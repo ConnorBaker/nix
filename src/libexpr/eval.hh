@@ -14,13 +14,17 @@
 #include "search-path.hh"
 #include "repl-exit-status.hh"
 
+#include <execution>
 #include <map>
 #include <optional>
 #include <unordered_map>
 #include <mutex>
 #include <functional>
 
+#include <omp.h>
+
 namespace nix {
+
 
 /**
  * We put a limit on primop arity because it lets us use a fixed size array on
@@ -129,7 +133,7 @@ struct Constant
     typedef std::map<std::string, Value *> ValMap;
 #endif
 
-struct Env
+struct alignas(8) Env
 {
     Env * up;
     Value * values[0];
@@ -674,9 +678,44 @@ public:
         return BindingsBuilder(*this, allocBindings(capacity));
     }
 
-    ListBuilder buildList(size_t size)
+    Bindings * allocBindings(size_t size, Attr * attrs);
+
+    BindingsBuilder buildBindings(size_t size, Attr * attrs, size_t nrNewValues)
     {
-        return ListBuilder(*this, size);
+        auto bindings = BindingsBuilder(*this, allocBindings(size, attrs));
+        nrValues += nrNewValues;
+        return bindings;
+    }
+
+    /**
+     * Create a new list of the given size.
+     * The goal of the preallocate parameter is to avoid the pattern of creating a list and then
+     * iterating over it and calling `allocValue` for each element.
+     * @param size The size of the list.
+     * @param preallocate If true, the list will have its elements (references to values, as well as
+     * the values themselves) preallocated.
+     * @return A `ListBuilder` object that can be used to add elements to the list.
+     * @see `ListBuilder`
+     */
+    ListBuilder buildList(size_t size, bool preallocate = false)
+    {
+        auto list = ListBuilder(*this, size);
+
+        if (preallocate && size > 0) {
+            // list is essentially a list of references -- we need to allocate the actual values.
+            auto refs = list.elems;
+            // We allocate values with allocAligned because:
+            // - allocValue increments the global nrValues
+            // - we can align the memory for better SIMD processing
+            auto values = static_cast<Value *>(allocAligned(size, sizeof(Value)));
+            [[omp::directive(simd aligned(refs: sizeof(Value *)) aligned(values: sizeof(Value)))]]
+            for (size_t i = 0; i < size; i++) {
+                refs[i] = &values[i];
+            };
+            nrValues += size;
+        }
+
+        return list;
     }
 
     /**

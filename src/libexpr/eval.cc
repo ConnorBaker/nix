@@ -829,7 +829,7 @@ inline Value * EvalState::lookupVar(Env * env, const ExprVar & var, bool noEval)
 
 ListBuilder::ListBuilder(EvalState & state, size_t size)
     : size(size)
-    , elems(size <= 2 ? inlineElems : (Value * *) allocBytes(size * sizeof(Value *)))
+    , elems(size <= 2 ? inlineElems : static_cast<Value * *>(allocAligned(size, sizeof(Value *))))
 {
     state.nrListElems += size;
 }

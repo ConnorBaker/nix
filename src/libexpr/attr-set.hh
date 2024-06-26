@@ -16,7 +16,7 @@ struct Value;
 /**
  * Map one attribute name to its value.
  */
-struct Attr
+struct alignas(16) Attr
 {
     /* the placement of `name` and `pos` in this struct is important.
        both of them are uint32 wrappers, they are next to each other
@@ -45,7 +45,7 @@ static_assert(sizeof(Attr) == 2 * sizeof(uint32_t) + sizeof(Value *),
  * elements allocated after this structure, while the size corresponds to
  * the number of elements already inserted in this structure.
  */
-class Bindings
+class alignas(16) Bindings
 {
 public:
     typedef uint32_t size_t;
@@ -53,9 +53,12 @@ public:
 
 private:
     size_t size_, capacity_;
-    Attr attrs[0];
+    Attr * attrs;
 
-    Bindings(size_t capacity) : size_(0), capacity_(capacity) { }
+    Bindings(size_t capacity) : size_(0), capacity_(capacity) {
+        attrs = static_cast<Attr *>(nix::allocAligned(capacity, sizeof(Attr)));
+    }
+    Bindings(size_t size, Attr * attrs) : size_(size), capacity_(size), attrs(attrs) { }
     Bindings(const Bindings & bindings) = delete;
 
 public:

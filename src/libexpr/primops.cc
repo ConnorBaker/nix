@@ -25,8 +25,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <numeric>
+#include <omp.h>
 #include <sstream>
 #include <regex>
+#include <vector>
 
 #ifndef _WIN32
 # include <dlfcn.h>
@@ -197,10 +200,10 @@ static void import(EvalState & state, const PosIdx pos, Value & vPath, Value * v
         });
         attrs.alloc(state.sName).mkString(drv.env["name"]);
 
-        auto list = state.buildList(drv.outputs.size());
+        auto list = state.buildList(drv.outputs.size(), true);
         for (const auto & [i, o] : enumerate(drv.outputs)) {
             mkOutputString(state, attrs, *storePath, o);
-            (list[i] = state.allocValue())->mkString(o.first);
+            list[i]->mkString(o.first);
         }
         attrs.alloc(state.sOutputs).mkList(list);
 
@@ -2535,11 +2538,20 @@ static RegisterPrimOp primop_path({
 static void prim_attrNames(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrNames");
+    auto & bindings = *args[0]->attrs();
+    auto numAttrs = bindings.size();
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    if (0 == numAttrs) {
+        v = state.vEmptyList;
+        return;
+    }
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
-        (list[n] = state.allocValue())->mkString(state.symbols[i.name]);
+    auto list = state.buildList(numAttrs, true);
+    auto refs = list.elems;
+
+    [[omp::directive(simd aligned(refs: sizeof(Value *)))]]
+    for (size_t i = 0; i < numAttrs; ++i)
+        refs[i]->mkString(state.symbols[bindings[i].name]);
 
     std::sort(list.begin(), list.end(),
               [](Value * v1, Value * v2) { return strcmp(v1->c_str(), v2->c_str()) < 0; });
@@ -2564,10 +2576,15 @@ static void prim_attrValues(EvalState & state, const PosIdx pos, Value * * args,
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrValues");
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    auto & bindings = *args[0]->attrs();
+    auto numAttrs = bindings.size();
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
-        list[n] = (Value *) &i;
+    auto list = state.buildList(numAttrs);
+    auto refs = list.elems;
+
+    [[omp::directive(simd aligned(refs: sizeof(Value *)))]]
+    for (size_t i = 0; i < numAttrs; ++i)
+        refs[i] = (Value *) &bindings[i];
 
     std::sort(list.begin(), list.end(),
         [&](Value * v1, Value * v2) {
@@ -2576,8 +2593,9 @@ static void prim_attrValues(EvalState & state, const PosIdx pos, Value * * args,
             return s1 < s2;
         });
 
-    for (auto & v : list)
-        v = ((Attr *) v)->value;
+    [[omp::directive(simd aligned(refs: sizeof(Value *)))]]
+    for (size_t i = 0; i < numAttrs; ++i)
+        refs[i] = ((Attr *) refs[i])->value;
 
     v.mkList(list);
 }
@@ -2985,17 +3003,32 @@ static void prim_mapAttrs(EvalState & state, const PosIdx pos, Value * * args, V
 {
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.mapAttrs");
 
-    auto attrs = state.buildBindings(args[1]->attrs()->size());
+    auto & bindings = *args[1]->attrs();
+    auto numAttrs = bindings.size();
 
-    for (auto & i : *args[1]->attrs()) {
-        Value * vName = state.allocValue();
-        Value * vFun2 = state.allocValue();
-        vName->mkString(state.symbols[i.name]);
-        vFun2->mkApp(args[0], vName);
-        attrs.alloc(i.name).mkApp(vFun2, i.value);
+    // NOTE: Don't use forceFunction here.
+    auto funcRef = args[0];
+
+    auto attrNames = static_cast<Value *>(allocAligned(numAttrs, sizeof(Value)));
+    // Application of the curried function to the attribute name.
+    auto funcAppName = static_cast<Value *>(allocAligned(numAttrs, sizeof(Value)));
+    auto funcAppValue = static_cast<Value *>(allocAligned(numAttrs, sizeof(Value)));
+    auto _attrs = static_cast<Attr *>(allocAligned(numAttrs, sizeof(Attr)));
+    [[omp::directive(simd aligned(attrNames, funcAppName, funcAppValue: sizeof(Value)) aligned(_attrs: sizeof(Attr)))]]
+    for (size_t i = 0; i < numAttrs; ++i) {
+        auto attr = bindings[i];
+        attrNames[i].mkString(state.symbols[attr.name]);
+        funcAppName[i].mkApp(funcRef, &attrNames[i]);
+        funcAppValue[i].mkApp(&funcAppName[i], attr.value);
+        _attrs[i] = Attr(attr.name, &funcAppValue[i], noPos);
     }
 
-    v.mkAttrs(attrs.alreadySorted());
+    // Number of new values is 3 times the number of attributes: copy of attribute name,
+    // partial application of the function to the attribute name, and the result of the function
+    // after application to the attribute value.
+    auto attrsBuilder = state.buildBindings(numAttrs, _attrs, 3 * numAttrs);
+
+    v.mkAttrs(attrsBuilder.alreadySorted());
 }
 
 static RegisterPrimOp primop_mapAttrs({
@@ -3202,19 +3235,26 @@ static RegisterPrimOp primop_tail({
 static void prim_map(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.map");
+    auto oldList = *args[1];
 
-    if (args[1]->listSize() == 0) {
-        v = *args[1];
+    auto oldListSize = oldList.listSize();
+    if (oldListSize == 0) {
+        v = state.vEmptyList;
         return;
     }
 
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.map");
+    auto funcRef = args[0];
 
-    auto list = state.buildList(args[1]->listSize());
-    for (const auto & [n, v] : enumerate(list))
-        (v = state.allocValue())->mkApp(
-            args[0], args[1]->listElems()[n]);
-    v.mkList(list);
+    auto oldRefs = oldList.listElems();
+    auto newList = state.buildList(oldListSize, true);
+    auto newRefs = newList.elems;
+
+    [[omp::directive(simd aligned(newRefs, oldRefs: sizeof(Value *)))]]
+    for (size_t n = 0; n < oldListSize; ++n)
+        newRefs[n]->mkApp(funcRef, oldRefs[n]);
+
+    v.mkList(newList);
 }
 
 static RegisterPrimOp primop_map({
@@ -3440,11 +3480,11 @@ static void prim_genList(EvalState & state, const PosIdx pos, Value * * args, Va
     // as evaluating map without accessing any values makes little sense.
     state.forceFunction(*args[0], noPos, "while evaluating the first argument passed to builtins.genList");
 
-    auto list = state.buildList(len);
+    auto list = state.buildList(len, true);
     for (const auto & [n, v] : enumerate(list)) {
         auto arg = state.allocValue();
         arg->mkInt(n);
-        (v = state.allocValue())->mkApp(args[0], arg);
+        v->mkApp(args[0], arg);
     }
     v.mkList(list);
 }
@@ -4451,9 +4491,9 @@ static void prim_splitVersion(EvalState & state, const PosIdx pos, Value * * arg
             break;
         components.emplace_back(component);
     }
-    auto list = state.buildList(components.size());
+    auto list = state.buildList(components.size(), true);
     for (const auto & [n, component] : enumerate(components))
-        (list[n] = state.allocValue())->mkString(std::move(component));
+        list[n]->mkString(std::move(component));
     v.mkList(list);
 }
 
@@ -4696,12 +4736,12 @@ void EvalState::createBaseEnv()
     });
 
     /* Add a value containing the current Nix expression search path. */
-    auto list = buildList(lookupPath.elements.size());
+    auto list = buildList(lookupPath.elements.size(), true);
     for (const auto & [n, i] : enumerate(lookupPath.elements)) {
         auto attrs = buildBindings(2);
         attrs.alloc("path").mkString(i.path.s);
         attrs.alloc("prefix").mkString(i.prefix.s);
-        (list[n] = allocValue())->mkAttrs(attrs);
+        list[n]->mkAttrs(attrs);
     }
     v.mkList(list);
     addConstant("__nixPath", v, {

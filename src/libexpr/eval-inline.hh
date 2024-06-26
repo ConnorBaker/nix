@@ -23,9 +23,8 @@ inline void * allocBytes(size_t n)
     return p;
 }
 
-
 [[gnu::always_inline]]
-Value * EvalState::allocValue()
+inline Value * EvalState::allocValue()
 {
 #if HAVE_BOEHMGC
     /* We use the boehm batch allocator to speed up allocations of Values (of which there are many).
@@ -52,7 +51,7 @@ Value * EvalState::allocValue()
 
 
 [[gnu::always_inline]]
-Env & EvalState::allocEnv(size_t size)
+inline Env & EvalState::allocEnv(size_t size)
 {
     nrEnvs++;
     nrValuesInEnvs += size;
@@ -82,7 +81,7 @@ Env & EvalState::allocEnv(size_t size)
 
 
 [[gnu::always_inline]]
-void EvalState::forceValue(Value & v, const PosIdx pos)
+inline void EvalState::forceValue(Value & v, const PosIdx pos)
 {
     if (v.isThunk()) {
         Env * env = v.payload.thunk.env;

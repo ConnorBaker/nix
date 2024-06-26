@@ -50,7 +50,7 @@ bool createUserEnv(EvalState & state, PackageInfos & elems,
 
     /* Construct the whole top level derivation. */
     StorePathSet references;
-    auto list = state.buildList(elems.size());
+    auto list = state.buildList(elems.size(), true);
     for (const auto & [n, i] : enumerate(elems)) {
         /* Create a pseudo-derivation containing the name, system,
            output paths, and optionally the derivation path, as well
@@ -71,9 +71,9 @@ bool createUserEnv(EvalState & state, PackageInfos & elems,
             attrs.alloc(state.sDrvPath).mkString(state.store->printStorePath(*drvPath));
 
         // Copy each output meant for installation.
-        auto outputsList = state.buildList(outputs.size());
+        auto outputsList = state.buildList(outputs.size(), true);
         for (const auto & [m, j] : enumerate(outputs)) {
-            (outputsList[m] = state.allocValue())->mkString(j.first);
+            outputsList[m]->mkString(j.first);
             auto outputAttrs = state.buildBindings(2);
             outputAttrs.alloc(state.sOutPath).mkString(state.store->printStorePath(*j.second));
             attrs.alloc(j.first).mkAttrs(outputAttrs);
@@ -97,7 +97,7 @@ bool createUserEnv(EvalState & state, PackageInfos & elems,
 
         attrs.alloc(state.sMeta).mkAttrs(meta);
 
-        (list[n] = state.allocValue())->mkAttrs(attrs);
+        list[n]->mkAttrs(attrs);
 
         if (drvPath) references.insert(*drvPath);
     }

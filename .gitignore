@@ -156,6 +156,9 @@ result-*
 .vscode/
 .idea/
 
+.direnv
+.envrc
+
 .pre-commit-config.yaml
 
 # clangd and possibly more

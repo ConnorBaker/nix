@@ -17,6 +17,24 @@
 
 namespace nix {
 
+[[gnu::always_inline]]
+inline void * allocAligned(size_t numElems, size_t elemSize)
+{
+    // elemSize must be a multiple of two
+    if (elemSize & (elemSize - 1)) throw std::invalid_argument("alignment must be a power of two");
+    const size_t totalSize = numElems * elemSize;
+    void * p;
+#if HAVE_BOEHMGC
+    p = GC_memalign(elemSize, totalSize);
+#else
+    p = aligned_alloc(elemSize, totalSize);
+#endif
+    if (!p) throw std::bad_alloc();
+    memset(p, 0, totalSize);
+    return p;
+}
+
+
 struct Value;
 class BindingsBuilder;
 
@@ -163,7 +181,7 @@ public:
 };
 
 
-struct Value
+struct alignas(32) Value
 {
 private:
     InternalType internalType = tUninitialized;

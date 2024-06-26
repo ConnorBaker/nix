@@ -19,7 +19,18 @@ Bindings * EvalState::allocBindings(size_t capacity)
         throw Error("attribute set of size %d is too big", capacity);
     nrAttrsets++;
     nrAttrsInAttrsets += capacity;
-    return new (allocBytes(sizeof(Bindings) + sizeof(Attr) * capacity)) Bindings((Bindings::size_t) capacity);
+    return new (static_cast<Bindings *>(allocAligned(1, sizeof(Bindings)))) Bindings((Bindings::size_t) capacity);
+}
+
+Bindings * EvalState::allocBindings(size_t size, Attr * attrs)
+{
+    if (size == 0)
+        return &emptyBindings;
+    if (size > std::numeric_limits<Bindings::size_t>::max())
+        throw Error("attribute set of size %d is too big", size);
+    nrAttrsets++;
+    nrAttrsInAttrsets += size;
+    return new (static_cast<Bindings *>(allocAligned(1, sizeof(Bindings)))) Bindings((Bindings::size_t) size, attrs);
 }
 
 

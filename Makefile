@@ -73,7 +73,7 @@ endif
 OPTIMIZE = 1
 
 ifeq ($(OPTIMIZE), 1)
-  GLOBAL_CXXFLAGS += -O3 $(CXXLTO)
+  GLOBAL_CXXFLAGS += -O3 $(CXXLTO) -fopenmp-simd
   GLOBAL_LDFLAGS += $(CXXLTO)
 else
   GLOBAL_CXXFLAGS += -O0 -U_FORTIFY_SOURCE
@@ -90,7 +90,7 @@ ifdef HOST_WINDOWS
   GLOBAL_LDFLAGS += -Wl,--export-all-symbols
 endif
 
-GLOBAL_CXXFLAGS += -g -Wall -Wdeprecated-copy -Wignored-qualifiers -Wimplicit-fallthrough -include $(buildprefix)config.h -std=c++2a -I src
+GLOBAL_CXXFLAGS += -g -Wall -Wdeprecated-copy -Wignored-qualifiers -Wimplicit-fallthrough -Wno-attributes -include $(buildprefix)config.h -std=c++2a -I src
 
 # Include the main lib, causing rules to be defined
 
