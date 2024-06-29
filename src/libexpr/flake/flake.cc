@@ -78,7 +78,7 @@ static std::tuple<StorePath, FlakeRef, FlakeRef> fetchOrSubstituteTree(
 
 static void forceTrivialValue(EvalState & state, Value & value, const PosIdx pos)
 {
-    if (value.isThunk() && value.isTrivial())
+    if (value.isClosure() && value.isTrivial())
         state.forceValue(value, pos);
 }
 
@@ -239,8 +239,8 @@ static Flake readFlake(
     if (auto outputs = vInfo.attrs()->get(sOutputs)) {
         expectType(state, nFunction, *outputs->value, outputs->pos);
 
-        if (outputs->value->isLambda() && outputs->value->payload.lambda.fun->hasFormals()) {
-            for (auto & formal : outputs->value->payload.lambda.fun->formals->formals) {
+        if (outputs->value->isLambda() && outputs->value->lambdaFun()->hasFormals()) {
+            for (auto & formal : outputs->value->lambdaFun()->formals->formals) {
                 if (formal.name != state.sSelf)
                     flake.inputs.emplace(state.symbols[formal.name], FlakeInput {
                         .ref = parseFlakeRef(state.symbols[formal.name])
@@ -258,28 +258,28 @@ static Flake readFlake(
 
         for (auto & setting : *nixConfig->value->attrs()) {
             forceTrivialValue(state, *setting.value, setting.pos);
-            if (setting.value->type() == nString)
+            if (setting.value->isString())
                 flake.config.settings.emplace(
                     state.symbols[setting.name],
                     std::string(state.forceStringNoCtx(*setting.value, setting.pos, "")));
-            else if (setting.value->type() == nPath) {
+            else if (setting.value->isPath()) {
                 NixStringContext emptyContext = {};
                 flake.config.settings.emplace(
                     state.symbols[setting.name],
                     state.coerceToString(setting.pos, *setting.value, emptyContext, "", false, true, true).toOwned());
             }
-            else if (setting.value->type() == nInt)
+            else if (setting.value->isInt())
                 flake.config.settings.emplace(
                     state.symbols[setting.name],
                     state.forceInt(*setting.value, setting.pos, ""));
-            else if (setting.value->type() == nBool)
+            else if (setting.value->isBool())
                 flake.config.settings.emplace(
                     state.symbols[setting.name],
                     Explicit<bool> { state.forceBool(*setting.value, setting.pos, "") });
-            else if (setting.value->type() == nList) {
+            else if (setting.value->isList()) {
                 std::vector<std::string> ss;
                 for (auto elem : setting.value->listItems()) {
-                    if (elem->type() != nString)
+                    if (!elem->isString())
                         state.error<TypeError>("list element in flake configuration setting '%s' is %s while a string is expected",
                             state.symbols[setting.name], showType(*setting.value)).debugThrow();
                     ss.emplace_back(state.forceStringNoCtx(*elem, setting.pos, ""));

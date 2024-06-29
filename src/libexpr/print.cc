@@ -256,7 +256,7 @@ private:
     {
         if (options.ansiColors)
             output << ANSI_GREEN;
-        output << v.path().to_string(); // !!! escaping?
+        output << v.getSourcePath().to_string(); // !!! escaping?
         if (options.ansiColors)
             output << ANSI_NORMAL;
     }
@@ -434,13 +434,13 @@ private:
 
         if (v.isLambda()) {
             output << "lambda";
-            if (v.payload.lambda.fun) {
-                if (v.payload.lambda.fun->name) {
-                    output << " " << state.symbols[v.payload.lambda.fun->name];
+            if (v.lambdaFun()) {
+                if (v.lambdaFun()->name) {
+                    output << " " << state.symbols[v.lambdaFun()->name];
                 }
 
                 std::ostringstream s;
-                s << state.positions[v.payload.lambda.fun->pos];
+                s << state.positions[v.lambdaFun()->pos];
                 output << " @ " << filterANSIEscapes(s.str());
             }
         } else if (v.isPrimOp()) {
@@ -478,13 +478,14 @@ private:
             output << "«potential infinite recursion»";
             if (options.ansiColors)
                 output << ANSI_NORMAL;
-        } else if (v.isThunk() || v.isApp()) {
+        } else if (v.isThunk()) {
             if (options.ansiColors)
                     output << ANSI_MAGENTA;
             output << "«thunk»";
             if (options.ansiColors)
                     output << ANSI_NORMAL;
         } else {
+            
             abort();
         }
     }
@@ -518,60 +519,34 @@ private:
         checkInterrupt();
 
         try {
-            if (options.force) {
+            if (options.force)
                 state.forceValue(v, v.determinePos(noPos));
-            }
 
-            switch (v.type()) {
-
-            case nInt:
-                printInt(v);
-                break;
-
-            case nFloat:
-                printFloat(v);
-                break;
-
-            case nBool:
-                printBool(v);
-                break;
-
-            case nString:
-                printString(v);
-                break;
-
-            case nPath:
-                printPath(v);
-                break;
-
-            case nNull:
+            if (v.isNull())
                 printNull();
-                break;
-
-            case nAttrs:
-                printAttrs(v, depth);
-                break;
-
-            case nList:
+            else if (v.isBool())
+                printBool(v);
+            else if (v.isInt())
+                printInt(v);
+            else if (v.isFloat())
+                printFloat(v);
+            else if (v.isString())
+                printString(v);
+            else if (v.isPath())
+                printPath(v);
+            else if (v.isList())
                 printList(v, depth);
-                break;
-
-            case nFunction:
+            else if (v.isAttrs())
+                printAttrs(v, depth);
+            else if (v.isFunction())
                 printFunction(v);
-                break;
-
-            case nThunk:
+            else if (v.isThunk())
                 printThunk(v);
-                break;
-
-            case nExternal:
+            else if (v.isExternal())
                 printExternal(v);
-                break;
-
-            default:
+            else
                 printUnknown();
-                break;
-            }
+
         } catch (Error & e) {
             if (options.errors == ErrorPrintBehavior::Throw
                 || (options.errors == ErrorPrintBehavior::ThrowTopLevel

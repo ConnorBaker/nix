@@ -91,7 +91,7 @@ TEST_F(ValuePrintingTests, tList)
 TEST_F(ValuePrintingTests, vThunk)
 {
     Value vThunk;
-    vThunk.mkThunk(nullptr, nullptr);
+    vThunk.mkClosure(nullptr, nullptr);
 
     test(vThunk, "«thunk»");
 }
@@ -521,7 +521,7 @@ TEST_F(ValuePrintingTests, ansiColorsAssert)
     ExprAssert expr(noPos, &eFalse, &eInt);
 
     Value v;
-    state.mkThunk_(v, &expr);
+    state.mkClosure_(v, &expr);
 
     test(v,
          ANSI_RED "«error: assertion 'false' failed»" ANSI_NORMAL,
@@ -621,7 +621,7 @@ TEST_F(ValuePrintingTests, ansiColorsPrimOpApp)
 TEST_F(ValuePrintingTests, ansiColorsThunk)
 {
     Value v;
-    v.mkThunk(nullptr, nullptr);
+    v.mkClosure(nullptr, nullptr);
 
     test(v,
          ANSI_MAGENTA "«thunk»" ANSI_NORMAL,

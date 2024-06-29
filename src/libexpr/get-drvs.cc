@@ -160,7 +160,7 @@ PackageInfo::Outputs PackageInfo::queryOutputs(bool withPaths, bool onlyOutputsT
         if (!outTI->isList()) throw errMsg;
         Outputs result;
         for (auto elem : outTI->listItems()) {
-            if (elem->type() != nString) throw errMsg;
+            if (!elem->isString()) throw errMsg;
             auto out = outputs.find(elem->c_str());
             if (out == outputs.end()) throw errMsg;
             result.insert(*out);
@@ -205,19 +205,19 @@ StringSet PackageInfo::queryMetaNames()
 bool PackageInfo::checkMeta(Value & v)
 {
     state->forceValue(v, v.determinePos(noPos));
-    if (v.type() == nList) {
+    if (v.isList()) {
         for (auto elem : v.listItems())
             if (!checkMeta(*elem)) return false;
         return true;
     }
-    else if (v.type() == nAttrs) {
+    else if (v.isAttrs()) {
         if (v.attrs()->get(state->sOutPath)) return false;
         for (auto & i : *v.attrs())
             if (!checkMeta(*i.value)) return false;
         return true;
     }
-    else return v.type() == nInt || v.type() == nBool || v.type() == nString ||
-                v.type() == nFloat;
+    else return v.isInt() || v.isBool() || v.isString() ||
+                v.isFloat();
 }
 
 
@@ -233,8 +233,7 @@ Value * PackageInfo::queryMeta(const std::string & name)
 std::string PackageInfo::queryMetaString(const std::string & name)
 {
     Value * v = queryMeta(name);
-    if (!v || v->type() != nString) return "";
-    return v->c_str();
+    return (v && v->isString()) ? v->c_str() : "";
 }
 
 
@@ -242,8 +241,8 @@ NixInt PackageInfo::queryMetaInt(const std::string & name, NixInt def)
 {
     Value * v = queryMeta(name);
     if (!v) return def;
-    if (v->type() == nInt) return v->integer();
-    if (v->type() == nString) {
+    if (v->isInt()) return v->integer();
+    if (v->isString()) {
         /* Backwards compatibility with before we had support for
            integer meta fields. */
         if (auto n = string2Int<NixInt>(v->c_str()))
@@ -256,8 +255,8 @@ NixFloat PackageInfo::queryMetaFloat(const std::string & name, NixFloat def)
 {
     Value * v = queryMeta(name);
     if (!v) return def;
-    if (v->type() == nFloat) return v->fpoint();
-    if (v->type() == nString) {
+    if (v->isFloat()) return v->fpoint();
+    if (v->isString()) {
         /* Backwards compatibility with before we had support for
            float meta fields. */
         if (auto n = string2Float<NixFloat>(v->c_str()))
@@ -271,8 +270,8 @@ bool PackageInfo::queryMetaBool(const std::string & name, bool def)
 {
     Value * v = queryMeta(name);
     if (!v) return def;
-    if (v->type() == nBool) return v->boolean();
-    if (v->type() == nString) {
+    if (v->isBool()) return v->boolean();
+    if (v->isString()) {
         /* Backwards compatibility with before we had support for
            Boolean meta fields. */
         if (v->string_view() == "true") return true;
@@ -362,7 +361,7 @@ static void getDerivations(EvalState & state, Value & vIn,
     /* Process the expression. */
     if (!getDerivation(state, v, pathPrefix, drvs, done, ignoreAssertionFailures)) ;
 
-    else if (v.type() == nAttrs) {
+    else if (v.isAttrs()) {
 
         /* !!! undocumented hackery to support combining channels in
            nix-env.cc. */
@@ -384,7 +383,7 @@ static void getDerivations(EvalState & state, Value & vIn,
                 /* If the value of this attribute is itself a set,
                    should we recurse into it?  => Only if it has a
                    `recurseForDerivations = true' attribute. */
-                if (i->value->type() == nAttrs) {
+                if (i->value->isAttrs()) {
                     auto j = i->value->attrs()->get(state.sRecurseForDerivations);
                     if (j && state.forceBool(*j->value, j->pos, "while evaluating the attribute `recurseForDerivations`"))
                         getDerivations(state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
@@ -393,7 +392,7 @@ static void getDerivations(EvalState & state, Value & vIn,
         }
     }
 
-    else if (v.type() == nList) {
+    else if (v.isList()) {
         for (auto [n, elem] : enumerate(v.listItems())) {
             std::string pathPrefix2 = addToPath(pathPrefix, fmt("%d", n));
             if (getDerivation(state, *elem, pathPrefix2, drvs, done, ignoreAssertionFailures))

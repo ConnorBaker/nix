@@ -44,8 +44,8 @@ ref<InstallableValue> InstallableValue::require(ref<Installable> installable)
 
 std::optional<DerivedPathWithInfo> InstallableValue::trySinglePathToDerivedPaths(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
-    if (v.type() == nPath) {
-        auto storePath = fetchToStore(*state->store, v.path(), FetchMode::Copy);
+    if (v.isPath()) {
+        auto storePath = fetchToStore(*state->store, v.getSourcePath(), FetchMode::Copy);
         return {{
             .path = DerivedPath::Opaque {
                 .path = std::move(storePath),
@@ -54,7 +54,7 @@ std::optional<DerivedPathWithInfo> InstallableValue::trySinglePathToDerivedPaths
         }};
     }
 
-    else if (v.type() == nString) {
+    else if (v.isString()) {
         return {{
             .path = DerivedPath::fromSingle(
                 state->coerceToSingleDerivedPath(pos, v, errorCtx)),

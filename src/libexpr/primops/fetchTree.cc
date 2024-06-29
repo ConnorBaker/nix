@@ -92,7 +92,7 @@ static void fetchTree(
 
     state.forceValue(*args[0], pos);
 
-    if (args[0]->type() == nAttrs) {
+    if (args[0]->isAttrs()) {
         state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.fetchTree");
 
         fetchers::Attrs attrs;
@@ -113,16 +113,16 @@ static void fetchTree(
         for (auto & attr : *args[0]->attrs()) {
             if (attr.name == state.sType) continue;
             state.forceValue(*attr.value, attr.pos);
-            if (attr.value->type() == nPath || attr.value->type() == nString) {
+            if (attr.value->isPath() || attr.value->isString()) {
                 auto s = state.coerceToString(attr.pos, *attr.value, context, "", false, false).toOwned();
                 attrs.emplace(state.symbols[attr.name],
                     params.isFetchGit && state.symbols[attr.name] == "url"
                     ? fixGitURL(s)
                     : s);
             }
-            else if (attr.value->type() == nBool)
+            else if (attr.value->isBool())
                 attrs.emplace(state.symbols[attr.name], Explicit<bool>{attr.value->boolean()});
-            else if (attr.value->type() == nInt)
+            else if (attr.value->isInt())
                 attrs.emplace(state.symbols[attr.name], uint64_t(attr.value->integer()));
             else if (state.symbols[attr.name] == "publicKeys") {
                 experimentalFeatureSettings.require(Xp::VerifiedFetches);
@@ -431,7 +431,7 @@ static void fetch(EvalState & state, const PosIdx pos, Value * * args, Value & v
 
     state.forceValue(*args[0], pos);
 
-    if (args[0]->type() == nAttrs) {
+    if (args[0]->isAttrs()) {
 
         for (auto & attr : *args[0]->attrs()) {
             std::string_view n(state.symbols[attr.name]);

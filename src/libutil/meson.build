@@ -320,7 +320,7 @@ import('pkgconfig').generate(
   name : 'Nix',
   description : 'Nix Package Manager',
   subdirs : ['nix'],
-  extra_cflags : ['-std=c++2a'],
+  extra_cflags : ['-std=c++20'],
   requires : deps_public,
   requires_private : deps_private,
   libraries_private : libraries_private,
@@ -329,6 +329,6 @@ import('pkgconfig').generate(
 meson.override_dependency(meson.project_name(), declare_dependency(
   include_directories : include_dirs,
   link_with : this_library,
-  compile_args : ['-std=c++2a'],
+  compile_args : ['-std=c++20'],
   dependencies : [],
 ))

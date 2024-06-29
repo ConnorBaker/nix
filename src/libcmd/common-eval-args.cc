@@ -182,7 +182,7 @@ Bindings * MixEvalArgs::getAutoArgs(EvalState & state)
         auto v = state.allocValue();
         std::visit(overloaded {
             [&](const AutoArgExpr & arg) {
-                state.mkThunk_(*v, state.parseExprFromString(arg.expr, state.rootPath(".")));
+                state.mkClosure_(*v, state.parseExprFromString(arg.expr, state.rootPath(".")));
             },
             [&](const AutoArgString & arg) {
                 v->mkString(arg.s);

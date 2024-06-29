@@ -73,7 +73,7 @@ static void printValueAsXML(EvalState & state, bool strict, bool location,
             break;
 
         case nPath:
-            doc.writeEmptyElement("path", singletonAttrs("value", v.path().to_string()));
+            doc.writeEmptyElement("path", singletonAttrs("value", v.getSourcePath().to_string()));
             break;
 
         case nNull:
@@ -87,13 +87,13 @@ static void printValueAsXML(EvalState & state, bool strict, bool location,
                 Path drvPath;
                 if (auto a = v.attrs()->get(state.sDrvPath)) {
                     if (strict) state.forceValue(*a->value, a->pos);
-                    if (a->value->type() == nString)
+                    if (a->value->isString())
                         xmlAttrs["drvPath"] = drvPath = a->value->c_str();
                 }
 
                 if (auto a = v.attrs()->get(state.sOutPath)) {
                     if (strict) state.forceValue(*a->value, a->pos);
-                    if (a->value->type() == nString)
+                    if (a->value->isString())
                         xmlAttrs["outPath"] = a->value->c_str();
                 }
 
@@ -126,18 +126,18 @@ static void printValueAsXML(EvalState & state, bool strict, bool location,
                 break;
             }
             XMLAttrs xmlAttrs;
-            if (location) posToXML(state, xmlAttrs, state.positions[v.payload.lambda.fun->pos]);
+            if (location) posToXML(state, xmlAttrs, state.positions[v.lambdaFun()->pos]);
             XMLOpenElement _(doc, "function", xmlAttrs);
 
-            if (v.payload.lambda.fun->hasFormals()) {
+            if (v.lambdaFun()->hasFormals()) {
                 XMLAttrs attrs;
-                if (v.payload.lambda.fun->arg) attrs["name"] = state.symbols[v.payload.lambda.fun->arg];
-                if (v.payload.lambda.fun->formals->ellipsis) attrs["ellipsis"] = "1";
+                if (v.lambdaFun()->arg) attrs["name"] = state.symbols[v.lambdaFun()->arg];
+                if (v.lambdaFun()->formals->ellipsis) attrs["ellipsis"] = "1";
                 XMLOpenElement _(doc, "attrspat", attrs);
-                for (auto & i : v.payload.lambda.fun->formals->lexicographicOrder(state.symbols))
+                for (auto & i : v.lambdaFun()->formals->lexicographicOrder(state.symbols))
                     doc.writeEmptyElement("attr", singletonAttrs("name", state.symbols[i.name]));
             } else
-                doc.writeEmptyElement("varpat", singletonAttrs("name", state.symbols[v.payload.lambda.fun->arg]));
+                doc.writeEmptyElement("varpat", singletonAttrs("name", state.symbols[v.lambdaFun()->arg]));
 
             break;
         }

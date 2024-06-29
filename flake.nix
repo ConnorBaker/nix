@@ -379,7 +379,9 @@
             ++ lib.optionals havePerl (map (transformFlag "perl") pkgs.nix-perl-bindings.mesonFlags)
             ;
 
-          nativeBuildInputs = attrs.nativeBuildInputs or []
+          nativeBuildInputs = attrs.nativeBuildInputs or [] ++ [
+            pkgs.gdb
+          ]
             ++ pkgs.nix-util.nativeBuildInputs
             ++ pkgs.nix-store.nativeBuildInputs
             ++ pkgs.nix-fetchers.nativeBuildInputs

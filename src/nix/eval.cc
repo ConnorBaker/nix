@@ -83,10 +83,10 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
             recurse = [&](Value & v, const PosIdx pos, const Path & path)
             {
                 state->forceValue(v, pos);
-                if (v.type() == nString)
+                if (v.isString())
                     // FIXME: disallow strings with contexts?
                     writeFile(path, v.string_view());
-                else if (v.type() == nAttrs) {
+                else if (v.isAttrs()) {
                     if (mkdir(path.c_str()
 #ifndef _WIN32 // TODO abstract mkdir perms for Windows
                         , 0777

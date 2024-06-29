@@ -80,24 +80,30 @@ inline Env & EvalState::allocEnv(size_t size)
 }
 
 
-[[gnu::always_inline]]
-inline void EvalState::forceValue(Value & v, const PosIdx pos)
+// [[gnu::always_inline]]
+/* inline */ void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    if (v.isThunk()) {
-        Env * env = v.payload.thunk.env;
-        Expr * expr = v.payload.thunk.expr;
+    if (v.isClosure()) {
+        Env * env = v.closureEnv();
+        Expr * expr = v.closureExpr();
         try {
             v.mkBlackhole();
             //checkInterrupt();
             expr->eval(*this, *env, v);
         } catch (...) {
-            v.mkThunk(env, expr);
+            v.mkClosure(env, expr);
             tryFixupBlackHolePos(v, pos);
             throw;
         }
     }
-    else if (v.isApp())
-        callFunction(*v.payload.app.left, *v.payload.app.right, v, pos);
+    else if (v.isApp()) {
+        assert(v.isValid());
+        auto appRight = v.appRight();
+        assert(appRight->isValid());
+        auto appLeft = v.appLeft();
+        assert(appLeft->isValid());
+        callFunction(*v.appLeft(), *v.appRight(), v, pos);
+    }
 }
 
 
@@ -114,7 +120,7 @@ inline void EvalState::forceAttrs(Value & v, Callable getPos, std::string_view e
 {
     PosIdx pos = getPos();
     forceValue(v, pos);
-    if (v.type() != nAttrs) {
+    if (!v.isAttrs()) {
         error<TypeError>(
             "expected a set but found %1%: %2%",
             showType(v),

@@ -102,6 +102,12 @@ struct PrimOp
     void check();
 };
 
+inline void Value::mkPrimOp(PrimOp * p)
+{
+    p->check();
+    payload.emplace<PrimOp *>(p);
+}
+
 std::ostream & operator<<(std::ostream & output, const PrimOp & primOp);
 
 /**
@@ -655,6 +661,8 @@ public:
 
     void callFunction(Value & fun, Value & arg, Value & vRes, const PosIdx pos)
     {
+        assert(fun.isValid());
+        assert(arg.isValid());
         Value * args[] = {&arg};
         callFunction(fun, 1, args, vRes, pos);
     }
@@ -723,7 +731,7 @@ public:
      */
     Value *getBool(bool b);
 
-    void mkThunk_(Value & v, Expr * expr);
+    void mkClosure_(Value & v, Expr * expr);
     void mkPos(Value & v, PosIdx pos);
 
     /**
@@ -897,6 +905,109 @@ SourcePath resolveExprPath(SourcePath path);
  */
 bool isAllowedURI(std::string_view uri, const Strings & allowedPaths);
 
+/**
+ * Check whether forcing this value requires a trivial amount of
+ * computation. In particular, function applications are
+ * non-trivial.
+ */
+inline bool Value::isTrivial() const
+{
+    if (isApp() || isPrimOpApp())
+        return false;
+
+    auto thunk = std::get_if<ClosureThunk>(&payload);
+    if (!thunk)
+        return true;
+
+    // TODO(@connorbaker): see if you can simplify this. Which values *are* trivial?
+    auto exprAsAttrs = dynamic_cast<ExprAttrs *>(thunk->expr);
+
+    auto exprIsEmptyAttrs = exprAsAttrs && exprAsAttrs->dynamicAttrs.empty();
+    auto exprIsLambda = dynamic_cast<ExprLambda *>(thunk->expr);
+    auto exprIsList = dynamic_cast<ExprList *>(thunk->expr);
+    return exprIsEmptyAttrs || exprIsLambda || exprIsList;
+}
+
+inline PosIdx Value::determinePos(const PosIdx pos) const
+{
+    return
+        isAttrs()
+        ? attrs()->pos
+        : isLambda()
+        ? lambdaFun()->pos
+        : isApp()
+        ? appLeft()->determinePos(pos)
+        : pos;
+}
+
+static char * allocString(size_t size)
+{
+    char * t;
+#if HAVE_BOEHMGC
+    t = (char *) GC_MALLOC_ATOMIC(size);
+#else
+    t = (char *) malloc(size);
+#endif
+    if (!t) throw std::bad_alloc();
+    return t;
+}
+
+
+static char * dupString(const char * s)
+{
+    char * t;
+#if HAVE_BOEHMGC
+    t = GC_STRDUP(s);
+#else
+    t = strdup(s);
+#endif
+    if (!t) throw std::bad_alloc();
+    return t;
+}
+
+
+// When there's no need to write to the string, we can optimize away empty
+// string allocations.
+// This function handles makeImmutableString(std::string_view()) by returning
+// the empty string.
+static const char * makeImmutableString(std::string_view s)
+{
+    const size_t size = s.size();
+    if (size == 0)
+        return "";
+    auto t = allocString(size + 1);
+    memcpy(t, s.data(), size);
+    t[size] = '\0';
+    return t;
+}
+
+void * allocBytes(size_t n);
+
+static const char * * encodeContext(const NixStringContext & context)
+{
+    if (!context.empty()) {
+        size_t n = 0;
+        auto ctx = (const char * *)
+            allocBytes((context.size() + 1) * sizeof(char *));
+        for (auto & i : context)
+            ctx[n++] = dupString(i.to_string().c_str());
+        ctx[n] = 0;
+        return ctx;
+    } else
+        return nullptr;
+}
+
+inline void Value::mkString(std::string_view s)
+{ mkString(makeImmutableString(s)); }
+
+inline void Value::mkString(std::string_view s, const NixStringContext & context)
+{ mkString(makeImmutableString(s), encodeContext(context)); }
+
+inline void Value::mkStringMove(const char * s, const NixStringContext & context)
+{ mkString(s, encodeContext(context)); }
+
+inline void Value::mkPath(const SourcePath & path)
+{ mkPath(&*path.accessor, makeImmutableString(path.path.abs())); }
 }
 
 #include "eval-inline.hh"

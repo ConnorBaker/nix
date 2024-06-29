@@ -258,13 +258,13 @@ namespace nix {
 
         auto a = v.attrs()->find(createSymbol("a"));
         ASSERT_NE(a, nullptr);
-        ASSERT_THAT(*a->value, IsThunk());
+        ASSERT_THAT(*a->value, isClosure());
         state.forceValue(*a->value, noPos);
         ASSERT_THAT(*a->value, IsIntEq(10));
 
         auto b = v.attrs()->find(createSymbol("b"));
         ASSERT_NE(b, nullptr);
-        ASSERT_THAT(*b->value, IsThunk());
+        ASSERT_THAT(*b->value, isClosure());
         state.forceValue(*b->value, noPos);
         ASSERT_THAT(*b->value, IsIntEq(20));
     }
@@ -316,17 +316,17 @@ namespace nix {
         auto v = eval("map (x: \"foo\" + x) [ \"bar\" \"bla\" \"abc\" ]");
         ASSERT_THAT(v, IsListOfSize(3));
         auto elem = v.listElems()[0];
-        ASSERT_THAT(*elem, IsThunk());
+        ASSERT_THAT(*elem, isClosure());
         state.forceValue(*elem, noPos);
         ASSERT_THAT(*elem, IsStringEq("foobar"));
 
         elem = v.listElems()[1];
-        ASSERT_THAT(*elem, IsThunk());
+        ASSERT_THAT(*elem, isClosure());
         state.forceValue(*elem, noPos);
         ASSERT_THAT(*elem, IsStringEq("foobla"));
 
         elem = v.listElems()[2];
-        ASSERT_THAT(*elem, IsThunk());
+        ASSERT_THAT(*elem, isClosure());
         state.forceValue(*elem, noPos);
         ASSERT_THAT(*elem, IsStringEq("fooabc"));
     }
@@ -390,7 +390,7 @@ namespace nix {
         ASSERT_EQ(v.type(), nList);
         ASSERT_EQ(v.listSize(), 3);
         for (const auto [i, elem] : enumerate(v.listItems())) {
-            ASSERT_THAT(*elem, IsThunk());
+            ASSERT_THAT(*elem, isClosure());
             state.forceValue(*elem, noPos);
             ASSERT_THAT(*elem, IsIntEq(static_cast<int>(i)+1));
         }
@@ -641,8 +641,8 @@ namespace nix {
         auto v = eval("derivation");
         ASSERT_EQ(v.type(), nFunction);
         ASSERT_TRUE(v.isLambda());
-        ASSERT_NE(v.payload.lambda.fun, nullptr);
-        ASSERT_TRUE(v.payload.lambda.fun->hasFormals());
+        ASSERT_NE(v.lambdaFun(), nullptr);
+        ASSERT_TRUE(v.lambdaFun()->hasFormals());
     }
 
     TEST_F(PrimOpTest, currentTime) {

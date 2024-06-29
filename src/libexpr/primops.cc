@@ -450,7 +450,7 @@ static RegisterPrimOp primop_typeOf({
 static void prim_isNull(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nNull);
+    v.mkBool(args[0]->isNull());
 }
 
 static RegisterPrimOp primop_isNull({
@@ -468,7 +468,7 @@ static RegisterPrimOp primop_isNull({
 static void prim_isFunction(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nFunction);
+    v.mkBool(args[0]->isFunction());
 }
 
 static RegisterPrimOp primop_isFunction({
@@ -484,7 +484,7 @@ static RegisterPrimOp primop_isFunction({
 static void prim_isInt(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nInt);
+    v.mkBool(args[0]->isInt());
 }
 
 static RegisterPrimOp primop_isInt({
@@ -500,7 +500,7 @@ static RegisterPrimOp primop_isInt({
 static void prim_isFloat(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nFloat);
+    v.mkBool(args[0]->isFloat());
 }
 
 static RegisterPrimOp primop_isFloat({
@@ -516,7 +516,7 @@ static RegisterPrimOp primop_isFloat({
 static void prim_isString(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nString);
+    v.mkBool(args[0]->isString());
 }
 
 static RegisterPrimOp primop_isString({
@@ -532,7 +532,7 @@ static RegisterPrimOp primop_isString({
 static void prim_isBool(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nBool);
+    v.mkBool(args[0]->isBool());
 }
 
 static RegisterPrimOp primop_isBool({
@@ -548,7 +548,7 @@ static RegisterPrimOp primop_isBool({
 static void prim_isPath(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nPath);
+    v.mkBool(args[0]->isPath());
 }
 
 static RegisterPrimOp primop_isPath({
@@ -590,9 +590,9 @@ struct CompareValues
     bool operator () (Value * v1, Value * v2, std::string_view errorCtx) const
     {
         try {
-            if (v1->type() == nFloat && v2->type() == nInt)
+            if (v1->isFloat() && v2->isInt())
                 return v1->fpoint() < v2->integer();
-            if (v1->type() == nInt && v2->type() == nFloat)
+            if (v1->isInt() && v2->isFloat())
                 return v1->integer() < v2->fpoint();
             if (v1->type() != v2->type())
                 state.error<EvalError>("cannot compare %s with %s", showType(*v1), showType(*v2)).debugThrow();
@@ -610,7 +610,7 @@ struct CompareValues
                     // Note: we don't take the accessor into account
                     // since it's not obvious how to compare them in a
                     // reproducible way.
-                    return strcmp(v1->payload.path.path, v2->payload.path.path) < 0;
+                    return strcmp(v1->pathString(), v2->pathString()) < 0;
                 case nList:
                     // Lexicographic comparison
                     for (size_t i = 0;; i++) {
@@ -1015,7 +1015,7 @@ static RegisterPrimOp primop_deepSeq({
 static void prim_trace(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    if (args[0]->type() == nString)
+    if (args[0]->isString())
         printError("trace: %1%", args[0]->string_view());
     else
         printError("trace: %1%", ValuePrinter(state, *args[0]));
@@ -1256,7 +1256,7 @@ static void derivationStrictInternal(
 
             if (ignoreNulls) {
                 state.forceValue(*i->value, pos);
-                if (i->value->type() == nNull) continue;
+                if (i->value->isNull()) continue;
             }
 
             if (i->name == state.sContentAddressed && state.forceBool(*i->value, pos, context_below)) {
@@ -1630,7 +1630,7 @@ static void prim_pathExists(EvalState & state, const PosIdx pos, Value * * args,
 
         /* SourcePath doesn't know about trailing slash. */
         state.forceValue(arg, pos);
-        auto mustBeDir = arg.type() == nString
+        auto mustBeDir = arg.isString()
             && (arg.string_view().ends_with("/")
                 || arg.string_view().ends_with("/."));
 
@@ -1710,8 +1710,8 @@ static RegisterPrimOp primop_baseNameOf({
 static void prim_dirOf(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    if (args[0]->type() == nPath) {
-        auto path = args[0]->path();
+    if (args[0]->isPath()) {
+        auto path = args[0]->getSourcePath();
         v.mkPath(path.path.isRoot() ? path : path.parent());
     } else {
         NixStringContext context;
@@ -2728,7 +2728,7 @@ static RegisterPrimOp primop_hasAttr({
 static void prim_isAttrs(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nAttrs);
+    v.mkBool(args[0]->isAttrs());
 }
 
 static RegisterPrimOp primop_isAttrs({
@@ -2970,13 +2970,13 @@ static void prim_functionArgs(EvalState & state, const PosIdx pos, Value * * arg
     if (!args[0]->isLambda())
         state.error<TypeError>("'functionArgs' requires a function").atPos(pos).debugThrow();
 
-    if (!args[0]->payload.lambda.fun->hasFormals()) {
+    if (!args[0]->lambdaFun()->hasFormals()) {
         v.mkAttrs(&state.emptyBindings);
         return;
     }
 
-    auto attrs = state.buildBindings(args[0]->payload.lambda.fun->formals->formals.size());
-    for (auto & i : args[0]->payload.lambda.fun->formals->formals)
+    auto attrs = state.buildBindings(args[0]->lambdaFun()->formals->formals.size());
+    for (auto & i : args[0]->lambdaFun()->formals->formals)
         attrs.insert(i.name, state.getBool(i.def), i.pos);
     v.mkAttrs(attrs);
 }
@@ -3143,7 +3143,7 @@ static RegisterPrimOp primop_zipAttrsWith({
 static void prim_isList(EvalState & state, const PosIdx pos, Value * * args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nList);
+    v.mkBool(args[0]->isList());
 }
 
 static RegisterPrimOp primop_isList({
@@ -3728,7 +3728,7 @@ static void prim_add(EvalState & state, const PosIdx pos, Value * * args, Value 
 {
     state.forceValue(*args[0], pos);
     state.forceValue(*args[1], pos);
-    if (args[0]->type() == nFloat || args[1]->type() == nFloat)
+    if (args[0]->isFloat() || args[1]->isFloat())
         v.mkFloat(state.forceFloat(*args[0], pos, "while evaluating the first argument of the addition")
                 + state.forceFloat(*args[1], pos, "while evaluating the second argument of the addition"));
     else
@@ -3749,7 +3749,7 @@ static void prim_sub(EvalState & state, const PosIdx pos, Value * * args, Value 
 {
     state.forceValue(*args[0], pos);
     state.forceValue(*args[1], pos);
-    if (args[0]->type() == nFloat || args[1]->type() == nFloat)
+    if (args[0]->isFloat() || args[1]->isFloat())
         v.mkFloat(state.forceFloat(*args[0], pos, "while evaluating the first argument of the subtraction")
                 - state.forceFloat(*args[1], pos, "while evaluating the second argument of the subtraction"));
     else
@@ -3770,7 +3770,7 @@ static void prim_mul(EvalState & state, const PosIdx pos, Value * * args, Value 
 {
     state.forceValue(*args[0], pos);
     state.forceValue(*args[1], pos);
-    if (args[0]->type() == nFloat || args[1]->type() == nFloat)
+    if (args[0]->isFloat() || args[1]->isFloat())
         v.mkFloat(state.forceFloat(*args[0], pos, "while evaluating the first of the multiplication")
                 * state.forceFloat(*args[1], pos, "while evaluating the second argument of the multiplication"));
     else
@@ -3796,7 +3796,7 @@ static void prim_div(EvalState & state, const PosIdx pos, Value * * args, Value 
     if (f2 == 0)
         state.error<EvalError>("division by zero").atPos(pos).debugThrow();
 
-    if (args[0]->type() == nFloat || args[1]->type() == nFloat) {
+    if (args[0]->isFloat() || args[1]->isFloat()) {
         v.mkFloat(state.forceFloat(*args[0], pos, "while evaluating the first operand of the division") / f2);
     } else {
         NixInt i1 = state.forceInt(*args[0], pos, "while evaluating the first operand of the division");
@@ -3943,7 +3943,7 @@ static void prim_substring(EvalState & state, const PosIdx pos, Value * * args, 
     // This allows for the use of empty substrings to efficently capture string context
     if (len == 0) {
         state.forceValue(*args[2], pos);
-        if (args[2]->type() == nString) {
+        if (args[2]->isString()) {
             v.mkString("", args[2]->context());
             return;
         }
@@ -4785,7 +4785,7 @@ void EvalState::createBaseEnv()
 
     /* Now that we've added all primops, sort the `builtins' set,
        because attribute lookups expect it to be sorted. */
-    baseEnv.values[0]->payload.attrs->sort();
+    baseEnv.values[0]->attrs()->sort();
 
     staticBaseEnv->sort();
 

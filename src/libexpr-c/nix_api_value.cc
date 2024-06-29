@@ -105,7 +105,7 @@ static void nix_c_primop_wrapper(
             .debugThrow();
     }
 
-    if (vTmp.type() == nix::nThunk) {
+    if (vTmp.isThunk()) {
         // We might allow this in the future if it makes sense for the evaluator
         // e.g. implementing tail recursion by returning a thunk to the next
         // "iteration". Until then, this is most likely a mistake or misunderstanding.
@@ -225,7 +225,7 @@ bool nix_get_bool(nix_c_context * context, const nix_value * value)
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nBool);
+        assert(v.isBool());
         return v.boolean();
     }
     NIXC_CATCH_ERRS_RES(false);
@@ -238,7 +238,7 @@ nix_get_string(nix_c_context * context, const nix_value * value, nix_get_string_
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nString);
+        assert(v.isString());
         call_nix_get_string_callback(v.c_str(), callback, user_data);
     }
     NIXC_CATCH_ERRS
@@ -250,7 +250,7 @@ const char * nix_get_path_string(nix_c_context * context, const nix_value * valu
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nPath);
+        assert(v.isPath());
         // NOTE (from @yorickvP)
         // v._path.path should work but may not be how Eelco intended it.
         // Long-term this function should be rewritten to copy some data into a
@@ -258,7 +258,7 @@ const char * nix_get_path_string(nix_c_context * context, const nix_value * valu
         // We could use v.path().to_string().c_str(), but I'm concerned this
         // crashes. Looks like .path() allocates a CanonPath with a copy of the
         // string, then it gets the underlying data from that.
-        return v.payload.path.path;
+        return v.pathString();
     }
     NIXC_CATCH_ERRS_NULL
 }
@@ -269,7 +269,7 @@ unsigned int nix_get_list_size(nix_c_context * context, const nix_value * value)
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nList);
+        assert(v.isList());
         return v.listSize();
     }
     NIXC_CATCH_ERRS_RES(0);
@@ -281,7 +281,7 @@ unsigned int nix_get_attrs_size(nix_c_context * context, const nix_value * value
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nAttrs);
+        assert(v.isAttrs());
         return v.attrs()->size();
     }
     NIXC_CATCH_ERRS_RES(0);
@@ -293,7 +293,7 @@ double nix_get_float(nix_c_context * context, const nix_value * value)
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nFloat);
+        assert(v.isFloat());
         return v.fpoint();
     }
     NIXC_CATCH_ERRS_RES(0.0);
@@ -305,7 +305,7 @@ int64_t nix_get_int(nix_c_context * context, const nix_value * value)
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nInt);
+        assert(v.isInt());
         return v.integer();
     }
     NIXC_CATCH_ERRS_RES(0);
@@ -317,7 +317,7 @@ ExternalValue * nix_get_external(nix_c_context * context, nix_value * value)
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_out(value);
-        assert(v.type() == nix::nExternal);
+        assert(v.isExternal());
         return (ExternalValue *) v.external();
     }
     NIXC_CATCH_ERRS_NULL;
@@ -329,7 +329,7 @@ nix_value * nix_get_list_byidx(nix_c_context * context, const nix_value * value,
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nList);
+        assert(v.isList());
         auto * p = v.listElems()[ix];
         nix_gc_incref(nullptr, p);
         if (p != nullptr)
@@ -345,7 +345,7 @@ nix_value * nix_get_attr_byname(nix_c_context * context, const nix_value * value
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nAttrs);
+        assert(v.isAttrs());
         nix::Symbol s = state->state.symbols.create(name);
         auto attr = v.attrs()->get(s);
         if (attr) {
@@ -365,7 +365,7 @@ bool nix_has_attr_byname(nix_c_context * context, const nix_value * value, EvalS
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nAttrs);
+        assert(v.isAttrs());
         nix::Symbol s = state->state.symbols.create(name);
         auto attr = v.attrs()->get(s);
         if (attr)

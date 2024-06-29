@@ -52,66 +52,66 @@ namespace nix {
     }
 
     MATCHER(IsList, "") {
-        return arg.type() == nList;
+        return arg.isList();
     }
 
     MATCHER(IsString, "") {
-        return arg.type() == nString;
+        return arg.isString();
     }
 
     MATCHER(IsNull, "") {
-        return arg.type() == nNull;
+        return arg.isNull();
     }
 
     MATCHER(IsThunk, "") {
-        return arg.type() == nThunk;
+        return arg.isThunk();
     }
 
     MATCHER(IsAttrs, "") {
-        return arg.type() == nAttrs;
+        return arg.isAttrs();
     }
 
     MATCHER_P(IsStringEq, s, fmt("The string is equal to \"%1%\"", s)) {
-        if (arg.type() != nString) {
+        if (!arg.isString()) {
             return false;
         }
         return std::string_view(arg.c_str()) == s;
     }
 
     MATCHER_P(IsIntEq, v, fmt("The string is equal to \"%1%\"", v)) {
-        if (arg.type() != nInt) {
+        if (!arg.isInt()) {
             return false;
         }
         return arg.integer() == v;
     }
 
     MATCHER_P(IsFloatEq, v, fmt("The float is equal to \"%1%\"", v)) {
-        if (arg.type() != nFloat) {
+        if (!arg.isFloat()) {
             return false;
         }
         return arg.fpoint() == v;
     }
 
     MATCHER(IsTrue, "") {
-        if (arg.type() != nBool) {
+        if (!arg.isBool()) {
             return false;
         }
         return arg.boolean() == true;
     }
 
     MATCHER(IsFalse, "") {
-        if (arg.type() != nBool) {
+        if (!arg.isBool()) {
             return false;
         }
         return arg.boolean() == false;
     }
 
     MATCHER_P(IsPathEq, p, fmt("Is a path equal to \"%1%\"", p)) {
-        if (arg.type() != nPath) {
+        if (!arg.isPath()) {
             *result_listener << "Expected a path got " << arg.type();
             return false;
         } else {
-            auto path = arg.path();
+            auto path = arg.getSourcePath();
             if (path.path != CanonPath(p)) {
                 *result_listener << "Expected a path that equals \"" << p << "\" but got: " << path.path;
                 return false;
@@ -122,7 +122,7 @@ namespace nix {
 
 
     MATCHER_P(IsListOfSize, n, fmt("Is a list of size [%1%]", n)) {
-        if (arg.type() != nList) {
+        if (!arg.isList()) {
             *result_listener << "Expected list got " << arg.type();
             return false;
         } else if (arg.listSize() != (size_t)n) {
@@ -133,7 +133,7 @@ namespace nix {
     }
 
     MATCHER_P(IsAttrsOfSize, n, fmt("Is a set of size [%1%]", n)) {
-        if (arg.type() != nAttrs) {
+        if (!arg.isAttrs()) {
             *result_listener << "Expected set got " << arg.type();
             return false;
         } else if (arg.attrs()->size() != (size_t) n) {

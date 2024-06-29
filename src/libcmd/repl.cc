@@ -492,12 +492,12 @@ ProcessLineResult NixRepl::processLine(std::string line)
         evalString(arg, v);
 
         const auto [path, line] = [&] () -> std::pair<SourcePath, uint32_t> {
-            if (v.type() == nPath || v.type() == nString) {
+            if (v.isPath() || v.isString()) {
                 NixStringContext context;
                 auto path = state->coerceToPath(noPos, v, context, "while evaluating the filename to edit");
                 return {path, 0};
             } else if (v.isLambda()) {
-                auto pos = state->positions[v.payload.lambda.fun->pos];
+                auto pos = state->positions[v.lambdaFun()->pos];
                 if (auto path = std::get_if<SourcePath>(&pos.origin))
                     return {*path, pos.line};
                 else
@@ -601,7 +601,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
     else if (command == ":p" || command == ":print") {
         Value v;
         evalString(arg, v);
-        if (v.type() == nString) {
+        if (v.isString()) {
             std::cout << v.string_view();
         } else {
             printValue(std::cout, v);
@@ -662,7 +662,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
         {
             Expr * e = parseString(line.substr(p + 1));
             Value & v(*state->allocValue());
-            v.mkThunk(env, e);
+            v.mkClosure(env, e);
             addVarToScope(state->symbols.create(name), v);
         } else {
             Value v;

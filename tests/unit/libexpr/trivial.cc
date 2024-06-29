@@ -154,7 +154,7 @@ namespace nix {
         auto a = v.attrs()->find(createSymbol("a"));
         ASSERT_NE(a, nullptr);
 
-        ASSERT_THAT(*a->value, IsThunk());
+        ASSERT_THAT(*a->value, isClosure());
         state.forceValue(*a->value, noPos);
 
         ASSERT_THAT(*a->value, IsAttrsOfSize(2));

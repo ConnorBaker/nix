@@ -337,7 +337,7 @@ std::ostream & showErrorInfo(std::ostream & out, const ErrorInfo & einfo, bool s
      *  {
      *      try {
      *          e->eval(*this, env, v);
-     *          if (v.type() != nAttrs)
+     *          if (!v.isAttrs())
      *              error<TypeError>("expected a set but found %1%", v);
      *      } catch (Error & e) {
      *          e.addTrace(pos, errorCtx);
@@ -351,7 +351,7 @@ std::ostream & showErrorInfo(std::ostream & out, const ErrorInfo & einfo, bool s
      *  {
      *      e->eval(*this, env, v);
      *      try {
-     *          if (v.type() != nAttrs)
+     *          if (!v.isAttrs())
      *              error<TypeError>("expected a set but found %1%", v);
      *      } catch (Error & e) {
      *          e.addTrace(pos, errorCtx);

@@ -3,7 +3,12 @@
 
 #include <cassert>
 #include <climits>
+#include <new>
+#include <ostream>
 #include <span>
+#include <stdexcept>
+#include <string>
+#include <variant>
 
 #include "symbol-table.hh"
 #include "value/context.hh"
@@ -38,26 +43,6 @@ inline void * allocAligned(size_t numElems, size_t elemSize)
 struct Value;
 class BindingsBuilder;
 
-
-typedef enum {
-    tUninitialized = 0,
-    tInt = 1,
-    tBool,
-    tString,
-    tPath,
-    tNull,
-    tAttrs,
-    tList1,
-    tList2,
-    tListN,
-    tThunk,
-    tApp,
-    tLambda,
-    tPrimOp,
-    tPrimOpApp,
-    tExternal,
-    tFloat
-} InternalType;
 
 /**
  * This type abstracts over all actual value types in the language,
@@ -94,6 +79,8 @@ class Printer;
 
 typedef int64_t NixInt;
 typedef double NixFloat;
+
+extern ExprBlackHole eBlackHole;
 
 /**
  * External values must descend from ExternalValueBase, so that
@@ -168,9 +155,7 @@ public:
     { }
 
     Value * & operator [](size_t n)
-    {
-        return elems[n];
-    }
+    { return elems[n]; }
 
     typedef Value * * iterator;
 
@@ -180,32 +165,9 @@ public:
     friend struct Value;
 };
 
-
 struct alignas(32) Value
 {
 private:
-    InternalType internalType = tUninitialized;
-
-    friend std::string showType(const Value & v);
-
-public:
-
-    void print(EvalState &state, std::ostream &str, PrintOptions options = PrintOptions {});
-
-    // Functions needed to distinguish the type
-    // These should be removed eventually, by putting the functionality that's
-    // needed by callers into methods of this type
-
-    // type() == nThunk
-    inline bool isThunk() const { return internalType == tThunk; };
-    inline bool isApp() const { return internalType == tApp; };
-    inline bool isBlackhole() const;
-
-    // type() == nFunction
-    inline bool isLambda() const { return internalType == tLambda; };
-    inline bool isPrimOp() const { return internalType == tPrimOp; };
-    inline bool isPrimOpApp() const { return internalType == tPrimOpApp; };
-
     /**
      * Strings in the evaluator carry a so-called `context` which
      * is a list of strings representing store paths.  This is to
@@ -238,45 +200,75 @@ public:
         const char * path;
     };
 
+    struct Null {};
+
     struct ClosureThunk {
         Env * env;
         Expr * expr;
     };
 
-    struct FunctionApplicationThunk {
-        Value * left, * right;
-    };
+    struct FuncAppThunk 
+    { Value * left, * right; };
+
+    struct FuncPrimOpAppThunk
+    { Value * left, * right; };
 
     struct Lambda {
         Env * env;
         ExprLambda * fun;
     };
 
-    using Payload = union
-    {
-        NixInt integer;
-        bool boolean;
+    struct SmallList1
+    { Value * elems[1]; };
 
-        StringWithContext string;
+    struct SmallList2
+    { Value * elems[2]; };
 
-        Path path;
-
-        Bindings * attrs;
-        struct {
-            size_t size;
-            Value * const * elems;
-        } bigList;
-        Value * smallList[2];
-        ClosureThunk thunk;
-        FunctionApplicationThunk app;
-        Lambda lambda;
-        PrimOp * primOp;
-        FunctionApplicationThunk primOpApp;
-        ExternalValueBase * external;
-        NixFloat fpoint;
+    struct BigList {
+        size_t size;
+        Value * const * elems;
     };
 
+    using Payload = std::variant<
+        std::monostate,                    // tUninitialized
+        NixInt,                            // tInt
+        bool,                              // tBool
+        StringWithContext,                 // tString
+        Path,                              // tPath
+        Null,                              // tNull
+        Bindings *,                        // tAttrs
+        SmallList1,                        // tList1,
+        SmallList2,                        // tList2,
+        BigList,                           // tListN
+        ClosureThunk,                      // tThunk
+        FuncAppThunk,                      // tApp
+        Lambda,                            // tLambda
+        PrimOp *,                          // tPrimOp
+        FuncPrimOpAppThunk,                // tPrimOpApp
+        ExternalValueBase *,               // tExternal
+        NixFloat                           // tFloat
+    >;
     Payload payload;
+
+    friend std::string showType(const Value & v);
+
+public:
+    /**
+     * A value becomes valid when it is initialized. We don't use this
+     * in the evaluator; only in the bindings, where the slight extra
+     * cost is warranted because of inexperienced callers.
+     */
+    /* inline */ bool isValid() const
+    { return !std::holds_alternative<std::monostate>(payload); }
+
+    /**
+     * Check whether forcing this value requires a trivial amount of
+     * computation. In particular, function applications are
+     * non-trivial.
+     */
+    // Defined in eval.hh
+    /* inline */ bool isTrivial() const;
+
 
     /**
      * Returns the normal type of a Value. This only returns nThunk if
@@ -285,230 +277,438 @@ public:
      * @param invalidIsThunk Instead of aborting an an invalid (probably
      * 0, so uninitialized) internal type, return `nThunk`.
      */
-    inline ValueType type(bool invalidIsThunk = false) const
+    /* inline */ ValueType type(bool invalidIsThunk = false) const
     {
-        switch (internalType) {
-            case tUninitialized: break;
-            case tInt: return nInt;
-            case tBool: return nBool;
-            case tString: return nString;
-            case tPath: return nPath;
-            case tNull: return nNull;
-            case tAttrs: return nAttrs;
-            case tList1: case tList2: case tListN: return nList;
-            case tLambda: case tPrimOp: case tPrimOpApp: return nFunction;
-            case tExternal: return nExternal;
-            case tFloat: return nFloat;
-            case tThunk: case tApp: return nThunk;
-        }
-        if (invalidIsThunk)
+        if (isNull()) {
+            return nNull;
+        } else if (isBool()) {
+            return nBool;
+        } else if (isInt()) {
+            return nInt;
+        } else if (isFloat()) {
+            return nFloat;
+        } else if (isString()) {
+            return nString;
+        } else if (isPath()) {
+            return nPath;
+        } else if (isList()) {
+            return nList;
+        } else if (isAttrs()) {
+            return nAttrs;
+        } else if (isFunction()) {
+            return nFunction;
+        } else if (isThunk(invalidIsThunk)) {
             return nThunk;
-        else
+        } else if (isExternal()) {
+            return nExternal;
+        } else {
             abort();
+        }
     }
 
-    inline void finishValue(InternalType newType, Payload newPayload)
+
+    // Methods for nulls
+    /* inline */ bool isNull() const
+    { return std::holds_alternative<Null>(payload); }
+
+    /* inline */ void mkNull()
+    { payload.emplace<Null>(Null{}); }
+
+
+    // Methods for boolean values
+    /* inline */ bool isBool() const
+    { return std::holds_alternative<bool>(payload); }
+
+    /* inline */ void mkBool(bool b)
+    { payload.emplace<bool>(b); }
+
+    /* inline */ bool boolean() const
+    { return std::get<bool>(payload); }
+
+
+    // Methods for integers
+    /* inline */ bool isInt() const
+    { return std::holds_alternative<NixInt>(payload); }
+
+    /* inline */ void mkInt(NixInt n)
+    { payload.emplace<NixInt>(n); }
+
+    /* inline */ NixInt integer() const
+    { return std::get<NixInt>(payload); }
+
+
+    // Methods for floats
+    /* inline */ bool isFloat() const
+    { return std::holds_alternative<NixFloat>(payload); };
+
+    /* inline */ void mkFloat(NixFloat n)
+    { payload.emplace<NixFloat>(n); }
+
+    /* inline */ NixFloat fpoint() const
+    { return std::get<NixFloat>(payload); }
+
+
+    // Methods for strings
+    /* inline */ bool isString() const
+    { return std::holds_alternative<StringWithContext>(payload); }
+
+    /* inline */ bool isStringWithContext() const
+    { return isString() && (context() != nullptr); }
+
+    /* inline */ void mkString(const Symbol & s)
+    { mkString(((const std::string &) s).c_str()); }
+
+    /* inline */ void mkString(const char * s, const char * * context = nullptr)
     {
-        payload = newPayload;
-        internalType = newType;
+        assert(s);
+        payload.emplace<StringWithContext>(StringWithContext{ .c_str = s, .context = context });
+        assert(isValid());
     }
 
-    /**
-     * A value becomes valid when it is initialized. We don't use this
-     * in the evaluator; only in the bindings, where the slight extra
-     * cost is warranted because of inexperienced callers.
-     */
-    inline bool isValid() const
+    // Defined in eval.cc
+    /* inline */ void mkString(std::string_view s);
+
+    // Defined in eval.cc
+    /* inline */ void mkString(std::string_view s, const NixStringContext & context);
+
+    // Defined in eval.cc
+    /* inline */ void mkStringMove(const char * s, const NixStringContext & context);
+
+    /* inline */ const char * c_str() const
+    { return std::get<StringWithContext>(payload).c_str; }
+
+    /* inline */ std::string_view string_view() const
+    { return std::string_view(c_str()); }
+
+    /* inline */ const char * * context() const
+    { return std::get<StringWithContext>(payload).context; }
+
+
+    // Methods for paths
+    /* inline */ bool isPath() const
+    { return std::holds_alternative<Path>(payload); }
+
+    /* inline */ void mkPath(const SourcePath & path);
+
+    /* inline */ void mkPath(std::string_view path);
+
+    /* inline */ void mkPath(SourceAccessor * accessor, const char * path)
     {
-        return internalType != tUninitialized;
+        assert(accessor);
+        assert(path);
+        payload.emplace<Path>(Path{ .accessor = accessor, .path = path });
+        assert(isValid());
     }
 
-    inline void mkInt(NixInt n)
+    /* inline */ const char * pathString() const
     {
-        finishValue(tInt, { .integer = n });
+        auto path = std::get<Path>(payload);
+        assert(path.path);
+        return path.path;
     }
 
-    inline void mkBool(bool b)
+    /* inline */ SourceAccessor * pathAccessor() const
     {
-        finishValue(tBool, { .boolean = b });
+        auto path = std::get<Path>(payload);
+        assert(path.accessor);
+        return path.accessor;
     }
 
-    inline void mkString(const char * s, const char * * context = 0)
+    /* inline */ SourcePath getSourcePath() const
     {
-        finishValue(tString, { .string = { .c_str = s, .context = context } });
+        auto nixPath = std::get<Path>(payload);
+        return SourcePath(
+            ref(nixPath.accessor->shared_from_this()),
+            CanonPath(CanonPath::unchecked_t(), nixPath.path));
     }
 
-    void mkString(std::string_view s);
 
-    void mkString(std::string_view s, const NixStringContext & context);
-
-    void mkStringMove(const char * s, const NixStringContext & context);
-
-    inline void mkString(const Symbol & s)
+    // Methods for lists
+    /* inline */ bool isList() const
     {
-        mkString(((const std::string &) s).c_str());
+        return std::holds_alternative<SmallList1>(payload)
+            || std::holds_alternative<SmallList2>(payload)
+            || std::holds_alternative<BigList>(payload);
     }
 
-    void mkPath(const SourcePath & path);
-    void mkPath(std::string_view path);
-
-    inline void mkPath(SourceAccessor * accessor, const char * path)
+    // Non-const version
+    /* inline */ Value * const * listElems() const
     {
-        finishValue(tPath, { .path = { .accessor = accessor, .path = path } });
+         return std::visit([](auto& arg) -> Value * const * {
+            using ArgType = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<ArgType, SmallList1>) {
+                return arg.elems;
+            } else if constexpr (std::is_same_v<ArgType, SmallList2>) {
+                return arg.elems;
+            } else if constexpr (std::is_same_v<ArgType, BigList>) {
+                return arg.elems;
+            } else {
+                abort();
+            }
+        }, payload);
     }
 
-    inline void mkNull()
+    /* inline */ void mkList(const ListBuilder & builder)
     {
-        finishValue(tNull, {});
+        if (builder.size == 1)
+            payload.emplace<SmallList1>(SmallList1{ .elems = { builder.elems[0] } });
+        else if (builder.size == 2)
+            payload.emplace<SmallList2>(SmallList2{ .elems = { builder.elems[0], builder.elems[1] } });
+        else
+            payload.emplace<BigList>(BigList{ .size = builder.size, .elems = builder.elems });
     }
 
-    inline void mkAttrs(Bindings * a)
+    /* inline */ size_t listSize() const
     {
-        finishValue(tAttrs, { .attrs = a });
+        return std::visit([](auto& arg) -> size_t {
+            using ArgType = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<ArgType, SmallList1>) {
+                return 1;
+            } else if constexpr (std::is_same_v<ArgType, SmallList2>) {
+                return 2;
+            } else if constexpr (std::is_same_v<ArgType, BigList>) {
+                return arg.size;
+            } else {
+                abort();
+            }
+        }, payload);
+    }
+
+    /* inline */ std::span<Value * const> listItems() const
+    { return std::span<Value * const>(listElems(), listSize()); }
+
+
+    // Methods for attributes
+    /* inline */ bool isAttrs() const
+    { return std::holds_alternative<Bindings *>(payload); }
+
+    /* inline */ void mkAttrs(Bindings * a)
+    {
+        assert(a);
+        payload.emplace<Bindings *>(a);
+        assert(isValid());
     }
 
     Value & mkAttrs(BindingsBuilder & bindings);
 
-    void mkList(const ListBuilder & builder)
+    /* inline */ Bindings * attrs() const
     {
-        if (builder.size == 1)
-            finishValue(tList1, { .smallList = { builder.inlineElems[0] } });
-        else if (builder.size == 2)
-            finishValue(tList2, { .smallList = { builder.inlineElems[0], builder.inlineElems[1] } });
-        else
-            finishValue(tListN, { .bigList = { .size = builder.size, .elems = builder.elems } });
+        auto attrs = std::get<Bindings *>(payload);
+        assert(attrs);
+        return attrs;
     }
 
-    inline void mkThunk(Env * e, Expr * ex)
+
+    // Methods for lambdas
+    /* inline */ bool isLambda() const
+    { return std::holds_alternative<Lambda>(payload); };
+
+    /* inline */ void mkLambda(Env * e, ExprLambda * f)
     {
-        finishValue(tThunk, { .thunk = { .env = e, .expr = ex } });
+        assert(e);
+        assert(f);
+        payload.emplace<Lambda>(Lambda{ .env = e, .fun = f });
+        assert(isValid());
     }
 
-    inline void mkApp(Value * l, Value * r)
+    /* inline */ Env * lambdaEnv() const
+    { return std::get<Lambda>(payload).env; }
+
+    /* inline */ ExprLambda * lambdaFun() const
+    { return std::get<Lambda>(payload).fun; }
+
+
+    // Methods for primops
+    /* inline */ bool isPrimOp() const
+    { return std::holds_alternative<PrimOp *>(payload); };
+
+    // Defined in eval.hh
+    /* inline */ void mkPrimOp(PrimOp * p);
+
+    /* inline */ const PrimOp * primOp() const
     {
-        finishValue(tApp, { .app = { .left = l, .right = r } });
+        auto primOp = std::get<PrimOp *>(payload);
+        assert(primOp);
+        return primOp;
     }
 
-    inline void mkLambda(Env * e, ExprLambda * f)
-    {
-        finishValue(tLambda, { .lambda = { .env = e, .fun = f } });
+    /**
+     * Get the primitive operation that this value is a part of.
+     */
+    /* inline */ const Value * getPrimOp() const {
+        auto valuePtr = this;
+        std::cerr << "getPrimOp: starting at " << valuePtr;
+        while (valuePtr && valuePtr->isPrimOpApp()) {
+            valuePtr = valuePtr->primOpAppLeft();
+            std::cerr << "getPrimOp: -> " << valuePtr;
+        }
+        assert(valuePtr->isPrimOp());
+        std::cerr << "getPrimOp: finished at " << valuePtr << std::endl;
+        return valuePtr;
     }
 
-    inline void mkBlackhole();
 
-    void mkPrimOp(PrimOp * p);
+    // Methods for primitive operation applications
+    /* inline */ bool isPrimOpApp() const
+    { return std::holds_alternative<FuncPrimOpAppThunk>(payload); };
 
-    inline void mkPrimOpApp(Value * l, Value * r)
+    /* inline */ void mkPrimOpApp(Value * l, Value * r)
     {
-        finishValue(tPrimOpApp, { .primOpApp = { .left = l, .right = r } });
+        assert(l);
+        assert(l->isValid());
+        assert(r);
+        assert(r->isValid());
+        payload.emplace<FuncPrimOpAppThunk>(FuncPrimOpAppThunk{ .left = l, .right = r });
+        assert(isValid());
+    }
+
+    /* inline */ Value * primOpAppLeft() const
+    {
+        auto primOpApp = std::get<FuncPrimOpAppThunk>(payload);
+        assert(primOpApp.left);
+        assert(primOpApp.left->isValid());
+        return primOpApp.left;
+    }
+
+    /* inline */ Value * primOpAppRight() const
+    {
+        auto primOpApp = std::get<FuncPrimOpAppThunk>(payload);
+        assert(primOpApp.right);
+        assert(primOpApp.right->isValid());
+        return primOpApp.right;
     }
 
     /**
      * For a `tPrimOpApp` value, get the original `PrimOp` value.
      */
-    const PrimOp * primOpAppPrimOp() const;
-
-    inline void mkExternal(ExternalValueBase * e)
+    // TODO(@connorbaker): This seems like getPrimOp without the assert and an additional dereference?
+    /* inline */ const PrimOp * primOpAppPrimOp() const
     {
-        finishValue(tExternal, { .external = e });
+        auto valuePtr = this;
+        std::cerr << "primOpAppPrimOp: starting at " << valuePtr;
+        while (valuePtr && valuePtr->isPrimOpApp()) {
+            valuePtr = valuePtr->primOpAppLeft();
+            std::cerr << "primOpAppPrimOp: -> " << valuePtr;
+        }
+
+        if (!valuePtr) {
+            std::cerr << "primOpAppPrimOp: -> nullptr" << std::endl;
+            return nullptr;
+        }
+        auto primOpPtr = valuePtr->primOp();
+        std::cerr << "primOpAppPrimOp: finished at " << primOpPtr << std::endl;
+        return primOpPtr;
+    }
+    // {
+    //     Value * left = primOpAppLeft();
+    //     while (left && !left->isPrimOp()) {
+    //         left = left->primOpAppLeft();
+    //     }
+
+    //     if (!left)
+    //         return nullptr;
+    //     return left->primOp();
+    // }
+
+
+    // Common utility for functions
+    /* inline */ bool isFunction() const
+    { return isLambda() || isPrimOp() || isPrimOpApp(); }
+
+
+    // Methods for closures
+    /* inline */ bool isClosure() const
+    { return std::holds_alternative<ClosureThunk>(payload); };
+
+    /* inline */ void mkClosure(Env * e, Expr * ex)
+    {
+        // assert(e);
+        assert(ex);
+        payload.emplace<ClosureThunk>(ClosureThunk{ .env = e, .expr = ex });
+        assert(isValid());
     }
 
-    inline void mkFloat(NixFloat n)
+    /* inline */ Env * closureEnv() const
     {
-        finishValue(tFloat, { .fpoint = n });
+        auto closure = std::get<ClosureThunk>(payload);
+        assert(closure.env);
+        return closure.env;
     }
 
-    bool isList() const
+    /* inline */ Expr * closureExpr() const
     {
-        return internalType == tList1 || internalType == tList2 || internalType == tListN;
+        auto closure = std::get<ClosureThunk>(payload);
+        assert(closure.expr);
+        return closure.expr;
     }
 
-    Value * const * listElems()
+
+    // Methods for function applications
+    /* inline */ bool isApp() const
+    { return std::holds_alternative<FuncAppThunk>(payload); };
+
+    /* inline */ void mkApp(Value * l, Value * r)
     {
-        return internalType == tList1 || internalType == tList2 ? payload.smallList : payload.bigList.elems;
+        assert(l);
+        assert(l->isValid());
+        assert(r);
+        assert(r->isValid());
+        payload.emplace<FuncAppThunk>(FuncAppThunk{ .left = l, .right = r });
+        assert(isValid());
     }
 
-    std::span<Value * const> listItems() const
+    /* inline */ Value * appLeft() const
     {
-        assert(isList());
-        return std::span<Value * const>(listElems(), listSize());
+        auto app = std::get<FuncAppThunk>(payload);
+        assert(app.left);
+        assert(app.left->isValid());
+        return app.left;
     }
 
-    Value * const * listElems() const
+    /* inline */ Value * appRight() const
     {
-        return internalType == tList1 || internalType == tList2 ? payload.smallList : payload.bigList.elems;
+        auto app = std::get<FuncAppThunk>(payload);
+        assert(app.right);
+        assert(app.right->isValid());
+        return app.right;
     }
 
-    size_t listSize() const
+
+    // Common utility for thunks
+    /* inline */ bool isThunk(bool invalidIsThunk = false) const
+    { return isClosure() || isApp() || (invalidIsThunk && !isValid()); }
+
+
+    // Methods for external values
+    /* inline */ bool isExternal() const
+    { return std::holds_alternative<ExternalValueBase *>(payload); };
+
+    /* inline */ void mkExternal(ExternalValueBase * e)
+    { payload.emplace<ExternalValueBase *>(e); }
+
+    /* inline */ ExternalValueBase * external() const
+    { return std::get<ExternalValueBase *>(payload); }
+
+    /* inline */ bool isBlackhole() const
     {
-        return internalType == tList1 ? 1 : internalType == tList2 ? 2 : payload.bigList.size;
+        auto maybeThunk = std::get_if<ClosureThunk>(&payload);
+        return maybeThunk && maybeThunk->expr == (Expr*) &eBlackHole;
     }
 
-    PosIdx determinePos(const PosIdx pos) const;
+    /* inline */ void mkBlackhole()
+    { mkClosure(nullptr, (Expr *) &eBlackHole); }
 
-    /**
-     * Check whether forcing this value requires a trivial amount of
-     * computation. In particular, function applications are
-     * non-trivial.
-     */
-    bool isTrivial() const;
 
-    SourcePath path() const
-    {
-        assert(internalType == tPath);
-        return SourcePath(
-            ref(payload.path.accessor->shared_from_this()),
-            CanonPath(CanonPath::unchecked_t(), payload.path.path));
-    }
+    
 
-    std::string_view string_view() const
-    {
-        assert(internalType == tString);
-        return std::string_view(payload.string.c_str);
-    }
 
-    const char * c_str() const
-    {
-        assert(internalType == tString);
-        return payload.string.c_str;
-    }
+    // Utility methods
+    // Defined in eval.hh
+    /* inline */ PosIdx determinePos(const PosIdx pos) const;
 
-    const char * * context() const
-    {
-        return payload.string.context;
-    }
-
-    ExternalValueBase * external() const
-    { return payload.external; }
-
-    const Bindings * attrs() const
-    { return payload.attrs; }
-
-    const PrimOp * primOp() const
-    { return payload.primOp; }
-
-    bool boolean() const
-    { return payload.boolean; }
-
-    NixInt integer() const
-    { return payload.integer; }
-
-    NixFloat fpoint() const
-    { return payload.fpoint; }
+    // Defined in eval.cc
+    void print(EvalState &state, std::ostream &str, PrintOptions options = PrintOptions {});
 };
-
-
-extern ExprBlackHole eBlackHole;
-
-bool Value::isBlackhole() const
-{
-    return internalType == tThunk && payload.thunk.expr == (Expr*) &eBlackHole;
-}
-
-void Value::mkBlackhole()
-{
-    mkThunk(nullptr, (Expr *) &eBlackHole);
-}
 
 
 #if HAVE_BOEHMGC

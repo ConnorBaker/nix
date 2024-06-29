@@ -1232,36 +1232,36 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
                                 "derivation '%s' has invalid meta attribute '%s'",
                                 i.queryName(), j);
                         else {
-                            if (v->type() == nString) {
+                            if (v->isString()) {
                                 attrs2["type"] = "string";
                                 attrs2["value"] = v->c_str();
                                 xml.writeEmptyElement("meta", attrs2);
-                            } else if (v->type() == nInt) {
+                            } else if (v->isInt()) {
                                 attrs2["type"] = "int";
                                 attrs2["value"] = fmt("%1%", v->integer());
                                 xml.writeEmptyElement("meta", attrs2);
-                            } else if (v->type() == nFloat) {
+                            } else if (v->isFloat()) {
                                 attrs2["type"] = "float";
                                 attrs2["value"] = fmt("%1%", v->fpoint());
                                 xml.writeEmptyElement("meta", attrs2);
-                            } else if (v->type() == nBool) {
+                            } else if (v->isBool()) {
                                 attrs2["type"] = "bool";
                                 attrs2["value"] = v->boolean() ? "true" : "false";
                                 xml.writeEmptyElement("meta", attrs2);
-                            } else if (v->type() == nList) {
+                            } else if (v->isList()) {
                                 attrs2["type"] = "strings";
                                 XMLOpenElement m(xml, "meta", attrs2);
                                 for (auto elem : v->listItems()) {
-                                    if (elem->type() != nString) continue;
+                                    if (!elem->isString()) continue;
                                     XMLAttrs attrs3;
                                     attrs3["value"] = elem->c_str();
                                     xml.writeEmptyElement("string", attrs3);
                                 }
-                            } else if (v->type() == nAttrs) {
+                            } else if (v->isAttrs()) {
                                 attrs2["type"] = "strings";
                                 XMLOpenElement m(xml, "meta", attrs2);
                                 for (auto & i : *v->attrs()) {
-                                    if (i.value->type() != nString) continue;
+                                    if (!i.value->isString()) continue;
                                     XMLAttrs attrs3;
                                     attrs3["type"] = globals.state->symbols[i.name];
                                     attrs3["value"] = i.value->c_str();
