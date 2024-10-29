@@ -16,6 +16,7 @@
 , flex
 , git
 , gtest
+, immer
 , jq
 , libarchive
 , libcpuid
@@ -243,6 +244,7 @@ in {
 
   propagatedBuildInputs = lib.optionals doBuild ([
     boost
+    immer
     nlohmann_json
   ] ++ lib.optional enableGC boehmgc
   );

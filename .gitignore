@@ -158,6 +158,8 @@ result-*
 # IDE
 .vscode/
 .idea/
+.direnv/
+.envrc
 
 .pre-commit-config.yaml
 

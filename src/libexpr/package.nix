@@ -4,6 +4,7 @@
 
 , bison
 , flex
+, immer
 , cmake # for resolving toml11 dep
 
 , nix-util
@@ -72,6 +73,7 @@ mkMesonLibrary (finalAttrs: {
     nix-store
     nix-fetchers
     boost
+    immer
     nlohmann_json
   ] ++ lib.optional enableGC boehmgc;
 
