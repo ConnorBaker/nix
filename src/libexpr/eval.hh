@@ -698,7 +698,7 @@ public:
     /**
      * Allocation primitives.
      */
-    inline Value::List * allocList();
+    inline ValueList * allocList();
     inline Value * allocValue();
     inline Env & allocEnv(size_t size);
 
@@ -760,7 +760,7 @@ public:
         const SingleDerivedPath & p,
         Value & v);
 
-    void concatLists(Value & v, const Value::List lists, const PosIdx pos, std::string_view errorCtx);
+    void concatLists(Value & v, const ValueList lists, const PosIdx pos, std::string_view errorCtx);
 
     /**
      * Print statistics, if enabled.
