@@ -31,6 +31,7 @@
 , openssh
 , openssl
 , pkg-config
+, range-v3
 , rapidcheck
 , sqlite
 , toml11
@@ -246,6 +247,7 @@ in {
     boost
     immer
     nlohmann_json
+    range-v3
   ] ++ lib.optional enableGC boehmgc
   );
 

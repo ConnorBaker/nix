@@ -13,6 +13,7 @@
 , boost
 , boehmgc
 , nlohmann_json
+, range-v3
 , toml11
 
 # Configuration Options
@@ -75,6 +76,7 @@ mkMesonLibrary (finalAttrs: {
     boost
     immer
     nlohmann_json
+    range-v3
   ] ++ lib.optional enableGC boehmgc;
 
   preConfigure =
