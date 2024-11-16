@@ -1,10 +1,13 @@
 // FIXME: integrate this with nix path-info?
 // FIXME: rename to 'nix store derivation show' or 'nix debug derivation show'?
 
+#include "attr-path.hh"
 #include "command.hh"
-#include "common-args.hh"
+#include "eval-error.hh"
+#include "installables.hh"
+#include "logging.hh"
+#include "path.hh"
 #include "store-api.hh"
-#include "archive.hh"
 #include "derivations.hh"
 #include <nlohmann/json.hpp>
 
@@ -41,7 +44,28 @@ struct CmdShowDerivation : InstallablesCommand
 
     void run(ref<Store> store, Installables && installables) override
     {
-        auto drvPaths = Installable::toDerivations(store, installables, true);
+        auto drvPaths = StorePathSet();
+        auto jsonRoot = json::object();
+        size_t numErrors = 0;
+
+        // This loop takes the longest time relative to the others.
+        // TODO:
+        // error: attribute 'http_parser' in selection path 'legacyPackages.x86_64-linux.rubyPackages.http_parser.rb' not found
+        for (const auto & installable : installables) {
+            try {
+                drvPaths.merge(Installable::toDerivations(store, {installable}, true));
+            } 
+            // Really should only catch EvalError and AttrPathNotFound.
+            catch (Error & e) {
+                e.addTrace(nullptr, "while evaluating the installable '%s'", installable->what());
+                if (settings.keepGoing) {
+                    ignoreExceptionExceptInterrupt();
+                    numErrors++;
+                } else {
+                    throw;
+                }
+            }
+        }
 
         if (recursive) {
             StorePathSet closure;
@@ -49,15 +73,20 @@ struct CmdShowDerivation : InstallablesCommand
             drvPaths = std::move(closure);
         }
 
-        json jsonRoot = json::object();
-
-        for (auto & drvPath : drvPaths) {
-            if (!drvPath.isDerivation()) continue;
+        for (const auto & drvPath : drvPaths) {
+            if (!drvPath.isDerivation()) {
+                continue;
+            }
 
             jsonRoot[store->printStorePath(drvPath)] =
                 store->readDerivation(drvPath).toJSON(*store);
         }
-        logger->cout(jsonRoot.dump(2));
+
+        logger->cout(jsonRoot.dump());
+
+        if (numErrors > 0) {
+            throw Error("some errors (%s) were encountered during the evaluation", numErrors);
+        }
     }
 };
 
