@@ -231,10 +231,12 @@ foreach suite : suites
       env : {
         '_NIX_TEST_SOURCE_DIR': meson.current_source_dir(),
         '_NIX_TEST_BUILD_DIR': meson.current_build_dir(),
+        'MALLOC_PERTURB_': '0',
         'TEST_NAME': suite_name / name,
         'NIX_REMOTE': '',
         'PS4': '+(${BASH_SOURCE[0]-$0}:$LINENO) ',
       },
+      is_parallel : false,
       # Some tests take 15+ seconds even on an otherwise idle machine;
       # on a loaded machine this can easily drive them to failure. Give
       # them more time than the default of 30 seconds.
