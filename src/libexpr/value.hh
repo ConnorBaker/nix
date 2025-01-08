@@ -168,26 +168,6 @@ struct Value
 private:
     InternalType internalType = tUninitialized;
 
-    friend std::string showType(const Value & v);
-
-public:
-
-    void print(EvalState &state, std::ostream &str, PrintOptions options = PrintOptions {});
-
-    // Functions needed to distinguish the type
-    // These should be removed eventually, by putting the functionality that's
-    // needed by callers into methods of this type
-
-    // type() == nThunk
-    inline bool isThunk() const { return internalType == tThunk; };
-    inline bool isApp() const { return internalType == tApp; };
-    inline bool isBlackhole() const;
-
-    // type() == nFunction
-    inline bool isLambda() const { return internalType == tLambda; };
-    inline bool isPrimOp() const { return internalType == tPrimOp; };
-    inline bool isPrimOpApp() const { return internalType == tPrimOpApp; };
-
     /**
      * Strings in the evaluator carry a so-called `context` which
      * is a list of strings representing store paths.  This is to
@@ -259,6 +239,31 @@ public:
     };
 
     Payload payload;
+
+    friend std::string showType(const Value & v);
+
+    // TODO(@connorbaker): This should not exist.
+    friend EvalState;
+    Bindings * mutableAttrs() const
+    { return payload.attrs; }
+
+public:
+
+    void print(EvalState &state, std::ostream &str, PrintOptions options = PrintOptions {});
+
+    // Functions needed to distinguish the type
+    // These should be removed eventually, by putting the functionality that's
+    // needed by callers into methods of this type
+
+    // type() == nThunk
+    inline bool isThunk() const { return internalType == tThunk; };
+    inline bool isApp() const { return internalType == tApp; };
+    inline bool isBlackhole() const;
+
+    // type() == nFunction
+    inline bool isLambda() const { return internalType == tLambda; };
+    inline bool isPrimOp() const { return internalType == tPrimOp; };
+    inline bool isPrimOpApp() const { return internalType == tPrimOpApp; };
 
     /**
      * Returns the normal type of a Value. This only returns nThunk if
@@ -440,7 +445,13 @@ public:
      */
     bool isTrivial() const;
 
-    SourcePath path() const
+    Path path() const
+    {
+        assert(internalType == tPath);
+        return payload.path;
+    }
+
+    SourcePath sourcePath() const
     {
         assert(internalType == tPath);
         return SourcePath(
@@ -482,6 +493,26 @@ public:
 
     NixFloat fpoint() const
     { return payload.fpoint; }
+
+    FunctionApplicationThunk app() const {
+        assert(internalType == tApp);
+        return payload.app;
+    }
+
+    ClosureThunk thunk() const {
+        assert(internalType == tThunk);
+        return payload.thunk;
+    }
+
+    Lambda lambda() const {
+        assert(internalType == tLambda);
+        return payload.lambda;
+    }
+
+    FunctionApplicationThunk primOpApp() const {
+        assert(internalType == tPrimOpApp);
+        return payload.primOpApp;
+    }
 };
 
 
