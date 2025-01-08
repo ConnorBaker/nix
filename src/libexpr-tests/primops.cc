@@ -641,8 +641,8 @@ namespace nix {
         auto v = eval("derivation");
         ASSERT_EQ(v.type(), nFunction);
         ASSERT_TRUE(v.isLambda());
-        ASSERT_NE(v.lambda().fun, nullptr);
-        ASSERT_TRUE(v.lambda().fun->hasFormals());
+        ASSERT_NE(v.lambda().getFun(), nullptr);
+        ASSERT_TRUE(v.lambda().getFun()->hasFormals());
     }
 
     TEST_F(PrimOpTest, currentTime) {

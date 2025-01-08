@@ -86,9 +86,9 @@ Env & EvalState::allocEnv(size_t size)
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
     if (v.isThunk()) {
-        Env * env = v.thunk().env;
+        Env * env = v.thunk().getEnv();
         assert(env || v.isBlackhole());
-        Expr * expr = v.thunk().expr;
+        Expr * expr = v.thunk().getExpr();
         try {
             v.mkBlackhole();
             //checkInterrupt();
@@ -103,7 +103,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         }
     }
     else if (v.isApp())
-        callFunction(*v.app().left, *v.app().right, v, pos);
+        callFunction(*v.app().getLeft(), *v.app().getRight(), v, pos);
 }
 
 
