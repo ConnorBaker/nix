@@ -453,13 +453,13 @@ private:
 
         if (v.isLambda()) {
             output << "lambda";
-            if (v.lambda().fun) {
-                if (v.lambda().fun->name) {
-                    output << " " << state.symbols[v.lambda().fun->name];
+            if (v.lambda().getFun()) {
+                if (v.lambda().getFun()->name) {
+                    output << " " << state.symbols[v.lambda().getFun()->name];
                 }
 
                 std::ostringstream s;
-                s << state.positions[v.lambda().fun->pos];
+                s << state.positions[v.lambda().getFun()->pos];
                 output << " @ " << filterANSIEscapes(toView(s));
             }
         } else if (v.isPrimOp()) {

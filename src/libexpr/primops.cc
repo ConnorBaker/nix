@@ -635,7 +635,7 @@ struct CompareValues
                     // Note: we don't take the accessor into account
                     // since it's not obvious how to compare them in a
                     // reproducible way.
-                    return strcmp(v1->path().path, v2->path().path) < 0;
+                    return strcmp(v1->path().getPath(), v2->path().getPath()) < 0;
                 case nList:
                     // Lexicographic comparison
                     for (size_t i = 0;; i++) {
@@ -3087,13 +3087,13 @@ static void prim_functionArgs(EvalState & state, const PosIdx pos, Value * * arg
     if (!args[0]->isLambda())
         state.error<TypeError>("'functionArgs' requires a function").atPos(pos).debugThrow();
 
-    if (!args[0]->lambda().fun->hasFormals()) {
+    if (!args[0]->lambda().getFun()->hasFormals()) {
         v.mkAttrs(&state.emptyBindings);
         return;
     }
 
-    auto attrs = state.buildBindings(args[0]->lambda().fun->formals->formals.size());
-    for (auto & i : args[0]->lambda().fun->formals->formals)
+    auto attrs = state.buildBindings(args[0]->lambda().getFun()->formals->formals.size());
+    for (auto & i : args[0]->lambda().getFun()->formals->formals)
         attrs.insert(i.name, state.getBool(i.def), i.pos);
     v.mkAttrs(attrs);
 }
@@ -4935,7 +4935,7 @@ void EvalState::createBaseEnv()
 
     /* Now that we've added all primops, sort the `builtins' set,
        because attribute lookups expect it to be sorted. */
-    getBuiltins().payload.attrs->sort();
+    getBuiltins().mutableAttrs()->sort();
 
     staticBaseEnv->sort();
 

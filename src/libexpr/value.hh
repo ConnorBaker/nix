@@ -1,10 +1,14 @@
 #pragma once
 ///@file
 
+#include <bit>
 #include <cassert>
+#include <cstdint>
 #include <span>
 
+#include "config-expr.hh"
 #include "eval-gc.hh"
+#include "source-accessor.hh"
 #include "symbol-table.hh"
 #include "value/context.hh"
 #include "source-path.hh"
@@ -18,6 +22,15 @@ namespace nix {
 struct Value;
 class BindingsBuilder;
 
+static constexpr size_t NUM_BYTES_FOR_ADDRESSING = sizeof(uintptr_t);
+static constexpr size_t NUM_BITS_FOR_ADDRESSING = NUM_BYTES_FOR_ADDRESSING * 8;
+
+static_assert(std::endian::native == std::endian::little, "Only little endian supported");
+static_assert(NUM_BITS_FOR_ADDRESSING == 64, "Only 64-bit supported");
+static_assert(HAVE_BOEHMGC == 0, "GC not supported");
+
+static constexpr size_t NUM_BITS_FOR_TYPE_TAG = 4u;
+static constexpr size_t NUM_BITS_SHIFTED_FOR_TYPE_TAG = NUM_BITS_FOR_ADDRESSING - NUM_BITS_FOR_TYPE_TAG;
 
 typedef enum {
     tUninitialized = 0,
@@ -28,7 +41,6 @@ typedef enum {
     tNull,
     tAttrs,
     tList1,
-    tList2,
     tListN,
     tThunk,
     tApp,
@@ -39,24 +51,33 @@ typedef enum {
     tFloat
 } InternalType;
 
+inline uintptr_t setInternalTypeTag(uintptr_t ptrToTag, InternalType tag)
+{
+    return
+        // Shift out the tag bits.
+        ((ptrToTag << NUM_BITS_FOR_TYPE_TAG) >> NUM_BITS_FOR_TYPE_TAG)
+        // Set the tag bits.
+        | (static_cast<uintptr_t>(tag) << NUM_BITS_SHIFTED_FOR_TYPE_TAG);
+}
+
+inline uintptr_t removeInternalTypeTag(uintptr_t taggedPtr)
+{
+    return
+        // Shift out the tag bits, converting to intptr_t to sign-extend when shifting back.
+        static_cast<uintptr_t>(static_cast<intptr_t>(taggedPtr << NUM_BITS_FOR_TYPE_TAG) >> NUM_BITS_FOR_TYPE_TAG);
+}
+
+inline InternalType getInternalTypeTag(uintptr_t taggedPtr)
+{
+    return static_cast<InternalType>(taggedPtr >> NUM_BITS_SHIFTED_FOR_TYPE_TAG);
+}
+
 /**
  * This type abstracts over all actual value types in the language,
  * grouping together implementation details like tList*, different function
  * types, and types in non-normal form (so thunks and co.)
  */
-typedef enum {
-    nThunk,
-    nInt,
-    nFloat,
-    nBool,
-    nString,
-    nPath,
-    nNull,
-    nAttrs,
-    nList,
-    nFunction,
-    nExternal
-} ValueType;
+typedef enum { nThunk, nInt, nFloat, nBool, nString, nPath, nNull, nAttrs, nList, nFunction, nExternal } ValueType;
 
 class Bindings;
 struct Env;
@@ -81,15 +102,15 @@ using NixFloat = double;
  */
 class ExternalValueBase
 {
-    friend std::ostream & operator << (std::ostream & str, const ExternalValueBase & v);
+    friend std::ostream & operator<<(std::ostream & str, const ExternalValueBase & v);
     friend class Printer;
-    protected:
+protected:
     /**
      * Print out the value
      */
     virtual std::ostream & print(std::ostream & str) const = 0;
 
-    public:
+public:
     /**
      * Return a simple string describing the type
      */
@@ -104,69 +125,121 @@ class ExternalValueBase
      * Coerce the value to a string. Defaults to uncoercable, i.e. throws an
      * error.
      */
-    virtual std::string coerceToString(EvalState & state, const PosIdx & pos, NixStringContext & context, bool copyMore, bool copyToStore) const;
+    virtual std::string coerceToString(
+        EvalState & state, const PosIdx & pos, NixStringContext & context, bool copyMore, bool copyToStore) const;
 
     /**
      * Compare to another value of the same type. Defaults to uncomparable,
      * i.e. always false.
      */
-    virtual bool operator ==(const ExternalValueBase & b) const noexcept;
+    virtual bool operator==(const ExternalValueBase & b) const noexcept;
 
     /**
      * Print the value as JSON. Defaults to unconvertable, i.e. throws an error
      */
-    virtual nlohmann::json printValueAsJSON(EvalState & state, bool strict,
-        NixStringContext & context, bool copyToStore = true) const;
+    virtual nlohmann::json
+    printValueAsJSON(EvalState & state, bool strict, NixStringContext & context, bool copyToStore = true) const;
 
     /**
      * Print the value as XML. Defaults to unevaluated
      */
-    virtual void printValueAsXML(EvalState & state, bool strict, bool location,
-        XMLWriter & doc, NixStringContext & context, PathSet & drvsSeen,
+    virtual void printValueAsXML(
+        EvalState & state,
+        bool strict,
+        bool location,
+        XMLWriter & doc,
+        NixStringContext & context,
+        PathSet & drvsSeen,
         const PosIdx pos) const;
 
-    virtual ~ExternalValueBase()
-    {
-    };
+    virtual ~ExternalValueBase() {};
 };
 
-std::ostream & operator << (std::ostream & str, const ExternalValueBase & v);
-
+std::ostream & operator<<(std::ostream & str, const ExternalValueBase & v);
 
 class ListBuilder
 {
     const size_t size;
-    Value * inlineElems[2] = {nullptr, nullptr};
+    Value * inlineSingleton[1] = {nullptr};
 public:
-    Value * * elems;
+    Value ** elems;
     ListBuilder(EvalState & state, size_t size);
 
     // NOTE: Can be noexcept because we are just copying integral values and
     // raw pointers.
     ListBuilder(ListBuilder && x) noexcept
         : size(x.size)
-        , inlineElems{x.inlineElems[0], x.inlineElems[1]}
-        , elems(size <= 2 ? inlineElems : x.elems)
-    { }
+        , inlineSingleton{x.inlineSingleton[0]}
+        , elems(size <= 1 ? inlineSingleton : x.elems)
+    {
+    }
 
-    Value * & operator [](size_t n)
+    Value *& operator[](size_t n)
     {
         return elems[n];
     }
 
-    typedef Value * * iterator;
+    typedef Value ** iterator;
 
-    iterator begin() { return &elems[0]; }
-    iterator end() { return &elems[size]; }
+    iterator begin()
+    {
+        return &elems[0];
+    }
+    iterator end()
+    {
+        return &elems[size];
+    }
 
     friend struct Value;
 };
 
-
-struct Value
+struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) Value
 {
 private:
-    InternalType internalType = tUninitialized;
+    // NOTE: For all of our tagged values, the first value must be the tag.
+    // NOTE: Each tagged value has two, eight-byte fields.
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedBoolean
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t tag;
+        alignas(NUM_BYTES_FOR_ADDRESSING) bool boolean;
+    public:
+        inline bool getBoolean() const
+        {
+            return boolean;
+        }
+    };
+    static_assert(sizeof(TaggedBoolean) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedInteger
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t tag;
+        alignas(NUM_BYTES_FOR_ADDRESSING) NixInt integer;
+    public:
+        inline NixInt getInteger() const
+        {
+            return integer;
+        }
+    };
+    static_assert(sizeof(TaggedInteger) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedFloat
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t tag;
+        alignas(NUM_BYTES_FOR_ADDRESSING) NixFloat fpoint;
+    public:
+        inline NixFloat getFloat() const
+        {
+            return fpoint;
+        }
+    };
+    static_assert(sizeof(TaggedFloat) == NUM_BYTES_FOR_ADDRESSING * 2);
 
     /**
      * Strings in the evaluator carry a so-called `context` which
@@ -190,80 +263,265 @@ private:
 
      * For canonicity, the store paths should be in sorted order.
      */
-    struct StringWithContext {
-        const char * c_str;
-        const char * * context; // must be in sorted order
-    };
-
-    struct Path {
-        SourceAccessor * accessor;
-        const char * path;
-    };
-
-    struct ClosureThunk {
-        Env * env;
-        Expr * expr;
-    };
-
-    struct FunctionApplicationThunk {
-        Value * left, * right;
-    };
-
-    struct Lambda {
-        Env * env;
-        ExprLambda * fun;
-    };
-
-    using Payload = union
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedStringWithContext
     {
-        NixInt integer;
-        bool boolean;
-
-        StringWithContext string;
-
-        Path path;
-
-        Bindings * attrs;
-        struct {
-            size_t size;
-            Value * const * elems;
-        } bigList;
-        Value * smallList[2];
-        ClosureThunk thunk;
-        FunctionApplicationThunk app;
-        Lambda lambda;
-        PrimOp * primOp;
-        FunctionApplicationThunk primOpApp;
-        ExternalValueBase * external;
-        NixFloat fpoint;
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t tagged_c_str; // const char *
+        alignas(NUM_BYTES_FOR_ADDRESSING) const char ** context;  // must be in sorted order
+    public:
+        inline const char * get_c_str() const
+        {
+            return reinterpret_cast<const char *>(removeInternalTypeTag(tagged_c_str));
+        }
+        inline const char ** getContext() const
+        {
+            return context;
+        }
     };
+    static_assert(sizeof(TaggedStringWithContext) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedPath
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t taggedSourceAccessorPtr; // SourceAccessor *
+        alignas(NUM_BYTES_FOR_ADDRESSING) const char * path;
+    public:
+        inline SourceAccessor * getSourceAccessor() const
+        {
+            return reinterpret_cast<SourceAccessor *>(removeInternalTypeTag(taggedSourceAccessorPtr));
+        }
+        inline const char * getPath() const
+        {
+            return path;
+        }
+    };
+    static_assert(sizeof(TaggedPath) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    // TODO(@connorbaker): Stuck with singleton lists instead of two-element lists because there's no way to ensure
+    // the array recieved by the caller has the untagged pointers without:
+    // 1. Duplicating the array
+    // 2. Removing the type tag from the pointers in the array and breaking the struct on subsequent calls
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedSingletonList
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t tag; // Value * const *
+        alignas(NUM_BYTES_FOR_ADDRESSING) Value * singleton[1];
+    public:
+        inline Value * const * getElems() const
+        {
+            return singleton;
+        }
+    };
+    static_assert(sizeof(TaggedSingletonList) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedBigList
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t taggedElems; // Value * const *
+        alignas(NUM_BYTES_FOR_ADDRESSING) size_t size;
+    public:
+        inline Value * const * getElems() const
+        {
+            return reinterpret_cast<Value * const *>(removeInternalTypeTag(taggedElems));
+        }
+        inline size_t getSize() const
+        {
+            return size;
+        }
+    };
+    static_assert(sizeof(TaggedBigList) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedBindings
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t tag;
+        alignas(NUM_BYTES_FOR_ADDRESSING) Bindings * attrs;
+    public:
+        // TODO(@connorbaker): This should never be needed.
+        inline Bindings * getMutableAttrs() const
+        {
+            return attrs;
+        }
+        inline const Bindings * getAttrs() const
+        {
+            return attrs;
+        }
+    };
+    static_assert(sizeof(TaggedBindings) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedClosureThunk
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t taggedEnvPtr; // Env *
+        alignas(NUM_BYTES_FOR_ADDRESSING) Expr * expr;
+    public:
+        inline Env * getEnv() const
+        {
+            return reinterpret_cast<Env *>(removeInternalTypeTag(taggedEnvPtr));
+        }
+        inline Expr * getExpr() const
+        {
+            return expr;
+        }
+    };
+    static_assert(sizeof(TaggedClosureThunk) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedFunctionApplicationThunk
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t taggedLeftValuePtr; // Value *
+        alignas(NUM_BYTES_FOR_ADDRESSING) Value * right;
+    public:
+        inline Value * getLeft() const
+        {
+            return reinterpret_cast<Value *>(removeInternalTypeTag(taggedLeftValuePtr));
+        }
+        inline Value * getRight() const
+        {
+            return right;
+        }
+    };
+    static_assert(sizeof(TaggedFunctionApplicationThunk) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedLambda
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t taggedEnvPtr; // Env *
+        alignas(NUM_BYTES_FOR_ADDRESSING) ExprLambda * fun;
+    public:
+        inline Env * getEnv() const
+        {
+            return reinterpret_cast<Env *>(removeInternalTypeTag(taggedEnvPtr));
+        }
+        inline ExprLambda * getFun() const
+        {
+            return fun;
+        }
+    };
+    static_assert(sizeof(TaggedLambda) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedPrimOp
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t tag;
+        alignas(NUM_BYTES_FOR_ADDRESSING) PrimOp * primOp;
+    public:
+        inline PrimOp * getPrimOp() const
+        {
+            return primOp;
+        }
+    };
+    static_assert(sizeof(TaggedPrimOp) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) TaggedExternalValueBase
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t tag;
+        alignas(NUM_BYTES_FOR_ADDRESSING) ExternalValueBase * external;
+    public:
+        inline ExternalValueBase * getExternal() const
+        {
+            return external;
+        }
+    };
+    static_assert(sizeof(TaggedExternalValueBase) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    struct alignas(NUM_BYTES_FOR_ADDRESSING * 2) _InternalTaggedValue
+    {
+    private:
+        friend struct Value;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t taggedFirst;
+        alignas(NUM_BYTES_FOR_ADDRESSING) uintptr_t second;
+    public:
+        inline uintptr_t getInternalType() const
+        {
+            return getInternalTypeTag(taggedFirst);
+        }
+    };
+    static_assert(sizeof(_InternalTaggedValue) == NUM_BYTES_FOR_ADDRESSING * 2);
+
+    union Payload
+    {
+        // Primitives
+        TaggedBoolean taggedBoolean;
+        TaggedInteger taggedInteger;
+        TaggedFloat taggedFloat;
+
+        TaggedStringWithContext taggedStringWithContext;
+
+        TaggedPath taggedPath;
+
+        // Data structures
+        TaggedSingletonList taggedSingletonList;
+        TaggedBigList taggedBigList;
+        TaggedBindings taggedBindings;
+
+        // Functions, etc.
+        TaggedClosureThunk taggedThunk;
+        TaggedFunctionApplicationThunk taggedApp;
+        TaggedLambda taggedLambda;
+        TaggedPrimOp taggedPrimOp;
+        TaggedFunctionApplicationThunk taggedPrimOpApp;
+        TaggedExternalValueBase taggedExternal;
+
+        // Internal
+        _InternalTaggedValue _internalTaggedValue;
+
+        // Default constructor
+        Payload()
+        {
+            _internalTaggedValue.taggedFirst = setInternalTypeTag(0, tUninitialized);
+            _internalTaggedValue.second = 0;
+        }
+    };
+    static_assert(sizeof(Payload) == NUM_BYTES_FOR_ADDRESSING * 2);
 
     Payload payload;
+
+    inline uintptr_t getInternalType() const
+    {
+        return payload._internalTaggedValue.getInternalType();
+    }
 
     friend std::string showType(const Value & v);
 
     // TODO(@connorbaker): This should not exist.
     friend EvalState;
-    Bindings * mutableAttrs() const
-    { return payload.attrs; }
+    inline Bindings * mutableAttrs() const
+    {
+        assert(getInternalType() == tAttrs);
+        return payload.taggedBindings.getMutableAttrs();
+    }
 
 public:
+    void print(EvalState & state, std::ostream & str, PrintOptions options = PrintOptions{});
 
-    void print(EvalState &state, std::ostream &str, PrintOptions options = PrintOptions {});
+    /**
+     * A value becomes valid when it is initialized. We don't use this
+     * in the evaluator; only in the bindings, where the slight extra
+     * cost is warranted because of inexperienced callers.
+     */
+    inline bool isValid() const
+    {
+        return getInternalType() != tUninitialized;
+    }
 
-    // Functions needed to distinguish the type
-    // These should be removed eventually, by putting the functionality that's
-    // needed by callers into methods of this type
-
-    // type() == nThunk
-    inline bool isThunk() const { return internalType == tThunk; };
-    inline bool isApp() const { return internalType == tApp; };
-    inline bool isBlackhole() const;
-
-    // type() == nFunction
-    inline bool isLambda() const { return internalType == tLambda; };
-    inline bool isPrimOp() const { return internalType == tPrimOp; };
-    inline bool isPrimOpApp() const { return internalType == tPrimOpApp; };
+    /**
+     * Check whether forcing this value requires a trivial amount of
+     * computation. In particular, function applications are
+     * non-trivial.
+     */
+    bool isTrivial() const;
 
     /**
      * Returns the normal type of a Value. This only returns nThunk if
@@ -274,19 +532,35 @@ public:
      */
     inline ValueType type(bool invalidIsThunk = false) const
     {
-        switch (internalType) {
-            case tUninitialized: break;
-            case tInt: return nInt;
-            case tBool: return nBool;
-            case tString: return nString;
-            case tPath: return nPath;
-            case tNull: return nNull;
-            case tAttrs: return nAttrs;
-            case tList1: case tList2: case tListN: return nList;
-            case tLambda: case tPrimOp: case tPrimOpApp: return nFunction;
-            case tExternal: return nExternal;
-            case tFloat: return nFloat;
-            case tThunk: case tApp: return nThunk;
+        switch (getInternalType()) {
+        case tUninitialized:
+            break;
+        case tNull:
+            return nNull;
+        case tBool:
+            return nBool;
+        case tInt:
+            return nInt;
+        case tFloat:
+            return nFloat;
+        case tString:
+            return nString;
+        case tPath:
+            return nPath;
+        case tList1:
+        case tListN:
+            return nList;
+        case tAttrs:
+            return nAttrs;
+        case tThunk:
+        case tApp:
+            return nThunk;
+        case tLambda:
+        case tPrimOp:
+        case tPrimOpApp:
+            return nFunction;
+        case tExternal:
+            return nExternal;
         }
         if (invalidIsThunk)
             return nThunk;
@@ -294,20 +568,52 @@ public:
             unreachable();
     }
 
-    inline void finishValue(InternalType newType, Payload newPayload)
+    // Functions needed to distinguish the type
+    // These should be removed eventually, by putting the functionality that's
+    // needed by callers into methods of this type
+
+    // type() == nList
+    inline bool isList() const
     {
-        payload = newPayload;
-        internalType = newType;
+        return getInternalType() == tList1 || getInternalType() == tListN;
+    };
+
+    // type() == nThunk
+    inline bool isThunk() const
+    {
+        return getInternalType() == tThunk;
+    };
+    inline bool isApp() const
+    {
+        return getInternalType() == tApp;
+    };
+    inline bool isBlackhole() const;
+
+    // type() == nFunction
+    inline bool isLambda() const
+    {
+        return getInternalType() == tLambda;
+    };
+    inline bool isPrimOp() const
+    {
+        return getInternalType() == tPrimOp;
+    };
+    inline bool isPrimOpApp() const
+    {
+        return getInternalType() == tPrimOpApp;
+    };
+
+    inline void mkNull()
+    {
+        payload._internalTaggedValue.taggedFirst = setInternalTypeTag(0, tNull);
     }
 
-    /**
-     * A value becomes valid when it is initialized. We don't use this
-     * in the evaluator; only in the bindings, where the slight extra
-     * cost is warranted because of inexperienced callers.
-     */
-    inline bool isValid() const
+    inline void mkBool(bool b)
     {
-        return internalType != tUninitialized;
+        TaggedBoolean taggedBoolean;
+        taggedBoolean.tag = setInternalTypeTag(0, tBool);
+        taggedBoolean.boolean = b;
+        payload.taggedBoolean = taggedBoolean;
     }
 
     inline void mkInt(NixInt::Inner n)
@@ -317,17 +623,18 @@ public:
 
     inline void mkInt(NixInt n)
     {
-        finishValue(tInt, { .integer = n });
+        TaggedInteger taggedInteger;
+        taggedInteger.tag = setInternalTypeTag(0, tInt);
+        taggedInteger.integer = n;
+        payload.taggedInteger = taggedInteger;
     }
 
-    inline void mkBool(bool b)
+    inline void mkFloat(NixFloat n)
     {
-        finishValue(tBool, { .boolean = b });
-    }
-
-    inline void mkString(const char * s, const char * * context = 0)
-    {
-        finishValue(tString, { .string = { .c_str = s, .context = context } });
+        TaggedFloat taggedFloat;
+        taggedFloat.tag = setInternalTypeTag(0, tFloat);
+        taggedFloat.fpoint = n;
+        payload.taggedFloat = taggedFloat;
     }
 
     void mkString(std::string_view s);
@@ -341,58 +648,203 @@ public:
         mkString(s.c_str());
     }
 
+    inline void mkString(const char * s, const char ** context = nullptr)
+    {
+        TaggedStringWithContext taggedStringWithContext;
+        taggedStringWithContext.tagged_c_str = setInternalTypeTag(reinterpret_cast<uintptr_t>(s), tString);
+        taggedStringWithContext.context = context;
+        payload.taggedStringWithContext = taggedStringWithContext;
+    }
+
     void mkPath(const SourcePath & path);
+
     void mkPath(std::string_view path);
 
     inline void mkPath(SourceAccessor * accessor, const char * path)
     {
-        finishValue(tPath, { .path = { .accessor = accessor, .path = path } });
+        TaggedPath taggedPath;
+        taggedPath.taggedSourceAccessorPtr = setInternalTypeTag(reinterpret_cast<uintptr_t>(accessor), tPath);
+        taggedPath.path = path;
+        payload.taggedPath = taggedPath;
     }
 
-    inline void mkNull()
+    inline void mkList(const ListBuilder & builder)
     {
-        finishValue(tNull, {});
-    }
-
-    inline void mkAttrs(Bindings * a)
-    {
-        finishValue(tAttrs, { .attrs = a });
+        if (builder.size == 1) {
+            TaggedSingletonList taggedSingletonList;
+            taggedSingletonList.tag = setInternalTypeTag(0, tList1);
+            taggedSingletonList.singleton[0] = builder.inlineSingleton[0];
+            payload.taggedSingletonList = taggedSingletonList;
+        } else {
+            TaggedBigList taggedBigList;
+            taggedBigList.taggedElems = setInternalTypeTag(reinterpret_cast<uintptr_t>(builder.elems), tListN);
+            taggedBigList.size = builder.size;
+            payload.taggedBigList = taggedBigList;
+        }
     }
 
     Value & mkAttrs(BindingsBuilder & bindings);
 
-    void mkList(const ListBuilder & builder)
+    inline void mkAttrs(Bindings * a)
     {
-        if (builder.size == 1)
-            finishValue(tList1, { .smallList = { builder.inlineElems[0] } });
-        else if (builder.size == 2)
-            finishValue(tList2, { .smallList = { builder.inlineElems[0], builder.inlineElems[1] } });
-        else
-            finishValue(tListN, { .bigList = { .size = builder.size, .elems = builder.elems } });
+        TaggedBindings taggedBindings;
+        taggedBindings.tag = setInternalTypeTag(0, tAttrs);
+        taggedBindings.attrs = a;
+        payload.taggedBindings = taggedBindings;
     }
 
     inline void mkThunk(Env * e, Expr * ex)
     {
-        finishValue(tThunk, { .thunk = { .env = e, .expr = ex } });
+        TaggedClosureThunk taggedThunk;
+        taggedThunk.taggedEnvPtr = setInternalTypeTag(reinterpret_cast<uintptr_t>(e), tThunk);
+        taggedThunk.expr = ex;
+        payload.taggedThunk = taggedThunk;
     }
 
     inline void mkApp(Value * l, Value * r)
     {
-        finishValue(tApp, { .app = { .left = l, .right = r } });
+        TaggedFunctionApplicationThunk taggedApp;
+        taggedApp.taggedLeftValuePtr = setInternalTypeTag(reinterpret_cast<uintptr_t>(l), tApp);
+        taggedApp.right = r;
+        payload.taggedApp = taggedApp;
     }
 
     inline void mkLambda(Env * e, ExprLambda * f)
     {
-        finishValue(tLambda, { .lambda = { .env = e, .fun = f } });
+        TaggedLambda taggedLambda;
+        taggedLambda.taggedEnvPtr = setInternalTypeTag(reinterpret_cast<uintptr_t>(e), tLambda);
+        taggedLambda.fun = f;
+        payload.taggedLambda = taggedLambda;
     }
-
-    inline void mkBlackhole();
 
     void mkPrimOp(PrimOp * p);
 
     inline void mkPrimOpApp(Value * l, Value * r)
     {
-        finishValue(tPrimOpApp, { .primOpApp = { .left = l, .right = r } });
+        TaggedFunctionApplicationThunk taggedPrimOpApp;
+        taggedPrimOpApp.taggedLeftValuePtr = setInternalTypeTag(reinterpret_cast<uintptr_t>(l), tPrimOpApp);
+        taggedPrimOpApp.right = r;
+        payload.taggedPrimOpApp = taggedPrimOpApp;
+    }
+
+    inline void mkExternal(ExternalValueBase * e)
+    {
+        TaggedExternalValueBase taggedExternal;
+        taggedExternal.tag = setInternalTypeTag(0, tExternal);
+        taggedExternal.external = e;
+        payload.taggedExternal = taggedExternal;
+    }
+
+    inline void mkBlackhole();
+
+    inline bool boolean() const
+    {
+        return payload.taggedBoolean.getBoolean();
+    }
+
+    inline NixInt integer() const
+    {
+        return payload.taggedInteger.getInteger();
+    }
+
+    inline NixFloat fpoint() const
+    {
+        return payload.taggedFloat.getFloat();
+    }
+
+    inline std::string_view string_view() const
+    {
+        assert(getInternalType() == tString);
+        return std::string_view(payload.taggedStringWithContext.get_c_str());
+    }
+
+    inline const char * c_str() const
+    {
+        assert(getInternalType() == tString);
+        return payload.taggedStringWithContext.get_c_str();
+    }
+
+    inline const char ** context() const
+    {
+        assert(getInternalType() == tString);
+        return payload.taggedStringWithContext.getContext();
+    }
+
+    inline TaggedPath path() const
+    {
+        assert(getInternalType() == tPath);
+        return payload.taggedPath;
+    }
+
+    inline SourcePath sourcePath() const
+    {
+        assert(getInternalType() == tPath);
+        return SourcePath(
+            ref(payload.taggedPath.getSourceAccessor()->shared_from_this()),
+            CanonPath(CanonPath::unchecked_t(), payload.taggedPath.getPath()));
+    }
+
+    inline Value * const * listElems()
+    {
+        const auto ty = getInternalType();
+        assert(ty == tList1 || ty == tListN);
+        return ty == tList1 ? payload.taggedSingletonList.getElems() : payload.taggedBigList.getElems();
+    }
+
+    inline std::span<Value * const> listItems() const
+    {
+        assert(isList());
+        return std::span<Value * const>(listElems(), listSize());
+    }
+
+    inline Value * const * listElems() const
+    {
+        const auto ty = getInternalType();
+        assert(ty == tList1 || ty == tListN);
+        return ty == tList1 ? payload.taggedSingletonList.getElems() : payload.taggedBigList.getElems();
+    }
+
+    inline size_t listSize() const
+    {
+        const auto ty = getInternalType();
+        assert(ty == tList1 || ty == tListN);
+        return ty == tList1 ? 1 : payload.taggedBigList.getSize();
+    }
+
+    inline const Bindings * attrs() const
+    {
+        assert(getInternalType() == tAttrs);
+        return payload.taggedBindings.getAttrs();
+    }
+
+    inline TaggedClosureThunk thunk() const
+    {
+        assert(getInternalType() == tThunk);
+        return payload.taggedThunk;
+    }
+
+    inline TaggedLambda lambda() const
+    {
+        assert(getInternalType() == tLambda);
+        return payload.taggedLambda;
+    }
+
+    inline TaggedFunctionApplicationThunk app() const
+    {
+        assert(getInternalType() == tApp);
+        return payload.taggedApp;
+    }
+
+    inline TaggedFunctionApplicationThunk primOpApp() const
+    {
+        assert(getInternalType() == tPrimOpApp);
+        return payload.taggedPrimOpApp;
+    }
+
+    inline const PrimOp * primOp() const
+    {
+        assert(getInternalType() == tPrimOp);
+        return payload.taggedPrimOp.getPrimOp();
     }
 
     /**
@@ -400,139 +852,38 @@ public:
      */
     const PrimOp * primOpAppPrimOp() const;
 
-    inline void mkExternal(ExternalValueBase * e)
+    inline ExternalValueBase * external() const
     {
-        finishValue(tExternal, { .external = e });
-    }
-
-    inline void mkFloat(NixFloat n)
-    {
-        finishValue(tFloat, { .fpoint = n });
-    }
-
-    bool isList() const
-    {
-        return internalType == tList1 || internalType == tList2 || internalType == tListN;
-    }
-
-    Value * const * listElems()
-    {
-        return internalType == tList1 || internalType == tList2 ? payload.smallList : payload.bigList.elems;
-    }
-
-    std::span<Value * const> listItems() const
-    {
-        assert(isList());
-        return std::span<Value * const>(listElems(), listSize());
-    }
-
-    Value * const * listElems() const
-    {
-        return internalType == tList1 || internalType == tList2 ? payload.smallList : payload.bigList.elems;
-    }
-
-    size_t listSize() const
-    {
-        return internalType == tList1 ? 1 : internalType == tList2 ? 2 : payload.bigList.size;
+        assert(getInternalType() == tExternal);
+        return payload.taggedExternal.getExternal();
     }
 
     PosIdx determinePos(const PosIdx pos) const;
-
-    /**
-     * Check whether forcing this value requires a trivial amount of
-     * computation. In particular, function applications are
-     * non-trivial.
-     */
-    bool isTrivial() const;
-
-    Path path() const
-    {
-        assert(internalType == tPath);
-        return payload.path;
-    }
-
-    SourcePath sourcePath() const
-    {
-        assert(internalType == tPath);
-        return SourcePath(
-            ref(payload.path.accessor->shared_from_this()),
-            CanonPath(CanonPath::unchecked_t(), payload.path.path));
-    }
-
-    std::string_view string_view() const
-    {
-        assert(internalType == tString);
-        return std::string_view(payload.string.c_str);
-    }
-
-    const char * c_str() const
-    {
-        assert(internalType == tString);
-        return payload.string.c_str;
-    }
-
-    const char * * context() const
-    {
-        return payload.string.context;
-    }
-
-    ExternalValueBase * external() const
-    { return payload.external; }
-
-    const Bindings * attrs() const
-    { return payload.attrs; }
-
-    const PrimOp * primOp() const
-    { return payload.primOp; }
-
-    bool boolean() const
-    { return payload.boolean; }
-
-    NixInt integer() const
-    { return payload.integer; }
-
-    NixFloat fpoint() const
-    { return payload.fpoint; }
-
-    FunctionApplicationThunk app() const {
-        assert(internalType == tApp);
-        return payload.app;
-    }
-
-    ClosureThunk thunk() const {
-        assert(internalType == tThunk);
-        return payload.thunk;
-    }
-
-    Lambda lambda() const {
-        assert(internalType == tLambda);
-        return payload.lambda;
-    }
-
-    FunctionApplicationThunk primOpApp() const {
-        assert(internalType == tPrimOpApp);
-        return payload.primOpApp;
-    }
 };
-
+static_assert(sizeof(Value) == NUM_BYTES_FOR_ADDRESSING * 2);
 
 extern ExprBlackHole eBlackHole;
 
-bool Value::isBlackhole() const
+inline bool Value::isBlackhole() const
 {
-    return internalType == tThunk && payload.thunk.expr == (Expr*) &eBlackHole;
+    return getInternalType() == tThunk && payload.taggedThunk.getExpr() == (Expr *) &eBlackHole;
 }
 
-void Value::mkBlackhole()
+inline void Value::mkBlackhole()
 {
     mkThunk(nullptr, (Expr *) &eBlackHole);
 }
 
-
 typedef std::vector<Value *, traceable_allocator<Value *>> ValueVector;
-typedef std::unordered_map<Symbol, Value *, std::hash<Symbol>, std::equal_to<Symbol>, traceable_allocator<std::pair<const Symbol, Value *>>> ValueMap;
-typedef std::map<Symbol, ValueVector, std::less<Symbol>, traceable_allocator<std::pair<const Symbol, ValueVector>>> ValueVectorMap;
-
+typedef std::unordered_map<
+    Symbol,
+    Value *,
+    std::hash<Symbol>,
+    std::equal_to<Symbol>,
+    traceable_allocator<std::pair<const Symbol, Value *>>>
+    ValueMap;
+typedef std::map<Symbol, ValueVector, std::less<Symbol>, traceable_allocator<std::pair<const Symbol, ValueVector>>>
+    ValueVectorMap;
 
 /**
  * A value allocated in traceable memory.
