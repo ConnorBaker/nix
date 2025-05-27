@@ -861,6 +861,10 @@ public:
 
     void concatLists(Value & v, size_t nrLists, Value * const * lists, const PosIdx pos, std::string_view errorCtx);
 
+    std::optional<nlohmann::json> maybeGetStats();
+
+    nlohmann::json getStatistics();
+
     /**
      * Print statistics, if enabled.
      *

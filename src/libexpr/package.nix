@@ -28,7 +28,7 @@
   #
   # Temporarily disabled on Windows because the `GC_throw_bad_alloc`
   # symbol is missing during linking.
-  enableGC ? !stdenv.hostPlatform.isWindows,
+  enableGC ? false,
 }:
 
 let

@@ -2871,6 +2871,24 @@ bool EvalState::fullGC()
 #endif
 }
 
+std::optional<nlohmann::json> EvalState::maybeGetStats()
+{
+    const bool showStats = getEnv("NIX_SHOW_STATS").value_or("0") != "0";
+
+    if (showStats) {
+        // Make the final heap size more deterministic.
+#if NIX_USE_BOEHMGC
+        if (!fullGC()) {
+            warn("failed to perform a full GC before reporting stats");
+        }
+#endif
+        return std::make_optional(getStatistics());
+    }
+
+    return std::nullopt;
+}
+
+// TODO(@connorbaker): Deduplicate with maybeGetStats.
 void EvalState::maybePrintStats()
 {
     bool showStats = getEnv("NIX_SHOW_STATS").value_or("0") != "0";
@@ -2886,7 +2904,7 @@ void EvalState::maybePrintStats()
     }
 }
 
-void EvalState::printStatistics()
+nlohmann::json EvalState::getStatistics()
 {
 #ifndef _WIN32 // TODO use portable implementation
     struct rusage buf;
@@ -2909,10 +2927,6 @@ void EvalState::printStatistics()
     auto gcCycles = getGCCycles();
 #endif
 
-    auto outPath = getEnv("NIX_SHOW_STATS_PATH").value_or("-");
-    std::fstream fs;
-    if (outPath != "-")
-        fs.open(outPath, std::fstream::out);
     json topObj = json::object();
 #ifndef _WIN32 // TODO implement
     topObj["cpuTime"] = cpuTime;
@@ -3017,10 +3031,25 @@ void EvalState::printStatistics()
         auto & list = topObj["symbols"];
         symbols.dump([&](std::string_view s) { list.emplace_back(s); });
     }
-    if (outPath == "-") {
-        std::cerr << topObj.dump(2) << std::endl;
+
+    return topObj;
+}
+
+void EvalState::printStatistics()
+{
+    const auto stats = getStatistics();
+    const auto outPath = getEnv("NIX_SHOW_STATS_PATH").value_or("-");
+
+    if (outPath != "-") {
+        // TODO(@connorbaker): Is there a way we can do this with one line?
+        std::fstream fs;
+        fs.open(outPath, std::fstream::out);
+        fs << stats.dump(2) << std::endl;
+        // TODO(@connorbaker): Is this necessary?
+        fs.flush();
+        fs.close();
     } else {
-        fs << topObj.dump(2) << std::endl;
+        std::cerr << stats.dump(2) << std::endl;
     }
 }
 
