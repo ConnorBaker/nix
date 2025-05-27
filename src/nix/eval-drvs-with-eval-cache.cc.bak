@@ -1,0 +1,191 @@
+#include "nix/cmd/command-installable-value.hh"
+#include "nix/expr/eval-cache.hh"
+#include "nix/expr/nixexpr.hh"
+#include "nix/expr/symbol-table.hh"
+#include "nix/expr/value.hh"
+#include "nix/main/common-args.hh"
+#include "nix/main/shared.hh"
+#include "nix/store/store-api.hh"
+#include "nix/expr/eval.hh"
+#include "nix/util/signals.hh"
+
+#include <cstddef>
+#include <nlohmann/json.hpp>
+#include <nlohmann/json_fwd.hpp>
+#include <sys/wait.h>
+#include <unistd.h>
+
+using namespace nix;
+
+namespace nix::fs {
+using namespace std::filesystem;
+}
+
+struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
+{
+    bool json = true;
+    bool outputPretty = false;
+
+    CmdEvalDrvs()
+        : InstallableValueCommand()
+    {
+    }
+
+    std::string description() override
+    {
+        return "evaluate an attribute set of derivations";
+    }
+
+    std::string doc() override
+    {
+        return
+#include "eval-drvs.md"
+            ;
+    }
+
+    Category category() override
+    {
+        return catSecondary;
+    }
+
+    nlohmann::json _get_json_for_primitive(const ValueType & ty, const Value & v)
+    {
+        switch (ty) {
+        case nNull:
+            // TODO: Verify this is actually null.
+            return nlohmann::json{};
+        case nBool:
+            return v.boolean();
+        case nInt:
+            return v.integer().value;
+        case nFloat:
+            return v.fpoint();
+        case nString:
+            // TODO: Why bother copying context if it's unused?
+            // copyContext(v, context);
+            // TODO: Difference between string_view and c_str?
+            return v.string_view();
+        case nPath:
+            // NOTE: copyToStore is false, so we just take the other branch.
+            // if (copyToStore)
+            //     out = state.store->printStorePath(
+            //         state.copyPathToStore(context, v.path()));
+            // else
+            //     out = v.path().path.abs();
+            return v.path().path.abs();
+        case nThunk:
+            return "encountered a thunk";
+        case nFunction:
+            return "encountered a function which cannot be auto-called";
+        case nExternal:
+            // printValueAsJSON uses this:
+            // return v.external()->printValueAsJSON(state, strict, context, copyToStore);
+            return "encountered an external value";
+        case nList:
+            // NOTE: No notation for indexing lists from the CLI, so this is ignored.
+            return "encountered a list";
+        case nAttrs:
+            [[unlikely]] throw;
+        }
+    }
+
+    bool _try_primitive_case(EvalState & state, eval_cache::AttrCursor & attrCursor)
+    {
+        const auto v = attrCursor.forceValue();
+        const auto ty = v.type();
+
+        // TODO: isDerivation calls forceValue for us, but does so with caching.
+        // TODO: See if there's a better way we can be lazily compute isDerivation.
+        // Is there a way to expose getValue as a friend struct?
+        const auto isDerivation = attrCursor.isDerivation();
+        const auto isPrimitiveCase = nAttrs != ty || isDerivation;
+
+        // Early return if not a primitive case
+        if (!isPrimitiveCase)
+            return false;
+
+        // Create the JSON object
+        nlohmann::json res;
+        // TODO: Does attrCursor's cached EvalState match the EvalState we pass in explicitly?
+        res["attrPath"] = state.symbols.resolve(attrCursor.getAttrPath());
+        if (isDerivation) {
+            res["type"] = "derivation";
+            res["value"] = attrCursor.forceDerivation().to_string();
+        } else {
+            res["type"] = showType(ty, false);
+            res["value"] = _get_json_for_primitive(ty, v);
+        }
+        res["stats"] = state.getStatistics();
+
+        printJSON(res);
+
+        // Successfully handled the primitive case.
+        return true;
+    }
+
+    // TODO: Use AttrCursor to benefit from caching? Is the "db" it caches to on-disk?
+    // TODO: Ideally evalCache would be shared among processes?
+    // TODO: Since AttrCursor belongs to eval_cache, and that has state, should we use it instead of EvalState?
+    // TODO: Implement some kind of heuristic where we fork whenever the symbol name ends in "Pkgs" or "Packages"?
+    void _recurse(EvalState & state, eval_cache::AttrCursor & attrCursor)
+    {
+        static int haveForked;
+        checkInterrupt();
+
+        pid_t pid = 0;
+        if (!haveForked) {
+            haveForked = 1;
+            pid = fork();
+        }
+
+        if (pid == -1) {
+            throw;
+        } else if (pid != 0) {
+            return;
+        }
+
+        if (!_try_primitive_case(state, attrCursor)) {
+            // Value is known to be an attribute set and not a derivation in this branch.
+            // Do a depth-first traversal.
+            for (const auto & sym : attrCursor.getAttrs()) {
+                const auto newAttrCursor = attrCursor.getAttr(sym);
+                try {
+                    _recurse(state, *newAttrCursor);
+                } catch (Error & e) {
+                    e.addTrace(Pos{}, HintFmt("while evaluating the attribute '%s'", newAttrCursor->getAttrPathStr()));
+                    throw;
+                }
+            }
+        }
+        return;
+    }
+
+    void run(ref<Store> store, ref<InstallableValue> installable) override
+    {
+        // TODO: Cursors use AttrDb, which interacts with SQLite... isn't SQLite well-known for not being safe for use
+        // with mulitple writers?
+        // TODO: Doesn't installable have state already?
+        // auto state = getEvalState();
+        auto state = installable->state;
+        auto cursor = installable->getCursor(*state);
+        logger->stop();
+        _recurse(*state, *cursor);
+
+        // TODO: Keep for logging from the main thread?
+        // {
+        //     logger->cout(
+        //         "%s",
+        //         ValuePrinter(
+        //             *state,
+        //             *v,
+        //             PrintOptions {
+        //                 .force = true,
+        //                 .derivationPaths = true
+        //             }
+        //         )
+        //     );
+        // }
+    }
+};
+
+static auto rCmdEval = registerCommand<CmdEvalDrvs>("eval-drvs");
