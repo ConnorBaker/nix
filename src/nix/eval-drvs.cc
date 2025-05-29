@@ -21,10 +21,12 @@
 #include <boost/interprocess/sync/interprocess_mutex.hpp>
 #include <boost/interprocess/sync/interprocess_semaphore.hpp>
 #include <boost/interprocess/timed_utils.hpp>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <nlohmann/json_fwd.hpp>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <sched.h>
 #include <stdexcept>
 #include <string>
@@ -45,7 +47,8 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
 {
     bool json = true;
     bool outputPretty = false;
-    int maxProcesses = 32; // Default number of processes to use for evaluation
+    bool forceRecurse = false;
+    uint32_t maxProcesses = 32;
 
     CmdEvalDrvs()
         : InstallableValueCommand()
@@ -57,8 +60,17 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
             .description =
                 "Maximum number of processes to use for simultaneous evaluation (actual number may be higher)",
             .labels = {"n"},
-            .handler = {[&](const std::string s) { maxProcesses = string2IntWithUnitPrefix<uint64_t>(s); }},
+            .handler = {[&](const std::string s) { maxProcesses = string2IntWithUnitPrefix<uint32_t>(s); }},
         });
+
+        addFlag({
+            .longName = "force-recurse",
+            .shortName = 'R',
+            .description =
+                "When set, forces recursion into attribute sets even if they do not set `recurseForDerivations`",
+            .handler = {&forceRecurse, true},
+        });
+
         // TODO: Add "ignore at root level" flag, to ignore names which appear at the root level
         // TODO: Add "ignore at any level" flag, to ignore names which appear at any level
     }
@@ -109,11 +121,8 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         interprocess_semaphore & evalTokens,
         EvalState & state,
         std::vector<SymbolStr> & attrPath,
-        Value & forcedValue)
+        const Bindings * const attrs)
     {
-        // Get the attribute set we'll be iterating over.
-        const auto attrs = forcedValue.attrs();
-
         // Keep track of child processes.
         std::unordered_map<pid_t, SymbolStr> pidToSymbolStr;
         pidToSymbolStr.reserve(attrs->size());
@@ -134,6 +143,12 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
             case 0: {
                 int exitCode = 0;
                 try {
+                    // TODO:
+                    // This is gross and probably doesn't work in the way I hope it does.
+                    // The goal is to force re-creation of the file descriptors/sockets used for the build and eval
+                    // store.
+                    state.store->init();
+                    state.buildStore->init();
                     _step(loggerMutex, evalTokens, state, attrPath, *attr.value);
                 } catch (std::exception & e) {
                     loggerMutex.lock();
@@ -224,8 +239,35 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
                 }
                 evalTokens.post(); // Release as part of getting ready for cleanup and exit.
             } else {
-                evalTokens.post(); // Release prior to recursing deeper.
-                _recursiveCase(loggerMutex, evalTokens, state, attrPath, value);
+                // Get the attribute set we'll be iterating over.
+                const auto attrs = value.attrs();
+
+                // NOTE: Performing the check for whether we should recurse or not here, rather than in _recursiveCase,
+                // allows us to force recursion into the root attribute set since the first iteration is special-cased
+                // in run.
+
+                // If we are not forcing recursion, we need to check if the attribute set has recurseForDerivations set
+                // to true.
+                if (!forceRecurse) {
+                    // Try to get the recurseForDerivations attribute.
+                    const auto recurseForDerivationsAttr = attrs->get(state.sRecurseForDerivations);
+
+                    // If recurseForDerivations is not present, we do not recurse.
+                    if (!recurseForDerivationsAttr)
+                        return;
+
+                    // Get the value of recurseForDerivations.
+                    const auto recurseForDerivationsValue = recurseForDerivationsAttr->value;
+                    state.forceValue(*recurseForDerivationsValue, recurseForDerivationsValue->determinePos(attrs->pos));
+                    // TODO: check if recurseForDerivationsValue is a boolean, and throw an error if it is not.
+
+                    // If recurseForDerivations is not set to true, we do not recurse; otherwise continue.
+                    if (!recurseForDerivationsValue->boolean())
+                        return;
+                }
+
+                evalTokens.post(); // Release prior to recursing.
+                _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrs);
             }
         }
     }
@@ -256,8 +298,10 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
                 if (state->isDerivation(forcedValue)) {
                     PackageInfo packageInfo(*state, concatStringsSep(".", attrPath), forcedValue.attrs());
                     _baseCase(*loggerMutex, *state, attrPath, packageInfo);
-                } else
-                    _recursiveCase(*loggerMutex, *evalTokens, *state, attrPath, forcedValue);
+                } else {
+                    const auto attrs = forcedValue.attrs();
+                    _recursiveCase(*loggerMutex, *evalTokens, *state, attrPath, attrs);
+                }
             }
         } catch (interprocess_exception & ex) {
             // If we cannot create the shared memory segment, we throw an error.
