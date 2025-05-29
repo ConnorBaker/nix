@@ -59,10 +59,31 @@ _getJSON(const EvalState & state, const std::vector<SymbolStr> & attrPath, const
     return result;
 }
 
+bool _shouldRecurse(const bool forceRecurse, EvalState & state, const Bindings * const attrs)
+{
+    if (forceRecurse)
+        return true;
+
+    // Try to get the recurseForDerivations attribute.
+    const auto recurseForDerivationsAttr = attrs->get(state.sRecurseForDerivations);
+
+    // If recurseForDerivations is not present, we do not recurse.
+    if (nullptr == recurseForDerivationsAttr)
+        return false;
+
+    // Get the value of recurseForDerivations.
+    const auto recurseForDerivationsValue = recurseForDerivationsAttr->value;
+    state.forceValue(*recurseForDerivationsValue, recurseForDerivationsValue->determinePos(attrs->pos));
+    // TODO: check if recurseForDerivationsValue is a boolean, and throw an error if it is not.
+
+    // Recurse iff. recurseForDerivations is set to true.
+    return recurseForDerivationsValue->boolean();
+}
+
 void _doFork(
     const std::function<void()> & doFailure,
     const std::function<int()> & doChild,
-    const std::function<void(pid_t)> & doParent)
+    const std::function<void(const pid_t)> & doParent)
 {
     const auto pid = fork();
     switch (pid) {
@@ -75,6 +96,20 @@ void _doFork(
         doParent(pid);
         return;
     }
+}
+
+void _doWait(
+    const std::function<pid_t(int &)> & doWait,
+    const std::function<void(const pid_t, const int)> & doFailure,
+    const std::function<void(const pid_t, const int)> & doNotReady,
+    const std::function<void(const pid_t, const int)> &
+        doSuccess // Success as in "successfully waited for the child process"
+)
+{
+    int status = 0;
+    const auto waitedPid = doWait(status);
+    const auto func = (waitedPid < 0) ? doFailure : (waitedPid == 0) ? doNotReady : doSuccess;
+    func(waitedPid, status);
 }
 
 struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
@@ -142,7 +177,7 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         loggerMutex.unlock();
     }
 
-    void _recursiveCase(
+    std::unordered_map<pid_t, SymbolStr> _spawnChildren(
         interprocess_mutex & loggerMutex,
         interprocess_semaphore & evalTokens,
         EvalState & state,
@@ -153,11 +188,11 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         std::unordered_map<pid_t, SymbolStr> pidToSymbolStr;
         pidToSymbolStr.reserve(attrs->size());
 
-        const auto failureFunc = [&]() -> void {
+        const auto doFailure = [&]() -> void {
             throw std::runtime_error(concatStringsSep(".", attrPath) + ": fork failed");
         };
 
-        const auto childFunc = [&](const auto & value) -> int {
+        const auto doChild = [&](const auto & value) -> int {
             int exitCode = 0;
             try {
                 // TODO:
@@ -179,70 +214,99 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
             return exitCode;
         };
 
-        // Updates pidToSymbolStr with the pid and the last element of attrPath.
-        const auto parentFunc = [&](const auto symbolStr, const auto pid) -> void {
+        const auto doParent = [&](const auto symbolStr, const auto pid) -> void {
             pidToSymbolStr.emplace(pid, symbolStr);
         };
 
         for (const auto attr : *attrs) {
             const auto symbolStr = state.symbols[attr.name];
-
-            // Add the attribute name to the path.
-            attrPath.push_back(symbolStr);
-
-            // Must take eval token in the parent before calling _step in the child.
-            evalTokens.wait();
-
-            // Fork a child process to evaluate the attribute.
-            _doFork(
-                failureFunc, std::bind(childFunc, attr.value), std::bind(parentFunc, symbolStr, std::placeholders::_1));
-
-            // Remove the last element from the attribute path.
-            attrPath.pop_back();
+            attrPath.push_back(symbolStr); // Mutation is fine since it's only visible to the child after the fork.
+            evalTokens.wait();             // Must take eval token in the parent before calling _step in the child.
+            _doFork(doFailure, std::bind(doChild, attr.value), std::bind(doParent, symbolStr, std::placeholders::_1));
+            attrPath.pop_back(); // Remove the symbolStr from the path, since we are done with it.
         }
 
-        // Wait for all of the children, looping through them so long as there is at least one which has not been
-        // awaited.
+        return pidToSymbolStr;
+    }
+
+    void _waitChildren(
+        interprocess_mutex & loggerMutex,
+        interprocess_semaphore & evalTokens,
+        EvalState & state,
+        std::vector<SymbolStr> & attrPath,
+        const Bindings * const attrs,
+        std::unordered_map<pid_t, SymbolStr> & pidToSymbolStr)
+    {
+        using namespace std::chrono_literals;
+
+        const auto doWait = [](const pid_t & pid, int & status) -> pid_t {
+            // Wait for a child process to finish.
+            return waitpid(pid, &status, WNOHANG | WUNTRACED);
+        };
+
+        const auto doFailure =
+            [&](bool & result, const SymbolStr & symbolStr, const pid_t & _pid, const int & _status) -> void {
+            attrPath.push_back(symbolStr);
+            loggerMutex.lock();
+            logger->log(
+                Verbosity::lvlError,
+                "waitpid failed for child processing " + concatStringsSep(".", attrPath) + ": "
+                    + std::string(strerror(errno)));
+            loggerMutex.unlock();
+            attrPath.pop_back();
+            result = false; // Mark for later checking.
+        };
+
+        const auto doNotReady = [&](bool & result, const pid_t & _pid, const int & _status) -> void {
+            result = false; // Mark for later checking.
+        };
+
+        const auto doSuccess =
+            [&](bool & result, const SymbolStr & symbolStr, const pid_t & _pid, const int & status) -> void {
+            // Log if it exited poorly.
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                attrPath.push_back(symbolStr);
+                loggerMutex.lock();
+                logger->log(
+                    Verbosity::lvlError,
+                    "child processing " + concatStringsSep(".", attrPath) + " did not exit cleanly");
+                loggerMutex.unlock();
+                attrPath.pop_back();
+            }
+            result = true; // Mark for removal.
+        };
+
         while (!pidToSymbolStr.empty()) {
+            // Wait for all of the children, looping through them so long as there is at least one which has not
+            // been awaited.
             pidToSymbolStr.erase(std::erase_if(pidToSymbolStr, [&](const auto tup2) -> bool {
                 const auto [pid, symbolStr] = tup2;
+                bool result = false;
+                const auto resultRef = std::ref(result);
 
-                int status = 0;
-                const auto result = waitpid(pid, &status, WNOHANG | WUNTRACED);
-                if (result == 0)
-                    // Need to check later
-                    return false;
-                else if (result > 0) {
-                    // Log if it exited poorly.
-                    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                        attrPath.push_back(symbolStr);
-                        loggerMutex.lock();
-                        logger->log(
-                            Verbosity::lvlError,
-                            "child processing " + concatStringsSep(".", attrPath) + " did not exit cleanly");
-                        loggerMutex.unlock();
-                        attrPath.pop_back();
-                    }
-                    // Mark for removal.
-                    return true;
-                } else {
-                    attrPath.push_back(symbolStr);
-                    loggerMutex.lock();
-                    logger->log(
-                        Verbosity::lvlError, "waitpid failed for child processing " + concatStringsSep(".", attrPath));
-                    loggerMutex.unlock();
-                    attrPath.pop_back();
-                    // Check later
-                    return false;
-                }
+                _doWait(
+                    std::bind(doWait, pid, std::placeholders::_1),
+                    std::bind(doFailure, resultRef, symbolStr, std::placeholders::_1, std::placeholders::_2),
+                    std::bind(doNotReady, resultRef, std::placeholders::_1, std::placeholders::_2),
+                    std::bind(doSuccess, resultRef, symbolStr, std::placeholders::_1, std::placeholders::_2));
+
+                return result;
             }));
 
             // NOTE: It helps (noticeably) to have a small sleep here so the parent isn't in a hot loop.
-            {
-                using namespace std::chrono_literals;
-                std::this_thread::sleep_for(1s);
-            }
+            std::this_thread::sleep_for(500ms);
         }
+    }
+
+    void _recursiveCase(
+        interprocess_mutex & loggerMutex,
+        interprocess_semaphore & evalTokens,
+        EvalState & state,
+        std::vector<SymbolStr> & attrPath,
+        const Bindings * const attrs)
+    {
+        auto pidToSymbolStr = _spawnChildren(loggerMutex, evalTokens, state, attrPath, attrs);
+        _waitChildren(loggerMutex, evalTokens, state, attrPath, attrs, pidToSymbolStr);
     }
 
     // NOTE: _step must only ever be called from the child process of a fork.
@@ -272,34 +336,15 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
                 }
                 evalTokens.post(); // Release as part of getting ready for cleanup and exit.
             } else {
-                // Get the attribute set we'll be iterating over.
                 const auto attrs = value.attrs();
 
                 // NOTE: Performing the check for whether we should recurse or not here, rather than in _recursiveCase,
                 // allows us to force recursion into the root attribute set since the first iteration is special-cased
                 // in run.
+                if (!_shouldRecurse(forceRecurse, state, attrs))
+                    return;
 
-                // If we are not forcing recursion, we need to check if the attribute set has recurseForDerivations set
-                // to true.
-                if (!forceRecurse) {
-                    // Try to get the recurseForDerivations attribute.
-                    const auto recurseForDerivationsAttr = attrs->get(state.sRecurseForDerivations);
-
-                    // If recurseForDerivations is not present, we do not recurse.
-                    if (!recurseForDerivationsAttr)
-                        return;
-
-                    // Get the value of recurseForDerivations.
-                    const auto recurseForDerivationsValue = recurseForDerivationsAttr->value;
-                    state.forceValue(*recurseForDerivationsValue, recurseForDerivationsValue->determinePos(attrs->pos));
-                    // TODO: check if recurseForDerivationsValue is a boolean, and throw an error if it is not.
-
-                    // If recurseForDerivations is not set to true, we do not recurse; otherwise continue.
-                    if (!recurseForDerivationsValue->boolean())
-                        return;
-                }
-
-                evalTokens.post(); // Release prior to recursing.
+                evalTokens.post(); // Release prior to recursing, but after eval required for _shouldRecurse.
                 _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrs);
             }
         }
