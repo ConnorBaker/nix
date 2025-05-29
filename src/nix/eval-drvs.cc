@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <functional>
+#include <memory>
 #include <nlohmann/json_fwd.hpp>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -39,8 +41,40 @@
 using namespace nix;
 using namespace boost::interprocess;
 
-namespace nix::fs {
-using namespace std::filesystem;
+const nlohmann::json
+_getJSON(const EvalState & state, const std::vector<SymbolStr> & attrPath, const PackageInfo & packageInfo)
+{
+    nlohmann::json result;
+
+    // TODO: Either remove cpuTime from statistics or find a way to do a before/after forcing the derivation path
+    // to get some sort of marginal cost for the evaluation.
+    result["attr"] = packageInfo.attrPath;
+    result["attrPath"] = attrPath;
+    result["drvPath"] = packageInfo.queryDrvPath()->to_string();
+    result["name"] = packageInfo.queryName();
+    // TODO: outputs
+    result["stats"] = state.getStatistics();
+    result["system"] = packageInfo.querySystem();
+
+    return result;
+}
+
+void _doFork(
+    const std::function<void()> & doFailure,
+    const std::function<int()> & doChild,
+    const std::function<void(pid_t)> & doParent)
+{
+    const auto pid = fork();
+    switch (pid) {
+    [[unlikely]] case -1: // fork failed
+        doFailure();
+        return;
+    case 0:
+        _exit(doChild());
+    default:
+        doParent(pid);
+        return;
+    }
 }
 
 struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
@@ -100,19 +134,11 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         const std::vector<SymbolStr> & attrPath,
         PackageInfo & packageInfo)
     {
-        // TODO: Either remove cpuTime from statistics or find a way to do a before/after forcing the derivation path
-        // to get some sort of marginal cost for the evaluation.
-        nlohmann::json result;
-        result["attr"] = packageInfo.attrPath;
-        result["attrPath"] = attrPath;
-        result["drvPath"] = packageInfo.queryDrvPath()->to_string();
-        result["name"] = packageInfo.queryName();
-        // TODO: outputs
-        result["stats"] = state.getStatistics();
-        result["system"] = packageInfo.querySystem();
+        const auto result = _getJSON(state, attrPath, packageInfo);
 
+        // Acquire the logger mutex and write the result to stdout.
         loggerMutex.lock();
-        printJSON(result);
+        logger->writeToStdout(result.dump());
         loggerMutex.unlock();
     }
 
@@ -127,45 +153,52 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         std::unordered_map<pid_t, SymbolStr> pidToSymbolStr;
         pidToSymbolStr.reserve(attrs->size());
 
+        const auto failureFunc = [&]() -> void {
+            throw std::runtime_error(concatStringsSep(".", attrPath) + ": fork failed");
+        };
+
+        const auto childFunc = [&](const auto & value) -> int {
+            int exitCode = 0;
+            try {
+                // TODO:
+                // This is gross and probably doesn't work in the way I hope it does.
+                // The goal is to force re-creation of the file descriptors/sockets used for the build and eval
+                // store.
+                state.store->init();
+                state.buildStore->init();
+                _step(loggerMutex, evalTokens, state, attrPath, *value);
+            } catch (std::exception & e) {
+                loggerMutex.lock();
+                // TODO: e.what() doesn't post the Nix stack trace.
+                logger->log(
+                    Verbosity::lvlError,
+                    "processing " + concatStringsSep(".", attrPath) + " failed: " + std::string(e.what()));
+                loggerMutex.unlock();
+                exitCode = 1;
+            }
+            return exitCode;
+        };
+
+        // Updates pidToSymbolStr with the pid and the last element of attrPath.
+        const auto parentFunc = [&](const auto symbolStr, const auto pid) -> void {
+            pidToSymbolStr.emplace(pid, symbolStr);
+        };
+
         for (const auto attr : *attrs) {
-            attrPath.push_back(state.symbols[attr.name]);
+            const auto symbolStr = state.symbols[attr.name];
+
+            // Add the attribute name to the path.
+            attrPath.push_back(symbolStr);
 
             // Must take eval token in the parent before calling _step in the child.
             evalTokens.wait();
 
-            // TODO: Add a method to re-initialize the store/daemon connections so this can work without needing to own
-            // the store. fork doesn't do anything for the file descriptors the child and parent share, so the daemon
-            // dies horribly.
-            const pid_t pid = fork();
-            switch (pid) {
-            case -1: // fork failed
-                [[unlikely]] throw std::runtime_error(concatStringsSep(".", attrPath) + ": fork failed");
-            case 0: {
-                int exitCode = 0;
-                try {
-                    // TODO:
-                    // This is gross and probably doesn't work in the way I hope it does.
-                    // The goal is to force re-creation of the file descriptors/sockets used for the build and eval
-                    // store.
-                    state.store->init();
-                    state.buildStore->init();
-                    _step(loggerMutex, evalTokens, state, attrPath, *attr.value);
-                } catch (std::exception & e) {
-                    loggerMutex.lock();
-                    // TODO: e.what() doesn't post the Nix stack trace.
-                    logger->log(
-                        Verbosity::lvlError,
-                        "processing " + concatStringsSep(".", attrPath) + " failed: " + std::string(e.what()));
-                    loggerMutex.unlock();
-                    exitCode = 1;
-                }
-                _exit(exitCode);
-            }
-            default: {
-                pidToSymbolStr.insert({pid, attrPath.back()});
-                attrPath.pop_back();
-            }
-            };
+            // Fork a child process to evaluate the attribute.
+            _doFork(
+                failureFunc, std::bind(childFunc, attr.value), std::bind(parentFunc, symbolStr, std::placeholders::_1));
+
+            // Remove the last element from the attribute path.
+            attrPath.pop_back();
         }
 
         // Wait for all of the children, looping through them so long as there is at least one which has not been
@@ -274,6 +307,9 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
 
     void run(ref<Store> store, ref<InstallableValue> installable) override
     {
+        if (outputPretty)
+            throw std::runtime_error("The --output-pretty flag is not supported by this command.");
+
         const auto state = installable->state;
         const auto cursor = installable->getCursor(*state);
         logger->stop();
