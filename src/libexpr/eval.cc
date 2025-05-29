@@ -2904,7 +2904,7 @@ void EvalState::maybePrintStats()
     }
 }
 
-nlohmann::json EvalState::getStatistics()
+nlohmann::json EvalState::getStatistics() const
 {
 #ifndef _WIN32 // TODO use portable implementation
     struct rusage buf;

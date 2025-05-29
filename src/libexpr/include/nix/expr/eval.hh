@@ -863,7 +863,7 @@ public:
 
     std::optional<nlohmann::json> maybeGetStats();
 
-    nlohmann::json getStatistics();
+    nlohmann::json getStatistics() const;
 
     /**
      * Print statistics, if enabled.
