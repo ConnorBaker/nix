@@ -86,46 +86,18 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         interprocess_mutex & loggerMutex,
         EvalState & state,
         const std::vector<SymbolStr> & attrPath,
-        Value & forcedValue)
+        PackageInfo & packageInfo)
     {
-        const auto attrs = forcedValue.attrs();
-        
-        // TODO: Switch to getDerivation.
-        // auto packageInfo = getDerivation(state, forcedValue, false);
-
-        // Utility to always have pos.
-        const auto forceValue = [&](Value * const value) -> void { state.forceValue(*value, attrs->pos); };
-
-        // Taken from AttrCursor::forceDerivation()
-        const auto drvPathValue = attrs->get(state.sDrvPath)->value;
-        forceValue(drvPathValue);
-        // TODO: assert path?
-
-        const auto drvPath = state.store->parseStorePath(drvPathValue->string_view());
-        drvPath.requireDerivation();
-
-        const auto nameValue = attrs->get(state.sName)->value;
-        forceValue(nameValue);
-        // TODO: assert string
-
-        const auto systemValue = attrs->get(state.sSystem)->value;
-        forceValue(systemValue);
-        // TODO: assert string
-
-        const auto outputsValue = attrs->get(state.sOutputs)->value;
-        forceValue(outputsValue);
-        // TODO: assert attribute set?
-
         // TODO: Either remove cpuTime from statistics or find a way to do a before/after forcing the derivation path
         // to get some sort of marginal cost for the evaluation.
         nlohmann::json result;
-        result["attr"] = concatStringsSep(".", attrPath);
+        result["attr"] = packageInfo.attrPath;
         result["attrPath"] = attrPath;
-        result["drvPath"] = drvPath.to_string();
-        result["name"] = nameValue->c_str();
+        result["drvPath"] = packageInfo.queryDrvPath()->to_string();
+        result["name"] = packageInfo.queryName();
         // TODO: outputs
         result["stats"] = state.getStatistics();
-        result["system"] = systemValue->c_str();
+        result["system"] = packageInfo.querySystem();
 
         loggerMutex.lock();
         printJSON(result);
@@ -165,8 +137,10 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
                     _step(loggerMutex, evalTokens, state, attrPath, *attr.value);
                 } catch (std::exception & e) {
                     loggerMutex.lock();
+                    // TODO: e.what() doesn't post the Nix stack trace.
                     logger->log(
-                        Verbosity::lvlError, "processing " + concatStringsSep(".", attrPath) + " failed: " + e.what());
+                        Verbosity::lvlError,
+                        "processing " + concatStringsSep(".", attrPath) + " failed: " + std::string(e.what()));
                     loggerMutex.unlock();
                     exitCode = 1;
                 }
@@ -236,27 +210,23 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
 
         // TODO: Find a way to push evaluation warnings and errors into the JSON output.
 
-        // TODO: forceValue can throw
-        state.forceValue(value, noPos);
-
-        if (nAttrs != value.type() || value.attrs()->empty()) {
-            evalTokens.post();
-        }
-
-        // TODO: isDerivation can throw
-        else if (state.isDerivation(value)) {
-            try {
-                _baseCase(loggerMutex, state, attrPath, value);
+        // TODO: forceValue can throw.
+        state.forceValue(value, value.determinePos(noPos));
+        if (nAttrs == value.type() && !value.attrs()->empty()) {
+            // TODO: isDerivation can throw.
+            if (state.isDerivation(value)) {
+                PackageInfo packageInfo(state, concatStringsSep(".", attrPath), value.attrs());
+                try {
+                    _baseCase(loggerMutex, state, attrPath, packageInfo);
+                } catch (std::exception & e) {
+                    evalTokens.post(); // Release as part of getting ready for cleanup and exit.
+                    throw e;
+                }
                 evalTokens.post(); // Release as part of getting ready for cleanup and exit.
-            } catch (std::exception & e) {
-                evalTokens.post(); // Release as part of getting ready for cleanup and exit.
-                throw e;
+            } else {
+                evalTokens.post(); // Release prior to recursing deeper.
+                _recursiveCase(loggerMutex, evalTokens, state, attrPath, value);
             }
-        }
-
-        else {
-            evalTokens.post(); // Release prior to recursing deeper.
-            _recursiveCase(loggerMutex, evalTokens, state, attrPath, value);
         }
     }
 
@@ -280,20 +250,18 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
             // Get the attribute path
             auto attrPath = state->symbols.resolve(cursor->getAttrPath());
 
-            // No way to get the value from the cursor without forcing it.
-            auto forcedValue = cursor->forceValue();
-
             // Copied from _step but without the token stuff
-            if (nAttrs != forcedValue.type() || forcedValue.attrs()->empty())
-                /* Do nothing */;
-            else if (state->isDerivation(forcedValue))
-                _baseCase(*loggerMutex, *state, attrPath, forcedValue);
-            else
-                _recursiveCase(*loggerMutex, *evalTokens, *state, attrPath, forcedValue);
+            auto forcedValue = cursor->forceValue();
+            if (nAttrs == forcedValue.type() && !forcedValue.attrs()->empty()) {
+                if (state->isDerivation(forcedValue)) {
+                    PackageInfo packageInfo(*state, concatStringsSep(".", attrPath), forcedValue.attrs());
+                    _baseCase(*loggerMutex, *state, attrPath, packageInfo);
+                } else
+                    _recursiveCase(*loggerMutex, *evalTokens, *state, attrPath, forcedValue);
+            }
         } catch (interprocess_exception & ex) {
             // If we cannot create the shared memory segment, we throw an error.
-            [[unlikely]] throw std::runtime_error(
-                "Failed to create shared memory segment(s): " + std::string(ex.what()));
+            throw std::runtime_error("Failed to create shared memory segment(s): " + std::string(ex.what()));
         }
     }
 };
