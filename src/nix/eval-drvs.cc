@@ -65,19 +65,19 @@ auto getJSON(const EvalState & state, const std::vector<SymbolStr> & attrPath, c
     return result;
 }
 
-auto shouldRecurse(const bool forceRecurse, EvalState & state, const Bindings * const attrs) -> bool
+auto shouldRecurse(const bool forceRecurse, EvalState & state, const Bindings & attrs) -> bool
 {
     if (forceRecurse)
         return true;
 
     // If recurseForDerivations is not present, we do not recurse.
-    const auto recurseForDerivationsAttr = attrs->get(state.sRecurseForDerivations);
+    const auto recurseForDerivationsAttr = attrs.get(state.sRecurseForDerivations);
     if (nullptr == recurseForDerivationsAttr)
         return false;
 
     // Get the value of recurseForDerivations.
-    auto & recurseForDerivationsValue = *recurseForDerivationsAttr->value;
-    state.forceValue(recurseForDerivationsValue, recurseForDerivationsValue.determinePos(attrs->pos));
+    auto recurseForDerivationsValue = *recurseForDerivationsAttr->value;
+    state.forceValue(recurseForDerivationsValue, recurseForDerivationsValue.determinePos(attrs.pos));
     // TODO: check if recurseForDerivationsValue is a boolean, and throw an error if it is not.
 
     // Recurse iff. recurseForDerivations is set to true.
@@ -169,7 +169,7 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         interprocess_mutex & loggerMutex,
         EvalState & state,
         const std::vector<SymbolStr> & attrPath,
-        PackageInfo & packageInfo)
+        const PackageInfo & packageInfo)
     {
         const auto result = getJSON(state, attrPath, packageInfo);
 
@@ -184,14 +184,15 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         interprocess_semaphore & evalTokens,
         EvalState & state,
         std::vector<SymbolStr> & attrPath,
-        const Bindings * const attrs)
+        const Bindings & attrs)
     {
         // Keep track of child processes.
         std::unordered_map<pid_t, SymbolStr> pidToSymbolStr;
-        pidToSymbolStr.reserve(attrs->size());
+        pidToSymbolStr.reserve(attrs.size());
 
         // Spawn the children.
-        for (const auto attr : *attrs) {
+        // NOTE: Attr is only 16B, so we can afford to copy it.
+        for (const auto attr : attrs) {
             const auto symbolStr = state.symbols[attr.name];
             attrPath.push_back(symbolStr); // Mutation is fine since it's only visible to the child after the fork.
             evalTokens.wait();             // Must take eval token in the parent before calling _step in the child.
@@ -221,7 +222,7 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
                     return exitCode;
                 },
                 // onParent
-                [&](const pid_t & pid) -> void { pidToSymbolStr.emplace(pid, symbolStr); });
+                [&](const pid_t pid) -> void { pidToSymbolStr.emplace(pid, symbolStr); });
             attrPath.pop_back(); // Remove the symbolStr from the path, since we are done with it.
         }
 
@@ -302,32 +303,36 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
 
         // TODO: Find a way to push evaluation warnings and errors into the JSON output.
 
+        // TODO: Ensure every path through _step releases the eval token.
+        // Generally, we want to hold on to it as long as possible (for as much evaluation as possible) but we
+        // release it before recursing into the attribute set.
+
         // TODO: forceValue can throw.
         state.forceValue(value, value.determinePos(noPos));
         if (nAttrs == value.type() && !value.attrs()->empty()) {
+            const auto & attrs = *value.attrs();
+
             // TODO: isDerivation can throw.
             if (state.isDerivation(value)) {
-                PackageInfo packageInfo(state, concatStringsSep(".", attrPath), value.attrs());
                 try {
-                    _baseCase(loggerMutex, state, attrPath, packageInfo);
+                    _baseCase(
+                        loggerMutex, state, attrPath, PackageInfo(state, concatStringsSep(".", attrPath), &attrs));
                 } catch (std::exception & e) {
-                    evalTokens.post(); // Release as part of getting ready for cleanup and exit.
+                    evalTokens.post(); // Release for case with derivation throwing an exception.
                     throw e;
                 }
-                evalTokens.post(); // Release as part of getting ready for cleanup and exit.
-            } else {
-                const auto attrs = value.attrs();
-
-                // NOTE: Performing the check for whether we should recurse or not here, rather than in _recursiveCase,
-                // allows us to force recursion into the root attribute set since the first iteration is special-cased
-                // in run.
-                if (!shouldRecurse(forceRecurse, state, attrs))
-                    return;
-
+                evalTokens.post(); // Release for case with derivation.
+            }
+            // NOTE: Performing the check for whether we should recurse or not here, rather than in _recursiveCase,
+            // allows us to force recursion into the root attribute set since the first iteration is special-cased
+            // in run.
+            else if (shouldRecurse(forceRecurse, state, attrs)) {
                 evalTokens.post(); // Release prior to recursing, but after eval required for shouldRecurse.
                 _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrs);
-            }
-        }
+            } else
+                evalTokens.post(); // Release for case without recursion.
+        } else
+            evalTokens.post(); // Release for case with non-attribute set value.
     }
 
     void run(ref<Store> store, ref<InstallableValue> installable) override
@@ -355,13 +360,12 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
             // Copied from _step but without the token stuff
             auto forcedValue = cursor.forceValue();
             if (nAttrs == forcedValue.type() && !forcedValue.attrs()->empty()) {
-                if (state.isDerivation(forcedValue)) {
-                    PackageInfo packageInfo(state, concatStringsSep(".", attrPath), forcedValue.attrs());
-                    _baseCase(loggerMutex, state, attrPath, packageInfo);
-                } else {
-                    const auto attrs = forcedValue.attrs();
+                const auto & attrs = *forcedValue.attrs();
+                if (state.isDerivation(forcedValue))
+                    _baseCase(
+                        loggerMutex, state, attrPath, PackageInfo(state, concatStringsSep(".", attrPath), &attrs));
+                else
                     _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrs);
-                }
             }
         } catch (interprocess_exception & ex) {
             // If we cannot create the shared memory segment, we throw an error.
