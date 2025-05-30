@@ -1,5 +1,6 @@
 #include "nix/cmd/command-installable-value.hh"
 #include "nix/expr/eval-cache.hh"
+#include "nix/expr/eval-error.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/expr/nixexpr.hh"
@@ -7,6 +8,7 @@
 #include "nix/expr/value.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
+#include "nix/store/derivations.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/error.hh"
 #include "nix/util/logging.hh"
@@ -45,18 +47,14 @@ auto getJSON(const EvalState & state, const std::vector<SymbolStr> & attrPath, c
 {
     nlohmann::json result;
 
-    const auto drvPath = packageInfo.queryDrvPath();
-    [[unlikely]] if (!drvPath)
-        throw std::runtime_error(
-            "PackageInfo for " + packageInfo.queryName() + " at " + packageInfo.attrPath
-            + " does not have a derivation path, cannot evaluate.");
-
     // TODO: Either remove cpuTime from statistics or find a way to do a before/after forcing the derivation path
     // to get some sort of marginal cost for the evaluation.
     result["attr"] = packageInfo.attrPath;
     result["attrPath"] = attrPath;
-    // TODO: drvPath does not contain the store prefix.
-    result["drvPath"] = drvPath.value().to_string();
+    // TODO: This is not enough to actually create the derivation in the store.
+    // Check out libstore/derivations.cc and writeDerivation.
+    result["drvPath"] = state.store->printStorePath(packageInfo.requireDrvPath());
+    // result["drv"] = state.store->derivationFromPath(packageInfo.requireDrvPath()).toJSON(state.store->config);
     result["name"] = packageInfo.queryName();
     // TODO: outputs
     result["stats"] = state.getStatistics();
@@ -212,10 +210,7 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
                         _step(loggerMutex, evalTokens, state, attrPath, *attr.value);
                     } catch (std::exception & e) {
                         loggerMutex.lock();
-                        // TODO: e.what() doesn't post the Nix stack trace.
-                        logger->log(
-                            Verbosity::lvlError,
-                            "processing " + concatStringsSep(".", attrPath) + " failed: " + std::string(e.what()));
+                        logger->log(Verbosity::lvlError, e.what());
                         loggerMutex.unlock();
                         exitCode = 1;
                     }
@@ -265,16 +260,17 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
                             // onSuccess
                             [&](const pid_t, const int status) -> void {
                                 // Log if it exited poorly.
-                                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                                    attrPath.push_back(symbolStr);
-                                    loggerMutex.lock();
-                                    logger->log(
-                                        Verbosity::lvlError,
-                                        "child processing " + concatStringsSep(".", attrPath)
-                                            + " did not exit cleanly");
-                                    loggerMutex.unlock();
-                                    attrPath.pop_back();
-                                }
+                                // TODO: Worthwhile to keep this considering we log throws in the child?
+                                // if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                                //     attrPath.push_back(symbolStr);
+                                //     loggerMutex.lock();
+                                //     logger->log(
+                                //         Verbosity::lvlError,
+                                //         "child processing " + concatStringsSep(".", attrPath)
+                                //             + " did not exit cleanly");
+                                //     loggerMutex.unlock();
+                                //     attrPath.pop_back();
+                                // }
                                 // Regardless of whether it exited cleanly or not, we can erase it from the map because
                                 // we have successfully reaped it.
                                 okayToErase = true;
@@ -307,32 +303,32 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         // Generally, we want to hold on to it as long as possible (for as much evaluation as possible) but we
         // release it before recursing into the attribute set.
 
-        // TODO: forceValue can throw.
-        state.forceValue(value, value.determinePos(noPos));
-        if (nAttrs == value.type() && !value.attrs()->empty()) {
-            const auto & attrs = *value.attrs();
+        try {
+            state.forceValue(value, value.determinePos(noPos));
+            if (nAttrs == value.type() && !value.attrs()->empty()) {
+                const auto & attrs = *value.attrs();
 
-            // TODO: isDerivation can throw.
-            if (state.isDerivation(value)) {
-                try {
+                // TODO: isDerivation can throw.
+                if (state.isDerivation(value)) {
                     _baseCase(
                         loggerMutex, state, attrPath, PackageInfo(state, concatStringsSep(".", attrPath), &attrs));
-                } catch (std::exception & e) {
-                    evalTokens.post(); // Release for case with derivation throwing an exception.
-                    throw e;
+                    evalTokens.post(); // Release for case with derivation.
                 }
-                evalTokens.post(); // Release for case with derivation.
-            }
-            // NOTE: Performing the check for whether we should recurse or not here, rather than in _recursiveCase,
-            // allows us to force recursion into the root attribute set since the first iteration is special-cased
-            // in run.
-            else if (shouldRecurse(forceRecurse, state, attrs)) {
-                evalTokens.post(); // Release prior to recursing, but after eval required for shouldRecurse.
-                _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrs);
+                // NOTE: Performing the check for whether we should recurse or not here, rather than in _recursiveCase,
+                // allows us to force recursion into the root attribute set since the first iteration is special-cased
+                // in run.
+                else if (shouldRecurse(forceRecurse, state, attrs)) {
+                    evalTokens.post(); // Release prior to recursing, but after eval required for shouldRecurse.
+                    _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrs);
+                } else
+                    evalTokens.post(); // Release for case without recursion.
             } else
-                evalTokens.post(); // Release for case without recursion.
-        } else
-            evalTokens.post(); // Release for case with non-attribute set value.
+                evalTokens.post(); // Release for case with non-attribute set value.
+        } catch (std::exception & e) {
+            evalTokens.post(); // Release for case with an exception.
+            state.error<nix::EvalError>("evaluation of %s failed: %s", concatStringsSep(".", attrPath), e.what())
+                .debugThrow();
+        }
     }
 
     void run(ref<Store> store, ref<InstallableValue> installable) override
