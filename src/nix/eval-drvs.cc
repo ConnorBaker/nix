@@ -24,7 +24,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
-#include <functional>
 #include <memory>
 #include <nlohmann/json_fwd.hpp>
 #include <nlohmann/json.hpp>
@@ -85,35 +84,32 @@ auto shouldRecurse(const bool forceRecurse, EvalState & state, const Bindings * 
     return recurseForDerivationsValue.boolean();
 }
 
-void doFork(
-    const std::function<void()> & doFailure,
-    const std::function<int()> & doChild,
-    const std::function<void(const pid_t)> & doParent)
+template<class FFailure, class FChild, class FParent>
+void doFork(FFailure && onFailure, FChild && onChild, FParent && onParent)
 {
     const auto pid = fork();
     switch (pid) {
     [[unlikely]] case -1: // fork failed
-        doFailure();
+        std::forward<FFailure>(onFailure)();
         return;
     case 0:
-        _exit(doChild());
+        _exit(std::forward<FChild>(onChild)());
     default:
-        doParent(pid);
+        std::forward<FParent>(onParent)(pid);
         return;
     }
 }
 
-void doWait(
-    const std::function<std::tuple<const pid_t, const int>()> & doWait_,
-    const std::function<void(const pid_t, const int)> & doFailure,
-    const std::function<void(const pid_t, const int)> & doNotReady,
-    const std::function<void(const pid_t, const int)> &
-        doSuccess // Success as in "successfully waited for the child process"
-)
+template<class FWait, class FFailure, class FNotReady, class FSuccess>
+void doWait(FWait && onWait, FFailure && onFailure, FNotReady && onNotReady, FSuccess && onSuccess)
 {
-    const auto [pid, status] = doWait_();
-    const auto func = (pid < 0) ? doFailure : (pid == 0) ? doNotReady : doSuccess;
-    func(pid, status);
+    const auto [pid, status] = std::forward<FWait>(onWait)();
+    [[unlikely]] if (pid < 0) // It's unlikely waitpid failed, but it can happen.
+        std::forward<FFailure>(onFailure)(pid, status);
+    else if (pid == 0)
+        std::forward<FNotReady>(onNotReady)(pid, status);
+    else
+        std::forward<FSuccess>(onSuccess)(pid, status);
 }
 
 struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
@@ -121,6 +117,8 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
     bool json = true;
     bool outputPretty = false;
     bool forceRecurse = false;
+
+    // TODO: See if we can re-use the logic for `cores`.
     uint32_t maxProcesses = 32;
 
     CmdEvalDrvs()
@@ -181,137 +179,6 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         loggerMutex.unlock();
     }
 
-    auto _spawnChildren(
-        interprocess_mutex & loggerMutex,
-        interprocess_semaphore & evalTokens,
-        EvalState & state,
-        std::vector<SymbolStr> & attrPath,
-        const Bindings * const attrs) -> std::unordered_map<pid_t, SymbolStr>
-    {
-        // Keep track of child processes.
-        std::unordered_map<pid_t, SymbolStr> pidToSymbolStr;
-        pidToSymbolStr.reserve(attrs->size());
-
-        const auto doFailure = [&]() -> void {
-            throw std::runtime_error(concatStringsSep(".", attrPath) + ": fork failed");
-        };
-
-        const auto doChild = [&](auto & value) {
-            return [&]() -> int {
-                int exitCode = 0;
-                try {
-                    // TODO:
-                    // This is gross and probably doesn't work in the way I hope it does.
-                    // The goal is to force re-creation of the file descriptors/sockets used for the build and eval
-                    // store.
-                    state.store->init();
-                    state.buildStore->init();
-                    _step(loggerMutex, evalTokens, state, attrPath, value);
-                } catch (std::exception & e) {
-                    loggerMutex.lock();
-                    // TODO: e.what() doesn't post the Nix stack trace.
-                    logger->log(
-                        Verbosity::lvlError,
-                        "processing " + concatStringsSep(".", attrPath) + " failed: " + std::string(e.what()));
-                    loggerMutex.unlock();
-                    exitCode = 1;
-                }
-                return exitCode;
-            };
-        };
-
-        const auto doParent = [&](const auto & symbolStr) {
-            return [&](const pid_t & pid) -> void {
-                // Post the eval token so that the parent can continue
-                pidToSymbolStr.emplace(pid, symbolStr);
-            };
-        };
-
-        for (const auto attr : *attrs) {
-            const auto symbolStr = state.symbols[attr.name];
-            attrPath.push_back(symbolStr); // Mutation is fine since it's only visible to the child after the fork.
-            evalTokens.wait();             // Must take eval token in the parent before calling _step in the child.
-            doFork(doFailure, doChild(*attr.value), doParent(symbolStr));
-            attrPath.pop_back(); // Remove the symbolStr from the path, since we are done with it.
-        }
-
-        return pidToSymbolStr;
-    }
-
-    void _waitChildren(
-        interprocess_mutex & loggerMutex,
-        interprocess_semaphore & evalTokens,
-        EvalState & state,
-        std::vector<SymbolStr> & attrPath,
-        const Bindings * const attrs,
-        std::unordered_map<pid_t, SymbolStr> & pidToSymbolStr)
-    {
-        using namespace std::chrono_literals;
-
-        const auto doWait_ = [](const pid_t & pid) {
-            return [&]() -> std::tuple<pid_t, int> {
-                int status = 0;
-                const auto pid_ = waitpid(pid, &status, WNOHANG | WUNTRACED);
-                return {pid_, status};
-            };
-        };
-
-        const auto doFailure = [&](bool & result, const auto & symbolStr) {
-            return [&](const pid_t & _pid, const int & _status) -> void {
-                attrPath.push_back(symbolStr);
-                loggerMutex.lock();
-                logger->log(
-                    Verbosity::lvlError,
-                    "waitpid failed for child processing " + concatStringsSep(".", attrPath) + ": "
-                        + std::string(strerror(errno)));
-                loggerMutex.unlock();
-                attrPath.pop_back();
-                result = false; // Mark for later checking.
-            };
-        };
-
-        const auto doNotReady = [](bool & result) {
-            return [&](const pid_t & _pid, const int & _status) -> void {
-                result = false; // Mark for later checking.
-            };
-        };
-
-        const auto doSuccess = [&](bool & result, const auto & symbolStr) {
-            return [&](const pid_t & _pid, const int & status) -> void {
-                // Log if it exited poorly.
-                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                    attrPath.push_back(symbolStr);
-                    loggerMutex.lock();
-                    logger->log(
-                        Verbosity::lvlError,
-                        "child processing " + concatStringsSep(".", attrPath) + " did not exit cleanly");
-                    loggerMutex.unlock();
-                    attrPath.pop_back();
-                }
-                result = true; // Mark for removal.
-            };
-        };
-
-        const auto eraseTest = [&](const auto & tup2) -> bool {
-            const auto & [pid, symbolStr] = tup2;
-            bool result = false;
-            doWait(doWait_(pid), doFailure(result, symbolStr), doNotReady(result), doSuccess(result, symbolStr));
-            return result;
-        };
-
-        while (!pidToSymbolStr.empty()) {
-            // Wait for all of the children, looping through them so long as there is at least one which has not
-            // been awaited.
-            pidToSymbolStr.erase(
-                std::erase_if( // NOLINT(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
-                    pidToSymbolStr,
-                    eraseTest));
-
-            // NOTE: It helps (noticeably) to have a small sleep here so the parent isn't in a hot loop.
-            std::this_thread::sleep_for(500ms);
-        }
-    }
-
     void _recursiveCase(
         interprocess_mutex & loggerMutex,
         interprocess_semaphore & evalTokens,
@@ -319,8 +186,107 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
         std::vector<SymbolStr> & attrPath,
         const Bindings * const attrs)
     {
-        auto pidToSymbolStr = _spawnChildren(loggerMutex, evalTokens, state, attrPath, attrs);
-        _waitChildren(loggerMutex, evalTokens, state, attrPath, attrs, pidToSymbolStr);
+        // Keep track of child processes.
+        std::unordered_map<pid_t, SymbolStr> pidToSymbolStr;
+        pidToSymbolStr.reserve(attrs->size());
+
+        // Spawn the children.
+        for (const auto attr : *attrs) {
+            const auto symbolStr = state.symbols[attr.name];
+            attrPath.push_back(symbolStr); // Mutation is fine since it's only visible to the child after the fork.
+            evalTokens.wait();             // Must take eval token in the parent before calling _step in the child.
+            doFork(
+                // onFailure
+                [&]() -> void { throw std::runtime_error(concatStringsSep(".", attrPath) + ": fork failed"); },
+                // onChild
+                [&]() -> int {
+                    int exitCode = 0;
+                    try {
+                        // TODO:
+                        // This is gross and probably doesn't work in the way I hope it does.
+                        // The goal is to force re-creation of the file descriptors/sockets used for the build and
+                        // eval store.
+                        state.store->init();
+                        state.buildStore->init();
+                        _step(loggerMutex, evalTokens, state, attrPath, *attr.value);
+                    } catch (std::exception & e) {
+                        loggerMutex.lock();
+                        // TODO: e.what() doesn't post the Nix stack trace.
+                        logger->log(
+                            Verbosity::lvlError,
+                            "processing " + concatStringsSep(".", attrPath) + " failed: " + std::string(e.what()));
+                        loggerMutex.unlock();
+                        exitCode = 1;
+                    }
+                    return exitCode;
+                },
+                // onParent
+                [&](const pid_t & pid) -> void { pidToSymbolStr.emplace(pid, symbolStr); });
+            attrPath.pop_back(); // Remove the symbolStr from the path, since we are done with it.
+        }
+
+        // Wait for all of the children to finish.
+        while (!pidToSymbolStr.empty()) {
+            // Wait for all of the children, looping through them so long as there is at least one which has not
+            // been awaited.
+            pidToSymbolStr.erase(
+                std::erase_if( // NOLINT(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
+                    pidToSymbolStr,
+                    [&](const std::tuple<const pid_t, const SymbolStr> tup2) -> bool {
+                        const auto [pid, symbolStr] = tup2;
+                        bool okayToErase = false;
+                        doWait(
+                            // onWait
+                            [pid]() -> std::tuple<const pid_t, const int> {
+                                int status = 0;
+                                const auto pid_ = waitpid(
+                                    // For some reason, the clang-analyzer can't figure out that `pid` is neither being
+                                    // dereferenced nor is null.
+                                    pid, // NOLINT(clang-analyzer-core.NullDereference)
+                                    &status,
+                                    WNOHANG | WUNTRACED);
+                                return {pid_, status};
+                            },
+                            // onFailure
+                            [&](const pid_t, const int) -> void {
+                                attrPath.push_back(symbolStr);
+                                loggerMutex.lock();
+                                logger->log(
+                                    Verbosity::lvlError,
+                                    "waitpid failed for child processing " + concatStringsSep(".", attrPath) + ": "
+                                        + std::string(strerror(errno)));
+                                loggerMutex.unlock();
+                                attrPath.pop_back();
+                                okayToErase = false;
+                            },
+                            // onNotReady
+                            [&](const pid_t, const int) -> void { okayToErase = false; },
+                            // onSuccess
+                            [&](const pid_t, const int status) -> void {
+                                // Log if it exited poorly.
+                                if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                                    attrPath.push_back(symbolStr);
+                                    loggerMutex.lock();
+                                    logger->log(
+                                        Verbosity::lvlError,
+                                        "child processing " + concatStringsSep(".", attrPath)
+                                            + " did not exit cleanly");
+                                    loggerMutex.unlock();
+                                    attrPath.pop_back();
+                                }
+                                // Regardless of whether it exited cleanly or not, we can erase it from the map because
+                                // we have successfully reaped it.
+                                okayToErase = true;
+                            });
+                        return okayToErase;
+                    }));
+
+            // NOTE: It helps (noticeably) to have a small sleep here so the parent isn't in a hot loop.
+            {
+                using namespace std::chrono_literals;
+                std::this_thread::sleep_for(500ms);
+            }
+        }
     }
 
     // NOTE: _step must only ever be called from the child process of a fork.
@@ -387,7 +353,7 @@ struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
             auto attrPath = state.symbols.resolve(cursor.getAttrPath());
 
             // Copied from _step but without the token stuff
-            auto & forcedValue = cursor.forceValue();
+            auto forcedValue = cursor.forceValue();
             if (nAttrs == forcedValue.type() && !forcedValue.attrs()->empty()) {
                 if (state.isDerivation(forcedValue)) {
                     PackageInfo packageInfo(state, concatStringsSep(".", attrPath), forcedValue.attrs());
