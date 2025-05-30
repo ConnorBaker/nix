@@ -29,7 +29,6 @@
 #include <memory>
 #include <nlohmann/json_fwd.hpp>
 #include <nlohmann/json.hpp>
-#include <optional>
 #include <sched.h>
 #include <stdexcept>
 #include <string>
@@ -51,7 +50,8 @@ auto getJSON(const EvalState & state, const std::vector<SymbolStr> & attrPath, c
     // to get some sort of marginal cost for the evaluation.
     result["attr"] = packageInfo.attrPath;
     result["attrPath"] = attrPath;
-    // TODO: This is not enough to actually create the derivation in the store.
+    // TODO: This is not enough to actually create the derivation in the store, or is failing because file descriptors
+    // are shared between processes.
     // Check out libstore/derivations.cc and writeDerivation.
     result["drvPath"] = state.store->printStorePath(packageInfo.requireDrvPath());
     // result["drv"] = state.store->derivationFromPath(packageInfo.requireDrvPath()).toJSON(state.store->config);
@@ -75,11 +75,10 @@ auto shouldRecurse(const bool forceRecurse, EvalState & state, const Bindings & 
 
     // Get the value of recurseForDerivations.
     auto recurseForDerivationsValue = *recurseForDerivationsAttr->value;
-    state.forceValue(recurseForDerivationsValue, recurseForDerivationsValue.determinePos(attrs.pos));
-    // TODO: check if recurseForDerivationsValue is a boolean, and throw an error if it is not.
-
-    // Recurse iff. recurseForDerivations is set to true.
-    return recurseForDerivationsValue.boolean();
+    return state.forceBool(
+        recurseForDerivationsValue,
+        recurseForDerivationsValue.determinePos(attrs.pos),
+        "while evaluating the `recurseForDerivations` attribute");
 }
 
 template<class FFailure, class FChild, class FParent>
@@ -110,7 +109,7 @@ void doWait(FWait && onWait, FFailure && onFailure, FNotReady && onNotReady, FSu
         std::forward<FSuccess>(onSuccess)(pid, status);
 }
 
-struct CmdEvalDrvs : InstallableValueCommand, MixReadOnlyOption, MixPrintJSON
+struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
 {
     bool json = true;
     bool outputPretty = false;
