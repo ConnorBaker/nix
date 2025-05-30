@@ -41,6 +41,28 @@
 using namespace nix;
 using namespace boost::interprocess;
 
+// NOTE: EvalState attributes to be concerned about:
+//
+// - storeFS
+// - rootFS
+// - corepkgsFS
+// - internalFS
+// - derivationInternal
+// - store
+// - buildStore
+// - inputCache
+// - evalCaches
+// - srcToStore
+// - fileParseCache
+// - fileEvalCache
+// - positionToDocComment
+// - lookupPathResolved
+//
+// In terms of direct dependencies on the store attributes:
+//
+// - storeFS is initialized with store
+// - rootFS is initialized with store (and storeFS!)
+
 auto getJSON(const EvalState & state, const std::vector<SymbolStr> & attrPath, const PackageInfo & packageInfo)
     -> const nlohmann::json
 {
@@ -50,11 +72,7 @@ auto getJSON(const EvalState & state, const std::vector<SymbolStr> & attrPath, c
     // to get some sort of marginal cost for the evaluation.
     result["attr"] = packageInfo.attrPath;
     result["attrPath"] = attrPath;
-    // TODO: This is not enough to actually create the derivation in the store, or is failing because file descriptors
-    // are shared between processes.
-    // Check out libstore/derivations.cc and writeDerivation.
     result["drvPath"] = state.store->printStorePath(packageInfo.requireDrvPath());
-    // result["drv"] = state.store->derivationFromPath(packageInfo.requireDrvPath()).toJSON(state.store->config);
     result["name"] = packageInfo.queryName();
     // TODO: outputs
     result["stats"] = state.getStatistics();
@@ -204,8 +222,10 @@ struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
                         // This is gross and probably doesn't work in the way I hope it does.
                         // The goal is to force re-creation of the file descriptors/sockets used for the build and
                         // eval store.
-                        state.store->init();
-                        state.buildStore->init();
+                        *const_cast<ref<Store> *>(&state.store) = // NOLINT(cppcoreguidelines-pro-type-const-cast)
+                            state.store->config.openStore();
+                        *const_cast<ref<Store> *>(&state.buildStore) = // NOLINT(cppcoreguidelines-pro-type-const-cast)
+                            state.buildStore->config.openStore();
                         _step(loggerMutex, evalTokens, state, attrPath, *attr.value);
                     } catch (std::exception & e) {
                         loggerMutex.lock();
@@ -353,6 +373,9 @@ struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
             auto attrPath = state.symbols.resolve(cursor.getAttrPath());
 
             // Copied from _step but without the token stuff
+            // TODO: The output attrPath does not include the root?
+            // For example, if run with .#hydraJobs, all of the output attrPaths are rooted at children of `hydraJobs`,
+            // rather than at `hydraJobs` itself.
             auto forcedValue = cursor.forceValue();
             if (nAttrs == forcedValue.type() && !forcedValue.attrs()->empty()) {
                 const auto & attrs = *forcedValue.attrs();
