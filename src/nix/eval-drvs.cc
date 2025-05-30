@@ -222,6 +222,7 @@ struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
                         // This is gross and probably doesn't work in the way I hope it does.
                         // The goal is to force re-creation of the file descriptors/sockets used for the build and
                         // eval store.
+                        // TODO: Create a pool of file descriptors/sockets which can be reused across children.
                         *const_cast<ref<Store> *>(&state.store) = // NOLINT(cppcoreguidelines-pro-type-const-cast)
                             state.store->config.openStore();
                         *const_cast<ref<Store> *>(&state.buildStore) = // NOLINT(cppcoreguidelines-pro-type-const-cast)
