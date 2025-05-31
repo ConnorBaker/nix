@@ -6,7 +6,6 @@
 #include "nix/expr/nixexpr.hh"
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/value.hh"
-#include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/store-api.hh"
@@ -16,7 +15,6 @@
 #include "nix/util/strings-inline.hh"
 #include "nix/util/util.hh"
 
-#include <algorithm>
 #include <bits/chrono.h>
 #include <bits/elements_of.h>
 #include <boost/interprocess/anonymous_shared_memory.hpp>
@@ -104,54 +102,80 @@ auto shouldRecurse(const bool forceRecurse, EvalState & state, const Bindings & 
         "while evaluating the `recurseForDerivations` attribute");
 }
 
-template<class FFailure, class FChild, class FParent>
-void doFork(FFailure && onFailure, FChild && onChild, FParent && onParent)
+// Forks the current process and runs the child function in the child process.
+// If the fork fails, the failure function is called in the parent process.
+// The child process exits with the return value of the child function.
+// NOTE: Because control flow returns to the parent process after this function, there is no
+// `onParent` argument.
+template<class FFailure, class FChild>
+auto doFork(
+    FFailure && onFailure, // :: () -> void
+    FChild && onChild      // :: () -> int
+    ) -> pid_t
 {
     const auto pid = fork();
-    switch (pid) {
-    [[unlikely]] case -1: // fork failed
+    [[unlikely]] if (pid < 0) {
         std::forward<FFailure>(onFailure)();
-        return;
-    case 0:
+        return pid;
+    } else if (pid == 0)
         _exit(std::forward<FChild>(onChild)());
-    default:
-        std::forward<FParent>(onParent)(pid);
-        return;
+    else
+        return pid;
+}
+
+// Returns true if the child process was successfully waited for, false otherwise.
+template<class FFailure, class FNotReady, class FSuccess>
+auto doWait(
+    const pid_t pid,
+    FFailure && onFailure,   // :: (pid_t, int) -> void
+    FNotReady && onNotReady, // :: (pid_t, int) -> void
+    FSuccess && onSuccess    // :: (pid_t, int) -> void
+    ) -> bool
+{
+    int status = 0;
+    const auto awaitedPid = waitpid(pid, &status, WNOHANG | WUNTRACED);
+
+    [[unlikely]] if (awaitedPid < 0) {
+        std::forward<FFailure>(onFailure)(awaitedPid, status);
+        return false;
+    } else if (awaitedPid == 0) {
+        std::forward<FNotReady>(onNotReady)(awaitedPid, status);
+        return false;
+    } else {
+        std::forward<FSuccess>(onSuccess)(awaitedPid, status);
+        return true;
     }
 }
 
-template<class FWait, class FFailure, class FNotReady, class FSuccess>
-void doWait(FWait && onWait, FFailure && onFailure, FNotReady && onNotReady, FSuccess && onSuccess)
-{
-    const auto [pid, status] = std::forward<FWait>(onWait)();
-    [[unlikely]] if (pid < 0) // It's unlikely waitpid failed, but it can happen.
-        std::forward<FFailure>(onFailure)(pid, status);
-    else if (pid == 0)
-        std::forward<FNotReady>(onNotReady)(pid, status);
-    else
-        std::forward<FSuccess>(onSuccess)(pid, status);
-}
-
-// Specialized for unordered_map, as erase and erase_if performance differ across containers.
-template<typename K, typename V, class FPred>
-void doUnorderedWaits(std::unordered_map<K, V> & tasks, FPred && taskIsComplete)
+template<std::ranges::input_range Range, class FEach, class FWait>
+void doForEachParallel(
+    Range && r,      // :: Range a
+    FEach && onEach, // :: a -> (b, c)
+    FWait && onWait  // :: (b, c) -> bool
+)
 {
     using namespace std::chrono_literals;
-    // NOTE: Cannot forward in the loop, as that would be a use-after-move.
-    auto pred = std::forward<FPred>(taskIsComplete);
-    while (!tasks.empty()) {
-        tasks.erase(std::erase_if( // NOLINT(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
-            tasks,
-            pred));
+
+    // Populate the pidMap.
+    // NOTE: Keys are required to be unique.
+    auto pidMap = std::forward<Range>(r) | std::views::transform(std::forward<FEach>(onEach))
+                  | std::ranges::to<std::unordered_map>();
+
+    // Drain the pidMap.
+    const auto waitAndShouldErasePredicate = std::forward<FWait>(onWait);
+    while (!pidMap.empty()) {
+        // Remove all of the children which have finished.
+        pidMap.erase(std::erase_if( // NOLINT(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
+            pidMap,
+            waitAndShouldErasePredicate));
+
         // NOTE: It helps (noticeably) to have a small sleep here so the parent isn't in a hot loop.
         std::this_thread::sleep_for(500ms);
     }
 }
 
-struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
+struct CmdEvalDrvs : InstallableValueCommand
 {
-    bool json = true;
-    bool outputPretty = false;
     bool forceRecurse = false;
 
     // TODO: See if we can re-use the logic for `cores`.
@@ -219,82 +243,65 @@ struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
         interprocess_semaphore & evalTokens,
         EvalState & state,
         std::vector<SymbolStr> & attrPath,
+        const std::string & attrPathStr,
         const Bindings & attrs)
     {
-        std::unordered_map<pid_t, SymbolStr> pidToSymbolStr;
-        pidToSymbolStr.reserve(attrs.size()); // Reserve space for the number of attributes.
+        doForEachParallel(
+            attrs,
 
-        std::ranges::for_each(attrs, [&](auto attr) {
-            const auto symbolStr = state.symbols[attr.name];
-            pid_t pid = 0;     // Initialize pid to 0, so we can use it in the lambda below.
-            evalTokens.wait(); // Must take eval token in the parent before calling _step in the child.
-            doFork(
-                // onFailure
-                [&]() -> void {
-                    throw std::runtime_error(concatStringsSep(".", attrPath) + "." + symbolStr + ": fork failed");
-                },
-                // onChild
-                [&]() -> int {
-                    attrPath.push_back(symbolStr); // Only visible to the child.
-                    try {
-                        // TODO:
-                        // This is gross and probably doesn't work in the way I hope it does.
-                        // The goal is to force re-creation of the file descriptors/sockets used for the build and
-                        // eval store.
-                        // TODO: Create a pool of file descriptors/sockets which can be reused across children.
-                        *const_cast<ref<Store> *>(&state.store) = // NOLINT(cppcoreguidelines-pro-type-const-cast)
-                            state.store->config.openStore();
-                        *const_cast<ref<Store> *>( // NOLINT(cppcoreguidelines-pro-type-const-cast)
-                            &state.buildStore) = state.buildStore->config.openStore();
-                        _step(loggerMutex, evalTokens, state, attrPath, *attr.value);
-                    } catch (std::exception & e) {
+            // onEach
+            [&](const Attr attr) -> std::tuple<const pid_t, const SymbolStr> {
+                const auto symbolStr = state.symbols[attr.name];
+                evalTokens.wait(); // Must take eval token in the parent before calling _step in the child.
+                const auto pid = doFork(
+                    // onFailure
+                    [&]() -> void { throw std::runtime_error(attrPathStr + "." + symbolStr + ": fork failed"); },
+                    // onChild
+                    [&]() -> int {
+                        attrPath.push_back(symbolStr); // Only visible to the child.
+                        try {
+                            // TODO:
+                            // This is gross and probably doesn't work in the way I hope it does.
+                            // The goal is to force re-creation of the file descriptors/sockets used for the build and
+                            // eval store.
+                            // TODO: Create a pool of file descriptors/sockets which can be reused across children.
+                            *const_cast<ref<Store> *>(&state.store) = // NOLINT(cppcoreguidelines-pro-type-const-cast)
+                                state.store->config.openStore();
+                            *const_cast<ref<Store> *>( // NOLINT(cppcoreguidelines-pro-type-const-cast)
+                                &state.buildStore) = state.buildStore->config.openStore();
+
+                            // NOTE: _step catches exceptions and releases the eval token before re-throwing.
+                            _step(loggerMutex, evalTokens, state, attrPath, *attr.value);
+                        } catch (std::exception & e) {
+                            loggerMutex.lock();
+                            logger->log(Verbosity::lvlError, e.what());
+                            loggerMutex.unlock();
+                            return 1; // Failure.
+                        }
+                        return 0; // Success.
+                    });
+                return std::make_tuple(pid, symbolStr);
+            },
+
+            // onWait
+            [&](std::tuple<const pid_t, const SymbolStr> pidAndSymbolStr) -> bool {
+                // NOTE: If we do tuple unpacking, clang-tidy complains about symbolStr being a null pointer.
+                return doWait(
+                    std::get<0>(pidAndSymbolStr),
+                    // onFailure
+                    [&](const auto...) -> void {
                         loggerMutex.lock();
-                        logger->log(Verbosity::lvlError, e.what());
+                        logger->log(
+                            Verbosity::lvlError,
+                            "waitpid failed for child processing " + attrPathStr + "." + std::get<1>(pidAndSymbolStr)
+                                + ": " + std::string(strerror(errno)));
                         loggerMutex.unlock();
-                        return 1; // Failure.
-                    }
-                    return 0; // Success.
-                },
-                // onParent
-                [&](const pid_t pid_) -> void { pid = pid_; });
-
-            pidToSymbolStr.emplace(pid, symbolStr); // Store the pid and symbolStr in the map.
-        });
-
-        // Wait for all of the children to finish.
-        doUnorderedWaits(pidToSymbolStr, [&](const std::tuple<const pid_t, const SymbolStr> tup2) -> bool {
-            const auto [pid, symbolStr] = tup2;
-            bool completed = false;
-            doWait(
-                // onWait
-                [pid]() -> std::tuple<const pid_t, const int> {
-                    int status = 0;
-                    const auto pid_ = waitpid(
-                        // For some reason, the clang-analyzer can't figure out that `pid` is neither
-                        // being dereferenced nor is null.
-                        pid, // NOLINT(clang-analyzer-core.NullDereference)
-                        &status,
-                        WNOHANG | WUNTRACED);
-                    return {pid_, status};
-                },
-                // onFailure
-                [&](const pid_t, const int) -> void {
-                    attrPath.push_back(symbolStr);
-                    loggerMutex.lock();
-                    logger->log(
-                        Verbosity::lvlError,
-                        "waitpid failed for child processing " + concatStringsSep(".", attrPath) + ": "
-                            + std::string(strerror(errno)));
-                    loggerMutex.unlock();
-                    attrPath.pop_back();
-                    completed = false;
-                },
-                // onNotReady
-                [&](const pid_t, const int) -> void { completed = false; },
-                // onSuccess
-                [&](const pid_t, const int) -> void { completed = true; });
-            return completed;
-        });
+                    },
+                    // onNotReady
+                    [](const auto...) -> void {},
+                    // onSuccess
+                    [](const auto...) -> void {});
+            });
     }
 
     // NOTE: _step must only ever be called from the child process of a fork.
@@ -314,6 +321,9 @@ struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
         // Generally, we want to hold on to it as long as possible (for as much evaluation as possible) but we
         // release it before recursing into the attribute set.
 
+        // Used throughout, so declare once here.
+        const auto attrPathStr = concatStringsSep(".", attrPath);
+
         try {
             state.forceValue(value, value.determinePos(noPos));
             if (nAttrs == value.type() && !value.attrs()->empty()) {
@@ -321,8 +331,7 @@ struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
 
                 // TODO: isDerivation can throw.
                 if (state.isDerivation(value)) {
-                    _baseCase(
-                        loggerMutex, state, attrPath, PackageInfo(state, concatStringsSep(".", attrPath), &attrs));
+                    _baseCase(loggerMutex, state, attrPath, PackageInfo(state, attrPathStr, &attrs));
                     evalTokens.post(); // Release for case with derivation.
                 }
                 // NOTE: Performing the check for whether we should recurse or not here, rather than in _recursiveCase,
@@ -330,23 +339,19 @@ struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
                 // in run.
                 else if (shouldRecurse(forceRecurse, state, attrs)) {
                     evalTokens.post(); // Release prior to recursing, but after eval required for shouldRecurse.
-                    _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrs);
+                    _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrPathStr, attrs);
                 } else
                     evalTokens.post(); // Release for case without recursion.
             } else
                 evalTokens.post(); // Release for case with non-attribute set value.
         } catch (std::exception & e) {
             evalTokens.post(); // Release for case with an exception.
-            state.error<nix::EvalError>("evaluation of %s failed: %s", concatStringsSep(".", attrPath), e.what())
-                .debugThrow();
+            state.error<nix::EvalError>("evaluation of %s failed: %s", attrPathStr, e.what()).debugThrow();
         }
     }
 
     void run(ref<Store> store, ref<InstallableValue> installable) override
     {
-        if (outputPretty)
-            throw std::runtime_error("The --output-pretty flag is not supported by this command.");
-
         auto & state = *installable->state;
         auto & cursor = *installable->getCursor(state);
         logger->stop();
@@ -363,6 +368,7 @@ struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
 
             // Get the attribute path
             auto attrPath = state.symbols.resolve(cursor.getAttrPath());
+            const auto attrPathStr = concatStringsSep(".", attrPath);
 
             // Copied from _step but without the token stuff
             // TODO: The output attrPath does not include the root?
@@ -372,10 +378,9 @@ struct CmdEvalDrvs : InstallableValueCommand, MixPrintJSON
             if (nAttrs == forcedValue.type() && !forcedValue.attrs()->empty()) {
                 const auto & attrs = *forcedValue.attrs();
                 if (state.isDerivation(forcedValue))
-                    _baseCase(
-                        loggerMutex, state, attrPath, PackageInfo(state, concatStringsSep(".", attrPath), &attrs));
+                    _baseCase(loggerMutex, state, attrPath, PackageInfo(state, attrPathStr, &attrs));
                 else
-                    _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrs);
+                    _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrPathStr, attrs);
             }
         } catch (interprocess_exception & ex) {
             // If we cannot create the shared memory segment, we throw an error.
