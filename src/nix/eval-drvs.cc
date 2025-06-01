@@ -66,8 +66,11 @@ using namespace boost::interprocess;
 // - storeFS is initialized with store
 // - rootFS is initialized with store (and storeFS!)
 
-auto getJSON(const EvalState & state, const std::vector<SymbolStr> & attrPath, const PackageInfo & packageInfo)
-    -> const nlohmann::json
+auto getJSON(
+    const bool showStats,
+    const EvalState & state,
+    const std::vector<SymbolStr> & attrPath,
+    const PackageInfo & packageInfo) -> const nlohmann::json
 {
     nlohmann::json result;
 
@@ -78,7 +81,8 @@ auto getJSON(const EvalState & state, const std::vector<SymbolStr> & attrPath, c
     result["drvPath"] = state.store->printStorePath(packageInfo.requireDrvPath());
     result["name"] = packageInfo.queryName();
     // TODO: outputs
-    result["stats"] = state.getStatistics();
+    if (showStats)
+        result["stats"] = state.getStatistics();
     result["system"] = packageInfo.querySystem();
 
     return result;
@@ -174,9 +178,212 @@ void doForEachParallel(
     }
 }
 
+struct PushDownParallel
+{
+    // This is a helper struct to push down parallelism into the `doForEachParallel` function.
+    // It is used to avoid capturing the `this` pointer in lambdas, which can cause issues with
+    // shared ownership and lifetime management.
+
+    // TODO: Access to the logger, or just a function we can use to log?
+    // TODO: Access to write output, or just a function we can use to write output?
+    PushDownParallel(
+        // Required for evaluation
+        std::vector<SymbolStr> attrPath,
+        ref<EvalState> state,
+        Value & value,
+
+        // Configuration
+        const uint32_t maxProcesses,
+        const bool forceRecurse,
+        const bool showStats)
+        : logger(makeSimpleLogger())
+        , attrPath(std::move(attrPath))
+        , attrPathStr(concatStringsSep(".", this->attrPath))
+        , state(std::move(state))
+        , value(value)
+        , forceRecurse(forceRecurse)
+        , showStats(showStats)
+        , loggerMutexRegion(anonymous_shared_memory(sizeof(interprocess_mutex)))
+        , loggerMutex(static_cast<interprocess_mutex *>(loggerMutexRegion.get_address()))
+        , evalTokensRegion(anonymous_shared_memory(sizeof(interprocess_semaphore)))
+        , evalTokens(static_cast<interprocess_semaphore *>(evalTokensRegion.get_address()))
+    // TODO: For things which are known as a result of configuration (e.g., forceRecurse, showStats),
+    // we should select implementations of the methods generated through template specialization.
+    // This would allow us to avoid the overhead of the `if` checks in the methods.
+    {
+        // Construct in place using placement new:
+        new (loggerMutex) interprocess_mutex();
+        new (evalTokens) interprocess_semaphore(maxProcesses);
+    }
+
+public:
+
+    void run()
+    {
+        state->forceValue(value, value.determinePos(noPos));
+        if (nAttrs == value.type() && !value.attrs()->empty()) {
+            const auto & attrs = *value.attrs();
+            if (state->isDerivation(value))
+                _baseCase(PackageInfo(*state, attrPathStr, &attrs));
+            else
+                _recursiveCase(attrs);
+        }
+    }
+
+private:
+    // Logger
+    std::unique_ptr<Logger> logger;
+
+    // Required for evaluation
+    std::vector<SymbolStr> attrPath;
+    std::string attrPathStr; // Cached instead of recomputing it every time.
+    ref<EvalState> state;
+    Value value; // Cached forced value, if applicable.
+
+    // Configuration
+    bool forceRecurse;
+    bool showStats;
+
+    // Required for parallelism
+    mapped_region loggerMutexRegion;
+    interprocess_mutex * loggerMutex; // placement-new in shared memory, do not delete
+
+    mapped_region evalTokensRegion;
+    interprocess_semaphore * evalTokens; // placement-new in shared memory, do not delete
+
+    void _log(const Verbosity lvl, const std::string & msg)
+    {
+        loggerMutex->lock();
+        logger->log(lvl, msg);
+        loggerMutex->unlock();
+    }
+
+    // It is assumed the value has already been forced, like by _testDerivation.
+    void _baseCase(const PackageInfo & packageInfo)
+    {
+        const auto result = getJSON(showStats, *state, attrPath, packageInfo);
+
+        // Acquire the logger mutex and write the result to stdout.
+        loggerMutex->lock();
+        logger->writeToStdout(result.dump());
+        loggerMutex->unlock();
+    }
+
+    void _recursiveCase(const Bindings & attrs)
+    {
+        doForEachParallel(
+            attrs,
+
+            // onEach
+            [&](const Attr attr) -> std::tuple<const pid_t, const SymbolStr> {
+                const auto symbolStr = state->symbols[attr.name];
+                evalTokens->wait(); // Must take eval token in the parent before calling _step in the child.
+                const auto pid = doFork(
+                    // onFailure
+                    [&]() -> void { throw std::runtime_error(attrPathStr + "." + symbolStr + ": fork failed"); },
+                    // onChild
+                    [&]() -> int {
+                        try {
+                            // TODO:
+                            // This is gross and probably doesn't work in the way I hope it does.
+                            // The goal is to force re-creation of the file descriptors/sockets used for the build and
+                            // eval store.
+                            // TODO: Create a pool of file descriptors/sockets which can be reused across children.
+                            // TODO: This is unecessary if the store is owned by the user rather than the daemon.
+                            *const_cast<ref<Store> *>(&state->store) = // NOLINT(cppcoreguidelines-pro-type-const-cast)
+                                state->store->config.openStore();
+                            // TODO: We need the build store in case of IFD, right?
+                            *const_cast<ref<Store> *>( // NOLINT(cppcoreguidelines-pro-type-const-cast)
+                                &state->buildStore) = state->buildStore->config.openStore();
+
+                            // Update the object now that we're in the child process (and so these changes are visible
+                            // only to the child).
+                            // NOTE: These steps mirror the dependencies in the constructor.
+                            attrPath.push_back(symbolStr);
+                            attrPathStr += "." + symbolStr;
+                            value = *attr.value;
+
+                            // NOTE: _step catches exceptions and releases the eval token before re-throwing.
+                            _step();
+                            return 0; // Success.
+                        } catch (std::exception & e) {
+                            _log(Verbosity::lvlError, e.what());
+                            return 1; // Failure.
+                        }
+                    });
+                return std::make_tuple(pid, symbolStr);
+            },
+
+            // onWait
+            [&](std::tuple<const pid_t, const SymbolStr> pidAndSymbolStr) -> bool {
+                // NOTE: If we do tuple unpacking, clang-tidy complains about symbolStr being a null pointer.
+                return doWait(
+                    std::get<0>(pidAndSymbolStr),
+                    // onFailure
+                    [&](const auto...) -> void {
+                        _log(
+                            Verbosity::lvlError,
+                            "waitpid failed for child processing " + attrPathStr + "." + std::get<1>(pidAndSymbolStr)
+                                + ": " + std::string(strerror(errno)));
+                    },
+                    // onNotReady
+                    [](const auto...) -> void {},
+                    // onSuccess
+                    [](const auto...) -> void {});
+            });
+    }
+
+    // NOTE: _step must only ever be called from the child process of a fork.
+    // NOTE: It is assumed that prior to _step being called, an eval token is taken.
+    void _step()
+    {
+        checkInterrupt();
+
+        // TODO: Find a way to push evaluation warnings and errors into the JSON output.
+
+        // TODO: Ensure every path through _step releases the eval token.
+        // Generally, we want to hold on to it as long as possible (for as much evaluation as possible) but we
+        // release it before recursing into the attribute set.
+
+        try {
+            state->forceValue(value, value.determinePos(noPos));
+
+            // Only case where we have anything to do.
+            if (nAttrs == value.type() && !value.attrs()->empty()) {
+                const auto & attrs = *value.attrs();
+
+                if (state->isDerivation(value)) {
+                    _baseCase(PackageInfo(*state, attrPathStr, &attrs));
+                    evalTokens->post(); // Release for case with derivation.
+                }
+
+                // NOTE: Performing the check for whether we should recurse or not here, rather than in _recursiveCase,
+                // allows us to force recursion into the root attribute set since the first iteration is special-cased
+                // in run.
+                else if (shouldRecurse(forceRecurse, *state, attrs)) {
+                    evalTokens->post(); // Release prior to recursing, but after eval required for shouldRecurse.
+                    _recursiveCase(attrs);
+                }
+
+                // Release for case without recursion.
+                else
+                    evalTokens->post();
+            }
+
+            // Release for case with non-attribute set value.
+            else
+                evalTokens->post();
+        } catch (std::exception & e) {
+            evalTokens->post(); // Release for case with an exception.
+            state->error<nix::EvalError>("evaluation of %s failed: %s", attrPathStr, e.what()).debugThrow();
+        }
+    }
+};
+
 struct CmdEvalDrvs : InstallableValueCommand
 {
     bool forceRecurse = false;
+    bool showStats = false;
 
     // TODO: See if we can re-use the logic for `cores`.
     uint32_t maxProcesses = 32;
@@ -197,13 +404,31 @@ struct CmdEvalDrvs : InstallableValueCommand
         addFlag({
             .longName = "force-recurse",
             .shortName = 'R',
-            .description =
-                "When set, forces recursion into attribute sets even if they do not set `recurseForDerivations`",
+            .description = "When set, forces recursion into attribute sets regardless of `recurseForDerivations`",
             .handler = {&forceRecurse, true},
         });
 
-        // TODO: Add "ignore at root level" flag, to ignore names which appear at the root level
-        // TODO: Add "ignore at any level" flag, to ignore names which appear at any level
+        addFlag({
+            .longName = "show-stats",
+            .shortName = 'S',
+            .description = "When set, outputs stats for each derivation evaluated",
+            .handler = {&showStats, true},
+        });
+
+        // TODO: Restrict to a single installable attribute set rather than just any installable value.
+
+        // TODO: Add support for regex for attribute paths to ignore.
+
+        // TODO: Optionally show stats.
+
+        // TODO: Add a `pre-eval` option:
+        //  - accepts any number of attribute paths
+        //  - these paths are interpreted as relative to the provided installable (which must be an attribute set)
+        //  - these attribute paths are evaluated (but not printed) in order in the main process before recursing into
+        //    the installable
+        //  - this would allow creating and forcing thunks common across values in the installable
+        //  - for example, if evaluating Nixpkgs, one might specify `lib` and its children, `hello` (to force top-level,
+        //    stdenv, and mkDerivation), `python3Packages` (to force attribute names in the Python package set)
     }
 
     auto description() -> std::string override
@@ -223,165 +448,31 @@ struct CmdEvalDrvs : InstallableValueCommand
         return catSecondary;
     }
 
-    // It is assumed the value has already been forced, like by _testDerivation.
-    void _baseCase(
-        interprocess_mutex & loggerMutex,
-        EvalState & state,
-        const std::vector<SymbolStr> & attrPath,
-        const PackageInfo & packageInfo)
-    {
-        const auto result = getJSON(state, attrPath, packageInfo);
-
-        // Acquire the logger mutex and write the result to stdout.
-        loggerMutex.lock();
-        logger->writeToStdout(result.dump());
-        loggerMutex.unlock();
-    }
-
-    void _recursiveCase(
-        interprocess_mutex & loggerMutex,
-        interprocess_semaphore & evalTokens,
-        EvalState & state,
-        std::vector<SymbolStr> & attrPath,
-        const std::string & attrPathStr,
-        const Bindings & attrs)
-    {
-        doForEachParallel(
-            attrs,
-
-            // onEach
-            [&](const Attr attr) -> std::tuple<const pid_t, const SymbolStr> {
-                const auto symbolStr = state.symbols[attr.name];
-                evalTokens.wait(); // Must take eval token in the parent before calling _step in the child.
-                const auto pid = doFork(
-                    // onFailure
-                    [&]() -> void { throw std::runtime_error(attrPathStr + "." + symbolStr + ": fork failed"); },
-                    // onChild
-                    [&]() -> int {
-                        attrPath.push_back(symbolStr); // Only visible to the child.
-                        try {
-                            // TODO:
-                            // This is gross and probably doesn't work in the way I hope it does.
-                            // The goal is to force re-creation of the file descriptors/sockets used for the build and
-                            // eval store.
-                            // TODO: Create a pool of file descriptors/sockets which can be reused across children.
-                            *const_cast<ref<Store> *>(&state.store) = // NOLINT(cppcoreguidelines-pro-type-const-cast)
-                                state.store->config.openStore();
-                            *const_cast<ref<Store> *>( // NOLINT(cppcoreguidelines-pro-type-const-cast)
-                                &state.buildStore) = state.buildStore->config.openStore();
-
-                            // NOTE: _step catches exceptions and releases the eval token before re-throwing.
-                            _step(loggerMutex, evalTokens, state, attrPath, *attr.value);
-                        } catch (std::exception & e) {
-                            loggerMutex.lock();
-                            logger->log(Verbosity::lvlError, e.what());
-                            loggerMutex.unlock();
-                            return 1; // Failure.
-                        }
-                        return 0; // Success.
-                    });
-                return std::make_tuple(pid, symbolStr);
-            },
-
-            // onWait
-            [&](std::tuple<const pid_t, const SymbolStr> pidAndSymbolStr) -> bool {
-                // NOTE: If we do tuple unpacking, clang-tidy complains about symbolStr being a null pointer.
-                return doWait(
-                    std::get<0>(pidAndSymbolStr),
-                    // onFailure
-                    [&](const auto...) -> void {
-                        loggerMutex.lock();
-                        logger->log(
-                            Verbosity::lvlError,
-                            "waitpid failed for child processing " + attrPathStr + "." + std::get<1>(pidAndSymbolStr)
-                                + ": " + std::string(strerror(errno)));
-                        loggerMutex.unlock();
-                    },
-                    // onNotReady
-                    [](const auto...) -> void {},
-                    // onSuccess
-                    [](const auto...) -> void {});
-            });
-    }
-
-    // NOTE: _step must only ever be called from the child process of a fork.
-    // NOTE: It is assumed that prior to _step being called, a eval token is taken.
-    void _step(
-        interprocess_mutex & loggerMutex,
-        interprocess_semaphore & evalTokens,
-        EvalState & state,
-        std::vector<SymbolStr> & attrPath,
-        Value & value)
-    {
-        checkInterrupt();
-
-        // TODO: Find a way to push evaluation warnings and errors into the JSON output.
-
-        // TODO: Ensure every path through _step releases the eval token.
-        // Generally, we want to hold on to it as long as possible (for as much evaluation as possible) but we
-        // release it before recursing into the attribute set.
-
-        // Used throughout, so declare once here.
-        const auto attrPathStr = concatStringsSep(".", attrPath);
-
-        try {
-            state.forceValue(value, value.determinePos(noPos));
-            if (nAttrs == value.type() && !value.attrs()->empty()) {
-                const auto & attrs = *value.attrs();
-
-                // TODO: isDerivation can throw.
-                if (state.isDerivation(value)) {
-                    _baseCase(loggerMutex, state, attrPath, PackageInfo(state, attrPathStr, &attrs));
-                    evalTokens.post(); // Release for case with derivation.
-                }
-                // NOTE: Performing the check for whether we should recurse or not here, rather than in _recursiveCase,
-                // allows us to force recursion into the root attribute set since the first iteration is special-cased
-                // in run.
-                else if (shouldRecurse(forceRecurse, state, attrs)) {
-                    evalTokens.post(); // Release prior to recursing, but after eval required for shouldRecurse.
-                    _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrPathStr, attrs);
-                } else
-                    evalTokens.post(); // Release for case without recursion.
-            } else
-                evalTokens.post(); // Release for case with non-attribute set value.
-        } catch (std::exception & e) {
-            evalTokens.post(); // Release for case with an exception.
-            state.error<nix::EvalError>("evaluation of %s failed: %s", attrPathStr, e.what()).debugThrow();
-        }
-    }
-
     void run(ref<Store> store, ref<InstallableValue> installable) override
     {
         auto & state = *installable->state;
-        auto & cursor = *installable->getCursor(state);
-        logger->stop();
+        auto cursor = installable->getCursor(state);
+
+        // NOTE: If we were to force just one derivation in the main process before forking,
+        // we'd likely have all the thunks required for mkDerivation and friends forced, avoiding
+        // the need to force them in each child process.
+        // However, this would hide the cost of doing that evaluation in all subsequent evaluations,
+        // so we do not do that here.
 
         try {
-            // Create anonymous shared memory segments.
-            // They are unmapped when we go out of scope.
-            mapped_region loggerMutexRegion(anonymous_shared_memory(sizeof(interprocess_mutex)));
-            mapped_region evalTokensRegion(anonymous_shared_memory(sizeof(interprocess_semaphore)));
+            auto pdp = PushDownParallel(
+                // Required for evaluation
+                state.symbols.resolve(cursor->getAttrPath()),
+                installable->state,
+                cursor->forceValue(),
 
-            // Create inter-process semaphore to synchronize access
-            auto & loggerMutex = *new (loggerMutexRegion.get_address()) interprocess_mutex();
-            auto & evalTokens = *new (evalTokensRegion.get_address()) interprocess_semaphore(maxProcesses);
+                // Configuration
+                maxProcesses,
+                forceRecurse,
+                showStats);
 
-            // Get the attribute path
-            auto attrPath = state.symbols.resolve(cursor.getAttrPath());
-            const auto attrPathStr = concatStringsSep(".", attrPath);
-
-            // Copied from _step but without the token stuff
-            // TODO: The output attrPath does not include the root?
-            // For example, if run with .#hydraJobs, all of the output attrPaths are rooted at children of `hydraJobs`,
-            // rather than at `hydraJobs` itself.
-            auto forcedValue = cursor.forceValue();
-            if (nAttrs == forcedValue.type() && !forcedValue.attrs()->empty()) {
-                const auto & attrs = *forcedValue.attrs();
-                if (state.isDerivation(forcedValue))
-                    _baseCase(loggerMutex, state, attrPath, PackageInfo(state, attrPathStr, &attrs));
-                else
-                    _recursiveCase(loggerMutex, evalTokens, state, attrPath, attrPathStr, attrs);
-            }
+            // Run the evaluation in parallel.
+            pdp.run();
         } catch (interprocess_exception & ex) {
             // If we cannot create the shared memory segment, we throw an error.
             throw std::runtime_error("Failed to create shared memory segment(s): " + std::string(ex.what()));
