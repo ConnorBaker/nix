@@ -1,4 +1,8 @@
 #include "nix/cmd/command-installable-value.hh"
+#include "nix/cmd/command.hh"
+#include "nix/cmd/installable-value.hh"
+#include "nix/cmd/installable-value.hh"
+#include "nix/expr/attr-path.hh"
 #include "nix/expr/eval-cache.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval.hh"
@@ -218,6 +222,9 @@ struct PushDownParallel
 
 public:
 
+    // TODO: Should we try to do something similar to what findAlongAttrPath does and use
+    // autoCalling to force the value?
+
     void run()
     {
         state->forceValue(value, value.determinePos(noPos));
@@ -382,15 +389,39 @@ private:
 
 struct CmdEvalDrvs : InstallableValueCommand
 {
+private:
+    std::vector<std::string> commonAttrPaths;
     bool forceRecurse = false;
+    uint32_t maxProcesses = 1;
+    std::optional<std::string> evalAttrPath;
     bool showStats = false;
 
-    // TODO: See if we can re-use the logic for `cores`.
-    uint32_t maxProcesses = 32;
-
+public:
     CmdEvalDrvs()
-        : InstallableValueCommand()
     {
+        addFlag({
+            .longName = "attr-path",
+            .shortName = 'A',
+            .description = "Attribute path to evaluate relative to the provided installable",
+            .labels = {"attr-path"},
+            .handler = Handler(&evalAttrPath),
+        });
+
+        addFlag({
+            .longName = "common-attr-paths",
+            .shortName = 'C',
+            .description = "Common attribute paths to evaluate before the installable (must be specified last)",
+            .labels = {"attr-paths"},
+            .handler = Handler(&commonAttrPaths),
+        });
+
+        addFlag({
+            .longName = "force-recurse",
+            .shortName = 'R',
+            .description = "Recurse into attribute sets regardless of `recurseForDerivations`",
+            .handler = Handler(&forceRecurse, true),
+        });
+
         // TODO: As implemented, this is a misnomer.
         addFlag({
             .longName = "max-processes",
@@ -398,37 +429,17 @@ struct CmdEvalDrvs : InstallableValueCommand
             .description =
                 "Maximum number of processes to use for simultaneous evaluation (actual number may be higher)",
             .labels = {"n"},
-            .handler = {[&](const std::string & s) { maxProcesses = string2IntWithUnitPrefix<uint32_t>(s); }},
-        });
-
-        addFlag({
-            .longName = "force-recurse",
-            .shortName = 'R',
-            .description = "When set, forces recursion into attribute sets regardless of `recurseForDerivations`",
-            .handler = {&forceRecurse, true},
+            .handler = Handler(&maxProcesses),
         });
 
         addFlag({
             .longName = "show-stats",
             .shortName = 'S',
-            .description = "When set, outputs stats for each derivation evaluated",
-            .handler = {&showStats, true},
+            .description = "Output stats for each derivation evaluated",
+            .handler = Handler(&showStats, true),
         });
 
-        // TODO: Restrict to a single installable attribute set rather than just any installable value.
-
         // TODO: Add support for regex for attribute paths to ignore.
-
-        // TODO: Optionally show stats.
-
-        // TODO: Add a `pre-eval` option:
-        //  - accepts any number of attribute paths
-        //  - these paths are interpreted as relative to the provided installable (which must be an attribute set)
-        //  - these attribute paths are evaluated (but not printed) in order in the main process before recursing into
-        //    the installable
-        //  - this would allow creating and forcing thunks common across values in the installable
-        //  - for example, if evaluating Nixpkgs, one might specify `lib` and its children, `hello` (to force top-level,
-        //    stdenv, and mkDerivation), `python3Packages` (to force attribute names in the Python package set)
     }
 
     auto description() -> std::string override
@@ -448,23 +459,45 @@ struct CmdEvalDrvs : InstallableValueCommand
         return catSecondary;
     }
 
+    // No default attribute paths for this command.
+    auto getDefaultFlakeAttrPaths() -> Strings override
+    {
+        return {""};
+    };
+
+    // No default attribute paths for this command.
+    auto getDefaultFlakeAttrPathPrefixes() -> Strings override
+    {
+        return {""};
+    };
+
     void run(ref<Store> store, ref<InstallableValue> installable) override
     {
-        auto & state = *installable->state;
-        auto cursor = installable->getCursor(state);
+        if (maxProcesses <= 0)
+            throw UsageError("max-processes must be greater than 0");
 
-        // NOTE: If we were to force just one derivation in the main process before forking,
-        // we'd likely have all the thunks required for mkDerivation and friends forced, avoiding
-        // the need to force them in each child process.
-        // However, this would hide the cost of doing that evaluation in all subsequent evaluations,
-        // so we do not do that here.
+        auto state = installable->state;
+        auto & rootValue = *installable->toValue(*state).first;
+        auto & autoArgs = *getAutoArgs(*state);
+        auto attrPath = state->symbols.resolve(installable->getCursor(*state)->getAttrPath());
+
+        // Process all of the common attribute paths first.
+        processCommonAttrPaths(*state, autoArgs, rootValue, commonAttrPaths);
+
+        // If an attrPath is provided, we use it to index into the installable.
+        if (evalAttrPath.has_value()) {
+            rootValue = *findAlongAttrPath(*state, *evalAttrPath, autoArgs, rootValue).first;
+            // Update the attrPath to include the evaluated attribute path.
+            for (const auto & attrPathComponent : parseAttrPath(*state, evalAttrPath.value()))
+                attrPath.push_back(state->symbols[attrPathComponent]);
+        }
 
         try {
             auto pdp = PushDownParallel(
                 // Required for evaluation
-                state.symbols.resolve(cursor->getAttrPath()),
-                installable->state,
-                cursor->forceValue(),
+                attrPath,
+                state,
+                rootValue,
 
                 // Configuration
                 maxProcesses,
@@ -476,6 +509,31 @@ struct CmdEvalDrvs : InstallableValueCommand
         } catch (interprocess_exception & ex) {
             // If we cannot create the shared memory segment, we throw an error.
             throw std::runtime_error("Failed to create shared memory segment(s): " + std::string(ex.what()));
+        }
+    }
+
+private:
+    void processCommonAttrPaths(
+        EvalState & state, Bindings & autoArgs, Value & rootValue, const std::vector<std::string> & commonAttrPaths)
+    {
+        // All we need to do for the common installables is to force their values, and, if they are derivations,
+        // force their derivations.
+        // We need to do this through the value rather than the cursor because evaluation caching doesn't force
+        // state like we need.
+        // NOTE: InstallableValue's toValue() uses findAlongAttrPath() to find the value, which uses autoCalling;
+        // cursor->forceValue() does not.
+        for (const auto & commonAttrPathStr : commonAttrPaths) {
+            auto & value = *findAlongAttrPath(state, commonAttrPathStr, autoArgs, rootValue).first;
+            if (state.isDerivation(value)) {
+                const auto drvPath =
+                    state.store->printStorePath(PackageInfo(state, commonAttrPathStr, value.attrs()).requireDrvPath());
+                logger->log(
+                    Verbosity::lvlError,
+                    "Forced derivation (" + drvPath + ") for common installable: " + commonAttrPathStr.c_str());
+            } else
+                logger->log(
+                    Verbosity::lvlError,
+                    "Forced value (" + showType(value) + ") for common installable: " + commonAttrPathStr.c_str());
         }
     }
 };
