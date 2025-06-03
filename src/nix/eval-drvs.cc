@@ -74,7 +74,7 @@ auto getJSON(
     const bool showStats,
     const EvalState & state,
     const std::vector<SymbolStr> & attrPath,
-    const PackageInfo & packageInfo) -> const nlohmann::json
+    const PackageInfo & packageInfo) -> nlohmann::json
 {
     nlohmann::json result;
 
@@ -260,6 +260,10 @@ private:
 
     void _log(const Verbosity lvl, const std::string & msg)
     {
+        // Early return if the logger is not enabled for the given level.
+        if (lvl > verbosity)
+            return;
+
         loggerMutex->lock();
         logger->log(lvl, msg);
         loggerMutex->unlock();
