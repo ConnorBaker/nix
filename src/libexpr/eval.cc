@@ -2396,7 +2396,7 @@ BackedStringView EvalState::coerceToString(
         if (v.type() == nInt)
             return std::to_string(v.integer().value);
         if (v.type() == nFloat)
-            return std::to_string(v.fpoint());
+            return std::format("{:f}", v.fpoint()); // Keep formatting consistent with pre-C++26
         if (v.type() == nNull)
             return "";
 
