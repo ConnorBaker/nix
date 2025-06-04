@@ -13,6 +13,7 @@
 #include "nix/main/shared.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/store-api.hh"
+#include "nix/util/configuration.hh"
 #include "nix/util/error.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/signals.hh"
@@ -69,28 +70,6 @@ using namespace boost::interprocess;
 //
 // - storeFS is initialized with store
 // - rootFS is initialized with store (and storeFS!)
-
-auto getJSON(
-    const bool showStats,
-    const EvalState & state,
-    const std::vector<SymbolStr> & attrPath,
-    const PackageInfo & packageInfo) -> nlohmann::json
-{
-    nlohmann::json result;
-
-    // TODO: Either remove cpuTime from statistics or find a way to do a before/after forcing the derivation path
-    // to get some sort of marginal cost for the evaluation.
-    result["attr"] = packageInfo.attrPath;
-    result["attrPath"] = attrPath;
-    result["drvPath"] = state.store->printStorePath(packageInfo.requireDrvPath());
-    result["name"] = packageInfo.queryName();
-    // TODO: outputs
-    if (showStats)
-        result["stats"] = state.getStatistics();
-    result["system"] = packageInfo.querySystem();
-
-    return result;
-}
 
 auto shouldRecurse(const bool forceRecurse, EvalState & state, const Bindings & attrs) -> bool
 {
@@ -209,6 +188,8 @@ struct PushDownParallel
         , showStats(showStats)
         , loggerMutexRegion(anonymous_shared_memory(sizeof(interprocess_mutex)))
         , loggerMutex(static_cast<interprocess_mutex *>(loggerMutexRegion.get_address()))
+        , stateMutexRegion(anonymous_shared_memory(sizeof(interprocess_mutex)))
+        , stateMutex(static_cast<interprocess_mutex *>(stateMutexRegion.get_address()))
         , evalTokensRegion(anonymous_shared_memory(sizeof(interprocess_semaphore)))
         , evalTokens(static_cast<interprocess_semaphore *>(evalTokensRegion.get_address()))
     // TODO: For things which are known as a result of configuration (e.g., forceRecurse, showStats),
@@ -217,6 +198,7 @@ struct PushDownParallel
     {
         // Construct in place using placement new:
         new (loggerMutex) interprocess_mutex();
+        new (stateMutex) interprocess_mutex();
         new (evalTokens) interprocess_semaphore(maxProcesses);
     }
 
@@ -231,7 +213,7 @@ public:
         if (nAttrs == value.type() && !value.attrs()->empty()) {
             const auto & attrs = *value.attrs();
             if (state->isDerivation(value))
-                _baseCase(PackageInfo(*state, attrPathStr, &attrs));
+                _baseCase(attrs);
             else
                 _recursiveCase(attrs);
         }
@@ -255,6 +237,9 @@ private:
     mapped_region loggerMutexRegion;
     interprocess_mutex * loggerMutex; // placement-new in shared memory, do not delete
 
+    mapped_region stateMutexRegion;
+    interprocess_mutex * stateMutex; // placement-new in shared memory, do not delete
+
     mapped_region evalTokensRegion;
     interprocess_semaphore * evalTokens; // placement-new in shared memory, do not delete
 
@@ -265,18 +250,114 @@ private:
             return;
 
         loggerMutex->lock();
-        logger->log(lvl, msg);
+        {
+            logger->log(lvl, msg);
+        }
         loggerMutex->unlock();
     }
 
     // It is assumed the value has already been forced, like by _testDerivation.
-    void _baseCase(const PackageInfo & packageInfo)
+    void _baseCase(const Bindings & attrs)
     {
-        const auto result = getJSON(showStats, *state, attrPath, packageInfo);
+        auto drvPathIdx = -1;
+        auto nameIdx = -1;
+        auto systemIdx = -1;
+
+        // TODO: Since PackageInfo is constructed with `const Bindings * attrs`, getting attributes by name is
+        // $O(n)$ because Bindings are not sorted and so `find` uses a linear scan. We instead to a single O(n) scan
+        // over the array of attributes.
+        // Traverse attrs to find the indices for drvPath, name, and system.
+        // This doesn't involve modifying state, so it's safe to do without a lock.
+        for (const auto [idx, attr] : attrs | std::views::enumerate) {
+            if (attr.name == state->sDrvPath) {
+                drvPathIdx = idx;
+            } else if (attr.name == state->sName) {
+                // taken from PackageInfo::queryName
+                nameIdx = idx;
+            } else if (attr.name == state->sOutputs) {
+                // TODO: outputs
+                continue;
+            } else if (attr.name == state->sSystem) {
+                // taken from PackageInfo::querySystem
+                systemIdx = idx;
+            }
+        }
+
+        // system has a default value; drvPath and name do not.
+        if (drvPathIdx == -1) {
+            // Changed from PackageInfo::requireDrvPath to use TypeError
+            throw state->error<TypeError>("derivation does not contain a `drvPath` attribute");
+        } else if (nameIdx == -1) {
+            // Changed from PackageInfo::queryName to align with wording error in PackageInfo::requireDrvPath uses
+            throw state->error<TypeError>("derivation does not contain a `name` attribute");
+        }
+
+        nlohmann::json result;
+        result["attr"] = attrPathStr;
+        result["attrPath"] = attrPath;
+        // TODO: Either remove cpuTime from statistics or find a way to do a before/after forcing the derivation
+        // path to get some sort of marginal cost for the evaluation.
+        // NOTE: Getting stats in a process-parallel implementation should be safe without acquiring a lock on state.
+        if (showStats)
+            result["stats"] = state->getStatistics();
+
+        // TODO: Moving stateMutex down into forcing drvPath
+        stateMutex->lock();
+        {
+            // drvPath
+            {
+                const auto [name, pos, value] = attrs[drvPathIdx];
+                NixStringContext context;
+                // TODO: Child processes will call this function and never return -- but they also aren't considered
+                // dead, and waitpid with WNOHAND will repeatedly return 0 for them, indicating they're still running.
+
+                // TODO: Perhaps the function which is causing the problem is copy_context?
+                const auto drvPathStorePathStringView = state->forceString(
+                    *value, context, pos, "while evaluating the `drvPath` attribute of a derivation");
+
+                // Same as the above forceString
+                // const auto drvPathStorePathStringView =
+                //     state->forceString(*value, pos, "while evaluating the `drvPath` attribute of a derivation");
+                // if (value->payload.string.context)
+                //     for (const char ** p = value->payload.string.context; *p; ++p)
+                //         context.insert(NixStringContextElem::parse(*p, experimentalFeatureSettings));
+
+                const auto drvPathStorePath = state->store->parseStorePath(std::move(drvPathStorePathStringView));
+                drvPathStorePath.requireDerivation(); // Can fail, should be in try catch?
+                result["drvPath"] = state->store->printStorePath(std::move(drvPathStorePath));
+            }
+            // name
+            {
+                const auto [name, pos, value] = attrs[nameIdx];
+                // taken from PackageInfo::queryName
+                result["name"] =
+                state->forceStringNoCtx(*value, pos, "while evaluating the `name` attribute of a derivation");
+            }
+            // outputs
+            {
+                // TODO: outputs
+            }
+            // system
+            {
+                // taken from PackageInfo::querySystem
+                if (systemIdx == -1) {
+                    result["system"] = "unknown";
+                } else {
+                    const auto [name, pos, value] = attrs[systemIdx];
+                    result["system"] =
+                    state->forceStringNoCtx(*value, pos, "while evaluating the `system` attribute of a derivation");
+                }
+            }
+        }
+        stateMutex->unlock();
+
+        const auto resultStr = result.dump();
 
         // Acquire the logger mutex and write the result to stdout.
         loggerMutex->lock();
-        logger->writeToStdout(result.dump());
+        {
+            logger->writeToStdout(resultStr);
+        }
         loggerMutex->unlock();
     }
 
@@ -300,7 +381,8 @@ private:
                             // The goal is to force re-creation of the file descriptors/sockets used for the build and
                             // eval store.
                             // TODO: Create a pool of file descriptors/sockets which can be reused across children.
-                            // TODO: This is unecessary if the store is owned by the user rather than the daemon.
+                            // TODO: This is unnecessary if the store is owned by the user rather than the daemon.
+                            // NOTE: Most of this is taken from eval.cc.
                             *const_cast<ref<Store> *>(&state->store) = // NOLINT(cppcoreguidelines-pro-type-const-cast)
                                 state->store->config.openStore();
                             // TODO: We need the build store in case of IFD, right?
@@ -357,37 +439,64 @@ private:
         // release it before recursing into the attribute set.
 
         try {
-            state->forceValue(value, value.determinePos(noPos));
-
-            // Only case where we have anything to do.
-            if (nAttrs == value.type() && !value.attrs()->empty()) {
-                const auto & attrs = *value.attrs();
-
-                if (state->isDerivation(value)) {
-                    _baseCase(PackageInfo(*state, attrPathStr, &attrs));
-                    evalTokens->post(); // Release for case with derivation.
-                }
-
-                // NOTE: Performing the check for whether we should recurse or not here, rather than in _recursiveCase,
-                // allows us to force recursion into the root attribute set since the first iteration is special-cased
-                // in run.
-                else if (shouldRecurse(forceRecurse, *state, attrs)) {
-                    evalTokens->post(); // Release prior to recursing, but after eval required for shouldRecurse.
-                    _recursiveCase(attrs);
-                }
-
-                // Release for case without recursion.
-                else
-                    evalTokens->post();
+            stateMutex->lock();
+            {
+                state->forceValue(value, value.determinePos(noPos));
             }
-
-            // Release for case with non-attribute set value.
-            else
-                evalTokens->post();
+            stateMutex->unlock();
         } catch (std::exception & e) {
-            evalTokens->post(); // Release for case with an exception.
-            state->error<nix::EvalError>("evaluation of %s failed: %s", attrPathStr, e.what()).debugThrow();
+            stateMutex->unlock();
+            evalTokens->post();
+            throw state->error<nix::EvalError>("failed to force %s: %s", attrPathStr, e.what()).error;
         }
+
+        // We only care about non-empty attribute sets.
+        if (nAttrs != value.type() || value.attrs()->empty()) {
+            evalTokens->post();
+            return;
+        }
+
+        const auto & attrs = *value.attrs();
+        auto isBaseCase = false;
+        auto isRecursiveCase = false;
+
+        try {
+            stateMutex->lock();
+            {
+                isBaseCase = state->isDerivation(value);
+                isRecursiveCase = !isBaseCase && shouldRecurse(forceRecurse, *state, attrs);
+            }
+            stateMutex->unlock();
+        } catch (std::exception & e) {
+            stateMutex->unlock();
+            evalTokens->post();
+            throw state->error<nix::EvalError>("failed to determine case for %s: %s", attrPathStr, e.what()).error;
+        }
+
+        if (isBaseCase) {
+            try {
+                _baseCase(attrs);
+            } catch (std::exception & e) {
+                evalTokens->post(); // Release for case with an exception.
+                throw state->error<nix::EvalError>("failed to perform base case for %s: %s", attrPathStr, e.what())
+                    .error;
+            }
+            evalTokens->post(); // Release after base case.
+            return;
+        } else if (isRecursiveCase) {
+            evalTokens->post(); // Release prior to recursing!
+            try {
+                _recursiveCase(attrs);
+            } catch (std::exception & e) {
+                throw state->error<nix::EvalError>("failed to perform recursive case for %s: %s", attrPathStr, e.what())
+                    .error;
+            }
+            return;
+        } else {
+            evalTokens->post();
+            return;
+        }
+        unreachable();
     }
 };
 
@@ -527,17 +636,18 @@ private:
         // NOTE: InstallableValue's toValue() uses findAlongAttrPath() to find the value, which uses autoCalling;
         // cursor->forceValue() does not.
         for (const auto & commonAttrPathStr : commonAttrPaths) {
-            auto & value = *findAlongAttrPath(state, commonAttrPathStr, autoArgs, rootValue).first;
-            if (state.isDerivation(value)) {
+            auto [value, pos] = findAlongAttrPath(state, commonAttrPathStr, autoArgs, rootValue);
+            state.forceValue(*value, pos);
+            if (state.isDerivation(*value)) {
                 const auto drvPath =
-                    state.store->printStorePath(PackageInfo(state, commonAttrPathStr, value.attrs()).requireDrvPath());
+                    state.store->printStorePath(PackageInfo(state, commonAttrPathStr, value->attrs()).requireDrvPath());
                 logger->log(
                     Verbosity::lvlError,
                     "Forced derivation (" + drvPath + ") for common installable: " + commonAttrPathStr.c_str());
             } else
                 logger->log(
                     Verbosity::lvlError,
-                    "Forced value (" + showType(value) + ") for common installable: " + commonAttrPathStr.c_str());
+                    "Forced value (" + showType(*value) + ") for common installable: " + commonAttrPathStr.c_str());
         }
     }
 };
