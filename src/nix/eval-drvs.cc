@@ -6,6 +6,7 @@
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/nixexpr.hh"
+#include "nix/expr/parallel-eval.hh"
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/value.hh"
 #include "nix/main/shared.hh"
@@ -84,6 +85,8 @@ public:
     void run(ref<Store> store, ref<InstallableValue> installable) override
     {
         auto state = installable->state;
+        FutureVector futures(*state->executor);
+
         auto cursor = installable->getCursor(*state);
 
         // If an attrPath is provided, we use it to index into the installable.
@@ -141,71 +144,80 @@ public:
         };
 
         std::function<void(const ref<eval_cache::AttrCursor>)> visit = [&](const auto cursor) -> void {
+            std::vector<std::pair<Executor::work_t, uint8_t>> work;
             for (const auto attr : cursor->getAttrs()) {
-                const auto newCursor = cursor->getAttr(attr);
-                const auto newCursorPath = newCursor->getAttrPathStr();
-                auto isDerivation = false;
-                auto doRecurse = false;
+                work.emplace_back(
+                    [this, attr, cursor, &logDrvAsJson, &shouldRecurse, &visit]() {
+                        const auto newCursor = cursor->getAttr(attr);
+                        const auto newCursorPath = newCursor->getAttrPathStr();
+                        auto isDerivation = false;
+                        auto doRecurse = false;
 
-                try {
-                    isDerivation = newCursor->isDerivation();
-                } catch (const std::exception & e) {
-                    logger->log(
-                        Verbosity::lvlDebug,
-                        "Failed to determine if " + newCursorPath + " is a derivation: " + e.what());
-                    continue;
-                }
+                        try {
+                            isDerivation = newCursor->isDerivation();
+                        } catch (const std::exception & e) {
+                            logger->log(
+                                Verbosity::lvlDebug,
+                                "Failed to determine if " + newCursorPath + " is a derivation: " + e.what());
+                            return;
+                        }
 
-                // Each of these cases is mutually exclusive -- the condition we would branch on
-                // can throw, so we wrap each in a try-catch block.
-                if (isDerivation) {
-                    try {
-                        logDrvAsJson(attr, newCursor);
-                    } catch (eval_cache::CachedEvalError & e) {
-                        // Retry the evaluation of the attribute that failed to report it to the user.
-                        if (retryFailed) {
-                            logger->log(Verbosity::lvlDebug, "Retrying failed evaluation of " + newCursorPath);
+                        // Each of these cases is mutually exclusive -- the condition we would branch on
+                        // can throw, so we wrap each in a try-catch block.
+                        if (isDerivation) {
                             try {
-                                e.force();
                                 logDrvAsJson(attr, newCursor);
+                            } catch (eval_cache::CachedEvalError & e) {
+                                // Retry the evaluation of the attribute that failed to report it to the user.
+                                if (retryFailed) {
+                                    logger->log(Verbosity::lvlDebug, "Retrying failed evaluation of " + newCursorPath);
+                                    try {
+                                        e.force();
+                                        logDrvAsJson(attr, newCursor);
+                                    } catch (const std::exception & e) {
+                                        logger->log(
+                                            Verbosity::lvlError,
+                                            "Failed to log derivation for " + newCursorPath + ": " + e.what());
+                                    }
+                                    return;
+                                }
+
+                                logger->log(
+                                    Verbosity::lvlError,
+                                    "Failed to log derivation for " + newCursorPath + ": " + e.what());
                             } catch (const std::exception & e) {
                                 logger->log(
                                     Verbosity::lvlError,
                                     "Failed to log derivation for " + newCursorPath + ": " + e.what());
                             }
-                            continue;
+                            return;
                         }
 
-                        logger->log(
-                            Verbosity::lvlError, "Failed to log derivation for " + newCursorPath + ": " + e.what());
-                    } catch (const std::exception & e) {
-                        logger->log(
-                            Verbosity::lvlError, "Failed to log derivation for " + newCursorPath + ": " + e.what());
-                    }
-                    continue;
-                }
+                        try {
+                            doRecurse = shouldRecurse(newCursor);
+                        } catch (const std::exception & e) {
+                            logger->log(
+                                Verbosity::lvlError,
+                                "Failed to determine if " + newCursorPath + " should recurse: " + e.what());
+                            return;
+                        }
 
-                try {
-                    doRecurse = shouldRecurse(newCursor);
-                } catch (const std::exception & e) {
-                    logger->log(
-                        Verbosity::lvlError,
-                        "Failed to determine if " + newCursorPath + " should recurse: " + e.what());
-                    continue;
-                }
+                        if (doRecurse) {
+                            logger->log(Verbosity::lvlDebug, "Found attribute set to recurse into: " + newCursorPath);
+                            visit(newCursor);
+                            return;
+                        }
 
-                if (doRecurse) {
-                    logger->log(Verbosity::lvlDebug, "Found attribute set to recurse into: " + newCursorPath);
-                    visit(newCursor);
-                    continue;
-                }
-
-                logger->log(Verbosity::lvlDebug, "Found non-derivation: " + newCursorPath);
-            }
+                        logger->log(Verbosity::lvlDebug, "Found non-derivation: " + newCursorPath);
+                    },
+                    0);
+            };
+            futures.spawn(std::move(work));
         };
 
-        visit(cursor);
-    }
+        futures.spawn(1, [&]() { visit(cursor); });
+        futures.finishAll();
+    };
 };
 
 static auto rCmdEval = // NOLINT(cppcoreguidelines-avoid-non-const-global-variables,cert-err58-cpp)
