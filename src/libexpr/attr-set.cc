@@ -1,5 +1,6 @@
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/ghc-gc.hh"  // Iteration 58: Write barriers
 
 #include <algorithm>
 
@@ -18,13 +19,19 @@ Bindings * EvalMemory::allocBindings(size_t capacity)
         throw Error("attribute set of size %d is too big", capacity);
     stats.nrAttrsets++;
     stats.nrAttrsInAttrsets += capacity;
-    return new (allocBytes(sizeof(Bindings) + sizeof(Attr) * capacity)) Bindings();
+    // Use dedicated Bindings allocation for better tracking
+    return new (Allocator::allocBindings(capacity)) Bindings();
 }
 
 Value & BindingsBuilder::alloc(Symbol name, PosIdx pos)
 {
     auto value = mem.get().allocValue();
     bindings->push_back(Attr(name, value, pos));
+
+    // Iteration 58: Write barrier for Bindings modification
+    // The bindings (old?) now contains a reference to value (young?)
+    ghc::gcWriteBarrier(bindings, value);
+
     return *value;
 }
 

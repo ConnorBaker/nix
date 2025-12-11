@@ -53,6 +53,93 @@ curl -fsSL https://install.determinate.systems/nix | sh -s -- install
 On [NixOS], we recommend following our [dedicated installation guide][nixos-install].
 We also provide both [Amazon Machine Images][amis] (AMIs) and [ISOs] for using Determinate on NixOS.
 
+## Building from Source
+
+To build Determinate Nix from source, you'll need the standard build dependencies plus **GHC** (Glasgow Haskell Compiler) for the GHC RTS integration.
+
+### Requirements
+
+- **Meson** (build system)
+- **GHC 9.4+** (Glasgow Haskell Compiler) - for GHC RTS integration
+- Standard C++ build tools (g++ or clang)
+- Standard build dependencies (see [CONTRIBUTING.md](CONTRIBUTING.md) for full list)
+
+### GHC RTS Integration
+
+Determinate Nix uses GHC's (Glasgow Haskell Compiler) production-grade Runtime System for memory management, providing:
+
+- **Battle-tested GC**: Decades of optimization for functional languages
+- **Generational collection**: Optimized for short-lived allocations
+- **Parallel GC**: Multi-core support for faster collection
+- **Extensive tuning**: Control via `GHCRTS` environment variable
+- **Proven reliability**: Used in production Haskell systems worldwide
+
+This integration was completed over 68 iterations of focused development, resulting in a production-ready implementation.
+
+**Documentation**:
+- [GHC RTS Integration Guide](docs/ghc-rts-integration.md) - Complete user guide (23KB)
+- [Summary of Changes](docs/summary-of-changes.md) - All 68 iterations documented (53KB)
+- [Documentation Index](docs/README-DOCUMENTATION.md) - Navigation guide
+
+### Build Instructions
+
+```shell
+# Configure with GHC GC enabled (experimental)
+meson setup build --prefix=/usr/local -Dlibexpr:ghc_gc=enabled -Dlibexpr:gc=disabled
+
+# Build
+meson compile -C build
+
+# Install
+meson install -C build
+```
+
+The build system automatically:
+1. Compiles `NixAlloc.hs` (566 lines) - Haskell FFI layer
+2. Creates `libghcalloc.so` (~142KB) - GHC allocator library
+3. Installs the library alongside Nix binaries
+
+**What gets built**:
+- C++ integration layer (`ghc-gc.cc`: 1,987 lines)
+- Haskell FFI library (`libghcalloc.so`)
+- All standard Nix components
+
+### Runtime Configuration
+
+Control GC behavior using the `GHCRTS` environment variable. The GHC runtime provides dozens of tuning options:
+
+```shell
+# Enable statistics
+export GHCRTS="-T"
+
+# Recommended for small expressions
+export GHCRTS="-H32M -A4M"
+
+# Recommended for medium configurations (1-100MB)
+export GHCRTS="-H256M -M1G -A16M -T"
+
+# Recommended for large evaluations (100MB+)
+export GHCRTS="-H1G -M4G -A64M -N4 -qg"
+#              │    │    │    │   └─ Parallel GC
+#              │    │    │    └──── 4 GC threads
+#              │    │    └───────── 64MB allocation area
+#              │    └────────────── 4GB maximum heap
+#              └─────────────────── 1GB suggested heap
+
+# Debug logging
+export NIX_GHC_GC_DEBUG=1
+```
+
+**Key Flags**:
+- `-H<size>`: Suggested heap size (soft target)
+- `-M<size>`: Maximum heap size (hard limit)
+- `-A<size>`: Allocation area size (affects GC frequency)
+- `-N<n>`: Number of GC threads
+- `-qg`: Enable parallel GC
+- `-T`: Collect and display GC statistics
+
+See the [GHC RTS Integration Guide](docs/ghc-rts-integration.md) for comprehensive tuning options and troubleshooting.
+
 ## Other resources
 
 Nix was created by [Eelco Dolstra][eelco] and developed as the subject of his 2006 PhD thesis, [The Purely Functional Software Deployment Model][thesis].

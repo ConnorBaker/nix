@@ -4,6 +4,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/gc-small-vector.hh"
+#include "nix/expr/ghc-gc.hh"
 #include "nix/expr/json-to-value.hh"
 #include "nix/store/globals.hh"
 #include "nix/store/names.hh"
@@ -3759,6 +3760,11 @@ static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Valu
             v = vs[n];
         v.mkList(list);
     }
+
+    // GC safe point: After filtering completes, result is stored in v
+#if NIX_USE_GHC_GC
+    { ghc::GCSafePoint safePoint; }
+#endif
 }
 
 static RegisterPrimOp primop_filter({
@@ -3853,6 +3859,11 @@ static void prim_foldlStrict(EvalState & state, const PosIdx pos, Value ** args,
         state.forceValue(*args[1], pos);
         v = *args[1];
     }
+
+    // GC safe point: After fold completes, result is stored in v
+#if NIX_USE_GHC_GC
+    { ghc::GCSafePoint safePoint; }
+#endif
 }
 
 static RegisterPrimOp primop_foldlStrict({
@@ -3891,11 +3902,20 @@ static void anyOrAll(bool any, EvalState & state, const PosIdx pos, Value ** arg
         bool res = state.forceBool(vTmp, pos, errorCtx);
         if (res == any) {
             v.mkBool(any);
+            // GC safe point: After any/all early exit
+#if NIX_USE_GHC_GC
+            { ghc::GCSafePoint safePoint; }
+#endif
             return;
         }
     }
 
     v.mkBool(!any);
+
+    // GC safe point: After any/all completes
+#if NIX_USE_GHC_GC
+    { ghc::GCSafePoint safePoint; }
+#endif
 }
 
 static void prim_any(EvalState & state, const PosIdx pos, Value ** args, Value & v)
@@ -4204,6 +4224,11 @@ static void prim_concatMap(EvalState & state, const PosIdx pos, Value ** args, V
         pos += l;
     }
     v.mkList(list);
+
+    // GC safe point: After concatMap completes, result is stored in v
+#if NIX_USE_GHC_GC
+    { ghc::GCSafePoint safePoint; }
+#endif
 }
 
 static RegisterPrimOp primop_concatMap({

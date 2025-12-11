@@ -28,6 +28,7 @@
 #include "nix/expr/print.hh"
 #include "nix/util/ref.hh"
 #include "nix/expr/value.hh"
+#include "nix/expr/ghc-gc.hh"
 
 #include "nix/util/strings.hh"
 
@@ -224,6 +225,13 @@ ReplExitStatus NixRepl::mainLoop()
         } catch (Interrupted & e) {
             printMsg(lvlError, e.msg());
         }
+
+        // GC safe point: After processing REPL command, before waiting for next input
+        // This is an ideal location for GC since no Values are on the stack and
+        // the user is about to provide new input (natural pause point).
+#if NIX_USE_GHC_GC
+        { ghc::GCSafePoint safePoint; }
+#endif
 
         // We handled the current input fully, so we should clear it
         // and read brand new input.

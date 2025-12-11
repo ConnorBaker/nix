@@ -8,6 +8,10 @@
 
 #include "expr-config-private.hh"
 
+#if NIX_USE_GHC_GC
+#  include "nix/expr/ghc-gc.hh"
+#endif
+
 #if NIX_USE_BOEHMGC
 
 #  include <pthread.h>
@@ -202,6 +206,24 @@ void initGC()
     initGCReal();
 
     gcCyclesAfterInit = GC_get_gc_no();
+#elif NIX_USE_GHC_GC
+    // Iteration 20: GHC RTS initialization is completely skipped.
+    // The allocator uses mmap-based memory pools and doesn't need GHC at all.
+    // GHC RTS would only be needed for:
+    // - GC statistics (getGCCycles, getHeapSize, etc.)
+    // - Explicit GC (performGC)
+    // - StablePtrs for GC roots
+    // All of these gracefully return 0/no-op when GHC is not initialized.
+    //
+    // Note: hs_init_ghc was crashing (SIGSEGV) even with valid parameters,
+    // likely due to GHC RTS initialization issues in a C++ context.
+    // ITERATION 62: Always initialize pure C++ GC runtime
+    // The pure C++ GC implementation doesn't require GHC libraries,
+    // but it DOES require initialization to enable garbage collection.
+    // Without this, GC will never run!
+    if (!ghc::initGHCRuntime(nullptr, nullptr)) {
+        fprintf(stderr, "Warning: Failed to initialize GC runtime - garbage collection will not work\n");
+    }
 #endif
 
     // NIX_PATH must override the regular setting

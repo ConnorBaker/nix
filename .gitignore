@@ -50,3 +50,9 @@ flake-regressions
 
 # direnv
 .direnv/
+
+# Iteration 64: GHC RTS integration - Haskell build artifacts
+src/libexpr/ghc-alloc/build/
+src/libexpr/ghc-alloc/dist/
+src/libexpr/ghc-alloc/*.hi
+src/libexpr/ghc-alloc/*.o

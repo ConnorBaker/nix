@@ -1,0 +1,54 @@
+cabal-version: 2.4
+name: libghcalloc
+version: 0.1.0.0
+synopsis: GHC RTS allocator for Nix
+description:
+  Provides FFI exports for Nix to allocate memory on the GHC heap
+  and use GHC's garbage collector instead of a custom implementation.
+license: LGPL-2.1-only
+author: Nix Contributors
+maintainer: nix-dev@cs.uu.nl
+category: System
+build-type: Simple
+
+library
+  exposed-modules: NixAlloc
+  hs-source-dirs: .
+  build-depends:
+      base >= 4.14 && < 5
+  default-language: Haskell2010
+  ghc-options:
+    -O2
+    -Wall
+    -fno-warn-unused-imports
+    -fno-warn-unused-matches
+    -threaded
+    -rtsopts
+    -with-rtsopts=-T
+
+  -- Enable runtime statistics
+  if impl(ghc >= 8.10)
+    ghc-options: -with-rtsopts=-T
+
+-- Build shared library for C++ linking
+foreign-library ghcalloc
+  type: native-shared
+  lib-version-info: 0:0:0
+
+  other-modules: NixAlloc
+  hs-source-dirs: .
+  build-depends:
+      base >= 4.14 && < 5
+
+  c-sources:
+  ghc-options:
+    -O2
+    -Wall
+    -threaded
+    -rtsopts
+    -with-rtsopts=-T
+    -fPIC
+    -shared
+    -dynamic
+
+  default-language: Haskell2010

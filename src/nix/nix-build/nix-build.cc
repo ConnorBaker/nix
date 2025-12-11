@@ -28,6 +28,7 @@
 #include "nix/util/users.hh"
 #include "nix/cmd/network-proxy.hh"
 #include "nix/cmd/compatibility-settings.hh"
+#include "nix/expr/ghc-gc.hh"
 #include "man-pages.hh"
 
 using namespace nix;
@@ -410,6 +411,11 @@ static void main_nix_build(int argc, char ** argv)
         Value vRoot;
         state->eval(e, vRoot);
 
+        // GC safe point: After evaluating expression
+#if NIX_USE_GHC_GC
+        { ghc::GCSafePoint safePoint; }
+#endif
+
         std::function<bool(const Value & v)> takesNixShellAttr;
         takesNixShellAttr = [&](const Value & v) {
             if (!isNixShell) {
@@ -432,6 +438,12 @@ static void main_nix_build(int argc, char ** argv)
                 *findAlongAttrPath(*state, i, takesNixShellAttr(vRoot) ? *autoArgsWithInNixShell : *autoArgs, vRoot)
                      .first);
             state->forceValue(v, v.determinePos(noPos));
+
+            // GC safe point: After forcing value for attr path
+#if NIX_USE_GHC_GC
+            { ghc::GCSafePoint safePoint; }
+#endif
+
             getDerivations(*state, v, "", takesNixShellAttr(v) ? *autoArgsWithInNixShell : *autoArgs, drvs, false);
         }
     }

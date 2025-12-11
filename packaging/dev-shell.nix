@@ -120,6 +120,14 @@ pkgs.nixComponents2.nix-util.overrideAttrs (
         pkgs.buildPackages.nixfmt-rfc-style
         pkgs.buildPackages.shellcheck
         pkgs.buildPackages.gdb
+        pkgs.buildPackages.ghc
+        pkgs.buildPackages.nodejs
+        pkgs.buildPackages.uv
+        pkgs.buildPackages.hyperfine
+        pkgs.buildPackages.gperftools
+        pkgs.buildPackages.linuxPackages.perf
+        pkgs.buildPackages.valgrind
+        pkgs.buildPackages.flamegraph
       ]
       ++ lib.optional (stdenv.cc.isClang && stdenv.hostPlatform == stdenv.buildPlatform) (
         lib.hiPrio pkgs.buildPackages.clang-tools
@@ -128,6 +136,7 @@ pkgs.nixComponents2.nix-util.overrideAttrs (
 
     buildInputs = [
       pkgs.gbenchmark
+      pkgs.ghc
     ]
     ++ attrs.buildInputs or [ ]
     ++ pkgs.nixComponents2.nix-util.buildInputs

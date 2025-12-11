@@ -8,12 +8,14 @@ config_pub_h = configure_file(
 )
 
 headers = [ config_pub_h ] + files(
+  'allocator.hh',
   'attr-path.hh',
   'attr-set.hh',
   'counter.hh',
   'eval-cache.hh',
   'eval-error.hh',
   'eval-gc.hh',
+  'ghc-gc.hh',
   'eval-inline.hh',
   'eval-profiler-settings.hh',
   'eval-profiler.hh',

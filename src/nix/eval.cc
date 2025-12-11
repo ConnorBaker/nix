@@ -5,6 +5,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/expr/ghc-gc.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -71,12 +72,22 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
         auto [v, pos] = installable->toValue(*state);
         NixStringContext context;
 
+        // GC safe point: After initial evaluation, result is stored in v
+#if NIX_USE_GHC_GC
+        { ghc::GCSafePoint safePoint; }
+#endif
+
         if (apply) {
             auto vApply = state->allocValue();
             state->eval(state->parseExprFromString(*apply, state->rootPath(".")), *vApply);
             auto vRes = state->allocValue();
             state->callFunction(*vApply, *v, *vRes, noPos);
             v = vRes;
+
+            // GC safe point: After applying function
+#if NIX_USE_GHC_GC
+            { ghc::GCSafePoint safePoint; }
+#endif
         }
 
         if (writeTo) {

@@ -12,6 +12,7 @@
 #include "nix/store/local-fs-store.hh"
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/cmd/legacy.hh"
+#include "nix/expr/ghc-gc.hh"
 #include "man-pages.hh"
 
 #include <map>
@@ -46,9 +47,19 @@ void processExpr(
     Value vRoot;
     state.eval(e, vRoot);
 
+    // GC safe point: After initial evaluation
+#if NIX_USE_GHC_GC
+    { ghc::GCSafePoint safePoint; }
+#endif
+
     for (auto & i : attrPaths) {
         Value & v(*findAlongAttrPath(state, i, autoArgs, vRoot).first);
         state.forceValue(v, v.determinePos(noPos));
+
+        // GC safe point: After forcing value for attr path
+#if NIX_USE_GHC_GC
+        { ghc::GCSafePoint safePoint; }
+#endif
 
         NixStringContext context;
         if (evalOnly) {

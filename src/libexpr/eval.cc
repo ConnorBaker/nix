@@ -26,6 +26,7 @@
 #include "nix/util/current-process.hh"
 #include "nix/store/async-path-writer.hh"
 #include "nix/expr/parallel-eval.hh"
+#include "nix/expr/ghc-gc.hh"
 
 #include "parser-tab.hh"
 
@@ -56,11 +57,8 @@ namespace nix {
 
 static char * allocString(size_t size)
 {
-    char * t;
-    t = (char *) GC_MALLOC_ATOMIC(size);
-    if (!t)
-        throw std::bad_alloc();
-    return t;
+    // Use atomic allocation for strings (they don't contain pointers to trace)
+    return static_cast<char *>(Allocator::allocAtomic(size));
 }
 
 // When there's no need to write to the string, we can optimize away empty
@@ -80,7 +78,20 @@ static const char * makeImmutableString(std::string_view s)
 
 RootValue allocRootValue(Value * v)
 {
+#if NIX_USE_GHC_GC
+    // Register the value as a GC root so it won't be collected
+    ghc::gcAddRoot(v);
+    // Use a custom deleter that unregisters the root when the shared_ptr is destroyed
+    return std::shared_ptr<Value *>(
+        new Value*(v),
+        [](Value** p) {
+            ghc::gcRemoveRoot(*p);
+            delete p;
+        }
+    );
+#else
     return std::allocate_shared<Value *>(traceable_allocator<Value *>(), v);
+#endif
 }
 
 // Pretty print types for assertion errors
@@ -915,7 +926,8 @@ inline Value * EvalState::lookupVar(Env * env, const ExprVar & var, bool noEval)
 
 ListBuilder::ListBuilder(size_t size)
     : size(size)
-    , elems(size <= 2 ? inlineElems : (Value **) allocBytes(size * sizeof(Value *)))
+    // Use dedicated list allocation for better tracking
+    , elems(size <= 2 ? inlineElems : (Value **) Allocator::allocList(size))
 {
 }
 
@@ -1131,6 +1143,7 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         [&](auto & i) {
             vExpr = allocValue();
             vExpr->mkThunk(&baseEnv, &expr);
+            // Cache vExpr - it will be forced and cache the result
             i.second = vExpr;
         },
         [&](auto & i) { vExpr = i.second; });
@@ -1142,6 +1155,15 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
 
 void EvalState::resetFileCache()
 {
+    // Phase 4: Unroot preserved Envs before clearing cache (Iteration 49)
+    // When the cache is cleared, we need to unregister all preserved Envs
+    // to prevent memory leaks and allow them to be garbage collected
+#if NIX_USE_GHC_GC
+    fileEvalCache->cvisit_all([](const auto & entry) {
+        ghc::gcUnpreserveEnv((void*)entry.second);
+    });
+#endif
+
     importResolutionCache->clear();
     fileEvalCache->clear();
     inputCache->clear();
@@ -2200,6 +2222,12 @@ void EvalState::forceValueDeep(Value & v)
     };
 
     recurse(v);
+
+    // GC safe point: After deep forcing completes, all values have been evaluated
+    // and results stored in the value graph. No Values are on the stack at this point.
+#if NIX_USE_GHC_GC
+    ghc::GCSafePoint safePoint;
+#endif
 }
 
 NixInt EvalState::forceInt(Value & v, const PosIdx pos, std::string_view errorCtx)
@@ -3020,6 +3048,25 @@ void EvalState::printStatistics()
         {"heapSize", heapSize},
         {"totalBytes", totalBytes},
         {"cycles", gcCycles},
+    };
+#elif NIX_USE_GHC_GC
+    topObj["gc"] = {
+        {"heapSize", ghc::getHeapSize()},
+        {"totalBytes", ghc::getAllocatedBytes()},
+        {"cycles", ghc::getGCCycles()},
+        {"allocCount", ghc::getAllocCount()},
+        {"tracedAllocCount", ghc::getTracedAllocCount()},
+        {"tracedAllocBytes", ghc::getTracedAllocBytes()},
+        {"atomicAllocCount", ghc::getAtomicAllocCount()},
+        {"atomicAllocBytes", ghc::getAtomicAllocBytes()},
+        {"valueAllocCount", ghc::getValueAllocCount()},
+        {"valueAllocBytes", ghc::getValueAllocBytes()},
+        {"envAllocCount", ghc::getEnvAllocCount()},
+        {"envAllocBytes", ghc::getEnvAllocBytes()},
+        {"bindingsAllocCount", ghc::getBindingsAllocCount()},
+        {"bindingsAllocBytes", ghc::getBindingsAllocBytes()},
+        {"listAllocCount", ghc::getListAllocCount()},
+        {"listAllocBytes", ghc::getListAllocBytes()},
     };
 #endif
 

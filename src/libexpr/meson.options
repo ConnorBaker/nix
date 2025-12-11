@@ -3,3 +3,10 @@ option(
   type : 'feature',
   description : 'enable garbage collection in the Nix expression evaluator (requires Boehm GC)',
 )
+
+option(
+  'ghc_gc',
+  type : 'feature',
+  value : 'disabled',
+  description : 'use GHC runtime system for garbage collection instead of Boehm GC (experimental)',
+)

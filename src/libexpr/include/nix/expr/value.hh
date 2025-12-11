@@ -12,6 +12,7 @@
 #include "nix/util/source-path.hh"
 #include "nix/expr/print-options.hh"
 #include "nix/util/checked-arithmetic.hh"
+#include "nix/expr/ghc-gc.hh"  // Iteration 58: Write barriers
 
 #include <boost/unordered/unordered_flat_map_fwd.hpp>
 #include <nlohmann/json_fwd.hpp>
@@ -752,7 +753,14 @@ protected:
         setSingleDWordPayload<tFailed>(std::bit_cast<PackedPointer>(failed));
     }
 
-    ValueStorage() {}
+    ValueStorage() {
+        // CRITICAL: Initialize to zero to avoid reading garbage from reused memory.
+        // GHC heap can reuse memory from previously freed objects, which may have
+        // had discriminator=pdThunk. If we don't initialize, finish() will crash
+        // when it sees the old pdThunk discriminator.
+        p0.store(0, std::memory_order_relaxed);
+        p1 = 0;
+    }
 
     ValueStorage(const ValueStorage & v)
     {
@@ -1207,6 +1215,10 @@ public:
     inline void mkAttrs(Bindings * a) noexcept
     {
         setStorage(a);
+
+        // Iteration 58: Write barrier for mkAttrs
+        // This Value now contains a reference to Bindings (which contains Value* pointers)
+        ghc::gcWriteBarrier(this, a);
     }
 
     Value & mkAttrs(BindingsBuilder & bindings);
@@ -1219,12 +1231,20 @@ public:
             break;
         case 1:
             setStorage(std::array<Value *, 2>{builder.inlineElems[0], nullptr});
+            // Iteration 58: Write barrier for list with 1 element
+            ghc::gcWriteBarrier(this, builder.inlineElems[0]);
             break;
         case 2:
             setStorage(std::array<Value *, 2>{builder.inlineElems[0], builder.inlineElems[1]});
+            // Iteration 58: Write barriers for list with 2 elements
+            ghc::gcWriteBarrier(this, builder.inlineElems[0]);
+            ghc::gcWriteBarrier(this, builder.inlineElems[1]);
             break;
         default:
             setStorage(List{.size = builder.size, .elems = builder.elems});
+            // Iteration 58: Conservative write barrier for large lists
+            // We don't know what's in builder.elems, so conservatively mark this Value
+            ghc::gcRecordMutation(this);
             break;
         }
     }
@@ -1232,16 +1252,28 @@ public:
     inline void mkThunk(Env * e, Expr * ex) noexcept
     {
         setStorage(ClosureThunk{.env = e, .expr = ex});
+
+        // Iteration 58: Write barriers for mkThunk
+        ghc::gcWriteBarrier(this, e);
+        // Note: Expr* is not heap-allocated, so no barrier needed for ex
     }
 
     inline void mkApp(Value * l, Value * r) noexcept
     {
         setStorage(FunctionApplicationThunk{.left = l, .right = r});
+
+        // Iteration 58: Write barriers for mkApp
+        ghc::gcWriteBarrier(this, l);
+        ghc::gcWriteBarrier(this, r);
     }
 
     inline void mkLambda(Env * e, ExprLambda * f) noexcept
     {
         setStorage(Lambda{.env = e, .fun = f});
+
+        // Iteration 58: Write barrier for mkLambda
+        ghc::gcWriteBarrier(this, e);
+        // Note: ExprLambda* is not heap-allocated, so no barrier needed for f
     }
 
     void mkPrimOp(PrimOp * p);
@@ -1249,6 +1281,10 @@ public:
     inline void mkPrimOpApp(Value * l, Value * r) noexcept
     {
         setStorage(PrimOpApplicationThunk{.left = l, .right = r});
+
+        // Iteration 58: Write barriers for mkPrimOpApp
+        ghc::gcWriteBarrier(this, l);
+        ghc::gcWriteBarrier(this, r);
     }
 
     /**
