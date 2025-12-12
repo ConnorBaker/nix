@@ -3,6 +3,7 @@
   buildPackages,
   stdenv,
   mkMesonExecutable,
+  writableTmpDirAsHomeHook,
 
   nix-expr,
   nix-expr-c,
@@ -55,19 +56,14 @@ mkMesonExecutable (finalAttrs: {
         runCommand "${finalAttrs.pname}-run"
           {
             meta.broken = !stdenv.hostPlatform.emulatorAvailable buildPackages;
+            buildInputs = [ writableTmpDirAsHomeHook ];
           }
-          (
-            lib.optionalString stdenv.hostPlatform.isWindows ''
-              export HOME="$PWD/home-dir"
-              mkdir -p "$HOME"
-            ''
-            + ''
-              export ASAN_OPTIONS=abort_on_error=1:print_summary=1:detect_leaks=0
-              export _NIX_TEST_UNIT_DATA=${resolvePath ./data}
-              ${stdenv.hostPlatform.emulator buildPackages} ${lib.getExe finalAttrs.finalPackage}
-              touch $out
-            ''
-          );
+          ''
+            export ASAN_OPTIONS=abort_on_error=1:print_summary=1:detect_leaks=0
+            export _NIX_TEST_UNIT_DATA=${resolvePath ./data}
+            ${stdenv.hostPlatform.emulator buildPackages} ${lib.getExe finalAttrs.finalPackage}
+            touch $out
+          '';
     };
   };
 

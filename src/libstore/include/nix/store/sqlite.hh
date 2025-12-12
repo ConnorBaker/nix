@@ -143,6 +143,24 @@ struct SQLiteStmt
 };
 
 /**
+ * Transaction mode for SQLiteTxn.
+ */
+enum class SQLiteTxnMode {
+    /**
+     * DEFERRED transaction - acquires locks lazily on first access.
+     * May fail with SQLITE_BUSY on upgrade from read to write without
+     * respecting busy_timeout.
+     */
+    Deferred,
+    /**
+     * IMMEDIATE transaction - acquires write lock immediately.
+     * Respects busy_timeout if database is locked. Recommended for
+     * write transactions to enable effective retry logic.
+     */
+    Immediate
+};
+
+/**
  * RAII helper that ensures transactions are aborted unless explicitly
  * committed.
  */
@@ -151,7 +169,7 @@ struct SQLiteTxn
     bool active = false;
     sqlite3 * db;
 
-    SQLiteTxn(sqlite3 * db);
+    SQLiteTxn(sqlite3 * db, SQLiteTxnMode mode = SQLiteTxnMode::Deferred);
 
     void commit();
 
