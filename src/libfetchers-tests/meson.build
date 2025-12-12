@@ -41,6 +41,7 @@ subdir('nix-meson-build-support/asan-options')
 
 sources = files(
   'access-tokens.cc',
+  'cache-locking.cc',
   'git-utils.cc',
   'git.cc',
   'nix_api_fetchers.cc',

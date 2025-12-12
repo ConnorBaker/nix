@@ -4,7 +4,11 @@
 #include "nix/util/signals.hh"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
+#include <thread>
+
+using namespace std::chrono_literals;
 
 #include <fcntl.h>
 #include <sys/types.h>
@@ -53,8 +57,7 @@ bool lockFile(Descriptor desc, LockType lockType, bool wait)
             checkInterrupt();
             if (errno != EINTR)
                 throw SysError("acquiring/releasing lock");
-            else
-                return false;
+            /* If EINTR, the loop continues and retries flock() */
         }
     } else {
         while (flock(desc, type | LOCK_NB) != 0) {
@@ -67,6 +70,54 @@ bool lockFile(Descriptor desc, LockType lockType, bool wait)
     }
 
     return true;
+}
+
+bool lockFileWithTimeout(Descriptor desc, LockType lockType, unsigned int timeout)
+{
+    if (timeout == 0) {
+        /* No timeout - wait indefinitely */
+        return lockFile(desc, lockType, true);
+    }
+
+    /*
+     * flock() doesn't support timeouts natively. We use a polling approach
+     * with exponential backoff, which is the standard solution for timed
+     * flock() since:
+     *
+     * 1. Using alarm()/SIGALRM is not thread-safe and interferes with
+     *    other signal handling.
+     *
+     * 2. poll()/select() don't work with flock() - you can't wait on
+     *    lock acquisition in a select-like manner.
+     *
+     * 3. Boost Interprocess file_lock uses a different locking mechanism
+     *    (fcntl F_SETLK) that's incompatible with flock(), so mixing them
+     *    would cause deadlocks with other Nix processes.
+     *
+     * The exponential backoff (10ms -> 20ms -> ... -> 500ms cap) minimizes
+     * CPU usage while remaining responsive to lock availability.
+     */
+    auto startTime = std::chrono::steady_clock::now();
+    auto timeoutDuration = std::chrono::seconds(timeout);
+    auto sleepDuration = 10ms;
+    constexpr auto maxSleep = 500ms;
+
+    while (true) {
+        checkInterrupt();
+
+        /* Try non-blocking lock */
+        if (lockFile(desc, lockType, false))
+            return true;
+
+        /* Check if we've exceeded the timeout */
+        auto elapsed = std::chrono::steady_clock::now() - startTime;
+        if (elapsed >= timeoutDuration)
+            return false;
+
+        /* Sleep with exponential backoff, capped at 500ms */
+        std::this_thread::sleep_for(sleepDuration);
+        sleepDuration = std::min(sleepDuration * 2, maxSleep);
+    }
 }
 
 bool PathLocks::lockPaths(const PathSet & paths, const std::string & waitMsg, bool wait)

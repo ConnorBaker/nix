@@ -1,14 +1,27 @@
 #include "nix/fetchers/cache.hh"
+#include "nix/fetchers/cache-impl.hh"
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/util/users.hh"
+#include "nix/util/logging.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/util/sync.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/globals.hh"
+#include "nix/util/hash.hh"
 
+#include <mutex>
 #include <nlohmann/json.hpp>
 
 namespace nix::fetchers {
+
+Path getFetchLockPath(std::string_view identity)
+{
+    static std::once_flag fetchLockDirCreated;
+    auto lockDir = getCacheDir() + "/fetch-locks";
+    std::call_once(fetchLockDirCreated, [&]() { createDirs(lockDir); });
+    auto hash = hashString(HashAlgorithm::SHA256, identity);
+    return lockDir + "/" + hash.to_string(HashFormat::Nix32, false) + ".lock";
+}
 
 static const char * schema = R"sql(
 
@@ -147,6 +160,26 @@ struct CacheImpl : Cache
     {
         auto res = lookupStorePath(std::move(key), store, false);
         return res && !res->expired ? res : std::nullopt;
+    }
+
+    std::optional<ResultWithStorePath> lookupOrFetch(
+        Key key, Store & store, std::function<std::pair<Attrs, StorePath>()> fetcher, unsigned int lockTimeout) override
+    {
+        auto keyStr = fmt("%s:%s", key.first, attrsToJSON(key.second).dump());
+
+        return withFetchLock(
+            keyStr,
+            lockTimeout,
+            [&]() -> std::optional<std::optional<ResultWithStorePath>> {
+                if (auto cached = lookupStorePath(key, store, false))
+                    return cached;
+                return std::nullopt;
+            },
+            [&]() -> std::optional<ResultWithStorePath> {
+                auto [attrs, storePath] = fetcher();
+                upsert(key, store, attrs, storePath);
+                return lookupStorePath(key, store, false);
+            });
     }
 };
 
