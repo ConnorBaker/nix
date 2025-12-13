@@ -143,6 +143,24 @@ struct SQLiteStmt
 };
 
 /**
+ * Transaction mode for SQLiteTxn.
+ */
+enum class SQLiteTxnMode {
+    /**
+     * DEFERRED transaction - acquires locks lazily on first access.
+     * May fail with SQLITE_BUSY on upgrade from read to write without
+     * respecting busy_timeout.
+     */
+    Deferred,
+    /**
+     * IMMEDIATE transaction - acquires write lock immediately.
+     * Respects busy_timeout if database is locked. Recommended for
+     * write transactions to enable effective retry logic.
+     */
+    Immediate
+};
+
+/**
  * RAII helper that ensures transactions are aborted unless explicitly
  * committed.
  */
@@ -151,7 +169,7 @@ struct SQLiteTxn
     bool active = false;
     sqlite3 * db;
 
-    SQLiteTxn(sqlite3 * db);
+    SQLiteTxn(sqlite3 * db, SQLiteTxnMode mode = SQLiteTxnMode::Deferred);
 
     void commit();
 
@@ -197,16 +215,26 @@ void handleSQLiteBusy(const SQLiteBusy & e, time_t & nextWarning);
 /**
  * Convenience function for retrying a SQLite transaction when the
  * database is busy.
+ *
+ * @param fun The function to execute and retry on SQLITE_BUSY.
+ * @param maxRetries Maximum number of retry attempts before giving up.
+ *                   Default is 100, which with exponential backoff in
+ *                   handleSQLiteBusy allows for several minutes of retries.
+ * @return The result of fun() on success.
+ * @throws Error if maxRetries is exceeded.
  */
 template<typename T, typename F>
-T retrySQLite(F && fun)
+T retrySQLite(F && fun, size_t maxRetries = 100)
 {
     time_t nextWarning = time(0) + 1;
+    size_t retries = 0;
 
     while (true) {
         try {
             return fun();
         } catch (SQLiteBusy & e) {
+            if (++retries > maxRetries)
+                throw Error("SQLite operation failed after %zu retries: %s", maxRetries, e.what());
             handleSQLiteBusy(e, nextWarning);
         }
     }
