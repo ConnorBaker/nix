@@ -176,6 +176,30 @@ sources = files(
   'value/context.cc',
 )
 
+# HVM4 backend (experimental)
+hvm4_enabled = get_option('hvm4-backend').enabled()
+if hvm4_enabled
+  sources += files(
+    'hvm4/hvm4-attrs.cc',
+    'hvm4/hvm4-backend.cc',
+    'hvm4/hvm4-bigint.cc',
+    'hvm4/hvm4-compile-context.cc',
+    'hvm4/hvm4-compiler.cc',
+    'hvm4/hvm4-compiler-analysis.cc',
+    'hvm4/hvm4-compiler-emit-attrs.cc',
+    'hvm4/hvm4-compiler-emit-basic.cc',
+    'hvm4/hvm4-compiler-emit-control.cc',
+    'hvm4/hvm4-compiler-emit-lambda.cc',
+    'hvm4/hvm4-compiler-emit-ops.cc',
+    'hvm4/hvm4-list.cc',
+    'hvm4/hvm4-path.cc',
+    'hvm4/hvm4-result.cc',
+    'hvm4/hvm4-runtime.cc',
+    'hvm4/hvm4-string.cc',
+  )
+endif
+configdata_pub.set('NIX_USE_HVM4', hvm4_enabled.to_int())
+
 subdir('include/nix/expr')
 
 subdir('primops')

@@ -3,3 +3,10 @@ option(
   type : 'feature',
   description : 'enable garbage collection in the Nix expression evaluator (requires Boehm GC)',
 )
+
+option(
+  'hvm4-backend',
+  type : 'feature',
+  value : 'disabled',
+  description : 'enable experimental HVM4 evaluator backend for accelerated pure computation',
+)

@@ -50,6 +50,32 @@ sources = files(
   'derived-path.cc',
   'error_traces.cc',
   'eval.cc',
+  'hvm4/hvm4-arithmetic-test.cc',
+  'hvm4/hvm4-attrs-test.cc',
+  'hvm4/hvm4-backend-test.cc',
+  'hvm4/hvm4-bigint-test.cc',
+  'hvm4/hvm4-boolean-test.cc',
+  'hvm4/hvm4-capability-test.cc',
+  'hvm4/hvm4-closure-test.cc',
+  'hvm4/hvm4-comparison-test.cc',
+  'hvm4/hvm4-conditional-test.cc',
+  'hvm4/hvm4-derivation-test.cc',
+  'hvm4/hvm4-float-test.cc',
+  'hvm4/hvm4-import-test.cc',
+  'hvm4/hvm4-integration-test.cc',
+  'hvm4/hvm4-known-limitations-test.cc',
+  'hvm4/hvm4-lambda-test.cc',
+  'hvm4/hvm4-let-test.cc',
+  'hvm4/hvm4-list-test.cc',
+  'hvm4/hvm4-null-test.cc',
+  'hvm4/hvm4-path-test.cc',
+  'hvm4/hvm4-pattern-test.cc',
+  'hvm4/hvm4-primop-test.cc',
+  'hvm4/hvm4-rec-test.cc',
+  'hvm4/hvm4-runtime-test.cc',
+  'hvm4/hvm4-stress-test.cc',
+  'hvm4/hvm4-string-test.cc',
+  'hvm4/hvm4-with-test.cc',
   'json.cc',
   'main.cc',
   'nix_api_expr.cc',
@@ -64,7 +90,7 @@ sources = files(
   'value/value.cc',
 )
 
-include_dirs = [ include_directories('.') ]
+include_dirs = [ include_directories('.'), include_directories('hvm4') ]
 
 
 this_exe = executable(

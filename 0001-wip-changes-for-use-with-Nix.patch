@@ -1,0 +1,94 @@
+From 5cf1db9bad82af52d28085b42f6d5572f090b1e8 Mon Sep 17 00:00:00 2001
+From: Connor Baker <ConnorBaker01@gmail.com>
+Date: Tue, 23 Dec 2025 03:53:23 +0000
+Subject: [PATCH] wip: changes for use with Nix
+
+Signed-off-by: Connor Baker <ConnorBaker01@gmail.com>
+---
+ clang/hvm4.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/clang/hvm4.c b/clang/hvm4.c
+index e05a78a..da8f24f 100644
+--- a/clang/hvm4.c
++++ b/clang/hvm4.c
+@@ -266,38 +266,55 @@ static int    PARSE_FORK_SIDE = -1;      // -1 = off, 0 = left branch (CO0), 1 =
+ 
+ // Nick
+ // ====
++// Note: nick/names.c defines constructor name constants needed by the evaluator
++// The other nick functions are only needed for printing
+ 
++#include "nick/names.c"
++
++#ifndef HVM4_NO_PRINT
+ #include "nick/letter_to_b64.c"
+ #include "nick/b64_to_letter.c"
+ #include "nick/to_str.c"
+ #include "nick/is_init.c"
+ #include "nick/is_char.c"
+-#include "nick/names.c"
++#endif
+ 
+ // System
+ // ======
++// Note: system functions are used by parser for file reading
+ 
++#ifndef HVM4_NO_PARSER
+ #include "sys/error.c"
+ #include "sys/path_join.c"
+ #include "sys/file_read.c"
++#endif
+ 
+ // Table
+ // =====
++// Note: table functions are used by parser for definition lookup
+ 
++#ifndef HVM4_NO_PARSER
+ #include "table/_.c"
+ #include "table/find.c"
+ #include "table/get.c"
++#endif
+ 
+ // Print
+ // =====
+ 
++#ifndef HVM4_NO_PRINT
+ #include "print/name.c"
+ #include "print/utf8.c"
+ #include "print/term.c"
++#else
++// Stub for print_term when printing is disabled (used in DEBUG branches of WNF)
++fn void print_term(Term term) { (void)term; }
++#endif
+ 
+ // Parse
+ // =====
+ 
++#ifndef HVM4_NO_PARSER
+ #include "parse/error.c"
+ #include "parse/error_var.c"
+ #include "parse/at_end.c"
+@@ -338,6 +355,7 @@ static int    PARSE_FORK_SIDE = -1;      // -1 = off, 0 = left branch (CO0), 1 =
+ #include "parse/term/_.c"
+ #include "parse/include.c"
+ #include "parse/def.c"
++#endif
+ 
+ // WNF
+ // ===
+@@ -428,7 +446,11 @@ static int    PARSE_FORK_SIDE = -1;      // -1 = off, 0 = left branch (CO0), 1 =
+ 
+ // Collapse
+ // ========
++// Note: collapse module uses 'template' as parameter name which is a C++ keyword
++// Exclude when embedding in C++ code
+ 
++#ifndef HVM4_NO_COLLAPSE
+ #include "collapse/inject.c"
+ #include "collapse/step.c"
+ #include "collapse/flatten.c"
++#endif
+-- 
+2.50.1
+

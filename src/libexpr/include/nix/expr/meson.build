@@ -38,3 +38,16 @@ headers = [ config_pub_h ] + files(
   'value.hh',
   'value/context.hh',
 )
+
+# HVM4 headers (always installed, guarded by NIX_USE_HVM4 in code)
+headers += files(
+  'hvm4/hvm4-attrs.hh',
+  'hvm4/hvm4-backend.hh',
+  'hvm4/hvm4-bigint.hh',
+  'hvm4/hvm4-compiler.hh',
+  'hvm4/hvm4-list.hh',
+  'hvm4/hvm4-path.hh',
+  'hvm4/hvm4-result.hh',
+  'hvm4/hvm4-runtime.hh',
+  'hvm4/hvm4-string.hh',
+)
