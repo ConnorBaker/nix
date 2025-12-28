@@ -29,7 +29,7 @@ void processExpr(
     const Strings & attrPaths,
     bool parseOnly,
     bool strict,
-    Bindings & autoArgs,
+    Value & autoArgs,
     bool evalOnly,
     OutputKind output,
     bool location,
@@ -51,7 +51,7 @@ void processExpr(
         NixStringContext context;
         if (evalOnly) {
             Value vRes;
-            if (autoArgs.empty())
+            if (autoArgs.attrsSize() == 0)
                 vRes = v;
             else
                 state.autoCallFunction(autoArgs, v, vRes);
@@ -172,7 +172,7 @@ static int main_nix_instantiate(int argc, char ** argv)
         auto state = std::make_unique<EvalState>(myArgs.lookupPath, evalStore, fetchSettings, evalSettings, store);
         state->repair = myArgs.repair;
 
-        Bindings & autoArgs = *myArgs.getAutoArgs(*state);
+        Value & autoArgs = *myArgs.getAutoArgs(*state);
 
         if (attrPaths.empty())
             attrPaths = {""};

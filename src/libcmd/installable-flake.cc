@@ -72,7 +72,7 @@ InstallableFlake::InstallableFlake(
     , extendedOutputsSpec(std::move(extendedOutputsSpec))
     , lockFlags(lockFlags)
 {
-    if (cmd && cmd->getAutoArgs(*state)->size())
+    if (cmd && cmd->getAutoArgs(*state)->attrsSize())
         throw UsageError("'--arg' and '--argstr' are incompatible with flakes");
 }
 

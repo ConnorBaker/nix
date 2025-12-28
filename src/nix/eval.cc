@@ -94,18 +94,18 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
                     [[maybe_unused]] bool directoryCreated = std::filesystem::create_directory(path);
                     // Directory should not already exist
                     assert(directoryCreated);
-                    for (auto & attr : *v.attrs()) {
-                        std::string_view name = state->symbols[attr.name];
+                    v.forEachAttr([&](Symbol sym, Value * attrValue, PosIdx attrPos) {
+                        std::string_view name = state->symbols[sym];
                         try {
                             if (name == "." || name == "..")
                                 throw Error("invalid file name '%s'", name);
-                            recurse(*attr.value, attr.pos, path / name);
+                            recurse(*attrValue, attrPos, path / name);
                         } catch (Error & e) {
                             e.addTrace(
-                                state->positions[attr.pos], HintFmt("while evaluating the attribute '%s'", name));
+                                state->positions[attrPos], HintFmt("while evaluating the attribute '%s'", name));
                             throw;
                         }
-                    }
+                    });
                 } else
                     state->error<TypeError>("value at '%s' is not a string or an attribute set", state->positions[pos])
                         .debugThrow();

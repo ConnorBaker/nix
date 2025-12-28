@@ -25,8 +25,9 @@ PackageInfos queryInstalled(EvalState & state, const Path & userEnv)
     if (pathExists(manifestFile)) {
         Value v;
         state.evalFile(state.rootPath(CanonPath(manifestFile)).resolveSymlinks(), v);
-        Bindings & bindings = Bindings::emptyBindings;
-        getDerivations(state, v, "", bindings, elems, false);
+        Value emptyArgs;
+        emptyArgs.mkAttrs(&ImmerBindings::emptyImmerBindings);
+        getDerivations(state, v, "", emptyArgs, elems, false);
     }
     return elems;
 }
@@ -142,10 +143,10 @@ bool createUserEnv(
     debug("evaluating user environment builder");
     state.forceValue(topLevel, topLevel.determinePos(noPos));
     NixStringContext context;
-    auto & aDrvPath(*topLevel.attrs()->get(state.s.drvPath));
+    auto aDrvPath = topLevel.attrsGet(state.s.drvPath);
     auto topLevelDrv = state.coerceToStorePath(aDrvPath.pos, *aDrvPath.value, context, "");
     topLevelDrv.requireDerivation();
-    auto & aOutPath(*topLevel.attrs()->get(state.s.outPath));
+    auto aOutPath = topLevel.attrsGet(state.s.outPath);
     auto topLevelOut = state.coerceToStorePath(aOutPath.pos, *aOutPath.value, context, "");
 
     /* Realise the resulting store expression. */

@@ -296,15 +296,15 @@ void SourceExprCommand::completeInstallable(AddCompletions & completions, std::s
             state->autoCallFunction(*autoArgs, v1, v2);
 
             if (v2.type() == nAttrs) {
-                for (auto & i : *v2.attrs()) {
-                    std::string_view name = state->symbols[i.name];
+                v2.forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx attrPos) {
+                    std::string_view name = state->symbols[attrName];
                     if (name.find(searchWord) == 0) {
                         if (prefix_ == "")
                             completions.add(std::string(name));
                         else
                             completions.add(prefix_ + "." + name);
                     }
-                }
+                });
             }
         } else {
             completeFlakeRefWithFragment(
