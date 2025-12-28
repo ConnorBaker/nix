@@ -13,10 +13,12 @@
 #include <concepts>
 
 #include "nix/expr/eval-gc.hh"
+#include "nix/expr/immer-gc-policy.hh"
 #include "nix/expr/value/context.hh"
 #include "nix/util/source-path.hh"
 #include "nix/expr/print-options.hh"
 #include "nix/util/checked-arithmetic.hh"
+#include "nix/util/pos-idx.hh"
 
 #include <boost/unordered/unordered_flat_map_fwd.hpp>
 #include <nlohmann/json_fwd.hpp>
@@ -24,7 +26,7 @@
 namespace nix {
 
 struct Value;
-class BindingsBuilder;
+class ImmerBindingsBuilder;
 
 /**
  * Internal type discriminator, which is more detailed than `ValueType`, as
@@ -44,7 +46,8 @@ typedef enum {
     tFloat,
     tExternal,
     tPrimOp,
-    tAttrs,
+    tAttrsImmer, // Immer map-based attrs (structural sharing)
+    tListImmer,  // Immer flex_vector-based list (structural sharing)
     /* layout: Pair of pointers payload */
     tListSmall,
     tPrimOpApp,
@@ -76,7 +79,7 @@ typedef enum {
     nExternal,
 } ValueType;
 
-class Bindings;
+struct ImmerBindings;
 struct Env;
 struct Expr;
 struct ExprLambda;
@@ -84,7 +87,6 @@ struct ExprBlackHole;
 struct PrimOp;
 class Symbol;
 class SymbolStr;
-class PosIdx;
 struct Pos;
 class StorePath;
 class EvalState;
@@ -420,6 +422,24 @@ struct ValueBase
         size_t size;
         Value * const * elems;
     };
+
+    /**
+     * Wrapper for Immer-based list storage.
+     * Points to a GC-allocated NixList (immer::flex_vector).
+     */
+    struct ImmerList
+    {
+        const NixList* list;
+    };
+
+    /**
+     * Wrapper for Immer-based attribute set storage.
+     * Points to a GC-allocated ImmerBindings (immer::map).
+     */
+    struct ImmerAttrs
+    {
+        const ImmerBindings* bindings;
+    };
 };
 
 template<typename T>
@@ -437,7 +457,8 @@ struct PayloadTypeToInternalType
     MACRO(ValueBase::StringWithContext, string, tString)            \
     MACRO(ValueBase::Path, path, tPath)                             \
     MACRO(ValueBase::Null, null_, tNull)                            \
-    MACRO(Bindings *, attrs, tAttrs)                                \
+    MACRO(ValueBase::ImmerAttrs, immerAttrs, tAttrsImmer)           \
+    MACRO(ValueBase::ImmerList, immerList, tListImmer)              \
     MACRO(ValueBase::List, bigList, tListN)                         \
     MACRO(ValueBase::SmallList, smallList, tListSmall)              \
     MACRO(ValueBase::ClosureThunk, thunk, tThunk)                   \
@@ -727,9 +748,14 @@ protected:
         primOp = std::bit_cast<PrimOp *>(payload[1]);
     }
 
-    void getStorage(Bindings *& attrs) const noexcept
+    void getStorage(ImmerList & immerList) const noexcept
     {
-        attrs = std::bit_cast<Bindings *>(payload[1]);
+        immerList.list = std::bit_cast<const NixList *>(payload[1]);
+    }
+
+    void getStorage(ImmerAttrs & immerAttrs) const noexcept
+    {
+        immerAttrs.bindings = std::bit_cast<const ImmerBindings *>(payload[1]);
     }
 
     void getStorage(List & list) const noexcept
@@ -780,9 +806,14 @@ protected:
         setSingleDWordPayload<tPrimOp>(std::bit_cast<PackedPointer>(primOp));
     }
 
-    void setStorage(Bindings * bindings) noexcept
+    void setStorage(ImmerList immerList) noexcept
     {
-        setSingleDWordPayload<tAttrs>(std::bit_cast<PackedPointer>(bindings));
+        setSingleDWordPayload<tListImmer>(std::bit_cast<PackedPointer>(immerList.list));
+    }
+
+    void setStorage(ImmerAttrs immerAttrs) noexcept
+    {
+        setSingleDWordPayload<tAttrsImmer>(std::bit_cast<PackedPointer>(immerAttrs.bindings));
     }
 
     void setStorage(List list) noexcept
@@ -806,7 +837,7 @@ protected:
  *
  * Since not all representations of ValueStorage can provide
  * a pointer to a const array of Value * this proxy class either
- * stores the small list inline or points to the big list.
+ * stores the small list inline, points to the big list, or wraps an Immer list.
  */
 class ListView
 {
@@ -814,7 +845,7 @@ class ListView
     using SmallList = detail::ValueBase::SmallList;
     using List = detail::ValueBase::List;
 
-    std::variant<SmallList, List> raw;
+    std::variant<SmallList, List, const NixList*> raw;
 
 public:
     ListView(SmallList list)
@@ -827,11 +858,28 @@ public:
     {
     }
 
+    ListView(const NixList* list)
+        : raw(list)
+    {
+    }
+
+    /**
+     * Returns pointer to contiguous storage.
+     * @warning Only valid for SmallList and List, not Immer lists.
+     *          For Immer lists, this asserts and returns nullptr.
+     */
     Value * const * data() const & noexcept
     {
         return std::visit(
             overloaded{
-                [](const SmallList & list) { return list.data(); }, [](const List & list) { return list.elems; }},
+                [](const SmallList & list) { return list.data(); },
+                [](const List & list) { return list.elems; },
+                [](const NixList*) -> Value* const* {
+                    // Immer lists don't have contiguous storage.
+                    // Use iterators instead.
+                    assert(false && "data() not supported for Immer lists");
+                    return nullptr;
+                }},
             raw);
     }
 
@@ -840,15 +888,25 @@ public:
         return std::visit(
             overloaded{
                 [](const SmallList & list) -> std::size_t { return list.back() == nullptr ? 1 : 2; },
-                [](const List & list) -> std::size_t { return list.size; }},
+                [](const List & list) -> std::size_t { return list.size; },
+                [](const NixList* list) -> std::size_t { return list->size(); }},
             raw);
     }
 
     Value * operator[](std::size_t i) const noexcept
     {
-        return data()[i];
+        return std::visit(
+            overloaded{
+                [i](const SmallList & list) { return list[i]; },
+                [i](const List & list) { return list.elems[i]; },
+                [i](const NixList* list) { return (*list)[i]; }},
+            raw);
     }
 
+    /**
+     * Returns a span view of the list.
+     * @warning Only valid for SmallList and List, not Immer lists.
+     */
     SpanType span() const &
     {
         return SpanType(data(), size());
@@ -860,120 +918,194 @@ public:
     Value * const * data() && noexcept = delete;
 
     /**
-     * Random-access iterator that only allows iterating over a constant range
-     * of mutable Value pointers.
+     * Returns true if this ListView wraps an Immer list.
+     */
+    bool isImmer() const noexcept
+    {
+        return std::holds_alternative<const NixList*>(raw);
+    }
+
+    /**
+     * Returns the underlying Immer list pointer.
+     * @pre isImmer() must be true
+     */
+    const NixList* immerList() const noexcept
+    {
+        return std::get<const NixList*>(raw);
+    }
+
+    /**
+     * Random-access iterator that supports both contiguous storage (pointer-based)
+     * and Immer lists (iterator-based).
      *
-     * @note Not a pointer to minimize potential misuses and implicitly relying
-     * on the iterator being a pointer.
+     * @note Uses a variant internally to handle both cases efficiently.
      **/
     class iterator
     {
     public:
         using value_type = Value *;
         using pointer = const value_type *;
-        using reference = const value_type &;
+        using reference = value_type;  // Return by value for Immer compatibility
         using difference_type = std::ptrdiff_t;
         using iterator_category = std::random_access_iterator_tag;
 
     private:
-        pointer ptr = nullptr;
+        // Store either a raw pointer (for contiguous storage) or Immer iterator
+        std::variant<pointer, NixList::const_iterator> it;
 
         friend class ListView;
 
         iterator(pointer ptr)
-            : ptr(ptr)
+            : it(ptr)
+        {
+        }
+
+        iterator(NixList::const_iterator immerIt)
+            : it(immerIt)
         {
         }
 
     public:
         iterator() = default;
 
-        reference operator*() const
+        value_type operator*() const
         {
-            return *ptr;
+            return std::visit(
+                overloaded{
+                    [](pointer ptr) { return *ptr; },
+                    [](const NixList::const_iterator& immerIt) { return *immerIt; }},
+                it);
         }
 
-        const value_type * operator->() const
+        value_type operator[](difference_type diff) const
         {
-            return ptr;
-        }
-
-        reference operator[](difference_type diff) const
-        {
-            return ptr[diff];
+            return std::visit(
+                overloaded{
+                    [diff](pointer ptr) { return ptr[diff]; },
+                    [diff](const NixList::const_iterator& immerIt) { return *(immerIt + diff); }},
+                it);
         }
 
         iterator & operator++()
         {
-            ++ptr;
+            std::visit(
+                overloaded{
+                    [](pointer& ptr) { ++ptr; },
+                    [](NixList::const_iterator& immerIt) { ++immerIt; }},
+                it);
             return *this;
         }
 
         iterator operator++(int)
         {
-            pointer tmp = ptr;
+            iterator tmp = *this;
             ++*this;
-            return iterator(tmp);
+            return tmp;
         }
 
         iterator & operator--()
         {
-            --ptr;
+            std::visit(
+                overloaded{
+                    [](pointer& ptr) { --ptr; },
+                    [](NixList::const_iterator& immerIt) { --immerIt; }},
+                it);
             return *this;
         }
 
         iterator operator--(int)
         {
-            pointer tmp = ptr;
+            iterator tmp = *this;
             --*this;
-            return iterator(tmp);
+            return tmp;
         }
 
         iterator & operator+=(difference_type diff)
         {
-            ptr += diff;
+            std::visit(
+                overloaded{
+                    [diff](pointer& ptr) { ptr += diff; },
+                    [diff](NixList::const_iterator& immerIt) { immerIt += diff; }},
+                it);
             return *this;
         }
 
         iterator operator+(difference_type diff) const
         {
-            return iterator(ptr + diff);
+            return std::visit(
+                overloaded{
+                    [diff](pointer ptr) { return iterator(ptr + diff); },
+                    [diff](const NixList::const_iterator& immerIt) { return iterator(immerIt + diff); }},
+                it);
         }
 
         friend iterator operator+(difference_type diff, const iterator & rhs)
         {
-            return iterator(diff + rhs.ptr);
+            return rhs + diff;
         }
 
         iterator & operator-=(difference_type diff)
         {
-            ptr -= diff;
-            return *this;
+            return *this += -diff;
         }
 
         iterator operator-(difference_type diff) const
         {
-            return iterator(ptr - diff);
+            return *this + (-diff);
         }
 
         difference_type operator-(const iterator & rhs) const
         {
-            return ptr - rhs.ptr;
+            // Both iterators must be of the same type
+            if (std::holds_alternative<pointer>(it)) {
+                return std::get<pointer>(it) - std::get<pointer>(rhs.it);
+            } else {
+                return std::get<NixList::const_iterator>(it) - std::get<NixList::const_iterator>(rhs.it);
+            }
         }
 
-        std::strong_ordering operator<=>(const iterator & rhs) const = default;
+        bool operator==(const iterator & rhs) const
+        {
+            return it == rhs.it;
+        }
+
+        std::strong_ordering operator<=>(const iterator & rhs) const
+        {
+            if (std::holds_alternative<pointer>(it)) {
+                return std::get<pointer>(it) <=> std::get<pointer>(rhs.it);
+            } else {
+                // Immer iterators support comparison
+                auto lhs_it = std::get<NixList::const_iterator>(it);
+                auto rhs_it = std::get<NixList::const_iterator>(rhs.it);
+                if (lhs_it < rhs_it) return std::strong_ordering::less;
+                if (lhs_it > rhs_it) return std::strong_ordering::greater;
+                return std::strong_ordering::equal;
+            }
+        }
     };
 
     using const_iterator = iterator;
 
     iterator begin() const &
     {
-        return data();
+        return std::visit(
+            overloaded{
+                [](const SmallList & list) { return iterator(list.data()); },
+                [](const List & list) { return iterator(list.elems); },
+                [](const NixList* list) { return iterator(list->begin()); }},
+            raw);
     }
 
     iterator end() const &
     {
-        return data() + size();
+        return std::visit(
+            overloaded{
+                [](const SmallList & list) {
+                    return iterator(list.data() + (list.back() == nullptr ? 1 : 2));
+                },
+                [](const List & list) { return iterator(list.elems + list.size); },
+                [](const NixList* list) { return iterator(list->end()); }},
+            raw);
     }
 
     /* Ensure that no dangling iterators can be created accidentally, as that
@@ -1097,10 +1229,11 @@ public:
             return nPath;
         case tNull:
             return nNull;
-        case tAttrs:
+        case tAttrsImmer:
             return nAttrs;
         case tListSmall:
         case tListN:
+        case tListImmer:
             return nList;
         case tLambda:
         case tPrimOp:
@@ -1168,12 +1301,17 @@ public:
         setStorage(Null{});
     }
 
-    inline void mkAttrs(Bindings * a) noexcept
+    inline void mkAttrs(ImmerBindings * a) noexcept
     {
-        setStorage(a);
+        setStorage(ImmerAttrs{.bindings = a});
     }
 
-    Value & mkAttrs(BindingsBuilder & bindings);
+    inline void mkAttrs(const ImmerBindings * a) noexcept
+    {
+        setStorage(ImmerAttrs{.bindings = a});
+    }
+
+    Value & mkAttrs(ImmerBindingsBuilder & bindings);
 
     void mkList(const ListBuilder & builder) noexcept
     {
@@ -1234,17 +1372,83 @@ public:
 
     bool isList() const noexcept
     {
-        return isa<tListSmall, tListN>();
+        return isa<tListSmall, tListN, tListImmer>();
+    }
+
+    bool isImmerList() const noexcept
+    {
+        return isa<tListImmer>();
     }
 
     ListView listView() const noexcept
     {
+        if (isa<tListImmer>()) {
+            return ListView(&immerList());
+        }
         return isa<tListSmall>() ? ListView(getStorage<SmallList>()) : ListView(getStorage<List>());
     }
 
     size_t listSize() const noexcept
     {
+        if (isa<tListImmer>()) {
+            return getStorage<ImmerList>().list->size();
+        }
         return isa<tListSmall>() ? (getStorage<SmallList>()[1] == nullptr ? 1 : 2) : getStorage<List>().size;
+    }
+
+    /**
+     * Get the underlying Immer list.
+     * @pre isImmerList() must be true
+     */
+    const NixList& immerList() const noexcept
+    {
+        return *getStorage<ImmerList>().list;
+    }
+
+    /**
+     * Get the n-th element of a list, regardless of list type.
+     * Works for tListSmall, tListN, and tListImmer.
+     * @pre isList() must be true and n < listSize()
+     */
+    Value* listElem(size_t n) const noexcept
+    {
+        if (isa<tListImmer>()) {
+            return (*getStorage<ImmerList>().list)[n];
+        }
+        return listView()[n];
+    }
+
+    /**
+     * Create an Immer-based list value.
+     */
+    void mkImmerList(const NixList* list) noexcept
+    {
+        setStorage(ImmerList{.list = list});
+    }
+
+    /**
+     * Check if this is an Immer-based attribute set.
+     */
+    bool isImmerAttrs() const noexcept
+    {
+        return isa<tAttrsImmer>();
+    }
+
+    /**
+     * Get the underlying Immer bindings.
+     * @pre isImmerAttrs() must be true
+     */
+    const ImmerBindings& immerAttrs() const noexcept
+    {
+        return *getStorage<ImmerAttrs>().bindings;
+    }
+
+    /**
+     * Create an Immer-based attribute set value.
+     */
+    void mkImmerAttrs(const ImmerBindings* bindings) noexcept
+    {
+        setStorage(ImmerAttrs{.bindings = bindings});
     }
 
     PosIdx determinePos(const PosIdx pos) const;
@@ -1287,10 +1491,37 @@ public:
         return getStorage<ExternalValueBase *>();
     }
 
-    const Bindings * attrs() const noexcept
-    {
-        return getStorage<Bindings *>();
-    }
+    /**
+     * Get the number of attributes.
+     * @pre type() == nAttrs
+     */
+    size_t attrsSize() const noexcept;
+
+    /**
+     * Lightweight reference to an attribute value and position.
+     * Used for unified access across tAttrs and tAttrsImmer.
+     */
+    struct AttrRef {
+        Value * value = nullptr;
+        PosIdx pos;
+
+        explicit operator bool() const noexcept { return value != nullptr; }
+    };
+
+    /**
+     * Look up an attribute by name.
+     * Returns AttrRef with value and position, or empty AttrRef if not found.
+     * @pre type() == nAttrs
+     */
+    AttrRef attrsGet(Symbol name) const noexcept;
+
+    /**
+     * Iterate over all attributes, calling f(Symbol name, Value* value, PosIdx pos)
+     * for each attribute.
+     * @pre type() == nAttrs
+     */
+    template<typename F>
+    void forEachAttr(F && f) const;
 
     const PrimOp * primOp() const noexcept
     {

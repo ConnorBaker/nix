@@ -10,6 +10,7 @@
 #include "nix/expr/eval.hh"
 
 #include <boost/unordered/unordered_flat_set.hpp>
+#include <gc/gc_allocator.h>
 
 namespace nix {
 
@@ -153,8 +154,9 @@ struct ImportantFirstAttrNameCmp
     }
 };
 
-typedef std::set<const void *> ValuesSeen;
-typedef std::vector<std::pair<std::string, Value *>> AttrVec;
+// Use gc_allocator so the GC can see Value* pointers stored in these containers
+typedef std::set<const void *, std::less<const void *>, gc_allocator<const void *>> ValuesSeen;
+typedef std::vector<std::pair<std::string, Value *>, gc_allocator<std::pair<std::string, Value *>>> AttrVec;
 
 class Printer
 {
@@ -273,10 +275,10 @@ private:
     void printDerivation(Value & v)
     {
         std::optional<StorePath> storePath;
-        if (auto i = v.attrs()->get(state.s.drvPath)) {
+        if (auto i = v.attrsGet(state.s.drvPath)) {
             NixStringContext context;
             storePath =
-                state.coerceToStorePath(i->pos, *i->value, context, "while evaluating the drvPath of a derivation");
+                state.coerceToStorePath(i.pos, *i.value, context, "while evaluating the drvPath of a derivation");
         }
 
         /* This unfortunately breaks printing nested values because of
@@ -330,7 +332,9 @@ private:
 
     void printAttrs(Value & v, size_t depth)
     {
-        if (seen && !seen->insert(v.attrs()).second) {
+        // Get a unique pointer for cycle detection
+        const void * seenKey = static_cast<const void *>(&v.immerAttrs());
+        if (seen && !seen->insert(seenKey).second) {
             printRepeated();
             return;
         }
@@ -342,8 +346,8 @@ private:
             output << "{";
 
             AttrVec sorted;
-            for (auto & i : *v.attrs())
-                sorted.emplace_back(std::pair(state.symbols[i.name], i.value));
+            for (auto & [name, attr] : v.immerAttrs().map)
+                sorted.emplace_back(std::pair(state.symbols[name], attr.value));
 
             if (options.maxAttrs == std::numeric_limits<size_t>::max())
                 std::sort(sorted.begin(), sorted.end());
@@ -406,6 +410,36 @@ private:
         return itemType == nList || itemType == nAttrs || itemType == nThunk;
     }
 
+    /**
+     * Determine if a list should be pretty-printed.
+     * Works for both legacy and Immer lists.
+     */
+    bool shouldPrettyPrintListValue(Value & v)
+    {
+        auto listSize = v.listSize();
+        if (!options.shouldPrettyPrint() || listSize == 0) {
+            return false;
+        }
+
+        // Pretty-print lists with more than one item.
+        if (listSize > 1) {
+            return true;
+        }
+
+        auto * item = v.listElem(0);
+        if (!item) {
+            return true;
+        }
+
+        // It is ok to force the item(s) here, because they will be printed anyway.
+        state.forceValue(*item, item->determinePos(noPos));
+
+        // Pretty-print single-item lists only if they contain nested
+        // structures.
+        auto itemType = item->type();
+        return itemType == nList || itemType == nAttrs || itemType == nThunk;
+    }
+
     void printList(Value & v, size_t depth)
     {
         if (seen && v.listSize() && !seen->insert(&v).second) {
@@ -416,19 +450,20 @@ private:
         if (depth < options.maxDepth) {
             increaseIndent();
             output << "[";
-            auto listItems = v.listView();
-            auto prettyPrint = shouldPrettyPrintList(listItems.span());
+            auto prettyPrint = shouldPrettyPrintListValue(v);
 
+            auto listSize = v.listSize();
             size_t currentListItemsPrinted = 0;
 
-            for (auto elem : listItems) {
+            for (size_t n = 0; n < listSize; ++n) {
                 printSpace(prettyPrint);
 
                 if (totalListItemsPrinted >= options.maxListItems) {
-                    printElided(listItems.size() - currentListItemsPrinted, "item", "items");
+                    printElided(listSize - currentListItemsPrinted, "item", "items");
                     break;
                 }
 
+                auto * elem = v.listElem(n);
                 if (elem) {
                     print(*elem, depth + 1);
                 } else {

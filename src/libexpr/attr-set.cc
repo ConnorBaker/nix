@@ -5,40 +5,43 @@
 
 namespace nix {
 
-Bindings Bindings::emptyBindings;
+ImmerBindings ImmerBindings::emptyImmerBindings;
 
-/* Allocate a new array of attributes for an attribute set with a specific
-   capacity. The space is implicitly reserved after the Bindings
-   structure. */
-Bindings * EvalMemory::allocBindings(size_t capacity)
+NixList * EvalMemory::allocImmerList(NixList list)
 {
-    if (capacity == 0)
-        return &Bindings::emptyBindings;
-    if (capacity > std::numeric_limits<Bindings::size_type>::max())
-        throw Error("attribute set of size %d is too big", capacity);
-    stats.nrAttrsets++;
-    stats.nrAttrsInAttrsets += capacity;
-    return new (allocBytes(sizeof(Bindings) + sizeof(Attr) * capacity)) Bindings();
+    stats.nrListElems += list.size();
+    // Allocate on GC heap and use placement new
+    auto * ptr = static_cast<NixList *>(allocBytes(sizeof(NixList)));
+    return new (ptr) NixList(std::move(list));
 }
 
-Value & BindingsBuilder::alloc(Symbol name, PosIdx pos)
+ImmerBindings * EvalMemory::allocImmerBindings(AttrMap map, PosIdx pos)
+{
+    stats.nrAttrsets++;
+    stats.nrAttrsInAttrsets += map.size();
+    // Allocate on GC heap and use placement new
+    auto * ptr = static_cast<ImmerBindings *>(allocBytes(sizeof(ImmerBindings)));
+    return new (ptr) ImmerBindings(std::move(map), pos);
+}
+
+ImmerBindings * ImmerBindingsBuilder::finish()
+{
+    return mem.get().allocImmerBindings(transient.persistent(), pos);
+}
+
+Value & ImmerBindingsBuilder::alloc(Symbol name, PosIdx attrPos)
 {
     auto value = mem.get().allocValue();
-    bindings->push_back(Attr(name, value, pos));
+    transient.set(name, AttrValue(value, attrPos));
     return *value;
 }
 
-Value & BindingsBuilder::alloc(std::string_view name, PosIdx pos)
+Value & ImmerBindingsBuilder::alloc(std::string_view name, PosIdx attrPos)
 {
-    return alloc(symbols.get().create(name), pos);
+    return alloc(symbols.get().create(name), attrPos);
 }
 
-void Bindings::sort()
-{
-    std::sort(attrs, attrs + numAttrs);
-}
-
-Value & Value::mkAttrs(BindingsBuilder & bindings)
+Value & Value::mkAttrs(ImmerBindingsBuilder & bindings)
 {
     mkAttrs(bindings.finish());
     return *this;
