@@ -51,6 +51,8 @@ mkMesonLibrary (finalAttrs: {
     ./include/nix/expr/meson.build
     (fileset.fileFilter (file: file.hasExt "cc") ./.)
     (fileset.fileFilter (file: file.hasExt "hh") ./.)
+    (fileset.fileFilter (file: file.hasExt "hpp") ./.)  # For vendored immer headers
+    ./include/immer  # Include entire immer directory (has .cpp implementation files too)
     ./lexer.l
     ./parser.y
     (fileset.difference (fileset.fileFilter (file: file.hasExt "nix") ./.) ./package.nix)

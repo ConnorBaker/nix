@@ -22,6 +22,7 @@ headers = [ config_pub_h ] + files(
   'function-trace.hh',
   'gc-small-vector.hh',
   'get-drvs.hh',
+  'immer-gc-policy.hh',
   'json-to-value.hh',
   'nixexpr.hh',
   'parser-state.hh',

@@ -246,6 +246,12 @@ this_library = library(
 
 install_headers(headers, subdir : 'nix/expr', preserve_path : true)
 
+# Install vendored immer headers so downstream packages can find them
+install_subdir(
+  'include/immer',
+  install_dir : get_option('includedir'),
+)
+
 libraries_private = []
 
 subdir('nix-meson-build-support/export')
