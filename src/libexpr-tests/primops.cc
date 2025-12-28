@@ -97,9 +97,9 @@ TEST_F(PrimOpTest, tryEvalFailure)
     auto v = eval("builtins.tryEval (throw \"\")");
     ASSERT_THAT(v, IsAttrsOfSize(2));
     auto s = createSymbol("success");
-    auto p = v.attrs()->get(s);
-    ASSERT_NE(p, nullptr);
-    ASSERT_THAT(*p->value, IsFalse());
+    auto p = v.attrsGet(s);
+    ASSERT_TRUE(p);
+    ASSERT_THAT(*p.value, IsFalse());
 }
 
 TEST_F(PrimOpTest, tryEvalSuccess)
@@ -107,13 +107,13 @@ TEST_F(PrimOpTest, tryEvalSuccess)
     auto v = eval("builtins.tryEval 123");
     ASSERT_THAT(v, IsAttrs());
     auto s = createSymbol("success");
-    auto p = v.attrs()->get(s);
-    ASSERT_NE(p, nullptr);
-    ASSERT_THAT(*p->value, IsTrue());
+    auto p = v.attrsGet(s);
+    ASSERT_TRUE(p);
+    ASSERT_THAT(*p.value, IsTrue());
     s = createSymbol("value");
-    p = v.attrs()->get(s);
-    ASSERT_NE(p, nullptr);
-    ASSERT_THAT(*p->value, IsIntEq(123));
+    p = v.attrsGet(s);
+    ASSERT_TRUE(p);
+    ASSERT_THAT(*p.value, IsIntEq(123));
 }
 
 TEST_F(PrimOpTest, getEnv)
@@ -195,21 +195,21 @@ TEST_F(PrimOpTest, unsafeGetAttrPos)
     auto v = eval(expr);
     ASSERT_THAT(v, IsAttrsOfSize(3));
 
-    auto file = v.attrs()->get(createSymbol("file"));
-    ASSERT_NE(file, nullptr);
-    ASSERT_THAT(*file->value, IsString());
-    auto s = baseNameOf(file->value->string_view());
+    auto file = v.attrsGet(createSymbol("file"));
+    ASSERT_TRUE(file);
+    ASSERT_THAT(*file.value, IsString());
+    auto s = baseNameOf(file.value->string_view());
     ASSERT_EQ(s, "foo.nix");
 
-    auto line = v.attrs()->get(createSymbol("line"));
-    ASSERT_NE(line, nullptr);
-    state.forceValue(*line->value, noPos);
-    ASSERT_THAT(*line->value, IsIntEq(4));
+    auto line = v.attrsGet(createSymbol("line"));
+    ASSERT_TRUE(line);
+    state.forceValue(*line.value, noPos);
+    ASSERT_THAT(*line.value, IsIntEq(4));
 
-    auto column = v.attrs()->get(createSymbol("column"));
-    ASSERT_NE(column, nullptr);
-    state.forceValue(*column->value, noPos);
-    ASSERT_THAT(*column->value, IsIntEq(3));
+    auto column = v.attrsGet(createSymbol("column"));
+    ASSERT_TRUE(column);
+    state.forceValue(*column.value, noPos);
+    ASSERT_THAT(*column.value, IsIntEq(3));
 }
 
 TEST_F(PrimOpTest, hasAttr)
@@ -246,7 +246,7 @@ TEST_F(PrimOpTest, removeAttrsRetains)
 {
     auto v = eval("builtins.removeAttrs { x = 1; y = 2; } [\"x\"]");
     ASSERT_THAT(v, IsAttrsOfSize(1));
-    ASSERT_NE(v.attrs()->get(createSymbol("y")), nullptr);
+    ASSERT_TRUE(v.attrsGet(createSymbol("y")));
 }
 
 TEST_F(PrimOpTest, listToAttrsEmptyList)
@@ -254,7 +254,7 @@ TEST_F(PrimOpTest, listToAttrsEmptyList)
     auto v = eval("builtins.listToAttrs []");
     ASSERT_THAT(v, IsAttrsOfSize(0));
     ASSERT_EQ(v.type(), nAttrs);
-    ASSERT_EQ(v.attrs()->size(), 0u);
+    ASSERT_EQ(v.attrsSize(), 0u);
 }
 
 TEST_F(PrimOpTest, listToAttrsNotFieldName)
@@ -266,18 +266,18 @@ TEST_F(PrimOpTest, listToAttrs)
 {
     auto v = eval("builtins.listToAttrs [ { name = \"key\"; value = 123; } ]");
     ASSERT_THAT(v, IsAttrsOfSize(1));
-    auto key = v.attrs()->get(createSymbol("key"));
-    ASSERT_NE(key, nullptr);
-    ASSERT_THAT(*key->value, IsIntEq(123));
+    auto key = v.attrsGet(createSymbol("key"));
+    ASSERT_TRUE(key);
+    ASSERT_THAT(*key.value, IsIntEq(123));
 }
 
 TEST_F(PrimOpTest, intersectAttrs)
 {
     auto v = eval("builtins.intersectAttrs { a = 1; b = 2; } { b = 3; c = 4; }");
     ASSERT_THAT(v, IsAttrsOfSize(1));
-    auto b = v.attrs()->get(createSymbol("b"));
-    ASSERT_NE(b, nullptr);
-    ASSERT_THAT(*b->value, IsIntEq(3));
+    auto b = v.attrsGet(createSymbol("b"));
+    ASSERT_TRUE(b);
+    ASSERT_THAT(*b.value, IsIntEq(3));
 }
 
 TEST_F(PrimOpTest, catAttrs)
@@ -293,13 +293,13 @@ TEST_F(PrimOpTest, functionArgs)
     auto v = eval("builtins.functionArgs ({ x, y ? 123}: 1)");
     ASSERT_THAT(v, IsAttrsOfSize(2));
 
-    auto x = v.attrs()->get(createSymbol("x"));
-    ASSERT_NE(x, nullptr);
-    ASSERT_THAT(*x->value, IsFalse());
+    auto x = v.attrsGet(createSymbol("x"));
+    ASSERT_TRUE(x);
+    ASSERT_THAT(*x.value, IsFalse());
 
-    auto y = v.attrs()->get(createSymbol("y"));
-    ASSERT_NE(y, nullptr);
-    ASSERT_THAT(*y->value, IsTrue());
+    auto y = v.attrsGet(createSymbol("y"));
+    ASSERT_TRUE(y);
+    ASSERT_THAT(*y.value, IsTrue());
 }
 
 TEST_F(PrimOpTest, mapAttrs)
@@ -307,17 +307,17 @@ TEST_F(PrimOpTest, mapAttrs)
     auto v = eval("builtins.mapAttrs (name: value: value * 10) { a = 1; b = 2; }");
     ASSERT_THAT(v, IsAttrsOfSize(2));
 
-    auto a = v.attrs()->get(createSymbol("a"));
-    ASSERT_NE(a, nullptr);
-    ASSERT_THAT(*a->value, IsThunk());
-    state.forceValue(*a->value, noPos);
-    ASSERT_THAT(*a->value, IsIntEq(10));
+    auto a = v.attrsGet(createSymbol("a"));
+    ASSERT_TRUE(a);
+    ASSERT_THAT(*a.value, IsThunk());
+    state.forceValue(*a.value, noPos);
+    ASSERT_THAT(*a.value, IsIntEq(10));
 
-    auto b = v.attrs()->get(createSymbol("b"));
-    ASSERT_NE(b, nullptr);
-    ASSERT_THAT(*b->value, IsThunk());
-    state.forceValue(*b->value, noPos);
-    ASSERT_THAT(*b->value, IsIntEq(20));
+    auto b = v.attrsGet(createSymbol("b"));
+    ASSERT_TRUE(b);
+    ASSERT_THAT(*b.value, IsThunk());
+    state.forceValue(*b.value, noPos);
+    ASSERT_THAT(*b.value, IsIntEq(20));
 }
 
 TEST_F(PrimOpTest, isList)
@@ -489,20 +489,20 @@ TEST_F(PrimOpTest, partition)
     auto v = eval("builtins.partition (x: x > 10) [1 23 9 3 42]");
     ASSERT_THAT(v, IsAttrsOfSize(2));
 
-    auto right = v.attrs()->get(createSymbol("right"));
-    ASSERT_NE(right, nullptr);
-    ASSERT_THAT(*right->value, IsListOfSize(2));
-    ASSERT_THAT(*right->value->listView()[0], IsIntEq(23));
-    ASSERT_THAT(*right->value->listView()[1], IsIntEq(42));
+    auto right = v.attrsGet(createSymbol("right"));
+    ASSERT_TRUE(right);
+    ASSERT_THAT(*right.value, IsListOfSize(2));
+    ASSERT_THAT(*right.value->listView()[0], IsIntEq(23));
+    ASSERT_THAT(*right.value->listView()[1], IsIntEq(42));
 
-    auto wrong = v.attrs()->get(createSymbol("wrong"));
-    ASSERT_NE(wrong, nullptr);
-    ASSERT_EQ(wrong->value->type(), nList);
-    ASSERT_EQ(wrong->value->listSize(), 3u);
-    ASSERT_THAT(*wrong->value, IsListOfSize(3));
-    ASSERT_THAT(*wrong->value->listView()[0], IsIntEq(1));
-    ASSERT_THAT(*wrong->value->listView()[1], IsIntEq(9));
-    ASSERT_THAT(*wrong->value->listView()[2], IsIntEq(3));
+    auto wrong = v.attrsGet(createSymbol("wrong"));
+    ASSERT_TRUE(wrong);
+    ASSERT_EQ(wrong.value->type(), nList);
+    ASSERT_EQ(wrong.value->listSize(), 3u);
+    ASSERT_THAT(*wrong.value, IsListOfSize(3));
+    ASSERT_THAT(*wrong.value->listView()[0], IsIntEq(1));
+    ASSERT_THAT(*wrong.value->listView()[1], IsIntEq(9));
+    ASSERT_THAT(*wrong.value->listView()[2], IsIntEq(3));
 }
 
 TEST_F(PrimOpTest, concatMap)
@@ -845,13 +845,13 @@ TEST_P(ParseDrvNamePrimOpTest, parseDrvName)
     auto v = eval(expr);
     ASSERT_THAT(v, IsAttrsOfSize(2));
 
-    auto name = v.attrs()->get(createSymbol("name"));
+    auto name = v.attrsGet(createSymbol("name"));
     ASSERT_TRUE(name);
-    ASSERT_THAT(*name->value, IsStringEq(expectedName));
+    ASSERT_THAT(*name.value, IsStringEq(expectedName));
 
-    auto version = v.attrs()->get(createSymbol("version"));
+    auto version = v.attrsGet(createSymbol("version"));
     ASSERT_TRUE(version);
-    ASSERT_THAT(*version->value, IsStringEq(expectedVersion));
+    ASSERT_THAT(*version.value, IsStringEq(expectedVersion));
 }
 
 INSTANTIATE_TEST_SUITE_P(

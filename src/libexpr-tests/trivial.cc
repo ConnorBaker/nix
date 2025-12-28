@@ -76,13 +76,13 @@ TEST_F(TrivialExpressionTest, updateAttrs)
 {
     auto v = eval("{ a = 1; } // { b = 2; a = 3; }");
     ASSERT_THAT(v, IsAttrsOfSize(2));
-    auto a = v.attrs()->get(createSymbol("a"));
-    ASSERT_NE(a, nullptr);
-    ASSERT_THAT(*a->value, IsIntEq(3));
+    auto a = v.attrsGet(createSymbol("a"));
+    ASSERT_TRUE(a);
+    ASSERT_THAT(*a.value, IsIntEq(3));
 
-    auto b = v.attrs()->get(createSymbol("b"));
-    ASSERT_NE(b, nullptr);
-    ASSERT_THAT(*b->value, IsIntEq(2));
+    auto b = v.attrsGet(createSymbol("b"));
+    ASSERT_TRUE(b);
+    ASSERT_THAT(*b.value, IsIntEq(2));
 }
 
 TEST_F(TrivialExpressionTest, hasAttrOpFalse)
@@ -178,21 +178,21 @@ TEST_P(AttrSetMergeTrvialExpressionTest, attrsetMergeLazy)
     auto v = eval(expr);
     ASSERT_THAT(v, IsAttrsOfSize(1));
 
-    auto a = v.attrs()->get(createSymbol("a"));
-    ASSERT_NE(a, nullptr);
+    auto a = v.attrsGet(createSymbol("a"));
+    ASSERT_TRUE(a);
 
-    ASSERT_THAT(*a->value, IsThunk());
-    state.forceValue(*a->value, noPos);
+    ASSERT_THAT(*a.value, IsThunk());
+    state.forceValue(*a.value, noPos);
 
-    ASSERT_THAT(*a->value, IsAttrsOfSize(2));
+    ASSERT_THAT(*a.value, IsAttrsOfSize(2));
 
-    auto b = a->value->attrs()->get(createSymbol("b"));
-    ASSERT_NE(b, nullptr);
-    ASSERT_THAT(*b->value, IsIntEq(1));
+    auto b = a.value->attrsGet(createSymbol("b"));
+    ASSERT_TRUE(b);
+    ASSERT_THAT(*b.value, IsIntEq(1));
 
-    auto c = a->value->attrs()->get(createSymbol("c"));
-    ASSERT_NE(c, nullptr);
-    ASSERT_THAT(*c->value, IsIntEq(2));
+    auto c = a.value->attrsGet(createSymbol("c"));
+    ASSERT_TRUE(c);
+    ASSERT_THAT(*c.value, IsIntEq(2));
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -332,9 +332,9 @@ TEST_F(TrivialExpressionTest, bindOr)
 {
     auto v = eval("{ or = 1; }");
     ASSERT_THAT(v, IsAttrsOfSize(1));
-    auto b = v.attrs()->get(createSymbol("or"));
-    ASSERT_NE(b, nullptr);
-    ASSERT_THAT(*b->value, IsIntEq(1));
+    auto b = v.attrsGet(createSymbol("or"));
+    ASSERT_TRUE(b);
+    ASSERT_THAT(*b.value, IsIntEq(1));
 }
 
 TEST_F(TrivialExpressionTest, orCantBeUsed)

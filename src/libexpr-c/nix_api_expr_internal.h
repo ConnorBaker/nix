@@ -29,7 +29,7 @@ struct EvalState
 
 struct BindingsBuilder
 {
-    nix::BindingsBuilder builder;
+    nix::ImmerBindingsBuilder builder;
 };
 
 struct ListBuilder
