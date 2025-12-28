@@ -2029,7 +2029,7 @@ struct concat_merger_mut
     result_t result_;
     count_t count_      = 0;
     node_t* candidate_  = nullptr;
-    edit_t candidate_e_ = Node::memory::transience_t::noone;
+    edit_t candidate_e_ = Node::memory::transience_t::noone();
 
     concat_merger_mut(edit_t ec,
                       shift_t shift,

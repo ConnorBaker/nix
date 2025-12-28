@@ -871,7 +871,7 @@ struct rrbtree
                                      el,
                                      l.tail,
                                      tail_size,
-                                     MemoryPolicy::transience_t::noone,
+                                     MemoryPolicy::transience_t::noone(),
                                      r.root,
                                      r.shift,
                                      r.tail_offset());
@@ -908,7 +908,7 @@ struct rrbtree
                                      tail_offst,
                                      l.tail,
                                      tail_size,
-                                     MemoryPolicy::transience_t::noone,
+                                     MemoryPolicy::transience_t::noone(),
                                      r.root,
                                      r.shift,
                                      r.tail_offset());
@@ -1013,7 +1013,7 @@ struct rrbtree
                 auto tail_size  = l.size - tail_offst;
                 auto concated =
                     concat_trees_mut(er,
-                                     MemoryPolicy::transience_t::noone,
+                                     MemoryPolicy::transience_t::noone(),
                                      l.tail,
                                      tail_size,
                                      er,
@@ -1043,7 +1043,7 @@ struct rrbtree
                 auto tail_size  = l.size - tail_offst;
                 auto concated =
                     concat_trees_mut(er,
-                                     MemoryPolicy::transience_t::noone,
+                                     MemoryPolicy::transience_t::noone(),
                                      l.root,
                                      l.shift,
                                      tail_offst,

@@ -36,13 +36,18 @@ struct no_transience_policy
                 bool owned() const { return false; }
             };
 
-            static owner noone;
+            /**
+             * Returns a "no owner" sentinel.
+             * For consistency with gc_transience_policy, this is a function
+             * returning a reference to a lazily-initialized static.
+             */
+            static owner& noone()
+            {
+                static owner instance;
+                return instance;
+            }
         };
     };
 };
-
-template <typename HP>
-typename no_transience_policy::apply<HP>::type::owner
-    no_transience_policy::apply<HP>::type::noone = {};
 
 } // namespace immer
