@@ -1,0 +1,11 @@
+// Nix integer encoding for HVM4
+//
+// Small integers (fit in int32) use NUM directly.
+// Large integers use constructors with 32-bit limbs:
+//   #Pos{lo, hi}  =>  (hi << 32) | lo
+//   #Neg{lo, hi}  => -((hi << 32) | lo)
+//
+// Examples:
+//   42            => 42
+//   2147483648    => #Pos{0x00000000, 0x00000001}
+//   -1            => #Neg{0x00000001, 0x00000000}

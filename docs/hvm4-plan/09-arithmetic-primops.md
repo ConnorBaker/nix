@@ -1,6 +1,12 @@
 # 9. Arithmetic Primops
 
 > Source: `plan-future-work.claude.md` (extracted into `docs/hvm4-plan`).
+>
+> Status (2025-12-28): Arithmetic primop calls are limited to `__sub`, `__mul`,
+> `__div`, and `__lessThan`. The compiler emits native OP2 for the first three and
+> uses a BigInt-aware comparison for `__lessThan`. There is no overflow handling
+> for add/sub/mul, and division-by-zero is not checked. General BigInt arithmetic
+> is not implemented.
 
 `-`, `*`, `/` are primops in Nix, not syntax.
 
@@ -56,13 +62,12 @@ Implement operations that work with BigInt encoding.
 | Performance | Slower for large numbers |
 | Complexity | Medium |
 
-## CHOSEN: Direct OP2 with BigInt Fast Path (Option B)
+## Current Implementation: Direct OP2 (limited) + BigInt-aware lessThan
 
 **Rationale:**
-- HVM4 has native OP_ADD, OP_SUB, OP_MUL, OP_DIV, and comparison operators
-- BigInt encoding (already implemented) handles 64-bit overflow
-- Fast path for common case (32-bit values that fit in NUM)
-- Slow path for large numbers using BigInt encoding
+- HVM4 OP2 covers basic integer ops for small values
+- BigInt encoding exists for literals, but arithmetic still assumes NUM in most cases
+- `__lessThan` uses BigInt-aware comparison for correctness across 64-bit values
 
 **Encoding:**
 ```hvm4

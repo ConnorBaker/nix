@@ -1,6 +1,10 @@
 # HVM4 Backend for Nix - Future Work Implementation Options
 
 > Note: This is the source document. The consolidated, split plan lives under `docs/hvm4-plan` starting at [00-overview.md](./00-overview.md).
+>
+> Status (2025-12-28): This is an archival planning document and does not reflect
+> the current HVM4 backend implementation. See `docs/hvm4-plan/plan.claude.md`
+> and `src/libexpr/hvm4/STATUS.md` for the current state.
 
 This document details multiple implementation approaches for features not included in the minimal prototype, along with design tradeoffs for each approach.
 

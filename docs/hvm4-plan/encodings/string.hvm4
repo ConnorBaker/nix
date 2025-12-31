@@ -1,0 +1,15 @@
+// Nix string encoding for HVM4
+//
+// String literals are interned in a runtime StringTable and represented as:
+//   #Str{string_id}
+//
+// Runtime concatenation uses:
+//   #SCat{left, right}
+//
+// Integer interpolation uses:
+//   #SNum{int_term}
+//
+// Examples:
+//   "hello"        => #Str{42}          // 42 is a StringTable id
+//   "a" + "b"    => #SCat{#Str{1}, #Str{2}}
+//   "x${1}"       => #SCat{#Str{3}, #SNum{1}}

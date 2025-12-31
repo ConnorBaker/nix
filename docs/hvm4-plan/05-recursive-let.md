@@ -1,6 +1,10 @@
 # 5. Recursive Let / Rec
 
 > Source: `plan-future-work.claude.md` (extracted into `docs/hvm4-plan`).
+>
+> Status (2025-12-28): `rec` is supported only for acyclic bindings. The compiler
+> topologically sorts dependencies and emits nested lets. Cycles are rejected and
+> fall back to the standard evaluator (no Y-combinator support).
 
 Nix supports mutually recursive bindings with cycle detection.
 
@@ -99,19 +103,18 @@ Add "fuel" parameter to bound recursion depth.
 | False positives | May reject deep recursion |
 | Configurability | Fuel limit tunable |
 
-## CHOSEN: Static Topo-Sort + Y-Combinator Fallback (Options C + A)
+## Current Implementation: Static Topo-Sort (Option C only)
 
 **Rationale:**
 - Most `rec` usages in real Nix code are acyclic (can be topologically sorted)
-- Y-combinator handles true mutual recursion when needed
 - Static analysis at compile time avoids runtime overhead for simple cases
-- HVM4's optimal lazy evaluation works well with Y-combinator approach
+- Cyclic bindings are currently rejected (no fixpoint encoding yet)
 
 **Strategy:**
 1. Build dependency graph from rec bindings
 2. Attempt topological sort
 3. If acyclic: emit as nested lets in dependency order (fast path)
-4. If cyclic: use Y-combinator to create fixpoint (correct but slower)
+4. If cyclic: reject and fall back to the standard evaluator
 
 ### Detailed Implementation Steps
 
@@ -233,7 +236,7 @@ Term HVM4Compiler::emitAcyclicRec(const ExprAttrs& attrs,
 }
 ```
 
-#### Step 4: Emit Cyclic Rec with Y-Combinator
+#### Step 4: Emit Cyclic Rec with Y-Combinator (planned, not implemented)
 
 ```cpp
 // Y combinator definition (pre-compiled as @def)

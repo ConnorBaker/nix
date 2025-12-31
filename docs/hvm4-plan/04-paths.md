@@ -1,6 +1,10 @@
 # 4. Paths
 
 > Source: `plan-future-work.claude.md` (extracted into `docs/hvm4-plan`).
+>
+> Status (2025-12-28): Implemented as `#Pth{accessor_id, path_string_id}` where
+> `path_string_id` refers to the HVM4 string table. Path concatenation and
+> path-to-string coercion are not implemented; store interaction is deferred.
 
 Nix paths have:
 - A `SourceAccessor` for virtual filesystem access
@@ -15,6 +19,21 @@ struct Path {
     const StringData* path;    // Path string
 };
 ```
+
+## Current Implementation (HVM4 backend)
+
+```hvm4
+// Path = #Pth{accessor_id, path_string_id}
+// accessor_id is managed by AccessorRegistry
+// path_string_id points into the runtime StringTable
+
+// Example: ./foo/bar.nix (after resolution)
+#Pth{0, 123}
+```
+
+Notes:
+- The backend does not coerce paths to strings inside HVM4.
+- No store copy or context tracking is implemented.
 
 ## Option A: Pure Path (No Store Interaction)
 
@@ -76,7 +95,10 @@ Pre-copy all referenced paths before HVM4 evaluation.
 | Runtime | Pure |
 | Limitation | Can't handle dynamic paths |
 
-## CHOSEN: Pure Path Representation (Option A)
+## Original Plan (partially implemented): Pure Path Representation (Option A)
+
+The pure representation is in place, but the planned coercions and store
+interaction are not implemented yet.
 
 **Rationale:**
 - Defer store operations to post-HVM4 phase (at evaluation boundary)

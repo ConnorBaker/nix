@@ -1,6 +1,6 @@
 # HVM4 Backend Implementation Status
 
-*Last updated: 2025-12-23*
+*Last updated: 2025-12-28*
 
 This document describes the current implementation status of the HVM4 evaluator backend for Nix.
 
@@ -107,7 +107,6 @@ HVM4 provides native 32-bit integers (`NUM`) and constructors (`C00`-`C16`). All
 
 ### Bindings
 - [x] Let bindings (non-recursive)
-- [x] Let bindings (acyclic recursive)
 - [x] With expressions (basic)
 - [x] With expressions (nested) - partial, outer scope access limited
 
@@ -123,13 +122,13 @@ HVM4 provides native 32-bit integers (`NUM`) and constructors (`C00`-`C16`). All
 
 ### Lists
 - [x] List literals (`[1 2 3]`)
-- [x] List concatenation (`++`)
+- [x] List concatenation (`++`) - only when both operands are list literals
 - [ ] `builtins.head`, `builtins.tail`, etc. (falls back)
 
 ### Strings
 - [x] String literals (`"hello"`)
 - [x] Constant string concatenation (`"a" + "b"`)
-- [x] String interpolation with constants (`"${x}"` where x is string)
+- [ ] String interpolation with non-constant parts (falls back)
 - [ ] String interpolation with `toString` (falls back)
 - [ ] Path-to-string coercion (falls back)
 
@@ -164,6 +163,21 @@ Float literals are supported, but float arithmetic and comparisons are not:
 
 ### Division by Zero
 HVM4 does not detect division by zero. Instead of throwing an error, it produces undefined results.
+
+### Boolean Extraction
+Booleans are represented as NUM (0/1) and are extracted as integers, not `nBool`.
+
+### Laziness Loss at Extraction
+List elements and attribute values are forced during extraction, which breaks Nix laziness for
+results that escape to the evaluator.
+
+### Error Handling Gaps
+Missing attributes and type errors currently tend to return ERA (mapped to null) instead of
+throwing `EvalError`. Proper `#Err{}` propagation is not implemented.
+
+### String Coercion Gaps
+Only constant string concatenations are compiled today. Interpolation with non-constant
+parts falls back, and no general `toString` coercion is performed in HVM4.
 
 ### Nested With Expressions
 Basic `with` works, but accessing attributes from outer `with` scopes in nested `with` expressions may fail:
@@ -211,7 +225,7 @@ The HVM4 backend has comprehensive test coverage in `src/libexpr-tests/hvm4/`:
 | `hvm4-known-limitations-test.cc` | Documented limitations |
 | `hvm4-runtime-test.cc` | Low-level runtime tests |
 
-**Total: 1102 HVM4 tests passing**
+Test counts change frequently; see `src/libexpr-tests/hvm4/` for coverage.
 
 ## Performance Notes
 
@@ -234,5 +248,5 @@ Priority items for expanding HVM4 coverage:
 ## References
 
 - [HVM4 Repository](https://github.com/HigherOrderCO/HVM)
-- Plan file: `~/.claude/plans/velvety-mapping-dawn.md`
+- Plan file: `docs/hvm4-plan/plan.claude.md`
 - Test common utilities: `src/libexpr-tests/hvm4/hvm4-test-common.hh`

@@ -1,6 +1,12 @@
 # 3. Strings
 
 > Source: `plan-future-work.claude.md` (extracted into `docs/hvm4-plan`).
+>
+> Status (2025-12-28): Implemented as an interned string table with `#Str{string_id}`.
+> Runtime concatenation uses `#SCat{left, right}` and integer interpolation uses
+> `#SNum{int}`. String context tracking is not implemented. String interpolation is
+> only compiled when all parts are constant strings; otherwise the expression falls
+> back to the standard evaluator. BigInt-to-string conversion is not implemented.
 
 Nix strings have:
 - Arbitrary length content
@@ -18,6 +24,26 @@ struct StringWithContext {
 
 // Context elements: Opaque (path), DrvDeep (drv+closure), Built (drv output)
 ```
+
+## Current Implementation (HVM4 backend)
+
+```hvm4
+// String literal: #Str{string_id}
+// Concatenation: #SCat{left, right}
+// Int interpolation: #SNum{int_term}
+
+// Example: "hello"
+#Str{42}  // 42 is an index into the runtime string table
+
+// Example runtime concat (if compiled):
+#SCat{#Str{...}, #SNum{1}}
+```
+
+Notes:
+- The string table is owned by the HVM4 runtime (`StringTable`).
+- `extractStringContent` evaluates to normal form and then resolves `#Str`, `#SCat`,
+  and `#SNum` nodes to produce the final string.
+- No string context tracking (`#NoC/#Ctx`) is implemented today.
 
 ## Option A: List of Character Codes
 
@@ -104,7 +130,10 @@ Pack multiple characters into 32-bit words.
 
 **Key Insight**: Context is a **set** - use same encoding as attribute set keys.
 
-## CHOSEN: HVM4 Native #Chr List + Context Wrapper (Option A with Context)
+## Original Plan (superseded): HVM4 Native #Chr List + Context Wrapper (Option A with Context)
+
+This section describes the original plan. The current backend uses a string table
+and does not track string context.
 
 **Rationale:**
 - HVM4 already represents strings as `#Con{#Chr{n}, ...}` natively

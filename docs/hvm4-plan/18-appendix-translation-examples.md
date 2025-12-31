@@ -2,6 +2,10 @@
 
 This section shows how common Nix patterns translate to HVM4 terms, useful for understanding the compilation process.
 
+Status (2025-12-28): Examples below reflect the current HVM4 encoding (#Ats/#Atr,
+string table `#Str`, NUM booleans). String context, dynamic interpolation, and
+structured errors are not implemented.
+
 ## Simple Values
 
 ```
@@ -9,10 +13,13 @@ Nix: 42
 HVM4: 42  (raw NUM)
 
 Nix: "hello"
-HVM4: #Str{#Con{#Chr{104}, #Con{#Chr{101}, #Con{#Chr{108}, #Con{#Chr{108}, #Con{#Chr{111}, #Nil{}}}}}}, #NoC{}}
+HVM4: #Str{42}  (42 is a string-table id)
 
 Nix: true
-HVM4: #Tru{}
+HVM4: 1  (NUM)
+
+Nix: false
+HVM4: 0  (NUM)
 
 Nix: null
 HVM4: #Nul{}
@@ -40,7 +47,7 @@ Nix:
   { a = 1; b = 2; }
 
 HVM4:
-  #ABs{#Con{#Atr{sym_a, 1}, #Con{#Atr{sym_b, 2}, #Nil{}}}}
+  #Ats{#Con{#Atr{sym_a, 1}, #Con{#Atr{sym_b, 2}, #Nil{}}}}
 
 Note: sym_a and sym_b are symbol IDs, sorted numerically
 ```
@@ -56,9 +63,7 @@ HVM4:
 
 Expands to searching the sorted list:
   @lookup = λkey.λattrs. λ{
-    #ABs: λlist. @lookup_list(key, list)
-    #ALy: λoverlay.λbase.
-      @lookup_list(key, overlay) .or. @lookup(key, base)
+    #Ats: λlist. @lookup_list(key, list)  // returns ERA if missing
   }(attrs)
 ```
 
@@ -102,10 +107,9 @@ Nix:
   if cond then a else b
 
 HVM4:
-  λ{#Tru: a; #Fls: b}(cond)
+  (MAT 0 b (λ_. a)) cond
 
-Or using MAT:
-  (MAT cond #Tru a #Fls b)
+// NUM 0 = false, nonzero = true
 ```
 
 ## Recursion (rec)
@@ -117,16 +121,13 @@ Nix:
 HVM4 (acyclic, after topo-sort):
   @let b = 10;
   @let a = (OP2 ADD b 1);
-  #ABs{#Con{#Atr{sym_a, a}, #Con{#Atr{sym_b, b}, #Nil{}}}}
+  #Ats{#Con{#Atr{sym_a, a}, #Con{#Atr{sym_b, b}, #Nil{}}}}
 
 Nix:
   rec { even = n: ...; odd = n: ...; }
 
-HVM4 (cyclic, using Y-combinator):
-  @Y(λself. #ABs{
-    #Atr{sym_even, λn. ... (@select(self, sym_odd)) ...},
-    #Atr{sym_odd, λn. ... (@select(self, sym_even)) ...}
-  })
+HVM4:
+  // Cyclic rec not implemented; falls back to standard evaluator
 ```
 
 ## With Expressions
@@ -136,18 +137,16 @@ Nix:
   with { x = 1; }; x
 
 HVM4 (static resolution):
-  @let $with = #ABs{#Con{#Atr{sym_x, 1}, #Nil{}}};
+  @let $with = #Ats{#Con{#Atr{sym_x, 1}, #Nil{}}};
   @select($with, sym_x)
 
-Nix (ambiguous):
+Nix (nested with fallback):
   let x = 1; in with { x = 2; }; x
 
 HVM4:
-  @let x = 1;
-  @let $with = #ABs{#Con{#Atr{sym_x, 2}, #Nil{}}};
-  @if (@hasAttr($with, sym_x))
-      (@select($with, sym_x))
-      (x)
+  // Current backend only looks at the innermost with; no outer fallback.
+  @let $with = #Ats{#Con{#Atr{sym_x, 2}, #Nil{}}};
+  @select($with, sym_x)
 ```
 
 ## String Interpolation
@@ -157,15 +156,13 @@ Nix:
   "hello ${name}!"
 
 HVM4:
-  @str_concat(
-    @str_concat(
-      #Str{[h,e,l,l,o, ], #NoC{}},
-      @coerce_to_string(name)
-    ),
-    #Str{[!], #NoC{}}
-  )
+  #SCat{
+    #SCat{#Str{...}, name},  // planned runtime concat form
+    #Str{...}
+  }
 
-Note: Context from 'name' is merged into result
+Note: Only fully-constant concatenations are compiled today, and no string
+context is tracked.
 ```
 
 ## Attribute Update
@@ -175,10 +172,9 @@ Nix:
   { a = 1; } // { b = 2; }
 
 HVM4 (layer wrapping):
-  #ALy{
-    #Con{#Atr{sym_b, 2}, #Nil{}},  // overlay
-    #ABs{#Con{#Atr{sym_a, 1}, #Nil{}}}  // base
-  }
+  #Ats{#Con{#Atr{sym_a, 1}, #Con{#Atr{sym_b, 2}, #Nil{}}}}
+
+// mergeAttrs eagerly merges two sorted spines (no layering)
 ```
 
 ## Function Application
@@ -201,7 +197,7 @@ Nix:
   ./foo/bar.nix
 
 HVM4:
-  #Pth{0, #Str{"/absolute/path/foo/bar.nix", #NoC{}}}
+  #Pth{0, 123}  // 123 is a string-table id for "/absolute/path/foo/bar.nix"
 ```
 
 ## Assertions
@@ -213,5 +209,5 @@ Nix:
 HVM4:
   @if cond
       value
-      (#Err{@make_string("assertion failed")})
+      ERA
 ```

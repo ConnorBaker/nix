@@ -2,6 +2,9 @@
 
 These tests verify the HVM4 backend handles edge cases, large inputs, and pathological patterns correctly.
 
+Status (2025-12-28): Most tests below are aspirational and will not pass with the
+current backend due to missing builtins, imports, derivations, and error handling.
+
 ## Memory and Scale Tests
 
 ```cpp

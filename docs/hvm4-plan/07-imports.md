@@ -1,6 +1,9 @@
 # 7. Imports
 
 > Source: `plan-future-work.claude.md` (extracted into `docs/hvm4-plan`).
+>
+> Status (2025-12-28): Imports are not implemented in the HVM4 backend. Any
+> expression that requires `import` falls back to the standard evaluator.
 
 `import path` loads and evaluates a Nix file, with memoization.
 
@@ -93,7 +96,7 @@ Phase 1: Evaluate to collect import requests. Phase 2: Resolve and re-evaluate.
 | IFD | Limited - no nested IFD |
 | Iterations | Multiple passes |
 
-## CHOSEN: Pre-Import Resolution (Phase 1: Option A)
+## Original Plan (not implemented): Pre-Import Resolution (Phase 1: Option A)
 
 **Rationale:**
 - Simplest approach that works for most use cases

@@ -2,6 +2,10 @@
 
 These tests verify that multiple features work correctly together, testing the interactions between different data types and language constructs.
 
+Status (2025-12-28): Most of these tests are aspirational and will fail with the
+current HVM4 backend because many builtins, imports, derivations, and error
+handling paths are not implemented. Treat this as a future test plan.
+
 ## Attribute Sets + Lists
 
 ```cpp

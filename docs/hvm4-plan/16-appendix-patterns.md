@@ -2,6 +2,9 @@
 
 > **Note:** This section shows generic HVM4 programming patterns. For the specific
 > constructor names used in the Nix HVM4 encoding, see the [Overview](./00-overview.md).
+>
+> Project note (2025-12-28): Booleans are represented as NUM 0/1 (not `#Tru/#Fls`),
+> and structured error values (`#Err`) are not implemented.
 
 ## Pattern: Sum Types
 

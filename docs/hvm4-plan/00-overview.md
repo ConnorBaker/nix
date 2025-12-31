@@ -15,6 +15,13 @@ This directory consolidates the HVM4 backend planning docs.
 3. [Strings](./03-strings.md)
 4. [Paths](./04-paths.md)
 
+### Encodings (HVM4)
+- [Booleans](./encodings/boolean.hvm4)
+- [Integers](./encodings/integer.hvm4)
+- [Strings](./encodings/string.hvm4)
+- [Lists](./encodings/list.hvm4)
+- [Attribute Sets](./encodings/attrs.hvm4)
+
 ### Language Features
 5. [Recursive Let / Rec](./05-recursive-let.md)
 6. [With Expressions](./06-with-expressions.md)
@@ -49,7 +56,7 @@ This directory consolidates the HVM4 backend planning docs.
 |-----------|-------------|-----------------|
 | **Attribute Sets** | **STRICT** - keys are Symbol IDs, forced at construction | **LAZY** - values are thunks until accessed |
 | **Lists** | **STRICT** - length is known at construction (O(1)) | **LAZY** - elements are thunks until accessed |
-| **Strings** | **STRICT** - content is fully evaluated | Context is a strict set |
+| **Strings** | **STRICT** - content is fully evaluated | Context not implemented (tracked externally in Nix) |
 
 ### Key Implications
 
@@ -57,11 +64,16 @@ This directory consolidates the HVM4 backend planning docs.
 
 2. **Lists**: `builtins.length [1 (throw "x") 3]` must return `3` without throwing. Elements are only evaluated when accessed via `builtins.elemAt` or iteration.
 
-3. **Strings**: String content is always strict. `"hello ${throw "x"}"` will throw during construction, not when the string is used.
+3. **Strings**: String content is always strict. `"hello ${throw "x"}"` would throw during construction (but variable interpolation currently falls back to the standard evaluator).
 
 ---
 
 ## HVM4 Encoding Strategy
+
+> Status (2025-12-28): This overview reflects the current encoding choices in
+> `src/libexpr/hvm4/`. Some constructors below are still planned (not yet used).
+> String context tracking is not implemented; only fully-constant string concatenations
+> are compiled by the HVM4 backend today.
 
 All encodings use HVM4 constructors (C00-C16) with base-64 encoded names:
 
@@ -69,29 +81,24 @@ All encodings use HVM4 constructors (C00-C16) with base-64 encoded names:
 |-------------|----------|-------|---------|
 | `#Nil` | 166118 | 0 | Empty list |
 | `#Con` | 121448 | 2 | Cons cell (head, tail) |
-| `#Lst` | TBD | 2 | List wrapper (length, spine) |
-| `#ABs` | TBD | 1 | Attrs base (sorted_list) |
-| `#ALy` | TBD | 2 | Attrs layer (overlay, base) |
-| `#Atr` | TBD | 2 | Attr node (key_id, value) |
-| `#Str` | TBD | 2 | String (chars, context) |
-| `#Chr` | Native | 1 | Character (codepoint) |
-| `#Pth` | TBD | 2 | Path (accessor_id, path_string) |
-| `#NoC` | TBD | 0 | No context (strings) |
-| `#Ctx` | TBD | 1 | Context present (elements) |
-| `#Pos` | Existing | 2 | BigInt positive (lo, hi) |
-| `#Neg` | Existing | 2 | BigInt negative (lo, hi) |
-| `#Tru` | TBD | 0 | Boolean true |
-| `#Fls` | TBD | 0 | Boolean false |
-| `#Som` | TBD | 1 | Option some (value) |
-| `#Non` | TBD | 0 | Option none |
-| `#Err` | TBD | 1 | Error value (message) |
-| `#Opq` | TBD | 1 | Opaque context element |
-| `#Drv` | TBD | 1 | Derivation context element |
-| `#Blt` | TBD | 2 | Built output context element |
-| `#Nul` | TBD | 0 | Null value |
-| `#Imp` | TBD | 2 | Import result (path, value) |
-| `#Lam` | TBD | 2 | Lambda (arg_pattern, body) |
-| `#App` | TBD | 2 | Application (func, arg) |
+| `#Lst` | CTR_LST | 2 | List wrapper (length, spine) |
+| `#Ats` | CTR_ATS | 1 | Attrset wrapper (spine) |
+| `#Atr` | CTR_ATR | 2 | Attr node (key_id, value) |
+| `#Str` | CTR_STR | 1 | String table id |
+| `#SCat` | CTR_SCAT | 2 | String concatenation |
+| `#SNum` | CTR_SNUM | 1 | Int-to-string wrapper |
+| `#Pth` | CTR_PTH | 2 | Path (accessor_id, path_string_id) |
+| `#Som` | CTR_SOM | 1 | Option some (value) |
+| `#Non` | CTR_NON | 0 | Option none |
+| `#Nul` | NIX_NULL | 0 | Null value |
+| `#Pos` | BIGINT_POS | 2 | BigInt positive (lo, hi) |
+| `#Neg` | BIGINT_NEG | 2 | BigInt negative (lo, hi) |
+| `#Err` | TBD | 1 | Error value (planned) |
+| `#Opq` | TBD | 1 | Opaque context element (planned) |
+| `#Drv` | TBD | 1 | Derivation context element (planned) |
+| `#Blt` | TBD | 2 | Built output context element (planned) |
+
+**Note:** booleans are represented as NUM (0/1), not constructors.
 
 ## HVM4 Operator Reference
 
@@ -102,14 +109,17 @@ All encodings use HVM4 constructors (C00-C16) with base-64 encoded names:
 | `OP_MUL` | 2 | Multiplication | `*` |
 | `OP_DIV` | 3 | Integer division | `/` |
 | `OP_MOD` | 4 | Modulo | N/A (use primop) |
-| `OP_EQ` | 5 | Equality | `==` |
-| `OP_NE` | 6 | Not equal | `!=` |
-| `OP_LT` | 7 | Less than | `<` |
-| `OP_LE` | 8 | Less or equal | `<=` |
-| `OP_GT` | 9 | Greater than | `>` |
-| `OP_GE` | 10 | Greater or equal | `>=` |
-| `OP_AND` | 11 | Bitwise AND | N/A |
-| `OP_OR` | 12 | Bitwise OR | N/A |
-| `OP_XOR` | 13 | Bitwise XOR | N/A |
+| `OP_AND` | 5 | Bitwise AND | N/A |
+| `OP_OR` | 6 | Bitwise OR | N/A |
+| `OP_XOR` | 7 | Bitwise XOR | N/A |
+| `OP_LSH` | 8 | Left shift | N/A |
+| `OP_RSH` | 9 | Right shift | N/A |
+| `OP_NOT` | 10 | Bitwise NOT | N/A |
+| `OP_EQ` | 11 | Equality | `==` |
+| `OP_NE` | 12 | Not equal | `!=` |
+| `OP_LT` | 13 | Less than | `<` |
+| `OP_LE` | 14 | Less or equal | `<=` |
+| `OP_GT` | 15 | Greater than | `>` |
+| `OP_GE` | 16 | Greater or equal | `>=` |
 
 **Note**: Logical `&&` and `||` in Nix are short-circuiting and are implemented as conditionals, not OP2.

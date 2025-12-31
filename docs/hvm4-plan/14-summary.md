@@ -1,33 +1,26 @@
 # Summary: Implementation Priority and Chosen Approaches
 
-## Feature Matrix
+## Feature Matrix (Current Status)
 
-| Feature | Priority | CHOSEN Approach | Complexity | Notes |
-|---------|----------|-----------------|------------|-------|
-| **Lists** | High | Spine-Strict Cons + Cached Length | Low | O(1) length, lazy elements |
-| **Attribute Sets** | High | Hybrid Layered (up to 8 layers) | Medium | O(1) for //, O(layers×n) lookup |
-| **Strings** | High | #Chr List + Context Wrapper | Medium | HVM4 native encoding |
-| **Pattern Lambdas** | High | Desugar to Attr Destructure | Low | Compile-time transform |
-| **Arithmetic Primops** | High | Direct OP2 + BigInt Fast Path | Medium | Native ops for 32-bit |
-| **Recursive Let** | Medium | Topo-Sort + Y-Combinator | Medium | Fast path for acyclic |
-| **Paths** | Medium | Pure String Wrapper | Low | Store ops at boundary |
-| **With Expressions** | Medium | Partial Eval + Runtime Lookup | High | Static analysis first |
-| **Imports** | Medium | Pre-resolution (Phase 1) | Medium | Resolve at compile-time |
-| **Derivations** | Low | Pure records (Phase 1) | Medium | Store writes post-eval |
-| **Floats** | Low | Reject (unsupported) | N/A | Fallback to std eval |
+| Feature | Status | Current Approach | Notes |
+|---------|--------|------------------|-------|
+| **Lists** | Implemented (basic) | `#Lst{len, spine}` | `++` only for list literals; list primops missing |
+| **Attribute Sets** | Implemented (basic) | `#Ats{spine}` sorted list | No layering; O(n) lookup; dynamic keys unsupported |
+| **Strings** | Implemented (basic) | String table + `#SCat/#SNum` | No context tracking; only constant concat compiled |
+| **Pattern Lambdas** | Implemented (partial) | Desugar to attr lookups | No extra-attr check; missing attrs yield ERA |
+| **Arithmetic Primops** | Partial | OP2 for `__sub/__mul/__div`; BigInt compare for `__lessThan` | No overflow handling |
+| **Recursive Let** | Partial | Topo-sort acyclic `rec` | Cycles rejected; `let rec` unsupported |
+| **Paths** | Partial | `#Pth{accessor_id, path_string_id}` | No coercion or store interaction |
+| **With Expressions** | Partial | Innermost lookup only | No outer fallback |
+| **Imports** | Not implemented | - | Falls back |
+| **Derivations** | Not implemented | - | Falls back |
+| **Floats** | Partial | `#Flt{lo, hi}` literals | Arithmetic/comparison falls back |
 
-## Implementation Order
+## Implementation Order (Completed vs Planned)
 
-Based on dependencies and complexity:
-
-1. **Lists** - Foundation for other data structures (attrs, strings use lists)
-2. **Arithmetic Primops** - Enables more complex tests, low dependency
-3. **Strings** - Required for attribute names and output
-4. **Attribute Sets** - Core Nix data structure, depends on lists
-5. **Pattern Lambdas** - Depends on attribute sets
-6. **Recursive Let** - Depends on attribute sets
-7. **Paths** - Depends on strings
-8. **With Expressions** - Depends on attribute sets
+Completed in some form: Lists, Attrs, Strings, Pattern Lambdas, Paths, basic ops.
+Planned work remains for imports, derivations, full primops, error handling, and
+proper `with`/`rec` semantics.
 
 ## Key Design Decisions
 
@@ -37,27 +30,21 @@ Based on dependencies and complexity:
 - String content is strict (Nix semantics)
 
 ### Layering Optimization
-- Attribute sets use layered approach for O(1) `//` operations
-- Maximum 8 layers before flattening
-- Matches Nix's internal optimization
+- Not implemented (attrsets are merged eagerly with O(n+m) cost)
 
 ### BigInt Encoding
 - Small integers (32-bit) use native HVM4 NUM
 - Large integers use #Pos{lo, hi} or #Neg{lo, hi}
-- Overflow checking at arithmetic boundaries
+- Overflow checking is not implemented for add/sub/mul
 
 ### Pure Evaluation
-- No side effects during HVM4 evaluation
-- Derivations are pure records, store writes happen post-eval
-- Imports are pre-resolved before HVM4 compilation
+- HVM4 evaluation is pure, but derivations/imports are not implemented yet
 
 ## Phase 1 vs Phase 2
 
 ### Phase 1 (Current)
-- Pre-import resolution (no IFD)
-- Pure derivation records (no store writes during eval)
-- No float support
-- Static import paths only
+- No import/derivation handling in HVM4 yet (fallback)
+- Float literals supported; arithmetic/comparison fall back
 
 ### Phase 2 (Future)
 - Effect-based imports for IFD

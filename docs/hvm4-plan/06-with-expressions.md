@@ -1,6 +1,11 @@
 # 6. With Expressions
 
 > Source: `plan-future-work.claude.md` (extracted into `docs/hvm4-plan`).
+>
+> Status (2025-12-28): `with` is implemented as a hidden binding for the innermost
+> attrset. Variables marked `fromWith` are compiled to a direct lookup in that
+> attrset only. Fallback to outer `with` scopes is not implemented; missing attributes
+> return ERA.
 
 `with e; body` adds all attributes of `e` to lexical scope dynamically.
 
@@ -92,7 +97,10 @@ Resolve what can be resolved statically, generate fallback for dynamic.
 | Complexity | Medium |
 | Correctness | Full |
 
-## CHOSEN: Partial Evaluation + Runtime Lookup (Option D)
+## Current Implementation: Innermost With Lookup Only
+
+The current backend does not perform static analysis or chained lookups. It emits
+only a single lookup against the innermost `with` binding.
 
 **Rationale:**
 - Static analysis resolves unambiguous cases efficiently (most common)

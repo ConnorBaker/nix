@@ -100,6 +100,12 @@ Or compile with debug flags:
 #endif
 ```
 
+## Upstream HVM4 Runtime Notes (2025-12-20+)
+
+- **SNF normalization** now lives in `hvm4/clang/eval/normalize.c` and uses a work-stealing queue (`wsq`) plus a visited set (`uset`) to traverse the heap graph. It runs in parallel when `thread_set_count(n > 1)` is used.
+- **CNF readback / collapse** is implemented via `hvm4/clang/cnf/_.c` + `hvm4/clang/eval/collapse.c` and uses a keyed work-stealing queue (`wspq`). Lower numeric keys pop first; `INC` decreases the key (higher priority), `SUP` increases it.
+- For **deterministic debugging output**, set HVM4's thread count to 1 (single-thread runs pop FIFO within each key bucket).
+
 ## Testing Strategies
 
 ### Unit Test Template

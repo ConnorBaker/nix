@@ -1,6 +1,9 @@
 # 8. Derivations
 
 > Source: `plan-future-work.claude.md` (extracted into `docs/hvm4-plan`).
+>
+> Status (2025-12-28): Derivations are not implemented in the HVM4 backend.
+> `derivationStrict` and related primops fall back to the standard evaluator.
 
 Derivations are the core of Nix - they define build actions.
 
@@ -77,7 +80,7 @@ Separate derivation computation from evaluation.
 // Requires multiple passes but keeps HVM4 pure
 ```
 
-## CHOSEN: Pure Derivation Records (Phase 1: Option A)
+## Original Plan (not implemented): Pure Derivation Records (Phase 1: Option A)
 
 **Rationale:**
 - Keeps HVM4 evaluation pure and deterministic

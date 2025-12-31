@@ -1,0 +1,9 @@
+// Nix boolean encoding for HVM4
+//
+// - true  = 1 (NUM)
+// - false = 0 (NUM)
+// - Any nonzero NUM is treated as true by HVM4 conditionals.
+//
+// Examples:
+//   true  => 1
+//   false => 0

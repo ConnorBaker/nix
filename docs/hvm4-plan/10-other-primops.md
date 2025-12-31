@@ -1,6 +1,20 @@
 # 10. Other Primops
 
 > Source: `plan-future-work.claude.md` (extracted into `docs/hvm4-plan`).
+>
+> Status (2025-12-28): Only a small subset of operators are implemented. Supported:
+> boolean `!`, `&&`, `||`, `->` (NUM 0/1), `==`/`!=` (null-aware), `?` (hasAttr),
+> `//` (attr merge), and `++` for list literals. General builtins, type checks,
+> coercions, and string/list/attr primops are not implemented.
+
+## Current Implementation Summary (HVM4 backend)
+
+- Boolean ops: `!`, `&&`, `||`, `->` compiled to NUM-based conditionals and OPs.
+- Equality/inequality: null-aware structural equality (`EQL`) for NUM and BigInt.
+- Attribute ops: `?` and `//` compiled using the `#Ats` encoding.
+- List concat: `++` only when both operands are list literals.
+
+The remaining sections are the original plan text and are not implemented yet.
 
 Nix has ~100+ primops. Key categories:
 

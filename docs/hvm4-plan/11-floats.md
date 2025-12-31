@@ -1,6 +1,10 @@
 # 11. Floats
 
 > Source: `plan-future-work.claude.md` (extracted into `docs/hvm4-plan`).
+>
+> Status (2025-12-28): Float literals are supported via `#Flt{lo, hi}` encoding.
+> Float arithmetic and comparisons are not implemented and will fall back to the
+> standard evaluator.
 
 Nix has double-precision floats. HVM4 only has 32-bit integers.
 
@@ -38,13 +42,11 @@ Defer float operations to external handler.
 // Float operations become effects handled outside HVM4
 ```
 
-## CHOSEN: Reject Floats (Not Supported)
+## Current Implementation: Encode Float Literals Only
 
 **Rationale:**
-- Implementing IEEE 754 double-precision in HVM4's 32-bit integers is extremely complex
-- Would require reimplementing all floating-point operations in software
-- Float usage in Nix is rare (mostly for builtins.fromJSON parsing)
-- Can fall back to standard evaluator for expressions containing floats
+- Literal support unblocks parsing and extraction of float values
+- Arithmetic/comparison still falls back due to missing operator support
 
 **Implementation:**
 

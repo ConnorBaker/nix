@@ -1,0 +1,15 @@
+// Nix attribute set encoding for HVM4
+//
+// Attribute sets are wrapped sorted lists:
+//   #Ats{spine}
+//
+// Spine is a list of attribute nodes:
+//   #Nil{}
+//   #Con{#Atr{key_id, value}, tail}
+//
+// key_id is a Symbol id (NUM). Values are lazy terms.
+//
+// Examples:
+//   {} => #Ats{#Nil{}}
+//   { a = 1; b = 2; } =>
+//     #Ats{#Con{#Atr{sym_a, 1}, #Con{#Atr{sym_b, 2}, #Nil{}}}}

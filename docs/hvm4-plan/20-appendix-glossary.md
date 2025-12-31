@@ -29,27 +29,27 @@
 
 | Term | Definition |
 |------|------------|
-| **`#ABs`** | Attrs Base - base layer of an attribute set as a sorted list. |
-| **`#ALy`** | Attrs Layer - overlay layer for // optimization. |
+| **`#Ats`** | Attrs wrapper for a sorted list spine. |
 | **`#Atr`** | Attribute node storing key_id and value. |
-| **`#Chr`** | Character (Unicode codepoint) - HVM4's native string element. |
 | **`#Con`** | Cons cell for list spine (head, tail). |
-| **`#Ctx`** | Context present - wrapper containing context elements. |
-| **`#Drv`** | Derivation context element. |
-| **`#Err`** | Error value for propagating evaluation errors. |
-| **`#Fls`** | Boolean false. |
 | **`#Lst`** | List wrapper with cached length. |
-| **`#Neg`** | Negative BigInt (lo, hi words). |
 | **`#Nil`** | Empty list terminator. |
-| **`#NoC`** | No Context - strings without store path dependencies. |
 | **`#Non`** | Option none (no value). |
-| **`#Nul`** | Nix null value. |
-| **`#Opq`** | Opaque context element. |
-| **`#Pos`** | Positive BigInt (lo, hi words). |
-| **`#Pth`** | Path value (accessor_id, path_string). |
 | **`#Som`** | Option some (has value). |
-| **`#Str`** | String with context (chars, context). |
-| **`#Tru`** | Boolean true. |
+| **`#Nul`** | Nix null value. |
+| **`#Pos`** | Positive BigInt (lo, hi words). |
+| **`#Neg`** | Negative BigInt (lo, hi words). |
+| **`#Str`** | String literal (string-table id). |
+| **`#SCat`** | String concatenation node. |
+| **`#SNum`** | Int-to-string wrapper. |
+| **`#Pth`** | Path value (accessor_id, path_string_id). |
+| **`#Flt`** | Float literal (IEEE 754, lo/hi words). |
+| **`#Err`** | Error value (planned, not implemented). |
+| **`#Opq`** | Opaque context element (planned). |
+| **`#Drv`** | Derivation context element (planned). |
+| **`#Blt`** | Built output context element (planned). |
+
+Note: Booleans are represented as NUM 0/1, not `#Tru/#Fls`.
 
 ## Implementation Terms
 
@@ -82,12 +82,15 @@
 | 2 | `OP_MUL` | Multiplication |
 | 3 | `OP_DIV` | Integer division |
 | 4 | `OP_MOD` | Modulo |
-| 5 | `OP_EQ` | Equality |
-| 6 | `OP_NE` | Not equal |
-| 7 | `OP_LT` | Less than |
-| 8 | `OP_LE` | Less or equal |
-| 9 | `OP_GT` | Greater than |
-| 10 | `OP_GE` | Greater or equal |
-| 11 | `OP_AND` | Bitwise AND |
-| 12 | `OP_OR` | Bitwise OR |
-| 13 | `OP_XOR` | Bitwise XOR |
+| 5 | `OP_AND` | Bitwise AND |
+| 6 | `OP_OR` | Bitwise OR |
+| 7 | `OP_XOR` | Bitwise XOR |
+| 8 | `OP_LSH` | Left shift |
+| 9 | `OP_RSH` | Right shift |
+| 10 | `OP_NOT` | Bitwise NOT |
+| 11 | `OP_EQ` | Equality |
+| 12 | `OP_NE` | Not equal |
+| 13 | `OP_LT` | Less than |
+| 14 | `OP_LE` | Less or equal |
+| 15 | `OP_GT` | Greater than |
+| 16 | `OP_GE` | Greater or equal |

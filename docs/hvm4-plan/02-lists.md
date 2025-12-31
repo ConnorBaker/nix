@@ -1,6 +1,12 @@
 # 2. Lists
 
 > Source: `plan-future-work.claude.md` (extracted into `docs/hvm4-plan`).
+>
+> Status (2025-12-28): Implemented as `#Lst{length, spine}` with `#Nil/#Con` spine.
+> List concatenation (`++`) is supported only for list literals (compile-time merge).
+> List primops like `head`, `tail`, `elemAt`, `length`, `map`, etc. are not implemented
+> as HVM4 functions; they fall back to the standard evaluator. Result extraction
+> evaluates each element to normal form.
 
 Nix lists are **arrays of lazy values** with:
 - O(1) length and element access
@@ -120,6 +126,11 @@ For efficient list building, then convert to cons list.
 // Empty list
 #Lst{0, #Nil{}}
 ```
+
+**Current limitations:**
+- `++` only works when both operands are list literals (checked in `canCompileWithScope`).
+- No HVM4 implementations of list primops (`builtins.head`, `builtins.tail`, `builtins.length`, etc.).
+- Extraction forces each element to normal form, so laziness is only preserved within HVM4.
 
 ### Detailed Implementation Steps
 

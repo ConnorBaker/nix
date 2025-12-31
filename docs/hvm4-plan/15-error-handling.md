@@ -1,8 +1,11 @@
 # Error Handling Strategy
 
-This document documents how errors should be propagated and handled in the HVM4 backend to maintain Nix's evaluation semantics.
+Status (2025-12-28): Structured error propagation is not implemented. The backend
+uses ERA as a placeholder for missing attributes and failed asserts, and many
+error conditions fall back to the standard evaluator. The sections below describe
+the planned error model, not the current behavior.
 
-## Error Encoding
+## Error Encoding (planned)
 
 All errors use the `#Err{message}` constructor:
 

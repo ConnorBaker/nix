@@ -1,0 +1,107 @@
+// Nix list encoding for HVM4
+//
+// List wrapper with cached length:
+//   #Lst{length, spine}
+//
+// Spine is a standard cons list:
+//   #Nil{}
+//   #Con{head, tail}
+//
+// Examples:
+//   []        => #Lst{0, #Nil{}}
+//   [1 2 3]   => #Lst{3, #Con{1, #Con{2, #Con{3, #Nil{}}}}}
+
+// Constructors
+// @List = λlength. λspine. #Lst{length, spine}
+// @Nil  = #Nil{}
+// @Con  = λhead. λtail. #Con{head, tail}
+
+// [
+//   "all"
+//   "any"
+//   "concatLists"
+//   "concatMap"
+//   "elem"
+//   "elemAt"
+//   "filter"
+//   "foldl'"
+//   "genList"
+//   "head"
+//   "length"
+//   "map"
+//   "sort"
+//   "tail"
+// ]
+
+@Err = λe.#Err{e}
+
+@Nil = []
+@Con = λ h, t. h <> t
+
+@id = λ a. a
+@const = λ a, b. a
+@flip = λ f, a, b. f(b, a)
+
+@and = λ a, b. a .&. b
+@or = λ a, b. a .|. b
+
+// https://hackage-content.haskell.org/package/base-4.22.0.0/docs/Data-Bool.html#v:bool
+@bool = λ f, t, {0: f; 1: t}
+
+// NOTE: Cannot match on Con and Nil, use [] and <>.
+// Same thing goes for booleans.
+
+@exampleList0 = []
+@exampleList1 = [1]
+@exampleList2 = [2, 3]
+@exampleList3 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+@prim_head = λ{[]: @Error("head cannot be used on an empty list"); <>: λ h, t. h}
+@prim_tail = λ{[]: []; <>: λ h, t. t}
+
+// List catamorphism
+// foldr :: (a -> b -> b) -> b -> [a] -> b
+// @prim_foldr = λ &op, &nul, {[]: nul; <>: λ v, acc. op(v, @prim_foldr(op, nul, acc))}
+
+// Using the continuation builder form to avoid duplicating nul every time.
+@foldr_build = λ &op, {[]: @id; <>: λ v, acc, z. op(v, @foldr_build(op, acc)(z))}
+@prim_foldr = λ &op, nul, lst. @foldr_build(op, lst)(nul)
+
+@prim_map = λ f. @prim_foldr(λ v, acc. f(v) <> acc, [])
+
+// Adopting the CPS style to preserve linearity, then doing eta-reduction.
+// @prim_filter = λ pred. @prim_foldr(λ &v, &acc. @bool(acc, v <> acc, pred(v)), [])
+// @prim_filter = λ pred. @prim_foldr(λ &v, acc. (@bool(@id, @Con(v), pred(v)))(acc), [])
+@prim_filter = λ pred. @prim_foldr(λ &v. @bool(@id, @Con(v), pred(v)), [])
+
+// @prim_all = λ pred. @prim_foldr(λ v, acc. pred(v) .&. acc, 1)
+@prim_all = λ pred. @prim_foldr(λ v. @and(pred(v)), 1)
+// @prim_all = λ pred, lst. @prim_foldr(@and, 1, @prim_map(pred, lst))
+
+@prim_any = λ pred. @prim_foldr(λ v. @or(pred(v)), 0)
+
+@concat_list = @flip(@prim_foldr(@Con))
+@prim_concatLists = @prim_foldr(@concat_list, [])
+
+
+
+// @prim_concatMap = []
+// @prim_elem = []
+// @prim_elemAt = []
+// @prim_foldlStrict = []
+// @prim_genList = []
+
+@prim_length = @prim_foldr(λ v, acc. 1 + acc, 0)
+
+// @prim_sort = []
+
+
+// @main = @prim_foldr(@Con, [], @exampleList3)
+// @main = @prim_map(λ n. n + 2, @exampleList3)
+// @main = @prim_all(λ n. n != 2, @exampleList3)
+
+// @main = @prim_filter(λ n. n != 2, [2, 2, 3, 2, 3])
+// @main = @concat_list([1,2,3], [4,5,6])
+// @main = @prim_concatLists([[1,2,3], [4,5,6], [4,5,6]])
+// Why is there no CSE? Why aren't these other values deduplicated? Number of interactions grows linearlly as I add more.
+@main = @prim_length(@prim_concatLists([[1,2,3], [4,5,6], [4,5,6]])) + @prim_length(@prim_concatLists([[1,2,3], [4,5,6], [4,5,6]])) + @prim_length(@prim_concatLists([[1,2,3], [4,5,6], [4,5,6]])) + @prim_length(@prim_concatLists([[1,2,3], [4,5,6], [4,5,6]]))

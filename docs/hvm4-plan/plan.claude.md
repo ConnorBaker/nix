@@ -270,6 +270,10 @@ static u64   ITRS  = 0; // Interaction counter
 static char **TABLE;    // Name table: id -> string
 ```
 
+**Update (2025-12-20+):** Upstream HVM4 now uses per-thread heap slices and WNF
+stacks (`HEAP_NEXT/HEAP_END`, `WNF_BANKS`, `WNF_ITRS_BANKS`) instead of a single
+global `ALLOC/STACK/ITRS`. See `hvm4/clang/hvm4.c` and `hvm4/clang/wnf/stack_init.c`.
+
 ### 2.3 Term Bit Layout (64-bit)
 
 ```
@@ -456,17 +460,12 @@ fn Term term_unmark(Term t) { return t & ~((u64)1 << 63); }
 // Weak normal form (head normal form)
 __attribute__((hot)) fn Term wnf(Term term);
 
-// Strong normal form (fully evaluate all subterms)
-fn Term snf(Term term, u32 depth) {
-  term = wnf(term);
-  u32 ari = term_arity(term);
-  if (ari == 0) return term;
-
-  u64 loc = term_val(term);
-  for (u32 i = 0; i < ari; i++) {
-    HEAP[loc + i] = snf(HEAP[loc + i], depth);
-  }
-  return term;
+// Strong normal form (work-stealing traversal over heap graph)
+fn Term eval_normalize(Term term) {
+  // 1) Reduce root to WNF
+  // 2) Traverse reachable heap nodes via WSQ
+  // 3) Use Uset to avoid revisiting locations
+  // 4) If thread_count > 1, workers steal tasks
 }
 ```
 
@@ -475,19 +474,18 @@ fn Term snf(Term term, u32 depth) {
 From `hvm4/clang/main.c`:
 
 ```c
-// 1. Allocate memory
+// 1. Configure threads (default: 1)
+thread_set_count(1);
+wnf_set_tid(0);
+
+// 2. Allocate memory
 BOOK  = calloc(BOOK_CAP, sizeof(u32));
 HEAP  = calloc(HEAP_CAP, sizeof(Term));
-STACK = calloc(WNF_CAP, sizeof(Term));
 TABLE = calloc(BOOK_CAP, sizeof(char*));
-
-// 2. Initialize counters
-ALLOC = 1;  // Slot 0 reserved
-S_POS = 1;
-ITRS  = 0;
+heap_init_slices();
 
 // 3. Evaluate
-Term result = snf(term, 0);
+Term result = eval_normalize(term);
 ```
 
 ---
@@ -1411,7 +1409,12 @@ TEST_F(HVM4CompilerTest, CompileMultiUseVariable) {
 - `hvm4/clang/term/new/*.c` - All term_new_* functions
 - `hvm4/clang/parse/auto_dup.c` - Auto-duplication algorithm
 - `hvm4/clang/wnf/_.c` - WNF evaluator
-- `hvm4/clang/snf/_.c` - SNF evaluator
+- `hvm4/clang/eval/normalize.c` - SNF evaluator (parallel work-stealing)
+- `hvm4/clang/cnf/_.c` - CNF readback step (collapser)
+- `hvm4/clang/eval/collapse.c` - CNF readback traversal
+- `hvm4/clang/data/wsq.c` - Work-stealing deque (normalize)
+- `hvm4/clang/data/wspq.c` - Keyed work-stealing queue (collapse)
+- `hvm4/clang/data/uset.c` - Visited set for normalize
 - `hvm4/README.md` - Language reference
 
 **Test Infrastructure:**
@@ -1425,829 +1428,67 @@ TEST_F(HVM4CompilerTest, CompileMultiUseVariable) {
 
 # Part 4: Implementation Progress
 
-## Completed Steps (December 2024)
-
-All core implementation files have been created and the HVM4 backend is functional for a limited subset of Nix:
-
-### Step 1: Runtime Wrapper - DONE
-- File: `src/libexpr/hvm4/hvm4-runtime.cc`
-- Headers moved to: `src/libexpr/include/nix/expr/hvm4/hvm4-runtime.hh`
-- Complete implementation of HVM4 runtime including embedded WNF/SNF evaluator
-- All term construction APIs exposed
-
-### Step 2: BigInt Encoding - DONE
-- File: `src/libexpr/hvm4/hvm4-bigint.cc`
-- Header: `src/libexpr/include/nix/expr/hvm4/hvm4-bigint.hh`
-- Small integers (32-bit signed) use native NUM
-- Large integers use `#Pos{lo, hi}` or `#Neg{lo, hi}` constructors
-- Full roundtrip encoding/decoding verified by tests
-
-### Step 3: AST Compiler - DONE
-- File: `src/libexpr/hvm4/hvm4-compiler.cc`
-- Header: `src/libexpr/include/nix/expr/hvm4/hvm4-compiler.hh`
-- Two-pass compilation: usage counting + code emission
-- Auto-DUP insertion for multi-use variables
-- Supports: ExprInt, ExprVar, ExprLambda, ExprCall, ExprLet, ExprConcatStrings (addition)
-
-### Step 4: Result Extraction - DONE
-- File: `src/libexpr/hvm4/hvm4-result.cc`
-- Header: `src/libexpr/include/nix/expr/hvm4/hvm4-result.hh`
-- Extracts NUM, BigInt, and ERA terms back to Nix Values
-
-### Step 5: Backend Integration - DONE
-- File: `src/libexpr/hvm4/hvm4-backend.cc`
-- Header: `src/libexpr/include/nix/expr/hvm4/hvm4-backend.hh`
-- `canEvaluate()` and `tryEvaluate()` interface for integration with Nix evaluator
-- Statistics tracking (compilations, evaluations, fallbacks)
-
-### Step 6: Build System - DONE
-- Modified: `src/libexpr/meson.options` - Added `hvm4-backend` feature option
-- Modified: `src/libexpr/meson.build` - Conditional source compilation
-- Modified: `src/libexpr/include/nix/expr/meson.build` - HVM4 headers installation
-- Build with: `meson setup build -Dlibexpr:hvm4-backend=enabled`
-
-### Step 7: Unit Tests - DONE
-- File: `src/libexpr-tests/hvm4.cc`
-- 46 tests covering:
-  - Runtime term construction (NUM, VAR, LAM, APP, SUP, OP2, ERA)
-  - Runtime evaluation (identity, addition, multiplication, comparisons)
-  - BigInt encoding/decoding roundtrips
-  - Backend canEvaluate checks
-  - Backend evaluation (integers, addition, let bindings)
-  - Statistics tracking
-
-## Test Results
-
-All 99 HVM4 tests pass:
-```
-[  PASSED  ] 99 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests (term construction and low-level evaluation)
-- HVM4BigIntTest: 10 tests (64-bit integer encoding)
-- HVM4BackendTest: 68 tests (compiler and integration)
-
-## Session 2: Lambda and Variable Fixes (December 2024)
-
-### Critical Bug Fix: Lambda Evaluation
-
-The initial implementation had a critical bug in lambda reduction semantics:
-
-**Problem**: The `wnf_app_lam` function was returning `HEAP[lam_loc]` AFTER substituting the argument, which overwrote the body with the argument.
-
-**Solution**: Read the body BEFORE substituting, then return the original body:
-```c
-fn Term wnf_app_lam(Term fun, Term arg) {
-    ITRS++;
-    u32 lam_loc = term_val(fun);
-    Term body = HEAP[lam_loc];      // Read body BEFORE substituting
-    heap_subst_var(lam_loc, arg);   // Then substitute
-    return body;                     // Return original body
-}
-```
-
-### Critical Bug Fix: VAR Semantics
-
-**Discovery**: HVM4 VAR terms interpret the `val` field as a **heap location**, NOT a de Bruijn index. The parser creates VARs that reference the lambda's heap location directly.
-
-**Solution**: Pre-allocate lambda slots before constructing the body:
-```cpp
-// New API methods:
-uint32_t allocateLamSlot();  // Pre-allocate slot
-Term finalizeLam(uint32_t lamLoc, Term body);  // Set body and create LAM
-
-// Usage in compiler:
-uint32_t lamLoc = ctx.runtime().allocateLamSlot();
-ctx.pushBinding(e.arg, lamLoc);  // Bind with heap location
-Term body = emit(*e.body, ctx);  // VARs use lamLoc
-ctx.popBinding();
-return ctx.runtime().finalizeLam(lamLoc, body);
-```
-
-### Bug Fix: Scope-Aware canCompile
-
-**Problem**: `canCompile` returned true for any ExprVar, including free variables like builtins (`true`, `false`, `sub`).
-
-**Solution**: Made `canCompile` scope-aware with a helper that tracks bound symbols:
-```cpp
-bool canCompileWithScope(const Expr& expr, std::vector<Symbol>& scope) const;
-```
-
-This correctly rejects:
-- `true` and `false` (builtins, not literals in Nix)
-- Unary negation `-5` (parsed as `sub(0, 5)`, calls builtin)
-- Any other free variables
-
-### Tests Added
-
-Added 34 new tests covering:
-- Comparison operators (==, !=)
-- Boolean operations (!, &&, ||)
-- If-then-else
-- Lambda evaluation (identity, const, nested)
-- Let bindings (single, multiple, nested, shadowing)
-- Multi-use variables (DUP insertion)
-- Negative test cases for unsupported features
-
-## Current Limitations
-
-The HVM4 backend currently supports:
-- Integer literals (via ExprInt)
-- Integer addition (via ExprConcatStrings with forceString=false)
-- Simple lambdas (not pattern matching)
-- Function application
-- Non-recursive let bindings
-- Variables (locally bound only)
-- Comparison operators (==, !=)
-- Boolean operations (!, &&, ||)
-- If-then-else
-
-NOT yet supported:
-- Boolean literals (`true`/`false` are builtins in Nix, use `1==1` instead)
-- Unary negation (parsed as `sub(0, x)` builtin call)
-- Subtraction, multiplication, division (use Nix primops)
-- Recursion
-- Strings, lists, attribute sets
-- Pattern-matching lambdas
-- With expressions
-- Assertions
-
-## Session 3: Test Refinements and Documentation (December 2024)
-
-### Comprehensive Tests Added
-
-Added 19 new edge case tests covering:
-- **Higher-order functions**: Functions returning functions, currying
-- **Deep nesting**: Deeply nested lambdas and let bindings
-- **Complex expressions**: Chained additions, many bindings, variables used across expressions
-- **Boolean operations**: Chained &&/||, mixed operations, double negation
-- **If-then-else**: True/false branches, nested conditionals, with let bindings
-- **Edge cases**: Unused bindings, shadowing in nested lambdas, large integers
-
-### Known Limitations Documented
-
-Tests exposed limitations requiring future work:
-- **Closures**: Lambdas that capture variables from outer let bindings
-- **Multi-use functions**: Functions stored in let bindings called multiple times
-- **Higher-order patterns**: `twice f x = f (f x)`, function composition
-
-These require proper closure support and DUP insertion for lambda values.
-
-### Documentation Enhanced
-
-Updated header files with comprehensive documentation:
-- **hvm4-runtime.hh**: Term layout, semantics, lambda creation pattern
-- **hvm4-compiler.hh**: Design decisions, VAR heap locations, known limitations
-- **hvm4-backend.hh**: Usage examples, supported constructs
-
-### Test Results
-
-All 99 HVM4 tests pass:
-```
-[  PASSED  ] 99 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 68 tests
-
-## Session 4: Deep Nesting and Closure Fixes (December 2024)
-
-### Critical Bug Fix: Nested Let Counting
-
-**Problem**: Deep nesting (3+ levels of let bindings) caused segfaults during evaluation. The issue was that nested `emitLet` calls during their first pass (counting variable usages) were incrementing `useCount` for outer bindings that had already been configured in the second pass.
-
-**Root Cause Analysis**:
-1. Outer emitLet's second pass sets `binding.useCount = 1` for outer variable
-2. Outer emitLet calls `emit(body)` where body contains nested lets
-3. Nested emitLet's first pass calls `countUsages()` which increments outer binding's `useCount` to 2
-4. Later `emitVar` sees `useCount > 1` and tries to use CO0/CO1 projections
-5. But no DUP nodes were set up for this binding (because outer let saved `useCounts = [1]`)
-6. Crash during evaluation due to invalid term structure
-
-**Solution**: In `countUsages()`, only count bindings that were pushed for counting purposes (with `heapLoc == 0`). Bindings pushed during second pass (with `heapLoc > 0`) have already been counted and configured:
-
-```cpp
-if (auto* e = dynamic_cast<const ExprVar*>(&expr)) {
-    if (auto* binding = ctx.lookup(e->name)) {
-        // Only count if this binding was pushed for counting (heapLoc=0).
-        // Bindings pushed during second pass (heapLoc>0) have already been
-        // counted and configured - don't increment their useCount again.
-        if (binding->heapLoc == 0) {
-            binding->useCount++;
-        }
-    }
-    return;
-}
-```
-
-### Bug Fix: Set useCount for All Bindings
-
-**Problem**: In emitLet's second pass, `binding.useCount` was only set when `useCounts[i] > 1`. This left single-use bindings with `useCount = 0` (the default).
-
-**Solution**: Always set `binding.useCount = useCounts[i]` regardless of whether DUP handling is needed:
-
-```cpp
-for (size_t i = 0; i < bindings.size(); i++) {
-    auto& binding = ctx.getBindings()[startBinding + i];
-    // Always set useCount - needed for emitVar to properly handle single-use vs multi-use
-    binding.useCount = useCounts[i];
-    if (useCounts[i] > 1) {
-        // Set up DUP handling...
-    }
-}
-```
-
-### Tests Added
-
-Added 4 new tests for deep nesting:
-- `EvalThreeNestedLetsSimpleBody`: 3 nested lets with simple body
-- `EvalThreeNestedLetsTwoVarAdd`: 3 nested lets with addition of 2 variables
-- `EvalThreeNestedLets`: 3 nested lets with all variables used
-- `EvalDeeplyNestedLets`: 4 nested lets (existing test, now passes)
-
-### Test Results
-
-All 103 HVM4 tests pass:
-```
-[  PASSED  ] 103 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 72 tests
-
-## Session 5: Closure Edge Case Tests (December 2024)
-
-### New Closure Tests Added
-
-Added comprehensive tests for closure behavior:
-
-1. **EvalClosureCapturingMultipleVariables**: Closure capturing multiple outer variables (`let a = 1; b = 2; f = x: a + b + x; in f 3`)
-
-2. **EvalNestedClosures**: Nested closures with inner function capturing variables from multiple scopes (`let outer = 10; f = x: let inner = x + outer; in y: inner + y; in (f 5) 3`)
-
-3. **EvalClosureInConditionalSingleUse**: Closure used in one branch of a conditional (single-use lambda works)
-
-4. **EvalClosureWithMultiUseCapture**: Closure where the captured variable is used multiple times within the closure body
-
-5. **EvalDeepClosureNesting**: Deeply nested let bindings with closure capturing variables from outer scopes
-
-### Known Limitation Confirmed
-
-Confirmed that multi-use of lambda values stored in let bindings remains unsupported. The test `EvalClosureInConditional` (where `f` appears in both then and else branches) was documented as disabled because static counting sees `f` twice even though only one branch executes.
-
-### Test Results
-
-All 108 HVM4 tests pass:
-```
-[  PASSED  ] 108 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 77 tests
-
-## Session 6: Additional Edge Case Tests (December 2024)
-
-### New Edge Case Tests Added
-
-Added 11 new tests covering edge cases and boundary conditions:
-
-1. **EvalNegativeInteger**: Negative integer literal handling (-42)
-2. **EvalZeroInAddition**: Zero as operand in addition (0 + 5, 5 + 0)
-3. **EvalZeroInComparison**: Zero in comparison operations (0 == 0)
-4. **EvalZeroNotEqualNonZero**: Zero inequality with non-zero (0 != 1)
-5. **EvalComplexNestedExpression**: Complex expression combining let, closures, and application (single-use pattern)
-6. **EvalDeeplyNestedArithmetic**: Deeply nested parenthesized arithmetic ((((1 + 2) + 3) + 4) + 5)
-7. **EvalConditionalWithComplexCondition**: Conditional with && in condition
-8. **EvalNestedConditionalWithOr**: Conditional with || in condition
-9. **EvalIdentityFunctionSingleUse**: Identity function applied once
-10. **EvalLambdaReturningLambda**: Higher-order function pattern (currying)
-11. **EvalPartialApplicationInLet**: Partial application stored in let binding
-12. **EvalSingleBindingWithComputation**: Let with computed binding value used twice
-13. **EvalMultipleBindingsWithDependencies**: Let bindings depending on earlier bindings
-
-### Bug Fix: Test Case Corrections
-
-Fixed two tests that incorrectly used multi-use lambda patterns (unsupported):
-- **EvalComplexNestedExpression**: Changed from `if f 3 == 6 then f 10 else 0` to `f 3` (single use)
-- **EvalIdentityFunctionChain**: Changed from `id (id (id (id 42)))` to `id 42` (single use)
-
-### Test Results
-
-All 121 HVM4 tests pass:
-```
-[  PASSED  ] 121 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 90 tests
-
-## Session 7: Comprehensive Test Coverage (December 2024)
-
-### Additional Negative Tests
-
-Added 13 new negative tests to verify proper rejection of unsupported constructs:
-
-1. **CannotEvaluateSubtraction**: `5 - 3` (uses __sub primop)
-2. **CannotEvaluateMultiplication**: `5 * 3` (uses __mul primop)
-3. **CannotEvaluateDivision**: `10 / 2` (uses __div primop)
-4. **CannotEvaluateSelect**: `{ a = 1; }.a` (attribute selection)
-5. **CannotEvaluateHasAttr**: `{ a = 1; } ? a` (has-attr operator)
-6. **CannotEvaluateImplication**: `(1 == 1) -> (2 == 2)` (implication)
-7. **CannotEvaluateListConcat**: `[1] ++ [2]` (list concatenation)
-8. **CannotEvaluateAttrUpdate**: `{ a = 1; } // { b = 2; }` (attribute update)
-9. **CannotEvaluateNull**: `null` (builtin)
-10. **CannotEvaluateLessThan**: `1 < 2` (uses __lessThan primop)
-11. **CannotEvaluateGreaterThan**: `2 > 1` (uses comparison primops)
-12. **CannotEvaluateLessOrEqual**: `1 <= 2` (uses comparison primops)
-13. **CannotEvaluateGreaterOrEqual**: `2 >= 1` (uses comparison primops)
-
-### Stress Tests
-
-Added 8 stress tests for larger and more complex expressions:
-
-1. **StressManyLetBindings**: 10 let bindings forming a dependency chain
-2. **StressDeeplyNestedLets**: 5 levels of nested let expressions
-3. **StressLongAdditionChain**: 15 additions in sequence
-4. **StressDeeplyNestedLambdas**: 5-arity curried function application
-5. **StressNestedConditionals**: 4 levels of nested if-then-else
-6. **StressComplexBooleanExpression**: Complex && and || combinations
-7. **StressMultiUseVariableInLargeExpression**: Variable used 5 times in expression
-8. **StressCurriedFunctionDirect**: Curried function with closure applied directly
-
-### Test Results
-
-All 142 HVM4 tests pass:
-```
-[  PASSED  ] 142 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 111 tests
-
-## Session 8: Boundary Condition Tests (December 2024)
-
-### Boundary Condition Tests Added
-
-Added 12 boundary condition tests covering edge cases:
-
-1. **BoundaryMaxInt32**: Maximum 32-bit signed integer (2147483647)
-2. **BoundaryMinInt32**: Zero as neutral element (negative literals not directly testable)
-3. **BoundaryAdditionNearOverflow**: Large addition near 32-bit boundary
-4. **BoundaryEmptyBodyLambda**: Identity lambda `(x: x) 99`
-5. **BoundaryMinimalLet**: Minimal let expression `let x = 1; in x`
-6. **BoundaryMinimalIf**: Minimal if-then-else expression
-7. **BoundaryNotOfEquality**: Negation of equality `!(1 == 2)`
-8. **BoundaryAndWithFalseFirst**: Short-circuit && with false first
-9. **BoundaryOrWithTrueFirst**: Short-circuit || with true first
-10. **BoundaryNestedNotNot**: Triple negation `!!!(1 == 1)`
-11. **BoundarySameValueEquality**: `42 == 42`
-12. **BoundaryZeroEquality**: `0 == 0`
-
-### Test Results
-
-All 154 HVM4 tests pass:
-```
-[  PASSED  ] 154 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 123 tests
-
-## Session 9: Precedence and Shadowing Tests (December 2024)
-
-### Operator Precedence Tests Added
-
-Added 6 tests verifying correct operator precedence handling:
-
-1. **PrecedenceAdditionLeftAssociative**: `1 + 2 + 3` evaluates correctly
-2. **PrecedenceParenthesesOverride**: `1 + (2 + 3)` respects parentheses
-3. **PrecedenceAndOverOr**: `&&` has higher precedence than `||`
-4. **PrecedenceNotHighest**: `!` has highest precedence
-5. **PrecedenceComparisonInConditional**: `if 1 + 1 == 2 then ...`
-6. **PrecedenceNestedParentheses**: `((((1 + 2))))` handles deep nesting
-
-### Variable Shadowing Edge Cases Added
-
-Added 6 tests covering variable shadowing scenarios:
-
-1. **ShadowingInNestedLet**: Inner let shadows outer `let x=10; in let x=20; in x`
-2. **ShadowingOuterStillAccessible**: Outer binding usable before inner shadow
-3. **ShadowingLambdaParameter**: Lambda parameter shadows let binding
-4. **ShadowingMultipleLevels**: Three levels of shadowing
-5. **ShadowingDifferentVariables**: Different names don't interfere
-6. **ShadowingInLambdaBody**: Let inside lambda body shadows outer
-
-### Test Results
-
-All 166 HVM4 tests pass:
-```
-[  PASSED  ] 166 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 135 tests
-
-## Session 10: Application and Arithmetic Tests (December 2024)
-
-### Function Application Edge Cases Added
-
-Added 6 tests for function application patterns:
-
-1. **AppDirectLambda**: `(x: x + 1) 5` - direct lambda application
-2. **AppNestedDirectLambdas**: `(x: y: x + y) 3 4` - curried direct lambdas
-3. **AppLambdaToLambda**: `((x: y: x) 10) 20` - const function pattern
-4. **AppWithComputedArgument**: `(x: x + x) (1 + 2)` - computed arguments
-5. **AppResultInCondition**: Application result used in if condition
-6. **AppSingleUseInLet**: Single use of lambda stored in let binding
-
-### Arithmetic Combination Tests Added
-
-Added 6 tests for arithmetic edge cases:
-
-1. **ArithAdditionChain**: Sum of 1..10 = 55
-2. **ArithAdditionWithVariables**: Addition with let bindings
-3. **ArithNestedInConditional**: Arithmetic in conditional branches
-4. **ArithInLambdaBody**: `(x: x + x + x) 7` = 21
-5. **ArithWithComparisonResult**: Adding comparison results (0/1)
-6. **ArithZeroIdentity**: Zero as identity element
-
-### Test Results
-
-All 178 HVM4 tests pass:
-```
-[  PASSED  ] 178 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 147 tests
-
-## Session 11: Conditional and Let Binding Tests (December 2024)
-
-### Conditional Expression Edge Cases Added
-
-Added 6 tests for conditional expression patterns:
-
-1. **CondTrueBranchOnly**: True branch evaluated when condition is true
-2. **CondFalseBranchOnly**: False branch evaluated when condition is false
-3. **CondWithLetInBranches**: Let expressions inside conditional branches
-4. **CondWithLambdaInBranches**: Lambda application in branches
-5. **CondNestedDeeply**: Three levels of nested conditionals
-6. **CondAsArgument**: Conditional as function argument
-
-### Let Binding Interaction Tests Added
-
-Added 6 tests for let binding patterns:
-
-1. **LetBindingOrder**: Later bindings reference earlier ones
-2. **LetWithUnusedBindings**: Unused bindings don't affect result
-3. **LetNestedWithSameNames**: Inner let reuses outer name via intermediate
-4. **LetBindingInCondition**: Binding used in if condition
-5. **LetBindingWithLambda**: Lambda stored in let binding (single use)
-6. **LetBindingComplexExpression**: Complex expression as binding value
-
-### Test Results
-
-All 190 HVM4 tests pass:
-```
-[  PASSED  ] 190 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 159 tests
-
-## Session 12: Integration Tests (December 2024)
-
-### Integration Tests Added
-
-Added 8 integration tests combining multiple features in realistic patterns:
-
-1. **IntegrationAbsFunction**: Conditional with value check pattern
-2. **IntegrationMaxFunction**: Direct curried function with nested conditionals
-3. **IntegrationComputeWithBindings**: Multiple let bindings with computation
-4. **IntegrationNestedFunctions**: Nested function application (addOne (double 5))
-5. **IntegrationConditionalChain**: Chain of else-if conditionals
-6. **IntegrationBooleanLogicComplex**: Complex && and || with let bindings
-7. **IntegrationCurriedApplication**: Three-argument curried function
-8. **IntegrationCompositeComputation**: Multi-step computation with conditionals
-
-### Test Results
-
-All 198 HVM4 tests pass:
-```
-[  PASSED  ] 198 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 167 tests
-
-### Test Coverage Summary
-
-The HVM4 backend now has comprehensive test coverage across:
-- **Runtime tests (21)**: Term construction, heap allocation, basic evaluation
-- **BigInt tests (10)**: Integer encoding/decoding, roundtrips
-- **Backend tests (167)**: Full integration from parsing to evaluation
-
-Test categories by feature:
-- Basic operations: integers, addition, comparison
-- Boolean logic: and, or, not, conditional
-- Functions: lambdas, application, currying, closures
-- Let bindings: simple, nested, shadowing, dependencies
-- Edge cases: boundaries, precedence, stress tests
-- Negative tests: proper rejection of unsupported constructs
-
-## Session 13: Final Edge Cases (December 2024)
-
-### Final Edge Case Tests Added
-
-Added 6 final edge case tests for completeness:
-
-1. **FinalSingleIntegerLiteral**: Simplest possible expression `1`
-2. **FinalNestedParenthesesDeep**: Seven levels of parentheses
-3. **FinalEqualitySameExpression**: `(1 + 2) == (2 + 1)` both sides compute to same
-4. **FinalInequalityDifferentValues**: `1 != 2` returns true
-5. **FinalConditionalWithComputedCondition**: `if (1 + 1) == 2 then ...`
-6. **FinalLetWithAllFeatures**: Comprehensive let with bindings, closure, and application
-
-### Final Test Results
-
-All 204 HVM4 tests pass:
-```
-[  PASSED  ] 204 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 21 tests
-- HVM4BigIntTest: 10 tests
-- HVM4BackendTest: 173 tests
-
-### Implementation Complete
-
-The HVM4 backend implementation is now complete with:
-- Full compiler from Nix AST to HVM4 terms
-- Two-pass compilation with usage counting and DUP insertion
-- Comprehensive test suite covering all supported constructs
-- Proper rejection of unsupported Nix features
-
-## Session 14: Refinement Tests (December 2024)
-
-### Additional Tests Added
-
-Added 24 refinement tests covering additional edge cases and combinations:
-
-**BigInt Boundary Tests (4 tests)**:
-1. **BoundaryJustAboveInt32Max**: Value at INT32_MAX + 1
-2. **BoundaryJustBelowInt32Min**: Value at INT32_MIN - 1
-3. **PowerOfTwoBoundaries**: 2^31, 2^32, 2^40, 2^50, 2^62
-4. **NegativePowerOfTwoBoundaries**: -2^31, -2^32, -2^40, -2^50
-
-**Runtime Operator Tests (8 tests)**:
-1. **EvalDivision**: Integer division (20 / 4 = 5)
-2. **EvalModulo**: Modulo operation (17 % 5 = 2)
-3. **EvalBitwiseAnd**: Bitwise AND (0b1010 & 0b1100 = 0b1000)
-4. **EvalBitwiseOr**: Bitwise OR (0b1010 | 0b1100 = 0b1110)
-5. **EvalBitwiseXor**: Bitwise XOR (0b1010 ^ 0b1100 = 0b0110)
-6. **EvalGreaterOrEqual**: Comparison (5 >= 5)
-7. **EvalLessOrEqual**: Comparison (3 <= 5)
-8. **EvalGreaterThan**: Comparison (7 > 3)
-
-**Backend Combination Tests (12 tests)**:
-1. **RefinementLetWithChainedAddition**: Chained addition in let binding value
-2. **RefinementNestedEqualityChecks**: Nested equality in conditional
-3. **RefinementBooleanWithComputed**: Boolean ops with computed values
-4. **RefinementDeepFunctionNesting**: 4-arity curried function
-5. **RefinementLetWithConditionalValue**: Conditional as let binding value
-6. **RefinementMultipleIndependentBindings**: Four independent bindings summed
-7. **RefinementConditionalWithFunctionResult**: Function result in condition
-8. **RefinementNotOfInequality**: !(1 != 1)
-9. **RefinementOrBothFalse**: || with both sides false
-10. **RefinementAndBothTrue**: && with both sides true
-11. **RefinementLambdaReturningConditional**: Lambda body is conditional
-12. **RefinementLambdaWithComputedBody**: Computed expression in lambda
-
-### Test Results
-
-All 228 HVM4 tests pass:
-```
-[  PASSED  ] 228 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 29 tests (+8 new runtime operator tests)
-- HVM4BigIntTest: 14 tests (+4 new boundary tests)
-- HVM4BackendTest: 185 tests (+12 new combination tests)
-
-## Session 15: Additional Refinement Tests (December 2024)
-
-### Tests Added
-
-Added 18 additional refinement tests:
-
-**Zero Edge Cases (3 tests)**:
-1. **Session15ZeroChain**: Addition chain of all zeros
-2. **Session15ZeroAsArgument**: Zero passed to multi-use lambda
-3. **Session15ZeroInConditional**: Zero in equality comparison
-
-**Nested Boolean Operations (3 tests)**:
-1. **Session15TripleAnd**: Three-way AND chain
-2. **Session15TripleOr**: Three-way OR chain
-3. **Session15MixedBooleanWithParens**: Complex AND/OR with grouping
-
-**Complex Lambda Patterns (4 tests)**:
-1. **Session15AllParametersUsed**: Three-arg function using all parameters
-2. **Session15IgnoredParameters**: Function ignoring first and last parameters
-3. **Session15FirstParameter**: Projection to first of three
-4. **Session15LastParameter**: Projection to last of three
-
-**Nested Let Computation (2 tests)**:
-1. **Session15LetMultipleRefs**: Multiple bindings each used twice
-2. **Session15LetConditionalBinding**: Conditionals as let binding values
-
-**Runtime Edge Cases (6 tests)**:
-1. **Session15EvalEqualityZero**: Zero equality test
-2. **Session15EvalInequalityDiff**: Inequality of distinct values
-3. **Session15EvalAddLarge**: Addition of large values
-4. **Session15EvalSubToZero**: Subtraction resulting in zero
-5. **Session15EvalMulByOne**: Multiplication identity
-6. **Session15EvalMulByZero**: Multiplication by zero
-
-### Test Results
-
-All 246 HVM4 tests pass:
-```
-[  PASSED  ] 246 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 35 tests (+6 new)
-- HVM4BigIntTest: 14 tests
-- HVM4BackendTest: 197 tests (+12 new)
-
-## Session 16: Complex Expression Tests (December 2024)
-
-### Tests Added
-
-Added 15 complex expression tests:
-
-**Conditional Chains (3 tests)**:
-1. **Session16NestedCondArith**: Nested conditionals with arithmetic in branches
-2. **Session16CondWithBoolOps**: Conditional with && in condition
-3. **Session16CondWithNegation**: Conditional with ! in condition
-
-**Deep Structure Tests (2 tests)**:
-1. **Session16SixNestedLets**: Six levels of nested let expressions
-2. **Session16FiveArityCurried**: Five-parameter curried function
-
-**Equality Edge Cases (3 tests)**:
-1. **Session16EqualComputedBothSides**: Computed values on both sides of ==
-2. **Session16InequalComputedBothSides**: Computed values on both sides of !=
-3. **Session16EqualityInLetBinding**: Equality result stored in let binding
-
-**Lambda Parameter Patterns (2 tests)**:
-1. **Session16LambdaParamInComparison**: Parameter used in == comparison
-2. **Session16LambdaParamInBoolExpr**: Parameter used in || expression
-
-**Addition Patterns (2 tests)**:
-1. **Session16LargeAdditionResult**: Large values in addition chain
-2. **Session16AdditionInBothBranches**: Addition in both if branches
-
-**Runtime Additional Tests (3 tests)**:
-1. **Session16ChainedOps**: Chained arithmetic operations
-2. **Session16ComparisonChain**: Comparison result used in equality
-3. **Session16DivisionRemainder**: Division and modulo operations
-
-### Test Results
-
-All 261 HVM4 tests pass:
-```
-[  PASSED  ] 261 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 38 tests (+3 new)
-- HVM4BigIntTest: 14 tests
-- HVM4BackendTest: 209 tests (+12 new)
-
-## Session 17: Final Edge Cases (December 2024)
-
-### Tests Added
-
-Added 10 final edge case tests:
-
-**Comprehensive Integration Tests (2 tests)**:
-1. **Session17FullIntegration**: Complete expression with let, lambda, conditional, boolean ops
-2. **Session17DeepBooleanNesting**: Four-level negation nesting
-
-**Specific Value Tests (2 tests)**:
-1. **Session17MaxInt32InExpr**: Maximum 32-bit value (2147483647)
-2. **Session17LargeComputedValue**: Addition resulting in 2 billion
-
-**Identity and Constant Functions (2 tests)**:
-1. **Session17KCombinator**: K combinator (x: y: x) returning first argument
-2. **Session17KICombinator**: KI combinator (x: y: y) returning second argument
-
-**Short-Circuit Evaluation (2 tests)**:
-1. **Session17AndShortCircuit**: AND with false first operand
-2. **Session17OrShortCircuit**: OR with true first operand
-
-**Expression Position Tests (2 tests)**:
-1. **Session17LambdaInCondResult**: Lambda returned from conditional then applied
-2. **Session17CondAsLambdaBody**: Conditional inside lambda body
-
-### Test Results
-
-All 271 HVM4 tests pass:
-```
-[  PASSED  ] 271 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 38 tests
-- HVM4BigIntTest: 14 tests
-- HVM4BackendTest: 219 tests (+10 new)
-
-### Total Test Coverage Summary
-
-The HVM4 backend now has 271 comprehensive tests covering:
-- **Runtime (38)**: Term construction, evaluation, operators
-- **BigInt (14)**: 64-bit integer encoding/decoding
-- **Backend (219)**: Full Nix-to-HVM4 compilation and evaluation
-
-## Session 18: Documentation and Completeness (December 2024)
-
-### Documentation Improvements
-
-Updated test file header with comprehensive documentation including:
-- Build instructions for enabling HVM4
-- Complete test category breakdown
-- Supported Nix expressions list
-- Known limitations documentation
-- Test coverage summary by feature
-
-### Tests Added
-
-Added 8 final completeness tests:
-
-**Core Functionality Verification (5 tests)**:
-1. **Session18SimpleInteger**: Simplest integer (0)
-2. **Session18SimpleAddition**: Simplest addition (0 + 0)
-3. **Session18SimpleLambda**: Simplest lambda ((x: x) 1)
-4. **Session18SimpleLet**: Simplest let (let x = 1; in x)
-5. **Session18SimpleConditional**: Simplest conditional
-
-**Final Edge Cases (3 tests)**:
-1. **Session18JustBoundValue**: Let binding returned directly
-2. **Session18FalseBranchTaken**: Conditional false branch
-3. **Session18DoubleApplication**: Higher-order function application
-
-### Test Results
-
-All 279 HVM4 tests pass:
-```
-[  PASSED  ] 279 tests.
-```
-
-Test categories:
-- HVM4RuntimeTest: 38 tests
-- HVM4BigIntTest: 14 tests
-- HVM4BackendTest: 227 tests (+8 new)
-
-### Final Test Coverage
-
-The HVM4 backend test suite is now complete with 279 tests providing comprehensive coverage of:
-- All supported Nix expression types
-- Edge cases and boundary conditions
-- Error handling and rejection of unsupported features
-- Integration of multiple features in complex expressions
-
-## Future Extensions
-
-Once the minimal prototype works:
-
-1. **Lists**: Encode as `#Nil{}` / `#Cons{head, tail}`
-2. **Strings**: Encode as list of char codes or packed chunks
-3. **Attribute sets**: Encode as sorted list of `#Attr{name, value}`
-4. **More arithmetic**: Implement `-`, `*`, `/` by compiling primop calls
-5. **Parallelism**: Leverage HVM4's parallel reduction model
-6. **Recursive let**: Needs Y-combinator or similar encoding
-7. **Closures**: Proper closure conversion for lambdas capturing free variables
+## Current Status (2025-12-28)
+
+This section reflects the current tree (see `src/libexpr/hvm4/STATUS.md`).
+
+### Core Infrastructure
+- Runtime wrapper, compiler, result extractor, and backend integration: **DONE**
+- Build system integration (meson feature flag + headers): **DONE**
+- HVM4 runtime integration now relies on upstream `eval_normalize` / `eval_collapse` (see Part 2 updates)
+
+### Data Encodings (DONE)
+- Integers (32-bit NUM) + 64-bit BigInt constructors
+- Floats (encoding/decoding only)
+- Strings (`#Str`, `#SCat`, `#SNum`)
+- Lists (`#Lst{len, spine}`)
+- Attrsets (`#Ats{spine}` + `#Atr{key,val}`)
+- Paths (`#Pth{accessor_id, path_string_id}`)
+
+### Implemented Language Features
+- **Literals**: int, float, string, path, null, booleans
+- **Arithmetic**: `+ - * /` (integer only), BigInt comparisons via MAT
+- **Comparison**: `< <= > >= == !=` (integer / structural; float falls back)
+- **Boolean**: `&& || !` and implication
+- **Control**: if-then-else, assert
+- **Bindings**: non-recursive let, acyclic `rec`, basic `with` (nested outer lookup still limited)
+- **Functions**: lambdas, pattern lambdas, defaults, ellipsis, @-patterns, closures, currying
+- **Lists**: literals, `++` (currently literal-literal only)
+- **Strings**: literals, constant concat, basic interpolation (non-`toString`)
+- **Attrs**: literals, select, `?`, `//`, inherit, inherit-from, acyclic `rec`
+
+### Tests
+- HVM4 test suite is extensive under `src/libexpr-tests/hvm4/`.
+- Test counts change; see `src/libexpr/hvm4/STATUS.md` for current notes.
+
+## Things to Go Back and Fix / Change
+
+### Semantics / Correctness
+- Preserve laziness when returning lists/attrs to Nix (avoid forcing all elements/values at extraction).
+- Replace ERA-as-null with explicit `#Err{}` propagation and proper `EvalError` conversion.
+- Implement full nested `with` chain lookup (outer scope fallback + correct DUP counting).
+- Add cyclic `rec` support (SCC/Y-combinator) and allow `inherit-from` to see rec bindings.
+- Support dynamic attributes and dynamic attribute paths.
+
+### Feature Gaps
+- Builtins: `head`, `tail`, `length`, `map`, `filter`, `foldl'`, `attrNames`, etc.
+- Imports: static import resolution + memoization (reject/route dynamic imports to fallback).
+- Derivations: pure record construction + post-eval handling.
+- String context and path-to-string coercion.
+- Float arithmetic/comparisons.
+- BigInt arithmetic beyond 32-bit OP2.
+
+### Runtime / Interop
+- Validate wrapper behavior against recent upstream HVM4 changes (per-thread heaps, eval_normalize).
+- Decide on thread-count configuration and deterministic output strategy.
+
+### Performance / Limits
+- Division by zero handling.
+- `++` support for non-literal list operands.
+  
+## References
+
+- `src/libexpr/hvm4/STATUS.md` - source of truth for current implementation status
+- `src/libexpr/hvm4/` - HVM4 backend implementation (compiler/runtime/extractor)
+- `src/libexpr-tests/hvm4/` - HVM4 test suite
+- `hvm4/clang/` - vendored HVM4 runtime (eval_normalize, eval_collapse, wnf)
