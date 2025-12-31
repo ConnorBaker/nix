@@ -3,7 +3,10 @@
 
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/eval-error.hh"
+#include "nix/expr/eval-hash.hh"
 #include "nix/expr/eval-profiler.hh"
+#include "nix/expr/expr-hash.hh"
+#include "nix/expr/value-hash.hh"
 #include "nix/util/types.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/nixexpr.hh"
@@ -55,6 +58,22 @@ struct MountedSourceAccessor;
 namespace eval_cache {
 class EvalCache;
 }
+
+/**
+ * Reason for marking an operation as impure.
+ *
+ * Impure operations cannot be safely memoized across evaluations because
+ * they may produce different results or side effects on each invocation.
+ * This enum is used for debugging and statistics.
+ */
+enum class ImpureReason : uint8_t {
+    Trace,            ///< Console output via trace/traceVerbose
+    Warn,             ///< Console output via warn
+    Break,            ///< REPL interaction via break
+    CurrentTime,      ///< Nondeterministic builtins.currentTime
+    GetEnv,           ///< Environment-dependent builtins.getEnv
+    NonPortablePath,  ///< Raw path without content hash (filesystem-dependent)
+};
 
 /**
  * Increments a count on construction and decrements on destruction.
@@ -170,9 +189,40 @@ typedef std::
 
 typedef boost::unordered_flat_map<PosIdx, DocComment, std::hash<PosIdx>> DocCommentMap;
 
+/**
+ * Runtime environment binding values to variables.
+ *
+ * Envs form a chain via the `up` pointer, with each level containing
+ * bindings introduced by a let, lambda, or with expression.
+ *
+ * ## Memory Layout
+ *
+ * The `values` array is a C flexible array member (FAM). Memory is allocated
+ * as: sizeof(Env) + size * sizeof(Value*). The `size` field stores the
+ * number of Value* slots for use in content-based hashing.
+ *
+ * ## Potential Optimization: Pointer Bit Packing
+ *
+ * On 64-bit systems with 48-bit virtual addresses, pointers have 16 unused
+ * high bits. Similarly, aligned pointers have unused low bits. A future
+ * optimization could encode the size in these unused bits to eliminate the
+ * size field overhead:
+ *
+ *   - High bits of `up`: Could store size for small envs (e.g., 0-65535)
+ *   - Low bits of `values[0]`: Could store flags or small sizes
+ *   - Combined: Use high bits of both pointers for larger size ranges
+ *
+ * This would require careful masking on every pointer access but could
+ * save 8 bytes per env (significant for millions of envs). The current
+ * explicit size field prioritizes simplicity and debuggability.
+ *
+ * Alternatively, the maximum env size could be limited (e.g., to 2^16-1)
+ * and the size stored in a uint16_t, reducing overhead to 2 bytes + padding.
+ */
 struct Env
 {
     Env * up;
+    uint32_t size;
     Value * values[0];
 };
 
@@ -1042,6 +1092,127 @@ private:
     Counter nrListConcats;
     Counter nrPrimOpCalls;
     Counter nrFunctionCalls;
+
+    /**
+     * Thunk memoization statistics.
+     *
+     * When a thunk is forced, we compute its structural hash and check if we've
+     * already evaluated a thunk with the same hash. If so, we reuse the cached result.
+     *
+     * The structural hash uses content-based env hashing (via env.size field), making
+     * it stable within and across evaluations. For cross-evaluation persistent caching,
+     * additional portability checks are required.
+     */
+    Counter nrThunkMemoHits;
+    Counter nrThunkMemoMisses;
+    Counter nrThunkMemoImpureSkips;
+    Counter nrThunkMemoLazySkips;  // Values containing unevaluated thunks
+    Counter nrThunkMemoStaleHits;  // Cache entries from previous GC cycles
+
+    /**
+     * Impure operation counter for memoization safety.
+     *
+     * This counter is incremented by impure builtins (trace, warn, break, etc.)
+     * before they perform their side effect. When forcing a thunk:
+     * 1. Save the current token value
+     * 2. Force the thunk
+     * 3. If token changed, skip caching (thunk contained impure operations)
+     *
+     * This prevents incorrect memoization of side-effectful expressions like:
+     *   let x = trace "msg" 42; in x + x  -- should print twice, not once
+     *
+     * Use markImpure() to increment this counter with a reason for debugging.
+     */
+    uint64_t impureTokenCounter_ = 0;
+
+public:
+    /**
+     * Mark the current evaluation as impure, preventing thunk memoization.
+     *
+     * Call this in primops that have side effects (trace, warn, break) or
+     * that produce nondeterministic results (currentTime, getEnv).
+     *
+     * @param reason The type of impurity, for debugging/statistics
+     */
+    void markImpure(ImpureReason reason)
+    {
+        (void) reason; // Currently unused, but available for debugging
+        impureTokenCounter_++;
+    }
+
+    /**
+     * Get the current impure token value (for save/compare in forceValue).
+     */
+    uint64_t getImpureToken() const
+    {
+        return impureTokenCounter_;
+    }
+
+private:
+
+    /**
+     * Thunk memoization cache entry.
+     *
+     * Stores both the cached value and the GC cycle count at insertion time.
+     * This enables GC-safe memoization: entries become stale after GC runs
+     * because Value* pointers may be reused for different objects.
+     */
+    struct ThunkMemoCacheEntry {
+        Value * value;
+        size_t gcCycle;  // GC cycle count when this entry was created
+    };
+
+    /**
+     * Thunk result cache: maps thunk structural hash to forced value.
+     *
+     * This enables within-evaluation memoization: when the same thunk (by hash)
+     * is forced multiple times, we return the cached result instead of re-evaluating.
+     *
+     * Key: StructuralHash computed from (exprHash, envHash, tryLevel)
+     * Value: Cached result + GC cycle count for staleness detection
+     *
+     * GC Safety: Each entry stores the GC cycle count at insertion time.
+     * On lookup, we verify the current GC cycle matches - if not, the entry
+     * is stale because Value* pointers may have been reused by GC.
+     *
+     * Thread Safety: Uses concurrent_flat_map for lock-free concurrent access.
+     * Multiple threads can safely lookup and insert entries simultaneously.
+     *
+     * Note: Results from thunks that called impure builtins are NOT cached.
+     */
+    ref<boost::concurrent_flat_map<StructuralHash, ThunkMemoCacheEntry>> thunkMemoCache;
+
+    /**
+     * Expression content hash cache.
+     *
+     * Since expressions are immutable after parsing, their content hashes
+     * can be cached by pointer. This dramatically speeds up thunk hash
+     * computation by avoiding redundant expression tree walks.
+     */
+    ExprHashCache exprHashCache;
+
+    /**
+     * Value content hash cache.
+     *
+     * Values can be cached by pointer because:
+     * - Forced values are immutable (their content never changes)
+     * - Thunk/lambda values hash their (expr, env) which is stable
+     *
+     * This dramatically speeds up env hashing by avoiding redundant
+     * value tree walks.
+     */
+    ValueHashCache valueHashCache;
+
+    /**
+     * DEBUG: Track which (Expr*, Env*) pairs produced which hash.
+     * Used to detect hash collisions (same hash, different pointers).
+     */
+    struct ThunkKey {
+        const Expr * expr;
+        const Env * env;
+        bool operator==(const ThunkKey &) const = default;
+    };
+    boost::unordered_flat_map<StructuralHash, ThunkKey> thunkHashDebugMap;
 
     bool countCalls;
 

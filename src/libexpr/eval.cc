@@ -304,6 +304,7 @@ EvalState::EvalState(
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
     , regexCache(makeRegexCache())
+    , thunkMemoCache(make_ref<decltype(thunkMemoCache)::element_type>())
 #if NIX_USE_BOEHMGC
     , baseEnvP(std::allocate_shared<Env *>(traceable_allocator<Env *>(), &mem.allocEnv(BASE_ENV_SIZE)))
     , baseEnv(**baseEnvP)
@@ -3022,6 +3023,23 @@ void EvalState::printStatistics()
     topObj["nrLookups"] = nrLookups.load();
     topObj["nrPrimOpCalls"] = nrPrimOpCalls.load();
     topObj["nrFunctionCalls"] = nrFunctionCalls.load();
+    // Thunk memoization statistics
+    // Prerequisites for safe memoization (all complete):
+    //   1. Content-based env hashing (env.size field)
+    //   2. Impure token tracking (trace/warn/break increment counter)
+    //   3. valueContainsThunks check to prevent caching lazy structures
+    topObj["thunkMemo"] = {
+        {"enabled", true},  // ENABLED - with valueContainsThunks fix
+        {"hits", nrThunkMemoHits.load()},
+        {"misses", nrThunkMemoMisses.load()},
+        {"impureSkips", nrThunkMemoImpureSkips.load()},
+        {"lazySkips", nrThunkMemoLazySkips.load()},
+        {"staleHits", nrThunkMemoStaleHits.load()},
+        {"cacheSize", thunkMemoCache->size()},
+        {"hitRate", nrThunkMemoHits.load() + nrThunkMemoMisses.load() > 0
+            ? static_cast<double>(nrThunkMemoHits.load()) / (nrThunkMemoHits.load() + nrThunkMemoMisses.load())
+            : 0.0},
+    };
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {
         {"heapSize", heapSize},
