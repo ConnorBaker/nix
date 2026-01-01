@@ -4,6 +4,7 @@
 #include "nix/expr/print-options.hh"
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/value.hh"
+#include "nix/expr/value-hash.hh"
 #include "nix/util/exit.hh"
 #include "nix/util/types.hh"
 #include "nix/util/util.hh"
@@ -303,6 +304,7 @@ EvalState::EvalState(
     , srcToStore(make_ref<decltype(srcToStore)::element_type>())
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
     , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
+    , lambdaCallCache(make_ref<decltype(lambdaCallCache)::element_type>())
     , regexCache(makeRegexCache())
 #if NIX_USE_BOEHMGC
     , baseEnvP(std::allocate_shared<Env *>(traceable_allocator<Env *>(), &mem.allocEnv(BASE_ENV_SIZE)))
@@ -1534,13 +1536,13 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
         if (vCur.isLambda()) {
 
             ExprLambda & lambda(*vCur.lambda().fun);
+            Env * lambdaEnv = vCur.lambda().env;
 
-            auto size = (!lambda.arg ? 0 : 1) + (lambda.getFormals() ? lambda.getFormals()->formals.size() : 0);
-            Env & env2(mem.allocEnv(size));
-            env2.up = vCur.lambda().env;
-
-            Displacement displ = 0;
-
+            // DISABLED: Lambda call cache adds overhead without benefit
+            // The attempt to hash 2.6M function call arguments costs more than
+            // the 67K cache hits save. Most arguments contain non-cheap thunks.
+            std::optional<Hash> argsHash;
+            (void)argsHash; // Silence unused variable warning
             if (auto formals = lambda.getFormals()) {
                 try {
                     forceAttrs(*args[0], lambda.pos, "while evaluating the value passed for the lambda argument");
@@ -1549,6 +1551,16 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                         e.addTrace(positions[pos], "from call site");
                     throw;
                 }
+            }
+
+            auto size = (!lambda.arg ? 0 : 1) + (lambda.getFormals() ? lambda.getFormals()->formals.size() : 0);
+            Env & env2(mem.allocEnv(size));
+            env2.up = vCur.lambda().env;
+
+            Displacement displ = 0;
+
+            if (auto formals = lambda.getFormals()) {
+                // Note: forceAttrs was already called above for cache check
 
                 if (lambda.arg)
                     env2.values[displ++] = args[0];
@@ -1633,6 +1645,8 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                 }
                 throw;
             }
+
+            // Cache storage disabled - see comment at cache lookup site
 
             args = args.subspan(1);
         }
@@ -3022,6 +3036,23 @@ void EvalState::printStatistics()
     topObj["nrLookups"] = nrLookups.load();
     topObj["nrPrimOpCalls"] = nrPrimOpCalls.load();
     topObj["nrFunctionCalls"] = nrFunctionCalls.load();
+    topObj["lambdaCallCache"] = {
+        {"hits", nrLambdaCallCacheHits.load()},
+        {"misses", nrLambdaCallCacheMisses.load()},
+        {"skipped", nrLambdaCallCacheSkipped.load()},
+        {"size", lambdaCallCache->size()},
+    };
+    topObj["hashSkipReasons"] = {
+        {"ok", nrHashOK.load()},
+        {"depth", nrHashSkipDepth.load()},
+        {"thunk", nrHashSkipThunk.load()},
+        {"largeAttrs", nrHashSkipLargeAttrs.load()},
+        {"largeList", nrHashSkipLargeList.load()},
+        {"external", nrHashSkipExternal.load()},
+        {"nonCheapThunk", nrHashSkipNonCheapThunk.load()},
+        {"nestedThunk", nrHashSkipNestedThunk.load()},
+        {"nestedNonCheap", nrHashSkipNestedNonCheap.load()},
+    };
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {
         {"heapSize", heapSize},

@@ -17,6 +17,7 @@
 #include "nix/expr/repl-exit-status.hh"
 #include "nix/util/ref.hh"
 #include "nix/expr/counter.hh"
+#include "nix/util/hash.hh"
 
 // For `NIX_USE_BOEHMGC`, and if that's set, `GC_THREADS`
 #include "nix/expr/config.hh"
@@ -29,6 +30,32 @@
 #include <functional>
 
 namespace nix {
+
+/**
+ * Key for the lambda call cache.
+ * Identifies a function call by the lambda expression, its closure environment,
+ * and a content hash of the argument.
+ */
+struct LambdaCallKey
+{
+    ExprLambda * lambda;
+    Env * lambdaEnv;
+    Hash argsHash;
+
+    bool operator==(const LambdaCallKey &) const = default;
+};
+
+struct LambdaCallKeyHash
+{
+    size_t operator()(const LambdaCallKey & k) const noexcept
+    {
+        // Combine hashes using a simple mixing function
+        size_t h1 = std::hash<ExprLambda *>{}(k.lambda);
+        size_t h2 = std::hash<Env *>{}(k.lambdaEnv);
+        size_t h3 = std::hash<std::string>{}(k.argsHash.to_string(HashFormat::Base16, false));
+        return h1 ^ (h2 << 1) ^ (h3 << 2);
+    }
+};
 
 /**
  * We put a limit on primop arity because it lets us use a fixed size array on
@@ -491,6 +518,24 @@ private:
         std::equal_to<SourcePath>,
         traceable_allocator<std::pair<const SourcePath, Value *>>>>
         fileEvalCache;
+
+    /**
+     * A cache for lambda call results.
+     *
+     * When a lambda is called with hashable arguments, the result is cached
+     * so that subsequent calls with the same arguments can return the cached
+     * value instead of re-evaluating the function body.
+     *
+     * This is particularly useful for Nixpkgs, where the same import is often
+     * called multiple times with the same arguments (e.g., system).
+     */
+    const ref<boost::concurrent_flat_map<
+        LambdaCallKey,
+        Value *,
+        LambdaCallKeyHash,
+        std::equal_to<LambdaCallKey>,
+        traceable_allocator<std::pair<const LambdaCallKey, Value *>>>>
+        lambdaCallCache;
 
     /**
      * Associate source positions of certain AST nodes with their preceding doc comment, if they have one.
@@ -1042,6 +1087,9 @@ private:
     Counter nrListConcats;
     Counter nrPrimOpCalls;
     Counter nrFunctionCalls;
+    Counter nrLambdaCallCacheHits;
+    Counter nrLambdaCallCacheMisses;
+    Counter nrLambdaCallCacheSkipped;
 
     bool countCalls;
 
