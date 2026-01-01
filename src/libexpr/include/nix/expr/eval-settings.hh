@@ -361,6 +361,49 @@ struct EvalSettings : Config
           The default value is chosen to balance performance and memory usage. On 32 bit systems
           where memory is scarce, the default is a large value to reduce the amount of allocations.
     )"};
+
+    Setting<bool> thunkMemoization{
+        this,
+        false,
+        "thunk-memoization",
+        R"(
+          **This setting is deprecated and has no effect.**
+
+          Research (December 2024) conclusively demonstrated that thunk-level
+          memoization provides no benefit for Nix evaluation:
+
+          **Benchmark: `nixos/release.nix` closures (16 NixOS system configurations)**
+
+          | Approach | Hit Rate | Overhead |
+          |----------|----------|----------|
+          | L0 Identity Cache (pointer-based) | 0% | +28% CPU, +880MB RAM |
+          | L1 Content Hash (structural) | N/A | ~10x hash overhead |
+          | File Cache (existing) | 96% | Already implemented |
+
+          **Why thunk memoization doesn't work in Nix:**
+
+          1. **Fresh environment per scope**: Nix allocates a new `Env*` for each
+             `let`, lambda call, `rec`, and `with` block. Even identical expressions
+             have unique `(expr*, env*)` pairs, making identity-based caching useless.
+
+          2. **Mutable thunk forcing**: Thunks overwrite themselves in-place when
+             evaluated (blackhole mechanism). This is Nix's primary memoization
+             mechanism - multiple references to a binding share one thunk.
+
+          3. **Content hashing too expensive**: Computing structural hashes of
+             expressions and environments costs ~10x more than just evaluating.
+
+          4. **File caching already works**: The existing `fileEvalCache` achieves
+             96% hit rate, which is the correct granularity for memoization.
+
+          The `maybeThunk` optimization already avoids 84% of thunk allocations
+          for trivially-evaluating expressions (variables, lambdas, etc.).
+
+          For future optimization, focus on:
+          - Persistent cross-evaluation file caching
+          - Parallel file evaluation
+          - Profile-guided optimization of actual bottlenecks
+    )"};
 };
 
 /**

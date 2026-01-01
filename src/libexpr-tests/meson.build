@@ -50,7 +50,6 @@ sources = files(
   'derived-path.cc',
   'error_traces.cc',
   'eval.cc',
-  'hash.cc',
   'json.cc',
   'main.cc',
   'nix_api_expr.cc',

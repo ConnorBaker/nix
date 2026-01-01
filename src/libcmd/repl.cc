@@ -460,9 +460,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
     }
 
     else if (command == ":a" || command == ":add") {
-        // Heap-allocate to avoid stack-use-after-return when
-        // addAttrsToScope stores pointers into env->values.
-        Value & v = *state->allocValue();
+        Value v;
         evalString(arg, v);
         addAttrsToScope(v);
     }
@@ -719,10 +717,7 @@ void NixRepl::loadFile(const std::filesystem::path & path)
 {
     loadedFiles.remove(path);
     loadedFiles.push_back(path);
-    // Heap-allocate to avoid stack-use-after-return when
-    // addAttrsToScope stores pointers into env->values.
-    Value & v = *state->allocValue();
-    Value & v2 = *state->allocValue();
+    Value v, v2;
     state->evalFile(lookupFileArg(*state, path.string()), v);
     state->autoCallFunction(*autoArgs, v, v2);
     addAttrsToScope(v2);
@@ -747,9 +742,7 @@ void NixRepl::loadFlake(const std::string & flakeRefS)
     if (evalSettings.pureEval && !flakeRef.input.isLocked(fetchSettings))
         throw Error("cannot use ':load-flake' on unlocked flake reference '%s' (use --impure to override)", flakeRefS);
 
-    // Heap-allocate to avoid stack-use-after-return when
-    // addAttrsToScope stores pointers into env->values.
-    Value & v = *state->allocValue();
+    Value v;
 
     flake::callFlake(
         *state,

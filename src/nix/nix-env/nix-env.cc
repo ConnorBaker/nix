@@ -394,15 +394,12 @@ static void queryInstSources(
        (import ./foo.nix)' = `(import ./foo.nix).bar'. */
     case srcNixExprs: {
 
-        // Heap-allocate Values to avoid stack-use-after-return when
-        // mkApp stores pointers that may be accessed after this scope ends.
-        Value & vArg = *state.allocValue();
+        Value vArg;
         loadSourceExpr(state, *instSource.nixExprPath, vArg);
 
         for (auto & i : args) {
             Expr * eFun = state.parseExprFromString(i, state.rootPath("."));
-            Value & vFun = *state.allocValue();
-            Value & vTmp = *state.allocValue();
+            Value vFun, vTmp;
             state.eval(eFun, vFun);
             vTmp.mkApp(&vFun, &vArg);
             getDerivations(state, vTmp, "", *instSource.autoArgs, elems, true);

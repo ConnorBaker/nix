@@ -180,38 +180,6 @@ static SourcePath realisePath(
 }
 
 /**
- * Check if a path is content-addressed (stable for caching).
- *
- * A path is content-addressed if:
- * - It's a store path (/nix/store/...)
- * - OR it has a SourceAccessor that provides a fingerprint
- *
- * If the path is NOT content-addressed, this marks the evaluation as impure
- * to prevent incorrect memoization of filesystem-dependent operations.
- *
- * @param state The evaluation state
- * @param path The path to check
- * @return true if the path is content-addressed, false otherwise
- */
-static bool checkPathContentAddressed(EvalState & state, const SourcePath & path)
-{
-    // Store paths are content-addressed by definition
-    if (state.store->isInStore(path.path.abs())) {
-        return true;
-    }
-
-    // Check if the accessor has a fingerprint for this path
-    auto [_, fingerprint] = path.accessor->getFingerprint(path.path);
-    if (fingerprint.has_value()) {
-        return true;
-    }
-
-    // Path is not content-addressed - mark as impure
-    state.markImpure(ImpureReason::NonPortablePath);
-    return false;
-}
-
-/**
  * Add and attribute to the given attribute map from the output name to
  * the output path, or a placeholder.
  *
@@ -998,9 +966,7 @@ static RegisterPrimOp primop_break(
       Otherwise, return the argument `v`.
     )",
      .fun = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
-         // Mark as impure to prevent memoization (REPL interaction is a side effect)
          if (state.canDebug()) {
-             state.markImpure(ImpureReason::Break);
              auto error = Error(
                  ErrorInfo{
                      .level = lvlInfo,
@@ -1251,11 +1217,6 @@ static void prim_getEnv(EvalState & state, const PosIdx pos, Value ** args, Valu
 {
     std::string name(
         state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.getEnv"));
-    // In impure mode (neither pureEval nor restrictEval), getEnv reads from the environment
-    // which may differ across machines/sessions - mark as impure to prevent incorrect memoization
-    if (!state.settings.restrictEval && !state.settings.pureEval) {
-        state.markImpure(ImpureReason::GetEnv);
-    }
     v.mkString(state.settings.restrictEval || state.settings.pureEval ? "" : getEnv(name).value_or(""), state.mem);
 }
 
@@ -1318,10 +1279,6 @@ static RegisterPrimOp primop_deepSeq({
    return the second expression.  Useful for debugging. */
 static void prim_trace(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    // Mark as impure BEFORE the side effect to prevent memoization
-    // of expressions containing trace calls
-    state.markImpure(ImpureReason::Trace);
-
     state.forceValue(*args[0], pos);
     if (args[0]->type() == nString)
         printError("trace: %1%", args[0]->string_view());
@@ -1353,10 +1310,6 @@ static RegisterPrimOp primop_trace({
 
 static void prim_warn(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    // Mark as impure BEFORE the side effect to prevent memoization
-    // of expressions containing warn calls
-    state.markImpure(ImpureReason::Warn);
-
     // We only accept a string argument for now. The use case for pretty printing a value is covered by `trace`.
     // By rejecting non-strings we allow future versions to add more features without breaking existing code.
     auto msgStr =
@@ -2019,8 +1972,6 @@ static void prim_pathExists(EvalState & state, const PosIdx pos, Value ** args, 
 
         auto symlinkResolution = mustBeDir ? SymlinkResolution::Full : SymlinkResolution::Ancestors;
         auto path = realisePath(state, pos, arg, symlinkResolution);
-        // Mark as impure if path is not content-addressed (prevents incorrect memoization)
-        checkPathContentAddressed(state, path);
 
         auto st = path.maybeLstat();
         auto exists = st && (!mustBeDir || st->type == SourceAccessor::tDirectory);
@@ -2128,8 +2079,6 @@ static RegisterPrimOp primop_dirOf({
 static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto path = realisePath(state, pos, *args[0]);
-    // Mark as impure if path is not content-addressed (prevents incorrect memoization)
-    checkPathContentAddressed(state, path);
     auto s = path.readFile();
     if (s.find((char) 0) != std::string::npos)
         state.error<EvalError>("the contents of the file '%1%' cannot be represented as a Nix string", path)
@@ -2417,8 +2366,6 @@ static const Value & fileTypeToString(EvalState & state, SourceAccessor::Type ty
 static void prim_readFileType(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto path = realisePath(state, pos, *args[0], std::nullopt);
-    // Mark as impure if path is not content-addressed (prevents incorrect memoization)
-    checkPathContentAddressed(state, path);
     /* Retrieve the directory entry type and stringize it. */
     v = fileTypeToString(state, path.lstat().type);
 }
@@ -2437,8 +2384,6 @@ static RegisterPrimOp primop_readFileType({
 static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto path = realisePath(state, pos, *args[0]);
-    // Mark as impure if path is not content-addressed (prevents incorrect memoization)
-    checkPathContentAddressed(state, path);
 
     // Retrieve directory entries for all nodes in a directory.
     // This is similar to `getFileType` but is optimized to reduce system calls
@@ -4680,16 +4625,8 @@ static void prim_convertHash(EvalState & state, const PosIdx pos, Value ** args,
 
     auto iteratorToHashFormat = state.getAttr(
         state.symbols.create("toHashFormat"), args[0]->attrs(), "while locating the attribute 'toHashFormat'");
-    auto toHashFormatStr =
-        state.forceStringNoCtx(*iteratorToHashFormat->value, pos, "while evaluating the attribute 'toHashFormat'");
-
-    // Mark as impure if using deprecated "base32" format, since parseHashFormat
-    // will emit a deprecation warning (side effect that should not be memoized)
-    if (toHashFormatStr == "base32") {
-        state.markImpure(ImpureReason::Warn);
-    }
-
-    HashFormat hf = parseHashFormat(toHashFormatStr);
+    HashFormat hf = parseHashFormat(
+        state.forceStringNoCtx(*iteratorToHashFormat->value, pos, "while evaluating the attribute 'toHashFormat'"));
 
     v.mkString(Hash::parseAny(hash, ha).to_string(hf, hf == HashFormat::SRI), state.mem);
 }
