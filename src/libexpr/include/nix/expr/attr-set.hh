@@ -11,6 +11,8 @@
 #include <functional>
 #include <ranges>
 #include <optional>
+#include <span>
+#include <vector>
 
 namespace nix {
 
@@ -39,6 +41,14 @@ struct Attr
     {
         return name <=> a.name;
     }
+
+    /**
+     * Arrow operator for pointer-like access syntax compatibility.
+     * Allows `attr->name` as an alias for `attr.name` when attr is a value, not a pointer.
+     * This is useful for code that iterates over Attr values but was written for Attr pointers.
+     */
+    const Attr * operator->() const noexcept { return this; }
+    Attr * operator->() noexcept { return this; }
 };
 
 static_assert(
@@ -48,10 +58,12 @@ static_assert(
     "introduce new fields that need not be present for almost every instance.");
 
 /**
- * Bindings contains all the attributes of an attribute set. It is defined
- * by its size and its capacity, the capacity being the number of Attr
- * elements allocated after this structure, while the size corresponds to
- * the number of elements already inserted in this structure.
+ * Bindings contains all the attributes of an attribute set. It uses a
+ * Structure-of-Arrays (SoA) layout for better cache efficiency during
+ * iteration and lookup operations.
+ *
+ * Memory layout after header:
+ *   [names: Symbol × capacity] [padding to 8-byte align] [values: Value* × capacity] [positions: PosIdx × capacity]
  *
  * Bindings can be efficiently `//`-composed into an intrusive linked list of "layers"
  * that saves on copies and allocations. Each lookup (@see Bindings::get) traverses
@@ -74,7 +86,7 @@ public:
 
 private:
     /**
-     * Number of attributes in the attrs FAM (Flexible Array Member).
+     * Number of attributes in the SoA arrays.
      */
     size_type numAttrs = 0;
 
@@ -87,6 +99,11 @@ private:
     size_type numAttrsInChain = 0;
 
     /**
+     * Capacity of the SoA arrays. Needed to compute offsets to values and positions arrays.
+     */
+    size_type capacity_ = 0;
+
+    /**
      * Length of the layers list.
      */
     uint32_t numLayers = 1;
@@ -97,9 +114,10 @@ private:
     const Bindings * baseLayer = nullptr;
 
     /**
-     * Flexible array member of attributes.
+     * Structure-of-Arrays layout: names array is stored first (FAM),
+     * followed by values array (8-byte aligned), then positions array.
      */
-    Attr attrs[0];
+    Symbol names_[0];
 
     Bindings() = default;
     Bindings(const Bindings &) = delete;
@@ -110,11 +128,53 @@ private:
     ~Bindings() = default;
 
     friend class BindingsBuilder;
+    friend class EvalMemory;
 
     /**
      * Maximum length of the Bindings layer chains.
      */
     static constexpr unsigned maxLayers = 8;
+
+    /**
+     * SoA array accessors. The memory layout is:
+     *   [Header] [names: Symbol × capacity] [padding] [values: Value* × capacity] [positions: PosIdx × capacity]
+     */
+    Symbol * namesArray() noexcept { return names_; }
+    const Symbol * namesArray() const noexcept { return names_; }
+
+    Value ** valuesArray() noexcept
+    {
+        // Values array starts after names array, aligned to 8 bytes
+        auto namesEnd = reinterpret_cast<uintptr_t>(names_ + capacity_);
+        auto valuesStart = (namesEnd + 7) & ~uintptr_t{7};  // 8-byte align
+        return reinterpret_cast<Value **>(valuesStart);
+    }
+
+    Value * const * valuesArray() const noexcept
+    {
+        auto namesEnd = reinterpret_cast<uintptr_t>(names_ + capacity_);
+        auto valuesStart = (namesEnd + 7) & ~uintptr_t{7};
+        return reinterpret_cast<Value * const *>(valuesStart);
+    }
+
+    PosIdx * positionsArray() noexcept
+    {
+        // Positions array starts after values array
+        return reinterpret_cast<PosIdx *>(valuesArray() + capacity_);
+    }
+
+    const PosIdx * positionsArray() const noexcept
+    {
+        return reinterpret_cast<const PosIdx *>(valuesArray() + capacity_);
+    }
+
+    /**
+     * Get attribute at index as an Attr (for compatibility).
+     */
+    Attr attrAt(size_type idx) const noexcept
+    {
+        return Attr(namesArray()[idx], const_cast<Value *>(valuesArray()[idx]), positionsArray()[idx]);
+    }
 
 public:
     size_type size() const
@@ -139,17 +199,25 @@ public:
         friend class Bindings;
 
     private:
+        /**
+         * Cursor into a Bindings layer, using index-based access for SoA layout.
+         */
         struct BindingsCursor
         {
             /**
-             * Attr that the cursor currently points to.
+             * Pointer to the bindings layer this cursor iterates over.
              */
-            pointer current;
+            const Bindings * bindings;
 
             /**
-             * One past the end pointer to the contiguous buffer of Attrs.
+             * Current index into the SoA arrays.
              */
-            pointer end;
+            size_type current;
+
+            /**
+             * One past the end index.
+             */
+            size_type end;
 
             /**
              * Priority of the value. Lesser values have more priority (i.e. they override
@@ -157,14 +225,14 @@ public:
              */
             uint32_t priority;
 
-            pointer operator->() const noexcept
+            Symbol currentName() const noexcept
             {
-                return current;
+                return bindings->namesArray()[current];
             }
 
-            reference get() const noexcept
+            Attr get() const noexcept
             {
-                return *current;
+                return bindings->attrAt(current);
             }
 
             bool empty() const noexcept
@@ -179,11 +247,22 @@ public:
 
             void consume(Symbol name) noexcept
             {
-                while (!empty() && current->name <= name)
+                while (!empty() && currentName() <= name)
                     ++current;
             }
 
-            GENERATE_CMP(BindingsCursor, me->current->name, me->priority)
+            // Comparison by (name, priority) - lower priority wins for equal names
+            bool operator==(const BindingsCursor & o) const noexcept
+            {
+                return currentName() == o.currentName() && priority == o.priority;
+            }
+
+            auto operator<=>(const BindingsCursor & o) const noexcept
+            {
+                if (auto cmp = currentName() <=> o.currentName(); cmp != 0)
+                    return cmp;
+                return priority <=> o.priority;
+            }
         };
 
         using QueueStorageType = boost::container::static_vector<BindingsCursor, maxLayers>;
@@ -200,14 +279,25 @@ public:
         QueueStorageType cursorHeap;
 
         /**
-         * The attribute the iterator currently points to.
+         * Cached Attr for the current position (reconstructed from SoA on demand).
          */
-        pointer current = nullptr;
+        mutable Attr currentAttr_;
 
         /**
-         * Whether iterating over a single attribute and not a merge chain.
+         * Whether the iterator is valid (not at end).
+         */
+        bool valid_ = false;
+
+        /**
+         * Whether iterating over a single layer (no merge needed).
          */
         bool doMerge = true;
+
+        /**
+         * For non-merge iteration: current index and the bindings pointer.
+         */
+        size_type simpleIndex_ = 0;
+        const Bindings * simpleBindings_ = nullptr;
 
         void push(BindingsCursor cursor) noexcept
         {
@@ -225,25 +315,31 @@ public:
 
         iterator & finished() noexcept
         {
-            current = nullptr;
+            valid_ = false;
             return *this;
         }
 
         void next(BindingsCursor cursor) noexcept
         {
-            current = &cursor.get();
+            currentAttr_ = cursor.get();
+            valid_ = true;
             cursor.increment();
 
             if (!cursor.empty())
                 push(cursor);
         }
 
+        void updateCurrentFromSimple() noexcept
+        {
+            currentAttr_ = simpleBindings_->attrAt(simpleIndex_);
+        }
+
         std::optional<BindingsCursor> consumeAllUntilCurrentName() noexcept
         {
             auto cursor = pop();
-            Symbol lastHandledName = current->name;
+            Symbol lastHandledName = currentAttr_.name;
 
-            while (cursor->name <= lastHandledName) {
+            while (cursor.currentName() <= lastHandledName) {
                 cursor.consume(lastHandledName);
                 if (!cursor.empty())
                     push(cursor);
@@ -258,14 +354,14 @@ public:
         }
 
         explicit iterator(const Bindings & attrs) noexcept
-            : doMerge(attrs.baseLayer)
+            : doMerge(attrs.baseLayer != nullptr)
         {
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
-                auto first = layer.attrs;
                 push(
                     BindingsCursor{
-                        .current = first,
-                        .end = first + layer.numAttrs,
+                        .bindings = &layer,
+                        .current = 0,
+                        .end = layer.numAttrs,
                         .priority = priority++,
                     });
             };
@@ -274,8 +370,11 @@ public:
                 if (attrs.empty())
                     return;
 
-                current = attrs.attrs;
-                pushBindings(attrs);
+                simpleBindings_ = &attrs;
+                simpleIndex_ = 0;
+                updateCurrentFromSimple();
+                valid_ = true;
+                pushBindings(attrs);  // Still need for end detection
 
                 return;
             }
@@ -298,20 +397,21 @@ public:
 
         reference operator*() const noexcept
         {
-            return *current;
+            return currentAttr_;
         }
 
         pointer operator->() const noexcept
         {
-            return current;
+            return &currentAttr_;
         }
 
         iterator & operator++() noexcept
         {
             if (!doMerge) {
-                ++current;
-                if (current == cursorHeap.front().end)
+                ++simpleIndex_;
+                if (simpleIndex_ == cursorHeap.front().end)
                     return finished();
+                updateCurrentFromSimple();
                 return *this;
             }
 
@@ -335,7 +435,7 @@ public:
 
         bool operator==(const iterator & rhs) const noexcept
         {
-            return current == rhs.current;
+            return valid_ == rhs.valid_ && (!valid_ || currentAttr_.name == rhs.currentAttr_.name);
         }
     };
 
@@ -343,33 +443,64 @@ public:
 
     void push_back(const Attr & attr)
     {
-        attrs[numAttrs++] = attr;
+        namesArray()[numAttrs] = attr.name;
+        valuesArray()[numAttrs] = attr.value;
+        positionsArray()[numAttrs] = attr.pos;
+        ++numAttrs;
         numAttrsInChain = numAttrs;
     }
 
     /**
-     * Get attribute by name or nullptr if no such attribute exists.
+     * Result of a lookup operation. Contains index and bindings pointer
+     * to avoid reconstructing an Attr unless needed.
      */
-    const Attr * get(Symbol name) const noexcept
+    struct LookupResult
     {
-        auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
-            auto first = chunk.attrs;
+        const Bindings * bindings;
+        size_type index;
+
+        Symbol name() const noexcept { return bindings->namesArray()[index]; }
+        Value * value() const noexcept { return const_cast<Value *>(bindings->valuesArray()[index]); }
+        PosIdx pos() const noexcept { return bindings->positionsArray()[index]; }
+        Attr attr() const noexcept { return bindings->attrAt(index); }
+
+        // Compatibility: allow using as Attr*-like pointer
+        Value * operator->() const noexcept { return value(); }
+    };
+
+    /**
+     * Get attribute by name. Returns optional LookupResult for efficient access.
+     */
+    std::optional<LookupResult> find(Symbol name) const noexcept
+    {
+        auto searchLayer = [](const Bindings & chunk, Symbol key) -> std::optional<size_type> {
+            auto first = chunk.namesArray();
             auto last = first + chunk.numAttrs;
-            const Attr * i = std::lower_bound(first, last, key);
-            if (i != last && i->name == key.name)
-                return i;
-            return nullptr;
+            auto i = std::lower_bound(first, last, key);
+            if (i != last && *i == key)
+                return static_cast<size_type>(i - first);
+            return std::nullopt;
         };
 
         const Bindings * currentChunk = this;
         while (currentChunk) {
-            const Attr * maybeAttr = getInChunk(*currentChunk);
-            if (maybeAttr)
-                return maybeAttr;
+            if (auto idx = searchLayer(*currentChunk, name))
+                return LookupResult{currentChunk, *idx};
             currentChunk = currentChunk->baseLayer;
         }
 
-        return nullptr;
+        return std::nullopt;
+    }
+
+    /**
+     * Get attribute by name or nullopt if no such attribute exists.
+     * Returns Attr by value since SoA doesn't store Attr objects.
+     */
+    std::optional<Attr> get(Symbol name) const noexcept
+    {
+        if (auto result = find(name))
+            return result->attr();
+        return std::nullopt;
     }
 
     /**
@@ -398,36 +529,71 @@ public:
         return const_iterator();
     }
 
-    Attr & operator[](size_type pos)
+    /**
+     * Get attribute at position by value (SoA doesn't store Attr objects).
+     * Only valid for non-layered bindings.
+     */
+    Attr operator[](size_type idx) const
     {
         if (isLayered()) [[unlikely]]
             unreachable();
-        return attrs[pos];
+        return attrAt(idx);
     }
 
-    const Attr & operator[](size_type pos) const
+    /**
+     * Direct access to name at index (for sorting and other internal operations).
+     */
+    Symbol & nameAt(size_type idx) { return namesArray()[idx]; }
+    Value *& valueAt(size_type idx) { return valuesArray()[idx]; }
+    PosIdx & posAt(size_type idx) { return positionsArray()[idx]; }
+
+    /**
+     * Set attribute at index (for in-place construction).
+     */
+    void setAt(size_type idx, Symbol name, Value * value, PosIdx pos = noPos)
     {
-        if (isLayered()) [[unlikely]]
-            unreachable();
-        return attrs[pos];
+        namesArray()[idx] = name;
+        valuesArray()[idx] = value;
+        positionsArray()[idx] = pos;
+    }
+
+    void setAt(size_type idx, const Attr & attr)
+    {
+        setAt(idx, attr.name, attr.value, attr.pos);
+    }
+
+    /**
+     * Set the number of attributes (for algorithms that populate the array directly).
+     */
+    void setSize(size_type n)
+    {
+        numAttrs = n;
+        numAttrsInChain = n;
     }
 
     void sort();
 
     /**
      * Returns the attributes in lexicographically sorted order.
+     * Returns Attr by value since SoA doesn't store Attr objects.
      */
-    std::vector<const Attr *> lexicographicOrder(const SymbolTable & symbols) const
+    std::vector<Attr> lexicographicOrder(const SymbolTable & symbols) const
     {
-        std::vector<const Attr *> res;
+        std::vector<Attr> res;
         res.reserve(size());
-        std::ranges::transform(*this, std::back_inserter(res), [](const Attr & a) { return &a; });
-        std::ranges::sort(res, [&](const Attr * a, const Attr * b) {
-            std::string_view sa = symbols[a->name], sb = symbols[b->name];
+        for (const auto & a : *this)
+            res.push_back(a);
+        std::ranges::sort(res, [&](const Attr & a, const Attr & b) {
+            std::string_view sa = symbols[a.name], sb = symbols[b.name];
             return sa < sb;
         });
         return res;
     }
+
+    /**
+     * Get the number of attributes in this layer (not including base layers).
+     */
+    size_type localSize() const noexcept { return numAttrs; }
 
     friend class EvalMemory;
 };
@@ -481,7 +647,7 @@ private:
             return;
 
         auto & base = *bindings->baseLayer;
-        auto attrs = std::span(bindings->attrs, bindings->numAttrs);
+        auto localNames = std::span(bindings->namesArray(), bindings->localSize());
 
         Bindings::size_type duplicates = 0;
 
@@ -493,21 +659,28 @@ private:
            optimizing for the case when a small attribute set gets "layered" on top of
            a much larger one. When attrsets are already small it's fine to do a linear
            scan, but we should avoid expensive iterations over large "base" attrsets. */
-        if (attrs.size() > base.size()) {
+        if (localNames.size() > base.size()) {
+            // Create a names-only view of base for intersection
+            // The base iterator yields Attrs, so we extract names
+            std::vector<Symbol> baseNames;
+            baseNames.reserve(base.size());
+            for (const auto & attr : base)
+                baseNames.push_back(attr.name);
+
             std::set_intersection(
-                base.begin(),
-                base.end(),
-                attrs.begin(),
-                attrs.end(),
+                baseNames.begin(),
+                baseNames.end(),
+                localNames.begin(),
+                localNames.end(),
                 boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
         } else {
-            for (const auto & attr : attrs) {
-                if (base.get(attr.name))
+            for (Symbol name : localNames) {
+                if (base.find(name))
                     ++duplicates;
             }
         }
 
-        bindings->numAttrsInChain = base.numAttrsInChain + attrs.size() - duplicates;
+        bindings->numAttrsInChain = base.numAttrsInChain + localNames.size() - duplicates;
     }
 
 public:

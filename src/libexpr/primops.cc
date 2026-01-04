@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <numeric>
 #include <sstream>
 #include <regex>
 
@@ -831,17 +832,17 @@ static void prim_genericClosure(EvalState & state, const PosIdx pos, Value ** ar
             throw;
         }
 
-        const Attr * key;
+        Attr key;
         try {
             key = state.getAttr(state.s.key, e->attrs(), "");
         } catch (Error & err) {
             err.addTrace(nullptr, "in genericClosure element %s", ValuePrinter(state, *e, errorPrintOptions));
             throw;
         }
-        state.forceValue(*key->value, noPos);
+        state.forceValue(*key.value, noPos);
 
         try {
-            auto [it, inserted] = keyToElem.insert({key->value, e});
+            auto [it, inserted] = keyToElem.insert({key.value, e});
             if (!inserted)
                 continue;
         } catch (Error & err) {
@@ -849,7 +850,7 @@ static void prim_genericClosure(EvalState & state, const PosIdx pos, Value ** ar
             Value * otherElem = nullptr;
             for (auto & [otherKey, elem] : keyToElem) {
                 try {
-                    cmp(key->value, otherKey);
+                    cmp(key.value, otherKey);
                 } catch (Error &) {
                     // Found the element we're comparing against
                     otherElem = elem;
@@ -3056,18 +3057,24 @@ static void prim_attrValues(EvalState & state, const PosIdx pos, Value ** args, 
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrValues");
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    auto attrs = args[0]->attrs();
+    auto list = state.buildList(attrs->size());
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
-        list[n] = (Value *) &i;
+    // Collect Attrs into a vector (SoA iterator returns by value)
+    std::vector<Attr> sorted;
+    sorted.reserve(attrs->size());
+    for (const auto & i : *attrs)
+        sorted.push_back(i);
 
-    std::sort(list.begin(), list.end(), [&](Value * v1, Value * v2) {
-        std::string_view s1 = state.symbols[((Attr *) v1)->name], s2 = state.symbols[((Attr *) v2)->name];
-        return s1 < s2;
+    // Sort by name
+    std::sort(sorted.begin(), sorted.end(), [&](const Attr & a, const Attr & b) {
+        std::string_view sa = state.symbols[a.name], sb = state.symbols[b.name];
+        return sa < sb;
     });
 
-    for (auto & v : list)
-        v = ((Attr *) v)->value;
+    // Extract values
+    for (const auto & [n, attr] : enumerate(sorted))
+        list[n] = attr.value;
 
     v.mkList(list);
 }
@@ -3181,7 +3188,7 @@ static void prim_hasAttr(EvalState & state, const PosIdx pos, Value ** args, Val
 {
     auto attr = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.hasAttr");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.hasAttr");
-    v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)));
+    v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)).has_value());
 }
 
 static RegisterPrimOp primop_hasAttr({
@@ -3263,50 +3270,66 @@ static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args,
 {
     state.forceList(*args[0], pos, "while evaluating the argument passed to builtins.listToAttrs");
 
-    // Step 1. Sort the name-value attrsets in place using the memory we allocate for the result
     auto listView = args[0]->listView();
     size_t listSize = listView.size();
-    auto & bindings = *state.mem.allocBindings(listSize);
-    using ElemPtr = decltype(&bindings[0].value);
+    if (listSize == 0) {
+        v.mkAttrs(&Bindings::emptyBindings);
+        return;
+    }
 
-    for (const auto & [n, v2] : enumerate(listView)) {
+    auto & bindings = *state.mem.allocBindings(listSize);
+    using ElemPtr = Value * const *;
+
+    // Step 1: Populate bindings with (name, ptr-to-list-element).
+    auto listData = listView.data();
+    for (size_t n = 0; n < listSize; ++n) {
+        Value * v2 = listData[n];
         state.forceAttrs(*v2, pos, "while evaluating an element of the list passed to builtins.listToAttrs");
 
         auto j = state.getAttr(state.s.name, v2->attrs(), "in a {name=...; value=...;} pair");
-
         auto name = state.forceStringNoCtx(
             *j->value,
             j->pos,
             "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs");
-        auto sym = state.symbols.create(name);
 
-        // (ab)use Attr to store a Value * * instead of a Value *, so that we can stabilize the sort using the Value * *
-        bindings[n] = Attr(sym, std::bit_cast<Value *>(&v2));
+        // Store (name, ptr-to-list-slot) - ptr encodes original list position for stable sort
+        bindings.setAt(n, state.symbols.create(name), std::bit_cast<Value *>(listData + n));
     }
 
-    std::sort(&bindings[0], &bindings[listSize], [](const Attr & a, const Attr & b) {
-        // Note that .value is actually a Value * * that corresponds to the position in the list
-        return a < b || (!(a > b) && std::bit_cast<ElemPtr>(a.value) < std::bit_cast<ElemPtr>(b.value));
+    // Sort indices by (name, original-position) for stable deduplication
+    std::vector<Bindings::size_type> indices(listSize);
+    std::iota(indices.begin(), indices.end(), Bindings::size_type{0});
+    std::sort(indices.begin(), indices.end(), [&](Bindings::size_type a, Bindings::size_type b) {
+        Symbol nameA = bindings.nameAt(a), nameB = bindings.nameAt(b);
+        if (nameA != nameB)
+            return nameA < nameB;
+        return std::bit_cast<ElemPtr>(bindings.valueAt(a)) < std::bit_cast<ElemPtr>(bindings.valueAt(b));
     });
 
-    // Step 2. Unpack the bindings in place and skip name-value pairs with duplicate names
+    // Step 2: Collect deduplicated results into temporary storage.
+    // Required because sorted indices may reference positions we haven't processed yet.
+    std::vector<Attr> results;
+    results.reserve(listSize);
     Symbol prev;
-    for (size_t n = 0; n < listSize; n++) {
-        auto attr = bindings[n];
-        if (prev == attr.name) {
+    for (auto idx : indices) {
+        Symbol attrName = bindings.nameAt(idx);
+        if (prev == attrName)
             continue;
-        }
-        // Note that .value is actually a Value * *; see earlier comments
-        Value * v2 = *std::bit_cast<ElemPtr>(attr.value);
-
+        Value * v2 = *std::bit_cast<ElemPtr>(bindings.valueAt(idx));
         auto j = state.getAttr(state.s.value, v2->attrs(), "in a {name=...; value=...;} pair");
-        prev = attr.name;
-        bindings.push_back({prev, j->value, j->pos});
+        prev = attrName;
+        results.emplace_back(attrName, j->value, j->pos);
     }
-    // help GC and clear end of allocated array
-    for (size_t n = bindings.size(); n < listSize; n++) {
-        bindings[n] = Attr{};
-    }
+
+    // Copy results into bindings
+    for (size_t n = 0; n < results.size(); ++n)
+        bindings.setAt(n, results[n]);
+    bindings.setSize(results.size());
+
+    // Clear remaining slots for GC
+    for (size_t n = results.size(); n < listSize; ++n)
+        bindings.setAt(n, Symbol{}, nullptr, noPos);
+
     v.mkAttrs(&bindings);
 }
 

@@ -449,8 +449,7 @@ void mainWrapped(int argc, char ** argv)
         evalSettings.pureEval = false;
         EvalState state({}, openStore("dummy://"), fetchSettings, evalSettings);
         auto builtinsJson = nlohmann::json::object();
-        for (auto & builtinPtr : state.getBuiltins().attrs()->lexicographicOrder(state.symbols)) {
-            auto & builtin = *builtinPtr;
+        for (auto & builtin : state.getBuiltins().attrs()->lexicographicOrder(state.symbols)) {
             auto b = nlohmann::json::object();
             if (!builtin.value->isPrimOp())
                 continue;

@@ -689,7 +689,7 @@ public:
     /**
      * Get attribute from an attribute set and throw an error if it doesn't exist.
      */
-    const Attr * getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx);
+    Attr getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx);
 
     template<typename... Args>
     [[gnu::noinline]]

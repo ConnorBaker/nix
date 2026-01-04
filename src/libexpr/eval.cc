@@ -1414,8 +1414,8 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
 
         for (auto & i : getAttrPath()) {
             state.nrLookups++;
-            const Attr * j;
             auto name = getName(i, state, env);
+            std::optional<Attr> j;
             if (def) {
                 state.forceValue(*vAttrs, pos);
                 if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
@@ -1483,14 +1483,15 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
 
     for (auto & i : attrPath) {
         state.forceValue(*vAttrs, getPos());
-        const Attr * j;
         auto name = getName(i, state, env);
-        if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
-            vAttrs = j->value;
-        } else {
-            v.mkBool(false);
-            return;
+        if (vAttrs->type() == nAttrs) {
+            if (auto j = vAttrs->attrs()->get(name)) {
+                vAttrs = j->value;
+                continue;
+            }
         }
+        v.mkBool(false);
+        return;
     }
 
     v.mkBool(true);
@@ -1527,7 +1528,7 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
         }
     };
 
-    const Attr * functor;
+    std::optional<Attr> functor;
 
     while (args.size() > 0) {
 
@@ -2288,13 +2289,13 @@ bool EvalState::forceBool(Value & v, const PosIdx pos, std::string_view errorCtx
     return v.boolean();
 }
 
-const Attr * EvalState::getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx)
+Attr EvalState::getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx)
 {
     auto value = attrSet->get(attrSym);
     if (!value) {
         error<TypeError>("attribute '%s' missing", symbols[attrSym]).withTrace(noPos, errorCtx).debugThrow();
     }
-    return value;
+    return *value;
 }
 
 bool EvalState::isFunctor(const Value & fun) const
