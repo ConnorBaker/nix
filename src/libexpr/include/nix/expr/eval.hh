@@ -1043,6 +1043,84 @@ private:
     Counter nrPrimOpCalls;
     Counter nrFunctionCalls;
 
+public:
+
+    /**
+     * Statistics for builtin argument sizes.
+     * Used to track distributions and identify optimization opportunities.
+     */
+    struct BuiltinStats
+    {
+        // List builtins with function args
+        struct
+        {
+            SizeHistogram listSize;
+            Counter nrAvoided;
+        } map, filter, sort, foldl, any, all, partition, groupBy, concatMap;
+
+        // List builtins without function args
+        struct
+        {
+            SizeHistogram listSize;
+            Counter nrAvoided;
+        } elem;
+        struct
+        {
+            SizeHistogram listSize;
+            Counter nrAvoided;
+        } concatLists;
+
+        // Attr builtins
+        struct
+        {
+            SizeHistogram attrSize;
+            Counter nrAvoided;
+        } hasAttr;
+        struct
+        {
+            SizeHistogram attrSize;
+            Counter nrAvoided;
+        } attrNames, attrValues, mapAttrs;
+        struct
+        {
+            SizeHistogram leftSize, rightSize;
+            Counter nrAvoided;
+        } intersectAttrs;
+        struct
+        {
+            SizeHistogram attrSize, namesSize;
+            Counter nrAvoided;
+        } removeAttrs;
+        struct
+        {
+            SizeHistogram listSize;
+            Counter nrAvoided;
+        } listToAttrs, catAttrs, zipAttrsWith;
+
+        // String builtins
+        struct
+        {
+            SizeHistogram listSize;
+            Counter nrAvoided;
+        } concatStringsSep;
+        struct
+        {
+            SizeHistogram fromSize;
+            Counter nrAvoided;
+        } replaceStrings;
+        struct
+        {
+            Counter nrCalls;
+            Counter nrAlreadyString;
+        } toString;
+        struct
+        {
+            SizeHistogram strSize;
+        } match, split;
+    } builtinStats;
+
+private:
+
     bool countCalls;
 
     typedef boost::unordered_flat_map<std::string, size_t, StringViewHash, std::equal_to<>> PrimOpCalls;

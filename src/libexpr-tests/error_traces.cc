@@ -786,7 +786,7 @@ TEST_F(ErrorTraceTest, sort)
         HintFmt("while evaluating the second argument passed to builtins.sort"));
 
     ASSERT_TRACE2(
-        "sort 1 [ \"foo\" ]",
+        "sort 1 [ \"foo\" \"bar\" ]",
         TypeError,
         HintFmt("expected a function but found %s: %s", "an integer", Uncolored(ANSI_CYAN "1" ANSI_NORMAL)),
         HintFmt("while evaluating the first argument passed to builtins.sort"));

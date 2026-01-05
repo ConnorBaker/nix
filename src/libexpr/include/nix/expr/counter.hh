@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 
@@ -64,6 +65,36 @@ struct alignas(64) Counter
     value_type operator-=(value_type n) noexcept
     {
         return enabled ? inner -= n : 0;
+    }
+};
+
+/**
+ * Histogram with fixed buckets for argument size statistics.
+ * Buckets: 0, 1, 2-5, 6-10, 11-50, 51+
+ */
+struct SizeHistogram
+{
+    static constexpr size_t NUM_BUCKETS = 6;
+    Counter buckets[NUM_BUCKETS];
+
+    static constexpr size_t bucketIndex(size_t size) noexcept
+    {
+        if (size == 0) return 0;
+        if (size == 1) return 1;
+        if (size <= 5) return 2;
+        if (size <= 10) return 3;
+        if (size <= 50) return 4;
+        return 5;
+    }
+
+    void record(size_t size) noexcept
+    {
+        buckets[bucketIndex(size)]++;
+    }
+
+    static constexpr std::array<const char *, NUM_BUCKETS> bucketLabels() noexcept
+    {
+        return {"0", "1", "2-5", "6-10", "11-50", "51+"};
     }
 };
 

@@ -3028,13 +3028,23 @@ static RegisterPrimOp primop_path({
 static void prim_attrNames(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrNames");
+    auto size = args[0]->attrs()->size();
+    state.builtinStats.attrNames.attrSize.record(size);
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    if (size == 0) {
+        state.builtinStats.attrNames.nrAvoided++;
+        v = Value::vEmptyList;
+        return;
+    }
+
+    auto list = state.buildList(size);
 
     for (const auto & [n, i] : enumerate(*args[0]->attrs()))
         list[n] = Value::toPtr(state.symbols[i.name]);
 
-    std::sort(list.begin(), list.end(), [](Value * v1, Value * v2) { return v1->string_view() < v2->string_view(); });
+    // Skip sorting for single-element lists
+    if (size > 1)
+        std::sort(list.begin(), list.end(), [](Value * v1, Value * v2) { return v1->string_view() < v2->string_view(); });
 
     v.mkList(list);
 }
@@ -3055,8 +3065,24 @@ static RegisterPrimOp primop_attrNames({
 static void prim_attrValues(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrValues");
+    auto size = args[0]->attrs()->size();
+    state.builtinStats.attrValues.attrSize.record(size);
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    if (size == 0) {
+        state.builtinStats.attrValues.nrAvoided++;
+        v = Value::vEmptyList;
+        return;
+    }
+
+    // Fast path for single-element attrs: no sorting needed
+    if (size == 1) {
+        auto list = state.buildList(1);
+        list[0] = args[0]->attrs()->begin()->value;
+        v.mkList(list);
+        return;
+    }
+
+    auto list = state.buildList(size);
 
     for (const auto & [n, i] : enumerate(*args[0]->attrs()))
         list[n] = (Value *) &i;
@@ -3181,6 +3207,22 @@ static void prim_hasAttr(EvalState & state, const PosIdx pos, Value ** args, Val
 {
     auto attr = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.hasAttr");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.hasAttr");
+    auto attrSize = args[1]->attrs()->size();
+    state.builtinStats.hasAttr.attrSize.record(attrSize);
+
+    // Fast path for empty attr set: can never contain the attribute
+    if (attrSize == 0) {
+        state.builtinStats.hasAttr.nrAvoided++;
+        v.mkBool(false);
+        return;
+    }
+
+    // Fast path for singleton attr set: direct string comparison avoids symbol creation and hash lookup
+    if (attrSize == 1) {
+        v.mkBool(state.symbols[args[1]->attrs()->begin()->name] == attr);
+        return;
+    }
+
     v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)));
 }
 
@@ -3215,6 +3257,22 @@ static void prim_removeAttrs(EvalState & state, const PosIdx pos, Value ** args,
 {
     state.forceAttrs(*args[0], pos, "while evaluating the first argument passed to builtins.removeAttrs");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.removeAttrs");
+    state.builtinStats.removeAttrs.attrSize.record(args[0]->attrs()->size());
+    state.builtinStats.removeAttrs.namesSize.record(args[1]->listSize());
+
+    // Fast path for empty attr set - nothing to remove from
+    if (args[0]->attrs()->size() == 0) {
+        state.builtinStats.removeAttrs.nrAvoided++;
+        v.mkAttrs(&Bindings::emptyBindings);
+        return;
+    }
+
+    // Early return if names list is empty - nothing to remove
+    if (args[1]->listSize() == 0) {
+        state.builtinStats.removeAttrs.nrAvoided++;
+        v = *args[0];
+        return;
+    }
 
     /* Get the attribute names to be removed.
        We keep them as Attrs instead of Symbols so std::set_difference
@@ -3262,6 +3320,32 @@ static RegisterPrimOp primop_removeAttrs({
 static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[0], pos, "while evaluating the argument passed to builtins.listToAttrs");
+    state.builtinStats.listToAttrs.listSize.record(args[0]->listSize());
+
+    if (args[0]->listSize() == 0) {
+        state.builtinStats.listToAttrs.nrAvoided++;
+        v.mkAttrs(&Bindings::emptyBindings);
+        return;
+    }
+
+    // Fast path for single-element list: no sorting needed
+    if (args[0]->listSize() == 1) {
+        auto v2 = args[0]->listView()[0];
+        state.forceAttrs(*v2, pos, "while evaluating an element of the list passed to builtins.listToAttrs");
+
+        auto nameAttr = state.getAttr(state.s.name, v2->attrs(), "in a {name=...; value=...;} pair");
+        auto name = state.forceStringNoCtx(
+            *nameAttr->value,
+            nameAttr->pos,
+            "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs");
+
+        auto valueAttr = state.getAttr(state.s.value, v2->attrs(), "in a {name=...; value=...;} pair");
+
+        auto attrs = state.buildBindings(1);
+        attrs.insert(state.symbols.create(name), valueAttr->value, valueAttr->pos);
+        v.mkAttrs(attrs.alreadySorted());
+        return;
+    }
 
     // Step 1. Sort the name-value attrsets in place using the memory we allocate for the result
     auto listView = args[0]->listView();
@@ -3345,9 +3429,17 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
 {
     state.forceAttrs(*args[0], pos, "while evaluating the first argument passed to builtins.intersectAttrs");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.intersectAttrs");
+    state.builtinStats.intersectAttrs.leftSize.record(args[0]->attrs()->size());
+    state.builtinStats.intersectAttrs.rightSize.record(args[1]->attrs()->size());
 
     auto & left = *args[0]->attrs();
     auto & right = *args[1]->attrs();
+
+    if (left.empty() || right.empty()) {
+        state.builtinStats.intersectAttrs.nrAvoided++;
+        v.mkAttrs(&Bindings::emptyBindings);
+        return;
+    }
 
     auto attrs = state.buildBindings(std::min(left.size(), right.size()));
 
@@ -3423,6 +3515,28 @@ static void prim_catAttrs(EvalState & state, const PosIdx pos, Value ** args, Va
     auto attrName = state.symbols.create(
         state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.catAttrs"));
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.catAttrs");
+    state.builtinStats.catAttrs.listSize.record(args[1]->listSize());
+
+    if (args[1]->listSize() == 0) {
+        state.builtinStats.catAttrs.nrAvoided++;
+        v = Value::vEmptyList;
+        return;
+    }
+
+    // Fast path: singleton list
+    if (args[1]->listSize() == 1) {
+        auto v2 = args[1]->listView()[0];
+        state.forceAttrs(
+            *v2, pos, "while evaluating an element in the list passed as second argument to builtins.catAttrs");
+        if (auto i = v2->attrs()->get(attrName)) {
+            auto list = state.buildList(1);
+            list[0] = i->value;
+            v.mkList(list);
+        } else {
+            v = Value::vEmptyList;
+        }
+        return;
+    }
 
     SmallValueVector<nonRecursiveStackReservation> res(args[1]->listSize());
     size_t found = 0;
@@ -3504,6 +3618,13 @@ static RegisterPrimOp primop_functionArgs({
 static void prim_mapAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.mapAttrs");
+    state.builtinStats.mapAttrs.attrSize.record(args[1]->attrs()->size());
+
+    if (args[1]->attrs()->size() == 0) {
+        state.builtinStats.mapAttrs.nrAvoided++;
+        v.mkAttrs(&Bindings::emptyBindings);
+        return;
+    }
 
     auto attrs = state.buildBindings(args[1]->attrs()->size());
 
@@ -3534,6 +3655,17 @@ static RegisterPrimOp primop_mapAttrs({
 
 static void prim_zipAttrsWith(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
+    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.zipAttrsWith");
+    state.builtinStats.zipAttrsWith.listSize.record(args[1]->listSize());
+
+    if (args[1]->listSize() == 0) {
+        state.builtinStats.zipAttrsWith.nrAvoided++;
+        v.mkAttrs(&Bindings::emptyBindings);
+        return;
+    }
+
+    state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.zipAttrsWith");
+
     // we will first count how many values are present for each given key.
     // we then allocate a single attrset and pre-populate it with lists of
     // appropriate sizes, stash the pointers to the list elements of each,
@@ -3549,9 +3681,6 @@ static void prim_zipAttrsWith(EvalState & state, const PosIdx pos, Value ** args
     };
 
     std::map<Symbol, Item, std::less<Symbol>, traceable_allocator<std::pair<const Symbol, Item>>> attrsSeen;
-
-    state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.zipAttrsWith");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.zipAttrsWith");
     const auto listItems = args[1]->listView();
 
     for (auto & vElem : listItems) {
@@ -3719,8 +3848,10 @@ static RegisterPrimOp primop_tail({
 static void prim_map(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.map");
+    state.builtinStats.map.listSize.record(args[1]->listSize());
 
     if (args[1]->listSize() == 0) {
+        state.builtinStats.map.nrAvoided++;
         v = *args[1];
         return;
     }
@@ -3755,8 +3886,10 @@ static RegisterPrimOp primop_map({
 static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.filter");
+    state.builtinStats.filter.listSize.record(args[1]->listSize());
 
     if (args[1]->listSize() == 0) {
+        state.builtinStats.filter.nrAvoided++;
         v = *args[1];
         return;
     }
@@ -3801,14 +3934,21 @@ static RegisterPrimOp primop_filter({
 /* Return true if a list contains a given element. */
 static void prim_elem(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    bool res = false;
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.elem");
+    state.builtinStats.elem.listSize.record(args[1]->listSize());
+
+    if (args[1]->listSize() == 0) {
+        state.builtinStats.elem.nrAvoided++;
+        v.mkBool(false);
+        return;
+    }
+
     for (auto elem : args[1]->listView())
         if (state.eqValues(*args[0], *elem, pos, "while searching for the presence of the given element in the list")) {
-            res = true;
-            break;
+            v.mkBool(true);
+            return;
         }
-    v.mkBool(res);
+    v.mkBool(false);
 }
 
 static RegisterPrimOp primop_elem({
@@ -3865,21 +4005,23 @@ static void prim_foldlStrict(EvalState & state, const PosIdx pos, Value ** args,
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.foldlStrict");
     state.forceList(*args[2], pos, "while evaluating the third argument passed to builtins.foldlStrict");
+    state.builtinStats.foldl.listSize.record(args[2]->listSize());
 
-    if (args[2]->listSize()) {
-        Value * vCur = args[1];
-
-        auto listView = args[2]->listView();
-        for (auto [n, elem] : enumerate(listView)) {
-            Value * vs[]{vCur, elem};
-            vCur = n == args[2]->listSize() - 1 ? &v : state.allocValue();
-            state.callFunction(*args[0], vs, *vCur, pos);
-        }
-        state.forceValue(v, pos);
-    } else {
+    if (args[2]->listSize() == 0) {
+        state.builtinStats.foldl.nrAvoided++;
         state.forceValue(*args[1], pos);
         v = *args[1];
+        return;
     }
+
+    Value * vCur = args[1];
+    auto listView = args[2]->listView();
+    for (auto [n, elem] : enumerate(listView)) {
+        Value * vs[]{vCur, elem};
+        vCur = n == args[2]->listSize() - 1 ? &v : state.allocValue();
+        state.callFunction(*args[0], vs, *vCur, pos);
+    }
+    state.forceValue(v, pos);
 }
 
 static RegisterPrimOp primop_foldlStrict({
@@ -3908,6 +4050,14 @@ static void anyOrAll(bool any, EvalState & state, const PosIdx pos, Value ** arg
         *args[0], pos, std::string("while evaluating the first argument passed to builtins.") + (any ? "any" : "all"));
     state.forceList(
         *args[1], pos, std::string("while evaluating the second argument passed to builtins.") + (any ? "any" : "all"));
+    auto & stats = any ? state.builtinStats.any : state.builtinStats.all;
+    stats.listSize.record(args[1]->listSize());
+
+    if (args[1]->listSize() == 0) {
+        stats.nrAvoided++;
+        v.mkBool(!any); // any([]) = false, all([]) = true
+        return;
+    }
 
     std::string_view errorCtx = any ? "while evaluating the return value of the function passed to builtins.any"
                                     : "while evaluating the return value of the function passed to builtins.all";
@@ -3998,9 +4148,12 @@ static void prim_lessThan(EvalState & state, const PosIdx pos, Value ** args, Va
 static void prim_sort(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.sort");
+    state.builtinStats.sort.listSize.record(args[1]->listSize());
 
     auto len = args[1]->listSize();
-    if (len == 0) {
+    // Fast path: 0 or 1 elements are trivially sorted, comparator not needed
+    if (len <= 1) {
+        state.builtinStats.sort.nrAvoided++;
         v = *args[1];
         return;
     }
@@ -4107,7 +4260,16 @@ static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, V
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.partition");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.partition");
+    state.builtinStats.partition.listSize.record(args[1]->listSize());
 
+    if (args[1]->listSize() == 0) {
+        state.builtinStats.partition.nrAvoided++;
+        auto attrs = state.buildBindings(2);
+        attrs.alloc(state.s.right) = Value::vEmptyList;
+        attrs.alloc(state.s.wrong) = Value::vEmptyList;
+        v.mkAttrs(attrs);
+        return;
+    }
     auto len = args[1]->listSize();
 
     ValueVector right, wrong;
@@ -4168,6 +4330,13 @@ static void prim_groupBy(EvalState & state, const PosIdx pos, Value ** args, Val
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.groupBy");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.groupBy");
+    state.builtinStats.groupBy.listSize.record(args[1]->listSize());
+
+    if (args[1]->listSize() == 0) {
+        state.builtinStats.groupBy.nrAvoided++;
+        v.mkAttrs(&Bindings::emptyBindings);
+        return;
+    }
 
     ValueVectorMap attrs;
 
@@ -4221,6 +4390,24 @@ static void prim_concatMap(EvalState & state, const PosIdx pos, Value ** args, V
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.concatMap");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.concatMap");
+    state.builtinStats.concatMap.listSize.record(args[1]->listSize());
+
+    if (args[1]->listSize() == 0) {
+        state.builtinStats.concatMap.nrAvoided++;
+        v = *args[1];
+        return;
+    }
+
+    // Fast path: singleton list, just call the function and return its result directly
+    if (args[1]->listSize() == 1) {
+        state.callFunction(*args[0], *args[1]->listView()[0], v, pos);
+        state.forceList(
+            v,
+            v.determinePos(args[0]->determinePos(pos)),
+            "while evaluating the return value of the function passed to builtins.concatMap");
+        return;
+    }
+
     auto nrLists = args[1]->listSize();
 
     // List of returned lists before concatenation. References to these Values must NOT be persisted.
@@ -4467,6 +4654,11 @@ static RegisterPrimOp primop_lessThan({
    `"/nix/store/whatever..."'. */
 static void prim_toString(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
+    state.builtinStats.toString.nrCalls++;
+    state.forceValue(*args[0], pos);
+    if (args[0]->type() == nString) {
+        state.builtinStats.toString.nrAlreadyString++;
+    }
     NixStringContext context;
     auto s = state.coerceToString(
         pos, *args[0], context, "while evaluating the first argument passed to builtins.toString", true, false);
@@ -4753,6 +4945,7 @@ void prim_match(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         NixStringContext context;
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.match");
+        state.builtinStats.match.strSize.record(str.size());
 
         std::cmatch match;
         if (!std::regex_match(str.begin(), str.end(), match, *regex)) {
@@ -4827,6 +5020,7 @@ void prim_split(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         NixStringContext context;
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.split");
+        state.builtinStats.split.strSize.record(str.size());
 
         auto begin = std::cregex_iterator(str.begin(), str.end(), *regex);
         auto end = std::cregex_iterator();
@@ -4931,6 +5125,24 @@ static void prim_concatStringsSep(EvalState & state, const PosIdx pos, Value ** 
         *args[1],
         pos,
         "while evaluating the second argument (the list of strings to concat) passed to builtins.concatStringsSep");
+    state.builtinStats.concatStringsSep.listSize.record(args[1]->listSize());
+
+    if (args[1]->listSize() == 0) {
+        state.builtinStats.concatStringsSep.nrAvoided++;
+        v.mkString("", context, state.mem);
+        return;
+    }
+
+    // Fast path: singleton list, separator not used
+    if (args[1]->listSize() == 1) {
+        auto s = state.coerceToString(
+            pos,
+            *args[1]->listView()[0],
+            context,
+            "while evaluating one element of the list of strings to concat passed to builtins.concatStringsSep");
+        v.mkString(*s, context, state.mem);
+        return;
+    }
 
     std::string res;
     res.reserve((args[1]->listSize() + 32) * sep.size());
@@ -4966,10 +5178,19 @@ static void prim_replaceStrings(EvalState & state, const PosIdx pos, Value ** ar
 {
     state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.replaceStrings");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.replaceStrings");
+    state.builtinStats.replaceStrings.fromSize.record(args[0]->listSize());
     if (args[0]->listSize() != args[1]->listSize())
         state.error<EvalError>("'from' and 'to' arguments passed to builtins.replaceStrings have different lengths")
             .atPos(pos)
             .debugThrow();
+
+    // Early return if from list is empty - nothing to replace
+    if (args[0]->listSize() == 0) {
+        state.builtinStats.replaceStrings.nrAvoided++;
+        state.forceValue(*args[2], pos);
+        v = *args[2];
+        return;
+    }
 
     std::vector<std::string_view> from;
     from.reserve(args[0]->listSize());

@@ -135,4 +135,14 @@ with builtins;
     ]
     [ 3 ]
   ])
+
+  # Comparator is not called for empty list
+  (sort (throw "comparator should not be called") [ ])
+
+  # Comparator is not called for single-element list
+  (sort (throw "comparator should not be called") [ 42 ])
+
+  # Comparator is not even validated for 0 or 1 element lists
+  (sort "not a function" [ ])
+  (sort 123 [ "single" ])
 ]

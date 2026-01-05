@@ -2029,6 +2029,22 @@ void EvalState::concatLists(
     Value & v, size_t nrLists, Value * const * lists, const PosIdx pos, std::string_view errorCtx)
 {
     nrListConcats++;
+    builtinStats.concatLists.listSize.record(nrLists);
+
+    // Fast path: zero lists
+    if (nrLists == 0) {
+        builtinStats.concatLists.nrAvoided++;
+        v = Value::vEmptyList;
+        return;
+    }
+
+    // Fast path: single list
+    if (nrLists == 1) {
+        builtinStats.concatLists.nrAvoided++;
+        forceList(*lists[0], pos, errorCtx);
+        v = *lists[0];
+        return;
+    }
 
     Value * nonEmpty = 0;
     size_t len = 0;
@@ -3035,6 +3051,75 @@ void EvalState::printStatistics()
         {"cycles", gcCycles},
     };
 #endif
+
+    // Builtin argument size statistics
+    auto histogramToJson = [](const SizeHistogram & h) {
+        json j = json::object();
+        auto labels = SizeHistogram::bucketLabels();
+        for (size_t i = 0; i < SizeHistogram::NUM_BUCKETS; i++)
+            j[labels[i]] = h.buckets[i].load();
+        return j;
+    };
+
+    auto listFnStatsToJson = [&](const auto & s) {
+        return json{{"avoided", s.nrAvoided.load()}, {"listSize", histogramToJson(s.listSize)}};
+    };
+
+    auto attrStatsToJson = [&](const auto & s) {
+        return json{{"attrSize", histogramToJson(s.attrSize)}, {"avoided", s.nrAvoided.load()}};
+    };
+
+    topObj["builtinStats"] = {
+        {"all", listFnStatsToJson(builtinStats.all)},
+        {"any", listFnStatsToJson(builtinStats.any)},
+        {"attrNames", attrStatsToJson(builtinStats.attrNames)},
+        {"attrValues", attrStatsToJson(builtinStats.attrValues)},
+        {"catAttrs",
+         {{"avoided", builtinStats.catAttrs.nrAvoided.load()},
+          {"listSize", histogramToJson(builtinStats.catAttrs.listSize)}}},
+        {"concatLists",
+         {{"avoided", builtinStats.concatLists.nrAvoided.load()},
+          {"listSize", histogramToJson(builtinStats.concatLists.listSize)}}},
+        {"concatMap", listFnStatsToJson(builtinStats.concatMap)},
+        {"concatStringsSep",
+         {{"avoided", builtinStats.concatStringsSep.nrAvoided.load()},
+          {"listSize", histogramToJson(builtinStats.concatStringsSep.listSize)}}},
+        {"elem",
+         {{"avoided", builtinStats.elem.nrAvoided.load()},
+          {"listSize", histogramToJson(builtinStats.elem.listSize)}}},
+        {"filter", listFnStatsToJson(builtinStats.filter)},
+        {"foldl", listFnStatsToJson(builtinStats.foldl)},
+        {"groupBy", listFnStatsToJson(builtinStats.groupBy)},
+        {"hasAttr",
+         {{"attrSize", histogramToJson(builtinStats.hasAttr.attrSize)},
+          {"avoided", builtinStats.hasAttr.nrAvoided.load()}}},
+        {"intersectAttrs",
+         {{"avoided", builtinStats.intersectAttrs.nrAvoided.load()},
+          {"leftSize", histogramToJson(builtinStats.intersectAttrs.leftSize)},
+          {"rightSize", histogramToJson(builtinStats.intersectAttrs.rightSize)}}},
+        {"listToAttrs",
+         {{"avoided", builtinStats.listToAttrs.nrAvoided.load()},
+          {"listSize", histogramToJson(builtinStats.listToAttrs.listSize)}}},
+        {"map", listFnStatsToJson(builtinStats.map)},
+        {"mapAttrs", attrStatsToJson(builtinStats.mapAttrs)},
+        {"match", {{"strSize", histogramToJson(builtinStats.match.strSize)}}},
+        {"partition", listFnStatsToJson(builtinStats.partition)},
+        {"removeAttrs",
+         {{"attrSize", histogramToJson(builtinStats.removeAttrs.attrSize)},
+          {"avoided", builtinStats.removeAttrs.nrAvoided.load()},
+          {"namesSize", histogramToJson(builtinStats.removeAttrs.namesSize)}}},
+        {"replaceStrings",
+         {{"avoided", builtinStats.replaceStrings.nrAvoided.load()},
+          {"fromSize", histogramToJson(builtinStats.replaceStrings.fromSize)}}},
+        {"sort", listFnStatsToJson(builtinStats.sort)},
+        {"split", {{"strSize", histogramToJson(builtinStats.split.strSize)}}},
+        {"toString",
+         {{"alreadyString", builtinStats.toString.nrAlreadyString.load()},
+          {"calls", builtinStats.toString.nrCalls.load()}}},
+        {"zipAttrsWith",
+         {{"avoided", builtinStats.zipAttrsWith.nrAvoided.load()},
+          {"listSize", histogramToJson(builtinStats.zipAttrsWith.listSize)}}},
+    };
 
     if (countCalls) {
         topObj["primops"] = primOpCalls;
