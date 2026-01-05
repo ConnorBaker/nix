@@ -1045,6 +1045,8 @@ private:
 
     bool countCalls;
 
+private:
+
     typedef boost::unordered_flat_map<std::string, size_t, StringViewHash, std::equal_to<>> PrimOpCalls;
     PrimOpCalls primOpCalls;
 

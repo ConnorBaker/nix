@@ -142,27 +142,27 @@ private:
      * SoA array accessors. Memory layout (no padding needed):
      *   [Header 24B] [positions: PosIdx × cap] [names: Symbol × cap] [values: Value* × cap]
      */
-    PosIdx * positionsArray() noexcept { return positions_; }
-    const PosIdx * positionsArray() const noexcept { return positions_; }
+    [[gnu::always_inline]] PosIdx * positionsArray() noexcept { return positions_; }
+    [[gnu::always_inline]] const PosIdx * positionsArray() const noexcept { return positions_; }
 
-    Symbol * namesArray() noexcept
+    [[gnu::always_inline]] Symbol * namesArray() noexcept
     {
         return reinterpret_cast<Symbol *>(positions_ + capacity_);
     }
 
-    const Symbol * namesArray() const noexcept
+    [[gnu::always_inline]] const Symbol * namesArray() const noexcept
     {
         return reinterpret_cast<const Symbol *>(positions_ + capacity_);
     }
 
-    Value ** valuesArray() noexcept
+    [[gnu::always_inline]] Value ** valuesArray() noexcept
     {
         // Values array starts after names array; always 8-byte aligned since
         // header (24B) + positions (4B × cap) + names (4B × cap) = 24 + 8*cap
         return reinterpret_cast<Value **>(namesArray() + capacity_);
     }
 
-    Value * const * valuesArray() const noexcept
+    [[gnu::always_inline]] Value * const * valuesArray() const noexcept
     {
         return reinterpret_cast<Value * const *>(namesArray() + capacity_);
     }
@@ -170,7 +170,7 @@ private:
     /**
      * Get attribute at index as an Attr (for compatibility).
      */
-    Attr attrAt(size_type idx) const noexcept
+    [[gnu::always_inline]] Attr attrAt(size_type idx) const noexcept
     {
         return Attr(namesArray()[idx], const_cast<Value *>(valuesArray()[idx]), positionsArray()[idx]);
     }
@@ -547,9 +547,12 @@ public:
     /**
      * Direct access to name at index (for sorting and other internal operations).
      */
-    Symbol & nameAt(size_type idx) { return namesArray()[idx]; }
-    Value *& valueAt(size_type idx) { return valuesArray()[idx]; }
-    PosIdx & posAt(size_type idx) { return positionsArray()[idx]; }
+    [[gnu::always_inline]] Symbol & nameAt(size_type idx) noexcept { return namesArray()[idx]; }
+    [[gnu::always_inline]] Symbol nameAt(size_type idx) const noexcept { return namesArray()[idx]; }
+    [[gnu::always_inline]] Value *& valueAt(size_type idx) noexcept { return valuesArray()[idx]; }
+    [[gnu::always_inline]] Value * valueAt(size_type idx) const noexcept { return valuesArray()[idx]; }
+    [[gnu::always_inline]] PosIdx & posAt(size_type idx) noexcept { return positionsArray()[idx]; }
+    [[gnu::always_inline]] PosIdx posAt(size_type idx) const noexcept { return positionsArray()[idx]; }
 
     /**
      * Set attribute at index (for in-place construction).

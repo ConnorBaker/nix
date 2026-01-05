@@ -3030,10 +3030,35 @@ static void prim_attrNames(EvalState & state, const PosIdx pos, Value ** args, V
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrNames");
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    auto & bindings = *args[0]->attrs();
+    auto size = bindings.size();
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
-        list[n] = Value::toPtr(state.symbols[i.name]);
+    // Fast paths for 0 and 1 element sets (48% of calls in nixpkgs)
+    if (size == 0) {
+        v = Value::vEmptyList;
+        return;
+    }
+
+    if (size == 1) {
+        auto list = state.buildList(1);
+        list[0] = Value::toPtr(state.symbols[bindings.begin()->name]);
+        v.mkList(list);
+        return;
+    }
+
+    auto list = state.buildList(size);
+
+    if (!bindings.isLayered()) {
+        // Fast path: directly iterate namesArray() for contiguous memory access.
+        // This avoids iterator overhead and enables better cache utilization.
+        auto n = bindings.localSize();
+        for (Bindings::size_type i = 0; i < n; ++i)
+            list[i] = Value::toPtr(state.symbols[bindings.nameAt(i)]);
+    } else {
+        // Layered bindings: use iterator for k-way merge
+        for (const auto & [n, i] : enumerate(bindings))
+            list[n] = Value::toPtr(state.symbols[i.name]);
+    }
 
     std::sort(list.begin(), list.end(), [](Value * v1, Value * v2) { return v1->string_view() < v2->string_view(); });
 
@@ -3057,24 +3082,54 @@ static void prim_attrValues(EvalState & state, const PosIdx pos, Value ** args, 
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrValues");
 
-    auto attrs = args[0]->attrs();
-    auto list = state.buildList(attrs->size());
+    auto & bindings = *args[0]->attrs();
+    auto size = bindings.size();
 
-    // Collect Attrs into a vector (SoA iterator returns by value)
-    std::vector<Attr> sorted;
-    sorted.reserve(attrs->size());
-    for (const auto & i : *attrs)
-        sorted.push_back(i);
+    // Fast paths for 0 and 1 element sets (11% of calls in nixpkgs)
+    if (size == 0) {
+        v = Value::vEmptyList;
+        return;
+    }
 
-    // Sort by name
-    std::sort(sorted.begin(), sorted.end(), [&](const Attr & a, const Attr & b) {
-        std::string_view sa = state.symbols[a.name], sb = state.symbols[b.name];
-        return sa < sb;
-    });
+    if (size == 1) {
+        auto list = state.buildList(1);
+        list[0] = bindings.begin()->value;
+        v.mkList(list);
+        return;
+    }
 
-    // Extract values
-    for (const auto & [n, attr] : enumerate(sorted))
-        list[n] = attr.value;
+    auto list = state.buildList(size);
+
+    if (!bindings.isLayered()) {
+        // Fast path: use indices to avoid creating Attr objects.
+        // Sort indices by name, then access values directly via SoA.
+        auto n = bindings.localSize();
+        std::vector<Bindings::size_type> indices(n);
+        std::iota(indices.begin(), indices.end(), Bindings::size_type{0});
+
+        std::sort(indices.begin(), indices.end(), [&](auto a, auto b) {
+            std::string_view sa = state.symbols[bindings.nameAt(a)];
+            std::string_view sb = state.symbols[bindings.nameAt(b)];
+            return sa < sb;
+        });
+
+        for (Bindings::size_type i = 0; i < n; ++i)
+            list[i] = bindings.valueAt(indices[i]);
+    } else {
+        // Layered: collect Attrs, sort, extract values
+        std::vector<Attr> sorted;
+        sorted.reserve(bindings.size());
+        for (const auto & i : bindings)
+            sorted.push_back(i);
+
+        std::sort(sorted.begin(), sorted.end(), [&](const Attr & a, const Attr & b) {
+            std::string_view sa = state.symbols[a.name], sb = state.symbols[b.name];
+            return sa < sb;
+        });
+
+        for (const auto & [n, attr] : enumerate(sorted))
+            list[n] = attr.value;
+    }
 
     v.mkList(list);
 }
@@ -3528,9 +3583,18 @@ static void prim_mapAttrs(EvalState & state, const PosIdx pos, Value ** args, Va
 {
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.mapAttrs");
 
-    auto attrs = state.buildBindings(args[1]->attrs()->size());
+    auto & bindings = *args[1]->attrs();
+    auto size = bindings.size();
 
-    for (auto & i : *args[1]->attrs()) {
+    // Fast path for empty set (14% of calls)
+    if (size == 0) {
+        v.mkAttrs(&Bindings::emptyBindings);
+        return;
+    }
+
+    auto attrs = state.buildBindings(size);
+
+    for (auto & i : bindings) {
         Value * vName = Value::toPtr(state.symbols[i.name]);
         Value * vFun2 = state.allocValue();
         vFun2->mkApp(args[0], vName);
