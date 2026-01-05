@@ -10,8 +10,8 @@ namespace nix {
 Bindings Bindings::emptyBindings;
 
 /* Allocate a new SoA layout for an attribute set with a specific capacity.
-   Memory layout after header:
-     [names: Symbol × capacity] [padding to 8-byte align] [values: Value* × capacity] [positions: PosIdx × capacity]
+   Memory layout after header (no padding needed):
+     [positions: PosIdx × capacity] [names: Symbol × capacity] [values: Value* × capacity]
 */
 Bindings * EvalMemory::allocBindings(size_t capacity)
 {
@@ -23,15 +23,9 @@ Bindings * EvalMemory::allocBindings(size_t capacity)
     stats.nrAttrsets++;
     stats.nrAttrsInAttrsets += capacity;
 
-    // Calculate SoA layout sizes with proper alignment
-    size_t headerSize = sizeof(Bindings);
-    size_t namesSize = capacity * sizeof(Symbol);
-    size_t namesEnd = headerSize + namesSize;
-    size_t valuesStart = (namesEnd + 7) & ~size_t{7};  // 8-byte align for Value*
-    size_t valuesSize = capacity * sizeof(Value *);
-    size_t positionsSize = capacity * sizeof(PosIdx);
-
-    size_t totalSize = valuesStart + valuesSize + positionsSize;
+    // SoA layout: [header 24B][positions 4B×cap][names 4B×cap][values 8B×cap]
+    // No padding needed: 24 + 8*cap is always 8-byte aligned for Value* array
+    size_t totalSize = sizeof(Bindings) + capacity * (sizeof(PosIdx) + sizeof(Symbol) + sizeof(Value *));
 
     auto * bindings = new (allocBytes(totalSize)) Bindings();
     bindings->capacity_ = static_cast<Bindings::size_type>(capacity);

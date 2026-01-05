@@ -76,13 +76,24 @@ class Bindings
 public:
     using size_type = uint32_t;
 
-    PosIdx pos;
-
     /**
      * An instance of bindings objects with 0 attributes.
      * This object must never be modified.
      */
     static Bindings emptyBindings;
+
+private:
+    // SoA layout with 24-byte header (same as original AoS).
+    // Fields: baseLayer (8) + pos (4) + numAttrs (4) + numAttrsInChain (4) + capacity_ (4) = 24 bytes.
+    // numLayers was removed; it's computed on-the-fly by walking the baseLayer chain.
+
+    /**
+     * Bindings that this attrset is "layered" on top of.
+     */
+    const Bindings * baseLayer = nullptr;
+
+public:
+    PosIdx pos;
 
 private:
     /**
@@ -99,25 +110,17 @@ private:
     size_type numAttrsInChain = 0;
 
     /**
-     * Capacity of the SoA arrays. Needed to compute offsets to values and positions arrays.
+     * Capacity of the SoA arrays. Needed to compute offsets to names and values arrays.
      */
     size_type capacity_ = 0;
 
     /**
-     * Length of the layers list.
+     * Structure-of-Arrays layout optimized to avoid padding:
+     *   [positions: PosIdx × cap] [names: Symbol × cap] [values: Value* × cap]
+     * Since PosIdx and Symbol are both 4 bytes, and header is 24 bytes (8-byte aligned),
+     * the values array (8-byte aligned) starts at offset 24 + 8*cap, which is always 8-byte aligned.
      */
-    uint32_t numLayers = 1;
-
-    /**
-     * Bindings that this attrset is "layered" on top of.
-     */
-    const Bindings * baseLayer = nullptr;
-
-    /**
-     * Structure-of-Arrays layout: names array is stored first (FAM),
-     * followed by values array (8-byte aligned), then positions array.
-     */
-    Symbol names_[0];
+    PosIdx positions_[0];
 
     Bindings() = default;
     Bindings(const Bindings &) = delete;
@@ -136,36 +139,32 @@ private:
     static constexpr unsigned maxLayers = 8;
 
     /**
-     * SoA array accessors. The memory layout is:
-     *   [Header] [names: Symbol × capacity] [padding] [values: Value* × capacity] [positions: PosIdx × capacity]
+     * SoA array accessors. Memory layout (no padding needed):
+     *   [Header 24B] [positions: PosIdx × cap] [names: Symbol × cap] [values: Value* × cap]
      */
-    Symbol * namesArray() noexcept { return names_; }
-    const Symbol * namesArray() const noexcept { return names_; }
+    PosIdx * positionsArray() noexcept { return positions_; }
+    const PosIdx * positionsArray() const noexcept { return positions_; }
+
+    Symbol * namesArray() noexcept
+    {
+        return reinterpret_cast<Symbol *>(positions_ + capacity_);
+    }
+
+    const Symbol * namesArray() const noexcept
+    {
+        return reinterpret_cast<const Symbol *>(positions_ + capacity_);
+    }
 
     Value ** valuesArray() noexcept
     {
-        // Values array starts after names array, aligned to 8 bytes
-        auto namesEnd = reinterpret_cast<uintptr_t>(names_ + capacity_);
-        auto valuesStart = (namesEnd + 7) & ~uintptr_t{7};  // 8-byte align
-        return reinterpret_cast<Value **>(valuesStart);
+        // Values array starts after names array; always 8-byte aligned since
+        // header (24B) + positions (4B × cap) + names (4B × cap) = 24 + 8*cap
+        return reinterpret_cast<Value **>(namesArray() + capacity_);
     }
 
     Value * const * valuesArray() const noexcept
     {
-        auto namesEnd = reinterpret_cast<uintptr_t>(names_ + capacity_);
-        auto valuesStart = (namesEnd + 7) & ~uintptr_t{7};
-        return reinterpret_cast<Value * const *>(valuesStart);
-    }
-
-    PosIdx * positionsArray() noexcept
-    {
-        // Positions array starts after values array
-        return reinterpret_cast<PosIdx *>(valuesArray() + capacity_);
-    }
-
-    const PosIdx * positionsArray() const noexcept
-    {
-        return reinterpret_cast<const PosIdx *>(valuesArray() + capacity_);
+        return reinterpret_cast<Value * const *>(namesArray() + capacity_);
     }
 
     /**
@@ -504,19 +503,24 @@ public:
     }
 
     /**
-     * Check if the layer chain is full.
+     * Check if the layer chain is full (has maxLayers layers).
+     * Computed by walking the baseLayer chain.
      */
     bool isLayerListFull() const noexcept
     {
-        return numLayers == Bindings::maxLayers;
+        unsigned count = 1;
+        for (auto * p = baseLayer; p; p = p->baseLayer)
+            if (++count >= maxLayers)
+                return true;
+        return false;
     }
 
     /**
-     * Test if the length of the linked list of layers is greater than 1.
+     * Test if this bindings has a base layer (i.e., is the result of `//`).
      */
     bool isLayered() const noexcept
     {
-        return numLayers > 1;
+        return baseLayer != nullptr;
     }
 
     const_iterator begin() const
@@ -600,6 +604,9 @@ public:
 
 static_assert(std::forward_iterator<Bindings::iterator>);
 static_assert(std::ranges::forward_range<Bindings>);
+static_assert(
+    sizeof(Bindings) == 24,
+    "Bindings header size changed. If intentional, update this assert and the comment in the class definition.");
 
 /**
  * A wrapper around Bindings that ensures that its always in sorted
@@ -716,7 +723,6 @@ public:
     void layerOnTopOf(const Bindings & base) noexcept
     {
         bindings->baseLayer = &base;
-        bindings->numLayers = base.numLayers + 1;
     }
 
     Value & alloc(Symbol name, PosIdx pos = noPos);
