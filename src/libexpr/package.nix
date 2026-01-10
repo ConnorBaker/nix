@@ -12,6 +12,7 @@
   nix-fetchers,
   boost,
   boehmgc,
+  immer,
   nlohmann_json,
   toml11,
 
@@ -71,6 +72,7 @@ mkMesonLibrary (finalAttrs: {
     nix-store
     nix-fetchers
     boost
+    immer
     nlohmann_json
   ]
   ++ lib.optional enableGC boehmgc;

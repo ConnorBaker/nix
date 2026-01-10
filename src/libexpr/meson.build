@@ -53,6 +53,16 @@ deps_other += boost
 nlohmann_json = dependency('nlohmann_json', version : '>= 3.9')
 deps_public += nlohmann_json
 
+immer = dependency(
+  'Immer',
+  version : '>= 0.9.0',
+  method : 'cmake',
+  include_type : 'system',
+)
+# immer is a public dependency, but not a pkg-config dependency, so we
+# put it in `deps_other` (like boost and toml11).
+deps_other += immer
+
 bdw_gc_required = get_option('gc').disable_if(
   'address' in get_option('b_sanitize'),
   error_message : 'Building with Boehm GC and ASAN is not supported',

@@ -30,6 +30,33 @@ scope: {
         NIX_CFLAGS_COMPILE = "-DINITIAL_MARK_STACK_SIZE=1048576";
       });
 
+  # Immer persistent data structures for attribute sets
+  # Upgraded to 0.9.0 and patched for Boehm GC compatibility
+  immer = pkgs.immer.overrideAttrs (old: rec {
+    version = "0.9.0";
+    src = pkgs.fetchFromGitHub {
+      owner = "arximboldi";
+      repo = "immer";
+      rev = "v${version}";
+      hash = "sha256-jP0DXOu21jMkPunXv4CIBb4wVusT21GAWaGcVDnxzzE=";
+    };
+    patches = (old.patches or [ ]) ++ [
+      # Fix static initialization order issues with Boehm GC by using
+      # lazy initialization for the `noone` sentinel in transience policies.
+      ./immer-lazy-noone.patch
+    ];
+    # Disable tests, examples, benchmarks, and fuzzers
+    cmakeFlags = (old.cmakeFlags or [ ]) ++ [
+      "-Dimmer_BUILD_TESTS=OFF"
+      "-Dimmer_BUILD_EXAMPLES=OFF"
+      "-Dimmer_BUILD_EXTRAS=OFF"
+      "-Dimmer_BUILD_DOCS=OFF"
+    ];
+    # Keep header-only installation behavior
+    dontBuild = true;
+    dontUseCmakeBuildDir = true;
+  });
+
   lowdown = pkgs.lowdown.overrideAttrs (prevAttrs: rec {
     version = "2.0.2";
     src = pkgs.fetchurl {
