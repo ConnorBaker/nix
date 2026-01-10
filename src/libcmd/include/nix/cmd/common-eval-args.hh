@@ -19,7 +19,7 @@ struct Settings;
 
 class EvalState;
 struct CompatibilitySettings;
-class Bindings;
+struct Value;
 
 namespace flake {
 struct Settings;
@@ -51,7 +51,7 @@ struct MixEvalArgs : virtual Args, virtual MixRepair
 
     MixEvalArgs();
 
-    Bindings * getAutoArgs(EvalState & state);
+    Value * getAutoArgs(EvalState & state);
 
     LookupPath lookupPath;
 

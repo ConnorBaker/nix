@@ -100,20 +100,20 @@ struct CmdBundle : InstallableValueCommand
         if (!evalState->isDerivation(*vRes))
             throw Error("the bundler '%s' does not produce a derivation", bundler.what());
 
-        auto attr1 = vRes->attrs()->get(evalState->s.drvPath);
+        auto attr1 = vRes->attrsGet(evalState->s.drvPath);
         if (!attr1)
             throw Error("the bundler '%s' does not produce a derivation", bundler.what());
 
         NixStringContext context2;
-        auto drvPath = evalState->coerceToStorePath(attr1->pos, *attr1->value, context2, "");
+        auto drvPath = evalState->coerceToStorePath(attr1.pos, *attr1.value, context2, "");
 
         drvPath.requireDerivation();
 
-        auto attr2 = vRes->attrs()->get(evalState->s.outPath);
+        auto attr2 = vRes->attrsGet(evalState->s.outPath);
         if (!attr2)
             throw Error("the bundler '%s' does not produce a derivation", bundler.what());
 
-        auto outPath = evalState->coerceToStorePath(attr2->pos, *attr2->value, context2, "");
+        auto outPath = evalState->coerceToStorePath(attr2.pos, *attr2.value, context2, "");
 
         store->buildPaths({
             DerivedPath::Built{
@@ -123,10 +123,10 @@ struct CmdBundle : InstallableValueCommand
         });
 
         if (!outLink) {
-            auto * attr = vRes->attrs()->get(evalState->s.name);
+            auto attr = vRes->attrsGet(evalState->s.name);
             if (!attr)
                 throw Error("attribute 'name' missing");
-            outLink = evalState->forceStringNoCtx(*attr->value, attr->pos, "");
+            outLink = evalState->forceStringNoCtx(*attr.value, attr.pos, "");
         }
 
         // TODO: will crash if not a localFSStore?

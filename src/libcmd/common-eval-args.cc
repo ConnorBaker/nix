@@ -152,9 +152,9 @@ MixEvalArgs::MixEvalArgs()
     });
 }
 
-Bindings * MixEvalArgs::getAutoArgs(EvalState & state)
+Value * MixEvalArgs::getAutoArgs(EvalState & state)
 {
-    auto res = state.buildBindings(autoArgs.size());
+    auto res = state.buildBindings(noPos);
     for (auto & [name, arg] : autoArgs) {
         auto v = state.allocValue();
         std::visit(
@@ -174,7 +174,9 @@ Bindings * MixEvalArgs::getAutoArgs(EvalState & state)
             arg);
         res.insert(state.symbols.create(name), v);
     }
-    return res.finish();
+    auto * v = state.allocValue();
+    v->mkAttrs(res);
+    return v;
 }
 
 SourcePath lookupFileArg(EvalState & state, std::string_view s, const std::filesystem::path * baseDir)

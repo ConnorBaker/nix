@@ -1,41 +1,42 @@
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/eval-inline.hh"
 
-#include <algorithm>
-
 namespace nix {
 
 Bindings Bindings::emptyBindings;
 
-/* Allocate a new array of attributes for an attribute set with a specific
-   capacity. The space is implicitly reserved after the Bindings
-   structure. */
-Bindings * EvalMemory::allocBindings(size_t capacity)
+NixList * EvalMemory::allocImmerList(NixList list)
 {
-    if (capacity == 0)
-        return &Bindings::emptyBindings;
-    if (capacity > std::numeric_limits<Bindings::size_type>::max())
-        throw Error("attribute set of size %d is too big", capacity);
-    stats.nrAttrsets++;
-    stats.nrAttrsInAttrsets += capacity;
-    return new (allocBytes(sizeof(Bindings) + sizeof(Attr) * capacity)) Bindings();
+    stats.nrListElems += list.size();
+    // Allocate on GC heap and use placement new
+    auto * ptr = static_cast<NixList *>(allocBytes(sizeof(NixList)));
+    return new (ptr) NixList(std::move(list));
 }
 
-Value & BindingsBuilder::alloc(Symbol name, PosIdx pos)
+Bindings * EvalMemory::allocBindings(AttrMap map, PosIdx pos)
+{
+    stats.nrAttrsets++;
+    stats.nrAttrsInAttrsets += map.size();
+    // Allocate on GC heap and use placement new
+    auto * ptr = static_cast<Bindings *>(allocBytes(sizeof(Bindings)));
+    return new (ptr) Bindings(std::move(map), pos);
+}
+
+Bindings * BindingsBuilder::finish()
+{
+    return mem.get().allocBindings(transient.persistent(), pos);
+}
+
+Value & BindingsBuilder::alloc(Symbol name, PosIdx attrPos)
 {
     auto value = mem.get().allocValue();
-    bindings->push_back(Attr(name, value, pos));
+    transient.set(name, AttrValue(value, attrPos));
     return *value;
 }
 
-Value & BindingsBuilder::alloc(std::string_view name, PosIdx pos)
+Value & BindingsBuilder::alloc(std::string_view name, PosIdx attrPos)
 {
-    return alloc(symbols.get().create(name), pos);
-}
-
-void Bindings::sort()
-{
-    std::sort(attrs, attrs + numAttrs);
+    return alloc(symbols.get().create(name), attrPos);
 }
 
 Value & Value::mkAttrs(BindingsBuilder & bindings)

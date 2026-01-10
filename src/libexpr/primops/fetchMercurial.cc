@@ -20,13 +20,13 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
 
     if (args[0]->type() == nAttrs) {
 
-        for (auto & attr : *args[0]->attrs()) {
-            std::string_view n(state.symbols[attr.name]);
+        args[0]->forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx attrPos) {
+            std::string_view n(state.symbols[attrName]);
             if (n == "url")
                 url = state
                           .coerceToString(
-                              attr.pos,
-                              *attr.value,
+                              attrPos,
+                              *attrValue,
                               context,
                               "while evaluating the `url` attribute passed to builtins.fetchMercurial",
                               false,
@@ -36,19 +36,19 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
                 // Ugly: unlike fetchGit, here the "rev" attribute can
                 // be both a revision or a branch/tag name.
                 auto value = state.forceStringNoCtx(
-                    *attr.value, attr.pos, "while evaluating the `rev` attribute passed to builtins.fetchMercurial");
+                    *attrValue, attrPos, "while evaluating the `rev` attribute passed to builtins.fetchMercurial");
                 if (std::regex_match(value.begin(), value.end(), revRegex))
                     rev = Hash::parseAny(value, HashAlgorithm::SHA1);
                 else
                     ref = value;
             } else if (n == "name")
                 name = state.forceStringNoCtx(
-                    *attr.value, attr.pos, "while evaluating the `name` attribute passed to builtins.fetchMercurial");
+                    *attrValue, attrPos, "while evaluating the `name` attribute passed to builtins.fetchMercurial");
             else
-                state.error<EvalError>("unsupported argument '%s' to 'fetchMercurial'", state.symbols[attr.name])
-                    .atPos(attr.pos)
+                state.error<EvalError>("unsupported argument '%s' to 'fetchMercurial'", state.symbols[attrName])
+                    .atPos(attrPos)
                     .debugThrow();
-        }
+        });
 
         if (url.empty())
             state.error<EvalError>("'url' argument required").atPos(pos).debugThrow();
@@ -83,18 +83,21 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
 
     auto [storePath, input2] = input.fetchToStore(state.fetchSettings, *state.store);
 
-    auto attrs2 = state.buildBindings(8);
-    state.mkStorePathString(storePath, attrs2.alloc(state.s.outPath));
-    if (input2.getRef())
-        attrs2.alloc("branch").mkString(*input2.getRef(), state.mem);
+    // Use BindingsBuilder - Immer everywhere
+    auto builder = state.buildBindings(noPos);
+    state.mkStorePathString(storePath, builder.alloc(state.s.outPath));
+    if (input2.getRef()) {
+        builder.alloc(state.symbols.create("branch")).mkString(*input2.getRef(), state.mem);
+    }
     // Backward compatibility: set 'rev' to
     // 0000000000000000000000000000000000000000 for a dirty tree.
     auto rev2 = input2.getRev().value_or(Hash(HashAlgorithm::SHA1));
-    attrs2.alloc("rev").mkString(rev2.gitRev(), state.mem);
-    attrs2.alloc("shortRev").mkString(rev2.gitRev().substr(0, 12), state.mem);
-    if (auto revCount = input2.getRevCount())
-        attrs2.alloc("revCount").mkInt(*revCount);
-    v.mkAttrs(attrs2);
+    builder.alloc(state.symbols.create("rev")).mkString(rev2.gitRev(), state.mem);
+    builder.alloc(state.symbols.create("shortRev")).mkString(rev2.gitRev().substr(0, 12), state.mem);
+    if (auto revCount = input2.getRevCount()) {
+        builder.alloc(state.symbols.create("revCount")).mkInt(*revCount);
+    }
+    v.mkAttrs(builder);
 
     state.allowPath(storePath);
 }

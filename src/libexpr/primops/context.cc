@@ -205,26 +205,30 @@ static void prim_getContext(EvalState & state, const PosIdx pos, Value ** args, 
             ((NixStringContextElem &&) i).raw);
     }
 
-    auto attrs = state.buildBindings(contextInfos.size());
+    // Use BindingsBuilder - Immer everywhere
+    auto builder = state.buildBindings(noPos);
 
     auto sPath = state.symbols.create("path");
     auto sAllOutputs = state.symbols.create("allOutputs");
     for (const auto & info : contextInfos) {
-        auto infoAttrs = state.buildBindings(3);
-        if (info.second.path)
-            infoAttrs.alloc(sPath).mkBool(true);
-        if (info.second.allOutputs)
-            infoAttrs.alloc(sAllOutputs).mkBool(true);
+        // Use BindingsBuilder for nested attrs
+        auto infoBuilder = state.buildBindings(noPos);
+        if (info.second.path) {
+            infoBuilder.insert(sPath, &Value::vTrue);
+        }
+        if (info.second.allOutputs) {
+            infoBuilder.insert(sAllOutputs, &Value::vTrue);
+        }
         if (!info.second.outputs.empty()) {
             auto list = state.buildList(info.second.outputs.size());
             for (const auto & [i, output] : enumerate(info.second.outputs))
                 (list[i] = state.allocValue())->mkString(output, state.mem);
-            infoAttrs.alloc(state.s.outputs).mkList(list);
+            infoBuilder.alloc(state.s.outputs).mkList(list);
         }
-        attrs.alloc(state.store->printStorePath(info.first)).mkAttrs(infoAttrs);
+        builder.alloc(state.symbols.create(state.store->printStorePath(info.first))).mkAttrs(infoBuilder);
     }
 
-    v.mkAttrs(attrs);
+    v.mkAttrs(builder);
 }
 
 static RegisterPrimOp primop_getContext(
@@ -266,31 +270,31 @@ static void prim_appendContext(EvalState & state, const PosIdx pos, Value ** arg
 
     auto sPath = state.symbols.create("path");
     auto sAllOutputs = state.symbols.create("allOutputs");
-    for (auto & i : *args[1]->attrs()) {
-        const auto & name = state.symbols[i.name];
+    args[1]->forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx attrPos) {
+        const auto & name = state.symbols[attrName];
         if (!state.store->isStorePath(name))
-            state.error<EvalError>("context key '%s' is not a store path", name).atPos(i.pos).debugThrow();
+            state.error<EvalError>("context key '%s' is not a store path", name).atPos(attrPos).debugThrow();
         auto namePath = state.store->parseStorePath(name);
         if (!settings.readOnlyMode)
             state.store->ensurePath(namePath);
-        state.forceAttrs(*i.value, i.pos, "while evaluating the value of a string context");
+        state.forceAttrs(*attrValue, attrPos, "while evaluating the value of a string context");
 
-        if (auto attr = i.value->attrs()->get(sPath)) {
-            if (state.forceBool(*attr->value, attr->pos, "while evaluating the `path` attribute of a string context"))
+        if (auto attr = attrValue->attrsGet(sPath)) {
+            if (state.forceBool(*attr.value, attr.pos, "while evaluating the `path` attribute of a string context"))
                 context.emplace(
                     NixStringContextElem::Opaque{
                         .path = namePath,
                     });
         }
 
-        if (auto attr = i.value->attrs()->get(sAllOutputs)) {
+        if (auto attr = attrValue->attrsGet(sAllOutputs)) {
             if (state.forceBool(
-                    *attr->value, attr->pos, "while evaluating the `allOutputs` attribute of a string context")) {
+                    *attr.value, attr.pos, "while evaluating the `allOutputs` attribute of a string context")) {
                 if (!isDerivation(name)) {
                     state
                         .error<EvalError>(
                             "tried to add all-outputs context of %s, which is not a derivation, to a string", name)
-                        .atPos(i.pos)
+                        .atPos(attrPos)
                         .debugThrow();
                 }
                 context.emplace(
@@ -300,18 +304,18 @@ static void prim_appendContext(EvalState & state, const PosIdx pos, Value ** arg
             }
         }
 
-        if (auto attr = i.value->attrs()->get(state.s.outputs)) {
-            state.forceList(*attr->value, attr->pos, "while evaluating the `outputs` attribute of a string context");
-            if (attr->value->listSize() && !isDerivation(name)) {
+        if (auto attr = attrValue->attrsGet(state.s.outputs)) {
+            state.forceList(*attr.value, attr.pos, "while evaluating the `outputs` attribute of a string context");
+            if (attr.value->listSize() && !isDerivation(name)) {
                 state
                     .error<EvalError>(
                         "tried to add derivation output context of %s, which is not a derivation, to a string", name)
-                    .atPos(i.pos)
+                    .atPos(attrPos)
                     .debugThrow();
             }
-            for (auto elem : attr->value->listView()) {
+            for (auto elem : attr.value->listView()) {
                 auto outputName =
-                    state.forceStringNoCtx(*elem, attr->pos, "while evaluating an output name within a string context");
+                    state.forceStringNoCtx(*elem, attr.pos, "while evaluating an output name within a string context");
                 context.emplace(
                     NixStringContextElem::Built{
                         .drvPath = makeConstantStorePathRef(namePath),
@@ -319,7 +323,7 @@ static void prim_appendContext(EvalState & state, const PosIdx pos, Value ** arg
                     });
             }
         }
-    }
+    });
 
     v.mkString(orig, context, state.mem);
 }

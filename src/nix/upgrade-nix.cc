@@ -162,8 +162,9 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
         auto state = std::make_unique<EvalState>(LookupPath{}, store, fetchSettings, evalSettings);
         auto v = state->allocValue();
         state->eval(state->parseExprFromString(res.data, state->rootPath(CanonPath("/no-such-path"))), *v);
-        Bindings & bindings = Bindings::emptyBindings;
-        auto v2 = findAlongAttrPath(*state, settings.thisSystem, bindings, *v).first;
+        Value emptyArgs;
+        emptyArgs.mkAttrs(&Bindings::emptyBindings);
+        auto v2 = findAlongAttrPath(*state, settings.thisSystem, emptyArgs, *v).first;
 
         return store->parseStorePath(
             state->forceString(*v2, noPos, "while evaluating the path tho latest nix version"));

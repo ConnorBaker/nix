@@ -277,11 +277,11 @@ static void showHelp(std::vector<std::string> subcommand, NixArgs & toplevel)
     Value * args[]{&state.getBuiltin("false"), vDump};
     state.callFunction(*vGenerateManpage, args, *vRes, noPos);
 
-    auto attr = vRes->attrs()->get(state.symbols.create(mdName + ".md"));
+    auto attr = vRes->attrsGet(state.symbols.create(mdName + ".md"));
     if (!attr)
         throw UsageError("Nix has no subcommand '%s'", concatStringsSep("", subcommand));
 
-    auto markdown = state.forceString(*attr->value, noPos, "while evaluating the lowdown help text");
+    auto markdown = state.forceString(*attr.value, noPos, "while evaluating the lowdown help text");
 
     RunPager pager;
     std::cout << renderMarkdownToTerminal(markdown) << "\n";
@@ -449,19 +449,26 @@ void mainWrapped(int argc, char ** argv)
         evalSettings.pureEval = false;
         EvalState state({}, openStore("dummy://"), fetchSettings, evalSettings);
         auto builtinsJson = nlohmann::json::object();
-        for (auto & builtinPtr : state.getBuiltins().attrs()->lexicographicOrder(state.symbols)) {
-            auto & builtin = *builtinPtr;
+        /* Collect builtins and sort by name for deterministic output */
+        std::vector<std::tuple<std::string, Value*, PosIdx>> builtinsList;
+        state.getBuiltins().forEachAttr([&](Symbol name, Value* value, PosIdx pos) {
+            builtinsList.emplace_back(state.symbols[name], value, pos);
+        });
+        std::sort(builtinsList.begin(), builtinsList.end(),
+            [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
+
+        for (const auto& [name, value, pos] : builtinsList) {
             auto b = nlohmann::json::object();
-            if (!builtin.value->isPrimOp())
+            if (!value->isPrimOp())
                 continue;
-            auto primOp = builtin.value->primOp();
+            auto primOp = value->primOp();
             if (!primOp->doc)
                 continue;
             b["args"] = primOp->args;
             b["doc"] = trim(stripIndentation(*primOp->doc));
             if (primOp->experimentalFeature)
                 b["experimental-feature"] = primOp->experimentalFeature;
-            builtinsJson.emplace(state.symbols[builtin.name], std::move(b));
+            builtinsJson.emplace(name, std::move(b));
         }
         for (auto & [name, info] : state.constantInfos) {
             auto b = nlohmann::json::object();

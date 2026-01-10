@@ -87,7 +87,7 @@ static void prim_parseFlakeRef(EvalState & state, const PosIdx pos, Value ** arg
     std::string flakeRefS(
         state.forceStringNoCtx(*args[0], pos, "while evaluating the argument passed to builtins.parseFlakeRef"));
     auto attrs = nix::parseFlakeRef(state.fetchSettings, flakeRefS, {}, true).toAttrs();
-    auto binds = state.buildBindings(attrs.size());
+    auto binds = state.buildBindings(pos);
     for (const auto & [key, value] : attrs) {
         auto s = state.symbols.create(key);
         auto & vv = binds.alloc(s);
@@ -127,34 +127,34 @@ static void prim_flakeRefToString(EvalState & state, const PosIdx pos, Value ** 
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.flakeRefToString");
     fetchers::Attrs attrs;
-    for (const auto & attr : *args[0]->attrs()) {
-        auto t = attr.value->type();
+    args[0]->forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx) {
+        auto t = attrValue->type();
         if (t == nInt) {
-            auto intValue = attr.value->integer().value;
+            auto intValue = attrValue->integer().value;
 
             if (intValue < 0) {
                 state
                     .error<EvalError>(
-                        "negative value given for flake ref attr %1%: %2%", state.symbols[attr.name], intValue)
+                        "negative value given for flake ref attr %1%: %2%", state.symbols[attrName], intValue)
                     .atPos(pos)
                     .debugThrow();
             }
 
-            attrs.emplace(state.symbols[attr.name], uint64_t(intValue));
+            attrs.emplace(state.symbols[attrName], uint64_t(intValue));
         } else if (t == nBool) {
-            attrs.emplace(state.symbols[attr.name], Explicit<bool>{attr.value->boolean()});
+            attrs.emplace(state.symbols[attrName], Explicit<bool>{attrValue->boolean()});
         } else if (t == nString) {
-            attrs.emplace(state.symbols[attr.name], std::string(attr.value->string_view()));
+            attrs.emplace(state.symbols[attrName], std::string(attrValue->string_view()));
         } else {
             state
                 .error<EvalError>(
                     "flake reference attribute sets may only contain integers, Booleans, "
                     "and strings, but attribute '%s' is %s",
-                    state.symbols[attr.name],
-                    showType(*attr.value))
+                    state.symbols[attrName],
+                    showType(*attrValue))
                 .debugThrow();
         }
-    }
+    });
     auto flakeRef = FlakeRef::fromAttrs(state.fetchSettings, attrs);
     v.mkString(flakeRef.to_string(), state.mem);
 }

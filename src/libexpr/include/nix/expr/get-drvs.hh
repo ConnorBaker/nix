@@ -32,9 +32,10 @@ private:
      */
     bool failed = false;
 
-    const Bindings *attrs = nullptr, *meta = nullptr;
+    Value * attrsValue = nullptr;
+    Value * metaValue = nullptr;
 
-    const Bindings * getMeta();
+    Value * getMeta();
 
     bool checkMeta(Value & v);
 
@@ -46,7 +47,7 @@ public:
 
     PackageInfo(EvalState & state)
         : state(&state) {};
-    PackageInfo(EvalState & state, std::string attrPath, const Bindings * attrs);
+    PackageInfo(EvalState & state, std::string attrPath, Value * attrsValue);
     PackageInfo(EvalState & state, ref<Store> store, const std::string & drvPathWithOutputs);
 
     std::string queryName() const;
@@ -112,7 +113,7 @@ void getDerivations(
     EvalState & state,
     Value & v,
     const std::string & pathPrefix,
-    Bindings & autoArgs,
+    Value & autoArgs,
     PackageInfos & drvs,
     bool ignoreAssertionFailures);
 

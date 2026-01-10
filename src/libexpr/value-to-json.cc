@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <nlohmann/json.hpp>
+#include <gc/gc_allocator.h>
 
 namespace nix {
 using json = nlohmann::json;
@@ -55,18 +56,24 @@ json printValueAsJSON(
             out = *maybeString;
             break;
         }
-        if (auto i = v.attrs()->get(state.s.outPath))
-            return printValueAsJSON(state, strict, *i->value, i->pos, context, copyToStore);
+        if (auto i = v.attrsGet(state.s.outPath))
+            return printValueAsJSON(state, strict, *i.value, i.pos, context, copyToStore);
         else {
             out = json::object();
-            for (auto & a : v.attrs()->lexicographicOrder(state.symbols)) {
+            // Build a sorted list of attributes
+            // Use gc_allocator so the GC can see Value* pointers stored in the vector
+            std::vector<std::tuple<std::string_view, Value *, PosIdx>, gc_allocator<std::tuple<std::string_view, Value *, PosIdx>>> sorted;
+            v.forEachAttr([&](Symbol name, Value * value, PosIdx pos) {
+                sorted.emplace_back(state.symbols[name], value, pos);
+            });
+            std::sort(sorted.begin(), sorted.end(), [](auto & a, auto & b) {
+                return std::get<0>(a) < std::get<0>(b);
+            });
+            for (auto & [name, value, attrPos] : sorted) {
                 try {
-                    out.emplace(
-                        state.symbols[a->name],
-                        printValueAsJSON(state, strict, *a->value, a->pos, context, copyToStore));
+                    out.emplace(name, printValueAsJSON(state, strict, *value, attrPos, context, copyToStore));
                 } catch (Error & e) {
-                    e.addTrace(
-                        state.positions[a->pos], HintFmt("while evaluating attribute '%1%'", state.symbols[a->name]));
+                    e.addTrace(state.positions[attrPos], HintFmt("while evaluating attribute '%1%'", name));
                     throw;
                 }
             }

@@ -288,12 +288,12 @@ StringSet NixRepl::completePrefix(const std::string & prefix)
                 noPos,
                 "while evaluating an attrset for the purpose of completion (this error should not be displayed; file an issue?)");
 
-            for (auto & i : *v.attrs()) {
-                std::string_view name = state->symbols[i.name];
+            v.forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx attrPos) {
+                std::string_view name = state->symbols[attrName];
                 if (name.substr(0, cur2.size()) != cur2)
-                    continue;
+                    return;
                 completions.insert(concatStrings(prev, expr, ".", name));
-            }
+            });
 
         } catch (ParseError & e) {
             // Quietly ignore parse errors.
@@ -626,9 +626,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
             fallbackName = state->symbols[name];
 
             state->forceAttrs(vAttrs, noPos, "while evaluating an attribute set to look for documentation");
-            auto attrs = vAttrs.attrs();
-            assert(attrs);
-            auto attr = attrs->get(name);
+            auto attr = vAttrs.attrsGet(name);
             if (!attr) {
                 // When missing, trigger the normal exception
                 // e.g. :doc builtins.foo
@@ -638,8 +636,8 @@ ProcessLineResult NixRepl::processLine(std::string line)
                 evalString(arg, v);
                 assert(false);
             }
-            if (attr->pos) {
-                fallbackPos = attr->pos;
+            if (attr.pos) {
+                fallbackPos = attr.pos;
                 fallbackDoc = state->getDocCommentForPos(fallbackPos);
             }
         }
@@ -775,10 +773,16 @@ void NixRepl::showLastLoaded()
 {
     RunPager pager;
 
-    for (auto & i : *lastLoaded.attrs()) {
-        std::string_view name = state->symbols[i.name];
-        logger->cout(name);
-    }
+    // Collect and sort names for deterministic output
+    // (Immer maps iterate in hash order, not sorted order)
+    std::vector<Symbol> names;
+    lastLoaded.forEachAttr([&](Symbol attrName, Value *, PosIdx) {
+        names.push_back(attrName);
+    });
+    std::sort(names.begin(), names.end());
+
+    for (auto & name : names)
+        logger->cout(state->symbols[name]);
 }
 
 void NixRepl::reloadFilesAndFlakes()
@@ -822,38 +826,48 @@ void NixRepl::addAttrsToScope(Value & attrs)
         attrs,
         [&]() { return attrs.determinePos(noPos); },
         "while evaluating an attribute set to be merged in the global scope");
-    if (displ + attrs.attrs()->size() >= envSize)
+    auto attrCount = attrs.attrsSize();
+    if (displ + attrCount >= envSize)
         throw Error("environment full; cannot add more variables");
 
-    for (auto & i : *attrs.attrs()) {
-        staticEnv->vars.emplace_back(i.name, displ);
-        env->values[displ++] = i.value;
-        varNames.emplace(state->symbols[i.name]);
-    }
+    attrs.forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx attrPos) {
+        staticEnv->vars.emplace_back(attrName, displ);
+        env->values[displ++] = attrValue;
+        varNames.emplace(state->symbols[attrName]);
+    });
     staticEnv->sort();
     staticEnv->deduplicate();
-    notice("Added %1% variables.", attrs.attrs()->size());
+    notice("Added %1% variables.", attrCount);
 
     lastLoaded = attrs;
+
+    // Collect and sort attribute names for display
+    std::vector<Symbol> sortedNames;
+    attrs.forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx attrPos) {
+        sortedNames.push_back(attrName);
+    });
+    std::sort(sortedNames.begin(), sortedNames.end(), [&](Symbol a, Symbol b) {
+        return static_cast<std::string_view>(state->symbols[a]) < static_cast<std::string_view>(state->symbols[b]);
+    });
 
     const int max_print = 20;
     int counter = 0;
     std::ostringstream loaded;
-    for (auto & i : attrs.attrs()->lexicographicOrder(state->symbols)) {
+    for (auto & name : sortedNames) {
         if (counter >= max_print)
             break;
 
         if (counter > 0)
             loaded << ", ";
 
-        printIdentifier(loaded, state->symbols[i->name]);
+        printIdentifier(loaded, state->symbols[name]);
         counter += 1;
     }
 
     notice("%1%", loaded.str());
 
-    if (attrs.attrs()->size() > max_print)
-        notice("... and %1% more; view with :ll", attrs.attrs()->size() - max_print);
+    if (attrCount > max_print)
+        notice("... and %1% more; view with :ll", attrCount - max_print);
 }
 
 void NixRepl::addVarToScope(const Symbol name, Value & v)

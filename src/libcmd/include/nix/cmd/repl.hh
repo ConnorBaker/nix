@@ -8,7 +8,7 @@ namespace nix {
 struct AbstractNixRepl
 {
     ref<EvalState> state;
-    Bindings * autoArgs;
+    Value * autoArgs;
 
     AbstractNixRepl(ref<EvalState> state)
         : state(state)

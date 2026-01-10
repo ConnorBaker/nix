@@ -4,6 +4,7 @@
 #include "nix/util/signals.hh"
 
 #include <cstdlib>
+#include <gc/gc_allocator.h>
 
 namespace nix {
 
@@ -36,21 +37,29 @@ static void showAttrs(
     EvalState & state,
     bool strict,
     bool location,
-    const Bindings & attrs,
+    Value & v,
     XMLWriter & doc,
     NixStringContext & context,
     PathSet & drvsSeen)
 {
-    StringSet names;
+    // Build a sorted list of (name, value, pos) tuples
+    // Use gc_allocator so the GC can see Value* pointers stored in the vector
+    std::vector<std::tuple<std::string_view, Value *, PosIdx>, gc_allocator<std::tuple<std::string_view, Value *, PosIdx>>> sorted;
+    v.forEachAttr([&](Symbol name, Value * value, PosIdx pos) {
+        sorted.emplace_back(state.symbols[name], value, pos);
+    });
+    std::sort(sorted.begin(), sorted.end(), [](auto & a, auto & b) {
+        return std::get<0>(a) < std::get<0>(b);
+    });
 
-    for (auto & a : attrs.lexicographicOrder(state.symbols)) {
+    for (auto & [name, value, attrPos] : sorted) {
         XMLAttrs xmlAttrs;
-        xmlAttrs["name"] = state.symbols[a->name];
-        if (location && a->pos)
-            posToXML(state, xmlAttrs, state.positions[a->pos]);
+        xmlAttrs["name"] = name;
+        if (location && attrPos)
+            posToXML(state, xmlAttrs, state.positions[attrPos]);
 
         XMLOpenElement _(doc, "attr", xmlAttrs);
-        printValueAsXML(state, strict, location, *a->value, doc, context, drvsSeen, a->pos);
+        printValueAsXML(state, strict, location, *value, doc, context, drvsSeen, attrPos);
     }
 }
 
@@ -65,8 +74,6 @@ static void printValueAsXML(
     const PosIdx pos)
 {
     checkInterrupt();
-
-    auto _level = state.addCallDepth(pos);
 
     if (strict)
         state.forceValue(v, pos);
@@ -100,31 +107,31 @@ static void printValueAsXML(
             XMLAttrs xmlAttrs;
 
             Path drvPath;
-            if (auto a = v.attrs()->get(state.s.drvPath)) {
+            if (auto a = v.attrsGet(state.s.drvPath)) {
                 if (strict)
-                    state.forceValue(*a->value, a->pos);
-                if (a->value->type() == nString)
-                    xmlAttrs["drvPath"] = drvPath = a->value->string_view();
+                    state.forceValue(*a.value, a.pos);
+                if (a.value->type() == nString)
+                    xmlAttrs["drvPath"] = drvPath = a.value->string_view();
             }
 
-            if (auto a = v.attrs()->get(state.s.outPath)) {
+            if (auto a = v.attrsGet(state.s.outPath)) {
                 if (strict)
-                    state.forceValue(*a->value, a->pos);
-                if (a->value->type() == nString)
-                    xmlAttrs["outPath"] = a->value->string_view();
+                    state.forceValue(*a.value, a.pos);
+                if (a.value->type() == nString)
+                    xmlAttrs["outPath"] = a.value->string_view();
             }
 
             XMLOpenElement _(doc, "derivation", xmlAttrs);
 
             if (drvPath != "" && drvsSeen.insert(drvPath).second)
-                showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
+                showAttrs(state, strict, location, v, doc, context, drvsSeen);
             else
                 doc.writeEmptyElement("repeated");
         }
 
         else {
             XMLOpenElement _(doc, "attrs");
-            showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
+            showAttrs(state, strict, location, v, doc, context, drvsSeen);
         }
 
         break;

@@ -4,6 +4,8 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-error.hh"
 
+#include <gc/gc_allocator.h>
+
 namespace nix {
 
 // See: https://github.com/NixOS/nix/issues/9730
@@ -13,6 +15,7 @@ void printAmbiguous(EvalState & state, Value & v, std::ostream & str, std::set<c
 
     if (depth > state.settings.maxCallDepth)
         state.error<StackOverflowError>().atPos(v.determinePos(noPos)).debugThrow();
+
     switch (v.type()) {
     case nInt:
         str << v.integer();
@@ -30,13 +33,25 @@ void printAmbiguous(EvalState & state, Value & v, std::ostream & str, std::set<c
         str << "null";
         break;
     case nAttrs: {
-        if (seen && !v.attrs()->empty() && !seen->insert(v.attrs()).second)
+        // Get a unique pointer for cycle detection
+        const void * seenKey = static_cast<const void *>(&v.attrs());
+        if (seen && v.attrsSize() > 0 && !seen->insert(seenKey).second)
             str << "«repeated»";
         else {
             str << "{ ";
-            for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
-                str << state.symbols[i->name] << " = ";
-                printAmbiguous(state, *i->value, str, seen, depth + 1);
+            // Build a sorted list of (name, value) pairs
+            // Use gc_allocator so the GC can see Value* pointers stored in the vector
+            std::vector<std::pair<std::string_view, Value *>, gc_allocator<std::pair<std::string_view, Value *>>> sorted;
+            v.forEachAttr([&](Symbol name, Value * value, PosIdx) {
+                sorted.emplace_back(state.symbols[name], value);
+            });
+            std::sort(sorted.begin(), sorted.end(), [](auto & a, auto & b) {
+                return a.first < b.first;
+            });
+            for (auto & [name, value] : sorted) {
+                printAttributeName(str, name);
+                str << " = ";
+                printAmbiguous(state, *value, str, seen, depth + 1);
                 str << "; ";
             }
             str << "}";

@@ -21,6 +21,11 @@
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/util/url.hh"
+
+#include <gc/gc_allocator.h>
+#if NIX_USE_BOEHMGC
+#include <gc/gc.h>
+#endif
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/tarball.hh"
 #include "nix/fetchers/input-cache.hh"
@@ -190,7 +195,7 @@ PosIdx Value::determinePos(const PosIdx pos) const
 #pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (getInternalType()) {
     case tAttrs:
-        return attrs()->pos;
+        return attrs().pos;
     case tLambda:
         return lambda().fun->pos;
     case tApp:
@@ -348,6 +353,7 @@ EvalState::EvalState(
     );
 
     createBaseEnv(settings);
+    finalizeBuiltins();
 
     /* Register function call tracer. */
     if (settings.traceFunctionCalls)
@@ -473,7 +479,10 @@ void EvalState::addConstant(const std::string & name, Value * v, Constant info)
         /* Install value the base environment. */
         staticBaseEnv->vars.emplace_back(symbols.create(name), baseEnvDispl);
         baseEnv.values[baseEnvDispl++] = v;
-        const_cast<Bindings *>(getBuiltins().attrs())->push_back(Attr(symbols.create(name2), v));
+
+        /* Add to builtins transient (will be finalized later) */
+        assert(builtinsTransient_.has_value() && "builtinsTransient_ must be initialized before adding constants");
+        builtinsTransient_->set(symbols.create(name2), AttrValue(v, noPos));
     }
 }
 
@@ -542,7 +551,10 @@ Value * EvalState::addPrimOp(PrimOp && primOp)
     else {
         staticBaseEnv->vars.emplace_back(envName, baseEnvDispl);
         baseEnv.values[baseEnvDispl++] = v;
-        const_cast<Bindings *>(getBuiltins().attrs())->push_back(Attr(symbols.create(primOp.name), v));
+
+        /* Add to builtins transient (will be finalized later) */
+        assert(builtinsTransient_.has_value() && "builtinsTransient_ must be initialized before adding primops");
+        builtinsTransient_->set(symbols.create(primOp.name), AttrValue(v, noPos));
     }
 
     return v;
@@ -555,11 +567,28 @@ Value & EvalState::getBuiltins()
 
 Value & EvalState::getBuiltin(const std::string & name)
 {
-    auto it = getBuiltins().attrs()->get(symbols.create(name));
-    if (it)
-        return *it->value;
+    auto ref = getBuiltins().attrsGet(symbols.create(name));
+    if (ref)
+        return *ref.value;
     else
         error<EvalError>("builtin '%1%' not found", name).debugThrow();
+}
+
+void EvalState::finalizeBuiltins()
+{
+    assert(builtinsTransient_.has_value() && "finalizeBuiltins called but no transient exists");
+
+    /* Add 'builtins' to itself so that builtins.builtins works */
+    builtinsTransient_->set(symbols.create("builtins"), AttrValue(baseEnv.values[0], noPos));
+
+    /* Convert the transient to an immutable Bindings */
+    auto * bindings = mem.allocBindings(builtinsTransient_->persistent(), noPos);
+
+    /* Store in baseEnv.values[0] which is the 'builtins' value */
+    baseEnv.values[0]->mkAttrs(bindings);
+
+    /* Clear the transient to free memory and prevent further modifications */
+    builtinsTransient_.reset();
 }
 
 std::optional<EvalState::Doc> EvalState::getDoc(Value & v)
@@ -622,7 +651,7 @@ std::optional<EvalState::Doc> EvalState::getDoc(Value & v)
     }
     if (isFunctor(v)) {
         try {
-            Value & functor = *v.attrs()->get(s.functor)->value;
+            Value & functor = *v.attrsGet(s.functor).value;
             Value * vp[] = {&v};
             Value partiallyApplied;
             // The first parameter is not user-provided, and may be
@@ -657,11 +686,9 @@ void printWithBindings(const SymbolTable & st, const Env & env)
     if (!env.values[0]->isThunk()) {
         std::cout << "with: ";
         std::cout << ANSI_MAGENTA;
-        auto j = env.values[0]->attrs()->begin();
-        while (j != env.values[0]->attrs()->end()) {
-            std::cout << st[j->name] << " ";
-            ++j;
-        }
+        env.values[0]->forEachAttr([&](Symbol name, Value *, PosIdx) {
+            std::cout << st[name] << " ";
+        });
         std::cout << ANSI_NORMAL;
         std::cout << std::endl;
     }
@@ -711,8 +738,9 @@ void mapStaticEnvBindings(const SymbolTable & st, const StaticEnv & se, const En
 
         if (se.isWith && !env.values[0]->isThunk()) {
             // add 'with' bindings.
-            for (auto & j : *env.values[0]->attrs())
-                vm.insert_or_assign(std::string(st[j.name]), j.value);
+            env.values[0]->forEachAttr([&](Symbol name, Value * value, PosIdx) {
+                vm.insert_or_assign(std::string(st[name]), value);
+            });
         } else {
             // iterate through staticenv bindings and add them.
             for (auto & i : se.vars)
@@ -903,10 +931,10 @@ inline Value * EvalState::lookupVar(Env * env, const ExprVar & var, bool noEval)
     auto * fromWith = var.fromWith;
     while (1) {
         forceAttrs(*env->values[0], fromWith->pos, "while evaluating the first subexpression of a with expression");
-        if (auto j = env->values[0]->attrs()->get(var.name)) {
+        if (auto ref = env->values[0]->attrsGet(var.name)) {
             if (countCalls)
-                attrSelects[j->pos]++;
-            return j->value;
+                attrSelects[ref.pos]++;
+            return ref.value;
         }
         if (!fromWith->parentWith)
             error<UndefinedVarError>("undefined variable '%1%'", symbols[var.name])
@@ -947,7 +975,8 @@ void EvalState::mkPos(Value & v, PosIdx p)
 {
     auto origin = positions.originOf(p);
     if (auto path = std::get_if<SourcePath>(&origin)) {
-        auto attrs = buildBindings(3);
+        // Always 3 elements: file, line, column
+        auto attrs = buildBindings();
         attrs.alloc(s.file).mkString(path->path.abs(), mem);
         makePositionThunks(*this, p, attrs.alloc(s.line), attrs.alloc(s.column));
         v.mkAttrs(attrs);
@@ -1231,9 +1260,15 @@ Env * ExprAttrs::buildInheritFromEnv(EvalState & state, Env & up)
 
 void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
 {
-    auto bindings = state.buildBindings(attrs->size() + dynamicAttrs->size());
     auto dynamicEnv = &env;
-    bool sort = false;
+
+    bool hasOverrides = false;
+    if (recursive) {
+        AttrDefs::iterator overridesIt = attrs->find(state.s.overrides);
+        hasOverrides = overridesIt != attrs->end();
+    }
+
+    auto builder = state.buildBindings(pos);
 
     if (recursive) {
         /* Create a new environment that contains the attributes in
@@ -1244,7 +1279,6 @@ void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
         Env * inheritEnv = inheritFromExprs ? buildInheritFromEnv(state, env2) : nullptr;
 
         AttrDefs::iterator overrides = attrs->find(state.s.overrides);
-        bool hasOverrides = overrides != attrs->end();
 
         /* The recursive attributes are evaluated in the new
            environment, while the inherited attributes are evaluated
@@ -1258,7 +1292,7 @@ void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
             } else
                 vAttr = i.second.e->maybeThunk(state, *i.second.chooseByKind(&env2, &env, inheritEnv));
             env2.values[displ++] = vAttr;
-            bindings.insert(i.first, vAttr, i.second.pos);
+            builder.insert(i.first, vAttr, i.second.pos);
         }
 
         /* If the rec contains an attribute called `__overrides', then
@@ -1270,28 +1304,30 @@ void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
            been substituted into the bodies of the other attributes.
            Hence we need __overrides.) */
         if (hasOverrides) {
-            Value * vOverrides = (*bindings.bindings)[overrides->second.displ].value;
+            // Get __overrides value from the environment (same value as in builder)
+            Value * vOverrides = env2.values[overrides->second.displ];
             state.forceAttrs(
                 *vOverrides,
                 [&]() { return vOverrides->determinePos(noPos); },
                 "while evaluating the `__overrides` attribute");
-            bindings.grow(state.buildBindings(bindings.capacity() + vOverrides->attrs()->size()));
-            for (auto & i : *vOverrides->attrs()) {
-                AttrDefs::iterator j = attrs->find(i.name);
+            vOverrides->forEachAttr([&](Symbol name, Value * value, PosIdx attrPos) {
+                AttrDefs::iterator j = attrs->find(name);
                 if (j != attrs->end()) {
-                    (*bindings.bindings)[j->second.displ] = i;
-                    env2.values[j->second.displ] = i.value;
-                } else
-                    bindings.push_back(i);
-            }
-            sort = true;
+                    // Override existing attr in both builder and environment
+                    builder.insert(name, value, attrPos);
+                    env2.values[j->second.displ] = value;
+                } else {
+                    // Add new attr
+                    builder.insert(name, value, attrPos);
+                }
+            });
         }
     }
 
     else {
         Env * inheritEnv = inheritFromExprs ? buildInheritFromEnv(state, env) : nullptr;
         for (auto & i : *attrs)
-            bindings.insert(
+            builder.insert(
                 i.first, i.second.e->maybeThunk(state, *i.second.chooseByKind(&env, &env, inheritEnv)), i.second.pos);
     }
 
@@ -1304,26 +1340,20 @@ void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
             continue;
         state.forceStringNoCtx(nameVal, i.pos, "while evaluating the name of a dynamic attribute");
         auto nameSym = state.symbols.create(nameVal.string_view());
-        if (sort)
-            // FIXME: inefficient
-            bindings.bindings->sort();
-        if (auto j = bindings.bindings->get(nameSym))
+        // Check for duplicates using name-based lookup (Immer maps are always consistent)
+        if (auto existing = builder.get(nameSym))
             state
                 .error<EvalError>(
-                    "dynamic attribute '%1%' already defined at %2%", state.symbols[nameSym], state.positions[j->pos])
+                    "dynamic attribute '%1%' already defined at %2%", state.symbols[nameSym], state.positions[existing->pos])
                 .atPos(i.pos)
                 .withFrame(env, *this)
                 .debugThrow();
 
         i.valueExpr->setName(nameSym);
-        /* Keep sorted order so find can catch duplicates */
-        bindings.insert(nameSym, i.valueExpr->maybeThunk(state, *dynamicEnv), i.pos);
-        sort = true;
+        builder.insert(nameSym, i.valueExpr->maybeThunk(state, *dynamicEnv), i.pos);
     }
 
-    bindings.bindings->pos = pos;
-
-    v.mkAttrs(sort ? bindings.finish() : bindings.alreadySorted());
+    v.mkAttrs(builder);
 }
 
 void ExprLet::eval(EvalState & state, Env & env, Value & v)
@@ -1352,10 +1382,16 @@ void ExprLet::eval(EvalState & state, Env & env, Value & v)
 
 void ExprList::eval(EvalState & state, Env & env, Value & v)
 {
-    auto list = state.buildList(elems.size());
-    for (const auto & [n, v2] : enumerate(list))
-        v2 = elems[n]->maybeThunk(state, env);
-    v.mkList(list);
+    if (elems.empty()) {
+        v = Value::vEmptyList;
+        return;
+    }
+
+    // Use Immer transient for efficient batch list construction
+    auto transient = state.mem.buildImmerList();
+    for (auto & elem : elems)
+        transient.push_back(elem->maybeThunk(state, env));
+    v.mkImmerList(state.mem.allocImmerList(std::move(transient).persistent()));
 }
 
 Value * ExprList::maybeThunk(EvalState & state, Env & env)
@@ -1414,20 +1450,21 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
 
         for (auto & i : getAttrPath()) {
             state.nrLookups++;
-            const Attr * j;
             auto name = getName(i, state, env);
+            Value::AttrRef ref;
             if (def) {
                 state.forceValue(*vAttrs, pos);
-                if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
+                if (vAttrs->type() != nAttrs || !(ref = vAttrs->attrsGet(name))) {
                     def->eval(state, env, v);
                     return;
                 }
             } else {
                 state.forceAttrs(*vAttrs, pos, "while selecting an attribute");
-                if (!(j = vAttrs->attrs()->get(name))) {
+                if (!(ref = vAttrs->attrsGet(name))) {
                     StringSet allAttrNames;
-                    for (auto & attr : *vAttrs->attrs())
-                        allAttrNames.insert(std::string(state.symbols[attr.name]));
+                    vAttrs->forEachAttr([&](Symbol attrName, Value *, PosIdx) {
+                        allAttrNames.insert(std::string(state.symbols[attrName]));
+                    });
                     auto suggestions = Suggestions::bestMatches(allAttrNames, state.symbols[name]);
                     state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
                         .atPos(pos)
@@ -1436,8 +1473,8 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
                         .debugThrow();
                 }
             }
-            vAttrs = j->value;
-            pos2 = j->pos;
+            vAttrs = ref.value;
+            pos2 = ref.pos;
             if (state.countCalls)
                 state.attrSelects[pos2]++;
         }
@@ -1483,10 +1520,14 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
 
     for (auto & i : attrPath) {
         state.forceValue(*vAttrs, getPos());
-        const Attr * j;
         auto name = getName(i, state, env);
-        if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
-            vAttrs = j->value;
+        if (vAttrs->type() == nAttrs) {
+            if (auto ref = vAttrs->attrsGet(name)) {
+                vAttrs = ref.value;
+            } else {
+                v.mkBool(false);
+                return;
+            }
         } else {
             v.mkBool(false);
             return;
@@ -1527,7 +1568,7 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
         }
     };
 
-    const Attr * functor;
+    Value::AttrRef functor;
 
     while (args.size() > 0) {
 
@@ -1558,8 +1599,8 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                    argument has a default, use the default. */
                 size_t attrsUsed = 0;
                 for (auto & i : formals->formals) {
-                    auto j = args[0]->attrs()->get(i.name);
-                    if (!j) {
+                    auto ref = args[0]->attrsGet(i.name);
+                    if (!ref) {
                         if (!i.def) {
                             error<TypeError>(
                                 "function '%1%' called without required argument '%2%'",
@@ -1573,31 +1614,32 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
                         env2.values[displ++] = i.def->maybeThunk(*this, env2);
                     } else {
                         attrsUsed++;
-                        env2.values[displ++] = j->value;
+                        env2.values[displ++] = ref.value;
                     }
                 }
 
                 /* Check that each actual argument is listed as a formal
                    argument (unless the attribute match specifies a `...'). */
-                if (!formals->ellipsis && attrsUsed != args[0]->attrs()->size()) {
+                if (!formals->ellipsis && attrsUsed != args[0]->attrsSize()) {
                     /* Nope, so show the first unexpected argument to the
                        user. */
-                    for (auto & i : *args[0]->attrs())
-                        if (!formals->has(i.name)) {
+                    args[0]->forEachAttr([&](Symbol attrName, Value *, PosIdx) {
+                        if (!formals->has(attrName)) {
                             StringSet formalNames;
                             for (auto & formal : formals->formals)
                                 formalNames.insert(std::string(symbols[formal.name]));
-                            auto suggestions = Suggestions::bestMatches(formalNames, symbols[i.name]);
+                            auto suggestions = Suggestions::bestMatches(formalNames, symbols[attrName]);
                             error<TypeError>(
                                 "function '%1%' called with unexpected argument '%2%'",
                                 (lambda.name ? std::string(symbols[lambda.name]) : "anonymous lambda"),
-                                symbols[i.name])
+                                symbols[attrName])
                                 .atPos(lambda.pos)
                                 .withTrace(pos, "from call site")
                                 .withSuggestions(suggestions)
                                 .withFrame(*vCur.lambda().env, lambda)
                                 .debugThrow();
                         }
+                    });
                     unreachable();
                 }
             } else {
@@ -1715,14 +1757,14 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
             }
         }
 
-        else if (vCur.type() == nAttrs && (functor = vCur.attrs()->get(s.functor))) {
+        else if (vCur.type() == nAttrs && (functor = vCur.attrsGet(s.functor))) {
             /* 'vCur' may be allocated on the stack of the calling
                function, but for functors we may keep a reference, so
                heap-allocate a copy and use that instead. */
             Value * args2[] = {allocValue(), args[0]};
             *args2[0] = vCur;
             try {
-                callFunction(*functor->value, args2, vCur, functor->pos);
+                callFunction(*functor.value, args2, vCur, functor.pos);
             } catch (Error & e) {
                 e.addTrace(positions[pos], "while calling a functor (an attribute set with a '__functor' attribute)");
                 throw;
@@ -1770,17 +1812,17 @@ void EvalState::incrFunctionCall(ExprLambda * fun)
     functionCalls[fun]++;
 }
 
-void EvalState::autoCallFunction(const Bindings & args, Value & fun, Value & res)
+void EvalState::autoCallFunction(Value & args, Value & fun, Value & res)
 {
     auto pos = fun.determinePos(noPos);
 
     forceValue(fun, pos);
 
     if (fun.type() == nAttrs) {
-        auto found = fun.attrs()->get(s.functor);
+        auto found = fun.attrsGet(s.functor);
         if (found) {
             Value * v = allocValue();
-            callFunction(*found->value, fun, *v, pos);
+            callFunction(*found.value, fun, *v, pos);
             forceValue(*v, pos);
             return autoCallFunction(args, *v, res);
         }
@@ -1792,20 +1834,21 @@ void EvalState::autoCallFunction(const Bindings & args, Value & fun, Value & res
     }
     auto formals = fun.lambda().fun->getFormals();
 
-    auto attrs = buildBindings(std::max(static_cast<uint32_t>(formals->formals.size()), args.size()));
+    auto builder = buildBindings(noPos);
 
     if (formals->ellipsis) {
         // If the formals have an ellipsis (eg the function accepts extra args) pass
         // all available automatic arguments (which includes arguments specified on
         // the command line via --arg/--argstr)
-        for (auto & v : args)
-            attrs.insert(v);
+        args.forEachAttr([&](Symbol name, Value * value, PosIdx attrPos) {
+            builder.insert(name, value, attrPos);
+        });
     } else {
         // Otherwise, only pass the arguments that the function accepts
         for (auto & i : formals->formals) {
-            auto j = args.get(i.name);
+            auto j = args.attrsGet(i.name);
             if (j) {
-                attrs.insert(*j);
+                builder.insert(i.name, j.value, j.pos);
             } else if (!i.def) {
                 error<MissingArgumentError>(
                     R"(cannot evaluate a function that has an argument without a value ('%1%')
@@ -1821,7 +1864,9 @@ https://nix.dev/manual/nix/stable/language/syntax.html#functions.)",
         }
     }
 
-    callFunction(fun, allocValue()->mkAttrs(attrs), res, pos);
+    auto * actualArgs = allocValue();
+    actualArgs->mkAttrs(builder);
+    callFunction(fun, *actualArgs, res, pos);
 }
 
 void ExprWith::eval(EvalState & state, Env & env, Value & v)
@@ -1912,75 +1957,33 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 {
     state.nrOpUpdates++;
 
-    const Bindings & bindings1 = *v1.attrs();
-    if (bindings1.empty()) {
+    // Handle empty cases using unified accessors
+    auto size1 = v1.attrsSize();
+    auto size2 = v2.attrsSize();
+
+    if (size1 == 0) {
         v = v2;
         return;
     }
-
-    const Bindings & bindings2 = *v2.attrs();
-    if (bindings2.empty()) {
+    if (size2 == 0) {
         v = v1;
         return;
     }
 
-    /* Simple heuristic for determining whether attrs2 should be "layered" on top of
-       attrs1 instead of copying to a new Bindings. */
-    bool shouldLayer = [&]() -> bool {
-        if (bindings1.isLayerListFull())
-            return false;
+    // Get position from v1 for the result
+    PosIdx resultPos = v1.attrs().pos;
 
-        if (bindings2.size() > state.settings.bindingsUpdateLayerRhsSizeThreshold)
-            return false;
+    // Build result using Immer transient, starting with v1's map for structural sharing
+    AttrMapTransient transient = v1.attrs().map.transient();
 
-        return true;
-    }();
-
-    if (shouldLayer) {
-        auto attrs = state.buildBindings(bindings2.size());
-        attrs.layerOnTopOf(bindings1);
-
-        std::ranges::copy(bindings2, std::back_inserter(attrs));
-        v.mkAttrs(attrs.alreadySorted());
-
-        state.nrOpUpdateValuesCopied += bindings2.size();
-        return;
+    // Add/override with v2's attributes
+    for (const auto & [name, attr] : v2.attrs().map) {
+        transient.set(name, attr);
     }
 
-    auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
+    v.mkAttrs(state.mem.allocBindings(std::move(transient).persistent(), resultPos));
 
-    /* Merge the sets, preferring values from the second set.  Make
-       sure to keep the resulting vector in sorted order. */
-    auto i = bindings1.begin();
-    auto j = bindings2.begin();
-
-    while (i != bindings1.end() && j != bindings2.end()) {
-        if (i->name == j->name) {
-            attrs.insert(*j);
-            ++i;
-            ++j;
-        } else if (i->name < j->name) {
-            attrs.insert(*i);
-            ++i;
-        } else {
-            attrs.insert(*j);
-            ++j;
-        }
-    }
-
-    while (i != bindings1.end()) {
-        attrs.insert(*i);
-        ++i;
-    }
-
-    while (j != bindings2.end()) {
-        attrs.insert(*j);
-        ++j;
-    }
-
-    v.mkAttrs(attrs.alreadySorted());
-
-    state.nrOpUpdateValuesCopied += v.attrs()->size();
+    state.nrOpUpdateValuesCopied += size2;
 }
 
 void ExprOpUpdate::eval(EvalState & state, Env & env, Value & v)
@@ -2032,27 +2035,44 @@ void EvalState::concatLists(
 
     Value * nonEmpty = 0;
     size_t len = 0;
+    bool allImmer = true;
     for (size_t n = 0; n < nrLists; ++n) {
         forceList(*lists[n], pos, errorCtx);
         auto l = lists[n]->listSize();
         len += l;
-        if (l)
+        if (l) {
             nonEmpty = lists[n];
+            // Check if all non-empty lists are Immer
+            if (!lists[n]->isImmerList())
+                allImmer = false;
+        }
     }
 
+    // Optimization: if only one list is non-empty, return it directly
     if (nonEmpty && len == nonEmpty->listSize()) {
         v = *nonEmpty;
         return;
     }
 
+    // Use O(log n) structural sharing when all non-empty inputs are Immer lists
+    if (allImmer && len > 2) {
+        NixList result;
+        for (size_t n = 0; n < nrLists; ++n) {
+            if (lists[n]->listSize() > 0)
+                result = result + lists[n]->immerList();
+        }
+        v.mkImmerList(mem.allocImmerList(std::move(result)));
+        return;
+    }
+
+    // Fall through to legacy O(n) path for small/mixed lists
     auto list = buildList(len);
     auto out = list.elems;
-    for (size_t n = 0, pos = 0; n < nrLists; ++n) {
-        auto listView = lists[n]->listView();
-        auto l = listView.size();
-        if (l)
-            memcpy(out + pos, listView.data(), l * sizeof(Value *));
-        pos += l;
+    size_t outPos = 0;
+    for (size_t n = 0; n < nrLists; ++n) {
+        auto l = lists[n]->listSize();
+        for (size_t i = 0; i < l; ++i)
+            out[outPos++] = lists[n]->listElem(i);
     }
     v.mkList(list);
 }
@@ -2190,7 +2210,8 @@ void EvalState::tryFixupBlackHolePos(Value & v, PosIdx pos)
 
 void EvalState::forceValueDeep(Value & v)
 {
-    std::set<const Value *> seen;
+    // Use gc_allocator so the GC can see Value* pointers stored in the set's tree nodes
+    std::set<const Value *, std::less<const Value *>, gc_allocator<const Value *>> seen;
 
     [&, &state(*this)](this const auto & recurse, Value & v) {
         auto _level = state.addCallDepth(v.determinePos(noPos));
@@ -2201,23 +2222,24 @@ void EvalState::forceValueDeep(Value & v)
         state.forceValue(v, v.determinePos(noPos));
 
         if (v.type() == nAttrs) {
-            for (auto & i : *v.attrs())
+            v.forEachAttr([&](Symbol name, Value * value, PosIdx pos) {
                 try {
                     // If the value is a thunk, we're evaling. Otherwise no trace necessary.
-                    auto dts = state.debugRepl && i.value->isThunk() ? makeDebugTraceStacker(
-                                                                           state,
-                                                                           *i.value->thunk().expr,
-                                                                           *i.value->thunk().env,
-                                                                           i.pos,
-                                                                           "while evaluating the attribute '%1%'",
-                                                                           state.symbols[i.name])
-                                                                     : nullptr;
+                    auto dts = state.debugRepl && value->isThunk() ? makeDebugTraceStacker(
+                                                                          state,
+                                                                          *value->thunk().expr,
+                                                                          *value->thunk().env,
+                                                                          pos,
+                                                                          "while evaluating the attribute '%1%'",
+                                                                          state.symbols[name])
+                                                                    : nullptr;
 
-                    recurse(*i.value);
+                    recurse(*value);
                 } catch (Error & e) {
-                    state.addErrorTrace(e, i.pos, "while evaluating the attribute '%1%'", state.symbols[i.name]);
+                    state.addErrorTrace(e, pos, "while evaluating the attribute '%1%'", state.symbols[name]);
                     throw;
                 }
+            });
         }
 
         else if (v.isList()) {
@@ -2288,18 +2310,18 @@ bool EvalState::forceBool(Value & v, const PosIdx pos, std::string_view errorCtx
     return v.boolean();
 }
 
-const Attr * EvalState::getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx)
+Value::AttrRef EvalState::getAttr(Symbol attrSym, Value & attrSet, std::string_view errorCtx)
 {
-    auto value = attrSet->get(attrSym);
-    if (!value) {
+    auto ref = attrSet.attrsGet(attrSym);
+    if (!ref) {
         error<TypeError>("attribute '%s' missing", symbols[attrSym]).withTrace(noPos, errorCtx).debugThrow();
     }
-    return value;
+    return ref;
 }
 
 bool EvalState::isFunctor(const Value & fun) const
 {
-    return fun.type() == nAttrs && fun.attrs()->get(s.functor);
+    return fun.type() == nAttrs && fun.attrsGet(s.functor);
 }
 
 void EvalState::forceFunction(Value & v, const PosIdx pos, std::string_view errorCtx)
@@ -2370,22 +2392,22 @@ bool EvalState::isDerivation(Value & v)
 {
     if (v.type() != nAttrs)
         return false;
-    auto i = v.attrs()->get(s.type);
+    auto i = v.attrsGet(s.type);
     if (!i)
         return false;
-    forceValue(*i->value, i->pos);
-    if (i->value->type() != nString)
+    forceValue(*i.value, i.pos);
+    if (i.value->type() != nString)
         return false;
-    return i->value->string_view().compare("derivation") == 0;
+    return i.value->string_view().compare("derivation") == 0;
 }
 
 std::optional<std::string>
 EvalState::tryAttrsToString(const PosIdx pos, Value & v, NixStringContext & context, bool coerceMore, bool copyToStore)
 {
-    auto i = v.attrs()->get(s.toString);
+    auto i = v.attrsGet(s.toString);
     if (i) {
         Value v1;
-        callFunction(*i->value, v, v1, pos);
+        callFunction(*i.value, v, v1, pos);
         return coerceToString(
                    pos,
                    v1,
@@ -2433,14 +2455,14 @@ BackedStringView EvalState::coerceToString(
         auto maybeString = tryAttrsToString(pos, v, context, coerceMore, copyToStore);
         if (maybeString)
             return std::move(*maybeString);
-        auto i = v.attrs()->get(s.outPath);
+        auto i = v.attrsGet(s.outPath);
         if (!i) {
             error<TypeError>(
                 "cannot coerce %1% to a string: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
                 .withTrace(pos, errorCtx)
                 .debugThrow();
         }
-        return coerceToString(pos, *i->value, context, errorCtx, coerceMore, copyToStore, canonicalizePath);
+        return coerceToString(pos, *i.value, context, errorCtx, coerceMore, copyToStore, canonicalizePath);
     }
 
     if (v.type() == nExternal) {
@@ -2540,10 +2562,10 @@ SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext
     /* Similarly, handle __toString where the result may be a path
        value. */
     if (v.type() == nAttrs) {
-        auto i = v.attrs()->get(s.toString);
+        auto i = v.attrsGet(s.toString);
         if (i) {
             Value v1;
-            callFunction(*i->value, v, v1, pos);
+            callFunction(*i.value, v, v1, pos);
             return coerceToPath(pos, v1, context, errorCtx);
         }
     }
@@ -2722,7 +2744,7 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
         }
         for (size_t n = 0; n < v1.listSize(); ++n) {
             try {
-                assertEqValues(*v1.listView()[n], *v2.listView()[n], pos, errorCtx);
+                assertEqValues(*v1.listElem(n), *v2.listElem(n), pos, errorCtx);
             } catch (Error & e) {
                 e.addTrace(positions[pos], "while comparing list element %d", n);
                 throw;
@@ -2732,11 +2754,11 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
 
     case nAttrs: {
         if (isDerivation(v1) && isDerivation(v2)) {
-            auto i = v1.attrs()->get(s.outPath);
-            auto j = v2.attrs()->get(s.outPath);
+            auto i = v1.attrsGet(s.outPath);
+            auto j = v2.attrsGet(s.outPath);
             if (i && j) {
                 try {
-                    assertEqValues(*i->value, *j->value, pos, errorCtx);
+                    assertEqValues(*i.value, *j.value, pos, errorCtx);
                     return;
                 } catch (Error & e) {
                     e.addTrace(positions[pos], "while comparing a derivation by its '%s' attribute", "outPath");
@@ -2746,7 +2768,7 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
             }
         }
 
-        if (v1.attrs()->size() != v2.attrs()->size()) {
+        if (v1.attrsSize() != v2.attrsSize()) {
             error<AssertionError>(
                 "attribute names of attribute set '%s' differs from attribute set '%s'",
                 ValuePrinter(*this, v1, errorPrintOptions),
@@ -2754,50 +2776,31 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
                 .debugThrow();
         }
 
-        // Like normal comparison, we compare the attributes in non-deterministic Symbol index order.
-        // This function is called when eqValues has found a difference, so to reliably
-        // report about its result, we should follow in its literal footsteps and not
-        // try anything fancy that could lead to an error.
-        Bindings::const_iterator i, j;
-        for (i = v1.attrs()->begin(), j = v2.attrs()->begin(); i != v1.attrs()->end(); ++i, ++j) {
-            if (i->name != j->name) {
-                // A difference in a sorted list means that one attribute is not contained in the other, but we don't
-                // know which. Let's find out. Could use <, but this is more clear.
-                if (!v2.attrs()->get(i->name)) {
-                    error<AssertionError>(
-                        "attribute name '%s' is contained in '%s', but not in '%s'",
-                        symbols[i->name],
-                        ValuePrinter(*this, v1, errorPrintOptions),
-                        ValuePrinter(*this, v2, errorPrintOptions))
-                        .debugThrow();
-                }
-                if (!v1.attrs()->get(j->name)) {
-                    error<AssertionError>(
-                        "attribute name '%s' is missing in '%s', but is contained in '%s'",
-                        symbols[j->name],
-                        ValuePrinter(*this, v1, errorPrintOptions),
-                        ValuePrinter(*this, v2, errorPrintOptions))
-                        .debugThrow();
-                }
-                assert(false);
+        // Compare attributes by iterating over v1 and looking up in v2.
+        // This works regardless of whether we're using Immer or Bindings.
+        auto compareAttr = [&](Symbol name, Value * val1, PosIdx pos1) {
+            auto attr2 = v2.attrsGet(name);
+            if (!attr2) {
+                error<AssertionError>(
+                    "attribute name '%s' is contained in '%s', but not in '%s'",
+                    symbols[name],
+                    ValuePrinter(*this, v1, errorPrintOptions),
+                    ValuePrinter(*this, v2, errorPrintOptions))
+                    .debugThrow();
             }
             try {
-                assertEqValues(*i->value, *j->value, pos, errorCtx);
+                assertEqValues(*val1, *attr2.value, pos, errorCtx);
             } catch (Error & e) {
-                // The order of traces is reversed, so this presents as
-                //  where left hand side is
-                //    at <pos>
-                //  where right hand side is
-                //    at <pos>
-                //  while comparing attribute '<name>'
-                if (j->pos != noPos)
-                    e.addTrace(positions[j->pos], "where right hand side is");
-                if (i->pos != noPos)
-                    e.addTrace(positions[i->pos], "where left hand side is");
-                e.addTrace(positions[pos], "while comparing attribute '%s'", symbols[i->name]);
+                if (attr2.pos != noPos)
+                    e.addTrace(positions[attr2.pos], "where right hand side is");
+                if (pos1 != noPos)
+                    e.addTrace(positions[pos1], "where left hand side is");
+                e.addTrace(positions[pos], "while comparing attribute '%s'", symbols[name]);
                 throw;
             }
-        }
+        };
+
+        v1.forEachAttr(compareAttr);
         return;
     }
 
@@ -2880,7 +2883,7 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         if (v1.listSize() != v2.listSize())
             return false;
         for (size_t n = 0; n < v1.listSize(); ++n)
-            if (!eqValues(*v1.listView()[n], *v2.listView()[n], pos, errorCtx))
+            if (!eqValues(*v1.listElem(n), *v2.listElem(n), pos, errorCtx))
                 return false;
         return true;
 
@@ -2888,22 +2891,30 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         /* If both sets denote a derivation (type = "derivation"),
            then compare their outPaths. */
         if (isDerivation(v1) && isDerivation(v2)) {
-            auto i = v1.attrs()->get(s.outPath);
-            auto j = v2.attrs()->get(s.outPath);
+            auto i = v1.attrsGet(s.outPath);
+            auto j = v2.attrsGet(s.outPath);
             if (i && j)
-                return eqValues(*i->value, *j->value, pos, errorCtx);
+                return eqValues(*i.value, *j.value, pos, errorCtx);
         }
 
-        if (v1.attrs()->size() != v2.attrs()->size())
+        if (v1.attrsSize() != v2.attrsSize())
             return false;
 
-        /* Otherwise, compare the attributes one by one. */
-        Bindings::const_iterator i, j;
-        for (i = v1.attrs()->begin(), j = v2.attrs()->begin(); i != v1.attrs()->end(); ++i, ++j)
-            if (i->name != j->name || !eqValues(*i->value, *j->value, pos, errorCtx))
-                return false;
+        /* Otherwise, compare the attributes one by one.
+           We iterate over v1 and look up each attr in v2. */
+        bool result = true;
+        v1.forEachAttr([&](Symbol name, Value * val, PosIdx) {
+            if (!result) return;  // Short-circuit
+            auto attr2 = v2.attrsGet(name);
+            if (!attr2) {
+                result = false;
+                return;
+            }
+            if (!eqValues(*val, *attr2.value, pos, errorCtx))
+                result = false;
+        });
 
-        return true;
+        return result;
     }
 
     /* Functions are incomparable. */
@@ -2966,7 +2977,9 @@ void EvalState::printStatistics()
     uint64_t bEnvs = memstats.nrEnvs * sizeof(Env) + memstats.nrValuesInEnvs * sizeof(Value *);
     uint64_t bLists = memstats.nrListElems * sizeof(Value *);
     uint64_t bValues = memstats.nrValues * sizeof(Value);
-    uint64_t bAttrsets = memstats.nrAttrsets * sizeof(Bindings) + memstats.nrAttrsInAttrsets * sizeof(Attr);
+    // Note: Bindings uses a CHAMP trie with structural sharing.
+    // The actual memory usage is complex to calculate, so this is an approximation.
+    uint64_t bAttrsets = memstats.nrAttrsets * sizeof(Bindings) + memstats.nrAttrsInAttrsets * sizeof(AttrValue);
 
 #if NIX_USE_BOEHMGC
     GC_word heapSize, totalBytes;
@@ -3018,8 +3031,9 @@ void EvalState::printStatistics()
     topObj["sizes"] = {
         {"Env", sizeof(Env)},
         {"Value", sizeof(Value)},
-        {"Bindings", sizeof(Bindings)},
         {"Attr", sizeof(Attr)},
+        {"Bindings", sizeof(Bindings)},
+        {"AttrValue", sizeof(AttrValue)},
     };
     topObj["nrOpUpdates"] = nrOpUpdates.load();
     topObj["nrOpUpdateValuesCopied"] = nrOpUpdateValuesCopied.load();

@@ -28,48 +28,51 @@ void emitTreeAttrs(
     bool emptyRevFallback,
     bool forceDirty)
 {
-    auto attrs = state.buildBindings(100);
+    // Use BindingsBuilder - Immer everywhere
+    auto builder = state.buildBindings(noPos);
 
-    state.mkStorePathString(storePath, attrs.alloc(state.s.outPath));
+    state.mkStorePathString(storePath, builder.alloc(state.s.outPath));
 
     // FIXME: support arbitrary input attributes.
 
-    if (auto narHash = input.getNarHash())
-        attrs.alloc("narHash").mkString(narHash->to_string(HashFormat::SRI, true), state.mem);
+    if (auto narHash = input.getNarHash()) {
+        builder.alloc(state.symbols.create("narHash")).mkString(narHash->to_string(HashFormat::SRI, true), state.mem);
+    }
 
-    if (input.getType() == "git")
-        attrs.alloc("submodules").mkBool(fetchers::maybeGetBoolAttr(input.attrs, "submodules").value_or(false));
+    if (input.getType() == "git") {
+        builder.alloc(state.symbols.create("submodules")).mkBool(fetchers::maybeGetBoolAttr(input.attrs, "submodules").value_or(false));
+    }
 
     if (!forceDirty) {
 
         if (auto rev = input.getRev()) {
-            attrs.alloc("rev").mkString(rev->gitRev(), state.mem);
-            attrs.alloc("shortRev").mkString(rev->gitShortRev(), state.mem);
+            builder.alloc(state.symbols.create("rev")).mkString(rev->gitRev(), state.mem);
+            builder.alloc(state.symbols.create("shortRev")).mkString(rev->gitShortRev(), state.mem);
         } else if (emptyRevFallback) {
             // Backwards compat for `builtins.fetchGit`: dirty repos return an empty sha1 as rev
             auto emptyHash = Hash(HashAlgorithm::SHA1);
-            attrs.alloc("rev").mkString(emptyHash.gitRev(), state.mem);
-            attrs.alloc("shortRev").mkString(emptyHash.gitShortRev(), state.mem);
+            builder.alloc(state.symbols.create("rev")).mkString(emptyHash.gitRev(), state.mem);
+            builder.alloc(state.symbols.create("shortRev")).mkString(emptyHash.gitShortRev(), state.mem);
         }
 
-        if (auto revCount = input.getRevCount())
-            attrs.alloc("revCount").mkInt(*revCount);
-        else if (emptyRevFallback)
-            attrs.alloc("revCount").mkInt(0);
+        if (auto revCount = input.getRevCount()) {
+            builder.alloc(state.symbols.create("revCount")).mkInt(*revCount);
+        } else if (emptyRevFallback) {
+            builder.alloc(state.symbols.create("revCount")).mkInt(0);
+        }
     }
 
     if (auto dirtyRev = fetchers::maybeGetStrAttr(input.attrs, "dirtyRev")) {
-        attrs.alloc("dirtyRev").mkString(*dirtyRev, state.mem);
-        attrs.alloc("dirtyShortRev").mkString(*fetchers::maybeGetStrAttr(input.attrs, "dirtyShortRev"), state.mem);
+        builder.alloc(state.symbols.create("dirtyRev")).mkString(*dirtyRev, state.mem);
+        builder.alloc(state.symbols.create("dirtyShortRev")).mkString(*fetchers::maybeGetStrAttr(input.attrs, "dirtyShortRev"), state.mem);
     }
 
     if (auto lastModified = input.getLastModified()) {
-        attrs.alloc("lastModified").mkInt(*lastModified);
-        attrs.alloc("lastModifiedDate")
-            .mkString(fmt("%s", std::put_time(std::gmtime(&*lastModified), "%Y%m%d%H%M%S")), state.mem);
+        builder.alloc(state.symbols.create("lastModified")).mkInt(*lastModified);
+        builder.alloc(state.symbols.create("lastModifiedDate")).mkString(fmt("%s", std::put_time(std::gmtime(&*lastModified), "%Y%m%d%H%M%S")), state.mem);
     }
 
-    v.mkAttrs(attrs);
+    v.mkAttrs(builder);
 }
 
 struct FetchTreeParams
@@ -97,54 +100,54 @@ static void fetchTree(
 
         fetchers::Attrs attrs;
 
-        if (auto aType = args[0]->attrs()->get(state.s.type)) {
+        if (auto aType = args[0]->attrsGet(state.s.type)) {
             if (type)
                 state.error<EvalError>("unexpected argument 'type'").atPos(pos).debugThrow();
             type = state.forceStringNoCtx(
-                *aType->value, aType->pos, fmt("while evaluating the `type` argument passed to '%s'", fetcher));
+                *aType.value, aType.pos, fmt("while evaluating the `type` argument passed to '%s'", fetcher));
         } else if (!type)
             state.error<EvalError>("argument 'type' is missing in call to '%s'", fetcher).atPos(pos).debugThrow();
 
         attrs.emplace("type", type.value());
 
-        for (auto & attr : *args[0]->attrs()) {
-            if (attr.name == state.s.type)
-                continue;
-            state.forceValue(*attr.value, attr.pos);
-            if (attr.value->type() == nPath || attr.value->type() == nString) {
-                auto s = state.coerceToString(attr.pos, *attr.value, context, "", false, false).toOwned();
+        args[0]->forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx attrPos) {
+            if (attrName == state.s.type)
+                return;
+            state.forceValue(*attrValue, attrPos);
+            if (attrValue->type() == nPath || attrValue->type() == nString) {
+                auto s = state.coerceToString(attrPos, *attrValue, context, "", false, false).toOwned();
                 attrs.emplace(
-                    state.symbols[attr.name],
-                    params.isFetchGit && state.symbols[attr.name] == "url" ? fixGitURL(s).to_string() : s);
-            } else if (attr.value->type() == nBool)
-                attrs.emplace(state.symbols[attr.name], Explicit<bool>{attr.value->boolean()});
-            else if (attr.value->type() == nInt) {
-                auto intValue = attr.value->integer().value;
+                    state.symbols[attrName],
+                    params.isFetchGit && state.symbols[attrName] == "url" ? fixGitURL(s).to_string() : s);
+            } else if (attrValue->type() == nBool)
+                attrs.emplace(state.symbols[attrName], Explicit<bool>{attrValue->boolean()});
+            else if (attrValue->type() == nInt) {
+                auto intValue = attrValue->integer().value;
 
                 if (intValue < 0)
                     state
                         .error<EvalError>(
                             "negative value given for '%s' argument '%s': %d",
                             fetcher,
-                            state.symbols[attr.name],
+                            state.symbols[attrName],
                             intValue)
                         .atPos(pos)
                         .debugThrow();
 
-                attrs.emplace(state.symbols[attr.name], uint64_t(intValue));
-            } else if (state.symbols[attr.name] == "publicKeys") {
+                attrs.emplace(state.symbols[attrName], uint64_t(intValue));
+            } else if (state.symbols[attrName] == "publicKeys") {
                 experimentalFeatureSettings.require(Xp::VerifiedFetches);
                 attrs.emplace(
-                    state.symbols[attr.name], printValueAsJSON(state, true, *attr.value, pos, context).dump());
+                    state.symbols[attrName], printValueAsJSON(state, true, *attrValue, pos, context).dump());
             } else
                 state
                     .error<TypeError>(
                         "argument '%s' to '%s' is %s while a string, Boolean or integer is expected",
-                        state.symbols[attr.name],
+                        state.symbols[attrName],
                         fetcher,
-                        showType(*attr.value))
+                        showType(*attrValue))
                     .debugThrow();
-        }
+        });
 
         if (params.isFetchGit && !attrs.contains("exportIgnore")
             && (!attrs.contains("submodules") || !*fetchers::maybeGetBoolAttr(attrs, "submodules"))) {
@@ -392,22 +395,22 @@ static void fetch(
 
     if (isArgAttrs) {
 
-        for (auto & attr : *args[0]->attrs()) {
-            std::string_view n(state.symbols[attr.name]);
+        args[0]->forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx attrPos) {
+            std::string_view n(state.symbols[attrName]);
             if (n == "url")
-                url = state.forceStringNoCtx(*attr.value, attr.pos, "while evaluating the url we should fetch");
+                url = state.forceStringNoCtx(*attrValue, attrPos, "while evaluating the url we should fetch");
             else if (n == "sha256")
                 expectedHash = newHashAllowEmpty(
                     state.forceStringNoCtx(
-                        *attr.value, attr.pos, "while evaluating the sha256 of the content we should fetch"),
+                        *attrValue, attrPos, "while evaluating the sha256 of the content we should fetch"),
                     HashAlgorithm::SHA256);
             else if (n == "name") {
                 nameAttrPassed = true;
                 name = state.forceStringNoCtx(
-                    *attr.value, attr.pos, "while evaluating the name of the content we should fetch");
+                    *attrValue, attrPos, "while evaluating the name of the content we should fetch");
             } else
                 state.error<EvalError>("unsupported argument '%s' to '%s'", n, who).atPos(pos).debugThrow();
-        }
+        });
 
         if (!url)
             state.error<EvalError>("'url' argument required").atPos(pos).debugThrow();

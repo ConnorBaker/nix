@@ -50,7 +50,7 @@ std::vector<SymbolStr> AttrPath::resolve(EvalState & state) const
 }
 
 std::pair<Value *, PosIdx>
-findAlongAttrPath(EvalState & state, const std::string & attrPath, Bindings & autoArgs, Value & vIn)
+findAlongAttrPath(EvalState & state, const std::string & attrPath, Value & autoArgs, Value & vIn)
 {
     Strings tokens = parseAttrPath(attrPath);
 
@@ -83,18 +83,19 @@ findAlongAttrPath(EvalState & state, const std::string & attrPath, Bindings & au
             if (attr.empty())
                 throw Error("empty attribute name in selection path '%1%'", attrPath);
 
-            auto a = v->attrs()->get(state.symbols.create(attr));
+            auto a = v->attrsGet(state.symbols.create(attr));
             if (!a) {
                 StringSet attrNames;
-                for (auto & attr : *v->attrs())
-                    attrNames.insert(std::string(state.symbols[attr.name]));
+                v->forEachAttr([&](Symbol name, Value *, PosIdx) {
+                    attrNames.insert(std::string(state.symbols[name]));
+                });
 
                 auto suggestions = Suggestions::bestMatches(attrNames, attr);
                 throw AttrPathNotFound(
                     suggestions, "attribute '%1%' in selection path '%2%' not found", attr, attrPath);
             }
-            v = &*a->value;
-            pos = a->pos;
+            v = &*a.value;
+            pos = a.pos;
         }
 
         else {
@@ -109,7 +110,7 @@ findAlongAttrPath(EvalState & state, const std::string & attrPath, Bindings & au
             if (*attrIndex >= v->listSize())
                 throw AttrPathNotFound("list index %1% in selection path '%2%' is out of range", *attrIndex, attrPath);
 
-            v = v->listView()[*attrIndex];
+            v = v->listElem(*attrIndex);
             pos = noPos;
         }
     }
@@ -121,7 +122,8 @@ std::pair<SourcePath, uint32_t> findPackageFilename(EvalState & state, Value & v
 {
     Value * v2;
     try {
-        auto & dummyArgs = Bindings::emptyBindings;
+        Value dummyArgs;
+        dummyArgs.mkAttrs(&Bindings::emptyBindings);
         v2 = findAlongAttrPath(state, "meta.position", dummyArgs, v).first;
     } catch (Error &) {
         throw NoPositionInfo("package '%s' has no source location information", what);

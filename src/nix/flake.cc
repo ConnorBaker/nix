@@ -180,23 +180,23 @@ static void enumerateOutputs(
     auto pos = vFlake.determinePos(noPos);
     state.forceAttrs(vFlake, pos, "while evaluating a flake to get its outputs");
 
-    auto aOutputs = vFlake.attrs()->get(state.symbols.create("outputs"));
+    auto aOutputs = vFlake.attrsGet(state.symbols.create("outputs"));
     assert(aOutputs);
 
-    state.forceAttrs(*aOutputs->value, pos, "while evaluating the outputs of a flake");
+    state.forceAttrs(*aOutputs.value, pos, "while evaluating the outputs of a flake");
 
     auto sHydraJobs = state.symbols.create("hydraJobs");
 
     /* Hack: ensure that hydraJobs is evaluated before anything
        else. This way we can disable IFD for hydraJobs and then enable
        it for other outputs. */
-    if (auto attr = aOutputs->value->attrs()->get(sHydraJobs))
-        callback(state.symbols[attr->name], *attr->value, attr->pos);
+    if (auto attr = aOutputs.value->attrsGet(sHydraJobs))
+        callback(state.symbols[sHydraJobs], *attr.value, attr.pos);
 
-    for (auto & attr : *aOutputs->value->attrs()) {
-        if (attr.name != sHydraJobs)
-            callback(state.symbols[attr.name], *attr.value, attr.pos);
-    }
+    aOutputs.value->forEachAttr([&](Symbol name, Value * value, PosIdx attrPos) {
+        if (name != sHydraJobs)
+            callback(state.symbols[name], *value, attrPos);
+    });
 }
 
 struct CmdFlakeMetadata : FlakeCommand, MixJSON
@@ -427,23 +427,26 @@ struct CmdFlakeCheck : FlakeCommand
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking app '%s'", attrPath));
                 state->forceAttrs(v, pos, "");
-                if (auto attr = v.attrs()->get(state->symbols.create("type")))
-                    state->forceStringNoCtx(*attr->value, attr->pos, "");
+                auto sType = state->symbols.create("type");
+                auto sProgram = state->symbols.create("program");
+                auto sMeta = state->symbols.create("meta");
+                auto sDescription = state->symbols.create("description");
+
+                if (auto attr = v.attrsGet(sType))
+                    state->forceStringNoCtx(*attr.value, attr.pos, "");
                 else
                     throw Error("app '%s' lacks attribute 'type'", attrPath);
 
-                if (auto attr = v.attrs()->get(state->symbols.create("program"))) {
-                    if (attr->name == state->symbols.create("program")) {
-                        NixStringContext context;
-                        state->forceString(*attr->value, context, attr->pos, "");
-                    }
+                if (auto attr = v.attrsGet(sProgram)) {
+                    NixStringContext context;
+                    state->forceString(*attr.value, context, attr.pos, "");
                 } else
                     throw Error("app '%s' lacks attribute 'program'", attrPath);
 
-                if (auto attr = v.attrs()->get(state->symbols.create("meta"))) {
-                    state->forceAttrs(*attr->value, attr->pos, "");
-                    if (auto dAttr = attr->value->attrs()->get(state->symbols.create("description")))
-                        state->forceStringNoCtx(*dAttr->value, dAttr->pos, "");
+                if (auto attr = v.attrsGet(sMeta)) {
+                    state->forceAttrs(*attr.value, attr.pos, "");
+                    if (auto dAttr = attr.value->attrsGet(sDescription))
+                        state->forceStringNoCtx(*dAttr.value, dAttr.pos, "");
                     else
                         logWarning({
                             .msg = HintFmt("app '%s' lacks attribute 'meta.description'", attrPath),
@@ -453,11 +456,11 @@ struct CmdFlakeCheck : FlakeCommand
                         .msg = HintFmt("app '%s' lacks attribute 'meta'", attrPath),
                     });
 
-                for (auto & attr : *v.attrs()) {
-                    std::string_view name(state->symbols[attr.name]);
-                    if (name != "type" && name != "program" && name != "meta")
-                        throw Error("app '%s' has unsupported attribute '%s'", attrPath, name);
-                }
+                v.forEachAttr([&](Symbol name, Value *, PosIdx) {
+                    std::string_view nameStr(state->symbols[name]);
+                    if (nameStr != "type" && nameStr != "program" && nameStr != "meta")
+                        throw Error("app '%s' has unsupported attribute '%s'", attrPath, nameStr);
+                });
             } catch (Error & e) {
                 e.addTrace(resolve(pos), HintFmt("while checking the app definition '%s'", attrPath));
                 reportError(e);
@@ -501,15 +504,15 @@ struct CmdFlakeCheck : FlakeCommand
                 if (state->isDerivation(v))
                     throw Error("jobset should not be a derivation at top-level");
 
-                for (auto & attr : *v.attrs()) {
-                    state->forceAttrs(*attr.value, attr.pos, "");
-                    auto attrPath2 = concatStrings(attrPath, ".", state->symbols[attr.name]);
-                    if (state->isDerivation(*attr.value)) {
+                v.forEachAttr([&](Symbol name, Value * value, PosIdx attrPos) {
+                    state->forceAttrs(*value, attrPos, "");
+                    auto attrPath2 = concatStrings(attrPath, ".", state->symbols[name]);
+                    if (state->isDerivation(*value)) {
                         Activity act(*logger, lvlInfo, actUnknown, fmt("checking Hydra job '%s'", attrPath2));
-                        checkDerivation(attrPath2, *attr.value, attr.pos);
+                        checkDerivation(attrPath2, *value, attrPos);
                     } else
-                        checkHydraJobs(attrPath2, *attr.value, attr.pos);
-                }
+                        checkHydraJobs(attrPath2, *value, attrPos);
+                });
 
             } catch (Error & e) {
                 e.addTrace(resolve(pos), HintFmt("while checking the Hydra jobset '%s'", attrPath));
@@ -520,8 +523,9 @@ struct CmdFlakeCheck : FlakeCommand
         auto checkNixOSConfiguration = [&](const std::string & attrPath, Value & v, const PosIdx pos) {
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking NixOS configuration '%s'", attrPath));
-                Bindings & bindings = Bindings::emptyBindings;
-                auto vToplevel = findAlongAttrPath(*state, "config.system.build.toplevel", bindings, v).first;
+                Value emptyArgs;
+                emptyArgs.mkAttrs(&Bindings::emptyBindings);
+                auto vToplevel = findAlongAttrPath(*state, "config.system.build.toplevel", emptyArgs, v).first;
                 state->forceValue(*vToplevel, pos);
                 if (!state->isDerivation(*vToplevel))
                     throw Error("attribute 'config.system.build.toplevel' is not a derivation");
@@ -536,28 +540,28 @@ struct CmdFlakeCheck : FlakeCommand
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking template '%s'", attrPath));
 
                 state->forceAttrs(v, pos, "");
+                auto sPath = state->symbols.create("path");
+                auto sDescription = state->symbols.create("description");
 
-                if (auto attr = v.attrs()->get(state->symbols.create("path"))) {
-                    if (attr->name == state->symbols.create("path")) {
-                        NixStringContext context;
-                        auto path = state->coerceToPath(attr->pos, *attr->value, context, "");
-                        if (!path.pathExists())
-                            throw Error("template '%s' refers to a non-existent path '%s'", attrPath, path);
-                        // TODO: recursively check the flake in 'path'.
-                    }
+                if (auto attr = v.attrsGet(sPath)) {
+                    NixStringContext context;
+                    auto path = state->coerceToPath(attr.pos, *attr.value, context, "");
+                    if (!path.pathExists())
+                        throw Error("template '%s' refers to a non-existent path '%s'", attrPath, path);
+                    // TODO: recursively check the flake in 'path'.
                 } else
                     throw Error("template '%s' lacks attribute 'path'", attrPath);
 
-                if (auto attr = v.attrs()->get(state->symbols.create("description")))
-                    state->forceStringNoCtx(*attr->value, attr->pos, "");
+                if (auto attr = v.attrsGet(sDescription))
+                    state->forceStringNoCtx(*attr.value, attr.pos, "");
                 else
                     throw Error("template '%s' lacks attribute 'description'", attrPath);
 
-                for (auto & attr : *v.attrs()) {
-                    std::string_view name(state->symbols[attr.name]);
-                    if (name != "path" && name != "description" && name != "welcomeText")
-                        throw Error("template '%s' has unsupported attribute '%s'", attrPath, name);
-                }
+                v.forEachAttr([&](Symbol name, Value *, PosIdx) {
+                    std::string_view nameStr(state->symbols[name]);
+                    if (nameStr != "path" && nameStr != "description" && nameStr != "welcomeText")
+                        throw Error("template '%s' has unsupported attribute '%s'", attrPath, nameStr);
+                });
             } catch (Error & e) {
                 e.addTrace(resolve(pos), HintFmt("while checking the template '%s'", attrPath));
                 reportError(e);
@@ -604,16 +608,16 @@ struct CmdFlakeCheck : FlakeCommand
 
                     if (name == "checks") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
-                            std::string_view attr_name = state->symbols[attr.name];
-                            checkSystemName(attr_name, attr.pos);
-                            if (checkSystemType(attr_name, attr.pos)) {
-                                state->forceAttrs(*attr.value, attr.pos, "");
-                                for (auto & attr2 : *attr.value->attrs()) {
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            std::string_view attr_name = state->symbols[attrSym];
+                            checkSystemName(attr_name, attrPos);
+                            if (checkSystemType(attr_name, attrPos)) {
+                                state->forceAttrs(*attrValue, attrPos, "");
+                                attrValue->forEachAttr([&](Symbol attr2Sym, Value * attr2Value, PosIdx attr2Pos) {
                                     auto drvPath = checkDerivation(
-                                        fmt("%s.%s.%s", name, attr_name, state->symbols[attr2.name]),
-                                        *attr2.value,
-                                        attr2.pos);
+                                        fmt("%s.%s.%s", name, attr_name, state->symbols[attr2Sym]),
+                                        *attr2Value,
+                                        attr2Pos);
                                     if (drvPath && attr_name == settings.thisSystem.get()) {
                                         auto path = DerivedPath::Built{
                                             .drvPath = makeConstantStorePathRef(*drvPath),
@@ -621,86 +625,88 @@ struct CmdFlakeCheck : FlakeCommand
                                         };
 
                                         // Build and store the attribute path for error reporting
-                                        AttrPath attrPath{state->symbols.create(name), attr.name, attr2.name};
+                                        AttrPath attrPath{state->symbols.create(name), attrSym, attr2Sym};
                                         attrPathsByDrv[path].push_back(std::move(attrPath));
                                     }
-                                }
+                                });
                             }
-                        }
+                        });
                     }
 
                     else if (name == "formatter") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
-                            const auto & attr_name = state->symbols[attr.name];
-                            checkSystemName(attr_name, attr.pos);
-                            if (checkSystemType(attr_name, attr.pos)) {
-                                checkDerivation(fmt("%s.%s", name, attr_name), *attr.value, attr.pos);
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            const auto & attr_name = state->symbols[attrSym];
+                            checkSystemName(attr_name, attrPos);
+                            if (checkSystemType(attr_name, attrPos)) {
+                                checkDerivation(fmt("%s.%s", name, attr_name), *attrValue, attrPos);
                             };
-                        }
+                        });
                     }
 
                     else if (name == "packages" || name == "devShells") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
-                            const auto & attr_name = state->symbols[attr.name];
-                            checkSystemName(attr_name, attr.pos);
-                            if (checkSystemType(attr_name, attr.pos)) {
-                                state->forceAttrs(*attr.value, attr.pos, "");
-                                for (auto & attr2 : *attr.value->attrs())
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            const auto & attr_name = state->symbols[attrSym];
+                            checkSystemName(attr_name, attrPos);
+                            if (checkSystemType(attr_name, attrPos)) {
+                                state->forceAttrs(*attrValue, attrPos, "");
+                                attrValue->forEachAttr([&](Symbol attr2Sym, Value * attr2Value, PosIdx attr2Pos) {
                                     checkDerivation(
-                                        fmt("%s.%s.%s", name, attr_name, state->symbols[attr2.name]),
-                                        *attr2.value,
-                                        attr2.pos);
+                                        fmt("%s.%s.%s", name, attr_name, state->symbols[attr2Sym]),
+                                        *attr2Value,
+                                        attr2Pos);
+                                });
                             };
-                        }
+                        });
                     }
 
                     else if (name == "apps") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
-                            const auto & attr_name = state->symbols[attr.name];
-                            checkSystemName(attr_name, attr.pos);
-                            if (checkSystemType(attr_name, attr.pos)) {
-                                state->forceAttrs(*attr.value, attr.pos, "");
-                                for (auto & attr2 : *attr.value->attrs())
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            const auto & attr_name = state->symbols[attrSym];
+                            checkSystemName(attr_name, attrPos);
+                            if (checkSystemType(attr_name, attrPos)) {
+                                state->forceAttrs(*attrValue, attrPos, "");
+                                attrValue->forEachAttr([&](Symbol attr2Sym, Value * attr2Value, PosIdx attr2Pos) {
                                     checkApp(
-                                        fmt("%s.%s.%s", name, attr_name, state->symbols[attr2.name]),
-                                        *attr2.value,
-                                        attr2.pos);
+                                        fmt("%s.%s.%s", name, attr_name, state->symbols[attr2Sym]),
+                                        *attr2Value,
+                                        attr2Pos);
+                                });
                             };
-                        }
+                        });
                     }
 
                     else if (name == "defaultPackage" || name == "devShell") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
-                            const auto & attr_name = state->symbols[attr.name];
-                            checkSystemName(attr_name, attr.pos);
-                            if (checkSystemType(attr_name, attr.pos)) {
-                                checkDerivation(fmt("%s.%s", name, attr_name), *attr.value, attr.pos);
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            const auto & attr_name = state->symbols[attrSym];
+                            checkSystemName(attr_name, attrPos);
+                            if (checkSystemType(attr_name, attrPos)) {
+                                checkDerivation(fmt("%s.%s", name, attr_name), *attrValue, attrPos);
                             };
-                        }
+                        });
                     }
 
                     else if (name == "defaultApp") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
-                            const auto & attr_name = state->symbols[attr.name];
-                            checkSystemName(attr_name, attr.pos);
-                            if (checkSystemType(attr_name, attr.pos)) {
-                                checkApp(fmt("%s.%s", name, attr_name), *attr.value, attr.pos);
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            const auto & attr_name = state->symbols[attrSym];
+                            checkSystemName(attr_name, attrPos);
+                            if (checkSystemType(attr_name, attrPos)) {
+                                checkApp(fmt("%s.%s", name, attr_name), *attrValue, attrPos);
                             };
-                        }
+                        });
                     }
 
                     else if (name == "legacyPackages") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
-                            checkSystemName(state->symbols[attr.name], attr.pos);
-                            checkSystemType(state->symbols[attr.name], attr.pos);
+                        vOutput.forEachAttr([&](Symbol attrSym, Value *, PosIdx attrPos) {
+                            checkSystemName(state->symbols[attrSym], attrPos);
+                            checkSystemType(state->symbols[attrSym], attrPos);
                             // FIXME: do getDerivations?
-                        }
+                        });
                     }
 
                     else if (name == "overlay")
@@ -708,8 +714,9 @@ struct CmdFlakeCheck : FlakeCommand
 
                     else if (name == "overlays") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs())
-                            checkOverlay(fmt("%s.%s", name, state->symbols[attr.name]), *attr.value, attr.pos);
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            checkOverlay(fmt("%s.%s", name, state->symbols[attrSym]), *attrValue, attrPos);
+                        });
                     }
 
                     else if (name == "nixosModule")
@@ -717,15 +724,17 @@ struct CmdFlakeCheck : FlakeCommand
 
                     else if (name == "nixosModules") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs())
-                            checkModule(fmt("%s.%s", name, state->symbols[attr.name]), *attr.value, attr.pos);
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            checkModule(fmt("%s.%s", name, state->symbols[attrSym]), *attrValue, attrPos);
+                        });
                     }
 
                     else if (name == "nixosConfigurations") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs())
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
                             checkNixOSConfiguration(
-                                fmt("%s.%s", name, state->symbols[attr.name]), *attr.value, attr.pos);
+                                fmt("%s.%s", name, state->symbols[attrSym]), *attrValue, attrPos);
+                        });
                     }
 
                     else if (name == "hydraJobs")
@@ -736,36 +745,37 @@ struct CmdFlakeCheck : FlakeCommand
 
                     else if (name == "templates") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs())
-                            checkTemplate(fmt("%s.%s", name, state->symbols[attr.name]), *attr.value, attr.pos);
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            checkTemplate(fmt("%s.%s", name, state->symbols[attrSym]), *attrValue, attrPos);
+                        });
                     }
 
                     else if (name == "defaultBundler") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
-                            const auto & attr_name = state->symbols[attr.name];
-                            checkSystemName(attr_name, attr.pos);
-                            if (checkSystemType(attr_name, attr.pos)) {
-                                checkBundler(fmt("%s.%s", name, attr_name), *attr.value, attr.pos);
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            const auto & attr_name = state->symbols[attrSym];
+                            checkSystemName(attr_name, attrPos);
+                            if (checkSystemType(attr_name, attrPos)) {
+                                checkBundler(fmt("%s.%s", name, attr_name), *attrValue, attrPos);
                             };
-                        }
+                        });
                     }
 
                     else if (name == "bundlers") {
                         state->forceAttrs(vOutput, pos, "");
-                        for (auto & attr : *vOutput.attrs()) {
-                            const auto & attr_name = state->symbols[attr.name];
-                            checkSystemName(attr_name, attr.pos);
-                            if (checkSystemType(attr_name, attr.pos)) {
-                                state->forceAttrs(*attr.value, attr.pos, "");
-                                for (auto & attr2 : *attr.value->attrs()) {
+                        vOutput.forEachAttr([&](Symbol attrSym, Value * attrValue, PosIdx attrPos) {
+                            const auto & attr_name = state->symbols[attrSym];
+                            checkSystemName(attr_name, attrPos);
+                            if (checkSystemType(attr_name, attrPos)) {
+                                state->forceAttrs(*attrValue, attrPos, "");
+                                attrValue->forEachAttr([&](Symbol attr2Sym, Value * attr2Value, PosIdx attr2Pos) {
                                     checkBundler(
-                                        fmt("%s.%s.%s", name, attr_name, state->symbols[attr2.name]),
-                                        *attr2.value,
-                                        attr2.pos);
-                                }
+                                        fmt("%s.%s.%s", name, attr_name, state->symbols[attr2Sym]),
+                                        *attr2Value,
+                                        attr2Pos);
+                                });
                             };
-                        }
+                        });
                     }
 
                     else if (

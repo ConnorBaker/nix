@@ -25,8 +25,9 @@ PackageInfos queryInstalled(EvalState & state, const Path & userEnv)
     if (pathExists(manifestFile)) {
         Value v;
         state.evalFile(state.rootPath(CanonPath(manifestFile)).resolveSymlinks(), v);
-        Bindings & bindings = Bindings::emptyBindings;
-        getDerivations(state, v, "", bindings, elems, false);
+        Value emptyArgs;
+        emptyArgs.mkAttrs(&Bindings::emptyBindings);
+        getDerivations(state, v, "", emptyArgs, elems, false);
     }
     return elems;
 }
@@ -55,7 +56,7 @@ bool createUserEnv(
         PackageInfo::Outputs outputs = i.queryOutputs(true, true);
         StringSet metaNames = i.queryMetaNames();
 
-        auto attrs = state.buildBindings(7 + outputs.size());
+        auto attrs = state.buildBindings(noPos);
 
         attrs.alloc(state.s.type).mkStringNoCopy("derivation"_sds);
         attrs.alloc(state.s.name).mkString(i.queryName(), state.mem);
@@ -70,7 +71,7 @@ bool createUserEnv(
         auto outputsList = state.buildList(outputs.size());
         for (const auto & [m, j] : enumerate(outputs)) {
             (outputsList[m] = state.allocValue())->mkString(j.first, state.mem);
-            auto outputAttrs = state.buildBindings(2);
+            auto outputAttrs = state.buildBindings(noPos);
             outputAttrs.alloc(state.s.outPath).mkString(state.store->printStorePath(*j.second), state.mem);
             attrs.alloc(j.first).mkAttrs(outputAttrs);
 
@@ -84,7 +85,7 @@ bool createUserEnv(
         attrs.alloc(state.s.outputs).mkList(outputsList);
 
         // Copy the meta attributes.
-        auto meta = state.buildBindings(metaNames.size());
+        auto meta = state.buildBindings(noPos);
         for (auto & j : metaNames) {
             Value * v = i.queryMeta(j);
             if (!v)
@@ -129,7 +130,7 @@ bool createUserEnv(
 
     /* Construct a Nix expression that calls the user environment
        builder with the manifest as argument. */
-    auto attrs = state.buildBindings(3);
+    auto attrs = state.buildBindings(noPos);
     state.mkStorePathString(manifestFile, attrs.alloc("manifest"));
     attrs.insert(state.symbols.create("derivations"), &manifest);
     Value args;
@@ -142,10 +143,10 @@ bool createUserEnv(
     debug("evaluating user environment builder");
     state.forceValue(topLevel, topLevel.determinePos(noPos));
     NixStringContext context;
-    auto & aDrvPath(*topLevel.attrs()->get(state.s.drvPath));
+    auto aDrvPath = topLevel.attrsGet(state.s.drvPath);
     auto topLevelDrv = state.coerceToStorePath(aDrvPath.pos, *aDrvPath.value, context, "");
     topLevelDrv.requireDerivation();
-    auto & aOutPath(*topLevel.attrs()->get(state.s.outPath));
+    auto aOutPath = topLevel.attrsGet(state.s.outPath);
     auto topLevelOut = state.coerceToStorePath(aOutPath.pos, *aOutPath.value, context, "");
 
     /* Realise the resulting store expression. */

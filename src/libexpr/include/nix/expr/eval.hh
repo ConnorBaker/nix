@@ -339,17 +339,46 @@ public:
     inline Value * allocValue();
     inline Env & allocEnv(size_t size);
 
-    Bindings * allocBindings(size_t capacity);
-
-    BindingsBuilder buildBindings(SymbolTable & symbols, size_t capacity)
+    /**
+     * Build a BindingsBuilder for constructing attribute sets.
+     * The capacity parameter is ignored (kept for API compatibility).
+     */
+    BindingsBuilder buildBindings(SymbolTable & sym, [[maybe_unused]] size_t capacity = 0, PosIdx pos = noPos)
     {
-        return BindingsBuilder(*this, symbols, allocBindings(capacity), capacity);
+        return BindingsBuilder(*this, sym, pos);
     }
 
     ListBuilder buildList(size_t size)
     {
         stats.nrListElems += size;
         return ListBuilder(*this, size);
+    }
+
+    /**
+     * Allocate a NixList (immer::flex_vector) on the GC heap.
+     */
+    NixList * allocImmerList(NixList list);
+
+    /**
+     * Allocate Bindings on the GC heap.
+     */
+    Bindings * allocBindings(AttrMap map, PosIdx pos = noPos);
+
+
+    /**
+     * Build an empty Immer list transient for batch construction.
+     */
+    NixListTransient buildImmerList()
+    {
+        return NixList{}.transient();
+    }
+
+    /**
+     * Build an empty attribute map transient for batch construction.
+     */
+    AttrMapTransient buildBindingsTransient()
+    {
+        return AttrMap{}.transient();
     }
 
     const Statistics & getStats() const &
@@ -362,7 +391,7 @@ public:
      */
     Exprs exprs;
 
-private:
+    // Made public for instrumentation access from ExprOpUpdate and builders
     Statistics stats;
 };
 
@@ -687,9 +716,11 @@ public:
     std::string_view forceStringNoCtx(Value & v, const PosIdx pos, std::string_view errorCtx);
 
     /**
-     * Get attribute from an attribute set and throw an error if it doesn't exist.
+     * Get attribute from a Value attribute set.
+     * Returns AttrRef which contains value and position.
+     * Throws if attribute doesn't exist.
      */
-    const Attr * getAttr(Symbol attrSym, const Bindings * attrSet, std::string_view errorCtx);
+    Value::AttrRef getAttr(Symbol attrSym, Value & attrSet, std::string_view errorCtx);
 
     template<typename... Args>
     [[gnu::noinline]]
@@ -808,7 +839,20 @@ private:
 
     unsigned int baseEnvDispl = 0;
 
+    /**
+     * Temporary storage for builtins during initialization.
+     * Used because Immer bindings are immutable after construction,
+     * so we collect all builtins in a transient, then finalize once.
+     */
+    std::optional<AttrMapTransient> builtinsTransient_;
+
     void createBaseEnv(const EvalSettings & settings);
+
+    /**
+     * Finalize the builtins attrset after all constants and primops are registered.
+     * Converts the transient builtins collection to an immutable Bindings.
+     */
+    void finalizeBuiltins();
 
     Value * addConstant(const std::string & name, Value & v, Constant info);
 
@@ -907,13 +951,17 @@ public:
 
     /**
      * Automatically call a function for which each argument has a
-     * default value or has a binding in the `args` map.
+     * default value or has a binding in the `args` attrset.
      */
-    void autoCallFunction(const Bindings & args, Value & fun, Value & res);
+    void autoCallFunction(Value & args, Value & fun, Value & res);
 
-    BindingsBuilder buildBindings(size_t capacity)
+    /**
+     * Build a BindingsBuilder for constructing attribute sets.
+     * Uses CHAMP trie for structural sharing.
+     */
+    BindingsBuilder buildBindings(PosIdx pos = noPos)
     {
-        return mem.buildBindings(symbols, capacity);
+        return mem.buildBindings(symbols, 0, pos);
     }
 
     ListBuilder buildList(size_t size)

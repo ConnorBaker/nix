@@ -18,7 +18,7 @@ struct GetDerivationsEnv
     EvalSettings evalSettings{readOnlyMode};
     EvalState state;
 
-    Bindings * autoArgs = nullptr;
+    Value autoArgs;
     Value attrsValue;
 
     explicit GetDerivationsEnv(size_t attrCount)
@@ -29,9 +29,9 @@ struct GetDerivationsEnv
         }())
         , state({}, store, fetchSettings, evalSettings, nullptr)
     {
-        autoArgs = state.buildBindings(0).finish();
+        autoArgs.mkAttrs(&Bindings::emptyBindings);
 
-        auto attrs = state.buildBindings(attrCount);
+        auto attrs = state.buildBindings(noPos);
 
         for (size_t i = 0; i < attrCount; ++i) {
             auto name = fmt("pkg%|1$06d|", i);
@@ -40,7 +40,7 @@ struct GetDerivationsEnv
             v.mkInt(i);
         }
 
-        attrsValue.mkAttrs(attrs.finish());
+        attrsValue.mkAttrs(attrs);
     }
 };
 
@@ -54,7 +54,7 @@ static void BM_GetDerivationsAttrScan(benchmark::State & state)
     for (auto _ : state) {
         PackageInfos drvs;
         getDerivations(
-            env.state, env.attrsValue, /*pathPrefix=*/"", *env.autoArgs, drvs, /*ignoreAssertionFailures=*/true);
+            env.state, env.attrsValue, /*pathPrefix=*/"", env.autoArgs, drvs, /*ignoreAssertionFailures=*/true);
         benchmark::DoNotOptimize(drvs.size());
     }
 

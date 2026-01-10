@@ -42,7 +42,7 @@ struct InstallSourceInfo
     std::shared_ptr<SourcePath> nixExprPath; /* for srcNixExprDrvs, srcNixExprs */
     Path profile;                            /* for srcProfile */
     std::string systemFilter;                /* for srcNixExprDrvs */
-    Bindings * autoArgs;
+    Value * autoArgs;
 };
 
 struct Globals
@@ -158,7 +158,7 @@ static void loadSourceExpr(EvalState & state, const SourcePath & path, Value & v
        ~/.nix-defexpr directory that includes some system-wide
        directory). */
     else if (st.type == SourceAccessor::tDirectory) {
-        auto attrs = state.buildBindings(maxAttrs);
+        auto attrs = state.buildBindings(noPos);
         attrs.insert(state.symbols.create("_combineChannels"), &Value::vEmptyList);
         StringSet seen;
         getAllExprs(state, path, seen, attrs);
@@ -173,7 +173,7 @@ static void loadDerivations(
     EvalState & state,
     const SourcePath & nixExprPath,
     std::string systemFilter,
-    Bindings & autoArgs,
+    Value & autoArgs,
     const std::string & pathPrefix,
     PackageInfos & elems)
 {
@@ -1224,14 +1224,14 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
                             } else if (v->type() == nAttrs) {
                                 attrs2["type"] = "strings";
                                 XMLOpenElement m(xml, "meta", attrs2);
-                                for (auto & i : *v->attrs()) {
-                                    if (i.value->type() != nString)
-                                        continue;
+                                v->forEachAttr([&](Symbol name, Value * value, PosIdx) {
+                                    if (value->type() != nString)
+                                        return;
                                     XMLAttrs attrs3;
-                                    attrs3["type"] = globals.state->symbols[i.name];
-                                    attrs3["value"] = i.value->string_view();
+                                    attrs3["type"] = globals.state->symbols[name];
+                                    attrs3["value"] = value->string_view();
                                     xml.writeEmptyElement("string", attrs3);
-                                }
+                                });
                             }
                         }
                     }

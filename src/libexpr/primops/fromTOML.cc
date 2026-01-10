@@ -97,14 +97,16 @@ static void prim_fromTOML(EvalState & state, const PosIdx pos, Value ** args, Va
         switch (t.type()) {
         case toml::value_t::table: {
             auto table = toml::get<toml::table>(t);
-            auto attrs = state.buildBindings(table.size());
+            // Use BindingsBuilder - Immer everywhere
+            auto builder = state.buildBindings(noPos);
 
             for (auto & elem : table) {
                 forceNoNullByte(elem.first);
-                self(attrs.alloc(elem.first), elem.second);
+                auto & elemVal = builder.alloc(state.symbols.create(elem.first));
+                self(elemVal, elem.second);
             }
 
-            v.mkAttrs(attrs);
+            v.mkAttrs(builder);
         } break;
         case toml::value_t::array: {
             auto array = toml::get<std::vector<toml::value>>(t);
@@ -136,14 +138,15 @@ static void prim_fromTOML(EvalState & state, const PosIdx pos, Value ** args, Va
 #if HAVE_TOML11_4
                 normalizeDatetimeFormat(t);
 #endif
-                auto attrs = state.buildBindings(2);
-                attrs.alloc("_type").mkStringNoCopy("timestamp"_sds);
+                // Use BindingsBuilder - Immer everywhere
+                auto builder = state.buildBindings(noPos);
+                builder.alloc(state.symbols.create("_type")).mkStringNoCopy("timestamp"_sds);
                 std::ostringstream s;
                 s << t;
                 auto str = s.view();
                 forceNoNullByte(str);
-                attrs.alloc("value").mkString(str, state.mem);
-                v.mkAttrs(attrs);
+                builder.alloc(state.s.value).mkString(str, state.mem);
+                v.mkAttrs(builder);
             } else {
                 throw std::runtime_error("Dates and times are not supported");
             }

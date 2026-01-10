@@ -135,39 +135,39 @@ static void prim_fetchClosure(EvalState & state, const PosIdx pos, Value ** args
     std::optional<StorePathOrGap> toPath;
     std::optional<bool> inputAddressedMaybe;
 
-    for (auto & attr : *args[0]->attrs()) {
-        const auto & attrName = state.symbols[attr.name];
+    args[0]->forEachAttr([&](Symbol name, Value * value, PosIdx attrPos) {
+        const auto & attrName = state.symbols[name];
         auto attrHint = [&]() -> std::string {
             return fmt("while evaluating the attribute '%s' passed to builtins.fetchClosure", attrName);
         };
 
         if (attrName == "fromPath") {
             NixStringContext context;
-            fromPath = state.coerceToStorePath(attr.pos, *attr.value, context, attrHint());
+            fromPath = state.coerceToStorePath(attrPos, *value, context, attrHint());
         }
 
         else if (attrName == "toPath") {
-            state.forceValue(*attr.value, attr.pos);
-            bool isEmptyString = attr.value->type() == nString && attr.value->string_view() == "";
+            state.forceValue(*value, attrPos);
+            bool isEmptyString = value->type() == nString && value->string_view() == "";
             if (isEmptyString) {
                 toPath = StorePathOrGap{};
             } else {
                 NixStringContext context;
-                toPath = state.coerceToStorePath(attr.pos, *attr.value, context, attrHint());
+                toPath = state.coerceToStorePath(attrPos, *value, context, attrHint());
             }
         }
 
         else if (attrName == "fromStore")
-            fromStoreUrl = state.forceStringNoCtx(*attr.value, attr.pos, attrHint());
+            fromStoreUrl = state.forceStringNoCtx(*value, attrPos, attrHint());
 
         else if (attrName == "inputAddressed")
-            inputAddressedMaybe = state.forceBool(*attr.value, attr.pos, attrHint());
+            inputAddressedMaybe = state.forceBool(*value, attrPos, attrHint());
 
         else
             throw Error(
                 {.msg = HintFmt("attribute '%s' isn't supported in call to 'fetchClosure'", attrName),
                  .pos = state.positions[pos]});
-    }
+    });
 
     if (!fromPath)
         throw Error(

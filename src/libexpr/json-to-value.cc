@@ -56,10 +56,11 @@ class JSONSax : nlohmann::json_sax<json>
 
         std::unique_ptr<JSONState> resolve(EvalState & state) override
         {
-            auto attrs2 = state.buildBindings(attrs.size());
+            // Use BindingsBuilder - Immer everywhere
+            auto builder = state.buildBindings(noPos);
             for (auto & i : attrs)
-                attrs2.insert(i.first, i.second);
-            parent->value(state).mkAttrs(attrs2);
+                builder.insert(i.first, i.second);
+            parent->value(state).mkAttrs(builder);
             return std::move(parent);
         }
 

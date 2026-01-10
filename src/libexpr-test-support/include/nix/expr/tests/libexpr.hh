@@ -174,8 +174,8 @@ MATCHER_P(IsAttrsOfSize, n, fmt("Is a set of size [%1%]", n))
     if (arg.type() != nAttrs) {
         *result_listener << "Expected set got " << arg.type();
         return false;
-    } else if (arg.attrs()->size() != (size_t) n) {
-        *result_listener << "Expected a set with " << n << " attributes but got " << arg.attrs()->size();
+    } else if (arg.attrsSize() != (size_t) n) {
+        *result_listener << "Expected a set with " << n << " attributes but got " << arg.attrsSize();
         return false;
     }
     return true;

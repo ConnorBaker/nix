@@ -148,46 +148,46 @@ static FlakeInput parseFlakeInput(
     fetchers::Attrs attrs;
     std::optional<std::string> url;
 
-    for (auto & attr : *value->attrs()) {
+    value->forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx attrPos) {
         try {
-            if (attr.name == sUrl) {
-                forceTrivialValue(state, *attr.value, pos);
-                if (attr.value->type() == nString)
-                    url = attr.value->string_view();
-                else if (attr.value->type() == nPath) {
-                    auto path = attr.value->path();
+            if (attrName == sUrl) {
+                forceTrivialValue(state, *attrValue, pos);
+                if (attrValue->type() == nString)
+                    url = attrValue->string_view();
+                else if (attrValue->type() == nPath) {
+                    auto path = attrValue->path();
                     if (path.accessor != flakeDir.accessor)
                         throw Error(
                             "input attribute path '%s' at %s must be in the same source tree as %s",
                             path,
-                            state.positions[attr.pos],
+                            state.positions[attrPos],
                             flakeDir);
                     url = "path:" + flakeDir.path.makeRelative(path.path);
                 } else
                     throw Error(
                         "expected a string or a path but got %s at %s",
-                        showType(attr.value->type()),
-                        state.positions[attr.pos]);
+                        showType(attrValue->type()),
+                        state.positions[attrPos]);
                 attrs.emplace("url", *url);
-            } else if (attr.name == sFlake) {
-                expectType(state, nBool, *attr.value, attr.pos);
-                input.isFlake = attr.value->boolean();
-            } else if (attr.name == sInputs) {
+            } else if (attrName == sFlake) {
+                expectType(state, nBool, *attrValue, attrPos);
+                input.isFlake = attrValue->boolean();
+            } else if (attrName == sInputs) {
                 input.overrides =
-                    parseFlakeInputs(state, attr.value, attr.pos, lockRootAttrPath, flakeDir, false).first;
-            } else if (attr.name == sFollows) {
-                expectType(state, nString, *attr.value, attr.pos);
-                auto follows(parseInputAttrPath(attr.value->string_view()));
+                    parseFlakeInputs(state, attrValue, attrPos, lockRootAttrPath, flakeDir, false).first;
+            } else if (attrName == sFollows) {
+                expectType(state, nString, *attrValue, attrPos);
+                auto follows(parseInputAttrPath(attrValue->string_view()));
                 follows.insert(follows.begin(), lockRootAttrPath.begin(), lockRootAttrPath.end());
                 input.follows = follows;
             } else
-                parseFlakeInputAttr(state, attr, attrs);
+                parseFlakeInputAttr(state, Attr(attrName, attrValue, attrPos), attrs);
         } catch (Error & e) {
             e.addTrace(
-                state.positions[attr.pos], HintFmt("while evaluating flake attribute '%s'", state.symbols[attr.name]));
+                state.positions[attrPos], HintFmt("while evaluating flake attribute '%s'", state.symbols[attrName]));
             throw;
         }
-    }
+    });
 
     if (attrs.count("type"))
         try {
@@ -223,19 +223,20 @@ static std::pair<std::map<FlakeId, FlakeInput>, fetchers::Attrs> parseFlakeInput
 
     expectType(state, nAttrs, *value, pos);
 
-    for (auto & inputAttr : *value->attrs()) {
-        auto inputName = state.symbols[inputAttr.name];
+    value->forEachAttr([&](Symbol name, Value * attrValue, PosIdx attrPos) {
+        auto inputName = state.symbols[name];
         if (inputName == "self") {
             if (!allowSelf)
-                throw Error("'self' input attribute not allowed at %s", state.positions[inputAttr.pos]);
-            expectType(state, nAttrs, *inputAttr.value, inputAttr.pos);
-            for (auto & attr : *inputAttr.value->attrs())
-                parseFlakeInputAttr(state, attr, selfAttrs);
+                throw Error("'self' input attribute not allowed at %s", state.positions[attrPos]);
+            expectType(state, nAttrs, *attrValue, attrPos);
+            attrValue->forEachAttr([&](Symbol selfAttrName, Value * selfAttrValue, PosIdx selfAttrPos) {
+                parseFlakeInputAttr(state, Attr(selfAttrName, selfAttrValue, selfAttrPos), selfAttrs);
+            });
         } else {
             inputs.emplace(
-                inputName, parseFlakeInput(state, inputAttr.value, inputAttr.pos, lockRootAttrPath, flakeDir));
+                inputName, parseFlakeInput(state, attrValue, attrPos, lockRootAttrPath, flakeDir));
         }
-    }
+    });
 
     return {inputs, selfAttrs};
 }
@@ -262,27 +263,27 @@ static Flake readFlake(
         .path = flakePath,
     };
 
-    if (auto description = vInfo.attrs()->get(state.s.description)) {
-        expectType(state, nString, *description->value, description->pos);
-        flake.description = description->value->string_view();
+    if (auto description = vInfo.attrsGet(state.s.description)) {
+        expectType(state, nString, *description.value, description.pos);
+        flake.description = description.value->string_view();
     }
 
     auto sInputs = state.symbols.create("inputs");
 
-    if (auto inputs = vInfo.attrs()->get(sInputs)) {
+    if (auto inputs = vInfo.attrsGet(sInputs)) {
         auto [flakeInputs, selfAttrs] =
-            parseFlakeInputs(state, inputs->value, inputs->pos, lockRootAttrPath, flakeDir, true);
+            parseFlakeInputs(state, inputs.value, inputs.pos, lockRootAttrPath, flakeDir, true);
         flake.inputs = std::move(flakeInputs);
         flake.selfAttrs = std::move(selfAttrs);
     }
 
     auto sOutputs = state.symbols.create("outputs");
 
-    if (auto outputs = vInfo.attrs()->get(sOutputs)) {
-        expectType(state, nFunction, *outputs->value, outputs->pos);
+    if (auto outputs = vInfo.attrsGet(sOutputs)) {
+        expectType(state, nFunction, *outputs.value, outputs.pos);
 
-        if (outputs->value->isLambda()) {
-            if (auto formals = outputs->value->lambda().fun->getFormals()) {
+        if (outputs.value->isLambda()) {
+            if (auto formals = outputs.value->lambda().fun->getFormals()) {
                 for (auto & formal : formals->formals) {
                     if (formal.name != state.s.self)
                         flake.inputs.emplace(
@@ -298,54 +299,54 @@ static Flake readFlake(
 
     auto sNixConfig = state.symbols.create("nixConfig");
 
-    if (auto nixConfig = vInfo.attrs()->get(sNixConfig)) {
-        expectType(state, nAttrs, *nixConfig->value, nixConfig->pos);
+    if (auto nixConfig = vInfo.attrsGet(sNixConfig)) {
+        expectType(state, nAttrs, *nixConfig.value, nixConfig.pos);
 
-        for (auto & setting : *nixConfig->value->attrs()) {
-            forceTrivialValue(state, *setting.value, setting.pos);
-            if (setting.value->type() == nString)
+        nixConfig.value->forEachAttr([&](Symbol settingName, Value * settingValue, PosIdx settingPos) {
+            forceTrivialValue(state, *settingValue, settingPos);
+            if (settingValue->type() == nString)
                 flake.config.settings.emplace(
-                    state.symbols[setting.name], std::string(state.forceStringNoCtx(*setting.value, setting.pos, "")));
-            else if (setting.value->type() == nPath) {
+                    state.symbols[settingName], std::string(state.forceStringNoCtx(*settingValue, settingPos, "")));
+            else if (settingValue->type() == nPath) {
                 auto storePath =
-                    fetchToStore(state.fetchSettings, *state.store, setting.value->path(), FetchMode::Copy);
-                flake.config.settings.emplace(state.symbols[setting.name], state.store->printStorePath(storePath));
-            } else if (setting.value->type() == nInt)
+                    fetchToStore(state.fetchSettings, *state.store, settingValue->path(), FetchMode::Copy);
+                flake.config.settings.emplace(state.symbols[settingName], state.store->printStorePath(storePath));
+            } else if (settingValue->type() == nInt)
                 flake.config.settings.emplace(
-                    state.symbols[setting.name], state.forceInt(*setting.value, setting.pos, "").value);
-            else if (setting.value->type() == nBool)
+                    state.symbols[settingName], state.forceInt(*settingValue, settingPos, "").value);
+            else if (settingValue->type() == nBool)
                 flake.config.settings.emplace(
-                    state.symbols[setting.name], Explicit<bool>{state.forceBool(*setting.value, setting.pos, "")});
-            else if (setting.value->type() == nList) {
+                    state.symbols[settingName], Explicit<bool>{state.forceBool(*settingValue, settingPos, "")});
+            else if (settingValue->type() == nList) {
                 std::vector<std::string> ss;
-                for (auto elem : setting.value->listView()) {
+                for (auto elem : settingValue->listView()) {
                     if (elem->type() != nString)
                         state
                             .error<TypeError>(
                                 "list element in flake configuration setting '%s' is %s while a string is expected",
-                                state.symbols[setting.name],
-                                showType(*setting.value))
+                                state.symbols[settingName],
+                                showType(*settingValue))
                             .debugThrow();
-                    ss.emplace_back(state.forceStringNoCtx(*elem, setting.pos, ""));
+                    ss.emplace_back(state.forceStringNoCtx(*elem, settingPos, ""));
                 }
-                flake.config.settings.emplace(state.symbols[setting.name], ss);
+                flake.config.settings.emplace(state.symbols[settingName], ss);
             } else
                 state
                     .error<TypeError>(
-                        "flake configuration setting '%s' is %s", state.symbols[setting.name], showType(*setting.value))
+                        "flake configuration setting '%s' is %s", state.symbols[settingName], showType(*settingValue))
                     .debugThrow();
-        }
+        });
     }
 
-    for (auto & attr : *vInfo.attrs()) {
-        if (attr.name != state.s.description && attr.name != sInputs && attr.name != sOutputs
-            && attr.name != sNixConfig)
+    vInfo.forEachAttr([&](Symbol attrName, Value * attrValue, PosIdx attrPos) {
+        if (attrName != state.s.description && attrName != sInputs && attrName != sOutputs
+            && attrName != sNixConfig)
             throw Error(
                 "flake '%s' has an unsupported attribute '%s', at %s",
                 resolvedRef,
-                state.symbols[attr.name],
-                state.positions[attr.pos]);
-    }
+                state.symbols[attrName],
+                state.positions[attrPos]);
+    });
 
     return flake;
 }
@@ -933,10 +934,10 @@ void callFlake(EvalState & state, const LockedFlake & lockedFlake, Value & vRes)
 
     auto [lockFileStr, keyMap] = lockedFlake.lockFile.to_string();
 
-    auto overrides = state.buildBindings(lockedFlake.nodePaths.size());
+    auto overrides = state.buildBindings(noPos);
 
     for (auto & [node, sourcePath] : lockedFlake.nodePaths) {
-        auto override = state.buildBindings(2);
+        auto override = state.buildBindings(noPos);
 
         auto & vSourceInfo = override.alloc(state.symbols.create("sourceInfo"));
 
@@ -957,10 +958,12 @@ void callFlake(EvalState & state, const LockedFlake & lockedFlake, Value & vRes)
 
         override.alloc(state.symbols.create("dir")).mkString(CanonPath(subdir).rel(), state.mem);
 
-        overrides.alloc(state.symbols.create(key->second)).mkAttrs(override);
+        auto & vOverride = overrides.alloc(state.symbols.create(key->second));
+        vOverride.mkAttrs(override);
     }
 
-    auto & vOverrides = state.allocValue()->mkAttrs(overrides);
+    auto * vOverrides = state.allocValue();
+    vOverrides->mkAttrs(overrides);
 
     Value * vCallFlake = requireInternalFile(state, CanonPath("call-flake.nix"));
 
@@ -970,7 +973,7 @@ void callFlake(EvalState & state, const LockedFlake & lockedFlake, Value & vRes)
     auto vFetchFinalTree = get(state.internalPrimOps, "fetchFinalTree");
     assert(vFetchFinalTree);
 
-    Value * args[] = {vLocks, &vOverrides, *vFetchFinalTree};
+    Value * args[] = {vLocks, vOverrides, *vFetchFinalTree};
     state.callFunction(*vCallFlake, args, vRes, noPos);
 }
 
@@ -1017,10 +1020,10 @@ ref<eval_cache::EvalCache> openEvalCache(EvalState & state, ref<const LockedFlak
 
         state.forceAttrs(*vFlake, noPos, "while parsing cached flake data");
 
-        auto aOutputs = vFlake->attrs()->get(state.symbols.create("outputs"));
+        auto aOutputs = vFlake->attrsGet(state.symbols.create("outputs"));
         assert(aOutputs);
 
-        return aOutputs->value;
+        return aOutputs.value;
     };
 
     if (fingerprint) {
