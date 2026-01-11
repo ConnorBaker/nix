@@ -163,7 +163,7 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
         auto v = state->allocValue();
         state->eval(state->parseExprFromString(res.data, state->rootPath(CanonPath("/no-such-path"))), *v);
         Value emptyArgs;
-        emptyArgs.mkAttrs(&Bindings::emptyBindings);
+        emptyArgs.mkAttrs(&Bindings::emptySingleton());
         auto v2 = findAlongAttrPath(*state, settings.thisSystem, emptyArgs, *v).first;
 
         return store->parseStorePath(

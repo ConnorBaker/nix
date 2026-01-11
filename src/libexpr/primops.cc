@@ -3251,17 +3251,17 @@ static void prim_removeAttrs(EvalState & state, const PosIdx pos, Value ** args,
         namesToRemove.push_back(state.symbols.create(elem->string_view()));
     }
 
-    // Create a set for O(1) lookup of names to remove
-    std::set<Symbol> namesToRemoveSet(namesToRemove.begin(), namesToRemove.end());
+    if (namesToRemove.empty()) {
+        v = *args[0];
+        return;
+    }
 
-    /* Copy all attributes not in the removal set. Use BindingsBuilder - Immer everywhere */
-    auto attrs = state.buildBindings(noPos);
-    args[0]->forEachAttr([&](Symbol name, Value * value, PosIdx pos) {
-        if (namesToRemoveSet.find(name) == namesToRemoveSet.end()) {
-            attrs.insert(name, value, pos);
-        }
-    });
-    v.mkAttrs(attrs);
+    // Use a transient based on the original map for structural sharing
+    auto transient = args[0]->attrs().map.transient();
+    for (auto name : namesToRemove)
+        transient.erase(name);
+
+    v.mkAttrs(state.mem.allocBindings(std::move(transient).persistent(), noPos));
 }
 
 static RegisterPrimOp primop_removeAttrs({
@@ -3291,12 +3291,8 @@ static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args,
 
     auto listView = args[0]->listView();
 
-    // Use a set to track seen names for deduplication (first occurrence wins)
-    std::set<Symbol> seen;
-    // Build list of (symbol, value, pos) for the attrs we'll include
-    // Use gc_allocator so the GC can see Value* pointers stored in the vector
-    std::vector<std::tuple<Symbol, Value*, PosIdx>, gc_allocator<std::tuple<Symbol, Value*, PosIdx>>> attrList;
-    attrList.reserve(listView.size());
+    // Build attrs directly, keeping the first occurrence
+    auto attrs = state.buildBindings(noPos);
 
     for (auto v2 : listView) {
         state.forceAttrs(*v2, pos, "while evaluating an element of the list passed to builtins.listToAttrs");
@@ -3314,7 +3310,7 @@ static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args,
         auto sym = state.symbols.create(name);
 
         // Skip if we already have this attribute (first occurrence wins)
-        if (!seen.insert(sym).second)
+        if (attrs.contains(sym))
             continue;
 
         auto valueAttr = v2->attrsGet(state.s.value);
@@ -3323,13 +3319,7 @@ static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args,
                 .withTrace(noPos, "in a {name=...; value=...;} pair")
                 .debugThrow();
 
-        attrList.emplace_back(sym, valueAttr.value, valueAttr.pos);
-    }
-
-    // Use BindingsBuilder - Immer everywhere
-    auto attrs = state.buildBindings(noPos);
-    for (auto & [sym, value, attrPos] : attrList) {
-        attrs.insert(sym, value, attrPos);
+        attrs.insert(sym, valueAttr.value, valueAttr.pos);
     }
 
     v.mkAttrs(attrs);
@@ -3451,7 +3441,7 @@ static void prim_functionArgs(EvalState & state, const PosIdx pos, Value ** args
 {
     state.forceValue(*args[0], pos);
     if (args[0]->isPrimOpApp() || args[0]->isPrimOp()) {
-        v.mkAttrs(&Bindings::emptyBindings);
+        v.mkAttrs(&Bindings::emptySingleton());
         return;
     }
     if (!args[0]->isLambda())
@@ -3464,7 +3454,7 @@ static void prim_functionArgs(EvalState & state, const PosIdx pos, Value ** args
             attrs.insert(i.name, state.getBool(i.def), i.pos);
         v.mkAttrs(attrs);
     } else {
-        v.mkAttrs(&Bindings::emptyBindings);
+        v.mkAttrs(&Bindings::emptySingleton());
         return;
     }
 }
@@ -4245,15 +4235,16 @@ static void prim_concatMap(EvalState & state, const PosIdx pos, Value ** args, V
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.concatMap");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.concatMap");
-    auto nrLists = args[1]->listSize();
+    auto listView = args[1]->listView();
+    auto nrLists = listView.size();
 
     // List of returned lists before concatenation. References to these Values must NOT be persisted.
     SmallTemporaryValueVector<conservativeStackReservation> lists(nrLists);
     size_t len = 0;
     bool allImmer = true;
 
-    for (size_t n = 0; n < nrLists; ++n) {
-        Value * vElem = args[1]->listElem(n);
+    size_t n = 0;
+    for (auto vElem : listView) {
         state.callFunction(*args[0], *vElem, lists[n], pos);
         state.forceList(
             lists[n],
@@ -4263,6 +4254,7 @@ static void prim_concatMap(EvalState & state, const PosIdx pos, Value ** args, V
         len += l;
         if (l > 0 && !lists[n].isImmerList())
             allImmer = false;
+        ++n;
     }
 
     if (len == 0) {
@@ -4286,9 +4278,8 @@ static void prim_concatMap(EvalState & state, const PosIdx pos, Value ** args, V
     // Fall back to O(n) path for mixed lists
     auto transient = state.mem.buildImmerList();
     for (size_t n = 0; n < nrLists; ++n) {
-        auto l = lists[n].listSize();
-        for (size_t i = 0; i < l; ++i)
-            transient.push_back(lists[n].listElem(i));
+        for (auto elem : lists[n].listView())
+            transient.push_back(elem);
     }
     v.mkImmerList(state.mem.allocImmerList(std::move(transient).persistent()));
 }

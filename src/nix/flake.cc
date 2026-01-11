@@ -524,7 +524,7 @@ struct CmdFlakeCheck : FlakeCommand
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking NixOS configuration '%s'", attrPath));
                 Value emptyArgs;
-                emptyArgs.mkAttrs(&Bindings::emptyBindings);
+                emptyArgs.mkAttrs(&Bindings::emptySingleton());
                 auto vToplevel = findAlongAttrPath(*state, "config.system.build.toplevel", emptyArgs, v).first;
                 state->forceValue(*vToplevel, pos);
                 if (!state->isDerivation(*vToplevel))

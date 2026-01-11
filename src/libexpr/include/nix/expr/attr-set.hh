@@ -116,10 +116,10 @@ struct Bindings {
     PosIdx pos;
 
     /**
-     * An instance of Bindings with 0 attributes.
-     * This object must never be modified.
+     * Returns a singleton Bindings with 0 attributes.
+     * Lazily initialized to avoid GC init ordering issues.
      */
-    static Bindings emptyBindings;
+    static const Bindings & emptySingleton();
 
     Bindings() = default;
     Bindings(AttrMap m, PosIdx p = {}) : map(std::move(m)), pos(p) {}

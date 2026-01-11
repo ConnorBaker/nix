@@ -720,7 +720,10 @@ nix_err nix_bindings_builder_insert(nix_c_context * context, BindingsBuilder * b
 void nix_bindings_builder_free(BindingsBuilder * bb)
 {
 #if NIX_USE_BOEHMGC
-    GC_FREE(bb);
+    if (bb) {
+        bb->~BindingsBuilder();
+        GC_FREE(bb);
+    }
 #else
     delete bb;
 #endif

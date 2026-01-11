@@ -26,7 +26,7 @@ PackageInfos queryInstalled(EvalState & state, const Path & userEnv)
         Value v;
         state.evalFile(state.rootPath(CanonPath(manifestFile)).resolveSymlinks(), v);
         Value emptyArgs;
-        emptyArgs.mkAttrs(&Bindings::emptyBindings);
+        emptyArgs.mkAttrs(&Bindings::emptySingleton());
         getDerivations(state, v, "", emptyArgs, elems, false);
     }
     return elems;

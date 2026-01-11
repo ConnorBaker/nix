@@ -3,7 +3,11 @@
 
 namespace nix {
 
-Bindings Bindings::emptyBindings;
+const Bindings & Bindings::emptySingleton()
+{
+    static const Bindings empty{AttrMap{}};
+    return empty;
+}
 
 NixList * EvalMemory::allocImmerList(NixList list)
 {

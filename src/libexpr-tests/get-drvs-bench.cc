@@ -29,7 +29,7 @@ struct GetDerivationsEnv
         }())
         , state({}, store, fetchSettings, evalSettings, nullptr)
     {
-        autoArgs.mkAttrs(&Bindings::emptyBindings);
+        autoArgs.mkAttrs(&Bindings::emptySingleton());
 
         auto attrs = state.buildBindings(noPos);
 

@@ -123,7 +123,7 @@ std::pair<SourcePath, uint32_t> findPackageFilename(EvalState & state, Value & v
     Value * v2;
     try {
         Value dummyArgs;
-        dummyArgs.mkAttrs(&Bindings::emptyBindings);
+        dummyArgs.mkAttrs(&Bindings::emptySingleton());
         v2 = findAlongAttrPath(state, "meta.position", dummyArgs, v).first;
     } catch (Error &) {
         throw NoPositionInfo("package '%s' has no source location information", what);

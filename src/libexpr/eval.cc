@@ -1981,9 +1981,10 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         transient.set(name, attr);
     }
 
+    auto resultSize = transient.size();
     v.mkAttrs(state.mem.allocBindings(std::move(transient).persistent(), resultPos));
 
-    state.nrOpUpdateValuesCopied += size2;
+    state.nrOpUpdateValuesCopied += resultSize;
 }
 
 void ExprOpUpdate::eval(EvalState & state, Env & env, Value & v)
@@ -1991,7 +1992,7 @@ void ExprOpUpdate::eval(EvalState & state, Env & env, Value & v)
     UpdateQueue q;
     evalForUpdate(state, env, q);
 
-    v.mkAttrs(&Bindings::emptyBindings);
+    v.mkAttrs(&Bindings::emptySingleton());
     for (auto & rhs : std::views::reverse(q)) {
         /* Remember that queue is sorted rightmost attrset first. */
         eval(state, /*v=*/v, /*v1=*/v, /*v2=*/rhs);
@@ -2070,9 +2071,8 @@ void EvalState::concatLists(
     auto out = list.elems;
     size_t outPos = 0;
     for (size_t n = 0; n < nrLists; ++n) {
-        auto l = lists[n]->listSize();
-        for (size_t i = 0; i < l; ++i)
-            out[outPos++] = lists[n]->listElem(i);
+        for (auto elem : lists[n]->listView())
+            out[outPos++] = elem;
     }
     v.mkList(list);
 }
