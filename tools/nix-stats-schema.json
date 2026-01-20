@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nix-evaluator-stats.schema.json",
+  "title": "Nix Evaluator Statistics",
+  "type": "object",
+  "properties": {
+    "builtinStats": {
+      "type": "object",
+      "description": "Per-builtin function statistics",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "avoided": { "type": "integer", "description": "Calls avoided due to empty/singleton input" },
+          "listSize": { "$ref": "#/$defs/histogram", "description": "Distribution of input list sizes" },
+          "attrSize": { "$ref": "#/$defs/histogram", "description": "Distribution of input attr set sizes" }
+        }
+      }
+    },
+    "operatorStats": {
+      "type": "object",
+      "properties": {
+        "attrLookup": {
+          "type": "object",
+          "properties": {
+            "calls": { "type": "integer" },
+            "found": { "type": "integer" },
+            "notFound": { "type": "integer" },
+            "attrSetSize": { "$ref": "#/$defs/histogram" },
+            "totalLayers": { "$ref": "#/$defs/histogram" },
+            "foundAtDepth": { "$ref": "#/$defs/histogram" },
+            "layersSearched": { "$ref": "#/$defs/histogram" }
+          }
+        },
+        "boolOps": {
+          "type": "object",
+          "properties": {
+            "andCalls": { "type": "integer" },
+            "andShortCircuit": { "type": "integer" },
+            "orCalls": { "type": "integer" },
+            "orShortCircuit": { "type": "integer" },
+            "implCalls": { "type": "integer" },
+            "implShortCircuit": { "type": "integer" }
+          }
+        },
+        "concatStrings": {
+          "type": "object",
+          "properties": {
+            "calls": { "type": "integer" },
+            "numParts": { "$ref": "#/$defs/histogram" },
+            "resultLength": { "$ref": "#/$defs/histogram" },
+            "intArithmetic": { "type": "integer" },
+            "floatArithmetic": { "type": "integer" },
+            "pathConcat": { "type": "integer" }
+          }
+        },
+        "getAttr": {
+          "type": "object",
+          "properties": {
+            "calls": { "type": "integer" },
+            "found": { "type": "integer" },
+            "notFound": { "type": "integer" },
+            "attrSetSize": { "$ref": "#/$defs/histogram" },
+            "totalLayers": { "$ref": "#/$defs/histogram" },
+            "foundAtDepth": { "$ref": "#/$defs/histogram" }
+          }
+        },
+        "opConcatLists": {
+          "type": "object",
+          "properties": {
+            "calls": { "type": "integer" },
+            "leftEmpty": { "type": "integer" },
+            "rightEmpty": { "type": "integer" },
+            "operandSizes": { "$ref": "#/$defs/pairHistogram" },
+            "resultSize": { "$ref": "#/$defs/histogram" }
+          }
+        },
+        "opEq": {
+          "type": "object",
+          "properties": {
+            "calls": { "type": "integer" },
+            "samePointer": { "type": "integer" },
+            "typeMismatch": { "type": "integer" },
+            "byType": {
+              "type": "object",
+              "properties": {
+                "attrs": { "type": "integer" },
+                "bool": { "type": "integer" },
+                "external": { "type": "integer" },
+                "float": { "type": "integer" },
+                "function": { "type": "integer" },
+                "int": { "type": "integer" },
+                "list": { "type": "integer" },
+                "null": { "type": "integer" },
+                "path": { "type": "integer" },
+                "string": { "type": "integer" }
+              }
+            },
+            "attrSizes": { "$ref": "#/$defs/pairHistogram" },
+            "listSizes": { "$ref": "#/$defs/pairHistogram" }
+          }
+        },
+        "opHasAttr": {
+          "type": "object",
+          "properties": {
+            "calls": { "type": "integer" },
+            "found": { "type": "integer" },
+            "notFound": { "type": "integer" },
+            "notAttrs": { "type": "integer" },
+            "attrSetSize": { "$ref": "#/$defs/histogram" },
+            "pathLength": { "$ref": "#/$defs/histogram" },
+            "totalLayers": { "$ref": "#/$defs/histogram" }
+          }
+        },
+        "opUpdate": {
+          "type": "object",
+          "properties": {
+            "calls": { "type": "integer" },
+            "fullMerge": { "type": "integer" },
+            "layered": { "type": "integer" },
+            "leftEmpty": { "type": "integer" },
+            "rightEmpty": { "type": "integer" },
+            "numLayers": { "$ref": "#/$defs/histogram" },
+            "operandSizes": { "$ref": "#/$defs/pairHistogram" },
+            "resultSize": { "$ref": "#/$defs/histogram" }
+          }
+        }
+      }
+    },
+    "sets": {
+      "type": "object",
+      "properties": {
+        "bytes": { "type": "integer" },
+        "elements": { "type": "integer" },
+        "number": { "type": "integer" }
+      }
+    },
+    "sizes": {
+      "type": "object",
+      "properties": {
+        "Attr": { "type": "integer" },
+        "Bindings": { "type": "integer" },
+        "Env": { "type": "integer" },
+        "Value": { "type": "integer" }
+      }
+    },
+    "symbols": {
+      "type": "object",
+      "properties": {
+        "bytes": { "type": "integer" },
+        "number": { "type": "integer" }
+      }
+    },
+    "time": {
+      "type": "object",
+      "properties": {
+        "cpu": { "type": "number" },
+        "gc": { "type": "number" },
+        "gcFraction": { "type": "number" }
+      }
+    },
+    "values": {
+      "type": "object",
+      "properties": {
+        "bytes": { "type": "integer" },
+        "number": { "type": "integer" }
+      }
+    }
+  },
+  "$defs": {
+    "histogram": {
+      "type": "object",
+      "description": "Histogram mapping size (as string) to count",
+      "additionalProperties": { "type": "integer" },
+      "propertyNames": { "pattern": "^[0-9]+$" }
+    },
+    "pairHistogram": {
+      "type": "object",
+      "description": "Histogram mapping [left,right] pair to count",
+      "additionalProperties": { "type": "integer" },
+      "propertyNames": { "pattern": "^\\[[0-9]+,[0-9]+\\]$" }
+    }
+  }
+}

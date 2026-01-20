@@ -1,0 +1,1495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nix Evaluator Statistics Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vega-lite@6"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
+    <style>
+        :root {
+            --bg-primary: #1a1a2e;
+            --bg-secondary: #16213e;
+            --bg-card: #0f3460;
+            --text-primary: #eef2f7;
+            --text-secondary: #a0aec0;
+            --accent: #e94560;
+            --accent-secondary: #0db8de;
+            --success: #38a169;
+            --warning: #ecc94b;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-card) 100%);
+            padding: 1.5rem 2rem;
+            border-bottom: 2px solid var(--accent);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        .header h1 {
+            font-size: 1.75rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .file-input-container {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .file-input-wrapper {
+            position: relative;
+            display: inline-block;
+        }
+
+        .file-input-wrapper input[type="file"] {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            cursor: pointer;
+        }
+
+        .file-input-btn {
+            background: var(--accent);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .file-input-btn:hover {
+            background: #d63051;
+        }
+
+        .file-name {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 1.5rem;
+        }
+
+        .section {
+            margin-bottom: 2rem;
+        }
+
+        .section-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--accent-secondary);
+        }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .summary-card {
+            background: var(--bg-card);
+            border-radius: 8px;
+            padding: 1.25rem;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .summary-card .label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .summary-card .value {
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: var(--accent-secondary);
+        }
+
+        .summary-card .sub-value {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 0.25rem;
+        }
+
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(450px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .chart-container {
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            padding: 1rem;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .chart-title {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 0.75rem;
+            color: var(--text-primary);
+        }
+
+        .chart-subtitle {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+
+        .chart {
+            width: 100%;
+            min-height: 250px;
+        }
+
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 200px;
+            color: var(--text-secondary);
+        }
+
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            height: 60vh;
+            text-align: center;
+            color: var(--text-secondary);
+        }
+
+        .empty-state h2 {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+            color: var(--text-primary);
+        }
+
+        .empty-state p {
+            max-width: 400px;
+            margin-bottom: 1.5rem;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .stat-row:last-child {
+            border-bottom: none;
+        }
+
+        .stat-label {
+            color: var(--text-secondary);
+        }
+
+        .stat-value {
+            font-weight: 600;
+            color: var(--accent-secondary);
+        }
+
+        .percentage {
+            color: var(--success);
+        }
+
+        .tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+        }
+
+        .tab {
+            background: var(--bg-card);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: var(--text-secondary);
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+
+        .tab:hover {
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+        }
+
+        .tab.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        /* Vega tooltip styling */
+        #vg-tooltip-element {
+            font-family: inherit !important;
+            background: var(--bg-card) !important;
+            border: 1px solid var(--accent) !important;
+            border-radius: 4px !important;
+            padding: 0.5rem !important;
+            color: var(--text-primary) !important;
+        }
+
+        /* Section-level summary cards (smaller than main summary) */
+        .section-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 0.75rem;
+            margin-bottom: 1.5rem;
+            padding: 1rem;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 8px;
+        }
+
+        .section-summary-card {
+            text-align: center;
+            padding: 0.75rem;
+        }
+
+        .section-summary-card .value {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--accent-secondary);
+        }
+
+        .section-summary-card .label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 0.25rem;
+        }
+
+        /* Data table for pie chart details */
+        .chart-data-table {
+            width: 100%;
+            margin-top: 0.75rem;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+
+        .chart-data-table th,
+        .chart-data-table td {
+            padding: 0.4rem 0.6rem;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .chart-data-table th {
+            color: var(--text-secondary);
+            font-weight: 500;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+        }
+
+        .chart-data-table td {
+            color: var(--text-primary);
+        }
+
+        .chart-data-table td:last-child {
+            text-align: right;
+            color: var(--accent-secondary);
+        }
+
+        .chart-data-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        @media (max-width: 768px) {
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .charts-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .summary-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .section-summary {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <h1>Nix Evaluator Statistics Dashboard</h1>
+        <div class="file-input-container">
+            <div class="file-input-wrapper">
+                <span class="file-input-btn">Choose File</span>
+                <input type="file" id="fileInput" accept=".json">
+            </div>
+            <span class="file-name" id="fileName">No file selected</span>
+        </div>
+    </header>
+
+    <main class="container">
+        <div id="emptyState" class="empty-state">
+            <h2>Load a Statistics File</h2>
+            <p>Select a JSON file exported from the Nix evaluator to visualize statistics about builtin usage, operator performance, and memory allocation.</p>
+        </div>
+
+        <div id="dashboard" class="hidden">
+            <!-- Summary Section -->
+            <section class="section">
+                <h2 class="section-title">Summary</h2>
+                <div class="summary-grid" id="summaryGrid"></div>
+            </section>
+
+            <!-- Builtin Functions Overview -->
+            <section class="section">
+                <h2 class="section-title">Builtin Functions Overview</h2>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Top Builtins & Operators by Total Calls</h3>
+                        <p class="chart-subtitle">Logarithmic scale; hover for optimization breakdown</p>
+                        <div id="builtinCallsChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Optimization Rate by Builtin & Operator</h3>
+                        <p class="chart-subtitle">Ranked by % of calls avoided via empty/singleton/short-circuit fast paths</p>
+                        <div id="builtinAvoidedChart" class="chart"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Attribute Sets Section -->
+            <section class="section">
+                <h2 class="section-title">Attribute Sets</h2>
+                <p class="chart-subtitle" style="margin-bottom: 1rem; color: var(--text-secondary);">Operations on attribute sets: lookup (.attr), has attribute (?), update (//)</p>
+                <div class="section-summary" id="attrSetsSummary"></div>
+
+                <h3 class="chart-title" style="margin-top: 1.5rem; margin-bottom: 0.75rem; font-size: 1.1rem; border-left: 3px solid var(--accent); padding-left: 0.75rem;">Attribute Lookup (.attr)</h3>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Lookup Success Rate</h3>
+                        <div id="attrLookupPieChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Found at Depth Distribution</h3>
+                        <p class="chart-subtitle">How deep in the layer stack attributes were found (line = cumulative %)</p>
+                        <div id="foundAtDepthChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Total Layers Distribution</h3>
+                        <p class="chart-subtitle">Number of attribute set layers being searched (line = cumulative %)</p>
+                        <div id="totalLayersChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Attribute Set Size Distribution</h3>
+                        <p class="chart-subtitle">Size of attribute sets being looked up (line = cumulative %)</p>
+                        <div id="attrSetSizeChart" class="chart"></div>
+                    </div>
+                </div>
+
+                <h3 class="chart-title" style="margin-top: 1.5rem; margin-bottom: 0.75rem; font-size: 1.1rem; border-left: 3px solid var(--accent); padding-left: 0.75rem;">Has Attribute (?)</h3>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Result Distribution</h3>
+                        <div id="opHasAttrResultChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Path Length Distribution</h3>
+                        <p class="chart-subtitle">Number of components in attribute path (line = cumulative %)</p>
+                        <div id="opHasAttrPathChart" class="chart"></div>
+                    </div>
+                </div>
+
+                <h3 class="chart-title" style="margin-top: 1.5rem; margin-bottom: 0.75rem; font-size: 1.1rem; border-left: 3px solid var(--accent); padding-left: 0.75rem;">Attribute Update (//)</h3>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Update Strategy Distribution</h3>
+                        <p class="chart-subtitle">How updates were handled</p>
+                        <div id="opUpdateStrategyChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Operand Sizes Heatmap</h3>
+                        <p class="chart-subtitle">Left vs right attribute set sizes</p>
+                        <div id="opUpdateHeatmap" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Number of Layers</h3>
+                        <p class="chart-subtitle">Distribution of layer counts in layered updates (line = cumulative %)</p>
+                        <div id="opUpdateLayersChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Result Size Distribution</h3>
+                        <p class="chart-subtitle">Size of resulting attribute set (line = cumulative %)</p>
+                        <div id="opUpdateResultChart" class="chart"></div>
+                    </div>
+                </div>
+
+                <h3 class="chart-title" style="margin-top: 1.5rem; margin-bottom: 0.75rem; font-size: 1.1rem; border-left: 3px solid var(--accent); padding-left: 0.75rem;">Attribute Set Equality Comparisons</h3>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Size Comparisons Heatmap</h3>
+                        <p class="chart-subtitle">Heatmap of left vs right operand sizes in == comparisons</p>
+                        <div id="opEqAttrHeatmap" class="chart"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Lists Section -->
+            <section class="section">
+                <h2 class="section-title">Lists</h2>
+                <p class="chart-subtitle" style="margin-bottom: 1rem; color: var(--text-secondary);">Operations on lists: concatenation (++)</p>
+                <div class="section-summary" id="listsSummary"></div>
+
+                <h3 class="chart-title" style="margin-top: 1.5rem; margin-bottom: 0.75rem; font-size: 1.1rem; border-left: 3px solid var(--accent); padding-left: 0.75rem;">List Concatenation (++)</h3>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Empty Operand Optimization</h3>
+                        <div id="opConcatListsOptChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Operand Sizes Heatmap</h3>
+                        <p class="chart-subtitle">Left vs right list sizes</p>
+                        <div id="opConcatListsHeatmap" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Result Size Distribution</h3>
+                        <p class="chart-subtitle">Size of concatenated list (line = cumulative %)</p>
+                        <div id="opConcatListsResultChart" class="chart"></div>
+                    </div>
+                </div>
+
+                <h3 class="chart-title" style="margin-top: 1.5rem; margin-bottom: 0.75rem; font-size: 1.1rem; border-left: 3px solid var(--accent); padding-left: 0.75rem;">List Equality Comparisons</h3>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Size Comparisons Heatmap</h3>
+                        <p class="chart-subtitle">Heatmap of left vs right operand sizes in == comparisons</p>
+                        <div id="opEqListHeatmap" class="chart"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Strings Section -->
+            <section class="section">
+                <h2 class="section-title">Strings</h2>
+                <p class="chart-subtitle" style="margin-bottom: 1rem; color: var(--text-secondary);">String concatenation and interpolation operations</p>
+                <div class="section-summary" id="stringsSummary"></div>
+                <div class="chart-container" style="margin-bottom: 1.5rem;">
+                    <h3 class="chart-title">Number of Parts Distribution</h3>
+                    <p class="chart-subtitle">How many parts are concatenated per call (line = cumulative %)</p>
+                    <div id="concatStringsPartsChart" class="chart"></div>
+                </div>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Result Length Distribution</h3>
+                        <p class="chart-subtitle">Length of concatenated result (line = cumulative %)</p>
+                        <div id="concatStringsLengthChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">String Interpolation Types</h3>
+                        <p class="chart-subtitle">Integer, float, and path concatenations</p>
+                        <div id="concatStringsTypesChart" class="chart"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Comparisons & Logic Section -->
+            <section class="section">
+                <h2 class="section-title">Comparisons & Logic</h2>
+                <p class="chart-subtitle" style="margin-bottom: 1rem; color: var(--text-secondary);">Equality comparisons (==) and boolean operations (&&, ||, ->)</p>
+                <div class="section-summary" id="comparisonsSummary"></div>
+
+                <h3 class="chart-title" style="margin-top: 1.5rem; margin-bottom: 0.75rem; font-size: 1.1rem; border-left: 3px solid var(--accent); padding-left: 0.75rem;">Equality (==)</h3>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Comparisons by Type</h3>
+                        <div id="opEqByTypeChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Comparison Optimization</h3>
+                        <p class="chart-subtitle">Same pointer vs type mismatch vs full comparison</p>
+                        <div id="opEqOptChart" class="chart"></div>
+                    </div>
+                </div>
+
+                <h3 class="chart-title" style="margin-top: 1.5rem; margin-bottom: 0.75rem; font-size: 1.1rem; border-left: 3px solid var(--accent); padding-left: 0.75rem;">Boolean Operations (&&, ||, ->)</h3>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Short-Circuit Efficiency</h3>
+                        <p class="chart-subtitle">Percentage of operations that short-circuited</p>
+                        <div id="boolOpsChart" class="chart"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Memory Section -->
+            <section class="section">
+                <h2 class="section-title">Memory Usage</h2>
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3 class="chart-title">Memory Allocation by Category</h3>
+                        <div id="memoryChart" class="chart"></div>
+                    </div>
+                    <div class="chart-container">
+                        <h3 class="chart-title">Object Counts</h3>
+                        <div id="objectCountsChart" class="chart"></div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <script>
+        // Utility functions
+        function formatNumber(n) {
+            if (n === undefined || n === null) return '0';
+            if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+            if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(2) + 'K';
+            return n.toLocaleString();
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === undefined || bytes === null) return '0 B';
+            if (bytes >= 1e9) return (bytes / 1e9).toFixed(1) + ' GB';
+            if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
+            if (bytes >= 1e3) return (bytes / 1e3).toFixed(1) + ' KB';
+            return bytes + ' B';
+        }
+
+        function formatTime(seconds) {
+            if (seconds === undefined || seconds === null) return '0s';
+            if (seconds >= 60) return (seconds / 60).toFixed(2) + 'm';
+            if (seconds >= 1) return seconds.toFixed(2) + 's';
+            return (seconds * 1000).toFixed(1) + 'ms';
+        }
+
+        function formatPercent(value, total) {
+            if (!total) return '0%';
+            return ((value / total) * 100).toFixed(1) + '%';
+        }
+
+        // Convert histogram object to array
+        function histogramToArray(hist) {
+            if (!hist) return [];
+            return Object.entries(hist).map(([k, v]) => ({
+                size: parseInt(k),
+                count: v
+            })).sort((a, b) => a.size - b.size);
+        }
+
+        // Parse pair histogram "[left,right]": count
+        function pairHistogramToArray(hist) {
+            if (!hist) return [];
+            return Object.entries(hist).map(([k, v]) => {
+                const match = k.match(/\[(\d+),(\d+)\]/);
+                if (!match) return null;
+                return {
+                    left: parseInt(match[1]),
+                    right: parseInt(match[2]),
+                    count: v
+                };
+            }).filter(x => x !== null);
+        }
+
+        // Aggregate histogram to get total calls
+        function histogramTotal(hist) {
+            if (!hist) return 0;
+            return Object.values(hist).reduce((a, b) => a + b, 0);
+        }
+
+        // Configurable bin definitions
+        // Each bin is [maxValue, label] - values <= maxValue get this label
+        // Last entry should have Infinity as maxValue
+        const BINS_COARSE = [
+            [0, '0'], [1, '1'], [5, '2-5'], [10, '6-10'],
+            [50, '11-50'], [100, '51-100'], [Infinity, '100+']
+        ];
+        const BINS_FINE = [
+            [0, '0'], [1, '1'], [5, '2-5'], [10, '6-10'], [25, '11-25'],
+            [50, '26-50'], [100, '51-100'], [500, '101-500'], [1000, '501-1K'], [Infinity, '1K+']
+        ];
+
+        // Get bin label for a value using given bin definition
+        function getBinLabel(n, bins) {
+            for (const [max, label] of bins) {
+                if (n <= max) return label;
+            }
+            return bins[bins.length - 1][1]; // fallback to last label
+        }
+
+        // Get ordered bin labels from bin definition
+        function getBinOrder(bins) {
+            return bins.map(([_, label]) => label);
+        }
+
+        // Bin histogram data with configurable bins
+        function binHistogram(data, bins = BINS_FINE) {
+            const binMap = new Map();
+            data.forEach(d => {
+                const label = getBinLabel(d.size, bins);
+                binMap.set(label, (binMap.get(label) || 0) + d.count);
+            });
+            return getBinOrder(bins)
+                .filter(label => binMap.has(label))
+                .map(label => ({ size: label, count: binMap.get(label) }));
+        }
+
+        // Bin pair data for heatmaps (uses coarse bins for readability)
+        function binPairData(data) {
+            const aggregated = new Map();
+            let totalCount = 0;
+            data.forEach(d => {
+                const key = `${getBinLabel(d.left, BINS_COARSE)}|${getBinLabel(d.right, BINS_COARSE)}`;
+                aggregated.set(key, (aggregated.get(key) || 0) + d.count);
+                totalCount += d.count;
+            });
+            return Array.from(aggregated.entries()).map(([key, count]) => {
+                const [left, right] = key.split('|');
+                return { left, right, count, percentage: formatPercent(count, totalCount) };
+            });
+        }
+
+        // Bin order for heatmap axis sorting
+        const binOrder = getBinOrder(BINS_COARSE);
+
+        // Helper to create pie chart data from a simple object of {label: value} pairs
+        // Automatically computes percentages and filters out zero values
+        function makePieData(entries, categoryField = 'category', valueField = 'value') {
+            const total = entries.reduce((sum, [_, v]) => sum + (v || 0), 0);
+            return entries
+                .filter(([_, v]) => v > 0)
+                .map(([label, value]) => ({
+                    [categoryField]: label,
+                    [valueField]: value,
+                    percentage: formatPercent(value, total)
+                }));
+        }
+
+        // Vega-Lite configuration
+        const vegaConfig = {
+            background: 'transparent',
+            axis: {
+                labelColor: '#a0aec0',
+                titleColor: '#eef2f7',
+                gridColor: '#2d3748',
+                domainColor: '#4a5568',
+                tickColor: '#4a5568'
+            },
+            legend: {
+                labelColor: '#a0aec0',
+                titleColor: '#eef2f7'
+            },
+            title: {
+                color: '#eef2f7'
+            },
+            view: {
+                stroke: 'transparent'
+            }
+        };
+
+        // Base spec with common properties - spread into chart specs
+        const baseSpec = (height = 250) => ({
+            $schema: 'https://vega.github.io/schema/vega-lite/v6.json',
+            config: vegaConfig,
+            width: 'container',
+            height,
+            autosize: { type: 'fit', contains: 'padding' }
+        });
+
+        // Create bar chart spec with percentage support
+        function createBarChartSpec(data, xField, yField, color = '#0db8de', title = null) {
+            // Add percentage to data if not already present
+            const total = data.reduce((sum, d) => sum + (d[yField] || 0), 0);
+            const dataWithPct = data.map(d => ({
+                ...d,
+                percentage: d.percentage || formatPercent(d[yField], total)
+            }));
+
+            return {
+                ...baseSpec(),
+                data: { values: dataWithPct },
+                mark: { type: 'bar', color, cornerRadiusTopLeft: 3, cornerRadiusTopRight: 3 },
+                encoding: {
+                    x: { field: xField, type: 'nominal', axis: { labelAngle: -45, labelLimit: 100 }, sort: '-y' },
+                    y: { field: yField, type: 'quantitative', title },
+                    tooltip: [
+                        { field: xField, type: 'nominal', title: xField },
+                        { field: yField, type: 'quantitative', title: yField, format: ',' },
+                        { field: 'percentage', type: 'nominal', title: 'Percentage' }
+                    ]
+                }
+            };
+        }
+
+        // Create histogram spec with CDF line overlay
+        function createHistogramWithCDFSpec(data, xField = 'size', yField = 'count', color = '#0db8de') {
+            // Add percentage and CDF to data
+            const total = data.reduce((sum, d) => sum + (d[yField] || 0), 0);
+            let cumulative = 0;
+            const dataWithCDF = data.map(d => {
+                cumulative += d[yField] || 0;
+                return {
+                    ...d,
+                    percentage: formatPercent(d[yField], total),
+                    cdf: cumulative / total,
+                    cdfPercent: formatPercent(cumulative, total)
+                };
+            });
+
+            return {
+                ...baseSpec(),
+                data: { values: dataWithCDF },
+                encoding: {
+                    x: { field: xField, type: 'ordinal', axis: { labelAngle: -45, labelLimit: 60 }, title: xField, sort: null }
+                },
+                layer: [
+                    {
+                        mark: { type: 'bar', color, cornerRadiusTopLeft: 2, cornerRadiusTopRight: 2 },
+                        encoding: {
+                            y: { field: yField, type: 'quantitative', title: yField },
+                            tooltip: [
+                                { field: xField, type: 'nominal', title: xField },
+                                { field: yField, type: 'quantitative', title: 'Count', format: ',' },
+                                { field: 'percentage', type: 'nominal', title: 'Percentage' },
+                                { field: 'cdfPercent', type: 'nominal', title: 'Cumulative' }
+                            ]
+                        }
+                    },
+                    {
+                        mark: { type: 'line', color: '#e94560', strokeWidth: 2, point: { color: '#e94560', size: 40 } },
+                        encoding: {
+                            y: { field: 'cdf', type: 'quantitative', axis: { title: 'Cumulative %', format: '.0%', orient: 'right' }, scale: { domain: [0, 1] } }
+                        }
+                    }
+                ],
+                resolve: { scale: { y: 'independent' } }
+            };
+        }
+
+        // Create pie chart spec with percentage labels on chart
+        // Only shows text labels for slices >= 5% to avoid overlapping text
+        function createPieChartSpec(data, categoryField, valueField) {
+            // Calculate total and add showLabel flag for slices >= 5%
+            const total = data.reduce((sum, d) => sum + (d[valueField] || 0), 0);
+            const dataWithMeta = data.map(d => ({
+                ...d,
+                showLabel: total > 0 && (d[valueField] / total) >= 0.05,
+                // For legend display - category: value (percentage)
+                legendLabel: `${d[categoryField]}: ${formatNumber(d[valueField])} (${d.percentage || formatPercent(d[valueField], total)})`
+            }));
+
+            return {
+                ...baseSpec(),
+                data: { values: dataWithMeta },
+                encoding: {
+                    theta: { field: valueField, type: 'quantitative', stack: true },
+                    color: { field: categoryField, type: 'nominal', scale: { scheme: 'tableau10' }, legend: { orient: 'right', title: null, labelLimit: 200 } }
+                },
+                layer: [
+                    {
+                        mark: { type: 'arc', innerRadius: 50, outerRadius: 100, stroke: '#1a1a2e', strokeWidth: 2 },
+                        encoding: {
+                            tooltip: [
+                                { field: categoryField, type: 'nominal', title: 'Category' },
+                                { field: valueField, type: 'quantitative', format: ',', title: 'Count' },
+                                { field: 'percentage', type: 'nominal', title: 'Percentage' }
+                            ]
+                        }
+                    },
+                    {
+                        mark: { type: 'text', radius: 75, fontSize: 11, fontWeight: 'bold', fill: '#fff' },
+                        encoding: {
+                            text: { condition: { test: 'datum.showLabel', field: 'percentage', type: 'nominal' }, value: '' }
+                        }
+                    }
+                ]
+            };
+        }
+
+        // Create pie chart with a data table below showing all values
+        // Use this for charts where precise values are important
+        function createPieWithTable(containerId, data, categoryField, valueField) {
+            // First render the pie chart
+            const spec = createPieChartSpec(data, categoryField, valueField);
+            embedChart(containerId, spec);
+
+            // Then add a data table below the chart
+            const total = data.reduce((sum, d) => sum + (d[valueField] || 0), 0);
+            const sortedData = [...data].sort((a, b) => b[valueField] - a[valueField]);
+
+            const tableHtml = `
+                <table class="chart-data-table">
+                    <thead><tr><th>Category</th><th>Count</th><th>%</th></tr></thead>
+                    <tbody>
+                        ${sortedData.map(d => `
+                            <tr>
+                                <td>${d[categoryField]}</td>
+                                <td>${formatNumber(d[valueField])}</td>
+                                <td>${d.percentage || formatPercent(d[valueField], total)}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+
+            // Insert table after the chart container
+            const chartContainer = document.getElementById(containerId);
+            if (chartContainer) {
+                // Remove any existing table
+                const existingTable = chartContainer.parentElement.querySelector('.chart-data-table');
+                if (existingTable) existingTable.remove();
+                // Add the new table
+                chartContainer.insertAdjacentHTML('afterend', tableHtml);
+            }
+        }
+
+        // Create stacked bar chart spec
+        function createStackedBarSpec(data, xField, yField, colorField) {
+            return {
+                ...baseSpec(),
+                data: { values: data },
+                mark: { type: 'bar', cornerRadiusTopLeft: 3, cornerRadiusTopRight: 3 },
+                encoding: {
+                    x: { field: xField, type: 'nominal', axis: { labelAngle: 0 } },
+                    y: { field: yField, type: 'quantitative', stack: 'normalize', title: 'Percentage' },
+                    color: { field: colorField, type: 'nominal', scale: { scheme: 'tableau10' } },
+                    tooltip: [
+                        { field: xField, type: 'nominal' },
+                        { field: colorField, type: 'nominal' },
+                        { field: yField, type: 'quantitative', format: ',' }
+                    ]
+                }
+            };
+        }
+
+        // Create heatmap spec with binned data support
+        function createHeatmapSpec(data, xField, yField, colorField, useBinOrder = false) {
+            // Determine sort order - use binOrder for binned data, numeric sort for raw data
+            let sortX, sortY;
+            if (useBinOrder) {
+                sortX = binOrder.filter(b => data.some(d => d[xField] === b));
+                sortY = binOrder.filter(b => data.some(d => d[yField] === b));
+            } else {
+                sortX = [...new Set(data.map(d => d[xField]))].sort((a, b) => a - b);
+                sortY = [...new Set(data.map(d => d[yField]))].sort((a, b) => a - b);
+            }
+
+            // Add percentage if not present
+            const total = data.reduce((sum, d) => sum + d[colorField], 0);
+            const dataWithPct = data.map(d => ({
+                ...d,
+                percentage: d.percentage || formatPercent(d[colorField], total)
+            }));
+
+            return {
+                ...baseSpec(300),
+                data: { values: dataWithPct },
+                mark: { type: 'rect' },
+                encoding: {
+                    x: { field: xField, type: 'ordinal', title: 'Left Size', sort: sortX },
+                    y: { field: yField, type: 'ordinal', title: 'Right Size', sort: sortY },
+                    color: { field: colorField, type: 'quantitative', scale: { type: 'log', scheme: 'viridis' }, legend: { title: 'Count' } },
+                    tooltip: [
+                        { field: xField, type: 'nominal', title: 'Left' },
+                        { field: yField, type: 'nominal', title: 'Right' },
+                        { field: colorField, type: 'quantitative', title: 'Count', format: ',' },
+                        { field: 'percentage', type: 'nominal', title: 'Percentage' }
+                    ]
+                }
+            };
+        }
+
+        // Embed chart with error handling
+        async function embedChart(elementId, spec) {
+            const element = document.getElementById(elementId);
+            if (!element) return;
+
+            try {
+                await vegaEmbed('#' + elementId, spec, {
+                    actions: false,
+                    renderer: 'svg'
+                });
+            } catch (error) {
+                console.error(`Error rendering chart ${elementId}:`, error);
+                element.innerHTML = `<div class="loading">Error rendering chart</div>`;
+            }
+        }
+
+        // Common chart rendering helpers - combine data transformation + chart creation
+
+        // Render histogram with CDF from raw histogram data
+        function renderHistogram(chartId, histData, { binned = false } = {}) {
+            const data = histogramToArray(histData);
+            if (data.length === 0) return;
+            const processed = binned ? binHistogram(data) : data;
+            embedChart(chartId, createHistogramWithCDFSpec(processed, 'size', 'count', '#0db8de'));
+        }
+
+        // Render heatmap from raw pair histogram data
+        function renderHeatmap(chartId, pairHistData) {
+            const data = pairHistogramToArray(pairHistData);
+            if (data.length === 0) return;
+            embedChart(chartId, createHeatmapSpec(binPairData(data), 'left', 'right', 'count', true));
+        }
+
+        // Render pie chart from entries array
+        function renderPie(chartId, entries, categoryField = 'category', valueField = 'value') {
+            const data = makePieData(entries, categoryField, valueField);
+            if (data.length === 0) return;
+            embedChart(chartId, createPieChartSpec(data, categoryField, valueField));
+        }
+
+        // Main data and state
+        let currentData = null;
+
+        // Update summary cards
+        function updateSummary(data) {
+            const grid = document.getElementById('summaryGrid');
+            grid.innerHTML = '';
+
+            const cards = [
+                {
+                    label: 'CPU Time',
+                    value: formatTime(data.time?.cpu),
+                    sub: `GC: ${formatTime(data.time?.gc)} (${formatPercent(data.time?.gc, data.time?.cpu)})`
+                },
+                {
+                    label: 'Attribute Lookups',
+                    value: formatNumber(data.operatorStats?.attrLookup?.calls),
+                    sub: `Found: ${formatPercent(data.operatorStats?.attrLookup?.found, data.operatorStats?.attrLookup?.calls)}`
+                },
+                {
+                    label: 'Equality Checks',
+                    value: formatNumber(data.operatorStats?.opEq?.calls),
+                    sub: `Same ptr: ${formatPercent(data.operatorStats?.opEq?.samePointer, data.operatorStats?.opEq?.calls)}`
+                },
+                {
+                    label: 'Attr Updates',
+                    value: formatNumber(data.operatorStats?.opUpdate?.calls),
+                    sub: `Layered: ${formatPercent(data.operatorStats?.opUpdate?.layered, data.operatorStats?.opUpdate?.calls)}`
+                },
+                {
+                    label: 'List Concat',
+                    value: formatNumber(data.operatorStats?.opConcatLists?.calls),
+                    sub: `Empty opt: ${formatPercent(data.operatorStats?.opConcatLists?.leftEmpty + data.operatorStats?.opConcatLists?.rightEmpty, data.operatorStats?.opConcatLists?.calls)}`
+                },
+                {
+                    label: 'Attr Sets',
+                    value: formatBytes(data.sets?.bytes),
+                    sub: `${formatNumber(data.sets?.number)} sets, ${formatNumber(data.sets?.elements)} elements`
+                },
+                {
+                    label: 'Values',
+                    value: formatBytes(data.values?.bytes),
+                    sub: `${formatNumber(data.values?.number)} values`
+                },
+                {
+                    label: 'Symbols',
+                    value: formatBytes(data.symbols?.bytes),
+                    sub: `${formatNumber(data.symbols?.number)} symbols`
+                }
+            ];
+
+            cards.forEach(card => {
+                const div = document.createElement('div');
+                div.className = 'summary-card';
+                div.innerHTML = `
+                    <div class="label">${card.label}</div>
+                    <div class="value">${card.value}</div>
+                    <div class="sub-value">${card.sub}</div>
+                `;
+                grid.appendChild(div);
+            });
+        }
+
+        // Update section-level summaries
+        function updateSectionSummaries(data) {
+            // Attribute Sets section summary
+            const attrSummary = document.getElementById('attrSetsSummary');
+            if (attrSummary) {
+                const sets = data.sets || {};
+                const attrLookup = data.operatorStats?.attrLookup || {};
+                const opUpdate = data.operatorStats?.opUpdate || {};
+                const opHasAttr = data.operatorStats?.opHasAttr || {};
+
+                attrSummary.innerHTML = `
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(sets.number)}</div>
+                        <div class="label">Attr Sets</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(sets.elements)}</div>
+                        <div class="label">Total Elements</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatBytes(sets.bytes)}</div>
+                        <div class="label">Memory</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(attrLookup.calls)}</div>
+                        <div class="label">Lookups</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(opHasAttr.calls)}</div>
+                        <div class="label">Has Attr (?)</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(opUpdate.calls)}</div>
+                        <div class="label">Updates (//)</div>
+                    </div>
+                `;
+            }
+
+            // Lists section summary
+            const listsSummary = document.getElementById('listsSummary');
+            if (listsSummary) {
+                const opConcatLists = data.operatorStats?.opConcatLists || {};
+                const opEq = data.operatorStats?.opEq || {};
+                const listEqCount = opEq.byType?.list || 0;
+                const leftEmpty = opConcatLists.leftEmpty || 0;
+                const rightEmpty = opConcatLists.rightEmpty || 0;
+                const emptyOpt = leftEmpty + rightEmpty;
+                const emptyOptPct = opConcatLists.calls ? formatPercent(emptyOpt, opConcatLists.calls) : '0%';
+
+                listsSummary.innerHTML = `
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(opConcatLists.calls)}</div>
+                        <div class="label">Concatenations</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(emptyOpt)}</div>
+                        <div class="label">Empty Optimized</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${emptyOptPct}</div>
+                        <div class="label">Optimization Rate</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(listEqCount)}</div>
+                        <div class="label">Equality Comparisons</div>
+                    </div>
+                `;
+            }
+
+            // Strings section summary
+            const stringsSummary = document.getElementById('stringsSummary');
+            if (stringsSummary) {
+                const concatStrings = data.operatorStats?.concatStrings || {};
+                const numPartsHist = concatStrings.numParts || {};
+                const totalConcats = histogramTotal(numPartsHist);
+                const opEq = data.operatorStats?.opEq || {};
+                const stringEqCount = opEq.byType?.string || 0;
+                const intArith = concatStrings.intArithmetic || 0;
+                const floatArith = concatStrings.floatArithmetic || 0;
+                const pathConcat = concatStrings.pathConcat || 0;
+
+                stringsSummary.innerHTML = `
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(totalConcats)}</div>
+                        <div class="label">Concat Calls</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(stringEqCount)}</div>
+                        <div class="label">Equality Comparisons</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(intArith + floatArith)}</div>
+                        <div class="label">Numeric Coercions</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(pathConcat)}</div>
+                        <div class="label">Path Concats</div>
+                    </div>
+                `;
+            }
+
+            // Comparisons & Logic section summary
+            const comparisonsSummary = document.getElementById('comparisonsSummary');
+            if (comparisonsSummary) {
+                const opEq = data.operatorStats?.opEq || {};
+                const boolOps = data.operatorStats?.boolOps || {};
+                const samePtr = opEq.samePointer || 0;
+                const typeMismatch = opEq.typeMismatch || 0;
+                const totalBoolOps = (boolOps.andCalls || 0) + (boolOps.orCalls || 0) + (boolOps.implCalls || 0);
+                const totalShortCircuit = (boolOps.andShortCircuit || 0) + (boolOps.orShortCircuit || 0) + (boolOps.implShortCircuit || 0);
+                const shortCircuitPct = totalBoolOps ? formatPercent(totalShortCircuit, totalBoolOps) : '0%';
+
+                comparisonsSummary.innerHTML = `
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(opEq.calls)}</div>
+                        <div class="label">Equality Checks (==)</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(samePtr + typeMismatch)}</div>
+                        <div class="label">Fast Path (ptr/type)</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${formatNumber(totalBoolOps)}</div>
+                        <div class="label">Bool Ops (&&, ||, ->)</div>
+                    </div>
+                    <div class="section-summary-card">
+                        <div class="value">${shortCircuitPct}</div>
+                        <div class="label">Short-Circuited</div>
+                    </div>
+                `;
+            }
+        }
+
+        // Operator definitions for the builtin/operator chart
+        // Each entry: [displayName, statsPath, callsKey, avoidedKeys]
+        // avoidedKeys can be an array of keys to sum, or a function(stats) => avoided
+        const OPERATOR_DEFS = [
+            ['++ (list concat)', 'opConcatLists', 'calls', ['leftEmpty', 'rightEmpty']],
+            ['// (attr update)', 'opUpdate', 'calls', ['leftEmpty', 'rightEmpty']],
+            ['.attr (lookup)', 'attrLookup', 'calls', []],
+            ['? (has attr)', 'opHasAttr', 'calls', []],
+            ['== (equality)', 'opEq', 'calls', s => (s.samePointer || 0) + (s.typeMismatch || 0)],
+            ['+ (string concat)', 'concatStrings', 'calls', []],
+            ['&& (and)', 'boolOps', 'andCalls', ['andShortCircuit']],
+            ['|| (or)', 'boolOps', 'orCalls', ['orShortCircuit']],
+            ['-> (impl)', 'boolOps', 'implCalls', ['implShortCircuit']],
+        ];
+
+        // Update builtin statistics charts
+        function updateBuiltinCharts(data) {
+            const builtinStats = data.builtinStats || {};
+            const operatorStats = data.operatorStats || {};
+
+            // Calculate total calls per builtin
+            const builtinCalls = Object.entries(builtinStats).map(([name, stats]) => {
+                const sizeHist = stats.listSize || stats.attrSize || {};
+                const total = histogramTotal(sizeHist);
+                const avoided = stats.avoided || 0;
+                return { name, total: total + avoided, executed: total, avoided, isOperator: false };
+            }).filter(b => b.total > 0);
+
+            // Add operators using data-driven definitions
+            for (const [name, path, callsKey, avoidedDef] of OPERATOR_DEFS) {
+                const stats = operatorStats[path] || {};
+                const calls = stats[callsKey] || 0;
+                if (calls === 0) continue;
+
+                const avoided = typeof avoidedDef === 'function'
+                    ? avoidedDef(stats)
+                    : avoidedDef.reduce((sum, key) => sum + (stats[key] || 0), 0);
+
+                builtinCalls.push({
+                    name,
+                    total: calls,
+                    executed: calls - avoided,
+                    avoided,
+                    isOperator: true
+                });
+            }
+
+            // Top builtins/operators by total (executed + avoided)
+            const topBuiltins = builtinCalls
+                .sort((a, b) => b.total - a.total)
+                .slice(0, 20);
+
+            // Add formatted data for tooltips
+            const chartData = topBuiltins.map(b => ({
+                ...b,
+                pctAvoided: formatPercent(b.avoided, b.total)
+            }));
+
+            // Simple horizontal bar chart (no stacking - clearer with log scale)
+            embedChart('builtinCallsChart', {
+                ...baseSpec(450),
+                data: { values: chartData },
+                mark: { type: 'bar', color: '#0db8de', cornerRadiusTopRight: 3, cornerRadiusBottomRight: 3 },
+                encoding: {
+                    y: { field: 'name', type: 'nominal', sort: topBuiltins.map(b => b.name), title: null },
+                    x: { field: 'total', type: 'quantitative', title: 'Total Calls', scale: { type: 'symlog', constant: 1000 } },
+                    tooltip: [
+                        { field: 'name', type: 'nominal', title: 'Name' },
+                        { field: 'total', type: 'quantitative', title: 'Total Calls', format: ',' },
+                        { field: 'executed', type: 'quantitative', title: 'Executed', format: ',' },
+                        { field: 'avoided', type: 'quantitative', title: 'Avoided', format: ',' },
+                        { field: 'pctAvoided', type: 'nominal', title: 'Optimization Rate' }
+                    ]
+                }
+            });
+
+            // Builtins/operators sorted by optimization rate (% avoided) - shows which benefit most from fast paths
+            const optimizationRateData = builtinCalls
+                .filter(b => b.avoided > 0 && b.total >= 100)  // Only show items with meaningful sample size
+                .map(b => ({
+                    name: b.name,
+                    optimizationRate: (b.avoided / b.total * 100),
+                    avoided: b.avoided,
+                    executed: b.executed,
+                    total: b.total,
+                    percentage: formatPercent(b.avoided, b.total),
+                    isOperator: b.isOperator
+                }))
+                .sort((a, b) => b.optimizationRate - a.optimizationRate)
+                .slice(0, 20);
+
+            embedChart('builtinAvoidedChart', {
+                ...baseSpec(450),
+                data: { values: optimizationRateData },
+                mark: { type: 'bar', color: '#38a169', cornerRadiusTopRight: 3, cornerRadiusBottomRight: 3 },
+                encoding: {
+                    y: { field: 'name', type: 'nominal', sort: optimizationRateData.map(d => d.name), title: null },
+                    x: { field: 'optimizationRate', type: 'quantitative', title: 'Optimization Rate (%)', scale: { domain: [0, 100] } },
+                    tooltip: [
+                        { field: 'name', type: 'nominal', title: 'Name' },
+                        { field: 'percentage', type: 'nominal', title: 'Optimization Rate' },
+                        { field: 'avoided', type: 'quantitative', title: 'Avoided', format: ',' },
+                        { field: 'executed', type: 'quantitative', title: 'Executed', format: ',' },
+                        { field: 'total', type: 'quantitative', title: 'Total', format: ',' }
+                    ]
+                }
+            });
+        }
+
+        // Update attribute lookup charts
+        function updateAttrLookupCharts(data) {
+            const attrLookup = data.operatorStats?.attrLookup || {};
+
+            // Pie chart for found vs notFound
+            renderPie('attrLookupPieChart', [
+                ['Found', attrLookup.found || 0],
+                ['Not Found', attrLookup.notFound || 0]
+            ]);
+
+            // Histograms with CDF
+            renderHistogram('foundAtDepthChart', attrLookup.foundAtDepth);
+            renderHistogram('totalLayersChart', attrLookup.totalLayers);
+            renderHistogram('attrSetSizeChart', attrLookup.attrSetSize, { binned: true });
+        }
+
+        // Update boolean operations chart
+        function updateBoolOpsCharts(data) {
+            const boolOps = data.operatorStats?.boolOps || {};
+
+            const boolOpsData = [
+                { op: '&&', type: 'Short-circuit', value: boolOps.andShortCircuit || 0 },
+                { op: '&&', type: 'Full eval', value: (boolOps.andCalls || 0) - (boolOps.andShortCircuit || 0) },
+                { op: '||', type: 'Short-circuit', value: boolOps.orShortCircuit || 0 },
+                { op: '||', type: 'Full eval', value: (boolOps.orCalls || 0) - (boolOps.orShortCircuit || 0) },
+                { op: '->', type: 'Short-circuit', value: boolOps.implShortCircuit || 0 },
+                { op: '->', type: 'Full eval', value: (boolOps.implCalls || 0) - (boolOps.implShortCircuit || 0) }
+            ];
+
+            embedChart('boolOpsChart', createStackedBarSpec(boolOpsData, 'op', 'value', 'type'));
+        }
+
+        // Update opEq charts
+        function updateOpEqCharts(data) {
+            const opEq = data.operatorStats?.opEq || {};
+
+            // By type pie chart
+            const byType = opEq.byType || {};
+            const typeTotal = Object.values(byType).reduce((a, b) => a + b, 0);
+            const typeData = Object.entries(byType)
+                .filter(([_, v]) => v > 0)
+                .map(([type, value]) => ({
+                    type,
+                    value,
+                    percentage: formatPercent(value, typeTotal)
+                }))
+                .sort((a, b) => b.value - a.value);
+            // Use pie with table for better visibility of all type counts
+            createPieWithTable('opEqByTypeChart', typeData, 'type', 'value');
+
+            // Optimization breakdown
+            const calls = opEq.calls || 0;
+            const samePtr = opEq.samePointer || 0;
+            const typeMismatch = opEq.typeMismatch || 0;
+            renderPie('opEqOptChart', [
+                ['Same Pointer', samePtr],
+                ['Type Mismatch', typeMismatch],
+                ['Full Compare', calls - samePtr - typeMismatch]
+            ]);
+
+            // Heatmaps
+            renderHeatmap('opEqAttrHeatmap', opEq.attrSizes);
+            renderHeatmap('opEqListHeatmap', opEq.listSizes);
+        }
+
+        // Update opUpdate charts
+        function updateOpUpdateCharts(data) {
+            const opUpdate = data.operatorStats?.opUpdate || {};
+
+            // Strategy distribution
+            renderPie('opUpdateStrategyChart', [
+                ['Left Empty', opUpdate.leftEmpty || 0],
+                ['Right Empty', opUpdate.rightEmpty || 0],
+                ['Layered', opUpdate.layered || 0],
+                ['Full Merge', opUpdate.fullMerge || 0]
+            ], 'strategy', 'value');
+
+            // Heatmap and histograms
+            renderHeatmap('opUpdateHeatmap', opUpdate.operandSizes);
+            renderHistogram('opUpdateLayersChart', opUpdate.numLayers);
+            renderHistogram('opUpdateResultChart', opUpdate.resultSize, { binned: true });
+        }
+
+        // Update opConcatLists charts
+        function updateOpConcatListsCharts(data) {
+            const opConcatLists = data.operatorStats?.opConcatLists || {};
+
+            // Empty operand optimization
+            const calls = opConcatLists.calls || 0;
+            const leftEmpty = opConcatLists.leftEmpty || 0;
+            const rightEmpty = opConcatLists.rightEmpty || 0;
+            renderPie('opConcatListsOptChart', [
+                ['Left Empty', leftEmpty],
+                ['Right Empty', rightEmpty],
+                ['Both Non-Empty', calls - leftEmpty - rightEmpty]
+            ]);
+
+            // Heatmap and histogram
+            renderHeatmap('opConcatListsHeatmap', opConcatLists.operandSizes);
+            renderHistogram('opConcatListsResultChart', opConcatLists.resultSize, { binned: true });
+        }
+
+        // Update concatStrings charts
+        function updateConcatStringsCharts(data) {
+            const concatStrings = data.operatorStats?.concatStrings || {};
+
+            // Histograms
+            renderHistogram('concatStringsPartsChart', concatStrings.numParts);
+            renderHistogram('concatStringsLengthChart', concatStrings.resultLength, { binned: true });
+
+            // Types bar chart
+            const typesData = [
+                { type: 'Int Arithmetic', value: concatStrings.intArithmetic || 0 },
+                { type: 'Float Arithmetic', value: concatStrings.floatArithmetic || 0 },
+                { type: 'Path Concat', value: concatStrings.pathConcat || 0 }
+            ].filter(d => d.value > 0);
+            if (typesData.length > 0) {
+                embedChart('concatStringsTypesChart', createBarChartSpec(typesData, 'type', 'value', '#ecc94b', 'Calls'));
+            }
+        }
+
+        // Update opHasAttr charts
+        function updateOpHasAttrCharts(data) {
+            const opHasAttr = data.operatorStats?.opHasAttr || {};
+
+            // Result distribution and histogram
+            renderPie('opHasAttrResultChart', [
+                ['Found', opHasAttr.found || 0],
+                ['Not Found', opHasAttr.notFound || 0],
+                ['Not Attrs', opHasAttr.notAttrs || 0]
+            ], 'result', 'value');
+            renderHistogram('opHasAttrPathChart', opHasAttr.pathLength);
+        }
+
+        // Update memory charts
+        function updateMemoryCharts(data) {
+            // Memory allocation by category
+            const memoryData = [
+                { category: 'Attr Sets', bytes: data.sets?.bytes || 0 },
+                { category: 'Values', bytes: data.values?.bytes || 0 },
+                { category: 'Symbols', bytes: data.symbols?.bytes || 0 }
+            ];
+            memoryData.forEach(d => d.formatted = formatBytes(d.bytes));
+
+            embedChart('memoryChart', {
+                ...baseSpec(),
+                data: { values: memoryData },
+                mark: { type: 'bar', color: '#0db8de', cornerRadiusTopLeft: 3, cornerRadiusTopRight: 3 },
+                encoding: {
+                    x: { field: 'category', type: 'nominal', axis: { labelAngle: 0 } },
+                    y: { field: 'bytes', type: 'quantitative', title: 'Bytes' },
+                    tooltip: [
+                        { field: 'category', type: 'nominal' },
+                        { field: 'formatted', type: 'nominal', title: 'Size' }
+                    ]
+                }
+            });
+
+            // Object counts
+            const countData = [
+                { category: 'Attr Sets', count: data.sets?.number || 0 },
+                { category: 'Attr Elements', count: data.sets?.elements || 0 },
+                { category: 'Values', count: data.values?.number || 0 },
+                { category: 'Symbols', count: data.symbols?.number || 0 }
+            ];
+            embedChart('objectCountsChart', createBarChartSpec(countData, 'category', 'count', '#38a169', 'Count'));
+        }
+
+        // Process loaded data
+        function processData(data) {
+            currentData = data;
+
+            // Show dashboard, hide empty state
+            document.getElementById('emptyState').classList.add('hidden');
+            document.getElementById('dashboard').classList.remove('hidden');
+
+            // Update all sections
+            updateSummary(data);
+            updateSectionSummaries(data);
+            updateBuiltinCharts(data);
+            updateAttrLookupCharts(data);
+            updateBoolOpsCharts(data);
+            updateOpEqCharts(data);
+            updateOpUpdateCharts(data);
+            updateOpConcatListsCharts(data);
+            updateConcatStringsCharts(data);
+            updateOpHasAttrCharts(data);
+            updateMemoryCharts(data);
+        }
+
+        // File input handler
+        document.getElementById('fileInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            document.getElementById('fileName').textContent = file.name;
+
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                try {
+                    const data = JSON.parse(event.target.result);
+                    processData(data);
+                } catch (error) {
+                    alert('Error parsing JSON file: ' + error.message);
+                }
+            };
+            reader.readAsText(file);
+        });
+    </script>
+</body>
+</html>
