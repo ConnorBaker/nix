@@ -3111,14 +3111,32 @@ static RegisterPrimOp primop_attrValues({
 /* Dynamic version of the `.' operator. */
 void prim_getAttr(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
+    state.operatorStats.getAttr.nrCalls++;
     auto attr = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.getAttr");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.getAttr");
-    auto i = state.getAttr(state.symbols.create(attr), args[1]->attrs(), "in the attribute set under consideration");
+
+    auto * attrs = args[1]->attrs();
+    uint32_t totalLayers = attrs->getNumLayers();
+    state.operatorStats.getAttr.attrSetSize.record(attrs->size());
+    state.operatorStats.getAttr.totalLayers.record(totalLayers);
+
+    auto name = state.symbols.create(attr);
+    auto [found, depth] = attrs->getWithStats(name);
+    if (!found) {
+        state.operatorStats.getAttr.nrNotFound++;
+        state.error<TypeError>("attribute '%s' missing", attr)
+            .withTrace(noPos, "in the attribute set under consideration")
+            .debugThrow();
+    }
+
+    state.operatorStats.getAttr.nrFound++;
+    state.operatorStats.getAttr.foundAtDepth.record(depth);
+
     // !!! add to stack trace?
-    if (state.countCalls && i->pos)
-        state.attrSelects[i->pos]++;
-    state.forceValue(*i->value, pos);
-    v = *i->value;
+    if (state.countCalls && found->pos)
+        state.attrSelects[found->pos]++;
+    state.forceValue(*found->value, pos);
+    v = *found->value;
 }
 
 static RegisterPrimOp primop_getAttr({

@@ -1119,6 +1119,81 @@ public:
         } match, split;
     } builtinStats;
 
+    /**
+     * Statistics for operator execution.
+     * Used to track distributions and identify optimization opportunities.
+     */
+    struct OperatorStats
+    {
+        // Attribute set update (//) - use pairs to capture correlation
+        struct
+        {
+            SizePairHistogram operandSizes; // (leftSize, rightSize) pairs
+            SizeHistogram resultSize;
+            SizeHistogram numLayers; // layers in left operand before merge
+            Counter nrCalls, nrLayered, nrFullMerge, nrLeftEmpty, nrRightEmpty;
+        } opUpdate;
+
+        // Attribute lookup via ExprSelect (a.b.c syntax)
+        struct
+        {
+            SizeHistogram attrSetSize;   // size of attr set being searched
+            SizeHistogram totalLayers;   // number of layers in the binding chain
+            SizeHistogram foundAtDepth;  // which layer the attr was found in (1-indexed)
+            SizeHistogram layersSearched; // how many layers were searched
+            Counter nrCalls, nrFound, nrNotFound;
+        } attrLookup;
+
+        // builtins.getAttr primop (separate from ExprSelect)
+        struct
+        {
+            SizeHistogram attrSetSize;
+            SizeHistogram totalLayers;
+            SizeHistogram foundAtDepth;
+            Counter nrCalls, nrFound, nrNotFound;
+        } getAttr;
+
+        // Equality (== and !=) - pairs for collection comparisons
+        struct
+        {
+            Counter nrCalls, nrSamePointer, nrTypeMismatch;
+            Counter byType[10]; // int, bool, string, path, null, list, attrs, function, external, float
+            SizePairHistogram listSizes;  // (v1.listSize, v2.listSize) when comparing lists
+            SizePairHistogram attrSizes;  // (v1.attrs.size, v2.attrs.size) when comparing attrs
+        } opEq;
+
+        // hasAttr (?)
+        struct
+        {
+            SizeHistogram attrSetSize, pathLength;
+            SizeHistogram totalLayers;
+            Counter nrCalls, nrFound, nrNotFound, nrNotAttrs;
+        } opHasAttr;
+
+        // List concat (++) - use pairs for operand correlation
+        struct
+        {
+            SizePairHistogram operandSizes; // (leftSize, rightSize) pairs
+            SizeHistogram resultSize;
+            Counter nrCalls, nrLeftEmpty, nrRightEmpty;
+        } opConcatLists;
+
+        // String/path concat
+        struct
+        {
+            SizeHistogram numParts, resultLength;
+            Counter nrCalls, nrIntArithmetic, nrFloatArithmetic, nrPathConcat;
+        } concatStrings;
+
+        // Boolean ops (&&, ||, ->)
+        struct
+        {
+            Counter nrAndCalls, nrAndShortCircuit;
+            Counter nrOrCalls, nrOrShortCircuit;
+            Counter nrImplCalls, nrImplShortCircuit;
+        } boolOps;
+    } operatorStats;
+
 private:
 
     bool countCalls;

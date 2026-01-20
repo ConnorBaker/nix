@@ -373,6 +373,42 @@ public:
     }
 
     /**
+     * Get the number of layers in the binding chain.
+     */
+    uint32_t getNumLayers() const noexcept
+    {
+        return numLayers;
+    }
+
+    /**
+     * Get attribute by name with statistics about layer depth.
+     * @return (Attr*, layers_searched) where layers_searched is 1-indexed depth
+     *         where attr was found, or 0 if not found.
+     */
+    std::pair<const Attr *, uint32_t> getWithStats(Symbol name) const noexcept
+    {
+        auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
+            auto first = chunk.attrs;
+            auto last = first + chunk.numAttrs;
+            const Attr * i = std::lower_bound(first, last, key);
+            if (i != last && i->name == key.name)
+                return i;
+            return nullptr;
+        };
+
+        const Bindings * currentChunk = this;
+        uint32_t depth = 0;
+        while (currentChunk) {
+            depth++;
+            const Attr * maybeAttr = getInChunk(*currentChunk);
+            if (maybeAttr)
+                return {maybeAttr, depth};
+            currentChunk = currentChunk->baseLayer;
+        }
+        return {nullptr, 0};
+    }
+
+    /**
      * Check if the layer chain is full.
      */
     bool isLayerListFull() const noexcept

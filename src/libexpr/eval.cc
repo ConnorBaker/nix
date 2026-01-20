@@ -1414,19 +1414,45 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
 
         for (auto & i : getAttrPath()) {
             state.nrLookups++;
+            state.operatorStats.attrLookup.nrCalls++;
             const Attr * j;
             auto name = getName(i, state, env);
             if (def) {
                 state.forceValue(*vAttrs, pos);
-                if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
+                if (vAttrs->type() != nAttrs) {
+                    state.operatorStats.attrLookup.nrNotFound++;
                     def->eval(state, env, v);
                     return;
                 }
+                auto * attrs = vAttrs->attrs();
+                uint32_t totalLayers = attrs->getNumLayers();
+                state.operatorStats.attrLookup.attrSetSize.record(attrs->size());
+                state.operatorStats.attrLookup.totalLayers.record(totalLayers);
+
+                auto [found, depth] = attrs->getWithStats(name);
+                if (!found) {
+                    state.operatorStats.attrLookup.nrNotFound++;
+                    state.operatorStats.attrLookup.layersSearched.record(totalLayers);
+                    def->eval(state, env, v);
+                    return;
+                }
+                j = found;
+                state.operatorStats.attrLookup.nrFound++;
+                state.operatorStats.attrLookup.foundAtDepth.record(depth);
+                state.operatorStats.attrLookup.layersSearched.record(depth);
             } else {
                 state.forceAttrs(*vAttrs, pos, "while selecting an attribute");
-                if (!(j = vAttrs->attrs()->get(name))) {
+                auto * attrs = vAttrs->attrs();
+                uint32_t totalLayers = attrs->getNumLayers();
+                state.operatorStats.attrLookup.attrSetSize.record(attrs->size());
+                state.operatorStats.attrLookup.totalLayers.record(totalLayers);
+
+                auto [found, depth] = attrs->getWithStats(name);
+                if (!found) {
+                    state.operatorStats.attrLookup.nrNotFound++;
+                    state.operatorStats.attrLookup.layersSearched.record(totalLayers);
                     StringSet allAttrNames;
-                    for (auto & attr : *vAttrs->attrs())
+                    for (auto & attr : *attrs)
                         allAttrNames.insert(std::string(state.symbols[attr.name]));
                     auto suggestions = Suggestions::bestMatches(allAttrNames, state.symbols[name]);
                     state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
@@ -1435,6 +1461,10 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
                         .withFrame(env, *this)
                         .debugThrow();
                 }
+                j = found;
+                state.operatorStats.attrLookup.nrFound++;
+                state.operatorStats.attrLookup.foundAtDepth.record(depth);
+                state.operatorStats.attrLookup.layersSearched.record(depth);
             }
             vAttrs = j->value;
             pos2 = j->pos;
@@ -1481,18 +1511,32 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
 
     e->eval(state, env, vTmp);
 
+    state.operatorStats.opHasAttr.nrCalls++;
+    state.operatorStats.opHasAttr.pathLength.record(attrPath.size());
+
     for (auto & i : attrPath) {
         state.forceValue(*vAttrs, getPos());
-        const Attr * j;
         auto name = getName(i, state, env);
-        if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
-            vAttrs = j->value;
-        } else {
+        if (vAttrs->type() != nAttrs) {
+            state.operatorStats.opHasAttr.nrNotAttrs++;
             v.mkBool(false);
             return;
         }
+        auto * attrs = vAttrs->attrs();
+        uint32_t totalLayers = attrs->getNumLayers();
+        state.operatorStats.opHasAttr.attrSetSize.record(attrs->size());
+        state.operatorStats.opHasAttr.totalLayers.record(totalLayers);
+
+        auto [found, depth] = attrs->getWithStats(name);
+        if (!found) {
+            state.operatorStats.opHasAttr.nrNotFound++;
+            v.mkBool(false);
+            return;
+        }
+        vAttrs = found->value;
     }
 
+    state.operatorStats.opHasAttr.nrFound++;
     v.mkBool(true);
 }
 
@@ -1889,37 +1933,62 @@ void ExprOpNEq::eval(EvalState & state, Env & env, Value & v)
 
 void ExprOpAnd::eval(EvalState & state, Env & env, Value & v)
 {
-    v.mkBool(
-        state.evalBool(env, e1, pos, "in the left operand of the AND (&&) operator")
-        && state.evalBool(env, e2, pos, "in the right operand of the AND (&&) operator"));
+    state.operatorStats.boolOps.nrAndCalls++;
+    bool left = state.evalBool(env, e1, pos, "in the left operand of the AND (&&) operator");
+    if (!left) {
+        state.operatorStats.boolOps.nrAndShortCircuit++;
+        v.mkBool(false);
+        return;
+    }
+    v.mkBool(state.evalBool(env, e2, pos, "in the right operand of the AND (&&) operator"));
 }
 
 void ExprOpOr::eval(EvalState & state, Env & env, Value & v)
 {
-    v.mkBool(
-        state.evalBool(env, e1, pos, "in the left operand of the OR (||) operator")
-        || state.evalBool(env, e2, pos, "in the right operand of the OR (||) operator"));
+    state.operatorStats.boolOps.nrOrCalls++;
+    bool left = state.evalBool(env, e1, pos, "in the left operand of the OR (||) operator");
+    if (left) {
+        state.operatorStats.boolOps.nrOrShortCircuit++;
+        v.mkBool(true);
+        return;
+    }
+    v.mkBool(state.evalBool(env, e2, pos, "in the right operand of the OR (||) operator"));
 }
 
 void ExprOpImpl::eval(EvalState & state, Env & env, Value & v)
 {
-    v.mkBool(
-        !state.evalBool(env, e1, pos, "in the left operand of the IMPL (->) operator")
-        || state.evalBool(env, e2, pos, "in the right operand of the IMPL (->) operator"));
+    state.operatorStats.boolOps.nrImplCalls++;
+    bool left = state.evalBool(env, e1, pos, "in the left operand of the IMPL (->) operator");
+    if (!left) {
+        state.operatorStats.boolOps.nrImplShortCircuit++;
+        v.mkBool(true);
+        return;
+    }
+    v.mkBool(state.evalBool(env, e2, pos, "in the right operand of the IMPL (->) operator"));
 }
 
 void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 {
     state.nrOpUpdates++;
+    state.operatorStats.opUpdate.nrCalls++;
 
     const Bindings & bindings1 = *v1.attrs();
+    const Bindings & bindings2 = *v2.attrs();
+
+    // Record operand sizes
+    state.operatorStats.opUpdate.operandSizes.record(bindings1.size(), bindings2.size());
+    state.operatorStats.opUpdate.numLayers.record(bindings1.getNumLayers());
+
     if (bindings1.empty()) {
+        state.operatorStats.opUpdate.nrLeftEmpty++;
+        state.operatorStats.opUpdate.resultSize.record(bindings2.size());
         v = v2;
         return;
     }
 
-    const Bindings & bindings2 = *v2.attrs();
     if (bindings2.empty()) {
+        state.operatorStats.opUpdate.nrRightEmpty++;
+        state.operatorStats.opUpdate.resultSize.record(bindings1.size());
         v = v1;
         return;
     }
@@ -1937,16 +2006,19 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
     }();
 
     if (shouldLayer) {
+        state.operatorStats.opUpdate.nrLayered++;
         auto attrs = state.buildBindings(bindings2.size());
         attrs.layerOnTopOf(bindings1);
 
         std::ranges::copy(bindings2, std::back_inserter(attrs));
         v.mkAttrs(attrs.alreadySorted());
 
+        state.operatorStats.opUpdate.resultSize.record(v.attrs()->size());
         state.nrOpUpdateValuesCopied += bindings2.size();
         return;
     }
 
+    state.operatorStats.opUpdate.nrFullMerge++;
     auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
 
     /* Merge the sets, preferring values from the second set.  Make
@@ -1980,6 +2052,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 
     v.mkAttrs(attrs.alreadySorted());
 
+    state.operatorStats.opUpdate.resultSize.record(v.attrs()->size());
     state.nrOpUpdateValuesCopied += v.attrs()->size();
 }
 
@@ -2021,8 +2094,39 @@ void ExprOpConcatLists::eval(EvalState & state, Env & env, Value & v)
     e1->eval(state, env, v1);
     Value v2;
     e2->eval(state, env, v2);
-    Value * lists[2] = {&v1, &v2};
-    state.concatLists(v, 2, lists, pos, "while evaluating one of the elements to concatenate");
+
+    // Track operator-specific statistics
+    state.operatorStats.opConcatLists.nrCalls++;
+    // Use the same error message as concatLists for consistency with tests
+    state.forceList(v1, pos, "while evaluating one of the elements to concatenate");
+    state.forceList(v2, pos, "while evaluating one of the elements to concatenate");
+    size_t leftSize = v1.listSize();
+    size_t rightSize = v2.listSize();
+    state.operatorStats.opConcatLists.operandSizes.record(leftSize, rightSize);
+
+    if (leftSize == 0) {
+        state.operatorStats.opConcatLists.nrLeftEmpty++;
+        state.operatorStats.opConcatLists.resultSize.record(rightSize);
+        v = v2;
+        return;
+    }
+    if (rightSize == 0) {
+        state.operatorStats.opConcatLists.nrRightEmpty++;
+        state.operatorStats.opConcatLists.resultSize.record(leftSize);
+        v = v1;
+        return;
+    }
+
+    // Build the concatenated list
+    state.nrListConcats++;
+    auto list = state.buildList(leftSize + rightSize);
+    auto out = list.elems;
+    auto v1View = v1.listView();
+    auto v2View = v2.listView();
+    memcpy(out, v1View.data(), leftSize * sizeof(Value *));
+    memcpy(out + leftSize, v2View.data(), rightSize * sizeof(Value *));
+    v.mkList(list);
+    state.operatorStats.opConcatLists.resultSize.record(leftSize + rightSize);
 }
 
 void EvalState::concatLists(
@@ -2075,6 +2179,9 @@ void EvalState::concatLists(
 
 void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
 {
+    state.operatorStats.concatStrings.nrCalls++;
+    state.operatorStats.concatStrings.numParts.record(es.size());
+
     NixStringContext context;
     std::vector<BackedStringView> strings;
     size_t sSize = 0;
@@ -2146,10 +2253,13 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
     }
 
     if (firstType == nInt) {
+        state.operatorStats.concatStrings.nrIntArithmetic++;
         v.mkInt(n);
     } else if (firstType == nFloat) {
+        state.operatorStats.concatStrings.nrFloatArithmetic++;
         v.mkFloat(nf);
     } else if (firstType == nPath) {
+        state.operatorStats.concatStrings.nrPathConcat++;
         if (!context.empty())
             state.error<EvalError>("a string that refers to a store path cannot be appended to a path")
                 .atPos(pos)
@@ -2160,6 +2270,7 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
         for (const auto & part : strings) {
             resultStr += *part;
         }
+        state.operatorStats.concatStrings.resultLength.record(resultStr.size());
         v.mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
     } else {
         auto & resultStr = StringData::alloc(state.mem, sSize);
@@ -2169,6 +2280,7 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
             tmp += part->size();
         }
         *tmp = '\0';
+        state.operatorStats.concatStrings.resultLength.record(sSize);
         v.mkStringMove(resultStr, context, state.mem);
     }
 }
@@ -2855,14 +2967,18 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
 {
     auto _level = addCallDepth(pos);
 
+    operatorStats.opEq.nrCalls++;
+
     forceValue(v1, pos);
     forceValue(v2, pos);
 
     /* !!! Hack to support some old broken code that relies on pointer
        equality tests between sets.  (Specifically, builderDefs calls
        uniqList on a list of sets.)  Will remove this eventually. */
-    if (&v1 == &v2)
+    if (&v1 == &v2) {
+        operatorStats.opEq.nrSamePointer++;
         return true;
+    }
 
     // Special case type-compatibility between float and int
     if (v1.type() == nInt && v2.type() == nFloat)
@@ -2871,8 +2987,28 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return v1.fpoint() == v2.integer().value;
 
     // All other types are not compatible with each other.
-    if (v1.type() != v2.type())
+    if (v1.type() != v2.type()) {
+        operatorStats.opEq.nrTypeMismatch++;
         return false;
+    }
+
+    // Map type to index: int=0, bool=1, string=2, path=3, null=4, list=5, attrs=6, function=7, external=8, float=9
+    auto typeToIndex = [](ValueType t) -> size_t {
+        switch (t) {
+        case nInt: return 0;
+        case nBool: return 1;
+        case nString: return 2;
+        case nPath: return 3;
+        case nNull: return 4;
+        case nList: return 5;
+        case nAttrs: return 6;
+        case nFunction: return 7;
+        case nExternal: return 8;
+        case nFloat: return 9;
+        default: return 0;
+        }
+    };
+    operatorStats.opEq.byType[typeToIndex(v1.type())]++;
 
     switch (v1.type()) {
     case nInt:
@@ -2893,6 +3029,7 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return true;
 
     case nList:
+        operatorStats.opEq.listSizes.record(v1.listSize(), v2.listSize());
         if (v1.listSize() != v2.listSize())
             return false;
         for (size_t n = 0; n < v1.listSize(); ++n)
@@ -2901,6 +3038,7 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return true;
 
     case nAttrs: {
+        operatorStats.opEq.attrSizes.record(v1.attrs()->size(), v2.attrs()->size());
         /* If both sets denote a derivation (type = "derivation"),
            then compare their outPaths. */
         if (isDerivation(v1) && isDerivation(v2)) {
@@ -3052,12 +3190,22 @@ void EvalState::printStatistics()
     };
 #endif
 
-    // Builtin argument size statistics
+    // Builtin argument size statistics - now using sparse maps for exact counts
     auto histogramToJson = [](const SizeHistogram & h) {
         json j = json::object();
-        auto labels = SizeHistogram::bucketLabels();
-        for (size_t i = 0; i < SizeHistogram::NUM_BUCKETS; i++)
-            j[labels[i]] = h.buckets[i].load();
+        h.forEach([&](size_t size, uint64_t count) {
+            if (count > 0)
+                j[std::to_string(size)] = count;
+        });
+        return j;
+    };
+
+    auto pairHistogramToJson = [](const SizePairHistogram & h) {
+        json j = json::object();
+        h.forEach([&](size_t left, size_t right, uint64_t count) {
+            if (count > 0)
+                j["[" + std::to_string(left) + "," + std::to_string(right) + "]"] = count;
+        });
         return j;
     };
 
@@ -3119,6 +3267,79 @@ void EvalState::printStatistics()
         {"zipAttrsWith",
          {{"avoided", builtinStats.zipAttrsWith.nrAvoided.load()},
           {"listSize", histogramToJson(builtinStats.zipAttrsWith.listSize)}}},
+    };
+
+    // Operator statistics
+    topObj["operatorStats"] = {
+        {"opUpdate",
+         {{"calls", operatorStats.opUpdate.nrCalls.load()},
+          {"operandSizes", pairHistogramToJson(operatorStats.opUpdate.operandSizes)},
+          {"resultSize", histogramToJson(operatorStats.opUpdate.resultSize)},
+          {"numLayers", histogramToJson(operatorStats.opUpdate.numLayers)},
+          {"layered", operatorStats.opUpdate.nrLayered.load()},
+          {"fullMerge", operatorStats.opUpdate.nrFullMerge.load()},
+          {"leftEmpty", operatorStats.opUpdate.nrLeftEmpty.load()},
+          {"rightEmpty", operatorStats.opUpdate.nrRightEmpty.load()}}},
+        {"attrLookup",
+         {{"calls", operatorStats.attrLookup.nrCalls.load()},
+          {"attrSetSize", histogramToJson(operatorStats.attrLookup.attrSetSize)},
+          {"totalLayers", histogramToJson(operatorStats.attrLookup.totalLayers)},
+          {"foundAtDepth", histogramToJson(operatorStats.attrLookup.foundAtDepth)},
+          {"layersSearched", histogramToJson(operatorStats.attrLookup.layersSearched)},
+          {"found", operatorStats.attrLookup.nrFound.load()},
+          {"notFound", operatorStats.attrLookup.nrNotFound.load()}}},
+        {"getAttr",
+         {{"calls", operatorStats.getAttr.nrCalls.load()},
+          {"attrSetSize", histogramToJson(operatorStats.getAttr.attrSetSize)},
+          {"totalLayers", histogramToJson(operatorStats.getAttr.totalLayers)},
+          {"foundAtDepth", histogramToJson(operatorStats.getAttr.foundAtDepth)},
+          {"found", operatorStats.getAttr.nrFound.load()},
+          {"notFound", operatorStats.getAttr.nrNotFound.load()}}},
+        {"opEq",
+         {{"calls", operatorStats.opEq.nrCalls.load()},
+          {"samePointer", operatorStats.opEq.nrSamePointer.load()},
+          {"typeMismatch", operatorStats.opEq.nrTypeMismatch.load()},
+          {"byType",
+           {{"int", operatorStats.opEq.byType[0].load()},
+            {"bool", operatorStats.opEq.byType[1].load()},
+            {"string", operatorStats.opEq.byType[2].load()},
+            {"path", operatorStats.opEq.byType[3].load()},
+            {"null", operatorStats.opEq.byType[4].load()},
+            {"list", operatorStats.opEq.byType[5].load()},
+            {"attrs", operatorStats.opEq.byType[6].load()},
+            {"function", operatorStats.opEq.byType[7].load()},
+            {"external", operatorStats.opEq.byType[8].load()},
+            {"float", operatorStats.opEq.byType[9].load()}}},
+          {"listSizes", pairHistogramToJson(operatorStats.opEq.listSizes)},
+          {"attrSizes", pairHistogramToJson(operatorStats.opEq.attrSizes)}}},
+        {"opHasAttr",
+         {{"calls", operatorStats.opHasAttr.nrCalls.load()},
+          {"attrSetSize", histogramToJson(operatorStats.opHasAttr.attrSetSize)},
+          {"pathLength", histogramToJson(operatorStats.opHasAttr.pathLength)},
+          {"totalLayers", histogramToJson(operatorStats.opHasAttr.totalLayers)},
+          {"found", operatorStats.opHasAttr.nrFound.load()},
+          {"notFound", operatorStats.opHasAttr.nrNotFound.load()},
+          {"notAttrs", operatorStats.opHasAttr.nrNotAttrs.load()}}},
+        {"opConcatLists",
+         {{"calls", operatorStats.opConcatLists.nrCalls.load()},
+          {"operandSizes", pairHistogramToJson(operatorStats.opConcatLists.operandSizes)},
+          {"resultSize", histogramToJson(operatorStats.opConcatLists.resultSize)},
+          {"leftEmpty", operatorStats.opConcatLists.nrLeftEmpty.load()},
+          {"rightEmpty", operatorStats.opConcatLists.nrRightEmpty.load()}}},
+        {"concatStrings",
+         {{"calls", operatorStats.concatStrings.nrCalls.load()},
+          {"numParts", histogramToJson(operatorStats.concatStrings.numParts)},
+          {"resultLength", histogramToJson(operatorStats.concatStrings.resultLength)},
+          {"intArithmetic", operatorStats.concatStrings.nrIntArithmetic.load()},
+          {"floatArithmetic", operatorStats.concatStrings.nrFloatArithmetic.load()},
+          {"pathConcat", operatorStats.concatStrings.nrPathConcat.load()}}},
+        {"boolOps",
+         {{"andCalls", operatorStats.boolOps.nrAndCalls.load()},
+          {"andShortCircuit", operatorStats.boolOps.nrAndShortCircuit.load()},
+          {"orCalls", operatorStats.boolOps.nrOrCalls.load()},
+          {"orShortCircuit", operatorStats.boolOps.nrOrShortCircuit.load()},
+          {"implCalls", operatorStats.boolOps.nrImplCalls.load()},
+          {"implShortCircuit", operatorStats.boolOps.nrImplShortCircuit.load()}}},
     };
 
     if (countCalls) {
