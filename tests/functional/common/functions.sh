@@ -51,6 +51,11 @@ doClearStore() {
     mkdir "$NIX_STORE_DIR"
     rm -rf "$NIX_STATE_DIR"
     mkdir "$NIX_STATE_DIR"
+    # Clear eval cache: clearStore destroys the store DB, so cached drvPaths
+    # reference store paths that no longer exist. Normal GC doesn't need this
+    # (toDerivedPaths recovery re-evaluates invalid drvPaths), but clearStore's
+    # wholesale destruction of the store DB requires explicit cleanup.
+    rm -rf "$TEST_HOME/.cache/nix/eval-cache"*
     clearProfiles
 }
 
