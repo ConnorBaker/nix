@@ -58,14 +58,14 @@ TEST_F(EvalCacheIntegrationTest, ColdStore_ThenWarmPath)
 {
     auto db = makeDbBackend();
 
-    auto attrId = db.coldStore(
+    auto storeResult = db.coldStore(
         "", string_t{"hello", {}}, {}, std::nullopt, true);
 
     auto result = db.warmPath("", {}, state);
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(std::holds_alternative<string_t>(result->value));
     EXPECT_EQ(std::get<string_t>(result->value).first, "hello");
-    EXPECT_EQ(result->attrId, attrId);
+    EXPECT_EQ(result->depSetId, storeResult.depSetId);
 }
 
 TEST_F(EvalCacheIntegrationTest, MultipleContextHashes_Isolated)
@@ -104,17 +104,17 @@ TEST_F(EvalCacheIntegrationTest, ParentChild_AttrChain)
 {
     auto db = makeDbBackend();
 
-    auto parentId = db.coldStore(
+    auto parentResult = db.coldStore(
         "", std::vector<Symbol>{createSymbol("child")},
         {}, std::nullopt, true);
 
     std::string childAttrPath = "child";
     db.coldStore(
         childAttrPath, int_t{NixInt{42}},
-        {}, parentId, false);
+        {}, parentResult.depSetId, false);
 
     // Warm path for child should work
-    auto result = db.warmPath(childAttrPath, {}, state, parentId);
+    auto result = db.warmPath(childAttrPath, {}, state, parentResult.depSetId);
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(std::holds_alternative<int_t>(result->value));
     EXPECT_EQ(std::get<int_t>(result->value).x.value, 42);
@@ -128,14 +128,14 @@ TEST_F(EvalCacheIntegrationTest, ParentChild_ValidationCascade)
 
     // Parent with a valid dep
     auto dep = makeEnvVarDep("NIX_INT_TEST_VAR", "valid");
-    auto parentId = db.coldStore(
+    auto parentResult = db.coldStore(
         "", null_t{}, {dep}, std::nullopt, true);
 
     // Child inheriting parent validity
-    auto childId = db.coldStore(
-        "child", int_t{NixInt{1}}, {}, parentId, false);
+    auto childResult = db.coldStore(
+        "child", int_t{NixInt{1}}, {}, parentResult.depSetId, false);
 
-    EXPECT_TRUE(db.validateAttr(childId, {}, state));
+    EXPECT_TRUE(db.validateDepSet(childResult.depSetId, {}, state));
 }
 
 TEST_F(EvalCacheIntegrationTest, ParentInvalidation_CascadesToChild)
@@ -146,17 +146,17 @@ TEST_F(EvalCacheIntegrationTest, ParentInvalidation_CascadesToChild)
 
     // Parent with stale dep (hash doesn't match current env)
     auto staleDep = makeEnvVarDep("NIX_INT_CASCADE", "old_value");
-    auto parentId = db.coldStore(
+    auto parentResult = db.coldStore(
         "", null_t{}, {staleDep}, std::nullopt, true);
 
     // Child with no direct deps
-    auto childId = db.coldStore(
-        "child", int_t{NixInt{1}}, {}, parentId, false);
+    auto childResult = db.coldStore(
+        "child", int_t{NixInt{1}}, {}, parentResult.depSetId, false);
 
     // Child should be invalid because parent is invalid
     // (need to clear session cache since coldStore marks as validated)
     db.clearSessionCaches();
-    EXPECT_FALSE(db.validateAttr(childId, {}, state));
+    EXPECT_FALSE(db.validateDepSet(childResult.depSetId, {}, state));
 }
 
 // ── Full EvalCache + FileLoadTracker flow ────────────────────────────
@@ -275,36 +275,36 @@ TEST_F(EvalCacheIntegrationTest, FullFlow_ParsedExpr)
 
 // ── Session caching integration ──────────────────────────────────────
 
-TEST_F(EvalCacheIntegrationTest, SessionCache_AttrValidation_SkipsRevalidation)
+TEST_F(EvalCacheIntegrationTest, SessionCache_DepSetValidation_SkipsRevalidation)
 {
     ScopedEnvVar env("NIX_EVAL_SESSION", "ok");
 
     auto db = makeDbBackend();
     auto dep = makeEnvVarDep("NIX_EVAL_SESSION", "ok");
-    auto attrId = db.coldStore(
+    auto result = db.coldStore(
         "", null_t{}, {dep}, std::nullopt, true);
 
-    // coldStore adds to validatedAttrIds for non-volatile deps
-    EXPECT_TRUE(db.validatedAttrIds.count(attrId));
+    // coldStore adds to validatedDepSetIds for non-volatile deps
+    EXPECT_TRUE(db.validatedDepSetIds.count(result.depSetId));
 
     // Clear and re-validate manually
     db.clearSessionCaches();
-    EXPECT_TRUE(db.validateAttr(attrId, {}, state));
-    EXPECT_TRUE(db.validatedAttrIds.count(attrId));
+    EXPECT_TRUE(db.validateDepSet(result.depSetId, {}, state));
+    EXPECT_TRUE(db.validatedDepSetIds.count(result.depSetId));
 
-    // Second call should be cached (hits validatedAttrIds early exit)
-    EXPECT_TRUE(db.validateAttr(attrId, {}, state));
+    // Second call should be cached (hits validatedDepSetIds early exit)
+    EXPECT_TRUE(db.validateDepSet(result.depSetId, {}, state));
 }
 
 TEST_F(EvalCacheIntegrationTest, SessionCache_VolatileDep_NotCached)
 {
     auto db = makeDbBackend();
     auto dep = makeCurrentTimeDep();
-    auto attrId = db.coldStore(
+    auto result = db.coldStore(
         "", null_t{}, {dep}, std::nullopt, true);
 
     // Volatile deps should NOT be session-cached
-    EXPECT_FALSE(db.validatedAttrIds.count(attrId));
+    EXPECT_FALSE(db.validatedDepSetIds.count(result.depSetId));
 }
 
 // ── Recovery flow integration ────────────────────────────────────────
@@ -318,10 +318,11 @@ TEST_F(EvalCacheIntegrationTest, Recovery_AfterDepChange)
     auto db = makeDbBackend();
 
     // Phase 1: Cold with v1
+    EvalCacheDb::ColdStoreResult v1Result;
     {
         ScopedEnvVar env("NIX_RECOVERY_TEST", "v1");
         auto dep = makeEnvVarDep("NIX_RECOVERY_TEST", "v1");
-        db.coldStore("", string_t{"result-v1", {}}, {dep}, std::nullopt, true);
+        v1Result = db.coldStore("", string_t{"result-v1", {}}, {dep}, std::nullopt, true);
     }
 
     // Phase 2: Cold with v2
@@ -356,14 +357,14 @@ TEST_F(EvalCacheIntegrationTest, Recovery_VolatileFails)
 
     // Store with volatile dep
     auto dep = makeCurrentTimeDep();
-    auto attrId = db.coldStore(
+    auto storeResult = db.coldStore(
         "", null_t{}, {dep}, std::nullopt, true);
 
     // Clear session cache
     db.clearSessionCaches();
 
     // Recovery should fail for volatile deps
-    auto result = db.recovery(attrId, "", {}, state);
+    auto result = db.recovery(storeResult.depSetId, "", {}, state);
     EXPECT_FALSE(result.has_value());
 }
 

@@ -32,10 +32,10 @@ struct ExprCached : Expr, gc
     Env * origEnv = nullptr;
 
     /**
-     * The SQLite attr_id for this attribute.
+     * The dep set ID for this attribute's dependency set.
      * Set after warm path succeeds or cold path stores the result.
      */
-    std::optional<AttrId> attrId;
+    std::optional<int64_t> depSetId;
 
     /**
      * Cached storeAttrPath result. Lazily populated on first call.
@@ -87,10 +87,10 @@ struct ExprCached : Expr, gc
         return result;
     }
 
-    std::optional<AttrId> parentAttrId() const
+    std::optional<int64_t> parentDepSetId() const
     {
         if (!parentExpr) return std::nullopt;
-        return parentExpr->attrId;
+        return parentExpr->depSetId;
     }
 
     void evaluateCold(Value & v);
@@ -98,7 +98,7 @@ struct ExprCached : Expr, gc
     void materializeValue(Value & v, const AttrValue & cached);
     void materializeOrigExprAttrs(Value & v, const std::vector<Symbol> & childNames,
                                    Value * prePopulatedParent = nullptr);
-    void replayDepsToTracker(AttrId id);
+    void replayDepsToTracker(int64_t depSetId);
     void storeForcedSibling(ExprCached * parentEC, Symbol siblingName, Value & v);
     void sortChildNames(std::vector<Symbol> & names) const;
 };
@@ -190,17 +190,17 @@ void ExprCached::materializeOrigExprAttrs(
     v.mkAttrs(bindings.finish());
 }
 
-void ExprCached::replayDepsToTracker(AttrId id)
+void ExprCached::replayDepsToTracker(int64_t depSetId)
 {
     if (!FileLoadTracker::isActive())
         return;
 
     try {
-        auto deps = cache->dbBackend->loadDepsForAttr(id);
+        auto deps = cache->dbBackend->loadFullDepSet(depSetId);
         for (auto & dep : deps)
             FileLoadTracker::record(dep);
     } catch (std::exception &) {
-        // DB may be corrupt or attr may have been evicted — skip
+        // DB may be corrupt or dep set may have been evicted — skip
     }
 }
 
@@ -219,7 +219,7 @@ void ExprCached::storeForcedSibling(ExprCached * parentEC, Symbol siblingName, V
 
     // If already stored (by a prior evaluateCold with full deps),
     // don't overwrite with this dep-less speculative entry.
-    if (db.lookupAttr(siblingAttrPath))
+    if (db.attrExists(siblingAttrPath))
         return;
 
     // Serialize value
@@ -249,13 +249,14 @@ void ExprCached::storeForcedSibling(ExprCached * parentEC, Symbol siblingName, V
     }
 
     // Direct coldStore — no deferred writes needed with SQLite backend.
-    // Parent's attrId may be nullopt (parent not yet stored); skip silently.
-    if (!parentEC->attrId)
+    // Parent's depSetId may be nullopt (parent not yet stored); skip silently.
+    if (!parentEC->depSetId)
         return;
 
     try {
-        siblingEC->attrId = db.coldStore(
-            siblingAttrPath, attrValue, {}, parentEC->attrId, false);
+        auto storeResult = db.coldStore(
+            siblingAttrPath, attrValue, {}, parentEC->depSetId, false);
+        siblingEC->depSetId = storeResult.depSetId;
     } catch (std::exception & e) {
         debug("storeForcedSibling failed for '%s': %s", siblingAttrPath, e.what());
         return;
@@ -306,9 +307,10 @@ void ExprCached::storeForcedSibling(ExprCached * parentEC, Symbol siblingName, V
                 auto * childEC = new ExprCached(cache, 0, attr.name, siblingEC);
                 auto childAttrPath = childEC->storeAttrPath();
                 try {
-                    childEC->attrId = db.coldStore(
+                    auto childResult = db.coldStore(
                         childAttrPath, std::move(childValue), {},
-                        siblingEC->attrId, false);
+                        siblingEC->depSetId, false);
+                    childEC->depSetId = childResult.depSetId;
                 } catch (std::exception &) {}
             }
 
@@ -400,9 +402,6 @@ void ExprCached::materializeValue(Value & v, const AttrValue & cached)
     auto & st = cache->state;
 
     if (auto * attrs = std::get_if<std::vector<Symbol>>(&cached)) {
-        // Prefetch all children's attr rows in one query for batch warm lookup
-        if (attrId && cache->dbBackend)
-            cache->dbBackend->prefetchChildren(*attrId);
         auto bindings = st.buildBindings(attrs->size());
         for (auto & childName : *attrs) {
             auto * childVal = st.allocValue();
@@ -502,9 +501,10 @@ void ExprCached::evaluateCold(Value & v)
                     directDeps.push_back(dep);
 
             try {
-                this->attrId = cache->dbBackend->coldStore(
+                auto result = cache->dbBackend->coldStore(
                     attrPath, failed_t{}, directDeps,
-                    parentAttrId(), !parentExpr);
+                    parentDepSetId(), !parentExpr);
+                this->depSetId = result.depSetId;
             } catch (std::exception & e) {
                 debug("cold store failed for '%s': %s", attrPathStr(), e.what());
             }
@@ -566,9 +566,10 @@ void ExprCached::evaluateCold(Value & v)
 
         // Direct coldStore — no deferred writes
         try {
-            this->attrId = cache->dbBackend->coldStore(
+            auto coldResult = cache->dbBackend->coldStore(
                 attrPath, attrValue, directDeps,
-                parentAttrId(), !parentExpr);
+                parentDepSetId(), !parentExpr);
+            this->depSetId = coldResult.depSetId;
         } catch (std::exception & e) {
             debug("cold store failed for '%s': %s", attrPathStr(), e.what());
         }
@@ -622,11 +623,11 @@ void ExprCached::eval(EvalState & state, Env & env, Value & v)
     auto & db = *cache->dbBackend;
 
     auto attrPath = storeAttrPath();
-    auto warmResult = db.warmPath(attrPath, cache->inputAccessors, cache->state, parentAttrId());
+    auto warmResult = db.warmPath(attrPath, cache->inputAccessors, cache->state, parentDepSetId());
 
     if (warmResult) {
-        auto & [cachedValue, cachedAttrId] = *warmResult;
-        this->attrId = cachedAttrId;
+        auto & [cachedValue, cachedDepSetId] = *warmResult;
+        this->depSetId = cachedDepSetId;
 
         // Handle failed values — reproduce error
         if (std::get_if<failed_t>(&cachedValue)) {
@@ -648,18 +649,18 @@ void ExprCached::eval(EvalState & state, Env & env, Value & v)
         if (origExpr) {
             if (isLeafCached(cachedValue)) {
                 materializeValue(v, cachedValue);
-                replayDepsToTracker(cachedAttrId);
+                replayDepsToTracker(cachedDepSetId);
                 return;
             }
             if (auto * attrs = std::get_if<std::vector<Symbol>>(&cachedValue)) {
                 materializeOrigExprAttrs(v, *attrs);
-                replayDepsToTracker(cachedAttrId);
+                replayDepsToTracker(cachedDepSetId);
                 return;
             }
             // list_t or other → cold
         } else {
             materializeValue(v, cachedValue);
-            replayDepsToTracker(cachedAttrId);
+            replayDepsToTracker(cachedDepSetId);
             return;
         }
     }
