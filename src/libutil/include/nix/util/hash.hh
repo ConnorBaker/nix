@@ -131,6 +131,14 @@ public:
      */
     [[nodiscard]] std::string to_string(HashFormat hashFormat, bool includeAlgo) const;
 
+    /**
+     * View the raw hash bytes as a string_view (no encoding).
+     */
+    [[nodiscard]] std::string_view hashData() const
+    {
+        return {reinterpret_cast<const char *>(hash), hashSize};
+    }
+
     [[nodiscard]] std::string gitRev() const
     {
         return to_string(HashFormat::Base16, false);

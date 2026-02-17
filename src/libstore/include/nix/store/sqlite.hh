@@ -46,6 +46,7 @@ struct SQLite
     {
         SQLiteOpenMode mode = SQLiteOpenMode::Normal;
         bool useWAL;
+        bool noMutex = false;
     };
 
     SQLite(const std::filesystem::path & path, Settings && settings);
@@ -140,6 +141,7 @@ struct SQLiteStmt
         std::string getStr(int col);
         int64_t getInt(int col);
         bool isNull(int col);
+        std::pair<const void *, size_t> getBlob(int col);
     };
 
     Use use()
