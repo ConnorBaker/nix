@@ -9,6 +9,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace nix {
@@ -38,16 +39,31 @@ struct EvalCacheDb {
         SQLiteStmt upsertStruct;
         SQLiteStmt scanStructGroups;
         SQLiteStmt getDepSetContentHash;
+        SQLiteStmt getAncestorChain;
+        SQLiteStmt getValidationChain;
+        SQLiteStmt getChildrenByParent;
         std::unique_ptr<SQLiteTxn> txn;
     };
     std::unique_ptr<Sync<State>> _state;
     SymbolTable & symbols;
     int64_t contextHash;
 
+    struct AttrRow {
+        AttrId attrId;
+        std::optional<AttrId> parentId;
+        std::optional<int64_t> parentEpoch;
+        int type;
+        std::string value;
+        std::string context;
+        std::optional<int64_t> depSetId;
+    };
+
     // Session caches
     std::set<AttrId> validatedAttrIds;
     std::set<int64_t> validatedDepSetIds;
     std::map<int64_t, std::vector<Dep>> depSetCache;
+    std::unordered_map<AttrId, Hash> identityHashCache;
+    std::map<std::string, AttrRow> prefetchedRows;
 
     EvalCacheDb(SymbolTable & symbols, int64_t contextHash);
     ~EvalCacheDb();
@@ -84,19 +100,10 @@ struct EvalCacheDb {
         EvalState & state);
     std::optional<AttrId> lookupAttr(std::string_view attrPath);
     void clearSessionCaches();
+    void prefetchChildren(AttrId parentAttrId);
     static std::string buildAttrPath(const std::vector<std::string> & components);
 
 private:
-    struct AttrRow {
-        AttrId attrId;
-        std::optional<AttrId> parentId;
-        std::optional<int64_t> parentEpoch;
-        int type;
-        std::string value;
-        std::string context;
-        std::optional<int64_t> depSetId;
-    };
-
     std::optional<AttrRow> lookupAttrRow(std::string_view attrPath);
 
     int64_t getOrCreateDepSet(

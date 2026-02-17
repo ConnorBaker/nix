@@ -275,6 +275,40 @@ EvalCacheDb::EvalCacheDb(SymbolTable & symbols, int64_t contextHash)
     st->getDepSetContentHash.create(st->db,
         "SELECT content_hash FROM DepSets WHERE set_id = ?");
 
+    // Recursive CTE: fetch entire ancestor chain for identity hash computation.
+    // Returns rows from leaf (the queried attr) up to root (no parent),
+    // with each row's value hash components and dep content hash.
+    st->getAncestorChain.create(st->db,
+        "WITH RECURSIVE ancestors(attr_id, type, value, context, dep_set_id, parent_id, depth) AS ("
+        "  SELECT attr_id, type, value, context, dep_set_id, parent_id, 0 "
+        "  FROM Attributes WHERE attr_id = ? "
+        "  UNION ALL "
+        "  SELECT a.attr_id, a.type, a.value, a.context, a.dep_set_id, a.parent_id, ancestors.depth + 1 "
+        "  FROM Attributes a JOIN ancestors ON a.attr_id = ancestors.parent_id"
+        ") "
+        "SELECT anc.attr_id, anc.type, anc.value, anc.context, ds.content_hash, anc.parent_id "
+        "FROM ancestors anc LEFT JOIN DepSets ds ON ds.set_id = anc.dep_set_id "
+        "ORDER BY anc.depth DESC");
+
+    // Prefetch all children of a given parent (for FullAttrs batch lookup)
+    st->getChildrenByParent.create(st->db,
+        "SELECT attr_id, attr_path, parent_id, parent_epoch, type, value, context, dep_set_id "
+        "FROM Attributes WHERE context_hash = ? AND parent_id = ?");
+
+    // Recursive CTE: fetch entire ancestor chain for validation.
+    // Returns (attr_id, dep_set_id, parent_epoch, parent_current_epoch) root-first.
+    st->getValidationChain.create(st->db,
+        "WITH RECURSIVE chain(attr_id, dep_set_id, parent_id, parent_epoch, depth) AS ("
+        "  SELECT attr_id, dep_set_id, parent_id, parent_epoch, 0 "
+        "  FROM Attributes WHERE attr_id = ? "
+        "  UNION ALL "
+        "  SELECT a.attr_id, a.dep_set_id, a.parent_id, a.parent_epoch, chain.depth + 1 "
+        "  FROM Attributes a JOIN chain ON a.attr_id = chain.parent_id"
+        ") "
+        "SELECT c.attr_id, c.dep_set_id, c.parent_epoch, p.epoch "
+        "FROM chain c LEFT JOIN Attributes p ON p.attr_id = c.parent_id "
+        "ORDER BY c.depth DESC");
+
     st->txn = std::make_unique<SQLiteTxn>(st->db);
 
     _state = std::move(state);
@@ -308,6 +342,29 @@ void EvalCacheDb::clearSessionCaches()
     validatedAttrIds.clear();
     validatedDepSetIds.clear();
     depSetCache.clear();
+    identityHashCache.clear();
+    prefetchedRows.clear();
+}
+
+void EvalCacheDb::prefetchChildren(AttrId parentAttrId)
+{
+    auto st(_state->lock());
+    auto use(st->getChildrenByParent.use()
+        (contextHash)
+        (static_cast<int64_t>(parentAttrId)));
+    while (use.next()) {
+        AttrRow row;
+        row.attrId = static_cast<AttrId>(use.getInt(0));
+        auto [blobData, blobSize] = use.getBlob(1);
+        auto attrPath = std::string(static_cast<const char *>(blobData), blobSize);
+        row.parentId = use.isNull(2) ? std::nullopt : std::optional<AttrId>(static_cast<AttrId>(use.getInt(2)));
+        row.parentEpoch = use.isNull(3) ? std::nullopt : std::optional<int64_t>(use.getInt(3));
+        row.type = static_cast<int>(use.getInt(4));
+        row.value = use.isNull(5) ? "" : use.getStr(5);
+        row.context = use.isNull(6) ? "" : use.getStr(6);
+        row.depSetId = use.isNull(7) ? std::nullopt : std::optional<int64_t>(use.getInt(7));
+        prefetchedRows.insert_or_assign(std::move(attrPath), std::move(row));
+    }
 }
 
 // ── AttrValue SQL encoding/decoding ──────────────────────────────────
@@ -467,6 +524,12 @@ static void bindDepHashValue(SQLiteStmt::Use & use, const DepHashValue & v)
 
 std::optional<EvalCacheDb::AttrRow> EvalCacheDb::lookupAttrRow(std::string_view attrPath)
 {
+    // Check prefetch cache first (populated by prefetchChildren)
+    auto key = std::string(attrPath);
+    auto it = prefetchedRows.find(key);
+    if (it != prefetchedRows.end())
+        return it->second;
+
     auto st(_state->lock());
 
     auto use(st->lookupAttr.use()
@@ -565,48 +628,79 @@ static Hash computeValueHash(int type, std::string_view value, std::string_view 
 
 Hash EvalCacheDb::computeIdentityHash(AttrId attrId)
 {
-    HashSink sink(HashAlgorithm::SHA256);
+    // Check session cache first
+    auto cacheIt = identityHashCache.find(attrId);
+    if (cacheIt != identityHashCache.end())
+        return cacheIt->second;
 
-    // Include value hash
+    // Use recursive CTE to fetch entire ancestor chain in one query.
+    // Results are ordered root-first (highest depth first via ORDER BY depth DESC).
+    struct AncestorRow {
+        AttrId attrId;
+        int type;
+        std::string value;
+        std::string context;
+        std::optional<Hash> depContentHash;
+        bool hasParent;
+    };
+    std::vector<AncestorRow> chain;
+
     {
         auto st(_state->lock());
-        auto use(st->getAttrResult.use()(static_cast<int64_t>(attrId)));
-        if (use.next()) {
-            auto type = static_cast<int>(use.getInt(0));
-            auto val = use.isNull(1) ? "" : use.getStr(1);
-            auto ctx = use.isNull(2) ? "" : use.getStr(2);
-            auto valHash = computeValueHash(type, val, ctx);
-            auto hex = valHash.to_string(HashFormat::Base16, false);
-            sink(std::string_view("V", 1));
-            sink(hex);
+        auto use(st->getAncestorChain.use()(static_cast<int64_t>(attrId)));
+        while (use.next()) {
+            AncestorRow row;
+            row.attrId = static_cast<AttrId>(use.getInt(0));
+            row.type = static_cast<int>(use.getInt(1));
+            row.value = use.isNull(2) ? "" : use.getStr(2);
+            row.context = use.isNull(3) ? "" : use.getStr(3);
+            if (!use.isNull(4)) {
+                auto [blobData, blobSize] = use.getBlob(4);
+                auto hexStr = std::string(static_cast<const char *>(blobData), blobSize);
+                row.depContentHash = Hash::parseAny(hexStr, HashAlgorithm::SHA256);
+            }
+            row.hasParent = !use.isNull(5);
+            chain.push_back(std::move(row));
         }
     }
 
-    // Include dep content hash
-    auto depHash = getDepContentHashForAttr(attrId);
-    if (depHash) {
-        auto hex = depHash->to_string(HashFormat::Base16, false);
-        sink(std::string_view("D", 1));
+    // Compute identity hashes bottom-up (chain is root-first).
+    // Each node's identity = hash("V" + valueHash + "D" + depHash + "P" + parentIdentity).
+    std::optional<Hash> parentIdentity;
+    for (auto & row : chain) {
+        // Check cache for this ancestor
+        auto cached = identityHashCache.find(row.attrId);
+        if (cached != identityHashCache.end()) {
+            parentIdentity = cached->second;
+            continue;
+        }
+
+        HashSink sink(HashAlgorithm::SHA256);
+
+        auto valHash = computeValueHash(row.type, row.value, row.context);
+        auto hex = valHash.to_string(HashFormat::Base16, false);
+        sink(std::string_view("V", 1));
         sink(hex);
+
+        if (row.depContentHash) {
+            auto dhex = row.depContentHash->to_string(HashFormat::Base16, false);
+            sink(std::string_view("D", 1));
+            sink(dhex);
+        }
+
+        if (parentIdentity) {
+            auto phex = parentIdentity->to_string(HashFormat::Base16, false);
+            sink(std::string_view("P", 1));
+            sink(phex);
+        }
+
+        auto identity = sink.finish().hash;
+        identityHashCache.insert_or_assign(row.attrId, identity);
+        parentIdentity = identity;
     }
 
-    // Include parent's identity hash (recursive)
-    std::optional<AttrId> parentId;
-    {
-        auto st(_state->lock());
-        auto use(st->getAttrParentId.use()(static_cast<int64_t>(attrId)));
-        if (use.next() && !use.isNull(0))
-            parentId = static_cast<AttrId>(use.getInt(0));
-    }
-
-    if (parentId) {
-        auto parentIdentity = computeIdentityHash(*parentId);
-        auto hex = parentIdentity.to_string(HashFormat::Base16, false);
-        sink(std::string_view("P", 1));
-        sink(hex);
-    }
-
-    return sink.finish().hash;
+    // The last computed identity is for attrId itself
+    return parentIdentity.value();
 }
 
 int64_t EvalCacheDb::getOrCreateDepSet(
@@ -694,63 +788,62 @@ bool EvalCacheDb::validateAttr(
 
     nrDepValidations++;
 
-    // Get dep_set_id, parent_id, and parent_epoch in one query
-    std::optional<int64_t> depSetId;
-    std::optional<AttrId> parentId;
-    std::optional<int64_t> storedParentEpoch;
+    // Fetch entire ancestor chain in one CTE query (root-first order).
+    // Each row: (attr_id, dep_set_id, parent_epoch, parent_current_epoch)
+    struct ChainNode {
+        AttrId attrId;
+        std::optional<int64_t> depSetId;
+        std::optional<int64_t> storedParentEpoch;
+        std::optional<int64_t> parentCurrentEpoch;
+    };
+    std::vector<ChainNode> chain;
     {
         auto st(_state->lock());
-        auto use(st->getAttrValidationInfo.use()(static_cast<int64_t>(attrId)));
-        if (!use.next())
-            return false;
-        depSetId = use.isNull(0) ? std::nullopt : std::optional<int64_t>(use.getInt(0));
-        parentId = use.isNull(1) ? std::nullopt : std::optional<AttrId>(static_cast<AttrId>(use.getInt(1)));
-        storedParentEpoch = use.isNull(2) ? std::nullopt : std::optional<int64_t>(use.getInt(2));
+        auto use(st->getValidationChain.use()(static_cast<int64_t>(attrId)));
+        while (use.next()) {
+            ChainNode node;
+            node.attrId = static_cast<AttrId>(use.getInt(0));
+            node.depSetId = use.isNull(1) ? std::nullopt : std::optional<int64_t>(use.getInt(1));
+            node.storedParentEpoch = use.isNull(2) ? std::nullopt : std::optional<int64_t>(use.getInt(2));
+            node.parentCurrentEpoch = use.isNull(3) ? std::nullopt : std::optional<int64_t>(use.getInt(3));
+            chain.push_back(node);
+        }
     }
 
-    // Validate dep set
-    if (!depSetId) {
-        // No dep set → always invalid (empty dep sets should still have a row)
-        nrDepValidationsFailed++;
+    if (chain.empty())
         return false;
-    }
 
-    if (!validateDepSet(*depSetId, inputAccessors, state)) {
-        nrDepValidationsFailed++;
-        return false;
-    }
+    // Validate root-to-leaf. Skip already-validated ancestors.
+    for (auto & node : chain) {
+        if (validatedAttrIds.count(node.attrId))
+            continue;
 
-    // Recursively validate parent
-    if (parentId) {
-        if (!validateAttr(*parentId, inputAccessors, state)) {
-            debug("attr validation failed: parent invalid for attr_id=%d", attrId);
+        // Validate dep set
+        if (!node.depSetId) {
             nrDepValidationsFailed++;
             return false;
         }
 
-        // Check that parent's current epoch matches what was stored when
-        // this child was cold-stored. If the parent was cold-stored again
-        // (bumping its epoch), this child's result may be stale — even if
-        // the parent's deps are unchanged, its VALUE may have changed.
-        if (storedParentEpoch) {
-            int64_t parentCurrentEpoch = -1;
-            {
-                auto st(_state->lock());
-                auto use(st->getAttrEpoch.use()(static_cast<int64_t>(*parentId)));
-                if (use.next() && !use.isNull(0))
-                    parentCurrentEpoch = use.getInt(0);
-            }
-            if (parentCurrentEpoch != *storedParentEpoch) {
+        if (!validateDepSet(*node.depSetId, inputAccessors, state)) {
+            nrDepValidationsFailed++;
+            return false;
+        }
+
+        // Check epoch consistency with parent
+        if (node.storedParentEpoch && node.parentCurrentEpoch) {
+            if (*node.parentCurrentEpoch != *node.storedParentEpoch) {
                 debug("attr validation failed: parent epoch changed for attr_id=%d "
-                      "(stored=%d, current=%d)", attrId, *storedParentEpoch, parentCurrentEpoch);
+                      "(stored=%d, current=%d)", node.attrId,
+                      *node.storedParentEpoch, *node.parentCurrentEpoch);
                 nrDepValidationsFailed++;
                 return false;
             }
         }
+
+        validatedAttrIds.insert(node.attrId);
+        nrDepValidationsPassed++;
     }
 
-    validatedAttrIds.insert(attrId);
-    nrDepValidationsPassed++;
     return true;
 }
 
@@ -818,6 +911,12 @@ AttrId EvalCacheDb::coldStore(
     }
 
     // 7. Recovery index writes
+
+    // Invalidate session caches: this attrId's data may have changed,
+    // which would make any cached identity hash (and those of descendants) stale.
+    // Also clear prefetched rows since the stored value/deps may differ.
+    identityHashCache.clear();
+    prefetchedRows.clear();
 
     // Compute parent identity hash outside lock (it acquires its own lock internally)
     std::optional<Hash> phase2Hash;
@@ -952,6 +1051,7 @@ std::optional<EvalCacheDb::WarmResult> EvalCacheDb::tryCandidate(
     }
 
     // Update the main Attributes entry to point to recovered dep set + result
+    prefetchedRows.clear();
     {
         auto st(_state->lock());
         auto upsert = st->upsertAttr.use();
@@ -1095,6 +1195,7 @@ std::optional<EvalCacheDb::WarmResult> EvalCacheDb::recovery(
     for (auto groupDepSetId : groupDepSetIds) {
         auto repDeps = loadDepSetEntries(groupDepSetId);
 
+        // Recompute current hashes for this group's dep keys
         std::vector<Dep> groupDeps;
         bool allGroupComputable = true;
         for (auto & dep : repDeps) {
@@ -1112,23 +1213,21 @@ std::optional<EvalCacheDb::WarmResult> EvalCacheDb::recovery(
         if (!allGroupComputable)
             continue;
 
-        // Try without parent (skip for dep-less children with parent hint,
-        // same rationale as Phase 1 skip above)
-        bool skipGroupPhase1 = parentAttrIdHint && groupDeps.empty();
-        if (!skipGroupPhase1) {
-            auto groupDepHash = computeDepContentHash(groupDeps);
-            if (auto r = tryCandidate(groupDepHash, attrPath, inputAccessors, state, triedCandidates, parentAttrIdHint)) {
-                debug("recovery: Phase 3 succeeded for '%s'", attrPath);
-                return r;
-            }
-        }
-
-        // Also try with parent identity (same as Phase 2)
+        // Try Phase 2 first (more specific — includes parent identity)
         if (parentAttrIdHint) {
             auto parentIdentity = computeIdentityHash(*parentAttrIdHint);
             auto groupDepHashP = computeDepContentHashWithParent(groupDeps, parentIdentity);
             if (auto r = tryCandidate(groupDepHashP, attrPath, inputAccessors, state, triedCandidates, parentAttrIdHint)) {
                 debug("recovery: Phase 3 succeeded for '%s' (with parent)", attrPath);
+                return r;
+            }
+        }
+
+        // Try Phase 1 (skip for dep-less children with parent hint)
+        if (!(parentAttrIdHint && groupDeps.empty())) {
+            auto groupDepHash = computeDepContentHash(groupDeps);
+            if (auto r = tryCandidate(groupDepHash, attrPath, inputAccessors, state, triedCandidates, parentAttrIdHint)) {
+                debug("recovery: Phase 3 succeeded for '%s'", attrPath);
                 return r;
             }
         }

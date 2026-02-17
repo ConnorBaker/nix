@@ -381,6 +381,33 @@ TEST_F(EvalCacheDbTest, ValidateAttr_MultipleDeps_OneInvalid)
     EXPECT_FALSE(valid);
 }
 
+TEST_F(EvalCacheDbTest, ValidateAttr_ParentEpochMismatch)
+{
+    // Parent epoch mismatch: parent re-cold-stored (epoch increments),
+    // child's stored parent_epoch no longer matches → validation fails.
+    ScopedEnvVar env("NIX_EPOCH_TEST", "val");
+
+    auto db = makeDb();
+
+    // Cold store parent
+    std::vector<Dep> parentDeps = {makeEnvVarDep("NIX_EPOCH_TEST", "val")};
+    auto parentId = db.coldStore("", string_t{"parent_v1", {}}, parentDeps, std::nullopt, true);
+
+    // Cold store child referencing parent
+    auto childId = db.coldStore("child", string_t{"child_v1", {}}, {}, parentId, false);
+
+    // Re-cold-store parent with DIFFERENT value (same deps, so deps still validate),
+    // which increments its epoch
+    db.coldStore("", string_t{"parent_v2", {}}, parentDeps, std::nullopt, true);
+
+    // Clear session caches to force actual DB validation
+    db.clearSessionCaches();
+
+    // Child should fail: its stored parent_epoch doesn't match parent's new epoch
+    bool valid = db.validateAttr(childId, {}, state);
+    EXPECT_FALSE(valid);
+}
+
 // ── Cold -> Warm roundtrip ───────────────────────────────────────────
 
 TEST_F(EvalCacheDbTest, ColdWarm_Roundtrip)
@@ -772,6 +799,133 @@ TEST_F(EvalCacheDbTest, Phase1_2_3_Cascade)
     auto result = db.warmPath("child", {}, state);
     ASSERT_TRUE(result.has_value());
     assertAttrValueEquals(string_t{"target", {}}, result->value, state.symbols);
+}
+
+TEST_F(EvalCacheDbTest, Phase2_DeepChainRecovery)
+{
+    // Deep chain (depth 6): root → c1 → c2 → c3 → c4 → c5
+    // Store two versions, revert, verify Phase 2 recovery at deepest level.
+    ScopedEnvVar env1("NIX_DEEP_ROOT", "v1");
+    ScopedEnvVar env2("NIX_DEEP_C1", "v1");
+
+    auto db = makeDb();
+
+    // Build attr paths
+    auto makePath = [](std::vector<std::string> parts) {
+        std::string path;
+        for (size_t i = 0; i < parts.size(); i++) {
+            if (i > 0) path.push_back('\0');
+            path.append(parts[i]);
+        }
+        return path;
+    };
+    auto c1Path = makePath({"c1"});
+    auto c2Path = makePath({"c1", "c2"});
+    auto c3Path = makePath({"c1", "c2", "c3"});
+    auto c4Path = makePath({"c1", "c2", "c3", "c4"});
+    auto c5Path = makePath({"c1", "c2", "c3", "c4", "c5"});
+
+    // Version 1: chain with deps at root and c1
+    std::vector<Dep> rootDeps1 = {makeEnvVarDep("NIX_DEEP_ROOT", "v1")};
+    std::vector<Dep> c1Deps1 = {makeEnvVarDep("NIX_DEEP_C1", "v1")};
+    auto root1 = db.coldStore("", string_t{"root_v1", {}}, rootDeps1, std::nullopt, true);
+    auto c1_1 = db.coldStore(c1Path, string_t{"c1_v1", {}}, c1Deps1, root1, false);
+    auto c2_1 = db.coldStore(c2Path, string_t{"c2_v1", {}}, {}, c1_1, false);
+    auto c3_1 = db.coldStore(c3Path, string_t{"c3_v1", {}}, {}, c2_1, false);
+    auto c4_1 = db.coldStore(c4Path, string_t{"c4_v1", {}}, {}, c3_1, false);
+    db.coldStore(c5Path, string_t{"c5_v1", {}}, {}, c4_1, false);
+
+    // Version 2: different values
+    setenv("NIX_DEEP_ROOT", "v2", 1);
+    setenv("NIX_DEEP_C1", "v2", 1);
+    std::vector<Dep> rootDeps2 = {makeEnvVarDep("NIX_DEEP_ROOT", "v2")};
+    std::vector<Dep> c1Deps2 = {makeEnvVarDep("NIX_DEEP_C1", "v2")};
+    auto root2 = db.coldStore("", string_t{"root_v2", {}}, rootDeps2, std::nullopt, true);
+    auto c1_2 = db.coldStore(c1Path, string_t{"c1_v2", {}}, c1Deps2, root2, false);
+    auto c2_2 = db.coldStore(c2Path, string_t{"c2_v2", {}}, {}, c1_2, false);
+    auto c3_2 = db.coldStore(c3Path, string_t{"c3_v2", {}}, {}, c2_2, false);
+    auto c4_2 = db.coldStore(c4Path, string_t{"c4_v2", {}}, {}, c3_2, false);
+    db.coldStore(c5Path, string_t{"c5_v2", {}}, {}, c4_2, false);
+
+    // Revert to v1
+    setenv("NIX_DEEP_ROOT", "v1", 1);
+    setenv("NIX_DEEP_C1", "v1", 1);
+    db.clearSessionCaches();
+
+    // Recover root (Phase 1)
+    auto rootR = db.warmPath("", {}, state);
+    ASSERT_TRUE(rootR.has_value());
+    assertAttrValueEquals(string_t{"root_v1", {}}, rootR->value, state.symbols);
+
+    // Recover chain down to c5 (Phase 2 at each level)
+    auto c1R = db.warmPath(c1Path, {}, state, rootR->attrId);
+    ASSERT_TRUE(c1R.has_value());
+    assertAttrValueEquals(string_t{"c1_v1", {}}, c1R->value, state.symbols);
+
+    auto c2R = db.warmPath(c2Path, {}, state, c1R->attrId);
+    ASSERT_TRUE(c2R.has_value());
+    assertAttrValueEquals(string_t{"c2_v1", {}}, c2R->value, state.symbols);
+
+    auto c3R = db.warmPath(c3Path, {}, state, c2R->attrId);
+    ASSERT_TRUE(c3R.has_value());
+    assertAttrValueEquals(string_t{"c3_v1", {}}, c3R->value, state.symbols);
+
+    auto c4R = db.warmPath(c4Path, {}, state, c3R->attrId);
+    ASSERT_TRUE(c4R.has_value());
+    assertAttrValueEquals(string_t{"c4_v1", {}}, c4R->value, state.symbols);
+
+    auto c5R = db.warmPath(c5Path, {}, state, c4R->attrId);
+    ASSERT_TRUE(c5R.has_value());
+    assertAttrValueEquals(string_t{"c5_v1", {}}, c5R->value, state.symbols);
+}
+
+TEST_F(EvalCacheDbTest, RecoveryStress_10Versions)
+{
+    // Cold-store 10 versions of same attribute (each with different env var value).
+    // Revert to version 1. Verify recovery succeeds.
+    ScopedEnvVar env("NIX_STRESS_VAR", "version_0");
+
+    auto db = makeDb();
+
+    // Store 10 versions
+    for (int i = 0; i < 10; i++) {
+        auto val = "version_" + std::to_string(i);
+        setenv("NIX_STRESS_VAR", val.c_str(), 1);
+        std::vector<Dep> deps = {makeEnvVarDep("NIX_STRESS_VAR", val)};
+        auto result = "result_" + std::to_string(i);
+        db.coldStore("", string_t{result, {}}, deps, std::nullopt, true);
+    }
+
+    // Revert to each version and verify recovery
+    for (int target = 0; target < 10; target++) {
+        auto val = "version_" + std::to_string(target);
+        setenv("NIX_STRESS_VAR", val.c_str(), 1);
+        db.clearSessionCaches();
+
+        auto result = db.warmPath("", {}, state);
+        ASSERT_TRUE(result.has_value()) << "Recovery failed for version " << target;
+        auto expected = "result_" + std::to_string(target);
+        assertAttrValueEquals(string_t{expected, {}}, result->value, state.symbols);
+    }
+}
+
+TEST_F(EvalCacheDbTest, RecoveryFailure_AllPhasesFail)
+{
+    // All 3 phases fail: attribute has dep on env var, env var changed to a value
+    // that has never been stored. No recovery candidate matches.
+    ScopedEnvVar env("NIX_FAIL_VAR", "original");
+
+    auto db = makeDb();
+
+    std::vector<Dep> deps = {makeEnvVarDep("NIX_FAIL_VAR", "original")};
+    db.coldStore("", string_t{"old_result", {}}, deps, std::nullopt, true);
+
+    // Change to a NEVER-STORED value
+    setenv("NIX_FAIL_VAR", "completely_new_value", 1);
+    db.clearSessionCaches();
+
+    auto result = db.warmPath("", {}, state);
+    EXPECT_FALSE(result.has_value());
 }
 
 // ── Context hash isolation tests ─────────────────────────────────────

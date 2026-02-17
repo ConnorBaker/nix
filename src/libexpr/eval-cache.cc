@@ -37,6 +37,11 @@ struct ExprCached : Expr, gc
      */
     std::optional<AttrId> attrId;
 
+    /**
+     * Cached storeAttrPath result. Lazily populated on first call.
+     */
+    mutable std::optional<std::string> cachedStoreAttrPath;
+
     ExprCached(EvalCache * cache, AttrId /*unused*/, Symbol name, ExprCached * parentExpr,
                bool isListElement = false)
         : cache(cache)
@@ -66,13 +71,20 @@ struct ExprCached : Expr, gc
 
     std::string storeAttrPath() const
     {
-        if (!parentExpr)
-            return ""; // root
-        std::vector<std::string> components;
-        for (auto * e = this; e->parentExpr; e = e->parentExpr)
-            components.push_back(std::string(cache->state.symbols[e->name]));
-        std::reverse(components.begin(), components.end());
-        return EvalCacheDb::buildAttrPath(components);
+        if (cachedStoreAttrPath)
+            return *cachedStoreAttrPath;
+        std::string result;
+        if (!parentExpr) {
+            result = ""; // root
+        } else {
+            std::vector<std::string> components;
+            for (auto * e = this; e->parentExpr; e = e->parentExpr)
+                components.push_back(std::string(cache->state.symbols[e->name]));
+            std::reverse(components.begin(), components.end());
+            result = EvalCacheDb::buildAttrPath(components);
+        }
+        cachedStoreAttrPath = result;
+        return result;
     }
 
     std::optional<AttrId> parentAttrId() const
@@ -84,6 +96,8 @@ struct ExprCached : Expr, gc
     void evaluateCold(Value & v);
     Value * navigateToReal();
     void materializeValue(Value & v, const AttrValue & cached);
+    void materializeOrigExprAttrs(Value & v, const std::vector<Symbol> & childNames,
+                                   Value * prePopulatedParent = nullptr);
     void replayDepsToTracker(AttrId id);
     void storeForcedSibling(ExprCached * parentEC, Symbol siblingName, Value & v);
     void sortChildNames(std::vector<Symbol> & names) const;
@@ -157,6 +171,24 @@ void ExprCached::sortChildNames(std::vector<Symbol> & names) const
 }
 
 // ── ExprCached implementation ────────────────────────────────────────
+
+void ExprCached::materializeOrigExprAttrs(
+    Value & v, const std::vector<Symbol> & childNames, Value * prePopulatedParent)
+{
+    auto * shared = new SharedParentResult();
+    if (prePopulatedParent)
+        shared->value = prePopulatedParent;
+    auto bindings = cache->state.buildBindings(childNames.size());
+    for (auto & childName : childNames) {
+        auto * childVal = cache->state.allocValue();
+        auto * wrapper = new ExprCached(cache, 0, childName, this);
+        wrapper->origExpr = new ExprOrigChild(origExpr, origEnv, childName, shared);
+        wrapper->origEnv = origEnv;
+        childVal->mkThunk(&cache->state.baseEnv, wrapper);
+        bindings.insert(childName, childVal, noPos);
+    }
+    v.mkAttrs(bindings.finish());
+}
 
 void ExprCached::replayDepsToTracker(AttrId id)
 {
@@ -368,6 +400,9 @@ void ExprCached::materializeValue(Value & v, const AttrValue & cached)
     auto & st = cache->state;
 
     if (auto * attrs = std::get_if<std::vector<Symbol>>(&cached)) {
+        // Prefetch all children's attr rows in one query for batch warm lookup
+        if (attrId && cache->dbBackend)
+            cache->dbBackend->prefetchChildren(*attrId);
         auto bindings = st.buildBindings(attrs->size());
         for (auto & childName : *attrs) {
             auto * childVal = st.allocValue();
@@ -551,19 +586,7 @@ void ExprCached::evaluateCold(Value & v)
         }
 
         if (origExpr && std::holds_alternative<std::vector<Symbol>>(attrValue)) {
-            auto & childNames = std::get<std::vector<Symbol>>(attrValue);
-            auto * shared = new SharedParentResult();
-            shared->value = target;
-            auto bindings = cache->state.buildBindings(childNames.size());
-            for (auto & childName : childNames) {
-                auto * childVal = cache->state.allocValue();
-                auto * wrapper = new ExprCached(cache, 0, childName, this);
-                wrapper->origExpr = new ExprOrigChild(origExpr, origEnv, childName, shared);
-                wrapper->origEnv = origEnv;
-                childVal->mkThunk(&cache->state.baseEnv, wrapper);
-                bindings.insert(childName, childVal, noPos);
-            }
-            v.mkAttrs(bindings.finish());
+            materializeOrigExprAttrs(v, std::get<std::vector<Symbol>>(attrValue), target);
             return;
         }
 
@@ -629,17 +652,7 @@ void ExprCached::eval(EvalState & state, Env & env, Value & v)
                 return;
             }
             if (auto * attrs = std::get_if<std::vector<Symbol>>(&cachedValue)) {
-                auto * shared = new SharedParentResult();
-                auto bindings = cache->state.buildBindings(attrs->size());
-                for (auto & childName : *attrs) {
-                    auto * childVal = cache->state.allocValue();
-                    auto * wrapper = new ExprCached(cache, 0, childName, this);
-                    wrapper->origExpr = new ExprOrigChild(origExpr, origEnv, childName, shared);
-                    wrapper->origEnv = origEnv;
-                    childVal->mkThunk(&cache->state.baseEnv, wrapper);
-                    bindings.insert(childName, childVal, noPos);
-                }
-                v.mkAttrs(bindings.finish());
+                materializeOrigExprAttrs(v, *attrs);
                 replayDepsToTracker(cachedAttrId);
                 return;
             }

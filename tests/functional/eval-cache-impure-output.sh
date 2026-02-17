@@ -348,4 +348,134 @@ result_recover_b="$(NIX_ALLOW_EVAL=0 nix eval --json --impure -f "$testDir/test-
 
 echo "Test 10 passed: three-way cycling recovery"
 
+###############################################################################
+# Test 11: Phase 2 recovery — dep-less child with parent identity
+# Parent changes value, child has no direct deps but its value changes.
+# Phase 1 is SKIPPED for dep-less children with parent hint (hash([]) is
+# ambiguous). Phase 2 uses parent's Merkle identity hash to discriminate.
+###############################################################################
+clearStoreIndex
+
+echo "v1" > "$testDir/parent-dep.txt"
+
+cat >"$testDir/test-phase2.nix" <<'EOF'
+let
+  parentData = builtins.readFile ./parent-dep.txt;
+in {
+  child = parentData;
+}
+EOF
+
+# Cold cache: v1
+[[ "$(nix eval --json --impure -f "$testDir/test-phase2.nix" child)" == '"v1\n"' ]]
+
+# Warm cache: verify cached
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json --impure -f "$testDir/test-phase2.nix" child)" == '"v1\n"' ]]
+
+# Switch to v2 (different size to avoid stat-hash-cache issues)
+echo "version2" > "$testDir/parent-dep.txt"
+
+# Cold cache: v2
+[[ "$(nix eval --json --impure -f "$testDir/test-phase2.nix" child)" == '"version2\n"' ]]
+
+# Warm cache: verify cached
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json --impure -f "$testDir/test-phase2.nix" child)" == '"version2\n"' ]]
+
+# Revert to v1 — Phase 2 recovery should find child="v1\n" via parent identity
+echo "v1" > "$testDir/parent-dep.txt"
+
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json --impure -f "$testDir/test-phase2.nix" child)" == '"v1\n"' ]]
+
+echo "Test 11 passed: Phase 2 recovery (dep-less child with parent identity)"
+
+###############################################################################
+# Test 12: Phase 3 recovery — structural variant scanning
+# Attribute reads different files depending on mode. Two cached versions have
+# different dep structures. When current deps invalidate, Phase 3 scans struct
+# groups and finds the version with matching structure.
+###############################################################################
+clearStoreIndex
+
+echo "simple" > "$testDir/p3-mode.txt"
+echo "base-data" > "$testDir/p3-base.txt"
+echo "extra-data" > "$testDir/p3-extra.txt"
+
+cat >"$testDir/test-phase3.nix" <<'NIXEOF'
+let
+  mode = builtins.readFile ./p3-mode.txt;
+in {
+  result = if mode == "simple\n"
+    then builtins.readFile ./p3-base.txt
+    else builtins.readFile ./p3-base.txt + builtins.readFile ./p3-extra.txt;
+}
+NIXEOF
+
+# Cold cache v1: mode="simple" → reads only base
+# Dep structure: [Content(test-phase3.nix), Content(p3-mode.txt), Content(p3-base.txt)]
+[[ "$(nix eval --json --impure -f "$testDir/test-phase3.nix" result)" == '"base-data\n"' ]]
+
+# Verify warm cache
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json --impure -f "$testDir/test-phase3.nix" result)" == '"base-data\n"' ]]
+
+# Switch to complex mode → reads base + extra
+# Dep structure: [Content(test-phase3.nix), Content(p3-mode.txt), Content(p3-base.txt), Content(p3-extra.txt)]
+echo "complex" > "$testDir/p3-mode.txt"
+
+# Cold cache v2
+[[ "$(nix eval --json --impure -f "$testDir/test-phase3.nix" result)" == '"base-data\nextra-data\n"' ]]
+
+# Verify warm cache
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json --impure -f "$testDir/test-phase3.nix" result)" == '"base-data\nextra-data\n"' ]]
+
+# Now modify extra AND revert mode to simple:
+# - Current entry has v2's structure [test.nix, mode, base, extra]
+# - mode.txt changed ("complex" → "simple") → v2's deps invalid
+# - Phase 1: recompute v2's structure with new hashes → no match
+# - Phase 3: scan struct groups, find v1's group [test.nix, mode, base]
+#   All of v1's deps validate (test.nix unchanged, mode="simple" matches v1, base unchanged)
+#   → recover v1's result
+echo "simple" > "$testDir/p3-mode.txt"
+echo "extra-data-modified!!" > "$testDir/p3-extra.txt"
+
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json --impure -f "$testDir/test-phase3.nix" result)" == '"base-data\n"' ]]
+
+echo "Test 12 passed: Phase 3 recovery (structural variant scanning)"
+
+###############################################################################
+# Test 13: Stat-hash-cache — same-size file modification invalidates
+# Verifies that modifying a file to same-length content is detected by the
+# stat-hash-cache (nanosecond mtime or inode change), preventing stale cache.
+###############################################################################
+clearStoreIndex
+
+echo "AAAA" > "$testDir/stat-dep.txt"
+
+cat >"$testDir/test-stat-cache.nix" <<'EOF'
+{
+  result = builtins.readFile ./stat-dep.txt;
+}
+EOF
+
+# Cold cache: "AAAA"
+[[ "$(nix eval --json --impure -f "$testDir/test-stat-cache.nix" result)" == '"AAAA\n"' ]]
+
+# Warm cache
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json --impure -f "$testDir/test-stat-cache.nix" result)" == '"AAAA\n"' ]]
+
+# Modify to same-size content (4 chars + newline = 5 bytes, same as original)
+echo "BBBB" > "$testDir/stat-dep.txt"
+
+# Should detect the change (stat-hash-cache uses nanosecond mtime)
+# If stat-hash-cache is broken, this would incorrectly return "AAAA"
+NIX_ALLOW_EVAL=0 expectStderr 1 nix eval --json --impure -f "$testDir/test-stat-cache.nix" result \
+  | grepQuiet "not everything is cached"
+
+# Re-evaluate to cache "BBBB"
+[[ "$(nix eval --json --impure -f "$testDir/test-stat-cache.nix" result)" == '"BBBB\n"' ]]
+
+# Verify warm cache
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json --impure -f "$testDir/test-stat-cache.nix" result)" == '"BBBB\n"' ]]
+
+echo "Test 13 passed: stat-hash-cache same-size modification"
+
 echo "All eval-cache-impure-output tests passed!"
