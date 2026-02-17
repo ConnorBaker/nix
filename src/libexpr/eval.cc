@@ -1,4 +1,5 @@
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-cache.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/file-load-tracker.hh"
 #include "nix/expr/primops.hh"
@@ -3089,6 +3090,15 @@ void EvalState::printStatistics()
     topObj["nrLookups"] = nrLookups.load();
     topObj["nrPrimOpCalls"] = nrPrimOpCalls.load();
     topObj["nrFunctionCalls"] = nrFunctionCalls.load();
+    topObj["evalCache"] = {
+        {"hits", eval_cache::nrEvalCacheHits.load()},
+        {"misses", eval_cache::nrEvalCacheMisses.load()},
+        {"depValidations", eval_cache::nrDepValidations.load()},
+        {"depValidationsPassed", eval_cache::nrDepValidationsPassed.load()},
+        {"depValidationsFailed", eval_cache::nrDepValidationsFailed.load()},
+        {"depsChecked", eval_cache::nrDepsChecked.load()},
+        {"verificationFailures", eval_cache::nrCacheVerificationFailures.load()},
+    };
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {
         {"heapSize", heapSize},

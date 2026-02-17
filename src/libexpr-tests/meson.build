@@ -50,6 +50,15 @@ sources = files(
   'derived-path.cc',
   'error_traces.cc',
   'eval.cc',
+  'eval-cache/helpers.cc',
+  'eval-cache/dep-tracking.cc',
+  'eval-cache/eval-cache.cc',
+  'eval-cache/eval-cache-store.cc',
+  'eval-cache/eval-index-db.cc',
+  'eval-cache/eval-result-serialise.cc',
+  'eval-cache/file-load-tracker.cc',
+  'eval-cache/integration.cc',
+  'eval-cache/stat-hash-cache.cc',
   'json.cc',
   'main.cc',
   'nix_api_expr.cc',
@@ -64,7 +73,9 @@ sources = files(
   'value/value.cc',
 )
 
-include_dirs = [ include_directories('.') ]
+include_dirs = [
+  include_directories('.'),
+]
 
 
 this_exe = executable(

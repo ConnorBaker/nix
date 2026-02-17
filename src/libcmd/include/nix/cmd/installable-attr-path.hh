@@ -48,6 +48,8 @@ class InstallableAttrPath : public InstallableValue
 
     DerivedPathsWithInfo toDerivedPaths() override;
 
+    ref<eval_cache::EvalCache> getOrCreateEvalCache(EvalState & state);
+
 public:
 
     static InstallableAttrPath parse(

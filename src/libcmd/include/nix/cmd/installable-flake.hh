@@ -41,6 +41,7 @@ struct InstallableFlake : InstallableValue
     ExtendedOutputsSpec extendedOutputsSpec;
     const flake::LockFlags & lockFlags;
     mutable std::shared_ptr<flake::LockedFlake> _lockedFlake;
+    mutable std::string resolvedAttrPath_;
 
     InstallableFlake(
         SourceExprCommand * cmd,
@@ -63,11 +64,7 @@ struct InstallableFlake : InstallableValue
 
     std::pair<Value *, PosIdx> toValue(EvalState & state) override;
 
-    /**
-     * Get a cursor to every attrpath in getActualAttrPaths() that
-     * exists. However if none exists, throw an exception.
-     */
-    std::vector<ref<eval_cache::AttrCursor>> getCursors(EvalState & state) override;
+    std::string resolvedAttrPath() const override { return resolvedAttrPath_; }
 
     ref<flake::LockedFlake> getLockedFlake() const;
 

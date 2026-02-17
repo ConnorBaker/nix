@@ -10,6 +10,7 @@
 #include <iostream>
 
 #include "nix/util/fmt.hh"
+#include "nix/util/ref.hh"
 #include "nix/expr/print-options.hh"
 
 namespace nix {

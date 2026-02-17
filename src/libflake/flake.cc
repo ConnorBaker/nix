@@ -1003,11 +1003,77 @@ std::optional<Fingerprint> LockedFlake::getFingerprint(Store & store, const fetc
 
 Flake::~Flake() {}
 
+static std::optional<Hash> computeStableIdentity(ref<const LockedFlake> lockedFlake)
+{
+    // Use resolvedRef (not lockedRef) so the identity is version-independent.
+    // lockedRef may be rewritten by the fetcher in ways that differ across
+    // versions, whereas resolvedRef is the stable, resolved flake URL.
+    auto identity = lockedFlake->flake.resolvedRef.input.getStableIdentity();
+    if (!identity)
+        return std::nullopt;
+
+    if (!lockedFlake->flake.resolvedRef.subdir.empty())
+        *identity += fmt(";dir=%s", lockedFlake->flake.resolvedRef.subdir);
+
+    return hashString(HashAlgorithm::BLAKE3, *identity);
+}
+
 ref<eval_cache::EvalCache> openEvalCache(EvalState & state, ref<const LockedFlake> lockedFlake)
 {
-    auto fingerprint = state.settings.useEvalCache && state.settings.pureEval
-                           ? lockedFlake->getFingerprint(*state.store, state.fetchSettings)
-                           : std::nullopt;
+    auto stableIdentity = state.settings.useEvalCache
+                              ? computeStableIdentity(lockedFlake)
+                              : std::nullopt;
+
+    auto [lockFileStr, keyMap] = lockedFlake->lockFile.to_string();
+
+    // Build mount-to-input and input-accessors maps for dep tracking
+    std::map<CanonPath, std::pair<std::string, std::string>> mountToInput;
+    std::map<std::string, SourcePath> inputAccessors;
+
+    for (auto & [node, sourcePath] : lockedFlake->nodePaths) {
+        auto [storePath, subdir] = state.store->toStorePath(sourcePath.path.abs());
+        auto mountPoint = CanonPath(state.store->printStorePath(storePath));
+        auto key = keyMap.find(node);
+        if (key == keyMap.end())
+            throw Error("internal error: flake node not found in lock file key map");
+        mountToInput.emplace(mountPoint, std::make_pair(key->second, subdir));
+        inputAccessors.emplace(key->second, sourcePath);
+    }
+
+    // Populate inputAccessors/mountToInput for locked nodes NOT in nodePaths.
+    // This ensures dep tracking works for all flake inputs, even those that
+    // were already locked and didn't need re-fetching during lockFlake().
+    for (auto & [node, key] : keyMap) {
+        if (inputAccessors.count(key))
+            continue; // Already populated from nodePaths
+
+        auto lockedNode = dynamic_cast<const LockedNode *>(&*node);
+        if (!lockedNode)
+            continue; // Root node — already handled via nodePaths
+
+        try {
+            auto storePath = lockedNode->computeStorePath(*state.store);
+            auto storePathStr = state.store->printStorePath(storePath);
+            auto mountPoint = CanonPath(storePathStr);
+            auto & subdir = lockedNode->lockedRef.subdir;
+
+            auto fullPath = subdir.empty()
+                ? mountPoint
+                : mountPoint / CanonPath("/" + subdir);
+            auto sourcePath = SourcePath(getFSSourceAccessor(), fullPath);
+
+            mountToInput.emplace(mountPoint, std::make_pair(key, subdir));
+            inputAccessors.emplace(key, sourcePath);
+        } catch (Error &) {
+            // Unlocked input without narHash, or other resolution failure.
+            // Skip — deps referencing this input will fail validation,
+            // triggering re-evaluation (correct behavior).
+        }
+    }
+
+    // Also set mountToInput on EvalState so evalFile/primops can use it
+    state.mountToInput = mountToInput;
+
     auto rootLoader = [&state, lockedFlake]() {
         /* For testing whether the evaluation cache is
            complete. */
@@ -1025,16 +1091,21 @@ ref<eval_cache::EvalCache> openEvalCache(EvalState & state, ref<const LockedFlak
         return aOutputs->value;
     };
 
-    if (fingerprint) {
-        auto search = state.evalCaches.find(fingerprint.value());
+    if (stableIdentity) {
+        auto search = state.evalCaches.find(stableIdentity.value());
         if (search == state.evalCaches.end()) {
             search = state.evalCaches
-                         .emplace(fingerprint.value(), make_ref<eval_cache::EvalCache>(fingerprint, state, rootLoader))
+                         .emplace(stableIdentity.value(),
+                             make_ref<eval_cache::EvalCache>(
+                                 stableIdentity, state, rootLoader,
+                                 std::move(inputAccessors)))
                          .first;
         }
         return search->second;
     } else {
-        return make_ref<eval_cache::EvalCache>(std::nullopt, state, rootLoader);
+        return make_ref<eval_cache::EvalCache>(
+            std::nullopt, state, rootLoader,
+            std::move(inputAccessors));
     }
 }
 

@@ -1,721 +1,888 @@
-#include "nix/util/users.hh"
+#include "nix/expr/eval-cache-store.hh"
+#include "nix/util/environment-variables.hh"
 #include "nix/expr/eval-cache.hh"
-#include "nix/store/sqlite.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/store/store-api.hh"
-#include "nix/store/globals.hh"
-// Need specialization involving `SymbolStr` just in this one module.
-#include "nix/util/strings-inline.hh"
+#include "nix/fetchers/fetchers.hh"
+#include "nix/expr/value-to-json.hh"
+
+#include <algorithm>
+#include <nlohmann/json.hpp>
 
 namespace nix::eval_cache {
 
-CachedEvalError::CachedEvalError(ref<AttrCursor> cursor, Symbol attr)
-    : EvalError(cursor->root->state, "cached failure of attribute '%s'", cursor->getAttrPathStr(attr))
-    , cursor(cursor)
-    , attr(attr)
+Counter nrEvalCacheHits;
+Counter nrEvalCacheMisses;
+Counter nrDepValidations;
+Counter nrDepValidationsPassed;
+Counter nrDepValidationsFailed;
+Counter nrDepsChecked;
+Counter nrCacheVerificationFailures;
+
+// ── ExprCached struct definition ─────────────────────────────────────
+
+/**
+ * An Expr node whose eval() reads from the eval cache (warm path) or
+ * evaluates the real thunk and stores the result (cold path). GC-allocated
+ * so it can be embedded in Values as a thunk. CLI commands use standard
+ * forceValue() + Value operations instead of cache-specific APIs.
+ *
+ * During cold-path evaluation, navigateToReal() wraps sibling thunks
+ * with ExprCached, enabling partial tree invalidation: unchanged siblings
+ * are served from cache while the target attribute is re-evaluated.
+ */
+struct ExprCached : Expr, gc
 {
-}
+    EvalCache * cache;
+    Symbol name;
+    ExprCached * parentExpr; // GC-traced, nullptr for root
+    bool isListElement;      // true = list index, false = attr access
+    /**
+     * For side-effect sibling wrappers created during navigateToReal.
+     *
+     * When navigateToReal traverses the real evaluation tree to reach a
+     * target attribute (e.g., hello.drvPath), it wraps sibling thunks
+     * (e.g., stdenv) with ExprCached wrappers that have origExpr/origEnv
+     * set. When these siblings are later forced as side effects (e.g.,
+     * derivationStrictInternal forcing stdenv), the wrapper's eval()
+     * tries the warm cache first, then falls back to evaluating the
+     * original thunk expression directly — without navigateToReal.
+     *
+     * Warm cache for FullAttrs uses ExprOrigChild as the origExpr of
+     * materialized children. ExprOrigChild resolves children by
+     * evaluating the parent's original expression directly (shared
+     * across siblings) rather than using navigateToReal, which would
+     * cycle through the materialized parent and hit a blackhole.
+     *
+     * Cold path still produces real values (v = *target) with children
+     * wrapped as origExpr ExprCached thunks for future warm cache hits.
+     */
+    Expr * origExpr = nullptr;
+    Env * origEnv = nullptr;
 
-void CachedEvalError::force()
-{
-    auto & v = cursor->forceValue();
+    /**
+     * The trace store path for this attribute.
+     * Set after warm path succeeds or cold path stores the result.
+     */
+    std::optional<StorePath> tracePath;
 
-    if (v.type() == nAttrs) {
-        auto a = v.attrs()->get(this->attr);
-
-        state.forceValue(*a->value, a->pos);
+    ExprCached(EvalCache * cache, AttrId /*unused*/, Symbol name, ExprCached * parentExpr,
+               bool isListElement = false)
+        : cache(cache)
+        , name(name)
+        , parentExpr(parentExpr)
+        , isListElement(isListElement)
+    {
     }
 
-    // Shouldn't happen.
-    throw EvalError(
-        state, "evaluation of cached failed attribute '%s' unexpectedly succeeded", cursor->getAttrPathStr(attr));
-}
+    void eval(EvalState & state, Env & env, Value & v) override;
+    void show(const SymbolTable &, std::ostream &) const override {}
+    void bindVars(EvalState &, const std::shared_ptr<const StaticEnv> &) override {}
 
-static const char * schema = R"sql(
-create table if not exists Attributes (
-    parent      integer not null,
-    name        text,
-    type        integer not null,
-    value       text,
-    context     text,
-    primary key (parent, name)
-);
-)sql";
-
-struct AttrDb
-{
-    std::atomic_bool failed{false};
-
-    const StoreDirConfig & cfg;
-
-    struct State
+    /**
+     * Build a human-readable attr path string from the ExprCached parent chain.
+     */
+    std::string attrPathStr() const
     {
-        SQLite db;
-        SQLiteStmt insertAttribute;
-        SQLiteStmt insertAttributeWithContext;
-        SQLiteStmt queryAttribute;
-        SQLiteStmt queryAttributes;
-        std::unique_ptr<SQLiteTxn> txn;
-    };
-
-    std::unique_ptr<Sync<State>> _state;
-
-    SymbolTable & symbols;
-
-    AttrDb(const StoreDirConfig & cfg, const Hash & fingerprint, SymbolTable & symbols)
-        : cfg(cfg)
-        , _state(std::make_unique<Sync<State>>())
-        , symbols(symbols)
-    {
-        auto state(_state->lock());
-
-        auto cacheDir = std::filesystem::path(getCacheDir()) / "eval-cache-v6";
-        createDirs(cacheDir);
-
-        auto dbPath = cacheDir / (fingerprint.to_string(HashFormat::Base16, false) + ".sqlite");
-
-        state->db = SQLite(dbPath, {.useWAL = settings.useSQLiteWAL});
-        state->db.isCache();
-        state->db.exec(schema);
-
-        state->insertAttribute.create(
-            state->db, "insert or replace into Attributes(parent, name, type, value) values (?, ?, ?, ?)");
-
-        state->insertAttributeWithContext.create(
-            state->db, "insert or replace into Attributes(parent, name, type, value, context) values (?, ?, ?, ?, ?)");
-
-        state->queryAttribute.create(
-            state->db, "select rowid, type, value, context from Attributes where parent = ? and name = ?");
-
-        state->queryAttributes.create(state->db, "select name from Attributes where parent = ?");
-
-        state->txn = std::make_unique<SQLiteTxn>(state->db);
+        if (!parentExpr)
+            return "«root»";
+        std::vector<Symbol> syms;
+        for (auto * e = this; e->parentExpr; e = e->parentExpr)
+            syms.push_back(e->name);
+        std::reverse(syms.begin(), syms.end());
+        AttrPath path(syms.begin(), syms.end());
+        return path.to_string(cache->state);
     }
 
-    ~AttrDb()
+    // ── Store backend methods ────────────────────────────────────
+
+    /**
+     * Build the null-byte-separated attr path for the store backend.
+     */
+    std::string storeAttrPath() const
     {
-        try {
-            auto state(_state->lock());
-            if (!failed && state->txn->active)
-                state->txn->commit();
-            state->txn.reset();
-        } catch (...) {
-            ignoreExceptionInDestructor();
-        }
+        if (!parentExpr)
+            return ""; // root
+        std::vector<std::string> components;
+        for (auto * e = this; e->parentExpr; e = e->parentExpr)
+            components.push_back(std::string(cache->state.symbols[e->name]));
+        std::reverse(components.begin(), components.end());
+        return EvalCacheStore::buildAttrPath(components);
     }
 
-    template<typename F>
-    AttrId doSQLite(F && fun)
+    /**
+     * Get the parent's trace store path.
+     */
+    std::optional<StorePath> parentTracePath() const
     {
-        if (failed)
-            return 0;
-        try {
-            return fun();
-        } catch (SQLiteError &) {
-            ignoreExceptionExceptInterrupt();
-            failed = true;
-            return 0;
-        }
+        if (!parentExpr) return std::nullopt;
+        return parentExpr->tracePath;
     }
 
-    AttrId setAttrs(AttrKey key, const std::vector<Symbol> & attrs)
-    {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::FullAttrs) (0, false).exec();
-
-            AttrId rowId = state->db.getLastInsertedRowId();
-            assert(rowId);
-
-            for (auto & attr : attrs)
-                state->insertAttribute.use()(rowId)(symbols[attr])(AttrType::Placeholder) (0, false).exec();
-
-            return rowId;
-        });
-    }
-
-    AttrId setString(AttrKey key, std::string_view s, const Value::StringWithContext::Context * context = nullptr)
-    {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            if (context) {
-                std::string ctx;
-                bool first = true;
-                for (auto * elem : *context) {
-                    if (!first)
-                        ctx.push_back(' ');
-                    ctx.append(elem->view());
-                    first = false;
-                }
-                state->insertAttributeWithContext.use()(key.first)(symbols[key.second])(AttrType::String) (s) (ctx)
-                    .exec();
-            } else {
-                state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::String) (s).exec();
-            }
-
-            return state->db.getLastInsertedRowId();
-        });
-    }
-
-    AttrId setBool(AttrKey key, bool b)
-    {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::Bool) (b ? 1 : 0).exec();
-
-            return state->db.getLastInsertedRowId();
-        });
-    }
-
-    AttrId setInt(AttrKey key, int n)
-    {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::Int) (n).exec();
-
-            return state->db.getLastInsertedRowId();
-        });
-    }
-
-    AttrId setListOfStrings(AttrKey key, const std::vector<std::string> & l)
-    {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute
-                .use()(key.first)(symbols[key.second])(
-                    AttrType::ListOfStrings) (dropEmptyInitThenConcatStringsSep("\t", l))
-                .exec();
-
-            return state->db.getLastInsertedRowId();
-        });
-    }
-
-    AttrId setPlaceholder(AttrKey key)
-    {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::Placeholder) (0, false).exec();
-
-            return state->db.getLastInsertedRowId();
-        });
-    }
-
-    AttrId setMissing(AttrKey key)
-    {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::Missing) (0, false).exec();
-
-            return state->db.getLastInsertedRowId();
-        });
-    }
-
-    AttrId setMisc(AttrKey key)
-    {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::Misc) (0, false).exec();
-
-            return state->db.getLastInsertedRowId();
-        });
-    }
-
-    AttrId setFailed(AttrKey key)
-    {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::Failed) (0, false).exec();
-
-            return state->db.getLastInsertedRowId();
-        });
-    }
-
-    std::optional<std::pair<AttrId, AttrValue>> getAttr(AttrKey key)
-    {
-        auto state(_state->lock());
-
-        auto queryAttribute(state->queryAttribute.use()(key.first)(symbols[key.second]));
-        if (!queryAttribute.next())
-            return {};
-
-        auto rowId = (AttrId) queryAttribute.getInt(0);
-        auto type = (AttrType) queryAttribute.getInt(1);
-
-        switch (type) {
-        case AttrType::Placeholder:
-            return {{rowId, placeholder_t()}};
-        case AttrType::FullAttrs: {
-            // FIXME: expensive, should separate this out.
-            std::vector<Symbol> attrs;
-            auto queryAttributes(state->queryAttributes.use()(rowId));
-            while (queryAttributes.next())
-                attrs.emplace_back(symbols.create(queryAttributes.getStr(0)));
-            return {{rowId, attrs}};
-        }
-        case AttrType::String: {
-            NixStringContext context;
-            if (!queryAttribute.isNull(3))
-                for (auto & s : tokenizeString<std::vector<std::string>>(queryAttribute.getStr(3), " "))
-                    context.insert(NixStringContextElem::parse(s));
-            return {{rowId, string_t{queryAttribute.getStr(2), context}}};
-        }
-        case AttrType::Bool:
-            return {{rowId, queryAttribute.getInt(2) != 0}};
-        case AttrType::Int:
-            return {{rowId, int_t{NixInt{queryAttribute.getInt(2)}}}};
-        case AttrType::ListOfStrings:
-            return {{rowId, tokenizeString<std::vector<std::string>>(queryAttribute.getStr(2), "\t")}};
-        case AttrType::Missing:
-            return {{rowId, missing_t()}};
-        case AttrType::Misc:
-            return {{rowId, misc_t()}};
-        case AttrType::Failed:
-            return {{rowId, failed_t()}};
-        default:
-            throw Error("unexpected type in evaluation cache");
-        }
-    }
+    void evaluateCold(Value & v);
+    Value * navigateToReal();
+    void materializeValue(Value & v, const AttrValue & cached);
+    void replayDepsToTracker(const StorePath & tracePath);
+    void storeForcedSibling(ExprCached * parentEC, Symbol siblingName, Value & v);
+    void sortChildNames(std::vector<Symbol> & names) const;
 };
 
-static std::shared_ptr<AttrDb> makeAttrDb(const StoreDirConfig & cfg, const Hash & fingerprint, SymbolTable & symbols)
+// ── DeferredColdStore::execute() ──────────────────────────────────────
+
+void DeferredColdStore::execute()
 {
+    std::optional<StorePath> parentTrace;
+    if (parentSrc) {
+        parentTrace = parentSrc->tracePath;
+        if (!parentTrace) return;
+    }
+    auto traceP = sb->coldStore(attrPath, name, value, deps, parentTrace, isRoot);
+    target->tracePath = traceP;
+}
+
+// ── Support types (SharedParentResult, ExprOrigChild) ────────────────
+
+/**
+ * GC-allocated container for a shared lazy parent evaluation result.
+ * Multiple ExprOrigChild instances share this so the parent is
+ * evaluated at most once.
+ */
+struct SharedParentResult : gc
+{
+    Value * value = nullptr;
+};
+
+/**
+ * Expr subclass for children of a materialized origExpr FullAttrs.
+ *
+ * Instead of using navigateToReal (which would cycle through the
+ * materialized parent and hit a blackhole), this resolves the child
+ * by evaluating the parent's original expression and looking up
+ * the child name in the resulting real attrset.
+ */
+struct ExprOrigChild : Expr, gc
+{
+    Expr * parentOrigExpr;
+    Env * parentOrigEnv;
+    Symbol childName;
+    SharedParentResult * shared;
+
+    ExprOrigChild(Expr * parentOrigExpr, Env * parentOrigEnv,
+                  Symbol childName, SharedParentResult * shared)
+        : parentOrigExpr(parentOrigExpr)
+        , parentOrigEnv(parentOrigEnv)
+        , childName(childName)
+        , shared(shared)
+    {}
+
+    void eval(EvalState & state, Env &, Value & v) override
+    {
+        if (!shared->value) {
+            shared->value = state.allocValue();
+            // Suspend dep recording while evaluating the parent expression.
+            // The parent (e.g., buildPackages = all of nixpkgs) can record
+            // 10K+ file deps that would bloat this child's dep set.
+            // The child's own deps are recorded after the guard is destroyed.
+            // Parent dep chains in the store handle invalidation chain-of-custody.
+            {
+                SuspendFileLoadTracker suspend;
+                parentOrigExpr->eval(state, *parentOrigEnv, *shared->value);
+                state.forceAttrs(*shared->value, noPos,
+                    "while resolving cached child attribute");
+            }
+        }
+        auto * attr = shared->value->attrs()->get(childName);
+        if (!attr)
+            throw Error("attribute '%s' not found in cached parent",
+                        state.symbols[childName]);
+        state.forceValue(*attr->value, noPos);
+        v = *attr->value;
+    }
+
+    void show(const SymbolTable &, std::ostream &) const override {}
+    void bindVars(EvalState &, const std::shared_ptr<const StaticEnv> &) override {}
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Returns true if the AttrValue is a leaf that can be served from cache
+ * without navigateToReal (scalars, paths, string lists).
+ */
+static bool isLeafCached(const AttrValue & v)
+{
+    return std::get_if<string_t>(&v)
+        || std::get_if<bool>(&v)
+        || std::get_if<int_t>(&v)
+        || std::get_if<path_t>(&v)
+        || std::get_if<null_t>(&v)
+        || std::get_if<float_t>(&v)
+        || std::get_if<std::vector<std::string>>(&v);
+}
+
+void ExprCached::sortChildNames(std::vector<Symbol> & names) const
+{
+    std::sort(names.begin(), names.end(),
+        [&](Symbol a, Symbol b) {
+            return std::string_view(cache->state.symbols[a])
+                 < std::string_view(cache->state.symbols[b]);
+        });
+}
+
+// ── ExprCached implementation ────────────────────────────────────────
+
+void ExprCached::replayDepsToTracker(const StorePath & traceP)
+{
+    if (!FileLoadTracker::isActive())
+        return;
+
+    auto & sb = *cache->storeBackend;
     try {
-        return std::make_shared<AttrDb>(cfg, fingerprint, symbols);
-    } catch (SQLiteError &) {
-        ignoreExceptionExceptInterrupt();
-        return nullptr;
+        // Load deps from the trace's dep set blob (two-object model).
+        // Uses depSetCache to avoid redundant decompression if validation
+        // already loaded the same dep set.
+        auto deps = sb.loadDepsForTrace(traceP);
+        // Replay only direct deps from this trace — do NOT recurse into
+        // parent traces (parent deps are already captured in the parent's
+        // FileLoadTracker).
+        for (auto & dep : deps) {
+            FileLoadTracker::record(dep);
+        }
+    } catch (std::exception &) {
+        // trace or dep set blob may have been GC'd — skip
     }
 }
 
-EvalCache::EvalCache(
-    std::optional<std::reference_wrapper<const Hash>> useCache, EvalState & state, RootLoader rootLoader)
-    : db(useCache ? makeAttrDb(*state.store, *useCache, state.symbols) : nullptr)
-    , state(state)
-    , rootLoader(rootLoader)
+void ExprCached::storeForcedSibling(ExprCached * parentEC, Symbol siblingName, Value & v)
 {
-}
+    // Skip path values: they reference source trees needing SourceAccessor
+    // context from cold evaluation for fetchToStore hash caching.
+    if (v.type() == nPath)
+        return;
 
-Value * EvalCache::getRootValue()
-{
-    if (!value) {
-        debug("getting root value");
-        value = allocRootValue(rootLoader());
+    auto & sb = *cache->storeBackend;
+    auto nameStr = std::string(cache->state.symbols[siblingName]);
+
+    // Create a GC-allocated ExprCached node for the sibling so children
+    // have correct parentExpr chain for storeAttrPath() / parentEvalDrvPath()
+    auto * siblingEC = new ExprCached(cache, 0, siblingName, parentEC);
+    auto siblingAttrPath = siblingEC->storeAttrPath();
+
+    // If already staged or stored (by a prior evaluateCold with full deps),
+    // don't overwrite with this dep-less speculative entry.
+    if (sb.isStaged(siblingAttrPath) || sb.index.lookup(sb.contextHash, siblingAttrPath, sb.store))
+        return;
+
+    // Serialize value
+    AttrValue attrValue;
+    if (v.type() == nString) {
+        NixStringContext ctx;
+        if (v.context())
+            for (auto * elem : *v.context())
+                ctx.insert(NixStringContextElem::parse(elem->view()));
+        attrValue = string_t{std::string(v.string_view()), std::move(ctx)};
+    } else if (v.type() == nBool) {
+        attrValue = v.boolean();
+    } else if (v.type() == nInt) {
+        attrValue = int_t{NixInt{v.integer().value}};
+    } else if (v.type() == nNull) {
+        attrValue = null_t{};
+    } else if (v.type() == nFloat) {
+        attrValue = float_t{v.fpoint()};
+    } else if (v.type() == nAttrs) {
+        std::vector<Symbol> childNames;
+        for (auto & attr : *v.attrs())
+            childNames.push_back(attr.name);
+        sortChildNames(childNames);
+        attrValue = childNames;
+    } else {
+        return; // list, function, external — skip
     }
-    return *value;
-}
 
-ref<AttrCursor> EvalCache::getRoot()
-{
-    return make_ref<AttrCursor>(ref(shared_from_this()), std::nullopt);
-}
+    // Defer sibling coldStore — parent's tracePath resolved at flush time.
+    // DeferredColdStore is GC-allocated, keeping siblingEC and parentEC
+    // reachable by the Boehm GC (prevents use-after-free in flush()).
+    auto * sbPtr = &sb;
+    sbPtr->defer(siblingAttrPath, new DeferredColdStore{
+        {}, sbPtr, siblingEC, parentEC,
+        std::string(siblingAttrPath), nameStr,
+        attrValue, {}, false});
 
-AttrCursor::AttrCursor(
-    ref<EvalCache> root, Parent parent, Value * value, std::optional<std::pair<AttrId, AttrValue>> && cachedValue)
-    : root(root)
-    , parent(parent)
-    , cachedValue(std::move(cachedValue))
-{
-    if (value)
-        _value = allocRootValue(value);
-}
+    try {
+        if (v.type() == nAttrs) {
+            // For derivations, eagerly force drvPath/outPath so they get
+            // stored as leaf children. Use try-catch because nixpkgs wraps
+            // these with license assertions (extendDerivation). Guard against
+            // double-wrapping via dynamic_cast (derivation.nix Value* aliasing:
+            // default.out and default share the same Value*).
+            if (cache->state.isDerivation(v)) {
+                if (auto * a = v.attrs()->get(cache->state.s.drvPath))
+                    if (a->value->isThunk()
+                        && !dynamic_cast<ExprCached*>(a->value->thunk().expr))
+                        try { cache->state.forceValue(*a->value, a->pos); }
+                        catch (EvalError &) {}
+                if (auto * a = v.attrs()->get(cache->state.s.outPath))
+                    if (a->value->isThunk()
+                        && !dynamic_cast<ExprCached*>(a->value->thunk().expr))
+                        try { cache->state.forceValue(*a->value, a->pos); }
+                        catch (EvalError &) {}
+            }
 
-AttrKey AttrCursor::getKey()
-{
-    if (!parent)
-        return {0, root->state.s.epsilon};
-    if (!parent->first->cachedValue) {
-        parent->first->cachedValue = root->db->getAttr(parent->first->getKey());
-        assert(parent->first->cachedValue);
+            // Store forced leaf children (single level, no recursion).
+            // Skip path, attrset, list — only simple scalars/strings.
+            for (auto & attr : *v.attrs()) {
+                if (attr.value->isThunk())
+                    continue;
+                auto childType = attr.value->type();
+                if (childType == nPath || childType == nAttrs || childType == nList)
+                    continue;
+
+                AttrValue childValue;
+                if (childType == nString) {
+                    NixStringContext ctx;
+                    if (attr.value->context())
+                        for (auto * elem : *attr.value->context())
+                            ctx.insert(NixStringContextElem::parse(elem->view()));
+                    childValue = string_t{std::string(attr.value->string_view()), std::move(ctx)};
+                } else if (childType == nBool) {
+                    childValue = attr.value->boolean();
+                } else if (childType == nInt) {
+                    childValue = int_t{NixInt{attr.value->integer().value}};
+                } else if (childType == nNull) {
+                    childValue = null_t{};
+                } else if (childType == nFloat) {
+                    childValue = float_t{attr.value->fpoint()};
+                } else {
+                    continue;
+                }
+
+                auto childNameStr = std::string(cache->state.symbols[attr.name]);
+                auto * childEC = new ExprCached(cache, 0, attr.name, siblingEC);
+                auto childAttrPath = childEC->storeAttrPath();
+                sbPtr->defer(childAttrPath, new DeferredColdStore{
+                    {}, sbPtr, childEC, siblingEC,
+                    std::string(childAttrPath), childNameStr,
+                    std::move(childValue), {}, false});
+            }
+
+            // Wrap remaining thunk children with ExprCached origExpr wrappers
+            // so they get cached when later forced as side effects.
+            for (auto & attr : *v.attrs()) {
+                if (attr.value->isThunk()
+                    && !dynamic_cast<ExprCached*>(attr.value->thunk().expr))
+                {
+                    auto * wrapper = new ExprCached(cache, 0, attr.name, siblingEC);
+                    wrapper->origExpr = attr.value->thunk().expr;
+                    wrapper->origEnv = attr.value->thunk().env;
+                    attr.value->mkThunk(attr.value->thunk().env, wrapper);
+                }
+            }
+        }
+    } catch (std::exception &) {
+        // Failed to process children — silently skip
     }
-    return {parent->first->cachedValue->first, parent->second};
 }
 
-Value & AttrCursor::getValue()
+Value * ExprCached::navigateToReal()
 {
-    if (!_value) {
-        if (parent) {
-            auto & vParent = parent->first->getValue();
-            root->state.forceAttrs(vParent, noPos, "while searching for an attribute");
-            auto attr = vParent.attrs()->get(parent->second);
+    // Build path with list-index metadata from parent chain
+    struct PathStep {
+        Symbol sym;
+        bool isListElement;
+    };
+    std::vector<PathStep> path;
+    for (auto * e = this; e->parentExpr; e = e->parentExpr)
+        path.push_back({e->name, e->isListElement});
+    std::reverse(path.begin(), path.end());
+
+    auto * v = cache->getOrEvaluateRoot();
+
+    // Build ExprCached chain from root to this.
+    // exprChain[i] is the parent ExprCached for siblings at path step i.
+    std::vector<ExprCached*> storeExprChain;
+    for (auto * e = this; e; e = e->parentExpr)
+        storeExprChain.push_back(e);
+    std::reverse(storeExprChain.begin(), storeExprChain.end());
+    size_t pathStep = 0;
+
+    for (auto & step : path) {
+        if (step.isListElement) {
+            // List indexing — force the value, parse index, direct access
+            cache->state.forceValue(*v, noPos);
+            if (v->type() != nList)
+                throw Error("expected a list but found %s while navigating to cached list element",
+                            showType(*v));
+
+            auto indexStr = std::string(cache->state.symbols[step.sym]);
+            size_t index = std::stoul(indexStr);
+            if (index >= v->listSize())
+                throw Error("list index %d out of bounds (size %d) during re-evaluation",
+                            index, v->listSize());
+
+            v = v->listView()[index];
+        } else {
+            // Attrset access
+            cache->state.forceAttrs(*v, noPos, "while navigating to cached attribute");
+
+            // Wrap sibling thunks and store already-forced siblings.
+            // When siblings are later forced as side effects, the wrapper's
+            // eval() stores results in the cache. Already-forced siblings
+            // are stored speculatively with parent deps inherited via inputDrvs.
+            auto * parentEC = storeExprChain[pathStep];
+            for (auto & attr : *v->attrs()) {
+                if (attr.name == step.sym)
+                    continue;
+                if (attr.value->isThunk()
+                    && !dynamic_cast<ExprCached*>(attr.value->thunk().expr))
+                {
+                    auto * wrapper = new ExprCached(cache, 0, attr.name, parentEC);
+                    wrapper->origExpr = attr.value->thunk().expr;
+                    wrapper->origEnv = attr.value->thunk().env;
+                    attr.value->mkThunk(attr.value->thunk().env, wrapper);
+                }
+                else if (!attr.value->isThunk())
+                {
+                    storeForcedSibling(parentEC, attr.name, *attr.value);
+                }
+            }
+
+            auto * attr = v->attrs()->get(step.sym);
             if (!attr)
-                throw Error("attribute '%s' is unexpectedly missing", getAttrPathStr());
-            _value = allocRootValue(attr->value);
-        } else
-            _value = allocRootValue(root->getRootValue());
-    }
-    return **_value;
-}
-
-void AttrCursor::fetchCachedValue()
-{
-    if (!cachedValue)
-        cachedValue = root->db->getAttr(getKey());
-    if (cachedValue && std::get_if<failed_t>(&cachedValue->second) && parent)
-        throw CachedEvalError(parent->first, parent->second);
-}
-
-AttrPath AttrCursor::getAttrPath() const
-{
-    if (parent) {
-        auto attrPath = parent->first->getAttrPath();
-        attrPath.push_back(parent->second);
-        return attrPath;
-    } else
-        return {};
-}
-
-AttrPath AttrCursor::getAttrPath(Symbol name) const
-{
-    auto attrPath = getAttrPath();
-    attrPath.push_back(name);
-    return attrPath;
-}
-
-std::string AttrCursor::getAttrPathStr() const
-{
-    return getAttrPath().to_string(root->state);
-}
-
-std::string AttrCursor::getAttrPathStr(Symbol name) const
-{
-    return getAttrPath(name).to_string(root->state);
-}
-
-Value & AttrCursor::forceValue()
-{
-    debug("evaluating uncached attribute '%s'", getAttrPathStr());
-
-    auto & v = getValue();
-
-    try {
-        root->state.forceValue(v, noPos);
-    } catch (EvalError &) {
-        debug("setting '%s' to failed", getAttrPathStr());
-        if (root->db)
-            cachedValue = {root->db->setFailed(getKey()), failed_t()};
-        throw;
-    }
-
-    if (root->db && (!cachedValue || std::get_if<placeholder_t>(&cachedValue->second))) {
-        if (v.type() == nString)
-            cachedValue = {root->db->setString(getKey(), v.string_view(), v.context()), string_t{v.string_view(), {}}};
-        else if (v.type() == nPath) {
-            auto path = v.path().path;
-            cachedValue = {root->db->setString(getKey(), path.abs()), string_t{path.abs(), {}}};
-        } else if (v.type() == nBool)
-            cachedValue = {root->db->setBool(getKey(), v.boolean()), v.boolean()};
-        else if (v.type() == nInt)
-            cachedValue = {root->db->setInt(getKey(), v.integer().value), int_t{v.integer()}};
-        else if (v.type() == nAttrs)
-            ; // FIXME: do something?
-        else
-            cachedValue = {root->db->setMisc(getKey()), misc_t()};
+                throw Error("attribute '%s' vanished during re-evaluation",
+                            cache->state.symbols[step.sym]);
+            v = attr->value;
+        }
+        ++pathStep;
     }
 
     return v;
 }
 
-Suggestions AttrCursor::getSuggestionsForAttr(Symbol name)
+void ExprCached::materializeValue(Value & v, const AttrValue & cached)
 {
-    auto attrNames = getAttrs();
-    StringSet strAttrNames;
-    for (auto & name : attrNames)
-        strAttrNames.insert(std::string(root->state.symbols[name]));
+    auto & st = cache->state;
 
-    return Suggestions::bestMatches(strAttrNames, root->state.symbols[name]);
+    if (auto * attrs = std::get_if<std::vector<Symbol>>(&cached)) {
+        auto bindings = st.buildBindings(attrs->size());
+        for (auto & childName : *attrs) {
+            auto * childVal = st.allocValue();
+            auto * child = new ExprCached(cache, 0, childName, this);
+            child->tracePath = std::nullopt; // Will be resolved on access
+            childVal->mkThunk(&st.baseEnv, child);
+            bindings.insert(childName, childVal, noPos);
+        }
+        v.mkAttrs(bindings.finish());
+    } else if (auto * s = std::get_if<string_t>(&cached)) {
+        if (s->second.empty())
+            v.mkString(s->first, st.mem);
+        else
+            v.mkString(s->first, s->second, st.mem);
+    } else if (auto * b = std::get_if<bool>(&cached)) {
+        v.mkBool(*b);
+    } else if (auto * i = std::get_if<int_t>(&cached)) {
+        v.mkInt(i->x);
+    } else if (auto * p = std::get_if<path_t>(&cached)) {
+        v.mkPath(st.rootPath(CanonPath(p->path)), st.mem);
+    } else if (auto * l = std::get_if<std::vector<std::string>>(&cached)) {
+        auto list = st.buildList(l->size());
+        for (size_t i = 0; i < l->size(); i++) {
+            auto * elemVal = st.allocValue();
+            elemVal->mkString((*l)[i], st.mem);
+            list[i] = elemVal;
+        }
+        v.mkList(list);
+    } else if (std::get_if<null_t>(&cached)) {
+        v.mkNull();
+    } else if (auto * f = std::get_if<float_t>(&cached)) {
+        v.mkFloat(f->x);
+    } else if (auto * lt = std::get_if<list_t>(&cached)) {
+        auto list = st.buildList(lt->size);
+        for (size_t i = 0; i < lt->size; i++) {
+            auto * elemVal = st.allocValue();
+            auto sym = st.symbols.create(std::to_string(i));
+            auto * child = new ExprCached(cache, 0, sym, this, /*isListElement=*/true);
+            elemVal->mkThunk(&st.baseEnv, child);
+            list[i] = elemVal;
+        }
+        v.mkList(list);
+    } else {
+        // misc_t, failed_t, missing_t, placeholder_t — go cold
+        evaluateCold(v);
+    }
 }
 
-std::shared_ptr<AttrCursor> AttrCursor::maybeGetAttr(Symbol name)
+void ExprCached::evaluateCold(Value & v)
 {
-    if (root->db) {
-        fetchCachedValue();
+    FileLoadTracker tracker;
 
-        if (cachedValue) {
-            if (auto attrs = std::get_if<std::vector<Symbol>>(&cachedValue->second)) {
-                for (auto & attr : *attrs)
-                    if (attr == name)
-                        return std::make_shared<AttrCursor>(root, std::make_pair(ref(shared_from_this()), attr));
-                return nullptr;
-            } else if (std::get_if<placeholder_t>(&cachedValue->second)) {
-                auto attr = root->db->getAttr({cachedValue->first, name});
-                if (attr) {
-                    if (std::get_if<missing_t>(&attr->second))
-                        return nullptr;
-                    else if (std::get_if<failed_t>(&attr->second))
-                        throw CachedEvalError(ref(shared_from_this()), name);
-                    else
-                        return std::make_shared<AttrCursor>(
-                            root, std::make_pair(ref(shared_from_this()), name), nullptr, std::move(attr));
+    Value * target;
+    if (origExpr) {
+        target = cache->state.allocValue();
+        origExpr->eval(cache->state, *origEnv, *target);
+    } else {
+        if (parentExpr) {
+            SuspendFileLoadTracker suspend;
+            target = navigateToReal();
+        } else {
+            target = navigateToReal();
+        }
+
+        // navigateToReal() may have wrapped this value with ExprCached
+        // during a prior sibling wrapping pass. Unwrap it so forceValue
+        // evaluates the original expression directly, capturing deps in
+        // THIS tracker rather than in the wrapper's nested tracker.
+        if (target->isThunk()) {
+            if (auto * ec = dynamic_cast<ExprCached*>(target->thunk().expr)) {
+                if (ec->origExpr) {
+                    Expr * expr = ec->origExpr;
+                    Env * oenv = ec->origEnv;
+                    target = cache->state.allocValue();
+                    expr->eval(cache->state, *oenv, *target);
                 }
-                // Incomplete attrset, so need to fall thru and
-                // evaluate to see whether 'name' exists
-            } else
-                return nullptr;
-            // error<TypeError>("'%s' is not an attribute set", getAttrPathStr()).debugThrow();
+            }
         }
     }
 
-    auto & v = forceValue();
+    auto & st = cache->state;
 
-    if (v.type() != nAttrs)
-        return nullptr;
-    // error<TypeError>("'%s' is not an attribute set", getAttrPathStr()).debugThrow();
+    try {
+        st.forceValue(*target, noPos);
 
-    auto attr = v.attrs()->get(name);
+        // For origExpr wrappers: exit the blackhole on v early.
+        //
+        // v (the Value* in the real evaluation tree, e.g. pkgs.perl) is
+        // currently blackholed from the caller's forceValue(v). The
+        // derivationStrict call below can trigger deep dependency chains
+        // through the nixpkgs fixed-point (self), e.g.:
+        //   perl.derivationStrict → libxcrypt → buildPackages.perl → self.perl
+        // If self.perl is still blackholed, this causes infinite recursion.
+        //
+        // In normal (non-cached) evaluation, the blackhole exits as soon as
+        // the thunk expression produces a result — before derivationStrict
+        // runs. We replicate that by setting v = *target now. v will be
+        // overwritten with the final materialized value at the end.
+        if (origExpr)
+            v = *target;
 
-    if (!attr) {
-        if (root->db) {
-            if (!cachedValue)
-                cachedValue = {root->db->setPlaceholder(getKey()), placeholder_t()};
-            root->db->setMissing({cachedValue->first, name});
+        // derivation.nix uses `let strict = derivationStrict drvAttrs` lazily,
+        // so merely forcing the derivation attrset to WHNF does NOT call
+        // derivationStrict. Force drvPath to trigger it, ensuring deps from
+        // env var processing (e.g., readFile via buildCommand string
+        // interpolation) are captured in this attribute's dep set.
+        //
+        // Only do this for the main navigation target (!origExpr). For
+        // origExpr wrappers (side-effect siblings wrapped by navigateToReal),
+        // skip eager drvPath forcing: it triggers derivationStrict chains
+        // that don't exist in normal (non-cached) evaluation, causing
+        // infinite recursion in nixpkgs' fixed-point package sets where
+        // buildPackages = self on native builds. Side-effect siblings will
+        // have derivationStrict triggered naturally when string coercion
+        // needs outPath, matching normal evaluation order.
+        if (!origExpr && target->type() == nAttrs && st.isDerivation(*target)) {
+            if (auto * dp = target->attrs()->get(st.s.drvPath))
+                st.forceValue(*dp->value, noPos);
         }
-        return nullptr;
-    }
+    } catch (EvalError &) {
+        debug("setting '%s' to failed (cold path)", attrPathStr());
+        if (cache->storeBackend) {
+            auto attrPath = storeAttrPath();
+            auto nameStr = std::string(st.symbols[name]);
+            auto collectedDeps = tracker.collectDeps();
 
-    std::optional<std::pair<AttrId, AttrValue>> cachedValue2;
-    if (root->db) {
-        if (!cachedValue)
-            cachedValue = {root->db->setPlaceholder(getKey()), placeholder_t()};
-        cachedValue2 = {root->db->setPlaceholder({cachedValue->first, name}), placeholder_t()};
-    }
+            // Filter ParentContext
+            std::vector<Dep> directDeps;
+            for (auto & dep : collectedDeps)
+                if (dep.type != DepType::ParentContext)
+                    directDeps.push_back(dep);
 
-    return make_ref<AttrCursor>(
-        root, std::make_pair(ref(shared_from_this()), name), attr->value, std::move(cachedValue2));
-}
+            auto * sb = cache->storeBackend.get();
+            auto safeName = nameStr.empty() ? std::string("root") : nameStr;
+            bool isRoot = !parentExpr;
+            ExprCached * self = this;
+            ExprCached * parent = parentExpr;
 
-std::shared_ptr<AttrCursor> AttrCursor::maybeGetAttr(std::string_view name)
-{
-    return maybeGetAttr(root->state.symbols.create(name));
-}
-
-ref<AttrCursor> AttrCursor::getAttr(Symbol name)
-{
-    auto p = maybeGetAttr(name);
-    if (!p)
-        throw Error("attribute '%s' does not exist", getAttrPathStr(name));
-    return ref(p);
-}
-
-ref<AttrCursor> AttrCursor::getAttr(std::string_view name)
-{
-    return getAttr(root->state.symbols.create(name));
-}
-
-OrSuggestions<ref<AttrCursor>> AttrCursor::findAlongAttrPath(const AttrPath & attrPath)
-{
-    auto res = shared_from_this();
-    for (auto & attr : attrPath) {
-        auto child = res->maybeGetAttr(attr);
-        if (!child) {
-            auto suggestions = res->getSuggestionsForAttr(attr);
-            return OrSuggestions<ref<AttrCursor>>::failed(suggestions);
+            sb->defer(attrPath, new DeferredColdStore{
+                {}, sb, self, parent,
+                std::string(attrPath), safeName,
+                failed_t{}, std::move(directDeps), isRoot});
         }
-        res = child;
+        throw;
     }
-    return ref(res);
-}
 
-std::string AttrCursor::getString()
-{
-    if (root->db) {
-        fetchCachedValue();
-        if (cachedValue && !std::get_if<placeholder_t>(&cachedValue->second)) {
-            if (auto s = std::get_if<string_t>(&cachedValue->second)) {
-                debug("using cached string attribute '%s'", getAttrPathStr());
-                return s->first;
-            } else
-                root->state.error<TypeError>("'%s' is not a string", getAttrPathStr()).debugThrow();
+    if (cache->storeBackend) {
+        auto attrPath = storeAttrPath();
+        auto nameStr = std::string(st.symbols[name]);
+        auto collectedDeps = tracker.collectDeps();
+
+        // Filter ParentContext — parent dep inheritance is via trace references
+        std::vector<Dep> directDeps;
+        for (auto & dep : collectedDeps)
+            if (dep.type != DepType::ParentContext)
+                directDeps.push_back(dep);
+
+        // Build the AttrValue for serialization
+        AttrValue attrValue;
+        if (target->type() == nString) {
+            NixStringContext ctx;
+            if (target->context()) {
+                for (auto * elem : *target->context())
+                    ctx.insert(NixStringContextElem::parse(elem->view()));
+            }
+            attrValue = string_t{std::string(target->string_view()), std::move(ctx)};
+        } else if (target->type() == nBool) {
+            attrValue = target->boolean();
+        } else if (target->type() == nInt) {
+            attrValue = int_t{NixInt{target->integer().value}};
+        } else if (target->type() == nNull) {
+            attrValue = null_t{};
+        } else if (target->type() == nFloat) {
+            attrValue = float_t{target->fpoint()};
+        } else if (target->type() == nPath) {
+            attrValue = path_t{target->path().path.abs()};
+        } else if (target->type() == nAttrs) {
+            std::vector<Symbol> childNames;
+            for (auto & attr : *target->attrs())
+                childNames.push_back(attr.name);
+            sortChildNames(childNames);
+            attrValue = childNames;
+        } else if (target->type() == nList) {
+            bool allStrings = true;
+            for (size_t i = 0; i < target->listSize(); i++) {
+                st.forceValue(*target->listView()[i], noPos);
+                if (target->listView()[i]->type() != nString) { allStrings = false; break; }
+            }
+            if (allStrings) {
+                std::vector<std::string> strs;
+                for (size_t i = 0; i < target->listSize(); i++)
+                    strs.push_back(std::string(target->listView()[i]->c_str()));
+                attrValue = strs;
+            } else {
+                attrValue = list_t{target->listSize()};
+            }
+        } else {
+            attrValue = misc_t{};
         }
-    }
 
-    auto & v = forceValue();
+        {
+            auto * sb = cache->storeBackend.get();
+            auto safeName = nameStr.empty() ? std::string("root") : nameStr;
+            bool isRoot = !parentExpr;
+            ExprCached * self = this;
+            ExprCached * parent = parentExpr;
 
-    if (v.type() != nString && v.type() != nPath)
-        root->state.error<TypeError>("'%s' is not a string but %s", getAttrPathStr(), showType(v)).debugThrow();
+            // Copy for lambda; original stays on stack for materializeValue
+            auto deferredValue = attrValue;
+            auto deferredDeps = std::move(directDeps);
 
-    return v.type() == nString ? std::string(v.string_view()) : v.path().to_string();
-}
+            sb->defer(attrPath, new DeferredColdStore{
+                {}, sb, self, parent,
+                std::string(attrPath), safeName,
+                std::move(deferredValue), std::move(deferredDeps), isRoot});
+        }
 
-string_t AttrCursor::getStringWithContext()
-{
-    if (root->db) {
-        fetchCachedValue();
-        if (cachedValue && !std::get_if<placeholder_t>(&cachedValue->second)) {
-            if (auto s = std::get_if<string_t>(&cachedValue->second)) {
-                bool valid = true;
-                for (auto & c : s->second) {
-                    const StorePath & path = std::visit(
-                        overloaded{
-                            [&](const NixStringContextElem::DrvDeep & d) -> const StorePath & { return d.drvPath; },
-                            [&](const NixStringContextElem::Built & b) -> const StorePath & {
-                                return b.drvPath->getBaseStorePath();
-                            },
-                            [&](const NixStringContextElem::Opaque & o) -> const StorePath & { return o.path; },
-                        },
-                        c.raw);
-                    if (!root->state.store->isValidPath(path)) {
-                        valid = false;
-                        break;
+        // Store forced scalar children of derivation targets before
+        // materializeValue/ExprOrigChild replaces them with thunks.
+        // evaluateCold eagerly forces drvPath for derivation targets (the
+        // !origExpr && isDerivation guard above), but materializeValue and
+        // ExprOrigChild replace ALL children with thunks, losing the forced
+        // values. Only apply to derivations — non-derivation attrsets (e.g.,
+        // flake inputs) must NOT be cached as scalars because their warm path
+        // would bypass SourceAccessor setup (AllowListSourceAccessor).
+        // Only store scalars — NOT attrsets, which would trigger thunk
+        // wrapping in storeForcedSibling that modifies the real tree.
+        if (!origExpr && target->type() == nAttrs && cache->state.isDerivation(*target)) {
+            for (auto & attr : *target->attrs()) {
+                if (!attr.value->isThunk()) {
+                    auto t = attr.value->type();
+                    if (t == nString || t == nBool || t == nInt || t == nNull || t == nFloat) {
+                        storeForcedSibling(this, attr.name, *attr.value);
                     }
                 }
-                if (valid) {
-                    debug("using cached string attribute '%s'", getAttrPathStr());
-                    return *s;
+            }
+        }
+
+        if (origExpr && std::holds_alternative<std::vector<Symbol>>(attrValue)) {
+            // origExpr wrapper with attrset result: create children
+            // with ExprOrigChild to maintain cache chain WITHOUT
+            // navigateToReal. materializeValue would create
+            // ExprCached children without origExpr in the real tree,
+            // causing subsequent navigateToReal calls to hit blackholed
+            // Values (infinite recursion). ExprOrigChild resolves
+            // children via the parent's origExpr instead.
+            //
+            // Pre-fill SharedParentResult with already-evaluated target
+            // so ExprOrigChild doesn't re-evaluate the parent.
+            auto & childNames = std::get<std::vector<Symbol>>(attrValue);
+            auto * shared = new SharedParentResult();
+            shared->value = target;
+            auto bindings = cache->state.buildBindings(childNames.size());
+            for (auto & childName : childNames) {
+                auto * childVal = cache->state.allocValue();
+                auto * wrapper = new ExprCached(cache, 0, childName, this);
+                wrapper->origExpr = new ExprOrigChild(origExpr, origEnv, childName, shared);
+                wrapper->origEnv = origEnv;
+                childVal->mkThunk(&cache->state.baseEnv, wrapper);
+                bindings.insert(childName, childVal, noPos);
+            }
+            v.mkAttrs(bindings.finish());
+            return;
+        }
+
+        if (origExpr) {
+            // origExpr with non-attrset result: return real value
+            v = *target;
+        } else if (std::holds_alternative<misc_t>(attrValue)
+                || std::holds_alternative<missing_t>(attrValue)
+                || std::holds_alternative<placeholder_t>(attrValue)) {
+            // Non-materializable types: use real value directly.
+            // materializeValue for these calls evaluateCold(v) which
+            // would create infinite recursion.
+            v = *target;
+        } else {
+            // Main navigation path: materialize ExprCached children to
+            // maintain cache chain for deeper attribute access.
+            materializeValue(v, attrValue);
+        }
+        return;
+    } else {
+        v = *target;
+    }
+}
+
+void ExprCached::eval(EvalState & state, Env & env, Value & v)
+{
+    if (!cache->storeBackend) {
+        // No cache backend — evaluate directly
+        if (origExpr) {
+            origExpr->eval(state, *origEnv, v);
+            state.forceValue(v, noPos);
+        } else {
+            auto * target = navigateToReal();
+            state.forceValue(*target, noPos);
+            v = *target;
+        }
+        return;
+    }
+
+    auto & sb = *cache->storeBackend;
+
+    // Try warm path. parentTracePath() (defined at line ~117) returns
+    // the parent ExprCached's tracePath — set synchronously when the parent
+    // is warm-served or recovered, before eval() returns. For root attrs
+    // (no parent), returns nullopt → Phase 2 recovery skipped.
+    // This enables Phase 2 parent-aware recovery in EvalCacheStore::recovery().
+    auto attrPath = storeAttrPath();
+    auto warmResult = sb.warmPath(attrPath, cache->inputAccessors, cache->state, parentTracePath());
+
+    if (warmResult) {
+        auto & [cachedValue, traceP] = *warmResult;
+        tracePath = traceP;
+
+        // Handle failed values — reproduce error
+        if (std::get_if<failed_t>(&cachedValue)) {
+            evaluateCold(v);
+            return;
+        }
+
+        // Non-materializable types (functions, externals): re-evaluate.
+        // materializeValue for these calls evaluateCold → infinite recursion.
+        if (std::get_if<misc_t>(&cachedValue)
+            || std::get_if<missing_t>(&cachedValue)
+            || std::get_if<placeholder_t>(&cachedValue)) {
+            evaluateCold(v);
+            return;
+        }
+
+        nrEvalCacheHits++;
+        debug("eval cache hit for '%s'", attrPathStr());
+
+        // For origExpr wrappers: serve leaf or FullAttrs
+        if (origExpr) {
+            if (isLeafCached(cachedValue)) {
+                materializeValue(v, cachedValue);
+                replayDepsToTracker(traceP);
+                return;
+            }
+            if (auto * attrs = std::get_if<std::vector<Symbol>>(&cachedValue)) {
+                auto * shared = new SharedParentResult();
+                auto bindings = cache->state.buildBindings(attrs->size());
+                for (auto & childName : *attrs) {
+                    auto * childVal = cache->state.allocValue();
+                    auto * wrapper = new ExprCached(cache, 0, childName, this);
+                    wrapper->origExpr = new ExprOrigChild(origExpr, origEnv, childName, shared);
+                    wrapper->origEnv = origEnv;
+                    childVal->mkThunk(&cache->state.baseEnv, wrapper);
+                    bindings.insert(childName, childVal, noPos);
                 }
-            } else
-                root->state.error<TypeError>("'%s' is not a string", getAttrPathStr()).debugThrow();
+                v.mkAttrs(bindings.finish());
+                replayDepsToTracker(traceP);
+                return;
+            }
+            // list_t or other → cold
+        } else {
+            // Non-origExpr: materialize value
+            materializeValue(v, cachedValue);
+            replayDepsToTracker(traceP);
+            return;
         }
     }
 
-    auto & v = forceValue();
-
-    if (v.type() == nString) {
-        NixStringContext context;
-        copyContext(v, context);
-        return {std::string{v.string_view()}, std::move(context)};
-    } else if (v.type() == nPath)
-        return {v.path().to_string(), {}};
-    else
-        root->state.error<TypeError>("'%s' is not a string but %s", getAttrPathStr(), showType(v)).debugThrow();
+    // Cold path
+    nrEvalCacheMisses++;
+    debug("eval cache miss for '%s'", attrPathStr());
+    evaluateCold(v);
 }
 
-bool AttrCursor::getBool()
+// ── EvalCache public API ─────────────────────────────────────────────
+
+static std::shared_ptr<EvalCacheStore> makeStoreBackend(
+    Store & store, const Hash & fingerprint, SymbolTable & symbols)
 {
-    if (root->db) {
-        fetchCachedValue();
-        if (cachedValue && !std::get_if<placeholder_t>(&cachedValue->second)) {
-            if (auto b = std::get_if<bool>(&cachedValue->second)) {
-                debug("using cached Boolean attribute '%s'", getAttrPathStr());
-                return *b;
-            } else
-                root->state.error<TypeError>("'%s' is not a Boolean", getAttrPathStr()).debugThrow();
+    // Compute context hash from fingerprint (first 8 bytes as int64)
+    int64_t contextHash;
+    std::memcpy(&contextHash, fingerprint.hash, sizeof(contextHash));
+
+    return std::make_shared<EvalCacheStore>(store, symbols, contextHash);
+}
+
+EvalCache::EvalCache(
+    std::optional<std::reference_wrapper<const Hash>> useCache,
+    EvalState & state,
+    RootLoader rootLoader,
+    std::map<std::string, SourcePath> inputAccessors)
+    : state(state)
+    , rootLoader(rootLoader)
+    , inputAccessors(std::move(inputAccessors))
+{
+    if (useCache) {
+        try {
+            storeBackend = makeStoreBackend(*state.store, *useCache, state.symbols);
+        } catch (...) {
+            // If we can't create the cache (e.g., unwritable cache dir in
+            // sandbox), degrade gracefully to uncached mode.
+            ignoreExceptionExceptInterrupt();
         }
     }
-
-    auto & v = forceValue();
-
-    if (v.type() != nBool)
-        root->state.error<TypeError>("'%s' is not a Boolean", getAttrPathStr()).debugThrow();
-
-    return v.boolean();
 }
 
-NixInt AttrCursor::getInt()
+Value * EvalCache::getOrEvaluateRoot()
 {
-    if (root->db) {
-        fetchCachedValue();
-        if (cachedValue && !std::get_if<placeholder_t>(&cachedValue->second)) {
-            if (auto i = std::get_if<int_t>(&cachedValue->second)) {
-                debug("using cached integer attribute '%s'", getAttrPathStr());
-                return i->x;
-            } else
-                root->state.error<TypeError>("'%s' is not an integer", getAttrPathStr()).debugThrow();
-        }
+    if (!realRoot) {
+        debug("getting root value via rootLoader");
+        realRoot = allocRootValue(rootLoader());
     }
-
-    auto & v = forceValue();
-
-    if (v.type() != nInt)
-        root->state.error<TypeError>("'%s' is not an integer", getAttrPathStr()).debugThrow();
-
-    return v.integer();
+    return *realRoot;
 }
 
-std::vector<std::string> AttrCursor::getListOfStrings()
+Value * EvalCache::getRootValue()
 {
-    if (root->db) {
-        fetchCachedValue();
-        if (cachedValue && !std::get_if<placeholder_t>(&cachedValue->second)) {
-            if (auto l = std::get_if<std::vector<std::string>>(&cachedValue->second)) {
-                debug("using cached list of strings attribute '%s'", getAttrPathStr());
-                return *l;
-            } else
-                root->state.error<TypeError>("'%s' is not a list of strings", getAttrPathStr()).debugThrow();
-        }
+    if (!value) {
+        auto * v = state.allocValue();
+        v->mkThunk(&state.baseEnv, new ExprCached(this, 0, state.s.epsilon, nullptr));
+        value = allocRootValue(v);
     }
-
-    debug("evaluating uncached attribute '%s'", getAttrPathStr());
-
-    auto & v = getValue();
-    root->state.forceValue(v, noPos);
-
-    if (v.type() != nList)
-        root->state.error<TypeError>("'%s' is not a list", getAttrPathStr()).debugThrow();
-
-    std::vector<std::string> res;
-
-    for (auto elem : v.listView())
-        res.push_back(
-            std::string(root->state.forceStringNoCtx(*elem, noPos, "while evaluating an attribute for caching")));
-
-    if (root->db)
-        cachedValue = {root->db->setListOfStrings(getKey(), res), res};
-
-    return res;
-}
-
-std::vector<Symbol> AttrCursor::getAttrs()
-{
-    if (root->db) {
-        fetchCachedValue();
-        if (cachedValue && !std::get_if<placeholder_t>(&cachedValue->second)) {
-            if (auto attrs = std::get_if<std::vector<Symbol>>(&cachedValue->second)) {
-                debug("using cached attrset attribute '%s'", getAttrPathStr());
-                return *attrs;
-            } else
-                root->state.error<TypeError>("'%s' is not an attribute set", getAttrPathStr()).debugThrow();
-        }
-    }
-
-    auto & v = forceValue();
-
-    if (v.type() != nAttrs)
-        root->state.error<TypeError>("'%s' is not an attribute set", getAttrPathStr()).debugThrow();
-
-    std::vector<Symbol> attrs;
-    for (auto & attr : *getValue().attrs())
-        attrs.push_back(attr.name);
-    std::sort(attrs.begin(), attrs.end(), [&](Symbol a, Symbol b) {
-        std::string_view sa = root->state.symbols[a], sb = root->state.symbols[b];
-        return sa < sb;
-    });
-
-    if (root->db)
-        cachedValue = {root->db->setAttrs(getKey(), attrs), attrs};
-
-    return attrs;
-}
-
-bool AttrCursor::isDerivation()
-{
-    auto aType = maybeGetAttr("type");
-    return aType && aType->getString() == "derivation";
-}
-
-StorePath AttrCursor::forceDerivation()
-{
-    auto aDrvPath = getAttr(root->state.s.drvPath);
-    auto drvPath = root->state.store->parseStorePath(aDrvPath->getString());
-    drvPath.requireDerivation();
-    if (!root->state.store->isValidPath(drvPath) && !settings.readOnlyMode) {
-        /* The eval cache contains 'drvPath', but the actual path has
-           been garbage-collected. So force it to be regenerated. */
-        aDrvPath->forceValue();
-        if (!root->state.store->isValidPath(drvPath))
-            throw Error(
-                "don't know how to recreate store derivation '%s'!", root->state.store->printStorePath(drvPath));
-    }
-    return drvPath;
+    return *value;
 }
 
 } // namespace nix::eval_cache

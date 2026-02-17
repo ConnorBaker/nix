@@ -5,6 +5,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/expr/print.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -88,11 +89,20 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
             [&](this const auto & recurse, Value & v, const PosIdx pos, const std::filesystem::path & path) -> void {
                 state->forceValue(v, pos);
                 if (v.type() == nString)
-                    // FIXME: disallow strings with contexts?
                     writeFile(path.string(), v.string_view());
                 else if (v.type() == nAttrs) {
+                    // Derivations should be coerced to outPath, not enumerated
+                    if (state->isDerivation(v)) {
+                        auto * outPath = v.attrs()->get(state->s.outPath);
+                        if (outPath) {
+                            state->forceValue(*outPath->value, outPath->pos);
+                            if (outPath->value->type() == nString) {
+                                writeFile(path.string(), outPath->value->string_view());
+                                return;
+                            }
+                        }
+                    }
                     [[maybe_unused]] bool directoryCreated = std::filesystem::create_directory(path);
-                    // Directory should not already exist
                     assert(directoryCreated);
                     for (auto & attr : *v.attrs()) {
                         std::string_view name = state->symbols[attr.name];
@@ -110,21 +120,15 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
                     state->error<TypeError>("value at '%s' is not a string or an attribute set", state->positions[pos])
                         .debugThrow();
             }(*v, pos, *writeTo);
-        }
-
-        else if (raw) {
+        } else if (raw) {
             logger->stop();
             writeFull(
                 getStandardOutput(),
                 *state->coerceToString(noPos, *v, context, "while generating the eval command output"));
-        }
-
-        else if (json) {
+        } else if (json) {
             printJSON(printValueAsJSON(*state, true, *v, pos, context, false));
-        }
-
-        else {
-            logger->cout("%s", ValuePrinter(*state, *v, PrintOptions{.force = true, .derivationPaths = true}));
+        } else {
+            logger->cout("%s", ValuePrinter(*state, *v, PrintOptions{.force = true, .derivationPaths = true, .errors = ErrorPrintBehavior::ThrowTopLevel}));
         }
     }
 };

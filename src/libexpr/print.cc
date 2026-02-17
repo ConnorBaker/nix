@@ -639,6 +639,7 @@ public:
         ValuesSeen seen;
         print(v, 0);
     }
+
 };
 
 void printValue(EvalState & state, std::ostream & output, Value & v, PrintOptions options)

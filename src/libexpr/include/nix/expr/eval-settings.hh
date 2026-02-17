@@ -265,6 +265,16 @@ struct EvalSettings : Config
             Intermediate results are not cached.
         )"};
 
+    Setting<bool> verifyEvalCache{
+        this,
+        false,
+        "verify-eval-cache",
+        R"(
+            When enabled, every eval cache warm-path hit is verified by also
+            evaluating the cold path and comparing results. Mismatches are
+            logged as warnings. Intended for debugging, not production use.
+        )"};
+
     Setting<bool> ignoreExceptionsDuringTry{
         this,
         false,

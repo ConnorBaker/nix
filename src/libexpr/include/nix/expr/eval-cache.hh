@@ -5,49 +5,15 @@
 #include "nix/util/hash.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/attr-path.hh"
+#include "nix/expr/file-load-tracker.hh"
 
 #include <functional>
+#include <map>
 #include <variant>
 
 namespace nix::eval_cache {
 
-struct AttrDb;
-class AttrCursor;
-
-struct CachedEvalError : EvalError
-{
-    const ref<AttrCursor> cursor;
-    const Symbol attr;
-
-    CachedEvalError(ref<AttrCursor> cursor, Symbol attr);
-
-    /**
-     * Evaluate this attribute, which should result in a regular
-     * `EvalError` exception being thrown.
-     */
-    [[noreturn]]
-    void force();
-};
-
-class EvalCache : public std::enable_shared_from_this<EvalCache>
-{
-    friend class AttrCursor;
-    friend struct CachedEvalError;
-
-    std::shared_ptr<AttrDb> db;
-    EvalState & state;
-    typedef std::function<Value *()> RootLoader;
-    RootLoader rootLoader;
-    RootValue value;
-
-    Value * getRootValue();
-
-public:
-
-    EvalCache(std::optional<std::reference_wrapper<const Hash>> useCache, EvalState & state, RootLoader rootLoader);
-
-    ref<AttrCursor> getRoot();
-};
+// ── Shared types (used by EvalCacheStore, ExprCached, serialization) ──
 
 enum AttrType {
     Placeholder = 0,
@@ -59,24 +25,22 @@ enum AttrType {
     Bool = 6,
     ListOfStrings = 7,
     Int = 8,
+    Path = 9,
+    Null = 10,
+    Float = 11,
+    List = 12,
 };
 
-struct placeholder_t
-{};
+struct placeholder_t {};
+struct missing_t {};
+struct misc_t {};
+struct failed_t {};
 
-struct missing_t
-{};
-
-struct misc_t
-{};
-
-struct failed_t
-{};
-
-struct int_t
-{
-    NixInt x;
-};
+struct int_t { NixInt x; };
+struct path_t { std::string path; };
+struct null_t {};
+struct float_t { double x; };
+struct list_t { size_t size; };
 
 typedef uint64_t AttrId;
 typedef std::pair<AttrId, Symbol> AttrKey;
@@ -91,84 +55,70 @@ typedef std::variant<
     failed_t,
     bool,
     int_t,
-    std::vector<std::string>>
+    std::vector<std::string>,
+    path_t,
+    null_t,
+    float_t,
+    list_t>
     AttrValue;
 
-class AttrCursor : public std::enable_shared_from_this<AttrCursor>
+// ── EvalCache ────────────────────────────────────────────────────────
+
+struct EvalCacheStore;
+struct ExprCached;
+
+class EvalCache : public std::enable_shared_from_this<EvalCache>
 {
-    friend class EvalCache;
-    friend struct CachedEvalError;
-
-    ref<EvalCache> root;
-    using Parent = std::optional<std::pair<ref<AttrCursor>, Symbol>>;
-    Parent parent;
-    RootValue _value;
-    std::optional<std::pair<AttrId, AttrValue>> cachedValue;
-
-    AttrKey getKey();
-
-    Value & getValue();
+    friend struct ExprCached;
 
     /**
-     * If `cachedValue` is unset, try to initialize it from the
-     * database. It is not an error if it does not exist. Throw a
-     * `CachedEvalError` exception if it does exist but has type
-     * `AttrType::Failed`.
+     * Store-based eval cache backend.
      */
-    void fetchCachedValue();
+    std::shared_ptr<EvalCacheStore> storeBackend;
+
+    EvalState & state;
+    typedef std::function<Value *()> RootLoader;
+    RootLoader rootLoader;
+    RootValue value;
+    RootValue realRoot;
+
+    /**
+     * Maps flake input names to their source paths (accessor + base path).
+     * Used for validating cached dep hashes against current file content.
+     */
+    std::map<std::string, SourcePath> inputAccessors;
 
 public:
 
-    AttrCursor(
-        ref<EvalCache> root,
-        Parent parent,
-        Value * value = nullptr,
-        std::optional<std::pair<AttrId, AttrValue>> && cachedValue = {});
-
-    AttrPath getAttrPath() const;
-
-    AttrPath getAttrPath(Symbol name) const;
-
-    std::string getAttrPathStr() const;
-
-    std::string getAttrPathStr(Symbol name) const;
-
-    Suggestions getSuggestionsForAttr(Symbol name);
-
-    std::shared_ptr<AttrCursor> maybeGetAttr(Symbol name);
-
-    std::shared_ptr<AttrCursor> maybeGetAttr(std::string_view name);
-
-    ref<AttrCursor> getAttr(Symbol name);
-
-    ref<AttrCursor> getAttr(std::string_view name);
+    EvalCache(
+        std::optional<std::reference_wrapper<const Hash>> useCache,
+        EvalState & state,
+        RootLoader rootLoader,
+        std::map<std::string, SourcePath> inputAccessors = {});
 
     /**
-     * Get an attribute along a chain of attrsets. Note that this does
-     * not auto-call functors or functions.
+     * Get the real root value via rootLoader, bypassing the cache.
+     * Used to regenerate GC'd .drv files by forcing fresh evaluation.
      */
-    OrSuggestions<ref<AttrCursor>> findAlongAttrPath(const AttrPath & attrPath);
-
-    std::string getString();
-
-    string_t getStringWithContext();
-
-    bool getBool();
-
-    NixInt getInt();
-
-    std::vector<std::string> getListOfStrings();
-
-    std::vector<Symbol> getAttrs();
-
-    bool isDerivation();
-
-    Value & forceValue();
+    Value * getOrEvaluateRoot();
 
     /**
-     * Force creation of the .drv file in the Nix store.
+     * Get the root value backed by ExprCached thunks.
+     * On warm cache: returns a value materialized from the store.
+     * On cold cache: returns a thunk that evaluates via rootLoader.
      */
-    StorePath forceDerivation();
+    Value * getRootValue();
 };
+
+/**
+ * Eval cache performance counters, active when NIX_SHOW_STATS is set.
+ */
+extern Counter nrEvalCacheHits;
+extern Counter nrEvalCacheMisses;
+extern Counter nrDepValidations;
+extern Counter nrDepValidationsPassed;
+extern Counter nrDepValidationsFailed;
+extern Counter nrDepsChecked;
+extern Counter nrCacheVerificationFailures;
 
 } // namespace nix::eval_cache
