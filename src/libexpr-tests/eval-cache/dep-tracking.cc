@@ -1,5 +1,5 @@
 #include "helpers.hh"
-#include "nix/expr/eval-cache-store.hh"
+#include "nix/expr/eval-cache-db.hh"
 #include "nix/expr/stat-hash-cache.hh"
 
 #include <gtest/gtest.h>

@@ -13,7 +13,7 @@
 
 namespace nix::eval_cache {
 
-// ── Shared types (used by EvalCacheStore, ExprCached, serialization) ──
+// ── Shared types (used by EvalCacheDb, ExprCached, serialization) ────
 
 enum AttrType {
     Placeholder = 0,
@@ -64,7 +64,7 @@ typedef std::variant<
 
 // ── EvalCache ────────────────────────────────────────────────────────
 
-struct EvalCacheStore;
+struct EvalCacheDb;
 struct ExprCached;
 
 class EvalCache : public std::enable_shared_from_this<EvalCache>
@@ -72,9 +72,9 @@ class EvalCache : public std::enable_shared_from_this<EvalCache>
     friend struct ExprCached;
 
     /**
-     * Store-based eval cache backend.
+     * SQLite-based eval cache backend.
      */
-    std::shared_ptr<EvalCacheStore> storeBackend;
+    std::shared_ptr<EvalCacheDb> dbBackend;
 
     EvalState & state;
     typedef std::function<Value *()> RootLoader;

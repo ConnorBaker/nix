@@ -9,7 +9,7 @@ source ./common.sh
 requireGit
 
 clearStoreIndex() {
-    rm -f "$TEST_HOME/.cache/nix/eval-index-v2.sqlite"
+    rm -f "$TEST_HOME/.cache/nix/eval-cache-v1.sqlite"
 }
 
 ###############################################################################

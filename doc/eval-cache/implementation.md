@@ -12,8 +12,8 @@ goals) and `upstreaming.md` (commit cleanup plan).
 
 The eval cache was developed across ~48 sessions on the
 `vibe-coding/file-based-cas-eval-cache` branch. The implementation went through
-several major architectural phases before converging on the current CAS blob
-trace design.
+several major architectural phases, moving from SQLite to CAS blob traces and
+ultimately back to a pure SQLite backend.
 
 ### Phase 1: Foundation (Session 1–3)
 
@@ -102,7 +102,8 @@ probe on miss).
 ### Phase 6–7: Schema Redesign (Session 19–22)
 
 *(These phases applied to an intermediate SQLite-based design that was later
-replaced by CAS blob traces. Lessons learned still informed the final design.)*
+replaced by CAS blob traces, and then replaced again by a pure SQLite backend
+in Sessions 49–50. Lessons learned still informed the final design.)*
 
 **DAG-based dep sets.** Parent-child dep relationships encoded via
 `parent_set_id` FK instead of ParentContext dep entries. Each dep set stores only
@@ -128,6 +129,8 @@ load on first access. Stat-passing API: `lookupHash` returns
 ### Phase 9: CAS Blob Traces (Session 27–40)
 
 **Architectural pivot: replace monolithic SQLite with store-based CAS blobs.**
+*(Note: This CAS blob approach was itself later replaced by a pure SQLite backend
+in Phase 12, Sessions 49–50. See that section for details.)*
 
 The SQLite-based design had persistent correctness issues:
 - Cache coherence between session caches and persistent DB
@@ -146,6 +149,7 @@ CAS blob traces solve all of these:
 
 **Added:** `eval-cache-store.hh/cc`, `eval-index-db.hh/cc`,
 `eval-result-serialise.hh/cc`.
+*(These files were subsequently replaced in Phase 12.)*
 
 **Recovery redesign.** The SQLite design used derivation path determinism (same
 deps → same drv path → same output). CAS blob traces embed the result in the
@@ -172,6 +176,9 @@ but recording must still append to `sessionDeps` for thunk dep replay).
 with a single `maybeLstat()` that returns `std::optional<struct stat>`.
 
 ### Phase 11: Two-Object Trace Model (Session 49+)
+
+*(This phase refined the CAS blob approach that was later replaced by a pure
+SQLite backend in Phase 12.)*
 
 **Problem: Storage bloat from inline deps.**
 Analysis of a typical nixpkgs evaluation showed 465 MB of trace data in an
@@ -208,28 +215,145 @@ dep set blob becomes garbage and is collected on the next GC pass.
 was removed. `loadTrace()` rejects traces with `"v": 1`. Existing v1 traces in
 the store are harmless (they become unreferenced garbage) but cannot be loaded.
 
+### Phase 12: Pure SQLite Backend (Sessions 49–50)
+
+**Architectural pivot: replace CAS blob traces with a single SQLite database.**
+
+The CAS blob trace design (Phases 9–11) eliminated the earlier SQLite coherence
+bugs by making traces immutable store objects. However, it introduced its own
+set of problems:
+
+- **GC budget interference.** CAS blob traces (8–11 Text CA store paths per
+  cached expression) consumed autoGC's single-pass deletion budget, causing
+  gc-auto test failures (Bug 20). Disabling the cache in gc-auto was a
+  workaround, not a fix.
+- **Deferred write complexity.** The `DeferredColdStore` pattern (FIFO queue,
+  `stagedAttrPaths` dedup set, `defer()`/`flush()` lifecycle) existed solely
+  to ensure parent trace paths were set before children read them. This added
+  a non-trivial coordination layer.
+- **CBOR + zstd serialization overhead.** Two-object traces required CBOR
+  encoding via `nlohmann::json`, zstd compression for dep set blobs, and
+  store-path-based references between the result trace and its dep set blob.
+  Each layer added complexity and potential for non-determinism (Pitfall 25).
+- **Store coupling.** Trace storage depended on `addTextToStore()` and the
+  store's GC and reference graph. Recovery required `DepHashRecovery` to map
+  dep hashes back to trace store paths, which is a fundamentally store-aware
+  concern leaking into the eval cache.
+
+The pure SQLite backend eliminates all of these by storing everything in a
+single database at `~/.cache/nix/eval-cache-v1.sqlite`, with no store
+dependency for cache storage.
+
+**1. Replaced CAS blob traces with pure SQLite storage.**
+The entire `EvalCacheStore` (CAS blob backend) and `EvalIndexDb` (lightweight
+SQLite index) were replaced by a single `EvalCacheDb` class. Traces are no
+longer store objects — they are rows in SQLite tables. No `addTextToStore()`,
+no store path references, no GC coupling. The eval cache is now fully
+self-contained.
+
+**2. Five-table schema.**
+`Attributes`, `DepSets`, `DepSetEntries`, `DepHashRecovery`, `DepStructGroups`.
+Semi-normalized dep storage: dep entries use a clustered primary key with the
+dep set ID as prefix, so loading all deps for a dep set is a single range scan
+on the clustered index — no JOIN needed.
+
+**3. Direct coldStore.**
+No deferred write queue. `coldStore()` executes SQL statements directly and
+returns an `AttrId` (integer row ID) immediately. The entire `DeferredColdStore`
+struct — deferred writes vector, `stagedAttrPaths` set, `isStaged()`, `defer()`,
+`flush()` — was eliminated. Parent-child ordering is handled naturally by
+evaluation order: parents are always stored before children because evaluation
+is depth-first.
+
+**4. HashSink-based dep hashing.**
+Replaced CBOR-serialized dep hashing with direct `SHA256 HashSink` feeding.
+Domain-separated fields: `"T"` type, `"S"` source, `"K"` key, `"H"` hash for
+content hash; struct hash omits `"H"`. This eliminated the `nlohmann/json`
+dependency from `eval-result-serialise.cc`.
+
+**5. Epoch column for warm path validation.**
+Added `epoch INTEGER NOT NULL DEFAULT 0` to the Attributes table. The epoch
+increments on every UPSERT conflict (i.e., when an attribute is re-stored with
+new data). `parent_epoch` stores the parent's epoch at cold-store time.
+`validateAttr()` checks that the parent's current epoch matches the stored
+`parent_epoch`. This is a fast O(1) integer comparison that detects parent
+staleness without traversing the dep graph.
+
+**6. Merkle identity hash for Phase 2 recovery.**
+`computeIdentityHash(attrId)` = `hash("V" + valueHash + "D" + depContentHash +
+"P" + parentIdentityHash)`. This replaces the dep hash as the parent identity
+in Phase 2 recovery keys. It correctly handles edge cases that dep hash alone
+cannot:
+- **0-dep parents:** Dep hash is always the same empty-hash value for parents
+  with no deps. Identity hash includes the value, distinguishing them.
+- **FullAttrs parents with same child names but different values:** The value
+  hash for FullAttrs encodes child names but not child values. Identity hash
+  chains through ancestors, so root dep changes propagate through the tree.
+- **Implementation constraint:** Must be called outside lock scopes because it
+  acquires its own locks (non-recursive mutex would deadlock if called while
+  holding the DB lock).
+
+**Files changed.**
+- **Created:** `eval-cache-db.cc`, `eval-cache-db.hh`
+- **Deleted:** `eval-cache-store.cc`, `eval-cache-store.hh`, `eval-index-db.cc`,
+  `eval-index-db.hh`
+- **Modified:** `eval-cache.cc` (AttrId replaces StorePath, direct coldStore),
+  `eval-cache.hh` (`dbBackend` replaces `storeBackend`),
+  `eval-result-serialise.cc/hh` (removed CBOR, kept HashSink hashing),
+  `meson.build` files
+
+**Bugs found and fixed during this phase:**
+
+*Bug A: parent_dep_set_id fails for 0-dep parents.*
+Dep set IDs are content-addressed by hash. Zero deps always produces the same
+dep set ID. When a parent's value changes but it has zero deps, child
+validation incorrectly passed because `parent_dep_set_id` matched (same empty
+dep set). Fix: epoch mechanism (described above).
+
+*Bug B: Epoch breaks Phase 2 recovery.*
+Epochs only increment — they are not reproducible across sessions. When a root
+attribute is recovered and UPSERTed (epoch increments), Phase 2 recovery
+entries stored with old epochs never match. Fix: Merkle identity hash
+(described above) replaces epoch in recovery keys.
+
+*Bug C: Parent value hash fails for FullAttrs.*
+FullAttrs encodes only child names, not child values. Two attrsets with the
+same child names but different child values produce the same value hash. Fix:
+Merkle identity hash chains through ancestors, propagating root dep changes
+through the entire tree.
+
+*Bug D: computeIdentityHash deadlocks in coldStore.*
+`coldStore()` holds `_state->lock()`, then calls `computeIdentityHash()` which
+tries to acquire the same non-recursive lock. Fix: compute the Phase 2 hash
+outside the lock scope.
+
 ---
 
 ## 2. File Layout
 
 ### Source Files
 
+*(Note: This table reflects the state after Phase 12, Sessions 49–50.
+Files marked "replaced" were part of the CAS blob trace design and no longer
+exist. Their replacements are listed.)*
+
 | File | Lines | Description |
 |------|------:|-------------|
-| `src/libexpr/include/nix/expr/eval-cache.hh` | 124 | Public API: `EvalCache`, `AttrType`, `AttrValue`, counters |
-| `src/libexpr/include/nix/expr/eval-cache-store.hh` | 187 | `EvalCacheStore`: cold/warm/recovery, trace I/O |
-| `src/libexpr/include/nix/expr/eval-index-db.hh` | 142 | `EvalIndexDb`: SQLite index for warm-path + recovery |
-| `src/libexpr/include/nix/expr/eval-result-serialise.hh` | 141 | CBOR serialization: `EvalTrace`, `AttrValue`, hash functions |
+| `src/libexpr/include/nix/expr/eval-cache.hh` | ~130 | Public API: `EvalCache`, `AttrType`, `AttrValue`, counters |
+| `src/libexpr/include/nix/expr/eval-cache-db.hh` | ~200 | `EvalCacheDb`: pure SQLite backend (replaces `eval-cache-store.hh` + `eval-index-db.hh`) |
+| `src/libexpr/include/nix/expr/eval-result-serialise.hh` | ~100 | HashSink-based dep hashing (CBOR serialization removed in Phase 12) |
 | `src/libexpr/include/nix/expr/file-load-tracker.hh` | 390 | Dep types, `Dep`, `Blake3Hash`, `FileLoadTracker`, `SuspendFileLoadTracker` |
 | `src/libexpr/include/nix/expr/stat-hash-cache.hh` | 85 | `StatHashCache`: L1/L2 persistent file hash cache |
-| `src/libexpr/eval-cache.cc` | 891 | `ExprCached`, `ExprOrigChild`, `SharedParentResult`, eval loop |
-| `src/libexpr/eval-cache-store.cc` | 589 | Store backend: `coldStore`, `warmPath`, `recovery`, trace I/O |
-| `src/libexpr/eval-index-db.cc` | 283 | SQLite index: schema, prepared statements, CRUD |
-| `src/libexpr/eval-result-serialise.cc` | 355 | CBOR encoding/decoding via nlohmann::json; dep set zstd compression/decompression; v2 trace format (v1 removed) |
+| `src/libexpr/eval-cache.cc` | ~900 | `ExprCached`, `ExprOrigChild`, `SharedParentResult`, eval loop |
+| `src/libexpr/eval-cache-db.cc` | ~600 | SQLite backend: schema, cold/warm/recovery, dep storage (replaces `eval-cache-store.cc` + `eval-index-db.cc`) |
+| `src/libexpr/eval-result-serialise.cc` | ~200 | HashSink dep hashing; nlohmann::json and CBOR removed in Phase 12 |
 | `src/libexpr/file-load-tracker.cc` | 219 | Dep recording, hashing, input resolution |
 | `src/libexpr/stat-hash-cache.cc` | 339 | L1 concurrent map, L2 SQLite, stat validation |
 
-**Total new code:** ~3,745 lines across 12 files.
+**Removed in Phase 12:** `eval-cache-store.hh/cc` (CAS blob backend),
+`eval-index-db.hh/cc` (SQLite index for trace store paths).
+
+**Total new code:** ~3,200 lines across 10 files.
 
 ### Modified Files
 
@@ -355,22 +479,17 @@ StatHashCache (singleton):
 All L2 writes are wrapped in a single `SQLiteTxn` committed at destructor time.
 This reduces SQLite write overhead from per-dep to per-session.
 
-### 3.4 CBOR Serialization (eval-result-serialise.hh/cc)
+### 3.4 Dep Hashing (eval-result-serialise.hh/cc)
 
-Uses `nlohmann::json` for CBOR encoding (`json::to_cbor()`) and decoding
-(`json::from_cbor()`). This was chosen over a dedicated CBOR library because
-nlohmann::json is already a dependency.
-
-**Two-object serialization.** Result traces and dep set blobs are serialized
-independently. The dep set blob is CBOR-encoded and then zstd-compressed at a
-fixed compression level (level 3) before being stored as a Text CA blob. The
-result trace is a slim CBOR blob referencing the dep set blob's store path via
-the `"ds"` field. On load, `loadTrace()` reads the result trace, resolves the
-`"ds"` path, reads and decompresses the dep set blob, and returns the combined
-`EvalTrace` struct.
+*(Note: In Phases 9–11, this module handled CBOR serialization using
+`nlohmann::json` for `json::to_cbor()`/`json::from_cbor()` encoding, plus
+zstd compression for dep set blobs stored as Text CA store objects. In Phase 12
+(Sessions 49–50), CBOR serialization, zstd compression, and the nlohmann::json
+dependency were removed. The module now contains only HashSink-based dep
+hashing.)*
 
 **Dep hash computation** hashes sorted deps by feeding each dep's fields into a
-`HashSink(HashAlgorithm::SHA256)`:
+`HashSink(HashAlgorithm::SHA256)` with domain-separated fields:
 
 ```
 For each dep (sorted by type, source, key):
@@ -382,12 +501,17 @@ For each dep (sorted by type, source, key):
 
 Three hash variants:
 - `computeDepContentHash`: deps only (Phase 1 recovery key)
-- `computeDepContentHashWithParent`: deps + "P" + parent path (Phase 2)
+- `computeDepContentHashWithParent`: deps + "P" + parent identity hash (Phase 2)
 - `computeDepStructHash`: deps keys only, no hashes (Phase 3 grouping)
 
-### 3.5 Deferred Write Pattern (eval-cache-store.cc)
+### 3.5 Deferred Write Pattern (eval-cache-store.cc) — Removed in Phase 12
 
-Cold-path trace storage uses a FIFO queue to ensure correct ordering:
+*(This pattern existed in the CAS blob trace design, Phases 9–11. It was
+eliminated in Phase 12 when `coldStore()` was changed to execute SQL statements
+directly and return an `AttrId` immediately. Retained here for historical
+context.)*
+
+Cold-path trace storage used a FIFO queue to ensure correct ordering:
 
 ```
 deferredWrites: vector<function<void()>>
@@ -407,8 +531,11 @@ flush():
   flush()
 ```
 
-Parent lambdas are pushed before children because evaluation is depth-first.
-This guarantees that `parentEC->tracePath` is set before children read it.
+Parent lambdas were pushed before children because evaluation is depth-first.
+This guaranteed that `parentEC->tracePath` was set before children read it.
+In the pure SQLite backend, this coordination is unnecessary — parent rows
+exist in the database before children are stored, and `AttrId` (integer row
+ID) is available immediately after `INSERT`.
 
 ---
 
@@ -580,6 +707,9 @@ are not hex-encoded BLAKE3 hashes. Store paths are variable-length strings.
 ### 4.5 Store Integration (5 bugs)
 
 **Bug 20: CAS traces consume autoGC budget.**
+*(Note: This bug is specific to the CAS blob trace design, Phases 9–11.
+The pure SQLite backend (Phase 12) stores no objects in the Nix store, so
+this class of issue no longer applies.)*
 *Symptom:* gc-auto test fails (expects 2 of 3 garbage paths deleted).
 *Root cause:* `nix build --impure --expr` creates 8–11 Text CA traces per
 expression. When the process exits, traces become garbage. autoGC's single-pass
@@ -621,7 +751,11 @@ not content.
 `invalidateFileCache()` to clear both PosixSourceAccessor and StatHashCache L1.
 *Lesson:* Stat-based caching is vulnerable to same-size, same-timestamp writes.
 
-### 4.6 Two-Object Trace Model (3 pitfalls)
+### 4.6 Two-Object Trace Model (3 pitfalls) — CAS Blob Era Only
+
+*(These pitfalls are specific to the CAS blob trace design, Phases 9–11.
+The pure SQLite backend (Phase 12) does not use CAS blobs, zstd compression,
+or store-path-based references, so none of these apply to the current design.)*
 
 **Pitfall 25: Zstd determinism for CAS stability.**
 *Symptom:* Dep set blobs for identical dep sets produce different store paths.
@@ -689,7 +823,9 @@ drvPath forcing.
 Multiple bugs arose from session caches becoming stale after DB writes.
 The pattern: cache value X → write to DB (which changes X) → read cache
 (returns stale X). Must either invalidate caches after writes or avoid caching
-write-affected values.
+write-affected values. The Phase 12 epoch mechanism addresses one instance of
+this: parent staleness is detected via integer epoch comparison rather than
+session-cached dep set IDs.
 
 ### 5.5 Testing with Same-Size Files
 
@@ -779,5 +915,7 @@ if evaluation is attempted, proving the result was served entirely from cache.
    StatHashCache false hits.
 2. **Warm sibling dep incompleteness**: not tested because `c = a + b` with
    warm-served `a`/`b` produces incomplete dep sets for `c`.
-3. **autoGC interaction**: eval cache must be disabled in gc-auto.sh.
+3. **autoGC interaction**: eval cache was disabled in gc-auto.sh due to CAS
+   blob traces consuming GC budget (Bug 20). With the Phase 12 pure SQLite
+   backend, this may no longer be necessary since no store objects are created.
 4. **Parallel evaluation**: tests are single-threaded; no concurrent eval tests.

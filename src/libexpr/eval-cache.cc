@@ -1,4 +1,4 @@
-#include "nix/expr/eval-cache-store.hh"
+#include "nix/expr/eval-cache-db.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/expr/eval-cache.hh"
 #include "nix/expr/eval.hh"
@@ -8,7 +8,6 @@
 #include "nix/expr/value-to-json.hh"
 
 #include <algorithm>
-#include <nlohmann/json.hpp>
 
 namespace nix::eval_cache {
 
@@ -22,50 +21,21 @@ Counter nrCacheVerificationFailures;
 
 // ── ExprCached struct definition ─────────────────────────────────────
 
-/**
- * An Expr node whose eval() reads from the eval cache (warm path) or
- * evaluates the real thunk and stores the result (cold path). GC-allocated
- * so it can be embedded in Values as a thunk. CLI commands use standard
- * forceValue() + Value operations instead of cache-specific APIs.
- *
- * During cold-path evaluation, navigateToReal() wraps sibling thunks
- * with ExprCached, enabling partial tree invalidation: unchanged siblings
- * are served from cache while the target attribute is re-evaluated.
- */
 struct ExprCached : Expr, gc
 {
     EvalCache * cache;
     Symbol name;
     ExprCached * parentExpr; // GC-traced, nullptr for root
     bool isListElement;      // true = list index, false = attr access
-    /**
-     * For side-effect sibling wrappers created during navigateToReal.
-     *
-     * When navigateToReal traverses the real evaluation tree to reach a
-     * target attribute (e.g., hello.drvPath), it wraps sibling thunks
-     * (e.g., stdenv) with ExprCached wrappers that have origExpr/origEnv
-     * set. When these siblings are later forced as side effects (e.g.,
-     * derivationStrictInternal forcing stdenv), the wrapper's eval()
-     * tries the warm cache first, then falls back to evaluating the
-     * original thunk expression directly — without navigateToReal.
-     *
-     * Warm cache for FullAttrs uses ExprOrigChild as the origExpr of
-     * materialized children. ExprOrigChild resolves children by
-     * evaluating the parent's original expression directly (shared
-     * across siblings) rather than using navigateToReal, which would
-     * cycle through the materialized parent and hit a blackhole.
-     *
-     * Cold path still produces real values (v = *target) with children
-     * wrapped as origExpr ExprCached thunks for future warm cache hits.
-     */
+
     Expr * origExpr = nullptr;
     Env * origEnv = nullptr;
 
     /**
-     * The trace store path for this attribute.
+     * The SQLite attr_id for this attribute.
      * Set after warm path succeeds or cold path stores the result.
      */
-    std::optional<StorePath> tracePath;
+    std::optional<AttrId> attrId;
 
     ExprCached(EvalCache * cache, AttrId /*unused*/, Symbol name, ExprCached * parentExpr,
                bool isListElement = false)
@@ -80,9 +50,6 @@ struct ExprCached : Expr, gc
     void show(const SymbolTable &, std::ostream &) const override {}
     void bindVars(EvalState &, const std::shared_ptr<const StaticEnv> &) override {}
 
-    /**
-     * Build a human-readable attr path string from the ExprCached parent chain.
-     */
     std::string attrPathStr() const
     {
         if (!parentExpr)
@@ -95,11 +62,8 @@ struct ExprCached : Expr, gc
         return path.to_string(cache->state);
     }
 
-    // ── Store backend methods ────────────────────────────────────
+    // ── DB backend methods ──────────────────────────────────────
 
-    /**
-     * Build the null-byte-separated attr path for the store backend.
-     */
     std::string storeAttrPath() const
     {
         if (!parentExpr)
@@ -108,59 +72,30 @@ struct ExprCached : Expr, gc
         for (auto * e = this; e->parentExpr; e = e->parentExpr)
             components.push_back(std::string(cache->state.symbols[e->name]));
         std::reverse(components.begin(), components.end());
-        return EvalCacheStore::buildAttrPath(components);
+        return EvalCacheDb::buildAttrPath(components);
     }
 
-    /**
-     * Get the parent's trace store path.
-     */
-    std::optional<StorePath> parentTracePath() const
+    std::optional<AttrId> parentAttrId() const
     {
         if (!parentExpr) return std::nullopt;
-        return parentExpr->tracePath;
+        return parentExpr->attrId;
     }
 
     void evaluateCold(Value & v);
     Value * navigateToReal();
     void materializeValue(Value & v, const AttrValue & cached);
-    void replayDepsToTracker(const StorePath & tracePath);
+    void replayDepsToTracker(AttrId id);
     void storeForcedSibling(ExprCached * parentEC, Symbol siblingName, Value & v);
     void sortChildNames(std::vector<Symbol> & names) const;
 };
 
-// ── DeferredColdStore::execute() ──────────────────────────────────────
-
-void DeferredColdStore::execute()
-{
-    std::optional<StorePath> parentTrace;
-    if (parentSrc) {
-        parentTrace = parentSrc->tracePath;
-        if (!parentTrace) return;
-    }
-    auto traceP = sb->coldStore(attrPath, name, value, deps, parentTrace, isRoot);
-    target->tracePath = traceP;
-}
-
 // ── Support types (SharedParentResult, ExprOrigChild) ────────────────
 
-/**
- * GC-allocated container for a shared lazy parent evaluation result.
- * Multiple ExprOrigChild instances share this so the parent is
- * evaluated at most once.
- */
 struct SharedParentResult : gc
 {
     Value * value = nullptr;
 };
 
-/**
- * Expr subclass for children of a materialized origExpr FullAttrs.
- *
- * Instead of using navigateToReal (which would cycle through the
- * materialized parent and hit a blackhole), this resolves the child
- * by evaluating the parent's original expression and looking up
- * the child name in the resulting real attrset.
- */
 struct ExprOrigChild : Expr, gc
 {
     Expr * parentOrigExpr;
@@ -180,11 +115,6 @@ struct ExprOrigChild : Expr, gc
     {
         if (!shared->value) {
             shared->value = state.allocValue();
-            // Suspend dep recording while evaluating the parent expression.
-            // The parent (e.g., buildPackages = all of nixpkgs) can record
-            // 10K+ file deps that would bloat this child's dep set.
-            // The child's own deps are recorded after the guard is destroyed.
-            // Parent dep chains in the store handle invalidation chain-of-custody.
             {
                 SuspendFileLoadTracker suspend;
                 parentOrigExpr->eval(state, *parentOrigEnv, *shared->value);
@@ -206,10 +136,6 @@ struct ExprOrigChild : Expr, gc
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/**
- * Returns true if the AttrValue is a leaf that can be served from cache
- * without navigateToReal (scalars, paths, string lists).
- */
 static bool isLeafCached(const AttrValue & v)
 {
     return std::get_if<string_t>(&v)
@@ -232,25 +158,17 @@ void ExprCached::sortChildNames(std::vector<Symbol> & names) const
 
 // ── ExprCached implementation ────────────────────────────────────────
 
-void ExprCached::replayDepsToTracker(const StorePath & traceP)
+void ExprCached::replayDepsToTracker(AttrId id)
 {
     if (!FileLoadTracker::isActive())
         return;
 
-    auto & sb = *cache->storeBackend;
     try {
-        // Load deps from the trace's dep set blob (two-object model).
-        // Uses depSetCache to avoid redundant decompression if validation
-        // already loaded the same dep set.
-        auto deps = sb.loadDepsForTrace(traceP);
-        // Replay only direct deps from this trace — do NOT recurse into
-        // parent traces (parent deps are already captured in the parent's
-        // FileLoadTracker).
-        for (auto & dep : deps) {
+        auto deps = cache->dbBackend->loadDepsForAttr(id);
+        for (auto & dep : deps)
             FileLoadTracker::record(dep);
-        }
     } catch (std::exception &) {
-        // trace or dep set blob may have been GC'd — skip
+        // DB may be corrupt or attr may have been evicted — skip
     }
 }
 
@@ -261,17 +179,15 @@ void ExprCached::storeForcedSibling(ExprCached * parentEC, Symbol siblingName, V
     if (v.type() == nPath)
         return;
 
-    auto & sb = *cache->storeBackend;
+    auto & db = *cache->dbBackend;
     auto nameStr = std::string(cache->state.symbols[siblingName]);
 
-    // Create a GC-allocated ExprCached node for the sibling so children
-    // have correct parentExpr chain for storeAttrPath() / parentEvalDrvPath()
     auto * siblingEC = new ExprCached(cache, 0, siblingName, parentEC);
     auto siblingAttrPath = siblingEC->storeAttrPath();
 
-    // If already staged or stored (by a prior evaluateCold with full deps),
+    // If already stored (by a prior evaluateCold with full deps),
     // don't overwrite with this dep-less speculative entry.
-    if (sb.isStaged(siblingAttrPath) || sb.index.lookup(sb.contextHash, siblingAttrPath, sb.store))
+    if (db.lookupAttr(siblingAttrPath))
         return;
 
     // Serialize value
@@ -300,22 +216,21 @@ void ExprCached::storeForcedSibling(ExprCached * parentEC, Symbol siblingName, V
         return; // list, function, external — skip
     }
 
-    // Defer sibling coldStore — parent's tracePath resolved at flush time.
-    // DeferredColdStore is GC-allocated, keeping siblingEC and parentEC
-    // reachable by the Boehm GC (prevents use-after-free in flush()).
-    auto * sbPtr = &sb;
-    sbPtr->defer(siblingAttrPath, new DeferredColdStore{
-        {}, sbPtr, siblingEC, parentEC,
-        std::string(siblingAttrPath), nameStr,
-        attrValue, {}, false});
+    // Direct coldStore — no deferred writes needed with SQLite backend.
+    // Parent's attrId may be nullopt (parent not yet stored); skip silently.
+    if (!parentEC->attrId)
+        return;
+
+    try {
+        siblingEC->attrId = db.coldStore(
+            siblingAttrPath, attrValue, {}, parentEC->attrId, false);
+    } catch (std::exception & e) {
+        debug("storeForcedSibling failed for '%s': %s", siblingAttrPath, e.what());
+        return;
+    }
 
     try {
         if (v.type() == nAttrs) {
-            // For derivations, eagerly force drvPath/outPath so they get
-            // stored as leaf children. Use try-catch because nixpkgs wraps
-            // these with license assertions (extendDerivation). Guard against
-            // double-wrapping via dynamic_cast (derivation.nix Value* aliasing:
-            // default.out and default share the same Value*).
             if (cache->state.isDerivation(v)) {
                 if (auto * a = v.attrs()->get(cache->state.s.drvPath))
                     if (a->value->isThunk()
@@ -330,7 +245,6 @@ void ExprCached::storeForcedSibling(ExprCached * parentEC, Symbol siblingName, V
             }
 
             // Store forced leaf children (single level, no recursion).
-            // Skip path, attrset, list — only simple scalars/strings.
             for (auto & attr : *v.attrs()) {
                 if (attr.value->isThunk())
                     continue;
@@ -357,17 +271,16 @@ void ExprCached::storeForcedSibling(ExprCached * parentEC, Symbol siblingName, V
                     continue;
                 }
 
-                auto childNameStr = std::string(cache->state.symbols[attr.name]);
                 auto * childEC = new ExprCached(cache, 0, attr.name, siblingEC);
                 auto childAttrPath = childEC->storeAttrPath();
-                sbPtr->defer(childAttrPath, new DeferredColdStore{
-                    {}, sbPtr, childEC, siblingEC,
-                    std::string(childAttrPath), childNameStr,
-                    std::move(childValue), {}, false});
+                try {
+                    childEC->attrId = db.coldStore(
+                        childAttrPath, std::move(childValue), {},
+                        siblingEC->attrId, false);
+                } catch (std::exception &) {}
             }
 
             // Wrap remaining thunk children with ExprCached origExpr wrappers
-            // so they get cached when later forced as side effects.
             for (auto & attr : *v.attrs()) {
                 if (attr.value->isThunk()
                     && !dynamic_cast<ExprCached*>(attr.value->thunk().expr))
@@ -386,7 +299,6 @@ void ExprCached::storeForcedSibling(ExprCached * parentEC, Symbol siblingName, V
 
 Value * ExprCached::navigateToReal()
 {
-    // Build path with list-index metadata from parent chain
     struct PathStep {
         Symbol sym;
         bool isListElement;
@@ -398,8 +310,6 @@ Value * ExprCached::navigateToReal()
 
     auto * v = cache->getOrEvaluateRoot();
 
-    // Build ExprCached chain from root to this.
-    // exprChain[i] is the parent ExprCached for siblings at path step i.
     std::vector<ExprCached*> storeExprChain;
     for (auto * e = this; e; e = e->parentExpr)
         storeExprChain.push_back(e);
@@ -408,7 +318,6 @@ Value * ExprCached::navigateToReal()
 
     for (auto & step : path) {
         if (step.isListElement) {
-            // List indexing — force the value, parse index, direct access
             cache->state.forceValue(*v, noPos);
             if (v->type() != nList)
                 throw Error("expected a list but found %s while navigating to cached list element",
@@ -422,13 +331,8 @@ Value * ExprCached::navigateToReal()
 
             v = v->listView()[index];
         } else {
-            // Attrset access
             cache->state.forceAttrs(*v, noPos, "while navigating to cached attribute");
 
-            // Wrap sibling thunks and store already-forced siblings.
-            // When siblings are later forced as side effects, the wrapper's
-            // eval() stores results in the cache. Already-forced siblings
-            // are stored speculatively with parent deps inherited via inputDrvs.
             auto * parentEC = storeExprChain[pathStep];
             for (auto & attr : *v->attrs()) {
                 if (attr.name == step.sym)
@@ -468,7 +372,6 @@ void ExprCached::materializeValue(Value & v, const AttrValue & cached)
         for (auto & childName : *attrs) {
             auto * childVal = st.allocValue();
             auto * child = new ExprCached(cache, 0, childName, this);
-            child->tracePath = std::nullopt; // Will be resolved on access
             childVal->mkThunk(&st.baseEnv, child);
             bindings.insert(childName, childVal, noPos);
         }
@@ -528,10 +431,6 @@ void ExprCached::evaluateCold(Value & v)
             target = navigateToReal();
         }
 
-        // navigateToReal() may have wrapped this value with ExprCached
-        // during a prior sibling wrapping pass. Unwrap it so forceValue
-        // evaluates the original expression directly, capturing deps in
-        // THIS tracker rather than in the wrapper's nested tracker.
         if (target->isThunk()) {
             if (auto * ec = dynamic_cast<ExprCached*>(target->thunk().expr)) {
                 if (ec->origExpr) {
@@ -549,79 +448,45 @@ void ExprCached::evaluateCold(Value & v)
     try {
         st.forceValue(*target, noPos);
 
-        // For origExpr wrappers: exit the blackhole on v early.
-        //
-        // v (the Value* in the real evaluation tree, e.g. pkgs.perl) is
-        // currently blackholed from the caller's forceValue(v). The
-        // derivationStrict call below can trigger deep dependency chains
-        // through the nixpkgs fixed-point (self), e.g.:
-        //   perl.derivationStrict → libxcrypt → buildPackages.perl → self.perl
-        // If self.perl is still blackholed, this causes infinite recursion.
-        //
-        // In normal (non-cached) evaluation, the blackhole exits as soon as
-        // the thunk expression produces a result — before derivationStrict
-        // runs. We replicate that by setting v = *target now. v will be
-        // overwritten with the final materialized value at the end.
         if (origExpr)
             v = *target;
 
-        // derivation.nix uses `let strict = derivationStrict drvAttrs` lazily,
-        // so merely forcing the derivation attrset to WHNF does NOT call
-        // derivationStrict. Force drvPath to trigger it, ensuring deps from
-        // env var processing (e.g., readFile via buildCommand string
-        // interpolation) are captured in this attribute's dep set.
-        //
-        // Only do this for the main navigation target (!origExpr). For
-        // origExpr wrappers (side-effect siblings wrapped by navigateToReal),
-        // skip eager drvPath forcing: it triggers derivationStrict chains
-        // that don't exist in normal (non-cached) evaluation, causing
-        // infinite recursion in nixpkgs' fixed-point package sets where
-        // buildPackages = self on native builds. Side-effect siblings will
-        // have derivationStrict triggered naturally when string coercion
-        // needs outPath, matching normal evaluation order.
         if (!origExpr && target->type() == nAttrs && st.isDerivation(*target)) {
             if (auto * dp = target->attrs()->get(st.s.drvPath))
                 st.forceValue(*dp->value, noPos);
         }
     } catch (EvalError &) {
         debug("setting '%s' to failed (cold path)", attrPathStr());
-        if (cache->storeBackend) {
+        if (cache->dbBackend) {
             auto attrPath = storeAttrPath();
-            auto nameStr = std::string(st.symbols[name]);
             auto collectedDeps = tracker.collectDeps();
 
-            // Filter ParentContext
             std::vector<Dep> directDeps;
             for (auto & dep : collectedDeps)
                 if (dep.type != DepType::ParentContext)
                     directDeps.push_back(dep);
 
-            auto * sb = cache->storeBackend.get();
-            auto safeName = nameStr.empty() ? std::string("root") : nameStr;
-            bool isRoot = !parentExpr;
-            ExprCached * self = this;
-            ExprCached * parent = parentExpr;
-
-            sb->defer(attrPath, new DeferredColdStore{
-                {}, sb, self, parent,
-                std::string(attrPath), safeName,
-                failed_t{}, std::move(directDeps), isRoot});
+            try {
+                this->attrId = cache->dbBackend->coldStore(
+                    attrPath, failed_t{}, directDeps,
+                    parentAttrId(), !parentExpr);
+            } catch (std::exception & e) {
+                debug("cold store failed for '%s': %s", attrPathStr(), e.what());
+            }
         }
         throw;
     }
 
-    if (cache->storeBackend) {
+    if (cache->dbBackend) {
         auto attrPath = storeAttrPath();
-        auto nameStr = std::string(st.symbols[name]);
         auto collectedDeps = tracker.collectDeps();
 
-        // Filter ParentContext — parent dep inheritance is via trace references
         std::vector<Dep> directDeps;
         for (auto & dep : collectedDeps)
             if (dep.type != DepType::ParentContext)
                 directDeps.push_back(dep);
 
-        // Build the AttrValue for serialization
+        // Build the AttrValue for storage
         AttrValue attrValue;
         if (target->type() == nString) {
             NixStringContext ctx;
@@ -664,33 +529,16 @@ void ExprCached::evaluateCold(Value & v)
             attrValue = misc_t{};
         }
 
-        {
-            auto * sb = cache->storeBackend.get();
-            auto safeName = nameStr.empty() ? std::string("root") : nameStr;
-            bool isRoot = !parentExpr;
-            ExprCached * self = this;
-            ExprCached * parent = parentExpr;
-
-            // Copy for lambda; original stays on stack for materializeValue
-            auto deferredValue = attrValue;
-            auto deferredDeps = std::move(directDeps);
-
-            sb->defer(attrPath, new DeferredColdStore{
-                {}, sb, self, parent,
-                std::string(attrPath), safeName,
-                std::move(deferredValue), std::move(deferredDeps), isRoot});
+        // Direct coldStore — no deferred writes
+        try {
+            this->attrId = cache->dbBackend->coldStore(
+                attrPath, attrValue, directDeps,
+                parentAttrId(), !parentExpr);
+        } catch (std::exception & e) {
+            debug("cold store failed for '%s': %s", attrPathStr(), e.what());
         }
 
-        // Store forced scalar children of derivation targets before
-        // materializeValue/ExprOrigChild replaces them with thunks.
-        // evaluateCold eagerly forces drvPath for derivation targets (the
-        // !origExpr && isDerivation guard above), but materializeValue and
-        // ExprOrigChild replace ALL children with thunks, losing the forced
-        // values. Only apply to derivations — non-derivation attrsets (e.g.,
-        // flake inputs) must NOT be cached as scalars because their warm path
-        // would bypass SourceAccessor setup (AllowListSourceAccessor).
-        // Only store scalars — NOT attrsets, which would trigger thunk
-        // wrapping in storeForcedSibling that modifies the real tree.
+        // Store forced scalar children of derivation targets
         if (!origExpr && target->type() == nAttrs && cache->state.isDerivation(*target)) {
             for (auto & attr : *target->attrs()) {
                 if (!attr.value->isThunk()) {
@@ -703,16 +551,6 @@ void ExprCached::evaluateCold(Value & v)
         }
 
         if (origExpr && std::holds_alternative<std::vector<Symbol>>(attrValue)) {
-            // origExpr wrapper with attrset result: create children
-            // with ExprOrigChild to maintain cache chain WITHOUT
-            // navigateToReal. materializeValue would create
-            // ExprCached children without origExpr in the real tree,
-            // causing subsequent navigateToReal calls to hit blackholed
-            // Values (infinite recursion). ExprOrigChild resolves
-            // children via the parent's origExpr instead.
-            //
-            // Pre-fill SharedParentResult with already-evaluated target
-            // so ExprOrigChild doesn't re-evaluate the parent.
             auto & childNames = std::get<std::vector<Symbol>>(attrValue);
             auto * shared = new SharedParentResult();
             shared->value = target;
@@ -730,18 +568,12 @@ void ExprCached::evaluateCold(Value & v)
         }
 
         if (origExpr) {
-            // origExpr with non-attrset result: return real value
             v = *target;
         } else if (std::holds_alternative<misc_t>(attrValue)
                 || std::holds_alternative<missing_t>(attrValue)
                 || std::holds_alternative<placeholder_t>(attrValue)) {
-            // Non-materializable types: use real value directly.
-            // materializeValue for these calls evaluateCold(v) which
-            // would create infinite recursion.
             v = *target;
         } else {
-            // Main navigation path: materialize ExprCached children to
-            // maintain cache chain for deeper attribute access.
             materializeValue(v, attrValue);
         }
         return;
@@ -752,8 +584,7 @@ void ExprCached::evaluateCold(Value & v)
 
 void ExprCached::eval(EvalState & state, Env & env, Value & v)
 {
-    if (!cache->storeBackend) {
-        // No cache backend — evaluate directly
+    if (!cache->dbBackend) {
         if (origExpr) {
             origExpr->eval(state, *origEnv, v);
             state.forceValue(v, noPos);
@@ -765,19 +596,14 @@ void ExprCached::eval(EvalState & state, Env & env, Value & v)
         return;
     }
 
-    auto & sb = *cache->storeBackend;
+    auto & db = *cache->dbBackend;
 
-    // Try warm path. parentTracePath() (defined at line ~117) returns
-    // the parent ExprCached's tracePath — set synchronously when the parent
-    // is warm-served or recovered, before eval() returns. For root attrs
-    // (no parent), returns nullopt → Phase 2 recovery skipped.
-    // This enables Phase 2 parent-aware recovery in EvalCacheStore::recovery().
     auto attrPath = storeAttrPath();
-    auto warmResult = sb.warmPath(attrPath, cache->inputAccessors, cache->state, parentTracePath());
+    auto warmResult = db.warmPath(attrPath, cache->inputAccessors, cache->state, parentAttrId());
 
     if (warmResult) {
-        auto & [cachedValue, traceP] = *warmResult;
-        tracePath = traceP;
+        auto & [cachedValue, cachedAttrId] = *warmResult;
+        this->attrId = cachedAttrId;
 
         // Handle failed values — reproduce error
         if (std::get_if<failed_t>(&cachedValue)) {
@@ -785,8 +611,7 @@ void ExprCached::eval(EvalState & state, Env & env, Value & v)
             return;
         }
 
-        // Non-materializable types (functions, externals): re-evaluate.
-        // materializeValue for these calls evaluateCold → infinite recursion.
+        // Non-materializable types: re-evaluate
         if (std::get_if<misc_t>(&cachedValue)
             || std::get_if<missing_t>(&cachedValue)
             || std::get_if<placeholder_t>(&cachedValue)) {
@@ -797,11 +622,10 @@ void ExprCached::eval(EvalState & state, Env & env, Value & v)
         nrEvalCacheHits++;
         debug("eval cache hit for '%s'", attrPathStr());
 
-        // For origExpr wrappers: serve leaf or FullAttrs
         if (origExpr) {
             if (isLeafCached(cachedValue)) {
                 materializeValue(v, cachedValue);
-                replayDepsToTracker(traceP);
+                replayDepsToTracker(cachedAttrId);
                 return;
             }
             if (auto * attrs = std::get_if<std::vector<Symbol>>(&cachedValue)) {
@@ -816,14 +640,13 @@ void ExprCached::eval(EvalState & state, Env & env, Value & v)
                     bindings.insert(childName, childVal, noPos);
                 }
                 v.mkAttrs(bindings.finish());
-                replayDepsToTracker(traceP);
+                replayDepsToTracker(cachedAttrId);
                 return;
             }
             // list_t or other → cold
         } else {
-            // Non-origExpr: materialize value
             materializeValue(v, cachedValue);
-            replayDepsToTracker(traceP);
+            replayDepsToTracker(cachedAttrId);
             return;
         }
     }
@@ -836,14 +659,12 @@ void ExprCached::eval(EvalState & state, Env & env, Value & v)
 
 // ── EvalCache public API ─────────────────────────────────────────────
 
-static std::shared_ptr<EvalCacheStore> makeStoreBackend(
-    Store & store, const Hash & fingerprint, SymbolTable & symbols)
+static std::shared_ptr<EvalCacheDb> makeDbBackend(
+    const Hash & fingerprint, SymbolTable & symbols)
 {
-    // Compute context hash from fingerprint (first 8 bytes as int64)
     int64_t contextHash;
     std::memcpy(&contextHash, fingerprint.hash, sizeof(contextHash));
-
-    return std::make_shared<EvalCacheStore>(store, symbols, contextHash);
+    return std::make_shared<EvalCacheDb>(symbols, contextHash);
 }
 
 EvalCache::EvalCache(
@@ -857,10 +678,8 @@ EvalCache::EvalCache(
 {
     if (useCache) {
         try {
-            storeBackend = makeStoreBackend(*state.store, *useCache, state.symbols);
+            dbBackend = makeDbBackend(*useCache, state.symbols);
         } catch (...) {
-            // If we can't create the cache (e.g., unwritable cache dir in
-            // sandbox), degrade gracefully to uncached mode.
             ignoreExceptionExceptInterrupt();
         }
     }

@@ -78,7 +78,7 @@ struct TempTestFile
 
 /**
  * RAII helper that creates a temporary cache directory and sets NIX_CACHE_HOME.
- * Use this in test fixtures that create EvalIndexDb, EvalCacheStore, or EvalCache,
+ * Use this in test fixtures that create EvalCacheDb or EvalCache,
  * which all need a writable cache directory for their SQLite databases.
  * Required for sandbox builds where $HOME is /homeless-shelter (not writable).
  */

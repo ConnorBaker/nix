@@ -1,5 +1,5 @@
 #include "helpers.hh"
-#include "nix/expr/eval-cache-store.hh"
+#include "nix/expr/eval-cache-db.hh"
 
 #include <gtest/gtest.h>
 
@@ -25,7 +25,7 @@ public:
     {}
 
 protected:
-    // Writable cache dir for EvalIndexDb SQLite (sandbox has no writable $HOME)
+    // Writable cache dir for EvalCacheDb SQLite (sandbox has no writable $HOME)
     ScopedCacheDir cacheDir;
 
     Hash testFingerprint = hashString(HashAlgorithm::SHA256, "test-fingerprint");
