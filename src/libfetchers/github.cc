@@ -29,6 +29,8 @@ std::regex hostRegex(hostRegexS, std::regex::ECMAScript);
 
 struct GitArchiveInputScheme : InputScheme
 {
+    virtual std::string_view defaultHost() const = 0;
+
     virtual std::optional<std::pair<std::string, std::string>>
     accessHeaderFromToken(const std::string & token) const = 0;
 
@@ -373,6 +375,13 @@ struct GitArchiveInputScheme : InputScheme
         return Xp::Flakes;
     }
 
+    std::optional<std::string> getStableIdentity(const Input & input) const override
+    {
+        auto host = maybeGetStrAttr(input.attrs, "host").value_or(std::string{defaultHost()});
+        return fmt("%s:%s/%s/%s", schemeName(), host,
+            getStrAttr(input.attrs, "owner"), getStrAttr(input.attrs, "repo"));
+    }
+
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
     {
         if (auto rev = input.getRev())
@@ -384,6 +393,11 @@ struct GitArchiveInputScheme : InputScheme
 
 struct GitHubInputScheme : GitArchiveInputScheme
 {
+    std::string_view defaultHost() const override
+    {
+        return "github.com";
+    }
+
     std::string_view schemeName() const override
     {
         return "github";
@@ -472,6 +486,11 @@ struct GitHubInputScheme : GitArchiveInputScheme
 
 struct GitLabInputScheme : GitArchiveInputScheme
 {
+    std::string_view defaultHost() const override
+    {
+        return "gitlab.com";
+    }
+
     std::string_view schemeName() const override
     {
         return "gitlab";
@@ -563,6 +582,11 @@ struct GitLabInputScheme : GitArchiveInputScheme
 
 struct SourceHutInputScheme : GitArchiveInputScheme
 {
+    std::string_view defaultHost() const override
+    {
+        return "git.sr.ht";
+    }
+
     std::string_view schemeName() const override
     {
         return "sourcehut";

@@ -126,6 +126,11 @@ std::optional<std::string> Input::getFingerprint(Store & store) const
     return fingerprint;
 }
 
+std::optional<std::string> Input::getStableIdentity() const
+{
+    return scheme ? scheme->getStableIdentity(*this) : std::nullopt;
+}
+
 ParsedURL Input::toURL() const
 {
     if (!scheme)

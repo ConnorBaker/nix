@@ -174,6 +174,15 @@ public:
      * This is not a stable identifier between Nix versions, but not guaranteed to change either.
      */
     std::optional<std::string> getFingerprint(Store & store) const;
+
+    /**
+     * Return a version-independent stable identity for this input,
+     * suitable for use as a persistent cache key. Unlike fingerprints,
+     * stable identities do not change when the input is updated
+     * (e.g. new commits). Different versions of the same project
+     * share the same stable identity.
+     */
+    std::optional<std::string> getStableIdentity() const;
 };
 
 /**
@@ -254,6 +263,15 @@ struct InputScheme
     }
 
     virtual std::optional<std::string> getFingerprint(Store & store, const Input & input) const
+    {
+        return std::nullopt;
+    }
+
+    /**
+     * Return a version-independent stable identity for this input.
+     * Used as a persistent cache key that survives input updates.
+     */
+    virtual std::optional<std::string> getStableIdentity(const Input & input) const
     {
         return std::nullopt;
     }

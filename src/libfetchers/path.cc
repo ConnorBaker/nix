@@ -123,6 +123,11 @@ struct PathInputScheme : InputScheme
             return path;
     }
 
+    std::optional<std::string> getStableIdentity(const Input & input) const override
+    {
+        return fmt("path:%s", getStrAttr(input.attrs, "path"));
+    }
+
     bool isLocked(const Settings & settings, const Input & input) const override
     {
         return (bool) input.getNarHash();
