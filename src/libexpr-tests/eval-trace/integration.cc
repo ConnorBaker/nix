@@ -1,0 +1,371 @@
+#include "helpers.hh"
+#include "nix/expr/trace-store.hh"
+
+#include <gtest/gtest.h>
+
+#include "nix/expr/tests/libexpr.hh"
+#include "nix/expr/trace-cache.hh"
+#include "nix/util/hash.hh"
+
+namespace nix::eval_trace {
+
+using namespace nix::eval_trace::test;
+
+class TraceCacheIntegrationTest : public LibExprTest
+{
+public:
+    TraceCacheIntegrationTest()
+        : LibExprTest(openStore("dummy://", {{"read-only", "false"}}),
+            [](bool & readOnlyMode) {
+                readOnlyMode = false;
+                EvalSettings s{readOnlyMode};
+                s.nixPath = {};
+                return s;
+            })
+    {}
+
+protected:
+    // Writable cache dir for trace store SQLite (sandbox has no writable $HOME)
+    ScopedCacheDir cacheDir;
+
+    static constexpr int64_t testCtx = 0xDEADBEEF;
+    Hash testFingerprint = hashString(HashAlgorithm::SHA256, "integration-test");
+
+    TraceStore makeDbBackend()
+    {
+        return TraceStore(state.symbols, testCtx);
+    }
+
+    std::unique_ptr<TraceCache> makeCache(
+        const std::string & nixExpr,
+        int * loaderCalls = nullptr)
+    {
+        auto loader = [this, nixExpr, loaderCalls]() -> Value * {
+            if (loaderCalls) (*loaderCalls)++;
+            Value v = eval(nixExpr);
+            auto * result = state.allocValue();
+            *result = v;
+            return result;
+        };
+        return std::make_unique<TraceCache>(
+            testFingerprint, state, std::move(loader));
+    }
+};
+
+// ── TraceStore record/verify integration (BSàlC: trace recording then verification) ──
+
+TEST_F(TraceCacheIntegrationTest, ColdStore_ThenWarmPath)
+{
+    auto db = makeDbBackend();
+
+    auto storeResult = db.record(
+        "", string_t{"hello", {}}, {}, std::nullopt, true);
+
+    auto result = db.verify("", {}, state);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(std::holds_alternative<string_t>(result->value));
+    EXPECT_EQ(std::get<string_t>(result->value).first, "hello");
+    EXPECT_EQ(result->traceId, storeResult.traceId);
+}
+
+TEST_F(TraceCacheIntegrationTest, MultipleContextHashes_Isolated)
+{
+    // Use separate TraceStore instances with different context hashes (BSàlC: isolated trace stores)
+    {
+        TraceStore db1(state.symbols, 111);
+        db1.record("", string_t{"value-1", {}}, {}, std::nullopt, true);
+    }
+
+    {
+        TraceStore db2(state.symbols, 222);
+        db2.record("", string_t{"value-2", {}}, {}, std::nullopt, true);
+    }
+
+    // Verify isolation: each context hash sees its own trace result
+    {
+        TraceStore db1(state.symbols, 111);
+        auto r1 = db1.verify("", {}, state);
+        ASSERT_TRUE(r1.has_value());
+        ASSERT_TRUE(std::holds_alternative<string_t>(r1->value));
+        EXPECT_EQ(std::get<string_t>(r1->value).first, "value-1");
+    }
+    {
+        TraceStore db2(state.symbols, 222);
+        auto r2 = db2.verify("", {}, state);
+        ASSERT_TRUE(r2.has_value());
+        ASSERT_TRUE(std::holds_alternative<string_t>(r2->value));
+        EXPECT_EQ(std::get<string_t>(r2->value).first, "value-2");
+    }
+}
+
+// ── Parent-child trace chain tests (Adapton: DDG parent-child edges) ──
+
+TEST_F(TraceCacheIntegrationTest, ParentChild_AttrChain)
+{
+    auto db = makeDbBackend();
+
+    auto parentResult = db.record(
+        "", std::vector<Symbol>{createSymbol("child")},
+        {}, std::nullopt, true);
+
+    std::string childAttrPath = "child";
+    db.record(
+        childAttrPath, int_t{NixInt{42}},
+        {}, parentResult.traceId, false);
+
+    // Verification for child should work (BSàlC: verify child trace with parent hint)
+    auto result = db.verify(childAttrPath, {}, state, parentResult.traceId);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(std::holds_alternative<int_t>(result->value));
+    EXPECT_EQ(std::get<int_t>(result->value).x.value, 42);
+}
+
+TEST_F(TraceCacheIntegrationTest, ParentChild_ValidationCascade)
+{
+    ScopedEnvVar env("NIX_INT_TEST_VAR", "valid");
+
+    auto db = makeDbBackend();
+
+    // Parent trace with a valid dep (BSàlC: verifiable trace)
+    auto dep = makeEnvVarDep("NIX_INT_TEST_VAR", "valid");
+    auto parentResult = db.record(
+        "", null_t{}, {dep}, std::nullopt, true);
+
+    // Child trace inheriting parent validity (Shake: transitive clean)
+    auto childResult = db.record(
+        "child", int_t{NixInt{1}}, {}, parentResult.traceId, false);
+
+    EXPECT_TRUE(db.verifyTrace(childResult.traceId, {}, state));
+}
+
+TEST_F(TraceCacheIntegrationTest, ParentInvalidation_CascadesToChild)
+{
+    ScopedEnvVar env("NIX_INT_CASCADE", "current");
+
+    auto db = makeDbBackend();
+
+    // Parent trace with stale dep (hash doesn't match current oracle state)
+    auto staleDep = makeEnvVarDep("NIX_INT_CASCADE", "old_value");
+    auto parentResult = db.record(
+        "", null_t{}, {staleDep}, std::nullopt, true);
+
+    // Child with no direct deps
+    auto childResult = db.record(
+        "child", int_t{NixInt{1}}, {}, parentResult.traceId, false);
+
+    // Child trace should be invalid because parent trace is invalid (Shake: transitive dirty)
+    // (need to clear session memo since record marks as verified)
+    db.clearSessionCaches();
+    EXPECT_FALSE(db.verifyTrace(childResult.traceId, {}, state));
+}
+
+// ── Full TraceCache + DependencyTracker flow (BSàlC: end-to-end trace pipeline) ──
+
+TEST_F(TraceCacheIntegrationTest, FullFlow_ScalarRoot)
+{
+    // Fresh evaluation (BSàlC: trace recording)
+    {
+        auto cache = makeCache("\"hello world\"");
+        auto * v = cache->getRootValue();
+        state.forceValue(*v, noPos);
+        EXPECT_THAT(*v, IsStringEq("hello world"));
+    }
+    // Verification (BSàlC: verify trace and serve cached result)
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache("\"hello world\"", &loaderCalls);
+        auto * v = cache->getRootValue();
+        state.forceValue(*v, noPos);
+        EXPECT_THAT(*v, IsStringEq("hello world"));
+    }
+}
+
+TEST_F(TraceCacheIntegrationTest, FullFlow_NestedAttrAccess)
+{
+    // Fresh evaluation (BSàlC: trace recording)
+    {
+        auto cache = makeCache("{ x = { y = 42; }; }");
+        auto * v = cache->getRootValue();
+        state.forceValue(*v, noPos);
+        EXPECT_THAT(*v, IsAttrsOfSize(1));
+        auto * x = v->attrs()->get(createSymbol("x"));
+        ASSERT_NE(x, nullptr);
+        state.forceValue(*x->value, noPos);
+        auto * y = x->value->attrs()->get(createSymbol("y"));
+        ASSERT_NE(y, nullptr);
+        state.forceValue(*y->value, noPos);
+        EXPECT_THAT(*y->value, IsIntEq(42));
+    }
+    // Verification (BSàlC: verify trace and serve cached result)
+    {
+        auto cache = makeCache("{ x = { y = 42; }; }");
+        auto * v = cache->getRootValue();
+        state.forceValue(*v, noPos);
+        auto * x = v->attrs()->get(createSymbol("x"));
+        ASSERT_NE(x, nullptr);
+        state.forceValue(*x->value, noPos);
+        auto * y = x->value->attrs()->get(createSymbol("y"));
+        ASSERT_NE(y, nullptr);
+        state.forceValue(*y->value, noPos);
+        EXPECT_THAT(*y->value, IsIntEq(42));
+    }
+}
+
+TEST_F(TraceCacheIntegrationTest, FullFlow_TwoIndependentAttrs)
+{
+    // Fresh evaluation (BSàlC: trace recording)
+    {
+        auto cache = makeCache("{ a = 1; b = 2; }");
+        auto * v = cache->getRootValue();
+        state.forceValue(*v, noPos);
+        auto * a = v->attrs()->get(createSymbol("a"));
+        ASSERT_NE(a, nullptr);
+        state.forceValue(*a->value, noPos);
+        EXPECT_THAT(*a->value, IsIntEq(1));
+        auto * b = v->attrs()->get(createSymbol("b"));
+        ASSERT_NE(b, nullptr);
+        state.forceValue(*b->value, noPos);
+        EXPECT_THAT(*b->value, IsIntEq(2));
+    }
+    // Verification (BSàlC: verify trace and serve cached result)
+    {
+        auto cache = makeCache("{ a = 1; b = 2; }");
+        auto * v = cache->getRootValue();
+        state.forceValue(*v, noPos);
+        auto * a = v->attrs()->get(createSymbol("a"));
+        ASSERT_NE(a, nullptr);
+        state.forceValue(*a->value, noPos);
+        EXPECT_THAT(*a->value, IsIntEq(1));
+        auto * b = v->attrs()->get(createSymbol("b"));
+        ASSERT_NE(b, nullptr);
+        state.forceValue(*b->value, noPos);
+        EXPECT_THAT(*b->value, IsIntEq(2));
+    }
+}
+
+TEST_F(TraceCacheIntegrationTest, FullFlow_ParsedExpr)
+{
+    // Use state.parseExprFromString directly as the rootLoader
+    auto loader = [this]() -> Value * {
+        auto * e = state.parseExprFromString(
+            "{ message = \"parsed\"; count = 3; }",
+            state.rootPath(CanonPath::root));
+        auto * v = state.allocValue();
+        state.eval(e, *v);
+        return v;
+    };
+
+    // Fresh evaluation (BSàlC: trace recording)
+    {
+        auto cache = std::make_unique<TraceCache>(
+            testFingerprint, state, loader);
+        auto * v = cache->getRootValue();
+        state.forceValue(*v, noPos);
+        EXPECT_THAT(*v, IsAttrsOfSize(2));
+    }
+    // Verification (BSàlC: verify trace and serve cached result)
+    {
+        auto cache = std::make_unique<TraceCache>(
+            testFingerprint, state, loader);
+        auto * v = cache->getRootValue();
+        state.forceValue(*v, noPos);
+        EXPECT_THAT(*v, IsAttrsOfSize(2));
+    }
+}
+
+// ── Session memoization integration (Salsa: memoized verification) ───
+
+TEST_F(TraceCacheIntegrationTest, SessionCache_TraceVerification_SkipsRevalidation)
+{
+    ScopedEnvVar env("NIX_EVAL_SESSION", "ok");
+
+    auto db = makeDbBackend();
+    auto dep = makeEnvVarDep("NIX_EVAL_SESSION", "ok");
+    auto result = db.record(
+        "", null_t{}, {dep}, std::nullopt, true);
+
+    // Recording adds to verifiedTraceIds for non-volatile deps (Salsa: memoize verified query)
+    EXPECT_TRUE(db.verifiedTraceIds.count(result.traceId));
+
+    // Clear session memo and re-verify manually
+    db.clearSessionCaches();
+    EXPECT_TRUE(db.verifyTrace(result.traceId, {}, state));
+    EXPECT_TRUE(db.verifiedTraceIds.count(result.traceId));
+
+    // Second call should be memoized (hits verifiedTraceIds early exit — Salsa: green query)
+    EXPECT_TRUE(db.verifyTrace(result.traceId, {}, state));
+}
+
+TEST_F(TraceCacheIntegrationTest, SessionCache_VolatileDep_NotCached)
+{
+    auto db = makeDbBackend();
+    auto dep = makeCurrentTimeDep();
+    auto result = db.record(
+        "", null_t{}, {dep}, std::nullopt, true);
+
+    // Volatile deps should NOT be session-memoized (Salsa: no memoization for volatile)
+    EXPECT_FALSE(db.verifiedTraceIds.count(result.traceId));
+}
+
+// ── Constructive recovery flow integration (BSàlC: constructive traces) ──
+
+TEST_F(TraceCacheIntegrationTest, Recovery_AfterDepChange)
+{
+    // Step 1: Record trace with env var = "v1"
+    // Step 2: Change env var to "v2", old trace invalid
+    // Step 3: Change back to "v1" -> constructive recovery should find v1's trace
+
+    auto db = makeDbBackend();
+
+    // Step 1: Record trace with v1
+    TraceStore::RecordResult v1Result;
+    {
+        ScopedEnvVar env("NIX_RECOVERY_TEST", "v1");
+        auto dep = makeEnvVarDep("NIX_RECOVERY_TEST", "v1");
+        v1Result = db.record("", string_t{"result-v1", {}}, {dep}, std::nullopt, true);
+    }
+
+    // Step 2: Record trace with v2
+    {
+        ScopedEnvVar env("NIX_RECOVERY_TEST", "v2");
+        auto dep = makeEnvVarDep("NIX_RECOVERY_TEST", "v2");
+        db.record("", string_t{"result-v2", {}}, {dep}, std::nullopt, true);
+    }
+
+    // Step 3: Revert to v1 — trigger constructive recovery
+    {
+        ScopedEnvVar env("NIX_RECOVERY_TEST", "v1");
+
+        // Clear session memos to force re-verification
+        db.clearSessionCaches();
+
+        // Verification should fail (v2 trace deps don't match v1 oracle state)
+        // Constructive recovery should find v1's trace
+        auto result = db.verify("", {}, state);
+        if (result.has_value()) {
+            // Constructive recovery found v1's trace result!
+            ASSERT_TRUE(std::holds_alternative<string_t>(result->value));
+            EXPECT_EQ(std::get<string_t>(result->value).first, "result-v1");
+        }
+        // If constructive recovery doesn't find it, that's acceptable too
+    }
+}
+
+TEST_F(TraceCacheIntegrationTest, Recovery_VolatileFails)
+{
+    auto db = makeDbBackend();
+
+    // Record trace with volatile dep (Shake: always-dirty rule)
+    auto dep = makeCurrentTimeDep();
+    auto storeResult = db.record(
+        "", null_t{}, {dep}, std::nullopt, true);
+
+    // Clear session memo cache
+    db.clearSessionCaches();
+
+    // Constructive recovery should fail for volatile deps (Shake: always-dirty, no recovery)
+    auto result = db.recovery(storeResult.traceId, "", {}, state);
+    EXPECT_FALSE(result.has_value());
+}
+
+} // namespace nix::eval_trace

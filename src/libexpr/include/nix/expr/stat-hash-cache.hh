@@ -1,7 +1,7 @@
 #pragma once
 ///@file
 
-#include "nix/expr/file-load-tracker.hh"
+#include "nix/expr/dep-tracker.hh"
 #include "nix/util/file-system.hh"
 
 #include <filesystem>

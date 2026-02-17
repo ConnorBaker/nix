@@ -17,7 +17,7 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/globals.hh"
 #include "nix/util/hash.hh"
-#include "nix/expr/file-load-tracker.hh"
+#include "nix/expr/dep-tracker.hh"
 
 namespace nix {
 

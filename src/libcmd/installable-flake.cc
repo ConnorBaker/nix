@@ -13,7 +13,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/main/shared.hh"
 #include "nix/flake/flake.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/trace-cache.hh"
 #include "nix/util/url.hh"
 #include "nix/fetchers/registry.hh"
 #include "nix/store/build-result.hh"
@@ -80,7 +80,7 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
 {
     Activity act(*logger, lvlTalkative, actUnknown, fmt("evaluating derivation '%s'", what()));
 
-    auto evalCache = openEvalCache(*state, getLockedFlake());
+    auto evalCache = openTraceCache(*state, getLockedFlake());
     auto * root = evalCache->getRootValue();
     state->forceValue(*root, noPos);
 
@@ -128,12 +128,12 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
     auto drvPath = state->store->parseStorePath(aDrvPath->value->string_view());
     drvPath.requireDerivation();
     if (!state->store->isValidPath(drvPath)) {
-        /* The eval cache may have returned drvPath from a previous session,
-           but the .drv file was garbage-collected. Re-evaluate from scratch
-           via the rootLoader to regenerate it. This also re-copies any
-           source paths without derivers (e.g., .patch files added via
-           builtins.path or path coercion) that were GC'd along with the
-           .drv that referenced them. */
+        /* The eval trace may have returned a traced drvPath from a previous
+           session, but the .drv file was garbage-collected. Perform fresh
+           evaluation via the rootLoader to regenerate it (BSàlC: rebuild).
+           This also re-copies any source paths without derivers (e.g.,
+           .patch files added via builtins.path or path coercion) that were
+           GC'd along with the .drv that referenced them. */
         auto * realRoot = evalCache->getOrEvaluateRoot();
         state->forceValue(*realRoot, noPos);
         auto [v2, pos2] = findAlongAttrPath(*state, resolvedPath, *emptyArgs, *realRoot);
@@ -219,7 +219,7 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
 
 std::pair<Value *, PosIdx> InstallableFlake::toValue(EvalState & state)
 {
-    auto evalCache = openEvalCache(state, getLockedFlake());
+    auto evalCache = openTraceCache(state, getLockedFlake());
     auto * root = evalCache->getRootValue();
     state.forceValue(*root, noPos);
 

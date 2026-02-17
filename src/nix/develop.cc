@@ -709,7 +709,7 @@ struct CmdDevelop : Common, MixEnvironment
             }
         }
 
-        // Release our references to eval caches to ensure they are persisted to disk, because
+        // Release our references to trace caches to ensure they are persisted to disk, because
         // we are about to exec out of this process without running C++ destructors.
         getEvalState()->evalCaches.clear();
 

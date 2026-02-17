@@ -3,7 +3,7 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/store-api.hh"
 #include "nix/fetchers/fetchers.hh"
-#include "nix/expr/file-load-tracker.hh"
+#include "nix/expr/dep-tracker.hh"
 #include "nix/util/url.hh"
 #include "nix/util/url-parts.hh"
 
@@ -84,9 +84,9 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
 
     auto [storePath, input2] = input.fetchToStore(state.fetchSettings, *state.store);
 
-    // Record unlocked fetchMercurial with result store path for re-fetch validation
-    if (!input.isLocked(state.fetchSettings) && FileLoadTracker::isActive()) {
-        FileLoadTracker::record({"", input.to_string(),
+    // Record UnhashedFetch oracle dep for trace verification (re-fetch on verify)
+    if (!input.isLocked(state.fetchSettings) && DependencyTracker::isActive()) {
+        DependencyTracker::record({"", input.to_string(),
             DepHashValue(state.store->printStorePath(storePath)), DepType::UnhashedFetch});
     }
 

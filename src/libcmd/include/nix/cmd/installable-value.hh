@@ -9,9 +9,9 @@ namespace nix {
 struct PackageInfo;
 struct SourceExprCommand;
 
-namespace eval_cache {
-class EvalCache;
-} // namespace eval_cache
+namespace eval_trace {
+class TraceCache;
+} // namespace eval_trace
 
 struct App
 {

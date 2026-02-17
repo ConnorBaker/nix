@@ -3,7 +3,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
-#include "nix/expr/file-load-tracker.hh"
+#include "nix/expr/dep-tracker.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/expr/json-to-value.hh"
 #include "nix/expr/static-string-data.hh"
@@ -511,10 +511,10 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 
     auto output = runProgram(program, true, commandArgs);
 
-    // Record exec dep for eval cache. Always invalidates since we cannot
-    // safely re-execute the program to verify the output hasn't changed.
-    if (FileLoadTracker::isActive()) {
-        FileLoadTracker::record({"<exec>", program, depHash(program + "\0" + output), DepType::Exec});
+    // Record Exec oracle dep for the eval trace (Shake-style: always dirty
+    // since we cannot safely re-execute the program during verification).
+    if (DependencyTracker::isActive()) {
+        DependencyTracker::record({"<exec>", program, depHash(program + "\0" + output), DepType::Exec});
     }
 
     Expr * parsed;
@@ -1225,10 +1225,10 @@ static void prim_getEnv(EvalState & state, const PosIdx pos, Value ** args, Valu
         ? "" : getEnv(name).value_or("");
     v.mkString(value, state.mem);
 
-    // Record env var dependency for eval cache
-    if (FileLoadTracker::isActive() && !state.settings.pureEval && !state.settings.restrictEval) {
+    // Record EnvVar oracle dep for the eval trace (Shake-style external dependency)
+    if (DependencyTracker::isActive() && !state.settings.pureEval && !state.settings.restrictEval) {
         auto hash = depHash(value);
-        FileLoadTracker::record({"", name, hash, DepType::EnvVar});
+        DependencyTracker::record({"", name, hash, DepType::EnvVar});
     }
 }
 
@@ -1337,7 +1337,7 @@ static void prim_warn(EvalState & state, const PosIdx pos, Value ** args, Value 
     }
 
     if (state.settings.builtinsAbortOnWarn) {
-        // Not an EvalError or subclass, which would cause the error to be stored in the eval cache.
+        // Not an EvalError or subclass, which would cause the error to be recorded in the eval trace.
         state.error<EvalBaseError>("aborting to reveal stack trace of warning, as abort-on-warn is set")
             .setIsFromExpr()
             .debugThrow();
@@ -1834,14 +1834,15 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
     auto drvPath = writeDerivation(*state.store, drv, state.repair);
     auto drvPathS = state.store->printStorePath(drvPath);
 
-    // TODO: Record an Existence dep for the .drv store path so the eval
-    // cache self-invalidates when GC removes it. An earlier attempt caused
-    // CA test failures (ca/build-delete, ca/issue-13247): when .drv files
-    // are deleted mid-test, the Existence dep fails validation, routing
-    // through evaluateCold instead of toDerivedPaths recovery. The cold
-    // path re-evaluates derivationStrictInternal, which calls
-    // pathDerivationModulo() on input .drv files that were also deleted,
-    // producing "path does not exist" errors via SourceAccessor::lstat().
+    // TODO: Record an Existence dep for the .drv store path so trace
+    // verification (BSàlC: verifying trace) detects GC removal. An earlier
+    // attempt caused CA test failures (ca/build-delete, ca/issue-13247):
+    // when .drv files are deleted mid-test, the Existence dep fails
+    // verification, routing through fresh evaluation instead of the
+    // toDerivedPaths recovery path. Fresh evaluation re-evaluates
+    // derivationStrictInternal, which calls pathDerivationModulo() on
+    // input .drv files that were also deleted, producing "path does not
+    // exist" errors via SourceAccessor::lstat().
 
     printMsg(lvlChatty, "instantiated '%1%' -> '%2%'", drvName, drvPathS);
 
@@ -1997,11 +1998,11 @@ static void prim_pathExists(EvalState & state, const PosIdx pos, Value ** args, 
         auto st = path.maybeLstat();
         auto exists = st && (!mustBeDir || st->type == SourceAccessor::tDirectory);
 
-        // Record existence dependency for eval cache tracking.
+        // Record Existence oracle dep for trace verification.
         // We record the file type (not just existence) so that type changes
-        // (e.g. directory → file) are detected, which matters for mustBeDir
+        // (e.g. directory -> file) are detected, which matters for mustBeDir
         // paths like `builtins.pathExists ./foo/`.
-        if (FileLoadTracker::isActive()) {
+        if (DependencyTracker::isActive()) {
             DepHashValue hashValue = st
                 ? DepHashValue(fmt("type:%d", static_cast<int>(st->type)))
                 : DepHashValue(std::string("missing"));
@@ -2114,8 +2115,8 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
     auto path = state.realisePath(pos, *args[0]);
     auto s = path.readFile();
 
-    // Record content dependency for eval cache tracking
-    if (FileLoadTracker::isActive()) {
+    // Record Content oracle dep for trace verification (Adapton DDG edge)
+    if (DependencyTracker::isActive()) {
         auto hash = depHash(s);
         recordDep(path.path, hash, DepType::Content, state.mountToInput);
     }
@@ -2356,8 +2357,8 @@ static void prim_hashFile(EvalState & state, const PosIdx pos, Value ** args, Va
     auto path = state.realisePath(pos, *args[1]);
     auto content = path.readFile();
 
-    // Record content dependency for eval cache tracking
-    if (FileLoadTracker::isActive()) {
+    // Record Content oracle dep for trace verification (Adapton DDG edge)
+    if (DependencyTracker::isActive()) {
         auto hash = depHash(content);
         recordDep(path.path, hash, DepType::Content, state.mountToInput);
     }
@@ -2415,8 +2416,8 @@ static void prim_readFileType(EvalState & state, const PosIdx pos, Value ** args
     auto path = state.realisePath(pos, *args[0], std::nullopt);
     auto st = path.lstat();
 
-    // Record existence dep (with file type) for eval cache tracking
-    if (FileLoadTracker::isActive()) {
+    // Record Existence oracle dep (with file type) for trace verification
+    if (DependencyTracker::isActive()) {
         recordDep(path.path, DepHashValue(fmt("type:%d", static_cast<int>(st.type))),
             DepType::Existence, state.mountToInput);
     }
@@ -2444,8 +2445,8 @@ static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Val
     // on many systems.
     auto entries = path.readDirectory();
 
-    // Record directory dependency for eval cache tracking
-    if (FileLoadTracker::isActive()) {
+    // Record Directory oracle dep for trace verification
+    if (DependencyTracker::isActive()) {
         recordDep(path.path, depHashDirListing(entries), DepType::Directory, state.mountToInput);
     }
     auto attrs = state.buildBindings(entries.size());
@@ -2882,30 +2883,31 @@ static void addPath(
 
         std::unique_ptr<PathFilter> filter;
         if (filterFun) {
-            // Check once whether we should record per-file deps for this
-            // filtered path (avoid repeated checks in the lambda).
-            bool recordFilterDeps = FileLoadTracker::isActive()
+            // Check once whether we should record per-file oracle deps for
+            // this filtered path (avoid repeated checks in the lambda).
+            bool recordFilterDeps = DependencyTracker::isActive()
                 && !state.store->isInStore(path.path.abs());
 
-            // Directory deps for filtered builtins.path / filterSource:
+            // Directory oracle deps for filtered builtins.path / filterSource:
             //
             // We record a Directory dep (full listing hash) for each directory
             // traversed during the filtered copy, including the root. This is
             // deliberately over-conservative: the hash includes entries the filter
             // rejects, so adding a file the filter would ignore (e.g. a .log file)
-            // still invalidates the cache.
+            // still invalidates the trace during verification.
             //
             // Why the full listing is necessary:
-            //   Per-file NARContent deps validate files that existed at cache time,
-            //   but cannot detect NEW files that appeared later. If a new file passes
-            //   the filter, the result would differ, yet no existing NARContent dep
-            //   would catch it. The Directory dep ensures any listing change triggers
-            //   re-evaluation.
+            //   Per-file NARContent deps validate files that were traced at
+            //   recording time, but cannot detect NEW files that appeared later.
+            //   If a new file passes the filter, the result would differ, yet no
+            //   existing NARContent dep would catch it. The Directory dep ensures
+            //   any listing change triggers fresh evaluation (BSàlC: rebuilding).
             //
             // Why we can't hash only the filtered listing:
-            //   Dep validation runs before evaluation — the Nix filter function is
-            //   not available. CopiedPath validation (computeStorePath) also can't
-            //   replicate filtered copies because it computes the unfiltered NAR hash.
+            //   Trace verification runs before evaluation -- the Nix filter
+            //   function is not available. CopiedPath validation (computeStorePath)
+            //   also can't replicate filtered copies because it computes the
+            //   unfiltered NAR hash.
             //
             // Possible future refinements:
             //   - A FilteredCopiedPath dep that re-runs fetchToStore() with the filter
@@ -2913,7 +2915,7 @@ static void addPath(
             //     conservatively invalidates only when new (unknown) entries appear
             //   - For builtins.path on large working directories, the root Directory
             //     dep is inherently fragile (any new file invalidates). Users should
-            //     avoid creating files in the source tree between cached evaluations.
+            //     avoid creating files in the source tree between traced evaluations.
             filter = std::make_unique<PathFilter>([&](const Path & p) {
                 auto p2 = CanonPath(p);
                 SourcePath sp{path.accessor, p2};
@@ -2977,10 +2979,10 @@ static void addPath(
             state.allowAndSetStorePathString(*expectedStorePath, v);
         }
 
-        // Record CopiedPath dep for unfiltered paths only. For filtered paths,
-        // per-file Content + Directory deps were already recorded in the PathFilter
-        // lambda above (more granular, avoids expensive unfiltered NAR hash).
-        if (!filterFun && refs.empty() && FileLoadTracker::isActive()
+        // Record CopiedPath oracle dep for unfiltered paths only. For filtered
+        // paths, per-file Content + Directory deps were already recorded in the
+        // PathFilter lambda above (more granular, avoids expensive unfiltered NAR hash).
+        if (!filterFun && refs.empty() && DependencyTracker::isActive()
             && !state.store->isInStore(path.path.abs()))
         {
             recordDep(path.path, DepHashValue(resultStorePath), DepType::CopiedPath, state.mountToInput);
@@ -5357,8 +5359,8 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
             .name = "__currentTime_thunk",
             .arity = 1,
             .fun = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
-                if (FileLoadTracker::isActive()) {
-                    FileLoadTracker::record({"", "currentTime",
+                if (DependencyTracker::isActive()) {
+                    DependencyTracker::record({"", "currentTime",
                         DepHashValue(std::to_string(time(0))), DepType::CurrentTime});
                 }
                 v.mkInt(time(0));
@@ -5403,10 +5405,10 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
             .name = "__currentSystem_thunk",
             .arity = 1,
             .fun = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
-                if (FileLoadTracker::isActive()) {
+                if (DependencyTracker::isActive()) {
                     auto system = state.settings.getCurrentSystem();
                     auto hash = depHash(system);
-                    FileLoadTracker::record({"", "currentSystem", hash, DepType::System});
+                    DependencyTracker::record({"", "currentSystem", hash, DepType::System});
                 }
                 v.mkString(state.settings.getCurrentSystem(), state.mem);
             },

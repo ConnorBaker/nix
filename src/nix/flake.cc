@@ -11,7 +11,7 @@
 #include "nix/expr/attr-path.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/registry.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/trace-cache.hh"
 #include "nix/cmd/markdown.hh"
 #include "nix/util/users.hh"
 #include "nix/fetchers/fetch-to-store.hh"
@@ -374,7 +374,7 @@ struct CmdFlakeCheck : FlakeCommand
 
         StringSet omittedSystems;
 
-        // FIXME: rewrite to use EvalCache.
+        // FIXME: rewrite to use the eval trace (TraceCache).
 
         auto resolve = [&](PosIdx p) { return state->positions[p]; };
 
@@ -1502,7 +1502,7 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
             return j;
         };
 
-        auto cache = openEvalCache(*state, ref<flake::LockedFlake>(flake));
+        auto cache = openTraceCache(*state, ref<flake::LockedFlake>(flake));
         auto * root = cache->getRootValue();
         state->forceValue(*root, noPos);
 

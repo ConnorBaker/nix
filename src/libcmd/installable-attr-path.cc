@@ -12,7 +12,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/main/shared.hh"
 #include "nix/flake/flake.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/trace-cache.hh"
 #include "nix/util/url.hh"
 #include "nix/util/hash.hh"
 #include "nix/util/environment-variables.hh"
@@ -83,20 +83,20 @@ InstallableAttrPath::InstallableAttrPath(
 {
 }
 
-ref<eval_cache::EvalCache> InstallableAttrPath::getOrCreateEvalCache(EvalState & state)
+ref<eval_trace::TraceCache> InstallableAttrPath::getOrCreateTraceCache(EvalState & state)
 {
     std::optional<Hash> stableIdentity;
-    if (state.settings.useEvalCache)
+    if (state.settings.useTraceCache)
         stableIdentity = computeFileEvalIdentity(cmd, state);
 
     auto * autoArgs = cmd.getAutoArgs(state);
     auto vRoot = v; // RootValue (shared_ptr keeps GC root alive)
 
-    // When using the eval cache, the rootLoader must re-evaluate the
-    // expression from scratch so that FileLoadTracker (active during
-    // AttrCursor::forceValue()) captures dependencies. If we reused
-    // the pre-evaluated vRoot, state.forceValue() would be a no-op
-    // and the tracker would record zero deps.
+    // When using the eval trace, the rootLoader must perform fresh
+    // evaluation from scratch so the dependency tracker (Adapton DDG)
+    // captures oracle deps during trace recording. If we reused the
+    // pre-evaluated vRoot, state.forceValue() would be a no-op and
+    // the tracker would record zero deps.
     auto & cmdRef = cmd;
     auto rootLoader = [vRoot, autoArgs, &state, &cmdRef, stableIdentity]() -> Value * {
         if (getEnv("NIX_ALLOW_EVAL").value_or("1") == "0") {
@@ -105,7 +105,7 @@ ref<eval_cache::EvalCache> InstallableAttrPath::getOrCreateEvalCache(EvalState &
 
         Value * base;
         if (stableIdentity && (cmdRef.file || cmdRef.expr)) {
-            // Re-evaluate from source so FileLoadTracker captures deps
+            // Fresh evaluation from source so dependency tracker captures oracle deps
             base = state.allocValue();
             if (cmdRef.file) {
                 auto dir = absPath(cmdRef.getCommandBaseDir());
@@ -129,18 +129,18 @@ ref<eval_cache::EvalCache> InstallableAttrPath::getOrCreateEvalCache(EvalState &
         if (search == state.evalCaches.end()) {
             search = state.evalCaches
                 .emplace(*stableIdentity,
-                    make_ref<eval_cache::EvalCache>(
+                    make_ref<eval_trace::TraceCache>(
                         stableIdentity, state, rootLoader))
                 .first;
         }
         return search->second;
     }
-    return make_ref<eval_cache::EvalCache>(std::nullopt, state, rootLoader);
+    return make_ref<eval_trace::TraceCache>(std::nullopt, state, rootLoader);
 }
 
 std::pair<Value *, PosIdx> InstallableAttrPath::toValue(EvalState & state)
 {
-    auto evalCache = getOrCreateEvalCache(state);
+    auto evalCache = getOrCreateTraceCache(state);
     auto * root = evalCache->getRootValue();
     state.forceValue(*root, noPos);
 
@@ -165,13 +165,13 @@ DerivedPathsWithInfo InstallableAttrPath::toDerivedPaths()
         auto drvPath = state->store->parseStorePath(aDrvPath->value->string_view());
         drvPath.requireDerivation();
         if (!state->store->isValidPath(drvPath)) {
-            /* The eval cache may have returned drvPath from a previous session,
-               but the .drv file was garbage-collected. Re-evaluate from scratch
-               via the rootLoader to regenerate it. This also re-copies any
-               source paths without derivers (e.g., .patch files added via
-               builtins.path or path coercion) that were GC'd along with the
-               .drv that referenced them. */
-            auto evalCache = getOrCreateEvalCache(*state);
+            /* The eval trace may have returned a traced drvPath from a previous
+               session, but the .drv file was garbage-collected. Perform fresh
+               evaluation via the rootLoader to regenerate it (BSàlC: rebuild).
+               This also re-copies any source paths without derivers (e.g.,
+               .patch files added via builtins.path or path coercion) that were
+               GC'd along with the .drv that referenced them. */
+            auto evalCache = getOrCreateTraceCache(*state);
             auto * realRoot = evalCache->getOrEvaluateRoot();
             state->forceValue(*realRoot, noPos);
             Value * target = realRoot;

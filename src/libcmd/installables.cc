@@ -17,7 +17,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/main/shared.hh"
 #include "nix/flake/flake.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/trace-cache.hh"
 #include "nix/util/url.hh"
 #include "nix/fetchers/registry.hh"
 #include "nix/store/build-result.hh"
@@ -349,7 +349,7 @@ void completeFlakeRefWithFragment(
             auto flakeRef =
                 parseFlakeRef(fetchSettings, expandTilde(flakeRefS), std::filesystem::current_path().string());
 
-            auto evalCache = openEvalCache(
+            auto evalCache = openTraceCache(
                 *evalState, make_ref<flake::LockedFlake>(lockFlake(flakeSettings, *evalState, flakeRef, lockFlags)));
 
             auto * root = evalCache->getRootValue();
@@ -481,13 +481,15 @@ Installables SourceExprCommand::parseInstallables(ref<Store> store, std::vector<
         auto state = getEvalState();
         auto vFile = state->allocValue();
 
-        // When the eval cache is enabled and the source is cacheable (not stdin),
-        // defer evaluation: the rootLoader in getOrCreateEvalCache() will re-evaluate from
-        // source to capture file deps. Evaluating eagerly here would be wasted work.
+        // When the eval trace is enabled and the source is cacheable (not stdin),
+        // defer evaluation: the rootLoader in getOrCreateTraceCache() will
+        // perform fresh evaluation to record oracle deps (Adapton DDG edges).
+        // Evaluating eagerly here would be wasted work.
         // Don't defer when pureEval is true: eager evaluation enforces pureEval
-        // restrictions (e.g., no readFile) before the cache is consulted, preventing
-        // previously-cached impure results from being served in pure eval mode.
-        bool deferEval = evalSettings.useEvalCache && !evalSettings.pureEval
+        // restrictions (e.g., no readFile) before the trace is consulted,
+        // preventing previously-traced impure results from being served in
+        // pure eval mode.
+        bool deferEval = evalSettings.useTraceCache && !evalSettings.pureEval
             && !(file && file->string() == "-");
 
         if (file == "-") {

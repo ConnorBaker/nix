@@ -13,7 +13,7 @@
 #include "nix/expr/get-drvs.hh"
 #include "nix/store/store-api.hh"
 #include "nix/main/shared.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/trace-cache.hh"
 #include "nix/util/url.hh"
 #include "nix/fetchers/registry.hh"
 #include "nix/store/build-result.hh"
@@ -48,7 +48,7 @@ class InstallableAttrPath : public InstallableValue
 
     DerivedPathsWithInfo toDerivedPaths() override;
 
-    ref<eval_cache::EvalCache> getOrCreateEvalCache(EvalState & state);
+    ref<eval_trace::TraceCache> getOrCreateTraceCache(EvalState & state);
 
 public:
 

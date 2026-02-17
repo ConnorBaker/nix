@@ -2,7 +2,7 @@
 #include "nix/expr/primops.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
-#include "nix/expr/file-load-tracker.hh"
+#include "nix/expr/dep-tracker.hh"
 #include "nix/store/store-api.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/store/filetransfer.hh"
@@ -226,9 +226,9 @@ static void fetchTree(
 
     auto storePath = state.mountInput(cachedInput.lockedInput, input, cachedInput.accessor);
 
-    // Record unlocked fetchTree with result store path for re-fetch validation
-    if (!input.isLocked(state.fetchSettings) && FileLoadTracker::isActive()) {
-        FileLoadTracker::record({"", input.to_string(),
+    // Record UnhashedFetch oracle dep for trace verification (re-fetch on verify)
+    if (!input.isLocked(state.fetchSettings) && DependencyTracker::isActive()) {
+        DependencyTracker::record({"", input.to_string(),
             DepHashValue(state.store->printStorePath(storePath)), DepType::UnhashedFetch});
     }
 
@@ -460,9 +460,9 @@ static void fetch(
             .atPos(pos)
             .debugThrow();
 
-    // Record unhashed fetch as always-invalidate dep
-    if (!expectedHash && FileLoadTracker::isActive()) {
-        FileLoadTracker::record({"", *url, DepHashValue(std::string("")), DepType::UnhashedFetch});
+    // Record UnhashedFetch oracle dep (always dirty during trace verification)
+    if (!expectedHash && DependencyTracker::isActive()) {
+        DependencyTracker::record({"", *url, DepHashValue(std::string("")), DepType::UnhashedFetch});
     }
 
     // early exit if pinned and already in the store

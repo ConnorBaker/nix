@@ -1,7 +1,7 @@
 #include "nix/expr/eval.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/trace-cache.hh"
 #include "nix/expr/eval-settings.hh"
-#include "nix/expr/file-load-tracker.hh"
+#include "nix/expr/dep-tracker.hh"
 #include "nix/expr/primops.hh"
 #include "nix/expr/print-options.hh"
 #include "nix/expr/symbol-table.hh"
@@ -304,7 +304,7 @@ EvalState::EvalState(
     , trylevel(0)
     , srcToStore(make_ref<decltype(srcToStore)::element_type>())
     , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
-    , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
+    , fileTraceCache(make_ref<decltype(fileTraceCache)::element_type>())
     , regexCache(makeRegexCache())
 #if NIX_USE_BOEHMGC
     , baseEnvP(std::allocate_shared<Env *>(traceable_allocator<Env *>(), &mem.allocEnv(BASE_ENV_SIZE)))
@@ -1071,7 +1071,7 @@ Value * ExprPath::maybeThunk(EvalState & state, Env & env)
 /**
  * A helper `Expr` class to lets us parse and evaluate Nix expressions
  * from a thunk, ensuring that every file is parsed/evaluated only
- * once (via the thunk stored in `EvalState::fileEvalCache`).
+ * once (via the thunk stored in `EvalState::fileTraceCache`).
  */
 struct ExprParseFile : Expr, gc
 {
@@ -1120,8 +1120,8 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         importResolutionCache->emplace(path, *resolvedPath);
     }
 
-    // Record file dependency for eval cache tracking
-    if (FileLoadTracker::isActive()) {
+    // Record Content oracle dep for eval trace (Adapton DDG edge)
+    if (DependencyTracker::isActive()) {
         std::optional<Blake3Hash> hash;
         if (auto it = fileContentHashes.find(*resolvedPath); it != fileContentHashes.end()) {
             hash = it->second;
@@ -1131,14 +1131,14 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
                 hash = depHash(content);
                 fileContentHashes.emplace(*resolvedPath, *hash);
             } catch (Error &) {
-                // If we can't read the file, skip dep tracking for it
+                // If we can't read the file, skip oracle dep recording
             }
         }
         if (hash)
             recordDep(resolvedPath->path, DepHashValue(*hash), DepType::Content, mountToInput);
     }
 
-    if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
+    if (auto v2 = getConcurrent(*fileTraceCache, *resolvedPath)) {
         forceValue(**v2, noPos);
         v = **v2;
         return;
@@ -1151,7 +1151,7 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
     // `forceValue()` returns.
     auto expr = new ExprParseFile{*resolvedPath, mustBeTrivial};
 
-    fileEvalCache->try_emplace_and_cvisit(
+    fileTraceCache->try_emplace_and_cvisit(
         *resolvedPath,
         nullptr,
         [&](auto & i) {
@@ -1169,14 +1169,14 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
 void EvalState::resetFileCache()
 {
     importResolutionCache->clear();
-    fileEvalCache->clear();
+    fileTraceCache->clear();
     inputCache->clear();
     positions.clear();
     evalCaches.clear();
     fileContentHashes.clear();
     mountToInput.clear();
     epochMap.clear();
-    FileLoadTracker::clearSessionDeps();
+    DependencyTracker::clearSessionTraces();
 }
 
 void EvalState::replayMemoizedDeps(const Value & v)
@@ -1188,10 +1188,10 @@ void EvalState::replayMemoizedDeps(const Value & v)
 
     // Add the epoch range to each active tracker that doesn't already
     // include these deps in its own session range. Deduped by Value pointer.
-    for (auto * tracker = FileLoadTracker::activeTracker; tracker; tracker = tracker->previous) {
+    for (auto * tracker = DependencyTracker::activeTracker; tracker; tracker = tracker->previous) {
         // If the range is within this tracker's session range, skip —
-        // the deps are already captured by [startIndex, sessionDeps.size()).
-        if (range.deps == tracker->mySessionDeps
+        // the deps are already captured by [startIndex, sessionTraces.size()).
+        if (range.deps == tracker->mySessionTraces
             && range.start >= tracker->startIndex)
             continue;
         if (tracker->replayedValues.insert(&v).second)
@@ -1201,9 +1201,9 @@ void EvalState::replayMemoizedDeps(const Value & v)
 
 void EvalState::recordThunkDeps(Value & v, uint32_t epochStart)
 {
-    uint32_t epochEnd = FileLoadTracker::sessionDeps.size();
+    uint32_t epochEnd = DependencyTracker::sessionTraces.size();
     if (epochStart < epochEnd)
-        epochMap.emplace(&v, EpochRange{&FileLoadTracker::sessionDeps, epochStart, epochEnd});
+        epochMap.emplace(&v, DepRange{&DependencyTracker::sessionTraces, epochStart, epochEnd});
 }
 
 void EvalState::eval(Expr * e, Value & v)
@@ -2572,9 +2572,9 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
         return dstPath;
     }();
 
-    // Record a CopiedPath dep so the eval cache invalidates when the
+    // Record a CopiedPath dep so trace verification fails when the
     // store path for this source would change (i.e., any file changed).
-    if (!dstPathCached && FileLoadTracker::isActive()
+    if (!dstPathCached && DependencyTracker::isActive()
         && !hasPrefix(path.path.abs(), "/nix/store/"))
     {
         recordDep(path.path, DepHashValue(store->printStorePath(dstPath)),
@@ -3091,13 +3091,13 @@ void EvalState::printStatistics()
     topObj["nrPrimOpCalls"] = nrPrimOpCalls.load();
     topObj["nrFunctionCalls"] = nrFunctionCalls.load();
     topObj["evalCache"] = {
-        {"hits", eval_cache::nrEvalCacheHits.load()},
-        {"misses", eval_cache::nrEvalCacheMisses.load()},
-        {"depValidations", eval_cache::nrDepValidations.load()},
-        {"depValidationsPassed", eval_cache::nrDepValidationsPassed.load()},
-        {"depValidationsFailed", eval_cache::nrDepValidationsFailed.load()},
-        {"depsChecked", eval_cache::nrDepsChecked.load()},
-        {"verificationFailures", eval_cache::nrCacheVerificationFailures.load()},
+        {"hits", eval_trace::nrTraceCacheHits.load()},
+        {"misses", eval_trace::nrTraceCacheMisses.load()},
+        {"depValidations", eval_trace::nrTraceVerifications.load()},
+        {"depValidationsPassed", eval_trace::nrVerificationsPassed.load()},
+        {"depValidationsFailed", eval_trace::nrVerificationsFailed.load()},
+        {"depsChecked", eval_trace::nrDepsChecked.load()},
+        {"verificationFailures", eval_trace::nrRecoveryFailures.load()},
     };
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {
@@ -3191,8 +3191,8 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_p
     auto resolvedPath = path.resolveSymlinks();
     auto buffer = resolvedPath.readFile();
 
-    // Compute and cache content hash for dependency tracking
-    if (FileLoadTracker::isActive()) {
+    // Compute and cache content hash for oracle dep recording (Adapton DDG)
+    if (DependencyTracker::isActive()) {
         auto hash = depHash(buffer);
         fileContentHashes.emplace(resolvedPath, std::move(hash));
     }
@@ -3238,11 +3238,11 @@ SourcePath EvalState::findFile(const std::string_view path)
 
 SourcePath EvalState::findFile(const LookupPath & lookupPath, const std::string_view path, const PosIdx pos)
 {
-    // Record NIX_PATH dep for eval cache tracking
-    if (FileLoadTracker::isActive() && !settings.pureEval) {
+    // Record NIX_PATH dep for eval trace tracking
+    if (DependencyTracker::isActive() && !settings.pureEval) {
         auto nixPath = getEnv("NIX_PATH").value_or("");
         auto hash = depHash(nixPath);
-        FileLoadTracker::record({"", "NIX_PATH", hash, DepType::EnvVar});
+        DependencyTracker::record({"", "NIX_PATH", hash, DepType::EnvVar});
     }
 
     for (auto & i : lookupPath.elements) {

@@ -5,7 +5,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
-#include "nix/expr/file-load-tracker.hh"
+#include "nix/expr/dep-tracker.hh"
 
 namespace nix {
 
@@ -90,8 +90,8 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
-        uint32_t epochStart = FileLoadTracker::isActive()
-            ? FileLoadTracker::sessionDeps.size() : 0;
+        uint32_t epochStart = DependencyTracker::isActive()
+            ? DependencyTracker::sessionTraces.size() : 0;
         try {
             v.mkBlackhole();
             // checkInterrupt();
@@ -104,15 +104,15 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             tryFixupBlackHolePos(v, pos);
             throw;
         }
-        if (FileLoadTracker::isActive())
+        if (DependencyTracker::isActive())
             recordThunkDeps(v, epochStart);
     } else if (v.isApp()) {
-        uint32_t epochStart = FileLoadTracker::isActive()
-            ? FileLoadTracker::sessionDeps.size() : 0;
+        uint32_t epochStart = DependencyTracker::isActive()
+            ? DependencyTracker::sessionTraces.size() : 0;
         callFunction(*v.app().left, *v.app().right, v, pos);
-        if (FileLoadTracker::isActive())
+        if (DependencyTracker::isActive())
             recordThunkDeps(v, epochStart);
-    } else if (FileLoadTracker::isActive()) {
+    } else if (DependencyTracker::isActive()) {
         replayMemoizedDeps(v);
     }
 }

@@ -169,6 +169,6 @@ EOF
   git commit -m "Initial commit"
 
   # I don't understand why two calls are necessary to reproduce the issue.
-  nix eval --json .#nestedFlake1.nestedFlake2 --no-eval-cache
-  nix eval --json .#nestedFlake1.nestedFlake2 --no-eval-cache
+  nix eval --json .#nestedFlake1.nestedFlake2 --no-eval-trace
+  nix eval --json .#nestedFlake1.nestedFlake2 --no-eval-trace
 )

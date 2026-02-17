@@ -24,7 +24,7 @@
 #include "nix/util/environment-variables.hh"
 #include "nix/flake/flake.hh"
 #include "nix/expr/eval.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/trace-cache.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/flake/lockfile.hh"
 #include "nix/expr/eval-inline.hh"
@@ -1018,15 +1018,15 @@ static std::optional<Hash> computeStableIdentity(ref<const LockedFlake> lockedFl
     return hashString(HashAlgorithm::BLAKE3, *identity);
 }
 
-ref<eval_cache::EvalCache> openEvalCache(EvalState & state, ref<const LockedFlake> lockedFlake)
+ref<eval_trace::TraceCache> openTraceCache(EvalState & state, ref<const LockedFlake> lockedFlake)
 {
-    auto stableIdentity = state.settings.useEvalCache
+    auto stableIdentity = state.settings.useTraceCache
                               ? computeStableIdentity(lockedFlake)
                               : std::nullopt;
 
     auto [lockFileStr, keyMap] = lockedFlake->lockFile.to_string();
 
-    // Build mount-to-input and input-accessors maps for dep tracking
+    // Build mount-to-input and input-accessors maps for oracle dep recording
     std::map<CanonPath, std::pair<std::string, std::string>> mountToInput;
     std::map<std::string, SourcePath> inputAccessors;
 
@@ -1041,8 +1041,8 @@ ref<eval_cache::EvalCache> openEvalCache(EvalState & state, ref<const LockedFlak
     }
 
     // Populate inputAccessors/mountToInput for locked nodes NOT in nodePaths.
-    // This ensures dep tracking works for all flake inputs, even those that
-    // were already locked and didn't need re-fetching during lockFlake().
+    // This ensures oracle dep recording works for all flake inputs, even
+    // those that were already locked and didn't need re-fetching during lockFlake().
     for (auto & [node, key] : keyMap) {
         if (inputAccessors.count(key))
             continue; // Already populated from nodePaths
@@ -1075,8 +1075,8 @@ ref<eval_cache::EvalCache> openEvalCache(EvalState & state, ref<const LockedFlak
     state.mountToInput = mountToInput;
 
     auto rootLoader = [&state, lockedFlake]() {
-        /* For testing whether the evaluation cache is
-           complete. */
+        /* For testing whether the eval trace is complete
+           (i.e. all needed attributes have been traced). */
         if (getEnv("NIX_ALLOW_EVAL").value_or("1") == "0")
             throw Error("not everything is cached, but evaluation is not allowed");
 
@@ -1096,14 +1096,14 @@ ref<eval_cache::EvalCache> openEvalCache(EvalState & state, ref<const LockedFlak
         if (search == state.evalCaches.end()) {
             search = state.evalCaches
                          .emplace(stableIdentity.value(),
-                             make_ref<eval_cache::EvalCache>(
+                             make_ref<eval_trace::TraceCache>(
                                  stableIdentity, state, rootLoader,
                                  std::move(inputAccessors)))
                          .first;
         }
         return search->second;
     } else {
-        return make_ref<eval_cache::EvalCache>(
+        return make_ref<eval_trace::TraceCache>(
             std::nullopt, state, rootLoader,
             std::move(inputAccessors));
     }

@@ -23,14 +23,14 @@ while IFS= read -r d; do
 done < <(jq -r '.[] | .drvPath' "$TEST_ROOT"/a.json)
 nix copy --to "$cache" "${drvs[@]}"
 # Also copy resolved drvs (needed for CA early cut-off via derivation
-# resolution). Glob may also match eval cache drvs — copy those
+# resolution). Glob may also match eval trace drvs — copy those
 # best-effort (they are InputAddressed and harmless in the cache).
 for d in "$NIX_STORE_DIR"/*-issue-13247-a.drv "$NIX_STORE_DIR"/*-use-a-more-outputs.drv; do
     nix copy --to "$cache" "$d" "$d"^* 2>/dev/null || true
 done
 
 function delete () {
-    # The eval cache store backend writes CBOR result files into the store
+    # The eval trace store backend writes CBOR result files into the store
     # whose content includes serialized store path strings (drvPath, outPath).
     # The store's NAR scanner picks these up as references, preventing
     # deletion of the user paths they mention. Delete referrers first.

@@ -255,24 +255,27 @@ struct EvalSettings : Config
           See [`eval-profiler`](#conf-eval-profiler).
         )"};
 
-    Setting<bool> useEvalCache{
+    Setting<bool> useTraceCache{
         this,
         true,
-        "eval-cache",
+        "eval-trace",
         R"(
-            Whether to use the flake evaluation cache.
-            Certain commands won't have to evaluate when invoked for the second time with a particular version of a flake.
-            Intermediate results are not cached.
+            Whether to use the eval trace (BSàlC: verifying traces).
+            When enabled, certain commands skip fresh evaluation on
+            subsequent invocations with the same flake version by
+            verifying recorded oracle deps instead of re-evaluating.
+            Intermediate results are not traced.
         )"};
 
-    Setting<bool> verifyEvalCache{
+    Setting<bool> verifyTraceCache{
         this,
         false,
-        "verify-eval-cache",
+        "verify-eval-trace",
         R"(
-            When enabled, every eval cache warm-path hit is verified by also
-            evaluating the cold path and comparing results. Mismatches are
-            logged as warnings. Intended for debugging, not production use.
+            When enabled, every trace verification hit is cross-checked
+            by also performing fresh evaluation and comparing results.
+            Mismatches are logged as warnings. Intended for debugging
+            trace correctness, not production use.
         )"};
 
     Setting<bool> ignoreExceptionsDuringTry{
