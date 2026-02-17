@@ -1,5 +1,6 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/file-load-tracker.hh"
 #include "nix/expr/primops.hh"
 #include "nix/expr/print-options.hh"
 #include "nix/expr/symbol-table.hh"
@@ -1118,6 +1119,24 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         importResolutionCache->emplace(path, *resolvedPath);
     }
 
+    // Record file dependency for eval cache tracking
+    if (FileLoadTracker::isActive()) {
+        std::optional<Blake3Hash> hash;
+        if (auto it = fileContentHashes.find(*resolvedPath); it != fileContentHashes.end()) {
+            hash = it->second;
+        } else {
+            try {
+                auto content = resolvedPath->readFile();
+                hash = depHash(content);
+                fileContentHashes.emplace(*resolvedPath, *hash);
+            } catch (Error &) {
+                // If we can't read the file, skip dep tracking for it
+            }
+        }
+        if (hash)
+            recordDep(resolvedPath->path, DepHashValue(*hash), DepType::Content, mountToInput);
+    }
+
     if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
         forceValue(**v2, noPos);
         v = **v2;
@@ -1152,6 +1171,38 @@ void EvalState::resetFileCache()
     fileEvalCache->clear();
     inputCache->clear();
     positions.clear();
+    evalCaches.clear();
+    fileContentHashes.clear();
+    mountToInput.clear();
+    epochMap.clear();
+    FileLoadTracker::clearSessionDeps();
+}
+
+void EvalState::replayMemoizedDeps(const Value & v)
+{
+    auto it = epochMap.find(&v);
+    if (it == epochMap.end()) return;
+
+    auto & range = it->second;
+
+    // Add the epoch range to each active tracker that doesn't already
+    // include these deps in its own session range. Deduped by Value pointer.
+    for (auto * tracker = FileLoadTracker::activeTracker; tracker; tracker = tracker->previous) {
+        // If the range is within this tracker's session range, skip —
+        // the deps are already captured by [startIndex, sessionDeps.size()).
+        if (range.deps == tracker->mySessionDeps
+            && range.start >= tracker->startIndex)
+            continue;
+        if (tracker->replayedValues.insert(&v).second)
+            tracker->replayedRanges.push_back(range);
+    }
+}
+
+void EvalState::recordThunkDeps(Value & v, uint32_t epochStart)
+{
+    uint32_t epochEnd = FileLoadTracker::sessionDeps.size();
+    if (epochStart < epochEnd)
+        epochMap.emplace(&v, EpochRange{&FileLoadTracker::sessionDeps, epochStart, epochEnd});
 }
 
 void EvalState::eval(Expr * e, Value & v)
@@ -2520,9 +2571,19 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
         return dstPath;
     }();
 
+    // Record a CopiedPath dep so the eval cache invalidates when the
+    // store path for this source would change (i.e., any file changed).
+    if (!dstPathCached && FileLoadTracker::isActive()
+        && !hasPrefix(path.path.abs(), "/nix/store/"))
+    {
+        recordDep(path.path, DepHashValue(store->printStorePath(dstPath)),
+            DepType::CopiedPath, mountToInput);
+    }
+
     context.insert(NixStringContextElem::Opaque{.path = dstPath});
     return dstPath;
 }
+
 
 SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)
 {
@@ -3117,7 +3178,15 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path)
 
 Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv)
 {
-    auto buffer = path.resolveSymlinks().readFile();
+    auto resolvedPath = path.resolveSymlinks();
+    auto buffer = resolvedPath.readFile();
+
+    // Compute and cache content hash for dependency tracking
+    if (FileLoadTracker::isActive()) {
+        auto hash = depHash(buffer);
+        fileContentHashes.emplace(resolvedPath, std::move(hash));
+    }
+
     // readFile hopefully have left some extra space for terminators
     buffer.append("\0\0", 2);
     return parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);
@@ -3159,6 +3228,13 @@ SourcePath EvalState::findFile(const std::string_view path)
 
 SourcePath EvalState::findFile(const LookupPath & lookupPath, const std::string_view path, const PosIdx pos)
 {
+    // Record NIX_PATH dep for eval cache tracking
+    if (FileLoadTracker::isActive() && !settings.pureEval) {
+        auto nixPath = getEnv("NIX_PATH").value_or("");
+        auto hash = depHash(nixPath);
+        FileLoadTracker::record({"", "NIX_PATH", hash, DepType::EnvVar});
+    }
+
     for (auto & i : lookupPath.elements) {
         auto suffixOpt = i.prefix.suffixIfPotentialMatch(path);
 

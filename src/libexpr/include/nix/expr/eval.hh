@@ -4,6 +4,7 @@
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-profiler.hh"
+#include "nix/expr/file-load-tracker.hh"
 #include "nix/util/types.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/nixexpr.hh"
@@ -468,6 +469,46 @@ public:
      * A cache for evaluation caches, so as to reuse the same root value if possible
      */
     std::map<const Hash, ref<eval_cache::EvalCache>> evalCaches;
+
+    /**
+     * Cache of file content SHA-256 hashes, keyed by SourcePath.
+     * Populated during parseExprFromFile() and used by evalFile()
+     * for dependency tracking.
+     */
+    std::map<SourcePath, Blake3Hash> fileContentHashes;
+
+    /**
+     * Maps store mount points to (inputName, subdir) pairs.
+     * Used to resolve absolute paths back to input-relative paths
+     * for dependency tracking. Populated by openEvalCache().
+     */
+    std::map<CanonPath, std::pair<std::string, std::string>> mountToInput;
+
+    /**
+     * Epoch-based memoized deps from thunk/app evaluation, keyed by Value address.
+     * Each entry records the [start, end) range in the session-wide dep vector
+     * that was produced during the thunk's evaluation. Used by replayMemoizedDeps()
+     * to replay deps for already-forced values into active trackers.
+     */
+    boost::unordered_flat_map<const Value *, EpochRange> epochMap;
+
+    /**
+     * Replay memoized deps for an already-forced Value into active trackers.
+     * Called when forceValue encounters a non-thunk, non-app Value with
+     * an active FileLoadTracker. Adds the value's epoch range to each
+     * active tracker's replayedRanges (skipping trackers that already
+     * include those deps in their session range).
+     */
+    void replayMemoizedDeps(const Value & v);
+
+    /**
+     * Record that thunk/app evaluation of `v` produced deps in
+     * [epochStart, sessionDeps.size()). Called from forceValue after
+     * thunk or app evaluation completes. Extracted as noinline to keep
+     * forceValue's hot path small.
+     */
+    [[gnu::noinline]]
+    void recordThunkDeps(Value & v, uint32_t epochStart);
 
 private:
 

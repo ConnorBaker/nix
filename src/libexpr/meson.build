@@ -91,6 +91,9 @@ configdata_priv.set(
 
 deps_other += toml11
 
+sqlite = dependency('sqlite3', 'sqlite', version : '>=3.37.0')
+deps_other += sqlite
+
 config_priv_h = configure_file(
   configuration : configdata_priv,
   output : 'expr-config-private.hh',
@@ -154,6 +157,7 @@ sources = files(
   'attr-path.cc',
   'attr-set.cc',
   'eval-cache.cc',
+  'file-load-tracker.cc',
   'eval-error.cc',
   'eval-gc.cc',
   'eval-profiler-settings.cc',
@@ -170,6 +174,7 @@ sources = files(
   'print-ambiguous.cc',
   'print.cc',
   'search-path.cc',
+  'stat-hash-cache.cc',
   'value-to-json.cc',
   'value-to-xml.cc',
   'value.cc',

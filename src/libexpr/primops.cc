@@ -3,6 +3,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/file-load-tracker.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/expr/json-to-value.hh"
 #include "nix/expr/static-string-data.hh"
@@ -509,6 +510,13 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
     }
 
     auto output = runProgram(program, true, commandArgs);
+
+    // Record exec dep for eval cache. Always invalidates since we cannot
+    // safely re-execute the program to verify the output hasn't changed.
+    if (FileLoadTracker::isActive()) {
+        FileLoadTracker::record({"<exec>", program, depHash(program + "\0" + output), DepType::Exec});
+    }
+
     Expr * parsed;
     try {
         parsed = state.parseExprFromString(std::move(output), state.rootPath(CanonPath::root));
@@ -1213,7 +1221,15 @@ static void prim_getEnv(EvalState & state, const PosIdx pos, Value ** args, Valu
 {
     std::string name(
         state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.getEnv"));
-    v.mkString(state.settings.restrictEval || state.settings.pureEval ? "" : getEnv(name).value_or(""), state.mem);
+    auto value = state.settings.restrictEval || state.settings.pureEval
+        ? "" : getEnv(name).value_or("");
+    v.mkString(value, state.mem);
+
+    // Record env var dependency for eval cache
+    if (FileLoadTracker::isActive() && !state.settings.pureEval && !state.settings.restrictEval) {
+        auto hash = depHash(value);
+        FileLoadTracker::record({"", name, hash, DepType::EnvVar});
+    }
 }
 
 static RegisterPrimOp primop_getEnv({
@@ -1818,6 +1834,15 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
     auto drvPath = writeDerivation(*state.store, drv, state.repair);
     auto drvPathS = state.store->printStorePath(drvPath);
 
+    // TODO: Record an Existence dep for the .drv store path so the eval
+    // cache self-invalidates when GC removes it. An earlier attempt caused
+    // CA test failures (ca/build-delete, ca/issue-13247): when .drv files
+    // are deleted mid-test, the Existence dep fails validation, routing
+    // through evaluateCold instead of toDerivedPaths recovery. The cold
+    // path re-evaluates derivationStrictInternal, which calls
+    // pathDerivationModulo() on input .drv files that were also deleted,
+    // producing "path does not exist" errors via SourceAccessor::lstat().
+
     printMsg(lvlChatty, "instantiated '%1%' -> '%2%'", drvName, drvPathS);
 
     /* Optimisation, but required in read-only mode! because in that
@@ -1971,6 +1996,18 @@ static void prim_pathExists(EvalState & state, const PosIdx pos, Value ** args, 
 
         auto st = path.maybeLstat();
         auto exists = st && (!mustBeDir || st->type == SourceAccessor::tDirectory);
+
+        // Record existence dependency for eval cache tracking.
+        // We record the file type (not just existence) so that type changes
+        // (e.g. directory → file) are detected, which matters for mustBeDir
+        // paths like `builtins.pathExists ./foo/`.
+        if (FileLoadTracker::isActive()) {
+            DepHashValue hashValue = st
+                ? DepHashValue(fmt("type:%d", static_cast<int>(st->type)))
+                : DepHashValue(std::string("missing"));
+            recordDep(path.path, hashValue, DepType::Existence, state.mountToInput);
+        }
+
         v.mkBool(exists);
     } catch (RestrictedPathError & e) {
         v.mkBool(false);
@@ -2076,6 +2113,13 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
 {
     auto path = state.realisePath(pos, *args[0]);
     auto s = path.readFile();
+
+    // Record content dependency for eval cache tracking
+    if (FileLoadTracker::isActive()) {
+        auto hash = depHash(s);
+        recordDep(path.path, hash, DepType::Content, state.mountToInput);
+    }
+
     if (s.find((char) 0) != std::string::npos)
         state.error<EvalError>("the contents of the file '%1%' cannot be represented as a Nix string", path)
             .atPos(pos)
@@ -2310,8 +2354,15 @@ static void prim_hashFile(EvalState & state, const PosIdx pos, Value ** args, Va
         state.error<EvalError>("unknown hash algorithm '%1%'", algo).atPos(pos).debugThrow();
 
     auto path = state.realisePath(pos, *args[1]);
+    auto content = path.readFile();
 
-    v.mkString(hashString(*ha, path.readFile()).to_string(HashFormat::Base16, false), state.mem);
+    // Record content dependency for eval cache tracking
+    if (FileLoadTracker::isActive()) {
+        auto hash = depHash(content);
+        recordDep(path.path, hash, DepType::Content, state.mountToInput);
+    }
+
+    v.mkString(hashString(*ha, content).to_string(HashFormat::Base16, false), state.mem);
 }
 
 static RegisterPrimOp primop_hashFile({
@@ -2362,8 +2413,15 @@ static const Value & fileTypeToString(EvalState & state, SourceAccessor::Type ty
 static void prim_readFileType(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto path = state.realisePath(pos, *args[0], std::nullopt);
-    /* Retrieve the directory entry type and stringize it. */
-    v = fileTypeToString(state, path.lstat().type);
+    auto st = path.lstat();
+
+    // Record existence dep (with file type) for eval cache tracking
+    if (FileLoadTracker::isActive()) {
+        recordDep(path.path, DepHashValue(fmt("type:%d", static_cast<int>(st.type))),
+            DepType::Existence, state.mountToInput);
+    }
+
+    v = fileTypeToString(state, st.type);
 }
 
 static RegisterPrimOp primop_readFileType({
@@ -2385,6 +2443,11 @@ static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Val
     // This is similar to `getFileType` but is optimized to reduce system calls
     // on many systems.
     auto entries = path.readDirectory();
+
+    // Record directory dependency for eval cache tracking
+    if (FileLoadTracker::isActive()) {
+        recordDep(path.path, depHashDirListing(entries), DepType::Directory, state.mountToInput);
+    }
     auto attrs = state.buildBindings(entries.size());
 
     // If we hit unknown directory entry types we may need to fallback to
@@ -2818,17 +2881,72 @@ static void addPath(
         }
 
         std::unique_ptr<PathFilter> filter;
-        if (filterFun)
+        if (filterFun) {
+            // Check once whether we should record per-file deps for this
+            // filtered path (avoid repeated checks in the lambda).
+            bool recordFilterDeps = FileLoadTracker::isActive()
+                && !state.store->isInStore(path.path.abs());
+
+            // Directory deps for filtered builtins.path / filterSource:
+            //
+            // We record a Directory dep (full listing hash) for each directory
+            // traversed during the filtered copy, including the root. This is
+            // deliberately over-conservative: the hash includes entries the filter
+            // rejects, so adding a file the filter would ignore (e.g. a .log file)
+            // still invalidates the cache.
+            //
+            // Why the full listing is necessary:
+            //   Per-file NARContent deps validate files that existed at cache time,
+            //   but cannot detect NEW files that appeared later. If a new file passes
+            //   the filter, the result would differ, yet no existing NARContent dep
+            //   would catch it. The Directory dep ensures any listing change triggers
+            //   re-evaluation.
+            //
+            // Why we can't hash only the filtered listing:
+            //   Dep validation runs before evaluation — the Nix filter function is
+            //   not available. CopiedPath validation (computeStorePath) also can't
+            //   replicate filtered copies because it computes the unfiltered NAR hash.
+            //
+            // Possible future refinements:
+            //   - A FilteredCopiedPath dep that re-runs fetchToStore() with the filter
+            //   - A filtered listing hash that records included entry names and
+            //     conservatively invalidates only when new (unknown) entries appear
+            //   - For builtins.path on large working directories, the root Directory
+            //     dep is inherently fragile (any new file invalidates). Users should
+            //     avoid creating files in the source tree between cached evaluations.
             filter = std::make_unique<PathFilter>([&](const Path & p) {
                 auto p2 = CanonPath(p);
-                return state.callPathFilter(filterFun, {path.accessor, p2}, pos);
+                SourcePath sp{path.accessor, p2};
+                bool include = state.callPathFilter(filterFun, sp, pos);
+
+                if (include && recordFilterDeps) {
+                    auto st = sp.lstat();
+                    if (st.type == SourceAccessor::tRegular) {
+                        recordDep(sp.path, depHashPath(sp), DepType::NARContent,
+                                  state.mountToInput);
+                    } else if (st.type == SourceAccessor::tDirectory) {
+                        recordDep(sp.path, depHashDirListing(sp.readDirectory()), DepType::Directory,
+                                  state.mountToInput);
+                    }
+                    // Symlink target changes are not tracked individually.
+                    // Parent Directory dep captures symlink existence.
+                }
+                return include;
             });
+
+            // Record Directory dep on root directory (filter never sees the root itself).
+            if (recordFilterDeps) {
+                recordDep(path.path, depHashDirListing(path.readDirectory()), DepType::Directory,
+                          state.mountToInput);
+            }
+        }
 
         std::optional<StorePath> expectedStorePath;
         if (expectedHash)
             expectedStorePath = state.store->makeFixedOutputPathFromCA(
                 name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
 
+        std::string resultStorePath;
         if (!expectedHash || !state.store->isValidPath(*expectedStorePath)) {
             // FIXME: support refs in fetchToStore()?
             auto dstPath = refs.empty() ? fetchToStore(
@@ -2852,9 +2970,21 @@ static void addPath(
                 state.error<EvalError>("store path mismatch in (possibly filtered) path added from '%s'", path)
                     .atPos(pos)
                     .debugThrow();
+            resultStorePath = state.store->printStorePath(dstPath);
             state.allowAndSetStorePathString(dstPath, v);
-        } else
+        } else {
+            resultStorePath = state.store->printStorePath(*expectedStorePath);
             state.allowAndSetStorePathString(*expectedStorePath, v);
+        }
+
+        // Record CopiedPath dep for unfiltered paths only. For filtered paths,
+        // per-file Content + Directory deps were already recorded in the PathFilter
+        // lambda above (more granular, avoids expensive unfiltered NAR hash).
+        if (!filterFun && refs.empty() && FileLoadTracker::isActive()
+            && !state.store->isInStore(path.path.abs()))
+        {
+            recordDep(path.path, DepHashValue(resultStorePath), DepType::CopiedPath, state.mountToInput);
+        }
     } catch (Error & e) {
         e.addTrace(state.positions[pos], "while adding path '%s'", path);
         throw;
@@ -5222,7 +5352,23 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
         });
 
     if (!settings.pureEval) {
-        v.mkInt(time(0));
+        // Use a thunk so we can record a dep when currentTime is actually used
+        static PrimOp primop_currentTimeThunk{
+            .name = "__currentTime_thunk",
+            .arity = 1,
+            .fun = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
+                if (FileLoadTracker::isActive()) {
+                    FileLoadTracker::record({"", "currentTime",
+                        DepHashValue(std::to_string(time(0))), DepType::CurrentTime});
+                }
+                v.mkInt(time(0));
+            },
+        };
+        auto * fn = allocValue();
+        fn->mkPrimOp(&primop_currentTimeThunk);
+        auto * arg = allocValue();
+        arg->mkNull();
+        v.mkApp(fn, arg);
     }
     addConstant(
         "__currentTime",
@@ -5251,8 +5397,26 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
             .impureOnly = true,
         });
 
-    if (!settings.pureEval)
-        v.mkString(settings.getCurrentSystem(), mem);
+    if (!settings.pureEval) {
+        // Use a thunk so we can record a dep when currentSystem is actually used
+        static PrimOp primop_currentSystemThunk{
+            .name = "__currentSystem_thunk",
+            .arity = 1,
+            .fun = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
+                if (FileLoadTracker::isActive()) {
+                    auto system = state.settings.getCurrentSystem();
+                    auto hash = depHash(system);
+                    FileLoadTracker::record({"", "currentSystem", hash, DepType::System});
+                }
+                v.mkString(state.settings.getCurrentSystem(), state.mem);
+            },
+        };
+        auto * fn = allocValue();
+        fn->mkPrimOp(&primop_currentSystemThunk);
+        auto * arg = allocValue();
+        arg->mkNull();
+        v.mkApp(fn, arg);
+    }
     addConstant(
         "__currentSystem",
         v,

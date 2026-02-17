@@ -2,6 +2,7 @@
 #include "nix/expr/primops.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/file-load-tracker.hh"
 #include "nix/store/store-api.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/store/filetransfer.hh"
@@ -224,6 +225,12 @@ static void fetchTree(
         state.inputCache->getAccessor(state.fetchSettings, *state.store, input, fetchers::UseRegistries::No);
 
     auto storePath = state.mountInput(cachedInput.lockedInput, input, cachedInput.accessor);
+
+    // Record unlocked fetchTree with result store path for re-fetch validation
+    if (!input.isLocked(state.fetchSettings) && FileLoadTracker::isActive()) {
+        FileLoadTracker::record({"", input.to_string(),
+            DepHashValue(state.store->printStorePath(storePath)), DepType::UnhashedFetch});
+    }
 
     emitTreeAttrs(state, storePath, cachedInput.lockedInput, v, params.emptyRevFallback, false);
 }
@@ -452,6 +459,11 @@ static void fetch(
         state.error<EvalError>("in pure evaluation mode, '%s' requires a 'sha256' argument", who)
             .atPos(pos)
             .debugThrow();
+
+    // Record unhashed fetch as always-invalidate dep
+    if (!expectedHash && FileLoadTracker::isActive()) {
+        FileLoadTracker::record({"", *url, DepHashValue(std::string("")), DepType::UnhashedFetch});
+    }
 
     // early exit if pinned and already in the store
     if (expectedHash && expectedHash->algo == HashAlgorithm::SHA256) {

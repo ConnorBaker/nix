@@ -3,6 +3,7 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/store-api.hh"
 #include "nix/fetchers/fetchers.hh"
+#include "nix/expr/file-load-tracker.hh"
 #include "nix/util/url.hh"
 #include "nix/util/url-parts.hh"
 
@@ -82,6 +83,12 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
     auto input = fetchers::Input::fromAttrs(state.fetchSettings, std::move(attrs));
 
     auto [storePath, input2] = input.fetchToStore(state.fetchSettings, *state.store);
+
+    // Record unlocked fetchMercurial with result store path for re-fetch validation
+    if (!input.isLocked(state.fetchSettings) && FileLoadTracker::isActive()) {
+        FileLoadTracker::record({"", input.to_string(),
+            DepHashValue(state.store->printStorePath(storePath)), DepType::UnhashedFetch});
+    }
 
     auto attrs2 = state.buildBindings(8);
     state.mkStorePathString(storePath, attrs2.alloc(state.s.outPath));

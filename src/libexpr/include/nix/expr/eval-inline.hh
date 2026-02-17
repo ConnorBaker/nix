@@ -5,6 +5,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/file-load-tracker.hh"
 
 namespace nix {
 
@@ -89,6 +90,8 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
+        uint32_t epochStart = FileLoadTracker::isActive()
+            ? FileLoadTracker::sessionDeps.size() : 0;
         try {
             v.mkBlackhole();
             // checkInterrupt();
@@ -101,8 +104,17 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             tryFixupBlackHolePos(v, pos);
             throw;
         }
-    } else if (v.isApp())
+        if (FileLoadTracker::isActive())
+            recordThunkDeps(v, epochStart);
+    } else if (v.isApp()) {
+        uint32_t epochStart = FileLoadTracker::isActive()
+            ? FileLoadTracker::sessionDeps.size() : 0;
         callFunction(*v.app().left, *v.app().right, v, pos);
+        if (FileLoadTracker::isActive())
+            recordThunkDeps(v, epochStart);
+    } else if (FileLoadTracker::isActive()) {
+        replayMemoizedDeps(v);
+    }
 }
 
 [[gnu::always_inline]]
