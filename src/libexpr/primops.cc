@@ -2882,10 +2882,14 @@ static void addPath(
         }
 
         std::unique_ptr<PathFilter> filter;
+        // Must be declared at the same scope as `filter` because the
+        // PathFilter lambda captures it by reference and outlives the
+        // `if (filterFun)` block.
+        bool recordFilterDeps = false;
         if (filterFun) {
             // Check once whether we should record per-file oracle deps for
             // this filtered path (avoid repeated checks in the lambda).
-            bool recordFilterDeps = DependencyTracker::isActive()
+            recordFilterDeps = DependencyTracker::isActive()
                 && !state.store->isInStore(path.path.abs());
 
             // Directory oracle deps for filtered builtins.path / filterSource:
