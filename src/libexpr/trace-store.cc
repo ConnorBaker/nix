@@ -842,13 +842,12 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
             depMap.insert_or_assign(DepKey(dep), dep);
     }
 
-    // Flatten to sorted+deduped vector (sort once here, callers can skip)
+    // Flatten to vector (NOT sorted — callers that need canonical order
+    // must call sortAndDedupDeps() explicitly)
     std::vector<Dep> result;
     result.reserve(depMap.size());
     for (auto & [_, dep] : depMap)
         result.push_back(dep);
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
 
     traceCache[traceId] = result;
     nrLoadTraceTimeUs += elapsedUs(loadStart);
@@ -1268,8 +1267,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     // disambiguating child traces across different parent versions. O(1) lookup.
     if (allComputable) {
         auto directHashStart = timerStart();
-        // currentDeps preserves key order from loadFullTrace (already sorted+deduped)
-        auto & sortedCurrentDeps = currentDeps;
+        auto sortedCurrentDeps = sortAndDedupDeps(currentDeps);
         Hash newFullHash(HashAlgorithm::BLAKE3);
         if (parentTraceIdHint) {
             auto parentFullHash = getTraceFullHash(*parentTraceIdHint);
@@ -1383,8 +1381,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         if (!repComputable)
             continue;
 
-        // repCurrentDeps preserves key order from loadFullTrace (already sorted+deduped)
-        auto & sortedRepDeps = repCurrentDeps;
+        auto sortedRepDeps = sortAndDedupDeps(repCurrentDeps);
         Hash candidateFullHash(HashAlgorithm::BLAKE3);
         if (parentTraceIdHint) {
             auto parentFullHash = getTraceFullHash(*parentTraceIdHint);

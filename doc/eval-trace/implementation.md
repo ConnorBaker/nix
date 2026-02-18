@@ -206,6 +206,14 @@ session.
 variants (`serializeEvalTraceSorted`, `computeTraceHashFromSorted`, etc.)
 used for serialization and hashing -- avoids redundant sorting.
 
+**Performance finding: sort-once-on-load anti-pattern.** An attempt to sort deps
+in `loadFullTrace()` (so callers could skip sorting) caused a 44.8% regression in
+loadTrace time. On warm recovery commits, 326 traces are loaded but only ~31 need
+sorted output (for `computeTraceHashFromSorted`). The other 295 loads (for
+`verifyTrace`, `computeTraceDelta`, hash recomputation) iterate deps in arbitrary
+order. Sorting on load penalized all 326 loads for the benefit of 31. The fix:
+sort lazily at the call site.
+
 **Per-tracker dedup (DDG deduplication).** `DependencyTracker::record()`
 deduplicates by `(type, source, key)` within the active tracker scope using a
 `DepKey` hash set. Note: dedup only when an active tracker exists

@@ -184,6 +184,25 @@ struct TraceStore {
         EvalState & state,
         std::optional<TraceId> parentTraceIdHint = std::nullopt);
 
+    /**
+     * Load the full dependency set for a trace (resolving delta chains).
+     *
+     * The returned vector is NOT sorted. Callers that need canonical ordering
+     * (e.g., for trace hash computation via computeTraceHashFromSorted) must
+     * call sortAndDedupDeps() explicitly.
+     *
+     * Order-invariant callers (no sort needed):
+     *   - verifyTrace(): iterates deps, checks each hash independently
+     *   - recovery() hash recomputation: iterates deps, computes current hashes
+     *   - computeTraceDelta(): builds unordered_map from deps
+     *   - optimizeTraces(): computes deltas via unordered_map
+     *   - record() parent merge: merges into unordered_map, sorts the merged result
+     *
+     * Order-dependent callers (must sort):
+     *   - recovery() direct hash: feeds computeTraceHashFromSorted()
+     *   - recovery() struct variant hash: feeds computeTraceHashFromSorted()
+     *   - record() trace/struct hash: calls sortAndDedupDeps() on merged result
+     */
     std::vector<Dep> loadFullTrace(TraceId traceId);
     bool attrExists(std::string_view attrPath);
     void clearSessionCaches();

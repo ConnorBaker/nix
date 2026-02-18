@@ -265,10 +265,21 @@ produces only one dep entry.
 
 ### 4.3 Verification (BSàlC Verifying Trace Check)
 
-During the verify path, each dep is validated by `computeCurrentHash()` in
-`trace-store.cc` — this is the core VT verification step from BSàlC. Verification
-short-circuits on the first failure: if any dep hash is invalid, the entire trace
-is invalid.
+Verification operates in two modes depending on the caller:
+
+- **Initial verification** (`verify()` → `verifyTrace(earlyExit=true)`):
+  short-circuits on the first dep hash mismatch. This is the fast path for the
+  common case where verification succeeds — only `lstat()` calls are needed for
+  unchanged files (via StatHashCache). On the first failure, verification aborts
+  immediately and hands off to `recovery()`.
+
+- **Recovery hash recomputation** (`recovery()` → iterates deps with
+  `computeCurrentHash`): computes current hashes for *all* deps in a trace,
+  caching them in `currentDepHashes`. These hashes are populated lazily
+  on-demand — `verifyTrace(earlyExit=false)` computes all hashes even on
+  mismatch, and recovery reuses the cached values. This avoids redundant
+  `lstat()` / hash computation when the same dep appears in multiple
+  historical traces during structural variant recovery.
 
 For file-based deps (Content, Directory, NARContent), the `StatHashCache` provides
 a fast verification path: if the file's stat metadata (device, inode, mtime
@@ -573,7 +584,7 @@ Direct hash recovery (with Salsa-style parent Merkle chaining)    [O(1)]
   Else:
     Compute plain trace_hash from current dep hashes
   Point lookup in Traces table by trace_hash → candidate trace
-  Verify candidate → if valid, update CurrentTraces and serve
+  Accept candidate (hash match proves validity) → update CurrentTraces and serve
 
 Structural variant recovery (novel, beyond BSàlC)                 [O(V)]
   Scan TraceHistory for same (context_hash, attr_path_id)
@@ -586,6 +597,12 @@ Structural variant recovery (novel, beyond BSàlC)                 [O(V)]
   Handles dep structure instability (dynamic deps — different deps across
   fresh evaluations depending on evaluation order, per Shake)
 ```
+
+Note on direct hash recovery: finding a trace by the computed `trace_hash` IS the
+verification. We computed `trace_hash = BLAKE3(sorted current dep hashes)` — a
+matching trace in the database was recorded with identical dep values. No dep-by-dep
+`verifyTrace` call is needed (probability of false match: 2^-256). This is why
+`acceptRecoveredTrace` updates CurrentTraces directly without calling `verifyTrace`.
 
 Recovery is particularly effective for file reverts: reverting a file to a previous
 state produces the same dep hashes, and direct hash recovery finds the matching
