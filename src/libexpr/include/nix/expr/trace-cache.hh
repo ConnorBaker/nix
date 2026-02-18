@@ -8,7 +8,7 @@
 #include "nix/expr/trace-result.hh"
 
 #include <functional>
-#include <map>
+#include <unordered_map>
 
 namespace nix::eval_trace {
 
@@ -37,7 +37,7 @@ class TraceCache : public std::enable_shared_from_this<TraceCache>
      * Used during trace verification (BSàlC verifying trace check) to validate dep hashes
      * against current file content.
      */
-    std::map<std::string, SourcePath> inputAccessors;
+    std::unordered_map<std::string, SourcePath> inputAccessors;
 
 public:
 
@@ -45,7 +45,7 @@ public:
         std::optional<std::reference_wrapper<const Hash>> useCache,
         EvalState & state,
         RootLoader rootLoader,
-        std::map<std::string, SourcePath> inputAccessors = {});
+        std::unordered_map<std::string, SourcePath> inputAccessors = {});
 
     /**
      * Get the real root value via rootLoader, bypassing the trace system.

@@ -59,21 +59,21 @@ TEST_F(TraceStoreTest, BuildAttrPath_Multiple)
     EXPECT_EQ(path, expected);
 }
 
-// ── depTypeString tests ──────────────────────────────────────────────
+// ── depTypeName tests ───────────────────────────────────────────────
 
-TEST_F(TraceStoreTest, DepTypeString_AllTypes)
+TEST_F(TraceStoreTest, DepTypeName_AllTypes)
 {
-    EXPECT_EQ(depTypeString(DepType::Content), "content");
-    EXPECT_EQ(depTypeString(DepType::Directory), "directory");
-    EXPECT_EQ(depTypeString(DepType::Existence), "existence");
-    EXPECT_EQ(depTypeString(DepType::EnvVar), "envvar");
-    EXPECT_EQ(depTypeString(DepType::CurrentTime), "current-time");
-    EXPECT_EQ(depTypeString(DepType::System), "system");
-    EXPECT_EQ(depTypeString(DepType::UnhashedFetch), "unhashed-fetch");
-    EXPECT_EQ(depTypeString(DepType::ParentContext), "parent-context");
-    EXPECT_EQ(depTypeString(DepType::CopiedPath), "copied-path");
-    EXPECT_EQ(depTypeString(DepType::Exec), "exec");
-    EXPECT_EQ(depTypeString(DepType::NARContent), "nar-content");
+    EXPECT_EQ(depTypeName(DepType::Content), "content");
+    EXPECT_EQ(depTypeName(DepType::Directory), "directory");
+    EXPECT_EQ(depTypeName(DepType::Existence), "existence");
+    EXPECT_EQ(depTypeName(DepType::EnvVar), "envvar");
+    EXPECT_EQ(depTypeName(DepType::CurrentTime), "currentTime");
+    EXPECT_EQ(depTypeName(DepType::System), "system");
+    EXPECT_EQ(depTypeName(DepType::UnhashedFetch), "unhashedFetch");
+    EXPECT_EQ(depTypeName(DepType::ParentContext), "parentContext");
+    EXPECT_EQ(depTypeName(DepType::CopiedPath), "copiedPath");
+    EXPECT_EQ(depTypeName(DepType::Exec), "exec");
+    EXPECT_EQ(depTypeName(DepType::NARContent), "narContent");
 }
 
 // ── record tests (BSàlC: trace recording / fresh evaluation) ─────

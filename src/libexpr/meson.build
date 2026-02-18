@@ -160,7 +160,6 @@ sources = files(
   'trace-cache.cc',
   'trace-store.cc',
   'trace-hash.cc',
-  'eval-trace-deps.cc',
   'dependency-tracker.cc',
   'eval-error.cc',
   'eval-gc.cc',

@@ -490,7 +490,7 @@ public:
     /**
      * Get the mount-to-input mapping. Returns an empty map if traceCtx is null.
      */
-    const std::map<CanonPath, std::pair<std::string, std::string>> & getMountToInput() const;
+    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & getMountToInput() const;
 
     /**
      * Flush trace caches to persist SQLite WAL. Safe to call when traceCtx is null.

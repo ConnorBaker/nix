@@ -5,10 +5,12 @@
 #include "nix/util/hash.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/source-accessor.hh"
+#include "nix/util/std-hash.hh"
 #include "nix/util/util.hh"
 
 #include <array>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <optional>
@@ -42,7 +44,7 @@ struct SourcePath;
  * but only records the final resolved file as a Content/Directory dep.
  * Changes to intermediate symlink targets will NOT invalidate traced results.
  */
-enum class DepType : int {
+enum class DepType : uint8_t {
     /** File content was read (evalFile, readFile, parseExprFromFile). */
     Content = 1,
     /** Directory listing was read (readDir). */
@@ -70,9 +72,25 @@ enum class DepType : int {
 };
 
 /**
- * Human-readable name for a DepType, for debug logging.
+ * Human-readable name for a DepType.
  */
-const char * depTypeName(DepType type);
+inline std::string depTypeName(DepType type)
+{
+    switch (type) {
+    case DepType::Content: return "content";
+    case DepType::Directory: return "directory";
+    case DepType::Existence: return "existence";
+    case DepType::EnvVar: return "envvar";
+    case DepType::CurrentTime: return "currentTime";
+    case DepType::System: return "system";
+    case DepType::UnhashedFetch: return "unhashedFetch";
+    case DepType::ParentContext: return "parentContext";
+    case DepType::CopiedPath: return "copiedPath";
+    case DepType::Exec: return "exec";
+    case DepType::NARContent: return "narContent";
+    }
+    unreachable();
+}
 
 /**
  * Fixed-size BLAKE3-256 hash. Stack-allocated, no heap allocation.
@@ -177,7 +195,7 @@ inline bool isBlake3Dep(DepType type) {
     case DepType::Exec:
         return false;
     }
-    return false;
+    unreachable();
 }
 
 /**
@@ -213,6 +231,10 @@ struct Dep {
     DepHashValue expectedHash;
     /** What kind of access was performed. */
     DepType type;
+
+    /** Identity is the key (type, source, key); expectedHash is the observed value. */
+    bool operator==(const Dep & other) const;
+    auto operator<=>(const Dep & other) const;
 };
 
 /**
@@ -235,14 +257,21 @@ struct DepKey {
     std::string source;
     std::string key;
     bool operator==(const DepKey &) const = default;
+    auto operator<=>(const DepKey &) const = default;
+
+    explicit DepKey(const Dep & dep)
+        : type(dep.type), source(dep.source), key(dep.key) {}
+    DepKey(DepType type, std::string source, std::string key)
+        : type(type), source(std::move(source)), key(std::move(key)) {}
+
     struct Hash {
         size_t operator()(const DepKey & k) const noexcept {
-            size_t h = std::hash<int>{}(static_cast<int>(k.type));
-            h ^= std::hash<std::string>{}(k.source) * 1099511628211ULL;
-            h ^= std::hash<std::string>{}(k.key) * 14695981039346656037ULL;
-            return h;
+            return hashValues(std::to_underlying(k.type), k.source, k.key);
         }
     };
 };
+
+inline bool Dep::operator==(const Dep & other) const { return DepKey(*this) == DepKey(other); }
+inline auto Dep::operator<=>(const Dep & other) const { return DepKey(*this) <=> DepKey(other); }
 
 } // namespace nix

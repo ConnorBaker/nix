@@ -5,11 +5,10 @@
 #include "nix/store/sqlite.hh"
 #include "nix/util/sync.hh"
 
-#include <map>
 #include <optional>
-#include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace nix {
@@ -18,7 +17,17 @@ class EvalState;
 
 namespace nix::eval_trace {
 
-std::string depTypeString(DepType type);
+/** SQLite rowid for the Traces table. */
+using TraceId = int64_t;
+
+/** SQLite rowid for the Results table. */
+using ResultId = int64_t;
+
+/** SQLite rowid for the Strings table. */
+using StringId = int64_t;
+
+/** SQLite rowid for the AttrPaths table. */
+using AttrPathId = int64_t;
 
 struct TraceStore {
     struct State {
@@ -73,23 +82,23 @@ struct TraceStore {
     };
 
     struct TraceRow {
-        int64_t traceId;
-        int64_t resultId;
-        int type;
+        TraceId traceId;
+        ResultId resultId;
+        ResultKind type;
         std::string value;
         std::string context;
     };
 
     // Session caches
-    std::set<int64_t> verifiedTraceIds;
-    std::unordered_map<std::string, int64_t> internedStrings;
-    std::unordered_map<std::string, int64_t> internedAttrPaths;
-    std::map<int64_t, std::vector<Dep>> traceCache;
-    std::map<int64_t, Hash> traceHashCache;
-    std::map<int64_t, Hash> traceStructHashCache;
+    std::unordered_set<TraceId> verifiedTraceIds;
+    std::unordered_map<std::string, StringId> internedStrings;
+    std::unordered_map<std::string, AttrPathId> internedAttrPaths;
+    std::unordered_map<TraceId, std::vector<Dep>> traceCache;
+    std::unordered_map<TraceId, Hash> traceHashCache;
+    std::unordered_map<TraceId, Hash> traceStructHashCache;
 
     // Session string table (reverse: id -> string, for BLOB deserialization)
-    std::unordered_map<int64_t, std::string> stringTable;
+    std::unordered_map<StringId, std::string> stringTable;
     bool stringTableLoaded = false;
     void ensureStringTableLoaded();
 
@@ -97,18 +106,18 @@ struct TraceStore {
     std::unordered_map<DepKey, std::optional<DepHashValue>, DepKey::Hash> currentDepHashes;
 
     // Dirty traces (recorded this session, for post-record optimization)
-    std::set<int64_t> dirtyTraceIds;
+    std::unordered_set<TraceId> dirtyTraceIds;
 
     TraceStore(SymbolTable & symbols, int64_t contextHash);
     ~TraceStore();
 
     struct VerifyResult {
         CachedResult value;
-        int64_t traceId;
+        TraceId traceId;
     };
 
     struct RecordResult {
-        int64_t traceId;
+        TraceId traceId;
     };
 
     /**
@@ -127,9 +136,9 @@ struct TraceStore {
      */
     std::optional<VerifyResult> verify(
         std::string_view attrPath,
-        const std::map<std::string, SourcePath> & inputAccessors,
+        const std::unordered_map<std::string, SourcePath> & inputAccessors,
         EvalState & state,
-        std::optional<int64_t> parentTraceIdHint = std::nullopt);
+        std::optional<TraceId> parentTraceIdHint = std::nullopt);
 
     /**
      * Record a fresh evaluation result with its dependencies (BSàlC constructive
@@ -148,7 +157,7 @@ struct TraceStore {
         std::string_view attrPath,
         const CachedResult & value,
         const std::vector<Dep> & allDeps,
-        std::optional<int64_t> parentTraceId,
+        std::optional<TraceId> parentTraceId,
         bool isRoot);
 
     /**
@@ -171,13 +180,13 @@ struct TraceStore {
      *     beyond BSàlC's taxonomy.
      */
     std::optional<VerifyResult> recovery(
-        int64_t oldTraceId,
+        TraceId oldTraceId,
         std::string_view attrPath,
-        const std::map<std::string, SourcePath> & inputAccessors,
+        const std::unordered_map<std::string, SourcePath> & inputAccessors,
         EvalState & state,
-        std::optional<int64_t> parentTraceIdHint = std::nullopt);
+        std::optional<TraceId> parentTraceIdHint = std::nullopt);
 
-    std::vector<Dep> loadFullTrace(int64_t traceId);
+    std::vector<Dep> loadFullTrace(TraceId traceId);
     bool attrExists(std::string_view attrPath);
     void clearSessionCaches();
     static std::string buildAttrPath(const std::vector<std::string> & components);
@@ -202,36 +211,36 @@ struct TraceStore {
      * (tracked via verifiedTraceIds).
      */
     bool verifyTrace(
-        int64_t traceId,
-        const std::map<std::string, SourcePath> & inputAccessors,
+        TraceId traceId,
+        const std::unordered_map<std::string, SourcePath> & inputAccessors,
         EvalState & state);
 
 private:
     std::optional<TraceRow> lookupTraceRow(std::string_view attrPath);
 
-    int64_t doInternString(std::string_view s);
-    int64_t doInternAttrPath(std::string_view path);
-    int64_t doInternResult(int type, const std::string & value,
-                           const std::string & context, const Hash & resultHash);
+    StringId doInternString(std::string_view s);
+    AttrPathId doInternAttrPath(std::string_view path);
+    ResultId doInternResult(ResultKind type, const std::string & value,
+                            const std::string & context, const Hash & resultHash);
 
-    int64_t getOrCreateTrace(
+    TraceId getOrCreateTrace(
         const std::vector<Dep> & fullDeps,
         const std::vector<InternedDep> & deltaDeps,
         const Hash & traceHash,
         const Hash & structHash,
-        std::optional<int64_t> baseTraceId);
+        std::optional<TraceId> baseTraceId);
 
-    std::vector<Dep> loadTraceDelta(int64_t traceId);
+    std::vector<Dep> loadTraceDelta(TraceId traceId);
 
     static std::vector<Dep> computeTraceDelta(
         const std::vector<Dep> & fullDeps,
         const std::vector<Dep> & baseDeps);
 
     CachedResult decodeCachedResult(const TraceRow & row);
-    std::tuple<int, std::string, std::string> encodeCachedResult(const CachedResult & value);
+    std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);
 
-    Hash getTraceFullHash(int64_t traceId);
-    std::optional<int64_t> getTraceBaseId(int64_t traceId);
+    Hash getTraceFullHash(TraceId traceId);
+    std::optional<TraceId> getTraceBaseId(TraceId traceId);
 };
 
 } // namespace nix::eval_trace

@@ -9,20 +9,12 @@ namespace nix::eval_trace {
 std::vector<Dep> sortAndDedupDeps(const std::vector<Dep> & deps)
 {
     auto sorted = deps;
-    std::sort(sorted.begin(), sorted.end(),
-        [](const Dep & a, const Dep & b) {
-            if (a.type != b.type) return a.type < b.type;
-            if (a.source != b.source) return a.source < b.source;
-            return a.key < b.key;
-        });
-    sorted.erase(std::unique(sorted.begin(), sorted.end(),
-        [](const Dep & a, const Dep & b) {
-            return a.type == b.type && a.source == b.source && a.key == b.key;
-        }), sorted.end());
+    std::sort(sorted.begin(), sorted.end());
+    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
     return sorted;
 }
 
-// ── Trace hashing (HashSink-based, BSàlC §3.2 verifying traces) ─────
+// ── Trace hashing (BLAKE3 via HashSink, BSàlC §3.2 verifying traces) ──
 
 static void feedDepToSink(HashSink & sink, const Dep & dep, bool includeHash)
 {
@@ -41,7 +33,7 @@ static void feedDepToSink(HashSink & sink, const Dep & dep, bool includeHash)
 
 Hash computeTraceHashFromSorted(const std::vector<Dep> & sortedDeps)
 {
-    HashSink sink(HashAlgorithm::SHA256);
+    HashSink sink(HashAlgorithm::BLAKE3);
     for (auto & dep : sortedDeps)
         feedDepToSink(sink, dep, true);
     return sink.finish().hash;
@@ -54,7 +46,7 @@ Hash computeTraceHash(const std::vector<Dep> & deps)
 
 Hash computeTraceStructHashFromSorted(const std::vector<Dep> & sortedDeps)
 {
-    HashSink sink(HashAlgorithm::SHA256);
+    HashSink sink(HashAlgorithm::BLAKE3);
     for (auto & dep : sortedDeps)
         feedDepToSink(sink, dep, false);
     return sink.finish().hash;
@@ -69,7 +61,7 @@ Hash computeTraceHashWithParentFromSorted(
     const std::vector<Dep> & sortedDeps,
     const Hash & parentDepContentHash)
 {
-    HashSink sink(HashAlgorithm::SHA256);
+    HashSink sink(HashAlgorithm::BLAKE3);
     for (auto & dep : sortedDeps)
         feedDepToSink(sink, dep, true);
     // Domain-separated parent Merkle chaining (Salsa versioned query context for Phase 1 recovery)

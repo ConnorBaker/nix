@@ -3,7 +3,10 @@
 
 #include "nix/expr/eval-trace-deps.hh"
 
+#include <sys/types.h>
+
 #include <functional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -146,7 +149,7 @@ Blake3Hash depHashDirListingCached(const SourcePath & path, const SourceAccessor
  */
 std::optional<std::pair<std::string, CanonPath>> resolveToInput(
     const CanonPath & absPath,
-    const std::map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
+    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
 
 /**
  * Record a file dependency, resolving to an input-relative path if possible.
@@ -159,7 +162,7 @@ void recordDep(
     const CanonPath & absPath,
     const DepHashValue & hash,
     DepType depType,
-    const std::map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
+    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
 
 /**
  * Clear the in-memory (L1) stat-hash cache. Used by tests to force
@@ -168,13 +171,37 @@ void recordDep(
 void clearStatHashMemoryCache();
 
 /**
+ * Stat metadata used as a cache key: if these fields match, the file
+ * hasn't changed and the cached hash is still valid. Field types match
+ * the POSIX stat struct. Used as the L1 cache key in StatHashCache and
+ * embedded in StatHashEntry for the L2/SQLite round-trip.
+ */
+struct StatHashKey {
+    dev_t dev;
+    ino_t ino;
+    time_t mtime_sec;
+    int64_t mtime_nsec;
+    off_t size;
+    DepType depType;
+
+    bool operator==(const StatHashKey &) const = default;
+
+    struct Hash {
+        std::size_t operator()(const StatHashKey & k) const noexcept
+        {
+            return hashValues(k.dev, k.ino, k.mtime_sec, k.mtime_nsec, k.size, std::to_underlying(k.depType));
+        }
+    };
+};
+
+/**
  * Entry for bulk-loading/flushing the stat-hash cache between
  * TraceStore (SQLite owner) and the in-memory StatHashCache singleton.
+ * The int64_t cast for SQLite binding happens at the TraceStore boundary.
  */
 struct StatHashEntry {
     std::string path;
-    DepType depType;
-    int64_t dev, ino, mtime_sec, mtime_nsec, size;
+    StatHashKey stat;
     Blake3Hash hash;
 };
 

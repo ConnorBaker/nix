@@ -1028,8 +1028,8 @@ ref<eval_trace::TraceCache> openTraceCache(EvalState & state, ref<const LockedFl
     auto [lockFileStr, keyMap] = lockedFlake->lockFile.to_string();
 
     // Build mount-to-input and input-accessors maps for oracle dep recording
-    std::map<CanonPath, std::pair<std::string, std::string>> mountToInput;
-    std::map<std::string, SourcePath> inputAccessors;
+    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mountToInput;
+    std::unordered_map<std::string, SourcePath> inputAccessors;
 
     for (auto & [node, sourcePath] : lockedFlake->nodePaths) {
         auto [storePath, subdir] = state.store->toStorePath(sourcePath.path.abs());

@@ -13,15 +13,15 @@
 
 #include <cstring>
 #include <filesystem>
-#include <set>
 #include <tuple>
+#include <unordered_set>
 
 namespace nix::eval_trace {
 
 // ── Trace verification helpers (BSàlC verifying trace check) ─────────
 
 static std::optional<SourcePath> resolveDepPath(
-    const Dep & dep, const std::map<std::string, SourcePath> & inputAccessors)
+    const Dep & dep, const std::unordered_map<std::string, SourcePath> & inputAccessors)
 {
     if (dep.source == absolutePathDep)
         return SourcePath(getFSSourceAccessor(), CanonPath(dep.key));
@@ -35,7 +35,7 @@ static std::optional<SourcePath> resolveDepPath(
 
 static std::optional<DepHashValue> computeCurrentHash(
     EvalState & state, const Dep & dep,
-    const std::map<std::string, SourcePath> & inputAccessors)
+    const std::unordered_map<std::string, SourcePath> & inputAccessors)
 {
     switch (dep.type) {
     case DepType::Content: {
@@ -113,26 +113,6 @@ static std::optional<DepHashValue> computeCurrentHash(
     unreachable();
 }
 
-// ── Dep type naming ──────────────────────────────────────────────────
-
-std::string depTypeString(DepType type)
-{
-    switch (type) {
-    case DepType::Content:       return "content";
-    case DepType::Directory:     return "directory";
-    case DepType::Existence:     return "existence";
-    case DepType::EnvVar:        return "envvar";
-    case DepType::CurrentTime:   return "current-time";
-    case DepType::System:        return "system";
-    case DepType::UnhashedFetch: return "unhashed-fetch";
-    case DepType::ParentContext: return "parent-context";
-    case DepType::CopiedPath:    return "copied-path";
-    case DepType::Exec:          return "exec";
-    case DepType::NARContent:    return "nar-content";
-    }
-    return "unknown";
-}
-
 // ── Raw hash helpers ─────────────────────────────────────────────────
 
 static void bindRawHash(SQLiteStmt::Use & use, const Hash & h)
@@ -143,22 +123,18 @@ static void bindRawHash(SQLiteStmt::Use & use, const Hash & h)
 
 static Hash readRawHash(const void * data, size_t size)
 {
-    Hash h(HashAlgorithm::SHA256);
-    if (size == 32) {
-        memcpy(h.hash, data, 32);
-    } else {
-        // Fallback: parse as hex string
-        auto hexStr = std::string(static_cast<const char *>(data), size);
-        h = Hash::parseAny(hexStr, HashAlgorithm::SHA256);
-    }
+    if (size != 32)
+        throw Error("expected 32-byte BLAKE3 hash blob, got %d bytes", size);
+    Hash h(HashAlgorithm::BLAKE3);
+    memcpy(h.hash, data, 32);
     return h;
 }
 
-static Hash computeResultHash(int type, std::string_view value, std::string_view context)
+static Hash computeResultHash(ResultKind type, std::string_view value, std::string_view context)
 {
-    HashSink sink(HashAlgorithm::SHA256);
+    HashSink sink(HashAlgorithm::BLAKE3);
     sink(std::string_view("T", 1));
-    auto typeStr = std::to_string(type);
+    auto typeStr = std::to_string(std::to_underlying(type));
     sink(typeStr);
     sink(std::string_view("V", 1));
     sink(value);
@@ -170,40 +146,29 @@ static Hash computeResultHash(int type, std::string_view value, std::string_view
 // ── BLOB serialization for dep entries ───────────────────────────────
 //
 // Packed binary format per dep entry:
-//   type:      1 byte  (DepType enum value)
-//   source_id: 4 bytes (little-endian uint32)
-//   key_id:    4 bytes (little-endian uint32)
-//   hash_len:  1 byte  (0-255, typically 32 for BLAKE3)
+//   header:    10 bytes (type[1] + source_id[4] + key_id[4] + hash_len[1])
 //   hash_data: hash_len bytes
+
+struct __attribute__((packed)) DepBlobHeader {
+    uint8_t type;
+    uint32_t sourceId;
+    uint32_t keyId;
+    uint8_t hashLen;
+};
+static_assert(sizeof(DepBlobHeader) == 10);
 
 std::vector<uint8_t> TraceStore::serializeDeps(const std::vector<InternedDep> & deps)
 {
     std::vector<uint8_t> blob;
-    // Reserve approximate space: ~42 bytes per BLAKE3 dep
     blob.reserve(deps.size() * 42);
 
     for (auto & dep : deps) {
-        // type: 1 byte
-        blob.push_back(static_cast<uint8_t>(dep.type));
-
-        // source_id: 4 bytes LE
-        uint32_t sid = dep.sourceId;
-        blob.push_back(sid & 0xFF);
-        blob.push_back((sid >> 8) & 0xFF);
-        blob.push_back((sid >> 16) & 0xFF);
-        blob.push_back((sid >> 24) & 0xFF);
-
-        // key_id: 4 bytes LE
-        uint32_t kid = dep.keyId;
-        blob.push_back(kid & 0xFF);
-        blob.push_back((kid >> 8) & 0xFF);
-        blob.push_back((kid >> 16) & 0xFF);
-        blob.push_back((kid >> 24) & 0xFF);
-
-        // hash_len + hash_data
-        auto [data, size] = blobData(dep.hash);
-        blob.push_back(static_cast<uint8_t>(size));
-        blob.insert(blob.end(), data, data + size);
+        auto [hashData, hashSize] = blobData(dep.hash);
+        DepBlobHeader hdr{std::to_underlying(dep.type), dep.sourceId, dep.keyId,
+                          static_cast<uint8_t>(hashSize)};
+        auto * raw = reinterpret_cast<const uint8_t *>(&hdr);
+        blob.insert(blob.end(), raw, raw + sizeof(hdr));
+        blob.insert(blob.end(), hashData, hashData + hashSize);
     }
 
     return blob;
@@ -216,34 +181,22 @@ std::vector<TraceStore::InternedDep> TraceStore::deserializeInternedDeps(
     const uint8_t * p = static_cast<const uint8_t *>(blob);
     const uint8_t * end = p + size;
 
-    while (p < end) {
+    while (p + sizeof(DepBlobHeader) <= end) {
+        DepBlobHeader hdr;
+        std::memcpy(&hdr, p, sizeof(hdr));
+        p += sizeof(hdr);
+
+        if (p + hdr.hashLen > end) break;
+
         InternedDep dep;
-
-        if (p + 10 > end) break; // minimum: 1 + 4 + 4 + 1 + 0 = 10 bytes
-
-        dep.type = static_cast<DepType>(*p++);
-
-        dep.sourceId = static_cast<uint32_t>(p[0])
-            | (static_cast<uint32_t>(p[1]) << 8)
-            | (static_cast<uint32_t>(p[2]) << 16)
-            | (static_cast<uint32_t>(p[3]) << 24);
-        p += 4;
-
-        dep.keyId = static_cast<uint32_t>(p[0])
-            | (static_cast<uint32_t>(p[1]) << 8)
-            | (static_cast<uint32_t>(p[2]) << 16)
-            | (static_cast<uint32_t>(p[3]) << 24);
-        p += 4;
-
-        uint8_t hashLen = *p++;
-        if (p + hashLen > end) break;
-
-        if (isBlake3Dep(dep.type) && hashLen == 32) {
+        dep.type = static_cast<DepType>(hdr.type);
+        dep.sourceId = hdr.sourceId;
+        dep.keyId = hdr.keyId;
+        if (isBlake3Dep(dep.type) && hdr.hashLen == 32)
             dep.hash = Blake3Hash::fromBlob(p, 32);
-        } else {
-            dep.hash = std::string(reinterpret_cast<const char *>(p), hashLen);
-        }
-        p += hashLen;
+        else
+            dep.hash = std::string(reinterpret_cast<const char *>(p), hdr.hashLen);
+        p += hdr.hashLen;
 
         deps.push_back(std::move(dep));
     }
@@ -258,8 +211,8 @@ std::vector<Dep> TraceStore::resolveDeps(const std::vector<InternedDep> & intern
     deps.reserve(interned.size());
 
     for (auto & d : interned) {
-        auto sourceIt = stringTable.find(static_cast<int64_t>(d.sourceId));
-        auto keyIt = stringTable.find(static_cast<int64_t>(d.keyId));
+        auto sourceIt = stringTable.find(static_cast<StringId>(d.sourceId));
+        auto keyIt = stringTable.find(static_cast<StringId>(d.keyId));
         deps.push_back(Dep{
             sourceIt != stringTable.end() ? sourceIt->second : "",
             keyIt != stringTable.end() ? keyIt->second : "",
@@ -479,12 +432,14 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
             if (hashLen != 32) continue;
             entries.push_back(StatHashEntry{
                 .path = use.getStr(0),
-                .depType = static_cast<DepType>(use.getInt(1)),
-                .dev = use.getInt(2),
-                .ino = use.getInt(3),
-                .mtime_sec = use.getInt(4),
-                .mtime_nsec = use.getInt(5),
-                .size = use.getInt(6),
+                .stat = {
+                    .dev = static_cast<dev_t>(use.getInt(2)),
+                    .ino = static_cast<ino_t>(use.getInt(3)),
+                    .mtime_sec = static_cast<time_t>(use.getInt(4)),
+                    .mtime_nsec = use.getInt(5),
+                    .size = static_cast<off_t>(use.getInt(6)),
+                    .depType = static_cast<DepType>(use.getInt(1)),
+                },
                 .hash = Blake3Hash::fromBlob(hashBlob, hashLen),
             });
         }
@@ -502,12 +457,12 @@ TraceStore::~TraceStore()
         forEachDirtyStatHash([&](const StatHashEntry & e) {
             st->upsertStatHash.use()
                 (e.path)
-                (static_cast<int64_t>(e.depType))
-                (e.dev)
-                (e.ino)
-                (e.mtime_sec)
-                (e.mtime_nsec)
-                (e.size)
+                (static_cast<int64_t>(std::to_underlying(e.stat.depType)))
+                (static_cast<int64_t>(e.stat.dev))
+                (static_cast<int64_t>(e.stat.ino))
+                (e.stat.mtime_sec)
+                (e.stat.mtime_nsec)
+                (static_cast<int64_t>(e.stat.size))
                 (e.hash.data(), e.hash.size())
                 .exec();
         });
@@ -532,12 +487,7 @@ TraceStore::~TraceStore()
 
 std::string TraceStore::buildAttrPath(const std::vector<std::string> & components)
 {
-    std::string path;
-    for (size_t i = 0; i < components.size(); i++) {
-        if (i > 0) path.push_back('\0');
-        path.append(components[i]);
-    }
-    return path;
+    return concatStringsSep(std::string_view("\0", 1), components);
 }
 
 void TraceStore::clearSessionCaches()
@@ -570,10 +520,10 @@ void TraceStore::ensureStringTableLoaded()
 
 // ── CachedResult SQL encoding/decoding ──────────────────────────────────
 
-std::tuple<int, std::string, std::string> TraceStore::encodeCachedResult(const CachedResult & value)
+std::tuple<ResultKind, std::string, std::string> TraceStore::encodeCachedResult(const CachedResult & value)
 {
     return std::visit(overloaded{
-        [&](const std::vector<Symbol> & attrs) -> std::tuple<int, std::string, std::string> {
+        [&](const std::vector<Symbol> & attrs) -> std::tuple<ResultKind, std::string, std::string> {
             std::string val;
             bool first = true;
             for (auto & sym : attrs) {
@@ -583,7 +533,7 @@ std::tuple<int, std::string, std::string> TraceStore::encodeCachedResult(const C
             }
             return {ResultKind::FullAttrs, std::move(val), ""};
         },
-        [&](const string_t & s) -> std::tuple<int, std::string, std::string> {
+        [&](const string_t & s) -> std::tuple<ResultKind, std::string, std::string> {
             std::string ctx;
             bool first = true;
             for (auto & elem : s.second) {
@@ -593,25 +543,25 @@ std::tuple<int, std::string, std::string> TraceStore::encodeCachedResult(const C
             }
             return {ResultKind::String, s.first, std::move(ctx)};
         },
-        [&](const placeholder_t &) -> std::tuple<int, std::string, std::string> {
+        [&](const placeholder_t &) -> std::tuple<ResultKind, std::string, std::string> {
             return {ResultKind::Placeholder, "", ""};
         },
-        [&](const missing_t &) -> std::tuple<int, std::string, std::string> {
+        [&](const missing_t &) -> std::tuple<ResultKind, std::string, std::string> {
             return {ResultKind::Missing, "", ""};
         },
-        [&](const misc_t &) -> std::tuple<int, std::string, std::string> {
+        [&](const misc_t &) -> std::tuple<ResultKind, std::string, std::string> {
             return {ResultKind::Misc, "", ""};
         },
-        [&](const failed_t &) -> std::tuple<int, std::string, std::string> {
+        [&](const failed_t &) -> std::tuple<ResultKind, std::string, std::string> {
             return {ResultKind::Failed, "", ""};
         },
-        [&](bool b) -> std::tuple<int, std::string, std::string> {
+        [&](bool b) -> std::tuple<ResultKind, std::string, std::string> {
             return {ResultKind::Bool, b ? "1" : "0", ""};
         },
-        [&](const int_t & i) -> std::tuple<int, std::string, std::string> {
+        [&](const int_t & i) -> std::tuple<ResultKind, std::string, std::string> {
             return {ResultKind::Int, std::to_string(i.x.value), ""};
         },
-        [&](const std::vector<std::string> & l) -> std::tuple<int, std::string, std::string> {
+        [&](const std::vector<std::string> & l) -> std::tuple<ResultKind, std::string, std::string> {
             std::string val;
             bool first = true;
             for (auto & s : l) {
@@ -621,16 +571,16 @@ std::tuple<int, std::string, std::string> TraceStore::encodeCachedResult(const C
             }
             return {ResultKind::ListOfStrings, std::move(val), ""};
         },
-        [&](const path_t & p) -> std::tuple<int, std::string, std::string> {
+        [&](const path_t & p) -> std::tuple<ResultKind, std::string, std::string> {
             return {ResultKind::Path, p.path, ""};
         },
-        [&](const null_t &) -> std::tuple<int, std::string, std::string> {
+        [&](const null_t &) -> std::tuple<ResultKind, std::string, std::string> {
             return {ResultKind::Null, "", ""};
         },
-        [&](const float_t & f) -> std::tuple<int, std::string, std::string> {
+        [&](const float_t & f) -> std::tuple<ResultKind, std::string, std::string> {
             return {ResultKind::Float, std::to_string(f.x), ""};
         },
-        [&](const list_t & lt) -> std::tuple<int, std::string, std::string> {
+        [&](const list_t & lt) -> std::tuple<ResultKind, std::string, std::string> {
             return {ResultKind::List, std::to_string(lt.size), ""};
         },
     }, value);
@@ -638,8 +588,7 @@ std::tuple<int, std::string, std::string> TraceStore::encodeCachedResult(const C
 
 CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
 {
-    auto type = static_cast<ResultKind>(row.type);
-    switch (type) {
+    switch (row.type) {
     case ResultKind::FullAttrs: {
         std::vector<Symbol> attrs;
         if (!row.value.empty()) {
@@ -681,13 +630,13 @@ CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
     case ResultKind::Placeholder:
         return placeholder_t{};
     default:
-        throw Error("unexpected type %d in eval trace", row.type);
+        throw Error("unexpected type %d in eval trace", std::to_underlying(row.type));
     }
 }
 
 // ── Intern methods ───────────────────────────────────────────────────
 
-int64_t TraceStore::doInternString(std::string_view s)
+StringId TraceStore::doInternString(std::string_view s)
 {
     auto key = std::string(s);
     auto it = internedStrings.find(key);
@@ -700,14 +649,14 @@ int64_t TraceStore::doInternString(std::string_view s)
     auto use(st->lookupStringId.use()(s));
     if (!use.next())
         throw Error("failed to intern string '%s'", s);
-    auto id = use.getInt(0);
+    StringId id = use.getInt(0);
     internedStrings[key] = id;
     // Also populate reverse string table
     stringTable[id] = key;
     return id;
 }
 
-int64_t TraceStore::doInternAttrPath(std::string_view path)
+AttrPathId TraceStore::doInternAttrPath(std::string_view path)
 {
     auto key = std::string(path);
     auto it = internedAttrPaths.find(key);
@@ -723,12 +672,12 @@ int64_t TraceStore::doInternAttrPath(std::string_view path)
         (reinterpret_cast<const unsigned char *>(path.data()), path.size()));
     if (!use.next())
         throw Error("failed to intern attr path");
-    auto id = use.getInt(0);
+    AttrPathId id = use.getInt(0);
     internedAttrPaths[key] = id;
     return id;
 }
 
-int64_t TraceStore::doInternResult(int type, const std::string & value,
+ResultId TraceStore::doInternResult(ResultKind type, const std::string & value,
                                      const std::string & context, const Hash & resultHash)
 {
     auto st(_state->lock());
@@ -763,7 +712,7 @@ int64_t TraceStore::doInternResult(int type, const std::string & value,
 
 // ── Trace storage (BSàlC trace store) ───────────────────────────────
 
-std::optional<int64_t> TraceStore::getTraceBaseId(int64_t traceId)
+std::optional<TraceId> TraceStore::getTraceBaseId(TraceId traceId)
 {
     auto st(_state->lock());
     auto use(st->getTraceInfo.use()(traceId));
@@ -774,7 +723,7 @@ std::optional<int64_t> TraceStore::getTraceBaseId(int64_t traceId)
     return use.getInt(0);
 }
 
-Hash TraceStore::getTraceFullHash(int64_t traceId)
+Hash TraceStore::getTraceFullHash(TraceId traceId)
 {
     auto cacheIt = traceHashCache.find(traceId);
     if (cacheIt != traceHashCache.end())
@@ -790,7 +739,7 @@ Hash TraceStore::getTraceFullHash(int64_t traceId)
     return h;
 }
 
-std::vector<Dep> TraceStore::loadTraceDelta(int64_t traceId)
+std::vector<Dep> TraceStore::loadTraceDelta(TraceId traceId)
 {
     // Read deps_blob from Traces and deserialize
     const void * blobPtr = nullptr;
@@ -820,15 +769,15 @@ std::vector<Dep> TraceStore::loadTraceDelta(int64_t traceId)
     return resolveDeps(interned);
 }
 
-std::vector<Dep> TraceStore::loadFullTrace(int64_t traceId)
+std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
 {
     auto cacheIt = traceCache.find(traceId);
     if (cacheIt != traceCache.end())
         return cacheIt->second;
 
     // Walk up the base_trace_id chain to find nearest cached ancestor or root
-    std::vector<int64_t> chainToApply;
-    int64_t currentId = traceId;
+    std::vector<TraceId> chainToApply;
+    TraceId currentId = traceId;
     std::vector<Dep> baseDeps;
 
     while (true) {
@@ -849,22 +798,21 @@ std::vector<Dep> TraceStore::loadFullTrace(int64_t traceId)
     std::reverse(chainToApply.begin(), chainToApply.end());
 
     // Build dep map starting from base
-    using DepKeyTuple = std::tuple<DepType, std::string, std::string>;
-    std::map<DepKeyTuple, Dep> depMap;
+    std::unordered_map<DepKey, Dep, DepKey::Hash> depMap;
     for (auto & dep : baseDeps)
-        depMap[{dep.type, dep.source, dep.key}] = dep;
+        depMap.insert_or_assign(DepKey(dep), dep);
 
     // Apply deltas from root toward traceId
     for (auto id : chainToApply) {
         auto delta = loadTraceDelta(id);
         for (auto & dep : delta)
-            depMap[{dep.type, dep.source, dep.key}] = dep;
+            depMap.insert_or_assign(DepKey(dep), dep);
     }
 
     // Flatten to vector
     std::vector<Dep> result;
     result.reserve(depMap.size());
-    for (auto & [key, dep] : depMap)
+    for (auto & [_, dep] : depMap)
         result.push_back(dep);
 
     traceCache[traceId] = result;
@@ -876,15 +824,13 @@ std::vector<Dep> TraceStore::computeTraceDelta(
     const std::vector<Dep> & baseDeps)
 {
     // Build lookup map for base deps: key -> expectedHash
-    using DepKeyTuple = std::tuple<DepType, std::string, std::string>;
-    std::map<DepKeyTuple, DepHashValue> baseMap;
+    std::unordered_map<DepKey, DepHashValue, DepKey::Hash> baseMap;
     for (auto & dep : baseDeps)
-        baseMap[{dep.type, dep.source, dep.key}] = dep.expectedHash;
+        baseMap.insert_or_assign(DepKey(dep), dep.expectedHash);
 
     std::vector<Dep> delta;
     for (auto & dep : fullDeps) {
-        auto key = std::make_tuple(dep.type, dep.source, dep.key);
-        auto it = baseMap.find(key);
+        auto it = baseMap.find(DepKey(dep));
         if (it != baseMap.end() && it->second == dep.expectedHash)
             continue; // Same key and same hash → inherited from base
         // New dep or different hash → include in delta
@@ -893,12 +839,12 @@ std::vector<Dep> TraceStore::computeTraceDelta(
     return delta;
 }
 
-int64_t TraceStore::getOrCreateTrace(
+TraceId TraceStore::getOrCreateTrace(
     const std::vector<Dep> & fullDeps,
     const std::vector<InternedDep> & deltaDeps,
     const Hash & traceHash,
     const Hash & structHash,
-    std::optional<int64_t> baseTraceId)
+    std::optional<TraceId> baseTraceId)
 {
     // Serialize delta deps into BLOB
     auto blob = serializeDeps(deltaDeps);
@@ -925,7 +871,7 @@ int64_t TraceStore::getOrCreateTrace(
     }
 
     // Get the set_id
-    int64_t setId;
+    TraceId setId;
     {
         auto use(st->lookupTraceByFullHash.use());
         bindRawHash(use, traceHash);
@@ -943,8 +889,8 @@ int64_t TraceStore::getOrCreateTrace(
 // ── Trace verification (BSàlC VT check) ─────────────────────────────
 
 bool TraceStore::verifyTrace(
-    int64_t traceId,
-    const std::map<std::string, SourcePath> & inputAccessors,
+    TraceId traceId,
+    const std::unordered_map<std::string, SourcePath> & inputAccessors,
     EvalState & state)
 {
     if (verifiedTraceIds.count(traceId))
@@ -964,7 +910,7 @@ bool TraceStore::verifyTrace(
             continue; // still compute other hashes for caching
         }
 
-        DepKey dk{dep.type, dep.source, dep.key};
+        DepKey dk(dep);
         auto cacheIt = currentDepHashes.find(dk);
         std::optional<DepHashValue> current;
 
@@ -998,7 +944,7 @@ std::optional<TraceStore::TraceRow> TraceStore::lookupTraceRow(std::string_view 
 
     auto st(_state->lock());
 
-    int64_t attrPathId;
+    AttrPathId attrPathId;
     if (cacheIt != internedAttrPaths.end()) {
         attrPathId = cacheIt->second;
     } else {
@@ -1017,7 +963,7 @@ std::optional<TraceStore::TraceRow> TraceStore::lookupTraceRow(std::string_view 
     TraceRow row;
     row.traceId = use.getInt(0);
     row.resultId = use.getInt(1);
-    row.type = static_cast<int>(use.getInt(2));
+    row.type = static_cast<ResultKind>(use.getInt(2));
     row.value = use.isNull(3) ? "" : use.getStr(3);
     row.context = use.isNull(4) ? "" : use.getStr(4);
     return row;
@@ -1034,7 +980,7 @@ TraceStore::RecordResult TraceStore::record(
     std::string_view attrPath,
     const CachedResult & value,
     const std::vector<Dep> & allDeps,
-    std::optional<int64_t> parentTraceId,
+    std::optional<TraceId> parentTraceId,
     bool isRoot)
 {
     // 1. Filter deps: remove ParentContext
@@ -1051,12 +997,11 @@ TraceStore::RecordResult TraceStore::record(
     std::vector<Dep> fullDeps;
     if (parentTraceId) {
         auto parentFullDeps = loadFullTrace(*parentTraceId);
-        using DepKeyTuple = std::tuple<DepType, std::string, std::string>;
-        std::map<DepKeyTuple, Dep> depMap;
+        std::unordered_map<DepKey, Dep, DepKey::Hash> depMap;
         for (auto & dep : parentFullDeps)
-            depMap[{dep.type, dep.source, dep.key}] = dep;
+            depMap.insert_or_assign(DepKey(dep), dep);
         for (auto & dep : sortedDeps)
-            depMap[{dep.type, dep.source, dep.key}] = dep;
+            depMap.insert_or_assign(DepKey(dep), dep);
         fullDeps.reserve(depMap.size());
         for (auto & [_, dep] : depMap)
             fullDeps.push_back(dep);
@@ -1066,7 +1011,7 @@ TraceStore::RecordResult TraceStore::record(
     }
 
     // 4. Compute trace_hash from full trace (includes parent context)
-    Hash traceHash(HashAlgorithm::SHA256);
+    Hash traceHash(HashAlgorithm::BLAKE3);
     if (parentTraceId) {
         auto parentFullHash = getTraceFullHash(*parentTraceId);
         traceHash = computeTraceHashWithParentFromSorted(fullDeps, parentFullHash);
@@ -1079,7 +1024,7 @@ TraceStore::RecordResult TraceStore::record(
 
     // 6. Find struct-hash-based base for delta encoding
     //    base_trace_id is for storage compression only — decoupled from parentTraceId
-    std::optional<int64_t> baseTraceId;
+    std::optional<TraceId> baseTraceId;
     {
         auto st(_state->lock());
         auto use(st->lookupTraceByStructHash.use());
@@ -1103,13 +1048,13 @@ TraceStore::RecordResult TraceStore::record(
     // 9. Encode CachedResult and intern result
     auto [type, val, ctx] = encodeCachedResult(value);
     auto resultHash = computeResultHash(type, val, ctx);
-    auto resultId = doInternResult(type, val, ctx, resultHash);
+    ResultId resultId = doInternResult(type, val, ctx, resultHash);
 
     // 10. Intern attr path
-    auto attrPathId = doInternAttrPath(attrPath);
+    AttrPathId attrPathId = doInternAttrPath(attrPath);
 
     // 11. Get or create trace (with BLOB)
-    auto traceId = getOrCreateTrace(fullDeps, internedDelta, traceHash, structHash, baseTraceId);
+    TraceId traceId = getOrCreateTrace(fullDeps, internedDelta, traceHash, structHash, baseTraceId);
 
     // 12. Upsert Attrs + insert History
     {
@@ -1137,9 +1082,9 @@ TraceStore::RecordResult TraceStore::record(
 
 std::optional<TraceStore::VerifyResult> TraceStore::verify(
     std::string_view attrPath,
-    const std::map<std::string, SourcePath> & inputAccessors,
+    const std::unordered_map<std::string, SourcePath> & inputAccessors,
     EvalState & state,
-    std::optional<int64_t> parentTraceIdHint)
+    std::optional<TraceId> parentTraceIdHint)
 {
     // 1. Lookup attribute
     auto row = lookupTraceRow(attrPath);
@@ -1163,11 +1108,11 @@ std::optional<TraceStore::VerifyResult> TraceStore::verify(
 //    Two-phase: direct hash lookup + structural scan
 
 std::optional<TraceStore::VerifyResult> TraceStore::recovery(
-    int64_t oldTraceId,
+    TraceId oldTraceId,
     std::string_view attrPath,
-    const std::map<std::string, SourcePath> & inputAccessors,
+    const std::unordered_map<std::string, SourcePath> & inputAccessors,
     EvalState & state,
-    std::optional<int64_t> parentTraceIdHint)
+    std::optional<TraceId> parentTraceIdHint)
 {
     // Load old trace's full deps
     auto oldDeps = loadFullTrace(oldTraceId);
@@ -1184,7 +1129,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     std::vector<Dep> currentDeps;
     bool allComputable = true;
     for (auto & dep : oldDeps) {
-        DepKey dk{dep.type, dep.source, dep.key};
+        DepKey dk(dep);
         auto cacheIt = currentDepHashes.find(dk);
         std::optional<DepHashValue> current;
 
@@ -1207,7 +1152,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
     // Resolve attr_path_id for DB lookups
     auto pathKey = std::string(attrPath);
-    std::optional<int64_t> attrPathId;
+    std::optional<AttrPathId> attrPathId;
     {
         auto cacheIt = internedAttrPaths.find(pathKey);
         if (cacheIt != internedAttrPaths.end()) {
@@ -1227,16 +1172,16 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         return std::nullopt;
     }
 
-    std::set<int64_t> triedTraceIds;
+    std::unordered_set<TraceId> triedTraceIds;
 
     // Helper: try a candidate trace ID for recovery
-    auto tryCandidate = [&](int64_t candidateTraceId) -> std::optional<VerifyResult> {
+    auto tryCandidate = [&](TraceId candidateTraceId) -> std::optional<VerifyResult> {
         if (triedTraceIds.count(candidateTraceId))
             return std::nullopt;
         triedTraceIds.insert(candidateTraceId);
 
         // Look up in History
-        int64_t resultId;
+        ResultId resultId;
         {
             auto st(_state->lock());
             auto use(st->lookupHistoryByTrace.use()
@@ -1259,7 +1204,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
                 return std::nullopt;
             recRow.traceId = candidateTraceId;
             recRow.resultId = resultId;
-            recRow.type = static_cast<int>(use.getInt(0));
+            recRow.type = static_cast<ResultKind>(use.getInt(0));
             recRow.value = use.isNull(1) ? "" : use.getStr(1);
             recRow.context = use.isNull(2) ? "" : use.getStr(2);
         }
@@ -1281,7 +1226,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     // parent versions. Analogous to Salsa's versioned query with context.
     if (allComputable) {
         auto sortedCurrentDeps = sortAndDedupDeps(currentDeps);
-        Hash newFullHash(HashAlgorithm::SHA256);
+        Hash newFullHash(HashAlgorithm::BLAKE3);
         if (parentTraceIdHint) {
             auto parentFullHash = getTraceFullHash(*parentTraceIdHint);
             newFullHash = computeTraceHashWithParentFromSorted(sortedCurrentDeps, parentFullHash);
@@ -1290,7 +1235,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         }
 
         // Look up Traces by trace_hash
-        std::optional<int64_t> newTraceId;
+        std::optional<TraceId> newTraceId;
         {
             auto st(_state->lock());
             auto use(st->lookupTraceByFullHash.use());
@@ -1314,8 +1259,8 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     // ignoring hash values), recomputes current hashes per group, retries Phase 1.
     struct HistoryEntry {
         Hash structHash;
-        int64_t traceId;
-        int64_t resultId;
+        TraceId traceId;
+        ResultId resultId;
     };
     std::vector<HistoryEntry> historyEntries;
     {
@@ -1335,7 +1280,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
           attrPath, historyEntries.size());
 
     // Group by struct_hash, pick one representative per group
-    std::map<Hash, int64_t> structGroups; // struct_hash -> representative trace_id
+    std::unordered_map<Hash, TraceId> structGroups; // struct_hash -> representative trace_id
     for (auto & e : historyEntries) {
         if (triedTraceIds.count(e.traceId))
             continue;
@@ -1358,7 +1303,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
                 break;
             }
 
-            DepKey dk{dep.type, dep.source, dep.key};
+            DepKey dk(dep);
             auto cacheIt = currentDepHashes.find(dk);
             std::optional<DepHashValue> current;
 
@@ -1380,7 +1325,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
         // Compute candidate trace_hash
         auto sortedRepDeps = sortAndDedupDeps(repCurrentDeps);
-        Hash candidateFullHash(HashAlgorithm::SHA256);
+        Hash candidateFullHash(HashAlgorithm::BLAKE3);
         if (parentTraceIdHint) {
             auto parentFullHash = getTraceFullHash(*parentTraceIdHint);
             candidateFullHash = computeTraceHashWithParentFromSorted(sortedRepDeps, parentFullHash);
@@ -1389,7 +1334,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         }
 
         // Look up Traces by candidate trace_hash
-        std::optional<int64_t> candidateTraceId;
+        std::optional<TraceId> candidateTraceId;
         {
             auto st(_state->lock());
             auto use(st->lookupTraceByFullHash.use());
@@ -1420,10 +1365,10 @@ void TraceStore::optimizeTraces()
     // Group dirty traces by struct_hash.
     // All lock-acquiring work (DB reads, string interning) is done OUTSIDE
     // lock scopes to avoid deadlock. The lock is only held for UPDATE writes.
-    std::map<Hash, std::vector<int64_t>> structGroups;
+    std::unordered_map<Hash, std::vector<TraceId>> structGroups;
     for (auto traceId : dirtyTraceIds) {
         // Get struct_hash from session cache or DB
-        Hash structHash(HashAlgorithm::SHA256);
+        Hash structHash(HashAlgorithm::BLAKE3);
         auto cacheIt = traceStructHashCache.find(traceId);
         if (cacheIt != traceStructHashCache.end()) {
             structHash = cacheIt->second;
@@ -1441,7 +1386,7 @@ void TraceStore::optimizeTraces()
         if (group.size() <= 1) continue;
 
         // Pick the trace with the most full deps as canonical base
-        int64_t baseTraceId = group[0];
+        TraceId baseTraceId = group[0];
         size_t maxSize = 0;
         for (auto traceId : group) {
             auto it = traceCache.find(traceId);
@@ -1463,7 +1408,7 @@ void TraceStore::optimizeTraces()
 
         // Pre-compute all member blobs
         struct MemberUpdate {
-            int64_t traceId;
+            TraceId traceId;
             bool isBase;
             std::vector<uint8_t> blob;
         };

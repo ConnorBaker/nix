@@ -8,6 +8,7 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <map>
+#include <unordered_map>
 
 namespace nix {
 
@@ -49,7 +50,7 @@ struct EvalTraceContext {
      * Used to resolve absolute paths back to input-relative paths
      * for oracle dep recording (Adapton DDG). Populated by openTraceCache().
      */
-    std::map<CanonPath, std::pair<std::string, std::string>> mountToInput;
+    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mountToInput;
 
     /**
      * Epoch-based memoized oracle deps from thunk/app evaluation, keyed by

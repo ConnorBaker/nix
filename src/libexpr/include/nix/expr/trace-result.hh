@@ -5,6 +5,7 @@
 #include "nix/expr/value/context.hh"
 #include "nix/expr/symbol-table.hh"
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <variant>
@@ -14,7 +15,7 @@ namespace nix::eval_trace {
 
 // ── Shared types (used by TraceStore, TracedExpr, serialization) ────
 
-enum ResultKind {
+enum class ResultKind : uint8_t {
     Placeholder = 0,
     FullAttrs = 1,
     String = 2,
@@ -22,6 +23,9 @@ enum ResultKind {
     Misc = 4,
     Failed = 5,
     Bool = 6,
+    /** Stores full content for lists of plain strings (e.g., meta.platforms).
+     *  Avoids creating N thunks + N child trace lookups that the generic
+     *  List kind would require. */
     ListOfStrings = 7,
     Int = 8,
     Path = 9,

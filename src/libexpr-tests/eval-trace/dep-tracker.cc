@@ -268,7 +268,7 @@ TEST_F(DependencyTrackerTest, Suspend_NestedSuspend)
 
 TEST_F(DependencyTrackerTest, ResolveToInput_MatchingMount)
 {
-    std::map<CanonPath, std::pair<std::string, std::string>> mounts;
+    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mounts;
     mounts[CanonPath("/foo/bar")] = {"myInput", ""};
 
     auto result = resolveToInput(CanonPath("/foo/bar/baz.nix"), mounts);
@@ -279,7 +279,7 @@ TEST_F(DependencyTrackerTest, ResolveToInput_MatchingMount)
 
 TEST_F(DependencyTrackerTest, ResolveToInput_NoMatchingMount)
 {
-    std::map<CanonPath, std::pair<std::string, std::string>> mounts;
+    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mounts;
     mounts[CanonPath("/foo/bar")] = {"myInput", ""};
 
     auto result = resolveToInput(CanonPath("/other/path.nix"), mounts);
@@ -288,7 +288,7 @@ TEST_F(DependencyTrackerTest, ResolveToInput_NoMatchingMount)
 
 TEST_F(DependencyTrackerTest, ResolveToInput_ExactMatch)
 {
-    std::map<CanonPath, std::pair<std::string, std::string>> mounts;
+    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mounts;
     mounts[CanonPath("/foo/bar")] = {"myInput", ""};
 
     auto result = resolveToInput(CanonPath("/foo/bar"), mounts);
@@ -299,7 +299,7 @@ TEST_F(DependencyTrackerTest, ResolveToInput_ExactMatch)
 
 TEST_F(DependencyTrackerTest, ResolveToInput_LongestPrefixWins)
 {
-    std::map<CanonPath, std::pair<std::string, std::string>> mounts;
+    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mounts;
     mounts[CanonPath("/foo")] = {"broad", ""};
     mounts[CanonPath("/foo/bar")] = {"specific", ""};
 
@@ -311,7 +311,7 @@ TEST_F(DependencyTrackerTest, ResolveToInput_LongestPrefixWins)
 
 TEST_F(DependencyTrackerTest, ResolveToInput_WithSubdir)
 {
-    std::map<CanonPath, std::pair<std::string, std::string>> mounts;
+    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mounts;
     mounts[CanonPath("/flake-src")] = {"myInput", "subdir"};
 
     auto result = resolveToInput(CanonPath("/flake-src/subdir/file.nix"), mounts);
@@ -357,17 +357,17 @@ TEST_F(DependencyTrackerTest, Blake3Hash_View)
 
 TEST_F(DependencyTrackerTest, DepTypeName_AllTypes)
 {
-    EXPECT_STREQ(depTypeName(DepType::Content), "content");
-    EXPECT_STREQ(depTypeName(DepType::Directory), "directory");
-    EXPECT_STREQ(depTypeName(DepType::Existence), "existence");
-    EXPECT_STREQ(depTypeName(DepType::EnvVar), "envvar");
-    EXPECT_STREQ(depTypeName(DepType::CurrentTime), "currentTime");
-    EXPECT_STREQ(depTypeName(DepType::System), "system");
-    EXPECT_STREQ(depTypeName(DepType::UnhashedFetch), "unhashedFetch");
-    EXPECT_STREQ(depTypeName(DepType::ParentContext), "parentContext");
-    EXPECT_STREQ(depTypeName(DepType::CopiedPath), "copiedPath");
-    EXPECT_STREQ(depTypeName(DepType::Exec), "exec");
-    EXPECT_STREQ(depTypeName(DepType::NARContent), "narContent");
+    EXPECT_EQ(depTypeName(DepType::Content), "content");
+    EXPECT_EQ(depTypeName(DepType::Directory), "directory");
+    EXPECT_EQ(depTypeName(DepType::Existence), "existence");
+    EXPECT_EQ(depTypeName(DepType::EnvVar), "envvar");
+    EXPECT_EQ(depTypeName(DepType::CurrentTime), "currentTime");
+    EXPECT_EQ(depTypeName(DepType::System), "system");
+    EXPECT_EQ(depTypeName(DepType::UnhashedFetch), "unhashedFetch");
+    EXPECT_EQ(depTypeName(DepType::ParentContext), "parentContext");
+    EXPECT_EQ(depTypeName(DepType::CopiedPath), "copiedPath");
+    EXPECT_EQ(depTypeName(DepType::Exec), "exec");
+    EXPECT_EQ(depTypeName(DepType::NARContent), "narContent");
 }
 
 // ── isBlake3Dep tests ────────────────────────────────────────────────

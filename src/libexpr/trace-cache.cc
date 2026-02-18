@@ -57,7 +57,7 @@ struct TracedExpr : Expr, gc
      * The trace ID for this attribute's trace (dependency record).
      * Set after verify path succeeds or fresh evaluation records the result.
      */
-    std::optional<int64_t> traceId;
+    std::optional<TraceId> traceId;
 
     /**
      * Cached storeAttrPath result. Lazily populated on first call.
@@ -109,7 +109,7 @@ struct TracedExpr : Expr, gc
         return result;
     }
 
-    std::optional<int64_t> parentTraceId() const
+    std::optional<TraceId> parentTraceId() const
     {
         if (!parentExpr) return std::nullopt;
         return parentExpr->traceId;
@@ -120,7 +120,7 @@ struct TracedExpr : Expr, gc
     void materializeResult(Value & v, const CachedResult & cached);
     void materializeOrigExprAttrs(Value & v, const std::vector<Symbol> & childNames,
                                    Value * prePopulatedParent = nullptr);
-    void replayTrace(int64_t traceId);
+    void replayTrace(TraceId traceId);
     void recordSiblingTrace(TracedExpr * parentEC, Symbol siblingName, Value & v);
     void sortChildNames(std::vector<Symbol> & names) const;
 };
@@ -213,7 +213,7 @@ void TracedExpr::materializeOrigExprAttrs(
 }
 
 // Replay trace (Adapton change propagation)
-void TracedExpr::replayTrace(int64_t traceId)
+void TracedExpr::replayTrace(TraceId traceId)
 {
     if (!DependencyTracker::isActive())
         return;
@@ -247,28 +247,41 @@ void TracedExpr::recordSiblingTrace(TracedExpr * parentEC, Symbol siblingName, V
 
     // Serialize value
     CachedResult attrValue;
-    if (v.type() == nString) {
+    switch (v.type()) {
+    case nString: {
         NixStringContext ctx;
         if (v.context())
             for (auto * elem : *v.context())
                 ctx.insert(NixStringContextElem::parse(elem->view()));
         attrValue = string_t{std::string(v.string_view()), std::move(ctx)};
-    } else if (v.type() == nBool) {
+        break;
+    }
+    case nBool:
         attrValue = v.boolean();
-    } else if (v.type() == nInt) {
+        break;
+    case nInt:
         attrValue = int_t{NixInt{v.integer().value}};
-    } else if (v.type() == nNull) {
+        break;
+    case nNull:
         attrValue = null_t{};
-    } else if (v.type() == nFloat) {
+        break;
+    case nFloat:
         attrValue = float_t{v.fpoint()};
-    } else if (v.type() == nAttrs) {
+        break;
+    case nAttrs: {
         std::vector<Symbol> childNames;
         for (auto & attr : *v.attrs())
             childNames.push_back(attr.name);
         sortChildNames(childNames);
         attrValue = childNames;
-    } else {
-        return; // list, function, external — skip
+        break;
+    }
+    case nThunk:
+    case nPath:
+    case nList:
+    case nFunction:
+    case nExternal:
+        return; // thunk, path, list, function, external — skip
     }
 
     // Direct record — no deferred writes needed with SQLite backend.
@@ -309,21 +322,33 @@ void TracedExpr::recordSiblingTrace(TracedExpr * parentEC, Symbol siblingName, V
                     continue;
 
                 CachedResult childValue;
-                if (childType == nString) {
+                switch (childType) {
+                case nString: {
                     NixStringContext ctx;
                     if (attr.value->context())
                         for (auto * elem : *attr.value->context())
                             ctx.insert(NixStringContextElem::parse(elem->view()));
                     childValue = string_t{std::string(attr.value->string_view()), std::move(ctx)};
-                } else if (childType == nBool) {
+                    break;
+                }
+                case nBool:
                     childValue = attr.value->boolean();
-                } else if (childType == nInt) {
+                    break;
+                case nInt:
                     childValue = int_t{NixInt{attr.value->integer().value}};
-                } else if (childType == nNull) {
+                    break;
+                case nNull:
                     childValue = null_t{};
-                } else if (childType == nFloat) {
+                    break;
+                case nFloat:
                     childValue = float_t{attr.value->fpoint()};
-                } else {
+                    break;
+                case nThunk:
+                case nPath:
+                case nAttrs:
+                case nList:
+                case nFunction:
+                case nExternal:
                     continue;
                 }
 
@@ -712,7 +737,7 @@ TraceCache::TraceCache(
     std::optional<std::reference_wrapper<const Hash>> useCache,
     EvalState & state,
     RootLoader rootLoader,
-    std::map<std::string, SourcePath> inputAccessors)
+    std::unordered_map<std::string, SourcePath> inputAccessors)
     : state(state)
     , rootLoader(rootLoader)
     , inputAccessors(std::move(inputAccessors))

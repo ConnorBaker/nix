@@ -31,7 +31,7 @@ thread_local std::vector<Dep> DependencyTracker::sessionTraces;
 void DependencyTracker::record(const Dep & dep)
 {
     if (activeTracker) {
-        DepKey key{dep.type, dep.source, dep.key};
+        DepKey key(dep);
         if (!activeTracker->recordedKeys.insert(key).second)
             return;  // Dependency already recorded in this trace scope — skip duplicate
     }
@@ -103,75 +103,30 @@ Blake3Hash depHashDirListing(const SourceAccessor::DirEntries & entries)
 
 namespace {
 
-// ── L1 key: (dev, ino, mtime_sec, mtime_nsec, size, depType) ────────
-
-struct StatHashKey
-{
-    dev_t dev;
-    ino_t ino;
-    int64_t mtime_sec;
-    int64_t mtime_nsec;
-    off_t size;
-    DepType depType;
-
-    bool operator==(const StatHashKey &) const = default;
-};
-
-struct StatHashKeyHash
-{
-    std::size_t operator()(const StatHashKey & k) const noexcept
-    {
-        // FNV-1a-style combine
-        std::size_t h = 14695981039346656037ULL;
-        auto mix = [&](auto v) {
-            h ^= static_cast<std::size_t>(v);
-            h *= 1099511628211ULL;
-        };
-        mix(k.dev);
-        mix(k.ino);
-        mix(k.mtime_sec);
-        mix(k.mtime_nsec);
-        mix(k.size);
-        mix(static_cast<int>(k.depType));
-        return h;
-    }
-};
-
 // ── Impl ────────────────────────────────────────────────────────────
 
 static constexpr size_t L1_MAX_SIZE = 65536;
 
-// ── L2 bulk load entry ───────────────────────────────────────────────
-
-struct L2Entry {
-    dev_t dev; ino_t ino;
-    int64_t mtime_sec; int64_t mtime_nsec;
-    off_t size;
-    Blake3Hash hash;
-};
-
 // Key for L2 bulk map: path + dep_type
-struct L2BulkKey {
+struct L2Key {
     std::string path;
     DepType depType;
 
-    bool operator==(const L2BulkKey &) const = default;
-};
+    bool operator==(const L2Key &) const = default;
 
-struct L2BulkKeyHash {
-    std::size_t operator()(const L2BulkKey & k) const noexcept {
-        std::size_t h = std::hash<std::string>{}(k.path);
-        h ^= std::hash<int>{}(static_cast<int>(k.depType)) * 1099511628211ULL;
-        return h;
-    }
+    struct Hash {
+        std::size_t operator()(const L2Key & k) const noexcept {
+            return hashValues(k.path, std::to_underlying(k.depType));
+        }
+    };
 };
 
 struct StatHashCacheImpl
 {
-    boost::concurrent_flat_map<StatHashKey, Blake3Hash, StatHashKeyHash> l1;
+    boost::concurrent_flat_map<StatHashKey, Blake3Hash, StatHashKey::Hash> l1;
 
     // L2 bulk load cache (populated by loadStatHashEntries from TraceStore)
-    std::unordered_map<L2BulkKey, L2Entry, L2BulkKeyHash> l2Bulk;
+    std::unordered_map<L2Key, StatHashEntry, L2Key::Hash> l2Bulk;
     bool l2Loaded = false;
 
     // Dirty entries: newly-stored hashes that TraceStore should flush to SQLite
@@ -199,6 +154,7 @@ static StatHashKey makeKey(const PosixStat & st, DepType type)
         type,
     };
 }
+
 
 // ── StatHashCache singleton + public API ─────────────────────────────
 
@@ -231,20 +187,18 @@ struct StatHashCache
 
         // L2: bulk-loaded lookup (populated by loadStatHashEntries from TraceStore)
         auto pathStr = physPath.string();
-        auto l2It = impl->l2Bulk.find(L2BulkKey{pathStr, type});
+        auto l2It = impl->l2Bulk.find(L2Key{pathStr, type});
         if (l2It != impl->l2Bulk.end()) {
-            auto & entry = l2It->second;
+            auto & e = l2It->second;
             // Validate stat metadata
-            if (entry.dev == key.dev && entry.ino == key.ino
-                && entry.mtime_sec == key.mtime_sec && entry.mtime_nsec == key.mtime_nsec
-                && entry.size == key.size)
+            if (e.stat == key)
             {
                 // Promote to L1
                 if (impl->l1.size() < L1_MAX_SIZE)
-                    impl->l1.emplace(key, entry.hash);
+                    impl->l1.emplace(key, e.hash);
 
                 debug("stat hash cache: L2 hit for '%s' (%s)", physPath.string(), depTypeName(type));
-                return {entry.hash, *st};
+                return {e.hash, *st};
             }
         }
 
@@ -254,9 +208,14 @@ struct StatHashCache
 
     void storeHash(
         const std::filesystem::path & physPath, DepType type,
-        const Blake3Hash & hash, const PosixStat & st)
+        const Blake3Hash & hash, std::optional<PosixStat> st = std::nullopt)
     {
-        auto key = makeKey(st, type);
+        if (!st) {
+            st = maybeLstat(physPath);
+            if (!st)
+                return;
+        }
+        auto key = makeKey(*st, type);
 
         // L1: store in memory
         if (impl->l1.size() < L1_MAX_SIZE)
@@ -267,42 +226,15 @@ struct StatHashCache
         // Track as dirty for TraceStore to flush to SQLite
         impl->dirtyEntries.push_back(StatHashEntry{
             .path = physPath.string(),
-            .depType = type,
-            .dev = static_cast<int64_t>(key.dev),
-            .ino = static_cast<int64_t>(key.ino),
-            .mtime_sec = key.mtime_sec,
-            .mtime_nsec = key.mtime_nsec,
-            .size = static_cast<int64_t>(key.size),
+            .stat = key,
             .hash = hash,
         });
 
-        // Update L2 bulk cache
+        // Update L2 bulk cache (reuse the dirty entry we just created)
         if (impl->l2Loaded) {
             auto pathStr = physPath.string();
-            impl->l2Bulk[L2BulkKey{pathStr, type}] = L2Entry{
-                .dev = st.st_dev,
-                .ino = st.st_ino,
-#ifdef __APPLE__
-                .mtime_sec = st.st_mtimespec.tv_sec,
-                .mtime_nsec = st.st_mtimespec.tv_nsec,
-#else
-                .mtime_sec = st.st_mtim.tv_sec,
-                .mtime_nsec = st.st_mtim.tv_nsec,
-#endif
-                .size = st.st_size,
-                .hash = hash,
-            };
+            impl->l2Bulk[L2Key{pathStr, type}] = impl->dirtyEntries.back();
         }
-    }
-
-    void storeHash(
-        const std::filesystem::path & physPath, DepType type,
-        const Blake3Hash & hash)
-    {
-        auto st = maybeLstat(physPath);
-        if (!st)
-            return;
-        storeHash(physPath, type, hash, *st);
     }
 
     void clearMemoryCache()
@@ -313,14 +245,8 @@ struct StatHashCache
     void bulkLoadEntries(std::vector<StatHashEntry> entries)
     {
         for (auto & e : entries) {
-            impl->l2Bulk[L2BulkKey{e.path, e.depType}] = L2Entry{
-                .dev = static_cast<dev_t>(e.dev),
-                .ino = static_cast<ino_t>(e.ino),
-                .mtime_sec = e.mtime_sec,
-                .mtime_nsec = e.mtime_nsec,
-                .size = static_cast<off_t>(e.size),
-                .hash = e.hash,
-            };
+            auto key = L2Key{e.path, e.stat.depType};
+            impl->l2Bulk[std::move(key)] = std::move(e);
         }
         impl->l2Loaded = true;
         debug("stat hash cache: loaded %d L2 entries from TraceStore", entries.size());
@@ -419,7 +345,7 @@ Blake3Hash depHashDirListingCached(const SourcePath & path, const SourceAccessor
 // input is checked out on disk.
 std::optional<std::pair<std::string, CanonPath>> resolveToInput(
     const CanonPath & absPath,
-    const std::map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
+    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
 {
     auto path = absPath;
     std::vector<std::string> subpathParts;
@@ -469,7 +395,7 @@ void recordDep(
     const CanonPath & absPath,
     const DepHashValue & hash,
     DepType depType,
-    const std::map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
+    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
 {
     bool recorded = false;
     // Single lstat — reused for both existence gating and stat-hash-cache population
@@ -480,25 +406,19 @@ void recordDep(
             DependencyTracker::record({resolved->first, resolved->second.abs(), hash, depType});
             recorded = true;
             // Flake input path — no lstat needed (accessor provides content)
-        } else {
-            fileStat = maybeLstat(std::filesystem::path(absPath.abs()));
-            if (fileStat) {
-                // Real path outside flake input tree (e.g., store path from IFD).
-                // Record with "<absolute>" sentinel — verification oracle reads
-                // directly from the filesystem, bypassing input accessor resolution.
-                DependencyTracker::record({std::string(absolutePathDep), absPath.abs(), hash, depType});
-                recorded = true;
-            }
-            // else: virtual file — no filesystem oracle, skip (see above)
-        }
-    } else {
-        fileStat = maybeLstat(std::filesystem::path(absPath.abs()));
-        if (fileStat) {
-            DependencyTracker::record({"", absPath.abs(), hash, depType});
+        } else if ((fileStat = maybeLstat(std::filesystem::path(absPath.abs())))) {
+            // Real path outside flake input tree (e.g., store path from IFD).
+            // Record with "<absolute>" sentinel — verification oracle reads
+            // directly from the filesystem, bypassing input accessor resolution.
+            DependencyTracker::record({std::string(absolutePathDep), absPath.abs(), hash, depType});
             recorded = true;
         }
         // else: virtual file — no filesystem oracle, skip (see above)
+    } else if ((fileStat = maybeLstat(std::filesystem::path(absPath.abs())))) {
+        DependencyTracker::record({"", absPath.abs(), hash, depType});
+        recorded = true;
     }
+    // else: virtual file — no filesystem oracle, skip (see above)
 
     // Populate stat-hash cache for hashable deps (Shake: write-back of
     // computed hashes for future early-cutoff verification checks).
@@ -507,17 +427,9 @@ void recordDep(
         && (depType == DepType::Content || depType == DepType::Directory || depType == DepType::NARContent))
     {
         try {
-            if (auto * b3 = std::get_if<Blake3Hash>(&hash)) {
-                if (fileStat) {
-                    // Reuse existing stat metadata — avoids redundant lstat syscall
-                    StatHashCache::instance().storeHash(
-                        std::filesystem::path(absPath.abs()), depType, *b3, *fileStat);
-                } else {
-                    // Flake input path (resolved via mountToInput) — stat internally
-                    StatHashCache::instance().storeHash(
-                        std::filesystem::path(absPath.abs()), depType, *b3);
-                }
-            }
+            if (auto * b3 = std::get_if<Blake3Hash>(&hash))
+                StatHashCache::instance().storeHash(
+                    std::filesystem::path(absPath.abs()), depType, *b3, fileStat);
         } catch (...) {}
     }
 }

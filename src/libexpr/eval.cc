@@ -1191,10 +1191,10 @@ void EvalState::recordThunkDeps(Value & v, uint32_t epochStart)
     traceCtx->recordThunkDeps(v, epochStart);
 }
 
-const std::map<CanonPath, std::pair<std::string, std::string>> &
+const std::unordered_map<CanonPath, std::pair<std::string, std::string>> &
 EvalState::getMountToInput() const
 {
-    static const std::map<CanonPath, std::pair<std::string, std::string>> empty;
+    static const std::unordered_map<CanonPath, std::pair<std::string, std::string>> empty;
     return traceCtx ? traceCtx->mountToInput : empty;
 }
 
