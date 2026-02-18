@@ -271,7 +271,13 @@ struct DepKey {
     };
 };
 
-inline bool Dep::operator==(const Dep & other) const { return DepKey(*this) == DepKey(other); }
-inline auto Dep::operator<=>(const Dep & other) const { return DepKey(*this) <=> DepKey(other); }
+inline bool Dep::operator==(const Dep & other) const {
+    return type == other.type && source == other.source && key == other.key;
+}
+inline auto Dep::operator<=>(const Dep & other) const {
+    if (auto cmp = type <=> other.type; cmp != 0) return cmp;
+    if (auto cmp = source <=> other.source; cmp != 0) return cmp;
+    return key <=> other.key;
+}
 
 } // namespace nix

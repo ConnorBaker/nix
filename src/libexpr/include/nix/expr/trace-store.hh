@@ -202,8 +202,11 @@ struct TraceStore {
      * stored expected values (BSàlC VT dep-hash verification).
      *
      * Returns true if every non-volatile dep's current hash matches its stored
-     * hash. Volatile deps (CurrentTime, Exec) always fail. All computed hashes
-     * are cached in currentDepHashes for reuse by recovery().
+     * hash. Volatile deps (CurrentTime, Exec) always fail.
+     *
+     * When earlyExit is true, returns false on the first mismatch without
+     * computing remaining dep hashes. When false (default), computes ALL dep
+     * hashes even on mismatch, populating currentDepHashes for recovery().
      *
      * Session-memoized: a trace verified once in this session is not re-verified
      * (tracked via verifiedTraceIds).
@@ -211,7 +214,8 @@ struct TraceStore {
     bool verifyTrace(
         TraceId traceId,
         const std::unordered_map<std::string, SourcePath> & inputAccessors,
-        EvalState & state);
+        EvalState & state,
+        bool earlyExit = false);
 
 private:
     std::optional<TraceRow> lookupTraceRow(std::string_view attrPath);

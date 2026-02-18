@@ -12,6 +12,7 @@
 #include "nix/util/source-accessor.hh"
 #include "nix/fetchers/fetchers.hh"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -363,8 +364,8 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
     auto dbPath = cacheDir / "eval-trace-v2.sqlite";
 
     st->db = SQLite(dbPath, {.useWAL = settings.useSQLiteWAL});
+    st->db.exec("pragma page_size = 65536");            // 64KB pages for large BLOB I/O (MUST be before isCache)
     st->db.isCache();
-    st->db.exec("pragma page_size = 65536");            // 64KB pages for large BLOB I/O
     st->db.exec("pragma cache_size = -16000");           // 16MB page cache
     st->db.exec("pragma mmap_size = 268435456");         // 256MB mmap
     st->db.exec("pragma temp_store = memory");
@@ -841,11 +842,13 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
             depMap.insert_or_assign(DepKey(dep), dep);
     }
 
-    // Flatten to vector
+    // Flatten to sorted+deduped vector (sort once here, callers can skip)
     std::vector<Dep> result;
     result.reserve(depMap.size());
     for (auto & [_, dep] : depMap)
         result.push_back(dep);
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
 
     traceCache[traceId] = result;
     nrLoadTraceTimeUs += elapsedUs(loadStart);
@@ -904,7 +907,8 @@ TraceId TraceStore::getOrCreateTrace(
 bool TraceStore::verifyTrace(
     TraceId traceId,
     const std::unordered_map<std::string, SourcePath> & inputAccessors,
-    EvalState & state)
+    EvalState & state,
+    bool earlyExit)
 {
     if (verifiedTraceIds.count(traceId))
         return true;
@@ -914,15 +918,19 @@ bool TraceStore::verifyTrace(
     // Load the FULL trace (base chain already resolved)
     auto fullDeps = loadFullTrace(traceId);
 
-    // Batch verification: compute ALL current hashes, cache them,
-    // then compare. This ensures all hashes are cached for recovery.
+    // Verify dep hashes against current state.
+    // When earlyExit is true, return false on first mismatch (fast path for
+    // initial verification — recovery will compute remaining hashes lazily).
+    // When earlyExit is false, compute ALL hashes to populate currentDepHashes
+    // cache for recovery.
     bool allValid = true;
     for (auto & dep : fullDeps) {
         nrDepsChecked++;
 
         if (dep.type == DepType::CurrentTime || dep.type == DepType::Exec) {
             allValid = false;
-            continue; // still compute other hashes for caching
+            if (earlyExit) break;
+            continue;
         }
 
         DepKey dk(dep);
@@ -939,7 +947,7 @@ bool TraceStore::verifyTrace(
         if (!current || *current != dep.expectedHash) {
             nrVerificationsFailed++;
             allValid = false;
-            // Don't short-circuit: continue computing hashes for caching
+            if (earlyExit) break;
         }
     }
 
@@ -1117,8 +1125,9 @@ std::optional<TraceStore::VerifyResult> TraceStore::verify(
 
     nrTraceVerifications++;
 
-    // 2. Verify trace (batch mode: computes all hashes, caches them)
-    if (verifyTrace(row->traceId, inputAccessors, state)) {
+    // 2. Verify trace (early-exit mode: stop on first mismatch for speed;
+    //    recovery() will compute remaining hashes lazily if needed)
+    if (verifyTrace(row->traceId, inputAccessors, state, /*earlyExit=*/true)) {
         nrVerificationsPassed++;
         nrVerifyTimeUs += elapsedUs(verifyStart);
         return VerifyResult{decodeCachedResult(*row), row->traceId};
@@ -1208,8 +1217,10 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
     std::unordered_set<TraceId> triedTraceIds;
 
-    // Helper: try a candidate trace ID for recovery
-    auto tryCandidate = [&](TraceId candidateTraceId) -> std::optional<VerifyResult> {
+    // Accept a candidate trace found by trace_hash lookup. The hash match
+    // proves all deps match current state (probability of false match: 2^-256),
+    // so no dep-by-dep verifyTrace call is needed.
+    auto acceptRecoveredTrace = [&](TraceId candidateTraceId) -> std::optional<VerifyResult> {
         if (triedTraceIds.count(candidateTraceId))
             return std::nullopt;
         triedTraceIds.insert(candidateTraceId);
@@ -1225,10 +1236,6 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             resultId = use.getInt(0);
         }
 
-        // Verify the candidate trace
-        if (!verifyTrace(candidateTraceId, inputAccessors, state))
-            return std::nullopt;
-
         // Get result
         TraceRow recRow;
         {
@@ -1243,13 +1250,14 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             recRow.context = use.isNull(2) ? "" : use.getStr(2);
         }
 
-        // Update Attrs entry to point to recovered trace + result
+        // Update CurrentTraces to point to recovered trace + result
         {
             auto st(_state->lock());
             st->upsertAttr.use()
                 (contextHash)(*attrPathId)(candidateTraceId)(resultId).exec();
         }
 
+        // Hash match guarantees all deps match current state
         verifiedTraceIds.insert(candidateTraceId);
         return VerifyResult{decodeCachedResult(recRow), candidateTraceId};
     };
@@ -1260,7 +1268,8 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     // disambiguating child traces across different parent versions. O(1) lookup.
     if (allComputable) {
         auto directHashStart = timerStart();
-        auto sortedCurrentDeps = sortAndDedupDeps(currentDeps);
+        // currentDeps preserves key order from loadFullTrace (already sorted+deduped)
+        auto & sortedCurrentDeps = currentDeps;
         Hash newFullHash(HashAlgorithm::BLAKE3);
         if (parentTraceIdHint) {
             auto parentFullHash = getTraceFullHash(*parentTraceIdHint);
@@ -1280,7 +1289,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         }
 
         if (newTraceId) {
-            if (auto r = tryCandidate(*newTraceId)) {
+            if (auto r = acceptRecoveredTrace(*newTraceId)) {
                 debug("recovery: direct hash recovery succeeded for '%s'", attrPath);
                 nrRecoveryDirectHashHits++;
                 nrRecoveryDirectHashTimeUs += elapsedUs(directHashStart);
@@ -1374,8 +1383,8 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         if (!repComputable)
             continue;
 
-        // Compute candidate trace_hash
-        auto sortedRepDeps = sortAndDedupDeps(repCurrentDeps);
+        // repCurrentDeps preserves key order from loadFullTrace (already sorted+deduped)
+        auto & sortedRepDeps = repCurrentDeps;
         Hash candidateFullHash(HashAlgorithm::BLAKE3);
         if (parentTraceIdHint) {
             auto parentFullHash = getTraceFullHash(*parentTraceIdHint);
@@ -1395,7 +1404,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         }
 
         if (candidateTraceId) {
-            if (auto r = tryCandidate(*candidateTraceId)) {
+            if (auto r = acceptRecoveredTrace(*candidateTraceId)) {
                 debug("recovery: structural variant recovery succeeded for '%s'", attrPath);
                 nrRecoveryStructVariantHits++;
                 nrRecoveryStructVariantTimeUs += elapsedUs(structVariantStart);
