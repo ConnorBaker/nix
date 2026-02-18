@@ -33,26 +33,24 @@ struct TraceStore {
     struct State {
         SQLite db;
 
-        // Strings interning
-        SQLiteStmt insertString;
-        SQLiteStmt lookupStringId;
+        // Strings interning (UPSERT RETURNING)
+        SQLiteStmt upsertString;
+        SQLiteStmt getAllStrings;
 
-        // AttrPaths interning
-        SQLiteStmt insertAttrPath;
-        SQLiteStmt lookupAttrPathId;
+        // AttrPaths interning (UPSERT RETURNING)
+        SQLiteStmt upsertAttrPath;
+        SQLiteStmt lookupAttrPathId;  // read-only lookup (no insert)
 
-        // Results dedup
-        SQLiteStmt insertResult;
-        SQLiteStmt lookupResultByHash;
+        // Results dedup (UPSERT RETURNING)
+        SQLiteStmt upsertResult;
         SQLiteStmt getResult;
 
         // Traces (delta-encoded with base_trace_id chain, BLOB storage)
-        SQLiteStmt insertTrace;
+        SQLiteStmt upsertTrace;
         SQLiteStmt lookupTraceByFullHash;
         SQLiteStmt getTraceInfo;
         SQLiteStmt lookupTraceByStructHash;
         SQLiteStmt updateTraceBlob;
-        SQLiteStmt getAllStrings;
 
         // CurrentTraces (current verified state per attribute)
         SQLiteStmt lookupAttr;
@@ -240,6 +238,7 @@ private:
     std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);
 
     Hash getTraceFullHash(TraceId traceId);
+    Hash getTraceStructHash(TraceId traceId);
     std::optional<TraceId> getTraceBaseId(TraceId traceId);
 };
 

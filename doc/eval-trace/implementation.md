@@ -114,7 +114,7 @@ This detects `chmod +x` changes that `Content` would miss.
 accelerator).**
 L1 is a `boost::concurrent_flat_map` (session-scoped, 64K entry cap). L2 is
 bulk-loaded from the `StatHashCache` table in TraceStore's
-`eval-trace-v1.sqlite` database at session start, and dirty entries are flushed
+`eval-trace-v2.sqlite` database at session start, and dirty entries are flushed
 back at session end. Both levels are keyed on file stat metadata `(path, dev,
 ino, mtime_sec, mtime_nsec, size, dep_type)`. This cache accelerates the BSàlC
 VT verification step: validating dep hashes reduces to a series of `lstat()`
@@ -122,7 +122,7 @@ calls for unchanged files.
 
 *(Historical note: Prior to Session 56, L2 was a separate SQLite database at
 `~/.cache/nix/stat-hash-cache-v2.sqlite`. This was merged into the single
-`eval-trace-v1.sqlite` database to simplify the storage model. The
+`eval-trace-v2.sqlite` database to simplify the storage model. The
 StatHashCache singleton no longer owns any SQLite connection; TraceStore handles
 all persistence through its single connection/transaction.)*
 
@@ -282,7 +282,7 @@ set of problems:
   fundamentally store-aware concern leaking into the trace system.
 
 The pure SQLite backend eliminates all of these by storing everything in a
-single database at `~/.cache/nix/eval-trace-v1.sqlite`, with no store
+single database at `~/.cache/nix/eval-trace-v2.sqlite`, with no store
 dependency for trace storage.
 
 **1. Replaced CAS blob traces with pure SQLite TraceStore (BSàlC trace store).**
@@ -311,7 +311,7 @@ evaluation order: parents are always recorded before children because evaluation
 is depth-first (Adapton demand-driven traversal).
 
 **4. HashSink-based trace hashing.**
-Replaced CBOR-serialized dep hashing with direct `SHA256 HashSink` feeding.
+Replaced CBOR-serialized dep hashing with direct `BLAKE3 HashSink` feeding.
 Domain-separated fields: `"T"` type, `"S"` source, `"K"` key, `"H"` hash for
 trace hash; structural hash omits `"H"`. This eliminated the `nlohmann/json`
 dependency from `trace-hash.cc`.
@@ -545,7 +545,7 @@ Consumers access it through the `depHashFile`, `depHashPathCached`, and
 internally.
 
 The StatHashCache singleton has no SQLite connection of its own. TraceStore
-owns the `StatHashCache` table in its single `eval-trace-v1.sqlite` database
+owns the `StatHashCache` table in its single `eval-trace-v2.sqlite` database
 and handles all persistence:
 
 - **Construction:** TraceStore bulk-loads all `StatHashCache` rows into the
@@ -586,7 +586,7 @@ functions declared in `dependency-tracker.hh`:
 - `loadStatHashEntries(vector<StatHashEntry>)`: populates L2 from DB rows
 - `forEachDirtyStatHash(callback)`: iterates dirty entries for DB flush
 
-This design ensures a single SQLite file (`eval-trace-v1.sqlite`) with a
+This design ensures a single SQLite file (`eval-trace-v2.sqlite`) with a
 single connection and transaction for all trace and stat-hash data.
 
 ### 3.4 Trace Hashing (trace-hash.hh/cc)
@@ -599,7 +599,7 @@ dependency were removed. The module now contains only HashSink-based trace
 hashing.)*
 
 **Trace hash computation** hashes sorted deps by feeding each dep's fields into a
-`HashSink(HashAlgorithm::SHA256)` with domain-separated fields:
+`HashSink(HashAlgorithm::BLAKE3)` with domain-separated fields:
 
 ```
 For each dep (sorted by type, source, key):

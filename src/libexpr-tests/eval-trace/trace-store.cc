@@ -1059,8 +1059,9 @@ TEST_F(TraceStoreTest, BlobRoundTrip_LargeSet)
     }
 
     auto blob = TraceStore::serializeDeps(deps);
-    // Each dep: 1 + 4 + 4 + 1 + 32 = 42 bytes
-    EXPECT_EQ(blob.size(), 10000u * 42u);
+    // Blob is zstd-compressed; verify it's smaller than raw size (10000 * 42 bytes)
+    EXPECT_GT(blob.size(), 0u);
+    EXPECT_LT(blob.size(), 10000u * 42u);
 
     auto result = TraceStore::deserializeInternedDeps(blob.data(), blob.size());
     ASSERT_EQ(result.size(), 10000u);

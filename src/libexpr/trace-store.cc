@@ -7,6 +7,7 @@
 #include "nix/util/users.hh"
 #include "nix/util/util.hh"
 #include "nix/util/hash.hh"
+#include "nix/util/compression.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/fetchers/fetchers.hh"
@@ -187,15 +188,30 @@ std::vector<uint8_t> TraceStore::serializeDeps(const std::vector<InternedDep> & 
         blob.insert(blob.end(), hashData, hashData + hashSize);
     }
 
+    // Compress with zstd level 1 (fast, good ratio for structured binary data)
+    if (!blob.empty()) {
+        auto compressed = nix::compress(
+            CompressionAlgo::zstd,
+            {reinterpret_cast<const char *>(blob.data()), blob.size()},
+            false, 1);
+        return {compressed.begin(), compressed.end()};
+    }
     return blob;
 }
 
 std::vector<TraceStore::InternedDep> TraceStore::deserializeInternedDeps(
     const void * blob, size_t size)
 {
+    if (size == 0)
+        return {};
+
+    // Decompress zstd-compressed deps_blob
+    auto decompressed = nix::decompress("zstd",
+        {static_cast<const char *>(blob), size});
+
     std::vector<InternedDep> deps;
-    const uint8_t * p = static_cast<const uint8_t *>(blob);
-    const uint8_t * end = p + size;
+    const uint8_t * p = reinterpret_cast<const uint8_t *>(decompressed.data());
+    const uint8_t * end = p + decompressed.size();
 
     while (p + sizeof(DepBlobHeader) <= end) {
         DepBlobHeader hdr;
@@ -344,48 +360,51 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
     auto cacheDir = std::filesystem::path(getCacheDir());
     createDirs(cacheDir);
 
-    auto dbPath = cacheDir / "eval-trace-v1.sqlite";
+    auto dbPath = cacheDir / "eval-trace-v2.sqlite";
 
     st->db = SQLite(dbPath, {.useWAL = settings.useSQLiteWAL});
     st->db.isCache();
-    st->db.exec("pragma cache_size = -4000");          // 4MB page cache
-    st->db.exec("pragma mmap_size = 30000000");        // 30MB mmap
+    st->db.exec("pragma page_size = 65536");            // 64KB pages for large BLOB I/O
+    st->db.exec("pragma cache_size = -16000");           // 16MB page cache
+    st->db.exec("pragma mmap_size = 268435456");         // 256MB mmap
     st->db.exec("pragma temp_store = memory");
-    st->db.exec("pragma journal_size_limit = 2097152"); // 2MB WAL limit
+    st->db.exec("pragma journal_size_limit = 2097152");  // 2MB WAL limit
 
     st->db.exec(schema);
 
-    // Strings interning
-    st->insertString.create(st->db,
-        "INSERT OR IGNORE INTO Strings(value) VALUES (?)");
-
-    st->lookupStringId.create(st->db,
-        "SELECT id FROM Strings WHERE value = ?");
+    // Strings interning (UPSERT RETURNING: 1 statement instead of INSERT + SELECT)
+    st->upsertString.create(st->db,
+        "INSERT INTO Strings(value) VALUES (?) "
+        "ON CONFLICT(value) DO UPDATE SET value = excluded.value "
+        "RETURNING id");
 
     st->getAllStrings.create(st->db,
         "SELECT id, value FROM Strings");
 
-    // AttrPaths interning
-    st->insertAttrPath.create(st->db,
-        "INSERT OR IGNORE INTO AttrPaths(path) VALUES (?)");
+    // AttrPaths interning (UPSERT RETURNING)
+    st->upsertAttrPath.create(st->db,
+        "INSERT INTO AttrPaths(path) VALUES (?) "
+        "ON CONFLICT(path) DO UPDATE SET path = excluded.path "
+        "RETURNING id");
 
     st->lookupAttrPathId.create(st->db,
         "SELECT id FROM AttrPaths WHERE path = ?");
 
-    // Results dedup
-    st->insertResult.create(st->db,
-        "INSERT OR IGNORE INTO Results(type, value, context, hash) VALUES (?, ?, ?, ?)");
-
-    st->lookupResultByHash.create(st->db,
-        "SELECT id FROM Results WHERE hash = ?");
+    // Results dedup (UPSERT RETURNING)
+    st->upsertResult.create(st->db,
+        "INSERT INTO Results(type, value, context, hash) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(hash) DO UPDATE SET type = excluded.type "
+        "RETURNING id");
 
     st->getResult.create(st->db,
         "SELECT type, value, context FROM Results WHERE id = ?");
 
-    // Traces (BLOB storage)
-    st->insertTrace.create(st->db,
-        "INSERT OR IGNORE INTO Traces(base_trace_id, trace_hash, struct_hash, deps_blob) "
-        "VALUES (?, ?, ?, ?)");
+    // Traces (BLOB storage, UPSERT RETURNING)
+    st->upsertTrace.create(st->db,
+        "INSERT INTO Traces(base_trace_id, trace_hash, struct_hash, deps_blob) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(trace_hash) DO UPDATE SET trace_hash = excluded.trace_hash "
+        "RETURNING id");
 
     st->lookupTraceByFullHash.create(st->db,
         "SELECT id FROM Traces WHERE trace_hash = ?");
@@ -664,14 +683,11 @@ StringId TraceStore::doInternString(std::string_view s)
         return it->second;
 
     auto st(_state->lock());
-    st->insertString.use()(s).exec();
-
-    auto use(st->lookupStringId.use()(s));
+    auto use(st->upsertString.use()(s));
     if (!use.next())
         throw Error("failed to intern string '%s'", s);
     StringId id = use.getInt(0);
     internedStrings[key] = id;
-    // Also populate reverse string table
     stringTable[id] = key;
     return id;
 }
@@ -684,11 +700,7 @@ AttrPathId TraceStore::doInternAttrPath(std::string_view path)
         return it->second;
 
     auto st(_state->lock());
-    st->insertAttrPath.use()
-        (reinterpret_cast<const unsigned char *>(path.data()), path.size())
-        .exec();
-
-    auto use(st->lookupAttrPathId.use()
+    auto use(st->upsertAttrPath.use()
         (reinterpret_cast<const unsigned char *>(path.data()), path.size()));
     if (!use.next())
         throw Error("failed to intern attr path");
@@ -701,33 +713,14 @@ ResultId TraceStore::doInternResult(ResultKind type, const std::string & value,
                                      const std::string & context, const Hash & resultHash)
 {
     auto st(_state->lock());
-
-    // Try to find existing result by hash
-    {
-        auto use(st->lookupResultByHash.use());
-        bindRawHash(use, resultHash);
-        if (use.next())
-            return use.getInt(0);
-    }
-
-    // Insert new result
-    {
-        auto use(st->insertResult.use());
-        use(static_cast<int64_t>(type));
-        use(value);
-        use(context);
-        bindRawHash(use, resultHash);
-        use.exec();
-    }
-
-    // Get id
-    {
-        auto use(st->lookupResultByHash.use());
-        bindRawHash(use, resultHash);
-        if (!use.next())
-            throw Error("failed to intern result");
-        return use.getInt(0);
-    }
+    auto use(st->upsertResult.use());
+    use(static_cast<int64_t>(type));
+    use(value);
+    use(context);
+    bindRawHash(use, resultHash);
+    if (!use.next())
+        throw Error("failed to intern result");
+    return use.getInt(0);
 }
 
 // ── Trace storage (BSàlC trace store) ───────────────────────────────
@@ -756,6 +749,22 @@ Hash TraceStore::getTraceFullHash(TraceId traceId)
     auto [blobData, blobSize] = use.getBlob(1);
     auto h = readRawHash(blobData, blobSize);
     traceHashCache.insert_or_assign(traceId, h);
+    return h;
+}
+
+Hash TraceStore::getTraceStructHash(TraceId traceId)
+{
+    auto cacheIt = traceStructHashCache.find(traceId);
+    if (cacheIt != traceStructHashCache.end())
+        return cacheIt->second;
+
+    auto st(_state->lock());
+    auto use(st->getTraceInfo.use()(traceId));
+    if (!use.next())
+        throw Error("trace %d not found", traceId);
+    auto [blobData, blobSize] = use.getBlob(2);
+    auto h = readRawHash(blobData, blobSize);
+    traceStructHashCache.insert_or_assign(traceId, h);
     return h;
 }
 
@@ -873,41 +882,21 @@ TraceId TraceStore::getOrCreateTrace(
     // Serialize delta deps into BLOB
     auto blob = serializeDeps(deltaDeps);
 
-    // Batch DB operations under one lock
+    // Single UPSERT RETURNING: insert or get existing trace ID
     auto st(_state->lock());
-
-    // Check if trace already exists
-    {
-        auto use(st->lookupTraceByFullHash.use());
-        bindRawHash(use, traceHash);
-        if (use.next())
-            return use.getInt(0);
-    }
-
-    // Insert new trace with BLOB
-    {
-        auto use(st->insertTrace.use());
-        use(baseTraceId ? *baseTraceId : (int64_t)0, baseTraceId.has_value());
-        bindRawHash(use, traceHash);
-        bindRawHash(use, structHash);
-        bindBlobVec(use, blob);
-        use.exec();
-    }
-
-    // Get the trace ID
-    TraceId newTraceId;
-    {
-        auto use(st->lookupTraceByFullHash.use());
-        bindRawHash(use, traceHash);
-        if (!use.next())
-            throw Error("failed to retrieve trace after insert");
-        newTraceId = use.getInt(0);
-    }
+    auto use(st->upsertTrace.use());
+    use(baseTraceId ? *baseTraceId : (int64_t)0, baseTraceId.has_value());
+    bindRawHash(use, traceHash);
+    bindRawHash(use, structHash);
+    bindBlobVec(use, blob);
+    if (!use.next())
+        throw Error("failed to get or create trace");
+    TraceId traceId = use.getInt(0);
 
     // Track as dirty for post-write optimization
-    dirtyTraceIds.insert(newTraceId);
+    dirtyTraceIds.insert(traceId);
 
-    return newTraceId;
+    return traceId;
 }
 
 // ── Trace verification (BSàlC VT check) ─────────────────────────────
@@ -1302,6 +1291,13 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         nrRecoveryDirectHashTimeUs += elapsedUs(directHashStart);
     }
 
+    // If direct hash recovery tried the old trace's dep structure (allComputable),
+    // save its struct_hash so we can skip identical structures in variant scan.
+    std::optional<Hash> directHashStructHash;
+    if (allComputable) {
+        directHashStructHash = getTraceStructHash(oldTraceId);
+    }
+
     // === Structural variant recovery (novel extension beyond BSàlC) ===
     // Handles dynamic dep instability (Shake-style): the same attribute can have
     // different dep structures across evaluations. Scans TraceHistory for entries
@@ -1341,6 +1337,9 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
     for (auto & [structHash, repTraceId] : structGroups) {
         if (triedTraceIds.count(repTraceId))
+            continue;
+        // Skip structural variants identical to the one direct hash recovery already tried
+        if (directHashStructHash && structHash == *directHashStructHash)
             continue;
 
         // Load full deps for this representative

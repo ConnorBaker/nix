@@ -173,7 +173,7 @@ TracedExpr thunks                                [trace-cache.cc]
   |
   v
 TraceStore                                      [trace-store.cc]
-  SQLite backend. Single database at ~/.cache/nix/eval-trace-v1.sqlite.
+  SQLite backend. Single database at ~/.cache/nix/eval-trace-v2.sqlite.
   +-- verify():       SELECT → verifyTrace → decode CachedResult
   +-- record():       INSERT/UPSERT → trace + recovery index writes
   +-- recovery():     direct hash + structural variant lookup in TraceHistory
@@ -305,9 +305,10 @@ specifically) would not invalidate `hello.pname`.
 ### 5.1 SQLite Database
 
 All trace data lives in a single SQLite database at
-`~/.cache/nix/eval-trace-v1.sqlite`. This includes attribute results, recorded
-traces, and recovery indices. The database uses WAL mode, memory-mapped I/O
-(30 MB), and a 4 MB page cache for performance.
+`~/.cache/nix/eval-trace-v2.sqlite`. This includes attribute results, recorded
+traces, and recovery indices. The database uses WAL mode, 64 KB page size
+(optimized for large BLOB I/O), 256 MB memory-mapped I/O, and a 16 MB page
+cache for performance.
 
 The choice of a unified SQLite database (rather than separate index + store, or
 content-addressed store objects) provides several advantages:
@@ -394,11 +395,13 @@ references.
 with the same result share a single Results row.
 
 **Traces** stores deduplicated dependency traces (BSàlC constructive traces),
-keyed by `trace_hash` (SHA-256 of the full dep content including hash values).
+keyed by `trace_hash` (BLAKE3 of the full dep content including hash values).
 The `struct_hash` captures the structural signature (dep types + sources + keys,
 without hash values) for structural variant recovery. The `deps_blob`
-stores delta-encoded dependency entries as a compact BLOB, with `base_trace_id`
-pointing to a base trace for delta chain resolution.
+stores zstd-compressed, delta-encoded dependency entries as a compact BLOB,
+with `base_trace_id` pointing to a base trace for delta chain resolution.
+Zstd level 1 compression achieves 5–10× size reduction on the repetitive
+binary dep data with sub-millisecond encode/decode overhead.
 
 **CurrentTraces** maps `(context_hash, attr_path_id)` to the current trace and
 result for each attribute. This is the primary lookup table for the verify path.
@@ -462,8 +465,10 @@ Attribute values are encoded as three SQL columns: `type` (INTEGER), `value`
 | Failed (5) | 5 | (empty) | (empty) |
 | Placeholder (0) | 0 | (empty) | (empty) |
 
-This avoids binary serialization (no CBOR, no zstd). Decoding is a switch on the
-integer type with simple string parsing.
+This avoids binary serialization for result values (no CBOR). Decoding is a
+switch on the integer type with simple string parsing. (Note: `deps_blob` in
+the Traces table *is* zstd-compressed for storage efficiency, but result values
+in the Results table use plain SQL columns.)
 
 ### 5.5 Session Caches
 
@@ -534,8 +539,8 @@ The fresh evaluation path evaluates the real thunk and records the trace:
    b. Sort and dedup deps
    c. Compute trace_hash (with parent Merkle chaining if parent exists)
       and struct_hash via HashSink
-   d. INSERT OR IGNORE INTO Traces (dedup by trace_hash)
-   e. Intern result into Results table (dedup by result hash)
+   d. UPSERT RETURNING INTO Traces (dedup by trace_hash, single statement)
+   e. UPSERT RETURNING INTO Results (dedup by result hash, single statement)
    f. UPSERT INTO CurrentTraces (ON CONFLICT: update trace_id, result_id)
    g. INSERT INTO TraceHistory (record for future constructive recovery)
    h. Add to session caches (verifiedTraceIds)
@@ -574,7 +579,9 @@ Structural variant recovery (novel, beyond BSàlC)                 [O(V)]
   Scan TraceHistory for same (context_hash, attr_path_id)
   Group by struct_hash — returns representative traces for each unique
   dep KEY structure (types + sources + keys, without hash values)
-  For each representative: load its deps, recompute current hashes
+  Skip struct_hash groups already tried by direct hash recovery
+    (short-circuit: same dep structure would produce the same trace_hash)
+  For each remaining representative: load its deps, recompute current hashes
     Retry direct hash lookup with recomputed hashes
   Handles dep structure instability (dynamic deps — different deps across
   fresh evaluations depending on evaluation order, per Shake)
@@ -591,8 +598,8 @@ Direct hash recovery uses `computeTraceHashWithParentFromSorted()` to mix the pa
 `trace_hash` into the child's recovery lookup key. This creates a Merkle chain:
 
 ```
-traceHash(root)  = SHA256(sorted_deps)
-traceHash(child) = SHA256(sorted_deps + "P" + parent.traceHash)
+traceHash(root)  = BLAKE3(sorted_deps)
+traceHash(child) = BLAKE3(sorted_deps + "P" + parent.traceHash)
 ```
 
 The parent's `trace_hash` is itself computed from its deps (and its parent's hash,
@@ -667,8 +674,8 @@ this identity, used as the index partition key.
 
 For non-flake evaluations (`nix eval -f` / `nix eval --expr`):
 
-- `--file <path>`: SHA256 of the canonical absolute path
-- `--expr <text>`: SHA256 of the expression text
+- `--file <path>`: BLAKE3 of the canonical absolute path (plus auto-args, lookup paths, store dir, system)
+- `--expr <text>`: BLAKE3 of the expression text (plus auto-args, lookup paths, store dir, system)
 
 These are also version-independent, enabling tracing and recovery across
 modifications to the evaluated file or expression.

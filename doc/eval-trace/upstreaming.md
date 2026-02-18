@@ -376,7 +376,7 @@ nix develop --command bash -c "meson test -C build trace-cache"
 
 ```bash
 # Fresh evaluation path (first eval -- Adapton demand-driven recomputation)
-rm -rf ~/.cache/nix/eval-trace-v1.sqlite
+rm -rf ~/.cache/nix/eval-trace-v2.sqlite
 time nix eval nixpkgs#hello.pname
 # Expected: ~3-5s (dominated by evaluation + store I/O)
 
