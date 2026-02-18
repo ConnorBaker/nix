@@ -4,7 +4,6 @@
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-profiler.hh"
-#include "nix/expr/dep-tracker.hh"
 #include "nix/util/types.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/nixexpr.hh"
@@ -26,6 +25,7 @@
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <functional>
 
@@ -56,6 +56,8 @@ struct MountedSourceAccessor;
 namespace eval_trace {
 class TraceCache;
 }
+
+struct EvalTraceContext;
 
 /**
  * Increments a count on construction and decrements on destruction.
@@ -466,55 +468,34 @@ public:
     }
 
     /**
-     * Registry of eval trace instances (BSàlC: verifying traces), keyed by
-     * flake identity hash. Allows reuse of the same traced root value across
-     * installables that share the same flake lock.
+     * Trace-aware evaluation context (BSàlC trace store + Adapton DDG).
+     * Holds evalCaches, fileContentHashes, mountToInput, epochMap.
+     * Non-null when eval-trace is enabled (the default); nullptr otherwise.
      */
-    std::map<const Hash, ref<eval_trace::TraceCache>> evalCaches;
-
-    /**
-     * Cache of file content BLAKE3 hashes, keyed by SourcePath.
-     * Populated during parseExprFromFile() and used by evalFile()
-     * to record Content oracle deps (Adapton DDG edges) without
-     * redundant re-hashing.
-     */
-    std::map<SourcePath, Blake3Hash> fileContentHashes;
-
-    /**
-     * Maps store mount points to (inputName, subdir) pairs.
-     * Used to resolve absolute paths back to input-relative paths
-     * for oracle dep recording (Adapton DDG). Populated by openTraceCache().
-     */
-    std::map<CanonPath, std::pair<std::string, std::string>> mountToInput;
-
-    /**
-     * Epoch-based memoized oracle deps from thunk/app evaluation, keyed by
-     * Value address. Each entry records the [start, end) range in the
-     * session-wide dep vector that was produced during the thunk's evaluation.
-     * Used by replayMemoizedDeps() to propagate deps into active dependency
-     * trackers (Adapton DDG: transitive dependency edges).
-     */
-    boost::unordered_flat_map<const Value *, DepRange> epochMap;
+    std::unique_ptr<EvalTraceContext> traceCtx;
 
     /**
      * Replay memoized oracle deps for an already-forced Value into active
-     * dependency trackers (Adapton: propagating transitive DDG edges).
-     * Called when forceValue encounters a non-thunk, non-app Value with
-     * an active DependencyTracker. Adds the value's epoch range to each
-     * active tracker's replayedRanges (skipping trackers that already
-     * include those deps in their session range).
+     * dependency trackers. Forwards to traceCtx->replayMemoizedDeps().
      */
     void replayMemoizedDeps(const Value & v);
 
     /**
      * Record that thunk/app evaluation of `v` produced oracle deps in
-     * [epochStart, sessionTraces.size()). Called from forceValue after
-     * thunk or app evaluation completes to populate the epoch map
-     * (enables dep replay for subsequent forcing). Extracted as noinline
-     * to keep forceValue's hot path small.
+     * [epochStart, sessionTraces.size()). Forwards to traceCtx->recordThunkDeps().
      */
     [[gnu::noinline]]
     void recordThunkDeps(Value & v, uint32_t epochStart);
+
+    /**
+     * Get the mount-to-input mapping. Returns an empty map if traceCtx is null.
+     */
+    const std::map<CanonPath, std::pair<std::string, std::string>> & getMountToInput() const;
+
+    /**
+     * Flush trace caches to persist SQLite WAL. Safe to call when traceCtx is null.
+     */
+    void flushTraceContext();
 
 private:
 

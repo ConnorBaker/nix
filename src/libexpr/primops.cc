@@ -2006,7 +2006,7 @@ static void prim_pathExists(EvalState & state, const PosIdx pos, Value ** args, 
             DepHashValue hashValue = st
                 ? DepHashValue(fmt("type:%d", static_cast<int>(st->type)))
                 : DepHashValue(std::string("missing"));
-            recordDep(path.path, hashValue, DepType::Existence, state.mountToInput);
+            recordDep(path.path, hashValue, DepType::Existence, state.getMountToInput());
         }
 
         v.mkBool(exists);
@@ -2118,7 +2118,7 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
     // Record Content oracle dep for trace verification (Adapton DDG edge)
     if (DependencyTracker::isActive()) {
         auto hash = depHash(s);
-        recordDep(path.path, hash, DepType::Content, state.mountToInput);
+        recordDep(path.path, hash, DepType::Content, state.getMountToInput());
     }
 
     if (s.find((char) 0) != std::string::npos)
@@ -2360,7 +2360,7 @@ static void prim_hashFile(EvalState & state, const PosIdx pos, Value ** args, Va
     // Record Content oracle dep for trace verification (Adapton DDG edge)
     if (DependencyTracker::isActive()) {
         auto hash = depHash(content);
-        recordDep(path.path, hash, DepType::Content, state.mountToInput);
+        recordDep(path.path, hash, DepType::Content, state.getMountToInput());
     }
 
     v.mkString(hashString(*ha, content).to_string(HashFormat::Base16, false), state.mem);
@@ -2419,7 +2419,7 @@ static void prim_readFileType(EvalState & state, const PosIdx pos, Value ** args
     // Record Existence oracle dep (with file type) for trace verification
     if (DependencyTracker::isActive()) {
         recordDep(path.path, DepHashValue(fmt("type:%d", static_cast<int>(st.type))),
-            DepType::Existence, state.mountToInput);
+            DepType::Existence, state.getMountToInput());
     }
 
     v = fileTypeToString(state, st.type);
@@ -2447,7 +2447,7 @@ static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Val
 
     // Record Directory oracle dep for trace verification
     if (DependencyTracker::isActive()) {
-        recordDep(path.path, depHashDirListing(entries), DepType::Directory, state.mountToInput);
+        recordDep(path.path, depHashDirListing(entries), DepType::Directory, state.getMountToInput());
     }
     auto attrs = state.buildBindings(entries.size());
 
@@ -2925,10 +2925,10 @@ static void addPath(
                     auto st = sp.lstat();
                     if (st.type == SourceAccessor::tRegular) {
                         recordDep(sp.path, depHashPath(sp), DepType::NARContent,
-                                  state.mountToInput);
+                                  state.getMountToInput());
                     } else if (st.type == SourceAccessor::tDirectory) {
                         recordDep(sp.path, depHashDirListing(sp.readDirectory()), DepType::Directory,
-                                  state.mountToInput);
+                                  state.getMountToInput());
                     }
                     // Symlink target changes are not tracked individually.
                     // Parent Directory dep captures symlink existence.
@@ -2939,7 +2939,7 @@ static void addPath(
             // Record Directory dep on root directory (filter never sees the root itself).
             if (recordFilterDeps) {
                 recordDep(path.path, depHashDirListing(path.readDirectory()), DepType::Directory,
-                          state.mountToInput);
+                          state.getMountToInput());
             }
         }
 
@@ -2985,7 +2985,7 @@ static void addPath(
         if (!filterFun && refs.empty() && DependencyTracker::isActive()
             && !state.store->isInStore(path.path.abs()))
         {
-            recordDep(path.path, DepHashValue(resultStorePath), DepType::CopiedPath, state.mountToInput);
+            recordDep(path.path, DepHashValue(resultStorePath), DepType::CopiedPath, state.getMountToInput());
         }
     } catch (Error & e) {
         e.addTrace(state.positions[pos], "while adding path '%s'", path);

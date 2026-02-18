@@ -98,7 +98,7 @@ struct CmdFormatterRun : MixFormatter, MixJSON
 
         // Release our references to trace caches to ensure they are persisted to disk, because
         // we are about to exec out of this process without running C++ destructors.
-        evalState->evalCaches.clear();
+        evalState->flushTraceContext();
 
         execProgramInStore(
             store,

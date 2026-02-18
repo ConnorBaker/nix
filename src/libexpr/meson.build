@@ -156,6 +156,7 @@ endforeach
 sources = files(
   'attr-path.cc',
   'attr-set.cc',
+  'eval-trace-context.cc',
   'trace-cache.cc',
   'trace-store.cc',
   'trace-hash.cc',

@@ -24,6 +24,7 @@
 #include "nix/util/environment-variables.hh"
 #include "nix/flake/flake.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-trace-context.hh"
 #include "nix/expr/trace-cache.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/flake/lockfile.hh"
@@ -1072,7 +1073,8 @@ ref<eval_trace::TraceCache> openTraceCache(EvalState & state, ref<const LockedFl
     }
 
     // Also set mountToInput on EvalState so evalFile/primops can use it
-    state.mountToInput = mountToInput;
+    if (state.traceCtx)
+        state.traceCtx->mountToInput = mountToInput;
 
     auto rootLoader = [&state, lockedFlake]() {
         /* For testing whether the eval trace is complete
@@ -1092,9 +1094,10 @@ ref<eval_trace::TraceCache> openTraceCache(EvalState & state, ref<const LockedFl
     };
 
     if (stableIdentity) {
-        auto search = state.evalCaches.find(stableIdentity.value());
-        if (search == state.evalCaches.end()) {
-            search = state.evalCaches
+        // stableIdentity implies useTraceCache=true -> traceCtx is non-null
+        auto search = state.traceCtx->evalCaches.find(stableIdentity.value());
+        if (search == state.traceCtx->evalCaches.end()) {
+            search = state.traceCtx->evalCaches
                          .emplace(stableIdentity.value(),
                              make_ref<eval_trace::TraceCache>(
                                  stableIdentity, state, rootLoader,

@@ -400,15 +400,17 @@ exist. Their replacements are listed.)*
 | File | Changes | Description |
 |------|--------:|-------------|
 | `src/libexpr/eval.cc` | +88 | DependencyTracker integration (Adapton DDG), `evalFile` Content dep |
+| `src/libexpr/eval-trace-context.cc` | ~50 | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
 | `src/libexpr/primops.cc` | +184 | `recordDep` calls for all file-accessing builtins |
 | `src/libexpr/primops/fetchTree.cc` | +12 | UnhashedFetch dep recording |
+| `src/libexpr/include/nix/expr/eval-trace-context.hh` | ~95 | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
+| `src/libexpr/include/nix/expr/eval-settings.hh` | +20 | `trace-cache`, `verify-trace-cache` settings |
 | `src/libcmd/installable-attr-path.cc` | ~200 | `NIX_ALLOW_EVAL` guard, TracedExpr root articulation point creation |
 | `src/libcmd/installable-flake.cc` | ~200 | Trace lifecycle, `computeStableIdentity()` |
-| `src/libflake/flake.cc` | +85 | Input accessor mappings, `mountToInput` |
+| `src/libflake/flake.cc` | +85 | Input accessor mappings, `traceCtx->mountToInput` |
 | `src/nix/eval.cc` | ~50 | `getRootValue()` instead of `getRoot()` |
 | `src/nix/search.cc` | ~50 | Value-based API instead of AttrCursor |
 | `src/nix/flake.cc` | ~50 | Value-based API instead of AttrCursor |
-| `src/libexpr/include/nix/expr/eval-settings.hh` | +20 | `trace-cache`, `verify-trace-cache` settings |
 
 ### Test Files
 
@@ -910,9 +912,12 @@ different-size content for reliable invalidation testing.
 
 ### 6.1 EvalState
 
-`EvalState` holds a `std::map<const Hash, ref<eval_trace::TraceCache>> evalCaches`
-map. Each unique trace identity (flake source or file/expr hash) gets its own
-`TraceCache` instance. Integration is transparent: `TracedExpr` articulation
+`EvalState` holds a `std::unique_ptr<EvalTraceContext> traceCtx` that is non-null
+when eval-trace is enabled (the default). The `EvalTraceContext` struct contains
+`evalCaches`, `fileContentHashes`, `mountToInput`, and `epochMap` -- all state
+needed for trace-aware incremental evaluation. Each unique trace identity (flake
+source or file/expr hash) gets its own `TraceCache` instance via
+`traceCtx->evalCaches`. Integration is transparent: `TracedExpr` articulation
 points are placed in the Value tree and `forceValue()` triggers
 `TracedExpr::eval()` automatically -- this is the Adapton demand-driven model
 where computation is memoized and re-verified on access.

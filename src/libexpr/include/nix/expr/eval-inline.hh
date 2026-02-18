@@ -90,7 +90,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
-        uint32_t epochStart = DependencyTracker::isActive()
+        uint32_t epochStart = traceCtx && DependencyTracker::isActive()
             ? DependencyTracker::sessionTraces.size() : 0;
         try {
             v.mkBlackhole();
@@ -104,15 +104,15 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             tryFixupBlackHolePos(v, pos);
             throw;
         }
-        if (DependencyTracker::isActive())
+        if (traceCtx && DependencyTracker::isActive())
             recordThunkDeps(v, epochStart);
     } else if (v.isApp()) {
-        uint32_t epochStart = DependencyTracker::isActive()
+        uint32_t epochStart = traceCtx && DependencyTracker::isActive()
             ? DependencyTracker::sessionTraces.size() : 0;
         callFunction(*v.app().left, *v.app().right, v, pos);
-        if (DependencyTracker::isActive())
+        if (traceCtx && DependencyTracker::isActive())
             recordThunkDeps(v, epochStart);
-    } else if (DependencyTracker::isActive()) {
+    } else if (traceCtx && DependencyTracker::isActive()) {
         replayMemoizedDeps(v);
     }
 }

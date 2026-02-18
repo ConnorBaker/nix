@@ -1,4 +1,5 @@
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-trace-context.hh"
 #include "nix/expr/trace-cache.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/dep-tracker.hh"
@@ -350,6 +351,9 @@ EvalState::EvalState(
     );
 
     createBaseEnv(settings);
+
+    if (settings.useTraceCache)
+        traceCtx = std::make_unique<EvalTraceContext>();
 
     /* Register function call tracer. */
     if (settings.traceFunctionCalls)
@@ -1123,19 +1127,19 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
     // Record Content oracle dep for eval trace (Adapton DDG edge)
     if (DependencyTracker::isActive()) {
         std::optional<Blake3Hash> hash;
-        if (auto it = fileContentHashes.find(*resolvedPath); it != fileContentHashes.end()) {
+        if (auto it = traceCtx->fileContentHashes.find(*resolvedPath); it != traceCtx->fileContentHashes.end()) {
             hash = it->second;
         } else {
             try {
                 auto content = resolvedPath->readFile();
                 hash = depHash(content);
-                fileContentHashes.emplace(*resolvedPath, *hash);
+                traceCtx->fileContentHashes.emplace(*resolvedPath, *hash);
             } catch (Error &) {
                 // If we can't read the file, skip oracle dep recording
             }
         }
         if (hash)
-            recordDep(resolvedPath->path, DepHashValue(*hash), DepType::Content, mountToInput);
+            recordDep(resolvedPath->path, DepHashValue(*hash), DepType::Content, traceCtx->mountToInput);
     }
 
     if (auto v2 = getConcurrent(*fileTraceCache, *resolvedPath)) {
@@ -1172,38 +1176,32 @@ void EvalState::resetFileCache()
     fileTraceCache->clear();
     inputCache->clear();
     positions.clear();
-    evalCaches.clear();
-    fileContentHashes.clear();
-    mountToInput.clear();
-    epochMap.clear();
+    if (traceCtx)
+        traceCtx->reset();
     DependencyTracker::clearSessionTraces();
 }
 
 void EvalState::replayMemoizedDeps(const Value & v)
 {
-    auto it = epochMap.find(&v);
-    if (it == epochMap.end()) return;
-
-    auto & range = it->second;
-
-    // Add the epoch range to each active tracker that doesn't already
-    // include these deps in its own session range. Deduped by Value pointer.
-    for (auto * tracker = DependencyTracker::activeTracker; tracker; tracker = tracker->previous) {
-        // If the range is within this tracker's session range, skip —
-        // the deps are already captured by [startIndex, sessionTraces.size()).
-        if (range.deps == tracker->mySessionTraces
-            && range.start >= tracker->startIndex)
-            continue;
-        if (tracker->replayedValues.insert(&v).second)
-            tracker->replayedRanges.push_back(range);
-    }
+    traceCtx->replayMemoizedDeps(v);
 }
 
 void EvalState::recordThunkDeps(Value & v, uint32_t epochStart)
 {
-    uint32_t epochEnd = DependencyTracker::sessionTraces.size();
-    if (epochStart < epochEnd)
-        epochMap.emplace(&v, DepRange{&DependencyTracker::sessionTraces, epochStart, epochEnd});
+    traceCtx->recordThunkDeps(v, epochStart);
+}
+
+const std::map<CanonPath, std::pair<std::string, std::string>> &
+EvalState::getMountToInput() const
+{
+    static const std::map<CanonPath, std::pair<std::string, std::string>> empty;
+    return traceCtx ? traceCtx->mountToInput : empty;
+}
+
+void EvalState::flushTraceContext()
+{
+    if (traceCtx)
+        traceCtx->flush();
 }
 
 void EvalState::eval(Expr * e, Value & v)
@@ -2578,7 +2576,7 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
         && !hasPrefix(path.path.abs(), "/nix/store/"))
     {
         recordDep(path.path, DepHashValue(store->printStorePath(dstPath)),
-            DepType::CopiedPath, mountToInput);
+            DepType::CopiedPath, getMountToInput());
     }
 
     context.insert(NixStringContextElem::Opaque{.path = dstPath});
@@ -3194,7 +3192,7 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_p
     // Compute and cache content hash for oracle dep recording (Adapton DDG)
     if (DependencyTracker::isActive()) {
         auto hash = depHash(buffer);
-        fileContentHashes.emplace(resolvedPath, std::move(hash));
+        traceCtx->fileContentHashes.emplace(resolvedPath, std::move(hash));
     }
 
     // readFile hopefully have left some extra space for terminators

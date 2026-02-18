@@ -8,6 +8,7 @@
 #include "nix/store/derivations.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-trace-context.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/store/store-api.hh"
 #include "nix/main/shared.hh"
@@ -125,9 +126,10 @@ ref<eval_trace::TraceCache> InstallableAttrPath::getOrCreateTraceCache(EvalState
     };
 
     if (stableIdentity) {
-        auto search = state.evalCaches.find(*stableIdentity);
-        if (search == state.evalCaches.end()) {
-            search = state.evalCaches
+        // stableIdentity implies useTraceCache=true -> traceCtx is non-null
+        auto search = state.traceCtx->evalCaches.find(*stableIdentity);
+        if (search == state.traceCtx->evalCaches.end()) {
+            search = state.traceCtx->evalCaches
                 .emplace(*stableIdentity,
                     make_ref<eval_trace::TraceCache>(
                         stableIdentity, state, rootLoader))

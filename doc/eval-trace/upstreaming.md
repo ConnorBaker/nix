@@ -76,7 +76,9 @@ independently.
 - `src/libexpr/primops.cc` -- `recordDep` calls for all builtins (+184 lines)
 - `src/libexpr/primops/fetchTree.cc` -- UnhashedFetch dep recording (+12)
 - `src/libexpr/primops/fetchMercurial.cc` -- UnhashedFetch dep recording (+7)
-- `src/libexpr/include/nix/expr/eval.hh` -- `mountToInput` map (+41)
+- `src/libexpr/include/nix/expr/eval.hh` -- `EvalTraceContext` (via `traceCtx`) (+41)
+- `src/libexpr/include/nix/expr/eval-trace-context.hh` -- trace context struct
+- `src/libexpr/eval-trace-context.cc` -- trace context implementation
 - Meson build files for new sources
 
 **~1,700 lines.**
