@@ -450,8 +450,8 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
         "WHERE context_hash = ? AND attr_path_id = ? AND trace_id = ?");
 
     st->scanHistoryForAttr.create(st->db,
-        "SELECT ds.struct_hash, h.trace_id, h.result_id "
-        "FROM TraceHistory h JOIN Traces ds ON h.trace_id = ds.id "
+        "SELECT t.struct_hash, h.trace_id, h.result_id "
+        "FROM TraceHistory h JOIN Traces t ON h.trace_id = t.id "
         "WHERE h.context_hash = ? AND h.attr_path_id = ?");
 
     // StatHashCache
@@ -771,8 +771,7 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
     nrLoadTraces++;
 
     // Single DB read via JOIN — no chain walk
-    const void * blobPtr = nullptr;
-    size_t blobLen = 0;
+    std::vector<uint8_t> blobCopy;
     {
         auto st(_state->lock());
         auto use(st->getTraceInfo.use()(traceId));
@@ -785,14 +784,11 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
             nrLoadTraceTimeUs += elapsedUs(loadStart);
             return {};
         }
-        blobLen = size;
-        auto * copy = new uint8_t[size];
-        memcpy(copy, data, size);
-        blobPtr = copy;
+        auto * p = static_cast<const uint8_t *>(data);
+        blobCopy.assign(p, p + size);
     }
 
-    auto interned = deserializeInternedDeps(blobPtr, blobLen);
-    delete[] static_cast<const uint8_t *>(blobPtr);
+    auto interned = deserializeInternedDeps(blobCopy.data(), blobCopy.size());
     auto result = resolveDeps(interned);
 
     traceCache[traceId] = result;
