@@ -529,6 +529,19 @@ TraceStore::~TraceStore()
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+// Reverse of buildAttrPath: convert null-byte-separated storage encoding
+// to dot-separated display format for debug messages.
+static std::string displayAttrPath(std::string_view attrPath)
+{
+    if (attrPath.empty())
+        return "«root»";
+    std::string result;
+    result.reserve(attrPath.size());
+    for (char c : attrPath)
+        result.push_back(c == '\0' ? '.' : c);
+    return result;
+}
+
 std::string TraceStore::buildAttrPath(const std::vector<std::string> & components)
 {
     return concatStringsSep(std::string_view("\0", 1), components);
@@ -1042,7 +1055,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::verify(
     }
 
     // 3. Verification failed → constructive recovery (uses currentDepHashes)
-    debug("verify: trace validation failed for '%s', attempting constructive recovery", std::string(attrPath));
+    debug("verify: trace validation failed for '%s', attempting constructive recovery", displayAttrPath(attrPath));
     auto result = recovery(row->traceId, attrPath, inputAccessors, state, parentTraceIdHint);
     nrVerifyTimeUs += elapsedUs(verifyStart);
     return result;
@@ -1067,7 +1080,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     // Check for volatile deps → immediate abort
     for (auto & dep : oldDeps) {
         if (dep.type == DepType::CurrentTime || dep.type == DepType::Exec) {
-            debug("recovery: aborting for '%s' -- contains volatile dep", attrPath);
+            debug("recovery: aborting for '%s' -- contains volatile dep", displayAttrPath(attrPath));
             nrRecoveryFailures++;
             nrRecoveryTimeUs += elapsedUs(recoveryStart);
             return std::nullopt;
@@ -1097,7 +1110,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     }
 
     debug("recovery: recomputed %d/%d dep hashes for '%s'",
-          currentDeps.size(), oldDeps.size(), attrPath);
+          currentDeps.size(), oldDeps.size(), displayAttrPath(attrPath));
 
     // Resolve attr_path_id for DB lookups
     auto pathKey = std::string(attrPath);
@@ -1117,7 +1130,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         }
     }
     if (!attrPathId) {
-        debug("recovery: attr path not interned for '%s'", attrPath);
+        debug("recovery: attr path not interned for '%s'", displayAttrPath(attrPath));
         nrRecoveryFailures++;
         nrRecoveryTimeUs += elapsedUs(recoveryStart);
         return std::nullopt;
@@ -1197,7 +1210,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
         if (newTraceId) {
             if (auto r = acceptRecoveredTrace(*newTraceId)) {
-                debug("recovery: direct hash recovery succeeded for '%s'", attrPath);
+                debug("recovery: direct hash recovery succeeded for '%s'", displayAttrPath(attrPath));
                 nrRecoveryDirectHashHits++;
                 nrRecoveryDirectHashTimeUs += elapsedUs(directHashStart);
                 nrRecoveryTimeUs += elapsedUs(recoveryStart);
@@ -1241,7 +1254,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     }
 
     debug("recovery: structural variant scan for '%s' -- scanning %d history entries",
-          attrPath, historyEntries.size());
+          displayAttrPath(attrPath), historyEntries.size());
 
     // Group by struct_hash, pick one representative per group
     std::unordered_map<Hash, TraceId> structGroups; // struct_hash -> representative trace_id
@@ -1311,7 +1324,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
         if (candidateTraceId) {
             if (auto r = acceptRecoveredTrace(*candidateTraceId)) {
-                debug("recovery: structural variant recovery succeeded for '%s'", attrPath);
+                debug("recovery: structural variant recovery succeeded for '%s'", displayAttrPath(attrPath));
                 nrRecoveryStructVariantHits++;
                 nrRecoveryStructVariantTimeUs += elapsedUs(structVariantStart);
                 nrRecoveryTimeUs += elapsedUs(recoveryStart);
@@ -1321,7 +1334,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     }
     nrRecoveryStructVariantTimeUs += elapsedUs(structVariantStart);
 
-    debug("recovery: all strategies failed for '%s'", attrPath);
+    debug("recovery: all strategies failed for '%s'", displayAttrPath(attrPath));
     nrRecoveryFailures++;
     nrRecoveryTimeUs += elapsedUs(recoveryStart);
     return std::nullopt;
