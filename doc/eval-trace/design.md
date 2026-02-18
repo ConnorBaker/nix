@@ -180,18 +180,16 @@ TraceStore                                      [trace-store.cc]
   +-- verifyTrace():  validate all deps in a trace against current state
   |
   +=============================================+
-  | DependencyTracker    [dep-tracker.cc]       |
+  | DependencyTracker  [dependency-tracker.cc]  |
   |   RAII thread_local dep recording.          |
   |   Records dynamic dependency graph          |
   |   (Adapton DDG) during evaluation into      |
   |   session-wide vector.                      |
-  +=============================================+
-  |
-  +=============================================+
-  | StatHashCache      [stat-hash-cache.cc]     |
-  |   Persistent file → BLAKE3 hash cache.      |
+  |   Includes internal StatHashCache:          |
   |   L1: concurrent_flat_map (session, 64K cap)|
-  |   L2: SQLite (persistent, stat-validated)   |
+  |   L2: bulk-loaded from TraceStore's SQLite  |
+  |   Dirty entries flushed back on TraceStore  |
+  |   destruction (single DB, no separate file) |
   +=============================================+
 ```
 
@@ -329,7 +327,7 @@ content-addressed store objects) provides several advantages:
 4. **Expendability.** The database is a cache. If deleted or corrupted, fresh
    evaluation re-records everything. Correctness is never at risk.
 
-### 5.2 Schema (6 Tables)
+### 5.2 Schema (7 Tables)
 
 ```sql
 CREATE TABLE IF NOT EXISTS Strings (
@@ -373,6 +371,18 @@ CREATE TABLE IF NOT EXISTS TraceHistory (
     result_id     INTEGER NOT NULL,
     PRIMARY KEY (context_hash, attr_path_id, trace_id)
 ) WITHOUT ROWID, STRICT;
+
+CREATE TABLE IF NOT EXISTS StatHashCache (
+    path       TEXT NOT NULL,
+    dep_type   INTEGER NOT NULL,
+    dev        INTEGER NOT NULL,
+    ino        INTEGER NOT NULL,
+    mtime_sec  INTEGER NOT NULL,
+    mtime_nsec INTEGER NOT NULL,
+    size       INTEGER NOT NULL,
+    hash       BLOB NOT NULL,
+    PRIMARY KEY (path, dep_type)
+) STRICT;
 ```
 
 **Strings** and **AttrPaths** are interning tables that deduplicate string values
@@ -398,6 +408,14 @@ result_id)` tuples — every trace that has ever been recorded for an attribute.
 This is the constructive trace store that enables recovery: when the current
 trace is invalid, recovery searches TraceHistory for a historical trace whose
 deps match the current state.
+
+**StatHashCache** stores persistent file stat metadata to hash mappings, keyed
+by `(path, dep_type)`. This accelerates BSàlC VT dep verification by caching
+BLAKE3 hashes of file content, NAR serializations, and directory listings. At
+TraceStore construction, all entries are bulk-loaded into the in-memory
+StatHashCache singleton. During evaluation, new/updated entries accumulate as
+dirty entries. At TraceStore destruction, dirty entries are flushed back to the
+database within the same transaction as trace data.
 
 ### 5.3 One Row Per Attribute, Keys-Only Attrsets
 
@@ -728,18 +746,47 @@ modifications to the evaluated file or expression.
 
 ## Appendix A: File Layout
 
+### `nix::` namespace — evaluator-facing types
+
 | File | Description |
 |------|-------------|
-| `src/libexpr/include/nix/expr/trace-cache.hh` | TraceCache public API, ResultKind/CachedResult types |
+| `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange` |
+| `src/libexpr/eval-trace-deps.cc` | `depTypeName()` implementation |
+| `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker`, `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API |
+| `src/libexpr/dependency-tracker.cc` | DependencyTracker implementation, dep hash functions, `resolveToInput`, `recordDep`, internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore) |
+| `src/libexpr/include/nix/expr/eval-trace-context.hh` | `EvalTraceContext` struct (EvalState integration) |
+| `src/libexpr/eval-trace-context.cc` | `EvalTraceContext` methods |
+
+### `nix::eval_trace` namespace — trace system internals
+
+| File | Description |
+|------|-------------|
+| `src/libexpr/include/nix/expr/trace-result.hh` | Result vocabulary types: `ResultKind`, `CachedResult`, all result structs (header-only) |
+| `src/libexpr/include/nix/expr/trace-cache.hh` | TraceCache public API, performance counters |
 | `src/libexpr/trace-cache.cc` | TracedExpr (verify/record/recover logic), ExprOrigChild, SharedParentResult |
 | `src/libexpr/include/nix/expr/trace-store.hh` | TraceStore class declaration |
-| `src/libexpr/trace-store.cc` | TraceStore implementation: schema, verify, record, recover, verifyTrace |
+| `src/libexpr/trace-store.cc` | TraceStore implementation: schema (including StatHashCache table), verify, record, recover, verifyTrace, stat-hash bulk-load/flush |
 | `src/libexpr/include/nix/expr/trace-hash.hh` | Trace hash computation functions (sortAndDedupDeps, computeTraceHash, etc.) |
 | `src/libexpr/trace-hash.cc` | Trace hash computation implementations |
-| `src/libexpr/include/nix/expr/dep-tracker.hh` | Dep types, DependencyTracker, dep hash helpers |
-| `src/libexpr/dep-tracker.cc` | DependencyTracker implementation, stat-cached dep hash variants |
-| `src/libexpr/include/nix/expr/stat-hash-cache.hh` | StatHashCache class declaration |
-| `src/libexpr/stat-hash-cache.cc` | StatHashCache implementation (L1 concurrent_flat_map + L2 SQLite) |
+
+### Header dependency graph
+
+```
+eval-trace-deps.hh          trace-result.hh
+    ↑                            ↑         ↑
+    |                            |         |
+dependency-                   trace-      trace-
+tracker.hh                   store.hh    cache.hh
+    ↑                            ↑
+    |                            |
+eval-trace-                  trace-hash.hh
+context.hh
+```
+
+### Tests
+
+| File | Description |
+|------|-------------|
 | `tests/functional/flakes/eval-trace-*.sh` | Functional tests (flake-based) |
 | `tests/functional/eval-trace-impure-*.sh` | Functional tests (impure / --file / --expr) |
 

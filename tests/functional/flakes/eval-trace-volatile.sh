@@ -11,7 +11,9 @@ source ./common.sh
 requireGit
 
 clearStoreIndex() {
-    rm -f "$TEST_HOME/.cache/nix/eval-trace-v1.sqlite"
+    rm -f "$TEST_HOME/.cache/nix/eval-trace-v1.sqlite" \
+          "$TEST_HOME/.cache/nix/eval-trace-v1.sqlite-wal" \
+          "$TEST_HOME/.cache/nix/eval-trace-v1.sqlite-shm"
 }
 
 ###############################################################################

@@ -1,5 +1,5 @@
 #include "nix/expr/eval-trace-context.hh"
-#include "nix/expr/dep-tracker.hh"
+#include "nix/expr/dependency-tracker.hh"
 #include "nix/expr/value.hh"
 
 namespace nix {

@@ -1,7 +1,8 @@
 #pragma once
 
 #include "nix/expr/trace-cache.hh"
-#include "nix/expr/dep-tracker.hh"
+#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace-deps.hh"
 
 #include <cstdlib>
 #include <filesystem>

@@ -5,7 +5,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
-#include "nix/expr/dep-tracker.hh"
+#include "nix/expr/dependency-tracker.hh"
 
 namespace nix {
 

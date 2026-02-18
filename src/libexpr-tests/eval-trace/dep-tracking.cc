@@ -1,6 +1,6 @@
 #include "helpers.hh"
 #include "nix/expr/trace-store.hh"
-#include "nix/expr/stat-hash-cache.hh"
+#include "nix/expr/dependency-tracker.hh"
 
 #include <gtest/gtest.h>
 #include <filesystem>
@@ -84,7 +84,7 @@ protected:
     void invalidateFileCache(const std::filesystem::path & path)
     {
         getFSSourceAccessor()->invalidateCache(CanonPath(path.string()));
-        StatHashCache::instance().clearMemoryCache();
+        clearStatHashMemoryCache();
     }
 };
 

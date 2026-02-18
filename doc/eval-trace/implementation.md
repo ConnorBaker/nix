@@ -112,11 +112,19 @@ This detects `chmod +x` changes that `Content` would miss.
 
 **Decision: Two-level persistent cache for file hashes (BSàlC VT verification
 accelerator).**
-L1 is a `boost::concurrent_flat_map` (session-scoped, 64K entry cap). L2 is a
-SQLite database at `~/.cache/nix/stat-hash-cache-v2.sqlite`. Both are keyed on
-file stat metadata `(path, dev, ino, mtime_sec, mtime_nsec, size, dep_type)`.
-This cache accelerates the BSàlC VT verification step: validating dep hashes
-reduces to a series of `lstat()` calls for unchanged files.
+L1 is a `boost::concurrent_flat_map` (session-scoped, 64K entry cap). L2 is
+bulk-loaded from the `StatHashCache` table in TraceStore's
+`eval-trace-v1.sqlite` database at session start, and dirty entries are flushed
+back at session end. Both levels are keyed on file stat metadata `(path, dev,
+ino, mtime_sec, mtime_nsec, size, dep_type)`. This cache accelerates the BSàlC
+VT verification step: validating dep hashes reduces to a series of `lstat()`
+calls for unchanged files.
+
+*(Historical note: Prior to Session 56, L2 was a separate SQLite database at
+`~/.cache/nix/stat-hash-cache-v2.sqlite`. This was merged into the single
+`eval-trace-v1.sqlite` database to simplify the storage model. The
+StatHashCache singleton no longer owns any SQLite connection; TraceStore handles
+all persistence through its single connection/transaction.)*
 
 **Removed: epochBloom filter.** A 64-bit bloom filter guarded `epochMap.find()`
 for trace replay memoization (Adapton change propagation). Measurement across
@@ -284,8 +292,9 @@ longer store objects -- they are rows in SQLite tables. No `addTextToStore()`,
 no store path references, no GC coupling. The trace system is now a fully
 self-contained BSàlC trace store.
 
-**2. Six-table schema.**
-`Strings`, `AttrPaths`, `Results`, `Traces`, `CurrentTraces`, `TraceHistory`.
+**2. Seven-table schema.**
+`Strings`, `AttrPaths`, `Results`, `Traces`, `CurrentTraces`, `TraceHistory`,
+`StatHashCache`.
 Semi-normalized trace storage: dep entries use delta-encoded BLOBs within the
 `Traces` table, and result values are deduplicated via the `Results` table.
 `CurrentTraces` maps `(context_hash, attr_path_id)` to the current trace and
@@ -373,27 +382,40 @@ outside the lock scope.
 
 ### Source Files
 
-*(Note: This table reflects the state after Phase 12, Sessions 49--50.
-Files marked "replaced" were part of the CAS blob trace design and no longer
-exist. Their replacements are listed.)*
+*(Note: This table reflects the state after Phase 13 file reorganization.
+The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
+
+#### `nix::` namespace — evaluator-facing types
 
 | File | Lines | Description |
 |------|------:|-------------|
-| `src/libexpr/include/nix/expr/trace-cache.hh` | 126 | Public API: `TraceCache`, `ResultKind`, `CachedResult`, counters |
-| `src/libexpr/include/nix/expr/trace-store.hh` | 176 | `TraceStore`: pure SQLite backend (BSàlC trace store) |
-| `src/libexpr/include/nix/expr/trace-hash.hh` | 79 | HashSink-based trace hashing (CBOR serialization removed in Phase 12) |
-| `src/libexpr/include/nix/expr/dep-tracker.hh` | 390 | Dep types, `Dep`, `Blake3Hash`, `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking` |
-| `src/libexpr/include/nix/expr/stat-hash-cache.hh` | 85 | `StatHashCache`: L1/L2 persistent file hash cache (BSàlC verifying trace accelerator) |
-| `src/libexpr/trace-cache.cc` | 726 | `TracedExpr` (Adapton articulation point), `ExprOrigChild`, `SharedParentResult`, verify/record/recover loop |
-| `src/libexpr/trace-store.cc` | 1426 | SQLite backend: schema, verify, record, constructive recovery, verifyTrace (BSàlC VT/CT operations) |
-| `src/libexpr/trace-hash.cc` | 89 | HashSink trace hashing; nlohmann::json and CBOR removed in Phase 12 |
-| `src/libexpr/dep-tracker.cc` | 273 | Dep recording (Adapton DDG construction), hashing, input resolution |
-| `src/libexpr/stat-hash-cache.cc` | 339 | L1 concurrent map, L2 SQLite, stat validation |
+| `src/libexpr/include/nix/expr/eval-trace-deps.hh` | ~250 | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange`, inline helpers |
+| `src/libexpr/eval-trace-deps.cc` | ~25 | `depTypeName()` implementation |
+| `src/libexpr/include/nix/expr/dependency-tracker.hh` | ~190 | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API |
+| `src/libexpr/dependency-tracker.cc` | ~450 | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) |
+| `src/libexpr/include/nix/expr/eval-trace-context.hh` | ~95 | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
+| `src/libexpr/eval-trace-context.cc` | ~50 | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
+
+#### `nix::eval_trace` namespace — trace system internals
+
+| File | Lines | Description |
+|------|------:|-------------|
+| `src/libexpr/include/nix/expr/trace-result.hh` | ~65 | Result vocabulary types: `ResultKind`, `CachedResult`, all result structs (header-only) |
+| `src/libexpr/include/nix/expr/trace-cache.hh` | ~65 | Public API: `TraceCache`, performance counters |
+| `src/libexpr/trace-cache.cc` | ~726 | `TracedExpr` (Adapton articulation point), `ExprOrigChild`, `SharedParentResult`, verify/record/recover loop |
+| `src/libexpr/include/nix/expr/trace-store.hh` | ~176 | `TraceStore`: pure SQLite backend (BSàlC trace store) |
+| `src/libexpr/trace-store.cc` | ~1426 | SQLite backend: schema, verify, record, constructive recovery, verifyTrace (BSàlC VT/CT operations) |
+| `src/libexpr/include/nix/expr/trace-hash.hh` | ~79 | HashSink-based trace hashing (CBOR serialization removed in Phase 12) |
+| `src/libexpr/trace-hash.cc` | ~89 | HashSink trace hashing implementations |
 
 **Removed in Phase 12:** `trace-cache-store.hh/cc` (CAS blob backend),
 `eval-index-db.hh/cc` (SQLite index for trace store paths).
 
-**Total new code:** ~3,700 lines across 10 files.
+**Removed in Phase 13 (file reorganization):** `dep-tracker.hh/cc` (split into
+`eval-trace-deps.hh/cc` + `dependency-tracker.hh/cc`), `stat-hash-cache.hh/cc`
+(folded into `dependency-tracker.cc` as an anonymous-namespace implementation detail).
+
+**Total new code:** ~3,700 lines across 13 files.
 
 ### Modified Files
 
@@ -470,7 +492,7 @@ Key correctness guards:
 - `dynamic_cast<TracedExpr*>` guard -- prevents double-wrapping due to
   `derivation.nix` Value* aliasing (`default.out` shares Value* with `default`).
 
-### 3.2 DependencyTracker Session Model -- Adapton DDG Builder (dep-tracker.hh/cc)
+### 3.2 DependencyTracker Session Model -- Adapton DDG Builder (dependency-tracker.hh/cc)
 
 The `DependencyTracker` constructs the dynamic dependency graph (DDG) during
 evaluation, analogous to Adapton's DDG construction during `force`. Dependencies
@@ -509,35 +531,60 @@ explosion -- without suspension, evaluating a parent like `buildPackages` (= all
 of nixpkgs) would record 10,000+ deps into each child's DDG, violating the
 per-attribute trace granularity goal.
 
-### 3.3 StatHashCache Architecture -- BSàlC VT Verification Accelerator (stat-hash-cache.hh/cc)
+### 3.3 StatHashCache Architecture -- BSàlC VT Verification Accelerator (internal to dependency-tracker.cc)
 
 The StatHashCache accelerates the BSàlC VT verification step by caching file
 hashes keyed on stat metadata. This reduces dep verification to a series of
-`lstat()` system calls for unchanged files.
+`lstat()` system calls for unchanged files. It is an implementation detail
+inside `dependency-tracker.cc` (anonymous namespace) — no public header exists.
+Consumers access it through the `depHashFile`, `depHashPathCached`, and
+`depHashDirListingCached` functions, which handle stat-cache lookup/store
+internally.
+
+The StatHashCache singleton has no SQLite connection of its own. TraceStore
+owns the `StatHashCache` table in its single `eval-trace-v1.sqlite` database
+and handles all persistence:
+
+- **Construction:** TraceStore bulk-loads all `StatHashCache` rows into the
+  in-memory L2 map via `loadStatHashEntries()`.
+- **Evaluation:** New/updated hashes are stored in L1 and tracked as dirty
+  entries (no SQLite writes during evaluation).
+- **Destruction:** TraceStore calls `forEachDirtyStatHash()` to upsert all
+  dirty entries back to the database within the same transaction as trace data.
 
 ```
-StatHashCache (singleton):
+StatHashCache (anonymous namespace singleton in dependency-tracker.cc):
   L1: boost::concurrent_flat_map<StatHashKey, Blake3Hash>
       Key: (dev, ino, mtime_sec, mtime_nsec, size, depType)
-      Session-scoped, 64K entry cap, cleared on invalidateFileCache()
+      Session-scoped, 64K entry cap
 
-  L2: SQLite (persistent, ~/.cache/nix/stat-hash-cache-v2.sqlite)
-      Schema: (path TEXT, dep_type INT) -> hash BLOB(32)
-      Plus stat metadata columns for validation
-      Bulk-loaded on first L1 miss, L1 promoted on L2 hit
+  L2: unordered_map<(path, depType), L2Entry>
+      Bulk-loaded from TraceStore's SQLite at session start
+      L1 promoted on L2 hit
 
-  lookupHash(path, depType, stat):
+  dirtyEntries: vector<StatHashEntry>
+      Accumulated during evaluation, flushed by TraceStore at session end
+
+  lookupHash(path, depType):
+    lstat(path) -> stat (returned even on miss)
     if L1.find(key) -> return {hash, stat}
-    if L2.query(path, depType) and stat matches -> promote to L1, return
-    return nullopt
+    if L2.find(path, depType) and stat matches -> promote to L1, return
+    return {nullopt, stat}
 
   storeHash(path, depType, hash, stat):
     L1.insert(key, hash)
-    L2.upsert(path, depType, hash, stat)  // deferred in SQLiteTxn
+    dirtyEntries.push_back(entry)  // for TraceStore to flush later
+    L2.update(path, depType, entry)  // keep L2 in sync
 ```
 
-All L2 writes are wrapped in a single `SQLiteTxn` committed at destructor time.
-This reduces SQLite write overhead from per-dep to per-session.
+The bridge API between TraceStore and StatHashCache consists of two free
+functions declared in `dependency-tracker.hh`:
+
+- `loadStatHashEntries(vector<StatHashEntry>)`: populates L2 from DB rows
+- `forEachDirtyStatHash(callback)`: iterates dirty entries for DB flush
+
+This design ensures a single SQLite file (`eval-trace-v1.sqlite`) with a
+single connection and transaction for all trace and stat-hash data.
 
 ### 3.4 Trace Hashing (trace-hash.hh/cc)
 

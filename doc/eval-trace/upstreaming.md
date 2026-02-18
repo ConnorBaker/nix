@@ -58,18 +58,18 @@ This commit introduces the dependency tracking layer (analogous to Adapton's DDG
 construction) without any eval trace changes. It can be reviewed and tested
 independently.
 
-**New files:**
-- `src/libexpr/include/nix/expr/dep-tracker.hh` (390 lines)
+**New files** *(reorganized in Phase 13 — see current layout below)*:
+- `src/libexpr/include/nix/expr/eval-trace-deps.hh` (~250 lines)
   - `DepType` enum (11 types), `Dep` struct, `Blake3Hash` struct
   - `DepHashValue` variant, `DepKey` dedup key
+- `src/libexpr/eval-trace-deps.cc` (~25 lines)
+  - `depTypeName()` implementation
+- `src/libexpr/include/nix/expr/dependency-tracker.hh` (~170 lines)
   - `DependencyTracker` RAII tracker (Adapton DDG builder), `SuspendDepTracking`
   - `depHash*` functions, `recordDep`, `resolveToInput`
-- `src/libexpr/dep-tracker.cc` (219 lines)
+- `src/libexpr/dependency-tracker.cc` (~450 lines)
   - Dep recording, BLAKE3 hashing, input resolution
-- `src/libexpr/include/nix/expr/stat-hash-cache.hh` (85 lines)
-  - `StatHashCache` singleton API
-- `src/libexpr/stat-hash-cache.cc` (339 lines)
-  - L1 concurrent_flat_map, L2 SQLite, stat-based validation
+  - StatHashCache (anonymous namespace): L1 concurrent_flat_map, L2 bulk-loaded from TraceStore, dirty tracking for flush
 
 **Modified files:**
 - `src/libexpr/eval.cc` -- `evalFile` Content dep recording (+88 lines)
@@ -234,11 +234,12 @@ Checklist of items to consider before upstreaming:
   are all in one file. Acceptable -- layout keeps everything close to usage, which
   aids understanding.
 
-- [x] **dep-tracker.hh (390 lines)**: Contains `DepType` enum, `Blake3Hash`
-  struct, `DepHashValue` variant, `Dep` struct (BSàlC trace entry), `DepKey`,
-  `DependencyTracker` (Adapton DDG builder), and `SuspendDepTracking`. These
-  are tightly coupled -- splitting would create circular includes. Acceptable
-  as-is.
+- [x] **eval-trace-deps.hh + dependency-tracker.hh** (formerly dep-tracker.hh):
+  Split into vocabulary types (`DepType`, `Blake3Hash`, `DepHashValue`, `Dep`,
+  `DepKey` in eval-trace-deps.hh) and RAII machinery (`DependencyTracker`,
+  `SuspendDepTracking`, dep hash declarations in dependency-tracker.hh). The
+  split eliminates the grab-bag concern. StatHashCache folded into
+  dependency-tracker.cc as an anonymous namespace implementation detail.
 
 - [x] **trace-cache-store.cc (603 lines)**: `record()` (~100 lines, BSàlC CT
   recording), `verify()` (~60 lines, BSàlC VT check), `recover()` (~150 lines,
@@ -319,16 +320,14 @@ Files needing documentation review before upstreaming:
   format descriptions. `serializeTrace`/`deserializeTrace` document the
   zstd-compressed CBOR format. Ready for review.
 
-- [x] **dep-tracker.hh** -- `///@file` marker. `DepType` enum categorized
-  into Hash Oracle, Reference Resolution, and Volatile types with per-value docs.
-  `Dep` struct has field-level docs. `DependencyTracker` (Adapton DDG builder)
-  has usage guide comment. Most comprehensive documentation in the set. Ready
-  for review.
+- [x] **eval-trace-deps.hh** -- `DepType` enum categorized into Hash Oracle,
+  Reference Resolution, and Volatile types with per-value docs. `Dep` struct
+  has field-level docs. `Blake3Hash` struct documented. Ready for review.
 
-- [x] **stat-hash-cache.hh** -- Module-level comment describes two-level (L1/L2)
-  architecture. `LookupResult` struct fields explained. All public methods
-  documented (`lookupHash`, `storeHash` overloads, `clearMemoryCache`). Ready
-  for review.
+- [x] **dependency-tracker.hh** -- `DependencyTracker` (Adapton DDG builder)
+  has usage guide comment. `SuspendDepTracking` documented. Dep hash function
+  declarations documented. StatHashCache is internal (anonymous namespace in
+  dependency-tracker.cc) and invisible to consumers. Ready for review.
 
 ---
 
@@ -418,10 +417,11 @@ nix develop --command bash -c "meson test -C build --suite ca"
 
 ### Recommended Review Order
 
-1. **`dep-tracker.hh`** -- Start with dep types and the DependencyTracker
-   (Adapton DDG builder). This is the conceptual foundation: how dependencies
-   are dynamically discovered and recorded during evaluation (cf. Shake's dynamic
-   dependencies, Adapton's DDG construction).
+1. **`eval-trace-deps.hh`** then **`dependency-tracker.hh`** -- Start with dep
+   vocabulary types, then the DependencyTracker (Adapton DDG builder). This is
+   the conceptual foundation: how dependencies are dynamically discovered and
+   recorded during evaluation (cf. Shake's dynamic dependencies, Adapton's DDG
+   construction).
 
 2. **`trace-cache.hh`** -- Public API surface (124 lines). Understand what
    consumers see: `TraceCache`, `ResultKind`, `CachedResult`.
@@ -442,9 +442,11 @@ nix develop --command bash -c "meson test -C build --suite ca"
    Supports the constructive recovery phases by mapping trace hashes and
    structural signatures to historical trace entries.
 
-7. **`stat-hash-cache.hh/cc`** -- Performance optimization for the BSàlC VT
-   check. Two-level cache (L1 memory + L2 SQLite) reduces dep verification
-   to `lstat()` calls. Can be reviewed last.
+7. **StatHashCache** (internal to `dependency-tracker.cc`) -- Performance
+   optimization for the BSàlC VT check. Two-level cache (L1 memory + L2
+   bulk-loaded from TraceStore's SQLite) reduces dep verification to `lstat()`
+   calls. Dirty entries flushed back to TraceStore at session end. Anonymous
+   namespace — review as part of dependency-tracker.cc.
 
 8. **CLI integration** (`src/libcmd/`, `src/nix/`) -- How commands use the
    trace. Focus on `installable-attr-path.cc` and `installable-flake.cc`.

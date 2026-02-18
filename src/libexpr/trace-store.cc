@@ -1,4 +1,6 @@
 #include "nix/expr/trace-store.hh"
+#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/trace-cache.hh"
 #include "nix/expr/trace-hash.hh"
 #include "nix/expr/eval.hh"
 #include "nix/store/globals.hh"
@@ -346,6 +348,18 @@ static const char * schema = R"sql(
         PRIMARY KEY (context_hash, attr_path_id, trace_id)
     ) WITHOUT ROWID, STRICT;
 
+    CREATE TABLE IF NOT EXISTS StatHashCache (
+        path       TEXT NOT NULL,
+        dep_type   INTEGER NOT NULL,
+        dev        INTEGER NOT NULL,
+        ino        INTEGER NOT NULL,
+        mtime_sec  INTEGER NOT NULL,
+        mtime_nsec INTEGER NOT NULL,
+        size       INTEGER NOT NULL,
+        hash       BLOB NOT NULL,
+        PRIMARY KEY (path, dep_type)
+    ) STRICT;
+
 )sql";
 
 // ── Constructor / Destructor ─────────────────────────────────────────
@@ -362,7 +376,7 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
 
     auto dbPath = cacheDir / "eval-trace-v1.sqlite";
 
-    st->db = SQLite(dbPath, {.useWAL = settings.useSQLiteWAL, .noMutex = true});
+    st->db = SQLite(dbPath, {.useWAL = settings.useSQLiteWAL});
     st->db.isCache();
     st->db.exec("pragma cache_size = -4000");          // 4MB page cache
     st->db.exec("pragma mmap_size = 30000000");        // 30MB mmap
@@ -441,15 +455,71 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
         "FROM TraceHistory h JOIN Traces ds ON h.trace_id = ds.id "
         "WHERE h.context_hash = ? AND h.attr_path_id = ?");
 
+    // StatHashCache
+    st->queryAllStatHash.create(st->db,
+        "SELECT path, dep_type, dev, ino, mtime_sec, mtime_nsec, size, hash "
+        "FROM StatHashCache");
+
+    st->upsertStatHash.create(st->db,
+        "INSERT INTO StatHashCache (path, dep_type, dev, ino, mtime_sec, mtime_nsec, size, hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT (path, dep_type) DO UPDATE SET "
+        "dev = excluded.dev, ino = excluded.ino, "
+        "mtime_sec = excluded.mtime_sec, mtime_nsec = excluded.mtime_nsec, "
+        "size = excluded.size, hash = excluded.hash");
+
     st->txn = std::make_unique<SQLiteTxn>(st->db);
+
+    // Bulk-load StatHashCache entries into in-memory singleton
+    {
+        std::vector<StatHashEntry> entries;
+        auto use(st->queryAllStatHash.use());
+        while (use.next()) {
+            auto [hashBlob, hashLen] = use.getBlob(7);
+            if (hashLen != 32) continue;
+            entries.push_back(StatHashEntry{
+                .path = use.getStr(0),
+                .depType = static_cast<DepType>(use.getInt(1)),
+                .dev = use.getInt(2),
+                .ino = use.getInt(3),
+                .mtime_sec = use.getInt(4),
+                .mtime_nsec = use.getInt(5),
+                .size = use.getInt(6),
+                .hash = Blake3Hash::fromBlob(hashBlob, hashLen),
+            });
+        }
+        loadStatHashEntries(std::move(entries));
+    }
 
     _state = std::move(state);
 }
 
 TraceStore::~TraceStore()
 {
+    // Flush dirty stat-hash entries back to SQLite
+    try {
+        auto st(_state->lock());
+        forEachDirtyStatHash([&](const StatHashEntry & e) {
+            st->upsertStatHash.use()
+                (e.path)
+                (static_cast<int64_t>(e.depType))
+                (e.dev)
+                (e.ino)
+                (e.mtime_sec)
+                (e.mtime_nsec)
+                (e.size)
+                (e.hash.data(), e.hash.size())
+                .exec();
+        });
+    } catch (...) {
+        ignoreExceptionExceptInterrupt();
+    }
     try {
         optimizeTraces();
+    } catch (...) {
+        ignoreExceptionExceptInterrupt();
+    }
+    try {
         auto st(_state->lock());
         if (st->txn)
             st->txn->commit();

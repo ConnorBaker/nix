@@ -1,7 +1,7 @@
 #pragma once
 
-#include "nix/expr/trace-cache.hh"
-#include "nix/expr/dep-tracker.hh"
+#include "nix/expr/trace-result.hh"
+#include "nix/expr/eval-trace-deps.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/util/sync.hh"
 
@@ -53,6 +53,10 @@ struct TraceStore {
         SQLiteStmt insertHistory;
         SQLiteStmt lookupHistoryByTrace;
         SQLiteStmt scanHistoryForAttr;
+
+        // StatHashCache (stat-hash cache persistence)
+        SQLiteStmt queryAllStatHash;
+        SQLiteStmt upsertStatHash;
 
         std::unique_ptr<SQLiteTxn> txn;
     };

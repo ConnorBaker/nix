@@ -2,7 +2,8 @@
 
 #include <gtest/gtest.h>
 
-#include "nix/expr/dep-tracker.hh"
+#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace-deps.hh"
 #include "nix/util/source-path.hh"
 
 namespace nix::eval_trace {

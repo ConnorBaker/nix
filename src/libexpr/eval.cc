@@ -2,7 +2,7 @@
 #include "nix/expr/eval-trace-context.hh"
 #include "nix/expr/trace-cache.hh"
 #include "nix/expr/eval-settings.hh"
-#include "nix/expr/dep-tracker.hh"
+#include "nix/expr/dependency-tracker.hh"
 #include "nix/expr/primops.hh"
 #include "nix/expr/print-options.hh"
 #include "nix/expr/symbol-table.hh"

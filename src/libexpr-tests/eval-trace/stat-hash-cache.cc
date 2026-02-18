@@ -2,8 +2,9 @@
 
 #include <gtest/gtest.h>
 
-#include "nix/expr/stat-hash-cache.hh"
-#include "nix/expr/dep-tracker.hh"
+#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace-deps.hh"
+#include "nix/util/source-path.hh"
 
 #include <chrono>
 #include <filesystem>
@@ -14,173 +15,141 @@ namespace nix::eval_trace {
 
 using namespace nix::eval_trace::test;
 
-class StatHashCacheTest : public ::testing::Test
+class StatCachedHashTest : public ::testing::Test
 {
 protected:
-    StatHashCache & cache = StatHashCache::instance();
-
-    void SetUp() override
-    {
-        cache.clearMemoryCache();
-    }
+    ScopedCacheDir cacheDir;
 };
 
-// ── L1 (in-memory) oracle hash cache operations ─────────────────────
+// ── depHashFile: stat-cached Content oracle hash ─────────────────────
 
-TEST_F(StatHashCacheTest, StoreAndLookup_L1Hit)
+TEST_F(StatCachedHashTest, DepHashFile_Deterministic)
 {
     TempTestFile f("hello world");
-    auto hash = depHash("hello world");
+    auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    // Store oracle hash with explicit stat metadata
-    cache.storeHash(f.path, DepType::Content, hash);
-
-    // L1 lookup should return the cached oracle hash
-    auto result = cache.lookupHash(f.path, DepType::Content);
-    ASSERT_TRUE(result.hash.has_value());
-    EXPECT_EQ(*result.hash, hash);
-    ASSERT_TRUE(result.stat.has_value());
+    auto h1 = depHashFile(path);
+    auto h2 = depHashFile(path);
+    EXPECT_EQ(h1, h2);
 }
 
-TEST_F(StatHashCacheTest, Lookup_Miss)
+TEST_F(StatCachedHashTest, DepHashFile_MatchesRawHash)
 {
-    TempTestFile f("test content");
+    TempTestFile f("hello world");
+    auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    // Never stored — oracle hash cache miss
-    auto result = cache.lookupHash(f.path, DepType::Content);
-    EXPECT_FALSE(result.hash.has_value());
-    // But stat metadata should be populated from the lstat call
-    EXPECT_TRUE(result.stat.has_value());
+    auto cached = depHashFile(path);
+    auto raw = depHash("hello world");
+    EXPECT_EQ(cached, raw);
 }
 
-TEST_F(StatHashCacheTest, DifferentDepTypes_SameFile)
+TEST_F(StatCachedHashTest, DepHashFile_CachedOnSecondCall)
 {
-    TempTestFile f("test data");
-    auto contentHash = depHash("content-hash");
-    auto dirHash = depHash("dir-hash");
+    TempTestFile f("cached content");
+    auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    cache.storeHash(f.path, DepType::Content, contentHash);
-    cache.storeHash(f.path, DepType::Directory, dirHash);
-
-    auto r1 = cache.lookupHash(f.path, DepType::Content);
-    auto r2 = cache.lookupHash(f.path, DepType::Directory);
-
-    ASSERT_TRUE(r1.hash.has_value());
-    ASSERT_TRUE(r2.hash.has_value());
-    EXPECT_EQ(*r1.hash, contentHash);
-    EXPECT_EQ(*r2.hash, dirHash);
-    EXPECT_NE(*r1.hash, *r2.hash);
+    // First call computes and caches
+    auto h1 = depHashFile(path);
+    // Second call should use stat-cache (same result)
+    auto h2 = depHashFile(path);
+    EXPECT_EQ(h1, h2);
 }
 
-TEST_F(StatHashCacheTest, StatMismatch_L1Miss)
+TEST_F(StatCachedHashTest, DepHashFile_DetectsModification)
 {
     TempTestFile f("original");
-    auto hash = depHash("original");
-    cache.storeHash(f.path, DepType::Content, hash);
+    auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    // Modify file to change stat oracle metadata (mtime and possibly size)
-    // Sleep briefly to ensure mtime differs
+    auto h1 = depHashFile(path);
+
+    // Modify with different-sized content to ensure stat metadata changes
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     f.modify("modified content!!!");
+    getFSSourceAccessor()->invalidateCache(CanonPath(f.path.string()));
 
-    // L1 key includes stat oracle metadata — mismatch should cause cache miss
-    auto result = cache.lookupHash(f.path, DepType::Content);
-    // Could be L1 miss but L2 hit if same session, or full miss
-    // The key is that the stale oracle hash should NOT be returned if stat changed
-    if (result.hash.has_value()) {
-        // If L2 returned something, it should be the stale entry
-        // (L2 validates by stat too, so this shouldn't happen for changed files)
-        // This test is best-effort since filesystem timing is tricky
-    }
+    auto h2 = depHashFile(path);
+    EXPECT_NE(h1, h2);
+    EXPECT_EQ(h2, depHash("modified content!!!"));
 }
 
-TEST_F(StatHashCacheTest, ClearMemoryCache_L1Cleared)
+TEST_F(StatCachedHashTest, DepHashFile_DifferentFiles)
 {
-    TempTestFile f("data");
-    auto hash = depHash("data");
-    cache.storeHash(f.path, DepType::Content, hash);
+    TempTestFile f1("file-one");
+    TempTestFile f2("file-two");
+    auto p1 = SourcePath(getFSSourceAccessor(), CanonPath(f1.path.string()));
+    auto p2 = SourcePath(getFSSourceAccessor(), CanonPath(f2.path.string()));
 
-    // Verify L1 oracle cache hit
-    auto r1 = cache.lookupHash(f.path, DepType::Content);
-    ASSERT_TRUE(r1.hash.has_value());
-
-    cache.clearMemoryCache();
-
-    // After clearing L1 (session-scoped), L2 (persistent SQLite) may still serve the oracle hash
-    auto r2 = cache.lookupHash(f.path, DepType::Content);
-    // L2 persistent store should still return the oracle hash (if SQLite is available)
-    // Weaker assertion: L2 availability depends on environment
-    EXPECT_TRUE(r2.stat.has_value()); // stat oracle metadata should always work
+    EXPECT_NE(depHashFile(p1), depHashFile(p2));
 }
 
-// ── L2 (persistent SQLite oracle hash store) ────────────────────────
+// ── depHashPathCached: stat-cached NARContent oracle hash ────────────
 
-TEST_F(StatHashCacheTest, L2Roundtrip)
+TEST_F(StatCachedHashTest, DepHashPathCached_Deterministic)
 {
-    TempTestFile f("persistent data");
-    auto hash = depHash("persistent data");
+    TempTestFile f("nar test");
+    auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    // Store oracle hash — writes to both L1 (session) and L2 (persistent SQLite)
-    cache.storeHash(f.path, DepType::Content, hash);
-
-    // Clear L1 session cache to force L2 persistent lookup
-    cache.clearMemoryCache();
-
-    auto result = cache.lookupHash(f.path, DepType::Content);
-    // L2 persistent store should return the oracle hash (if SQLite is available)
-    if (result.hash.has_value()) {
-        EXPECT_EQ(*result.hash, hash);
-    }
+    auto h1 = depHashPathCached(path);
+    auto h2 = depHashPathCached(path);
+    EXPECT_EQ(h1, h2);
 }
 
-TEST_F(StatHashCacheTest, L2BlobStorage_RoundtripExact)
+TEST_F(StatCachedHashTest, DepHashPathCached_MatchesUncached)
 {
-    TempTestFile f("blob test");
-    auto hash = depHash("blob test");
+    TempTestFile f("nar content");
+    auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    cache.storeHash(f.path, DepType::Content, hash);
-    cache.clearMemoryCache();
-
-    auto result = cache.lookupHash(f.path, DepType::Content);
-    if (result.hash.has_value()) {
-        // Verify byte-exact BLOB roundtrip through L2 persistent oracle store
-        EXPECT_EQ(std::memcmp(result.hash->data(), hash.data(), 32), 0);
-    }
+    auto cached = depHashPathCached(path);
+    auto uncached = depHashPath(path);
+    EXPECT_EQ(cached, uncached);
 }
 
-// ── Edge cases (oracle cache robustness) ─────────────────────────────
-
-TEST_F(StatHashCacheTest, NonexistentFile_LookupReturnsEmpty)
+TEST_F(StatCachedHashTest, DepHashPathCached_DiffersFromContentHash)
 {
-    auto result = cache.lookupHash("/nonexistent/path/to/file.nix", DepType::Content);
-    EXPECT_FALSE(result.hash.has_value());
-    EXPECT_FALSE(result.stat.has_value());
+    TempTestFile f("same content");
+    auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
+
+    // NARContent hash includes NAR header/metadata, so it differs from raw Content hash
+    auto narHash = depHashPathCached(path);
+    auto contentHash = depHashFile(path);
+    EXPECT_NE(narHash, contentHash);
 }
 
-TEST_F(StatHashCacheTest, StoreHash_NonexistentPath)
+// ── depHashDirListingCached: stat-cached Directory oracle hash ───────
+
+TEST_F(StatCachedHashTest, DepHashDirListingCached_Deterministic)
 {
-    auto hash = depHash("test");
-    // storeHash with no stat overload calls maybeLstat (oracle stat query), which returns
-    // nullopt for nonexistent paths. Should be a no-op, not a crash.
-    cache.storeHash("/nonexistent/path.nix", DepType::Content, hash);
-    // No crash = success (oracle cache gracefully handles missing inputs)
+    auto dir = std::filesystem::temp_directory_path()
+             / ("nix-test-dir-cache-" + std::to_string(getpid()));
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir / "a.txt") << "a";
+    std::ofstream(dir / "b.txt") << "b";
+
+    auto path = SourcePath(getFSSourceAccessor(), CanonPath(dir.string()));
+    auto entries = path.readDirectory();
+
+    auto h1 = depHashDirListingCached(path, entries);
+    auto h2 = depHashDirListingCached(path, entries);
+    EXPECT_EQ(h1, h2);
+
+    std::filesystem::remove_all(dir);
 }
 
-TEST_F(StatHashCacheTest, MultipleTypes_IndependentStorage)
+TEST_F(StatCachedHashTest, DepHashDirListingCached_MatchesUncached)
 {
-    TempTestFile f("multi-type test");
+    auto dir = std::filesystem::temp_directory_path()
+             / ("nix-test-dir-cache2-" + std::to_string(getpid()));
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir / "x.nix") << "42";
 
-    auto h1 = depHash("content-val");
-    auto h2 = depHash("nar-val");
-    auto h3 = depHash("dir-val");
+    auto path = SourcePath(getFSSourceAccessor(), CanonPath(dir.string()));
+    auto entries = path.readDirectory();
 
-    cache.storeHash(f.path, DepType::Content, h1);
-    cache.storeHash(f.path, DepType::NARContent, h2);
-    cache.storeHash(f.path, DepType::Directory, h3);
+    auto cached = depHashDirListingCached(path, entries);
+    auto uncached = depHashDirListing(entries);
+    EXPECT_EQ(cached, uncached);
 
-    EXPECT_EQ(*cache.lookupHash(f.path, DepType::Content).hash, h1);
-    EXPECT_EQ(*cache.lookupHash(f.path, DepType::NARContent).hash, h2);
-    EXPECT_EQ(*cache.lookupHash(f.path, DepType::Directory).hash, h3);
+    std::filesystem::remove_all(dir);
 }
 
 } // namespace nix::eval_trace
