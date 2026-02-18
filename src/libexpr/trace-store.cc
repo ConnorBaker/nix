@@ -308,12 +308,17 @@ static const char * schema = R"sql(
         hash    BLOB NOT NULL UNIQUE
     ) STRICT;
 
+    CREATE TABLE IF NOT EXISTS DepsSets (
+        id        INTEGER PRIMARY KEY,
+        deps_hash BLOB NOT NULL UNIQUE,
+        deps_blob BLOB NOT NULL
+    ) STRICT;
+
     CREATE TABLE IF NOT EXISTS Traces (
-        id          INTEGER PRIMARY KEY,
-        base_trace_id     INTEGER REFERENCES Traces(id),
+        id           INTEGER PRIMARY KEY,
         trace_hash   BLOB NOT NULL UNIQUE,
-        struct_hash BLOB NOT NULL,
-        deps_blob   BLOB NOT NULL
+        struct_hash  BLOB NOT NULL,
+        deps_set_id  INTEGER NOT NULL REFERENCES DepsSets(id)
     ) STRICT;
 
     CREATE INDEX IF NOT EXISTS idx_traces_struct ON Traces(struct_hash);
@@ -400,10 +405,16 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
     st->getResult.create(st->db,
         "SELECT type, value, context FROM Results WHERE id = ?");
 
-    // Traces (BLOB storage, UPSERT RETURNING)
+    // DepsSets (content-addressed dep storage, UPSERT RETURNING)
+    st->upsertDepsSet.create(st->db,
+        "INSERT INTO DepsSets(deps_hash, deps_blob) VALUES (?, ?) "
+        "ON CONFLICT(deps_hash) DO UPDATE SET deps_hash = excluded.deps_hash "
+        "RETURNING id");
+
+    // Traces (references DepsSets via deps_set_id FK, UPSERT RETURNING)
     st->upsertTrace.create(st->db,
-        "INSERT INTO Traces(base_trace_id, trace_hash, struct_hash, deps_blob) "
-        "VALUES (?, ?, ?, ?) "
+        "INSERT INTO Traces(trace_hash, struct_hash, deps_set_id) "
+        "VALUES (?, ?, ?) "
         "ON CONFLICT(trace_hash) DO UPDATE SET trace_hash = excluded.trace_hash "
         "RETURNING id");
 
@@ -411,13 +422,11 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
         "SELECT id FROM Traces WHERE trace_hash = ?");
 
     st->getTraceInfo.create(st->db,
-        "SELECT base_trace_id, trace_hash, struct_hash, deps_blob FROM Traces WHERE id = ?");
+        "SELECT t.trace_hash, t.struct_hash, d.deps_blob "
+        "FROM Traces t JOIN DepsSets d ON t.deps_set_id = d.id WHERE t.id = ?");
 
     st->lookupTraceByStructHash.create(st->db,
         "SELECT id FROM Traces WHERE struct_hash = ? LIMIT 1");
-
-    st->updateTraceBlob.create(st->db,
-        "UPDATE Traces SET base_trace_id = ?, deps_blob = ? WHERE id = ?");
 
     // CurrentTraces (JOIN with Results to get result fields)
     st->lookupAttr.create(st->db,
@@ -509,11 +518,6 @@ TraceStore::~TraceStore()
         ignoreExceptionExceptInterrupt();
     }
     try {
-        optimizeTraces();
-    } catch (...) {
-        ignoreExceptionExceptInterrupt();
-    }
-    try {
         auto st(_state->lock());
         if (st->txn)
             st->txn->commit();
@@ -541,7 +545,6 @@ void TraceStore::clearSessionCaches()
     stringTable.clear();
     stringTableLoaded = false;
     currentDepHashes.clear();
-    dirtyTraceIds.clear();
 }
 
 void TraceStore::ensureStringTableLoaded()
@@ -726,17 +729,6 @@ ResultId TraceStore::doInternResult(ResultKind type, const std::string & value,
 
 // ── Trace storage (BSàlC trace store) ───────────────────────────────
 
-std::optional<TraceId> TraceStore::getTraceBaseId(TraceId traceId)
-{
-    auto st(_state->lock());
-    auto use(st->getTraceInfo.use()(traceId));
-    if (!use.next())
-        return std::nullopt;
-    if (use.isNull(0))
-        return std::nullopt;
-    return use.getInt(0);
-}
-
 Hash TraceStore::getTraceFullHash(TraceId traceId)
 {
     auto cacheIt = traceHashCache.find(traceId);
@@ -747,7 +739,7 @@ Hash TraceStore::getTraceFullHash(TraceId traceId)
     auto use(st->getTraceInfo.use()(traceId));
     if (!use.next())
         throw Error("trace %d not found", traceId);
-    auto [blobData, blobSize] = use.getBlob(1);
+    auto [blobData, blobSize] = use.getBlob(0);
     auto h = readRawHash(blobData, blobSize);
     traceHashCache.insert_or_assign(traceId, h);
     return h;
@@ -763,40 +755,10 @@ Hash TraceStore::getTraceStructHash(TraceId traceId)
     auto use(st->getTraceInfo.use()(traceId));
     if (!use.next())
         throw Error("trace %d not found", traceId);
-    auto [blobData, blobSize] = use.getBlob(2);
+    auto [blobData, blobSize] = use.getBlob(1);
     auto h = readRawHash(blobData, blobSize);
     traceStructHashCache.insert_or_assign(traceId, h);
     return h;
-}
-
-std::vector<Dep> TraceStore::loadTraceDelta(TraceId traceId)
-{
-    // Read deps_blob from Traces and deserialize
-    const void * blobPtr = nullptr;
-    size_t blobLen = 0;
-
-    {
-        auto st(_state->lock());
-        auto use(st->getTraceInfo.use()(traceId));
-        if (!use.next())
-            return {};
-
-        // Column 3 = deps_blob
-        auto [data, size] = use.getBlob(3);
-        if (!data || size == 0)
-            return {};
-
-        // Copy blob data since the SQLite statement will be reset
-        blobLen = size;
-        auto * copy = new uint8_t[size];
-        memcpy(copy, data, size);
-        blobPtr = copy;
-    }
-
-    auto interned = deserializeInternedDeps(blobPtr, blobLen);
-    delete[] static_cast<const uint8_t *>(blobPtr);
-
-    return resolveDeps(interned);
 }
 
 std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
@@ -808,97 +770,65 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
     auto loadStart = timerStart();
     nrLoadTraces++;
 
-    // Walk up the base_trace_id chain to find nearest cached ancestor or root
-    std::vector<TraceId> chainToApply;
-    TraceId currentId = traceId;
-    std::vector<Dep> baseDeps;
-
-    while (true) {
-        auto cached = traceCache.find(currentId);
-        if (cached != traceCache.end()) {
-            baseDeps = cached->second;
-            break;
+    // Single DB read via JOIN — no chain walk
+    const void * blobPtr = nullptr;
+    size_t blobLen = 0;
+    {
+        auto st(_state->lock());
+        auto use(st->getTraceInfo.use()(traceId));
+        if (!use.next())
+            return {};
+        // Column 2 = deps_blob (from DepsSets via JOIN)
+        auto [data, size] = use.getBlob(2);
+        if (!data || size == 0) {
+            traceCache[traceId] = {};
+            nrLoadTraceTimeUs += elapsedUs(loadStart);
+            return {};
         }
-        chainToApply.push_back(currentId);
-        auto baseTraceId = getTraceBaseId(currentId);
-        if (!baseTraceId)
-            break;
-        currentId = *baseTraceId;
+        blobLen = size;
+        auto * copy = new uint8_t[size];
+        memcpy(copy, data, size);
+        blobPtr = copy;
     }
 
-    // chainToApply is [traceId, parent, ..., root_or_near_cached]
-    // Reverse to apply from root toward traceId
-    std::reverse(chainToApply.begin(), chainToApply.end());
-
-    // Build dep map starting from base
-    std::unordered_map<DepKey, Dep, DepKey::Hash> depMap;
-    for (auto & dep : baseDeps)
-        depMap.insert_or_assign(DepKey(dep), dep);
-
-    // Apply deltas from root toward traceId
-    for (auto id : chainToApply) {
-        auto delta = loadTraceDelta(id);
-        for (auto & dep : delta)
-            depMap.insert_or_assign(DepKey(dep), dep);
-    }
-
-    // Flatten to vector (NOT sorted — callers that need canonical order
-    // must call sortAndDedupDeps() explicitly)
-    std::vector<Dep> result;
-    result.reserve(depMap.size());
-    for (auto & [_, dep] : depMap)
-        result.push_back(dep);
+    auto interned = deserializeInternedDeps(blobPtr, blobLen);
+    delete[] static_cast<const uint8_t *>(blobPtr);
+    auto result = resolveDeps(interned);
 
     traceCache[traceId] = result;
     nrLoadTraceTimeUs += elapsedUs(loadStart);
     return result;
 }
 
-std::vector<Dep> TraceStore::computeTraceDelta(
+int64_t TraceStore::getOrCreateDepsSet(
     const std::vector<Dep> & fullDeps,
-    const std::vector<Dep> & baseDeps)
+    const Hash & depsHash)
 {
-    // Build lookup map for base deps: key -> expectedHash
-    std::unordered_map<DepKey, DepHashValue, DepKey::Hash> baseMap;
-    for (auto & dep : baseDeps)
-        baseMap.insert_or_assign(DepKey(dep), dep.expectedHash);
+    auto interned = internDeps(fullDeps);
+    auto blob = serializeDeps(interned);
 
-    std::vector<Dep> delta;
-    for (auto & dep : fullDeps) {
-        auto it = baseMap.find(DepKey(dep));
-        if (it != baseMap.end() && it->second == dep.expectedHash)
-            continue; // Same key and same hash → inherited from base
-        // New dep or different hash → include in delta
-        delta.push_back(dep);
-    }
-    return delta;
+    auto st(_state->lock());
+    auto use(st->upsertDepsSet.use());
+    bindRawHash(use, depsHash);
+    bindBlobVec(use, blob);
+    if (!use.next())
+        throw Error("failed to get or create deps set");
+    return use.getInt(0);
 }
 
 TraceId TraceStore::getOrCreateTrace(
-    const std::vector<Dep> & fullDeps,
-    const std::vector<InternedDep> & deltaDeps,
     const Hash & traceHash,
     const Hash & structHash,
-    std::optional<TraceId> baseTraceId)
+    int64_t depsSetId)
 {
-    // Serialize delta deps into BLOB
-    auto blob = serializeDeps(deltaDeps);
-
-    // Single UPSERT RETURNING: insert or get existing trace ID
     auto st(_state->lock());
     auto use(st->upsertTrace.use());
-    use(baseTraceId ? *baseTraceId : (int64_t)0, baseTraceId.has_value());
     bindRawHash(use, traceHash);
     bindRawHash(use, structHash);
-    bindBlobVec(use, blob);
+    use(depsSetId);
     if (!use.next())
         throw Error("failed to get or create trace");
-    TraceId traceId = use.getInt(0);
-
-    // Track as dirty for post-write optimization
-    dirtyTraceIds.insert(traceId);
-
-    return traceId;
+    return use.getInt(0);
 }
 
 // ── Trace verification (BSàlC VT check) ─────────────────────────────
@@ -1036,53 +966,36 @@ TraceStore::RecordResult TraceStore::record(
         fullDeps = sortedDeps;
     }
 
-    // 4. Compute trace_hash from full trace (includes parent context)
+    // 4. Compute deps_hash (parent-free, for DepsSets dedup)
+    auto depsHash = computeTraceHashFromSorted(fullDeps);
+
+    // 5. Compute trace_hash (includes parent Merkle chaining)
     Hash traceHash(HashAlgorithm::BLAKE3);
     if (parentTraceId) {
         auto parentFullHash = getTraceFullHash(*parentTraceId);
         traceHash = computeTraceHashWithParentFromSorted(fullDeps, parentFullHash);
     } else {
-        traceHash = computeTraceHashFromSorted(fullDeps);
+        traceHash = depsHash;  // No parent → trace_hash == deps_hash
     }
 
-    // 5. Compute struct_hash from FULL deps (for delta encoding + structural variant recovery)
+    // 6. Compute struct_hash (for structural variant recovery)
     auto structHash = computeTraceStructHashFromSorted(fullDeps);
 
-    // 6. Find struct-hash-based base for delta encoding
-    //    base_trace_id is for storage compression only — decoupled from parentTraceId
-    std::optional<TraceId> baseTraceId;
-    {
-        auto st(_state->lock());
-        auto use(st->lookupTraceByStructHash.use());
-        bindRawHash(use, structHash);
-        if (use.next())
-            baseTraceId = use.getInt(0);
-    }
+    // 7. Get or create deps set (content-addressed by deps_hash)
+    auto depsSetId = getOrCreateDepsSet(fullDeps, depsHash);
 
-    // 7. Compute delta from struct-hash base (not parent)
-    std::vector<Dep> deltaDeps;
-    if (baseTraceId) {
-        auto baseDeps = loadFullTrace(*baseTraceId);
-        deltaDeps = computeTraceDelta(fullDeps, baseDeps);
-    } else {
-        deltaDeps = fullDeps;
-    }
-
-    // 8. Intern delta dep strings and serialize
-    auto internedDelta = internDeps(deltaDeps);
-
-    // 9. Encode CachedResult and intern result
+    // 8. Encode CachedResult and intern result
     auto [type, val, ctx] = encodeCachedResult(value);
     auto resultHash = computeResultHash(type, val, ctx);
     ResultId resultId = doInternResult(type, val, ctx, resultHash);
 
-    // 10. Intern attr path
+    // 9. Intern attr path
     AttrPathId attrPathId = doInternAttrPath(attrPath);
 
-    // 11. Get or create trace (with BLOB)
-    TraceId traceId = getOrCreateTrace(fullDeps, internedDelta, traceHash, structHash, baseTraceId);
+    // 10. Get or create trace
+    TraceId traceId = getOrCreateTrace(traceHash, structHash, depsSetId);
 
-    // 12. Upsert Attrs + insert History
+    // 11. Upsert Attrs + insert History
     {
         auto st(_state->lock());
         st->upsertAttr.use()
@@ -1091,7 +1004,7 @@ TraceStore::RecordResult TraceStore::record(
             (contextHash)(attrPathId)(traceId)(resultId).exec();
     }
 
-    // 13. Session caches
+    // 12. Session caches
     bool hasVolatile = std::any_of(allDeps.begin(), allDeps.end(),
         [](auto & d) { return d.type == DepType::CurrentTime || d.type == DepType::Exec; });
     if (!hasVolatile)
@@ -1416,96 +1329,6 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     nrRecoveryFailures++;
     nrRecoveryTimeUs += elapsedUs(recoveryStart);
     return std::nullopt;
-}
-
-// ── Post-write optimization ──────────────────────────────────────────
-
-void TraceStore::optimizeTraces()
-{
-    if (dirtyTraceIds.empty())
-        return;
-
-    // Group dirty traces by struct_hash.
-    // All lock-acquiring work (DB reads, string interning) is done OUTSIDE
-    // lock scopes to avoid deadlock. The lock is only held for UPDATE writes.
-    std::unordered_map<Hash, std::vector<TraceId>> structGroups;
-    for (auto traceId : dirtyTraceIds) {
-        // Get struct_hash from session cache or DB
-        Hash structHash(HashAlgorithm::BLAKE3);
-        auto cacheIt = traceStructHashCache.find(traceId);
-        if (cacheIt != traceStructHashCache.end()) {
-            structHash = cacheIt->second;
-        } else {
-            auto st(_state->lock());
-            auto use(st->getTraceInfo.use()(traceId));
-            if (!use.next()) continue;
-            auto [data, size] = use.getBlob(2); // struct_hash is column 2
-            structHash = readRawHash(data, size);
-        }
-        structGroups[structHash].push_back(traceId);
-    }
-
-    for (auto & [structHash, group] : structGroups) {
-        if (group.size() <= 1) continue;
-
-        // Pick the trace with the most full deps as canonical base
-        TraceId baseTraceId = group[0];
-        size_t maxSize = 0;
-        for (auto traceId : group) {
-            auto it = traceCache.find(traceId);
-            size_t sz = (it != traceCache.end()) ? it->second.size() : 0;
-            if (sz > maxSize) {
-                maxSize = sz;
-                baseTraceId = traceId;
-            }
-        }
-
-        // Load base deps and pre-compute all blobs OUTSIDE lock scope.
-        // This avoids deadlock: loadFullTrace, internDeps, and resolveDeps
-        // all acquire _state->lock() internally.
-        auto baseDeps = loadFullTrace(baseTraceId);
-
-        // Pre-compute the base blob
-        auto internedBase = internDeps(baseDeps);
-        auto baseBlob = serializeDeps(internedBase);
-
-        // Pre-compute all member blobs
-        struct MemberUpdate {
-            TraceId traceId;
-            bool isBase;
-            std::vector<uint8_t> blob;
-        };
-        std::vector<MemberUpdate> updates;
-        updates.reserve(group.size());
-
-        for (auto traceId : group) {
-            if (traceId == baseTraceId) {
-                updates.push_back({traceId, true, baseBlob});
-            } else {
-                auto myDeps = loadFullTrace(traceId);
-                auto delta = computeTraceDelta(myDeps, baseDeps);
-                auto internedDelta = internDeps(delta);
-                auto blob = serializeDeps(internedDelta);
-                updates.push_back({traceId, false, std::move(blob)});
-            }
-        }
-
-        // Now write all updates under a single lock acquisition
-        auto st(_state->lock());
-        for (auto & upd : updates) {
-            auto use(st->updateTraceBlob.use());
-            if (upd.isBase) {
-                use((int64_t)0, false); // NULL base_trace_id
-            } else {
-                use(baseTraceId);
-            }
-            bindBlobVec(use, upd.blob);
-            use(upd.traceId);
-            use.exec();
-        }
-    }
-
-    dirtyTraceIds.clear();
 }
 
 } // namespace nix::eval_trace

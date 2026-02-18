@@ -45,12 +45,14 @@ struct TraceStore {
         SQLiteStmt upsertResult;
         SQLiteStmt getResult;
 
-        // Traces (delta-encoded with base_trace_id chain, BLOB storage)
+        // DepsSets (content-addressed dep storage)
+        SQLiteStmt upsertDepsSet;
+
+        // Traces (references DepsSets via deps_set_id FK)
         SQLiteStmt upsertTrace;
         SQLiteStmt lookupTraceByFullHash;
         SQLiteStmt getTraceInfo;
         SQLiteStmt lookupTraceByStructHash;
-        SQLiteStmt updateTraceBlob;
 
         // CurrentTraces (current verified state per attribute)
         SQLiteStmt lookupAttr;
@@ -103,9 +105,6 @@ struct TraceStore {
     // Current dep hash cache (persists across verification → recovery within session)
     std::unordered_map<DepKey, std::optional<DepHashValue>, DepKey::Hash> currentDepHashes;
 
-    // Dirty traces (recorded this session, for post-record optimization)
-    std::unordered_set<TraceId> dirtyTraceIds;
-
     TraceStore(SymbolTable & symbols, int64_t contextHash);
     ~TraceStore();
 
@@ -145,7 +144,9 @@ struct TraceStore {
      * Stores (attrPath, result, deps) as a constructive trace: the full result
      * value is persisted alongside dep hashes, enabling future recovery without
      * re-evaluation. If a trace with the same trace_hash already exists (dedup),
-     * reuses it. Delta-encodes deps against a base trace when possible.
+     * reuses it. Deps are content-addressed via DepsSets table — traces sharing
+     * identical deps (differing only in parent Merkle chaining) share a single
+     * DepsSets row.
      *
      * Also inserts into TraceHistory for constructive recovery: historical traces
      * can be recovered when dep hashes match a previously-seen state (e.g., after
@@ -185,30 +186,18 @@ struct TraceStore {
         std::optional<TraceId> parentTraceIdHint = std::nullopt);
 
     /**
-     * Load the full dependency set for a trace (resolving delta chains).
+     * Load the full dependency set for a trace.
+     *
+     * Reads the deps_blob from the DepsSets table via the trace's deps_set_id
+     * foreign key. O(1) — single DB read + zstd decompression.
      *
      * The returned vector is NOT sorted. Callers that need canonical ordering
-     * (e.g., for trace hash computation via computeTraceHashFromSorted) must
-     * call sortAndDedupDeps() explicitly.
-     *
-     * Order-invariant callers (no sort needed):
-     *   - verifyTrace(): iterates deps, checks each hash independently
-     *   - recovery() hash recomputation: iterates deps, computes current hashes
-     *   - computeTraceDelta(): builds unordered_map from deps
-     *   - optimizeTraces(): computes deltas via unordered_map
-     *   - record() parent merge: merges into unordered_map, sorts the merged result
-     *
-     * Order-dependent callers (must sort):
-     *   - recovery() direct hash: feeds computeTraceHashFromSorted()
-     *   - recovery() struct variant hash: feeds computeTraceHashFromSorted()
-     *   - record() trace/struct hash: calls sortAndDedupDeps() on merged result
+     * must call sortAndDedupDeps() explicitly.
      */
     std::vector<Dep> loadFullTrace(TraceId traceId);
     bool attrExists(std::string_view attrPath);
     void clearSessionCaches();
     static std::string buildAttrPath(const std::vector<std::string> & components);
-
-    void optimizeTraces();
 
     // BLOB serialization for dep entries
     static std::vector<uint8_t> serializeDeps(const std::vector<InternedDep> & deps);
@@ -245,24 +234,19 @@ private:
                             const std::string & context, const Hash & resultHash);
 
     TraceId getOrCreateTrace(
-        const std::vector<Dep> & fullDeps,
-        const std::vector<InternedDep> & deltaDeps,
         const Hash & traceHash,
         const Hash & structHash,
-        std::optional<TraceId> baseTraceId);
+        int64_t depsSetId);
 
-    std::vector<Dep> loadTraceDelta(TraceId traceId);
-
-    static std::vector<Dep> computeTraceDelta(
+    int64_t getOrCreateDepsSet(
         const std::vector<Dep> & fullDeps,
-        const std::vector<Dep> & baseDeps);
+        const Hash & depsHash);
 
     CachedResult decodeCachedResult(const TraceRow & row);
     std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);
 
     Hash getTraceFullHash(TraceId traceId);
     Hash getTraceStructHash(TraceId traceId);
-    std::optional<TraceId> getTraceBaseId(TraceId traceId);
 };
 
 } // namespace nix::eval_trace

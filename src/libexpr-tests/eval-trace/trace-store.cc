@@ -159,7 +159,7 @@ TEST_F(TraceStoreTest, ColdStore_WithParent)
     auto childResult = db.record("child", string_t{"child-val", {}},
                                  {makeEnvVarDep("FOO", "bar")}, parentResult.traceId, false);
 
-    // With delta encoding, loadFullTrace flattens the trace DAG (parent + child deps)
+    // loadFullTrace returns the full trace (parent + child deps merged at record time)
     auto childDeps = db.loadFullTrace(childResult.traceId);
     EXPECT_EQ(childDeps.size(), 2u);
 
@@ -1080,9 +1080,9 @@ TEST_F(TraceStoreTest, BlobRoundTrip_LargeSet)
     }
 }
 
-// ── Delta encoding tests (trace compression via structural sharing) ──
+// ── Dep storage tests (content-addressed DepsSets dedup) ─────────────
 
-TEST_F(TraceStoreTest, DeltaEncoding_SiblingOverlap)
+TEST_F(TraceStoreTest, DepsSets_SiblingOverlap)
 {
     auto db = makeDb();
 
@@ -1114,66 +1114,15 @@ TEST_F(TraceStoreTest, DeltaEncoding_SiblingOverlap)
     auto loadedB = db.loadFullTrace(childB.traceId);
     EXPECT_EQ(loadedA.size(), 100u);
     EXPECT_EQ(loadedB.size(), 100u);
-
-    // After optimization, child B should use child A as base (same structural hash)
-    // since they have the same 100 dep keys
-    db.optimizeTraces();
-
-    // Verify both traces still load correctly after optimization
-    auto reloadedA = db.loadFullTrace(childA.traceId);
-    auto reloadedB = db.loadFullTrace(childB.traceId);
-    EXPECT_EQ(reloadedA.size(), 100u);
-    EXPECT_EQ(reloadedB.size(), 100u);
 }
 
-TEST_F(TraceStoreTest, DeltaEncoding_StructHashMatch)
+TEST_F(TraceStoreTest, Record_ParentDepMerge)
 {
+    // Parent with deps, child with own deps — record merges them.
+    // Tests parent dep merging in record(), not delta encoding.
     auto db = makeDb();
 
-    // Trace v1 with deps [A=h1, B=h2, C=h3]
-    std::vector<Dep> depsV1 = {
-        makeContentDep("/a.nix", "h1"),
-        makeContentDep("/b.nix", "h2"),
-        makeContentDep("/c.nix", "h3"),
-    };
-    auto v1 = db.record("attr", string_t{"v1", {}}, depsV1, std::nullopt, false);
-
-    // Trace v2 with deps [A=h1', B=h2, C=h3] — same structural hash, different dep hash for A
-    std::vector<Dep> depsV2 = {
-        makeContentDep("/a.nix", "h1-modified"),
-        makeContentDep("/b.nix", "h2"),
-        makeContentDep("/c.nix", "h3"),
-    };
-    auto v2 = db.record("attr", string_t{"v2", {}}, depsV2, std::nullopt, false);
-
-    // v2 should use v1 as structural-hash base since they have same dep keys
-    // After optimization, v2's delta should be much smaller than v1's full trace
-    db.optimizeTraces();
-
-    // Both traces should still load correctly
-    auto loadedV1 = db.loadFullTrace(v1.traceId);
-    auto loadedV2 = db.loadFullTrace(v2.traceId);
-
-    ASSERT_EQ(loadedV1.size(), 3u);
-    ASSERT_EQ(loadedV2.size(), 3u);
-
-    // Verify v2 trace has the modified dep hash for A
-    bool foundModifiedA = false;
-    for (auto & dep : loadedV2) {
-        if (dep.key == "/a.nix") {
-            auto h = depHash("h1-modified");
-            EXPECT_EQ(dep.expectedHash, DepHashValue(h));
-            foundModifiedA = true;
-        }
-    }
-    EXPECT_TRUE(foundModifiedA);
-}
-
-TEST_F(TraceStoreTest, DeltaEncoding_NoParentBase)
-{
-    auto db = makeDb();
-
-    // Parent with 0 deps (empty trace)
+    // Parent with 0 deps (FullAttrs pattern — trace records only child names)
     auto parent = db.record("", null_t{}, {}, std::nullopt, true);
 
     // Child A trace with 100 deps
@@ -1193,11 +1142,7 @@ TEST_F(TraceStoreTest, DeltaEncoding_NoParentBase)
     depsB.push_back(makeContentDep("/f99.nix", "c99-modified"));
     auto childB = db.record("b", int_t{NixInt{2}}, depsB, parent.traceId, false);
 
-    // After optimization, child B should NOT use parent (0 deps) as delta base.
-    // It should use child A (same structural hash — same 100 dep keys).
-    db.optimizeTraces();
-
-    // Verify both traces still load correctly
+    // Verify both traces load correctly
     auto loadedA = db.loadFullTrace(childA.traceId);
     auto loadedB = db.loadFullTrace(childB.traceId);
     EXPECT_EQ(loadedA.size(), 100u);
@@ -1213,100 +1158,6 @@ TEST_F(TraceStoreTest, DeltaEncoding_NoParentBase)
         }
     }
     EXPECT_TRUE(foundModified);
-}
-
-TEST_F(TraceStoreTest, DeltaEncoding_PostWriteOptimization)
-{
-    auto db = makeDb();
-
-    // Record 5 traces with same structural hash in suboptimal order (smallest first)
-    std::vector<int64_t> traceIds;
-    for (int setNum = 0; setNum < 5; setNum++) {
-        std::vector<Dep> deps;
-        for (int i = 0; i < 50; i++) {
-            auto key = "/shared-" + std::to_string(i) + ".nix";
-            auto content = "content-" + std::to_string(i) + "-v" + std::to_string(setNum);
-            deps.push_back(makeContentDep(key, content));
-        }
-        auto result = db.record(
-            "attr-" + std::to_string(setNum), int_t{NixInt{setNum}},
-            deps, std::nullopt, false);
-        traceIds.push_back(result.traceId);
-    }
-
-    // Run optimization
-    db.optimizeTraces();
-
-    // All 5 traces should still load correctly with 50 deps each
-    for (int i = 0; i < 5; i++) {
-        auto loaded = db.loadFullTrace(traceIds[i]);
-        EXPECT_EQ(loaded.size(), 50u) << "Trace " << i << " has wrong number of deps";
-    }
-}
-
-TEST_F(TraceStoreTest, DeltaEncoding_CrossCommitDelta)
-{
-    // Simulate 3 "commits" for the same attribute, each recording a trace with slightly different deps
-    auto db = makeDb();
-
-    // Base deps: 50 shared files
-    auto makeDeps = [](int version) {
-        std::vector<Dep> deps;
-        for (int i = 0; i < 50; i++) {
-            auto key = "/src/" + std::to_string(i) + ".nix";
-            // Most deps are the same across versions, a few change
-            auto content = (i < 45)
-                ? "stable-content-" + std::to_string(i)
-                : "content-v" + std::to_string(version) + "-" + std::to_string(i);
-            deps.push_back(makeContentDep(key, content));
-        }
-        return deps;
-    };
-
-    auto r1 = db.record("", string_t{"commit-1", {}}, makeDeps(1), std::nullopt, true);
-    auto r2 = db.record("", string_t{"commit-2", {}}, makeDeps(2), std::nullopt, true);
-    auto r3 = db.record("", string_t{"commit-3", {}}, makeDeps(3), std::nullopt, true);
-
-    // After optimization, all 3 traces should share a delta base
-    db.optimizeTraces();
-
-    // All should load correctly with 50 deps
-    EXPECT_EQ(db.loadFullTrace(r1.traceId).size(), 50u);
-    EXPECT_EQ(db.loadFullTrace(r2.traceId).size(), 50u);
-    EXPECT_EQ(db.loadFullTrace(r3.traceId).size(), 50u);
-}
-
-TEST_F(TraceStoreTest, DeltaEncoding_RowCount)
-{
-    // Record 10 traces each with 100 shared deps + 10 unique deps.
-    // Total storage should be much less than 10 x 110 due to structural sharing.
-    auto db = makeDb();
-
-    std::vector<int64_t> traceIds;
-    for (int attrNum = 0; attrNum < 10; attrNum++) {
-        std::vector<Dep> deps;
-        // 100 shared deps (same keys, same hashes)
-        for (int i = 0; i < 100; i++) {
-            deps.push_back(makeContentDep(
-                "/shared-" + std::to_string(i) + ".nix", "shared-content"));
-        }
-        // 10 unique deps per attr
-        for (int i = 0; i < 10; i++) {
-            deps.push_back(makeContentDep(
-                "/unique-" + std::to_string(attrNum) + "-" + std::to_string(i) + ".nix",
-                "unique-content"));
-        }
-        auto result = db.record(
-            "attr-" + std::to_string(attrNum), int_t{NixInt{attrNum}},
-            deps, std::nullopt, false);
-        traceIds.push_back(result.traceId);
-    }
-
-    // All 10 traces should load correctly with 110 deps each
-    for (int i = 0; i < 10; i++) {
-        auto loaded = db.loadFullTrace(traceIds[i]);
-        EXPECT_EQ(loaded.size(), 110u) << "Trace " << i << " has wrong number of deps";
-    }
 }
 
 // ── Batch verification + dep hash caching tests (Shake: unchanged check) ──
@@ -1412,11 +1263,11 @@ TEST_F(TraceStoreTest, WarmPath_BaseValidatedOnce)
     EXPECT_FALSE(db.verifiedTraceIds.empty());
 }
 
-// ── Full end-to-end delta + verification roundtrip ───────────────────
+// ── Full end-to-end record + verification roundtrip ──────────────────
 
-TEST_F(TraceStoreTest, DeltaEncoding_WarmRoundtrip)
+TEST_F(TraceStoreTest, RecordVerify_WarmRoundtrip)
 {
-    // End-to-end: record traces with delta encoding, then verification retrieves correctly.
+    // End-to-end: record traces, then verification retrieves correctly.
     // Use EnvVar deps so verification can actually check them (no files needed).
     ScopedEnvVar env1("NIX_DW_SHARED", "stable");
     ScopedEnvVar env2("NIX_DW_A", "a-val");
@@ -1453,27 +1304,6 @@ TEST_F(TraceStoreTest, DeltaEncoding_WarmRoundtrip)
     auto rc = db.verify("c", {}, state);
     ASSERT_TRUE(rc.has_value());
     assertCachedResultEquals(string_t{"val-c", {}}, rc->value, state.symbols);
-}
-
-TEST_F(TraceStoreTest, OptimizeTraces_NoDirty)
-{
-    // optimizeTraces with no dirty traces should be a no-op
-    auto db = makeDb();
-    db.optimizeTraces(); // Should not crash or throw
-}
-
-TEST_F(TraceStoreTest, OptimizeTraces_SingletonGroup)
-{
-    // Single trace in a structural hash group — no optimization needed
-    auto db = makeDb();
-    std::vector<Dep> deps = {makeContentDep("/a.nix", "a")};
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
-
-    // Should not crash; singleton structural groups are skipped
-    db.optimizeTraces();
-
-    auto loaded = db.loadFullTrace(result.traceId);
-    EXPECT_EQ(loaded.size(), 1u);
 }
 
 } // namespace nix::eval_trace

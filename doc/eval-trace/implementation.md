@@ -300,11 +300,13 @@ longer store objects -- they are rows in SQLite tables. No `addTextToStore()`,
 no store path references, no GC coupling. The trace system is now a fully
 self-contained BSàlC trace store.
 
-**2. Seven-table schema.**
-`Strings`, `AttrPaths`, `Results`, `Traces`, `CurrentTraces`, `TraceHistory`,
-`StatHashCache`.
-Semi-normalized trace storage: dep entries use delta-encoded BLOBs within the
-`Traces` table, and result values are deduplicated via the `Results` table.
+**2. Eight-table schema.**
+`Strings`, `AttrPaths`, `Results`, `DepsSets`, `Traces`, `CurrentTraces`,
+`TraceHistory`, `StatHashCache`.
+Normalized trace storage: dep entries are content-addressed in the `DepsSets`
+table (keyed by `deps_hash = BLAKE3(sorted deps, no parent Merkle)`), and
+`Traces` references `DepsSets` via `deps_set_id` FK. Result values are
+deduplicated via the `Results` table.
 `CurrentTraces` maps `(context_hash, attr_path_id)` to the current trace and
 result (the BSàlC VT lookup table). `TraceHistory` stores all historical
 trace-result pairs for each attribute (the BSàlC CT recovery store). See
@@ -351,6 +353,14 @@ cannot:
 - **Implementation constraint:** Must be called outside lock scopes because it
   acquires its own locks (non-recursive mutex would deadlock if called while
   holding the DB lock).
+
+**6. DepsSets normalization (post Phase 12).**
+Replaced delta-encoded `deps_blob` + `base_trace_id` chain with a normalized
+`DepsSets` table. Content-addressed by `deps_hash = BLAKE3(sorted deps, no
+parent Merkle)`. Traces reference `DepsSets(id)` via FK. Eliminates chain walk
+(O(depth) → O(1) load), `optimizeTraces()` post-write pass, and ~200 lines
+of delta encoding code. Same storage because traces differing only in parent
+context share a `DepsSets` row.
 
 **Files changed.**
 - **Created:** `trace-store.cc`, `trace-store.hh`
@@ -414,8 +424,8 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 | `src/libexpr/include/nix/expr/trace-result.hh` | ~65 | Result vocabulary types: `ResultKind`, `CachedResult`, all result structs (header-only) |
 | `src/libexpr/include/nix/expr/trace-cache.hh` | ~65 | Public API: `TraceCache`, performance counters |
 | `src/libexpr/trace-cache.cc` | ~726 | `TracedExpr` (Adapton articulation point), `ExprOrigChild`, `SharedParentResult`, verify/record/recover loop |
-| `src/libexpr/include/nix/expr/trace-store.hh` | ~176 | `TraceStore`: pure SQLite backend (BSàlC trace store) |
-| `src/libexpr/trace-store.cc` | ~1426 | SQLite backend: schema, verify, record, constructive recovery, verifyTrace (BSàlC VT/CT operations) |
+| `src/libexpr/include/nix/expr/trace-store.hh` | ~170 | `TraceStore`: pure SQLite backend (BSàlC trace store) |
+| `src/libexpr/trace-store.cc` | ~1230 | SQLite backend: schema, verify, record, constructive recovery, verifyTrace (BSàlC VT/CT operations) |
 | `src/libexpr/include/nix/expr/trace-hash.hh` | ~79 | HashSink-based trace hashing (CBOR serialization removed in Phase 12) |
 | `src/libexpr/trace-hash.cc` | ~89 | HashSink trace hashing implementations |
 

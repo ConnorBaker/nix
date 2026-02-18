@@ -339,7 +339,7 @@ content-addressed store objects) provides several advantages:
 4. **Expendability.** The database is a cache. If deleted or corrupted, fresh
    evaluation re-records everything. Correctness is never at risk.
 
-### 5.2 Schema (7 Tables)
+### 5.2 Schema (8 Tables)
 
 ```sql
 CREATE TABLE IF NOT EXISTS Strings (
@@ -360,12 +360,17 @@ CREATE TABLE IF NOT EXISTS Results (
     hash    BLOB NOT NULL UNIQUE
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS DepsSets (
+    id        INTEGER PRIMARY KEY,
+    deps_hash BLOB NOT NULL UNIQUE,
+    deps_blob BLOB NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS Traces (
-    id            INTEGER PRIMARY KEY,
-    base_trace_id INTEGER REFERENCES Traces(id),
-    trace_hash    BLOB NOT NULL UNIQUE,
-    struct_hash   BLOB NOT NULL,
-    deps_blob     BLOB NOT NULL
+    id           INTEGER PRIMARY KEY,
+    trace_hash   BLOB NOT NULL UNIQUE,
+    struct_hash  BLOB NOT NULL,
+    deps_set_id  INTEGER NOT NULL REFERENCES DepsSets(id)
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS CurrentTraces (
@@ -405,14 +410,19 @@ references.
 `(type, value, context)` triple encoding a `CachedResult`. Multiple attributes
 with the same result share a single Results row.
 
+**DepsSets** stores content-addressed dependency sets. The `deps_hash` is the
+BLAKE3 hash of the sorted deps *without* parent Merkle chaining, so traces that
+differ only in parent context share the same `DepsSets` row. The `deps_blob`
+stores zstd-compressed dependency entries as a compact BLOB. Zstd level 1
+compression achieves 5–10× size reduction on the repetitive binary dep data
+with sub-millisecond encode/decode overhead.
+
 **Traces** stores deduplicated dependency traces (BSàlC constructive traces),
-keyed by `trace_hash` (BLAKE3 of the full dep content including hash values).
-The `struct_hash` captures the structural signature (dep types + sources + keys,
-without hash values) for structural variant recovery. The `deps_blob`
-stores zstd-compressed, delta-encoded dependency entries as a compact BLOB,
-with `base_trace_id` pointing to a base trace for delta chain resolution.
-Zstd level 1 compression achieves 5–10× size reduction on the repetitive
-binary dep data with sub-millisecond encode/decode overhead.
+keyed by `trace_hash` (BLAKE3 of the full dep content including parent Merkle
+chaining). The `struct_hash` captures the structural signature (dep types +
+sources + keys, without hash values) for structural variant recovery. Traces
+reference `DepsSets` via `deps_set_id` for content-addressed dep storage —
+loading a trace's deps is O(1) via a single JOIN.
 
 **CurrentTraces** maps `(context_hash, attr_path_id)` to the current trace and
 result for each attribute. This is the primary lookup table for the verify path.
@@ -492,7 +502,7 @@ reads within a single evaluation session:
   individually verified (BSàlC VT check passed). Shared across attributes with
   the same trace.
 - **`traceCache`** (`std::map<int64_t, std::vector<Dep>>`): Loaded trace entries.
-  Avoids re-reading `Traces` rows for the same trace.
+  Caches deserialized deps from `DepsSets` JOINs to avoid redundant DB reads.
 
 These caches are cleared by `clearSessionCaches()` and are not persisted.
 
