@@ -63,7 +63,7 @@ taxonomy defines:
 - **Constructive trace (CT):** Records `(key, [dep_hash], result)`. Like VT but
   stores the *actual result*, not just its hash. On a match, the result can be
   served directly without recomputation. Our **record()** path stores full results,
-  and **recover()** uses historical traces to serve results constructively.
+  and **recovery()** uses historical traces to serve results constructively.
 
 - **Deep constructive trace (DCT):** A CT that records traces at every intermediate
   node, not just leaves. Our system traces at all nesting levels — root attrsets,
@@ -100,7 +100,7 @@ Key concepts we adopt:
 > Used in the Rust compiler (rust-analyzer).
 
 Salsa provides versioned queries with memoized results. Our **parent Merkle
-chaining** in Phase 1 recovery is analogous to Salsa's versioned query with
+chaining** in direct hash recovery is analogous to Salsa's versioned query with
 context: when a parent's trace_hash is mixed into the child's recovery lookup
 key, it disambiguates child traces across different parent versions. The same
 child attribute with the same deps but a different parent produces a different
@@ -124,7 +124,7 @@ on evaluation order, whether a root file is already cached, etc.).
 | **trace** | constructive trace (BSàlC) | A record of `(key, [dep_hash], result)` from an evaluation |
 | **verify()** | verifying trace check (BSàlC VT) | Check if recorded dep hashes still match current state |
 | **record()** | trace recording (BSàlC CT) | Store evaluation result + dep hashes for future verification |
-| **recover()** | constructive trace recovery (BSàlC CT) | Find historical trace with matching deps to reuse its result |
+| **recovery()** | constructive trace recovery (BSàlC CT) | Find historical trace with matching deps to reuse its result |
 | **verifyTrace()** | verify all deps in a trace (BSàlC) | Validate every dep hash in a trace against current state |
 | **TraceStore** | trace store (BSàlC) | Persistent database of recorded traces |
 | **TraceCache** | trace-based incremental cache | Cache implemented via constructive traces |
@@ -169,14 +169,14 @@ TracedExpr thunks                                [trace-cache.cc]
   GC-allocated Expr subclass. eval() dispatches:
   +-- Verify path: DB lookup → dep validation → result decode
   +-- Fresh eval path: navigateToReal → forceValue → DependencyTracker → record
-  +-- Recovery: 3-phase trace hash / identity-aware / structural variant
+  +-- Recovery: direct hash / structural variant
   |
   v
 TraceStore                                      [trace-store.cc]
   SQLite backend. Single database at ~/.cache/nix/eval-trace-v1.sqlite.
   +-- verify():       SELECT → verifyTrace → decode CachedResult
   +-- record():       INSERT/UPSERT → trace + recovery index writes
-  +-- recover():      3-phase lookup in TraceHistory
+  +-- recovery():     direct hash + structural variant lookup in TraceHistory
   +-- verifyTrace():  validate all deps in a trace against current state
   |
   +=============================================+
@@ -280,7 +280,7 @@ system calls for unchanged files.
 
 Parent context is critical for recovery correctness. When a child attribute has
 the same deps across two evaluations but its parent has changed, the child's
-result may differ. To disambiguate, Phase 1 recovery uses **parent Merkle
+result may differ. To disambiguate, direct hash recovery uses **parent Merkle
 chaining**: the parent's `trace_hash` is mixed into the child's recovery lookup
 key via `computeTraceHashWithParentFromSorted()`. This is analogous to Salsa's
 versioned query with context — the same function with different argument versions
@@ -396,7 +396,7 @@ with the same result share a single Results row.
 **Traces** stores deduplicated dependency traces (BSàlC constructive traces),
 keyed by `trace_hash` (SHA-256 of the full dep content including hash values).
 The `struct_hash` captures the structural signature (dep types + sources + keys,
-without hash values) for Phase 3 structural variant recovery. The `deps_blob`
+without hash values) for structural variant recovery. The `deps_blob`
 stores delta-encoded dependency entries as a compact BLOB, with `base_trace_id`
 pointing to a base trace for delta chain resolution.
 
@@ -559,7 +559,7 @@ key advantage of a constructive trace (BSàlC CT) over a verifying trace (VT):
 the CT stores full results, enabling recovery without re-evaluation.
 
 ```
-Phase 1: Direct hash recovery (with Salsa-style parent chaining)  [O(1)]
+Direct hash recovery (with Salsa-style parent Merkle chaining)    [O(1)]
   Recompute current dep hashes from old trace's dep keys
   If parentTraceIdHint available:
     Get parent's trace_hash → mix into child trace_hash (Merkle chaining)
@@ -570,24 +570,24 @@ Phase 1: Direct hash recovery (with Salsa-style parent chaining)  [O(1)]
   Point lookup in Traces table by trace_hash → candidate trace
   Verify candidate → if valid, update CurrentTraces and serve
 
-Phase 3: Structural variant recovery (novel, beyond BSàlC)        [O(V)]
+Structural variant recovery (novel, beyond BSàlC)                 [O(V)]
   Scan TraceHistory for same (context_hash, attr_path_id)
   Group by struct_hash — returns representative traces for each unique
   dep KEY structure (types + sources + keys, without hash values)
   For each representative: load its deps, recompute current hashes
-    Retry Phase 1 lookup with recomputed hashes
+    Retry direct hash lookup with recomputed hashes
   Handles dep structure instability (dynamic deps — different deps across
   fresh evaluations depending on evaluation order, per Shake)
 ```
 
 Recovery is particularly effective for file reverts: reverting a file to a previous
-state produces the same dep hashes, and Phase 1 finds the matching candidate in
-O(1). This is a direct consequence of the constructive trace property — the
+state produces the same dep hashes, and direct hash recovery finds the matching
+candidate in O(1). This is a direct consequence of the constructive trace property — the
 historical result is stored and can be served immediately.
 
 ### 6.4 Parent Merkle Chaining (Salsa Versioned Query)
 
-Phase 1 recovery uses `computeTraceHashWithParentFromSorted()` to mix the parent's
+Direct hash recovery uses `computeTraceHashWithParentFromSorted()` to mix the parent's
 `trace_hash` into the child's recovery lookup key. This creates a Merkle chain:
 
 ```
@@ -701,9 +701,9 @@ modifications to the evaluated file or expression.
 
 5. **Dynamic dep instability.** Like Shake, dependencies are discovered during
    evaluation and can vary between evaluations of the same attribute (e.g.,
-   depending on whether a root file is already cached). This means hash-based
-   recovery (Phases 1–2) cannot be the sole mechanism — Phase 3 structural
-   variant recovery is needed as a fallback.
+   depending on whether a root file is already cached). This means direct hash
+   recovery cannot be the sole mechanism — structural variant recovery is needed
+   as a fallback.
 
 6. **Symlinks not tracked.** Intermediate symlink targets are not recorded as deps.
    Changes to a symlink target without changing the resolved file will not

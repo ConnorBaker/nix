@@ -46,7 +46,7 @@ struct TraceStore {
         SQLiteStmt lookupResultByHash;
         SQLiteStmt getResult;
 
-        // Traces (delta-encoded with base_id chain, BLOB storage)
+        // Traces (delta-encoded with base_trace_id chain, BLOB storage)
         SQLiteStmt insertTrace;
         SQLiteStmt lookupTraceByFullHash;
         SQLiteStmt getTraceInfo;
@@ -168,16 +168,16 @@ struct TraceStore {
      * a constructive trace over a verifying trace: stored results enable recovery
      * without re-evaluation.
      *
-     * Two-phase recovery:
-     *   Phase 1 — Direct hash lookup: compute trace_hash from current dep hashes
-     *     (with optional parent Merkle chaining via parentTraceIdHint), look up
-     *     in Traces table. O(1). Handles file reverts and same-structure changes.
-     *   Phase 3 — Structural variant scan: scan TraceHistory for entries with the
-     *     same (context_hash, attr_path_id), group by struct_hash, recompute
-     *     current dep hashes for each structural variant, retry Phase 1 lookup.
+     * Two-strategy recovery:
+     *   Direct hash recovery: compute trace_hash from current dep hashes (with
+     *     optional parent Merkle chaining via parentTraceIdHint), look up in
+     *     Traces table. O(1). Handles file reverts and same-structure changes.
+     *   Structural variant recovery: scan TraceHistory for entries with the same
+     *     (context_hash, attr_path_id), group by struct_hash, recompute current
+     *     dep hashes for each structural variant, retry direct hash lookup.
      *     O(V) where V = number of distinct dep structures. Handles dynamic dep
-     *     instability (Shake-style: deps vary between evaluations). Novel extension
-     *     beyond BSàlC's taxonomy.
+     *     instability (Shake-style: deps vary between evaluations). Novel
+     *     extension beyond BSàlC's taxonomy.
      */
     std::optional<VerifyResult> recovery(
         TraceId oldTraceId,

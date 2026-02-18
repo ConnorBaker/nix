@@ -73,4 +73,22 @@ extern Counter nrVerificationsFailed;
 extern Counter nrDepsChecked;
 extern Counter nrRecoveryFailures;
 
+// Timing accumulators (microseconds, gated on Counter::enabled)
+extern Counter nrVerifyTimeUs;
+extern Counter nrVerifyTraceTimeUs;
+extern Counter nrRecoveryTimeUs;
+extern Counter nrRecoveryDirectHashTimeUs;
+extern Counter nrRecoveryStructVariantTimeUs;
+extern Counter nrRecordTimeUs;
+extern Counter nrLoadTraceTimeUs;
+extern Counter nrDbInitTimeUs;
+extern Counter nrDbCloseTimeUs;
+
+// Event counters
+extern Counter nrRecoveryAttempts;
+extern Counter nrRecoveryDirectHashHits;
+extern Counter nrRecoveryStructVariantHits;
+extern Counter nrRecords;
+extern Counter nrLoadTraces;
+
 } // namespace nix::eval_trace

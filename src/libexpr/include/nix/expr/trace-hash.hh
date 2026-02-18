@@ -33,11 +33,11 @@ Hash computeTraceHash(const std::vector<Dep> & deps);
  * dependency graph without its content (Adapton: the structure of a
  * demanded computation graph (DCG) node, ignoring computed values).
  *
- * Used for structural-group constructive recovery (Phase 3): traces are
- * grouped by structural hash so that when a trace hash miss occurs, we can
- * scan only structurally-equivalent traces and recompute their trace hashes
- * against current dep values (BSàlC §3.4, constructive traces with
- * structural equivalence classes).
+ * Used for structural variant recovery: traces are grouped by structural
+ * hash so that when a trace hash miss occurs, we can scan only
+ * structurally-equivalent traces and recompute their trace hashes against
+ * current dep values (BSàlC §3.4, constructive traces with structural
+ * equivalence classes).
  */
 Hash computeTraceStructHash(const std::vector<Dep> & deps);
 
@@ -47,10 +47,10 @@ Hash computeTraceStructHash(const std::vector<Dep> & deps);
  * parent hash is domain-separated ("P" prefix + 32-byte hash) and appended
  * to the dep-hash stream.
  *
- * Used for parent-aware constructive recovery within Phase 1: when a plain
- * trace hash lookup is ambiguous (e.g., multiple traces share an empty dep
- * list), incorporating the parent's identity disambiguates which historical
- * trace corresponds to the current evaluation context.
+ * Used for parent-aware direct hash recovery: when a plain trace hash
+ * lookup is ambiguous (e.g., multiple traces share an empty dep list),
+ * incorporating the parent's identity disambiguates which historical trace
+ * corresponds to the current evaluation context.
  */
 Hash computeTraceHashWithParent(
     const std::vector<Dep> & deps,

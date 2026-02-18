@@ -125,7 +125,7 @@ serialization, and includes all C++ unit tests.
   - Two-object trace model documentation
 - `src/libexpr/trace-cache-store.cc` (603 lines)
   - `record()` (BSàlC trace recording), `verify()` (BSàlC VT check),
-    `recover()` (BSàlC constructive recovery) with 3 phases
+    `recovery()` (BSàlC constructive recovery) with direct hash + structural variant strategies
   - `storeTrace()`, `loadTrace()`, `loadDepsForTrace()`
 - `src/libexpr/include/nix/expr/eval-index-db.hh` (142 lines)
   - `EvalIndexDb`: SQLite index with 3 tables
@@ -242,7 +242,7 @@ Checklist of items to consider before upstreaming:
   dependency-tracker.cc as an anonymous namespace implementation detail.
 
 - [x] **trace-cache-store.cc (603 lines)**: `record()` (~100 lines, BSàlC CT
-  recording), `verify()` (~60 lines, BSàlC VT check), `recover()` (~150 lines,
+  recording), `verify()` (~60 lines, BSàlC VT check), `recovery()` (~150 lines,
   BSàlC constructive recovery), trace I/O (~100 lines),
   `storeTrace()`/`loadTrace()` (~80 lines). Well-structured with clear section
   headers. Acceptable as-is.
@@ -433,7 +433,8 @@ nix develop --command bash -c "meson test -C build --suite ca"
 
 4. **`trace-cache-store.hh/cc`** -- Trace store backend (BSàlC trace store).
    `record()` (trace recording) and `verify()` (verifying trace check) are the
-   two main flows. `recover()` implements three-phase constructive recovery.
+   two main flows. `recovery()` implements constructive recovery via direct hash
+   lookup and structural variant scan.
 
 5. **`trace-hash.hh/cc`** -- CBOR format. Straightforward serialization of
    `EvalTrace` structs (BSàlC trace = key + dep hashes + result).
@@ -501,8 +502,8 @@ a quick mapping from our implementation to prior art concepts:
 | `SuspendDepTracking` | Adapton selective tracking (avoid "fat parent" deps) | -- |
 | `record()` in TraceStore | BSàlC constructive trace recording | Mokhov et al. 2020, Definition 5 |
 | `verify()` in TraceStore | BSàlC verifying trace check | Mokhov et al. 2020, Definition 3 |
-| `recover()` Phase 1+2 | BSàlC constructive recovery with Salsa-style versioning | Mokhov et al. 2020, Def 5; Salsa |
-| `recover()` Phase 3 | Structural variant recovery (novel extension) | -- |
+| `recovery()` direct hash | BSàlC constructive recovery with Salsa-style parent Merkle chaining | Mokhov et al. 2020, Def 5; Salsa |
+| `recovery()` structural variant | Structural variant recovery (novel extension) | -- |
 | Epoch-based staleness | Salsa revision counter | Matsakis et al. |
 | Dynamic dep recording | Shake dynamic dependencies | Mitchell 2012, Section 3 |
 | `replayTrace()` | Adapton change propagation | Hammer et al. 2014, Section 4 |

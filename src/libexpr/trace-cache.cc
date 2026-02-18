@@ -19,6 +19,24 @@ Counter nrVerificationsFailed;
 Counter nrDepsChecked;
 Counter nrRecoveryFailures;
 
+// Timing accumulators (microseconds)
+Counter nrVerifyTimeUs;
+Counter nrVerifyTraceTimeUs;
+Counter nrRecoveryTimeUs;
+Counter nrRecoveryDirectHashTimeUs;
+Counter nrRecoveryStructVariantTimeUs;
+Counter nrRecordTimeUs;
+Counter nrLoadTraceTimeUs;
+Counter nrDbInitTimeUs;
+Counter nrDbCloseTimeUs;
+
+// Event counters
+Counter nrRecoveryAttempts;
+Counter nrRecoveryDirectHashHits;
+Counter nrRecoveryStructVariantHits;
+Counter nrRecords;
+Counter nrLoadTraces;
+
 // ── TracedExpr struct definition ─────────────────────────────────────
 
 /**

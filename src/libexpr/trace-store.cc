@@ -11,12 +11,28 @@
 #include "nix/util/source-accessor.hh"
 #include "nix/fetchers/fetchers.hh"
 
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <tuple>
 #include <unordered_set>
 
 namespace nix::eval_trace {
+
+// ── Timing helpers (no-op when NIX_SHOW_STATS is unset) ──────────────
+
+static auto timerStart()
+{
+    return Counter::enabled ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+}
+
+static uint64_t elapsedUs(std::chrono::steady_clock::time_point start)
+{
+    if (!Counter::enabled) return 0;
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count();
+}
 
 // ── Trace verification helpers (BSàlC verifying trace check) ─────────
 
@@ -321,6 +337,7 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
     : symbols(symbols)
     , contextHash(contextHash)
 {
+    auto initStart = timerStart();
     auto state = std::make_unique<Sync<State>>();
     auto st(state->lock());
 
@@ -382,7 +399,7 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
     st->updateTraceBlob.create(st->db,
         "UPDATE Traces SET base_trace_id = ?, deps_blob = ? WHERE id = ?");
 
-    // Attrs (JOIN with Results to get result fields)
+    // CurrentTraces (JOIN with Results to get result fields)
     st->lookupAttr.create(st->db,
         "SELECT a.trace_id, a.result_id, r.type, r.value, r.context "
         "FROM CurrentTraces a JOIN Results r ON a.result_id = r.id "
@@ -447,10 +464,12 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
     }
 
     _state = std::move(state);
+    nrDbInitTimeUs += elapsedUs(initStart);
 }
 
 TraceStore::~TraceStore()
 {
+    auto closeStart = timerStart();
     // Flush dirty stat-hash entries back to SQLite
     try {
         auto st(_state->lock());
@@ -481,6 +500,7 @@ TraceStore::~TraceStore()
     } catch (...) {
         ignoreExceptionExceptInterrupt();
     }
+    nrDbCloseTimeUs += elapsedUs(closeStart);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -775,6 +795,9 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
     if (cacheIt != traceCache.end())
         return cacheIt->second;
 
+    auto loadStart = timerStart();
+    nrLoadTraces++;
+
     // Walk up the base_trace_id chain to find nearest cached ancestor or root
     std::vector<TraceId> chainToApply;
     TraceId currentId = traceId;
@@ -816,6 +839,7 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
         result.push_back(dep);
 
     traceCache[traceId] = result;
+    nrLoadTraceTimeUs += elapsedUs(loadStart);
     return result;
 }
 
@@ -870,20 +894,20 @@ TraceId TraceStore::getOrCreateTrace(
         use.exec();
     }
 
-    // Get the set_id
-    TraceId setId;
+    // Get the trace ID
+    TraceId newTraceId;
     {
         auto use(st->lookupTraceByFullHash.use());
         bindRawHash(use, traceHash);
         if (!use.next())
             throw Error("failed to retrieve trace after insert");
-        setId = use.getInt(0);
+        newTraceId = use.getInt(0);
     }
 
     // Track as dirty for post-write optimization
-    dirtyTraceIds.insert(setId);
+    dirtyTraceIds.insert(newTraceId);
 
-    return setId;
+    return newTraceId;
 }
 
 // ── Trace verification (BSàlC VT check) ─────────────────────────────
@@ -895,6 +919,8 @@ bool TraceStore::verifyTrace(
 {
     if (verifiedTraceIds.count(traceId))
         return true;
+
+    auto vtStart = timerStart();
 
     // Load the FULL trace (base chain already resolved)
     auto fullDeps = loadFullTrace(traceId);
@@ -931,6 +957,7 @@ bool TraceStore::verifyTrace(
     if (allValid) {
         verifiedTraceIds.insert(traceId);
     }
+    nrVerifyTraceTimeUs += elapsedUs(vtStart);
     return allValid;
 }
 
@@ -983,6 +1010,9 @@ TraceStore::RecordResult TraceStore::record(
     std::optional<TraceId> parentTraceId,
     bool isRoot)
 {
+    auto recordStart = timerStart();
+    nrRecords++;
+
     // 1. Filter deps: remove ParentContext
     std::vector<Dep> storedDeps;
     for (auto & dep : allDeps) {
@@ -1019,7 +1049,7 @@ TraceStore::RecordResult TraceStore::record(
         traceHash = computeTraceHashFromSorted(fullDeps);
     }
 
-    // 5. Compute struct_hash from FULL deps (for delta encoding + Phase 3 constructive recovery)
+    // 5. Compute struct_hash from FULL deps (for delta encoding + structural variant recovery)
     auto structHash = computeTraceStructHashFromSorted(fullDeps);
 
     // 6. Find struct-hash-based base for delta encoding
@@ -1075,6 +1105,7 @@ TraceStore::RecordResult TraceStore::record(
     traceStructHashCache.insert_or_assign(traceId, structHash);
     traceCache[traceId] = fullDeps;
 
+    nrRecordTimeUs += elapsedUs(recordStart);
     return RecordResult{traceId};
 }
 
@@ -1086,26 +1117,33 @@ std::optional<TraceStore::VerifyResult> TraceStore::verify(
     EvalState & state,
     std::optional<TraceId> parentTraceIdHint)
 {
+    auto verifyStart = timerStart();
+
     // 1. Lookup attribute
     auto row = lookupTraceRow(attrPath);
-    if (!row)
+    if (!row) {
+        nrVerifyTimeUs += elapsedUs(verifyStart);
         return std::nullopt;
+    }
 
     nrTraceVerifications++;
 
     // 2. Verify trace (batch mode: computes all hashes, caches them)
     if (verifyTrace(row->traceId, inputAccessors, state)) {
         nrVerificationsPassed++;
+        nrVerifyTimeUs += elapsedUs(verifyStart);
         return VerifyResult{decodeCachedResult(*row), row->traceId};
     }
 
     // 3. Verification failed → constructive recovery (uses currentDepHashes)
     debug("verify: trace validation failed for '%s', attempting constructive recovery", std::string(attrPath));
-    return recovery(row->traceId, attrPath, inputAccessors, state, parentTraceIdHint);
+    auto result = recovery(row->traceId, attrPath, inputAccessors, state, parentTraceIdHint);
+    nrVerifyTimeUs += elapsedUs(verifyStart);
+    return result;
 }
 
 // ── Recovery (BSàlC constructive trace recovery) ─────────────────────
-//    Two-phase: direct hash lookup + structural scan
+//    Two-phase: direct hash recovery + structural variant recovery
 
 std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     TraceId oldTraceId,
@@ -1114,6 +1152,9 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     EvalState & state,
     std::optional<TraceId> parentTraceIdHint)
 {
+    auto recoveryStart = timerStart();
+    nrRecoveryAttempts++;
+
     // Load old trace's full deps
     auto oldDeps = loadFullTrace(oldTraceId);
 
@@ -1121,6 +1162,8 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     for (auto & dep : oldDeps) {
         if (dep.type == DepType::CurrentTime || dep.type == DepType::Exec) {
             debug("recovery: aborting for '%s' -- contains volatile dep", attrPath);
+            nrRecoveryFailures++;
+            nrRecoveryTimeUs += elapsedUs(recoveryStart);
             return std::nullopt;
         }
     }
@@ -1169,6 +1212,8 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     }
     if (!attrPathId) {
         debug("recovery: attr path not interned for '%s'", attrPath);
+        nrRecoveryFailures++;
+        nrRecoveryTimeUs += elapsedUs(recoveryStart);
         return std::nullopt;
     }
 
@@ -1220,11 +1265,12 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         return VerifyResult{decodeCachedResult(recRow), candidateTraceId};
     };
 
-    // === Phase 1: Direct trace_hash lookup (BSàlC CT, with Salsa-style parent chaining) ===
-    // When parentTraceIdHint is available, the trace_hash includes the parent's
-    // trace_hash (Merkle chaining), disambiguating child traces across different
-    // parent versions. Analogous to Salsa's versioned query with context.
+    // === Direct hash recovery (BSàlC CT, with Salsa-style parent Merkle chaining) ===
+    // Recompute trace_hash from current dep hashes. When parentTraceIdHint is
+    // available, the parent's trace_hash is mixed in (Merkle chaining),
+    // disambiguating child traces across different parent versions. O(1) lookup.
     if (allComputable) {
+        auto directHashStart = timerStart();
         auto sortedCurrentDeps = sortAndDedupDeps(currentDeps);
         Hash newFullHash(HashAlgorithm::BLAKE3);
         if (parentTraceIdHint) {
@@ -1246,17 +1292,23 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
         if (newTraceId) {
             if (auto r = tryCandidate(*newTraceId)) {
-                debug("recovery: Phase 1 succeeded for '%s'", attrPath);
+                debug("recovery: direct hash recovery succeeded for '%s'", attrPath);
+                nrRecoveryDirectHashHits++;
+                nrRecoveryDirectHashTimeUs += elapsedUs(directHashStart);
+                nrRecoveryTimeUs += elapsedUs(recoveryStart);
                 return r;
             }
         }
+        nrRecoveryDirectHashTimeUs += elapsedUs(directHashStart);
     }
 
-    // === Phase 3: Structural variant scanning (novel extension beyond BSàlC) ===
+    // === Structural variant recovery (novel extension beyond BSàlC) ===
     // Handles dynamic dep instability (Shake-style): the same attribute can have
     // different dep structures across evaluations. Scans TraceHistory for entries
     // with the same attr, groups by struct_hash (dep types + sources + keys,
-    // ignoring hash values), recomputes current hashes per group, retries Phase 1.
+    // ignoring hash values), recomputes current hashes per group, retries direct
+    // hash lookup. O(V) where V = number of distinct dep structures.
+    auto structVariantStart = timerStart();
     struct HistoryEntry {
         Hash structHash;
         TraceId traceId;
@@ -1276,7 +1328,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         }
     }
 
-    debug("recovery: Phase 3 for '%s' -- scanning %d history entries",
+    debug("recovery: structural variant scan for '%s' -- scanning %d history entries",
           attrPath, historyEntries.size());
 
     // Group by struct_hash, pick one representative per group
@@ -1345,13 +1397,19 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
         if (candidateTraceId) {
             if (auto r = tryCandidate(*candidateTraceId)) {
-                debug("recovery: Phase 3 succeeded for '%s'", attrPath);
+                debug("recovery: structural variant recovery succeeded for '%s'", attrPath);
+                nrRecoveryStructVariantHits++;
+                nrRecoveryStructVariantTimeUs += elapsedUs(structVariantStart);
+                nrRecoveryTimeUs += elapsedUs(recoveryStart);
                 return r;
             }
         }
     }
+    nrRecoveryStructVariantTimeUs += elapsedUs(structVariantStart);
 
-    debug("recovery: all phases failed for '%s'", attrPath);
+    debug("recovery: all strategies failed for '%s'", attrPath);
+    nrRecoveryFailures++;
+    nrRecoveryTimeUs += elapsedUs(recoveryStart);
     return std::nullopt;
 }
 

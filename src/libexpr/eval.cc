@@ -3088,14 +3088,44 @@ void EvalState::printStatistics()
     topObj["nrLookups"] = nrLookups.load();
     topObj["nrPrimOpCalls"] = nrPrimOpCalls.load();
     topObj["nrFunctionCalls"] = nrFunctionCalls.load();
-    topObj["evalCache"] = {
+    topObj["evalTrace"] = {
+        {"db", {
+            {"closeTimeUs", eval_trace::nrDbCloseTimeUs.load()},
+            {"initTimeUs", eval_trace::nrDbInitTimeUs.load()},
+        }},
         {"hits", eval_trace::nrTraceCacheHits.load()},
+        {"loadTrace", {
+            {"count", eval_trace::nrLoadTraces.load()},
+            {"timeUs", eval_trace::nrLoadTraceTimeUs.load()},
+        }},
         {"misses", eval_trace::nrTraceCacheMisses.load()},
-        {"depValidations", eval_trace::nrTraceVerifications.load()},
-        {"depValidationsPassed", eval_trace::nrVerificationsPassed.load()},
-        {"depValidationsFailed", eval_trace::nrVerificationsFailed.load()},
-        {"depsChecked", eval_trace::nrDepsChecked.load()},
-        {"verificationFailures", eval_trace::nrRecoveryFailures.load()},
+        {"record", {
+            {"count", eval_trace::nrRecords.load()},
+            {"timeUs", eval_trace::nrRecordTimeUs.load()},
+        }},
+        {"recovery", {
+            {"attempts", eval_trace::nrRecoveryAttempts.load()},
+            {"directHash", {
+                {"hits", eval_trace::nrRecoveryDirectHashHits.load()},
+                {"timeUs", eval_trace::nrRecoveryDirectHashTimeUs.load()},
+            }},
+            {"failures", eval_trace::nrRecoveryFailures.load()},
+            {"structVariant", {
+                {"hits", eval_trace::nrRecoveryStructVariantHits.load()},
+                {"timeUs", eval_trace::nrRecoveryStructVariantTimeUs.load()},
+            }},
+            {"timeUs", eval_trace::nrRecoveryTimeUs.load()},
+        }},
+        {"verify", {
+            {"count", eval_trace::nrTraceVerifications.load()},
+            {"depsChecked", eval_trace::nrDepsChecked.load()},
+            {"failed", eval_trace::nrVerificationsFailed.load()},
+            {"passed", eval_trace::nrVerificationsPassed.load()},
+            {"timeUs", eval_trace::nrVerifyTimeUs.load()},
+        }},
+        {"verifyTrace", {
+            {"timeUs", eval_trace::nrVerifyTraceTimeUs.load()},
+        }},
     };
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {

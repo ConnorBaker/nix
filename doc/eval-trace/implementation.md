@@ -325,10 +325,13 @@ new data). `parent_epoch` stores the parent's epoch at recording time.
 revision counter -- that detects parent staleness without traversing the dep
 graph.
 
-**6. Merkle identity hash for Phase 2 constructive recovery.**
+**6. Merkle identity hash for parent-aware constructive recovery.**
+*(Historical note: this was originally called "Phase 2 identity-aware recovery"
+and was subsequently simplified into the parent Merkle chaining used by direct
+hash recovery.)*
 `computeIdentityHash(attrId)` = `hash("V" + valueHash + "D" + traceHash +
 "P" + parentIdentityHash)`. This replaces the dep hash as the parent identity
-in Phase 2 recovery keys. It is analogous to Salsa's versioned query with
+in parent-aware recovery keys. It is analogous to Salsa's versioned query with
 context -- the identity includes both the local computation and the full
 ancestor chain. It correctly handles edge cases that a plain trace hash alone
 cannot:
@@ -358,12 +361,12 @@ trace ID. When a parent's value changes but it has zero deps, child
 verification incorrectly passed because `base_trace_id` matched (same empty
 trace). Fix: epoch mechanism (Salsa revision counter, described above).
 
-*Bug B: Epoch breaks Phase 2 constructive recovery.*
+*Bug B: Epoch breaks parent-aware constructive recovery.*
 Epochs only increment -- they are not reproducible across sessions (unlike
 Salsa's revision counter, which is deterministic). When a root attribute is
-recovered and UPSERTed (epoch increments), Phase 2 recovery entries stored with
-old epochs never match. Fix: Merkle identity hash (described above) replaces
-epoch in recovery keys -- it is reproducible (same state produces the same hash).
+recovered and UPSERTed (epoch increments), recovery entries stored with old
+epochs never match. Fix: Merkle identity hash (described above) replaces epoch
+in recovery keys -- it is reproducible (same state produces the same hash).
 
 *Bug C: Parent value hash fails for FullAttrs.*
 FullAttrs encodes only child names, not child values. Two attrsets with the
@@ -373,7 +376,7 @@ through the entire tree.
 
 *Bug D: computeIdentityHash deadlocks in record.*
 `record()` holds `_state->lock()`, then calls `computeIdentityHash()` which
-tries to acquire the same non-recursive lock. Fix: compute the Phase 2 hash
+tries to acquire the same non-recursive lock. Fix: compute the identity hash
 outside the lock scope.
 
 ---
@@ -606,13 +609,14 @@ For each dep (sorted by type, source, key):
   sink("H")  hashDepValue(sink, dep.expectedHash)
 ```
 
-Three hash variants correspond to the three constructive recovery phases
+Three hash variants serve the two constructive recovery strategies
 (BSàlC CT recovery pipeline):
-- `computeTraceHash`: deps only (Phase 1 direct hash recovery key)
-- `computeTraceHashWithParent`: deps + "P" + parent identity hash (Phase 2
-  identity-aware recovery, analogous to Salsa versioned query with context)
-- `computeTraceStructHash`: dep keys only, no hashes (Phase 3 structural
-  variant recovery grouping key -- handles Shake-style dynamic dep instability)
+- `computeTraceHash`: deps only (direct hash recovery key)
+- `computeTraceHashWithParent`: deps + "P" + parent trace hash (direct hash
+  recovery with parent Merkle chaining, analogous to Salsa versioned query
+  with context — used when parentTraceIdHint is available)
+- `computeTraceStructHash`: dep keys only, no hashes (structural variant
+  recovery grouping key — handles Shake-style dynamic dep instability)
 
 ### 3.5 Deferred Write Pattern (trace-cache-store.cc) -- Removed in Phase 12
 
@@ -921,8 +925,8 @@ The trace for an attribute can have different structure across fresh evaluations
 depending on evaluation order. This is a direct consequence of Shake-style
 dynamic dependency discovery -- the dep set is not statically determined. This
 broke hash-based constructive recovery (which assumed identical structure ->
-identical hash) and required adding Phase 3 structural variant recovery as a
-fallback (scanning TraceHistory for traces with matching structural signatures).
+identical hash) and required adding structural variant recovery as a fallback
+(scanning TraceHistory for traces with matching structural signatures).
 
 ### 5.2 Forgetting Value* Aliasing
 

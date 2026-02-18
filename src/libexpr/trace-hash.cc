@@ -64,7 +64,7 @@ Hash computeTraceHashWithParentFromSorted(
     HashSink sink(HashAlgorithm::BLAKE3);
     for (auto & dep : sortedDeps)
         feedDepToSink(sink, dep, true);
-    // Domain-separated parent Merkle chaining (Salsa versioned query context for Phase 1 recovery)
+    // Domain-separated parent Merkle chaining (Salsa versioned query context for direct hash recovery)
     sink(std::string_view("P", 1));
     auto parentHex = parentDepContentHash.to_string(HashFormat::Base16, false);
     sink(parentHex);
