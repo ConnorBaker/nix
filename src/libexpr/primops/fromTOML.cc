@@ -118,7 +118,7 @@ struct TomlDataNode : TracedDataNode {
         return Kind::Null;
     }
 
-    char formatTag() const override { return 't'; }
+    StructuredFormat formatTag() const override { return StructuredFormat::Toml; }
 
     std::vector<std::string> objectKeys() const override {
         std::vector<std::string> keys;

@@ -723,9 +723,13 @@ void TracedExpr::verifyAgainstFresh(const CachedResult & cachedResult, TraceId c
             try {
                 auto deps = cache->dbBackend->loadFullTrace(cachedTraceId);
                 msg += fmt("\n  trace_id=%d, dep_count=%d\n  deps:", cachedTraceId, deps.size());
-                for (auto & dep : deps)
-                    msg += fmt("\n    [%s] source=\"%s\" key=\"%s\"",
-                        depTypeName(dep.type), dep.source, dep.key);
+                for (auto & dep : deps) {
+                    auto displayKey = dep.type == DepType::StructuredContent
+                        ? formatStructuredDepKey(dep.key) : dep.key;
+                    msg += fmt("\n    [%s (%s)] source=\"%s\" key=\"%s\"",
+                        depTypeName(dep.type), depKindName(depKind(dep.type)),
+                        dep.source, displayKey);
+                }
             } catch (...) {}
 
             throw Error(msg);
@@ -753,9 +757,13 @@ void TracedExpr::verifyAgainstFresh(const CachedResult & cachedResult, TraceId c
         try {
             auto deps = cache->dbBackend->loadFullTrace(cachedTraceId);
             msg += fmt("\n  trace_id=%d, dep_count=%d\n  deps:", cachedTraceId, deps.size());
-            for (auto & dep : deps)
-                msg += fmt("\n    [%s] source=\"%s\" key=\"%s\"",
-                    depTypeName(dep.type), dep.source, dep.key);
+            for (auto & dep : deps) {
+                auto displayKey = dep.type == DepType::StructuredContent
+                    ? formatStructuredDepKey(dep.key) : dep.key;
+                msg += fmt("\n    [%s (%s)] source=\"%s\" key=\"%s\"",
+                    depTypeName(dep.type), depKindName(depKind(dep.type)),
+                    dep.source, displayKey);
+            }
         } catch (...) {}
 
         throw Error(msg);

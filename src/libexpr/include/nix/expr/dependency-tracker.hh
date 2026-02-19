@@ -224,7 +224,7 @@ struct TracedContainerProvenance {
     std::string depSource;
     std::string depKey;
     std::string dataPath;
-    char formatTag;
+    StructuredFormat format;
 };
 
 /**

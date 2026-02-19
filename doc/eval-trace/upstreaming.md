@@ -36,8 +36,10 @@ independently.
 
 **New files:**
 - `src/libexpr/include/nix/expr/eval-trace-deps.hh` (header-only)
-  - `DepType` enum (12 types), `Dep` struct, `Blake3Hash` struct
-  - `DepHashValue` variant, `DepKey` dedup key, inline `depTypeName()`
+  - `DepType` enum (12 types), `DepKind` enum, `Dep` struct, `Blake3Hash` struct
+  - `DepHashValue` variant, `DepKey` dedup key, `StructuredFormat`, `ShapeSuffix`
+  - Inline helpers: `depTypeName()`, `depKind()`, `depKindName()`, `isVolatile()`,
+    `isContentOverrideable()`, `buildStructuredDepKey()`, `formatStructuredDepKey()`
 - `src/libexpr/include/nix/expr/dependency-tracker.hh`
   - `DependencyTracker` RAII tracker (Adapton DDG builder), `SuspendDepTracking`
   - `depHash*` functions, `recordDep`, `resolveToInput`

@@ -1141,7 +1141,7 @@ The benchmark findings point to three concrete optimization opportunities:
 
 | File | Description |
 |------|-------------|
-| `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange` (header-only, includes inline `depTypeName()`) |
+| `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `DepKind`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange`, `StructuredFormat`, `ShapeSuffix` (header-only, includes inline helpers: `depTypeName()`, `depKind()`, `depKindName()`, `isVolatile()`, `isContentOverrideable()`, `buildStructuredDepKey()`, `formatStructuredDepKey()`, etc.) |
 | `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker`, `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance` |
 | `src/libexpr/dependency-tracker.cc` | DependencyTracker implementation, dep hash functions, `resolveToInput`, `recordDep`, internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore), provenance threading |
 | `src/libexpr/include/nix/expr/eval-trace-context.hh` | `EvalTraceContext` struct (EvalState integration) |
@@ -1173,7 +1173,7 @@ tracker.hh                   store.hh    cache.hh
 eval-trace-                  trace-hash.hh
 context.hh
 
-traced-data.hh  (standalone — depends on eval-gc.hh, nixexpr.hh)
+traced-data.hh  (depends on eval-gc.hh, nixexpr.hh, eval-trace-deps.hh)
 ```
 
 ### Tests

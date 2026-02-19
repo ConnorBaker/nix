@@ -2,6 +2,7 @@
 ///@file
 
 #include "nix/expr/eval-gc.hh"
+#include "nix/expr/eval-trace-deps.hh"
 #include "nix/expr/nixexpr.hh"
 
 #include <string>
@@ -13,8 +14,8 @@ class EvalState;
 struct Value;
 
 /**
- * Virtual interface for a node in a parsed data tree (JSON or TOML).
- * Format-agnostic: JsonDataNode and TomlDataNode implement this.
+ * Virtual interface for a node in a parsed data tree (JSON, TOML, or directory listing).
+ * Format-agnostic: JsonDataNode, TomlDataNode, and DirDataNode implement this.
  * GC-allocated (inherits from gc, not gc_cleanup — std::string members
  * and backing DOM data leak when GC collects, bounded by file size).
  */
@@ -24,8 +25,8 @@ struct TracedDataNode : gc {
     virtual ~TracedDataNode() = default;
     virtual Kind kind() const = 0;
 
-    /** Format tag: 'j' for JSON, 't' for TOML. Embedded in dep keys. */
-    virtual char formatTag() const = 0;
+    /** Format tag identifying the data source type. Embedded in dep keys. */
+    virtual StructuredFormat formatTag() const = 0;
 
     /** Object keys (only valid when kind() == Object). */
     virtual std::vector<std::string> objectKeys() const = 0;

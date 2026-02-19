@@ -265,25 +265,15 @@ static std::optional<DepHashValue> computeCurrentHash(
         }
     }
     case DepType::StructuredContent: {
-        // Key format: "filepath\tf:datapath" (tab separator)
+        // Key format: "filepath\tf:datapath[#suffix]" (tab separator)
         auto sep = dep.key.find('\t');
         if (sep == std::string::npos || sep + 2 >= dep.key.size())
             return std::nullopt;
-        char format = dep.key[sep + 1];
-        if (dep.key[sep + 2] != ':')
+        auto format = parseStructuredFormat(dep.key[sep + 1]);
+        if (!format || dep.key[sep + 2] != ':')
             return std::nullopt;
         std::string filePath = dep.key.substr(0, sep);
-        std::string dataPath = dep.key.substr(sep + 3);
-
-        // Check for shape suffix (#len or #keys)
-        std::string shapeSuffix;
-        if (dataPath.size() >= 4 && dataPath.compare(dataPath.size() - 4, 4, "#len") == 0) {
-            shapeSuffix = "len";
-            dataPath.resize(dataPath.size() - 4);
-        } else if (dataPath.size() >= 5 && dataPath.compare(dataPath.size() - 5, 5, "#keys") == 0) {
-            shapeSuffix = "keys";
-            dataPath.resize(dataPath.size() - 5);
-        }
+        auto [dataPath, shape] = parseShapeSuffix(dep.key.substr(sep + 3));
 
         // Construct a synthetic Content dep to resolve the file path
         Dep fileDep{dep.source, filePath, DepHashValue{Blake3Hash{}}, DepType::Content};
@@ -291,7 +281,19 @@ static std::optional<DepHashValue> computeCurrentHash(
         if (!path) return std::nullopt;
 
         try {
-            if (format == 'j') {
+            // Helper: compute hash for sorted key set (shared across formats)
+            auto hashSortedKeys = [](std::vector<std::string> keys) -> DepHashValue {
+                std::sort(keys.begin(), keys.end());
+                std::string canonical;
+                for (size_t i = 0; i < keys.size(); i++) {
+                    if (i > 0) canonical += '\0';
+                    canonical += keys[i];
+                }
+                return DepHashValue(depHash(canonical));
+            };
+
+            switch (*format) {
+            case StructuredFormat::Json: {
                 // Use DOM cache to avoid re-parsing
                 auto cacheKey = dep.source + '\t' + filePath;
                 auto cacheIt = jsonDomCache.find(cacheKey);
@@ -301,25 +303,23 @@ static std::optional<DepHashValue> computeCurrentHash(
                 }
                 auto * node = navigateJson(cacheIt->second, dataPath);
                 if (!node) return std::nullopt;
-                if (shapeSuffix == "len") {
+                switch (shape) {
+                case ShapeSuffix::Len:
                     if (!node->is_array()) return std::nullopt;
                     return DepHashValue(depHash(std::to_string(node->size())));
-                } else if (shapeSuffix == "keys") {
+                case ShapeSuffix::Keys: {
                     if (!node->is_object()) return std::nullopt;
                     std::vector<std::string> keys;
                     for (auto & [k, _] : node->items())
                         keys.push_back(k);
-                    std::sort(keys.begin(), keys.end());
-                    std::string canonical;
-                    for (size_t i = 0; i < keys.size(); i++) {
-                        if (i > 0) canonical += '\0';
-                        canonical += keys[i];
-                    }
-                    return DepHashValue(depHash(canonical));
-                } else {
+                    return hashSortedKeys(std::move(keys));
+                }
+                case ShapeSuffix::None:
                     return DepHashValue(depHash(node->dump()));
                 }
-            } else if (format == 't') {
+                break;
+            }
+            case StructuredFormat::Toml: {
                 auto cacheKey = dep.source + '\t' + filePath;
                 auto cacheIt = tomlDomCache.find(cacheKey);
                 if (cacheIt == tomlDomCache.end()) {
@@ -334,26 +334,24 @@ static std::optional<DepHashValue> computeCurrentHash(
                 }
                 auto * node = navigateToml(cacheIt->second, dataPath);
                 if (!node) return std::nullopt;
-                if (shapeSuffix == "len") {
+                switch (shape) {
+                case ShapeSuffix::Len:
                     if (!node->is_array()) return std::nullopt;
                     return DepHashValue(depHash(std::to_string(toml::get<std::vector<toml::value>>(*node).size())));
-                } else if (shapeSuffix == "keys") {
+                case ShapeSuffix::Keys: {
                     if (!node->is_table()) return std::nullopt;
                     auto & table = toml::get<toml::table>(*node);
                     std::vector<std::string> keys;
                     for (auto & [k, _] : table)
                         keys.push_back(k);
-                    std::sort(keys.begin(), keys.end());
-                    std::string canonical;
-                    for (size_t i = 0; i < keys.size(); i++) {
-                        if (i > 0) canonical += '\0';
-                        canonical += keys[i];
-                    }
-                    return DepHashValue(depHash(canonical));
-                } else {
+                    return hashSortedKeys(std::move(keys));
+                }
+                case ShapeSuffix::None:
                     return DepHashValue(depHash(tomlCanonical(*node)));
                 }
-            } else if (format == 'd') {
+                break;
+            }
+            case StructuredFormat::Directory: {
                 // Directory structural dep: re-read listing, look up entry
                 auto cacheKey = dep.source + '\t' + filePath;
                 auto cacheIt = dirListingCache.find(cacheKey);
@@ -363,9 +361,10 @@ static std::optional<DepHashValue> computeCurrentHash(
                 }
                 auto & entries = cacheIt->second;
 
-                if (shapeSuffix == "len") {
+                switch (shape) {
+                case ShapeSuffix::Len:
                     return DepHashValue(depHash(std::to_string(entries.size())));
-                } else if (shapeSuffix == "keys") {
+                case ShapeSuffix::Keys: {
                     // std::map is already sorted by key
                     std::string canonical;
                     bool first = true;
@@ -375,13 +374,17 @@ static std::optional<DepHashValue> computeCurrentHash(
                         first = false;
                     }
                     return DepHashValue(depHash(canonical));
-                } else {
+                }
+                case ShapeSuffix::None: {
                     auto segments = parseDataPath(dataPath);
                     if (segments.size() != 1) return std::nullopt;
                     auto it = entries.find(segments[0]);
                     if (it == entries.end()) return std::nullopt;
                     return DepHashValue(depHash(dirEntryTypeString(it->second)));
                 }
+                }
+                break;
+            }
             }
             return std::nullopt;
         } catch (...) {
@@ -1250,19 +1253,19 @@ bool TraceStore::verifyTrace(
     for (auto & dep : fullDeps) {
         nrDepsChecked++;
 
-        if (dep.type == DepType::CurrentTime || dep.type == DepType::Exec) {
+        if (isVolatile(dep.type)) {
             hasNonContentFailure = true;
             continue;
         }
 
-        if (dep.type == DepType::StructuredContent) {
+        if (depKind(dep.type) == DepKind::Structural) {
             hasStructuralDeps = true;
             structuralDeps.push_back(&dep);
             continue;
         }
 
         // ParentContext: verify the parent's current trace hash matches
-        if (dep.type == DepType::ParentContext) {
+        if (depKind(dep.type) == DepKind::ParentContext) {
             auto parentTraceHash = getCurrentTraceHash(dep.key);
             if (parentTraceHash) {
                 auto * expected = std::get_if<Blake3Hash>(&dep.expectedHash);
@@ -1289,7 +1292,7 @@ bool TraceStore::verifyTrace(
 
         if (!current || *current != dep.expectedHash) {
             nrVerificationsFailed++;
-            if (dep.type == DepType::Content || dep.type == DepType::Directory) {
+            if (isContentOverrideable(dep.type)) {
                 hasContentFailure = true;
                 failedContentFiles.insert(dep.source + '\t' + dep.key);
             } else {
@@ -1478,7 +1481,7 @@ TraceStore::RecordResult TraceStore::record(
 
     // 10. Session caches
     bool hasVolatile = std::any_of(allDeps.begin(), allDeps.end(),
-        [](auto & d) { return d.type == DepType::CurrentTime || d.type == DepType::Exec; });
+        [](auto & d) { return isVolatile(d.type); });
     if (!hasVolatile)
         verifiedTraceIds.insert(traceId);
 
@@ -1546,7 +1549,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
     // Check for volatile deps → immediate abort
     for (auto & dep : oldDeps) {
-        if (dep.type == DepType::CurrentTime || dep.type == DepType::Exec) {
+        if (isVolatile(dep.type)) {
             debug("recovery: aborting for '%s' -- contains volatile dep", displayAttrPath(attrPath));
             nrRecoveryFailures++;
             nrRecoveryTimeUs += elapsedUs(recoveryStart);
@@ -1559,7 +1562,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     bool allComputable = true;
     for (auto & dep : oldDeps) {
         // ParentContext: compute current parent trace hash directly
-        if (dep.type == DepType::ParentContext) {
+        if (depKind(dep.type) == DepKind::ParentContext) {
             auto parentTraceHash = getCurrentTraceHash(dep.key);
             if (!parentTraceHash) { allComputable = false; break; }
             Blake3Hash b3;
@@ -1764,7 +1767,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         for (auto & key : repKeys) {
             auto type = key.type;
 
-            if (type == DepType::CurrentTime || type == DepType::Exec) {
+            if (isVolatile(type)) {
                 repComputable = false;
                 break;
             }
@@ -1776,7 +1779,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             std::string depKey = keyIt != stringTable.end() ? keyIt->second : "";
 
             // ParentContext: compute current parent trace hash directly
-            if (type == DepType::ParentContext) {
+            if (depKind(type) == DepKind::ParentContext) {
                 auto parentTraceHash = getCurrentTraceHash(depKey);
                 if (!parentTraceHash) { repComputable = false; break; }
                 Blake3Hash b3;

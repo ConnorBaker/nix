@@ -27,18 +27,23 @@ struct SourcePath;
 /**
  * Dependency types for eval trace verification (BSàlC verifying trace check).
  *
- * Category A (Hash Oracle): Verified by recomputing a hash and comparing.
- *   Content, Directory, Existence, EnvVar, System, StructuredContent
+ * Each DepType maps to a DepKind via depKind(), which classifies its
+ * verification behavior:
  *
- * Category B (Reference Resolution): Verified by re-resolving a reference
- *   (store path computation or re-fetch) and comparing.
- *   CopiedPath, UnhashedFetch
+ *   Normal: Verified by recomputing a hash or re-resolving a reference.
+ *     Existence, EnvVar, System, NARContent, CopiedPath, UnhashedFetch
  *
- * Category C (Volatile): Always invalidates — verification always fails.
- *   CurrentTime, Exec
+ *   ContentOverrideable: Coarse file/dir dep, overrideable by StructuredContent.
+ *     Content, Directory
  *
- * Category D (Structural): Verified by checking parent context hash.
- *   ParentContext
+ *   Volatile: Always fails verification; aborts recovery.
+ *     CurrentTime, Exec
+ *
+ *   Structural: Fine-grained dep deferred to second verification pass.
+ *     StructuredContent
+ *
+ *   ParentContext: Verified by checking parent trace hash.
+ *     ParentContext
  *
  * NOTE: Symlink targets are not tracked. resolveSymlinks() follows symlinks
  * but only records the final resolved file as a Content/Directory dep.
@@ -185,6 +190,87 @@ inline std::pair<const unsigned char *, size_t> blobData(const DepHashValue & v)
 }
 
 /**
+ * Behavioral classification of DepType values.
+ *
+ * Each DepType maps to exactly one DepKind via depKind(). Adding a new
+ * DepType without updating depKind() produces a -Wswitch compiler warning,
+ * ensuring the categorization is kept in sync.
+ */
+enum class DepKind : uint8_t {
+    /** Recomputable hash-verified dep (Existence, EnvVar, System, NARContent, CopiedPath, UnhashedFetch). */
+    Normal = 0,
+    /** Always fails verification; aborts recovery (CurrentTime, Exec). */
+    Volatile = 1,
+    /** Coarse file/dir dep overrideable by StructuredContent (Content, Directory). */
+    ContentOverrideable = 2,
+    /** Fine-grained structural dep; deferred to second verification pass (StructuredContent). */
+    Structural = 3,
+    /** Parent context dep; verified via trace hash lookup (ParentContext). */
+    ParentContext = 4,
+};
+
+/**
+ * Classify a DepType into its behavioral kind.
+ * Exhaustive switch — adding a new DepType without a case here triggers -Wswitch.
+ */
+inline constexpr DepKind depKind(DepType type)
+{
+    switch (type) {
+    case DepType::Content:
+    case DepType::Directory:
+        return DepKind::ContentOverrideable;
+    case DepType::Existence:
+    case DepType::EnvVar:
+    case DepType::System:
+    case DepType::NARContent:
+    case DepType::CopiedPath:
+    case DepType::UnhashedFetch:
+        return DepKind::Normal;
+    case DepType::CurrentTime:
+    case DepType::Exec:
+        return DepKind::Volatile;
+    case DepType::StructuredContent:
+        return DepKind::Structural;
+    case DepType::ParentContext:
+        return DepKind::ParentContext;
+    }
+    unreachable();
+}
+
+/**
+ * Human-readable name for a DepKind.
+ */
+inline constexpr std::string_view depKindName(DepKind kind)
+{
+    switch (kind) {
+    case DepKind::Normal: return "normal";
+    case DepKind::Volatile: return "volatile";
+    case DepKind::ContentOverrideable: return "contentOverrideable";
+    case DepKind::Structural: return "structural";
+    case DepKind::ParentContext: return "parentContext";
+    }
+    unreachable();
+}
+
+/**
+ * Returns true if the dep type is volatile (always fails verification).
+ * Shorthand for the most frequent DepKind check (~6 call sites).
+ */
+inline constexpr bool isVolatile(DepType type)
+{
+    return depKind(type) == DepKind::Volatile;
+}
+
+/**
+ * Returns true if the dep type is a coarse content/directory dep
+ * that can be overridden by fine-grained StructuredContent deps.
+ */
+inline constexpr bool isContentOverrideable(DepType type)
+{
+    return depKind(type) == DepKind::ContentOverrideable;
+}
+
+/**
  * Returns true if the dep type stores a BLAKE3 hash (not a string).
  */
 inline bool isBlake3Dep(DepType type) {
@@ -205,6 +291,152 @@ inline bool isBlake3Dep(DepType type) {
         return false;
     }
     unreachable();
+}
+
+/**
+ * Format tag for StructuredContent deps identifying the data source type.
+ * Stored as a single char in dep keys: "filepath\tf:datapath".
+ */
+enum class StructuredFormat : char {
+    Json      = 'j',
+    Toml      = 't',
+    Directory = 'd',
+};
+
+/**
+ * Convert a StructuredFormat to its wire-format character.
+ */
+inline constexpr char structuredFormatChar(StructuredFormat f)
+{
+    return static_cast<char>(f);
+}
+
+/**
+ * Parse a wire-format character to a StructuredFormat, or nullopt if invalid.
+ */
+inline constexpr std::optional<StructuredFormat> parseStructuredFormat(char c)
+{
+    switch (c) {
+    case 'j': return StructuredFormat::Json;
+    case 't': return StructuredFormat::Toml;
+    case 'd': return StructuredFormat::Directory;
+    default: return std::nullopt;
+    }
+}
+
+/**
+ * Human-readable name for a StructuredFormat (for diagnostics/logging).
+ */
+inline constexpr std::string_view structuredFormatName(StructuredFormat f)
+{
+    switch (f) {
+    case StructuredFormat::Json: return "json";
+    case StructuredFormat::Toml: return "toml";
+    case StructuredFormat::Directory: return "directory";
+    }
+    unreachable();
+}
+
+/**
+ * Shape suffix for StructuredContent deps on containers.
+ * Appended to the data path in dep keys.
+ */
+enum class ShapeSuffix : uint8_t {
+    None = 0,  ///< Scalar leaf access — no suffix
+    Len  = 1,  ///< List/array length (#len)
+    Keys = 2,  ///< Object/attrset key set (#keys)
+};
+
+/**
+ * Wire-format string for a ShapeSuffix (appended to data path in dep keys).
+ * Returns "", "#len", or "#keys".
+ */
+inline constexpr std::string_view shapeSuffixString(ShapeSuffix s)
+{
+    switch (s) {
+    case ShapeSuffix::None: return "";
+    case ShapeSuffix::Len: return "#len";
+    case ShapeSuffix::Keys: return "#keys";
+    }
+    unreachable();
+}
+
+/**
+ * Display name for a ShapeSuffix (for diagnostics).
+ * Returns "", "len", or "keys".
+ */
+inline constexpr std::string_view shapeSuffixName(ShapeSuffix s)
+{
+    switch (s) {
+    case ShapeSuffix::None: return "";
+    case ShapeSuffix::Len: return "len";
+    case ShapeSuffix::Keys: return "keys";
+    }
+    unreachable();
+}
+
+/**
+ * Parse a data path, splitting off any trailing shape suffix (#len or #keys).
+ * Returns the base data path (without suffix) and the parsed ShapeSuffix.
+ */
+inline std::pair<std::string, ShapeSuffix> parseShapeSuffix(std::string_view dataPath)
+{
+    if (dataPath.size() >= 4 && dataPath.substr(dataPath.size() - 4) == "#len")
+        return {std::string(dataPath.substr(0, dataPath.size() - 4)), ShapeSuffix::Len};
+    if (dataPath.size() >= 5 && dataPath.substr(dataPath.size() - 5) == "#keys")
+        return {std::string(dataPath.substr(0, dataPath.size() - 5)), ShapeSuffix::Keys};
+    return {std::string(dataPath), ShapeSuffix::None};
+}
+
+/**
+ * Build a StructuredContent dep key in the canonical wire format:
+ *   "filepath\tf:datapath[#suffix]"
+ */
+inline std::string buildStructuredDepKey(
+    std::string_view depKey, StructuredFormat format,
+    std::string_view dataPath, ShapeSuffix shape = ShapeSuffix::None)
+{
+    std::string result;
+    result.reserve(depKey.size() + 3 + dataPath.size() + 5);
+    result += depKey;
+    result += '\t';
+    result += structuredFormatChar(format);
+    result += ':';
+    result += dataPath;
+    result += shapeSuffixString(shape);
+    return result;
+}
+
+/**
+ * Parse and pretty-print a StructuredContent dep key for diagnostics.
+ * Input:  "flake.lock\tj:.nodes.nixpkgs.locked.rev#len"
+ * Output: "flake.lock [json] .nodes.nixpkgs.locked.rev #len"
+ * Falls back to the raw key on parse failure.
+ */
+inline std::string formatStructuredDepKey(std::string_view key)
+{
+    auto sep = key.find('\t');
+    if (sep == std::string::npos || sep + 2 >= key.size())
+        return std::string(key);
+    auto format = parseStructuredFormat(key[sep + 1]);
+    if (!format || key[sep + 2] != ':')
+        return std::string(key);
+    auto filePath = key.substr(0, sep);
+    auto dataPathWithSuffix = key.substr(sep + 3);
+    auto [dataPath, shape] = parseShapeSuffix(dataPathWithSuffix);
+
+    std::string result;
+    result += filePath;
+    result += " [";
+    result += structuredFormatName(*format);
+    result += "] ";
+    result += dataPath;
+    auto suffix = shapeSuffixString(shape);
+    if (!suffix.empty()) {
+        result += ' ';
+        result += suffix;
+    }
+    return result;
 }
 
 /**

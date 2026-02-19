@@ -68,7 +68,9 @@ void DependencyTracker::record(const Dep & dep)
         if (!activeTracker->recordedKeys.insert(key).second)
             return;  // Dependency already recorded in this trace scope — skip duplicate
     }
-    debug("recording %s dep: input='%s' key='%s'", depTypeName(dep.type), dep.source, dep.key);
+    debug("recording %s (%s) dep: input='%s' key='%s'",
+        depTypeName(dep.type), depKindName(depKind(dep.type)), dep.source,
+        dep.type == DepType::StructuredContent ? formatStructuredDepKey(dep.key) : dep.key);
     sessionTraces.push_back(dep);
 }
 

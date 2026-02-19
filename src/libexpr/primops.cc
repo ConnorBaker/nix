@@ -55,7 +55,7 @@ static void maybeRecordListLenDep(const Value & v)
     // Use first element Value* as key (matches registration in ExprTracedData::eval)
     auto * prov = lookupTracedContainer((const void *)v.listView()[0]);
     if (!prov) return;
-    auto fullKey = prov->depKey + '\t' + prov->formatTag + ':' + prov->dataPath + "#len";
+    auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Len);
     auto hash = depHash(std::to_string(v.listSize()));
     DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
 }
@@ -67,7 +67,7 @@ static void maybeRecordAttrKeysDep(EvalState & state, const Value & v)
     // Use Bindings* as key (matches registration in ExprTracedData::eval)
     auto * prov = lookupTracedContainer((const void *)v.attrs());
     if (!prov) return;
-    auto fullKey = prov->depKey + '\t' + prov->formatTag + ':' + prov->dataPath + "#keys";
+    auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Keys);
     std::vector<std::string_view> keys;
     keys.reserve(v.attrs()->size());
     for (auto & attr : *v.attrs())
@@ -2501,7 +2501,7 @@ struct DirScalarNode : TracedDataNode {
         : entryType(type) {}
 
     Kind kind() const override { return Kind::String; }
-    char formatTag() const override { return 'd'; }
+    StructuredFormat formatTag() const override { return StructuredFormat::Directory; }
     std::vector<std::string> objectKeys() const override { return {}; }
     TracedDataNode * objectGet(const std::string &) const override { return nullptr; }
     size_t arraySize() const override { return 0; }
@@ -2547,7 +2547,7 @@ struct DirDataNode : TracedDataNode {
         : entries(std::move(entries)) {}
 
     Kind kind() const override { return Kind::Object; }
-    char formatTag() const override { return 'd'; }
+    StructuredFormat formatTag() const override { return StructuredFormat::Directory; }
 
     std::vector<std::string> objectKeys() const override
     {

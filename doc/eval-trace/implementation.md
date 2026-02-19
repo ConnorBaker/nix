@@ -450,7 +450,7 @@ existing `StructuredContent` deps pass, incorrectly overriding the list's trace.
 operating on traced data containers. Implementation uses a thread-local
 `tracedContainerMap` (in `dependency-tracker.cc`, anonymous namespace)
 mapping `const void*` → `TracedContainerProvenance` (depSource, depKey,
-dataPath, formatTag). The map key is a stable internal pointer that
+dataPath, format). The map key is a stable internal pointer that
 survives Value copies: `Bindings*` for attrsets, first-element `Value*`
 for lists. Empty lists cannot be tracked (no stable internal pointer)
 but this is safe — they have no leaf `StructuredContent` deps.
@@ -524,7 +524,7 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 
 | File | Description |
 |------|-------------|
-| `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange`, inline helpers (header-only, includes `depTypeName()`) |
+| `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `DepKind`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange`, `StructuredFormat`, `ShapeSuffix`, inline helpers (header-only, includes `depTypeName()`, `depKind()`, `depKindName()`, `isVolatile()`, `isContentOverrideable()`, `buildStructuredDepKey()`, `formatStructuredDepKey()`, etc.) |
 | `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance`, `resolveProvenance`, `dirEntryTypeString` |
 | `src/libexpr/dependency-tracker.cc` | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) + provenance threading + `dirEntryTypeString` |
 | `src/libexpr/include/nix/expr/traced-data.hh` | `TracedDataNode` virtual interface, `ExprTracedData` Expr subclass for lazy structural dep tracking |

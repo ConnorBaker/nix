@@ -238,7 +238,7 @@ struct JsonDataNode : TracedDataNode {
         return Kind::Null;
     }
 
-    char formatTag() const override { return 'j'; }
+    StructuredFormat formatTag() const override { return StructuredFormat::Json; }
 
     std::vector<std::string> objectKeys() const override {
         std::vector<std::string> keys;
@@ -388,7 +388,7 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
     case TracedDataNode::Kind::Bool:
     case TracedDataNode::Kind::Null: {
         // Scalar leaf — record StructuredContent dep
-        auto fullKey = depKey + '\t' + node->formatTag() + ':' + dataPath;
+        auto fullKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath);
         auto hash = depHash(node->canonicalValue());
         DependencyTracker::record({depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
         node->materializeScalar(state, v);
