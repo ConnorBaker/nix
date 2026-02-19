@@ -5,6 +5,8 @@
 #include "nix/expr/value/context.hh"
 #include "nix/expr/symbol-table.hh"
 
+#include "nix/util/error.hh"
+
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -64,5 +66,28 @@ typedef std::variant<
     float_t,
     list_t>
     CachedResult;
+
+/**
+ * Human-readable name for a ResultKind.
+ */
+inline std::string_view resultKindName(ResultKind k)
+{
+    switch (k) {
+    case ResultKind::Placeholder: return "Placeholder";
+    case ResultKind::FullAttrs: return "FullAttrs";
+    case ResultKind::String: return "String";
+    case ResultKind::Missing: return "Missing";
+    case ResultKind::Misc: return "Misc";
+    case ResultKind::Failed: return "Failed";
+    case ResultKind::Bool: return "Bool";
+    case ResultKind::ListOfStrings: return "ListOfStrings";
+    case ResultKind::Int: return "Int";
+    case ResultKind::Path: return "Path";
+    case ResultKind::Null: return "Null";
+    case ResultKind::Float: return "Float";
+    case ResultKind::List: return "List";
+    }
+    unreachable();
+}
 
 } // namespace nix::eval_trace

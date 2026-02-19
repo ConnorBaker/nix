@@ -268,6 +268,8 @@ struct TraceStore {
         const std::unordered_map<std::string, SourcePath> & inputAccessors,
         EvalState & state);
 
+    std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);
+
 private:
     std::optional<TraceRow> lookupTraceRow(std::string_view attrPath);
 
@@ -286,7 +288,6 @@ private:
         const std::vector<uint8_t> & keysBlob);
 
     CachedResult decodeCachedResult(const TraceRow & row);
-    std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);
 
     Hash getTraceStructHash(TraceId traceId);
 };

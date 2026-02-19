@@ -3,6 +3,7 @@
 #include "nix/expr/trace-cache.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/eval-settings.hh"
 #include "nix/store/store-api.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/expr/value-to-json.hh"
@@ -134,6 +135,7 @@ struct TracedExpr : Expr, gc
     }
 
     void evaluateFresh(Value & v);
+    void verifyAgainstFresh(const CachedResult & cachedResult, TraceId cachedTraceId);
     Value * navigateToReal();
     void materializeResult(Value & v, const CachedResult & cached);
     void materializeOrigExprAttrs(Value & v, const std::vector<Symbol> & childNames,
@@ -267,6 +269,69 @@ void TracedExpr::sortChildNames(std::vector<Symbol> & names) const
             return std::string_view(cache->state.symbols[a])
                  < std::string_view(cache->state.symbols[b]);
         });
+}
+
+/**
+ * Convert a forced Value into a CachedResult for storage/comparison.
+ * The value must already be forced. For lists, suspends dep tracking
+ * during the allStrings check to avoid mixing StructuredContent deps.
+ */
+static CachedResult buildCachedResult(EvalState & st, Value & target)
+{
+    switch (target.type()) {
+    case nString: {
+        NixStringContext ctx;
+        if (target.context()) {
+            for (auto * elem : *target.context())
+                ctx.insert(NixStringContextElem::parse(elem->view()));
+        }
+        return string_t{std::string(target.string_view()), std::move(ctx)};
+    }
+    case nBool:
+        return target.boolean();
+    case nInt:
+        return int_t{NixInt{target.integer().value}};
+    case nNull:
+        return null_t{};
+    case nFloat:
+        return float_t{target.fpoint()};
+    case nPath:
+        return path_t{target.path().path.abs()};
+    case nAttrs: {
+        std::vector<Symbol> childNames;
+        for (auto & attr : *target.attrs())
+            childNames.push_back(attr.name);
+        std::sort(childNames.begin(), childNames.end(),
+            [&](Symbol a, Symbol b) {
+                return std::string_view(st.symbols[a])
+                     < std::string_view(st.symbols[b]);
+            });
+        return childNames;
+    }
+    case nList: {
+        bool allStrings = true;
+        {
+            SuspendDepTracking suspend;
+            for (size_t i = 0; i < target.listSize(); i++) {
+                st.forceValue(*target.listView()[i], noPos);
+                if (target.listView()[i]->type() != nString) { allStrings = false; break; }
+            }
+        }
+        if (allStrings) {
+            std::vector<std::string> strs;
+            for (size_t i = 0; i < target.listSize(); i++)
+                strs.push_back(std::string(target.listView()[i]->c_str()));
+            return strs;
+        } else {
+            return list_t{target.listSize()};
+        }
+    }
+    case nThunk:
+    case nFunction:
+    case nExternal:
+        return misc_t{};
+    }
+    unreachable();
 }
 
 // ── TracedExpr implementation (Adapton articulation points) ──────────
@@ -533,58 +598,7 @@ void TracedExpr::evaluateFresh(Value & v)
         auto directDeps = tracker.collectTraces();
 
         // Build the CachedResult for storage
-        CachedResult attrValue;
-        if (target->type() == nString) {
-            NixStringContext ctx;
-            if (target->context()) {
-                for (auto * elem : *target->context())
-                    ctx.insert(NixStringContextElem::parse(elem->view()));
-            }
-            attrValue = string_t{std::string(target->string_view()), std::move(ctx)};
-        } else if (target->type() == nBool) {
-            attrValue = target->boolean();
-        } else if (target->type() == nInt) {
-            attrValue = int_t{NixInt{target->integer().value}};
-        } else if (target->type() == nNull) {
-            attrValue = null_t{};
-        } else if (target->type() == nFloat) {
-            attrValue = float_t{target->fpoint()};
-        } else if (target->type() == nPath) {
-            attrValue = path_t{target->path().path.abs()};
-        } else if (target->type() == nAttrs) {
-            std::vector<Symbol> childNames;
-            for (auto & attr : *target->attrs())
-                childNames.push_back(attr.name);
-            sortChildNames(childNames);
-            attrValue = childNames;
-        } else if (target->type() == nList) {
-            // Suspend dep tracking during the allStrings check. Without this,
-            // forcing ExprTracedData element thunks would record StructuredContent
-            // deps in this trace's DependencyTracker, mixing them with the Content
-            // dep from readFile. That would let the two-level override incorrectly
-            // validate the trace when the list size changes but element values don't
-            // (e.g., element added to a JSON array). By suspending, the list trace
-            // has only Content deps → any file change invalidates → correct.
-            // Per-element override still works via TracedExpr children in list_t path.
-            bool allStrings = true;
-            {
-                SuspendDepTracking suspend;
-                for (size_t i = 0; i < target->listSize(); i++) {
-                    st.forceValue(*target->listView()[i], noPos);
-                    if (target->listView()[i]->type() != nString) { allStrings = false; break; }
-                }
-            }
-            if (allStrings) {
-                std::vector<std::string> strs;
-                for (size_t i = 0; i < target->listSize(); i++)
-                    strs.push_back(std::string(target->listView()[i]->c_str()));
-                attrValue = strs;
-            } else {
-                attrValue = list_t{target->listSize()};
-            }
-        } else {
-            attrValue = misc_t{};
-        }
+        CachedResult attrValue = buildCachedResult(st, *target);
 
         // For navigated children (no origExpr), add ParentContext deps linking
         // this trace to the siblings it accessed during evaluation. Per-sibling
@@ -642,6 +656,112 @@ void TracedExpr::evaluateFresh(Value & v)
     }
 }
 
+// verifyAgainstFresh — cross-check cache hit with fresh evaluation
+void TracedExpr::verifyAgainstFresh(const CachedResult & cachedResult, TraceId cachedTraceId)
+{
+    SuspendDepTracking suspend;
+
+    auto & st = cache->state;
+    Value freshV;
+    bool freshFailed = false;
+    std::string freshError;
+
+    try {
+        Value * target;
+        if (origExpr) {
+            target = st.allocValue();
+            origExpr->eval(st, *origEnv, *target);
+        } else {
+            if (parentExpr) {
+                target = navigateToReal();
+            } else {
+                target = navigateToReal();
+            }
+            if (target->isThunk()) {
+                if (auto * ec = dynamic_cast<TracedExpr*>(target->thunk().expr)) {
+                    if (ec->origExpr) {
+                        Expr * expr = ec->origExpr;
+                        Env * oenv = ec->origEnv;
+                        target = st.allocValue();
+                        expr->eval(st, *oenv, *target);
+                    }
+                }
+            }
+        }
+
+        st.forceValue(*target, noPos);
+
+        // Force drvPath on derivation attrsets (matching evaluateFresh)
+        if (!origExpr && target->type() == nAttrs && st.isDerivation(*target)) {
+            if (auto * dp = target->attrs()->get(st.s.drvPath))
+                st.forceValue(*dp->value, noPos);
+        }
+
+        freshV = *target;
+    } catch (std::exception & e) {
+        freshFailed = true;
+        freshError = e.what();
+    }
+
+    // If fresh eval failed but cached result is not failed_t → mismatch
+    if (freshFailed) {
+        // failed_t won't reach here (it's re-evaluated via evaluateFresh in eval()),
+        // but check for safety
+        if (!std::get_if<failed_t>(&cachedResult)) {
+            auto [cachedKind, cachedVal, cachedCtx] = cache->dbBackend->encodeCachedResult(cachedResult);
+
+            std::string msg = fmt(
+                "verify-eval-trace: mismatch at '%s'\n"
+                "  cached: %s = \"%s\"\n"
+                "  fresh:  threw exception: %s",
+                attrPathStr(),
+                resultKindName(cachedKind),
+                cachedVal.substr(0, 200),
+                freshError.substr(0, 200));
+
+            // Append dep list
+            try {
+                auto deps = cache->dbBackend->loadFullTrace(cachedTraceId);
+                msg += fmt("\n  trace_id=%d, dep_count=%d\n  deps:", cachedTraceId, deps.size());
+                for (auto & dep : deps)
+                    msg += fmt("\n    [%s] source=\"%s\" key=\"%s\"",
+                        depTypeName(dep.type), dep.source, dep.key);
+            } catch (...) {}
+
+            throw Error(msg);
+        }
+        return;
+    }
+
+    // Both succeeded — compare encoded results
+    auto freshResult = buildCachedResult(st, freshV);
+    auto [cachedKind, cachedVal, cachedCtx] = cache->dbBackend->encodeCachedResult(cachedResult);
+    auto [freshKind, freshVal, freshCtx] = cache->dbBackend->encodeCachedResult(freshResult);
+
+    if (cachedKind != freshKind || cachedVal != freshVal || cachedCtx != freshCtx) {
+        std::string msg = fmt(
+            "verify-eval-trace: mismatch at '%s'\n"
+            "  cached: %s = \"%s\"\n"
+            "  fresh:  %s = \"%s\"",
+            attrPathStr(),
+            resultKindName(cachedKind),
+            cachedVal.substr(0, 200),
+            resultKindName(freshKind),
+            freshVal.substr(0, 200));
+
+        // Append dep list
+        try {
+            auto deps = cache->dbBackend->loadFullTrace(cachedTraceId);
+            msg += fmt("\n  trace_id=%d, dep_count=%d\n  deps:", cachedTraceId, deps.size());
+            for (auto & dep : deps)
+                msg += fmt("\n    [%s] source=\"%s\" key=\"%s\"",
+                    depTypeName(dep.type), dep.source, dep.key);
+        } catch (...) {}
+
+        throw Error(msg);
+    }
+}
+
 // TracedExpr::eval — demand-driven dispatch (Adapton)
 void TracedExpr::eval(EvalState & state, Env & env, Value & v)
 {
@@ -695,21 +815,27 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
         nrTraceCacheHits++;
         debug("trace verify hit for '%s'", attrPathStr());
 
+        bool handled = false;
         if (origExpr) {
             if (isLeafCached(cachedValue)) {
                 materializeResult(v, cachedValue);
                 replayTrace(cachedTraceId);
-                return;
-            }
-            if (auto * attrs = std::get_if<std::vector<Symbol>>(&cachedValue)) {
+                handled = true;
+            } else if (auto * attrs = std::get_if<std::vector<Symbol>>(&cachedValue)) {
                 materializeOrigExprAttrs(v, *attrs);
                 replayTrace(cachedTraceId);
-                return;
+                handled = true;
             }
-            // list_t or other → fresh evaluation needed
+            // list_t or other → falls through to evaluateFresh (not a cache hit)
         } else {
             materializeResult(v, cachedValue);
             replayTrace(cachedTraceId);
+            handled = true;
+        }
+
+        if (handled) {
+            if (cache->state.settings.verifyTraceCache)
+                verifyAgainstFresh(cachedValue, cachedTraceId);
             return;
         }
     }
