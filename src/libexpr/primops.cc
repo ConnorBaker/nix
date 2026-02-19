@@ -4,6 +4,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/traced-data.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/expr/json-to-value.hh"
 #include "nix/expr/static-string-data.hh"
@@ -2478,6 +2479,95 @@ static RegisterPrimOp primop_readFileType({
     .fun = prim_readFileType,
 });
 
+// ── TracedDataNode subclasses for readDir ─────────────────────────────
+// These enable lazy per-entry dep tracking for directory listings, allowing
+// traces to survive directory changes when only specific entries were observed.
+
+namespace {
+
+/**
+ * Scalar leaf node for a single directory entry type.
+ * materializeScalar produces the same string as fileTypeToString.
+ */
+struct DirScalarNode : TracedDataNode {
+    std::optional<SourceAccessor::Type> entryType;
+
+    explicit DirScalarNode(std::optional<SourceAccessor::Type> type)
+        : entryType(type) {}
+
+    Kind kind() const override { return Kind::String; }
+    char formatTag() const override { return 'd'; }
+    std::vector<std::string> objectKeys() const override { return {}; }
+    TracedDataNode * objectGet(const std::string &) const override { return nullptr; }
+    size_t arraySize() const override { return 0; }
+    TracedDataNode * arrayGet(size_t) const override { return nullptr; }
+
+    void materializeScalar(EvalState & state, Value & v) const override
+    {
+        // Must produce the exact same Value as fileTypeToString
+        if (!entryType) {
+            v.mkStringNoCopy("unknown"_sds);
+            return;
+        }
+        switch (*entryType) {
+        case SourceAccessor::tRegular:
+            v.mkStringNoCopy("regular"_sds);
+            break;
+        case SourceAccessor::tDirectory:
+            v.mkStringNoCopy("directory"_sds);
+            break;
+        case SourceAccessor::tSymlink:
+            v.mkStringNoCopy("symlink"_sds);
+            break;
+        default:
+            v.mkStringNoCopy("unknown"_sds);
+            break;
+        }
+    }
+
+    std::string canonicalValue() const override
+    {
+        return dirEntryTypeString(entryType);
+    }
+};
+
+/**
+ * Root object node representing a directory listing from readDir.
+ * Keys are entry names, values are DirScalarNode leaves.
+ */
+struct DirDataNode : TracedDataNode {
+    SourceAccessor::DirEntries entries;
+
+    explicit DirDataNode(SourceAccessor::DirEntries entries)
+        : entries(std::move(entries)) {}
+
+    Kind kind() const override { return Kind::Object; }
+    char formatTag() const override { return 'd'; }
+
+    std::vector<std::string> objectKeys() const override
+    {
+        std::vector<std::string> keys;
+        keys.reserve(entries.size());
+        for (auto & [name, _] : entries)
+            keys.push_back(name);
+        return keys;
+    }
+
+    TracedDataNode * objectGet(const std::string & key) const override
+    {
+        auto it = entries.find(key);
+        if (it == entries.end()) return nullptr;
+        return new DirScalarNode(it->second);
+    }
+
+    size_t arraySize() const override { return 0; }
+    TracedDataNode * arrayGet(size_t) const override { return nullptr; }
+    void materializeScalar(EvalState &, Value &) const override {}
+    std::string canonicalValue() const override { return ""; }
+};
+
+} // anonymous namespace
+
 /* Read a directory (without . or ..) */
 static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
@@ -2491,7 +2581,24 @@ static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Val
     // Record Directory oracle dep for trace verification
     if (DependencyTracker::isActive()) {
         recordDep(path.path, depHashDirListing(entries), DepType::Directory, state.getMountToInput());
+
+        // If all entries have known types, wrap in ExprTracedData for lazy
+        // per-entry StructuredContent dep tracking. This allows traces to
+        // survive directory changes when only specific entries were observed.
+        bool allTypesKnown = std::all_of(entries.begin(), entries.end(),
+            [](auto & e) { return e.second.has_value(); });
+
+        if (allTypesKnown) {
+            auto [depSource, depKey] = resolveProvenance(path.path, state.getMountToInput());
+            auto * rootNode = new DirDataNode(std::move(entries));
+            auto * rootExpr = new ExprTracedData(rootNode, depSource, depKey, "");
+            rootExpr->eval(state, state.baseEnv, v);
+            return;
+        }
     }
+
+    // Eager path: used when eval-trace is inactive or when some entry types
+    // are unknown (rare filesystem case).
     auto attrs = state.buildBindings(entries.size());
 
     // If we hit unknown directory entry types we may need to fallback to

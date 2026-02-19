@@ -506,6 +506,20 @@ std::pair<std::string, std::string> resolveProvenance(
     return {"", absPath.abs()};
 }
 
+std::string dirEntryTypeString(std::optional<SourceAccessor::Type> type)
+{
+    if (!type) return "unknown";
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch-enum"
+    switch (*type) {
+    case SourceAccessor::tRegular: return "regular";
+    case SourceAccessor::tDirectory: return "directory";
+    case SourceAccessor::tSymlink: return "symlink";
+    default: return "unknown";
+    }
+#pragma GCC diagnostic pop
+}
+
 void clearStatHashMemoryCache()
 {
     StatHashCache::instance().clearMemoryCache();

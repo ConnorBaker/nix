@@ -216,7 +216,7 @@ The eval trace tracks 12 dependency types, organized into four categories:
 | **Reference** | CopiedPath (9) | `builtins.path` (unfiltered) | BLAKE3 of NAR |
 | | UnhashedFetch (7) | `fetchTree` (unlocked) | Re-fetch, compare store path |
 | | NARContent (11) | `builtins.path` (filtered) | BLAKE3 of NAR (captures exec bit) |
-| | StructuredContent (12) | `fromJSON`/`fromTOML` leaf access | BLAKE3 of canonical scalar at data path |
+| | StructuredContent (12) | `fromJSON`/`fromTOML`/`readDir` leaf access | BLAKE3 of canonical scalar at data path |
 | **Volatile** | CurrentTime (5) | `currentTime` | Always invalidates |
 | | Exec (10) | `builtins.exec` | Always invalidates |
 | **Structural** | ParentContext (8) | (internal) | Parent trace hash |
@@ -261,6 +261,7 @@ Recording sites are instrumented throughout the evaluator:
 - `builtins.path`: → CopiedPath or NARContent (filtered) dep
 - `json-to-value.cc`: `ExprTracedData::eval()` → StructuredContent dep (scalar leaf access)
 - `primops/fromTOML.cc`: `ExprTracedData::eval()` → StructuredContent dep (via shared `ExprTracedData`)
+- `primops.cc`: `readDir` + `ExprTracedData::eval()` → StructuredContent dep (directory entry type access, format tag `'d'`)
 
 Each tracker deduplicates deps by `(type, source, key)` within its scope using a
 `DepKey` hash set, so the same file read twice during one attribute's evaluation
@@ -271,6 +272,9 @@ produces only one dep entry.
 When `fromJSON` or `fromTOML` parses a string that came directly from `readFile`
 (validated by matching the string's BLAKE3 hash against the recorded Content dep),
 the result is returned as a **lazy attrset/list** whose children are thunks.
+Similarly, when `readDir` is called with eval-trace active, the result is an
+`ExprTracedData`-wrapped attrset with one thunk per directory entry (backed by
+`DirDataNode`/`DirScalarNode`).
 Each thunk wraps an `ExprTracedData` node that, when forced:
 
 - **For containers (objects/arrays):** Creates another lazy attrset/list with
@@ -283,9 +287,10 @@ removing, or modifying keys/elements that are never accessed does NOT invalidate
 the trace.
 
 **Dep key format:** `"filepath\tf:datapath"` where `\t` is the tab separator,
-`f` is the format tag (`j` for JSON, `t` for TOML), and `datapath` uses `.`
-for object keys and `.[N]` for array indices. Example:
-`"/path/to/flake.lock\tj:nodes.nixpkgs.locked.rev"`.
+`f` is the format tag (`j` for JSON, `t` for TOML, `d` for directory entries),
+and `datapath` uses `.` for object keys and `.[N]` for array indices. Example:
+`"/path/to/flake.lock\tj:nodes.nixpkgs.locked.rev"` or
+`"/path/to/src\td:main.cc"`.
 
 **Provenance threading:** `readFile` sets a thread-local `ReadFileProvenance`
 (path + content hash). `fromJSON`/`fromTOML` consumes it and verifies the
@@ -327,21 +332,26 @@ system calls for unchanged files.
 
 When `fromJSON(readFile f)` or `fromTOML(readFile f)` is used, the eval trace
 records both a whole-file `Content` dep and fine-grained `StructuredContent` deps
-for each accessed scalar leaf. During verification, if the `Content` dep fails
-(file changed) but all `StructuredContent` deps pass (accessed leaf values
-unchanged), the trace remains valid. This two-level override enables traces to
-survive changes to unused parts of structured data files (e.g., changing an
-unused input's `rev` in `flake.lock`).
+for each accessed scalar leaf. Similarly, when `readDir` is used, a whole-listing
+`Directory` dep and per-entry `StructuredContent` deps (format tag `'d'`) are
+recorded. During verification, if the `Content` or `Directory` dep fails
+(file/directory changed) but all `StructuredContent` deps pass (accessed
+values unchanged), the trace remains valid. This two-level override enables
+traces to survive changes to unused parts of structured data files (e.g.,
+changing an unused input's `rev` in `flake.lock`) or directory listings (e.g.,
+adding a new file to a directory when only specific entries were checked).
 
 The override logic in `verifyTrace()`:
 
 1. **First pass:** Verify all non-structural deps normally. Defer
-   `StructuredContent` deps. Track which `Content` deps failed.
-2. **If any non-Content, non-structural dep fails:** trace invalid (no override).
-3. **If Content failures exist and structural deps cover those files:** verify
-   all structural deps. If all pass, Content failures are overridden.
-4. **If Content failure with no structural coverage:** trace invalid (backward
-   compatible with pre-structural behavior).
+   `StructuredContent` deps. Track which `Content` and `Directory` deps failed.
+2. **If any non-Content, non-Directory, non-structural dep fails:** trace
+   invalid (no override).
+3. **If Content/Directory failures exist and structural deps cover those
+   files/directories:** verify all structural deps. If all pass,
+   Content/Directory failures are overridden.
+4. **If Content/Directory failure with no structural coverage:** trace invalid
+   (backward compatible with pre-structural behavior).
 
 #### Key-Set Safety with `mapAttrs` and `attrNames`
 
@@ -385,6 +395,51 @@ Container structures are cached at the trace level that produces them, where onl
 `Content` deps exist. `StructuredContent` deps only appear in child traces
 (when individual leaf values are forced), where the cached result is the leaf
 value and structural changes do not affect correctness.
+
+#### Directory Two-Level Override
+
+The two-level override extends beyond JSON and TOML to directory listings.
+When `readDir` is called with eval-trace active, it returns an
+`ExprTracedData`-wrapped attrset whose children are lazy thunks (one per
+directory entry). The directory-level `Directory` dep (BLAKE3 of the full
+sorted listing) acts as the "coarse" dep, and per-entry `StructuredContent`
+deps with format tag `'d'` act as the "fine-grained" deps.
+
+**How it works.** `readDir` records a `Directory` dep covering the entire
+listing. The returned attrset has one key per entry; each value is a
+`DirScalarNode` thunk. When a specific entry is forced, a
+`StructuredContent` dep is recorded with the BLAKE3 hash of the entry's
+type string (the canonical value: `"regular"`, `"directory"`, `"symlink"`,
+or `"unknown"`). If the directory listing changes (entry added/removed) but
+the accessed entries' types are unchanged, the `Directory` dep fails while
+all `StructuredContent` deps pass, and the two-level override keeps the
+trace valid.
+
+The dep key format mirrors the JSON/TOML pattern:
+`"dirpath\td:entryname"` where `\t` is the tab separator, `d` is the
+format tag for directory entries, and `entryname` is the directory entry
+name. For example: `"/path/to/src\td:main.cc"`.
+
+**Canonical values.** The `dirEntryTypeString()` helper (in
+`dependency-tracker.hh/.cc`) maps `SourceAccessor::Type` to a canonical
+string: `"regular"`, `"directory"`, `"symlink"`, or `"unknown"`. This
+string is BLAKE3-hashed for the `StructuredContent` dep value.
+
+**TracedDataNode implementations.** `DirDataNode` and `DirScalarNode`
+(defined in `primops.cc`) implement the `TracedDataNode` virtual interface
+for directory listings. `DirDataNode` is the container (one child per
+entry); `DirScalarNode` is the leaf (produces the type string as canonical
+value). All entry types are known eagerly from the `readDir` result, so
+the lazy thunks do not re-read the directory.
+
+**By-name limitation.** When `mapAttrs` is used as `mapAttrs (name: _: ...)`
+(accessing only names, ignoring values), no entry thunks are forced, so no
+`StructuredContent` deps are recorded. Only the `Directory` dep controls
+invalidation. Any directory change invalidates the trace — this is the
+correct, conservative behavior because the key set changed. Language
+constructs that propagate attrsets transparently (`//`, `with`, `rec`,
+`self:`, `mapAttrs`) are transparent to dep tracking — they neither force
+nor suppress thunk evaluation.
 
 **Shape observation tracking.** When shape-observing builtins (`length`,
 `attrNames`, `hasAttr`) operate on traced data containers, a shape dep is

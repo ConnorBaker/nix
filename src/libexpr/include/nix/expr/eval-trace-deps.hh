@@ -47,7 +47,8 @@ struct SourcePath;
 enum class DepType : uint8_t {
     /** File content was read (evalFile, readFile, parseExprFromFile). */
     Content = 1,
-    /** Directory listing was read (readDir). */
+    /** Directory listing was read (readDir). Coarse dep: hashes entire listing.
+     *  Can be overridden by StructuredContent deps with format tag 'd' (per-entry). */
     Directory = 2,
     /** File existence was checked (pathExists). */
     Existence = 3,
@@ -70,9 +71,10 @@ enum class DepType : uint8_t {
      *  Unlike Content (raw bytes only), this detects chmod +x changes. */
     NARContent = 11,
     /** BLAKE3 of canonical representation of a scalar at a data path within
-     *  a structured file (JSON/TOML). Key format: "filepath\tf:datapath"
-     *  where f is format tag ('j'/'t'). Enables two-level verification:
-     *  if Content dep fails but all StructuredContent deps pass, trace is valid. */
+     *  a structured source (JSON/TOML file or directory listing). Key format:
+     *  "filepath\tf:datapath" where f is format tag ('j'=JSON, 't'=TOML, 'd'=directory).
+     *  Enables two-level verification: if Content/Directory dep fails but all
+     *  StructuredContent deps pass, trace is valid. */
     StructuredContent = 12,
 };
 

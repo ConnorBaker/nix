@@ -62,11 +62,13 @@ static std::optional<SourcePath> resolveDepPath(
 // StructuredContent deps reference it. Cleared at verifyTrace entry.
 static thread_local std::unordered_map<std::string, nlohmann::json> jsonDomCache;
 static thread_local std::unordered_map<std::string, toml::value> tomlDomCache;
+static thread_local std::unordered_map<std::string, SourceAccessor::DirEntries> dirListingCache;
 
 static void clearDomCaches()
 {
     jsonDomCache.clear();
     tomlDomCache.clear();
+    dirListingCache.clear();
 }
 
 /**
@@ -347,6 +349,35 @@ static std::optional<DepHashValue> computeCurrentHash(
                     return DepHashValue(depHash(canonical));
                 } else {
                     return DepHashValue(depHash(tomlCanonical(*node)));
+                }
+            } else if (format == 'd') {
+                // Directory structural dep: re-read listing, look up entry
+                auto cacheKey = dep.source + '\t' + filePath;
+                auto cacheIt = dirListingCache.find(cacheKey);
+                if (cacheIt == dirListingCache.end()) {
+                    auto dirEntries = path->readDirectory();
+                    cacheIt = dirListingCache.emplace(cacheKey, std::move(dirEntries)).first;
+                }
+                auto & entries = cacheIt->second;
+
+                if (shapeSuffix == "len") {
+                    return DepHashValue(depHash(std::to_string(entries.size())));
+                } else if (shapeSuffix == "keys") {
+                    // std::map is already sorted by key
+                    std::string canonical;
+                    bool first = true;
+                    for (auto & [k, _] : entries) {
+                        if (!first) canonical += '\0';
+                        canonical += k;
+                        first = false;
+                    }
+                    return DepHashValue(depHash(canonical));
+                } else {
+                    auto segments = parseDataPath(dataPath);
+                    if (segments.size() != 1) return std::nullopt;
+                    auto it = entries.find(segments[0]);
+                    if (it == entries.end()) return std::nullopt;
+                    return DepHashValue(depHash(dirEntryTypeString(it->second)));
                 }
             }
             return std::nullopt;
@@ -1088,27 +1119,28 @@ bool TraceStore::verifyTrace(
     // Load the FULL trace (base chain already resolved)
     auto fullDeps = loadFullTrace(traceId);
 
-    // Two-level verification: Content failures can be overridden by passing
-    // StructuredContent deps that cover the same file. This enables fine-grained
-    // invalidation for fromJSON(readFile f) patterns.
+    // Two-level verification: Content and Directory failures can be overridden
+    // by passing StructuredContent deps that cover the same file/directory.
+    // This enables fine-grained invalidation for fromJSON(readFile f) and
+    // readDir patterns.
     //
     // Key-set safety: the override only activates when StructuredContent deps
     // exist in this trace. If code only iterates keys (mapAttrs, attrNames)
     // without forcing leaf values, no StructuredContent deps are recorded and
-    // the Content dep alone controls invalidation — any file change triggers
+    // the coarse dep alone controls invalidation — any change triggers
     // re-evaluation. This is correct because the key set is part of the cached
     // result's structure at this trace level. StructuredContent deps only appear
     // in child traces (when specific leaf values are forced), where the cached
     // result is the leaf value and key-set changes are irrelevant.
     //
     // First pass: verify non-structural deps, defer StructuredContent deps,
-    // track failed Content deps by their file key (source + key).
+    // track failed coarse (Content/Directory) deps by their file key (source + key).
 
     bool hasNonContentFailure = false;
     bool hasContentFailure = false;
     bool hasStructuralDeps = false;
 
-    // Track failed Content dep file keys: "source\tkey"
+    // Track failed coarse dep file/dir keys: "source\tkey"
     std::unordered_set<std::string> failedContentFiles;
     // Deferred structural deps
     std::vector<const Dep *> structuralDeps;
@@ -1141,7 +1173,7 @@ bool TraceStore::verifyTrace(
 
         if (!current || *current != dep.expectedHash) {
             nrVerificationsFailed++;
-            if (dep.type == DepType::Content) {
+            if (dep.type == DepType::Content || dep.type == DepType::Directory) {
                 hasContentFailure = true;
                 failedContentFiles.insert(dep.source + '\t' + dep.key);
             } else {
@@ -1154,16 +1186,16 @@ bool TraceStore::verifyTrace(
     bool allValid;
 
     if (hasNonContentFailure) {
-        // Non-Content, non-structural failure → trace invalid (no override possible)
+        // Non-coarse, non-structural failure → trace invalid (no override possible)
         allValid = false;
     } else if (!hasContentFailure) {
         // No failures at all (structural deps haven't been checked yet, but
-        // they can only strengthen the result — if Content passed, structural
-        // deps would also pass since the file hasn't changed)
+        // they can only strengthen the result — if coarse deps passed, structural
+        // deps would also pass since the file/dir hasn't changed)
         allValid = true;
     } else if (hasContentFailure && hasStructuralDeps) {
-        // Content failure(s) exist AND structural deps are present.
-        // Check if all structural deps covering failed files still pass.
+        // Coarse failure(s) (Content/Directory) exist AND structural deps are present.
+        // Check if all structural deps covering failed files/dirs still pass.
         allValid = true;
 
         // Build set of files covered by structural deps
@@ -1174,7 +1206,7 @@ bool TraceStore::verifyTrace(
                 structuralCoveredFiles.insert(dep->source + '\t' + dep->key.substr(0, sep));
         }
 
-        // Check that all failed Content files are covered by structural deps
+        // Check that all failed coarse deps (Content/Directory) are covered by structural deps
         for (auto & failedFile : failedContentFiles) {
             if (structuralCoveredFiles.find(failedFile) == structuralCoveredFiles.end()) {
                 allValid = false;
@@ -1205,7 +1237,7 @@ bool TraceStore::verifyTrace(
             }
         }
     } else {
-        // Content failure with no structural deps → invalid (backward compat)
+        // Coarse failure with no structural deps → invalid (backward compat)
         allValid = false;
     }
 

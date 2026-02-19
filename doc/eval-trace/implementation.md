@@ -402,13 +402,16 @@ outside the lock scope.
 **Problem: Whole-file Content deps cause over-invalidation for structured data.**
 When `fromJSON(readFile "flake.lock")` is used, a `Content` dep is recorded on
 the entire file. Any change — even to an unused input's `rev` — invalidates the
-trace. This is unnecessarily conservative for structured data where only specific
-scalar values are accessed.
+trace. Similarly, a `Directory` dep on a `readDir` result invalidates whenever
+any entry is added, removed, or changes type — even if only specific entries
+are accessed. This is unnecessarily conservative for structured data where only
+specific scalar values are accessed.
 
 **Solution: StructuredContent deps with two-level verification override.**
 Added `StructuredContent` (DepType 12), a Hash Oracle dep that records the
-BLAKE3 hash of a scalar value at a specific data path within a JSON or TOML
-file. During verification, if the whole-file `Content` dep fails but all
+BLAKE3 hash of a scalar value at a specific data path within a JSON file,
+TOML file, or directory listing. During verification, if the whole-file
+`Content` dep or whole-listing `Directory` dep fails but all
 `StructuredContent` deps pass (accessed values unchanged), the trace remains
 valid.
 
@@ -421,7 +424,8 @@ node backed by a format-agnostic `TracedDataNode` virtual interface
 
 - **Containers:** Create nested lazy attrsets/lists. No dep recorded.
 - **Scalar leaves:** Record `StructuredContent` dep with BLAKE3 of canonical
-  value. Dep key: `"filepath\tf:datapath"` (tab separator, `f` = format tag).
+  value. Dep key: `"filepath\tf:datapath"` (tab separator, `f` = format tag:
+  `'j'` for JSON, `'t'` for TOML, `'d'` for directory entries).
 
 **Provenance threading.** Thread-local `ReadFileProvenance` set by `readFile`,
 consumed by `fromJSON`/`fromTOML`. Content hash validation ensures structural
@@ -431,9 +435,9 @@ deps are only used when the string came directly from `readFile` (not modified).
 when multiple `StructuredContent` deps reference the same file.
 
 **Two-level verification in verifyTrace.** First pass verifies non-structural
-deps and defers `StructuredContent` deps. If only `Content` failures exist and
-structural deps cover those files, structural deps are verified. If all pass,
-`Content` failures are overridden.
+deps and defers `StructuredContent` deps. If only `Content` and/or `Directory`
+failures exist and structural deps cover those files/directories, structural
+deps are verified. If all pass, `Content`/`Directory` failures are overridden.
 
 **Key-set safety with `mapAttrs`/`attrNames`.** The lazy attrset eagerly
 materializes the full key set but records no dep for it — only the `Content`
@@ -480,15 +484,44 @@ used `\0` as separator (`"filepath\0f:datapath"`). SQLite TEXT columns truncate
 at null bytes, so the interned key contained only the filepath. Fixed by
 using `\t` (tab) as separator.
 
+**Directory two-level override (readDir).** Extended the StructuredContent
+two-level override to directory listings. `readDir` now returns an
+`ExprTracedData`-wrapped attrset when eval-trace is active. The `Directory`
+dep (BLAKE3 of sorted listing) is the coarse dep; per-entry
+`StructuredContent` deps with format tag `'d'` are the fine-grained deps.
+
+- `DirDataNode` / `DirScalarNode` (in `primops.cc`): `TracedDataNode`
+  subclasses for directory entries. `DirDataNode` is the root container
+  (one child per entry name). `DirScalarNode` is the leaf — its
+  `canonicalValue()` returns the type string (`"regular"`, `"directory"`,
+  `"symlink"`, `"unknown"`) via `dirEntryTypeString()`.
+- `dirEntryTypeString()` (in `dependency-tracker.hh/.cc`): shared helper
+  mapping `std::optional<SourceAccessor::Type>` to a canonical string.
+  Used by both `DirScalarNode::canonicalValue()` and `computeCurrentHash`
+  `'d'` format handler.
+- `dirListingCache` (in `trace-store.cc`): thread-local
+  `std::unordered_map<std::string, SourceAccessor::DirEntries>`, alongside
+  `jsonDomCache` and `tomlDomCache`. Avoids re-reading directory listings
+  when multiple `StructuredContent` deps with format `'d'` reference the
+  same directory within a single `verifyTrace` call. Cleared by
+  `clearDomCaches()`.
+- `computeCurrentHash` `'d'` handler: re-reads the directory listing
+  (cached via `dirListingCache`), looks up the entry by name, and hashes
+  the type string via `dirEntryTypeString()`.
+- `verifyTrace` decision tree: `Directory` dep failures are now
+  override-eligible alongside `Content` failures. If a `Directory` dep
+  fails but all `StructuredContent` deps covering that directory pass,
+  the `Directory` failure is overridden.
+
 **Files added/modified:**
 - `traced-data.hh` (new): `TracedDataNode` + `ExprTracedData`
 - `eval-trace-deps.hh`: `StructuredContent = 12`
-- `dependency-tracker.hh/cc`: `ReadFileProvenance`, `resolveProvenance`, `TracedContainerProvenance`, `registerTracedContainer`/`lookupTracedContainer`/`clearTracedContainerMap`
+- `dependency-tracker.hh/cc`: `ReadFileProvenance`, `resolveProvenance`, `TracedContainerProvenance`, `registerTracedContainer`/`lookupTracedContainer`/`clearTracedContainerMap`, `dirEntryTypeString`
 - `json-to-value.hh/cc`: `JsonDataNode`, `parseTracedJSON`, `ExprTracedData::eval()`
 - `primops/fromTOML.cc`: `TomlDataNode`, `parseTracedTOML`
-- `primops.cc`: provenance wiring in `readFile`/`fromJSON`
-- `trace-store.cc`: `computeCurrentHash` for StructuredContent, two-level `verifyTrace`, DOM caches, `navigateJson`/`navigateToml` helpers
-- `traced-data.cc` (new test): 34 GTest unit tests (13 core + 21 shape tracking)
+- `primops.cc`: provenance wiring in `readFile`/`fromJSON`, `DirDataNode`/`DirScalarNode` for `readDir`
+- `trace-store.cc`: `computeCurrentHash` for StructuredContent (including `'d'` format), two-level `verifyTrace` (Content + Directory override), DOM caches (`jsonDomCache`/`tomlDomCache`/`dirListingCache`), `navigateJson`/`navigateToml` helpers
+- `traced-data.cc` (new test): 94 GTest unit tests (62 JSON/TOML + 32 directory)
 
 ---
 
@@ -505,9 +538,9 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 |------|------:|-------------|
 | `src/libexpr/include/nix/expr/eval-trace-deps.hh` | ~250 | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange`, inline helpers |
 | `src/libexpr/eval-trace-deps.cc` | ~25 | `depTypeName()` implementation |
-| `src/libexpr/include/nix/expr/dependency-tracker.hh` | ~200 | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance`, `resolveProvenance` |
-| `src/libexpr/dependency-tracker.cc` | ~480 | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) + provenance threading |
-| `src/libexpr/include/nix/expr/traced-data.hh` | ~80 | `TracedDataNode` virtual interface, `ExprTracedData` Expr subclass for lazy structural dep tracking |
+| `src/libexpr/include/nix/expr/dependency-tracker.hh` | ~310 | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance`, `resolveProvenance`, `dirEntryTypeString` |
+| `src/libexpr/dependency-tracker.cc` | ~540 | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) + provenance threading + `dirEntryTypeString` |
+| `src/libexpr/include/nix/expr/traced-data.hh` | ~100 | `TracedDataNode` virtual interface, `ExprTracedData` Expr subclass for lazy structural dep tracking |
 | `src/libexpr/include/nix/expr/eval-trace-context.hh` | ~95 | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
 | `src/libexpr/eval-trace-context.cc` | ~50 | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
 
@@ -518,8 +551,8 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 | `src/libexpr/include/nix/expr/trace-result.hh` | ~65 | Result vocabulary types: `ResultKind`, `CachedResult`, all result structs (header-only) |
 | `src/libexpr/include/nix/expr/trace-cache.hh` | ~65 | Public API: `TraceCache`, performance counters |
 | `src/libexpr/trace-cache.cc` | ~726 | `TracedExpr` (Adapton articulation point), `ExprOrigChild`, `SharedParentResult`, verify/record/recover loop |
-| `src/libexpr/include/nix/expr/trace-store.hh` | ~170 | `TraceStore`: pure SQLite backend (BSàlC trace store) |
-| `src/libexpr/trace-store.cc` | ~1230 | SQLite backend: schema, verify, record, constructive recovery, verifyTrace (BSàlC VT/CT operations) |
+| `src/libexpr/include/nix/expr/trace-store.hh` | ~250 | `TraceStore`: pure SQLite backend (BSàlC trace store) |
+| `src/libexpr/trace-store.cc` | ~1700 | SQLite backend: schema, verify, record, constructive recovery, verifyTrace (BSàlC VT/CT operations), `computeCurrentHash` ('j'/'t'/'d' formats), DOM caches |
 | `src/libexpr/include/nix/expr/trace-hash.hh` | ~79 | HashSink-based trace hashing (CBOR serialization removed in Phase 12) |
 | `src/libexpr/trace-hash.cc` | ~89 | HashSink trace hashing implementations |
 
@@ -530,7 +563,7 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 `eval-trace-deps.hh/cc` + `dependency-tracker.hh/cc`), `stat-hash-cache.hh/cc`
 (folded into `dependency-tracker.cc` as an anonymous-namespace implementation detail).
 
-**Total new code:** ~4,400 lines across 15 files.
+**Total new code:** ~5,100 lines across 15 files.
 
 ### Modified Files
 
@@ -538,7 +571,7 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 |------|--------:|-------------|
 | `src/libexpr/eval.cc` | +88 | DependencyTracker integration (Adapton DDG), `evalFile` Content dep |
 | `src/libexpr/eval-trace-context.cc` | ~50 | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
-| `src/libexpr/primops.cc` | +210 | `recordDep` calls for all file-accessing builtins + `ReadFileProvenance` in readFile, provenance consumption in fromJSON |
+| `src/libexpr/primops.cc` | +310 | `recordDep` calls for all file-accessing builtins + `ReadFileProvenance` in readFile, provenance consumption in fromJSON, `DirDataNode`/`DirScalarNode` + ExprTracedData path in readDir |
 | `src/libexpr/primops/fetchTree.cc` | +12 | UnhashedFetch dep recording |
 | `src/libexpr/primops/fromTOML.cc` | +100 | `TomlDataNode`, `parseTracedTOML`, provenance consumption |
 | `src/libexpr/json-to-value.cc` | +120 | `JsonDataNode`, `parseTracedJSON`, `ExprTracedData::eval()` vtable |
@@ -565,9 +598,9 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 | `tests/functional/eval-trace-impure-advanced.sh` | ~350 | Deep origExpr, dep suspension, fat parent |
 | `tests/functional/eval-trace-impure-output.sh` | ~300 | Cursor eval, JSON, revert constructive recovery |
 | `tests/functional/eval-trace-impure-regression.sh` | ~200 | Specific bug regressions (3 tests) |
-| `src/libexpr-tests/eval-trace/traced-data.cc` | ~460 | GTest: lazy structural dep tracking (13 tests: JSON/TOML scalar access, two-level override, array access, provenance) |
+| `src/libexpr-tests/eval-trace/traced-data.cc` | ~2920 | GTest: lazy structural dep tracking (94 tests: 62 JSON/TOML + 32 directory; covers scalar access, two-level override, shape deps, provenance, directory entries) |
 
-**Total test code:** ~3,260 lines across 11 files.
+**Total test code:** ~5,700 lines across 11 files.
 
 ---
 

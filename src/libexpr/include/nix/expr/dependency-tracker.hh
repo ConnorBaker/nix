@@ -251,6 +251,13 @@ const TracedContainerProvenance * lookupTracedContainer(const void * key);
 void clearTracedContainerMap();
 
 /**
+ * Convert a directory entry type to its canonical string form.
+ * Must be consistent between DirScalarNode::canonicalValue() (primops.cc)
+ * and computeCurrentHash 'd' format handler (trace-store.cc).
+ */
+std::string dirEntryTypeString(std::optional<SourceAccessor::Type> type);
+
+/**
  * Stat metadata used as a cache key: if these fields match, the file
  * hasn't changed and the cached hash is still valid. Field types match
  * the POSIX stat struct. Used as the L1 cache key in StatHashCache and
