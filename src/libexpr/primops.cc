@@ -41,6 +41,46 @@
 
 namespace nix {
 
+// ── Shape dep recording for traced data containers ───────────────────
+// Called by shape-observing builtins (length, attrNames, hasAttr) to
+// record StructuredContent shape deps (#len for list length, #keys for
+// attrset key set). These helpers check the traced container provenance
+// map and only record deps for Values that came from ExprTracedData.
+
+static void maybeRecordListLenDep(const Value & v)
+{
+    if (!DependencyTracker::isActive()) return;
+    if (v.listSize() == 0) return; // Empty lists can't be tracked (no stable key)
+    // Use first element Value* as key (matches registration in ExprTracedData::eval)
+    auto * prov = lookupTracedContainer((const void *)v.listView()[0]);
+    if (!prov) return;
+    auto fullKey = prov->depKey + '\t' + prov->formatTag + ':' + prov->dataPath + "#len";
+    auto hash = depHash(std::to_string(v.listSize()));
+    DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+}
+
+static void maybeRecordAttrKeysDep(EvalState & state, const Value & v)
+{
+    if (!DependencyTracker::isActive()) return;
+    if (v.type() != nAttrs) return;
+    // Use Bindings* as key (matches registration in ExprTracedData::eval)
+    auto * prov = lookupTracedContainer((const void *)v.attrs());
+    if (!prov) return;
+    auto fullKey = prov->depKey + '\t' + prov->formatTag + ':' + prov->dataPath + "#keys";
+    std::vector<std::string_view> keys;
+    keys.reserve(v.attrs()->size());
+    for (auto & attr : *v.attrs())
+        keys.push_back(state.symbols[attr.name]);
+    std::sort(keys.begin(), keys.end());
+    std::string canonical;
+    for (size_t i = 0; i < keys.size(); i++) {
+        if (i > 0) canonical += '\0';
+        canonical += keys[i];
+    }
+    auto hash = depHash(canonical);
+    DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+}
+
 RegisterPrimOp::PrimOps & RegisterPrimOp::primOps()
 {
     static RegisterPrimOp::PrimOps primOps;
@@ -3181,6 +3221,7 @@ static RegisterPrimOp primop_path({
 static void prim_attrNames(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrNames");
+    maybeRecordAttrKeysDep(state, *args[0]);
 
     auto list = state.buildList(args[0]->attrs()->size());
 
@@ -3334,6 +3375,7 @@ static void prim_hasAttr(EvalState & state, const PosIdx pos, Value ** args, Val
 {
     auto attr = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.hasAttr");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.hasAttr");
+    maybeRecordAttrKeysDep(state, *args[1]);
     v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)));
 }
 
@@ -4000,6 +4042,7 @@ static RegisterPrimOp primop_concatLists({
 static void prim_length(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.length");
+    maybeRecordListLenDep(*args[0]);
     v.mkInt(args[0]->listSize());
 }
 

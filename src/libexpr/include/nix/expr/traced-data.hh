@@ -66,6 +66,13 @@ struct TracedDataNode : gc {
  *     removals) because the cached result is the leaf value, not the
  *     full attrset.
  *
+ *   - Container Values are registered in a thread-local provenance map
+ *     (see registerTracedContainer in dependency-tracker.hh). Shape-observing
+ *     builtins (length, attrNames, hasAttr) check this map and record
+ *     StructuredContent shape deps (#len for lists, #keys for attrsets).
+ *     The map key is a stable internal pointer (Bindings* for attrsets,
+ *     first-element Value* for lists) that survives Value copies.
+ *
  * For scalars: records a StructuredContent dep (BLAKE3 of canonical value)
  * and materializes the Nix value.
  *

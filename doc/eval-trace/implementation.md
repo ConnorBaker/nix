@@ -453,7 +453,24 @@ wrapped in `SuspendDepTracking` to prevent `ExprTracedData` thunks from recordin
 adding an element to a JSON array could make the `Content` dep fail while all
 existing `StructuredContent` deps pass, incorrectly overriding the list's trace.
 
-**Data path key escaping.** Object keys containing `.`, `[`, `]`, `"`, or `\`
+**Shape observation tracking.** Shape-observing builtins (`length`,
+`attrNames`, `hasAttr`) record `StructuredContent` shape deps when
+operating on traced data containers. Implementation uses a thread-local
+`tracedContainerMap` (in `dependency-tracker.cc`, anonymous namespace)
+mapping `const void*` → `TracedContainerProvenance` (depSource, depKey,
+dataPath, formatTag). The map key is a stable internal pointer that
+survives Value copies: `Bindings*` for attrsets, first-element `Value*`
+for lists. Empty lists cannot be tracked (no stable internal pointer)
+but this is safe — they have no leaf `StructuredContent` deps.
+`ExprTracedData::eval()` registers containers; builtins call
+`maybeRecordListLenDep()` / `maybeRecordAttrKeysDep()` in `primops.cc`.
+The map is cleared on root `DependencyTracker` construction via
+`onRootConstruction()`. `escapeDataPathKey()` now quotes `#` to prevent
+ambiguity with shape suffixes (`#len`, `#keys`). `computeCurrentHash()`
+in `trace-store.cc` detects `#len`/`#keys` suffixes and computes shape
+hashes during verification.
+
+**Data path key escaping.** Object keys containing `.`, `[`, `]`, `"`, `\`, or `#`
 are quoted using `"..."` with `\"` and `\\` escaping (matching Nix attr-path
 conventions). `parseDataPath` in `trace-store.cc` handles bare keys, quoted
 keys (with unescape), and array indices `[N]`.
@@ -466,12 +483,12 @@ using `\t` (tab) as separator.
 **Files added/modified:**
 - `traced-data.hh` (new): `TracedDataNode` + `ExprTracedData`
 - `eval-trace-deps.hh`: `StructuredContent = 12`
-- `dependency-tracker.hh/cc`: `ReadFileProvenance`, `resolveProvenance`
+- `dependency-tracker.hh/cc`: `ReadFileProvenance`, `resolveProvenance`, `TracedContainerProvenance`, `registerTracedContainer`/`lookupTracedContainer`/`clearTracedContainerMap`
 - `json-to-value.hh/cc`: `JsonDataNode`, `parseTracedJSON`, `ExprTracedData::eval()`
 - `primops/fromTOML.cc`: `TomlDataNode`, `parseTracedTOML`
 - `primops.cc`: provenance wiring in `readFile`/`fromJSON`
 - `trace-store.cc`: `computeCurrentHash` for StructuredContent, two-level `verifyTrace`, DOM caches, `navigateJson`/`navigateToml` helpers
-- `traced-data.cc` (new test): 13 GTest unit tests
+- `traced-data.cc` (new test): 34 GTest unit tests (13 core + 21 shape tracking)
 
 ---
 

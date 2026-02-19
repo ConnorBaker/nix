@@ -386,16 +386,32 @@ Container structures are cached at the trace level that produces them, where onl
 (when individual leaf values are forced), where the cached result is the leaf
 value and structural changes do not affect correctness.
 
-**Known trade-off (flat expressions).** If a single expression both observes
-container structure (e.g., `length`, `attrNames`) AND forces leaf values from
-traced data within the same `DependencyTracker`, the override could serve stale
-structural data. Example: `(toString (length arr)) + "-" + (elemAt arr 0)` — if
-the list size changes but element 0 is unchanged, the `StructuredContent` dep
-passes and the override serves the old string (with stale length). This is a
-fundamental tension: tracking container structure would prevent the override from
-surviving key-set changes, which is the primary use case. In practice, the
-hierarchical trace structure means structural observations and leaf access are in
-different traces (different `TracedExpr` levels), so this edge case is rare.
+**Shape observation tracking.** When shape-observing builtins (`length`,
+`attrNames`, `hasAttr`) operate on traced data containers, a shape dep is
+recorded as a `StructuredContent` dep with a `#len` or `#keys` suffix.
+This ensures the two-level override cannot serve stale structural data.
+For example, `(toString (length arr)) + "-" + (elemAt arr 0)` correctly
+invalidates when the array length changes, even if element 0 is unchanged.
+
+The shape dep key format is `"filepath\tf:datapath#len"` for list length
+(BLAKE3 of decimal size string) and `"filepath\tf:datapath#keys"` for
+attrset key sets (BLAKE3 of null-byte-joined sorted key names). Shape deps
+reuse the `StructuredContent` dep type and participate in two-level
+verification unchanged: if the shape changes, the dep fails and the
+override is prevented.
+
+Shape deps are recorded **only** when a shape-observing builtin is used.
+Point observers (`elemAt`, attribute select `.name`) and shape-preserving
+transforms (`mapAttrs`, `map`) do not record shape deps. This preserves
+the primary use case: `data.x` still survives key-set changes in the
+file because no shape dep is recorded — only the `StructuredContent` dep
+for `x`'s value participates in the override.
+
+**Remaining edge case (strict consumers).** Builtins like `sort`, `foldl'`,
+`filter`, `any`, `all` observe both shape and all values but are not yet
+instrumented. If a single TracedExpr applies such a builtin to traced data,
+an element count change could still cause a stale result. These builtins
+can be instrumented incrementally by adding `maybeRecordListLenDep()` calls.
 
 ### 4.5 Parent Chain Disambiguation (Salsa Versioned Query)
 

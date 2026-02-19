@@ -23,6 +23,38 @@ thread_local DependencyTracker * DependencyTracker::activeTracker = nullptr;
 // dependencies observed during this evaluation session).
 thread_local std::vector<Dep> DependencyTracker::sessionTraces;
 
+// ═══════════════════════════════════════════════════════════════════════
+// Traced container provenance map — shape dep tracking
+// ═══════════════════════════════════════════════════════════════════════
+
+// Thread-local map from stable container identity to provenance info.
+// Keys are internal pointers shared across Value copies:
+//   - Bindings* for attrsets (heap-allocated, stable)
+//   - First element Value* for lists (heap-allocated, stable)
+// Populated by ExprTracedData::eval(), queried by shape-observing builtins.
+static thread_local std::unordered_map<const void*, TracedContainerProvenance> tracedContainerMap;
+
+void DependencyTracker::onRootConstruction()
+{
+    clearTracedContainerMap();
+}
+
+void registerTracedContainer(const void * key, TracedContainerProvenance prov)
+{
+    tracedContainerMap.emplace(key, std::move(prov));
+}
+
+const TracedContainerProvenance * lookupTracedContainer(const void * key)
+{
+    auto it = tracedContainerMap.find(key);
+    return it != tracedContainerMap.end() ? &it->second : nullptr;
+}
+
+void clearTracedContainerMap()
+{
+    tracedContainerMap.clear();
+}
+
 // Record a dependency edge in the dynamic dependency graph (Adapton: "add-edge").
 // BSàlC §3.2: during fresh evaluation, the scheduler records each dependency
 // into the trace for later verification. Deduplication ensures each (type,

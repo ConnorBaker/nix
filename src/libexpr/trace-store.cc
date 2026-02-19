@@ -270,6 +270,16 @@ static std::optional<DepHashValue> computeCurrentHash(
         std::string filePath = dep.key.substr(0, sep);
         std::string dataPath = dep.key.substr(sep + 3);
 
+        // Check for shape suffix (#len or #keys)
+        std::string shapeSuffix;
+        if (dataPath.size() >= 4 && dataPath.compare(dataPath.size() - 4, 4, "#len") == 0) {
+            shapeSuffix = "len";
+            dataPath.resize(dataPath.size() - 4);
+        } else if (dataPath.size() >= 5 && dataPath.compare(dataPath.size() - 5, 5, "#keys") == 0) {
+            shapeSuffix = "keys";
+            dataPath.resize(dataPath.size() - 5);
+        }
+
         // Construct a synthetic Content dep to resolve the file path
         Dep fileDep{dep.source, filePath, DepHashValue{Blake3Hash{}}, DepType::Content};
         auto path = resolveDepPath(fileDep, inputAccessors);
@@ -286,7 +296,24 @@ static std::optional<DepHashValue> computeCurrentHash(
                 }
                 auto * node = navigateJson(cacheIt->second, dataPath);
                 if (!node) return std::nullopt;
-                return DepHashValue(depHash(node->dump()));
+                if (shapeSuffix == "len") {
+                    if (!node->is_array()) return std::nullopt;
+                    return DepHashValue(depHash(std::to_string(node->size())));
+                } else if (shapeSuffix == "keys") {
+                    if (!node->is_object()) return std::nullopt;
+                    std::vector<std::string> keys;
+                    for (auto & [k, _] : node->items())
+                        keys.push_back(k);
+                    std::sort(keys.begin(), keys.end());
+                    std::string canonical;
+                    for (size_t i = 0; i < keys.size(); i++) {
+                        if (i > 0) canonical += '\0';
+                        canonical += keys[i];
+                    }
+                    return DepHashValue(depHash(canonical));
+                } else {
+                    return DepHashValue(depHash(node->dump()));
+                }
             } else if (format == 't') {
                 auto cacheKey = dep.source + '\t' + filePath;
                 auto cacheIt = tomlDomCache.find(cacheKey);
@@ -302,7 +329,25 @@ static std::optional<DepHashValue> computeCurrentHash(
                 }
                 auto * node = navigateToml(cacheIt->second, dataPath);
                 if (!node) return std::nullopt;
-                return DepHashValue(depHash(tomlCanonical(*node)));
+                if (shapeSuffix == "len") {
+                    if (!node->is_array()) return std::nullopt;
+                    return DepHashValue(depHash(std::to_string(toml::get<std::vector<toml::value>>(*node).size())));
+                } else if (shapeSuffix == "keys") {
+                    if (!node->is_table()) return std::nullopt;
+                    auto & table = toml::get<toml::table>(*node);
+                    std::vector<std::string> keys;
+                    for (auto & [k, _] : table)
+                        keys.push_back(k);
+                    std::sort(keys.begin(), keys.end());
+                    std::string canonical;
+                    for (size_t i = 0; i < keys.size(); i++) {
+                        if (i > 0) canonical += '\0';
+                        canonical += keys[i];
+                    }
+                    return DepHashValue(depHash(canonical));
+                } else {
+                    return DepHashValue(depHash(tomlCanonical(*node)));
+                }
             }
             return std::nullopt;
         } catch (...) {

@@ -52,7 +52,14 @@ struct DependencyTracker {
         , startIndex(mySessionTraces->size())
     {
         activeTracker = this;
+        if (!previous) onRootConstruction();
     }
+
+    /**
+     * Called when a root DependencyTracker is constructed (no parent).
+     * Clears per-evaluation-session state such as the traced container map.
+     */
+    static void onRootConstruction();
     ~DependencyTracker() { activeTracker = previous; }
 
     DependencyTracker(const DependencyTracker &) = delete;
@@ -200,6 +207,41 @@ std::pair<std::string, std::string> resolveProvenance(
  * re-hashing after modifying files.
  */
 void clearStatHashMemoryCache();
+
+/**
+ * Provenance information for a container Value (attrset or list) produced
+ * by ExprTracedData::eval(). Used by shape-observing builtins (length,
+ * attrNames, hasAttr) to record shape deps (#len, #keys).
+ */
+struct TracedContainerProvenance {
+    std::string depSource;
+    std::string depKey;
+    std::string dataPath;
+    char formatTag;
+};
+
+/**
+ * Register a container in the thread-local provenance map.
+ * Called by ExprTracedData::eval() for Object and Array nodes.
+ *
+ * The key is a stable internal pointer that survives Value copies:
+ * - For attrsets: Bindings* (heap-allocated, shared across copies)
+ * - For lists: first element Value* (heap-allocated, shared across copies)
+ * Empty lists cannot be tracked (no stable internal pointer).
+ */
+void registerTracedContainer(const void * key, TracedContainerProvenance prov);
+
+/**
+ * Look up a container in the thread-local provenance map.
+ * Returns nullptr if not found.
+ */
+const TracedContainerProvenance * lookupTracedContainer(const void * key);
+
+/**
+ * Clear the thread-local traced container provenance map.
+ * Called on root DependencyTracker construction.
+ */
+void clearTracedContainerMap();
 
 /**
  * Stat metadata used as a cache key: if these fields match, the file

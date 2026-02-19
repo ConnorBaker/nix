@@ -301,14 +301,15 @@ struct JsonDataNode : TracedDataNode {
 } // anonymous namespace
 
 // ── Data path key escaping ────────────────────────────────────────────
-// Keys that contain '.', '[', ']', '"', or '\' are quoted with "..." and
-// inner '"' / '\' are backslash-escaped. Matches Nix attr-path conventions.
+// Keys that contain '.', '[', ']', '"', '\', or '#' are quoted with "..." and
+// inner '"' / '\' are backslash-escaped. '#' is quoted to avoid ambiguity with
+// shape dep suffixes (#len, #keys). Matches Nix attr-path conventions.
 
 static std::string escapeDataPathKey(const std::string & key)
 {
     bool needsQuote = false;
     for (char c : key) {
-        if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\') {
+        if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\' || c == '#') {
             needsQuote = true;
             break;
         }
@@ -354,6 +355,10 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
             attrs.insert(state.symbols.create(k), thunkVal);
         }
         v.mkAttrs(attrs);
+        if (DependencyTracker::isActive()) {
+            // Use Bindings* as key: heap-allocated, shared across Value copies
+            registerTracedContainer((const void *)v.attrs(), {depSource, depKey, dataPath, node->formatTag()});
+        }
         break;
     }
     case TracedDataNode::Kind::Array: {
@@ -369,6 +374,13 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
             list[i] = thunkVal;
         }
         v.mkList(list);
+        if (DependencyTracker::isActive() && sz > 0) {
+            // Use first element Value* as key: heap-allocated, shared across Value copies.
+            // Empty lists cannot be tracked (no stable internal pointer), but this is
+            // safe: an empty list has no leaf StructuredContent deps, so the two-level
+            // override cannot apply when the file changes.
+            registerTracedContainer((const void *)list[0], {depSource, depKey, dataPath, node->formatTag()});
+        }
         break;
     }
     case TracedDataNode::Kind::String:
