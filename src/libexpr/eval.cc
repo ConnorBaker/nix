@@ -1124,7 +1124,12 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         importResolutionCache->emplace(path, *resolvedPath);
     }
 
-    // Record Content oracle dep for eval trace (Adapton DDG edge)
+    // Record Content oracle dep for eval trace (Adapton DDG edge).
+    // Note: the Content dep covers the whole file. For .nix code consumed
+    // via import/evalFile, no fine-grained override exists — any byte change
+    // invalidates the trace. For data files consumed by fromJSON/fromTOML,
+    // ReadFileProvenance enables StructuredContent two-level override.
+    // See design.md Section 4.6 (Dependency Over-Approximation).
     if (DependencyTracker::isActive()) {
         std::optional<Blake3Hash> hash;
         if (auto it = traceCtx->fileContentHashes.find(*resolvedPath); it != traceCtx->fileContentHashes.end()) {

@@ -315,6 +315,14 @@ private:
 // The stat-hash cache acts as an oracle memoization layer — if the file's
 // stat metadata (dev, ino, mtime_ns, size) is unchanged since the last
 // hashing, the cached BLAKE3 hash is returned without re-reading the file.
+//
+// Note: hashes the entire file content. For .nix files consumed via
+// import/evalFile, this is an over-approximation — a change to any part
+// of the file invalidates all traces that depend on it, even if the change
+// is semantically irrelevant (e.g., reformatting, adding a comment in an
+// unused branch). For data files consumed by fromJSON/fromTOML, the
+// StructuredContent two-level override (see design.md Section 4.6) can
+// mitigate this. For .nix code, no fine-grained override exists.
 Blake3Hash depHashFile(const SourcePath & path)
 {
     if (auto physPath = path.getPhysicalPath()) {

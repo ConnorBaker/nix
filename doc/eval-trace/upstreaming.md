@@ -2,53 +2,29 @@
 
 **Target audience:** Nix core team reviewing the PR.
 
-This document covers how to prepare the `vibe-coding/file-based-cas-trace-cache`
-branch for upstreaming: commit cleanup, code organization review, documentation
-checklist, and verification.
+This document covers how to prepare the `vibe-coding/file-based-eval-cache`
+branch for upstreaming: commit organization, code review checklist,
+documentation checklist, and verification.
 
 For terminology and prior art references, see [design.md](design.md) Section 2.
 
 ---
 
-## 1. Branch Overview
+## 1. Proposed Commit Organization
 
-**7 commits, 82 files changed, +14,055/-998 lines.**
-
-The 25 original development commits have been squashed and reorganized into
-7 clean, incremental commits. Each commit is independently buildable.
-
-### Commits (oldest to newest)
-
-```
-5453c6274 BLAKE3 HashSink support and SQLite BLOB binding
-2d1673b1c DependencyTracker, dep types, and StatHashCache
-5365b9e0f Add getStableIdentity() to all fetcher input schemes
-2d198c5cf TracedExpr thunks, CAS blob traces, and three-phase recovery
-fe2b6b8e4 Eval trace functional tests
-de8e0dfb7 Disable eval trace in GC and CA tests
-bb1642e07 Eval trace design, implementation, and upstreaming documentation
-```
-
----
-
-## 2. Commit Cleanup Strategy
-
-The original 25 development commits have been squashed and reorganized into
-7 clean, incremental commits. Each commit is independently buildable and
-testable.
+The development commits should be squashed and reorganized into clean,
+incremental commits. Each commit should be independently buildable.
 
 ### Commit 1: BLAKE3 + SQLite BLOB Prerequisites
 
 **Small prerequisite changes needed by later commits.**
 
 **Modified files:**
-- `src/libutil/hash.cc` -- BLAKE3 HashSink support (+9)
-- `src/libutil/include/nix/util/hash.hh` -- BLAKE3 hash type (+8)
-- `src/libstore/sqlite.cc` -- BLOB binding extension (+9)
-- `src/libstore/include/nix/store/sqlite.hh` -- BLOB API (+2)
-- `package.nix` -- Build dependency additions (+2)
-
-**~30 lines.**
+- `src/libutil/hash.cc` -- BLAKE3 HashSink support
+- `src/libutil/include/nix/util/hash.hh` -- BLAKE3 hash type
+- `src/libstore/sqlite.cc` -- BLOB binding extension
+- `src/libstore/include/nix/store/sqlite.hh` -- BLOB API
+- `package.nix` -- Build dependency additions
 
 ### Commit 2: DependencyTracker + Dep Types + StatHashCache
 
@@ -58,30 +34,27 @@ This commit introduces the dependency tracking layer (analogous to Adapton's DDG
 construction) without any eval trace changes. It can be reviewed and tested
 independently.
 
-**New files** *(reorganized in Phase 13 — see current layout below)*:
-- `src/libexpr/include/nix/expr/eval-trace-deps.hh` (~250 lines)
-  - `DepType` enum (11 types), `Dep` struct, `Blake3Hash` struct
-  - `DepHashValue` variant, `DepKey` dedup key
-- `src/libexpr/eval-trace-deps.cc` (~25 lines)
-  - `depTypeName()` implementation
-- `src/libexpr/include/nix/expr/dependency-tracker.hh` (~170 lines)
+**New files:**
+- `src/libexpr/include/nix/expr/eval-trace-deps.hh` (header-only)
+  - `DepType` enum (12 types), `Dep` struct, `Blake3Hash` struct
+  - `DepHashValue` variant, `DepKey` dedup key, inline `depTypeName()`
+- `src/libexpr/include/nix/expr/dependency-tracker.hh`
   - `DependencyTracker` RAII tracker (Adapton DDG builder), `SuspendDepTracking`
   - `depHash*` functions, `recordDep`, `resolveToInput`
-- `src/libexpr/dependency-tracker.cc` (~450 lines)
+- `src/libexpr/dependency-tracker.cc`
   - Dep recording, BLAKE3 hashing, input resolution
-  - StatHashCache (anonymous namespace): L1 concurrent_flat_map, L2 bulk-loaded from TraceStore, dirty tracking for flush
+  - StatHashCache (anonymous namespace): L1 concurrent_flat_map, L2 bulk-loaded
+    from TraceStore, dirty tracking for flush
 
 **Modified files:**
-- `src/libexpr/eval.cc` -- `evalFile` Content dep recording (+88 lines)
-- `src/libexpr/primops.cc` -- `recordDep` calls for all builtins (+184 lines)
-- `src/libexpr/primops/fetchTree.cc` -- UnhashedFetch dep recording (+12)
-- `src/libexpr/primops/fetchMercurial.cc` -- UnhashedFetch dep recording (+7)
-- `src/libexpr/include/nix/expr/eval.hh` -- `EvalTraceContext` (via `traceCtx`) (+41)
+- `src/libexpr/eval.cc` -- `evalFile` Content dep recording
+- `src/libexpr/primops.cc` -- `recordDep` calls for all builtins
+- `src/libexpr/primops/fetchTree.cc` -- UnhashedFetch dep recording
+- `src/libexpr/primops/fetchMercurial.cc` -- UnhashedFetch dep recording
+- `src/libexpr/include/nix/expr/eval.hh` -- `EvalTraceContext` (via `traceCtx`)
 - `src/libexpr/include/nix/expr/eval-trace-context.hh` -- trace context struct
 - `src/libexpr/eval-trace-context.cc` -- trace context implementation
 - Meson build files for new sources
-
-**~1,700 lines.**
 
 ### Commit 3: Fetcher Stable Identities
 
@@ -91,117 +64,117 @@ Provides the `contextHash` partition key used by the trace store (BSàlC trace
 store). Small and self-contained -- can be reviewed independently.
 
 **Modified files:**
-- `src/libfetchers/fetchers.cc` -- `getStableIdentity()` (+5)
-- `src/libfetchers/git.cc` -- `git:<url>` identity (+5)
-- `src/libfetchers/github.cc` -- `<scheme>:<host>/<owner>/<repo>` identity (+24)
-- `src/libfetchers/mercurial.cc` -- `hg:<url>` identity (+5)
-- `src/libfetchers/path.cc` -- `path:<path>` identity (+5)
-- `src/libfetchers/tarball.cc` -- `tarball:<url>` identity (+10)
-- `src/libfetchers/include/nix/fetchers/fetchers.hh` -- API (+18)
+- `src/libfetchers/fetchers.cc` -- `getStableIdentity()`
+- `src/libfetchers/git.cc` -- `git:<url>` identity
+- `src/libfetchers/github.cc` -- `<scheme>:<host>/<owner>/<repo>` identity
+- `src/libfetchers/mercurial.cc` -- `hg:<url>` identity
+- `src/libfetchers/path.cc` -- `path:<path>` identity
+- `src/libfetchers/tarball.cc` -- `tarball:<url>` identity
+- `src/libfetchers/include/nix/fetchers/fetchers.hh` -- API
 
-**~72 lines.**
+### Commit 4: TracedExpr + TraceStore + Recovery + Unit Tests
 
-### Commit 4: TracedExpr + CAS Store + Recovery + Unit Tests
+**Core eval trace: TracedExpr thunks (Adapton articulation points), pure SQLite
+trace store (BSàlC constructive traces), two-strategy constructive recovery.**
 
-**Core eval trace: TracedExpr thunks (Adapton articulation points), CAS blob
-traces (BSàlC constructive traces), three-phase constructive recovery.**
-
-This is the largest commit. It replaces the existing `AttrCursor` tree navigation
-with `TracedExpr` GC-allocated thunks, adds the CAS store backend with CBOR
-serialization, and includes all C++ unit tests.
+This is the largest commit. It replaces the existing `AttrCursor` tree
+navigation with `TracedExpr` GC-allocated thunks, adds the pure SQLite
+`TraceStore` backend, and includes all C++ unit tests.
 
 **New/rewritten files:**
-- `src/libexpr/include/nix/expr/trace-cache.hh` (124 lines, rewrite)
-  - `TraceCache` class, `ResultKind`/`CachedResult` types, performance counters
-- `src/libexpr/trace-cache.cc` (888 lines, rewrite)
-  - `TracedExpr` (Adapton articulation point), `ExprOrigChild`, `SharedParentResult`
+- `src/libexpr/include/nix/expr/trace-cache.hh`
+  - `TraceCache` class, performance counters
+- `src/libexpr/trace-cache.cc`
+  - `TracedExpr` (Adapton articulation point), `ExprOrigChild`,
+    `SharedParentResult`
   - `eval()` dispatch: verify / fresh evaluation / constructive recovery paths
   - `navigateToReal()`, `evaluateFresh()` (Adapton demand-driven recomputation),
     `materializeResult()`
   - `recordSiblingTrace()`, `replayTrace()` (Adapton change propagation)
-- `src/libexpr/include/nix/expr/trace-cache-store.hh` (262 lines)
-  - `TraceCacheStore`: record/verify/recover (BSàlC CT operations), trace I/O,
-    deferred writes
-  - Two-object trace model documentation
-- `src/libexpr/trace-cache-store.cc` (603 lines)
-  - `record()` (BSàlC trace recording), `verify()` (BSàlC VT check),
-    `recovery()` (BSàlC constructive recovery) with direct hash + structural variant strategies
-  - `storeTrace()`, `loadTrace()`, `loadDepsForTrace()`
-- `src/libexpr/include/nix/expr/eval-index-db.hh` (142 lines)
-  - `EvalIndexDb`: SQLite index with 3 tables
-- `src/libexpr/eval-index-db.cc` (283 lines)
-  - Schema creation, prepared statements, batch writes
-- `src/libexpr/include/nix/expr/trace-hash.hh` (150 lines)
-  - `EvalTrace` struct (BSàlC trace = key + dep hashes + result), CBOR
-    serialize/deserialize, hash functions
-  - `serializeTrace`/`deserializeTrace` (zstd-compressed CBOR)
-- `src/libexpr/trace-hash.cc` (385 lines)
-  - CBOR encoding via nlohmann::json, dep hash computation
+- `src/libexpr/include/nix/expr/trace-result.hh` (header-only)
+  - `ResultKind`, `CachedResult`, all result structs
+- `src/libexpr/include/nix/expr/trace-store.hh`
+  - `TraceStore`: pure SQLite backend (BSàlC trace store) with 8-table schema
+- `src/libexpr/trace-store.cc`
+  - Schema (Strings, AttrPaths, Results, DepKeySets, Traces, CurrentTraces,
+    TraceHistory, StatHashCache)
+  - `verify()` (BSàlC VT check), `record()` (BSàlC CT recording),
+    `recovery()` (BSàlC constructive recovery) with direct hash + structural
+    variant strategies
+  - `loadFullTrace()`, `loadKeySet()`, `verifyTrace()`, two-level
+    StructuredContent verification, DOM caching
+- `src/libexpr/include/nix/expr/trace-hash.hh`
+  - `computeTraceHash`, `computeTraceStructHash`, `sortAndDedupDeps`
+- `src/libexpr/trace-hash.cc`
+  - HashSink-based BLAKE3 trace hashing (domain-separated fields)
+- `src/libexpr/include/nix/expr/traced-data.hh` (header-only)
+  - `TracedDataNode` virtual interface, `ExprTracedData` Expr subclass
 
 **Modified files:**
-- `src/libcmd/installable-attr-path.cc` -- TracedExpr root creation (+233)
-- `src/libcmd/installable-flake.cc` -- Flake eval trace lifecycle (+145)
-- `src/libcmd/installables.cc` -- `getRootValue()` integration (+66)
-- `src/libcmd/common-eval-args.cc` -- Trace option plumbing (+27)
-- `src/libflake/flake.cc` -- Input accessor mappings (+85)
-- `src/nix/eval.cc` -- Value-based API (+28)
-- `src/nix/search.cc` -- Value-based API (+55)
-- `src/nix/flake.cc` -- Value-based API (+121)
-- `src/nix/app.cc` -- Value-based API (+101)
-- `src/nix/main.cc` -- Stats output (+10)
-- `src/libexpr/include/nix/expr/eval-inline.hh` -- `forceValue` hook (+14)
-- `src/libexpr/include/nix/expr/eval-settings.hh` -- Settings (+10)
-- `src/libexpr/print.cc`, `src/libexpr/include/nix/expr/print.hh` -- Print support (+2)
+- `src/libcmd/installable-attr-path.cc` -- TracedExpr root creation
+- `src/libcmd/installable-flake.cc` -- Flake eval trace lifecycle
+- `src/libcmd/installables.cc` -- `getRootValue()` integration
+- `src/libcmd/common-eval-args.cc` -- Trace option plumbing
+- `src/libflake/flake.cc` -- Input accessor mappings
+- `src/nix/eval.cc` -- Value-based API
+- `src/nix/search.cc` -- Value-based API
+- `src/nix/flake.cc` -- Value-based API
+- `src/nix/app.cc` -- Value-based API
+- `src/nix/main.cc` -- Stats output
+- `src/libexpr/include/nix/expr/eval-inline.hh` -- `forceValue` hook
+- `src/libexpr/include/nix/expr/eval-settings.hh` -- Settings
+- `src/libexpr/print.cc`, `src/libexpr/include/nix/expr/print.hh` -- Print support
+- `src/libexpr/primops.cc` -- `ReadFileProvenance` in readFile, `DirDataNode`/
+  `DirScalarNode` + `ExprTracedData` wrapping in readDir
+- `src/libexpr/primops/fromTOML.cc` -- `TomlDataNode`, `parseTracedTOML`
+- `src/libexpr/json-to-value.cc` -- `JsonDataNode`, `parseTracedJSON`,
+  `ExprTracedData::eval()` vtable emission
 - Various `.hh` files in `src/libcmd/include/` -- Interface changes
 
 **Deleted:**
 - `tests/functional/flakes/trace-cache.sh` (replaced by new test suites)
 
-**Unit test files (9 files):**
-- `src/libexpr-tests/eval-trace/helpers.hh` (174 lines)
-- `src/libexpr-tests/eval-trace/helpers.cc` (64 lines)
-- `src/libexpr-tests/eval-trace/trace-cache.cc` (459 lines)
-- `src/libexpr-tests/eval-trace/trace-store.cc` (1,478 lines)
-- `src/libexpr-tests/eval-trace/trace-hash.cc` (170 lines)
-- `src/libexpr-tests/eval-trace/dep-tracker.cc` (456 lines)
-- `src/libexpr-tests/eval-trace/stat-hash-cache.cc` (186 lines)
-- `src/libexpr-tests/eval-trace/dep-tracking.cc` (790 lines)
-- `src/libexpr-tests/eval-trace/integration.cc` (371 lines)
-
-**~4,150 lines.**
+**Unit test files:**
+- `src/libexpr-tests/eval-trace/helpers.hh`
+- `src/libexpr-tests/eval-trace/helpers.cc`
+- `src/libexpr-tests/eval-trace/trace-cache.cc`
+- `src/libexpr-tests/eval-trace/trace-store.cc`
+- `src/libexpr-tests/eval-trace/traced-data.cc`
+- `src/libexpr-tests/eval-trace/trace-hash.cc`
+- `src/libexpr-tests/eval-trace/dep-tracker.cc`
+- `src/libexpr-tests/eval-trace/stat-hash-cache.cc`
+- `src/libexpr-tests/eval-trace/dep-tracking.cc`
+- `src/libexpr-tests/eval-trace/integration.cc`
+- `src/libexpr-tests/eval-trace/per-sibling-invalidation.cc`
 
 ### Commit 5: Functional Tests
 
-**10 functional test suites covering all eval trace behavior.**
+**Functional test suites covering all eval trace behavior.**
 
 **New files:**
-- `tests/functional/flakes/eval-trace-core.sh` (427 lines)
-- `tests/functional/flakes/eval-trace-deps.sh` (286 lines)
-- `tests/functional/flakes/eval-trace-output.sh` (192 lines)
-- `tests/functional/flakes/eval-trace-recovery.sh` (157 lines)
-- `tests/functional/flakes/eval-trace-volatile.sh` (129 lines)
-- `tests/functional/eval-trace-impure-core.sh` (200 lines)
-- `tests/functional/eval-trace-impure-deps.sh` (422 lines)
-- `tests/functional/eval-trace-impure-advanced.sh` (343 lines)
-- `tests/functional/eval-trace-impure-output.sh` (351 lines)
-- `tests/functional/eval-trace-impure-regression.sh` (273 lines)
+- `tests/functional/flakes/eval-trace-core.sh`
+- `tests/functional/flakes/eval-trace-deps.sh`
+- `tests/functional/flakes/eval-trace-output.sh`
+- `tests/functional/flakes/eval-trace-recovery.sh`
+- `tests/functional/flakes/eval-trace-volatile.sh`
+- `tests/functional/eval-trace-impure-core.sh`
+- `tests/functional/eval-trace-impure-deps.sh`
+- `tests/functional/eval-trace-impure-advanced.sh`
+- `tests/functional/eval-trace-impure-output.sh`
+- `tests/functional/eval-trace-impure-regression.sh`
 
 **Modified files:**
-- `tests/functional/flakes/meson.build` -- Register new test suites (+6)
-- `tests/functional/meson.build` -- Register new test suites (+5)
-- `tests/functional/common/functions.sh` -- Shared helpers (+5)
-
-**~2,800 lines.**
+- `tests/functional/flakes/meson.build` -- Register new test suites
+- `tests/functional/meson.build` -- Register new test suites
+- `tests/functional/common/functions.sh` -- Shared helpers
 
 ### Commit 6: Test Fixes + GC Workaround
 
 **Disable eval trace in GC tests and fix CA test interaction.**
 
 **Modified files:**
-- `tests/functional/gc-auto.sh` -- Disable eval trace in GC tests (+11)
-- `tests/functional/ca/issue-13247.sh` -- Test fix (+26)
-
-**~37 lines.**
+- `tests/functional/gc-auto.sh` -- Disable eval trace in GC tests
+- `tests/functional/ca/issue-13247.sh` -- Test fix
 
 ### Commit 7: Documentation
 
@@ -222,17 +195,16 @@ serialization, and includes all C++ unit tests.
 
 ---
 
-## 3. Code Organization Review
+## 2. Code Organization Review
 
 Checklist of items to consider before upstreaming:
 
 ### File Size
 
-- [x] **trace-cache.cc (888 lines)**: The `TracedExpr` struct definition (~130
-  lines) + support types (`ExprOrigChild`, `SharedParentResult`, ~70 lines) + the
-  `eval()` method (~200 lines, implementing BSàlC verify/record/recover dispatch)
-  are all in one file. Acceptable -- layout keeps everything close to usage, which
-  aids understanding.
+- [x] **trace-cache.cc**: The `TracedExpr` struct definition + support types
+  (`ExprOrigChild`, `SharedParentResult`) + the `eval()` method (implementing
+  BSàlC verify/record/recover dispatch) are all in one file. Acceptable --
+  layout keeps everything close to usage, which aids understanding.
 
 - [x] **eval-trace-deps.hh + dependency-tracker.hh** (formerly dep-tracker.hh):
   Split into vocabulary types (`DepType`, `Blake3Hash`, `DepHashValue`, `Dep`,
@@ -241,19 +213,19 @@ Checklist of items to consider before upstreaming:
   split eliminates the grab-bag concern. StatHashCache folded into
   dependency-tracker.cc as an anonymous namespace implementation detail.
 
-- [x] **trace-cache-store.cc (603 lines)**: `record()` (~100 lines, BSàlC CT
-  recording), `verify()` (~60 lines, BSàlC VT check), `recovery()` (~150 lines,
-  BSàlC constructive recovery), trace I/O (~100 lines),
-  `storeTrace()`/`loadTrace()` (~80 lines). Well-structured with clear section
+- [x] **trace-store.cc**: `record()` (BSàlC CT recording), `verify()` (BSàlC VT
+  check), `recovery()` (BSàlC constructive recovery), `loadFullTrace()`,
+  `loadKeySet()`, `verifyTrace()` with two-level StructuredContent override,
+  `computeCurrentHash()`, DOM caches. Well-structured with clear section
   headers. Acceptable as-is.
 
 ### Code Patterns
 
-- [x] **primops.cc recordDep calls (184 lines)**: Each built-in that accesses
-  files has a `recordDep(...)` call with appropriate type and hash. The calls
-  are repetitive but each has type-specific logic (Content vs Directory vs
-  Existence, NAR vs raw bytes, etc.). A wrapper macro would obscure the type
-  semantics. Acceptable as-is.
+- [x] **primops.cc recordDep calls**: Each built-in that accesses files has a
+  `recordDep(...)` call with appropriate type and hash. The calls are repetitive
+  but each has type-specific logic (Content vs Directory vs Existence, NAR vs raw
+  bytes, etc.). A wrapper macro would obscure the type semantics. Acceptable
+  as-is.
 
 - [x] **recordSiblingTrace (trace-cache.cc)**: Large method that serializes
   values and defers writes. The value serialization switch is similar to
@@ -268,57 +240,38 @@ Checklist of items to consider before upstreaming:
 
 ### Naming
 
-- [x] **`storeAttrPath()` returns null-byte-separated strings**: The name could
-  be confused with "store path" (Nix store). However, it is only used internally
-  by the store backend for index lookups. **Decision:** Keep as-is -- renaming to
-  `serializedAttrPath()` or `indexAttrPath()` would be clearer but the function
-  is internal and documented. Low priority for upstream review.
-
-- [x] **`tracePath`**: Good name -- clearly identifies the content-addressed
-  trace blob (BSàlC constructive trace) in the store. No change needed.
+- [x] **`buildAttrPath()` returns tab-separated strings**: Used internally for
+  SQLite AttrPaths table lookups. The name is accurate.
 
 - [x] **`contextHash`**: The first 8 bytes of BLAKE3 of the stable identity.
   Could be confused with `NixStringContext`. **Decision:** Keep as-is -- the name
-  is accurate in the eval trace context and well-documented in
-  `trace-cache-store.hh`. Renaming to `identityHash` is an option if reviewers
-  flag it, but the term "context" here refers to "evaluation context" (flake
-  inputs, expression hash), not string context.
+  is accurate in the eval trace context and well-documented in `trace-store.hh`.
+  Renaming to `identityHash` is an option if reviewers flag it, but the term
+  "context" here refers to "evaluation context" (flake inputs, expression hash),
+  not string context.
 
 ### Dead Code
 
-- [x] Verify no remnants of the intermediate SQLite-based AttrDb design remain
-  (all removed in the CAS blob trace commit). **Verified:** No `class AttrDb`
-  references in any source files.
-
-- [x] Verify `trace-store.hh/cc` files are fully removed (they were part of
-  the intermediate design). **Verified:** Files do not exist.
-  `src/libstore/builtins/eval.cc` (marker builders) also confirmed removed.
+- [x] Verify no remnants of intermediate designs remain (CAS blob traces,
+  EvalIndexDb, AttrDb, TraceCacheStore, CBOR serialization). **Verified:** None
+  of these classes or patterns exist in the current codebase.
 
 ---
 
-## 4. Interface Documentation Checklist
+## 3. Interface Documentation Checklist
 
 Files needing documentation review before upstreaming:
 
-- [x] **trace-cache.hh** -- `TraceCache` class has `///@file` marker, method-level
-  docs on `getOrEvaluateRoot()` and `getRootValue()`, field docs on
-  `storeBackend` and `inputAccessors`. `ResultKind` enum could use per-value docs
-  but is self-descriptive. Adequate for review.
+- [x] **trace-cache.hh** -- `TraceCache` class with method-level docs.
+  `ResultKind` is in a separate header (`trace-result.hh`). Adequate for review.
 
-- [x] **trace-cache-store.hh** -- Comprehensive doxygen on every public method.
-  Module-level comment describes the two-object trace model (BSàlC constructive
-  trace structure). `DeferredColdStore` and `TraceCacheStore` both have detailed
-  class-level docs. Ready for review.
+- [x] **trace-store.hh** -- `TraceStore` struct with comprehensive doxygen on
+  `verify()`, `record()`, `recovery()`, `loadFullTrace()`, `loadKeySet()`, and
+  `verifyTrace()`. Documents factored serialization (`serializeKeys`,
+  `serializeValues`, etc.) and session caches. Ready for review.
 
-- [x] **eval-index-db.hh** -- Module-level comment explains index role and how
-  losses affect recovery (BSàlC constructive trace recovery degrades to fresh
-  evaluation). All public methods documented. `IndexEntry` and `StructGroup`
-  structs documented. Ready for review.
-
-- [x] **trace-hash.hh** -- `EvalTrace` struct (BSàlC trace = key + dep hashes +
-  result) well-documented with field explanations. Serialization functions have
-  format descriptions. `serializeTrace`/`deserializeTrace` document the
-  zstd-compressed CBOR format. Ready for review.
+- [x] **trace-hash.hh** -- `computeTraceHash`, `computeTraceStructHash`,
+  `sortAndDedupDeps`. Domain-separated BLAKE3 hashing. Ready for review.
 
 - [x] **eval-trace-deps.hh** -- `DepType` enum categorized into Hash Oracle,
   Reference Resolution, and Volatile types with per-value docs. `Dep` struct
@@ -329,47 +282,43 @@ Files needing documentation review before upstreaming:
   declarations documented. StatHashCache is internal (anonymous namespace in
   dependency-tracker.cc) and invisible to consumers. Ready for review.
 
+- [x] **traced-data.hh** -- `TracedDataNode` virtual interface and
+  `ExprTracedData` Expr subclass for lazy structural dep tracking. Documents
+  the two-level verification mechanism. Ready for review.
+
 ---
 
-## 5. Duplicate Functionality Check
+## 4. Duplicate Functionality Check
 
 Analysis of potential overlap with existing Nix code:
 
 | Area | Status | Notes |
 |------|--------|-------|
-| CBOR | No duplication | Centralized in `trace-hash.cc` via `nlohmann::json::to_cbor`. No other CBOR usage in Nix. |
 | BLAKE3 | No duplication | Uses existing `nix::Hash` / `nix::HashSink` throughout. `Blake3Hash` is a lightweight 32-byte wrapper. |
-| SQLite | No duplication | Extends existing `sqlite.hh/cc` wrapper. `EvalIndexDb` uses standard `SQLite`/`SQLiteStmt`. |
+| SQLite | No duplication | Extends existing `sqlite.hh/cc` wrapper. `TraceStore` uses standard `SQLite`/`SQLiteStmt`. |
 | File hashing | No duplication | Centralized in `StatHashCache` + `depHash*` functions. No overlap with store-level hashing. |
-| Store operations | No duplication | Uses standard `Store::addTextToStore()` for CAS blobs (constructive trace storage). |
-| JSON/CBOR library | Existing dependency | `nlohmann/json` is already used by libexpr (no new dependency). |
+| zstd compression | No duplication | Uses existing `nix/util/compression.hh` for `keys_blob` and `values_blob` compression. |
 
-**No new external dependencies added.**
+**No new external dependencies added** (BLAKE3, SQLite, zstd are all existing
+Nix dependencies).
 
 ---
 
-## 6. Pre-Upstreaming Verification
+## 5. Pre-Upstreaming Verification
 
 ### Functional Tests
 
 ```bash
-# All functional tests (expects 199 OK, 8 skipped, 0 failures)
-nix build -L .#nix-functional-tests
-
 # Individual test suites
 nix develop --command bash -c "meson test -C build --suite flakes"
 nix develop --command bash -c "meson test -C build --suite main"
-nix develop --command bash -c "meson test -C build --suite ca"
 ```
 
 ### C++ Unit Tests
 
 ```bash
-# All unit tests (expects 677 tests, 0 failures)
-nix develop --command bash -c "meson test -C build --suite main"
-
-# Eval trace specific
-nix develop --command bash -c "meson test -C build trace-cache"
+# All unit tests
+cd build && ./src/libexpr-tests/nix-expr-tests
 ```
 
 ### Performance Sanity Check
@@ -378,7 +327,7 @@ nix develop --command bash -c "meson test -C build trace-cache"
 # Fresh evaluation path (first eval -- Adapton demand-driven recomputation)
 rm -rf ~/.cache/nix/eval-trace-v2.sqlite
 time nix eval nixpkgs#hello.pname
-# Expected: ~3-5s (dominated by evaluation + store I/O)
+# Expected: ~3-5s (dominated by evaluation)
 
 # Verify path (BSàlC verifying trace check -- traced eval)
 time nix eval nixpkgs#hello.pname
@@ -390,30 +339,20 @@ time nix eval nixpkgs#hello.pname
 ```bash
 # Full test suite including non-eval-trace tests
 nix develop --command bash -c "meson test -C build"
+```
 
-# CA tests (sensitive to store operations)
-nix develop --command bash -c "meson test -C build --suite ca"
+### ASAN Testing
+
+```bash
+meson configure build -Db_sanitize=address
+meson compile -C build
+ASAN_OPTIONS=detect_leaks=0 ./build/src/libexpr-tests/nix-expr-tests
+meson configure build -Db_sanitize=none  # restore
 ```
 
 ---
 
-## 7. Summary of Changes by Category
-
-| Category | Files | Lines | Description |
-|----------|------:|------:|-------------|
-| Core eval trace | 12 | ~3,870 | TracedExpr (Adapton articulation points), trace store (BSàlC CT), index, serialization |
-| Dep tracking | 4 | ~1,033 | DependencyTracker (Adapton DDG builder), StatHashCache |
-| CLI integration | 15 | ~970 | installables, commands, settings, fetcher IDs |
-| C++ unit tests | 10 | ~4,508 | Component and integration tests |
-| Functional tests | 10 | ~2,780 | End-to-end trace verification and recovery tests |
-| Build system | 7 | ~37 | Meson build file updates |
-| Test fixes | 3 | ~42 | gc-auto.sh, CA test, common functions |
-| Documentation | 3 | ~1,811 | Design (with prior art), implementation, upstreaming docs |
-| **Total** | **82 files** | **~13,022 net** | |
-
----
-
-## 8. Review Guidance
+## 6. Review Guidance
 
 ### Recommended Review Order
 
@@ -423,60 +362,63 @@ nix develop --command bash -c "meson test -C build --suite ca"
    recorded during evaluation (cf. Shake's dynamic dependencies, Adapton's DDG
    construction).
 
-2. **`trace-cache.hh`** -- Public API surface (124 lines). Understand what
-   consumers see: `TraceCache`, `ResultKind`, `CachedResult`.
+2. **`trace-result.hh`** -- Result vocabulary: `ResultKind`, `CachedResult`,
+   all result struct variants. Header-only, small.
 
-3. **`trace-cache.cc`** -- Core eval loop. Focus on `TracedExpr::eval()` and
-   `evaluateFresh()`. The three-way dispatch -- verify (BSàlC VT) / record
-   (BSàlC CT) / recover (BSàlC constructive recovery) -- is the heart of the
-   system.
+3. **`trace-cache.hh`** -- Public API surface. Understand what consumers see:
+   `TraceCache` and performance counters.
 
-4. **`trace-cache-store.hh/cc`** -- Trace store backend (BSàlC trace store).
-   `record()` (trace recording) and `verify()` (verifying trace check) are the
-   two main flows. `recovery()` implements constructive recovery via direct hash
-   lookup and structural variant scan.
+4. **`trace-cache.cc`** -- Core eval loop. Focus on `TracedExpr::eval()` and
+   `evaluateFresh()`. The verify / record / recover dispatch is the heart of
+   the system.
 
-5. **`trace-hash.hh/cc`** -- CBOR format. Straightforward serialization of
-   `EvalTrace` structs (BSàlC trace = key + dep hashes + result).
+5. **`trace-store.hh/cc`** -- Pure SQLite trace store backend (BSàlC trace
+   store). `verify()` (verifying trace check), `record()` (trace recording),
+   and `recovery()` (constructive recovery via direct hash lookup + structural
+   variant scan) are the three main flows. The 8-table schema and factored
+   dep storage (DepKeySets + per-trace values_blob) are documented inline.
 
-6. **`eval-index-db.hh/cc`** -- SQLite index. Simple CRUD with 3 tables.
-   Supports the constructive recovery phases by mapping trace hashes and
-   structural signatures to historical trace entries.
+6. **`trace-hash.hh/cc`** -- BLAKE3 trace hashing with domain-separated fields.
 
-7. **StatHashCache** (internal to `dependency-tracker.cc`) -- Performance
+7. **`traced-data.hh`** + related code in `json-to-value.cc`, `primops/fromTOML.cc`,
+   `primops.cc` -- Lazy structural dep tracking via `ExprTracedData` Expr
+   subclass. Implements two-level verification (StructuredContent overrides
+   Content/Directory failures).
+
+8. **StatHashCache** (internal to `dependency-tracker.cc`) -- Performance
    optimization for the BSàlC VT check. Two-level cache (L1 memory + L2
    bulk-loaded from TraceStore's SQLite) reduces dep verification to `lstat()`
    calls. Dirty entries flushed back to TraceStore at session end. Anonymous
-   namespace — review as part of dependency-tracker.cc.
+   namespace -- review as part of dependency-tracker.cc.
 
-8. **CLI integration** (`src/libcmd/`, `src/nix/`) -- How commands use the
+9. **CLI integration** (`src/libcmd/`, `src/nix/`) -- How commands use the
    trace. Focus on `installable-attr-path.cc` and `installable-flake.cc`.
 
-9. **Fetcher changes** (`src/libfetchers/`) -- `getStableIdentity()` additions.
-   Small, self-contained.
+10. **Fetcher changes** (`src/libfetchers/`) -- `getStableIdentity()` additions.
+    Small, self-contained.
 
-10. **Tests** -- Read the test names and comments for coverage understanding.
+11. **Tests** -- Read the test names and comments for coverage understanding.
     The regression tests (`eval-trace-impure-regression.sh`) document specific
     bugs that were found and fixed.
 
 ### Key Design Decisions to Evaluate
 
-1. **CAS blobs vs SQLite for result storage (BSàlC constructive trace store
-   strategy).** The design trades SQLite's query flexibility for store-native GC
-   integration and immutability. A BSàlC constructive trace needs to store full
-   results; we store them as CAS blobs in the Nix store, gaining GC integration
-   for free. Is this the right trade-off for the Nix ecosystem?
+1. **Pure SQLite for all trace storage (BSàlC constructive trace store
+   strategy).** Everything lives in a single `eval-trace-v2.sqlite` cache file.
+   Results, dep keys, dep hash values, trace history, and stat hash cache are all
+   in SQLite tables. The DB is a pure cache -- deletion causes re-evaluation, not
+   data loss. Is this the right trade-off vs. store-integrated CAS blobs?
 
-2. **11 dep types (BSàlC oracle taxonomy).** Each dep type defines an oracle
+2. **12 dep types (BSàlC oracle taxonomy).** Each dep type defines an oracle
    for verifying trace validity. Is this the right granularity? Are there deps
    we're missing (e.g., symlink targets) or deps that are over-specific? See
    design.md Section 4.1 for the full taxonomy.
 
-3. **Two-phase constructive recovery (extending BSàlC CT).** Phase 1 (direct
-   hash lookup, with optional Salsa-style parent Merkle chaining for versioned
-   queries) provides O(1) recovery. Phase 3 (structural variant scan) handles
-   dynamic dep instability (cf. Shake's dynamic dependencies) at the cost of
-   O(V) scanning. Is this complexity justified? See design.md Section 6.3.
+3. **Two-strategy constructive recovery (extending BSàlC CT).** Direct hash
+   recovery computes all current dep hashes and does an O(1) trace_hash lookup.
+   Structural variant recovery scans TraceHistory for entries with the same dep
+   key structure, loading only key sets (no values_blob decompression). Is this
+   complexity justified? See design.md Section 6.3.
 
 4. **TracedExpr as Expr subclass (Adapton articulation point strategy).** The
    GC-allocated thunk approach requires understanding of the evaluator's memory
@@ -490,6 +432,18 @@ nix develop --command bash -c "meson test -C build --suite ca"
    complexity. Is there a simpler way to handle sibling tracing without the
    origExpr/ExprOrigChild indirection?
 
+6. **StructuredContent two-level verification.** For JSON/TOML data files and
+   directory listings, fine-grained `StructuredContent` deps track individual
+   data paths. When a Content/Directory dep fails but all StructuredContent deps
+   pass, the trace is still valid. Is this complexity worth the improved
+   granularity?
+
+7. **Per-sibling ParentContext deps.** Children record ParentContext deps only
+   for siblings they actually access during evaluation, not the full parent.
+   This avoids cascading invalidation when unrelated siblings change, at the cost
+   of a known soundness gap for parent-mediated value changes (see design.md
+   Section 9.8). Is this trade-off acceptable?
+
 ### Prior Art Mapping for Reviewers
 
 For reviewers familiar with the incremental computation literature, here is
@@ -502,12 +456,13 @@ a quick mapping from our implementation to prior art concepts:
 | `SuspendDepTracking` | Adapton selective tracking (avoid "fat parent" deps) | -- |
 | `record()` in TraceStore | BSàlC constructive trace recording | Mokhov et al. 2020, Definition 5 |
 | `verify()` in TraceStore | BSàlC verifying trace check | Mokhov et al. 2020, Definition 3 |
-| `recovery()` direct hash | BSàlC constructive recovery with Salsa-style parent Merkle chaining | Mokhov et al. 2020, Def 5; Salsa |
+| `recovery()` direct hash | BSàlC constructive recovery | Mokhov et al. 2020, Def 5 |
 | `recovery()` structural variant | Structural variant recovery (novel extension) | -- |
-| Epoch-based staleness | Salsa revision counter | Matsakis et al. |
+| ParentContext deps | Parent invalidation (replaces Salsa revision counter) | Matsakis et al. |
 | Dynamic dep recording | Shake dynamic dependencies | Mitchell 2012, Section 3 |
 | `replayTrace()` | Adapton change propagation | Hammer et al. 2014, Section 4 |
 | `StatHashCache` L1/L2 | Memoized oracle (optimization of BSàlC VT hash check) | -- |
+| `StructuredContent` deps | Fine-grained data file tracking (novel extension) | -- |
 
 ---
 
@@ -533,6 +488,11 @@ comments can use this table to translate.
 | coldStore | record | BSàlC (trace recording) |
 | warmPath | verify | BSàlC (verifying trace check) |
 | eval_cache namespace | eval_trace namespace | -- |
+| TraceCacheStore | TraceStore | BSàlC (trace store) |
+| EvalIndexDb | (merged into TraceStore) | -- |
+| CAS blob traces | SQLite-stored traces | -- |
+| CBOR serialization | zstd-compressed binary blobs | -- |
+| epoch / Merkle chaining | ParentContext deps | -- |
 
 ---
 

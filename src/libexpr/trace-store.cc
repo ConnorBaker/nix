@@ -18,6 +18,7 @@
 #include <toml.hpp>
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -134,6 +135,7 @@ static const nlohmann::json * navigateJson(const nlohmann::json & root, const st
     auto segments = parseDataPath(dataPath);
     const nlohmann::json * node = &root;
     for (auto & seg : segments) {
+        if (seg.empty()) continue; // skip empty segments from malformed paths (e.g., "a..b")
         if (seg.front() == '[') {
             // Array index
             if (!node->is_array()) return nullptr;
@@ -160,6 +162,7 @@ static const toml::value * navigateToml(const toml::value & root, const std::str
     auto segments = parseDataPath(dataPath);
     const toml::value * node = &root;
     for (auto & seg : segments) {
+        if (seg.empty()) continue; // skip empty segments from malformed paths
         if (seg.front() == '[') {
             if (!node->is_array()) return nullptr;
             auto idxStr = seg.substr(1, seg.size() - 2);
@@ -423,35 +426,32 @@ static Hash computeResultHash(ResultKind type, std::string_view value, std::stri
     return sink.finish().hash;
 }
 
-// ── BLOB serialization for dep entries ───────────────────────────────
+// ── BLOB serialization for dep key sets ──────────────────────────────
 //
-// Packed binary format per dep entry:
-//   header:    10 bytes (type[1] + source_id[4] + key_id[4] + hash_len[1])
-//   hash_data: hash_len bytes
+// keys_blob: packed 9-byte entries (type[1] + sourceId[4] + keyId[4]),
+// zstd compressed. Stored in DepKeySets table, shared across traces with
+// the same dep structure (same struct_hash).
+// Note: uses native byte order for uint32_t fields. The database is a
+// local cache (safe to delete), so cross-endianness portability is not required.
 
-struct __attribute__((packed)) DepBlobHeader {
+struct __attribute__((packed)) DepKeyBlobEntry {
     uint8_t type;
     uint32_t sourceId;
     uint32_t keyId;
-    uint8_t hashLen;
 };
-static_assert(sizeof(DepBlobHeader) == 10);
+static_assert(sizeof(DepKeyBlobEntry) == 9);
 
-std::vector<uint8_t> TraceStore::serializeDeps(const std::vector<InternedDep> & deps)
+std::vector<uint8_t> TraceStore::serializeKeys(const std::vector<InternedDepKey> & keys)
 {
     std::vector<uint8_t> blob;
-    blob.reserve(deps.size() * 42);
+    blob.reserve(keys.size() * sizeof(DepKeyBlobEntry));
 
-    for (auto & dep : deps) {
-        auto [hashData, hashSize] = blobData(dep.hash);
-        DepBlobHeader hdr{std::to_underlying(dep.type), dep.sourceId, dep.keyId,
-                          static_cast<uint8_t>(hashSize)};
-        auto * raw = reinterpret_cast<const uint8_t *>(&hdr);
-        blob.insert(blob.end(), raw, raw + sizeof(hdr));
-        blob.insert(blob.end(), hashData, hashData + hashSize);
+    for (auto & key : keys) {
+        DepKeyBlobEntry entry{std::to_underlying(key.type), key.sourceId, key.keyId};
+        auto * raw = reinterpret_cast<const uint8_t *>(&entry);
+        blob.insert(blob.end(), raw, raw + sizeof(entry));
     }
 
-    // Compress with zstd level 1 (fast, good ratio for structured binary data)
     if (!blob.empty()) {
         auto compressed = nix::compress(
             CompressionAlgo::zstd,
@@ -462,57 +462,119 @@ std::vector<uint8_t> TraceStore::serializeDeps(const std::vector<InternedDep> & 
     return blob;
 }
 
-std::vector<TraceStore::InternedDep> TraceStore::deserializeInternedDeps(
+std::vector<TraceStore::InternedDepKey> TraceStore::deserializeKeys(
     const void * blob, size_t size)
 {
     if (size == 0)
         return {};
 
-    // Decompress zstd-compressed deps_blob
     auto decompressed = nix::decompress("zstd",
         {static_cast<const char *>(blob), size});
 
-    std::vector<InternedDep> deps;
+    std::vector<InternedDepKey> keys;
     const uint8_t * p = reinterpret_cast<const uint8_t *>(decompressed.data());
     const uint8_t * end = p + decompressed.size();
 
-    while (p + sizeof(DepBlobHeader) <= end) {
-        DepBlobHeader hdr;
-        std::memcpy(&hdr, p, sizeof(hdr));
-        p += sizeof(hdr);
+    while (p + sizeof(DepKeyBlobEntry) <= end) {
+        DepKeyBlobEntry entry;
+        std::memcpy(&entry, p, sizeof(entry));
+        p += sizeof(entry);
 
-        if (p + hdr.hashLen > end) break;
-
-        InternedDep dep;
-        dep.type = static_cast<DepType>(hdr.type);
-        dep.sourceId = hdr.sourceId;
-        dep.keyId = hdr.keyId;
-        if (isBlake3Dep(dep.type) && hdr.hashLen == 32)
-            dep.hash = Blake3Hash::fromBlob(p, 32);
-        else
-            dep.hash = std::string(reinterpret_cast<const char *>(p), hdr.hashLen);
-        p += hdr.hashLen;
-
-        deps.push_back(std::move(dep));
+        keys.push_back({
+            static_cast<DepType>(entry.type),
+            entry.sourceId,
+            entry.keyId
+        });
     }
 
-    return deps;
+    return keys;
 }
 
-std::vector<Dep> TraceStore::resolveDeps(const std::vector<InternedDep> & interned)
+// ── BLOB serialization for dep hash values ───────────────────────────
+//
+// values_blob: per-entry hashLen[1] + hashData[hashLen], zstd compressed.
+// Stored in Traces table. Entries are positionally matched with keys_blob
+// in the corresponding DepKeySets row.
+
+std::vector<uint8_t> TraceStore::serializeValues(const std::vector<InternedDep> & deps)
+{
+    std::vector<uint8_t> blob;
+    blob.reserve(deps.size() * 33);  // BLAKE3: 1 + 32 bytes typical
+
+    for (auto & dep : deps) {
+        auto [hashData, hashSize] = blobData(dep.hash);
+        assert(hashSize <= 255 && "dep hash value exceeds single-byte length prefix");
+        blob.push_back(static_cast<uint8_t>(hashSize));
+        blob.insert(blob.end(), hashData, hashData + hashSize);
+    }
+
+    if (!blob.empty()) {
+        auto compressed = nix::compress(
+            CompressionAlgo::zstd,
+            {reinterpret_cast<const char *>(blob.data()), blob.size()},
+            false, 1);
+        return {compressed.begin(), compressed.end()};
+    }
+    return blob;
+}
+
+std::vector<DepHashValue> TraceStore::deserializeValues(
+    const void * blob, size_t size, const std::vector<InternedDepKey> & keys)
+{
+    if (size == 0)
+        return {};
+
+    auto decompressed = nix::decompress("zstd",
+        {static_cast<const char *>(blob), size});
+
+    std::vector<DepHashValue> values;
+    const uint8_t * p = reinterpret_cast<const uint8_t *>(decompressed.data());
+    const uint8_t * end = p + decompressed.size();
+    size_t idx = 0;
+
+    while (p < end && idx < keys.size()) {
+        uint8_t hashLen = *p++;
+        if (p + hashLen > end) break;
+
+        // Use the dep type from the corresponding key to determine whether
+        // this is a Blake3Hash or a variable-length string. Without this,
+        // a 32-byte store path string would be incorrectly decoded as Blake3.
+        if (isBlake3Dep(keys[idx].type) && hashLen == 32)
+            values.push_back(Blake3Hash::fromBlob(p, 32));
+        else
+            values.push_back(std::string(reinterpret_cast<const char *>(p), hashLen));
+        p += hashLen;
+        idx++;
+    }
+
+    // Warn on key/value count mismatch (could indicate DB corruption)
+    if (values.size() != keys.size())
+        warn("deserializeValues: got %d values but expected %d (keys count)",
+             values.size(), keys.size());
+
+    return values;
+}
+
+// ── Dep key/value resolution ─────────────────────────────────────────
+
+std::vector<Dep> TraceStore::resolveDeps(
+    const std::vector<InternedDepKey> & keys,
+    const std::vector<DepHashValue> & values)
 {
     ensureStringTableLoaded();
     std::vector<Dep> deps;
-    deps.reserve(interned.size());
+    auto count = std::min(keys.size(), values.size());
+    deps.reserve(count);
 
-    for (auto & d : interned) {
-        auto sourceIt = stringTable.find(static_cast<StringId>(d.sourceId));
-        auto keyIt = stringTable.find(static_cast<StringId>(d.keyId));
+    for (size_t i = 0; i < count; ++i) {
+        auto & k = keys[i];
+        auto sourceIt = stringTable.find(static_cast<StringId>(k.sourceId));
+        auto keyIt = stringTable.find(static_cast<StringId>(k.keyId));
         deps.push_back(Dep{
             sourceIt != stringTable.end() ? sourceIt->second : "",
             keyIt != stringTable.end() ? keyIt->second : "",
-            d.hash,
-            d.type
+            values[i],
+            k.type
         });
     }
 
@@ -570,20 +632,26 @@ static const char * schema = R"sql(
         hash    BLOB NOT NULL UNIQUE
     ) STRICT;
 
-    CREATE TABLE IF NOT EXISTS DepsSets (
-        id        INTEGER PRIMARY KEY,
-        deps_hash BLOB NOT NULL UNIQUE,
-        deps_blob BLOB NOT NULL
+    -- Content-addressed dep key sets. Traces with the same dep structure
+    -- (same types + sources + keys, different hash values) share a single
+    -- DepKeySets row. struct_hash is the BLAKE3 of the structural signature
+    -- (type + source + key per dep).
+    CREATE TABLE IF NOT EXISTS DepKeySets (
+        id          INTEGER PRIMARY KEY,
+        struct_hash BLOB NOT NULL UNIQUE,
+        keys_blob   BLOB NOT NULL
     ) STRICT;
 
+    -- Each trace references a shared DepKeySets row (dep structure) and stores
+    -- its own values_blob (hash values in positional order matching keys_blob).
     CREATE TABLE IF NOT EXISTS Traces (
-        id           INTEGER PRIMARY KEY,
-        trace_hash   BLOB NOT NULL UNIQUE,
-        struct_hash  BLOB NOT NULL,
-        deps_set_id  INTEGER NOT NULL REFERENCES DepsSets(id)
+        id              INTEGER PRIMARY KEY,
+        trace_hash      BLOB NOT NULL UNIQUE,
+        dep_key_set_id  INTEGER NOT NULL REFERENCES DepKeySets(id),
+        values_blob     BLOB NOT NULL
     ) STRICT;
 
-    CREATE INDEX IF NOT EXISTS idx_traces_struct ON Traces(struct_hash);
+    CREATE INDEX IF NOT EXISTS idx_traces_dep_key_set ON Traces(dep_key_set_id);
 
     CREATE TABLE IF NOT EXISTS CurrentTraces (
         context_hash  INTEGER NOT NULL,
@@ -667,15 +735,18 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
     st->getResult.create(st->db,
         "SELECT type, value, context FROM Results WHERE id = ?");
 
-    // DepsSets (content-addressed dep storage, UPSERT RETURNING)
-    st->upsertDepsSet.create(st->db,
-        "INSERT INTO DepsSets(deps_hash, deps_blob) VALUES (?, ?) "
-        "ON CONFLICT(deps_hash) DO UPDATE SET deps_hash = excluded.deps_hash "
+    // DepKeySets (content-addressed dep key storage, UPSERT RETURNING)
+    st->upsertDepKeySet.create(st->db,
+        "INSERT INTO DepKeySets(struct_hash, keys_blob) VALUES (?, ?) "
+        "ON CONFLICT(struct_hash) DO UPDATE SET struct_hash = excluded.struct_hash "
         "RETURNING id");
 
-    // Traces (references DepsSets via deps_set_id FK, UPSERT RETURNING)
+    st->getDepKeySet.create(st->db,
+        "SELECT struct_hash, keys_blob FROM DepKeySets WHERE id = ?");
+
+    // Traces (references DepKeySets via dep_key_set_id FK, UPSERT RETURNING)
     st->upsertTrace.create(st->db,
-        "INSERT INTO Traces(trace_hash, struct_hash, deps_set_id) "
+        "INSERT INTO Traces(trace_hash, dep_key_set_id, values_blob) "
         "VALUES (?, ?, ?) "
         "ON CONFLICT(trace_hash) DO UPDATE SET trace_hash = excluded.trace_hash "
         "RETURNING id");
@@ -683,12 +754,11 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
     st->lookupTraceByFullHash.create(st->db,
         "SELECT id FROM Traces WHERE trace_hash = ?");
 
+    // getTraceInfo: returns trace_hash, struct_hash, dep_key_set_id, keys_blob, values_blob
+    // via JOIN with DepKeySets. Used by loadFullTrace, getTraceStructHash, getCurrentTraceHash.
     st->getTraceInfo.create(st->db,
-        "SELECT t.trace_hash, t.struct_hash, d.deps_blob "
-        "FROM Traces t JOIN DepsSets d ON t.deps_set_id = d.id WHERE t.id = ?");
-
-    st->lookupTraceByStructHash.create(st->db,
-        "SELECT id FROM Traces WHERE struct_hash = ? LIMIT 1");
+        "SELECT t.trace_hash, dk.struct_hash, dk.id, dk.keys_blob, t.values_blob "
+        "FROM Traces t JOIN DepKeySets dk ON t.dep_key_set_id = dk.id WHERE t.id = ?");
 
     // CurrentTraces (JOIN with Results to get result fields)
     st->lookupAttr.create(st->db,
@@ -711,9 +781,13 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
         "SELECT result_id FROM TraceHistory "
         "WHERE context_hash = ? AND attr_path_id = ? AND trace_id = ?");
 
+    // scanHistoryForAttr: JOIN through Traces→DepKeySets to get dep_key_set_id
+    // and struct_hash for structural variant recovery grouping.
     st->scanHistoryForAttr.create(st->db,
-        "SELECT t.struct_hash, h.trace_id, h.result_id "
-        "FROM TraceHistory h JOIN Traces t ON h.trace_id = t.id "
+        "SELECT dk.id, dk.struct_hash, h.trace_id, h.result_id "
+        "FROM TraceHistory h "
+        "JOIN Traces t ON h.trace_id = t.id "
+        "JOIN DepKeySets dk ON t.dep_key_set_id = dk.id "
         "WHERE h.context_hash = ? AND h.attr_path_id = ?");
 
     // StatHashCache
@@ -816,6 +890,7 @@ void TraceStore::clearSessionCaches()
     internedAttrPaths.clear();
     traceCache.clear();
     traceStructHashCache.clear();
+    depKeySetCache.clear();
     stringTable.clear();
     stringTableLoaded = false;
     currentDepHashes.clear();
@@ -1011,10 +1086,11 @@ Hash TraceStore::getTraceStructHash(TraceId traceId)
         return cacheIt->second;
 
     auto st(_state->lock());
+    // getTraceInfo columns: 0=trace_hash, 1=struct_hash, 2=dep_key_set_id, 3=keys_blob, 4=values_blob
     auto use(st->getTraceInfo.use()(traceId));
     if (!use.next())
         throw Error("trace %d not found", traceId);
-    auto [blobData, blobSize] = use.getBlob(1);
+    auto [blobData, blobSize] = use.getBlob(1);  // column 1 = struct_hash (from DepKeySets)
     auto h = readRawHash(blobData, blobSize);
     traceStructHashCache.insert_or_assign(traceId, h);
     return h;
@@ -1029,58 +1105,101 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
     auto loadStart = timerStart();
     nrLoadTraces++;
 
-    // Single DB read via JOIN — no chain walk
-    std::vector<uint8_t> blobCopy;
+    // Single DB read via JOIN — keys from DepKeySets, values from Traces
+    // getTraceInfo columns: 0=trace_hash, 1=struct_hash, 2=dep_key_set_id, 3=keys_blob, 4=values_blob
+    std::vector<uint8_t> keysBlobCopy, valuesBlobCopy;
+    DepKeySetId depKeySetId = 0;
     {
         auto st(_state->lock());
         auto use(st->getTraceInfo.use()(traceId));
-        if (!use.next())
-            return {};
-        // Column 2 = deps_blob (from DepsSets via JOIN)
-        auto [data, size] = use.getBlob(2);
-        if (!data || size == 0) {
+        if (!use.next()) {
             traceCache[traceId] = {};
             nrLoadTraceTimeUs += elapsedUs(loadStart);
             return {};
         }
-        auto * p = static_cast<const uint8_t *>(data);
-        blobCopy.assign(p, p + size);
+        depKeySetId = use.getInt(2);  // column 2 = dep_key_set_id
+
+        auto [keysData, keysSize] = use.getBlob(3);  // column 3 = keys_blob
+        if (keysData && keysSize > 0) {
+            auto * p = static_cast<const uint8_t *>(keysData);
+            keysBlobCopy.assign(p, p + keysSize);
+        }
+
+        auto [valsData, valsSize] = use.getBlob(4);  // column 4 = values_blob
+        if (valsData && valsSize > 0) {
+            auto * p = static_cast<const uint8_t *>(valsData);
+            valuesBlobCopy.assign(p, p + valsSize);
+        }
     }
 
-    auto interned = deserializeInternedDeps(blobCopy.data(), blobCopy.size());
-    auto result = resolveDeps(interned);
+    if (keysBlobCopy.empty()) {
+        traceCache[traceId] = {};
+        nrLoadTraceTimeUs += elapsedUs(loadStart);
+        return {};
+    }
+
+    // Deserialize keys first (needed to type-dispatch values), then values
+    auto keys = deserializeKeys(keysBlobCopy.data(), keysBlobCopy.size());
+    auto values = deserializeValues(valuesBlobCopy.data(), valuesBlobCopy.size(), keys);
+    auto result = resolveDeps(keys, values);
+
+    // Also populate the dep key set cache for potential recovery use
+    depKeySetCache.insert_or_assign(depKeySetId, keys);
 
     traceCache[traceId] = result;
     nrLoadTraceTimeUs += elapsedUs(loadStart);
     return result;
 }
 
-int64_t TraceStore::getOrCreateDepsSet(
-    const std::vector<Dep> & fullDeps,
-    const Hash & depsHash)
+std::vector<TraceStore::InternedDepKey> TraceStore::loadKeySet(DepKeySetId depKeySetId)
 {
-    auto interned = internDeps(fullDeps);
-    auto blob = serializeDeps(interned);
+    // Session cache: avoid re-decompressing keys_blob for shared key sets
+    auto cacheIt = depKeySetCache.find(depKeySetId);
+    if (cacheIt != depKeySetCache.end())
+        return cacheIt->second;
 
     auto st(_state->lock());
-    auto use(st->upsertDepsSet.use());
-    bindRawHash(use, depsHash);
-    bindBlobVec(use, blob);
+    auto use(st->getDepKeySet.use()(depKeySetId));
     if (!use.next())
-        throw Error("failed to get or create deps set");
+        return {};
+
+    // Column 0 = struct_hash (not needed here), column 1 = keys_blob
+    auto [keysData, keysSize] = use.getBlob(1);
+    if (!keysData || keysSize == 0)
+        return {};
+
+    std::vector<uint8_t> blobCopy(
+        static_cast<const uint8_t *>(keysData),
+        static_cast<const uint8_t *>(keysData) + keysSize);
+
+    auto keys = deserializeKeys(blobCopy.data(), blobCopy.size());
+    depKeySetCache.insert_or_assign(depKeySetId, keys);
+    return keys;
+}
+
+DepKeySetId TraceStore::getOrCreateDepKeySet(
+    const Hash & structHash,
+    const std::vector<uint8_t> & keysBlob)
+{
+    auto st(_state->lock());
+    auto use(st->upsertDepKeySet.use());
+    bindRawHash(use, structHash);
+    bindBlobVec(use, keysBlob);
+    if (!use.next())
+        throw Error("failed to get or create dep key set");
     return use.getInt(0);
 }
 
 TraceId TraceStore::getOrCreateTrace(
     const Hash & traceHash,
-    const Hash & structHash,
-    int64_t depsSetId)
+    DepKeySetId depKeySetId,
+    const std::vector<uint8_t> & valuesBlob)
 {
     auto st(_state->lock());
     auto use(st->upsertTrace.use());
     bindRawHash(use, traceHash);
-    bindRawHash(use, structHash);
-    use(depsSetId);
+    use(depKeySetId);
+    bindBlobVec(use, valuesBlob);
     if (!use.next())
         throw Error("failed to get or create trace");
     return use.getInt(0);
@@ -1091,8 +1210,7 @@ TraceId TraceStore::getOrCreateTrace(
 bool TraceStore::verifyTrace(
     TraceId traceId,
     const std::unordered_map<std::string, SourcePath> & inputAccessors,
-    EvalState & state,
-    bool earlyExit)
+    EvalState & state)
 {
     if (verifiedTraceIds.count(traceId))
         return true;
@@ -1100,7 +1218,7 @@ bool TraceStore::verifyTrace(
     auto vtStart = timerStart();
     clearDomCaches();
 
-    // Load the FULL trace (base chain already resolved)
+    // Load the full trace (single DB read via JOIN)
     auto fullDeps = loadFullTrace(traceId);
 
     // Two-level verification: Content and Directory failures can be overridden
@@ -1134,7 +1252,6 @@ bool TraceStore::verifyTrace(
 
         if (dep.type == DepType::CurrentTime || dep.type == DepType::Exec) {
             hasNonContentFailure = true;
-            if (earlyExit) break;
             continue;
         }
 
@@ -1156,7 +1273,6 @@ bool TraceStore::verifyTrace(
             // Parent trace changed or missing → non-content failure
             nrVerificationsFailed++;
             hasNonContentFailure = true;
-            if (earlyExit) break;
             continue;
         }
 
@@ -1178,7 +1294,6 @@ bool TraceStore::verifyTrace(
                 failedContentFiles.insert(dep.source + '\t' + dep.key);
             } else {
                 hasNonContentFailure = true;
-                if (earlyExit) break;
             }
         }
     }
@@ -1232,7 +1347,6 @@ bool TraceStore::verifyTrace(
                 if (!current || *current != dep->expectedHash) {
                     nrVerificationsFailed++;
                     allValid = false;
-                    if (earlyExit) break;
                 }
             }
         }
@@ -1301,6 +1415,7 @@ std::optional<Hash> TraceStore::getCurrentTraceHash(std::string_view attrPath)
     // Return trace_hash (captures dep structure + hashes), not result hash.
     // Result hash for attrsets only captures attribute names, not values —
     // it wouldn't detect changes to attribute values within an attrset.
+    // getTraceInfo columns: 0=trace_hash, 1=struct_hash, 2=dep_key_set_id, 3=keys_blob, 4=values_blob
     auto st(_state->lock());
     auto use(st->getTraceInfo.use()(row->traceId));
     if (!use.next()) return std::nullopt;
@@ -1322,14 +1437,24 @@ TraceStore::RecordResult TraceStore::record(
     // 1. Sort+dedup deps (ParentContext deps are now stored, not filtered)
     auto sortedDeps = sortAndDedupDeps(allDeps);
 
-    // 3. Compute deps_hash = trace_hash (own deps only, no Merkle chaining)
-    auto depsHash = computeTraceHashFromSorted(sortedDeps);
+    // 2. Compute trace_hash (BLAKE3 of full sorted deps including hashes)
+    auto traceHash = computeTraceHashFromSorted(sortedDeps);
 
-    // 4. Compute struct_hash (for structural variant recovery)
+    // 3. Compute struct_hash (dep types + sources + keys, without hash values)
     auto structHash = computeTraceStructHashFromSorted(sortedDeps);
 
-    // 5. Get or create deps set (content-addressed by deps_hash)
-    auto depsSetId = getOrCreateDepsSet(sortedDeps, depsHash);
+    // 4. Intern deps and split into keys + values
+    auto interned = internDeps(sortedDeps);
+    std::vector<InternedDepKey> keys;
+    keys.reserve(interned.size());
+    for (auto & d : interned)
+        keys.push_back({d.type, d.sourceId, d.keyId});
+
+    auto keysBlob = serializeKeys(keys);
+    auto valuesBlob = serializeValues(interned);
+
+    // 5. Get or create dep key set (content-addressed by struct_hash)
+    auto depKeySetId = getOrCreateDepKeySet(structHash, keysBlob);
 
     // 6. Encode CachedResult and intern result
     auto [type, val, ctx] = encodeCachedResult(value);
@@ -1339,8 +1464,8 @@ TraceStore::RecordResult TraceStore::record(
     // 7. Intern attr path
     AttrPathId attrPathId = doInternAttrPath(attrPath);
 
-    // 8. Get or create trace
-    TraceId traceId = getOrCreateTrace(depsHash, structHash, depsSetId);
+    // 8. Get or create trace (keyed by trace_hash, stores dep_key_set_id + values_blob)
+    TraceId traceId = getOrCreateTrace(traceHash, depKeySetId, valuesBlob);
 
     // 9. Upsert Attrs + insert History
     {
@@ -1358,6 +1483,7 @@ TraceStore::RecordResult TraceStore::record(
         verifiedTraceIds.insert(traceId);
 
     traceStructHashCache.insert_or_assign(traceId, structHash);
+    depKeySetCache.insert_or_assign(depKeySetId, keys);
     traceCache[traceId] = sortedDeps;
 
     nrRecordTimeUs += elapsedUs(recordStart);
@@ -1382,15 +1508,21 @@ std::optional<TraceStore::VerifyResult> TraceStore::verify(
 
     nrTraceVerifications++;
 
-    // 2. Verify trace (early-exit mode: stop on first mismatch for speed;
-    //    recovery() will compute remaining hashes lazily if needed)
-    if (verifyTrace(row->traceId, inputAccessors, state, /*earlyExit=*/true)) {
+    // 2. Verify trace — compute ALL dep hashes upfront.
+    //    With StatHashCache warm, computing all hashes is cheap (~2ms for ~4K deps:
+    //    just lstat() + L1 cache lookup per file dep). Computing all hashes upfront
+    //    ensures recovery can reuse them immediately via currentDepHashes.
+    if (verifyTrace(row->traceId, inputAccessors, state)) {
         nrVerificationsPassed++;
         nrVerifyTimeUs += elapsedUs(verifyStart);
         return VerifyResult{decodeCachedResult(*row), row->traceId};
     }
 
-    // 3. Verification failed → constructive recovery (uses currentDepHashes)
+    // 3. Verification failed → constructive recovery.
+    //    All dep hashes are pre-computed in currentDepHashes (from step 2).
+    //    Direct hash recovery is O(1): sort+hash the pre-computed values, lookup.
+    //    No additional hash computation needed unless structural variant recovery
+    //    encounters a trace with different dep keys (rare).
     debug("verify: trace validation failed for '%s', attempting constructive recovery", displayAttrPath(attrPath));
     auto result = recovery(row->traceId, attrPath, inputAccessors, state);
     nrVerifyTimeUs += elapsedUs(verifyStart);
@@ -1567,11 +1699,13 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     // === Structural variant recovery (novel extension beyond BSàlC) ===
     // Handles dynamic dep instability (Shake-style): the same attribute can have
     // different dep structures across evaluations. Scans TraceHistory for entries
-    // with the same attr, groups by struct_hash (dep types + sources + keys,
-    // ignoring hash values), recomputes current hashes per group, retries direct
-    // hash lookup. O(V) where V = number of distinct dep structures.
+    // with the same attr, groups by dep_key_set_id (integer, more efficient than
+    // grouping by 32-byte struct_hash), loads key set once per group, recomputes
+    // current hashes, retries direct hash lookup. O(V) where V = number of
+    // distinct dep structures. Zero values_blob decompression needed.
     auto structVariantStart = timerStart();
     struct HistoryEntry {
+        DepKeySetId depKeySetId;
         Hash structHash;
         TraceId traceId;
         ResultId resultId;
@@ -1579,13 +1713,15 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     std::vector<HistoryEntry> historyEntries;
     {
         auto st(_state->lock());
+        // scanHistoryForAttr columns: 0=dk.id, 1=dk.struct_hash, 2=h.trace_id, 3=h.result_id
         auto use(st->scanHistoryForAttr.use()(contextHash)(*attrPathId));
         while (use.next()) {
-            auto [blobData, blobSize] = use.getBlob(0);
+            auto [blobData, blobSize] = use.getBlob(1);
             historyEntries.push_back(HistoryEntry{
+                use.getInt(0),
                 readRawHash(blobData, blobSize),
-                use.getInt(1),
-                use.getInt(2)
+                use.getInt(2),
+                use.getInt(3)
             });
         }
     }
@@ -1593,51 +1729,74 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     debug("recovery: structural variant scan for '%s' -- scanning %d history entries",
           displayAttrPath(attrPath), historyEntries.size());
 
-    // Group by struct_hash, pick one representative per group
-    std::unordered_map<Hash, TraceId> structGroups; // struct_hash -> representative trace_id
+    // Group by dep_key_set_id (integer), pick one representative per group.
+    // Using dep_key_set_id instead of struct_hash for grouping is more efficient
+    // (integer comparison vs 32-byte hash comparison).
+    std::unordered_map<DepKeySetId, TraceId> structGroups; // dep_key_set_id -> representative trace_id
+    // Also collect struct_hash per group for the direct-hash short-circuit
+    std::unordered_map<DepKeySetId, Hash> groupStructHashes;
     for (auto & e : historyEntries) {
         if (triedTraceIds.count(e.traceId))
             continue;
-        structGroups.emplace(e.structHash, e.traceId);
+        structGroups.emplace(e.depKeySetId, e.traceId);
+        groupStructHashes.emplace(e.depKeySetId, e.structHash);
     }
 
-    for (auto & [structHash, repTraceId] : structGroups) {
+    for (auto & [depKeySetId, repTraceId] : structGroups) {
         if (triedTraceIds.count(repTraceId))
             continue;
         // Skip structural variants identical to the one direct hash recovery already tried
-        if (directHashStructHash && structHash == *directHashStructHash)
+        auto structHashIt = groupStructHashes.find(depKeySetId);
+        if (directHashStructHash && structHashIt != groupStructHashes.end()
+            && structHashIt->second == *directHashStructHash)
             continue;
 
-        // Load full deps for this representative
-        auto repDeps = loadFullTrace(repTraceId);
+        // Phase D optimization: load only the dep key set (no values_blob decompression).
+        // The key set is session-cached, so subsequent traces with the same dep structure
+        // hit the cache. We then resolve keys to full Dep objects (with string lookups)
+        // and look up current hashes from currentDepHashes (pre-computed in verify step).
+        auto repKeys = loadKeySet(depKeySetId);
+        ensureStringTableLoaded();
 
-        // Recompute current hashes for this trace's keys, using cache
+        // Resolve keys to Dep objects and look up current hashes
         std::vector<Dep> repCurrentDeps;
         bool repComputable = true;
-        for (auto & dep : repDeps) {
-            if (dep.type == DepType::CurrentTime || dep.type == DepType::Exec) {
+        for (auto & key : repKeys) {
+            auto type = key.type;
+
+            if (type == DepType::CurrentTime || type == DepType::Exec) {
                 repComputable = false;
                 break;
             }
 
+            // Resolve string IDs to strings
+            auto sourceIt = stringTable.find(static_cast<StringId>(key.sourceId));
+            auto keyIt = stringTable.find(static_cast<StringId>(key.keyId));
+            std::string source = sourceIt != stringTable.end() ? sourceIt->second : "";
+            std::string depKey = keyIt != stringTable.end() ? keyIt->second : "";
+
             // ParentContext: compute current parent trace hash directly
-            if (dep.type == DepType::ParentContext) {
-                auto parentTraceHash = getCurrentTraceHash(dep.key);
+            if (type == DepType::ParentContext) {
+                auto parentTraceHash = getCurrentTraceHash(depKey);
                 if (!parentTraceHash) { repComputable = false; break; }
                 Blake3Hash b3;
                 std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
-                repCurrentDeps.push_back({dep.source, dep.key, DepHashValue(b3), dep.type});
+                repCurrentDeps.push_back({source, depKey, DepHashValue(b3), type});
                 continue;
             }
 
-            DepKey dk(dep);
+            // Look up pre-computed hash from currentDepHashes (populated by verify step)
+            DepKey dk(type, source, depKey);
             auto cacheIt = currentDepHashes.find(dk);
             std::optional<DepHashValue> current;
 
             if (cacheIt != currentDepHashes.end()) {
                 current = cacheIt->second;
             } else {
-                current = computeCurrentHash(state, dep, inputAccessors);
+                // Dep not in cache — must be a new key not seen in old trace.
+                // Construct a synthetic Dep for hash computation.
+                Dep syntheticDep{source, depKey, DepHashValue{Blake3Hash{}}, type};
+                current = computeCurrentHash(state, syntheticDep, inputAccessors);
                 currentDepHashes[dk] = current;
             }
 
@@ -1645,7 +1804,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
                 repComputable = false;
                 break;
             }
-            repCurrentDeps.push_back({dep.source, dep.key, *current, dep.type});
+            repCurrentDeps.push_back({source, depKey, *current, type});
         }
         if (!repComputable)
             continue;

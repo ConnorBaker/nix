@@ -12,7 +12,7 @@ reach a single leaf attribute. In typical development workflows — edit-build-t
 cycles, CI pipelines, `nix search` — the same flake is evaluated repeatedly with
 few or no input changes between runs.
 
-The existing eval trace (`AttrCursor`, ~721 lines in `trace-cache.cc` on `master`)
+The existing eval trace (`AttrCursor` in `trace-cache.cc` on `master`)
 stores evaluation results in SQLite keyed by a fingerprint derived from the flake
 lock file. It has five fundamental limitations:
 
@@ -235,7 +235,7 @@ respects `tarballTtl` for within-TTL validation.
 verification (BSàlC VT check) always fail.
 
 **Structural** deps (ParentContext) are stored as regular dep entries in the
-trace's `deps_blob`, just like any other dep type. A ParentContext dep records
+trace's dep set, just like any other dep type. A ParentContext dep records
 the parent's `trace_hash`, which is looked up via `getCurrentTraceHash()`.
 This links the child trace to a specific parent version without merging parent
 deps into the child (see Section 4.5).
@@ -498,6 +498,49 @@ into child traces and used Merkle chaining (`computeTraceHashWithParent`)
 to disambiguate — that approach caused cascading invalidation because any
 parent dep change invalidated all children.
 
+### 4.6 Dependency Over-Approximation
+
+The eval trace system tracks file-level dependencies — a **Content dep** records
+that the entire file was read, and a **Directory dep** records the entire sorted
+directory listing. For data files consumed by `fromJSON`/`fromTOML`, the
+**StructuredContent two-level override** (Section 4.4) provides fine-grained
+tracking: only the specific JSON/TOML scalars that were accessed produce deps,
+and changes to unaccessed parts of the file do not invalidate the trace.
+Similarly, for `readDir` with `ExprTracedData` wrapping (Section 4.4, Directory
+Two-Level Override), only accessed directory entries produce deps.
+
+However, for `.nix` code consumed via `import`/`evalFile`, **no fine-grained
+override exists**. Nix reads and evaluates the entire `.nix` file as code, and
+there is no way to determine which portion of a `.nix` file affects which output
+without language-level incremental support (cf. Salsa's query-level tracking in
+rust-analyzer, where every function call is a tracked query). The Content dep at
+parse time is correct but inherently coarse.
+
+**How it manifests.** `readFile`/`evalFile` records a Content dep covering the
+entire file. `readDir` records a Directory dep covering the full listing. The
+two-level verification (Section 4.4) mitigates Content and Directory failures for
+structured data (JSON/TOML via `fromJSON`/`fromTOML`) and directory entries
+(readDir with `ExprTracedData` wrapping). For `.nix` code consumed via `import`,
+no override exists — any byte change invalidates the trace.
+
+**Consequences for large shared files.** Nixpkgs contains large shared `.nix`
+files — `aliases.nix` (~8,300 lines), `python-packages.nix` (~40,000 lines),
+`all-packages.nix` (~50,000 lines) — imported by many evaluation paths. A
+semantically irrelevant change (renaming an unused alias, adding an unrelated
+Python package) invalidates **all** traces that import the changed file.
+Similarly, adding a directory entry to `pkgs/by-name/xx/` invalidates all traces
+that enumerate that directory, even if the new package is never used by the
+evaluated attribute.
+
+**Comparison with Salsa.** Systems like Salsa (rust-analyzer) achieve
+fine-grained invalidation by making every function call a tracked query with its
+own dependency set. This requires language-level integration — the Salsa runtime
+is tightly coupled to the Rust compiler's query system. Nix's evaluator lacks
+this infrastructure; adding query-level tracking would be a fundamental language
+change, not a trace system enhancement. The eval trace system operates at the
+evaluator boundary (file reads, env vars, store operations) rather than at the
+language level.
+
 ---
 
 ## 5. Storage Model
@@ -549,18 +592,20 @@ CREATE TABLE IF NOT EXISTS Results (
     hash    BLOB NOT NULL UNIQUE
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS DepsSets (
-    id        INTEGER PRIMARY KEY,
-    deps_hash BLOB NOT NULL UNIQUE,
-    deps_blob BLOB NOT NULL
+CREATE TABLE IF NOT EXISTS DepKeySets (
+    id          INTEGER PRIMARY KEY,
+    struct_hash BLOB NOT NULL UNIQUE,
+    keys_blob   BLOB NOT NULL
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS Traces (
-    id           INTEGER PRIMARY KEY,
-    trace_hash   BLOB NOT NULL UNIQUE,
-    struct_hash  BLOB NOT NULL,
-    deps_set_id  INTEGER NOT NULL REFERENCES DepsSets(id)
+    id              INTEGER PRIMARY KEY,
+    trace_hash      BLOB NOT NULL UNIQUE,
+    dep_key_set_id  INTEGER NOT NULL REFERENCES DepKeySets(id),
+    values_blob     BLOB NOT NULL
 ) STRICT;
+
+CREATE INDEX IF NOT EXISTS idx_traces_dep_key_set ON Traces(dep_key_set_id);
 
 CREATE TABLE IF NOT EXISTS CurrentTraces (
     context_hash  INTEGER NOT NULL,
@@ -599,19 +644,18 @@ references.
 `(type, value, context)` triple encoding a `CachedResult`. Multiple attributes
 with the same result share a single Results row.
 
-**DepsSets** stores content-addressed dependency sets. The `deps_hash` is the
-BLAKE3 hash of the sorted deps (including any `ParentContext` deps). Traces
-that share the same dep set (same files, same parent) share the same `DepsSets`
-row. The `deps_blob` stores zstd-compressed dependency entries as a compact
-BLOB. Zstd level 1 compression achieves 5-10x size reduction on the repetitive
-binary dep data with sub-millisecond encode/decode overhead.
+**DepKeySets** stores content-addressed dep key sets. The `struct_hash` is the
+BLAKE3 hash of the structural signature (dep types + sources + keys, without
+hash values). Traces with the same dep structure (same types + sources + keys,
+different hash values) share a single `DepKeySets` row. The `keys_blob` stores
+zstd-compressed 9-byte packed entries `(type[1] + sourceId[4] + keyId[4])`.
 
 **Traces** stores deduplicated dependency traces (BSàlC constructive traces),
-keyed by `trace_hash` (which equals the `deps_hash` — the BLAKE3 of the full
-sorted dep content). The `struct_hash` captures the structural signature (dep
-types + sources + keys, without hash values) for structural variant recovery.
-Traces reference `DepsSets` via `deps_set_id` for content-addressed dep
-storage — loading a trace's deps is O(1) via a single JOIN.
+keyed by `trace_hash` (BLAKE3 of the full sorted dep content including hash
+values). Each trace references a shared `DepKeySets` row via `dep_key_set_id`
+and stores its own `values_blob` (zstd-compressed hash values in positional
+order matching `keys_blob`). Loading a trace's deps requires a single JOIN +
+two zstd decompressions.
 
 **CurrentTraces** maps `(context_hash, attr_path_id)` to the current trace and
 result for each attribute. This is the primary lookup table for the verify path.
@@ -676,22 +720,34 @@ Attribute values are encoded as three SQL columns: `type` (INTEGER), `value`
 | Placeholder (0) | 0 | (empty) | (empty) |
 
 This avoids binary serialization for result values (no CBOR). Decoding is a
-switch on the integer type with simple string parsing. (Note: `deps_blob` in
-the Traces table *is* zstd-compressed for storage efficiency, but result values
-in the Results table use plain SQL columns.)
+switch on the integer type with simple string parsing. (Note: `keys_blob` in
+DepKeySets and `values_blob` in Traces *are* zstd-compressed for storage
+efficiency, but result values in the Results table use plain SQL columns.)
 
 ### 5.5 Session Caches
 
-`TraceStore` maintains three in-memory session caches to avoid redundant SQLite
-reads within a single evaluation session:
+`TraceStore` maintains several in-memory session caches to avoid redundant
+SQLite reads and hash computations within a single evaluation session:
 
-- **`validatedAttrIds`** (`std::set<AttrId>`): Attributes whose traces have been
-  verified in this session. Skips re-verification on repeated access.
-- **`verifiedTraceIds`** (`std::set<int64_t>`): Traces whose dep entries have been
-  individually verified (BSàlC VT check passed). Shared across attributes with
-  the same trace.
-- **`traceCache`** (`std::map<int64_t, std::vector<Dep>>`): Loaded trace entries.
-  Caches deserialized deps from `DepsSets` JOINs to avoid redundant DB reads.
+- **`verifiedTraceIds`** (`std::unordered_set<TraceId>`): Traces whose dep
+  entries have been individually verified (BSàlC VT check passed). Shared across
+  attributes with the same trace.
+- **`traceCache`** (`std::unordered_map<TraceId, std::vector<Dep>>`): Loaded
+  trace entries. Caches deserialized deps from DepKeySets + Traces JOINs to
+  avoid redundant DB reads.
+- **`traceStructHashCache`** (`std::unordered_map<TraceId, Hash>`): Structural
+  hash per trace, for recovery short-circuit (skip struct_hash groups already
+  tried by direct hash recovery).
+- **`depKeySetCache`** (`std::unordered_map<DepKeySetId, std::vector<InternedDepKey>>`):
+  Resolved dep key sets. Avoids re-decompressing keys_blob when multiple traces
+  share a key set.
+- **`currentDepHashes`** (`std::unordered_map<DepKey, std::optional<DepHashValue>>`):
+  Current dep hash cache. Persists across verification and recovery within a
+  session. Value is `nullopt` if the dep's resource is unavailable (caches
+  failure to avoid re-attempting expensive hash computations).
+- **`internedStrings`** / **`internedAttrPaths`**: Session-local string/path
+  interning caches.
+- **`stringTable`**: Reverse lookup (id → string) for BLOB deserialization.
 
 These caches are cleared by `clearSessionCaches()` and are not persisted.
 
@@ -711,7 +767,7 @@ The verify path serves a traced result without evaluation — the core VT check:
 2. Verify trace (verifyTrace — BSàlC VT check)
    a. Load trace: trace_id, deps from Traces table
    b. Verify trace (if not already verified in session):
-      - Load deps from deps_blob (delta-decode if needed)
+      - Load deps from DepKeySets + Traces (keys_blob + values_blob)
       - For each dep: computeCurrentHash(dep, inputAccessors) → currentHash
       - If currentHash != dep.expectedHash → FAIL (trace invalid)
       - Volatile deps (CurrentTime, Exec) always fail
@@ -905,8 +961,8 @@ modifications to the evaluated file or expression.
    invalidate the trace.
 
 7. **(Resolved)** ~~Merkle identity hash is O(depth).~~ Parent Merkle chaining
-   has been removed. `trace_hash` now equals `deps_hash` (BLAKE3 of own sorted
-   deps including any ParentContext dep). No recursive parent-chain walk is needed.
+   has been removed. `trace_hash` is the BLAKE3 of own sorted deps (including
+   any ParentContext dep). No recursive parent-chain walk is needed.
 
 8. **Parent-mediated value changes (soundness gap).** Per-sibling ParentContext
    deps track only which siblings a child accessed during evaluation. If a parent
@@ -925,6 +981,14 @@ modifications to the evaluated file or expression.
    - **Future fix**: could be addressed by recording the parent's evaluation
      result hash alongside per-sibling deps, or by adding explicit dep tracking
      for overlay application sites.
+
+9. **Whole-file Content dep over-approximation.** For `.nix` code consumed via
+   `import`/`evalFile`, the Content dep covers the entire file. Any byte change
+   — even a comment edit in an unused branch — invalidates all traces that
+   imported the file. This is the dominant source of unnecessary re-evaluations
+   in the 100-commit nixpkgs benchmark (Section 4.6, Section 11.3). The
+   StructuredContent two-level override (Section 4.4) mitigates this for data
+   files (JSON/TOML) but not for `.nix` code.
 
 ---
 
@@ -954,6 +1018,121 @@ modifications to the evaluated file or expression.
 6. **Symlink tracking.** Record intermediate symlink targets as Existence deps to
    detect symlink retargeting.
 
+7. **Fine-grained `.nix` file dependency tracking.** The dominant source of
+   unnecessary re-evaluations is the whole-file Content dep for `.nix` code
+   (Section 4.6, Section 11.3 Pattern A and Pattern C). A future system could
+   track dependencies at a finer granularity — e.g., per-binding or per-function
+   — to avoid invalidating traces when changes are semantically irrelevant.
+   This would require language-level integration similar to Salsa's query system.
+
+8. **Key-set Directory shape deps for `mapAttrs`/`attrNames`.** When `readDir`
+   results are consumed only by key-enumerating operations (`mapAttrs`,
+   `attrNames`), the current system falls back to the coarse Directory dep
+   because no individual entry thunks are forced (Section 4.6, Section 11.3
+   Pattern B). A shape dep recording the sorted key set (without entry types)
+   could enable traces to survive additions/removals of irrelevant entries.
+
+9. **(Implemented)** ~~Dep key factoring and direct-lookup recovery.~~ Dep keys
+   are now stored in a shared `DepKeySets` table (keyed by `struct_hash`),
+   separate from per-trace hash values in `Traces.values_blob`. Structural
+   variant recovery loads only key sets (no values_blob decompression). All
+   dep hashes are computed upfront using warm StatHashCache, enabling O(1)
+   direct-lookup recovery as the primary strategy.
+
+---
+
+## Section 11: Benchmark Findings (100-Commit Nixpkgs Analysis)
+
+This section summarizes findings from benchmarking the eval trace system across
+100 consecutive nixpkgs commits, evaluating `nixpkgs#hello.pname` for each
+commit in both cold (fresh DB) and hot (warmed DB) configurations.
+
+### 11.1 Database Size
+
+After 200 evaluations (100 cold + 100 hot), the eval-trace database grew to
+**455 MB**. Dep storage (now split between `DepKeySets.keys_blob` and
+`Traces.values_blob`) accounts for **98.8%** of total storage. With dep key
+factoring, traces sharing the same dep structure now share a single `DepKeySets`
+row. However, each trace still requires its own `values_blob` because at least
+one hash value differs between commits. Typical traces contain ~20,000–40,000
+deps.
+
+### 11.2 Hot Evaluation Overhead
+
+Hot evaluations (warmed StatHashCache + populated DB) show **25.3% overhead**
+compared to baseline Nix evaluation:
+
+| Component | Time | Notes |
+|-----------|------|-------|
+| Verify (dep checking) | 127s total | 20.5M dep hash comparisons |
+| Recovery (direct + structural) | 116s total | 1,228 attempts, 31.6% success |
+| Trace loading | 34s total | 679 blob decompresses |
+| **Total trace overhead** | **277s** | **25.3% of 1,093s total** |
+
+The recovery time breaks down as: direct hash recovery (142 hits, fast) and
+structural variant recovery (246 hits, 840 failures — each failure requires
+decompressing 176–451 KB blobs to load dep entries for hash recomputation).
+
+### 11.3 Unnecessary Re-evaluations
+
+**29 out of 100** hot evaluations miss the cache (no verify hit, no recovery
+hit) but produce a result identical to an already-recorded trace. These
+represent **~980 seconds** of wasted evaluation time (73% of total hot eval
+time). Three patterns account for all 29 cases:
+
+**Pattern A: `aliases.nix` changes (26 cases).** `pkgs/top-level/aliases.nix` is
+imported by `all-packages.nix`, which is imported by every evaluation path.
+Changes to unrelated aliases (e.g., renaming `sddm-kcm` to `kde-sddm`) change
+the file's Content hash, invalidating all traces that imported it. The affected
+attribute (`hello.pname`) never uses any alias — the entire invalidation is a
+consequence of whole-file Content dep over-approximation (Section 4.6).
+
+**Pattern B: `pkgs/by-name/` directory additions (13 cases).** Adding a new
+package to `pkgs/by-name/xx/` changes the directory listing hash, invalidating
+all traces that enumerate the parent directory. The `hello` package is unaffected
+by the addition. The current system records a coarse Directory dep for the
+listing; the two-level override only applies when individual entries are forced
+via `ExprTracedData` thunks.
+
+**Pattern C: `python-packages.nix` additions (2 cases).** Similar to Pattern A
+— adding a new Python package to the ~40,000-line file changes the Content hash,
+invalidating traces that import it even though `hello` has no Python dependency.
+
+### 11.4 Recovery Effectiveness
+
+| Strategy | Hits | Failures |
+|----------|------|----------|
+| Direct hash recovery | 142 | N/A |
+| Structural variant recovery | 246 | 840 |
+| **Total** | **388 (31.6%)** | **840 (68.4%)** |
+
+Direct hash recovery succeeds when the dep *values* (file hashes) match a
+previously-seen trace — i.e., the exact combination of file versions has been
+evaluated before. This is O(1) and fast. Structural variant recovery succeeds
+when a different dep *structure* (different dep keys) produces a matching trace
+— handling dynamic dep instability (Shake-style). Neither strategy helps when
+the dep state is genuinely novel (a never-before-seen combination of file
+hashes), which is the case for the 840 failures.
+
+### 11.5 Implications
+
+The benchmark findings point to three concrete optimization opportunities:
+
+1. **Dep key factoring** (addresses DB size + recovery overhead): Separating dep
+   keys from hash values would enable key-set dedup across structurally-identical
+   traces and eliminate blob decompression during structural variant recovery.
+   Estimated 30% storage reduction and significant recovery speedup.
+
+2. **Direct-lookup as primary recovery** (addresses verify+recovery overhead):
+   With StatHashCache warm (8,535 entries, ~0.5us per dep for stat-only lookup),
+   computing all current dep hashes upfront is cheap (~2ms for 4,283 deps).
+   Direct hash recovery then becomes O(1). The current two-phase
+   verify→recovery pattern is an artifact of an era when hash computation was
+   expensive.
+
+3. **Fine-grained `.nix` tracking** (addresses Pattern A+C): This is a
+   longer-term goal requiring language-level changes (Section 10, item 7).
+
 ---
 
 ## Appendix A: File Layout
@@ -962,8 +1141,7 @@ modifications to the evaluated file or expression.
 
 | File | Description |
 |------|-------------|
-| `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange` |
-| `src/libexpr/eval-trace-deps.cc` | `depTypeName()` implementation |
+| `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange` (header-only, includes inline `depTypeName()`) |
 | `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker`, `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance` |
 | `src/libexpr/dependency-tracker.cc` | DependencyTracker implementation, dep hash functions, `resolveToInput`, `recordDep`, internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore), provenance threading |
 | `src/libexpr/include/nix/expr/eval-trace-context.hh` | `EvalTraceContext` struct (EvalState integration) |
@@ -1004,7 +1182,8 @@ traced-data.hh  (standalone — depends on eval-gc.hh, nixexpr.hh)
 |------|-------------|
 | `tests/functional/flakes/eval-trace-*.sh` | Functional tests (flake-based) |
 | `tests/functional/eval-trace-impure-*.sh` | Functional tests (impure / --file / --expr) |
-| `src/libexpr-tests/eval-trace/traced-data.cc` | GTest unit tests for lazy structural dep tracking (13 tests) |
+| `src/libexpr-tests/eval-trace/traced-data.cc` | GTest unit tests for lazy structural dep tracking |
+| `src/libexpr-tests/eval-trace/trace-store.cc` | GTest unit tests for TraceStore (schema, serialization, verify/record/recover) |
 
 ## Appendix B: References
 

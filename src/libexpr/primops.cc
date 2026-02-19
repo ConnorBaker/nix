@@ -2156,7 +2156,12 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
     auto path = state.realisePath(pos, *args[0]);
     auto s = path.readFile();
 
-    // Record Content oracle dep for trace verification (Adapton DDG edge)
+    // Record Content oracle dep for trace verification (Adapton DDG edge).
+    // Note: for data files consumed by fromJSON/fromTOML, ReadFileProvenance
+    // enables StructuredContent two-level override — only accessed scalar
+    // values produce deps, so changes to unaccessed parts don't invalidate.
+    // For .nix code (consumed via import/evalFile), Content is the only dep;
+    // no fine-grained override exists. See design.md Section 4.6.
     if (DependencyTracker::isActive()) {
         auto hash = depHash(s);
         recordDep(path.path, hash, DepType::Content, state.getMountToInput());
@@ -2578,7 +2583,13 @@ static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Val
     // on many systems.
     auto entries = path.readDirectory();
 
-    // Record Directory oracle dep for trace verification
+    // Record Directory oracle dep for trace verification.
+    // Note: the coarse Directory dep hashes the entire sorted directory listing.
+    // When ExprTracedData wrapping succeeds (below), per-entry StructuredContent
+    // deps can override the coarse dep via two-level verification. When evaluation
+    // enumerates all keys (e.g., mapAttrs over the attrset without forcing values),
+    // no StructuredContent deps are recorded and the coarse dep alone controls
+    // invalidation. See design.md Section 4.6.
     if (DependencyTracker::isActive()) {
         recordDep(path.path, depHashDirListing(entries), DepType::Directory, state.getMountToInput());
 

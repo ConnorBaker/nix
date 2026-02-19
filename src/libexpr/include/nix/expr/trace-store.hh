@@ -29,6 +29,14 @@ using StringId = int64_t;
 /** SQLite rowid for the AttrPaths table. */
 using AttrPathId = int64_t;
 
+/** SQLite rowid for the DepKeySets table. */
+using DepKeySetId = int64_t;
+
+/** SQLite-backed trace store for the eval trace system.
+ *  Not thread-safe: must be used from a single thread. The session caches
+ *  (verifiedTraceIds, internedStrings, traceCache, currentDepHashes, etc.)
+ *  are plain containers without synchronization. Only the SQLite connection
+ *  (_state) uses Sync<> for locking. */
 struct TraceStore {
     struct State {
         SQLite db;
@@ -45,14 +53,14 @@ struct TraceStore {
         SQLiteStmt upsertResult;
         SQLiteStmt getResult;
 
-        // DepsSets (content-addressed dep storage)
-        SQLiteStmt upsertDepsSet;
+        // DepKeySets (content-addressed dep key storage, keyed by struct_hash)
+        SQLiteStmt upsertDepKeySet;
+        SQLiteStmt getDepKeySet;
 
-        // Traces (references DepsSets via deps_set_id FK)
+        // Traces (references DepKeySets via dep_key_set_id FK, stores values_blob)
         SQLiteStmt upsertTrace;
         SQLiteStmt lookupTraceByFullHash;
         SQLiteStmt getTraceInfo;
-        SQLiteStmt lookupTraceByStructHash;
 
         // CurrentTraces (current verified state per attribute)
         SQLiteStmt lookupAttr;
@@ -73,7 +81,16 @@ struct TraceStore {
     SymbolTable & symbols;
     int64_t contextHash;
 
-    // Interned dep entry (string IDs instead of strings, for BLOB serialization)
+    // Interned dep key (string IDs, no hash value — used for keys_blob serialization)
+    // Ordering is not required; these are serialized positionally in keys_blob
+    // and indexed by DepKeySetId in the session cache.
+    struct InternedDepKey {
+        DepType type;
+        uint32_t sourceId;
+        uint32_t keyId;
+    };
+
+    // Interned dep entry (key + hash value — used for full dep reconstruction)
     struct InternedDep {
         DepType type;
         uint32_t sourceId;
@@ -89,19 +106,28 @@ struct TraceStore {
         std::string context;
     };
 
-    // Session caches
+    // Session caches — unordered because we only need O(1) lookup by key,
+    // not iteration in any particular order.
     std::unordered_set<TraceId> verifiedTraceIds;
     std::unordered_map<std::string, StringId> internedStrings;
     std::unordered_map<std::string, AttrPathId> internedAttrPaths;
     std::unordered_map<TraceId, std::vector<Dep>> traceCache;
+    // Structural hash (dep shape without values) per trace, for recovery short-circuit.
     std::unordered_map<TraceId, Hash> traceStructHashCache;
+
+    // DepKeySet session cache: maps DepKeySetId → resolved dep keys.
+    // Keyed by integer ID (not hash) because we look up by ID after DB queries.
+    // Avoids re-decompressing keys_blob when multiple traces share a key set.
+    std::unordered_map<DepKeySetId, std::vector<InternedDepKey>> depKeySetCache;
 
     // Session string table (reverse: id -> string, for BLOB deserialization)
     std::unordered_map<StringId, std::string> stringTable;
     bool stringTableLoaded = false;
     void ensureStringTableLoaded();
 
-    // Current dep hash cache (persists across verification → recovery within session)
+    // Current dep hash cache (persists across verification → recovery within session).
+    // Value is nullopt if the dep's resource is unavailable (e.g., file deleted);
+    // this caches the failure to avoid re-attempting expensive hash computations.
     std::unordered_map<DepKey, std::optional<DepHashValue>, DepKey::Hash> currentDepHashes;
 
     TraceStore(SymbolTable & symbols, int64_t contextHash);
@@ -138,7 +164,8 @@ struct TraceStore {
      * value is persisted alongside dep hashes, enabling future recovery without
      * re-evaluation. Each trace stores only its own deps — no parent dep
      * inheritance. If a trace with the same trace_hash already exists (dedup),
-     * reuses it. Deps are content-addressed via DepsSets table.
+     * reuses it. Dep keys are content-addressed via DepKeySets table; hash
+     * values are stored per-trace in values_blob.
      *
      * Also inserts into TraceHistory for constructive recovery: historical traces
      * can be recovered when dep hashes match a previously-seen state (e.g., after
@@ -162,11 +189,11 @@ struct TraceStore {
      *   Direct hash recovery: compute trace_hash from current dep hashes, look
      *     up in Traces table. O(1). Handles file reverts and same-structure changes.
      *   Structural variant recovery: scan TraceHistory for entries with the same
-     *     (context_hash, attr_path_id), group by struct_hash, recompute current
-     *     dep hashes for each structural variant, retry direct hash lookup.
-     *     O(V) where V = number of distinct dep structures. Handles dynamic dep
-     *     instability (Shake-style: deps vary between evaluations). Novel
-     *     extension beyond BSàlC's taxonomy.
+     *     (context_hash, attr_path_id), group by dep_key_set_id, load key set once
+     *     per group, recompute current dep hashes, retry direct hash lookup.
+     *     O(V) where V = number of distinct dep structures. Zero values_blob
+     *     decompression needed — only keys_blob is loaded. Handles dynamic dep
+     *     instability (Shake-style: deps vary between evaluations).
      */
     std::optional<VerifyResult> recovery(
         TraceId oldTraceId,
@@ -177,13 +204,25 @@ struct TraceStore {
     /**
      * Load the full dependency set for a trace.
      *
-     * Reads the deps_blob from the DepsSets table via the trace's deps_set_id
-     * foreign key. O(1) — single DB read + zstd decompression.
+     * Reads the keys_blob from DepKeySets and values_blob from Traces via JOIN.
+     * Zips the key set with positional hash values to reconstruct full deps.
+     * Single DB round-trip + two zstd decompressions. O(D) in dep count.
      *
      * The returned vector is NOT sorted. Callers that need canonical ordering
      * must call sortAndDedupDeps() explicitly.
      */
     std::vector<Dep> loadFullTrace(TraceId traceId);
+
+    /**
+     * Load just the dep key set for a DepKeySets row (no hash values).
+     *
+     * Returns InternedDepKey entries (type + string IDs). Session-cached:
+     * subsequent calls for the same depKeySetId return from depKeySetCache.
+     * Used by structural variant recovery (Phase D) to avoid decompressing
+     * values_blob when only dep keys are needed for hash recomputation.
+     */
+    std::vector<InternedDepKey> loadKeySet(DepKeySetId depKeySetId);
+
     bool attrExists(std::string_view attrPath);
     /** Get the current trace hash for an attr path (for ParentContext dep verification).
      *  Returns the trace_hash from the Traces table, which captures the full dep
@@ -193,10 +232,20 @@ struct TraceStore {
     void clearSessionCaches();
     static std::string buildAttrPath(const std::vector<std::string> & components);
 
-    // BLOB serialization for dep entries
-    static std::vector<uint8_t> serializeDeps(const std::vector<InternedDep> & deps);
-    static std::vector<InternedDep> deserializeInternedDeps(const void * blob, size_t size);
-    std::vector<Dep> resolveDeps(const std::vector<InternedDep> & interned);
+    // BLOB serialization for dep key sets (keys only, no hash values)
+    static std::vector<uint8_t> serializeKeys(const std::vector<InternedDepKey> & keys);
+    static std::vector<InternedDepKey> deserializeKeys(const void * blob, size_t size);
+
+    // BLOB serialization for dep hash values (positional, matching key set order).
+    // deserializeValues needs the key types to distinguish Blake3Hash (32 bytes)
+    // from string values that happen to be 32 bytes (e.g., store paths).
+    static std::vector<uint8_t> serializeValues(const std::vector<InternedDep> & deps);
+    static std::vector<DepHashValue> deserializeValues(
+        const void * blob, size_t size, const std::vector<InternedDepKey> & keys);
+
+    // Full dep interning/resolution (combines key set + values)
+    std::vector<Dep> resolveDeps(const std::vector<InternedDepKey> & keys,
+                                  const std::vector<DepHashValue> & values);
     std::vector<InternedDep> internDeps(const std::vector<Dep> & deps);
 
     /**
@@ -206,9 +255,10 @@ struct TraceStore {
      * Returns true if every non-volatile dep's current hash matches its stored
      * hash. Volatile deps (CurrentTime, Exec) always fail.
      *
-     * When earlyExit is true, returns false on the first mismatch without
-     * computing remaining dep hashes. When false (default), computes ALL dep
-     * hashes even on mismatch, populating currentDepHashes for recovery().
+     * Always computes ALL dep hashes even on mismatch, populating
+     * currentDepHashes for recovery(). With StatHashCache warm, computing
+     * all hashes is cheap (~2ms for ~4K deps) and eliminates redundant
+     * hash computation in the recovery path.
      *
      * Session-memoized: a trace verified once in this session is not re-verified
      * (tracked via verifiedTraceIds).
@@ -216,8 +266,7 @@ struct TraceStore {
     bool verifyTrace(
         TraceId traceId,
         const std::unordered_map<std::string, SourcePath> & inputAccessors,
-        EvalState & state,
-        bool earlyExit = false);
+        EvalState & state);
 
 private:
     std::optional<TraceRow> lookupTraceRow(std::string_view attrPath);
@@ -229,12 +278,12 @@ private:
 
     TraceId getOrCreateTrace(
         const Hash & traceHash,
-        const Hash & structHash,
-        int64_t depsSetId);
+        DepKeySetId depKeySetId,
+        const std::vector<uint8_t> & valuesBlob);
 
-    int64_t getOrCreateDepsSet(
-        const std::vector<Dep> & fullDeps,
-        const Hash & depsHash);
+    DepKeySetId getOrCreateDepKeySet(
+        const Hash & structHash,
+        const std::vector<uint8_t> & keysBlob);
 
     CachedResult decodeCachedResult(const TraceRow & row);
     std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);

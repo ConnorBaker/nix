@@ -301,11 +301,12 @@ no store path references, no GC coupling. The trace system is now a fully
 self-contained BSàlC trace store.
 
 **2. Eight-table schema.**
-`Strings`, `AttrPaths`, `Results`, `DepsSets`, `Traces`, `CurrentTraces`,
+`Strings`, `AttrPaths`, `Results`, `DepKeySets`, `Traces`, `CurrentTraces`,
 `TraceHistory`, `StatHashCache`.
-Normalized trace storage: dep entries are content-addressed in the `DepsSets`
-table (keyed by `deps_hash = BLAKE3(sorted deps, no parent Merkle)`), and
-`Traces` references `DepsSets` via `deps_set_id` FK. Result values are
+Dep keys are content-addressed in the `DepKeySets` table (keyed by
+`struct_hash = BLAKE3(dep types + sources + keys)`). Each `Traces` row
+references a shared `DepKeySets` row via `dep_key_set_id` FK and stores its
+own `values_blob` (hash values in positional order). Result values are
 deduplicated via the `Results` table.
 `CurrentTraces` maps `(context_hash, attr_path_id)` to the current trace and
 result (the BSàlC VT lookup table). `TraceHistory` stores all historical
@@ -326,14 +327,12 @@ Domain-separated fields: `"T"` type, `"S"` source, `"K"` key, `"H"` hash for
 trace hash; structural hash omits `"H"`. This eliminated the `nlohmann/json`
 dependency from `trace-hash.cc`.
 
-**5. Epoch column for verify-path validation (Salsa revision counter).**
-Added `epoch INTEGER NOT NULL DEFAULT 0` to the Attributes table. The epoch
-increments on every UPSERT conflict (i.e., when an attribute is re-recorded with
-new data). `parent_epoch` stores the parent's epoch at recording time.
-`verifyTrace()` checks that the parent's current epoch matches the stored
-`parent_epoch`. This is a fast O(1) integer comparison -- analogous to Salsa's
-revision counter -- that detects parent staleness without traversing the dep
-graph.
+**5. Epoch column for verify-path validation (removed).**
+*(Historical note: an epoch column analogous to Salsa's revision counter was
+originally added to detect parent staleness via O(1) integer comparison. This
+was superseded by ParentContext deps — each child now records the parent's
+`trace_hash` as a dep, and parent staleness is detected via normal dep hash
+verification. The Attributes table and epoch mechanism no longer exist.)*
 
 **6. Parent Merkle chaining (removed).**
 *(Historical note: parent-aware constructive recovery originally used Merkle
@@ -343,13 +342,13 @@ separated: each trace now stores only its own deps, and parent invalidation
 no longer cascades to children. The `computeTraceHashWithParent*` functions
 and `getTraceFullHash()` / `traceHashCache` were deleted.)*
 
-**6. DepsSets normalization (post Phase 12).**
-Replaced delta-encoded `deps_blob` + `base_trace_id` chain with a normalized
-`DepsSets` table. Content-addressed by `deps_hash = BLAKE3(sorted deps, no
-parent Merkle)`. Traces reference `DepsSets(id)` via FK. Eliminates chain walk
-(O(depth) → O(1) load), `optimizeTraces()` post-write pass, and ~200 lines
-of delta encoding code. Same storage because traces differing only in parent
-context share a `DepsSets` row.
+**7. Dep key factoring (DepKeySets).**
+Dep storage is split into shared key sets and per-trace hash values. The
+`DepKeySets` table stores content-addressed dep key sets (keyed by
+`struct_hash = BLAKE3(dep types + sources + keys)`). Each `Traces` row
+references a `DepKeySets` row and stores its own `values_blob`. Traces with the
+same dep structure share a single `DepKeySets` row. Structural variant recovery
+loads only key sets (no `values_blob` decompression needed).
 
 **Files changed.**
 - **Created:** `trace-store.cc`, `trace-store.hh`
@@ -523,73 +522,70 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 
 #### `nix::` namespace — evaluator-facing types
 
-| File | Lines | Description |
-|------|------:|-------------|
-| `src/libexpr/include/nix/expr/eval-trace-deps.hh` | ~250 | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange`, inline helpers |
-| `src/libexpr/eval-trace-deps.cc` | ~25 | `depTypeName()` implementation |
-| `src/libexpr/include/nix/expr/dependency-tracker.hh` | ~310 | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance`, `resolveProvenance`, `dirEntryTypeString` |
-| `src/libexpr/dependency-tracker.cc` | ~540 | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) + provenance threading + `dirEntryTypeString` |
-| `src/libexpr/include/nix/expr/traced-data.hh` | ~100 | `TracedDataNode` virtual interface, `ExprTracedData` Expr subclass for lazy structural dep tracking |
-| `src/libexpr/include/nix/expr/eval-trace-context.hh` | ~95 | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
-| `src/libexpr/eval-trace-context.cc` | ~50 | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
+| File | Description |
+|------|-------------|
+| `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange`, inline helpers (header-only, includes `depTypeName()`) |
+| `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance`, `resolveProvenance`, `dirEntryTypeString` |
+| `src/libexpr/dependency-tracker.cc` | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) + provenance threading + `dirEntryTypeString` |
+| `src/libexpr/include/nix/expr/traced-data.hh` | `TracedDataNode` virtual interface, `ExprTracedData` Expr subclass for lazy structural dep tracking |
+| `src/libexpr/include/nix/expr/eval-trace-context.hh` | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
+| `src/libexpr/eval-trace-context.cc` | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
 
 #### `nix::eval_trace` namespace — trace system internals
 
-| File | Lines | Description |
-|------|------:|-------------|
-| `src/libexpr/include/nix/expr/trace-result.hh` | ~65 | Result vocabulary types: `ResultKind`, `CachedResult`, all result structs (header-only) |
-| `src/libexpr/include/nix/expr/trace-cache.hh` | ~65 | Public API: `TraceCache`, performance counters |
-| `src/libexpr/trace-cache.cc` | ~726 | `TracedExpr` (Adapton articulation point), `ExprOrigChild`, `SharedParentResult`, verify/record/recover loop |
-| `src/libexpr/include/nix/expr/trace-store.hh` | ~250 | `TraceStore`: pure SQLite backend (BSàlC trace store) |
-| `src/libexpr/trace-store.cc` | ~1700 | SQLite backend: schema, verify, record, constructive recovery, verifyTrace (BSàlC VT/CT operations), `computeCurrentHash` ('j'/'t'/'d' formats), DOM caches |
-| `src/libexpr/include/nix/expr/trace-hash.hh` | ~79 | HashSink-based trace hashing (CBOR serialization removed in Phase 12) |
-| `src/libexpr/trace-hash.cc` | ~89 | HashSink trace hashing implementations |
+| File | Description |
+|------|-------------|
+| `src/libexpr/include/nix/expr/trace-result.hh` | Result vocabulary types: `ResultKind`, `CachedResult`, all result structs (header-only) |
+| `src/libexpr/include/nix/expr/trace-cache.hh` | Public API: `TraceCache`, performance counters |
+| `src/libexpr/trace-cache.cc` | `TracedExpr` (Adapton articulation point), `ExprOrigChild`, `SharedParentResult`, verify/record/recover loop |
+| `src/libexpr/include/nix/expr/trace-store.hh` | `TraceStore`: pure SQLite backend (BSàlC trace store) |
+| `src/libexpr/trace-store.cc` | SQLite backend: schema, verify, record, constructive recovery, verifyTrace (BSàlC VT/CT operations), `computeCurrentHash` ('j'/'t'/'d' formats), DOM caches |
+| `src/libexpr/include/nix/expr/trace-hash.hh` | HashSink-based trace hashing |
+| `src/libexpr/trace-hash.cc` | HashSink trace hashing implementations |
 
 **Removed in Phase 12:** `trace-cache-store.hh/cc` (CAS blob backend),
 `eval-index-db.hh/cc` (SQLite index for trace store paths).
 
 **Removed in Phase 13 (file reorganization):** `dep-tracker.hh/cc` (split into
-`eval-trace-deps.hh/cc` + `dependency-tracker.hh/cc`), `stat-hash-cache.hh/cc`
-(folded into `dependency-tracker.cc` as an anonymous-namespace implementation detail).
-
-**Total new code:** ~5,100 lines across 15 files.
+header-only `eval-trace-deps.hh` + `dependency-tracker.hh/cc`),
+`stat-hash-cache.hh/cc` (folded into `dependency-tracker.cc` as an
+anonymous-namespace implementation detail).
 
 ### Modified Files
 
-| File | Changes | Description |
-|------|--------:|-------------|
-| `src/libexpr/eval.cc` | +88 | DependencyTracker integration (Adapton DDG), `evalFile` Content dep |
-| `src/libexpr/eval-trace-context.cc` | ~50 | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
-| `src/libexpr/primops.cc` | +310 | `recordDep` calls for all file-accessing builtins + `ReadFileProvenance` in readFile, provenance consumption in fromJSON, `DirDataNode`/`DirScalarNode` + ExprTracedData path in readDir |
-| `src/libexpr/primops/fetchTree.cc` | +12 | UnhashedFetch dep recording |
-| `src/libexpr/primops/fromTOML.cc` | +100 | `TomlDataNode`, `parseTracedTOML`, provenance consumption |
-| `src/libexpr/json-to-value.cc` | +120 | `JsonDataNode`, `parseTracedJSON`, `ExprTracedData::eval()` vtable |
-| `src/libexpr/include/nix/expr/eval-trace-context.hh` | ~95 | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
-| `src/libexpr/include/nix/expr/eval-settings.hh` | +20 | `trace-cache`, `verify-trace-cache` settings |
-| `src/libcmd/installable-attr-path.cc` | ~200 | `NIX_ALLOW_EVAL` guard, TracedExpr root articulation point creation |
-| `src/libcmd/installable-flake.cc` | ~200 | Trace lifecycle, `computeStableIdentity()` |
-| `src/libflake/flake.cc` | +85 | Input accessor mappings, `traceCtx->mountToInput` |
-| `src/nix/eval.cc` | ~50 | `getRootValue()` instead of `getRoot()` |
-| `src/nix/search.cc` | ~50 | Value-based API instead of AttrCursor |
-| `src/nix/flake.cc` | ~50 | Value-based API instead of AttrCursor |
+| File | Description |
+|------|-------------|
+| `src/libexpr/eval.cc` | DependencyTracker integration (Adapton DDG), `evalFile` Content dep |
+| `src/libexpr/eval-trace-context.cc` | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
+| `src/libexpr/primops.cc` | `recordDep` calls for all file-accessing builtins + `ReadFileProvenance` in readFile, provenance consumption in fromJSON, `DirDataNode`/`DirScalarNode` + ExprTracedData path in readDir |
+| `src/libexpr/primops/fetchTree.cc` | UnhashedFetch dep recording |
+| `src/libexpr/primops/fromTOML.cc` | `TomlDataNode`, `parseTracedTOML`, provenance consumption |
+| `src/libexpr/json-to-value.cc` | `JsonDataNode`, `parseTracedJSON`, `ExprTracedData::eval()` vtable |
+| `src/libexpr/include/nix/expr/eval-trace-context.hh` | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
+| `src/libexpr/include/nix/expr/eval-settings.hh` | `trace-cache`, `verify-trace-cache` settings |
+| `src/libcmd/installable-attr-path.cc` | `NIX_ALLOW_EVAL` guard, TracedExpr root articulation point creation |
+| `src/libcmd/installable-flake.cc` | Trace lifecycle, `computeStableIdentity()` |
+| `src/libflake/flake.cc` | Input accessor mappings, `traceCtx->mountToInput` |
+| `src/nix/eval.cc` | `getRootValue()` instead of `getRoot()` |
+| `src/nix/search.cc` | Value-based API instead of AttrCursor |
+| `src/nix/flake.cc` | Value-based API instead of AttrCursor |
 
 ### Test Files
 
-| File | Lines | Description |
-|------|------:|-------------|
-| `tests/functional/flakes/eval-trace-core.sh` | ~350 | Core verify/record cycle, per-attr invalidation, GC resilience |
-| `tests/functional/flakes/eval-trace-deps.sh` | ~300 | pathExists, readDir, flake input, partial tree |
-| `tests/functional/flakes/eval-trace-output.sh` | ~250 | Scalar types, JSON output, write-to |
-| `tests/functional/flakes/eval-trace-recovery.sh` | ~200 | Dep revert, alternating versions, constructive recovery |
-| `tests/functional/flakes/eval-trace-volatile.sh` | ~150 | currentTime, mixed volatile/non-volatile |
-| `tests/functional/eval-trace-impure-core.sh` | ~350 | --file, --expr, selective invalidation |
-| `tests/functional/eval-trace-impure-deps.sh` | ~350 | getEnv, currentSystem, pathExists, hashFile, addPath |
-| `tests/functional/eval-trace-impure-advanced.sh` | ~350 | Deep origExpr, dep suspension, fat parent |
-| `tests/functional/eval-trace-impure-output.sh` | ~300 | Cursor eval, JSON, revert constructive recovery |
-| `tests/functional/eval-trace-impure-regression.sh` | ~200 | Specific bug regressions (3 tests) |
-| `src/libexpr-tests/eval-trace/traced-data.cc` | ~2920 | GTest: lazy structural dep tracking (94 tests: 62 JSON/TOML + 32 directory; covers scalar access, two-level override, shape deps, provenance, directory entries) |
-
-**Total test code:** ~5,700 lines across 11 files.
+| File | Description |
+|------|-------------|
+| `tests/functional/flakes/eval-trace-core.sh` | Core verify/record cycle, per-attr invalidation, GC resilience |
+| `tests/functional/flakes/eval-trace-deps.sh` | pathExists, readDir, flake input, partial tree |
+| `tests/functional/flakes/eval-trace-output.sh` | Scalar types, JSON output, write-to |
+| `tests/functional/flakes/eval-trace-recovery.sh` | Dep revert, alternating versions, constructive recovery |
+| `tests/functional/flakes/eval-trace-volatile.sh` | currentTime, mixed volatile/non-volatile |
+| `tests/functional/eval-trace-impure-core.sh` | --file, --expr, selective invalidation |
+| `tests/functional/eval-trace-impure-deps.sh` | getEnv, currentSystem, pathExists, hashFile, addPath |
+| `tests/functional/eval-trace-impure-advanced.sh` | Deep origExpr, dep suspension, fat parent |
+| `tests/functional/eval-trace-impure-output.sh` | Cursor eval, JSON, revert constructive recovery |
+| `tests/functional/eval-trace-impure-regression.sh` | Specific bug regressions |
+| `src/libexpr-tests/eval-trace/traced-data.cc` | GTest: lazy structural dep tracking (JSON/TOML + directory; covers scalar access, two-level override, shape deps, provenance, directory entries) |
+| `src/libexpr-tests/eval-trace/trace-store.cc` | GTest: TraceStore (schema, serialization, verify/record/recover) |
 
 ---
 
@@ -1025,8 +1021,10 @@ alternative that doesn't appear in file paths or data paths.
 ### 4.7 Two-Object Trace Model (3 pitfalls) -- CAS Blob Era Only
 
 *(These pitfalls are specific to the CAS blob trace design, Phases 9--11.
-The pure SQLite TraceStore (Phase 12) does not use CAS blobs, zstd compression,
-or store-path-based references, so none of these apply to the current design.)*
+The pure SQLite TraceStore does not use CAS blobs or store-path-based references,
+so none of these apply to the current design. Note: the current TraceStore does
+use zstd compression for `keys_blob` and `values_blob`, but determinism is not
+required since these are SQLite BLOBs, not content-addressed store paths.)*
 
 **Pitfall 25: Zstd determinism for CAS stability.**
 *Symptom:* Dep blobs for identical traces produce different store paths.
