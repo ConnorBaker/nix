@@ -37,6 +37,7 @@ static thread_local std::unordered_map<const void*, TracedContainerProvenance> t
 void DependencyTracker::onRootConstruction()
 {
     clearTracedContainerMap();
+    clearReadFileProvenanceMap();
 }
 
 void registerTracedContainer(const void * key, TracedContainerProvenance prov)
@@ -470,21 +471,27 @@ void recordDep(
 // ReadFile provenance threading
 // ═══════════════════════════════════════════════════════════════════════
 
-// Thread-local provenance from the last readFile call. Evaluation is
-// single-threaded, so this is safe. Set by prim_readFile, consumed by
+// Thread-local map from content hash to ReadFileProvenance. Evaluation is
+// single-threaded, so this is safe. Populated by prim_readFile, queried by
 // prim_fromJSON/prim_fromTOML to enable lazy structural dep tracking.
-static thread_local std::optional<ReadFileProvenance> readFileProvenance;
+// Keyed by content hash so multiple readFile results coexist and the same
+// provenance can serve multiple fromJSON/fromTOML calls (non-consuming lookup).
+static thread_local std::unordered_map<Blake3Hash, ReadFileProvenance, Blake3Hash::Hasher> readFileProvenanceMap;
 
-void setReadFileProvenance(ReadFileProvenance prov)
+void addReadFileProvenance(ReadFileProvenance prov)
 {
-    readFileProvenance = std::move(prov);
+    readFileProvenanceMap.insert_or_assign(prov.contentHash, std::move(prov));
 }
 
-std::optional<ReadFileProvenance> consumeReadFileProvenance()
+const ReadFileProvenance * lookupReadFileProvenance(const Blake3Hash & contentHash)
 {
-    auto result = std::move(readFileProvenance);
-    readFileProvenance.reset();
-    return result;
+    auto it = readFileProvenanceMap.find(contentHash);
+    return it != readFileProvenanceMap.end() ? &it->second : nullptr;
+}
+
+void clearReadFileProvenanceMap()
+{
+    readFileProvenanceMap.clear();
 }
 
 std::pair<std::string, std::string> resolveProvenance(

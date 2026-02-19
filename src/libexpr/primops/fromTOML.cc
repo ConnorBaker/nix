@@ -227,15 +227,13 @@ static void prim_fromTOML(EvalState & state, const PosIdx pos, Value ** args, Va
     // If the string came directly from readFile (provenance hash matches),
     // produce lazy traced data with fine-grained StructuredContent deps.
     if (DependencyTracker::isActive()) {
-        if (auto prov = consumeReadFileProvenance()) {
-            if (prov->contentHash == depHash(toml)) {
-                auto [depSource, depKey] = resolveProvenance(prov->path, state.getMountToInput());
-                try {
-                    parseTracedTOML(state, toml, val, depSource, depKey);
-                    return;
-                } catch (std::exception & e) {
-                    state.error<EvalError>("while parsing TOML: %s", e.what()).atPos(pos).debugThrow();
-                }
+        if (auto * prov = lookupReadFileProvenance(depHash(toml))) {
+            auto [depSource, depKey] = resolveProvenance(prov->path, state.getMountToInput());
+            try {
+                parseTracedTOML(state, toml, val, depSource, depKey);
+                return;
+            } catch (std::exception & e) {
+                state.error<EvalError>("while parsing TOML: %s", e.what()).atPos(pos).debugThrow();
             }
         }
     }

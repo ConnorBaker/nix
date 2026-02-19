@@ -1848,4 +1848,177 @@ TEST_F(TracedDataTest, TracedTOML_LengthAfterTypeChangeToTable)
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ReadFileProvenance map tests (multi-file, reuse, forced-before-fromJSON)
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── Two files read before fromJSON ────────────────────────────────────
+
+TEST_F(TracedDataTest, TracedJSON_TwoFilesReadBeforeFromJSON)
+{
+    // Read two files, then fromJSON both. Both should get traced data
+    // (verifies no single-slot overwrite).
+    TempJsonFile f1(R"({"x": "hello"})");
+    TempJsonFile f2(R"({"y": "world"})");
+    auto expr = R"(let a = builtins.readFile )" + f1.path.string()
+        + R"(; b = builtins.readFile )" + f2.path.string()
+        + R"(; in (builtins.fromJSON a).x + "-" + (builtins.fromJSON b).y)";
+
+    // Fresh evaluation
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("hello-world"));
+    }
+
+    // Verify trace served from cache
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_THAT(v, IsStringEq("hello-world"));
+    }
+
+    // Modify f1 value of x → first trace invalidates
+    f1.modify(R"({"x": "CHANGED!!"})");
+    invalidateFileCache(f1.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1);
+        EXPECT_THAT(v, IsStringEq("CHANGED!!-world"));
+    }
+
+    // Modify f2 value of y → second trace invalidates
+    f2.modify(R"({"y": "CHANGED!!"})");
+    invalidateFileCache(f2.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1);
+        EXPECT_THAT(v, IsStringEq("CHANGED!!-CHANGED!!"));
+    }
+}
+
+// ── Same readFile result fed to two fromJSON calls ────────────────────
+
+TEST_F(TracedDataTest, TracedJSON_SameReadFileTwoFromJSON)
+{
+    // Same readFile result used by two fromJSON calls. Both should get
+    // traced data (verifies non-consuming lookup).
+    TempJsonFile file(R"({"x": "alpha", "y": "beta"})");
+    auto expr = R"(let s = builtins.readFile )" + file.path.string()
+        + R"(; in (builtins.fromJSON s).x + "-" + (builtins.fromJSON s).y)";
+
+    // Fresh evaluation
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("alpha-beta"));
+    }
+
+    // Verify trace served from cache
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_THAT(v, IsStringEq("alpha-beta"));
+    }
+
+    // Change x value → trace invalid (StructuredContent dep on x fails)
+    file.modify(R"({"x": "CHANGED!!", "y": "beta"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1);
+        EXPECT_THAT(v, IsStringEq("CHANGED!!-beta"));
+    }
+
+    // Change only y (unaccessed by x dep) — but y is also accessed,
+    // so StructuredContent dep on y fails → trace invalid
+    file.modify(R"({"x": "CHANGED!!", "y": "ALSO-NEW!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1);
+        EXPECT_THAT(v, IsStringEq("CHANGED!!-ALSO-NEW!!"));
+    }
+
+    // Change only unused key (add "z") → trace valid (two-level override)
+    file.modify(R"({"x": "CHANGED!!", "y": "ALSO-NEW!!", "z": "extra!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_THAT(v, IsStringEq("CHANGED!!-ALSO-NEW!!"));
+    }
+}
+
+// ── Forced before fromJSON (builtins.seq) ─────────────────────────────
+
+TEST_F(TracedDataTest, TracedJSON_ForcedBeforeFromJSON)
+{
+    // Force readFile result (via builtins.seq) before fromJSON. Provenance
+    // should still be available because the map is non-consuming.
+    // seq forces s but returns s (same string), so depHash(s) matches.
+    TempJsonFile file(R"({"x": "hello", "extra": "padding"})");
+    auto expr = R"(let s = builtins.readFile )" + file.path.string()
+        + R"(; forced = builtins.seq s s; in (builtins.fromJSON forced).x)";
+
+    // Fresh evaluation
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("hello"));
+    }
+
+    // Verify trace served from cache
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_THAT(v, IsStringEq("hello"));
+    }
+
+    // Change unused key → two-level override applies
+    file.modify(R"({"x": "hello", "extra": "CHANGED-padding!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_THAT(v, IsStringEq("hello"));
+    }
+
+    // Change used key → trace invalid
+    file.modify(R"({"x": "CHANGED!!", "extra": "CHANGED-padding!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1);
+        EXPECT_THAT(v, IsStringEq("CHANGED!!"));
+    }
+}
+
 } // namespace nix::eval_trace

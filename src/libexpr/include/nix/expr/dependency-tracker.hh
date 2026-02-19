@@ -182,16 +182,23 @@ struct ReadFileProvenance {
 };
 
 /**
- * Set the read-file provenance for the next fromJSON/fromTOML call.
- * Overwrites any previous provenance.
+ * Add read-file provenance keyed by content hash. Multiple readFile
+ * results can coexist; fromJSON/fromTOML look up by content hash.
  */
-void setReadFileProvenance(ReadFileProvenance prov);
+void addReadFileProvenance(ReadFileProvenance prov);
 
 /**
- * Consume the read-file provenance (move and reset). Returns nullopt
- * if no provenance was set or it was already consumed.
+ * Look up read-file provenance by content hash. Returns a non-owning
+ * pointer (nullptr if not found). Non-consuming: the same provenance
+ * can serve multiple fromJSON/fromTOML calls on the same string.
  */
-std::optional<ReadFileProvenance> consumeReadFileProvenance();
+const ReadFileProvenance * lookupReadFileProvenance(const Blake3Hash & contentHash);
+
+/**
+ * Clear the thread-local read-file provenance map.
+ * Called on root DependencyTracker construction.
+ */
+void clearReadFileProvenanceMap();
 
 /**
  * Resolve an absolute path to a (source, key) pair for dep recording,
