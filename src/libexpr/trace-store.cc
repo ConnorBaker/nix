@@ -4,6 +4,8 @@
 #include "nix/expr/trace-hash.hh"
 #include "nix/expr/eval.hh"
 #include "nix/store/globals.hh"
+
+#include "expr-config-private.hh"
 #include "nix/util/users.hh"
 #include "nix/util/util.hh"
 #include "nix/util/hash.hh"
@@ -11,6 +13,9 @@
 #include "nix/util/environment-variables.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/fetchers/fetchers.hh"
+
+#include <nlohmann/json.hpp>
+#include <toml.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -49,6 +54,137 @@ static std::optional<SourcePath> resolveDepPath(
     if (dep.source.empty())
         return SourcePath(getFSSourceAccessor(), CanonPath(dep.key));
     return std::nullopt;
+}
+
+// ── Structured content navigation helpers ────────────────────────────
+
+// Thread-local DOM caches: avoid re-parsing the same file when multiple
+// StructuredContent deps reference it. Cleared at verifyTrace entry.
+static thread_local std::unordered_map<std::string, nlohmann::json> jsonDomCache;
+static thread_local std::unordered_map<std::string, toml::value> tomlDomCache;
+
+static void clearDomCaches()
+{
+    jsonDomCache.clear();
+    tomlDomCache.clear();
+}
+
+/**
+ * Parse a data path like "nodes.nixpkgs.locked.rev" or "items.[0].name"
+ * into segments. '.' separates object keys, '[N]' denotes array indices.
+ * Array indices may appear at the start ("[0].name") or after a dot ("items.[0]").
+ *
+ * Known limitation: object keys containing '.' or '[' will be misinterpreted.
+ * This is conservative — verification fails, causing re-evaluation, never stale results.
+ */
+/**
+ * Parse a data path into segments. Supports three segment types:
+ *   - Array index: [N]
+ *   - Quoted key: "key" (with \" and \\ escape sequences, unescaped on parse)
+ *   - Bare key: chars until '.', '[', or end
+ * Segments are separated by '.'. Returns empty vector on malformed input.
+ */
+static std::vector<std::string> parseDataPath(const std::string & path)
+{
+    std::vector<std::string> segments;
+    if (path.empty()) return segments;
+
+    size_t pos = 0;
+    while (pos < path.size()) {
+        if (path[pos] == '[') {
+            // Array index: find closing ']'
+            auto end = path.find(']', pos);
+            if (end == std::string::npos) return {}; // malformed
+            segments.push_back(path.substr(pos, end - pos + 1));
+            pos = end + 1;
+            if (pos < path.size() && path[pos] == '.') pos++;
+        } else if (path[pos] == '"') {
+            // Quoted key: unescape backslash-escaped chars
+            std::string segment;
+            pos++; // skip opening quote
+            while (pos < path.size() && path[pos] != '"') {
+                if (path[pos] == '\\' && pos + 1 < path.size()) {
+                    pos++; // skip backslash, take next char literally
+                }
+                segment += path[pos++];
+            }
+            if (pos >= path.size()) return {}; // malformed: no closing quote
+            pos++; // skip closing quote
+            if (pos < path.size() && path[pos] == '.') pos++;
+            segments.push_back(std::move(segment));
+        } else {
+            // Bare key: until '.', '[', or end
+            size_t start = pos;
+            while (pos < path.size() && path[pos] != '.' && path[pos] != '[')
+                pos++;
+            segments.push_back(path.substr(start, pos - start));
+            if (pos < path.size() && path[pos] == '.') pos++;
+        }
+    }
+    return segments;
+}
+
+/**
+ * Navigate a JSON DOM to a data path. Returns nullptr if path is invalid.
+ */
+static const nlohmann::json * navigateJson(const nlohmann::json & root, const std::string & dataPath)
+{
+    auto segments = parseDataPath(dataPath);
+    const nlohmann::json * node = &root;
+    for (auto & seg : segments) {
+        if (seg.front() == '[') {
+            // Array index
+            if (!node->is_array()) return nullptr;
+            auto idxStr = seg.substr(1, seg.size() - 2);
+            size_t idx = std::stoull(idxStr);
+            if (idx >= node->size()) return nullptr;
+            node = &(*node)[idx];
+        } else {
+            // Object key
+            if (!node->is_object()) return nullptr;
+            auto it = node->find(seg);
+            if (it == node->end()) return nullptr;
+            node = &*it;
+        }
+    }
+    return node;
+}
+
+/**
+ * Navigate a TOML DOM to a data path. Returns nullptr if path is invalid.
+ */
+static const toml::value * navigateToml(const toml::value & root, const std::string & dataPath)
+{
+    auto segments = parseDataPath(dataPath);
+    const toml::value * node = &root;
+    for (auto & seg : segments) {
+        if (seg.front() == '[') {
+            if (!node->is_array()) return nullptr;
+            auto idxStr = seg.substr(1, seg.size() - 2);
+            size_t idx = std::stoull(idxStr);
+            auto & arr = toml::get<std::vector<toml::value>>(*node);
+            if (idx >= arr.size()) return nullptr;
+            node = &arr[idx];
+        } else {
+            if (!node->is_table()) return nullptr;
+            auto & table = toml::get<toml::table>(*node);
+            auto it = table.find(seg);
+            if (it == table.end()) return nullptr;
+            node = &it->second;
+        }
+    }
+    return node;
+}
+
+/**
+ * Canonical string form of a TOML scalar value for hashing.
+ * Must match TomlDataNode::canonicalValue() in fromTOML.cc.
+ */
+static std::string tomlCanonical(const toml::value & v)
+{
+    std::ostringstream ss;
+    ss << v;
+    return ss.str();
 }
 
 static std::optional<DepHashValue> computeCurrentHash(
@@ -120,6 +256,56 @@ static std::optional<DepHashValue> computeCurrentHash(
                 state.fetchSettings, *state.store);
             return DepHashValue(state.store->printStorePath(storePath));
         } catch (std::exception &) {
+            return std::nullopt;
+        }
+    }
+    case DepType::StructuredContent: {
+        // Key format: "filepath\tf:datapath" (tab separator)
+        auto sep = dep.key.find('\t');
+        if (sep == std::string::npos || sep + 2 >= dep.key.size())
+            return std::nullopt;
+        char format = dep.key[sep + 1];
+        if (dep.key[sep + 2] != ':')
+            return std::nullopt;
+        std::string filePath = dep.key.substr(0, sep);
+        std::string dataPath = dep.key.substr(sep + 3);
+
+        // Construct a synthetic Content dep to resolve the file path
+        Dep fileDep{dep.source, filePath, DepHashValue{Blake3Hash{}}, DepType::Content};
+        auto path = resolveDepPath(fileDep, inputAccessors);
+        if (!path) return std::nullopt;
+
+        try {
+            if (format == 'j') {
+                // Use DOM cache to avoid re-parsing
+                auto cacheKey = dep.source + '\t' + filePath;
+                auto cacheIt = jsonDomCache.find(cacheKey);
+                if (cacheIt == jsonDomCache.end()) {
+                    auto contents = path->readFile();
+                    cacheIt = jsonDomCache.emplace(cacheKey, nlohmann::json::parse(contents)).first;
+                }
+                auto * node = navigateJson(cacheIt->second, dataPath);
+                if (!node) return std::nullopt;
+                return DepHashValue(depHash(node->dump()));
+            } else if (format == 't') {
+                auto cacheKey = dep.source + '\t' + filePath;
+                auto cacheIt = tomlDomCache.find(cacheKey);
+                if (cacheIt == tomlDomCache.end()) {
+                    auto contents = path->readFile();
+                    std::istringstream stream(std::move(contents));
+                    cacheIt = tomlDomCache.emplace(cacheKey, toml::parse(
+                        stream, "verifyTrace"
+#if HAVE_TOML11_4
+                        , toml::spec::v(1, 0, 0)
+#endif
+                    )).first;
+                }
+                auto * node = navigateToml(cacheIt->second, dataPath);
+                if (!node) return std::nullopt;
+                return DepHashValue(depHash(tomlCanonical(*node)));
+            }
+            return std::nullopt;
+        } catch (...) {
             return std::nullopt;
         }
     }
@@ -852,22 +1038,48 @@ bool TraceStore::verifyTrace(
         return true;
 
     auto vtStart = timerStart();
+    clearDomCaches();
 
     // Load the FULL trace (base chain already resolved)
     auto fullDeps = loadFullTrace(traceId);
 
-    // Verify dep hashes against current state.
-    // When earlyExit is true, return false on first mismatch (fast path for
-    // initial verification — recovery will compute remaining hashes lazily).
-    // When earlyExit is false, compute ALL hashes to populate currentDepHashes
-    // cache for recovery.
-    bool allValid = true;
+    // Two-level verification: Content failures can be overridden by passing
+    // StructuredContent deps that cover the same file. This enables fine-grained
+    // invalidation for fromJSON(readFile f) patterns.
+    //
+    // Key-set safety: the override only activates when StructuredContent deps
+    // exist in this trace. If code only iterates keys (mapAttrs, attrNames)
+    // without forcing leaf values, no StructuredContent deps are recorded and
+    // the Content dep alone controls invalidation — any file change triggers
+    // re-evaluation. This is correct because the key set is part of the cached
+    // result's structure at this trace level. StructuredContent deps only appear
+    // in child traces (when specific leaf values are forced), where the cached
+    // result is the leaf value and key-set changes are irrelevant.
+    //
+    // First pass: verify non-structural deps, defer StructuredContent deps,
+    // track failed Content deps by their file key (source + key).
+
+    bool hasNonContentFailure = false;
+    bool hasContentFailure = false;
+    bool hasStructuralDeps = false;
+
+    // Track failed Content dep file keys: "source\tkey"
+    std::unordered_set<std::string> failedContentFiles;
+    // Deferred structural deps
+    std::vector<const Dep *> structuralDeps;
+
     for (auto & dep : fullDeps) {
         nrDepsChecked++;
 
         if (dep.type == DepType::CurrentTime || dep.type == DepType::Exec) {
-            allValid = false;
+            hasNonContentFailure = true;
             if (earlyExit) break;
+            continue;
+        }
+
+        if (dep.type == DepType::StructuredContent) {
+            hasStructuralDeps = true;
+            structuralDeps.push_back(&dep);
             continue;
         }
 
@@ -884,15 +1096,79 @@ bool TraceStore::verifyTrace(
 
         if (!current || *current != dep.expectedHash) {
             nrVerificationsFailed++;
-            allValid = false;
-            if (earlyExit) break;
+            if (dep.type == DepType::Content) {
+                hasContentFailure = true;
+                failedContentFiles.insert(dep.source + '\t' + dep.key);
+            } else {
+                hasNonContentFailure = true;
+                if (earlyExit) break;
+            }
         }
+    }
+
+    bool allValid;
+
+    if (hasNonContentFailure) {
+        // Non-Content, non-structural failure → trace invalid (no override possible)
+        allValid = false;
+    } else if (!hasContentFailure) {
+        // No failures at all (structural deps haven't been checked yet, but
+        // they can only strengthen the result — if Content passed, structural
+        // deps would also pass since the file hasn't changed)
+        allValid = true;
+    } else if (hasContentFailure && hasStructuralDeps) {
+        // Content failure(s) exist AND structural deps are present.
+        // Check if all structural deps covering failed files still pass.
+        allValid = true;
+
+        // Build set of files covered by structural deps
+        std::unordered_set<std::string> structuralCoveredFiles;
+        for (auto * dep : structuralDeps) {
+            auto sep = dep->key.find('\t');
+            if (sep != std::string::npos)
+                structuralCoveredFiles.insert(dep->source + '\t' + dep->key.substr(0, sep));
+        }
+
+        // Check that all failed Content files are covered by structural deps
+        for (auto & failedFile : failedContentFiles) {
+            if (structuralCoveredFiles.find(failedFile) == structuralCoveredFiles.end()) {
+                allValid = false;
+                break;
+            }
+        }
+
+        // If covered, verify all structural deps pass
+        if (allValid) {
+            for (auto * dep : structuralDeps) {
+                nrDepsChecked++;
+                DepKey dk(*dep);
+                auto cacheIt = currentDepHashes.find(dk);
+                std::optional<DepHashValue> current;
+
+                if (cacheIt != currentDepHashes.end()) {
+                    current = cacheIt->second;
+                } else {
+                    current = computeCurrentHash(state, *dep, inputAccessors);
+                    currentDepHashes[dk] = current;
+                }
+
+                if (!current || *current != dep->expectedHash) {
+                    nrVerificationsFailed++;
+                    allValid = false;
+                    if (earlyExit) break;
+                }
+            }
+        }
+    } else {
+        // Content failure with no structural deps → invalid (backward compat)
+        allValid = false;
     }
 
     if (allValid) {
         verifiedTraceIds.insert(traceId);
     }
     nrVerifyTraceTimeUs += elapsedUs(vtStart);
+    clearDomCaches();
     return allValid;
 }
 

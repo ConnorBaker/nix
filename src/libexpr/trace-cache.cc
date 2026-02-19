@@ -616,10 +616,21 @@ void TracedExpr::evaluateFresh(Value & v)
             sortChildNames(childNames);
             attrValue = childNames;
         } else if (target->type() == nList) {
+            // Suspend dep tracking during the allStrings check. Without this,
+            // forcing ExprTracedData element thunks would record StructuredContent
+            // deps in this trace's DependencyTracker, mixing them with the Content
+            // dep from readFile. That would let the two-level override incorrectly
+            // validate the trace when the list size changes but element values don't
+            // (e.g., element added to a JSON array). By suspending, the list trace
+            // has only Content deps → any file change invalidates → correct.
+            // Per-element override still works via TracedExpr children in list_t path.
             bool allStrings = true;
-            for (size_t i = 0; i < target->listSize(); i++) {
-                st.forceValue(*target->listView()[i], noPos);
-                if (target->listView()[i]->type() != nString) { allStrings = false; break; }
+            {
+                SuspendDepTracking suspend;
+                for (size_t i = 0; i < target->listSize(); i++) {
+                    st.forceValue(*target->listView()[i], noPos);
+                    if (target->listView()[i]->type() != nString) { allStrings = false; break; }
+                }
             }
             if (allStrings) {
                 std::vector<std::string> strs;

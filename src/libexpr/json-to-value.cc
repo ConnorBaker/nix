@@ -1,4 +1,6 @@
 #include "nix/expr/json-to-value.hh"
+#include "nix/expr/traced-data.hh"
+#include "nix/expr/dependency-tracker.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/eval.hh"
 
@@ -207,6 +209,194 @@ void parseJSON(EvalState & state, const std::string_view & s_, Value & v)
     bool res = json::sax_parse(s_, &parser);
     if (!res)
         throw JSONParseError("Invalid JSON Value");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Lazy structural dependency tracking for JSON (traced data)
+// ═══════════════════════════════════════════════════════════════════════
+
+namespace {
+
+struct JsonDataNode : TracedDataNode {
+    json data;
+
+    explicit JsonDataNode(json d) : data(std::move(d)) {}
+
+    Kind kind() const override {
+        switch (data.type()) {
+        case json::value_t::object: return Kind::Object;
+        case json::value_t::array: return Kind::Array;
+        case json::value_t::string: return Kind::String;
+        case json::value_t::boolean: return Kind::Bool;
+        case json::value_t::number_integer:
+        case json::value_t::number_unsigned:
+        case json::value_t::number_float: return Kind::Number;
+        case json::value_t::null:
+        case json::value_t::discarded: return Kind::Null;
+        case json::value_t::binary: return Kind::Null; // unreachable for JSON text
+        }
+        return Kind::Null;
+    }
+
+    char formatTag() const override { return 'j'; }
+
+    std::vector<std::string> objectKeys() const override {
+        std::vector<std::string> keys;
+        keys.reserve(data.size());
+        for (auto & [k, _] : data.items())
+            keys.push_back(k);
+        return keys;
+    }
+
+    TracedDataNode * objectGet(const std::string & key) const override {
+        return new JsonDataNode(data.at(key));
+    }
+
+    size_t arraySize() const override { return data.size(); }
+
+    TracedDataNode * arrayGet(size_t index) const override {
+        return new JsonDataNode(data.at(index));
+    }
+
+    void materializeScalar(EvalState & state, Value & v) const override {
+        switch (data.type()) {
+        case json::value_t::string: {
+            auto s = data.get<std::string>();
+            forceNoNullByte(s);
+            v.mkString(s, state.mem);
+            break;
+        }
+        case json::value_t::number_integer:
+            v.mkInt(data.get<NixInt::Inner>());
+            break;
+        case json::value_t::number_unsigned: {
+            auto val = data.get<uint64_t>();
+            if (val > static_cast<uint64_t>(std::numeric_limits<NixInt::Inner>::max()))
+                throw Error("unsigned json number %1% outside of Nix integer range", val);
+            v.mkInt(static_cast<NixInt::Inner>(val));
+            break;
+        }
+        case json::value_t::number_float:
+            v.mkFloat(data.get<NixFloat>());
+            break;
+        case json::value_t::boolean:
+            v.mkBool(data.get<bool>());
+            break;
+        case json::value_t::null:
+        case json::value_t::discarded:
+        case json::value_t::binary:
+            v.mkNull();
+            break;
+        case json::value_t::object:
+        case json::value_t::array:
+            throw Error("cannot materialize non-scalar JSON value");
+        }
+    }
+
+    std::string canonicalValue() const override {
+        return data.dump();
+    }
+};
+
+} // anonymous namespace
+
+// ── Data path key escaping ────────────────────────────────────────────
+// Keys that contain '.', '[', ']', '"', or '\' are quoted with "..." and
+// inner '"' / '\' are backslash-escaped. Matches Nix attr-path conventions.
+
+static std::string escapeDataPathKey(const std::string & key)
+{
+    bool needsQuote = false;
+    for (char c : key) {
+        if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\') {
+            needsQuote = true;
+            break;
+        }
+    }
+    if (!needsQuote) return key;
+
+    std::string out;
+    out.reserve(key.size() + 4);
+    out += '"';
+    for (char c : key) {
+        if (c == '"' || c == '\\')
+            out += '\\';
+        out += c;
+    }
+    out += '"';
+    return out;
+}
+
+// ── ExprTracedData::eval() — vtable emitted here ────────────────────
+
+void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
+{
+    auto nodeKind = node->kind();
+
+    switch (nodeKind) {
+    case TracedDataNode::Kind::Object: {
+        // Eagerly materialize the full key set; each value is a lazy thunk.
+        // No dep is recorded here — the key set is covered by the Content dep
+        // from readFile. This means builtins that only iterate keys (mapAttrs,
+        // attrNames) without forcing values produce no StructuredContent deps,
+        // so the two-level override cannot apply and any file change correctly
+        // invalidates the trace at this level. See traced-data.hh for details.
+        auto keys = node->objectKeys();
+        auto attrs = state.buildBindings(keys.size());
+        for (auto & k : keys) {
+            auto escaped = escapeDataPathKey(k);
+            auto childPath = dataPath.empty() ? escaped : dataPath + "." + escaped;
+            auto * childExpr = new ExprTracedData(
+                node->objectGet(k), depSource, depKey, std::move(childPath));
+            auto * thunkVal = state.allocValue();
+            thunkVal->mkThunk(&state.baseEnv, childExpr);
+            forceNoNullByte(k);
+            attrs.insert(state.symbols.create(k), thunkVal);
+        }
+        v.mkAttrs(attrs);
+        break;
+    }
+    case TracedDataNode::Kind::Array: {
+        auto sz = node->arraySize();
+        auto list = state.buildList(sz);
+        for (size_t i = 0; i < sz; i++) {
+            auto indexPart = "[" + std::to_string(i) + "]";
+            auto childPath = dataPath.empty() ? indexPart : dataPath + "." + indexPart;
+            auto * childExpr = new ExprTracedData(
+                node->arrayGet(i), depSource, depKey, std::move(childPath));
+            auto * thunkVal = state.allocValue();
+            thunkVal->mkThunk(&state.baseEnv, childExpr);
+            list[i] = thunkVal;
+        }
+        v.mkList(list);
+        break;
+    }
+    case TracedDataNode::Kind::String:
+    case TracedDataNode::Kind::Number:
+    case TracedDataNode::Kind::Bool:
+    case TracedDataNode::Kind::Null: {
+        // Scalar leaf — record StructuredContent dep
+        auto fullKey = depKey + '\t' + node->formatTag() + ':' + dataPath;
+        auto hash = depHash(node->canonicalValue());
+        DependencyTracker::record({depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        node->materializeScalar(state, v);
+        break;
+    }
+    }
+}
+
+void parseTracedJSON(EvalState & state, const std::string_view & s, Value & v,
+                     const std::string & depSource, const std::string & depKey)
+{
+    auto j = json::parse(s);
+    if (j.is_object() || j.is_array()) {
+        auto * rootNode = new JsonDataNode(std::move(j));
+        auto * rootExpr = new ExprTracedData(rootNode, depSource, depKey, "");
+        rootExpr->eval(state, state.baseEnv, v);
+    } else {
+        // Scalar root — fall back to eager parsing (no structural tracking)
+        parseJSON(state, s, v);
+    }
 }
 
 } // namespace nix

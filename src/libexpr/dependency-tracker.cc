@@ -434,6 +434,39 @@ void recordDep(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ReadFile provenance threading
+// ═══════════════════════════════════════════════════════════════════════
+
+// Thread-local provenance from the last readFile call. Evaluation is
+// single-threaded, so this is safe. Set by prim_readFile, consumed by
+// prim_fromJSON/prim_fromTOML to enable lazy structural dep tracking.
+static thread_local std::optional<ReadFileProvenance> readFileProvenance;
+
+void setReadFileProvenance(ReadFileProvenance prov)
+{
+    readFileProvenance = std::move(prov);
+}
+
+std::optional<ReadFileProvenance> consumeReadFileProvenance()
+{
+    auto result = std::move(readFileProvenance);
+    readFileProvenance.reset();
+    return result;
+}
+
+std::pair<std::string, std::string> resolveProvenance(
+    const CanonPath & absPath,
+    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
+{
+    if (!mountToInput.empty()) {
+        if (auto resolved = resolveToInput(absPath, mountToInput))
+            return {resolved->first, resolved->second.abs()};
+        return {std::string(absolutePathDep), absPath.abs()};
+    }
+    return {"", absPath.abs()};
+}
+
 void clearStatHashMemoryCache()
 {
     StatHashCache::instance().clearMemoryCache();

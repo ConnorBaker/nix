@@ -28,7 +28,7 @@ struct SourcePath;
  * Dependency types for eval trace verification (BSàlC verifying trace check).
  *
  * Category A (Hash Oracle): Verified by recomputing a hash and comparing.
- *   Content, Directory, Existence, EnvVar, System
+ *   Content, Directory, Existence, EnvVar, System, StructuredContent
  *
  * Category B (Reference Resolution): Verified by re-resolving a reference
  *   (store path computation or re-fetch) and comparing.
@@ -69,6 +69,11 @@ enum class DepType : uint8_t {
      *  Used for per-file deps in builtins.path with a filter function.
      *  Unlike Content (raw bytes only), this detects chmod +x changes. */
     NARContent = 11,
+    /** BLAKE3 of canonical representation of a scalar at a data path within
+     *  a structured file (JSON/TOML). Key format: "filepath\tf:datapath"
+     *  where f is format tag ('j'/'t'). Enables two-level verification:
+     *  if Content dep fails but all StructuredContent deps pass, trace is valid. */
+    StructuredContent = 12,
 };
 
 /**
@@ -88,6 +93,7 @@ inline std::string depTypeName(DepType type)
     case DepType::CopiedPath: return "copiedPath";
     case DepType::Exec: return "exec";
     case DepType::NARContent: return "narContent";
+    case DepType::StructuredContent: return "structuredContent";
     }
     unreachable();
 }
@@ -187,6 +193,7 @@ inline bool isBlake3Dep(DepType type) {
     case DepType::EnvVar:
     case DepType::System:
     case DepType::ParentContext:
+    case DepType::StructuredContent:
         return true;
     case DepType::Existence:
     case DepType::CopiedPath:

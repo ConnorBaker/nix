@@ -165,6 +165,37 @@ void recordDep(
     const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
 
 /**
+ * Provenance information from a readFile call, used to connect
+ * fromJSON/fromTOML to the file that was read. Thread-local, set by
+ * prim_readFile and consumed by prim_fromJSON/prim_fromTOML.
+ */
+struct ReadFileProvenance {
+    CanonPath path;
+    Blake3Hash contentHash;
+};
+
+/**
+ * Set the read-file provenance for the next fromJSON/fromTOML call.
+ * Overwrites any previous provenance.
+ */
+void setReadFileProvenance(ReadFileProvenance prov);
+
+/**
+ * Consume the read-file provenance (move and reset). Returns nullopt
+ * if no provenance was set or it was already consumed.
+ */
+std::optional<ReadFileProvenance> consumeReadFileProvenance();
+
+/**
+ * Resolve an absolute path to a (source, key) pair for dep recording,
+ * using the same resolution logic as recordDep. Helper for provenance
+ * consumers that need to construct dep keys.
+ */
+std::pair<std::string, std::string> resolveProvenance(
+    const CanonPath & absPath,
+    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
+
+/**
  * Clear the in-memory (L1) stat-hash cache. Used by tests to force
  * re-hashing after modifying files.
  */

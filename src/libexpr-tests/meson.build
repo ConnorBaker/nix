@@ -58,6 +58,7 @@ sources = files(
   'eval-trace/dep-tracker.cc',
   'eval-trace/integration.cc',
   'eval-trace/stat-hash-cache.cc',
+  'eval-trace/traced-data.cc',
   'json.cc',
   'main.cc',
   'nix_api_expr.cc',

@@ -1,6 +1,8 @@
 #include "nix/expr/primops.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/static-string-data.hh"
+#include "nix/expr/traced-data.hh"
+#include "nix/expr/dependency-tracker.hh"
 
 #include "expr-config-private.hh"
 
@@ -87,13 +89,160 @@ static void normalizeDatetimeFormat(toml::value & t)
 
 #endif
 
+// ═══════════════════════════════════════════════════════════════════════
+// Lazy structural dependency tracking for TOML (traced data)
+// ═══════════════════════════════════════════════════════════════════════
+
+namespace {
+
+struct TomlDataNode : TracedDataNode {
+    toml::value data;
+
+    explicit TomlDataNode(toml::value d) : data(std::move(d)) {}
+
+    Kind kind() const override {
+        switch (data.type()) {
+        case toml::value_t::table: return Kind::Object;
+        case toml::value_t::array: return Kind::Array;
+        case toml::value_t::string: return Kind::String;
+        case toml::value_t::boolean: return Kind::Bool;
+        case toml::value_t::integer: return Kind::Number;
+        case toml::value_t::floating: return Kind::Number;
+        case toml::value_t::empty: return Kind::Null;
+        // datetime types → treated as scalar (materializeScalar creates attrset)
+        case toml::value_t::offset_datetime:
+        case toml::value_t::local_datetime:
+        case toml::value_t::local_date:
+        case toml::value_t::local_time: return Kind::String;
+        }
+        return Kind::Null;
+    }
+
+    char formatTag() const override { return 't'; }
+
+    std::vector<std::string> objectKeys() const override {
+        std::vector<std::string> keys;
+        auto & table = toml::get<toml::table>(data);
+        keys.reserve(table.size());
+        for (auto & [k, _] : table)
+            keys.push_back(k);
+        return keys;
+    }
+
+    TracedDataNode * objectGet(const std::string & key) const override {
+        return new TomlDataNode(toml::get<toml::table>(data).at(key));
+    }
+
+    size_t arraySize() const override {
+        return toml::get<std::vector<toml::value>>(data).size();
+    }
+
+    TracedDataNode * arrayGet(size_t index) const override {
+        return new TomlDataNode(toml::get<std::vector<toml::value>>(data).at(index));
+    }
+
+    void materializeScalar(EvalState & state, Value & v) const override {
+        switch (data.type()) {
+        case toml::value_t::boolean:
+            v.mkBool(toml::get<bool>(data));
+            break;
+        case toml::value_t::integer:
+            v.mkInt(toml::get<int64_t>(data));
+            break;
+        case toml::value_t::floating:
+            v.mkFloat(toml::get<NixFloat>(data));
+            break;
+        case toml::value_t::string: {
+            auto s = toml::get<std::string_view>(data);
+            forceNoNullByte(s);
+            v.mkString(s, state.mem);
+            break;
+        }
+        case toml::value_t::local_datetime:
+        case toml::value_t::offset_datetime:
+        case toml::value_t::local_date:
+        case toml::value_t::local_time: {
+            if (experimentalFeatureSettings.isEnabled(Xp::ParseTomlTimestamps)) {
+                auto mutData = data; // copy for normalization
+#if HAVE_TOML11_4
+                normalizeDatetimeFormat(mutData);
+#endif
+                auto attrs = state.buildBindings(2);
+                attrs.alloc("_type").mkStringNoCopy("timestamp"_sds);
+                std::ostringstream s;
+                s << mutData;
+                auto str = s.view();
+                forceNoNullByte(str);
+                attrs.alloc("value").mkString(str, state.mem);
+                v.mkAttrs(attrs);
+            } else {
+                throw std::runtime_error("Dates and times are not supported");
+            }
+            break;
+        }
+        case toml::value_t::empty:
+            v.mkNull();
+            break;
+        case toml::value_t::table:
+        case toml::value_t::array:
+            throw Error("cannot materialize non-scalar TOML value");
+        }
+    }
+
+    std::string canonicalValue() const override {
+        std::ostringstream ss;
+        ss << data;
+        return ss.str();
+    }
+};
+
+} // anonymous namespace
+
+static void parseTracedTOML(EvalState & state, const std::string_view & s, Value & v,
+                            const std::string & depSource, const std::string & depKey)
+{
+    std::istringstream tomlStream(std::string{s});
+    auto parsed = toml::parse(
+        tomlStream,
+        "fromTOML"
+#if HAVE_TOML11_4
+        ,
+        toml::spec::v(1, 0, 0)
+#endif
+    );
+    if (parsed.type() == toml::value_t::table) {
+        auto * rootNode = new TomlDataNode(std::move(parsed));
+        auto * rootExpr = new ExprTracedData(rootNode, depSource, depKey, "");
+        rootExpr->eval(state, state.baseEnv, v);
+    } else {
+        // Non-table root (unusual for TOML) — fall back to eager
+        throw std::runtime_error("TOML root is not a table");
+    }
+}
+
 static void prim_fromTOML(EvalState & state, const PosIdx pos, Value ** args, Value & val)
 {
     auto toml = state.forceStringNoCtx(*args[0], pos, "while evaluating the argument passed to builtins.fromTOML");
 
+    // If the string came directly from readFile (provenance hash matches),
+    // produce lazy traced data with fine-grained StructuredContent deps.
+    if (DependencyTracker::isActive()) {
+        if (auto prov = consumeReadFileProvenance()) {
+            if (prov->contentHash == depHash(toml)) {
+                auto [depSource, depKey] = resolveProvenance(prov->path, state.getMountToInput());
+                try {
+                    parseTracedTOML(state, toml, val, depSource, depKey);
+                    return;
+                } catch (std::exception & e) {
+                    state.error<EvalError>("while parsing TOML: %s", e.what()).atPos(pos).debugThrow();
+                }
+            }
+        }
+    }
+
     std::istringstream tomlStream(std::string{toml});
 
-    auto visit = [&](this auto & self, Value & v, toml::value t) -> void {
+    auto visit = [&](this auto & self, Value & v, ::toml::value t) -> void {
         switch (t.type()) {
         case toml::value_t::table: {
             auto table = toml::get<toml::table>(t);

@@ -2119,6 +2119,9 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
     if (DependencyTracker::isActive()) {
         auto hash = depHash(s);
         recordDep(path.path, hash, DepType::Content, state.getMountToInput());
+        // Set provenance so a subsequent fromJSON/fromTOML can produce lazy
+        // structural deps instead of relying solely on the whole-file Content dep.
+        setReadFileProvenance({path.path, hash});
     }
 
     if (s.find((char) 0) != std::string::npos)
@@ -2687,6 +2690,24 @@ static RegisterPrimOp primop_toJSON({
 static void prim_fromJSON(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto s = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.fromJSON");
+
+    // If the string came directly from readFile (provenance hash matches),
+    // produce lazy traced data with fine-grained StructuredContent deps.
+    if (DependencyTracker::isActive()) {
+        if (auto prov = consumeReadFileProvenance()) {
+            if (prov->contentHash == depHash(s)) {
+                auto [depSource, depKey] = resolveProvenance(prov->path, state.getMountToInput());
+                try {
+                    parseTracedJSON(state, s, v, depSource, depKey);
+                    return;
+                } catch (JSONParseError & e) {
+                    e.addTrace(state.positions[pos], "while decoding a JSON string");
+                    throw;
+                }
+            }
+        }
+    }
+
     try {
         parseJSON(state, s, v);
     } catch (JSONParseError & e) {

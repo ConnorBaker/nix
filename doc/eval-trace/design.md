@@ -204,7 +204,7 @@ a defined interface to the layer below.
 
 ### 4.1 Dependency Types
 
-The eval trace tracks 11 dependency types, organized into four categories:
+The eval trace tracks 12 dependency types, organized into four categories:
 
 | Category | Type | Source Builtins | Validation |
 |----------|------|-----------------|------------|
@@ -216,6 +216,7 @@ The eval trace tracks 11 dependency types, organized into four categories:
 | **Reference** | CopiedPath (9) | `builtins.path` (unfiltered) | BLAKE3 of NAR |
 | | UnhashedFetch (7) | `fetchTree` (unlocked) | Re-fetch, compare store path |
 | | NARContent (11) | `builtins.path` (filtered) | BLAKE3 of NAR (captures exec bit) |
+| | StructuredContent (12) | `fromJSON`/`fromTOML` leaf access | BLAKE3 of canonical scalar at data path |
 | **Volatile** | CurrentTime (5) | `currentTime` | Always invalidates |
 | | Exec (10) | `builtins.exec` | Always invalidates |
 | **Structural** | ParentContext (8) | (internal) | Parent trace hash |
@@ -258,12 +259,47 @@ Recording sites are instrumented throughout the evaluator:
   `currentSystem`, `hashFile`, `readFileType` → appropriate dep types
 - `primops/fetchTree.cc`: `fetchTree` (unlocked) → UnhashedFetch dep
 - `builtins.path`: → CopiedPath or NARContent (filtered) dep
+- `json-to-value.cc`: `ExprTracedData::eval()` → StructuredContent dep (scalar leaf access)
+- `primops/fromTOML.cc`: `ExprTracedData::eval()` → StructuredContent dep (via shared `ExprTracedData`)
 
 Each tracker deduplicates deps by `(type, source, key)` within its scope using a
 `DepKey` hash set, so the same file read twice during one attribute's evaluation
 produces only one dep entry.
 
-### 4.3 Verification (BSàlC Verifying Trace Check)
+### 4.3 Lazy Structural Dependency Tracking (TracedData)
+
+When `fromJSON` or `fromTOML` parses a string that came directly from `readFile`
+(validated by matching the string's BLAKE3 hash against the recorded Content dep),
+the result is returned as a **lazy attrset/list** whose children are thunks.
+Each thunk wraps an `ExprTracedData` node that, when forced:
+
+- **For containers (objects/arrays):** Creates another lazy attrset/list with
+  child thunks. No dep is recorded for intermediate containers.
+- **For scalar leaves:** Records a `StructuredContent` dep with the BLAKE3 hash
+  of the scalar's canonical representation.
+
+This means only **actually accessed** scalar values produce deps. Adding,
+removing, or modifying keys/elements that are never accessed does NOT invalidate
+the trace.
+
+**Dep key format:** `"filepath\tf:datapath"` where `\t` is the tab separator,
+`f` is the format tag (`j` for JSON, `t` for TOML), and `datapath` uses `.`
+for object keys and `.[N]` for array indices. Example:
+`"/path/to/flake.lock\tj:nodes.nixpkgs.locked.rev"`.
+
+**Provenance threading:** `readFile` sets a thread-local `ReadFileProvenance`
+(path + content hash). `fromJSON`/`fromTOML` consumes it and verifies the
+content hash matches the string being parsed. If the hash doesn't match (string
+was modified after readFile), eager parsing is used (no structural deps).
+
+**Verification:** During `computeCurrentHash` for a `StructuredContent` dep:
+
+1. Parse the dep key to extract file path, format tag, and data path.
+2. Read and parse the file (DOM cached per-file within a `verifyTrace` call).
+3. Navigate the DOM to the data path.
+4. Hash the leaf's canonical value and compare with the stored hash.
+
+### 4.4 Verification (BSàlC Verifying Trace Check)
 
 Verification operates in two modes depending on the caller:
 
@@ -287,7 +323,81 @@ nanoseconds, size) matches the cached entry, the stored hash is returned without
 re-reading the file. This reduces the verification step to a series of `lstat()`
 system calls for unchanged files.
 
-### 4.4 Parent Chain Disambiguation (Salsa Versioned Query)
+#### Two-Level Verification (StructuredContent Override)
+
+When `fromJSON(readFile f)` or `fromTOML(readFile f)` is used, the eval trace
+records both a whole-file `Content` dep and fine-grained `StructuredContent` deps
+for each accessed scalar leaf. During verification, if the `Content` dep fails
+(file changed) but all `StructuredContent` deps pass (accessed leaf values
+unchanged), the trace remains valid. This two-level override enables traces to
+survive changes to unused parts of structured data files (e.g., changing an
+unused input's `rev` in `flake.lock`).
+
+The override logic in `verifyTrace()`:
+
+1. **First pass:** Verify all non-structural deps normally. Defer
+   `StructuredContent` deps. Track which `Content` deps failed.
+2. **If any non-Content, non-structural dep fails:** trace invalid (no override).
+3. **If Content failures exist and structural deps cover those files:** verify
+   all structural deps. If all pass, Content failures are overridden.
+4. **If Content failure with no structural coverage:** trace invalid (backward
+   compatible with pre-structural behavior).
+
+#### Key-Set Safety with `mapAttrs` and `attrNames`
+
+The lazy attrset design intentionally does NOT track object key sets as deps —
+only `Content` (whole file) covers them. This interacts correctly with
+`mapAttrs` and `attrNames` because of how the two-level override operates:
+
+**`mapAttrs` with no leaf access** — e.g., `mapAttrs f (fromJSON (readFile f))`
+returned as a root attrset. `mapAttrs` iterates keys and creates new thunks but
+forces no values. Only the `Content` dep is recorded (no `StructuredContent`
+deps). If the file changes, `Content` fails and there are no structural deps to
+trigger the override → the trace is invalidated and re-evaluated. The new key set
+is correctly reflected in the fresh result.
+
+**`mapAttrs` with specific value access** — e.g.,
+`(mapAttrs f (fromJSON (readFile f))).nixpkgs`. The root result is the value at
+`.nixpkgs`, not the full attrset. `StructuredContent` deps are recorded for the
+accessed leaf values. If the file changes (key added/removed) but the accessed
+values are unchanged, the override applies and the cached result (the leaf value)
+is served — correctly, because the key set is irrelevant to the result.
+
+**`attrNames` with no leaf access** — e.g.,
+`attrNames (fromJSON (readFile f))`. This enumerates keys without forcing any
+values. Only `Content` is recorded. Any file change invalidates.
+
+**Array size safety.** The same principle applies to lists. `builtins.length`
+reads the list's size field without forcing elements — no `StructuredContent`
+deps recorded. If no elements are forced, `Content` alone controls. If specific
+elements are forced (e.g., `elemAt list 0`), the override applies to the leaf
+value and the list size is irrelevant to that result.
+
+Note: `TracedExpr::evaluateFresh()` eagerly forces all list elements to check if
+they're all strings (the `allStrings` optimization). This forcing is wrapped in
+`SuspendDepTracking` to prevent `StructuredContent` deps from contaminating the
+list trace. Without this, adding an element to a JSON array could incorrectly
+trigger the override.
+
+**Why this is correct in general:** The hierarchical trace structure naturally
+separates structural concerns (key sets, list sizes) from value concerns.
+Container structures are cached at the trace level that produces them, where only
+`Content` deps exist. `StructuredContent` deps only appear in child traces
+(when individual leaf values are forced), where the cached result is the leaf
+value and structural changes do not affect correctness.
+
+**Known trade-off (flat expressions).** If a single expression both observes
+container structure (e.g., `length`, `attrNames`) AND forces leaf values from
+traced data within the same `DependencyTracker`, the override could serve stale
+structural data. Example: `(toString (length arr)) + "-" + (elemAt arr 0)` — if
+the list size changes but element 0 is unchanged, the `StructuredContent` dep
+passes and the override serves the old string (with stale length). This is a
+fundamental tension: tracking container structure would prevent the override from
+surviving key-set changes, which is the primary use case. In practice, the
+hierarchical trace structure means structural observations and leaf access are in
+different traces (different `TracedExpr` levels), so this edge case is rare.
+
+### 4.5 Parent Chain Disambiguation (Salsa Versioned Query)
 
 Parent context is critical for recovery correctness. When a child attribute has
 the same deps across two evaluations but its parent has changed, the child's
@@ -786,10 +896,11 @@ modifications to the evaluated file or expression.
 |------|-------------|
 | `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange` |
 | `src/libexpr/eval-trace-deps.cc` | `depTypeName()` implementation |
-| `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker`, `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API |
-| `src/libexpr/dependency-tracker.cc` | DependencyTracker implementation, dep hash functions, `resolveToInput`, `recordDep`, internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore) |
+| `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker`, `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance` |
+| `src/libexpr/dependency-tracker.cc` | DependencyTracker implementation, dep hash functions, `resolveToInput`, `recordDep`, internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore), provenance threading |
 | `src/libexpr/include/nix/expr/eval-trace-context.hh` | `EvalTraceContext` struct (EvalState integration) |
 | `src/libexpr/eval-trace-context.cc` | `EvalTraceContext` methods |
+| `src/libexpr/include/nix/expr/traced-data.hh` | `TracedDataNode` virtual interface, `ExprTracedData` Expr subclass for lazy structural dep tracking |
 
 ### `nix::eval_trace` namespace — trace system internals
 
@@ -815,6 +926,8 @@ tracker.hh                   store.hh    cache.hh
     |                            |
 eval-trace-                  trace-hash.hh
 context.hh
+
+traced-data.hh  (standalone — depends on eval-gc.hh, nixexpr.hh)
 ```
 
 ### Tests
@@ -823,6 +936,7 @@ context.hh
 |------|-------------|
 | `tests/functional/flakes/eval-trace-*.sh` | Functional tests (flake-based) |
 | `tests/functional/eval-trace-impure-*.sh` | Functional tests (impure / --file / --expr) |
+| `src/libexpr-tests/eval-trace/traced-data.cc` | GTest unit tests for lazy structural dep tracking (13 tests) |
 
 ## Appendix B: References
 

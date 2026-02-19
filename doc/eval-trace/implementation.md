@@ -397,6 +397,82 @@ through the entire tree.
 tries to acquire the same non-recursive lock. Fix: compute the identity hash
 outside the lock scope.
 
+### Phase 14: Lazy Structural Dependency Tracking (Session 60+)
+
+**Problem: Whole-file Content deps cause over-invalidation for structured data.**
+When `fromJSON(readFile "flake.lock")` is used, a `Content` dep is recorded on
+the entire file. Any change — even to an unused input's `rev` — invalidates the
+trace. This is unnecessarily conservative for structured data where only specific
+scalar values are accessed.
+
+**Solution: StructuredContent deps with two-level verification override.**
+Added `StructuredContent` (DepType 12), a Hash Oracle dep that records the
+BLAKE3 hash of a scalar value at a specific data path within a JSON or TOML
+file. During verification, if the whole-file `Content` dep fails but all
+`StructuredContent` deps pass (accessed values unchanged), the trace remains
+valid.
+
+**Implementation: Lazy thunks via `ExprTracedData` Expr subclass.**
+When `fromJSON`/`fromTOML` parses a string whose BLAKE3 hash matches the
+`ReadFileProvenance` set by the preceding `readFile`, the result is returned
+as a lazy attrset/list. Each child is a thunk wrapping an `ExprTracedData`
+node backed by a format-agnostic `TracedDataNode` virtual interface
+(`JsonDataNode` wraps `nlohmann::json`, `TomlDataNode` wraps `toml::value`).
+
+- **Containers:** Create nested lazy attrsets/lists. No dep recorded.
+- **Scalar leaves:** Record `StructuredContent` dep with BLAKE3 of canonical
+  value. Dep key: `"filepath\tf:datapath"` (tab separator, `f` = format tag).
+
+**Provenance threading.** Thread-local `ReadFileProvenance` set by `readFile`,
+consumed by `fromJSON`/`fromTOML`. Content hash validation ensures structural
+deps are only used when the string came directly from `readFile` (not modified).
+
+**DOM caching in verifyTrace.** Thread-local parsed DOM caches avoid re-parsing
+when multiple `StructuredContent` deps reference the same file.
+
+**Two-level verification in verifyTrace.** First pass verifies non-structural
+deps and defers `StructuredContent` deps. If only `Content` failures exist and
+structural deps cover those files, structural deps are verified. If all pass,
+`Content` failures are overridden.
+
+**Key-set safety with `mapAttrs`/`attrNames`.** The lazy attrset eagerly
+materializes the full key set but records no dep for it — only the `Content`
+dep from `readFile` covers the key set. The two-level override only activates
+when `StructuredContent` deps exist in the trace. If code only iterates keys
+(e.g., `mapAttrs` without forcing values, `attrNames`), no `StructuredContent`
+deps are recorded and `Content` alone controls → any file change invalidates.
+If specific values are accessed, the cached result is the leaf value (not the
+attrset) and key-set changes are irrelevant. This is the correct behavior for
+flake-compat patterns where `mapAttrs` is used over lock file inputs and
+adding/removing unused inputs should not invalidate traces.
+
+**List allStrings fix.** `TracedExpr::evaluateFresh()` eagerly forces all list
+elements to check if they're all strings (for compact storage). This forcing is
+wrapped in `SuspendDepTracking` to prevent `ExprTracedData` thunks from recording
+`StructuredContent` deps into the list trace's `DependencyTracker`. Without this,
+adding an element to a JSON array could make the `Content` dep fail while all
+existing `StructuredContent` deps pass, incorrectly overriding the list's trace.
+
+**Data path key escaping.** Object keys containing `.`, `[`, `]`, `"`, or `\`
+are quoted using `"..."` with `\"` and `\\` escaping (matching Nix attr-path
+conventions). `parseDataPath` in `trace-store.cc` handles bare keys, quoted
+keys (with unescape), and array indices `[N]`.
+
+**Key bug: SQLite TEXT truncation at null bytes.** The original dep key format
+used `\0` as separator (`"filepath\0f:datapath"`). SQLite TEXT columns truncate
+at null bytes, so the interned key contained only the filepath. Fixed by
+using `\t` (tab) as separator.
+
+**Files added/modified:**
+- `traced-data.hh` (new): `TracedDataNode` + `ExprTracedData`
+- `eval-trace-deps.hh`: `StructuredContent = 12`
+- `dependency-tracker.hh/cc`: `ReadFileProvenance`, `resolveProvenance`
+- `json-to-value.hh/cc`: `JsonDataNode`, `parseTracedJSON`, `ExprTracedData::eval()`
+- `primops/fromTOML.cc`: `TomlDataNode`, `parseTracedTOML`
+- `primops.cc`: provenance wiring in `readFile`/`fromJSON`
+- `trace-store.cc`: `computeCurrentHash` for StructuredContent, two-level `verifyTrace`, DOM caches, `navigateJson`/`navigateToml` helpers
+- `traced-data.cc` (new test): 13 GTest unit tests
+
 ---
 
 ## 2. File Layout
@@ -412,8 +488,9 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 |------|------:|-------------|
 | `src/libexpr/include/nix/expr/eval-trace-deps.hh` | ~250 | Dep vocabulary types: `DepType`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange`, inline helpers |
 | `src/libexpr/eval-trace-deps.cc` | ~25 | `depTypeName()` implementation |
-| `src/libexpr/include/nix/expr/dependency-tracker.hh` | ~190 | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API |
-| `src/libexpr/dependency-tracker.cc` | ~450 | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) |
+| `src/libexpr/include/nix/expr/dependency-tracker.hh` | ~200 | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance`, `resolveProvenance` |
+| `src/libexpr/dependency-tracker.cc` | ~480 | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) + provenance threading |
+| `src/libexpr/include/nix/expr/traced-data.hh` | ~80 | `TracedDataNode` virtual interface, `ExprTracedData` Expr subclass for lazy structural dep tracking |
 | `src/libexpr/include/nix/expr/eval-trace-context.hh` | ~95 | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
 | `src/libexpr/eval-trace-context.cc` | ~50 | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
 
@@ -436,7 +513,7 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 `eval-trace-deps.hh/cc` + `dependency-tracker.hh/cc`), `stat-hash-cache.hh/cc`
 (folded into `dependency-tracker.cc` as an anonymous-namespace implementation detail).
 
-**Total new code:** ~3,700 lines across 13 files.
+**Total new code:** ~4,400 lines across 15 files.
 
 ### Modified Files
 
@@ -444,8 +521,10 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 |------|--------:|-------------|
 | `src/libexpr/eval.cc` | +88 | DependencyTracker integration (Adapton DDG), `evalFile` Content dep |
 | `src/libexpr/eval-trace-context.cc` | ~50 | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
-| `src/libexpr/primops.cc` | +184 | `recordDep` calls for all file-accessing builtins |
+| `src/libexpr/primops.cc` | +210 | `recordDep` calls for all file-accessing builtins + `ReadFileProvenance` in readFile, provenance consumption in fromJSON |
 | `src/libexpr/primops/fetchTree.cc` | +12 | UnhashedFetch dep recording |
+| `src/libexpr/primops/fromTOML.cc` | +100 | `TomlDataNode`, `parseTracedTOML`, provenance consumption |
+| `src/libexpr/json-to-value.cc` | +120 | `JsonDataNode`, `parseTracedJSON`, `ExprTracedData::eval()` vtable |
 | `src/libexpr/include/nix/expr/eval-trace-context.hh` | ~95 | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
 | `src/libexpr/include/nix/expr/eval-settings.hh` | +20 | `trace-cache`, `verify-trace-cache` settings |
 | `src/libcmd/installable-attr-path.cc` | ~200 | `NIX_ALLOW_EVAL` guard, TracedExpr root articulation point creation |
@@ -469,8 +548,9 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 | `tests/functional/eval-trace-impure-advanced.sh` | ~350 | Deep origExpr, dep suspension, fat parent |
 | `tests/functional/eval-trace-impure-output.sh` | ~300 | Cursor eval, JSON, revert constructive recovery |
 | `tests/functional/eval-trace-impure-regression.sh` | ~200 | Specific bug regressions (3 tests) |
+| `src/libexpr-tests/eval-trace/traced-data.cc` | ~460 | GTest: lazy structural dep tracking (13 tests: JSON/TOML scalar access, two-level override, array access, provenance) |
 
-**Total test code:** ~2,800 lines across 10 files.
+**Total test code:** ~3,260 lines across 11 files.
 
 ---
 
@@ -890,7 +970,23 @@ not content -- the stat-based BSàlC VT approximation is inherently lossy.
 `invalidateFileCache()` to clear both PosixSourceAccessor and StatHashCache L1.
 *Lesson:* Stat-based caching is vulnerable to same-size, same-timestamp writes.
 
-### 4.6 Two-Object Trace Model (3 pitfalls) -- CAS Blob Era Only
+### 4.6 Structural Dep Tracking (1 bug)
+
+**Bug 25: SQLite TEXT truncation at null bytes.**
+*Symptom:* All StructuredContent dep keys were truncated to just the filepath,
+causing two-level verification to never find structural deps covering failed
+Content dep files.
+*Root cause:* The original dep key format used `\0` (null byte) as separator
+between the filepath and the format/datapath suffix. SQLite TEXT columns
+truncate strings at null bytes, so the interned key in the `Strings` table
+contained only the filepath portion, losing the structural information.
+*Fix:* Changed separator from `\0` to `\t` (tab character) throughout all
+code: `ExprTracedData::eval()`, `computeCurrentHash()`, `verifyTrace()`
+two-level logic, and doc comments.
+*Lesson:* Never use null bytes in SQLite TEXT column values. Tab is a safe
+alternative that doesn't appear in file paths or data paths.
+
+### 4.7 Two-Object Trace Model (3 pitfalls) -- CAS Blob Era Only
 
 *(These pitfalls are specific to the CAS blob trace design, Phases 9--11.
 The pure SQLite TraceStore (Phase 12) does not use CAS blobs, zstd compression,
@@ -1058,6 +1154,9 @@ trace store -- a BSàlC constructive trace serving without recomputation.
 - **Volatile tests**: currentTime, mixed volatile/stable (always-failing VT check)
 - **Regression tests**: specific bug reproductions (lazy derivationStrict,
   recordSiblingTrace overwrite, DDG dep stealing)
+- **Structural dep tests** (GTest): lazy JSON/TOML structural dep tracking,
+  two-level Content override, scalar access, nested access, array access,
+  provenance validation, unused key change survival
 
 ### 7.3 Known Test Limitations
 

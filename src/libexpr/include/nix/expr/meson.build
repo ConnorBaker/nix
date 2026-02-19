@@ -16,6 +16,7 @@ headers = [ config_pub_h ] + files(
   'trace-hash.hh',
   'eval-trace-deps.hh',
   'dependency-tracker.hh',
+  'traced-data.hh',
   'trace-result.hh',
   'eval-error.hh',
   'eval-gc.hh',
