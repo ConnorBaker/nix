@@ -815,7 +815,6 @@ void TraceStore::clearSessionCaches()
     internedStrings.clear();
     internedAttrPaths.clear();
     traceCache.clear();
-    traceHashCache.clear();
     traceStructHashCache.clear();
     stringTable.clear();
     stringTableLoaded = false;
@@ -1004,21 +1003,6 @@ ResultId TraceStore::doInternResult(ResultKind type, const std::string & value,
 
 // ── Trace storage (BSàlC trace store) ───────────────────────────────
 
-Hash TraceStore::getTraceFullHash(TraceId traceId)
-{
-    auto cacheIt = traceHashCache.find(traceId);
-    if (cacheIt != traceHashCache.end())
-        return cacheIt->second;
-
-    auto st(_state->lock());
-    auto use(st->getTraceInfo.use()(traceId));
-    if (!use.next())
-        throw Error("trace %d not found", traceId);
-    auto [blobData, blobSize] = use.getBlob(0);
-    auto h = readRawHash(blobData, blobSize);
-    traceHashCache.insert_or_assign(traceId, h);
-    return h;
-}
 
 Hash TraceStore::getTraceStructHash(TraceId traceId)
 {
@@ -1160,6 +1144,22 @@ bool TraceStore::verifyTrace(
             continue;
         }
 
+        // ParentContext: verify the parent's current trace hash matches
+        if (dep.type == DepType::ParentContext) {
+            auto parentTraceHash = getCurrentTraceHash(dep.key);
+            if (parentTraceHash) {
+                auto * expected = std::get_if<Blake3Hash>(&dep.expectedHash);
+                if (expected && std::memcmp(expected->bytes.data(), parentTraceHash->hash, 32) == 0) {
+                    continue; // parent trace unchanged → dep passes
+                }
+            }
+            // Parent trace changed or missing → non-content failure
+            nrVerificationsFailed++;
+            hasNonContentFailure = true;
+            if (earlyExit) break;
+            continue;
+        }
+
         DepKey dk(dep);
         auto cacheIt = currentDepHashes.find(dk);
         std::optional<DepHashValue> current;
@@ -1289,75 +1289,60 @@ bool TraceStore::attrExists(std::string_view attrPath)
     return lookupTraceRow(attrPath).has_value();
 }
 
+std::optional<Hash> TraceStore::getCurrentTraceHash(std::string_view attrPath)
+{
+    // ParentContext dep keys use \t as separator (Strings table is TEXT,
+    // truncates at \0), but lookupTraceRow needs \0-separated AttrPaths.
+    std::string path(attrPath);
+    std::replace(path.begin(), path.end(), '\t', '\0');
+    auto row = lookupTraceRow(path);
+    if (!row) return std::nullopt;
+
+    // Return trace_hash (captures dep structure + hashes), not result hash.
+    // Result hash for attrsets only captures attribute names, not values —
+    // it wouldn't detect changes to attribute values within an attrset.
+    auto st(_state->lock());
+    auto use(st->getTraceInfo.use()(row->traceId));
+    if (!use.next()) return std::nullopt;
+    auto [hashData, hashSize] = use.getBlob(0);  // column 0 = trace_hash
+    return readRawHash(hashData, hashSize);
+}
+
 // ── Record path (BSàlC constructive trace recording) ─────────────────
 
 TraceStore::RecordResult TraceStore::record(
     std::string_view attrPath,
     const CachedResult & value,
     const std::vector<Dep> & allDeps,
-    std::optional<TraceId> parentTraceId,
     bool isRoot)
 {
     auto recordStart = timerStart();
     nrRecords++;
 
-    // 1. Filter deps: remove ParentContext
-    std::vector<Dep> storedDeps;
-    for (auto & dep : allDeps) {
-        if (dep.type == DepType::ParentContext) continue;
-        storedDeps.push_back(dep);
-    }
+    // 1. Sort+dedup deps (ParentContext deps are now stored, not filtered)
+    auto sortedDeps = sortAndDedupDeps(allDeps);
 
-    // 2. Sort+dedup own deps
-    auto sortedDeps = sortAndDedupDeps(storedDeps);
+    // 3. Compute deps_hash = trace_hash (own deps only, no Merkle chaining)
+    auto depsHash = computeTraceHashFromSorted(sortedDeps);
 
-    // 3. Compute full trace (own + inherited from parent chain)
-    std::vector<Dep> fullDeps;
-    if (parentTraceId) {
-        auto parentFullDeps = loadFullTrace(*parentTraceId);
-        std::unordered_map<DepKey, Dep, DepKey::Hash> depMap;
-        for (auto & dep : parentFullDeps)
-            depMap.insert_or_assign(DepKey(dep), dep);
-        for (auto & dep : sortedDeps)
-            depMap.insert_or_assign(DepKey(dep), dep);
-        fullDeps.reserve(depMap.size());
-        for (auto & [_, dep] : depMap)
-            fullDeps.push_back(dep);
-        fullDeps = sortAndDedupDeps(fullDeps);
-    } else {
-        fullDeps = sortedDeps;
-    }
+    // 4. Compute struct_hash (for structural variant recovery)
+    auto structHash = computeTraceStructHashFromSorted(sortedDeps);
 
-    // 4. Compute deps_hash (parent-free, for DepsSets dedup)
-    auto depsHash = computeTraceHashFromSorted(fullDeps);
+    // 5. Get or create deps set (content-addressed by deps_hash)
+    auto depsSetId = getOrCreateDepsSet(sortedDeps, depsHash);
 
-    // 5. Compute trace_hash (includes parent Merkle chaining)
-    Hash traceHash(HashAlgorithm::BLAKE3);
-    if (parentTraceId) {
-        auto parentFullHash = getTraceFullHash(*parentTraceId);
-        traceHash = computeTraceHashWithParentFromSorted(fullDeps, parentFullHash);
-    } else {
-        traceHash = depsHash;  // No parent → trace_hash == deps_hash
-    }
-
-    // 6. Compute struct_hash (for structural variant recovery)
-    auto structHash = computeTraceStructHashFromSorted(fullDeps);
-
-    // 7. Get or create deps set (content-addressed by deps_hash)
-    auto depsSetId = getOrCreateDepsSet(fullDeps, depsHash);
-
-    // 8. Encode CachedResult and intern result
+    // 6. Encode CachedResult and intern result
     auto [type, val, ctx] = encodeCachedResult(value);
     auto resultHash = computeResultHash(type, val, ctx);
     ResultId resultId = doInternResult(type, val, ctx, resultHash);
 
-    // 9. Intern attr path
+    // 7. Intern attr path
     AttrPathId attrPathId = doInternAttrPath(attrPath);
 
-    // 10. Get or create trace
-    TraceId traceId = getOrCreateTrace(traceHash, structHash, depsSetId);
+    // 8. Get or create trace
+    TraceId traceId = getOrCreateTrace(depsHash, structHash, depsSetId);
 
-    // 11. Upsert Attrs + insert History
+    // 9. Upsert Attrs + insert History
     {
         auto st(_state->lock());
         st->upsertAttr.use()
@@ -1366,15 +1351,14 @@ TraceStore::RecordResult TraceStore::record(
             (contextHash)(attrPathId)(traceId)(resultId).exec();
     }
 
-    // 12. Session caches
+    // 10. Session caches
     bool hasVolatile = std::any_of(allDeps.begin(), allDeps.end(),
         [](auto & d) { return d.type == DepType::CurrentTime || d.type == DepType::Exec; });
     if (!hasVolatile)
         verifiedTraceIds.insert(traceId);
 
-    traceHashCache.insert_or_assign(traceId, traceHash);
     traceStructHashCache.insert_or_assign(traceId, structHash);
-    traceCache[traceId] = fullDeps;
+    traceCache[traceId] = sortedDeps;
 
     nrRecordTimeUs += elapsedUs(recordStart);
     return RecordResult{traceId};
@@ -1385,8 +1369,7 @@ TraceStore::RecordResult TraceStore::record(
 std::optional<TraceStore::VerifyResult> TraceStore::verify(
     std::string_view attrPath,
     const std::unordered_map<std::string, SourcePath> & inputAccessors,
-    EvalState & state,
-    std::optional<TraceId> parentTraceIdHint)
+    EvalState & state)
 {
     auto verifyStart = timerStart();
 
@@ -1409,7 +1392,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::verify(
 
     // 3. Verification failed → constructive recovery (uses currentDepHashes)
     debug("verify: trace validation failed for '%s', attempting constructive recovery", displayAttrPath(attrPath));
-    auto result = recovery(row->traceId, attrPath, inputAccessors, state, parentTraceIdHint);
+    auto result = recovery(row->traceId, attrPath, inputAccessors, state);
     nrVerifyTimeUs += elapsedUs(verifyStart);
     return result;
 }
@@ -1421,8 +1404,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     TraceId oldTraceId,
     std::string_view attrPath,
     const std::unordered_map<std::string, SourcePath> & inputAccessors,
-    EvalState & state,
-    std::optional<TraceId> parentTraceIdHint)
+    EvalState & state)
 {
     auto recoveryStart = timerStart();
     nrRecoveryAttempts++;
@@ -1444,6 +1426,16 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     std::vector<Dep> currentDeps;
     bool allComputable = true;
     for (auto & dep : oldDeps) {
+        // ParentContext: compute current parent trace hash directly
+        if (dep.type == DepType::ParentContext) {
+            auto parentTraceHash = getCurrentTraceHash(dep.key);
+            if (!parentTraceHash) { allComputable = false; break; }
+            Blake3Hash b3;
+            std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
+            currentDeps.push_back({dep.source, dep.key, DepHashValue(b3), dep.type});
+            continue;
+        }
+
         DepKey dk(dep);
         auto cacheIt = currentDepHashes.find(dk);
         std::optional<DepHashValue> current;
@@ -1536,20 +1528,12 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         return VerifyResult{decodeCachedResult(recRow), candidateTraceId};
     };
 
-    // === Direct hash recovery (BSàlC CT, with Salsa-style parent Merkle chaining) ===
-    // Recompute trace_hash from current dep hashes. When parentTraceIdHint is
-    // available, the parent's trace_hash is mixed in (Merkle chaining),
-    // disambiguating child traces across different parent versions. O(1) lookup.
+    // === Direct hash recovery (BSàlC CT) ===
+    // Recompute trace_hash from current dep hashes. O(1) lookup.
     if (allComputable) {
         auto directHashStart = timerStart();
         auto sortedCurrentDeps = sortAndDedupDeps(currentDeps);
-        Hash newFullHash(HashAlgorithm::BLAKE3);
-        if (parentTraceIdHint) {
-            auto parentFullHash = getTraceFullHash(*parentTraceIdHint);
-            newFullHash = computeTraceHashWithParentFromSorted(sortedCurrentDeps, parentFullHash);
-        } else {
-            newFullHash = computeTraceHashFromSorted(sortedCurrentDeps);
-        }
+        auto newFullHash = computeTraceHashFromSorted(sortedCurrentDeps);
 
         // Look up Traces by trace_hash
         std::optional<TraceId> newTraceId;
@@ -1636,6 +1620,16 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
                 break;
             }
 
+            // ParentContext: compute current parent trace hash directly
+            if (dep.type == DepType::ParentContext) {
+                auto parentTraceHash = getCurrentTraceHash(dep.key);
+                if (!parentTraceHash) { repComputable = false; break; }
+                Blake3Hash b3;
+                std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
+                repCurrentDeps.push_back({dep.source, dep.key, DepHashValue(b3), dep.type});
+                continue;
+            }
+
             DepKey dk(dep);
             auto cacheIt = currentDepHashes.find(dk);
             std::optional<DepHashValue> current;
@@ -1657,13 +1651,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             continue;
 
         auto sortedRepDeps = sortAndDedupDeps(repCurrentDeps);
-        Hash candidateFullHash(HashAlgorithm::BLAKE3);
-        if (parentTraceIdHint) {
-            auto parentFullHash = getTraceFullHash(*parentTraceIdHint);
-            candidateFullHash = computeTraceHashWithParentFromSorted(sortedRepDeps, parentFullHash);
-        } else {
-            candidateFullHash = computeTraceHashFromSorted(sortedRepDeps);
-        }
+        auto candidateFullHash = computeTraceHashFromSorted(sortedRepDeps);
 
         // Look up Traces by candidate trace_hash
         std::optional<TraceId> candidateTraceId;

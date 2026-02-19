@@ -360,7 +360,9 @@ TEST_F(DepTrackingTest, NestedAttrs_ChildDepInvalidation)
         EXPECT_THAT(*b->value, IsIntEq(42));
     }
 
-    // Verification — all traces should be verified and served from cache
+    // Verification — all traces should be verified and served from cache.
+    // Children with zero own deps have a ParentContext dep linking them
+    // to the parent's result hash, enabling cache hits on warm path.
     {
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
@@ -506,7 +508,8 @@ TEST_F(DepTrackingTest, DeepNesting_LeafOnlyDep)
         EXPECT_THAT(*leaf->value, IsStringEq("leaf-val"));
     }
 
-    // Verification — all level traces verified
+    // Verification — all level traces verified.
+    // Intermediates have ParentContext deps; leaf has Content dep.
     {
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);

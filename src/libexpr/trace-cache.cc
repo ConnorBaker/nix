@@ -245,156 +245,11 @@ void TracedExpr::replayTrace(TraceId traceId)
     }
 }
 
-void TracedExpr::recordSiblingTrace(TracedExpr * parentEC, Symbol siblingName, Value & v)
+void TracedExpr::recordSiblingTrace(TracedExpr * /* parentEC */, Symbol /* siblingName */, Value & /* v */)
 {
-    // Skip path values: they reference source trees needing SourceAccessor
-    // context from fresh evaluation for fetchToStore hash caching.
-    if (v.type() == nPath)
-        return;
-
-    auto & db = *cache->dbBackend;
-    auto nameStr = std::string(cache->state.symbols[siblingName]);
-
-    auto * siblingEC = new TracedExpr(cache, 0, siblingName, parentEC);
-    auto siblingAttrPath = siblingEC->storeAttrPath();
-
-    // If already recorded (by a prior evaluateFresh with full deps),
-    // don't overwrite with this dep-less speculative entry.
-    if (db.attrExists(siblingAttrPath))
-        return;
-
-    // Serialize value
-    CachedResult attrValue;
-    switch (v.type()) {
-    case nString: {
-        NixStringContext ctx;
-        if (v.context())
-            for (auto * elem : *v.context())
-                ctx.insert(NixStringContextElem::parse(elem->view()));
-        attrValue = string_t{std::string(v.string_view()), std::move(ctx)};
-        break;
-    }
-    case nBool:
-        attrValue = v.boolean();
-        break;
-    case nInt:
-        attrValue = int_t{NixInt{v.integer().value}};
-        break;
-    case nNull:
-        attrValue = null_t{};
-        break;
-    case nFloat:
-        attrValue = float_t{v.fpoint()};
-        break;
-    case nAttrs: {
-        std::vector<Symbol> childNames;
-        for (auto & attr : *v.attrs())
-            childNames.push_back(attr.name);
-        sortChildNames(childNames);
-        attrValue = childNames;
-        break;
-    }
-    case nThunk:
-    case nPath:
-    case nList:
-    case nFunction:
-    case nExternal:
-        return; // thunk, path, list, function, external — skip
-    }
-
-    // Direct record — no deferred writes needed with SQLite backend.
-    // Parent's traceId may be nullopt (parent not yet recorded); skip silently.
-    if (!parentEC->traceId)
-        return;
-
-    try {
-        auto storeResult = db.record(
-            siblingAttrPath, attrValue, {}, parentEC->traceId, false);
-        siblingEC->traceId = storeResult.traceId;
-    } catch (std::exception & e) {
-        debug("recordSiblingTrace failed for '%s': %s", siblingAttrPath, e.what());
-        return;
-    }
-
-    try {
-        if (v.type() == nAttrs) {
-            if (cache->state.isDerivation(v)) {
-                if (auto * a = v.attrs()->get(cache->state.s.drvPath))
-                    if (a->value->isThunk()
-                        && !dynamic_cast<TracedExpr*>(a->value->thunk().expr))
-                        try { cache->state.forceValue(*a->value, a->pos); }
-                        catch (EvalError &) {}
-                if (auto * a = v.attrs()->get(cache->state.s.outPath))
-                    if (a->value->isThunk()
-                        && !dynamic_cast<TracedExpr*>(a->value->thunk().expr))
-                        try { cache->state.forceValue(*a->value, a->pos); }
-                        catch (EvalError &) {}
-            }
-
-            // Store forced leaf children (single level, no recursion).
-            for (auto & attr : *v.attrs()) {
-                if (attr.value->isThunk())
-                    continue;
-                auto childType = attr.value->type();
-                if (childType == nPath || childType == nAttrs || childType == nList)
-                    continue;
-
-                CachedResult childValue;
-                switch (childType) {
-                case nString: {
-                    NixStringContext ctx;
-                    if (attr.value->context())
-                        for (auto * elem : *attr.value->context())
-                            ctx.insert(NixStringContextElem::parse(elem->view()));
-                    childValue = string_t{std::string(attr.value->string_view()), std::move(ctx)};
-                    break;
-                }
-                case nBool:
-                    childValue = attr.value->boolean();
-                    break;
-                case nInt:
-                    childValue = int_t{NixInt{attr.value->integer().value}};
-                    break;
-                case nNull:
-                    childValue = null_t{};
-                    break;
-                case nFloat:
-                    childValue = float_t{attr.value->fpoint()};
-                    break;
-                case nThunk:
-                case nPath:
-                case nAttrs:
-                case nList:
-                case nFunction:
-                case nExternal:
-                    continue;
-                }
-
-                auto * childEC = new TracedExpr(cache, 0, attr.name, siblingEC);
-                auto childAttrPath = childEC->storeAttrPath();
-                try {
-                    auto childResult = db.record(
-                        childAttrPath, std::move(childValue), {},
-                        siblingEC->traceId, false);
-                    childEC->traceId = childResult.traceId;
-                } catch (std::exception &) {}
-            }
-
-            // Wrap remaining thunk children with TracedExpr origExpr wrappers
-            for (auto & attr : *v.attrs()) {
-                if (attr.value->isThunk()
-                    && !dynamic_cast<TracedExpr*>(attr.value->thunk().expr))
-                {
-                    auto * wrapper = new TracedExpr(cache, 0, attr.name, siblingEC);
-                    wrapper->origExpr = attr.value->thunk().expr;
-                    wrapper->origEnv = attr.value->thunk().env;
-                    attr.value->mkThunk(attr.value->thunk().env, wrapper);
-                }
-            }
-        }
-    } catch (std::exception &) {
-        // Failed to process children — silently skip
-    }
+    // Disabled: with dep separation (no parent dep merging), sibling traces
+    // recorded with empty deps always verify as valid, returning stale results.
+    // Siblings will be evaluated fresh when needed and get proper deps.
 }
 
 // navigateToReal — real tree navigation for fresh evaluation
@@ -562,17 +417,26 @@ void TracedExpr::evaluateFresh(Value & v)
         debug("setting '%s' to failed (fresh evaluation)", attrPathStr());
         if (cache->dbBackend) {
             auto attrPath = storeAttrPath();
-            auto collectedDeps = tracker.collectTraces();
+            auto directDeps = tracker.collectTraces();
 
-            std::vector<Dep> directDeps;
-            for (auto & dep : collectedDeps)
-                if (dep.type != DepType::ParentContext)
-                    directDeps.push_back(dep);
+            // Add ParentContext dep for navigated children
+            if (!origExpr && parentExpr) {
+                auto parentPath = parentExpr->storeAttrPath();
+                auto parentTraceHash = cache->dbBackend->getCurrentTraceHash(parentPath);
+                if (parentTraceHash) {
+                    Blake3Hash b3;
+                    std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
+                    // Use \t separator for dep key (Strings table is TEXT, truncates at \0)
+                    auto depKey = parentPath;
+                    std::replace(depKey.begin(), depKey.end(), '\0', '\t');
+                    directDeps.push_back(Dep{
+                        "", depKey, DepHashValue(b3), DepType::ParentContext});
+                }
+            }
 
             try {
                 auto result = cache->dbBackend->record(
-                    attrPath, failed_t{}, directDeps,
-                    parentTraceId(), !parentExpr);
+                    attrPath, failed_t{}, directDeps, !parentExpr);
                 this->traceId = result.traceId;
             } catch (std::exception & e) {
                 debug("trace recording failed for '%s': %s", attrPathStr(), e.what());
@@ -583,12 +447,7 @@ void TracedExpr::evaluateFresh(Value & v)
 
     if (cache->dbBackend) {
         auto attrPath = storeAttrPath();
-        auto collectedDeps = tracker.collectTraces();
-
-        std::vector<Dep> directDeps;
-        for (auto & dep : collectedDeps)
-            if (dep.type != DepType::ParentContext)
-                directDeps.push_back(dep);
+        auto directDeps = tracker.collectTraces();
 
         // Build the CachedResult for storage
         CachedResult attrValue;
@@ -644,11 +503,31 @@ void TracedExpr::evaluateFresh(Value & v)
             attrValue = misc_t{};
         }
 
+        // For navigated children (no origExpr), add a ParentContext dep linking
+        // this trace to the parent's current trace hash. Without this, zero-dep
+        // navigated children always verify as valid, returning stale results
+        // when the parent's value changes (e.g., after fetchGit repo update).
+        // We use trace_hash (not result hash) because result hash for attrsets
+        // only captures attribute names, not values.
+        if (!origExpr && parentExpr && cache->dbBackend) {
+            auto parentPath = parentExpr->storeAttrPath();
+            auto parentTraceHash = cache->dbBackend->getCurrentTraceHash(parentPath);
+            if (parentTraceHash) {
+                Blake3Hash b3;
+                static_assert(sizeof(b3.bytes) == 32);
+                std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
+                // Use \t separator for dep key (Strings table is TEXT, truncates at \0)
+                auto depKey = parentPath;
+                std::replace(depKey.begin(), depKey.end(), '\0', '\t');
+                directDeps.push_back(Dep{
+                    "", depKey, DepHashValue(b3), DepType::ParentContext});
+            }
+        }
+
         // Direct record — no deferred writes
         try {
             auto coldResult = cache->dbBackend->record(
-                attrPath, attrValue, directDeps,
-                parentTraceId(), !parentExpr);
+                attrPath, attrValue, directDeps, !parentExpr);
             this->traceId = coldResult.traceId;
         } catch (std::exception & e) {
             debug("trace recording failed for '%s': %s", attrPathStr(), e.what());
@@ -704,7 +583,7 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
     auto & db = *cache->dbBackend;
 
     auto attrPath = storeAttrPath();
-    auto warmResult = db.verify(attrPath, cache->inputAccessors, cache->state, parentTraceId());
+    auto warmResult = db.verify(attrPath, cache->inputAccessors, cache->state);
 
     if (warmResult) {
         auto & [cachedValue, cachedTraceId] = *warmResult;
@@ -748,7 +627,6 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
 
     // Verify miss — fresh evaluation path
     nrTraceCacheMisses++;
-    debug("trace verify miss for '%s'", attrPathStr());
     evaluateFresh(v);
 }
 

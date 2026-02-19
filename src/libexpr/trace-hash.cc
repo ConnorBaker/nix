@@ -57,25 +57,5 @@ Hash computeTraceStructHash(const std::vector<Dep> & deps)
     return computeTraceStructHashFromSorted(sortAndDedupDeps(deps));
 }
 
-Hash computeTraceHashWithParentFromSorted(
-    const std::vector<Dep> & sortedDeps,
-    const Hash & parentDepContentHash)
-{
-    HashSink sink(HashAlgorithm::BLAKE3);
-    for (auto & dep : sortedDeps)
-        feedDepToSink(sink, dep, true);
-    // Domain-separated parent Merkle chaining (Salsa versioned query context for direct hash recovery)
-    sink(std::string_view("P", 1));
-    auto parentHex = parentDepContentHash.to_string(HashFormat::Base16, false);
-    sink(parentHex);
-    return sink.finish().hash;
-}
-
-Hash computeTraceHashWithParent(
-    const std::vector<Dep> & deps,
-    const Hash & parentDepContentHash)
-{
-    return computeTraceHashWithParentFromSorted(sortAndDedupDeps(deps), parentDepContentHash);
-}
 
 } // namespace nix::eval_trace

@@ -63,27 +63,6 @@ TEST_F(DepHashTest, DepStructHash_EmptyDeps)
     EXPECT_EQ(h1, h2);
 }
 
-TEST_F(DepHashTest, DepContentHashWithParent_DifferentParents)
-{
-    // Same deps + different parent trace hashes -> different hashes (Merkle identity mixing)
-    std::vector<Dep> deps = {makeContentDep("/a.nix", "val")};
-    auto parentHash1 = hashString(HashAlgorithm::SHA256, "parent-deps-1");
-    auto parentHash2 = hashString(HashAlgorithm::SHA256, "parent-deps-2");
-    auto h1 = computeTraceHashWithParent(deps, parentHash1);
-    auto h2 = computeTraceHashWithParent(deps, parentHash2);
-    EXPECT_NE(h1, h2);
-}
-
-TEST_F(DepHashTest, DepContentHashWithParent_SameParent)
-{
-    // Same deps + same parent trace hash -> same hash (deterministic Merkle identity)
-    std::vector<Dep> deps = {makeContentDep("/a.nix", "val")};
-    auto parentHash = hashString(HashAlgorithm::SHA256, "parent-deps");
-    auto h1 = computeTraceHashWithParent(deps, parentHash);
-    auto h2 = computeTraceHashWithParent(deps, parentHash);
-    EXPECT_EQ(h1, h2);
-}
-
 // ── sortAndDedupDeps tests ───────────────────────────────────────────
 
 TEST_F(DepHashTest, SortAndDedup_RemovesDuplicates)
@@ -152,19 +131,6 @@ TEST_F(DepHashTest, PreSorted_StructHashMatchesUnsorted)
     };
     auto sorted = sortAndDedupDeps(deps);
     EXPECT_EQ(computeTraceStructHash(deps), computeTraceStructHashFromSorted(sorted));
-}
-
-TEST_F(DepHashTest, PreSorted_ParentHashMatchesUnsorted)
-{
-    std::vector<Dep> deps = {
-        makeEnvVarDep("B", "val"),
-        makeContentDep("/a.nix", "a"),
-    };
-    auto sorted = sortAndDedupDeps(deps);
-    auto parentHash = hashString(HashAlgorithm::SHA256, "parent-deps");
-    EXPECT_EQ(
-        computeTraceHashWithParent(deps, parentHash),
-        computeTraceHashWithParentFromSorted(sorted, parentHash));
 }
 
 } // namespace nix::eval_trace

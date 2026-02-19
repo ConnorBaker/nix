@@ -164,6 +164,14 @@ inline Dep makeDirectoryDep(std::string_view key, const Blake3Hash & hash)
     return Dep{"", std::string(key), hash, DepType::Directory};
 }
 
+inline Dep makeParentContextDep(std::string_view depKey, const Hash & traceHash)
+{
+    Blake3Hash b3;
+    static_assert(sizeof(b3.bytes) == 32);
+    std::memcpy(b3.bytes.data(), traceHash.hash, 32);
+    return Dep{"", std::string(depKey), DepHashValue(b3), DepType::ParentContext};
+}
+
 // ── CachedResult comparison (trace result equality) ─────────────────────
 
 /**

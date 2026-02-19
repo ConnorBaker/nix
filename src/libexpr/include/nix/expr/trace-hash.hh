@@ -42,21 +42,6 @@ Hash computeTraceHash(const std::vector<Dep> & deps);
 Hash computeTraceStructHash(const std::vector<Dep> & deps);
 
 /**
- * Compute a trace hash that includes the parent's trace_hash, forming a
- * Merkle chain (analogous to Salsa's versioned query with context). The
- * parent hash is domain-separated ("P" prefix + 32-byte hash) and appended
- * to the dep-hash stream.
- *
- * Used for parent-aware direct hash recovery: when a plain trace hash
- * lookup is ambiguous (e.g., multiple traces share an empty dep list),
- * incorporating the parent's identity disambiguates which historical trace
- * corresponds to the current evaluation context.
- */
-Hash computeTraceHashWithParent(
-    const std::vector<Dep> & deps,
-    const Hash & parentDepContentHash);
-
-/**
  * Sort deps by (type, source, key) and deduplicate by the same triple.
  * Produces a canonical dep ordering so that trace hashes are deterministic
  * regardless of the order in which deps were collected during evaluation.
@@ -66,13 +51,9 @@ std::vector<Dep> sortAndDedupDeps(const std::vector<Dep> & deps);
 /**
  * Pre-sorted variants: skip internal sort+dedup (caller must provide
  * canonically sorted deps). Used by trace recording (BSàlC: "record"),
- * which sorts once and computes multiple hash functions — trace hash,
- * structural hash, and parent-aware trace hash — in a single pass.
+ * which sorts once and computes both trace hash and structural hash.
  */
 Hash computeTraceHashFromSorted(const std::vector<Dep> & sortedDeps);
 Hash computeTraceStructHashFromSorted(const std::vector<Dep> & sortedDeps);
-Hash computeTraceHashWithParentFromSorted(
-    const std::vector<Dep> & sortedDeps,
-    const Hash & parentDepContentHash);
 
 } // namespace nix::eval_trace

@@ -335,24 +335,13 @@ new data). `parent_epoch` stores the parent's epoch at recording time.
 revision counter -- that detects parent staleness without traversing the dep
 graph.
 
-**6. Merkle identity hash for parent-aware constructive recovery.**
-*(Historical note: this was originally called "Phase 2 identity-aware recovery"
-and was subsequently simplified into the parent Merkle chaining used by direct
-hash recovery.)*
-`computeIdentityHash(attrId)` = `hash("V" + valueHash + "D" + traceHash +
-"P" + parentIdentityHash)`. This replaces the dep hash as the parent identity
-in parent-aware recovery keys. It is analogous to Salsa's versioned query with
-context -- the identity includes both the local computation and the full
-ancestor chain. It correctly handles edge cases that a plain trace hash alone
-cannot:
-- **0-dep parents:** Trace hash is always the same empty-hash value for parents
-  with no deps. Identity hash includes the value, distinguishing them.
-- **FullAttrs parents with same child names but different values:** The value
-  hash for FullAttrs encodes child names but not child values. Identity hash
-  chains through ancestors, so root dep changes propagate through the tree.
-- **Implementation constraint:** Must be called outside lock scopes because it
-  acquires its own locks (non-recursive mutex would deadlock if called while
-  holding the DB lock).
+**6. Parent Merkle chaining (removed).**
+*(Historical note: parent-aware constructive recovery originally used Merkle
+chaining — `computeTraceHashWithParent()` mixed the parent's `trace_hash` into
+the child's recovery lookup key. This was removed when dep ownership was
+separated: each trace now stores only its own deps, and parent invalidation
+no longer cascades to children. The `computeTraceHashWithParent*` functions
+and `getTraceFullHash()` / `traceHashCache` were deleted.)*
 
 **6. DepsSets normalization (post Phase 12).**
 Replaced delta-encoded `deps_blob` + `base_trace_id` chain with a normalized
@@ -757,12 +746,9 @@ For each dep (sorted by type, source, key):
   sink("H")  hashDepValue(sink, dep.expectedHash)
 ```
 
-Three hash variants serve the two constructive recovery strategies
+Two hash variants serve the two constructive recovery strategies
 (BSàlC CT recovery pipeline):
-- `computeTraceHash`: deps only (direct hash recovery key)
-- `computeTraceHashWithParent`: deps + "P" + parent trace hash (direct hash
-  recovery with parent Merkle chaining, analogous to Salsa versioned query
-  with context — used when parentTraceIdHint is available)
+- `computeTraceHash`: deps with hashes (direct hash recovery key)
 - `computeTraceStructHash`: dep keys only, no hashes (structural variant
   recovery grouping key — handles Shake-style dynamic dep instability)
 

@@ -2,6 +2,7 @@
 #include "nix/expr/trace-store.hh"
 #include "nix/expr/trace-hash.hh"
 
+#include <algorithm>
 #include <gtest/gtest.h>
 
 #include "nix/expr/tests/libexpr.hh"
@@ -81,7 +82,7 @@ TEST_F(TraceStoreTest, DepTypeName_AllTypes)
 TEST_F(TraceStoreTest, Record_ReturnsTraceId)
 {
     auto db = makeDb();
-    auto result = db.record("", string_t{"hello", {}}, {}, std::nullopt, true);
+    auto result = db.record("", string_t{"hello", {}}, {}, true);
     // Trace recording returns a positive trace identifier (BSàlC: trace key)
     EXPECT_GT(result.traceId, 0);
 }
@@ -89,7 +90,7 @@ TEST_F(TraceStoreTest, Record_ReturnsTraceId)
 TEST_F(TraceStoreTest, ColdStore_AttrExists)
 {
     auto db = makeDb();
-    db.record("", string_t{"hello", {}}, {}, std::nullopt, true);
+    db.record("", string_t{"hello", {}}, {}, true);
 
     EXPECT_TRUE(db.attrExists(""));
     EXPECT_FALSE(db.attrExists("nonexistent"));
@@ -103,7 +104,7 @@ TEST_F(TraceStoreTest, ColdStore_WithDeps)
         makeEnvVarDep("HOME", "/home"),
     };
 
-    auto result = db.record("", int_t{NixInt{42}}, deps, std::nullopt, true);
+    auto result = db.record("", int_t{NixInt{42}}, deps, true);
 
     auto loadedDeps = db.loadFullTrace(result.traceId);
     EXPECT_EQ(loadedDeps.size(), 2u);
@@ -114,7 +115,7 @@ TEST_F(TraceStoreTest, ColdStore_VolatileDep_NotSessionCached)
     auto db = makeDb();
     std::vector<Dep> deps = {makeCurrentTimeDep()};
 
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
+    auto result = db.record("", null_t{}, deps, true);
 
     // Volatile dep (CurrentTime) -> trace NOT marked as verified in session (Salsa: no memoization)
     EXPECT_FALSE(db.verifiedTraceIds.count(result.traceId));
@@ -125,13 +126,13 @@ TEST_F(TraceStoreTest, ColdStore_NonVolatile_SessionCached)
     auto db = makeDb();
     std::vector<Dep> deps = {makeContentDep("/a.nix", "a")};
 
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
+    auto result = db.record("", null_t{}, deps, true);
 
     // Non-volatile dep -> trace marked as verified in session (Salsa: memoized query result)
     EXPECT_TRUE(db.verifiedTraceIds.count(result.traceId));
 }
 
-TEST_F(TraceStoreTest, ColdStore_ParentContextFiltered)
+TEST_F(TraceStoreTest, ColdStore_ParentContextStored)
 {
     auto db = makeDb();
     std::vector<Dep> deps = {
@@ -139,12 +140,11 @@ TEST_F(TraceStoreTest, ColdStore_ParentContextFiltered)
         Dep{"", "", DepHashValue(std::string("parent-hash")), DepType::ParentContext},
     };
 
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
+    auto result = db.record("", null_t{}, deps, true);
 
     auto loadedDeps = db.loadFullTrace(result.traceId);
-    // ParentContext deps are filtered at recording time -- only oracle deps stored in trace
-    EXPECT_EQ(loadedDeps.size(), 1u);
-    EXPECT_EQ(loadedDeps[0].type, DepType::Content);
+    // ParentContext deps are now stored (dep separation: children reference parent result hash)
+    EXPECT_EQ(loadedDeps.size(), 2u);
 }
 
 TEST_F(TraceStoreTest, ColdStore_WithParent)
@@ -152,25 +152,17 @@ TEST_F(TraceStoreTest, ColdStore_WithParent)
     auto db = makeDb();
 
     // Record parent trace (BSàlC: trace for root key)
-    auto parentResult = db.record("", string_t{"parent-val", {}},
-                                  {makeContentDep("/a.nix", "a")}, std::nullopt, true);
+    db.record("", string_t{"parent-val", {}},
+              {makeContentDep("/a.nix", "a")}, true);
 
-    // Record child trace with parent link (Adapton: edge in DDG)
+    // Record child trace — own deps only, no parent dep inheritance
     auto childResult = db.record("child", string_t{"child-val", {}},
-                                 {makeEnvVarDep("FOO", "bar")}, parentResult.traceId, false);
+                                 {makeEnvVarDep("FOO", "bar")}, false);
 
-    // loadFullTrace returns the full trace (parent + child deps merged at record time)
+    // loadFullTrace returns only the child's own deps (no parent merging)
     auto childDeps = db.loadFullTrace(childResult.traceId);
-    EXPECT_EQ(childDeps.size(), 2u);
-
-    // Verify both dependency types are present in the flattened trace
-    bool hasContent = false, hasEnvVar = false;
-    for (auto & dep : childDeps) {
-        if (dep.type == DepType::Content) hasContent = true;
-        if (dep.type == DepType::EnvVar) hasEnvVar = true;
-    }
-    EXPECT_TRUE(hasContent);
-    EXPECT_TRUE(hasEnvVar);
+    EXPECT_EQ(childDeps.size(), 1u);
+    EXPECT_EQ(childDeps[0].type, DepType::EnvVar);
 }
 
 TEST_F(TraceStoreTest, ColdStore_Deterministic)
@@ -180,8 +172,8 @@ TEST_F(TraceStoreTest, ColdStore_Deterministic)
     std::vector<Dep> deps = {makeContentDep("/a.nix", "a")};
     CachedResult value = string_t{"result", {}};
 
-    auto r1 = db.record("", value, deps, std::nullopt, true);
-    auto r2 = db.record("", value, deps, std::nullopt, true);
+    auto r1 = db.record("", value, deps, true);
+    auto r2 = db.record("", value, deps, true);
 
     // Same deps + same parent -> same trace (content-addressed deduplication)
     EXPECT_EQ(r1.traceId, r2.traceId);
@@ -193,7 +185,7 @@ TEST_F(TraceStoreTest, ColdStore_AllValueTypes)
 
     auto testRoundtrip = [&](const CachedResult & value, std::string_view name) {
         auto path = std::string(name);
-        db.record(path, value, {}, std::nullopt, false);
+        db.record(path, value, {}, false);
 
         auto result = db.verify(path, {}, state);
         ASSERT_TRUE(result.has_value()) << "verify failed for " << name;
@@ -222,8 +214,8 @@ TEST_F(TraceStoreTest, TraceDedup_IdenticalDeps)
     std::vector<Dep> deps = {makeContentDep("/shared.nix", "shared")};
 
     // Two root attributes with identical deps should share the same trace (BSàlC: trace sharing)
-    auto r1 = db.record("a", string_t{"val1", {}}, deps, std::nullopt, false);
-    auto r2 = db.record("b", string_t{"val2", {}}, deps, std::nullopt, false);
+    auto r1 = db.record("a", string_t{"val1", {}}, deps, false);
+    auto r2 = db.record("b", string_t{"val2", {}}, deps, false);
 
     // Both should share the same trace ID (content-addressed)
     EXPECT_EQ(r1.traceId, r2.traceId);
@@ -237,7 +229,7 @@ TEST_F(TraceStoreTest, EmptyTrace_HasDbRow)
     // Attributes with zero deps must still get a trace row (BSàlC: empty trace is valid)
     auto db = makeDb();
 
-    auto result = db.record("", string_t{"val", {}}, {}, std::nullopt, true);
+    auto result = db.record("", string_t{"val", {}}, {}, true);
 
     // Loading a trace with no deps should return empty vector (not fail)
     auto deps = db.loadFullTrace(result.traceId);
@@ -255,7 +247,7 @@ TEST_F(TraceStoreTest, VerifyTrace_EnvVar_Valid)
 
     auto db = makeDb();
     std::vector<Dep> deps = {makeEnvVarDep("NIX_TEST_CACHE_VAR", "expected_value")};
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
+    auto result = db.record("", null_t{}, deps, true);
 
     // Clear session memo cache so verifyTrace re-checks all deps (Salsa: force re-verification)
     db.clearSessionCaches();
@@ -271,7 +263,7 @@ TEST_F(TraceStoreTest, VerifyTrace_EnvVar_Invalid)
     auto db = makeDb();
     // Record trace with OLD expected hash — current env has a different value
     std::vector<Dep> deps = {makeEnvVarDep("NIX_TEST_CACHE_VAR", "old_value")};
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
+    auto result = db.record("", null_t{}, deps, true);
 
     // Clear session memo cache so verifyTrace re-checks all deps (Salsa: force re-verification)
     db.clearSessionCaches();
@@ -284,7 +276,7 @@ TEST_F(TraceStoreTest, VerifyTrace_CurrentTime_AlwaysFails)
 {
     auto db = makeDb();
     std::vector<Dep> deps = {makeCurrentTimeDep()};
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
+    auto result = db.record("", null_t{}, deps, true);
 
     // CurrentTime is volatile — verification always fails (Shake: always-dirty rule)
     bool valid = db.verifyTrace(result.traceId, {}, state);
@@ -295,7 +287,7 @@ TEST_F(TraceStoreTest, VerifyTrace_Exec_AlwaysFails)
 {
     auto db = makeDb();
     std::vector<Dep> deps = {makeExecDep()};
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
+    auto result = db.record("", null_t{}, deps, true);
 
     bool valid = db.verifyTrace(result.traceId, {}, state);
     EXPECT_FALSE(valid);
@@ -307,7 +299,7 @@ TEST_F(TraceStoreTest, VerifyTrace_SessionCacheHit)
 
     auto db = makeDb();
     std::vector<Dep> deps = {makeEnvVarDep("NIX_TEST_CACHE_VAR2", "val")};
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
+    auto result = db.record("", null_t{}, deps, true);
 
     // Recording with non-volatile deps should session-memo the trace (Salsa: memoization)
     EXPECT_TRUE(db.verifiedTraceIds.count(result.traceId));
@@ -318,7 +310,7 @@ TEST_F(TraceStoreTest, VerifyTrace_SessionCacheHit)
 TEST_F(TraceStoreTest, VerifyTrace_NoDeps_Valid)
 {
     auto db = makeDb();
-    auto result = db.record("", string_t{"val", {}}, {}, std::nullopt, true);
+    auto result = db.record("", string_t{"val", {}}, {}, true);
 
     db.clearSessionCaches();
 
@@ -326,26 +318,27 @@ TEST_F(TraceStoreTest, VerifyTrace_NoDeps_Valid)
     EXPECT_TRUE(valid);
 }
 
-TEST_F(TraceStoreTest, VerifyTrace_ParentInvalid)
+TEST_F(TraceStoreTest, VerifyTrace_ParentInvalid_ChildSurvives)
 {
     ScopedEnvVar env("NIX_TEST_PARENT", "current_value");
 
     auto db = makeDb();
 
-    // Record parent trace with stale dep (Shake: parent's input changed)
+    // Record parent trace with stale dep
     std::vector<Dep> staleDeps = {makeEnvVarDep("NIX_TEST_PARENT", "stale_value")};
-    auto parentResult = db.record("", string_t{"parent", {}},
-                                  staleDeps, std::nullopt, true);
+    db.record("", string_t{"parent", {}}, staleDeps, true);
 
-    // Record child with no direct deps, but parent trace is invalid (Shake: transitive dirty)
+    // Record child with no direct deps — child has no deps to invalidate
     auto childResult = db.record("child", string_t{"child", {}},
-                                 {}, parentResult.traceId, false);
+                                 {}, false);
 
     // Clear session memo cache
     db.clearSessionCaches();
 
+    // With separated deps, child has no deps of its own → always valid
+    // Parent invalidation no longer cascades to children
     bool valid = db.verifyTrace(childResult.traceId, {}, state);
-    EXPECT_FALSE(valid);
+    EXPECT_TRUE(valid);
 }
 
 TEST_F(TraceStoreTest, VerifyTrace_ParentValid)
@@ -356,12 +349,12 @@ TEST_F(TraceStoreTest, VerifyTrace_ParentValid)
 
     // Record parent trace with correct dep (BSàlC: verifying trace succeeds)
     std::vector<Dep> parentDeps = {makeEnvVarDep("NIX_TEST_PARENT", "correct_value")};
-    auto parentResult = db.record("", string_t{"parent", {}},
-                                  parentDeps, std::nullopt, true);
+    db.record("", string_t{"parent", {}},
+              parentDeps, true);
 
     // Record child with valid parent (Shake: transitive clean)
     auto childResult = db.record("child", string_t{"child", {}},
-                                 {}, parentResult.traceId, false);
+                                 {}, false);
 
     // Clear session memo cache
     db.clearSessionCaches();
@@ -380,7 +373,7 @@ TEST_F(TraceStoreTest, VerifyTrace_MultipleDeps_OneInvalid)
         makeEnvVarDep("NIX_TEST_VALID", "current_value"),  // dep hash matches current
         makeEnvVarDep("NIX_TEST_STALE", "old_value"),      // dep hash stale (Shake: dirty input)
     };
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
+    auto result = db.record("", null_t{}, deps, true);
 
     db.clearSessionCaches();
 
@@ -398,7 +391,7 @@ TEST_F(TraceStoreTest, ColdWarm_Roundtrip)
     CachedResult input = string_t{"cached value", {}};
     std::vector<Dep> deps = {makeEnvVarDep("NIX_WARM_TEST", "stable")};
 
-    db.record("", input, deps, std::nullopt, true);
+    db.record("", input, deps, true);
 
     // Verification should find and validate the recorded trace (BSàlC: verify trace)
     auto result = db.verify("", {}, state);
@@ -414,7 +407,7 @@ TEST_F(TraceStoreTest, RecordVerify_Roundtrip_TraceId)
     CachedResult input = int_t{NixInt{99}};
     std::vector<Dep> deps = {makeEnvVarDep("NIX_WARM_TEST2", "stable")};
 
-    auto coldResult = db.record("", input, deps, std::nullopt, true);
+    auto coldResult = db.record("", input, deps, true);
 
     auto result = db.verify("", {}, state);
     ASSERT_TRUE(result.has_value());
@@ -437,7 +430,7 @@ TEST_F(TraceStoreTest, WarmPath_InvalidatedDeps)
 
     auto db = makeDb();
     std::vector<Dep> deps = {makeEnvVarDep("NIX_WARM_INVALID", "value1")};
-    db.record("", string_t{"old", {}}, deps, std::nullopt, true);
+    db.record("", string_t{"old", {}}, deps, true);
 
     // Change env var — invalidates the recorded dep hash
     setenv("NIX_WARM_INVALID", "value2", 1);
@@ -459,12 +452,12 @@ TEST_F(TraceStoreTest, Phase1_StillWorks)
 
     auto db = makeDb();
     std::vector<Dep> depsA = {makeEnvVarDep("NIX_P1_TEST", "value_A")};
-    db.record("", string_t{"result_A", {}}, depsA, std::nullopt, true);
+    db.record("", string_t{"result_A", {}}, depsA, true);
 
     // Change env var to value_B and record new trace
     setenv("NIX_P1_TEST", "value_B", 1);
     std::vector<Dep> depsB = {makeEnvVarDep("NIX_P1_TEST", "value_B")};
-    db.record("", string_t{"result_B", {}}, depsB, std::nullopt, true);
+    db.record("", string_t{"result_B", {}}, depsB, true);
 
     // Revert to value_A -- Phase 1 constructive recovery should find the trace from first recording
     setenv("NIX_P1_TEST", "value_A", 1);
@@ -475,46 +468,36 @@ TEST_F(TraceStoreTest, Phase1_StillWorks)
     assertCachedResultEquals(string_t{"result_A", {}}, result->value, state.symbols);
 }
 
-TEST_F(TraceStoreTest, Phase1_ParentContextDisambiguation)
+TEST_F(TraceStoreTest, ChildSurvivesParentInvalidation_NoDeps)
 {
-    // Dep-less child, parent changed. Phase 1 recovers via parent-mixed trace hash (Merkle identity).
+    // Child with no deps survives parent invalidation (separated dep ownership).
+    // After parent changes, child verifies independently because it has no deps.
     ScopedEnvVar env("NIX_P1_ROOT", "val1");
 
     auto db = makeDb();
 
     // Record root trace with val1
     std::vector<Dep> rootDeps1 = {makeEnvVarDep("NIX_P1_ROOT", "val1")};
-    auto rootResult1 = db.record("", string_t{"root1", {}}, rootDeps1, std::nullopt, true);
+    db.record("", string_t{"root1", {}}, rootDeps1, true);
 
-    // Record child trace (no deps) linked to root1 (Adapton: DDG edge)
-    db.record("child", string_t{"child1", {}}, {}, rootResult1.traceId, false);
+    // Record child trace (no deps)
+    db.record("child", string_t{"child1", {}}, {}, false);
 
-    // Record root trace with val2
+    // Change root env var — root trace becomes invalid
     setenv("NIX_P1_ROOT", "val2", 1);
-    std::vector<Dep> rootDeps2 = {makeEnvVarDep("NIX_P1_ROOT", "val2")};
-    auto rootResult2 = db.record("", string_t{"root2", {}}, rootDeps2, std::nullopt, true);
-
-    // Record child trace linked to root2
-    db.record("child", string_t{"child2", {}}, {}, rootResult2.traceId, false);
-
-    // Revert to val1: root recovered via Phase 1, then child via parent-mixed trace hash
-    setenv("NIX_P1_ROOT", "val1", 1);
     db.clearSessionCaches();
 
-    // Root constructive recovery (Phase 1: direct trace hash match)
-    auto rootResult = db.verify("", {}, state);
-    ASSERT_TRUE(rootResult.has_value());
-    assertCachedResultEquals(string_t{"root1", {}}, rootResult->value, state.symbols);
-
-    // Child constructive recovery (Phase 1 -- parent-mixed trace hash via Merkle identity)
-    auto childResult = db.verify("child", {}, state, rootResult->traceId);
+    // Child has no deps → verifies immediately despite parent invalidation
+    auto childResult = db.verify("child", {}, state);
     ASSERT_TRUE(childResult.has_value());
+    // Returns latest recorded result (child1 — only one was recorded for "child")
     assertCachedResultEquals(string_t{"child1", {}}, childResult->value, state.symbols);
 }
 
-TEST_F(TraceStoreTest, Phase1_ParentContextWithChildDeps)
+TEST_F(TraceStoreTest, ChildSurvivesParentInvalidation_WithStableDeps)
 {
-    // Child with deps, parent changed. Phase 1 recovers via parent-mixed trace hash.
+    // Child with stable deps passes verification when parent changes.
+    // With separated deps, child's trace_hash depends only on its own deps.
     ScopedEnvVar env1("NIX_P1W_ROOT", "rval1");
     ScopedEnvVar env2("NIX_P1W_CHILD", "cval");
 
@@ -522,37 +505,26 @@ TEST_F(TraceStoreTest, Phase1_ParentContextWithChildDeps)
 
     // Record root trace with rval1
     std::vector<Dep> rootDeps1 = {makeEnvVarDep("NIX_P1W_ROOT", "rval1")};
-    auto rootResult1 = db.record("", string_t{"root1", {}}, rootDeps1, std::nullopt, true);
+    db.record("", string_t{"root1", {}}, rootDeps1, true);
 
-    // Record child trace with stable dep + parent link
+    // Record child trace with stable dep (own dep only)
     std::vector<Dep> childDeps = {makeEnvVarDep("NIX_P1W_CHILD", "cval")};
-    db.record("child", string_t{"child1", {}}, childDeps, rootResult1.traceId, false);
+    db.record("child", string_t{"child1", {}}, childDeps, false);
 
-    // Record root trace with rval2
+    // Change parent env var — parent trace becomes invalid
     setenv("NIX_P1W_ROOT", "rval2", 1);
-    std::vector<Dep> rootDeps2 = {makeEnvVarDep("NIX_P1W_ROOT", "rval2")};
-    auto rootResult2 = db.record("", string_t{"root2", {}}, rootDeps2, std::nullopt, true);
-
-    // Record child trace linked to root2
-    db.record("child", string_t{"child2", {}}, childDeps, rootResult2.traceId, false);
-
-    // Revert to rval1 — triggers constructive recovery cascade
-    setenv("NIX_P1W_ROOT", "rval1", 1);
     db.clearSessionCaches();
 
-    auto rootResult = db.verify("", {}, state);
-    ASSERT_TRUE(rootResult.has_value());
-
-    auto childResult = db.verify("child", {}, state, rootResult->traceId);
+    // Child's own dep (NIX_P1W_CHILD=cval) is still valid → verify passes
+    auto childResult = db.verify("child", {}, state);
     ASSERT_TRUE(childResult.has_value());
     assertCachedResultEquals(string_t{"child1", {}}, childResult->value, state.symbols);
 }
 
-TEST_F(TraceStoreTest, Phase1_CascadeThroughTree)
+TEST_F(TraceStoreTest, IndependentVerification_TreeWithOwnDeps)
 {
-    // Root -> child1 -> child2 (grandchild), with deps at each level.
-    // Phase 1 uses trace_hash = hash(deps + "P" + parent_trace_hash) (Merkle identity),
-    // so each level's trace hash changes when ancestor deps change.
+    // Each level has its own deps. With separated dep ownership, each level
+    // verifies independently. Root and child recover via own deps.
     ScopedEnvVar env1("NIX_P1C_ROOT", "v1");
     ScopedEnvVar env2("NIX_P1C_CHILD", "cv1");
 
@@ -566,35 +538,37 @@ TEST_F(TraceStoreTest, Phase1_CascadeThroughTree)
     // Version 1: record traces for entire tree
     std::vector<Dep> rootDeps1 = {makeEnvVarDep("NIX_P1C_ROOT", "v1")};
     std::vector<Dep> childDeps1 = {makeEnvVarDep("NIX_P1C_CHILD", "cv1")};
-    auto root1 = db.record("", string_t{"r1", {}}, rootDeps1, std::nullopt, true);
-    auto child1_1 = db.record("c1", string_t{"c1v1", {}}, childDeps1, root1.traceId, false);
-    db.record(c2AttrPath, string_t{"c2v1", {}}, {}, child1_1.traceId, false);
+    db.record("", string_t{"r1", {}}, rootDeps1, true);
+    db.record("c1", string_t{"c1v1", {}}, childDeps1, false);
+    db.record(c2AttrPath, string_t{"c2v1", {}}, {}, false);
 
     // Version 2 — record new traces with changed deps at root and child
     setenv("NIX_P1C_ROOT", "v2", 1);
     setenv("NIX_P1C_CHILD", "cv2", 1);
     std::vector<Dep> rootDeps2 = {makeEnvVarDep("NIX_P1C_ROOT", "v2")};
     std::vector<Dep> childDeps2 = {makeEnvVarDep("NIX_P1C_CHILD", "cv2")};
-    auto root2 = db.record("", string_t{"r2", {}}, rootDeps2, std::nullopt, true);
-    auto child1_2 = db.record("c1", string_t{"c1v2", {}}, childDeps2, root2.traceId, false);
-    db.record(c2AttrPath, string_t{"c2v2", {}}, {}, child1_2.traceId, false);
+    db.record("", string_t{"r2", {}}, rootDeps2, true);
+    db.record("c1", string_t{"c1v2", {}}, childDeps2, false);
+    db.record(c2AttrPath, string_t{"c2v2", {}}, {}, false);
 
-    // Revert to v1 — constructive recovery should cascade through all levels
+    // Revert to v1 — each level recovers via own deps
     setenv("NIX_P1C_ROOT", "v1", 1);
     setenv("NIX_P1C_CHILD", "cv1", 1);
     db.clearSessionCaches();
 
+    // Root recovers via own dep (NIX_P1C_ROOT=v1)
     auto rootR = db.verify("", {}, state);
     ASSERT_TRUE(rootR.has_value());
     assertCachedResultEquals(string_t{"r1", {}}, rootR->value, state.symbols);
 
-    auto c1R = db.verify("c1", {}, state, rootR->traceId);
+    // Child recovers via own dep (NIX_P1C_CHILD=cv1)
+    auto c1R = db.verify("c1", {}, state);
     ASSERT_TRUE(c1R.has_value());
     assertCachedResultEquals(string_t{"c1v1", {}}, c1R->value, state.symbols);
 
-    auto c2R = db.verify(c2AttrPath, {}, state, c1R->traceId);
+    // Grandchild has no deps → verifies immediately
+    auto c2R = db.verify(c2AttrPath, {}, state);
     ASSERT_TRUE(c2R.has_value());
-    assertCachedResultEquals(string_t{"c2v1", {}}, c2R->value, state.symbols);
 }
 
 TEST_F(TraceStoreTest, Phase3_DepStructMismatch)
@@ -608,14 +582,14 @@ TEST_F(TraceStoreTest, Phase3_DepStructMismatch)
 
     // First recording: trace with only dep A
     std::vector<Dep> deps1 = {makeEnvVarDep("NIX_P3_A", "aval")};
-    db.record("", string_t{"result1", {}}, deps1, std::nullopt, true);
+    db.record("", string_t{"result1", {}}, deps1, true);
 
     // Second recording: trace with deps A + B (different structural hash)
     std::vector<Dep> deps2 = {
         makeEnvVarDep("NIX_P3_A", "aval"),
         makeEnvVarDep("NIX_P3_B", "bval"),
     };
-    db.record("", string_t{"result2", {}}, deps2, std::nullopt, true);
+    db.record("", string_t{"result2", {}}, deps2, true);
 
     // Now attribute points to trace with deps A+B.
     // Change B to invalidate that trace's deps.
@@ -641,18 +615,18 @@ TEST_F(TraceStoreTest, Phase3_MultipleStructGroups)
 
     // Structural hash group 1: only A
     db.record("", string_t{"r1", {}},
-                  {makeEnvVarDep("NIX_P3M_A", "a")}, std::nullopt, true);
+                  {makeEnvVarDep("NIX_P3M_A", "a")}, true);
 
     // Structural hash group 2: A + B
     db.record("", string_t{"r2", {}},
                   {makeEnvVarDep("NIX_P3M_A", "a"), makeEnvVarDep("NIX_P3M_B", "b")},
-                  std::nullopt, true);
+                  true);
 
     // Structural hash group 3: A + B + C (latest, in attribute entry)
     db.record("", string_t{"r3", {}},
                   {makeEnvVarDep("NIX_P3M_A", "a"), makeEnvVarDep("NIX_P3M_B", "b"),
                    makeEnvVarDep("NIX_P3M_C", "c")},
-                  std::nullopt, true);
+                  true);
 
     // Change C -> invalidates structural hash group 3
     setenv("NIX_P3M_C", "c_new", 1);
@@ -671,9 +645,9 @@ TEST_F(TraceStoreTest, Phase3_EmptyDeps)
     // Structural hash group with zero deps (empty trace)
     auto db = makeDb();
 
-    db.record("", string_t{"empty1", {}}, {}, std::nullopt, true);
+    db.record("", string_t{"empty1", {}}, {}, true);
     db.record("", string_t{"empty2", {}},
-                  {makeEnvVarDep("NIX_P3E_X", "x")}, std::nullopt, true);
+                  {makeEnvVarDep("NIX_P3E_X", "x")}, true);
 
     // Invalidate X
     ScopedEnvVar env("NIX_P3E_X", "x_new");
@@ -694,10 +668,10 @@ TEST_F(TraceStoreTest, Phase1_FallbackToPhase3)
 
     // Two traces with different structural hashes
     db.record("", string_t{"r1", {}},
-                  {makeEnvVarDep("NIX_P1F_A", "a")}, std::nullopt, true);
+                  {makeEnvVarDep("NIX_P1F_A", "a")}, true);
     db.record("", string_t{"r2", {}},
                   {makeEnvVarDep("NIX_P1F_A", "a"), makeEnvVarDep("NIX_P1F_B", "b")},
-                  std::nullopt, true);
+                  true);
 
     // Invalidate B
     setenv("NIX_P1F_B", "b_new", 1);
@@ -715,7 +689,7 @@ TEST_F(TraceStoreTest, AllPhaseFail_Volatile)
     auto db = makeDb();
 
     std::vector<Dep> deps = {makeCurrentTimeDep()};
-    db.record("", null_t{}, deps, std::nullopt, true);
+    db.record("", null_t{}, deps, true);
 
     auto result = db.verify("", {}, state);
     EXPECT_FALSE(result.has_value());
@@ -730,11 +704,11 @@ TEST_F(TraceStoreTest, RecoveryUpdatesAttribute)
 
     // Two trace recordings
     std::vector<Dep> depsA = {makeEnvVarDep("NIX_RUI_TEST", "val_A")};
-    db.record("", string_t{"rA", {}}, depsA, std::nullopt, true);
+    db.record("", string_t{"rA", {}}, depsA, true);
 
     setenv("NIX_RUI_TEST", "val_B", 1);
     std::vector<Dep> depsB = {makeEnvVarDep("NIX_RUI_TEST", "val_B")};
-    db.record("", string_t{"rB", {}}, depsB, std::nullopt, true);
+    db.record("", string_t{"rB", {}}, depsB, true);
 
     // Revert to A — constructive recovery should update attribute entry
     setenv("NIX_RUI_TEST", "val_A", 1);
@@ -760,12 +734,12 @@ TEST_F(TraceStoreTest, Phase1_Then_Phase3_Cascade)
 
     // Trace with structural hash for only dep A (recovery target)
     db.record("child", string_t{"target", {}},
-                  {makeEnvVarDep("NIX_CASCADE_A", "a")}, std::nullopt, false);
+                  {makeEnvVarDep("NIX_CASCADE_A", "a")}, false);
 
     // Trace with structural hash for deps A + B (latest, in attribute)
     db.record("child", string_t{"latest", {}},
                   {makeEnvVarDep("NIX_CASCADE_A", "a"), makeEnvVarDep("NIX_CASCADE_B", "b")},
-                  std::nullopt, false);
+                  false);
 
     // Invalidate B -> Phase 1 fails (trace hash A+B, B mismatches)
     // Phase 3 finds structural group with only A -> constructive recovery succeeds
@@ -777,10 +751,11 @@ TEST_F(TraceStoreTest, Phase1_Then_Phase3_Cascade)
     assertCachedResultEquals(string_t{"target", {}}, result->value, state.symbols);
 }
 
-TEST_F(TraceStoreTest, Phase1_DeepChainRecovery)
+TEST_F(TraceStoreTest, DeepChain_IndependentVerification)
 {
     // Deep trace chain (depth 6): root -> c1 -> c2 -> c3 -> c4 -> c5
-    // Record two versions, revert, verify Phase 1 constructive recovery at deepest level.
+    // With separated deps, only root and c1 have deps. c2-c5 have no deps.
+    // Reverting root/c1 deps triggers recovery for them, while c2-c5 verify immediately.
     ScopedEnvVar env1("NIX_DEEP_ROOT", "v1");
     ScopedEnvVar env2("NIX_DEEP_C1", "v1");
 
@@ -804,55 +779,45 @@ TEST_F(TraceStoreTest, Phase1_DeepChainRecovery)
     // Version 1: record traces for chain with deps at root and c1
     std::vector<Dep> rootDeps1 = {makeEnvVarDep("NIX_DEEP_ROOT", "v1")};
     std::vector<Dep> c1Deps1 = {makeEnvVarDep("NIX_DEEP_C1", "v1")};
-    auto root1 = db.record("", string_t{"root_v1", {}}, rootDeps1, std::nullopt, true);
-    auto c1_1 = db.record(c1Path, string_t{"c1_v1", {}}, c1Deps1, root1.traceId, false);
-    auto c2_1 = db.record(c2Path, string_t{"c2_v1", {}}, {}, c1_1.traceId, false);
-    auto c3_1 = db.record(c3Path, string_t{"c3_v1", {}}, {}, c2_1.traceId, false);
-    auto c4_1 = db.record(c4Path, string_t{"c4_v1", {}}, {}, c3_1.traceId, false);
-    db.record(c5Path, string_t{"c5_v1", {}}, {}, c4_1.traceId, false);
+    db.record("", string_t{"root_v1", {}}, rootDeps1, true);
+    db.record(c1Path, string_t{"c1_v1", {}}, c1Deps1, false);
+    db.record(c2Path, string_t{"c2_v1", {}}, {}, false);
+    db.record(c3Path, string_t{"c3_v1", {}}, {}, false);
+    db.record(c4Path, string_t{"c4_v1", {}}, {}, false);
+    db.record(c5Path, string_t{"c5_v1", {}}, {}, false);
 
     // Version 2: record traces with different dep values
     setenv("NIX_DEEP_ROOT", "v2", 1);
     setenv("NIX_DEEP_C1", "v2", 1);
     std::vector<Dep> rootDeps2 = {makeEnvVarDep("NIX_DEEP_ROOT", "v2")};
     std::vector<Dep> c1Deps2 = {makeEnvVarDep("NIX_DEEP_C1", "v2")};
-    auto root2 = db.record("", string_t{"root_v2", {}}, rootDeps2, std::nullopt, true);
-    auto c1_2 = db.record(c1Path, string_t{"c1_v2", {}}, c1Deps2, root2.traceId, false);
-    auto c2_2 = db.record(c2Path, string_t{"c2_v2", {}}, {}, c1_2.traceId, false);
-    auto c3_2 = db.record(c3Path, string_t{"c3_v2", {}}, {}, c2_2.traceId, false);
-    auto c4_2 = db.record(c4Path, string_t{"c4_v2", {}}, {}, c3_2.traceId, false);
-    db.record(c5Path, string_t{"c5_v2", {}}, {}, c4_2.traceId, false);
+    db.record("", string_t{"root_v2", {}}, rootDeps2, true);
+    db.record(c1Path, string_t{"c1_v2", {}}, c1Deps2, false);
+    db.record(c2Path, string_t{"c2_v2", {}}, {}, false);
+    db.record(c3Path, string_t{"c3_v2", {}}, {}, false);
+    db.record(c4Path, string_t{"c4_v2", {}}, {}, false);
+    db.record(c5Path, string_t{"c5_v2", {}}, {}, false);
 
     // Revert to v1
     setenv("NIX_DEEP_ROOT", "v1", 1);
     setenv("NIX_DEEP_C1", "v1", 1);
     db.clearSessionCaches();
 
-    // Recover root via Phase 1 direct trace hash match
+    // Root recovers via own dep hash match
     auto rootR = db.verify("", {}, state);
     ASSERT_TRUE(rootR.has_value());
     assertCachedResultEquals(string_t{"root_v1", {}}, rootR->value, state.symbols);
 
-    // Recover chain down to c5 (Phase 1 at each level via parent-mixed Merkle identity)
-    auto c1R = db.verify(c1Path, {}, state, rootR->traceId);
+    // c1 recovers via own dep hash match
+    auto c1R = db.verify(c1Path, {}, state);
     ASSERT_TRUE(c1R.has_value());
     assertCachedResultEquals(string_t{"c1_v1", {}}, c1R->value, state.symbols);
 
-    auto c2R = db.verify(c2Path, {}, state, c1R->traceId);
-    ASSERT_TRUE(c2R.has_value());
-    assertCachedResultEquals(string_t{"c2_v1", {}}, c2R->value, state.symbols);
-
-    auto c3R = db.verify(c3Path, {}, state, c2R->traceId);
-    ASSERT_TRUE(c3R.has_value());
-    assertCachedResultEquals(string_t{"c3_v1", {}}, c3R->value, state.symbols);
-
-    auto c4R = db.verify(c4Path, {}, state, c3R->traceId);
-    ASSERT_TRUE(c4R.has_value());
-    assertCachedResultEquals(string_t{"c4_v1", {}}, c4R->value, state.symbols);
-
-    auto c5R = db.verify(c5Path, {}, state, c4R->traceId);
-    ASSERT_TRUE(c5R.has_value());
-    assertCachedResultEquals(string_t{"c5_v1", {}}, c5R->value, state.symbols);
+    // c2-c5 have no deps → verify immediately (no recovery needed)
+    ASSERT_TRUE(db.verify(c2Path, {}, state).has_value());
+    ASSERT_TRUE(db.verify(c3Path, {}, state).has_value());
+    ASSERT_TRUE(db.verify(c4Path, {}, state).has_value());
+    ASSERT_TRUE(db.verify(c5Path, {}, state).has_value());
 }
 
 TEST_F(TraceStoreTest, RecoveryStress_10Versions)
@@ -869,7 +834,7 @@ TEST_F(TraceStoreTest, RecoveryStress_10Versions)
         setenv("NIX_STRESS_VAR", val.c_str(), 1);
         std::vector<Dep> deps = {makeEnvVarDep("NIX_STRESS_VAR", val)};
         auto result = "result_" + std::to_string(i);
-        db.record("", string_t{result, {}}, deps, std::nullopt, true);
+        db.record("", string_t{result, {}}, deps, true);
     }
 
     // Revert to each version and verify constructive recovery
@@ -894,7 +859,7 @@ TEST_F(TraceStoreTest, RecoveryFailure_AllPhasesFail)
     auto db = makeDb();
 
     std::vector<Dep> deps = {makeEnvVarDep("NIX_FAIL_VAR", "original")};
-    db.record("", string_t{"old_result", {}}, deps, std::nullopt, true);
+    db.record("", string_t{"old_result", {}}, deps, true);
 
     // Change to a NEVER-RECORDED value
     setenv("NIX_FAIL_VAR", "completely_new_value", 1);
@@ -912,11 +877,11 @@ TEST_F(TraceStoreTest, DifferentContextHash_Isolated)
 
     {
         TraceStore db1(state.symbols, 111);
-        db1.record("pkg", string_t{"v1", {}}, {}, std::nullopt, false);
+        db1.record("pkg", string_t{"v1", {}}, {}, false);
     }
     {
         TraceStore db2(state.symbols, 222);
-        db2.record("pkg", string_t{"v2", {}}, {}, std::nullopt, false);
+        db2.record("pkg", string_t{"v2", {}}, {}, false);
     }
 
     {
@@ -946,7 +911,7 @@ TEST_F(TraceStoreTest, NullByteAttrPath)
     attrPath.push_back('\0');
     attrPath.append("hello");
 
-    db.record(attrPath, string_t{"val", {}}, {}, std::nullopt, false);
+    db.record(attrPath, string_t{"val", {}}, {}, false);
     EXPECT_TRUE(db.attrExists(attrPath));
     EXPECT_FALSE(db.attrExists("packages"));
 }
@@ -954,7 +919,7 @@ TEST_F(TraceStoreTest, NullByteAttrPath)
 TEST_F(TraceStoreTest, EmptyAttrPath)
 {
     auto db = makeDb();
-    db.record("", string_t{"root-val", {}}, {}, std::nullopt, true);
+    db.record("", string_t{"root-val", {}}, {}, true);
     EXPECT_TRUE(db.attrExists(""));
 }
 
@@ -965,7 +930,7 @@ TEST_F(TraceStoreTest, MultipleEntries_Stress)
     // Record 100 trace entries
     for (int i = 0; i < 100; i++) {
         auto name = "stress-" + std::to_string(i);
-        db.record(name, int_t{NixInt{i}}, {}, std::nullopt, false);
+        db.record(name, int_t{NixInt{i}}, {}, false);
     }
 
     EXPECT_TRUE(db.attrExists("stress-0"));
@@ -1087,15 +1052,15 @@ TEST_F(TraceStoreTest, DepsSets_SiblingOverlap)
     auto db = makeDb();
 
     // Parent with 0 deps (FullAttrs pattern — trace records only child names)
-    auto parentResult = db.record("", null_t{}, {}, std::nullopt, true);
+    db.record("", null_t{}, {}, true);
 
-    // Child A trace with 100 deps
+    // Child A trace with 100 deps (own deps only, no parent inheritance)
     std::vector<Dep> depsA;
     for (int i = 0; i < 100; i++) {
         depsA.push_back(makeContentDep("/file-" + std::to_string(i) + ".nix",
                                        "content-" + std::to_string(i)));
     }
-    auto childA = db.record("a", string_t{"val-a", {}}, depsA, parentResult.traceId, false);
+    auto childA = db.record("a", string_t{"val-a", {}}, depsA, false);
 
     // Child B trace with 95 overlapping deps + 5 different hashes
     std::vector<Dep> depsB;
@@ -1107,7 +1072,7 @@ TEST_F(TraceStoreTest, DepsSets_SiblingOverlap)
         depsB.push_back(makeContentDep("/file-" + std::to_string(i) + ".nix",
                                        "content-modified-" + std::to_string(i)));
     }
-    auto childB = db.record("b", string_t{"val-b", {}}, depsB, parentResult.traceId, false);
+    auto childB = db.record("b", string_t{"val-b", {}}, depsB, false);
 
     // Both traces should load correctly with full deps
     auto loadedA = db.loadFullTrace(childA.traceId);
@@ -1116,14 +1081,14 @@ TEST_F(TraceStoreTest, DepsSets_SiblingOverlap)
     EXPECT_EQ(loadedB.size(), 100u);
 }
 
-TEST_F(TraceStoreTest, Record_ParentDepMerge)
+TEST_F(TraceStoreTest, Record_SeparatedDeps)
 {
-    // Parent with deps, child with own deps — record merges them.
-    // Tests parent dep merging in record(), not delta encoding.
+    // Parent with deps, child with own deps — each stores only its own.
+    // Tests that parent deps are NOT merged into child traces.
     auto db = makeDb();
 
     // Parent with 0 deps (FullAttrs pattern — trace records only child names)
-    auto parent = db.record("", null_t{}, {}, std::nullopt, true);
+    db.record("", null_t{}, {}, true);
 
     // Child A trace with 100 deps
     std::vector<Dep> depsA;
@@ -1131,7 +1096,7 @@ TEST_F(TraceStoreTest, Record_ParentDepMerge)
         depsA.push_back(makeContentDep("/f" + std::to_string(i) + ".nix",
                                        "c" + std::to_string(i)));
     }
-    auto childA = db.record("a", int_t{NixInt{1}}, depsA, parent.traceId, false);
+    auto childA = db.record("a", int_t{NixInt{1}}, depsA, false);
 
     // Child B trace with 99 overlapping + 1 different dep hash
     std::vector<Dep> depsB;
@@ -1140,7 +1105,7 @@ TEST_F(TraceStoreTest, Record_ParentDepMerge)
                                        "c" + std::to_string(i)));
     }
     depsB.push_back(makeContentDep("/f99.nix", "c99-modified"));
-    auto childB = db.record("b", int_t{NixInt{2}}, depsB, parent.traceId, false);
+    auto childB = db.record("b", int_t{NixInt{2}}, depsB, false);
 
     // Verify both traces load correctly
     auto loadedA = db.loadFullTrace(childA.traceId);
@@ -1176,7 +1141,7 @@ TEST_F(TraceStoreTest, WarmPath_BatchValidation)
         setenv(key.c_str(), value.c_str(), 1);
         deps.push_back(makeEnvVarDep(key, value));
     }
-    auto result = db.record("", null_t{}, deps, std::nullopt, true);
+    auto result = db.record("", null_t{}, deps, true);
 
     // Change dep #25 to invalidate its hash
     setenv("NIX_BATCH_25", "CHANGED", 1);
@@ -1210,7 +1175,7 @@ TEST_F(TraceStoreTest, WarmPath_HashCaching)
         makeEnvVarDep("NIX_HASHCACHE_A", "valA"),
         makeEnvVarDep("NIX_HASHCACHE_B", "valB"),
     };
-    db.record("", string_t{"result-1", {}}, deps1, std::nullopt, true);
+    db.record("", string_t{"result-1", {}}, deps1, true);
 
     // Version 2: A changed, B same
     setenv("NIX_HASHCACHE_A", "valA2", 1);
@@ -1218,7 +1183,7 @@ TEST_F(TraceStoreTest, WarmPath_HashCaching)
         makeEnvVarDep("NIX_HASHCACHE_A", "valA2"),
         makeEnvVarDep("NIX_HASHCACHE_B", "valB"),
     };
-    db.record("", string_t{"result-2", {}}, deps2, std::nullopt, true);
+    db.record("", string_t{"result-2", {}}, deps2, true);
 
     // Revert A
     setenv("NIX_HASHCACHE_A", "valA", 1);
@@ -1245,7 +1210,7 @@ TEST_F(TraceStoreTest, WarmPath_BaseValidatedOnce)
     // Record 5 attrs with identical deps (all share the same trace)
     for (int i = 0; i < 5; i++) {
         auto name = "sibling-" + std::to_string(i);
-        db.record(name, int_t{NixInt{i}}, sharedDeps, std::nullopt, false);
+        db.record(name, int_t{NixInt{i}}, sharedDeps, false);
     }
 
     db.clearSessionCaches();
@@ -1280,15 +1245,15 @@ TEST_F(TraceStoreTest, RecordVerify_WarmRoundtrip)
 
     // Attr 1: shared + 1 unique
     std::vector<Dep> deps1 = {sharedDep, makeEnvVarDep("NIX_DW_A", "a-val")};
-    db.record("a", string_t{"val-a", {}}, deps1, std::nullopt, false);
+    db.record("a", string_t{"val-a", {}}, deps1, false);
 
     // Attr 2: shared + 1 different unique
     std::vector<Dep> deps2 = {sharedDep, makeEnvVarDep("NIX_DW_B", "b-val")};
-    db.record("b", string_t{"val-b", {}}, deps2, std::nullopt, false);
+    db.record("b", string_t{"val-b", {}}, deps2, false);
 
     // Attr 3: shared only
     std::vector<Dep> deps3 = {sharedDep};
-    db.record("c", string_t{"val-c", {}}, deps3, std::nullopt, false);
+    db.record("c", string_t{"val-c", {}}, deps3, false);
 
     db.clearSessionCaches();
 
@@ -1304,6 +1269,299 @@ TEST_F(TraceStoreTest, RecordVerify_WarmRoundtrip)
     auto rc = db.verify("c", {}, state);
     ASSERT_TRUE(rc.has_value());
     assertCachedResultEquals(string_t{"val-c", {}}, rc->value, state.symbols);
+}
+
+// ── getCurrentTraceHash tests (ParentContext dep infrastructure) ─────
+
+TEST_F(TraceStoreTest, GetCurrentTraceHash_ReturnsHash)
+{
+    auto db = makeDb();
+    db.record("root", string_t{"val", {}}, {makeEnvVarDep("NIX_GTH_1", "a")}, true);
+
+    auto hash = db.getCurrentTraceHash("root");
+    ASSERT_TRUE(hash.has_value());
+
+    // Deterministic: same call returns same hash
+    auto hash2 = db.getCurrentTraceHash("root");
+    ASSERT_TRUE(hash2.has_value());
+    EXPECT_EQ(hash->to_string(HashFormat::Base16, false),
+              hash2->to_string(HashFormat::Base16, false));
+}
+
+TEST_F(TraceStoreTest, GetCurrentTraceHash_MissingAttr)
+{
+    auto db = makeDb();
+    auto hash = db.getCurrentTraceHash("nonexistent");
+    EXPECT_FALSE(hash.has_value());
+}
+
+TEST_F(TraceStoreTest, GetCurrentTraceHash_ChangesWithDeps)
+{
+    auto db = makeDb();
+
+    // Record with deps A
+    db.record("root", string_t{"v1", {}}, {makeEnvVarDep("NIX_GTH_2A", "a")}, true);
+    auto hash1 = db.getCurrentTraceHash("root");
+    ASSERT_TRUE(hash1.has_value());
+
+    // Re-record with deps B (different deps → different trace hash)
+    db.record("root", string_t{"v2", {}}, {makeEnvVarDep("NIX_GTH_2B", "b")}, true);
+    auto hash2 = db.getCurrentTraceHash("root");
+    ASSERT_TRUE(hash2.has_value());
+
+    EXPECT_NE(hash1->to_string(HashFormat::Base16, false),
+              hash2->to_string(HashFormat::Base16, false));
+}
+
+TEST_F(TraceStoreTest, GetCurrentTraceHash_DiffersFromResultHash)
+{
+    // Two attrs with identical results but different deps should have
+    // different trace hashes. This is the key property: trace hash captures
+    // dep structure, not just result content.
+    auto db = makeDb();
+
+    db.record("a", string_t{"same-result", {}}, {makeEnvVarDep("NIX_GTH_3A", "a")}, false);
+    db.record("b", string_t{"same-result", {}}, {makeEnvVarDep("NIX_GTH_3B", "b")}, false);
+
+    auto hashA = db.getCurrentTraceHash("a");
+    auto hashB = db.getCurrentTraceHash("b");
+    ASSERT_TRUE(hashA.has_value());
+    ASSERT_TRUE(hashB.has_value());
+
+    // Same result but different deps → different trace hashes
+    EXPECT_NE(hashA->to_string(HashFormat::Base16, false),
+              hashB->to_string(HashFormat::Base16, false));
+}
+
+TEST_F(TraceStoreTest, GetCurrentTraceHash_TabSeparatorConversion)
+{
+    auto db = makeDb();
+
+    // Build a null-byte-separated attr path (like buildAttrPath produces)
+    std::string attrPath = "packages";
+    attrPath.push_back('\0');
+    attrPath.append("x86_64-linux");
+
+    db.record(attrPath, string_t{"val", {}},
+              {makeEnvVarDep("NIX_GTH_4", "v")}, false);
+
+    // Convert \0 to \t (as trace-cache.cc does for ParentContext dep keys)
+    std::string depKey = attrPath;
+    std::replace(depKey.begin(), depKey.end(), '\0', '\t');
+
+    // getCurrentTraceHash converts \t back to \0 internally
+    auto hashViaTab = db.getCurrentTraceHash(depKey);
+    ASSERT_TRUE(hashViaTab.has_value());
+
+    // Should match direct lookup with original \0-separated path
+    auto hashDirect = db.getCurrentTraceHash(attrPath);
+    ASSERT_TRUE(hashDirect.has_value());
+
+    EXPECT_EQ(hashViaTab->to_string(HashFormat::Base16, false),
+              hashDirect->to_string(HashFormat::Base16, false));
+}
+
+// ── ParentContext dep verification tests ─────────────────────────────
+
+TEST_F(TraceStoreTest, ParentContext_VerifiesWhenParentUnchanged)
+{
+    ScopedEnvVar env("NIX_PCV_1", "val");
+    auto db = makeDb();
+
+    // Record parent
+    db.record("parent", string_t{"parent-val", {}},
+              {makeEnvVarDep("NIX_PCV_1", "val")}, true);
+    auto parentHash = db.getCurrentTraceHash("parent");
+    ASSERT_TRUE(parentHash.has_value());
+
+    // Record child with ParentContext dep
+    db.record("child", string_t{"child-val", {}},
+              {makeParentContextDep("parent", *parentHash)}, false);
+
+    db.clearSessionCaches();
+
+    // Parent unchanged → child verification passes
+    auto result = db.verify("child", {}, state);
+    ASSERT_TRUE(result.has_value());
+    assertCachedResultEquals(string_t{"child-val", {}}, result->value, state.symbols);
+}
+
+TEST_F(TraceStoreTest, ParentContext_FailsWhenParentChanges)
+{
+    ScopedEnvVar env("NIX_PCV_2", "val1");
+    auto db = makeDb();
+
+    // Record parent v1
+    db.record("parent", string_t{"parent-v1", {}},
+              {makeEnvVarDep("NIX_PCV_2", "val1")}, true);
+    auto parentHash1 = db.getCurrentTraceHash("parent");
+    ASSERT_TRUE(parentHash1.has_value());
+
+    // Record child with ParentContext dep on parent v1
+    db.record("child", string_t{"child-v1", {}},
+              {makeParentContextDep("parent", *parentHash1)}, false);
+
+    // Change parent deps → different trace hash
+    setenv("NIX_PCV_2", "val2", 1);
+    db.record("parent", string_t{"parent-v2", {}},
+              {makeEnvVarDep("NIX_PCV_2", "val2")}, true);
+
+    // Verify parent trace hash changed
+    auto parentHash2 = db.getCurrentTraceHash("parent");
+    ASSERT_TRUE(parentHash2.has_value());
+    EXPECT_NE(parentHash1->to_string(HashFormat::Base16, false),
+              parentHash2->to_string(HashFormat::Base16, false));
+
+    db.clearSessionCaches();
+
+    // Child verification fails: ParentContext dep mismatch
+    auto result = db.verify("child", {}, state);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(TraceStoreTest, ParentContext_RecoveryOnRevert)
+{
+    ScopedEnvVar env("NIX_PCV_3", "val1");
+    auto db = makeDb();
+
+    // Version 1: parent with val1
+    db.record("parent", string_t{"parent-v1", {}},
+              {makeEnvVarDep("NIX_PCV_3", "val1")}, true);
+    auto parentHash1 = db.getCurrentTraceHash("parent");
+    ASSERT_TRUE(parentHash1.has_value());
+
+    // Child v1 with ParentContext dep
+    db.record("child", string_t{"child-v1", {}},
+              {makeParentContextDep("parent", *parentHash1)}, false);
+
+    // Version 2: parent with val2
+    setenv("NIX_PCV_3", "val2", 1);
+    db.record("parent", string_t{"parent-v2", {}},
+              {makeEnvVarDep("NIX_PCV_3", "val2")}, true);
+    auto parentHash2 = db.getCurrentTraceHash("parent");
+    ASSERT_TRUE(parentHash2.has_value());
+
+    // Child v2 with ParentContext dep
+    db.record("child", string_t{"child-v2", {}},
+              {makeParentContextDep("parent", *parentHash2)}, false);
+
+    // Revert parent to v1 (re-record so CurrentTraces points to v1 trace)
+    setenv("NIX_PCV_3", "val1", 1);
+    db.record("parent", string_t{"parent-v1", {}},
+              {makeEnvVarDep("NIX_PCV_3", "val1")}, true);
+
+    db.clearSessionCaches();
+
+    // Child recovery finds child v1 trace (ParentContext matches v1 hash)
+    auto result = db.verify("child", {}, state);
+    ASSERT_TRUE(result.has_value());
+    assertCachedResultEquals(string_t{"child-v1", {}}, result->value, state.symbols);
+}
+
+TEST_F(TraceStoreTest, ParentContext_WithTabSeparatedKey)
+{
+    ScopedEnvVar env("NIX_PCV_4", "val");
+    auto db = makeDb();
+
+    // Record parent with null-byte-separated attr path
+    std::string parentPath = "packages";
+    parentPath.push_back('\0');
+    parentPath.append("x86_64-linux");
+
+    db.record(parentPath, string_t{"parent-val", {}},
+              {makeEnvVarDep("NIX_PCV_4", "val")}, false);
+    auto parentHash = db.getCurrentTraceHash(parentPath);
+    ASSERT_TRUE(parentHash.has_value());
+
+    // Build dep key with \t separator (as trace-cache.cc does)
+    std::string depKey = parentPath;
+    std::replace(depKey.begin(), depKey.end(), '\0', '\t');
+
+    // Record child with ParentContext dep using \t-separated key
+    std::string childPath = parentPath;
+    childPath.push_back('\0');
+    childPath.append("hello");
+
+    db.record(childPath, string_t{"child-val", {}},
+              {makeParentContextDep(depKey, *parentHash)}, false);
+
+    db.clearSessionCaches();
+
+    // Child verification passes — ParentContext dep with \t key works correctly
+    auto result = db.verify(childPath, {}, state);
+    ASSERT_TRUE(result.has_value());
+    assertCachedResultEquals(string_t{"child-val", {}}, result->value, state.symbols);
+}
+
+TEST_F(TraceStoreTest, ParentContext_MixedWithOwnDeps)
+{
+    ScopedEnvVar env1("NIX_PCV_5P", "parent-val");
+    ScopedEnvVar env2("NIX_PCV_5C", "child-val");
+    auto db = makeDb();
+
+    // Record parent
+    db.record("parent", string_t{"parent-result", {}},
+              {makeEnvVarDep("NIX_PCV_5P", "parent-val")}, true);
+    auto parentHash = db.getCurrentTraceHash("parent");
+    ASSERT_TRUE(parentHash.has_value());
+
+    // Record child with both own dep AND ParentContext dep
+    std::vector<Dep> childDeps = {
+        makeEnvVarDep("NIX_PCV_5C", "child-val"),
+        makeParentContextDep("parent", *parentHash),
+    };
+    db.record("child", string_t{"child-result", {}}, childDeps, false);
+
+    db.clearSessionCaches();
+
+    // Both deps pass → verification succeeds
+    auto result = db.verify("child", {}, state);
+    ASSERT_TRUE(result.has_value());
+    assertCachedResultEquals(string_t{"child-result", {}}, result->value, state.symbols);
+
+    // Now change only the child's own dep
+    setenv("NIX_PCV_5C", "child-val-new", 1);
+    db.clearSessionCaches();
+
+    // Verification fails (own dep stale, not just ParentContext)
+    auto result2 = db.verify("child", {}, state);
+    EXPECT_FALSE(result2.has_value());
+}
+
+TEST_F(TraceStoreTest, ParentContext_SameResultDifferentDeps_Detects)
+{
+    // Key test: parent returns same result (same attrset shape) but different deps.
+    // With trace hash (not result hash), the change is detected.
+    auto db = makeDb();
+
+    ScopedEnvVar env("NIX_PCV_6", "val-A");
+
+    // Parent v1: result "same" with dep on val-A
+    db.record("parent", string_t{"same", {}},
+              {makeEnvVarDep("NIX_PCV_6", "val-A")}, true);
+    auto parentHash1 = db.getCurrentTraceHash("parent");
+    ASSERT_TRUE(parentHash1.has_value());
+
+    // Child with ParentContext dep on parent v1
+    db.record("child", string_t{"child-from-A", {}},
+              {makeParentContextDep("parent", *parentHash1)}, false);
+
+    // Parent v2: SAME result "same" but different dep value
+    setenv("NIX_PCV_6", "val-B", 1);
+    db.record("parent", string_t{"same", {}},
+              {makeEnvVarDep("NIX_PCV_6", "val-B")}, true);
+
+    // Parent trace hash changed even though result is identical
+    auto parentHash2 = db.getCurrentTraceHash("parent");
+    ASSERT_TRUE(parentHash2.has_value());
+    EXPECT_NE(parentHash1->to_string(HashFormat::Base16, false),
+              parentHash2->to_string(HashFormat::Base16, false));
+
+    db.clearSessionCaches();
+
+    // Child verification fails — trace hash detects dep change despite same result
+    auto result = db.verify("child", {}, state);
+    EXPECT_FALSE(result.has_value());
 }
 
 } // namespace nix::eval_trace

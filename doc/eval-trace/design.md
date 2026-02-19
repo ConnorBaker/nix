@@ -99,13 +99,13 @@ Key concepts we adopt:
 > Matsakis et al. "Salsa: A Framework for On-Demand, Incremental Computation."
 > Used in the Rust compiler (rust-analyzer).
 
-Salsa provides versioned queries with memoized results. Our **parent Merkle
-chaining** in direct hash recovery is analogous to Salsa's versioned query with
-context: when a parent's trace_hash is mixed into the child's recovery lookup
-key, it disambiguates child traces across different parent versions. The same
-child attribute with the same deps but a different parent produces a different
-lookup key — analogous to how Salsa's versioned queries produce different
-results under different input revisions.
+Salsa provides versioned queries with memoized results. Our **ParentContext
+deps** are analogous to Salsa's versioned query with context: a child trace
+stores a `ParentContext` dep (DepType=8) containing the parent's `trace_hash`,
+linking the child to a specific parent version. The same child attribute with
+the same own deps but a different parent produces a different `trace_hash`
+(because the ParentContext dep hash differs) — analogous to how Salsa's
+versioned queries produce different results under different input revisions.
 
 ### 2.4 Shake
 
@@ -132,7 +132,7 @@ on evaluation order, whether a root file is already cached, etc.).
 | **DependencyTracker** | DDG builder (Adapton) | Records dynamic dependency graph during evaluation |
 | **evaluateFresh()** | demand-driven recomputation (Adapton) | Evaluate an expression from scratch, recording deps |
 | **replayTrace()** | change propagation (Adapton) | Replay recorded deps into current tracking context |
-| **parent Merkle chaining** | versioned query (Salsa) | Parent trace_hash mixed into child recovery key for disambiguation |
+| **ParentContext dep** | versioned query (Salsa) | Parent trace_hash stored as a regular dep in the child trace for disambiguation |
 
 ### 2.6 System Classification
 
@@ -234,11 +234,11 @@ respects `tarballTtl` for within-TTL validation.
 `currentTime` or `builtins.exec` is re-evaluated every time — these deps make
 verification (BSàlC VT check) always fail.
 
-**Structural** deps (ParentContext) are recorded during evaluation but are
-**not stored** in the database as separate dep entries. Parent-child
-relationships are tracked via the `parentTraceIdHint` parameter passed to
-`verify()` and `recovery()`, which enables parent Merkle chaining for
-disambiguation (see Section 4.4).
+**Structural** deps (ParentContext) are stored as regular dep entries in the
+trace's `deps_blob`, just like any other dep type. A ParentContext dep records
+the parent's `trace_hash`, which is looked up via `getCurrentTraceHash()`.
+This links the child trace to a specific parent version without merging parent
+deps into the child (see Section 4.5).
 
 ### 4.2 Recording (Adapton DDG Construction)
 
@@ -468,27 +468,35 @@ instrumented. If a single TracedExpr applies such a builtin to traced data,
 an element count change could still cause a stale result. These builtins
 can be instrumented incrementally by adding `maybeRecordListLenDep()` calls.
 
-### 4.5 Parent Chain Disambiguation (Salsa Versioned Query)
+### 4.5 Separated Parent and Child Deps
 
-Parent context is critical for recovery correctness. When a child attribute has
-the same deps across two evaluations but its parent has changed, the child's
-result may differ. To disambiguate, direct hash recovery uses **parent Merkle
-chaining**: the parent's `trace_hash` is mixed into the child's recovery lookup
-key via `computeTraceHashWithParentFromSorted()`. This is analogous to Salsa's
-versioned query with context — the same function with different argument versions
-produces different lookup keys.
+Each trace stores only its **own** deps — deps recorded by the
+`DependencyTracker` during that specific thunk's evaluation. Parent deps are
+never merged into child traces. This separation has important consequences:
 
-During verification, `verify()` delegates to `verifyTrace()` which checks all
-dep hashes in the trace. There is no separate parent staleness counter; parent
-validity is ensured through the dependency chain itself (the child's deps
-include all deps inherited from the parent evaluation context via
-`DependencyTracker` nesting).
+1. **Parent invalidation does not cascade to children.** When a parent attrset's
+   Directory dep changes (e.g., a package is added to `pkgs/by-name/`), only the
+   parent trace is invalidated. Child traces (e.g., `hello.pname`) retain their
+   own (unchanged) deps and pass verification independently.
 
-The parent chain is critical for correctness: an attribute like `hello.pname` has
-its own deps (the files it directly reads) plus all deps inherited from the
-evaluation context that produced the `hello` attrset. Without the parent chain,
-changing a file that affects the `hello` derivation itself (but not `pname`
-specifically) would not invalidate `hello.pname`.
+2. **Correctness is maintained through evaluation ordering.** The parent is
+   always forced before its children. If the parent's trace is invalid, it is
+   re-evaluated (producing an updated attrset). Children are then accessed from
+   the new attrset. A child's own deps capture everything it directly depends on
+   — if a file change affects the child's evaluation, the child's own deps will
+   reflect that change.
+
+3. **Recovery hit rates improve dramatically.** Without parent dep merging,
+   child `trace_hash` values are stable across parent changes. Direct hash
+   recovery succeeds for ~10k child traces that would previously have failed
+   due to inherited parent dep changes.
+
+Parent-child relationships are now expressed through `ParentContext` deps
+(DepType=8), which store the parent's `trace_hash` as a regular dep entry.
+This replaces the previous design where `record()` merged all parent deps
+into child traces and used Merkle chaining (`computeTraceHashWithParent`)
+to disambiguate — that approach caused cascading invalidation because any
+parent dep change invalidated all children.
 
 ---
 
@@ -592,18 +600,18 @@ references.
 with the same result share a single Results row.
 
 **DepsSets** stores content-addressed dependency sets. The `deps_hash` is the
-BLAKE3 hash of the sorted deps *without* parent Merkle chaining, so traces that
-differ only in parent context share the same `DepsSets` row. The `deps_blob`
-stores zstd-compressed dependency entries as a compact BLOB. Zstd level 1
-compression achieves 5–10× size reduction on the repetitive binary dep data
-with sub-millisecond encode/decode overhead.
+BLAKE3 hash of the sorted deps (including any `ParentContext` deps). Traces
+that share the same dep set (same files, same parent) share the same `DepsSets`
+row. The `deps_blob` stores zstd-compressed dependency entries as a compact
+BLOB. Zstd level 1 compression achieves 5-10x size reduction on the repetitive
+binary dep data with sub-millisecond encode/decode overhead.
 
 **Traces** stores deduplicated dependency traces (BSàlC constructive traces),
-keyed by `trace_hash` (BLAKE3 of the full dep content including parent Merkle
-chaining). The `struct_hash` captures the structural signature (dep types +
-sources + keys, without hash values) for structural variant recovery. Traces
-reference `DepsSets` via `deps_set_id` for content-addressed dep storage —
-loading a trace's deps is O(1) via a single JOIN.
+keyed by `trace_hash` (which equals the `deps_hash` — the BLAKE3 of the full
+sorted dep content). The `struct_hash` captures the structural signature (dep
+types + sources + keys, without hash values) for structural variant recovery.
+Traces reference `DepsSets` via `deps_set_id` for content-addressed dep
+storage — loading a trace's deps is O(1) via a single JOIN.
 
 **CurrentTraces** maps `(context_hash, attr_path_id)` to the current trace and
 result for each attribute. This is the primary lookup table for the verify path.
@@ -738,9 +746,8 @@ The fresh evaluation path evaluates the real thunk and records the trace:
 
 3. Record trace (BSàlC constructive trace recording)
    a. Collect deps from DependencyTracker
-   b. Sort and dedup deps
-   c. Compute trace_hash (with parent Merkle chaining if parent exists)
-      and struct_hash via HashSink
+   b. Sort and dedup own deps (no parent dep inheritance)
+   c. Compute trace_hash and struct_hash from own deps via HashSink
    d. UPSERT RETURNING INTO Traces (dedup by trace_hash, single statement)
    e. UPSERT RETURNING INTO Results (dedup by result hash, single statement)
    f. UPSERT INTO CurrentTraces (ON CONFLICT: update trace_id, result_id)
@@ -766,14 +773,9 @@ key advantage of a constructive trace (BSàlC CT) over a verifying trace (VT):
 the CT stores full results, enabling recovery without re-evaluation.
 
 ```
-Direct hash recovery (with Salsa-style parent Merkle chaining)    [O(1)]
+Direct hash recovery                                               [O(1)]
   Recompute current dep hashes from old trace's dep keys
-  If parentTraceIdHint available:
-    Get parent's trace_hash → mix into child trace_hash (Merkle chaining)
-    This disambiguates child traces across parent changes
-    (Analogous to Salsa's versioned query with context)
-  Else:
-    Compute plain trace_hash from current dep hashes
+  Compute trace_hash from current dep hashes (own deps only)
   Point lookup in Traces table by trace_hash → candidate trace
   Accept candidate (hash match proves validity) → update CurrentTraces and serve
 
@@ -799,28 +801,6 @@ Recovery is particularly effective for file reverts: reverting a file to a previ
 state produces the same dep hashes, and direct hash recovery finds the matching
 candidate in O(1). This is a direct consequence of the constructive trace property — the
 historical result is stored and can be served immediately.
-
-### 6.4 Parent Merkle Chaining (Salsa Versioned Query)
-
-Direct hash recovery uses `computeTraceHashWithParentFromSorted()` to mix the parent's
-`trace_hash` into the child's recovery lookup key. This creates a Merkle chain:
-
-```
-traceHash(root)  = BLAKE3(sorted_deps)
-traceHash(child) = BLAKE3(sorted_deps + "P" + parent.traceHash)
-```
-
-The parent's `trace_hash` is itself computed from its deps (and its parent's hash,
-recursively), so the child's lookup key transitively captures the entire ancestor
-chain. This correctly disambiguates: the same child deps under different parents
-produce different lookup keys.
-
-The cost is O(1) per recovery (the parent's trace_hash is already stored in the
-Traces table and retrieved via `getTraceFullHash()`).
-
-This is analogous to Salsa's versioned query: the "same function" (same attribute)
-with different "input revisions" (different parent state) maps to different
-memoization entries.
 
 ---
 
@@ -924,10 +904,9 @@ modifications to the evaluated file or expression.
    Changes to a symlink target without changing the resolved file will not
    invalidate the trace.
 
-7. **Merkle identity hash is O(depth).** `computeIdentityHash` recursively walks
-   the parent chain, issuing separate SQLite queries at each level. For deeply
-   nested attributes, this can be expensive. Not currently cached across calls
-   within a session.
+7. **(Resolved)** ~~Merkle identity hash is O(depth).~~ Parent Merkle chaining
+   has been removed. `trace_hash` now equals `deps_hash` (BLAKE3 of own sorted
+   deps including any ParentContext dep). No recursive parent-chain walk is needed.
 
 ---
 
@@ -945,9 +924,9 @@ modifications to the evaluated file or expression.
    Currently verification is sequential; parallelism would reduce verify-path
    latency for attributes with many deps.
 
-4. **Parent trace_hash caching.** Cache `getTraceFullHash` results in a session
-   cache to avoid redundant DB lookups when multiple children use the same
-   parent's trace_hash for Merkle chaining during recovery.
+4. **(Resolved)** ~~Parent trace_hash caching.~~ Parent Merkle chaining has been
+   removed. `getCurrentTraceHash()` looks up the parent's `trace_hash` from the
+   Traces table, and no recursive chain walk is needed.
 
 5. **Integration with content-addressed derivations.** Content-addressed
    derivations could provide additional optimization opportunities — the eval

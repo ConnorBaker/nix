@@ -94,7 +94,6 @@ struct TraceStore {
     std::unordered_map<std::string, StringId> internedStrings;
     std::unordered_map<std::string, AttrPathId> internedAttrPaths;
     std::unordered_map<TraceId, std::vector<Dep>> traceCache;
-    std::unordered_map<TraceId, Hash> traceHashCache;
     std::unordered_map<TraceId, Hash> traceStructHashCache;
 
     // Session string table (reverse: id -> string, for BLOB deserialization)
@@ -125,17 +124,11 @@ struct TraceStore {
      * values. If all match, returns the constructive trace (CT) result directly
      * without re-evaluation. On verification failure, automatically attempts
      * constructive recovery before returning nullopt.
-     *
-     * The parentTraceIdHint enables Merkle parent chaining: when provided, the
-     * parent's trace_hash is mixed into recovery lookups, disambiguating child
-     * traces across different parent versions (analogous to Salsa's versioned
-     * query with context).
      */
     std::optional<VerifyResult> verify(
         std::string_view attrPath,
         const std::unordered_map<std::string, SourcePath> & inputAccessors,
-        EvalState & state,
-        std::optional<TraceId> parentTraceIdHint = std::nullopt);
+        EvalState & state);
 
     /**
      * Record a fresh evaluation result with its dependencies (BSàlC constructive
@@ -143,10 +136,9 @@ struct TraceStore {
      *
      * Stores (attrPath, result, deps) as a constructive trace: the full result
      * value is persisted alongside dep hashes, enabling future recovery without
-     * re-evaluation. If a trace with the same trace_hash already exists (dedup),
-     * reuses it. Deps are content-addressed via DepsSets table — traces sharing
-     * identical deps (differing only in parent Merkle chaining) share a single
-     * DepsSets row.
+     * re-evaluation. Each trace stores only its own deps — no parent dep
+     * inheritance. If a trace with the same trace_hash already exists (dedup),
+     * reuses it. Deps are content-addressed via DepsSets table.
      *
      * Also inserts into TraceHistory for constructive recovery: historical traces
      * can be recovered when dep hashes match a previously-seen state (e.g., after
@@ -156,7 +148,6 @@ struct TraceStore {
         std::string_view attrPath,
         const CachedResult & value,
         const std::vector<Dep> & allDeps,
-        std::optional<TraceId> parentTraceId,
         bool isRoot);
 
     /**
@@ -168,9 +159,8 @@ struct TraceStore {
      * without re-evaluation.
      *
      * Two-strategy recovery:
-     *   Direct hash recovery: compute trace_hash from current dep hashes (with
-     *     optional parent Merkle chaining via parentTraceIdHint), look up in
-     *     Traces table. O(1). Handles file reverts and same-structure changes.
+     *   Direct hash recovery: compute trace_hash from current dep hashes, look
+     *     up in Traces table. O(1). Handles file reverts and same-structure changes.
      *   Structural variant recovery: scan TraceHistory for entries with the same
      *     (context_hash, attr_path_id), group by struct_hash, recompute current
      *     dep hashes for each structural variant, retry direct hash lookup.
@@ -182,8 +172,7 @@ struct TraceStore {
         TraceId oldTraceId,
         std::string_view attrPath,
         const std::unordered_map<std::string, SourcePath> & inputAccessors,
-        EvalState & state,
-        std::optional<TraceId> parentTraceIdHint = std::nullopt);
+        EvalState & state);
 
     /**
      * Load the full dependency set for a trace.
@@ -196,6 +185,11 @@ struct TraceStore {
      */
     std::vector<Dep> loadFullTrace(TraceId traceId);
     bool attrExists(std::string_view attrPath);
+    /** Get the current trace hash for an attr path (for ParentContext dep verification).
+     *  Returns the trace_hash from the Traces table, which captures the full dep
+     *  structure + hashes. Unlike a result hash (which for attrsets only captures
+     *  attribute names), the trace hash changes when any dep value changes. */
+    std::optional<Hash> getCurrentTraceHash(std::string_view attrPath);
     void clearSessionCaches();
     static std::string buildAttrPath(const std::vector<std::string> & components);
 
@@ -245,7 +239,6 @@ private:
     CachedResult decodeCachedResult(const TraceRow & row);
     std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);
 
-    Hash getTraceFullHash(TraceId traceId);
     Hash getTraceStructHash(TraceId traceId);
 };
 
