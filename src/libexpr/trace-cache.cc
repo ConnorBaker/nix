@@ -143,6 +143,65 @@ struct TracedExpr : Expr, gc
     void sortChildNames(std::vector<Symbol> & names) const;
 };
 
+// ── SiblingAccessTracker (per-accessed-sibling ParentContext deps) ────
+
+/**
+ * RAII tracker for recording which siblings a navigated child accesses
+ * during evaluation. Thread-local linked list enables nesting (inner
+ * child evaluations isolate from outer).
+ *
+ * Used to create per-sibling ParentContext deps instead of a single
+ * whole-parent dep, avoiding cascading invalidation when unrelated
+ * siblings are added/removed. Each navigated child's evaluateFresh()
+ * creates a tracker scoped to its parentExpr; sibling TracedExpr::eval()
+ * calls maybeRecord() at completion to register themselves.
+ */
+struct SiblingAccessTracker
+{
+    TracedExpr * parentExpr;
+    std::vector<std::pair<std::string, Hash>> accesses;
+    std::unordered_set<std::string> seen; // dedup by attrPath
+
+    static thread_local SiblingAccessTracker * current;
+    SiblingAccessTracker * previous;
+
+    explicit SiblingAccessTracker(TracedExpr * parent)
+        : parentExpr(parent), previous(current) { current = this; }
+    ~SiblingAccessTracker() { current = previous; }
+
+    SiblingAccessTracker(const SiblingAccessTracker &) = delete;
+    SiblingAccessTracker & operator=(const SiblingAccessTracker &) = delete;
+
+    void recordAccess(const std::string & attrPath, const Hash & traceHash)
+    {
+        if (seen.insert(attrPath).second)
+            accesses.emplace_back(attrPath, traceHash);
+    }
+
+    /**
+     * Called at the end of TracedExpr::eval() to record a sibling access.
+     * Only records if:
+     * - A tracker is active (some ancestor is being evaluated fresh)
+     * - The sibling shares the same parentExpr as the tracker
+     * - The sibling has a valid traceId (eval completed successfully)
+     * - The sibling's current trace hash is available in the DB
+     */
+    static void maybeRecord(TracedExpr * expr, TraceStore & db)
+    {
+        if (!current) return;
+        if (expr->parentExpr != current->parentExpr) return;
+        if (!expr->traceId) return;
+        try {
+            auto path = expr->storeAttrPath();
+            auto hash = db.getCurrentTraceHash(path);
+            if (hash) current->recordAccess(path, *hash);
+        } catch (...) {
+            // DB error during sibling recording — skip silently
+        }
+    }
+};
+thread_local SiblingAccessTracker * SiblingAccessTracker::current = nullptr;
+
 // ── Support types (SharedParentResult, ExprOrigChild) ────────────────
 
 struct SharedParentResult : gc
@@ -377,6 +436,44 @@ void TracedExpr::evaluateFresh(Value & v)
 {
     DependencyTracker tracker;
 
+    // Track which siblings this navigated child accesses during evaluation.
+    // Per-sibling ParentContext deps replace the single whole-parent dep to
+    // avoid cascading invalidation when unrelated siblings are added/removed.
+    std::optional<SiblingAccessTracker> siblingTracker;
+    if (!origExpr && parentExpr && cache->dbBackend)
+        siblingTracker.emplace(parentExpr);
+
+    // Append per-sibling or whole-parent ParentContext deps for navigated children.
+    // Called from both the success and error paths of evaluateFresh().
+    auto appendParentContextDeps = [&](std::vector<Dep> & deps) {
+        if (origExpr || !parentExpr || !cache->dbBackend) return;
+        if (siblingTracker && !siblingTracker->accesses.empty()) {
+            // Per-sibling ParentContext deps: one dep per accessed sibling
+            for (auto & [path, hash] : siblingTracker->accesses) {
+                Blake3Hash b3;
+                static_assert(sizeof(b3.bytes) == 32);
+                std::memcpy(b3.bytes.data(), hash.hash, 32);
+                auto depKey = path;
+                std::replace(depKey.begin(), depKey.end(), '\0', '\t');
+                deps.push_back(Dep{
+                    "", depKey, DepHashValue(b3), DepType::ParentContext});
+            }
+        } else {
+            // Zero sibling accesses: fallback to whole-parent dep
+            auto parentPath = parentExpr->storeAttrPath();
+            auto parentTraceHash = cache->dbBackend->getCurrentTraceHash(parentPath);
+            if (parentTraceHash) {
+                Blake3Hash b3;
+                static_assert(sizeof(b3.bytes) == 32);
+                std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
+                auto depKey = parentPath;
+                std::replace(depKey.begin(), depKey.end(), '\0', '\t');
+                deps.push_back(Dep{
+                    "", depKey, DepHashValue(b3), DepType::ParentContext});
+            }
+        }
+    };
+
     Value * target;
     if (origExpr) {
         target = cache->state.allocValue();
@@ -418,21 +515,7 @@ void TracedExpr::evaluateFresh(Value & v)
         if (cache->dbBackend) {
             auto attrPath = storeAttrPath();
             auto directDeps = tracker.collectTraces();
-
-            // Add ParentContext dep for navigated children
-            if (!origExpr && parentExpr) {
-                auto parentPath = parentExpr->storeAttrPath();
-                auto parentTraceHash = cache->dbBackend->getCurrentTraceHash(parentPath);
-                if (parentTraceHash) {
-                    Blake3Hash b3;
-                    std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
-                    // Use \t separator for dep key (Strings table is TEXT, truncates at \0)
-                    auto depKey = parentPath;
-                    std::replace(depKey.begin(), depKey.end(), '\0', '\t');
-                    directDeps.push_back(Dep{
-                        "", depKey, DepHashValue(b3), DepType::ParentContext});
-                }
-            }
+            appendParentContextDeps(directDeps);
 
             try {
                 auto result = cache->dbBackend->record(
@@ -503,26 +586,20 @@ void TracedExpr::evaluateFresh(Value & v)
             attrValue = misc_t{};
         }
 
-        // For navigated children (no origExpr), add a ParentContext dep linking
-        // this trace to the parent's current trace hash. Without this, zero-dep
-        // navigated children always verify as valid, returning stale results
-        // when the parent's value changes (e.g., after fetchGit repo update).
+        // For navigated children (no origExpr), add ParentContext deps linking
+        // this trace to the siblings it accessed during evaluation. Per-sibling
+        // deps avoid cascading invalidation: adding/removing an unaccessed
+        // sibling doesn't invalidate this child's trace. When zero siblings
+        // were accessed, falls back to whole-parent dep for soundness (e.g.,
+        // constant-valued navigated attributes like `version = "1.0"`).
         // We use trace_hash (not result hash) because result hash for attrsets
         // only captures attribute names, not values.
-        if (!origExpr && parentExpr && cache->dbBackend) {
-            auto parentPath = parentExpr->storeAttrPath();
-            auto parentTraceHash = cache->dbBackend->getCurrentTraceHash(parentPath);
-            if (parentTraceHash) {
-                Blake3Hash b3;
-                static_assert(sizeof(b3.bytes) == 32);
-                std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
-                // Use \t separator for dep key (Strings table is TEXT, truncates at \0)
-                auto depKey = parentPath;
-                std::replace(depKey.begin(), depKey.end(), '\0', '\t');
-                directDeps.push_back(Dep{
-                    "", depKey, DepHashValue(b3), DepType::ParentContext});
-            }
-        }
+        //
+        // KNOWN LIMITATION (soundness gap): If a parent overlay changes this
+        // child's definition without changing any file this child reads OR any
+        // sibling this child accesses, the trace incorrectly validates. See
+        // design.md §9.8 and DISABLED test ParentMediatedValueChange_SoundnessGap.
+        appendParentContextDeps(directDeps);
 
         // Direct record — no deferred writes
         try {
@@ -581,6 +658,18 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
     }
 
     auto & db = *cache->dbBackend;
+
+    // Record this TracedExpr as a sibling access in any active tracker
+    // when eval() exits (both cache-hit and cache-miss paths). Uses RAII
+    // to ensure recording happens even on exception paths.
+    struct SiblingRecordGuard {
+        TracedExpr * self;
+        TraceStore & db;
+        ~SiblingRecordGuard() {
+            try { SiblingAccessTracker::maybeRecord(self, db); }
+            catch (...) {}
+        }
+    } siblingGuard{this, db};
 
     auto attrPath = storeAttrPath();
     auto warmResult = db.verify(attrPath, cache->inputAccessors, cache->state);

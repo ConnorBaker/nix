@@ -57,6 +57,7 @@ sources = files(
   'eval-trace/trace-hash.cc',
   'eval-trace/dep-tracker.cc',
   'eval-trace/integration.cc',
+  'eval-trace/per-sibling-invalidation.cc',
   'eval-trace/stat-hash-cache.cc',
   'eval-trace/traced-data.cc',
   'json.cc',

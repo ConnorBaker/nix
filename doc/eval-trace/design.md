@@ -908,6 +908,24 @@ modifications to the evaluated file or expression.
    has been removed. `trace_hash` now equals `deps_hash` (BLAKE3 of own sorted
    deps including any ParentContext dep). No recursive parent-chain walk is needed.
 
+8. **Parent-mediated value changes (soundness gap).** Per-sibling ParentContext
+   deps track only which siblings a child accessed during evaluation. If a parent
+   overlay changes a child's definition without changing any file that the child
+   reads **or** any sibling the child accesses, the child's trace incorrectly
+   validates. Example: a parent overlay that patches `hello.meta.description` via
+   Nix code (not a file change) would not invalidate `hello`'s trace if `hello`
+   never accessed the attribute that carries the overlay's dep. This is:
+   - **Pre-existing**: origExpr children already lack ParentContext deps entirely.
+   - **Extremely rare**: overlays that modify existing packages without changing
+     any files are almost nonexistent in real Nixpkgs usage.
+   - **Acceptable trade-off**: avoids cascading invalidation of ~60K traces on
+     every by-name package addition.
+   - **Tracked**: A DISABLED test (`ParentMediatedValueChange_SoundnessGap`) in
+     `per-sibling-invalidation.cc` demonstrates this gap.
+   - **Future fix**: could be addressed by recording the parent's evaluation
+     result hash alongside per-sibling deps, or by adding explicit dep tracking
+     for overlay application sites.
+
 ---
 
 ## 10. Future Work
