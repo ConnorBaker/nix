@@ -3513,6 +3513,7 @@ static void prim_removeAttrs(EvalState & state, const PosIdx pos, Value ** args,
     std::set_difference(
         args[0]->attrs()->begin(), args[0]->attrs()->end(), names.begin(), names.end(), std::back_inserter(attrs));
     v.mkAttrs(attrs.alreadySorted());
+    propagateTrackedAttrs(v, *args[0]);
 }
 
 static RegisterPrimOp primop_removeAttrs({
@@ -3684,6 +3685,7 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
     }
 
     v.mkAttrs(attrs.alreadySorted());
+    propagateTrackedAttrsAny(v, {args[0], args[1]});
 }
 
 static RegisterPrimOp primop_intersectAttrs({
@@ -3796,6 +3798,7 @@ static void prim_mapAttrs(EvalState & state, const PosIdx pos, Value ** args, Va
     }
 
     v.mkAttrs(attrs.alreadySorted());
+    propagateTrackedAttrs(v, *args[1]);
 }
 
 static RegisterPrimOp primop_mapAttrs({
@@ -3981,6 +3984,7 @@ static void prim_tail(EvalState & state, const PosIdx pos, Value ** args, Value 
     for (const auto & [n, v] : enumerate(list))
         v = args[0]->listView()[n + 1];
     v.mkList(list);
+    propagateTrackedList(v, *args[0]);
 }
 
 static RegisterPrimOp primop_tail({
@@ -4071,6 +4075,7 @@ static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Valu
         for (const auto & [n, v] : enumerate(list))
             v = vs[n];
         v.mkList(list);
+        propagateTrackedList(v, *args[1]);
     }
 }
 
@@ -4330,6 +4335,7 @@ static void prim_sort(EvalState & state, const PosIdx pos, Value ** args, Value 
     peeksort(list.begin(), list.end(), comparator);
 
     v.mkList(list);
+    propagateTrackedList(v, *args[1]);
 }
 
 static RegisterPrimOp primop_sort({
@@ -4423,13 +4429,17 @@ static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, V
     auto rlist = state.buildList(rsize);
     if (rsize)
         memcpy(rlist.elems, right.data(), sizeof(Value *) * rsize);
-    attrs.alloc(state.s.right).mkList(rlist);
+    auto & rVal = attrs.alloc(state.s.right);
+    rVal.mkList(rlist);
+    propagateTrackedList(rVal, *args[1]);
 
     auto wsize = wrong.size();
     auto wlist = state.buildList(wsize);
     if (wsize)
         memcpy(wlist.elems, wrong.data(), sizeof(Value *) * wsize);
-    attrs.alloc(state.s.wrong).mkList(wlist);
+    auto & wVal = attrs.alloc(state.s.wrong);
+    wVal.mkList(wlist);
+    propagateTrackedList(wVal, *args[1]);
 
     v.mkAttrs(attrs);
 }
@@ -4481,7 +4491,9 @@ static void prim_groupBy(EvalState & state, const PosIdx pos, Value ** args, Val
         auto size = i.second.size();
         auto list = state.buildList(size);
         memcpy(list.elems, i.second.data(), sizeof(Value *) * size);
-        attrs2.alloc(i.first).mkList(list);
+        auto & groupVal = attrs2.alloc(i.first);
+        groupVal.mkList(list);
+        propagateTrackedList(groupVal, *args[1]);
     }
 
     v.mkAttrs(attrs2.alreadySorted());

@@ -293,6 +293,48 @@ void maybeRecordAttrKeysDep(const SymbolTable & symbols, const Value & v);
  */
 void maybeRecordTypeDep(const Value & v);
 
+// ═══════════════════════════════════════════════════════════════════════
+// Provenance propagation for container-reconstructing operations
+// ═══════════════════════════════════════════════════════════════════════
+//
+// When builtins like mapAttrs, filter, sort, removeAttrs create new
+// containers from tracked inputs, provenance must be propagated to
+// the output so that subsequent shape observations (attrNames, length)
+// can record shape deps. Without propagation, the output container's
+// Bindings*/Value* is not in the provenance map, and shape deps are
+// silently lost.
+//
+// Example: mapAttrs(f, trackedFromJSON) produces a new attrset with
+// different Bindings*. Without propagation, attrNames on the result
+// would fail to record a #keys dep, creating a soundness gap.
+
+/**
+ * Propagate attrset provenance from a single tracked input to the output.
+ * Call after building the output attrset (mkAttrs).
+ * No-op if dep tracking is inactive, input is not tracked, or output is empty.
+ */
+void propagateTrackedAttrs(const Value & output, const Value & input);
+
+/**
+ * Propagate list provenance from a single tracked input to the output.
+ * Call after building the output list (mkList).
+ * No-op if dep tracking is inactive, input is not tracked, or either is empty.
+ */
+void propagateTrackedList(const Value & output, const Value & input);
+
+/**
+ * Propagate attrset provenance from the first tracked input found.
+ * Used for operations like // and intersectAttrs where either input
+ * could be tracked. Copies provenance from whichever input is found first.
+ */
+void propagateTrackedAttrsAny(const Value & output, std::initializer_list<const Value *> inputs);
+
+/**
+ * Propagate list provenance from the first tracked input found.
+ * Used for concatLists where any input list could be tracked.
+ */
+void propagateTrackedListFromAny(const Value & output, size_t nInputs, Value * const * inputs);
+
 /**
  * Stat metadata used as a cache key: if these fields match, the file
  * hasn't changed and the cached hash is still valid. Field types match

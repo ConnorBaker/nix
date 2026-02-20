@@ -456,6 +456,12 @@ for lists. Empty lists cannot be tracked (no stable internal pointer)
 but this is safe — they have no leaf `StructuredContent` deps.
 `ExprTracedData::eval()` registers containers; builtins call
 `maybeRecordListLenDep()` / `maybeRecordAttrKeysDep()` in `primops.cc`.
+Container-reconstructing builtins (`mapAttrs`, `filter`, `sort`,
+`removeAttrs`, `intersectAttrs`, `//`, `++`, `partition`, `groupBy`,
+`tail`) propagate provenance from tracked inputs to new output containers
+via `propagateTrackedAttrs()` / `propagateTrackedList()` /
+`propagateTrackedAttrsAny()` / `propagateTrackedListFromAny()`.
+This ensures shape deps can be recorded on *derived* containers.
 The map is cleared on root `DependencyTracker` construction via
 `onRootConstruction()`. `escapeDataPathKey()` now quotes `#` to prevent
 ambiguity with shape suffixes (`#len`, `#keys`). `computeCurrentHash()`
@@ -525,8 +531,8 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 | File | Description |
 |------|-------------|
 | `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `DepKind`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange`, `StructuredFormat`, `ShapeSuffix`, inline helpers (header-only, includes `depTypeName()`, `depKind()`, `depKindName()`, `isVolatile()`, `isContentOverrideable()`, `buildStructuredDepKey()`, `formatStructuredDepKey()`, etc.) |
-| `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance`, `resolveProvenance`, `dirEntryTypeString` |
-| `src/libexpr/dependency-tracker.cc` | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) + provenance threading + `dirEntryTypeString` |
+| `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance`, `resolveProvenance`, `dirEntryTypeString`, provenance propagation helpers (`propagateTrackedAttrs`, `propagateTrackedList`, `propagateTrackedAttrsAny`, `propagateTrackedListFromAny`) |
+| `src/libexpr/dependency-tracker.cc` | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) + provenance threading + `dirEntryTypeString` + provenance propagation impls |
 | `src/libexpr/include/nix/expr/traced-data.hh` | `TracedDataNode` virtual interface, `ExprTracedData` Expr subclass for lazy structural dep tracking |
 | `src/libexpr/include/nix/expr/eval-trace-context.hh` | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
 | `src/libexpr/eval-trace-context.cc` | `EvalTraceContext` methods (recordThunkDeps, replayMemoizedDeps, reset, flush) |
@@ -584,7 +590,7 @@ anonymous-namespace implementation detail).
 | `tests/functional/eval-trace-impure-advanced.sh` | Deep origExpr, dep suspension, fat parent |
 | `tests/functional/eval-trace-impure-output.sh` | Cursor eval, JSON, revert constructive recovery |
 | `tests/functional/eval-trace-impure-regression.sh` | Specific bug regressions |
-| `src/libexpr-tests/eval-trace/traced-data.cc` | GTest: lazy structural dep tracking (JSON/TOML + directory; covers scalar access, two-level override, shape deps, provenance, directory entries) |
+| `src/libexpr-tests/eval-trace/traced-data.cc` | GTest: lazy structural dep tracking (JSON/TOML + directory; covers scalar access, two-level override, shape deps, provenance, directory entries, provenance propagation through mapAttrs/filter/sort/removeAttrs/intersectAttrs///partition/groupBy) |
 | `src/libexpr-tests/eval-trace/trace-store.cc` | GTest: TraceStore (schema, serialization, verify/record/recover) |
 
 ---

@@ -2011,6 +2011,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 
         std::ranges::copy(bindings2, std::back_inserter(attrs));
         v.mkAttrs(attrs.alreadySorted());
+        propagateTrackedAttrsAny(v, {&v1, &v2});
 
         state.nrOpUpdateValuesCopied += bindings2.size();
         return;
@@ -2048,6 +2049,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
     }
 
     v.mkAttrs(attrs.alreadySorted());
+    propagateTrackedAttrsAny(v, {&v1, &v2});
 
     state.nrOpUpdateValuesCopied += v.attrs()->size();
 }
@@ -2125,6 +2127,7 @@ void EvalState::concatLists(
         pos += l;
     }
     v.mkList(list);
+    propagateTrackedListFromAny(v, nrLists, lists);
 }
 
 void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)

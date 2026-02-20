@@ -462,11 +462,16 @@ the primary use case: `data.x` still survives key-set changes in the
 file because no shape dep is recorded — only the `StructuredContent` dep
 for `x`'s value participates in the override.
 
-**Remaining edge case (strict consumers).** Builtins like `sort`, `foldl'`,
-`filter`, `any`, `all` observe both shape and all values but are not yet
-instrumented. If a single TracedExpr applies such a builtin to traced data,
-an element count change could still cause a stale result. These builtins
-can be instrumented incrementally by adding `maybeRecordListLenDep()` calls.
+**Provenance propagation.** Container-reconstructing builtins (`mapAttrs`,
+`filter`, `sort`, `removeAttrs`, `intersectAttrs`, `//`, `++`, `partition`,
+`groupBy`, `tail`) propagate the tracked container provenance from their
+inputs to their output. This allows shape deps to be recorded even on
+*derived* containers. For example, `attrNames (mapAttrs f trackedData)`
+correctly records a `#keys` dep because `mapAttrs` propagates provenance
+from the tracked input to the new output `Bindings*`. The propagation is
+conservative: the dep references the *original* data path in the source
+file, so derived containers with different shapes (e.g., after
+`removeAttrs`) may cause false invalidations but never false positives.
 
 ### 4.5 Separated Parent and Child Deps
 

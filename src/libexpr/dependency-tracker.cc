@@ -606,4 +606,54 @@ void maybeRecordTypeDep(const Value & v)
     DependencyTracker::record({prov->depSource, fullKey, DepHashValue(depHash(typeStr)), DepType::StructuredContent});
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Provenance propagation for container-reconstructing operations
+// ═══════════════════════════════════════════════════════════════════════
+
+void propagateTrackedAttrs(const Value & output, const Value & input)
+{
+    if (!DependencyTracker::isActive()) return;
+    if (output.attrs()->size() == 0) return; // Empty output has no stable key
+    auto * prov = lookupTracedContainer((const void *)input.attrs());
+    if (!prov) return;
+    registerTracedContainer((const void *)output.attrs(), *prov);
+}
+
+void propagateTrackedList(const Value & output, const Value & input)
+{
+    if (!DependencyTracker::isActive()) return;
+    if (input.listSize() == 0) return; // Empty input has no stable key
+    auto * prov = lookupTracedContainer((const void *)input.listView()[0]);
+    if (!prov) return;
+    if (output.listSize() == 0) return; // Empty output has no stable key
+    registerTracedContainer((const void *)output.listView()[0], *prov);
+}
+
+void propagateTrackedAttrsAny(const Value & output, std::initializer_list<const Value *> inputs)
+{
+    if (!DependencyTracker::isActive()) return;
+    if (output.attrs()->size() == 0) return;
+    for (auto * input : inputs) {
+        auto * prov = lookupTracedContainer((const void *)input->attrs());
+        if (prov) {
+            registerTracedContainer((const void *)output.attrs(), *prov);
+            return;
+        }
+    }
+}
+
+void propagateTrackedListFromAny(const Value & output, size_t nInputs, Value * const * inputs)
+{
+    if (!DependencyTracker::isActive()) return;
+    if (output.listSize() == 0) return;
+    for (size_t i = 0; i < nInputs; i++) {
+        if (inputs[i]->listSize() == 0) continue;
+        auto * prov = lookupTracedContainer((const void *)inputs[i]->listView()[0]);
+        if (prov) {
+            registerTracedContainer((const void *)output.listView()[0], *prov);
+            return;
+        }
+    }
+}
+
 } // namespace nix
