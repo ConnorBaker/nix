@@ -1,54 +1,25 @@
 #include "helpers.hh"
-#include "nix/expr/trace-store.hh"
 
 #include <gtest/gtest.h>
-
-#include "nix/expr/tests/libexpr.hh"
-#include "nix/expr/trace-cache.hh"
-#include "nix/util/hash.hh"
 
 namespace nix::eval_trace {
 
 using namespace nix::eval_trace::test;
 
-class TraceCacheIntegrationTest : public LibExprTest
+class TraceCacheIntegrationTest : public TraceCacheFixture
 {
 public:
     TraceCacheIntegrationTest()
-        : LibExprTest(openStore("dummy://", {{"read-only", "false"}}),
-            [](bool & readOnlyMode) {
-                readOnlyMode = false;
-                EvalSettings s{readOnlyMode};
-                s.nixPath = {};
-                return s;
-            })
-    {}
+    {
+        testFingerprint = hashString(HashAlgorithm::SHA256, "integration-test");
+    }
 
 protected:
-    // Writable cache dir for trace store SQLite (sandbox has no writable $HOME)
-    ScopedCacheDir cacheDir;
-
     static constexpr int64_t testCtx = 0xDEADBEEF;
-    Hash testFingerprint = hashString(HashAlgorithm::SHA256, "integration-test");
 
     TraceStore makeDbBackend()
     {
         return TraceStore(state.symbols, testCtx);
-    }
-
-    std::unique_ptr<TraceCache> makeCache(
-        const std::string & nixExpr,
-        int * loaderCalls = nullptr)
-    {
-        auto loader = [this, nixExpr, loaderCalls]() -> Value * {
-            if (loaderCalls) (*loaderCalls)++;
-            Value v = eval(nixExpr);
-            auto * result = state.allocValue();
-            *result = v;
-            return result;
-        };
-        return std::make_unique<TraceCache>(
-            testFingerprint, state, std::move(loader));
     }
 };
 

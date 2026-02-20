@@ -1,37 +1,22 @@
 #include "helpers.hh"
-#include "nix/expr/trace-store.hh"
 
 #include <gtest/gtest.h>
-
-#include "nix/expr/tests/libexpr.hh"
-#include "nix/expr/trace-cache.hh"
-#include "nix/util/hash.hh"
 
 namespace nix::eval_trace {
 
 using namespace nix::eval_trace::test;
 
-class TraceCacheTest : public LibExprTest
+class TraceCacheTest : public TraceCacheFixture
 {
 public:
     TraceCacheTest()
-        : LibExprTest(openStore("dummy://", {{"read-only", "false"}}),
-            [](bool & readOnlyMode) {
-                readOnlyMode = false;
-                EvalSettings s{readOnlyMode};
-                s.nixPath = {};
-                return s;
-            })
-    {}
+    {
+        testFingerprint = hashString(HashAlgorithm::SHA256, "test-fingerprint");
+    }
 
 protected:
-    // Writable cache dir for trace store SQLite (sandbox has no writable $HOME)
-    ScopedCacheDir cacheDir;
-
-    Hash testFingerprint = hashString(HashAlgorithm::SHA256, "test-fingerprint");
-
     /**
-     * Create a TraceCache with a rootLoader that evaluates a Nix expression string.
+     * Create a TraceCache with a specific fingerprint (or nullopt).
      * The fingerprint serves as the trace context key (BSàlC: task identity).
      */
     std::unique_ptr<TraceCache> makeCache(
@@ -49,23 +34,7 @@ protected:
         return std::make_unique<TraceCache>(fingerprint, state, std::move(loader));
     }
 
-    /**
-     * Create a trace cache with default fingerprint.
-     */
-    std::unique_ptr<TraceCache> makeCache(const std::string & nixExpr)
-    {
-        return makeCache(nixExpr, testFingerprint);
-    }
-
-    /**
-     * Force a trace cache's root value to completion (triggers recording or verification).
-     */
-    Value forceRoot(TraceCache & cache)
-    {
-        auto * v = cache.getRootValue();
-        state.forceValue(*v, noPos);
-        return *v;
-    }
+    using TraceCacheFixture::makeCache;
 };
 
 // ── Construction tests ───────────────────────────────────────────────

@@ -1,15 +1,6 @@
 #include "helpers.hh"
-#include "nix/expr/trace-store.hh"
-#include "nix/expr/dependency-tracker.hh"
 
 #include <gtest/gtest.h>
-#include <filesystem>
-
-#include "nix/expr/tests/libexpr.hh"
-#include "nix/expr/trace-cache.hh"
-#include "nix/util/hash.hh"
-#include "nix/util/source-accessor.hh"
-#include "nix/util/canon-path.hh"
 
 namespace nix::eval_trace {
 
@@ -31,60 +22,12 @@ using namespace nix::eval_trace::test;
  * - Verification validates deps and serves from trace (loaderCalls == 0)
  * - After dep invalidation, verification falls back to fresh evaluation (loaderCalls == 1)
  */
-class DepTrackingTest : public LibExprTest
+class DepTrackingTest : public TraceCacheFixture
 {
 public:
     DepTrackingTest()
-        : LibExprTest(openStore("dummy://", {{"read-only", "false"}}),
-            [](bool & readOnlyMode) {
-                readOnlyMode = false;
-                EvalSettings s{readOnlyMode};
-                s.nixPath = {};
-                return s;
-            })
-    {}
-
-protected:
-    ScopedCacheDir cacheDir;
-    Hash testFingerprint = hashString(HashAlgorithm::SHA256, "dep-tracking-test");
-
-    /**
-     * Create a TraceCache with a rootLoader that evaluates a Nix expression.
-     * Optionally tracks how many times the rootLoader is called:
-     *   loaderCalls == 0  -> verification hit (BSàlC: verifying trace succeeded)
-     *   loaderCalls == 1  -> verification miss, fresh evaluation (BSàlC: trace recording)
-     */
-    std::unique_ptr<TraceCache> makeCache(
-        const std::string & nixExpr,
-        int * loaderCalls = nullptr)
     {
-        auto loader = [this, nixExpr, loaderCalls]() -> Value * {
-            if (loaderCalls) (*loaderCalls)++;
-            Value v = eval(nixExpr);
-            auto * result = state.allocValue();
-            *result = v;
-            return result;
-        };
-        return std::make_unique<TraceCache>(
-            testFingerprint, state, std::move(loader));
-    }
-
-    Value forceRoot(TraceCache & cache)
-    {
-        auto * v = cache.getRootValue();
-        state.forceValue(*v, noPos);
-        return *v;
-    }
-
-    /**
-     * Invalidate all oracle caches that could mask a file modification:
-     * - PosixSourceAccessor's singleton lstat cache
-     * - StatHashCache's L1 in-memory cache (process singleton)
-     */
-    void invalidateFileCache(const std::filesystem::path & path)
-    {
-        getFSSourceAccessor()->invalidateCache(CanonPath(path.string()));
-        clearStatHashMemoryCache();
+        testFingerprint = hashString(HashAlgorithm::SHA256, "dep-tracking-test");
     }
 };
 

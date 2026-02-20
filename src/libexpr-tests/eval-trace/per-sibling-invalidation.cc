@@ -1,11 +1,7 @@
 #include "helpers.hh"
-#include "nix/expr/trace-store.hh"
 #include "nix/expr/trace-hash.hh"
 
-#include <algorithm>
 #include <gtest/gtest.h>
-
-#include "nix/expr/tests/libexpr.hh"
 
 namespace nix::eval_trace {
 
@@ -19,52 +15,15 @@ using namespace nix::eval_trace::test;
  * what SiblingAccessTracker produces) and verify behavior through the
  * TraceStore API.
  */
-class PerSiblingInvalidationTest : public LibExprTest
+class PerSiblingInvalidationTest : public TraceStoreFixture
 {
-public:
-    PerSiblingInvalidationTest()
-        : LibExprTest(openStore("dummy://", {{"read-only", "false"}}),
-            [](bool & readOnlyMode) {
-                readOnlyMode = false;
-                EvalSettings s{readOnlyMode};
-                s.nixPath = {};
-                return s;
-            })
-    {}
-
 protected:
-    ScopedCacheDir cacheDir;
+    // Use a distinct context hash from the base class
     static constexpr int64_t testContextHash = 0xABCDEF0123456789;
 
     TraceStore makeDb()
     {
         return TraceStore(state.symbols, testContextHash);
-    }
-
-    /**
-     * Build a null-byte-separated attr path from components.
-     */
-    static std::string makePath(std::initializer_list<std::string_view> parts)
-    {
-        std::string path;
-        bool first = true;
-        for (auto & part : parts) {
-            if (!first) path.push_back('\0');
-            path.append(part);
-            first = false;
-        }
-        return path;
-    }
-
-    /**
-     * Convert an attr path (\0-separated) to a ParentContext dep key (\t-separated).
-     * Matches the conversion in trace-cache.cc.
-     */
-    static std::string toDepKey(const std::string & attrPath)
-    {
-        std::string key = attrPath;
-        std::replace(key.begin(), key.end(), '\0', '\t');
-        return key;
     }
 };
 
