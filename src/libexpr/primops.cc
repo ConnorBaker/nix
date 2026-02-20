@@ -760,6 +760,8 @@ struct CompareValues
                 // reproducible way.
                 return v1->pathStrView() < v2->pathStrView();
             case nList:
+                maybeRecordListLenDep(*v1);
+                maybeRecordListLenDep(*v2);
                 // Lexicographic comparison
                 for (size_t i = 0;; i++) {
                     if (i == v2->listSize()) {
@@ -3537,6 +3539,7 @@ static RegisterPrimOp primop_removeAttrs({
 static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[0], pos, "while evaluating the argument passed to builtins.listToAttrs");
+    maybeRecordListLenDep(*args[0]);
 
     // Step 1. Sort the name-value attrsets in place using the memory we allocate for the result
     auto listView = args[0]->listView();
@@ -3620,6 +3623,8 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
 {
     state.forceAttrs(*args[0], pos, "while evaluating the first argument passed to builtins.intersectAttrs");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.intersectAttrs");
+    maybeRecordAttrKeysDep(state.symbols, *args[0]);
+    maybeRecordAttrKeysDep(state.symbols, *args[1]);
 
     auto & left = *args[0]->attrs();
     auto & right = *args[1]->attrs();

@@ -2295,7 +2295,10 @@ TEST_F(TracedDataTest, TracedDir_ChangeUnrelatedType)
 
 TEST_F(TracedDataTest, TracedDir_ThroughUpdate)
 {
-    // readDir result passed through // (update operator) — thunks survive
+    // readDir result passed through // (update operator) — thunks survive.
+    // The // operator records #keys for both operands, so adding a new file
+    // causes a #keys dep failure even though .hello is unchanged. This is the
+    // expected precision trade-off for the soundness fix in ExprOpUpdate.
     TempDir td;
     td.addFile("hello", "content");
     td.addFile("other", "pad");
@@ -2314,7 +2317,7 @@ TEST_F(TracedDataTest, TracedDir_ThroughUpdate)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_EQ(loaderCalls, 1); // #keys dep on readDir result causes re-eval
         EXPECT_THAT(v, IsStringEq("regular"));
     }
 }
@@ -3479,8 +3482,11 @@ TEST_F(TracedDataTest, TracedJSON_MapAttrs_KeyAdded_CacheHit)
     }
 }
 
-TEST_F(TracedDataTest, TracedJSON_Update_KeyAdded_CacheHit)
+TEST_F(TracedDataTest, TracedJSON_Update_KeyAdded_CacheMiss)
 {
+    // The // operator now records #keys for both operands. When a key is added
+    // to the traced JSON, the #keys dep fails even though .a is unchanged.
+    // This is the expected precision trade-off for the soundness fix.
     TempJsonFile file(R"({"a":"x","b":"y"})");
     auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
         + R"(); in (j // { extra = "e"; }).a)";
@@ -3498,14 +3504,16 @@ TEST_F(TracedDataTest, TracedJSON_Update_KeyAdded_CacheHit)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_EQ(loaderCalls, 1); // #keys dep causes re-eval
         EXPECT_THAT(v, IsStringEq("x"));
     }
 }
 
-TEST_F(TracedDataTest, TracedJSON_IntersectAttrs_KeyAdded_CacheHit)
+TEST_F(TracedDataTest, TracedJSON_IntersectAttrs_KeyAdded_CacheMiss)
 {
-    // intersectAttrs { a = true; } j — first arg provides key set, second provides values
+    // intersectAttrs now records #keys for both operands. When a key is added
+    // to the traced JSON, the #keys dep fails even though .a is unchanged.
+    // This is the expected precision trade-off for the soundness fix.
     TempJsonFile file(R"({"a":"x","b":"y"})");
     auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
         + R"(); in (builtins.intersectAttrs { a = true; } j).a)";
@@ -3523,7 +3531,7 @@ TEST_F(TracedDataTest, TracedJSON_IntersectAttrs_KeyAdded_CacheHit)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_EQ(loaderCalls, 1); // #keys dep causes re-eval
         EXPECT_THAT(v, IsStringEq("x"));
     }
 }
@@ -3552,8 +3560,11 @@ TEST_F(TracedDataTest, TracedJSON_RemoveAttrs_KeyAdded_CacheHit)
     }
 }
 
-TEST_F(TracedDataTest, TracedJSON_ListToAttrs_ElementAppended_CacheHit)
+TEST_F(TracedDataTest, TracedJSON_ListToAttrs_ElementAppended_CacheMiss)
 {
+    // listToAttrs now records #len for the input list. When an element is
+    // appended, the #len dep fails even though .a is unchanged.
+    // This is the expected precision trade-off for the soundness fix.
     TempJsonFile file(R"([{"name":"a","value":"x"},{"name":"b","value":"y"}])");
     auto expr = R"((builtins.listToAttrs (builtins.fromJSON (builtins.readFile )" + file.path.string()
         + R"())).a)";
@@ -3571,7 +3582,7 @@ TEST_F(TracedDataTest, TracedJSON_ListToAttrs_ElementAppended_CacheHit)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_EQ(loaderCalls, 1); // #len dep causes re-eval
         EXPECT_THAT(v, IsStringEq("x"));
     }
 }
@@ -4272,6 +4283,531 @@ TEST_F(TracedDataTest, TracedTOML_StandaloneStructuralDep_CacheMiss)
         EXPECT_EQ(std::string(xStr), "changed");
     }
     EXPECT_EQ(loaderCalls, 1);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Adversarial soundness tests: gaps where shape dep recording is missing
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── Gap 1: eqValues (== and !=) — no shape deps ─────────────────────
+
+TEST_F(TracedDataTest, TracedJSON_EqOp_ListLengthGrows)
+{
+    // [SOUNDNESS] == checks list length without recording #len shape dep.
+    // Cold: arr has 2 elements, matches literal → true.
+    // Hot: arr grows to 3 elements, but SC deps for [0] and [1] still pass.
+    // Without #len dep, override incorrectly accepts stale "true".
+    TempJsonFile file(R"({"arr":["a","b"]})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in if j.arr == ["a" "b"] then "yes" else "no")";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("yes"));
+    }
+
+    // arr grows: ["a","b"] → ["a","b","c!!"] (different size for stat invalidation)
+    file.modify(R"({"arr":["a","b","c!!"]})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // must re-evaluate (length changed)
+        EXPECT_THAT(v, IsStringEq("no")); // 3-element list != 2-element literal
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_EqOp_AttrsetKeyAdded)
+{
+    // [SOUNDNESS] == checks attrset key count/names without recording #keys.
+    // Cold: obj has {a,b}, matches literal → true.
+    // Hot: obj gains key "c", but SC deps for .a and .b still pass.
+    TempJsonFile file(R"({"obj":{"a":1,"b":2}})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in if j.obj == { a = 1; b = 2; } then "yes" else "no")";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("yes"));
+    }
+
+    file.modify(R"({"obj":{"a":1,"b":2,"c":3}})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // must re-evaluate (key set changed)
+        EXPECT_THAT(v, IsStringEq("no")); // extra key → not equal
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_NeqOp_ListLengthGrows)
+{
+    // [SOUNDNESS] != has the same gap as == (shares eqValues).
+    // Cold: arr matches → != returns false → "no".
+    // Hot: arr grows → should return true → "yes".
+    TempJsonFile file(R"({"arr":["a","b"]})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in if j.arr != ["a" "b"] then "yes" else "no")";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("no")); // equal → != is false
+    }
+
+    file.modify(R"({"arr":["a","b","c!!"]})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // must re-evaluate
+        EXPECT_THAT(v, IsStringEq("yes")); // not equal → != is true
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_EqOp_ListElementChanges)
+{
+    // [PRECISION] Same length, element changes → SC dep for element fails → re-eval.
+    TempJsonFile file(R"({"arr":["a","b"]})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in if j.arr == ["a" "b"] then "yes" else "no")";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("yes"));
+    }
+
+    // Same length but element 1 changes (different size for stat invalidation)
+    file.modify(R"({"arr":["a","B!!!"]})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // SC dep for [1] fails → re-eval
+        EXPECT_THAT(v, IsStringEq("no"));
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_EqOp_ListUnrelatedChange)
+{
+    // [PRECISION] arr unchanged, unrelated key changes → override correctly accepts.
+    TempJsonFile file(R"({"arr":["a","b"],"extra":"x"})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in if j.arr == ["a" "b"] then "yes" else "no")";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("yes"));
+    }
+
+    file.modify(R"({"arr":["a","b"],"extra":"changed!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // cache hit (arr unchanged)
+        EXPECT_THAT(v, IsStringEq("yes"));
+    }
+}
+
+// ── Gap 2: genericClosure — no #len on startSet ─────────────────────
+
+TEST_F(TracedDataTest, TracedJSON_GenericClosure_StartSetGrows)
+{
+    // [SOUNDNESS] genericClosure iterates startSet without recording #len.
+    // Cold: 2 nodes → closure has 2 elements.
+    // Hot: 3 nodes, existing SC deps for [0].key and [1].key pass, no #len dep.
+    TempJsonFile file(R"({"nodes":[{"key":"a"},{"key":"b"}]})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in builtins.length (builtins.genericClosure { startSet = j.nodes; operator = n: []; }))";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(2));
+    }
+
+    file.modify(R"({"nodes":[{"key":"a"},{"key":"b"},{"key":"c!!"}]})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // must re-evaluate (startSet grew)
+        EXPECT_THAT(v, IsIntEq(3));
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_GenericClosure_ElementChanges)
+{
+    // [PRECISION] Element value changes → SC dep for that element fails → re-eval.
+    TempJsonFile file(R"({"nodes":[{"key":"a"},{"key":"b"}]})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in builtins.head (builtins.genericClosure { startSet = j.nodes; operator = n: []; }))";
+
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * keyAttr = root.attrs()->get(state.symbols.create("key"));
+        ASSERT_NE(keyAttr, nullptr);
+        state.forceValue(*keyAttr->value, noPos);
+        EXPECT_THAT(*keyAttr->value, IsStringEq("a"));
+    }
+
+    file.modify(R"({"nodes":[{"key":"CHANGED!"},{"key":"b"}]})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * keyAttr = root.attrs()->get(state.symbols.create("key"));
+        ASSERT_NE(keyAttr, nullptr);
+        state.forceValue(*keyAttr->value, noPos);
+        EXPECT_EQ(loaderCalls, 1); // SC dep for [0].key fails
+        EXPECT_THAT(*keyAttr->value, IsStringEq("CHANGED!"));
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_GenericClosure_CacheHit)
+{
+    // [PRECISION] Unaccessed non-key attribute changes → cache hit.
+    // genericClosure reads ALL elements' .key for dedup, so we must change
+    // a non-.key attribute to avoid invalidation.
+    TempJsonFile file(R"({"nodes":[{"key":"a","val":"x"},{"key":"b","val":"y"}]})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in builtins.head (builtins.genericClosure { startSet = j.nodes; operator = n: []; }))";
+
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * keyAttr = root.attrs()->get(state.symbols.create("key"));
+        ASSERT_NE(keyAttr, nullptr);
+        state.forceValue(*keyAttr->value, noPos);
+        EXPECT_THAT(*keyAttr->value, IsStringEq("a"));
+    }
+
+    // Change element [1]'s non-key attribute only (unaccessed by result)
+    file.modify(R"({"nodes":[{"key":"a","val":"x"},{"key":"b","val":"CHANGED!"}]})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * keyAttr = root.attrs()->get(state.symbols.create("key"));
+        ASSERT_NE(keyAttr, nullptr);
+        state.forceValue(*keyAttr->value, noPos);
+        EXPECT_EQ(loaderCalls, 0); // cache hit ([0].key and [1].key unchanged)
+        EXPECT_THAT(*keyAttr->value, IsStringEq("a"));
+    }
+}
+
+// ── Gap 3: listToAttrs — no #len on input list ──────────────────────
+
+TEST_F(TracedDataTest, TracedJSON_ListToAttrs_FullResultGrows)
+{
+    // [SOUNDNESS] listToAttrs iterates list without recording #len.
+    // Cold: 2 items → 2 attrs. Hot: 3 items, existing SC deps pass.
+    TempJsonFile file(R"({"items":[{"name":"a","value":"1"},{"name":"b","value":"2"}]})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in builtins.length (builtins.attrNames (builtins.listToAttrs j.items)))";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(2));
+    }
+
+    file.modify(R"({"items":[{"name":"a","value":"1"},{"name":"b","value":"2"},{"name":"c","value":"3!!"}]})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // must re-evaluate (list grew)
+        EXPECT_THAT(v, IsIntEq(3));
+    }
+}
+
+// ── Gap 4: Raw + parsed readFile from same file ─────────────────────
+
+TEST_F(TracedDataTest, DISABLED_TracedJSON_RawAndParsedReadFile_ContentChanges)
+{
+    // [SOUNDNESS] DEFERRED: Raw + parsed readFile from same file requires deeper
+    // design work. When both a raw readFile (used via stringLength) and a parsed
+    // readFile (used via fromJSON) reference the same file, SC deps from the parsed
+    // path can incorrectly "cover" the Content dep failure for the raw path.
+    // This needs a mechanism to distinguish raw vs parsed readFile provenance.
+    TempJsonFile file(R"({"name":"foo","extra":"short"})");
+    auto expr = R"(let raw = builtins.readFile )" + file.path.string()
+        + R"(; j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in toString (builtins.stringLength raw) + "-" + j.name)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        // File is 30 bytes: {"name":"foo","extra":"short"}
+        auto str = state.forceStringNoCtx(v, noPos, "");
+        // Just verify it has the right format (number-name)
+        EXPECT_TRUE(std::string(str).find("-foo") != std::string::npos);
+    }
+
+    // Change extra (name stays same, file size changes)
+    file.modify(R"({"name":"foo","extra":"longer!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // raw stringLength changed → must re-evaluate
+        auto str = state.forceStringNoCtx(v, noPos, "");
+        EXPECT_TRUE(std::string(str).find("-foo") != std::string::npos);
+    }
+}
+
+// ── Gap 5: intersectAttrs — no #keys on inputs ─────────────────────
+
+TEST_F(TracedDataTest, TracedJSON_IntersectAttrs_TracedGainsMatchingKey)
+{
+    // [SOUNDNESS] intersectAttrs iterates key sets without recording #keys.
+    // A passing SC dep (marker) triggers the override, but key set changes
+    // in intersectAttrs inputs go undetected.
+    TempJsonFile file(R"({"a":1,"b":2,"marker":"ok"})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in builtins.seq j.marker (builtins.length (builtins.attrNames (builtins.intersectAttrs j { a = 1; b = 2; c = 3; }))))";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(2)); // intersection of {a,b,marker} ∩ {a,b,c} = {a,b}
+    }
+
+    // j gains "c" which is in the literal set → intersection grows
+    file.modify(R"({"a":1,"b":2,"c":99,"marker":"ok"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // must re-evaluate (intersection changed)
+        EXPECT_THAT(v, IsIntEq(3)); // now {a,b,c}
+    }
+}
+
+// ── Additional precision tests for Gap 1 ────────────────────────────
+
+TEST_F(TracedDataTest, TracedJSON_EqOp_AttrsetValueChanges)
+{
+    // [PRECISION] Same keys, value changes → SC dep for value fails → re-eval.
+    TempJsonFile file(R"({"obj":{"a":1,"b":2}})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in if j.obj == { a = 1; b = 2; } then "yes" else "no")";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("yes"));
+    }
+
+    file.modify(R"({"obj":{"a":1,"b":99}})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // SC dep for .b fails
+        EXPECT_THAT(v, IsStringEq("no"));
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_EqOp_AttrsetUnrelatedChange)
+{
+    // [PRECISION] obj unchanged, unrelated key changes → override correctly accepts.
+    TempJsonFile file(R"({"obj":{"a":1,"b":2},"extra":"x"})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in if j.obj == { a = 1; b = 2; } then "yes" else "no")";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("yes"));
+    }
+
+    file.modify(R"({"obj":{"a":1,"b":2},"extra":"changed!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // cache hit (obj unchanged)
+        EXPECT_THAT(v, IsStringEq("yes"));
+    }
+}
+
+// ── Gap B1: CompareValues (<) — no #len on lists ────────────────────
+
+TEST_F(TracedDataTest, TracedJSON_LessThan_ListLengthGrows)
+{
+    // [SOUNDNESS] Lexicographic list comparison accesses listSize() without recording #len.
+    // Cold: [1,2] < [1,2,3] → true (shorter list is "less").
+    // Hot: first list grows to [1,2,9], SC deps for [0] and [1] still pass.
+    // Without #len dep, override incorrectly accepts stale "true".
+    TempJsonFile file(R"({"arr":[1,2]})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in if builtins.lessThan j.arr [1 2 3] then "yes" else "no")";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("yes")); // [1,2] < [1,2,3]
+    }
+
+    // arr grows: [1,2] → [1,2,9] (different size for stat invalidation)
+    file.modify(R"({"arr":[1,2,9]})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // must re-evaluate (length changed)
+        EXPECT_THAT(v, IsStringEq("no")); // [1,2,9] < [1,2,3] is false
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_LessThan_ListUnrelatedChange)
+{
+    // [PRECISION] Same lengths, unrelated element changes → SC dep for element fails → re-eval.
+    TempJsonFile file(R"({"arr":[1,2],"extra":"short"})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in if builtins.lessThan j.arr [1 2 3] then "yes" else "no")";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("yes"));
+    }
+
+    // Only extra changes, arr stays same
+    file.modify(R"({"arr":[1,2],"extra":"changed!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // cache hit (arr unchanged)
+        EXPECT_THAT(v, IsStringEq("yes"));
+    }
+}
+
+// ── Gap B2: ExprOpUpdate (//) — no #keys on inputs ──────────────────
+
+TEST_F(TracedDataTest, TracedJSON_Update_TracedGainsKey)
+{
+    // [SOUNDNESS] // merges attrsets without recording #keys.
+    // Cold: base has {a:1}, overlay has {b:2} → result {a:1,b:2}.
+    // Hot: base gains key "b" with value 99, but SC dep for .a still passes.
+    // Without #keys dep, override incorrectly accepts stale {a:1,b:2}.
+    TempJsonFile file(R"({"base":{"a":1},"over":{"b":2}})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in (j.base // j.over).b)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(2)); // overlay's b wins
+    }
+
+    // base gains "b":99 — now base // over should still give over's b=2,
+    // but the key set of base changed
+    file.modify(R"({"base":{"a":1,"b":99},"over":{"b":2}})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // must re-evaluate (base key set changed)
+        EXPECT_THAT(v, IsIntEq(2)); // overlay still wins
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_Update_UnrelatedChange)
+{
+    // [PRECISION] base/over unchanged, unrelated key changes → cache hit.
+    TempJsonFile file(R"({"base":{"a":1},"over":{"b":2},"extra":"x"})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in (j.base // j.over).b)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(2));
+    }
+
+    file.modify(R"({"base":{"a":1},"over":{"b":2},"extra":"changed!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // cache hit
+        EXPECT_THAT(v, IsIntEq(2));
+    }
+}
+
+// ── Gap B3: callFunction strict formals — no #keys ──────────────────
+
+TEST_F(TracedDataTest, TracedJSON_StrictFormals_KeyAdded)
+{
+    // [SOUNDNESS] Strict formals check (no ...) compares attrsUsed != size()
+    // without recording #keys. Cold: {a:1} passed to ({a}: a) → 1.
+    // Hot: {a:1,b:2} — should throw "unexpected argument 'b'" but SC dep
+    // for .a still passes. Without #keys dep, override accepts stale result.
+    TempJsonFile file(R"({"obj":{"a":1}})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); f = {a}: a; in f j.obj)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(1));
+    }
+
+    // obj gains key "b" — strict formals should reject
+    file.modify(R"({"obj":{"a":1,"b":2}})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        EXPECT_THROW(forceRoot(*cache), nix::Error); // unexpected argument 'b'
+        EXPECT_EQ(loaderCalls, 1); // must re-evaluate (key set changed)
+    }
 }
 
 } // namespace nix::eval_trace
