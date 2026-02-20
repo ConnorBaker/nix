@@ -113,6 +113,27 @@ protected:
         TempTomlFile(const TempTomlFile &) = delete;
         TempTomlFile & operator=(const TempTomlFile &) = delete;
     };
+
+    struct TempTextFile {
+        std::filesystem::path path;
+        explicit TempTextFile(std::string_view content)
+        {
+            auto dir = std::filesystem::temp_directory_path() / "nix-test-eval-trace";
+            std::filesystem::create_directories(dir);
+            static int counter = 0;
+            path = dir / ("test-" + std::to_string(getpid()) + "-" + std::to_string(counter++) + ".txt");
+            std::ofstream ofs(path);
+            ofs << content;
+        }
+        void modify(std::string_view newContent)
+        {
+            std::ofstream ofs(path, std::ios::trunc);
+            ofs << newContent;
+        }
+        ~TempTextFile() { std::filesystem::remove(path); }
+        TempTextFile(const TempTextFile &) = delete;
+        TempTextFile & operator=(const TempTextFile &) = delete;
+    };
 };
 
 // ── JSON: Scalar access records StructuredContent dep ────────────────
@@ -4547,7 +4568,207 @@ TEST_F(TracedDataTest, TracedJSON_ListToAttrs_FullResultGrows)
     }
 }
 
-// ── Gap 4: Raw + parsed readFile from same file ─────────────────────
+// ── Gap 4: Positive tests for raw + parsed readFile scenarios ────────
+
+TEST_F(TracedDataTest, RawOnly_StringLength_ContentChanges)
+{
+    // Raw-only readFile correctly invalidates when content changes.
+    // No SC deps at all — Content dep failure forces re-evaluation.
+    TempJsonFile file(R"({"name":"foo","extra":"short"})");
+    auto expr = R"(let raw = builtins.readFile )" + file.path.string()
+        + R"(; in builtins.stringLength raw)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(30));
+    }
+
+    file.modify(R"({"name":"foo","extra":"longer!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // Content dep fails, no SC deps → must re-eval
+        EXPECT_THAT(v, IsIntEq(33));
+    }
+}
+
+TEST_F(TracedDataTest, RawOnly_Substring_ContentChanges)
+{
+    // Raw substring invalidates when content changes.
+    // No SC deps — Content dep failure forces re-evaluation.
+    TempJsonFile file(R"({"name":"foo"})");
+    auto expr = R"(let raw = builtins.readFile )" + file.path.string()
+        + R"(; in builtins.substring 0 10 raw)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq(R"({"name":"f)"));
+    }
+
+    file.modify(R"({"xame":"foo"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // Content dep fails, no SC override
+        EXPECT_THAT(v, IsStringEq(R"({"xame":"f)"));
+    }
+}
+
+TEST_F(TracedDataTest, RawOnly_StringLength_SameSizeChange)
+{
+    // Raw invalidates even when file size is unchanged.
+    // Tests that we hash content, not just stat metadata.
+    TempJsonFile file(R"({"a":"xxx"})");
+    auto expr = R"(let raw = builtins.readFile )" + file.path.string()
+        + R"(; in builtins.stringLength raw)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(11));
+    }
+
+    file.modify(R"({"a":"yyy"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // Content hash changes even though size is same
+        EXPECT_THAT(v, IsIntEq(11));
+    }
+}
+
+TEST_F(TracedDataTest, ParsedOnly_UnusedFieldChange_CacheHit)
+{
+    // Parsed-only path allows SC override when only unused fields change.
+    // Adjacent to Gap 4 to make the contrast with raw+parsed explicit.
+    TempJsonFile file(R"({"name":"foo","extra":"short"})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in j.name)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("foo"));
+    }
+
+    file.modify(R"({"name":"foo","extra":"longer!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // Content fails, SC dep on .name passes → override
+        EXPECT_THAT(v, IsStringEq("foo"));
+    }
+}
+
+TEST_F(TracedDataTest, RawAndParsed_DifferentFiles_RawFileChanges)
+{
+    // Raw + parsed from different files: SC deps from parsed file cannot cover
+    // raw file's Content dep failure.
+    TempTextFile file1("hello world");
+    TempJsonFile file2(R"({"name":"foo","extra":"short"})");
+    auto expr = R"(let raw = builtins.readFile )" + file1.path.string()
+        + R"(; j = builtins.fromJSON (builtins.readFile )" + file2.path.string()
+        + R"(); in toString (builtins.stringLength raw) + "-" + j.name)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        auto str = state.forceStringNoCtx(v, noPos, "");
+        EXPECT_EQ(std::string(str), "11-foo");
+    }
+
+    // Only modify the raw file
+    file1.modify("hello world!!");
+    invalidateFileCache(file1.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // file1 Content fails, no SC deps for file1 → re-eval
+        auto str = state.forceStringNoCtx(v, noPos, "");
+        EXPECT_EQ(std::string(str), "13-foo");
+    }
+}
+
+TEST_F(TracedDataTest, RawAndParsed_DifferentFiles_ParsedUnusedChange)
+{
+    // Raw + parsed from different files: SC override applies only to parsed file.
+    // Raw file unchanged → its Content dep passes. Parsed file's unused field
+    // changes → Content fails but SC dep on .name passes → override.
+    TempTextFile file1("hello world");
+    TempJsonFile file2(R"({"name":"foo","extra":"short"})");
+    auto expr = R"(let raw = builtins.readFile )" + file1.path.string()
+        + R"(; j = builtins.fromJSON (builtins.readFile )" + file2.path.string()
+        + R"(); in toString (builtins.stringLength raw) + "-" + j.name)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        auto str = state.forceStringNoCtx(v, noPos, "");
+        EXPECT_EQ(std::string(str), "11-foo");
+    }
+
+    // Only modify parsed file's unused field
+    file2.modify(R"({"name":"foo","extra":"longer!!"})");
+    invalidateFileCache(file2.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // file1 passes, file2 SC override → cache hit
+        auto str = state.forceStringNoCtx(v, noPos, "");
+        EXPECT_EQ(std::string(str), "11-foo");
+    }
+}
+
+TEST_F(TracedDataTest, RawAndParsed_SameFile_AccessedFieldChanges)
+{
+    // Same file, raw + parsed: correctly re-evals when SC dep also fails.
+    // Content dep fails AND SC dep on .name fails → override rejected → re-eval.
+    // Contrasts with the DISABLED Gap 4 test where only an unused field changes.
+    TempJsonFile file(R"({"name":"foo","extra":"short"})");
+    auto expr = R"(let raw = builtins.readFile )" + file.path.string()
+        + R"(; j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in toString (builtins.stringLength raw) + "-" + j.name)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        auto str = state.forceStringNoCtx(v, noPos, "");
+        EXPECT_TRUE(std::string(str).find("-foo") != std::string::npos);
+    }
+
+    // Change the accessed field (.name)
+    file.modify(R"({"name":"bar","extra":"short"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // Content fails, SC dep on .name ALSO fails → re-eval
+        auto str = state.forceStringNoCtx(v, noPos, "");
+        EXPECT_TRUE(std::string(str).find("-bar") != std::string::npos);
+    }
+}
+
+// ── Gap 4: Raw + parsed readFile from same file (KNOWN BUG) ─────────
 
 TEST_F(TracedDataTest, DISABLED_TracedJSON_RawAndParsedReadFile_ContentChanges)
 {
