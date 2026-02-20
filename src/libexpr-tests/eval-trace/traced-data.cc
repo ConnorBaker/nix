@@ -4108,4 +4108,170 @@ TEST_F(TracedDataTest, TracedJSON_ToXML_KeyAdded)
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Standalone StructuredContent dep tests (cross-trace dep separation)
+// ═══════════════════════════════════════════════════════════════════════
+// These tests verify that SC deps for files WITHOUT a corresponding
+// Content/Directory dep in the same trace are correctly verified.
+// This arises when a parent trace calls readFile+fromJSON (Content dep
+// in parent), and a child trace forces thunks from the result (SC deps
+// in child, but NO Content dep). The child's standalone SC deps must
+// be checked even when no coarse dep fails in the child trace.
+
+TEST_F(TracedDataTest, TracedJSON_StandaloneStructuralDep_CacheMiss)
+{
+    // Child trace has SC dep for .name but no Content dep for the file.
+    // When .name changes, the standalone SC dep must fail → cache miss.
+    TempJsonFile f(R"({"name":"foo","marker":"ok"})");
+
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + f.path.string()
+        + R"(); in builtins.seq j.marker { x = j.name; })";
+
+    // Cold run: record root + child traces
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * xAttr = root.attrs()->get(state.symbols.create("x"));
+        ASSERT_NE(xAttr, nullptr);
+        state.forceValue(*xAttr->value, noPos);
+        EXPECT_THAT(*xAttr->value, IsStringEq("foo"));
+    }
+
+    // Modify: change .name, keep .marker unchanged
+    f.modify(R"({"name":"changed","marker":"ok"})");
+    invalidateFileCache(f.path);
+
+    // Hot run: standalone SC dep for .name in child must fail
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * xAttr = root.attrs()->get(state.symbols.create("x"));
+        ASSERT_NE(xAttr, nullptr);
+        state.forceValue(*xAttr->value, noPos);
+
+        auto xStr = state.forceStringNoCtx(*xAttr->value, noPos, "");
+        EXPECT_EQ(std::string(xStr), "changed");
+    }
+    EXPECT_EQ(loaderCalls, 1);
+}
+
+TEST_F(TracedDataTest, TracedJSON_StandaloneStructuralDep_CacheHit)
+{
+    // Child trace has SC dep for .name (standalone). When an unrelated
+    // field changes, root's override accepts (marker SC passes) and
+    // child's standalone SC dep for .name also passes → cache hit.
+    TempJsonFile f(R"({"name":"foo","marker":"ok","extra":"bar"})");
+
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + f.path.string()
+        + R"(); in builtins.seq j.marker { x = j.name; })";
+
+    // Cold run
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * xAttr = root.attrs()->get(state.symbols.create("x"));
+        ASSERT_NE(xAttr, nullptr);
+        state.forceValue(*xAttr->value, noPos);
+        EXPECT_THAT(*xAttr->value, IsStringEq("foo"));
+    }
+
+    // Modify: change unrelated field, keep .name and .marker
+    f.modify(R"({"name":"foo","marker":"ok","extra":"changed"})");
+    invalidateFileCache(f.path);
+
+    // Hot run: everything should be served from cache
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * xAttr = root.attrs()->get(state.symbols.create("x"));
+        ASSERT_NE(xAttr, nullptr);
+        state.forceValue(*xAttr->value, noPos);
+
+        auto xStr = state.forceStringNoCtx(*xAttr->value, noPos, "");
+        EXPECT_EQ(std::string(xStr), "foo");
+    }
+    EXPECT_EQ(loaderCalls, 0);
+}
+
+TEST_F(TracedDataTest, TracedJSON_StandaloneStructuralDep_MarkerChanges)
+{
+    // When the root's SC dep (.marker) fails, the root is re-evaluated
+    // (override rejected). This changes the root's trace hash, so the
+    // child's ParentContext dep fails → child also re-evaluated.
+    // Confirms existing ParentContext cascade behavior.
+    TempJsonFile f(R"({"name":"foo","marker":"ok"})");
+
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + f.path.string()
+        + R"(); in builtins.seq j.marker { x = j.name; })";
+
+    // Cold run
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * xAttr = root.attrs()->get(state.symbols.create("x"));
+        ASSERT_NE(xAttr, nullptr);
+        state.forceValue(*xAttr->value, noPos);
+        EXPECT_THAT(*xAttr->value, IsStringEq("foo"));
+    }
+
+    // Modify: change .marker, keep .name
+    f.modify(R"({"name":"foo","marker":"changed"})");
+    invalidateFileCache(f.path);
+
+    // Hot run: root's SC dep for .marker fails → root re-evaluated →
+    // child's ParentContext dep fails → child re-evaluated
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * xAttr = root.attrs()->get(state.symbols.create("x"));
+        ASSERT_NE(xAttr, nullptr);
+        state.forceValue(*xAttr->value, noPos);
+
+        auto xStr = state.forceStringNoCtx(*xAttr->value, noPos, "");
+        EXPECT_EQ(std::string(xStr), "foo");
+    }
+    EXPECT_EQ(loaderCalls, 1);
+}
+
+TEST_F(TracedDataTest, TracedTOML_StandaloneStructuralDep_CacheMiss)
+{
+    // Same as TracedJSON_StandaloneStructuralDep_CacheMiss but with TOML.
+    // Confirms the fix is format-agnostic.
+    TempTomlFile f("[data]\nname = \"foo\"\nmarker = \"ok\"\n");
+
+    auto expr = R"(let t = builtins.fromTOML (builtins.readFile )" + f.path.string()
+        + R"(); in builtins.seq t.data.marker { x = t.data.name; })";
+
+    // Cold run
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * xAttr = root.attrs()->get(state.symbols.create("x"));
+        ASSERT_NE(xAttr, nullptr);
+        state.forceValue(*xAttr->value, noPos);
+        EXPECT_THAT(*xAttr->value, IsStringEq("foo"));
+    }
+
+    // Modify: change name, keep marker
+    f.modify("[data]\nname = \"changed\"\nmarker = \"ok\"\n");
+    invalidateFileCache(f.path);
+
+    // Hot run: standalone SC dep for data.name must fail
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * xAttr = root.attrs()->get(state.symbols.create("x"));
+        ASSERT_NE(xAttr, nullptr);
+        state.forceValue(*xAttr->value, noPos);
+
+        auto xStr = state.forceStringNoCtx(*xAttr->value, noPos, "");
+        EXPECT_EQ(std::string(xStr), "changed");
+    }
+    EXPECT_EQ(loaderCalls, 1);
+}
+
 } // namespace nix::eval_trace
