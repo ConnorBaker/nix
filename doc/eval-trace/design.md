@@ -732,12 +732,17 @@ SQLite reads and hash computations within a single evaluation session:
 - **`verifiedTraceIds`** (`std::unordered_set<TraceId>`): Traces whose dep
   entries have been individually verified (BSàlC VT check passed). Shared across
   attributes with the same trace.
-- **`traceCache`** (`std::unordered_map<TraceId, std::vector<Dep>>`): Loaded
-  trace entries. Caches deserialized deps from DepKeySets + Traces JOINs to
-  avoid redundant DB reads.
-- **`traceStructHashCache`** (`std::unordered_map<TraceId, Hash>`): Structural
-  hash per trace, for recovery short-circuit (skip struct_hash groups already
-  tried by direct hash recovery).
+- **`traceDataCache`** (`std::unordered_map<TraceId, CachedTraceData>`): Unified
+  per-trace cache. Each `CachedTraceData` holds `traceHash`, `structHash`
+  (populated eagerly from a single `getTraceInfo` query), and an optional
+  `deps` vector (populated lazily by `loadFullTrace`). The structural hash
+  enables recovery short-circuit (skip struct_hash groups already tried by
+  direct hash recovery). `hashesPopulated()` detects placeholder (all-zero)
+  sentinel state.
+- **`traceRowCache`** (`std::unordered_map<std::string, TraceRow>`): Caches
+  `lookupTraceRow` results (attrPath → CurrentTraces row). Invalidated when
+  CurrentTraces changes for a path (in recovery and record). Makes
+  `getCurrentTraceHash()` fully cached after first call per attr path.
 - **`depKeySetCache`** (`std::unordered_map<DepKeySetId, std::vector<InternedDepKey>>`):
   Resolved dep key sets. Avoids re-decompressing keys_blob when multiple traces
   share a key set.
@@ -829,20 +834,24 @@ key advantage of a constructive trace (BSàlC CT) over a verifying trace (VT):
 the CT stores full results, enabling recovery without re-evaluation.
 
 ```
+Pre-load: single widened scan query                                [O(1)]
+  scanHistoryForAttr JOINs TraceHistory→Traces→DepKeySets→Results
+  Pre-loads trace_hash + result data for ALL history entries
+  Builds in-memory trace_hash → entry map for O(1) candidate matching
+
 Direct hash recovery                                               [O(1)]
   Recompute current dep hashes from old trace's dep keys
   Compute trace_hash from current dep hashes (own deps only)
-  Point lookup in Traces table by trace_hash → candidate trace
+  In-memory lookup by trace_hash → candidate entry (pre-loaded)
   Accept candidate (hash match proves validity) → update CurrentTraces and serve
 
 Structural variant recovery (novel, beyond BSàlC)                 [O(V)]
-  Scan TraceHistory for same (context_hash, attr_path_id)
-  Group by struct_hash — returns representative traces for each unique
-  dep KEY structure (types + sources + keys, without hash values)
+  Group pre-loaded history entries by dep_key_set_id
   Skip struct_hash groups already tried by direct hash recovery
     (short-circuit: same dep structure would produce the same trace_hash)
-  For each remaining representative: load its deps, recompute current hashes
-    Retry direct hash lookup with recomputed hashes
+  For each remaining group: load dep KEY SET (no values_blob decompression),
+    recompute current hashes, compute candidate trace_hash
+    In-memory lookup by candidate trace_hash → candidate entry
   Handles dep structure instability (dynamic deps — different deps across
   fresh evaluations depending on evaluation order, per Shake)
 ```

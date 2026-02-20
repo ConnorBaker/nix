@@ -784,13 +784,19 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
         "SELECT result_id FROM TraceHistory "
         "WHERE context_hash = ? AND attr_path_id = ? AND trace_id = ?");
 
-    // scanHistoryForAttr: JOIN through Traces→DepKeySets to get dep_key_set_id
-    // and struct_hash for structural variant recovery grouping.
+    // scanHistoryForAttr: JOIN through Traces→DepKeySets→Results to pre-load
+    // all data needed for recovery in a single query. Columns:
+    //   0=dk.id, 1=dk.struct_hash, 2=h.trace_id, 3=h.result_id,
+    //   4=t.trace_hash, 5=r.type, 6=r.value, 7=r.context
+    // The trace_hash enables in-memory candidate matching (no per-group DB lookup).
+    // The result data eliminates getResult calls in acceptRecoveredTrace.
     st->scanHistoryForAttr.create(st->db,
-        "SELECT dk.id, dk.struct_hash, h.trace_id, h.result_id "
+        "SELECT dk.id, dk.struct_hash, h.trace_id, h.result_id, "
+        "       t.trace_hash, r.type, r.value, r.context "
         "FROM TraceHistory h "
         "JOIN Traces t ON h.trace_id = t.id "
         "JOIN DepKeySets dk ON t.dep_key_set_id = dk.id "
+        "JOIN Results r ON h.result_id = r.id "
         "WHERE h.context_hash = ? AND h.attr_path_id = ?");
 
     // StatHashCache
@@ -891,8 +897,8 @@ void TraceStore::clearSessionCaches()
     verifiedTraceIds.clear();
     internedStrings.clear();
     internedAttrPaths.clear();
-    traceCache.clear();
-    traceStructHashCache.clear();
+    traceDataCache.clear();
+    traceRowCache.clear();
     depKeySetCache.clear();
     stringTable.clear();
     stringTableLoaded = false;
@@ -1082,28 +1088,46 @@ ResultId TraceStore::doInternResult(ResultKind type, const std::string & value,
 // ── Trace storage (BSàlC trace store) ───────────────────────────────
 
 
-Hash TraceStore::getTraceStructHash(TraceId traceId)
+TraceStore::CachedTraceData * TraceStore::ensureTraceHashes(TraceId traceId)
 {
-    auto cacheIt = traceStructHashCache.find(traceId);
-    if (cacheIt != traceStructHashCache.end())
-        return cacheIt->second;
+    auto it = traceDataCache.find(traceId);
+    if (it != traceDataCache.end())
+        return &it->second;
 
     auto st(_state->lock());
     // getTraceInfo columns: 0=trace_hash, 1=struct_hash, 2=dep_key_set_id, 3=keys_blob, 4=values_blob
     auto use(st->getTraceInfo.use()(traceId));
     if (!use.next())
+        return nullptr;
+
+    CachedTraceData data;
+    auto [thData, thSize] = use.getBlob(0);
+    data.traceHash = readRawHash(thData, thSize);
+    auto [shData, shSize] = use.getBlob(1);
+    data.structHash = readRawHash(shData, shSize);
+    // deps left as nullopt (populated lazily by loadFullTrace)
+
+    // Sanity: DB should never contain all-zero hashes (placeholder sentinel).
+    assert(data.hashesPopulated() && "deserialized trace has placeholder (all-zero) hashes");
+
+    auto [insertIt, _] = traceDataCache.emplace(traceId, std::move(data));
+    return &insertIt->second;
+}
+
+Hash TraceStore::getTraceStructHash(TraceId traceId)
+{
+    auto * data = ensureTraceHashes(traceId);
+    if (!data)
         throw Error("trace %d not found", traceId);
-    auto [blobData, blobSize] = use.getBlob(1);  // column 1 = struct_hash (from DepKeySets)
-    auto h = readRawHash(blobData, blobSize);
-    traceStructHashCache.insert_or_assign(traceId, h);
-    return h;
+    return data->structHash;
 }
 
 std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
 {
-    auto cacheIt = traceCache.find(traceId);
-    if (cacheIt != traceCache.end())
-        return cacheIt->second;
+    // Check if deps already cached in unified traceDataCache
+    auto it = traceDataCache.find(traceId);
+    if (it != traceDataCache.end() && it->second.deps)
+        return *it->second.deps;
 
     auto loadStart = timerStart();
     nrLoadTraces++;
@@ -1112,31 +1136,46 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
     // getTraceInfo columns: 0=trace_hash, 1=struct_hash, 2=dep_key_set_id, 3=keys_blob, 4=values_blob
     std::vector<uint8_t> keysBlobCopy, valuesBlobCopy;
     DepKeySetId depKeySetId = 0;
+    Hash traceHash(HashAlgorithm::BLAKE3), structHash(HashAlgorithm::BLAKE3);
     {
         auto st(_state->lock());
         auto use(st->getTraceInfo.use()(traceId));
         if (!use.next()) {
-            traceCache[traceId] = {};
+            // Trace not found in DB — don't create a cache entry with
+            // placeholder hashes, as ensureTraceHashes would incorrectly
+            // return them as valid.
             nrLoadTraceTimeUs += elapsedUs(loadStart);
             return {};
         }
-        depKeySetId = use.getInt(2);  // column 2 = dep_key_set_id
 
-        auto [keysData, keysSize] = use.getBlob(3);  // column 3 = keys_blob
+        // Opportunistically populate hash fields from the same query
+        auto [thData, thSize] = use.getBlob(0);
+        traceHash = readRawHash(thData, thSize);
+        auto [shData, shSize] = use.getBlob(1);
+        structHash = readRawHash(shData, shSize);
+        depKeySetId = use.getInt(2);
+
+        auto [keysData, keysSize] = use.getBlob(3);
         if (keysData && keysSize > 0) {
             auto * p = static_cast<const uint8_t *>(keysData);
             keysBlobCopy.assign(p, p + keysSize);
         }
 
-        auto [valsData, valsSize] = use.getBlob(4);  // column 4 = values_blob
+        auto [valsData, valsSize] = use.getBlob(4);
         if (valsData && valsSize > 0) {
             auto * p = static_cast<const uint8_t *>(valsData);
             valuesBlobCopy.assign(p, p + valsSize);
         }
     }
 
+    // Update hash fields in cache (may already exist from ensureTraceHashes)
+    auto & data = traceDataCache[traceId];
+    data.traceHash = traceHash;
+    data.structHash = structHash;
+    assert(data.hashesPopulated() && "DB returned placeholder (all-zero) hashes in loadFullTrace");
+
     if (keysBlobCopy.empty()) {
-        traceCache[traceId] = {};
+        data.deps = {};
         nrLoadTraceTimeUs += elapsedUs(loadStart);
         return {};
     }
@@ -1149,7 +1188,7 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
     // Also populate the dep key set cache for potential recovery use
     depKeySetCache.insert_or_assign(depKeySetId, keys);
 
-    traceCache[traceId] = result;
+    data.deps = result;
     nrLoadTraceTimeUs += elapsedUs(loadStart);
     return result;
 }
@@ -1370,15 +1409,22 @@ bool TraceStore::verifyTrace(
 
 std::optional<TraceStore::TraceRow> TraceStore::lookupTraceRow(std::string_view attrPath)
 {
-    // Resolve attr_path_id (lookup only, no insert)
     auto pathKey = std::string(attrPath);
-    auto cacheIt = internedAttrPaths.find(pathKey);
+
+    // Check traceRowCache first (populated on previous lookups, invalidated on
+    // CurrentTraces changes in acceptRecoveredTrace and record).
+    auto rowCacheIt = traceRowCache.find(pathKey);
+    if (rowCacheIt != traceRowCache.end())
+        return rowCacheIt->second;
+
+    // Resolve attr_path_id (lookup only, no insert)
+    auto apCacheIt = internedAttrPaths.find(pathKey);
 
     auto st(_state->lock());
 
     AttrPathId attrPathId;
-    if (cacheIt != internedAttrPaths.end()) {
-        attrPathId = cacheIt->second;
+    if (apCacheIt != internedAttrPaths.end()) {
+        attrPathId = apCacheIt->second;
     } else {
         auto use(st->lookupAttrPathId.use()
             (reinterpret_cast<const unsigned char *>(attrPath.data()), attrPath.size()));
@@ -1398,6 +1444,8 @@ std::optional<TraceStore::TraceRow> TraceStore::lookupTraceRow(std::string_view 
     row.type = static_cast<ResultKind>(use.getInt(2));
     row.value = use.isNull(3) ? "" : use.getStr(3);
     row.context = use.isNull(4) ? "" : use.getStr(4);
+
+    traceRowCache[pathKey] = row;
     return row;
 }
 
@@ -1412,18 +1460,15 @@ std::optional<Hash> TraceStore::getCurrentTraceHash(std::string_view attrPath)
     // truncates at \0), but lookupTraceRow needs \0-separated AttrPaths.
     std::string path(attrPath);
     std::replace(path.begin(), path.end(), '\t', '\0');
-    auto row = lookupTraceRow(path);
+    auto row = lookupTraceRow(path);  // hits traceRowCache after first call
     if (!row) return std::nullopt;
 
     // Return trace_hash (captures dep structure + hashes), not result hash.
     // Result hash for attrsets only captures attribute names, not values —
     // it wouldn't detect changes to attribute values within an attrset.
-    // getTraceInfo columns: 0=trace_hash, 1=struct_hash, 2=dep_key_set_id, 3=keys_blob, 4=values_blob
-    auto st(_state->lock());
-    auto use(st->getTraceInfo.use()(row->traceId));
-    if (!use.next()) return std::nullopt;
-    auto [hashData, hashSize] = use.getBlob(0);  // column 0 = trace_hash
-    return readRawHash(hashData, hashSize);
+    auto * data = ensureTraceHashes(row->traceId);  // hits traceDataCache after first call
+    if (!data) return std::nullopt;
+    return data->traceHash;
 }
 
 // ── Record path (BSàlC constructive trace recording) ─────────────────
@@ -1485,9 +1530,18 @@ TraceStore::RecordResult TraceStore::record(
     if (!hasVolatile)
         verifiedTraceIds.insert(traceId);
 
-    traceStructHashCache.insert_or_assign(traceId, structHash);
+    {
+        auto & data = traceDataCache[traceId];
+        data.traceHash = traceHash;
+        data.structHash = structHash;
+        data.deps = sortedDeps;
+        assert(data.hashesPopulated() && "recording trace with placeholder (all-zero) hashes");
+    }
     depKeySetCache.insert_or_assign(depKeySetId, keys);
-    traceCache[traceId] = sortedDeps;
+
+    // Update traceRowCache so subsequent lookupTraceRow/getCurrentTraceHash
+    // calls for this attr path don't go to DB.
+    traceRowCache[std::string(attrPath)] = TraceRow{traceId, resultId, type, val, ctx};
 
     nrRecordTimeUs += elapsedUs(recordStart);
     return RecordResult{traceId};
@@ -1618,70 +1672,105 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
     std::unordered_set<TraceId> triedTraceIds;
 
-    // Accept a candidate trace found by trace_hash lookup. The hash match
-    // proves all deps match current state (probability of false match: 2^-256),
-    // so no dep-by-dep verifyTrace call is needed.
-    auto acceptRecoveredTrace = [&](TraceId candidateTraceId) -> std::optional<VerifyResult> {
-        if (triedTraceIds.count(candidateTraceId))
-            return std::nullopt;
-        triedTraceIds.insert(candidateTraceId);
-
-        // Look up in History
+    // === Pre-load: scan history with widened query ===
+    // Single DB query pre-loads trace_hash + result data for ALL history entries.
+    // This enables in-memory candidate matching for both directHash and structural
+    // variant recovery, eliminating per-group lookupTraceByFullHash DB calls and
+    // per-candidate getResult DB calls.
+    struct HistoryEntry {
+        DepKeySetId depKeySetId;
+        Hash structHash;
+        TraceId traceId;
         ResultId resultId;
-        {
-            auto st(_state->lock());
-            auto use(st->lookupHistoryByTrace.use()
-                (contextHash)(*attrPathId)(candidateTraceId));
-            if (!use.next())
-                return std::nullopt;
-            resultId = use.getInt(0);
-        }
+        Hash traceHash;
+        ResultKind type;
+        std::string value;
+        std::string context;
 
-        // Get result
-        TraceRow recRow;
-        {
-            auto st(_state->lock());
-            auto use(st->getResult.use()(resultId));
-            if (!use.next())
-                return std::nullopt;
-            recRow.traceId = candidateTraceId;
-            recRow.resultId = resultId;
-            recRow.type = static_cast<ResultKind>(use.getInt(0));
-            recRow.value = use.isNull(1) ? "" : use.getStr(1);
-            recRow.context = use.isNull(2) ? "" : use.getStr(2);
+        HistoryEntry(DepKeySetId dksId, Hash sh, TraceId tid, ResultId rid,
+                     Hash th, ResultKind t, std::string v, std::string c)
+            : depKeySetId(dksId), structHash(std::move(sh)), traceId(tid), resultId(rid),
+              traceHash(std::move(th)), type(t), value(std::move(v)), context(std::move(c)) {}
+    };
+    std::vector<HistoryEntry> historyEntries;
+    {
+        auto st(_state->lock());
+        // scanHistoryForAttr columns: 0=dk.id, 1=dk.struct_hash, 2=h.trace_id,
+        //   3=h.result_id, 4=t.trace_hash, 5=r.type, 6=r.value, 7=r.context
+        auto use(st->scanHistoryForAttr.use()(contextHash)(*attrPathId));
+        while (use.next()) {
+            auto [shData, shSize] = use.getBlob(1);
+            auto [thData, thSize] = use.getBlob(4);
+            historyEntries.emplace_back(
+                use.getInt(0),
+                readRawHash(shData, shSize),
+                use.getInt(2),
+                use.getInt(3),
+                readRawHash(thData, thSize),
+                static_cast<ResultKind>(use.getInt(5)),
+                use.isNull(6) ? "" : use.getStr(6),
+                use.isNull(7) ? "" : use.getStr(7)
+            );
         }
+    }
 
-        // Update CurrentTraces to point to recovered trace + result
+    // Build in-memory trace_hash → entry index lookup.
+    // Key: raw 32-byte hash as std::string (efficient hashing, no custom hasher needed).
+    // trace_hash is UNIQUE in the Traces table, so each hash maps to at most one entry.
+    // When duplicates exist in history (same trace_id appearing multiple times), the
+    // first entry wins via emplace — all duplicates have the same result data.
+    std::unordered_map<std::string, size_t> traceHashToEntry;
+    for (size_t i = 0; i < historyEntries.size(); i++) {
+        auto & e = historyEntries[i];
+        std::string hashKey(reinterpret_cast<const char *>(e.traceHash.hash), e.traceHash.hashSize);
+        traceHashToEntry.emplace(hashKey, i);
+    }
+
+    // Look up a candidate trace_hash in the pre-loaded in-memory map.
+    // Returns null if no history entry has this hash (the trace either doesn't
+    // exist or exists for a different attr path — either way, not recoverable).
+    auto lookupCandidate = [&](const Hash & candidateHash) -> const HistoryEntry * {
+        std::string hashKey(reinterpret_cast<const char *>(candidateHash.hash), candidateHash.hashSize);
+        auto it = traceHashToEntry.find(hashKey);
+        if (it == traceHashToEntry.end()) return nullptr;
+        return &historyEntries[it->second];
+    };
+
+    // Accept a candidate found via in-memory trace_hash matching. The hash match
+    // proves all deps match current state (collision probability: 2^-256),
+    // so no dep-by-dep verifyTrace call is needed.
+    // Result data is pre-loaded from the widened scan — only upsertAttr needs DB.
+    auto acceptRecoveredTrace = [&](const HistoryEntry & entry) -> std::optional<VerifyResult> {
+        if (triedTraceIds.count(entry.traceId))
+            return std::nullopt;
+        triedTraceIds.insert(entry.traceId);
+
+        // Update CurrentTraces to point to recovered trace + result (only remaining DB call)
         {
             auto st(_state->lock());
             st->upsertAttr.use()
-                (contextHash)(*attrPathId)(candidateTraceId)(resultId).exec();
+                (contextHash)(*attrPathId)(entry.traceId)(entry.resultId).exec();
         }
 
+        // Update traceRowCache so subsequent lookupTraceRow/getCurrentTraceHash
+        // calls for this attr path reflect the recovered state.
+        TraceRow newRow{entry.traceId, entry.resultId, entry.type, entry.value, entry.context};
+        traceRowCache[pathKey] = newRow;
+
         // Hash match guarantees all deps match current state
-        verifiedTraceIds.insert(candidateTraceId);
-        return VerifyResult{decodeCachedResult(recRow), candidateTraceId};
+        verifiedTraceIds.insert(entry.traceId);
+        return VerifyResult{decodeCachedResult(newRow), entry.traceId};
     };
 
     // === Direct hash recovery (BSàlC CT) ===
-    // Recompute trace_hash from current dep hashes. O(1) lookup.
+    // Recompute trace_hash from current dep hashes. In-memory lookup.
     if (allComputable) {
         auto directHashStart = timerStart();
         auto sortedCurrentDeps = sortAndDedupDeps(currentDeps);
         auto newFullHash = computeTraceHashFromSorted(sortedCurrentDeps);
 
-        // Look up Traces by trace_hash
-        std::optional<TraceId> newTraceId;
-        {
-            auto st(_state->lock());
-            auto use(st->lookupTraceByFullHash.use());
-            bindRawHash(use, newFullHash);
-            if (use.next())
-                newTraceId = use.getInt(0);
-        }
-
-        if (newTraceId) {
-            if (auto r = acceptRecoveredTrace(*newTraceId)) {
+        if (auto * entry = lookupCandidate(newFullHash)) {
+            if (auto r = acceptRecoveredTrace(*entry)) {
                 debug("recovery: direct hash recovery succeeded for '%s'", displayAttrPath(attrPath));
                 nrRecoveryDirectHashHits++;
                 nrRecoveryDirectHashTimeUs += elapsedUs(directHashStart);
@@ -1701,33 +1790,11 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
     // === Structural variant recovery (novel extension beyond BSàlC) ===
     // Handles dynamic dep instability (Shake-style): the same attribute can have
-    // different dep structures across evaluations. Scans TraceHistory for entries
-    // with the same attr, groups by dep_key_set_id (integer, more efficient than
-    // grouping by 32-byte struct_hash), loads key set once per group, recomputes
-    // current hashes, retries direct hash lookup. O(V) where V = number of
+    // different dep structures across evaluations. Groups history entries by
+    // dep_key_set_id, loads key set once per group, recomputes current hashes,
+    // and matches against in-memory trace_hash map. O(V) where V = number of
     // distinct dep structures. Zero values_blob decompression needed.
     auto structVariantStart = timerStart();
-    struct HistoryEntry {
-        DepKeySetId depKeySetId;
-        Hash structHash;
-        TraceId traceId;
-        ResultId resultId;
-    };
-    std::vector<HistoryEntry> historyEntries;
-    {
-        auto st(_state->lock());
-        // scanHistoryForAttr columns: 0=dk.id, 1=dk.struct_hash, 2=h.trace_id, 3=h.result_id
-        auto use(st->scanHistoryForAttr.use()(contextHash)(*attrPathId));
-        while (use.next()) {
-            auto [blobData, blobSize] = use.getBlob(1);
-            historyEntries.push_back(HistoryEntry{
-                use.getInt(0),
-                readRawHash(blobData, blobSize),
-                use.getInt(2),
-                use.getInt(3)
-            });
-        }
-    }
 
     debug("recovery: structural variant scan for '%s' -- scanning %d history entries",
           displayAttrPath(attrPath), historyEntries.size());
@@ -1735,8 +1802,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     // Group by dep_key_set_id (integer), pick one representative per group.
     // Using dep_key_set_id instead of struct_hash for grouping is more efficient
     // (integer comparison vs 32-byte hash comparison).
-    std::unordered_map<DepKeySetId, TraceId> structGroups; // dep_key_set_id -> representative trace_id
-    // Also collect struct_hash per group for the direct-hash short-circuit
+    std::unordered_map<DepKeySetId, TraceId> structGroups;
     std::unordered_map<DepKeySetId, Hash> groupStructHashes;
     for (auto & e : historyEntries) {
         if (triedTraceIds.count(e.traceId))
@@ -1754,10 +1820,8 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             && structHashIt->second == *directHashStructHash)
             continue;
 
-        // Phase D optimization: load only the dep key set (no values_blob decompression).
-        // The key set is session-cached, so subsequent traces with the same dep structure
-        // hit the cache. We then resolve keys to full Dep objects (with string lookups)
-        // and look up current hashes from currentDepHashes (pre-computed in verify step).
+        // Load only the dep key set (no values_blob decompression).
+        // Session-cached: subsequent traces with the same dep structure hit the cache.
         auto repKeys = loadKeySet(depKeySetId);
         ensureStringTableLoaded();
 
@@ -1779,6 +1843,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             std::string depKey = keyIt != stringTable.end() ? keyIt->second : "";
 
             // ParentContext: compute current parent trace hash directly
+            // (now cached via traceRowCache + traceDataCache)
             if (depKind(type) == DepKind::ParentContext) {
                 auto parentTraceHash = getCurrentTraceHash(depKey);
                 if (!parentTraceHash) { repComputable = false; break; }
@@ -1815,18 +1880,9 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         auto sortedRepDeps = sortAndDedupDeps(repCurrentDeps);
         auto candidateFullHash = computeTraceHashFromSorted(sortedRepDeps);
 
-        // Look up Traces by candidate trace_hash
-        std::optional<TraceId> candidateTraceId;
-        {
-            auto st(_state->lock());
-            auto use(st->lookupTraceByFullHash.use());
-            bindRawHash(use, candidateFullHash);
-            if (use.next())
-                candidateTraceId = use.getInt(0);
-        }
-
-        if (candidateTraceId) {
-            if (auto r = acceptRecoveredTrace(*candidateTraceId)) {
+        // In-memory lookup instead of per-group DB query
+        if (auto * entry = lookupCandidate(candidateFullHash)) {
+            if (auto r = acceptRecoveredTrace(*entry)) {
                 debug("recovery: structural variant recovery succeeded for '%s'", displayAttrPath(attrPath));
                 nrRecoveryStructVariantHits++;
                 nrRecoveryStructVariantTimeUs += elapsedUs(structVariantStart);

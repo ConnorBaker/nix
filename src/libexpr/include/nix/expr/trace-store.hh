@@ -34,7 +34,7 @@ using DepKeySetId = int64_t;
 
 /** SQLite-backed trace store for the eval trace system.
  *  Not thread-safe: must be used from a single thread. The session caches
- *  (verifiedTraceIds, internedStrings, traceCache, currentDepHashes, etc.)
+ *  (verifiedTraceIds, traceDataCache, traceRowCache, currentDepHashes, etc.)
  *  are plain containers without synchronization. Only the SQLite connection
  *  (_state) uses Sync<> for locking. */
 struct TraceStore {
@@ -106,14 +106,41 @@ struct TraceStore {
         std::string context;
     };
 
-    // Session caches — unordered because we only need O(1) lookup by key,
+    // Per-trace session cache: hash fields populated lazily (by ensureTraceHashes,
+    // loadFullTrace), deps populated on demand by loadFullTrace only.
+    // Default-constructed entries have placeholder all-zero hashes (overwritten
+    // before use). The hashesPopulated() check detects this sentinel state —
+    // all-zero is never a valid BLAKE3 output (even BLAKE3("") is non-zero).
+    struct CachedTraceData {
+        Hash traceHash{HashAlgorithm::BLAKE3};
+        Hash structHash{HashAlgorithm::BLAKE3};
+        std::optional<std::vector<Dep>> deps;
+
+        /** True if hash fields have been populated from DB (non-placeholder). */
+        bool hashesPopulated() const {
+            // Check traceHash — if it's populated, structHash was populated
+            // at the same time (both are set together in ensureTraceHashes/loadFullTrace).
+            for (size_t i = 0; i < traceHash.hashSize; i++)
+                if (traceHash.hash[i] != 0) return true;
+            return false;
+        }
+    };
+
+    // Session caches — all unordered because we only need O(1) lookup by key,
     // not iteration in any particular order.
     std::unordered_set<TraceId> verifiedTraceIds;
     std::unordered_map<std::string, StringId> internedStrings;
     std::unordered_map<std::string, AttrPathId> internedAttrPaths;
-    std::unordered_map<TraceId, std::vector<Dep>> traceCache;
-    // Structural hash (dep shape without values) per trace, for recovery short-circuit.
-    std::unordered_map<TraceId, Hash> traceStructHashCache;
+
+    // Unified per-trace cache, replacing the old separate traceCache and
+    // traceStructHashCache. Keyed by TraceId (DB rowid) — unique per trace.
+    std::unordered_map<TraceId, CachedTraceData> traceDataCache;
+
+    // lookupTraceRow cache: attrPath (canonical \0-separated) → TraceRow.
+    // std::string correctly handles embedded \0 bytes in both hashing and comparison.
+    // Avoids repeated CurrentTraces DB lookups for the same attr path.
+    // Invalidated when CurrentTraces changes for a path (in recovery and record).
+    std::unordered_map<std::string, TraceRow> traceRowCache;
 
     // DepKeySet session cache: maps DepKeySetId → resolved dep keys.
     // Keyed by integer ID (not hash) because we look up by ID after DB queries.
@@ -218,7 +245,7 @@ struct TraceStore {
      *
      * Returns InternedDepKey entries (type + string IDs). Session-cached:
      * subsequent calls for the same depKeySetId return from depKeySetCache.
-     * Used by structural variant recovery (Phase D) to avoid decompressing
+     * Used by structural variant recovery to avoid decompressing
      * values_blob when only dep keys are needed for hash recomputation.
      */
     std::vector<InternedDepKey> loadKeySet(DepKeySetId depKeySetId);
@@ -272,6 +299,10 @@ struct TraceStore {
 
 private:
     std::optional<TraceRow> lookupTraceRow(std::string_view attrPath);
+
+    /** Ensure traceDataCache has traceHash + structHash for the given traceId.
+     *  Queries getTraceInfo on cache miss. Returns null if trace not found. */
+    CachedTraceData * ensureTraceHashes(TraceId traceId);
 
     StringId doInternString(std::string_view s);
     AttrPathId doInternAttrPath(std::string_view path);
