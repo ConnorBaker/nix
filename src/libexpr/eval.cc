@@ -2218,6 +2218,31 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
             resultStr += *part;
         }
         v.mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
+
+        // Record a Content dep on the final concatenated path if it resolves
+        // to a file outside the store. This ensures that path concatenation
+        // expressions like `./dir + "/file.nix"` record a dep on the result.
+        //
+        // CONSERVATIVE OVER-APPROXIMATION: This may duplicate a dep that will
+        // also be recorded at the consumption point (import, readFile,
+        // copyPathToStore). Duplicates are harmless — within a single
+        // DependencyTracker, record() deduplicates by (type, source, key).
+        // The extra readFile + BLAKE3 hash per path
+        // concatenation result is the trade-off for soundness. Directories
+        // and nonexistent paths are handled by the try-catch: their deps are
+        // recorded when actually consumed (readDir, copyPathToStore, etc.).
+        if (DependencyTracker::isActive()) {
+            auto finalPath = state.rootPath(CanonPath(resultStr));
+            if (!hasPrefix(finalPath.path.abs(), "/nix/store/")) {
+                try {
+                    auto content = finalPath.readFile();
+                    recordDep(finalPath.path, DepHashValue(depHash(content)),
+                        DepType::Content, state.getMountToInput());
+                } catch (...) {
+                    // Directory or nonexistent — dep recorded at consumption point
+                }
+            }
+        }
     } else {
         auto & resultStr = StringData::alloc(state.mem, sSize);
         auto * tmp = resultStr.data();
@@ -2596,7 +2621,12 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
 
     // Record a CopiedPath dep so trace verification fails when the
     // store path for this source would change (i.e., any file changed).
-    if (!dstPathCached && DependencyTracker::isActive()
+    // Note: we record unconditionally (regardless of dstPathCached) because
+    // multiple DependencyTrackers may be active across different traces in
+    // the same process. The srcToStore cache deduplicates the store copy,
+    // but each tracker needs its own dep record. Within a single tracker,
+    // DependencyTracker::record() deduplicates by (type, source, key).
+    if (DependencyTracker::isActive()
         && !hasPrefix(path.path.abs(), "/nix/store/"))
     {
         recordDep(path.path, DepHashValue(store->printStorePath(dstPath)),

@@ -69,6 +69,7 @@ sources = files(
   'eval-trace/traced-data-builtins.cc',
   'eval-trace/traced-data-gaps.cc',
   'eval-trace/cold-verify.cc',
+  'eval-trace/dep-copied-path.cc',
   'json.cc',
   'main.cc',
   'nix_api_expr.cc',

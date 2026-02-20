@@ -981,6 +981,32 @@ verifying cache hits when only unrelated fields change.
 | B1 | `<` (`CompareValues`) | `primops.cc:763-764` — `maybeRecordListLenDep` on both lists | `LessThan_ListLengthGrows` (correctness); `LessThan_ListUnrelatedChange` (precision) |
 | B2 | `//` (`ExprOpUpdate`) | `eval.cc:1981-1982` — `maybeRecordAttrKeysDep` on both operands | `Update_TracedGainsKey` (correctness); `Update_UnrelatedChange` (precision) |
 | B3 | Strict formals (`callFunction`) | `eval.cc:1648` — `maybeRecordAttrKeysDep` on argument attrset (before `attrsUsed != size()` check) | `StrictFormals_KeyAdded` (correctness); `StrictFormals_ValueChanges`, `StrictFormals_UnrelatedChange` (precision) |
+| S1 | `copyPathToStore` CopiedPath dep dropping | `eval.cc:2599` — removed `!dstPathCached` guard from CopiedPath dep recording | `CopiedPath_MultipleTraces_AllRecordDep`, `CopiedPath_ThreeTraces_AllInvalidate` (correctness); `CopiedPath_SingleTrace_WarmHit`, `CopiedPath_SingleTrace_Invalidation` (basic) |
+| S2 | Path coercion (`./dir + "/file"`) | `eval.cc` ExprConcatStrings — record Content dep on final concatenated path | `PathConcat_FileContent_Invalidation` (correctness); `PathConcat_FileContent_WarmHit`, `PathConcat_Directory_NoDep`, `PathConcat_ReadFile_DupDep` (precision/edge) |
+
+**Note on Gap S1 (copyPathToStore CopiedPath dep dropping):** `copyPathToStore()`
+caches store paths in a process-wide `srcToStore` map. Before the fix, the
+CopiedPath dep was only recorded when the cache was cold (`!dstPathCached`).
+When evaluating multiple NixOS system closures, only the first closure to copy
+a given source directory would get the CopiedPath dep. Later closures served
+stale results because the missing dep didn't catch source file changes.
+Fix: remove the `!dstPathCached` guard. The dep hash (store path string) is
+deterministic within a process, so recording it multiple times for different
+trackers is correct and idempotent within each tracker.
+
+**Note on Gap S2 (path coercion — conservative over-approximation):**
+`ExprConcatStrings::eval` produces path values (e.g., `./dir + "/file.nix"`)
+without recording any dep. When the concatenated path resolves to a file,
+changes to that file don't invalidate traces that use the path. Fix: record a
+Content dep on the final concatenated path (eval.cc, after `v.mkPath()`). This
+is a **conservative over-approximation** — the dep may duplicate one recorded at
+the consumption point (import, readFile, copyPathToStore). Duplicates are
+harmless (`DependencyTracker::record()` deduplicates by `(type, source, key)`
+within a single tracker scope). The trade-off is one extra `readFile` + BLAKE3
+hash per path concatenation result, in exchange for soundness. For directories
+and nonexistent paths, no dep is recorded at this point (caught by try-catch);
+their deps will be recorded at the consumption point (readDir, copyPathToStore,
+etc.).
 
 **Note on Gap 2 (genericClosure):** The fix is indirect. `prim_genericClosure`
 does not call `maybeRecordListLenDep` on the startSet. However, the test
@@ -1030,6 +1056,47 @@ the child's trace incorrectly validates.
 - **Fix**: Record the parent's evaluation result hash alongside per-sibling
   deps, or add explicit dep tracking for overlay application sites.
 
+##### Gap O1: ParentContext non-transitive verification
+
+`getCurrentTraceHash()` returns the stored `trace_hash` from the `Traces` table
+without recursively verifying the parent trace's own deps. If a parent's deps
+have changed (e.g., a fetchGit input now resolves to a different `narHash`), the
+parent's `trace_hash` is stale, but child traces with ParentContext deps on that
+hash won't detect the staleness because they only compare against the stored
+hash — they don't re-verify the parent's deps.
+
+- **Test**: Not yet implemented (documented in `dep-copied-path.cc` as known issue 2)
+- **Severity**: Medium. Occurs when parent inputs change between evaluations
+  (e.g., flake lock updates that change fetchGit results).
+- **Fix**: Recursive parent verification in `verifyTrace()`, or guaranteed
+  bottom-up eval order that ensures parents are verified before children.
+
+##### Gap O2: Empty sibling traces always verify as valid
+
+`recordSiblingTrace()` records zero-dep traces for already-forced siblings.
+These empty traces always pass verification (no deps to check), even when
+the sibling's actual value would differ on re-evaluation.
+
+- **Test**: Not yet implemented (documented in `dep-copied-path.cc` as known issue 3)
+- **Severity**: Low. Requires a sibling to be pre-forced with one result and
+  then have its inputs change between trace recording and verification.
+- **Fix**: Defer sibling trace recording until the sibling is actually evaluated
+  (architectural change to trace-cache.cc).
+
+##### Gap O3: `prim_path` expectedHash skips dep recording
+
+When `builtins.path` is called with an `expectedHash` argument and the store
+path already exists with the correct hash, `fetchToStore` is skipped entirely.
+No CopiedPath or NARContent dep is recorded for the source path. If the source
+changes but the expectedHash check still passes (because the hash was
+pre-computed), the trace serves stale results.
+
+- **Test**: Not yet implemented (documented in `dep-copied-path.cc` as known issue 7)
+- **Severity**: Low. Requires `builtins.path` with `sha256` argument where the
+  source changes but store path validity check still passes.
+- **Fix**: Record dep in primops.cc `prim_path` regardless of whether
+  `fetchToStore` was skipped.
+
 #### Summary
 
 | Gap | Status | Operation |
@@ -1042,6 +1109,11 @@ the child's trace incorrectly validates.
 | B1 | **Fixed** | `<` (CompareValues) |
 | B2 | **Fixed** | `//` (update) |
 | B3 | **Fixed** | Strict formals |
+| S1 | **Fixed** | `copyPathToStore` CopiedPath dep dropping |
+| S2 | **Fixed** | Path coercion (`./dir + "/file"`) |
+| O1 | **Open** | ParentContext non-transitive verification |
+| O2 | **Open** | Empty sibling traces always valid |
+| O3 | **Open** | `prim_path` expectedHash skips dep recording |
 | P1 | **Open** | Parent-mediated changes |
 
 ### 9.2 Precision Issues
@@ -1079,6 +1151,19 @@ to the derived container.
 Recovery works for `nix eval` (leaf values) but doesn't cascade through deep
 trees for `nix build`. A recovered parent does not automatically recover its
 children's trace entries.
+
+#### P5: Path coercion Content dep is a conservative over-approximation
+
+The fix for Gap S2 records a Content dep on the final concatenated path at the
+point of path creation (`ExprConcatStrings::eval`). This dep may duplicate one
+that will also be recorded at the consumption point (e.g., `import` records its
+own Content dep on the same file; `copyPathToStore` records a CopiedPath dep).
+The duplicate is harmless — `DependencyTracker::record()` deduplicates by
+`(type, source, key)` within each tracker scope.
+However, the extra `readFile` + BLAKE3 hash per path concatenation result adds
+overhead. For directories and nonexistent paths, the dep is not recorded at
+creation time (the `readFile` call in the try-catch throws); it will be recorded
+at the consumption point.
 
 ### 9.3 Other Limitations
 

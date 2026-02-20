@@ -1024,6 +1024,49 @@ two-level logic, and doc comments.
 *Lesson:* Never use null bytes in SQLite TEXT column values. Tab is a safe
 alternative that doesn't appear in file paths or data paths.
 
+### 4.6b Dep Recording Gaps (2 bugs)
+
+**Bug 26: `copyPathToStore` CopiedPath dep dropping (srcToStore cache).**
+*Symptom:* When evaluating multiple NixOS system closures, only the first
+closure to copy a given source directory gets a CopiedPath dep. Later closures
+serve stale results because the missing dep doesn't catch file changes.
+*Root cause:* `copyPathToStore()` caches store paths in a process-wide
+`srcToStore` map. The CopiedPath dep recording was guarded by `!dstPathCached`,
+so only the first call per source path per process recorded the dep. Subsequent
+calls found the cached store path and skipped dep recording entirely.
+*Fix:* Remove the `!dstPathCached` guard from the dep recording condition
+(eval.cc:2599). The dep hash (store path string) is deterministic within a
+process, so recording it multiple times for different DependencyTrackers is
+correct and idempotent within each tracker (deps are deduped by
+`sortAndDedupDeps`).
+*Tests:* `CopiedPath_MultipleTraces_AllRecordDep`,
+`CopiedPath_ThreeTraces_AllInvalidate` in `dep-copied-path.cc`.
+*Lesson:* Process-wide caching of store operations must not suppress dep
+recording. Each DependencyTracker (each trace) needs its own dep record.
+
+**Bug 27: Path coercion produces paths without dep recording.**
+*Symptom:* `./dir + "/file.nix"` produces a path value with no dep recorded.
+Changes to the file don't invalidate traces that consume this path.
+*Root cause:* `ExprConcatStrings::eval` with `firstType == nPath` concatenates
+path components and produces a path value (`v.mkPath()`), but never records
+any dep on the resulting path. The dep is only recorded at the consumption
+point (e.g., `import`, `readFile`), but if the path value is passed around
+before being consumed, intermediate traces can serve stale results.
+*Fix:* After `v.mkPath()`, record a Content dep on the final concatenated path
+if it resolves to a file outside `/nix/store/`. For directories and nonexistent
+paths, no dep is recorded (caught by try-catch); their deps are recorded at
+the consumption point.
+*Trade-off:* This is a **conservative over-approximation**. The dep may
+duplicate one recorded at the consumption point (e.g., `import` also records
+a Content dep). Duplicates are harmless (`DependencyTracker::record()`
+deduplicates by `(type, source, key)` within each tracker scope). The cost is
+one extra `readFile` + BLAKE3 hash per path concatenation result.
+*Tests:* `PathConcat_FileContent_Invalidation`,
+`PathConcat_ReadFile_DupDep` in `dep-copied-path.cc`.
+*Lesson:* Dep recording at value-creation time is needed when the value can
+be passed to a different trace before consumption. Over-approximation is
+acceptable when the alternative is missing deps (unsound).
+
 ### 4.7 Known Soundness Gaps in Two-Level Override
 
 The two-level StructuredContent override had a systematic class of soundness
@@ -1099,6 +1142,23 @@ ParentContext deps track only accessed siblings. Parent overlays that change
 a child's definition without changing files or accessed siblings go undetected.
 *Test:* `DISABLED_ParentMediatedValueChange_SoundnessGap` in
 `per-sibling-invalidation.cc`.
+
+**Gap O1: ParentContext non-transitive verification — OPEN.**
+`getCurrentTraceHash()` returns the stored `trace_hash` without recursively
+verifying the parent's own deps. If the parent's deps are stale, child
+traces with ParentContext deps won't detect it.
+*Fix:* Recursive parent verification in `verifyTrace()`, or guaranteed
+bottom-up eval order.
+
+**Gap O2: Empty sibling traces always verify as valid — OPEN.**
+`recordSiblingTrace()` records zero-dep traces for already-forced siblings.
+These always pass verification, even when values would differ.
+*Fix:* Defer sibling trace recording until actual evaluation.
+
+**Gap O3: `prim_path` expectedHash skips dep recording — OPEN.**
+When `builtins.path` has `sha256` and the store path is valid, `fetchToStore`
+is skipped entirely with no CopiedPath/NARContent dep recorded.
+*Fix:* Always record dep in `prim_path` regardless of store cache.
 
 Gap 4 requires deeper design work to distinguish raw vs parsed readFile
 provenance in the two-level override. Gap P1 requires recording the parent's
