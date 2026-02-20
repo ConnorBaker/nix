@@ -4310,11 +4310,11 @@ TEST_F(TracedDataTest, TracedTOML_StandaloneStructuralDep_CacheMiss)
 // Adversarial soundness tests: gaps where shape dep recording is missing
 // ═══════════════════════════════════════════════════════════════════════
 
-// ── Gap 1: eqValues (== and !=) — no shape deps ─────────────────────
+// ── Gap 1 (FIXED): eqValues (== and !=) — shape deps added ──────────
 
 TEST_F(TracedDataTest, TracedJSON_EqOp_ListLengthGrows)
 {
-    // [SOUNDNESS] == checks list length without recording #len shape dep.
+    // [FIXED] == checks list length — #len shape dep now recorded at eval.cc:2964-2975.
     // Cold: arr has 2 elements, matches literal → true.
     // Hot: arr grows to 3 elements, but SC deps for [0] and [1] still pass.
     // Without #len dep, override incorrectly accepts stale "true".
@@ -4343,7 +4343,7 @@ TEST_F(TracedDataTest, TracedJSON_EqOp_ListLengthGrows)
 
 TEST_F(TracedDataTest, TracedJSON_EqOp_AttrsetKeyAdded)
 {
-    // [SOUNDNESS] == checks attrset key count/names without recording #keys.
+    // [FIXED] == checks attrset key count/names — #keys shape dep now recorded at eval.cc:2964-2975.
     // Cold: obj has {a,b}, matches literal → true.
     // Hot: obj gains key "c", but SC deps for .a and .b still pass.
     TempJsonFile file(R"({"obj":{"a":1,"b":2}})");
@@ -4370,7 +4370,7 @@ TEST_F(TracedDataTest, TracedJSON_EqOp_AttrsetKeyAdded)
 
 TEST_F(TracedDataTest, TracedJSON_NeqOp_ListLengthGrows)
 {
-    // [SOUNDNESS] != has the same gap as == (shares eqValues).
+    // [FIXED] != has the same fix as == (shares eqValues).
     // Cold: arr matches → != returns false → "no".
     // Hot: arr grows → should return true → "yes".
     TempJsonFile file(R"({"arr":["a","b"]})");
@@ -4446,11 +4446,11 @@ TEST_F(TracedDataTest, TracedJSON_EqOp_ListUnrelatedChange)
     }
 }
 
-// ── Gap 2: genericClosure — no #len on startSet ─────────────────────
+// ── Gap 2 (FIXED): genericClosure — indirect #len via shared Value* ─
 
 TEST_F(TracedDataTest, TracedJSON_GenericClosure_StartSetGrows)
 {
-    // [SOUNDNESS] genericClosure iterates startSet without recording #len.
+    // [FIXED] genericClosure — indirect fix via shared Value* provenance (see design.md Gap 2).
     // Cold: 2 nodes → closure has 2 elements.
     // Hot: 3 nodes, existing SC deps for [0].key and [1].key pass, no #len dep.
     TempJsonFile file(R"({"nodes":[{"key":"a"},{"key":"b"}]})");
@@ -4540,11 +4540,11 @@ TEST_F(TracedDataTest, TracedJSON_GenericClosure_CacheHit)
     }
 }
 
-// ── Gap 3: listToAttrs — no #len on input list ──────────────────────
+// ── Gap 3 (FIXED): listToAttrs — #len on input list ─────────────────
 
 TEST_F(TracedDataTest, TracedJSON_ListToAttrs_FullResultGrows)
 {
-    // [SOUNDNESS] listToAttrs iterates list without recording #len.
+    // [FIXED] listToAttrs — #len shape dep now recorded at primops.cc:3543.
     // Cold: 2 items → 2 attrs. Hot: 3 items, existing SC deps pass.
     TempJsonFile file(R"({"items":[{"name":"a","value":"1"},{"name":"b","value":"2"}]})");
     auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
@@ -4565,6 +4565,58 @@ TEST_F(TracedDataTest, TracedJSON_ListToAttrs_FullResultGrows)
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1); // must re-evaluate (list grew)
         EXPECT_THAT(v, IsIntEq(3));
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_ListToAttrs_ElementChanges)
+{
+    // [PRECISION] Same list length, element value changes → SC dep fails → re-eval.
+    TempJsonFile file(R"({"items":[{"name":"a","value":"1"},{"name":"b","value":"2"}]})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in (builtins.listToAttrs j.items).a)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("1"));
+    }
+
+    // Change value of "a" item, keep list length the same
+    file.modify(R"({"items":[{"name":"a","value":"99"},{"name":"b","value":"2"}]})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // SC dep for .value fails
+        EXPECT_THAT(v, IsStringEq("99"));
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_ListToAttrs_UnrelatedChange)
+{
+    // [PRECISION] Unrelated field changes → SC override accepts → cache hit.
+    TempJsonFile file(R"({"items":[{"name":"a","value":"1"},{"name":"b","value":"2"}],"extra":"x"})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in (builtins.listToAttrs j.items).a)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsStringEq("1"));
+    }
+
+    // Only change unrelated field
+    file.modify(R"({"items":[{"name":"a","value":"1"},{"name":"b","value":"2"}],"extra":"changed!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // cache hit (items unchanged)
+        EXPECT_THAT(v, IsStringEq("1"));
     }
 }
 
@@ -4805,11 +4857,11 @@ TEST_F(TracedDataTest, DISABLED_TracedJSON_RawAndParsedReadFile_ContentChanges)
     }
 }
 
-// ── Gap 5: intersectAttrs — no #keys on inputs ─────────────────────
+// ── Gap 5 (FIXED): intersectAttrs — #keys on inputs ────────────────
 
 TEST_F(TracedDataTest, TracedJSON_IntersectAttrs_TracedGainsMatchingKey)
 {
-    // [SOUNDNESS] intersectAttrs iterates key sets without recording #keys.
+    // [FIXED] intersectAttrs — #keys shape dep now recorded at primops.cc:3627-3628.
     // A passing SC dep (marker) triggers the override, but key set changes
     // in intersectAttrs inputs go undetected.
     TempJsonFile file(R"({"a":1,"b":2,"marker":"ok"})");
@@ -4832,6 +4884,60 @@ TEST_F(TracedDataTest, TracedJSON_IntersectAttrs_TracedGainsMatchingKey)
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1); // must re-evaluate (intersection changed)
         EXPECT_THAT(v, IsIntEq(3)); // now {a,b,c}
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_IntersectAttrs_ValueChanges)
+{
+    // [PRECISION] Same keys, accessed value changes → SC dep fails → re-eval.
+    // intersectAttrs takes values from the second argument, so we put traced
+    // data as the second arg and access a value from the result.
+    TempJsonFile file(R"({"a":1,"b":2})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in (builtins.intersectAttrs { a = true; } j).a)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(1)); // intersect {a} ∩ {a,b} → {a: j.a} → 1
+    }
+
+    // Change value of "a" but keep same keys
+    file.modify(R"({"a":99,"b":2})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // SC dep for .a fails
+        EXPECT_THAT(v, IsIntEq(99));
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_IntersectAttrs_UnrelatedChange)
+{
+    // [PRECISION] Unrelated field changes → SC override accepts → cache hit.
+    TempJsonFile file(R"({"a":1,"b":2,"extra":"x"})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); in (builtins.intersectAttrs { a = true; } j).a)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(1));
+    }
+
+    // Only change unrelated "extra" field
+    file.modify(R"({"a":1,"b":2,"extra":"changed!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // cache hit (a unchanged)
+        EXPECT_THAT(v, IsIntEq(1));
     }
 }
 
@@ -4887,11 +4993,11 @@ TEST_F(TracedDataTest, TracedJSON_EqOp_AttrsetUnrelatedChange)
     }
 }
 
-// ── Gap B1: CompareValues (<) — no #len on lists ────────────────────
+// ── Gap B1 (FIXED): CompareValues (<) — #len on lists ───────────────
 
 TEST_F(TracedDataTest, TracedJSON_LessThan_ListLengthGrows)
 {
-    // [SOUNDNESS] Lexicographic list comparison accesses listSize() without recording #len.
+    // [FIXED] Lexicographic list comparison — #len shape dep now recorded at primops.cc:763-764.
     // Cold: [1,2] < [1,2,3] → true (shorter list is "less").
     // Hot: first list grows to [1,2,9], SC deps for [0] and [1] still pass.
     // Without #len dep, override incorrectly accepts stale "true".
@@ -4944,11 +5050,11 @@ TEST_F(TracedDataTest, TracedJSON_LessThan_ListUnrelatedChange)
     }
 }
 
-// ── Gap B2: ExprOpUpdate (//) — no #keys on inputs ──────────────────
+// ── Gap B2 (FIXED): ExprOpUpdate (//) — #keys on inputs ─────────────
 
 TEST_F(TracedDataTest, TracedJSON_Update_TracedGainsKey)
 {
-    // [SOUNDNESS] // merges attrsets without recording #keys.
+    // [FIXED] // merges attrsets — #keys shape dep now recorded at eval.cc:1981-1982.
     // Cold: base has {a:1}, overlay has {b:2} → result {a:1,b:2}.
     // Hot: base gains key "b" with value 99, but SC dep for .a still passes.
     // Without #keys dep, override incorrectly accepts stale {a:1,b:2}.
@@ -5001,11 +5107,11 @@ TEST_F(TracedDataTest, TracedJSON_Update_UnrelatedChange)
     }
 }
 
-// ── Gap B3: callFunction strict formals — no #keys ──────────────────
+// ── Gap B3 (FIXED): callFunction strict formals — #keys ─────────────
 
 TEST_F(TracedDataTest, TracedJSON_StrictFormals_KeyAdded)
 {
-    // [SOUNDNESS] Strict formals check (no ...) compares attrsUsed != size()
+    // [FIXED] Strict formals check (no ...) — #keys shape dep now recorded at eval.cc:1648.
     // without recording #keys. Cold: {a:1} passed to ({a}: a) → 1.
     // Hot: {a:1,b:2} — should throw "unexpected argument 'b'" but SC dep
     // for .a still passes. Without #keys dep, override accepts stale result.
@@ -5028,6 +5134,58 @@ TEST_F(TracedDataTest, TracedJSON_StrictFormals_KeyAdded)
         auto cache = makeCache(expr, &loaderCalls);
         EXPECT_THROW(forceRoot(*cache), nix::Error); // unexpected argument 'b'
         EXPECT_EQ(loaderCalls, 1); // must re-evaluate (key set changed)
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_StrictFormals_ValueChanges)
+{
+    // [PRECISION] Same keys, value changes → SC dep for value fails → re-eval.
+    TempJsonFile file(R"({"obj":{"a":1}})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); f = {a}: a; in f j.obj)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(1));
+    }
+
+    // Change value of "a" but keep same key set
+    file.modify(R"({"obj":{"a":99}})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // SC dep for .a fails
+        EXPECT_THAT(v, IsIntEq(99));
+    }
+}
+
+TEST_F(TracedDataTest, TracedJSON_StrictFormals_UnrelatedChange)
+{
+    // [PRECISION] Unrelated field changes → SC override accepts → cache hit.
+    TempJsonFile file(R"({"obj":{"a":1},"extra":"x"})");
+    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
+        + R"(); f = {a}: a; in f j.obj)";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(1));
+    }
+
+    // Only change unrelated "extra" field
+    file.modify(R"({"obj":{"a":1},"extra":"changed!!"})");
+    invalidateFileCache(file.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // cache hit (obj.a unchanged)
+        EXPECT_THAT(v, IsIntEq(1));
     }
 }
 

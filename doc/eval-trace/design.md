@@ -940,7 +940,147 @@ modifications to the evaluated file or expression.
 
 ---
 
-## 9. Known Limitations and Trade-offs
+## 9. Known Soundness Gaps and Precision Issues
+
+This section catalogs all known cases where the eval trace system can produce
+incorrect results (soundness gaps) or over-invalidate (precision issues). The
+distinction matters:
+
+- **Soundness gap**: The system serves a stale cached result when it should
+  re-evaluate. The result may be wrong. These are bugs.
+- **Precision issue**: The system re-evaluates when it could have served a
+  cached result. The result is always correct, but performance suffers. These
+  are optimization opportunities.
+
+All soundness gaps have corresponding test cases in the test suite (marked
+`[SOUNDNESS]` with `EXPECT_EQ(loaderCalls, 1)` that currently passes because
+the gap causes the test to observe `loaderCalls == 0`). The DISABLED tests
+document scenarios where the fix is deferred.
+
+### 9.1 Soundness Gaps
+
+This section catalogs all known or historically known cases where the
+two-level StructuredContent override could accept a trace that should be
+invalidated. Most have been **fixed** by adding shape dep recording calls.
+Two remain **open**.
+
+#### Fixed Gaps (verified by tests)
+
+The following gaps were identified during development and fixed by adding
+`maybeRecordListLenDep` / `maybeRecordAttrKeysDep` / `maybeRecordTypeDep`
+calls at the appropriate locations. Each has a test that verifies correct
+re-evaluation when structural properties change, plus precision tests
+verifying cache hits when only unrelated fields change.
+
+| Gap | Operation | Fix Location | Tests |
+|-----|-----------|-------------|-------|
+| 1 | `==` / `!=` (`eqValues`) | `eval.cc:2964-2975` — `maybeRecordListLenDep` + `maybeRecordAttrKeysDep` on both operands | `EqOp_ListLengthGrows`, `EqOp_AttrsetKeyAdded`, `NeqOp_ListLengthGrows` (correctness); `EqOp_ListElementChanges`, `EqOp_ListUnrelatedChange`, `EqOp_AttrsetValueChanges`, `EqOp_AttrsetUnrelatedChange` (precision) |
+| 2 | `genericClosure` | No explicit call in `prim_genericClosure`, but effectively fixed: `builtins.length` on the result finds provenance through shared `Value*` pointers (genericClosure returns the same element pointers from the tracked startSet) | `GenericClosure_StartSetGrows` (correctness); `GenericClosure_ElementChanges`, `GenericClosure_CacheHit` (precision) |
+| 3 | `listToAttrs` | `primops.cc:3543` — `maybeRecordListLenDep` on input list | `ListToAttrs_FullResultGrows` (correctness); `ListToAttrs_ElementChanges`, `ListToAttrs_UnrelatedChange` (precision) |
+| 5 | `intersectAttrs` | `primops.cc:3627-3628` — `maybeRecordAttrKeysDep` on both inputs | `IntersectAttrs_TracedGainsMatchingKey` (correctness); `IntersectAttrs_ValueChanges`, `IntersectAttrs_UnrelatedChange` (precision) |
+| B1 | `<` (`CompareValues`) | `primops.cc:763-764` — `maybeRecordListLenDep` on both lists | `LessThan_ListLengthGrows` (correctness); `LessThan_ListUnrelatedChange` (precision) |
+| B2 | `//` (`ExprOpUpdate`) | `eval.cc:1981-1982` — `maybeRecordAttrKeysDep` on both operands | `Update_TracedGainsKey` (correctness); `Update_UnrelatedChange` (precision) |
+| B3 | Strict formals (`callFunction`) | `eval.cc:1648` — `maybeRecordAttrKeysDep` on argument attrset (before `attrsUsed != size()` check) | `StrictFormals_KeyAdded` (correctness); `StrictFormals_ValueChanges`, `StrictFormals_UnrelatedChange` (precision) |
+
+**Note on Gap 2 (genericClosure):** The fix is indirect. `prim_genericClosure`
+does not call `maybeRecordListLenDep` on the startSet. However, the test
+passes because genericClosure returns the same `Value*` element pointers from
+the tracked input list. When `builtins.length` is subsequently called on the
+result, `maybeRecordListLenDep` finds the provenance via the shared first-element
+pointer and records a `#len` dep referencing the original tracked data path.
+This is conservative: if the Value pointers were not shared (e.g., if
+genericClosure cloned elements), no `#len` dep would be recorded, and the
+Content dep failure would cause re-evaluation (safe, not stale).
+
+#### Open Gaps
+
+##### Gap 4: Raw + parsed `readFile` from same file
+
+When both a raw `readFile` (used via e.g. `stringLength`) and a parsed
+`readFile` (used via `fromJSON`) reference the **same file**, the SC deps
+from the parsed path can incorrectly "cover" the Content dep failure for the
+raw path. The two-level override sees: Content dep fails (file changed), SC
+deps from `fromJSON` pass (accessed JSON field unchanged) → override accepts.
+But the raw consumer's result (e.g., `stringLength`) has changed because the
+file size changed.
+
+- **Test**: `DISABLED_TracedJSON_RawAndParsedReadFile_ContentChanges` in
+  `traced-data.cc` (DISABLED because this is a known bug)
+- **Positive boundary tests**: 7 tests (`RawOnly_*`, `ParsedOnly_*`,
+  `RawAndParsed_*`) verify the adjacent non-buggy scenarios.
+- **Severity**: Medium. Raw + parsed access to the same file occurs when Nix
+  code reads a file both as text (e.g., for hashing or length checks) and as
+  structured data. This is uncommon but not impossible.
+- **Fix**: Requires distinguishing raw vs parsed `readFile` provenance in the
+  two-level override logic, so SC deps only override Content failures for the
+  *same* readFile usage (parsed), not for a different usage (raw).
+
+##### Gap P1: Parent-mediated value changes
+
+Per-sibling ParentContext deps track only which siblings a child accessed
+during evaluation. If a parent overlay changes a child's definition without
+changing any file that the child reads **or** any sibling the child accesses,
+the child's trace incorrectly validates.
+
+- **Test**: `DISABLED_ParentMediatedValueChange_SoundnessGap` in
+  `per-sibling-invalidation.cc`
+- **Severity**: Very low. Overlays that modify existing packages without
+  changing any files are almost nonexistent in real Nixpkgs usage.
+- **Pre-existing**: origExpr children already lack ParentContext deps entirely.
+- **Fix**: Record the parent's evaluation result hash alongside per-sibling
+  deps, or add explicit dep tracking for overlay application sites.
+
+#### Summary
+
+| Gap | Status | Operation |
+|-----|--------|-----------|
+| 1 | **Fixed** | `==` / `!=` |
+| 2 | **Fixed** (indirect) | `genericClosure` |
+| 3 | **Fixed** | `listToAttrs` |
+| 4 | **Open** | Raw + parsed readFile (same file) |
+| 5 | **Fixed** | `intersectAttrs` |
+| B1 | **Fixed** | `<` (CompareValues) |
+| B2 | **Fixed** | `//` (update) |
+| B3 | **Fixed** | Strict formals |
+| P1 | **Open** | Parent-mediated changes |
+
+### 9.2 Precision Issues
+
+These are cases where the system over-invalidates (re-evaluates when it could
+serve a cached result). The result is always correct.
+
+#### P1: Whole-file Content dep for `.nix` code
+
+For `.nix` code consumed via `import`/`evalFile`, the Content dep covers the
+entire file. Any byte change — even a comment edit in an unused branch —
+invalidates all traces that imported the file. This is the dominant source of
+unnecessary re-evaluations in the 100-commit nixpkgs benchmark (Section 11.3).
+The StructuredContent two-level override (Section 4.4) mitigates this for data
+files (JSON/TOML) but not for `.nix` code.
+
+#### P2: Verify-served siblings don't replay traces
+
+When `c = a + b` and `a`, `b` are served from the verify path, their deps are
+not replayed into `c`'s `DependencyTracker`. Result: `c`'s trace may be
+incomplete (missing deps from verify-served children). This is conservative —
+`c` will be re-evaluated more often than necessary, not less.
+
+#### P3: Provenance propagation is conservative
+
+Container-reconstructing builtins (`mapAttrs`, `filter`, etc.) propagate
+provenance from the *original* tracked container to the output. When the
+derived container has a different shape (e.g., `removeAttrs` removes keys),
+shape deps reference the original container's data path, which may cause
+false invalidation when the original container changes in ways irrelevant
+to the derived container.
+
+#### P4: Recovery is single-attribute level
+
+Recovery works for `nix eval` (leaf values) but doesn't cascade through deep
+trees for `nix build`. A recovered parent does not automatically recover its
+children's trace entries.
+
+### 9.3 Other Limitations
 
 1. **origExpr wrappers skip eager drvPath forcing.** When a sibling is wrapped
    with an origExpr `TracedExpr` wrapper, it does not eagerly force `drvPath`.
@@ -949,60 +1089,24 @@ modifications to the evaluated file or expression.
    `outPath` is naturally accessed. Trade-off: avoids infinite recursion through
    nixpkgs' `buildPackages = self` fixed-point.
 
-2. **Verify-served siblings don't replay traces.** When `c = a + b` and `a`, `b`
-   are served from the verify path, their deps are not replayed into `c`'s
-   `DependencyTracker`. Result: `c`'s trace may be incomplete (missing deps from
-   verify-served children). This is conservative — `c` will be re-evaluated more
-   often than necessary, not less.
-
-3. **Recovery is single-attribute level.** Recovery works for `nix eval` (leaf
-   values) but doesn't cascade through deep trees for `nix build`. A recovered
-   parent does not automatically recover its children's trace entries.
-
-4. **StatHashCache same-size file flakiness.** The stat-hash cache keys on
+2. **StatHashCache same-size file flakiness.** The stat-hash cache keys on
    `(dev, ino, mtime_nsec, size)`. File modifications of the same size within the
    same mtime granularity can produce false cache hits. Mitigated by using
    nanosecond mtime precision.
 
-5. **Dynamic dep instability.** Like Shake, dependencies are discovered during
+3. **Dynamic dep instability.** Like Shake, dependencies are discovered during
    evaluation and can vary between evaluations of the same attribute (e.g.,
    depending on whether a root file is already cached). This means direct hash
    recovery cannot be the sole mechanism — structural variant recovery is needed
    as a fallback.
 
-6. **Symlinks not tracked.** Intermediate symlink targets are not recorded as deps.
+4. **Symlinks not tracked.** Intermediate symlink targets are not recorded as deps.
    Changes to a symlink target without changing the resolved file will not
    invalidate the trace.
 
-7. **(Resolved)** ~~Merkle identity hash is O(depth).~~ Parent Merkle chaining
+5. **(Resolved)** ~~Merkle identity hash is O(depth).~~ Parent Merkle chaining
    has been removed. `trace_hash` is the BLAKE3 of own sorted deps (including
    any ParentContext dep). No recursive parent-chain walk is needed.
-
-8. **Parent-mediated value changes (soundness gap).** Per-sibling ParentContext
-   deps track only which siblings a child accessed during evaluation. If a parent
-   overlay changes a child's definition without changing any file that the child
-   reads **or** any sibling the child accesses, the child's trace incorrectly
-   validates. Example: a parent overlay that patches `hello.meta.description` via
-   Nix code (not a file change) would not invalidate `hello`'s trace if `hello`
-   never accessed the attribute that carries the overlay's dep. This is:
-   - **Pre-existing**: origExpr children already lack ParentContext deps entirely.
-   - **Extremely rare**: overlays that modify existing packages without changing
-     any files are almost nonexistent in real Nixpkgs usage.
-   - **Acceptable trade-off**: avoids cascading invalidation of ~60K traces on
-     every by-name package addition.
-   - **Tracked**: A DISABLED test (`ParentMediatedValueChange_SoundnessGap`) in
-     `per-sibling-invalidation.cc` demonstrates this gap.
-   - **Future fix**: could be addressed by recording the parent's evaluation
-     result hash alongside per-sibling deps, or by adding explicit dep tracking
-     for overlay application sites.
-
-9. **Whole-file Content dep over-approximation.** For `.nix` code consumed via
-   `import`/`evalFile`, the Content dep covers the entire file. Any byte change
-   — even a comment edit in an unused branch — invalidates all traces that
-   imported the file. This is the dominant source of unnecessary re-evaluations
-   in the 100-commit nixpkgs benchmark (Section 4.6, Section 11.3). The
-   StructuredContent two-level override (Section 4.4) mitigates this for data
-   files (JSON/TOML) but not for `.nix` code.
 
 ---
 

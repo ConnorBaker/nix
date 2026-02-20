@@ -1024,7 +1024,87 @@ two-level logic, and doc comments.
 *Lesson:* Never use null bytes in SQLite TEXT column values. Tab is a safe
 alternative that doesn't appear in file paths or data paths.
 
-### 4.7 Two-Object Trace Model (3 pitfalls) -- CAS Blob Era Only
+### 4.7 Known Soundness Gaps in Two-Level Override
+
+The two-level StructuredContent override had a systematic class of soundness
+gaps: builtins and operators that read structural properties of traced
+containers (list length, attrset key set) without recording shape deps.
+Most have been **fixed** by adding `maybeRecordListLenDep` /
+`maybeRecordAttrKeysDep` / `maybeRecordTypeDep` calls at the appropriate
+locations. Two gaps remain **open**. All gaps are documented with tests in
+`traced-data.cc` and summarized in `design.md` Section 9.1.
+
+#### Fixed Gaps
+
+**Gap 1: `eqValues` (`==`/`!=`) — FIXED.**
+Added `maybeRecordListLenDep` + `maybeRecordAttrKeysDep` on both operands
+at `eval.cc:2964-2975`.
+*Soundness tests:* `TracedJSON_EqOp_ListLengthGrows`,
+`TracedJSON_EqOp_AttrsetKeyAdded`, `TracedJSON_NeqOp_ListLengthGrows`.
+*Precision tests:* `TracedJSON_EqOp_ListElementChanges`,
+`TracedJSON_EqOp_ListUnrelatedChange`, `TracedJSON_EqOp_AttrsetValueChanges`,
+`TracedJSON_EqOp_AttrsetUnrelatedChange`.
+
+**Gap 2: `genericClosure` — FIXED (indirect).**
+No explicit call in `prim_genericClosure`, but effectively fixed:
+`builtins.length` on the result finds provenance through shared `Value*`
+pointers (genericClosure returns the same element pointers from the tracked
+startSet).
+*Soundness test:* `TracedJSON_GenericClosure_StartSetGrows`.
+*Precision tests:* `TracedJSON_GenericClosure_ElementChanges`,
+`TracedJSON_GenericClosure_CacheHit`.
+
+**Gap 3: `listToAttrs` — FIXED.**
+Added `maybeRecordListLenDep` on input list at `primops.cc:3543`.
+*Soundness test:* `TracedJSON_ListToAttrs_FullResultGrows`.
+*Precision tests:* `TracedJSON_ListToAttrs_ElementChanges`,
+`TracedJSON_ListToAttrs_UnrelatedChange`.
+
+**Gap 5: `intersectAttrs` — FIXED.**
+Added `maybeRecordAttrKeysDep` on both inputs at `primops.cc:3627-3628`.
+*Soundness test:* `TracedJSON_IntersectAttrs_TracedGainsMatchingKey`.
+*Precision tests:* `TracedJSON_IntersectAttrs_ValueChanges`,
+`TracedJSON_IntersectAttrs_UnrelatedChange`.
+
+**Gap B1: `CompareValues` (`<`) — FIXED.**
+Added `maybeRecordListLenDep` on both lists at `primops.cc:763-764`.
+*Soundness test:* `TracedJSON_LessThan_ListLengthGrows`.
+*Precision test:* `TracedJSON_LessThan_ListUnrelatedChange`.
+
+**Gap B2: `ExprOpUpdate` (`//`) — FIXED.**
+Added `maybeRecordAttrKeysDep` on both operands at `eval.cc:1981-1982`.
+*Soundness test:* `TracedJSON_Update_TracedGainsKey`.
+*Precision test:* `TracedJSON_Update_UnrelatedChange`.
+
+**Gap B3: `callFunction` strict formals — FIXED.**
+Added `maybeRecordAttrKeysDep` on argument attrset at `eval.cc:1648`.
+*Soundness test:* `TracedJSON_StrictFormals_KeyAdded`.
+*Precision tests:* `TracedJSON_StrictFormals_ValueChanges`,
+`TracedJSON_StrictFormals_UnrelatedChange`.
+
+#### Open Gaps
+
+**Gap 4: Raw + parsed `readFile` from same file — OPEN.**
+When both raw (e.g., `stringLength`) and parsed (e.g., `fromJSON`) readFile
+reference the same file, SC deps from the parsed path incorrectly cover the
+Content dep failure for the raw path. Unlike gaps 1-3/5/B1-B3, this is NOT
+a missing shape dep — it's a fundamental limitation of the two-level override:
+it cannot distinguish which Content dep failure should be overrideable.
+*Test:* `DISABLED_TracedJSON_RawAndParsedReadFile_ContentChanges`.
+*Positive boundary tests:* 7 tests (`RawOnly_*`, `ParsedOnly_*`,
+`RawAndParsed_*`) verify adjacent non-buggy scenarios.
+
+**Gap P1: Parent-mediated value changes — OPEN.**
+ParentContext deps track only accessed siblings. Parent overlays that change
+a child's definition without changing files or accessed siblings go undetected.
+*Test:* `DISABLED_ParentMediatedValueChange_SoundnessGap` in
+`per-sibling-invalidation.cc`.
+
+Gap 4 requires deeper design work to distinguish raw vs parsed readFile
+provenance in the two-level override. Gap P1 requires recording the parent's
+result hash alongside per-sibling deps.
+
+### 4.8 Two-Object Trace Model (3 pitfalls) -- CAS Blob Era Only
 
 *(These pitfalls are specific to the CAS blob trace design, Phases 9--11.
 The pure SQLite TraceStore does not use CAS blobs or store-path-based references,
@@ -1198,7 +1278,32 @@ trace store -- a BSàlC constructive trace serving without recomputation.
   two-level Content override, scalar access, nested access, array access,
   provenance validation, unused key change survival
 
-### 7.3 Known Test Limitations
+### 7.3 Soundness and Precision Gap Tests
+
+The test suite includes systematic coverage of all known soundness gaps and
+precision behaviors. See `design.md` Section 9 for the full catalog.
+
+**Fixed gap tests** (in `traced-data.cc`, marked `[FIXED]`):
+Each fixed gap has a soundness test verifying correct re-evaluation when
+structural properties change, plus precision tests verifying cache hits when
+only unrelated fields change.
+
+**Open gap tests** (marked `[SOUNDNESS]` or `DISABLED_`):
+Gaps 4 and P1 remain open with DISABLED tests documenting the known bugs.
+
+| Gap | Status | Soundness Test | Precision Tests |
+|-----|--------|---------------|-----------------|
+| 1 (`==`/`!=`) | **Fixed** | `EqOp_ListLengthGrows`, `EqOp_AttrsetKeyAdded`, `NeqOp_ListLengthGrows` | `EqOp_ListElementChanges`, `EqOp_ListUnrelatedChange`, `EqOp_AttrsetValueChanges`, `EqOp_AttrsetUnrelatedChange` |
+| 2 (`genericClosure`) | **Fixed** | `GenericClosure_StartSetGrows` | `GenericClosure_ElementChanges`, `GenericClosure_CacheHit` |
+| 3 (`listToAttrs`) | **Fixed** | `ListToAttrs_FullResultGrows` | `ListToAttrs_ElementChanges`, `ListToAttrs_UnrelatedChange` |
+| 4 (raw+parsed readFile) | **Open** | `DISABLED_RawAndParsedReadFile_ContentChanges` | `RawOnly_StringLength_ContentChanges`, `RawOnly_Substring_ContentChanges`, `RawOnly_StringLength_SameSizeChange`, `ParsedOnly_UnusedFieldChange_CacheHit`, `RawAndParsed_DifferentFiles_RawFileChanges`, `RawAndParsed_DifferentFiles_ParsedUnusedChange`, `RawAndParsed_SameFile_AccessedFieldChanges` |
+| 5 (`intersectAttrs`) | **Fixed** | `IntersectAttrs_TracedGainsMatchingKey` | `IntersectAttrs_ValueChanges`, `IntersectAttrs_UnrelatedChange` |
+| B1 (`<`) | **Fixed** | `LessThan_ListLengthGrows` | `LessThan_ListUnrelatedChange` |
+| B2 (`//`) | **Fixed** | `Update_TracedGainsKey` | `Update_UnrelatedChange` |
+| B3 (strict formals) | **Fixed** | `StrictFormals_KeyAdded` | `StrictFormals_ValueChanges`, `StrictFormals_UnrelatedChange` |
+| P1 (parent-mediated) | **Open** | `DISABLED_ParentMediatedValueChange_SoundnessGap` (in `per-sibling-invalidation.cc`) | (sibling invalidation tests in same file) |
+
+### 7.4 Known Test Limitations
 
 1. **Same-size file modification**: must use different-size content to avoid
    StatHashCache false hits (stat-based BSàlC VT approximation).

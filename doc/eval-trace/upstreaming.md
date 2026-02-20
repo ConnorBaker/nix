@@ -444,7 +444,14 @@ meson configure build -Db_sanitize=none  # restore
    for siblings they actually access during evaluation, not the full parent.
    This avoids cascading invalidation when unrelated siblings change, at the cost
    of a known soundness gap for parent-mediated value changes (see design.md
-   Section 9.8). Is this trade-off acceptable?
+   Section 9.1, Gap P1). Is this trade-off acceptable?
+
+8. **Known soundness gaps in two-level override.** Nine soundness gaps are
+   documented where the StructuredContent two-level override can serve stale
+   results (see design.md Section 9.1 and implementation.md Section 4.7). Most
+   involve builtins that read container structure (list length, key sets) without
+   recording shape deps. All are tested and low-severity. Is the trade-off of
+   shipping with known gaps (vs. blocking on fixing all of them) acceptable?
 
 ### Prior Art Mapping for Reviewers
 
