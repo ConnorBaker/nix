@@ -1474,6 +1474,9 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
             if (def) {
                 state.forceValue(*vAttrs, pos);
                 if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
+                    // Record #keys for traced attrset where key was NOT found
+                    if (vAttrs->type() == nAttrs)
+                        maybeRecordAttrKeysDep(state.symbols, *vAttrs);
                     def->eval(state, env, v);
                     return;
                 }
@@ -1533,6 +1536,7 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
 {
     Value vTmp;
     Value * vAttrs = &vTmp;
+    Value * lastAttrset = nullptr;
 
     e->eval(state, env, vTmp);
 
@@ -1541,13 +1545,20 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
         const Attr * j;
         auto name = getName(i, state, env);
         if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
+            lastAttrset = vAttrs;
             vAttrs = j->value;
         } else {
+            // Record #keys for the attrset where the key was NOT found
+            if (vAttrs->type() == nAttrs)
+                maybeRecordAttrKeysDep(state.symbols, *vAttrs);
             v.mkBool(false);
             return;
         }
     }
 
+    // Record #keys for the last attrset where the key was found
+    if (lastAttrset)
+        maybeRecordAttrKeysDep(state.symbols, *lastAttrset);
     v.mkBool(true);
 }
 
@@ -2089,6 +2100,7 @@ void EvalState::concatLists(
     size_t len = 0;
     for (size_t n = 0; n < nrLists; ++n) {
         forceList(*lists[n], pos, errorCtx);
+        maybeRecordListLenDep(*lists[n]);
         auto l = lists[n]->listSize();
         len += l;
         if (l)
@@ -2522,6 +2534,7 @@ BackedStringView EvalState::coerceToString(
             return "";
 
         if (v.isList()) {
+            maybeRecordListLenDep(v);
             std::string result;
             auto listView = v.listView();
             for (auto [n, v2] : enumerate(listView)) {

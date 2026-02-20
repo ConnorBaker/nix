@@ -337,11 +337,6 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
     switch (nodeKind) {
     case TracedDataNode::Kind::Object: {
         // Eagerly materialize the full key set; each value is a lazy thunk.
-        // No dep is recorded here — the key set is covered by the Content dep
-        // from readFile. This means builtins that only iterate keys (mapAttrs,
-        // attrNames) without forcing values produce no StructuredContent deps,
-        // so the two-level override cannot apply and any file change correctly
-        // invalidates the trace at this level. See traced-data.hh for details.
         auto keys = node->objectKeys();
         auto attrs = state.buildBindings(keys.size());
         for (auto & k : keys) {
@@ -356,8 +351,16 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         }
         v.mkAttrs(attrs);
         if (DependencyTracker::isActive()) {
-            // Use Bindings* as key: heap-allocated, shared across Value copies
-            registerTracedContainer((const void *)v.attrs(), {depSource, depKey, dataPath, node->formatTag()});
+            if (keys.empty()) {
+                // Empty objects have no stable internal pointer for provenance
+                // tracking. Record #keys directly so that key additions are caught
+                // by two-level verification even when sibling SC deps pass.
+                auto keysKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath, ShapeSuffix::Keys);
+                DependencyTracker::record({depSource, keysKey, DepHashValue(depHash("")), DepType::StructuredContent});
+            } else {
+                // Use Bindings* as key: heap-allocated, shared across Value copies
+                registerTracedContainer((const void *)v.attrs(), {depSource, depKey, dataPath, node->formatTag()});
+            }
         }
         break;
     }
@@ -374,12 +377,17 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
             list[i] = thunkVal;
         }
         v.mkList(list);
-        if (DependencyTracker::isActive() && sz > 0) {
-            // Use first element Value* as key: heap-allocated, shared across Value copies.
-            // Empty lists cannot be tracked (no stable internal pointer), but this is
-            // safe: an empty list has no leaf StructuredContent deps, so the two-level
-            // override cannot apply when the file changes.
-            registerTracedContainer((const void *)list[0], {depSource, depKey, dataPath, node->formatTag()});
+        if (DependencyTracker::isActive()) {
+            if (sz == 0) {
+                // Empty lists have no stable internal pointer for provenance
+                // tracking. Record #len=0 directly so that element additions
+                // are caught by two-level verification even when sibling SC deps pass.
+                auto lenKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath, ShapeSuffix::Len);
+                DependencyTracker::record({depSource, lenKey, DepHashValue(depHash("0")), DepType::StructuredContent});
+            } else {
+                // Use first element Value* as key: heap-allocated, shared across Value copies
+                registerTracedContainer((const void *)list[0], {depSource, depKey, dataPath, node->formatTag()});
+            }
         }
         break;
     }

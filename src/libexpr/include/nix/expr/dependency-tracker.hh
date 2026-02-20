@@ -42,8 +42,19 @@ struct DependencyTracker {
     DependencyTracker * previous;
     std::vector<Dep> * mySessionTraces;
     uint32_t startIndex;
+    /// Append-only list of dep ranges replayed from memoized thunks.
+    /// Order preserved: ranges are appended in evaluation encounter order,
+    /// then concatenated by collectTraces() to form the final dep vector.
     std::vector<DepRange> replayedRanges;
+
+    /// Deduplication set: prevents adding the same memoized dep range twice
+    /// when a Value is re-forced. Pointer keys are safe because Values are
+    /// long-lived within a single evaluation context. No ordering needed.
     std::unordered_set<const Value *> replayedValues;
+
+    /// Deduplication set for (type, source, key) triples within this tracker
+    /// scope. record() checks membership before appending to sessionTraces.
+    /// Hash-based for O(1) expected dedup checks; no ordering needed.
     std::unordered_set<DepKey, DepKey::Hash> recordedKeys;
 
     DependencyTracker()
@@ -256,6 +267,31 @@ void clearTracedContainerMap();
  * and computeCurrentHash 'd' format handler (trace-store.cc).
  */
 std::string dirEntryTypeString(std::optional<SourceAccessor::Type> type);
+
+class SymbolTable;
+
+/**
+ * Record a #len StructuredContent dep if the list value came from
+ * ExprTracedData (checked via traced container provenance map).
+ * No-op if dep tracking is inactive or list is empty (no stable key).
+ */
+void maybeRecordListLenDep(const Value & v);
+
+/**
+ * Record a #keys StructuredContent dep if the attrset value came from
+ * ExprTracedData (checked via traced container provenance map).
+ * No-op if dep tracking is inactive or value is not an attrset.
+ */
+void maybeRecordAttrKeysDep(const SymbolTable & symbols, const Value & v);
+
+/**
+ * Record a #type StructuredContent dep if the value is a container
+ * (attrset/list) that came from ExprTracedData. Records hash("object")
+ * for attrsets, hash("array") for lists. Only records when type is
+ * explicitly observed (typeOf, isAttrs, isList), NOT at materialization.
+ * No-op if dep tracking is inactive or value is not a container.
+ */
+void maybeRecordTypeDep(const Value & v);
 
 /**
  * Stat metadata used as a cache key: if these fields match, the file

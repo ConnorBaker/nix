@@ -1,6 +1,7 @@
 #include "nix/expr/value-to-xml.hh"
 #include "nix/util/xml-writer.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/dependency-tracker.hh"
 #include "nix/util/signals.hh"
 
 #include <cstdlib>
@@ -41,6 +42,25 @@ static void showAttrs(
     NixStringContext & context,
     PathSet & drvsSeen)
 {
+    // Record #keys for traced attrsets (provenance keyed by Bindings*)
+    if (DependencyTracker::isActive()) {
+        if (auto * prov = lookupTracedContainer((const void *)&attrs)) {
+            auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Keys);
+            std::vector<std::string_view> keys;
+            keys.reserve(attrs.size());
+            for (auto & attr : attrs)
+                keys.push_back(state.symbols[attr.name]);
+            std::sort(keys.begin(), keys.end());
+            std::string canonical;
+            for (size_t i = 0; i < keys.size(); i++) {
+                if (i > 0) canonical += '\0';
+                canonical += keys[i];
+            }
+            auto hash = depHash(canonical);
+            DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        }
+    }
+
     StringSet names;
 
     for (auto & a : attrs.lexicographicOrder(state.symbols)) {
@@ -130,6 +150,7 @@ static void printValueAsXML(
         break;
 
     case nList: {
+        maybeRecordListLenDep(v);
         XMLOpenElement _(doc, "list");
         for (auto v2 : v.listView())
             printValueAsXML(state, strict, location, *v2, doc, context, drvsSeen, pos);

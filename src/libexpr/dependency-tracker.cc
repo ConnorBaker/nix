@@ -1,5 +1,8 @@
 #include "nix/expr/eval-trace-deps.hh"
 #include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/value.hh"
+#include "nix/expr/attr-set.hh"
+#include "nix/expr/symbol-table.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/hash.hh"
 #include "nix/util/logging.hh"
@@ -32,6 +35,7 @@ thread_local std::vector<Dep> DependencyTracker::sessionTraces;
 //   - Bindings* for attrsets (heap-allocated, stable)
 //   - First element Value* for lists (heap-allocated, stable)
 // Populated by ExprTracedData::eval(), queried by shape-observing builtins.
+// Hash-based (unordered): only membership/lookup needed, no ordering required.
 static thread_local std::unordered_map<const void*, TracedContainerProvenance> tracedContainerMap;
 
 void DependencyTracker::onRootConstruction()
@@ -543,6 +547,63 @@ void loadStatHashEntries(std::vector<StatHashEntry> entries)
 void forEachDirtyStatHash(std::function<void(const StatHashEntry &)> callback)
 {
     StatHashCache::instance().flushDirtyEntries(std::move(callback));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Shape dep recording for traced data containers
+// ═══════════════════════════════════════════════════════════════════════
+
+void maybeRecordListLenDep(const Value & v)
+{
+    if (!DependencyTracker::isActive()) return;
+    if (v.listSize() == 0) return; // Empty lists can't be tracked (no stable key)
+    // Use first element Value* as key (matches registration in ExprTracedData::eval)
+    auto * prov = lookupTracedContainer((const void *)v.listView()[0]);
+    if (!prov) return;
+    auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Len);
+    auto hash = depHash(std::to_string(v.listSize()));
+    DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+}
+
+void maybeRecordAttrKeysDep(const SymbolTable & symbols, const Value & v)
+{
+    if (!DependencyTracker::isActive()) return;
+    if (v.type() != nAttrs) return;
+    // Use Bindings* as key (matches registration in ExprTracedData::eval)
+    auto * prov = lookupTracedContainer((const void *)v.attrs());
+    if (!prov) return;
+    auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Keys);
+    // Sorted key names separated by null bytes for canonical representation
+    std::vector<std::string_view> keys;
+    keys.reserve(v.attrs()->size());
+    for (auto & attr : *v.attrs())
+        keys.push_back(symbols[attr.name]);
+    std::sort(keys.begin(), keys.end());
+    std::string canonical;
+    for (size_t i = 0; i < keys.size(); i++) {
+        if (i > 0) canonical += '\0';
+        canonical += keys[i];
+    }
+    auto hash = depHash(canonical);
+    DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+}
+
+void maybeRecordTypeDep(const Value & v)
+{
+    if (!DependencyTracker::isActive()) return;
+    const TracedContainerProvenance * prov = nullptr;
+    const char * typeStr = nullptr;
+    if (v.type() == nAttrs) {
+        prov = lookupTracedContainer((const void *)v.attrs());
+        typeStr = "object";
+    } else if (v.type() == nList && v.listSize() > 0) {
+        // Empty lists can't be tracked (no stable key in provenance map)
+        prov = lookupTracedContainer((const void *)v.listView()[0]);
+        typeStr = "array";
+    }
+    if (!prov) return;
+    auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Type);
+    DependencyTracker::record({prov->depSource, fullKey, DepHashValue(depHash(typeStr)), DepType::StructuredContent});
 }
 
 } // namespace nix

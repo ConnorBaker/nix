@@ -345,6 +345,7 @@ enum class ShapeSuffix : uint8_t {
     None = 0,  ///< Scalar leaf access — no suffix
     Len  = 1,  ///< List/array length (#len)
     Keys = 2,  ///< Object/attrset key set (#keys)
+    Type = 3,  ///< Container type — "object" or "array" (#type)
 };
 
 /**
@@ -357,13 +358,14 @@ inline constexpr std::string_view shapeSuffixString(ShapeSuffix s)
     case ShapeSuffix::None: return "";
     case ShapeSuffix::Len: return "#len";
     case ShapeSuffix::Keys: return "#keys";
+    case ShapeSuffix::Type: return "#type";
     }
     unreachable();
 }
 
 /**
  * Display name for a ShapeSuffix (for diagnostics).
- * Returns "", "len", or "keys".
+ * Returns "", "len", "keys", or "type".
  */
 inline constexpr std::string_view shapeSuffixName(ShapeSuffix s)
 {
@@ -371,6 +373,7 @@ inline constexpr std::string_view shapeSuffixName(ShapeSuffix s)
     case ShapeSuffix::None: return "";
     case ShapeSuffix::Len: return "len";
     case ShapeSuffix::Keys: return "keys";
+    case ShapeSuffix::Type: return "type";
     }
     unreachable();
 }
@@ -385,6 +388,8 @@ inline std::pair<std::string, ShapeSuffix> parseShapeSuffix(std::string_view dat
         return {std::string(dataPath.substr(0, dataPath.size() - 4)), ShapeSuffix::Len};
     if (dataPath.size() >= 5 && dataPath.substr(dataPath.size() - 5) == "#keys")
         return {std::string(dataPath.substr(0, dataPath.size() - 5)), ShapeSuffix::Keys};
+    if (dataPath.size() >= 5 && dataPath.substr(dataPath.size() - 5) == "#type")
+        return {std::string(dataPath.substr(0, dataPath.size() - 5)), ShapeSuffix::Type};
     return {std::string(dataPath), ShapeSuffix::None};
 }
 

@@ -314,6 +314,10 @@ static std::optional<DepHashValue> computeCurrentHash(
                         keys.push_back(k);
                     return hashSortedKeys(std::move(keys));
                 }
+                case ShapeSuffix::Type:
+                    if (node->is_object()) return DepHashValue(depHash("object"));
+                    if (node->is_array()) return DepHashValue(depHash("array"));
+                    return std::nullopt; // scalar — type changed from container
                 case ShapeSuffix::None:
                     return DepHashValue(depHash(node->dump()));
                 }
@@ -346,6 +350,10 @@ static std::optional<DepHashValue> computeCurrentHash(
                         keys.push_back(k);
                     return hashSortedKeys(std::move(keys));
                 }
+                case ShapeSuffix::Type:
+                    if (node->is_table()) return DepHashValue(depHash("object"));
+                    if (node->is_array()) return DepHashValue(depHash("array"));
+                    return std::nullopt;
                 case ShapeSuffix::None:
                     return DepHashValue(depHash(tomlCanonical(*node)));
                 }
@@ -375,6 +383,9 @@ static std::optional<DepHashValue> computeCurrentHash(
                     }
                     return DepHashValue(depHash(canonical));
                 }
+                case ShapeSuffix::Type:
+                    // Directories are always "object" (key→type mapping)
+                    return DepHashValue(depHash("object"));
                 case ShapeSuffix::None: {
                     auto segments = parseDataPath(dataPath);
                     if (segments.size() != 1) return std::nullopt;
