@@ -272,10 +272,12 @@ struct EvalSettings : Config
         false,
         "verify-eval-trace",
         R"(
-            When enabled, every trace verification hit is cross-checked
-            by also performing fresh evaluation and comparing results.
-            Mismatches are logged as warnings. Intended for debugging
-            trace correctness, not production use.
+            When enabled, performs a complete second evaluation with
+            dependency tracking disabled and compares the result against
+            the traced evaluation. Reports the first value divergence
+            with full attribute path, type information, and derivation
+            input diffs. Intended for debugging trace correctness, not
+            production use.
         )"};
 
     Setting<bool> ignoreExceptionsDuringTry{

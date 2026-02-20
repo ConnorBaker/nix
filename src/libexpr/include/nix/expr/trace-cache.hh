@@ -60,7 +60,26 @@ public:
      * On verify miss: returns a thunk that evaluates freshly via rootLoader.
      */
     Value * getRootValue();
+
+    /**
+     * Cold verification: re-evaluate attrPath from scratch with dependency
+     * tracking disabled (equivalent to --no-eval-trace) and compare against
+     * the traced result. Throws Error on the first value divergence with
+     * full diagnostics including attribute path, type info, and derivation
+     * input diffs.
+     */
+    void verifyCold(const std::string & attrPath, Value & tracedResult);
 };
+
+/**
+ * Recursively compare two Nix values, returning a diagnostic string
+ * on the first mismatch or std::nullopt if they match.
+ * Depth-limited to 20 to avoid infinite recursion on self-referential attrsets.
+ * Diagnostics label the first value "a" and the second "b".
+ */
+std::optional<std::string> deepCompare(
+    EvalState & state, Value & a, Value & b,
+    const std::string & path, int depth = 0);
 
 /**
  * Eval trace performance counters, active when NIX_SHOW_STATS is set.

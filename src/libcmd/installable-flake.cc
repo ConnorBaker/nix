@@ -107,6 +107,9 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
 
     state->forceValue(*vp, noPos);
 
+    if (state->settings.verifyTraceCache)
+        evalCache->verifyCold(resolvedPath, *vp);
+
     if (vp->type() != nAttrs || !state->isDerivation(*vp)) {
         if (std::optional derivedPathWithInfo = trySinglePathToDerivedPaths(
                 *vp, noPos, fmt("while evaluating the flake output attribute '%s'", resolvedPath))) {
@@ -227,18 +230,27 @@ std::pair<Value *, PosIdx> InstallableFlake::toValue(EvalState & state)
     Suggestions suggestions;
     auto emptyArgs = state.buildBindings(0).finish();
 
+    std::pair<Value *, PosIdx> found{nullptr, noPos};
     for (auto & attrPath : attrPaths) {
         debug("trying flake output attribute '%s'", attrPath);
         try {
-            auto result = findAlongAttrPath(state, attrPath, *emptyArgs, *root);
+            found = findAlongAttrPath(state, attrPath, *emptyArgs, *root);
             resolvedAttrPath_ = attrPath;
-            return result;
+            break;
         } catch (Error & e) {
             suggestions += e.info().suggestions;
         }
     }
 
-    throw Error(suggestions, "flake '%s' does not provide attribute %s", flakeRef, showAttrPaths(attrPaths));
+    if (!found.first)
+        throw Error(suggestions, "flake '%s' does not provide attribute %s", flakeRef, showAttrPaths(attrPaths));
+
+    if (state.settings.verifyTraceCache) {
+        state.forceValue(*found.first, noPos);
+        evalCache->verifyCold(resolvedAttrPath_, *found.first);
+    }
+
+    return found;
 }
 
 
