@@ -141,7 +141,6 @@ struct TracedExpr : Expr, gc
     void materializeOrigExprAttrs(Value & v, const std::vector<Symbol> & childNames,
                                    Value * prePopulatedParent = nullptr);
     void replayTrace(TraceId traceId);
-    void recordSiblingTrace(TracedExpr * parentEC, Symbol siblingName, Value & v);
     void sortChildNames(std::vector<Symbol> & names) const;
 };
 
@@ -369,13 +368,6 @@ void TracedExpr::replayTrace(TraceId traceId)
     }
 }
 
-void TracedExpr::recordSiblingTrace(TracedExpr * /* parentEC */, Symbol /* siblingName */, Value & /* v */)
-{
-    // Disabled: with dep separation (no parent dep merging), sibling traces
-    // recorded with empty deps always verify as valid, returning stale results.
-    // Siblings will be evaluated fresh when needed and get proper deps.
-}
-
 // navigateToReal — real tree navigation for fresh evaluation
 Value * TracedExpr::navigateToReal()
 {
@@ -425,10 +417,8 @@ Value * TracedExpr::navigateToReal()
                     wrapper->origEnv = attr.value->thunk().env;
                     attr.value->mkThunk(attr.value->thunk().env, wrapper);
                 }
-                else if (!attr.value->isThunk())
-                {
-                    recordSiblingTrace(parentEC, attr.name, *attr.value);
-                }
+                // Non-thunk siblings are left alone. Each sibling's TracedExpr
+                // handles its own tracing independently when accessed.
             }
 
             auto * attr = v->attrs()->get(step.sym);
@@ -624,17 +614,8 @@ void TracedExpr::evaluateFresh(Value & v)
             debug("trace recording failed for '%s': %s", attrPathStr(), e.what());
         }
 
-        // Store forced scalar children of derivation targets
-        if (!origExpr && target->type() == nAttrs && cache->state.isDerivation(*target)) {
-            for (auto & attr : *target->attrs()) {
-                if (!attr.value->isThunk()) {
-                    auto t = attr.value->type();
-                    if (t == nString || t == nBool || t == nInt || t == nNull || t == nFloat) {
-                        recordSiblingTrace(this, attr.name, *attr.value);
-                    }
-                }
-            }
-        }
+        // Sibling traces are no longer speculatively recorded. Each sibling's
+        // TracedExpr handles its own tracing independently when accessed.
 
         if (origExpr && std::holds_alternative<std::vector<Symbol>>(attrValue)) {
             materializeOrigExprAttrs(v, std::get<std::vector<Symbol>>(attrValue), target);

@@ -1474,9 +1474,9 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
             if (def) {
                 state.forceValue(*vAttrs, pos);
                 if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
-                    // Record #keys for traced attrset where key was NOT found
+                    // Record #has:key for traced attrset where key was NOT found
                     if (vAttrs->type() == nAttrs)
-                        maybeRecordAttrKeysDep(state.symbols, *vAttrs);
+                        maybeRecordHasKeyDep(*vAttrs, state.symbols[name], false);
                     def->eval(state, env, v);
                     return;
                 }
@@ -1537,6 +1537,7 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
     Value vTmp;
     Value * vAttrs = &vTmp;
     Value * lastAttrset = nullptr;
+    std::string_view lastKeyName;
 
     e->eval(state, env, vTmp);
 
@@ -1546,19 +1547,20 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
         auto name = getName(i, state, env);
         if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
             lastAttrset = vAttrs;
+            lastKeyName = state.symbols[name];
             vAttrs = j->value;
         } else {
-            // Record #keys for the attrset where the key was NOT found
+            // Record #has:key for the attrset where the key was NOT found
             if (vAttrs->type() == nAttrs)
-                maybeRecordAttrKeysDep(state.symbols, *vAttrs);
+                maybeRecordHasKeyDep(*vAttrs, state.symbols[name], false);
             v.mkBool(false);
             return;
         }
     }
 
-    // Record #keys for the last attrset where the key was found
+    // Record #has:key for the last attrset where the key was found
     if (lastAttrset)
-        maybeRecordAttrKeysDep(state.symbols, *lastAttrset);
+        maybeRecordHasKeyDep(*lastAttrset, lastKeyName, true);
     v.mkBool(true);
 }
 
@@ -2011,7 +2013,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 
         std::ranges::copy(bindings2, std::back_inserter(attrs));
         v.mkAttrs(attrs.alreadySorted());
-        propagateTrackedAttrsAny(v, {&v1, &v2});
+        propagateTrackedAttrsAll(v, {&v1, &v2});
 
         state.nrOpUpdateValuesCopied += bindings2.size();
         return;
@@ -2049,7 +2051,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
     }
 
     v.mkAttrs(attrs.alreadySorted());
-    propagateTrackedAttrsAny(v, {&v1, &v2});
+    propagateTrackedAttrsAll(v, {&v1, &v2});
 
     state.nrOpUpdateValuesCopied += v.attrs()->size();
 }
@@ -2980,6 +2982,8 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return v1.boolean() == v2.boolean();
 
     case nString:
+        maybeRecordRawContentDep(*this, v1);
+        maybeRecordRawContentDep(*this, v2);
         return v1.string_view() == v2.string_view();
 
     case nPath:

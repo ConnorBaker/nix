@@ -81,6 +81,18 @@ enum class DepType : uint8_t {
      *  Enables two-level verification: if Content/Directory dep fails but all
      *  StructuredContent deps pass, trace is valid. */
     StructuredContent = 12,
+    /** Creation-time structural fingerprint (#keys, #len) recorded by
+     *  ExprTracedData::eval() when materializing containers. Same key format
+     *  as StructuredContent. Always ignored during verification — serves as
+     *  a conservative bound that doesn't block fine-grained override. */
+    ImplicitShape = 13,
+    /** Raw readFile content observed by a string builtin (stringLength, hashString,
+     *  substring, match, split, replaceStrings) or eqValues. Recorded at the
+     *  consumer site, not at readFile. Prevents StructuredContent two-level
+     *  override from incorrectly covering raw byte observations.
+     *  Same verification as Content (BLAKE3 of file bytes), but classified as
+     *  Normal (not ContentOverrideable) — cannot be overridden by SC deps. */
+    RawContent = 14,
 };
 
 /**
@@ -101,6 +113,8 @@ inline std::string depTypeName(DepType type)
     case DepType::Exec: return "exec";
     case DepType::NARContent: return "narContent";
     case DepType::StructuredContent: return "structuredContent";
+    case DepType::ImplicitShape: return "implicitShape";
+    case DepType::RawContent: return "rawContent";
     }
     unreachable();
 }
@@ -207,6 +221,8 @@ enum class DepKind : uint8_t {
     Structural = 3,
     /** Parent context dep; verified via trace hash lookup (ParentContext). */
     ParentContext = 4,
+    /** Creation-time structural fingerprint; always ignored during verification (ImplicitShape). */
+    ImplicitStructural = 5,
 };
 
 /**
@@ -225,12 +241,15 @@ inline constexpr DepKind depKind(DepType type)
     case DepType::NARContent:
     case DepType::CopiedPath:
     case DepType::UnhashedFetch:
+    case DepType::RawContent:
         return DepKind::Normal;
     case DepType::CurrentTime:
     case DepType::Exec:
         return DepKind::Volatile;
     case DepType::StructuredContent:
         return DepKind::Structural;
+    case DepType::ImplicitShape:
+        return DepKind::ImplicitStructural;
     case DepType::ParentContext:
         return DepKind::ParentContext;
     }
@@ -248,6 +267,7 @@ inline constexpr std::string_view depKindName(DepKind kind)
     case DepKind::ContentOverrideable: return "contentOverrideable";
     case DepKind::Structural: return "structural";
     case DepKind::ParentContext: return "parentContext";
+    case DepKind::ImplicitStructural: return "implicitStructural";
     }
     unreachable();
 }
@@ -282,6 +302,8 @@ inline bool isBlake3Dep(DepType type) {
     case DepType::System:
     case DepType::ParentContext:
     case DepType::StructuredContent:
+    case DepType::ImplicitShape:
+    case DepType::RawContent:
         return true;
     case DepType::Existence:
     case DepType::CopiedPath:
@@ -410,6 +432,79 @@ inline std::string buildStructuredDepKey(
     result += dataPath;
     result += shapeSuffixString(shape);
     return result;
+}
+
+/**
+ * Build a StructuredContent dep key with a raw string suffix (e.g., "#has:key").
+ * The suffix is appended verbatim — caller must ensure it is properly escaped
+ * (use escapeDataPathKey for key names embedded in the suffix).
+ */
+inline std::string buildStructuredDepKey(
+    std::string_view depKey, StructuredFormat format,
+    std::string_view dataPath, std::string_view rawSuffix)
+{
+    std::string result;
+    result.reserve(depKey.size() + 3 + dataPath.size() + rawSuffix.size());
+    result += depKey;
+    result += '\t';
+    result += structuredFormatChar(format);
+    result += ':';
+    result += dataPath;
+    result += rawSuffix;
+    return result;
+}
+
+/**
+ * Escape a data path key segment for use in dep key construction.
+ * Keys containing '.', '[', ']', '"', '\', or '#' are quoted with "..."
+ * and inner '"' / '\' are backslash-escaped.
+ *
+ * The '#' quoting is critical for preventing ambiguity with shape suffixes
+ * (#len, #keys, #type) and #has: prefixes. A key like "#has:foo" is escaped
+ * to "\"#has:foo\"", which cannot collide with the #has: dep key syntax
+ * because the quoted form never appears bare in a data path.
+ *
+ * Inverse: unescapeDataPathKey (must be used when parsing #has:key from dep keys).
+ */
+inline std::string escapeDataPathKey(std::string_view key)
+{
+    bool needsQuote = false;
+    for (char c : key) {
+        if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\' || c == '#') {
+            needsQuote = true;
+            break;
+        }
+    }
+    if (!needsQuote) return std::string(key);
+
+    std::string out;
+    out.reserve(key.size() + 4);
+    out += '"';
+    for (char c : key) {
+        if (c == '"' || c == '\\')
+            out += '\\';
+        out += c;
+    }
+    out += '"';
+    return out;
+}
+
+/**
+ * Unescape a single data path key segment. Reverses escapeDataPathKey.
+ */
+inline std::string unescapeDataPathKey(std::string_view key)
+{
+    if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
+        std::string result;
+        result.reserve(key.size() - 2);
+        for (size_t i = 1; i + 1 < key.size(); i++) {
+            if (key[i] == '\\' && i + 2 < key.size())
+                i++; // skip backslash
+            result += key[i];
+        }
+        return result;
+    }
+    return std::string(key);
 }
 
 /**

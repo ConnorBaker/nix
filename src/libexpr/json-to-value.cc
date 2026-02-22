@@ -300,35 +300,8 @@ struct JsonDataNode : TracedDataNode {
 
 } // anonymous namespace
 
-// ── Data path key escaping ────────────────────────────────────────────
-// Keys that contain '.', '[', ']', '"', '\', or '#' are quoted with "..." and
-// inner '"' / '\' are backslash-escaped. '#' is quoted to avoid ambiguity with
-// shape dep suffixes (#len, #keys). Matches Nix attr-path conventions.
-
-static std::string escapeDataPathKey(const std::string & key)
-{
-    bool needsQuote = false;
-    for (char c : key) {
-        if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\' || c == '#') {
-            needsQuote = true;
-            break;
-        }
-    }
-    if (!needsQuote) return key;
-
-    std::string out;
-    out.reserve(key.size() + 4);
-    out += '"';
-    for (char c : key) {
-        if (c == '"' || c == '\\')
-            out += '\\';
-        out += c;
-    }
-    out += '"';
-    return out;
-}
-
 // ── ExprTracedData::eval() — vtable emitted here ────────────────────
+// escapeDataPathKey is now in eval-trace-deps.hh (shared with dependency-tracker.cc)
 
 void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
 {
@@ -352,14 +325,28 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         v.mkAttrs(attrs);
         if (DependencyTracker::isActive()) {
             if (keys.empty()) {
-                // Empty objects have no stable internal pointer for provenance
-                // tracking. Record #keys directly so that key additions are caught
-                // by two-level verification even when sibling SC deps pass.
+                // Empty objects have no stable internal pointer for provenance tracking.
+                // Record blocking StructuredContent #keys so that key additions are caught.
                 auto keysKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath, ShapeSuffix::Keys);
                 DependencyTracker::record({depSource, keysKey, DepHashValue(depHash("")), DepType::StructuredContent});
             } else {
-                // Use Bindings* as key: heap-allocated, shared across Value copies
-                registerTracedContainer((const void *)v.attrs(), {depSource, depKey, dataPath, node->formatTag()});
+                // Non-empty: record ImplicitShape #keys fingerprint at creation time.
+                // Sorted key names separated by null bytes for canonical representation.
+                // This dep is always ignored during verification (ImplicitStructural)
+                // but participates in structural recovery via DepKeySets.
+                auto keysKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath, ShapeSuffix::Keys);
+                std::vector<std::string> sortedKeys(keys);
+                std::sort(sortedKeys.begin(), sortedKeys.end());
+                std::string canonical;
+                for (size_t i = 0; i < sortedKeys.size(); i++) {
+                    if (i > 0) canonical += '\0';
+                    canonical += sortedKeys[i];
+                }
+                DependencyTracker::record({depSource, keysKey, DepHashValue(depHash(canonical)), DepType::ImplicitShape});
+
+                // Register provenance for shape-observing builtins (attrNames, etc.)
+                // that record explicit StructuredContent #keys/#has deps.
+                registerTracedContainer((const void *)v.attrs(), &this->provenance);
             }
         }
         break;
@@ -379,14 +366,17 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         v.mkList(list);
         if (DependencyTracker::isActive()) {
             if (sz == 0) {
-                // Empty lists have no stable internal pointer for provenance
-                // tracking. Record #len=0 directly so that element additions
-                // are caught by two-level verification even when sibling SC deps pass.
+                // Empty lists have no stable internal pointer for provenance tracking.
+                // Record blocking StructuredContent #len so that element additions are caught.
                 auto lenKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath, ShapeSuffix::Len);
                 DependencyTracker::record({depSource, lenKey, DepHashValue(depHash("0")), DepType::StructuredContent});
             } else {
-                // Use first element Value* as key: heap-allocated, shared across Value copies
-                registerTracedContainer((const void *)list[0], {depSource, depKey, dataPath, node->formatTag()});
+                // Non-empty: record ImplicitShape #len fingerprint at creation time.
+                auto lenKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath, ShapeSuffix::Len);
+                DependencyTracker::record({depSource, lenKey, DepHashValue(depHash(std::to_string(sz))), DepType::ImplicitShape});
+
+                // Register provenance for shape-observing builtins (length, etc.)
+                registerTracedContainer((const void *)list[0], &this->provenance);
             }
         }
         break;

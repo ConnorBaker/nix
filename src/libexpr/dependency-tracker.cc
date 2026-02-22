@@ -1,5 +1,6 @@
 #include "nix/expr/eval-trace-deps.hh"
 #include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/symbol-table.hh"
@@ -36,20 +37,27 @@ thread_local std::vector<Dep> DependencyTracker::sessionTraces;
 //   - First element Value* for lists (heap-allocated, stable)
 // Populated by ExprTracedData::eval(), queried by shape-observing builtins.
 // Hash-based (unordered): only membership/lookup needed, no ordering required.
-static thread_local std::unordered_map<const void*, TracedContainerProvenance> tracedContainerMap;
+// Stores up to two ProvenanceRefs per container (for multi-source operations like //).
+static thread_local std::unordered_map<const void*, TracedContainerProvenances> tracedContainerMap;
 
 void DependencyTracker::onRootConstruction()
 {
     clearTracedContainerMap();
     clearReadFileProvenanceMap();
+    clearReadFileStringPtrs();
 }
 
-void registerTracedContainer(const void * key, TracedContainerProvenance prov)
+void registerTracedContainer(const void * key, const TracedContainerProvenance * prov)
 {
-    tracedContainerMap.emplace(key, std::move(prov));
+    tracedContainerMap.emplace(key, TracedContainerProvenances{prov, nullptr});
 }
 
-const TracedContainerProvenance * lookupTracedContainer(const void * key)
+void registerTracedContainers(const void * key, TracedContainerProvenances provs)
+{
+    tracedContainerMap.emplace(key, provs);
+}
+
+const TracedContainerProvenances * lookupTracedContainers(const void * key)
 {
     auto it = tracedContainerMap.find(key);
     return it != tracedContainerMap.end() ? &it->second : nullptr;
@@ -508,6 +516,38 @@ void clearReadFileProvenanceMap()
     readFileProvenanceMap.clear();
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// ReadFile string pointer tracking for RawContent deps
+// ═══════════════════════════════════════════════════════════════════════
+
+// Thread-local map from string data pointer (Value::c_str()) to content hash.
+// Populated by prim_readFile, queried by string builtins that observe raw bytes.
+// Key is a raw const char* — valid because readFile strings are GC-allocated
+// and stable for the evaluation session. Typically empty or very small.
+static thread_local std::unordered_map<const char *, Blake3Hash> readFileStringPtrs;
+
+void addReadFileStringPtr(const char * ptr, const Blake3Hash & contentHash)
+{
+    readFileStringPtrs.emplace(ptr, contentHash);
+}
+
+void clearReadFileStringPtrs()
+{
+    readFileStringPtrs.clear();
+}
+
+void maybeRecordRawContentDep(EvalState & state, const Value & v)
+{
+    if (!DependencyTracker::isActive()) return;
+    if (v.type() != nString) return;
+    auto it = readFileStringPtrs.find(v.c_str());
+    if (it == readFileStringPtrs.end()) return;
+    auto * prov = lookupReadFileProvenance(it->second);
+    if (!prov) return;
+    auto [source, key] = resolveProvenance(prov->path, state.getMountToInput());
+    DependencyTracker::record({source, key, DepHashValue(it->second), DepType::RawContent});
+}
+
 std::pair<std::string, std::string> resolveProvenance(
     const CanonPath & absPath,
     const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
@@ -558,11 +598,15 @@ void maybeRecordListLenDep(const Value & v)
     if (!DependencyTracker::isActive()) return;
     if (v.listSize() == 0) return; // Empty lists can't be tracked (no stable key)
     // Use first element Value* as key (matches registration in ExprTracedData::eval)
-    auto * prov = lookupTracedContainer((const void *)v.listView()[0]);
-    if (!prov) return;
-    auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Len);
-    auto hash = depHash(std::to_string(v.listSize()));
-    DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+    auto * provs = lookupTracedContainers((const void *)v.listView()[0]);
+    if (!provs) return;
+    if (provs->shapeModified) return; // Skip — derived container's length differs from source
+    for (auto * prov : {provs->first, provs->second}) {
+        if (!prov) continue;
+        auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Len);
+        auto hash = depHash(std::to_string(v.listSize()));
+        DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+    }
 }
 
 void maybeRecordAttrKeysDep(const SymbolTable & symbols, const Value & v)
@@ -570,10 +614,10 @@ void maybeRecordAttrKeysDep(const SymbolTable & symbols, const Value & v)
     if (!DependencyTracker::isActive()) return;
     if (v.type() != nAttrs) return;
     // Use Bindings* as key (matches registration in ExprTracedData::eval)
-    auto * prov = lookupTracedContainer((const void *)v.attrs());
-    if (!prov) return;
-    auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Keys);
-    // Sorted key names separated by null bytes for canonical representation
+    auto * provs = lookupTracedContainers((const void *)v.attrs());
+    if (!provs) return;
+    if (provs->shapeModified) return; // Skip — derived container's keys differ from source
+    // Compute canonical key hash once (shared across provenances)
     std::vector<std::string_view> keys;
     keys.reserve(v.attrs()->size());
     for (auto & attr : *v.attrs())
@@ -585,60 +629,109 @@ void maybeRecordAttrKeysDep(const SymbolTable & symbols, const Value & v)
         canonical += keys[i];
     }
     auto hash = depHash(canonical);
-    DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+    for (auto * prov : {provs->first, provs->second}) {
+        if (!prov) continue;
+        auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Keys);
+        DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+    }
 }
 
 void maybeRecordTypeDep(const Value & v)
 {
     if (!DependencyTracker::isActive()) return;
-    const TracedContainerProvenance * prov = nullptr;
+    const TracedContainerProvenances * provs = nullptr;
     const char * typeStr = nullptr;
     if (v.type() == nAttrs) {
-        prov = lookupTracedContainer((const void *)v.attrs());
+        provs = lookupTracedContainers((const void *)v.attrs());
         typeStr = "object";
     } else if (v.type() == nList && v.listSize() > 0) {
         // Empty lists can't be tracked (no stable key in provenance map)
-        prov = lookupTracedContainer((const void *)v.listView()[0]);
+        provs = lookupTracedContainers((const void *)v.listView()[0]);
         typeStr = "array";
     }
-    if (!prov) return;
-    auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Type);
-    DependencyTracker::record({prov->depSource, fullKey, DepHashValue(depHash(typeStr)), DepType::StructuredContent});
+    if (!provs) return;
+    auto hash = depHash(typeStr);
+    for (auto * prov : {provs->first, provs->second}) {
+        if (!prov) continue;
+        auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Type);
+        DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+    }
+}
+
+void maybeRecordHasKeyDep(const Value & v, std::string_view keyName, bool exists)
+{
+    if (!DependencyTracker::isActive()) return;
+    if (v.type() != nAttrs) return;
+    auto * provs = lookupTracedContainers((const void *)v.attrs());
+    if (!provs) return;
+    // Skip #has:key on multi-source shapeModified containers — the key may only
+    // exist in one source, so the other source's dep would always fail.
+    if (provs->shapeModified && provs->second) return;
+    auto escaped = escapeDataPathKey(keyName);
+    std::string rawSuffix = "#has:";
+    rawSuffix += escaped;
+    auto hash = depHash(exists ? "1" : "0");
+    for (auto * prov : {provs->first, provs->second}) {
+        if (!prov) continue;
+        auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, rawSuffix);
+        DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Provenance propagation for container-reconstructing operations
 // ═══════════════════════════════════════════════════════════════════════
 
-void propagateTrackedAttrs(const Value & output, const Value & input)
+void propagateTrackedAttrs(const Value & output, const Value & input, bool shapeModifying)
 {
     if (!DependencyTracker::isActive()) return;
     if (output.attrs()->size() == 0) return; // Empty output has no stable key
-    auto * prov = lookupTracedContainer((const void *)input.attrs());
-    if (!prov) return;
-    registerTracedContainer((const void *)output.attrs(), *prov);
+    auto * provs = lookupTracedContainers((const void *)input.attrs());
+    if (!provs) return;
+    auto outProvs = *provs;
+    if (shapeModifying && output.attrs()->size() != input.attrs()->size())
+        outProvs.shapeModified = true;
+    registerTracedContainers((const void *)output.attrs(), outProvs);
 }
 
-void propagateTrackedList(const Value & output, const Value & input)
+void propagateTrackedList(const Value & output, const Value & input, bool shapeModifying)
 {
     if (!DependencyTracker::isActive()) return;
     if (input.listSize() == 0) return; // Empty input has no stable key
-    auto * prov = lookupTracedContainer((const void *)input.listView()[0]);
-    if (!prov) return;
+    auto * provs = lookupTracedContainers((const void *)input.listView()[0]);
+    if (!provs) return;
     if (output.listSize() == 0) return; // Empty output has no stable key
-    registerTracedContainer((const void *)output.listView()[0], *prov);
+    auto outProvs = *provs;
+    if (shapeModifying && output.listSize() != input.listSize())
+        outProvs.shapeModified = true;
+    registerTracedContainers((const void *)output.listView()[0], outProvs);
 }
 
-void propagateTrackedAttrsAny(const Value & output, std::initializer_list<const Value *> inputs)
+void propagateTrackedAttrsAll(const Value & output, std::initializer_list<const Value *> inputs)
 {
     if (!DependencyTracker::isActive()) return;
     if (output.attrs()->size() == 0) return;
+    TracedContainerProvenances merged{};
+    bool anyMismatch = false;
     for (auto * input : inputs) {
-        auto * prov = lookupTracedContainer((const void *)input->attrs());
-        if (prov) {
-            registerTracedContainer((const void *)output.attrs(), *prov);
-            return;
+        auto * provs = lookupTracedContainers((const void *)input->attrs());
+        if (!provs) continue;
+        if (output.attrs()->size() != input->attrs()->size())
+            anyMismatch = true;
+        if (provs->shapeModified)
+            anyMismatch = true;
+        for (auto * p : {provs->first, provs->second}) {
+            if (!p) continue;
+            if (!merged.first) { merged.first = p; continue; }
+            if (p == merged.first) continue;
+            if (!merged.second) { merged.second = p; break; }
+            break;
         }
+        if (merged.first && merged.second) break;
+    }
+    if (merged.first) {
+        merged.shapeModified = anyMismatch;
+        registerTracedContainers((const void *)output.attrs(), merged);
     }
 }
 
@@ -646,13 +739,28 @@ void propagateTrackedListFromAny(const Value & output, size_t nInputs, Value * c
 {
     if (!DependencyTracker::isActive()) return;
     if (output.listSize() == 0) return;
+    TracedContainerProvenances merged{};
+    bool anyMismatch = false;
     for (size_t i = 0; i < nInputs; i++) {
         if (inputs[i]->listSize() == 0) continue;
-        auto * prov = lookupTracedContainer((const void *)inputs[i]->listView()[0]);
-        if (prov) {
-            registerTracedContainer((const void *)output.listView()[0], *prov);
-            return;
+        auto * provs = lookupTracedContainers((const void *)inputs[i]->listView()[0]);
+        if (!provs) continue;
+        if (output.listSize() != inputs[i]->listSize())
+            anyMismatch = true;
+        if (provs->shapeModified)
+            anyMismatch = true;
+        for (auto * p : {provs->first, provs->second}) {
+            if (!p) continue;
+            if (!merged.first) { merged.first = p; continue; }
+            if (p == merged.first) continue;
+            if (!merged.second) { merged.second = p; break; }
+            break;
         }
+        if (merged.first && merged.second) break;
+    }
+    if (merged.first) {
+        merged.shapeModified = anyMismatch;
+        registerTracedContainers((const void *)output.listView()[0], merged);
     }
 }
 

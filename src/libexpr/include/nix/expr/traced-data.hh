@@ -1,6 +1,7 @@
 #pragma once
 ///@file
 
+#include "nix/expr/dependency-tracker.hh"
 #include "nix/expr/eval-gc.hh"
 #include "nix/expr/eval-trace-deps.hh"
 #include "nix/expr/nixexpr.hh"
@@ -70,7 +71,8 @@ struct TracedDataNode : gc {
  *   - Container Values are registered in a thread-local provenance map
  *     (see registerTracedContainer in dependency-tracker.hh). Shape-observing
  *     builtins (length, attrNames, hasAttr) check this map and record
- *     StructuredContent shape deps (#len for lists, #keys for attrsets).
+ *     StructuredContent shape deps (#len for lists, #keys for attrsets,
+ *     #has:key for specific attribute existence checks).
  *     The map key is a stable internal pointer (Bindings* for attrsets,
  *     first-element Value* for lists) that survives Value copies.
  *
@@ -86,6 +88,14 @@ struct ExprTracedData : Expr, gc {
     std::string depSource;  // flake input name (from provenance resolution)
     std::string depKey;     // base file path (before \t separator)
     std::string dataPath;   // dot/bracket path within data structure
+    /// Owned provenance for ProvenanceRef pointers. Contains copies of the
+    /// string fields above — this duplication is intentional because:
+    /// 1. ProvenanceRef consumers see only TracedContainerProvenance*, not ExprTracedData.
+    /// 2. String copies are bounded by file size (one per JSON/TOML/directory node).
+    /// 3. Using string_view into this->depSource etc. would be fragile if ExprTracedData
+    ///    were ever moved (it isn't — GC-allocated — but copies are simpler and safer).
+    /// Must be declared AFTER depSource/depKey/dataPath for correct initialization order.
+    TracedContainerProvenance provenance;
 
     ExprTracedData(TracedDataNode * node, std::string depSource,
                    std::string depKey, std::string dataPath)
@@ -93,6 +103,7 @@ struct ExprTracedData : Expr, gc {
         , depSource(std::move(depSource))
         , depKey(std::move(depKey))
         , dataPath(std::move(dataPath))
+        , provenance{this->depSource, this->depKey, this->dataPath, node->formatTag()}
     {}
 
     void eval(EvalState & state, Env & env, Value & v) override;

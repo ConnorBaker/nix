@@ -24,7 +24,7 @@
  * consumption point (readDir, copyPathToStore, etc.).
  */
 
-#include "helpers.hh"
+#include "eval-trace/helpers.hh"
 
 #include "nix/expr/trace-cache.hh"
 #include "nix/expr/eval.hh"
@@ -203,7 +203,7 @@ TEST_F(DepCopiedPathTest, CopiedPath_SingleTrace_WarmHit)
     {
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
-        auto v = forceRoot(*cache);
+        (void)forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 0);
     }
 }
@@ -238,7 +238,7 @@ TEST_F(DepCopiedPathTest, CopiedPath_SingleTrace_Invalidation)
     {
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
-        auto v = forceRoot(*cache);
+        (void)forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
     }
 }
@@ -302,7 +302,7 @@ TEST_F(DepCopiedPathTest, CopiedPath_MultipleTraces_AllRecordDep)
     {
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
-        auto v = forceRoot(*cache);
+        (void)forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1) << "trace 1 must re-evaluate after modification";
     }
 
@@ -311,7 +311,7 @@ TEST_F(DepCopiedPathTest, CopiedPath_MultipleTraces_AllRecordDep)
     {
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
-        auto v = forceRoot(*cache);
+        (void)forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1) << "trace 2 must re-evaluate after modification (regression: was 0 before fix)";
     }
 }
@@ -353,7 +353,7 @@ TEST_F(DepCopiedPathTest, CopiedPath_ThreeTraces_AllInvalidate)
         testFingerprint = fp;
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
-        auto v = forceRoot(*cache);
+        (void)forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1) << "all three traces must re-evaluate after modification";
     }
 }

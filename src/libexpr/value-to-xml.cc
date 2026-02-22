@@ -44,8 +44,7 @@ static void showAttrs(
 {
     // Record #keys for traced attrsets (provenance keyed by Bindings*)
     if (DependencyTracker::isActive()) {
-        if (auto * prov = lookupTracedContainer((const void *)&attrs)) {
-            auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Keys);
+        if (auto * provs = lookupTracedContainers((const void *)&attrs)) {
             std::vector<std::string_view> keys;
             keys.reserve(attrs.size());
             for (auto & attr : attrs)
@@ -57,7 +56,11 @@ static void showAttrs(
                 canonical += keys[i];
             }
             auto hash = depHash(canonical);
-            DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+            for (auto * prov : {provs->first, provs->second}) {
+                if (!prov) continue;
+                auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Keys);
+                DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+            }
         }
     }
 

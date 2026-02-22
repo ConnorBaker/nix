@@ -197,7 +197,8 @@ static std::optional<DepHashValue> computeCurrentHash(
     const std::unordered_map<std::string, SourcePath> & inputAccessors)
 {
     switch (dep.type) {
-    case DepType::Content: {
+    case DepType::Content:
+    case DepType::RawContent: {
         auto path = resolveDepPath(dep, inputAccessors);
         if (!path) return std::nullopt;
         try {
@@ -275,6 +276,23 @@ static std::optional<DepHashValue> computeCurrentHash(
         std::string filePath = dep.key.substr(0, sep);
         auto [dataPath, shape] = parseShapeSuffix(dep.key.substr(sep + 3));
 
+        // Check for #has:key suffix (finer-grained than #keys, records per-key existence).
+        // This runs only when parseShapeSuffix returns None — no collision with #len/#keys/#type.
+        // Real keys containing '#' are escaped by escapeDataPathKey (quoted with "..."),
+        // so "#has:" can only appear bare at a segment boundary, never inside a quoted key.
+        // The key name after "#has:" may itself be escaped (e.g., "#has:\"key.name\"")
+        // and must be unescaped before use.
+        std::string hasKeyName;
+        bool isHasKey = false;
+        if (shape == ShapeSuffix::None) {
+            auto hasPos = dataPath.find("#has:");
+            if (hasPos != std::string::npos) {
+                isHasKey = true;
+                hasKeyName = unescapeDataPathKey(dataPath.substr(hasPos + 5));
+                dataPath = dataPath.substr(0, hasPos);
+            }
+        }
+
         // Construct a synthetic Content dep to resolve the file path
         Dep fileDep{dep.source, filePath, DepHashValue{Blake3Hash{}}, DepType::Content};
         auto path = resolveDepPath(fileDep, inputAccessors);
@@ -319,6 +337,10 @@ static std::optional<DepHashValue> computeCurrentHash(
                     if (node->is_array()) return DepHashValue(depHash("array"));
                     return std::nullopt; // scalar — type changed from container
                 case ShapeSuffix::None:
+                    if (isHasKey) {
+                        if (!node->is_object()) return std::nullopt;
+                        return DepHashValue(depHash(node->contains(hasKeyName) ? "1" : "0"));
+                    }
                     return DepHashValue(depHash(node->dump()));
                 }
                 break;
@@ -355,6 +377,11 @@ static std::optional<DepHashValue> computeCurrentHash(
                     if (node->is_array()) return DepHashValue(depHash("array"));
                     return std::nullopt;
                 case ShapeSuffix::None:
+                    if (isHasKey) {
+                        if (!node->is_table()) return std::nullopt;
+                        auto & table = toml::get<toml::table>(*node);
+                        return DepHashValue(depHash(table.count(hasKeyName) ? "1" : "0"));
+                    }
                     return DepHashValue(depHash(tomlCanonical(*node)));
                 }
                 break;
@@ -387,6 +414,9 @@ static std::optional<DepHashValue> computeCurrentHash(
                     // Directories are always "object" (key→type mapping)
                     return DepHashValue(depHash("object"));
                 case ShapeSuffix::None: {
+                    if (isHasKey) {
+                        return DepHashValue(depHash(entries.count(hasKeyName) ? "1" : "0"));
+                    }
                     auto segments = parseDataPath(dataPath);
                     if (segments.size() != 1) return std::nullopt;
                     auto it = entries.find(segments[0]);
@@ -402,6 +432,11 @@ static std::optional<DepHashValue> computeCurrentHash(
             return std::nullopt;
         }
     }
+    case DepType::ImplicitShape:
+        // ImplicitShape uses the same key format and hash computation as
+        // StructuredContent, but is never checked during verification.
+        // Fall through to unreachable — this case should never be reached
+        // because verifyTrace skips ImplicitStructural deps entirely.
     case DepType::CurrentTime:
     case DepType::Exec:
     case DepType::ParentContext:
@@ -1308,22 +1343,37 @@ bool TraceStore::verifyTrace(
             continue;
         }
 
+        // ImplicitShape deps (creation-time #keys/#len) are always tolerable.
+        // They serve as conservative structural fingerprints but never block
+        // verification or prevent fine-grained override by leaf SC deps.
+        if (depKind(dep.type) == DepKind::ImplicitStructural) {
+            continue;
+        }
+
         if (depKind(dep.type) == DepKind::Structural) {
             hasStructuralDeps = true;
             structuralDeps.push_back(&dep);
             continue;
         }
 
-        // ParentContext: verify the parent's current trace hash matches
+        // ParentContext: verify the parent's trace hash matches AND parent is valid.
+        // Recursive verification ensures stale parents don't make children appear valid.
+        // verifiedTraceIds cache prevents infinite loops and ensures O(N) total work.
         if (depKind(dep.type) == DepKind::ParentContext) {
             auto parentTraceHash = getCurrentTraceHash(dep.key);
             if (parentTraceHash) {
                 auto * expected = std::get_if<Blake3Hash>(&dep.expectedHash);
                 if (expected && std::memcmp(expected->bytes.data(), parentTraceHash->hash, 32) == 0) {
-                    continue; // parent trace unchanged → dep passes
+                    // Hash matches. Now recursively verify the parent trace is valid.
+                    std::string path(dep.key);
+                    std::replace(path.begin(), path.end(), '\t', '\0');
+                    auto parentRow = lookupTraceRow(path);
+                    if (parentRow && verifyTrace(parentRow->traceId, inputAccessors, state)) {
+                        continue; // parent trace unchanged AND valid → dep passes
+                    }
                 }
             }
-            // Parent trace changed or missing → non-content failure
+            // Parent trace changed, missing, or invalid → non-content failure
             nrVerificationsFailed++;
             hasNonContentFailure = true;
             continue;

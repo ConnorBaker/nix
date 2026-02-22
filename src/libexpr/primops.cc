@@ -2125,12 +2125,14 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
     // values produce deps, so changes to unaccessed parts don't invalidate.
     // For .nix code (consumed via import/evalFile), Content is the only dep;
     // no fine-grained override exists. See design.md Section 4.6.
+    std::optional<Blake3Hash> contentHash;
     if (DependencyTracker::isActive()) {
         auto hash = depHash(s);
         recordDep(path.path, hash, DepType::Content, state.getMountToInput());
         // Set provenance so a subsequent fromJSON/fromTOML can produce lazy
         // structural deps instead of relying solely on the whole-file Content dep.
         addReadFileProvenance({path.path, hash});
+        contentHash = hash;
     }
 
     if (s.find((char) 0) != std::string::npos)
@@ -2156,6 +2158,12 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
             });
     }
     v.mkString(s, context, state.mem);
+
+    // Register string pointer for RawContent tracking. String builtins
+    // (stringLength, hashString, etc.) check this map to record a RawContent
+    // dep that prevents SC two-level override from covering raw byte observations.
+    if (contentHash)
+        addReadFileStringPtr(v.c_str(), *contentHash);
 }
 
 static RegisterPrimOp primop_readFile({
@@ -3455,8 +3463,9 @@ static void prim_hasAttr(EvalState & state, const PosIdx pos, Value ** args, Val
 {
     auto attr = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.hasAttr");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.hasAttr");
-    maybeRecordAttrKeysDep(state.symbols, *args[1]);
-    v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)));
+    auto found = args[1]->attrs()->get(state.symbols.create(attr));
+    maybeRecordHasKeyDep(*args[1], attr, found != nullptr);
+    v.mkBool(found);
 }
 
 static RegisterPrimOp primop_hasAttr({
@@ -3513,7 +3522,7 @@ static void prim_removeAttrs(EvalState & state, const PosIdx pos, Value ** args,
     std::set_difference(
         args[0]->attrs()->begin(), args[0]->attrs()->end(), names.begin(), names.end(), std::back_inserter(attrs));
     v.mkAttrs(attrs.alreadySorted());
-    propagateTrackedAttrs(v, *args[0]);
+    propagateTrackedAttrs(v, *args[0], /*shapeModifying=*/true);
 }
 
 static RegisterPrimOp primop_removeAttrs({
@@ -3685,7 +3694,7 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
     }
 
     v.mkAttrs(attrs.alreadySorted());
-    propagateTrackedAttrsAny(v, {args[0], args[1]});
+    propagateTrackedAttrsAll(v, {args[0], args[1]});
 }
 
 static RegisterPrimOp primop_intersectAttrs({
@@ -3984,7 +3993,7 @@ static void prim_tail(EvalState & state, const PosIdx pos, Value ** args, Value 
     for (const auto & [n, v] : enumerate(list))
         v = args[0]->listView()[n + 1];
     v.mkList(list);
-    propagateTrackedList(v, *args[0]);
+    propagateTrackedList(v, *args[0], /*shapeModifying=*/true);
 }
 
 static RegisterPrimOp primop_tail({
@@ -4075,7 +4084,7 @@ static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Valu
         for (const auto & [n, v] : enumerate(list))
             v = vs[n];
         v.mkList(list);
-        propagateTrackedList(v, *args[1]);
+        propagateTrackedList(v, *args[1], /*shapeModifying=*/true);
     }
 }
 
@@ -4431,7 +4440,7 @@ static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, V
         memcpy(rlist.elems, right.data(), sizeof(Value *) * rsize);
     auto & rVal = attrs.alloc(state.s.right);
     rVal.mkList(rlist);
-    propagateTrackedList(rVal, *args[1]);
+    propagateTrackedList(rVal, *args[1], /*shapeModifying=*/true);
 
     auto wsize = wrong.size();
     auto wlist = state.buildList(wsize);
@@ -4439,7 +4448,7 @@ static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, V
         memcpy(wlist.elems, wrong.data(), sizeof(Value *) * wsize);
     auto & wVal = attrs.alloc(state.s.wrong);
     wVal.mkList(wlist);
-    propagateTrackedList(wVal, *args[1]);
+    propagateTrackedList(wVal, *args[1], /*shapeModifying=*/true);
 
     v.mkAttrs(attrs);
 }
@@ -4493,7 +4502,7 @@ static void prim_groupBy(EvalState & state, const PosIdx pos, Value ** args, Val
         memcpy(list.elems, i.second.data(), sizeof(Value *) * size);
         auto & groupVal = attrs2.alloc(i.first);
         groupVal.mkList(list);
-        propagateTrackedList(groupVal, *args[1]);
+        propagateTrackedList(groupVal, *args[1], /*shapeModifying=*/true);
     }
 
     v.mkAttrs(attrs2.alreadySorted());
@@ -4849,6 +4858,7 @@ static void prim_substring(EvalState & state, const PosIdx pos, Value ** args, V
     NixStringContext context;
     auto s = state.coerceToString(
         pos, *args[2], context, "while evaluating the third argument (the string) passed to builtins.substring");
+    maybeRecordRawContentDep(state, *args[2]); // after coerceToString forces the value
 
     v.mkString(NixUInt(start) >= s->size() ? "" : s->substr(start, _len), context, state.mem);
 }
@@ -4879,6 +4889,7 @@ static void prim_stringLength(EvalState & state, const PosIdx pos, Value ** args
     NixStringContext context;
     auto s =
         state.coerceToString(pos, *args[0], context, "while evaluating the argument passed to builtins.stringLength");
+    maybeRecordRawContentDep(state, *args[0]); // after coerceToString forces the value
     v.mkInt(NixInt::Inner(s->size()));
 }
 
@@ -4904,6 +4915,7 @@ static void prim_hashString(EvalState & state, const PosIdx pos, Value ** args, 
     NixStringContext context; // discarded
     auto s =
         state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.hashString");
+    maybeRecordRawContentDep(state, *args[1]); // after forceString
 
     v.mkString(hashString(*ha, s).to_string(HashFormat::Base16, false), state.mem);
 }
@@ -5060,6 +5072,7 @@ void prim_match(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         NixStringContext context;
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.match");
+        maybeRecordRawContentDep(state, *args[1]); // after forceString
 
         std::cmatch match;
         if (!std::regex_match(str.begin(), str.end(), match, *regex)) {
@@ -5134,6 +5147,7 @@ void prim_split(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         NixStringContext context;
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.split");
+        maybeRecordRawContentDep(state, *args[1]); // after forceString
 
         auto begin = std::cregex_iterator(str.begin(), str.end(), *regex);
         auto end = std::cregex_iterator();
@@ -5293,6 +5307,7 @@ static void prim_replaceStrings(EvalState & state, const PosIdx pos, Value ** ar
     NixStringContext context;
     auto s = state.forceString(
         *args[2], context, pos, "while evaluating the third argument passed to builtins.replaceStrings");
+    maybeRecordRawContentDep(state, *args[2]); // after forceString
 
     std::string res;
     // Loops one past last character to handle the case where 'from' contains an empty string.

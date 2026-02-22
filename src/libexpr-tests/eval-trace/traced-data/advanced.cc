@@ -1,4 +1,4 @@
-#include "helpers.hh"
+#include "eval-trace/helpers.hh"
 
 #include <gtest/gtest.h>
 
