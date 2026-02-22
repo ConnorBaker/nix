@@ -299,6 +299,20 @@ struct TracedContainerProvenances {
 };
 
 /**
+ * Allocate a TracedContainerProvenance in a stable, non-GC thread-local pool.
+ * Returns a pointer that remains valid until the next root DependencyTracker
+ * construction (which clears the pool). Unlike ExprTracedData's GC-allocated
+ * memory, the pool is managed by std::allocator and is never collected by Boehm.
+ *
+ * This fixes a use-after-free where ExprTracedData (GC-allocated, no gc_cleanup)
+ * is collected while the provenance map still holds a pointer to its provenance
+ * field. The GC's interior pointer scanning is disabled (GC_set_all_interior_pointers(0)),
+ * so provenance map entries don't keep ExprTracedData alive.
+ */
+ProvenanceRef allocateProvenance(std::string depSource, std::string depKey,
+                                 std::string dataPath, StructuredFormat format);
+
+/**
  * Register a container in the thread-local provenance map.
  * Called by ExprTracedData::eval() for Object and Array nodes.
  *

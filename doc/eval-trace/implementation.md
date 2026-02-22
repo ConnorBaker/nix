@@ -460,7 +460,7 @@ Container-reconstructing builtins (`mapAttrs`, `filter`, `sort`,
 `removeAttrs`, `intersectAttrs`, `//`, `++`, `partition`, `groupBy`,
 `tail`) propagate provenance from tracked inputs to new output containers
 via `propagateTrackedAttrs()` / `propagateTrackedList()` /
-`propagateTrackedAttrsAny()` / `propagateTrackedListFromAny()`.
+`propagateTrackedAttrsAll()` / `propagateTrackedListFromAny()`.
 This ensures shape deps can be recorded on *derived* containers.
 The map is cleared on root `DependencyTracker` construction via
 `onRootConstruction()`. `escapeDataPathKey()` now quotes `#` to prevent
@@ -517,6 +517,48 @@ dep (BLAKE3 of sorted listing) is the coarse dep; per-entry
 - `trace-store.cc`: `computeCurrentHash` for StructuredContent (including `'d'` format), two-level `verifyTrace` (Content + Directory override), DOM caches (`jsonDomCache`/`tomlDomCache`/`dirListingCache`), `navigateJson`/`navigateToml` helpers
 - `traced-data.cc` (new test): 94 GTest unit tests (62 JSON/TOML + 32 directory)
 
+### Phase 15: ImplicitShape + Soundness Fixes (Session 71)
+
+**ImplicitShape DepType.** Added `DepType::ImplicitShape` (13) and
+`DepKind::ImplicitStructural` (5) to separate creation-time structural
+fingerprints (#keys, #len recorded by `ExprTracedData::eval()`) from
+explicit shape observations (#keys from `attrNames`, #len from `length`).
+ImplicitShape deps use the same key format and BLAKE3 hash as
+StructuredContent but are always skipped during `verifyTrace()` — they
+serve as conservative bounds that participate in structural recovery
+(via `DepKeySets.struct_hash`) but never block fine-grained override.
+Explicit StructuredContent shape deps (from `maybeRecordAttrKeysDep` etc.)
+remain blocking.
+
+**Gap O1 fixed: recursive parent verification.** ParentContext deps in
+`verifyTrace()` now recursively verify the parent trace is valid (not just
+that its stored hash matches). Uses `verifiedTraceIds` cache to prevent
+infinite loops and ensure O(N) total work.
+
+**Gap O2 fixed: speculative sibling removal.** Removed `recordSiblingTrace()`
+declaration, definition, and both call sites. With dep separation (no parent
+dep merging), zero-dep sibling traces always pass verification, returning
+stale results. Each sibling's TracedExpr handles its own tracing independently
+when accessed.
+
+**Rejected: TracingSourceAccessor (automatic I/O dep recording).**
+A `TracingSourceAccessor` SourceAccessor decorator was prototyped that wrapped
+`rootFS` to auto-record Content, Directory, and Existence deps for all file
+I/O. Content and Directory recording worked correctly and eliminated 3
+per-primop recording sites. However, Existence dep recording via
+`maybeLstat()` was too aggressive — it captured deps from symlink resolution,
+import path resolution, and other internal stat calls that don't verify
+correctly in flake contexts (the dep paths don't resolve through
+`inputAccessors` during verification). Restricting to just Content + Directory
+left only 3 primop sites eliminated (readFile, hashFile, readDir), which was
+insufficient justification for the accessor chain complexity:
+an extra layer in every I/O path, `AllowListSourceAccessor*` / `TracingFS*`
+stored pointers, 8 `dynamic_pointer_cast` replacement sites, and an unexplained
+REPL reload regression when removing the `evalFile` dep recording block
+(guarded by `DependencyTracker::isActive()` yet affecting a non-trace test).
+TracingSourceAccessor was reverted in favor of keeping explicit per-primop
+dep recording.
+
 ---
 
 ## 2. File Layout
@@ -531,7 +573,7 @@ The dep-tracker and stat-hash-cache modules have been split and consolidated.)*
 | File | Description |
 |------|-------------|
 | `src/libexpr/include/nix/expr/eval-trace-deps.hh` | Dep vocabulary types: `DepType`, `DepKind`, `Blake3Hash`, `DepHashValue`, `Dep`, `DepKey`, `DepRange`, `StructuredFormat`, `ShapeSuffix`, inline helpers (header-only, includes `depTypeName()`, `depKind()`, `depKindName()`, `isVolatile()`, `isContentOverrideable()`, `buildStructuredDepKey()`, `formatStructuredDepKey()`, etc.) |
-| `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance`, `resolveProvenance`, `dirEntryTypeString`, provenance propagation helpers (`propagateTrackedAttrs`, `propagateTrackedList`, `propagateTrackedAttrsAny`, `propagateTrackedListFromAny`) |
+| `src/libexpr/include/nix/expr/dependency-tracker.hh` | `DependencyTracker` (Adapton DDG builder), `SuspendDepTracking`, dep hash function declarations, `StatHashEntry` bridge API, `ReadFileProvenance`, `resolveProvenance`, `dirEntryTypeString`, provenance propagation helpers (`propagateTrackedAttrs`, `propagateTrackedList`, `propagateTrackedAttrsAll`, `propagateTrackedListFromAny`) |
 | `src/libexpr/dependency-tracker.cc` | Dep recording, hashing, input resolution + internal StatHashCache (L1 concurrent_flat_map + L2 bulk-loaded from TraceStore, dirty tracking for flush) + provenance threading + `dirEntryTypeString` + provenance propagation impls |
 | `src/libexpr/include/nix/expr/traced-data.hh` | `TracedDataNode` virtual interface, `ExprTracedData` Expr subclass for lazy structural dep tracking |
 | `src/libexpr/include/nix/expr/eval-trace-context.hh` | `EvalTraceContext` struct (evalCaches, fileContentHashes, mountToInput, epochMap) |
@@ -1143,21 +1185,20 @@ a child's definition without changing files or accessed siblings go undetected.
 *Test:* `DISABLED_ParentMediatedValueChange_SoundnessGap` in
 `per-sibling-invalidation.cc`.
 
-**Gap O1: ParentContext non-transitive verification — OPEN.**
-`getCurrentTraceHash()` returns the stored `trace_hash` without recursively
-verifying the parent's own deps. If the parent's deps are stale, child
-traces with ParentContext deps won't detect it.
-*Fix:* Recursive parent verification in `verifyTrace()`, or guaranteed
-bottom-up eval order.
+**Gap O1: ParentContext non-transitive verification — FIXED (Session 71).**
+`getCurrentTraceHash()` returned the stored `trace_hash` without recursively
+verifying the parent's own deps. Fixed: `verifyTrace()` now recursively
+verifies the parent trace when encountering a ParentContext dep.
+`verifiedTraceIds` cache prevents infinite loops.
 
-**Gap O2: Empty sibling traces always verify as valid — OPEN.**
-`recordSiblingTrace()` records zero-dep traces for already-forced siblings.
-These always pass verification, even when values would differ.
-*Fix:* Defer sibling trace recording until actual evaluation.
+**Gap O2: Empty sibling traces always verify as valid — FIXED (Session 71).**
+`recordSiblingTrace()` recorded zero-dep traces for already-forced siblings.
+Fixed: removed `recordSiblingTrace()` entirely. Each sibling's TracedExpr
+handles its own tracing independently when accessed.
 
-**Gap O3: `prim_path` expectedHash skips dep recording — OPEN.**
-When `builtins.path` has `sha256` and the store path is valid, `fetchToStore`
-is skipped entirely with no CopiedPath/NARContent dep recorded.
+**Gap O3: `prim_path` expectedHash skips dep recording — FIXED (already).**
+CopiedPath dep is recorded unconditionally after the if-else block that
+handles both the fetchToStore and cache-hit branches.
 *Fix:* Always record dep in `prim_path` regardless of store cache.
 
 Gap 4 requires deeper design work to distinguish raw vs parsed readFile

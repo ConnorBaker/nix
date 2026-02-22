@@ -443,17 +443,23 @@ nor suppress thunk evaluation.
 
 **Shape observation tracking.** When shape-observing builtins (`length`,
 `attrNames`, `hasAttr`) operate on traced data containers, a shape dep is
-recorded as a `StructuredContent` dep with a `#len` or `#keys` suffix.
-This ensures the two-level override cannot serve stale structural data.
-For example, `(toString (length arr)) + "-" + (elemAt arr 0)` correctly
-invalidates when the array length changes, even if element 0 is unchanged.
+recorded as a `StructuredContent` dep with a `#len`, `#keys`, or `#has:key`
+suffix. This ensures the two-level override cannot serve stale structural
+data. For example, `(toString (length arr)) + "-" + (elemAt arr 0)`
+correctly invalidates when the array length changes, even if element 0 is
+unchanged.
 
-The shape dep key format is `"filepath\tf:datapath#len"` for list length
-(BLAKE3 of decimal size string) and `"filepath\tf:datapath#keys"` for
-attrset key sets (BLAKE3 of null-byte-joined sorted key names). Shape deps
-reuse the `StructuredContent` dep type and participate in two-level
-verification unchanged: if the shape changes, the dep fails and the
-override is prevented.
+The shape dep key formats are:
+- `"filepath\tf:datapath#len"` for list length (BLAKE3 of decimal size string)
+- `"filepath\tf:datapath#keys"` for attrset key sets (BLAKE3 of null-byte-joined sorted key names)
+- `"filepath\tf:datapath#has:key"` for specific key existence (BLAKE3 of `"1"` if present, `"0"` if absent)
+
+The `#has:key` suffix provides finer-grained invalidation for `hasAttr`,
+the `?` operator, and select-with-default: only the specific key's existence
+is tracked, not the full key set. Adding an unrelated sibling key does not
+invalidate traces that only checked for one key. Shape deps reuse the
+`StructuredContent` dep type and participate in two-level verification
+unchanged: if the shape changes, the dep fails and the override is prevented.
 
 Shape deps are recorded **only** when a shape-observing builtin is used.
 Point observers (`elemAt`, attribute select `.name`) and shape-preserving
@@ -1020,26 +1026,32 @@ Content dep failure would cause re-evaluation (safe, not stale).
 
 #### Open Gaps
 
-##### Gap 4: Raw + parsed `readFile` from same file
+##### Gap 4 (FIXED): Raw + parsed `readFile` from same file
 
-When both a raw `readFile` (used via e.g. `stringLength`) and a parsed
-`readFile` (used via `fromJSON`) reference the **same file**, the SC deps
-from the parsed path can incorrectly "cover" the Content dep failure for the
-raw path. The two-level override sees: Content dep fails (file changed), SC
-deps from `fromJSON` pass (accessed JSON field unchanged) → override accepts.
-But the raw consumer's result (e.g., `stringLength`) has changed because the
-file size changed.
+**Fixed** by `RawContent` dep type (DepType 14). String builtins that observe
+raw bytes (`stringLength`, `hashString`, `substring`, `match`, `split`,
+`replaceStrings`) and `eqValues` (string case) now call
+`maybeRecordRawContentDep()`, which records a `RawContent` dep when the
+string came from `readFile`. `RawContent` is classified as `DepKind::Normal`
+(not `ContentOverrideable`), so it cannot be overridden by SC deps.
 
-- **Test**: `DISABLED_TracedJSON_RawAndParsedReadFile_ContentChanges` in
-  `traced-data.cc` (DISABLED because this is a known bug)
-- **Positive boundary tests**: 7 tests (`RawOnly_*`, `ParsedOnly_*`,
-  `RawAndParsed_*`) verify the adjacent non-buggy scenarios.
-- **Severity**: Medium. Raw + parsed access to the same file occurs when Nix
-  code reads a file both as text (e.g., for hashing or length checks) and as
-  structured data. This is uncommon but not impossible.
-- **Fix**: Requires distinguishing raw vs parsed `readFile` provenance in the
-  two-level override logic, so SC deps only override Content failures for the
-  *same* readFile usage (parsed), not for a different usage (raw).
+The key insight is recording at the **consumer** (the builtin that observes
+raw bytes), not at the **producer** (readFile). This naturally handles all
+cases including single-readFile-both-ways: the RawContent dep is only recorded
+when a raw-observing builtin actually touches the string.
+
+**Implementation**: A thread-local `readFileStringPtrs` map (pointer → hash)
+is populated by `prim_readFile` and checked by `maybeRecordRawContentDep`.
+O(1) pointer lookup, no BLAKE3 recomputation.
+
+- **Tests**: `TracedJSON_RawAndParsedReadFile_ContentChanges` (re-enabled),
+  `RawContent_PureFromJSON_OverrideStillWorks`,
+  `RawContent_PureRawReadFile_AlwaysReEval`,
+  `RawContent_DoubleFromJSON_BothStructural`,
+  `RawContent_SingleReadFileBothWays`.
+- **Remaining limitation**: `fromJSON`/`fromTOML` do NOT record RawContent
+  (they consume structurally), so pure structural access still benefits from
+  the two-level override.
 
 ##### Gap P1: Parent-mediated value changes
 
@@ -1164,6 +1176,27 @@ However, the extra `readFile` + BLAKE3 hash per path concatenation result adds
 overhead. For directories and nonexistent paths, the dep is not recorded at
 creation time (the `readFile` call in the try-catch throws); it will be recorded
 at the consumption point.
+
+#### P6: `callFunction` with `...` formals records `#keys`
+
+At `eval.cc:1650`, `maybeRecordAttrKeysDep` records the full key set hash on
+the argument attrset, even for functions with `...` (ellipsis) formals. With
+`...`, extra keys are accepted — adding an unrelated key to a tracked argument
+should not invalidate. Per-formal `#has:formalName` deps would be more precise
+but require significant refactoring.
+
+#### P7: Shape deps on derived containers may cause unnecessary re-evaluation
+
+When a container is produced by a key/element-changing operation (`removeAttrs`,
+`filter`, `tail`, `//`, `intersectAttrs`, `++`, `partition`, `groupBy`) and the
+output size differs from the input, shape deps (`#keys`, `#len`) are suppressed
+via the `shapeModified` flag. This is because the runtime hash (from the derived
+container) would mismatch the source file hash during verification. The
+suppression is conservative: when output size equals input size (e.g.,
+`removeAttrs obj []`, `filter (x: true) list`), shape deps are still recorded.
+For multi-source operations (`//`, `intersectAttrs`, `++`), `#has:key` deps are
+also suppressed when `shapeModified` is set, since the key may only exist in one
+source while the dep is recorded against all sources.
 
 ### 9.3 Other Limitations
 

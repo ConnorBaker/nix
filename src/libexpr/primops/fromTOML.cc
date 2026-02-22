@@ -96,12 +96,20 @@ static void normalizeDatetimeFormat(toml::value & t)
 namespace {
 
 struct TomlDataNode : TracedDataNode {
-    toml::value data;
+    toml::value ownedData;       // only meaningful for root node (holds the full DOM)
+    const toml::value * data;    // non-owning pointer into root's DOM
+    TomlDataNode * root;         // GC pointer keeps root alive while children exist
 
-    explicit TomlDataNode(toml::value d) : data(std::move(d)) {}
+    // Root node: owns the DOM
+    explicit TomlDataNode(toml::value d)
+        : ownedData(std::move(d)), data(&ownedData), root(this) {}
+
+    // Child node: references into root's DOM (zero-copy)
+    TomlDataNode(const toml::value * d, TomlDataNode * r)
+        : data(d), root(r) {}
 
     Kind kind() const override {
-        switch (data.type()) {
+        switch (data->type()) {
         case toml::value_t::table: return Kind::Object;
         case toml::value_t::array: return Kind::Array;
         case toml::value_t::string: return Kind::String;
@@ -122,7 +130,7 @@ struct TomlDataNode : TracedDataNode {
 
     std::vector<std::string> objectKeys() const override {
         std::vector<std::string> keys;
-        auto & table = toml::get<toml::table>(data);
+        auto & table = toml::get<toml::table>(*data);
         keys.reserve(table.size());
         for (auto & [k, _] : table)
             keys.push_back(k);
@@ -130,30 +138,30 @@ struct TomlDataNode : TracedDataNode {
     }
 
     TracedDataNode * objectGet(const std::string & key) const override {
-        return new TomlDataNode(toml::get<toml::table>(data).at(key));
+        return new TomlDataNode(&toml::get<toml::table>(*data).at(key), root);
     }
 
     size_t arraySize() const override {
-        return toml::get<std::vector<toml::value>>(data).size();
+        return toml::get<std::vector<toml::value>>(*data).size();
     }
 
     TracedDataNode * arrayGet(size_t index) const override {
-        return new TomlDataNode(toml::get<std::vector<toml::value>>(data).at(index));
+        return new TomlDataNode(&toml::get<std::vector<toml::value>>(*data).at(index), root);
     }
 
     void materializeScalar(EvalState & state, Value & v) const override {
-        switch (data.type()) {
+        switch (data->type()) {
         case toml::value_t::boolean:
-            v.mkBool(toml::get<bool>(data));
+            v.mkBool(toml::get<bool>(*data));
             break;
         case toml::value_t::integer:
-            v.mkInt(toml::get<int64_t>(data));
+            v.mkInt(toml::get<int64_t>(*data));
             break;
         case toml::value_t::floating:
-            v.mkFloat(toml::get<NixFloat>(data));
+            v.mkFloat(toml::get<NixFloat>(*data));
             break;
         case toml::value_t::string: {
-            auto s = toml::get<std::string_view>(data);
+            auto s = toml::get<std::string_view>(*data);
             forceNoNullByte(s);
             v.mkString(s, state.mem);
             break;
@@ -163,7 +171,7 @@ struct TomlDataNode : TracedDataNode {
         case toml::value_t::local_date:
         case toml::value_t::local_time: {
             if (experimentalFeatureSettings.isEnabled(Xp::ParseTomlTimestamps)) {
-                auto mutData = data; // copy for normalization
+                auto mutData = *data; // copy for normalization
 #if HAVE_TOML11_4
                 normalizeDatetimeFormat(mutData);
 #endif
@@ -191,7 +199,7 @@ struct TomlDataNode : TracedDataNode {
 
     std::string canonicalValue() const override {
         std::ostringstream ss;
-        ss << data;
+        ss << *data;
         return ss.str();
     }
 };

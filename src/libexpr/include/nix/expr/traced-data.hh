@@ -17,8 +17,10 @@ struct Value;
 /**
  * Virtual interface for a node in a parsed data tree (JSON, TOML, or directory listing).
  * Format-agnostic: JsonDataNode, TomlDataNode, and DirDataNode implement this.
- * GC-allocated (inherits from gc, not gc_cleanup — std::string members
- * and backing DOM data leak when GC collects, bounded by file size).
+ * GC-allocated with plain gc (no gc_cleanup). DOM internals (malloc'd by
+ * nlohmann::json / toml::value) leak when GC collects, but zero-copy
+ * children (pointer into root's DOM) eliminate the N-copy multiplication
+ * that was the main OOM cause. One leaked DOM per fromJSON/fromTOML call.
  */
 struct TracedDataNode : gc {
     enum class Kind { Object, Array, String, Number, Bool, Null };
@@ -88,14 +90,6 @@ struct ExprTracedData : Expr, gc {
     std::string depSource;  // flake input name (from provenance resolution)
     std::string depKey;     // base file path (before \t separator)
     std::string dataPath;   // dot/bracket path within data structure
-    /// Owned provenance for ProvenanceRef pointers. Contains copies of the
-    /// string fields above — this duplication is intentional because:
-    /// 1. ProvenanceRef consumers see only TracedContainerProvenance*, not ExprTracedData.
-    /// 2. String copies are bounded by file size (one per JSON/TOML/directory node).
-    /// 3. Using string_view into this->depSource etc. would be fragile if ExprTracedData
-    ///    were ever moved (it isn't — GC-allocated — but copies are simpler and safer).
-    /// Must be declared AFTER depSource/depKey/dataPath for correct initialization order.
-    TracedContainerProvenance provenance;
 
     ExprTracedData(TracedDataNode * node, std::string depSource,
                    std::string depKey, std::string dataPath)
@@ -103,7 +97,6 @@ struct ExprTracedData : Expr, gc {
         , depSource(std::move(depSource))
         , depKey(std::move(depKey))
         , dataPath(std::move(dataPath))
-        , provenance{this->depSource, this->depKey, this->dataPath, node->formatTag()}
     {}
 
     void eval(EvalState & state, Env & env, Value & v) override;

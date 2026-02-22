@@ -218,12 +218,20 @@ void parseJSON(EvalState & state, const std::string_view & s_, Value & v)
 namespace {
 
 struct JsonDataNode : TracedDataNode {
-    json data;
+    json ownedData;          // only meaningful for root node (holds the full DOM)
+    const json * data;       // non-owning pointer into root's DOM
+    JsonDataNode * root;     // GC pointer keeps root alive while children exist
 
-    explicit JsonDataNode(json d) : data(std::move(d)) {}
+    // Root node: owns the DOM
+    explicit JsonDataNode(json d)
+        : ownedData(std::move(d)), data(&ownedData), root(this) {}
+
+    // Child node: references into root's DOM (zero-copy)
+    JsonDataNode(const json * d, JsonDataNode * r)
+        : data(d), root(r) {}
 
     Kind kind() const override {
-        switch (data.type()) {
+        switch (data->type()) {
         case json::value_t::object: return Kind::Object;
         case json::value_t::array: return Kind::Array;
         case json::value_t::string: return Kind::String;
@@ -242,45 +250,45 @@ struct JsonDataNode : TracedDataNode {
 
     std::vector<std::string> objectKeys() const override {
         std::vector<std::string> keys;
-        keys.reserve(data.size());
-        for (auto & [k, _] : data.items())
+        keys.reserve(data->size());
+        for (auto & [k, _] : data->items())
             keys.push_back(k);
         return keys;
     }
 
     TracedDataNode * objectGet(const std::string & key) const override {
-        return new JsonDataNode(data.at(key));
+        return new JsonDataNode(&data->at(key), root);
     }
 
-    size_t arraySize() const override { return data.size(); }
+    size_t arraySize() const override { return data->size(); }
 
     TracedDataNode * arrayGet(size_t index) const override {
-        return new JsonDataNode(data.at(index));
+        return new JsonDataNode(&data->at(index), root);
     }
 
     void materializeScalar(EvalState & state, Value & v) const override {
-        switch (data.type()) {
+        switch (data->type()) {
         case json::value_t::string: {
-            auto s = data.get<std::string>();
+            auto s = data->get<std::string>();
             forceNoNullByte(s);
             v.mkString(s, state.mem);
             break;
         }
         case json::value_t::number_integer:
-            v.mkInt(data.get<NixInt::Inner>());
+            v.mkInt(data->get<NixInt::Inner>());
             break;
         case json::value_t::number_unsigned: {
-            auto val = data.get<uint64_t>();
+            auto val = data->get<uint64_t>();
             if (val > static_cast<uint64_t>(std::numeric_limits<NixInt::Inner>::max()))
                 throw Error("unsigned json number %1% outside of Nix integer range", val);
             v.mkInt(static_cast<NixInt::Inner>(val));
             break;
         }
         case json::value_t::number_float:
-            v.mkFloat(data.get<NixFloat>());
+            v.mkFloat(data->get<NixFloat>());
             break;
         case json::value_t::boolean:
-            v.mkBool(data.get<bool>());
+            v.mkBool(data->get<bool>());
             break;
         case json::value_t::null:
         case json::value_t::discarded:
@@ -294,7 +302,7 @@ struct JsonDataNode : TracedDataNode {
     }
 
     std::string canonicalValue() const override {
-        return data.dump();
+        return data->dump();
     }
 };
 
@@ -346,7 +354,10 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
 
                 // Register provenance for shape-observing builtins (attrNames, etc.)
                 // that record explicit StructuredContent #keys/#has deps.
-                registerTracedContainer((const void *)v.attrs(), &this->provenance);
+                // Provenance is allocated in a stable non-GC pool to survive
+                // GC collection of this ExprTracedData object.
+                auto * prov = allocateProvenance(depSource, depKey, dataPath, node->formatTag());
+                registerTracedContainer((const void *)v.attrs(), prov);
             }
         }
         break;
@@ -376,7 +387,8 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
                 DependencyTracker::record({depSource, lenKey, DepHashValue(depHash(std::to_string(sz))), DepType::ImplicitShape});
 
                 // Register provenance for shape-observing builtins (length, etc.)
-                registerTracedContainer((const void *)list[0], &this->provenance);
+                auto * prov = allocateProvenance(depSource, depKey, dataPath, node->formatTag());
+                registerTracedContainer((const void *)list[0], prov);
             }
         }
         break;

@@ -12,6 +12,7 @@
 
 #include <boost/unordered/concurrent_flat_map.hpp>
 
+#include <deque>
 #include <filesystem>
 
 namespace nix {
@@ -40,11 +41,25 @@ thread_local std::vector<Dep> DependencyTracker::sessionTraces;
 // Stores up to two ProvenanceRefs per container (for multi-source operations like //).
 static thread_local std::unordered_map<const void*, TracedContainerProvenances> tracedContainerMap;
 
+// Stable, non-GC pool for provenance data. std::deque never invalidates
+// pointers on push_back, so ProvenanceRef pointers remain valid until clear().
+// Cleared alongside tracedContainerMap on root DependencyTracker construction.
+static thread_local std::deque<TracedContainerProvenance> provenancePool;
+
 void DependencyTracker::onRootConstruction()
 {
     clearTracedContainerMap();
+    provenancePool.clear();
     clearReadFileProvenanceMap();
     clearReadFileStringPtrs();
+}
+
+ProvenanceRef allocateProvenance(std::string depSource, std::string depKey,
+                                 std::string dataPath, StructuredFormat format)
+{
+    provenancePool.emplace_back(TracedContainerProvenance{
+        std::move(depSource), std::move(depKey), std::move(dataPath), format});
+    return &provenancePool.back();
 }
 
 void registerTracedContainer(const void * key, const TracedContainerProvenance * prov)
