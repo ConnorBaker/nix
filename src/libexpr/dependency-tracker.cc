@@ -659,33 +659,35 @@ void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symb
     if (!DependencyTracker::isActive()) return;
     if (v.type() != nAttrs) return;
 
-    // Group attrs by their DataFile origin, collecting key names per origin.
-    // Mixed-provenance attrsets (e.g., after //) naturally get partial recording:
-    // each origin's #keys only covers keys that came from that source file.
+    // Group attrs by their DataFile origin (pointer identity — all attrs from
+    // the same addOrigin() call resolve to the same map entry).
+    // Uses originOfPtr() to avoid copying Pos::Origin (which contains 3 strings
+    // for DataFile variants).
     struct OriginKeys {
-        Pos::DataFile df;
+        const Pos::DataFile * df;
         std::vector<std::string_view> keys;
     };
     std::vector<OriginKeys> groups;
 
     for (auto & attr : *v.attrs()) {
-        auto origin = positions.originOf(attr.pos);
-        auto * df = std::get_if<Pos::DataFile>(&origin);
+        auto * origin = positions.originOfPtr(attr.pos);
+        if (!origin) continue;
+        auto * df = std::get_if<Pos::DataFile>(origin);
         if (!df) continue;
-        // Find or create group for this origin
+        // Find or create group for this origin (pointer identity)
         OriginKeys * group = nullptr;
         for (auto & g : groups) {
-            if (g.df == *df) { group = &g; break; }
+            if (g.df == df) { group = &g; break; }
         }
         if (!group) {
-            groups.push_back({*df, {}});
+            groups.push_back({df, {}});
             group = &groups.back();
         }
         group->keys.push_back(symbols[attr.name]);
     }
 
     for (auto & g : groups) {
-        auto fmt = parseStructuredFormat(g.df.format);
+        auto fmt = parseStructuredFormat(g.df->format);
         if (!fmt) continue;
         std::sort(g.keys.begin(), g.keys.end());
         std::string canonical;
@@ -694,8 +696,8 @@ void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symb
             canonical += g.keys[i];
         }
         auto hash = depHash(canonical);
-        auto fullKey = buildStructuredDepKey(g.df.depKey, *fmt, g.df.dataPath, ShapeSuffix::Keys);
-        DependencyTracker::record({g.df.depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        auto fullKey = buildStructuredDepKey(g.df->depKey, *fmt, g.df->dataPath, ShapeSuffix::Keys);
+        DependencyTracker::record({g.df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
     }
 }
 
@@ -705,18 +707,20 @@ void maybeRecordTypeDep(const PosTable & positions, const Value & v)
 
     if (v.type() == nAttrs) {
         // Scan attrs for any DataFile origin — if found, record #type.
+        // Uses originOfPtr() + pointer identity dedup to avoid string copies.
         auto hash = depHash("object");
-        std::vector<Pos::DataFile> seen;
+        std::vector<const Pos::DataFile *> seen;
         for (auto & attr : *v.attrs()) {
-            auto origin = positions.originOf(attr.pos);
-            auto * df = std::get_if<Pos::DataFile>(&origin);
+            auto * origin = positions.originOfPtr(attr.pos);
+            if (!origin) continue;
+            auto * df = std::get_if<Pos::DataFile>(origin);
             if (!df) continue;
             bool dup = false;
-            for (auto & s : seen) { if (s == *df) { dup = true; break; } }
+            for (auto * s : seen) { if (s == df) { dup = true; break; } }
             if (dup) continue;
             auto fmt = parseStructuredFormat(df->format);
             if (!fmt) continue;
-            seen.push_back(*df);
+            seen.push_back(df);
             auto fullKey = buildStructuredDepKey(df->depKey, *fmt, df->dataPath, ShapeSuffix::Type);
             DependencyTracker::record({df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
         }
@@ -745,8 +749,9 @@ void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbol
         // Key was found — look up the Attr to check its PosIdx origin.
         auto * attr = v.attrs()->get(keyName);
         if (!attr) return;
-        auto origin = positions.originOf(attr->pos);
-        auto * df = std::get_if<Pos::DataFile>(&origin);
+        auto * origin = positions.originOfPtr(attr->pos);
+        if (!origin) return;
+        auto * df = std::get_if<Pos::DataFile>(origin);
         if (!df) return; // Nix-added key (no DataFile provenance) — skip
         auto fmt = parseStructuredFormat(df->format);
         if (!fmt) return;
@@ -756,16 +761,17 @@ void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbol
     } else {
         // Key not found — record against every unique DataFile origin in this attrset.
         // Each origin represents a data file that could have contained the key.
-        std::vector<Pos::DataFile> seen;
+        // Uses pointer identity for dedup (same addOrigin → same map entry).
+        std::vector<const Pos::DataFile *> seen;
         auto hash = depHash("0");
         for (auto & attr : *v.attrs()) {
-            auto origin = positions.originOf(attr.pos);
-            auto * df = std::get_if<Pos::DataFile>(&origin);
+            auto * origin = positions.originOfPtr(attr.pos);
+            if (!origin) continue;
+            auto * df = std::get_if<Pos::DataFile>(origin);
             if (!df) continue;
-            // Deduplicate by content (originOf returns by value).
             bool dup = false;
-            for (auto & s : seen) {
-                if (s == *df) {
+            for (auto * s : seen) {
+                if (s == df) {
                     dup = true;
                     break;
                 }
@@ -773,7 +779,7 @@ void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbol
             if (dup) continue;
             auto fmt = parseStructuredFormat(df->format);
             if (!fmt) continue;
-            seen.push_back(*df);
+            seen.push_back(df);
             auto fullKey = buildStructuredDepKey(df->depKey, *fmt, df->dataPath, rawSuffix);
             DependencyTracker::record({df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
         }

@@ -112,6 +112,14 @@ public:
         return std::monostate{};
     }
 
+    /** Return a pointer to the origin for p, or nullptr. No copies. */
+    const Pos::Origin * originOfPtr(PosIdx p) const
+    {
+        if (auto o = resolve(p))
+            return &o->origin;
+        return nullptr;
+    }
+
     /**
      * Remove all origins from the table.
      */

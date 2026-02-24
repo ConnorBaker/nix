@@ -43,23 +43,25 @@ static void showAttrs(
     PathSet & drvsSeen)
 {
     // Record #keys for traced attrsets using PosIdx-based DataFile origin scanning.
+    // Uses originOfPtr() + pointer identity to avoid copying Pos::Origin strings.
     if (DependencyTracker::isActive()) {
         struct OriginKeys {
-            Pos::DataFile df;
+            const Pos::DataFile * df;
             std::vector<std::string_view> keys;
         };
         std::vector<OriginKeys> groups;
         for (auto & attr : attrs) {
-            auto origin = state.positions.originOf(attr.pos);
-            auto * df = std::get_if<Pos::DataFile>(&origin);
+            auto * origin = state.positions.originOfPtr(attr.pos);
+            if (!origin) continue;
+            auto * df = std::get_if<Pos::DataFile>(origin);
             if (!df) continue;
             OriginKeys * group = nullptr;
-            for (auto & g : groups) { if (g.df == *df) { group = &g; break; } }
-            if (!group) { groups.push_back({*df, {}}); group = &groups.back(); }
+            for (auto & g : groups) { if (g.df == df) { group = &g; break; } }
+            if (!group) { groups.push_back({df, {}}); group = &groups.back(); }
             group->keys.push_back(state.symbols[attr.name]);
         }
         for (auto & g : groups) {
-            auto fmt = parseStructuredFormat(g.df.format);
+            auto fmt = parseStructuredFormat(g.df->format);
             if (!fmt) continue;
             std::sort(g.keys.begin(), g.keys.end());
             std::string canonical;
@@ -68,8 +70,8 @@ static void showAttrs(
                 canonical += g.keys[i];
             }
             auto hash = depHash(canonical);
-            auto fullKey = buildStructuredDepKey(g.df.depKey, *fmt, g.df.dataPath, ShapeSuffix::Keys);
-            DependencyTracker::record({g.df.depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+            auto fullKey = buildStructuredDepKey(g.df->depKey, *fmt, g.df->dataPath, ShapeSuffix::Keys);
+            DependencyTracker::record({g.df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
         }
     }
 
