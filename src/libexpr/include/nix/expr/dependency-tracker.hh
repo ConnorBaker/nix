@@ -44,13 +44,26 @@ struct DependencyTracker {
     uint32_t startIndex;
     /// Append-only list of dep ranges replayed from memoized thunks.
     /// Order preserved: ranges are appended in evaluation encounter order,
-    /// then concatenated by collectTraces() to form the final dep vector.
+    /// then appended by collectTraces() to form the final dep vector
+    /// (filtering out ranges fully within excludedChildRanges).
     std::vector<DepRange> replayedRanges;
 
     /// Deduplication set: prevents adding the same memoized dep range twice
     /// when a Value is re-forced. Pointer keys are safe because Values are
     /// long-lived within a single evaluation context. No ordering needed.
     std::unordered_set<const Value *> replayedValues;
+
+    /// Ranges in sessionTraces belonging to child TracedExpr evaluations.
+    /// Excluded from this tracker's collectTraces() output to prevent
+    /// parent traces from inheriting children's dependencies. Each
+    /// TracedExpr manages its own trace; the parent references children
+    /// via ParentContext deps.
+    std::vector<std::pair<uint32_t, uint32_t>> excludedChildRanges;
+
+    void excludeChildRange(uint32_t start, uint32_t end) {
+        if (start < end)
+            excludedChildRanges.emplace_back(start, end);
+    }
 
     /// Deduplication set for (type, source, key) triples within this tracker
     /// scope. record() checks membership before appending to sessionTraces.
@@ -84,7 +97,7 @@ struct DependencyTracker {
 
     /**
      * Collect all deps: session range [startIndex, current) plus
-     * all replayed epoch ranges.
+     * replayed epoch ranges, skipping any regions in excludedChildRanges.
      */
     std::vector<Dep> collectTraces() const;
 

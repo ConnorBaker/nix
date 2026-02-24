@@ -6,6 +6,10 @@ namespace nix {
 
 void EvalTraceContext::recordThunkDeps(Value & v, uint32_t epochStart)
 {
+    if (&v == skipEpochRecordFor) {
+        skipEpochRecordFor = nullptr;
+        return;
+    }
     uint32_t epochEnd = DependencyTracker::sessionTraces.size();
     if (epochStart < epochEnd)
         epochMap.emplace(&v, DepRange{&DependencyTracker::sessionTraces, epochStart, epochEnd});
@@ -37,6 +41,7 @@ void EvalTraceContext::reset()
     fileContentHashes.clear();
     mountToInput.clear();
     epochMap.clear();
+    skipEpochRecordFor = nullptr;
 }
 
 void EvalTraceContext::flush()

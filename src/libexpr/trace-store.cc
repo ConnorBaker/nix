@@ -1712,10 +1712,19 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     std::vector<Dep> currentDeps;
     bool allComputable = true;
     for (auto & dep : oldDeps) {
-        // ParentContext: compute current parent trace hash directly
+        // ParentContext: compute current parent trace hash AND recursively
+        // verify the parent trace is valid. Without recursive verification,
+        // recovery accepts stale traces when the parent's deps have changed
+        // but the parent's trace hash hasn't been updated yet in the DB.
         if (depKind(dep.type) == DepKind::ParentContext) {
             auto parentTraceHash = getCurrentTraceHash(dep.key);
             if (!parentTraceHash) { allComputable = false; break; }
+            std::string path(dep.key);
+            std::replace(path.begin(), path.end(), '\t', '\0');
+            auto parentRow = lookupTraceRow(path);
+            if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state)) {
+                allComputable = false; break;
+            }
             Blake3Hash b3;
             std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
             currentDeps.push_back({dep.source, dep.key, DepHashValue(b3), dep.type});
@@ -1939,11 +1948,17 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             std::string source = sourceIt != stringTable.end() ? sourceIt->second : "";
             std::string depKey = keyIt != stringTable.end() ? keyIt->second : "";
 
-            // ParentContext: compute current parent trace hash directly
-            // (now cached via traceRowCache + traceDataCache)
+            // ParentContext: compute current parent trace hash AND recursively
+            // verify the parent trace is valid (same invariant as verifyTrace).
             if (depKind(type) == DepKind::ParentContext) {
                 auto parentTraceHash = getCurrentTraceHash(depKey);
                 if (!parentTraceHash) { repComputable = false; break; }
+                std::string path(depKey);
+                std::replace(path.begin(), path.end(), '\t', '\0');
+                auto parentRow = lookupTraceRow(path);
+                if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state)) {
+                    repComputable = false; break;
+                }
                 Blake3Hash b3;
                 std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
                 repCurrentDeps.push_back({source, depKey, DepHashValue(b3), type});

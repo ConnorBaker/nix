@@ -107,17 +107,58 @@ void DependencyTracker::record(const Dep & dep)
 //   1. Directly recorded deps from this scope [startIndex, endIndex)
 //   2. Replayed deps from previously-verified thunks (Adapton: "demanded
 //      computations" whose cached traces are transitively included)
+// When excludedChildRanges is non-empty, session deps within those ranges
+// are skipped, and replayed ranges fully contained within an excluded range
+// are filtered out. This prevents parent TracedExpr traces from inheriting
+// children's deps (children have their own traces + ParentContext deps).
 // The result is the flattened dependency vector for trace storage.
 std::vector<Dep> DependencyTracker::collectTraces() const
 {
     uint32_t endIndex = mySessionTraces->size();
 
-    if (replayedRanges.empty())
-        return {mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex};
+    if (excludedChildRanges.empty()) {
+        // Fast path: no child exclusions needed
+        if (replayedRanges.empty())
+            return {mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex};
 
-    std::vector<Dep> result(mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex);
-    for (auto & r : replayedRanges)
-        result.insert(result.end(), r.deps->begin() + r.start, r.deps->begin() + r.end);
+        std::vector<Dep> result(mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex);
+        for (auto & r : replayedRanges)
+            result.insert(result.end(), r.deps->begin() + r.start, r.deps->begin() + r.end);
+        return result;
+    }
+
+    // Slow path: skip excluded child ranges to prevent parent traces
+    // from inheriting children's dependencies.
+    std::vector<Dep> result;
+
+    // Copy session deps [startIndex, endIndex) skipping excluded ranges
+    uint32_t pos = startIndex;
+    for (auto & [exStart, exEnd] : excludedChildRanges) {
+        uint32_t s = std::max(exStart, startIndex);
+        uint32_t e = std::min(exEnd, endIndex);
+        if (s > pos)
+            result.insert(result.end(), mySessionTraces->begin() + pos, mySessionTraces->begin() + s);
+        if (e > pos)
+            pos = e;
+    }
+    if (pos < endIndex)
+        result.insert(result.end(), mySessionTraces->begin() + pos, mySessionTraces->begin() + endIndex);
+
+    // Append replayed ranges, filtering out any fully within an excluded range
+    for (auto & r : replayedRanges) {
+        bool excluded = false;
+        if (r.deps == mySessionTraces) {
+            for (auto & [exStart, exEnd] : excludedChildRanges) {
+                if (r.start >= exStart && r.end <= exEnd) {
+                    excluded = true;
+                    break;
+                }
+            }
+        }
+        if (!excluded)
+            result.insert(result.end(), r.deps->begin() + r.start, r.deps->begin() + r.end);
+    }
+
     return result;
 }
 

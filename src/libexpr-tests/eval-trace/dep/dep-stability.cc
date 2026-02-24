@@ -1,0 +1,612 @@
+#include "eval-trace/helpers.hh"
+
+#include <gtest/gtest.h>
+
+#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace-deps.hh"
+#include "nix/expr/trace-hash.hh"
+#include "nix/expr/trace-result.hh"
+#include "nix/expr/value.hh"
+
+namespace nix::eval_trace {
+
+using namespace nix::eval_trace::test;
+
+/// Extract dep keys from a dep vector for exact-match assertions.
+static std::vector<std::string> keys(const std::vector<Dep> & deps)
+{
+    std::vector<std::string> out;
+    out.reserve(deps.size());
+    for (auto & d : deps)
+        out.push_back(d.key);
+    return out;
+}
+
+class DepStabilityTest : public ::testing::Test
+{
+protected:
+    void SetUp() override { DependencyTracker::clearSessionTraces(); }
+    void TearDown() override { DependencyTracker::clearSessionTraces(); }
+
+    /// Simulate a parent evaluation that records its own deps, then a child
+    /// evaluates fresh (recording into sessionTraces). Returns the parent's
+    /// collected deps after excluding the child's range.
+    std::vector<std::string> runWithFreshChild(
+        const std::vector<Dep> & parentDeps,
+        const std::vector<Dep> & childDeps)
+    {
+        DependencyTracker::clearSessionTraces();
+        DependencyTracker parent;
+
+        // Parent's own deps (before child)
+        for (auto & d : parentDeps)
+            DependencyTracker::record(d);
+
+        // Child evaluates fresh — records into sessionTraces
+        uint32_t childStart = DependencyTracker::sessionTraces.size();
+        for (auto & d : childDeps)
+            DependencyTracker::record(d);
+        uint32_t childEnd = DependencyTracker::sessionTraces.size();
+
+        // Exclude child range (what ChildRangeExcluder does)
+        parent.excludeChildRange(childStart, childEnd);
+
+        return keys(parent.collectTraces());
+    }
+
+    /// Same as runWithFreshChild but the child's deps are replayed via
+    /// replayedRanges (simulating a cached child replaying its trace).
+    std::vector<std::string> runWithCachedChild(
+        const std::vector<Dep> & parentDeps,
+        const std::vector<Dep> & childReplayedDeps)
+    {
+        DependencyTracker::clearSessionTraces();
+        DependencyTracker parent;
+
+        // Parent's own deps
+        for (auto & d : parentDeps)
+            DependencyTracker::record(d);
+
+        // Child replays cached deps — these go into sessionTraces AND
+        // are added as a replayed range on the parent's tracker
+        uint32_t childStart = DependencyTracker::sessionTraces.size();
+        for (auto & d : childReplayedDeps)
+            DependencyTracker::record(d);
+        uint32_t childEnd = DependencyTracker::sessionTraces.size();
+
+        parent.replayedRanges.push_back(
+            DepRange{&DependencyTracker::sessionTraces, childStart, childEnd});
+
+        // Exclude child range
+        parent.excludeChildRange(childStart, childEnd);
+
+        return keys(parent.collectTraces());
+    }
+};
+
+// ═════════════════════════════════════════════════════════════════════
+// Test 1: Parent deps stable when child evaluates fresh
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_F(DepStabilityTest, ParentDepsStable_ChildFreshEval)
+{
+    std::vector<Dep> parentDeps = {
+        makeContentDep("/parent/a.nix", "pa"),
+        makeContentDep("/parent/b.nix", "pb"),
+    };
+
+    // Run 1: child has 4 deps
+    auto run1 = runWithFreshChild(parentDeps, {
+        makeContentDep("/child/f1.nix", "c1"),
+        makeContentDep("/child/f2.nix", "c2"),
+        makeContentDep("/child/f3.nix", "c3"),
+        makeContentDep("/child/f4.nix", "c4"),
+    });
+
+    // Run 2: child has different deps (different caching state)
+    auto run2 = runWithFreshChild(parentDeps, {
+        makeContentDep("/child/f1.nix", "c1"),
+        makeContentDep("/child/f5.nix", "c5"),
+    });
+
+    // Parent deps must be identical regardless of child's dep set
+    EXPECT_EQ(run1, run2);
+    EXPECT_EQ(run1, (std::vector<std::string>{"/parent/a.nix", "/parent/b.nix"}));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test 2: Parent deps stable when child replays cached deps
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_F(DepStabilityTest, ParentDepsStable_ChildCachedReplay)
+{
+    std::vector<Dep> parentDeps = {
+        makeContentDep("/parent/x.nix", "px"),
+    };
+
+    // Run 1: child evaluates fresh with N deps
+    auto run1 = runWithFreshChild(parentDeps, {
+        makeContentDep("/child/a.nix", "ca"),
+        makeContentDep("/child/b.nix", "cb"),
+        makeContentDep("/child/c.nix", "cc"),
+    });
+
+    // Run 2: child is cached, replays M != N deps
+    auto run2 = runWithCachedChild(parentDeps, {
+        makeContentDep("/child/a.nix", "ca"),
+        makeContentDep("/child/d.nix", "cd"),
+    });
+
+    // Parent sees only its own deps in both cases
+    EXPECT_EQ(run1, run2);
+    EXPECT_EQ(run1, (std::vector<std::string>{"/parent/x.nix"}));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test 3: Oscillation pattern — three consecutive runs
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_F(DepStabilityTest, OscillationPattern_ThreeConsecutiveRuns)
+{
+    std::vector<Dep> parentDeps = {
+        makeContentDep("/parent/root.nix", "pr"),
+    };
+
+    // Run 1 (cold): child evaluates fresh, records {f1, f2, f3, f4}
+    auto run1 = runWithFreshChild(parentDeps, {
+        makeContentDep("/child/f1.nix", "c1"),
+        makeContentDep("/child/f2.nix", "c2"),
+        makeContentDep("/child/f3.nix", "c3"),
+        makeContentDep("/child/f4.nix", "c4"),
+    });
+
+    // Run 2 (warm): child verify-replays subset {f1, f2}
+    auto run2 = runWithCachedChild(parentDeps, {
+        makeContentDep("/child/f1.nix", "c1"),
+        makeContentDep("/child/f2.nix", "c2"),
+    });
+
+    // Run 3 (re-eval): child evaluates fresh again with {f1, f2, f5}
+    auto run3 = runWithFreshChild(parentDeps, {
+        makeContentDep("/child/f1.nix", "c1"),
+        makeContentDep("/child/f2.nix", "c2"),
+        makeContentDep("/child/f5.nix", "c5"),
+    });
+
+    // All three runs produce identical parent deps
+    EXPECT_EQ(run1, run2);
+    EXPECT_EQ(run2, run3);
+    EXPECT_EQ(run1, (std::vector<std::string>{"/parent/root.nix"}));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test 4: Without exclusion, parent deps vary (negative test)
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_F(DepStabilityTest, NoExclusion_ParentDepsVary)
+{
+    // Run 1: child has 3 deps, NO exclusion applied
+    {
+        DependencyTracker::clearSessionTraces();
+        DependencyTracker parent;
+        DependencyTracker::record(makeContentDep("/parent/p.nix", "pp"));
+        DependencyTracker::record(makeContentDep("/child/a.nix", "ca"));
+        DependencyTracker::record(makeContentDep("/child/b.nix", "cb"));
+        DependencyTracker::record(makeContentDep("/child/c.nix", "cc"));
+        auto run1 = keys(parent.collectTraces());
+
+        // Run 2: child has different deps, NO exclusion
+        DependencyTracker::clearSessionTraces();
+        DependencyTracker parent2;
+        DependencyTracker::record(makeContentDep("/parent/p.nix", "pp"));
+        DependencyTracker::record(makeContentDep("/child/x.nix", "cx"));
+        auto run2 = keys(parent2.collectTraces());
+
+        // Without exclusion, parent deps DIFFER (this is the bug)
+        EXPECT_NE(run1, run2);
+        EXPECT_EQ(run1.size(), 4u);  // parent + 3 child deps
+        EXPECT_EQ(run2.size(), 2u);  // parent + 1 child dep
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test 5: Multiple children with varying cache states
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_F(DepStabilityTest, MultipleChildren_VaryingCacheState)
+{
+    std::vector<Dep> parentDeps = {
+        makeContentDep("/parent/main.nix", "pm"),
+    };
+
+    // Run 1: C1 fresh (100 deps), C2 cached (50 deps)
+    auto run1 = [&]() {
+        DependencyTracker::clearSessionTraces();
+        DependencyTracker parent;
+
+        for (auto & d : parentDeps)
+            DependencyTracker::record(d);
+
+        // C1 fresh: 100 deps
+        uint32_t c1Start = DependencyTracker::sessionTraces.size();
+        for (int i = 0; i < 100; i++)
+            DependencyTracker::record(
+                makeContentDep("/c1/f" + std::to_string(i) + ".nix", "c1-" + std::to_string(i)));
+        uint32_t c1End = DependencyTracker::sessionTraces.size();
+        parent.excludeChildRange(c1Start, c1End);
+
+        // C2 cached: 50 replayed deps
+        uint32_t c2Start = DependencyTracker::sessionTraces.size();
+        for (int i = 0; i < 50; i++)
+            DependencyTracker::record(
+                makeContentDep("/c2/g" + std::to_string(i) + ".nix", "c2-" + std::to_string(i)));
+        uint32_t c2End = DependencyTracker::sessionTraces.size();
+        parent.replayedRanges.push_back(
+            DepRange{&DependencyTracker::sessionTraces, c2Start, c2End});
+        parent.excludeChildRange(c2Start, c2End);
+
+        return keys(parent.collectTraces());
+    }();
+
+    // Run 2: C1 cached (30 deps), C2 fresh (80 deps)
+    auto run2 = [&]() {
+        DependencyTracker::clearSessionTraces();
+        DependencyTracker parent;
+
+        for (auto & d : parentDeps)
+            DependencyTracker::record(d);
+
+        // C1 cached: 30 replayed deps
+        uint32_t c1Start = DependencyTracker::sessionTraces.size();
+        for (int i = 0; i < 30; i++)
+            DependencyTracker::record(
+                makeContentDep("/c1/f" + std::to_string(i) + ".nix", "c1-" + std::to_string(i)));
+        uint32_t c1End = DependencyTracker::sessionTraces.size();
+        parent.replayedRanges.push_back(
+            DepRange{&DependencyTracker::sessionTraces, c1Start, c1End});
+        parent.excludeChildRange(c1Start, c1End);
+
+        // C2 fresh: 80 deps
+        uint32_t c2Start = DependencyTracker::sessionTraces.size();
+        for (int i = 0; i < 80; i++)
+            DependencyTracker::record(
+                makeContentDep("/c2/g" + std::to_string(i) + ".nix", "c2-" + std::to_string(i)));
+        uint32_t c2End = DependencyTracker::sessionTraces.size();
+        parent.excludeChildRange(c2Start, c2End);
+
+        return keys(parent.collectTraces());
+    }();
+
+    EXPECT_EQ(run1, run2);
+    EXPECT_EQ(run1, (std::vector<std::string>{"/parent/main.nix"}));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test 6: Exclusion composes with replayed ranges within child scope
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_F(DepStabilityTest, ExclusionPlusReplayedRanges_Composable)
+{
+    DependencyTracker::clearSessionTraces();
+    DependencyTracker parent;
+
+    DependencyTracker::record(makeContentDep("/parent/p.nix", "pp"));
+
+    // Child evaluates and also triggers epoch replay within its scope.
+    // Both the child's fresh deps AND replayed deps fall within the
+    // excluded range and must be filtered.
+    uint32_t childStart = DependencyTracker::sessionTraces.size();
+    DependencyTracker::record(makeContentDep("/child/fresh1.nix", "cf1"));
+    DependencyTracker::record(makeContentDep("/child/fresh2.nix", "cf2"));
+
+    // Simulate epoch replay within child's scope: adds a replayed range
+    // to parent that falls within the child's excluded range.
+    uint32_t replayStart = DependencyTracker::sessionTraces.size();
+    DependencyTracker::record(makeContentDep("/child/replayed.nix", "cr"));
+    uint32_t replayEnd = DependencyTracker::sessionTraces.size();
+    parent.replayedRanges.push_back(
+        DepRange{&DependencyTracker::sessionTraces, replayStart, replayEnd});
+
+    uint32_t childEnd = DependencyTracker::sessionTraces.size();
+
+    // More parent deps after child
+    DependencyTracker::record(makeContentDep("/parent/q.nix", "pq"));
+
+    parent.excludeChildRange(childStart, childEnd);
+
+    auto deps = keys(parent.collectTraces());
+    // Only parent deps survive — child's fresh and replayed deps excluded
+    EXPECT_EQ(deps, (std::vector<std::string>{"/parent/p.nix", "/parent/q.nix"}));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test 7: Per-sibling dep chain detects file change (TraceStore level)
+//
+// Reproduces the relative-paths-lockfile regression mechanism:
+// Child y has per-sibling ParentContext dep on sibling x.
+// Sibling x has a Content dep on a file.
+// When the file changes, the chain y→x→file must detect it.
+// ═════════════════════════════════════════════════════════════════════
+
+class DepStabilityStoreTest : public TraceStoreFixture
+{
+protected:
+    static constexpr int64_t testCtxHash = 0xDEADBEEF42424242;
+    TraceStore makeDb() { return TraceStore(state.symbols, testCtxHash); }
+};
+
+TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
+{
+    // Simulate: rec { x = readFile f; y = x - 1; }
+    // x reads a file → Content dep. y accesses x → per-sibling ParentContext dep.
+    // When the file changes, y must detect it via the chain:
+    //   y → ParentContext(x) → verify(x) → Content(file) fails → y re-evaluates.
+
+    ScopedCacheDir cacheDir;
+    TempExtFile dataFile("json", "11");
+    auto db = makeDb();
+
+    // Record ROOT trace with zero deps (typical for ROOT)
+    auto rootPath = std::string("");
+    db.record(rootPath, CachedResult(std::vector<Symbol>{}), {}, true);
+    auto rootHash = db.getCurrentTraceHash(rootPath);
+    ASSERT_TRUE(rootHash.has_value());
+
+    // Record "x" trace with Content dep on the data file + ParentContext on ROOT
+    auto xPath = makePath({"x"});
+    auto fileHash = depHashFile(
+        SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
+    std::vector<Dep> xDeps = {
+        Dep{"", dataFile.path.string(), DepHashValue(fileHash), DepType::Content},
+        makeParentContextDep("", *rootHash),
+    };
+    db.record(xPath, CachedResult(int_t{NixInt(11)}), xDeps, false);
+    auto xHash = db.getCurrentTraceHash(toDepKey(xPath));
+    ASSERT_TRUE(xHash.has_value());
+
+    // Record "y" trace with per-sibling ParentContext dep on x
+    auto yPath = makePath({"y"});
+    std::vector<Dep> yDeps = {
+        makeParentContextDep(toDepKey(xPath), *xHash),
+    };
+    db.record(yPath, CachedResult(int_t{NixInt(10)}), yDeps, false);
+
+    // Before file change: y should verify (chain is valid)
+    db.clearSessionCaches();
+    auto yVerify1 = db.verify(yPath, {}, state);
+    ASSERT_TRUE(yVerify1.has_value()) << "y should verify before file change";
+
+    // Change the data file
+    dataFile.modify("13");
+    getFSSourceAccessor()->invalidateCache(CanonPath(dataFile.path.string()));
+    clearStatHashMemoryCache();
+
+    // After file change: y should FAIL verification
+    // Chain: y → ParentContext(x) → verify(x) → Content(file) changed → FAIL
+    db.clearSessionCaches();
+    auto yVerify2 = db.verify(yPath, {}, state);
+    EXPECT_FALSE(yVerify2.has_value())
+        << "y must detect file change via per-sibling dep chain";
+}
+
+TEST_F(DepStabilityStoreTest, PerSiblingChain_NoChange_StillValid)
+{
+    // Same setup as above, but file doesn't change. y should verify.
+    ScopedCacheDir cacheDir;
+    TempExtFile dataFile("json", "42");
+    auto db = makeDb();
+
+    db.record("", CachedResult(std::vector<Symbol>{}), {}, true);
+    auto rootHash = db.getCurrentTraceHash("");
+    ASSERT_TRUE(rootHash.has_value());
+
+    auto xPath = makePath({"x"});
+    auto fileHash = depHashFile(
+        SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
+    db.record(xPath, CachedResult(int_t{NixInt(42)}),
+        {Dep{"", dataFile.path.string(), DepHashValue(fileHash), DepType::Content},
+         makeParentContextDep("", *rootHash)}, false);
+    auto xHash = db.getCurrentTraceHash(toDepKey(xPath));
+    ASSERT_TRUE(xHash.has_value());
+
+    auto yPath = makePath({"y"});
+    db.record(yPath, CachedResult(int_t{NixInt(41)}),
+        {makeParentContextDep(toDepKey(xPath), *xHash)}, false);
+
+    db.clearSessionCaches();
+    auto yVerify = db.verify(yPath, {}, state);
+    EXPECT_TRUE(yVerify.has_value()) << "y should verify when file unchanged";
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test 8: Recovery must not bypass recursive ParentContext verification
+//
+// Regression test for the relative-paths-lockfile failure:
+// verifyTrace correctly fails (sibling's deps changed), but recovery()
+// finds a historical trace where the ParentContext dep hash matches
+// WITHOUT recursively verifying the sibling's trace is valid.
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerification)
+{
+    ScopedCacheDir cacheDir;
+    TempExtFile dataFile("nix", "content_v1");
+    auto db = makeDb();
+
+    // ROOT: stable (no deps that change)
+    db.record("", CachedResult(std::vector<Symbol>{}), {}, true);
+    auto rootHash = db.getCurrentTraceHash("");
+    ASSERT_TRUE(rootHash.has_value());
+
+    // x: Content dep on the data file + ParentContext on ROOT
+    auto xPath = makePath({"x"});
+    auto fileHash = depHashFile(
+        SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
+    db.record(xPath, CachedResult(string_t{"x_v1", {}}),
+        {Dep{"", dataFile.path.string(), DepHashValue(fileHash), DepType::Content},
+         makeParentContextDep("", *rootHash)},
+        false);
+    auto xHash = db.getCurrentTraceHash(toDepKey(xPath));
+    ASSERT_TRUE(xHash.has_value());
+
+    // y: per-sibling ParentContext dep on x only
+    auto yPath = makePath({"y"});
+    db.record(yPath, CachedResult(string_t{"y_v1", {}}),
+        {makeParentContextDep(toDepKey(xPath), *xHash)},
+        false);
+
+    // Verify y before change — should pass
+    db.clearSessionCaches();
+    ASSERT_TRUE(db.verify(yPath, {}, state).has_value());
+
+    // Change the file that x depends on
+    dataFile.modify("content_v2");
+    getFSSourceAccessor()->invalidateCache(CanonPath(dataFile.path.string()));
+    clearStatHashMemoryCache();
+    db.clearSessionCaches();
+
+    // Verify y after change — must FAIL
+    // verifyTrace correctly detects x's Content dep failure via recursive
+    // ParentContext verification. But recovery() must NOT find a stale
+    // historical trace where the ParentContext hash matches without
+    // recursive verification.
+    auto result = db.verify(yPath, {}, state);
+    EXPECT_FALSE(result.has_value())
+        << "recovery must not bypass recursive ParentContext verification";
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test 9: Unrelated input change must NOT invalidate sibling's trace
+//
+// Models the scenario: a flake has inputs depA and depB. Attribute x
+// only uses depA. Changing the lockfile to update depB should NOT
+// invalidate x's trace, because x has no dep on depB.
+// ═════════════════════════════════════════════════════════════════════
+
+TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
+{
+    ScopedCacheDir cacheDir;
+    TempExtFile depAFile("nix", "{ x = 11; }");
+    TempExtFile depBFile("nix", "{ z = 99; }");
+    auto db = makeDb();
+
+    // ROOT trace: no deps (stable)
+    db.record("", CachedResult(std::vector<Symbol>{}), {}, true);
+    auto rootTraceHash = db.getCurrentTraceHash("");
+    ASSERT_TRUE(rootTraceHash.has_value());
+
+    // "x" trace: Content dep on depA file + ParentContext on ROOT
+    auto depAHash = depHashFile(
+        SourcePath(getFSSourceAccessor(), CanonPath(depAFile.path.string())));
+    auto xPath = makePath({"x"});
+    db.record(xPath, CachedResult(int_t{NixInt(11)}),
+        {Dep{"", depAFile.path.string(), DepHashValue(depAHash), DepType::Content},
+         makeParentContextDep("", *rootTraceHash)},
+        false);
+    auto xTraceHash = db.getCurrentTraceHash(toDepKey(xPath));
+    ASSERT_TRUE(xTraceHash.has_value());
+
+    // "z" trace: Content dep on depB file + ParentContext on ROOT
+    auto depBHash = depHashFile(
+        SourcePath(getFSSourceAccessor(), CanonPath(depBFile.path.string())));
+    auto zPath = makePath({"z"});
+    db.record(zPath, CachedResult(int_t{NixInt(99)}),
+        {Dep{"", depBFile.path.string(), DepHashValue(depBHash), DepType::Content},
+         makeParentContextDep("", *rootTraceHash)},
+        false);
+
+    // "y" trace: per-sibling dep on x only (y = x - 1, doesn't touch z)
+    auto yPath = makePath({"y"});
+    db.record(yPath, CachedResult(int_t{NixInt(10)}),
+        {makeParentContextDep(toDepKey(xPath), *xTraceHash)},
+        false);
+
+    // Simulate lockfile change: depB changes, depA stays the same.
+    depBFile.modify("{ z = 100; }");
+    getFSSourceAccessor()->invalidateCache(CanonPath(depBFile.path.string()));
+    clearStatHashMemoryCache();
+    db.clearSessionCaches();
+
+    // y should still verify — y depends on x, x depends on depA, depA is unchanged
+    auto yVerify = db.verify(yPath, {}, state);
+    EXPECT_TRUE(yVerify.has_value())
+        << "y must NOT be invalidated by unrelated depB change";
+
+    // z should be invalidated — z depends on depB which changed
+    auto zVerify = db.verify(zPath, {}, state);
+    EXPECT_FALSE(zVerify.has_value())
+        << "z must be invalidated by depB change";
+
+    // x should still verify — x depends on depA which is unchanged
+    auto xVerify = db.verify(xPath, {}, state);
+    EXPECT_TRUE(xVerify.has_value())
+        << "x must NOT be invalidated by unrelated depB change";
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Test 9: Full integration — rec attrset with file-reading sibling
+//
+// Uses TraceCacheFixture to exercise the complete flow:
+// ChildRangeExcluder + SiblingAccessTracker + ParentContext deps.
+// ═════════════════════════════════════════════════════════════════════
+
+class DepStabilityIntegrationTest : public TraceCacheFixture
+{
+public:
+    DepStabilityIntegrationTest()
+    {
+        testFingerprint = hashString(HashAlgorithm::SHA256, "dep-stability-integration");
+    }
+};
+
+TEST_F(DepStabilityIntegrationTest, SiblingFileChange_PropagatedThroughDepChain)
+{
+    // rec { x = fromJSON(readFile f); y = x - 1; }
+    // When f changes from 11 to 13, y must change from 10 to 12.
+    // The file dep is on x (origExpr sibling). y detects it via
+    // per-sibling ParentContext dep on x's trace hash.
+
+    TempExtFile dataFile("json", "11");
+
+    std::string expr = fmt(R"(
+        rec {
+            x = builtins.fromJSON (builtins.readFile "%s");
+            y = x - 1;
+        }
+    )", dataFile.path.string());
+
+    // Eval 1: cold cache — ROOT + attributes evaluate fresh
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * y = root.attrs()->get(state.symbols.create("y"));
+        state.forceValue(*y->value, noPos);
+        EXPECT_EQ(y->value->integer().value, 10);
+    }
+
+    // Eval 2: warm cache — ROOT materializes TracedExpr children,
+    // x and y evaluate as TracedExprs (their traces are recorded)
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * y = root.attrs()->get(state.symbols.create("y"));
+        state.forceValue(*y->value, noPos);
+        EXPECT_EQ(y->value->integer().value, 10);
+    }
+
+    // Change the file (simulate lockfile update)
+    dataFile.modify("13");
+    invalidateFileCache(dataFile.path);
+
+    // Eval 3: warm cache — must detect file change and produce new result
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * y = root.attrs()->get(state.symbols.create("y"));
+        state.forceValue(*y->value, noPos);
+        EXPECT_EQ(y->value->integer().value, (int64_t)12)
+            << "y must detect file change via per-sibling dep chain on x";
+    }
+}
+
+} // namespace nix::eval_trace

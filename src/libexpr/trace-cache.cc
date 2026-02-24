@@ -3,6 +3,7 @@
 #include "nix/expr/trace-cache.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/eval-trace-context.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/derivations.hh"
@@ -491,17 +492,17 @@ void TracedExpr::evaluateFresh(Value & v)
 {
     DependencyTracker tracker;
 
-    // Track which siblings this navigated child accesses during evaluation.
+    // Track which siblings this child accesses during evaluation.
     // Per-sibling ParentContext deps replace the single whole-parent dep to
     // avoid cascading invalidation when unrelated siblings are added/removed.
     std::optional<SiblingAccessTracker> siblingTracker;
-    if (!origExpr && parentExpr && cache->dbBackend)
+    if (parentExpr && cache->dbBackend)
         siblingTracker.emplace(parentExpr);
 
-    // Append per-sibling or whole-parent ParentContext deps for navigated children.
+    // Append per-sibling or whole-parent ParentContext deps for children.
     // Called from both the success and error paths of evaluateFresh().
     auto appendParentContextDeps = [&](std::vector<Dep> & deps) {
-        if (origExpr || !parentExpr || !cache->dbBackend) return;
+        if (!parentExpr || !cache->dbBackend) return;
         if (siblingTracker && !siblingTracker->accesses.empty()) {
             // Per-sibling ParentContext deps: one dep per accessed sibling
             for (auto & [path, hash] : siblingTracker->accesses) {
@@ -590,12 +591,12 @@ void TracedExpr::evaluateFresh(Value & v)
         // Build the CachedResult for storage
         CachedResult attrValue = buildCachedResult(st, *target);
 
-        // For navigated children (no origExpr), add ParentContext deps linking
+        // For all children with a parent, add ParentContext deps linking
         // this trace to the siblings it accessed during evaluation. Per-sibling
         // deps avoid cascading invalidation: adding/removing an unaccessed
         // sibling doesn't invalidate this child's trace. When zero siblings
         // were accessed, falls back to whole-parent dep for soundness (e.g.,
-        // constant-valued navigated attributes like `version = "1.0"`).
+        // constant-valued attributes like `version = "1.0"`).
         // We use trace_hash (not result hash) because result hash for attrsets
         // only captures attribute names, not values.
         //
@@ -882,6 +883,27 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
         }
         return;
     }
+
+    // Exclude this child TracedExpr's dep range from the parent's trace.
+    // Each TracedExpr manages its own deps via its DependencyTracker in
+    // evaluateFresh(); the parent references children via ParentContext
+    // deps (appendParentContextDeps). Without this exclusion, parent
+    // traces inherit ~30K child deps, making them evaluation-order-dependent.
+    auto * parentTracker = DependencyTracker::activeTracker;
+    uint32_t childRangeStart = DependencyTracker::sessionTraces.size();
+    if (parentTracker && state.traceCtx)
+        state.traceCtx->skipEpochRecordFor = &v;
+
+    struct ChildRangeExcluder {
+        DependencyTracker * parentTracker;
+        uint32_t rangeStart;
+        ~ChildRangeExcluder() {
+            if (parentTracker) {
+                uint32_t rangeEnd = DependencyTracker::sessionTraces.size();
+                parentTracker->excludeChildRange(rangeStart, rangeEnd);
+            }
+        }
+    } childExcluder{parentTracker, childRangeStart};
 
     auto & db = *cache->dbBackend;
 

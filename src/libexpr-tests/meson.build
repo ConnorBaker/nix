@@ -55,6 +55,8 @@ sources = files(
   'eval-trace/dep/hash.cc',
   'eval-trace/dep/format.cc',
   'eval-trace/dep/tracker.cc',
+  'eval-trace/dep/child-range-exclusion.cc',
+  'eval-trace/dep/dep-stability.cc',
   'eval-trace/dep/oracle-basic.cc',
   'eval-trace/dep/oracle-nested.cc',
   'eval-trace/dep/copied-path.cc',

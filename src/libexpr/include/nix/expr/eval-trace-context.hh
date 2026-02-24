@@ -62,6 +62,17 @@ struct EvalTraceContext {
     boost::unordered_flat_map<const Value *, DepRange> epochMap;
 
     /**
+     * Value pointer for which the next recordThunkDeps() call should be
+     * skipped. Set by TracedExpr::eval() to prevent forceValue's post-eval
+     * recordThunkDeps from creating an epoch map entry for TracedExpr
+     * thunks, which would cause parent dep contamination via
+     * replayMemoizedDeps(). Uses Value pointer (not a boolean flag)
+     * so that sub-thunk recordThunkDeps calls within evaluateFresh()
+     * are not incorrectly suppressed.
+     */
+    const Value * skipEpochRecordFor = nullptr;
+
+    /**
      * Record that thunk/app evaluation of `v` produced oracle deps in
      * [epochStart, sessionTraces.size()). Called from forceValue after
      * thunk or app evaluation completes to populate the epoch map
