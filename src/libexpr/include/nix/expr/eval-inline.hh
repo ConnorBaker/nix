@@ -90,7 +90,11 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
-        uint32_t epochStart = traceCtx && DependencyTracker::isActive()
+        // Capture epochStart unconditionally (not gated on isActive()) so that
+        // thunks forced during SuspendDepTracking still get epochMap entries.
+        // Without this, replayMemoizedDeps() can't find deps for values forced
+        // during suspension, causing evaluation-order-dependent dep sets.
+        uint32_t epochStart = traceCtx
             ? DependencyTracker::sessionTraces.size() : 0;
         try {
             v.mkBlackhole();
@@ -104,15 +108,15 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             tryFixupBlackHolePos(v, pos);
             throw;
         }
-        if (traceCtx && DependencyTracker::isActive())
+        if (traceCtx)
             recordThunkDeps(v, epochStart);
     } else if (v.isApp()) {
-        uint32_t epochStart = traceCtx && DependencyTracker::isActive()
+        uint32_t epochStart = traceCtx
             ? DependencyTracker::sessionTraces.size() : 0;
         callFunction(*v.app().left, *v.app().right, v, pos);
-        if (traceCtx && DependencyTracker::isActive())
+        if (traceCtx)
             recordThunkDeps(v, epochStart);
-    } else if (traceCtx && DependencyTracker::isActive()) {
+    } else if (traceCtx) {
         replayMemoizedDeps(v);
     }
 }
