@@ -70,13 +70,15 @@ struct TracedDataNode : gc {
  *     removals) because the cached result is the leaf value, not the
  *     full attrset.
  *
- *   - Container Values are registered in a thread-local provenance map
+ *   - Attrset keys get PosIdx with Pos::DataFile origin at creation time.
+ *     Shape-observing builtins (attrNames, hasAttr) use PosTable::originOf()
+ *     on Attr::pos to find DataFile provenance and record StructuredContent
+ *     shape deps (#keys, #has:key). PosIdx survives attrset operations (//).
+ *
+ *   - List Values are registered in a thread-local provenance map
  *     (see registerTracedContainer in dependency-tracker.hh). Shape-observing
- *     builtins (length, attrNames, hasAttr) check this map and record
- *     StructuredContent shape deps (#len for lists, #keys for attrsets,
- *     #has:key for specific attribute existence checks).
- *     The map key is a stable internal pointer (Bindings* for attrsets,
- *     first-element Value* for lists) that survives Value copies.
+ *     builtins (length) check this map and record #len shape deps.
+ *     The map key is the first-element Value* that survives Value copies.
  *
  * For scalars: records a StructuredContent dep (BLAKE3 of canonical value)
  * and materializes the Nix value.

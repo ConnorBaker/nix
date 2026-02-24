@@ -320,7 +320,17 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         // Eagerly materialize the full key set; each value is a lazy thunk.
         auto keys = node->objectKeys();
         auto attrs = state.buildBindings(keys.size());
-        for (auto & k : keys) {
+
+        // Assign per-key PosIdx with DataFile provenance so that
+        // shape dep functions can use originOf(attr->pos) to determine
+        // each key's origin file — surviving // and other attrset ops.
+        PosTable::Origin origin = state.positions.addOrigin(
+            Pos::DataFile{depSource, depKey, dataPath, structuredFormatChar(node->formatTag())},
+            keys.empty() ? 0 : keys.size());
+        bool tracking = DependencyTracker::isActive() && !keys.empty();
+
+        for (size_t idx = 0; idx < keys.size(); idx++) {
+            auto & k = keys[idx];
             auto escaped = escapeDataPathKey(k);
             auto childPath = dataPath.empty() ? escaped : dataPath + "." + escaped;
             auto * childExpr = new ExprTracedData(
@@ -328,7 +338,8 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
             auto * thunkVal = state.allocValue();
             thunkVal->mkThunk(&state.baseEnv, childExpr);
             forceNoNullByte(k);
-            attrs.insert(state.symbols.create(k), thunkVal);
+            PosIdx keyPos = tracking ? state.positions.add(origin, idx) : PosIdx{};
+            attrs.insert(state.symbols.create(k), thunkVal, keyPos);
         }
         v.mkAttrs(attrs);
         if (DependencyTracker::isActive()) {
@@ -351,13 +362,6 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
                     canonical += sortedKeys[i];
                 }
                 DependencyTracker::record({depSource, keysKey, DepHashValue(depHash(canonical)), DepType::ImplicitShape});
-
-                // Register provenance for shape-observing builtins (attrNames, etc.)
-                // that record explicit StructuredContent #keys/#has deps.
-                // Provenance is allocated in a stable non-GC pool to survive
-                // GC collection of this ExprTracedData object.
-                auto * prov = allocateProvenance(depSource, depKey, dataPath, node->formatTag());
-                registerTracedContainer((const void *)v.attrs(), prov);
             }
         }
         break;

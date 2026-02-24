@@ -42,25 +42,34 @@ static void showAttrs(
     NixStringContext & context,
     PathSet & drvsSeen)
 {
-    // Record #keys for traced attrsets (provenance keyed by Bindings*)
+    // Record #keys for traced attrsets using PosIdx-based DataFile origin scanning.
     if (DependencyTracker::isActive()) {
-        if (auto * provs = lookupTracedContainers((const void *)&attrs)) {
+        struct OriginKeys {
+            Pos::DataFile df;
             std::vector<std::string_view> keys;
-            keys.reserve(attrs.size());
-            for (auto & attr : attrs)
-                keys.push_back(state.symbols[attr.name]);
-            std::sort(keys.begin(), keys.end());
+        };
+        std::vector<OriginKeys> groups;
+        for (auto & attr : attrs) {
+            auto origin = state.positions.originOf(attr.pos);
+            auto * df = std::get_if<Pos::DataFile>(&origin);
+            if (!df) continue;
+            OriginKeys * group = nullptr;
+            for (auto & g : groups) { if (g.df == *df) { group = &g; break; } }
+            if (!group) { groups.push_back({*df, {}}); group = &groups.back(); }
+            group->keys.push_back(state.symbols[attr.name]);
+        }
+        for (auto & g : groups) {
+            auto fmt = parseStructuredFormat(g.df.format);
+            if (!fmt) continue;
+            std::sort(g.keys.begin(), g.keys.end());
             std::string canonical;
-            for (size_t i = 0; i < keys.size(); i++) {
+            for (size_t i = 0; i < g.keys.size(); i++) {
                 if (i > 0) canonical += '\0';
-                canonical += keys[i];
+                canonical += g.keys[i];
             }
             auto hash = depHash(canonical);
-            for (auto * prov : {provs->first, provs->second}) {
-                if (!prov) continue;
-                auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Keys);
-                DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
-            }
+            auto fullKey = buildStructuredDepKey(g.df.depKey, *fmt, g.df.dataPath, ShapeSuffix::Keys);
+            DependencyTracker::record({g.df.depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
         }
     }
 

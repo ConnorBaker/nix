@@ -59,7 +59,7 @@ json printValueAsJSON(
         if (auto i = v.attrs()->get(state.s.outPath))
             return printValueAsJSON(state, strict, *i->value, i->pos, context, copyToStore);
         else {
-            maybeRecordAttrKeysDep(state.symbols, v);
+            maybeRecordAttrKeysDep(state.positions, state.symbols, v);
             out = json::object();
             for (auto & a : v.attrs()->lexicographicOrder(state.symbols)) {
                 try {

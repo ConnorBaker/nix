@@ -277,75 +277,30 @@ struct TracedContainerProvenance {
 
 /**
  * Non-owning pointer to a GC-stable TracedContainerProvenance.
- * Points to the provenance field of an ExprTracedData (which is GC-allocated).
- *
- * Lifetime: valid for the duration of an evaluation session. ExprTracedData
- * objects are GC-allocated and kept alive by thunk references in Value objects.
- * The provenance map is cleared on root DependencyTracker construction (new
- * session), so stale pointers cannot survive across sessions.
- *
- * Raw pointer (not shared_ptr) because: the GC already manages the lifetime
- * of ExprTracedData, and shared_ptr would conflict with GC allocation.
+ * Used for list provenance tracking (lists still use the container map).
  */
 using ProvenanceRef = const TracedContainerProvenance *;
 
 /**
- * Up to two provenance references for a container Value.
- * Supports tracking provenance from two different traced sources,
- * e.g., after `a // b` where both a and b are from traced files.
- *
- * A fixed-size pair (not a vector) because:
- * - Binary operators (//, intersectAttrs) are the only multi-source
- *   container constructors, taking exactly two inputs.
- * - 16 bytes (two pointers), trivially copyable, no heap allocation.
- * - O(1) iteration in maybeRecord* functions (always exactly 2 checks).
- */
-struct TracedContainerProvenances {
-    ProvenanceRef first = nullptr;
-    ProvenanceRef second = nullptr;
-    /** True when the container was produced by a key/element-changing operation
-     *  (removeAttrs, filter, tail, //, intersectAttrs, ++, partition, groupBy)
-     *  AND the output size differs from the input size. When set, #keys and #len
-     *  shape deps are suppressed because the runtime hash (from the derived
-     *  container) would mismatch the source file hash during verification. */
-    bool shapeModified = false;
-};
-
-/**
  * Allocate a TracedContainerProvenance in a stable, non-GC thread-local pool.
- * Returns a pointer that remains valid until the next root DependencyTracker
- * construction (which clears the pool). Unlike ExprTracedData's GC-allocated
- * memory, the pool is managed by std::allocator and is never collected by Boehm.
- *
- * This fixes a use-after-free where ExprTracedData (GC-allocated, no gc_cleanup)
- * is collected while the provenance map still holds a pointer to its provenance
- * field. The GC's interior pointer scanning is disabled (GC_set_all_interior_pointers(0)),
- * so provenance map entries don't keep ExprTracedData alive.
+ * Used for list provenance. Returns a pointer valid until the next root
+ * DependencyTracker construction (which clears the pool).
  */
 ProvenanceRef allocateProvenance(std::string depSource, std::string depKey,
                                  std::string dataPath, StructuredFormat format);
 
 /**
- * Register a container in the thread-local provenance map.
- * Called by ExprTracedData::eval() for Object and Array nodes.
- *
- * The key is a stable internal pointer that survives Value copies:
- * - For attrsets: Bindings* (heap-allocated, shared across copies)
- * - For lists: first element Value* (heap-allocated, shared across copies)
+ * Register a list container in the thread-local provenance map.
+ * The key is the first element Value* (heap-allocated, stable across copies).
  * Empty lists cannot be tracked (no stable internal pointer).
  */
 void registerTracedContainer(const void * key, const TracedContainerProvenance * prov);
 
 /**
- * Register a container with an existing provenance pair (for propagation).
+ * Look up a list container's provenance in the thread-local provenance map.
+ * Returns nullptr if not found. For lists only (attrsets use PosIdx).
  */
-void registerTracedContainers(const void * key, TracedContainerProvenances provs);
-
-/**
- * Look up a container in the thread-local provenance map.
- * Returns nullptr if not found.
- */
-const TracedContainerProvenances * lookupTracedContainers(const void * key);
+const TracedContainerProvenance * lookupTracedContainer(const void * key);
 
 /**
  * Clear the thread-local traced container provenance map.
@@ -360,7 +315,9 @@ void clearTracedContainerMap();
  */
 std::string dirEntryTypeString(std::optional<SourceAccessor::Type> type);
 
+class PosTable;
 class SymbolTable;
+class Symbol;
 
 /**
  * Record a #len StructuredContent dep if the list value came from
@@ -370,52 +327,41 @@ class SymbolTable;
 void maybeRecordListLenDep(const Value & v);
 
 /**
- * Record a #keys StructuredContent dep if the attrset value came from
- * ExprTracedData (checked via traced container provenance map).
+ * Record a #keys StructuredContent dep if the attrset contains attrs
+ * with DataFile provenance (checked via PosTable::originOf on Attr::pos).
+ * Groups by origin — mixed-provenance attrsets get partial recording.
  * No-op if dep tracking is inactive or value is not an attrset.
  */
-void maybeRecordAttrKeysDep(const SymbolTable & symbols, const Value & v);
+void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symbols, const Value & v);
 
 /**
- * Record a #has:key StructuredContent dep if the attrset value came from
- * ExprTracedData. Records depHash("1") if key exists, depHash("0") if not.
- * More precise than #keys — only invalidates when the specific key's
- * existence changes, not when unrelated keys are added/removed.
+ * Record a #has:key StructuredContent dep using PosIdx-based provenance.
+ * For exists=true: checks the found attr's PosIdx origin — if DataFile,
+ * records depHash("1"); if Nix-added (no DataFile origin), skips.
+ * For exists=false: scans all attrs, records depHash("0") against each
+ * unique DataFile origin.
  */
-void maybeRecordHasKeyDep(const Value & v, std::string_view keyName, bool exists);
+void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbols,
+                          const Value & v, Symbol keyName, bool exists);
 
 /**
- * Record a #type StructuredContent dep if the value is a container
- * (attrset/list) that came from ExprTracedData. Records hash("object")
- * for attrsets, hash("array") for lists. Only records when type is
- * explicitly observed (typeOf, isAttrs, isList), NOT at materialization.
+ * Record a #type StructuredContent dep if the value is a container.
+ * For attrsets: uses PosIdx-based DataFile origin scanning.
+ * For lists: uses the existing tracedContainerMap lookup.
  * No-op if dep tracking is inactive or value is not a container.
  */
-void maybeRecordTypeDep(const Value & v);
+void maybeRecordTypeDep(const PosTable & positions, const Value & v);
 
 // ═══════════════════════════════════════════════════════════════════════
-// Provenance propagation for container-reconstructing operations
+// Provenance propagation for list-reconstructing operations
 // ═══════════════════════════════════════════════════════════════════════
 //
-// When builtins like mapAttrs, filter, sort, removeAttrs create new
-// containers from tracked inputs, provenance must be propagated to
-// the output so that subsequent shape observations (attrNames, length)
-// can record shape deps. Without propagation, the output container's
-// Bindings*/Value* is not in the provenance map, and shape deps are
-// silently lost.
+// Attrset provenance uses PosIdx (DataFile origin per Attr) and needs
+// no propagation — PosIdx survives attrset operations (//, mapAttrs,
+// removeAttrs) because Attr objects are copied with their pos field.
 //
-// Example: mapAttrs(f, trackedFromJSON) produces a new attrset with
-// different Bindings*. Without propagation, attrNames on the result
-// would fail to record a #keys dep, creating a soundness gap.
-
-/**
- * Propagate attrset provenance from a single tracked input to the output.
- * Call after building the output attrset (mkAttrs).
- * No-op if dep tracking is inactive, input is not tracked, or output is empty.
- * When shapeModifying is true, sets shapeModified flag on the output provenance
- * if the output size differs from the input size.
- */
-void propagateTrackedAttrs(const Value & output, const Value & input, bool shapeModifying = false);
+// List provenance still uses the container map (first-element Value*
+// → provenance) and requires explicit propagation.
 
 /**
  * Propagate list provenance from a single tracked input to the output.
@@ -425,14 +371,6 @@ void propagateTrackedAttrs(const Value & output, const Value & input, bool shape
  * if the output size differs from the input size.
  */
 void propagateTrackedList(const Value & output, const Value & input, bool shapeModifying = false);
-
-/**
- * Propagate attrset provenance from all tracked inputs, merging up to
- * two distinct provenance refs. Used for // and intersectAttrs where
- * both inputs may be tracked from different files.
- * Sets shapeModified when output size differs from any input's size.
- */
-void propagateTrackedAttrsAll(const Value & output, std::initializer_list<const Value *> inputs);
 
 /**
  * Propagate list provenance from the first tracked input found.

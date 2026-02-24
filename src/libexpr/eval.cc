@@ -1476,7 +1476,7 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
                 if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
                     // Record #has:key for traced attrset where key was NOT found
                     if (vAttrs->type() == nAttrs)
-                        maybeRecordHasKeyDep(*vAttrs, state.symbols[name], false);
+                        maybeRecordHasKeyDep(state.positions, state.symbols, *vAttrs, name, false);
                     def->eval(state, env, v);
                     return;
                 }
@@ -1537,7 +1537,7 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
     Value vTmp;
     Value * vAttrs = &vTmp;
     Value * lastAttrset = nullptr;
-    std::string_view lastKeyName;
+    Symbol lastKeyName;
 
     e->eval(state, env, vTmp);
 
@@ -1547,12 +1547,12 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
         auto name = getName(i, state, env);
         if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
             lastAttrset = vAttrs;
-            lastKeyName = state.symbols[name];
+            lastKeyName = name;
             vAttrs = j->value;
         } else {
             // Record #has:key for the attrset where the key was NOT found
             if (vAttrs->type() == nAttrs)
-                maybeRecordHasKeyDep(*vAttrs, state.symbols[name], false);
+                maybeRecordHasKeyDep(state.positions, state.symbols, *vAttrs, name, false);
             v.mkBool(false);
             return;
         }
@@ -1560,7 +1560,7 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
 
     // Record #has:key for the last attrset where the key was found
     if (lastAttrset)
-        maybeRecordHasKeyDep(*lastAttrset, lastKeyName, true);
+        maybeRecordHasKeyDep(state.positions, state.symbols, *lastAttrset, lastKeyName, true);
     v.mkBool(true);
 }
 
@@ -1647,7 +1647,7 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
 
                 /* Check that each actual argument is listed as a formal
                    argument (unless the attribute match specifies a `...'). */
-                maybeRecordAttrKeysDep(symbols, *args[0]);
+                maybeRecordAttrKeysDep(positions, symbols, *args[0]);
                 if (!formals->ellipsis && attrsUsed != args[0]->attrs()->size()) {
                     /* Nope, so show the first unexpected argument to the
                        user. */
@@ -1980,8 +1980,8 @@ void ExprOpImpl::eval(EvalState & state, Env & env, Value & v)
 void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 {
     state.nrOpUpdates++;
-    maybeRecordAttrKeysDep(state.symbols, v1);
-    maybeRecordAttrKeysDep(state.symbols, v2);
+    maybeRecordAttrKeysDep(state.positions, state.symbols, v1);
+    maybeRecordAttrKeysDep(state.positions, state.symbols, v2);
 
     const Bindings & bindings1 = *v1.attrs();
     if (bindings1.empty()) {
@@ -2013,7 +2013,6 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 
         std::ranges::copy(bindings2, std::back_inserter(attrs));
         v.mkAttrs(attrs.alreadySorted());
-        propagateTrackedAttrsAll(v, {&v1, &v2});
 
         state.nrOpUpdateValuesCopied += bindings2.size();
         return;
@@ -2051,7 +2050,6 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
     }
 
     v.mkAttrs(attrs.alreadySorted());
-    propagateTrackedAttrsAll(v, {&v1, &v2});
 
     state.nrOpUpdateValuesCopied += v.attrs()->size();
 }
@@ -3005,8 +3003,8 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return true;
 
     case nAttrs: {
-        maybeRecordAttrKeysDep(symbols, v1);
-        maybeRecordAttrKeysDep(symbols, v2);
+        maybeRecordAttrKeysDep(positions, symbols, v1);
+        maybeRecordAttrKeysDep(positions, symbols, v2);
         /* If both sets denote a derivation (type = "derivation"),
            then compare their outPaths. */
         if (isDerivation(v1) && isDerivation(v2)) {

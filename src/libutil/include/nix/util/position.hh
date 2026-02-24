@@ -51,7 +51,24 @@ struct Pos
         }
     };
 
-    typedef std::variant<std::monostate, Stdin, String, SourcePath> Origin;
+    /**
+     * Origin for attributes materialized from structured data files
+     * (JSON, TOML, directory listings). Carries provenance info so that
+     * PosTable::originOf() can recover the dep source/key/path without
+     * a separate container provenance map.
+     */
+    struct DataFile
+    {
+        std::string depSource;   ///< flake input name
+        std::string depKey;      ///< file path
+        std::string dataPath;    ///< dot/bracket path within structure
+        char format;             ///< 'j', 't', 'd' (StructuredFormat char)
+
+        bool operator==(const DataFile &) const = default;
+        auto operator<=>(const DataFile &) const = default;
+    };
+
+    typedef std::variant<std::monostate, Stdin, String, SourcePath, DataFile> Origin;
 
     Origin origin = std::monostate();
 

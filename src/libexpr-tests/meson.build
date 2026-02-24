@@ -76,6 +76,7 @@ sources = files(
   'eval-trace/traced-data/readdir-override.cc',
   'eval-trace/traced-data/readdir-shape.cc',
   'eval-trace/traced-data/has-key.cc',
+  'eval-trace/traced-data/has-key-nix-added.cc',
   'eval-trace/traced-data/shape-modified.cc',
   'eval-trace/traced-data/shape-core.cc',
   'eval-trace/traced-data/shape-edge-cases.cc',

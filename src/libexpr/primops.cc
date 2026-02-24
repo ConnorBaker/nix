@@ -539,7 +539,7 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 static void prim_typeOf(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    maybeRecordTypeDep(*args[0]);
+    maybeRecordTypeDep(state.positions, *args[0]);
     switch (args[0]->type()) {
     case nInt:
         v.mkStringNoCopy("int"_sds);
@@ -3308,7 +3308,7 @@ static RegisterPrimOp primop_path({
 static void prim_attrNames(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrNames");
-    maybeRecordAttrKeysDep(state.symbols, *args[0]);
+    maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
 
     auto list = state.buildList(args[0]->attrs()->size());
 
@@ -3336,7 +3336,7 @@ static RegisterPrimOp primop_attrNames({
 static void prim_attrValues(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrValues");
-    maybeRecordAttrKeysDep(state.symbols, *args[0]);
+    maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
 
     auto list = state.buildList(args[0]->attrs()->size());
 
@@ -3463,8 +3463,9 @@ static void prim_hasAttr(EvalState & state, const PosIdx pos, Value ** args, Val
 {
     auto attr = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.hasAttr");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.hasAttr");
-    auto found = args[1]->attrs()->get(state.symbols.create(attr));
-    maybeRecordHasKeyDep(*args[1], attr, found != nullptr);
+    auto sym = state.symbols.create(attr);
+    auto found = args[1]->attrs()->get(sym);
+    maybeRecordHasKeyDep(state.positions, state.symbols, *args[1], sym, found != nullptr);
     v.mkBool(found);
 }
 
@@ -3483,7 +3484,7 @@ static RegisterPrimOp primop_hasAttr({
 static void prim_isAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    maybeRecordTypeDep(*args[0]);
+    maybeRecordTypeDep(state.positions, *args[0]);
     v.mkBool(args[0]->type() == nAttrs);
 }
 
@@ -3522,7 +3523,6 @@ static void prim_removeAttrs(EvalState & state, const PosIdx pos, Value ** args,
     std::set_difference(
         args[0]->attrs()->begin(), args[0]->attrs()->end(), names.begin(), names.end(), std::back_inserter(attrs));
     v.mkAttrs(attrs.alreadySorted());
-    propagateTrackedAttrs(v, *args[0], /*shapeModifying=*/true);
 }
 
 static RegisterPrimOp primop_removeAttrs({
@@ -3633,8 +3633,8 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
 {
     state.forceAttrs(*args[0], pos, "while evaluating the first argument passed to builtins.intersectAttrs");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.intersectAttrs");
-    maybeRecordAttrKeysDep(state.symbols, *args[0]);
-    maybeRecordAttrKeysDep(state.symbols, *args[1]);
+    maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
+    maybeRecordAttrKeysDep(state.positions, state.symbols, *args[1]);
 
     auto & left = *args[0]->attrs();
     auto & right = *args[1]->attrs();
@@ -3694,7 +3694,6 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
     }
 
     v.mkAttrs(attrs.alreadySorted());
-    propagateTrackedAttrsAll(v, {args[0], args[1]});
 }
 
 static RegisterPrimOp primop_intersectAttrs({
@@ -3803,11 +3802,10 @@ static void prim_mapAttrs(EvalState & state, const PosIdx pos, Value ** args, Va
         Value * vName = Value::toPtr(state.symbols[i.name]);
         Value * vFun2 = state.allocValue();
         vFun2->mkApp(args[0], vName);
-        attrs.alloc(i.name).mkApp(vFun2, i.value);
+        attrs.alloc(i.name, i.pos).mkApp(vFun2, i.value);
     }
 
     v.mkAttrs(attrs.alreadySorted());
-    propagateTrackedAttrs(v, *args[1]);
 }
 
 static RegisterPrimOp primop_mapAttrs({
@@ -3838,6 +3836,7 @@ static void prim_zipAttrsWith(EvalState & state, const PosIdx pos, Value ** args
     {
         size_t size = 0;
         size_t pos = 0;
+        PosIdx attrPos;  // PosIdx from first input attr (preserves DataFile origin)
         std::optional<ListBuilder> list;
     };
 
@@ -3851,8 +3850,12 @@ static void prim_zipAttrsWith(EvalState & state, const PosIdx pos, Value ** args
     for (auto & vElem : listItems) {
         state.forceAttrs(
             *vElem, noPos, "while evaluating a value of the list passed as second argument to builtins.zipAttrsWith");
-        for (auto & attr : *vElem->attrs())
-            attrsSeen.try_emplace(attr.name).first->second.size++;
+        for (auto & attr : *vElem->attrs()) {
+            auto & item = attrsSeen.try_emplace(attr.name).first->second;
+            item.size++;
+            if (!item.attrPos)
+                item.attrPos = attr.pos;  // Keep PosIdx from first input
+        }
     }
 
     for (auto & [sym, elem] : attrsSeen)
@@ -3875,7 +3878,7 @@ static void prim_zipAttrsWith(EvalState & state, const PosIdx pos, Value ** args
         auto arg = state.allocValue();
         arg->mkList(*elem.list);
         call2->mkApp(call1, arg);
-        attrs.insert(sym, call2);
+        attrs.insert(Attr(sym, call2, elem.attrPos));
     }
 
     v.mkAttrs(attrs.alreadySorted());
@@ -3921,7 +3924,7 @@ static RegisterPrimOp primop_zipAttrsWith({
 static void prim_isList(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    maybeRecordTypeDep(*args[0]);
+    maybeRecordTypeDep(state.positions, *args[0]);
     v.mkBool(args[0]->type() == nList);
 }
 
