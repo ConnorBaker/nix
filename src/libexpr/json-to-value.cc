@@ -324,10 +324,10 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         // Assign per-key PosIdx with TracedData provenance so that
         // shape dep functions can use originOf(attr->pos) to determine
         // each key's origin file — surviving // and other attrset ops.
-        PosTable::Origin origin = state.positions.addOrigin(
+        bool tracking = DependencyTracker::isActive() && !keys.empty();
+        auto originHandle = state.positions.addOriginHandle(
             Pos::TracedData{depSource, depKey, dataPath, structuredFormatChar(node->formatTag())},
             keys.empty() ? 0 : keys.size());
-        bool tracking = DependencyTracker::isActive() && !keys.empty();
 
         for (size_t idx = 0; idx < keys.size(); idx++) {
             auto & k = keys[idx];
@@ -338,7 +338,7 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
             auto * thunkVal = state.allocValue();
             thunkVal->mkThunk(&state.baseEnv, childExpr);
             forceNoNullByte(k);
-            PosIdx keyPos = tracking ? state.positions.add(origin, idx) : PosIdx{};
+            PosIdx keyPos = tracking ? state.positions.add(originHandle, idx) : PosIdx{};
             attrs.insert(state.symbols.create(k), thunkVal, keyPos);
         }
         v.mkAttrs(attrs);

@@ -27,14 +27,25 @@ public:
         }
 
     public:
-        const uint32_t offset;
-        const Pos::Origin origin;
-        const size_t size;
+        uint32_t offset;
+        Pos::Origin origin;
+        size_t size;
 
         uint32_t offsetOf(PosIdx p) const
         {
             return (p.id & ~PosIdx::tracedDataTag) - 1 - offset;
         }
+    };
+
+    /**
+     * Lightweight handle returned by addOrigin(). Contains only the
+     * scalars needed by add() — avoids copying the Pos::Origin variant.
+     */
+    struct OriginHandle
+    {
+        uint32_t offset;
+        size_t size;
+        bool tracedData;
     };
 
 private:
@@ -75,6 +86,7 @@ public:
     PosTable(std::size_t linesCacheCapacity = 65536)
         : linesCache(linesCacheCapacity)
     {
+        origins.reserve(4096);
     }
 
     Origin addOrigin(Pos::Origin origin, size_t size)
@@ -91,12 +103,40 @@ public:
         return origins.back();
     }
 
+    /**
+     * Add an origin and return a lightweight handle (no variant copy).
+     * Use with the OriginHandle overload of add().
+     */
+    OriginHandle addOriginHandle(Pos::Origin origin, size_t size)
+    {
+        bool td = std::holds_alternative<Pos::TracedData>(origin);
+        uint32_t off = 0;
+        if (!origins.empty())
+            off = origins.back().offset + origins.back().size;
+        if (2 + off + size < off) {
+            origins.push_back(Origin{std::move(origin), off, 0});
+            return {off, 0, td};
+        }
+        origins.push_back(Origin{std::move(origin), off, size});
+        return {off, size, td};
+    }
+
     PosIdx add(const Origin & origin, size_t offset)
     {
         if (offset > origin.size)
             return PosIdx();
         uint32_t id = 1 + origin.offset + offset;
         if (std::holds_alternative<Pos::TracedData>(origin.origin))
+            id |= PosIdx::tracedDataTag;
+        return PosIdx(id);
+    }
+
+    PosIdx add(const OriginHandle & origin, size_t offset)
+    {
+        if (offset > origin.size)
+            return PosIdx();
+        uint32_t id = 1 + origin.offset + offset;
+        if (origin.tracedData)
             id |= PosIdx::tracedDataTag;
         return PosIdx(id);
     }

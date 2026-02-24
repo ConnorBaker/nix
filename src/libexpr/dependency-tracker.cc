@@ -39,6 +39,10 @@ thread_local std::vector<Dep> DependencyTracker::sessionTraces;
 // origin tracking instead.
 static thread_local std::unordered_map<const void*, const TracedContainerProvenance *> tracedContainerMap;
 
+// Memoization: skip re-scanning the same Bindings* in maybeRecordAttrKeysDep.
+// Cleared on root DependencyTracker construction.
+static thread_local std::unordered_set<const void *> scannedBindings;
+
 // Stable, non-GC pool for provenance data. std::deque never invalidates
 // pointers on push_back, so ProvenanceRef pointers remain valid until clear().
 // Cleared alongside tracedContainerMap on root DependencyTracker construction.
@@ -50,6 +54,7 @@ void DependencyTracker::onRootConstruction()
     provenancePool.clear();
     clearReadFileProvenanceMap();
     clearReadFileStringPtrs();
+    scannedBindings.clear();
 }
 
 ProvenanceRef allocateProvenance(std::string depSource, std::string depKey,
@@ -658,11 +663,15 @@ void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symb
 {
     if (!DependencyTracker::isActive()) return;
     if (v.type() != nAttrs) return;
+    if (!v.attrs()->hasAnyTracedDataLayer()) return;
+
+    // Memoize: skip if we've already scanned this exact Bindings*.
+    // DependencyTracker::record deduplicates deps, so re-scanning is always
+    // redundant. The set is cleared on root DependencyTracker construction.
+    if (!scannedBindings.insert(v.attrs()).second) return;
 
     // Group attrs by their TracedData origin (pointer identity — all attrs from
-    // the same addOrigin() call resolve to the same map entry).
-    // Uses originOfPtr() to avoid copying Pos::Origin (which contains 3 strings
-    // for TracedData variants).
+    // the same addOrigin() call resolve to the same vector entry).
     struct OriginKeys {
         const Pos::TracedData * df;
         std::vector<std::string_view> keys;
@@ -675,7 +684,6 @@ void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symb
         if (!origin) continue;
         auto * df = std::get_if<Pos::TracedData>(origin);
         if (!df) continue;
-        // Find or create group for this origin (pointer identity)
         OriginKeys * group = nullptr;
         for (auto & g : groups) {
             if (g.df == df) { group = &g; break; }
@@ -707,8 +715,7 @@ void maybeRecordTypeDep(const PosTable & positions, const Value & v)
     if (!DependencyTracker::isActive()) return;
 
     if (v.type() == nAttrs) {
-        // Scan attrs for any TracedData origin — if found, record #type.
-        // Uses tag bit for O(1) rejection + pointer identity dedup.
+        if (!v.attrs()->hasAnyTracedDataLayer()) return;
         auto hash = depHash("object");
         std::vector<const Pos::TracedData *> seen;
         for (auto & attr : *v.attrs()) {
@@ -741,6 +748,7 @@ void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbol
 {
     if (!DependencyTracker::isActive()) return;
     if (v.type() != nAttrs) return;
+    if (!v.attrs()->hasAnyTracedDataLayer()) return;
 
     auto keyStr = std::string(std::string_view(symbols[keyName]));
     auto escaped = escapeDataPathKey(keyStr);
@@ -762,8 +770,6 @@ void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbol
         DependencyTracker::record({df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
     } else {
         // Key not found — record against every unique TracedData origin in this attrset.
-        // Each origin represents a data file that could have contained the key.
-        // Uses tag bit for O(1) rejection + pointer identity for dedup.
         std::vector<const Pos::TracedData *> seen;
         auto hash = depHash("0");
         for (auto & attr : *v.attrs()) {
@@ -774,10 +780,7 @@ void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbol
             if (!df) continue;
             bool dup = false;
             for (auto * s : seen) {
-                if (s == df) {
-                    dup = true;
-                    break;
-                }
+                if (s == df) { dup = true; break; }
             }
             if (dup) continue;
             auto fmt = parseStructuredFormat(df->format);

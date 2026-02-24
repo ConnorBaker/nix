@@ -44,7 +44,7 @@ static void showAttrs(
 {
     // Record #keys for traced attrsets using PosIdx-based TracedData origin scanning.
     // Uses originOfPtr() + pointer identity to avoid copying Pos::Origin strings.
-    if (DependencyTracker::isActive()) {
+    if (DependencyTracker::isActive() && attrs.hasAnyTracedDataLayer()) {
         struct OriginKeys {
             const Pos::TracedData * df;
             std::vector<std::string_view> keys;
