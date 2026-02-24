@@ -328,7 +328,7 @@ void maybeRecordListLenDep(const Value & v);
 
 /**
  * Record a #keys StructuredContent dep if the attrset contains attrs
- * with DataFile provenance (checked via PosTable::originOf on Attr::pos).
+ * with TracedData provenance (checked via PosTable::originOf on Attr::pos).
  * Groups by origin — mixed-provenance attrsets get partial recording.
  * No-op if dep tracking is inactive or value is not an attrset.
  */
@@ -336,17 +336,17 @@ void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symb
 
 /**
  * Record a #has:key StructuredContent dep using PosIdx-based provenance.
- * For exists=true: checks the found attr's PosIdx origin — if DataFile,
- * records depHash("1"); if Nix-added (no DataFile origin), skips.
+ * For exists=true: checks the found attr's PosIdx origin — if TracedData,
+ * records depHash("1"); if Nix-added (no TracedData origin), skips.
  * For exists=false: scans all attrs, records depHash("0") against each
- * unique DataFile origin.
+ * unique TracedData origin.
  */
 void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbols,
                           const Value & v, Symbol keyName, bool exists);
 
 /**
  * Record a #type StructuredContent dep if the value is a container.
- * For attrsets: uses PosIdx-based DataFile origin scanning.
+ * For attrsets: uses PosIdx-based TracedData origin scanning.
  * For lists: uses the existing tracedContainerMap lookup.
  * No-op if dep tracking is inactive or value is not a container.
  */
@@ -356,7 +356,7 @@ void maybeRecordTypeDep(const PosTable & positions, const Value & v);
 // Provenance propagation for list-reconstructing operations
 // ═══════════════════════════════════════════════════════════════════════
 //
-// Attrset provenance uses PosIdx (DataFile origin per Attr) and needs
+// Attrset provenance uses PosIdx (TracedData origin per Attr) and needs
 // no propagation — PosIdx survives attrset operations (//, mapAttrs,
 // removeAttrs) because Attr objects are copied with their pos field.
 //

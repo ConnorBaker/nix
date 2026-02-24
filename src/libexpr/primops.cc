@@ -3836,7 +3836,7 @@ static void prim_zipAttrsWith(EvalState & state, const PosIdx pos, Value ** args
     {
         size_t size = 0;
         size_t pos = 0;
-        PosIdx attrPos;  // PosIdx from first input attr (preserves DataFile origin)
+        PosIdx attrPos;  // PosIdx from first input attr (preserves TracedData origin)
         std::optional<ListBuilder> list;
     };
 

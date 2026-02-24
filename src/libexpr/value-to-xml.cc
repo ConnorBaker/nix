@@ -42,18 +42,19 @@ static void showAttrs(
     NixStringContext & context,
     PathSet & drvsSeen)
 {
-    // Record #keys for traced attrsets using PosIdx-based DataFile origin scanning.
+    // Record #keys for traced attrsets using PosIdx-based TracedData origin scanning.
     // Uses originOfPtr() + pointer identity to avoid copying Pos::Origin strings.
     if (DependencyTracker::isActive()) {
         struct OriginKeys {
-            const Pos::DataFile * df;
+            const Pos::TracedData * df;
             std::vector<std::string_view> keys;
         };
         std::vector<OriginKeys> groups;
         for (auto & attr : attrs) {
+            if (!attr.pos.isTracedData()) continue;
             auto * origin = state.positions.originOfPtr(attr.pos);
             if (!origin) continue;
-            auto * df = std::get_if<Pos::DataFile>(origin);
+            auto * df = std::get_if<Pos::TracedData>(origin);
             if (!df) continue;
             OriginKeys * group = nullptr;
             for (auto & g : groups) { if (g.df == df) { group = &g; break; } }

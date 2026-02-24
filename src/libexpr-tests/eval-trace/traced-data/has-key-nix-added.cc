@@ -9,9 +9,9 @@ using namespace nix::eval_trace::test;
 // ═══════════════════════════════════════════════════════════════════════
 // #has:key recording/verification mismatch for Nix-added attributes
 //
-// Fixed: PosIdx-based provenance (Pos::DataFile origin per Attr) now
+// Fixed: PosIdx-based provenance (Pos::TracedData origin per Attr) now
 // determines each key's origin. When Nix code adds keys via //, those
-// keys have Nix-expression PosIdx (not DataFile), so maybeRecordHasKeyDep
+// keys have Nix-expression PosIdx (not TracedData), so maybeRecordHasKeyDep
 // skips them entirely. Only keys that actually came from a data file
 // (JSON/TOML/directory) get #has:key deps recorded.
 //
@@ -36,7 +36,7 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyMismatch_NixAddedKey_FailsVerify)
     //
     // This dep pattern NO LONGER occurs in practice: the PosIdx-based
     // provenance system skips #has:key recording for Nix-added keys
-    // (keys without DataFile origin). This test documents that IF such
+    // (keys without TracedData origin). This test documents that IF such
     // a dep were manually constructed, verification would still fail.
     auto db = makeDb();
 

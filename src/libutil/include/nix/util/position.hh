@@ -52,23 +52,23 @@ struct Pos
     };
 
     /**
-     * Origin for attributes materialized from structured data files
+     * Origin for attributes materialized from traced data sources
      * (JSON, TOML, directory listings). Carries provenance info so that
      * PosTable::originOf() can recover the dep source/key/path without
      * a separate container provenance map.
      */
-    struct DataFile
+    struct TracedData
     {
         std::string depSource;   ///< flake input name
         std::string depKey;      ///< file path
         std::string dataPath;    ///< dot/bracket path within structure
         char format;             ///< 'j', 't', 'd' (StructuredFormat char)
 
-        bool operator==(const DataFile &) const = default;
-        auto operator<=>(const DataFile &) const = default;
+        bool operator==(const TracedData &) const = default;
+        auto operator<=>(const TracedData &) const = default;
     };
 
-    typedef std::variant<std::monostate, Stdin, String, SourcePath, DataFile> Origin;
+    typedef std::variant<std::monostate, Stdin, String, SourcePath, TracedData> Origin;
 
     Origin origin = std::monostate();
 

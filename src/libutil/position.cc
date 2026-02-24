@@ -51,7 +51,7 @@ std::optional<std::string> Pos::getSource() const
                     return std::nullopt;
                 }
             },
-            [](const Pos::DataFile &) -> std::optional<std::string> { return std::nullopt; }},
+            [](const Pos::TracedData &) -> std::optional<std::string> { return std::nullopt; }},
         origin);
 }
 
@@ -71,7 +71,7 @@ void Pos::print(std::ostream & out, bool showOrigin) const
                 [&](const Pos::Stdin &) { out << "«stdin»"; },
                 [&](const Pos::String & s) { out << "«string»"; },
                 [&](const SourcePath & path) { out << path; },
-                [&](const Pos::DataFile & df) { out << "«data:" << df.depKey << "»"; }},
+                [&](const Pos::TracedData & df) { out << "«data:" << df.depKey << "»"; }},
             origin);
         out << ":";
     }

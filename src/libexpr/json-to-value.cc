@@ -321,11 +321,11 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         auto keys = node->objectKeys();
         auto attrs = state.buildBindings(keys.size());
 
-        // Assign per-key PosIdx with DataFile provenance so that
+        // Assign per-key PosIdx with TracedData provenance so that
         // shape dep functions can use originOf(attr->pos) to determine
         // each key's origin file — surviving // and other attrset ops.
         PosTable::Origin origin = state.positions.addOrigin(
-            Pos::DataFile{depSource, depKey, dataPath, structuredFormatChar(node->formatTag())},
+            Pos::TracedData{depSource, depKey, dataPath, structuredFormatChar(node->formatTag())},
             keys.empty() ? 0 : keys.size());
         bool tracking = DependencyTracker::isActive() && !keys.empty();
 

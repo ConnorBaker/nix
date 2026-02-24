@@ -70,9 +70,9 @@ struct TracedDataNode : gc {
  *     removals) because the cached result is the leaf value, not the
  *     full attrset.
  *
- *   - Attrset keys get PosIdx with Pos::DataFile origin at creation time.
+ *   - Attrset keys get PosIdx with Pos::TracedData origin at creation time.
  *     Shape-observing builtins (attrNames, hasAttr) use PosTable::originOf()
- *     on Attr::pos to find DataFile provenance and record StructuredContent
+ *     on Attr::pos to find TracedData provenance and record StructuredContent
  *     shape deps (#keys, #has:key). PosIdx survives attrset operations (//).
  *
  *   - List Values are registered in a thread-local provenance map

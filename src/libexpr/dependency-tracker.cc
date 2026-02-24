@@ -35,7 +35,7 @@ thread_local std::vector<Dep> DependencyTracker::sessionTraces;
 
 // Thread-local map from stable list identity (first element Value*) to provenance.
 // Lists still use this map because list provenance is tracked at access time
-// (maybeRecordListLenDep), not via PosIdx. Attrsets use PosIdx-based DataFile
+// (maybeRecordListLenDep), not via PosIdx. Attrsets use PosIdx-based TracedData
 // origin tracking instead.
 static thread_local std::unordered_map<const void*, const TracedContainerProvenance *> tracedContainerMap;
 
@@ -659,20 +659,21 @@ void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symb
     if (!DependencyTracker::isActive()) return;
     if (v.type() != nAttrs) return;
 
-    // Group attrs by their DataFile origin (pointer identity — all attrs from
+    // Group attrs by their TracedData origin (pointer identity — all attrs from
     // the same addOrigin() call resolve to the same map entry).
     // Uses originOfPtr() to avoid copying Pos::Origin (which contains 3 strings
-    // for DataFile variants).
+    // for TracedData variants).
     struct OriginKeys {
-        const Pos::DataFile * df;
+        const Pos::TracedData * df;
         std::vector<std::string_view> keys;
     };
     std::vector<OriginKeys> groups;
 
     for (auto & attr : *v.attrs()) {
+        if (!attr.pos.isTracedData()) continue;
         auto * origin = positions.originOfPtr(attr.pos);
         if (!origin) continue;
-        auto * df = std::get_if<Pos::DataFile>(origin);
+        auto * df = std::get_if<Pos::TracedData>(origin);
         if (!df) continue;
         // Find or create group for this origin (pointer identity)
         OriginKeys * group = nullptr;
@@ -706,14 +707,15 @@ void maybeRecordTypeDep(const PosTable & positions, const Value & v)
     if (!DependencyTracker::isActive()) return;
 
     if (v.type() == nAttrs) {
-        // Scan attrs for any DataFile origin — if found, record #type.
-        // Uses originOfPtr() + pointer identity dedup to avoid string copies.
+        // Scan attrs for any TracedData origin — if found, record #type.
+        // Uses tag bit for O(1) rejection + pointer identity dedup.
         auto hash = depHash("object");
-        std::vector<const Pos::DataFile *> seen;
+        std::vector<const Pos::TracedData *> seen;
         for (auto & attr : *v.attrs()) {
+            if (!attr.pos.isTracedData()) continue;
             auto * origin = positions.originOfPtr(attr.pos);
             if (!origin) continue;
-            auto * df = std::get_if<Pos::DataFile>(origin);
+            auto * df = std::get_if<Pos::TracedData>(origin);
             if (!df) continue;
             bool dup = false;
             for (auto * s : seen) { if (s == df) { dup = true; break; } }
@@ -746,28 +748,29 @@ void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbol
     rawSuffix += escaped;
 
     if (exists) {
-        // Key was found — look up the Attr to check its PosIdx origin.
+        // Key was found — check tag bit, then look up origin.
         auto * attr = v.attrs()->get(keyName);
-        if (!attr) return;
+        if (!attr || !attr->pos.isTracedData()) return;
         auto * origin = positions.originOfPtr(attr->pos);
         if (!origin) return;
-        auto * df = std::get_if<Pos::DataFile>(origin);
-        if (!df) return; // Nix-added key (no DataFile provenance) — skip
+        auto * df = std::get_if<Pos::TracedData>(origin);
+        if (!df) return; // Nix-added key (no TracedData provenance) — skip
         auto fmt = parseStructuredFormat(df->format);
         if (!fmt) return;
         auto fullKey = buildStructuredDepKey(df->depKey, *fmt, df->dataPath, rawSuffix);
         auto hash = depHash("1");
         DependencyTracker::record({df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
     } else {
-        // Key not found — record against every unique DataFile origin in this attrset.
+        // Key not found — record against every unique TracedData origin in this attrset.
         // Each origin represents a data file that could have contained the key.
-        // Uses pointer identity for dedup (same addOrigin → same map entry).
-        std::vector<const Pos::DataFile *> seen;
+        // Uses tag bit for O(1) rejection + pointer identity for dedup.
+        std::vector<const Pos::TracedData *> seen;
         auto hash = depHash("0");
         for (auto & attr : *v.attrs()) {
+            if (!attr.pos.isTracedData()) continue;
             auto * origin = positions.originOfPtr(attr.pos);
             if (!origin) continue;
-            auto * df = std::get_if<Pos::DataFile>(origin);
+            auto * df = std::get_if<Pos::TracedData>(origin);
             if (!df) continue;
             bool dup = false;
             for (auto * s : seen) {
