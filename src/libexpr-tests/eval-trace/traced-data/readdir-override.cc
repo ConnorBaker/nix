@@ -229,9 +229,8 @@ TEST_F(TracedDataTest, TracedDir_ChangeUnrelatedType)
 TEST_F(TracedDataTest, TracedDir_ThroughUpdate)
 {
     // readDir result passed through // (update operator) — thunks survive.
-    // The // operator records #keys for both operands, so adding a new file
-    // causes a #keys dep failure even though .hello is unchanged. This is the
-    // expected precision trade-off for the soundness fix in ExprOpUpdate.
+    // The // operator does NOT record #keys (precision fix). Only .hello
+    // access records #has:hello, which passes when "newfile" is added.
     TempDir td;
     td.addFile("hello", "content");
     td.addFile("other", "pad");
@@ -250,7 +249,7 @@ TEST_F(TracedDataTest, TracedDir_ThroughUpdate)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 1); // #keys dep on readDir result causes re-eval
+        EXPECT_EQ(loaderCalls, 0); // #has:hello passes — newfile is unrelated
         EXPECT_THAT(v, IsStringEq("regular"));
     }
 }

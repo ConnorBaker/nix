@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "nix/util/lru-cache.hh"
@@ -167,6 +168,14 @@ public:
         if (auto o = resolve(p))
             return &o->origin;
         return nullptr;
+    }
+
+    /** Return the origin offset for p, or nullopt. Stable across vector growth. */
+    std::optional<uint32_t> originOffsetOf(PosIdx p) const
+    {
+        if (auto o = resolve(p))
+            return o->offset;
+        return std::nullopt;
     }
 
     /**

@@ -7,6 +7,7 @@
 #include "nix/util/source-path.hh"
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <bitset>
 #include <map>
 #include <unordered_map>
 
@@ -60,6 +61,25 @@ struct EvalTraceContext {
      * trackers (Adapton DDG: transitive dependency edges).
      */
     boost::unordered_flat_map<const Value *, DepRange> epochMap;
+
+    /**
+     * Bloom filter for fast rejection in replayMemoizedDeps().
+     * A bit is set when a Value* is inserted into epochMap via recordThunkDeps.
+     * replayMemoizedDeps tests the bit before doing the epochMap lookup —
+     * ~95% of calls miss epochMap, so this avoids ~9M x 50ns flat_map lookups.
+     * 2M bits = 256KB, giving ~5% false positive rate at typical load.
+     */
+    static constexpr size_t BLOOM_BITS = 1 << 21;
+    std::bitset<BLOOM_BITS> replayBloom;
+
+    void bloomSet(const Value * v) {
+        auto h = reinterpret_cast<uintptr_t>(v) >> 4;
+        replayBloom.set(h % BLOOM_BITS);
+    }
+    bool bloomTest(const Value * v) const {
+        auto h = reinterpret_cast<uintptr_t>(v) >> 4;
+        return replayBloom.test(h % BLOOM_BITS);
+    }
 
     /**
      * Value pointer for which the next recordThunkDeps() call should be

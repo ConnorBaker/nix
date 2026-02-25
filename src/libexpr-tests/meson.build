@@ -87,6 +87,9 @@ sources = files(
   'eval-trace/traced-data/gaps-soundness.cc',
   'eval-trace/traced-data/gaps-rawcontent.cc',
   'eval-trace/traced-data/gaps-propagation.cc',
+  'eval-trace/traced-data/dep-precision-update.cc',
+  'eval-trace/traced-data/dep-precision-formals.cc',
+  'eval-trace/traced-data/dep-precision-intersect.cc',
   # eval-trace/verify/
   'eval-trace/verify/cold-compare.cc',
   'eval-trace/verify/cold-verify.cc',

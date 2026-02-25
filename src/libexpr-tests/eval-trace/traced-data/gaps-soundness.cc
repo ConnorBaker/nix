@@ -884,10 +884,11 @@ TEST_F(TracedDataTest, TracedJSON_LessThan_ListUnrelatedChange)
 
 TEST_F(TracedDataTest, TracedJSON_Update_TracedGainsKey)
 {
-    // [FIXED] // merges attrsets — #keys shape dep now recorded at eval.cc:1981-1982.
+    // // does NOT record #keys for its operands (precision fix).
     // Cold: base has {a:1}, overlay has {b:2} → result {a:1,b:2}.
-    // Hot: base gains key "b" with value 99, but SC dep for .a still passes.
-    // Without #keys dep, override incorrectly accepts stale {a:1,b:2}.
+    // .b access records #has:b on over's origin. When base gains key "b",
+    // over's origin is unchanged → #has:b still passes → cache hit.
+    // This is sound because over.b still wins in the merge (b=2).
     TempJsonFile file(R"({"base":{"a":1},"over":{"b":2}})");
     auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
         + R"(); in (j.base // j.over).b)";
@@ -898,8 +899,7 @@ TEST_F(TracedDataTest, TracedJSON_Update_TracedGainsKey)
         EXPECT_THAT(v, IsIntEq(2)); // overlay's b wins
     }
 
-    // base gains "b":99 — now base // over should still give over's b=2,
-    // but the key set of base changed
+    // base gains "b":99 — overlay's b=2 still wins in the merge
     file.modify(R"({"base":{"a":1,"b":99},"over":{"b":2}})");
     invalidateFileCache(file.path);
 
@@ -907,7 +907,7 @@ TEST_F(TracedDataTest, TracedJSON_Update_TracedGainsKey)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 1); // must re-evaluate (base key set changed)
+        EXPECT_EQ(loaderCalls, 0); // #has:b on over's origin passes — result unchanged
         EXPECT_THAT(v, IsIntEq(2)); // overlay still wins
     }
 }

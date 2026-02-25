@@ -11,12 +11,15 @@ void EvalTraceContext::recordThunkDeps(Value & v, uint32_t epochStart)
         return;
     }
     uint32_t epochEnd = DependencyTracker::sessionTraces.size();
-    if (epochStart < epochEnd)
+    if (epochStart < epochEnd) {
         epochMap.emplace(&v, DepRange{&DependencyTracker::sessionTraces, epochStart, epochEnd});
+        bloomSet(&v);
+    }
 }
 
 void EvalTraceContext::replayMemoizedDeps(const Value & v)
 {
+    if (!bloomTest(&v)) return;
     auto it = epochMap.find(&v);
     if (it == epochMap.end()) return;
 
@@ -41,6 +44,7 @@ void EvalTraceContext::reset()
     fileContentHashes.clear();
     mountToInput.clear();
     epochMap.clear();
+    replayBloom.reset();
     skipEpochRecordFor = nullptr;
 }
 

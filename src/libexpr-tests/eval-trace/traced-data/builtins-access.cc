@@ -185,11 +185,11 @@ TEST_F(TracedDataTest, TracedJSON_MapAttrs_KeyAdded_CacheHit)
     }
 }
 
-TEST_F(TracedDataTest, TracedJSON_Update_KeyAdded_CacheMiss)
+TEST_F(TracedDataTest, TracedJSON_Update_KeyAdded_CacheHit)
 {
-    // The // operator now records #keys for both operands. When a key is added
-    // to the traced JSON, the #keys dep fails even though .a is unchanged.
-    // This is the expected precision trade-off for the soundness fix.
+    // The // operator does NOT record #keys for its operands (precision fix).
+    // Only the consumer (.a access) records #has:a, which still passes when
+    // an unrelated key "c" is added. Result: cache hit.
     TempJsonFile file(R"({"a":"x","b":"y"})");
     auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
         + R"(); in (j // { extra = "e"; }).a)";
@@ -207,7 +207,7 @@ TEST_F(TracedDataTest, TracedJSON_Update_KeyAdded_CacheMiss)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 1); // #keys dep causes re-eval
+        EXPECT_EQ(loaderCalls, 0); // #has:a passes — key "c" is unrelated
         EXPECT_THAT(v, IsStringEq("x"));
     }
 }

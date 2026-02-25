@@ -1980,8 +1980,6 @@ void ExprOpImpl::eval(EvalState & state, Env & env, Value & v)
 void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 {
     state.nrOpUpdates++;
-    maybeRecordAttrKeysDep(state.positions, state.symbols, v1);
-    maybeRecordAttrKeysDep(state.positions, state.symbols, v2);
 
     const Bindings & bindings1 = *v1.attrs();
     if (bindings1.empty()) {

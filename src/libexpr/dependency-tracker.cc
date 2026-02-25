@@ -48,6 +48,11 @@ static thread_local std::unordered_set<const void *> scannedBindings;
 // Cleared alongside tracedContainerMap on root DependencyTracker construction.
 static thread_local std::deque<TracedContainerProvenance> provenancePool;
 
+// Precomputed keys hash map: Pos::TracedData* → {hash, keyCount, fullKey, depSource}.
+// Populated by ExprTracedData::eval() at creation time; consumed by maybeRecordAttrKeysDep
+// to skip sort + concat + BLAKE3 when all original keys are visible (common case).
+static thread_local std::unordered_map<uint32_t, PrecomputedKeysInfo> precomputedKeysMap;
+
 void DependencyTracker::onRootConstruction()
 {
     clearTracedContainerMap();
@@ -55,6 +60,7 @@ void DependencyTracker::onRootConstruction()
     clearReadFileProvenanceMap();
     clearReadFileStringPtrs();
     scannedBindings.clear();
+    clearPrecomputedKeysMap();
 }
 
 ProvenanceRef allocateProvenance(std::string depSource, std::string depKey,
@@ -79,6 +85,16 @@ const TracedContainerProvenance * lookupTracedContainer(const void * key)
 void clearTracedContainerMap()
 {
     tracedContainerMap.clear();
+}
+
+void registerPrecomputedKeys(uint32_t originOffset, PrecomputedKeysInfo info)
+{
+    precomputedKeysMap.emplace(originOffset, std::move(info));
+}
+
+void clearPrecomputedKeysMap()
+{
+    precomputedKeysMap.clear();
 }
 
 // Record a dependency edge in the dynamic dependency graph (Adapton: "add-edge").
@@ -670,10 +686,12 @@ void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symb
     // redundant. The set is cleared on root DependencyTracker construction.
     if (!scannedBindings.insert(v.attrs()).second) return;
 
-    // Group attrs by their TracedData origin (pointer identity — all attrs from
-    // the same addOrigin() call resolve to the same vector entry).
+    // Group attrs by their TracedData origin. Use the Origin's offset (stable
+    // across vector reallocation) to match against the precomputed keys map,
+    // and the TracedData pointer (valid within this call) for grouping.
     struct OriginKeys {
         const Pos::TracedData * df;
+        uint32_t originOffset;
         std::vector<std::string_view> keys;
     };
     std::vector<OriginKeys> groups;
@@ -684,18 +702,29 @@ void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symb
         if (!origin) continue;
         auto * df = std::get_if<Pos::TracedData>(origin);
         if (!df) continue;
+        auto off = positions.originOffsetOf(attr.pos);
+        if (!off) continue;
         OriginKeys * group = nullptr;
         for (auto & g : groups) {
             if (g.df == df) { group = &g; break; }
         }
         if (!group) {
-            groups.push_back({df, {}});
+            groups.push_back({df, *off, {}});
             group = &groups.back();
         }
         group->keys.push_back(symbols[attr.name]);
     }
 
     for (auto & g : groups) {
+        // Fast path: if all original keys are visible (no shadowing by //),
+        // use the precomputed hash from ExprTracedData::eval() creation time.
+        auto pcIt = precomputedKeysMap.find(g.originOffset);
+        if (pcIt != precomputedKeysMap.end() && pcIt->second.keyCount == g.keys.size()) {
+            auto & info = pcIt->second;
+            DependencyTracker::record({info.depSource, info.fullKey, DepHashValue(info.hash), DepType::StructuredContent});
+            continue;
+        }
+        // Slow path: keys were shadowed by // or otherwise differ from creation.
         auto fmt = parseStructuredFormat(g.df->format);
         if (!fmt) continue;
         std::sort(g.keys.begin(), g.keys.end());

@@ -361,7 +361,21 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
                     if (i > 0) canonical += '\0';
                     canonical += sortedKeys[i];
                 }
-                DependencyTracker::record({depSource, keysKey, DepHashValue(depHash(canonical)), DepType::ImplicitShape});
+                auto keysHash = depHash(canonical);
+                DependencyTracker::record({depSource, keysKey, DepHashValue(keysHash), DepType::ImplicitShape});
+
+                // Register precomputed hash so maybeRecordAttrKeysDep can skip
+                // sort + concat + BLAKE3 when all original keys are still visible.
+                // Key is the origin offset (stable across PosTable vector growth).
+                PosIdx anyKeyPos = v.attrs()->begin()->pos;
+                if (auto off = state.positions.originOffsetOf(anyKeyPos)) {
+                    registerPrecomputedKeys(*off, PrecomputedKeysInfo{
+                        keysHash,
+                        static_cast<uint32_t>(keys.size()),
+                        keysKey,
+                        depSource,
+                    });
+                }
             }
         }
         break;

@@ -320,6 +320,33 @@ class SymbolTable;
 class Symbol;
 
 /**
+ * Precomputed keys hash from ExprTracedData::eval() Object case.
+ * Stored in a thread-local side map keyed by Pos::TracedData* (pointer identity
+ * from PosTable origins vector). At access time, maybeRecordAttrKeysDep compares
+ * visible key count to stored count; if equal, uses the precomputed hash directly,
+ * avoiding the sort + concat + BLAKE3 hash that dominates its runtime.
+ */
+struct PrecomputedKeysInfo {
+    Blake3Hash hash;
+    uint32_t keyCount;
+    std::string fullKey;   ///< pre-built structured dep key for #keys
+    std::string depSource;
+};
+
+/**
+ * Register a precomputed keys hash for a TracedData origin.
+ * Called from ExprTracedData::eval() after recording ImplicitShape #keys.
+ * The key is the PosTable origin offset (stable across vector reallocation,
+ * unlike raw Origin* pointers which are invalidated by vector growth).
+ */
+void registerPrecomputedKeys(uint32_t originOffset, PrecomputedKeysInfo info);
+
+/**
+ * Clear the precomputed keys map. Called on root DependencyTracker construction.
+ */
+void clearPrecomputedKeysMap();
+
+/**
  * Record a #len StructuredContent dep if the list value came from
  * ExprTracedData (checked via traced container provenance map).
  * No-op if dep tracking is inactive or list is empty (no stable key).

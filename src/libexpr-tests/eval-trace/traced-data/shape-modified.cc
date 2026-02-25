@@ -125,8 +125,11 @@ TEST_F(TracedDataTest, RemoveAttrs_HasKey_QueriedKeyRemoved)
 TEST_F(TracedDataTest, MultiProv_Update_HasKey_BothHave)
 {
     // hasAttr "x" (fj a // fj b) where both have "x" and identical key sets.
-    // a={x:1,y:2}, b={x:10,y:20} → output={x:10,y:20} (b wins). Sizes all equal
-    // → NOT shapeModified → #has:x NOT suppressed → cache hit.
+    // a={x:1,y:2}, b={x:10,y:20} → output={x:10,y:20} (b wins).
+    // #has:x recorded on b's origin only. When a changes (value, not keys),
+    // Content(a) fails. No SC dep covers a, but ImplicitShape #keys from
+    // creation time provides fallback verification: a's keys unchanged →
+    // override succeeds → cache hit.
     TempJsonFile fileA(R"({"x": 1, "y": 2})");
     TempJsonFile fileB(R"({"x": 10, "y": 20})");
     auto expr = R"(builtins.hasAttr "x" (builtins.fromJSON (builtins.readFile )"
@@ -139,7 +142,7 @@ TEST_F(TracedDataTest, MultiProv_Update_HasKey_BothHave)
         EXPECT_THAT(v, IsTrue());
     }
 
-    // Change value in a (not keys) → cache hit
+    // Change value in a (not keys) → cache hit (ImplicitShape #keys passes)
     fileA.modify(R"({"x": 999, "y": 888})");
     invalidateFileCache(fileA.path);
 
@@ -147,7 +150,7 @@ TEST_F(TracedDataTest, MultiProv_Update_HasKey_BothHave)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 0); // NOT shapeModified → #has:x recorded → passes
+        EXPECT_EQ(loaderCalls, 0); // ImplicitShape fallback: a's keys unchanged
         EXPECT_THAT(v, IsTrue());
     }
 }
@@ -433,7 +436,10 @@ TEST_F(TracedDataTest, MultiProv_Update_ScalarAccess_ChangeA)
 
 TEST_F(TracedDataTest, MultiProv_Update_ScalarAccess_ChangeB)
 {
-    // (fj a // fj b).x where x from a; change unrelated value in b → cache hit
+    // (fj a // fj b).x where x from a; change unrelated value in b → cache hit.
+    // .x records scalar dep on a's origin. When b changes (value, not keys),
+    // Content(b) fails. No SC dep covers b, but ImplicitShape #keys from
+    // creation time provides fallback: b's keys unchanged → override succeeds.
     TempJsonFile fileA(R"({"x": 1, "y": 2})");
     TempJsonFile fileB(R"({"z": 3})");
     auto expr = R"((builtins.fromJSON (builtins.readFile )" + fileA.path.string()
@@ -453,7 +459,7 @@ TEST_F(TracedDataTest, MultiProv_Update_ScalarAccess_ChangeB)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_EQ(loaderCalls, 0); // ImplicitShape fallback: b's keys unchanged
         EXPECT_THAT(v, IsIntEq(1));
     }
 }
@@ -520,7 +526,11 @@ TEST_F(TracedDataTest, MultiProv_Update_AttrNames_KeyAdded)
 TEST_F(TracedDataTest, MultiProv_Update_AttrNames_SameKeys_ValueChanged)
 {
     // attrNames (fj a // fj b) where a and b have identical keys;
-    // change a value → cache hit (NOT shapeModified — sizes match — #keys recorded and passes)
+    // change a value → cache hit. In the merged result, all attrs come from
+    // b (b wins for both x and y). attrNames records #keys on b's origin.
+    // When a changes (value, not keys), Content(a) fails. No SC dep covers a,
+    // but ImplicitShape #keys from creation time passes (a's keys unchanged)
+    // → override succeeds.
     TempJsonFile fileA(R"({"x": 1, "y": 2})");
     TempJsonFile fileB(R"({"x": 10, "y": 20})");
     auto expr = R"(builtins.attrNames (builtins.fromJSON (builtins.readFile )"
@@ -540,7 +550,7 @@ TEST_F(TracedDataTest, MultiProv_Update_AttrNames_SameKeys_ValueChanged)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 0); // #keys passes — same key set
+        EXPECT_EQ(loaderCalls, 0); // ImplicitShape fallback: a's keys unchanged
         EXPECT_EQ(v.listSize(), 2);
     }
 }
@@ -667,7 +677,10 @@ TEST_F(TracedDataTest, Concat_BothTracked_Length_ElementAdded)
 
 TEST_F(TracedDataTest, ChainedUpdate_ScalarAccess_ChangeB)
 {
-    // (fj a // fj b // fj c).x where x from a; change unrelated value in b → cache hit
+    // (fj a // fj b // fj c).x where x from a; change unrelated value in b → cache hit.
+    // .x records scalar dep on a's origin. When b changes (value, not keys),
+    // Content(b) fails. No SC dep covers b, but ImplicitShape #keys from
+    // creation time passes (b's keys unchanged) → override succeeds.
     TempJsonFile fileA(R"({"x": 1})");
     TempJsonFile fileB(R"({"y": 2})");
     TempJsonFile fileC(R"({"z": 3})");
@@ -689,7 +702,7 @@ TEST_F(TracedDataTest, ChainedUpdate_ScalarAccess_ChangeB)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_EQ(loaderCalls, 0); // ImplicitShape fallback: b's keys unchanged
         EXPECT_THAT(v, IsIntEq(1));
     }
 }

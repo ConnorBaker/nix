@@ -265,6 +265,10 @@ static std::optional<DepHashValue> computeCurrentHash(
             return std::nullopt;
         }
     }
+    case DepType::ImplicitShape:
+        // ImplicitShape uses the same key format and hash computation as
+        // StructuredContent. Verified only for failed sources without SC deps.
+        [[fallthrough]];
     case DepType::StructuredContent: {
         // Key format: "filepath\tf:datapath[#suffix]" (tab separator)
         auto sep = dep.key.find('\t');
@@ -432,11 +436,6 @@ static std::optional<DepHashValue> computeCurrentHash(
             return std::nullopt;
         }
     }
-    case DepType::ImplicitShape:
-        // ImplicitShape uses the same key format and hash computation as
-        // StructuredContent, but is never checked during verification.
-        // Fall through to unreachable — this case should never be reached
-        // because verifyTrace skips ImplicitStructural deps entirely.
     case DepType::CurrentTime:
     case DepType::Exec:
     case DepType::ParentContext:
@@ -1314,26 +1313,28 @@ bool TraceStore::verifyTrace(
     // This enables fine-grained invalidation for fromJSON(readFile f) and
     // readDir patterns.
     //
-    // Key-set safety: the override only activates when StructuredContent deps
-    // exist in this trace. If code only iterates keys (mapAttrs, attrNames)
-    // without forcing leaf values, no StructuredContent deps are recorded and
-    // the coarse dep alone controls invalidation — any change triggers
-    // re-evaluation. This is correct because the key set is part of the cached
-    // result's structure at this trace level. StructuredContent deps only appear
-    // in child traces (when specific leaf values are forced), where the cached
-    // result is the leaf value and key-set changes are irrelevant.
+    // ImplicitShape fallback: for failed sources with NO StructuredContent deps
+    // (e.g., an operand of // whose values were never accessed), ImplicitShape
+    // deps (creation-time #keys/#len) provide conservative verification. This
+    // enables structural recovery for multi-provenance // without losing
+    // single-provenance precision. For sources WITH SC deps, ImplicitShape is
+    // skipped (SC provides finer-grained verification that tolerates key
+    // additions irrelevant to the accessed values).
     //
-    // First pass: verify non-structural deps, defer StructuredContent deps,
-    // track failed coarse (Content/Directory) deps by their file key (source + key).
+    // First pass: verify non-structural deps, defer StructuredContent and
+    // ImplicitShape deps, track failed coarse (Content/Directory) deps.
 
     bool hasNonContentFailure = false;
     bool hasContentFailure = false;
     bool hasStructuralDeps = false;
+    bool hasImplicitShapeDeps = false;
 
     // Track failed coarse dep file/dir keys: "source\tkey"
     std::unordered_set<std::string> failedContentFiles;
-    // Deferred structural deps
+    // Deferred structural deps (StructuredContent)
     std::vector<const Dep *> structuralDeps;
+    // Deferred implicit shape deps (ImplicitShape — creation-time #keys/#len)
+    std::vector<const Dep *> implicitShapeDeps;
 
     for (auto & dep : fullDeps) {
         nrDepsChecked++;
@@ -1343,10 +1344,15 @@ bool TraceStore::verifyTrace(
             continue;
         }
 
-        // ImplicitShape deps (creation-time #keys/#len) are always tolerable.
-        // They serve as conservative structural fingerprints but never block
-        // verification or prevent fine-grained override by leaf SC deps.
+        // ImplicitShape deps (creation-time #keys/#len) are deferred.
+        // They serve as conservative structural fingerprints. During normal
+        // verification they never block; they're only verified as a fallback
+        // for failed sources that have no StructuredContent deps (enables
+        // structural recovery for multi-provenance // without losing
+        // precision for single-provenance //).
         if (depKind(dep.type) == DepKind::ImplicitStructural) {
+            hasImplicitShapeDeps = true;
+            implicitShapeDeps.push_back(&dep);
             continue;
         }
 
@@ -1447,12 +1453,22 @@ bool TraceStore::verifyTrace(
                 }
             }
         }
-    } else if (hasContentFailure && hasStructuralDeps) {
-        // Coarse failure(s) (Content/Directory) exist AND structural deps are present.
-        // Check if all structural deps covering failed files/dirs still pass.
+    } else if (hasContentFailure && (hasStructuralDeps || hasImplicitShapeDeps)) {
+        // Coarse failure(s) exist AND structural/implicit-shape deps are present.
+        //
+        // Two-tier coverage: StructuredContent (SC) deps provide fine-grained
+        // verification. ImplicitShape deps provide fallback coverage for sources
+        // that have no SC deps (e.g., an operand of // whose values were never
+        // accessed). This enables structural recovery for multi-provenance //
+        // without losing single-provenance precision.
+        //
+        // Rule: for each failed source, if SC deps cover it, verify SC deps
+        // (ImplicitShape skipped — SC is finer-grained). If only ImplicitShape
+        // covers it, verify ImplicitShape (conservative but sound: key set
+        // unchanged means the source's structural contribution is unchanged).
         allValid = true;
 
-        // Build set of files covered by structural deps
+        // Build coverage sets: which files are covered by SC vs ImplicitShape
         std::unordered_set<std::string> structuralCoveredFiles;
         for (auto * dep : structuralDeps) {
             auto sep = dep->key.find('\t');
@@ -1460,15 +1476,23 @@ bool TraceStore::verifyTrace(
                 structuralCoveredFiles.insert(dep->source + '\t' + dep->key.substr(0, sep));
         }
 
-        // Check that all failed coarse deps (Content/Directory) are covered by structural deps
+        std::unordered_set<std::string> implicitCoveredFiles;
+        for (auto * dep : implicitShapeDeps) {
+            auto sep = dep->key.find('\t');
+            if (sep != std::string::npos)
+                implicitCoveredFiles.insert(dep->source + '\t' + dep->key.substr(0, sep));
+        }
+
+        // Check that all failed coarse deps are covered by EITHER SC or ImplicitShape
         for (auto & failedFile : failedContentFiles) {
-            if (structuralCoveredFiles.find(failedFile) == structuralCoveredFiles.end()) {
+            if (!structuralCoveredFiles.count(failedFile)
+                && !implicitCoveredFiles.count(failedFile)) {
                 allValid = false;
                 break;
             }
         }
 
-        // If covered, verify all structural deps pass
+        // Verify all SC deps (as before — fine-grained verification)
         if (allValid) {
             for (auto * dep : structuralDeps) {
                 nrDepsChecked++;
@@ -1489,8 +1513,39 @@ bool TraceStore::verifyTrace(
                 }
             }
         }
+
+        // Verify ImplicitShape deps ONLY for failed files NOT covered by SC.
+        // If a file has SC deps, those provide finer verification and
+        // ImplicitShape would be over-conservative (e.g., key additions
+        // that don't affect accessed values would spuriously fail).
+        if (allValid) {
+            for (auto * dep : implicitShapeDeps) {
+                auto sep = dep->key.find('\t');
+                if (sep == std::string::npos) continue;
+                auto fileKey = dep->source + '\t' + dep->key.substr(0, sep);
+                if (structuralCoveredFiles.count(fileKey)) continue;
+                if (!failedContentFiles.count(fileKey)) continue;
+
+                nrDepsChecked++;
+                DepKey dk(*dep);
+                auto cacheIt = currentDepHashes.find(dk);
+                std::optional<DepHashValue> current;
+
+                if (cacheIt != currentDepHashes.end()) {
+                    current = cacheIt->second;
+                } else {
+                    current = computeCurrentHash(state, *dep, inputAccessors);
+                    currentDepHashes[dk] = current;
+                }
+
+                if (!current || *current != dep->expectedHash) {
+                    nrVerificationsFailed++;
+                    allValid = false;
+                }
+            }
+        }
     } else {
-        // Coarse failure with no structural deps → invalid (backward compat)
+        // Coarse failure with no structural or implicit-shape deps → invalid
         allValid = false;
     }
 
