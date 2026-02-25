@@ -10,6 +10,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <boost/unordered/unordered_flat_set.hpp>
+
 namespace nix {
 
 /**
@@ -68,7 +70,7 @@ struct DependencyTracker {
     /// Deduplication set for (type, source, key) triples within this tracker
     /// scope. record() checks membership before appending to sessionTraces.
     /// Hash-based for O(1) expected dedup checks; no ordering needed.
-    std::unordered_set<DepKey, DepKey::Hash> recordedKeys;
+    boost::unordered_flat_set<DepKey, DepKey::Hash, std::equal_to<DepKey>> recordedKeys;
 
     DependencyTracker()
         : previous(activeTracker)
@@ -378,33 +380,6 @@ void clearPrecomputedKeysMap();
  * No-op if dep tracking is inactive or value is not a container.
  */
 [[gnu::cold]] void maybeRecordTypeDep(const PosTable & positions, const Value & v);
-
-// ═══════════════════════════════════════════════════════════════════════
-// Provenance propagation for list-reconstructing operations
-// ═══════════════════════════════════════════════════════════════════════
-//
-// Attrset provenance uses PosIdx (TracedData origin per Attr) and needs
-// no propagation — PosIdx survives attrset operations (//, mapAttrs,
-// removeAttrs) because Attr objects are copied with their pos field.
-//
-// List provenance still uses the container map (first-element Value*
-// → provenance) and requires explicit propagation.
-
-/**
- * Propagate list provenance from a single tracked input to the output.
- * Call after building the output list (mkList).
- * No-op if dep tracking is inactive, input is not tracked, or either is empty.
- * When shapeModifying is true, sets shapeModified flag on the output provenance
- * if the output size differs from the input size.
- */
-[[gnu::cold]] void propagateTrackedList(const Value & output, const Value & input, bool shapeModifying = false);
-
-/**
- * Propagate list provenance from the first tracked input found.
- * Used for concatLists where any input list could be tracked.
- * Sets shapeModified when output size differs from any input's size.
- */
-[[gnu::cold]] void propagateTrackedListFromAny(const Value & output, size_t nInputs, Value * const * inputs);
 
 /**
  * Stat metadata used as a cache key: if these fields match, the file

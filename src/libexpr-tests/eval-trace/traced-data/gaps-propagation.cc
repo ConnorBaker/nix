@@ -375,9 +375,9 @@ TEST_F(TracedDataTest, Propagation_Chained_SortFilter)
     }
 }
 
-// ── Empty output from filter → propagation is no-op ──────────────────
-// When filter produces an empty list, propagateTrackedList should be
-// a no-op (empty output has no stable key). This must not crash.
+// ── Empty output from filter ──────────────────────────────────────────
+// When filter produces an empty list, length returns 0 without needing
+// list provenance. The input list's #len dep covers invalidation.
 
 TEST_F(TracedDataTest, Propagation_Filter_EmptyOutput)
 {

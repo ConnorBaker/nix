@@ -3999,7 +3999,6 @@ static void prim_tail(EvalState & state, const PosIdx pos, Value ** args, Value 
     for (const auto & [n, v] : enumerate(list))
         v = args[0]->listView()[n + 1];
     v.mkList(list);
-    if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(v, *args[0], /*shapeModifying=*/true);
 }
 
 static RegisterPrimOp primop_tail({
@@ -4090,7 +4089,6 @@ static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Valu
         for (const auto & [n, v] : enumerate(list))
             v = vs[n];
         v.mkList(list);
-        if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(v, *args[1], /*shapeModifying=*/true);
     }
 }
 
@@ -4350,7 +4348,6 @@ static void prim_sort(EvalState & state, const PosIdx pos, Value ** args, Value 
     peeksort(list.begin(), list.end(), comparator);
 
     v.mkList(list);
-    if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(v, *args[1]);
 }
 
 static RegisterPrimOp primop_sort({
@@ -4446,7 +4443,6 @@ static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, V
         memcpy(rlist.elems, right.data(), sizeof(Value *) * rsize);
     auto & rVal = attrs.alloc(state.s.right);
     rVal.mkList(rlist);
-    if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(rVal, *args[1], /*shapeModifying=*/true);
 
     auto wsize = wrong.size();
     auto wlist = state.buildList(wsize);
@@ -4454,7 +4450,6 @@ static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, V
         memcpy(wlist.elems, wrong.data(), sizeof(Value *) * wsize);
     auto & wVal = attrs.alloc(state.s.wrong);
     wVal.mkList(wlist);
-    if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(wVal, *args[1], /*shapeModifying=*/true);
 
     v.mkAttrs(attrs);
 }
@@ -4508,7 +4503,6 @@ static void prim_groupBy(EvalState & state, const PosIdx pos, Value ** args, Val
         memcpy(list.elems, i.second.data(), sizeof(Value *) * size);
         auto & groupVal = attrs2.alloc(i.first);
         groupVal.mkList(list);
-        if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(groupVal, *args[1], /*shapeModifying=*/true);
     }
 
     v.mkAttrs(attrs2.alreadySorted());

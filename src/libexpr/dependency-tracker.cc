@@ -824,39 +824,4 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Provenance propagation for list-reconstructing operations
-// ═══════════════════════════════════════════════════════════════════════
-
-[[gnu::cold]] void propagateTrackedList(const Value & output, const Value & input, bool shapeModifying)
-{
-    if (!DependencyTracker::isActive()) return;
-    if (input.listSize() == 0) return; // Empty input has no stable key
-    auto * prov = lookupTracedContainer((const void *)input.listView()[0]);
-    if (!prov) return;
-    if (output.listSize() == 0) return; // Empty output has no stable key
-    // For shapeModifying operations where output size differs, we skip
-    // propagation to avoid recording incorrect #len deps.
-    if (shapeModifying && output.listSize() != input.listSize())
-        return;
-    registerTracedContainer((const void *)output.listView()[0], prov);
-}
-
-[[gnu::cold]] void propagateTrackedListFromAny(const Value & output, size_t nInputs, Value * const * inputs)
-{
-    if (!DependencyTracker::isActive()) return;
-    if (output.listSize() == 0) return;
-    for (size_t i = 0; i < nInputs; i++) {
-        if (inputs[i]->listSize() == 0) continue;
-        auto * prov = lookupTracedContainer((const void *)inputs[i]->listView()[0]);
-        if (!prov) continue;
-        // For concat: output size always differs, so skip propagation
-        // (same as shapeModified=true behavior).
-        if (output.listSize() != inputs[i]->listSize())
-            return;
-        registerTracedContainer((const void *)output.listView()[0], prov);
-        return;
-    }
-}
-
 } // namespace nix

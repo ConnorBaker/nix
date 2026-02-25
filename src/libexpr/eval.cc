@@ -2164,7 +2164,6 @@ void EvalState::concatLists(
         pos += l;
     }
     v.mkList(list);
-    if (traceActiveDepth) [[unlikely]] propagateTrackedListFromAny(v, nrLists, lists);
 }
 
 [[gnu::noinline]]
