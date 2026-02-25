@@ -607,7 +607,7 @@ void clearReadFileStringPtrs()
     readFileStringPtrs.clear();
 }
 
-void maybeRecordRawContentDep(EvalState & state, const Value & v)
+[[gnu::cold]] void maybeRecordRawContentDep(EvalState & state, const Value & v)
 {
     if (!DependencyTracker::isActive()) return;
     if (v.type() != nString) return;
@@ -664,7 +664,36 @@ void forEachDirtyStatHash(std::function<void(const StatHashEntry &)> callback)
 // Shape dep recording for traced data containers
 // ═══════════════════════════════════════════════════════════════════════
 
-void maybeRecordListLenDep(const Value & v)
+/**
+ * Iterate unique TracedData origins in an attrset and invoke a callback for each.
+ * The callback receives (depSource, depKey, format, dataPath) from the origin.
+ * Deduplicates by TracedData pointer identity. Used by maybeRecordTypeDep and
+ * maybeRecordHasKeyDep (exists=false) to avoid duplicated scanning loops.
+ */
+template<typename Fn>
+static void forEachTracedDataOrigin(const PosTable & positions, const Value & v, Fn && fn)
+{
+    std::vector<const Pos::TracedData *> seen;
+    for (auto & attr : *v.attrs()) {
+        if (!attr.pos.isTracedData()) continue;
+        auto * origin = positions.originOfPtr(attr.pos);
+        if (!origin) continue;
+        auto * df = std::get_if<Pos::TracedData>(origin);
+        if (!df) continue;
+        bool dup = false;
+        for (auto * s : seen) { if (s == df) { dup = true; break; } }
+        if (dup) continue;
+        auto fmt = parseStructuredFormat(df->format);
+        if (!fmt) continue;
+        seen.push_back(df);
+        fn(df->depSource, df->depKey, *fmt, df->dataPath);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════
+
+[[gnu::cold]] void maybeRecordListLenDep(const Value & v)
 {
     if (!DependencyTracker::isActive()) return;
     if (v.listSize() == 0) return; // Empty lists can't be tracked (no stable key)
@@ -676,7 +705,7 @@ void maybeRecordListLenDep(const Value & v)
     DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
 }
 
-void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symbols, const Value & v)
+[[gnu::cold]] void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symbols, const Value & v)
 {
     if (!DependencyTracker::isActive()) return;
     if (v.type() != nAttrs) return;
@@ -740,31 +769,18 @@ void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symb
     }
 }
 
-void maybeRecordTypeDep(const PosTable & positions, const Value & v)
+[[gnu::cold]] void maybeRecordTypeDep(const PosTable & positions, const Value & v)
 {
     if (!DependencyTracker::isActive()) return;
 
     if (v.type() == nAttrs) {
         if (!v.attrs()->hasAnyTracedDataLayer()) return;
         auto hash = depHash("object");
-        std::vector<const Pos::TracedData *> seen;
-        for (auto & attr : *v.attrs()) {
-            if (!attr.pos.isTracedData()) continue;
-            auto * origin = positions.originOfPtr(attr.pos);
-            if (!origin) continue;
-            auto * df = std::get_if<Pos::TracedData>(origin);
-            if (!df) continue;
-            bool dup = false;
-            for (auto * s : seen) { if (s == df) { dup = true; break; } }
-            if (dup) continue;
-            auto fmt = parseStructuredFormat(df->format);
-            if (!fmt) continue;
-            seen.push_back(df);
-            auto fullKey = buildStructuredDepKey(df->depKey, *fmt, df->dataPath, ShapeSuffix::Type);
-            DependencyTracker::record({df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
-        }
+        forEachTracedDataOrigin(positions, v, [&](auto & depSource, auto & depKey, auto fmt, auto & dataPath) {
+            auto fullKey = buildStructuredDepKey(depKey, fmt, dataPath, ShapeSuffix::Type);
+            DependencyTracker::record({depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        });
     } else if (v.type() == nList && v.listSize() > 0) {
-        // Lists still use the existing tracedContainerMap lookup.
         auto * prov = lookupTracedContainer((const void *)v.listView()[0]);
         if (!prov) return;
         auto hash = depHash("array");
@@ -773,7 +789,7 @@ void maybeRecordTypeDep(const PosTable & positions, const Value & v)
     }
 }
 
-void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbols,
+[[gnu::cold]] void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbols,
                           const Value & v, Symbol keyName, bool exists)
 {
     if (!DependencyTracker::isActive()) return;
@@ -800,25 +816,11 @@ void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbol
         DependencyTracker::record({df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
     } else {
         // Key not found — record against every unique TracedData origin in this attrset.
-        std::vector<const Pos::TracedData *> seen;
         auto hash = depHash("0");
-        for (auto & attr : *v.attrs()) {
-            if (!attr.pos.isTracedData()) continue;
-            auto * origin = positions.originOfPtr(attr.pos);
-            if (!origin) continue;
-            auto * df = std::get_if<Pos::TracedData>(origin);
-            if (!df) continue;
-            bool dup = false;
-            for (auto * s : seen) {
-                if (s == df) { dup = true; break; }
-            }
-            if (dup) continue;
-            auto fmt = parseStructuredFormat(df->format);
-            if (!fmt) continue;
-            seen.push_back(df);
-            auto fullKey = buildStructuredDepKey(df->depKey, *fmt, df->dataPath, rawSuffix);
-            DependencyTracker::record({df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
-        }
+        forEachTracedDataOrigin(positions, v, [&](auto & depSource, auto & depKey, auto fmt, auto & dataPath) {
+            auto fullKey = buildStructuredDepKey(depKey, fmt, dataPath, rawSuffix);
+            DependencyTracker::record({depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        });
     }
 }
 
@@ -826,7 +828,7 @@ void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbol
 // Provenance propagation for list-reconstructing operations
 // ═══════════════════════════════════════════════════════════════════════
 
-void propagateTrackedList(const Value & output, const Value & input, bool shapeModifying)
+[[gnu::cold]] void propagateTrackedList(const Value & output, const Value & input, bool shapeModifying)
 {
     if (!DependencyTracker::isActive()) return;
     if (input.listSize() == 0) return; // Empty input has no stable key
@@ -840,7 +842,7 @@ void propagateTrackedList(const Value & output, const Value & input, bool shapeM
     registerTracedContainer((const void *)output.listView()[0], prov);
 }
 
-void propagateTrackedListFromAny(const Value & output, size_t nInputs, Value * const * inputs)
+[[gnu::cold]] void propagateTrackedListFromAny(const Value & output, size_t nInputs, Value * const * inputs)
 {
     if (!DependencyTracker::isActive()) return;
     if (output.listSize() == 0) return;

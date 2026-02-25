@@ -227,7 +227,7 @@ static void fetchTree(
     auto storePath = state.mountInput(cachedInput.lockedInput, input, cachedInput.accessor);
 
     // Record UnhashedFetch oracle dep for trace verification (re-fetch on verify)
-    if (!input.isLocked(state.fetchSettings) && state.traceActiveDepth) {
+    if (!input.isLocked(state.fetchSettings) && state.traceActiveDepth) [[unlikely]] {
         DependencyTracker::record({"", input.to_string(),
             DepHashValue(state.store->printStorePath(storePath)), DepType::UnhashedFetch});
     }
@@ -461,7 +461,7 @@ static void fetch(
             .debugThrow();
 
     // Record UnhashedFetch oracle dep (always dirty during trace verification)
-    if (!expectedHash && state.traceActiveDepth) {
+    if (!expectedHash && state.traceActiveDepth) [[unlikely]] {
         DependencyTracker::record({"", *url, DepHashValue(std::string("")), DepType::UnhashedFetch});
     }
 

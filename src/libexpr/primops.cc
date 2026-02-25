@@ -514,7 +514,7 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 
     // Record Exec oracle dep for the eval trace (Shake-style: always dirty
     // since we cannot safely re-execute the program during verification).
-    if (state.traceActiveDepth) {
+    if (state.traceActiveDepth) [[unlikely]] {
         DependencyTracker::record({"<exec>", program, depHash(program + "\0" + output), DepType::Exec});
     }
 
@@ -539,7 +539,7 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 static void prim_typeOf(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    if (state.traceActiveDepth) maybeRecordTypeDep(state.positions, *args[0]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordTypeDep(state.positions, *args[0]);
     switch (args[0]->type()) {
     case nInt:
         v.mkStringNoCopy("int"_sds);
@@ -760,7 +760,7 @@ struct CompareValues
                 // reproducible way.
                 return v1->pathStrView() < v2->pathStrView();
             case nList:
-                if (state.traceActiveDepth) {
+                if (state.traceActiveDepth) [[unlikely]] {
                     maybeRecordListLenDep(*v1);
                     maybeRecordListLenDep(*v2);
                 }
@@ -2008,7 +2008,7 @@ static void prim_pathExists(EvalState & state, const PosIdx pos, Value ** args, 
         // We record the file type (not just existence) so that type changes
         // (e.g. directory -> file) are detected, which matters for mustBeDir
         // paths like `builtins.pathExists ./foo/`.
-        if (state.traceActiveDepth) {
+        if (state.traceActiveDepth) [[unlikely]] {
             DepHashValue hashValue = st
                 ? DepHashValue(fmt("type:%d", static_cast<int>(st->type)))
                 : DepHashValue(std::string("missing"));
@@ -2128,7 +2128,7 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
     // For .nix code (consumed via import/evalFile), Content is the only dep;
     // no fine-grained override exists. See design.md Section 4.6.
     std::optional<Blake3Hash> contentHash;
-    if (state.traceActiveDepth) {
+    if (state.traceActiveDepth) [[unlikely]] {
         auto hash = depHash(s);
         recordDep(path.path, hash, DepType::Content, state.getMountToInput());
         // Set provenance so a subsequent fromJSON/fromTOML can produce lazy
@@ -2380,7 +2380,7 @@ static void prim_hashFile(EvalState & state, const PosIdx pos, Value ** args, Va
     auto content = path.readFile();
 
     // Record Content oracle dep for trace verification (Adapton DDG edge)
-    if (state.traceActiveDepth) {
+    if (state.traceActiveDepth) [[unlikely]] {
         auto hash = depHash(content);
         recordDep(path.path, hash, DepType::Content, state.getMountToInput());
     }
@@ -2439,7 +2439,7 @@ static void prim_readFileType(EvalState & state, const PosIdx pos, Value ** args
     auto st = path.lstat();
 
     // Record Existence oracle dep (with file type) for trace verification
-    if (state.traceActiveDepth) {
+    if (state.traceActiveDepth) [[unlikely]] {
         recordDep(path.path, DepHashValue(fmt("type:%d", static_cast<int>(st.type))),
             DepType::Existence, state.getMountToInput());
     }
@@ -2823,7 +2823,7 @@ static void prim_fromJSON(EvalState & state, const PosIdx pos, Value ** args, Va
 
     // If the string came directly from readFile (provenance hash matches),
     // produce lazy traced data with fine-grained StructuredContent deps.
-    if (state.traceActiveDepth) {
+    if (state.traceActiveDepth) [[unlikely]] {
         if (auto * prov = lookupReadFileProvenance(depHash(s))) {
             auto [depSource, depKey] = resolveProvenance(prov->path, state.getMountToInput());
             try {
@@ -3309,7 +3309,7 @@ static RegisterPrimOp primop_path({
 static void prim_attrNames(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrNames");
-    if (state.traceActiveDepth) maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
 
     auto list = state.buildList(args[0]->attrs()->size());
 
@@ -3337,7 +3337,7 @@ static RegisterPrimOp primop_attrNames({
 static void prim_attrValues(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrValues");
-    if (state.traceActiveDepth) maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
 
     auto list = state.buildList(args[0]->attrs()->size());
 
@@ -3466,7 +3466,7 @@ static void prim_hasAttr(EvalState & state, const PosIdx pos, Value ** args, Val
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.hasAttr");
     auto sym = state.symbols.create(attr);
     auto found = args[1]->attrs()->get(sym);
-    if (state.traceActiveDepth) maybeRecordHasKeyDep(state.positions, state.symbols, *args[1], sym, found != nullptr);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordHasKeyDep(state.positions, state.symbols, *args[1], sym, found != nullptr);
     v.mkBool(found);
 }
 
@@ -3485,7 +3485,7 @@ static RegisterPrimOp primop_hasAttr({
 static void prim_isAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    if (state.traceActiveDepth) maybeRecordTypeDep(state.positions, *args[0]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordTypeDep(state.positions, *args[0]);
     v.mkBool(args[0]->type() == nAttrs);
 }
 
@@ -3502,7 +3502,7 @@ static void prim_removeAttrs(EvalState & state, const PosIdx pos, Value ** args,
 {
     state.forceAttrs(*args[0], pos, "while evaluating the first argument passed to builtins.removeAttrs");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.removeAttrs");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     /* Get the attribute names to be removed.
        We keep them as Attrs instead of Symbols so std::set_difference
@@ -3550,7 +3550,7 @@ static RegisterPrimOp primop_removeAttrs({
 static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[0], pos, "while evaluating the argument passed to builtins.listToAttrs");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[0]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[0]);
 
     // Step 1. Sort the name-value attrsets in place using the memory we allocate for the result
     auto listView = args[0]->listView();
@@ -3634,8 +3634,10 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
 {
     state.forceAttrs(*args[0], pos, "while evaluating the first argument passed to builtins.intersectAttrs");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.intersectAttrs");
-    if (state.traceActiveDepth) maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
-    if (state.traceActiveDepth) maybeRecordAttrKeysDep(state.positions, state.symbols, *args[1]);
+    if (state.traceActiveDepth) [[unlikely]] {
+        maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
+        maybeRecordAttrKeysDep(state.positions, state.symbols, *args[1]);
+    }
 
     auto & left = *args[0]->attrs();
     auto & right = *args[1]->attrs();
@@ -3714,7 +3716,7 @@ static void prim_catAttrs(EvalState & state, const PosIdx pos, Value ** args, Va
     auto attrName = state.symbols.create(
         state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.catAttrs"));
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.catAttrs");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     SmallValueVector<nonRecursiveStackReservation> res(args[1]->listSize());
     size_t found = 0;
@@ -3845,7 +3847,7 @@ static void prim_zipAttrsWith(EvalState & state, const PosIdx pos, Value ** args
 
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.zipAttrsWith");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.zipAttrsWith");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
     const auto listItems = args[1]->listView();
 
     for (auto & vElem : listItems) {
@@ -3925,7 +3927,7 @@ static RegisterPrimOp primop_zipAttrsWith({
 static void prim_isList(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    if (state.traceActiveDepth) maybeRecordTypeDep(state.positions, *args[0]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordTypeDep(state.positions, *args[0]);
     v.mkBool(args[0]->type() == nList);
 }
 
@@ -3989,7 +3991,7 @@ static RegisterPrimOp primop_head({
 static void prim_tail(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[0], pos, "while evaluating the first argument passed to 'builtins.tail'");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[0]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[0]);
     if (args[0]->listSize() == 0)
         state.error<EvalError>("'builtins.tail' called on an empty list").atPos(pos).debugThrow();
 
@@ -3997,7 +3999,7 @@ static void prim_tail(EvalState & state, const PosIdx pos, Value ** args, Value 
     for (const auto & [n, v] : enumerate(list))
         v = args[0]->listView()[n + 1];
     v.mkList(list);
-    if (state.traceActiveDepth) propagateTrackedList(v, *args[0], /*shapeModifying=*/true);
+    if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(v, *args[0], /*shapeModifying=*/true);
 }
 
 static RegisterPrimOp primop_tail({
@@ -4020,7 +4022,7 @@ static RegisterPrimOp primop_tail({
 static void prim_map(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.map");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     if (args[1]->listSize() == 0) {
         v = *args[1];
@@ -4057,7 +4059,7 @@ static RegisterPrimOp primop_map({
 static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.filter");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     if (args[1]->listSize() == 0) {
         v = *args[1];
@@ -4088,7 +4090,7 @@ static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Valu
         for (const auto & [n, v] : enumerate(list))
             v = vs[n];
         v.mkList(list);
-        if (state.traceActiveDepth) propagateTrackedList(v, *args[1], /*shapeModifying=*/true);
+        if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(v, *args[1], /*shapeModifying=*/true);
     }
 }
 
@@ -4107,7 +4109,7 @@ static void prim_elem(EvalState & state, const PosIdx pos, Value ** args, Value 
 {
     bool res = false;
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.elem");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
     for (auto elem : args[1]->listView())
         if (state.eqValues(*args[0], *elem, pos, "while searching for the presence of the given element in the list")) {
             res = true;
@@ -4130,7 +4132,7 @@ static RegisterPrimOp primop_elem({
 static void prim_concatLists(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.concatLists");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[0]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[0]);
     auto listView = args[0]->listView();
     state.concatLists(
         v,
@@ -4153,7 +4155,7 @@ static RegisterPrimOp primop_concatLists({
 static void prim_length(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.length");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[0]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[0]);
     v.mkInt(args[0]->listSize());
 }
 
@@ -4172,7 +4174,7 @@ static void prim_foldlStrict(EvalState & state, const PosIdx pos, Value ** args,
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.foldlStrict");
     state.forceList(*args[2], pos, "while evaluating the third argument passed to builtins.foldlStrict");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[2]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[2]);
 
     if (args[2]->listSize()) {
         Value * vCur = args[1];
@@ -4216,7 +4218,7 @@ static void anyOrAll(bool any, EvalState & state, const PosIdx pos, Value ** arg
         *args[0], pos, std::string("while evaluating the first argument passed to builtins.") + (any ? "any" : "all"));
     state.forceList(
         *args[1], pos, std::string("while evaluating the second argument passed to builtins.") + (any ? "any" : "all"));
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     std::string_view errorCtx = any ? "while evaluating the return value of the function passed to builtins.any"
                                     : "while evaluating the return value of the function passed to builtins.all";
@@ -4307,7 +4309,7 @@ static void prim_lessThan(EvalState & state, const PosIdx pos, Value ** args, Va
 static void prim_sort(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.sort");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     auto len = args[1]->listSize();
     if (len == 0) {
@@ -4348,7 +4350,7 @@ static void prim_sort(EvalState & state, const PosIdx pos, Value ** args, Value 
     peeksort(list.begin(), list.end(), comparator);
 
     v.mkList(list);
-    if (state.traceActiveDepth) propagateTrackedList(v, *args[1]);
+    if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(v, *args[1]);
 }
 
 static RegisterPrimOp primop_sort({
@@ -4418,7 +4420,7 @@ static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, V
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.partition");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.partition");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     auto len = args[1]->listSize();
 
@@ -4444,7 +4446,7 @@ static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, V
         memcpy(rlist.elems, right.data(), sizeof(Value *) * rsize);
     auto & rVal = attrs.alloc(state.s.right);
     rVal.mkList(rlist);
-    if (state.traceActiveDepth) propagateTrackedList(rVal, *args[1], /*shapeModifying=*/true);
+    if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(rVal, *args[1], /*shapeModifying=*/true);
 
     auto wsize = wrong.size();
     auto wlist = state.buildList(wsize);
@@ -4452,7 +4454,7 @@ static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, V
         memcpy(wlist.elems, wrong.data(), sizeof(Value *) * wsize);
     auto & wVal = attrs.alloc(state.s.wrong);
     wVal.mkList(wlist);
-    if (state.traceActiveDepth) propagateTrackedList(wVal, *args[1], /*shapeModifying=*/true);
+    if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(wVal, *args[1], /*shapeModifying=*/true);
 
     v.mkAttrs(attrs);
 }
@@ -4484,7 +4486,7 @@ static void prim_groupBy(EvalState & state, const PosIdx pos, Value ** args, Val
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.groupBy");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.groupBy");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     ValueVectorMap attrs;
 
@@ -4506,7 +4508,7 @@ static void prim_groupBy(EvalState & state, const PosIdx pos, Value ** args, Val
         memcpy(list.elems, i.second.data(), sizeof(Value *) * size);
         auto & groupVal = attrs2.alloc(i.first);
         groupVal.mkList(list);
-        if (state.traceActiveDepth) propagateTrackedList(groupVal, *args[1], /*shapeModifying=*/true);
+        if (state.traceActiveDepth) [[unlikely]] propagateTrackedList(groupVal, *args[1], /*shapeModifying=*/true);
     }
 
     v.mkAttrs(attrs2.alreadySorted());
@@ -4540,7 +4542,7 @@ static void prim_concatMap(EvalState & state, const PosIdx pos, Value ** args, V
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.concatMap");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.concatMap");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
     auto nrLists = args[1]->listSize();
 
     // List of returned lists before concatenation. References to these Values must NOT be persisted.
@@ -4862,7 +4864,7 @@ static void prim_substring(EvalState & state, const PosIdx pos, Value ** args, V
     NixStringContext context;
     auto s = state.coerceToString(
         pos, *args[2], context, "while evaluating the third argument (the string) passed to builtins.substring");
-    if (state.traceActiveDepth) maybeRecordRawContentDep(state, *args[2]); // after coerceToString forces the value
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[2]); // after coerceToString forces the value
 
     v.mkString(NixUInt(start) >= s->size() ? "" : s->substr(start, _len), context, state.mem);
 }
@@ -4893,7 +4895,7 @@ static void prim_stringLength(EvalState & state, const PosIdx pos, Value ** args
     NixStringContext context;
     auto s =
         state.coerceToString(pos, *args[0], context, "while evaluating the argument passed to builtins.stringLength");
-    if (state.traceActiveDepth) maybeRecordRawContentDep(state, *args[0]); // after coerceToString forces the value
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[0]); // after coerceToString forces the value
     v.mkInt(NixInt::Inner(s->size()));
 }
 
@@ -4919,7 +4921,7 @@ static void prim_hashString(EvalState & state, const PosIdx pos, Value ** args, 
     NixStringContext context; // discarded
     auto s =
         state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.hashString");
-    if (state.traceActiveDepth) maybeRecordRawContentDep(state, *args[1]); // after forceString
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[1]); // after forceString
 
     v.mkString(hashString(*ha, s).to_string(HashFormat::Base16, false), state.mem);
 }
@@ -5076,7 +5078,7 @@ void prim_match(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         NixStringContext context;
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.match");
-        if (state.traceActiveDepth) maybeRecordRawContentDep(state, *args[1]); // after forceString
+        if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[1]); // after forceString
 
         std::cmatch match;
         if (!std::regex_match(str.begin(), str.end(), match, *regex)) {
@@ -5151,7 +5153,7 @@ void prim_split(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         NixStringContext context;
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.split");
-        if (state.traceActiveDepth) maybeRecordRawContentDep(state, *args[1]); // after forceString
+        if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[1]); // after forceString
 
         auto begin = std::cregex_iterator(str.begin(), str.end(), *regex);
         auto end = std::cregex_iterator();
@@ -5256,7 +5258,7 @@ static void prim_concatStringsSep(EvalState & state, const PosIdx pos, Value ** 
         *args[1],
         pos,
         "while evaluating the second argument (the list of strings to concat) passed to builtins.concatStringsSep");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     std::string res;
     res.reserve((args[1]->listSize() + 32) * sep.size());
@@ -5292,8 +5294,10 @@ static void prim_replaceStrings(EvalState & state, const PosIdx pos, Value ** ar
 {
     state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.replaceStrings");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.replaceStrings");
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[0]);
-    if (state.traceActiveDepth) maybeRecordListLenDep(*args[1]);
+    if (state.traceActiveDepth) [[unlikely]] {
+        maybeRecordListLenDep(*args[0]);
+        maybeRecordListLenDep(*args[1]);
+    }
     if (args[0]->listSize() != args[1]->listSize())
         state.error<EvalError>("'from' and 'to' arguments passed to builtins.replaceStrings have different lengths")
             .atPos(pos)
@@ -5311,7 +5315,7 @@ static void prim_replaceStrings(EvalState & state, const PosIdx pos, Value ** ar
     NixStringContext context;
     auto s = state.forceString(
         *args[2], context, pos, "while evaluating the third argument passed to builtins.replaceStrings");
-    if (state.traceActiveDepth) maybeRecordRawContentDep(state, *args[2]); // after forceString
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[2]); // after forceString
 
     std::string res;
     // Loops one past last character to handle the case where 'from' contains an empty string.
@@ -5560,7 +5564,7 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
             .name = "__currentTime_thunk",
             .arity = 1,
             .fun = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
-                if (state.traceActiveDepth) {
+                if (state.traceActiveDepth) [[unlikely]] {
                     DependencyTracker::record({"", "currentTime",
                         DepHashValue(std::to_string(time(0))), DepType::CurrentTime});
                 }
@@ -5606,7 +5610,7 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
             .name = "__currentSystem_thunk",
             .arity = 1,
             .fun = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
-                if (state.traceActiveDepth) {
+                if (state.traceActiveDepth) [[unlikely]] {
                     auto system = state.settings.getCurrentSystem();
                     auto hash = depHash(system);
                     DependencyTracker::record({"", "currentSystem", hash, DepType::System});

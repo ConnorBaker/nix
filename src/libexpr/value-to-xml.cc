@@ -42,7 +42,7 @@ static void showAttrs(
     NixStringContext & context,
     PathSet & drvsSeen)
 {
-    if (state.traceActiveDepth)
+    if (state.traceActiveDepth) [[unlikely]]
         maybeRecordAttrKeysDep(state.positions, state.symbols, v);
 
     StringSet names;
@@ -134,7 +134,7 @@ static void printValueAsXML(
         break;
 
     case nList: {
-        if (state.traceActiveDepth) maybeRecordListLenDep(v);
+        if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(v);
         XMLOpenElement _(doc, "list");
         for (auto v2 : v.listView())
             printValueAsXML(state, strict, location, *v2, doc, context, drvsSeen, pos);

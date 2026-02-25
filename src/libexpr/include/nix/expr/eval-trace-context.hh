@@ -8,7 +8,9 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <bitset>
+#include <cstring>
 #include <map>
+#include <memory>
 #include <unordered_map>
 
 namespace nix {
@@ -65,20 +67,57 @@ struct EvalTraceContext {
     /**
      * Bloom filter for fast rejection in replayMemoizedDeps().
      * A bit is set when a Value* is inserted into epochMap via recordThunkDeps.
-     * replayMemoizedDeps tests the bit before doing the epochMap lookup —
-     * ~95% of calls miss epochMap, so this avoids ~9M x 50ns flat_map lookups.
-     * 2M bits = 256KB, giving ~5% false positive rate at typical load.
+     * replayMemoizedDeps tests the bit before doing the epochMap lookup.
+     *
+     * Sizing (k=2 hash functions, m=8M bits = 1MB):
+     *
+     *   Profiled on `nix eval -f nixos/release.nix closures --json`:
+     *     n=654K insertions, 494M tests → 1.3% FP, 97.4% rejection rate
+     *   Profiled on `nix eval -f nixos/release.nix closures.gnome --json`:
+     *     n=174K insertions, 106M tests → 0.07% FP, 98.5% rejection rate
+     *
+     *   Saves ~1s on the heavy workload (replayMemoizedDeps drops from
+     *   2270ms to 1258ms by avoiding 480M+ epochMap lookups).
+     *
+     *   Smaller sizes were tested and rejected:
+     *     256KB (1<<21): 8.5% FP at 654K insertions (46% load), 42M wasted lookups
+     *      32KB (1<<18): 16.6% FP at 174K insertions (66% load), catastrophically overloaded
+     *
+     * Hash functions: h1 = ptr >> 4 (strips 16-byte GC alignment),
+     * h2 = (ptr >> 4) * phi64 >> 43 (golden-ratio multiplicative hash
+     * for an independent bit position).
      */
-    static constexpr size_t BLOOM_BITS = 1 << 21;
-    std::bitset<BLOOM_BITS> replayBloom;
+    static constexpr size_t BLOOM_BITS = 1 << 23;
+    static constexpr size_t BLOOM_BYTES = BLOOM_BITS / 8;
+
+    /**
+     * GC-invisible bloom storage. Allocated with malloc (not GC_MALLOC)
+     * so Boehm never scans the 1MB bitset for pointers. Contains only
+     * hashed bit positions — no pointer-like data to cause false retention.
+     */
+    struct BloomStorage {
+        uint8_t * data;
+        BloomStorage() : data(static_cast<uint8_t *>(::malloc(BLOOM_BYTES))) {
+            std::memset(data, 0, BLOOM_BYTES);
+        }
+        ~BloomStorage() { ::free(data); }
+        BloomStorage(const BloomStorage &) = delete;
+        BloomStorage & operator=(const BloomStorage &) = delete;
+
+        void set(size_t bit) { data[bit / 8] |= (1u << (bit % 8)); }
+        bool test(size_t bit) const { return data[bit / 8] & (1u << (bit % 8)); }
+        void reset() { std::memset(data, 0, BLOOM_BYTES); }
+    } replayBloom;
 
     void bloomSet(const Value * v) {
-        auto h = reinterpret_cast<uintptr_t>(v) >> 4;
-        replayBloom.set(h % BLOOM_BITS);
+        auto h = reinterpret_cast<uintptr_t>(v);
+        replayBloom.set((h >> 4) % BLOOM_BITS);
+        replayBloom.set(((h >> 4) * 0x9E3779B97F4A7C15ULL >> 43) % BLOOM_BITS);
     }
     bool bloomTest(const Value * v) const {
-        auto h = reinterpret_cast<uintptr_t>(v) >> 4;
-        return replayBloom.test(h % BLOOM_BITS);
+        auto h = reinterpret_cast<uintptr_t>(v);
+        return replayBloom.test((h >> 4) % BLOOM_BITS)
+            && replayBloom.test(((h >> 4) * 0x9E3779B97F4A7C15ULL >> 43) % BLOOM_BITS);
     }
 
     /**

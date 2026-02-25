@@ -234,7 +234,7 @@ static void prim_fromTOML(EvalState & state, const PosIdx pos, Value ** args, Va
 
     // If the string came directly from readFile (provenance hash matches),
     // produce lazy traced data with fine-grained StructuredContent deps.
-    if (state.traceActiveDepth) {
+    if (state.traceActiveDepth) [[unlikely]] {
         if (auto * prov = lookupReadFileProvenance(depHash(toml))) {
             auto [depSource, depKey] = resolveProvenance(prov->path, state.getMountToInput());
             try {

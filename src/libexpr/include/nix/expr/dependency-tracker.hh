@@ -246,7 +246,7 @@ class EvalState;
  * hashString, substring, match, split, replaceStrings) and eqValues.
  * No-op if dep tracking is inactive or the string didn't come from readFile.
  */
-void maybeRecordRawContentDep(EvalState & state, const Value & v);
+[[gnu::cold]] void maybeRecordRawContentDep(EvalState & state, const Value & v);
 
 /**
  * Resolve an absolute path to a (source, key) pair for dep recording,
@@ -351,7 +351,7 @@ void clearPrecomputedKeysMap();
  * ExprTracedData (checked via traced container provenance map).
  * No-op if dep tracking is inactive or list is empty (no stable key).
  */
-void maybeRecordListLenDep(const Value & v);
+[[gnu::cold]] void maybeRecordListLenDep(const Value & v);
 
 /**
  * Record a #keys StructuredContent dep if the attrset contains attrs
@@ -359,7 +359,7 @@ void maybeRecordListLenDep(const Value & v);
  * Groups by origin — mixed-provenance attrsets get partial recording.
  * No-op if dep tracking is inactive or value is not an attrset.
  */
-void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symbols, const Value & v);
+[[gnu::cold]] void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symbols, const Value & v);
 
 /**
  * Record a #has:key StructuredContent dep using PosIdx-based provenance.
@@ -368,7 +368,7 @@ void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symb
  * For exists=false: scans all attrs, records depHash("0") against each
  * unique TracedData origin.
  */
-void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbols,
+[[gnu::cold]] void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbols,
                           const Value & v, Symbol keyName, bool exists);
 
 /**
@@ -377,7 +377,7 @@ void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbol
  * For lists: uses the existing tracedContainerMap lookup.
  * No-op if dep tracking is inactive or value is not a container.
  */
-void maybeRecordTypeDep(const PosTable & positions, const Value & v);
+[[gnu::cold]] void maybeRecordTypeDep(const PosTable & positions, const Value & v);
 
 // ═══════════════════════════════════════════════════════════════════════
 // Provenance propagation for list-reconstructing operations
@@ -397,14 +397,14 @@ void maybeRecordTypeDep(const PosTable & positions, const Value & v);
  * When shapeModifying is true, sets shapeModified flag on the output provenance
  * if the output size differs from the input size.
  */
-void propagateTrackedList(const Value & output, const Value & input, bool shapeModifying = false);
+[[gnu::cold]] void propagateTrackedList(const Value & output, const Value & input, bool shapeModifying = false);
 
 /**
  * Propagate list provenance from the first tracked input found.
  * Used for concatLists where any input list could be tracked.
  * Sets shapeModified when output size differs from any input's size.
  */
-void propagateTrackedListFromAny(const Value & output, size_t nInputs, Value * const * inputs);
+[[gnu::cold]] void propagateTrackedListFromAny(const Value & output, size_t nInputs, Value * const * inputs);
 
 /**
  * Stat metadata used as a cache key: if these fields match, the file

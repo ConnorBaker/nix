@@ -1130,7 +1130,7 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
     // invalidates the trace. For data files consumed by fromJSON/fromTOML,
     // ReadFileProvenance enables StructuredContent two-level override.
     // See design.md Section 4.6 (Dependency Over-Approximation).
-    if (traceActiveDepth)
+    if (traceActiveDepth) [[unlikely]]
         recordImportContentDep(*resolvedPath);
 
     if (auto v2 = getConcurrent(*fileTraceCache, *resolvedPath)) {
@@ -1514,7 +1514,7 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
                 state.forceValue(*vAttrs, pos);
                 if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
                     // Record #has:key for traced attrset where key was NOT found
-                    if (state.traceActiveDepth && vAttrs->type() == nAttrs)
+                    if (state.traceActiveDepth && vAttrs->type() == nAttrs) [[unlikely]]
                         maybeRecordHasKeyDep(state.positions, state.symbols, *vAttrs, name, false);
                     def->eval(state, env, v);
                     return;
@@ -1590,7 +1590,7 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
             vAttrs = j->value;
         } else {
             // Record #has:key for the attrset where the key was NOT found
-            if (state.traceActiveDepth && vAttrs->type() == nAttrs)
+            if (state.traceActiveDepth && vAttrs->type() == nAttrs) [[unlikely]]
                 maybeRecordHasKeyDep(state.positions, state.symbols, *vAttrs, name, false);
             v.mkBool(false);
             return;
@@ -1598,7 +1598,7 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
     }
 
     // Record #has:key for the last attrset where the key was found
-    if (state.traceActiveDepth && lastAttrset)
+    if (state.traceActiveDepth && lastAttrset) [[unlikely]]
         maybeRecordHasKeyDep(state.positions, state.symbols, *lastAttrset, lastKeyName, true);
     v.mkBool(true);
 }
@@ -1686,7 +1686,7 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
 
                 /* Check that each actual argument is listed as a formal
                    argument (unless the attribute match specifies a `...'). */
-                if (traceActiveDepth) maybeRecordAttrKeysDep(positions, symbols, *args[0]);
+                if (traceActiveDepth) [[unlikely]] maybeRecordAttrKeysDep(positions, symbols, *args[0]);
                 if (!formals->ellipsis && attrsUsed != args[0]->attrs()->size()) {
                     /* Nope, so show the first unexpected argument to the
                        user. */
@@ -2142,7 +2142,7 @@ void EvalState::concatLists(
     size_t len = 0;
     for (size_t n = 0; n < nrLists; ++n) {
         forceList(*lists[n], pos, errorCtx);
-        if (traceActiveDepth) maybeRecordListLenDep(*lists[n]);
+        if (traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*lists[n]);
         auto l = lists[n]->listSize();
         len += l;
         if (l)
@@ -2164,7 +2164,7 @@ void EvalState::concatLists(
         pos += l;
     }
     v.mkList(list);
-    if (traceActiveDepth) propagateTrackedListFromAny(v, nrLists, lists);
+    if (traceActiveDepth) [[unlikely]] propagateTrackedListFromAny(v, nrLists, lists);
 }
 
 [[gnu::noinline]]
@@ -2281,7 +2281,7 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
         // concatenation result is the trade-off for soundness. Directories
         // and nonexistent paths are handled by the try-catch: their deps are
         // recorded when actually consumed (readDir, copyPathToStore, etc.).
-        if (state.traceActiveDepth) recordConcatPathDep(state, resultStr);
+        if (state.traceActiveDepth) [[unlikely]] recordConcatPathDep(state, resultStr);
     } else {
         auto & resultStr = StringData::alloc(state.mem, sSize);
         auto * tmp = resultStr.data();
@@ -2604,7 +2604,7 @@ BackedStringView EvalState::coerceToString(
             return "";
 
         if (v.isList()) {
-            if (traceActiveDepth) maybeRecordListLenDep(v);
+            if (traceActiveDepth) [[unlikely]] maybeRecordListLenDep(v);
             std::string result;
             auto listView = v.listView();
             for (auto [n, v2] : enumerate(listView)) {
@@ -2666,7 +2666,7 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
     // but each tracker needs its own dep record. Within a single tracker,
     // DependencyTracker::record() deduplicates by (type, source, key).
     if (traceActiveDepth
-        && !hasPrefix(path.path.abs(), "/nix/store/"))
+        && !hasPrefix(path.path.abs(), "/nix/store/")) [[unlikely]]
     {
         recordDep(path.path, DepHashValue(store->printStorePath(dstPath)),
             DepType::CopiedPath, getMountToInput());
@@ -3019,7 +3019,7 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return v1.boolean() == v2.boolean();
 
     case nString:
-        if (traceActiveDepth) {
+        if (traceActiveDepth) [[unlikely]] {
             maybeRecordRawContentDep(*this, v1);
             maybeRecordRawContentDep(*this, v2);
         }
@@ -3034,7 +3034,7 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return true;
 
     case nList:
-        if (traceActiveDepth) {
+        if (traceActiveDepth) [[unlikely]] {
             maybeRecordListLenDep(v1);
             maybeRecordListLenDep(v2);
         }
@@ -3046,7 +3046,7 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return true;
 
     case nAttrs: {
-        if (traceActiveDepth) {
+        if (traceActiveDepth) [[unlikely]] {
             maybeRecordAttrKeysDep(positions, symbols, v1);
             maybeRecordAttrKeysDep(positions, symbols, v2);
         }
@@ -3325,7 +3325,7 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_p
     auto buffer = resolvedPath.readFile();
 
     // Compute and cache content hash for oracle dep recording (Adapton DDG)
-    if (traceActiveDepth) {
+    if (traceActiveDepth) [[unlikely]] {
         auto hash = depHash(buffer);
         traceCtx->fileContentHashes.emplace(resolvedPath, std::move(hash));
     }
@@ -3372,7 +3372,7 @@ SourcePath EvalState::findFile(const std::string_view path)
 SourcePath EvalState::findFile(const LookupPath & lookupPath, const std::string_view path, const PosIdx pos)
 {
     // Record NIX_PATH dep for eval trace tracking
-    if (traceActiveDepth && !settings.pureEval) {
+    if (traceActiveDepth && !settings.pureEval) [[unlikely]] {
         auto nixPath = getEnv("NIX_PATH").value_or("");
         auto hash = depHash(nixPath);
         DependencyTracker::record({"", "NIX_PATH", hash, DepType::EnvVar});

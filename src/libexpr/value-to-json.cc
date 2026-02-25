@@ -59,7 +59,7 @@ json printValueAsJSON(
         if (auto i = v.attrs()->get(state.s.outPath))
             return printValueAsJSON(state, strict, *i->value, i->pos, context, copyToStore);
         else {
-            if (state.traceActiveDepth) maybeRecordAttrKeysDep(state.positions, state.symbols, v);
+            if (state.traceActiveDepth) [[unlikely]] maybeRecordAttrKeysDep(state.positions, state.symbols, v);
             out = json::object();
             for (auto & a : v.attrs()->lexicographicOrder(state.symbols)) {
                 try {
@@ -77,7 +77,7 @@ json printValueAsJSON(
     }
 
     case nList: {
-        if (state.traceActiveDepth) maybeRecordListLenDep(v);
+        if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(v);
         out = json::array();
         int i = 0;
         for (auto elem : v.listView()) {
