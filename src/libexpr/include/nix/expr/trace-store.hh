@@ -222,6 +222,7 @@ struct TraceStore {
      *     decompression needed — only keys_blob is loaded. Handles dynamic dep
      *     instability (Shake-style: deps vary between evaluations).
      */
+    [[gnu::cold]]
     std::optional<VerifyResult> recovery(
         TraceId oldTraceId,
         std::string_view attrPath,
@@ -290,6 +291,7 @@ struct TraceStore {
      * Session-memoized: a trace verified once in this session is not re-verified
      * (tracked via verifiedTraceIds).
      */
+    [[gnu::cold]]
     bool verifyTrace(
         TraceId traceId,
         const std::unordered_map<std::string, SourcePath> & inputAccessors,

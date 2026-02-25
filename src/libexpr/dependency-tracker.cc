@@ -61,6 +61,7 @@ void DependencyTracker::onRootConstruction()
     clearReadFileStringPtrs();
     scannedBindings.clear();
     clearPrecomputedKeysMap();
+    sessionTraces.reserve(16384);
 }
 
 ProvenanceRef allocateProvenance(std::string depSource, std::string depKey,

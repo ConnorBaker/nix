@@ -31,7 +31,9 @@ protected:
     std::vector<Dep> evalAndCollectDeps(const std::string & nixExpr)
     {
         DependencyTracker tracker;
+        state.traceActiveDepth++;
         auto v = eval(nixExpr, /* forceValue */ true);
+        state.traceActiveDepth--;
         return tracker.collectTraces();
     }
 

@@ -475,9 +475,23 @@ public:
     std::unique_ptr<EvalTraceContext> traceCtx;
 
     /**
+     * Non-zero only inside TracedExpr::evaluateFresh(), so forceValue
+     * skips replayMemoizedDeps when no DependencyTracker is active.
+     */
+    uint32_t traceActiveDepth = 0;
+
+    /**
+     * Record Content oracle dep for an imported/evaled file path.
+     * Outlined from evalFile() to reduce hot function code size.
+     */
+    [[gnu::noinline]]
+    void recordImportContentDep(const SourcePath & resolvedPath);
+
+    /**
      * Replay memoized oracle deps for an already-forced Value into active
      * dependency trackers. Forwards to traceCtx->replayMemoizedDeps().
      */
+    [[gnu::noinline]]
     void replayMemoizedDeps(const Value & v);
 
     /**
@@ -486,6 +500,18 @@ public:
      */
     [[gnu::noinline]]
     void recordThunkDeps(Value & v, uint32_t epochStart);
+
+    /**
+     * Outlined thunk-forcing path for forceValue (reduces inline code size).
+     */
+    [[gnu::noinline]]
+    void forceThunkValue(Value & v, PosIdx pos);
+
+    /**
+     * Outlined app-forcing path for forceValue (reduces inline code size).
+     */
+    [[gnu::noinline]]
+    void forceAppValue(Value & v, PosIdx pos);
 
     /**
      * Get the mount-to-input mapping. Returns an empty map if traceCtx is null.

@@ -5,7 +5,6 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
-#include "nix/expr/dependency-tracker.hh"
 
 namespace nix {
 
@@ -84,39 +83,13 @@ Env & EvalMemory::allocEnv(size_t size)
 }
 
 [[gnu::always_inline]]
-void EvalState::forceValue(Value & v, const PosIdx pos)
+inline void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    if (v.isThunk()) {
-        Env * env = v.thunk().env;
-        assert(env || v.isBlackhole());
-        Expr * expr = v.thunk().expr;
-        // Capture epochStart unconditionally (not gated on isActive()) so that
-        // thunks forced during SuspendDepTracking still get epochMap entries.
-        // Without this, replayMemoizedDeps() can't find deps for values forced
-        // during suspension, causing evaluation-order-dependent dep sets.
-        uint32_t epochStart = traceCtx
-            ? DependencyTracker::sessionTraces.size() : 0;
-        try {
-            v.mkBlackhole();
-            // checkInterrupt();
-            if (env) [[likely]]
-                expr->eval(*this, *env, v);
-            else
-                ExprBlackHole::throwInfiniteRecursionError(*this, v);
-        } catch (...) {
-            v.mkThunk(env, expr);
-            tryFixupBlackHolePos(v, pos);
-            throw;
-        }
-        if (traceCtx)
-            recordThunkDeps(v, epochStart);
-    } else if (v.isApp()) {
-        uint32_t epochStart = traceCtx
-            ? DependencyTracker::sessionTraces.size() : 0;
-        callFunction(*v.app().left, *v.app().right, v, pos);
-        if (traceCtx)
-            recordThunkDeps(v, epochStart);
-    } else if (traceCtx) {
+    if (v.isThunk()) [[unlikely]] {
+        forceThunkValue(v, pos);
+    } else if (v.isApp()) [[unlikely]] {
+        forceAppValue(v, pos);
+    } else if (traceActiveDepth) {
         replayMemoizedDeps(v);
     }
 }

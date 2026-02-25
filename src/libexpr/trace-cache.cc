@@ -1,9 +1,11 @@
 #include "nix/expr/trace-store.hh"
 #include "nix/util/environment-variables.hh"
+#include "nix/util/finally.hh"
 #include "nix/expr/trace-cache.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-trace-context.hh"
+#include "nix/expr/dependency-tracker.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/derivations.hh"
@@ -491,6 +493,8 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
 void TracedExpr::evaluateFresh(Value & v)
 {
     DependencyTracker tracker;
+    cache->state.traceActiveDepth++;
+    Finally decrementDepth{[&]{ cache->state.traceActiveDepth--; }};
 
     // Track which siblings this child accesses during evaluation.
     // Per-sibling ParentContext deps replace the single whole-parent dep to
@@ -644,6 +648,7 @@ void TracedExpr::evaluateFresh(Value & v)
  * Compare two derivations by their .drv contents and report which
  * environment variables, input derivations, or input sources differ.
  */
+[[gnu::cold]]
 static std::string diffDerivationInputs(
     EvalState & state,
     const StorePath & drvA, const StorePath & drvB)
@@ -721,6 +726,7 @@ static std::string diffDerivationInputs(
  * on the first mismatch or std::nullopt if they match.
  * Depth-limited to 20 to avoid infinite recursion on self-referential attrsets.
  */
+[[gnu::cold]]
 std::optional<std::string> deepCompare(
     EvalState & state, Value & a, Value & b,
     const std::string & path, int depth)
