@@ -99,6 +99,18 @@ struct DependencyTracker {
     static void record(const Dep & dep);
 
     /**
+     * Append a dependency to sessionTraces without touching the active
+     * tracker's recordedKeys dedup set. Used by TracedExpr::replayTrace()
+     * to propagate a child's cached deps into the session trace (needed
+     * for thunk epoch ranges) without polluting the parent tracker's
+     * dedup state. Without this, a parent that independently records the
+     * same dep later would silently drop it (the dep only exists in the
+     * child's excluded range, so the parent's stored trace would be
+     * incomplete).
+     */
+    static void recordReplay(const Dep & dep);
+
+    /**
      * Collect all deps: session range [startIndex, current) plus
      * replayed epoch ranges, skipping any regions in excludedChildRanges.
      */

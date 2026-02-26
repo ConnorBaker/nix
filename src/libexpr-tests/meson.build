@@ -61,6 +61,8 @@ sources = files(
   'eval-trace/dep/oracle-nested.cc',
   'eval-trace/dep/copied-path.cc',
   'eval-trace/dep/stat-hash-cache.cc',
+  'eval-trace/dep/replay-pollution.cc',
+  'eval-trace/dep/replay-integration.cc',
   # eval-trace/store/
   'eval-trace/store/cache.cc',
   'eval-trace/store/record-verify.cc',

@@ -116,6 +116,19 @@ void DependencyTracker::record(const Dep & dep)
     sessionTraces.push_back(dep);
 }
 
+// Replay a child's cached dependency into the session trace without touching the
+// active tracker's dedup set (recordedKeys). This prevents parent dedup-set
+// pollution: the child's deps land in an excluded range in sessionTraces (so
+// they're skipped by collectTraces), but if record() were used instead, the
+// parent's recordedKeys would reject a later independent recording of the same
+// dep. recordReplay avoids this by only appending to sessionTraces — the dep
+// still participates in thunk epoch ranges (recordThunkDeps) for correct
+// transitive propagation.
+void DependencyTracker::recordReplay(const Dep & dep)
+{
+    sessionTraces.push_back(dep);
+}
+
 // Collect the complete trace for this evaluation scope (BSàlC §3.1: a trace
 // is the ordered sequence of (key, hash) pairs observed during evaluation).
 // Combines two sources:
