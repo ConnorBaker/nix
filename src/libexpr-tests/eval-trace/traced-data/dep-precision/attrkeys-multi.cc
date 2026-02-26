@@ -272,7 +272,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, PartialOverlap_SCKeys_NotRecordedForShadow
 // intersectAttrs dep precision (from dep-precision-intersect.cc)
 // ═══════════════════════════════════════════════════════════════════════
 
-TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_RecordsSCKeys_BothOperands)
+TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_RecordsHasKeyDeps)
 {
     TempJsonFile fileA(R"({"x": 1, "y": 2})");
     TempJsonFile fileB(R"({"x": 10, "z": 30})");
@@ -280,8 +280,18 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_RecordsSCKeys_BothOperands)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_GE(countDeps(deps, DepType::StructuredContent, "#keys"), 2u)
-        << "intersectAttrs currently records #keys for both operands\n" << dumpDeps(deps);
+    // intersectAttrs records #has:x on both operands (shared key)
+    EXPECT_GE(countDeps(deps, DepType::StructuredContent, "#has:x"), 2u)
+        << "intersectAttrs must record #has:x on both operands\n" << dumpDeps(deps);
+    // No #keys deps (replaced by per-key #has)
+    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        << "intersectAttrs must NOT record #keys\n" << dumpDeps(deps);
+    // Non-shared keys get #has exists=false dep on the OTHER operand
+    // (detects new keys entering the intersection)
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:y"))
+        << "Left-only key y must get #has:y exists=false dep on right operand\n" << dumpDeps(deps);
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:z"))
+        << "Right-only key z must get #has:z exists=false dep on left operand\n" << dumpDeps(deps);
 }
 
 TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_SharedKeyChanged_CacheMiss)
@@ -308,9 +318,8 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_SharedKeyChanged_CacheMiss)
     }
 }
 
-TEST_F(DepPrecisionAttrKeysMultiTest, DISABLED_IntersectAttrs_DisjointKeyAdded_CacheHit)
+TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_DisjointKeyAdded_CacheHit)
 {
-    // CURRENTLY FAILS: #keys on a is recorded, so key addition invalidates.
     TempJsonFile fileA(R"({"x": 1})");
     TempJsonFile fileB(R"({"x": 10, "z": 30})");
     auto expr = std::format("(builtins.intersectAttrs ({}) ({})).x", fj(fileA.path), fj(fileB.path));
@@ -334,7 +343,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, DISABLED_IntersectAttrs_DisjointKeyAdded_C
     }
 }
 
-TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_CurrentlyInvalidatesOnDisjointKeyAdd)
+TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_DisjointKeyAdded_CacheHit_TraceCache)
 {
     TempJsonFile fileA(R"({"x": 1})");
     TempJsonFile fileB(R"({"x": 10, "z": 30})");
@@ -353,8 +362,8 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_CurrentlyInvalidatesOnDisjo
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 1)
-            << "KNOWN IMPRECISION: intersectAttrs records #keys on both operands";
+        EXPECT_EQ(loaderCalls, 0)
+            << "Adding disjoint key should not invalidate intersection";
         EXPECT_THAT(v, IsIntEq(10));
     }
 }
@@ -380,6 +389,99 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_ValueChangeUnrelatedKey_Cac
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 0);
         EXPECT_THAT(v, IsIntEq(10));
+    }
+}
+
+// Shared key "b" gets #has exists=true; disjoint keys get #has exists=false on other operand
+TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_HasKeyDepsForAllKeys)
+{
+    TempJsonFile fileA(R"({"a": 1, "b": 2})");
+    TempJsonFile fileB(R"({"b": 10, "c": 30})");
+    auto expr = std::format("builtins.intersectAttrs ({}) ({})", fj(fileA.path), fj(fileB.path));
+    auto deps = evalAndCollectDeps(expr);
+
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:b"))
+        << "Shared key b must get #has dep\n" << dumpDeps(deps);
+    // Disjoint keys get exists=false on the other operand
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:a"))
+        << "Left-only key a gets #has exists=false on right\n" << dumpDeps(deps);
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:c"))
+        << "Right-only key c gets #has exists=false on left\n" << dumpDeps(deps);
+    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        << "No #keys deps\n" << dumpDeps(deps);
+}
+
+// Empty intersection: all keys are non-shared → exists=false deps on each operand
+TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_EmptyIntersection_HasFalseDeps)
+{
+    TempJsonFile fileA(R"({"a": 1})");
+    TempJsonFile fileB(R"({"b": 2})");
+    auto expr = std::format("builtins.intersectAttrs ({}) ({})", fj(fileA.path), fj(fileB.path));
+    auto deps = evalAndCollectDeps(expr);
+
+    // "a" is left-only → #has:a exists=false on right (fileB)
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:a"))
+        << "Left-only key a gets exists=false dep on right\n" << dumpDeps(deps);
+    // "b" is right-only → #has:b exists=false on left (fileA)
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:b"))
+        << "Right-only key b gets exists=false dep on left\n" << dumpDeps(deps);
+    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        << "No #keys deps\n" << dumpDeps(deps);
+}
+
+// Multiple shared keys: each gets #has dep; non-shared get exists=false
+TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_MultipleSharedKeys_AllGetHasDep)
+{
+    TempJsonFile fileA(R"({"x": 1, "y": 2, "z": 3})");
+    TempJsonFile fileB(R"({"x": 10, "y": 20, "w": 40})");
+    auto expr = std::format("builtins.intersectAttrs ({}) ({})", fj(fileA.path), fj(fileB.path));
+    auto deps = evalAndCollectDeps(expr);
+
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        << "Shared key x must get #has dep\n" << dumpDeps(deps);
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:y"))
+        << "Shared key y must get #has dep\n" << dumpDeps(deps);
+    // Non-shared keys get exists=false on the other operand
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:z"))
+        << "Left-only key z gets exists=false on right\n" << dumpDeps(deps);
+    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:w"))
+        << "Right-only key w gets exists=false on left\n" << dumpDeps(deps);
+}
+
+// Disjoint key removed from one operand — no dep for it → cache hit
+TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_DisjointKeyRemoved_CacheHit)
+{
+    TempJsonFile fileA(R"({"x": 1, "y": 2})");
+    TempJsonFile fileB(R"({"x": 10, "z": 30})");
+    auto expr = std::format("(builtins.intersectAttrs ({}) ({})).x", fj(fileA.path), fj(fileB.path));
+    { auto cache = makeCache(expr); auto v = forceRoot(*cache); EXPECT_THAT(v, IsIntEq(10)); }
+    fileA.modify(R"({"x": 1})");  // Remove disjoint "y"
+    invalidateFileCache(fileA.path);
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0) << "Removing disjoint key should not invalidate";
+        EXPECT_THAT(v, IsIntEq(10));
+    }
+}
+
+// Shared key removed — #has:x changes → cache miss
+TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_SharedKeyRemoved_CacheMiss)
+{
+    TempJsonFile fileA(R"({"x": 1, "y": 2})");
+    TempJsonFile fileB(R"({"x": 10, "z": 30})");
+    auto expr = std::format("(builtins.intersectAttrs ({}) ({})).x", fj(fileA.path), fj(fileB.path));
+    { auto cache = makeCache(expr); auto v = forceRoot(*cache); EXPECT_THAT(v, IsIntEq(10)); }
+    fileA.modify(R"({"y": 2})");  // Remove shared "x" from left
+    invalidateFileCache(fileA.path);
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        // Content changed → cache miss. Re-eval: intersection is now empty,
+        // .x would fail (attribute missing).
+        try { forceRoot(*cache); } catch (...) {}
+        EXPECT_EQ(loaderCalls, 1) << "Removing shared key must invalidate";
     }
 }
 

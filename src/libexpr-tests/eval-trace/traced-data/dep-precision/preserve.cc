@@ -706,7 +706,7 @@ TEST_F(DepPrecisionPreserveTest, RemoveAttrs_KeyAdded_CacheHit)
     }
 }
 
-TEST_F(DepPrecisionPreserveTest, IntersectAttrs_KeyAdded_CacheMiss)
+TEST_F(DepPrecisionPreserveTest, IntersectAttrs_DisjointKeyAdded_CacheHit)
 {
     TempJsonFile file(R"({"a":"x","b":"y"})");
     auto expr = std::format(
@@ -715,8 +715,11 @@ TEST_F(DepPrecisionPreserveTest, IntersectAttrs_KeyAdded_CacheMiss)
     // -- Dep verification --
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
-            << "intersectAttrs must record SC #keys\n" << dumpDeps(deps);
+        // intersectAttrs records per-key #has deps, not #keys
+        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:a"))
+            << "intersectAttrs must record SC #has:a\n" << dumpDeps(deps);
+        EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+            << "intersectAttrs must NOT record #keys\n" << dumpDeps(deps);
     }
 
     // -- Cache behavior --
@@ -726,6 +729,7 @@ TEST_F(DepPrecisionPreserveTest, IntersectAttrs_KeyAdded_CacheMiss)
         EXPECT_THAT(v, IsStringEq("x"));
     }
 
+    // Adding disjoint key "c" doesn't change the intersection or result
     file.modify(R"({"a":"x","b":"y","c":"z"})");
     invalidateFileCache(file.path);
 
@@ -733,7 +737,8 @@ TEST_F(DepPrecisionPreserveTest, IntersectAttrs_KeyAdded_CacheMiss)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 1); // #keys dep causes re-eval
+        EXPECT_EQ(loaderCalls, 0)
+            << "Adding disjoint key should not invalidate intersection result";
         EXPECT_THAT(v, IsStringEq("x"));
     }
 }

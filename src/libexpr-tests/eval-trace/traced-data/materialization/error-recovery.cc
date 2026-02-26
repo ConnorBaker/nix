@@ -117,9 +117,10 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_AttrNamesCacheHit)
 }
 
 // KNOWN BUG: Leaf value d.x incorrectly cache-hits after value change.
-// The leaf trace has [ParentContext(d)] but no Content dep — the parent
-// passes verify (keys unchanged), so the leaf's ParentContext passes
-// and the leaf is served stale.
+// The child's evaluation via ExprOrigChild records deps (Content, SC) on its own
+// tracker, but ParentContext(d) passes because d's ImplicitShape(#keys) covers
+// the Content failure (keys unchanged). The sibling tracking records d but not
+// x (grandchild), so val doesn't detect x's value change.
 TEST_F(MaterializationDepTest, DISABLED_SameKeysDiffValues_ValueAccess_Invalidates)
 {
     TempJsonFile f(R"({"x":42})");

@@ -271,9 +271,10 @@ TEST_F(DepPrecisionPipelinesTest, MapAttrsFilterAttrNames_CacheMiss)
     }
 }
 
-TEST_F(DepPrecisionPipelinesTest, RemoveAttrsIntersectAttrNames_CacheMiss)
+TEST_F(DepPrecisionPipelinesTest, RemoveAttrsIntersectAttrNames_DisjointKeyAdded_CacheHit)
 {
     // attrNames (intersectAttrs (removeAttrs a [...]) b)
+    // Adding "w" to a doesn't change the intersection (w ∉ b)
     TempJsonFile fileA(R"({"x": 1, "y": 2, "z": 3})");
     TempJsonFile fileB(R"({"x": 10, "y": 20})");
     auto expr = std::format(
@@ -286,6 +287,7 @@ TEST_F(DepPrecisionPipelinesTest, RemoveAttrsIntersectAttrNames_CacheMiss)
         EXPECT_EQ(v.listSize(), 2); // x, y
     }
 
+    // Adding "w" to a: removeAttrs produces {x,y,w}, intersect with {x,y} = {x,y}
     fileA.modify(R"({"x": 1, "y": 2, "z": 3, "w": 4})");
     invalidateFileCache(fileA.path);
 
@@ -293,7 +295,9 @@ TEST_F(DepPrecisionPipelinesTest, RemoveAttrsIntersectAttrNames_CacheMiss)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(loaderCalls, 1); // #keys dep on a detects change
+        EXPECT_EQ(loaderCalls, 0)
+            << "Disjoint key w (not in b) should not invalidate intersection";
+        EXPECT_EQ(v.listSize(), 2); // still x, y
     }
 }
 

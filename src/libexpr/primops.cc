@@ -3649,11 +3649,6 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
 {
     state.forceAttrs(*args[0], pos, "while evaluating the first argument passed to builtins.intersectAttrs");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.intersectAttrs");
-    if (state.traceActiveDepth) [[unlikely]] {
-        maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
-        maybeRecordAttrKeysDep(state.positions, state.symbols, *args[1]);
-    }
-
     auto & left = *args[0]->attrs();
     auto & right = *args[1]->attrs();
 
@@ -3708,6 +3703,28 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
             auto l = left.get(r.name);
             if (l)
                 attrs.insert(r);
+        }
+    }
+
+    // Record per-key #has deps for traced data operands. For shared keys,
+    // exists=true on both; for non-shared keys, exists=false on the other
+    // operand. This detects new keys entering (or leaving) the intersection
+    // without spurious invalidation from truly disjoint key changes.
+    if (state.traceActiveDepth) [[unlikely]] {
+        for (auto & l : left) {
+            if (right.get(l.name)) {
+                maybeRecordHasKeyDep(state.positions, state.symbols, *args[0], l.name, true);
+                maybeRecordHasKeyDep(state.positions, state.symbols, *args[1], l.name, true);
+            } else {
+                // Left-only key: record exists=false on right operand
+                maybeRecordHasKeyDep(state.positions, state.symbols, *args[1], l.name, false);
+            }
+        }
+        for (auto & r : right) {
+            if (!left.get(r.name)) {
+                // Right-only key: record exists=false on left operand
+                maybeRecordHasKeyDep(state.positions, state.symbols, *args[0], r.name, false);
+            }
         }
     }
 
