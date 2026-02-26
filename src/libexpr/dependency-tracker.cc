@@ -53,6 +53,16 @@ static thread_local std::deque<TracedContainerProvenance> provenancePool;
 // to skip sort + concat + BLAKE3 when all original keys are visible (common case).
 static thread_local std::unordered_map<uint32_t, PrecomputedKeysInfo> precomputedKeysMap;
 
+// Per-Bindings* cache of TracedData origin info for intersectAttrs.
+// Avoids re-scanning the same large attrset (e.g., allPackages with 50K attrs)
+// thousands of times across repeated intersectAttrs calls.
+// Cleared on root DependencyTracker construction.
+struct IntersectOriginInfo {
+    std::string depSource;
+    std::string keyPrefix; // depKey + '\t' + formatChar + ':' + dataPath + "#has:"
+};
+static thread_local std::unordered_map<const Bindings *, std::vector<IntersectOriginInfo>> intersectOriginsCache;
+
 void DependencyTracker::onRootConstruction()
 {
     clearTracedContainerMap();
@@ -61,6 +71,7 @@ void DependencyTracker::onRootConstruction()
     clearReadFileStringPtrs();
     scannedBindings.clear();
     clearPrecomputedKeysMap();
+    intersectOriginsCache.clear();
     sessionTraces.reserve(16384);
 }
 
@@ -789,6 +800,116 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
         auto hash = depHash("array");
         auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Type);
         DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+    }
+}
+
+static const std::vector<IntersectOriginInfo> emptyOrigins;
+
+static const std::vector<IntersectOriginInfo> & collectOriginsCached(
+    const PosTable & positions, const Value & v)
+{
+    auto * bindings = v.attrs();
+    auto [it, inserted] = intersectOriginsCache.try_emplace(bindings);
+    if (!inserted)
+        return it->second;
+
+    auto & result = it->second;
+    std::vector<const Pos::TracedData *> seen;
+    for (auto & attr : *bindings) {
+        if (!attr.pos.isTracedData()) continue;
+        auto * origin = positions.originOfPtr(attr.pos);
+        if (!origin) continue;
+        auto * df = std::get_if<Pos::TracedData>(origin);
+        if (!df) continue;
+        bool dup = false;
+        for (auto * s : seen) { if (s == df) { dup = true; break; } }
+        if (dup) continue;
+        auto fmt = parseStructuredFormat(df->format);
+        if (!fmt) continue;
+        seen.push_back(df);
+        std::string prefix;
+        prefix.reserve(df->depKey.size() + 3 + df->dataPath.size() + 5);
+        prefix += df->depKey;
+        prefix += '\t';
+        prefix += structuredFormatChar(*fmt);
+        prefix += ':';
+        prefix += df->dataPath;
+        prefix += "#has:";
+        result.push_back({df->depSource, std::move(prefix)});
+    }
+    return result;
+}
+
+[[gnu::cold]] void recordIntersectAttrsDeps(const PosTable & positions, const SymbolTable & symbols,
+                                            const Value & left, const Value & right)
+{
+    if (!DependencyTracker::isActive()) return;
+
+    bool leftHasData = left.type() == nAttrs && left.attrs()->hasAnyTracedDataLayer();
+    bool rightHasData = right.type() == nAttrs && right.attrs()->hasAnyTracedDataLayer();
+    if (!leftHasData && !rightHasData) return;
+
+    // Cached origin scan — O(|attrs|) only on first encounter per Bindings*
+    const auto & leftOrigins = leftHasData ? collectOriginsCached(positions, left) : emptyOrigins;
+    const auto & rightOrigins = rightHasData ? collectOriginsCached(positions, right) : emptyOrigins;
+
+    // Early exit if no actual TracedData origins found
+    if (leftOrigins.empty() && rightOrigins.empty()) return;
+
+    auto hashExists = depHash("1");
+    auto hashAbsent = depHash("0");
+
+    auto & leftAttrs = *left.attrs();
+    auto & rightAttrs = *right.attrs();
+
+    // Record exists=true for a single attr against its operand's origins
+    auto recordExists = [&](const Attr & attr, const std::vector<IntersectOriginInfo> & origins) {
+        if (!attr.pos.isTracedData()) return;
+        auto * origin = positions.originOfPtr(attr.pos);
+        if (!origin) return;
+        auto * df = std::get_if<Pos::TracedData>(origin);
+        if (!df) return;
+        auto fmt = parseStructuredFormat(df->format);
+        if (!fmt) return;
+        auto keyStr = std::string(std::string_view(symbols[attr.name]));
+        auto escaped = escapeDataPathKey(keyStr);
+        std::string rawSuffix = "#has:";
+        rawSuffix += escaped;
+        auto fullKey = buildStructuredDepKey(df->depKey, *fmt, df->dataPath, rawSuffix);
+        DependencyTracker::record({df->depSource, fullKey, DepHashValue(hashExists), DepType::StructuredContent});
+    };
+
+    // Record exists=false against all pre-computed origins
+    auto recordAbsent = [&](Symbol keyName, const std::vector<IntersectOriginInfo> & origins) {
+        auto keyStr = std::string(std::string_view(symbols[keyName]));
+        auto escaped = escapeDataPathKey(keyStr);
+        for (auto & oi : origins) {
+            std::string fullKey = oi.keyPrefix;
+            fullKey += escaped;
+            DependencyTracker::record({oi.depSource, fullKey, DepHashValue(hashAbsent), DepType::StructuredContent});
+        }
+    };
+
+    // Iterate left keys: covers intersection + left-only
+    for (auto & l : leftAttrs) {
+        auto * r = rightAttrs.get(l.name);
+        if (r) {
+            // Intersection key
+            if (!rightOrigins.empty()) recordExists(*r, rightOrigins);
+            if (!leftOrigins.empty()) recordExists(l, leftOrigins);
+        } else {
+            // Left-only: absent from right
+            if (!rightOrigins.empty()) recordAbsent(l.name, rightOrigins);
+        }
+    }
+
+    // Iterate right-only keys (only needed if left has TracedData)
+    if (!leftOrigins.empty()) {
+        for (auto & r : rightAttrs) {
+            if (!leftAttrs.get(r.name)) {
+                recordAbsent(r.name, leftOrigins);
+            }
+        }
     }
 }
 

@@ -3706,26 +3706,11 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
         }
     }
 
-    // Record per-key #has deps for traced data operands. For shared keys,
-    // exists=true on both; for non-shared keys, exists=false on the other
-    // operand. This detects new keys entering (or leaving) the intersection
-    // without spurious invalidation from truly disjoint key changes.
+    // Record per-key #has deps for traced data operands. Pre-computes origins
+    // once per operand, then iterates keys — O(|left|+|right|) × O(origins)
+    // instead of O(|left|+|right|) × O(|attrs|) per absent key.
     if (state.traceActiveDepth) [[unlikely]] {
-        for (auto & l : left) {
-            if (right.get(l.name)) {
-                maybeRecordHasKeyDep(state.positions, state.symbols, *args[0], l.name, true);
-                maybeRecordHasKeyDep(state.positions, state.symbols, *args[1], l.name, true);
-            } else {
-                // Left-only key: record exists=false on right operand
-                maybeRecordHasKeyDep(state.positions, state.symbols, *args[1], l.name, false);
-            }
-        }
-        for (auto & r : right) {
-            if (!left.get(r.name)) {
-                // Right-only key: record exists=false on left operand
-                maybeRecordHasKeyDep(state.positions, state.symbols, *args[0], r.name, false);
-            }
-        }
+        recordIntersectAttrsDeps(state.positions, state.symbols, *args[0], *args[1]);
     }
 
     v.mkAttrs(attrs.alreadySorted());

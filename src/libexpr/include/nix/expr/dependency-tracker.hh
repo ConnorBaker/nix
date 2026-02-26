@@ -377,6 +377,17 @@ void clearPrecomputedKeysMap();
 [[gnu::cold]] void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symbols, const Value & v);
 
 /**
+ * Record per-key #has deps for intersectAttrs in bulk. Pre-computes TracedData
+ * origins for each operand (one scan each), then iterates keys recording:
+ * - exists=true for intersection keys (tag bit check per attr, no origin scan)
+ * - exists=false for disjoint keys (against pre-computed origins only)
+ * Skips operands with no TracedData entirely, reducing ~100K deps to ~55
+ * in the typical callPackage pattern (50-key functionArgs vs 50K allPackages).
+ */
+[[gnu::cold]] void recordIntersectAttrsDeps(const PosTable & positions, const SymbolTable & symbols,
+                                            const Value & left, const Value & right);
+
+/**
  * Record a #has:key StructuredContent dep using PosIdx-based provenance.
  * For exists=true: checks the found attr's PosIdx origin — if TracedData,
  * records depHash("1"); if Nix-added (no TracedData origin), skips.
