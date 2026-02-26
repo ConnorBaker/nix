@@ -14,17 +14,9 @@ using namespace nix::eval_trace::test;
 /**
  * Dep-precision tests for lambda formals (pattern matching).
  *
- * Currently (eval.cc:1650), maybeRecordAttrKeysDep is called unconditionally
- * for ALL lambda formals, even when the lambda has `...` (ellipsis). This is
- * an over-approximation: a `{ x, ... }:` lambda doesn't observe the full key
- * set (it only extracts `x` and ignores the rest). Recording #keys causes
- * spurious invalidation when unrelated keys are added to the traced data input.
- *
- * The ideal behavior: only record #keys for STRICT formals (no `...`).
- * For ellipsis formals, only the specific extracted keys matter.
- *
- * Tests prefixed DISABLED_ document the ideal behavior that fails due to
- * the current over-approximation.
+ * Strict formals (no `...`) record SC #keys because extra keys would be
+ * a runtime error. Ellipsis formals skip #keys recording — they accept
+ * any extra keys, so only the specific extracted keys matter.
  */
 
 class DepPrecisionFormalsTest : public DepPrecisionTest {};
@@ -48,15 +40,10 @@ TEST_F(DepPrecisionFormalsTest, StrictFormals_RecordsSCKeys)
         << dumpDeps(deps);
 }
 
-TEST_F(DepPrecisionFormalsTest, DISABLED_StrictFormals_KeyAdded_CacheMiss)
+TEST_F(DepPrecisionFormalsTest, StrictFormals_KeyAdded_CacheMiss)
 {
     // ({ a, b }: a) applied to traced data; traced data gains a key.
-    // Strict formals records #keys, so adding a key SHOULD invalidate.
-    //
-    // CURRENTLY FAILS: The ImplicitShape fallback or the trace caching
-    // structure allows verification to pass despite #keys mismatch.
-    // Needs investigation — the cached result (1) is correct but the
-    // lambda would throw at runtime if re-evaluated with { a, b, c }.
+    // Strict formals records #keys, so adding a key invalidates.
     TempJsonFile file(R"({"a": 1, "b": 2})");
     auto expr = std::format("({{ a, b }}: a) ({})", fj(file.path));
 
@@ -72,43 +59,37 @@ TEST_F(DepPrecisionFormalsTest, DISABLED_StrictFormals_KeyAdded_CacheMiss)
     {
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
-        // Adding "c" to strict formals { a, b } would be an error, so
-        // the #keys dep should cause re-evaluation.
+        // Adding "c" to strict formals { a, b } causes Content hash change
+        // → cache miss → loader called → throws (strict formals reject "c").
+        try { forceRoot(*cache); } catch (...) {}
         EXPECT_EQ(loaderCalls, 1)
-            << "Strict formals: adding key must invalidate (#keys dep catches it)";
+            << "Strict formals: adding key must invalidate (Content dep catches it)";
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Negative: ellipsis formals ({ x, ... }) should NOT record #keys
-// (Currently over-approximated — these tests are DISABLED)
 // ═══════════════════════════════════════════════════════════════════════
 
-TEST_F(DepPrecisionFormalsTest, DISABLED_EllipsisFormals_NoSCKeys)
+TEST_F(DepPrecisionFormalsTest, EllipsisFormals_NoSCKeys)
 {
-    // ({ a, ... }: a) applied to traced data — ellipsis formals should NOT
+    // ({ a, ... }: a) applied to traced data — ellipsis formals do NOT
     // record #keys because extra keys are accepted. Only the specific
     // extracted key "a" matters.
-    //
-    // CURRENTLY FAILS: eval.cc:1650 calls maybeRecordAttrKeysDep
-    // unconditionally, recording #keys even with ellipsis.
     TempJsonFile file(R"({"a": 1, "b": 2})");
     auto expr = std::format("({{ a, ... }}: a) ({})", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
 
-    // Ideal: NO StructuredContent #keys (ellipsis accepts any keys)
     EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
         << "Ellipsis formals ({ a, ... }) should NOT record #keys — extra keys are accepted\n"
         << dumpDeps(deps);
 }
 
-TEST_F(DepPrecisionFormalsTest, DISABLED_EllipsisFormals_KeyAdded_CacheHit)
+TEST_F(DepPrecisionFormalsTest, EllipsisFormals_KeyAdded_CacheHit)
 {
     // ({ a, ... }: a) applied to traced data; traced data gains unrelated key.
-    // With ellipsis, key additions don't affect the result — should be cache hit.
-    //
-    // CURRENTLY FAILS: #keys is recorded, causing spurious invalidation.
+    // With ellipsis, key additions don't affect the result — cache hit.
     TempJsonFile file(R"({"a": 1, "b": 2})");
     auto expr = std::format("({{ a, ... }}: a) ({})", fj(file.path));
 
@@ -125,7 +106,6 @@ TEST_F(DepPrecisionFormalsTest, DISABLED_EllipsisFormals_KeyAdded_CacheHit)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        // Ideal: cache hit (ellipsis accepts "c", result is still 1)
         EXPECT_EQ(loaderCalls, 0)
             << "Ellipsis formals: adding unrelated key should not invalidate";
         EXPECT_THAT(v, IsIntEq(1));
@@ -133,28 +113,26 @@ TEST_F(DepPrecisionFormalsTest, DISABLED_EllipsisFormals_KeyAdded_CacheHit)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Documenting current behavior: ellipsis formals DO record #keys (over-approx)
+// Explicit verification: ellipsis formals precision
 // ═══════════════════════════════════════════════════════════════════════
 
-TEST_F(DepPrecisionFormalsTest, EllipsisFormals_CurrentlyRecordsSCKeys)
+TEST_F(DepPrecisionFormalsTest, EllipsisFormals_NoSCKeys_Explicit)
 {
-    // Documents the CURRENT over-approximation: ellipsis formals record #keys.
-    // This test will need updating when the imprecision is fixed.
+    // Explicit verification: ellipsis formals do NOT record #keys.
     TempJsonFile file(R"({"a": 1, "b": 2})");
     auto expr = std::format("({{ a, ... }}: a) ({})", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
 
-    // Current (imprecise) behavior: #keys IS recorded even with ellipsis
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
-        << "KNOWN IMPRECISION: ellipsis formals currently record #keys (eval.cc:1650)\n"
+    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        << "Ellipsis formals must not record #keys\n"
         << dumpDeps(deps);
 }
 
-TEST_F(DepPrecisionFormalsTest, EllipsisFormals_CurrentlyInvalidatesOnKeyAdd)
+TEST_F(DepPrecisionFormalsTest, EllipsisFormals_KeyAdded_CacheHit_TraceCache)
 {
-    // Documents the CURRENT over-approximation: ellipsis formals cause
-    // spurious cache miss when an unrelated key is added.
+    // Ellipsis formals do not cause spurious cache miss when an unrelated
+    // key is added — no #keys dep means key-set changes are invisible.
     TempJsonFile file(R"({"a": 1, "b": 2})");
     auto expr = std::format("({{ a, ... }}: a) ({})", fj(file.path));
 
@@ -171,9 +149,8 @@ TEST_F(DepPrecisionFormalsTest, EllipsisFormals_CurrentlyInvalidatesOnKeyAdd)
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
-        // Current (imprecise) behavior: #keys causes re-eval even with ellipsis
-        EXPECT_EQ(loaderCalls, 1)
-            << "KNOWN IMPRECISION: ellipsis formals + key addition → spurious re-eval";
+        EXPECT_EQ(loaderCalls, 0)
+            << "Ellipsis formals: adding unrelated key should not invalidate";
         EXPECT_THAT(v, IsIntEq(1));
     }
 }

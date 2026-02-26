@@ -1709,7 +1709,7 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
 
                 /* Check that each actual argument is listed as a formal
                    argument (unless the attribute match specifies a `...'). */
-                if (traceActiveDepth) [[unlikely]] maybeRecordAttrKeysDep(positions, symbols, *args[0]);
+                if (traceActiveDepth && !formals->ellipsis) [[unlikely]] maybeRecordAttrKeysDep(positions, symbols, *args[0]);
                 if (!formals->ellipsis && attrsUsed != args[0]->attrs()->size()) {
                     /* Nope, so show the first unexpected argument to the
                        user. */

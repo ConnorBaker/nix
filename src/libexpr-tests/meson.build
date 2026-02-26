@@ -85,6 +85,8 @@ sources = files(
   'eval-trace/traced-data/dep-precision/creation.cc',
   'eval-trace/traced-data/dep-precision/typeof.cc',
   'eval-trace/traced-data/dep-precision/formals.cc',
+  'eval-trace/traced-data/dep-precision/formals-comprehensive.cc',
+  'eval-trace/traced-data/dep-precision/formals-cache.cc',
   'eval-trace/traced-data/dep-precision/attrkeys.cc',
   'eval-trace/traced-data/dep-precision/attrkeys-multi.cc',
   'eval-trace/traced-data/dep-precision/hasattr.cc',

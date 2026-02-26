@@ -116,17 +116,10 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_AttrNamesCacheHit)
     }
 }
 
-// KNOWN BUG: Leaf value d.x where d = fromJSON(f) incorrectly cache-hits
-// after the value changes from 42 to 99. The leaf trace has [ParentContext(d)]
-// but no Content dep — same standalone-dep class as the nested ImplicitShape
-// bug. The parent d passes verify (keys unchanged), so the leaf's
-// ParentContext passes, and the leaf is served stale.
-//
-// The fix for ImplicitShape standalone deps doesn't help here because the
-// leaf's dep is a standalone SC value dep (j:x), which IS already checked
-// in the !hasContentFailure path. But the leaf might not have ANY SC dep
-// at all — scalar leaves may only have ParentContext. This needs separate
-// investigation to understand the exact dep structure of scalar leaf traces.
+// KNOWN BUG: Leaf value d.x incorrectly cache-hits after value change.
+// The leaf trace has [ParentContext(d)] but no Content dep — the parent
+// passes verify (keys unchanged), so the leaf's ParentContext passes
+// and the leaf is served stale.
 TEST_F(MaterializationDepTest, DISABLED_SameKeysDiffValues_ValueAccess_Invalidates)
 {
     TempJsonFile f(R"({"x":42})");
