@@ -9,13 +9,23 @@ void assertCachedResultEquals(const CachedResult & a, const CachedResult & b, Sy
     ASSERT_EQ(a.index(), b.index()) << "CachedResult variant index mismatch";
 
     std::visit(overloaded{
-        [&](const std::vector<Symbol> & va) {
-            auto & vb = std::get<std::vector<Symbol>>(b);
-            ASSERT_EQ(va.size(), vb.size()) << "FullAttrs: different number of children";
-            for (size_t i = 0; i < va.size(); i++)
-                EXPECT_EQ(std::string_view(symbols[va[i]]),
-                           std::string_view(symbols[vb[i]]))
+        [&](const attrs_t & va) {
+            auto & vb = std::get<attrs_t>(b);
+            ASSERT_EQ(va.names.size(), vb.names.size()) << "FullAttrs: different number of children";
+            for (size_t i = 0; i < va.names.size(); i++)
+                EXPECT_EQ(std::string_view(symbols[va.names[i]]),
+                           std::string_view(symbols[vb.names[i]]))
                     << "FullAttrs: child name mismatch at index " << i;
+            ASSERT_EQ(va.origins.size(), vb.origins.size()) << "FullAttrs: different number of origins";
+            for (size_t i = 0; i < va.origins.size(); i++) {
+                EXPECT_EQ(va.origins[i].depSource, vb.origins[i].depSource) << "Origin depSource mismatch at " << i;
+                EXPECT_EQ(va.origins[i].depKey, vb.origins[i].depKey) << "Origin depKey mismatch at " << i;
+                EXPECT_EQ(va.origins[i].dataPath, vb.origins[i].dataPath) << "Origin dataPath mismatch at " << i;
+                EXPECT_EQ(va.origins[i].format, vb.origins[i].format) << "Origin format mismatch at " << i;
+            }
+            ASSERT_EQ(va.originIndices.size(), vb.originIndices.size()) << "FullAttrs: different originIndices size";
+            for (size_t i = 0; i < va.originIndices.size(); i++)
+                EXPECT_EQ(va.originIndices[i], vb.originIndices[i]) << "originIndices mismatch at " << i;
         },
         [&](const string_t & va) {
             auto & vb = std::get<string_t>(b);

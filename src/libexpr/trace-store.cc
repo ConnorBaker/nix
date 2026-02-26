@@ -970,15 +970,37 @@ void TraceStore::ensureStringTableLoaded()
 std::tuple<ResultKind, std::string, std::string> TraceStore::encodeCachedResult(const CachedResult & value)
 {
     return std::visit(overloaded{
-        [&](const std::vector<Symbol> & attrs) -> std::tuple<ResultKind, std::string, std::string> {
+        [&](const attrs_t & a) -> std::tuple<ResultKind, std::string, std::string> {
             std::string val;
             bool first = true;
-            for (auto & sym : attrs) {
+            for (auto & sym : a.names) {
                 if (!first) val.push_back('\t');
                 val.append(std::string(symbols[sym]));
                 first = false;
             }
-            return {ResultKind::FullAttrs, std::move(val), ""};
+            // Encode origins into the context field when present.
+            // Format: "N\t" + N groups of "depSource\tdepKey\tdataPath\tformat"
+            //         + "\n" + space-separated per-attr indices
+            std::string ctx;
+            if (!a.origins.empty()) {
+                ctx += std::to_string(a.origins.size());
+                for (auto & orig : a.origins) {
+                    ctx += '\t';
+                    ctx += orig.depSource;
+                    ctx += '\t';
+                    ctx += orig.depKey;
+                    ctx += '\t';
+                    ctx += orig.dataPath;
+                    ctx += '\t';
+                    ctx += orig.format;
+                }
+                ctx += '\n';
+                for (size_t i = 0; i < a.originIndices.size(); i++) {
+                    if (i > 0) ctx += ' ';
+                    ctx += std::to_string(static_cast<int>(a.originIndices[i]));
+                }
+            }
+            return {ResultKind::FullAttrs, std::move(val), std::move(ctx)};
         },
         [&](const string_t & s) -> std::tuple<ResultKind, std::string, std::string> {
             std::string ctx;
@@ -1037,12 +1059,54 @@ CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
 {
     switch (row.type) {
     case ResultKind::FullAttrs: {
-        std::vector<Symbol> attrs;
+        attrs_t result;
         if (!row.value.empty()) {
             for (auto & name : tokenizeString<std::vector<std::string>>(row.value, "\t"))
-                attrs.push_back(symbols.create(name));
+                result.names.push_back(symbols.create(name));
         }
-        return attrs;
+        // Decode origins from the context field when present.
+        if (!row.context.empty()) {
+            auto nlPos = row.context.find('\n');
+            if (nlPos != std::string::npos) {
+                // Parse origin count and origins from before \n
+                auto header = std::string_view(row.context).substr(0, nlPos);
+                auto firstTab = header.find('\t');
+                size_t nOrigins = 0;
+                if (firstTab != std::string_view::npos) {
+                    nOrigins = std::stoull(std::string(header.substr(0, firstTab)));
+                }
+                // Parse origin groups: depSource\tdepKey\tdataPath\tformat
+                size_t pos = firstTab + 1;
+                for (size_t i = 0; i < nOrigins; i++) {
+                    attrs_t::Origin orig;
+                    // depSource
+                    auto tab1 = header.find('\t', pos);
+                    orig.depSource = std::string(header.substr(pos, tab1 - pos));
+                    pos = tab1 + 1;
+                    // depKey
+                    auto tab2 = header.find('\t', pos);
+                    orig.depKey = std::string(header.substr(pos, tab2 - pos));
+                    pos = tab2 + 1;
+                    // dataPath
+                    auto tab3 = header.find('\t', pos);
+                    orig.dataPath = std::string(header.substr(pos, tab3 - pos));
+                    pos = tab3 + 1;
+                    // format (single char)
+                    orig.format = header[pos];
+                    pos += 1;
+                    if (pos < header.size() && header[pos] == '\t')
+                        pos++; // skip separator before next origin
+                    result.origins.push_back(std::move(orig));
+                }
+                // Parse per-attr indices from after \n
+                auto indicesStr = row.context.substr(nlPos + 1);
+                if (!indicesStr.empty()) {
+                    for (auto & s : tokenizeString<std::vector<std::string>>(indicesStr, " "))
+                        result.originIndices.push_back(static_cast<int8_t>(std::stoi(s)));
+                }
+            }
+        }
+        return result;
     }
     case ResultKind::String: {
         NixStringContext context;

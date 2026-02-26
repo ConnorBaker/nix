@@ -51,8 +51,26 @@ typedef uint64_t AttrId;
 typedef std::pair<AttrId, Symbol> AttrKey;
 typedef std::pair<std::string, NixStringContext> string_t;
 
+/**
+ * Per-attr TracedData origin reconstruction info for cache materialization.
+ * Stored only for attrsets that originated from traced data sources (JSON/TOML/readDir).
+ * Empty for the vast majority of attrsets (plain Nix code).
+ */
+struct attrs_t {
+    std::vector<Symbol> names;
+    /// Deduplicated TracedData origins for reconstruction during materialization.
+    struct Origin {
+        std::string depSource;
+        std::string depKey;
+        std::string dataPath;
+        char format; ///< 'j', 't', 'd' (StructuredFormat char)
+    };
+    std::vector<Origin> origins;       ///< deduplicated
+    std::vector<int8_t> originIndices; ///< per-attr; -1 = no origin. Empty when origins is empty.
+};
+
 typedef std::variant<
-    std::vector<Symbol>,
+    attrs_t,
     string_t,
     placeholder_t,
     missing_t,

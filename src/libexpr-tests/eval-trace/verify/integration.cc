@@ -76,7 +76,7 @@ TEST_F(TraceCacheIntegrationTest, ParentChild_AttrChain)
     auto db = makeDbBackend();
 
     db.record(
-        "", std::vector<Symbol>{createSymbol("child")},
+        "", attrs_t{{createSymbol("child")}},
         {}, true);
 
     std::string childAttrPath = "child";

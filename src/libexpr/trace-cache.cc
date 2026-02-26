@@ -6,6 +6,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-trace-context.hh"
 #include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace-deps.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/derivations.hh"
@@ -141,10 +142,9 @@ struct TracedExpr : Expr, gc
     void evaluateFresh(Value & v);
     Value * navigateToReal();
     void materializeResult(Value & v, const CachedResult & cached);
-    void materializeOrigExprAttrs(Value & v, const std::vector<Symbol> & childNames,
+    void materializeOrigExprAttrs(Value & v, const attrs_t & attrs,
                                    Value * prePopulatedParent = nullptr);
     void replayTrace(TraceId traceId);
-    void sortChildNames(std::vector<Symbol> & names) const;
 };
 
 // ── SiblingAccessTracker (per-accessed-sibling ParentContext deps) ────
@@ -264,15 +264,6 @@ static bool isLeafCached(const CachedResult & v)
         || std::get_if<std::vector<std::string>>(&v);
 }
 
-void TracedExpr::sortChildNames(std::vector<Symbol> & names) const
-{
-    std::sort(names.begin(), names.end(),
-        [&](Symbol a, Symbol b) {
-            return std::string_view(cache->state.symbols[a])
-                 < std::string_view(cache->state.symbols[b]);
-        });
-}
-
 /**
  * Convert a forced Value into a CachedResult for storage/comparison.
  * The value must already be forced. For lists, suspends dep tracking
@@ -300,15 +291,47 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
     case nPath:
         return path_t{target.path().path.abs()};
     case nAttrs: {
-        std::vector<Symbol> childNames;
+        attrs_t result;
         for (auto & attr : *target.attrs())
-            childNames.push_back(attr.name);
-        std::sort(childNames.begin(), childNames.end(),
+            result.names.push_back(attr.name);
+        std::sort(result.names.begin(), result.names.end(),
             [&](Symbol a, Symbol b) {
                 return std::string_view(st.symbols[a])
                      < std::string_view(st.symbols[b]);
             });
-        return childNames;
+        // Capture per-attr TracedData origins for cross-scope materialization.
+        if (target.attrs()->hasAnyTracedDataLayer()) {
+            result.originIndices.resize(result.names.size(), -1);
+            for (size_t i = 0; i < result.names.size(); i++) {
+                auto * attr = target.attrs()->get(result.names[i]);
+                if (!attr || !attr->pos.isTracedData()) continue;
+                auto * origin = st.positions.originOfPtr(attr->pos);
+                if (!origin) continue;
+                auto * df = std::get_if<Pos::TracedData>(origin);
+                if (!df) continue;
+                // Deduplicate origins by identity
+                int8_t idx = -1;
+                for (size_t j = 0; j < result.origins.size(); j++) {
+                    if (result.origins[j].depSource == df->depSource
+                        && result.origins[j].depKey == df->depKey
+                        && result.origins[j].dataPath == df->dataPath
+                        && result.origins[j].format == df->format) {
+                        idx = static_cast<int8_t>(j);
+                        break;
+                    }
+                }
+                if (idx < 0) {
+                    idx = static_cast<int8_t>(result.origins.size());
+                    result.origins.push_back({df->depSource, df->depKey, df->dataPath, df->format});
+                }
+                result.originIndices[i] = idx;
+            }
+            // If no TracedData attrs found, clear the vectors
+            if (result.origins.empty()) {
+                result.originIndices.clear();
+            }
+        }
+        return result;
     }
     case nList: {
         bool allStrings = true;
@@ -339,21 +362,81 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
 // ── TracedExpr implementation (Adapton articulation points) ──────────
 
 void TracedExpr::materializeOrigExprAttrs(
-    Value & v, const std::vector<Symbol> & childNames, Value * prePopulatedParent)
+    Value & v, const attrs_t & attrs, Value * prePopulatedParent)
 {
     auto * shared = new SharedParentResult();
     if (prePopulatedParent)
         shared->value = prePopulatedParent;
-    auto bindings = cache->state.buildBindings(childNames.size());
-    for (auto & childName : childNames) {
-        auto * childVal = cache->state.allocValue();
+    auto & st = cache->state;
+    auto bindings = st.buildBindings(attrs.names.size());
+
+    // When origins are present, register them with PosTable and precomputedKeysMap
+    // so that downstream shape dep recording (SC #keys, #has:key, #type) works.
+    struct PerOrigin {
+        PosTable::OriginHandle handle;
+        uint32_t attrCount = 0;
+    };
+    std::vector<PerOrigin> originHandles;
+    if (!attrs.origins.empty()) {
+        originHandles.reserve(attrs.origins.size());
+        // Count attrs per origin for OriginHandle sizing
+        std::vector<uint32_t> counts(attrs.origins.size(), 0);
+        for (auto idx : attrs.originIndices)
+            if (idx >= 0) counts[idx]++;
+        for (auto & orig : attrs.origins) {
+            auto handle = st.positions.addOriginHandle(
+                Pos::TracedData{orig.depSource, orig.depKey, orig.dataPath, orig.format},
+                counts[&orig - attrs.origins.data()]);
+            originHandles.push_back({handle, 0});
+        }
+    }
+
+    for (size_t i = 0; i < attrs.names.size(); i++) {
+        auto childName = attrs.names[i];
+        auto * childVal = st.allocValue();
         auto * wrapper = new TracedExpr(cache, 0, childName, this);
         wrapper->origExpr = new ExprOrigChild(origExpr, origEnv, childName, shared);
         wrapper->origEnv = origEnv;
-        childVal->mkThunk(&cache->state.baseEnv, wrapper);
-        bindings.insert(childName, childVal, noPos);
+        childVal->mkThunk(&st.baseEnv, wrapper);
+
+        PosIdx pos = noPos;
+        if (!attrs.originIndices.empty() && attrs.originIndices[i] >= 0) {
+            auto oidx = attrs.originIndices[i];
+            pos = st.positions.add(originHandles[oidx].handle, originHandles[oidx].attrCount++);
+        }
+        bindings.insert(childName, childVal, pos);
     }
     v.mkAttrs(bindings.finish());
+
+    // Register precomputed keys per origin (mirrors ExprTracedData::eval() in json-to-value.cc)
+    if (!attrs.origins.empty()) {
+        for (size_t oidx = 0; oidx < attrs.origins.size(); oidx++) {
+            auto & orig = attrs.origins[oidx];
+            auto fmt = parseStructuredFormat(orig.format);
+            if (!fmt) continue;
+            // Collect sorted key names for this origin
+            std::vector<std::string> keys;
+            for (size_t i = 0; i < attrs.names.size(); i++) {
+                if (!attrs.originIndices.empty() && attrs.originIndices[i] == static_cast<int8_t>(oidx))
+                    keys.push_back(std::string(st.symbols[attrs.names[i]]));
+            }
+            std::sort(keys.begin(), keys.end());
+            std::string canonical;
+            for (size_t i = 0; i < keys.size(); i++) {
+                if (i > 0) canonical += '\0';
+                canonical += keys[i];
+            }
+            auto keysHash = depHash(canonical);
+            auto keysKey = buildStructuredDepKey(orig.depKey, *fmt, orig.dataPath, ShapeSuffix::Keys);
+            auto originOffset = originHandles[oidx].handle.offset;
+            registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
+                keysHash,
+                static_cast<uint32_t>(keys.size()),
+                keysKey,
+                orig.depSource,
+            });
+        }
+    }
 }
 
 // Replay trace (Adapton change propagation)
@@ -441,15 +524,71 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
 {
     auto & st = cache->state;
 
-    if (auto * attrs = std::get_if<std::vector<Symbol>>(&cached)) {
-        auto bindings = st.buildBindings(attrs->size());
-        for (auto & childName : *attrs) {
+    if (auto * attrs = std::get_if<attrs_t>(&cached)) {
+        auto bindings = st.buildBindings(attrs->names.size());
+
+        // When origins are present, register them with PosTable for TracedData provenance
+        struct PerOrigin {
+            PosTable::OriginHandle handle;
+            uint32_t attrCount = 0;
+        };
+        std::vector<PerOrigin> originHandles;
+        if (!attrs->origins.empty()) {
+            originHandles.reserve(attrs->origins.size());
+            std::vector<uint32_t> counts(attrs->origins.size(), 0);
+            for (auto idx : attrs->originIndices)
+                if (idx >= 0) counts[idx]++;
+            for (auto & orig : attrs->origins) {
+                auto handle = st.positions.addOriginHandle(
+                    Pos::TracedData{orig.depSource, orig.depKey, orig.dataPath, orig.format},
+                    counts[&orig - attrs->origins.data()]);
+                originHandles.push_back({handle, 0});
+            }
+        }
+
+        for (size_t i = 0; i < attrs->names.size(); i++) {
+            auto childName = attrs->names[i];
             auto * childVal = st.allocValue();
             auto * child = new TracedExpr(cache, 0, childName, this);
             childVal->mkThunk(&st.baseEnv, child);
-            bindings.insert(childName, childVal, noPos);
+
+            PosIdx pos = noPos;
+            if (!attrs->originIndices.empty() && attrs->originIndices[i] >= 0) {
+                auto oidx = attrs->originIndices[i];
+                pos = st.positions.add(originHandles[oidx].handle, originHandles[oidx].attrCount++);
+            }
+            bindings.insert(childName, childVal, pos);
         }
         v.mkAttrs(bindings.finish());
+
+        // Register precomputed keys per origin
+        if (!attrs->origins.empty()) {
+            for (size_t oidx = 0; oidx < attrs->origins.size(); oidx++) {
+                auto & orig = attrs->origins[oidx];
+                auto fmt = parseStructuredFormat(orig.format);
+                if (!fmt) continue;
+                std::vector<std::string> keys;
+                for (size_t i = 0; i < attrs->names.size(); i++) {
+                    if (!attrs->originIndices.empty() && attrs->originIndices[i] == static_cast<int8_t>(oidx))
+                        keys.push_back(std::string(st.symbols[attrs->names[i]]));
+                }
+                std::sort(keys.begin(), keys.end());
+                std::string canonical;
+                for (size_t i = 0; i < keys.size(); i++) {
+                    if (i > 0) canonical += '\0';
+                    canonical += keys[i];
+                }
+                auto keysHash = depHash(canonical);
+                auto keysKey = buildStructuredDepKey(orig.depKey, *fmt, orig.dataPath, ShapeSuffix::Keys);
+                auto originOffset = originHandles[oidx].handle.offset;
+                registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
+                    keysHash,
+                    static_cast<uint32_t>(keys.size()),
+                    keysKey,
+                    orig.depSource,
+                });
+            }
+        }
     } else if (auto * s = std::get_if<string_t>(&cached)) {
         if (s->second.empty())
             v.mkString(s->first, st.mem);
@@ -622,8 +761,8 @@ void TracedExpr::evaluateFresh(Value & v)
         // Sibling traces are no longer speculatively recorded. Each sibling's
         // TracedExpr handles its own tracing independently when accessed.
 
-        if (origExpr && std::holds_alternative<std::vector<Symbol>>(attrValue)) {
-            materializeOrigExprAttrs(v, std::get<std::vector<Symbol>>(attrValue), target);
+        if (origExpr && std::holds_alternative<attrs_t>(attrValue)) {
+            materializeOrigExprAttrs(v, std::get<attrs_t>(attrValue), target);
             return;
         }
 
@@ -955,7 +1094,7 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
                 materializeResult(v, cachedValue);
                 replayTrace(cachedTraceId);
                 handled = true;
-            } else if (auto * attrs = std::get_if<std::vector<Symbol>>(&cachedValue)) {
+            } else if (auto * attrs = std::get_if<attrs_t>(&cachedValue)) {
                 materializeOrigExprAttrs(v, *attrs);
                 replayTrace(cachedTraceId);
                 handled = true;

@@ -349,7 +349,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
 
     // Record ROOT trace with zero deps (typical for ROOT)
     auto rootPath = std::string("");
-    db.record(rootPath, CachedResult(std::vector<Symbol>{}), {}, true);
+    db.record(rootPath, CachedResult(attrs_t{}), {}, true);
     auto rootHash = db.getCurrentTraceHash(rootPath);
     ASSERT_TRUE(rootHash.has_value());
 
@@ -397,7 +397,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_NoChange_StillValid)
     TempExtFile dataFile("json", "42");
     auto db = makeDb();
 
-    db.record("", CachedResult(std::vector<Symbol>{}), {}, true);
+    db.record("", CachedResult(attrs_t{}), {}, true);
     auto rootHash = db.getCurrentTraceHash("");
     ASSERT_TRUE(rootHash.has_value());
 
@@ -435,7 +435,7 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
     auto db = makeDb();
 
     // ROOT: stable (no deps that change)
-    db.record("", CachedResult(std::vector<Symbol>{}), {}, true);
+    db.record("", CachedResult(attrs_t{}), {}, true);
     auto rootHash = db.getCurrentTraceHash("");
     ASSERT_TRUE(rootHash.has_value());
 
@@ -492,7 +492,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     auto db = makeDb();
 
     // ROOT trace: no deps (stable)
-    db.record("", CachedResult(std::vector<Symbol>{}), {}, true);
+    db.record("", CachedResult(attrs_t{}), {}, true);
     auto rootTraceHash = db.getCurrentTraceHash("");
     ASSERT_TRUE(rootTraceHash.has_value());
 

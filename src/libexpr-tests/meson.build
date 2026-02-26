@@ -97,6 +97,13 @@ sources = files(
   'eval-trace/traced-data/dep-precision/pipelines.cc',
   'eval-trace/traced-data/dep-precision/builtins-extra.cc',
   'eval-trace/traced-data/dep-precision/nixpkgs-patterns.cc',
+  # eval-trace/traced-data/materialization/
+  'eval-trace/traced-data/materialization/single-scope.cc',
+  'eval-trace/traced-data/materialization/cross-scope-attrkeys.cc',
+  'eval-trace/traced-data/materialization/cross-scope-haskey.cc',
+  'eval-trace/traced-data/materialization/cross-scope-typeof.cc',
+  'eval-trace/traced-data/materialization/cross-scope-cache.cc',
+  'eval-trace/traced-data/materialization/variant-roundtrip.cc',
   # eval-trace/verify/
   'eval-trace/verify/cold-compare.cc',
   'eval-trace/verify/cold-verify.cc',

@@ -490,4 +490,36 @@ protected:
     }
 };
 
+/**
+ * Fixture for cross-scope materialization tests.
+ * Extends DepPrecisionTest with getStoredDeps(attrPath) and getStoredResult(attrPath)
+ * for querying stored traces directly via a fresh TraceStore connection.
+ */
+class MaterializationDepTest : public DepPrecisionTest
+{
+protected:
+    TraceStore makeQueryDb()
+    {
+        int64_t contextHash;
+        std::memcpy(&contextHash, testFingerprint.hash, sizeof(contextHash));
+        return TraceStore(state.symbols, contextHash);
+    }
+
+    std::vector<Dep> getStoredDeps(const std::string & attrPath)
+    {
+        auto db = makeQueryDb();
+        auto result = db.verify(attrPath, {}, state);
+        if (!result) return {};
+        return db.loadFullTrace(result->traceId);
+    }
+
+    std::optional<CachedResult> getStoredResult(const std::string & attrPath)
+    {
+        auto db = makeQueryDb();
+        auto result = db.verify(attrPath, {}, state);
+        if (!result) return std::nullopt;
+        return result->value;
+    }
+};
+
 } // namespace nix::eval_trace::test
