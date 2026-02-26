@@ -12,6 +12,8 @@
 #include "nix/util/util.hh"
 
 #include <boost/unordered/concurrent_flat_map.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include <deque>
 #include <filesystem>
@@ -37,11 +39,11 @@ thread_local std::vector<Dep> DependencyTracker::sessionTraces;
 // Lists still use this map because list provenance is tracked at access time
 // (maybeRecordListLenDep), not via PosIdx. Attrsets use PosIdx-based TracedData
 // origin tracking instead.
-static thread_local std::unordered_map<const void*, const TracedContainerProvenance *> tracedContainerMap;
+static thread_local boost::unordered_flat_map<const void*, const TracedContainerProvenance *> tracedContainerMap;
 
 // Memoization: skip re-scanning the same Bindings* in maybeRecordAttrKeysDep.
 // Cleared on root DependencyTracker construction.
-static thread_local std::unordered_set<const void *> scannedBindings;
+static thread_local boost::unordered_flat_set<const void *> scannedBindings;
 
 // Stable, non-GC pool for provenance data. std::deque never invalidates
 // pointers on push_back, so ProvenanceRef pointers remain valid until clear().
@@ -51,7 +53,7 @@ static thread_local std::deque<TracedContainerProvenance> provenancePool;
 // Precomputed keys hash map: Pos::TracedData* → {hash, keyCount, fullKey, depSource}.
 // Populated by ExprTracedData::eval() at creation time; consumed by maybeRecordAttrKeysDep
 // to skip sort + concat + BLAKE3 when all original keys are visible (common case).
-static thread_local std::unordered_map<uint32_t, PrecomputedKeysInfo> precomputedKeysMap;
+static thread_local boost::unordered_flat_map<uint32_t, PrecomputedKeysInfo> precomputedKeysMap;
 
 // Per-Bindings* cache of TracedData origin info for intersectAttrs.
 // Avoids re-scanning the same large attrset (e.g., allPackages with 50K attrs)
@@ -61,7 +63,7 @@ struct IntersectOriginInfo {
     std::string depSource;
     std::string keyPrefix; // depKey + '\t' + formatChar + ':' + dataPath + "#has:"
 };
-static thread_local std::unordered_map<const Bindings *, std::vector<IntersectOriginInfo>> intersectOriginsCache;
+static thread_local boost::unordered_flat_map<const Bindings *, std::vector<IntersectOriginInfo>> intersectOriginsCache;
 
 void DependencyTracker::onRootConstruction()
 {
@@ -593,7 +595,7 @@ void recordDep(
 // prim_fromJSON/prim_fromTOML to enable lazy structural dep tracking.
 // Keyed by content hash so multiple readFile results coexist and the same
 // provenance can serve multiple fromJSON/fromTOML calls (non-consuming lookup).
-static thread_local std::unordered_map<Blake3Hash, ReadFileProvenance, Blake3Hash::Hasher> readFileProvenanceMap;
+static thread_local boost::unordered_flat_map<Blake3Hash, ReadFileProvenance, Blake3Hash::Hasher> readFileProvenanceMap;
 
 void addReadFileProvenance(ReadFileProvenance prov)
 {
@@ -619,7 +621,7 @@ void clearReadFileProvenanceMap()
 // Populated by prim_readFile, queried by string builtins that observe raw bytes.
 // Key is a raw const char* — valid because readFile strings are GC-allocated
 // and stable for the evaluation session. Typically empty or very small.
-static thread_local std::unordered_map<const char *, Blake3Hash> readFileStringPtrs;
+static thread_local boost::unordered_flat_map<const char *, Blake3Hash> readFileStringPtrs;
 
 void addReadFileStringPtr(const char * ptr, const Blake3Hash & contentHash)
 {

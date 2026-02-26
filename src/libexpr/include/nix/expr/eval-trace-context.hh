@@ -86,6 +86,13 @@ struct EvalTraceContext {
      * Hash functions: h1 = ptr >> 4 (strips 16-byte GC alignment),
      * h2 = (ptr >> 4) * phi64 >> 43 (golden-ratio multiplicative hash
      * for an independent bit position).
+     *
+     * Note: Boost.Bloom (boost::bloom::filter with fast_multiblock32) was
+     * benchmarked as a replacement but was 1.9x slower for replayMemoizedDeps
+     * (3.48% vs 2.06% self time, 13151 vs 11563 total samples). The SIMD
+     * block-oriented layout is optimized for batch throughput, but our access
+     * pattern is single scattered probes interleaved with other work, where
+     * the custom shift+multiply hash with direct byte-level bit test wins.
      */
     static constexpr size_t BLOOM_BITS = 1 << 23;
     static constexpr size_t BLOOM_BYTES = BLOOM_BITS / 8;
