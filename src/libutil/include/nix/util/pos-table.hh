@@ -178,6 +178,19 @@ public:
         return std::nullopt;
     }
 
+    /** Combined origin + offset resolution in a single binary search. */
+    struct ResolvedOrigin {
+        const Pos::Origin * origin;
+        uint32_t offset;
+    };
+
+    std::optional<ResolvedOrigin> resolveOriginFull(PosIdx p) const
+    {
+        if (auto o = resolve(p))
+            return ResolvedOrigin{&o->origin, o->offset};
+        return std::nullopt;
+    }
+
     /**
      * Remove all origins from the table.
      */

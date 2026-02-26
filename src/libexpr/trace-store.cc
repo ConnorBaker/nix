@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <tuple>
 #include <unordered_set>
 
@@ -1623,6 +1624,69 @@ std::optional<Hash> TraceStore::getCurrentTraceHash(std::string_view attrPath)
     return data->traceHash;
 }
 
+// ── Interned dep sort + hash (integer key comparison) ────────────────
+//
+// Sort on (type:1, sourceId:4, keyId:4) = 9 bytes of integers instead of
+// ~100 bytes of strings. Used by record() and recovery() for canonical ordering.
+// NOTE: produces a DIFFERENT sort order than sortAndDedupDeps (integer ID order
+// vs string lexicographic). Trace hashes are NOT compatible — one-time cache
+// invalidation of existing traces on first use.
+
+static void sortAndDedupInterned(std::vector<TraceStore::InternedDep> & deps)
+{
+    std::sort(deps.begin(), deps.end(),
+        [](const TraceStore::InternedDep & a, const TraceStore::InternedDep & b) {
+            if (auto cmp = a.type <=> b.type; cmp != 0) return cmp < 0;
+            if (a.sourceId != b.sourceId) return a.sourceId < b.sourceId;
+            return a.keyId < b.keyId;
+        });
+    deps.erase(std::unique(deps.begin(), deps.end(),
+        [](const TraceStore::InternedDep & a, const TraceStore::InternedDep & b) {
+            return a.type == b.type && a.sourceId == b.sourceId && a.keyId == b.keyId;
+        }), deps.end());
+}
+
+using StringLookup = std::function<std::string_view(uint32_t)>;
+
+static void feedInternedDepToSink(
+    HashSink & sink,
+    const TraceStore::InternedDep & dep,
+    bool includeHash,
+    const StringLookup & lookupString)
+{
+    auto typeStr = std::to_string(static_cast<int>(dep.type));
+    sink(std::string_view("T", 1));
+    sink(typeStr);
+    sink(std::string_view("S", 1));
+    sink(lookupString(dep.sourceId));
+    sink(std::string_view("K", 1));
+    sink(lookupString(dep.keyId));
+    if (includeHash) {
+        sink(std::string_view("H", 1));
+        hashDepValue(sink, dep.hash);
+    }
+}
+
+static Hash computeTraceHashFromInterned(
+    const std::vector<TraceStore::InternedDep> & sorted,
+    const StringLookup & lookupString)
+{
+    HashSink sink(HashAlgorithm::BLAKE3);
+    for (auto & dep : sorted)
+        feedInternedDepToSink(sink, dep, true, lookupString);
+    return sink.finish().hash;
+}
+
+static Hash computeStructHashFromInterned(
+    const std::vector<TraceStore::InternedDep> & sorted,
+    const StringLookup & lookupString)
+{
+    HashSink sink(HashAlgorithm::BLAKE3);
+    for (auto & dep : sorted)
+        feedInternedDepToSink(sink, dep, false, lookupString);
+    return sink.finish().hash;
+}
+
 // ── Record path (BSàlC constructive trace recording) ─────────────────
 
 TraceStore::RecordResult TraceStore::record(
@@ -1634,17 +1698,29 @@ TraceStore::RecordResult TraceStore::record(
     auto recordStart = timerStart();
     nrRecords++;
 
-    // 1. Sort+dedup deps (ParentContext deps are now stored, not filtered)
-    auto sortedDeps = sortAndDedupDeps(allDeps);
+    // 1. Intern strings FIRST (getting stable SQLite row IDs)
+    auto interned = internDeps(allDeps);
 
-    // 2. Compute trace_hash (BLAKE3 of full sorted deps including hashes)
-    auto traceHash = computeTraceHashFromSorted(sortedDeps);
+    // 2. Sort+dedup on integer keys (type:1, sourceId:4, keyId:4 = 9 bytes)
+    //    Much faster than string-based sort (~100 bytes per comparison).
+    //    NOTE: Sort order changes from string-lexicographic to integer-ID-based.
+    //    Trace hashes change → one-time cache invalidation of existing traces.
+    sortAndDedupInterned(interned);
 
-    // 3. Compute struct_hash (dep types + sources + keys, without hash values)
-    auto structHash = computeTraceStructHashFromSorted(sortedDeps);
+    // 3. String lookup for hash computation
+    auto lookupString = [this](uint32_t id) -> std::string_view {
+        auto it = stringTable.find(static_cast<StringId>(id));
+        if (it != stringTable.end()) return it->second;
+        return "";
+    };
 
-    // 4. Intern deps and split into keys + values
-    auto interned = internDeps(sortedDeps);
+    // 4. Compute trace_hash (BLAKE3 of full sorted deps including hashes)
+    auto traceHash = computeTraceHashFromInterned(interned, lookupString);
+
+    // 5. Compute struct_hash (dep types + sources + keys, without hash values)
+    auto structHash = computeStructHashFromInterned(interned, lookupString);
+
+    // 6. Split into keys + values
     std::vector<InternedDepKey> keys;
     keys.reserve(interned.size());
     for (auto & d : interned)
@@ -1653,21 +1729,21 @@ TraceStore::RecordResult TraceStore::record(
     auto keysBlob = serializeKeys(keys);
     auto valuesBlob = serializeValues(interned);
 
-    // 5. Get or create dep key set (content-addressed by struct_hash)
+    // 7. Get or create dep key set (content-addressed by struct_hash)
     auto depKeySetId = getOrCreateDepKeySet(structHash, keysBlob);
 
-    // 6. Encode CachedResult and intern result
+    // 8. Encode CachedResult and intern result
     auto [type, val, ctx] = encodeCachedResult(value);
     auto resultHash = computeResultHash(type, val, ctx);
     ResultId resultId = doInternResult(type, val, ctx, resultHash);
 
-    // 7. Intern attr path
+    // 9. Intern attr path
     AttrPathId attrPathId = doInternAttrPath(attrPath);
 
-    // 8. Get or create trace (keyed by trace_hash, stores dep_key_set_id + values_blob)
+    // 10. Get or create trace (keyed by trace_hash, stores dep_key_set_id + values_blob)
     TraceId traceId = getOrCreateTrace(traceHash, depKeySetId, valuesBlob);
 
-    // 9. Upsert Attrs + insert History
+    // 11. Upsert Attrs + insert History
     {
         auto st(_state->lock());
         st->upsertAttr.use()
@@ -1676,7 +1752,7 @@ TraceStore::RecordResult TraceStore::record(
             (contextHash)(attrPathId)(traceId)(resultId).exec();
     }
 
-    // 10. Session caches
+    // 12. Session caches
     bool hasVolatile = std::any_of(allDeps.begin(), allDeps.end(),
         [](auto & d) { return isVolatile(d.type); });
     if (!hasVolatile)
@@ -1686,7 +1762,14 @@ TraceStore::RecordResult TraceStore::record(
         auto & data = traceDataCache[traceId];
         data.traceHash = traceHash;
         data.structHash = structHash;
-        data.deps = sortedDeps;
+        // Reconstruct sorted Dep vector from interned for cache compatibility
+        data.deps = resolveDeps(keys,
+            [&]() {
+                std::vector<DepHashValue> vals;
+                vals.reserve(interned.size());
+                for (auto & d : interned) vals.push_back(d.hash);
+                return vals;
+            }());
         assert(data.hashesPopulated() && "recording trace with placeholder (all-zero) hashes");
     }
     depKeySetCache.insert_or_assign(depKeySetId, keys);
@@ -1923,12 +2006,20 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         return VerifyResult{decodeCachedResult(newRow), entry.traceId};
     };
 
+    // String lookup for interned hash computation (used by both recovery paths)
+    auto lookupString = [this](uint32_t id) -> std::string_view {
+        auto it = stringTable.find(static_cast<StringId>(id));
+        if (it != stringTable.end()) return it->second;
+        return "";
+    };
+
     // === Direct hash recovery (BSàlC CT) ===
     // Recompute trace_hash from current dep hashes. In-memory lookup.
     if (allComputable) {
         auto directHashStart = timerStart();
-        auto sortedCurrentDeps = sortAndDedupDeps(currentDeps);
-        auto newFullHash = computeTraceHashFromSorted(sortedCurrentDeps);
+        auto interned = internDeps(currentDeps);
+        sortAndDedupInterned(interned);
+        auto newFullHash = computeTraceHashFromInterned(interned, lookupString);
 
         if (auto * entry = lookupCandidate(newFullHash)) {
             if (auto r = acceptRecoveredTrace(*entry)) {
@@ -2044,8 +2135,9 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         if (!repComputable)
             continue;
 
-        auto sortedRepDeps = sortAndDedupDeps(repCurrentDeps);
-        auto candidateFullHash = computeTraceHashFromSorted(sortedRepDeps);
+        auto repInterned = internDeps(repCurrentDeps);
+        sortAndDedupInterned(repInterned);
+        auto candidateFullHash = computeTraceHashFromInterned(repInterned, lookupString);
 
         // In-memory lookup instead of per-group DB query
         if (auto * entry = lookupCandidate(candidateFullHash)) {

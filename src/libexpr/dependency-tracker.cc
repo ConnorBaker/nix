@@ -728,18 +728,16 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
 
     for (auto & attr : *v.attrs()) {
         if (!attr.pos.isTracedData()) continue;
-        auto * origin = positions.originOfPtr(attr.pos);
-        if (!origin) continue;
-        auto * df = std::get_if<Pos::TracedData>(origin);
+        auto resolved = positions.resolveOriginFull(attr.pos);
+        if (!resolved) continue;
+        auto * df = std::get_if<Pos::TracedData>(resolved->origin);
         if (!df) continue;
-        auto off = positions.originOffsetOf(attr.pos);
-        if (!off) continue;
         OriginKeys * group = nullptr;
         for (auto & g : groups) {
             if (g.df == df) { group = &g; break; }
         }
         if (!group) {
-            groups.push_back({df, *off, {}});
+            groups.push_back({df, resolved->offset, {}});
             group = &groups.back();
         }
         group->keys.push_back(symbols[attr.name]);
@@ -754,18 +752,10 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
             DependencyTracker::record({info.depSource, info.fullKey, DepHashValue(info.hash), DepType::StructuredContent});
             continue;
         }
-        // Slow path: keys were shadowed by // or otherwise differ from creation.
-        auto fmt = parseStructuredFormat(g.df->format);
-        if (!fmt) continue;
-        std::sort(g.keys.begin(), g.keys.end());
-        std::string canonical;
-        for (size_t i = 0; i < g.keys.size(); i++) {
-            if (i > 0) canonical += '\0';
-            canonical += g.keys[i];
-        }
-        auto hash = depHash(canonical);
-        auto fullKey = buildStructuredDepKey(g.df->depKey, *fmt, g.df->dataPath, ShapeSuffix::Keys);
-        DependencyTracker::record({g.df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        // Slow path REMOVED: when keys are shadowed by //, ImplicitShape
+        // (recorded at creation time with ALL source keys) handles verification.
+        // Recording SC #keys with the visible subset would poison ImplicitShape
+        // fallback because SC "covers" the file (blocking ImplicitShape check).
     }
 }
 

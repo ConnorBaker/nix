@@ -736,4 +736,126 @@ TEST_F(TracedDataTest, ChainedUpdate_AttrNames_KeyAdded)
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Partial overlap: a // b where b shadows some of a's keys
+// Tests the precision fix: SC #keys with visible subset is no longer
+// recorded (would always fail verification). ImplicitShape handles it.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PartialOverlap_AttrNames_ValueChanged_CacheHit)
+{
+    // a.json: {x, y}, b.json: {y, z} → merged = {x: a, y: b, z: b}
+    // attrNames sees x from a, y+z from b. a contributes 1 visible key (x),
+    // but a.json has 2 keys → fast path misses (key count mismatch).
+    // With the fix, slow path is removed → no SC #keys for a.
+    // Change a.json values only → ImplicitShape passes → cache hit.
+    TempJsonFile fileA(R"({"x": 1, "y": 2})");
+    TempJsonFile fileB(R"({"y": 3, "z": 4})");
+    auto expr = R"(builtins.attrNames (builtins.fromJSON (builtins.readFile )"
+        + fileA.path.string() + R"() // builtins.fromJSON (builtins.readFile )"
+        + fileB.path.string() + R"()))";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(v.listSize(), 3); // x, y, z
+    }
+
+    fileA.modify(R"({"x": 999, "y": 888})");
+    invalidateFileCache(fileA.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // ImplicitShape fallback: a's keys unchanged
+        EXPECT_EQ(v.listSize(), 3);
+    }
+}
+
+TEST_F(TracedDataTest, PartialOverlap_AttrNames_KeyAdded_ReEval)
+{
+    // Same setup: a={x,y}, b={y,z}. Add key "w" to a.json → re-eval.
+    // ImplicitShape detects key change in a.json.
+    TempJsonFile fileA(R"({"x": 1, "y": 2})");
+    TempJsonFile fileB(R"({"y": 3, "z": 4})");
+    auto expr = R"(builtins.attrNames (builtins.fromJSON (builtins.readFile )"
+        + fileA.path.string() + R"() // builtins.fromJSON (builtins.readFile )"
+        + fileB.path.string() + R"()))";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(v.listSize(), 3); // x, y, z
+    }
+
+    fileA.modify(R"({"x": 1, "y": 2, "w": 99})");
+    invalidateFileCache(fileA.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // ImplicitShape detects key change
+        EXPECT_EQ(v.listSize(), 4); // w, x, y, z
+    }
+}
+
+TEST_F(TracedDataTest, PartialOverlap_AttrNames_KeyRemoved_ReEval)
+{
+    // Same setup: a={x,y}, b={y,z}. Remove "y" from a.json → re-eval.
+    // Even though "y" was shadowed by b, ImplicitShape detects key change.
+    TempJsonFile fileA(R"({"x": 1, "y": 2})");
+    TempJsonFile fileB(R"({"y": 3, "z": 4})");
+    auto expr = R"(builtins.attrNames (builtins.fromJSON (builtins.readFile )"
+        + fileA.path.string() + R"() // builtins.fromJSON (builtins.readFile )"
+        + fileB.path.string() + R"()))";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(v.listSize(), 3); // x, y, z
+    }
+
+    fileA.modify(R"({"x": 1})");
+    invalidateFileCache(fileA.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1); // ImplicitShape detects key removal
+        EXPECT_EQ(v.listSize(), 3); // x, y, z (y still from b, x from a)
+    }
+}
+
+TEST_F(TracedDataTest, PartialOverlap_AttrNames_BFileChanged_CacheHit)
+{
+    // Same setup: a={x,y}, b={y,z}. Change b.json values only → cache hit.
+    // b has 2 visible keys (y, z) and 2 total keys → fast path matches →
+    // SC #keys recorded with precomputed hash. SC passes → cache hit.
+    TempJsonFile fileA(R"({"x": 1, "y": 2})");
+    TempJsonFile fileB(R"({"y": 3, "z": 4})");
+    auto expr = R"(builtins.attrNames (builtins.fromJSON (builtins.readFile )"
+        + fileA.path.string() + R"() // builtins.fromJSON (builtins.readFile )"
+        + fileB.path.string() + R"()))";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(v.listSize(), 3); // x, y, z
+    }
+
+    fileB.modify(R"({"y": 999, "z": 888})");
+    invalidateFileCache(fileB.path);
+
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0); // SC #keys for b passes
+        EXPECT_EQ(v.listSize(), 3);
+    }
+}
+
 } // namespace nix::eval_trace

@@ -53,7 +53,8 @@ struct DependencyTracker {
     /// Deduplication set: prevents adding the same memoized dep range twice
     /// when a Value is re-forced. Pointer keys are safe because Values are
     /// long-lived within a single evaluation context. No ordering needed.
-    std::unordered_set<const Value *> replayedValues;
+    /// boost::unordered_flat_set for better cache locality (open addressing).
+    boost::unordered_flat_set<const Value *> replayedValues;
 
     /// Ranges in sessionTraces belonging to child TracedExpr evaluations.
     /// Excluded from this tracker's collectTraces() output to prevent
