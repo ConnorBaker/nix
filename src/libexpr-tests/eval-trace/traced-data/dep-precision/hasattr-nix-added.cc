@@ -2,9 +2,17 @@
 
 #include <gtest/gtest.h>
 
+#include <format>
+
 namespace nix::eval_trace {
 
 using namespace nix::eval_trace::test;
+
+// Local helper — fj() is on DepPrecisionTest, but TracedDataTest doesn't inherit it.
+static std::string fj(const std::filesystem::path & path)
+{
+    return "builtins.fromJSON (builtins.readFile " + path.string() + ")";
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // #has:key recording/verification mismatch for Nix-added attributes
@@ -201,11 +209,7 @@ TEST_F(TracedDataTest, HasKey_NixAddedAttr_MergeUpdate_SingleTrace_CacheHit)
     // At single-trace level, the #has:_type mismatch is masked by the
     // covering Content dep. File unchanged → cache hit.
     TempJsonFile file(R"({"x": 1, "y": 2})");
-    auto expr = R"nix(
-        let data = builtins.fromJSON (builtins.readFile )nix"
-        + file.path.string() + R"nix() // { _type = "merged"; };
-        in builtins.hasAttr "_type" data
-    )nix";
+    auto expr = std::format(R"(let data = {} // {{ _type = "merged"; }}; in builtins.hasAttr "_type" data)", fj(file.path));
 
     {
         auto cache = makeCache(expr);
@@ -226,11 +230,7 @@ TEST_F(TracedDataTest, HasKey_NixAddedAttr_MergeUpdate_SingleTrace_CacheHit)
 TEST_F(TracedDataTest, HasKey_NixAddedAttr_QuestionMark_SingleTrace_CacheHit)
 {
     TempJsonFile file(R"({"x": 1})");
-    auto expr = R"nix(
-        let data = builtins.fromJSON (builtins.readFile )nix"
-        + file.path.string() + R"nix() // { _type = "flake"; };
-        in data ? _type
-    )nix";
+    auto expr = std::format(R"(let data = {} // {{ _type = "flake"; }}; in data ? _type)", fj(file.path));
 
     {
         auto cache = makeCache(expr);
@@ -252,11 +252,7 @@ TEST_F(TracedDataTest, HasKey_NixAddedAttr_QuestionMark_SingleTrace_CacheHit)
 TEST_F(TracedDataTest, HasKey_NixAddedAttr_FileChanged_MustReeval)
 {
     TempJsonFile file(R"({"x": 1})");
-    auto expr = R"nix(
-        let data = builtins.fromJSON (builtins.readFile )nix"
-        + file.path.string() + R"nix() // { _type = "merged"; };
-        in data.x
-    )nix";
+    auto expr = std::format(R"(let data = {} // {{ _type = "merged"; }}; in data.x)", fj(file.path));
 
     {
         auto cache = makeCache(expr);
@@ -279,11 +275,7 @@ TEST_F(TracedDataTest, HasKey_NixAddedAttr_FileChanged_MustReeval)
 TEST_F(TracedDataTest, HasKey_NixAddedAttr_JsonKeyRemoved_MustReeval)
 {
     TempJsonFile file(R"({"x": 1, "y": 2})");
-    auto expr = R"nix(
-        let data = builtins.fromJSON (builtins.readFile )nix"
-        + file.path.string() + R"nix() // { _type = "merged"; };
-        in builtins.hasAttr "x" data
-    )nix";
+    auto expr = std::format(R"(let data = {} // {{ _type = "merged"; }}; in builtins.hasAttr "x" data)", fj(file.path));
 
     {
         auto cache = makeCache(expr);
@@ -307,11 +299,7 @@ TEST_F(TracedDataTest, HasKey_NixAddedAttr_JsonKeyExists_CacheHit)
 {
     // Control: _type IS in the JSON → no mismatch either way
     TempJsonFile file(R"({"x": 1, "_type": "from-json"})");
-    auto expr = R"nix(
-        let data = builtins.fromJSON (builtins.readFile )nix"
-        + file.path.string() + R"nix() // { extra = true; };
-        in builtins.hasAttr "_type" data
-    )nix";
+    auto expr = std::format(R"(let data = {} // {{ extra = true; }}; in builtins.hasAttr "_type" data)", fj(file.path));
 
     {
         auto cache = makeCache(expr);

@@ -1277,6 +1277,17 @@ static RegisterPrimOp primop_seq({
    attrsets), then return the second argument. */
 static void prim_deepSeq(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
+    // Eval-trace precision note: forceValueDeep iterates attrset keys and
+    // list elements but does NOT call maybeRecordAttrKeysDep or
+    // maybeRecordListLenDep. This means deepSeq does not record shape deps
+    // (#keys, #len) for the containers it traverses.
+    //
+    // This is a precision concern, not a soundness concern: the Content dep
+    // always serves as a backstop. Without SC deps to override it, any file
+    // change triggers re-evaluation (conservative but correct). Recording
+    // shape deps here would allow the two-level override to serve cached
+    // results when only unrelated values change, avoiding unnecessary
+    // re-evaluation.
     state.forceValueDeep(*args[0]);
     state.forceValue(*args[1], pos);
     v = *args[1];
@@ -3466,6 +3477,10 @@ static void prim_hasAttr(EvalState & state, const PosIdx pos, Value ** args, Val
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.hasAttr");
     auto sym = state.symbols.create(attr);
     auto found = args[1]->attrs()->get(sym);
+    // Record a #has:key dep for the queried key. Unlike ? with multi-segment
+    // paths (ExprOpHasAttr), builtins.hasAttr always checks a single key on
+    // the root attrset, so there are no intermediate navigation concerns.
+    // See ExprOpHasAttr::eval for the full soundness argument.
     if (state.traceActiveDepth) [[unlikely]] maybeRecordHasKeyDep(state.positions, state.symbols, *args[1], sym, found != nullptr);
     v.mkBool(found);
 }

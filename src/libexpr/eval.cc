@@ -1573,6 +1573,26 @@ Symbol ExprSelect::evalExceptFinalSelect(EvalState & state, Env & env, Value & a
 
 void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
 {
+    // Eval-trace soundness for multi-segment ? (e.g., `data ? x.y`):
+    //
+    // Only the FINAL segment records a #has:key dep. Intermediate segments
+    // are navigated without recording #has deps. This is sound because:
+    //
+    // 1. The SC dep key encodes the full path (e.g., `j:x#has:y`).
+    //    During verification, the system navigates the JSON DOM through
+    //    all intermediate segments before checking the leaf. If any
+    //    intermediate key is removed, navigation fails → dep fails →
+    //    re-evaluation.
+    //
+    // 2. For multi-provenance attrsets (via //), ImplicitShape #keys deps
+    //    recorded at creation time serve as a fallback. If a source's key
+    //    set changes (e.g., another source adds a shadowing key), IS #keys
+    //    detects the change → re-evaluation.
+    //
+    // Recording #has:key for intermediate segments would be redundant:
+    // property (1) already catches removal, and property (2) catches
+    // multi-source shadowing.
+
     Value vTmp;
     Value * vAttrs = &vTmp;
     Value * lastAttrset = nullptr;
@@ -1589,7 +1609,9 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
             lastKeyName = name;
             vAttrs = j->value;
         } else {
-            // Record #has:key for the attrset where the key was NOT found
+            // Record #has:key for the attrset where the key was NOT found.
+            // Only the failure point gets a dep — intermediate successes
+            // are covered by SC dep path navigation during verification.
             if (state.traceActiveDepth && vAttrs->type() == nAttrs) [[unlikely]]
                 maybeRecordHasKeyDep(state.positions, state.symbols, *vAttrs, name, false);
             v.mkBool(false);
@@ -1597,7 +1619,8 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
         }
     }
 
-    // Record #has:key for the last attrset where the key was found
+    // Record #has:key for the last attrset where the key was found.
+    // Only the leaf segment gets a dep — see soundness comment above.
     if (state.traceActiveDepth && lastAttrset) [[unlikely]]
         maybeRecordHasKeyDep(state.positions, state.symbols, *lastAttrset, lastKeyName, true);
     v.mkBool(true);

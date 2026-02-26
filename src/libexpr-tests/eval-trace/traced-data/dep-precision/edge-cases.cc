@@ -2,21 +2,24 @@
 
 #include <gtest/gtest.h>
 
-#include "nix/expr/traced-data.hh"
-#include "nix/expr/json-to-value.hh"
+#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace-deps.hh"
+
+#include <format>
 
 namespace nix::eval_trace {
 
 using namespace nix::eval_trace::test;
 
+class DepPrecisionEdgeCasesTest : public DepPrecisionTest {};
+
 // ── Edge cases ────────────────────────────────────────────────────────
 
-TEST_F(TracedDataTest, TracedJSON_EmptyArrayLength)
+TEST_F(DepPrecisionEdgeCasesTest, TracedJSON_EmptyArrayLength)
 {
     // length([]) shape dep (file changes to [1])
     TempJsonFile file(R"({"arr": []})");
-    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
-        + R"(); in builtins.length j.arr)";
+    auto expr = std::format("let j = {}; in builtins.length j.arr", fj(file.path));
 
     {
         auto cache = makeCache(expr);
@@ -36,11 +39,11 @@ TEST_F(TracedDataTest, TracedJSON_EmptyArrayLength)
     }
 }
 
-TEST_F(TracedDataTest, TracedJSON_EmptyObjectAttrNames)
+TEST_F(DepPrecisionEdgeCasesTest, TracedJSON_EmptyObjectAttrNames)
 {
     // attrNames({}) shape dep (file changes to {"a":1})
     TempJsonFile file(R"({"obj": {}})");
-    auto expr = R"(builtins.attrNames (builtins.fromJSON (builtins.readFile )" + file.path.string() + R"()).obj)";
+    auto expr = std::format("builtins.attrNames ({}).obj", fj(file.path));
 
     {
         auto cache = makeCache(expr);
@@ -59,12 +62,11 @@ TEST_F(TracedDataTest, TracedJSON_EmptyObjectAttrNames)
     }
 }
 
-TEST_F(TracedDataTest, TracedJSON_KeyWithHash)
+TEST_F(DepPrecisionEdgeCasesTest, TracedJSON_KeyWithHash)
 {
     // JSON key containing '#' is properly escaped, no ambiguity with shape suffix
     TempJsonFile file(R"({"a#b": "value", "c": "other"})");
-    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
-        + R"(); in j.${"a#b"})";
+    auto expr = std::format(R"(let j = {}; in j.${{"{}"}})", fj(file.path), "a#b");
 
     {
         auto cache = makeCache(expr);
@@ -100,15 +102,14 @@ TEST_F(TracedDataTest, TracedJSON_KeyWithHash)
 
 // ── Data path escaping roundtrip ──────────────────────────────────────
 
-TEST_F(TracedDataTest, TracedJSON_DeeplyNestedMixedKeys)
+TEST_F(DepPrecisionEdgeCasesTest, TracedJSON_DeeplyNestedMixedKeys)
 {
     // Deeply nested path through dotted key → array index → bracket key.
     // Tests escapeDataPathKey ↔ parseDataPath roundtrip for complex paths:
     // the dep key encodes "a.b".[0]."c[d]" and verification must parse
     // this exact path to navigate the JSON DOM correctly.
     TempJsonFile file(R"({"a.b": [{"c[d]": "deep-value"}], "x": "other"})");
-    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
-        + R"(); in (builtins.elemAt j.${"a.b"} 0).${"c[d]"})";
+    auto expr = std::format(R"(let j = {}; in (builtins.elemAt j.${{"{}"}} 0).${{"{}"}})", fj(file.path), "a.b", "c[d]");
 
     {
         auto cache = makeCache(expr);
@@ -152,14 +153,13 @@ TEST_F(TracedDataTest, TracedJSON_DeeplyNestedMixedKeys)
 
 // ── Shape suffix disambiguation ───────────────────────────────────────
 
-TEST_F(TracedDataTest, TracedJSON_KeyNamedHashSuffix)
+TEST_F(DepPrecisionEdgeCasesTest, TracedJSON_KeyNamedHashSuffix)
 {
     // Keys literally named "#len" and "#keys" must be quoted by
     // escapeDataPathKey (because '#' triggers quoting), preventing
     // computeCurrentHash from confusing them with shape dep suffixes.
     TempJsonFile file(R"({"#len": "hash-len-val", "#keys": "hash-keys-val", "other": "x"})");
-    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
-        + R"(); in j.${"#len"} + "-" + j.${"#keys"})";
+    auto expr = std::format(R"(let j = {}; in j.${{"{}"}} + "-" + j.${{"{}"}})", fj(file.path), "#len", "#keys");
 
     {
         auto cache = makeCache(expr);
@@ -194,13 +194,12 @@ TEST_F(TracedDataTest, TracedJSON_KeyNamedHashSuffix)
 
 // ── Container type changes ────────────────────────────────────────────
 
-TEST_F(TracedDataTest, TracedJSON_LengthAfterTypeChangeToObject)
+TEST_F(DepPrecisionEdgeCasesTest, TracedJSON_LengthAfterTypeChangeToObject)
 {
     // Array changes to object — #len shape dep must fail because
     // computeCurrentHash checks is_array() and returns nullopt for objects.
     TempJsonFile file(R"({"items": [1, 2, 3]})");
-    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
-        + R"(); in builtins.length j.items)";
+    auto expr = std::format("let j = {}; in builtins.length j.items", fj(file.path));
 
     {
         auto cache = makeCache(expr);
@@ -221,12 +220,12 @@ TEST_F(TracedDataTest, TracedJSON_LengthAfterTypeChangeToObject)
     }
 }
 
-TEST_F(TracedDataTest, TracedJSON_AttrNamesAfterTypeChangeToArray)
+TEST_F(DepPrecisionEdgeCasesTest, TracedJSON_AttrNamesAfterTypeChangeToArray)
 {
     // Object changes to array — #keys shape dep must fail because
     // computeCurrentHash checks is_object() and returns nullopt for arrays.
     TempJsonFile file(R"({"data": {"x": 1, "y": 2}})");
-    auto expr = R"(builtins.attrNames (builtins.fromJSON (builtins.readFile )" + file.path.string() + R"()).data)";
+    auto expr = std::format("builtins.attrNames ({}).data", fj(file.path));
 
     {
         auto cache = makeCache(expr);
@@ -249,17 +248,15 @@ TEST_F(TracedDataTest, TracedJSON_AttrNamesAfterTypeChangeToArray)
 
 // ── Two-level override coverage gap ───────────────────────────────────
 
-TEST_F(TracedDataTest, TracedJSON_TwoFilesOnlyOneCovered)
+TEST_F(DepPrecisionEdgeCasesTest, TracedJSON_TwoFilesOnlyOneCovered)
 {
     // Two files read in same trace: f1 parsed with fromJSON (SC deps),
     // f2 read raw (only Content dep). When f2 changes, the override must
     // NOT apply because f2's Content failure is not covered by any SC dep.
     // Tests the structuralCoveredFiles check in verifyTrace.
     TempJsonFile f1(R"({"name": "hello"})");
-    TempJsonFile f2("raw-content-here");
-    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + f1.path.string()
-        + R"(); raw = builtins.readFile )" + f2.path.string()
-        + R"(; in j.name + "-" + raw)";
+    TempTextFile f2("raw-content-here");
+    auto expr = std::format("let j = {}; raw = builtins.readFile {}; in j.name + \"-\" + raw", fj(f1.path), f2.path.string());
 
     {
         auto cache = makeCache(expr);
@@ -280,15 +277,14 @@ TEST_F(TracedDataTest, TracedJSON_TwoFilesOnlyOneCovered)
     }
 }
 
-TEST_F(TracedDataTest, TracedJSON_NavigationFailureMidPath)
+TEST_F(DepPrecisionEdgeCasesTest, TracedJSON_NavigationFailureMidPath)
 {
     // Intermediate key removed — navigateJson fails at middle segment,
     // not at leaf. Tests that mid-path navigation failure (as opposed to
     // leaf-key removal tested by TracedJSON_RemoveUsedKey) correctly
     // invalidates the StructuredContent dep.
     TempJsonFile file(R"({"outer": {"inner": {"deep": "value"}}, "x": "padding"})");
-    auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
-        + R"(); in j.outer.inner.deep)";
+    auto expr = std::format("let j = {}; in j.outer.inner.deep", fj(file.path));
 
     {
         auto cache = makeCache(expr);

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -411,6 +412,82 @@ public:
  */
 class TraceStoreTest : public TraceStoreFixture
 {
+};
+
+/**
+ * Fixture for dep-precision tests.
+ * Provides evalAndCollectDeps(), hasDep(), countDeps(), dumpDeps().
+ * Inherits TracedDataTest so tests also have makeCache/forceRoot/invalidateFileCache.
+ */
+class DepPrecisionTest : public TracedDataTest
+{
+protected:
+    std::vector<Dep> evalAndCollectDeps(const std::string & nixExpr)
+    {
+        DependencyTracker tracker;
+        state.traceActiveDepth++;
+        (void) eval(nixExpr, /* forceValue */ true);
+        state.traceActiveDepth--;
+        return tracker.collectTraces();
+    }
+
+    /// Count deps of a given type whose key contains a substring.
+    static size_t countDeps(const std::vector<Dep> & deps, DepType type, const std::string & keySubstr)
+    {
+        size_t n = 0;
+        for (auto & d : deps)
+            if (d.type == type && d.key.find(keySubstr) != std::string::npos)
+                n++;
+        return n;
+    }
+
+    /// Check if any dep of a given type has a key containing a substring.
+    static bool hasDep(const std::vector<Dep> & deps, DepType type, const std::string & keySubstr)
+    {
+        return countDeps(deps, type, keySubstr) > 0;
+    }
+
+    /// Count all deps of a given type.
+    static size_t countDepsByType(const std::vector<Dep> & deps, DepType type)
+    {
+        size_t n = 0;
+        for (auto & d : deps)
+            if (d.type == type)
+                n++;
+        return n;
+    }
+
+    /// Dump deps for diagnostic output in EXPECT failures.
+    static std::string dumpDeps(const std::vector<Dep> & deps)
+    {
+        std::string result = "Deps (" + std::to_string(deps.size()) + "):\n";
+        for (auto & d : deps) {
+            result += "  [";
+            result += depTypeName(d.type);
+            result += "] " + d.key + "\n";
+        }
+        return result;
+    }
+
+    // ── Expression builder helpers ──────────────────────────────────
+
+    /// Build `builtins.fromJSON (builtins.readFile PATH)` expression fragment.
+    static std::string fj(const std::filesystem::path & path)
+    {
+        return "builtins.fromJSON (builtins.readFile " + path.string() + ")";
+    }
+
+    /// Build `builtins.fromTOML (builtins.readFile PATH)` expression fragment.
+    static std::string ft(const std::filesystem::path & path)
+    {
+        return "builtins.fromTOML (builtins.readFile " + path.string() + ")";
+    }
+
+    /// Build `builtins.readDir PATH` expression fragment.
+    static std::string rd(const std::filesystem::path & path)
+    {
+        return "builtins.readDir " + path.string();
+    }
 };
 
 } // namespace nix::eval_trace::test

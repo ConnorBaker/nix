@@ -5,6 +5,8 @@
 #include "nix/expr/dependency-tracker.hh"
 #include "nix/expr/eval-trace-deps.hh"
 
+#include <format>
+
 namespace nix::eval_trace {
 
 using namespace nix::eval_trace::test;
@@ -25,32 +27,7 @@ using namespace nix::eval_trace::test;
  * the current over-approximation.
  */
 
-class DepPrecisionFormalsTest : public TracedDataTest
-{
-protected:
-    std::vector<Dep> evalAndCollectDeps(const std::string & nixExpr)
-    {
-        DependencyTracker tracker;
-        state.traceActiveDepth++;
-        auto v = eval(nixExpr, /* forceValue */ true);
-        state.traceActiveDepth--;
-        return tracker.collectTraces();
-    }
-
-    static size_t countDeps(const std::vector<Dep> & deps, DepType type, const std::string & keySubstr)
-    {
-        size_t n = 0;
-        for (auto & d : deps)
-            if (d.type == type && d.key.find(keySubstr) != std::string::npos)
-                n++;
-        return n;
-    }
-
-    static bool hasDep(const std::vector<Dep> & deps, DepType type, const std::string & keySubstr)
-    {
-        return countDeps(deps, type, keySubstr) > 0;
-    }
-};
+class DepPrecisionFormalsTest : public DepPrecisionTest {};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Positive: strict formals (no ...) SHOULD record #keys
@@ -61,14 +38,14 @@ TEST_F(DepPrecisionFormalsTest, StrictFormals_RecordsSCKeys)
     // ({ a, b }: a) applied to traced data — strict formals correctly
     // records #keys because extra keys would be an error.
     TempJsonFile file(R"({"a": 1, "b": 2})");
-    auto expr = R"(({ a, b }: a) (builtins.fromJSON (builtins.readFile )"
-        + file.path.string() + R"()))";
+    auto expr = std::format("({{ a, b }}: a) ({})", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
 
     // Positive: strict formals should record StructuredContent #keys
     EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
-        << "Strict formals (no ...) must record #keys — extra keys are an error";
+        << "Strict formals (no ...) must record #keys — extra keys are an error\n"
+        << dumpDeps(deps);
 }
 
 TEST_F(DepPrecisionFormalsTest, DISABLED_StrictFormals_KeyAdded_CacheMiss)
@@ -81,8 +58,7 @@ TEST_F(DepPrecisionFormalsTest, DISABLED_StrictFormals_KeyAdded_CacheMiss)
     // Needs investigation — the cached result (1) is correct but the
     // lambda would throw at runtime if re-evaluated with { a, b, c }.
     TempJsonFile file(R"({"a": 1, "b": 2})");
-    auto expr = R"(({ a, b }: a) (builtins.fromJSON (builtins.readFile )"
-        + file.path.string() + R"()))";
+    auto expr = std::format("({{ a, b }}: a) ({})", fj(file.path));
 
     {
         auto cache = makeCache(expr);
@@ -117,14 +93,14 @@ TEST_F(DepPrecisionFormalsTest, DISABLED_EllipsisFormals_NoSCKeys)
     // CURRENTLY FAILS: eval.cc:1650 calls maybeRecordAttrKeysDep
     // unconditionally, recording #keys even with ellipsis.
     TempJsonFile file(R"({"a": 1, "b": 2})");
-    auto expr = R"(({ a, ... }: a) (builtins.fromJSON (builtins.readFile )"
-        + file.path.string() + R"()))";
+    auto expr = std::format("({{ a, ... }}: a) ({})", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
 
     // Ideal: NO StructuredContent #keys (ellipsis accepts any keys)
     EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
-        << "Ellipsis formals ({ a, ... }) should NOT record #keys — extra keys are accepted";
+        << "Ellipsis formals ({ a, ... }) should NOT record #keys — extra keys are accepted\n"
+        << dumpDeps(deps);
 }
 
 TEST_F(DepPrecisionFormalsTest, DISABLED_EllipsisFormals_KeyAdded_CacheHit)
@@ -134,8 +110,7 @@ TEST_F(DepPrecisionFormalsTest, DISABLED_EllipsisFormals_KeyAdded_CacheHit)
     //
     // CURRENTLY FAILS: #keys is recorded, causing spurious invalidation.
     TempJsonFile file(R"({"a": 1, "b": 2})");
-    auto expr = R"(({ a, ... }: a) (builtins.fromJSON (builtins.readFile )"
-        + file.path.string() + R"()))";
+    auto expr = std::format("({{ a, ... }}: a) ({})", fj(file.path));
 
     {
         auto cache = makeCache(expr);
@@ -166,14 +141,14 @@ TEST_F(DepPrecisionFormalsTest, EllipsisFormals_CurrentlyRecordsSCKeys)
     // Documents the CURRENT over-approximation: ellipsis formals record #keys.
     // This test will need updating when the imprecision is fixed.
     TempJsonFile file(R"({"a": 1, "b": 2})");
-    auto expr = R"(({ a, ... }: a) (builtins.fromJSON (builtins.readFile )"
-        + file.path.string() + R"()))";
+    auto expr = std::format("({{ a, ... }}: a) ({})", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
 
     // Current (imprecise) behavior: #keys IS recorded even with ellipsis
     EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
-        << "KNOWN IMPRECISION: ellipsis formals currently record #keys (eval.cc:1650)";
+        << "KNOWN IMPRECISION: ellipsis formals currently record #keys (eval.cc:1650)\n"
+        << dumpDeps(deps);
 }
 
 TEST_F(DepPrecisionFormalsTest, EllipsisFormals_CurrentlyInvalidatesOnKeyAdd)
@@ -181,8 +156,7 @@ TEST_F(DepPrecisionFormalsTest, EllipsisFormals_CurrentlyInvalidatesOnKeyAdd)
     // Documents the CURRENT over-approximation: ellipsis formals cause
     // spurious cache miss when an unrelated key is added.
     TempJsonFile file(R"({"a": 1, "b": 2})");
-    auto expr = R"(({ a, ... }: a) (builtins.fromJSON (builtins.readFile )"
-        + file.path.string() + R"()))";
+    auto expr = std::format("({{ a, ... }}: a) ({})", fj(file.path));
 
     {
         auto cache = makeCache(expr);
