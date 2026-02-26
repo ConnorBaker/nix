@@ -104,6 +104,7 @@ sources = files(
   'eval-trace/traced-data/materialization/cross-scope-typeof.cc',
   'eval-trace/traced-data/materialization/cross-scope-cache.cc',
   'eval-trace/traced-data/materialization/variant-roundtrip.cc',
+  'eval-trace/traced-data/materialization/nested-diagnostic.cc',
   # eval-trace/verify/
   'eval-trace/verify/cold-compare.cc',
   'eval-trace/verify/cold-verify.cc',

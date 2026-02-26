@@ -162,4 +162,37 @@ TEST_F(MaterializationDepTest, NestedAttrset_CrossScope_ShapeDeps)
         << "Nested cross-scope: SC #keys should be recorded\n" << dumpDeps(deps);
 }
 
+TEST_F(MaterializationDepTest, NestedAttrset_CrossScope_CacheMiss)
+{
+    TempJsonFile f(R"({"inner":{"x":1}})");
+    auto expr = std::format(
+        "let d = {}; in {{ inherit d; names = builtins.attrNames d.inner; }}",
+        fj(f.path));
+
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        state.forceAttrs(root, noPos, "test");
+        auto * namesAttr = root.attrs()->get(state.symbols.create("names"));
+        ASSERT_NE(namesAttr, nullptr);
+        state.forceValue(*namesAttr->value, noPos);
+        ASSERT_EQ(namesAttr->value->listSize(), 1u);
+    }
+
+    // Add a key to the nested object
+    f.modify(R"({"inner":{"x":1,"y":2}})");
+    invalidateFileCache(f.path);
+
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        state.forceAttrs(root, noPos, "test");
+        auto * namesAttr = root.attrs()->get(state.symbols.create("names"));
+        ASSERT_NE(namesAttr, nullptr);
+        state.forceValue(*namesAttr->value, noPos);
+        EXPECT_EQ(namesAttr->value->listSize(), 2u)
+            << "Nested: should have 2 keys after addition";
+    }
+}
+
 } // namespace nix::eval_trace::test

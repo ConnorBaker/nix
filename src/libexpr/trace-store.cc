@@ -1480,12 +1480,15 @@ bool TraceStore::verifyTrace(
     } else if (!hasContentFailure) {
         // No coarse failures. Structural deps for files WITH a passing Content/Directory
         // dep in this trace don't need checking (file unchanged → SC deps pass too).
-        // However, "standalone" SC deps — SC deps for files WITHOUT a Content/Directory
-        // dep in this trace — must be verified directly. These arise from cross-trace
-        // dep separation: a child trace inherits ExprTracedData thunks from the parent's
-        // result but has no Content dep for the file (the parent does).
+        // However, "standalone" structural deps — SC or ImplicitShape deps for files
+        // WITHOUT a Content/Directory dep in this trace — must be verified directly.
+        // These arise from cross-trace dep separation: a child trace inherits
+        // ExprTracedData thunks from the parent's result but has no Content dep for
+        // the file (the parent does). Without this check, a child trace with only
+        // [ParentContext, ImplicitShape] would always pass when the parent passes,
+        // even if the child's structural shape changed.
         allValid = true;
-        if (hasStructuralDeps) {
+        if (hasStructuralDeps || hasImplicitShapeDeps) {
             // Build set of files covered by passing Content/Directory deps in this trace
             std::unordered_set<std::string> coveredFiles;
             for (auto & dep : fullDeps) {
@@ -1493,6 +1496,7 @@ bool TraceStore::verifyTrace(
                     coveredFiles.insert(dep.source + '\t' + dep.key);
             }
 
+            // Verify standalone SC deps
             for (auto * dep : structuralDeps) {
                 auto sep = dep->key.find('\t');
                 if (sep == std::string::npos) continue;
@@ -1515,6 +1519,38 @@ bool TraceStore::verifyTrace(
                     nrVerificationsFailed++;
                     allValid = false;
                     break;
+                }
+            }
+
+            // Verify standalone ImplicitShape deps (same logic as SC above).
+            // A child trace may have ImplicitShape deps for a file whose Content
+            // dep lives in the parent's trace. Without verifying these, the child
+            // incorrectly passes when the parent passes (ParentContext check) even
+            // though the child's structural shape changed.
+            if (allValid) {
+                for (auto * dep : implicitShapeDeps) {
+                    auto sep = dep->key.find('\t');
+                    if (sep == std::string::npos) continue;
+                    auto fileKey = dep->source + '\t' + dep->key.substr(0, sep);
+                    if (coveredFiles.count(fileKey)) continue; // File has passing coarse dep
+
+                    nrDepsChecked++;
+                    DepKey dk(*dep);
+                    auto cacheIt = currentDepHashes.find(dk);
+                    std::optional<DepHashValue> current;
+
+                    if (cacheIt != currentDepHashes.end()) {
+                        current = cacheIt->second;
+                    } else {
+                        current = computeCurrentHash(state, *dep, inputAccessors);
+                        currentDepHashes[dk] = current;
+                    }
+
+                    if (!current || *current != dep->expectedHash) {
+                        nrVerificationsFailed++;
+                        allValid = false;
+                        break;
+                    }
                 }
             }
         }
