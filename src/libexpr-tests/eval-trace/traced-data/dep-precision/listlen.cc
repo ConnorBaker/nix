@@ -22,9 +22,9 @@ TEST_F(DepPrecisionListLenTest, Length_RecordsSCLen)
     auto expr = std::format("builtins.length ({}).items", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#len"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("len")))
         << "length must record SC #len\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "length must NOT record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -34,7 +34,7 @@ TEST_F(DepPrecisionListLenTest, Head_NoSCLen)
     auto expr = std::format("builtins.head ({}).items", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#len"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("len")))
         << "head must NOT record SC #len\n" << dumpDeps(deps);
 }
 
@@ -44,7 +44,7 @@ TEST_F(DepPrecisionListLenTest, ElemAt_NoSCLen)
     auto expr = std::format("builtins.elemAt ({}).items 0", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#len"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("len")))
         << "elemAt must NOT record SC #len\n" << dumpDeps(deps);
 }
 

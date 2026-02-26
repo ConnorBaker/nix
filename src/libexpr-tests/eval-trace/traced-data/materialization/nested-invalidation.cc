@@ -31,9 +31,9 @@ TEST_F(MaterializationDepTest, ThreeLevel_AttrNames_RecordsSCKeys)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "3-level nested attrNames should record SC #keys\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "attrNames should NOT record SC #type\n" << dumpDeps(deps);
 }
 
@@ -88,7 +88,7 @@ TEST_F(MaterializationDepTest, NestedMerge_AttrNames_RecordsSCKeys)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Nested merge attrNames should record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -176,9 +176,9 @@ TEST_F(MaterializationDepTest, NestedHasAttr_RecordsSCHasKey)
     }
 
     auto deps = getStoredDeps("has");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
         << "Nested hasAttr should record SC #has:x\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Nested hasAttr should NOT record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -202,9 +202,9 @@ TEST_F(MaterializationDepTest, NestedTypeOf_RecordsSCType)
     }
 
     auto deps = getStoredDeps("t");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "Nested typeOf should record SC #type\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Nested typeOf should NOT record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -228,7 +228,7 @@ TEST_F(MaterializationDepTest, MapAttrsNested_AttrNames_RecordsSCKeys)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "mapAttrs on nested TracedData should record SC #keys\n" << dumpDeps(deps);
 }
 

@@ -74,80 +74,22 @@ static void clearDomCaches()
 }
 
 /**
- * Parse a data path like "nodes.nixpkgs.locked.rev" or "items.[0].name"
- * into segments. '.' separates object keys, '[N]' denotes array indices.
- * Array indices may appear at the start ("[0].name") or after a dot ("items.[0]").
- *
- * Known limitation: object keys containing '.' or '[' will be misinterpreted.
- * This is conservative — verification fails, causing re-evaluation, never stale results.
+ * Navigate a JSON DOM using a JSON path array. Returns nullptr if path is invalid.
+ * Path components: strings for object keys, numbers for array indices.
  */
-/**
- * Parse a data path into segments. Supports three segment types:
- *   - Array index: [N]
- *   - Quoted key: "key" (with \" and \\ escape sequences, unescaped on parse)
- *   - Bare key: chars until '.', '[', or end
- * Segments are separated by '.'. Returns empty vector on malformed input.
- */
-static std::vector<std::string> parseDataPath(const std::string & path)
+static const nlohmann::json * navigateJson(const nlohmann::json & root, const nlohmann::json & pathArray)
 {
-    std::vector<std::string> segments;
-    if (path.empty()) return segments;
-
-    size_t pos = 0;
-    while (pos < path.size()) {
-        if (path[pos] == '[') {
-            // Array index: find closing ']'
-            auto end = path.find(']', pos);
-            if (end == std::string::npos) return {}; // malformed
-            segments.push_back(path.substr(pos, end - pos + 1));
-            pos = end + 1;
-            if (pos < path.size() && path[pos] == '.') pos++;
-        } else if (path[pos] == '"') {
-            // Quoted key: unescape backslash-escaped chars
-            std::string segment;
-            pos++; // skip opening quote
-            while (pos < path.size() && path[pos] != '"') {
-                if (path[pos] == '\\' && pos + 1 < path.size()) {
-                    pos++; // skip backslash, take next char literally
-                }
-                segment += path[pos++];
-            }
-            if (pos >= path.size()) return {}; // malformed: no closing quote
-            pos++; // skip closing quote
-            if (pos < path.size() && path[pos] == '.') pos++;
-            segments.push_back(std::move(segment));
-        } else {
-            // Bare key: until '.', '[', or end
-            size_t start = pos;
-            while (pos < path.size() && path[pos] != '.' && path[pos] != '[')
-                pos++;
-            segments.push_back(path.substr(start, pos - start));
-            if (pos < path.size() && path[pos] == '.') pos++;
-        }
-    }
-    return segments;
-}
-
-/**
- * Navigate a JSON DOM to a data path. Returns nullptr if path is invalid.
- */
-static const nlohmann::json * navigateJson(const nlohmann::json & root, const std::string & dataPath)
-{
-    auto segments = parseDataPath(dataPath);
     const nlohmann::json * node = &root;
-    for (auto & seg : segments) {
-        if (seg.empty()) continue; // skip empty segments from malformed paths (e.g., "a..b")
-        if (seg.front() == '[') {
-            // Array index
+    for (auto & component : pathArray) {
+        if (component.is_number()) {
             if (!node->is_array()) return nullptr;
-            auto idxStr = seg.substr(1, seg.size() - 2);
-            size_t idx = std::stoull(idxStr);
+            auto idx = component.get<size_t>();
             if (idx >= node->size()) return nullptr;
             node = &(*node)[idx];
         } else {
-            // Object key
             if (!node->is_object()) return nullptr;
-            auto it = node->find(seg);
+            auto key = component.get<std::string>();
+            auto it = node->find(key);
             if (it == node->end()) return nullptr;
             node = &*it;
         }
@@ -156,25 +98,23 @@ static const nlohmann::json * navigateJson(const nlohmann::json & root, const st
 }
 
 /**
- * Navigate a TOML DOM to a data path. Returns nullptr if path is invalid.
+ * Navigate a TOML DOM using a JSON path array. Returns nullptr if path is invalid.
  */
-static const toml::value * navigateToml(const toml::value & root, const std::string & dataPath)
+static const toml::value * navigateToml(const toml::value & root, const nlohmann::json & pathArray)
 {
-    auto segments = parseDataPath(dataPath);
     const toml::value * node = &root;
-    for (auto & seg : segments) {
-        if (seg.empty()) continue; // skip empty segments from malformed paths
-        if (seg.front() == '[') {
+    for (auto & component : pathArray) {
+        if (component.is_number()) {
             if (!node->is_array()) return nullptr;
-            auto idxStr = seg.substr(1, seg.size() - 2);
-            size_t idx = std::stoull(idxStr);
+            auto idx = component.get<size_t>();
             auto & arr = toml::get<std::vector<toml::value>>(*node);
             if (idx >= arr.size()) return nullptr;
             node = &arr[idx];
         } else {
             if (!node->is_table()) return nullptr;
+            auto key = component.get<std::string>();
             auto & table = toml::get<toml::table>(*node);
-            auto it = table.find(seg);
+            auto it = table.find(key);
             if (it == table.end()) return nullptr;
             node = &it->second;
         }
@@ -271,32 +211,28 @@ static std::optional<DepHashValue> computeCurrentHash(
         // StructuredContent. Verified only for failed sources without SC deps.
         [[fallthrough]];
     case DepType::StructuredContent: {
-        // Key format: "filepath\tf:datapath[#suffix]" (tab separator)
-        auto sep = dep.key.find('\t');
-        if (sep == std::string::npos || sep + 2 >= dep.key.size())
+        // Key format: JSON object {"f":"path","t":"j","p":[...],"s":"keys","h":"key"}
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(dep.key);
+        } catch (...) {
             return std::nullopt;
-        auto format = parseStructuredFormat(dep.key[sep + 1]);
-        if (!format || dep.key[sep + 2] != ':')
-            return std::nullopt;
-        std::string filePath = dep.key.substr(0, sep);
-        auto [dataPath, shape] = parseShapeSuffix(dep.key.substr(sep + 3));
-
-        // Check for #has:key suffix (finer-grained than #keys, records per-key existence).
-        // This runs only when parseShapeSuffix returns None — no collision with #len/#keys/#type.
-        // Real keys containing '#' are escaped by escapeDataPathKey (quoted with "..."),
-        // so "#has:" can only appear bare at a segment boundary, never inside a quoted key.
-        // The key name after "#has:" may itself be escaped (e.g., "#has:\"key.name\"")
-        // and must be unescaped before use.
-        std::string hasKeyName;
-        bool isHasKey = false;
-        if (shape == ShapeSuffix::None) {
-            auto hasPos = dataPath.find("#has:");
-            if (hasPos != std::string::npos) {
-                isHasKey = true;
-                hasKeyName = unescapeDataPathKey(dataPath.substr(hasPos + 5));
-                dataPath = dataPath.substr(0, hasPos);
-            }
         }
+        auto filePath = j.value("f", "");
+        auto formatStr = j.value("t", "");
+        if (formatStr.empty()) return std::nullopt;
+        auto format = parseStructuredFormat(formatStr[0]);
+        if (!format) return std::nullopt;
+        auto pathArray = j.value("p", nlohmann::json::array());
+        auto hasKeyName = j.value("h", "");
+        bool isHasKey = !hasKeyName.empty();
+        auto parseShapeName = [](const std::string & name) -> ShapeSuffix {
+            if (name == "len") return ShapeSuffix::Len;
+            if (name == "keys") return ShapeSuffix::Keys;
+            if (name == "type") return ShapeSuffix::Type;
+            return ShapeSuffix::None;
+        };
+        auto shape = parseShapeName(j.value("s", ""));
 
         // Construct a synthetic Content dep to resolve the file path
         Dep fileDep{dep.source, filePath, DepHashValue{Blake3Hash{}}, DepType::Content};
@@ -324,7 +260,7 @@ static std::optional<DepHashValue> computeCurrentHash(
                     auto contents = path->readFile();
                     cacheIt = jsonDomCache.emplace(cacheKey, nlohmann::json::parse(contents)).first;
                 }
-                auto * node = navigateJson(cacheIt->second, dataPath);
+                auto * node = navigateJson(cacheIt->second, pathArray);
                 if (!node) return std::nullopt;
                 switch (shape) {
                 case ShapeSuffix::Len:
@@ -363,7 +299,7 @@ static std::optional<DepHashValue> computeCurrentHash(
 #endif
                     )).first;
                 }
-                auto * node = navigateToml(cacheIt->second, dataPath);
+                auto * node = navigateToml(cacheIt->second, pathArray);
                 if (!node) return std::nullopt;
                 switch (shape) {
                 case ShapeSuffix::Len:
@@ -422,9 +358,9 @@ static std::optional<DepHashValue> computeCurrentHash(
                     if (isHasKey) {
                         return DepHashValue(depHash(entries.count(hasKeyName) ? "1" : "0"));
                     }
-                    auto segments = parseDataPath(dataPath);
-                    if (segments.size() != 1) return std::nullopt;
-                    auto it = entries.find(segments[0]);
+                    // Directory scalar: pathArray should have exactly one string component
+                    if (pathArray.size() != 1 || !pathArray[0].is_string()) return std::nullopt;
+                    auto it = entries.find(pathArray[0].get<std::string>());
                     if (it == entries.end()) return std::nullopt;
                     return DepHashValue(depHash(dirEntryTypeString(it->second)));
                 }
@@ -978,27 +914,22 @@ std::tuple<ResultKind, std::string, std::string> TraceStore::encodeCachedResult(
                 val.append(std::string(symbols[sym]));
                 first = false;
             }
-            // Encode origins into the context field when present.
-            // Format: "N\t" + N groups of "depSource\tdepKey\tdataPath\tformat"
-            //         + "\n" + space-separated per-attr indices
+            // Encode origins into the context field as JSON when present.
             std::string ctx;
             if (!a.origins.empty()) {
-                ctx += std::to_string(a.origins.size());
+                nlohmann::json originsJson;
+                nlohmann::json origArr = nlohmann::json::array();
                 for (auto & orig : a.origins) {
-                    ctx += '\t';
-                    ctx += orig.depSource;
-                    ctx += '\t';
-                    ctx += orig.depKey;
-                    ctx += '\t';
-                    ctx += orig.dataPath;
-                    ctx += '\t';
-                    ctx += orig.format;
+                    origArr.push_back({
+                        {"s", orig.depSource},
+                        {"f", orig.depKey},
+                        {"p", orig.dataPath},  // already a JSON array string
+                        {"t", std::string(1, orig.format)},
+                    });
                 }
-                ctx += '\n';
-                for (size_t i = 0; i < a.originIndices.size(); i++) {
-                    if (i > 0) ctx += ' ';
-                    ctx += std::to_string(static_cast<int>(a.originIndices[i]));
-                }
+                originsJson["origins"] = std::move(origArr);
+                originsJson["indices"] = a.originIndices;
+                ctx = originsJson.dump();
             }
             return {ResultKind::FullAttrs, std::move(val), std::move(ctx)};
         },
@@ -1064,47 +995,19 @@ CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
             for (auto & name : tokenizeString<std::vector<std::string>>(row.value, "\t"))
                 result.names.push_back(symbols.create(name));
         }
-        // Decode origins from the context field when present.
+        // Decode origins from JSON context field when present.
         if (!row.context.empty()) {
-            auto nlPos = row.context.find('\n');
-            if (nlPos != std::string::npos) {
-                // Parse origin count and origins from before \n
-                auto header = std::string_view(row.context).substr(0, nlPos);
-                auto firstTab = header.find('\t');
-                size_t nOrigins = 0;
-                if (firstTab != std::string_view::npos) {
-                    nOrigins = std::stoull(std::string(header.substr(0, firstTab)));
-                }
-                // Parse origin groups: depSource\tdepKey\tdataPath\tformat
-                size_t pos = firstTab + 1;
-                for (size_t i = 0; i < nOrigins; i++) {
-                    attrs_t::Origin orig;
-                    // depSource
-                    auto tab1 = header.find('\t', pos);
-                    orig.depSource = std::string(header.substr(pos, tab1 - pos));
-                    pos = tab1 + 1;
-                    // depKey
-                    auto tab2 = header.find('\t', pos);
-                    orig.depKey = std::string(header.substr(pos, tab2 - pos));
-                    pos = tab2 + 1;
-                    // dataPath
-                    auto tab3 = header.find('\t', pos);
-                    orig.dataPath = std::string(header.substr(pos, tab3 - pos));
-                    pos = tab3 + 1;
-                    // format (single char)
-                    orig.format = header[pos];
-                    pos += 1;
-                    if (pos < header.size() && header[pos] == '\t')
-                        pos++; // skip separator before next origin
-                    result.origins.push_back(std::move(orig));
-                }
-                // Parse per-attr indices from after \n
-                auto indicesStr = row.context.substr(nlPos + 1);
-                if (!indicesStr.empty()) {
-                    for (auto & s : tokenizeString<std::vector<std::string>>(indicesStr, " "))
-                        result.originIndices.push_back(static_cast<int8_t>(std::stoi(s)));
-                }
+            auto ctx = nlohmann::json::parse(row.context);
+            for (auto & origJson : ctx["origins"]) {
+                attrs_t::Origin orig;
+                orig.depSource = origJson["s"].get<std::string>();
+                orig.depKey = origJson["f"].get<std::string>();
+                orig.dataPath = origJson["p"].get<std::string>();
+                orig.format = origJson["t"].get<std::string>()[0];
+                result.origins.push_back(std::move(orig));
             }
+            for (auto & idx : ctx["indices"])
+                result.originIndices.push_back(idx.get<int8_t>());
         }
         return result;
     }
@@ -1359,6 +1262,33 @@ TraceId TraceStore::getOrCreateTrace(
 
 // ── Trace verification (BSàlC VT check) ─────────────────────────────
 
+/**
+ * File identity for coverage set lookups: (source, filePath).
+ * Content/Directory deps use dep.key directly as the file path.
+ * StructuredContent/ImplicitShape deps extract "f" from their JSON key.
+ */
+struct FileIdentity {
+    std::string source;
+    std::string filePath;
+
+    bool operator==(const FileIdentity &) const = default;
+
+    struct Hash {
+        size_t operator()(const FileIdentity & fi) const noexcept {
+            return hashValues(fi.source, fi.filePath);
+        }
+    };
+};
+
+static FileIdentity scFileIdentity(const Dep & dep) {
+    auto j = nlohmann::json::parse(dep.key);
+    return {dep.source, j["f"].get<std::string>()};
+}
+
+static FileIdentity contentFileIdentity(const Dep & dep) {
+    return {dep.source, dep.key};
+}
+
 // Forward declarations (defined after record(), used by verifyTrace's
 // trace_hash recomputation on content override).
 static void sortAndDedupInterned(std::vector<TraceStore::InternedDep> & deps);
@@ -1402,8 +1332,8 @@ bool TraceStore::verifyTrace(
     bool hasImplicitShapeDeps = false;
     bool hasImplicitShapeOnlyOverride = false;
 
-    // Track failed coarse dep file/dir keys: "source\tkey"
-    std::unordered_set<std::string> failedContentFiles;
+    // Track failed coarse dep file identity keys (source + NUL + filePath)
+    std::unordered_set<FileIdentity, FileIdentity::Hash> failedContentFiles;
     // Deferred structural deps (StructuredContent)
     std::vector<const Dep *> structuralDeps;
     // Deferred implicit shape deps (ImplicitShape — creation-time #keys/#len)
@@ -1481,7 +1411,7 @@ bool TraceStore::verifyTrace(
             nrVerificationsFailed++;
             if (isContentOverrideable(dep.type)) {
                 hasContentFailure = true;
-                failedContentFiles.insert(dep.source + '\t' + dep.key);
+                failedContentFiles.insert(contentFileIdentity(dep));
             } else {
                 hasNonContentFailure = true;
             }
@@ -1506,17 +1436,15 @@ bool TraceStore::verifyTrace(
         allValid = true;
         if (hasStructuralDeps || hasImplicitShapeDeps) {
             // Build set of files covered by passing Content/Directory deps in this trace
-            std::unordered_set<std::string> coveredFiles;
+            std::unordered_set<FileIdentity, FileIdentity::Hash> coveredFiles;
             for (auto & dep : fullDeps) {
                 if (isContentOverrideable(dep.type))
-                    coveredFiles.insert(dep.source + '\t' + dep.key);
+                    coveredFiles.insert(contentFileIdentity(dep));
             }
 
             // Verify standalone SC deps
             for (auto * dep : structuralDeps) {
-                auto sep = dep->key.find('\t');
-                if (sep == std::string::npos) continue;
-                auto fileKey = dep->source + '\t' + dep->key.substr(0, sep);
+                auto fileKey = scFileIdentity(*dep);
                 if (coveredFiles.count(fileKey)) continue; // File has passing coarse dep
 
                 nrDepsChecked++;
@@ -1545,9 +1473,7 @@ bool TraceStore::verifyTrace(
             // though the child's structural shape changed.
             if (allValid) {
                 for (auto * dep : implicitShapeDeps) {
-                    auto sep = dep->key.find('\t');
-                    if (sep == std::string::npos) continue;
-                    auto fileKey = dep->source + '\t' + dep->key.substr(0, sep);
+                    auto fileKey = scFileIdentity(*dep);
                     if (coveredFiles.count(fileKey)) continue; // File has passing coarse dep
 
                     nrDepsChecked++;
@@ -1586,18 +1512,14 @@ bool TraceStore::verifyTrace(
         allValid = true;
 
         // Build coverage sets: which files are covered by SC vs ImplicitShape
-        std::unordered_set<std::string> structuralCoveredFiles;
+        std::unordered_set<FileIdentity, FileIdentity::Hash> structuralCoveredFiles;
         for (auto * dep : structuralDeps) {
-            auto sep = dep->key.find('\t');
-            if (sep != std::string::npos)
-                structuralCoveredFiles.insert(dep->source + '\t' + dep->key.substr(0, sep));
+            structuralCoveredFiles.insert(scFileIdentity(*dep));
         }
 
-        std::unordered_set<std::string> implicitCoveredFiles;
+        std::unordered_set<FileIdentity, FileIdentity::Hash> implicitCoveredFiles;
         for (auto * dep : implicitShapeDeps) {
-            auto sep = dep->key.find('\t');
-            if (sep != std::string::npos)
-                implicitCoveredFiles.insert(dep->source + '\t' + dep->key.substr(0, sep));
+            implicitCoveredFiles.insert(scFileIdentity(*dep));
         }
 
         // Check that all failed coarse deps are covered by EITHER SC or ImplicitShape.
@@ -1645,9 +1567,7 @@ bool TraceStore::verifyTrace(
         // that don't affect accessed values would spuriously fail).
         if (allValid) {
             for (auto * dep : implicitShapeDeps) {
-                auto sep = dep->key.find('\t');
-                if (sep == std::string::npos) continue;
-                auto fileKey = dep->source + '\t' + dep->key.substr(0, sep);
+                auto fileKey = scFileIdentity(*dep);
                 if (structuralCoveredFiles.count(fileKey)) continue;
                 if (!failedContentFiles.count(fileKey)) continue;
 

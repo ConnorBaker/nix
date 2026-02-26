@@ -32,8 +32,8 @@ TEST_F(DepPrecisionBuiltinsExtraTest, Trace_DoesNotAffectDeps)
     EXPECT_TRUE(hasDep(depsWithout, DepType::StructuredContent, "x"));
 
     // Both should have IS #keys
-    EXPECT_TRUE(hasDep(depsWith, DepType::ImplicitShape, "#keys"));
-    EXPECT_TRUE(hasDep(depsWithout, DepType::ImplicitShape, "#keys"));
+    EXPECT_TRUE(hasJsonDep(depsWith, DepType::ImplicitShape, shapePred("keys")));
+    EXPECT_TRUE(hasJsonDep(depsWithout, DepType::ImplicitShape, shapePred("keys")));
 }
 
 TEST_F(DepPrecisionBuiltinsExtraTest, Seq_ForcesOne_RecordsDeps)
@@ -60,9 +60,9 @@ TEST_F(DepPrecisionBuiltinsExtraTest, DeepSeq_ForcesAll_RecordsDeps)
     // deepSeq forces all values but doesn't call shape-observing builtins
     // (attrNames, length) — so no SC #keys or #len. It does record scalar
     // deps for the forced leaf values and j.x access.
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, ":x"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"x"}))))
         << "deepSeq + j.x records scalar dep for x\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("keys")))
         << "IS #keys from creation\n" << dumpDeps(deps);
 }
 
@@ -190,7 +190,7 @@ TEST_F(DepPrecisionBuiltinsExtraTest, MapAttrsRecursive_RecordsDeps)
         fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Nested mapAttrs -> attrNames records SC #keys\n" << dumpDeps(deps);
 }
 

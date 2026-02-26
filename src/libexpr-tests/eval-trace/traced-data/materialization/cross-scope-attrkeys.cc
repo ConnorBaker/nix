@@ -33,7 +33,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_JSON_RecordsSCKeys)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Cross-scope: SC #keys should be recorded for attrNames on materialized value\n"
         << dumpDeps(deps);
 }
@@ -55,7 +55,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_TOML)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Cross-scope TOML: SC #keys should be recorded\n" << dumpDeps(deps);
 }
 
@@ -78,7 +78,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_ReadDir)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Cross-scope readDir: SC #keys should be recorded\n" << dumpDeps(deps);
 }
 
@@ -99,7 +99,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_MapAttrs_PreservesProvenance
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Cross-scope mapAttrs: SC #keys should be preserved through mapAttrs\n"
         << dumpDeps(deps);
 }
@@ -121,7 +121,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_Nested_RecordsSCKeys)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Cross-scope nested: SC #keys should be recorded for d.inner attrNames\n"
         << dumpDeps(deps);
 }
@@ -143,7 +143,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrValues_RecordsSCKeys)
     }
 
     auto deps = getStoredDeps("vals");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Cross-scope attrValues: SC #keys should be recorded\n"
         << dumpDeps(deps);
 }
@@ -167,7 +167,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_NoSCType)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "Cross-scope: attrNames should NOT record SC #type\n" << dumpDeps(deps);
 }
 
@@ -188,7 +188,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_NoSCHasKey)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#has:"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, [](const nlohmann::json & j) { return j.contains("h"); }))
         << "Cross-scope: attrNames should NOT record SC #has\n" << dumpDeps(deps);
 }
 
@@ -212,7 +212,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_MultiOrigin_RecordsSCKeysPer
     }
 
     auto deps = getStoredDeps("names");
-    auto scKeysCount = countDeps(deps, DepType::StructuredContent, "#keys");
+    auto scKeysCount = countJsonDeps(deps, DepType::StructuredContent, shapePred("keys"));
     EXPECT_GE(scKeysCount, 2u)
         << "Multi-origin: should have SC #keys for each origin\n" << dumpDeps(deps);
 }
@@ -234,7 +234,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_MixedOrigin_RecordsSCKeysFor
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Mixed origin: SC #keys should be recorded for the TracedData origin\n"
         << dumpDeps(deps);
 }

@@ -28,7 +28,7 @@ TEST_F(MaterializationDepTest, CacheHit_ShapeDepsPreserved_InStoredTrace)
     }
 
     auto deps1 = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps1, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps1, DepType::StructuredContent, shapePred("keys")))
         << "First run: SC #keys should be stored\n" << dumpDeps(deps1);
 
     // Second run — should be a cache hit, but stored deps should remain
@@ -42,7 +42,7 @@ TEST_F(MaterializationDepTest, CacheHit_ShapeDepsPreserved_InStoredTrace)
     }
 
     auto deps2 = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps2, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps2, DepType::StructuredContent, shapePred("keys")))
         << "Second run: SC #keys should still be in stored trace\n" << dumpDeps(deps2);
 }
 
@@ -77,9 +77,9 @@ TEST_F(MaterializationDepTest, CacheHit_ReplayedDepsMatchFreshDeps)
 
     auto cachedDeps = getStoredDeps("names");
 
-    EXPECT_TRUE(hasDep(freshDeps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(freshDeps, DepType::StructuredContent, shapePred("keys")))
         << "Fresh deps should have SC #keys\n" << dumpDeps(freshDeps);
-    EXPECT_TRUE(hasDep(cachedDeps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(cachedDeps, DepType::StructuredContent, shapePred("keys")))
         << "Cached deps should have SC #keys\n" << dumpDeps(cachedDeps);
 }
 
@@ -158,7 +158,7 @@ TEST_F(MaterializationDepTest, NestedAttrset_CrossScope_ShapeDeps)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Nested cross-scope: SC #keys should be recorded\n" << dumpDeps(deps);
 }
 

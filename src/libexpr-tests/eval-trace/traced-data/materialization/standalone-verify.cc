@@ -139,7 +139,7 @@ TEST_F(MaterializationDepTest, StandaloneSC_CrossScope_KeyChange)
 
     // Verify names has SC #keys as a standalone dep (no Content in names' trace)
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "names should have standalone SC #keys\n" << dumpDeps(deps);
     EXPECT_EQ(countDepsByType(deps, DepType::Content), 0u)
         << "names should have NO Content dep (parent d owns it)\n" << dumpDeps(deps);
@@ -212,7 +212,7 @@ TEST_F(MaterializationDepTest, StandaloneIS_DepStructure)
     auto innerDeps = getStoredDeps(makePath({"d", "inner"}));
     EXPECT_TRUE(hasDep(innerDeps, DepType::ParentContext, ""))
         << "d\\0inner should have ParentContext dep\n" << dumpDeps(innerDeps);
-    EXPECT_TRUE(hasDep(innerDeps, DepType::ImplicitShape, "#keys"))
+    EXPECT_TRUE(hasJsonDep(innerDeps, DepType::ImplicitShape, shapePred("keys")))
         << "d\\0inner should have ImplicitShape #keys dep\n" << dumpDeps(innerDeps);
     EXPECT_EQ(countDepsByType(innerDeps, DepType::Content), 0u)
         << "d\\0inner should have NO Content dep (parent d owns it)\n" << dumpDeps(innerDeps);
@@ -221,7 +221,7 @@ TEST_F(MaterializationDepTest, StandaloneIS_DepStructure)
     auto dDeps = getStoredDeps("d");
     EXPECT_TRUE(hasDep(dDeps, DepType::Content, ""))
         << "d should have Content dep\n" << dumpDeps(dDeps);
-    EXPECT_TRUE(hasDep(dDeps, DepType::ImplicitShape, "#keys"))
+    EXPECT_TRUE(hasJsonDep(dDeps, DepType::ImplicitShape, shapePred("keys")))
         << "d should have ImplicitShape #keys dep\n" << dumpDeps(dDeps);
 }
 

@@ -22,11 +22,11 @@ TEST_F(DepPrecisionTypeOfTest, TypeOf_List_RecordsSCType)
     auto expr = std::format("builtins.typeOf ({}).data", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "typeOf must record SC #type\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "typeOf must NOT record SC #keys\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#len"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("len")))
         << "typeOf must NOT record SC #len\n" << dumpDeps(deps);
 }
 
@@ -36,7 +36,7 @@ TEST_F(DepPrecisionTypeOfTest, TypeOf_Attrset_RecordsSCType)
     auto expr = std::format("builtins.typeOf ({}).data", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "typeOf on attrset must record SC #type\n" << dumpDeps(deps);
 }
 
@@ -50,7 +50,7 @@ TEST_F(DepPrecisionTypeOfTest, TypeOf_Scalar_NoSCType)
     auto deps = evalAndCollectDeps(expr);
     // Scalar typeOf: the value is already forced, typeOf is trivial.
     // No #type dep recorded for scalars.
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "typeOf on scalar must NOT record SC #type\n" << dumpDeps(deps);
 }
 
@@ -60,7 +60,7 @@ TEST_F(DepPrecisionTypeOfTest, IsAttrs_RecordsSCType)
     auto expr = std::format("builtins.isAttrs ({}).data", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "isAttrs must record SC #type\n" << dumpDeps(deps);
 }
 
@@ -70,7 +70,7 @@ TEST_F(DepPrecisionTypeOfTest, IsList_RecordsSCType)
     auto expr = std::format("builtins.isList ({}).data", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "isList must record SC #type\n" << dumpDeps(deps);
 }
 
@@ -81,7 +81,7 @@ TEST_F(DepPrecisionTypeOfTest, IsString_NoTypeDep)
     auto expr = std::format("builtins.isString ({}).x", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "isString on scalar must NOT record SC #type\n" << dumpDeps(deps);
 }
 
@@ -91,7 +91,7 @@ TEST_F(DepPrecisionTypeOfTest, IsInt_NoTypeDep)
     auto expr = std::format("builtins.isInt ({}).x", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "isInt on scalar must NOT record SC #type\n" << dumpDeps(deps);
 }
 
@@ -101,7 +101,7 @@ TEST_F(DepPrecisionTypeOfTest, IsBool_NoTypeDep)
     auto expr = std::format("builtins.isBool ({}).x", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "isBool on scalar must NOT record SC #type\n" << dumpDeps(deps);
 }
 
@@ -117,7 +117,7 @@ TEST_F(DepPrecisionTypeOfTest, TypeChange_ArrayToObject_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
             << "typeOf records SC #type\n" << dumpDeps(deps);
     }
 
@@ -148,7 +148,7 @@ TEST_F(DepPrecisionTypeOfTest, TypeChange_ObjectToArray_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
             << dumpDeps(deps);
     }
 
@@ -179,7 +179,7 @@ TEST_F(DepPrecisionTypeOfTest, TypeUnchanged_CacheHit)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
             << dumpDeps(deps);
     }
 
@@ -217,7 +217,7 @@ TEST_F(DepPrecisionTypeOfTest, IsAttrs_ObjectToArray_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
             << dumpDeps(deps);
     }
 
@@ -250,7 +250,7 @@ TEST_F(DepPrecisionTypeOfTest, IsList_ArrayToObject_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
             << dumpDeps(deps);
     }
 
@@ -281,7 +281,7 @@ TEST_F(DepPrecisionTypeOfTest, NestedTypeChange_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
             << dumpDeps(deps);
     }
 

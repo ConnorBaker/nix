@@ -59,11 +59,12 @@ typedef std::pair<std::string, NixStringContext> string_t;
 struct attrs_t {
     std::vector<Symbol> names;
     /// Deduplicated TracedData origins for reconstruction during materialization.
+    /// Stored as strings for SQLite serialization; re-interned into pools on replay.
     struct Origin {
-        std::string depSource;
-        std::string depKey;
-        std::string dataPath;
-        char format; ///< 'j', 't', 'd' (StructuredFormat char)
+        std::string depSource;  ///< flake input name
+        std::string depKey;     ///< file path (resolved via input accessor)
+        std::string dataPath;   ///< JSON array of path components, e.g. '["nodes","rev"]'
+        char format;            ///< 'j', 't', 'd' (StructuredFormat char)
     };
     std::vector<Origin> origins;       ///< deduplicated
     std::vector<int8_t> originIndices; ///< per-attr; -1 = no origin. Empty when origins is empty.

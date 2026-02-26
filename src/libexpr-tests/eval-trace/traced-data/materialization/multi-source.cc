@@ -31,7 +31,7 @@ TEST_F(MaterializationDepTest, JsonTomlMerge_AttrNames_RecordsSCKeysPerOrigin)
     }
 
     auto deps = getStoredDeps("names");
-    auto scKeysCount = countDeps(deps, DepType::StructuredContent, "#keys");
+    auto scKeysCount = countJsonDeps(deps, DepType::StructuredContent, shapePred("keys"));
     EXPECT_GE(scKeysCount, 2u)
         << "JSON+TOML merge should record SC #keys for each origin\n" << dumpDeps(deps);
 }
@@ -124,7 +124,7 @@ TEST_F(MaterializationDepTest, ReadDirThenJson_AttrNames_RecordsDeps)
     }
 
     auto deps = getStoredDeps("names");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "readDir attrNames should record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -227,7 +227,7 @@ TEST_F(MaterializationDepTest, JsonReadDirMerge_RecordsSCKeysPerOrigin)
     }
 
     auto deps = getStoredDeps("names");
-    auto scKeysCount = countDeps(deps, DepType::StructuredContent, "#keys");
+    auto scKeysCount = countJsonDeps(deps, DepType::StructuredContent, shapePred("keys"));
     EXPECT_GE(scKeysCount, 2u)
         << "JSON+readDir merge should record SC #keys for each origin\n" << dumpDeps(deps);
 }

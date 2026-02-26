@@ -259,11 +259,11 @@ TEST_F(DepPrecisionAttrKeysMultiTest, PartialOverlap_SCKeys_NotRecordedForShadow
 
     // SC #keys should exist for b (2 visible = 2 total), but NOT for a (1 visible != 2 total)
     // Both should have IS #keys from creation
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("keys")))
         << "IS #keys must exist from creation\n" << dumpDeps(deps);
 
     // Count SC #keys — should be exactly 1 (from b only)
-    size_t scKeysCount = countDeps(deps, DepType::StructuredContent, "#keys");
+    size_t scKeysCount = countJsonDeps(deps, DepType::StructuredContent, shapePred("keys"));
     EXPECT_EQ(scKeysCount, 1u)
         << "SC #keys should be recorded for b only (not shadowed a)\n" << dumpDeps(deps);
 }
@@ -281,16 +281,16 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_RecordsHasKeyDeps)
     auto deps = evalAndCollectDeps(expr);
 
     // intersectAttrs records #has:x on both operands (shared key)
-    EXPECT_GE(countDeps(deps, DepType::StructuredContent, "#has:x"), 2u)
+    EXPECT_GE(countJsonDeps(deps, DepType::StructuredContent, hasKeyPred("x")), 2u)
         << "intersectAttrs must record #has:x on both operands\n" << dumpDeps(deps);
     // No #keys deps (replaced by per-key #has)
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "intersectAttrs must NOT record #keys\n" << dumpDeps(deps);
     // Non-shared keys get #has exists=false dep on the OTHER operand
     // (detects new keys entering the intersection)
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:y"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("y")))
         << "Left-only key y must get #has:y exists=false dep on right operand\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:z"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("z")))
         << "Right-only key z must get #has:z exists=false dep on left operand\n" << dumpDeps(deps);
 }
 
@@ -400,14 +400,14 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_HasKeyDepsForAllKeys)
     auto expr = std::format("builtins.intersectAttrs ({}) ({})", fj(fileA.path), fj(fileB.path));
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:b"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("b")))
         << "Shared key b must get #has dep\n" << dumpDeps(deps);
     // Disjoint keys get exists=false on the other operand
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("a")))
         << "Left-only key a gets #has exists=false on right\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:c"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("c")))
         << "Right-only key c gets #has exists=false on left\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "No #keys deps\n" << dumpDeps(deps);
 }
 
@@ -420,12 +420,12 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_EmptyIntersection_HasFalseD
     auto deps = evalAndCollectDeps(expr);
 
     // "a" is left-only → #has:a exists=false on right (fileB)
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("a")))
         << "Left-only key a gets exists=false dep on right\n" << dumpDeps(deps);
     // "b" is right-only → #has:b exists=false on left (fileA)
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:b"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("b")))
         << "Right-only key b gets exists=false dep on left\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "No #keys deps\n" << dumpDeps(deps);
 }
 
@@ -437,14 +437,14 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_MultipleSharedKeys_AllGetHa
     auto expr = std::format("builtins.intersectAttrs ({}) ({})", fj(fileA.path), fj(fileB.path));
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
         << "Shared key x must get #has dep\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:y"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("y")))
         << "Shared key y must get #has dep\n" << dumpDeps(deps);
     // Non-shared keys get exists=false on the other operand
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:z"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("z")))
         << "Left-only key z gets exists=false on right\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:w"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("w")))
         << "Right-only key w gets exists=false on left\n" << dumpDeps(deps);
 }
 

@@ -2565,8 +2565,10 @@ static bool recordReadDirDep(EvalState & state, const SourcePath & path,
     if (!std::all_of(entries.begin(), entries.end(), [](auto & e) { return e.second.has_value(); }))
         return false;
     auto [depSource, depKey] = resolveProvenance(path.path, state.getMountToInput());
+    auto srcId = internDepSource(depSource);
+    auto fpId = internFilePath(depKey);
     auto * rootNode = new DirDataNode(std::move(entries));
-    auto * rootExpr = new ExprTracedData(rootNode, depSource, depKey, "");
+    auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, DataPathId{});
     rootExpr->eval(state, state.baseEnv, v);
     return true;
 }

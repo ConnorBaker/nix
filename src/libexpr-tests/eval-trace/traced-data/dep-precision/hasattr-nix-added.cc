@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <format>
+#include <nlohmann/json.hpp>
 
 namespace nix::eval_trace {
 
@@ -12,6 +13,23 @@ using namespace nix::eval_trace::test;
 static std::string fj(const std::filesystem::path & path)
 {
     return "builtins.fromJSON (builtins.readFile " + path.string() + ")";
+}
+
+/// Build a JSON-format StructuredContent dep key string for tests.
+static std::string makeJsonDepKey(
+    const std::string & filePath, const std::string & formatTag,
+    const nlohmann::json & pathArray,
+    const std::string & shapeSuffix = "", const std::string & hasKey = "")
+{
+    nlohmann::json j;
+    j["f"] = filePath;
+    j["t"] = formatTag;
+    j["p"] = pathArray;
+    if (!hasKey.empty())
+        j["h"] = hasKey;
+    else if (!shapeSuffix.empty())
+        j["s"] = shapeSuffix;
+    return j.dump();
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -51,8 +69,7 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyMismatch_NixAddedKey_FailsVerify)
     TempJsonFile file(R"({"x": 1, "y": 2})");
     auto filePath = file.path.string();
 
-    auto depKey = buildStructuredDepKey(
-        filePath, StructuredFormat::Json, "", "#has:_type");
+    auto depKey = makeJsonDepKey(filePath, "j", nlohmann::json::array(), "", "_type");
 
     std::vector<Dep> deps = {{
         "", depKey, DepHashValue(depHash("1")), DepType::StructuredContent
@@ -83,10 +100,8 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyMismatch_MultipleDeps_FirstBadBlocks)
     TempJsonFile file(R"({"x": 1, "y": 2})");
     auto filePath = file.path.string();
 
-    auto depKey1 = buildStructuredDepKey(
-        filePath, StructuredFormat::Json, "", "#has:_type");
-    auto depKey2 = buildStructuredDepKey(
-        filePath, StructuredFormat::Json, "", "#has:x");
+    auto depKey1 = makeJsonDepKey(filePath, "j", nlohmann::json::array(), "", "_type");
+    auto depKey2 = makeJsonDepKey(filePath, "j", nlohmann::json::array(), "", "x");
 
     std::vector<Dep> deps = {
         {"", depKey1, DepHashValue(depHash("1")), DepType::StructuredContent},
@@ -112,8 +127,7 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyCorrect_JsonKey_PassesVerify)
     TempJsonFile file(R"({"x": 1, "y": 2})");
     auto filePath = file.path.string();
 
-    auto depKey = buildStructuredDepKey(
-        filePath, StructuredFormat::Json, "", "#has:x");
+    auto depKey = makeJsonDepKey(filePath, "j", nlohmann::json::array(), "", "x");
 
     // Hash = depHash("1") — x exists in the JSON
     std::vector<Dep> deps = {{
@@ -138,8 +152,7 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyCorrect_MissingKey_PassesVerify)
     TempJsonFile file(R"({"x": 1, "y": 2})");
     auto filePath = file.path.string();
 
-    auto depKey = buildStructuredDepKey(
-        filePath, StructuredFormat::Json, "", "#has:_type");
+    auto depKey = makeJsonDepKey(filePath, "j", nlohmann::json::array(), "", "_type");
 
     // Hash = depHash("0") — _type doesn't exist in the JSON.
     // This is what verification will also compute → match.
@@ -175,8 +188,7 @@ TEST_F(TraceStoreTest, CoveredSC_HasKeyMismatch_MaskedByContentDep)
     auto contentHash = depHashFile(
         state.rootPath(CanonPath(filePath)));
 
-    auto scDepKey = buildStructuredDepKey(
-        filePath, StructuredFormat::Json, "", "#has:_type");
+    auto scDepKey = makeJsonDepKey(filePath, "j", nlohmann::json::array(), "", "_type");
 
     std::vector<Dep> deps = {
         // Content dep (covers the file)

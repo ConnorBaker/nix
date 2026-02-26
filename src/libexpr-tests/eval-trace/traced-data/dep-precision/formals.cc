@@ -35,7 +35,7 @@ TEST_F(DepPrecisionFormalsTest, StrictFormals_RecordsSCKeys)
     auto deps = evalAndCollectDeps(expr);
 
     // Positive: strict formals should record StructuredContent #keys
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Strict formals (no ...) must record #keys — extra keys are an error\n"
         << dumpDeps(deps);
 }
@@ -81,7 +81,7 @@ TEST_F(DepPrecisionFormalsTest, EllipsisFormals_NoSCKeys)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Ellipsis formals ({ a, ... }) should NOT record #keys — extra keys are accepted\n"
         << dumpDeps(deps);
 }
@@ -124,7 +124,7 @@ TEST_F(DepPrecisionFormalsTest, EllipsisFormals_NoSCKeys_Explicit)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Ellipsis formals must not record #keys\n"
         << dumpDeps(deps);
 }

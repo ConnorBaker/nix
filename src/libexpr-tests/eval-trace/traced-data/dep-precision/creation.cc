@@ -23,7 +23,7 @@ TEST_F(DepPrecisionCreationTest, Object_ImplicitShapeKeys_Present)
     auto expr = std::format("({}).x", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("keys")))
         << "Object creation must record ImplicitShape #keys\n" << dumpDeps(deps);
 }
 
@@ -33,7 +33,7 @@ TEST_F(DepPrecisionCreationTest, Object_NoImplicitShapeLen)
     auto expr = std::format("({}).x", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_FALSE(hasDep(deps, DepType::ImplicitShape, "#len"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("len")))
         << "Object creation must NOT record ImplicitShape #len\n" << dumpDeps(deps);
 }
 
@@ -43,9 +43,9 @@ TEST_F(DepPrecisionCreationTest, Object_EmptyObject_ImplicitShapeKeys)
     auto expr = std::format("builtins.attrNames ({}).obj", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("keys")))
         << "Empty object must still get ImplicitShape #keys\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "attrNames on empty object records SC #keys\n" << dumpDeps(deps);
 }
 
@@ -57,7 +57,7 @@ TEST_F(DepPrecisionCreationTest, Object_EmptyObject_BlockingSCKeys_CacheBehavior
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -90,7 +90,7 @@ TEST_F(DepPrecisionCreationTest, Array_ImplicitShapeLen_Present)
     auto expr = std::format("builtins.elemAt ({}).items 0", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#len"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("len")))
         << "Array creation must record ImplicitShape #len\n" << dumpDeps(deps);
 }
 
@@ -101,7 +101,7 @@ TEST_F(DepPrecisionCreationTest, Array_NoImplicitShapeKeys)
 
     auto deps = evalAndCollectDeps(expr);
     // The parent object DOES get IS #keys; the array gets IS #len.
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#len"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("len")))
         << "Array should have IS #len\n" << dumpDeps(deps);
 }
 
@@ -111,7 +111,7 @@ TEST_F(DepPrecisionCreationTest, RootArray_ImplicitShapeLen)
     auto expr = std::format("builtins.elemAt ({}) 0", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#len"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("len")))
         << "Root array creation must record ImplicitShape #len\n" << dumpDeps(deps);
 }
 
@@ -127,11 +127,11 @@ TEST_F(DepPrecisionCreationTest, Scalar_Int_RecordsSCDep)
     auto deps = evalAndCollectDeps(expr);
     EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "x"))
         << "Scalar int access must record SC dep\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Scalar access alone must NOT record SC #keys\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#len"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("len")))
         << "Scalar access must NOT record SC #len\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "Scalar access must NOT record SC #type\n" << dumpDeps(deps);
 }
 
@@ -195,7 +195,7 @@ TEST_F(DepPrecisionCreationTest, TOML_Object_ImplicitShapeKeys)
     auto expr = std::format("({}).section.x", ft(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("keys")))
         << "TOML object creation must record ImplicitShape #keys\n" << dumpDeps(deps);
 }
 
@@ -215,7 +215,7 @@ TEST_F(DepPrecisionCreationTest, TOML_Array_ImplicitShapeLen)
     auto expr = std::format("builtins.elemAt ({}).items 0", ft(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#len"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("len")))
         << "TOML array creation must record ImplicitShape #len\n" << dumpDeps(deps);
 }
 
@@ -232,7 +232,7 @@ TEST_F(DepPrecisionCreationTest, ReadDir_ImplicitShapeKeys)
     auto expr = std::format("({}).foo", rd(dir.path()));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("keys")))
         << "readDir creation must record ImplicitShape #keys\n" << dumpDeps(deps);
 }
 

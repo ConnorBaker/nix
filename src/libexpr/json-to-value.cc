@@ -309,32 +309,28 @@ struct JsonDataNode : TracedDataNode {
 } // anonymous namespace
 
 // ── ExprTracedData::eval() — vtable emitted here ────────────────────
-// escapeDataPathKey is now in eval-trace-deps.hh (shared with dependency-tracker.cc)
 
 void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
 {
+    initSessionSymbols(state.symbols);
     auto nodeKind = node->kind();
+    auto fmt = node->formatTag();
 
     switch (nodeKind) {
     case TracedDataNode::Kind::Object: {
-        // Eagerly materialize the full key set; each value is a lazy thunk.
         auto keys = node->objectKeys();
         auto attrs = state.buildBindings(keys.size());
 
-        // Assign per-key PosIdx with TracedData provenance so that
-        // shape dep functions can use originOf(attr->pos) to determine
-        // each key's origin file — surviving // and other attrset ops.
         bool tracking = DependencyTracker::isActive() && !keys.empty();
         auto originHandle = state.positions.addOriginHandle(
-            Pos::TracedData{depSource, depKey, dataPath, structuredFormatChar(node->formatTag())},
+            Pos::TracedData{sourceId, filePathId, dataPathId, structuredFormatChar(fmt)},
             keys.empty() ? 0 : keys.size());
 
         for (size_t idx = 0; idx < keys.size(); idx++) {
             auto & k = keys[idx];
-            auto escaped = escapeDataPathKey(k);
-            auto childPath = dataPath.empty() ? escaped : dataPath + "." + escaped;
+            auto childPathId = internDataPathChild(dataPathId, state.symbols.create(k));
             auto * childExpr = new ExprTracedData(
-                node->objectGet(k), depSource, depKey, std::move(childPath));
+                node->objectGet(k), sourceId, filePathId, childPathId);
             auto * thunkVal = state.allocValue();
             thunkVal->mkThunk(&state.baseEnv, childExpr);
             forceNoNullByte(k);
@@ -343,17 +339,13 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         }
         v.mkAttrs(attrs);
         if (DependencyTracker::isActive()) {
+            CompactDepComponents keysComp{sourceId, filePathId, fmt, dataPathId,
+                                          ShapeSuffix::Keys, Symbol{}};
             if (keys.empty()) {
-                // Empty objects have no stable internal pointer for provenance tracking.
-                // Record blocking StructuredContent #keys so that key additions are caught.
-                auto keysKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath, ShapeSuffix::Keys);
-                DependencyTracker::record({depSource, keysKey, DepHashValue(depHash("")), DepType::StructuredContent});
+                // Empty objects: blocking SC #keys so key additions are caught.
+                recordStructuredDep(keysComp, DepHashValue(depHash("")));
             } else {
-                // Non-empty: record ImplicitShape #keys fingerprint at creation time.
-                // Sorted key names separated by null bytes for canonical representation.
-                // This dep is always ignored during verification (ImplicitStructural)
-                // but participates in structural recovery via DepKeySets.
-                auto keysKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath, ShapeSuffix::Keys);
+                // Non-empty: ImplicitShape #keys fingerprint at creation time.
                 std::vector<std::string> sortedKeys(keys);
                 std::sort(sortedKeys.begin(), sortedKeys.end());
                 std::string canonical;
@@ -362,18 +354,14 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
                     canonical += sortedKeys[i];
                 }
                 auto keysHash = depHash(canonical);
-                DependencyTracker::record({depSource, keysKey, DepHashValue(keysHash), DepType::ImplicitShape});
+                recordStructuredDep(keysComp, DepHashValue(keysHash), DepType::ImplicitShape);
 
-                // Register precomputed hash so maybeRecordAttrKeysDep can skip
-                // sort + concat + BLAKE3 when all original keys are still visible.
-                // Key is the origin offset (stable across PosTable vector growth).
                 PosIdx anyKeyPos = v.attrs()->begin()->pos;
                 if (auto off = state.positions.originOffsetOf(anyKeyPos)) {
                     registerPrecomputedKeys(*off, PrecomputedKeysInfo{
                         keysHash,
                         static_cast<uint32_t>(keys.size()),
-                        keysKey,
-                        depSource,
+                        sourceId, filePathId, dataPathId, fmt,
                     });
                 }
             }
@@ -384,28 +372,25 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         auto sz = node->arraySize();
         auto list = state.buildList(sz);
         for (size_t i = 0; i < sz; i++) {
-            auto indexPart = "[" + std::to_string(i) + "]";
-            auto childPath = dataPath.empty() ? indexPart : dataPath + "." + indexPart;
+            auto childPathId = internDataPathArrayChild(dataPathId, static_cast<int32_t>(i));
             auto * childExpr = new ExprTracedData(
-                node->arrayGet(i), depSource, depKey, std::move(childPath));
+                node->arrayGet(i), sourceId, filePathId, childPathId);
             auto * thunkVal = state.allocValue();
             thunkVal->mkThunk(&state.baseEnv, childExpr);
             list[i] = thunkVal;
         }
         v.mkList(list);
         if (DependencyTracker::isActive()) {
+            CompactDepComponents lenComp{sourceId, filePathId, fmt, dataPathId,
+                                         ShapeSuffix::Len, Symbol{}};
             if (sz == 0) {
-                // Empty lists have no stable internal pointer for provenance tracking.
-                // Record blocking StructuredContent #len so that element additions are caught.
-                auto lenKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath, ShapeSuffix::Len);
-                DependencyTracker::record({depSource, lenKey, DepHashValue(depHash("0")), DepType::StructuredContent});
+                // Empty lists: blocking SC #len so element additions are caught.
+                recordStructuredDep(lenComp, DepHashValue(depHash("0")));
             } else {
-                // Non-empty: record ImplicitShape #len fingerprint at creation time.
-                auto lenKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath, ShapeSuffix::Len);
-                DependencyTracker::record({depSource, lenKey, DepHashValue(depHash(std::to_string(sz))), DepType::ImplicitShape});
+                // Non-empty: ImplicitShape #len fingerprint at creation time.
+                recordStructuredDep(lenComp, DepHashValue(depHash(std::to_string(sz))), DepType::ImplicitShape);
 
-                // Register provenance for shape-observing builtins (length, etc.)
-                auto * prov = allocateProvenance(depSource, depKey, dataPath, node->formatTag());
+                auto * prov = allocateProvenance(sourceId, filePathId, dataPathId, fmt);
                 registerTracedContainer((const void *)list[0], prov);
             }
         }
@@ -416,9 +401,10 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
     case TracedDataNode::Kind::Bool:
     case TracedDataNode::Kind::Null: {
         // Scalar leaf — record StructuredContent dep
-        auto fullKey = buildStructuredDepKey(depKey, node->formatTag(), dataPath);
+        CompactDepComponents scalarComp{sourceId, filePathId, fmt, dataPathId,
+                                        ShapeSuffix::None, Symbol{}};
         auto hash = depHash(node->canonicalValue());
-        DependencyTracker::record({depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        recordStructuredDep(scalarComp, DepHashValue(hash));
         node->materializeScalar(state, v);
         break;
     }
@@ -430,11 +416,12 @@ void parseTracedJSON(EvalState & state, const std::string_view & s, Value & v,
 {
     auto j = json::parse(s);
     if (j.is_object() || j.is_array()) {
+        auto srcId = internDepSource(depSource);
+        auto fpId = internFilePath(depKey);
         auto * rootNode = new JsonDataNode(std::move(j));
-        auto * rootExpr = new ExprTracedData(rootNode, depSource, depKey, "");
+        auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, DataPathId{});
         rootExpr->eval(state, state.baseEnv, v);
     } else {
-        // Scalar root — fall back to eager parsing (no structural tracking)
         parseJSON(state, s, v);
     }
 }

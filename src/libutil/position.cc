@@ -71,7 +71,7 @@ void Pos::print(std::ostream & out, bool showOrigin) const
                 [&](const Pos::Stdin &) { out << "«stdin»"; },
                 [&](const Pos::String & s) { out << "«string»"; },
                 [&](const SourcePath & path) { out << path; },
-                [&](const Pos::TracedData & df) { out << "«data:" << df.depKey << "»"; }},
+                [&](const Pos::TracedData & df) { out << "«traced-data:" << df.format << "»"; }},
             origin);
         out << ":";
     }

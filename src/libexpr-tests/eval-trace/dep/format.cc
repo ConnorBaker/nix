@@ -56,13 +56,6 @@ TEST_F(DependencyTrackerTest, StructuredFormatName_AllFormats)
 
 // ── ShapeSuffix enum tests ────────────────────────────────────────────
 
-TEST_F(DependencyTrackerTest, ShapeSuffixString_AllValues)
-{
-    EXPECT_EQ(shapeSuffixString(ShapeSuffix::None), "");
-    EXPECT_EQ(shapeSuffixString(ShapeSuffix::Len), "#len");
-    EXPECT_EQ(shapeSuffixString(ShapeSuffix::Keys), "#keys");
-}
-
 TEST_F(DependencyTrackerTest, ShapeSuffixName_AllValues)
 {
     EXPECT_EQ(shapeSuffixName(ShapeSuffix::None), "");
@@ -70,194 +63,35 @@ TEST_F(DependencyTrackerTest, ShapeSuffixName_AllValues)
     EXPECT_EQ(shapeSuffixName(ShapeSuffix::Keys), "keys");
 }
 
-TEST_F(DependencyTrackerTest, ParseShapeSuffix_NoSuffix)
+// ── StrongId type safety tests ────────────────────────────────────────
+
+TEST_F(DependencyTrackerTest, StrongId_DefaultZero)
 {
-    auto [path, shape] = parseShapeSuffix(".foo.bar");
-    EXPECT_EQ(path, ".foo.bar");
-    EXPECT_EQ(shape, ShapeSuffix::None);
+    DepSourceId src{};
+    FilePathId fp{};
+    DataPathId dp{};
+    EXPECT_EQ(src.value, 0);
+    EXPECT_EQ(fp.value, 0);
+    EXPECT_EQ(dp.value, 0);
+    EXPECT_FALSE(static_cast<bool>(src));
+    EXPECT_FALSE(static_cast<bool>(fp));
+    EXPECT_FALSE(static_cast<bool>(dp));
 }
 
-TEST_F(DependencyTrackerTest, ParseShapeSuffix_LenSuffix)
+TEST_F(DependencyTrackerTest, StrongId_NonZeroIsTrue)
 {
-    auto [path, shape] = parseShapeSuffix(".foo.bar#len");
-    EXPECT_EQ(path, ".foo.bar");
-    EXPECT_EQ(shape, ShapeSuffix::Len);
+    DepSourceId src(1);
+    DataPathId dp(42);
+    EXPECT_TRUE(static_cast<bool>(src));
+    EXPECT_TRUE(static_cast<bool>(dp));
 }
 
-TEST_F(DependencyTrackerTest, ParseShapeSuffix_KeysSuffix)
+TEST_F(DependencyTrackerTest, StrongId_EqualityAndOrdering)
 {
-    auto [path, shape] = parseShapeSuffix(".foo.bar#keys");
-    EXPECT_EQ(path, ".foo.bar");
-    EXPECT_EQ(shape, ShapeSuffix::Keys);
-}
-
-TEST_F(DependencyTrackerTest, ParseShapeSuffix_EmptyPath)
-{
-    auto [path, shape] = parseShapeSuffix("#len");
-    EXPECT_EQ(path, "");
-    EXPECT_EQ(shape, ShapeSuffix::Len);
-}
-
-TEST_F(DependencyTrackerTest, ParseShapeSuffix_JustHashNotSuffix)
-{
-    auto [path, shape] = parseShapeSuffix(".foo#bar");
-    EXPECT_EQ(path, ".foo#bar");
-    EXPECT_EQ(shape, ShapeSuffix::None);
-}
-
-// ── buildStructuredDepKey tests ───────────────────────────────────────
-
-TEST_F(DependencyTrackerTest, BuildStructuredDepKey_Scalar)
-{
-    auto key = buildStructuredDepKey("/file.json", StructuredFormat::Json, ".foo.bar");
-    EXPECT_EQ(key, "/file.json\tj:.foo.bar");
-}
-
-TEST_F(DependencyTrackerTest, BuildStructuredDepKey_WithLen)
-{
-    auto key = buildStructuredDepKey("/file.toml", StructuredFormat::Toml, ".list", ShapeSuffix::Len);
-    EXPECT_EQ(key, "/file.toml\tt:.list#len");
-}
-
-TEST_F(DependencyTrackerTest, BuildStructuredDepKey_WithKeys)
-{
-    auto key = buildStructuredDepKey("/dir", StructuredFormat::Directory, "", ShapeSuffix::Keys);
-    EXPECT_EQ(key, "/dir\td:#keys");
-}
-
-// ── formatStructuredDepKey tests ──────────────────────────────────────
-
-TEST_F(DependencyTrackerTest, FormatStructuredDepKey_JsonScalar)
-{
-    auto result = formatStructuredDepKey("/file.json\tj:.foo.bar");
-    EXPECT_EQ(result, "/file.json [json] .foo.bar");
-}
-
-TEST_F(DependencyTrackerTest, FormatStructuredDepKey_TomlWithLen)
-{
-    auto result = formatStructuredDepKey("/f.toml\tt:.list#len");
-    EXPECT_EQ(result, "/f.toml [toml] .list #len");
-}
-
-TEST_F(DependencyTrackerTest, FormatStructuredDepKey_DirWithKeys)
-{
-    auto result = formatStructuredDepKey("/dir\td:#keys");
-    EXPECT_EQ(result, "/dir [directory]  #keys");
-}
-
-TEST_F(DependencyTrackerTest, FormatStructuredDepKey_InvalidFallback)
-{
-    EXPECT_EQ(formatStructuredDepKey("no-tab-here"), "no-tab-here");
-    EXPECT_EQ(formatStructuredDepKey("a\tx:rest"), "a\tx:rest"); // invalid format char
-    EXPECT_EQ(formatStructuredDepKey("a\tj"), "a\tj"); // too short (no colon)
-}
-
-// ── parseShapeSuffix edge cases ────────────────────────────────────────
-
-TEST_F(DependencyTrackerTest, ParseShapeSuffix_TypeSuffix)
-{
-    auto [path, shape] = parseShapeSuffix(".foo#type");
-    EXPECT_EQ(path, ".foo");
-    EXPECT_EQ(shape, ShapeSuffix::Type);
-}
-
-TEST_F(DependencyTrackerTest, ParseShapeSuffix_HasKeyNotParsedAsShape)
-{
-    // #has:key is NOT a shape suffix — parseShapeSuffix returns None
-    auto [path, shape] = parseShapeSuffix(".foo#has:bar");
-    EXPECT_EQ(path, ".foo#has:bar");
-    EXPECT_EQ(shape, ShapeSuffix::None);
-}
-
-TEST_F(DependencyTrackerTest, ParseShapeSuffix_HasKeyWithEscapedName)
-{
-    // Escaped key after #has: — parseShapeSuffix should not consume it
-    auto [path, shape] = parseShapeSuffix(R"(#has:"key.name")");
-    EXPECT_EQ(path, R"(#has:"key.name")");
-    EXPECT_EQ(shape, ShapeSuffix::None);
-}
-
-// ── escapeDataPathKey / unescapeDataPathKey tests ─────────────────────
-
-TEST_F(DependencyTrackerTest, EscapeDataPathKey_PlainKey)
-{
-    EXPECT_EQ(escapeDataPathKey("foo"), "foo");
-    EXPECT_EQ(escapeDataPathKey("simple_key123"), "simple_key123");
-}
-
-TEST_F(DependencyTrackerTest, EscapeDataPathKey_KeyWithDot)
-{
-    EXPECT_EQ(escapeDataPathKey("key.name"), R"("key.name")");
-}
-
-TEST_F(DependencyTrackerTest, EscapeDataPathKey_KeyWithHash)
-{
-    // '#' triggers quoting — prevents collision with #len/#keys/#has:
-    EXPECT_EQ(escapeDataPathKey("#has:foo"), R"("#has:foo")");
-    EXPECT_EQ(escapeDataPathKey("x#len"), R"("x#len")");
-}
-
-TEST_F(DependencyTrackerTest, EscapeDataPathKey_KeyWithQuote)
-{
-    EXPECT_EQ(escapeDataPathKey(R"(key"name)"), R"("key\"name")");
-}
-
-TEST_F(DependencyTrackerTest, EscapeDataPathKey_KeyWithBackslash)
-{
-    EXPECT_EQ(escapeDataPathKey(R"(key\name)"), R"("key\\name")");
-}
-
-TEST_F(DependencyTrackerTest, EscapeDataPathKey_KeyWithBrackets)
-{
-    EXPECT_EQ(escapeDataPathKey("key[0]"), R"("key[0]")");
-}
-
-TEST_F(DependencyTrackerTest, EscapeDataPathKey_EmptyKey)
-{
-    EXPECT_EQ(escapeDataPathKey(""), "");
-}
-
-TEST_F(DependencyTrackerTest, UnescapeDataPathKey_PlainKey)
-{
-    EXPECT_EQ(unescapeDataPathKey("foo"), "foo");
-}
-
-TEST_F(DependencyTrackerTest, UnescapeDataPathKey_QuotedKey)
-{
-    EXPECT_EQ(unescapeDataPathKey(R"("key.name")"), "key.name");
-}
-
-TEST_F(DependencyTrackerTest, UnescapeDataPathKey_QuotedWithEscapes)
-{
-    EXPECT_EQ(unescapeDataPathKey(R"("key\"name")"), R"(key"name)");
-    EXPECT_EQ(unescapeDataPathKey(R"("key\\name")"), R"(key\name)");
-}
-
-TEST_F(DependencyTrackerTest, EscapeUnescapeRoundtrip)
-{
-    // Roundtrip: unescape(escape(key)) == key for all keys
-    std::vector<std::string> keys = {
-        "simple", "key.name", "key[0]", R"(key"name)", R"(key\name)",
-        "#has:foo", "x#len", "#keys", "", "a.b.c[1].d"
-    };
-    for (auto & key : keys) {
-        EXPECT_EQ(unescapeDataPathKey(escapeDataPathKey(key)), key)
-            << "Roundtrip failed for key: " << key;
-    }
-}
-
-// ── buildStructuredDepKey raw suffix overload ─────────────────────────
-
-TEST_F(DependencyTrackerTest, BuildStructuredDepKey_RawSuffix)
-{
-    auto key = buildStructuredDepKey("/file.json", StructuredFormat::Json, ".obj", "#has:x");
-    EXPECT_EQ(key, "/file.json\tj:.obj#has:x");
-}
-
-TEST_F(DependencyTrackerTest, BuildStructuredDepKey_RawSuffixEmptyPath)
-{
-    auto key = buildStructuredDepKey("/file.json", StructuredFormat::Json, "", "#has:x");
-    EXPECT_EQ(key, "/file.json\tj:#has:x");
+    DepSourceId a(1), b(1), c(2);
+    EXPECT_EQ(a, b);
+    EXPECT_NE(a, c);
+    EXPECT_LT(a, c);
 }
 
 } // namespace nix::eval_trace

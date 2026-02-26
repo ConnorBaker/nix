@@ -56,49 +56,27 @@ struct TracedDataNode : gc {
  * For objects/arrays: creates lazy attrsets/lists with thunks pointing to
  * child ExprTracedData nodes. No dep is recorded for containers — the key
  * set is eagerly materialized as part of the attrset structure, but only
- * the whole-file Content dep (from readFile) covers it. This is intentional:
- *
- *   - If code only iterates keys (e.g., mapAttrs, attrNames) without
- *     forcing leaf values, no StructuredContent deps are recorded.
- *     The Content dep alone controls invalidation → any file change
- *     triggers re-evaluation. This is correct because the key set IS
- *     part of the cached result's structure.
- *
- *   - If code accesses specific leaf values (e.g., result.nixpkgs.rev),
- *     StructuredContent deps are recorded for those leaves. The two-level
- *     override allows the trace to survive key-set changes (additions,
- *     removals) because the cached result is the leaf value, not the
- *     full attrset.
- *
- *   - Attrset keys get PosIdx with Pos::TracedData origin at creation time.
- *     Shape-observing builtins (attrNames, hasAttr) use PosTable::originOf()
- *     on Attr::pos to find TracedData provenance and record StructuredContent
- *     shape deps (#keys, #has:key). PosIdx survives attrset operations (//).
- *
- *   - List Values are registered in a thread-local provenance map
- *     (see registerTracedContainer in dependency-tracker.hh). Shape-observing
- *     builtins (length) check this map and record #len shape deps.
- *     The map key is the first-element Value* that survives Value copies.
+ * the whole-file Content dep (from readFile) covers it.
  *
  * For scalars: records a StructuredContent dep (BLAKE3 of canonical value)
  * and materializes the Nix value.
  *
- * The dep key format is: "filepath\tf:datapath" where f is the format tag
- * and datapath uses '.' for object keys and '[N]' for array indices.
- * Keys containing '.', '[', ']', '"', or '\' are quoted: "key\.with\.dots".
+ * Uses interned IDs (session-scoped pools) instead of strings to avoid
+ * O(N) string allocation during tree construction. JSON dep keys are
+ * constructed only for non-duplicate deps at recording time.
  */
 struct ExprTracedData : Expr, gc {
     TracedDataNode * node;
-    std::string depSource;  // flake input name (from provenance resolution)
-    std::string depKey;     // base file path (before \t separator)
-    std::string dataPath;   // dot/bracket path within data structure
+    DepSourceId sourceId;   ///< interned dep source (flake input name)
+    FilePathId filePathId;  ///< interned file path
+    DataPathId dataPathId;  ///< DataPath trie node
 
-    ExprTracedData(TracedDataNode * node, std::string depSource,
-                   std::string depKey, std::string dataPath)
+    ExprTracedData(TracedDataNode * node, DepSourceId sourceId,
+                   FilePathId filePathId, DataPathId dataPathId)
         : node(node)
-        , depSource(std::move(depSource))
-        , depKey(std::move(depKey))
-        , dataPath(std::move(dataPath))
+        , sourceId(sourceId)
+        , filePathId(filePathId)
+        , dataPathId(dataPathId)
     {}
 
     void eval(EvalState & state, Env & env, Value & v) override;

@@ -26,7 +26,7 @@ TEST_F(DepPrecisionTest, With_FieldAccess_RecordsContent)
     EXPECT_TRUE(hasDep(deps, DepType::Content, ""))
         << "with field access should record Content dep\n" << dumpDeps(deps);
     // `with` doesn't call attrNames/hasAttr/typeOf → no shape deps
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "with field access should NOT record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -38,7 +38,7 @@ TEST_F(DepPrecisionTest, With_DirectAttrNames_RecordsSCKeys)
     // attrNames on the original traced data (not a derived attrset)
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "with + direct attrNames on traced data should record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -49,7 +49,7 @@ TEST_F(DepPrecisionTest, With_HasAttr_RecordsSCHasKey)
         "let d = {}; in with d; d ? x", fj(f.path));
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
         << "with + hasAttr on traced data should record SC #has:x\n" << dumpDeps(deps);
 }
 
@@ -65,7 +65,7 @@ TEST_F(DepPrecisionTest, InheritFrom_NoSCKeys)
     auto deps = evalAndCollectDeps(expr);
 
     // The new attrset has Nix-defined attrs, not TracedData
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "inherit (expr) creates Nix attrset — no SC #keys on result\n" << dumpDeps(deps);
 }
 
@@ -100,7 +100,7 @@ TEST_F(DepPrecisionTest, RecAttrset_AttrNamesOnTraced_RecordsSCKeys)
         "let d = {}; in (rec {{ keys = builtins.attrNames d; data = d; }}).keys", fj(f.path));
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "rec attrset with attrNames on traced data should record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -116,9 +116,9 @@ TEST_F(DepPrecisionTest, StringInterp_TracedField_RecordsContent)
     EXPECT_TRUE(hasDep(deps, DepType::Content, ""))
         << "String interpolation of traced field should record Content dep\n" << dumpDeps(deps);
     // String interpolation doesn't call attrNames/hasAttr/typeOf
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "String interpolation should NOT record SC #keys\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "String interpolation should NOT record SC #type\n" << dumpDeps(deps);
 }
 
@@ -144,7 +144,7 @@ TEST_F(DepPrecisionTest, Arithmetic_Add_RecordsContent)
 
     EXPECT_TRUE(hasDep(deps, DepType::Content, ""))
         << "Arithmetic on traced values should record Content dep\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Arithmetic should NOT record SC #keys\n" << dumpDeps(deps);
 }
 

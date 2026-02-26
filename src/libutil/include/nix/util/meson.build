@@ -84,6 +84,7 @@ headers = files(
   'terminal.hh',
   'thread-pool.hh',
   'topo-sort.hh',
+  'traced-data-ids.hh',
   'types.hh',
   'unix-domain-socket.hh',
   'url-parts.hh',

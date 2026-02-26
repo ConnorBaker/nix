@@ -300,6 +300,7 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
                      < std::string_view(st.symbols[b]);
             });
         // Capture per-attr TracedData origins for cross-scope materialization.
+        // Resolve interned IDs back to strings for serialization.
         if (target.attrs()->hasAnyTracedDataLayer()) {
             result.originIndices.resize(result.names.size(), -1);
             for (size_t i = 0; i < result.names.size(); i++) {
@@ -309,12 +310,16 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
                 if (!origin) continue;
                 auto * df = std::get_if<Pos::TracedData>(origin);
                 if (!df) continue;
-                // Deduplicate origins by identity
+                // Resolve interned IDs to strings for storage
+                auto depSource = std::string(resolveDepSource(df->sourceId));
+                auto depKey = std::string(resolveFilePath(df->filePathId));
+                auto dataPath = dataPathToJsonString(df->dataPathId);
+                // Deduplicate origins by resolved values
                 int8_t idx = -1;
                 for (size_t j = 0; j < result.origins.size(); j++) {
-                    if (result.origins[j].depSource == df->depSource
-                        && result.origins[j].depKey == df->depKey
-                        && result.origins[j].dataPath == df->dataPath
+                    if (result.origins[j].depSource == depSource
+                        && result.origins[j].depKey == depKey
+                        && result.origins[j].dataPath == dataPath
                         && result.origins[j].format == df->format) {
                         idx = static_cast<int8_t>(j);
                         break;
@@ -322,11 +327,11 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
                 }
                 if (idx < 0) {
                     idx = static_cast<int8_t>(result.origins.size());
-                    result.origins.push_back({df->depSource, df->depKey, df->dataPath, df->format});
+                    result.origins.push_back({std::move(depSource), std::move(depKey),
+                                              std::move(dataPath), df->format});
                 }
                 result.originIndices[i] = idx;
             }
-            // If no TracedData attrs found, clear the vectors
             if (result.origins.empty()) {
                 result.originIndices.clear();
             }
@@ -370,7 +375,7 @@ void TracedExpr::materializeOrigExprAttrs(
     auto & st = cache->state;
     auto bindings = st.buildBindings(attrs.names.size());
 
-    // When origins are present, register them with PosTable and precomputedKeysMap
+    // When origins are present, re-intern and register with PosTable
     // so that downstream shape dep recording (SC #keys, #has:key, #type) works.
     struct PerOrigin {
         PosTable::OriginHandle handle;
@@ -378,14 +383,17 @@ void TracedExpr::materializeOrigExprAttrs(
     };
     std::vector<PerOrigin> originHandles;
     if (!attrs.origins.empty()) {
+        initSessionSymbols(st.symbols);
         originHandles.reserve(attrs.origins.size());
-        // Count attrs per origin for OriginHandle sizing
         std::vector<uint32_t> counts(attrs.origins.size(), 0);
         for (auto idx : attrs.originIndices)
             if (idx >= 0) counts[idx]++;
         for (auto & orig : attrs.origins) {
+            auto srcId = internDepSource(orig.depSource);
+            auto fpId = internFilePath(orig.depKey);
+            auto dpId = jsonStringToDataPathId(orig.dataPath, st.symbols);
             auto handle = st.positions.addOriginHandle(
-                Pos::TracedData{orig.depSource, orig.depKey, orig.dataPath, orig.format},
+                Pos::TracedData{srcId, fpId, dpId, orig.format},
                 counts[&orig - attrs.origins.data()]);
             originHandles.push_back({handle, 0});
         }
@@ -427,13 +435,14 @@ void TracedExpr::materializeOrigExprAttrs(
                 canonical += keys[i];
             }
             auto keysHash = depHash(canonical);
-            auto keysKey = buildStructuredDepKey(orig.depKey, *fmt, orig.dataPath, ShapeSuffix::Keys);
+            auto srcId = internDepSource(orig.depSource);
+            auto fpId = internFilePath(orig.depKey);
+            auto dpId = jsonStringToDataPathId(orig.dataPath, st.symbols);
             auto originOffset = originHandles[oidx].handle.offset;
             registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
                 keysHash,
                 static_cast<uint32_t>(keys.size()),
-                keysKey,
-                orig.depSource,
+                srcId, fpId, dpId, *fmt,
             });
         }
     }
@@ -527,20 +536,24 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
     if (auto * attrs = std::get_if<attrs_t>(&cached)) {
         auto bindings = st.buildBindings(attrs->names.size());
 
-        // When origins are present, register them with PosTable for TracedData provenance
+        // When origins are present, re-intern and register with PosTable for TracedData provenance
         struct PerOrigin {
             PosTable::OriginHandle handle;
             uint32_t attrCount = 0;
         };
         std::vector<PerOrigin> originHandles;
         if (!attrs->origins.empty()) {
+            initSessionSymbols(st.symbols);
             originHandles.reserve(attrs->origins.size());
             std::vector<uint32_t> counts(attrs->origins.size(), 0);
             for (auto idx : attrs->originIndices)
                 if (idx >= 0) counts[idx]++;
             for (auto & orig : attrs->origins) {
+                auto srcId = internDepSource(orig.depSource);
+                auto fpId = internFilePath(orig.depKey);
+                auto dpId = jsonStringToDataPathId(orig.dataPath, st.symbols);
                 auto handle = st.positions.addOriginHandle(
-                    Pos::TracedData{orig.depSource, orig.depKey, orig.dataPath, orig.format},
+                    Pos::TracedData{srcId, fpId, dpId, orig.format},
                     counts[&orig - attrs->origins.data()]);
                 originHandles.push_back({handle, 0});
             }
@@ -579,13 +592,14 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
                     canonical += keys[i];
                 }
                 auto keysHash = depHash(canonical);
-                auto keysKey = buildStructuredDepKey(orig.depKey, *fmt, orig.dataPath, ShapeSuffix::Keys);
+                auto srcId = internDepSource(orig.depSource);
+                auto fpId = internFilePath(orig.depKey);
+                auto dpId = jsonStringToDataPathId(orig.dataPath, st.symbols);
                 auto originOffset = originHandles[oidx].handle.offset;
                 registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
                     keysHash,
                     static_cast<uint32_t>(keys.size()),
-                    keysKey,
-                    orig.depSource,
+                    srcId, fpId, dpId, *fmt,
                 });
             }
         }

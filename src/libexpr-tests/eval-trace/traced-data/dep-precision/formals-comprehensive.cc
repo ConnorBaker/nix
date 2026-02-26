@@ -38,11 +38,11 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_TwoFields_RecordsSCKeysAndValues)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Strict formals must record SC #keys\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:b"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
         << "Field b accessed in body\n" << dumpDeps(deps);
     EXPECT_TRUE(hasDep(deps, DepType::Content, ""))
         << "Must have Content dep for file read\n" << dumpDeps(deps);
@@ -55,11 +55,11 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_PartialAccess_RecordsKeysAndAcces
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Strict formals must record SC #keys\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "j:b"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
         << "Field b not accessed in body — no SC dep\n" << dumpDeps(deps);
 }
 
@@ -70,11 +70,11 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_WithDefault_PresentField_RecordsV
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Strict formals must record SC #keys\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:b"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
         << "Field b present and accessed in body\n" << dumpDeps(deps);
 }
 
@@ -85,11 +85,11 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_WithDefault_MissingField_NoValueD
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Strict formals must record SC #keys\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "j:b"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
         << "Field b missing (default used) — no SC value dep\n" << dumpDeps(deps);
 }
 
@@ -100,11 +100,11 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_Named_RecordsSCKeys)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Named strict formals must record SC #keys\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed via formal\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:b"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
         << "Field b accessed via args.b\n" << dumpDeps(deps);
 }
 
@@ -115,7 +115,7 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_EmptyObject_RecordsSCKeys)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Empty strict formals must record SC #keys (empty key set hash)\n" << dumpDeps(deps);
 }
 
@@ -130,7 +130,7 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_NoSCType)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "Formals should not record #type\n" << dumpDeps(deps);
 }
 
@@ -141,7 +141,7 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_NoSCHasKey)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#has:"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, [](const nlohmann::json & j) { return j.contains("h"); }))
         << "Formals use get(), not ? operator — no #has: deps\n" << dumpDeps(deps);
 }
 
@@ -156,11 +156,11 @@ TEST_F(FormalsComprehensiveTest, EllipsisFormals_SingleField_RecordsValueOnly)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed in body\n" << dumpDeps(deps);
     EXPECT_TRUE(hasDep(deps, DepType::Content, ""))
         << "Must have Content dep for file read\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Ellipsis formals must NOT record #keys\n" << dumpDeps(deps);
 }
 
@@ -171,11 +171,11 @@ TEST_F(FormalsComprehensiveTest, EllipsisFormals_TwoFields_RecordsValuesOnly)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:b"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
         << "Field b accessed in body\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Ellipsis formals must NOT record #keys\n" << dumpDeps(deps);
 }
 
@@ -186,11 +186,11 @@ TEST_F(FormalsComprehensiveTest, EllipsisFormals_WithDefault_Present_RecordsValu
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:b"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
         << "Field b present and accessed in body\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Ellipsis formals must NOT record #keys\n" << dumpDeps(deps);
 }
 
@@ -201,11 +201,11 @@ TEST_F(FormalsComprehensiveTest, EllipsisFormals_WithDefault_Missing_NoValueDep)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Ellipsis formals must NOT record #keys\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "j:b"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
         << "Field b missing (default used) — no SC value dep\n" << dumpDeps(deps);
 }
 
@@ -216,9 +216,9 @@ TEST_F(FormalsComprehensiveTest, EllipsisFormals_Named_NoSCKeys)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Named ellipsis formals must NOT record #keys\n" << dumpDeps(deps);
 }
 
@@ -234,7 +234,7 @@ TEST_F(FormalsComprehensiveTest, EllipsisFormals_AttrNamesOnArg_RecordsSCKeysVia
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "attrNames records SC #keys even with ellipsis formals\n" << dumpDeps(deps);
 }
 
@@ -249,9 +249,9 @@ TEST_F(FormalsComprehensiveTest, EllipsisFormals_AttrNamesOnArg_PlusFieldAccess)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "#keys from attrNames, not from formals\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "j:a from field access\n" << dumpDeps(deps);
 }
 
@@ -266,13 +266,13 @@ TEST_F(FormalsComprehensiveTest, SingleArg_FieldAccess_NoSCKeys)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed via x.a\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:b"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
         << "Field b accessed via x.b\n" << dumpDeps(deps);
     EXPECT_TRUE(hasDep(deps, DepType::Content, ""))
         << "Must have Content dep for file read\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "No formals matching — no #keys\n" << dumpDeps(deps);
 }
 
@@ -283,7 +283,7 @@ TEST_F(FormalsComprehensiveTest, SingleArg_AttrNames_RecordsSCKeysViaBuiltin)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "attrNames records SC #keys\n" << dumpDeps(deps);
 }
 
@@ -301,7 +301,7 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_Merged_RecordsSCKeysPerOrigin)
     auto deps = evalAndCollectDeps(expr);
 
     // Strict formals on merged TracedData records #keys per origin
-    auto keysCount = countDeps(deps, DepType::StructuredContent, "#keys");
+    auto keysCount = countJsonDeps(deps, DepType::StructuredContent, shapePred("keys"));
     EXPECT_GE(keysCount, 2u)
         << "Strict formals on merged data should record #keys per origin\n" << dumpDeps(deps);
 }
@@ -315,9 +315,9 @@ TEST_F(FormalsComprehensiveTest, EllipsisFormals_Merged_NoSCKeys)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "Field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Ellipsis on merged TracedData: no #keys from formals\n" << dumpDeps(deps);
 }
 
@@ -336,11 +336,11 @@ TEST_F(FormalsComprehensiveTest, NestedStrict_OuterStrictInnerEllipsis)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "j:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "f's application: field a accessed\n" << dumpDeps(deps);
     EXPECT_TRUE(hasDep(deps, DepType::Content, ""))
         << "Must have Content dep for file read\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Neither formals call records #keys on TracedData\n" << dumpDeps(deps);
 }
 
@@ -356,7 +356,7 @@ TEST_F(FormalsComprehensiveTest, NestedEllipsis_PassThrough)
 
     EXPECT_TRUE(hasDep(deps, DepType::Content, ""))
         << "Must have Content dep for file read\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Ellipsis formals: no #keys\n" << dumpDeps(deps);
 }
 
@@ -372,7 +372,7 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_ResultPassedToAttrNames)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Strict formals on TracedData input records SC #keys\n" << dumpDeps(deps);
 }
 
@@ -387,11 +387,11 @@ TEST_F(FormalsComprehensiveTest, StrictFormals_TOML_RecordsSCKeys)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Strict formals on TOML data must record SC #keys\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "t:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "TOML field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "t:b"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
         << "TOML field b accessed in body\n" << dumpDeps(deps);
 }
 
@@ -402,9 +402,9 @@ TEST_F(FormalsComprehensiveTest, EllipsisFormals_TOML_NoSCKeys)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "t:a"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
         << "TOML field a accessed in body\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "Ellipsis formals on TOML data must NOT record #keys\n" << dumpDeps(deps);
 }
 

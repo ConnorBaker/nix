@@ -27,7 +27,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, FlakeLockParsing_NestedScalar_CacheHit)
         auto deps = evalAndCollectDeps(expr);
         EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "rev"))
             << "Nested scalar access records SC dep\n" << dumpDeps(deps);
-        EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << "Pure scalar access must NOT record SC #keys\n" << dumpDeps(deps);
     }
 
@@ -86,7 +86,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, CallPackage_OverridePattern_CacheHit)
         auto deps = evalAndCollectDeps(expr);
         EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "name"))
             << dumpDeps(deps);
-        EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << "// must NOT record SC #keys\n" << dumpDeps(deps);
     }
 
@@ -211,7 +211,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, NixpkgsAllPackages_MapAttrs_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << "mapAttrs -> attrNames records SC #keys\n" << dumpDeps(deps);
     }
 
@@ -277,7 +277,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, PackageSet_FilterBroken_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << "attrNames on removeAttrs records SC #keys\n" << dumpDeps(deps);
     }
 
@@ -343,7 +343,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, WithPackages_Pattern_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << "attrNames records SC #keys\n" << dumpDeps(deps);
     }
 

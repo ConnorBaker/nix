@@ -18,6 +18,8 @@
 #include <string>
 #include <string_view>
 
+#include <nlohmann/json.hpp>
+
 namespace nix::eval_trace::test {
 
 // ── RAII environment helpers ────────────────────────────────────────
@@ -431,7 +433,68 @@ protected:
         return tracker.collectTraces();
     }
 
-    /// Count deps of a given type whose key contains a substring.
+    /**
+     * Try to parse a dep key as JSON. Returns nullopt for non-JSON keys
+     * (Content, Directory, EnvVar, etc. use plain strings).
+     */
+    static std::optional<nlohmann::json> parseDepKey(const Dep & d)
+    {
+        if (d.key.empty() || d.key[0] != '{') return std::nullopt;
+        try { return nlohmann::json::parse(d.key); }
+        catch (...) { return std::nullopt; }
+    }
+
+    /**
+     * Count StructuredContent/ImplicitShape deps matching a JSON predicate.
+     * The predicate receives the parsed JSON dep key.
+     */
+    static size_t countJsonDeps(const std::vector<Dep> & deps, DepType type,
+                                std::function<bool(const nlohmann::json &)> pred)
+    {
+        size_t n = 0;
+        for (auto & d : deps) {
+            if (d.type != type) continue;
+            auto j = parseDepKey(d);
+            if (j && pred(*j)) n++;
+        }
+        return n;
+    }
+
+    /// Check if any dep of a given type has a JSON key matching a predicate.
+    static bool hasJsonDep(const std::vector<Dep> & deps, DepType type,
+                           std::function<bool(const nlohmann::json &)> pred)
+    {
+        return countJsonDeps(deps, type, std::move(pred)) > 0;
+    }
+
+    /// Match a #has:key dep: {"h": keyName, ...}
+    static auto hasKeyPred(const std::string & keyName)
+    {
+        return [=](const nlohmann::json & j) {
+            return j.contains("h") && j["h"].get<std::string>() == keyName;
+        };
+    }
+
+    /// Match a shape suffix dep: {"s": suffixName, ...}
+    static auto shapePred(const std::string & suffixName)
+    {
+        return [=](const nlohmann::json & j) {
+            return j.contains("s") && j["s"].get<std::string>() == suffixName;
+        };
+    }
+
+    /// Match any dep whose JSON path array contains these components (in order).
+    static auto pathContainsPred(const nlohmann::json & expectedPath)
+    {
+        return [=](const nlohmann::json & j) {
+            return j.contains("p") && j["p"] == expectedPath;
+        };
+    }
+
+    /**
+     * Count deps of a given type whose key contains a substring.
+     * For non-JSON keys (Content, EnvVar, etc.), does plain substring matching.
+     */
     static size_t countDeps(const std::vector<Dep> & deps, DepType type, const std::string & keySubstr)
     {
         size_t n = 0;

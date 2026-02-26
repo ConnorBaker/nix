@@ -27,7 +27,7 @@ TEST_F(DepPrecisionPipelinesTest, FilterMapLength_CacheMiss)
     // -- Dep verification --
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#len"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("len")))
             << "Pipeline must record SC #len\n" << dumpDeps(deps);
     }
 
@@ -63,7 +63,7 @@ TEST_F(DepPrecisionPipelinesTest, AttrNamesMapListToAttrs_CacheMiss)
     // (not TracedData), so attrNames does NOT record SC #keys on it
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#len"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("len")))
             << "listToAttrs records SC #len on input\n" << dumpDeps(deps);
     }
 
@@ -98,7 +98,7 @@ TEST_F(DepPrecisionPipelinesTest, UpdateMapAttrsAttrNames_CacheMiss)
     // -- Dep verification --
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("keys")))
             << "IS #keys from both sources\n" << dumpDeps(deps);
     }
 
@@ -213,9 +213,9 @@ TEST_F(DepPrecisionPipelinesTest, NestedUpdateScalarAccess_CacheHit)
         auto deps = evalAndCollectDeps(expr);
         EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "key"))
             << "Nested scalar access must record SC dep\n" << dumpDeps(deps);
-        EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << "No SC #keys from //\n" << dumpDeps(deps);
-        EXPECT_GE(countDeps(deps, DepType::ImplicitShape, "#keys"), 3u)
+        EXPECT_GE(countJsonDeps(deps, DepType::ImplicitShape, shapePred("keys")), 3u)
             << "IS #keys from all 3 sources\n" << dumpDeps(deps);
     }
 
@@ -248,7 +248,7 @@ TEST_F(DepPrecisionPipelinesTest, MapAttrsFilterAttrNames_CacheMiss)
     // -- Dep verification --
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << "attrNames after mapAttrs records SC #keys\n" << dumpDeps(deps);
     }
 

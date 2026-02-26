@@ -6,6 +6,7 @@
 #include "nix/util/serialise.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/std-hash.hh"
+#include "nix/util/traced-data-ids.hh"
 #include "nix/util/util.hh"
 
 #include <array>
@@ -76,15 +77,15 @@ enum class DepType : uint8_t {
      *  Unlike Content (raw bytes only), this detects chmod +x changes. */
     NARContent = 11,
     /** BLAKE3 of canonical representation of a scalar at a data path within
-     *  a structured source (JSON/TOML file or directory listing). Key format:
-     *  "filepath\tf:datapath" where f is format tag ('j'=JSON, 't'=TOML, 'd'=directory).
+     *  a structured source (JSON/TOML file or directory listing). Key is a
+     *  JSON object: {"f":"path","t":"j","p":["nodes","rev"],"s":"keys","h":"key"}.
      *  Enables two-level verification: if Content/Directory dep fails but all
      *  StructuredContent deps pass, trace is valid. */
     StructuredContent = 12,
     /** Creation-time structural fingerprint (#keys, #len) recorded by
-     *  ExprTracedData::eval() when materializing containers. Same key format
-     *  as StructuredContent. Always ignored during verification — serves as
-     *  a conservative bound that doesn't block fine-grained override. */
+     *  ExprTracedData::eval() when materializing containers. Same JSON key
+     *  format as StructuredContent. Always ignored during verification — serves
+     *  as a conservative bound that doesn't block fine-grained override. */
     ImplicitShape = 13,
     /** Raw readFile content observed by a string builtin (stringLength, hashString,
      *  substring, match, split, replaceStrings) or eqValues. Recorded at the
@@ -317,7 +318,7 @@ inline bool isBlake3Dep(DepType type) {
 
 /**
  * Format tag for StructuredContent deps identifying the data source type.
- * Stored as a single char in dep keys: "filepath\tf:datapath".
+ * Stored as the "t" field in JSON dep keys: {"t":"j",...}.
  */
 enum class StructuredFormat : char {
     Json      = 'j',
@@ -371,21 +372,6 @@ enum class ShapeSuffix : uint8_t {
 };
 
 /**
- * Wire-format string for a ShapeSuffix (appended to data path in dep keys).
- * Returns "", "#len", or "#keys".
- */
-inline constexpr std::string_view shapeSuffixString(ShapeSuffix s)
-{
-    switch (s) {
-    case ShapeSuffix::None: return "";
-    case ShapeSuffix::Len: return "#len";
-    case ShapeSuffix::Keys: return "#keys";
-    case ShapeSuffix::Type: return "#type";
-    }
-    unreachable();
-}
-
-/**
  * Display name for a ShapeSuffix (for diagnostics).
  * Returns "", "len", "keys", or "type".
  */
@@ -398,145 +384,6 @@ inline constexpr std::string_view shapeSuffixName(ShapeSuffix s)
     case ShapeSuffix::Type: return "type";
     }
     unreachable();
-}
-
-/**
- * Parse a data path, splitting off any trailing shape suffix (#len or #keys).
- * Returns the base data path (without suffix) and the parsed ShapeSuffix.
- */
-inline std::pair<std::string, ShapeSuffix> parseShapeSuffix(std::string_view dataPath)
-{
-    if (dataPath.size() >= 4 && dataPath.substr(dataPath.size() - 4) == "#len")
-        return {std::string(dataPath.substr(0, dataPath.size() - 4)), ShapeSuffix::Len};
-    if (dataPath.size() >= 5 && dataPath.substr(dataPath.size() - 5) == "#keys")
-        return {std::string(dataPath.substr(0, dataPath.size() - 5)), ShapeSuffix::Keys};
-    if (dataPath.size() >= 5 && dataPath.substr(dataPath.size() - 5) == "#type")
-        return {std::string(dataPath.substr(0, dataPath.size() - 5)), ShapeSuffix::Type};
-    return {std::string(dataPath), ShapeSuffix::None};
-}
-
-/**
- * Build a StructuredContent dep key in the canonical wire format:
- *   "filepath\tf:datapath[#suffix]"
- */
-inline std::string buildStructuredDepKey(
-    std::string_view depKey, StructuredFormat format,
-    std::string_view dataPath, ShapeSuffix shape = ShapeSuffix::None)
-{
-    std::string result;
-    result.reserve(depKey.size() + 3 + dataPath.size() + 5);
-    result += depKey;
-    result += '\t';
-    result += structuredFormatChar(format);
-    result += ':';
-    result += dataPath;
-    result += shapeSuffixString(shape);
-    return result;
-}
-
-/**
- * Build a StructuredContent dep key with a raw string suffix (e.g., "#has:key").
- * The suffix is appended verbatim — caller must ensure it is properly escaped
- * (use escapeDataPathKey for key names embedded in the suffix).
- */
-inline std::string buildStructuredDepKey(
-    std::string_view depKey, StructuredFormat format,
-    std::string_view dataPath, std::string_view rawSuffix)
-{
-    std::string result;
-    result.reserve(depKey.size() + 3 + dataPath.size() + rawSuffix.size());
-    result += depKey;
-    result += '\t';
-    result += structuredFormatChar(format);
-    result += ':';
-    result += dataPath;
-    result += rawSuffix;
-    return result;
-}
-
-/**
- * Escape a data path key segment for use in dep key construction.
- * Keys containing '.', '[', ']', '"', '\', or '#' are quoted with "..."
- * and inner '"' / '\' are backslash-escaped.
- *
- * The '#' quoting is critical for preventing ambiguity with shape suffixes
- * (#len, #keys, #type) and #has: prefixes. A key like "#has:foo" is escaped
- * to "\"#has:foo\"", which cannot collide with the #has: dep key syntax
- * because the quoted form never appears bare in a data path.
- *
- * Inverse: unescapeDataPathKey (must be used when parsing #has:key from dep keys).
- */
-inline std::string escapeDataPathKey(std::string_view key)
-{
-    bool needsQuote = false;
-    for (char c : key) {
-        if (c == '.' || c == '[' || c == ']' || c == '"' || c == '\\' || c == '#') {
-            needsQuote = true;
-            break;
-        }
-    }
-    if (!needsQuote) return std::string(key);
-
-    std::string out;
-    out.reserve(key.size() + 4);
-    out += '"';
-    for (char c : key) {
-        if (c == '"' || c == '\\')
-            out += '\\';
-        out += c;
-    }
-    out += '"';
-    return out;
-}
-
-/**
- * Unescape a single data path key segment. Reverses escapeDataPathKey.
- */
-inline std::string unescapeDataPathKey(std::string_view key)
-{
-    if (key.size() >= 2 && key.front() == '"' && key.back() == '"') {
-        std::string result;
-        result.reserve(key.size() - 2);
-        for (size_t i = 1; i + 1 < key.size(); i++) {
-            if (key[i] == '\\' && i + 2 < key.size())
-                i++; // skip backslash
-            result += key[i];
-        }
-        return result;
-    }
-    return std::string(key);
-}
-
-/**
- * Parse and pretty-print a StructuredContent dep key for diagnostics.
- * Input:  "flake.lock\tj:.nodes.nixpkgs.locked.rev#len"
- * Output: "flake.lock [json] .nodes.nixpkgs.locked.rev #len"
- * Falls back to the raw key on parse failure.
- */
-inline std::string formatStructuredDepKey(std::string_view key)
-{
-    auto sep = key.find('\t');
-    if (sep == std::string::npos || sep + 2 >= key.size())
-        return std::string(key);
-    auto format = parseStructuredFormat(key[sep + 1]);
-    if (!format || key[sep + 2] != ':')
-        return std::string(key);
-    auto filePath = key.substr(0, sep);
-    auto dataPathWithSuffix = key.substr(sep + 3);
-    auto [dataPath, shape] = parseShapeSuffix(dataPathWithSuffix);
-
-    std::string result;
-    result += filePath;
-    result += " [";
-    result += structuredFormatName(*format);
-    result += "] ";
-    result += dataPath;
-    auto suffix = shapeSuffixString(shape);
-    if (!suffix.empty()) {
-        result += ' ';
-        result += suffix;
-    }
-    return result;
 }
 
 /**

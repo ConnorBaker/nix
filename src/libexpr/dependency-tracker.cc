@@ -15,6 +15,8 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <deque>
 #include <filesystem>
 
@@ -30,6 +32,154 @@ thread_local DependencyTracker * DependencyTracker::activeTracker = nullptr;
 // Per-thread append-only dependency vector (Shake: the "journal" of all
 // dependencies observed during this evaluation session).
 thread_local std::vector<Dep> DependencyTracker::sessionTraces;
+
+// ═══════════════════════════════════════════════════════════════════════
+// Component interning pools — zero-allocation dep key construction
+// ═══════════════════════════════════════════════════════════════════════
+
+// StringPool16: intern strings to uint16_t indices. Process-lifetime (not cleared
+// per-session) because GC-heap ExprTracedData thunks hold interned IDs.
+struct StringPool16 {
+    std::vector<std::string> strings;
+    boost::unordered_flat_map<std::string, uint16_t> lookup;
+
+    uint16_t intern(std::string_view sv) {
+        std::string key(sv);
+        auto it = lookup.find(key);
+        if (it != lookup.end()) return it->second;
+        uint16_t id = static_cast<uint16_t>(strings.size());
+        strings.push_back(key);
+        lookup.emplace(std::move(key), id);
+        return id;
+    }
+
+    std::string_view resolve(uint16_t id) const { return strings[id]; }
+
+    // Intentionally no clear(): GC-heap ExprTracedData thunks hold interned
+    // IDs that must remain valid across DependencyTracker lifetimes. The pool
+    // grows monotonically, bounded by unique file paths (typically <100).
+};
+
+// DataPathPool: trie of path components. Process-lifetime (same reason as StringPool16).
+struct DataPathNode {
+    uint32_t parentId;      // 0 = root
+    Symbol component;       // object key (interned in SymbolTable)
+    int32_t arrayIndex;     // -1 if object key, >=0 if array index
+};
+
+struct DataPathPool {
+    std::vector<DataPathNode> nodes;
+    boost::unordered_flat_map<uint64_t, uint32_t> lookup;
+
+    DataPathPool() {
+        // Node 0 is the root sentinel (empty path)
+        nodes.push_back({0, Symbol{}, -1});
+    }
+
+    uint32_t internChild(uint32_t parentId, Symbol key) {
+        uint64_t h = hashValues(uint8_t(0), parentId, key.getId());
+        auto [it, inserted] = lookup.try_emplace(h, 0);
+        if (!inserted) return it->second;
+        uint32_t id = static_cast<uint32_t>(nodes.size());
+        nodes.push_back({parentId, key, -1});
+        it->second = id;
+        return id;
+    }
+
+    uint32_t internArrayChild(uint32_t parentId, int32_t index) {
+        uint64_t h = hashValues(uint8_t(1), parentId, index);
+        auto [it, inserted] = lookup.try_emplace(h, 0);
+        if (!inserted) return it->second;
+        uint32_t id = static_cast<uint32_t>(nodes.size());
+        nodes.push_back({parentId, Symbol{}, index});
+        it->second = id;
+        return id;
+    }
+
+    nlohmann::json toJsonArray(uint32_t nodeId, const SymbolTable & symbols) const {
+        nlohmann::json arr = nlohmann::json::array();
+        std::vector<uint32_t> path;
+        uint32_t cur = nodeId;
+        while (cur != 0) {
+            path.push_back(cur);
+            cur = nodes[cur].parentId;
+        }
+        std::reverse(path.begin(), path.end());
+        for (auto id : path) {
+            auto & node = nodes[id];
+            if (node.arrayIndex >= 0)
+                arr.push_back(node.arrayIndex);
+            else
+                arr.push_back(std::string(symbols[node.component]));
+        }
+        return arr;
+    }
+
+    // Intentionally no clear(): same lifetime rationale as StringPool16.
+    // Bounded by total JSON/TOML/directory structure size across all evaluated files.
+};
+
+static thread_local StringPool16 depSourcePool;
+static thread_local StringPool16 filePathPool;
+static thread_local DataPathPool dataPathPool;
+static thread_local const SymbolTable * sessionSymbols = nullptr;
+
+// Cached constant Blake3Hash values used in shape dep recording.
+// Function-local statics avoid static initialization order issues across TUs.
+static const Blake3Hash & kHashZero()   { static const auto h = depHash("0"); return h; }
+static const Blake3Hash & kHashOne()    { static const auto h = depHash("1"); return h; }
+static const Blake3Hash & kHashObject() { static const auto h = depHash("object"); return h; }
+static const Blake3Hash & kHashArray()  { static const auto h = depHash("array"); return h; }
+static const Blake3Hash & kHashEmpty()  { static const auto h = depHash(""); return h; }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Pool accessor functions (declared in dependency-tracker.hh)
+// ═══════════════════════════════════════════════════════════════════════
+
+DepSourceId internDepSource(std::string_view sv) {
+    return DepSourceId(depSourcePool.intern(sv));
+}
+
+FilePathId internFilePath(std::string_view sv) {
+    return FilePathId(filePathPool.intern(sv));
+}
+
+std::string_view resolveDepSource(DepSourceId id) {
+    return depSourcePool.resolve(id.value);
+}
+
+std::string_view resolveFilePath(FilePathId id) {
+    return filePathPool.resolve(id.value);
+}
+
+DataPathId internDataPathChild(DataPathId parentId, Symbol key) {
+    return DataPathId(dataPathPool.internChild(parentId.value, key));
+}
+
+DataPathId internDataPathArrayChild(DataPathId parentId, int32_t index) {
+    return DataPathId(dataPathPool.internArrayChild(parentId.value, index));
+}
+
+std::string dataPathToJsonString(DataPathId nodeId) {
+    assert(sessionSymbols && "initSessionSymbols() must be called before dataPathToJsonString()");
+    return dataPathPool.toJsonArray(nodeId.value, *sessionSymbols).dump();
+}
+
+DataPathId jsonStringToDataPathId(std::string_view jsonStr, SymbolTable & symbols) {
+    auto arr = nlohmann::json::parse(jsonStr);
+    uint32_t id = 0; // root
+    for (auto & elem : arr) {
+        if (elem.is_number())
+            id = dataPathPool.internArrayChild(id, elem.get<int32_t>());
+        else
+            id = dataPathPool.internChild(id, symbols.create(elem.get<std::string>()));
+    }
+    return DataPathId(id);
+}
+
+void initSessionSymbols(const SymbolTable & symbols) {
+    sessionSymbols = &symbols;
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Traced container provenance map — shape dep tracking
@@ -50,18 +200,18 @@ static thread_local boost::unordered_flat_set<const void *> scannedBindings;
 // Cleared alongside tracedContainerMap on root DependencyTracker construction.
 static thread_local std::deque<TracedContainerProvenance> provenancePool;
 
-// Precomputed keys hash map: Pos::TracedData* → {hash, keyCount, fullKey, depSource}.
+// Precomputed keys hash map: origin offset → {hash, keyCount, interned components}.
 // Populated by ExprTracedData::eval() at creation time; consumed by maybeRecordAttrKeysDep
 // to skip sort + concat + BLAKE3 when all original keys are visible (common case).
 static thread_local boost::unordered_flat_map<uint32_t, PrecomputedKeysInfo> precomputedKeysMap;
 
 // Per-Bindings* cache of TracedData origin info for intersectAttrs.
-// Avoids re-scanning the same large attrset (e.g., allPackages with 50K attrs)
-// thousands of times across repeated intersectAttrs calls.
-// Cleared on root DependencyTracker construction.
+// Uses interned IDs to avoid string allocation during the scan.
 struct IntersectOriginInfo {
-    std::string depSource;
-    std::string keyPrefix; // depKey + '\t' + formatChar + ':' + dataPath + "#has:"
+    DepSourceId sourceId;
+    FilePathId filePathId;
+    DataPathId dataPathId;
+    StructuredFormat format;
 };
 static thread_local boost::unordered_flat_map<const Bindings *, std::vector<IntersectOriginInfo>> intersectOriginsCache;
 
@@ -74,14 +224,19 @@ void DependencyTracker::onRootConstruction()
     scannedBindings.clear();
     clearPrecomputedKeysMap();
     intersectOriginsCache.clear();
+    // Note: depSourcePool, filePathPool, dataPathPool, and sessionSymbols
+    // are NOT cleared here. ExprTracedData thunks on the GC heap hold
+    // interned IDs that must remain valid across DependencyTracker lifetimes.
+    // The pools grow monotonically for the process lifetime (same as SymbolTable).
+    // This is safe: unique file paths and dep sources are O(100), and trie
+    // nodes are bounded by the total JSON/TOML/directory structure size.
     sessionTraces.reserve(16384);
 }
 
-ProvenanceRef allocateProvenance(std::string depSource, std::string depKey,
-                                 std::string dataPath, StructuredFormat format)
+ProvenanceRef allocateProvenance(DepSourceId sourceId, FilePathId filePathId,
+                                 DataPathId dataPathId, StructuredFormat format)
 {
-    provenancePool.emplace_back(TracedContainerProvenance{
-        std::move(depSource), std::move(depKey), std::move(dataPath), format});
+    provenancePool.emplace_back(TracedContainerProvenance{sourceId, filePathId, dataPathId, format});
     return &provenancePool.back();
 }
 
@@ -111,29 +266,62 @@ void clearPrecomputedKeysMap()
     precomputedKeysMap.clear();
 }
 
-// Record a dependency edge in the dynamic dependency graph (Adapton: "add-edge").
+// Record a non-StructuredContent dependency edge (Adapton: "add-edge").
 // BSàlC §3.2: during fresh evaluation, the scheduler records each dependency
-// into the trace for later verification. Deduplication ensures each (type,
-// source, key) triple appears at most once per trace, matching Salsa's
-// "dependency de-duplication" invariant.
-void DependencyTracker::record(const Dep & dep)
+// into the trace. Hash-based dedup: >90% of record() calls are duplicates,
+// so hashing the (type, source, key) triple avoids constructing DepKey strings.
+void DependencyTracker::record(Dep dep)
 {
     if (activeTracker) {
-        DepKey key(dep);
-        if (!activeTracker->recordedKeys.insert(key).second)
+        uint64_t h = hashValues(std::to_underlying(dep.type), dep.source, dep.key);
+        if (!activeTracker->recordedKeyHashes.insert(h).second)
             return;  // Dependency already recorded in this trace scope — skip duplicate
     }
     debug("recording %s (%s) dep: input='%s' key='%s'",
-        depTypeName(dep.type), depKindName(depKind(dep.type)), dep.source,
-        dep.type == DepType::StructuredContent ? formatStructuredDepKey(dep.key) : dep.key);
-    sessionTraces.push_back(dep);
+        depTypeName(dep.type), depKindName(depKind(dep.type)), dep.source, dep.key);
+    sessionTraces.push_back(std::move(dep));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// recordStructuredDep — zero-allocation dedup + JSON serialization
+// ═══════════════════════════════════════════════════════════════════════
+
+[[gnu::cold]] bool recordStructuredDep(
+    const CompactDepComponents & c,
+    const DepHashValue & hash,
+    DepType depType)
+{
+    // 1. Hash integer components — zero allocation
+    uint64_t h = hashValues(
+        uint8_t(depType), c.sourceId.value, c.filePathId.value,
+        uint8_t(c.format), c.dataPathId.value, uint8_t(c.suffix),
+        c.hasKey.getId());
+    if (DependencyTracker::activeTracker
+        && !DependencyTracker::activeTracker->recordedKeyHashes.insert(h).second)
+        return false;  // Duplicate — no work done
+
+    // 2. Only for non-duplicates: build JSON dep key
+    assert(sessionSymbols && "initSessionSymbols() must be called before recordStructuredDep()");
+    nlohmann::json key;
+    key["f"] = std::string(filePathPool.resolve(c.filePathId.value));
+    key["t"] = std::string(1, structuredFormatChar(c.format));
+    key["p"] = dataPathPool.toJsonArray(c.dataPathId.value, *sessionSymbols);
+    if (c.hasKey)
+        key["h"] = std::string((*sessionSymbols)[c.hasKey]);
+    else if (c.suffix != ShapeSuffix::None)
+        key["s"] = std::string(shapeSuffixName(c.suffix));
+
+    auto source = std::string(depSourcePool.resolve(c.sourceId.value));
+    DependencyTracker::sessionTraces.push_back(
+        Dep{std::move(source), key.dump(), hash, depType});
+    return true;
 }
 
 // Replay a child's cached dependency into the session trace without touching the
-// active tracker's dedup set (recordedKeys). This prevents parent dedup-set
+// active tracker's dedup set (recordedKeyHashes). This prevents parent dedup-set
 // pollution: the child's deps land in an excluded range in sessionTraces (so
 // they're skipped by collectTraces), but if record() were used instead, the
-// parent's recordedKeys would reject a later independent recording of the same
+// parent's recordedKeyHashes would reject a later independent recording of the same
 // dep. recordReplay avoids this by only appending to sessionTraces — the dep
 // still participates in thunk epoch ranges (recordThunkDeps) for correct
 // transitive propagation.
@@ -692,7 +880,7 @@ void forEachDirtyStatHash(std::function<void(const StatHashEntry &)> callback)
 
 /**
  * Iterate unique TracedData origins in an attrset and invoke a callback for each.
- * The callback receives (depSource, depKey, format, dataPath) from the origin.
+ * The callback receives the TracedData struct (interned IDs + format char).
  * Deduplicates by TracedData pointer identity. Used by maybeRecordTypeDep and
  * maybeRecordHasKeyDep (exists=false) to avoid duplicated scanning loops.
  */
@@ -709,10 +897,9 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
         bool dup = false;
         for (auto * s : seen) { if (s == df) { dup = true; break; } }
         if (dup) continue;
-        auto fmt = parseStructuredFormat(df->format);
-        if (!fmt) continue;
+        if (!parseStructuredFormat(df->format)) continue;
         seen.push_back(df);
-        fn(df->depSource, df->depKey, *fmt, df->dataPath);
+        fn(*df);
     }
 }
 
@@ -726,9 +913,10 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
     // Use first element Value* as key (matches registration in ExprTracedData::eval)
     auto * prov = lookupTracedContainer((const void *)v.listView()[0]);
     if (!prov) return;
-    auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Len);
     auto hash = depHash(std::to_string(v.listSize()));
-    DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+    CompactDepComponents c{prov->sourceId, prov->filePathId, prov->format, prov->dataPathId,
+                           ShapeSuffix::Len, Symbol{}};
+    recordStructuredDep(c, DepHashValue(hash));
 }
 
 [[gnu::cold]] void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symbols, const Value & v)
@@ -738,13 +926,9 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
     if (!v.attrs()->hasAnyTracedDataLayer()) return;
 
     // Memoize: skip if we've already scanned this exact Bindings*.
-    // DependencyTracker::record deduplicates deps, so re-scanning is always
-    // redundant. The set is cleared on root DependencyTracker construction.
     if (!scannedBindings.insert(v.attrs()).second) return;
 
-    // Group attrs by their TracedData origin. Use the Origin's offset (stable
-    // across vector reallocation) to match against the precomputed keys map,
-    // and the TracedData pointer (valid within this call) for grouping.
+    // Group attrs by their TracedData origin.
     struct OriginKeys {
         const Pos::TracedData * df;
         uint32_t originOffset;
@@ -775,13 +959,15 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
         auto pcIt = precomputedKeysMap.find(g.originOffset);
         if (pcIt != precomputedKeysMap.end() && pcIt->second.keyCount == g.keys.size()) {
             auto & info = pcIt->second;
-            DependencyTracker::record({info.depSource, info.fullKey, DepHashValue(info.hash), DepType::StructuredContent});
+            auto fmt = parseStructuredFormat(g.df->format);
+            if (!fmt) continue;
+            CompactDepComponents c{info.sourceId, info.filePathId, *fmt,
+                                   info.dataPathId, ShapeSuffix::Keys, Symbol{}};
+            recordStructuredDep(c, DepHashValue(info.hash));
             continue;
         }
         // Slow path REMOVED: when keys are shadowed by //, ImplicitShape
         // (recorded at creation time with ALL source keys) handles verification.
-        // Recording SC #keys with the visible subset would poison ImplicitShape
-        // fallback because SC "covers" the file (blocking ImplicitShape check).
     }
 }
 
@@ -789,19 +975,37 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
 {
     if (!DependencyTracker::isActive()) return;
 
-    if (v.type() == nAttrs) {
+    switch (v.type()) {
+    case nAttrs: {
         if (!v.attrs()->hasAnyTracedDataLayer()) return;
-        auto hash = depHash("object");
-        forEachTracedDataOrigin(positions, v, [&](auto & depSource, auto & depKey, auto fmt, auto & dataPath) {
-            auto fullKey = buildStructuredDepKey(depKey, fmt, dataPath, ShapeSuffix::Type);
-            DependencyTracker::record({depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        forEachTracedDataOrigin(positions, v, [&](const Pos::TracedData & df) {
+            auto fmt = parseStructuredFormat(df.format);
+            if (!fmt) return;
+            CompactDepComponents c{df.sourceId, df.filePathId, *fmt, df.dataPathId,
+                                   ShapeSuffix::Type, Symbol{}};
+            recordStructuredDep(c, DepHashValue(kHashObject()));
         });
-    } else if (v.type() == nList && v.listSize() > 0) {
+        break;
+    }
+    case nList: {
+        if (v.listSize() == 0) return;
         auto * prov = lookupTracedContainer((const void *)v.listView()[0]);
         if (!prov) return;
-        auto hash = depHash("array");
-        auto fullKey = buildStructuredDepKey(prov->depKey, prov->format, prov->dataPath, ShapeSuffix::Type);
-        DependencyTracker::record({prov->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        CompactDepComponents c{prov->sourceId, prov->filePathId, prov->format,
+                               prov->dataPathId, ShapeSuffix::Type, Symbol{}};
+        recordStructuredDep(c, DepHashValue(kHashArray()));
+        break;
+    }
+    case nInt:
+    case nBool:
+    case nString:
+    case nPath:
+    case nNull:
+    case nFloat:
+    case nThunk:
+    case nFunction:
+    case nExternal:
+        break;
     }
 }
 
@@ -829,15 +1033,7 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
         auto fmt = parseStructuredFormat(df->format);
         if (!fmt) continue;
         seen.push_back(df);
-        std::string prefix;
-        prefix.reserve(df->depKey.size() + 3 + df->dataPath.size() + 5);
-        prefix += df->depKey;
-        prefix += '\t';
-        prefix += structuredFormatChar(*fmt);
-        prefix += ':';
-        prefix += df->dataPath;
-        prefix += "#has:";
-        result.push_back({df->depSource, std::move(prefix)});
+        result.push_back({df->sourceId, df->filePathId, df->dataPathId, *fmt});
     }
     return result;
 }
@@ -851,21 +1047,15 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
     bool rightHasData = right.type() == nAttrs && right.attrs()->hasAnyTracedDataLayer();
     if (!leftHasData && !rightHasData) return;
 
-    // Cached origin scan — O(|attrs|) only on first encounter per Bindings*
     const auto & leftOrigins = leftHasData ? collectOriginsCached(positions, left) : emptyOrigins;
     const auto & rightOrigins = rightHasData ? collectOriginsCached(positions, right) : emptyOrigins;
-
-    // Early exit if no actual TracedData origins found
     if (leftOrigins.empty() && rightOrigins.empty()) return;
-
-    auto hashExists = depHash("1");
-    auto hashAbsent = depHash("0");
 
     auto & leftAttrs = *left.attrs();
     auto & rightAttrs = *right.attrs();
 
     // Record exists=true for a single attr against its operand's origins
-    auto recordExists = [&](const Attr & attr, const std::vector<IntersectOriginInfo> & origins) {
+    auto recordExists = [&](const Attr & attr, const std::vector<IntersectOriginInfo> &) {
         if (!attr.pos.isTracedData()) return;
         auto * origin = positions.originOfPtr(attr.pos);
         if (!origin) return;
@@ -873,44 +1063,34 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
         if (!df) return;
         auto fmt = parseStructuredFormat(df->format);
         if (!fmt) return;
-        auto keyStr = std::string(std::string_view(symbols[attr.name]));
-        auto escaped = escapeDataPathKey(keyStr);
-        std::string rawSuffix = "#has:";
-        rawSuffix += escaped;
-        auto fullKey = buildStructuredDepKey(df->depKey, *fmt, df->dataPath, rawSuffix);
-        DependencyTracker::record({df->depSource, fullKey, DepHashValue(hashExists), DepType::StructuredContent});
+        CompactDepComponents c{df->sourceId, df->filePathId, *fmt, df->dataPathId,
+                               ShapeSuffix::None, attr.name};
+        recordStructuredDep(c, DepHashValue(kHashOne()));
     };
 
     // Record exists=false against all pre-computed origins
     auto recordAbsent = [&](Symbol keyName, const std::vector<IntersectOriginInfo> & origins) {
-        auto keyStr = std::string(std::string_view(symbols[keyName]));
-        auto escaped = escapeDataPathKey(keyStr);
         for (auto & oi : origins) {
-            std::string fullKey = oi.keyPrefix;
-            fullKey += escaped;
-            DependencyTracker::record({oi.depSource, fullKey, DepHashValue(hashAbsent), DepType::StructuredContent});
+            CompactDepComponents c{oi.sourceId, oi.filePathId, oi.format, oi.dataPathId,
+                                   ShapeSuffix::None, keyName};
+            recordStructuredDep(c, DepHashValue(kHashZero()));
         }
     };
 
-    // Iterate left keys: covers intersection + left-only
     for (auto & l : leftAttrs) {
         auto * r = rightAttrs.get(l.name);
         if (r) {
-            // Intersection key
             if (!rightOrigins.empty()) recordExists(*r, rightOrigins);
             if (!leftOrigins.empty()) recordExists(l, leftOrigins);
         } else {
-            // Left-only: absent from right
             if (!rightOrigins.empty()) recordAbsent(l.name, rightOrigins);
         }
     }
 
-    // Iterate right-only keys (only needed if left has TracedData)
     if (!leftOrigins.empty()) {
         for (auto & r : rightAttrs) {
-            if (!leftAttrs.get(r.name)) {
+            if (!leftAttrs.get(r.name))
                 recordAbsent(r.name, leftOrigins);
-            }
         }
     }
 }
@@ -922,11 +1102,6 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
     if (v.type() != nAttrs) return;
     if (!v.attrs()->hasAnyTracedDataLayer()) return;
 
-    auto keyStr = std::string(std::string_view(symbols[keyName]));
-    auto escaped = escapeDataPathKey(keyStr);
-    std::string rawSuffix = "#has:";
-    rawSuffix += escaped;
-
     if (exists) {
         // Key was found — check tag bit, then look up origin.
         auto * attr = v.attrs()->get(keyName);
@@ -937,15 +1112,17 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
         if (!df) return; // Nix-added key (no TracedData provenance) — skip
         auto fmt = parseStructuredFormat(df->format);
         if (!fmt) return;
-        auto fullKey = buildStructuredDepKey(df->depKey, *fmt, df->dataPath, rawSuffix);
-        auto hash = depHash("1");
-        DependencyTracker::record({df->depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        CompactDepComponents c{df->sourceId, df->filePathId, *fmt, df->dataPathId,
+                               ShapeSuffix::None, keyName};
+        recordStructuredDep(c, DepHashValue(kHashOne()));
     } else {
-        // Key not found — record against every unique TracedData origin in this attrset.
-        auto hash = depHash("0");
-        forEachTracedDataOrigin(positions, v, [&](auto & depSource, auto & depKey, auto fmt, auto & dataPath) {
-            auto fullKey = buildStructuredDepKey(depKey, fmt, dataPath, rawSuffix);
-            DependencyTracker::record({depSource, fullKey, DepHashValue(hash), DepType::StructuredContent});
+        // Key not found — record against every unique TracedData origin.
+        forEachTracedDataOrigin(positions, v, [&](const Pos::TracedData & df) {
+            auto fmt = parseStructuredFormat(df.format);
+            if (!fmt) return;
+            CompactDepComponents c{df.sourceId, df.filePathId, *fmt, df.dataPathId,
+                                   ShapeSuffix::None, keyName};
+            recordStructuredDep(c, DepHashValue(kHashZero()));
         });
     }
 }

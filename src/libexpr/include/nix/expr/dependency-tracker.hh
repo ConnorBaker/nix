@@ -68,10 +68,11 @@ struct DependencyTracker {
             excludedChildRanges.emplace_back(start, end);
     }
 
-    /// Deduplication set for (type, source, key) triples within this tracker
-    /// scope. record() checks membership before appending to sessionTraces.
-    /// Hash-based for O(1) expected dedup checks; no ordering needed.
-    boost::unordered_flat_set<DepKey, DepKey::Hash, std::equal_to<DepKey>> recordedKeys;
+    /// Hash-based dedup set: stores uint64_t hashes of (type, source, key)
+    /// triples. record() and recordStructuredDep() check membership before
+    /// appending to sessionTraces. >90% of recording attempts are duplicates,
+    /// so hash-only dedup avoids constructing DepKey strings entirely.
+    boost::unordered_flat_set<uint64_t> recordedKeyHashes;
 
     DependencyTracker()
         : previous(activeTracker)
@@ -93,14 +94,15 @@ struct DependencyTracker {
     DependencyTracker & operator=(const DependencyTracker &) = delete;
 
     /**
-     * Record a dependency into the session-wide dep vector.
-     * Deduplicates by (type, source, key) within the active tracker scope.
+     * Record a non-StructuredContent dependency into the session-wide dep vector.
+     * Deduplicates by hashing (type, source, key) within the active tracker scope.
+     * For StructuredContent deps, use recordStructuredDep() instead (zero-allocation dedup).
      */
-    static void record(const Dep & dep);
+    static void record(Dep dep);
 
     /**
      * Append a dependency to sessionTraces without touching the active
-     * tracker's recordedKeys dedup set. Used by TracedExpr::replayTrace()
+     * tracker's recordedKeyHashes dedup set. Used by TracedExpr::replayTrace()
      * to propagate a child's cached deps into the session trace (needed
      * for thunk epoch ranges) without polluting the parent tracker's
      * dedup state. Without this, a parent that independently records the
@@ -280,13 +282,14 @@ void clearStatHashMemoryCache();
 
 /**
  * Provenance information for a container Value (attrset or list) produced
- * by ExprTracedData::eval(). Used by shape-observing builtins (length,
- * attrNames, hasAttr) to record shape deps (#len, #keys, #has:key).
+ * by ExprTracedData::eval(). Uses interned IDs matching the session pools.
+ * Used by shape-observing builtins (length, attrNames, hasAttr) to record
+ * shape deps (#len, #keys, #has:key).
  */
 struct TracedContainerProvenance {
-    std::string depSource;
-    std::string depKey;
-    std::string dataPath;
+    DepSourceId sourceId;
+    FilePathId filePathId;
+    DataPathId dataPathId;
     StructuredFormat format;
 };
 
@@ -301,8 +304,8 @@ using ProvenanceRef = const TracedContainerProvenance *;
  * Used for list provenance. Returns a pointer valid until the next root
  * DependencyTracker construction (which clears the pool).
  */
-ProvenanceRef allocateProvenance(std::string depSource, std::string depKey,
-                                 std::string dataPath, StructuredFormat format);
+ProvenanceRef allocateProvenance(DepSourceId sourceId, FilePathId filePathId,
+                                 DataPathId dataPathId, StructuredFormat format);
 
 /**
  * Register a list container in the thread-local provenance map.
@@ -334,18 +337,102 @@ class PosTable;
 class SymbolTable;
 class Symbol;
 
+// ═══════════════════════════════════════════════════════════════════════
+// Component interning — zero-allocation dep key construction
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Compact interned representation of a StructuredContent dep key.
+ * All fields are process-lifetime pool indices. Zero string allocation.
+ * JSON dep key is constructed only for non-duplicate deps at serialization time.
+ */
+struct CompactDepComponents {
+    DepSourceId sourceId;
+    FilePathId filePathId;
+    StructuredFormat format;
+    DataPathId dataPathId;
+    ShapeSuffix suffix;     ///< None/Len/Keys/Type
+    Symbol hasKey;           ///< non-zero for #has: deps
+};
+
+/**
+ * Intern a dep source string (flake input name) into the thread-local pool.
+ * Grows monotonically for the process lifetime (IDs stored in GC-heap thunks).
+ */
+DepSourceId internDepSource(std::string_view sv);
+
+/**
+ * Intern a file path string into the thread-local pool.
+ * Grows monotonically for the process lifetime (IDs stored in GC-heap thunks).
+ */
+FilePathId internFilePath(std::string_view sv);
+
+/** Resolve an interned dep source ID back to a string. */
+std::string_view resolveDepSource(DepSourceId id);
+
+/** Resolve an interned file path ID back to a string. */
+std::string_view resolveFilePath(FilePathId id);
+
+/**
+ * Intern an object key child in the DataPath trie.
+ * Grows monotonically for the process lifetime (IDs stored in GC-heap thunks).
+ */
+DataPathId internDataPathChild(DataPathId parentId, Symbol key);
+
+/**
+ * Intern an array index child in the DataPath trie.
+ * Grows monotonically for the process lifetime (IDs stored in GC-heap thunks).
+ */
+DataPathId internDataPathArrayChild(DataPathId parentId, int32_t index);
+
+/**
+ * Convert a DataPath trie node to a JSON array string of path components.
+ * Object keys become JSON strings; array indices become JSON numbers.
+ * Only called for non-duplicate deps at serialization time.
+ * Requires initSessionSymbols() to have been called.
+ * Returns the serialized JSON array, e.g. '["nodes","nixpkgs",0]'.
+ */
+std::string dataPathToJsonString(DataPathId nodeId);
+
+/**
+ * Convert a JSON array string of path components back to a DataPath trie node ID.
+ * Used when replaying cached origins (trace-cache.cc).
+ */
+DataPathId jsonStringToDataPathId(std::string_view jsonStr, SymbolTable & symbols);
+
+/**
+ * Set the SymbolTable pointer for the session. Called once from
+ * ExprTracedData::eval() or parseTracedJSON/parseTracedTOML.
+ * Required by dataPathToJsonArray() and recordStructuredDep().
+ */
+void initSessionSymbols(const SymbolTable & symbols);
+
+/**
+ * Record a StructuredContent dep with zero-allocation dedup.
+ * Hashes the compact integer components for dedup; only builds JSON
+ * dep key string for non-duplicates (confirmed novel deps).
+ * Returns true if the dep was recorded (not a duplicate).
+ */
+[[gnu::cold]] bool recordStructuredDep(
+    const CompactDepComponents & c,
+    const DepHashValue & hash,
+    DepType depType = DepType::StructuredContent);
+
 /**
  * Precomputed keys hash from ExprTracedData::eval() Object case.
  * Stored in a thread-local side map keyed by Pos::TracedData* (pointer identity
  * from PosTable origins vector). At access time, maybeRecordAttrKeysDep compares
  * visible key count to stored count; if equal, uses the precomputed hash directly,
  * avoiding the sort + concat + BLAKE3 hash that dominates its runtime.
+ * Uses interned IDs to avoid string allocation.
  */
 struct PrecomputedKeysInfo {
     Blake3Hash hash;
     uint32_t keyCount;
-    std::string fullKey;   ///< pre-built structured dep key for #keys
-    std::string depSource;
+    DepSourceId sourceId;
+    FilePathId filePathId;
+    DataPathId dataPathId;
+    StructuredFormat format;
 };
 
 /**

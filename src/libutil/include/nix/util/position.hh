@@ -10,6 +10,7 @@
 #include <variant>
 
 #include "nix/util/source-path.hh"
+#include "nix/util/traced-data-ids.hh"
 
 namespace nix {
 
@@ -53,15 +54,18 @@ struct Pos
 
     /**
      * Origin for attributes materialized from traced data sources
-     * (JSON, TOML, directory listings). Carries provenance info so that
-     * PosTable::originOf() can recover the dep source/key/path without
-     * a separate container provenance map.
+     * (JSON, TOML, directory listings). Carries interned provenance IDs
+     * so that shape dep functions can build CompactDepComponents from
+     * PosTable::originOf() without string allocation.
+     *
+     * IDs are indices into process-lifetime pools (StringPool16 for
+     * sourceId/filePathId, DataPathPool trie for dataPathId).
      */
     struct TracedData
     {
-        std::string depSource;   ///< flake input name
-        std::string depKey;      ///< file path
-        std::string dataPath;    ///< dot/bracket path within structure
+        DepSourceId sourceId;    ///< interned flake input name
+        FilePathId filePathId;   ///< interned file path
+        DataPathId dataPathId;   ///< trie node in DataPathPool
         char format;             ///< 'j', 't', 'd' (StructuredFormat char)
 
         bool operator==(const TracedData &) const = default;

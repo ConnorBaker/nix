@@ -25,7 +25,7 @@ TEST_F(MaterializationDepTest, CrossScope_HasAttr_Exists)
     }
 
     auto deps = getStoredDeps("has");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
         << "Cross-scope hasAttr exists: SC #has:x should be recorded\n"
         << dumpDeps(deps);
 }
@@ -47,7 +47,7 @@ TEST_F(MaterializationDepTest, CrossScope_HasAttr_Missing)
     }
 
     auto deps = getStoredDeps("has");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:z"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("z")))
         << "Cross-scope hasAttr missing: SC #has:z should be recorded\n"
         << dumpDeps(deps);
 }
@@ -70,7 +70,7 @@ TEST_F(MaterializationDepTest, CrossScope_HasAttr_OrDefault)
     }
 
     auto deps = getStoredDeps("val");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
         << "Cross-scope hasAttr + select: SC #has:x should be recorded\n"
         << dumpDeps(deps);
 }
@@ -92,7 +92,7 @@ TEST_F(MaterializationDepTest, CrossScope_HasAttr_TOML)
     }
 
     auto deps = getStoredDeps("has");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
         << "Cross-scope TOML hasAttr: SC #has:x should be recorded\n"
         << dumpDeps(deps);
 }
@@ -116,7 +116,7 @@ TEST_F(MaterializationDepTest, CrossScope_HasAttr_NoSCKeys)
     }
 
     auto deps = getStoredDeps("has");
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "hasAttr should NOT record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -137,7 +137,7 @@ TEST_F(MaterializationDepTest, CrossScope_HasAttr_NoSCType)
     }
 
     auto deps = getStoredDeps("has");
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "hasAttr should NOT record SC #type\n" << dumpDeps(deps);
 }
 

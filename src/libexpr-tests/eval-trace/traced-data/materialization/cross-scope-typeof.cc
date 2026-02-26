@@ -25,7 +25,7 @@ TEST_F(MaterializationDepTest, CrossScope_TypeOf_Attrs_RecordsSCType)
     }
 
     auto deps = getStoredDeps("t");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "Cross-scope typeOf: SC #type should be recorded\n"
         << dumpDeps(deps);
 }
@@ -47,7 +47,7 @@ TEST_F(MaterializationDepTest, CrossScope_TypeOf_Nested)
     }
 
     auto deps = getStoredDeps("t");
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "Cross-scope nested typeOf: SC #type should be recorded\n"
         << dumpDeps(deps);
 }
@@ -69,7 +69,7 @@ TEST_F(MaterializationDepTest, CrossScope_TypeOf_NoSCKeys)
     }
 
     auto deps = getStoredDeps("t");
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "typeOf should NOT record SC #keys\n" << dumpDeps(deps);
 }
 

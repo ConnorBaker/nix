@@ -23,9 +23,9 @@ TEST_F(DepPrecisionHasAttrTest, HasAttr_RecordsHasKey)
     auto expr = std::format(R"(builtins.hasAttr "x" ({}))", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
         << "hasAttr must record SC #has:x\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "hasAttr must NOT record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -36,9 +36,9 @@ TEST_F(DepPrecisionHasAttrTest, HasOp_KeyExists_NoSCKeys)
     auto expr = std::format("({}) ? x", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
         << "? operator must record SC #has:x\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "? operator must NOT record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -54,7 +54,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_True_KeyRemoved)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -84,7 +84,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_False_KeyAdded)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -114,7 +114,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_SelectDefault_KeyAppears)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -145,7 +145,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_QuestionMark_Nested_KeyRemoved)
     {
         auto deps = evalAndCollectDeps(expr);
         // ? x.y records #has:y on x's sub-path, not #has:x at root
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:y"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("y")))
             << "? x.y records #has:y on x's origin\n" << dumpDeps(deps);
     }
 
@@ -179,7 +179,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_True_SiblingAdded)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -209,7 +209,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_True_SiblingRemoved)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -239,7 +239,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_True_ValueChanged)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -269,7 +269,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_False_OtherKeyRemoved)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -299,7 +299,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_SelectDefault_SiblingAdded)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -329,7 +329,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_Propagated_MapAttrs)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -363,7 +363,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_AttrNames_StillBlocking)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -392,7 +392,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_EqOp_StillBlocking)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -425,7 +425,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_TopLevel_RootObject)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -456,7 +456,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_NestedQuestionMark_IntermediateSucceeds)
     // ? x.y where x exists but y doesn't — records #has:y on x's sub-path
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:y"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("y")))
             << "? x.y records #has:y on x's origin\n" << dumpDeps(deps);
     }
 
@@ -486,7 +486,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_QuestionMark_SingleLevel_SiblingAdded)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -517,7 +517,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_SelectDefault_NestedPath_SiblingAdded)
     // .inner.x or "default" where x exists → records scalar dep inner.x, not #has:x
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "inner.x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"inner", "x"}))))
             << "or-default with existing key records scalar dep\n" << dumpDeps(deps);
     }
 
@@ -549,7 +549,7 @@ TEST_F(DepPrecisionHasAttrTest, HasOp_NonAttrsetIntermediate)
     // reveals it's not an attrset, so no #has:y is recorded)
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, ":x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"x"}))))
             << "? x.y on non-attrset records scalar dep for x\n" << dumpDeps(deps);
     }
 
@@ -583,7 +583,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_Toml_True_SiblingAdded)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -613,7 +613,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_Toml_True_KeyRemoved)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
             << dumpDeps(deps);
     }
 
@@ -650,7 +650,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_ReadDir_True_SiblingAdded)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:foo"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("foo")))
             << dumpDeps(deps);
     }
 
@@ -682,7 +682,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_ReadDir_False_SiblingRemoved)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:missing"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("missing")))
             << dumpDeps(deps);
     }
 
@@ -715,7 +715,7 @@ TEST_F(DepPrecisionHasAttrTest, HasKey_ReadDir_True_KeyRemoved)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:foo"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("foo")))
             << dumpDeps(deps);
     }
 
@@ -749,7 +749,7 @@ TEST_F(DepPrecisionHasAttrTest, HasOp_KeyAdded_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:b"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("b")))
             << dumpDeps(deps);
     }
 
@@ -779,7 +779,7 @@ TEST_F(DepPrecisionHasAttrTest, HasOp_KeyRemoved_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:b"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("b")))
             << dumpDeps(deps);
     }
 
@@ -809,7 +809,7 @@ TEST_F(DepPrecisionHasAttrTest, HasOp_KeyUnchanged_ScalarChanged_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:a"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("a")))
             << dumpDeps(deps);
     }
 
@@ -839,7 +839,7 @@ TEST_F(DepPrecisionHasAttrTest, SelectOrDefault_KeyAdded_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:b"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("b")))
             << dumpDeps(deps);
     }
 
@@ -870,9 +870,9 @@ TEST_F(DepPrecisionHasAttrTest, SelectOrDefault_KeyPresent_CacheHit)
     // .b or "default" where b exists → records scalar deps for b and a, not #has:b
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, ":b"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"b"}))))
             << "or-default with existing key records scalar dep for b\n" << dumpDeps(deps);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, ":a"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"a"}))))
             << "scalar dep for a\n" << dumpDeps(deps);
     }
 

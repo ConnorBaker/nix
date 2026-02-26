@@ -199,9 +199,9 @@ TEST_F(DepPrecisionHasAttrMultiTest, Update_HasAttr_RecordsHasKey)
 
     auto deps = evalAndCollectDeps(expr);
 
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#has:x"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, hasKeyPred("x")))
         << "hasAttr must record SC #has:x\n" << dumpDeps(deps);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "hasAttr + // must not produce SC #keys\n" << dumpDeps(deps);
 }
 

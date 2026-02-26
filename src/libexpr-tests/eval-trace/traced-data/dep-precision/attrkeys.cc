@@ -23,9 +23,9 @@ TEST_F(DepPrecisionAttrKeysTest, AttrNames_RecordsSCKeys)
     auto expr = std::format("builtins.attrNames ({})", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "attrNames must record SC #keys\n" << dumpDeps(deps);
-    EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("keys")))
         << "Object creation must record IS #keys\n" << dumpDeps(deps);
 }
 
@@ -35,7 +35,7 @@ TEST_F(DepPrecisionAttrKeysTest, AttrNames_NoSCType)
     auto expr = std::format("builtins.attrNames ({})", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "attrNames must NOT record SC #type\n" << dumpDeps(deps);
 }
 
@@ -45,7 +45,7 @@ TEST_F(DepPrecisionAttrKeysTest, AttrNames_NoSCLen)
     auto expr = std::format("builtins.attrNames ({})", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#len"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("len")))
         << "attrNames must NOT record SC #len\n" << dumpDeps(deps);
 }
 
@@ -55,7 +55,7 @@ TEST_F(DepPrecisionAttrKeysTest, AttrValues_RecordsSCKeys)
     auto expr = std::format("builtins.concatStringsSep \",\" (builtins.attrValues ({}))", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+    EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
         << "attrValues must record SC #keys\n" << dumpDeps(deps);
 }
 
@@ -65,7 +65,7 @@ TEST_F(DepPrecisionAttrKeysTest, AttrValues_NoSCType)
     auto expr = std::format("builtins.concatStringsSep \",\" (builtins.attrValues ({}))", fj(file.path));
 
     auto deps = evalAndCollectDeps(expr);
-    EXPECT_FALSE(hasDep(deps, DepType::StructuredContent, "#type"))
+    EXPECT_FALSE(hasJsonDep(deps, DepType::StructuredContent, shapePred("type")))
         << "attrValues must NOT record SC #type\n" << dumpDeps(deps);
 }
 
@@ -83,7 +83,7 @@ TEST_F(DepPrecisionAttrKeysTest, AttrNamesNoLeafAccess_KeyAdded_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -113,7 +113,7 @@ TEST_F(DepPrecisionAttrKeysTest, AttrNamesOnly_KeySetChange_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -143,7 +143,7 @@ TEST_F(DepPrecisionAttrKeysTest, AttrNamesOnly_ValueChange_CacheHit)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -175,7 +175,7 @@ TEST_F(DepPrecisionAttrKeysTest, AttrNamesPlusValue_KeySetChange_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
         EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "a"))
             << dumpDeps(deps);
@@ -208,7 +208,7 @@ TEST_F(DepPrecisionAttrKeysTest, NestedAttrNames_KeyAdded_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -244,7 +244,7 @@ TEST_F(DepPrecisionAttrKeysTest, AttrValues_KeyAdded_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -279,7 +279,7 @@ TEST_F(DepPrecisionAttrKeysTest, ToJSON_ArrayGrows_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -309,7 +309,7 @@ TEST_F(DepPrecisionAttrKeysTest, ToJSON_KeyAdded_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -376,7 +376,7 @@ TEST_F(DepPrecisionAttrKeysTest, ToXML_KeyAdded_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -410,7 +410,7 @@ TEST_F(DepPrecisionAttrKeysTest, TOML_KeySetChange_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::StructuredContent, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::StructuredContent, shapePred("keys")))
             << dumpDeps(deps);
     }
 
@@ -445,7 +445,7 @@ TEST_F(DepPrecisionAttrKeysTest, MapAttrsNoForce_KeyAdded_CacheMiss)
     // ── Dep verification ──
     {
         auto deps = evalAndCollectDeps(expr);
-        EXPECT_TRUE(hasDep(deps, DepType::ImplicitShape, "#keys"))
+        EXPECT_TRUE(hasJsonDep(deps, DepType::ImplicitShape, shapePred("keys")))
             << dumpDeps(deps);
     }
 

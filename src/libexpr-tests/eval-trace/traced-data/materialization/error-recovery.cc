@@ -204,9 +204,9 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_DDeps_HasContentAndShape)
     auto dDeps = getStoredDeps("d");
     EXPECT_TRUE(hasDep(dDeps, DepType::Content, ""))
         << "d must have Content dep on the JSON file\n" << dumpDeps(dDeps);
-    EXPECT_TRUE(hasDep(dDeps, DepType::ImplicitShape, "#keys"))
+    EXPECT_TRUE(hasJsonDep(dDeps, DepType::ImplicitShape, shapePred("keys")))
         << "d must have ImplicitShape #keys dep\n" << dumpDeps(dDeps);
-    EXPECT_FALSE(hasDep(dDeps, DepType::StructuredContent, "j:x"))
+    EXPECT_FALSE(hasJsonDep(dDeps, DepType::StructuredContent, pathContainsPred(nlohmann::json({"x"}))))
         << "d's SC deps on x belong to x's child trace, not d's\n" << dumpDeps(dDeps);
 }
 
