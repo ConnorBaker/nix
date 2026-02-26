@@ -535,4 +535,166 @@ TEST_F(PerSiblingInvalidationTest, DISABLED_ParentMediatedValueChange_SoundnessG
         "See design.md section 9.8.";
 }
 
+// -- Bug 2 coverage: parent-mediated value change analysis -----------
+//
+// These tests pin down exact TraceStore behavior for whole-parent and
+// per-sibling deps. The gap is in TraceCache (evaluator layer), not
+// TraceStore — TraceStore correctly reflects whatever was recorded.
+
+TEST_F(PerSiblingInvalidationTest, WholeParentDep_ParentReRecorded_DifferentDeps_ChildInvalidated)
+{
+    // Whole-parent dep detects parent trace hash change.
+    // Re-recording parent with different deps changes its trace hash,
+    // which should invalidate the child's ParentContext dep.
+    ScopedEnvVar env("NIX_PS_WPD", "val");
+
+    auto db = makeDb();
+
+    auto parentPath = std::string("parent");
+    auto childPath = makePath({"parent", "child"});
+
+    // Record parent with result "A", dep on envvar=val
+    db.record(parentPath, string_t{"A", {}},
+              {makeEnvVarDep("NIX_PS_WPD", "val")}, false);
+    auto parentHash = db.getCurrentTraceHash(parentPath);
+    ASSERT_TRUE(parentHash.has_value());
+
+    // Record child with whole-parent dep
+    db.record(childPath, string_t{"child-val", {}},
+              {makeParentContextDep(toDepKey(parentPath), *parentHash)}, false);
+
+    db.clearSessionCaches();
+
+    // Verify passes initially
+    auto result1 = db.verify(childPath, {}, state);
+    ASSERT_TRUE(result1.has_value());
+
+    // Re-record parent with different deps → different trace hash
+    setenv("NIX_PS_WPD", "val2", 1);
+    db.record(parentPath, string_t{"B", {}},
+              {makeEnvVarDep("NIX_PS_WPD", "val2")}, false);
+
+    db.clearSessionCaches();
+
+    // Child's ParentContext dep should fail (parent trace hash changed)
+    auto result2 = db.verify(childPath, {}, state);
+    EXPECT_FALSE(result2.has_value())
+        << "Whole-parent dep should detect parent trace hash change";
+}
+
+TEST_F(PerSiblingInvalidationTest, WholeParentDep_ParentUnchanged_ChildPasses)
+{
+    // Baseline: parent unchanged → child passes verification.
+    ScopedEnvVar env("NIX_PS_WPU", "val");
+
+    auto db = makeDb();
+
+    auto parentPath = std::string("parent");
+    auto childPath = makePath({"parent", "child"});
+
+    // Record parent
+    db.record(parentPath, string_t{"parent-val", {}},
+              {makeEnvVarDep("NIX_PS_WPU", "val")}, false);
+    auto parentHash = db.getCurrentTraceHash(parentPath);
+    ASSERT_TRUE(parentHash.has_value());
+
+    // Record child with whole-parent dep
+    db.record(childPath, string_t{"child-val", {}},
+              {makeParentContextDep(toDepKey(parentPath), *parentHash)}, false);
+
+    db.clearSessionCaches();
+
+    // Verify passes — parent unchanged
+    auto result = db.verify(childPath, {}, state);
+    ASSERT_TRUE(result.has_value());
+    assertCachedResultEquals(string_t{"child-val", {}}, result->value, state.symbols);
+}
+
+TEST_F(PerSiblingInvalidationTest, PerSiblingDep_SiblingResultChanges_SameDeps_ChildStillPasses)
+{
+    // Sibling result changes but deps are identical → trace hash unchanged →
+    // child's ParentContext dep still passes.
+    // BUG: trace hash only covers deps, not the result. A sibling whose result
+    // changes (e.g., due to impure evaluation) without changing deps is invisible
+    // to per-sibling ParentContext deps.
+    ScopedEnvVar env("NIX_PS_SRC", "val");
+
+    auto db = makeDb();
+
+    auto sibPath = makePath({"parent", "sib"});
+    auto childPath = makePath({"parent", "child"});
+
+    // Record sib with result "v1"
+    db.record(sibPath, string_t{"v1", {}},
+              {makeEnvVarDep("NIX_PS_SRC", "val")}, false);
+    auto sibHash = db.getCurrentTraceHash(sibPath);
+    ASSERT_TRUE(sibHash.has_value());
+
+    // Record child with per-sibling dep on sib
+    db.record(childPath, string_t{"child-val", {}},
+              {makeParentContextDep(toDepKey(sibPath), *sibHash)}, false);
+
+    // Re-record sib with different result "v2" but SAME deps
+    db.record(sibPath, string_t{"v2", {}},
+              {makeEnvVarDep("NIX_PS_SRC", "val")}, false);
+    auto sibHashAfter = db.getCurrentTraceHash(sibPath);
+    ASSERT_TRUE(sibHashAfter.has_value());
+
+    // Trace hash unchanged because deps are identical (result not included)
+    EXPECT_EQ(std::memcmp(sibHash->hash, sibHashAfter->hash, 32), 0)
+        << "BUG: trace hash only covers deps, not result — same deps → same hash";
+
+    db.clearSessionCaches();
+
+    // Child passes because sib's trace hash didn't change
+    auto result = db.verify(childPath, {}, state);
+    EXPECT_TRUE(result.has_value())
+        << "BUG: child passes because trace hash doesn't include sibling result";
+}
+
+TEST_F(PerSiblingInvalidationTest, PerSiblingDep_SiblingUnchanged_ChildPasses_DocumentsGap)
+{
+    // Documents the gap: child with only per-sibling dep passes verification
+    // even if a parent overlay would change the child's result. TraceStore
+    // behaves correctly — the bug is in TraceCache (evaluator doesn't
+    // re-evaluate the child when only the parent definition changed).
+    ScopedEnvVar env("NIX_PS_GAP", "val");
+
+    auto db = makeDb();
+
+    auto sibPath = makePath({"parent", "sib"});
+    auto childPath = makePath({"parent", "child"});
+
+    // Record sib
+    db.record(sibPath, string_t{"sib-val", {}},
+              {makeEnvVarDep("NIX_PS_GAP", "val")}, false);
+    auto sibHash = db.getCurrentTraceHash(sibPath);
+    ASSERT_TRUE(sibHash.has_value());
+
+    // Record child with per-sibling dep on sib, result = "original"
+    db.record(childPath, string_t{"original", {}},
+              {makeParentContextDep(toDepKey(sibPath), *sibHash)}, false);
+
+    db.clearSessionCaches();
+
+    // Verify passes — sib unchanged, returns "original"
+    auto result1 = db.verify(childPath, {}, state);
+    ASSERT_TRUE(result1.has_value());
+    assertCachedResultEquals(string_t{"original", {}}, result1->value, state.symbols);
+
+    // Now imagine a parent overlay changes the child's definition to produce
+    // "modified". But we can't simulate that here — the child wasn't
+    // re-recorded by an evaluator. So verify again — still passes.
+    db.clearSessionCaches();
+    auto result2 = db.verify(childPath, {}, state);
+    ASSERT_TRUE(result2.has_value());
+    assertCachedResultEquals(string_t{"original", {}}, result2->value, state.symbols);
+    // CORRECT: since the child wasn't re-evaluated, the old result IS correct
+    // from TraceStore's perspective.
+    // GAP: the evaluator should have re-evaluated the child because the parent
+    // overlay changed its definition, but per-sibling ParentContext deps don't
+    // capture parent-mediated changes. This test documents that TraceStore
+    // behaves correctly; the bug is in TraceCache.
+}
+
 } // namespace nix::eval_trace
