@@ -60,6 +60,8 @@ TEST_F(TracedDataTest, TracedJSON_StandaloneStructuralDep_CacheHit)
     // Child trace has SC dep for .name (standalone). When an unrelated
     // field changes, root's override accepts (marker SC passes) and
     // child's standalone SC dep for .name also passes → cache hit.
+    // trace_hash is NOT recomputed because all failed files are SC-covered
+    // (SC is value-aware, so passing SC proves accessed values unchanged).
     TempJsonFile f(R"({"name":"foo","marker":"ok","extra":"bar"})");
 
     auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + f.path.string()
@@ -377,7 +379,8 @@ TEST_F(TracedDataTest, TracedJSON_GenericClosure_CacheHit)
 {
     // [PRECISION] Unaccessed non-key attribute changes → cache hit.
     // genericClosure reads ALL elements' .key for dedup, so we must change
-    // a non-.key attribute to avoid invalidation.
+    // a non-.key attribute to avoid invalidation. trace_hash is NOT recomputed
+    // because all failed files are SC-covered (value-aware verification).
     TempJsonFile file(R"({"nodes":[{"key":"a","val":"x"},{"key":"b","val":"y"}]})");
     auto expr = R"(let j = builtins.fromJSON (builtins.readFile )" + file.path.string()
         + R"(); in builtins.head (builtins.genericClosure { startSet = j.nodes; operator = n: []; }))";

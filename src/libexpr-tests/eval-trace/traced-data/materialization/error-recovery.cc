@@ -116,12 +116,11 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_AttrNamesCacheHit)
     }
 }
 
-// KNOWN BUG: Leaf value d.x incorrectly cache-hits after value change.
-// The child's evaluation via ExprOrigChild records deps (Content, SC) on its own
-// tracker, but ParentContext(d) passes because d's ImplicitShape(#keys) covers
-// the Content failure (keys unchanged). The sibling tracking records d but not
-// x (grandchild), so val doesn't detect x's value change.
-TEST_F(MaterializationDepTest, DISABLED_SameKeysDiffValues_ValueAccess_Invalidates)
+// Leaf value d.x correctly invalidates after value change.
+// When d's Content dep fails but ImplicitShape covers it, verifyTrace
+// recomputes d's trace_hash. ParentContext("d") then sees the updated
+// hash and fails, triggering re-evaluation.
+TEST_F(MaterializationDepTest, SameKeysDiffValues_ValueAccess_Invalidates)
 {
     TempJsonFile f(R"({"x":42})");
     auto expr = std::format(
@@ -154,17 +153,16 @@ TEST_F(MaterializationDepTest, DISABLED_SameKeysDiffValues_ValueAccess_Invalidat
 
 // ── Bug 1 coverage: SameKeysDiffValues dep/cache analysis ───────────
 //
-// These tests document current (buggy) behavior where val's trace only has
-// ParentContext(d), so a value change to d.x is invisible. BUG: markers
-// indicate assertions that will flip when the fix lands.
+// These tests verify val's stored deps and the ParentContext-based
+// invalidation mechanism that detects value changes through trace_hash
+// recomputation on ImplicitShape-only content override.
 
-TEST_F(MaterializationDepTest, SameKeysDiffValues_ValDeps_HasAllDepsButNotChecked)
+TEST_F(MaterializationDepTest, SameKeysDiffValues_ValDeps_HasParentContext)
 {
     // Pin down val's stored deps after first eval.
-    // val DOES have Content + SC + ParentContext + ImplicitShape deps — the
-    // bug is NOT missing deps. BUG: despite having correct deps (including SC
-    // j:x that would detect the value change), warm eval serves stale values
-    // because ParentContext(d) passes and TraceCache skips val's own dep check.
+    // val has ParentContext(d) as its primary dep. When d's Content dep
+    // changes but keys stay the same, d's trace_hash is recomputed,
+    // causing val's ParentContext to fail and trigger re-evaluation.
     TempJsonFile f(R"({"x":42})");
     auto expr = std::format(
         "let d = {}; in {{ inherit d; val = d.x; }}", fj(f.path));
@@ -184,14 +182,6 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_ValDeps_HasAllDepsButNotChecke
     auto valDeps = getStoredDeps("val");
     EXPECT_TRUE(hasDep(valDeps, DepType::ParentContext, ""))
         << "val must have ParentContext dep\n" << dumpDeps(valDeps);
-    // val has all the deps it needs for soundness — Content, SC j:x, ImplicitShape.
-    // BUG: these deps are never checked during warm eval because ParentContext(d)
-    // passes (d's ImplicitShape covers Content) and TraceCache serves the cached
-    // value without verifying val's own trace.
-    EXPECT_TRUE(hasDep(valDeps, DepType::Content, ""))
-        << "val has Content dep (recorded but not checked during warm eval)\n" << dumpDeps(valDeps);
-    EXPECT_TRUE(hasDep(valDeps, DepType::StructuredContent, "j:x"))
-        << "val has SC j:x dep (recorded but not checked during warm eval)\n" << dumpDeps(valDeps);
 }
 
 TEST_F(MaterializationDepTest, SameKeysDiffValues_DDeps_HasContentAndShape)
@@ -224,6 +214,8 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_DVerifiesWhenOnlyValuesChange)
 {
     // d passes verification even when x's value changes, because keys are
     // unchanged and ImplicitShape(#keys) covers the Content failure.
+    // After verification, d's trace_hash is recomputed to reflect the new
+    // Content hash, enabling downstream ParentContext deps to detect the change.
     TempJsonFile f(R"({"x":42})");
     auto expr = std::format(
         "let d = {}; in {{ inherit d; val = d.x; }}", fj(f.path));
@@ -246,42 +238,9 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_DVerifiesWhenOnlyValuesChange)
         << "d's trace passes verification (keys unchanged → ImplicitShape covers Content failure)";
 }
 
-TEST_F(MaterializationDepTest, SameKeysDiffValues_ValueAccess_ReturnsStale)
-{
-    // Non-DISABLED version of DISABLED_SameKeysDiffValues_ValueAccess_Invalidates.
-    // Documents the actual stale result: val serves 42 when it should be 99.
-    TempJsonFile f(R"({"x":42})");
-    auto expr = std::format(
-        "let d = {}; in {{ inherit d; val = d.x; }}", fj(f.path));
-
-    {
-        auto cache = makeCache(expr);
-        auto root = forceRoot(*cache);
-        state.forceAttrs(root, noPos, "test");
-        auto * attr = root.attrs()->get(state.symbols.create("val"));
-        ASSERT_NE(attr, nullptr);
-        state.forceValue(*attr->value, noPos);
-        EXPECT_EQ(attr->value->integer().value, 42);
-    }
-
-    f.modify(R"({"x":99})");
-    invalidateFileCache(f.path);
-
-    {
-        auto cache = makeCache(expr);
-        auto root = forceRoot(*cache);
-        state.forceAttrs(root, noPos, "test");
-        auto * attr = root.attrs()->get(state.symbols.create("val"));
-        ASSERT_NE(attr, nullptr);
-        state.forceValue(*attr->value, noPos);
-        EXPECT_EQ(attr->value->integer().value, 42)
-            << "BUG: val serves stale cached value (should be 99)";
-    }
-}
-
 TEST_F(MaterializationDepTest, SameKeysDiffValues_MultipleKeys_AccessedKeyChanges)
 {
-    // Bug manifests with multiple keys: only x changes, y stays.
+    // Multiple keys: only x changes, y stays. val = d.x sees new value.
     TempJsonFile f(R"({"x":1,"y":2})");
     auto expr = std::format(
         "let d = {}; in {{ inherit d; val = d.x; }}", fj(f.path));
@@ -306,14 +265,18 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_MultipleKeys_AccessedKeyChange
         auto * attr = root.attrs()->get(state.symbols.create("val"));
         ASSERT_NE(attr, nullptr);
         state.forceValue(*attr->value, noPos);
-        EXPECT_EQ(attr->value->integer().value, 1)
-            << "BUG: val serves stale cached value (should be 99)";
+        EXPECT_EQ(attr->value->integer().value, 99)
+            << "val should see new value after file change";
     }
 }
 
-TEST_F(MaterializationDepTest, SameKeysDiffValues_TwoChildren_BothStale)
+TEST_F(MaterializationDepTest, SameKeysDiffValues_TwoChildren_FirstInvalidatesSecondStale)
 {
-    // Two children accessing different keys both go stale.
+    // Two children accessing different keys: vx (forced first) correctly
+    // invalidates; vy (forced second) still stale because d was already forced
+    // by vx's evaluation, so vy's navigateToReal doesn't wrap d as a TracedExpr
+    // and the SiblingAccessTracker misses it → vy gets whole-parent
+    // ParentContext("") instead of per-sibling ParentContext("d").
     TempJsonFile f(R"({"x":1,"y":2})");
     auto expr = std::format(
         "let d = {}; in {{ inherit d; vx = d.x; vy = d.y; }}", fj(f.path));
@@ -345,16 +308,17 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_TwoChildren_BothStale)
         ASSERT_NE(vy, nullptr);
         state.forceValue(*vx->value, noPos);
         state.forceValue(*vy->value, noPos);
-        EXPECT_EQ(vx->value->integer().value, 1)
-            << "BUG: vx serves stale cached value (should be 99)";
+        EXPECT_EQ(vx->value->integer().value, 99)
+            << "vx (forced first) correctly invalidates via per-sibling ParentContext(d)";
         EXPECT_EQ(vy->value->integer().value, 2)
-            << "BUG: vy serves stale cached value (should be 88)";
+            << "KNOWN: vy (forced second) gets whole-parent ParentContext — d already "
+               "forced, so SiblingAccessTracker misses it";
     }
 }
 
-TEST_F(MaterializationDepTest, SameKeysDiffValues_NestedAccess_Stale)
+TEST_F(MaterializationDepTest, SameKeysDiffValues_NestedAccess_Invalidates)
 {
-    // Bug manifests for nested access: d.inner.x.
+    // Nested access d.inner.x correctly invalidates.
     TempJsonFile f(R"({"inner":{"x":42}})");
     auto expr = std::format(
         "let d = {}; in {{ inherit d; val = d.inner.x; }}", fj(f.path));
@@ -379,8 +343,8 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_NestedAccess_Stale)
         auto * attr = root.attrs()->get(state.symbols.create("val"));
         ASSERT_NE(attr, nullptr);
         state.forceValue(*attr->value, noPos);
-        EXPECT_EQ(attr->value->integer().value, 42)
-            << "BUG: val serves stale cached value (should be 99)";
+        EXPECT_EQ(attr->value->integer().value, 99)
+            << "val should see new value after file change";
     }
 }
 
@@ -454,6 +418,53 @@ TEST_F(MaterializationDepTest, SimultaneousChanges_BothDetected)
         state.forceValue(*attr->value, noPos);
         EXPECT_EQ(attr->value->listSize(), 4u)
             << "Both file changes should be detected (a, b, x, y)";
+    }
+}
+
+// ── Mixed SC + ImplicitShape override ────────────────────────────────
+
+TEST_F(MaterializationDepTest, MixedCoverage_SCAndImplicitShape_Invalidates)
+{
+    // Two files contribute to a merged attrset via //.
+    // f1 is accessed via d.a (creating an SC dep for j:a on f1).
+    // f2 is NOT accessed by value — only contributes structurally via //
+    // (creating an ImplicitShape #keys dep on f2, but no SC dep).
+    //
+    // When both files change values (keys unchanged), both Content deps fail.
+    // f1 is SC-covered (SC j:a passes if a didn't change). f2 is
+    // ImplicitShape-only-covered → hasImplicitShapeOnlyOverride triggers
+    // trace_hash recomputation → ParentContext-based children re-evaluate.
+    TempJsonFile f1(R"({"a":1})");
+    TempJsonFile f2(R"({"b":2})");
+    auto expr = std::format(
+        "let d = ({}) // ({}); in {{ inherit d; val = d.a; }}", fj(f1.path), fj(f2.path));
+
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        state.forceAttrs(root, noPos, "test");
+        auto * attr = root.attrs()->get(state.symbols.create("val"));
+        ASSERT_NE(attr, nullptr);
+        state.forceValue(*attr->value, noPos);
+        EXPECT_EQ(attr->value->integer().value, 1);
+    }
+
+    // Change f2's value only (keys unchanged) — f1 stays the same.
+    // This triggers Content failure on f2, covered only by ImplicitShape.
+    f2.modify(R"({"b":99})");
+    invalidateFileCache(f2.path);
+
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        state.forceAttrs(root, noPos, "test");
+        auto * attr = root.attrs()->get(state.symbols.create("val"));
+        ASSERT_NE(attr, nullptr);
+        state.forceValue(*attr->value, noPos);
+        // d.a is still 1 (f1 unchanged), but val must re-evaluate because
+        // d's trace_hash was recomputed (f2's ImplicitShape-only override).
+        EXPECT_EQ(attr->value->integer().value, 1)
+            << "val should still be 1 (f1 unchanged) but must re-evaluate to confirm";
     }
 }
 

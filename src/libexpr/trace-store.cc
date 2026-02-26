@@ -1359,6 +1359,13 @@ TraceId TraceStore::getOrCreateTrace(
 
 // ── Trace verification (BSàlC VT check) ─────────────────────────────
 
+// Forward declarations (defined after record(), used by verifyTrace's
+// trace_hash recomputation on content override).
+static void sortAndDedupInterned(std::vector<TraceStore::InternedDep> & deps);
+static Hash computeTraceHashFromInterned(
+    const std::vector<TraceStore::InternedDep> & sorted,
+    const std::function<std::string_view(uint32_t)> & lookupString);
+
 bool TraceStore::verifyTrace(
     TraceId traceId,
     const std::unordered_map<std::string, SourcePath> & inputAccessors,
@@ -1393,6 +1400,7 @@ bool TraceStore::verifyTrace(
     bool hasContentFailure = false;
     bool hasStructuralDeps = false;
     bool hasImplicitShapeDeps = false;
+    bool hasImplicitShapeOnlyOverride = false;
 
     // Track failed coarse dep file/dir keys: "source\tkey"
     std::unordered_set<std::string> failedContentFiles;
@@ -1427,20 +1435,28 @@ bool TraceStore::verifyTrace(
             continue;
         }
 
-        // ParentContext: verify the parent's trace hash matches AND parent is valid.
+        // ParentContext: verify the parent's trace is valid AND hash matches.
         // Recursive verification ensures stale parents don't make children appear valid.
         // verifiedTraceIds cache prevents infinite loops and ensures O(N) total work.
+        //
+        // IMPORTANT: verify the parent FIRST, then check the hash. Verification
+        // may update the parent's cached trace_hash when Content deps failed and
+        // ImplicitShape-only (value-blind) coverage was used. Checking the hash
+        // before verification would compare against the stale stored hash and
+        // incorrectly pass.
         if (depKind(dep.type) == DepKind::ParentContext) {
-            auto parentTraceHash = getCurrentTraceHash(dep.key);
-            if (parentTraceHash) {
-                auto * expected = std::get_if<Blake3Hash>(&dep.expectedHash);
-                if (expected && std::memcmp(expected->bytes.data(), parentTraceHash->hash, 32) == 0) {
-                    // Hash matches. Now recursively verify the parent trace is valid.
-                    std::string path(dep.key);
-                    std::replace(path.begin(), path.end(), '\t', '\0');
-                    auto parentRow = lookupTraceRow(path);
-                    if (parentRow && verifyTrace(parentRow->traceId, inputAccessors, state)) {
-                        continue; // parent trace unchanged AND valid → dep passes
+            std::string path(dep.key);
+            std::replace(path.begin(), path.end(), '\t', '\0');
+            auto parentRow = lookupTraceRow(path);
+            if (parentRow && verifyTrace(parentRow->traceId, inputAccessors, state)) {
+                // Parent is valid. Now check that the trace hash matches.
+                // getCurrentTraceHash returns the (potentially updated) hash
+                // after verification recomputed it for content overrides.
+                auto parentTraceHash = getCurrentTraceHash(dep.key);
+                if (parentTraceHash) {
+                    auto * expected = std::get_if<Blake3Hash>(&dep.expectedHash);
+                    if (expected && std::memcmp(expected->bytes.data(), parentTraceHash->hash, 32) == 0) {
+                        continue; // parent valid AND hash unchanged → dep passes
                     }
                 }
             }
@@ -1584,12 +1600,20 @@ bool TraceStore::verifyTrace(
                 implicitCoveredFiles.insert(dep->source + '\t' + dep->key.substr(0, sep));
         }
 
-        // Check that all failed coarse deps are covered by EITHER SC or ImplicitShape
+        // Check that all failed coarse deps are covered by EITHER SC or ImplicitShape.
+        // Track whether any failed file is covered by ImplicitShape-only (no SC):
+        // ImplicitShape is value-blind (only verifies key set), so values may have
+        // changed despite passing. This triggers trace_hash recomputation for
+        // downstream ParentContext deps.
         for (auto & failedFile : failedContentFiles) {
             if (!structuralCoveredFiles.count(failedFile)
                 && !implicitCoveredFiles.count(failedFile)) {
                 allValid = false;
                 break;
+            }
+            if (!structuralCoveredFiles.count(failedFile)
+                && implicitCoveredFiles.count(failedFile)) {
+                hasImplicitShapeOnlyOverride = true;
             }
         }
 
@@ -1651,6 +1675,52 @@ bool TraceStore::verifyTrace(
     }
 
     if (allValid) {
+        // When Content deps failed and the override relied on ImplicitShape
+        // (value-blind key-set check) for at least one file WITHOUT SC coverage,
+        // values may have changed despite the key set being identical. The stored
+        // trace_hash is stale and must be recomputed so downstream ParentContext
+        // deps detect the potential value change.
+        //
+        // When ALL failed files are covered by SC (value-aware), the specific
+        // accessed values are verified — the trace_hash is NOT updated, preserving
+        // precision: children whose own SC deps pass still cache-hit.
+        if (hasContentFailure && hasImplicitShapeOnlyOverride) {
+            std::vector<Dep> currentDeps;
+            currentDeps.reserve(fullDeps.size());
+            for (auto & dep : fullDeps) {
+                if (depKind(dep.type) == DepKind::ParentContext) {
+                    auto parentHash = getCurrentTraceHash(dep.key);
+                    if (parentHash) {
+                        Blake3Hash b3;
+                        std::memcpy(b3.bytes.data(), parentHash->hash, 32);
+                        currentDeps.push_back({dep.source, dep.key, DepHashValue(b3), dep.type});
+                    } else {
+                        currentDeps.push_back(dep);
+                    }
+                } else {
+                    DepKey dk(dep);
+                    auto cacheIt = currentDepHashes.find(dk);
+                    if (cacheIt != currentDepHashes.end() && cacheIt->second) {
+                        currentDeps.push_back({dep.source, dep.key, *cacheIt->second, dep.type});
+                    } else {
+                        currentDeps.push_back(dep);
+                    }
+                }
+            }
+            auto interned = internDeps(currentDeps);
+            sortAndDedupInterned(interned);
+            ensureStringTableLoaded();
+            auto lookupStr = [this](uint32_t id) -> std::string_view {
+                auto it = stringTable.find(static_cast<StringId>(id));
+                if (it != stringTable.end()) return it->second;
+                return "";
+            };
+            auto newTraceHash = computeTraceHashFromInterned(interned, lookupStr);
+            auto * data = ensureTraceHashes(traceId);
+            if (data) {
+                data->traceHash = newTraceHash;
+            }
+        }
         verifiedTraceIds.insert(traceId);
     }
     nrVerifyTraceTimeUs += elapsedUs(vtStart);
@@ -1950,19 +2020,19 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     std::vector<Dep> currentDeps;
     bool allComputable = true;
     for (auto & dep : oldDeps) {
-        // ParentContext: compute current parent trace hash AND recursively
-        // verify the parent trace is valid. Without recursive verification,
-        // recovery accepts stale traces when the parent's deps have changed
-        // but the parent's trace hash hasn't been updated yet in the DB.
+        // ParentContext: recursively verify the parent trace FIRST, then
+        // compute current trace hash. Verification may update the parent's
+        // cached trace_hash (ImplicitShape-only content override), so hash
+        // must be read after.
         if (depKind(dep.type) == DepKind::ParentContext) {
-            auto parentTraceHash = getCurrentTraceHash(dep.key);
-            if (!parentTraceHash) { allComputable = false; break; }
             std::string path(dep.key);
             std::replace(path.begin(), path.end(), '\t', '\0');
             auto parentRow = lookupTraceRow(path);
             if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state)) {
                 allComputable = false; break;
             }
+            auto parentTraceHash = getCurrentTraceHash(dep.key);
+            if (!parentTraceHash) { allComputable = false; break; }
             Blake3Hash b3;
             std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
             currentDeps.push_back({dep.source, dep.key, DepHashValue(b3), dep.type});
@@ -2194,17 +2264,16 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             std::string source = sourceIt != stringTable.end() ? sourceIt->second : "";
             std::string depKey = keyIt != stringTable.end() ? keyIt->second : "";
 
-            // ParentContext: compute current parent trace hash AND recursively
-            // verify the parent trace is valid (same invariant as verifyTrace).
+            // ParentContext: verify first, then get (potentially updated) hash.
             if (depKind(type) == DepKind::ParentContext) {
-                auto parentTraceHash = getCurrentTraceHash(depKey);
-                if (!parentTraceHash) { repComputable = false; break; }
                 std::string path(depKey);
                 std::replace(path.begin(), path.end(), '\t', '\0');
                 auto parentRow = lookupTraceRow(path);
                 if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state)) {
                     repComputable = false; break;
                 }
+                auto parentTraceHash = getCurrentTraceHash(depKey);
+                if (!parentTraceHash) { repComputable = false; break; }
                 Blake3Hash b3;
                 std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
                 repCurrentDeps.push_back({source, depKey, DepHashValue(b3), type});
