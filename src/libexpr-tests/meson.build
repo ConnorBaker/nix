@@ -97,6 +97,8 @@ sources = files(
   'eval-trace/traced-data/dep-precision/pipelines.cc',
   'eval-trace/traced-data/dep-precision/builtins-extra.cc',
   'eval-trace/traced-data/dep-precision/nixpkgs-patterns.cc',
+  'eval-trace/traced-data/dep-precision/function-application.cc',
+  'eval-trace/traced-data/dep-precision/language-features.cc',
   # eval-trace/traced-data/materialization/
   'eval-trace/traced-data/materialization/single-scope.cc',
   'eval-trace/traced-data/materialization/cross-scope-attrkeys.cc',
@@ -105,6 +107,10 @@ sources = files(
   'eval-trace/traced-data/materialization/cross-scope-cache.cc',
   'eval-trace/traced-data/materialization/variant-roundtrip.cc',
   'eval-trace/traced-data/materialization/nested-diagnostic.cc',
+  'eval-trace/traced-data/materialization/nested-invalidation.cc',
+  'eval-trace/traced-data/materialization/multi-source.cc',
+  'eval-trace/traced-data/materialization/standalone-verify.cc',
+  'eval-trace/traced-data/materialization/error-recovery.cc',
   # eval-trace/verify/
   'eval-trace/verify/cold-compare.cc',
   'eval-trace/verify/cold-verify.cc',
