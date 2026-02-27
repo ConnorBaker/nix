@@ -101,6 +101,9 @@ sources = files(
   'eval-trace/traced-data/dep-precision/nixpkgs-patterns.cc',
   'eval-trace/traced-data/dep-precision/function-application.cc',
   'eval-trace/traced-data/dep-precision/language-features.cc',
+  'eval-trace/traced-data/dep-precision/dirset-aggregation.cc',
+  # eval-trace/traced-data/
+  'eval-trace/traced-data/dirset-verification.cc',
   # eval-trace/traced-data/materialization/
   'eval-trace/traced-data/materialization/single-scope.cc',
   'eval-trace/traced-data/materialization/cross-scope-attrkeys.cc',

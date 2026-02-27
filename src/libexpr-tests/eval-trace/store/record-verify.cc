@@ -58,7 +58,7 @@ TEST_F(TraceStoreTest, Record_ReturnsTraceId)
     auto db = makeDb();
     auto result = db.record("", string_t{"hello", {}}, {}, true);
     // Trace recording returns a positive trace identifier (BSàlC: trace key)
-    EXPECT_GT(result.traceId, 0);
+    EXPECT_GT(result.traceId.value, 0u);
 }
 
 TEST_F(TraceStoreTest, ColdStore_AttrExists)

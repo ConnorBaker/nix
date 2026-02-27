@@ -262,7 +262,8 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_KeyAdded_CacheMiss)
     f.modify(R"({"a":1,"b":2,"c":3})");
     invalidateFileCache(f.path);
 
-    // Second evaluation — should get fresh deps
+    // Second evaluation — should get fresh deps; force list elements
+    // so child TracedExpr thunks record their traces
     {
         auto cache = makeCache(expr);
         auto root = forceRoot(*cache);
@@ -270,17 +271,26 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_KeyAdded_CacheMiss)
         auto * namesAttr = root.attrs()->get(state.symbols.create("names"));
         ASSERT_NE(namesAttr, nullptr);
         state.forceValue(*namesAttr->value, noPos);
+        for (size_t i = 0; i < namesAttr->value->listSize(); i++)
+            state.forceValue(*namesAttr->value->listView()[i], noPos);
     }
 
-    // The result should reflect the new keys
+    // The list is stored as list_t (child elements are separate traces)
     auto result = getStoredResult("names");
     ASSERT_TRUE(result.has_value());
-    auto * strs = std::get_if<std::vector<std::string>>(& *result);
-    ASSERT_NE(strs, nullptr);
-    ASSERT_EQ(strs->size(), 3u) << "After key addition, names should have 3 elements";
-    // Verify the actual names
+    auto * lt = std::get_if<list_t>(& *result);
+    ASSERT_NE(lt, nullptr);
+    ASSERT_EQ(lt->size, 3u) << "After key addition, names should have 3 elements";
+
+    // Verify stored child element values
     std::vector<std::string> expected{"a", "b", "c"};
-    EXPECT_EQ(*strs, expected) << "Names should be [a, b, c]";
+    for (size_t i = 0; i < expected.size(); i++) {
+        auto childResult = getStoredResult(TraceStore::buildAttrPath({"names", std::to_string(i)}));
+        ASSERT_TRUE(childResult.has_value()) << "Child " << i << " should have a stored trace";
+        auto * s = std::get_if<string_t>(& *childResult);
+        ASSERT_NE(s, nullptr) << "Child " << i << " should be a string";
+        EXPECT_EQ(s->first, expected[i]) << "Child " << i << " should be " << expected[i];
+    }
 }
 
 TEST_F(MaterializationDepTest, CrossScope_AttrNames_ValueChanged_CacheHit)
@@ -311,14 +321,25 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_ValueChanged_CacheHit)
         auto * namesAttr = root.attrs()->get(state.symbols.create("names"));
         ASSERT_NE(namesAttr, nullptr);
         state.forceValue(*namesAttr->value, noPos);
+        for (size_t i = 0; i < namesAttr->value->listSize(); i++)
+            state.forceValue(*namesAttr->value->listView()[i], noPos);
     }
 
     auto result = getStoredResult("names");
     ASSERT_TRUE(result.has_value());
-    auto * strs = std::get_if<std::vector<std::string>>(& *result);
-    ASSERT_NE(strs, nullptr);
+    auto * lt = std::get_if<list_t>(& *result);
+    ASSERT_NE(lt, nullptr);
+    EXPECT_EQ(lt->size, 2u) << "Names should still have 2 elements after value change";
+
+    // Verify stored child element values
     std::vector<std::string> expected{"a", "b"};
-    EXPECT_EQ(*strs, expected) << "Names should still be [a, b] after value change";
+    for (size_t i = 0; i < expected.size(); i++) {
+        auto childResult = getStoredResult(TraceStore::buildAttrPath({"names", std::to_string(i)}));
+        ASSERT_TRUE(childResult.has_value()) << "Child " << i << " should have a stored trace";
+        auto * s = std::get_if<string_t>(& *childResult);
+        ASSERT_NE(s, nullptr) << "Child " << i << " should be a string";
+        EXPECT_EQ(s->first, expected[i]) << "Child " << i << " should be " << expected[i];
+    }
 }
 
 } // namespace nix::eval_trace::test

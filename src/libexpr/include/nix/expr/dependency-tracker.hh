@@ -130,6 +130,15 @@ struct DependencyTracker {
 };
 
 /**
+ * Reset all process-lifetime eval trace pools (depSource, filePath, dataPath)
+ * and clear sessionTraces. Only for test isolation — in production these pools
+ * must outlive GC-heap ExprTracedData thunks. Call from test fixture setup
+ * to prevent cross-test state leakage when multiple EvalState instances
+ * exist within the same process.
+ */
+void resetEvalTracePools();
+
+/**
  * RAII guard that temporarily suspends dep recording by setting
  * activeTracker to nullptr. On destruction, restores the previous tracker.
  *
@@ -377,7 +386,7 @@ std::string_view resolveFilePath(FilePathId id);
  * Intern an object key child in the DataPath trie.
  * Grows monotonically for the process lifetime (IDs stored in GC-heap thunks).
  */
-DataPathId internDataPathChild(DataPathId parentId, Symbol key);
+DataPathId internDataPathChild(DataPathId parentId, std::string_view key);
 
 /**
  * Intern an array index child in the DataPath trie.
@@ -389,7 +398,6 @@ DataPathId internDataPathArrayChild(DataPathId parentId, int32_t index);
  * Convert a DataPath trie node to a JSON array string of path components.
  * Object keys become JSON strings; array indices become JSON numbers.
  * Only called for non-duplicate deps at serialization time.
- * Requires initSessionSymbols() to have been called.
  * Returns the serialized JSON array, e.g. '["nodes","nixpkgs",0]'.
  */
 std::string dataPathToJsonString(DataPathId nodeId);
@@ -398,7 +406,7 @@ std::string dataPathToJsonString(DataPathId nodeId);
  * Convert a JSON array string of path components back to a DataPath trie node ID.
  * Used when replaying cached origins (trace-cache.cc).
  */
-DataPathId jsonStringToDataPathId(std::string_view jsonStr, SymbolTable & symbols);
+DataPathId jsonStringToDataPathId(std::string_view jsonStr);
 
 /**
  * Set the SymbolTable pointer for the session. Called once from

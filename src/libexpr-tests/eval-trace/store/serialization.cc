@@ -101,10 +101,10 @@ TEST_F(TraceStoreTest, BlobRoundTrip_Blake3Deps)
     std::vector<TraceStore::InternedDep> deps;
     for (int i = 0; i < 5; i++) {
         auto hash = depHash("content-" + std::to_string(i));
-        keys.push_back({DepType::Content, static_cast<uint32_t>(i + 1),
-                        static_cast<uint32_t>(i + 100)});
-        deps.push_back({DepType::Content, static_cast<uint32_t>(i + 1),
-                        static_cast<uint32_t>(i + 100), DepHashValue(hash)});
+        keys.push_back({DepType::Content, StringId(static_cast<uint32_t>(i + 1)),
+                        StringId(static_cast<uint32_t>(i + 100))});
+        deps.push_back({DepType::Content, StringId(static_cast<uint32_t>(i + 1)),
+                        StringId(static_cast<uint32_t>(i + 100)), DepHashValue(hash)});
     }
 
     auto keysBlob = TraceStore::serializeKeys(keys);
@@ -119,8 +119,8 @@ TEST_F(TraceStoreTest, BlobRoundTrip_Blake3Deps)
 
     for (int i = 0; i < 5; i++) {
         EXPECT_EQ(keysResult[i].type, DepType::Content);
-        EXPECT_EQ(keysResult[i].sourceId, static_cast<uint32_t>(i + 1));
-        EXPECT_EQ(keysResult[i].keyId, static_cast<uint32_t>(i + 100));
+        EXPECT_EQ(keysResult[i].sourceId, StringId(static_cast<uint32_t>(i + 1)));
+        EXPECT_EQ(keysResult[i].keyId, StringId(static_cast<uint32_t>(i + 100)));
         EXPECT_EQ(valsResult[i], deps[i].hash);
     }
 }
@@ -131,21 +131,21 @@ TEST_F(TraceStoreTest, BlobRoundTrip_MixedDeps)
     std::vector<TraceStore::InternedDep> deps;
 
     // BLAKE3 hash dep (Content — file content oracle)
-    keys.push_back({DepType::Content, 1, 2});
-    deps.push_back({DepType::Content, 1, 2, DepHashValue(depHash("file-data"))});
+    keys.push_back({DepType::Content, StringId(1), StringId(2)});
+    deps.push_back({DepType::Content, StringId(1), StringId(2), DepHashValue(depHash("file-data"))});
 
     // String hash dep (CopiedPath — store path oracle)
-    keys.push_back({DepType::CopiedPath, 3, 4});
-    deps.push_back({DepType::CopiedPath, 3, 4,
+    keys.push_back({DepType::CopiedPath, StringId(3), StringId(4)});
+    deps.push_back({DepType::CopiedPath, StringId(3), StringId(4),
                     DepHashValue(std::string("/nix/store/aaaa-test"))});
 
     // BLAKE3 hash dep (EnvVar — environment oracle)
-    keys.push_back({DepType::EnvVar, 5, 6});
-    deps.push_back({DepType::EnvVar, 5, 6, DepHashValue(depHash("env-val"))});
+    keys.push_back({DepType::EnvVar, StringId(5), StringId(6)});
+    deps.push_back({DepType::EnvVar, StringId(5), StringId(6), DepHashValue(depHash("env-val"))});
 
     // String hash dep (Existence — filesystem oracle)
-    keys.push_back({DepType::Existence, 7, 8});
-    deps.push_back({DepType::Existence, 7, 8, DepHashValue(std::string("missing"))});
+    keys.push_back({DepType::Existence, StringId(7), StringId(8)});
+    deps.push_back({DepType::Existence, StringId(7), StringId(8), DepHashValue(std::string("missing"))});
 
     auto keysBlob = TraceStore::serializeKeys(keys);
     auto keysResult = TraceStore::deserializeKeys(keysBlob.data(), keysBlob.size());
@@ -157,14 +157,14 @@ TEST_F(TraceStoreTest, BlobRoundTrip_MixedDeps)
 
     // Content oracle: BLAKE3 hash key + value
     EXPECT_EQ(keysResult[0].type, DepType::Content);
-    EXPECT_EQ(keysResult[0].sourceId, 1u);
-    EXPECT_EQ(keysResult[0].keyId, 2u);
+    EXPECT_EQ(keysResult[0].sourceId, StringId(1));
+    EXPECT_EQ(keysResult[0].keyId, StringId(2));
     EXPECT_TRUE(std::holds_alternative<Blake3Hash>(valsResult[0]));
 
     // CopiedPath oracle: string (not BLAKE3, so deserialized as string)
     EXPECT_EQ(keysResult[1].type, DepType::CopiedPath);
-    EXPECT_EQ(keysResult[1].sourceId, 3u);
-    EXPECT_EQ(keysResult[1].keyId, 4u);
+    EXPECT_EQ(keysResult[1].sourceId, StringId(3));
+    EXPECT_EQ(keysResult[1].keyId, StringId(4));
     EXPECT_TRUE(std::holds_alternative<std::string>(valsResult[1]));
     EXPECT_EQ(std::get<std::string>(valsResult[1]), "/nix/store/aaaa-test");
 
@@ -184,8 +184,8 @@ TEST_F(TraceStoreTest, BlobRoundTrip_LargeSet)
     std::vector<TraceStore::InternedDep> deps;
     for (uint32_t i = 0; i < 10000; i++) {
         auto hash = depHash("content-" + std::to_string(i));
-        keys.push_back({DepType::Content, i, i + 50000});
-        deps.push_back({DepType::Content, i, i + 50000, DepHashValue(hash)});
+        keys.push_back({DepType::Content, StringId(i), StringId(i + 50000)});
+        deps.push_back({DepType::Content, StringId(i), StringId(i + 50000), DepHashValue(hash)});
     }
 
     auto keysBlob = TraceStore::serializeKeys(keys);
@@ -205,12 +205,12 @@ TEST_F(TraceStoreTest, BlobRoundTrip_LargeSet)
     ASSERT_EQ(valsResult.size(), 10000u);
 
     // Spot-check first, middle, and last
-    EXPECT_EQ(keysResult[0].sourceId, 0u);
-    EXPECT_EQ(keysResult[0].keyId, 50000u);
-    EXPECT_EQ(keysResult[5000].sourceId, 5000u);
-    EXPECT_EQ(keysResult[5000].keyId, 55000u);
-    EXPECT_EQ(keysResult[9999].sourceId, 9999u);
-    EXPECT_EQ(keysResult[9999].keyId, 59999u);
+    EXPECT_EQ(keysResult[0].sourceId, StringId(0));
+    EXPECT_EQ(keysResult[0].keyId, StringId(50000));
+    EXPECT_EQ(keysResult[5000].sourceId, StringId(5000));
+    EXPECT_EQ(keysResult[5000].keyId, StringId(55000));
+    EXPECT_EQ(keysResult[9999].sourceId, StringId(9999));
+    EXPECT_EQ(keysResult[9999].keyId, StringId(59999));
 
     // Verify hashes match
     for (uint32_t i = 0; i < 10000; i++) {

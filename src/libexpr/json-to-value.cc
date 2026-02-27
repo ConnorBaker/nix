@@ -1,6 +1,7 @@
 #include "nix/expr/json-to-value.hh"
 #include "nix/expr/traced-data.hh"
 #include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace-context.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/eval.hh"
 
@@ -328,14 +329,16 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
 
         for (size_t idx = 0; idx < keys.size(); idx++) {
             auto & k = keys[idx];
-            auto childPathId = internDataPathChild(dataPathId, state.symbols.create(k));
+            auto childPathId = internDataPathChild(dataPathId, k);
+            auto * childNode = node->objectGet(k);
+            auto * childVal = state.allocValue();
+
             auto * childExpr = new ExprTracedData(
-                node->objectGet(k), sourceId, filePathId, childPathId);
-            auto * thunkVal = state.allocValue();
-            thunkVal->mkThunk(&state.baseEnv, childExpr);
+                childNode, sourceId, filePathId, childPathId);
+            childVal->mkThunk(&state.baseEnv, childExpr);
             forceNoNullByte(k);
             PosIdx keyPos = tracking ? state.positions.add(originHandle, idx) : PosIdx{};
-            attrs.insert(state.symbols.create(k), thunkVal, keyPos);
+            attrs.insert(state.symbols.create(k), childVal, keyPos);
         }
         v.mkAttrs(attrs);
         if (DependencyTracker::isActive()) {
@@ -373,11 +376,13 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         auto list = state.buildList(sz);
         for (size_t i = 0; i < sz; i++) {
             auto childPathId = internDataPathArrayChild(dataPathId, static_cast<int32_t>(i));
+            auto * childNode = node->arrayGet(i);
+            auto * childVal = state.allocValue();
+
             auto * childExpr = new ExprTracedData(
-                node->arrayGet(i), sourceId, filePathId, childPathId);
-            auto * thunkVal = state.allocValue();
-            thunkVal->mkThunk(&state.baseEnv, childExpr);
-            list[i] = thunkVal;
+                childNode, sourceId, filePathId, childPathId);
+            childVal->mkThunk(&state.baseEnv, childExpr);
+            list[i] = childVal;
         }
         v.mkList(list);
         if (DependencyTracker::isActive()) {

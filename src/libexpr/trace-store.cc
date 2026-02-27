@@ -212,12 +212,40 @@ static std::optional<DepHashValue> computeCurrentHash(
         [[fallthrough]];
     case DepType::StructuredContent: {
         // Key format: JSON object {"f":"path","t":"j","p":[...],"s":"keys","h":"key"}
+        // Or aggregated DirSet: {"ds":"<hex>","h":"keyName","t":"d","dirs":[...]}
         nlohmann::json j;
         try {
             j = nlohmann::json::parse(dep.key);
         } catch (...) {
             return std::nullopt;
         }
+
+        // Aggregated DirSet dep: iterate all directories, check each for the key
+        if (j.contains("ds")) {
+            auto hasKeyName = j.value("h", "");
+            if (hasKeyName.empty()) return std::nullopt;
+            auto dirs = j.value("dirs", nlohmann::json::array());
+            for (auto & dir : dirs) {
+                if (!dir.is_array() || dir.size() != 2) continue;
+                auto source = dir[0].get<std::string>();
+                auto filePath = dir[1].get<std::string>();
+                Dep fileDep{source, filePath, DepHashValue{Blake3Hash{}}, DepType::Directory};
+                auto path = resolveDepPath(fileDep, inputAccessors);
+                if (!path) continue;
+                try {
+                    auto cacheKey = source + '\t' + filePath;
+                    auto cacheIt = dirListingCache.find(cacheKey);
+                    if (cacheIt == dirListingCache.end())
+                        cacheIt = dirListingCache.emplace(cacheKey, path->readDirectory()).first;
+                    if (cacheIt->second.count(hasKeyName))
+                        return DepHashValue(depHash("1")); // key found in this dir
+                } catch (...) {
+                    continue;
+                }
+            }
+            return DepHashValue(depHash("0")); // key absent in all dirs
+        }
+
         auto filePath = j.value("f", "");
         auto formatStr = j.value("t", "");
         if (formatStr.empty()) return std::nullopt;
@@ -432,7 +460,7 @@ std::vector<uint8_t> TraceStore::serializeKeys(const std::vector<InternedDepKey>
     blob.reserve(keys.size() * sizeof(DepKeyBlobEntry));
 
     for (auto & key : keys) {
-        DepKeyBlobEntry entry{std::to_underlying(key.type), key.sourceId, key.keyId};
+        DepKeyBlobEntry entry{std::to_underlying(key.type), key.sourceId.value, key.keyId.value};
         auto * raw = reinterpret_cast<const uint8_t *>(&entry);
         blob.insert(blob.end(), raw, raw + sizeof(entry));
     }
@@ -467,8 +495,8 @@ std::vector<TraceStore::InternedDepKey> TraceStore::deserializeKeys(
 
         keys.push_back({
             static_cast<DepType>(entry.type),
-            entry.sourceId,
-            entry.keyId
+            StringId(entry.sourceId),
+            StringId(entry.keyId)
         });
     }
 
@@ -551,13 +579,17 @@ std::vector<Dep> TraceStore::resolveDeps(
     auto count = std::min(keys.size(), values.size());
     deps.reserve(count);
 
+    auto lookupStr = [this](StringId id) -> const std::string & {
+        static const std::string empty;
+        if (id.value > 0 && id.value <= stringTable.size()) return stringTable[id.value - 1];
+        return empty;
+    };
+
     for (size_t i = 0; i < count; ++i) {
         auto & k = keys[i];
-        auto sourceIt = stringTable.find(static_cast<StringId>(k.sourceId));
-        auto keyIt = stringTable.find(static_cast<StringId>(k.keyId));
         deps.push_back(Dep{
-            sourceIt != stringTable.end() ? sourceIt->second : "",
-            keyIt != stringTable.end() ? keyIt->second : "",
+            lookupStr(k.sourceId),
+            lookupStr(k.keyId),
             values[i],
             k.type
         });
@@ -574,8 +606,8 @@ std::vector<TraceStore::InternedDep> TraceStore::internDeps(const std::vector<De
     for (auto & dep : deps) {
         interned.push_back({
             dep.type,
-            static_cast<uint32_t>(doInternString(dep.source)),
-            static_cast<uint32_t>(doInternString(dep.key)),
+            doInternString(dep.source),
+            doInternString(dep.key),
             dep.expectedHash
         });
     }
@@ -693,48 +725,44 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
 
     st->db.exec(schema);
 
-    // Strings interning (UPSERT RETURNING: 1 statement instead of INSERT + SELECT)
-    st->upsertString.create(st->db,
-        "INSERT INTO Strings(value) VALUES (?) "
-        "ON CONFLICT(value) DO UPDATE SET value = excluded.value "
-        "RETURNING id");
-
+    // Strings — bulk load + explicit-ID insert (no UPSERT)
     st->getAllStrings.create(st->db,
         "SELECT id, value FROM Strings");
+    st->insertStringWithId.create(st->db,
+        "INSERT OR IGNORE INTO Strings(id, value) VALUES (?, ?)");
 
-    // AttrPaths interning (UPSERT RETURNING)
-    st->upsertAttrPath.create(st->db,
-        "INSERT INTO AttrPaths(path) VALUES (?) "
-        "ON CONFLICT(path) DO UPDATE SET path = excluded.path "
-        "RETURNING id");
+    // AttrPaths — bulk load + explicit-ID insert
+    st->getAllAttrPaths.create(st->db,
+        "SELECT id, path FROM AttrPaths");
+    st->insertAttrPathWithId.create(st->db,
+        "INSERT OR IGNORE INTO AttrPaths(id, path) VALUES (?, ?)");
 
     st->lookupAttrPathId.create(st->db,
         "SELECT id FROM AttrPaths WHERE path = ?");
 
-    // Results dedup (UPSERT RETURNING)
-    st->upsertResult.create(st->db,
-        "INSERT INTO Results(type, value, context, hash) VALUES (?, ?, ?, ?) "
-        "ON CONFLICT(hash) DO UPDATE SET type = excluded.type "
-        "RETURNING id");
+    // Results — bulk load + explicit-ID insert
+    st->getAllResults.create(st->db,
+        "SELECT id, type, value, context, hash FROM Results");
+    st->insertResultWithId.create(st->db,
+        "INSERT OR IGNORE INTO Results(id, type, value, context, hash) VALUES (?, ?, ?, ?, ?)");
 
     st->getResult.create(st->db,
         "SELECT type, value, context FROM Results WHERE id = ?");
 
-    // DepKeySets (content-addressed dep key storage, UPSERT RETURNING)
-    st->upsertDepKeySet.create(st->db,
-        "INSERT INTO DepKeySets(struct_hash, keys_blob) VALUES (?, ?) "
-        "ON CONFLICT(struct_hash) DO UPDATE SET struct_hash = excluded.struct_hash "
-        "RETURNING id");
+    // DepKeySets — bulk load + explicit-ID insert
+    st->getAllDepKeySets.create(st->db,
+        "SELECT id, struct_hash FROM DepKeySets");
+    st->insertDepKeySetWithId.create(st->db,
+        "INSERT OR IGNORE INTO DepKeySets(id, struct_hash, keys_blob) VALUES (?, ?, ?)");
 
     st->getDepKeySet.create(st->db,
         "SELECT struct_hash, keys_blob FROM DepKeySets WHERE id = ?");
 
-    // Traces (references DepKeySets via dep_key_set_id FK, UPSERT RETURNING)
-    st->upsertTrace.create(st->db,
-        "INSERT INTO Traces(trace_hash, dep_key_set_id, values_blob) "
-        "VALUES (?, ?, ?) "
-        "ON CONFLICT(trace_hash) DO UPDATE SET trace_hash = excluded.trace_hash "
-        "RETURNING id");
+    // Traces — bulk load + explicit-ID insert
+    st->getAllTraces.create(st->db,
+        "SELECT id, trace_hash, dep_key_set_id FROM Traces");
+    st->insertTraceWithId.create(st->db,
+        "INSERT OR IGNORE INTO Traces(id, trace_hash, dep_key_set_id, values_blob) VALUES (?, ?, ?, ?)");
 
     st->lookupTraceByFullHash.create(st->db,
         "SELECT id FROM Traces WHERE trace_hash = ?");
@@ -819,13 +847,81 @@ TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
         loadStatHashEntries(std::move(entries));
     }
 
+    // Bulk-load all interned entities into in-memory maps.
+    // Done here (not via bulkLoadAll()) because st already holds the lock.
+    {
+        auto use(st->getAllStrings.use());
+        while (use.next()) {
+            auto id = StringId(static_cast<uint32_t>(use.getInt(0)));
+            auto value = std::string(use.getStr(1));
+            if (id.value > stringTable.size()) stringTable.resize(id.value);
+            stringTable[id.value - 1] = value;
+            internedStrings[value] = id;
+            if (id > nextStringId) nextStringId = id;
+        }
+        stringTableLoaded = true;
+    }
+    {
+        auto use(st->getAllAttrPaths.use());
+        while (use.next()) {
+            auto id = AttrPathId(static_cast<uint32_t>(use.getInt(0)));
+            auto [pathBlob, pathSize] = use.getBlob(1);
+            auto pathStr = std::string(static_cast<const char *>(pathBlob), pathSize);
+            internedAttrPaths[pathStr] = id;
+            if (id > nextAttrPathId) nextAttrPathId = id;
+        }
+    }
+    {
+        auto use(st->getAllResults.use());
+        while (use.next()) {
+            auto id = ResultId(static_cast<uint32_t>(use.getInt(0)));
+            auto [hashBlob, hashSize] = use.getBlob(4);
+            if (hashBlob && hashSize == 32) {
+                auto h = readRawHash(hashBlob, hashSize);
+                resultByHash[h] = id;
+            }
+            if (id > nextResultId) nextResultId = id;
+        }
+    }
+    {
+        auto use(st->getAllDepKeySets.use());
+        while (use.next()) {
+            auto id = DepKeySetId(static_cast<uint32_t>(use.getInt(0)));
+            auto [hashBlob, hashSize] = use.getBlob(1);
+            if (hashBlob && hashSize == 32) {
+                auto h = readRawHash(hashBlob, hashSize);
+                depKeySetByStructHash[h] = id;
+            }
+            if (id > nextDepKeySetId) nextDepKeySetId = id;
+        }
+    }
+    {
+        auto use(st->getAllTraces.use());
+        while (use.next()) {
+            auto id = TraceId(static_cast<uint32_t>(use.getInt(0)));
+            auto [hashBlob, hashSize] = use.getBlob(1);
+            if (hashBlob && hashSize == 32) {
+                auto h = readRawHash(hashBlob, hashSize);
+                traceByTraceHash[h] = id;
+            }
+            if (id > nextTraceId) nextTraceId = id;
+        }
+    }
+
     _state = std::move(state);
+
     nrDbInitTimeUs += elapsedUs(initStart);
 }
 
 TraceStore::~TraceStore()
 {
     auto closeStart = timerStart();
+    // Flush all pending in-memory writes to SQLite
+    try {
+        flush();
+    } catch (...) {
+        ignoreExceptionExceptInterrupt();
+    }
     // Flush dirty stat-hash entries back to SQLite
     try {
         auto st(_state->lock());
@@ -879,26 +975,169 @@ void TraceStore::clearSessionCaches()
     verifiedTraceIds.clear();
     internedStrings.clear();
     internedAttrPaths.clear();
+    resultByHash.clear();
+    depKeySetByStructHash.clear();
+    traceByTraceHash.clear();
     traceDataCache.clear();
     traceRowCache.clear();
     depKeySetCache.clear();
     stringTable.clear();
     stringTableLoaded = false;
+    nextStringId = StringId();
+    nextAttrPathId = AttrPathId();
+    nextResultId = ResultId();
+    nextDepKeySetId = DepKeySetId();
+    nextTraceId = TraceId();
+    pendingStrings.clear();
+    pendingAttrPaths.clear();
+    pendingResults.clear();
+    pendingDepKeySets.clear();
+    pendingTraces.clear();
     currentDepHashes.clear();
+
+    // Repopulate in-memory maps from DB so the store remains usable
+    bulkLoadAll();
 }
 
 void TraceStore::ensureStringTableLoaded()
 {
     if (stringTableLoaded) return;
 
+    // Load from DB as fallback (normally already populated by bulkLoadAll)
     auto st(_state->lock());
     auto use(st->getAllStrings.use());
     while (use.next()) {
-        auto id = use.getInt(0);
-        auto value = use.getStr(1);
-        stringTable[id] = value;
+        auto id = StringId(static_cast<uint32_t>(use.getInt(0)));
+        auto value = std::string(use.getStr(1));
+        if (id.value > stringTable.size()) stringTable.resize(id.value);
+        stringTable[id.value - 1] = value;
+        internedStrings.emplace(value, id);
+        if (id > nextStringId) nextStringId = id;
     }
     stringTableLoaded = true;
+}
+
+// ── Bulk load / flush ────────────────────────────────────────────────
+
+void TraceStore::bulkLoadAll()
+{
+    auto st(_state->lock());
+
+    // Load Strings: populate BOTH forward and reverse maps
+    {
+        auto use(st->getAllStrings.use());
+        while (use.next()) {
+            auto id = StringId(static_cast<uint32_t>(use.getInt(0)));
+            auto value = std::string(use.getStr(1));
+            if (id.value > stringTable.size()) stringTable.resize(id.value);
+            stringTable[id.value - 1] = value;
+            internedStrings[value] = id;
+            if (id > nextStringId) nextStringId = id;
+        }
+        stringTableLoaded = true;
+    }
+
+    // Load AttrPaths: populate forward map
+    {
+        auto use(st->getAllAttrPaths.use());
+        while (use.next()) {
+            auto id = AttrPathId(static_cast<uint32_t>(use.getInt(0)));
+            auto [pathBlob, pathSize] = use.getBlob(1);
+            auto pathStr = std::string(static_cast<const char *>(pathBlob), pathSize);
+            internedAttrPaths[pathStr] = id;
+            if (id > nextAttrPathId) nextAttrPathId = id;
+        }
+    }
+
+    // Load Results: populate hash → id dedup map
+    {
+        auto use(st->getAllResults.use());
+        while (use.next()) {
+            auto id = ResultId(static_cast<uint32_t>(use.getInt(0)));
+            auto [hashBlob, hashSize] = use.getBlob(4);
+            if (hashBlob && hashSize == 32) {
+                auto h = readRawHash(hashBlob, hashSize);
+                resultByHash[h] = id;
+            }
+            if (id > nextResultId) nextResultId = id;
+        }
+    }
+
+    // Load DepKeySets: populate struct_hash → id dedup map
+    {
+        auto use(st->getAllDepKeySets.use());
+        while (use.next()) {
+            auto id = DepKeySetId(static_cast<uint32_t>(use.getInt(0)));
+            auto [hashBlob, hashSize] = use.getBlob(1);
+            if (hashBlob && hashSize == 32) {
+                auto h = readRawHash(hashBlob, hashSize);
+                depKeySetByStructHash[h] = id;
+            }
+            if (id > nextDepKeySetId) nextDepKeySetId = id;
+        }
+    }
+
+    // Load Traces: populate trace_hash → id dedup map
+    {
+        auto use(st->getAllTraces.use());
+        while (use.next()) {
+            auto id = TraceId(static_cast<uint32_t>(use.getInt(0)));
+            auto [hashBlob, hashSize] = use.getBlob(1);
+            if (hashBlob && hashSize == 32) {
+                auto h = readRawHash(hashBlob, hashSize);
+                traceByTraceHash[h] = id;
+            }
+            if (id > nextTraceId) nextTraceId = id;
+        }
+    }
+}
+
+void TraceStore::flush()
+{
+    auto st(_state->lock());
+
+    // Flush in dependency order: Strings → AttrPaths → Results → DepKeySets → Traces
+
+    for (auto & [id, value] : pendingStrings)
+        st->insertStringWithId.use()(static_cast<int64_t>(id.value))(value).exec();
+    pendingStrings.clear();
+
+    for (auto & [id, path] : pendingAttrPaths)
+        st->insertAttrPathWithId.use()
+            (static_cast<int64_t>(id.value))
+            (reinterpret_cast<const unsigned char *>(path.data()), path.size())
+            .exec();
+    pendingAttrPaths.clear();
+
+    for (auto & r : pendingResults) {
+        auto use(st->insertResultWithId.use());
+        use(static_cast<int64_t>(r.id.value));
+        use(static_cast<int64_t>(r.type));
+        use(r.value);
+        use(r.context);
+        bindRawHash(use, r.hash);
+        use.exec();
+    }
+    pendingResults.clear();
+
+    for (auto & dks : pendingDepKeySets) {
+        auto use(st->insertDepKeySetWithId.use());
+        use(static_cast<int64_t>(dks.id.value));
+        bindRawHash(use, dks.structHash);
+        bindBlobVec(use, dks.keysBlob);
+        use.exec();
+    }
+    pendingDepKeySets.clear();
+
+    for (auto & t : pendingTraces) {
+        auto use(st->insertTraceWithId.use());
+        use(static_cast<int64_t>(t.id.value));
+        bindRawHash(use, t.traceHash);
+        use(static_cast<int64_t>(t.depKeySetId.value));
+        bindBlobVec(use, t.valuesBlob);
+        use.exec();
+    }
+    pendingTraces.clear();
 }
 
 // ── CachedResult SQL encoding/decoding ──────────────────────────────────
@@ -1052,50 +1291,44 @@ CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
 
 StringId TraceStore::doInternString(std::string_view s)
 {
-    auto key = std::string(s);
-    auto it = internedStrings.find(key);
+    // Transparent lookup avoids string_view → string copy on cache hit
+    auto it = internedStrings.find(s);
     if (it != internedStrings.end())
         return it->second;
 
-    auto st(_state->lock());
-    auto use(st->upsertString.use()(s));
-    if (!use.next())
-        throw Error("failed to intern string '%s'", s);
-    StringId id = use.getInt(0);
-    internedStrings[key] = id;
-    stringTable[id] = key;
+    auto id = StringId(++nextStringId.value);
+    auto owned = std::string(s);
+    internedStrings[owned] = id;
+    if (id.value > stringTable.size()) stringTable.resize(id.value);
+    stringTable[id.value - 1] = owned;
+    pendingStrings.push_back({id, std::move(owned)});
     return id;
 }
 
 AttrPathId TraceStore::doInternAttrPath(std::string_view path)
 {
-    auto key = std::string(path);
-    auto it = internedAttrPaths.find(key);
+    auto it = internedAttrPaths.find(path);
     if (it != internedAttrPaths.end())
         return it->second;
 
-    auto st(_state->lock());
-    auto use(st->upsertAttrPath.use()
-        (reinterpret_cast<const unsigned char *>(path.data()), path.size()));
-    if (!use.next())
-        throw Error("failed to intern attr path");
-    AttrPathId id = use.getInt(0);
-    internedAttrPaths[key] = id;
+    auto id = AttrPathId(++nextAttrPathId.value);
+    auto owned = std::string(path);
+    internedAttrPaths[owned] = id;
+    pendingAttrPaths.push_back({id, std::move(owned)});
     return id;
 }
 
 ResultId TraceStore::doInternResult(ResultKind type, const std::string & value,
                                      const std::string & context, const Hash & resultHash)
 {
-    auto st(_state->lock());
-    auto use(st->upsertResult.use());
-    use(static_cast<int64_t>(type));
-    use(value);
-    use(context);
-    bindRawHash(use, resultHash);
-    if (!use.next())
-        throw Error("failed to intern result");
-    return use.getInt(0);
+    auto it = resultByHash.find(resultHash);
+    if (it != resultByHash.end())
+        return it->second;
+
+    auto id = ResultId(++nextResultId.value);
+    resultByHash[resultHash] = id;
+    pendingResults.push_back({id, type, value, context, resultHash});
+    return id;
 }
 
 // ── Trace storage (BSàlC trace store) ───────────────────────────────
@@ -1109,7 +1342,7 @@ TraceStore::CachedTraceData * TraceStore::ensureTraceHashes(TraceId traceId)
 
     auto st(_state->lock());
     // getTraceInfo columns: 0=trace_hash, 1=struct_hash, 2=dep_key_set_id, 3=keys_blob, 4=values_blob
-    auto use(st->getTraceInfo.use()(traceId));
+    auto use(st->getTraceInfo.use()(static_cast<int64_t>(traceId.value)));
     if (!use.next())
         return nullptr;
 
@@ -1131,7 +1364,7 @@ Hash TraceStore::getTraceStructHash(TraceId traceId)
 {
     auto * data = ensureTraceHashes(traceId);
     if (!data)
-        throw Error("trace %d not found", traceId);
+        throw Error("trace %d not found", traceId.value);
     return data->structHash;
 }
 
@@ -1148,11 +1381,11 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
     // Single DB read via JOIN — keys from DepKeySets, values from Traces
     // getTraceInfo columns: 0=trace_hash, 1=struct_hash, 2=dep_key_set_id, 3=keys_blob, 4=values_blob
     std::vector<uint8_t> keysBlobCopy, valuesBlobCopy;
-    DepKeySetId depKeySetId = 0;
+    DepKeySetId depKeySetId;
     Hash traceHash(HashAlgorithm::BLAKE3), structHash(HashAlgorithm::BLAKE3);
     {
         auto st(_state->lock());
-        auto use(st->getTraceInfo.use()(traceId));
+        auto use(st->getTraceInfo.use()(static_cast<int64_t>(traceId.value)));
         if (!use.next()) {
             // Trace not found in DB — don't create a cache entry with
             // placeholder hashes, as ensureTraceHashes would incorrectly
@@ -1166,7 +1399,7 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
         traceHash = readRawHash(thData, thSize);
         auto [shData, shSize] = use.getBlob(1);
         structHash = readRawHash(shData, shSize);
-        depKeySetId = use.getInt(2);
+        depKeySetId = DepKeySetId(static_cast<uint32_t>(use.getInt(2)));
 
         auto [keysData, keysSize] = use.getBlob(3);
         if (keysData && keysSize > 0) {
@@ -1214,7 +1447,7 @@ std::vector<TraceStore::InternedDepKey> TraceStore::loadKeySet(DepKeySetId depKe
         return cacheIt->second;
 
     auto st(_state->lock());
-    auto use(st->getDepKeySet.use()(depKeySetId));
+    auto use(st->getDepKeySet.use()(static_cast<int64_t>(depKeySetId.value)));
     if (!use.next())
         return {};
 
@@ -1236,13 +1469,14 @@ DepKeySetId TraceStore::getOrCreateDepKeySet(
     const Hash & structHash,
     const std::vector<uint8_t> & keysBlob)
 {
-    auto st(_state->lock());
-    auto use(st->upsertDepKeySet.use());
-    bindRawHash(use, structHash);
-    bindBlobVec(use, keysBlob);
-    if (!use.next())
-        throw Error("failed to get or create dep key set");
-    return use.getInt(0);
+    auto it = depKeySetByStructHash.find(structHash);
+    if (it != depKeySetByStructHash.end())
+        return it->second;
+
+    auto id = DepKeySetId(++nextDepKeySetId.value);
+    depKeySetByStructHash[structHash] = id;
+    pendingDepKeySets.push_back({id, structHash, keysBlob});
+    return id;
 }
 
 TraceId TraceStore::getOrCreateTrace(
@@ -1250,14 +1484,14 @@ TraceId TraceStore::getOrCreateTrace(
     DepKeySetId depKeySetId,
     const std::vector<uint8_t> & valuesBlob)
 {
-    auto st(_state->lock());
-    auto use(st->upsertTrace.use());
-    bindRawHash(use, traceHash);
-    use(depKeySetId);
-    bindBlobVec(use, valuesBlob);
-    if (!use.next())
-        throw Error("failed to get or create trace");
-    return use.getInt(0);
+    auto it = traceByTraceHash.find(traceHash);
+    if (it != traceByTraceHash.end())
+        return it->second;
+
+    auto id = TraceId(++nextTraceId.value);
+    traceByTraceHash[traceHash] = id;
+    pendingTraces.push_back({id, traceHash, depKeySetId, valuesBlob});
+    return id;
 }
 
 // ── Trace verification (BSàlC VT check) ─────────────────────────────
@@ -1282,6 +1516,8 @@ struct FileIdentity {
 
 static FileIdentity scFileIdentity(const Dep & dep) {
     auto j = nlohmann::json::parse(dep.key);
+    if (j.contains("ds"))
+        return {dep.source, "ds:" + j["ds"].get<std::string>()};
     return {dep.source, j["f"].get<std::string>()};
 }
 
@@ -1294,7 +1530,7 @@ static FileIdentity contentFileIdentity(const Dep & dep) {
 static void sortAndDedupInterned(std::vector<TraceStore::InternedDep> & deps);
 static Hash computeTraceHashFromInterned(
     const std::vector<TraceStore::InternedDep> & sorted,
-    const std::function<std::string_view(uint32_t)> & lookupString);
+    const std::function<std::string_view(StringId)> & lookupString);
 
 bool TraceStore::verifyTrace(
     TraceId traceId,
@@ -1511,10 +1747,24 @@ bool TraceStore::verifyTrace(
         // unchanged means the source's structural contribution is unchanged).
         allValid = true;
 
-        // Build coverage sets: which files are covered by SC vs ImplicitShape
+        // Build coverage sets: which files are covered by SC vs ImplicitShape.
+        // DirSet deps expand to cover all their constituent directories.
         std::unordered_set<FileIdentity, FileIdentity::Hash> structuralCoveredFiles;
         for (auto * dep : structuralDeps) {
-            structuralCoveredFiles.insert(scFileIdentity(*dep));
+            auto fi = scFileIdentity(*dep);
+            structuralCoveredFiles.insert(fi);
+            // DirSet dep: also cover each individual directory
+            if (fi.filePath.starts_with("ds:")) {
+                try {
+                    auto j = nlohmann::json::parse(dep->key);
+                    if (j.contains("dirs")) {
+                        for (auto & dir : j["dirs"]) {
+                            if (dir.is_array() && dir.size() == 2)
+                                structuralCoveredFiles.insert({dir[0].get<std::string>(), dir[1].get<std::string>()});
+                        }
+                    }
+                } catch (...) {}
+            }
         }
 
         std::unordered_set<FileIdentity, FileIdentity::Hash> implicitCoveredFiles;
@@ -1630,9 +1880,8 @@ bool TraceStore::verifyTrace(
             auto interned = internDeps(currentDeps);
             sortAndDedupInterned(interned);
             ensureStringTableLoaded();
-            auto lookupStr = [this](uint32_t id) -> std::string_view {
-                auto it = stringTable.find(static_cast<StringId>(id));
-                if (it != stringTable.end()) return it->second;
+            auto lookupStr = [this](StringId id) -> std::string_view {
+                if (id.value > 0 && id.value <= stringTable.size()) return stringTable[id.value - 1];
                 return "";
             };
             auto newTraceHash = computeTraceHashFromInterned(interned, lookupStr);
@@ -1673,17 +1922,17 @@ std::optional<TraceStore::TraceRow> TraceStore::lookupTraceRow(std::string_view 
             (reinterpret_cast<const unsigned char *>(attrPath.data()), attrPath.size()));
         if (!use.next())
             return std::nullopt;
-        attrPathId = use.getInt(0);
+        attrPathId = AttrPathId(static_cast<uint32_t>(use.getInt(0)));
         internedAttrPaths[pathKey] = attrPathId;
     }
 
-    auto use(st->lookupAttr.use()(contextHash)(attrPathId));
+    auto use(st->lookupAttr.use()(contextHash)(attrPathId.value));
     if (!use.next())
         return std::nullopt;
 
     TraceRow row;
-    row.traceId = use.getInt(0);
-    row.resultId = use.getInt(1);
+    row.traceId = TraceId(static_cast<uint32_t>(use.getInt(0)));
+    row.resultId = ResultId(static_cast<uint32_t>(use.getInt(1)));
     row.type = static_cast<ResultKind>(use.getInt(2));
     row.value = use.isNull(3) ? "" : use.getStr(3);
     row.context = use.isNull(4) ? "" : use.getStr(4);
@@ -1736,7 +1985,7 @@ static void sortAndDedupInterned(std::vector<TraceStore::InternedDep> & deps)
         }), deps.end());
 }
 
-using StringLookup = std::function<std::string_view(uint32_t)>;
+using StringLookup = std::function<std::string_view(StringId)>;
 
 static void feedInternedDepToSink(
     HashSink & sink,
@@ -1798,9 +2047,8 @@ TraceStore::RecordResult TraceStore::record(
     sortAndDedupInterned(interned);
 
     // 3. String lookup for hash computation
-    auto lookupString = [this](uint32_t id) -> std::string_view {
-        auto it = stringTable.find(static_cast<StringId>(id));
-        if (it != stringTable.end()) return it->second;
+    auto lookupString = [this](StringId id) -> std::string_view {
+        if (id.value > 0 && id.value <= stringTable.size()) return stringTable[id.value - 1];
         return "";
     };
 
@@ -1833,13 +2081,16 @@ TraceStore::RecordResult TraceStore::record(
     // 10. Get or create trace (keyed by trace_hash, stores dep_key_set_id + values_blob)
     TraceId traceId = getOrCreateTrace(traceHash, depKeySetId, valuesBlob);
 
-    // 11. Upsert Attrs + insert History
+    // 11. Flush pending entities to DB (IDs must exist before FK references)
+    flush();
+
+    // 12. Upsert Attrs + insert History
     {
         auto st(_state->lock());
         st->upsertAttr.use()
-            (contextHash)(attrPathId)(traceId)(resultId).exec();
+            (contextHash)(static_cast<int64_t>(attrPathId.value))(static_cast<int64_t>(traceId.value))(static_cast<int64_t>(resultId.value)).exec();
         st->insertHistory.use()
-            (contextHash)(attrPathId)(traceId)(resultId).exec();
+            (contextHash)(static_cast<int64_t>(attrPathId.value))(static_cast<int64_t>(traceId.value))(static_cast<int64_t>(resultId.value)).exec();
     }
 
     // 12. Session caches
@@ -1992,7 +2243,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             auto use(st->lookupAttrPathId.use()
                 (reinterpret_cast<const unsigned char *>(attrPath.data()), attrPath.size()));
             if (use.next()) {
-                attrPathId = use.getInt(0);
+                attrPathId = AttrPathId(static_cast<uint32_t>(use.getInt(0)));
                 internedAttrPaths[pathKey] = *attrPathId;
             }
         }
@@ -2004,7 +2255,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         return std::nullopt;
     }
 
-    std::unordered_set<TraceId> triedTraceIds;
+    boost::unordered_flat_set<TraceId, TraceId::Hash> triedTraceIds;
 
     // === Pre-load: scan history with widened query ===
     // Single DB query pre-loads trace_hash + result data for ALL history entries.
@@ -2031,15 +2282,15 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         auto st(_state->lock());
         // scanHistoryForAttr columns: 0=dk.id, 1=dk.struct_hash, 2=h.trace_id,
         //   3=h.result_id, 4=t.trace_hash, 5=r.type, 6=r.value, 7=r.context
-        auto use(st->scanHistoryForAttr.use()(contextHash)(*attrPathId));
+        auto use(st->scanHistoryForAttr.use()(contextHash)(static_cast<int64_t>(attrPathId->value)));
         while (use.next()) {
             auto [shData, shSize] = use.getBlob(1);
             auto [thData, thSize] = use.getBlob(4);
             historyEntries.emplace_back(
-                use.getInt(0),
+                DepKeySetId(static_cast<uint32_t>(use.getInt(0))),
                 readRawHash(shData, shSize),
-                use.getInt(2),
-                use.getInt(3),
+                TraceId(static_cast<uint32_t>(use.getInt(2))),
+                ResultId(static_cast<uint32_t>(use.getInt(3))),
                 readRawHash(thData, thSize),
                 static_cast<ResultKind>(use.getInt(5)),
                 use.isNull(6) ? "" : use.getStr(6),
@@ -2083,7 +2334,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         {
             auto st(_state->lock());
             st->upsertAttr.use()
-                (contextHash)(*attrPathId)(entry.traceId)(entry.resultId).exec();
+                (contextHash)(static_cast<int64_t>(attrPathId->value))(static_cast<int64_t>(entry.traceId.value))(static_cast<int64_t>(entry.resultId.value)).exec();
         }
 
         // Update traceRowCache so subsequent lookupTraceRow/getCurrentTraceHash
@@ -2097,9 +2348,8 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     };
 
     // String lookup for interned hash computation (used by both recovery paths)
-    auto lookupString = [this](uint32_t id) -> std::string_view {
-        auto it = stringTable.find(static_cast<StringId>(id));
-        if (it != stringTable.end()) return it->second;
+    auto lookupString = [this](StringId id) -> std::string_view {
+        if (id.value > 0 && id.value <= stringTable.size()) return stringTable[id.value - 1];
         return "";
     };
 
@@ -2144,8 +2394,8 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     // Group by dep_key_set_id (integer), pick one representative per group.
     // Using dep_key_set_id instead of struct_hash for grouping is more efficient
     // (integer comparison vs 32-byte hash comparison).
-    std::unordered_map<DepKeySetId, TraceId> structGroups;
-    std::unordered_map<DepKeySetId, Hash> groupStructHashes;
+    boost::unordered_flat_map<DepKeySetId, TraceId, DepKeySetId::Hash> structGroups;
+    boost::unordered_flat_map<DepKeySetId, Hash, DepKeySetId::Hash> groupStructHashes;
     for (auto & e : historyEntries) {
         if (triedTraceIds.count(e.traceId))
             continue;
@@ -2179,10 +2429,10 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             }
 
             // Resolve string IDs to strings
-            auto sourceIt = stringTable.find(static_cast<StringId>(key.sourceId));
-            auto keyIt = stringTable.find(static_cast<StringId>(key.keyId));
-            std::string source = sourceIt != stringTable.end() ? sourceIt->second : "";
-            std::string depKey = keyIt != stringTable.end() ? keyIt->second : "";
+            std::string source = key.sourceId.value > 0 && key.sourceId.value <= stringTable.size()
+                ? stringTable[key.sourceId.value - 1] : "";
+            std::string depKey = key.keyId.value > 0 && key.keyId.value <= stringTable.size()
+                ? stringTable[key.keyId.value - 1] : "";
 
             // ParentContext: verify first, then get (potentially updated) hash.
             if (depKind(type) == DepKind::ParentContext) {

@@ -4,11 +4,15 @@
 #include "nix/expr/eval-trace-deps.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/util/sync.hh"
+#include "nix/util/traced-data-ids.hh"
 
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
+
+#include <cstring>
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace nix {
@@ -17,20 +21,64 @@ class EvalState;
 
 namespace nix::eval_trace {
 
-/** SQLite rowid for the Traces table. */
-using TraceId = int64_t;
+// ── Strongly-typed IDs for trace store entities ──────────────────────
+//
+// Dense uint32_t IDs assigned in-memory (starting at 1). Correspond to
+// SQLite INTEGER PRIMARY KEY rowids but are assigned by the application,
+// not by SQLite autoincrement. Flushed to DB periodically via flush().
 
-/** SQLite rowid for the Results table. */
-using ResultId = int64_t;
+struct TraceIdTag {};
+struct ResultIdTag {};
+struct StringIdTag {};
+struct AttrPathIdTag {};
+struct DepKeySetIdTag {};
 
-/** SQLite rowid for the Strings table. */
-using StringId = int64_t;
+/** ID for the Traces table (one per unique dep-structure + dep-values combination). */
+using TraceId = StrongId<TraceIdTag, uint32_t>;
 
-/** SQLite rowid for the AttrPaths table. */
-using AttrPathId = int64_t;
+/** ID for the Results table (one per unique result content hash). */
+using ResultId = StrongId<ResultIdTag, uint32_t>;
 
-/** SQLite rowid for the DepKeySets table. */
-using DepKeySetId = int64_t;
+/** ID for the Strings table (interned dep source names and dep key strings). */
+using StringId = StrongId<StringIdTag, uint32_t>;
+
+/** ID for the AttrPaths table (null-byte-separated attribute paths). */
+using AttrPathId = StrongId<AttrPathIdTag, uint32_t>;
+
+/** ID for the DepKeySets table (content-addressed dep key sets, keyed by struct_hash). */
+using DepKeySetId = StrongId<DepKeySetIdTag, uint32_t>;
+
+// ── Hash helpers for boost flat maps ─────────────────────────────────
+
+/** Transparent string hash — avoids string_view → string copy on cache hit. */
+struct TransparentStringHash {
+    using is_transparent = void;
+    using is_avalanching = void;
+
+    std::size_t operator()(std::string_view sv) const noexcept {
+        return boost::hash<std::string_view>{}(sv);
+    }
+};
+
+/** Transparent string equality. */
+struct TransparentStringEqual {
+    using is_transparent = void;
+
+    bool operator()(std::string_view a, std::string_view b) const noexcept {
+        return a == b;
+    }
+};
+
+/** Hash for nix::Hash keys (uses first 8 bytes of BLAKE3 — well-distributed). */
+struct HashKeyHash {
+    using is_avalanching = void;
+
+    std::size_t operator()(const Hash & h) const noexcept {
+        std::size_t result;
+        std::memcpy(&result, h.hash, sizeof(result));
+        return result;
+    }
+};
 
 /** SQLite-backed trace store for the eval trace system.
  *  Not thread-safe: must be used from a single thread. The session caches
@@ -41,24 +89,28 @@ struct TraceStore {
     struct State {
         SQLite db;
 
-        // Strings interning (UPSERT RETURNING)
-        SQLiteStmt upsertString;
+        // Strings — read-all for bulk load, explicit-ID insert for flush
         SQLiteStmt getAllStrings;
+        SQLiteStmt insertStringWithId;
 
-        // AttrPaths interning (UPSERT RETURNING)
-        SQLiteStmt upsertAttrPath;
+        // AttrPaths — read-all for bulk load, explicit-ID insert for flush
+        SQLiteStmt getAllAttrPaths;
+        SQLiteStmt insertAttrPathWithId;
         SQLiteStmt lookupAttrPathId;  // read-only lookup (no insert)
 
-        // Results dedup (UPSERT RETURNING)
-        SQLiteStmt upsertResult;
+        // Results — read-all for bulk load, explicit-ID insert for flush
+        SQLiteStmt getAllResults;
+        SQLiteStmt insertResultWithId;
         SQLiteStmt getResult;
 
         // DepKeySets (content-addressed dep key storage, keyed by struct_hash)
-        SQLiteStmt upsertDepKeySet;
+        SQLiteStmt getAllDepKeySets;
+        SQLiteStmt insertDepKeySetWithId;
         SQLiteStmt getDepKeySet;
 
         // Traces (references DepKeySets via dep_key_set_id FK, stores values_blob)
-        SQLiteStmt upsertTrace;
+        SQLiteStmt getAllTraces;
+        SQLiteStmt insertTraceWithId;
         SQLiteStmt lookupTraceByFullHash;
         SQLiteStmt getTraceInfo;
 
@@ -81,20 +133,20 @@ struct TraceStore {
     SymbolTable & symbols;
     int64_t contextHash;
 
-    // Interned dep key (string IDs, no hash value — used for keys_blob serialization)
-    // Ordering is not required; these are serialized positionally in keys_blob
+    // Interned dep key (string IDs, no hash value — used for keys_blob serialization).
+    // Ordering is not required; entries are serialized positionally in keys_blob
     // and indexed by DepKeySetId in the session cache.
     struct InternedDepKey {
         DepType type;
-        uint32_t sourceId;
-        uint32_t keyId;
+        StringId sourceId;
+        StringId keyId;
     };
 
     // Interned dep entry (key + hash value — used for full dep reconstruction)
     struct InternedDep {
         DepType type;
-        uint32_t sourceId;
-        uint32_t keyId;
+        StringId sourceId;
+        StringId keyId;
         DepHashValue hash;
     };
 
@@ -116,49 +168,112 @@ struct TraceStore {
         Hash structHash{HashAlgorithm::BLAKE3};
         std::optional<std::vector<Dep>> deps;
 
-        /** True if hash fields have been populated from DB (non-placeholder). */
+        /** True if hash fields have been populated from DB (non-placeholder).
+         *  Checks traceHash — if it's populated, structHash was populated
+         *  at the same time (both are set together in ensureTraceHashes/loadFullTrace). */
         bool hashesPopulated() const {
-            // Check traceHash — if it's populated, structHash was populated
-            // at the same time (both are set together in ensureTraceHashes/loadFullTrace).
             for (size_t i = 0; i < traceHash.hashSize; i++)
                 if (traceHash.hash[i] != 0) return true;
             return false;
         }
     };
 
-    // Session caches — all unordered because we only need O(1) lookup by key,
-    // not iteration in any particular order.
-    std::unordered_set<TraceId> verifiedTraceIds;
-    std::unordered_map<std::string, StringId> internedStrings;
-    std::unordered_map<std::string, AttrPathId> internedAttrPaths;
+    // ── Session caches (boost flat containers for cache locality) ─────
 
-    // Unified per-trace cache, replacing the old separate traceCache and
-    // traceStructHashCache. Keyed by TraceId (DB rowid) — unique per trace.
-    std::unordered_map<TraceId, CachedTraceData> traceDataCache;
+    /// Trace IDs verified in this session (skip re-verification).
+    boost::unordered_flat_set<TraceId, TraceId::Hash> verifiedTraceIds;
 
-    // lookupTraceRow cache: attrPath (canonical \0-separated) → TraceRow.
-    // std::string correctly handles embedded \0 bytes in both hashing and comparison.
-    // Avoids repeated CurrentTraces DB lookups for the same attr path.
-    // Invalidated when CurrentTraces changes for a path (in recovery and record).
-    std::unordered_map<std::string, TraceRow> traceRowCache;
+    /// Forward maps: string → ID (transparent lookup avoids string_view copy)
+    boost::unordered_flat_map<std::string, StringId,
+        TransparentStringHash, TransparentStringEqual> internedStrings;
+    boost::unordered_flat_map<std::string, AttrPathId,
+        TransparentStringHash, TransparentStringEqual> internedAttrPaths;
 
-    // DepKeySet session cache: maps DepKeySetId → resolved dep keys.
-    // Keyed by integer ID (not hash) because we look up by ID after DB queries.
-    // Avoids re-decompressing keys_blob when multiple traces share a key set.
-    std::unordered_map<DepKeySetId, std::vector<InternedDepKey>> depKeySetCache;
+    /// Content-addressed dedup maps (in-memory, flushed to DB periodically)
+    boost::unordered_flat_map<Hash, ResultId, HashKeyHash> resultByHash;
+    boost::unordered_flat_map<Hash, DepKeySetId, HashKeyHash> depKeySetByStructHash;
+    boost::unordered_flat_map<Hash, TraceId, HashKeyHash> traceByTraceHash;
 
-    // Session string table (reverse: id -> string, for BLOB deserialization)
-    std::unordered_map<StringId, std::string> stringTable;
+    /// Unified per-trace cache, keyed by TraceId. Replaces the old separate
+    /// traceCache and traceStructHashCache.
+    boost::unordered_flat_map<TraceId, CachedTraceData, TraceId::Hash> traceDataCache;
+
+    /// lookupTraceRow cache: attrPath (canonical \0-separated) → TraceRow.
+    /// std::string correctly handles embedded \0 bytes in both hashing and comparison.
+    /// Avoids repeated CurrentTraces DB lookups for the same attr path.
+    /// Invalidated when CurrentTraces changes for a path (in recovery and record).
+    boost::unordered_flat_map<std::string, TraceRow,
+        TransparentStringHash, TransparentStringEqual> traceRowCache;
+
+    /// DepKeySet session cache: maps DepKeySetId → resolved dep keys.
+    /// Keyed by integer ID (not hash) because we look up by ID after DB queries.
+    /// Avoids re-decompressing keys_blob when multiple traces share a key set.
+    boost::unordered_flat_map<DepKeySetId, std::vector<InternedDepKey>, DepKeySetId::Hash> depKeySetCache;
+
+    /// Reverse map: ID → string (O(1) lookup by index, indexed by id.value-1).
+    /// Populated by bulkLoadAll() at startup and by doInternString() for new strings.
+    std::vector<std::string> stringTable;
     bool stringTableLoaded = false;
     void ensureStringTableLoaded();
 
-    // Current dep hash cache (persists across verification → recovery within session).
-    // Value is nullopt if the dep's resource is unavailable (e.g., file deleted);
-    // this caches the failure to avoid re-attempting expensive hash computations.
-    std::unordered_map<DepKey, std::optional<DepHashValue>, DepKey::Hash> currentDepHashes;
+    /// Current dep hash cache (persists across verification → recovery within session).
+    /// Value is nullopt if the dep's resource is unavailable (e.g., file deleted);
+    /// this caches the failure to avoid re-attempting expensive hash computations.
+    boost::unordered_flat_map<DepKey, std::optional<DepHashValue>, DepKey::Hash> currentDepHashes;
+
+    // ── In-memory ID counters (next ID to assign = max(DB IDs) + 1) ──
+
+    StringId nextStringId;
+    AttrPathId nextAttrPathId;
+    ResultId nextResultId;
+    DepKeySetId nextDepKeySetId;
+    TraceId nextTraceId;
+
+    // ── Pending writes (deferred to flush()) ─────────────────────────
+
+    std::vector<std::pair<StringId, std::string>> pendingStrings;
+
+    std::vector<std::pair<AttrPathId, std::string>> pendingAttrPaths;
+
+    struct PendingResult {
+        ResultId id;
+        ResultKind type;
+        std::string value;
+        std::string context;
+        Hash hash;
+    };
+    std::vector<PendingResult> pendingResults;
+
+    struct PendingDepKeySet {
+        DepKeySetId id;
+        Hash structHash;
+        std::vector<uint8_t> keysBlob;
+    };
+    std::vector<PendingDepKeySet> pendingDepKeySets;
+
+    struct PendingTrace {
+        TraceId id;
+        Hash traceHash;
+        DepKeySetId depKeySetId;
+        std::vector<uint8_t> valuesBlob;
+    };
+    std::vector<PendingTrace> pendingTraces;
+
+    // ── Lifecycle ────────────────────────────────────────────────────
 
     TraceStore(SymbolTable & symbols, int64_t contextHash);
     ~TraceStore();
+
+    /** Bulk-load all interned entities from DB into in-memory maps.
+     *  Called once from constructor after schema creation, and again
+     *  from clearSessionCaches() to repopulate after a reset. */
+    void bulkLoadAll();
+
+    /** Flush all pending writes to SQLite in dependency order
+     *  (Strings → AttrPaths → Results → DepKeySets → Traces).
+     *  Called from record() before upsertAttr/insertHistory, and
+     *  from the destructor before committing the transaction. */
+    void flush();
 
     struct VerifyResult {
         CachedResult value;
@@ -252,21 +367,29 @@ struct TraceStore {
     std::vector<InternedDepKey> loadKeySet(DepKeySetId depKeySetId);
 
     bool attrExists(std::string_view attrPath);
+
     /** Get the current trace hash for an attr path (for ParentContext dep verification).
      *  Returns the trace_hash from the Traces table, which captures the full dep
      *  structure + hashes. Unlike a result hash (which for attrsets only captures
      *  attribute names), the trace hash changes when any dep value changes. */
     std::optional<Hash> getCurrentTraceHash(std::string_view attrPath);
+
     void clearSessionCaches();
     static std::string buildAttrPath(const std::vector<std::string> & components);
 
-    // BLOB serialization for dep key sets (keys only, no hash values)
+    // ── BLOB serialization ───────────────────────────────────────────
+
+    /// Serialize dep key set to packed 9-byte entries (type[1] + sourceId[4] + keyId[4]),
+    /// zstd compressed. Stored in DepKeySets table, shared across traces with
+    /// the same dep structure (same struct_hash).
     static std::vector<uint8_t> serializeKeys(const std::vector<InternedDepKey> & keys);
     static std::vector<InternedDepKey> deserializeKeys(const void * blob, size_t size);
 
-    // BLOB serialization for dep hash values (positional, matching key set order).
-    // deserializeValues needs the key types to distinguish Blake3Hash (32 bytes)
-    // from string values that happen to be 32 bytes (e.g., store paths).
+    /// Serialize dep hash values to per-entry hashLen[1] + hashData[hashLen],
+    /// zstd compressed. Stored in Traces table. Entries are positionally matched
+    /// with keys_blob in the corresponding DepKeySets row.
+    /// deserializeValues needs the key types to distinguish Blake3Hash (32 bytes)
+    /// from string values that happen to be 32 bytes (e.g., store paths).
     static std::vector<uint8_t> serializeValues(const std::vector<InternedDep> & deps);
     static std::vector<DepHashValue> deserializeValues(
         const void * blob, size_t size, const std::vector<InternedDepKey> & keys);

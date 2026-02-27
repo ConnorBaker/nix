@@ -6,6 +6,7 @@
 /// Lives in libutil so that Pos::TracedData (position.hh) can use them.
 
 #include <cstdint>
+#include <functional>
 
 namespace nix {
 
@@ -25,6 +26,14 @@ struct StrongId {
     constexpr bool operator==(const StrongId &) const = default;
     constexpr auto operator<=>(const StrongId &) const = default;
     constexpr explicit operator bool() const { return value != Repr{}; }
+
+    /// Hash functor for boost::unordered_flat_map/set.
+    struct Hash {
+        using is_avalanching = void;
+        std::size_t operator()(const StrongId & id) const noexcept {
+            return std::hash<Repr>{}(id.value);
+        }
+    };
 };
 
 struct DepSourceTag {};

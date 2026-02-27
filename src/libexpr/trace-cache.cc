@@ -74,19 +74,23 @@ struct TracedExpr : Expr, gc
     TracedExpr * parentExpr; // GC-traced, nullptr for root
     bool isListElement;      // true = list index, false = attr access
 
-    Expr * origExpr = nullptr;
-    Env * origEnv = nullptr;
-
     /**
-     * The trace ID for this attribute's trace (dependency record).
-     * Set after verify path succeeds or fresh evaluation records the result.
+     * Lazy-initialized state for fields only needed when eval() or
+     * navigateToReal() runs. Reduces per-child allocation from ~100 to ~40 bytes.
+     * For unaccessed children (the vast majority), LazyState is never allocated.
      */
-    std::optional<TraceId> traceId;
+    struct LazyState : gc {
+        Expr * origExpr = nullptr;
+        Env * origEnv = nullptr;
+        std::optional<TraceId> traceId;
+        mutable std::optional<std::string> cachedStoreAttrPath;
+    };
+    LazyState * lazy = nullptr;
 
-    /**
-     * Cached storeAttrPath result. Lazily populated on first call.
-     */
-    mutable std::optional<std::string> cachedStoreAttrPath;
+    LazyState & ensureLazy() {
+        if (!lazy) lazy = new LazyState{};
+        return *lazy;
+    }
 
     TracedExpr(TraceCache * cache, AttrId /*unused*/, Symbol name, TracedExpr * parentExpr,
                bool isListElement = false)
@@ -117,8 +121,8 @@ struct TracedExpr : Expr, gc
 
     std::string storeAttrPath() const
     {
-        if (cachedStoreAttrPath)
-            return *cachedStoreAttrPath;
+        if (lazy && lazy->cachedStoreAttrPath)
+            return *lazy->cachedStoreAttrPath;
         std::string result;
         if (!parentExpr) {
             result = ""; // root
@@ -129,14 +133,14 @@ struct TracedExpr : Expr, gc
             std::reverse(components.begin(), components.end());
             result = TraceStore::buildAttrPath(components);
         }
-        cachedStoreAttrPath = result;
+        const_cast<TracedExpr *>(this)->ensureLazy().cachedStoreAttrPath = result;
         return result;
     }
 
     std::optional<TraceId> parentTraceId() const
     {
         if (!parentExpr) return std::nullopt;
-        return parentExpr->traceId;
+        return parentExpr->lazy ? parentExpr->lazy->traceId : std::nullopt;
     }
 
     void evaluateFresh(Value & v);
@@ -194,7 +198,7 @@ struct SiblingAccessTracker
     {
         if (!current) return;
         if (expr->parentExpr != current->parentExpr) return;
-        if (!expr->traceId) return;
+        if (!expr->lazy || !expr->lazy->traceId) return;
         try {
             auto path = expr->storeAttrPath();
             auto hash = db.getCurrentTraceHash(path);
@@ -338,24 +342,8 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
         }
         return result;
     }
-    case nList: {
-        bool allStrings = true;
-        {
-            SuspendDepTracking suspend;
-            for (size_t i = 0; i < target.listSize(); i++) {
-                st.forceValue(*target.listView()[i], noPos);
-                if (target.listView()[i]->type() != nString) { allStrings = false; break; }
-            }
-        }
-        if (allStrings) {
-            std::vector<std::string> strs;
-            for (size_t i = 0; i < target.listSize(); i++)
-                strs.push_back(std::string(target.listView()[i]->c_str()));
-            return strs;
-        } else {
-            return list_t{target.listSize()};
-        }
-    }
+    case nList:
+        return list_t{target.listSize()};
     case nThunk:
     case nFunction:
     case nExternal:
@@ -391,7 +379,7 @@ void TracedExpr::materializeOrigExprAttrs(
         for (auto & orig : attrs.origins) {
             auto srcId = internDepSource(orig.depSource);
             auto fpId = internFilePath(orig.depKey);
-            auto dpId = jsonStringToDataPathId(orig.dataPath, st.symbols);
+            auto dpId = jsonStringToDataPathId(orig.dataPath);
             auto handle = st.positions.addOriginHandle(
                 Pos::TracedData{srcId, fpId, dpId, orig.format},
                 counts[&orig - attrs.origins.data()]);
@@ -403,8 +391,8 @@ void TracedExpr::materializeOrigExprAttrs(
         auto childName = attrs.names[i];
         auto * childVal = st.allocValue();
         auto * wrapper = new TracedExpr(cache, 0, childName, this);
-        wrapper->origExpr = new ExprOrigChild(origExpr, origEnv, childName, shared);
-        wrapper->origEnv = origEnv;
+        wrapper->ensureLazy().origExpr = new ExprOrigChild(lazy->origExpr, lazy->origEnv, childName, shared);
+        wrapper->ensureLazy().origEnv = lazy->origEnv;
         childVal->mkThunk(&st.baseEnv, wrapper);
 
         PosIdx pos = noPos;
@@ -437,7 +425,7 @@ void TracedExpr::materializeOrigExprAttrs(
             auto keysHash = depHash(canonical);
             auto srcId = internDepSource(orig.depSource);
             auto fpId = internFilePath(orig.depKey);
-            auto dpId = jsonStringToDataPathId(orig.dataPath, st.symbols);
+            auto dpId = jsonStringToDataPathId(orig.dataPath);
             auto originOffset = originHandles[oidx].handle.offset;
             registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
                 keysHash,
@@ -508,8 +496,8 @@ Value * TracedExpr::navigateToReal()
                     && !dynamic_cast<TracedExpr*>(attr.value->thunk().expr))
                 {
                     auto * wrapper = new TracedExpr(cache, 0, attr.name, parentEC);
-                    wrapper->origExpr = attr.value->thunk().expr;
-                    wrapper->origEnv = attr.value->thunk().env;
+                    wrapper->ensureLazy().origExpr = attr.value->thunk().expr;
+                    wrapper->ensureLazy().origEnv = attr.value->thunk().env;
                     attr.value->mkThunk(attr.value->thunk().env, wrapper);
                 }
                 // Non-thunk siblings are left alone. Each sibling's TracedExpr
@@ -551,7 +539,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
             for (auto & orig : attrs->origins) {
                 auto srcId = internDepSource(orig.depSource);
                 auto fpId = internFilePath(orig.depKey);
-                auto dpId = jsonStringToDataPathId(orig.dataPath, st.symbols);
+                auto dpId = jsonStringToDataPathId(orig.dataPath);
                 auto handle = st.positions.addOriginHandle(
                     Pos::TracedData{srcId, fpId, dpId, orig.format},
                     counts[&orig - attrs->origins.data()]);
@@ -594,7 +582,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
                 auto keysHash = depHash(canonical);
                 auto srcId = internDepSource(orig.depSource);
                 auto fpId = internFilePath(orig.depKey);
-                auto dpId = jsonStringToDataPathId(orig.dataPath, st.symbols);
+                auto dpId = jsonStringToDataPathId(orig.dataPath);
                 auto originOffset = originHandles[oidx].handle.offset;
                 registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
                     keysHash,
@@ -688,9 +676,10 @@ void TracedExpr::evaluateFresh(Value & v)
     };
 
     Value * target;
-    if (origExpr) {
+    bool hasOrig = lazy && lazy->origExpr;
+    if (hasOrig) {
         target = cache->state.allocValue();
-        origExpr->eval(cache->state, *origEnv, *target);
+        lazy->origExpr->eval(cache->state, *lazy->origEnv, *target);
     } else {
         if (parentExpr) {
             SuspendDepTracking suspend;
@@ -701,9 +690,9 @@ void TracedExpr::evaluateFresh(Value & v)
 
         if (target->isThunk()) {
             if (auto * ec = dynamic_cast<TracedExpr*>(target->thunk().expr)) {
-                if (ec->origExpr) {
-                    Expr * expr = ec->origExpr;
-                    Env * oenv = ec->origEnv;
+                if (ec->lazy && ec->lazy->origExpr) {
+                    Expr * expr = ec->lazy->origExpr;
+                    Env * oenv = ec->lazy->origEnv;
                     target = cache->state.allocValue();
                     expr->eval(cache->state, *oenv, *target);
                 }
@@ -716,10 +705,10 @@ void TracedExpr::evaluateFresh(Value & v)
     try {
         st.forceValue(*target, noPos);
 
-        if (origExpr)
+        if (hasOrig)
             v = *target;
 
-        if (!origExpr && target->type() == nAttrs && st.isDerivation(*target)) {
+        if (!hasOrig && target->type() == nAttrs && st.isDerivation(*target)) {
             if (auto * dp = target->attrs()->get(st.s.drvPath))
                 st.forceValue(*dp->value, noPos);
         }
@@ -733,7 +722,7 @@ void TracedExpr::evaluateFresh(Value & v)
             try {
                 auto result = cache->dbBackend->record(
                     attrPath, failed_t{}, directDeps, !parentExpr);
-                this->traceId = result.traceId;
+                ensureLazy().traceId = result.traceId;
             } catch (std::exception & e) {
                 debug("trace recording failed for '%s': %s", attrPathStr(), e.what());
             }
@@ -767,7 +756,7 @@ void TracedExpr::evaluateFresh(Value & v)
         try {
             auto coldResult = cache->dbBackend->record(
                 attrPath, attrValue, directDeps, !parentExpr);
-            this->traceId = coldResult.traceId;
+            ensureLazy().traceId = coldResult.traceId;
         } catch (std::exception & e) {
             debug("trace recording failed for '%s': %s", attrPathStr(), e.what());
         }
@@ -775,12 +764,12 @@ void TracedExpr::evaluateFresh(Value & v)
         // Sibling traces are no longer speculatively recorded. Each sibling's
         // TracedExpr handles its own tracing independently when accessed.
 
-        if (origExpr && std::holds_alternative<attrs_t>(attrValue)) {
+        if (hasOrig && std::holds_alternative<attrs_t>(attrValue)) {
             materializeOrigExprAttrs(v, std::get<attrs_t>(attrValue), target);
             return;
         }
 
-        if (origExpr) {
+        if (hasOrig) {
             v = *target;
         } else if (std::holds_alternative<misc_t>(attrValue)
                 || std::holds_alternative<missing_t>(attrValue)
@@ -1032,8 +1021,8 @@ std::optional<std::string> deepCompare(
 void TracedExpr::eval(EvalState & state, Env & env, Value & v)
 {
     if (!cache->dbBackend) {
-        if (origExpr) {
-            origExpr->eval(state, *origEnv, v);
+        if (lazy && lazy->origExpr) {
+            lazy->origExpr->eval(state, *lazy->origEnv, v);
             state.forceValue(v, noPos);
         } else {
             auto * target = navigateToReal();
@@ -1083,7 +1072,7 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
 
     if (warmResult) {
         auto & [cachedValue, cachedTraceId] = *warmResult;
-        this->traceId = cachedTraceId;
+        ensureLazy().traceId = cachedTraceId;
 
         // Handle failed values — reproduce error
         if (std::get_if<failed_t>(&cachedValue)) {
@@ -1103,7 +1092,7 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
         debug("trace verify hit for '%s'", attrPathStr());
 
         bool handled = false;
-        if (origExpr) {
+        if (lazy && lazy->origExpr) {
             if (isLeafCached(cachedValue)) {
                 materializeResult(v, cachedValue);
                 replayTrace(cachedTraceId);

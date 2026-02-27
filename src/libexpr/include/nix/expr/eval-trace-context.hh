@@ -23,14 +23,15 @@ class TraceCache;
 
 /**
  * Trace-aware evaluation context (BSàlC trace store + Adapton DDG support).
+ * [Lifetime 3: per-EvalState — owned as std::unique_ptr member of EvalState]
  *
  * Holds all state needed for incremental evaluation with dependency tracking.
  * Created eagerly in EvalState constructor when eval-trace is enabled;
- * nullptr otherwise (zero overhead).
+ * nullptr otherwise (zero overhead). Destroyed with the EvalState.
  *
- * This separates the trace-specific fields from EvalState's core memoization
- * caches (fileTraceCache, importResolutionCache, etc.), making the boundary
- * between "evaluator-fundamental" and "trace-specific" state explicit.
+ * See dependency-tracker.cc for the full lifetime documentation covering
+ * all three scopes: (1) process/thread pools, (2) per-root-tracker caches,
+ * (3) per-EvalState context (this struct).
  */
 struct EvalTraceContext {
     /**

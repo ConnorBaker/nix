@@ -334,7 +334,12 @@ public:
                 s.nixPath = {};
                 return s;
             })
-    {}
+    {
+        // Reset process-lifetime pools so each test starts with a clean
+        // eval trace state. In production these outlive EvalState, but in
+        // tests multiple EvalState instances exist in the same process.
+        resetEvalTracePools();
+    }
 
 protected:
     ScopedCacheDir cacheDir;

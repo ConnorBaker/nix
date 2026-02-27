@@ -23,22 +23,83 @@
 namespace nix {
 
 // ═══════════════════════════════════════════════════════════════════════
+// Eval trace thread-local state — lifetime documentation
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The eval trace system uses thread-local state at three lifetime scopes:
+//
+// ┌─────────────────────────────────────────────────────────────────────┐
+// │ LIFETIME 1: Process / thread  (never cleared in production)        │
+// │                                                                    │
+// │ These pools outlive any single EvalState. GC-heap ExprTracedData   │
+// │ thunks hold interned IDs (DepSourceId, FilePathId, DataPathId)     │
+// │ that must remain valid as long as the thunk is reachable.          │
+// │ In production (one EvalState per process), these grow              │
+// │ monotonically and are bounded by unique file paths / trie nodes.   │
+// │                                                                    │
+// │ In tests (multiple EvalState instances per process), these MUST    │
+// │ be cleared between tests via resetEvalTracePools() to prevent      │
+// │ cross-EvalState contamination. Any surviving GC thunks holding     │
+// │ stale IDs become invalid after a reset.                            │
+// │                                                                    │
+// │ Members:                                                           │
+// │   - depSourcePool      (StringPool16: flake input names)           │
+// │   - filePathPool       (StringPool16: file paths)                  │
+// │   - dataPathPool       (DataPathPool: JSON/TOML path trie)         │
+// │   - sessionSymbols     (SymbolTable pointer for hasKey resolution) │
+// │   - sessionTraces      (append-only dep vector, index-addressed)   │
+// │   - activeTracker      (current RAII tracker in the call stack)    │
+// ├─────────────────────────────────────────────────────────────────────┤
+// │ LIFETIME 2: Per root DependencyTracker  (cleared in                │
+// │             onRootConstruction)                                     │
+// │                                                                    │
+// │ Caches that are valid only for a single evaluation pass. Cleared   │
+// │ when a new root DependencyTracker is constructed (no parent).      │
+// │ These use Value*/Bindings* pointers as keys, which are only        │
+// │ valid within a single evaluation's GC heap generation.             │
+// │                                                                    │
+// │ Members:                                                           │
+// │   - tracedContainerMap   (Value* → list provenance)                │
+// │   - provenancePool       (stable deque of TracedContainerProv.)    │
+// │   - readFileProvenanceMap (content hash → ReadFileProvenance)      │
+// │   - readFileStringPtrs   (char* → content hash for RawContent)    │
+// │   - scannedBindings      (Bindings* memoization for #keys)         │
+// │   - precomputedKeysMap   (origin offset → precomputed hash)        │
+// │   - intersectOriginsCache (Bindings* → origin info for //∩)        │
+// ├─────────────────────────────────────────────────────────────────────┤
+// │ LIFETIME 3: Per EvalState  (owned by EvalTraceContext)             │
+// │                                                                    │
+// │ State tied to a specific evaluator instance. Destroyed with the    │
+// │ EvalState. Not thread-local — owned as a member of EvalState.      │
+// │                                                                    │
+// │ Members (in EvalTraceContext):                                     │
+// │   - epochMap           (Value* → dep range for thunk memoization)  │
+// │   - replayBloom        (fast rejection filter for epochMap)        │
+// │   - evalCaches         (flake hash → TraceCache instances)         │
+// │   - fileContentHashes  (SourcePath → BLAKE3 for Content deps)     │
+// │   - mountToInput       (mount point → (inputName, subdir))         │
+// │   - skipEpochRecordFor (TracedExpr anti-contamination guard)       │
+// └─────────────────────────────────────────────────────────────────────┘
+//
+// The StatHashCache singleton is a fourth scope (process-global, not
+// thread-local, not per-EvalState). It caches (dev,ino,mtime,size) → BLAKE3
+// mappings and is shared across all evaluators and threads.
+
+// ═══════════════════════════════════════════════════════════════════════
 // DependencyTracker — RAII dep recording (Adapton DDG builder)
 // ═══════════════════════════════════════════════════════════════════════
 
-// Per-thread active dependency tracker for dynamic dependency discovery
-// (Adapton: the "currently adapting" node whose edges are being recorded).
+// [Lifetime 1] Per-thread active dependency tracker pointer.
 thread_local DependencyTracker * DependencyTracker::activeTracker = nullptr;
-// Per-thread append-only dependency vector (Shake: the "journal" of all
-// dependencies observed during this evaluation session).
+// [Lifetime 1] Per-thread append-only dep vector. Index-addressed by
+// DepRange; never shrinks in production (only reserved, not cleared).
 thread_local std::vector<Dep> DependencyTracker::sessionTraces;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Component interning pools — zero-allocation dep key construction
+// [Lifetime 1: process / thread]
 // ═══════════════════════════════════════════════════════════════════════
 
-// StringPool16: intern strings to uint16_t indices. Process-lifetime (not cleared
-// per-session) because GC-heap ExprTracedData thunks hold interned IDs.
 struct StringPool16 {
     std::vector<std::string> strings;
     boost::unordered_flat_map<std::string, uint16_t> lookup;
@@ -55,15 +116,20 @@ struct StringPool16 {
 
     std::string_view resolve(uint16_t id) const { return strings[id]; }
 
-    // Intentionally no clear(): GC-heap ExprTracedData thunks hold interned
-    // IDs that must remain valid across DependencyTracker lifetimes. The pool
-    // grows monotonically, bounded by unique file paths (typically <100).
+    void clear() { strings.clear(); lookup.clear(); }
+
+    // In production, pools grow monotonically (GC-heap thunks hold IDs).
+    // clear() is only called by resetEvalTracePools() for test isolation.
 };
 
 // DataPathPool: trie of path components. Process-lifetime (same reason as StringPool16).
+// Stores resolved strings directly (not Symbol IDs) so the pool is self-contained
+// and independent of any particular SymbolTable. This is critical because in test
+// environments, multiple EvalState instances (each with their own SymbolTable) may
+// exist within the same process, and Symbol IDs are only valid within their table.
 struct DataPathNode {
     uint32_t parentId;      // 0 = root
-    Symbol component;       // object key (interned in SymbolTable)
+    std::string component;  // object key (resolved string, not Symbol)
     int32_t arrayIndex;     // -1 if object key, >=0 if array index
 };
 
@@ -73,15 +139,15 @@ struct DataPathPool {
 
     DataPathPool() {
         // Node 0 is the root sentinel (empty path)
-        nodes.push_back({0, Symbol{}, -1});
+        nodes.push_back({0, "", -1});
     }
 
-    uint32_t internChild(uint32_t parentId, Symbol key) {
-        uint64_t h = hashValues(uint8_t(0), parentId, key.getId());
+    uint32_t internChild(uint32_t parentId, std::string_view key) {
+        uint64_t h = hashValues(uint8_t(0), parentId, std::hash<std::string_view>{}(key));
         auto [it, inserted] = lookup.try_emplace(h, 0);
         if (!inserted) return it->second;
         uint32_t id = static_cast<uint32_t>(nodes.size());
-        nodes.push_back({parentId, key, -1});
+        nodes.push_back({parentId, std::string(key), -1});
         it->second = id;
         return id;
     }
@@ -91,12 +157,12 @@ struct DataPathPool {
         auto [it, inserted] = lookup.try_emplace(h, 0);
         if (!inserted) return it->second;
         uint32_t id = static_cast<uint32_t>(nodes.size());
-        nodes.push_back({parentId, Symbol{}, index});
+        nodes.push_back({parentId, "", index});
         it->second = id;
         return id;
     }
 
-    nlohmann::json toJsonArray(uint32_t nodeId, const SymbolTable & symbols) const {
+    nlohmann::json toJsonArray(uint32_t nodeId) const {
         nlohmann::json arr = nlohmann::json::array();
         std::vector<uint32_t> path;
         uint32_t cur = nodeId;
@@ -110,18 +176,26 @@ struct DataPathPool {
             if (node.arrayIndex >= 0)
                 arr.push_back(node.arrayIndex);
             else
-                arr.push_back(std::string(symbols[node.component]));
+                arr.push_back(node.component);
         }
         return arr;
     }
 
-    // Intentionally no clear(): same lifetime rationale as StringPool16.
-    // Bounded by total JSON/TOML/directory structure size across all evaluated files.
+    void clear() {
+        nodes.clear();
+        lookup.clear();
+        nodes.push_back({0, "", -1}); // re-add root sentinel
+    }
+
+    // In production, pools grow monotonically. clear() is for test isolation.
 };
 
+// [Lifetime 1] Interning pools — process-lifetime, cleared only by resetEvalTracePools().
 static thread_local StringPool16 depSourcePool;
 static thread_local StringPool16 filePathPool;
 static thread_local DataPathPool dataPathPool;
+// [Lifetime 1] SymbolTable pointer for resolving hasKey Symbol in recordStructuredDep().
+// Updated by initSessionSymbols() when a new evaluation starts.
 static thread_local const SymbolTable * sessionSymbols = nullptr;
 
 // Cached constant Blake3Hash values used in shape dep recording.
@@ -152,7 +226,7 @@ std::string_view resolveFilePath(FilePathId id) {
     return filePathPool.resolve(id.value);
 }
 
-DataPathId internDataPathChild(DataPathId parentId, Symbol key) {
+DataPathId internDataPathChild(DataPathId parentId, std::string_view key) {
     return DataPathId(dataPathPool.internChild(parentId.value, key));
 }
 
@@ -161,18 +235,19 @@ DataPathId internDataPathArrayChild(DataPathId parentId, int32_t index) {
 }
 
 std::string dataPathToJsonString(DataPathId nodeId) {
-    assert(sessionSymbols && "initSessionSymbols() must be called before dataPathToJsonString()");
-    return dataPathPool.toJsonArray(nodeId.value, *sessionSymbols).dump();
+    return dataPathPool.toJsonArray(nodeId.value).dump();
 }
 
-DataPathId jsonStringToDataPathId(std::string_view jsonStr, SymbolTable & symbols) {
+DataPathId jsonStringToDataPathId(std::string_view jsonStr) {
     auto arr = nlohmann::json::parse(jsonStr);
     uint32_t id = 0; // root
     for (auto & elem : arr) {
         if (elem.is_number())
             id = dataPathPool.internArrayChild(id, elem.get<int32_t>());
-        else
-            id = dataPathPool.internChild(id, symbols.create(elem.get<std::string>()));
+        else {
+            auto s = elem.get<std::string>();
+            id = dataPathPool.internChild(id, s);
+        }
     }
     return DataPathId(id);
 }
@@ -182,31 +257,26 @@ void initSessionSymbols(const SymbolTable & symbols) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Traced container provenance map — shape dep tracking
+// Per-root-tracker caches — shape dep tracking
+// [Lifetime 2: cleared in onRootConstruction()]
 // ═══════════════════════════════════════════════════════════════════════
 
-// Thread-local map from stable list identity (first element Value*) to provenance.
-// Lists still use this map because list provenance is tracked at access time
-// (maybeRecordListLenDep), not via PosIdx. Attrsets use PosIdx-based TracedData
-// origin tracking instead.
+// [Lifetime 2] Value* → list provenance. Lists use this (not PosIdx)
+// because list provenance is recorded at access time (maybeRecordListLenDep).
 static thread_local boost::unordered_flat_map<const void*, const TracedContainerProvenance *> tracedContainerMap;
 
-// Memoization: skip re-scanning the same Bindings* in maybeRecordAttrKeysDep.
-// Cleared on root DependencyTracker construction.
+// [Lifetime 2] Skip re-scanning the same Bindings* in maybeRecordAttrKeysDep.
 static thread_local boost::unordered_flat_set<const void *> scannedBindings;
 
-// Stable, non-GC pool for provenance data. std::deque never invalidates
-// pointers on push_back, so ProvenanceRef pointers remain valid until clear().
-// Cleared alongside tracedContainerMap on root DependencyTracker construction.
+// [Lifetime 2] Stable pool for TracedContainerProvenance data.
+// std::deque never invalidates pointers on push_back.
 static thread_local std::deque<TracedContainerProvenance> provenancePool;
 
-// Precomputed keys hash map: origin offset → {hash, keyCount, interned components}.
-// Populated by ExprTracedData::eval() at creation time; consumed by maybeRecordAttrKeysDep
-// to skip sort + concat + BLAKE3 when all original keys are visible (common case).
+// [Lifetime 2] Origin offset → precomputed keys hash. Populated at
+// ExprTracedData creation time; consumed by maybeRecordAttrKeysDep.
 static thread_local boost::unordered_flat_map<uint32_t, PrecomputedKeysInfo> precomputedKeysMap;
 
-// Per-Bindings* cache of TracedData origin info for intersectAttrs.
-// Uses interned IDs to avoid string allocation during the scan.
+// [Lifetime 2] Bindings* → origin info cache for intersectAttrs bulk recording.
 struct IntersectOriginInfo {
     DepSourceId sourceId;
     FilePathId filePathId;
@@ -217,6 +287,9 @@ static thread_local boost::unordered_flat_map<const Bindings *, std::vector<Inte
 
 void DependencyTracker::onRootConstruction()
 {
+    // Clear Lifetime 2 state (per-root-tracker caches).
+    // These use Value*/Bindings* pointers that are only valid within
+    // a single evaluation's GC heap generation.
     clearTracedContainerMap();
     provenancePool.clear();
     clearReadFileProvenanceMap();
@@ -224,13 +297,22 @@ void DependencyTracker::onRootConstruction()
     scannedBindings.clear();
     clearPrecomputedKeysMap();
     intersectOriginsCache.clear();
-    // Note: depSourcePool, filePathPool, dataPathPool, and sessionSymbols
-    // are NOT cleared here. ExprTracedData thunks on the GC heap hold
-    // interned IDs that must remain valid across DependencyTracker lifetimes.
-    // The pools grow monotonically for the process lifetime (same as SymbolTable).
-    // This is safe: unique file paths and dep sources are O(100), and trie
-    // nodes are bounded by the total JSON/TOML/directory structure size.
+
+    // Lifetime 1 state (pools, sessionTraces) is NOT cleared here.
+    // See lifetime documentation at the top of this file.
     sessionTraces.reserve(16384);
+}
+
+void resetEvalTracePools()
+{
+    // Clear ALL Lifetime 1 state. Only for test isolation — in production
+    // these pools must outlive GC-heap ExprTracedData thunks. Any surviving
+    // GC thunks holding stale pool IDs become invalid after this call.
+    depSourcePool.clear();
+    filePathPool.clear();
+    dataPathPool.clear();
+    sessionSymbols = nullptr;
+    DependencyTracker::sessionTraces.clear();
 }
 
 ProvenanceRef allocateProvenance(DepSourceId sourceId, FilePathId filePathId,
@@ -305,7 +387,7 @@ void DependencyTracker::record(Dep dep)
     nlohmann::json key;
     key["f"] = std::string(filePathPool.resolve(c.filePathId.value));
     key["t"] = std::string(1, structuredFormatChar(c.format));
-    key["p"] = dataPathPool.toJsonArray(c.dataPathId.value, *sessionSymbols);
+    key["p"] = dataPathPool.toJsonArray(c.dataPathId.value);
     if (c.hasKey)
         key["h"] = std::string((*sessionSymbols)[c.hasKey]);
     else if (c.suffix != ShapeSuffix::None)
@@ -1009,6 +1091,12 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
     }
 }
 
+// Forward declarations for DirSet aggregation helpers
+static std::string computeDirSetHash(const std::vector<std::pair<DepSourceId, FilePathId>> & dirs);
+static std::string buildAggregatedHasKeyJson(
+    const std::string & dsHash, std::string_view keyName,
+    const std::vector<std::pair<DepSourceId, FilePathId>> & dirs);
+
 static const std::vector<IntersectOriginInfo> emptyOrigins;
 
 static const std::vector<IntersectOriginInfo> & collectOriginsCached(
@@ -1068,12 +1156,30 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
         recordStructuredDep(c, DepHashValue(kHashOne()));
     };
 
-    // Record exists=false against all pre-computed origins
+    // Record exists=false, aggregating directory origins when >1
     auto recordAbsent = [&](Symbol keyName, const std::vector<IntersectOriginInfo> & origins) {
+        std::vector<std::pair<DepSourceId, FilePathId>> dirOrigins;
         for (auto & oi : origins) {
-            CompactDepComponents c{oi.sourceId, oi.filePathId, oi.format, oi.dataPathId,
-                                   ShapeSuffix::None, keyName};
-            recordStructuredDep(c, DepHashValue(kHashZero()));
+            if (oi.format == StructuredFormat::Directory)
+                dirOrigins.push_back({oi.sourceId, oi.filePathId});
+            else {
+                CompactDepComponents c{oi.sourceId, oi.filePathId, oi.format, oi.dataPathId,
+                                       ShapeSuffix::None, keyName};
+                recordStructuredDep(c, DepHashValue(kHashZero()));
+            }
+        }
+        if (dirOrigins.size() > 1) {
+            auto dsHash = computeDirSetHash(dirOrigins);
+            auto key = buildAggregatedHasKeyJson(dsHash, symbols[keyName], dirOrigins);
+            DependencyTracker::record(
+                Dep{"", std::move(key), DepHashValue(kHashZero()), DepType::StructuredContent});
+        } else {
+            for (auto & oi : origins) {
+                if (oi.format != StructuredFormat::Directory) continue;
+                CompactDepComponents c{oi.sourceId, oi.filePathId, oi.format, oi.dataPathId,
+                                       ShapeSuffix::None, keyName};
+                recordStructuredDep(c, DepHashValue(kHashZero()));
+            }
         }
     };
 
@@ -1095,6 +1201,113 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
     }
 }
 
+// ── DirSet aggregation for has-key-miss deps ─────────────────────────
+
+/**
+ * Compute a deterministic BLAKE3 hash for a set of directory origins.
+ * Sorts by (source, filePath) for determinism regardless of // operand order.
+ */
+[[gnu::cold]]
+static std::string computeDirSetHash(const std::vector<std::pair<DepSourceId, FilePathId>> & dirs)
+{
+    auto sorted = dirs;
+    std::sort(sorted.begin(), sorted.end(),
+        [](const auto & a, const auto & b) {
+            auto sa = resolveDepSource(a.first);
+            auto fa = resolveFilePath(a.second);
+            auto sb = resolveDepSource(b.first);
+            auto fb = resolveFilePath(b.second);
+            if (sa != sb) return sa < sb;
+            return fa < fb;
+        });
+
+    HashSink sink(HashAlgorithm::BLAKE3);
+    for (auto & [srcId, fpId] : sorted) {
+        sink(resolveDepSource(srcId));
+        sink(std::string_view("\0", 1));
+        sink(resolveFilePath(fpId));
+        sink(std::string_view("\0", 1));
+    }
+    auto hash = sink.finish().hash;
+
+    std::string hex;
+    hex.reserve(64);
+    for (size_t i = 0; i < hash.hashSize; i++) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02x", hash.hash[i]);
+        hex += buf;
+    }
+    return hex;
+}
+
+/**
+ * Build JSON dep key for an aggregated DirSet has-key-miss dep.
+ * Embeds directory paths so computeCurrentHash can verify independently.
+ */
+[[gnu::cold]]
+static std::string buildAggregatedHasKeyJson(
+    const std::string & dsHash, std::string_view keyName,
+    const std::vector<std::pair<DepSourceId, FilePathId>> & dirs)
+{
+    nlohmann::json j;
+    j["ds"] = dsHash;
+    j["h"] = std::string(keyName);
+    j["t"] = "d";
+    nlohmann::json dirArr = nlohmann::json::array();
+    for (auto & [srcId, fpId] : dirs) {
+        dirArr.push_back({std::string(resolveDepSource(srcId)),
+                          std::string(resolveFilePath(fpId))});
+    }
+    j["dirs"] = std::move(dirArr);
+    return j.dump();
+}
+
+/**
+ * Record has-key-miss deps, aggregating directory origins when >1 exist.
+ */
+[[gnu::cold]]
+static void recordHasKeyMissDeps(
+    const PosTable & positions, const SymbolTable & symbols,
+    const Value & v, Symbol keyName)
+{
+    std::vector<std::pair<DepSourceId, FilePathId>> dirOrigins;
+    std::vector<const Pos::TracedData *> nonDirOrigins;
+
+    forEachTracedDataOrigin(positions, v, [&](const Pos::TracedData & df) {
+        auto fmt = parseStructuredFormat(df.format);
+        if (!fmt) return;
+        if (*fmt == StructuredFormat::Directory)
+            dirOrigins.push_back({df.sourceId, df.filePathId});
+        else
+            nonDirOrigins.push_back(&df);
+    });
+
+    // Non-directory origins: always individual deps
+    for (auto * df : nonDirOrigins) {
+        auto fmt = parseStructuredFormat(df->format);
+        if (!fmt) continue;
+        CompactDepComponents c{df->sourceId, df->filePathId, *fmt, df->dataPathId,
+                               ShapeSuffix::None, keyName};
+        recordStructuredDep(c, DepHashValue(kHashZero()));
+    }
+
+    // Directory origins: aggregate when >1
+    if (dirOrigins.size() > 1) {
+        auto dsHash = computeDirSetHash(dirOrigins);
+        auto key = buildAggregatedHasKeyJson(dsHash, symbols[keyName], dirOrigins);
+        DependencyTracker::record(
+            Dep{"", std::move(key), DepHashValue(kHashZero()), DepType::StructuredContent});
+    } else {
+        forEachTracedDataOrigin(positions, v, [&](const Pos::TracedData & df) {
+            auto fmt = parseStructuredFormat(df.format);
+            if (!fmt || *fmt != StructuredFormat::Directory) return;
+            CompactDepComponents c{df.sourceId, df.filePathId, *fmt, df.dataPathId,
+                                   ShapeSuffix::None, keyName};
+            recordStructuredDep(c, DepHashValue(kHashZero()));
+        });
+    }
+}
+
 [[gnu::cold]] void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbols,
                           const Value & v, Symbol keyName, bool exists)
 {
@@ -1103,27 +1316,19 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
     if (!v.attrs()->hasAnyTracedDataLayer()) return;
 
     if (exists) {
-        // Key was found — check tag bit, then look up origin.
         auto * attr = v.attrs()->get(keyName);
         if (!attr || !attr->pos.isTracedData()) return;
         auto * origin = positions.originOfPtr(attr->pos);
         if (!origin) return;
         auto * df = std::get_if<Pos::TracedData>(origin);
-        if (!df) return; // Nix-added key (no TracedData provenance) — skip
+        if (!df) return;
         auto fmt = parseStructuredFormat(df->format);
         if (!fmt) return;
         CompactDepComponents c{df->sourceId, df->filePathId, *fmt, df->dataPathId,
                                ShapeSuffix::None, keyName};
         recordStructuredDep(c, DepHashValue(kHashOne()));
     } else {
-        // Key not found — record against every unique TracedData origin.
-        forEachTracedDataOrigin(positions, v, [&](const Pos::TracedData & df) {
-            auto fmt = parseStructuredFormat(df.format);
-            if (!fmt) return;
-            CompactDepComponents c{df.sourceId, df.filePathId, *fmt, df.dataPathId,
-                                   ShapeSuffix::None, keyName};
-            recordStructuredDep(c, DepHashValue(kHashZero()));
-        });
+        recordHasKeyMissDeps(positions, symbols, v, keyName);
     }
 }
 
