@@ -153,6 +153,36 @@ TEST_F(DependencyTrackerTest, Suspend_NestedSuspend)
     EXPECT_TRUE(DependencyTracker::isActive());
 }
 
+TEST_F(DependencyTrackerTest, Suspend_TrackerInsideSuspendPreservesSessionCaches)
+{
+    // Regression test: creating a DependencyTracker inside a SuspendDepTracking
+    // scope must NOT call onRootConstruction(), which would clear session-wide
+    // provenance caches (tracedContainerMap, provenancePool, etc.) mid-evaluation.
+
+    DependencyTracker root;
+
+    // Register provenance data in the session caches.
+    auto srcId = internDepSource("test-input");
+    auto fpId = internFilePath("/test.json");
+    auto dpId = jsonStringToDataPathId("[]");
+    auto * prov = allocateProvenance(srcId, fpId, dpId, StructuredFormat::Json);
+
+    // Use an arbitrary pointer as a list container key.
+    int fakeValue = 0;
+    registerTracedContainer(&fakeValue, prov);
+    ASSERT_NE(lookupTracedContainer(&fakeValue), nullptr);
+
+    // Create a new tracker inside a suspended scope. Without the fix,
+    // previous == nullptr triggers onRootConstruction() and wipes the caches.
+    {
+        SuspendDepTracking suspend;
+        DependencyTracker inner;
+    }
+
+    EXPECT_EQ(lookupTracedContainer(&fakeValue), prov)
+        << "Provenance must survive a DependencyTracker created inside SuspendDepTracking";
+}
+
 // ── resolveToInput tests ─────────────────────────────────────────────
 
 TEST_F(DependencyTrackerTest, ResolveToInput_MatchingMount)

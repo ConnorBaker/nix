@@ -41,6 +41,12 @@ namespace nix {
 struct DependencyTracker {
     static thread_local DependencyTracker * activeTracker;
     static thread_local std::vector<Dep> sessionTraces;
+    /// Nesting depth of live DependencyTracker instances on this thread.
+    /// Only the first (depth 0 → 1) is a true root that should call
+    /// onRootConstruction(). Trackers created inside a SuspendDepTracking
+    /// scope see previous == nullptr but depth > 0, so they correctly
+    /// skip the session cache reset.
+    static thread_local uint32_t depth;
 
     DependencyTracker * previous;
     std::vector<Dep> * mySessionTraces;
@@ -81,7 +87,7 @@ struct DependencyTracker {
         , startIndex(mySessionTraces->size())
     {
         activeTracker = this;
-        if (!previous) onRootConstruction();
+        if (depth++ == 0) onRootConstruction();
     }
 
     /**
@@ -89,7 +95,10 @@ struct DependencyTracker {
      * Clears per-evaluation-session state such as the traced container map.
      */
     static void onRootConstruction();
-    ~DependencyTracker() { activeTracker = previous; }
+    ~DependencyTracker() {
+        activeTracker = previous;
+        depth--;
+    }
 
     DependencyTracker(const DependencyTracker &) = delete;
     DependencyTracker & operator=(const DependencyTracker &) = delete;

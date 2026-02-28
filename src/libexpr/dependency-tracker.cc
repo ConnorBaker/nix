@@ -94,6 +94,8 @@ thread_local DependencyTracker * DependencyTracker::activeTracker = nullptr;
 // [Lifetime 1] Per-thread append-only dep vector. Index-addressed by
 // DepRange; never shrinks in production (only reserved, not cleared).
 thread_local std::vector<Dep> DependencyTracker::sessionTraces;
+// [Lifetime 1] Nesting depth of live DependencyTracker instances.
+thread_local uint32_t DependencyTracker::depth = 0;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Component interning pools — zero-allocation dep key construction
