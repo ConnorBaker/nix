@@ -2906,6 +2906,9 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
         return;
 
     case nAttrs: {
+        // See comment in eqValues nAttrs case.
+        if (v1.attrs() == v2.attrs())
+            return;
         if (isDerivation(v1) && isDerivation(v2)) {
             auto i = v1.attrs()->get(s.outPath);
             auto j = v2.attrs()->get(s.outPath);
@@ -3060,6 +3063,12 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
             maybeRecordListLenDep(v1);
             maybeRecordListLenDep(v2);
         }
+        /* TODO: eval-trace materialization breaks Value* pointer identity for
+           list elements, just as it does for attrset attrs. Unlike attrsets
+           (where the shared Bindings* pointer survives shallow copy), lists
+           have no analogous shared pointer to compare — SmallList is inline
+           and materialization allocates fresh backing arrays. A broader fix
+           (e.g., a materialization-level identity map) is needed. */
         if (v1.listSize() != v2.listSize())
             return false;
         for (size_t n = 0; n < v1.listSize(); ++n)
@@ -3072,6 +3081,12 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
             maybeRecordAttrKeysDep(positions, symbols, v1);
             maybeRecordAttrKeysDep(positions, symbols, v2);
         }
+        /* Eval-trace materialization gives each child attr a fresh Value*,
+           breaking the &v1 == &v2 short-circuit above. The shallow copy
+           preserves the underlying Bindings* pointer, so two aliases that
+           resolve to the same real attrset share the same Bindings*. */
+        if (v1.attrs() == v2.attrs())
+            return true;
         /* If both sets denote a derivation (type = "derivation"),
            then compare their outPaths. */
         if (isDerivation(v1) && isDerivation(v2)) {
