@@ -13,6 +13,7 @@ extern Counter nrExcludeChildRangeCalls;
 #include <sys/types.h>
 
 #include <functional>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -172,6 +173,19 @@ struct DependencyTracker {
  * exist within the same process.
  */
 void resetEvalTracePools();
+
+/**
+ * Create an InterningPools instance and set InterningPools::current.
+ * Called by EvalTraceContext constructor. The returned unique_ptr
+ * clears InterningPools::current on destruction.
+ */
+struct InterningPools;
+std::unique_ptr<InterningPools> createInterningPools();
+
+/**
+ * Custom deleter for InterningPools that clears the thread_local pointer.
+ */
+void destroyInterningPools(InterningPools * p);
 
 /**
  * RAII guard that temporarily suspends dep recording by setting

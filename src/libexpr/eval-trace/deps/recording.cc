@@ -279,18 +279,24 @@ struct InterningPools {
 
 thread_local InterningPools * InterningPools::current = nullptr;
 
-// Storage for the active InterningPools. Owned by this TU for now;
-// will move to EvalTraceContext ownership in a follow-up.
-static thread_local std::optional<InterningPools> poolsStorage;
-
-// Ensure pools exist. Called lazily from accessor functions.
 static InterningPools & ensurePools()
 {
-    if (!InterningPools::current) {
-        poolsStorage.emplace();
-        InterningPools::current = &*poolsStorage;
-    }
+    assert(InterningPools::current && "InterningPools not initialized — missing EvalTraceContext?");
     return *InterningPools::current;
+}
+
+std::unique_ptr<InterningPools> createInterningPools()
+{
+    auto p = std::make_unique<InterningPools>();
+    InterningPools::current = p.get();
+    return p;
+}
+
+void destroyInterningPools(InterningPools * p)
+{
+    if (InterningPools::current == p)
+        InterningPools::current = nullptr;
+    delete p;
 }
 
 // Cached constant Blake3Hash values used in shape dep recording.
@@ -486,10 +492,16 @@ void DependencyTracker::onRootDestruction()
 
 void resetEvalTracePools()
 {
-    // Reset by destroying and recreating the pools storage.
-    // In tests, this provides isolation between EvalState instances.
-    poolsStorage.reset();
-    InterningPools::current = nullptr;
+    // Clear all pool contents. With EvalTraceContext ownership, destroying
+    // the EvalState also destroys the pools. This function provides additional
+    // mid-session reset capability for tests that reuse the same EvalState.
+    if (auto * p = InterningPools::current) {
+        p->depSourcePool.clear();
+        p->filePathPool.clear();
+        p->dataPathPool.clear();
+        p->depKeyPool.clear();
+        p->sessionSymbols = nullptr;
+    }
     DependencyTracker::sessionTraces.clear();
 }
 

@@ -33,7 +33,17 @@ class TraceCache;
  * all three scopes: (1) process/thread pools, (2) per-root-tracker caches,
  * (3) per-EvalState context (this struct).
  */
+/// Forward declaration — full definition in recording.cc.
+struct InterningPools;
+
 struct EvalTraceContext {
+    /// Interning pools for dep recording. Owned here so each EvalState
+    /// gets its own pools, providing automatic test isolation.
+    /// Custom deleter avoids requiring InterningPools to be complete here.
+    std::unique_ptr<InterningPools, void(*)(InterningPools*)> pools{nullptr, nullptr};
+
+    EvalTraceContext();
+    ~EvalTraceContext();
     /**
      * Registry of trace cache instances (BSàlC: verifying traces), keyed by
      * flake identity hash. Allows reuse of the same traced root value across

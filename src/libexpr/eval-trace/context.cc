@@ -5,6 +5,13 @@
 
 namespace nix {
 
+EvalTraceContext::EvalTraceContext()
+    : pools(createInterningPools().release(), destroyInterningPools)
+{
+}
+
+EvalTraceContext::~EvalTraceContext() = default;
+
 namespace eval_trace {
 Counter nrReplayTotalCalls;
 Counter nrReplayBloomHits;
