@@ -252,19 +252,47 @@ struct StringPool32 {
     }
 };
 
-// [Lifetime 1] Interning pools — process-lifetime, cleared only by resetEvalTracePools().
-static thread_local StringPool16 depSourcePool;
-static thread_local StringPool16 filePathPool;
-static thread_local DataPathPool dataPathPool;
-// [Lifetime 1] Dep key strings (file paths, JSON SC keys, env var names).
-// Unlike depSourcePool/filePathPool (uint16_t, bounded by unique file paths),
-// depKeyPool uses uint32_t because unique dep keys can be numerous (one per
-// unique StructuredContent JSON key). In production (one EvalState per process),
-// this is bounded by the evaluation's dep key space.
-static thread_local StringPool32 depKeyPool;
-// [Lifetime 1] SymbolTable pointer for resolving hasKey Symbol in recordStructuredDep().
-// Updated by initSessionSymbols() when a new evaluation starts.
-static thread_local const SymbolTable * sessionSymbols = nullptr;
+// ═══════════════════════════════════════════════════════════════════════
+// InterningPools — owns all Lifetime 1 interning pools
+// ═══════════════════════════════════════════════════════════════════════
+//
+// In production (one EvalState per process), pools grow monotonically
+// for the process lifetime. In tests (multiple EvalState instances),
+// each EvalState gets its own pools via EvalTraceContext ownership,
+// providing automatic test isolation without manual resetEvalTracePools().
+//
+// Accessed from free functions via the thread_local `currentPools` pointer,
+// set when EvalTraceContext is initialized and cleared on destruction.
+
+struct InterningPools {
+    static thread_local InterningPools * current;
+
+    StringPool16 depSourcePool;
+    StringPool16 filePathPool;
+    DataPathPool dataPathPool;
+    // Dep key strings (file paths, JSON SC keys, env var names).
+    // uint32_t because unique dep keys can be numerous (one per unique
+    // StructuredContent JSON key).
+    StringPool32 depKeyPool;
+    // SymbolTable pointer for resolving hasKey Symbol in recordStructuredDep().
+    const SymbolTable * sessionSymbols = nullptr;
+};
+
+thread_local InterningPools * InterningPools::current = nullptr;
+
+// Storage for the active InterningPools. Owned by this TU for now;
+// will move to EvalTraceContext ownership in a follow-up.
+static thread_local std::optional<InterningPools> poolsStorage;
+
+// Ensure pools exist. Called lazily from accessor functions.
+static InterningPools & ensurePools()
+{
+    if (!InterningPools::current) {
+        poolsStorage.emplace();
+        InterningPools::current = &*poolsStorage;
+    }
+    return *InterningPools::current;
+}
 
 // Cached constant Blake3Hash values used in shape dep recording.
 // Function-local statics avoid static initialization order issues across TUs.
@@ -278,86 +306,95 @@ static const Blake3Hash & kHashArray()  { static const auto h = depHash("array")
 // ═══════════════════════════════════════════════════════════════════════
 
 DepSourceId internDepSource(std::string_view sv) {
+    auto & p = ensurePools();
 #ifndef NDEBUG
-    return DepSourceId(depSourcePool.intern(sv), depSourcePool.generation);
+    return DepSourceId(p.depSourcePool.intern(sv), p.depSourcePool.generation);
 #else
-    return DepSourceId(depSourcePool.intern(sv));
+    return DepSourceId(p.depSourcePool.intern(sv));
 #endif
 }
 
 FilePathId internFilePath(std::string_view sv) {
+    auto & p = ensurePools();
 #ifndef NDEBUG
-    return FilePathId(filePathPool.intern(sv), filePathPool.generation);
+    return FilePathId(p.filePathPool.intern(sv), p.filePathPool.generation);
 #else
-    return FilePathId(filePathPool.intern(sv));
+    return FilePathId(p.filePathPool.intern(sv));
 #endif
 }
 
 std::string_view resolveDepSource(DepSourceId id) {
+    auto & p = ensurePools();
 #ifndef NDEBUG
-    assert(id.generation == depSourcePool.generation && "DepSourceId used after pool clear");
+    assert(id.generation == p.depSourcePool.generation && "DepSourceId used after pool clear");
 #endif
-    return depSourcePool.resolve(id.value);
+    return p.depSourcePool.resolve(id.value);
 }
 
 std::string_view resolveFilePath(FilePathId id) {
+    auto & p = ensurePools();
 #ifndef NDEBUG
-    assert(id.generation == filePathPool.generation && "FilePathId used after pool clear");
+    assert(id.generation == p.filePathPool.generation && "FilePathId used after pool clear");
 #endif
-    return filePathPool.resolve(id.value);
+    return p.filePathPool.resolve(id.value);
 }
 
 DepKeyId internDepKey(std::string_view sv) {
+    auto & p = ensurePools();
 #ifndef NDEBUG
-    return DepKeyId(depKeyPool.intern(sv), depKeyPool.generation);
+    return DepKeyId(p.depKeyPool.intern(sv), p.depKeyPool.generation);
 #else
-    return DepKeyId(depKeyPool.intern(sv));
+    return DepKeyId(p.depKeyPool.intern(sv));
 #endif
 }
 
 std::string_view resolveDepKey(DepKeyId id) {
+    auto & p = ensurePools();
 #ifndef NDEBUG
-    assert(id.generation == depKeyPool.generation && "DepKeyId used after pool clear");
+    assert(id.generation == p.depKeyPool.generation && "DepKeyId used after pool clear");
 #endif
-    return depKeyPool.resolve(id.value);
+    return p.depKeyPool.resolve(id.value);
 }
 
 DataPathId internDataPathChild(DataPathId parentId, std::string_view key) {
+    auto & p = ensurePools();
 #ifndef NDEBUG
-    return DataPathId(dataPathPool.internChild(parentId.value, key), dataPathPool.generation);
+    return DataPathId(p.dataPathPool.internChild(parentId.value, key), p.dataPathPool.generation);
 #else
-    return DataPathId(dataPathPool.internChild(parentId.value, key));
+    return DataPathId(p.dataPathPool.internChild(parentId.value, key));
 #endif
 }
 
 DataPathId internDataPathArrayChild(DataPathId parentId, int32_t index) {
+    auto & p = ensurePools();
 #ifndef NDEBUG
-    return DataPathId(dataPathPool.internArrayChild(parentId.value, index), dataPathPool.generation);
+    return DataPathId(p.dataPathPool.internArrayChild(parentId.value, index), p.dataPathPool.generation);
 #else
-    return DataPathId(dataPathPool.internArrayChild(parentId.value, index));
+    return DataPathId(p.dataPathPool.internArrayChild(parentId.value, index));
 #endif
 }
 
 std::string dataPathToJsonString(DataPathId nodeId) {
-    return dataPathPool.toJsonArray(nodeId.value).dump();
+    return ensurePools().dataPathPool.toJsonArray(nodeId.value).dump();
 }
 
 DataPathId jsonStringToDataPathId(std::string_view jsonStr) {
+    auto & p = ensurePools();
     auto arr = nlohmann::json::parse(jsonStr);
     uint32_t id = 0; // root
     for (auto & elem : arr) {
         if (elem.is_number())
-            id = dataPathPool.internArrayChild(id, elem.get<int32_t>());
+            id = p.dataPathPool.internArrayChild(id, elem.get<int32_t>());
         else {
             auto s = elem.get<std::string>();
-            id = dataPathPool.internChild(id, s);
+            id = p.dataPathPool.internChild(id, s);
         }
     }
     return DataPathId(id);
 }
 
 void initSessionSymbols(const SymbolTable & symbols) {
-    sessionSymbols = &symbols;
+    ensurePools().sessionSymbols = &symbols;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -450,14 +487,10 @@ void DependencyTracker::onRootDestruction()
 
 void resetEvalTracePools()
 {
-    // Clear ALL Lifetime 1 state. Only for test isolation — in production
-    // these pools must outlive GC-heap ExprTracedData thunks. Any surviving
-    // GC thunks holding stale pool IDs become invalid after this call.
-    depSourcePool.clear();
-    filePathPool.clear();
-    dataPathPool.clear();
-    depKeyPool.clear();
-    sessionSymbols = nullptr;
+    // Reset by destroying and recreating the pools storage.
+    // In tests, this provides isolation between EvalState instances.
+    poolsStorage.reset();
+    InterningPools::current = nullptr;
     DependencyTracker::sessionTraces.clear();
 }
 
@@ -541,13 +574,14 @@ void DependencyTracker::record(Dep dep)
         return false;  // Duplicate — no work done
 
     // 2. Only for non-duplicates: build JSON dep key
-    assert(sessionSymbols && "initSessionSymbols() must be called before recordStructuredDep()");
+    auto & p = ensurePools();
+    assert(p.sessionSymbols && "initSessionSymbols() must be called before recordStructuredDep()");
     nlohmann::json key;
-    key["f"] = std::string(filePathPool.resolve(c.filePathId.value));
+    key["f"] = std::string(p.filePathPool.resolve(c.filePathId.value));
     key["t"] = std::string(1, structuredFormatChar(c.format));
-    key["p"] = dataPathPool.toJsonArray(c.dataPathId.value);
+    key["p"] = p.dataPathPool.toJsonArray(c.dataPathId.value);
     if (c.hasKey)
-        key["h"] = std::string((*sessionSymbols)[c.hasKey]);
+        key["h"] = std::string((*p.sessionSymbols)[c.hasKey]);
     else if (c.suffix != ShapeSuffix::None)
         key["s"] = std::string(shapeSuffixName(c.suffix));
 
