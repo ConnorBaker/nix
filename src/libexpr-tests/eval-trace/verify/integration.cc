@@ -29,7 +29,7 @@ TEST_F(TraceCacheIntegrationTest, ColdStore_ThenWarmPath)
 {
     auto db = makeDbBackend();
 
-    auto storeResult = db.record(
+    auto storeResult = db.recordDeps(
         "", string_t{"hello", {}}, {}, true);
 
     auto result = db.verify("", {}, state);
@@ -44,12 +44,12 @@ TEST_F(TraceCacheIntegrationTest, MultipleContextHashes_Isolated)
     // Use separate TraceStore instances with different context hashes (BSàlC: isolated trace stores)
     {
         TraceStore db1(state.symbols, 111);
-        db1.record("", string_t{"value-1", {}}, {}, true);
+        db1.recordDeps("", string_t{"value-1", {}}, {}, true);
     }
 
     {
         TraceStore db2(state.symbols, 222);
-        db2.record("", string_t{"value-2", {}}, {}, true);
+        db2.recordDeps("", string_t{"value-2", {}}, {}, true);
     }
 
     // Verify isolation: each context hash sees its own trace result
@@ -75,12 +75,12 @@ TEST_F(TraceCacheIntegrationTest, ParentChild_AttrChain)
 {
     auto db = makeDbBackend();
 
-    db.record(
+    db.recordDeps(
         "", attrs_t{{createSymbol("child")}},
         {}, true);
 
     std::string childAttrPath = "child";
-    db.record(
+    db.recordDeps(
         childAttrPath, int_t{NixInt{42}},
         {}, false);
 
@@ -99,11 +99,11 @@ TEST_F(TraceCacheIntegrationTest, ParentChild_ValidationCascade)
 
     // Parent trace with a valid dep (BSàlC: verifiable trace)
     auto dep = makeEnvVarDep("NIX_INT_TEST_VAR", "valid");
-    db.record(
+    db.recordDeps(
         "", null_t{}, {dep}, true);
 
     // Child trace with no deps — always valid (separated dep ownership)
-    auto childResult = db.record(
+    auto childResult = db.recordDeps(
         "child", int_t{NixInt{1}}, {}, false);
 
     EXPECT_TRUE(db.verifyTrace(childResult.traceId, {}, state));
@@ -117,10 +117,10 @@ TEST_F(TraceCacheIntegrationTest, ChildSurvivesParentInvalidation)
 
     // Parent trace with stale dep (hash doesn't match current oracle state)
     auto staleDep = makeEnvVarDep("NIX_INT_CASCADE", "old_value");
-    db.record("", null_t{}, {staleDep}, true);
+    db.recordDeps("", null_t{}, {staleDep}, true);
 
     // Child with no direct deps
-    auto childResult = db.record(
+    auto childResult = db.recordDeps(
         "child", int_t{NixInt{1}}, {}, false);
 
     // With separated deps, child has no deps → always valid
@@ -251,7 +251,7 @@ TEST_F(TraceCacheIntegrationTest, SessionCache_TraceVerification_SkipsRevalidati
 
     auto db = makeDbBackend();
     auto dep = makeEnvVarDep("NIX_EVAL_SESSION", "ok");
-    auto result = db.record(
+    auto result = db.recordDeps(
         "", null_t{}, {dep}, true);
 
     // Recording adds to verifiedTraceIds for non-volatile deps (Salsa: memoize verified query)
@@ -270,7 +270,7 @@ TEST_F(TraceCacheIntegrationTest, SessionCache_VolatileDep_NotCached)
 {
     auto db = makeDbBackend();
     auto dep = makeCurrentTimeDep();
-    auto result = db.record(
+    auto result = db.recordDeps(
         "", null_t{}, {dep}, true);
 
     // Volatile deps should NOT be session-memoized (Salsa: no memoization for volatile)
@@ -292,14 +292,14 @@ TEST_F(TraceCacheIntegrationTest, Recovery_AfterDepChange)
     {
         ScopedEnvVar env("NIX_RECOVERY_TEST", "v1");
         auto dep = makeEnvVarDep("NIX_RECOVERY_TEST", "v1");
-        v1Result = db.record("", string_t{"result-v1", {}}, {dep}, true);
+        v1Result = db.recordDeps("", string_t{"result-v1", {}}, {dep}, true);
     }
 
     // Step 2: Record trace with v2
     {
         ScopedEnvVar env("NIX_RECOVERY_TEST", "v2");
         auto dep = makeEnvVarDep("NIX_RECOVERY_TEST", "v2");
-        db.record("", string_t{"result-v2", {}}, {dep}, true);
+        db.recordDeps("", string_t{"result-v2", {}}, {dep}, true);
     }
 
     // Step 3: Revert to v1 — trigger constructive recovery
@@ -327,7 +327,7 @@ TEST_F(TraceCacheIntegrationTest, Recovery_VolatileFails)
 
     // Record trace with volatile dep (Shake: always-dirty rule)
     auto dep = makeCurrentTimeDep();
-    auto storeResult = db.record(
+    auto storeResult = db.recordDeps(
         "", null_t{}, {dep}, true);
 
     // Clear session memo cache

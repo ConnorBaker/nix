@@ -110,4 +110,26 @@ extern Counter nrRecoveryStructVariantHits;
 extern Counter nrRecords;
 extern Counter nrLoadTraces;
 
+// TracedExpr creation/forcing breakdown
+extern Counter nrTracedExprCreated;
+extern Counter nrTracedExprFromMaterialize;
+extern Counter nrTracedExprFromOrigAttrs;
+extern Counter nrTracedExprFromDataFile;
+extern Counter nrTracedExprForced;
+extern Counter nrLazyStateAllocated;
+
+// Data-file node type breakdown (ExprTracedData::eval)
+extern Counter nrDataFileScalarChildren;
+extern Counter nrDataFileContainerChildren;
+
+// DependencyTracker scope operations
+extern Counter nrDepTrackerScopes;
+extern Counter nrExcludeChildRangeCalls;
+
+// replayMemoizedDeps breakdown
+extern Counter nrReplayTotalCalls;
+extern Counter nrReplayBloomHits;
+extern Counter nrReplayEpochHits;
+extern Counter nrReplayAdded;
+
 } // namespace nix::eval_trace

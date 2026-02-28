@@ -36,7 +36,7 @@ TEST_F(TraceStoreTest, NixpkgsMiss_IrrelevantContentChange)
         makeEnvVarDep("NIX_CATAMISS_REL", "stable_value"),
         makeEnvVarDep("NIX_CATAMISS_IRREL", "original"),
     };
-    db.record("closures", string_t{"/nix/store/aaa-closures", {}}, deps, true);
+    db.recordDeps("closures", string_t{"/nix/store/aaa-closures", {}}, deps, true);
 
     // Simulate commit transition: irrelevant dep changes (aliases.nix edit)
     setenv("NIX_CATAMISS_IRREL", "modified", 1);
@@ -63,7 +63,7 @@ TEST_F(TraceStoreTest, NixpkgsHit_RevertAfterIrrelevantChange)
         makeEnvVarDep("NIX_CATAHIT_REL", "stable"),
         makeEnvVarDep("NIX_CATAHIT_IRREL", "v1"),
     };
-    db.record("closures", string_t{"/nix/store/aaa-closures", {}}, depsV1, true);
+    db.recordDeps("closures", string_t{"/nix/store/aaa-closures", {}}, depsV1, true);
 
     // Version 2: irrelevant change (new aliases.nix content)
     setenv("NIX_CATAHIT_IRREL", "v2", 1);
@@ -71,7 +71,7 @@ TEST_F(TraceStoreTest, NixpkgsHit_RevertAfterIrrelevantChange)
         makeEnvVarDep("NIX_CATAHIT_REL", "stable"),
         makeEnvVarDep("NIX_CATAHIT_IRREL", "v2"),
     };
-    db.record("closures", string_t{"/nix/store/aaa-closures", {}}, depsV2, true);
+    db.recordDeps("closures", string_t{"/nix/store/aaa-closures", {}}, depsV2, true);
 
     // Revert to v1: direct hash recovery should find original trace
     setenv("NIX_CATAHIT_IRREL", "v1", 1);
@@ -112,7 +112,7 @@ TEST_F(TraceStoreTest, NixpkgsMiss_NewDirectoryEntryChangesListing)
         makeEnvVarDep("NIX_CATB_DIR_LISTING", "hash_of_existing1_existing2"),
     };
     ScopedEnvVar dir("NIX_CATB_DIR_LISTING", "hash_of_existing1_existing2");
-    db.record("closures", string_t{"/nix/store/bbb-closures", {}}, deps, true);
+    db.recordDeps("closures", string_t{"/nix/store/bbb-closures", {}}, deps, true);
 
     // Add new entry to directory -> listing hash changes
     setenv("NIX_CATB_DIR_LISTING", "hash_of_existing1_existing2_fabs", 1);
@@ -143,7 +143,7 @@ TEST_F(TraceStoreTest, NixpkgsMiss_IrrelevantLineAdded)
         makeEnvVarDep("NIX_CATC_SHARED", "original_content_hash"),
         makeEnvVarDep("NIX_CATC_OWN", "my_stable_dep"),
     };
-    db.record("closures", string_t{"/nix/store/ccc-closures", {}}, deps, true);
+    db.recordDeps("closures", string_t{"/nix/store/ccc-closures", {}}, deps, true);
 
     // Add line to shared file -> content hash changes
     setenv("NIX_CATC_SHARED", "modified_content_hash", 1);
@@ -177,14 +177,14 @@ TEST_F(TraceStoreTest, NixpkgsMiss_InterleavingGroups)
         makeEnvVarDep("NIX_CATD_A", "a1"),
         makeEnvVarDep("NIX_CATD_B", "b1"),
     };
-    db.record("closures", string_t{"/nix/store/grp6", {}}, group6Deps, true);
+    db.recordDeps("closures", string_t{"/nix/store/grp6", {}}, group6Deps, true);
 
     // Group 8 commit: depends on A + C (different structural hash)
     std::vector<Dep> group8Deps = {
         makeEnvVarDep("NIX_CATD_A", "a1"),
         makeEnvVarDep("NIX_CATD_C", "c1"),
     };
-    db.record("closures", string_t{"/nix/store/grp8", {}}, group8Deps, true);
+    db.recordDeps("closures", string_t{"/nix/store/grp8", {}}, group8Deps, true);
 
     // Switch to a third version where A changed and B is different
     setenv("NIX_CATD_A", "a2", 1);
@@ -215,14 +215,14 @@ TEST_F(TraceStoreTest, NixpkgsHit_InterleavingRecovery)
     std::vector<Dep> deps1 = {
         makeEnvVarDep("NIX_CATD2_A", "a1"),
     };
-    db.record("closures", string_t{"/nix/store/v1", {}}, deps1, true);
+    db.recordDeps("closures", string_t{"/nix/store/v1", {}}, deps1, true);
 
     // Version 2: depends on A + B (different struct_hash, becomes current)
     std::vector<Dep> deps2 = {
         makeEnvVarDep("NIX_CATD2_A", "a1"),
         makeEnvVarDep("NIX_CATD2_B", "b1"),
     };
-    db.record("closures", string_t{"/nix/store/v2", {}}, deps2, true);
+    db.recordDeps("closures", string_t{"/nix/store/v2", {}}, deps2, true);
 
     // Change B -> version 2's trace invalid. But version 1 has only A dep.
     setenv("NIX_CATD2_B", "b2", 1);
@@ -258,7 +258,7 @@ TEST_F(TraceStoreTest, NixpkgsMiss_MultipleIrrelevantChanges)
         makeEnvVarDep("NIX_MULTI_ALIASES", "original"),
         makeEnvVarDep("NIX_MULTI_DIRNAME", "original_listing"),
     };
-    db.record("closures", string_t{"/nix/store/multi", {}}, deps, true);
+    db.recordDeps("closures", string_t{"/nix/store/multi", {}}, deps, true);
 
     // Both irrelevant deps change simultaneously
     setenv("NIX_MULTI_ALIASES", "renamed_alias", 1);
@@ -291,7 +291,7 @@ TEST_F(TraceStoreTest, NixpkgsHit_SameOutputDifferentHistory)
             makeEnvVarDep("NIX_HIST_COMMON", "c1"),
             makeEnvVarDep("NIX_HIST_VARYING", v),
         };
-        db.record("closures", string_t{"/nix/store/same-output", {}}, deps, true);
+        db.recordDeps("closures", string_t{"/nix/store/same-output", {}}, deps, true);
     }
 
     // Revert to v2 (previously recorded state)
@@ -322,14 +322,14 @@ TEST_F(TraceStoreTest, NixpkgsMiss_NovelDepState)
         makeEnvVarDep("NIX_NOVEL_COMMON", "c1"),
         makeEnvVarDep("NIX_NOVEL_VARYING", "v1"),
     };
-    db.record("closures", string_t{"/nix/store/same-output", {}}, depsV1, true);
+    db.recordDeps("closures", string_t{"/nix/store/same-output", {}}, depsV1, true);
 
     setenv("NIX_NOVEL_VARYING", "v2", 1);
     std::vector<Dep> depsV2 = {
         makeEnvVarDep("NIX_NOVEL_COMMON", "c1"),
         makeEnvVarDep("NIX_NOVEL_VARYING", "v2"),
     };
-    db.record("closures", string_t{"/nix/store/same-output", {}}, depsV2, true);
+    db.recordDeps("closures", string_t{"/nix/store/same-output", {}}, depsV2, true);
 
     // Set to v3 (never recorded) -- same result would be produced but
     // the dep state is novel, so recovery fails.

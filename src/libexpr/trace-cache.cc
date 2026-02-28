@@ -43,6 +43,18 @@ Counter nrRecoveryStructVariantHits;
 Counter nrRecords;
 Counter nrLoadTraces;
 
+// TracedExpr creation/forcing breakdown
+Counter nrTracedExprCreated;
+Counter nrTracedExprFromMaterialize;
+Counter nrTracedExprFromOrigAttrs;
+Counter nrTracedExprFromDataFile;
+Counter nrTracedExprForced;
+Counter nrLazyStateAllocated;
+
+// Data-file node type breakdown
+Counter nrDataFileScalarChildren;
+Counter nrDataFileContainerChildren;
+
 // ── TracedExpr struct definition ─────────────────────────────────────
 
 /**
@@ -88,7 +100,7 @@ struct TracedExpr : Expr, gc
     LazyState * lazy = nullptr;
 
     LazyState & ensureLazy() {
-        if (!lazy) lazy = new LazyState{};
+        if (!lazy) { lazy = new LazyState{}; nrLazyStateAllocated++; }
         return *lazy;
     }
 
@@ -391,6 +403,8 @@ void TracedExpr::materializeOrigExprAttrs(
         auto childName = attrs.names[i];
         auto * childVal = st.allocValue();
         auto * wrapper = new TracedExpr(cache, 0, childName, this);
+        nrTracedExprCreated++;
+        nrTracedExprFromOrigAttrs++;
         wrapper->ensureLazy().origExpr = new ExprOrigChild(lazy->origExpr, lazy->origEnv, childName, shared);
         wrapper->ensureLazy().origEnv = lazy->origEnv;
         childVal->mkThunk(&st.baseEnv, wrapper);
@@ -496,6 +510,8 @@ Value * TracedExpr::navigateToReal()
                     && !dynamic_cast<TracedExpr*>(attr.value->thunk().expr))
                 {
                     auto * wrapper = new TracedExpr(cache, 0, attr.name, parentEC);
+                    nrTracedExprCreated++;
+                    nrTracedExprFromOrigAttrs++;
                     wrapper->ensureLazy().origExpr = attr.value->thunk().expr;
                     wrapper->ensureLazy().origEnv = attr.value->thunk().env;
                     attr.value->mkThunk(attr.value->thunk().env, wrapper);
@@ -551,6 +567,8 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
             auto childName = attrs->names[i];
             auto * childVal = st.allocValue();
             auto * child = new TracedExpr(cache, 0, childName, this);
+            nrTracedExprCreated++;
+            nrTracedExprFromMaterialize++;
             childVal->mkThunk(&st.baseEnv, child);
 
             PosIdx pos = noPos;
@@ -620,6 +638,8 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
             auto * elemVal = st.allocValue();
             auto sym = st.symbols.create(std::to_string(i));
             auto * child = new TracedExpr(cache, 0, sym, this, /*isListElement=*/true);
+            nrTracedExprCreated++;
+            nrTracedExprFromMaterialize++;
             elemVal->mkThunk(&st.baseEnv, child);
             list[i] = elemVal;
         }
@@ -646,7 +666,7 @@ void TracedExpr::evaluateFresh(Value & v)
 
     // Append per-sibling or whole-parent ParentContext deps for children.
     // Called from both the success and error paths of evaluateFresh().
-    auto appendParentContextDeps = [&](std::vector<Dep> & deps) {
+    auto appendParentContextDeps = [&](std::vector<CompactDep> & deps) {
         if (!parentExpr || !cache->dbBackend) return;
         if (siblingTracker && !siblingTracker->accesses.empty()) {
             // Per-sibling ParentContext deps: one dep per accessed sibling
@@ -656,8 +676,8 @@ void TracedExpr::evaluateFresh(Value & v)
                 std::memcpy(b3.bytes.data(), hash.hash, 32);
                 auto depKey = path;
                 std::replace(depKey.begin(), depKey.end(), '\0', '\t');
-                deps.push_back(Dep{
-                    "", depKey, DepHashValue(b3), DepType::ParentContext});
+                deps.push_back(CompactDep{
+                    DepType::ParentContext, internDepSource(""), internDepKey(depKey), DepHashValue(b3)});
             }
         } else {
             // Zero sibling accesses: fallback to whole-parent dep
@@ -669,8 +689,8 @@ void TracedExpr::evaluateFresh(Value & v)
                 std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
                 auto depKey = parentPath;
                 std::replace(depKey.begin(), depKey.end(), '\0', '\t');
-                deps.push_back(Dep{
-                    "", depKey, DepHashValue(b3), DepType::ParentContext});
+                deps.push_back(CompactDep{
+                    DepType::ParentContext, internDepSource(""), internDepKey(depKey), DepHashValue(b3)});
             }
         }
     };
@@ -1020,6 +1040,7 @@ std::optional<std::string> deepCompare(
 // TracedExpr::eval — demand-driven dispatch (Adapton)
 void TracedExpr::eval(EvalState & state, Env & env, Value & v)
 {
+    nrTracedExprForced++;
     if (!cache->dbBackend) {
         if (lazy && lazy->origExpr) {
             lazy->origExpr->eval(state, *lazy->origEnv, v);
@@ -1160,6 +1181,7 @@ Value * TraceCache::getRootValue()
     if (!value) {
         auto * v = state.allocValue();
         v->mkThunk(&state.baseEnv, new TracedExpr(this, 0, state.s.epsilon, nullptr));
+        nrTracedExprCreated++;
         value = allocRootValue(v);
     }
     return *value;

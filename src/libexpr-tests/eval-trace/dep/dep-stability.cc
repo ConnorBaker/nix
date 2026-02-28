@@ -14,12 +14,12 @@ namespace nix::eval_trace {
 using namespace nix::eval_trace::test;
 
 /// Extract dep keys from a dep vector for exact-match assertions.
-static std::vector<std::string> keys(const std::vector<Dep> & deps)
+static std::vector<std::string> keys(const std::vector<CompactDep> & deps)
 {
     std::vector<std::string> out;
     out.reserve(deps.size());
     for (auto & d : deps)
-        out.push_back(d.key);
+        out.push_back(std::string(resolveDepKey(d.keyId)));
     return out;
 }
 
@@ -349,7 +349,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
 
     // Record ROOT trace with zero deps (typical for ROOT)
     auto rootPath = std::string("");
-    db.record(rootPath, CachedResult(attrs_t{}), {}, true);
+    db.recordDeps(rootPath, CachedResult(attrs_t{}), {}, true);
     auto rootHash = db.getCurrentTraceHash(rootPath);
     ASSERT_TRUE(rootHash.has_value());
 
@@ -361,7 +361,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
         Dep{"", dataFile.path.string(), DepHashValue(fileHash), DepType::Content},
         makeParentContextDep("", *rootHash),
     };
-    db.record(xPath, CachedResult(int_t{NixInt(11)}), xDeps, false);
+    db.recordDeps(xPath, CachedResult(int_t{NixInt(11)}), xDeps, false);
     auto xHash = db.getCurrentTraceHash(toDepKey(xPath));
     ASSERT_TRUE(xHash.has_value());
 
@@ -370,7 +370,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
     std::vector<Dep> yDeps = {
         makeParentContextDep(toDepKey(xPath), *xHash),
     };
-    db.record(yPath, CachedResult(int_t{NixInt(10)}), yDeps, false);
+    db.recordDeps(yPath, CachedResult(int_t{NixInt(10)}), yDeps, false);
 
     // Before file change: y should verify (chain is valid)
     db.clearSessionCaches();
@@ -397,21 +397,21 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_NoChange_StillValid)
     TempExtFile dataFile("json", "42");
     auto db = makeDb();
 
-    db.record("", CachedResult(attrs_t{}), {}, true);
+    db.recordDeps("", CachedResult(attrs_t{}), {}, true);
     auto rootHash = db.getCurrentTraceHash("");
     ASSERT_TRUE(rootHash.has_value());
 
     auto xPath = makePath({"x"});
     auto fileHash = depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
-    db.record(xPath, CachedResult(int_t{NixInt(42)}),
+    db.recordDeps(xPath, CachedResult(int_t{NixInt(42)}),
         {Dep{"", dataFile.path.string(), DepHashValue(fileHash), DepType::Content},
          makeParentContextDep("", *rootHash)}, false);
     auto xHash = db.getCurrentTraceHash(toDepKey(xPath));
     ASSERT_TRUE(xHash.has_value());
 
     auto yPath = makePath({"y"});
-    db.record(yPath, CachedResult(int_t{NixInt(41)}),
+    db.recordDeps(yPath, CachedResult(int_t{NixInt(41)}),
         {makeParentContextDep(toDepKey(xPath), *xHash)}, false);
 
     db.clearSessionCaches();
@@ -435,7 +435,7 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
     auto db = makeDb();
 
     // ROOT: stable (no deps that change)
-    db.record("", CachedResult(attrs_t{}), {}, true);
+    db.recordDeps("", CachedResult(attrs_t{}), {}, true);
     auto rootHash = db.getCurrentTraceHash("");
     ASSERT_TRUE(rootHash.has_value());
 
@@ -443,7 +443,7 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
     auto xPath = makePath({"x"});
     auto fileHash = depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
-    db.record(xPath, CachedResult(string_t{"x_v1", {}}),
+    db.recordDeps(xPath, CachedResult(string_t{"x_v1", {}}),
         {Dep{"", dataFile.path.string(), DepHashValue(fileHash), DepType::Content},
          makeParentContextDep("", *rootHash)},
         false);
@@ -452,7 +452,7 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
 
     // y: per-sibling ParentContext dep on x only
     auto yPath = makePath({"y"});
-    db.record(yPath, CachedResult(string_t{"y_v1", {}}),
+    db.recordDeps(yPath, CachedResult(string_t{"y_v1", {}}),
         {makeParentContextDep(toDepKey(xPath), *xHash)},
         false);
 
@@ -492,7 +492,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     auto db = makeDb();
 
     // ROOT trace: no deps (stable)
-    db.record("", CachedResult(attrs_t{}), {}, true);
+    db.recordDeps("", CachedResult(attrs_t{}), {}, true);
     auto rootTraceHash = db.getCurrentTraceHash("");
     ASSERT_TRUE(rootTraceHash.has_value());
 
@@ -500,7 +500,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     auto depAHash = depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(depAFile.path.string())));
     auto xPath = makePath({"x"});
-    db.record(xPath, CachedResult(int_t{NixInt(11)}),
+    db.recordDeps(xPath, CachedResult(int_t{NixInt(11)}),
         {Dep{"", depAFile.path.string(), DepHashValue(depAHash), DepType::Content},
          makeParentContextDep("", *rootTraceHash)},
         false);
@@ -511,14 +511,14 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     auto depBHash = depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(depBFile.path.string())));
     auto zPath = makePath({"z"});
-    db.record(zPath, CachedResult(int_t{NixInt(99)}),
+    db.recordDeps(zPath, CachedResult(int_t{NixInt(99)}),
         {Dep{"", depBFile.path.string(), DepHashValue(depBHash), DepType::Content},
          makeParentContextDep("", *rootTraceHash)},
         false);
 
     // "y" trace: per-sibling dep on x only (y = x - 1, doesn't touch z)
     auto yPath = makePath({"y"});
-    db.record(yPath, CachedResult(int_t{NixInt(10)}),
+    db.recordDeps(yPath, CachedResult(int_t{NixInt(10)}),
         {makeParentContextDep(toDepKey(xPath), *xTraceHash)},
         false);
 

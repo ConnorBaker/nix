@@ -17,11 +17,11 @@ TEST_F(TraceStoreTest, DifferentContextHash_Isolated)
 
     {
         TraceStore db1(state.symbols, 111);
-        db1.record("pkg", string_t{"v1", {}}, {}, false);
+        db1.recordDeps("pkg", string_t{"v1", {}}, {}, false);
     }
     {
         TraceStore db2(state.symbols, 222);
-        db2.record("pkg", string_t{"v2", {}}, {}, false);
+        db2.recordDeps("pkg", string_t{"v2", {}}, {}, false);
     }
 
     {
@@ -51,7 +51,7 @@ TEST_F(TraceStoreTest, NullByteAttrPath)
     attrPath.push_back('\0');
     attrPath.append("hello");
 
-    db.record(attrPath, string_t{"val", {}}, {}, false);
+    db.recordDeps(attrPath, string_t{"val", {}}, {}, false);
     EXPECT_TRUE(db.attrExists(attrPath));
     EXPECT_FALSE(db.attrExists("packages"));
 }
@@ -59,7 +59,7 @@ TEST_F(TraceStoreTest, NullByteAttrPath)
 TEST_F(TraceStoreTest, EmptyAttrPath)
 {
     auto db = makeDb();
-    db.record("", string_t{"root-val", {}}, {}, true);
+    db.recordDeps("", string_t{"root-val", {}}, {}, true);
     EXPECT_TRUE(db.attrExists(""));
 }
 
@@ -70,7 +70,7 @@ TEST_F(TraceStoreTest, MultipleEntries_Stress)
     // Record 100 trace entries
     for (int i = 0; i < 100; i++) {
         auto name = "stress-" + std::to_string(i);
-        db.record(name, int_t{NixInt{i}}, {}, false);
+        db.recordDeps(name, int_t{NixInt{i}}, {}, false);
     }
 
     EXPECT_TRUE(db.attrExists("stress-0"));
@@ -225,7 +225,7 @@ TEST_F(TraceStoreTest, DepKeySets_SiblingOverlap)
     auto db = makeDb();
 
     // Parent with 0 deps (FullAttrs pattern — trace records only child names)
-    db.record("", null_t{}, {}, true);
+    db.recordDeps("", null_t{}, {}, true);
 
     // Child A trace with 100 deps (own deps only, no parent inheritance)
     std::vector<Dep> depsA;
@@ -233,7 +233,7 @@ TEST_F(TraceStoreTest, DepKeySets_SiblingOverlap)
         depsA.push_back(makeContentDep("/file-" + std::to_string(i) + ".nix",
                                        "content-" + std::to_string(i)));
     }
-    auto childA = db.record("a", string_t{"val-a", {}}, depsA, false);
+    auto childA = db.recordDeps("a", string_t{"val-a", {}}, depsA, false);
 
     // Child B trace with 95 overlapping deps + 5 different hashes
     std::vector<Dep> depsB;
@@ -245,7 +245,7 @@ TEST_F(TraceStoreTest, DepKeySets_SiblingOverlap)
         depsB.push_back(makeContentDep("/file-" + std::to_string(i) + ".nix",
                                        "content-modified-" + std::to_string(i)));
     }
-    auto childB = db.record("b", string_t{"val-b", {}}, depsB, false);
+    auto childB = db.recordDeps("b", string_t{"val-b", {}}, depsB, false);
 
     // Both traces should load correctly with full deps
     auto loadedA = db.loadFullTrace(childA.traceId);
@@ -261,7 +261,7 @@ TEST_F(TraceStoreTest, Record_SeparatedDeps)
     auto db = makeDb();
 
     // Parent with 0 deps (FullAttrs pattern — trace records only child names)
-    db.record("", null_t{}, {}, true);
+    db.recordDeps("", null_t{}, {}, true);
 
     // Child A trace with 100 deps
     std::vector<Dep> depsA;
@@ -269,7 +269,7 @@ TEST_F(TraceStoreTest, Record_SeparatedDeps)
         depsA.push_back(makeContentDep("/f" + std::to_string(i) + ".nix",
                                        "c" + std::to_string(i)));
     }
-    auto childA = db.record("a", int_t{NixInt{1}}, depsA, false);
+    auto childA = db.recordDeps("a", int_t{NixInt{1}}, depsA, false);
 
     // Child B trace with 99 overlapping + 1 different dep hash
     std::vector<Dep> depsB;
@@ -278,7 +278,7 @@ TEST_F(TraceStoreTest, Record_SeparatedDeps)
                                        "c" + std::to_string(i)));
     }
     depsB.push_back(makeContentDep("/f99.nix", "c99-modified"));
-    auto childB = db.record("b", int_t{NixInt{2}}, depsB, false);
+    auto childB = db.recordDeps("b", int_t{NixInt{2}}, depsB, false);
 
     // Verify both traces load correctly
     auto loadedA = db.loadFullTrace(childA.traceId);
@@ -314,7 +314,7 @@ TEST_F(TraceStoreTest, WarmPath_BatchValidation)
         setenv(key.c_str(), value.c_str(), 1);
         deps.push_back(makeEnvVarDep(key, value));
     }
-    auto result = db.record("", null_t{}, deps, true);
+    auto result = db.recordDeps("", null_t{}, deps, true);
 
     // Change dep #25 to invalidate its hash
     setenv("NIX_BATCH_25", "CHANGED", 1);
@@ -348,7 +348,7 @@ TEST_F(TraceStoreTest, WarmPath_HashCaching)
         makeEnvVarDep("NIX_HASHCACHE_A", "valA"),
         makeEnvVarDep("NIX_HASHCACHE_B", "valB"),
     };
-    db.record("", string_t{"result-1", {}}, deps1, true);
+    db.recordDeps("", string_t{"result-1", {}}, deps1, true);
 
     // Version 2: A changed, B same
     setenv("NIX_HASHCACHE_A", "valA2", 1);
@@ -356,7 +356,7 @@ TEST_F(TraceStoreTest, WarmPath_HashCaching)
         makeEnvVarDep("NIX_HASHCACHE_A", "valA2"),
         makeEnvVarDep("NIX_HASHCACHE_B", "valB"),
     };
-    db.record("", string_t{"result-2", {}}, deps2, true);
+    db.recordDeps("", string_t{"result-2", {}}, deps2, true);
 
     // Revert A
     setenv("NIX_HASHCACHE_A", "valA", 1);
@@ -383,7 +383,7 @@ TEST_F(TraceStoreTest, WarmPath_BaseValidatedOnce)
     // Record 5 attrs with identical deps (all share the same trace)
     for (int i = 0; i < 5; i++) {
         auto name = "sibling-" + std::to_string(i);
-        db.record(name, int_t{NixInt{i}}, sharedDeps, false);
+        db.recordDeps(name, int_t{NixInt{i}}, sharedDeps, false);
     }
 
     db.clearSessionCaches();
@@ -418,15 +418,15 @@ TEST_F(TraceStoreTest, RecordVerify_WarmRoundtrip)
 
     // Attr 1: shared + 1 unique
     std::vector<Dep> deps1 = {sharedDep, makeEnvVarDep("NIX_DW_A", "a-val")};
-    db.record("a", string_t{"val-a", {}}, deps1, false);
+    db.recordDeps("a", string_t{"val-a", {}}, deps1, false);
 
     // Attr 2: shared + 1 different unique
     std::vector<Dep> deps2 = {sharedDep, makeEnvVarDep("NIX_DW_B", "b-val")};
-    db.record("b", string_t{"val-b", {}}, deps2, false);
+    db.recordDeps("b", string_t{"val-b", {}}, deps2, false);
 
     // Attr 3: shared only
     std::vector<Dep> deps3 = {sharedDep};
-    db.record("c", string_t{"val-c", {}}, deps3, false);
+    db.recordDeps("c", string_t{"val-c", {}}, deps3, false);
 
     db.clearSessionCaches();
 

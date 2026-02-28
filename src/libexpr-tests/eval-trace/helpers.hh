@@ -429,13 +429,27 @@ class TraceStoreTest : public TraceStoreFixture
 class DepPrecisionTest : public TracedDataTest
 {
 protected:
+    static std::vector<Dep> resolveDeps(const std::vector<CompactDep> & compact)
+    {
+        std::vector<Dep> result;
+        result.reserve(compact.size());
+        for (auto & c : compact) {
+            result.push_back(Dep{
+                std::string(resolveDepSource(c.sourceId)),
+                std::string(resolveDepKey(c.keyId)),
+                c.expectedHash,
+                c.type});
+        }
+        return result;
+    }
+
     std::vector<Dep> evalAndCollectDeps(const std::string & nixExpr)
     {
         DependencyTracker tracker;
         state.traceActiveDepth++;
         (void) eval(nixExpr, /* forceValue */ true);
         state.traceActiveDepth--;
-        return tracker.collectTraces();
+        return resolveDeps(tracker.collectTraces());
     }
 
     /**

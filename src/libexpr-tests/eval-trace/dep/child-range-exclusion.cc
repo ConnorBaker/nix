@@ -11,12 +11,12 @@ namespace nix::eval_trace {
 using namespace nix::eval_trace::test;
 
 /// Extract dep keys from a dep vector for exact-match assertions.
-static std::vector<std::string> keys(const std::vector<Dep> & deps)
+static std::vector<std::string> keys(const std::vector<CompactDep> & deps)
 {
     std::vector<std::string> out;
     out.reserve(deps.size());
     for (auto & d : deps)
-        out.push_back(d.key);
+        out.push_back(std::string(resolveDepKey(d.keyId)));
     return out;
 }
 

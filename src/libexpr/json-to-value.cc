@@ -2,6 +2,7 @@
 #include "nix/expr/traced-data.hh"
 #include "nix/expr/dependency-tracker.hh"
 #include "nix/expr/eval-trace-context.hh"
+#include "nix/expr/trace-cache.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/eval.hh"
 
@@ -336,6 +337,8 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
             auto * childExpr = new ExprTracedData(
                 childNode, sourceId, filePathId, childPathId);
             childVal->mkThunk(&state.baseEnv, childExpr);
+            eval_trace::nrTracedExprFromDataFile++;
+            eval_trace::nrDataFileContainerChildren++;
             forceNoNullByte(k);
             PosIdx keyPos = tracking ? state.positions.add(originHandle, idx) : PosIdx{};
             attrs.insert(state.symbols.create(k), childVal, keyPos);
@@ -382,6 +385,8 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
             auto * childExpr = new ExprTracedData(
                 childNode, sourceId, filePathId, childPathId);
             childVal->mkThunk(&state.baseEnv, childExpr);
+            eval_trace::nrTracedExprFromDataFile++;
+            eval_trace::nrDataFileContainerChildren++;
             list[i] = childVal;
         }
         v.mkList(list);
@@ -411,6 +416,7 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         auto hash = depHash(node->canonicalValue());
         recordStructuredDep(scalarComp, DepHashValue(hash));
         node->materializeScalar(state, v);
+        eval_trace::nrDataFileScalarChildren++;
         break;
     }
     }

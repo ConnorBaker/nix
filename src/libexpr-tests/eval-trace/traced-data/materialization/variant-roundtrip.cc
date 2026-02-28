@@ -27,7 +27,7 @@ TEST_F(TraceStoreTest, Attrs_RecordVerifyRoundtrip)
     original.origins.push_back({"input1", "file.json", "", 'j'});
     original.originIndices = {0, 0};
 
-    db.record("test_attr", CachedResult(original), {}, true);
+    db.recordDeps("test_attr", CachedResult(original), {}, true);
 
     auto result = db.verify("test_attr", {}, state);
     ASSERT_TRUE(result.has_value());
@@ -60,7 +60,7 @@ TEST_F(TraceStoreTest, Attrs_NonTracedData_NoOrigins)
     };
     // No origins set — plain Nix attrset
 
-    db.record("plain_attr", CachedResult(original), {}, true);
+    db.recordDeps("plain_attr", CachedResult(original), {}, true);
 
     auto result = db.verify("plain_attr", {}, state);
     ASSERT_TRUE(result.has_value());
@@ -86,7 +86,7 @@ TEST_F(TraceStoreTest, Attrs_MultiOrigin_PreservesPerAttrMapping)
     original.origins.push_back({"input2", "f2.json", "", 'j'});
     original.originIndices = {0, 1, 0}; // a->origin0, b->origin1, c->origin0
 
-    db.record("multi_attr", CachedResult(original), {}, true);
+    db.recordDeps("multi_attr", CachedResult(original), {}, true);
 
     auto result = db.verify("multi_attr", {}, state);
     ASSERT_TRUE(result.has_value());
@@ -114,7 +114,7 @@ TEST_F(TraceStoreTest, Attrs_MixedOrigin_NixAddedAttrsMinusOne)
     original.origins.push_back({"input1", "f1.json", "", 'j'});
     original.originIndices = {0, -1}; // a->origin0, extra->no origin (Nix-added)
 
-    db.record("mixed_attr", CachedResult(original), {}, true);
+    db.recordDeps("mixed_attr", CachedResult(original), {}, true);
 
     auto result = db.verify("mixed_attr", {}, state);
     ASSERT_TRUE(result.has_value());
@@ -134,7 +134,7 @@ TEST_F(TraceStoreTest, Attrs_EmptyObject_NoOrigins)
     attrs_t original;
     // Empty names, no origins
 
-    db.record("empty_attr", CachedResult(original), {}, true);
+    db.recordDeps("empty_attr", CachedResult(original), {}, true);
 
     auto result = db.verify("empty_attr", {}, state);
     ASSERT_TRUE(result.has_value());

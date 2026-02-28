@@ -316,6 +316,14 @@ struct TraceStore {
     RecordResult record(
         std::string_view attrPath,
         const CachedResult & value,
+        const std::vector<CompactDep> & allDeps,
+        bool isRoot);
+
+    /** Convenience overload: accepts Dep objects, interns them into CompactDeps.
+     *  Must pass an explicit vector (not an initializer list) to avoid ambiguity. */
+    RecordResult recordDeps(
+        std::string_view attrPath,
+        const CachedResult & value,
         const std::vector<Dep> & allDeps,
         bool isRoot);
 
@@ -397,6 +405,7 @@ struct TraceStore {
     // Full dep interning/resolution (combines key set + values)
     std::vector<Dep> resolveDeps(const std::vector<InternedDepKey> & keys,
                                   const std::vector<DepHashValue> & values);
+    std::vector<InternedDep> internDeps(const std::vector<CompactDep> & deps);
     std::vector<InternedDep> internDeps(const std::vector<Dep> & deps);
 
     /**

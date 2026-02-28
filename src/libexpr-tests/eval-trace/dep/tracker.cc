@@ -56,7 +56,7 @@ TEST_F(DependencyTrackerTest, Record_WithActiveTracker)
     DependencyTracker::record(dep);
     auto deps = tracker.collectTraces();
     ASSERT_EQ(deps.size(), 1u);
-    EXPECT_EQ(deps[0].key, "/test.nix");
+    EXPECT_EQ(resolveDepKey(deps[0].keyId), "/test.nix");
     EXPECT_EQ(deps[0].type, DepType::Content);
 }
 
@@ -77,12 +77,12 @@ TEST_F(DependencyTrackerTest, CollectDeps_OnlyCurrentRange)
         DependencyTracker::record(makeContentDep("/inner.nix", "inner"));
         auto innerDeps = inner.collectTraces();
         ASSERT_EQ(innerDeps.size(), 1u);
-        EXPECT_EQ(innerDeps[0].key, "/inner.nix");
+        EXPECT_EQ(resolveDepKey(innerDeps[0].keyId), "/inner.nix");
     }
     auto outerDeps = outer.collectTraces();
     // Outer should have both (inner recorded into outer's session range too — Adapton: nested scopes)
     EXPECT_GE(outerDeps.size(), 1u);
-    EXPECT_EQ(outerDeps[0].key, "/outer.nix");
+    EXPECT_EQ(resolveDepKey(outerDeps[0].keyId), "/outer.nix");
 }
 
 TEST_F(DependencyTrackerTest, ClearSessionDeps)

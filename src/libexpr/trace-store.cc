@@ -598,6 +598,23 @@ std::vector<Dep> TraceStore::resolveDeps(
     return deps;
 }
 
+std::vector<TraceStore::InternedDep> TraceStore::internDeps(const std::vector<CompactDep> & deps)
+{
+    std::vector<InternedDep> interned;
+    interned.reserve(deps.size());
+
+    for (auto & dep : deps) {
+        interned.push_back({
+            dep.type,
+            doInternString(resolveDepSource(dep.sourceId)),
+            doInternString(resolveDepKey(dep.keyId)),
+            dep.expectedHash
+        });
+    }
+
+    return interned;
+}
+
 std::vector<TraceStore::InternedDep> TraceStore::internDeps(const std::vector<Dep> & deps)
 {
     std::vector<InternedDep> interned;
@@ -2031,7 +2048,7 @@ static Hash computeStructHashFromInterned(
 TraceStore::RecordResult TraceStore::record(
     std::string_view attrPath,
     const CachedResult & value,
-    const std::vector<Dep> & allDeps,
+    const std::vector<CompactDep> & allDeps,
     bool isRoot)
 {
     auto recordStart = timerStart();
@@ -2121,6 +2138,25 @@ TraceStore::RecordResult TraceStore::record(
 
     nrRecordTimeUs += elapsedUs(recordStart);
     return RecordResult{traceId};
+}
+
+TraceStore::RecordResult TraceStore::recordDeps(
+    std::string_view attrPath,
+    const CachedResult & value,
+    const std::vector<Dep> & allDeps,
+    bool isRoot)
+{
+    // Convert Dep objects to CompactDep by interning strings into thread-local pools.
+    std::vector<CompactDep> compact;
+    compact.reserve(allDeps.size());
+    for (auto & dep : allDeps) {
+        compact.push_back(CompactDep{
+            dep.type,
+            internDepSource(dep.source),
+            internDepKey(dep.key),
+            dep.expectedHash});
+    }
+    return record(attrPath, value, compact, isRoot);
 }
 
 // ── Verify path (BSàlC verifying trace) ──────────────────────────────

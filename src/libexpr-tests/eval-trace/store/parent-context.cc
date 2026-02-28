@@ -14,7 +14,7 @@ using namespace nix::eval_trace::test;
 TEST_F(TraceStoreTest, GetCurrentTraceHash_ReturnsHash)
 {
     auto db = makeDb();
-    db.record("root", string_t{"val", {}}, {makeEnvVarDep("NIX_GTH_1", "a")}, true);
+    db.recordDeps("root", string_t{"val", {}}, {makeEnvVarDep("NIX_GTH_1", "a")}, true);
 
     auto hash = db.getCurrentTraceHash("root");
     ASSERT_TRUE(hash.has_value());
@@ -38,12 +38,12 @@ TEST_F(TraceStoreTest, GetCurrentTraceHash_ChangesWithDeps)
     auto db = makeDb();
 
     // Record with deps A
-    db.record("root", string_t{"v1", {}}, {makeEnvVarDep("NIX_GTH_2A", "a")}, true);
+    db.recordDeps("root", string_t{"v1", {}}, {makeEnvVarDep("NIX_GTH_2A", "a")}, true);
     auto hash1 = db.getCurrentTraceHash("root");
     ASSERT_TRUE(hash1.has_value());
 
     // Re-record with deps B (different deps → different trace hash)
-    db.record("root", string_t{"v2", {}}, {makeEnvVarDep("NIX_GTH_2B", "b")}, true);
+    db.recordDeps("root", string_t{"v2", {}}, {makeEnvVarDep("NIX_GTH_2B", "b")}, true);
     auto hash2 = db.getCurrentTraceHash("root");
     ASSERT_TRUE(hash2.has_value());
 
@@ -58,8 +58,8 @@ TEST_F(TraceStoreTest, GetCurrentTraceHash_DiffersFromResultHash)
     // dep structure, not just result content.
     auto db = makeDb();
 
-    db.record("a", string_t{"same-result", {}}, {makeEnvVarDep("NIX_GTH_3A", "a")}, false);
-    db.record("b", string_t{"same-result", {}}, {makeEnvVarDep("NIX_GTH_3B", "b")}, false);
+    db.recordDeps("a", string_t{"same-result", {}}, {makeEnvVarDep("NIX_GTH_3A", "a")}, false);
+    db.recordDeps("b", string_t{"same-result", {}}, {makeEnvVarDep("NIX_GTH_3B", "b")}, false);
 
     auto hashA = db.getCurrentTraceHash("a");
     auto hashB = db.getCurrentTraceHash("b");
@@ -80,7 +80,7 @@ TEST_F(TraceStoreTest, GetCurrentTraceHash_TabSeparatorConversion)
     attrPath.push_back('\0');
     attrPath.append("x86_64-linux");
 
-    db.record(attrPath, string_t{"val", {}},
+    db.recordDeps(attrPath, string_t{"val", {}},
               {makeEnvVarDep("NIX_GTH_4", "v")}, false);
 
     // Convert \0 to \t (as trace-cache.cc does for ParentContext dep keys)
@@ -107,13 +107,13 @@ TEST_F(TraceStoreTest, ParentContext_VerifiesWhenParentUnchanged)
     auto db = makeDb();
 
     // Record parent
-    db.record("parent", string_t{"parent-val", {}},
+    db.recordDeps("parent", string_t{"parent-val", {}},
               {makeEnvVarDep("NIX_PCV_1", "val")}, true);
     auto parentHash = db.getCurrentTraceHash("parent");
     ASSERT_TRUE(parentHash.has_value());
 
     // Record child with ParentContext dep
-    db.record("child", string_t{"child-val", {}},
+    db.recordDeps("child", string_t{"child-val", {}},
               {makeParentContextDep("parent", *parentHash)}, false);
 
     db.clearSessionCaches();
@@ -130,18 +130,18 @@ TEST_F(TraceStoreTest, ParentContext_FailsWhenParentChanges)
     auto db = makeDb();
 
     // Record parent v1
-    db.record("parent", string_t{"parent-v1", {}},
+    db.recordDeps("parent", string_t{"parent-v1", {}},
               {makeEnvVarDep("NIX_PCV_2", "val1")}, true);
     auto parentHash1 = db.getCurrentTraceHash("parent");
     ASSERT_TRUE(parentHash1.has_value());
 
     // Record child with ParentContext dep on parent v1
-    db.record("child", string_t{"child-v1", {}},
+    db.recordDeps("child", string_t{"child-v1", {}},
               {makeParentContextDep("parent", *parentHash1)}, false);
 
     // Change parent deps → different trace hash
     setenv("NIX_PCV_2", "val2", 1);
-    db.record("parent", string_t{"parent-v2", {}},
+    db.recordDeps("parent", string_t{"parent-v2", {}},
               {makeEnvVarDep("NIX_PCV_2", "val2")}, true);
 
     // Verify parent trace hash changed
@@ -163,29 +163,29 @@ TEST_F(TraceStoreTest, ParentContext_RecoveryOnRevert)
     auto db = makeDb();
 
     // Version 1: parent with val1
-    db.record("parent", string_t{"parent-v1", {}},
+    db.recordDeps("parent", string_t{"parent-v1", {}},
               {makeEnvVarDep("NIX_PCV_3", "val1")}, true);
     auto parentHash1 = db.getCurrentTraceHash("parent");
     ASSERT_TRUE(parentHash1.has_value());
 
     // Child v1 with ParentContext dep
-    db.record("child", string_t{"child-v1", {}},
+    db.recordDeps("child", string_t{"child-v1", {}},
               {makeParentContextDep("parent", *parentHash1)}, false);
 
     // Version 2: parent with val2
     setenv("NIX_PCV_3", "val2", 1);
-    db.record("parent", string_t{"parent-v2", {}},
+    db.recordDeps("parent", string_t{"parent-v2", {}},
               {makeEnvVarDep("NIX_PCV_3", "val2")}, true);
     auto parentHash2 = db.getCurrentTraceHash("parent");
     ASSERT_TRUE(parentHash2.has_value());
 
     // Child v2 with ParentContext dep
-    db.record("child", string_t{"child-v2", {}},
+    db.recordDeps("child", string_t{"child-v2", {}},
               {makeParentContextDep("parent", *parentHash2)}, false);
 
     // Revert parent to v1 (re-record so CurrentTraces points to v1 trace)
     setenv("NIX_PCV_3", "val1", 1);
-    db.record("parent", string_t{"parent-v1", {}},
+    db.recordDeps("parent", string_t{"parent-v1", {}},
               {makeEnvVarDep("NIX_PCV_3", "val1")}, true);
 
     db.clearSessionCaches();
@@ -206,7 +206,7 @@ TEST_F(TraceStoreTest, ParentContext_WithTabSeparatedKey)
     parentPath.push_back('\0');
     parentPath.append("x86_64-linux");
 
-    db.record(parentPath, string_t{"parent-val", {}},
+    db.recordDeps(parentPath, string_t{"parent-val", {}},
               {makeEnvVarDep("NIX_PCV_4", "val")}, false);
     auto parentHash = db.getCurrentTraceHash(parentPath);
     ASSERT_TRUE(parentHash.has_value());
@@ -220,7 +220,7 @@ TEST_F(TraceStoreTest, ParentContext_WithTabSeparatedKey)
     childPath.push_back('\0');
     childPath.append("hello");
 
-    db.record(childPath, string_t{"child-val", {}},
+    db.recordDeps(childPath, string_t{"child-val", {}},
               {makeParentContextDep(depKey, *parentHash)}, false);
 
     db.clearSessionCaches();
@@ -238,7 +238,7 @@ TEST_F(TraceStoreTest, ParentContext_MixedWithOwnDeps)
     auto db = makeDb();
 
     // Record parent
-    db.record("parent", string_t{"parent-result", {}},
+    db.recordDeps("parent", string_t{"parent-result", {}},
               {makeEnvVarDep("NIX_PCV_5P", "parent-val")}, true);
     auto parentHash = db.getCurrentTraceHash("parent");
     ASSERT_TRUE(parentHash.has_value());
@@ -248,7 +248,7 @@ TEST_F(TraceStoreTest, ParentContext_MixedWithOwnDeps)
         makeEnvVarDep("NIX_PCV_5C", "child-val"),
         makeParentContextDep("parent", *parentHash),
     };
-    db.record("child", string_t{"child-result", {}}, childDeps, false);
+    db.recordDeps("child", string_t{"child-result", {}}, childDeps, false);
 
     db.clearSessionCaches();
 
@@ -275,18 +275,18 @@ TEST_F(TraceStoreTest, ParentContext_SameResultDifferentDeps_Detects)
     ScopedEnvVar env("NIX_PCV_6", "val-A");
 
     // Parent v1: result "same" with dep on val-A
-    db.record("parent", string_t{"same", {}},
+    db.recordDeps("parent", string_t{"same", {}},
               {makeEnvVarDep("NIX_PCV_6", "val-A")}, true);
     auto parentHash1 = db.getCurrentTraceHash("parent");
     ASSERT_TRUE(parentHash1.has_value());
 
     // Child with ParentContext dep on parent v1
-    db.record("child", string_t{"child-from-A", {}},
+    db.recordDeps("child", string_t{"child-from-A", {}},
               {makeParentContextDep("parent", *parentHash1)}, false);
 
     // Parent v2: SAME result "same" but different dep value
     setenv("NIX_PCV_6", "val-B", 1);
-    db.record("parent", string_t{"same", {}},
+    db.recordDeps("parent", string_t{"same", {}},
               {makeEnvVarDep("NIX_PCV_6", "val-B")}, true);
 
     // Parent trace hash changed even though result is identical

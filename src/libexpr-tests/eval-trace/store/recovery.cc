@@ -18,12 +18,12 @@ TEST_F(TraceStoreTest, Phase1_StillWorks)
 
     auto db = makeDb();
     std::vector<Dep> depsA = {makeEnvVarDep("NIX_P1_TEST", "value_A")};
-    db.record("", string_t{"result_A", {}}, depsA, true);
+    db.recordDeps("", string_t{"result_A", {}}, depsA, true);
 
     // Change env var to value_B and record new trace
     setenv("NIX_P1_TEST", "value_B", 1);
     std::vector<Dep> depsB = {makeEnvVarDep("NIX_P1_TEST", "value_B")};
-    db.record("", string_t{"result_B", {}}, depsB, true);
+    db.recordDeps("", string_t{"result_B", {}}, depsB, true);
 
     // Revert to value_A -- Phase 1 constructive recovery should find the trace from first recording
     setenv("NIX_P1_TEST", "value_A", 1);
@@ -44,10 +44,10 @@ TEST_F(TraceStoreTest, ChildSurvivesParentInvalidation_NoDeps)
 
     // Record root trace with val1
     std::vector<Dep> rootDeps1 = {makeEnvVarDep("NIX_P1_ROOT", "val1")};
-    db.record("", string_t{"root1", {}}, rootDeps1, true);
+    db.recordDeps("", string_t{"root1", {}}, rootDeps1, true);
 
     // Record child trace (no deps)
-    db.record("child", string_t{"child1", {}}, {}, false);
+    db.recordDeps("child", string_t{"child1", {}}, {}, false);
 
     // Change root env var — root trace becomes invalid
     setenv("NIX_P1_ROOT", "val2", 1);
@@ -71,11 +71,11 @@ TEST_F(TraceStoreTest, ChildSurvivesParentInvalidation_WithStableDeps)
 
     // Record root trace with rval1
     std::vector<Dep> rootDeps1 = {makeEnvVarDep("NIX_P1W_ROOT", "rval1")};
-    db.record("", string_t{"root1", {}}, rootDeps1, true);
+    db.recordDeps("", string_t{"root1", {}}, rootDeps1, true);
 
     // Record child trace with stable dep (own dep only)
     std::vector<Dep> childDeps = {makeEnvVarDep("NIX_P1W_CHILD", "cval")};
-    db.record("child", string_t{"child1", {}}, childDeps, false);
+    db.recordDeps("child", string_t{"child1", {}}, childDeps, false);
 
     // Change parent env var — parent trace becomes invalid
     setenv("NIX_P1W_ROOT", "rval2", 1);
@@ -104,18 +104,18 @@ TEST_F(TraceStoreTest, IndependentVerification_TreeWithOwnDeps)
     // Version 1: record traces for entire tree
     std::vector<Dep> rootDeps1 = {makeEnvVarDep("NIX_P1C_ROOT", "v1")};
     std::vector<Dep> childDeps1 = {makeEnvVarDep("NIX_P1C_CHILD", "cv1")};
-    db.record("", string_t{"r1", {}}, rootDeps1, true);
-    db.record("c1", string_t{"c1v1", {}}, childDeps1, false);
-    db.record(c2AttrPath, string_t{"c2v1", {}}, {}, false);
+    db.recordDeps("", string_t{"r1", {}}, rootDeps1, true);
+    db.recordDeps("c1", string_t{"c1v1", {}}, childDeps1, false);
+    db.recordDeps(c2AttrPath, string_t{"c2v1", {}}, {}, false);
 
     // Version 2 — record new traces with changed deps at root and child
     setenv("NIX_P1C_ROOT", "v2", 1);
     setenv("NIX_P1C_CHILD", "cv2", 1);
     std::vector<Dep> rootDeps2 = {makeEnvVarDep("NIX_P1C_ROOT", "v2")};
     std::vector<Dep> childDeps2 = {makeEnvVarDep("NIX_P1C_CHILD", "cv2")};
-    db.record("", string_t{"r2", {}}, rootDeps2, true);
-    db.record("c1", string_t{"c1v2", {}}, childDeps2, false);
-    db.record(c2AttrPath, string_t{"c2v2", {}}, {}, false);
+    db.recordDeps("", string_t{"r2", {}}, rootDeps2, true);
+    db.recordDeps("c1", string_t{"c1v2", {}}, childDeps2, false);
+    db.recordDeps(c2AttrPath, string_t{"c2v2", {}}, {}, false);
 
     // Revert to v1 — each level recovers via own deps
     setenv("NIX_P1C_ROOT", "v1", 1);
@@ -148,14 +148,14 @@ TEST_F(TraceStoreTest, Phase3_DepStructMismatch)
 
     // First recording: trace with only dep A
     std::vector<Dep> deps1 = {makeEnvVarDep("NIX_P3_A", "aval")};
-    db.record("", string_t{"result1", {}}, deps1, true);
+    db.recordDeps("", string_t{"result1", {}}, deps1, true);
 
     // Second recording: trace with deps A + B (different structural hash)
     std::vector<Dep> deps2 = {
         makeEnvVarDep("NIX_P3_A", "aval"),
         makeEnvVarDep("NIX_P3_B", "bval"),
     };
-    db.record("", string_t{"result2", {}}, deps2, true);
+    db.recordDeps("", string_t{"result2", {}}, deps2, true);
 
     // Now attribute points to trace with deps A+B.
     // Change B to invalidate that trace's deps.
@@ -180,16 +180,16 @@ TEST_F(TraceStoreTest, Phase3_MultipleStructGroups)
     auto db = makeDb();
 
     // Structural hash group 1: only A
-    db.record("", string_t{"r1", {}},
+    db.recordDeps("", string_t{"r1", {}},
                   {makeEnvVarDep("NIX_P3M_A", "a")}, true);
 
     // Structural hash group 2: A + B
-    db.record("", string_t{"r2", {}},
+    db.recordDeps("", string_t{"r2", {}},
                   {makeEnvVarDep("NIX_P3M_A", "a"), makeEnvVarDep("NIX_P3M_B", "b")},
                   true);
 
     // Structural hash group 3: A + B + C (latest, in attribute entry)
-    db.record("", string_t{"r3", {}},
+    db.recordDeps("", string_t{"r3", {}},
                   {makeEnvVarDep("NIX_P3M_A", "a"), makeEnvVarDep("NIX_P3M_B", "b"),
                    makeEnvVarDep("NIX_P3M_C", "c")},
                   true);
@@ -211,8 +211,8 @@ TEST_F(TraceStoreTest, Phase3_EmptyDeps)
     // Structural hash group with zero deps (empty trace)
     auto db = makeDb();
 
-    db.record("", string_t{"empty1", {}}, {}, true);
-    db.record("", string_t{"empty2", {}},
+    db.recordDeps("", string_t{"empty1", {}}, {}, true);
+    db.recordDeps("", string_t{"empty2", {}},
                   {makeEnvVarDep("NIX_P3E_X", "x")}, true);
 
     // Invalidate X
@@ -233,9 +233,9 @@ TEST_F(TraceStoreTest, Phase1_FallbackToPhase3)
     auto db = makeDb();
 
     // Two traces with different structural hashes
-    db.record("", string_t{"r1", {}},
+    db.recordDeps("", string_t{"r1", {}},
                   {makeEnvVarDep("NIX_P1F_A", "a")}, true);
-    db.record("", string_t{"r2", {}},
+    db.recordDeps("", string_t{"r2", {}},
                   {makeEnvVarDep("NIX_P1F_A", "a"), makeEnvVarDep("NIX_P1F_B", "b")},
                   true);
 
@@ -255,7 +255,7 @@ TEST_F(TraceStoreTest, AllPhaseFail_Volatile)
     auto db = makeDb();
 
     std::vector<Dep> deps = {makeCurrentTimeDep()};
-    db.record("", null_t{}, deps, true);
+    db.recordDeps("", null_t{}, deps, true);
 
     auto result = db.verify("", {}, state);
     EXPECT_FALSE(result.has_value());
@@ -270,11 +270,11 @@ TEST_F(TraceStoreTest, RecoveryUpdatesAttribute)
 
     // Two trace recordings
     std::vector<Dep> depsA = {makeEnvVarDep("NIX_RUI_TEST", "val_A")};
-    db.record("", string_t{"rA", {}}, depsA, true);
+    db.recordDeps("", string_t{"rA", {}}, depsA, true);
 
     setenv("NIX_RUI_TEST", "val_B", 1);
     std::vector<Dep> depsB = {makeEnvVarDep("NIX_RUI_TEST", "val_B")};
-    db.record("", string_t{"rB", {}}, depsB, true);
+    db.recordDeps("", string_t{"rB", {}}, depsB, true);
 
     // Revert to A — constructive recovery should update attribute entry
     setenv("NIX_RUI_TEST", "val_A", 1);
@@ -299,11 +299,11 @@ TEST_F(TraceStoreTest, Phase1_Then_Phase3_Cascade)
     auto db = makeDb();
 
     // Trace with structural hash for only dep A (recovery target)
-    db.record("child", string_t{"target", {}},
+    db.recordDeps("child", string_t{"target", {}},
                   {makeEnvVarDep("NIX_CASCADE_A", "a")}, false);
 
     // Trace with structural hash for deps A + B (latest, in attribute)
-    db.record("child", string_t{"latest", {}},
+    db.recordDeps("child", string_t{"latest", {}},
                   {makeEnvVarDep("NIX_CASCADE_A", "a"), makeEnvVarDep("NIX_CASCADE_B", "b")},
                   false);
 
@@ -345,24 +345,24 @@ TEST_F(TraceStoreTest, DeepChain_IndependentVerification)
     // Version 1: record traces for chain with deps at root and c1
     std::vector<Dep> rootDeps1 = {makeEnvVarDep("NIX_DEEP_ROOT", "v1")};
     std::vector<Dep> c1Deps1 = {makeEnvVarDep("NIX_DEEP_C1", "v1")};
-    db.record("", string_t{"root_v1", {}}, rootDeps1, true);
-    db.record(c1Path, string_t{"c1_v1", {}}, c1Deps1, false);
-    db.record(c2Path, string_t{"c2_v1", {}}, {}, false);
-    db.record(c3Path, string_t{"c3_v1", {}}, {}, false);
-    db.record(c4Path, string_t{"c4_v1", {}}, {}, false);
-    db.record(c5Path, string_t{"c5_v1", {}}, {}, false);
+    db.recordDeps("", string_t{"root_v1", {}}, rootDeps1, true);
+    db.recordDeps(c1Path, string_t{"c1_v1", {}}, c1Deps1, false);
+    db.recordDeps(c2Path, string_t{"c2_v1", {}}, {}, false);
+    db.recordDeps(c3Path, string_t{"c3_v1", {}}, {}, false);
+    db.recordDeps(c4Path, string_t{"c4_v1", {}}, {}, false);
+    db.recordDeps(c5Path, string_t{"c5_v1", {}}, {}, false);
 
     // Version 2: record traces with different dep values
     setenv("NIX_DEEP_ROOT", "v2", 1);
     setenv("NIX_DEEP_C1", "v2", 1);
     std::vector<Dep> rootDeps2 = {makeEnvVarDep("NIX_DEEP_ROOT", "v2")};
     std::vector<Dep> c1Deps2 = {makeEnvVarDep("NIX_DEEP_C1", "v2")};
-    db.record("", string_t{"root_v2", {}}, rootDeps2, true);
-    db.record(c1Path, string_t{"c1_v2", {}}, c1Deps2, false);
-    db.record(c2Path, string_t{"c2_v2", {}}, {}, false);
-    db.record(c3Path, string_t{"c3_v2", {}}, {}, false);
-    db.record(c4Path, string_t{"c4_v2", {}}, {}, false);
-    db.record(c5Path, string_t{"c5_v2", {}}, {}, false);
+    db.recordDeps("", string_t{"root_v2", {}}, rootDeps2, true);
+    db.recordDeps(c1Path, string_t{"c1_v2", {}}, c1Deps2, false);
+    db.recordDeps(c2Path, string_t{"c2_v2", {}}, {}, false);
+    db.recordDeps(c3Path, string_t{"c3_v2", {}}, {}, false);
+    db.recordDeps(c4Path, string_t{"c4_v2", {}}, {}, false);
+    db.recordDeps(c5Path, string_t{"c5_v2", {}}, {}, false);
 
     // Revert to v1
     setenv("NIX_DEEP_ROOT", "v1", 1);
@@ -400,7 +400,7 @@ TEST_F(TraceStoreTest, RecoveryStress_10Versions)
         setenv("NIX_STRESS_VAR", val.c_str(), 1);
         std::vector<Dep> deps = {makeEnvVarDep("NIX_STRESS_VAR", val)};
         auto result = "result_" + std::to_string(i);
-        db.record("", string_t{result, {}}, deps, true);
+        db.recordDeps("", string_t{result, {}}, deps, true);
     }
 
     // Revert to each version and verify constructive recovery
@@ -425,7 +425,7 @@ TEST_F(TraceStoreTest, RecoveryFailure_AllPhasesFail)
     auto db = makeDb();
 
     std::vector<Dep> deps = {makeEnvVarDep("NIX_FAIL_VAR", "original")};
-    db.record("", string_t{"old_result", {}}, deps, true);
+    db.recordDeps("", string_t{"old_result", {}}, deps, true);
 
     // Change to a NEVER-RECORDED value
     setenv("NIX_FAIL_VAR", "completely_new_value", 1);

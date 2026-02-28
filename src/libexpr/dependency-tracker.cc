@@ -18,6 +18,11 @@
 #include <nlohmann/json.hpp>
 
 #include <deque>
+
+namespace nix::eval_trace {
+Counter nrDepTrackerScopes;
+Counter nrExcludeChildRangeCalls;
+} // namespace nix::eval_trace
 #include <filesystem>
 
 namespace nix {
@@ -46,8 +51,11 @@ namespace nix {
 // │   - depSourcePool      (StringPool16: flake input names)           │
 // │   - filePathPool       (StringPool16: file paths)                  │
 // │   - dataPathPool       (DataPathPool: JSON/TOML path trie)         │
+// │   - depKeyPool         (StringPool32: dep key strings for          │
+// │                          CompactDep; grows with unique dep keys)   │
 // │   - sessionSymbols     (SymbolTable pointer for hasKey resolution) │
-// │   - sessionTraces      (append-only dep vector, index-addressed)   │
+// │   - sessionTraces      (append-only CompactDep vector,             │
+// │                          index-addressed by DepRange)              │
 // │   - activeTracker      (current RAII tracker in the call stack)    │
 // ├─────────────────────────────────────────────────────────────────────┤
 // │ LIFETIME 2: Per root DependencyTracker  (cleared in                │
@@ -66,6 +74,7 @@ namespace nix {
 // │   - scannedBindings      (Bindings* memoization for #keys)         │
 // │   - precomputedKeysMap   (origin offset → precomputed hash)        │
 // │   - intersectOriginsCache (Bindings* → origin info for //∩)        │
+// │   - dirSetHashCache     (sorted dir-set → BLAKE3 hex hash)         │
 // ├─────────────────────────────────────────────────────────────────────┤
 // │ LIFETIME 3: Per EvalState  (owned by EvalTraceContext)             │
 // │                                                                    │
@@ -93,7 +102,7 @@ namespace nix {
 thread_local DependencyTracker * DependencyTracker::activeTracker = nullptr;
 // [Lifetime 1] Per-thread append-only dep vector. Index-addressed by
 // DepRange; never shrinks in production (only reserved, not cleared).
-thread_local std::vector<Dep> DependencyTracker::sessionTraces;
+thread_local std::vector<CompactDep> DependencyTracker::sessionTraces;
 // [Lifetime 1] Nesting depth of live DependencyTracker instances.
 thread_local uint32_t DependencyTracker::depth = 0;
 
@@ -192,10 +201,36 @@ struct DataPathPool {
     // In production, pools grow monotonically. clear() is for test isolation.
 };
 
+// StringPool32: like StringPool16 but with uint32_t IDs for larger key spaces.
+struct StringPool32 {
+    std::vector<std::string> strings;
+    boost::unordered_flat_map<std::string, uint32_t> lookup;
+
+    uint32_t intern(std::string_view sv) {
+        std::string key(sv);
+        auto it = lookup.find(key);
+        if (it != lookup.end()) return it->second;
+        uint32_t id = static_cast<uint32_t>(strings.size());
+        strings.push_back(key);
+        lookup.emplace(std::move(key), id);
+        return id;
+    }
+
+    std::string_view resolve(uint32_t id) const { return strings[id]; }
+
+    void clear() { strings.clear(); lookup.clear(); }
+};
+
 // [Lifetime 1] Interning pools — process-lifetime, cleared only by resetEvalTracePools().
 static thread_local StringPool16 depSourcePool;
 static thread_local StringPool16 filePathPool;
 static thread_local DataPathPool dataPathPool;
+// [Lifetime 1] Dep key strings (file paths, JSON SC keys, env var names).
+// Unlike depSourcePool/filePathPool (uint16_t, bounded by unique file paths),
+// depKeyPool uses uint32_t because unique dep keys can be numerous (one per
+// unique StructuredContent JSON key). In production (one EvalState per process),
+// this is bounded by the evaluation's dep key space.
+static thread_local StringPool32 depKeyPool;
 // [Lifetime 1] SymbolTable pointer for resolving hasKey Symbol in recordStructuredDep().
 // Updated by initSessionSymbols() when a new evaluation starts.
 static thread_local const SymbolTable * sessionSymbols = nullptr;
@@ -226,6 +261,14 @@ std::string_view resolveDepSource(DepSourceId id) {
 
 std::string_view resolveFilePath(FilePathId id) {
     return filePathPool.resolve(id.value);
+}
+
+DepKeyId internDepKey(std::string_view sv) {
+    return DepKeyId(depKeyPool.intern(sv));
+}
+
+std::string_view resolveDepKey(DepKeyId id) {
+    return depKeyPool.resolve(id.value);
 }
 
 DataPathId internDataPathChild(DataPathId parentId, std::string_view key) {
@@ -278,6 +321,22 @@ static thread_local std::deque<TracedContainerProvenance> provenancePool;
 // ExprTracedData creation time; consumed by maybeRecordAttrKeysDep.
 static thread_local boost::unordered_flat_map<uint32_t, PrecomputedKeysInfo> precomputedKeysMap;
 
+// [Lifetime 2] Cache for computeDirSetHash: sorted (sourceId, filePathId) → hex hash.
+// Same directory set produces the same BLAKE3 hash; caching avoids redundant sort + hash.
+struct DirSetKey {
+    std::vector<std::pair<DepSourceId, FilePathId>> sorted;
+    bool operator==(const DirSetKey &) const = default;
+    struct Hash {
+        size_t operator()(const DirSetKey & k) const noexcept {
+            size_t seed = k.sorted.size();
+            for (auto & [s, f] : k.sorted)
+                hash_combine(seed, s.value, f.value);
+            return seed;
+        }
+    };
+};
+static thread_local boost::unordered_flat_map<DirSetKey, std::string, DirSetKey::Hash> dirSetHashCache;
+
 // [Lifetime 2] Bindings* → origin info cache for intersectAttrs bulk recording.
 struct IntersectOriginInfo {
     DepSourceId sourceId;
@@ -299,6 +358,7 @@ void DependencyTracker::onRootConstruction()
     scannedBindings.clear();
     clearPrecomputedKeysMap();
     intersectOriginsCache.clear();
+    dirSetHashCache.clear();
 
     // Lifetime 1 state (pools, sessionTraces) is NOT cleared here.
     // See lifetime documentation at the top of this file.
@@ -313,6 +373,7 @@ void resetEvalTracePools()
     depSourcePool.clear();
     filePathPool.clear();
     dataPathPool.clear();
+    depKeyPool.clear();
     sessionSymbols = nullptr;
     DependencyTracker::sessionTraces.clear();
 }
@@ -363,7 +424,11 @@ void DependencyTracker::record(Dep dep)
     }
     debug("recording %s (%s) dep: input='%s' key='%s'",
         depTypeName(dep.type), depKindName(depKind(dep.type)), dep.source, dep.key);
-    sessionTraces.push_back(std::move(dep));
+    sessionTraces.push_back(CompactDep{
+        dep.type,
+        internDepSource(dep.source),
+        internDepKey(dep.key),
+        std::move(dep.expectedHash)});
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -395,9 +460,9 @@ void DependencyTracker::record(Dep dep)
     else if (c.suffix != ShapeSuffix::None)
         key["s"] = std::string(shapeSuffixName(c.suffix));
 
-    auto source = std::string(depSourcePool.resolve(c.sourceId.value));
+    auto keyStr = key.dump();
     DependencyTracker::sessionTraces.push_back(
-        Dep{std::move(source), key.dump(), hash, depType});
+        CompactDep{depType, c.sourceId, internDepKey(keyStr), hash});
     return true;
 }
 
@@ -411,7 +476,11 @@ void DependencyTracker::record(Dep dep)
 // transitive propagation.
 void DependencyTracker::recordReplay(const Dep & dep)
 {
-    sessionTraces.push_back(dep);
+    sessionTraces.push_back(CompactDep{
+        dep.type,
+        internDepSource(dep.source),
+        internDepKey(dep.key),
+        dep.expectedHash});
 }
 
 // Collect the complete trace for this evaluation scope (BSàlC §3.1: a trace
@@ -425,7 +494,7 @@ void DependencyTracker::recordReplay(const Dep & dep)
 // are filtered out. This prevents parent TracedExpr traces from inheriting
 // children's deps (children have their own traces + ParentContext deps).
 // The result is the flattened dependency vector for trace storage.
-std::vector<Dep> DependencyTracker::collectTraces() const
+std::vector<CompactDep> DependencyTracker::collectTraces() const
 {
     uint32_t endIndex = mySessionTraces->size();
 
@@ -434,7 +503,7 @@ std::vector<Dep> DependencyTracker::collectTraces() const
         if (replayedRanges.empty())
             return {mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex};
 
-        std::vector<Dep> result(mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex);
+        std::vector<CompactDep> result(mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex);
         for (auto & r : replayedRanges)
             result.insert(result.end(), r.deps->begin() + r.start, r.deps->begin() + r.end);
         return result;
@@ -442,7 +511,7 @@ std::vector<Dep> DependencyTracker::collectTraces() const
 
     // Slow path: skip excluded child ranges to prevent parent traces
     // from inheriting children's dependencies.
-    std::vector<Dep> result;
+    std::vector<CompactDep> result;
 
     // Copy session deps [startIndex, endIndex) skipping excluded ranges
     uint32_t pos = startIndex;
@@ -971,18 +1040,15 @@ void forEachDirtyStatHash(std::function<void(const StatHashEntry &)> callback)
 template<typename Fn>
 static void forEachTracedDataOrigin(const PosTable & positions, const Value & v, Fn && fn)
 {
-    std::vector<const Pos::TracedData *> seen;
+    boost::unordered_flat_set<const Pos::TracedData *> seen;
     for (auto & attr : *v.attrs()) {
         if (!attr.pos.isTracedData()) continue;
         auto * origin = positions.originOfPtr(attr.pos);
         if (!origin) continue;
         auto * df = std::get_if<Pos::TracedData>(origin);
         if (!df) continue;
-        bool dup = false;
-        for (auto * s : seen) { if (s == df) { dup = true; break; } }
-        if (dup) continue;
+        if (!seen.insert(df).second) continue;
         if (!parseStructuredFormat(df->format)) continue;
-        seen.push_back(df);
         fn(*df);
     }
 }
@@ -1110,19 +1176,16 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
         return it->second;
 
     auto & result = it->second;
-    std::vector<const Pos::TracedData *> seen;
+    boost::unordered_flat_set<const Pos::TracedData *> seen;
     for (auto & attr : *bindings) {
         if (!attr.pos.isTracedData()) continue;
         auto * origin = positions.originOfPtr(attr.pos);
         if (!origin) continue;
         auto * df = std::get_if<Pos::TracedData>(origin);
         if (!df) continue;
-        bool dup = false;
-        for (auto * s : seen) { if (s == df) { dup = true; break; } }
-        if (dup) continue;
+        if (!seen.insert(df).second) continue;
         auto fmt = parseStructuredFormat(df->format);
         if (!fmt) continue;
-        seen.push_back(df);
         result.push_back({df->sourceId, df->filePathId, df->dataPathId, *fmt});
     }
     return result;
@@ -1223,6 +1286,12 @@ static std::string computeDirSetHash(const std::vector<std::pair<DepSourceId, Fi
             return fa < fb;
         });
 
+    // Cache lookup after sorting (same sorted set → same hash).
+    DirSetKey cacheKey{sorted};
+    auto cacheIt = dirSetHashCache.find(cacheKey);
+    if (cacheIt != dirSetHashCache.end())
+        return cacheIt->second;
+
     HashSink sink(HashAlgorithm::BLAKE3);
     for (auto & [srcId, fpId] : sorted) {
         sink(resolveDepSource(srcId));
@@ -1239,6 +1308,8 @@ static std::string computeDirSetHash(const std::vector<std::pair<DepSourceId, Fi
         snprintf(buf, sizeof(buf), "%02x", hash.hash[i]);
         hex += buf;
     }
+
+    dirSetHashCache.emplace(std::move(cacheKey), hex);
     return hex;
 }
 

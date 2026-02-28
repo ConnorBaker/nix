@@ -3,6 +3,12 @@
 
 #include "nix/expr/eval-trace-deps.hh"
 #include "nix/expr/symbol-table.hh"
+#include "nix/expr/counter.hh"
+
+namespace nix::eval_trace {
+extern Counter nrDepTrackerScopes;
+extern Counter nrExcludeChildRangeCalls;
+} // namespace nix::eval_trace
 
 #include <sys/types.h>
 
@@ -40,7 +46,7 @@ namespace nix {
  */
 struct DependencyTracker {
     static thread_local DependencyTracker * activeTracker;
-    static thread_local std::vector<Dep> sessionTraces;
+    static thread_local std::vector<CompactDep> sessionTraces;
     /// Nesting depth of live DependencyTracker instances on this thread.
     /// Only the first (depth 0 → 1) is a true root that should call
     /// onRootConstruction(). Trackers created inside a SuspendDepTracking
@@ -49,7 +55,7 @@ struct DependencyTracker {
     static thread_local uint32_t depth;
 
     DependencyTracker * previous;
-    std::vector<Dep> * mySessionTraces;
+    std::vector<CompactDep> * mySessionTraces;
     uint32_t startIndex;
     /// Append-only list of dep ranges replayed from memoized thunks.
     /// Order preserved: ranges are appended in evaluation encounter order,
@@ -71,8 +77,10 @@ struct DependencyTracker {
     std::vector<std::pair<uint32_t, uint32_t>> excludedChildRanges;
 
     void excludeChildRange(uint32_t start, uint32_t end) {
-        if (start < end)
+        if (start < end) {
             excludedChildRanges.emplace_back(start, end);
+            eval_trace::nrExcludeChildRangeCalls++;
+        }
     }
 
     /// Hash-based dedup set: stores uint64_t hashes of (type, source, key)
@@ -88,6 +96,7 @@ struct DependencyTracker {
     {
         activeTracker = this;
         if (depth++ == 0) onRootConstruction();
+        eval_trace::nrDepTrackerScopes++;
     }
 
     /**
@@ -105,6 +114,7 @@ struct DependencyTracker {
 
     /**
      * Record a non-StructuredContent dependency into the session-wide dep vector.
+     * Interns source and key strings into thread-local pools at recording time.
      * Deduplicates by hashing (type, source, key) within the active tracker scope.
      * For StructuredContent deps, use recordStructuredDep() instead (zero-allocation dedup).
      */
@@ -112,13 +122,13 @@ struct DependencyTracker {
 
     /**
      * Append a dependency to sessionTraces without touching the active
-     * tracker's recordedKeyHashes dedup set. Used by TracedExpr::replayTrace()
-     * to propagate a child's cached deps into the session trace (needed
-     * for thunk epoch ranges) without polluting the parent tracker's
-     * dedup state. Without this, a parent that independently records the
-     * same dep later would silently drop it (the dep only exists in the
-     * child's excluded range, so the parent's stored trace would be
-     * incomplete).
+     * tracker's recordedKeyHashes dedup set. Interns strings into CompactDep.
+     * Used by TracedExpr::replayTrace() to propagate a child's cached deps
+     * (loaded from DB as Dep objects) into the session trace (needed for
+     * thunk epoch ranges) without polluting the parent tracker's dedup state.
+     * Without this, a parent that independently records the same dep later
+     * would silently drop it (the dep only exists in the child's excluded
+     * range, so the parent's stored trace would be incomplete).
      */
     static void recordReplay(const Dep & dep);
 
@@ -126,7 +136,7 @@ struct DependencyTracker {
      * Collect all deps: session range [startIndex, current) plus
      * replayed epoch ranges, skipping any regions in excludedChildRanges.
      */
-    std::vector<Dep> collectTraces() const;
+    std::vector<CompactDep> collectTraces() const;
 
     /**
      * Returns true if there is at least one active tracker.
@@ -389,6 +399,16 @@ std::string_view resolveDepSource(DepSourceId id);
 
 /** Resolve an interned file path ID back to a string. */
 std::string_view resolveFilePath(FilePathId id);
+
+/**
+ * Intern a dep key string into the thread-local pool.
+ * Used by CompactDep to avoid per-dep string allocation in sessionTraces.
+ * Grows monotonically within a session.
+ */
+DepKeyId internDepKey(std::string_view sv);
+
+/** Resolve an interned dep key ID back to a string. */
+std::string_view resolveDepKey(DepKeyId id);
 
 /**
  * Intern an object key child in the DataPath trie.

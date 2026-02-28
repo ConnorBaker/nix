@@ -3268,6 +3268,28 @@ void EvalState::printStatistics()
         {"verifyTrace", {
             {"timeUs", eval_trace::nrVerifyTraceTimeUs.load()},
         }},
+        {"thunks", {
+            {"created", eval_trace::nrTracedExprCreated.load()},
+            {"fromMaterialize", eval_trace::nrTracedExprFromMaterialize.load()},
+            {"fromOrigAttrs", eval_trace::nrTracedExprFromOrigAttrs.load()},
+            {"fromDataFile", eval_trace::nrTracedExprFromDataFile.load()},
+            {"forced", eval_trace::nrTracedExprForced.load()},
+            {"lazyStateAllocated", eval_trace::nrLazyStateAllocated.load()},
+        }},
+        {"dataFile", {
+            {"scalarChildren", eval_trace::nrDataFileScalarChildren.load()},
+            {"containerChildren", eval_trace::nrDataFileContainerChildren.load()},
+        }},
+        {"depTracker", {
+            {"scopes", eval_trace::nrDepTrackerScopes.load()},
+            {"excludeChildRangeCalls", eval_trace::nrExcludeChildRangeCalls.load()},
+        }},
+        {"replay", {
+            {"totalCalls", eval_trace::nrReplayTotalCalls.load()},
+            {"bloomHits", eval_trace::nrReplayBloomHits.load()},
+            {"epochHits", eval_trace::nrReplayEpochHits.load()},
+            {"added", eval_trace::nrReplayAdded.load()},
+        }},
     };
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {

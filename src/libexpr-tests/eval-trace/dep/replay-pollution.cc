@@ -10,12 +10,12 @@ namespace nix::eval_trace {
 using namespace nix::eval_trace::test;
 
 /// Extract dep keys from a dep vector for exact-match assertions.
-static std::vector<std::string> keys(const std::vector<Dep> & deps)
+static std::vector<std::string> keys(const std::vector<CompactDep> & deps)
 {
     std::vector<std::string> out;
     out.reserve(deps.size());
     for (auto & d : deps)
-        out.push_back(d.key);
+        out.push_back(std::string(resolveDepKey(d.keyId)));
     return out;
 }
 
@@ -92,7 +92,7 @@ TEST_F(ReplayPollutionTest, RecordReplay_AppendsToSessionTraces)
     DependencyTracker::recordReplay(makeContentDep("/x.nix", "x"));
     uint32_t after = DependencyTracker::sessionTraces.size();
     EXPECT_EQ(after, before + 1);
-    EXPECT_EQ(DependencyTracker::sessionTraces.back().key, "/x.nix");
+    EXPECT_EQ(resolveDepKey(DependencyTracker::sessionTraces.back().keyId), "/x.nix");
 }
 
 // ═════════════════════════════════════════════════════════════════════

@@ -39,6 +39,7 @@ struct StrongId {
 struct DepSourceTag {};
 struct FilePathTag {};
 struct DataPathTag {};
+struct DepKeyTag {};
 
 /// Interned dep source ID (flake input name index in StringPool16).
 using DepSourceId = StrongId<DepSourceTag>;
@@ -48,5 +49,9 @@ using FilePathId = StrongId<FilePathTag>;
 
 /// DataPath trie node ID (index into DataPathPool::nodes). ID 0 = root.
 using DataPathId = StrongId<DataPathTag, uint32_t>;
+
+/// Interned dep key ID (dep key string index in DepKeyPool).
+/// Used by CompactDep to avoid per-dep string allocation in sessionTraces.
+using DepKeyId = StrongId<DepKeyTag, uint32_t>;
 
 } // namespace nix

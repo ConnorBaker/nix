@@ -426,11 +426,24 @@ struct Dep {
 };
 
 /**
+ * Compact interned dependency: stores pool IDs instead of owned strings.
+ * 48 bytes per entry (with padding) vs 96+ bytes for Dep (plus heap-allocated
+ * strings). Zero per-dep heap allocation — all string data lives in thread-local
+ * interning pools, resolved via resolveDepSource()/resolveDepKey().
+ */
+struct CompactDep {
+    DepType type;
+    DepSourceId sourceId;    ///< Flake input name (interned in depSourcePool)
+    DepKeyId keyId;          ///< Dep key string (interned in depKeyPool)
+    DepHashValue expectedHash;
+};
+
+/**
  * A half-open range [start, end) into a session-wide dep vector,
  * representing the deps recorded during a single thunk/app evaluation.
  */
 struct DepRange {
-    std::vector<Dep> * deps;
+    std::vector<CompactDep> * deps;
     uint32_t start;
     uint32_t end;
 };
