@@ -1,7 +1,7 @@
 #pragma once
 /// @file
-/// Shared helpers for hashing interned dep vectors. Used by both
-/// record() (trace-store.cc) and verifyTrace/recovery (verification.cc).
+/// Shared helpers for hashing interned dep vectors. Used by record(),
+/// verifyTrace(), and recovery() — all in trace-store.cc.
 
 #include "nix/expr/eval-trace/store/trace-store.hh"
 #include "nix/expr/eval-trace/deps/types.hh"

@@ -257,12 +257,11 @@ struct StringPool32 {
 // ═══════════════════════════════════════════════════════════════════════
 //
 // In production (one EvalState per process), pools grow monotonically
-// for the process lifetime. In tests (multiple EvalState instances),
-// each EvalState gets its own pools via EvalTraceContext ownership,
-// providing automatic test isolation without manual resetEvalTracePools().
+// for the process lifetime. In tests, resetEvalTracePools() destroys
+// and recreates the storage for isolation between EvalState instances.
 //
-// Accessed from free functions via the thread_local `currentPools` pointer,
-// set when EvalTraceContext is initialized and cleared on destruction.
+// Accessed from free functions via `InterningPools::current` (thread_local
+// pointer), lazily initialized by ensurePools().
 
 struct InterningPools {
     static thread_local InterningPools * current;
