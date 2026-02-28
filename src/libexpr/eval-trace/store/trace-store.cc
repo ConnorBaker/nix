@@ -14,6 +14,8 @@
 #include "nix/util/source-accessor.hh"
 #include "nix/fetchers/fetchers.hh"
 
+#include "eval-trace/store/interned-hash.hh"
+
 #include <nlohmann/json.hpp>
 #include <toml.hpp>
 
@@ -1542,13 +1544,6 @@ static FileIdentity contentFileIdentity(const Dep & dep) {
     return {dep.source, dep.key};
 }
 
-// Forward declarations (defined after record(), used by verifyTrace's
-// trace_hash recomputation on content override).
-static void sortAndDedupInterned(std::vector<TraceStore::InternedDep> & deps);
-static Hash computeTraceHashFromInterned(
-    const std::vector<TraceStore::InternedDep> & sorted,
-    const std::function<std::string_view(StringId)> & lookupString);
-
 /**
  * Classification of trace verification outcome. Replaces the ad-hoc boolean
  * combination (allValid, hasContentFailure, hasImplicitShapeOnlyOverride).
@@ -1926,69 +1921,6 @@ std::optional<Hash> TraceStore::getCurrentTraceHash(std::string_view attrPath)
     auto * data = ensureTraceHashes(row->traceId);  // hits traceDataCache after first call
     if (!data) return std::nullopt;
     return data->traceHash;
-}
-
-// ── Interned dep sort + hash (integer key comparison) ────────────────
-//
-// Sort on (type:1, sourceId:4, keyId:4) = 9 bytes of integers instead of
-// ~100 bytes of strings. Used by record() and recovery() for canonical ordering.
-// NOTE: produces a DIFFERENT sort order than sortAndDedupDeps (integer ID order
-// vs string lexicographic). Trace hashes are NOT compatible — one-time cache
-// invalidation of existing traces on first use.
-
-static void sortAndDedupInterned(std::vector<TraceStore::InternedDep> & deps)
-{
-    std::sort(deps.begin(), deps.end(),
-        [](const TraceStore::InternedDep & a, const TraceStore::InternedDep & b) {
-            if (auto cmp = a.type <=> b.type; cmp != 0) return cmp < 0;
-            if (a.sourceId != b.sourceId) return a.sourceId < b.sourceId;
-            return a.keyId < b.keyId;
-        });
-    deps.erase(std::unique(deps.begin(), deps.end(),
-        [](const TraceStore::InternedDep & a, const TraceStore::InternedDep & b) {
-            return a.type == b.type && a.sourceId == b.sourceId && a.keyId == b.keyId;
-        }), deps.end());
-}
-
-using StringLookup = std::function<std::string_view(StringId)>;
-
-static void feedInternedDepToSink(
-    HashSink & sink,
-    const TraceStore::InternedDep & dep,
-    bool includeHash,
-    const StringLookup & lookupString)
-{
-    auto typeStr = std::to_string(static_cast<int>(dep.type));
-    sink(std::string_view("T", 1));
-    sink(typeStr);
-    sink(std::string_view("S", 1));
-    sink(lookupString(dep.sourceId));
-    sink(std::string_view("K", 1));
-    sink(lookupString(dep.keyId));
-    if (includeHash) {
-        sink(std::string_view("H", 1));
-        hashDepValue(sink, dep.hash);
-    }
-}
-
-static Hash computeTraceHashFromInterned(
-    const std::vector<TraceStore::InternedDep> & sorted,
-    const StringLookup & lookupString)
-{
-    HashSink sink(HashAlgorithm::BLAKE3);
-    for (auto & dep : sorted)
-        feedInternedDepToSink(sink, dep, true, lookupString);
-    return sink.finish().hash;
-}
-
-static Hash computeStructHashFromInterned(
-    const std::vector<TraceStore::InternedDep> & sorted,
-    const StringLookup & lookupString)
-{
-    HashSink sink(HashAlgorithm::BLAKE3);
-    for (auto & dep : sorted)
-        feedInternedDepToSink(sink, dep, false, lookupString);
-    return sink.finish().hash;
 }
 
 // ── Record path (BSàlC constructive trace recording) ─────────────────

@@ -159,6 +159,7 @@ sources = files(
   'eval-trace/context.cc',
   'eval-trace/cache/trace-cache.cc',
   'eval-trace/store/trace-store.cc',
+  'eval-trace/store/verification.cc',
   'eval-trace/deps/hash.cc',
   'eval-trace/deps/recording.cc',
   'eval-error.cc',
