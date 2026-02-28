@@ -60,18 +60,16 @@ static std::optional<SourcePath> resolveDepPath(
 
 // ── Structured content navigation helpers ────────────────────────────
 
-// Thread-local DOM caches: avoid re-parsing the same file when multiple
-// StructuredContent deps reference it. Cleared at verifyTrace entry.
-static thread_local std::unordered_map<std::string, nlohmann::json> jsonDomCache;
-static thread_local std::unordered_map<std::string, toml::value> tomlDomCache;
-static thread_local std::unordered_map<std::string, SourceAccessor::DirEntries> dirListingCache;
-
-static void clearDomCaches()
-{
-    jsonDomCache.clear();
-    tomlDomCache.clear();
-    dirListingCache.clear();
-}
+// Stack-local DOM caches: avoid re-parsing the same file when multiple
+// StructuredContent deps reference it within a single verifyTrace() call.
+// Each verifyTrace() invocation (including recursive ParentContext calls)
+// gets its own scope, fixing the reentrancy bug where recursive calls
+// would corrupt the outer invocation's DOM state via shared thread-locals.
+struct VerificationScope {
+    std::unordered_map<std::string, nlohmann::json> jsonDomCache;
+    std::unordered_map<std::string, toml::value> tomlDomCache;
+    std::unordered_map<std::string, SourceAccessor::DirEntries> dirListingCache;
+};
 
 /**
  * Navigate a JSON DOM using a JSON path array. Returns nullptr if path is invalid.
@@ -135,7 +133,8 @@ static std::string tomlCanonical(const toml::value & v)
 
 static std::optional<DepHashValue> computeCurrentHash(
     EvalState & state, const Dep & dep,
-    const std::unordered_map<std::string, SourcePath> & inputAccessors)
+    const std::unordered_map<std::string, SourcePath> & inputAccessors,
+    VerificationScope & scope)
 {
     switch (dep.type) {
     case DepType::Content:
@@ -234,9 +233,9 @@ static std::optional<DepHashValue> computeCurrentHash(
                 if (!path) continue;
                 try {
                     auto cacheKey = source + '\t' + filePath;
-                    auto cacheIt = dirListingCache.find(cacheKey);
-                    if (cacheIt == dirListingCache.end())
-                        cacheIt = dirListingCache.emplace(cacheKey, path->readDirectory()).first;
+                    auto cacheIt = scope.dirListingCache.find(cacheKey);
+                    if (cacheIt == scope.dirListingCache.end())
+                        cacheIt = scope.dirListingCache.emplace(cacheKey, path->readDirectory()).first;
                     if (cacheIt->second.count(hasKeyName))
                         return DepHashValue(depHash("1")); // key found in this dir
                 } catch (...) {
@@ -283,10 +282,10 @@ static std::optional<DepHashValue> computeCurrentHash(
             case StructuredFormat::Json: {
                 // Use DOM cache to avoid re-parsing
                 auto cacheKey = dep.source + '\t' + filePath;
-                auto cacheIt = jsonDomCache.find(cacheKey);
-                if (cacheIt == jsonDomCache.end()) {
+                auto cacheIt = scope.jsonDomCache.find(cacheKey);
+                if (cacheIt == scope.jsonDomCache.end()) {
                     auto contents = path->readFile();
-                    cacheIt = jsonDomCache.emplace(cacheKey, nlohmann::json::parse(contents)).first;
+                    cacheIt = scope.jsonDomCache.emplace(cacheKey, nlohmann::json::parse(contents)).first;
                 }
                 auto * node = navigateJson(cacheIt->second, pathArray);
                 if (!node) return std::nullopt;
@@ -316,11 +315,11 @@ static std::optional<DepHashValue> computeCurrentHash(
             }
             case StructuredFormat::Toml: {
                 auto cacheKey = dep.source + '\t' + filePath;
-                auto cacheIt = tomlDomCache.find(cacheKey);
-                if (cacheIt == tomlDomCache.end()) {
+                auto cacheIt = scope.tomlDomCache.find(cacheKey);
+                if (cacheIt == scope.tomlDomCache.end()) {
                     auto contents = path->readFile();
                     std::istringstream stream(std::move(contents));
-                    cacheIt = tomlDomCache.emplace(cacheKey, toml::parse(
+                    cacheIt = scope.tomlDomCache.emplace(cacheKey, toml::parse(
                         stream, "verifyTrace"
 #if HAVE_TOML11_4
                         , toml::spec::v(1, 0, 0)
@@ -358,10 +357,10 @@ static std::optional<DepHashValue> computeCurrentHash(
             case StructuredFormat::Directory: {
                 // Directory structural dep: re-read listing, look up entry
                 auto cacheKey = dep.source + '\t' + filePath;
-                auto cacheIt = dirListingCache.find(cacheKey);
-                if (cacheIt == dirListingCache.end()) {
+                auto cacheIt = scope.dirListingCache.find(cacheKey);
+                if (cacheIt == scope.dirListingCache.end()) {
                     auto dirEntries = path->readDirectory();
-                    cacheIt = dirListingCache.emplace(cacheKey, std::move(dirEntries)).first;
+                    cacheIt = scope.dirListingCache.emplace(cacheKey, std::move(dirEntries)).first;
                 }
                 auto & entries = cacheIt->second;
 
@@ -404,6 +403,7 @@ static std::optional<DepHashValue> computeCurrentHash(
     case DepType::CurrentTime:
     case DepType::Exec:
     case DepType::ParentContext:
+    case DepType::EndSentinel_:
         return std::nullopt;
     }
     unreachable();
@@ -1549,6 +1549,25 @@ static Hash computeTraceHashFromInterned(
     const std::vector<TraceStore::InternedDep> & sorted,
     const std::function<std::string_view(StringId)> & lookupString);
 
+/**
+ * Classification of trace verification outcome. Replaces the ad-hoc boolean
+ * combination (allValid, hasContentFailure, hasImplicitShapeOnlyOverride).
+ * -Wswitch ensures every consumer handles all cases.
+ */
+enum class VerifyOutcome {
+    /** All deps match current state. No hash recomputation needed. */
+    Valid,
+    /** Content dep(s) failed but StructuredContent deps cover all failures.
+     *  Value-aware: accessed scalars verified. No hash recomputation needed. */
+    ValidViaStructuralOverride,
+    /** Content dep(s) failed, covered by ImplicitShape-only (no SC coverage).
+     *  Value-blind: key set unchanged but values may differ. Requires
+     *  trace_hash recomputation so ParentContext deps detect potential change. */
+    ValidViaImplicitShapeOverride,
+    /** Unrecoverable verification failure. */
+    Invalid,
+};
+
 bool TraceStore::verifyTrace(
     TraceId traceId,
     const std::unordered_map<std::string, SourcePath> & inputAccessors,
@@ -1558,7 +1577,7 @@ bool TraceStore::verifyTrace(
         return true;
 
     auto vtStart = timerStart();
-    clearDomCaches();
+    VerificationScope scope;
 
     // Load the full trace (single DB read via JOIN)
     auto fullDeps = loadFullTrace(traceId);
@@ -1583,7 +1602,6 @@ bool TraceStore::verifyTrace(
     bool hasContentFailure = false;
     bool hasStructuralDeps = false;
     bool hasImplicitShapeDeps = false;
-    bool hasImplicitShapeOnlyOverride = false;
 
     // Track failed coarse dep file identity keys (source + NUL + filePath)
     std::unordered_set<FileIdentity, FileIdentity::Hash> failedContentFiles;
@@ -1656,7 +1674,7 @@ bool TraceStore::verifyTrace(
         if (cacheIt != currentDepHashes.end()) {
             current = cacheIt->second;
         } else {
-            current = computeCurrentHash(state, dep, inputAccessors);
+            current = computeCurrentHash(state, dep, inputAccessors, scope);
             currentDepHashes[dk] = current;
         }
 
@@ -1671,101 +1689,64 @@ bool TraceStore::verifyTrace(
         }
     }
 
-    bool allValid;
+    // ── Pass 2: Resolve overrides and determine outcome ─────────────
+
+    // Helper: verify a set of structural/implicit deps against current hashes.
+    // Returns false on first failure. Recovery computes any missing hashes
+    // on demand, so short-circuiting here is safe and avoids unnecessary work.
+    auto verifyDeps = [&](const std::vector<const Dep *> & deps,
+                          const std::unordered_set<FileIdentity, FileIdentity::Hash> * skipFiles = nullptr,
+                          const std::unordered_set<FileIdentity, FileIdentity::Hash> * onlyFiles = nullptr) -> bool {
+        for (auto * dep : deps) {
+            if (skipFiles || onlyFiles) {
+                auto fileKey = scFileIdentity(*dep);
+                if (skipFiles && skipFiles->count(fileKey)) continue;
+                if (onlyFiles && !onlyFiles->count(fileKey)) continue;
+            }
+            nrDepsChecked++;
+            DepKey dk(*dep);
+            auto cacheIt = currentDepHashes.find(dk);
+            std::optional<DepHashValue> current;
+            if (cacheIt != currentDepHashes.end()) {
+                current = cacheIt->second;
+            } else {
+                current = computeCurrentHash(state, *dep, inputAccessors, scope);
+                currentDepHashes[dk] = current;
+            }
+            if (!current || *current != dep->expectedHash) {
+                nrVerificationsFailed++;
+                return false;
+            }
+        }
+        return true;
+    };
+
+    VerifyOutcome outcome;
 
     if (hasNonContentFailure) {
         // Non-coarse, non-structural failure → trace invalid (no override possible)
-        allValid = false;
+        outcome = VerifyOutcome::Invalid;
     } else if (!hasContentFailure) {
-        // No coarse failures. Structural deps for files WITH a passing Content/Directory
-        // dep in this trace don't need checking (file unchanged → SC deps pass too).
-        // However, "standalone" structural deps — SC or ImplicitShape deps for files
-        // WITHOUT a Content/Directory dep in this trace — must be verified directly.
-        // These arise from cross-trace dep separation: a child trace inherits
-        // ExprTracedData thunks from the parent's result but has no Content dep for
-        // the file (the parent does). Without this check, a child trace with only
-        // [ParentContext, ImplicitShape] would always pass when the parent passes,
-        // even if the child's structural shape changed.
-        allValid = true;
+        // No coarse failures. Verify standalone structural deps — SC or ImplicitShape
+        // deps for files WITHOUT a Content/Directory dep in this trace. These arise
+        // from cross-trace dep separation: a child trace inherits ExprTracedData
+        // thunks from the parent's result but has no Content dep for the file.
+        bool standalonePassed = true;
         if (hasStructuralDeps || hasImplicitShapeDeps) {
-            // Build set of files covered by passing Content/Directory deps in this trace
             std::unordered_set<FileIdentity, FileIdentity::Hash> coveredFiles;
             for (auto & dep : fullDeps) {
                 if (isContentOverrideable(dep.type))
                     coveredFiles.insert(contentFileIdentity(dep));
             }
-
-            // Verify standalone SC deps
-            for (auto * dep : structuralDeps) {
-                auto fileKey = scFileIdentity(*dep);
-                if (coveredFiles.count(fileKey)) continue; // File has passing coarse dep
-
-                nrDepsChecked++;
-                DepKey dk(*dep);
-                auto cacheIt = currentDepHashes.find(dk);
-                std::optional<DepHashValue> current;
-
-                if (cacheIt != currentDepHashes.end()) {
-                    current = cacheIt->second;
-                } else {
-                    current = computeCurrentHash(state, *dep, inputAccessors);
-                    currentDepHashes[dk] = current;
-                }
-
-                if (!current || *current != dep->expectedHash) {
-                    nrVerificationsFailed++;
-                    allValid = false;
-                    break;
-                }
-            }
-
-            // Verify standalone ImplicitShape deps (same logic as SC above).
-            // A child trace may have ImplicitShape deps for a file whose Content
-            // dep lives in the parent's trace. Without verifying these, the child
-            // incorrectly passes when the parent passes (ParentContext check) even
-            // though the child's structural shape changed.
-            if (allValid) {
-                for (auto * dep : implicitShapeDeps) {
-                    auto fileKey = scFileIdentity(*dep);
-                    if (coveredFiles.count(fileKey)) continue; // File has passing coarse dep
-
-                    nrDepsChecked++;
-                    DepKey dk(*dep);
-                    auto cacheIt = currentDepHashes.find(dk);
-                    std::optional<DepHashValue> current;
-
-                    if (cacheIt != currentDepHashes.end()) {
-                        current = cacheIt->second;
-                    } else {
-                        current = computeCurrentHash(state, *dep, inputAccessors);
-                        currentDepHashes[dk] = current;
-                    }
-
-                    if (!current || *current != dep->expectedHash) {
-                        nrVerificationsFailed++;
-                        allValid = false;
-                        break;
-                    }
-                }
-            }
+            standalonePassed = verifyDeps(structuralDeps, &coveredFiles)
+                            && verifyDeps(implicitShapeDeps, &coveredFiles);
         }
+        outcome = standalonePassed ? VerifyOutcome::Valid : VerifyOutcome::Invalid;
     } else if (hasContentFailure && (hasStructuralDeps || hasImplicitShapeDeps)) {
         // Coarse failure(s) exist AND structural/implicit-shape deps are present.
-        //
-        // Two-tier coverage: StructuredContent (SC) deps provide fine-grained
-        // verification. ImplicitShape deps provide fallback coverage for sources
-        // that have no SC deps (e.g., an operand of // whose values were never
-        // accessed). This enables structural recovery for multi-provenance //
-        // without losing single-provenance precision.
-        //
-        // Rule: for each failed source, if SC deps cover it, verify SC deps
-        // (ImplicitShape skipped — SC is finer-grained). If only ImplicitShape
-        // covers it, verify ImplicitShape (conservative but sound: key set
-        // unchanged means the source's structural contribution is unchanged).
-        allValid = true;
+        // Two-tier coverage: SC provides fine-grained, ImplicitShape provides fallback.
 
         // Build coverage sets: which files are covered by SC vs ImplicitShape.
-        // DirSet deps expand to cover all their constituent directories.
         std::unordered_set<FileIdentity, FileIdentity::Hash> structuralCoveredFiles;
         for (auto * dep : structuralDeps) {
             auto fi = scFileIdentity(*dep);
@@ -1790,128 +1771,95 @@ bool TraceStore::verifyTrace(
         }
 
         // Check that all failed coarse deps are covered by EITHER SC or ImplicitShape.
-        // Track whether any failed file is covered by ImplicitShape-only (no SC):
-        // ImplicitShape is value-blind (only verifies key set), so values may have
-        // changed despite passing. This triggers trace_hash recomputation for
-        // downstream ParentContext deps.
+        bool allCovered = true;
+        bool hasImplicitOnly = false;
         for (auto & failedFile : failedContentFiles) {
             if (!structuralCoveredFiles.count(failedFile)
                 && !implicitCoveredFiles.count(failedFile)) {
-                allValid = false;
+                allCovered = false;
                 break;
             }
             if (!structuralCoveredFiles.count(failedFile)
                 && implicitCoveredFiles.count(failedFile)) {
-                hasImplicitShapeOnlyOverride = true;
+                hasImplicitOnly = true;
             }
         }
 
-        // Verify all SC deps (as before — fine-grained verification)
-        if (allValid) {
-            for (auto * dep : structuralDeps) {
-                nrDepsChecked++;
-                DepKey dk(*dep);
-                auto cacheIt = currentDepHashes.find(dk);
-                std::optional<DepHashValue> current;
-
-                if (cacheIt != currentDepHashes.end()) {
-                    current = cacheIt->second;
-                } else {
-                    current = computeCurrentHash(state, *dep, inputAccessors);
-                    currentDepHashes[dk] = current;
-                }
-
-                if (!current || *current != dep->expectedHash) {
-                    nrVerificationsFailed++;
-                    allValid = false;
-                }
-            }
-        }
-
-        // Verify ImplicitShape deps ONLY for failed files NOT covered by SC.
-        // If a file has SC deps, those provide finer verification and
-        // ImplicitShape would be over-conservative (e.g., key additions
-        // that don't affect accessed values would spuriously fail).
-        if (allValid) {
-            for (auto * dep : implicitShapeDeps) {
-                auto fileKey = scFileIdentity(*dep);
-                if (structuralCoveredFiles.count(fileKey)) continue;
-                if (!failedContentFiles.count(fileKey)) continue;
-
-                nrDepsChecked++;
-                DepKey dk(*dep);
-                auto cacheIt = currentDepHashes.find(dk);
-                std::optional<DepHashValue> current;
-
-                if (cacheIt != currentDepHashes.end()) {
-                    current = cacheIt->second;
-                } else {
-                    current = computeCurrentHash(state, *dep, inputAccessors);
-                    currentDepHashes[dk] = current;
-                }
-
-                if (!current || *current != dep->expectedHash) {
-                    nrVerificationsFailed++;
-                    allValid = false;
-                }
-            }
+        if (!allCovered) {
+            outcome = VerifyOutcome::Invalid;
+        } else if (!verifyDeps(structuralDeps)) {
+            // Verify all SC deps (fine-grained verification)
+            outcome = VerifyOutcome::Invalid;
+        } else if (!verifyDeps(implicitShapeDeps, &structuralCoveredFiles, &failedContentFiles)) {
+            // Verify ImplicitShape deps ONLY for failed files NOT covered by SC
+            outcome = VerifyOutcome::Invalid;
+        } else if (hasImplicitOnly) {
+            outcome = VerifyOutcome::ValidViaImplicitShapeOverride;
+        } else {
+            outcome = VerifyOutcome::ValidViaStructuralOverride;
         }
     } else {
         // Coarse failure with no structural or implicit-shape deps → invalid
-        allValid = false;
+        outcome = VerifyOutcome::Invalid;
     }
 
-    if (allValid) {
-        // When Content deps failed and the override relied on ImplicitShape
-        // (value-blind key-set check) for at least one file WITHOUT SC coverage,
-        // values may have changed despite the key set being identical. The stored
-        // trace_hash is stale and must be recomputed so downstream ParentContext
-        // deps detect the potential value change.
-        //
-        // When ALL failed files are covered by SC (value-aware), the specific
-        // accessed values are verified — the trace_hash is NOT updated, preserving
-        // precision: children whose own SC deps pass still cache-hit.
-        if (hasContentFailure && hasImplicitShapeOnlyOverride) {
-            std::vector<Dep> currentDeps;
-            currentDeps.reserve(fullDeps.size());
-            for (auto & dep : fullDeps) {
-                if (depKind(dep.type) == DepKind::ParentContext) {
-                    auto parentHash = getCurrentTraceHash(dep.key);
-                    if (parentHash) {
-                        Blake3Hash b3;
-                        std::memcpy(b3.bytes.data(), parentHash->hash, 32);
-                        currentDeps.push_back({dep.source, dep.key, DepHashValue(b3), dep.type});
-                    } else {
-                        currentDeps.push_back(dep);
-                    }
+    // ── Apply outcome ────────────────────────────────────────────────
+
+    switch (outcome) {
+    case VerifyOutcome::Valid:
+    case VerifyOutcome::ValidViaStructuralOverride:
+        verifiedTraceIds.insert(traceId);
+        break;
+
+    case VerifyOutcome::ValidViaImplicitShapeOverride: {
+        // ImplicitShape is value-blind (key set check only). Values may have
+        // changed despite the key set being identical. Recompute trace_hash
+        // from current dep hashes so downstream ParentContext deps detect
+        // the potential value change.
+        std::vector<Dep> currentDeps;
+        currentDeps.reserve(fullDeps.size());
+        for (auto & dep : fullDeps) {
+            if (depKind(dep.type) == DepKind::ParentContext) {
+                auto parentHash = getCurrentTraceHash(dep.key);
+                if (parentHash) {
+                    Blake3Hash b3;
+                    std::memcpy(b3.bytes.data(), parentHash->hash, 32);
+                    currentDeps.push_back({dep.source, dep.key, DepHashValue(b3), dep.type});
                 } else {
-                    DepKey dk(dep);
-                    auto cacheIt = currentDepHashes.find(dk);
-                    if (cacheIt != currentDepHashes.end() && cacheIt->second) {
-                        currentDeps.push_back({dep.source, dep.key, *cacheIt->second, dep.type});
-                    } else {
-                        currentDeps.push_back(dep);
-                    }
+                    currentDeps.push_back(dep);
+                }
+            } else {
+                DepKey dk(dep);
+                auto cacheIt = currentDepHashes.find(dk);
+                if (cacheIt != currentDepHashes.end() && cacheIt->second) {
+                    currentDeps.push_back({dep.source, dep.key, *cacheIt->second, dep.type});
+                } else {
+                    currentDeps.push_back(dep);
                 }
             }
-            auto interned = internDeps(currentDeps);
-            sortAndDedupInterned(interned);
-            ensureStringTableLoaded();
-            auto lookupStr = [this](StringId id) -> std::string_view {
-                if (id.value > 0 && id.value <= stringTable.size()) return stringTable[id.value - 1];
-                return "";
-            };
-            auto newTraceHash = computeTraceHashFromInterned(interned, lookupStr);
-            auto * data = ensureTraceHashes(traceId);
-            if (data) {
-                data->traceHash = newTraceHash;
-            }
+        }
+        auto interned = internDeps(currentDeps);
+        sortAndDedupInterned(interned);
+        ensureStringTableLoaded();
+        auto lookupStr = [this](StringId id) -> std::string_view {
+            if (id.value > 0 && id.value <= stringTable.size()) return stringTable[id.value - 1];
+            return "";
+        };
+        auto newTraceHash = computeTraceHashFromInterned(interned, lookupStr);
+        auto * data = ensureTraceHashes(traceId);
+        if (data) {
+            data->traceHash = newTraceHash;
         }
         verifiedTraceIds.insert(traceId);
+        break;
     }
+
+    case VerifyOutcome::Invalid:
+        break;
+    }
+
     nrVerifyTraceTimeUs += elapsedUs(vtStart);
-    clearDomCaches();
-    return allValid;
+    return outcome != VerifyOutcome::Invalid;
 }
 
 // ── DB lookups ───────────────────────────────────────────────────────
@@ -2209,6 +2157,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 {
     auto recoveryStart = timerStart();
     nrRecoveryAttempts++;
+    VerificationScope scope;
 
     // Load old trace's full deps
     auto oldDeps = loadFullTrace(oldTraceId);
@@ -2253,7 +2202,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         if (cacheIt != currentDepHashes.end()) {
             current = cacheIt->second;
         } else {
-            current = computeCurrentHash(state, dep, inputAccessors);
+            current = computeCurrentHash(state, dep, inputAccessors, scope);
             currentDepHashes[dk] = current;
         }
 
@@ -2497,7 +2446,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
                 // Dep not in cache — must be a new key not seen in old trace.
                 // Construct a synthetic Dep for hash computation.
                 Dep syntheticDep{source, depKey, DepHashValue{Blake3Hash{}}, type};
-                current = computeCurrentHash(state, syntheticDep, inputAccessors);
+                current = computeCurrentHash(state, syntheticDep, inputAccessors, scope);
                 currentDepHashes[dk] = current;
             }
 

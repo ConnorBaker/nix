@@ -58,15 +58,15 @@ namespace nix {
 // │                          index-addressed by DepRange)              │
 // │   - activeTracker      (current RAII tracker in the call stack)    │
 // ├─────────────────────────────────────────────────────────────────────┤
-// │ LIFETIME 2: Per root DependencyTracker  (cleared in                │
-// │             onRootConstruction)                                     │
+// │ LIFETIME 2: Per root DependencyTracker  (owned by RootTrackerScope)│
 // │                                                                    │
-// │ Caches that are valid only for a single evaluation pass. Cleared   │
-// │ when a new root DependencyTracker is constructed (no parent).      │
+// │ Caches valid only for a single root tracker scope. Owned as fields │
+// │ of RootTrackerScope, created at depth 0→1 and destroyed at 1→0.   │
 // │ These use Value*/Bindings* pointers as keys, which are only        │
 // │ valid within a single evaluation's GC heap generation.             │
+// │ RootTrackerScope::current provides access from free functions.     │
 // │                                                                    │
-// │ Members:                                                           │
+// │ Fields (all in RootTrackerScope):                                  │
 // │   - tracedContainerMap   (Value* → list provenance)                │
 // │   - provenancePool       (stable deque of TracedContainerProv.)    │
 // │   - readFileProvenanceMap (content hash → ReadFileProvenance)      │
@@ -241,7 +241,6 @@ static const Blake3Hash & kHashZero()   { static const auto h = depHash("0"); re
 static const Blake3Hash & kHashOne()    { static const auto h = depHash("1"); return h; }
 static const Blake3Hash & kHashObject() { static const auto h = depHash("object"); return h; }
 static const Blake3Hash & kHashArray()  { static const auto h = depHash("array"); return h; }
-static const Blake3Hash & kHashEmpty()  { static const auto h = depHash(""); return h; }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Pool accessor functions (declared in dependency-tracker.hh)
@@ -303,26 +302,11 @@ void initSessionSymbols(const SymbolTable & symbols) {
 
 // ═══════════════════════════════════════════════════════════════════════
 // Per-root-tracker caches — shape dep tracking
-// [Lifetime 2: cleared in onRootConstruction()]
+// [Lifetime 2: owned by RootTrackerScope, created/destroyed at depth 0↔1]
 // ═══════════════════════════════════════════════════════════════════════
 
-// [Lifetime 2] Value* → list provenance. Lists use this (not PosIdx)
-// because list provenance is recorded at access time (maybeRecordListLenDep).
-static thread_local boost::unordered_flat_map<const void*, const TracedContainerProvenance *> tracedContainerMap;
+// Helper types used by RootTrackerScope fields.
 
-// [Lifetime 2] Skip re-scanning the same Bindings* in maybeRecordAttrKeysDep.
-static thread_local boost::unordered_flat_set<const void *> scannedBindings;
-
-// [Lifetime 2] Stable pool for TracedContainerProvenance data.
-// std::deque never invalidates pointers on push_back.
-static thread_local std::deque<TracedContainerProvenance> provenancePool;
-
-// [Lifetime 2] Origin offset → precomputed keys hash. Populated at
-// ExprTracedData creation time; consumed by maybeRecordAttrKeysDep.
-static thread_local boost::unordered_flat_map<uint32_t, PrecomputedKeysInfo> precomputedKeysMap;
-
-// [Lifetime 2] Cache for computeDirSetHash: sorted (sourceId, filePathId) → hex hash.
-// Same directory set produces the same BLAKE3 hash; caching avoids redundant sort + hash.
 struct DirSetKey {
     std::vector<std::pair<DepSourceId, FilePathId>> sorted;
     bool operator==(const DirSetKey &) const = default;
@@ -335,34 +319,73 @@ struct DirSetKey {
         }
     };
 };
-static thread_local boost::unordered_flat_map<DirSetKey, std::string, DirSetKey::Hash> dirSetHashCache;
 
-// [Lifetime 2] Bindings* → origin info cache for intersectAttrs bulk recording.
 struct IntersectOriginInfo {
     DepSourceId sourceId;
     FilePathId filePathId;
     DataPathId dataPathId;
     StructuredFormat format;
 };
-static thread_local boost::unordered_flat_map<const Bindings *, std::vector<IntersectOriginInfo>> intersectOriginsCache;
+
+/**
+ * RAII container for all Lifetime 2 caches. Created when a root
+ * DependencyTracker is constructed (depth 0→1), destroyed when the
+ * root is destroyed (depth 1→0). All caches are automatically cleared
+ * by the destructor — adding a new L2 cache is just adding a field.
+ *
+ * A single thread_local non-owning pointer provides access from shape
+ * dep free functions. Between root tracker scopes, current is nullptr.
+ */
+struct RootTrackerScope {
+    static thread_local RootTrackerScope * current;
+    RootTrackerScope * previous;
+
+    // Value* → list provenance. Lists use this (not PosIdx).
+    boost::unordered_flat_map<const void*, const TracedContainerProvenance *> tracedContainerMap;
+
+    // Skip re-scanning the same Bindings* in maybeRecordAttrKeysDep.
+    boost::unordered_flat_set<const void *> scannedBindings;
+
+    // Stable pool for TracedContainerProvenance data (deque = no pointer invalidation).
+    std::deque<TracedContainerProvenance> provenancePool;
+
+    // Origin offset → precomputed keys hash.
+    boost::unordered_flat_map<uint32_t, PrecomputedKeysInfo> precomputedKeysMap;
+
+    // Sorted dir-set → BLAKE3 hex hash cache.
+    boost::unordered_flat_map<DirSetKey, std::string, DirSetKey::Hash> dirSetHashCache;
+
+    // Bindings* → origin info cache for intersectAttrs bulk recording.
+    boost::unordered_flat_map<const Bindings *, std::vector<IntersectOriginInfo>> intersectOriginsCache;
+
+    // Content hash → ReadFileProvenance (from prim_readFile → prim_fromJSON/fromTOML).
+    boost::unordered_flat_map<Blake3Hash, ReadFileProvenance, Blake3Hash::Hasher> readFileProvenanceMap;
+
+    // String data pointer → content hash (for RawContent dep tracking).
+    boost::unordered_flat_map<const char *, Blake3Hash> readFileStringPtrs;
+
+    RootTrackerScope() : previous(current) { current = this; }
+    ~RootTrackerScope() { current = previous; }
+
+    RootTrackerScope(const RootTrackerScope &) = delete;
+    RootTrackerScope & operator=(const RootTrackerScope &) = delete;
+};
+
+thread_local RootTrackerScope * RootTrackerScope::current = nullptr;
+
+// Storage for the active RootTrackerScope. emplaced at depth 0→1, reset at 1→0.
+static thread_local std::optional<RootTrackerScope> rootScopeStorage;
 
 void DependencyTracker::onRootConstruction()
 {
-    // Clear Lifetime 2 state (per-root-tracker caches).
-    // These use Value*/Bindings* pointers that are only valid within
-    // a single evaluation's GC heap generation.
-    clearTracedContainerMap();
-    provenancePool.clear();
-    clearReadFileProvenanceMap();
-    clearReadFileStringPtrs();
-    scannedBindings.clear();
-    clearPrecomputedKeysMap();
-    intersectOriginsCache.clear();
-    dirSetHashCache.clear();
-
+    rootScopeStorage.emplace();
     // Lifetime 1 state (pools, sessionTraces) is NOT cleared here.
-    // See lifetime documentation at the top of this file.
     sessionTraces.reserve(16384);
+}
+
+void DependencyTracker::onRootDestruction()
+{
+    rootScopeStorage.reset();
 }
 
 void resetEvalTracePools()
@@ -381,34 +404,42 @@ void resetEvalTracePools()
 ProvenanceRef allocateProvenance(DepSourceId sourceId, FilePathId filePathId,
                                  DataPathId dataPathId, StructuredFormat format)
 {
-    provenancePool.emplace_back(TracedContainerProvenance{sourceId, filePathId, dataPathId, format});
-    return &provenancePool.back();
+    auto * scope = RootTrackerScope::current;
+    if (!scope) return nullptr;
+    scope->provenancePool.emplace_back(TracedContainerProvenance{sourceId, filePathId, dataPathId, format});
+    return &scope->provenancePool.back();
 }
 
 void registerTracedContainer(const void * key, const TracedContainerProvenance * prov)
 {
-    tracedContainerMap.emplace(key, prov);
+    auto * scope = RootTrackerScope::current;
+    if (scope) scope->tracedContainerMap.emplace(key, prov);
 }
 
 const TracedContainerProvenance * lookupTracedContainer(const void * key)
 {
-    auto it = tracedContainerMap.find(key);
-    return it != tracedContainerMap.end() ? it->second : nullptr;
+    auto * scope = RootTrackerScope::current;
+    if (!scope) return nullptr;
+    auto it = scope->tracedContainerMap.find(key);
+    return it != scope->tracedContainerMap.end() ? it->second : nullptr;
 }
 
 void clearTracedContainerMap()
 {
-    tracedContainerMap.clear();
+    auto * scope = RootTrackerScope::current;
+    if (scope) scope->tracedContainerMap.clear();
 }
 
 void registerPrecomputedKeys(uint32_t originOffset, PrecomputedKeysInfo info)
 {
-    precomputedKeysMap.emplace(originOffset, std::move(info));
+    auto * scope = RootTrackerScope::current;
+    if (scope) scope->precomputedKeysMap.emplace(originOffset, std::move(info));
 }
 
 void clearPrecomputedKeysMap()
 {
-    precomputedKeysMap.clear();
+    auto * scope = RootTrackerScope::current;
+    if (scope) scope->precomputedKeysMap.clear();
 }
 
 // Record a non-StructuredContent dependency edge (Adapton: "add-edge").
@@ -419,7 +450,7 @@ void DependencyTracker::record(Dep dep)
 {
     if (activeTracker) {
         uint64_t h = hashValues(std::to_underlying(dep.type), dep.source, dep.key);
-        if (!activeTracker->recordedKeyHashes.insert(h).second)
+        if (!activeTracker->depDedup.tryInsert(h))
             return;  // Dependency already recorded in this trace scope — skip duplicate
     }
     debug("recording %s (%s) dep: input='%s' key='%s'",
@@ -446,7 +477,7 @@ void DependencyTracker::record(Dep dep)
         uint8_t(c.format), c.dataPathId.value, uint8_t(c.suffix),
         c.hasKey.getId());
     if (DependencyTracker::activeTracker
-        && !DependencyTracker::activeTracker->recordedKeyHashes.insert(h).second)
+        && !DependencyTracker::activeTracker->depDedup.tryInsert(h))
         return false;  // Duplicate — no work done
 
     // 2. Only for non-duplicates: build JSON dep key
@@ -467,10 +498,10 @@ void DependencyTracker::record(Dep dep)
 }
 
 // Replay a child's cached dependency into the session trace without touching the
-// active tracker's dedup set (recordedKeyHashes). This prevents parent dedup-set
+// active tracker's dedup filter (depDedup). This prevents parent dedup
 // pollution: the child's deps land in an excluded range in sessionTraces (so
 // they're skipped by collectTraces), but if record() were used instead, the
-// parent's recordedKeyHashes would reject a later independent recording of the same
+// parent's depDedup would reject a later independent recording of the same
 // dep. recordReplay avoids this by only appending to sessionTraces — the dep
 // still participates in thunk epoch ranges (recordThunkDeps) for correct
 // transitive propagation.
@@ -931,55 +962,59 @@ void recordDep(
 // ReadFile provenance threading
 // ═══════════════════════════════════════════════════════════════════════
 
-// Thread-local map from content hash to ReadFileProvenance. Evaluation is
-// single-threaded, so this is safe. Populated by prim_readFile, queried by
-// prim_fromJSON/prim_fromTOML to enable lazy structural dep tracking.
-// Keyed by content hash so multiple readFile results coexist and the same
-// provenance can serve multiple fromJSON/fromTOML calls (non-consuming lookup).
-static thread_local boost::unordered_flat_map<Blake3Hash, ReadFileProvenance, Blake3Hash::Hasher> readFileProvenanceMap;
-
+// Content hash → ReadFileProvenance (field of RootTrackerScope).
+// Populated by prim_readFile, queried by prim_fromJSON/prim_fromTOML to
+// enable lazy structural dep tracking. Keyed by content hash so multiple
+// readFile results coexist and the same provenance can serve multiple
+// fromJSON/fromTOML calls (non-consuming lookup).
 void addReadFileProvenance(ReadFileProvenance prov)
 {
-    readFileProvenanceMap.insert_or_assign(prov.contentHash, std::move(prov));
+    auto * scope = RootTrackerScope::current;
+    if (scope) scope->readFileProvenanceMap.insert_or_assign(prov.contentHash, std::move(prov));
 }
 
 const ReadFileProvenance * lookupReadFileProvenance(const Blake3Hash & contentHash)
 {
-    auto it = readFileProvenanceMap.find(contentHash);
-    return it != readFileProvenanceMap.end() ? &it->second : nullptr;
+    auto * scope = RootTrackerScope::current;
+    if (!scope) return nullptr;
+    auto it = scope->readFileProvenanceMap.find(contentHash);
+    return it != scope->readFileProvenanceMap.end() ? &it->second : nullptr;
 }
 
 void clearReadFileProvenanceMap()
 {
-    readFileProvenanceMap.clear();
+    auto * scope = RootTrackerScope::current;
+    if (scope) scope->readFileProvenanceMap.clear();
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // ReadFile string pointer tracking for RawContent deps
 // ═══════════════════════════════════════════════════════════════════════
 
-// Thread-local map from string data pointer (Value::c_str()) to content hash.
+// String data pointer → content hash (field of RootTrackerScope).
 // Populated by prim_readFile, queried by string builtins that observe raw bytes.
 // Key is a raw const char* — valid because readFile strings are GC-allocated
-// and stable for the evaluation session. Typically empty or very small.
-static thread_local boost::unordered_flat_map<const char *, Blake3Hash> readFileStringPtrs;
-
+// and stable within a root tracker scope. Typically empty or very small.
 void addReadFileStringPtr(const char * ptr, const Blake3Hash & contentHash)
 {
-    readFileStringPtrs.emplace(ptr, contentHash);
+    auto * scope = RootTrackerScope::current;
+    if (scope) scope->readFileStringPtrs.emplace(ptr, contentHash);
 }
 
 void clearReadFileStringPtrs()
 {
-    readFileStringPtrs.clear();
+    auto * scope = RootTrackerScope::current;
+    if (scope) scope->readFileStringPtrs.clear();
 }
 
 [[gnu::cold]] void maybeRecordRawContentDep(EvalState & state, const Value & v)
 {
     if (!DependencyTracker::isActive()) return;
     if (v.type() != nString) return;
-    auto it = readFileStringPtrs.find(v.c_str());
-    if (it == readFileStringPtrs.end()) return;
+    auto * scope = RootTrackerScope::current;
+    if (!scope) return;
+    auto it = scope->readFileStringPtrs.find(v.c_str());
+    if (it == scope->readFileStringPtrs.end()) return;
     auto * prov = lookupReadFileProvenance(it->second);
     if (!prov) return;
     auto [source, key] = resolveProvenance(prov->path, state.getMountToInput());
@@ -1076,7 +1111,9 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
     if (!v.attrs()->hasAnyTracedDataLayer()) return;
 
     // Memoize: skip if we've already scanned this exact Bindings*.
-    if (!scannedBindings.insert(v.attrs()).second) return;
+    auto * scope = RootTrackerScope::current;
+    if (!scope) return;
+    if (!scope->scannedBindings.insert(v.attrs()).second) return;
 
     // Group attrs by their TracedData origin.
     struct OriginKeys {
@@ -1106,8 +1143,8 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
     for (auto & g : groups) {
         // Fast path: if all original keys are visible (no shadowing by //),
         // use the precomputed hash from ExprTracedData::eval() creation time.
-        auto pcIt = precomputedKeysMap.find(g.originOffset);
-        if (pcIt != precomputedKeysMap.end() && pcIt->second.keyCount == g.keys.size()) {
+        auto pcIt = scope->precomputedKeysMap.find(g.originOffset);
+        if (pcIt != scope->precomputedKeysMap.end() && pcIt->second.keyCount == g.keys.size()) {
             auto & info = pcIt->second;
             auto fmt = parseStructuredFormat(g.df->format);
             if (!fmt) continue;
@@ -1170,8 +1207,10 @@ static const std::vector<IntersectOriginInfo> emptyOrigins;
 static const std::vector<IntersectOriginInfo> & collectOriginsCached(
     const PosTable & positions, const Value & v)
 {
+    auto * scope = RootTrackerScope::current;
+    if (!scope) return emptyOrigins;
     auto * bindings = v.attrs();
-    auto [it, inserted] = intersectOriginsCache.try_emplace(bindings);
+    auto [it, inserted] = scope->intersectOriginsCache.try_emplace(bindings);
     if (!inserted)
         return it->second;
 
@@ -1288,9 +1327,12 @@ static std::string computeDirSetHash(const std::vector<std::pair<DepSourceId, Fi
 
     // Cache lookup after sorting (same sorted set → same hash).
     DirSetKey cacheKey{sorted};
-    auto cacheIt = dirSetHashCache.find(cacheKey);
-    if (cacheIt != dirSetHashCache.end())
-        return cacheIt->second;
+    auto * scope = RootTrackerScope::current;
+    if (scope) {
+        auto cacheIt = scope->dirSetHashCache.find(cacheKey);
+        if (cacheIt != scope->dirSetHashCache.end())
+            return cacheIt->second;
+    }
 
     HashSink sink(HashAlgorithm::BLAKE3);
     for (auto & [srcId, fpId] : sorted) {
@@ -1309,7 +1351,8 @@ static std::string computeDirSetHash(const std::vector<std::pair<DepSourceId, Fi
         hex += buf;
     }
 
-    dirSetHashCache.emplace(std::move(cacheKey), hex);
+    if (scope)
+        scope->dirSetHashCache.emplace(std::move(cacheKey), hex);
     return hex;
 }
 

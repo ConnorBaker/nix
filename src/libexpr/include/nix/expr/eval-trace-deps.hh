@@ -22,7 +22,7 @@
 
 namespace nix {
 
-class Value;
+struct Value;
 struct SourcePath;
 
 /**
@@ -94,6 +94,9 @@ enum class DepType : uint8_t {
      *  Same verification as Content (BLAKE3 of file bytes), but classified as
      *  Normal (not ContentOverrideable) — cannot be overridden by SC deps. */
     RawContent = 14,
+
+    /** Not a real dep type. Must remain last — used to size the descriptor table. */
+    EndSentinel_,
 };
 
 /**
@@ -116,6 +119,7 @@ inline std::string depTypeName(DepType type)
     case DepType::StructuredContent: return "structuredContent";
     case DepType::ImplicitShape: return "implicitShape";
     case DepType::RawContent: return "rawContent";
+    case DepType::EndSentinel_: break;
     }
     unreachable();
 }
@@ -227,34 +231,92 @@ enum class DepKind : uint8_t {
 };
 
 /**
- * Classify a DepType into its behavioral kind.
- * Exhaustive switch — adding a new DepType without a case here triggers -Wswitch.
+ * Behavioral descriptor for a DepType. One entry per DepType in a constexpr
+ * table. Adding a new DepType without a descriptor triggers -Wswitch in
+ * the initializer function.
  */
-inline constexpr DepKind depKind(DepType type)
+struct DepKindDescriptor {
+    DepKind kind;
+    bool isBlake3;        ///< true = stores BLAKE3 hash; false = stores string
+    bool isOverrideable;  ///< true = can be overridden by StructuredContent
+    bool isVolatile;      ///< true = always fails verification
+};
+
+/**
+ * Build the descriptor for a single DepType. Constexpr; -Wswitch on the
+ * DepType switch ensures all variants are covered.
+ */
+inline constexpr DepKindDescriptor makeDescriptor(DepType type)
 {
     switch (type) {
     case DepType::Content:
+        return {DepKind::ContentOverrideable, true, true, false};
     case DepType::Directory:
-        return DepKind::ContentOverrideable;
+        return {DepKind::ContentOverrideable, true, true, false};
     case DepType::Existence:
+        return {DepKind::Normal, false, false, false};
     case DepType::EnvVar:
-    case DepType::System:
-    case DepType::NARContent:
-    case DepType::CopiedPath:
-    case DepType::UnhashedFetch:
-    case DepType::RawContent:
-        return DepKind::Normal;
+        return {DepKind::Normal, true, false, false};
     case DepType::CurrentTime:
-    case DepType::Exec:
-        return DepKind::Volatile;
-    case DepType::StructuredContent:
-        return DepKind::Structural;
-    case DepType::ImplicitShape:
-        return DepKind::ImplicitStructural;
+        return {DepKind::Volatile, false, false, true};
+    case DepType::System:
+        return {DepKind::Normal, true, false, false};
+    case DepType::UnhashedFetch:
+        return {DepKind::Normal, false, false, false};
     case DepType::ParentContext:
-        return DepKind::ParentContext;
+        return {DepKind::ParentContext, true, false, false};
+    case DepType::CopiedPath:
+        return {DepKind::Normal, false, false, false};
+    case DepType::Exec:
+        return {DepKind::Volatile, false, false, true};
+    case DepType::NARContent:
+        return {DepKind::Normal, true, false, false};
+    case DepType::StructuredContent:
+        return {DepKind::Structural, true, false, false};
+    case DepType::ImplicitShape:
+        return {DepKind::ImplicitStructural, true, false, false};
+    case DepType::RawContent:
+        return {DepKind::Normal, true, false, false};
+    case DepType::EndSentinel_:
+        break;
     }
     unreachable();
+}
+
+/// Constexpr descriptor table indexed by DepType value.
+/// DepType values start at 1, so index 0 is unused (default-initialized).
+inline constexpr auto depDescriptors = [] {
+    constexpr size_t N = std::to_underlying(DepType::EndSentinel_);
+    std::array<DepKindDescriptor, N> table{};
+    table[std::to_underlying(DepType::Content)] = makeDescriptor(DepType::Content);
+    table[std::to_underlying(DepType::Directory)] = makeDescriptor(DepType::Directory);
+    table[std::to_underlying(DepType::Existence)] = makeDescriptor(DepType::Existence);
+    table[std::to_underlying(DepType::EnvVar)] = makeDescriptor(DepType::EnvVar);
+    table[std::to_underlying(DepType::CurrentTime)] = makeDescriptor(DepType::CurrentTime);
+    table[std::to_underlying(DepType::System)] = makeDescriptor(DepType::System);
+    table[std::to_underlying(DepType::UnhashedFetch)] = makeDescriptor(DepType::UnhashedFetch);
+    table[std::to_underlying(DepType::ParentContext)] = makeDescriptor(DepType::ParentContext);
+    table[std::to_underlying(DepType::CopiedPath)] = makeDescriptor(DepType::CopiedPath);
+    table[std::to_underlying(DepType::Exec)] = makeDescriptor(DepType::Exec);
+    table[std::to_underlying(DepType::NARContent)] = makeDescriptor(DepType::NARContent);
+    table[std::to_underlying(DepType::StructuredContent)] = makeDescriptor(DepType::StructuredContent);
+    table[std::to_underlying(DepType::ImplicitShape)] = makeDescriptor(DepType::ImplicitShape);
+    table[std::to_underlying(DepType::RawContent)] = makeDescriptor(DepType::RawContent);
+    return table;
+}();
+
+/// Look up the descriptor for a DepType. O(1) table lookup.
+inline constexpr const DepKindDescriptor & describe(DepType type)
+{
+    return depDescriptors[std::to_underlying(type)];
+}
+
+/**
+ * Classify a DepType into its behavioral kind.
+ */
+inline constexpr DepKind depKind(DepType type)
+{
+    return describe(type).kind;
 }
 
 /**
@@ -275,11 +337,10 @@ inline constexpr std::string_view depKindName(DepKind kind)
 
 /**
  * Returns true if the dep type is volatile (always fails verification).
- * Shorthand for the most frequent DepKind check (~6 call sites).
  */
 inline constexpr bool isVolatile(DepType type)
 {
-    return depKind(type) == DepKind::Volatile;
+    return describe(type).isVolatile;
 }
 
 /**
@@ -288,32 +349,15 @@ inline constexpr bool isVolatile(DepType type)
  */
 inline constexpr bool isContentOverrideable(DepType type)
 {
-    return depKind(type) == DepKind::ContentOverrideable;
+    return describe(type).isOverrideable;
 }
 
 /**
  * Returns true if the dep type stores a BLAKE3 hash (not a string).
  */
-inline bool isBlake3Dep(DepType type) {
-    switch (type) {
-    case DepType::Content:
-    case DepType::Directory:
-    case DepType::NARContent:
-    case DepType::EnvVar:
-    case DepType::System:
-    case DepType::ParentContext:
-    case DepType::StructuredContent:
-    case DepType::ImplicitShape:
-    case DepType::RawContent:
-        return true;
-    case DepType::Existence:
-    case DepType::CopiedPath:
-    case DepType::UnhashedFetch:
-    case DepType::CurrentTime:
-    case DepType::Exec:
-        return false;
-    }
-    unreachable();
+inline constexpr bool isBlake3Dep(DepType type)
+{
+    return describe(type).isBlake3;
 }
 
 /**

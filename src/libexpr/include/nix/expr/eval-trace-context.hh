@@ -15,7 +15,7 @@
 
 namespace nix {
 
-class Value;
+struct Value;
 
 namespace eval_trace {
 class TraceCache;

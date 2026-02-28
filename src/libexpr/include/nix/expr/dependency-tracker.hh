@@ -83,11 +83,19 @@ struct DependencyTracker {
         }
     }
 
-    /// Hash-based dedup set: stores uint64_t hashes of (type, source, key)
-    /// triples. record() and recordStructuredDep() check membership before
-    /// appending to sessionTraces. >90% of recording attempts are duplicates,
-    /// so hash-only dedup avoids constructing DepKey strings entirely.
-    boost::unordered_flat_set<uint64_t> recordedKeyHashes;
+    /**
+     * Hash-based dedup filter: stores uint64_t identity hashes. Both
+     * record() and recordStructuredDep() check membership before appending
+     * to sessionTraces. >90% of recording attempts are duplicates, so
+     * hash-only dedup avoids constructing DepKey strings entirely.
+     *
+     * tryInsert returns true if the hash was NOT previously seen.
+     */
+    struct DedupFilter {
+        boost::unordered_flat_set<uint64_t> seen;
+        bool tryInsert(uint64_t h) { return seen.insert(h).second; }
+    };
+    DedupFilter depDedup;
 
     DependencyTracker()
         : previous(activeTracker)
@@ -100,13 +108,20 @@ struct DependencyTracker {
     }
 
     /**
-     * Called when a root DependencyTracker is constructed (no parent).
-     * Clears per-evaluation-session state such as the traced container map.
+     * Called when a root DependencyTracker is constructed (depth 0→1).
+     * Creates a RootTrackerScope containing all Lifetime 2 caches.
      */
     static void onRootConstruction();
+
+    /**
+     * Called when a root DependencyTracker is destroyed (depth 1→0).
+     * Destroys the RootTrackerScope, clearing all Lifetime 2 caches.
+     */
+    static void onRootDestruction();
+
     ~DependencyTracker() {
         activeTracker = previous;
-        depth--;
+        if (--depth == 0) onRootDestruction();
     }
 
     DependencyTracker(const DependencyTracker &) = delete;
@@ -122,7 +137,7 @@ struct DependencyTracker {
 
     /**
      * Append a dependency to sessionTraces without touching the active
-     * tracker's recordedKeyHashes dedup set. Interns strings into CompactDep.
+     * tracker's depDedup filter. Interns strings into CompactDep.
      * Used by TracedExpr::replayTrace() to propagate a child's cached deps
      * (loaded from DB as Dep objects) into the session trace (needed for
      * thunk epoch ranges) without polluting the parent tracker's dedup state.
