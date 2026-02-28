@@ -10,7 +10,6 @@
 #include <variant>
 
 #include "nix/util/source-path.hh"
-#include "nix/util/traced-data-ids.hh"
 
 namespace nix {
 
@@ -53,26 +52,20 @@ struct Pos
     };
 
     /**
-     * Origin for attributes materialized from traced data sources
-     * (JSON, TOML, directory listings). Carries interned provenance IDs
-     * so that shape dep functions can build CompactDepComponents from
-     * PosTable::originOf() without string allocation.
-     *
-     * IDs are indices into process-lifetime pools (StringPool16 for
-     * sourceId/filePathId, DataPathPool trie for dataPathId).
+     * Opaque reference to eval-trace provenance data. The actual
+     * provenance record (source ID, file path, data path, format)
+     * lives in a ProvenanceTable in libexpr. libutil only knows
+     * "this position has provenance" (1 tag bit in PosIdx + this index).
      */
-    struct TracedData
+    struct ProvenanceRef
     {
-        DepSourceId sourceId;    ///< interned flake input name
-        FilePathId filePathId;   ///< interned file path
-        DataPathId dataPathId;   ///< trie node in DataPathPool
-        char format;             ///< 'j', 't', 'd' (StructuredFormat char)
+        uint32_t id;
 
-        bool operator==(const TracedData &) const = default;
-        auto operator<=>(const TracedData &) const = default;
+        bool operator==(const ProvenanceRef &) const = default;
+        auto operator<=>(const ProvenanceRef &) const = default;
     };
 
-    typedef std::variant<std::monostate, Stdin, String, SourcePath, TracedData> Origin;
+    typedef std::variant<std::monostate, Stdin, String, SourcePath, ProvenanceRef> Origin;
 
     Origin origin = std::monostate();
 

@@ -188,6 +188,19 @@ std::unique_ptr<InterningPools> createInterningPools();
 void destroyInterningPools(InterningPools * p);
 
 /**
+ * Allocate a provenance record and return a Pos::ProvenanceRef for use
+ * in PosTable origins. The record is stored in the session's ProvenanceTable.
+ */
+Pos::ProvenanceRef allocateProvenanceRef(
+    DepSourceId srcId, FilePathId fpId, DataPathId dpId, char format);
+
+/**
+ * Resolve a Pos::ProvenanceRef to its full ProvenanceRecord.
+ * Returns nullptr if no InterningPools are active.
+ */
+const ProvenanceRecord * resolveProvenanceRef(const Pos::ProvenanceRef & ref);
+
+/**
  * RAII guard that temporarily suspends dep recording by setting
  * activeTracker to nullptr. On destruction, restores the previous tracker.
  *
@@ -485,7 +498,7 @@ void initSessionSymbols(const SymbolTable & symbols);
 
 /**
  * Precomputed keys hash from ExprTracedData::eval() Object case.
- * Stored in a thread-local side map keyed by Pos::TracedData* (pointer identity
+ * Stored in a thread-local side map keyed by PosTable origin offset (stable
  * from PosTable origins vector). At access time, maybeRecordAttrKeysDep compares
  * visible key count to stored count; if equal, uses the precomputed hash directly,
  * avoiding the sort + concat + BLAKE3 hash that dominates its runtime.

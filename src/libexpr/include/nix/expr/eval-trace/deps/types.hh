@@ -525,4 +525,41 @@ inline auto Dep::operator<=>(const Dep & other) const {
     return key <=> other.key;
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Provenance — eval-trace origin data for PosTable positions
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Full provenance record for a position originating from traced data
+ * (JSON, TOML, directory listings). Stored in a ProvenanceTable indexed
+ * by the opaque Pos::ProvenanceRef::id.
+ */
+struct ProvenanceRecord {
+    DepSourceId sourceId;
+    FilePathId filePathId;
+    DataPathId dataPathId;
+    char format;             ///< 'j', 't', 'd' (StructuredFormat char)
+};
+
+/**
+ * Flat table of provenance records. Append-only within a session.
+ * Owned by InterningPools (Lifetime 1).
+ */
+struct ProvenanceTable {
+    std::vector<ProvenanceRecord> records;
+
+    uint32_t allocate(DepSourceId srcId, FilePathId fpId, DataPathId dpId, char fmt) {
+        uint32_t id = static_cast<uint32_t>(records.size());
+        records.push_back({srcId, fpId, dpId, fmt});
+        return id;
+    }
+
+    const ProvenanceRecord & resolve(uint32_t id) const {
+        assert(id < records.size());
+        return records[id];
+    }
+
+    void clear() { records.clear(); }
+};
+
 } // namespace nix

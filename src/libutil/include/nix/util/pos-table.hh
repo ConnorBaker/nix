@@ -110,7 +110,7 @@ public:
      */
     OriginHandle addOriginHandle(Pos::Origin origin, size_t size)
     {
-        bool td = std::holds_alternative<Pos::TracedData>(origin);
+        bool td = std::holds_alternative<Pos::ProvenanceRef>(origin);
         uint32_t off = 0;
         if (!origins.empty())
             off = origins.back().offset + origins.back().size;
@@ -127,7 +127,7 @@ public:
         if (offset > origin.size)
             return PosIdx();
         uint32_t id = 1 + origin.offset + offset;
-        if (std::holds_alternative<Pos::TracedData>(origin.origin))
+        if (std::holds_alternative<Pos::ProvenanceRef>(origin.origin))
             id |= PosIdx::tracedDataTag;
         return PosIdx(id);
     }

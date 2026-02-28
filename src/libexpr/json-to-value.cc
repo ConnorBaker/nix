@@ -325,7 +325,7 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
 
         bool tracking = DependencyTracker::isActive() && !keys.empty();
         auto originHandle = state.positions.addOriginHandle(
-            Pos::TracedData{sourceId, filePathId, dataPathId, structuredFormatChar(fmt)},
+            allocateProvenanceRef(sourceId, filePathId, dataPathId, structuredFormatChar(fmt)),
             keys.empty() ? 0 : keys.size());
 
         for (size_t idx = 0; idx < keys.size(); idx++) {

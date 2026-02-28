@@ -324,7 +324,9 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
                 if (!attr || !attr->pos.isTracedData()) continue;
                 auto * origin = st.positions.originOfPtr(attr->pos);
                 if (!origin) continue;
-                auto * df = std::get_if<Pos::TracedData>(origin);
+                auto * pr = std::get_if<Pos::ProvenanceRef>(origin);
+                if (!pr) continue;
+                auto * df = resolveProvenanceRef(*pr);
                 if (!df) continue;
                 // Resolve interned IDs to strings for storage
                 auto depSource = std::string(resolveDepSource(df->sourceId));
@@ -393,7 +395,7 @@ void TracedExpr::materializeOrigExprAttrs(
             auto fpId = internFilePath(orig.depKey);
             auto dpId = jsonStringToDataPathId(orig.dataPath);
             auto handle = st.positions.addOriginHandle(
-                Pos::TracedData{srcId, fpId, dpId, orig.format},
+                allocateProvenanceRef(srcId, fpId, dpId, orig.format),
                 counts[&orig - attrs.origins.data()]);
             originHandles.push_back({handle, 0});
         }
@@ -557,7 +559,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
                 auto fpId = internFilePath(orig.depKey);
                 auto dpId = jsonStringToDataPathId(orig.dataPath);
                 auto handle = st.positions.addOriginHandle(
-                    Pos::TracedData{srcId, fpId, dpId, orig.format},
+                    allocateProvenanceRef(srcId, fpId, dpId, orig.format),
                     counts[&orig - attrs->origins.data()]);
                 originHandles.push_back({handle, 0});
             }

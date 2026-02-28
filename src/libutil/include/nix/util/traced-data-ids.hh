@@ -3,7 +3,7 @@
 ///
 /// Strongly-typed ID wrappers for eval trace component interning.
 /// Zero-cost abstractions: same layout as raw integers, type-safe at compile time.
-/// Lives in libutil so that Pos::TracedData (position.hh) can use them.
+/// Lives in libutil for use by eval-trace interning pools in libexpr.
 
 #include <cstdint>
 #include <functional>
