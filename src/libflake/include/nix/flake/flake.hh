@@ -5,7 +5,7 @@
 #include "nix/flake/flakeref.hh"
 #include "nix/flake/lockfile.hh"
 #include "nix/expr/value.hh"
-#include "nix/expr/trace-cache.hh"
+#include "nix/expr/eval-trace/cache/trace-cache.hh"
 
 namespace nix {
 

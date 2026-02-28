@@ -5,7 +5,7 @@
 
 #include "eval-trace/helpers.hh"
 
-#include "nix/expr/trace-cache.hh"
+#include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/value/context.hh"
 

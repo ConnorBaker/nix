@@ -1,6 +1,6 @@
 #pragma once
 
-#include "nix/expr/eval-trace-deps.hh"
+#include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/util/hash.hh"
 
 #include <string>

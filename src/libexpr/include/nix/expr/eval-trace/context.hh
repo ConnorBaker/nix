@@ -1,7 +1,7 @@
 #pragma once
 ///@file
 
-#include "nix/expr/eval-trace-deps.hh"
+#include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/util/ref.hh"
 #include "nix/util/hash.hh"
 #include "nix/util/source-path.hh"

@@ -1,5 +1,5 @@
-#include "nix/expr/eval-trace-deps.hh"
-#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace/deps/types.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/attr-set.hh"

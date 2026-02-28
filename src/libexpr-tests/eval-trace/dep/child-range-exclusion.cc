@@ -2,9 +2,9 @@
 
 #include <gtest/gtest.h>
 
-#include "nix/expr/dependency-tracker.hh"
-#include "nix/expr/eval-trace-context.hh"
-#include "nix/expr/eval-trace-deps.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/context.hh"
+#include "nix/expr/eval-trace/deps/types.hh"
 
 namespace nix::eval_trace {
 

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "nix/expr/trace-result.hh"
-#include "nix/expr/eval-trace-deps.hh"
+#include "nix/expr/eval-trace/result.hh"
+#include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/util/sync.hh"
 #include "nix/util/traced-data-ids.hh"

@@ -1,7 +1,7 @@
-#include "nix/expr/trace-store.hh"
-#include "nix/expr/dependency-tracker.hh"
-#include "nix/expr/trace-cache.hh"
-#include "nix/expr/trace-hash.hh"
+#include "nix/expr/eval-trace/store/trace-store.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/cache/trace-cache.hh"
+#include "nix/expr/eval-trace/deps/hash.hh"
 #include "nix/expr/eval.hh"
 #include "nix/store/globals.hh"
 

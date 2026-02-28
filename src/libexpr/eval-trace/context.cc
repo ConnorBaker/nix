@@ -1,6 +1,6 @@
-#include "nix/expr/eval-trace-context.hh"
-#include "nix/expr/dependency-tracker.hh"
-#include "nix/expr/trace-cache.hh"
+#include "nix/expr/eval-trace/context.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/expr/value.hh"
 
 namespace nix {

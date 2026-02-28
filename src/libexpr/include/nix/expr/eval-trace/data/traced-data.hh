@@ -1,9 +1,9 @@
 #pragma once
 ///@file
 
-#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/expr/eval-gc.hh"
-#include "nix/expr/eval-trace-deps.hh"
+#include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/nixexpr.hh"
 
 #include <string>

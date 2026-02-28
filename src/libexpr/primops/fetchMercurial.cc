@@ -3,7 +3,7 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/store-api.hh"
 #include "nix/fetchers/fetchers.hh"
-#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/util/url.hh"
 #include "nix/util/url-parts.hh"
 

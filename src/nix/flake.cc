@@ -11,7 +11,7 @@
 #include "nix/expr/attr-path.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/registry.hh"
-#include "nix/expr/trace-cache.hh"
+#include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/cmd/markdown.hh"
 #include "nix/util/users.hh"
 #include "nix/fetchers/fetch-to-store.hh"

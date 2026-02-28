@@ -1,4 +1,4 @@
-#include "nix/expr/trace-hash.hh"
+#include "nix/expr/eval-trace/deps/hash.hh"
 
 #include <algorithm>
 

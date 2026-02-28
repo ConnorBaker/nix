@@ -1,6 +1,6 @@
 #include "nix/expr/value-to-json.hh"
 #include "nix/expr/eval-inline.hh"
-#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/signals.hh"
 

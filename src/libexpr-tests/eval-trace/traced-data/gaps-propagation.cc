@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "nix/expr/traced-data.hh"
+#include "nix/expr/eval-trace/data/traced-data.hh"
 #include "nix/expr/json-to-value.hh"
 
 namespace nix::eval_trace {

@@ -1,5 +1,5 @@
 #include "eval-trace/helpers.hh"
-#include "nix/expr/trace-hash.hh"
+#include "nix/expr/eval-trace/deps/hash.hh"
 
 #include <gtest/gtest.h>
 

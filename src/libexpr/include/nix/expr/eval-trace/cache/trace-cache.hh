@@ -5,7 +5,7 @@
 #include "nix/util/hash.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/attr-path.hh"
-#include "nix/expr/trace-result.hh"
+#include "nix/expr/eval-trace/result.hh"
 
 #include <functional>
 #include <unordered_map>

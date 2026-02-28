@@ -1,8 +1,8 @@
 #include "nix/expr/primops.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/static-string-data.hh"
-#include "nix/expr/traced-data.hh"
-#include "nix/expr/dependency-tracker.hh"
+#include "nix/expr/eval-trace/data/traced-data.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 
 #include "expr-config-private.hh"
 
