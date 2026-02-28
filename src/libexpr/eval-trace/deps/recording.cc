@@ -114,6 +114,9 @@ thread_local uint32_t DependencyTracker::depth = 0;
 struct StringPool16 {
     std::vector<std::string> strings;
     boost::unordered_flat_map<std::string, uint16_t> lookup;
+#ifndef NDEBUG
+    uint32_t generation = 0;
+#endif
 
     uint16_t intern(std::string_view sv) {
         std::string key(sv);
@@ -125,9 +128,18 @@ struct StringPool16 {
         return id;
     }
 
-    std::string_view resolve(uint16_t id) const { return strings[id]; }
+    std::string_view resolve(uint16_t id) const {
+        assert(id < strings.size());
+        return strings[id];
+    }
 
-    void clear() { strings.clear(); lookup.clear(); }
+    void clear() {
+        strings.clear();
+        lookup.clear();
+#ifndef NDEBUG
+        generation++;
+#endif
+    }
 
     // In production, pools grow monotonically (GC-heap thunks hold IDs).
     // clear() is only called by resetEvalTracePools() for test isolation.
@@ -192,10 +204,17 @@ struct DataPathPool {
         return arr;
     }
 
+#ifndef NDEBUG
+    uint32_t generation = 0;
+#endif
+
     void clear() {
         nodes.clear();
         lookup.clear();
         nodes.push_back({0, "", -1}); // re-add root sentinel
+#ifndef NDEBUG
+        generation++;
+#endif
     }
 
     // In production, pools grow monotonically. clear() is for test isolation.
@@ -205,6 +224,9 @@ struct DataPathPool {
 struct StringPool32 {
     std::vector<std::string> strings;
     boost::unordered_flat_map<std::string, uint32_t> lookup;
+#ifndef NDEBUG
+    uint32_t generation = 0;
+#endif
 
     uint32_t intern(std::string_view sv) {
         std::string key(sv);
@@ -216,9 +238,18 @@ struct StringPool32 {
         return id;
     }
 
-    std::string_view resolve(uint32_t id) const { return strings[id]; }
+    std::string_view resolve(uint32_t id) const {
+        assert(id < strings.size());
+        return strings[id];
+    }
 
-    void clear() { strings.clear(); lookup.clear(); }
+    void clear() {
+        strings.clear();
+        lookup.clear();
+#ifndef NDEBUG
+        generation++;
+#endif
+    }
 };
 
 // [Lifetime 1] Interning pools — process-lifetime, cleared only by resetEvalTracePools().
@@ -247,35 +278,64 @@ static const Blake3Hash & kHashArray()  { static const auto h = depHash("array")
 // ═══════════════════════════════════════════════════════════════════════
 
 DepSourceId internDepSource(std::string_view sv) {
+#ifndef NDEBUG
+    return DepSourceId(depSourcePool.intern(sv), depSourcePool.generation);
+#else
     return DepSourceId(depSourcePool.intern(sv));
+#endif
 }
 
 FilePathId internFilePath(std::string_view sv) {
+#ifndef NDEBUG
+    return FilePathId(filePathPool.intern(sv), filePathPool.generation);
+#else
     return FilePathId(filePathPool.intern(sv));
+#endif
 }
 
 std::string_view resolveDepSource(DepSourceId id) {
+#ifndef NDEBUG
+    assert(id.generation == depSourcePool.generation && "DepSourceId used after pool clear");
+#endif
     return depSourcePool.resolve(id.value);
 }
 
 std::string_view resolveFilePath(FilePathId id) {
+#ifndef NDEBUG
+    assert(id.generation == filePathPool.generation && "FilePathId used after pool clear");
+#endif
     return filePathPool.resolve(id.value);
 }
 
 DepKeyId internDepKey(std::string_view sv) {
+#ifndef NDEBUG
+    return DepKeyId(depKeyPool.intern(sv), depKeyPool.generation);
+#else
     return DepKeyId(depKeyPool.intern(sv));
+#endif
 }
 
 std::string_view resolveDepKey(DepKeyId id) {
+#ifndef NDEBUG
+    assert(id.generation == depKeyPool.generation && "DepKeyId used after pool clear");
+#endif
     return depKeyPool.resolve(id.value);
 }
 
 DataPathId internDataPathChild(DataPathId parentId, std::string_view key) {
+#ifndef NDEBUG
+    return DataPathId(dataPathPool.internChild(parentId.value, key), dataPathPool.generation);
+#else
     return DataPathId(dataPathPool.internChild(parentId.value, key));
+#endif
 }
 
 DataPathId internDataPathArrayChild(DataPathId parentId, int32_t index) {
+#ifndef NDEBUG
+    return DataPathId(dataPathPool.internArrayChild(parentId.value, index), dataPathPool.generation);
+#else
     return DataPathId(dataPathPool.internArrayChild(parentId.value, index));
+#endif
 }
 
 std::string dataPathToJsonString(DataPathId nodeId) {

@@ -2461,6 +2461,12 @@ bool EvalState::isFunctor(const Value & fun) const
     return fun.type() == nAttrs && fun.attrs()->get(s.functor);
 }
 
+void EvalState::forceListObserved(Value & v, const PosIdx pos, std::string_view errorCtx)
+{
+    forceList(v, pos, errorCtx);
+    if (traceActiveDepth) [[unlikely]] maybeRecordListLenDep(v);
+}
+
 void EvalState::forceFunction(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
     try {

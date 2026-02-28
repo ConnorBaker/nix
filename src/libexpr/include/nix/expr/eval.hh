@@ -727,6 +727,14 @@ public:
     inline void forceAttrs(Value & v, Callable getPos, std::string_view errorCtx);
 
     inline void forceList(Value & v, const PosIdx pos, std::string_view errorCtx);
+
+    /**
+     * Force a list value and record a #len shape dep if the list has
+     * TracedData provenance. Combines forceList + maybeRecordListLenDep
+     * so primops don't need to remember the hook.
+     */
+    void forceListObserved(Value & v, const PosIdx pos, std::string_view errorCtx);
+
     /**
      * @param v either lambda or primop
      */

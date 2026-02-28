@@ -3518,8 +3518,7 @@ static RegisterPrimOp primop_isAttrs({
 static void prim_removeAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the first argument passed to builtins.removeAttrs");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.removeAttrs");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.removeAttrs");
 
     /* Get the attribute names to be removed.
        We keep them as Attrs instead of Symbols so std::set_difference
@@ -3566,8 +3565,7 @@ static RegisterPrimOp primop_removeAttrs({
    name, the first takes precedence. */
 static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[0], pos, "while evaluating the argument passed to builtins.listToAttrs");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[0]);
+    state.forceListObserved(*args[0], pos, "while evaluating the argument passed to builtins.listToAttrs");
 
     // Step 1. Sort the name-value attrsets in place using the memory we allocate for the result
     auto listView = args[0]->listView();
@@ -3734,8 +3732,7 @@ static void prim_catAttrs(EvalState & state, const PosIdx pos, Value ** args, Va
 {
     auto attrName = state.symbols.create(
         state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.catAttrs"));
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.catAttrs");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.catAttrs");
 
     SmallValueVector<nonRecursiveStackReservation> res(args[1]->listSize());
     size_t found = 0;
@@ -3865,8 +3862,7 @@ static void prim_zipAttrsWith(EvalState & state, const PosIdx pos, Value ** args
     std::map<Symbol, Item, std::less<Symbol>, traceable_allocator<std::pair<const Symbol, Item>>> attrsSeen;
 
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.zipAttrsWith");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.zipAttrsWith");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.zipAttrsWith");
     const auto listItems = args[1]->listView();
 
     for (auto & vElem : listItems) {
@@ -4009,8 +4005,7 @@ static RegisterPrimOp primop_head({
    don't want to use it!  */
 static void prim_tail(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[0], pos, "while evaluating the first argument passed to 'builtins.tail'");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[0]);
+    state.forceListObserved(*args[0], pos, "while evaluating the first argument passed to 'builtins.tail'");
     if (args[0]->listSize() == 0)
         state.error<EvalError>("'builtins.tail' called on an empty list").atPos(pos).debugThrow();
 
@@ -4039,8 +4034,7 @@ static RegisterPrimOp primop_tail({
 /* Apply a function to every element of a list. */
 static void prim_map(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.map");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.map");
 
     if (args[1]->listSize() == 0) {
         v = *args[1];
@@ -4076,8 +4070,7 @@ static RegisterPrimOp primop_map({
    returns true. */
 static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.filter");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.filter");
 
     if (args[1]->listSize() == 0) {
         v = *args[1];
@@ -4125,8 +4118,7 @@ static RegisterPrimOp primop_filter({
 static void prim_elem(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     bool res = false;
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.elem");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.elem");
     for (auto elem : args[1]->listView())
         if (state.eqValues(*args[0], *elem, pos, "while searching for the presence of the given element in the list")) {
             res = true;
@@ -4148,8 +4140,7 @@ static RegisterPrimOp primop_elem({
 /* Concatenate a list of lists. */
 static void prim_concatLists(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.concatLists");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[0]);
+    state.forceListObserved(*args[0], pos, "while evaluating the first argument passed to builtins.concatLists");
     auto listView = args[0]->listView();
     state.concatLists(
         v,
@@ -4171,8 +4162,7 @@ static RegisterPrimOp primop_concatLists({
 /* Return the length of a list.  This is an O(1) time operation. */
 static void prim_length(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.length");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[0]);
+    state.forceListObserved(*args[0], pos, "while evaluating the first argument passed to builtins.length");
     v.mkInt(args[0]->listSize());
 }
 
@@ -4190,8 +4180,7 @@ static RegisterPrimOp primop_length({
 static void prim_foldlStrict(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.foldlStrict");
-    state.forceList(*args[2], pos, "while evaluating the third argument passed to builtins.foldlStrict");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[2]);
+    state.forceListObserved(*args[2], pos, "while evaluating the third argument passed to builtins.foldlStrict");
 
     if (args[2]->listSize()) {
         Value * vCur = args[1];
@@ -4233,9 +4222,8 @@ static void anyOrAll(bool any, EvalState & state, const PosIdx pos, Value ** arg
 {
     state.forceFunction(
         *args[0], pos, std::string("while evaluating the first argument passed to builtins.") + (any ? "any" : "all"));
-    state.forceList(
+    state.forceListObserved(
         *args[1], pos, std::string("while evaluating the second argument passed to builtins.") + (any ? "any" : "all"));
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     std::string_view errorCtx = any ? "while evaluating the return value of the function passed to builtins.any"
                                     : "while evaluating the return value of the function passed to builtins.all";
@@ -4325,8 +4313,7 @@ static void prim_lessThan(EvalState & state, const PosIdx pos, Value ** args, Va
 
 static void prim_sort(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.sort");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.sort");
 
     auto len = args[1]->listSize();
     if (len == 0) {
@@ -4435,8 +4422,7 @@ static RegisterPrimOp primop_sort({
 static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.partition");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.partition");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.partition");
 
     auto len = args[1]->listSize();
 
@@ -4499,8 +4485,7 @@ static RegisterPrimOp primop_partition({
 static void prim_groupBy(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.groupBy");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.groupBy");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.groupBy");
 
     ValueVectorMap attrs;
 
@@ -4554,8 +4539,7 @@ static RegisterPrimOp primop_groupBy({
 static void prim_concatMap(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.concatMap");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.concatMap");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.concatMap");
     auto nrLists = args[1]->listSize();
 
     // List of returned lists before concatenation. References to these Values must NOT be persisted.
@@ -5267,11 +5251,10 @@ static void prim_concatStringsSep(EvalState & state, const PosIdx pos, Value ** 
         context,
         pos,
         "while evaluating the first argument (the separator string) passed to builtins.concatStringsSep");
-    state.forceList(
+    state.forceListObserved(
         *args[1],
         pos,
         "while evaluating the second argument (the list of strings to concat) passed to builtins.concatStringsSep");
-    if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*args[1]);
 
     std::string res;
     res.reserve((args[1]->listSize() + 32) * sep.size());
