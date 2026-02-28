@@ -3576,16 +3576,17 @@ static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args,
     for (const auto & [n, v2] : enumerate(listView)) {
         state.forceAttrs(*v2, pos, "while evaluating an element of the list passed to builtins.listToAttrs");
 
-        auto j = state.getAttr(state.s.name, v2->attrs(), "in a {name=...; value=...;} pair");
+        auto nameAttr = state.getAttr(state.s.name, v2->attrs(), "in a {name=...; value=...;} pair");
 
         auto name = state.forceStringNoCtx(
-            *j->value,
-            j->pos,
+            *nameAttr->value,
+            nameAttr->pos,
             "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs");
         auto sym = state.symbols.create(name);
 
         // (ab)use Attr to store a Value * * instead of a Value *, so that we can stabilize the sort using the Value * *
-        bindings[n] = Attr(sym, std::bit_cast<Value *>(&v2));
+        // Carry the name attr's PosIdx so TracedData provenance propagates to the result.
+        bindings[n] = Attr(sym, std::bit_cast<Value *>(&v2), nameAttr->pos);
     }
 
     std::sort(&bindings[0], &bindings[listSize], [](const Attr & a, const Attr & b) {
@@ -3605,7 +3606,11 @@ static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args,
 
         auto j = state.getAttr(state.s.value, v2->attrs(), "in a {name=...; value=...;} pair");
         prev = attr.name;
-        bindings.push_back({prev, j->value, j->pos});
+        // Propagate TracedData provenance from the name attr to the result.
+        // This enables shape dep recording (#keys, #has:key) on attrsets
+        // built via listToAttrs from TracedData sources.
+        auto resultPos = attr.pos.isTracedData() ? attr.pos : j->pos;
+        bindings.push_back({prev, j->value, resultPos});
     }
     // help GC and clear end of allocated array
     for (size_t n = bindings.size(); n < listSize; n++) {
