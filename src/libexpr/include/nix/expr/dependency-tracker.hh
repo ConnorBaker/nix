@@ -2,6 +2,7 @@
 ///@file
 
 #include "nix/expr/eval-trace-deps.hh"
+#include "nix/expr/symbol-table.hh"
 
 #include <sys/types.h>
 
@@ -343,8 +344,6 @@ void clearTracedContainerMap();
 std::string dirEntryTypeString(std::optional<SourceAccessor::Type> type);
 
 class PosTable;
-class SymbolTable;
-class Symbol;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Component interning — zero-allocation dep key construction
