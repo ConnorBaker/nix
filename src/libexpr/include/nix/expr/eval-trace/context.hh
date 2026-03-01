@@ -2,6 +2,7 @@
 ///@file
 
 #include "nix/expr/eval-trace/deps/types.hh"
+#include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/util/ref.hh"
 #include "nix/util/hash.hh"
 #include "nix/util/source-path.hh"
@@ -33,15 +34,10 @@ class TraceCache;
  * all three scopes: (1) process/thread pools, (2) per-root-tracker caches,
  * (3) per-EvalState context (this struct).
  */
-/// Forward declaration — full definition in recording.cc.
-struct InterningPools;
-
 struct EvalTraceContext {
     /// Interning pools for dep recording. Owned here so each EvalState
     /// gets its own pools, providing automatic test isolation.
-    /// Raw pointer with outlined constructor/destructor to avoid
-    /// requiring InterningPools to be complete in this header.
-    InterningPools * pools = nullptr;
+    std::unique_ptr<InterningPools> pools;
 
     EvalTraceContext();
     ~EvalTraceContext();

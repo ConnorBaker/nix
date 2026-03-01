@@ -1,5 +1,6 @@
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/attr-set.hh"
@@ -111,174 +112,6 @@ thread_local uint32_t DependencyTracker::depth = 0;
 // [Lifetime 1: process / thread]
 // ═══════════════════════════════════════════════════════════════════════
 
-struct StringPool16 {
-    std::vector<std::string> strings;
-    boost::unordered_flat_map<std::string, uint16_t> lookup;
-#ifndef NDEBUG
-    uint32_t generation = 0;
-#endif
-
-    uint16_t intern(std::string_view sv) {
-        std::string key(sv);
-        auto it = lookup.find(key);
-        if (it != lookup.end()) return it->second;
-        uint16_t id = static_cast<uint16_t>(strings.size());
-        strings.push_back(key);
-        lookup.emplace(std::move(key), id);
-        return id;
-    }
-
-    std::string_view resolve(uint16_t id) const {
-        assert(id < strings.size());
-        return strings[id];
-    }
-
-    void clear() {
-        strings.clear();
-        lookup.clear();
-#ifndef NDEBUG
-        generation++;
-#endif
-    }
-
-    // In production, pools grow monotonically (GC-heap thunks hold IDs).
-    // clear() is only called by resetEvalTracePools() for test isolation.
-};
-
-// DataPathPool: trie of path components. Process-lifetime (same reason as StringPool16).
-// Stores resolved strings directly (not Symbol IDs) so the pool is self-contained
-// and independent of any particular SymbolTable. This is critical because in test
-// environments, multiple EvalState instances (each with their own SymbolTable) may
-// exist within the same process, and Symbol IDs are only valid within their table.
-struct DataPathNode {
-    uint32_t parentId;      // 0 = root
-    std::string component;  // object key (resolved string, not Symbol)
-    int32_t arrayIndex;     // -1 if object key, >=0 if array index
-};
-
-struct DataPathPool {
-    std::vector<DataPathNode> nodes;
-    boost::unordered_flat_map<uint64_t, uint32_t> lookup;
-
-    DataPathPool() {
-        // Node 0 is the root sentinel (empty path)
-        nodes.push_back({0, "", -1});
-    }
-
-    uint32_t internChild(uint32_t parentId, std::string_view key) {
-        uint64_t h = hashValues(uint8_t(0), parentId, std::hash<std::string_view>{}(key));
-        auto [it, inserted] = lookup.try_emplace(h, 0);
-        if (!inserted) return it->second;
-        uint32_t id = static_cast<uint32_t>(nodes.size());
-        nodes.push_back({parentId, std::string(key), -1});
-        it->second = id;
-        return id;
-    }
-
-    uint32_t internArrayChild(uint32_t parentId, int32_t index) {
-        uint64_t h = hashValues(uint8_t(1), parentId, index);
-        auto [it, inserted] = lookup.try_emplace(h, 0);
-        if (!inserted) return it->second;
-        uint32_t id = static_cast<uint32_t>(nodes.size());
-        nodes.push_back({parentId, "", index});
-        it->second = id;
-        return id;
-    }
-
-    nlohmann::json toJsonArray(uint32_t nodeId) const {
-        nlohmann::json arr = nlohmann::json::array();
-        std::vector<uint32_t> path;
-        uint32_t cur = nodeId;
-        while (cur != 0) {
-            path.push_back(cur);
-            cur = nodes[cur].parentId;
-        }
-        std::reverse(path.begin(), path.end());
-        for (auto id : path) {
-            auto & node = nodes[id];
-            if (node.arrayIndex >= 0)
-                arr.push_back(node.arrayIndex);
-            else
-                arr.push_back(node.component);
-        }
-        return arr;
-    }
-
-#ifndef NDEBUG
-    uint32_t generation = 0;
-#endif
-
-    void clear() {
-        nodes.clear();
-        lookup.clear();
-        nodes.push_back({0, "", -1}); // re-add root sentinel
-#ifndef NDEBUG
-        generation++;
-#endif
-    }
-
-    // In production, pools grow monotonically. clear() is for test isolation.
-};
-
-// StringPool32: like StringPool16 but with uint32_t IDs for larger key spaces.
-struct StringPool32 {
-    std::vector<std::string> strings;
-    boost::unordered_flat_map<std::string, uint32_t> lookup;
-#ifndef NDEBUG
-    uint32_t generation = 0;
-#endif
-
-    uint32_t intern(std::string_view sv) {
-        std::string key(sv);
-        auto it = lookup.find(key);
-        if (it != lookup.end()) return it->second;
-        uint32_t id = static_cast<uint32_t>(strings.size());
-        strings.push_back(key);
-        lookup.emplace(std::move(key), id);
-        return id;
-    }
-
-    std::string_view resolve(uint32_t id) const {
-        assert(id < strings.size());
-        return strings[id];
-    }
-
-    void clear() {
-        strings.clear();
-        lookup.clear();
-#ifndef NDEBUG
-        generation++;
-#endif
-    }
-};
-
-// ═══════════════════════════════════════════════════════════════════════
-// InterningPools — owns all Lifetime 1 interning pools
-// ═══════════════════════════════════════════════════════════════════════
-//
-// In production (one EvalState per process), pools grow monotonically
-// for the process lifetime. In tests, resetEvalTracePools() destroys
-// and recreates the storage for isolation between EvalState instances.
-//
-// Accessed from free functions via `InterningPools::current` (thread_local
-// pointer), lazily initialized by ensurePools().
-
-struct InterningPools {
-    static thread_local InterningPools * current;
-
-    StringPool16 depSourcePool;
-    StringPool16 filePathPool;
-    DataPathPool dataPathPool;
-    // Dep key strings (file paths, JSON SC keys, env var names).
-    // uint32_t because unique dep keys can be numerous (one per unique
-    // StructuredContent JSON key).
-    StringPool32 depKeyPool;
-    // SymbolTable pointer for resolving hasKey Symbol in recordStructuredDep().
-    const SymbolTable * sessionSymbols = nullptr;
-    // Provenance records indexed by Pos::ProvenanceRef::id.
-    ProvenanceTable provenanceTable;
-};
-
 thread_local InterningPools * InterningPools::current = nullptr;
 
 static InterningPools & ensurePools()
@@ -298,7 +131,7 @@ void destroyInterningPools(InterningPools * p)
 {
     if (InterningPools::current == p)
         InterningPools::current = nullptr;
-    delete p;
+    // Note: does NOT delete p — the unique_ptr in EvalTraceContext owns it.
 }
 
 // Cached constant Blake3Hash values used in shape dep recording.
@@ -381,8 +214,19 @@ DataPathId internDataPathArrayChild(DataPathId parentId, int32_t index) {
 #endif
 }
 
+static nlohmann::json dataPathToJsonArray(const DataPathPool & pool, uint32_t nodeId) {
+    nlohmann::json arr = nlohmann::json::array();
+    for (auto & node : pool.collectPath(nodeId)) {
+        if (node.arrayIndex >= 0)
+            arr.push_back(node.arrayIndex);
+        else
+            arr.push_back(node.component);
+    }
+    return arr;
+}
+
 std::string dataPathToJsonString(DataPathId nodeId) {
-    return ensurePools().dataPathPool.toJsonArray(nodeId.value).dump();
+    return dataPathToJsonArray(ensurePools().dataPathPool, nodeId.value).dump();
 }
 
 DataPathId jsonStringToDataPathId(std::string_view jsonStr) {
@@ -605,7 +449,7 @@ void DependencyTracker::record(Dep dep)
     nlohmann::json key;
     key["f"] = std::string(p.filePathPool.resolve(c.filePathId.value));
     key["t"] = std::string(1, structuredFormatChar(c.format));
-    key["p"] = p.dataPathPool.toJsonArray(c.dataPathId.value);
+    key["p"] = dataPathToJsonArray(p.dataPathPool, c.dataPathId.value);
     if (c.hasKey)
         key["h"] = std::string((*p.sessionSymbols)[c.hasKey]);
     else if (c.suffix != ShapeSuffix::None)

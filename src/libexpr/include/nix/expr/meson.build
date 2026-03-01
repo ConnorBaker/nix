@@ -13,6 +13,7 @@ headers = [ config_pub_h ] + files(
   'counter.hh',
   'eval-trace/deps/types.hh',
   'eval-trace/deps/hash.hh',
+  'eval-trace/deps/interning-pools.hh',
   'eval-trace/deps/recording.hh',
   'eval-trace/context.hh',
   'eval-trace/cache/trace-cache.hh',

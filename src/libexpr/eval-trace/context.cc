@@ -6,13 +6,14 @@
 namespace nix {
 
 EvalTraceContext::EvalTraceContext()
-    : pools(createInterningPools().release())
+    : pools(createInterningPools())
 {
 }
 
 EvalTraceContext::~EvalTraceContext()
 {
-    destroyInterningPools(pools);
+    if (pools)
+        destroyInterningPools(pools.get());
 }
 
 namespace eval_trace {
