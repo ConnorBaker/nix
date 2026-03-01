@@ -185,14 +185,12 @@ TEST_F(TraceStoreTest, Phase3_MultipleStructGroups)
 
     // Structural hash group 2: A + B
     db.recordDeps("", string_t{"r2", {}},
-                  {makeEnvVarDep("NIX_P3M_A", "a"), makeEnvVarDep("NIX_P3M_B", "b")},
-                  true);
+                  {makeEnvVarDep("NIX_P3M_A", "a"), makeEnvVarDep("NIX_P3M_B", "b")}, true);
 
     // Structural hash group 3: A + B + C (latest, in attribute entry)
     db.recordDeps("", string_t{"r3", {}},
                   {makeEnvVarDep("NIX_P3M_A", "a"), makeEnvVarDep("NIX_P3M_B", "b"),
-                   makeEnvVarDep("NIX_P3M_C", "c")},
-                  true);
+                   makeEnvVarDep("NIX_P3M_C", "c")}, true);
 
     // Change C -> invalidates structural hash group 3
     setenv("NIX_P3M_C", "c_new", 1);
@@ -236,8 +234,7 @@ TEST_F(TraceStoreTest, Phase1_FallbackToPhase3)
     db.recordDeps("", string_t{"r1", {}},
                   {makeEnvVarDep("NIX_P1F_A", "a")}, true);
     db.recordDeps("", string_t{"r2", {}},
-                  {makeEnvVarDep("NIX_P1F_A", "a"), makeEnvVarDep("NIX_P1F_B", "b")},
-                  true);
+                  {makeEnvVarDep("NIX_P1F_A", "a"), makeEnvVarDep("NIX_P1F_B", "b")}, true);
 
     // Invalidate B
     setenv("NIX_P1F_B", "b_new", 1);
@@ -304,8 +301,7 @@ TEST_F(TraceStoreTest, Phase1_Then_Phase3_Cascade)
 
     // Trace with structural hash for deps A + B (latest, in attribute)
     db.recordDeps("child", string_t{"latest", {}},
-                  {makeEnvVarDep("NIX_CASCADE_A", "a"), makeEnvVarDep("NIX_CASCADE_B", "b")},
-                  false);
+                  {makeEnvVarDep("NIX_CASCADE_A", "a"), makeEnvVarDep("NIX_CASCADE_B", "b")}, false);
 
     // Invalidate B -> Phase 1 fails (trace hash A+B, B mismatches)
     // Phase 3 finds structural group with only A -> constructive recovery succeeds

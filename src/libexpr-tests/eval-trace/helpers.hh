@@ -338,7 +338,13 @@ public:
         // Reset process-lifetime pools so each test starts with a clean
         // eval trace state. In production these outlive EvalState, but in
         // tests multiple EvalState instances exist in the same process.
-        resetEvalTracePools();
+        auto & pools = *state.traceCtx->pools;
+        pools.depSourcePool.clear();
+        pools.filePathPool.clear();
+        pools.dataPathPool.clear();
+        pools.depKeyPool.clear();
+        pools.sessionSymbols = nullptr;
+        DependencyTracker::clearSessionTraces();
     }
 
 protected:
@@ -394,7 +400,7 @@ protected:
 
     TraceStore makeDb()
     {
-        return TraceStore(state.symbols, testContextHash);
+        return TraceStore(state.symbols, *state.traceCtx->pools, testContextHash);
     }
 };
 
@@ -429,14 +435,14 @@ class TraceStoreTest : public TraceStoreFixture
 class DepPrecisionTest : public TracedDataTest
 {
 protected:
-    static std::vector<Dep> resolveDeps(const std::vector<CompactDep> & compact)
+    static std::vector<Dep> resolveDeps(InterningPools & pools, const std::vector<CompactDep> & compact)
     {
         std::vector<Dep> result;
         result.reserve(compact.size());
         for (auto & c : compact) {
             result.push_back(Dep{
-                std::string(resolveDepSource(c.sourceId)),
-                std::string(resolveDepKey(c.keyId)),
+                std::string(pools.depSourcePool.resolve(c.sourceId)),
+                std::string(pools.depKeyPool.resolve(c.keyId)),
                 c.expectedHash,
                 c.type});
         }
@@ -445,11 +451,11 @@ protected:
 
     std::vector<Dep> evalAndCollectDeps(const std::string & nixExpr)
     {
-        DependencyTracker tracker;
+        DependencyTracker tracker(*state.traceCtx->pools);
         state.traceActiveDepth++;
         (void) eval(nixExpr, /* forceValue */ true);
         state.traceActiveDepth--;
-        return resolveDeps(tracker.collectTraces());
+        return resolveDeps(*state.traceCtx->pools, tracker.collectTraces());
     }
 
     /**
@@ -584,7 +590,7 @@ protected:
     {
         int64_t contextHash;
         std::memcpy(&contextHash, testFingerprint.hash, sizeof(contextHash));
-        return TraceStore(state.symbols, contextHash);
+        return TraceStore(state.symbols, *state.traceCtx->pools, contextHash);
     }
 
     std::vector<Dep> getStoredDeps(const std::string & attrPath)

@@ -16,23 +16,23 @@ TEST_F(TraceStoreTest, DifferentContextHash_Isolated)
     // Two different context hashes should have isolated trace namespaces
 
     {
-        TraceStore db1(state.symbols, 111);
+        TraceStore db1(state.symbols, *state.traceCtx->pools, 111);
         db1.recordDeps("pkg", string_t{"v1", {}}, {}, false);
     }
     {
-        TraceStore db2(state.symbols, 222);
+        TraceStore db2(state.symbols, *state.traceCtx->pools, 222);
         db2.recordDeps("pkg", string_t{"v2", {}}, {}, false);
     }
 
     {
-        TraceStore db1(state.symbols, 111);
+        TraceStore db1(state.symbols, *state.traceCtx->pools, 111);
         auto r1 = db1.verify("pkg", {}, state);
         ASSERT_TRUE(r1.has_value());
         ASSERT_TRUE(std::holds_alternative<string_t>(r1->value));
         EXPECT_EQ(std::get<string_t>(r1->value).first, "v1");
     }
     {
-        TraceStore db2(state.symbols, 222);
+        TraceStore db2(state.symbols, *state.traceCtx->pools, 222);
         auto r2 = db2.verify("pkg", {}, state);
         ASSERT_TRUE(r2.has_value());
         ASSERT_TRUE(std::holds_alternative<string_t>(r2->value));

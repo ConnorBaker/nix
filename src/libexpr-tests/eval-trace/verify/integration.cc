@@ -19,7 +19,7 @@ protected:
 
     TraceStore makeDbBackend()
     {
-        return TraceStore(state.symbols, testCtx);
+        return TraceStore(state.symbols, *state.traceCtx->pools, testCtx);
     }
 };
 
@@ -43,25 +43,25 @@ TEST_F(TraceCacheIntegrationTest, MultipleContextHashes_Isolated)
 {
     // Use separate TraceStore instances with different context hashes (BSàlC: isolated trace stores)
     {
-        TraceStore db1(state.symbols, 111);
+        TraceStore db1(state.symbols, *state.traceCtx->pools, 111);
         db1.recordDeps("", string_t{"value-1", {}}, {}, true);
     }
 
     {
-        TraceStore db2(state.symbols, 222);
+        TraceStore db2(state.symbols, *state.traceCtx->pools, 222);
         db2.recordDeps("", string_t{"value-2", {}}, {}, true);
     }
 
     // Verify isolation: each context hash sees its own trace result
     {
-        TraceStore db1(state.symbols, 111);
+        TraceStore db1(state.symbols, *state.traceCtx->pools, 111);
         auto r1 = db1.verify("", {}, state);
         ASSERT_TRUE(r1.has_value());
         ASSERT_TRUE(std::holds_alternative<string_t>(r1->value));
         EXPECT_EQ(std::get<string_t>(r1->value).first, "value-1");
     }
     {
-        TraceStore db2(state.symbols, 222);
+        TraceStore db2(state.symbols, *state.traceCtx->pools, 222);
         auto r2 = db2.verify("", {}, state);
         ASSERT_TRUE(r2.has_value());
         ASSERT_TRUE(std::holds_alternative<string_t>(r2->value));

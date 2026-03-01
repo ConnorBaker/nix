@@ -11,12 +11,12 @@ namespace nix::eval_trace {
 using namespace nix::eval_trace::test;
 
 /// Extract dep keys from a dep vector for exact-match assertions.
-static std::vector<std::string> keys(const std::vector<CompactDep> & deps)
+static std::vector<std::string> keys(InterningPools & pools, const std::vector<CompactDep> & deps)
 {
     std::vector<std::string> out;
     out.reserve(deps.size());
     for (auto & d : deps)
-        out.push_back(std::string(resolveDepKey(d.keyId)));
+        out.push_back(std::string(pools.depKeyPool.resolve(d.keyId)));
     return out;
 }
 
@@ -34,25 +34,25 @@ protected:
 
 TEST_F(ReplayPollutionTest, ReplayedDeps_DoNotPolluteParentDedupSet)
 {
-    DependencyTracker parent;
+    DependencyTracker parent(pools);
 
     // Parent records dep A
-    DependencyTracker::record(makeContentDep("/a.nix", "a"));
+    DependencyTracker::record(pools,makeContentDep("/a.nix", "a"));
 
     // Simulate child TracedExpr cache-hit replay:
     // record child's deps (including /shared.nix) into excluded range
     uint32_t childStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::recordReplay(makeContentDep("/shared.nix", "v1"));
-    DependencyTracker::recordReplay(makeContentDep("/child-only.nix", "c"));
+    DependencyTracker::recordReplay(pools,makeContentDep("/shared.nix", "v1"));
+    DependencyTracker::recordReplay(pools,makeContentDep("/child-only.nix", "c"));
     uint32_t childEnd = DependencyTracker::sessionTraces.size();
     parent.excludeChildRange(childStart, childEnd);
 
     // Parent independently records /shared.nix — MUST NOT be deduped
-    DependencyTracker::record(makeContentDep("/shared.nix", "v1"));
-    DependencyTracker::record(makeContentDep("/b.nix", "b"));
+    DependencyTracker::record(pools,makeContentDep("/shared.nix", "v1"));
+    DependencyTracker::record(pools,makeContentDep("/b.nix", "b"));
 
     auto deps = parent.collectTraces();
-    auto k = keys(deps);
+    auto k = keys(pools, deps);
     // Parent's trace must contain /a.nix, /shared.nix, /b.nix
     EXPECT_EQ(k, (std::vector<std::string>{"/a.nix", "/shared.nix", "/b.nix"}));
 }
@@ -63,22 +63,22 @@ TEST_F(ReplayPollutionTest, ReplayedDeps_DoNotPolluteParentDedupSet)
 
 TEST_F(ReplayPollutionTest, RecordPollutesParentDedupSet_Demonstration)
 {
-    DependencyTracker parent;
-    DependencyTracker::record(makeContentDep("/a.nix", "a"));
+    DependencyTracker parent(pools);
+    DependencyTracker::record(pools,makeContentDep("/a.nix", "a"));
 
     // Simulate child replay using record() (the old buggy path)
     uint32_t childStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(makeContentDep("/shared.nix", "v1"));
+    DependencyTracker::record(pools,makeContentDep("/shared.nix", "v1"));
     uint32_t childEnd = DependencyTracker::sessionTraces.size();
     parent.excludeChildRange(childStart, childEnd);
 
     // Parent tries to record /shared.nix — dedup drops it!
-    DependencyTracker::record(makeContentDep("/shared.nix", "v1"));
+    DependencyTracker::record(pools,makeContentDep("/shared.nix", "v1"));
 
     auto deps = parent.collectTraces();
     // BUG: /shared.nix is missing because record() deduped against recordedKeys
     // which was polluted by the child's replay
-    EXPECT_EQ(keys(deps), (std::vector<std::string>{"/a.nix"}));
+    EXPECT_EQ(keys(pools, deps), (std::vector<std::string>{"/a.nix"}));
     // This test documents the bug; it would need updating if we
     // change record() semantics (but we're adding recordReplay instead).
 }
@@ -89,12 +89,12 @@ TEST_F(ReplayPollutionTest, RecordPollutesParentDedupSet_Demonstration)
 
 TEST_F(ReplayPollutionTest, RecordReplay_AppendsToSessionTraces)
 {
-    DependencyTracker tracker;
+    DependencyTracker tracker(pools);
     uint32_t before = DependencyTracker::sessionTraces.size();
-    DependencyTracker::recordReplay(makeContentDep("/x.nix", "x"));
+    DependencyTracker::recordReplay(pools,makeContentDep("/x.nix", "x"));
     uint32_t after = DependencyTracker::sessionTraces.size();
     EXPECT_EQ(after, before + 1);
-    EXPECT_EQ(resolveDepKey(DependencyTracker::sessionTraces.back().keyId), "/x.nix");
+    EXPECT_EQ(pools.depKeyPool.resolve(DependencyTracker::sessionTraces.back().keyId), "/x.nix");
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -103,9 +103,9 @@ TEST_F(ReplayPollutionTest, RecordReplay_AppendsToSessionTraces)
 
 TEST_F(ReplayPollutionTest, RecordReplay_NoDedup)
 {
-    DependencyTracker tracker;
-    DependencyTracker::recordReplay(makeContentDep("/x.nix", "v1"));
-    DependencyTracker::recordReplay(makeContentDep("/x.nix", "v1")); // same dep
+    DependencyTracker tracker(pools);
+    DependencyTracker::recordReplay(pools,makeContentDep("/x.nix", "v1"));
+    DependencyTracker::recordReplay(pools,makeContentDep("/x.nix", "v1")); // same dep
     // Both appended (no dedup for replay)
     auto deps = tracker.collectTraces();
     EXPECT_EQ(deps.size(), 2u);
@@ -117,22 +117,22 @@ TEST_F(ReplayPollutionTest, RecordReplay_NoDedup)
 
 TEST_F(ReplayPollutionTest, EpochAfterReplay_ParentDepsIntact)
 {
-    DependencyTracker parent;
+    DependencyTracker parent(pools);
 
     // Parent records before child
-    DependencyTracker::record(makeContentDep("/before.nix", "b"));
+    DependencyTracker::record(pools,makeContentDep("/before.nix", "b"));
 
     // Child cache-hit replay (excluded range)
     uint32_t cs = DependencyTracker::sessionTraces.size();
-    DependencyTracker::recordReplay(makeContentDep("/child.nix", "c"));
+    DependencyTracker::recordReplay(pools,makeContentDep("/child.nix", "c"));
     uint32_t ce = DependencyTracker::sessionTraces.size();
     parent.excludeChildRange(cs, ce);
 
     // Parent records after child
-    DependencyTracker::record(makeContentDep("/after.nix", "a"));
+    DependencyTracker::record(pools,makeContentDep("/after.nix", "a"));
 
     auto deps = parent.collectTraces();
-    EXPECT_EQ(keys(deps), (std::vector<std::string>{"/before.nix", "/after.nix"}));
+    EXPECT_EQ(keys(pools, deps), (std::vector<std::string>{"/before.nix", "/after.nix"}));
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -141,29 +141,29 @@ TEST_F(ReplayPollutionTest, EpochAfterReplay_ParentDepsIntact)
 
 TEST_F(ReplayPollutionTest, MultipleChildren_SharedDep_ParentTraceComplete)
 {
-    DependencyTracker parent;
-    DependencyTracker::record(makeContentDep("/parent.nix", "p"));
+    DependencyTracker parent(pools);
+    DependencyTracker::record(pools,makeContentDep("/parent.nix", "p"));
 
     // Child A cache-hit replay (shares /lib.nix with parent)
     uint32_t c1s = DependencyTracker::sessionTraces.size();
-    DependencyTracker::recordReplay(makeContentDep("/lib.nix", "lib"));
-    DependencyTracker::recordReplay(makeContentDep("/a.nix", "a"));
+    DependencyTracker::recordReplay(pools,makeContentDep("/lib.nix", "lib"));
+    DependencyTracker::recordReplay(pools,makeContentDep("/a.nix", "a"));
     uint32_t c1e = DependencyTracker::sessionTraces.size();
     parent.excludeChildRange(c1s, c1e);
 
     // Child B cache-hit replay (also uses /lib.nix)
     uint32_t c2s = DependencyTracker::sessionTraces.size();
-    DependencyTracker::recordReplay(makeContentDep("/lib.nix", "lib"));
-    DependencyTracker::recordReplay(makeContentDep("/b.nix", "b"));
+    DependencyTracker::recordReplay(pools,makeContentDep("/lib.nix", "lib"));
+    DependencyTracker::recordReplay(pools,makeContentDep("/b.nix", "b"));
     uint32_t c2e = DependencyTracker::sessionTraces.size();
     parent.excludeChildRange(c2s, c2e);
 
     // Parent independently reads /lib.nix — must succeed
-    DependencyTracker::record(makeContentDep("/lib.nix", "lib"));
-    DependencyTracker::record(makeContentDep("/parent2.nix", "p2"));
+    DependencyTracker::record(pools,makeContentDep("/lib.nix", "lib"));
+    DependencyTracker::record(pools,makeContentDep("/parent2.nix", "p2"));
 
     auto deps = parent.collectTraces();
-    EXPECT_EQ(keys(deps),
+    EXPECT_EQ(keys(pools, deps),
         (std::vector<std::string>{"/parent.nix", "/lib.nix", "/parent2.nix"}));
 }
 

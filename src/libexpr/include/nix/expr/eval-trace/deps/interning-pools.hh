@@ -15,26 +15,41 @@
 
 namespace nix {
 
-struct StringPool16 {
+template <typename Id>
+struct StringPool {
+    using Repr = decltype(Id::value);
     std::vector<std::string> strings;
-    boost::unordered_flat_map<std::string, uint16_t> lookup;
+    boost::unordered_flat_map<std::string, Repr> lookup;
 #ifndef NDEBUG
     uint32_t generation = 0;
 #endif
 
-    uint16_t intern(std::string_view sv) {
+    Id intern(std::string_view sv) {
         std::string key(sv);
         auto it = lookup.find(key);
-        if (it != lookup.end()) return it->second;
-        uint16_t id = static_cast<uint16_t>(strings.size());
+        if (it != lookup.end()) {
+#ifndef NDEBUG
+            return Id(it->second, generation);
+#else
+            return Id(it->second);
+#endif
+        }
+        Repr id = static_cast<Repr>(strings.size());
         strings.push_back(key);
         lookup.emplace(std::move(key), id);
-        return id;
+#ifndef NDEBUG
+        return Id(id, generation);
+#else
+        return Id(id);
+#endif
     }
 
-    std::string_view resolve(uint16_t id) const {
-        assert(id < strings.size());
-        return strings[id];
+    std::string_view resolve(Id id) const {
+#ifndef NDEBUG
+        assert(id.generation == generation && "StrongId used after pool clear");
+#endif
+        assert(id.value < strings.size());
+        return strings[id.value];
     }
 
     void clear() {
@@ -55,37 +70,76 @@ struct DataPathNode {
 struct DataPathPool {
     std::vector<DataPathNode> nodes;
     boost::unordered_flat_map<uint64_t, uint32_t> lookup;
+#ifndef NDEBUG
+    uint32_t generation = 0;
+#endif
 
     DataPathPool() {
         nodes.push_back({0, "", -1}); // root sentinel
     }
 
-    uint32_t internChild(uint32_t parentId, std::string_view key) {
-        uint64_t h = hashValues(uint8_t(0), parentId, std::hash<std::string_view>{}(key));
-        auto [it, inserted] = lookup.try_emplace(h, 0);
-        if (!inserted) return it->second;
-        uint32_t id = static_cast<uint32_t>(nodes.size());
-        nodes.push_back({parentId, std::string(key), -1});
-        it->second = id;
-        return id;
+    /// Return the root sentinel DataPathId (node 0) with correct generation.
+    DataPathId root() const {
+#ifndef NDEBUG
+        return DataPathId(0, generation);
+#else
+        return DataPathId(0);
+#endif
     }
 
-    uint32_t internArrayChild(uint32_t parentId, int32_t index) {
-        uint64_t h = hashValues(uint8_t(1), parentId, index);
+    DataPathId internChild(DataPathId parentId, std::string_view key) {
+#ifndef NDEBUG
+        assert(parentId.generation == generation && "DataPathId used after pool clear");
+#endif
+        uint64_t h = hashValues(uint8_t(0), parentId.value, std::hash<std::string_view>{}(key));
         auto [it, inserted] = lookup.try_emplace(h, 0);
-        if (!inserted) return it->second;
+        if (!inserted) {
+#ifndef NDEBUG
+            return DataPathId(it->second, generation);
+#else
+            return DataPathId(it->second);
+#endif
+        }
         uint32_t id = static_cast<uint32_t>(nodes.size());
-        nodes.push_back({parentId, "", index});
+        nodes.push_back({parentId.value, std::string(key), -1});
         it->second = id;
-        return id;
+#ifndef NDEBUG
+        return DataPathId(id, generation);
+#else
+        return DataPathId(id);
+#endif
     }
 
-    /// Build path components from a trie node. Returns the sequence of
-    /// (component, arrayIndex) pairs from root to the given node.
-    /// The JSON serialization is done by dataPathToJsonString() in recording.cc.
-    std::vector<DataPathNode> collectPath(uint32_t nodeId) const {
+    DataPathId internArrayChild(DataPathId parentId, int32_t index) {
+#ifndef NDEBUG
+        assert(parentId.generation == generation && "DataPathId used after pool clear");
+#endif
+        uint64_t h = hashValues(uint8_t(1), parentId.value, index);
+        auto [it, inserted] = lookup.try_emplace(h, 0);
+        if (!inserted) {
+#ifndef NDEBUG
+            return DataPathId(it->second, generation);
+#else
+            return DataPathId(it->second);
+#endif
+        }
+        uint32_t id = static_cast<uint32_t>(nodes.size());
+        nodes.push_back({parentId.value, "", index});
+        it->second = id;
+#ifndef NDEBUG
+        return DataPathId(id, generation);
+#else
+        return DataPathId(id);
+#endif
+    }
+
+    /// Build path components from a trie node.
+    std::vector<DataPathNode> collectPath(DataPathId nodeId) const {
+#ifndef NDEBUG
+        assert(nodeId.generation == generation && "DataPathId used after pool clear");
+#endif
         std::vector<DataPathNode> path;
-        uint32_t cur = nodeId;
+        uint32_t cur = nodeId.value;
         while (cur != 0) {
             path.push_back(nodes[cur]);
             cur = nodes[cur].parentId;
@@ -93,10 +147,6 @@ struct DataPathPool {
         std::reverse(path.begin(), path.end());
         return path;
     }
-
-#ifndef NDEBUG
-    uint32_t generation = 0;
-#endif
 
     void clear() {
         nodes.clear();
@@ -108,55 +158,21 @@ struct DataPathPool {
     }
 };
 
-struct StringPool32 {
-    std::vector<std::string> strings;
-    boost::unordered_flat_map<std::string, uint32_t> lookup;
-#ifndef NDEBUG
-    uint32_t generation = 0;
-#endif
-
-    uint32_t intern(std::string_view sv) {
-        std::string key(sv);
-        auto it = lookup.find(key);
-        if (it != lookup.end()) return it->second;
-        uint32_t id = static_cast<uint32_t>(strings.size());
-        strings.push_back(key);
-        lookup.emplace(std::move(key), id);
-        return id;
-    }
-
-    std::string_view resolve(uint32_t id) const {
-        assert(id < strings.size());
-        return strings[id];
-    }
-
-    void clear() {
-        strings.clear();
-        lookup.clear();
-#ifndef NDEBUG
-        generation++;
-#endif
-    }
-};
-
 /**
  * Owns all Lifetime 1 interning pools for eval-trace dep recording.
  * Owned by EvalTraceContext (one per EvalState), providing automatic
- * test isolation. Accessed from free functions via the thread_local
- * `current` pointer.
+ * test isolation.
  */
 struct InterningPools {
-    static thread_local InterningPools * current;
-
-    InterningPools() { current = this; }
-    ~InterningPools() { if (current == this) current = nullptr; }
+    InterningPools() = default;
+    ~InterningPools() = default;
     InterningPools(const InterningPools &) = delete;
     InterningPools & operator=(const InterningPools &) = delete;
 
-    StringPool16 depSourcePool;
-    StringPool16 filePathPool;
+    StringPool<DepSourceId> depSourcePool;
+    StringPool<FilePathId> filePathPool;
     DataPathPool dataPathPool;
-    StringPool32 depKeyPool;
+    StringPool<DepKeyId> depKeyPool;
     const SymbolTable * sessionSymbols = nullptr;
     ProvenanceTable provenanceTable;
 };

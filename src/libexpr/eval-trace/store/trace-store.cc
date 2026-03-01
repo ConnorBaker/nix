@@ -1,4 +1,5 @@
 #include "nix/expr/eval-trace/store/trace-store.hh"
+#include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/expr/eval-trace/deps/hash.hh"
@@ -608,8 +609,8 @@ std::vector<TraceStore::InternedDep> TraceStore::internDeps(const std::vector<Co
     for (auto & dep : deps) {
         interned.push_back({
             dep.type,
-            doInternString(resolveDepSource(dep.sourceId)),
-            doInternString(resolveDepKey(dep.keyId)),
+            doInternString(pools.depSourcePool.resolve(dep.sourceId)),
+            doInternString(pools.depKeyPool.resolve(dep.keyId)),
             dep.expectedHash
         });
     }
@@ -721,8 +722,9 @@ static const char * schema = R"sql(
 
 // ── Constructor / Destructor ─────────────────────────────────────────
 
-TraceStore::TraceStore(SymbolTable & symbols, int64_t contextHash)
+TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, int64_t contextHash)
     : symbols(symbols)
+    , pools(pools)
     , contextHash(contextHash)
 {
     auto initStart = timerStart();
@@ -2026,14 +2028,14 @@ TraceStore::RecordResult TraceStore::recordDeps(
     const std::vector<Dep> & allDeps,
     bool isRoot)
 {
-    // Convert Dep objects to CompactDep by interning strings into thread-local pools.
+    // Convert Dep objects to CompactDep by interning strings into pools.
     std::vector<CompactDep> compact;
     compact.reserve(allDeps.size());
     for (auto & dep : allDeps) {
         compact.push_back(CompactDep{
             dep.type,
-            internDepSource(dep.source),
-            internDepKey(dep.key),
+            pools.depSourcePool.intern(dep.source),
+            pools.depKeyPool.intern(dep.key),
             dep.expectedHash});
     }
     return record(attrPath, value, compact, isRoot);

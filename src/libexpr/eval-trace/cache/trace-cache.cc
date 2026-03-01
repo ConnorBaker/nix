@@ -326,19 +326,19 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
                 if (!origin) continue;
                 auto * pr = std::get_if<Pos::ProvenanceRef>(origin);
                 if (!pr) continue;
-                auto * df = resolveProvenanceRef(*pr);
-                if (!df) continue;
+                auto & pools = *st.traceCtx->pools;
+                auto & df = resolveProvenanceRef(pools, *pr);
                 // Resolve interned IDs to strings for storage
-                auto depSource = std::string(resolveDepSource(df->sourceId));
-                auto depKey = std::string(resolveFilePath(df->filePathId));
-                auto dataPath = dataPathToJsonString(df->dataPathId);
+                auto depSource = std::string(pools.depSourcePool.resolve(df.sourceId));
+                auto depKey = std::string(pools.filePathPool.resolve(df.filePathId));
+                auto dataPath = dataPathToJsonString(pools, df.dataPathId);
                 // Deduplicate origins by resolved values
                 int8_t idx = -1;
                 for (size_t j = 0; j < result.origins.size(); j++) {
                     if (result.origins[j].depSource == depSource
                         && result.origins[j].depKey == depKey
                         && result.origins[j].dataPath == dataPath
-                        && result.origins[j].format == df->format) {
+                        && result.origins[j].format == df.format) {
                         idx = static_cast<int8_t>(j);
                         break;
                     }
@@ -346,7 +346,7 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
                 if (idx < 0) {
                     idx = static_cast<int8_t>(result.origins.size());
                     result.origins.push_back({std::move(depSource), std::move(depKey),
-                                              std::move(dataPath), df->format});
+                                              std::move(dataPath), df.format});
                 }
                 result.originIndices[i] = idx;
             }
@@ -384,18 +384,19 @@ void TracedExpr::materializeOrigExprAttrs(
         uint32_t attrCount = 0;
     };
     std::vector<PerOrigin> originHandles;
+    auto & pools = *st.traceCtx->pools;
     if (!attrs.origins.empty()) {
-        initSessionSymbols(st.symbols);
+        pools.sessionSymbols = &st.symbols;
         originHandles.reserve(attrs.origins.size());
         std::vector<uint32_t> counts(attrs.origins.size(), 0);
         for (auto idx : attrs.originIndices)
             if (idx >= 0) counts[idx]++;
         for (auto & orig : attrs.origins) {
-            auto srcId = internDepSource(orig.depSource);
-            auto fpId = internFilePath(orig.depKey);
-            auto dpId = jsonStringToDataPathId(orig.dataPath);
+            auto srcId = pools.depSourcePool.intern(orig.depSource);
+            auto fpId = pools.filePathPool.intern(orig.depKey);
+            auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
             auto handle = st.positions.addOriginHandle(
-                allocateProvenanceRef(srcId, fpId, dpId, orig.format),
+                allocateProvenanceRef(pools, srcId, fpId, dpId, orig.format),
                 counts[&orig - attrs.origins.data()]);
             originHandles.push_back({handle, 0});
         }
@@ -439,9 +440,9 @@ void TracedExpr::materializeOrigExprAttrs(
                 canonical += keys[i];
             }
             auto keysHash = depHash(canonical);
-            auto srcId = internDepSource(orig.depSource);
-            auto fpId = internFilePath(orig.depKey);
-            auto dpId = jsonStringToDataPathId(orig.dataPath);
+            auto srcId = pools.depSourcePool.intern(orig.depSource);
+            auto fpId = pools.filePathPool.intern(orig.depKey);
+            auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
             auto originOffset = originHandles[oidx].handle.offset;
             registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
                 keysHash,
@@ -459,9 +460,10 @@ void TracedExpr::replayTrace(TraceId traceId)
         return;
 
     try {
+        auto & pools = *cache->state.traceCtx->pools;
         auto deps = cache->dbBackend->loadFullTrace(traceId);
         for (auto & dep : deps)
-            DependencyTracker::recordReplay(dep);
+            DependencyTracker::recordReplay(pools, dep);
     } catch (std::exception &) {
         // DB may be corrupt or trace may have been evicted — skip
     }
@@ -548,18 +550,19 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
             uint32_t attrCount = 0;
         };
         std::vector<PerOrigin> originHandles;
+        auto & pools = *st.traceCtx->pools;
         if (!attrs->origins.empty()) {
-            initSessionSymbols(st.symbols);
+            pools.sessionSymbols = &st.symbols;
             originHandles.reserve(attrs->origins.size());
             std::vector<uint32_t> counts(attrs->origins.size(), 0);
             for (auto idx : attrs->originIndices)
                 if (idx >= 0) counts[idx]++;
             for (auto & orig : attrs->origins) {
-                auto srcId = internDepSource(orig.depSource);
-                auto fpId = internFilePath(orig.depKey);
-                auto dpId = jsonStringToDataPathId(orig.dataPath);
+                auto srcId = pools.depSourcePool.intern(orig.depSource);
+                auto fpId = pools.filePathPool.intern(orig.depKey);
+                auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
                 auto handle = st.positions.addOriginHandle(
-                    allocateProvenanceRef(srcId, fpId, dpId, orig.format),
+                    allocateProvenanceRef(pools, srcId, fpId, dpId, orig.format),
                     counts[&orig - attrs->origins.data()]);
                 originHandles.push_back({handle, 0});
             }
@@ -600,9 +603,9 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
                     canonical += keys[i];
                 }
                 auto keysHash = depHash(canonical);
-                auto srcId = internDepSource(orig.depSource);
-                auto fpId = internFilePath(orig.depKey);
-                auto dpId = jsonStringToDataPathId(orig.dataPath);
+                auto srcId = pools.depSourcePool.intern(orig.depSource);
+                auto fpId = pools.filePathPool.intern(orig.depKey);
+                auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
                 auto originOffset = originHandles[oidx].handle.offset;
                 registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
                     keysHash,
@@ -655,7 +658,8 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
 // Fresh evaluation (Adapton demand-driven recomputation)
 void TracedExpr::evaluateFresh(Value & v)
 {
-    DependencyTracker tracker;
+    auto & pools = *cache->state.traceCtx->pools;
+    DependencyTracker tracker(pools);
     cache->state.traceActiveDepth++;
     Finally decrementDepth{[&]{ cache->state.traceActiveDepth--; }};
 
@@ -679,7 +683,7 @@ void TracedExpr::evaluateFresh(Value & v)
                 auto depKey = path;
                 std::replace(depKey.begin(), depKey.end(), '\0', '\t');
                 deps.push_back(CompactDep{
-                    DepType::ParentContext, internDepSource(""), internDepKey(depKey), DepHashValue(b3)});
+                    DepType::ParentContext, pools.depSourcePool.intern(""), pools.depKeyPool.intern(depKey), DepHashValue(b3)});
             }
         } else {
             // Zero sibling accesses: fallback to whole-parent dep
@@ -692,7 +696,7 @@ void TracedExpr::evaluateFresh(Value & v)
                 auto depKey = parentPath;
                 std::replace(depKey.begin(), depKey.end(), '\0', '\t');
                 deps.push_back(CompactDep{
-                    DepType::ParentContext, internDepSource(""), internDepKey(depKey), DepHashValue(b3)});
+                    DepType::ParentContext, pools.depSourcePool.intern(""), pools.depKeyPool.intern(depKey), DepHashValue(b3)});
             }
         }
     };
@@ -1144,11 +1148,11 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
 // ── TraceCache public API ─────────────────────────────────────────────
 
 static std::shared_ptr<TraceStore> makeDbBackend(
-    const Hash & fingerprint, SymbolTable & symbols)
+    const Hash & fingerprint, SymbolTable & symbols, InterningPools & pools)
 {
     int64_t contextHash;
     std::memcpy(&contextHash, fingerprint.hash, sizeof(contextHash));
-    return std::make_shared<TraceStore>(symbols, contextHash);
+    return std::make_shared<TraceStore>(symbols, pools, contextHash);
 }
 
 TraceCache::TraceCache(
@@ -1162,7 +1166,7 @@ TraceCache::TraceCache(
 {
     if (useCache) {
         try {
-            dbBackend = makeDbBackend(*useCache, state.symbols);
+            dbBackend = makeDbBackend(*useCache, state.symbols, *state.traceCtx->pools);
         } catch (...) {
             ignoreExceptionExceptInterrupt();
         }

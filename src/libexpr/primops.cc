@@ -515,7 +515,7 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
     // Record Exec oracle dep for the eval trace (Shake-style: always dirty
     // since we cannot safely re-execute the program during verification).
     if (state.traceActiveDepth) [[unlikely]] {
-        DependencyTracker::record({"<exec>", program, depHash(program + "\0" + output), DepType::Exec});
+        DependencyTracker::record(*state.traceCtx->pools,{"<exec>", program, depHash(program + "\0" + output), DepType::Exec});
     }
 
     Expr * parsed;
@@ -1234,7 +1234,7 @@ static void prim_getEnv(EvalState & state, const PosIdx pos, Value ** args, Valu
     // Record EnvVar oracle dep for the eval trace (Shake-style external dependency)
     if (state.traceActiveDepth && !state.settings.pureEval && !state.settings.restrictEval) {
         auto hash = depHash(value);
-        DependencyTracker::record({"", name, hash, DepType::EnvVar});
+        DependencyTracker::record(*state.traceCtx->pools,{"", name, hash, DepType::EnvVar});
     }
 }
 
@@ -2023,7 +2023,7 @@ static void prim_pathExists(EvalState & state, const PosIdx pos, Value ** args, 
             DepHashValue hashValue = st
                 ? DepHashValue(fmt("type:%d", static_cast<int>(st->type)))
                 : DepHashValue(std::string("missing"));
-            recordDep(path.path, hashValue, DepType::Existence, state.getMountToInput());
+            recordDep(*state.traceCtx->pools,path.path, hashValue, DepType::Existence, state.getMountToInput());
         }
 
         v.mkBool(exists);
@@ -2141,7 +2141,7 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
     std::optional<Blake3Hash> contentHash;
     if (state.traceActiveDepth) [[unlikely]] {
         auto hash = depHash(s);
-        recordDep(path.path, hash, DepType::Content, state.getMountToInput());
+        recordDep(*state.traceCtx->pools,path.path, hash, DepType::Content, state.getMountToInput());
         // Set provenance so a subsequent fromJSON/fromTOML can produce lazy
         // structural deps instead of relying solely on the whole-file Content dep.
         addReadFileProvenance({path.path, hash});
@@ -2393,7 +2393,7 @@ static void prim_hashFile(EvalState & state, const PosIdx pos, Value ** args, Va
     // Record Content oracle dep for trace verification (Adapton DDG edge)
     if (state.traceActiveDepth) [[unlikely]] {
         auto hash = depHash(content);
-        recordDep(path.path, hash, DepType::Content, state.getMountToInput());
+        recordDep(*state.traceCtx->pools,path.path, hash, DepType::Content, state.getMountToInput());
     }
 
     v.mkString(hashString(*ha, content).to_string(HashFormat::Base16, false), state.mem);
@@ -2451,7 +2451,7 @@ static void prim_readFileType(EvalState & state, const PosIdx pos, Value ** args
 
     // Record Existence oracle dep (with file type) for trace verification
     if (state.traceActiveDepth) [[unlikely]] {
-        recordDep(path.path, DepHashValue(fmt("type:%d", static_cast<int>(st.type))),
+        recordDep(*state.traceCtx->pools,path.path, DepHashValue(fmt("type:%d", static_cast<int>(st.type))),
             DepType::Existence, state.getMountToInput());
     }
 
@@ -2561,14 +2561,15 @@ struct DirDataNode : TracedDataNode {
 static bool recordReadDirDep(EvalState & state, const SourcePath & path,
                              SourceAccessor::DirEntries & entries, Value & v)
 {
-    recordDep(path.path, depHashDirListing(entries), DepType::Directory, state.getMountToInput());
+    auto & pools = *state.traceCtx->pools;
+    recordDep(*state.traceCtx->pools,path.path, depHashDirListing(entries), DepType::Directory, state.getMountToInput());
     if (!std::all_of(entries.begin(), entries.end(), [](auto & e) { return e.second.has_value(); }))
         return false;
     auto [depSource, depKey] = resolveProvenance(path.path, state.getMountToInput());
-    auto srcId = internDepSource(depSource);
-    auto fpId = internFilePath(depKey);
+    auto srcId = pools.depSourcePool.intern(depSource);
+    auto fpId = pools.filePathPool.intern(depKey);
     auto * rootNode = new DirDataNode(std::move(entries));
-    auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, DataPathId{});
+    auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, pools.dataPathPool.root());
     rootExpr->eval(state, state.baseEnv, v);
     return true;
 }
@@ -3090,10 +3091,10 @@ static void addPath(
                 if (include && recordFilterDeps) {
                     auto st = sp.lstat();
                     if (st.type == SourceAccessor::tRegular) {
-                        recordDep(sp.path, depHashPath(sp), DepType::NARContent,
+                        recordDep(*state.traceCtx->pools,sp.path, depHashPath(sp), DepType::NARContent,
                                   state.getMountToInput());
                     } else if (st.type == SourceAccessor::tDirectory) {
-                        recordDep(sp.path, depHashDirListing(sp.readDirectory()), DepType::Directory,
+                        recordDep(*state.traceCtx->pools,sp.path, depHashDirListing(sp.readDirectory()), DepType::Directory,
                                   state.getMountToInput());
                     }
                     // Symlink target changes are not tracked individually.
@@ -3104,7 +3105,7 @@ static void addPath(
 
             // Record Directory dep on root directory (filter never sees the root itself).
             if (recordFilterDeps) {
-                recordDep(path.path, depHashDirListing(path.readDirectory()), DepType::Directory,
+                recordDep(*state.traceCtx->pools,path.path, depHashDirListing(path.readDirectory()), DepType::Directory,
                           state.getMountToInput());
             }
         }
@@ -3151,7 +3152,7 @@ static void addPath(
         if (!filterFun && refs.empty() && state.traceActiveDepth
             && !state.store->isInStore(path.path.abs()))
         {
-            recordDep(path.path, DepHashValue(resultStorePath), DepType::CopiedPath, state.getMountToInput());
+            recordDep(*state.traceCtx->pools,path.path, DepHashValue(resultStorePath), DepType::CopiedPath, state.getMountToInput());
         }
     } catch (Error & e) {
         e.addTrace(state.positions[pos], "while adding path '%s'", path);
@@ -5566,7 +5567,7 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
             .arity = 1,
             .fun = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
                 if (state.traceActiveDepth) [[unlikely]] {
-                    DependencyTracker::record({"", "currentTime",
+                    DependencyTracker::record(*state.traceCtx->pools,{"", "currentTime",
                         DepHashValue(std::to_string(time(0))), DepType::CurrentTime});
                 }
                 v.mkInt(time(0));
@@ -5614,7 +5615,7 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
                 if (state.traceActiveDepth) [[unlikely]] {
                     auto system = state.settings.getCurrentSystem();
                     auto hash = depHash(system);
-                    DependencyTracker::record({"", "currentSystem", hash, DepType::System});
+                    DependencyTracker::record(*state.traceCtx->pools,{"", "currentSystem", hash, DepType::System});
                 }
                 v.mkString(state.settings.getCurrentSystem(), state.mem);
             },

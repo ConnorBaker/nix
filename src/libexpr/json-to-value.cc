@@ -314,7 +314,8 @@ struct JsonDataNode : TracedDataNode {
 
 void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
 {
-    initSessionSymbols(state.symbols);
+    auto & pools = *state.traceCtx->pools;
+    pools.sessionSymbols = &state.symbols;
     auto nodeKind = node->kind();
     auto fmt = node->formatTag();
 
@@ -325,12 +326,12 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
 
         bool tracking = DependencyTracker::isActive() && !keys.empty();
         auto originHandle = state.positions.addOriginHandle(
-            allocateProvenanceRef(sourceId, filePathId, dataPathId, structuredFormatChar(fmt)),
+            allocateProvenanceRef(pools, sourceId, filePathId, dataPathId, structuredFormatChar(fmt)),
             keys.empty() ? 0 : keys.size());
 
         for (size_t idx = 0; idx < keys.size(); idx++) {
             auto & k = keys[idx];
-            auto childPathId = internDataPathChild(dataPathId, k);
+            auto childPathId = pools.dataPathPool.internChild(dataPathId, k);
             auto * childNode = node->objectGet(k);
             auto * childVal = state.allocValue();
 
@@ -349,7 +350,7 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
                                           ShapeSuffix::Keys, Symbol{}};
             if (keys.empty()) {
                 // Empty objects: blocking SC #keys so key additions are caught.
-                recordStructuredDep(keysComp, DepHashValue(depHash("")));
+                recordStructuredDep(pools, keysComp, DepHashValue(depHash("")));
             } else {
                 // Non-empty: ImplicitShape #keys fingerprint at creation time.
                 std::vector<std::string> sortedKeys(keys);
@@ -360,7 +361,7 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
                     canonical += sortedKeys[i];
                 }
                 auto keysHash = depHash(canonical);
-                recordStructuredDep(keysComp, DepHashValue(keysHash), DepType::ImplicitShape);
+                recordStructuredDep(pools, keysComp, DepHashValue(keysHash), DepType::ImplicitShape);
 
                 PosIdx anyKeyPos = v.attrs()->begin()->pos;
                 if (auto off = state.positions.originOffsetOf(anyKeyPos)) {
@@ -378,7 +379,7 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         auto sz = node->arraySize();
         auto list = state.buildList(sz);
         for (size_t i = 0; i < sz; i++) {
-            auto childPathId = internDataPathArrayChild(dataPathId, static_cast<int32_t>(i));
+            auto childPathId = pools.dataPathPool.internArrayChild(dataPathId, static_cast<int32_t>(i));
             auto * childNode = node->arrayGet(i);
             auto * childVal = state.allocValue();
 
@@ -395,10 +396,10 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
                                          ShapeSuffix::Len, Symbol{}};
             if (sz == 0) {
                 // Empty lists: blocking SC #len so element additions are caught.
-                recordStructuredDep(lenComp, DepHashValue(depHash("0")));
+                recordStructuredDep(pools, lenComp, DepHashValue(depHash("0")));
             } else {
                 // Non-empty: ImplicitShape #len fingerprint at creation time.
-                recordStructuredDep(lenComp, DepHashValue(depHash(std::to_string(sz))), DepType::ImplicitShape);
+                recordStructuredDep(pools, lenComp, DepHashValue(depHash(std::to_string(sz))), DepType::ImplicitShape);
 
                 auto * prov = allocateProvenance(sourceId, filePathId, dataPathId, fmt);
                 registerTracedContainer((const void *)list[0], prov);
@@ -414,7 +415,7 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
         CompactDepComponents scalarComp{sourceId, filePathId, fmt, dataPathId,
                                         ShapeSuffix::None, Symbol{}};
         auto hash = depHash(node->canonicalValue());
-        recordStructuredDep(scalarComp, DepHashValue(hash));
+        recordStructuredDep(pools, scalarComp, DepHashValue(hash));
         node->materializeScalar(state, v);
         eval_trace::nrDataFileScalarChildren++;
         break;
@@ -427,10 +428,11 @@ void parseTracedJSON(EvalState & state, const std::string_view & s, Value & v,
 {
     auto j = json::parse(s);
     if (j.is_object() || j.is_array()) {
-        auto srcId = internDepSource(depSource);
-        auto fpId = internFilePath(depKey);
+        auto & pools = *state.traceCtx->pools;
+        auto srcId = pools.depSourcePool.intern(depSource);
+        auto fpId = pools.filePathPool.intern(depKey);
         auto * rootNode = new JsonDataNode(std::move(j));
-        auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, DataPathId{});
+        auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, pools.dataPathPool.root());
         rootExpr->eval(state, state.baseEnv, v);
     } else {
         parseJSON(state, s, v);

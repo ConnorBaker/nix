@@ -472,8 +472,9 @@ struct Dep {
 /**
  * Compact interned dependency: stores pool IDs instead of owned strings.
  * 48 bytes per entry (with padding) vs 96+ bytes for Dep (plus heap-allocated
- * strings). Zero per-dep heap allocation — all string data lives in thread-local
- * interning pools, resolved via resolveDepSource()/resolveDepKey().
+ * strings). Zero per-dep heap allocation — all string data lives in
+ * InterningPools (owned by EvalTraceContext), resolved via
+ * pools.depSourcePool.resolve() / pools.depKeyPool.resolve().
  */
 struct CompactDep {
     DepType type;

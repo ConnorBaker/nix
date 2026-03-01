@@ -219,10 +219,11 @@ static void parseTracedTOML(EvalState & state, const std::string_view & s, Value
 #endif
     );
     if (parsed.type() == toml::value_t::table) {
-        auto srcId = internDepSource(depSource);
-        auto fpId = internFilePath(depKey);
+        auto & pools = *state.traceCtx->pools;
+        auto srcId = pools.depSourcePool.intern(depSource);
+        auto fpId = pools.filePathPool.intern(depKey);
         auto * rootNode = new TomlDataNode(std::move(parsed));
-        auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, DataPathId{});
+        auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, pools.dataPathPool.root());
         rootExpr->eval(state, state.baseEnv, v);
     } else {
         throw std::runtime_error("TOML root is not a table");

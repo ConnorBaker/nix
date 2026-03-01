@@ -1185,7 +1185,7 @@ void EvalState::recordImportContentDep(const SourcePath & resolvedPath)
         } catch (Error &) {}
     }
     if (hash)
-        recordDep(resolvedPath.path, DepHashValue(*hash), DepType::Content, traceCtx->mountToInput);
+        recordDep(*traceCtx->pools, resolvedPath.path, DepHashValue(*hash), DepType::Content, traceCtx->mountToInput);
 }
 
 [[gnu::noinline]]
@@ -2186,7 +2186,7 @@ static void recordConcatPathDep(EvalState & state, const std::string & resultStr
     if (!hasPrefix(finalPath.path.abs(), "/nix/store/")) {
         try {
             auto content = finalPath.readFile();
-            recordDep(finalPath.path, DepHashValue(depHash(content)),
+            recordDep(*state.traceCtx->pools, finalPath.path, DepHashValue(depHash(content)),
                 DepType::Content, state.getMountToInput());
         } catch (...) {}
     }
@@ -2686,7 +2686,7 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
     if (traceActiveDepth
         && !hasPrefix(path.path.abs(), "/nix/store/")) [[unlikely]]
     {
-        recordDep(path.path, DepHashValue(store->printStorePath(dstPath)),
+        recordDep(*traceCtx->pools, path.path, DepHashValue(store->printStorePath(dstPath)),
             DepType::CopiedPath, getMountToInput());
     }
 
@@ -3430,7 +3430,7 @@ SourcePath EvalState::findFile(const LookupPath & lookupPath, const std::string_
     if (traceActiveDepth && !settings.pureEval) [[unlikely]] {
         auto nixPath = getEnv("NIX_PATH").value_or("");
         auto hash = depHash(nixPath);
-        DependencyTracker::record({"", "NIX_PATH", hash, DepType::EnvVar});
+        DependencyTracker::record(*traceCtx->pools, {"", "NIX_PATH", hash, DepType::EnvVar});
     }
 
     for (auto & i : lookupPath.elements) {

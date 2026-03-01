@@ -22,7 +22,7 @@ protected:
 
     TraceStore makeDb()
     {
-        return TraceStore(state.symbols, testContextHash);
+        return TraceStore(state.symbols, *state.traceCtx->pools, testContextHash);
     }
 };
 

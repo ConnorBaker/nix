@@ -27,9 +27,9 @@ class TraceCache;
  * Created eagerly in EvalState constructor when eval-trace is enabled;
  * nullptr otherwise (zero overhead). Destroyed with the EvalState.
  *
- * See dependency-tracker.cc for the full lifetime documentation covering
- * all three scopes: (1) process/thread pools, (2) per-root-tracker caches,
- * (3) per-EvalState context (this struct).
+ * See recording.cc for the full lifetime documentation covering
+ * all three scopes: (1) thread-local recording state, (2) per-root-tracker
+ * caches, (3) per-EvalState context (this struct).
  */
 struct EvalTraceContext {
     /// Interning pools for dep recording. Owned here so each EvalState

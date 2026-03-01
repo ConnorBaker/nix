@@ -2,6 +2,7 @@
 ///@file
 
 #include "nix/expr/eval-trace/deps/types.hh"
+#include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/counter.hh"
 
@@ -56,6 +57,7 @@ struct DependencyTracker {
     /// skip the session cache reset.
     static thread_local uint32_t depth;
 
+    InterningPools & pools;
     DependencyTracker * previous;
     std::vector<CompactDep> * mySessionTraces;
     uint32_t startIndex;
@@ -99,8 +101,9 @@ struct DependencyTracker {
     };
     DedupFilter depDedup;
 
-    DependencyTracker()
-        : previous(activeTracker)
+    explicit DependencyTracker(InterningPools & pools)
+        : pools(pools)
+        , previous(activeTracker)
         , mySessionTraces(&sessionTraces)
         , startIndex(mySessionTraces->size())
     {
@@ -131,11 +134,12 @@ struct DependencyTracker {
 
     /**
      * Record a non-StructuredContent dependency into the session-wide dep vector.
-     * Interns source and key strings into thread-local pools at recording time.
+     * Interns source and key strings via the provided pools.
      * Deduplicates by hashing (type, source, key) within the active tracker scope.
-     * For StructuredContent deps, use recordStructuredDep() instead (zero-allocation dedup).
+     * When no tracker is active (e.g. during SuspendDepTracking), skips dedup
+     * but still interns and appends (needed for epoch tracking).
      */
-    static void record(Dep dep);
+    static void record(InterningPools & pools, Dep dep);
 
     /**
      * Append a dependency to sessionTraces without touching the active
@@ -143,11 +147,8 @@ struct DependencyTracker {
      * Used by TracedExpr::replayTrace() to propagate a child's cached deps
      * (loaded from DB as Dep objects) into the session trace (needed for
      * thunk epoch ranges) without polluting the parent tracker's dedup state.
-     * Without this, a parent that independently records the same dep later
-     * would silently drop it (the dep only exists in the child's excluded
-     * range, so the parent's stored trace would be incomplete).
      */
-    static void recordReplay(const Dep & dep);
+    static void recordReplay(InterningPools & pools, const Dep & dep);
 
     /**
      * Collect all deps: session range [startIndex, current) plus
@@ -167,26 +168,17 @@ struct DependencyTracker {
 };
 
 /**
- * Reset all process-lifetime eval trace pools (depSource, filePath, dataPath)
- * and clear sessionTraces. Only for test isolation — in production these pools
- * must outlive GC-heap ExprTracedData thunks. Call from test fixture setup
- * to prevent cross-test state leakage when multiple EvalState instances
- * exist within the same process.
- */
-void resetEvalTracePools();
-
-/**
  * Allocate a provenance record and return a Pos::ProvenanceRef for use
- * in PosTable origins. The record is stored in the session's ProvenanceTable.
+ * in PosTable origins. The record is stored in the given pools' ProvenanceTable.
  */
 Pos::ProvenanceRef allocateProvenanceRef(
-    DepSourceId srcId, FilePathId fpId, DataPathId dpId, char format);
+    InterningPools & pools, DepSourceId srcId, FilePathId fpId, DataPathId dpId, char format);
 
 /**
  * Resolve a Pos::ProvenanceRef to its full ProvenanceRecord.
- * Returns nullptr if no InterningPools are active.
+ * Requires an InterningPools reference.
  */
-const ProvenanceRecord * resolveProvenanceRef(const Pos::ProvenanceRef & ref);
+const ProvenanceRecord & resolveProvenanceRef(InterningPools & pools, const Pos::ProvenanceRef & ref);
 
 /**
  * RAII guard that temporarily suspends dep recording by setting
@@ -266,6 +258,7 @@ std::optional<std::pair<std::string, CanonPath>> resolveToInput(
  * against the real filesystem.
  */
 void recordDep(
+    InterningPools & pools,
     const CanonPath & absPath,
     const DepHashValue & hash,
     DepType depType,
@@ -413,65 +406,18 @@ struct CompactDepComponents {
 };
 
 /**
- * Intern a dep source string (flake input name) into the thread-local pool.
- * Grows monotonically for the process lifetime (IDs stored in GC-heap thunks).
- */
-DepSourceId internDepSource(std::string_view sv);
-
-/**
- * Intern a file path string into the thread-local pool.
- * Grows monotonically for the process lifetime (IDs stored in GC-heap thunks).
- */
-FilePathId internFilePath(std::string_view sv);
-
-/** Resolve an interned dep source ID back to a string. */
-std::string_view resolveDepSource(DepSourceId id);
-
-/** Resolve an interned file path ID back to a string. */
-std::string_view resolveFilePath(FilePathId id);
-
-/**
- * Intern a dep key string into the thread-local pool.
- * Used by CompactDep to avoid per-dep string allocation in sessionTraces.
- * Grows monotonically within a session.
- */
-DepKeyId internDepKey(std::string_view sv);
-
-/** Resolve an interned dep key ID back to a string. */
-std::string_view resolveDepKey(DepKeyId id);
-
-/**
- * Intern an object key child in the DataPath trie.
- * Grows monotonically for the process lifetime (IDs stored in GC-heap thunks).
- */
-DataPathId internDataPathChild(DataPathId parentId, std::string_view key);
-
-/**
- * Intern an array index child in the DataPath trie.
- * Grows monotonically for the process lifetime (IDs stored in GC-heap thunks).
- */
-DataPathId internDataPathArrayChild(DataPathId parentId, int32_t index);
-
-/**
  * Convert a DataPath trie node to a JSON array string of path components.
  * Object keys become JSON strings; array indices become JSON numbers.
  * Only called for non-duplicate deps at serialization time.
  * Returns the serialized JSON array, e.g. '["nodes","nixpkgs",0]'.
  */
-std::string dataPathToJsonString(DataPathId nodeId);
+std::string dataPathToJsonString(InterningPools & pools, DataPathId nodeId);
 
 /**
  * Convert a JSON array string of path components back to a DataPath trie node ID.
  * Used when replaying cached origins (trace-cache.cc).
  */
-DataPathId jsonStringToDataPathId(std::string_view jsonStr);
-
-/**
- * Set the SymbolTable pointer for the session. Called once from
- * ExprTracedData::eval() or parseTracedJSON/parseTracedTOML.
- * Required by dataPathToJsonArray() and recordStructuredDep().
- */
-void initSessionSymbols(const SymbolTable & symbols);
+DataPathId jsonStringToDataPathId(InterningPools & pools, std::string_view jsonStr);
 
 /**
  * Record a StructuredContent dep with zero-allocation dedup.
@@ -480,6 +426,7 @@ void initSessionSymbols(const SymbolTable & symbols);
  * Returns true if the dep was recorded (not a duplicate).
  */
 [[gnu::cold]] bool recordStructuredDep(
+    InterningPools & pools,
     const CompactDepComponents & c,
     const DepHashValue & hash,
     DepType depType = DepType::StructuredContent);

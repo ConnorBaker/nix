@@ -15,12 +15,12 @@ namespace nix::eval_trace {
 using namespace nix::eval_trace::test;
 
 /// Extract dep keys from a dep vector for exact-match assertions.
-static std::vector<std::string> keys(const std::vector<CompactDep> & deps)
+static std::vector<std::string> keys(InterningPools & pools, const std::vector<CompactDep> & deps)
 {
     std::vector<std::string> out;
     out.reserve(deps.size());
     for (auto & d : deps)
-        out.push_back(std::string(resolveDepKey(d.keyId)));
+        out.push_back(std::string(pools.depKeyPool.resolve(d.keyId)));
     return out;
 }
 
@@ -39,22 +39,22 @@ protected:
         const std::vector<Dep> & childDeps)
     {
         DependencyTracker::clearSessionTraces();
-        DependencyTracker parent;
+        DependencyTracker parent(pools);
 
         // Parent's own deps (before child)
         for (auto & d : parentDeps)
-            DependencyTracker::record(d);
+            DependencyTracker::record(pools,d);
 
         // Child evaluates fresh — records into sessionTraces
         uint32_t childStart = DependencyTracker::sessionTraces.size();
         for (auto & d : childDeps)
-            DependencyTracker::record(d);
+            DependencyTracker::record(pools,d);
         uint32_t childEnd = DependencyTracker::sessionTraces.size();
 
         // Exclude child range (what ChildRangeExcluder does)
         parent.excludeChildRange(childStart, childEnd);
 
-        return keys(parent.collectTraces());
+        return keys(pools, parent.collectTraces());
     }
 
     /// Same as runWithFreshChild but the child's deps are replayed via
@@ -64,17 +64,17 @@ protected:
         const std::vector<Dep> & childReplayedDeps)
     {
         DependencyTracker::clearSessionTraces();
-        DependencyTracker parent;
+        DependencyTracker parent(pools);
 
         // Parent's own deps
         for (auto & d : parentDeps)
-            DependencyTracker::record(d);
+            DependencyTracker::record(pools,d);
 
         // Child replays cached deps — these go into sessionTraces AND
         // are added as a replayed range on the parent's tracker
         uint32_t childStart = DependencyTracker::sessionTraces.size();
         for (auto & d : childReplayedDeps)
-            DependencyTracker::record(d);
+            DependencyTracker::record(pools,d);
         uint32_t childEnd = DependencyTracker::sessionTraces.size();
 
         parent.replayedRanges.push_back(
@@ -83,7 +83,7 @@ protected:
         // Exclude child range
         parent.excludeChildRange(childStart, childEnd);
 
-        return keys(parent.collectTraces());
+        return keys(pools, parent.collectTraces());
     }
 };
 
@@ -191,19 +191,19 @@ TEST_F(DepStabilityTest, NoExclusion_ParentDepsVary)
     // Run 1: child has 3 deps, NO exclusion applied
     {
         DependencyTracker::clearSessionTraces();
-        DependencyTracker parent;
-        DependencyTracker::record(makeContentDep("/parent/p.nix", "pp"));
-        DependencyTracker::record(makeContentDep("/child/a.nix", "ca"));
-        DependencyTracker::record(makeContentDep("/child/b.nix", "cb"));
-        DependencyTracker::record(makeContentDep("/child/c.nix", "cc"));
-        auto run1 = keys(parent.collectTraces());
+        DependencyTracker parent(pools);
+        DependencyTracker::record(pools,makeContentDep("/parent/p.nix", "pp"));
+        DependencyTracker::record(pools,makeContentDep("/child/a.nix", "ca"));
+        DependencyTracker::record(pools,makeContentDep("/child/b.nix", "cb"));
+        DependencyTracker::record(pools,makeContentDep("/child/c.nix", "cc"));
+        auto run1 = keys(pools, parent.collectTraces());
 
         // Run 2: child has different deps, NO exclusion
         DependencyTracker::clearSessionTraces();
-        DependencyTracker parent2;
-        DependencyTracker::record(makeContentDep("/parent/p.nix", "pp"));
-        DependencyTracker::record(makeContentDep("/child/x.nix", "cx"));
-        auto run2 = keys(parent2.collectTraces());
+        DependencyTracker parent2(pools);
+        DependencyTracker::record(pools,makeContentDep("/parent/p.nix", "pp"));
+        DependencyTracker::record(pools,makeContentDep("/child/x.nix", "cx"));
+        auto run2 = keys(pools, parent2.collectTraces());
 
         // Without exclusion, parent deps DIFFER (this is the bug)
         EXPECT_NE(run1, run2);
@@ -225,15 +225,15 @@ TEST_F(DepStabilityTest, MultipleChildren_VaryingCacheState)
     // Run 1: C1 fresh (100 deps), C2 cached (50 deps)
     auto run1 = [&]() {
         DependencyTracker::clearSessionTraces();
-        DependencyTracker parent;
+        DependencyTracker parent(pools);
 
         for (auto & d : parentDeps)
-            DependencyTracker::record(d);
+            DependencyTracker::record(pools,d);
 
         // C1 fresh: 100 deps
         uint32_t c1Start = DependencyTracker::sessionTraces.size();
         for (int i = 0; i < 100; i++)
-            DependencyTracker::record(
+            DependencyTracker::record(pools,
                 makeContentDep("/c1/f" + std::to_string(i) + ".nix", "c1-" + std::to_string(i)));
         uint32_t c1End = DependencyTracker::sessionTraces.size();
         parent.excludeChildRange(c1Start, c1End);
@@ -241,28 +241,28 @@ TEST_F(DepStabilityTest, MultipleChildren_VaryingCacheState)
         // C2 cached: 50 replayed deps
         uint32_t c2Start = DependencyTracker::sessionTraces.size();
         for (int i = 0; i < 50; i++)
-            DependencyTracker::record(
+            DependencyTracker::record(pools,
                 makeContentDep("/c2/g" + std::to_string(i) + ".nix", "c2-" + std::to_string(i)));
         uint32_t c2End = DependencyTracker::sessionTraces.size();
         parent.replayedRanges.push_back(
             DepRange{&DependencyTracker::sessionTraces, c2Start, c2End});
         parent.excludeChildRange(c2Start, c2End);
 
-        return keys(parent.collectTraces());
+        return keys(pools, parent.collectTraces());
     }();
 
     // Run 2: C1 cached (30 deps), C2 fresh (80 deps)
     auto run2 = [&]() {
         DependencyTracker::clearSessionTraces();
-        DependencyTracker parent;
+        DependencyTracker parent(pools);
 
         for (auto & d : parentDeps)
-            DependencyTracker::record(d);
+            DependencyTracker::record(pools,d);
 
         // C1 cached: 30 replayed deps
         uint32_t c1Start = DependencyTracker::sessionTraces.size();
         for (int i = 0; i < 30; i++)
-            DependencyTracker::record(
+            DependencyTracker::record(pools,
                 makeContentDep("/c1/f" + std::to_string(i) + ".nix", "c1-" + std::to_string(i)));
         uint32_t c1End = DependencyTracker::sessionTraces.size();
         parent.replayedRanges.push_back(
@@ -272,12 +272,12 @@ TEST_F(DepStabilityTest, MultipleChildren_VaryingCacheState)
         // C2 fresh: 80 deps
         uint32_t c2Start = DependencyTracker::sessionTraces.size();
         for (int i = 0; i < 80; i++)
-            DependencyTracker::record(
+            DependencyTracker::record(pools,
                 makeContentDep("/c2/g" + std::to_string(i) + ".nix", "c2-" + std::to_string(i)));
         uint32_t c2End = DependencyTracker::sessionTraces.size();
         parent.excludeChildRange(c2Start, c2End);
 
-        return keys(parent.collectTraces());
+        return keys(pools, parent.collectTraces());
     }();
 
     EXPECT_EQ(run1, run2);
@@ -291,21 +291,21 @@ TEST_F(DepStabilityTest, MultipleChildren_VaryingCacheState)
 TEST_F(DepStabilityTest, ExclusionPlusReplayedRanges_Composable)
 {
     DependencyTracker::clearSessionTraces();
-    DependencyTracker parent;
+    DependencyTracker parent(pools);
 
-    DependencyTracker::record(makeContentDep("/parent/p.nix", "pp"));
+    DependencyTracker::record(pools,makeContentDep("/parent/p.nix", "pp"));
 
     // Child evaluates and also triggers epoch replay within its scope.
     // Both the child's fresh deps AND replayed deps fall within the
     // excluded range and must be filtered.
     uint32_t childStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(makeContentDep("/child/fresh1.nix", "cf1"));
-    DependencyTracker::record(makeContentDep("/child/fresh2.nix", "cf2"));
+    DependencyTracker::record(pools,makeContentDep("/child/fresh1.nix", "cf1"));
+    DependencyTracker::record(pools,makeContentDep("/child/fresh2.nix", "cf2"));
 
     // Simulate epoch replay within child's scope: adds a replayed range
     // to parent that falls within the child's excluded range.
     uint32_t replayStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(makeContentDep("/child/replayed.nix", "cr"));
+    DependencyTracker::record(pools,makeContentDep("/child/replayed.nix", "cr"));
     uint32_t replayEnd = DependencyTracker::sessionTraces.size();
     parent.replayedRanges.push_back(
         DepRange{&DependencyTracker::sessionTraces, replayStart, replayEnd});
@@ -313,11 +313,11 @@ TEST_F(DepStabilityTest, ExclusionPlusReplayedRanges_Composable)
     uint32_t childEnd = DependencyTracker::sessionTraces.size();
 
     // More parent deps after child
-    DependencyTracker::record(makeContentDep("/parent/q.nix", "pq"));
+    DependencyTracker::record(pools,makeContentDep("/parent/q.nix", "pq"));
 
     parent.excludeChildRange(childStart, childEnd);
 
-    auto deps = keys(parent.collectTraces());
+    auto deps = keys(pools, parent.collectTraces());
     // Only parent deps survive — child's fresh and replayed deps excluded
     EXPECT_EQ(deps, (std::vector<std::string>{"/parent/p.nix", "/parent/q.nix"}));
 }
@@ -335,7 +335,7 @@ class DepStabilityStoreTest : public TraceStoreFixture
 {
 protected:
     static constexpr int64_t testCtxHash = 0xDEADBEEF42424242;
-    TraceStore makeDb() { return TraceStore(state.symbols, testCtxHash); }
+    TraceStore makeDb() { return TraceStore(state.symbols, *state.traceCtx->pools, testCtxHash); }
 };
 
 TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
@@ -632,6 +632,7 @@ TEST_F(DepStabilityIntegrationTest, SiblingFileChange_PropagatedThroughDepChain)
 class EpochStabilityTest : public ::testing::Test
 {
 protected:
+    InterningPools pools;
     EvalTraceContext ctx;
     void SetUp() override { DependencyTracker::clearSessionTraces(); }
     void TearDown() override { DependencyTracker::clearSessionTraces(); }
@@ -651,12 +652,12 @@ TEST_F(EpochStabilityTest, SuspendedThunk_EpochAlwaysRecorded)
 
     // Phase 1: outer tracker, SuspendDepTracking, force V
     {
-        DependencyTracker outer;
+        DependencyTracker outer(pools);
         uint32_t epochStart = DependencyTracker::sessionTraces.size();
         {
             SuspendDepTracking suspend;
-            DependencyTracker::record(makeContentDep("/lib/default.nix", "lib"));
-            DependencyTracker::record(makeContentDep("/lib/attrsets.nix", "attrs"));
+            DependencyTracker::record(pools,makeContentDep("/lib/default.nix", "lib"));
+            DependencyTracker::record(pools,makeContentDep("/lib/attrsets.nix", "attrs"));
         }
         // Fix: recordThunkDeps called regardless of isActive()
         ctx.recordThunkDeps(v, epochStart);
@@ -664,8 +665,8 @@ TEST_F(EpochStabilityTest, SuspendedThunk_EpochAlwaysRecorded)
 
     // Phase 2: new tracker replays V successfully
     {
-        DependencyTracker tracker;
-        DependencyTracker::record(makeContentDep("/closure.nix", "closure"));
+        DependencyTracker tracker(pools);
+        DependencyTracker::record(pools,makeContentDep("/closure.nix", "closure"));
         ctx.replayMemoizedDeps(v);
 
         auto deps = tracker.collectTraces();
@@ -687,12 +688,12 @@ TEST_F(EpochStabilityTest, SuspendedThunk_WithEpochEntry_ReplaySucceeds)
 
     // Phase 1: outer tracker, SuspendDepTracking, force V, record epoch
     {
-        DependencyTracker outer;
+        DependencyTracker outer(pools);
         uint32_t epochStart = DependencyTracker::sessionTraces.size();
         {
             SuspendDepTracking suspend;
-            DependencyTracker::record(makeContentDep("/lib/default.nix", "lib"));
-            DependencyTracker::record(makeContentDep("/lib/attrsets.nix", "attrs"));
+            DependencyTracker::record(pools,makeContentDep("/lib/default.nix", "lib"));
+            DependencyTracker::record(pools,makeContentDep("/lib/attrsets.nix", "attrs"));
         }
         // FIX: recordThunkDeps called regardless of isActive()
         ctx.recordThunkDeps(v, epochStart);
@@ -700,8 +701,8 @@ TEST_F(EpochStabilityTest, SuspendedThunk_WithEpochEntry_ReplaySucceeds)
 
     // Phase 2: new tracker replays V successfully
     {
-        DependencyTracker tracker;
-        DependencyTracker::record(makeContentDep("/closure.nix", "closure"));
+        DependencyTracker tracker(pools);
+        DependencyTracker::record(pools,makeContentDep("/closure.nix", "closure"));
         ctx.replayMemoizedDeps(v);
 
         auto deps = tracker.collectTraces();
@@ -733,18 +734,18 @@ TEST_F(EpochStabilityTest, DepSetStable_RegardlessOfSuspensionState)
 
         // Prior scope forces V
         {
-            DependencyTracker prior;
+            DependencyTracker prior(pools);
             uint32_t epochStart = DependencyTracker::sessionTraces.size();
-            DependencyTracker::record(makeContentDep("/lib/default.nix", "lib"));
-            DependencyTracker::record(makeContentDep("/lib/attrsets.nix", "attrs"));
+            DependencyTracker::record(pools,makeContentDep("/lib/default.nix", "lib"));
+            DependencyTracker::record(pools,makeContentDep("/lib/attrsets.nix", "attrs"));
             ctx.recordThunkDeps(v, epochStart);
         }
 
         // Child scope records own deps + replays V
-        DependencyTracker child;
-        DependencyTracker::record(makeContentDep("/closure.nix", "closure"));
+        DependencyTracker child(pools);
+        DependencyTracker::record(pools,makeContentDep("/closure.nix", "closure"));
         ctx.replayMemoizedDeps(v);
-        return keys(child.collectTraces());
+        return keys(pools, child.collectTraces());
     }();
 
     // Case B: V forced during SuspendDepTracking (the callFlake scenario)
@@ -754,22 +755,22 @@ TEST_F(EpochStabilityTest, DepSetStable_RegardlessOfSuspensionState)
 
         // Outer scope with suspension forces V
         {
-            DependencyTracker outer;
+            DependencyTracker outer(pools);
             uint32_t epochStart = DependencyTracker::sessionTraces.size();
             {
                 SuspendDepTracking suspend;
-                DependencyTracker::record(makeContentDep("/lib/default.nix", "lib"));
-                DependencyTracker::record(makeContentDep("/lib/attrsets.nix", "attrs"));
+                DependencyTracker::record(pools,makeContentDep("/lib/default.nix", "lib"));
+                DependencyTracker::record(pools,makeContentDep("/lib/attrsets.nix", "attrs"));
             }
             // FIX: recordThunkDeps called regardless of isActive()
             ctx.recordThunkDeps(v, epochStart);
         }
 
         // Child scope records own deps + replays V
-        DependencyTracker child;
-        DependencyTracker::record(makeContentDep("/closure.nix", "closure"));
+        DependencyTracker child(pools);
+        DependencyTracker::record(pools,makeContentDep("/closure.nix", "closure"));
         ctx.replayMemoizedDeps(v);
-        return keys(child.collectTraces());
+        return keys(pools, child.collectTraces());
     }();
 
     // Both should produce the same dep set
@@ -793,12 +794,12 @@ TEST_F(EpochStabilityTest, NestedThunks_SuspendedForcing_DepsPreserved)
     ctx.epochMap.clear();
 
     {
-        DependencyTracker outer;
+        DependencyTracker outer(pools);
         // V is forced during suspension
         uint32_t vStart = DependencyTracker::sessionTraces.size();
         {
             SuspendDepTracking suspend;
-            DependencyTracker::record(makeContentDep("/v-dep.nix", "v"));
+            DependencyTracker::record(pools,makeContentDep("/v-dep.nix", "v"));
         }
         ctx.recordThunkDeps(v, vStart);
 
@@ -806,7 +807,7 @@ TEST_F(EpochStabilityTest, NestedThunks_SuspendedForcing_DepsPreserved)
         uint32_t wStart = DependencyTracker::sessionTraces.size();
         {
             SuspendDepTracking suspend;
-            DependencyTracker::record(makeContentDep("/w-dep.nix", "w"));
+            DependencyTracker::record(pools,makeContentDep("/w-dep.nix", "w"));
             // W accesses V (already forced) → replay would fire if tracker active
             // During suspension, replay is no-op (activeTracker nullptr)
         }
@@ -814,13 +815,13 @@ TEST_F(EpochStabilityTest, NestedThunks_SuspendedForcing_DepsPreserved)
     }
 
     // Child tracker accesses W
-    DependencyTracker child;
-    DependencyTracker::record(makeContentDep("/child.nix", "c"));
+    DependencyTracker child(pools);
+    DependencyTracker::record(pools,makeContentDep("/child.nix", "c"));
     ctx.replayMemoizedDeps(w);
     // Also replay V (child might access V independently)
     ctx.replayMemoizedDeps(v);
 
-    auto deps = keys(child.collectTraces());
+    auto deps = keys(pools, child.collectTraces());
     EXPECT_GE(deps.size(), 3u)
         << "child should get own dep + V's dep + W's dep via replay";
 }

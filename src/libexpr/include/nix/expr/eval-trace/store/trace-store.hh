@@ -17,6 +17,7 @@
 
 namespace nix {
 class EvalState;
+struct InterningPools;
 }
 
 namespace nix::eval_trace {
@@ -131,6 +132,7 @@ struct TraceStore {
     };
     std::unique_ptr<Sync<State>> _state;
     SymbolTable & symbols;
+    InterningPools & pools;
     int64_t contextHash;
 
     // Interned dep key (string IDs, no hash value — used for keys_blob serialization).
@@ -261,7 +263,7 @@ struct TraceStore {
 
     // ── Lifecycle ────────────────────────────────────────────────────
 
-    TraceStore(SymbolTable & symbols, int64_t contextHash);
+    TraceStore(SymbolTable & symbols, InterningPools & pools, int64_t contextHash);
     ~TraceStore();
 
     /** Bulk-load all interned entities from DB into in-memory maps.
