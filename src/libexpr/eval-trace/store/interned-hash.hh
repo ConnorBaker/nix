@@ -22,13 +22,13 @@ inline void sortAndDedupInterned(std::vector<TraceStore::InternedDep> & deps)
 {
     std::sort(deps.begin(), deps.end(),
         [](const TraceStore::InternedDep & a, const TraceStore::InternedDep & b) {
-            if (auto cmp = a.type <=> b.type; cmp != 0) return cmp < 0;
-            if (a.sourceId != b.sourceId) return a.sourceId < b.sourceId;
-            return a.keyId < b.keyId;
+            if (auto cmp = a.key.type <=> b.key.type; cmp != 0) return cmp < 0;
+            if (a.key.sourceId != b.key.sourceId) return a.key.sourceId < b.key.sourceId;
+            return a.key.keyId < b.key.keyId;
         });
     deps.erase(std::unique(deps.begin(), deps.end(),
         [](const TraceStore::InternedDep & a, const TraceStore::InternedDep & b) {
-            return a.type == b.type && a.sourceId == b.sourceId && a.keyId == b.keyId;
+            return a.key.type == b.key.type && a.key.sourceId == b.key.sourceId && a.key.keyId == b.key.keyId;
         }), deps.end());
 }
 
@@ -38,13 +38,13 @@ inline void feedInternedDepToSink(
     bool includeHash,
     const StringLookup & lookupString)
 {
-    auto typeStr = std::to_string(static_cast<int>(dep.type));
+    auto typeStr = std::to_string(static_cast<int>(dep.key.type));
     sink(std::string_view("T", 1));
     sink(typeStr);
     sink(std::string_view("S", 1));
-    sink(lookupString(dep.sourceId));
+    sink(lookupString(dep.key.sourceId));
     sink(std::string_view("K", 1));
-    sink(lookupString(dep.keyId));
+    sink(lookupString(dep.key.keyId));
     if (includeHash) {
         sink(std::string_view("H", 1));
         hashDepValue(sink, dep.hash);

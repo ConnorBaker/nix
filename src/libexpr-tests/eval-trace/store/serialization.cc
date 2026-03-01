@@ -103,8 +103,8 @@ TEST_F(TraceStoreTest, BlobRoundTrip_Blake3Deps)
         auto hash = depHash("content-" + std::to_string(i));
         keys.push_back({DepType::Content, StringId(static_cast<uint32_t>(i + 1)),
                         StringId(static_cast<uint32_t>(i + 100))});
-        deps.push_back({DepType::Content, StringId(static_cast<uint32_t>(i + 1)),
-                        StringId(static_cast<uint32_t>(i + 100)), DepHashValue(hash)});
+        deps.push_back({{DepType::Content, StringId(static_cast<uint32_t>(i + 1)),
+                         StringId(static_cast<uint32_t>(i + 100))}, DepHashValue(hash)});
     }
 
     auto keysBlob = TraceStore::serializeKeys(keys);
@@ -132,20 +132,20 @@ TEST_F(TraceStoreTest, BlobRoundTrip_MixedDeps)
 
     // BLAKE3 hash dep (Content — file content oracle)
     keys.push_back({DepType::Content, StringId(1), StringId(2)});
-    deps.push_back({DepType::Content, StringId(1), StringId(2), DepHashValue(depHash("file-data"))});
+    deps.push_back({{DepType::Content, StringId(1), StringId(2)}, DepHashValue(depHash("file-data"))});
 
     // String hash dep (CopiedPath — store path oracle)
     keys.push_back({DepType::CopiedPath, StringId(3), StringId(4)});
-    deps.push_back({DepType::CopiedPath, StringId(3), StringId(4),
+    deps.push_back({{DepType::CopiedPath, StringId(3), StringId(4)},
                     DepHashValue(std::string("/nix/store/aaaa-test"))});
 
     // BLAKE3 hash dep (EnvVar — environment oracle)
     keys.push_back({DepType::EnvVar, StringId(5), StringId(6)});
-    deps.push_back({DepType::EnvVar, StringId(5), StringId(6), DepHashValue(depHash("env-val"))});
+    deps.push_back({{DepType::EnvVar, StringId(5), StringId(6)}, DepHashValue(depHash("env-val"))});
 
     // String hash dep (Existence — filesystem oracle)
     keys.push_back({DepType::Existence, StringId(7), StringId(8)});
-    deps.push_back({DepType::Existence, StringId(7), StringId(8), DepHashValue(std::string("missing"))});
+    deps.push_back({{DepType::Existence, StringId(7), StringId(8)}, DepHashValue(std::string("missing"))});
 
     auto keysBlob = TraceStore::serializeKeys(keys);
     auto keysResult = TraceStore::deserializeKeys(keysBlob.data(), keysBlob.size());
@@ -185,7 +185,7 @@ TEST_F(TraceStoreTest, BlobRoundTrip_LargeSet)
     for (uint32_t i = 0; i < 10000; i++) {
         auto hash = depHash("content-" + std::to_string(i));
         keys.push_back({DepType::Content, StringId(i), StringId(i + 50000)});
-        deps.push_back({DepType::Content, StringId(i), StringId(i + 50000), DepHashValue(hash)});
+        deps.push_back({{DepType::Content, StringId(i), StringId(i + 50000)}, DepHashValue(hash)});
     }
 
     auto keysBlob = TraceStore::serializeKeys(keys);

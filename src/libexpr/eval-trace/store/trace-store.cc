@@ -607,10 +607,10 @@ std::vector<TraceStore::InternedDep> TraceStore::internDeps(const std::vector<Co
     interned.reserve(deps.size());
 
     for (auto & dep : deps) {
-        interned.push_back({
-            dep.type,
-            doInternString(pools.depSourcePool.resolve(dep.sourceId)),
-            doInternString(pools.depKeyPool.resolve(dep.keyId)),
+        interned.push_back(InternedDep{
+            {dep.type,
+             doInternString(pools.depSourcePool.resolve(dep.sourceId)),
+             doInternString(pools.depKeyPool.resolve(dep.keyId))},
             dep.expectedHash
         });
     }
@@ -624,10 +624,10 @@ std::vector<TraceStore::InternedDep> TraceStore::internDeps(const std::vector<De
     interned.reserve(deps.size());
 
     for (auto & dep : deps) {
-        interned.push_back({
-            dep.type,
-            doInternString(dep.source),
-            doInternString(dep.key),
+        interned.push_back(InternedDep{
+            {dep.type,
+             doInternString(dep.source),
+             doInternString(dep.key)},
             dep.expectedHash
         });
     }
@@ -1961,7 +1961,7 @@ TraceStore::RecordResult TraceStore::record(
     std::vector<InternedDepKey> keys;
     keys.reserve(interned.size());
     for (auto & d : interned)
-        keys.push_back({d.type, d.sourceId, d.keyId});
+        keys.push_back(d.key);
 
     auto keysBlob = serializeKeys(keys);
     auto valuesBlob = serializeValues(interned);

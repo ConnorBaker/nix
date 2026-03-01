@@ -145,9 +145,7 @@ struct TraceStore {
 
     // Interned dep entry (key + hash value — used for full dep reconstruction)
     struct InternedDep {
-        DepType type;
-        StringId sourceId;
-        StringId keyId;
+        InternedDepKey key;
         DepHashValue hash;
     };
 

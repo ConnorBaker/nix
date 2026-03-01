@@ -19,10 +19,10 @@ TEST_F(TraceStoreTest, BlobRoundTrip_StructuredContent)
     std::vector<TraceStore::InternedDep> deps;
 
     keys.push_back({DepType::StructuredContent, StringId(1), StringId(2)});
-    deps.push_back({DepType::StructuredContent, StringId(1), StringId(2), DepHashValue(depHash("scalar-value"))});
+    deps.push_back({{DepType::StructuredContent, StringId(1), StringId(2)}, DepHashValue(depHash("scalar-value"))});
 
     keys.push_back({DepType::Content, StringId(3), StringId(4)});
-    deps.push_back({DepType::Content, StringId(3), StringId(4), DepHashValue(depHash("file-content"))});
+    deps.push_back({{DepType::Content, StringId(3), StringId(4)}, DepHashValue(depHash("file-content"))});
 
     auto keysBlob = TraceStore::serializeKeys(keys);
     auto keysResult = TraceStore::deserializeKeys(keysBlob.data(), keysBlob.size());
@@ -56,11 +56,11 @@ TEST_F(TraceStoreTest, BlobRoundTrip_32ByteStringVsBlake3)
 
     // CopiedPath with exactly 32-byte string value
     keys.push_back({DepType::CopiedPath, StringId(1), StringId(2)});
-    deps.push_back({DepType::CopiedPath, StringId(1), StringId(2), DepHashValue(exactly32)});
+    deps.push_back({{DepType::CopiedPath, StringId(1), StringId(2)}, DepHashValue(exactly32)});
 
     // Content with Blake3 hash (also 32 bytes)
     keys.push_back({DepType::Content, StringId(3), StringId(4)});
-    deps.push_back({DepType::Content, StringId(3), StringId(4), DepHashValue(depHash("data"))});
+    deps.push_back({{DepType::Content, StringId(3), StringId(4)}, DepHashValue(depHash("data"))});
 
     auto keysBlob = TraceStore::serializeKeys(keys);
     auto keysResult = TraceStore::deserializeKeys(keysBlob.data(), keysBlob.size());
@@ -87,7 +87,7 @@ TEST_F(TraceStoreTest, BlobRoundTrip_SingleEntry)
     std::vector<TraceStore::InternedDep> deps;
 
     keys.push_back({DepType::EnvVar, StringId(42), StringId(99)});
-    deps.push_back({DepType::EnvVar, StringId(42), StringId(99), DepHashValue(depHash("HOME=/home/user"))});
+    deps.push_back({{DepType::EnvVar, StringId(42), StringId(99)}, DepHashValue(depHash("HOME=/home/user"))});
 
     auto keysBlob = TraceStore::serializeKeys(keys);
     auto keysResult = TraceStore::deserializeKeys(keysBlob.data(), keysBlob.size());
@@ -111,11 +111,11 @@ TEST_F(TraceStoreTest, BlobRoundTrip_AllDepTypes)
 
     auto addBlake3 = [&](DepType type, uint32_t sid, uint32_t kid, std::string_view data) {
         keys.push_back({type, StringId(sid), StringId(kid)});
-        deps.push_back({type, StringId(sid), StringId(kid), DepHashValue(depHash(data))});
+        deps.push_back({{type, StringId(sid), StringId(kid)}, DepHashValue(depHash(data))});
     };
     auto addString = [&](DepType type, uint32_t sid, uint32_t kid, std::string_view data) {
         keys.push_back({type, StringId(sid), StringId(kid)});
-        deps.push_back({type, StringId(sid), StringId(kid), DepHashValue(std::string(data))});
+        deps.push_back({{type, StringId(sid), StringId(kid)}, DepHashValue(std::string(data))});
     };
 
     // Blake3 dep types
