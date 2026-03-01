@@ -39,8 +39,9 @@ struct InterningPools;
 struct EvalTraceContext {
     /// Interning pools for dep recording. Owned here so each EvalState
     /// gets its own pools, providing automatic test isolation.
-    /// Custom deleter avoids requiring InterningPools to be complete here.
-    std::unique_ptr<InterningPools, void(*)(InterningPools*)> pools{nullptr, nullptr};
+    /// Raw pointer with outlined constructor/destructor to avoid
+    /// requiring InterningPools to be complete in this header.
+    InterningPools * pools = nullptr;
 
     EvalTraceContext();
     ~EvalTraceContext();
