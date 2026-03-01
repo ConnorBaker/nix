@@ -7,6 +7,7 @@
 #include "nix/expr/symbol-table.hh"
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include <cassert>
 #include <string>
@@ -18,25 +19,57 @@ namespace nix {
 template <typename Id>
 struct StringPool {
     using Repr = decltype(Id::value);
+
+    struct Hash {
+        using is_transparent = void;
+        const std::vector<std::string> * strings;
+        size_t operator()(Repr id) const {
+            return boost::hash<std::string_view>{}((*strings)[id]);
+        }
+        size_t operator()(std::string_view sv) const {
+            return boost::hash<std::string_view>{}(sv);
+        }
+    };
+
+    struct Equal {
+        using is_transparent = void;
+        const std::vector<std::string> * strings;
+        bool operator()(Repr a, Repr b) const {
+            return (*strings)[a] == (*strings)[b];
+        }
+        bool operator()(Repr a, std::string_view b) const {
+            return (*strings)[a] == b;
+        }
+        bool operator()(std::string_view a, Repr b) const {
+            return a == (*strings)[b];
+        }
+    };
+
     std::vector<std::string> strings;
-    boost::unordered_flat_map<std::string, Repr> lookup;
+    boost::unordered_flat_set<Repr, Hash, Equal> lookup;
 #ifndef NDEBUG
     uint32_t generation = 0;
 #endif
 
+    StringPool() : lookup(0, Hash{&strings}, Equal{&strings}) {}
+
+    StringPool(const StringPool &) = delete;
+    StringPool & operator=(const StringPool &) = delete;
+    StringPool(StringPool &&) = delete;
+    StringPool & operator=(StringPool &&) = delete;
+
     Id intern(std::string_view sv) {
-        std::string key(sv);
-        auto it = lookup.find(key);
+        auto it = lookup.find(sv);
         if (it != lookup.end()) {
 #ifndef NDEBUG
-            return Id(it->second, generation);
+            return Id(*it, generation);
 #else
-            return Id(it->second);
+            return Id(*it);
 #endif
         }
         Repr id = static_cast<Repr>(strings.size());
-        strings.push_back(key);
-        lookup.emplace(std::move(key), id);
+        strings.emplace_back(sv);
+        lookup.insert(id);
 #ifndef NDEBUG
         return Id(id, generation);
 #else
