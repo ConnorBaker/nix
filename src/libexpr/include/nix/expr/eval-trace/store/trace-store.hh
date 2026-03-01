@@ -12,7 +12,6 @@
 #include <cstring>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace nix {
@@ -297,7 +296,7 @@ struct TraceStore {
      */
     std::optional<VerifyResult> verify(
         std::string_view attrPath,
-        const std::unordered_map<std::string, SourcePath> & inputAccessors,
+        const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
         EvalState & state);
 
     /**
@@ -351,7 +350,7 @@ struct TraceStore {
     std::optional<VerifyResult> recovery(
         TraceId oldTraceId,
         std::string_view attrPath,
-        const std::unordered_map<std::string, SourcePath> & inputAccessors,
+        const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
         EvalState & state);
 
     /**
@@ -428,7 +427,7 @@ struct TraceStore {
     [[gnu::cold]]
     bool verifyTrace(
         TraceId traceId,
-        const std::unordered_map<std::string, SourcePath> & inputAccessors,
+        const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
         EvalState & state);
 
     std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);

@@ -1030,7 +1030,7 @@ ref<eval_trace::TraceCache> openTraceCache(EvalState & state, ref<const LockedFl
 
     // Build mount-to-input and input-accessors maps for oracle dep recording
     boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> mountToInput;
-    std::unordered_map<std::string, SourcePath> inputAccessors;
+    boost::unordered_flat_map<std::string, SourcePath> inputAccessors;
 
     for (auto & [node, sourcePath] : lockedFlake->nodePaths) {
         auto [storePath, subdir] = state.store->toStorePath(sourcePath.path.abs());

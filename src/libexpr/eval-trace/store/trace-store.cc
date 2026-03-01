@@ -49,7 +49,7 @@ static uint64_t elapsedUs(std::chrono::steady_clock::time_point start)
 // ── Trace verification helpers (BSàlC verifying trace check) ─────────
 
 static std::optional<SourcePath> resolveDepPath(
-    const Dep & dep, const std::unordered_map<std::string, SourcePath> & inputAccessors)
+    const Dep & dep, const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors)
 {
     if (dep.source == absolutePathDep)
         return SourcePath(getFSSourceAccessor(), CanonPath(dep.key));
@@ -136,7 +136,7 @@ static std::string tomlCanonical(const toml::value & v)
 
 static std::optional<DepHashValue> computeCurrentHash(
     EvalState & state, const Dep & dep,
-    const std::unordered_map<std::string, SourcePath> & inputAccessors,
+    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
     VerificationScope & scope)
 {
     switch (dep.type) {
@@ -1567,7 +1567,7 @@ enum class VerifyOutcome {
 
 bool TraceStore::verifyTrace(
     TraceId traceId,
-    const std::unordered_map<std::string, SourcePath> & inputAccessors,
+    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
     EvalState & state)
 {
     if (verifiedTraceIds.count(traceId))
@@ -2045,7 +2045,7 @@ TraceStore::RecordResult TraceStore::recordDeps(
 
 std::optional<TraceStore::VerifyResult> TraceStore::verify(
     std::string_view attrPath,
-    const std::unordered_map<std::string, SourcePath> & inputAccessors,
+    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
     EvalState & state)
 {
     auto verifyStart = timerStart();
@@ -2086,7 +2086,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::verify(
 std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     TraceId oldTraceId,
     std::string_view attrPath,
-    const std::unordered_map<std::string, SourcePath> & inputAccessors,
+    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
     EvalState & state)
 {
     auto recoveryStart = timerStart();

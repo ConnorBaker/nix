@@ -7,8 +7,9 @@
 #include "nix/expr/attr-path.hh"
 #include "nix/expr/eval-trace/result.hh"
 
+#include <boost/unordered/unordered_flat_map.hpp>
+
 #include <functional>
-#include <unordered_map>
 
 namespace nix::eval_trace {
 
@@ -37,7 +38,7 @@ class TraceCache : public std::enable_shared_from_this<TraceCache>
      * Used during trace verification (BSàlC verifying trace check) to validate dep hashes
      * against current file content.
      */
-    std::unordered_map<std::string, SourcePath> inputAccessors;
+    boost::unordered_flat_map<std::string, SourcePath> inputAccessors;
 
 public:
 
@@ -45,7 +46,7 @@ public:
         std::optional<std::reference_wrapper<const Hash>> useCache,
         EvalState & state,
         RootLoader rootLoader,
-        std::unordered_map<std::string, SourcePath> inputAccessors = {});
+        boost::unordered_flat_map<std::string, SourcePath> inputAccessors = {});
 
     /**
      * Get the real root value via rootLoader, bypassing the trace system.

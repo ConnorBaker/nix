@@ -1159,7 +1159,7 @@ TraceCache::TraceCache(
     std::optional<std::reference_wrapper<const Hash>> useCache,
     EvalState & state,
     RootLoader rootLoader,
-    std::unordered_map<std::string, SourcePath> inputAccessors)
+    boost::unordered_flat_map<std::string, SourcePath> inputAccessors)
     : state(state)
     , rootLoader(rootLoader)
     , inputAccessors(std::move(inputAccessors))
