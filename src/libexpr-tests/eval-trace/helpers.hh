@@ -598,7 +598,12 @@ protected:
         auto db = makeQueryDb();
         auto result = db.verify(attrPath, {}, state);
         if (!result) return {};
-        return db.loadFullTrace(result->traceId);
+        auto interned = db.loadFullTrace(result->traceId);
+        std::vector<Dep> deps;
+        deps.reserve(interned.size());
+        for (auto & idep : interned)
+            deps.push_back(db.resolveDep(idep));
+        return deps;
     }
 
     std::optional<CachedResult> getStoredResult(const std::string & attrPath)

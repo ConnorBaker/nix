@@ -190,7 +190,7 @@ TEST_F(TraceStoreTest, DepKeySets_SharedKeysDifferentValues)
     // Both have Content dep at index 0 (after sort); check the hash values differ
     bool foundDifference = false;
     for (size_t i = 0; i < loaded1.size(); i++) {
-        if (loaded1[i].expectedHash != loaded2[i].expectedHash) {
+        if (loaded1[i].hash != loaded2[i].hash) {
             foundDifference = true;
             break;
         }

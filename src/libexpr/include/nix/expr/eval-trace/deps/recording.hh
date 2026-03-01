@@ -5,6 +5,7 @@
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/counter.hh"
+#include "nix/util/position.hh"
 
 namespace nix::eval_trace {
 extern Counter nrDepTrackerScopes;

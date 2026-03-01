@@ -573,63 +573,45 @@ std::vector<DepHashValue> TraceStore::deserializeValues(
 
 // ── Dep key/value resolution ─────────────────────────────────────────
 
-std::vector<Dep> TraceStore::resolveDeps(
-    const std::vector<InternedDepKey> & keys,
-    const std::vector<DepHashValue> & values)
+std::string_view TraceStore::resolveString(StringId id) const
+{
+    if (id.value > 0 && id.value <= stringTable.size())
+        return stringTable[id.value - 1];
+    return "";
+}
+
+Dep TraceStore::resolveDep(const InternedDep & idep)
 {
     ensureStringTableLoaded();
-    std::vector<Dep> deps;
-    auto count = std::min(keys.size(), values.size());
-    deps.reserve(count);
-
-    auto lookupStr = [this](StringId id) -> const std::string & {
-        static const std::string empty;
-        if (id.value > 0 && id.value <= stringTable.size()) return stringTable[id.value - 1];
-        return empty;
-    };
-
-    for (size_t i = 0; i < count; ++i) {
-        auto & k = keys[i];
-        deps.push_back(Dep{
-            lookupStr(k.sourceId),
-            lookupStr(k.keyId),
-            values[i],
-            k.type
-        });
-    }
-
-    return deps;
+    return Dep{
+        std::string(resolveString(idep.key.sourceId)),
+        std::string(resolveString(idep.key.keyId)),
+        idep.hash,
+        idep.key.type};
 }
 
 std::vector<TraceStore::InternedDep> TraceStore::internDeps(const std::vector<CompactDep> & deps)
 {
+    // Bridge helper: cache session pool ID → DB StringId mapping to avoid
+    // re-interning the same strings on every call.
+    auto bridgePoolId = [this](std::vector<StringId> & bridge, auto poolId, auto & pool) -> StringId {
+        auto idx = poolId.value;
+        if (idx < bridge.size() && bridge[idx].value != 0)
+            return bridge[idx];
+        auto sid = doInternString(pool.resolve(poolId));
+        if (idx >= bridge.size())
+            bridge.resize(idx + 1);
+        bridge[idx] = sid;
+        return sid;
+    };
+
     std::vector<InternedDep> interned;
     interned.reserve(deps.size());
 
     for (auto & dep : deps) {
-        interned.push_back(InternedDep{
-            {dep.type,
-             doInternString(pools.depSourcePool.resolve(dep.sourceId)),
-             doInternString(pools.depKeyPool.resolve(dep.keyId))},
-            dep.expectedHash
-        });
-    }
-
-    return interned;
-}
-
-std::vector<TraceStore::InternedDep> TraceStore::internDeps(const std::vector<Dep> & deps)
-{
-    std::vector<InternedDep> interned;
-    interned.reserve(deps.size());
-
-    for (auto & dep : deps) {
-        interned.push_back(InternedDep{
-            {dep.type,
-             doInternString(dep.source),
-             doInternString(dep.key)},
-            dep.expectedHash
-        });
+        auto srcSid = bridgePoolId(depSourceIdMap, dep.sourceId, pools.depSourcePool);
+        auto keySid = bridgePoolId(depKeyIdMap, dep.keyId, pools.depKeyPool);
+        interned.push_back(InternedDep{{dep.type, srcSid, keySid}, dep.expectedHash});
     }
 
     return interned;
@@ -1015,6 +997,8 @@ void TraceStore::clearSessionCaches()
     pendingDepKeySets.clear();
     pendingTraces.clear();
     currentDepHashes.clear();
+    depSourceIdMap.clear();
+    depKeyIdMap.clear();
 
     // Repopulate in-memory maps from DB so the store remains usable
     bulkLoadAll();
@@ -1389,7 +1373,7 @@ Hash TraceStore::getTraceStructHash(TraceId traceId)
     return data->structHash;
 }
 
-std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
+std::vector<TraceStore::InternedDep> TraceStore::loadFullTrace(TraceId traceId)
 {
     // Check if deps already cached in unified traceDataCache
     auto it = traceDataCache.find(traceId);
@@ -1450,7 +1434,12 @@ std::vector<Dep> TraceStore::loadFullTrace(TraceId traceId)
     // Deserialize keys first (needed to type-dispatch values), then values
     auto keys = deserializeKeys(keysBlobCopy.data(), keysBlobCopy.size());
     auto values = deserializeValues(valuesBlobCopy.data(), valuesBlobCopy.size(), keys);
-    auto result = resolveDeps(keys, values);
+
+    // Zip keys + values into InternedDep vector (no string resolution)
+    std::vector<InternedDep> result;
+    result.reserve(keys.size());
+    for (size_t i = 0; i < std::min(keys.size(), values.size()); ++i)
+        result.push_back({keys[i], std::move(values[i])});
 
     // Also populate the dep key set cache for potential recovery use
     depKeySetCache.insert_or_assign(depKeySetId, keys);
@@ -1576,109 +1565,76 @@ bool TraceStore::verifyTrace(
     auto vtStart = timerStart();
     VerificationScope scope;
 
-    // Load the full trace (single DB read via JOIN)
+    // Load the full trace (single DB read via JOIN) — now vector<InternedDep>
     auto fullDeps = loadFullTrace(traceId);
-
-    // Two-level verification: Content and Directory failures can be overridden
-    // by passing StructuredContent deps that cover the same file/directory.
-    // This enables fine-grained invalidation for fromJSON(readFile f) and
-    // readDir patterns.
-    //
-    // ImplicitShape fallback: for failed sources with NO StructuredContent deps
-    // (e.g., an operand of // whose values were never accessed), ImplicitShape
-    // deps (creation-time #keys/#len) provide conservative verification. This
-    // enables structural recovery for multi-provenance // without losing
-    // single-provenance precision. For sources WITH SC deps, ImplicitShape is
-    // skipped (SC provides finer-grained verification that tolerates key
-    // additions irrelevant to the accessed values).
-    //
-    // First pass: verify non-structural deps, defer StructuredContent and
-    // ImplicitShape deps, track failed coarse (Content/Directory) deps.
+    ensureStringTableLoaded();  // needed for resolveString() calls below
 
     bool hasNonContentFailure = false;
     bool hasContentFailure = false;
     bool hasStructuralDeps = false;
     bool hasImplicitShapeDeps = false;
 
-    // Track failed coarse dep file identity keys (source + NUL + filePath)
     std::unordered_set<FileIdentity, FileIdentity::Hash> failedContentFiles;
-    // Deferred structural deps (StructuredContent)
-    std::vector<const Dep *> structuralDeps;
-    // Deferred implicit shape deps (ImplicitShape — creation-time #keys/#len)
-    std::vector<const Dep *> implicitShapeDeps;
+    // Deferred structural/implicit deps stored as indices into fullDeps
+    std::vector<size_t> structuralDepIndices;
+    std::vector<size_t> implicitShapeDepIndices;
 
-    for (auto & dep : fullDeps) {
+    for (size_t i = 0; i < fullDeps.size(); ++i) {
+        auto & idep = fullDeps[i];
         nrDepsChecked++;
 
-        if (isVolatile(dep.type)) {
+        if (isVolatile(idep.key.type)) {
             hasNonContentFailure = true;
             continue;
         }
 
-        // ImplicitShape deps (creation-time #keys/#len) are deferred.
-        // They serve as conservative structural fingerprints. During normal
-        // verification they never block; they're only verified as a fallback
-        // for failed sources that have no StructuredContent deps (enables
-        // structural recovery for multi-provenance // without losing
-        // precision for single-provenance //).
-        if (depKind(dep.type) == DepKind::ImplicitStructural) {
+        if (depKind(idep.key.type) == DepKind::ImplicitStructural) {
             hasImplicitShapeDeps = true;
-            implicitShapeDeps.push_back(&dep);
+            implicitShapeDepIndices.push_back(i);
             continue;
         }
 
-        if (depKind(dep.type) == DepKind::Structural) {
+        if (depKind(idep.key.type) == DepKind::Structural) {
             hasStructuralDeps = true;
-            structuralDeps.push_back(&dep);
+            structuralDepIndices.push_back(i);
             continue;
         }
 
-        // ParentContext: verify the parent's trace is valid AND hash matches.
-        // Recursive verification ensures stale parents don't make children appear valid.
-        // verifiedTraceIds cache prevents infinite loops and ensures O(N) total work.
-        //
-        // IMPORTANT: verify the parent FIRST, then check the hash. Verification
-        // may update the parent's cached trace_hash when Content deps failed and
-        // ImplicitShape-only (value-blind) coverage was used. Checking the hash
-        // before verification would compare against the stale stored hash and
-        // incorrectly pass.
-        if (depKind(dep.type) == DepKind::ParentContext) {
-            std::string path(dep.key);
+        if (depKind(idep.key.type) == DepKind::ParentContext) {
+            auto keyStr = std::string(resolveString(idep.key.keyId));
+            std::string path(keyStr);
             std::replace(path.begin(), path.end(), '\t', '\0');
             auto parentRow = lookupTraceRow(path);
             if (parentRow && verifyTrace(parentRow->traceId, inputAccessors, state)) {
-                // Parent is valid. Now check that the trace hash matches.
-                // getCurrentTraceHash returns the (potentially updated) hash
-                // after verification recomputed it for content overrides.
-                auto parentTraceHash = getCurrentTraceHash(dep.key);
+                auto parentTraceHash = getCurrentTraceHash(keyStr);
                 if (parentTraceHash) {
-                    auto * expected = std::get_if<Blake3Hash>(&dep.expectedHash);
+                    auto * expected = std::get_if<Blake3Hash>(&idep.hash);
                     if (expected && std::memcmp(expected->bytes.data(), parentTraceHash->hash, 32) == 0) {
-                        continue; // parent valid AND hash unchanged → dep passes
+                        continue;
                     }
                 }
             }
-            // Parent trace changed, missing, or invalid → non-content failure
             nrVerificationsFailed++;
             hasNonContentFailure = true;
             continue;
         }
 
-        DepKey dk(dep);
-        auto cacheIt = currentDepHashes.find(dk);
+        // Cache lookup: integer key, zero allocation
+        auto cacheIt = currentDepHashes.find(idep.key);
         std::optional<DepHashValue> current;
-
         if (cacheIt != currentDepHashes.end()) {
             current = cacheIt->second;
         } else {
+            auto dep = resolveDep(idep);
             current = computeCurrentHash(state, dep, inputAccessors, scope);
-            currentDepHashes[dk] = current;
+            currentDepHashes[idep.key] = current;
         }
 
-        if (!current || *current != dep.expectedHash) {
+        if (!current || *current != idep.hash) {
             nrVerificationsFailed++;
-            if (isContentOverrideable(dep.type)) {
+            if (isContentOverrideable(idep.key.type)) {
                 hasContentFailure = true;
+                auto dep = resolveDep(idep);
                 failedContentFiles.insert(contentFileIdentity(dep));
             } else {
                 hasNonContentFailure = true;
@@ -1688,29 +1644,29 @@ bool TraceStore::verifyTrace(
 
     // ── Pass 2: Resolve overrides and determine outcome ─────────────
 
-    // Helper: verify a set of structural/implicit deps against current hashes.
-    // Returns false on first failure. Recovery computes any missing hashes
-    // on demand, so short-circuiting here is safe and avoids unnecessary work.
-    auto verifyDeps = [&](const std::vector<const Dep *> & deps,
+    // Helper: verify a set of structural/implicit deps (by index) against current hashes.
+    auto verifyDeps = [&](const std::vector<size_t> & indices,
                           const std::unordered_set<FileIdentity, FileIdentity::Hash> * skipFiles = nullptr,
                           const std::unordered_set<FileIdentity, FileIdentity::Hash> * onlyFiles = nullptr) -> bool {
-        for (auto * dep : deps) {
+        for (auto idx : indices) {
+            auto & idep = fullDeps[idx];
             if (skipFiles || onlyFiles) {
-                auto fileKey = scFileIdentity(*dep);
+                auto dep = resolveDep(idep);
+                auto fileKey = scFileIdentity(dep);
                 if (skipFiles && skipFiles->count(fileKey)) continue;
                 if (onlyFiles && !onlyFiles->count(fileKey)) continue;
             }
             nrDepsChecked++;
-            DepKey dk(*dep);
-            auto cacheIt = currentDepHashes.find(dk);
+            auto cacheIt = currentDepHashes.find(idep.key);
             std::optional<DepHashValue> current;
             if (cacheIt != currentDepHashes.end()) {
                 current = cacheIt->second;
             } else {
-                current = computeCurrentHash(state, *dep, inputAccessors, scope);
-                currentDepHashes[dk] = current;
+                auto dep = resolveDep(idep);
+                current = computeCurrentHash(state, dep, inputAccessors, scope);
+                currentDepHashes[idep.key] = current;
             }
-            if (!current || *current != dep->expectedHash) {
+            if (!current || *current != idep.hash) {
                 nrVerificationsFailed++;
                 return false;
             }
@@ -1721,37 +1677,30 @@ bool TraceStore::verifyTrace(
     VerifyOutcome outcome;
 
     if (hasNonContentFailure) {
-        // Non-coarse, non-structural failure → trace invalid (no override possible)
         outcome = VerifyOutcome::Invalid;
     } else if (!hasContentFailure) {
-        // No coarse failures. Verify standalone structural deps — SC or ImplicitShape
-        // deps for files WITHOUT a Content/Directory dep in this trace. These arise
-        // from cross-trace dep separation: a child trace inherits ExprTracedData
-        // thunks from the parent's result but has no Content dep for the file.
         bool standalonePassed = true;
         if (hasStructuralDeps || hasImplicitShapeDeps) {
             std::unordered_set<FileIdentity, FileIdentity::Hash> coveredFiles;
-            for (auto & dep : fullDeps) {
-                if (isContentOverrideable(dep.type))
+            for (auto & idep : fullDeps) {
+                if (isContentOverrideable(idep.key.type)) {
+                    auto dep = resolveDep(idep);
                     coveredFiles.insert(contentFileIdentity(dep));
+                }
             }
-            standalonePassed = verifyDeps(structuralDeps, &coveredFiles)
-                            && verifyDeps(implicitShapeDeps, &coveredFiles);
+            standalonePassed = verifyDeps(structuralDepIndices, &coveredFiles)
+                            && verifyDeps(implicitShapeDepIndices, &coveredFiles);
         }
         outcome = standalonePassed ? VerifyOutcome::Valid : VerifyOutcome::Invalid;
     } else if (hasContentFailure && (hasStructuralDeps || hasImplicitShapeDeps)) {
-        // Coarse failure(s) exist AND structural/implicit-shape deps are present.
-        // Two-tier coverage: SC provides fine-grained, ImplicitShape provides fallback.
-
-        // Build coverage sets: which files are covered by SC vs ImplicitShape.
         std::unordered_set<FileIdentity, FileIdentity::Hash> structuralCoveredFiles;
-        for (auto * dep : structuralDeps) {
-            auto fi = scFileIdentity(*dep);
+        for (auto idx : structuralDepIndices) {
+            auto dep = resolveDep(fullDeps[idx]);
+            auto fi = scFileIdentity(dep);
             structuralCoveredFiles.insert(fi);
-            // DirSet dep: also cover each individual directory
             if (fi.filePath.starts_with("ds:")) {
                 try {
-                    auto j = nlohmann::json::parse(dep->key);
+                    auto j = nlohmann::json::parse(dep.key);
                     if (j.contains("dirs")) {
                         for (auto & dir : j["dirs"]) {
                             if (dir.is_array() && dir.size() == 2)
@@ -1763,11 +1712,11 @@ bool TraceStore::verifyTrace(
         }
 
         std::unordered_set<FileIdentity, FileIdentity::Hash> implicitCoveredFiles;
-        for (auto * dep : implicitShapeDeps) {
-            implicitCoveredFiles.insert(scFileIdentity(*dep));
+        for (auto idx : implicitShapeDepIndices) {
+            auto dep = resolveDep(fullDeps[idx]);
+            implicitCoveredFiles.insert(scFileIdentity(dep));
         }
 
-        // Check that all failed coarse deps are covered by EITHER SC or ImplicitShape.
         bool allCovered = true;
         bool hasImplicitOnly = false;
         for (auto & failedFile : failedContentFiles) {
@@ -1784,11 +1733,9 @@ bool TraceStore::verifyTrace(
 
         if (!allCovered) {
             outcome = VerifyOutcome::Invalid;
-        } else if (!verifyDeps(structuralDeps)) {
-            // Verify all SC deps (fine-grained verification)
+        } else if (!verifyDeps(structuralDepIndices)) {
             outcome = VerifyOutcome::Invalid;
-        } else if (!verifyDeps(implicitShapeDeps, &structuralCoveredFiles, &failedContentFiles)) {
-            // Verify ImplicitShape deps ONLY for failed files NOT covered by SC
+        } else if (!verifyDeps(implicitShapeDepIndices, &structuralCoveredFiles, &failedContentFiles)) {
             outcome = VerifyOutcome::Invalid;
         } else if (hasImplicitOnly) {
             outcome = VerifyOutcome::ValidViaImplicitShapeOverride;
@@ -1796,7 +1743,6 @@ bool TraceStore::verifyTrace(
             outcome = VerifyOutcome::ValidViaStructuralOverride;
         }
     } else {
-        // Coarse failure with no structural or implicit-shape deps → invalid
         outcome = VerifyOutcome::Invalid;
     }
 
@@ -1809,40 +1755,33 @@ bool TraceStore::verifyTrace(
         break;
 
     case VerifyOutcome::ValidViaImplicitShapeOverride: {
-        // ImplicitShape is value-blind (key set check only). Values may have
-        // changed despite the key set being identical. Recompute trace_hash
-        // from current dep hashes so downstream ParentContext deps detect
-        // the potential value change.
-        std::vector<Dep> currentDeps;
-        currentDeps.reserve(fullDeps.size());
-        for (auto & dep : fullDeps) {
-            if (depKind(dep.type) == DepKind::ParentContext) {
-                auto parentHash = getCurrentTraceHash(dep.key);
+        // Build InternedDep directly — no internDeps round-trip needed
+        std::vector<InternedDep> currentInterned;
+        currentInterned.reserve(fullDeps.size());
+        for (auto & idep : fullDeps) {
+            if (depKind(idep.key.type) == DepKind::ParentContext) {
+                auto keyStr = std::string(resolveString(idep.key.keyId));
+                auto parentHash = getCurrentTraceHash(keyStr);
                 if (parentHash) {
                     Blake3Hash b3;
                     std::memcpy(b3.bytes.data(), parentHash->hash, 32);
-                    currentDeps.push_back({dep.source, dep.key, DepHashValue(b3), dep.type});
+                    currentInterned.push_back({idep.key, DepHashValue(b3)});
                 } else {
-                    currentDeps.push_back(dep);
+                    currentInterned.push_back(idep);
                 }
             } else {
-                DepKey dk(dep);
-                auto cacheIt = currentDepHashes.find(dk);
+                auto cacheIt = currentDepHashes.find(idep.key);
                 if (cacheIt != currentDepHashes.end() && cacheIt->second) {
-                    currentDeps.push_back({dep.source, dep.key, *cacheIt->second, dep.type});
+                    currentInterned.push_back({idep.key, *cacheIt->second});
                 } else {
-                    currentDeps.push_back(dep);
+                    currentInterned.push_back(idep);
                 }
             }
         }
-        auto interned = internDeps(currentDeps);
-        sortAndDedupInterned(interned);
+        sortAndDedupInterned(currentInterned);
         ensureStringTableLoaded();
-        auto lookupStr = [this](StringId id) -> std::string_view {
-            if (id.value > 0 && id.value <= stringTable.size()) return stringTable[id.value - 1];
-            return "";
-        };
-        auto newTraceHash = computeTraceHashFromInterned(interned, lookupStr);
+        auto lookupStr = [this](StringId id) { return resolveString(id); };
+        auto newTraceHash = computeTraceHashFromInterned(currentInterned, lookupStr);
         auto * data = ensureTraceHashes(traceId);
         if (data) {
             data->traceHash = newTraceHash;
@@ -1946,10 +1885,7 @@ TraceStore::RecordResult TraceStore::record(
     sortAndDedupInterned(interned);
 
     // 3. String lookup for hash computation
-    auto lookupString = [this](StringId id) -> std::string_view {
-        if (id.value > 0 && id.value <= stringTable.size()) return stringTable[id.value - 1];
-        return "";
-    };
+    auto lookupString = [this](StringId id) { return resolveString(id); };
 
     // 4. Compute trace_hash (BLAKE3 of full sorted deps including hashes)
     auto traceHash = computeTraceHashFromInterned(interned, lookupString);
@@ -2002,14 +1938,7 @@ TraceStore::RecordResult TraceStore::record(
         auto & data = traceDataCache[traceId];
         data.traceHash = traceHash;
         data.structHash = structHash;
-        // Reconstruct sorted Dep vector from interned for cache compatibility
-        data.deps = resolveDeps(keys,
-            [&]() {
-                std::vector<DepHashValue> vals;
-                vals.reserve(interned.size());
-                for (auto & d : interned) vals.push_back(d.hash);
-                return vals;
-            }());
+        data.deps = interned;  // already vector<InternedDep> from sort/dedup
         assert(data.hashesPopulated() && "recording trace with placeholder (all-zero) hashes");
     }
     depKeySetCache.insert_or_assign(depKeySetId, keys);
@@ -2093,12 +2022,13 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     nrRecoveryAttempts++;
     VerificationScope scope;
 
-    // Load old trace's full deps
+    // Load old trace's full deps — now vector<InternedDep>
     auto oldDeps = loadFullTrace(oldTraceId);
+    ensureStringTableLoaded();  // needed for resolveString() calls below
 
     // Check for volatile deps → immediate abort
-    for (auto & dep : oldDeps) {
-        if (isVolatile(dep.type)) {
+    for (auto & idep : oldDeps) {
+        if (isVolatile(idep.key.type)) {
             debug("recovery: aborting for '%s' -- contains volatile dep", displayAttrPath(attrPath));
             nrRecoveryFailures++;
             nrRecoveryTimeUs += elapsedUs(recoveryStart);
@@ -2106,49 +2036,45 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         }
     }
 
-    // Recompute current hashes for old dep keys, using currentDepHashes
-    std::vector<Dep> currentDeps;
+    // Build InternedDep directly — no round-trip through Dep + internDeps
+    std::vector<InternedDep> currentInterned;
     bool allComputable = true;
-    for (auto & dep : oldDeps) {
-        // ParentContext: recursively verify the parent trace FIRST, then
-        // compute current trace hash. Verification may update the parent's
-        // cached trace_hash (ImplicitShape-only content override), so hash
-        // must be read after.
-        if (depKind(dep.type) == DepKind::ParentContext) {
-            std::string path(dep.key);
+    for (auto & idep : oldDeps) {
+        if (depKind(idep.key.type) == DepKind::ParentContext) {
+            auto keyStr = std::string(resolveString(idep.key.keyId));
+            std::string path(keyStr);
             std::replace(path.begin(), path.end(), '\t', '\0');
             auto parentRow = lookupTraceRow(path);
             if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state)) {
                 allComputable = false; break;
             }
-            auto parentTraceHash = getCurrentTraceHash(dep.key);
+            auto parentTraceHash = getCurrentTraceHash(keyStr);
             if (!parentTraceHash) { allComputable = false; break; }
             Blake3Hash b3;
             std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
-            currentDeps.push_back({dep.source, dep.key, DepHashValue(b3), dep.type});
+            currentInterned.push_back({idep.key, DepHashValue(b3)});
             continue;
         }
 
-        DepKey dk(dep);
-        auto cacheIt = currentDepHashes.find(dk);
+        auto cacheIt = currentDepHashes.find(idep.key);
         std::optional<DepHashValue> current;
-
         if (cacheIt != currentDepHashes.end()) {
             current = cacheIt->second;
         } else {
+            auto dep = resolveDep(idep);
             current = computeCurrentHash(state, dep, inputAccessors, scope);
-            currentDepHashes[dk] = current;
+            currentDepHashes[idep.key] = current;
         }
 
         if (!current) {
             allComputable = false;
             break;
         }
-        currentDeps.push_back({dep.source, dep.key, *current, dep.type});
+        currentInterned.push_back({idep.key, *current});
     }
 
     debug("recovery: recomputed %d/%d dep hashes for '%s'",
-          currentDeps.size(), oldDeps.size(), displayAttrPath(attrPath));
+          currentInterned.size(), oldDeps.size(), displayAttrPath(attrPath));
 
     // Resolve attr_path_id for DB lookups
     auto pathKey = std::string(attrPath);
@@ -2177,10 +2103,6 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     boost::unordered_flat_set<TraceId, TraceId::Hash> triedTraceIds;
 
     // === Pre-load: scan history with widened query ===
-    // Single DB query pre-loads trace_hash + result data for ALL history entries.
-    // This enables in-memory candidate matching for both directHash and structural
-    // variant recovery, eliminating per-group lookupTraceByFullHash DB calls and
-    // per-candidate getResult DB calls.
     struct HistoryEntry {
         DepKeySetId depKeySetId;
         Hash structHash;
@@ -2199,8 +2121,6 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     std::vector<HistoryEntry> historyEntries;
     {
         auto st(_state->lock());
-        // scanHistoryForAttr columns: 0=dk.id, 1=dk.struct_hash, 2=h.trace_id,
-        //   3=h.result_id, 4=t.trace_hash, 5=r.type, 6=r.value, 7=r.context
         auto use(st->scanHistoryForAttr.use()(contextHash)(static_cast<int64_t>(attrPathId->value)));
         while (use.next()) {
             auto [shData, shSize] = use.getBlob(1);
@@ -2219,66 +2139,43 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     }
 
     // Build in-memory trace_hash → entry index lookup.
-    // Key: raw 32-byte hash as std::string (efficient hashing, no custom hasher needed).
-    // trace_hash is UNIQUE in the Traces table, so each hash maps to at most one entry.
-    // When duplicates exist in history (same trace_id appearing multiple times), the
-    // first entry wins via emplace — all duplicates have the same result data.
-    std::unordered_map<std::string, size_t> traceHashToEntry;
-    for (size_t i = 0; i < historyEntries.size(); i++) {
-        auto & e = historyEntries[i];
-        std::string hashKey(reinterpret_cast<const char *>(e.traceHash.hash), e.traceHash.hashSize);
-        traceHashToEntry.emplace(hashKey, i);
-    }
+    // Uses Hash key directly (no string construction needed).
+    boost::unordered_flat_map<Hash, size_t, HashKeyHash> traceHashToEntry;
+    for (size_t i = 0; i < historyEntries.size(); i++)
+        traceHashToEntry.emplace(historyEntries[i].traceHash, i);
 
-    // Look up a candidate trace_hash in the pre-loaded in-memory map.
-    // Returns null if no history entry has this hash (the trace either doesn't
-    // exist or exists for a different attr path — either way, not recoverable).
     auto lookupCandidate = [&](const Hash & candidateHash) -> const HistoryEntry * {
-        std::string hashKey(reinterpret_cast<const char *>(candidateHash.hash), candidateHash.hashSize);
-        auto it = traceHashToEntry.find(hashKey);
+        auto it = traceHashToEntry.find(candidateHash);
         if (it == traceHashToEntry.end()) return nullptr;
         return &historyEntries[it->second];
     };
 
-    // Accept a candidate found via in-memory trace_hash matching. The hash match
-    // proves all deps match current state (collision probability: 2^-256),
-    // so no dep-by-dep verifyTrace call is needed.
-    // Result data is pre-loaded from the widened scan — only upsertAttr needs DB.
     auto acceptRecoveredTrace = [&](const HistoryEntry & entry) -> std::optional<VerifyResult> {
         if (triedTraceIds.count(entry.traceId))
             return std::nullopt;
         triedTraceIds.insert(entry.traceId);
 
-        // Update CurrentTraces to point to recovered trace + result (only remaining DB call)
         {
             auto st(_state->lock());
             st->upsertAttr.use()
                 (contextHash)(static_cast<int64_t>(attrPathId->value))(static_cast<int64_t>(entry.traceId.value))(static_cast<int64_t>(entry.resultId.value)).exec();
         }
 
-        // Update traceRowCache so subsequent lookupTraceRow/getCurrentTraceHash
-        // calls for this attr path reflect the recovered state.
         TraceRow newRow{entry.traceId, entry.resultId, entry.type, entry.value, entry.context};
         traceRowCache[pathKey] = newRow;
 
-        // Hash match guarantees all deps match current state
         verifiedTraceIds.insert(entry.traceId);
         return VerifyResult{decodeCachedResult(newRow), entry.traceId};
     };
 
-    // String lookup for interned hash computation (used by both recovery paths)
-    auto lookupString = [this](StringId id) -> std::string_view {
-        if (id.value > 0 && id.value <= stringTable.size()) return stringTable[id.value - 1];
-        return "";
-    };
+    // String lookup for interned hash computation
+    auto lookupString = [this](StringId id) { return resolveString(id); };
 
     // === Direct hash recovery (BSàlC CT) ===
-    // Recompute trace_hash from current dep hashes. In-memory lookup.
     if (allComputable) {
         auto directHashStart = timerStart();
-        auto interned = internDeps(currentDeps);
-        sortAndDedupInterned(interned);
-        auto newFullHash = computeTraceHashFromInterned(interned, lookupString);
+        sortAndDedupInterned(currentInterned);
+        auto newFullHash = computeTraceHashFromInterned(currentInterned, lookupString);
 
         if (auto * entry = lookupCandidate(newFullHash)) {
             if (auto r = acceptRecoveredTrace(*entry)) {
@@ -2292,27 +2189,17 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         nrRecoveryDirectHashTimeUs += elapsedUs(directHashStart);
     }
 
-    // If direct hash recovery tried the old trace's dep structure (allComputable),
-    // save its struct_hash so we can skip identical structures in variant scan.
     std::optional<Hash> directHashStructHash;
     if (allComputable) {
         directHashStructHash = getTraceStructHash(oldTraceId);
     }
 
-    // === Structural variant recovery (novel extension beyond BSàlC) ===
-    // Handles dynamic dep instability (Shake-style): the same attribute can have
-    // different dep structures across evaluations. Groups history entries by
-    // dep_key_set_id, loads key set once per group, recomputes current hashes,
-    // and matches against in-memory trace_hash map. O(V) where V = number of
-    // distinct dep structures. Zero values_blob decompression needed.
+    // === Structural variant recovery ===
     auto structVariantStart = timerStart();
 
     debug("recovery: structural variant scan for '%s' -- scanning %d history entries",
           displayAttrPath(attrPath), historyEntries.size());
 
-    // Group by dep_key_set_id (integer), pick one representative per group.
-    // Using dep_key_set_id instead of struct_hash for grouping is more efficient
-    // (integer comparison vs 32-byte hash comparison).
     boost::unordered_flat_map<DepKeySetId, TraceId, DepKeySetId::Hash> structGroups;
     boost::unordered_flat_map<DepKeySetId, Hash, DepKeySetId::Hash> groupStructHashes;
     for (auto & e : historyEntries) {
@@ -2325,79 +2212,66 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     for (auto & [depKeySetId, repTraceId] : structGroups) {
         if (triedTraceIds.count(repTraceId))
             continue;
-        // Skip structural variants identical to the one direct hash recovery already tried
         auto structHashIt = groupStructHashes.find(depKeySetId);
         if (directHashStructHash && structHashIt != groupStructHashes.end()
             && structHashIt->second == *directHashStructHash)
             continue;
 
-        // Load only the dep key set (no values_blob decompression).
-        // Session-cached: subsequent traces with the same dep structure hit the cache.
         auto repKeys = loadKeySet(depKeySetId);
         ensureStringTableLoaded();
 
-        // Resolve keys to Dep objects and look up current hashes
-        std::vector<Dep> repCurrentDeps;
+        // Build InternedDep directly using InternedDepKey
+        std::vector<InternedDep> repInterned;
         bool repComputable = true;
         for (auto & key : repKeys) {
-            auto type = key.type;
-
-            if (isVolatile(type)) {
+            if (isVolatile(key.type)) {
                 repComputable = false;
                 break;
             }
 
-            // Resolve string IDs to strings
-            std::string source = key.sourceId.value > 0 && key.sourceId.value <= stringTable.size()
-                ? stringTable[key.sourceId.value - 1] : "";
-            std::string depKey = key.keyId.value > 0 && key.keyId.value <= stringTable.size()
-                ? stringTable[key.keyId.value - 1] : "";
-
-            // ParentContext: verify first, then get (potentially updated) hash.
-            if (depKind(type) == DepKind::ParentContext) {
-                std::string path(depKey);
+            if (depKind(key.type) == DepKind::ParentContext) {
+                auto keyStr = std::string(resolveString(key.keyId));
+                std::string path(keyStr);
                 std::replace(path.begin(), path.end(), '\t', '\0');
                 auto parentRow = lookupTraceRow(path);
                 if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state)) {
                     repComputable = false; break;
                 }
-                auto parentTraceHash = getCurrentTraceHash(depKey);
+                auto parentTraceHash = getCurrentTraceHash(keyStr);
                 if (!parentTraceHash) { repComputable = false; break; }
                 Blake3Hash b3;
                 std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
-                repCurrentDeps.push_back({source, depKey, DepHashValue(b3), type});
+                repInterned.push_back({key, DepHashValue(b3)});
                 continue;
             }
 
-            // Look up pre-computed hash from currentDepHashes (populated by verify step)
-            DepKey dk(type, source, depKey);
-            auto cacheIt = currentDepHashes.find(dk);
+            // Direct InternedDepKey lookup — zero allocation
+            auto cacheIt = currentDepHashes.find(key);
             std::optional<DepHashValue> current;
-
             if (cacheIt != currentDepHashes.end()) {
                 current = cacheIt->second;
             } else {
-                // Dep not in cache — must be a new key not seen in old trace.
-                // Construct a synthetic Dep for hash computation.
-                Dep syntheticDep{source, depKey, DepHashValue{Blake3Hash{}}, type};
+                // Resolve strings only on cache miss
+                Dep syntheticDep{
+                    std::string(resolveString(key.sourceId)),
+                    std::string(resolveString(key.keyId)),
+                    DepHashValue{Blake3Hash{}}, key.type};
                 current = computeCurrentHash(state, syntheticDep, inputAccessors, scope);
-                currentDepHashes[dk] = current;
+                currentDepHashes[key] = current;
             }
 
             if (!current) {
                 repComputable = false;
                 break;
             }
-            repCurrentDeps.push_back({source, depKey, *current, type});
+            repInterned.push_back({key, *current});
         }
         if (!repComputable)
             continue;
 
-        auto repInterned = internDeps(repCurrentDeps);
         sortAndDedupInterned(repInterned);
         auto candidateFullHash = computeTraceHashFromInterned(repInterned, lookupString);
 
-        // In-memory lookup instead of per-group DB query
         if (auto * entry = lookupCandidate(candidateFullHash)) {
             if (auto r = acceptRecoveredTrace(*entry)) {
                 debug("recovery: structural variant recovery succeeded for '%s'", displayAttrPath(attrPath));

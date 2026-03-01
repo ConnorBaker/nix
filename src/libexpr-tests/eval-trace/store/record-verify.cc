@@ -136,7 +136,7 @@ TEST_F(TraceStoreTest, ColdStore_WithParent)
     // loadFullTrace returns only the child's own deps (no parent merging)
     auto childDeps = db.loadFullTrace(childResult.traceId);
     EXPECT_EQ(childDeps.size(), 1u);
-    EXPECT_EQ(childDeps[0].type, DepType::EnvVar);
+    EXPECT_EQ(childDeps[0].key.type, DepType::EnvVar);
 }
 
 TEST_F(TraceStoreTest, ColdStore_Deterministic)

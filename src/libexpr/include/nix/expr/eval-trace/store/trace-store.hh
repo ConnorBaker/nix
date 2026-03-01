@@ -134,13 +134,22 @@ struct TraceStore {
     InterningPools & pools;
     int64_t contextHash;
 
-    // Interned dep key (string IDs, no hash value — used for keys_blob serialization).
-    // Ordering is not required; entries are serialized positionally in keys_blob
-    // and indexed by DepKeySetId in the session cache.
+    // Interned dep key (string IDs, no hash value). Used for keys_blob serialization
+    // (positionally in keys_blob, indexed by DepKeySetId in the session cache)
+    // and as the key type for currentDepHashes (replacing string-based DepKey).
     struct InternedDepKey {
         DepType type;
         StringId sourceId;
         StringId keyId;
+
+        bool operator==(const InternedDepKey &) const = default;
+
+        struct Hash {
+            using is_avalanching = void;
+            std::size_t operator()(const InternedDepKey & k) const noexcept {
+                return hashValues(std::to_underlying(k.type), k.sourceId.value, k.keyId.value);
+            }
+        };
     };
 
     // Interned dep entry (key + hash value — used for full dep reconstruction)
@@ -165,7 +174,7 @@ struct TraceStore {
     struct CachedTraceData {
         Hash traceHash{HashAlgorithm::BLAKE3};
         Hash structHash{HashAlgorithm::BLAKE3};
-        std::optional<std::vector<Dep>> deps;
+        std::optional<std::vector<InternedDep>> deps;
 
         /** True if hash fields have been populated from DB (non-placeholder).
          *  Checks traceHash — if it's populated, structHash was populated
@@ -218,7 +227,12 @@ struct TraceStore {
     /// Current dep hash cache (persists across verification → recovery within session).
     /// Value is nullopt if the dep's resource is unavailable (e.g., file deleted);
     /// this caches the failure to avoid re-attempting expensive hash computations.
-    boost::unordered_flat_map<DepKey, std::optional<DepHashValue>, DepKey::Hash> currentDepHashes;
+    boost::unordered_flat_map<InternedDepKey, std::optional<DepHashValue>, InternedDepKey::Hash> currentDepHashes;
+
+    /// Pool-to-store bridge: cached mapping from session pool IDs to DB StringIds.
+    /// Avoids re-interning the same strings on every internDeps(CompactDep) call.
+    std::vector<StringId> depSourceIdMap;  // DepSourceId.value → StringId
+    std::vector<StringId> depKeyIdMap;     // DepKeyId.value → StringId
 
     // ── In-memory ID counters (next ID to assign = max(DB IDs) + 1) ──
 
@@ -359,9 +373,9 @@ struct TraceStore {
      * Single DB round-trip + two zstd decompressions. O(D) in dep count.
      *
      * The returned vector is NOT sorted. Callers that need canonical ordering
-     * must call sortAndDedupDeps() explicitly.
+     * must call sortAndDedupInterned() explicitly.
      */
-    std::vector<Dep> loadFullTrace(TraceId traceId);
+    std::vector<InternedDep> loadFullTrace(TraceId traceId);
 
     /**
      * Load just the dep key set for a DepKeySets row (no hash values).
@@ -401,11 +415,15 @@ struct TraceStore {
     static std::vector<DepHashValue> deserializeValues(
         const void * blob, size_t size, const std::vector<InternedDepKey> & keys);
 
-    // Full dep interning/resolution (combines key set + values)
-    std::vector<Dep> resolveDeps(const std::vector<InternedDepKey> & keys,
-                                  const std::vector<DepHashValue> & values);
+    /// Resolve a single InternedDep to a string-based Dep (for computeCurrentHash, tests).
+    Dep resolveDep(const InternedDep & idep);
+
+    /// Resolve a StringId to its string value. O(1) array lookup.
+    std::string_view resolveString(StringId id) const;
+
+    /// Intern session-pool CompactDeps into DB StringIds (InternedDep).
+    /// Uses depSourceIdMap/depKeyIdMap bridge for cached pool→store mapping.
     std::vector<InternedDep> internDeps(const std::vector<CompactDep> & deps);
-    std::vector<InternedDep> internDeps(const std::vector<Dep> & deps);
 
     /**
      * Verify a single trace: recompute all dep hashes and compare against

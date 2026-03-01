@@ -462,8 +462,10 @@ void TracedExpr::replayTrace(TraceId traceId)
     try {
         auto & pools = *cache->state.traceCtx->pools;
         auto deps = cache->dbBackend->loadFullTrace(traceId);
-        for (auto & dep : deps)
+        for (auto & idep : deps) {
+            auto dep = cache->dbBackend->resolveDep(idep);
             DependencyTracker::recordReplay(pools, dep);
+        }
     } catch (std::exception &) {
         // DB may be corrupt or trace may have been evicted — skip
     }

@@ -288,7 +288,8 @@ TEST_F(TraceStoreTest, Record_SeparatedDeps)
 
     // Verify B trace has the modified dep hash
     bool foundModified = false;
-    for (auto & dep : loadedB) {
+    for (auto & idep : loadedB) {
+        auto dep = db.resolveDep(idep);
         if (dep.key == "/f99.nix") {
             auto h = depHash("c99-modified");
             EXPECT_EQ(dep.expectedHash, DepHashValue(h));
