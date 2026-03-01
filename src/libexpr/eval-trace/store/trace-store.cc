@@ -575,14 +575,11 @@ std::vector<DepHashValue> TraceStore::deserializeValues(
 
 std::string_view TraceStore::resolveString(StringId id) const
 {
-    if (id.value > 0 && id.value <= stringTable.size())
-        return stringTable[id.value - 1];
-    return "";
+    return pools.strings.resolve(id);
 }
 
 Dep TraceStore::resolveDep(const InternedDep & idep)
 {
-    ensureStringTableLoaded();
     return Dep{
         std::string(resolveString(idep.key.sourceId)),
         std::string(resolveString(idep.key.keyId)),
@@ -592,27 +589,17 @@ Dep TraceStore::resolveDep(const InternedDep & idep)
 
 std::vector<TraceStore::InternedDep> TraceStore::internDeps(const std::vector<CompactDep> & deps)
 {
-    // Bridge helper: cache session pool ID → DB StringId mapping to avoid
-    // re-interning the same strings on every call.
-    auto bridgePoolId = [this](std::vector<StringId> & bridge, auto poolId, auto & pool) -> StringId {
-        auto idx = poolId.value;
-        if (idx < bridge.size() && bridge[idx].value != 0)
-            return bridge[idx];
-        auto sid = doInternString(pool.resolve(poolId));
-        if (idx >= bridge.size())
-            bridge.resize(idx + 1);
-        bridge[idx] = sid;
-        return sid;
-    };
-
+    // DepSourceId, DepKeyId, and StringId all share the same StringInternTable
+    // index space. Conversion is a raw value copy — no string lookup needed.
+    // SAFETY: Only valid within the same pool generation. If pools.strings is
+    // cleared between recording and calling internDeps(), the IDs become invalid.
     std::vector<InternedDep> interned;
     interned.reserve(deps.size());
 
-    for (auto & dep : deps) {
-        auto srcSid = bridgePoolId(depSourceIdMap, dep.sourceId, pools.depSourcePool);
-        auto keySid = bridgePoolId(depKeyIdMap, dep.keyId, pools.depKeyPool);
-        interned.push_back(InternedDep{{dep.type, srcSid, keySid}, dep.expectedHash});
-    }
+    for (auto & dep : deps)
+        interned.push_back(InternedDep{
+            {dep.type, StringId(dep.sourceId.value), StringId(dep.keyId.value)},
+            dep.expectedHash});
 
     return interned;
 }
@@ -855,14 +842,12 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, int64_t co
     {
         auto use(st->getAllStrings.use());
         while (use.next()) {
-            auto id = StringId(static_cast<uint32_t>(use.getInt(0)));
-            auto value = std::string(use.getStr(1));
-            if (id.value > stringTable.size()) stringTable.resize(id.value);
-            stringTable[id.value - 1] = value;
-            internedStrings[value] = id;
-            if (id > nextStringId) nextStringId = id;
+            auto id = static_cast<uint32_t>(use.getInt(0));
+            auto value = use.getStr(1);
+            pools.strings.bulkLoad(id, value);
+            if (id > flushedStringHighWaterMark)
+                flushedStringHighWaterMark = id;
         }
-        stringTableLoaded = true;
     }
     {
         auto use(st->getAllAttrPaths.use());
@@ -976,7 +961,6 @@ std::string TraceStore::buildAttrPath(const std::vector<std::string> & component
 void TraceStore::clearSessionCaches()
 {
     verifiedTraceIds.clear();
-    internedStrings.clear();
     internedAttrPaths.clear();
     resultByHash.clear();
     depKeySetByStructHash.clear();
@@ -984,42 +968,20 @@ void TraceStore::clearSessionCaches()
     traceDataCache.clear();
     traceRowCache.clear();
     depKeySetCache.clear();
-    stringTable.clear();
-    stringTableLoaded = false;
-    nextStringId = StringId();
+    pools.strings.clear();
+    flushedStringHighWaterMark = 0;
     nextAttrPathId = AttrPathId();
     nextResultId = ResultId();
     nextDepKeySetId = DepKeySetId();
     nextTraceId = TraceId();
-    pendingStrings.clear();
     pendingAttrPaths.clear();
     pendingResults.clear();
     pendingDepKeySets.clear();
     pendingTraces.clear();
     currentDepHashes.clear();
-    depSourceIdMap.clear();
-    depKeyIdMap.clear();
 
     // Repopulate in-memory maps from DB so the store remains usable
     bulkLoadAll();
-}
-
-void TraceStore::ensureStringTableLoaded()
-{
-    if (stringTableLoaded) return;
-
-    // Load from DB as fallback (normally already populated by bulkLoadAll)
-    auto st(_state->lock());
-    auto use(st->getAllStrings.use());
-    while (use.next()) {
-        auto id = StringId(static_cast<uint32_t>(use.getInt(0)));
-        auto value = std::string(use.getStr(1));
-        if (id.value > stringTable.size()) stringTable.resize(id.value);
-        stringTable[id.value - 1] = value;
-        internedStrings.emplace(value, id);
-        if (id > nextStringId) nextStringId = id;
-    }
-    stringTableLoaded = true;
 }
 
 // ── Bulk load / flush ────────────────────────────────────────────────
@@ -1028,18 +990,16 @@ void TraceStore::bulkLoadAll()
 {
     auto st(_state->lock());
 
-    // Load Strings: populate BOTH forward and reverse maps
+    // Load Strings into the shared StringInternTable
     {
         auto use(st->getAllStrings.use());
         while (use.next()) {
-            auto id = StringId(static_cast<uint32_t>(use.getInt(0)));
-            auto value = std::string(use.getStr(1));
-            if (id.value > stringTable.size()) stringTable.resize(id.value);
-            stringTable[id.value - 1] = value;
-            internedStrings[value] = id;
-            if (id > nextStringId) nextStringId = id;
+            auto id = static_cast<uint32_t>(use.getInt(0));
+            auto value = use.getStr(1);
+            pools.strings.bulkLoad(id, value);
+            if (id > flushedStringHighWaterMark)
+                flushedStringHighWaterMark = id;
         }
-        stringTableLoaded = true;
     }
 
     // Load AttrPaths: populate forward map
@@ -1103,9 +1063,14 @@ void TraceStore::flush()
 
     // Flush in dependency order: Strings → AttrPaths → Results → DepKeySets → Traces
 
-    for (auto & [id, value] : pendingStrings)
-        st->insertStringWithId.use()(static_cast<int64_t>(id.value))(value).exec();
-    pendingStrings.clear();
+    // Flush new strings: those with ID > flushedStringHighWaterMark.
+    for (uint32_t i = flushedStringHighWaterMark + 1; i < pools.strings.nextId(); i++) {
+        auto sv = pools.strings.resolveRaw(i);
+        st->insertStringWithId.use()(static_cast<int64_t>(i))(sv).exec();
+    }
+    flushedStringHighWaterMark = pools.strings.nextId() > 0
+        ? pools.strings.nextId() - 1
+        : 0;
 
     for (auto & [id, path] : pendingAttrPaths)
         st->insertAttrPathWithId.use()
@@ -1293,22 +1258,6 @@ CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
 }
 
 // ── Intern methods ───────────────────────────────────────────────────
-
-StringId TraceStore::doInternString(std::string_view s)
-{
-    // Transparent lookup avoids string_view → string copy on cache hit
-    auto it = internedStrings.find(s);
-    if (it != internedStrings.end())
-        return it->second;
-
-    auto id = StringId(++nextStringId.value);
-    auto owned = std::string(s);
-    internedStrings[owned] = id;
-    if (id.value > stringTable.size()) stringTable.resize(id.value);
-    stringTable[id.value - 1] = owned;
-    pendingStrings.push_back({id, std::move(owned)});
-    return id;
-}
 
 AttrPathId TraceStore::doInternAttrPath(std::string_view path)
 {
@@ -1567,7 +1516,7 @@ bool TraceStore::verifyTrace(
 
     // Load the full trace (single DB read via JOIN) — now vector<InternedDep>
     auto fullDeps = loadFullTrace(traceId);
-    ensureStringTableLoaded();  // needed for resolveString() calls below
+
 
     bool hasNonContentFailure = false;
     bool hasContentFailure = false;
@@ -1779,7 +1728,6 @@ bool TraceStore::verifyTrace(
             }
         }
         sortAndDedupInterned(currentInterned);
-        ensureStringTableLoaded();
         auto lookupStr = [this](StringId id) { return resolveString(id); };
         auto newTraceHash = computeTraceHashFromInterned(currentInterned, lookupStr);
         auto * data = ensureTraceHashes(traceId);
@@ -1963,8 +1911,8 @@ TraceStore::RecordResult TraceStore::recordDeps(
     for (auto & dep : allDeps) {
         compact.push_back(CompactDep{
             dep.type,
-            pools.depSourcePool.intern(dep.source),
-            pools.depKeyPool.intern(dep.key),
+            pools.intern<DepSourceId>(dep.source),
+            pools.intern<DepKeyId>(dep.key),
             dep.expectedHash});
     }
     return record(attrPath, value, compact, isRoot);
@@ -2024,7 +1972,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 
     // Load old trace's full deps — now vector<InternedDep>
     auto oldDeps = loadFullTrace(oldTraceId);
-    ensureStringTableLoaded();  // needed for resolveString() calls below
+
 
     // Check for volatile deps → immediate abort
     for (auto & idep : oldDeps) {
@@ -2218,7 +2166,6 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             continue;
 
         auto repKeys = loadKeySet(depKeySetId);
-        ensureStringTableLoaded();
 
         // Build InternedDep directly using InternedDepKey
         std::vector<InternedDep> repInterned;

@@ -429,7 +429,7 @@ void parseTracedJSON(EvalState & state, const std::string_view & s, Value & v,
     auto j = json::parse(s);
     if (j.is_object() || j.is_array()) {
         auto & pools = *state.traceCtx->pools;
-        auto srcId = pools.depSourcePool.intern(depSource);
+        auto srcId = pools.intern<DepSourceId>(depSource);
         auto fpId = pools.filePathPool.intern(depKey);
         auto * rootNode = new JsonDataNode(std::move(j));
         auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, pools.dataPathPool.root());

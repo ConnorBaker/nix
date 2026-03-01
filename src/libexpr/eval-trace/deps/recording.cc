@@ -292,8 +292,8 @@ void DependencyTracker::record(InterningPools & pools, Dep dep)
         depTypeName(dep.type), depKindName(depKind(dep.type)), dep.source, dep.key);
     sessionTraces.push_back(CompactDep{
         dep.type,
-        pools.depSourcePool.intern(dep.source),
-        pools.depKeyPool.intern(dep.key),
+        pools.intern<DepSourceId>(dep.source),
+        pools.intern<DepKeyId>(dep.key),
         std::move(dep.expectedHash)});
 }
 
@@ -329,7 +329,7 @@ void DependencyTracker::record(InterningPools & pools, Dep dep)
 
     auto keyStr = key.dump();
     DependencyTracker::sessionTraces.push_back(
-        CompactDep{depType, c.sourceId, pools.depKeyPool.intern(keyStr), hash});
+        CompactDep{depType, c.sourceId, pools.intern<DepKeyId>(keyStr), hash});
     return true;
 }
 
@@ -345,8 +345,8 @@ void DependencyTracker::recordReplay(InterningPools & pools, const Dep & dep)
 {
     sessionTraces.push_back(CompactDep{
         dep.type,
-        pools.depSourcePool.intern(dep.source),
-        pools.depKeyPool.intern(dep.key),
+        pools.intern<DepSourceId>(dep.source),
+        pools.intern<DepKeyId>(dep.key),
         dep.expectedHash});
 }
 
@@ -1161,9 +1161,9 @@ static std::string computeDirSetHash(const std::vector<std::pair<DepSourceId, Fi
     auto sorted = dirs;
     std::sort(sorted.begin(), sorted.end(),
         [&pools](const auto & a, const auto & b) {
-            auto sa = pools.depSourcePool.resolve(a.first);
+            auto sa = pools.resolve(a.first);
             auto fa = pools.filePathPool.resolve(a.second);
-            auto sb = pools.depSourcePool.resolve(b.first);
+            auto sb = pools.resolve(b.first);
             auto fb = pools.filePathPool.resolve(b.second);
             if (sa != sb) return sa < sb;
             return fa < fb;
@@ -1180,7 +1180,7 @@ static std::string computeDirSetHash(const std::vector<std::pair<DepSourceId, Fi
 
     HashSink sink(HashAlgorithm::BLAKE3);
     for (auto & [srcId, fpId] : sorted) {
-        sink(pools.depSourcePool.resolve(srcId));
+        sink(pools.resolve(srcId));
         sink(std::string_view("\0", 1));
         sink(pools.filePathPool.resolve(fpId));
         sink(std::string_view("\0", 1));
@@ -1216,7 +1216,7 @@ static std::string buildAggregatedHasKeyJson(
     nlohmann::json dirArr = nlohmann::json::array();
     auto & pools = DependencyTracker::activeTracker->pools;
     for (auto & [srcId, fpId] : dirs) {
-        dirArr.push_back({std::string(pools.depSourcePool.resolve(srcId)),
+        dirArr.push_back({std::string(pools.resolve(srcId)),
                           std::string(pools.filePathPool.resolve(fpId))});
     }
     j["dirs"] = std::move(dirArr);

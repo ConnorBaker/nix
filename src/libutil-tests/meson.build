@@ -77,6 +77,7 @@ sources = files(
   'processes.cc',
   'sort.cc',
   'source-accessor.cc',
+  'string-intern-table.cc',
   'spawn.cc',
   'strings.cc',
   'suggestions.cc',

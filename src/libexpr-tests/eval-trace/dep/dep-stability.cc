@@ -20,7 +20,7 @@ static std::vector<std::string> keys(InterningPools & pools, const std::vector<C
     std::vector<std::string> out;
     out.reserve(deps.size());
     for (auto & d : deps)
-        out.push_back(std::string(pools.depKeyPool.resolve(d.keyId)));
+        out.push_back(std::string(pools.resolve(d.keyId)));
     return out;
 }
 

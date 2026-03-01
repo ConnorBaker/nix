@@ -76,6 +76,7 @@ headers = files(
   'source-path.hh',
   'split.hh',
   'std-hash.hh',
+  'string-intern-table.hh',
   'strings-inline.hh',
   'strings.hh',
   'suggestions.hh',

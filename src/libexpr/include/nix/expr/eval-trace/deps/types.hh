@@ -470,16 +470,16 @@ struct Dep {
 };
 
 /**
- * Compact interned dependency: stores pool IDs instead of owned strings.
- * 48 bytes per entry (with padding) vs 96+ bytes for Dep (plus heap-allocated
- * strings). Zero per-dep heap allocation — all string data lives in
- * InterningPools (owned by EvalTraceContext), resolved via
- * pools.depSourcePool.resolve() / pools.depKeyPool.resolve().
+ * Compact interned dependency: stores StringInternTable indices instead of
+ * owned strings. DepSourceId and DepKeyId share the same index space as
+ * StringId — all three are uint32_t indices into InterningPools::strings.
+ * Zero per-dep heap allocation; string data lives in the arena.
+ * Resolve via pools.resolve(sourceId) / pools.resolve(keyId).
  */
 struct CompactDep {
     DepType type;
-    DepSourceId sourceId;    ///< Flake input name (interned in depSourcePool)
-    DepKeyId keyId;          ///< Dep key string (interned in depKeyPool)
+    DepSourceId sourceId;    ///< Flake input name (interned in StringInternTable)
+    DepKeyId keyId;          ///< Dep key string (interned in StringInternTable)
     DepHashValue expectedHash;
 };
 

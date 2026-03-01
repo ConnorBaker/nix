@@ -339,10 +339,9 @@ public:
         // eval trace state. In production these outlive EvalState, but in
         // tests multiple EvalState instances exist in the same process.
         auto & pools = *state.traceCtx->pools;
-        pools.depSourcePool.clear();
+        pools.strings.clear();
         pools.filePathPool.clear();
         pools.dataPathPool.clear();
-        pools.depKeyPool.clear();
         pools.sessionSymbols = nullptr;
         DependencyTracker::clearSessionTraces();
     }
@@ -441,8 +440,8 @@ protected:
         result.reserve(compact.size());
         for (auto & c : compact) {
             result.push_back(Dep{
-                std::string(pools.depSourcePool.resolve(c.sourceId)),
-                std::string(pools.depKeyPool.resolve(c.keyId)),
+                std::string(pools.resolve(c.sourceId)),
+                std::string(pools.resolve(c.keyId)),
                 c.expectedHash,
                 c.type});
         }

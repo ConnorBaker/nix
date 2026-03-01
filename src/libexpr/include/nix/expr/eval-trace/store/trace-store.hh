@@ -29,7 +29,6 @@ namespace nix::eval_trace {
 
 struct TraceIdTag {};
 struct ResultIdTag {};
-struct StringIdTag {};
 struct AttrPathIdTag {};
 struct DepKeySetIdTag {};
 
@@ -39,8 +38,7 @@ using TraceId = StrongId<TraceIdTag, uint32_t>;
 /** ID for the Results table (one per unique result content hash). */
 using ResultId = StrongId<ResultIdTag, uint32_t>;
 
-/** ID for the Strings table (interned dep source names and dep key strings). */
-using StringId = StrongId<StringIdTag, uint32_t>;
+// StringId is now defined in traced-data-ids.hh (shared with DepSourceId/DepKeyId).
 
 /** ID for the AttrPaths table (null-byte-separated attribute paths). */
 using AttrPathId = StrongId<AttrPathIdTag, uint32_t>;
@@ -137,6 +135,10 @@ struct TraceStore {
     // Interned dep key (string IDs, no hash value). Used for keys_blob serialization
     // (positionally in keys_blob, indexed by DepKeySetId in the session cache)
     // and as the key type for currentDepHashes (replacing string-based DepKey).
+    //
+    // StringId, DepSourceId, and DepKeyId all share the same StringInternTable
+    // index space. We use StringId here for storage; internDeps() converts
+    // DepSourceId/DepKeyId to StringId via raw value copy.
     struct InternedDepKey {
         DepType type;
         StringId sourceId;
@@ -191,9 +193,9 @@ struct TraceStore {
     /// Trace IDs verified in this session (skip re-verification).
     boost::unordered_flat_set<TraceId, TraceId::Hash> verifiedTraceIds;
 
-    /// Forward maps: string → ID (transparent lookup avoids string_view copy)
-    boost::unordered_flat_map<std::string, StringId,
-        TransparentStringHash, TransparentStringEqual> internedStrings;
+    /// Forward map: attrPath → AttrPathId (transparent lookup avoids copy on hit).
+    /// String interning is handled by pools.strings (StringInternTable) — no
+    /// separate internedStrings map needed.
     boost::unordered_flat_map<std::string, AttrPathId,
         TransparentStringHash, TransparentStringEqual> internedAttrPaths;
 
@@ -218,33 +220,23 @@ struct TraceStore {
     /// Avoids re-decompressing keys_blob when multiple traces share a key set.
     boost::unordered_flat_map<DepKeySetId, std::vector<InternedDepKey>, DepKeySetId::Hash> depKeySetCache;
 
-    /// Reverse map: ID → string (O(1) lookup by index, indexed by id.value-1).
-    /// Populated by bulkLoadAll() at startup and by doInternString() for new strings.
-    std::vector<std::string> stringTable;
-    bool stringTableLoaded = false;
-    void ensureStringTableLoaded();
-
     /// Current dep hash cache (persists across verification → recovery within session).
     /// Value is nullopt if the dep's resource is unavailable (e.g., file deleted);
     /// this caches the failure to avoid re-attempting expensive hash computations.
     boost::unordered_flat_map<InternedDepKey, std::optional<DepHashValue>, InternedDepKey::Hash> currentDepHashes;
 
-    /// Pool-to-store bridge: cached mapping from session pool IDs to DB StringIds.
-    /// Avoids re-interning the same strings on every internDeps(CompactDep) call.
-    std::vector<StringId> depSourceIdMap;  // DepSourceId.value → StringId
-    std::vector<StringId> depKeyIdMap;     // DepKeyId.value → StringId
-
     // ── In-memory ID counters (next ID to assign = max(DB IDs) + 1) ──
 
-    StringId nextStringId;
     AttrPathId nextAttrPathId;
     ResultId nextResultId;
     DepKeySetId nextDepKeySetId;
     TraceId nextTraceId;
 
-    // ── Pending writes (deferred to flush()) ─────────────────────────
+    /// High-water mark: highest string ID flushed to DB.
+    /// Strings with ID > flushedStringHighWaterMark are pending write.
+    uint32_t flushedStringHighWaterMark = 0;
 
-    std::vector<std::pair<StringId, std::string>> pendingStrings;
+    // ── Pending writes (deferred to flush()) ─────────────────────────
 
     std::vector<std::pair<AttrPathId, std::string>> pendingAttrPaths;
 
@@ -418,11 +410,13 @@ struct TraceStore {
     /// Resolve a single InternedDep to a string-based Dep (for computeCurrentHash, tests).
     Dep resolveDep(const InternedDep & idep);
 
-    /// Resolve a StringId to its string value. O(1) array lookup.
+    /// Resolve a StringId to its string value. O(1) lookup via pools.strings.
+    /// Returns string_view into arena memory; lifetime tied to InterningPools.
     std::string_view resolveString(StringId id) const;
 
-    /// Intern session-pool CompactDeps into DB StringIds (InternedDep).
-    /// Uses depSourceIdMap/depKeyIdMap bridge for cached pool→store mapping.
+    /// Convert CompactDeps to InternedDeps. DepSourceId/DepKeyId share the same
+    /// index space as StringId (unified StringInternTable), so conversion is
+    /// a raw value copy — no string lookup needed.
     std::vector<InternedDep> internDeps(const std::vector<CompactDep> & deps);
 
     /**
@@ -455,7 +449,6 @@ private:
      *  Queries getTraceInfo on cache miss. Returns null if trace not found. */
     CachedTraceData * ensureTraceHashes(TraceId traceId);
 
-    StringId doInternString(std::string_view s);
     AttrPathId doInternAttrPath(std::string_view path);
     ResultId doInternResult(ResultKind type, const std::string & value,
                             const std::string & context, const Hash & resultHash);

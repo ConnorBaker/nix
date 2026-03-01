@@ -220,7 +220,7 @@ static void parseTracedTOML(EvalState & state, const std::string_view & s, Value
     );
     if (parsed.type() == toml::value_t::table) {
         auto & pools = *state.traceCtx->pools;
-        auto srcId = pools.depSourcePool.intern(depSource);
+        auto srcId = pools.intern<DepSourceId>(depSource);
         auto fpId = pools.filePathPool.intern(depKey);
         auto * rootNode = new TomlDataNode(std::move(parsed));
         auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, pools.dataPathPool.root());

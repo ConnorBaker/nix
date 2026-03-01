@@ -5,6 +5,7 @@
 
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/symbol-table.hh"
+#include "nix/util/string-intern-table.hh"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -195,6 +196,10 @@ struct DataPathPool {
  * Owns all Lifetime 1 interning pools for eval-trace dep recording.
  * Owned by EvalTraceContext (one per EvalState), providing automatic
  * test isolation.
+ *
+ * DepSourceId, DepKeyId, and StringId all share the same StringInternTable
+ * (arena-backed, zero per-string heap allocation). FilePathId uses a separate
+ * StringPool (session-only, not persisted to DB).
  */
 struct InterningPools {
     InterningPools() = default;
@@ -202,12 +207,21 @@ struct InterningPools {
     InterningPools(const InterningPools &) = delete;
     InterningPools & operator=(const InterningPools &) = delete;
 
-    StringPool<DepSourceId> depSourcePool;
+    /// Shared arena-backed string intern table for DepSourceId, DepKeyId, StringId.
+    StringInternTable strings;
+
     StringPool<FilePathId> filePathPool;
     DataPathPool dataPathPool;
-    StringPool<DepKeyId> depKeyPool;
     const SymbolTable * sessionSymbols = nullptr;
     ProvenanceTable provenanceTable;
+
+    /// Typed intern: delegates to strings.intern<Id>.
+    template<typename Id>
+    Id intern(std::string_view sv) { return strings.intern<Id>(sv); }
+
+    /// Typed resolve: delegates to strings.resolve<Id>.
+    template<typename Id>
+    std::string_view resolve(Id id) const { return strings.resolve(id); }
 };
 
 } // namespace nix

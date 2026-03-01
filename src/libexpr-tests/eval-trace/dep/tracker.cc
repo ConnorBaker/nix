@@ -59,7 +59,7 @@ TEST_F(DependencyTrackerTest, Record_WithActiveTracker)
     DependencyTracker::record(pools,dep);
     auto deps = tracker.collectTraces();
     ASSERT_EQ(deps.size(), 1u);
-    EXPECT_EQ(pools.depKeyPool.resolve(deps[0].keyId), "/test.nix");
+    EXPECT_EQ(pools.resolve(deps[0].keyId), "/test.nix");
     EXPECT_EQ(deps[0].type, DepType::Content);
 }
 
@@ -80,12 +80,12 @@ TEST_F(DependencyTrackerTest, CollectDeps_OnlyCurrentRange)
         DependencyTracker::record(pools,makeContentDep("/inner.nix", "inner"));
         auto innerDeps = inner.collectTraces();
         ASSERT_EQ(innerDeps.size(), 1u);
-        EXPECT_EQ(pools.depKeyPool.resolve(innerDeps[0].keyId), "/inner.nix");
+        EXPECT_EQ(pools.resolve(innerDeps[0].keyId), "/inner.nix");
     }
     auto outerDeps = outer.collectTraces();
     // Outer should have both (inner recorded into outer's session range too — Adapton: nested scopes)
     EXPECT_GE(outerDeps.size(), 1u);
-    EXPECT_EQ(pools.depKeyPool.resolve(outerDeps[0].keyId), "/outer.nix");
+    EXPECT_EQ(pools.resolve(outerDeps[0].keyId), "/outer.nix");
 }
 
 TEST_F(DependencyTrackerTest, ClearSessionDeps)
@@ -165,7 +165,7 @@ TEST_F(DependencyTrackerTest, Suspend_TrackerInsideSuspendPreservesSessionCaches
     DependencyTracker root(pools);
 
     // Register provenance data in the session caches.
-    auto srcId = pools.depSourcePool.intern("test-input");
+    auto srcId = pools.intern<DepSourceId>("test-input");
     auto fpId = pools.filePathPool.intern("/test.json");
     auto dpId = jsonStringToDataPathId(pools, "[]");
     auto * prov = allocateProvenance(srcId, fpId, dpId, StructuredFormat::Json);

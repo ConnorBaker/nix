@@ -329,7 +329,7 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
                 auto & pools = *st.traceCtx->pools;
                 auto & df = resolveProvenanceRef(pools, *pr);
                 // Resolve interned IDs to strings for storage
-                auto depSource = std::string(pools.depSourcePool.resolve(df.sourceId));
+                auto depSource = std::string(pools.resolve(df.sourceId));
                 auto depKey = std::string(pools.filePathPool.resolve(df.filePathId));
                 auto dataPath = dataPathToJsonString(pools, df.dataPathId);
                 // Deduplicate origins by resolved values
@@ -392,7 +392,7 @@ void TracedExpr::materializeOrigExprAttrs(
         for (auto idx : attrs.originIndices)
             if (idx >= 0) counts[idx]++;
         for (auto & orig : attrs.origins) {
-            auto srcId = pools.depSourcePool.intern(orig.depSource);
+            auto srcId = pools.intern<DepSourceId>(orig.depSource);
             auto fpId = pools.filePathPool.intern(orig.depKey);
             auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
             auto handle = st.positions.addOriginHandle(
@@ -440,7 +440,7 @@ void TracedExpr::materializeOrigExprAttrs(
                 canonical += keys[i];
             }
             auto keysHash = depHash(canonical);
-            auto srcId = pools.depSourcePool.intern(orig.depSource);
+            auto srcId = pools.intern<DepSourceId>(orig.depSource);
             auto fpId = pools.filePathPool.intern(orig.depKey);
             auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
             auto originOffset = originHandles[oidx].handle.offset;
@@ -560,7 +560,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
             for (auto idx : attrs->originIndices)
                 if (idx >= 0) counts[idx]++;
             for (auto & orig : attrs->origins) {
-                auto srcId = pools.depSourcePool.intern(orig.depSource);
+                auto srcId = pools.intern<DepSourceId>(orig.depSource);
                 auto fpId = pools.filePathPool.intern(orig.depKey);
                 auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
                 auto handle = st.positions.addOriginHandle(
@@ -605,7 +605,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
                     canonical += keys[i];
                 }
                 auto keysHash = depHash(canonical);
-                auto srcId = pools.depSourcePool.intern(orig.depSource);
+                auto srcId = pools.intern<DepSourceId>(orig.depSource);
                 auto fpId = pools.filePathPool.intern(orig.depKey);
                 auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
                 auto originOffset = originHandles[oidx].handle.offset;
@@ -685,7 +685,7 @@ void TracedExpr::evaluateFresh(Value & v)
                 auto depKey = path;
                 std::replace(depKey.begin(), depKey.end(), '\0', '\t');
                 deps.push_back(CompactDep{
-                    DepType::ParentContext, pools.depSourcePool.intern(""), pools.depKeyPool.intern(depKey), DepHashValue(b3)});
+                    DepType::ParentContext, pools.intern<DepSourceId>(""), pools.intern<DepKeyId>(depKey), DepHashValue(b3)});
             }
         } else {
             // Zero sibling accesses: fallback to whole-parent dep
@@ -698,7 +698,7 @@ void TracedExpr::evaluateFresh(Value & v)
                 auto depKey = parentPath;
                 std::replace(depKey.begin(), depKey.end(), '\0', '\t');
                 deps.push_back(CompactDep{
-                    DepType::ParentContext, pools.depSourcePool.intern(""), pools.depKeyPool.intern(depKey), DepHashValue(b3)});
+                    DepType::ParentContext, pools.intern<DepSourceId>(""), pools.intern<DepKeyId>(depKey), DepHashValue(b3)});
             }
         }
     };

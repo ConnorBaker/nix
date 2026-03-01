@@ -16,7 +16,7 @@ static std::vector<std::string> keys(InterningPools & pools, const std::vector<C
     std::vector<std::string> out;
     out.reserve(deps.size());
     for (auto & d : deps)
-        out.push_back(std::string(pools.depKeyPool.resolve(d.keyId)));
+        out.push_back(std::string(pools.resolve(d.keyId)));
     return out;
 }
 
@@ -94,7 +94,7 @@ TEST_F(ReplayPollutionTest, RecordReplay_AppendsToSessionTraces)
     DependencyTracker::recordReplay(pools,makeContentDep("/x.nix", "x"));
     uint32_t after = DependencyTracker::sessionTraces.size();
     EXPECT_EQ(after, before + 1);
-    EXPECT_EQ(pools.depKeyPool.resolve(DependencyTracker::sessionTraces.back().keyId), "/x.nix");
+    EXPECT_EQ(pools.resolve(DependencyTracker::sessionTraces.back().keyId), "/x.nix");
 }
 
 // ═════════════════════════════════════════════════════════════════════

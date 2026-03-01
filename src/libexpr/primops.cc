@@ -2566,7 +2566,7 @@ static bool recordReadDirDep(EvalState & state, const SourcePath & path,
     if (!std::all_of(entries.begin(), entries.end(), [](auto & e) { return e.second.has_value(); }))
         return false;
     auto [depSource, depKey] = resolveProvenance(path.path, state.getMountToInput());
-    auto srcId = pools.depSourcePool.intern(depSource);
+    auto srcId = pools.intern<DepSourceId>(depSource);
     auto fpId = pools.filePathPool.intern(depKey);
     auto * rootNode = new DirDataNode(std::move(entries));
     auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, pools.dataPathPool.root());
