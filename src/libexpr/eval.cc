@@ -1188,16 +1188,6 @@ void EvalState::recordImportContentDep(const SourcePath & resolvedPath)
         recordDep(resolvedPath.path, DepHashValue(*hash), DepType::Content, traceCtx->mountToInput);
 }
 
-void EvalState::replayMemoizedDeps(const Value & v)
-{
-    traceCtx->replayMemoizedDeps(v);
-}
-
-void EvalState::recordThunkDeps(Value & v, uint32_t epochStart)
-{
-    traceCtx->recordThunkDeps(v, epochStart);
-}
-
 [[gnu::noinline]]
 void EvalState::forceThunkValue(Value & v, const PosIdx pos)
 {
@@ -1222,7 +1212,7 @@ void EvalState::forceThunkValue(Value & v, const PosIdx pos)
         throw;
     }
     if (traceCtx)
-        recordThunkDeps(v, epochStart);
+        traceCtx->recordThunkDeps(v, epochStart);
 }
 
 [[gnu::noinline]]
@@ -1232,13 +1222,13 @@ void EvalState::forceAppValue(Value & v, const PosIdx pos)
         ? DependencyTracker::sessionTraces.size() : 0;
     callFunction(*v.app().left, *v.app().right, v, pos);
     if (traceCtx)
-        recordThunkDeps(v, epochStart);
+        traceCtx->recordThunkDeps(v, epochStart);
 }
 
-const std::unordered_map<CanonPath, std::pair<std::string, std::string>> &
+const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> &
 EvalState::getMountToInput() const
 {
-    static const std::unordered_map<CanonPath, std::pair<std::string, std::string>> empty;
+    static const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> empty;
     return traceCtx ? traceCtx->mountToInput : empty;
 }
 

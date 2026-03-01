@@ -120,19 +120,6 @@ static InterningPools & ensurePools()
     return *InterningPools::current;
 }
 
-std::unique_ptr<InterningPools> createInterningPools()
-{
-    auto p = std::make_unique<InterningPools>();
-    InterningPools::current = p.get();
-    return p;
-}
-
-void destroyInterningPools(InterningPools * p)
-{
-    if (InterningPools::current == p)
-        InterningPools::current = nullptr;
-    // Note: does NOT delete p — the unique_ptr in EvalTraceContext owns it.
-}
 
 // Cached constant Blake3Hash values used in shape dep recording.
 // Function-local statics avoid static initialization order issues across TUs.
@@ -833,7 +820,7 @@ Blake3Hash depHashDirListingCached(const SourcePath & path, const SourceAccessor
 // input is checked out on disk.
 std::optional<std::pair<std::string, CanonPath>> resolveToInput(
     const CanonPath & absPath,
-    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
+    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
 {
     auto path = absPath;
     std::vector<std::string> subpathParts;
@@ -883,7 +870,7 @@ void recordDep(
     const CanonPath & absPath,
     const DepHashValue & hash,
     DepType depType,
-    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
+    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
 {
     bool recorded = false;
     // Single lstat — reused for both existence gating and stat-hash-cache population
@@ -987,7 +974,7 @@ void clearReadFileStringPtrs()
 
 std::pair<std::string, std::string> resolveProvenance(
     const CanonPath & absPath,
-    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
+    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
 {
     if (!mountToInput.empty()) {
         if (auto resolved = resolveToInput(absPath, mountToInput))

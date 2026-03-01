@@ -488,20 +488,6 @@ public:
     void recordImportContentDep(const SourcePath & resolvedPath);
 
     /**
-     * Replay memoized oracle deps for an already-forced Value into active
-     * dependency trackers. Forwards to traceCtx->replayMemoizedDeps().
-     */
-    [[gnu::noinline]]
-    void replayMemoizedDeps(const Value & v);
-
-    /**
-     * Record that thunk/app evaluation of `v` produced oracle deps in
-     * [epochStart, sessionTraces.size()). Forwards to traceCtx->recordThunkDeps().
-     */
-    [[gnu::noinline]]
-    void recordThunkDeps(Value & v, uint32_t epochStart);
-
-    /**
      * Outlined thunk-forcing path for forceValue (reduces inline code size).
      */
     [[gnu::noinline]]
@@ -516,7 +502,7 @@ public:
     /**
      * Get the mount-to-input mapping. Returns an empty map if traceCtx is null.
      */
-    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & getMountToInput() const;
+    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & getMountToInput() const;
 
     /**
      * Flush trace caches to persist SQLite WAL. Safe to call when traceCtx is null.

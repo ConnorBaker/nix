@@ -18,6 +18,7 @@ extern Counter nrExcludeChildRangeCalls;
 #include <unordered_set>
 #include <vector>
 
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
 namespace nix {
@@ -175,19 +176,6 @@ struct DependencyTracker {
 void resetEvalTracePools();
 
 /**
- * Create an InterningPools instance and set InterningPools::current.
- * Called by EvalTraceContext constructor. The returned unique_ptr
- * clears InterningPools::current on destruction.
- */
-struct InterningPools;
-std::unique_ptr<InterningPools> createInterningPools();
-
-/**
- * Custom deleter for InterningPools that clears the thread_local pointer.
- */
-void destroyInterningPools(InterningPools * p);
-
-/**
  * Allocate a provenance record and return a Pos::ProvenanceRef for use
  * in PosTable origins. The record is stored in the session's ProvenanceTable.
  */
@@ -268,7 +256,7 @@ Blake3Hash depHashDirListingCached(const SourcePath & path, const SourceAccessor
  */
 std::optional<std::pair<std::string, CanonPath>> resolveToInput(
     const CanonPath & absPath,
-    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
+    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
 
 /**
  * Record a file dependency, resolving to an input-relative path if possible.
@@ -281,7 +269,7 @@ void recordDep(
     const CanonPath & absPath,
     const DepHashValue & hash,
     DepType depType,
-    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
+    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
 
 /**
  * Provenance information from a readFile call, used to connect
@@ -343,7 +331,7 @@ class EvalState;
  */
 std::pair<std::string, std::string> resolveProvenance(
     const CanonPath & absPath,
-    const std::unordered_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
+    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
 
 /**
  * Clear the in-memory (L1) stat-hash cache. Used by tests to force

@@ -5,17 +5,6 @@
 
 namespace nix {
 
-EvalTraceContext::EvalTraceContext()
-    : pools(createInterningPools())
-{
-}
-
-EvalTraceContext::~EvalTraceContext()
-{
-    if (pools)
-        destroyInterningPools(pools.get());
-}
-
 namespace eval_trace {
 Counter nrReplayTotalCalls;
 Counter nrReplayBloomHits;
@@ -23,7 +12,7 @@ Counter nrReplayEpochHits;
 Counter nrReplayAdded;
 } // namespace eval_trace
 
-void EvalTraceContext::recordThunkDeps(Value & v, uint32_t epochStart)
+void EvalTraceContext::recordThunkDeps(const Value & v, uint32_t epochStart)
 {
     if (&v == skipEpochRecordFor) {
         skipEpochRecordFor = nullptr;
@@ -32,14 +21,14 @@ void EvalTraceContext::recordThunkDeps(Value & v, uint32_t epochStart)
     uint32_t epochEnd = DependencyTracker::sessionTraces.size();
     if (epochStart < epochEnd) {
         epochMap.emplace(&v, DepRange{&DependencyTracker::sessionTraces, epochStart, epochEnd});
-        bloomSet(&v);
+        replayBloom.set(&v);
     }
 }
 
 void EvalTraceContext::replayMemoizedDeps(const Value & v)
 {
     eval_trace::nrReplayTotalCalls++;
-    if (!bloomTest(&v)) return;
+    if (!replayBloom.test(&v)) return;
     eval_trace::nrReplayBloomHits++;
     auto it = epochMap.find(&v);
     if (it == epochMap.end()) return;

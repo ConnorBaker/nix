@@ -3,6 +3,7 @@
 
 #include "nix/expr/print.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-trace/context.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 
@@ -90,7 +91,7 @@ inline void EvalState::forceValue(Value & v, const PosIdx pos)
     } else if (v.isApp()) [[unlikely]] {
         forceAppValue(v, pos);
     } else if (traceActiveDepth) {
-        replayMemoizedDeps(v);
+        traceCtx->replayMemoizedDeps(v);
     }
 }
 

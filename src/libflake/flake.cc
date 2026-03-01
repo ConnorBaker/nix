@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <boost/container/detail/std_fwd.hpp>
 #include <boost/core/pointer_traits.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/detail/foa/table.hpp>
 #include <algorithm>
 #include <filesystem>
@@ -1028,7 +1029,7 @@ ref<eval_trace::TraceCache> openTraceCache(EvalState & state, ref<const LockedFl
     auto [lockFileStr, keyMap] = lockedFlake->lockFile.to_string();
 
     // Build mount-to-input and input-accessors maps for oracle dep recording
-    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mountToInput;
+    boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> mountToInput;
     std::unordered_map<std::string, SourcePath> inputAccessors;
 
     for (auto & [node, sourcePath] : lockedFlake->nodePaths) {

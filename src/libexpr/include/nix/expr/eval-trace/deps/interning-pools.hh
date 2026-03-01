@@ -148,6 +148,11 @@ struct StringPool32 {
 struct InterningPools {
     static thread_local InterningPools * current;
 
+    InterningPools() { current = this; }
+    ~InterningPools() { if (current == this) current = nullptr; }
+    InterningPools(const InterningPools &) = delete;
+    InterningPools & operator=(const InterningPools &) = delete;
+
     StringPool16 depSourcePool;
     StringPool16 filePathPool;
     DataPathPool dataPathPool;

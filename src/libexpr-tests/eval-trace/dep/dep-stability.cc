@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/expr/eval-trace/context.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
@@ -26,6 +27,7 @@ static std::vector<std::string> keys(const std::vector<CompactDep> & deps)
 class DepStabilityTest : public ::testing::Test
 {
 protected:
+    InterningPools pools;
     void SetUp() override { DependencyTracker::clearSessionTraces(); }
     void TearDown() override { DependencyTracker::clearSessionTraces(); }
 

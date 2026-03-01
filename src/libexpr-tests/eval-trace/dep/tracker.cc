@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/util/source-path.hh"
@@ -13,6 +14,8 @@ using namespace nix::eval_trace::test;
 class DependencyTrackerTest : public ::testing::Test
 {
 protected:
+    InterningPools pools;
+
     void SetUp() override
     {
         DependencyTracker::clearSessionTraces();
@@ -187,7 +190,7 @@ TEST_F(DependencyTrackerTest, Suspend_TrackerInsideSuspendPreservesSessionCaches
 
 TEST_F(DependencyTrackerTest, ResolveToInput_MatchingMount)
 {
-    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mounts;
+    boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> mounts;
     mounts[CanonPath("/foo/bar")] = {"myInput", ""};
 
     auto result = resolveToInput(CanonPath("/foo/bar/baz.nix"), mounts);
@@ -198,7 +201,7 @@ TEST_F(DependencyTrackerTest, ResolveToInput_MatchingMount)
 
 TEST_F(DependencyTrackerTest, ResolveToInput_NoMatchingMount)
 {
-    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mounts;
+    boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> mounts;
     mounts[CanonPath("/foo/bar")] = {"myInput", ""};
 
     auto result = resolveToInput(CanonPath("/other/path.nix"), mounts);
@@ -207,7 +210,7 @@ TEST_F(DependencyTrackerTest, ResolveToInput_NoMatchingMount)
 
 TEST_F(DependencyTrackerTest, ResolveToInput_ExactMatch)
 {
-    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mounts;
+    boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> mounts;
     mounts[CanonPath("/foo/bar")] = {"myInput", ""};
 
     auto result = resolveToInput(CanonPath("/foo/bar"), mounts);
@@ -218,7 +221,7 @@ TEST_F(DependencyTrackerTest, ResolveToInput_ExactMatch)
 
 TEST_F(DependencyTrackerTest, ResolveToInput_LongestPrefixWins)
 {
-    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mounts;
+    boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> mounts;
     mounts[CanonPath("/foo")] = {"broad", ""};
     mounts[CanonPath("/foo/bar")] = {"specific", ""};
 
@@ -230,7 +233,7 @@ TEST_F(DependencyTrackerTest, ResolveToInput_LongestPrefixWins)
 
 TEST_F(DependencyTrackerTest, ResolveToInput_WithSubdir)
 {
-    std::unordered_map<CanonPath, std::pair<std::string, std::string>> mounts;
+    boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> mounts;
     mounts[CanonPath("/flake-src")] = {"myInput", "subdir"};
 
     auto result = resolveToInput(CanonPath("/flake-src/subdir/file.nix"), mounts);
