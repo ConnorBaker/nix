@@ -56,6 +56,7 @@ headers = files(
   'nar-cache.hh',
   'nar-listing.hh',
   'os-string.hh',
+  'pointer-bloom-filter.hh',
   'pool.hh',
   'pos-idx.hh',
   'pos-table.hh',
