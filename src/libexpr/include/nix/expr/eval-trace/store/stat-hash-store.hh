@@ -17,7 +17,7 @@
 #include <string>
 #include <utility>
 
-namespace nix {
+namespace nix::eval_trace {
 
 /**
  * Process-global singleton cache mapping (path, depType) → (stat fingerprint, BLAKE3 hash).
@@ -138,4 +138,4 @@ private:
     ~StatHashStore() = default;
 };
 
-} // namespace nix
+} // namespace nix::eval_trace

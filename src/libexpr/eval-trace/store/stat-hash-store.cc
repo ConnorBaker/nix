@@ -7,7 +7,7 @@
 
 #include <filesystem>
 
-namespace nix {
+namespace nix::eval_trace {
 
 // ── StatHashStore singleton + methods ───────────────────────────────
 
@@ -103,4 +103,4 @@ Blake3Hash StatHashStore::depHashDirListingCached(const SourcePath & path, const
     return cachedHash(path, DepType::Directory, [&] { return depHashDirListing(entries); });
 }
 
-} // namespace nix
+} // namespace nix::eval_trace

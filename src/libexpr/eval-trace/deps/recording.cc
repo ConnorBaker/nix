@@ -562,7 +562,7 @@ void recordDep(
     {
         try {
             if (auto * b3 = std::get_if<Blake3Hash>(&hash))
-                StatHashStore::instance().storeHash(
+                eval_trace::StatHashStore::instance().storeHash(
                     std::filesystem::path(absPath.abs()), depType, *b3, fileStat);
         } catch (...) {}
     }
