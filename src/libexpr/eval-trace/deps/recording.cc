@@ -41,7 +41,7 @@ namespace nix {
 // │ machinery. These are independent of any particular EvalState.      │
 // │                                                                    │
 // │ Members:                                                           │
-// │   - sessionTraces      (append-only CompactDep vector,             │
+// │   - sessionTraces      (append-only Dep vector,                    │
 // │                          index-addressed by DepRange)              │
 // │   - activeTracker      (current RAII tracker in the call stack)    │
 // │   - depth              (nesting depth of live trackers)            │
@@ -92,7 +92,7 @@ namespace nix {
 thread_local DependencyTracker * DependencyTracker::activeTracker = nullptr;
 // [Lifetime 1] Per-thread append-only dep vector. Index-addressed by
 // DepRange; never shrinks in production (only reserved, not cleared).
-thread_local std::vector<CompactDep> DependencyTracker::sessionTraces;
+thread_local std::vector<Dep> DependencyTracker::sessionTraces;
 // [Lifetime 1] Nesting depth of live DependencyTracker instances.
 thread_local uint32_t DependencyTracker::depth = 0;
 
@@ -281,20 +281,32 @@ void clearPrecomputedKeysMap()
 // BSàlC §3.2: during fresh evaluation, the scheduler records each dependency
 // into the trace. Hash-based dedup: >90% of record() calls are duplicates,
 // so hashing the (type, source, key) triple avoids constructing DepKey strings.
-void DependencyTracker::record(InterningPools & pools, Dep dep)
+void DependencyTracker::record(InterningPools & pools, DepType type,
+                               std::string_view source, std::string_view key,
+                               DepHashValue hash)
 {
     if (activeTracker) {
-        uint64_t h = hashValues(std::to_underlying(dep.type), dep.source, dep.key);
+        uint64_t h = hashValues(std::to_underlying(type), source, key);
         if (!activeTracker->depDedup.tryInsert(h))
             return;
     }
     debug("recording %s (%s) dep: input='%s' key='%s'",
-        depTypeName(dep.type), depKindName(depKind(dep.type)), dep.source, dep.key);
-    sessionTraces.push_back(CompactDep{
-        dep.type,
-        pools.intern<DepSourceId>(dep.source),
-        pools.intern<DepKeyId>(dep.key),
-        std::move(dep.expectedHash)});
+        depTypeName(type), depKindName(depKind(type)), source, key);
+    sessionTraces.push_back(Dep{
+        type,
+        pools.intern<DepSourceId>(source),
+        pools.intern<DepKeyId>(key),
+        std::move(hash)});
+}
+
+void DependencyTracker::record(const Dep & dep)
+{
+    if (activeTracker) {
+        uint64_t h = hashValues(std::to_underlying(dep.type), dep.sourceId.value, dep.keyId.value);
+        if (!activeTracker->depDedup.tryInsert(h))
+            return;
+    }
+    sessionTraces.push_back(dep);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -329,7 +341,7 @@ void DependencyTracker::record(InterningPools & pools, Dep dep)
 
     auto keyStr = key.dump();
     DependencyTracker::sessionTraces.push_back(
-        CompactDep{depType, c.sourceId, pools.intern<DepKeyId>(keyStr), hash});
+        Dep{depType, c.sourceId, pools.intern<DepKeyId>(keyStr), hash});
     return true;
 }
 
@@ -341,13 +353,20 @@ void DependencyTracker::record(InterningPools & pools, Dep dep)
 // dep. recordReplay avoids this by only appending to sessionTraces — the dep
 // still participates in thunk epoch ranges (recordThunkDeps) for correct
 // transitive propagation.
-void DependencyTracker::recordReplay(InterningPools & pools, const Dep & dep)
+void DependencyTracker::recordReplay(InterningPools & pools, DepType type,
+                                     std::string_view source, std::string_view key,
+                                     const DepHashValue & hash)
 {
-    sessionTraces.push_back(CompactDep{
-        dep.type,
-        pools.intern<DepSourceId>(dep.source),
-        pools.intern<DepKeyId>(dep.key),
-        dep.expectedHash});
+    sessionTraces.push_back(Dep{
+        type,
+        pools.intern<DepSourceId>(source),
+        pools.intern<DepKeyId>(key),
+        hash});
+}
+
+void DependencyTracker::recordReplay(const Dep & dep)
+{
+    sessionTraces.push_back(dep);
 }
 
 // Collect the complete trace for this evaluation scope (BSàlC §3.1: a trace
@@ -361,7 +380,7 @@ void DependencyTracker::recordReplay(InterningPools & pools, const Dep & dep)
 // are filtered out. This prevents parent TracedExpr traces from inheriting
 // children's deps (children have their own traces + ParentContext deps).
 // The result is the flattened dependency vector for trace storage.
-std::vector<CompactDep> DependencyTracker::collectTraces() const
+std::vector<Dep> DependencyTracker::collectTraces() const
 {
     uint32_t endIndex = mySessionTraces->size();
 
@@ -370,7 +389,7 @@ std::vector<CompactDep> DependencyTracker::collectTraces() const
         if (replayedRanges.empty())
             return {mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex};
 
-        std::vector<CompactDep> result(mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex);
+        std::vector<Dep> result(mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex);
         for (auto & r : replayedRanges)
             result.insert(result.end(), r.deps->begin() + r.start, r.deps->begin() + r.end);
         return result;
@@ -378,7 +397,7 @@ std::vector<CompactDep> DependencyTracker::collectTraces() const
 
     // Slow path: skip excluded child ranges to prevent parent traces
     // from inheriting children's dependencies.
-    std::vector<CompactDep> result;
+    std::vector<Dep> result;
 
     // Copy session deps [startIndex, endIndex) skipping excluded ranges
     uint32_t pos = startIndex;
@@ -764,16 +783,16 @@ void recordDep(
 
     if (!mountToInput.empty()) {
         if (auto resolved = resolveToInput(absPath, mountToInput)) {
-            DependencyTracker::record(pools, {resolved->first, resolved->second.abs(), hash, depType});
+            DependencyTracker::record(pools, depType, resolved->first, resolved->second.abs(), hash);
             recorded = true;
             // Flake input path — no lstat needed (accessor provides content)
         } else if ((fileStat = maybeLstat(std::filesystem::path(absPath.abs())))) {
-            DependencyTracker::record(pools, {std::string(absolutePathDep), absPath.abs(), hash, depType});
+            DependencyTracker::record(pools, depType, absolutePathDep, absPath.abs(), hash);
             recorded = true;
         }
         // else: virtual file — no filesystem oracle, skip (see above)
     } else if ((fileStat = maybeLstat(std::filesystem::path(absPath.abs())))) {
-        DependencyTracker::record(pools, {"", absPath.abs(), hash, depType});
+        DependencyTracker::record(pools, depType, "", absPath.abs(), hash);
         recorded = true;
     }
     // else: virtual file — no filesystem oracle, skip (see above)
@@ -852,7 +871,7 @@ void clearReadFileStringPtrs()
     auto * prov = lookupReadFileProvenance(it->second);
     if (!prov) return;
     auto [source, key] = resolveProvenance(prov->path, state.getMountToInput());
-    DependencyTracker::record(DependencyTracker::activeTracker->pools, {source, key, DepHashValue(it->second), DepType::RawContent});
+    DependencyTracker::record(DependencyTracker::activeTracker->pools, DepType::RawContent, source, key, DepHashValue(it->second));
 }
 
 std::pair<std::string, std::string> resolveProvenance(
@@ -1118,8 +1137,7 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
         if (dirOrigins.size() > 1) {
             auto dsHash = computeDirSetHash(dirOrigins);
             auto key = buildAggregatedHasKeyJson(dsHash, symbols[keyName], dirOrigins);
-            DependencyTracker::record(pools,
-                Dep{"", std::move(key), DepHashValue(kHashZero()), DepType::StructuredContent});
+            DependencyTracker::record(pools, DepType::StructuredContent, "", key, DepHashValue(kHashZero()));
         } else {
             for (auto & oi : origins) {
                 if (oi.format != StructuredFormat::Directory) continue;
@@ -1258,8 +1276,7 @@ static void recordHasKeyMissDeps(
     if (dirOrigins.size() > 1) {
         auto dsHash = computeDirSetHash(dirOrigins);
         auto key = buildAggregatedHasKeyJson(dsHash, symbols[keyName], dirOrigins);
-        DependencyTracker::record(pools,
-            Dep{"", std::move(key), DepHashValue(kHashZero()), DepType::StructuredContent});
+        DependencyTracker::record(pools, DepType::StructuredContent, "", key, DepHashValue(kHashZero()));
     } else {
         forEachTracedDataOrigin(positions, v, [&](const ProvenanceRecord & df) {
             auto fmt = parseStructuredFormat(df.format);

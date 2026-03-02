@@ -50,7 +50,7 @@ namespace nix {
  */
 struct DependencyTracker {
     static thread_local DependencyTracker * activeTracker;
-    static thread_local std::vector<CompactDep> sessionTraces;
+    static thread_local std::vector<Dep> sessionTraces;
     /// Nesting depth of live DependencyTracker instances on this thread.
     /// Only the first (depth 0 → 1) is a true root that should call
     /// onRootConstruction(). Trackers created inside a SuspendDepTracking
@@ -60,7 +60,7 @@ struct DependencyTracker {
 
     InterningPools & pools;
     DependencyTracker * previous;
-    std::vector<CompactDep> * mySessionTraces;
+    std::vector<Dep> * mySessionTraces;
     uint32_t startIndex;
     /// Append-only list of dep ranges replayed from memoized thunks.
     /// Order preserved: ranges are appended in evaluation encounter order,
@@ -135,27 +135,43 @@ struct DependencyTracker {
 
     /**
      * Record a non-StructuredContent dependency into the session-wide dep vector.
-     * Interns source and key strings via the provided pools.
+     * String-accepting overload: interns source and key via the provided pools.
      * Deduplicates by hashing (type, source, key) within the active tracker scope.
      * When no tracker is active (e.g. during SuspendDepTracking), skips dedup
      * but still interns and appends (needed for epoch tracking).
      */
-    static void record(InterningPools & pools, Dep dep);
+    static void record(InterningPools & pools, DepType type,
+                       std::string_view source, std::string_view key,
+                       DepHashValue hash);
+
+    /**
+     * Record a pre-interned dependency into the session-wide dep vector.
+     * Deduplicates by hashing (type, sourceId, keyId) within the active tracker scope.
+     */
+    static void record(const Dep & dep);
 
     /**
      * Append a dependency to sessionTraces without touching the active
-     * tracker's depDedup filter. Interns strings into CompactDep.
+     * tracker's depDedup filter. String-accepting overload: interns into Dep.
      * Used by TracedExpr::replayTrace() to propagate a child's cached deps
-     * (loaded from DB as Dep objects) into the session trace (needed for
-     * thunk epoch ranges) without polluting the parent tracker's dedup state.
+     * into the session trace (needed for thunk epoch ranges) without
+     * polluting the parent tracker's dedup state.
      */
-    static void recordReplay(InterningPools & pools, const Dep & dep);
+    static void recordReplay(InterningPools & pools, DepType type,
+                             std::string_view source, std::string_view key,
+                             const DepHashValue & hash);
+
+    /**
+     * Append a pre-interned dependency to sessionTraces without touching
+     * the active tracker's depDedup filter.
+     */
+    static void recordReplay(const Dep & dep);
 
     /**
      * Collect all deps: session range [startIndex, current) plus
      * replayed epoch ranges, skipping any regions in excludedChildRanges.
      */
-    std::vector<CompactDep> collectTraces() const;
+    std::vector<Dep> collectTraces() const;
 
     /**
      * Returns true if there is at least one active tracker.

@@ -285,7 +285,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_KeyAdded_CacheMiss)
     // Verify stored child element values
     std::vector<std::string> expected{"a", "b", "c"};
     for (size_t i = 0; i < expected.size(); i++) {
-        auto childResult = getStoredResult(TraceStore::buildAttrPath({"names", std::to_string(i)}));
+        auto childResult = getStoredResult("names." + std::to_string(i));
         ASSERT_TRUE(childResult.has_value()) << "Child " << i << " should have a stored trace";
         auto * s = std::get_if<string_t>(& *childResult);
         ASSERT_NE(s, nullptr) << "Child " << i << " should be a string";
@@ -334,7 +334,7 @@ TEST_F(MaterializationDepTest, CrossScope_AttrNames_ValueChanged_CacheHit)
     // Verify stored child element values
     std::vector<std::string> expected{"a", "b"};
     for (size_t i = 0; i < expected.size(); i++) {
-        auto childResult = getStoredResult(TraceStore::buildAttrPath({"names", std::to_string(i)}));
+        auto childResult = getStoredResult("names." + std::to_string(i));
         ASSERT_TRUE(childResult.has_value()) << "Child " << i << " should have a stored trace";
         auto * s = std::get_if<string_t>(& *childResult);
         ASSERT_NE(s, nullptr) << "Child " << i << " should be a string";

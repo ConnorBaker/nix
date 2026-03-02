@@ -69,6 +69,10 @@ void EvalTraceContext::reset()
 
 void EvalTraceContext::flush()
 {
+    // Destroy trace stores — TraceStore destructors flush all pending data
+    // (including vocab entries via ATTACH'd connection) and commit the
+    // single cross-DB transaction atomically. No separate vocab flush
+    // or commit needed.
     evalCaches.clear();
 }
 

@@ -77,7 +77,7 @@ TEST_F(MaterializationDepTest, Nested_DumpDepsAfterFirstEval)
 
     dumpPath("root (\"\")", "");
     dumpPath("d", "d");
-    dumpPath("d\\0inner", makePath({"d", "inner"}));
+    dumpPath("d.inner", "d.inner");
     dumpPath("names", "names");
 }
 
@@ -109,7 +109,7 @@ TEST_F(MaterializationDepTest, Nested_DInnerVerifyAfterChange)
 
     // Dump d\0inner deps BEFORE file change
     {
-        auto deps = getStoredDeps(makePath({"d", "inner"}));
+        auto deps = getStoredDeps("d.inner");
         std::string msg = "d\\0inner deps BEFORE change (" + std::to_string(deps.size()) + "):\n";
         for (auto & d : deps)
             msg += "  [" + std::string(depTypeName(d.type)) + "] src=\"" + d.source
@@ -125,16 +125,15 @@ TEST_F(MaterializationDepTest, Nested_DInnerVerifyAfterChange)
     // standalone ImplicitShape(inner#keys) detects the key set change
     {
         auto db = makeQueryDb();
-        auto innerPath = makePath({"d", "inner"});
-        auto result = db.verify(innerPath, {}, state);
+        auto result = db.verify(pathFromDotted("d.inner"), {}, state);
         EXPECT_FALSE(result.has_value())
-            << "d\\0inner verify should fail after nested keys changed";
+            << "d.inner verify should fail after nested keys changed";
     }
 
     // Also check d's verify (should still pass — top-level keys unchanged)
     {
         auto db = makeQueryDb();
-        auto result = db.verify("d", {}, state);
+        auto result = db.verify(pathFromDotted("d"), {}, state);
         EXPECT_TRUE(result.has_value()) << "d verify should pass (top-level keys unchanged)";
     }
 }

@@ -17,6 +17,7 @@ headers = [ config_pub_h ] + files(
   'eval-trace/deps/recording.hh',
   'eval-trace/context.hh',
   'eval-trace/cache/trace-cache.hh',
+  'eval-trace/store/attr-vocab-store.hh',
   'eval-trace/store/trace-store.hh',
   'eval-trace/result.hh',
   'eval-trace/data/traced-data.hh',

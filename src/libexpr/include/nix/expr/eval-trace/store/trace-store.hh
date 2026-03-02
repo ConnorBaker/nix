@@ -2,6 +2,7 @@
 
 #include "nix/expr/eval-trace/result.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
+#include "nix/expr/eval-trace/store/attr-vocab-store.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/util/sync.hh"
 #include "nix/util/traced-data-ids.hh"
@@ -29,7 +30,6 @@ namespace nix::eval_trace {
 
 struct TraceIdTag {};
 struct ResultIdTag {};
-struct AttrPathIdTag {};
 struct DepKeySetIdTag {};
 
 /** ID for the Traces table (one per unique dep-structure + dep-values combination). */
@@ -38,34 +38,12 @@ using TraceId = StrongId<TraceIdTag, uint32_t>;
 /** ID for the Results table (one per unique result content hash). */
 using ResultId = StrongId<ResultIdTag, uint32_t>;
 
-// StringId is now defined in traced-data-ids.hh (shared with DepSourceId/DepKeyId).
-
-/** ID for the AttrPaths table (null-byte-separated attribute paths). */
-using AttrPathId = StrongId<AttrPathIdTag, uint32_t>;
+// StringId, AttrNameId, AttrPathId are defined in traced-data-ids.hh.
 
 /** ID for the DepKeySets table (content-addressed dep key sets, keyed by struct_hash). */
 using DepKeySetId = StrongId<DepKeySetIdTag, uint32_t>;
 
 // ── Hash helpers for boost flat maps ─────────────────────────────────
-
-/** Transparent string hash — avoids string_view → string copy on cache hit. */
-struct TransparentStringHash {
-    using is_transparent = void;
-    using is_avalanching = void;
-
-    std::size_t operator()(std::string_view sv) const noexcept {
-        return boost::hash<std::string_view>{}(sv);
-    }
-};
-
-/** Transparent string equality. */
-struct TransparentStringEqual {
-    using is_transparent = void;
-
-    bool operator()(std::string_view a, std::string_view b) const noexcept {
-        return a == b;
-    }
-};
 
 /** Hash for nix::Hash keys (uses first 8 bytes of BLAKE3 — well-distributed). */
 struct HashKeyHash {
@@ -90,11 +68,6 @@ struct TraceStore {
         // Strings — read-all for bulk load, explicit-ID insert for flush
         SQLiteStmt getAllStrings;
         SQLiteStmt insertStringWithId;
-
-        // AttrPaths — read-all for bulk load, explicit-ID insert for flush
-        SQLiteStmt getAllAttrPaths;
-        SQLiteStmt insertAttrPathWithId;
-        SQLiteStmt lookupAttrPathId;  // read-only lookup (no insert)
 
         // Results — read-all for bulk load, explicit-ID insert for flush
         SQLiteStmt getAllResults;
@@ -121,15 +94,20 @@ struct TraceStore {
         SQLiteStmt lookupHistoryByTrace;
         SQLiteStmt scanHistoryForAttr;
 
-        // StatHashCache (stat-hash cache persistence)
+        // StatHashCache (stat-hash cache persistence, on stat_cache.* schema)
         SQLiteStmt queryAllStatHash;
         SQLiteStmt upsertStatHash;
+
+        // Vocab (on vocab.* schema, ATTACH'd from attr-vocab.sqlite)
+        SQLiteStmt insertVocabName;
+        SQLiteStmt insertVocabPath;
 
         std::unique_ptr<SQLiteTxn> txn;
     };
     std::unique_ptr<Sync<State>> _state;
     SymbolTable & symbols;
     InterningPools & pools;
+    AttrVocabStore & vocab;
     int64_t contextHash;
 
     // Interned dep key (string IDs, no hash value). Used for keys_blob serialization
@@ -193,12 +171,6 @@ struct TraceStore {
     /// Trace IDs verified in this session (skip re-verification).
     boost::unordered_flat_set<TraceId, TraceId::Hash> verifiedTraceIds;
 
-    /// Forward map: attrPath → AttrPathId (transparent lookup avoids copy on hit).
-    /// String interning is handled by pools.strings (StringInternTable) — no
-    /// separate internedStrings map needed.
-    boost::unordered_flat_map<std::string, AttrPathId,
-        TransparentStringHash, TransparentStringEqual> internedAttrPaths;
-
     /// Content-addressed dedup maps (in-memory, flushed to DB periodically)
     boost::unordered_flat_map<Hash, ResultId, HashKeyHash> resultByHash;
     boost::unordered_flat_map<Hash, DepKeySetId, HashKeyHash> depKeySetByStructHash;
@@ -208,12 +180,10 @@ struct TraceStore {
     /// traceCache and traceStructHashCache.
     boost::unordered_flat_map<TraceId, CachedTraceData, TraceId::Hash> traceDataCache;
 
-    /// lookupTraceRow cache: attrPath (canonical \0-separated) → TraceRow.
-    /// std::string correctly handles embedded \0 bytes in both hashing and comparison.
+    /// lookupTraceRow cache: AttrPathId → TraceRow (integer-keyed).
     /// Avoids repeated CurrentTraces DB lookups for the same attr path.
     /// Invalidated when CurrentTraces changes for a path (in recovery and record).
-    boost::unordered_flat_map<std::string, TraceRow,
-        TransparentStringHash, TransparentStringEqual> traceRowCache;
+    boost::unordered_flat_map<AttrPathId, TraceRow, AttrPathId::Hash> traceRowCache;
 
     /// DepKeySet session cache: maps DepKeySetId → resolved dep keys.
     /// Keyed by integer ID (not hash) because we look up by ID after DB queries.
@@ -227,7 +197,6 @@ struct TraceStore {
 
     // ── In-memory ID counters (next ID to assign = max(DB IDs) + 1) ──
 
-    AttrPathId nextAttrPathId;
     ResultId nextResultId;
     DepKeySetId nextDepKeySetId;
     TraceId nextTraceId;
@@ -237,8 +206,6 @@ struct TraceStore {
     uint32_t flushedStringHighWaterMark = 0;
 
     // ── Pending writes (deferred to flush()) ─────────────────────────
-
-    std::vector<std::pair<AttrPathId, std::string>> pendingAttrPaths;
 
     struct PendingResult {
         ResultId id;
@@ -266,7 +233,7 @@ struct TraceStore {
 
     // ── Lifecycle ────────────────────────────────────────────────────
 
-    TraceStore(SymbolTable & symbols, InterningPools & pools, int64_t contextHash);
+    TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabStore & vocab, int64_t contextHash);
     ~TraceStore();
 
     /** Bulk-load all interned entities from DB into in-memory maps.
@@ -275,7 +242,7 @@ struct TraceStore {
     void bulkLoadAll();
 
     /** Flush all pending writes to SQLite in dependency order
-     *  (Strings → AttrPaths → Results → DepKeySets → Traces).
+     *  (Strings → Results → DepKeySets → Traces).
      *  Called from record() before upsertAttr/insertHistory, and
      *  from the destructor before committing the transaction. */
     void flush();
@@ -299,7 +266,7 @@ struct TraceStore {
      * constructive recovery before returning nullopt.
      */
     std::optional<VerifyResult> verify(
-        std::string_view attrPath,
+        AttrPathId pathId,
         const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
         EvalState & state);
 
@@ -319,18 +286,11 @@ struct TraceStore {
      * a file revert).
      */
     RecordResult record(
-        std::string_view attrPath,
-        const CachedResult & value,
-        const std::vector<CompactDep> & allDeps,
-        bool isRoot);
-
-    /** Convenience overload: accepts Dep objects, interns them into CompactDeps.
-     *  Must pass an explicit vector (not an initializer list) to avoid ambiguity. */
-    RecordResult recordDeps(
-        std::string_view attrPath,
+        AttrPathId pathId,
         const CachedResult & value,
         const std::vector<Dep> & allDeps,
         bool isRoot);
+
 
     /**
      * Constructive trace recovery (BSàlC CT recovery).
@@ -353,7 +313,7 @@ struct TraceStore {
     [[gnu::cold]]
     std::optional<VerifyResult> recovery(
         TraceId oldTraceId,
-        std::string_view attrPath,
+        AttrPathId pathId,
         const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
         EvalState & state);
 
@@ -379,16 +339,15 @@ struct TraceStore {
      */
     std::vector<InternedDepKey> loadKeySet(DepKeySetId depKeySetId);
 
-    bool attrExists(std::string_view attrPath);
+    bool attrExists(AttrPathId pathId);
 
     /** Get the current trace hash for an attr path (for ParentContext dep verification).
      *  Returns the trace_hash from the Traces table, which captures the full dep
      *  structure + hashes. Unlike a result hash (which for attrsets only captures
      *  attribute names), the trace hash changes when any dep value changes. */
-    std::optional<Hash> getCurrentTraceHash(std::string_view attrPath);
+    std::optional<Hash> getCurrentTraceHash(AttrPathId pathId);
 
     void clearSessionCaches();
-    static std::string buildAttrPath(const std::vector<std::string> & components);
 
     // ── BLOB serialization ───────────────────────────────────────────
 
@@ -407,17 +366,29 @@ struct TraceStore {
     static std::vector<DepHashValue> deserializeValues(
         const void * blob, size_t size, const std::vector<InternedDepKey> & keys);
 
-    /// Resolve a single InternedDep to a string-based Dep (for computeCurrentHash, tests).
-    Dep resolveDep(const InternedDep & idep);
+    /**
+     * Resolved dependency with owned strings. Used by verification code
+     * (computeCurrentHash, resolveDepPath) and test assertions that need
+     * human-readable source/key values.
+     */
+    struct ResolvedDep {
+        std::string source;
+        std::string key;
+        DepHashValue expectedHash;
+        DepType type;
+    };
+
+    /// Resolve a single InternedDep to a string-based ResolvedDep.
+    ResolvedDep resolveDep(const InternedDep & idep);
 
     /// Resolve a StringId to its string value. O(1) lookup via pools.strings.
     /// Returns string_view into arena memory; lifetime tied to InterningPools.
     std::string_view resolveString(StringId id) const;
 
-    /// Convert CompactDeps to InternedDeps. DepSourceId/DepKeyId share the same
+    /// Convert Deps to InternedDeps. DepSourceId/DepKeyId share the same
     /// index space as StringId (unified StringInternTable), so conversion is
     /// a raw value copy — no string lookup needed.
-    std::vector<InternedDep> internDeps(const std::vector<CompactDep> & deps);
+    std::vector<InternedDep> internDeps(const std::vector<Dep> & deps);
 
     /**
      * Verify a single trace: recompute all dep hashes and compare against
@@ -443,13 +414,12 @@ struct TraceStore {
     std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);
 
 private:
-    std::optional<TraceRow> lookupTraceRow(std::string_view attrPath);
+    std::optional<TraceRow> lookupTraceRow(AttrPathId pathId);
 
     /** Ensure traceDataCache has traceHash + structHash for the given traceId.
      *  Queries getTraceInfo on cache miss. Returns null if trace not found. */
     CachedTraceData * ensureTraceHashes(TraceId traceId);
 
-    AttrPathId doInternAttrPath(std::string_view path);
     ResultId doInternResult(ResultKind type, const std::string & value,
                             const std::string & context, const Hash & resultHash);
 

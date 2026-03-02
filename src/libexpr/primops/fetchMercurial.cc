@@ -86,8 +86,8 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
 
     // Record UnhashedFetch oracle dep for trace verification (re-fetch on verify)
     if (!input.isLocked(state.fetchSettings) && state.traceActiveDepth) [[unlikely]] {
-        DependencyTracker::record(*state.traceCtx->pools,{"", input.to_string(),
-            DepHashValue(state.store->printStorePath(storePath)), DepType::UnhashedFetch});
+        DependencyTracker::record(*state.traceCtx->pools, DepType::UnhashedFetch, "", input.to_string(),
+            DepHashValue(state.store->printStorePath(storePath)));
     }
 
     auto attrs2 = state.buildBindings(8);

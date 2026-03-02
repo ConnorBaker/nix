@@ -515,7 +515,7 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
     // Record Exec oracle dep for the eval trace (Shake-style: always dirty
     // since we cannot safely re-execute the program during verification).
     if (state.traceActiveDepth) [[unlikely]] {
-        DependencyTracker::record(*state.traceCtx->pools,{"<exec>", program, depHash(program + "\0" + output), DepType::Exec});
+        DependencyTracker::record(*state.traceCtx->pools, DepType::Exec, "<exec>", program, depHash(program + "\0" + output));
     }
 
     Expr * parsed;
@@ -1234,7 +1234,7 @@ static void prim_getEnv(EvalState & state, const PosIdx pos, Value ** args, Valu
     // Record EnvVar oracle dep for the eval trace (Shake-style external dependency)
     if (state.traceActiveDepth && !state.settings.pureEval && !state.settings.restrictEval) {
         auto hash = depHash(value);
-        DependencyTracker::record(*state.traceCtx->pools,{"", name, hash, DepType::EnvVar});
+        DependencyTracker::record(*state.traceCtx->pools, DepType::EnvVar, "", name, hash);
     }
 }
 
@@ -1851,15 +1851,15 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
     auto drvPath = writeDerivation(*state.store, drv, state.repair);
     auto drvPathS = state.store->printStorePath(drvPath);
 
-    // TODO: Record an Existence dep for the .drv store path so trace
-    // verification (BSàlC: verifying trace) detects GC removal. An earlier
-    // attempt caused CA test failures (ca/build-delete, ca/issue-13247):
-    // when .drv files are deleted mid-test, the Existence dep fails
-    // verification, routing through fresh evaluation instead of the
-    // toDerivedPaths recovery path. Fresh evaluation re-evaluates
-    // derivationStrictInternal, which calls pathDerivationModulo() on
-    // input .drv files that were also deleted, producing "path does not
-    // exist" errors via SourceAccessor::lstat().
+    // Record a StorePathExistence dep for the .drv store path so trace
+    // verification detects GC removal. When the .drv is deleted, this dep
+    // fails ("valid" → "missing"), forcing fresh re-evaluation. Nix's lazy
+    // evaluation ensures input derivations are re-evaluated (and their .drv
+    // files recreated) before the parent calls pathDerivationModulo() on them.
+    if (state.traceActiveDepth) [[unlikely]] {
+        DependencyTracker::record(*state.traceCtx->pools, DepType::StorePathExistence,
+            "", drvPathS, DepHashValue(std::string("valid")));
+    }
 
     printMsg(lvlChatty, "instantiated '%1%' -> '%2%'", drvName, drvPathS);
 
@@ -5567,8 +5567,8 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
             .arity = 1,
             .fun = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
                 if (state.traceActiveDepth) [[unlikely]] {
-                    DependencyTracker::record(*state.traceCtx->pools,{"", "currentTime",
-                        DepHashValue(std::to_string(time(0))), DepType::CurrentTime});
+                    DependencyTracker::record(*state.traceCtx->pools, DepType::CurrentTime, "", "currentTime",
+                        DepHashValue(std::to_string(time(0))));
                 }
                 v.mkInt(time(0));
             },
@@ -5615,7 +5615,7 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
                 if (state.traceActiveDepth) [[unlikely]] {
                     auto system = state.settings.getCurrentSystem();
                     auto hash = depHash(system);
-                    DependencyTracker::record(*state.traceCtx->pools,{"", "currentSystem", hash, DepType::System});
+                    DependencyTracker::record(*state.traceCtx->pools, DepType::System, "", "currentSystem", hash);
                 }
                 v.mkString(state.settings.getCurrentSystem(), state.mem);
             },

@@ -6,6 +6,10 @@
 #include <string>
 #include <vector>
 
+namespace nix {
+struct InterningPools;
+}
+
 namespace nix::eval_trace {
 
 /**
@@ -24,7 +28,7 @@ namespace nix::eval_trace {
  * the same trace hash regardless of collection order or duplicates, since deps
  * are sorted and deduped before hashing.
  */
-Hash computeTraceHash(const std::vector<Dep> & deps);
+Hash computeTraceHash(InterningPools & pools, const std::vector<Dep> & deps);
 
 /**
  * Compute a structural hash of a trace's deps (type, source, key only — no
@@ -39,10 +43,10 @@ Hash computeTraceHash(const std::vector<Dep> & deps);
  * current dep values (BSàlC §3.4, constructive traces with structural
  * equivalence classes).
  */
-Hash computeTraceStructHash(const std::vector<Dep> & deps);
+Hash computeTraceStructHash(InterningPools & pools, const std::vector<Dep> & deps);
 
 /**
- * Sort deps by (type, source, key) and deduplicate by the same triple.
+ * Sort deps by (type, sourceId, keyId) and deduplicate by the same triple.
  * Produces a canonical dep ordering so that trace hashes are deterministic
  * regardless of the order in which deps were collected during evaluation.
  */
@@ -53,7 +57,7 @@ std::vector<Dep> sortAndDedupDeps(const std::vector<Dep> & deps);
  * canonically sorted deps). Used by trace recording (BSàlC: "record"),
  * which sorts once and computes both trace hash and structural hash.
  */
-Hash computeTraceHashFromSorted(const std::vector<Dep> & sortedDeps);
-Hash computeTraceStructHashFromSorted(const std::vector<Dep> & sortedDeps);
+Hash computeTraceHashFromSorted(InterningPools & pools, const std::vector<Dep> & sortedDeps);
+Hash computeTraceStructHashFromSorted(InterningPools & pools, const std::vector<Dep> & sortedDeps);
 
 } // namespace nix::eval_trace

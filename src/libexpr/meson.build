@@ -158,6 +158,7 @@ sources = files(
   'attr-set.cc',
   'eval-trace/context.cc',
   'eval-trace/cache/trace-cache.cc',
+  'eval-trace/store/attr-vocab-store.cc',
   'eval-trace/store/trace-store.cc',
   'eval-trace/deps/hash.cc',
   'eval-trace/deps/recording.cc',

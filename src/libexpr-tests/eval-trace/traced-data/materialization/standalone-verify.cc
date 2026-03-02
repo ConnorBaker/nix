@@ -209,7 +209,7 @@ TEST_F(MaterializationDepTest, StandaloneIS_DepStructure)
     }
 
     // Verify d\0inner's dep structure: should have ParentContext + ImplicitShape, NO Content
-    auto innerDeps = getStoredDeps(makePath({"d", "inner"}));
+    auto innerDeps = getStoredDeps("d.inner");
     EXPECT_TRUE(hasDep(innerDeps, DepType::ParentContext, ""))
         << "d\\0inner should have ParentContext dep\n" << dumpDeps(innerDeps);
     EXPECT_TRUE(hasJsonDep(innerDeps, DepType::ImplicitShape, shapePred("keys")))

@@ -83,8 +83,9 @@ struct TracedExpr : Expr, gc
 {
     TraceCache * cache;
     Symbol name;
-    TracedExpr * parentExpr; // GC-traced, nullptr for root
-    bool isListElement;      // true = list index, false = attr access
+    AttrPathId pathId;           // Trie path in AttrVocabStore (computed at construction)
+    TracedExpr * parentExpr;     // GC-traced, nullptr for root
+    bool isListElement;          // true = list index, false = attr access
 
     /**
      * Lazy-initialized state for fields only needed when eval() or
@@ -95,7 +96,6 @@ struct TracedExpr : Expr, gc
         Expr * origExpr = nullptr;
         Env * origEnv = nullptr;
         std::optional<TraceId> traceId;
-        mutable std::optional<std::string> cachedStoreAttrPath;
     };
     LazyState * lazy = nullptr;
 
@@ -104,50 +104,15 @@ struct TracedExpr : Expr, gc
         return *lazy;
     }
 
-    TracedExpr(TraceCache * cache, AttrId /*unused*/, Symbol name, TracedExpr * parentExpr,
-               bool isListElement = false)
-        : cache(cache)
-        , name(name)
-        , parentExpr(parentExpr)
-        , isListElement(isListElement)
-    {
-    }
+    TracedExpr(TraceCache * cache, Symbol name, TracedExpr * parentExpr,
+               bool isListElement = false);
 
     void eval(EvalState & state, Env & env, Value & v) override;
     void show(const SymbolTable &, std::ostream &) const override {}
     void bindVars(EvalState &, const std::shared_ptr<const StaticEnv> &) override {}
 
-    std::string attrPathStr() const
-    {
-        if (!parentExpr)
-            return "«root»";
-        std::vector<Symbol> syms;
-        for (auto * e = this; e->parentExpr; e = e->parentExpr)
-            syms.push_back(e->name);
-        std::reverse(syms.begin(), syms.end());
-        AttrPath path(syms.begin(), syms.end());
-        return path.to_string(cache->state);
-    }
-
-    // ── DB backend methods ──────────────────────────────────────
-
-    std::string storeAttrPath() const
-    {
-        if (lazy && lazy->cachedStoreAttrPath)
-            return *lazy->cachedStoreAttrPath;
-        std::string result;
-        if (!parentExpr) {
-            result = ""; // root
-        } else {
-            std::vector<std::string> components;
-            for (auto * e = this; e->parentExpr; e = e->parentExpr)
-                components.push_back(std::string(cache->state.symbols[e->name]));
-            std::reverse(components.begin(), components.end());
-            result = TraceStore::buildAttrPath(components);
-        }
-        const_cast<TracedExpr *>(this)->ensureLazy().cachedStoreAttrPath = result;
-        return result;
-    }
+    /// Dot-separated display path for diagnostics.
+    std::string attrPathStr() const { return vocab().displayPath(pathId); }
 
     std::optional<TraceId> parentTraceId() const
     {
@@ -161,7 +126,22 @@ struct TracedExpr : Expr, gc
     void materializeOrigExprAttrs(Value & v, const attrs_t & attrs,
                                    Value * prePopulatedParent = nullptr);
     void replayTrace(TraceId traceId);
+
+    /// Convenience accessor for the vocab store (lazy-inits if needed).
+    AttrVocabStore & vocab() const { return cache->state.traceCtx->getVocabStore(cache->state.symbols); }
 };
+
+TracedExpr::TracedExpr(TraceCache * cache, Symbol name, TracedExpr * parentExpr,
+                       bool isListElement)
+    : cache(cache)
+    , name(name)
+    , pathId(parentExpr
+          ? vocab().extendPath(parentExpr->pathId, name)
+          : AttrVocabStore::rootPath())
+    , parentExpr(parentExpr)
+    , isListElement(isListElement)
+{
+}
 
 // ── SiblingAccessTracker (per-accessed-sibling ParentContext deps) ────
 
@@ -179,8 +159,8 @@ struct TracedExpr : Expr, gc
 struct SiblingAccessTracker
 {
     TracedExpr * parentExpr;
-    std::vector<std::pair<std::string, Hash>> accesses;
-    std::unordered_set<std::string> seen; // dedup by attrPath
+    std::vector<std::pair<AttrPathId, Hash>> accesses;
+    boost::unordered_flat_set<AttrPathId, AttrPathId::Hash> seen;
 
     static thread_local SiblingAccessTracker * current;
     SiblingAccessTracker * previous;
@@ -192,32 +172,21 @@ struct SiblingAccessTracker
     SiblingAccessTracker(const SiblingAccessTracker &) = delete;
     SiblingAccessTracker & operator=(const SiblingAccessTracker &) = delete;
 
-    void recordAccess(const std::string & attrPath, const Hash & traceHash)
+    void recordAccess(AttrPathId pathId, const Hash & traceHash)
     {
-        if (seen.insert(attrPath).second)
-            accesses.emplace_back(attrPath, traceHash);
+        if (seen.insert(pathId).second)
+            accesses.emplace_back(pathId, traceHash);
     }
 
-    /**
-     * Called at the end of TracedExpr::eval() to record a sibling access.
-     * Only records if:
-     * - A tracker is active (some ancestor is being evaluated fresh)
-     * - The sibling shares the same parentExpr as the tracker
-     * - The sibling has a valid traceId (eval completed successfully)
-     * - The sibling's current trace hash is available in the DB
-     */
     static void maybeRecord(TracedExpr * expr, TraceStore & db)
     {
         if (!current) return;
         if (expr->parentExpr != current->parentExpr) return;
         if (!expr->lazy || !expr->lazy->traceId) return;
         try {
-            auto path = expr->storeAttrPath();
-            auto hash = db.getCurrentTraceHash(path);
-            if (hash) current->recordAccess(path, *hash);
-        } catch (...) {
-            // DB error during sibling recording — skip silently
-        }
+            auto hash = db.getCurrentTraceHash(expr->pathId);
+            if (hash) current->recordAccess(expr->pathId, *hash);
+        } catch (...) {}
     }
 };
 thread_local SiblingAccessTracker * SiblingAccessTracker::current = nullptr;
@@ -405,7 +374,7 @@ void TracedExpr::materializeOrigExprAttrs(
     for (size_t i = 0; i < attrs.names.size(); i++) {
         auto childName = attrs.names[i];
         auto * childVal = st.allocValue();
-        auto * wrapper = new TracedExpr(cache, 0, childName, this);
+        auto * wrapper = new TracedExpr(cache, childName, this);
         nrTracedExprCreated++;
         nrTracedExprFromOrigAttrs++;
         wrapper->ensureLazy().origExpr = new ExprOrigChild(lazy->origExpr, lazy->origEnv, childName, shared);
@@ -463,8 +432,9 @@ void TracedExpr::replayTrace(TraceId traceId)
         auto & pools = *cache->state.traceCtx->pools;
         auto deps = cache->dbBackend->loadFullTrace(traceId);
         for (auto & idep : deps) {
-            auto dep = cache->dbBackend->resolveDep(idep);
-            DependencyTracker::recordReplay(pools, dep);
+            auto resolved = cache->dbBackend->resolveDep(idep);
+            DependencyTracker::recordReplay(pools, resolved.type,
+                resolved.source, resolved.key, resolved.expectedHash);
         }
     } catch (std::exception &) {
         // DB may be corrupt or trace may have been evicted — skip
@@ -515,7 +485,7 @@ Value * TracedExpr::navigateToReal()
                 if (attr.value->isThunk()
                     && !dynamic_cast<TracedExpr*>(attr.value->thunk().expr))
                 {
-                    auto * wrapper = new TracedExpr(cache, 0, attr.name, parentEC);
+                    auto * wrapper = new TracedExpr(cache, attr.name, parentEC);
                     nrTracedExprCreated++;
                     nrTracedExprFromOrigAttrs++;
                     wrapper->ensureLazy().origExpr = attr.value->thunk().expr;
@@ -573,7 +543,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
         for (size_t i = 0; i < attrs->names.size(); i++) {
             auto childName = attrs->names[i];
             auto * childVal = st.allocValue();
-            auto * child = new TracedExpr(cache, 0, childName, this);
+            auto * child = new TracedExpr(cache, childName, this);
             nrTracedExprCreated++;
             nrTracedExprFromMaterialize++;
             childVal->mkThunk(&st.baseEnv, child);
@@ -644,7 +614,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
         for (size_t i = 0; i < lt->size; i++) {
             auto * elemVal = st.allocValue();
             auto sym = st.symbols.create(std::to_string(i));
-            auto * child = new TracedExpr(cache, 0, sym, this, /*isListElement=*/true);
+            auto * child = new TracedExpr(cache, sym, this, /*isListElement=*/true);
             nrTracedExprCreated++;
             nrTracedExprFromMaterialize++;
             elemVal->mkThunk(&st.baseEnv, child);
@@ -674,31 +644,20 @@ void TracedExpr::evaluateFresh(Value & v)
 
     // Append per-sibling or whole-parent ParentContext deps for children.
     // Called from both the success and error paths of evaluateFresh().
-    auto appendParentContextDeps = [&](std::vector<CompactDep> & deps) {
+    auto appendParentContextDeps = [&](std::vector<Dep> & deps) {
         if (!parentExpr || !cache->dbBackend) return;
         if (siblingTracker && !siblingTracker->accesses.empty()) {
             // Per-sibling ParentContext deps: one dep per accessed sibling
-            for (auto & [path, hash] : siblingTracker->accesses) {
-                Blake3Hash b3;
-                static_assert(sizeof(b3.bytes) == 32);
-                std::memcpy(b3.bytes.data(), hash.hash, 32);
-                auto depKey = path;
-                std::replace(depKey.begin(), depKey.end(), '\0', '\t');
-                deps.push_back(CompactDep{
-                    DepType::ParentContext, pools.intern<DepSourceId>(""), pools.intern<DepKeyId>(depKey), DepHashValue(b3)});
+            for (auto & [sibPathId, hash] : siblingTracker->accesses) {
+                deps.push_back(Dep::makeParentContext(
+                    sibPathId, DepHashValue(Blake3Hash::fromHash(hash))));
             }
         } else {
             // Zero sibling accesses: fallback to whole-parent dep
-            auto parentPath = parentExpr->storeAttrPath();
-            auto parentTraceHash = cache->dbBackend->getCurrentTraceHash(parentPath);
+            auto parentTraceHash = cache->dbBackend->getCurrentTraceHash(parentExpr->pathId);
             if (parentTraceHash) {
-                Blake3Hash b3;
-                static_assert(sizeof(b3.bytes) == 32);
-                std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
-                auto depKey = parentPath;
-                std::replace(depKey.begin(), depKey.end(), '\0', '\t');
-                deps.push_back(CompactDep{
-                    DepType::ParentContext, pools.intern<DepSourceId>(""), pools.intern<DepKeyId>(depKey), DepHashValue(b3)});
+                deps.push_back(Dep::makeParentContext(
+                    parentExpr->pathId, DepHashValue(Blake3Hash::fromHash(*parentTraceHash))));
             }
         }
     };
@@ -743,13 +702,12 @@ void TracedExpr::evaluateFresh(Value & v)
     } catch (EvalError &) {
         debug("setting '%s' to failed (fresh evaluation)", attrPathStr());
         if (cache->dbBackend) {
-            auto attrPath = storeAttrPath();
             auto directDeps = tracker.collectTraces();
             appendParentContextDeps(directDeps);
 
             try {
                 auto result = cache->dbBackend->record(
-                    attrPath, failed_t{}, directDeps, !parentExpr);
+                    pathId, failed_t{}, directDeps, !parentExpr);
                 ensureLazy().traceId = result.traceId;
             } catch (std::exception & e) {
                 debug("trace recording failed for '%s': %s", attrPathStr(), e.what());
@@ -759,7 +717,6 @@ void TracedExpr::evaluateFresh(Value & v)
     }
 
     if (cache->dbBackend) {
-        auto attrPath = storeAttrPath();
         auto directDeps = tracker.collectTraces();
 
         // Build the CachedResult for storage
@@ -783,7 +740,7 @@ void TracedExpr::evaluateFresh(Value & v)
         // Direct record — no deferred writes
         try {
             auto coldResult = cache->dbBackend->record(
-                attrPath, attrValue, directDeps, !parentExpr);
+                pathId, attrValue, directDeps, !parentExpr);
             ensureLazy().traceId = coldResult.traceId;
         } catch (std::exception & e) {
             debug("trace recording failed for '%s': %s", attrPathStr(), e.what());
@@ -1096,8 +1053,7 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
         }
     } siblingGuard{this, db};
 
-    auto attrPath = storeAttrPath();
-    auto warmResult = db.verify(attrPath, cache->inputAccessors, cache->state);
+    auto warmResult = db.verify(pathId, cache->inputAccessors, cache->state);
 
     if (warmResult) {
         auto & [cachedValue, cachedTraceId] = *warmResult;
@@ -1150,11 +1106,11 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
 // ── TraceCache public API ─────────────────────────────────────────────
 
 static std::shared_ptr<TraceStore> makeDbBackend(
-    const Hash & fingerprint, SymbolTable & symbols, InterningPools & pools)
+    const Hash & fingerprint, SymbolTable & symbols, InterningPools & pools, AttrVocabStore & vocab)
 {
     int64_t contextHash;
     std::memcpy(&contextHash, fingerprint.hash, sizeof(contextHash));
-    return std::make_shared<TraceStore>(symbols, pools, contextHash);
+    return std::make_shared<TraceStore>(symbols, pools, vocab, contextHash);
 }
 
 TraceCache::TraceCache(
@@ -1168,7 +1124,8 @@ TraceCache::TraceCache(
 {
     if (useCache) {
         try {
-            dbBackend = makeDbBackend(*useCache, state.symbols, *state.traceCtx->pools);
+            dbBackend = makeDbBackend(*useCache, state.symbols, *state.traceCtx->pools,
+                state.traceCtx->getVocabStore(state.symbols));
         } catch (...) {
             ignoreExceptionExceptInterrupt();
         }
@@ -1188,7 +1145,7 @@ Value * TraceCache::getRootValue()
 {
     if (!value) {
         auto * v = state.allocValue();
-        v->mkThunk(&state.baseEnv, new TracedExpr(this, 0, state.s.epsilon, nullptr));
+        v->mkThunk(&state.baseEnv, new TracedExpr(this, state.s.epsilon, nullptr));
         nrTracedExprCreated++;
         value = allocRootValue(v);
     }

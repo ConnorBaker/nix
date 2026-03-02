@@ -229,6 +229,7 @@ private:
 
 /**
  * Build a null-byte-separated attr path from components.
+ * DEPRECATED: Use vocabPath() for new code (returns AttrPathId).
  */
 inline std::string makePath(std::initializer_list<std::string_view> parts)
 {
@@ -243,72 +244,72 @@ inline std::string makePath(std::initializer_list<std::string_view> parts)
 }
 
 /**
- * Convert an attr path (\0-separated) to a ParentContext dep key (\t-separated).
- * Matches the conversion in trace-cache.cc.
+ * Build an AttrPathId from components using the vocab store.
  */
-inline std::string toDepKey(const std::string & attrPath)
+inline AttrPathId vocabPath(AttrVocabStore & vocab, std::initializer_list<std::string_view> parts)
 {
-    std::string key = attrPath;
-    std::replace(key.begin(), key.end(), '\0', '\t');
-    return key;
+    auto id = AttrVocabStore::rootPath();
+    for (auto & part : parts)
+        id = vocab.internPath(id, vocab.internName(part));
+    return id;
 }
+
 
 // ── Oracle dep factory helpers ──────────────────────────────────────
 
-inline Dep makeContentDep(std::string_view key, std::string_view content)
+inline Dep makeContentDep(InterningPools & p, std::string_view key, std::string_view content)
 {
-    return Dep{"", std::string(key), depHash(content), DepType::Content};
+    return {DepType::Content, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key), depHash(content)};
 }
 
-inline Dep makeEnvVarDep(std::string_view key, std::string_view value)
+inline Dep makeEnvVarDep(InterningPools & p, std::string_view key, std::string_view value)
 {
-    return Dep{"", std::string(key), depHash(value), DepType::EnvVar};
+    return {DepType::EnvVar, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key), depHash(value)};
 }
 
-inline Dep makeExistenceDep(std::string_view key, bool exists)
+inline Dep makeExistenceDep(InterningPools & p, std::string_view key, bool exists)
 {
-    return Dep{
-        "", std::string(key),
-        DepHashValue(exists ? std::string("type:1") : std::string("missing")),
-        DepType::Existence};
+    return {DepType::Existence, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key),
+        DepHashValue(exists ? std::string("type:1") : std::string("missing"))};
 }
 
-inline Dep makeSystemDep(std::string_view system)
+inline Dep makeSystemDep(InterningPools & p, std::string_view system)
 {
-    return Dep{"", "", depHash(system), DepType::System};
+    return {DepType::System, p.intern<DepSourceId>(""), p.intern<DepKeyId>(""), depHash(system)};
 }
 
-inline Dep makeCurrentTimeDep()
+inline Dep makeCurrentTimeDep(InterningPools & p)
 {
-    return Dep{"", "", DepHashValue(std::string("volatile")), DepType::CurrentTime};
+    return {DepType::CurrentTime, p.intern<DepSourceId>(""), p.intern<DepKeyId>(""),
+        DepHashValue(std::string("volatile"))};
 }
 
-inline Dep makeExecDep()
+inline Dep makeExecDep(InterningPools & p)
 {
-    return Dep{"", "", DepHashValue(std::string("volatile")), DepType::Exec};
+    return {DepType::Exec, p.intern<DepSourceId>(""), p.intern<DepKeyId>(""),
+        DepHashValue(std::string("volatile"))};
 }
 
-inline Dep makeCopiedPathDep(std::string_view key, std::string_view storePath)
+inline Dep makeCopiedPathDep(InterningPools & p, std::string_view key, std::string_view storePath)
 {
-    return Dep{"", std::string(key), DepHashValue(std::string(storePath)), DepType::CopiedPath};
+    return {DepType::CopiedPath, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key),
+        DepHashValue(std::string(storePath))};
 }
 
-inline Dep makeNARContentDep(std::string_view key, const Blake3Hash & hash)
+inline Dep makeNARContentDep(InterningPools & p, std::string_view key, const Blake3Hash & hash)
 {
-    return Dep{"", std::string(key), hash, DepType::NARContent};
+    return {DepType::NARContent, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key), hash};
 }
 
-inline Dep makeDirectoryDep(std::string_view key, const Blake3Hash & hash)
+inline Dep makeDirectoryDep(InterningPools & p, std::string_view key, const Blake3Hash & hash)
 {
-    return Dep{"", std::string(key), hash, DepType::Directory};
+    return {DepType::Directory, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key), hash};
 }
 
-inline Dep makeParentContextDep(std::string_view depKey, const Hash & traceHash)
+/// Create a ParentContext Dep from an AttrPathId and trace hash.
+inline Dep makeParentContextDep(AttrPathId pathId, const Hash & traceHash)
 {
-    Blake3Hash b3;
-    static_assert(sizeof(b3.bytes) == 32);
-    std::memcpy(b3.bytes.data(), traceHash.hash, 32);
-    return Dep{"", std::string(depKey), DepHashValue(b3), DepType::ParentContext};
+    return Dep::makeParentContext(pathId, DepHashValue(Blake3Hash::fromHash(traceHash)));
 }
 
 // ── CachedResult comparison ─────────────────────────────────────────
@@ -397,9 +398,24 @@ class TraceStoreFixture : public EvalTraceTest
 protected:
     static constexpr int64_t testContextHash = 0x1234567890ABCDEF;
 
+    AttrVocabStore & testVocab() {
+        return state.traceCtx->getVocabStore(state.symbols);
+    }
+
+    /// Build an AttrPathId from string components.
+    AttrPathId vpath(std::initializer_list<std::string_view> parts) {
+        return vocabPath(testVocab(), parts);
+    }
+
+    /// Root path sentinel.
+    AttrPathId rootPath() { return AttrVocabStore::rootPath(); }
+
+    InterningPools & pools() { return *state.traceCtx->pools; }
+
     TraceStore makeDb()
     {
-        return TraceStore(state.symbols, *state.traceCtx->pools, testContextHash);
+        return TraceStore(state.symbols, *state.traceCtx->pools,
+            testVocab(), testContextHash);
     }
 };
 
@@ -434,21 +450,23 @@ class TraceStoreTest : public TraceStoreFixture
 class DepPrecisionTest : public TracedDataTest
 {
 protected:
-    static std::vector<Dep> resolveDeps(InterningPools & pools, const std::vector<CompactDep> & compact)
+    using ResolvedDep = TraceStore::ResolvedDep;
+
+    static std::vector<ResolvedDep> resolveDeps(InterningPools & pools, const std::vector<Dep> & deps)
     {
-        std::vector<Dep> result;
-        result.reserve(compact.size());
-        for (auto & c : compact) {
-            result.push_back(Dep{
-                std::string(pools.resolve(c.sourceId)),
-                std::string(pools.resolve(c.keyId)),
-                c.expectedHash,
-                c.type});
+        std::vector<ResolvedDep> result;
+        result.reserve(deps.size());
+        for (auto & d : deps) {
+            result.push_back(ResolvedDep{
+                std::string(pools.resolve(d.sourceId)),
+                std::string(pools.resolve(d.keyId)),
+                d.expectedHash,
+                d.type});
         }
         return result;
     }
 
-    std::vector<Dep> evalAndCollectDeps(const std::string & nixExpr)
+    std::vector<ResolvedDep> evalAndCollectDeps(const std::string & nixExpr)
     {
         DependencyTracker tracker(*state.traceCtx->pools);
         state.traceActiveDepth++;
@@ -461,7 +479,7 @@ protected:
      * Try to parse a dep key as JSON. Returns nullopt for non-JSON keys
      * (Content, Directory, EnvVar, etc. use plain strings).
      */
-    static std::optional<nlohmann::json> parseDepKey(const Dep & d)
+    static std::optional<nlohmann::json> parseDepKey(const ResolvedDep & d)
     {
         if (d.key.empty() || d.key[0] != '{') return std::nullopt;
         try { return nlohmann::json::parse(d.key); }
@@ -472,7 +490,7 @@ protected:
      * Count StructuredContent/ImplicitShape deps matching a JSON predicate.
      * The predicate receives the parsed JSON dep key.
      */
-    static size_t countJsonDeps(const std::vector<Dep> & deps, DepType type,
+    static size_t countJsonDeps(const std::vector<ResolvedDep> & deps, DepType type,
                                 std::function<bool(const nlohmann::json &)> pred)
     {
         size_t n = 0;
@@ -485,7 +503,7 @@ protected:
     }
 
     /// Check if any dep of a given type has a JSON key matching a predicate.
-    static bool hasJsonDep(const std::vector<Dep> & deps, DepType type,
+    static bool hasJsonDep(const std::vector<ResolvedDep> & deps, DepType type,
                            std::function<bool(const nlohmann::json &)> pred)
     {
         return countJsonDeps(deps, type, std::move(pred)) > 0;
@@ -519,7 +537,7 @@ protected:
      * Count deps of a given type whose key contains a substring.
      * For non-JSON keys (Content, EnvVar, etc.), does plain substring matching.
      */
-    static size_t countDeps(const std::vector<Dep> & deps, DepType type, const std::string & keySubstr)
+    static size_t countDeps(const std::vector<ResolvedDep> & deps, DepType type, const std::string & keySubstr)
     {
         size_t n = 0;
         for (auto & d : deps)
@@ -529,13 +547,13 @@ protected:
     }
 
     /// Check if any dep of a given type has a key containing a substring.
-    static bool hasDep(const std::vector<Dep> & deps, DepType type, const std::string & keySubstr)
+    static bool hasDep(const std::vector<ResolvedDep> & deps, DepType type, const std::string & keySubstr)
     {
         return countDeps(deps, type, keySubstr) > 0;
     }
 
     /// Count all deps of a given type.
-    static size_t countDepsByType(const std::vector<Dep> & deps, DepType type)
+    static size_t countDepsByType(const std::vector<ResolvedDep> & deps, DepType type)
     {
         size_t n = 0;
         for (auto & d : deps)
@@ -545,7 +563,7 @@ protected:
     }
 
     /// Dump deps for diagnostic output in EXPECT failures.
-    static std::string dumpDeps(const std::vector<Dep> & deps)
+    static std::string dumpDeps(const std::vector<ResolvedDep> & deps)
     {
         std::string result = "Deps (" + std::to_string(deps.size()) + "):\n";
         for (auto & d : deps) {
@@ -589,16 +607,33 @@ protected:
     {
         int64_t contextHash;
         std::memcpy(&contextHash, testFingerprint.hash, sizeof(contextHash));
-        return TraceStore(state.symbols, *state.traceCtx->pools, contextHash);
+        return TraceStore(state.symbols, *state.traceCtx->pools,
+            state.traceCtx->getVocabStore(state.symbols), contextHash);
     }
 
-    std::vector<Dep> getStoredDeps(const std::string & attrPath)
+    /// Convert a dot-separated attr path string to an AttrPathId.
+    AttrPathId pathFromDotted(const std::string & dotPath) {
+        auto & v = state.traceCtx->getVocabStore(state.symbols);
+        if (dotPath.empty()) return AttrVocabStore::rootPath();
+        auto id = AttrVocabStore::rootPath();
+        size_t pos = 0;
+        while (pos < dotPath.size()) {
+            auto dot = dotPath.find('.', pos);
+            auto component = dotPath.substr(pos, dot == std::string::npos ? dot : dot - pos);
+            id = v.internPath(id, v.internName(component));
+            pos = dot == std::string::npos ? dotPath.size() : dot + 1;
+        }
+        return id;
+    }
+
+    std::vector<ResolvedDep> getStoredDeps(const std::string & attrPath)
     {
         auto db = makeQueryDb();
-        auto result = db.verify(attrPath, {}, state);
+        auto pathId = pathFromDotted(attrPath);
+        auto result = db.verify(pathId, {}, state);
         if (!result) return {};
         auto interned = db.loadFullTrace(result->traceId);
-        std::vector<Dep> deps;
+        std::vector<ResolvedDep> deps;
         deps.reserve(interned.size());
         for (auto & idep : interned)
             deps.push_back(db.resolveDep(idep));
@@ -608,7 +643,8 @@ protected:
     std::optional<CachedResult> getStoredResult(const std::string & attrPath)
     {
         auto db = makeQueryDb();
-        auto result = db.verify(attrPath, {}, state);
+        auto pathId = pathFromDotted(attrPath);
+        auto result = db.verify(pathId, {}, state);
         if (!result) return std::nullopt;
         return result->value;
     }

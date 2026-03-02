@@ -22,7 +22,8 @@ protected:
 
     TraceStore makeDb()
     {
-        return TraceStore(state.symbols, *state.traceCtx->pools, testContextHash);
+        return TraceStore(state.symbols, *state.traceCtx->pools,
+            state.traceCtx->getVocabStore(state.symbols), testContextHash);
     }
 };
 
@@ -34,26 +35,26 @@ TEST_F(PerSiblingInvalidationTest, SiblingTraceHashChanges_ChildInvalidated)
     // different deps), child's per-sibling dep fails.
     auto db = makeDb();
 
-    auto sibPath = makePath({"parent", "sib"});
-    auto childPath = makePath({"parent", "child"});
+    auto sibPathId = vpath({"parent", "sib"});
+    auto childPathId = vpath({"parent", "child"});
 
     // Record sibling with no deps
-    db.recordDeps(sibPath, string_t{"sib-val", {}}, {}, false);
-    auto sibHash = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"sib-val", {}}, {}, false);
+    auto sibHash = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHash.has_value());
 
     // Record child with per-sibling dep
-    db.recordDeps(childPath, string_t{"child-val", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHash)}, false);
+    db.record(childPathId, string_t{"child-val", {}},
+              {makeParentContextDep(vpath({"parent", "sib"}), *sibHash)}, false);
 
     // "Modify" sibling by recording with different deps -> new trace hash
-    db.recordDeps(sibPath, string_t{"sib-val-modified", {}},
-              {makeEnvVarDep("NIX_PS_GONE", "x")}, false);
+    db.record(sibPathId, string_t{"sib-val-modified", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_GONE", "x")}, false);
 
     db.clearSessionCaches();
 
     // Sibling's trace hash changed -> child fails
-    auto result = db.verify(childPath, {}, state);
+    auto result = db.verify(childPathId, {}, state);
     EXPECT_FALSE(result.has_value());
 }
 
@@ -67,27 +68,23 @@ TEST_F(PerSiblingInvalidationTest, DepKeyTabConversion_DeepPath)
 
     auto db = makeDb();
 
-    auto deepSibPath = makePath({"root", "mid", "deep", "sib"});
-    auto childPath = makePath({"root", "mid", "deep", "child"});
+    auto deepSibPathId = vpath({"root", "mid", "deep", "sib"});
+    auto childPathId = vpath({"root", "mid", "deep", "child"});
 
     // Record deeply nested sibling
-    db.recordDeps(deepSibPath, string_t{"deep-sib-val", {}},
-              {makeEnvVarDep("NIX_PS_DEEP", "val")}, false);
-    auto sibHash = db.getCurrentTraceHash(deepSibPath);
+    db.record(deepSibPathId, string_t{"deep-sib-val", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_DEEP", "val")}, false);
+    auto sibHash = db.getCurrentTraceHash(deepSibPathId);
     ASSERT_TRUE(sibHash.has_value());
 
-    // Record child with per-sibling dep using tab-separated key
-    auto depKey = toDepKey(deepSibPath);
-    // Verify the key has tabs (not null bytes)
-    EXPECT_NE(depKey.find('\t'), std::string::npos);
-
-    db.recordDeps(childPath, string_t{"child-val", {}},
-              {makeParentContextDep(depKey, *sibHash)}, false);
+    // Record child with per-sibling dep on deeply nested sibling
+    db.record(childPathId, string_t{"child-val", {}},
+              {makeParentContextDep(deepSibPathId, *sibHash)}, false);
 
     db.clearSessionCaches();
 
     // Verification should correctly resolve the tab-separated dep key
-    auto result = db.verify(childPath, {}, state);
+    auto result = db.verify(childPathId, {}, state);
     ASSERT_TRUE(result.has_value());
     assertCachedResultEquals(string_t{"child-val", {}}, result->value, state.symbols);
 }
@@ -101,28 +98,28 @@ TEST_F(PerSiblingInvalidationTest, SiblingRemovedFromDB_VerifyFails)
     // This exercises the "missing sibling" path in verifyTrace.
     auto db = makeDb();
 
-    auto sibPath = makePath({"parent", "sib"});
-    auto childPath = makePath({"parent", "child"});
+    auto sibPathId = vpath({"parent", "sib"});
+    auto childPathId = vpath({"parent", "child"});
 
     // Record sibling, get its trace hash
-    db.recordDeps(sibPath, string_t{"sib-val", {}}, {}, false);
-    auto sibHash = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"sib-val", {}}, {}, false);
+    auto sibHash = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHash.has_value());
 
     // Record child with per-sibling dep on sib
-    db.recordDeps(childPath, string_t{"child-val", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHash)}, false);
+    db.record(childPathId, string_t{"child-val", {}},
+              {makeParentContextDep(vpath({"parent", "sib"}), *sibHash)}, false);
 
     // Overwrite sib with a completely new trace (different result + deps)
     // This changes the trace hash, simulating the sibling being
     // re-evaluated with different content.
-    db.recordDeps(sibPath, string_t{"totally-different", {}},
-              {makeEnvVarDep("NIX_PS_GONE_2", "x")}, false);
+    db.record(sibPathId, string_t{"totally-different", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_GONE_2", "x")}, false);
 
     db.clearSessionCaches();
 
     // Child's per-sibling dep on old sib trace hash fails
-    auto result = db.verify(childPath, {}, state);
+    auto result = db.verify(childPathId, {}, state);
     EXPECT_FALSE(result.has_value());
 }
 
@@ -135,25 +132,23 @@ TEST_F(PerSiblingInvalidationTest, RootLevelPerSiblingDep_SingleComponentPath)
 
     auto db = makeDb();
 
-    auto sibPath = std::string("lib");       // single component, no separators
-    auto childPath = std::string("hello");   // single component, no separators
+    auto sibPathId = vpath({"lib"});       // single component, no separators
+    auto childPathId = vpath({"hello"});   // single component, no separators
 
     // Record root-level sibling
-    db.recordDeps(sibPath, string_t{"lib-val", {}},
-              {makeEnvVarDep("NIX_PS_ROOT_SIB", "val")}, false);
-    auto sibHash = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"lib-val", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_ROOT_SIB", "val")}, false);
+    auto sibHash = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHash.has_value());
 
-    // Record child with per-sibling dep (toDepKey is identity for no-separator paths)
-    auto depKey = toDepKey(sibPath);
-    EXPECT_EQ(depKey, sibPath); // no separators to convert
-    db.recordDeps(childPath, string_t{"hello-val", {}},
-              {makeParentContextDep(depKey, *sibHash)}, false);
+    // Record child with per-sibling dep on root-level sibling
+    db.record(childPathId, string_t{"hello-val", {}},
+              {makeParentContextDep(sibPathId, *sibHash)}, false);
 
     db.clearSessionCaches();
 
     // Verify passes -- sibling unchanged
-    auto result = db.verify(childPath, {}, state);
+    auto result = db.verify(childPathId, {}, state);
     ASSERT_TRUE(result.has_value());
     assertCachedResultEquals(string_t{"hello-val", {}}, result->value, state.symbols);
 }
@@ -168,38 +163,38 @@ TEST_F(PerSiblingInvalidationTest, MultipleChildrenShareAccessedSibling)
 
     auto db = makeDb();
 
-    auto sibPath = makePath({"parent", "shared"});
-    auto child1Path = makePath({"parent", "child1"});
-    auto child2Path = makePath({"parent", "child2"});
+    auto sibPathId = vpath({"parent", "shared"});
+    auto child1PathId = vpath({"parent", "child1"});
+    auto child2PathId = vpath({"parent", "child2"});
 
     // Record shared sibling
-    db.recordDeps(sibPath, string_t{"shared-val", {}},
-              {makeEnvVarDep("NIX_PS_SHARED", "val1")}, false);
-    auto sibHash = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"shared-val", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_SHARED", "val1")}, false);
+    auto sibHash = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHash.has_value());
 
     // Record both children with per-sibling dep on same sibling
-    db.recordDeps(child1Path, string_t{"child1-val", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHash)}, false);
-    db.recordDeps(child2Path, string_t{"child2-val", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHash)}, false);
+    db.record(child1PathId, string_t{"child1-val", {}},
+              {makeParentContextDep(sibPathId, *sibHash)}, false);
+    db.record(child2PathId, string_t{"child2-val", {}},
+              {makeParentContextDep(sibPathId, *sibHash)}, false);
 
     db.clearSessionCaches();
 
     // Both verify pass when sibling unchanged
-    EXPECT_TRUE(db.verify(child1Path, {}, state).has_value());
-    EXPECT_TRUE(db.verify(child2Path, {}, state).has_value());
+    EXPECT_TRUE(db.verify(child1PathId, {}, state).has_value());
+    EXPECT_TRUE(db.verify(child2PathId, {}, state).has_value());
 
     // Change sibling
     setenv("NIX_PS_SHARED", "val2", 1);
-    db.recordDeps(sibPath, string_t{"shared-new", {}},
-              {makeEnvVarDep("NIX_PS_SHARED", "val2")}, false);
+    db.record(sibPathId, string_t{"shared-new", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_SHARED", "val2")}, false);
 
     db.clearSessionCaches();
 
     // Both children should now fail
-    EXPECT_FALSE(db.verify(child1Path, {}, state).has_value());
-    EXPECT_FALSE(db.verify(child2Path, {}, state).has_value());
+    EXPECT_FALSE(db.verify(child1PathId, {}, state).has_value());
+    EXPECT_FALSE(db.verify(child2PathId, {}, state).has_value());
 }
 
 TEST_F(PerSiblingInvalidationTest, ChildWithDifferentSiblingSubsets)
@@ -211,38 +206,38 @@ TEST_F(PerSiblingInvalidationTest, ChildWithDifferentSiblingSubsets)
 
     auto db = makeDb();
 
-    auto sibAPath = makePath({"parent", "sibA"});
-    auto sibBPath = makePath({"parent", "sibB"});
-    auto child1Path = makePath({"parent", "child1"});
-    auto child2Path = makePath({"parent", "child2"});
+    auto sibAPathId = vpath({"parent", "sibA"});
+    auto sibBPathId = vpath({"parent", "sibB"});
+    auto child1PathId = vpath({"parent", "child1"});
+    auto child2PathId = vpath({"parent", "child2"});
 
     // Record two siblings
-    db.recordDeps(sibAPath, string_t{"a-val", {}},
-              {makeEnvVarDep("NIX_PS_CSA", "val-a")}, false);
-    db.recordDeps(sibBPath, string_t{"b-val", {}},
-              {makeEnvVarDep("NIX_PS_CSB", "val-b")}, false);
-    auto sibAHash = db.getCurrentTraceHash(sibAPath);
-    auto sibBHash = db.getCurrentTraceHash(sibBPath);
+    db.record(sibAPathId, string_t{"a-val", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_CSA", "val-a")}, false);
+    db.record(sibBPathId, string_t{"b-val", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_CSB", "val-b")}, false);
+    auto sibAHash = db.getCurrentTraceHash(sibAPathId);
+    auto sibBHash = db.getCurrentTraceHash(sibBPathId);
     ASSERT_TRUE(sibAHash.has_value());
     ASSERT_TRUE(sibBHash.has_value());
 
     // child1 depends on sibA only, child2 depends on sibB only
-    db.recordDeps(child1Path, string_t{"c1-val", {}},
-              {makeParentContextDep(toDepKey(sibAPath), *sibAHash)}, false);
-    db.recordDeps(child2Path, string_t{"c2-val", {}},
-              {makeParentContextDep(toDepKey(sibBPath), *sibBHash)}, false);
+    db.record(child1PathId, string_t{"c1-val", {}},
+              {makeParentContextDep(vpath({"parent", "sibA"}), *sibAHash)}, false);
+    db.record(child2PathId, string_t{"c2-val", {}},
+              {makeParentContextDep(vpath({"parent", "sibB"}), *sibBHash)}, false);
 
     // Change sibA only
     setenv("NIX_PS_CSA", "val-a-new", 1);
-    db.recordDeps(sibAPath, string_t{"a-val-new", {}},
-              {makeEnvVarDep("NIX_PS_CSA", "val-a-new")}, false);
+    db.record(sibAPathId, string_t{"a-val-new", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_CSA", "val-a-new")}, false);
 
     db.clearSessionCaches();
 
     // child1 (depends on sibA) should fail
-    EXPECT_FALSE(db.verify(child1Path, {}, state).has_value());
+    EXPECT_FALSE(db.verify(child1PathId, {}, state).has_value());
     // child2 (depends on sibB) should pass -- sibB unchanged
-    auto result = db.verify(child2Path, {}, state);
+    auto result = db.verify(child2PathId, {}, state);
     ASSERT_TRUE(result.has_value());
     assertCachedResultEquals(string_t{"c2-val", {}}, result->value, state.symbols);
 }
@@ -257,44 +252,44 @@ TEST_F(PerSiblingInvalidationTest, PerSiblingRecovery_MultipleHistorical)
 
     auto db = makeDb();
 
-    auto sibPath = makePath({"parent", "sib"});
-    auto childPath = makePath({"parent", "child"});
+    auto sibPathId = vpath({"parent", "sib"});
+    auto childPathId = vpath({"parent", "child"});
 
     // v1: sib with val1
-    db.recordDeps(sibPath, string_t{"sib-v1", {}},
-              {makeEnvVarDep("NIX_PS_MH", "val1")}, false);
-    auto sibHashV1 = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"sib-v1", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_MH", "val1")}, false);
+    auto sibHashV1 = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHashV1.has_value());
-    db.recordDeps(childPath, string_t{"child-v1", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHashV1)}, false);
+    db.record(childPathId, string_t{"child-v1", {}},
+              {makeParentContextDep(sibPathId, *sibHashV1)}, false);
 
     // v2: sib with val2
     setenv("NIX_PS_MH", "val2", 1);
-    db.recordDeps(sibPath, string_t{"sib-v2", {}},
-              {makeEnvVarDep("NIX_PS_MH", "val2")}, false);
-    auto sibHashV2 = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"sib-v2", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_MH", "val2")}, false);
+    auto sibHashV2 = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHashV2.has_value());
-    db.recordDeps(childPath, string_t{"child-v2", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHashV2)}, false);
+    db.record(childPathId, string_t{"child-v2", {}},
+              {makeParentContextDep(sibPathId, *sibHashV2)}, false);
 
     // v3: sib with val3
     setenv("NIX_PS_MH", "val3", 1);
-    db.recordDeps(sibPath, string_t{"sib-v3", {}},
-              {makeEnvVarDep("NIX_PS_MH", "val3")}, false);
-    auto sibHashV3 = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"sib-v3", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_MH", "val3")}, false);
+    auto sibHashV3 = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHashV3.has_value());
-    db.recordDeps(childPath, string_t{"child-v3", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHashV3)}, false);
+    db.record(childPathId, string_t{"child-v3", {}},
+              {makeParentContextDep(sibPathId, *sibHashV3)}, false);
 
     // Revert sib to v1
     setenv("NIX_PS_MH", "val1", 1);
-    db.recordDeps(sibPath, string_t{"sib-v1", {}},
-              {makeEnvVarDep("NIX_PS_MH", "val1")}, false);
+    db.record(sibPathId, string_t{"sib-v1", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_MH", "val1")}, false);
 
     db.clearSessionCaches();
 
     // Recovery should find child-v1 (matching sibHashV1)
-    auto result = db.verify(childPath, {}, state);
+    auto result = db.verify(childPathId, {}, state);
     ASSERT_TRUE(result.has_value());
     assertCachedResultEquals(string_t{"child-v1", {}}, result->value, state.symbols);
 }
@@ -308,24 +303,24 @@ TEST_F(PerSiblingInvalidationTest, SiblingIdenticalResult_DifferentDeps_Differen
 
     auto db = makeDb();
 
-    auto sibPath = makePath({"parent", "sib"});
-    auto childPath = makePath({"parent", "child"});
+    auto sibPathId = vpath({"parent", "sib"});
+    auto childPathId = vpath({"parent", "child"});
 
     // Record sib v1: result "same-val", dep on NIX_PS_ID=v1-dep
-    db.recordDeps(sibPath, string_t{"same-val", {}},
-              {makeEnvVarDep("NIX_PS_ID", "v1-dep")}, false);
-    auto sibHashV1 = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"same-val", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_ID", "v1-dep")}, false);
+    auto sibHashV1 = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHashV1.has_value());
 
     // Record child with per-sibling dep on sib v1
-    db.recordDeps(childPath, string_t{"child-val", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHashV1)}, false);
+    db.record(childPathId, string_t{"child-val", {}},
+              {makeParentContextDep(vpath({"parent", "sib"}), *sibHashV1)}, false);
 
     // Re-record sib with SAME result but DIFFERENT dep -> different trace hash
     setenv("NIX_PS_ID", "v2-dep", 1);
-    db.recordDeps(sibPath, string_t{"same-val", {}},
-              {makeEnvVarDep("NIX_PS_ID", "v2-dep")}, false);
-    auto sibHashV2 = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"same-val", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_ID", "v2-dep")}, false);
+    auto sibHashV2 = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHashV2.has_value());
 
     // Trace hashes should differ (deps differ, even though result is same)
@@ -335,7 +330,7 @@ TEST_F(PerSiblingInvalidationTest, SiblingIdenticalResult_DifferentDeps_Differen
     db.clearSessionCaches();
 
     // Child should fail -- sib's trace hash changed
-    auto result = db.verify(childPath, {}, state);
+    auto result = db.verify(childPathId, {}, state);
     EXPECT_FALSE(result.has_value());
 }
 
@@ -345,19 +340,19 @@ TEST_F(PerSiblingInvalidationTest, EmptyStringAttrPath_EdgeCase)
     // that tests the null-byte / tab conversion boundary.
     auto db = makeDb();
 
-    auto sibPath = makePath({"", "sib"});    // empty first component
-    auto childPath = makePath({"", "child"});
+    auto sibPathId = vpath({"", "sib"});    // empty first component
+    auto childPathId = vpath({"", "child"});
 
-    db.recordDeps(sibPath, string_t{"sib-val", {}}, {}, false);
-    auto sibHash = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"sib-val", {}}, {}, false);
+    auto sibHash = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHash.has_value());
 
-    db.recordDeps(childPath, string_t{"child-val", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHash)}, false);
+    db.record(childPathId, string_t{"child-val", {}},
+              {makeParentContextDep(vpath({"", "sib"}), *sibHash)}, false);
 
     db.clearSessionCaches();
 
-    auto result = db.verify(childPath, {}, state);
+    auto result = db.verify(childPathId, {}, state);
     ASSERT_TRUE(result.has_value());
     assertCachedResultEquals(string_t{"child-val", {}}, result->value, state.symbols);
 }
@@ -371,23 +366,23 @@ TEST_F(PerSiblingInvalidationTest, PerSiblingDepOnFailedSibling)
 
     auto db = makeDb();
 
-    auto sibPath = makePath({"parent", "sib"});
-    auto childPath = makePath({"parent", "child"});
+    auto sibPathId = vpath({"parent", "sib"});
+    auto childPathId = vpath({"parent", "child"});
 
     // Record sibling as failed
-    db.recordDeps(sibPath, failed_t{},
-              {makeEnvVarDep("NIX_PS_FAIL", "val")}, false);
-    auto sibHash = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, failed_t{},
+              {makeEnvVarDep(pools(), "NIX_PS_FAIL", "val")}, false);
+    auto sibHash = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHash.has_value());
 
     // Record child with per-sibling dep on failed sibling
-    db.recordDeps(childPath, string_t{"child-val", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHash)}, false);
+    db.record(childPathId, string_t{"child-val", {}},
+              {makeParentContextDep(vpath({"parent", "sib"}), *sibHash)}, false);
 
     db.clearSessionCaches();
 
     // Verify passes -- failed sibling's trace hash unchanged
-    auto result = db.verify(childPath, {}, state);
+    auto result = db.verify(childPathId, {}, state);
     ASSERT_TRUE(result.has_value());
     assertCachedResultEquals(string_t{"child-val", {}}, result->value, state.symbols);
 }
@@ -400,49 +395,49 @@ TEST_F(PerSiblingInvalidationTest, PerSiblingDep_ChildIsAlsoSiblingOfAnotherChil
 
     auto db = makeDb();
 
-    auto cPath = makePath({"parent", "c"});
-    auto bPath = makePath({"parent", "b"});
-    auto aPath = makePath({"parent", "a"});
+    auto cPathId = vpath({"parent", "c"});
+    auto bPathId = vpath({"parent", "b"});
+    auto aPathId = vpath({"parent", "a"});
 
     // Record C (leaf)
-    db.recordDeps(cPath, string_t{"c-result", {}},
-              {makeEnvVarDep("NIX_PS_CHAIN_C", "c-val")}, false);
-    auto cHash = db.getCurrentTraceHash(cPath);
+    db.record(cPathId, string_t{"c-result", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_CHAIN_C", "c-val")}, false);
+    auto cHash = db.getCurrentTraceHash(cPathId);
     ASSERT_TRUE(cHash.has_value());
 
     // Record B with per-sibling dep on C
-    db.recordDeps(bPath, string_t{"b-result", {}},
-              {makeParentContextDep(toDepKey(cPath), *cHash)}, false);
-    auto bHash = db.getCurrentTraceHash(bPath);
+    db.record(bPathId, string_t{"b-result", {}},
+              {makeParentContextDep(cPathId, *cHash)}, false);
+    auto bHash = db.getCurrentTraceHash(bPathId);
     ASSERT_TRUE(bHash.has_value());
 
     // Record A with per-sibling dep on B
-    db.recordDeps(aPath, string_t{"a-result", {}},
-              {makeParentContextDep(toDepKey(bPath), *bHash)}, false);
+    db.record(aPathId, string_t{"a-result", {}},
+              {makeParentContextDep(bPathId, *bHash)}, false);
 
     db.clearSessionCaches();
 
     // All pass when nothing changed
-    EXPECT_TRUE(db.verify(aPath, {}, state).has_value());
-    EXPECT_TRUE(db.verify(bPath, {}, state).has_value());
-    EXPECT_TRUE(db.verify(cPath, {}, state).has_value());
+    EXPECT_TRUE(db.verify(aPathId, {}, state).has_value());
+    EXPECT_TRUE(db.verify(bPathId, {}, state).has_value());
+    EXPECT_TRUE(db.verify(cPathId, {}, state).has_value());
 
     // Change C -> B's per-sibling dep on C fails -> B gets new trace hash ->
     // A's per-sibling dep on B fails
     setenv("NIX_PS_CHAIN_C", "c-val-new", 1);
-    db.recordDeps(cPath, string_t{"c-new", {}},
-              {makeEnvVarDep("NIX_PS_CHAIN_C", "c-val-new")}, false);
+    db.record(cPathId, string_t{"c-new", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_CHAIN_C", "c-val-new")}, false);
 
     // Re-record B (since C changed, B would re-evaluate in real system)
-    auto cHashNew = db.getCurrentTraceHash(cPath);
+    auto cHashNew = db.getCurrentTraceHash(cPathId);
     ASSERT_TRUE(cHashNew.has_value());
-    db.recordDeps(bPath, string_t{"b-new", {}},
-              {makeParentContextDep(toDepKey(cPath), *cHashNew)}, false);
+    db.record(bPathId, string_t{"b-new", {}},
+              {makeParentContextDep(cPathId, *cHashNew)}, false);
 
     db.clearSessionCaches();
 
     // A's per-sibling dep on B should now fail (B's trace hash changed)
-    EXPECT_FALSE(db.verify(aPath, {}, state).has_value());
+    EXPECT_FALSE(db.verify(aPathId, {}, state).has_value());
 }
 
 // -- Soundness gap: parent-mediated value changes ---------------------
@@ -476,23 +471,23 @@ TEST_F(PerSiblingInvalidationTest, DISABLED_ParentMediatedValueChange_SoundnessG
 
     auto db = makeDb();
 
-    auto sibAPath = makePath({"parent", "sibA"});
-    auto childPath = makePath({"parent", "child"});
+    auto sibAPathId = vpath({"parent", "sibA"});
+    auto childPathId = vpath({"parent", "child"});
 
     // Record sibling A
-    db.recordDeps(sibAPath, string_t{"sibA-val", {}},
-              {makeEnvVarDep("NIX_PS_PMV_A", "val-a")}, false);
-    auto sibAHash = db.getCurrentTraceHash(sibAPath);
+    db.record(sibAPathId, string_t{"sibA-val", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_PMV_A", "val-a")}, false);
+    auto sibAHash = db.getCurrentTraceHash(sibAPathId);
     ASSERT_TRUE(sibAHash.has_value());
 
     // Record child with per-sibling dep on sibA, result = "original"
-    db.recordDeps(childPath, string_t{"original", {}},
-              {makeParentContextDep(toDepKey(sibAPath), *sibAHash)}, false);
+    db.record(childPathId, string_t{"original", {}},
+              {makeParentContextDep(sibAPathId, *sibAHash)}, false);
 
     db.clearSessionCaches();
 
     // Verify passes (sibA unchanged) -- returns "original"
-    auto result1 = db.verify(childPath, {}, state);
+    auto result1 = db.verify(childPathId, {}, state);
     ASSERT_TRUE(result1.has_value());
     assertCachedResultEquals(string_t{"original", {}}, result1->value, state.symbols);
 
@@ -500,8 +495,8 @@ TEST_F(PerSiblingInvalidationTest, DISABLED_ParentMediatedValueChange_SoundnessG
     // would mean the parent's expression was modified (e.g., an overlay applies
     // a patch to the child's meta). We simulate by re-recording the child with
     // a DIFFERENT result but the SAME per-sibling dep (sibA unchanged).
-    db.recordDeps(childPath, string_t{"modified-by-overlay", {}},
-              {makeParentContextDep(toDepKey(sibAPath), *sibAHash)}, false);
+    db.record(childPathId, string_t{"modified-by-overlay", {}},
+              {makeParentContextDep(sibAPathId, *sibAHash)}, false);
 
     db.clearSessionCaches();
 
@@ -526,7 +521,7 @@ TEST_F(PerSiblingInvalidationTest, DISABLED_ParentMediatedValueChange_SoundnessG
     // This EXPECT_FALSE documents what SHOULD happen: verification should
     // fail because the parent's definition of this child changed. Currently
     // it would pass (soundness gap).
-    auto result2 = db.verify(childPath, {}, state);
+    auto result2 = db.verify(childPathId, {}, state);
     // With the soundness gap, this would be TRUE (old trace validates).
     // When fixed, this should be FALSE (parent change detected).
     // For now, we just document the gap exists.
@@ -550,34 +545,34 @@ TEST_F(PerSiblingInvalidationTest, WholeParentDep_ParentReRecorded_DifferentDeps
 
     auto db = makeDb();
 
-    auto parentPath = std::string("parent");
-    auto childPath = makePath({"parent", "child"});
+    auto parentPathId = vpath({"parent"});
+    auto childPathId = vpath({"parent", "child"});
 
     // Record parent with result "A", dep on envvar=val
-    db.recordDeps(parentPath, string_t{"A", {}},
-              {makeEnvVarDep("NIX_PS_WPD", "val")}, false);
-    auto parentHash = db.getCurrentTraceHash(parentPath);
+    db.record(parentPathId, string_t{"A", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_WPD", "val")}, false);
+    auto parentHash = db.getCurrentTraceHash(parentPathId);
     ASSERT_TRUE(parentHash.has_value());
 
     // Record child with whole-parent dep
-    db.recordDeps(childPath, string_t{"child-val", {}},
-              {makeParentContextDep(toDepKey(parentPath), *parentHash)}, false);
+    db.record(childPathId, string_t{"child-val", {}},
+              {makeParentContextDep(vpath({"parent"}), *parentHash)}, false);
 
     db.clearSessionCaches();
 
     // Verify passes initially
-    auto result1 = db.verify(childPath, {}, state);
+    auto result1 = db.verify(childPathId, {}, state);
     ASSERT_TRUE(result1.has_value());
 
     // Re-record parent with different deps → different trace hash
     setenv("NIX_PS_WPD", "val2", 1);
-    db.recordDeps(parentPath, string_t{"B", {}},
-              {makeEnvVarDep("NIX_PS_WPD", "val2")}, false);
+    db.record(parentPathId, string_t{"B", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_WPD", "val2")}, false);
 
     db.clearSessionCaches();
 
     // Child's ParentContext dep should fail (parent trace hash changed)
-    auto result2 = db.verify(childPath, {}, state);
+    auto result2 = db.verify(childPathId, {}, state);
     EXPECT_FALSE(result2.has_value())
         << "Whole-parent dep should detect parent trace hash change";
 }
@@ -589,23 +584,23 @@ TEST_F(PerSiblingInvalidationTest, WholeParentDep_ParentUnchanged_ChildPasses)
 
     auto db = makeDb();
 
-    auto parentPath = std::string("parent");
-    auto childPath = makePath({"parent", "child"});
+    auto parentPathId = vpath({"parent"});
+    auto childPathId = vpath({"parent", "child"});
 
     // Record parent
-    db.recordDeps(parentPath, string_t{"parent-val", {}},
-              {makeEnvVarDep("NIX_PS_WPU", "val")}, false);
-    auto parentHash = db.getCurrentTraceHash(parentPath);
+    db.record(parentPathId, string_t{"parent-val", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_WPU", "val")}, false);
+    auto parentHash = db.getCurrentTraceHash(parentPathId);
     ASSERT_TRUE(parentHash.has_value());
 
     // Record child with whole-parent dep
-    db.recordDeps(childPath, string_t{"child-val", {}},
-              {makeParentContextDep(toDepKey(parentPath), *parentHash)}, false);
+    db.record(childPathId, string_t{"child-val", {}},
+              {makeParentContextDep(vpath({"parent"}), *parentHash)}, false);
 
     db.clearSessionCaches();
 
     // Verify passes — parent unchanged
-    auto result = db.verify(childPath, {}, state);
+    auto result = db.verify(childPathId, {}, state);
     ASSERT_TRUE(result.has_value());
     assertCachedResultEquals(string_t{"child-val", {}}, result->value, state.symbols);
 }
@@ -621,23 +616,23 @@ TEST_F(PerSiblingInvalidationTest, PerSiblingDep_SiblingResultChanges_SameDeps_C
 
     auto db = makeDb();
 
-    auto sibPath = makePath({"parent", "sib"});
-    auto childPath = makePath({"parent", "child"});
+    auto sibPathId = vpath({"parent", "sib"});
+    auto childPathId = vpath({"parent", "child"});
 
     // Record sib with result "v1"
-    db.recordDeps(sibPath, string_t{"v1", {}},
-              {makeEnvVarDep("NIX_PS_SRC", "val")}, false);
-    auto sibHash = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"v1", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_SRC", "val")}, false);
+    auto sibHash = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHash.has_value());
 
     // Record child with per-sibling dep on sib
-    db.recordDeps(childPath, string_t{"child-val", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHash)}, false);
+    db.record(childPathId, string_t{"child-val", {}},
+              {makeParentContextDep(vpath({"parent", "sib"}), *sibHash)}, false);
 
     // Re-record sib with different result "v2" but SAME deps
-    db.recordDeps(sibPath, string_t{"v2", {}},
-              {makeEnvVarDep("NIX_PS_SRC", "val")}, false);
-    auto sibHashAfter = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"v2", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_SRC", "val")}, false);
+    auto sibHashAfter = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHashAfter.has_value());
 
     // Trace hash unchanged because deps are identical (result not included)
@@ -647,7 +642,7 @@ TEST_F(PerSiblingInvalidationTest, PerSiblingDep_SiblingResultChanges_SameDeps_C
     db.clearSessionCaches();
 
     // Child passes because sib's trace hash didn't change
-    auto result = db.verify(childPath, {}, state);
+    auto result = db.verify(childPathId, {}, state);
     EXPECT_TRUE(result.has_value())
         << "BUG: child passes because trace hash doesn't include sibling result";
 }
@@ -662,23 +657,23 @@ TEST_F(PerSiblingInvalidationTest, PerSiblingDep_SiblingUnchanged_ChildPasses_Do
 
     auto db = makeDb();
 
-    auto sibPath = makePath({"parent", "sib"});
-    auto childPath = makePath({"parent", "child"});
+    auto sibPathId = vpath({"parent", "sib"});
+    auto childPathId = vpath({"parent", "child"});
 
     // Record sib
-    db.recordDeps(sibPath, string_t{"sib-val", {}},
-              {makeEnvVarDep("NIX_PS_GAP", "val")}, false);
-    auto sibHash = db.getCurrentTraceHash(sibPath);
+    db.record(sibPathId, string_t{"sib-val", {}},
+              {makeEnvVarDep(pools(), "NIX_PS_GAP", "val")}, false);
+    auto sibHash = db.getCurrentTraceHash(sibPathId);
     ASSERT_TRUE(sibHash.has_value());
 
     // Record child with per-sibling dep on sib, result = "original"
-    db.recordDeps(childPath, string_t{"original", {}},
-              {makeParentContextDep(toDepKey(sibPath), *sibHash)}, false);
+    db.record(childPathId, string_t{"original", {}},
+              {makeParentContextDep(vpath({"parent", "sib"}), *sibHash)}, false);
 
     db.clearSessionCaches();
 
     // Verify passes — sib unchanged, returns "original"
-    auto result1 = db.verify(childPath, {}, state);
+    auto result1 = db.verify(childPathId, {}, state);
     ASSERT_TRUE(result1.has_value());
     assertCachedResultEquals(string_t{"original", {}}, result1->value, state.symbols);
 
@@ -686,7 +681,7 @@ TEST_F(PerSiblingInvalidationTest, PerSiblingDep_SiblingUnchanged_ChildPasses_Do
     // "modified". But we can't simulate that here — the child wasn't
     // re-recorded by an evaluator. So verify again — still passes.
     db.clearSessionCaches();
-    auto result2 = db.verify(childPath, {}, state);
+    auto result2 = db.verify(childPathId, {}, state);
     ASSERT_TRUE(result2.has_value());
     assertCachedResultEquals(string_t{"original", {}}, result2->value, state.symbols);
     // CORRECT: since the child wasn't re-evaluated, the old result IS correct

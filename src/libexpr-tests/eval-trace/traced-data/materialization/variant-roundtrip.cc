@@ -27,9 +27,9 @@ TEST_F(TraceStoreTest, Attrs_RecordVerifyRoundtrip)
     original.origins.push_back({"input1", "file.json", "", 'j'});
     original.originIndices = {0, 0};
 
-    db.recordDeps("test_attr", CachedResult(original), {}, true);
+    db.record(vpath({"test_attr"}), CachedResult(original), {}, true);
 
-    auto result = db.verify("test_attr", {}, state);
+    auto result = db.verify(vpath({"test_attr"}), {}, state);
     ASSERT_TRUE(result.has_value());
 
     auto * decoded = std::get_if<attrs_t>(&result->value);
@@ -60,9 +60,9 @@ TEST_F(TraceStoreTest, Attrs_NonTracedData_NoOrigins)
     };
     // No origins set — plain Nix attrset
 
-    db.recordDeps("plain_attr", CachedResult(original), {}, true);
+    db.record(vpath({"plain_attr"}), CachedResult(original), {}, true);
 
-    auto result = db.verify("plain_attr", {}, state);
+    auto result = db.verify(vpath({"plain_attr"}), {}, state);
     ASSERT_TRUE(result.has_value());
 
     auto * decoded = std::get_if<attrs_t>(&result->value);
@@ -86,9 +86,9 @@ TEST_F(TraceStoreTest, Attrs_MultiOrigin_PreservesPerAttrMapping)
     original.origins.push_back({"input2", "f2.json", "", 'j'});
     original.originIndices = {0, 1, 0}; // a->origin0, b->origin1, c->origin0
 
-    db.recordDeps("multi_attr", CachedResult(original), {}, true);
+    db.record(vpath({"multi_attr"}), CachedResult(original), {}, true);
 
-    auto result = db.verify("multi_attr", {}, state);
+    auto result = db.verify(vpath({"multi_attr"}), {}, state);
     ASSERT_TRUE(result.has_value());
 
     auto * decoded = std::get_if<attrs_t>(&result->value);
@@ -114,9 +114,9 @@ TEST_F(TraceStoreTest, Attrs_MixedOrigin_NixAddedAttrsMinusOne)
     original.origins.push_back({"input1", "f1.json", "", 'j'});
     original.originIndices = {0, -1}; // a->origin0, extra->no origin (Nix-added)
 
-    db.recordDeps("mixed_attr", CachedResult(original), {}, true);
+    db.record(vpath({"mixed_attr"}), CachedResult(original), {}, true);
 
-    auto result = db.verify("mixed_attr", {}, state);
+    auto result = db.verify(vpath({"mixed_attr"}), {}, state);
     ASSERT_TRUE(result.has_value());
 
     auto * decoded = std::get_if<attrs_t>(&result->value);
@@ -134,9 +134,9 @@ TEST_F(TraceStoreTest, Attrs_EmptyObject_NoOrigins)
     attrs_t original;
     // Empty names, no origins
 
-    db.recordDeps("empty_attr", CachedResult(original), {}, true);
+    db.record(vpath({"empty_attr"}), CachedResult(original), {}, true);
 
-    auto result = db.verify("empty_attr", {}, state);
+    auto result = db.verify(vpath({"empty_attr"}), {}, state);
     ASSERT_TRUE(result.has_value());
 
     auto * decoded = std::get_if<attrs_t>(&result->value);

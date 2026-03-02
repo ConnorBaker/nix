@@ -94,6 +94,9 @@ enum class DepType : uint8_t {
      *  Same verification as Content (BLAKE3 of file bytes), but classified as
      *  Normal (not ContentOverrideable) — cannot be overridden by SC deps. */
     RawContent = 14,
+    /** Store path existence check (derivationStrict .drv output).
+     *  Hash value: "valid" or "missing" string. Detects GC removal of .drv files. */
+    StorePathExistence = 15,
 
     /** Not a real dep type. Must remain last — used to size the descriptor table. */
     EndSentinel_,
@@ -119,6 +122,7 @@ inline std::string depTypeName(DepType type)
     case DepType::StructuredContent: return "structuredContent";
     case DepType::ImplicitShape: return "implicitShape";
     case DepType::RawContent: return "rawContent";
+    case DepType::StorePathExistence: return "storePathExistence";
     case DepType::EndSentinel_: break;
     }
     unreachable();
@@ -277,6 +281,8 @@ inline constexpr DepKindDescriptor makeDescriptor(DepType type)
         return {DepKind::ImplicitStructural, true, false, false};
     case DepType::RawContent:
         return {DepKind::Normal, true, false, false};
+    case DepType::StorePathExistence:
+        return {DepKind::Normal, false, false, false};
     case DepType::EndSentinel_:
         break;
     }
@@ -302,6 +308,7 @@ inline constexpr auto depDescriptors = [] {
     table[std::to_underlying(DepType::StructuredContent)] = makeDescriptor(DepType::StructuredContent);
     table[std::to_underlying(DepType::ImplicitShape)] = makeDescriptor(DepType::ImplicitShape);
     table[std::to_underlying(DepType::RawContent)] = makeDescriptor(DepType::RawContent);
+    table[std::to_underlying(DepType::StorePathExistence)] = makeDescriptor(DepType::StorePathExistence);
     return table;
 }();
 
@@ -439,48 +446,40 @@ inline constexpr std::string_view shapeSuffixName(ShapeSuffix s)
 inline constexpr std::string_view absolutePathDep = "<absolute>";
 
 /**
- * A single dependency: records that a particular resource was accessed,
- * along with a hash of its content at the time of access.
+ * A single interned dependency: stores StringInternTable indices instead of
+ * owned strings. DepSourceId and DepKeyId share the same index space as
+ * StringId — all three are uint32_t indices into InterningPools::strings.
+ * Zero per-dep heap allocation; string data lives in the arena.
+ * Resolve via pools.resolve(sourceId) / pools.resolve(keyId).
  *
- * For file deps (Content/Directory/Existence), `key` holds the path:
- *   - relative path for flake inputs (with non-empty `source`)
- *   - absolute path for non-flake evaluations (source == "")
- *   - absolute path for out-of-tree flake deps (source == "<absolute>")
+ * For file deps (Content/Directory/Existence), keyId resolves to:
+ *   - relative path for flake inputs (with non-empty sourceId)
+ *   - absolute path for non-flake evaluations (sourceId == "")
+ *   - absolute path for out-of-tree flake deps (sourceId == "<absolute>")
  *
- * For non-file deps, `key` holds a descriptive identifier:
+ * For non-file deps, keyId resolves to a descriptive identifier:
  *   - EnvVar: the environment variable name (e.g., "HOME")
  *   - CurrentTime: "currentTime"
  *   - System: "currentSystem"
  *   - UnhashedFetch: the fetch URL
  */
 struct Dep {
-    /** Flake input name (from lockfile keyMap), "" for self or non-flake,
-     *  or "<absolute>" for out-of-tree filesystem paths. */
-    std::string source;
-    /** Path or identifier key (see above). */
-    std::string key;
-    /** Hash of content, synthetic hash, or store path (for UnhashedFetch). */
-    DepHashValue expectedHash;
-    /** What kind of access was performed. */
-    DepType type;
-
-    /** Identity is the key (type, source, key); expectedHash is the observed value. */
-    bool operator==(const Dep & other) const;
-    auto operator<=>(const Dep & other) const;
-};
-
-/**
- * Compact interned dependency: stores StringInternTable indices instead of
- * owned strings. DepSourceId and DepKeyId share the same index space as
- * StringId — all three are uint32_t indices into InterningPools::strings.
- * Zero per-dep heap allocation; string data lives in the arena.
- * Resolve via pools.resolve(sourceId) / pools.resolve(keyId).
- */
-struct CompactDep {
     DepType type;
     DepSourceId sourceId;    ///< Flake input name (interned in StringInternTable)
     DepKeyId keyId;          ///< Dep key string (interned in StringInternTable)
     DepHashValue expectedHash;
+
+    /// Create a ParentContext dep storing AttrPathId directly in the keyId slot.
+    /// SourceId is 0 (empty) by convention for ParentContext deps.
+    static Dep makeParentContext(AttrPathId pathId, DepHashValue hash) {
+        return {DepType::ParentContext, DepSourceId(0), DepKeyId(pathId.value), std::move(hash)};
+    }
+
+    /// Extract the AttrPathId from a ParentContext dep's keyId slot.
+    AttrPathId parentContextPath() const {
+        assert(type == DepType::ParentContext);
+        return AttrPathId(keyId.value);
+    }
 };
 
 /**
@@ -488,43 +487,10 @@ struct CompactDep {
  * representing the deps recorded during a single thunk/app evaluation.
  */
 struct DepRange {
-    std::vector<CompactDep> * deps;
+    std::vector<Dep> * deps;
     uint32_t start;
     uint32_t end;
 };
-
-/**
- * Key for dep deduplication within a single DependencyTracker scope.
- * Two deps with the same (type, source, key) are considered duplicates
- * regardless of their expectedHash value.
- */
-struct DepKey {
-    DepType type;
-    std::string source;
-    std::string key;
-    bool operator==(const DepKey &) const = default;
-    auto operator<=>(const DepKey &) const = default;
-
-    explicit DepKey(const Dep & dep)
-        : type(dep.type), source(dep.source), key(dep.key) {}
-    DepKey(DepType type, std::string source, std::string key)
-        : type(type), source(std::move(source)), key(std::move(key)) {}
-
-    struct Hash {
-        size_t operator()(const DepKey & k) const noexcept {
-            return hashValues(std::to_underlying(k.type), k.source, k.key);
-        }
-    };
-};
-
-inline bool Dep::operator==(const Dep & other) const {
-    return type == other.type && source == other.source && key == other.key;
-}
-inline auto Dep::operator<=>(const Dep & other) const {
-    if (auto cmp = type <=> other.type; cmp != 0) return cmp;
-    if (auto cmp = source <=> other.source; cmp != 0) return cmp;
-    return key <=> other.key;
-}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Provenance — eval-trace origin data for PosTable positions

@@ -47,8 +47,6 @@ struct null_t {};
 struct float_t { double x; };
 struct list_t { size_t size; };
 
-typedef uint64_t AttrId;
-typedef std::pair<AttrId, Symbol> AttrKey;
 typedef std::pair<std::string, NixStringContext> string_t;
 
 /**

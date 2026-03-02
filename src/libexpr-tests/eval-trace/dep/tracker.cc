@@ -55,8 +55,8 @@ TEST_F(DependencyTrackerTest, Destructor_RestoresPrevious)
 TEST_F(DependencyTrackerTest, Record_WithActiveTracker)
 {
     DependencyTracker tracker(pools);
-    auto dep = makeContentDep("/test.nix", "content");
-    DependencyTracker::record(pools,dep);
+    auto dep = makeContentDep(pools, "/test.nix", "content");
+    DependencyTracker::record(dep);
     auto deps = tracker.collectTraces();
     ASSERT_EQ(deps.size(), 1u);
     EXPECT_EQ(pools.resolve(deps[0].keyId), "/test.nix");
@@ -66,18 +66,18 @@ TEST_F(DependencyTrackerTest, Record_WithActiveTracker)
 TEST_F(DependencyTrackerTest, Record_WithoutActiveTracker)
 {
     // Recording without an active tracker should just append to session traces without crash
-    auto dep = makeContentDep("/test.nix", "content");
-    DependencyTracker::record(pools,dep);
+    auto dep = makeContentDep(pools, "/test.nix", "content");
+    DependencyTracker::record(dep);
     // No crash is the test (dependency recorded to global session trace)
 }
 
 TEST_F(DependencyTrackerTest, CollectDeps_OnlyCurrentRange)
 {
     DependencyTracker outer(pools);
-    DependencyTracker::record(pools,makeContentDep("/outer.nix", "outer"));
+    DependencyTracker::record(makeContentDep(pools, "/outer.nix", "outer"));
     {
         DependencyTracker inner(pools);
-        DependencyTracker::record(pools,makeContentDep("/inner.nix", "inner"));
+        DependencyTracker::record(makeContentDep(pools, "/inner.nix", "inner"));
         auto innerDeps = inner.collectTraces();
         ASSERT_EQ(innerDeps.size(), 1u);
         EXPECT_EQ(pools.resolve(innerDeps[0].keyId), "/inner.nix");
@@ -91,8 +91,8 @@ TEST_F(DependencyTrackerTest, CollectDeps_OnlyCurrentRange)
 TEST_F(DependencyTrackerTest, ClearSessionDeps)
 {
     DependencyTracker tracker(pools);
-    DependencyTracker::record(pools,makeContentDep("/a.nix", "a"));
-    DependencyTracker::record(pools,makeContentDep("/b.nix", "b"));
+    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
+    DependencyTracker::record(makeContentDep(pools, "/b.nix", "b"));
     DependencyTracker::clearSessionTraces();
     // After clearing, new tracker should see no old deps
     // (session trace reset — Adapton: clean DDG slate)
@@ -126,13 +126,13 @@ TEST_F(DependencyTrackerTest, Suspend_RecordStillAppends)
     // Recording still appends to session traces even when tracker is suspended
     // (no active tracker scope, but session trace is global)
     DependencyTracker tracker(pools);
-    DependencyTracker::record(pools,makeContentDep("/before.nix", "a"));
+    DependencyTracker::record(makeContentDep(pools, "/before.nix", "a"));
     {
         SuspendDepTracking suspend;
         // Recording during suspension still pushes to session traces
-        DependencyTracker::record(pools,makeContentDep("/during.nix", "b"));
+        DependencyTracker::record(makeContentDep(pools, "/during.nix", "b"));
     }
-    DependencyTracker::record(pools,makeContentDep("/after.nix", "c"));
+    DependencyTracker::record(makeContentDep(pools, "/after.nix", "c"));
     auto deps = tracker.collectTraces();
     // All three should be in session traces and within tracker's range
     EXPECT_EQ(deps.size(), 3u);
@@ -247,10 +247,10 @@ TEST_F(DependencyTrackerTest, ResolveToInput_WithSubdir)
 TEST_F(DependencyTrackerTest, Record_DedupWithinTracker)
 {
     DependencyTracker tracker(pools);
-    auto dep = makeContentDep("/test.nix", "content");
-    DependencyTracker::record(pools,dep);
-    DependencyTracker::record(pools,dep); // same (type, source, key)
-    DependencyTracker::record(pools,dep); // third time
+    auto dep = makeContentDep(pools, "/test.nix", "content");
+    DependencyTracker::record(dep);
+    DependencyTracker::record(dep); // same (type, source, key)
+    DependencyTracker::record(dep); // third time
     auto deps = tracker.collectTraces();
     EXPECT_EQ(deps.size(), 1u); // Only one should survive (deduped by dep key)
 }
@@ -259,8 +259,8 @@ TEST_F(DependencyTrackerTest, Record_DedupIgnoresHash)
 {
     DependencyTracker tracker(pools);
     // Same dep key (type, source, key) but different expectedHash values
-    DependencyTracker::record(pools,makeContentDep("/test.nix", "content-v1"));
-    DependencyTracker::record(pools,makeContentDep("/test.nix", "content-v2"));
+    DependencyTracker::record(makeContentDep(pools, "/test.nix", "content-v1"));
+    DependencyTracker::record(makeContentDep(pools, "/test.nix", "content-v2"));
     auto deps = tracker.collectTraces();
     EXPECT_EQ(deps.size(), 1u); // Deduped by dep key, first hash wins
 }
@@ -268,8 +268,8 @@ TEST_F(DependencyTrackerTest, Record_DedupIgnoresHash)
 TEST_F(DependencyTrackerTest, Record_DedupDifferentKeysNotDeduped)
 {
     DependencyTracker tracker(pools);
-    DependencyTracker::record(pools,makeContentDep("/a.nix", "content"));
-    DependencyTracker::record(pools,makeContentDep("/b.nix", "content"));
+    DependencyTracker::record(makeContentDep(pools, "/a.nix", "content"));
+    DependencyTracker::record(makeContentDep(pools, "/b.nix", "content"));
     auto deps = tracker.collectTraces();
     EXPECT_EQ(deps.size(), 2u); // Different dep keys, both kept
 }
@@ -278,8 +278,8 @@ TEST_F(DependencyTrackerTest, Record_DedupDifferentTypesNotDeduped)
 {
     DependencyTracker tracker(pools);
     // Same key but different dep types -> not deduped (different oracle types)
-    DependencyTracker::record(pools,{"", "/test.nix", depHash("c"), DepType::Content});
-    DependencyTracker::record(pools,{"", "/test.nix", depHash("c"), DepType::Existence});
+    DependencyTracker::record(makeContentDep(pools, "/test.nix", "c"));
+    DependencyTracker::record(makeExistenceDep(pools, "/test.nix", true));
     auto deps = tracker.collectTraces();
     EXPECT_EQ(deps.size(), 2u);
 }
@@ -287,11 +287,11 @@ TEST_F(DependencyTrackerTest, Record_DedupDifferentTypesNotDeduped)
 TEST_F(DependencyTrackerTest, Record_DedupPerTrackerScope)
 {
     DependencyTracker outer(pools);
-    DependencyTracker::record(pools,makeContentDep("/test.nix", "content"));
+    DependencyTracker::record(makeContentDep(pools, "/test.nix", "content"));
     {
         DependencyTracker inner(pools);
         // Same dep in inner tracker — inner has its own dedup scope (Adapton: nested DDG node)
-        DependencyTracker::record(pools,makeContentDep("/test.nix", "content"));
+        DependencyTracker::record(makeContentDep(pools, "/test.nix", "content"));
         auto innerDeps = inner.collectTraces();
         EXPECT_EQ(innerDeps.size(), 1u);
     }
@@ -304,8 +304,8 @@ TEST_F(DependencyTrackerTest, Record_DedupWithDifferentSources)
 {
     DependencyTracker tracker(pools);
     // Same key and type but different sources -> not deduped (different oracle identities)
-    DependencyTracker::record(pools,{"inputA", "/test.nix", depHash("c"), DepType::Content});
-    DependencyTracker::record(pools,{"inputB", "/test.nix", depHash("c"), DepType::Content});
+    DependencyTracker::record(pools, DepType::Content, "inputA", "/test.nix", depHash("c"));
+    DependencyTracker::record(pools, DepType::Content, "inputB", "/test.nix", depHash("c"));
     auto deps = tracker.collectTraces();
     EXPECT_EQ(deps.size(), 2u);
 }

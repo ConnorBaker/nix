@@ -228,8 +228,8 @@ static void fetchTree(
 
     // Record UnhashedFetch oracle dep for trace verification (re-fetch on verify)
     if (!input.isLocked(state.fetchSettings) && state.traceActiveDepth) [[unlikely]] {
-        DependencyTracker::record(*state.traceCtx->pools,{"", input.to_string(),
-            DepHashValue(state.store->printStorePath(storePath)), DepType::UnhashedFetch});
+        DependencyTracker::record(*state.traceCtx->pools, DepType::UnhashedFetch, "", input.to_string(),
+            DepHashValue(state.store->printStorePath(storePath)));
     }
 
     emitTreeAttrs(state, storePath, cachedInput.lockedInput, v, params.emptyRevFallback, false);
@@ -462,7 +462,7 @@ static void fetch(
 
     // Record UnhashedFetch oracle dep (always dirty during trace verification)
     if (!expectedHash && state.traceActiveDepth) [[unlikely]] {
-        DependencyTracker::record(*state.traceCtx->pools,{"", *url, DepHashValue(std::string("")), DepType::UnhashedFetch});
+        DependencyTracker::record(*state.traceCtx->pools, DepType::UnhashedFetch, "", *url, DepHashValue(std::string("")));
     }
 
     // early exit if pinned and already in the store

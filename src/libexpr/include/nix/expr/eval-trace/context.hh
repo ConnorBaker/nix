@@ -3,6 +3,7 @@
 
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
+#include "nix/expr/eval-trace/store/attr-vocab-store.hh"
 #include "nix/util/pointer-bloom-filter.hh"
 #include "nix/util/ref.hh"
 #include "nix/util/hash.hh"
@@ -35,6 +36,17 @@ struct EvalTraceContext {
     /// Interning pools for dep recording. Owned here so each EvalState
     /// gets its own pools, providing automatic test isolation.
     std::unique_ptr<InterningPools> pools{std::make_unique<InterningPools>()};
+
+    /// Structured attr name/path vocabulary (shared across evaluations).
+    /// Constructed lazily when first needed (requires SymbolTable).
+    std::unique_ptr<eval_trace::AttrVocabStore> vocabStore;
+
+    /// Get or create the vocab store. Must pass the EvalState's SymbolTable.
+    eval_trace::AttrVocabStore & getVocabStore(SymbolTable & syms) {
+        if (!vocabStore)
+            vocabStore = std::make_unique<eval_trace::AttrVocabStore>(syms);
+        return *vocabStore;
+    }
     /**
      * Registry of trace cache instances (BSàlC: verifying traces), keyed by
      * flake identity hash. Allows reuse of the same traced root value across
@@ -129,7 +141,10 @@ struct EvalTraceContext {
     void reset();
 
     /**
-     * Flush trace caches to persist SQLite WAL. Called before exec().
+     * Flush and commit trace caches atomically. Called before exec().
+     * TraceStore destructors flush all pending data (including vocab
+     * entries via ATTACH'd connection) and commit the single cross-DB
+     * transaction. No separate vocab coordination needed.
      */
     void flush();
 };

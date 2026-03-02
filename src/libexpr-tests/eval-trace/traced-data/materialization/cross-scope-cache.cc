@@ -134,7 +134,7 @@ TEST_F(MaterializationDepTest, MultiChild_IndependentInvalidation)
 
     std::vector<std::string> expectedNames{"a", "b", "c"};
     for (size_t i = 0; i < expectedNames.size(); i++) {
-        auto childResult = getStoredResult(TraceStore::buildAttrPath({"names", std::to_string(i)}));
+        auto childResult = getStoredResult("names." + std::to_string(i));
         ASSERT_TRUE(childResult.has_value()) << "Child " << i << " should have a stored trace";
         auto * s = std::get_if<string_t>(& *childResult);
         ASSERT_NE(s, nullptr) << "Child " << i << " should be a string";
@@ -183,8 +183,7 @@ TEST_F(MaterializationDepTest, ListOfStrings_OnlyForcedElementsStored)
     // Only indices 1 ("b") and 3 ("d") were forced → only they should be stored
     std::vector<std::string> allExpected{"a", "b", "c", "d", "e"};
     for (size_t i = 0; i < 5; i++) {
-        auto childPath = TraceStore::buildAttrPath({"names", std::to_string(i)});
-        auto childResult = getStoredResult(childPath);
+        auto childResult = getStoredResult("names." + std::to_string(i));
         if (i == 1 || i == 3) {
             ASSERT_TRUE(childResult.has_value()) << "Forced child " << i << " should be stored";
             auto * s = std::get_if<string_t>(& *childResult);

@@ -57,6 +57,9 @@ struct DepKeyTag {};
 
 struct StringIdTag {};
 
+struct AttrNameIdTag {};
+struct AttrPathIdTag {};
+
 /// Interned dep source ID (flake input name, index in StringInternTable).
 /// uint32_t because it shares the same table as StringId/DepKeyId.
 using DepSourceId = StrongId<DepSourceTag, uint32_t>;
@@ -68,11 +71,18 @@ using FilePathId = StrongId<FilePathTag>;
 using DataPathId = StrongId<DataPathTag, uint32_t>;
 
 /// Interned dep key ID (dep key string index in StringInternTable).
-/// Used by CompactDep to avoid per-dep string allocation in sessionTraces.
+/// Used by Dep to avoid per-dep string allocation in sessionTraces.
 using DepKeyId = StrongId<DepKeyTag, uint32_t>;
 
 /// Interned string ID for DB-level dep source/key storage.
 /// Shares the same StringInternTable as DepSourceId and DepKeyId.
 using StringId = StrongId<StringIdTag, uint32_t>;
+
+/// Interned attr name ID (index in AttrVocabStore::nameTable).
+using AttrNameId = StrongId<AttrNameIdTag, uint32_t>;
+
+/// Interned attr path ID (trie node in AttrVocabStore::paths).
+/// ID 0 = root sentinel.
+using AttrPathId = StrongId<AttrPathIdTag, uint32_t>;
 
 } // namespace nix

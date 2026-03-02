@@ -3430,7 +3430,7 @@ SourcePath EvalState::findFile(const LookupPath & lookupPath, const std::string_
     if (traceActiveDepth && !settings.pureEval) [[unlikely]] {
         auto nixPath = getEnv("NIX_PATH").value_or("");
         auto hash = depHash(nixPath);
-        DependencyTracker::record(*traceCtx->pools, {"", "NIX_PATH", hash, DepType::EnvVar});
+        DependencyTracker::record(*traceCtx->pools, DepType::EnvVar, "", "NIX_PATH", hash);
     }
 
     for (auto & i : lookupPath.elements) {

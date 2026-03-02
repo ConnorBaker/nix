@@ -12,7 +12,7 @@ namespace nix::eval_trace {
 using namespace nix::eval_trace::test;
 
 /// Extract dep keys from a dep vector for exact-match assertions.
-static std::vector<std::string> keys(InterningPools & pools, const std::vector<CompactDep> & deps)
+static std::vector<std::string> keys(InterningPools & pools, const std::vector<Dep> & deps)
 {
     std::vector<std::string> out;
     out.reserve(deps.size());
@@ -38,14 +38,14 @@ protected:
 TEST_F(ChildRangeExclusionTest, ExcludeSingleChild_OnlyChildDepsRemoved)
 {
     DependencyTracker parent(pools);
-    DependencyTracker::record(pools,makeContentDep("/p1.nix", "p1"));
+    DependencyTracker::record(makeContentDep(pools,"/p1.nix", "p1"));
 
     uint32_t childStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/c1.nix", "c1"));
-    DependencyTracker::record(pools,makeContentDep("/c2.nix", "c2"));
+    DependencyTracker::record(makeContentDep(pools,"/c1.nix", "c1"));
+    DependencyTracker::record(makeContentDep(pools,"/c2.nix", "c2"));
     uint32_t childEnd = DependencyTracker::sessionTraces.size();
 
-    DependencyTracker::record(pools,makeContentDep("/p2.nix", "p2"));
+    DependencyTracker::record(makeContentDep(pools,"/p2.nix", "p2"));
     parent.excludeChildRange(childStart, childEnd);
 
     auto deps = parent.collectTraces();
@@ -55,20 +55,20 @@ TEST_F(ChildRangeExclusionTest, ExcludeSingleChild_OnlyChildDepsRemoved)
 TEST_F(ChildRangeExclusionTest, ExcludeMultipleChildren_GapPreserved)
 {
     DependencyTracker parent(pools);
-    DependencyTracker::record(pools,makeContentDep("/p1.nix", "p1"));
+    DependencyTracker::record(makeContentDep(pools,"/p1.nix", "p1"));
 
     uint32_t c1s = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/c1.nix", "c1"));
+    DependencyTracker::record(makeContentDep(pools,"/c1.nix", "c1"));
     uint32_t c1e = DependencyTracker::sessionTraces.size();
 
-    DependencyTracker::record(pools,makeContentDep("/p2.nix", "p2"));
+    DependencyTracker::record(makeContentDep(pools,"/p2.nix", "p2"));
 
     uint32_t c2s = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/c2a.nix", "c2a"));
-    DependencyTracker::record(pools,makeContentDep("/c2b.nix", "c2b"));
+    DependencyTracker::record(makeContentDep(pools,"/c2a.nix", "c2a"));
+    DependencyTracker::record(makeContentDep(pools,"/c2b.nix", "c2b"));
     uint32_t c2e = DependencyTracker::sessionTraces.size();
 
-    DependencyTracker::record(pools,makeContentDep("/p3.nix", "p3"));
+    DependencyTracker::record(makeContentDep(pools,"/p3.nix", "p3"));
 
     parent.excludeChildRange(c1s, c1e);
     parent.excludeChildRange(c2s, c2e);
@@ -81,7 +81,7 @@ TEST_F(ChildRangeExclusionTest, ExcludeAll_EmptyResult)
 {
     DependencyTracker parent(pools);
     uint32_t s = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/c.nix", "c"));
+    DependencyTracker::record(makeContentDep(pools,"/c.nix", "c"));
     uint32_t e = DependencyTracker::sessionTraces.size();
     parent.excludeChildRange(s, e);
 
@@ -91,10 +91,10 @@ TEST_F(ChildRangeExclusionTest, ExcludeAll_EmptyResult)
 TEST_F(ChildRangeExclusionTest, ExcludeReplayedRange_FullyContained)
 {
     DependencyTracker parent(pools);
-    DependencyTracker::record(pools,makeContentDep("/p.nix", "p"));
+    DependencyTracker::record(makeContentDep(pools,"/p.nix", "p"));
 
     uint32_t cs = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/c.nix", "c"));
+    DependencyTracker::record(makeContentDep(pools,"/c.nix", "c"));
     uint32_t ce = DependencyTracker::sessionTraces.size();
 
     parent.replayedRanges.push_back(
@@ -110,9 +110,9 @@ TEST_F(ChildRangeExclusionTest, ExcludeReplayedRange_FullyContained)
 TEST_F(ChildRangeExclusionTest, NoExclusions_FastPath_AllDepsPreserved)
 {
     DependencyTracker tracker(pools);
-    DependencyTracker::record(pools,makeContentDep("/a.nix", "a"));
-    DependencyTracker::record(pools,makeContentDep("/b.nix", "b"));
-    DependencyTracker::record(pools,makeContentDep("/c.nix", "c"));
+    DependencyTracker::record(makeContentDep(pools,"/a.nix", "a"));
+    DependencyTracker::record(makeContentDep(pools,"/b.nix", "b"));
+    DependencyTracker::record(makeContentDep(pools,"/c.nix", "c"));
 
     EXPECT_TRUE(tracker.excludedChildRanges.empty());
     EXPECT_EQ(keys(pools, tracker.collectTraces()),
@@ -122,7 +122,7 @@ TEST_F(ChildRangeExclusionTest, NoExclusions_FastPath_AllDepsPreserved)
 TEST_F(ChildRangeExclusionTest, EmptyRange_NothingExcluded)
 {
     DependencyTracker parent(pools);
-    DependencyTracker::record(pools,makeContentDep("/a.nix", "a"));
+    DependencyTracker::record(makeContentDep(pools,"/a.nix", "a"));
     uint32_t pos = DependencyTracker::sessionTraces.size();
     parent.excludeChildRange(pos, pos); // empty range (start == end)
 
@@ -133,10 +133,10 @@ TEST_F(ChildRangeExclusionTest, EmptyRange_NothingExcluded)
 TEST_F(ChildRangeExclusionTest, ExclusionOnOneTracker_DoesNotAffectAnother)
 {
     DependencyTracker outer(pools);
-    DependencyTracker::record(pools,makeContentDep("/outer.nix", "o"));
+    DependencyTracker::record(makeContentDep(pools,"/outer.nix", "o"));
     {
         DependencyTracker inner(pools);
-        DependencyTracker::record(pools,makeContentDep("/inner.nix", "i"));
+        DependencyTracker::record(makeContentDep(pools,"/inner.nix", "i"));
         // Exclude within inner's scope
         uint32_t s = inner.startIndex;
         uint32_t e = DependencyTracker::sessionTraces.size();
@@ -154,15 +154,15 @@ TEST_F(ChildRangeExclusionTest, ExclusionOnOneTracker_DoesNotAffectAnother)
 TEST_F(ChildRangeExclusionTest, ReplayedRange_PartialOverlap_NotFiltered)
 {
     DependencyTracker parent(pools);
-    DependencyTracker::record(pools,makeContentDep("/p.nix", "p"));
+    DependencyTracker::record(makeContentDep(pools,"/p.nix", "p"));
 
     uint32_t cs = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/c1.nix", "c1"));
-    DependencyTracker::record(pools,makeContentDep("/c2.nix", "c2"));
+    DependencyTracker::record(makeContentDep(pools,"/c1.nix", "c1"));
+    DependencyTracker::record(makeContentDep(pools,"/c2.nix", "c2"));
     uint32_t ce = DependencyTracker::sessionTraces.size();
 
     // Replayed range extends BEYOND the excluded range (partial overlap)
-    DependencyTracker::record(pools,makeContentDep("/extra.nix", "e"));
+    DependencyTracker::record(makeContentDep(pools,"/extra.nix", "e"));
     uint32_t beyondEnd = DependencyTracker::sessionTraces.size();
     parent.replayedRanges.push_back(
         DepRange{&DependencyTracker::sessionTraces, cs, beyondEnd});
@@ -180,14 +180,14 @@ TEST_F(ChildRangeExclusionTest, ReplayedRange_PartialOverlap_NotFiltered)
 TEST_F(ChildRangeExclusionTest, ReplayedRange_OutsideExclusion_Preserved)
 {
     DependencyTracker parent(pools);
-    DependencyTracker::record(pools,makeContentDep("/p.nix", "p"));
+    DependencyTracker::record(makeContentDep(pools,"/p.nix", "p"));
 
     uint32_t replayEnd = DependencyTracker::sessionTraces.size();
     parent.replayedRanges.push_back(
         DepRange{&DependencyTracker::sessionTraces, parent.startIndex, replayEnd});
 
     uint32_t cs = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/c.nix", "c"));
+    DependencyTracker::record(makeContentDep(pools,"/c.nix", "c"));
     uint32_t ce = DependencyTracker::sessionTraces.size();
     parent.excludeChildRange(cs, ce);
 
@@ -202,14 +202,14 @@ TEST_F(ChildRangeExclusionTest, AdjacentExclusions_GapNotSwallowed)
     DependencyTracker parent(pools);
 
     uint32_t c1s = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/c1.nix", "c1"));
+    DependencyTracker::record(makeContentDep(pools,"/c1.nix", "c1"));
     uint32_t c1e = DependencyTracker::sessionTraces.size();
 
     // Single dep between two excluded ranges — must survive
-    DependencyTracker::record(pools,makeContentDep("/between.nix", "b"));
+    DependencyTracker::record(makeContentDep(pools,"/between.nix", "b"));
 
     uint32_t c2s = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/c2.nix", "c2"));
+    DependencyTracker::record(makeContentDep(pools,"/c2.nix", "c2"));
     uint32_t c2e = DependencyTracker::sessionTraces.size();
 
     parent.excludeChildRange(c1s, c1e);
@@ -239,7 +239,7 @@ TEST_F(SkipEpochRecordTest, SkipMatchingValue_NoEpochEntry)
     Value v;
     v.mkInt(42);
     uint32_t epochStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/a.nix", "a"));
+    DependencyTracker::record(makeContentDep(pools,"/a.nix", "a"));
 
     ctx.skipEpochRecordFor = &v;
     ctx.recordThunkDeps(v, epochStart);
@@ -257,12 +257,12 @@ TEST_F(SkipEpochRecordTest, SkipConsumedOnce_SecondCallRecords)
     ctx.skipEpochRecordFor = &v;
 
     uint32_t e1 = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/a.nix", "a"));
+    DependencyTracker::record(makeContentDep(pools,"/a.nix", "a"));
     ctx.recordThunkDeps(v, e1);
     EXPECT_EQ(ctx.epochMap.find(&v), ctx.epochMap.end()); // skipped
 
     uint32_t e2 = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/b.nix", "b"));
+    DependencyTracker::record(makeContentDep(pools,"/b.nix", "b"));
     ctx.recordThunkDeps(v, e2);
 
     auto it = ctx.epochMap.find(&v);
@@ -289,7 +289,7 @@ TEST_F(SkipEpochRecordTest, NormalRecording_NoSkip)
     Value v;
     v.mkInt(42);
     uint32_t epochStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/a.nix", "a"));
+    DependencyTracker::record(makeContentDep(pools,"/a.nix", "a"));
 
     EXPECT_EQ(ctx.skipEpochRecordFor, nullptr); // no skip set
     ctx.recordThunkDeps(v, epochStart);
@@ -310,7 +310,7 @@ TEST_F(SkipEpochRecordTest, SkipTargetsOneValue_OthersUnaffected)
     ctx.skipEpochRecordFor = &target;
 
     uint32_t epochStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/a.nix", "a"));
+    DependencyTracker::record(makeContentDep(pools,"/a.nix", "a"));
     ctx.recordThunkDeps(other, epochStart);
 
     // 'other' was recorded despite skip being set (different address)
@@ -347,13 +347,13 @@ TEST_F(SkipEpochRecordTest, EmptyEpoch_NoEntryRegardless)
 TEST_F(ChildRangeExclusionTest, RAII_ExcludesChildDepsOnDestruction)
 {
     DependencyTracker parent(pools);
-    DependencyTracker::record(pools,makeContentDep("/p1.nix", "p1"));
+    DependencyTracker::record(makeContentDep(pools,"/p1.nix", "p1"));
 
     {
         auto * pt = DependencyTracker::activeTracker;
         uint32_t rs = DependencyTracker::sessionTraces.size();
 
-        DependencyTracker::record(pools,makeContentDep("/child.nix", "c"));
+        DependencyTracker::record(makeContentDep(pools,"/child.nix", "c"));
 
         struct Guard {
             DependencyTracker * t; uint32_t s;
@@ -361,14 +361,14 @@ TEST_F(ChildRangeExclusionTest, RAII_ExcludesChildDepsOnDestruction)
         } g{pt, rs};
     }
 
-    DependencyTracker::record(pools,makeContentDep("/p2.nix", "p2"));
+    DependencyTracker::record(makeContentDep(pools,"/p2.nix", "p2"));
     EXPECT_EQ(keys(pools, parent.collectTraces()), (std::vector<std::string>{"/p1.nix", "/p2.nix"}));
 }
 
 TEST_F(ChildRangeExclusionTest, RAII_ExceptionSafety)
 {
     DependencyTracker parent(pools);
-    DependencyTracker::record(pools,makeContentDep("/p.nix", "p"));
+    DependencyTracker::record(makeContentDep(pools,"/p.nix", "p"));
 
     try {
         auto * pt = DependencyTracker::activeTracker;
@@ -378,7 +378,7 @@ TEST_F(ChildRangeExclusionTest, RAII_ExceptionSafety)
             ~Guard() { if (t) t->excludeChildRange(s, DependencyTracker::sessionTraces.size()); }
         } g{pt, rs};
 
-        DependencyTracker::record(pools,makeContentDep("/child.nix", "c"));
+        DependencyTracker::record(makeContentDep(pools,"/child.nix", "c"));
         throw std::runtime_error("boom");
     } catch (...) {}
 
@@ -388,19 +388,19 @@ TEST_F(ChildRangeExclusionTest, RAII_ExceptionSafety)
 TEST_F(ChildRangeExclusionTest, RAII_NestedChildrenCompose)
 {
     DependencyTracker gp(pools);
-    DependencyTracker::record(pools,makeContentDep("/gp.nix", "gp"));
+    DependencyTracker::record(makeContentDep(pools,"/gp.nix", "gp"));
 
     {
         auto * gpT = DependencyTracker::activeTracker;
         uint32_t cs = DependencyTracker::sessionTraces.size();
 
         DependencyTracker child(pools);
-        DependencyTracker::record(pools,makeContentDep("/child.nix", "c"));
+        DependencyTracker::record(makeContentDep(pools,"/child.nix", "c"));
 
         {
             auto * childT = DependencyTracker::activeTracker;
             uint32_t gcs = DependencyTracker::sessionTraces.size();
-            DependencyTracker::record(pools,makeContentDep("/gc.nix", "gc"));
+            DependencyTracker::record(makeContentDep(pools,"/gc.nix", "gc"));
             childT->excludeChildRange(gcs, DependencyTracker::sessionTraces.size());
         }
 
@@ -410,7 +410,7 @@ TEST_F(ChildRangeExclusionTest, RAII_NestedChildrenCompose)
         gpT->excludeChildRange(cs, DependencyTracker::sessionTraces.size());
     }
 
-    DependencyTracker::record(pools,makeContentDep("/gp2.nix", "gp2"));
+    DependencyTracker::record(makeContentDep(pools,"/gp2.nix", "gp2"));
 
     // Grandparent trace: only its own deps (child+grandchild excluded)
     EXPECT_EQ(keys(pools, gp.collectTraces()), (std::vector<std::string>{"/gp.nix", "/gp2.nix"}));
@@ -421,7 +421,7 @@ TEST_F(ChildRangeExclusionTest, RAII_NestedChildrenCompose)
 TEST_F(ChildRangeExclusionTest, RAII_NullParent_NothingExcluded)
 {
     DependencyTracker tracker(pools);
-    DependencyTracker::record(pools,makeContentDep("/a.nix", "a"));
+    DependencyTracker::record(makeContentDep(pools,"/a.nix", "a"));
 
     {
         struct Guard {
@@ -429,10 +429,10 @@ TEST_F(ChildRangeExclusionTest, RAII_NullParent_NothingExcluded)
             ~Guard() { if (t) t->excludeChildRange(s, DependencyTracker::sessionTraces.size()); }
         } g{nullptr, 0}; // null parent → no-op
 
-        DependencyTracker::record(pools,makeContentDep("/b.nix", "b"));
+        DependencyTracker::record(makeContentDep(pools,"/b.nix", "b"));
     }
 
-    DependencyTracker::record(pools,makeContentDep("/c.nix", "c"));
+    DependencyTracker::record(makeContentDep(pools,"/c.nix", "c"));
     EXPECT_EQ(keys(pools, tracker.collectTraces()),
         (std::vector<std::string>{"/a.nix", "/b.nix", "/c.nix"}));
 }

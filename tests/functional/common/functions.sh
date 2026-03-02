@@ -55,7 +55,7 @@ doClearStore() {
     # reference store paths that no longer exist. Normal GC doesn't need this
     # (toDerivedPaths recovery re-evaluates invalid drvPaths), but clearStore's
     # wholesale destruction of the store DB requires explicit cleanup.
-    rm -rf "$TEST_HOME/.cache/nix/eval-trace"*
+    rm -rf "$TEST_HOME/.cache/nix/eval-trace"* "$TEST_HOME/.cache/nix/attr-vocab.sqlite"* "$TEST_HOME/.cache/nix/stat-hash-cache"*
     clearProfiles
 }
 

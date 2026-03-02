@@ -16,24 +16,24 @@ TEST_F(TraceStoreTest, DifferentContextHash_Isolated)
     // Two different context hashes should have isolated trace namespaces
 
     {
-        TraceStore db1(state.symbols, *state.traceCtx->pools, 111);
-        db1.recordDeps("pkg", string_t{"v1", {}}, {}, false);
+        TraceStore db1(state.symbols, *state.traceCtx->pools, state.traceCtx->getVocabStore(state.symbols), 111);
+        db1.record(vpath({"pkg"}), string_t{"v1", {}}, {}, false);
     }
     {
-        TraceStore db2(state.symbols, *state.traceCtx->pools, 222);
-        db2.recordDeps("pkg", string_t{"v2", {}}, {}, false);
+        TraceStore db2(state.symbols, *state.traceCtx->pools, state.traceCtx->getVocabStore(state.symbols), 222);
+        db2.record(vpath({"pkg"}), string_t{"v2", {}}, {}, false);
     }
 
     {
-        TraceStore db1(state.symbols, *state.traceCtx->pools, 111);
-        auto r1 = db1.verify("pkg", {}, state);
+        TraceStore db1(state.symbols, *state.traceCtx->pools, state.traceCtx->getVocabStore(state.symbols), 111);
+        auto r1 = db1.verify(vpath({"pkg"}), {}, state);
         ASSERT_TRUE(r1.has_value());
         ASSERT_TRUE(std::holds_alternative<string_t>(r1->value));
         EXPECT_EQ(std::get<string_t>(r1->value).first, "v1");
     }
     {
-        TraceStore db2(state.symbols, *state.traceCtx->pools, 222);
-        auto r2 = db2.verify("pkg", {}, state);
+        TraceStore db2(state.symbols, *state.traceCtx->pools, state.traceCtx->getVocabStore(state.symbols), 222);
+        auto r2 = db2.verify(vpath({"pkg"}), {}, state);
         ASSERT_TRUE(r2.has_value());
         ASSERT_TRUE(std::holds_alternative<string_t>(r2->value));
         EXPECT_EQ(std::get<string_t>(r2->value).first, "v2");
@@ -44,23 +44,19 @@ TEST_F(TraceStoreTest, NullByteAttrPath)
 {
     auto db = makeDb();
 
-    // Null-byte separated attr path like "packages\0x86_64-linux\0hello" (trace key encoding)
-    std::string attrPath = "packages";
-    attrPath.push_back('\0');
-    attrPath.append("x86_64-linux");
-    attrPath.push_back('\0');
-    attrPath.append("hello");
+    // Multi-component attr path: packages.x86_64-linux.hello
+    auto fullPath = vpath({"packages", "x86_64-linux", "hello"});
 
-    db.recordDeps(attrPath, string_t{"val", {}}, {}, false);
-    EXPECT_TRUE(db.attrExists(attrPath));
-    EXPECT_FALSE(db.attrExists("packages"));
+    db.record(fullPath, string_t{"val", {}}, {}, false);
+    EXPECT_TRUE(db.attrExists(fullPath));
+    EXPECT_FALSE(db.attrExists(vpath({"packages"})));
 }
 
 TEST_F(TraceStoreTest, EmptyAttrPath)
 {
     auto db = makeDb();
-    db.recordDeps("", string_t{"root-val", {}}, {}, true);
-    EXPECT_TRUE(db.attrExists(""));
+    db.record(rootPath(), string_t{"root-val", {}}, {}, true);
+    EXPECT_TRUE(db.attrExists(rootPath()));
 }
 
 TEST_F(TraceStoreTest, MultipleEntries_Stress)
@@ -70,12 +66,12 @@ TEST_F(TraceStoreTest, MultipleEntries_Stress)
     // Record 100 trace entries
     for (int i = 0; i < 100; i++) {
         auto name = "stress-" + std::to_string(i);
-        db.recordDeps(name, int_t{NixInt{i}}, {}, false);
+        db.record(vpath({name}), int_t{NixInt{i}}, {}, false);
     }
 
-    EXPECT_TRUE(db.attrExists("stress-0"));
-    EXPECT_TRUE(db.attrExists("stress-99"));
-    EXPECT_FALSE(db.attrExists("stress-100"));
+    EXPECT_TRUE(db.attrExists(vpath({"stress-0"})));
+    EXPECT_TRUE(db.attrExists(vpath({"stress-99"})));
+    EXPECT_FALSE(db.attrExists(vpath({"stress-100"})));
 }
 
 // ── BLOB serialization roundtrip tests (keys_blob + values_blob encoding) ──
@@ -225,27 +221,27 @@ TEST_F(TraceStoreTest, DepKeySets_SiblingOverlap)
     auto db = makeDb();
 
     // Parent with 0 deps (FullAttrs pattern — trace records only child names)
-    db.recordDeps("", null_t{}, {}, true);
+    db.record(rootPath(), null_t{}, {}, true);
 
     // Child A trace with 100 deps (own deps only, no parent inheritance)
     std::vector<Dep> depsA;
     for (int i = 0; i < 100; i++) {
-        depsA.push_back(makeContentDep("/file-" + std::to_string(i) + ".nix",
+        depsA.push_back(makeContentDep(pools(), "/file-" + std::to_string(i) + ".nix",
                                        "content-" + std::to_string(i)));
     }
-    auto childA = db.recordDeps("a", string_t{"val-a", {}}, depsA, false);
+    auto childA = db.record(vpath({"a"}), string_t{"val-a", {}}, depsA, false);
 
     // Child B trace with 95 overlapping deps + 5 different hashes
     std::vector<Dep> depsB;
     for (int i = 0; i < 95; i++) {
-        depsB.push_back(makeContentDep("/file-" + std::to_string(i) + ".nix",
+        depsB.push_back(makeContentDep(pools(), "/file-" + std::to_string(i) + ".nix",
                                        "content-" + std::to_string(i)));
     }
     for (int i = 95; i < 100; i++) {
-        depsB.push_back(makeContentDep("/file-" + std::to_string(i) + ".nix",
+        depsB.push_back(makeContentDep(pools(), "/file-" + std::to_string(i) + ".nix",
                                        "content-modified-" + std::to_string(i)));
     }
-    auto childB = db.recordDeps("b", string_t{"val-b", {}}, depsB, false);
+    auto childB = db.record(vpath({"b"}), string_t{"val-b", {}}, depsB, false);
 
     // Both traces should load correctly with full deps
     auto loadedA = db.loadFullTrace(childA.traceId);
@@ -261,24 +257,24 @@ TEST_F(TraceStoreTest, Record_SeparatedDeps)
     auto db = makeDb();
 
     // Parent with 0 deps (FullAttrs pattern — trace records only child names)
-    db.recordDeps("", null_t{}, {}, true);
+    db.record(rootPath(), null_t{}, {}, true);
 
     // Child A trace with 100 deps
     std::vector<Dep> depsA;
     for (int i = 0; i < 100; i++) {
-        depsA.push_back(makeContentDep("/f" + std::to_string(i) + ".nix",
+        depsA.push_back(makeContentDep(pools(), "/f" + std::to_string(i) + ".nix",
                                        "c" + std::to_string(i)));
     }
-    auto childA = db.recordDeps("a", int_t{NixInt{1}}, depsA, false);
+    auto childA = db.record(vpath({"a"}), int_t{NixInt{1}}, depsA, false);
 
     // Child B trace with 99 overlapping + 1 different dep hash
     std::vector<Dep> depsB;
     for (int i = 0; i < 99; i++) {
-        depsB.push_back(makeContentDep("/f" + std::to_string(i) + ".nix",
+        depsB.push_back(makeContentDep(pools(), "/f" + std::to_string(i) + ".nix",
                                        "c" + std::to_string(i)));
     }
-    depsB.push_back(makeContentDep("/f99.nix", "c99-modified"));
-    auto childB = db.recordDeps("b", int_t{NixInt{2}}, depsB, false);
+    depsB.push_back(makeContentDep(pools(), "/f99.nix", "c99-modified"));
+    auto childB = db.record(vpath({"b"}), int_t{NixInt{2}}, depsB, false);
 
     // Verify both traces load correctly
     auto loadedA = db.loadFullTrace(childA.traceId);
@@ -313,9 +309,9 @@ TEST_F(TraceStoreTest, WarmPath_BatchValidation)
         auto key = "NIX_BATCH_" + std::to_string(i);
         auto value = "v" + std::to_string(i);
         setenv(key.c_str(), value.c_str(), 1);
-        deps.push_back(makeEnvVarDep(key, value));
+        deps.push_back(makeEnvVarDep(pools(), key, value));
     }
-    auto result = db.recordDeps("", null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps, true);
 
     // Change dep #25 to invalidate its hash
     setenv("NIX_BATCH_25", "CHANGED", 1);
@@ -346,25 +342,25 @@ TEST_F(TraceStoreTest, WarmPath_HashCaching)
 
     // Version 1: deps A and B
     std::vector<Dep> deps1 = {
-        makeEnvVarDep("NIX_HASHCACHE_A", "valA"),
-        makeEnvVarDep("NIX_HASHCACHE_B", "valB"),
+        makeEnvVarDep(pools(), "NIX_HASHCACHE_A", "valA"),
+        makeEnvVarDep(pools(), "NIX_HASHCACHE_B", "valB"),
     };
-    db.recordDeps("", string_t{"result-1", {}}, deps1, true);
+    db.record(rootPath(), string_t{"result-1", {}}, deps1, true);
 
     // Version 2: A changed, B same
     setenv("NIX_HASHCACHE_A", "valA2", 1);
     std::vector<Dep> deps2 = {
-        makeEnvVarDep("NIX_HASHCACHE_A", "valA2"),
-        makeEnvVarDep("NIX_HASHCACHE_B", "valB"),
+        makeEnvVarDep(pools(), "NIX_HASHCACHE_A", "valA2"),
+        makeEnvVarDep(pools(), "NIX_HASHCACHE_B", "valB"),
     };
-    db.recordDeps("", string_t{"result-2", {}}, deps2, true);
+    db.record(rootPath(), string_t{"result-2", {}}, deps2, true);
 
     // Revert A
     setenv("NIX_HASHCACHE_A", "valA", 1);
     db.clearSessionCaches();
 
     // verify should fail verification (trace 2 deps don't match) then constructively recover to result-1
-    auto result = db.verify("", {}, state);
+    auto result = db.verify(rootPath(), {}, state);
     ASSERT_TRUE(result.has_value());
     assertCachedResultEquals(string_t{"result-1", {}}, result->value, state.symbols);
 
@@ -379,12 +375,12 @@ TEST_F(TraceStoreTest, WarmPath_BaseValidatedOnce)
     ScopedEnvVar env("NIX_BASE_VALID", "ok");
 
     auto db = makeDb();
-    std::vector<Dep> sharedDeps = {makeEnvVarDep("NIX_BASE_VALID", "ok")};
+    std::vector<Dep> sharedDeps = {makeEnvVarDep(pools(), "NIX_BASE_VALID", "ok")};
 
     // Record 5 attrs with identical deps (all share the same trace)
     for (int i = 0; i < 5; i++) {
         auto name = "sibling-" + std::to_string(i);
-        db.recordDeps(name, int_t{NixInt{i}}, sharedDeps, false);
+        db.record(vpath({name}), int_t{NixInt{i}}, sharedDeps, false);
     }
 
     db.clearSessionCaches();
@@ -392,7 +388,7 @@ TEST_F(TraceStoreTest, WarmPath_BaseValidatedOnce)
     // Verify all 5 — trace verified on first access, session-memoized for rest
     for (int i = 0; i < 5; i++) {
         auto name = "sibling-" + std::to_string(i);
-        auto result = db.verify(name, {}, state);
+        auto result = db.verify(vpath({name}), {}, state);
         ASSERT_TRUE(result.has_value()) << "Sibling " << i << " failed";
         ASSERT_TRUE(std::holds_alternative<int_t>(result->value));
         EXPECT_EQ(std::get<int_t>(result->value).x.value, i);
@@ -415,32 +411,32 @@ TEST_F(TraceStoreTest, RecordVerify_WarmRoundtrip)
     auto db = makeDb();
 
     // 3 attrs with overlapping deps (all env vars — verifiable)
-    auto sharedDep = makeEnvVarDep("NIX_DW_SHARED", "stable");
+    auto sharedDep = makeEnvVarDep(pools(), "NIX_DW_SHARED", "stable");
 
     // Attr 1: shared + 1 unique
-    std::vector<Dep> deps1 = {sharedDep, makeEnvVarDep("NIX_DW_A", "a-val")};
-    db.recordDeps("a", string_t{"val-a", {}}, deps1, false);
+    std::vector<Dep> deps1 = {sharedDep, makeEnvVarDep(pools(), "NIX_DW_A", "a-val")};
+    db.record(vpath({"a"}), string_t{"val-a", {}}, deps1, false);
 
     // Attr 2: shared + 1 different unique
-    std::vector<Dep> deps2 = {sharedDep, makeEnvVarDep("NIX_DW_B", "b-val")};
-    db.recordDeps("b", string_t{"val-b", {}}, deps2, false);
+    std::vector<Dep> deps2 = {sharedDep, makeEnvVarDep(pools(), "NIX_DW_B", "b-val")};
+    db.record(vpath({"b"}), string_t{"val-b", {}}, deps2, false);
 
     // Attr 3: shared only
     std::vector<Dep> deps3 = {sharedDep};
-    db.recordDeps("c", string_t{"val-c", {}}, deps3, false);
+    db.record(vpath({"c"}), string_t{"val-c", {}}, deps3, false);
 
     db.clearSessionCaches();
 
     // Verify all 3 traces (BSàlC: verify trace -> serve cached result)
-    auto ra = db.verify("a", {}, state);
+    auto ra = db.verify(vpath({"a"}), {}, state);
     ASSERT_TRUE(ra.has_value());
     assertCachedResultEquals(string_t{"val-a", {}}, ra->value, state.symbols);
 
-    auto rb = db.verify("b", {}, state);
+    auto rb = db.verify(vpath({"b"}), {}, state);
     ASSERT_TRUE(rb.has_value());
     assertCachedResultEquals(string_t{"val-b", {}}, rb->value, state.symbols);
 
-    auto rc = db.verify("c", {}, state);
+    auto rc = db.verify(vpath({"c"}), {}, state);
     ASSERT_TRUE(rc.has_value());
     assertCachedResultEquals(string_t{"val-c", {}}, rc->value, state.symbols);
 }

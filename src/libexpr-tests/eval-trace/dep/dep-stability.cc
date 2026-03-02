@@ -15,7 +15,7 @@ namespace nix::eval_trace {
 using namespace nix::eval_trace::test;
 
 /// Extract dep keys from a dep vector for exact-match assertions.
-static std::vector<std::string> keys(InterningPools & pools, const std::vector<CompactDep> & deps)
+static std::vector<std::string> keys(InterningPools & pools, const std::vector<Dep> & deps)
 {
     std::vector<std::string> out;
     out.reserve(deps.size());
@@ -43,12 +43,12 @@ protected:
 
         // Parent's own deps (before child)
         for (auto & d : parentDeps)
-            DependencyTracker::record(pools,d);
+            DependencyTracker::record(d);
 
         // Child evaluates fresh — records into sessionTraces
         uint32_t childStart = DependencyTracker::sessionTraces.size();
         for (auto & d : childDeps)
-            DependencyTracker::record(pools,d);
+            DependencyTracker::record(d);
         uint32_t childEnd = DependencyTracker::sessionTraces.size();
 
         // Exclude child range (what ChildRangeExcluder does)
@@ -68,13 +68,13 @@ protected:
 
         // Parent's own deps
         for (auto & d : parentDeps)
-            DependencyTracker::record(pools,d);
+            DependencyTracker::record(d);
 
         // Child replays cached deps — these go into sessionTraces AND
         // are added as a replayed range on the parent's tracker
         uint32_t childStart = DependencyTracker::sessionTraces.size();
         for (auto & d : childReplayedDeps)
-            DependencyTracker::record(pools,d);
+            DependencyTracker::record(d);
         uint32_t childEnd = DependencyTracker::sessionTraces.size();
 
         parent.replayedRanges.push_back(
@@ -94,22 +94,22 @@ protected:
 TEST_F(DepStabilityTest, ParentDepsStable_ChildFreshEval)
 {
     std::vector<Dep> parentDeps = {
-        makeContentDep("/parent/a.nix", "pa"),
-        makeContentDep("/parent/b.nix", "pb"),
+        makeContentDep(pools, "/parent/a.nix", "pa"),
+        makeContentDep(pools, "/parent/b.nix", "pb"),
     };
 
     // Run 1: child has 4 deps
     auto run1 = runWithFreshChild(parentDeps, {
-        makeContentDep("/child/f1.nix", "c1"),
-        makeContentDep("/child/f2.nix", "c2"),
-        makeContentDep("/child/f3.nix", "c3"),
-        makeContentDep("/child/f4.nix", "c4"),
+        makeContentDep(pools, "/child/f1.nix", "c1"),
+        makeContentDep(pools, "/child/f2.nix", "c2"),
+        makeContentDep(pools, "/child/f3.nix", "c3"),
+        makeContentDep(pools, "/child/f4.nix", "c4"),
     });
 
     // Run 2: child has different deps (different caching state)
     auto run2 = runWithFreshChild(parentDeps, {
-        makeContentDep("/child/f1.nix", "c1"),
-        makeContentDep("/child/f5.nix", "c5"),
+        makeContentDep(pools, "/child/f1.nix", "c1"),
+        makeContentDep(pools, "/child/f5.nix", "c5"),
     });
 
     // Parent deps must be identical regardless of child's dep set
@@ -124,20 +124,20 @@ TEST_F(DepStabilityTest, ParentDepsStable_ChildFreshEval)
 TEST_F(DepStabilityTest, ParentDepsStable_ChildCachedReplay)
 {
     std::vector<Dep> parentDeps = {
-        makeContentDep("/parent/x.nix", "px"),
+        makeContentDep(pools, "/parent/x.nix", "px"),
     };
 
     // Run 1: child evaluates fresh with N deps
     auto run1 = runWithFreshChild(parentDeps, {
-        makeContentDep("/child/a.nix", "ca"),
-        makeContentDep("/child/b.nix", "cb"),
-        makeContentDep("/child/c.nix", "cc"),
+        makeContentDep(pools, "/child/a.nix", "ca"),
+        makeContentDep(pools, "/child/b.nix", "cb"),
+        makeContentDep(pools, "/child/c.nix", "cc"),
     });
 
     // Run 2: child is cached, replays M != N deps
     auto run2 = runWithCachedChild(parentDeps, {
-        makeContentDep("/child/a.nix", "ca"),
-        makeContentDep("/child/d.nix", "cd"),
+        makeContentDep(pools, "/child/a.nix", "ca"),
+        makeContentDep(pools, "/child/d.nix", "cd"),
     });
 
     // Parent sees only its own deps in both cases
@@ -152,28 +152,28 @@ TEST_F(DepStabilityTest, ParentDepsStable_ChildCachedReplay)
 TEST_F(DepStabilityTest, OscillationPattern_ThreeConsecutiveRuns)
 {
     std::vector<Dep> parentDeps = {
-        makeContentDep("/parent/root.nix", "pr"),
+        makeContentDep(pools, "/parent/root.nix", "pr"),
     };
 
     // Run 1 (cold): child evaluates fresh, records {f1, f2, f3, f4}
     auto run1 = runWithFreshChild(parentDeps, {
-        makeContentDep("/child/f1.nix", "c1"),
-        makeContentDep("/child/f2.nix", "c2"),
-        makeContentDep("/child/f3.nix", "c3"),
-        makeContentDep("/child/f4.nix", "c4"),
+        makeContentDep(pools, "/child/f1.nix", "c1"),
+        makeContentDep(pools, "/child/f2.nix", "c2"),
+        makeContentDep(pools, "/child/f3.nix", "c3"),
+        makeContentDep(pools, "/child/f4.nix", "c4"),
     });
 
     // Run 2 (warm): child verify-replays subset {f1, f2}
     auto run2 = runWithCachedChild(parentDeps, {
-        makeContentDep("/child/f1.nix", "c1"),
-        makeContentDep("/child/f2.nix", "c2"),
+        makeContentDep(pools, "/child/f1.nix", "c1"),
+        makeContentDep(pools, "/child/f2.nix", "c2"),
     });
 
     // Run 3 (re-eval): child evaluates fresh again with {f1, f2, f5}
     auto run3 = runWithFreshChild(parentDeps, {
-        makeContentDep("/child/f1.nix", "c1"),
-        makeContentDep("/child/f2.nix", "c2"),
-        makeContentDep("/child/f5.nix", "c5"),
+        makeContentDep(pools, "/child/f1.nix", "c1"),
+        makeContentDep(pools, "/child/f2.nix", "c2"),
+        makeContentDep(pools, "/child/f5.nix", "c5"),
     });
 
     // All three runs produce identical parent deps
@@ -192,17 +192,17 @@ TEST_F(DepStabilityTest, NoExclusion_ParentDepsVary)
     {
         DependencyTracker::clearSessionTraces();
         DependencyTracker parent(pools);
-        DependencyTracker::record(pools,makeContentDep("/parent/p.nix", "pp"));
-        DependencyTracker::record(pools,makeContentDep("/child/a.nix", "ca"));
-        DependencyTracker::record(pools,makeContentDep("/child/b.nix", "cb"));
-        DependencyTracker::record(pools,makeContentDep("/child/c.nix", "cc"));
+        DependencyTracker::record(makeContentDep(pools,"/parent/p.nix", "pp"));
+        DependencyTracker::record(makeContentDep(pools,"/child/a.nix", "ca"));
+        DependencyTracker::record(makeContentDep(pools,"/child/b.nix", "cb"));
+        DependencyTracker::record(makeContentDep(pools,"/child/c.nix", "cc"));
         auto run1 = keys(pools, parent.collectTraces());
 
         // Run 2: child has different deps, NO exclusion
         DependencyTracker::clearSessionTraces();
         DependencyTracker parent2(pools);
-        DependencyTracker::record(pools,makeContentDep("/parent/p.nix", "pp"));
-        DependencyTracker::record(pools,makeContentDep("/child/x.nix", "cx"));
+        DependencyTracker::record(makeContentDep(pools,"/parent/p.nix", "pp"));
+        DependencyTracker::record(makeContentDep(pools,"/child/x.nix", "cx"));
         auto run2 = keys(pools, parent2.collectTraces());
 
         // Without exclusion, parent deps DIFFER (this is the bug)
@@ -219,7 +219,7 @@ TEST_F(DepStabilityTest, NoExclusion_ParentDepsVary)
 TEST_F(DepStabilityTest, MultipleChildren_VaryingCacheState)
 {
     std::vector<Dep> parentDeps = {
-        makeContentDep("/parent/main.nix", "pm"),
+        makeContentDep(pools, "/parent/main.nix", "pm"),
     };
 
     // Run 1: C1 fresh (100 deps), C2 cached (50 deps)
@@ -228,21 +228,21 @@ TEST_F(DepStabilityTest, MultipleChildren_VaryingCacheState)
         DependencyTracker parent(pools);
 
         for (auto & d : parentDeps)
-            DependencyTracker::record(pools,d);
+            DependencyTracker::record(d);
 
         // C1 fresh: 100 deps
         uint32_t c1Start = DependencyTracker::sessionTraces.size();
         for (int i = 0; i < 100; i++)
-            DependencyTracker::record(pools,
-                makeContentDep("/c1/f" + std::to_string(i) + ".nix", "c1-" + std::to_string(i)));
+            DependencyTracker::record(
+                makeContentDep(pools,"/c1/f" + std::to_string(i) + ".nix", "c1-" + std::to_string(i)));
         uint32_t c1End = DependencyTracker::sessionTraces.size();
         parent.excludeChildRange(c1Start, c1End);
 
         // C2 cached: 50 replayed deps
         uint32_t c2Start = DependencyTracker::sessionTraces.size();
         for (int i = 0; i < 50; i++)
-            DependencyTracker::record(pools,
-                makeContentDep("/c2/g" + std::to_string(i) + ".nix", "c2-" + std::to_string(i)));
+            DependencyTracker::record(
+                makeContentDep(pools,"/c2/g" + std::to_string(i) + ".nix", "c2-" + std::to_string(i)));
         uint32_t c2End = DependencyTracker::sessionTraces.size();
         parent.replayedRanges.push_back(
             DepRange{&DependencyTracker::sessionTraces, c2Start, c2End});
@@ -257,13 +257,13 @@ TEST_F(DepStabilityTest, MultipleChildren_VaryingCacheState)
         DependencyTracker parent(pools);
 
         for (auto & d : parentDeps)
-            DependencyTracker::record(pools,d);
+            DependencyTracker::record(d);
 
         // C1 cached: 30 replayed deps
         uint32_t c1Start = DependencyTracker::sessionTraces.size();
         for (int i = 0; i < 30; i++)
-            DependencyTracker::record(pools,
-                makeContentDep("/c1/f" + std::to_string(i) + ".nix", "c1-" + std::to_string(i)));
+            DependencyTracker::record(
+                makeContentDep(pools,"/c1/f" + std::to_string(i) + ".nix", "c1-" + std::to_string(i)));
         uint32_t c1End = DependencyTracker::sessionTraces.size();
         parent.replayedRanges.push_back(
             DepRange{&DependencyTracker::sessionTraces, c1Start, c1End});
@@ -272,8 +272,8 @@ TEST_F(DepStabilityTest, MultipleChildren_VaryingCacheState)
         // C2 fresh: 80 deps
         uint32_t c2Start = DependencyTracker::sessionTraces.size();
         for (int i = 0; i < 80; i++)
-            DependencyTracker::record(pools,
-                makeContentDep("/c2/g" + std::to_string(i) + ".nix", "c2-" + std::to_string(i)));
+            DependencyTracker::record(
+                makeContentDep(pools,"/c2/g" + std::to_string(i) + ".nix", "c2-" + std::to_string(i)));
         uint32_t c2End = DependencyTracker::sessionTraces.size();
         parent.excludeChildRange(c2Start, c2End);
 
@@ -293,19 +293,19 @@ TEST_F(DepStabilityTest, ExclusionPlusReplayedRanges_Composable)
     DependencyTracker::clearSessionTraces();
     DependencyTracker parent(pools);
 
-    DependencyTracker::record(pools,makeContentDep("/parent/p.nix", "pp"));
+    DependencyTracker::record(makeContentDep(pools,"/parent/p.nix", "pp"));
 
     // Child evaluates and also triggers epoch replay within its scope.
     // Both the child's fresh deps AND replayed deps fall within the
     // excluded range and must be filtered.
     uint32_t childStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/child/fresh1.nix", "cf1"));
-    DependencyTracker::record(pools,makeContentDep("/child/fresh2.nix", "cf2"));
+    DependencyTracker::record(makeContentDep(pools,"/child/fresh1.nix", "cf1"));
+    DependencyTracker::record(makeContentDep(pools,"/child/fresh2.nix", "cf2"));
 
     // Simulate epoch replay within child's scope: adds a replayed range
     // to parent that falls within the child's excluded range.
     uint32_t replayStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(pools,makeContentDep("/child/replayed.nix", "cr"));
+    DependencyTracker::record(makeContentDep(pools,"/child/replayed.nix", "cr"));
     uint32_t replayEnd = DependencyTracker::sessionTraces.size();
     parent.replayedRanges.push_back(
         DepRange{&DependencyTracker::sessionTraces, replayStart, replayEnd});
@@ -313,7 +313,7 @@ TEST_F(DepStabilityTest, ExclusionPlusReplayedRanges_Composable)
     uint32_t childEnd = DependencyTracker::sessionTraces.size();
 
     // More parent deps after child
-    DependencyTracker::record(pools,makeContentDep("/parent/q.nix", "pq"));
+    DependencyTracker::record(makeContentDep(pools,"/parent/q.nix", "pq"));
 
     parent.excludeChildRange(childStart, childEnd);
 
@@ -335,7 +335,8 @@ class DepStabilityStoreTest : public TraceStoreFixture
 {
 protected:
     static constexpr int64_t testCtxHash = 0xDEADBEEF42424242;
-    TraceStore makeDb() { return TraceStore(state.symbols, *state.traceCtx->pools, testCtxHash); }
+    TraceStore makeDb() { return TraceStore(state.symbols, *state.traceCtx->pools,
+        state.traceCtx->getVocabStore(state.symbols), testCtxHash); }
 };
 
 TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
@@ -350,33 +351,33 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
     auto db = makeDb();
 
     // Record ROOT trace with zero deps (typical for ROOT)
-    auto rootPath = std::string("");
-    db.recordDeps(rootPath, CachedResult(attrs_t{}), {}, true);
-    auto rootHash = db.getCurrentTraceHash(rootPath);
+    // rootPath() provided by fixture
+    db.record(rootPath(), CachedResult(attrs_t{}), {}, true);
+    auto rootHash = db.getCurrentTraceHash(rootPath());
     ASSERT_TRUE(rootHash.has_value());
 
     // Record "x" trace with Content dep on the data file + ParentContext on ROOT
-    auto xPath = makePath({"x"});
+    auto xPathId = vpath({"x"});
     auto fileHash = depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
     std::vector<Dep> xDeps = {
-        Dep{"", dataFile.path.string(), DepHashValue(fileHash), DepType::Content},
-        makeParentContextDep("", *rootHash),
+        {DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string()), DepHashValue(fileHash)},
+        makeParentContextDep(rootPath(), *rootHash),
     };
-    db.recordDeps(xPath, CachedResult(int_t{NixInt(11)}), xDeps, false);
-    auto xHash = db.getCurrentTraceHash(toDepKey(xPath));
+    db.record(xPathId, CachedResult(int_t{NixInt(11)}), xDeps, false);
+    auto xHash = db.getCurrentTraceHash(xPathId);
     ASSERT_TRUE(xHash.has_value());
 
     // Record "y" trace with per-sibling ParentContext dep on x
-    auto yPath = makePath({"y"});
+    auto yPathId = vpath({"y"});
     std::vector<Dep> yDeps = {
-        makeParentContextDep(toDepKey(xPath), *xHash),
+        makeParentContextDep(vpath({"x"}), *xHash),
     };
-    db.recordDeps(yPath, CachedResult(int_t{NixInt(10)}), yDeps, false);
+    db.record(yPathId, CachedResult(int_t{NixInt(10)}), yDeps, false);
 
     // Before file change: y should verify (chain is valid)
     db.clearSessionCaches();
-    auto yVerify1 = db.verify(yPath, {}, state);
+    auto yVerify1 = db.verify(yPathId, {}, state);
     ASSERT_TRUE(yVerify1.has_value()) << "y should verify before file change";
 
     // Change the data file
@@ -387,7 +388,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
     // After file change: y should FAIL verification
     // Chain: y → ParentContext(x) → verify(x) → Content(file) changed → FAIL
     db.clearSessionCaches();
-    auto yVerify2 = db.verify(yPath, {}, state);
+    auto yVerify2 = db.verify(yPathId, {}, state);
     EXPECT_FALSE(yVerify2.has_value())
         << "y must detect file change via per-sibling dep chain";
 }
@@ -399,25 +400,25 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_NoChange_StillValid)
     TempExtFile dataFile("json", "42");
     auto db = makeDb();
 
-    db.recordDeps("", CachedResult(attrs_t{}), {}, true);
-    auto rootHash = db.getCurrentTraceHash("");
+    db.record(rootPath(), CachedResult(attrs_t{}), {}, true);
+    auto rootHash = db.getCurrentTraceHash(rootPath());
     ASSERT_TRUE(rootHash.has_value());
 
-    auto xPath = makePath({"x"});
+    auto xPathId = vpath({"x"});
     auto fileHash = depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
-    db.recordDeps(xPath, CachedResult(int_t{NixInt(42)}),
-        {Dep{"", dataFile.path.string(), DepHashValue(fileHash), DepType::Content},
-         makeParentContextDep("", *rootHash)}, false);
-    auto xHash = db.getCurrentTraceHash(toDepKey(xPath));
+    db.record(xPathId, CachedResult(int_t{NixInt(42)}),
+        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string()), DepHashValue(fileHash)},
+         makeParentContextDep(rootPath(), *rootHash)}, false);
+    auto xHash = db.getCurrentTraceHash(xPathId);
     ASSERT_TRUE(xHash.has_value());
 
-    auto yPath = makePath({"y"});
-    db.recordDeps(yPath, CachedResult(int_t{NixInt(41)}),
-        {makeParentContextDep(toDepKey(xPath), *xHash)}, false);
+    auto yPathId = vpath({"y"});
+    db.record(yPathId, CachedResult(int_t{NixInt(41)}),
+        {makeParentContextDep(vpath({"x"}), *xHash)}, false);
 
     db.clearSessionCaches();
-    auto yVerify = db.verify(yPath, {}, state);
+    auto yVerify = db.verify(yPathId, {}, state);
     EXPECT_TRUE(yVerify.has_value()) << "y should verify when file unchanged";
 }
 
@@ -437,30 +438,30 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
     auto db = makeDb();
 
     // ROOT: stable (no deps that change)
-    db.recordDeps("", CachedResult(attrs_t{}), {}, true);
-    auto rootHash = db.getCurrentTraceHash("");
+    db.record(rootPath(), CachedResult(attrs_t{}), {}, true);
+    auto rootHash = db.getCurrentTraceHash(rootPath());
     ASSERT_TRUE(rootHash.has_value());
 
     // x: Content dep on the data file + ParentContext on ROOT
-    auto xPath = makePath({"x"});
+    auto xPathId = vpath({"x"});
     auto fileHash = depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
-    db.recordDeps(xPath, CachedResult(string_t{"x_v1", {}}),
-        {Dep{"", dataFile.path.string(), DepHashValue(fileHash), DepType::Content},
-         makeParentContextDep("", *rootHash)},
+    db.record(xPathId, CachedResult(string_t{"x_v1", {}}),
+        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string()), DepHashValue(fileHash)},
+         makeParentContextDep(rootPath(), *rootHash)},
         false);
-    auto xHash = db.getCurrentTraceHash(toDepKey(xPath));
+    auto xHash = db.getCurrentTraceHash(xPathId);
     ASSERT_TRUE(xHash.has_value());
 
     // y: per-sibling ParentContext dep on x only
-    auto yPath = makePath({"y"});
-    db.recordDeps(yPath, CachedResult(string_t{"y_v1", {}}),
-        {makeParentContextDep(toDepKey(xPath), *xHash)},
+    auto yPathId = vpath({"y"});
+    db.record(yPathId, CachedResult(string_t{"y_v1", {}}),
+        {makeParentContextDep(vpath({"x"}), *xHash)},
         false);
 
     // Verify y before change — should pass
     db.clearSessionCaches();
-    ASSERT_TRUE(db.verify(yPath, {}, state).has_value());
+    ASSERT_TRUE(db.verify(yPathId, {}, state).has_value());
 
     // Change the file that x depends on
     dataFile.modify("content_v2");
@@ -473,7 +474,7 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
     // ParentContext verification. But recovery() must NOT find a stale
     // historical trace where the ParentContext hash matches without
     // recursive verification.
-    auto result = db.verify(yPath, {}, state);
+    auto result = db.verify(yPathId, {}, state);
     EXPECT_FALSE(result.has_value())
         << "recovery must not bypass recursive ParentContext verification";
 }
@@ -494,34 +495,34 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     auto db = makeDb();
 
     // ROOT trace: no deps (stable)
-    db.recordDeps("", CachedResult(attrs_t{}), {}, true);
-    auto rootTraceHash = db.getCurrentTraceHash("");
+    db.record(rootPath(), CachedResult(attrs_t{}), {}, true);
+    auto rootTraceHash = db.getCurrentTraceHash(rootPath());
     ASSERT_TRUE(rootTraceHash.has_value());
 
     // "x" trace: Content dep on depA file + ParentContext on ROOT
     auto depAHash = depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(depAFile.path.string())));
-    auto xPath = makePath({"x"});
-    db.recordDeps(xPath, CachedResult(int_t{NixInt(11)}),
-        {Dep{"", depAFile.path.string(), DepHashValue(depAHash), DepType::Content},
-         makeParentContextDep("", *rootTraceHash)},
+    auto xPathId = vpath({"x"});
+    db.record(xPathId, CachedResult(int_t{NixInt(11)}),
+        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(depAFile.path.string()), DepHashValue(depAHash)},
+         makeParentContextDep(rootPath(), *rootTraceHash)},
         false);
-    auto xTraceHash = db.getCurrentTraceHash(toDepKey(xPath));
+    auto xTraceHash = db.getCurrentTraceHash(xPathId);
     ASSERT_TRUE(xTraceHash.has_value());
 
     // "z" trace: Content dep on depB file + ParentContext on ROOT
     auto depBHash = depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(depBFile.path.string())));
-    auto zPath = makePath({"z"});
-    db.recordDeps(zPath, CachedResult(int_t{NixInt(99)}),
-        {Dep{"", depBFile.path.string(), DepHashValue(depBHash), DepType::Content},
-         makeParentContextDep("", *rootTraceHash)},
+    auto zPathId = vpath({"z"});
+    db.record(zPathId, CachedResult(int_t{NixInt(99)}),
+        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(depBFile.path.string()), DepHashValue(depBHash)},
+         makeParentContextDep(rootPath(), *rootTraceHash)},
         false);
 
     // "y" trace: per-sibling dep on x only (y = x - 1, doesn't touch z)
-    auto yPath = makePath({"y"});
-    db.recordDeps(yPath, CachedResult(int_t{NixInt(10)}),
-        {makeParentContextDep(toDepKey(xPath), *xTraceHash)},
+    auto yPathId = vpath({"y"});
+    db.record(yPathId, CachedResult(int_t{NixInt(10)}),
+        {makeParentContextDep(vpath({"x"}), *xTraceHash)},
         false);
 
     // Simulate lockfile change: depB changes, depA stays the same.
@@ -531,17 +532,17 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     db.clearSessionCaches();
 
     // y should still verify — y depends on x, x depends on depA, depA is unchanged
-    auto yVerify = db.verify(yPath, {}, state);
+    auto yVerify = db.verify(yPathId, {}, state);
     EXPECT_TRUE(yVerify.has_value())
         << "y must NOT be invalidated by unrelated depB change";
 
     // z should be invalidated — z depends on depB which changed
-    auto zVerify = db.verify(zPath, {}, state);
+    auto zVerify = db.verify(zPathId, {}, state);
     EXPECT_FALSE(zVerify.has_value())
         << "z must be invalidated by depB change";
 
     // x should still verify — x depends on depA which is unchanged
-    auto xVerify = db.verify(xPath, {}, state);
+    auto xVerify = db.verify(xPathId, {}, state);
     EXPECT_TRUE(xVerify.has_value())
         << "x must NOT be invalidated by unrelated depB change";
 }
@@ -656,8 +657,8 @@ TEST_F(EpochStabilityTest, SuspendedThunk_EpochAlwaysRecorded)
         uint32_t epochStart = DependencyTracker::sessionTraces.size();
         {
             SuspendDepTracking suspend;
-            DependencyTracker::record(pools,makeContentDep("/lib/default.nix", "lib"));
-            DependencyTracker::record(pools,makeContentDep("/lib/attrsets.nix", "attrs"));
+            DependencyTracker::record(makeContentDep(pools,"/lib/default.nix", "lib"));
+            DependencyTracker::record(makeContentDep(pools,"/lib/attrsets.nix", "attrs"));
         }
         // Fix: recordThunkDeps called regardless of isActive()
         ctx.recordThunkDeps(v, epochStart);
@@ -666,7 +667,7 @@ TEST_F(EpochStabilityTest, SuspendedThunk_EpochAlwaysRecorded)
     // Phase 2: new tracker replays V successfully
     {
         DependencyTracker tracker(pools);
-        DependencyTracker::record(pools,makeContentDep("/closure.nix", "closure"));
+        DependencyTracker::record(makeContentDep(pools,"/closure.nix", "closure"));
         ctx.replayMemoizedDeps(v);
 
         auto deps = tracker.collectTraces();
@@ -692,8 +693,8 @@ TEST_F(EpochStabilityTest, SuspendedThunk_WithEpochEntry_ReplaySucceeds)
         uint32_t epochStart = DependencyTracker::sessionTraces.size();
         {
             SuspendDepTracking suspend;
-            DependencyTracker::record(pools,makeContentDep("/lib/default.nix", "lib"));
-            DependencyTracker::record(pools,makeContentDep("/lib/attrsets.nix", "attrs"));
+            DependencyTracker::record(makeContentDep(pools,"/lib/default.nix", "lib"));
+            DependencyTracker::record(makeContentDep(pools,"/lib/attrsets.nix", "attrs"));
         }
         // FIX: recordThunkDeps called regardless of isActive()
         ctx.recordThunkDeps(v, epochStart);
@@ -702,7 +703,7 @@ TEST_F(EpochStabilityTest, SuspendedThunk_WithEpochEntry_ReplaySucceeds)
     // Phase 2: new tracker replays V successfully
     {
         DependencyTracker tracker(pools);
-        DependencyTracker::record(pools,makeContentDep("/closure.nix", "closure"));
+        DependencyTracker::record(makeContentDep(pools,"/closure.nix", "closure"));
         ctx.replayMemoizedDeps(v);
 
         auto deps = tracker.collectTraces();
@@ -736,14 +737,14 @@ TEST_F(EpochStabilityTest, DepSetStable_RegardlessOfSuspensionState)
         {
             DependencyTracker prior(pools);
             uint32_t epochStart = DependencyTracker::sessionTraces.size();
-            DependencyTracker::record(pools,makeContentDep("/lib/default.nix", "lib"));
-            DependencyTracker::record(pools,makeContentDep("/lib/attrsets.nix", "attrs"));
+            DependencyTracker::record(makeContentDep(pools,"/lib/default.nix", "lib"));
+            DependencyTracker::record(makeContentDep(pools,"/lib/attrsets.nix", "attrs"));
             ctx.recordThunkDeps(v, epochStart);
         }
 
         // Child scope records own deps + replays V
         DependencyTracker child(pools);
-        DependencyTracker::record(pools,makeContentDep("/closure.nix", "closure"));
+        DependencyTracker::record(makeContentDep(pools,"/closure.nix", "closure"));
         ctx.replayMemoizedDeps(v);
         return keys(pools, child.collectTraces());
     }();
@@ -759,8 +760,8 @@ TEST_F(EpochStabilityTest, DepSetStable_RegardlessOfSuspensionState)
             uint32_t epochStart = DependencyTracker::sessionTraces.size();
             {
                 SuspendDepTracking suspend;
-                DependencyTracker::record(pools,makeContentDep("/lib/default.nix", "lib"));
-                DependencyTracker::record(pools,makeContentDep("/lib/attrsets.nix", "attrs"));
+                DependencyTracker::record(makeContentDep(pools,"/lib/default.nix", "lib"));
+                DependencyTracker::record(makeContentDep(pools,"/lib/attrsets.nix", "attrs"));
             }
             // FIX: recordThunkDeps called regardless of isActive()
             ctx.recordThunkDeps(v, epochStart);
@@ -768,7 +769,7 @@ TEST_F(EpochStabilityTest, DepSetStable_RegardlessOfSuspensionState)
 
         // Child scope records own deps + replays V
         DependencyTracker child(pools);
-        DependencyTracker::record(pools,makeContentDep("/closure.nix", "closure"));
+        DependencyTracker::record(makeContentDep(pools,"/closure.nix", "closure"));
         ctx.replayMemoizedDeps(v);
         return keys(pools, child.collectTraces());
     }();
@@ -799,7 +800,7 @@ TEST_F(EpochStabilityTest, NestedThunks_SuspendedForcing_DepsPreserved)
         uint32_t vStart = DependencyTracker::sessionTraces.size();
         {
             SuspendDepTracking suspend;
-            DependencyTracker::record(pools,makeContentDep("/v-dep.nix", "v"));
+            DependencyTracker::record(makeContentDep(pools,"/v-dep.nix", "v"));
         }
         ctx.recordThunkDeps(v, vStart);
 
@@ -807,7 +808,7 @@ TEST_F(EpochStabilityTest, NestedThunks_SuspendedForcing_DepsPreserved)
         uint32_t wStart = DependencyTracker::sessionTraces.size();
         {
             SuspendDepTracking suspend;
-            DependencyTracker::record(pools,makeContentDep("/w-dep.nix", "w"));
+            DependencyTracker::record(makeContentDep(pools,"/w-dep.nix", "w"));
             // W accesses V (already forced) → replay would fire if tracker active
             // During suspension, replay is no-op (activeTracker nullptr)
         }
@@ -816,7 +817,7 @@ TEST_F(EpochStabilityTest, NestedThunks_SuspendedForcing_DepsPreserved)
 
     // Child tracker accesses W
     DependencyTracker child(pools);
-    DependencyTracker::record(pools,makeContentDep("/child.nix", "c"));
+    DependencyTracker::record(makeContentDep(pools,"/child.nix", "c"));
     ctx.replayMemoizedDeps(w);
     // Also replay V (child might access V independently)
     ctx.replayMemoizedDeps(v);
