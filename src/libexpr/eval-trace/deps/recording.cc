@@ -1220,24 +1220,32 @@ static std::string computeDirSetHash(const std::vector<std::pair<DepSourceId, Fi
 
 /**
  * Build JSON dep key for an aggregated DirSet has-key-miss dep.
- * Embeds directory paths so computeCurrentHash can verify independently.
+ * The dirs array is stored once in pools.dirSets (keyed by dsHash)
+ * and persisted to the DirSets table by TraceStore::flush().
+ * The dep key itself is compact (~100 bytes) with no embedded dirs.
  */
 [[gnu::cold]]
 static std::string buildAggregatedHasKeyJson(
     const std::string & dsHash, std::string_view keyName,
     const std::vector<std::pair<DepSourceId, FilePathId>> & dirs)
 {
+    auto & pools = DependencyTracker::activeTracker->pools;
+
+    // Lazily build and cache the dirs JSON (once per unique dsHash)
+    if (!pools.dirSets.contains(dsHash)) {
+        nlohmann::json dirArr = nlohmann::json::array();
+        for (auto & [srcId, fpId] : dirs) {
+            dirArr.push_back({std::string(pools.resolve(srcId)),
+                              std::string(pools.filePathPool.resolve(fpId))});
+        }
+        pools.dirSets[dsHash] = dirArr.dump();
+    }
+
+    // Compact key — no dirs embedded (~100 bytes)
     nlohmann::json j;
     j["ds"] = dsHash;
     j["h"] = std::string(keyName);
     j["t"] = "d";
-    nlohmann::json dirArr = nlohmann::json::array();
-    auto & pools = DependencyTracker::activeTracker->pools;
-    for (auto & [srcId, fpId] : dirs) {
-        dirArr.push_back({std::string(pools.resolve(srcId)),
-                          std::string(pools.filePathPool.resolve(fpId))});
-    }
-    j["dirs"] = std::move(dirArr);
     return j.dump();
 }
 

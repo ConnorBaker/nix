@@ -94,6 +94,10 @@ struct TraceStore {
         SQLiteStmt lookupHistoryByTrace;
         SQLiteStmt scanHistoryForAttr;
 
+        // DirSets (normalized dir-set definitions for aggregated DirSet deps)
+        SQLiteStmt insertDirSet;
+        SQLiteStmt getAllDirSets;
+
         // StatHashCache (stat-hash cache persistence, on stat_cache.* schema)
         SQLiteStmt queryAllStatHash;
         SQLiteStmt upsertStatHash;

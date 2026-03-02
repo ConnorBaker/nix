@@ -137,7 +137,8 @@ static std::string tomlCanonical(const toml::value & v)
 static std::optional<DepHashValue> computeCurrentHash(
     EvalState & state, const TraceStore::ResolvedDep & dep,
     const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
-    VerificationScope & scope)
+    VerificationScope & scope,
+    const boost::unordered_flat_map<std::string, std::string> & dirSets)
 {
     switch (dep.type) {
     case DepType::Content:
@@ -214,7 +215,7 @@ static std::optional<DepHashValue> computeCurrentHash(
         [[fallthrough]];
     case DepType::StructuredContent: {
         // Key format: JSON object {"f":"path","t":"j","p":[...],"s":"keys","h":"key"}
-        // Or aggregated DirSet: {"ds":"<hex>","h":"keyName","t":"d","dirs":[...]}
+        // Or aggregated DirSet: {"ds":"<hex>","h":"keyName","t":"d"} (dirs in DirSets table)
         nlohmann::json j;
         try {
             j = nlohmann::json::parse(dep.key);
@@ -224,9 +225,13 @@ static std::optional<DepHashValue> computeCurrentHash(
 
         // Aggregated DirSet dep: iterate all directories, check each for the key
         if (j.contains("ds")) {
+            auto dsHash = j.value("ds", "");
             auto hasKeyName = j.value("h", "");
             if (hasKeyName.empty()) return std::nullopt;
-            auto dirs = j.value("dirs", nlohmann::json::array());
+
+            auto it = dirSets.find(dsHash);
+            if (it == dirSets.end()) return std::nullopt;
+            auto dirs = nlohmann::json::parse(it->second);
             for (auto & dir : dirs) {
                 if (!dir.is_array() || dir.size() != 2) continue;
                 auto source = dir[0].get<std::string>();
@@ -685,6 +690,15 @@ static const char * schema = R"sql(
         PRIMARY KEY (context_hash, attr_path_id, trace_id)
     ) WITHOUT ROWID, STRICT;
 
+    -- Normalized dir-set definitions for aggregated DirSet deps.
+    -- Each row stores the dirs JSON array once, keyed by content hash.
+    -- DirSet dep keys reference this table by ds_hash instead of
+    -- embedding the full dirs array (~44 KB) in every dep key string.
+    CREATE TABLE IF NOT EXISTS DirSets (
+        ds_hash TEXT PRIMARY KEY,
+        dirs    TEXT NOT NULL
+    ) STRICT;
+
 )sql";
 
 static const char * statHashSchema = R"sql(
@@ -836,6 +850,12 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabS
         "JOIN Results r ON h.result_id = r.id "
         "WHERE h.context_hash = ? AND h.attr_path_id = ?");
 
+    // DirSets (normalized dir-set definitions)
+    st->insertDirSet.create(st->db,
+        "INSERT OR IGNORE INTO DirSets(ds_hash, dirs) VALUES (?, ?)");
+    st->getAllDirSets.create(st->db,
+        "SELECT ds_hash, dirs FROM DirSets");
+
     // Vocab (on ATTACH'd vocab.* schema)
     st->insertVocabName.create(st->db,
         "INSERT OR IGNORE INTO vocab.AttrNames(id, name) VALUES (?, ?)");
@@ -928,6 +948,11 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabS
             if (id > nextTraceId) nextTraceId = id;
         }
     }
+    {
+        auto use(st->getAllDirSets.use());
+        while (use.next())
+            pools.dirSets.emplace(std::string(use.getStr(0)), std::string(use.getStr(1)));
+    }
 
     _state = std::move(state);
 
@@ -983,6 +1008,7 @@ void TraceStore::clearSessionCaches()
     traceRowCache.clear();
     depKeySetCache.clear();
     pools.strings.clear();
+    pools.dirSets.clear();
     flushedStringHighWaterMark = 0;
     nextResultId = ResultId();
     nextDepKeySetId = DepKeySetId();
@@ -1055,6 +1081,13 @@ void TraceStore::bulkLoadAll()
             if (id > nextTraceId) nextTraceId = id;
         }
     }
+
+    // Load DirSets: populate dsHash → dirs JSON cache
+    {
+        auto use(st->getAllDirSets.use());
+        while (use.next())
+            pools.dirSets.emplace(std::string(use.getStr(0)), std::string(use.getStr(1)));
+    }
 }
 
 void TraceStore::flush()
@@ -1067,7 +1100,7 @@ void TraceStore::flush()
     // across the session. This prevents SQLITE_BUSY when multiple TraceStores
     // (one per context hash) ATTACH the same vocab DB.
 
-    // Flush in dependency order: Strings → Results → DepKeySets → Traces
+    // Flush in dependency order: Strings → DirSets → Results → DepKeySets → Traces
 
     // Flush new strings: those with ID > flushedStringHighWaterMark.
     for (uint32_t i = flushedStringHighWaterMark + 1; i < pools.strings.nextId(); i++) {
@@ -1077,6 +1110,10 @@ void TraceStore::flush()
     flushedStringHighWaterMark = pools.strings.nextId() > 0
         ? pools.strings.nextId() - 1
         : 0;
+
+    // Flush DirSet definitions (INSERT OR IGNORE deduplicates; ~2 entries typical)
+    for (auto & [dsHash, dirsJson] : pools.dirSets)
+        st->insertDirSet.use()(dsHash)(dirsJson).exec();
 
     for (auto & r : pendingResults) {
         auto use(st->insertResultWithId.use());
@@ -1559,7 +1596,7 @@ bool TraceStore::verifyTrace(
             current = cacheIt->second;
         } else {
             auto dep = resolveDep(idep);
-            current = computeCurrentHash(state, dep, inputAccessors, scope);
+            current = computeCurrentHash(state, dep, inputAccessors, scope, pools.dirSets);
             currentDepHashes[idep.key] = current;
         }
 
@@ -1596,7 +1633,7 @@ bool TraceStore::verifyTrace(
                 current = cacheIt->second;
             } else {
                 auto dep = resolveDep(idep);
-                current = computeCurrentHash(state, dep, inputAccessors, scope);
+                current = computeCurrentHash(state, dep, inputAccessors, scope, pools.dirSets);
                 currentDepHashes[idep.key] = current;
             }
             if (!current || *current != idep.hash) {
@@ -1634,11 +1671,13 @@ bool TraceStore::verifyTrace(
             if (fi.filePath.starts_with("ds:")) {
                 try {
                     auto j = nlohmann::json::parse(dep.key);
-                    if (j.contains("dirs")) {
-                        for (auto & dir : j["dirs"]) {
-                            if (dir.is_array() && dir.size() == 2)
-                                structuralCoveredFiles.insert({dir[0].get<std::string>(), dir[1].get<std::string>()});
-                        }
+                    auto dsHash = j.value("ds", "");
+                    auto it = pools.dirSets.find(dsHash);
+                    if (it == pools.dirSets.end()) continue;
+                    auto dirs = nlohmann::json::parse(it->second);
+                    for (auto & dir : dirs) {
+                        if (dir.is_array() && dir.size() == 2)
+                            structuralCoveredFiles.insert({dir[0].get<std::string>(), dir[1].get<std::string>()});
                     }
                 } catch (...) {}
             }
@@ -1960,7 +1999,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             current = cacheIt->second;
         } else {
             auto dep = resolveDep(idep);
-            current = computeCurrentHash(state, dep, inputAccessors, scope);
+            current = computeCurrentHash(state, dep, inputAccessors, scope, pools.dirSets);
             currentDepHashes[idep.key] = current;
         }
 
@@ -2132,7 +2171,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
                     std::string(resolveString(key.sourceId)),
                     std::string(resolveString(key.keyId)),
                     DepHashValue{Blake3Hash{}}, key.type};
-                current = computeCurrentHash(state, syntheticDep, inputAccessors, scope);
+                current = computeCurrentHash(state, syntheticDep, inputAccessors, scope, pools.dirSets);
                 currentDepHashes[key] = current;
             }
 

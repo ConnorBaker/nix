@@ -222,6 +222,11 @@ struct InterningPools {
     /// Typed resolve: delegates to strings.resolve<Id>.
     template<typename Id>
     std::string_view resolve(Id id) const { return strings.resolve(id); }
+
+    /// DirSet definitions: dsHash → dirs JSON array string.
+    /// Populated during recording, persisted to the DirSets table by
+    /// TraceStore::flush(), loaded from DB by TraceStore::bulkLoadAll().
+    boost::unordered_flat_map<std::string, std::string> dirSets;
 };
 
 } // namespace nix
