@@ -1,5 +1,6 @@
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/store/stat-hash-store.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/value.hh"
@@ -12,7 +13,6 @@
 #include "nix/util/source-path.hh"
 #include "nix/util/util.hh"
 
-#include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
@@ -80,9 +80,10 @@ namespace nix {
 // │   - skipEpochRecordFor (TracedExpr anti-contamination guard)       │
 // └─────────────────────────────────────────────────────────────────────┘
 //
-// The StatHashCache singleton is a fourth scope (process-global, not
-// thread-local, not per-EvalState). It caches (dev,ino,mtime,size) → BLAKE3
-// mappings and is shared across all evaluators and threads.
+// The StatHashStore singleton (stat-hash-store.hh/cc) is a fourth scope
+// (process-global, not thread-local, not per-EvalState). It caches
+// (path,depType) → (FileFingerprint, BLAKE3) mappings and is shared across
+// all evaluators and threads.
 
 // ═══════════════════════════════════════════════════════════════════════
 // DependencyTracker — RAII dep recording (Adapton DDG builder)
@@ -468,250 +469,6 @@ Blake3Hash depHashDirListing(const SourceAccessor::DirEntries & entries)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// StatHashCache — persistent (dev, ino, mtime, size, depType) → BLAKE3
-// Implementation detail: invisible to all consumers.
-// ═══════════════════════════════════════════════════════════════════════
-
-namespace {
-
-// ── Impl ────────────────────────────────────────────────────────────
-
-static constexpr size_t L1_MAX_SIZE = 65536;
-
-// Key for L2 bulk map: path + dep_type
-struct L2Key {
-    std::string path;
-    DepType depType;
-
-    bool operator==(const L2Key &) const = default;
-
-    struct Hash {
-        std::size_t operator()(const L2Key & k) const noexcept {
-            return hashValues(k.path, std::to_underlying(k.depType));
-        }
-    };
-};
-
-struct StatHashCacheImpl
-{
-    boost::concurrent_flat_map<StatHashKey, Blake3Hash, StatHashKey::Hash> l1;
-
-    // L2 bulk load cache (populated by loadStatHashEntries from TraceStore)
-    std::unordered_map<L2Key, StatHashEntry, L2Key::Hash> l2Bulk;
-    bool l2Loaded = false;
-
-    // Dirty entries: newly-stored hashes that TraceStore should flush to SQLite
-    std::vector<StatHashEntry> dirtyEntries;
-
-    ~StatHashCacheImpl() = default;
-    StatHashCacheImpl() = default;
-};
-
-// ── Helpers ─────────────────────────────────────────────────────────
-
-static StatHashKey makeKey(const PosixStat & st, DepType type)
-{
-    return {
-        st.st_dev,
-        st.st_ino,
-#ifdef __APPLE__
-        st.st_mtimespec.tv_sec,
-        st.st_mtimespec.tv_nsec,
-#else
-        st.st_mtim.tv_sec,
-        st.st_mtim.tv_nsec,
-#endif
-        st.st_size,
-        type,
-    };
-}
-
-
-// ── StatHashCache singleton + public API ─────────────────────────────
-
-struct StatHashCache
-{
-    struct LookupResult {
-        std::optional<Blake3Hash> hash;
-        std::optional<PosixStat> stat;
-    };
-
-    static StatHashCache & instance()
-    {
-        static StatHashCache cache;
-        return cache;
-    }
-
-    LookupResult lookupHash(const std::filesystem::path & physPath, DepType type)
-    {
-        auto st = maybeLstat(physPath);
-        if (!st)
-            return {std::nullopt, std::nullopt};
-
-        auto key = makeKey(*st, type);
-
-        // L1: in-memory lookup
-        if (auto hit = getConcurrent(impl->l1, key)) {
-            debug("stat hash cache: L1 hit for '%s' (%s)", physPath.string(), depTypeName(type));
-            return {std::move(hit), *st};
-        }
-
-        // L2: bulk-loaded lookup (populated by loadStatHashEntries from TraceStore)
-        auto pathStr = physPath.string();
-        auto l2It = impl->l2Bulk.find(L2Key{pathStr, type});
-        if (l2It != impl->l2Bulk.end()) {
-            auto & e = l2It->second;
-            // Validate stat metadata
-            if (e.stat == key)
-            {
-                // Promote to L1
-                if (impl->l1.size() < L1_MAX_SIZE)
-                    impl->l1.emplace(key, e.hash);
-
-                debug("stat hash cache: L2 hit for '%s' (%s)", physPath.string(), depTypeName(type));
-                return {e.hash, *st};
-            }
-        }
-
-        debug("stat hash cache: miss for '%s' (%s)", physPath.string(), depTypeName(type));
-        return {std::nullopt, *st};
-    }
-
-    void storeHash(
-        const std::filesystem::path & physPath, DepType type,
-        const Blake3Hash & hash, std::optional<PosixStat> st = std::nullopt)
-    {
-        if (!st) {
-            st = maybeLstat(physPath);
-            if (!st)
-                return;
-        }
-        auto key = makeKey(*st, type);
-
-        // L1: store in memory
-        if (impl->l1.size() < L1_MAX_SIZE)
-            impl->l1.emplace_or_visit(key,
-                hash,
-                [&](auto & entry) { entry.second = hash; });
-
-        // Track as dirty for TraceStore to flush to SQLite
-        impl->dirtyEntries.push_back(StatHashEntry{
-            .path = physPath.string(),
-            .stat = key,
-            .hash = hash,
-        });
-
-        // Update L2 bulk cache (reuse the dirty entry we just created)
-        if (impl->l2Loaded) {
-            auto pathStr = physPath.string();
-            impl->l2Bulk[L2Key{pathStr, type}] = impl->dirtyEntries.back();
-        }
-    }
-
-    void clearMemoryCache()
-    {
-        impl->l1.clear();
-    }
-
-    void bulkLoadEntries(std::vector<StatHashEntry> entries)
-    {
-        for (auto & e : entries) {
-            auto key = L2Key{e.path, e.stat.depType};
-            impl->l2Bulk[std::move(key)] = std::move(e);
-        }
-        impl->l2Loaded = true;
-        debug("stat hash cache: loaded %d L2 entries from TraceStore", entries.size());
-    }
-
-    void flushDirtyEntries(std::function<void(const StatHashEntry &)> callback)
-    {
-        for (auto & e : impl->dirtyEntries)
-            callback(e);
-        impl->dirtyEntries.clear();
-    }
-
-private:
-    std::unique_ptr<StatHashCacheImpl> impl;
-
-    StatHashCache()
-        : impl(std::make_unique<StatHashCacheImpl>())
-    {
-    }
-
-    ~StatHashCache() = default;
-
-};
-
-} // anonymous namespace
-
-// ═══════════════════════════════════════════════════════════════════════
-// Stat-cached dep hash functions
-// ═══════════════════════════════════════════════════════════════════════
-
-// Compute Content dep hash with stat-cache acceleration (Shake: "file
-// modification time" early-cutoff check before reading file contents).
-// The stat-hash cache acts as an oracle memoization layer — if the file's
-// stat metadata (dev, ino, mtime_ns, size) is unchanged since the last
-// hashing, the cached BLAKE3 hash is returned without re-reading the file.
-//
-// Note: hashes the entire file content. For .nix files consumed via
-// import/evalFile, this is an over-approximation — a change to any part
-// of the file invalidates all traces that depend on it, even if the change
-// is semantically irrelevant (e.g., reformatting, adding a comment in an
-// unused branch). For data files consumed by fromJSON/fromTOML, the
-// StructuredContent two-level override (see design.md Section 4.6) can
-// mitigate this. For .nix code, no fine-grained override exists.
-Blake3Hash depHashFile(const SourcePath & path)
-{
-    if (auto physPath = path.getPhysicalPath()) {
-        auto result = StatHashCache::instance().lookupHash(*physPath, DepType::Content);
-        if (result.hash)
-            return *result.hash;
-        auto content = path.readFile();
-        auto hash = depHash(content);
-        if (result.stat)
-            StatHashCache::instance().storeHash(*physPath, DepType::Content, hash, *result.stat);
-        return hash;
-    }
-    return depHash(path.readFile());
-}
-
-// Stat-cached NAR content hash (Shake: early-cutoff via stat metadata).
-// Like depHashFile but hashes the NAR serialization, which captures both
-// file content and the executable permission bit — needed for builtins.path
-// deps where store path identity depends on permissions.
-Blake3Hash depHashPathCached(const SourcePath & path)
-{
-    if (auto physPath = path.getPhysicalPath()) {
-        auto result = StatHashCache::instance().lookupHash(*physPath, DepType::NARContent);
-        if (result.hash)
-            return *result.hash;
-        auto hash = depHashPath(path);
-        if (result.stat)
-            StatHashCache::instance().storeHash(*physPath, DepType::NARContent, hash, *result.stat);
-        return hash;
-    }
-    return depHashPath(path);
-}
-
-// Stat-cached directory listing hash (Shake: early-cutoff via stat metadata).
-// Directory stat changes (mtime update on entry add/remove) trigger rehashing;
-// unchanged stat metadata serves the cached hash without re-reading the listing.
-Blake3Hash depHashDirListingCached(const SourcePath & path, const SourceAccessor::DirEntries & entries)
-{
-    if (auto physPath = path.getPhysicalPath()) {
-        auto result = StatHashCache::instance().lookupHash(*physPath, DepType::Directory);
-        if (result.hash)
-            return *result.hash;
-        auto hash = depHashDirListing(entries);
-        if (result.stat)
-            StatHashCache::instance().storeHash(*physPath, DepType::Directory, hash, *result.stat);
-        return hash;
-    }
-    return depHashDirListing(entries);
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // Input resolution + dep recording
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -805,7 +562,7 @@ void recordDep(
     {
         try {
             if (auto * b3 = std::get_if<Blake3Hash>(&hash))
-                StatHashCache::instance().storeHash(
+                storeStatHash(
                     std::filesystem::path(absPath.abs()), depType, *b3, fileStat);
         } catch (...) {}
     }
@@ -898,21 +655,6 @@ std::string dirEntryTypeString(std::optional<SourceAccessor::Type> type)
     default: return "unknown";
     }
 #pragma GCC diagnostic pop
-}
-
-void clearStatHashMemoryCache()
-{
-    StatHashCache::instance().clearMemoryCache();
-}
-
-void loadStatHashEntries(std::vector<StatHashEntry> entries)
-{
-    StatHashCache::instance().bulkLoadEntries(std::move(entries));
-}
-
-void forEachDirtyStatHash(std::function<void(const StatHashEntry &)> callback)
-{
-    StatHashCache::instance().flushDirtyEntries(std::move(callback));
 }
 
 // ═══════════════════════════════════════════════════════════════════════

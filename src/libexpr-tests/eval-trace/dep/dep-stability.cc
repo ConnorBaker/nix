@@ -383,7 +383,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
     // Change the data file
     dataFile.modify("13");
     getFSSourceAccessor()->invalidateCache(CanonPath(dataFile.path.string()));
-    clearStatHashMemoryCache();
+    clearStatHashStore();
 
     // After file change: y should FAIL verification
     // Chain: y → ParentContext(x) → verify(x) → Content(file) changed → FAIL
@@ -466,7 +466,7 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
     // Change the file that x depends on
     dataFile.modify("content_v2");
     getFSSourceAccessor()->invalidateCache(CanonPath(dataFile.path.string()));
-    clearStatHashMemoryCache();
+    clearStatHashStore();
     db.clearSessionCaches();
 
     // Verify y after change — must FAIL
@@ -528,7 +528,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     // Simulate lockfile change: depB changes, depA stays the same.
     depBFile.modify("{ z = 100; }");
     getFSSourceAccessor()->invalidateCache(CanonPath(depBFile.path.string()));
-    clearStatHashMemoryCache();
+    clearStatHashStore();
     db.clearSessionCaches();
 
     // y should still verify — y depends on x, x depends on depA, depA is unchanged

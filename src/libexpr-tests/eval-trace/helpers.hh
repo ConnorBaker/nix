@@ -3,6 +3,7 @@
 #include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/expr/eval-trace/store/trace-store.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/store/stat-hash-store.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/tests/libexpr.hh"
 #include "nix/util/hash.hh"
@@ -222,7 +223,7 @@ private:
 #define INVALIDATE_DIR(td) \
     do { \
         getFSSourceAccessor()->invalidateCache(CanonPath((td).path().string())); \
-        clearStatHashMemoryCache(); \
+        clearStatHashStore(); \
     } while (0)
 
 // ── Attr path helpers ───────────────────────────────────────────────
@@ -385,7 +386,7 @@ protected:
     void invalidateFileCache(const std::filesystem::path & path)
     {
         getFSSourceAccessor()->invalidateCache(CanonPath(path.string()));
-        clearStatHashMemoryCache();
+        clearStatHashStore();
     }
 };
 

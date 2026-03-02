@@ -16,6 +16,7 @@ headers = [ config_pub_h ] + files(
   'eval-trace/deps/hash.hh',
   'eval-trace/deps/interning-pools.hh',
   'eval-trace/deps/recording.hh',
+  'eval-trace/store/stat-hash-store.hh',
   'eval-trace/context.hh',
   'eval-trace/cache/trace-cache.hh',
   'eval-trace/store/attr-vocab-store.hh',

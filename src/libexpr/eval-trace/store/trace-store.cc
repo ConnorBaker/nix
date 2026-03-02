@@ -1,6 +1,7 @@
 #include "nix/expr/eval-trace/store/trace-store.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/store/stat-hash-store.hh"
 #include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/expr/eval-trace/deps/hash.hh"
 #include "nix/expr/eval.hh"
@@ -879,25 +880,25 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabS
 
     // Bulk-load StatHashCache entries into in-memory singleton
     {
-        std::vector<StatHashEntry> entries;
+        StatCacheMap entries;
         auto use(st->queryAllStatHash.use());
         while (use.next()) {
             auto [hashBlob, hashLen] = use.getBlob(7);
             if (hashLen != 32) continue;
-            entries.push_back(StatHashEntry{
-                .path = use.getStr(0),
-                .stat = {
-                    .dev = static_cast<dev_t>(use.getInt(2)),
-                    .ino = static_cast<ino_t>(use.getInt(3)),
-                    .mtime_sec = static_cast<time_t>(use.getInt(4)),
-                    .mtime_nsec = use.getInt(5),
-                    .size = static_cast<off_t>(use.getInt(6)),
-                    .depType = static_cast<DepType>(use.getInt(1)),
-                },
-                .hash = Blake3Hash::fromBlob(hashBlob, hashLen),
-            });
+            entries.emplace(
+                StatCacheKey{use.getStr(0), static_cast<DepType>(use.getInt(1))},
+                StatCacheEntry{
+                    .stat = {
+                        .ino = static_cast<ino_t>(use.getInt(3)),
+                        .mtime_sec = static_cast<time_t>(use.getInt(4)),
+                        .mtime_nsec = use.getInt(5),
+                        .size = static_cast<off_t>(use.getInt(6)),
+                        .dev = static_cast<dev_t>(use.getInt(2)),
+                    },
+                    .hash = Blake3Hash::fromBlob(hashBlob, hashLen),
+                });
         }
-        loadStatHashEntries(std::move(entries));
+        loadStatHashStore(std::move(entries));
     }
 
     // Bulk-load all interned entities into in-memory maps.
@@ -976,10 +977,10 @@ TraceStore::~TraceStore()
     try {
         auto st(_state->lock());
         vocab.flushTo(st->insertVocabName, st->insertVocabPath);
-        forEachDirtyStatHash([&](const StatHashEntry & e) {
+        forEachDirtyStatHashEntry([&](const StatCacheKey & key, const StatCacheEntry & e) {
             st->upsertStatHash.use()
-                (e.path)
-                (static_cast<int64_t>(std::to_underlying(e.stat.depType)))
+                (key.path)
+                (static_cast<int64_t>(std::to_underlying(key.depType)))
                 (static_cast<int64_t>(e.stat.dev))
                 (static_cast<int64_t>(e.stat.ino))
                 (e.stat.mtime_sec)

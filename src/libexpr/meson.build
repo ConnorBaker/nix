@@ -163,6 +163,7 @@ sources = files(
   'eval-trace/store/trace-store.cc',
   'eval-trace/deps/hash.cc',
   'eval-trace/deps/recording.cc',
+  'eval-trace/store/stat-hash-store.cc',
   'eval-error.cc',
   'eval-gc.cc',
   'eval-profiler-settings.cc',
