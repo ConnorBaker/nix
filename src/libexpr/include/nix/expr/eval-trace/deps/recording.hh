@@ -12,9 +12,6 @@ extern Counter nrDepTrackerScopes;
 extern Counter nrExcludeChildRangeCalls;
 } // namespace nix::eval_trace
 
-#include <sys/types.h>
-
-#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -243,23 +240,6 @@ Blake3Hash depHashPath(const SourcePath & path);
 Blake3Hash depHashDirListing(const SourceAccessor::DirEntries & entries);
 
 /**
- * Stat-cached Content hash: looks up the physical file's stat metadata in
- * the persistent stat-hash cache before falling back to depHash(readFile()).
- */
-Blake3Hash depHashFile(const SourcePath & path);
-
-/**
- * Stat-cached NARContent hash: like depHashPath() but checks stat cache first.
- */
-Blake3Hash depHashPathCached(const SourcePath & path);
-
-/**
- * Stat-cached Directory hash: like depHashDirListing() but checks stat cache
- * for the directory's own stat metadata first.
- */
-Blake3Hash depHashDirListingCached(const SourcePath & path, const SourceAccessor::DirEntries & entries);
-
-/**
  * Resolve an absolute path to an (inputName, relativePath) pair using
  * a mount-point-to-input mapping. Walks up the path trying each prefix.
  */
@@ -342,12 +322,6 @@ class EvalState;
 std::pair<std::string, std::string> resolveProvenance(
     const CanonPath & absPath,
     const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
-
-/**
- * Clear the in-memory (L1) stat-hash cache. Used by tests to force
- * re-hashing after modifying files.
- */
-void clearStatHashMemoryCache();
 
 /**
  * Provenance information for a container Value (attrset or list) produced
@@ -521,52 +495,5 @@ void clearPrecomputedKeysMap();
  * No-op if dep tracking is inactive or value is not a container.
  */
 [[gnu::cold]] void maybeRecordTypeDep(const PosTable & positions, const Value & v);
-
-/**
- * Stat metadata used as a cache key: if these fields match, the file
- * hasn't changed and the cached hash is still valid. Field types match
- * the POSIX stat struct. Used as the L1 cache key in StatHashCache and
- * embedded in StatHashEntry for the L2/SQLite round-trip.
- */
-struct StatHashKey {
-    dev_t dev;
-    ino_t ino;
-    time_t mtime_sec;
-    int64_t mtime_nsec;
-    off_t size;
-    DepType depType;
-
-    bool operator==(const StatHashKey &) const = default;
-
-    struct Hash {
-        std::size_t operator()(const StatHashKey & k) const noexcept
-        {
-            return hashValues(k.dev, k.ino, k.mtime_sec, k.mtime_nsec, k.size, std::to_underlying(k.depType));
-        }
-    };
-};
-
-/**
- * Entry for bulk-loading/flushing the stat-hash cache between
- * TraceStore (SQLite owner) and the in-memory StatHashCache singleton.
- * The int64_t cast for SQLite binding happens at the TraceStore boundary.
- */
-struct StatHashEntry {
-    std::string path;
-    StatHashKey stat;
-    Blake3Hash hash;
-};
-
-/**
- * Bulk-load entries from TraceStore's SQLite into the in-memory
- * StatHashCache L2 map. Called once during TraceStore construction.
- */
-void loadStatHashEntries(std::vector<StatHashEntry> entries);
-
-/**
- * Iterate dirty (newly-stored) stat-hash entries for TraceStore to
- * flush back to its SQLite StatHashCache table during destruction.
- */
-void forEachDirtyStatHash(std::function<void(const StatHashEntry &)> callback);
 
 } // namespace nix
