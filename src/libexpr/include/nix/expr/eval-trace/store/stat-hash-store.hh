@@ -13,9 +13,9 @@
 
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace nix {
 
@@ -106,10 +106,10 @@ struct StatHashStore
     void load(Map entries);
 
     /**
-     * Iterate dirty (newly-stored) entries for TraceStore to flush back
+     * Extract dirty (newly-stored) entries for TraceStore to flush back
      * to its SQLite StatHashCache table during destruction.
      */
-    void forEachDirty(std::function<void(const Key &, const Value &)> callback);
+    Map takeDirty();
 
     /**
      * Stat-cached Content hash: looks up the physical file's stat metadata in
@@ -131,6 +131,8 @@ struct StatHashStore
 private:
     Map cache;
     Map dirtyEntries;
+
+    Blake3Hash cachedHash(const SourcePath & path, DepType depType, auto && computeHash);
 
     StatHashStore() = default;
     ~StatHashStore() = default;

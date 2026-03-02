@@ -977,7 +977,7 @@ TraceStore::~TraceStore()
     try {
         auto st(_state->lock());
         vocab.flushTo(st->insertVocabName, st->insertVocabPath);
-        StatHashStore::instance().forEachDirty([&](const StatHashStore::Key & key, const StatHashStore::Value & v) {
+        for (auto & [key, v] : StatHashStore::instance().takeDirty()) {
             st->upsertStatHash.use()
                 (key.path)
                 (static_cast<int64_t>(std::to_underlying(key.depType)))
@@ -988,7 +988,7 @@ TraceStore::~TraceStore()
                 (static_cast<int64_t>(v.stat.size))
                 (v.hash.data(), v.hash.size())
                 .exec();
-        });
+        }
         if (st->txn)
             st->txn->commit();
     } catch (...) {

@@ -62,61 +62,45 @@ void StatHashStore::clear()
 
 void StatHashStore::load(Map entries)
 {
-    for (auto & [k, e] : entries)
-        cache[k] = std::move(e);
-    debug("stat hash store: loaded %d entries from TraceStore", entries.size());
+    debug("stat hash store: loading %d entries from TraceStore", entries.size());
+    cache.merge(entries);
 }
 
-void StatHashStore::forEachDirty(
-    std::function<void(const Key &, const Value &)> callback)
+StatHashStore::Map StatHashStore::takeDirty()
 {
-    for (auto & [k, e] : dirtyEntries)
-        callback(k, e);
-    dirtyEntries.clear();
+    return std::exchange(dirtyEntries, {});
 }
 
 // ── Stat-cached dep hash functions ──────────────────────────────────
 
-Blake3Hash StatHashStore::depHashFile(const SourcePath & path)
+Blake3Hash StatHashStore::cachedHash(
+    const SourcePath & path, DepType depType, auto && computeHash)
 {
     if (auto physPath = path.getPhysicalPath()) {
-        if (auto result = lookupHash(*physPath, DepType::Content)) {
+        if (auto result = lookupHash(*physPath, depType)) {
             if (result->hash)
                 return *result->hash;
-            auto hash = depHash(path.readFile());
-            storeHash(*physPath, DepType::Content, hash, result->stat);
+            auto hash = computeHash();
+            storeHash(*physPath, depType, hash, result->stat);
             return hash;
         }
     }
-    return depHash(path.readFile());
+    return computeHash();
+}
+
+Blake3Hash StatHashStore::depHashFile(const SourcePath & path)
+{
+    return cachedHash(path, DepType::Content, [&] { return depHash(path.readFile()); });
 }
 
 Blake3Hash StatHashStore::depHashPathCached(const SourcePath & path)
 {
-    if (auto physPath = path.getPhysicalPath()) {
-        if (auto result = lookupHash(*physPath, DepType::NARContent)) {
-            if (result->hash)
-                return *result->hash;
-            auto hash = depHashPath(path);
-            storeHash(*physPath, DepType::NARContent, hash, result->stat);
-            return hash;
-        }
-    }
-    return depHashPath(path);
+    return cachedHash(path, DepType::NARContent, [&] { return depHashPath(path); });
 }
 
 Blake3Hash StatHashStore::depHashDirListingCached(const SourcePath & path, const SourceAccessor::DirEntries & entries)
 {
-    if (auto physPath = path.getPhysicalPath()) {
-        if (auto result = lookupHash(*physPath, DepType::Directory)) {
-            if (result->hash)
-                return *result->hash;
-            auto hash = depHashDirListing(entries);
-            storeHash(*physPath, DepType::Directory, hash, result->stat);
-            return hash;
-        }
-    }
-    return depHashDirListing(entries);
+    return cachedHash(path, DepType::Directory, [&] { return depHashDirListing(entries); });
 }
 
 } // namespace nix
