@@ -100,8 +100,8 @@ struct StatHashStore
     void clear();
 
     /**
-     * Bulk-load entries from TraceStore's SQLite into the in-memory cache.
-     * Called once during TraceStore construction.
+     * Bulk-load entries into the in-memory cache.
+     * Called by TraceStore after ATTACHing the DB.
      */
     void load(Map entries);
 
@@ -110,6 +110,14 @@ struct StatHashStore
      * to its SQLite StatHashCache table during destruction.
      */
     Map takeDirty();
+
+    /// Return the path to the stat-hash SQLite database file.
+    /// Computed from the current cache directory (handles per-test overrides).
+    std::filesystem::path getDbPath() const;
+
+    /// Create the DB file and schema at getDbPath() (idempotent).
+    /// Called by TraceStore before ATTACHing.
+    void ensureSchema();
 
     /**
      * Stat-cached Content hash: looks up the physical file's stat metadata in

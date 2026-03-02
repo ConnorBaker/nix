@@ -702,20 +702,6 @@ static const char * schema = R"sql(
 
 )sql";
 
-static const char * statHashSchema = R"sql(
-    CREATE TABLE IF NOT EXISTS stat_cache.StatHashCache (
-        path       TEXT NOT NULL,
-        dep_type   INTEGER NOT NULL,
-        dev        INTEGER NOT NULL,
-        ino        INTEGER NOT NULL,
-        mtime_sec  INTEGER NOT NULL,
-        mtime_nsec INTEGER NOT NULL,
-        size       INTEGER NOT NULL,
-        hash       BLOB NOT NULL,
-        PRIMARY KEY (path, dep_type)
-    ) STRICT;
-)sql";
-
 // ── Constructor / Destructor ─────────────────────────────────────────
 
 TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabStore & vocab, int64_t contextHash)
@@ -757,8 +743,11 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabS
             }
             return out;
         };
+        auto & statStore = StatHashStore::instance();
+        statStore.ensureSchema();
+
         auto vocabPath = quotePath(vocab.getDbPath().string());
-        auto statPath = quotePath((cacheDir / "stat-hash-cache.sqlite").string());
+        auto statPath = quotePath(statStore.getDbPath().string());
 
         st->db.exec("ATTACH DATABASE '" + vocabPath + "' AS vocab");
         st->db.exec("ATTACH DATABASE '" + statPath + "' AS stat_cache");
@@ -771,9 +760,8 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabS
         st->db.exec("PRAGMA vocab.synchronous = off");
         st->db.exec("PRAGMA stat_cache.synchronous = off");
 
-        // Create stat_cache schema (idempotent). The vocab schema is already
-        // created by the AttrVocabStore constructor's one-shot connection.
-        st->db.exec(statHashSchema);
+        // Both schemas are already created by their respective constructors'
+        // one-shot connections (AttrVocabStore, StatHashStore).
     }
 
     // Strings — bulk load + explicit-ID insert (no UPSERT)
@@ -864,10 +852,6 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabS
         "INSERT OR IGNORE INTO vocab.AttrPaths(id, parent, child) VALUES (?, ?, ?)");
 
     // StatHashCache (on ATTACH'd stat_cache.* schema)
-    st->queryAllStatHash.create(st->db,
-        "SELECT path, dep_type, dev, ino, mtime_sec, mtime_nsec, size, hash "
-        "FROM stat_cache.StatHashCache");
-
     st->upsertStatHash.create(st->db,
         "INSERT INTO stat_cache.StatHashCache (path, dep_type, dev, ino, mtime_sec, mtime_nsec, size, hash) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
@@ -880,8 +864,13 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabS
 
     // Bulk-load StatHashCache entries into in-memory singleton
     {
+        SQLiteStmt queryAllStatHash;
+        queryAllStatHash.create(st->db,
+            "SELECT path, dep_type, dev, ino, mtime_sec, mtime_nsec, size, hash "
+            "FROM stat_cache.StatHashCache");
+
         StatHashStore::Map entries;
-        auto use(st->queryAllStatHash.use());
+        auto use(queryAllStatHash.use());
         while (use.next()) {
             auto [hashBlob, hashLen] = use.getBlob(7);
             if (hashLen != 32) continue;

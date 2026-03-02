@@ -99,7 +99,6 @@ struct TraceStore {
         SQLiteStmt getAllDirSets;
 
         // StatHashStore (stat-hash persistence, on stat_cache.* schema)
-        SQLiteStmt queryAllStatHash;
         SQLiteStmt upsertStatHash;
 
         // Vocab (on vocab.* schema, ATTACH'd from attr-vocab.sqlite)
