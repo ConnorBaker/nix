@@ -20,91 +20,120 @@
 namespace nix {
 
 /**
- * Stat metadata used for cache validation: if these fields match, the file
- * hasn't changed and the cached hash is still valid. Field types match
- * the POSIX stat struct.
+ * Process-global singleton cache mapping (path, depType) → (stat fingerprint, BLAKE3 hash).
+ * On lookup, validates the cached entry's stat metadata against a fresh lstat;
+ * a cache hit means the file hasn't changed and the stored hash is still valid.
  */
-// Fields ordered largest-alignment-first to minimize padding.
-struct FileFingerprint {
-    ino_t ino;
-    time_t mtime_sec;
-    int64_t mtime_nsec;
-    off_t size;
-    dev_t dev;
+struct StatHashStore
+{
+    /**
+     * Stat metadata used for cache validation: if these fields match, the file
+     * hasn't changed and the cached hash is still valid. Field types match
+     * the POSIX stat struct.
+     */
+    // Fields ordered largest-alignment-first to minimize padding.
+    struct FileFingerprint {
+        ino_t ino;
+        time_t mtime_sec;
+        int64_t mtime_nsec;
+        off_t size;
+        dev_t dev;
 
-    bool operator==(const FileFingerprint &) const = default;
-};
+        bool operator==(const FileFingerprint &) const = default;
 
-/**
- * Cache key: (path, depType). One entry per unique (path, depType) pair.
- */
-struct StatCacheKey {
-    std::string path;
-    DepType depType;
+        static FileFingerprint fromStat(const PosixStat & st)
+        {
+            auto [sec, nsec] = [&](auto & s) {
+                if constexpr (requires { s.st_mtimespec; })
+                    return std::pair{s.st_mtimespec.tv_sec, s.st_mtimespec.tv_nsec};
+                else
+                    return std::pair{s.st_mtim.tv_sec, s.st_mtim.tv_nsec};
+            }(st);
+            return {
+                .ino = st.st_ino,
+                .mtime_sec = sec,
+                .mtime_nsec = nsec,
+                .size = st.st_size,
+                .dev = st.st_dev,
+            };
+        }
+    };
 
-    bool operator==(const StatCacheKey &) const = default;
+    /**
+     * Cache key: (path, depType). One entry per unique (path, depType) pair.
+     */
+    struct Key {
+        std::string path;
+        DepType depType;
 
-    struct Hash {
-        std::size_t operator()(const StatCacheKey & k) const noexcept
+        bool operator==(const Key &) const = default;
+
+        friend std::size_t hash_value(const Key & k) noexcept
         {
             return hashValues(k.path, std::to_underlying(k.depType));
         }
     };
+
+    /**
+     * Cache value: validated stat fingerprint + cached BLAKE3 hash.
+     */
+    struct Value {
+        FileFingerprint stat;
+        Blake3Hash hash;
+    };
+
+    using Map = boost::unordered_flat_map<Key, Value>;
+
+    struct LookupResult {
+        PosixStat stat;
+        std::optional<Blake3Hash> hash;
+    };
+
+    static StatHashStore & instance();
+
+    std::optional<LookupResult> lookupHash(const std::filesystem::path & physPath, DepType type);
+
+    void storeHash(
+        const std::filesystem::path & physPath, DepType type,
+        const Blake3Hash & hash, std::optional<PosixStat> st = std::nullopt);
+
+    void clear();
+
+    /**
+     * Bulk-load entries from TraceStore's SQLite into the in-memory cache.
+     * Called once during TraceStore construction.
+     */
+    void load(Map entries);
+
+    /**
+     * Iterate dirty (newly-stored) entries for TraceStore to flush back
+     * to its SQLite StatHashCache table during destruction.
+     */
+    void forEachDirty(std::function<void(const Key &, const Value &)> callback);
+
+    /**
+     * Stat-cached Content hash: looks up the physical file's stat metadata in
+     * the persistent stat-hash store before falling back to depHash(readFile()).
+     */
+    Blake3Hash depHashFile(const SourcePath & path);
+
+    /**
+     * Stat-cached NARContent hash: like depHashPath() but checks stat store first.
+     */
+    Blake3Hash depHashPathCached(const SourcePath & path);
+
+    /**
+     * Stat-cached Directory hash: like depHashDirListing() but checks stat store
+     * for the directory's own stat metadata first.
+     */
+    Blake3Hash depHashDirListingCached(const SourcePath & path, const SourceAccessor::DirEntries & entries);
+
+private:
+    Map cache;
+    Map dirtyEntries;
+
+    StatHashStore() = default;
+    ~StatHashStore() = default;
 };
-
-/**
- * Cache entry: validated stat fingerprint + cached BLAKE3 hash.
- */
-struct StatCacheEntry {
-    FileFingerprint stat;
-    Blake3Hash hash;
-};
-
-using StatCacheMap = boost::unordered_flat_map<StatCacheKey, StatCacheEntry, StatCacheKey::Hash>;
-
-/**
- * Bulk-load entries from TraceStore's SQLite into the in-memory
- * StatHashStore. Called once during TraceStore construction.
- */
-void loadStatHashStore(StatCacheMap entries);
-
-/**
- * Iterate dirty (newly-stored) stat-hash entries for TraceStore to
- * flush back to its SQLite StatHashCache table during destruction.
- */
-void forEachDirtyStatHashEntry(
-    std::function<void(const StatCacheKey &, const StatCacheEntry &)> callback);
-
-/**
- * Store a hash in the stat-hash store for the given path and dep type.
- * Performs an lstat if no stat metadata is provided. Best-effort: silently
- * returns if the path cannot be stat'd.
- */
-void storeStatHash(
-    const std::filesystem::path & physPath, DepType depType,
-    const Blake3Hash & hash, std::optional<PosixStat> stat = std::nullopt);
-
-/**
- * Clear the in-memory stat-hash store. Used by tests to force
- * re-hashing after modifying files.
- */
-void clearStatHashStore();
-
-/**
- * Stat-cached Content hash: looks up the physical file's stat metadata in
- * the persistent stat-hash store before falling back to depHash(readFile()).
- */
-Blake3Hash depHashFile(const SourcePath & path);
-
-/**
- * Stat-cached NARContent hash: like depHashPath() but checks stat store first.
- */
-Blake3Hash depHashPathCached(const SourcePath & path);
-
-/**
- * Stat-cached Directory hash: like depHashDirListing() but checks stat store
- * for the directory's own stat metadata first.
- */
-Blake3Hash depHashDirListingCached(const SourcePath & path, const SourceAccessor::DirEntries & entries);
 
 } // namespace nix

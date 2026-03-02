@@ -147,7 +147,7 @@ static std::optional<DepHashValue> computeCurrentHash(
         auto path = resolveDepPath(dep, inputAccessors);
         if (!path) return std::nullopt;
         try {
-            return DepHashValue(depHashFile(*path));
+            return DepHashValue(StatHashStore::instance().depHashFile(*path));
         } catch (std::exception &) {
             return std::nullopt;
         }
@@ -156,7 +156,7 @@ static std::optional<DepHashValue> computeCurrentHash(
         auto path = resolveDepPath(dep, inputAccessors);
         if (!path) return std::nullopt;
         try {
-            return DepHashValue(depHashPathCached(*path));
+            return DepHashValue(StatHashStore::instance().depHashPathCached(*path));
         } catch (std::exception &) {
             return std::nullopt;
         }
@@ -165,7 +165,7 @@ static std::optional<DepHashValue> computeCurrentHash(
         auto path = resolveDepPath(dep, inputAccessors);
         if (!path) return std::nullopt;
         try {
-            return DepHashValue(depHashDirListingCached(*path, path->readDirectory()));
+            return DepHashValue(StatHashStore::instance().depHashDirListingCached(*path, path->readDirectory()));
         } catch (std::exception &) {
             return std::nullopt;
         }
@@ -880,14 +880,14 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabS
 
     // Bulk-load StatHashCache entries into in-memory singleton
     {
-        StatCacheMap entries;
+        StatHashStore::Map entries;
         auto use(st->queryAllStatHash.use());
         while (use.next()) {
             auto [hashBlob, hashLen] = use.getBlob(7);
             if (hashLen != 32) continue;
             entries.emplace(
-                StatCacheKey{use.getStr(0), static_cast<DepType>(use.getInt(1))},
-                StatCacheEntry{
+                StatHashStore::Key{use.getStr(0), static_cast<DepType>(use.getInt(1))},
+                StatHashStore::Value{
                     .stat = {
                         .ino = static_cast<ino_t>(use.getInt(3)),
                         .mtime_sec = static_cast<time_t>(use.getInt(4)),
@@ -898,7 +898,7 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabS
                     .hash = Blake3Hash::fromBlob(hashBlob, hashLen),
                 });
         }
-        loadStatHashStore(std::move(entries));
+        StatHashStore::instance().load(std::move(entries));
     }
 
     // Bulk-load all interned entities into in-memory maps.
@@ -977,16 +977,16 @@ TraceStore::~TraceStore()
     try {
         auto st(_state->lock());
         vocab.flushTo(st->insertVocabName, st->insertVocabPath);
-        forEachDirtyStatHashEntry([&](const StatCacheKey & key, const StatCacheEntry & e) {
+        StatHashStore::instance().forEachDirty([&](const StatHashStore::Key & key, const StatHashStore::Value & v) {
             st->upsertStatHash.use()
                 (key.path)
                 (static_cast<int64_t>(std::to_underlying(key.depType)))
-                (static_cast<int64_t>(e.stat.dev))
-                (static_cast<int64_t>(e.stat.ino))
-                (e.stat.mtime_sec)
-                (e.stat.mtime_nsec)
-                (static_cast<int64_t>(e.stat.size))
-                (e.hash.data(), e.hash.size())
+                (static_cast<int64_t>(v.stat.dev))
+                (static_cast<int64_t>(v.stat.ino))
+                (v.stat.mtime_sec)
+                (v.stat.mtime_nsec)
+                (static_cast<int64_t>(v.stat.size))
+                (v.hash.data(), v.hash.size())
                 .exec();
         });
         if (st->txn)

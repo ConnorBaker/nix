@@ -190,7 +190,7 @@ TEST_F(TraceStoreTest, CoveredSC_HasKeyMismatch_MaskedByContentDep)
     TempJsonFile file(R"({"x": 1, "y": 2})");
     auto filePath = file.path.string();
 
-    auto contentHash = depHashFile(
+    auto contentHash = StatHashStore::instance().depHashFile(
         state.rootPath(CanonPath(filePath)));
 
     auto scDepKey = makeJsonDepKey(filePath, "j", nlohmann::json::array(), "", "_type");

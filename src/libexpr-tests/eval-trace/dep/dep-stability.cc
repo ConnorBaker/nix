@@ -358,7 +358,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
 
     // Record "x" trace with Content dep on the data file + ParentContext on ROOT
     auto xPathId = vpath({"x"});
-    auto fileHash = depHashFile(
+    auto fileHash = StatHashStore::instance().depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
     std::vector<Dep> xDeps = {
         {DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string()), DepHashValue(fileHash)},
@@ -383,7 +383,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
     // Change the data file
     dataFile.modify("13");
     getFSSourceAccessor()->invalidateCache(CanonPath(dataFile.path.string()));
-    clearStatHashStore();
+    StatHashStore::instance().clear();
 
     // After file change: y should FAIL verification
     // Chain: y → ParentContext(x) → verify(x) → Content(file) changed → FAIL
@@ -405,7 +405,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_NoChange_StillValid)
     ASSERT_TRUE(rootHash.has_value());
 
     auto xPathId = vpath({"x"});
-    auto fileHash = depHashFile(
+    auto fileHash = StatHashStore::instance().depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
     db.record(xPathId, CachedResult(int_t{NixInt(42)}),
         {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string()), DepHashValue(fileHash)},
@@ -444,7 +444,7 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
 
     // x: Content dep on the data file + ParentContext on ROOT
     auto xPathId = vpath({"x"});
-    auto fileHash = depHashFile(
+    auto fileHash = StatHashStore::instance().depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
     db.record(xPathId, CachedResult(string_t{"x_v1", {}}),
         {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string()), DepHashValue(fileHash)},
@@ -466,7 +466,7 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
     // Change the file that x depends on
     dataFile.modify("content_v2");
     getFSSourceAccessor()->invalidateCache(CanonPath(dataFile.path.string()));
-    clearStatHashStore();
+    StatHashStore::instance().clear();
     db.clearSessionCaches();
 
     // Verify y after change — must FAIL
@@ -500,7 +500,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     ASSERT_TRUE(rootTraceHash.has_value());
 
     // "x" trace: Content dep on depA file + ParentContext on ROOT
-    auto depAHash = depHashFile(
+    auto depAHash = StatHashStore::instance().depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(depAFile.path.string())));
     auto xPathId = vpath({"x"});
     db.record(xPathId, CachedResult(int_t{NixInt(11)}),
@@ -511,7 +511,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     ASSERT_TRUE(xTraceHash.has_value());
 
     // "z" trace: Content dep on depB file + ParentContext on ROOT
-    auto depBHash = depHashFile(
+    auto depBHash = StatHashStore::instance().depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(depBFile.path.string())));
     auto zPathId = vpath({"z"});
     db.record(zPathId, CachedResult(int_t{NixInt(99)}),
@@ -528,7 +528,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     // Simulate lockfile change: depB changes, depA stays the same.
     depBFile.modify("{ z = 100; }");
     getFSSourceAccessor()->invalidateCache(CanonPath(depBFile.path.string()));
-    clearStatHashStore();
+    StatHashStore::instance().clear();
     db.clearSessionCaches();
 
     // y should still verify — y depends on x, x depends on depA, depA is unchanged

@@ -28,8 +28,8 @@ TEST_F(StatCachedHashTest, DepHashFile_Deterministic)
     TempTestFile f("hello world");
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    auto h1 = depHashFile(path);
-    auto h2 = depHashFile(path);
+    auto h1 = StatHashStore::instance().depHashFile(path);
+    auto h2 = StatHashStore::instance().depHashFile(path);
     EXPECT_EQ(h1, h2);
 }
 
@@ -38,7 +38,7 @@ TEST_F(StatCachedHashTest, DepHashFile_MatchesRawHash)
     TempTestFile f("hello world");
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    auto cached = depHashFile(path);
+    auto cached = StatHashStore::instance().depHashFile(path);
     auto raw = depHash("hello world");
     EXPECT_EQ(cached, raw);
 }
@@ -49,9 +49,9 @@ TEST_F(StatCachedHashTest, DepHashFile_CachedOnSecondCall)
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
     // First call computes and caches
-    auto h1 = depHashFile(path);
+    auto h1 = StatHashStore::instance().depHashFile(path);
     // Second call should use stat-cache (same result)
-    auto h2 = depHashFile(path);
+    auto h2 = StatHashStore::instance().depHashFile(path);
     EXPECT_EQ(h1, h2);
 }
 
@@ -60,14 +60,14 @@ TEST_F(StatCachedHashTest, DepHashFile_DetectsModification)
     TempTestFile f("original");
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    auto h1 = depHashFile(path);
+    auto h1 = StatHashStore::instance().depHashFile(path);
 
     // Modify with different-sized content to ensure stat metadata changes
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     f.modify("modified content!!!");
     getFSSourceAccessor()->invalidateCache(CanonPath(f.path.string()));
 
-    auto h2 = depHashFile(path);
+    auto h2 = StatHashStore::instance().depHashFile(path);
     EXPECT_NE(h1, h2);
     EXPECT_EQ(h2, depHash("modified content!!!"));
 }
@@ -79,7 +79,7 @@ TEST_F(StatCachedHashTest, DepHashFile_DifferentFiles)
     auto p1 = SourcePath(getFSSourceAccessor(), CanonPath(f1.path.string()));
     auto p2 = SourcePath(getFSSourceAccessor(), CanonPath(f2.path.string()));
 
-    EXPECT_NE(depHashFile(p1), depHashFile(p2));
+    EXPECT_NE(StatHashStore::instance().depHashFile(p1), StatHashStore::instance().depHashFile(p2));
 }
 
 // ── depHashPathCached: stat-cached NARContent oracle hash ────────────
@@ -89,8 +89,8 @@ TEST_F(StatCachedHashTest, DepHashPathCached_Deterministic)
     TempTestFile f("nar test");
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    auto h1 = depHashPathCached(path);
-    auto h2 = depHashPathCached(path);
+    auto h1 = StatHashStore::instance().depHashPathCached(path);
+    auto h2 = StatHashStore::instance().depHashPathCached(path);
     EXPECT_EQ(h1, h2);
 }
 
@@ -99,7 +99,7 @@ TEST_F(StatCachedHashTest, DepHashPathCached_MatchesUncached)
     TempTestFile f("nar content");
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
-    auto cached = depHashPathCached(path);
+    auto cached = StatHashStore::instance().depHashPathCached(path);
     auto uncached = depHashPath(path);
     EXPECT_EQ(cached, uncached);
 }
@@ -110,8 +110,8 @@ TEST_F(StatCachedHashTest, DepHashPathCached_DiffersFromContentHash)
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
 
     // NARContent hash includes NAR header/metadata, so it differs from raw Content hash
-    auto narHash = depHashPathCached(path);
-    auto contentHash = depHashFile(path);
+    auto narHash = StatHashStore::instance().depHashPathCached(path);
+    auto contentHash = StatHashStore::instance().depHashFile(path);
     EXPECT_NE(narHash, contentHash);
 }
 
@@ -128,8 +128,8 @@ TEST_F(StatCachedHashTest, DepHashDirListingCached_Deterministic)
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(dir.string()));
     auto entries = path.readDirectory();
 
-    auto h1 = depHashDirListingCached(path, entries);
-    auto h2 = depHashDirListingCached(path, entries);
+    auto h1 = StatHashStore::instance().depHashDirListingCached(path, entries);
+    auto h2 = StatHashStore::instance().depHashDirListingCached(path, entries);
     EXPECT_EQ(h1, h2);
 
     std::filesystem::remove_all(dir);
@@ -145,7 +145,7 @@ TEST_F(StatCachedHashTest, DepHashDirListingCached_MatchesUncached)
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(dir.string()));
     auto entries = path.readDirectory();
 
-    auto cached = depHashDirListingCached(path, entries);
+    auto cached = StatHashStore::instance().depHashDirListingCached(path, entries);
     auto uncached = depHashDirListing(entries);
     EXPECT_EQ(cached, uncached);
 

@@ -223,7 +223,7 @@ private:
 #define INVALIDATE_DIR(td) \
     do { \
         getFSSourceAccessor()->invalidateCache(CanonPath((td).path().string())); \
-        clearStatHashStore(); \
+        StatHashStore::instance().clear(); \
     } while (0)
 
 // ── Attr path helpers ───────────────────────────────────────────────
@@ -386,7 +386,7 @@ protected:
     void invalidateFileCache(const std::filesystem::path & path)
     {
         getFSSourceAccessor()->invalidateCache(CanonPath(path.string()));
-        clearStatHashStore();
+        StatHashStore::instance().clear();
     }
 };
 
