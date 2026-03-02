@@ -7,7 +7,6 @@
 #include "nix/expr/get-drvs.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
-#include "nix/expr/eval-cache.hh"
 #include "nix/expr/attr-path.hh"
 #include "nix/util/hilite.hh"
 #include "nix/util/strings-inline.hh"
@@ -90,29 +89,45 @@ struct CmdSearch : InstallableValueCommand, MixJSON
 
         uint64_t results = 0;
 
-        std::function<void(eval_cache::AttrCursor & cursor, const AttrPath & attrPath, bool initialRecurse)> visit;
+        std::function<void(Value & v, const AttrPath & attrPath, bool initialRecurse)> visit;
 
-        visit = [&](eval_cache::AttrCursor & cursor, const AttrPath & attrPath, bool initialRecurse) {
+        visit = [&](Value & v, const AttrPath & attrPath, bool initialRecurse) {
             auto attrPathS = state->symbols.resolve({attrPath});
             auto attrPathStr = attrPath.to_string(*state);
 
             Activity act(*logger, lvlInfo, actUnknown, fmt("evaluating '%s'", attrPathStr));
             try {
+                state->forceValue(v, noPos);
+                if (v.type() != nAttrs)
+                    return;
+
                 auto recurse = [&]() {
-                    for (const auto & attr : cursor.getAttrs()) {
-                        auto cursor2 = cursor.getAttr(state->symbols[attr]);
+                    for (auto & attr : *v.attrs()) {
                         auto attrPath2(attrPath);
-                        attrPath2.push_back(attr);
-                        visit(*cursor2, attrPath2, false);
+                        attrPath2.push_back(attr.name);
+                        visit(*attr.value, attrPath2, false);
                     }
                 };
 
-                if (cursor.isDerivation()) {
-                    DrvName name(cursor.getAttr(state->s.name)->getString());
+                if (state->isDerivation(v)) {
+                    auto * aName = v.attrs()->get(state->s.name);
+                    if (!aName) return;
+                    state->forceValue(*aName->value, aName->pos);
+                    DrvName name(std::string(aName->value->string_view()));
 
-                    auto aMeta = cursor.maybeGetAttr(state->s.meta);
-                    auto aDescription = aMeta ? aMeta->maybeGetAttr(state->s.description) : nullptr;
-                    auto description = aDescription ? aDescription->getString() : "";
+                    std::string description;
+                    auto * aMeta = v.attrs()->get(state->s.meta);
+                    if (aMeta) {
+                        state->forceValue(*aMeta->value, aMeta->pos);
+                        if (aMeta->value->type() == nAttrs) {
+                            auto * aDesc = aMeta->value->attrs()->get(state->s.description);
+                            if (aDesc) {
+                                state->forceValue(*aDesc->value, aDesc->pos);
+                                if (aDesc->value->type() == nString)
+                                    description = std::string(aDesc->value->string_view());
+                            }
+                        }
+                    }
                     std::replace(description.begin(), description.end(), '\n', ' ');
 
                     std::vector<std::smatch> attrPathMatches;
@@ -175,9 +190,12 @@ struct CmdSearch : InstallableValueCommand, MixJSON
                     recurse();
 
                 else if (attrPathS[0] == "legacyPackages" && attrPath.size() > 2) {
-                    auto attr = cursor.maybeGetAttr(state->s.recurseForDerivations);
-                    if (attr && attr->getBool())
-                        recurse();
+                    auto * attr = v.attrs()->get(state->s.recurseForDerivations);
+                    if (attr) {
+                        state->forceValue(*attr->value, attr->pos);
+                        if (attr->value->type() == nBool && attr->value->boolean())
+                            recurse();
+                    }
                 }
 
             } catch (EvalError & e) {
@@ -186,8 +204,9 @@ struct CmdSearch : InstallableValueCommand, MixJSON
             }
         };
 
-        for (auto & cursor : installable->getCursors(*state))
-            visit(*cursor, cursor->getAttrPath(), true);
+        auto [vp, pos] = installable->toValue(*state);
+        state->forceValue(*vp, pos);
+        visit(*vp, {}, true);
 
         if (json)
             printJSON(*jsonOut);

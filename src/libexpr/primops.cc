@@ -3,6 +3,8 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/data/traced-data.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/expr/json-to-value.hh"
 #include "nix/expr/static-string-data.hh"
@@ -510,6 +512,13 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
     }
 
     auto output = runProgram(program, true, toOsStrings(std::move(commandArgs)));
+
+    // Record Exec oracle dep for the eval trace (Shake-style: always dirty
+    // since we cannot safely re-execute the program during verification).
+    if (state.traceActiveDepth) [[unlikely]] {
+        DependencyTracker::record(*state.traceCtx->pools, DepType::Exec, "<exec>", program, depHash(program + "\0" + output));
+    }
+
     Expr * parsed;
     try {
         parsed = state.parseExprFromString(std::move(output), state.rootPath(CanonPath::root));
@@ -531,6 +540,7 @@ void prim_exec(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 static void prim_typeOf(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordTypeDep(state.positions, *args[0]);
     switch (args[0]->type()) {
     case nInt:
         v.mkStringNoCopy("int"_sds);
@@ -752,6 +762,10 @@ struct CompareValues
                 // reproducible way.
                 return v1->pathStrView() < v2->pathStrView();
             case nList:
+                if (state.traceActiveDepth) [[unlikely]] {
+                    maybeRecordListLenDep(*v1);
+                    maybeRecordListLenDep(*v2);
+                }
                 // Lexicographic comparison
                 for (size_t i = 0;; i++) {
                     if (i == v2->listSize()) {
@@ -1215,7 +1229,15 @@ static void prim_getEnv(EvalState & state, const PosIdx pos, Value ** args, Valu
 {
     std::string name(
         state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.getEnv"));
-    v.mkString(state.settings.restrictEval || state.settings.pureEval ? "" : getEnv(name).value_or(""), state.mem);
+    auto value = state.settings.restrictEval || state.settings.pureEval
+        ? "" : getEnv(name).value_or("");
+    v.mkString(value, state.mem);
+
+    // Record EnvVar oracle dep for the eval trace (Shake-style external dependency)
+    if (state.traceActiveDepth && !state.settings.pureEval && !state.settings.restrictEval) {
+        auto hash = depHash(value);
+        DependencyTracker::record(*state.traceCtx->pools, DepType::EnvVar, "", name, hash);
+    }
 }
 
 static RegisterPrimOp primop_getEnv({
@@ -1257,6 +1279,17 @@ static RegisterPrimOp primop_seq({
    attrsets), then return the second argument. */
 static void prim_deepSeq(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
+    // Eval-trace precision note: forceValueDeep iterates attrset keys and
+    // list elements but does NOT call maybeRecordAttrKeysDep or
+    // maybeRecordListLenDep. This means deepSeq does not record shape deps
+    // (#keys, #len) for the containers it traverses.
+    //
+    // This is a precision concern, not a soundness concern: the Content dep
+    // always serves as a backstop. Without SC deps to override it, any file
+    // change triggers re-evaluation (conservative but correct). Recording
+    // shape deps here would allow the two-level override to serve cached
+    // results when only unrelated values change, avoiding unnecessary
+    // re-evaluation.
     state.forceValueDeep(*args[0]);
     state.forceValue(*args[1], pos);
     v = *args[1];
@@ -1324,7 +1357,7 @@ static void prim_warn(EvalState & state, const PosIdx pos, Value ** args, Value 
     }
 
     if (state.settings.builtinsAbortOnWarn) {
-        // Not an EvalError or subclass, which would cause the error to be stored in the eval cache.
+        // Not an EvalError or subclass, which would cause the error to be recorded in the eval trace.
         state.error<EvalBaseError>("aborting to reveal stack trace of warning, as abort-on-warn is set")
             .setIsFromExpr()
             .debugThrow();
@@ -1826,6 +1859,16 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
         settings.readOnlyMode ? computeStorePath(*state.store, drv) : state.store->writeDerivation(drv, state.repair);
     auto drvPathS = state.store->printStorePath(drvPath);
 
+    // Record a StorePathExistence dep for the .drv store path so trace
+    // verification detects GC removal. When the .drv is deleted, this dep
+    // fails ("valid" → "missing"), forcing fresh re-evaluation. Nix's lazy
+    // evaluation ensures input derivations are re-evaluated (and their .drv
+    // files recreated) before the parent calls pathDerivationModulo() on them.
+    if (state.traceActiveDepth) [[unlikely]] {
+        DependencyTracker::record(*state.traceCtx->pools, DepType::StorePathExistence,
+            "", drvPathS, DepHashValue(std::string("valid")));
+    }
+
     printMsg(lvlChatty, "instantiated '%1%' -> '%2%'", drvName, drvPathS);
 
     /* Optimisation, but required in read-only mode! because in that
@@ -1979,6 +2022,18 @@ static void prim_pathExists(EvalState & state, const PosIdx pos, Value ** args, 
 
         auto st = path.maybeLstat();
         auto exists = st && (!mustBeDir || st->type == SourceAccessor::tDirectory);
+
+        // Record Existence oracle dep for trace verification.
+        // We record the file type (not just existence) so that type changes
+        // (e.g. directory -> file) are detected, which matters for mustBeDir
+        // paths like `builtins.pathExists ./foo/`.
+        if (state.traceActiveDepth) [[unlikely]] {
+            DepHashValue hashValue = st
+                ? DepHashValue(fmt("type:%d", static_cast<int>(st->type)))
+                : DepHashValue(std::string("missing"));
+            recordDep(*state.traceCtx->pools,path.path, hashValue, DepType::Existence, state.getMountToInput());
+        }
+
         v.mkBool(exists);
     } catch (RestrictedPathError & e) {
         v.mkBool(false);
@@ -2084,6 +2139,23 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
 {
     auto path = state.realisePath(pos, *args[0]);
     auto s = path.readFile();
+
+    // Record Content oracle dep for trace verification (Adapton DDG edge).
+    // Note: for data files consumed by fromJSON/fromTOML, ReadFileProvenance
+    // enables StructuredContent two-level override — only accessed scalar
+    // values produce deps, so changes to unaccessed parts don't invalidate.
+    // For .nix code (consumed via import/evalFile), Content is the only dep;
+    // no fine-grained override exists. See design.md Section 4.6.
+    std::optional<Blake3Hash> contentHash;
+    if (state.traceActiveDepth) [[unlikely]] {
+        auto hash = depHash(s);
+        recordDep(*state.traceCtx->pools,path.path, hash, DepType::Content, state.getMountToInput());
+        // Set provenance so a subsequent fromJSON/fromTOML can produce lazy
+        // structural deps instead of relying solely on the whole-file Content dep.
+        addReadFileProvenance({path.path, hash});
+        contentHash = hash;
+    }
+
     if (s.find((char) 0) != std::string::npos)
         state.error<EvalError>("the contents of the file '%1%' cannot be represented as a Nix string", path)
             .atPos(pos)
@@ -2107,6 +2179,12 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
             });
     }
     v.mkString(s, context, state.mem);
+
+    // Register string pointer for RawContent tracking. String builtins
+    // (stringLength, hashString, etc.) check this map to record a RawContent
+    // dep that prevents SC two-level override from covering raw byte observations.
+    if (contentHash)
+        addReadFileStringPtr(v.c_str(), *contentHash);
 }
 
 static RegisterPrimOp primop_readFile({
@@ -2318,8 +2396,15 @@ static void prim_hashFile(EvalState & state, const PosIdx pos, Value ** args, Va
         state.error<EvalError>("unknown hash algorithm '%1%'", algo).atPos(pos).debugThrow();
 
     auto path = state.realisePath(pos, *args[1]);
+    auto content = path.readFile();
 
-    v.mkString(hashString(*ha, path.readFile()).to_string(HashFormat::Base16, false), state.mem);
+    // Record Content oracle dep for trace verification (Adapton DDG edge)
+    if (state.traceActiveDepth) [[unlikely]] {
+        auto hash = depHash(content);
+        recordDep(*state.traceCtx->pools,path.path, hash, DepType::Content, state.getMountToInput());
+    }
+
+    v.mkString(hashString(*ha, content).to_string(HashFormat::Base16, false), state.mem);
 }
 
 static RegisterPrimOp primop_hashFile({
@@ -2370,8 +2455,15 @@ static const Value & fileTypeToString(EvalState & state, SourceAccessor::Type ty
 static void prim_readFileType(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto path = state.realisePath(pos, *args[0], std::nullopt);
-    /* Retrieve the directory entry type and stringize it. */
-    v = fileTypeToString(state, path.lstat().type);
+    auto st = path.lstat();
+
+    // Record Existence oracle dep (with file type) for trace verification
+    if (state.traceActiveDepth) [[unlikely]] {
+        recordDep(*state.traceCtx->pools,path.path, DepHashValue(fmt("type:%d", static_cast<int>(st.type))),
+            DepType::Existence, state.getMountToInput());
+    }
+
+    v = fileTypeToString(state, st.type);
 }
 
 static RegisterPrimOp primop_readFileType({
@@ -2384,6 +2476,112 @@ static RegisterPrimOp primop_readFileType({
     .impl = prim_readFileType,
 });
 
+// ── TracedDataNode subclasses for readDir ─────────────────────────────
+// These enable lazy per-entry dep tracking for directory listings, allowing
+// traces to survive directory changes when only specific entries were observed.
+
+namespace {
+
+/**
+ * Scalar leaf node for a single directory entry type.
+ * materializeScalar produces the same string as fileTypeToString.
+ */
+struct DirScalarNode : TracedDataNode {
+    std::optional<SourceAccessor::Type> entryType;
+
+    explicit DirScalarNode(std::optional<SourceAccessor::Type> type)
+        : entryType(type) {}
+
+    Kind kind() const override { return Kind::String; }
+    StructuredFormat formatTag() const override { return StructuredFormat::Directory; }
+    std::vector<std::string> objectKeys() const override { return {}; }
+    TracedDataNode * objectGet(const std::string &) const override { return nullptr; }
+    size_t arraySize() const override { return 0; }
+    TracedDataNode * arrayGet(size_t) const override { return nullptr; }
+
+    void materializeScalar(EvalState & state, Value & v) const override
+    {
+        // Must produce the exact same Value as fileTypeToString
+        if (!entryType) {
+            v.mkStringNoCopy("unknown"_sds);
+            return;
+        }
+        switch (*entryType) {
+        case SourceAccessor::tRegular:
+            v.mkStringNoCopy("regular"_sds);
+            break;
+        case SourceAccessor::tDirectory:
+            v.mkStringNoCopy("directory"_sds);
+            break;
+        case SourceAccessor::tSymlink:
+            v.mkStringNoCopy("symlink"_sds);
+            break;
+        default:
+            v.mkStringNoCopy("unknown"_sds);
+            break;
+        }
+    }
+
+    std::string canonicalValue() const override
+    {
+        return dirEntryTypeString(entryType);
+    }
+};
+
+/**
+ * Root object node representing a directory listing from readDir.
+ * Keys are entry names, values are DirScalarNode leaves.
+ */
+struct DirDataNode : TracedDataNode {
+    SourceAccessor::DirEntries entries;
+
+    explicit DirDataNode(SourceAccessor::DirEntries entries)
+        : entries(std::move(entries)) {}
+
+    Kind kind() const override { return Kind::Object; }
+    StructuredFormat formatTag() const override { return StructuredFormat::Directory; }
+
+    std::vector<std::string> objectKeys() const override
+    {
+        std::vector<std::string> keys;
+        keys.reserve(entries.size());
+        for (auto & [name, _] : entries)
+            keys.push_back(name);
+        return keys;
+    }
+
+    TracedDataNode * objectGet(const std::string & key) const override
+    {
+        auto it = entries.find(key);
+        if (it == entries.end()) return nullptr;
+        return new DirScalarNode(it->second);
+    }
+
+    size_t arraySize() const override { return 0; }
+    TracedDataNode * arrayGet(size_t) const override { return nullptr; }
+    void materializeScalar(EvalState &, Value &) const override {}
+    std::string canonicalValue() const override { return ""; }
+};
+
+} // anonymous namespace
+
+[[gnu::noinline]]
+static bool recordReadDirDep(EvalState & state, const SourcePath & path,
+                             SourceAccessor::DirEntries & entries, Value & v)
+{
+    auto & pools = *state.traceCtx->pools;
+    recordDep(*state.traceCtx->pools,path.path, depHashDirListing(entries), DepType::Directory, state.getMountToInput());
+    if (!std::all_of(entries.begin(), entries.end(), [](auto & e) { return e.second.has_value(); }))
+        return false;
+    auto [depSource, depKey] = resolveProvenance(path.path, state.getMountToInput());
+    auto srcId = pools.intern<DepSourceId>(depSource);
+    auto fpId = pools.filePathPool.intern(depKey);
+    auto * rootNode = new DirDataNode(std::move(entries));
+    auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, pools.dataPathPool.root());
+    rootExpr->eval(state, state.baseEnv, v);
+    return true;
+}
+
 /* Read a directory (without . or ..) */
 static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
@@ -2393,6 +2591,19 @@ static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Val
     // This is similar to `getFileType` but is optimized to reduce system calls
     // on many systems.
     auto entries = path.readDirectory();
+
+    // Record Directory oracle dep for trace verification.
+    // Note: the coarse Directory dep hashes the entire sorted directory listing.
+    // When ExprTracedData wrapping succeeds (below), per-entry StructuredContent
+    // deps can override the coarse dep via two-level verification. When evaluation
+    // enumerates all keys (e.g., mapAttrs over the attrset without forcing values),
+    // no StructuredContent deps are recorded and the coarse dep alone controls
+    // invalidation. See design.md Section 4.6.
+    if (state.traceActiveDepth && recordReadDirDep(state, path, entries, v))
+        return;
+
+    // Eager path: used when eval-trace is inactive or when some entry types
+    // are unknown (rare filesystem case).
     auto attrs = state.buildBindings(entries.size());
 
     // If we hit unknown directory entry types we may need to fallback to
@@ -2631,6 +2842,22 @@ static RegisterPrimOp primop_toJSON({
 static void prim_fromJSON(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto s = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.fromJSON");
+
+    // If the string came directly from readFile (provenance hash matches),
+    // produce lazy traced data with fine-grained StructuredContent deps.
+    if (state.traceActiveDepth) [[unlikely]] {
+        if (auto * prov = lookupReadFileProvenance(depHash(s))) {
+            auto [depSource, depKey] = resolveProvenance(prov->path, state.getMountToInput());
+            try {
+                parseTracedJSON(state, s, v, depSource, depKey);
+                return;
+            } catch (JSONParseError & e) {
+                e.addTrace(state.positions[pos], "while decoding a JSON string");
+                throw;
+            }
+        }
+    }
+
     try {
         parseJSON(state, s, v);
     } catch (JSONParseError & e) {
@@ -2826,17 +3053,77 @@ static void addPath(
         }
 
         std::unique_ptr<PathFilter> filter;
-        if (filterFun)
+        // Must be declared at the same scope as `filter` because the
+        // PathFilter lambda captures it by reference and outlives the
+        // `if (filterFun)` block.
+        bool recordFilterDeps = false;
+        if (filterFun) {
+            // Check once whether we should record per-file oracle deps for
+            // this filtered path (avoid repeated checks in the lambda).
+            recordFilterDeps = state.traceActiveDepth
+                && !state.store->isInStore(path.path.abs());
+
+            // Directory oracle deps for filtered builtins.path / filterSource:
+            //
+            // We record a Directory dep (full listing hash) for each directory
+            // traversed during the filtered copy, including the root. This is
+            // deliberately over-conservative: the hash includes entries the filter
+            // rejects, so adding a file the filter would ignore (e.g. a .log file)
+            // still invalidates the trace during verification.
+            //
+            // Why the full listing is necessary:
+            //   Per-file NARContent deps validate files that were traced at
+            //   recording time, but cannot detect NEW files that appeared later.
+            //   If a new file passes the filter, the result would differ, yet no
+            //   existing NARContent dep would catch it. The Directory dep ensures
+            //   any listing change triggers fresh evaluation (BSàlC: rebuilding).
+            //
+            // Why we can't hash only the filtered listing:
+            //   Trace verification runs before evaluation -- the Nix filter
+            //   function is not available. CopiedPath validation (computeStorePath)
+            //   also can't replicate filtered copies because it computes the
+            //   unfiltered NAR hash.
+            //
+            // Possible future refinements:
+            //   - A FilteredCopiedPath dep that re-runs fetchToStore() with the filter
+            //   - A filtered listing hash that records included entry names and
+            //     conservatively invalidates only when new (unknown) entries appear
+            //   - For builtins.path on large working directories, the root Directory
+            //     dep is inherently fragile (any new file invalidates). Users should
+            //     avoid creating files in the source tree between traced evaluations.
             filter = std::make_unique<PathFilter>([&](const std::string & p) {
                 auto p2 = CanonPath(p);
-                return state.callPathFilter(filterFun, {path.accessor, p2}, pos);
+                SourcePath sp{path.accessor, p2};
+                bool include = state.callPathFilter(filterFun, sp, pos);
+
+                if (include && recordFilterDeps) {
+                    auto st = sp.lstat();
+                    if (st.type == SourceAccessor::tRegular) {
+                        recordDep(*state.traceCtx->pools,sp.path, depHashPath(sp), DepType::NARContent,
+                                  state.getMountToInput());
+                    } else if (st.type == SourceAccessor::tDirectory) {
+                        recordDep(*state.traceCtx->pools,sp.path, depHashDirListing(sp.readDirectory()), DepType::Directory,
+                                  state.getMountToInput());
+                    }
+                    // Symlink target changes are not tracked individually.
+                    // Parent Directory dep captures symlink existence.
+                }
+                return include;
             });
+
+            // Record Directory dep on root directory (filter never sees the root itself).
+            if (recordFilterDeps) {
+                recordDep(*state.traceCtx->pools,path.path, depHashDirListing(path.readDirectory()), DepType::Directory,
+                          state.getMountToInput());
+            }
+        }
 
         std::optional<StorePath> expectedStorePath;
         if (expectedHash)
             expectedStorePath = state.store->makeFixedOutputPathFromCA(
                 name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
 
+        std::string resultStorePath;
         if (!expectedHash || !state.store->isValidPath(*expectedStorePath)) {
             // FIXME: support refs in fetchToStore()?
             auto dstPath = refs.empty() ? fetchToStore(
@@ -2860,9 +3147,21 @@ static void addPath(
                 state.error<EvalError>("store path mismatch in (possibly filtered) path added from '%s'", path)
                     .atPos(pos)
                     .debugThrow();
+            resultStorePath = state.store->printStorePath(dstPath);
             state.allowAndSetStorePathString(dstPath, v);
-        } else
+        } else {
+            resultStorePath = state.store->printStorePath(*expectedStorePath);
             state.allowAndSetStorePathString(*expectedStorePath, v);
+        }
+
+        // Record CopiedPath oracle dep for unfiltered paths only. For filtered
+        // paths, per-file Content + Directory deps were already recorded in the
+        // PathFilter lambda above (more granular, avoids expensive unfiltered NAR hash).
+        if (!filterFun && refs.empty() && state.traceActiveDepth
+            && !state.store->isInStore(path.path.abs()))
+        {
+            recordDep(*state.traceCtx->pools,path.path, DepHashValue(resultStorePath), DepType::CopiedPath, state.getMountToInput());
+        }
     } catch (Error & e) {
         e.addTrace(state.positions[pos], "while adding path '%s'", path);
         throw;
@@ -3032,6 +3331,7 @@ static RegisterPrimOp primop_path({
 static void prim_attrNames(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrNames");
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
 
     auto list = state.buildList(args[0]->attrs()->size());
 
@@ -3059,6 +3359,7 @@ static RegisterPrimOp primop_attrNames({
 static void prim_attrValues(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.attrValues");
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordAttrKeysDep(state.positions, state.symbols, *args[0]);
 
     auto list = state.buildList(args[0]->attrs()->size());
 
@@ -3185,7 +3486,14 @@ static void prim_hasAttr(EvalState & state, const PosIdx pos, Value ** args, Val
 {
     auto attr = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.hasAttr");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.hasAttr");
-    v.mkBool(args[1]->attrs()->get(state.symbols.create(attr)));
+    auto sym = state.symbols.create(attr);
+    auto found = args[1]->attrs()->get(sym);
+    // Record a #has:key dep for the queried key. Unlike ? with multi-segment
+    // paths (ExprOpHasAttr), builtins.hasAttr always checks a single key on
+    // the root attrset, so there are no intermediate navigation concerns.
+    // See ExprOpHasAttr::eval for the full soundness argument.
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordHasKeyDep(state.positions, state.symbols, *args[1], sym, found != nullptr);
+    v.mkBool(found);
 }
 
 static RegisterPrimOp primop_hasAttr({
@@ -3203,6 +3511,7 @@ static RegisterPrimOp primop_hasAttr({
 static void prim_isAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordTypeDep(state.positions, *args[0]);
     v.mkBool(args[0]->type() == nAttrs);
 }
 
@@ -3218,7 +3527,7 @@ static RegisterPrimOp primop_isAttrs({
 static void prim_removeAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], pos, "while evaluating the first argument passed to builtins.removeAttrs");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.removeAttrs");
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.removeAttrs");
 
     /* Get the attribute names to be removed.
        We keep them as Attrs instead of Symbols so std::set_difference
@@ -3265,7 +3574,7 @@ static RegisterPrimOp primop_removeAttrs({
    name, the first takes precedence. */
 static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[0], pos, "while evaluating the argument passed to builtins.listToAttrs");
+    state.forceListObserved(*args[0], pos, "while evaluating the argument passed to builtins.listToAttrs");
 
     // Step 1. Sort the name-value attrsets in place using the memory we allocate for the result
     auto listView = args[0]->listView();
@@ -3276,16 +3585,17 @@ static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args,
     for (const auto & [n, v2] : enumerate(listView)) {
         state.forceAttrs(*v2, pos, "while evaluating an element of the list passed to builtins.listToAttrs");
 
-        auto j = state.getAttr(state.s.name, v2->attrs(), "in a {name=...; value=...;} pair");
+        auto nameAttr = state.getAttr(state.s.name, v2->attrs(), "in a {name=...; value=...;} pair");
 
         auto name = state.forceStringNoCtx(
-            *j->value,
-            j->pos,
+            *nameAttr->value,
+            nameAttr->pos,
             "while evaluating the `name` attribute of an element of the list passed to builtins.listToAttrs");
         auto sym = state.symbols.create(name);
 
         // (ab)use Attr to store a Value * * instead of a Value *, so that we can stabilize the sort using the Value * *
-        bindings[n] = Attr(sym, std::bit_cast<Value *>(&v2));
+        // Carry the name attr's PosIdx so TracedData provenance propagates to the result.
+        bindings[n] = Attr(sym, std::bit_cast<Value *>(&v2), nameAttr->pos);
     }
 
     std::sort(&bindings[0], &bindings[listSize], [](const Attr & a, const Attr & b) {
@@ -3305,7 +3615,11 @@ static void prim_listToAttrs(EvalState & state, const PosIdx pos, Value ** args,
 
         auto j = state.getAttr(state.s.value, v2->attrs(), "in a {name=...; value=...;} pair");
         prev = attr.name;
-        bindings.push_back({prev, j->value, j->pos});
+        // Propagate TracedData provenance from the name attr to the result.
+        // This enables shape dep recording (#keys, #has:key) on attrsets
+        // built via listToAttrs from TracedData sources.
+        auto resultPos = attr.pos.isTracedData() ? attr.pos : j->pos;
+        bindings.push_back({prev, j->value, resultPos});
     }
     // help GC and clear end of allocated array
     for (size_t n = bindings.size(); n < listSize; n++) {
@@ -3349,7 +3663,6 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
 {
     state.forceAttrs(*args[0], pos, "while evaluating the first argument passed to builtins.intersectAttrs");
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.intersectAttrs");
-
     auto & left = *args[0]->attrs();
     auto & right = *args[1]->attrs();
 
@@ -3407,6 +3720,13 @@ static void prim_intersectAttrs(EvalState & state, const PosIdx pos, Value ** ar
         }
     }
 
+    // Record per-key #has deps for traced data operands. Pre-computes origins
+    // once per operand, then iterates keys — O(|left|+|right|) × O(origins)
+    // instead of O(|left|+|right|) × O(|attrs|) per absent key.
+    if (state.traceActiveDepth) [[unlikely]] {
+        recordIntersectAttrsDeps(state.positions, state.symbols, *args[0], *args[1]);
+    }
+
     v.mkAttrs(attrs.alreadySorted());
 }
 
@@ -3426,7 +3746,7 @@ static void prim_catAttrs(EvalState & state, const PosIdx pos, Value ** args, Va
 {
     auto attrName = state.symbols.create(
         state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.catAttrs"));
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.catAttrs");
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.catAttrs");
 
     SmallValueVector<nonRecursiveStackReservation> res(args[1]->listSize());
     size_t found = 0;
@@ -3515,7 +3835,7 @@ static void prim_mapAttrs(EvalState & state, const PosIdx pos, Value ** args, Va
         Value * vName = Value::toPtr(state.symbols[i.name]);
         Value * vFun2 = state.allocValue();
         vFun2->mkApp(args[0], vName);
-        attrs.alloc(i.name).mkApp(vFun2, i.value);
+        attrs.alloc(i.name, i.pos).mkApp(vFun2, i.value);
     }
 
     v.mkAttrs(attrs.alreadySorted());
@@ -3549,20 +3869,25 @@ static void prim_zipAttrsWith(EvalState & state, const PosIdx pos, Value ** args
     {
         size_t size = 0;
         size_t pos = 0;
+        PosIdx attrPos;  // PosIdx from first input attr (preserves TracedData origin)
         std::optional<ListBuilder> list;
     };
 
     std::map<Symbol, Item, std::less<Symbol>, traceable_allocator<std::pair<const Symbol, Item>>> attrsSeen;
 
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.zipAttrsWith");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.zipAttrsWith");
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.zipAttrsWith");
     const auto listItems = args[1]->listView();
 
     for (auto & vElem : listItems) {
         state.forceAttrs(
             *vElem, noPos, "while evaluating a value of the list passed as second argument to builtins.zipAttrsWith");
-        for (auto & attr : *vElem->attrs())
-            attrsSeen.try_emplace(attr.name).first->second.size++;
+        for (auto & attr : *vElem->attrs()) {
+            auto & item = attrsSeen.try_emplace(attr.name).first->second;
+            item.size++;
+            if (!item.attrPos)
+                item.attrPos = attr.pos;  // Keep PosIdx from first input
+        }
     }
 
     for (auto & [sym, elem] : attrsSeen)
@@ -3585,7 +3910,7 @@ static void prim_zipAttrsWith(EvalState & state, const PosIdx pos, Value ** args
         auto arg = state.allocValue();
         arg->mkList(*elem.list);
         call2->mkApp(call1, arg);
-        attrs.insert(sym, call2);
+        attrs.insert(Attr(sym, call2, elem.attrPos));
     }
 
     v.mkAttrs(attrs.alreadySorted());
@@ -3631,6 +3956,7 @@ static RegisterPrimOp primop_zipAttrsWith({
 static void prim_isList(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordTypeDep(state.positions, *args[0]);
     v.mkBool(args[0]->type() == nList);
 }
 
@@ -3693,7 +4019,7 @@ static RegisterPrimOp primop_head({
    don't want to use it!  */
 static void prim_tail(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[0], pos, "while evaluating the first argument passed to 'builtins.tail'");
+    state.forceListObserved(*args[0], pos, "while evaluating the first argument passed to 'builtins.tail'");
     if (args[0]->listSize() == 0)
         state.error<EvalError>("'builtins.tail' called on an empty list").atPos(pos).debugThrow();
 
@@ -3722,7 +4048,7 @@ static RegisterPrimOp primop_tail({
 /* Apply a function to every element of a list. */
 static void prim_map(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.map");
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.map");
 
     if (args[1]->listSize() == 0) {
         v = *args[1];
@@ -3758,7 +4084,7 @@ static RegisterPrimOp primop_map({
    returns true. */
 static void prim_filter(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.filter");
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.filter");
 
     if (args[1]->listSize() == 0) {
         v = *args[1];
@@ -3806,7 +4132,7 @@ static RegisterPrimOp primop_filter({
 static void prim_elem(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     bool res = false;
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.elem");
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.elem");
     for (auto elem : args[1]->listView())
         if (state.eqValues(*args[0], *elem, pos, "while searching for the presence of the given element in the list")) {
             res = true;
@@ -3828,7 +4154,7 @@ static RegisterPrimOp primop_elem({
 /* Concatenate a list of lists. */
 static void prim_concatLists(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.concatLists");
+    state.forceListObserved(*args[0], pos, "while evaluating the first argument passed to builtins.concatLists");
     auto listView = args[0]->listView();
     state.concatLists(
         v,
@@ -3850,7 +4176,7 @@ static RegisterPrimOp primop_concatLists({
 /* Return the length of a list.  This is an O(1) time operation. */
 static void prim_length(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.length");
+    state.forceListObserved(*args[0], pos, "while evaluating the first argument passed to builtins.length");
     v.mkInt(args[0]->listSize());
 }
 
@@ -3868,7 +4194,7 @@ static RegisterPrimOp primop_length({
 static void prim_foldlStrict(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.foldlStrict");
-    state.forceList(*args[2], pos, "while evaluating the third argument passed to builtins.foldlStrict");
+    state.forceListObserved(*args[2], pos, "while evaluating the third argument passed to builtins.foldlStrict");
 
     if (args[2]->listSize()) {
         Value * vCur = args[1];
@@ -3910,7 +4236,7 @@ static void anyOrAll(bool any, EvalState & state, const PosIdx pos, Value ** arg
 {
     state.forceFunction(
         *args[0], pos, std::string("while evaluating the first argument passed to builtins.") + (any ? "any" : "all"));
-    state.forceList(
+    state.forceListObserved(
         *args[1], pos, std::string("while evaluating the second argument passed to builtins.") + (any ? "any" : "all"));
 
     std::string_view errorCtx = any ? "while evaluating the return value of the function passed to builtins.any"
@@ -4001,7 +4327,7 @@ static void prim_lessThan(EvalState & state, const PosIdx pos, Value ** args, Va
 
 static void prim_sort(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.sort");
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.sort");
 
     auto len = args[1]->listSize();
     if (len == 0) {
@@ -4110,7 +4436,7 @@ static RegisterPrimOp primop_sort({
 static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.partition");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.partition");
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.partition");
 
     auto len = args[1]->listSize();
 
@@ -4134,13 +4460,15 @@ static void prim_partition(EvalState & state, const PosIdx pos, Value ** args, V
     auto rlist = state.buildList(rsize);
     if (rsize)
         memcpy(rlist.elems, right.data(), sizeof(Value *) * rsize);
-    attrs.alloc(state.s.right).mkList(rlist);
+    auto & rVal = attrs.alloc(state.s.right);
+    rVal.mkList(rlist);
 
     auto wsize = wrong.size();
     auto wlist = state.buildList(wsize);
     if (wsize)
         memcpy(wlist.elems, wrong.data(), sizeof(Value *) * wsize);
-    attrs.alloc(state.s.wrong).mkList(wlist);
+    auto & wVal = attrs.alloc(state.s.wrong);
+    wVal.mkList(wlist);
 
     v.mkAttrs(attrs);
 }
@@ -4171,7 +4499,7 @@ static RegisterPrimOp primop_partition({
 static void prim_groupBy(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.groupBy");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.groupBy");
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.groupBy");
 
     ValueVectorMap attrs;
 
@@ -4191,7 +4519,8 @@ static void prim_groupBy(EvalState & state, const PosIdx pos, Value ** args, Val
         auto size = i.second.size();
         auto list = state.buildList(size);
         memcpy(list.elems, i.second.data(), sizeof(Value *) * size);
-        attrs2.alloc(i.first).mkList(list);
+        auto & groupVal = attrs2.alloc(i.first);
+        groupVal.mkList(list);
     }
 
     v.mkAttrs(attrs2.alreadySorted());
@@ -4224,7 +4553,7 @@ static RegisterPrimOp primop_groupBy({
 static void prim_concatMap(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceFunction(*args[0], pos, "while evaluating the first argument passed to builtins.concatMap");
-    state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.concatMap");
+    state.forceListObserved(*args[1], pos, "while evaluating the second argument passed to builtins.concatMap");
     auto nrLists = args[1]->listSize();
 
     // List of returned lists before concatenation. References to these Values must NOT be persisted.
@@ -4546,6 +4875,7 @@ static void prim_substring(EvalState & state, const PosIdx pos, Value ** args, V
     NixStringContext context;
     auto s = state.coerceToString(
         pos, *args[2], context, "while evaluating the third argument (the string) passed to builtins.substring");
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[2]); // after coerceToString forces the value
 
     v.mkString(NixUInt(start) >= s->size() ? "" : s->substr(start, _len), context, state.mem);
 }
@@ -4576,6 +4906,7 @@ static void prim_stringLength(EvalState & state, const PosIdx pos, Value ** args
     NixStringContext context;
     auto s =
         state.coerceToString(pos, *args[0], context, "while evaluating the argument passed to builtins.stringLength");
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[0]); // after coerceToString forces the value
     v.mkInt(NixInt::Inner(s->size()));
 }
 
@@ -4601,6 +4932,7 @@ static void prim_hashString(EvalState & state, const PosIdx pos, Value ** args, 
     NixStringContext context; // discarded
     auto s =
         state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.hashString");
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[1]); // after forceString
 
     v.mkString(hashString(*ha, s).to_string(HashFormat::Base16, false), state.mem);
 }
@@ -4757,6 +5089,7 @@ void prim_match(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         NixStringContext context;
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.match");
+        if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[1]); // after forceString
 
         std::cmatch match;
         if (!std::regex_match(str.begin(), str.end(), match, *regex)) {
@@ -4831,6 +5164,7 @@ void prim_split(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         NixStringContext context;
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.split");
+        if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[1]); // after forceString
 
         auto begin = std::cregex_iterator(str.begin(), str.end(), *regex);
         auto end = std::cregex_iterator();
@@ -4931,7 +5265,7 @@ static void prim_concatStringsSep(EvalState & state, const PosIdx pos, Value ** 
         context,
         pos,
         "while evaluating the first argument (the separator string) passed to builtins.concatStringsSep");
-    state.forceList(
+    state.forceListObserved(
         *args[1],
         pos,
         "while evaluating the second argument (the list of strings to concat) passed to builtins.concatStringsSep");
@@ -4970,6 +5304,10 @@ static void prim_replaceStrings(EvalState & state, const PosIdx pos, Value ** ar
 {
     state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.replaceStrings");
     state.forceList(*args[1], pos, "while evaluating the second argument passed to builtins.replaceStrings");
+    if (state.traceActiveDepth) [[unlikely]] {
+        maybeRecordListLenDep(*args[0]);
+        maybeRecordListLenDep(*args[1]);
+    }
     if (args[0]->listSize() != args[1]->listSize())
         state.error<EvalError>("'from' and 'to' arguments passed to builtins.replaceStrings have different lengths")
             .atPos(pos)
@@ -4987,6 +5325,7 @@ static void prim_replaceStrings(EvalState & state, const PosIdx pos, Value ** ar
     NixStringContext context;
     auto s = state.forceString(
         *args[2], context, pos, "while evaluating the third argument passed to builtins.replaceStrings");
+    if (state.traceActiveDepth) [[unlikely]] maybeRecordRawContentDep(state, *args[2]); // after forceString
 
     std::string res;
     // Loops one past last character to handle the case where 'from' contains an empty string.
@@ -5230,7 +5569,23 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
         });
 
     if (!settings.pureEval) {
-        v.mkInt(time(nullptr));
+        // Use a thunk so we can record a dep when currentTime is actually used
+        static PrimOp primop_currentTimeThunk{
+            .name = "__currentTime_thunk",
+            .arity = 1,
+            .impl = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
+                if (state.traceActiveDepth) [[unlikely]] {
+                    DependencyTracker::record(*state.traceCtx->pools, DepType::CurrentTime, "", "currentTime",
+                        DepHashValue(std::to_string(time(0))));
+                }
+                v.mkInt(time(0));
+            },
+        };
+        auto * fn = allocValue();
+        fn->mkPrimOp(&primop_currentTimeThunk);
+        auto * arg = allocValue();
+        arg->mkNull();
+        v.mkApp(fn, arg);
     }
     addConstant(
         "__currentTime",
@@ -5259,8 +5614,26 @@ void EvalState::createBaseEnv(const EvalSettings & evalSettings)
             .impureOnly = true,
         });
 
-    if (!settings.pureEval)
-        v.mkString(settings.getCurrentSystem(), mem);
+    if (!settings.pureEval) {
+        // Use a thunk so we can record a dep when currentSystem is actually used
+        static PrimOp primop_currentSystemThunk{
+            .name = "__currentSystem_thunk",
+            .arity = 1,
+            .impl = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
+                if (state.traceActiveDepth) [[unlikely]] {
+                    auto system = state.settings.getCurrentSystem();
+                    auto hash = depHash(system);
+                    DependencyTracker::record(*state.traceCtx->pools, DepType::System, "", "currentSystem", hash);
+                }
+                v.mkString(state.settings.getCurrentSystem(), state.mem);
+            },
+        };
+        auto * fn = allocValue();
+        fn->mkPrimOp(&primop_currentSystemThunk);
+        auto * arg = allocValue();
+        arg->mkNull();
+        v.mkApp(fn, arg);
+    }
     addConstant(
         "__currentSystem",
         v,

@@ -94,6 +94,8 @@ SQLite::SQLite(const std::filesystem::path & path, Settings && settings)
     int flags = immutable ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE;
     if (settings.mode == SQLiteOpenMode::Normal)
         flags |= SQLITE_OPEN_CREATE;
+    if (settings.noMutex)
+        flags |= SQLITE_OPEN_NOMUTEX;
     auto uri = "file:" + percentEncode(path.string()) + "?immutable=" + (immutable ? "1" : "0");
     int ret = sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_URI | flags, vfs);
     if (ret != SQLITE_OK) {
@@ -178,7 +180,7 @@ SQLiteStmt::Use::~Use()
 SQLiteStmt::Use & SQLiteStmt::Use::operator()(std::string_view value, bool notNull)
 {
     if (notNull) {
-        if (sqlite3_bind_text(stmt, curArg++, value.data(), -1, SQLITE_TRANSIENT) != SQLITE_OK)
+        if (sqlite3_bind_text(stmt, curArg++, value.data(), value.size(), SQLITE_TRANSIENT) != SQLITE_OK)
             SQLiteError::throw_(stmt.db, "binding argument");
     } else
         bind();
@@ -249,6 +251,13 @@ int64_t SQLiteStmt::Use::getInt(int col)
 bool SQLiteStmt::Use::isNull(int col)
 {
     return sqlite3_column_type(stmt, col) == SQLITE_NULL;
+}
+
+std::pair<const void *, size_t> SQLiteStmt::Use::getBlob(int col)
+{
+    auto * data = sqlite3_column_blob(stmt, col);
+    auto len = sqlite3_column_bytes(stmt, col);
+    return {data, static_cast<size_t>(len)};
 }
 
 SQLiteTxn::SQLiteTxn(sqlite3 * db)

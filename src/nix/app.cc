@@ -2,8 +2,9 @@
 #include "nix/cmd/installable-derived-path.hh"
 #include "nix/cmd/installable-value.hh"
 #include "nix/store/store-api.hh"
+#include "nix/store/globals.hh"
 #include "nix/expr/eval-inline.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/eval.hh"
 #include "nix/store/names.hh"
 #include "nix/cmd/command.hh"
 #include "nix/store/derivations.hh"
@@ -51,22 +52,65 @@ resolveString(Store & store, const std::string & toResolve, const std::vector<Bu
     return rewriteStrings(toResolve, rewrites);
 }
 
+/**
+ * Force a derivation and ensure its .drv file exists in the store.
+ */
+static StorePath ensureDerivationInStore(EvalState & state, Value & v)
+{
+    auto * aDrvPath = v.attrs()->get(state.s.drvPath);
+    if (!aDrvPath)
+        throw Error("derivation does not have a 'drvPath' attribute");
+    state.forceValue(*aDrvPath->value, aDrvPath->pos);
+    auto drvPath = state.store->parseStorePath(aDrvPath->value->string_view());
+    drvPath.requireDerivation();
+    if (!state.store->isValidPath(drvPath) && !settings.readOnlyMode)
+        throw Error(
+            "don't know how to recreate store derivation '%s'!", state.store->printStorePath(drvPath));
+    return drvPath;
+}
+
+static std::string forceStringAttr(EvalState & state, Value & parent, Symbol name)
+{
+    auto * attr = parent.attrs()->get(name);
+    if (!attr)
+        throw Error("attribute '%s' missing", state.symbols[name]);
+    state.forceValue(*attr->value, attr->pos);
+    return std::string(attr->value->string_view());
+}
+
 UnresolvedApp InstallableValue::toApp(EvalState & state)
 {
-    auto cursor = getCursor(state);
-    auto attrPath = cursor->getAttrPath();
+    auto [vp, pos] = toValue(state);
+    auto & v = *vp;
+    state.forceValue(v, pos);
 
-    auto type = cursor->getAttr("type")->getString();
+    if (v.type() != nAttrs)
+        throw Error("app value is not an attribute set");
 
-    std::string expectedType =
-        !attrPath.empty() && (state.symbols[attrPath[0]] == "apps" || state.symbols[attrPath[0]] == "defaultApp")
-            ? "app"
-            : "derivation";
-    if (type != expectedType)
-        throw Error("attribute '%s' should have type '%s'", cursor->getAttrPathStr(), expectedType);
+    auto type = forceStringAttr(state, v, state.symbols.create("type"));
+
+    auto attrPath = what();
+
+    // Validate type matches the schema position (apps.* → "app", packages.* → "derivation")
+    auto resolved = resolvedAttrPath();
+    if (!resolved.empty()) {
+        std::string expectedType;
+        if (resolved.starts_with("apps.") || resolved.starts_with("defaultApp"))
+            expectedType = "app";
+        else
+            expectedType = "derivation";
+        if (type != expectedType)
+            throw Error("attribute '%s' should have type '%s'", attrPath, expectedType);
+    }
 
     if (type == "app") {
-        auto [program, context] = cursor->getAttr("program")->getStringWithContext();
+        auto * aProg = v.attrs()->get(state.symbols.create("program"));
+        if (!aProg)
+            throw Error("app '%s' does not have a 'program' attribute", attrPath);
+        state.forceValue(*aProg->value, aProg->pos);
+        auto program = std::string(aProg->value->string_view());
+        NixStringContext context;
+        copyContext(*aProg->value, context);
 
         std::vector<DerivedPath> context2;
         for (auto & c : context) {
@@ -102,14 +146,29 @@ UnresolvedApp InstallableValue::toApp(EvalState & state)
     }
 
     else if (type == "derivation") {
-        auto drvPath = cursor->forceDerivation();
-        auto outPath = cursor->getAttr(state.s.outPath)->getString();
-        auto outputName = cursor->getAttr(state.s.outputName)->getString();
-        auto name = cursor->getAttr(state.s.name)->getString();
-        auto aPname = cursor->maybeGetAttr("pname");
-        auto aMeta = cursor->maybeGetAttr(state.s.meta);
-        auto aMainProgram = aMeta ? aMeta->maybeGetAttr("mainProgram") : nullptr;
-        auto mainProgram = aMainProgram ? aMainProgram->getString() : aPname ? aPname->getString() : DrvName(name).name;
+        auto drvPath = ensureDerivationInStore(state, v);
+        auto outPath = forceStringAttr(state, v, state.s.outPath);
+        auto outputName = forceStringAttr(state, v, state.s.outputName);
+        auto name = forceStringAttr(state, v, state.s.name);
+        auto * aPname = v.attrs()->get(state.symbols.create("pname"));
+        auto * aMeta = v.attrs()->get(state.s.meta);
+        std::string mainProgram;
+        if (aMeta) {
+            state.forceValue(*aMeta->value, aMeta->pos);
+            if (aMeta->value->type() == nAttrs) {
+                auto * aMainProgram = aMeta->value->attrs()->get(state.symbols.create("mainProgram"));
+                if (aMainProgram) {
+                    state.forceValue(*aMainProgram->value, aMainProgram->pos);
+                    mainProgram = std::string(aMainProgram->value->string_view());
+                }
+            }
+        }
+        if (mainProgram.empty() && aPname) {
+            state.forceValue(*aPname->value, aPname->pos);
+            mainProgram = std::string(aPname->value->string_view());
+        }
+        if (mainProgram.empty())
+            mainProgram = DrvName(name).name;
         auto program = outPath + "/bin/" + mainProgram;
         return UnresolvedApp{App{
             .context = {DerivedPath::Built{
@@ -121,7 +180,7 @@ UnresolvedApp InstallableValue::toApp(EvalState & state)
     }
 
     else
-        throw Error("attribute '%s' has unsupported type '%s'", cursor->getAttrPathStr(), type);
+        throw Error("attribute '%s' has unsupported type '%s'", attrPath, type);
 }
 
 std::vector<BuiltPathWithResult> UnresolvedApp::build(ref<Store> evalStore, ref<Store> store)

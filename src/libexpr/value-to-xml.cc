@@ -1,6 +1,7 @@
 #include "nix/expr/value-to-xml.hh"
 #include "nix/util/xml-writer.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/util/signals.hh"
 
 #include <cstdlib>
@@ -36,14 +37,17 @@ static void showAttrs(
     EvalState & state,
     bool strict,
     bool location,
-    const Bindings & attrs,
+    const Value & v,
     XMLWriter & doc,
     NixStringContext & context,
     StringSet & drvsSeen)
 {
+    if (state.traceActiveDepth) [[unlikely]]
+        maybeRecordAttrKeysDep(state.positions, state.symbols, v);
+
     StringSet names;
 
-    for (auto & a : attrs.lexicographicOrder(state.symbols)) {
+    for (auto & a : v.attrs()->lexicographicOrder(state.symbols)) {
         XMLAttrs xmlAttrs;
         xmlAttrs["name"] = state.symbols[a->name];
         if (location && a->pos)
@@ -117,19 +121,20 @@ static void printValueAsXML(
             XMLOpenElement _(doc, "derivation", xmlAttrs);
 
             if (drvPath != "" && drvsSeen.insert(drvPath).second)
-                showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
+                showAttrs(state, strict, location, v, doc, context, drvsSeen);
             else
                 doc.writeEmptyElement("repeated");
         }
 
         else {
             XMLOpenElement _(doc, "attrs");
-            showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
+            showAttrs(state, strict, location, v, doc, context, drvsSeen);
         }
 
         break;
 
     case nList: {
+        if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(v);
         XMLOpenElement _(doc, "list");
         for (auto v2 : v.listView())
             printValueAsXML(state, strict, location, *v2, doc, context, drvsSeen, pos);

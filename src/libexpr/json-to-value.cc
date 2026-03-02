@@ -1,4 +1,8 @@
 #include "nix/expr/json-to-value.hh"
+#include "nix/expr/eval-trace/data/traced-data.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/context.hh"
+#include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/eval.hh"
 
@@ -207,6 +211,232 @@ void parseJSON(EvalState & state, const std::string_view & s_, Value & v)
     bool res = json::sax_parse(s_, &parser);
     if (!res)
         throw JSONParseError("Invalid JSON Value");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Lazy structural dependency tracking for JSON (traced data)
+// ═══════════════════════════════════════════════════════════════════════
+
+namespace {
+
+struct JsonDataNode : TracedDataNode {
+    json ownedData;          // only meaningful for root node (holds the full DOM)
+    const json * data;       // non-owning pointer into root's DOM
+    JsonDataNode * root;     // GC pointer keeps root alive while children exist
+
+    // Root node: owns the DOM
+    explicit JsonDataNode(json d)
+        : ownedData(std::move(d)), data(&ownedData), root(this) {}
+
+    // Child node: references into root's DOM (zero-copy)
+    JsonDataNode(const json * d, JsonDataNode * r)
+        : data(d), root(r) {}
+
+    Kind kind() const override {
+        switch (data->type()) {
+        case json::value_t::object: return Kind::Object;
+        case json::value_t::array: return Kind::Array;
+        case json::value_t::string: return Kind::String;
+        case json::value_t::boolean: return Kind::Bool;
+        case json::value_t::number_integer:
+        case json::value_t::number_unsigned:
+        case json::value_t::number_float: return Kind::Number;
+        case json::value_t::null:
+        case json::value_t::discarded: return Kind::Null;
+        case json::value_t::binary: return Kind::Null; // unreachable for JSON text
+        }
+        return Kind::Null;
+    }
+
+    StructuredFormat formatTag() const override { return StructuredFormat::Json; }
+
+    std::vector<std::string> objectKeys() const override {
+        std::vector<std::string> keys;
+        keys.reserve(data->size());
+        for (auto & [k, _] : data->items())
+            keys.push_back(k);
+        return keys;
+    }
+
+    TracedDataNode * objectGet(const std::string & key) const override {
+        return new JsonDataNode(&data->at(key), root);
+    }
+
+    size_t arraySize() const override { return data->size(); }
+
+    TracedDataNode * arrayGet(size_t index) const override {
+        return new JsonDataNode(&data->at(index), root);
+    }
+
+    void materializeScalar(EvalState & state, Value & v) const override {
+        switch (data->type()) {
+        case json::value_t::string: {
+            auto s = data->get<std::string>();
+            forceNoNullByte(s);
+            v.mkString(s, state.mem);
+            break;
+        }
+        case json::value_t::number_integer:
+            v.mkInt(data->get<NixInt::Inner>());
+            break;
+        case json::value_t::number_unsigned: {
+            auto val = data->get<uint64_t>();
+            if (val > static_cast<uint64_t>(std::numeric_limits<NixInt::Inner>::max()))
+                throw Error("unsigned json number %1% outside of Nix integer range", val);
+            v.mkInt(static_cast<NixInt::Inner>(val));
+            break;
+        }
+        case json::value_t::number_float:
+            v.mkFloat(data->get<NixFloat>());
+            break;
+        case json::value_t::boolean:
+            v.mkBool(data->get<bool>());
+            break;
+        case json::value_t::null:
+        case json::value_t::discarded:
+        case json::value_t::binary:
+            v.mkNull();
+            break;
+        case json::value_t::object:
+        case json::value_t::array:
+            throw Error("cannot materialize non-scalar JSON value");
+        }
+    }
+
+    std::string canonicalValue() const override {
+        return data->dump();
+    }
+};
+
+} // anonymous namespace
+
+// ── ExprTracedData::eval() — vtable emitted here ────────────────────
+
+void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
+{
+    auto & pools = *state.traceCtx->pools;
+    pools.sessionSymbols = &state.symbols;
+    auto nodeKind = node->kind();
+    auto fmt = node->formatTag();
+
+    switch (nodeKind) {
+    case TracedDataNode::Kind::Object: {
+        auto keys = node->objectKeys();
+        auto attrs = state.buildBindings(keys.size());
+
+        bool tracking = DependencyTracker::isActive() && !keys.empty();
+        auto originHandle = state.positions.addOriginHandle(
+            allocateProvenanceRef(pools, sourceId, filePathId, dataPathId, structuredFormatChar(fmt)),
+            keys.empty() ? 0 : keys.size());
+
+        for (size_t idx = 0; idx < keys.size(); idx++) {
+            auto & k = keys[idx];
+            auto childPathId = pools.dataPathPool.internChild(dataPathId, k);
+            auto * childNode = node->objectGet(k);
+            auto * childVal = state.allocValue();
+
+            auto * childExpr = new ExprTracedData(
+                childNode, sourceId, filePathId, childPathId);
+            childVal->mkThunk(&state.baseEnv, childExpr);
+            eval_trace::nrTracedExprFromDataFile++;
+            eval_trace::nrDataFileContainerChildren++;
+            forceNoNullByte(k);
+            PosIdx keyPos = tracking ? state.positions.add(originHandle, idx) : PosIdx{};
+            attrs.insert(state.symbols.create(k), childVal, keyPos);
+        }
+        v.mkAttrs(attrs);
+        if (DependencyTracker::isActive()) {
+            CompactDepComponents keysComp{sourceId, filePathId, fmt, dataPathId,
+                                          ShapeSuffix::Keys, Symbol{}};
+            if (keys.empty()) {
+                // Empty objects: blocking SC #keys so key additions are caught.
+                recordStructuredDep(pools, keysComp, DepHashValue(depHash("")));
+            } else {
+                // Non-empty: ImplicitShape #keys fingerprint at creation time.
+                std::vector<std::string> sortedKeys(keys);
+                std::sort(sortedKeys.begin(), sortedKeys.end());
+                std::string canonical;
+                for (size_t i = 0; i < sortedKeys.size(); i++) {
+                    if (i > 0) canonical += '\0';
+                    canonical += sortedKeys[i];
+                }
+                auto keysHash = depHash(canonical);
+                recordStructuredDep(pools, keysComp, DepHashValue(keysHash), DepType::ImplicitShape);
+
+                PosIdx anyKeyPos = v.attrs()->begin()->pos;
+                if (auto off = state.positions.originOffsetOf(anyKeyPos)) {
+                    registerPrecomputedKeys(*off, PrecomputedKeysInfo{
+                        keysHash,
+                        static_cast<uint32_t>(keys.size()),
+                        sourceId, filePathId, dataPathId, fmt,
+                    });
+                }
+            }
+        }
+        break;
+    }
+    case TracedDataNode::Kind::Array: {
+        auto sz = node->arraySize();
+        auto list = state.buildList(sz);
+        for (size_t i = 0; i < sz; i++) {
+            auto childPathId = pools.dataPathPool.internArrayChild(dataPathId, static_cast<int32_t>(i));
+            auto * childNode = node->arrayGet(i);
+            auto * childVal = state.allocValue();
+
+            auto * childExpr = new ExprTracedData(
+                childNode, sourceId, filePathId, childPathId);
+            childVal->mkThunk(&state.baseEnv, childExpr);
+            eval_trace::nrTracedExprFromDataFile++;
+            eval_trace::nrDataFileContainerChildren++;
+            list[i] = childVal;
+        }
+        v.mkList(list);
+        if (DependencyTracker::isActive()) {
+            CompactDepComponents lenComp{sourceId, filePathId, fmt, dataPathId,
+                                         ShapeSuffix::Len, Symbol{}};
+            if (sz == 0) {
+                // Empty lists: blocking SC #len so element additions are caught.
+                recordStructuredDep(pools, lenComp, DepHashValue(depHash("0")));
+            } else {
+                // Non-empty: ImplicitShape #len fingerprint at creation time.
+                recordStructuredDep(pools, lenComp, DepHashValue(depHash(std::to_string(sz))), DepType::ImplicitShape);
+
+                auto * prov = allocateProvenance(sourceId, filePathId, dataPathId, fmt);
+                registerTracedContainer((const void *)list[0], prov);
+            }
+        }
+        break;
+    }
+    case TracedDataNode::Kind::String:
+    case TracedDataNode::Kind::Number:
+    case TracedDataNode::Kind::Bool:
+    case TracedDataNode::Kind::Null: {
+        // Scalar leaf — record StructuredContent dep
+        CompactDepComponents scalarComp{sourceId, filePathId, fmt, dataPathId,
+                                        ShapeSuffix::None, Symbol{}};
+        auto hash = depHash(node->canonicalValue());
+        recordStructuredDep(pools, scalarComp, DepHashValue(hash));
+        node->materializeScalar(state, v);
+        eval_trace::nrDataFileScalarChildren++;
+        break;
+    }
+    }
+}
+
+void parseTracedJSON(EvalState & state, const std::string_view & s, Value & v,
+                     const std::string & depSource, const std::string & depKey)
+{
+    auto j = json::parse(s);
+    if (j.is_object() || j.is_array()) {
+        auto & pools = *state.traceCtx->pools;
+        auto srcId = pools.intern<DepSourceId>(depSource);
+        auto fpId = pools.filePathPool.intern(depKey);
+        auto * rootNode = new JsonDataNode(std::move(j));
+        auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, pools.dataPathPool.root());
+        rootExpr->eval(state, state.baseEnv, v);
+    } else {
+        parseJSON(state, s, v);
+    }
 }
 
 } // namespace nix

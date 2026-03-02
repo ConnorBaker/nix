@@ -2,6 +2,7 @@
 #include "nix/expr/primops.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/store/store-api.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/store/filetransfer.hh"
@@ -224,6 +225,12 @@ static void fetchTree(
         state.inputCache->getAccessor(state.fetchSettings, *state.store, input, fetchers::UseRegistries::No);
 
     auto storePath = state.mountInput(cachedInput.lockedInput, input, cachedInput.accessor);
+
+    // Record UnhashedFetch oracle dep for trace verification (re-fetch on verify)
+    if (!input.isLocked(state.fetchSettings) && state.traceActiveDepth) [[unlikely]] {
+        DependencyTracker::record(*state.traceCtx->pools, DepType::UnhashedFetch, "", input.to_string(),
+            DepHashValue(state.store->printStorePath(storePath)));
+    }
 
     emitTreeAttrs(state, storePath, cachedInput.lockedInput, v, params.emptyRevFallback, false);
 }
@@ -452,6 +459,11 @@ static void fetch(
         state.error<EvalError>("in pure evaluation mode, '%s' requires a 'sha256' argument", who)
             .atPos(pos)
             .debugThrow();
+
+    // Record UnhashedFetch oracle dep (always dirty during trace verification)
+    if (!expectedHash && state.traceActiveDepth) [[unlikely]] {
+        DependencyTracker::record(*state.traceCtx->pools, DepType::UnhashedFetch, "", *url, DepHashValue(std::string("")));
+    }
 
     // early exit if pinned and already in the store
     if (expectedHash && expectedHash->algo == HashAlgorithm::SHA256) {

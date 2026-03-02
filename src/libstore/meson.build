@@ -145,7 +145,7 @@ deps_private += seccomp
 nlohmann_json = dependency('nlohmann_json', version : '>= 3.9')
 deps_public += nlohmann_json
 
-sqlite = dependency('sqlite3', 'sqlite', version : '>=3.6.19')
+sqlite = dependency('sqlite3', 'sqlite', version : '>=3.37.0')
 deps_private += sqlite
 
 s3_aws_auth = get_option('s3-aws-auth')

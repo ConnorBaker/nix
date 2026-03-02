@@ -27,12 +27,9 @@ const StringSet hashAlgorithms = {"blake3", "md5", "sha1", "sha256", "sha512"};
 
 const StringSet hashFormats = {"base64", "nix32", "base16", "sri"};
 
-Hash::Hash(HashAlgorithm algo, const ExperimentalFeatureSettings & xpSettings)
+Hash::Hash(HashAlgorithm algo, const ExperimentalFeatureSettings &)
     : algo(algo)
 {
-    if (algo == HashAlgorithm::BLAKE3) {
-        xpSettings.require(Xp::BLAKE3Hashes);
-    }
     hashSize = regularHashSize(algo);
     assert(hashSize <= maxHashSize);
     memset(hash, 0, maxHashSize);
@@ -467,10 +464,8 @@ std::string_view printHashFormat(HashFormat HashFormat)
 
 std::optional<HashAlgorithm> parseHashAlgoOpt(std::string_view s, const ExperimentalFeatureSettings & xpSettings)
 {
-    if (s == "blake3") {
-        xpSettings.require(Xp::BLAKE3Hashes);
+    if (s == "blake3")
         return HashAlgorithm::BLAKE3;
-    }
     if (s == "md5")
         return HashAlgorithm::MD5;
     if (s == "sha1")

@@ -9,10 +9,9 @@ namespace nix {
 struct PackageInfo;
 struct SourceExprCommand;
 
-namespace eval_cache {
-class EvalCache;
-class AttrCursor;
-} // namespace eval_cache
+namespace eval_trace {
+class TraceCache;
+} // namespace eval_trace
 
 struct App
 {
@@ -89,17 +88,11 @@ struct InstallableValue : Installable
     virtual std::pair<Value *, PosIdx> toValue(EvalState & state) = 0;
 
     /**
-     * Get a cursor to each value this Installable could refer to.
-     * However if none exists, throw exception instead of returning
-     * empty vector.
+     * The resolved attribute path used to reach this value in the eval tree.
+     * For flake installables, this is the full path after prefix resolution
+     * (e.g., "packages.x86_64-linux.hello"). Empty for non-flake installables.
      */
-    virtual std::vector<ref<eval_cache::AttrCursor>> getCursors(EvalState & state);
-
-    /**
-     * Get the first and most preferred cursor this Installable could
-     * refer to, or throw an exception if none exists.
-     */
-    virtual ref<eval_cache::AttrCursor> getCursor(EvalState & state);
+    virtual std::string resolvedAttrPath() const { return ""; }
 
     UnresolvedApp toApp(EvalState & state);
 

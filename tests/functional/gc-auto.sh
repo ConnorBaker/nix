@@ -69,12 +69,17 @@ with import ${config_nix}; mkDerivation {
 EOF
 )
 
+# Disable eval-trace: the eval trace system may interfere with this test's
+# tight auto-GC budget (maxFree - avail = ~1948 bytes). Disabling it ensures
+# the test measures only the garbage paths it cares about.
 nix build --impure -v -o "$TEST_ROOT"/result-A -L --expr "$expr" \
-    --min-free 1K --max-free 2K --min-free-check-interval 1 &
+    --min-free 1K --max-free 2K --min-free-check-interval 1 \
+    --option eval-trace false &
 pid1=$!
 
 nix build --impure -v -o "$TEST_ROOT"/result-B -L --expr "$expr2" \
-    --min-free 1K --max-free 2K --min-free-check-interval 1 &
+    --min-free 1K --max-free 2K --min-free-check-interval 1 \
+    --option eval-trace false &
 pid2=$!
 
 # Once the first build is done, unblock the second one.

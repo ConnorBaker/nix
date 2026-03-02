@@ -13,7 +13,7 @@
 #include "nix/expr/get-drvs.hh"
 #include "nix/store/store-api.hh"
 #include "nix/main/shared.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/util/url.hh"
 #include "nix/fetchers/registry.hh"
 #include "nix/store/build-result.hh"
@@ -47,6 +47,8 @@ class InstallableAttrPath : public InstallableValue
     std::pair<Value *, PosIdx> toValue(EvalState & state) override;
 
     DerivedPathsWithInfo toDerivedPaths() override;
+
+    ref<eval_trace::TraceCache> getOrCreateTraceCache(EvalState & state);
 
 public:
 

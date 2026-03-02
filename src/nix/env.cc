@@ -112,9 +112,9 @@ struct CmdShell : InstallablesCommand, MixEnvironment
         for (auto & arg : command)
             args.push_back(arg);
 
-        // Release our references to eval caches to ensure they are persisted to disk, because
+        // Release our references to trace caches to ensure they are persisted to disk, because
         // we are about to exec out of this process without running C++ destructors.
-        state->evalCaches.clear();
+        state->flushTraceContext();
 
         execProgramInStore(store, UseLookupPath::Use, *command.begin(), args);
     }

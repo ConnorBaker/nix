@@ -13,7 +13,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/main/shared.hh"
 #include "nix/flake/flake.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/util/url.hh"
 #include "nix/fetchers/registry.hh"
 #include "nix/store/build-result.hh"
@@ -80,35 +80,91 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
 {
     Activity act(*logger, lvlTalkative, actUnknown, fmt("evaluating derivation '%s'", what()));
 
-    auto attr = getCursor(*state);
+    auto evalCache = openTraceCache(*state, getLockedFlake());
+    auto * root = evalCache->getRootValue();
+    state->forceValue(*root, noPos);
 
-    auto attrPath = attr->getAttrPathStr();
+    auto emptyArgs = state->buildBindings(0).finish();
+    auto attrPaths = getActualAttrPaths();
+    Suggestions suggestions;
 
-    if (!attr->isDerivation()) {
+    Value * vp = nullptr;
+    std::string resolvedPath;
+    for (auto & ap : attrPaths) {
+        debug("trying flake output attribute '%s'", ap);
+        try {
+            auto [v, pos] = findAlongAttrPath(*state, ap, *emptyArgs, *root);
+            vp = v;
+            resolvedPath = ap;
+            break;
+        } catch (Error & e) {
+            suggestions += e.info().suggestions;
+        }
+    }
 
-        // FIXME: use eval cache?
-        auto v = attr->forceValue();
+    if (!vp)
+        throw Error(suggestions, "flake '%s' does not provide attribute %s", flakeRef, showAttrPaths(attrPaths));
 
+    state->forceValue(*vp, noPos);
+
+    if (state->settings.verifyTraceCache)
+        evalCache->verifyCold(resolvedPath, *vp);
+
+    if (vp->type() != nAttrs || !state->isDerivation(*vp)) {
         if (std::optional derivedPathWithInfo = trySinglePathToDerivedPaths(
-                v, noPos, fmt("while evaluating the flake output attribute '%s'", attrPath))) {
+                *vp, noPos, fmt("while evaluating the flake output attribute '%s'", resolvedPath))) {
             return {*derivedPathWithInfo};
         } else {
             throw Error(
                 "expected flake output attribute '%s' to be a derivation or path but found %s: %s",
-                attrPath,
-                showType(v),
-                ValuePrinter(*this->state, v, errorPrintOptions));
+                resolvedPath,
+                showType(*vp),
+                ValuePrinter(*this->state, *vp, errorPrintOptions));
         }
     }
 
-    auto drvPath = attr->forceDerivation();
+    // Ensure .drv exists in store
+    auto * aDrvPath = vp->attrs()->get(state->s.drvPath);
+    if (!aDrvPath)
+        throw Error("derivation does not have a 'drvPath' attribute");
+    state->forceValue(*aDrvPath->value, aDrvPath->pos);
+    auto drvPath = state->store->parseStorePath(aDrvPath->value->string_view());
+    drvPath.requireDerivation();
+    if (!state->store->isValidPath(drvPath)) {
+        /* The eval trace may have returned a traced drvPath from a previous
+           session, but the .drv file was garbage-collected. Perform fresh
+           evaluation via the rootLoader to regenerate it (BSàlC: rebuild).
+           This also re-copies any source paths without derivers (e.g.,
+           .patch files added via builtins.path or path coercion) that were
+           GC'd along with the .drv that referenced them. */
+        auto * realRoot = evalCache->getOrEvaluateRoot();
+        state->forceValue(*realRoot, noPos);
+        auto [v2, pos2] = findAlongAttrPath(*state, resolvedPath, *emptyArgs, *realRoot);
+        state->forceValue(*v2, noPos);
+        if (v2->type() == nAttrs) {
+            auto * aDP2 = v2->attrs()->get(state->s.drvPath);
+            if (aDP2) {
+                state->forceValue(*aDP2->value, aDP2->pos);
+                drvPath = state->store->parseStorePath(aDP2->value->string_view());
+            }
+        }
+        if (!state->store->isValidPath(drvPath))
+            throw Error(
+                "don't know how to recreate store derivation '%s'!",
+                state->store->printStorePath(drvPath));
+    }
 
     std::optional<NixInt::Inner> priority;
 
-    if (attr->maybeGetAttr(state->s.outputSpecified)) {
-    } else if (auto aMeta = attr->maybeGetAttr(state->s.meta)) {
-        if (auto aPriority = aMeta->maybeGetAttr("priority"))
-            priority = aPriority->getInt().value;
+    if (vp->attrs()->get(state->s.outputSpecified)) {
+    } else if (auto * aMeta = vp->attrs()->get(state->s.meta)) {
+        state->forceValue(*aMeta->value, aMeta->pos);
+        if (aMeta->value->type() == nAttrs) {
+            if (auto * aPriority = aMeta->value->attrs()->get(state->symbols.create("priority"))) {
+                state->forceValue(*aPriority->value, aPriority->pos);
+                priority = aPriority->value->integer().value;
+            }
+        }
     }
 
     return {{
@@ -117,17 +173,29 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
                 .drvPath = makeConstantStorePathRef(std::move(drvPath)),
                 .outputs = std::visit(
                     overloaded{
-                        [&](const ExtendedOutputsSpec::Default & d) -> OutputsSpec {
+                        [&](const ExtendedOutputsSpec::Default &) -> OutputsSpec {
                             StringSet outputsToInstall;
-                            if (auto aOutputSpecified = attr->maybeGetAttr(state->s.outputSpecified)) {
-                                if (aOutputSpecified->getBool()) {
-                                    if (auto aOutputName = attr->maybeGetAttr("outputName"))
-                                        outputsToInstall = {aOutputName->getString()};
+                            if (auto * aOutputSpecified = vp->attrs()->get(state->s.outputSpecified)) {
+                                state->forceValue(*aOutputSpecified->value, aOutputSpecified->pos);
+                                if (aOutputSpecified->value->type() == nBool && aOutputSpecified->value->boolean()) {
+                                    if (auto * aOutputName = vp->attrs()->get(state->symbols.create("outputName"))) {
+                                        state->forceValue(*aOutputName->value, aOutputName->pos);
+                                        outputsToInstall = {std::string(aOutputName->value->string_view())};
+                                    }
                                 }
-                            } else if (auto aMeta = attr->maybeGetAttr(state->s.meta)) {
-                                if (auto aOutputsToInstall = aMeta->maybeGetAttr("outputsToInstall"))
-                                    for (auto & s : aOutputsToInstall->getListOfStrings())
-                                        outputsToInstall.insert(s);
+                            } else if (auto * aMeta = vp->attrs()->get(state->s.meta)) {
+                                state->forceValue(*aMeta->value, aMeta->pos);
+                                if (aMeta->value->type() == nAttrs) {
+                                    if (auto * aOTI = aMeta->value->attrs()->get(state->symbols.create("outputsToInstall"))) {
+                                        state->forceValue(*aOTI->value, aOTI->pos);
+                                        if (aOTI->value->type() == nList) {
+                                            for (auto elem : aOTI->value->listView()) {
+                                                state->forceValue(*elem, noPos);
+                                                outputsToInstall.insert(std::string(elem->string_view()));
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             if (outputsToInstall.empty())
@@ -142,7 +210,7 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
         .info = make_ref<ExtraPathInfoFlake>(
             ExtraPathInfoValue::Value{
                 .priority = priority,
-                .attrPath = attrPath,
+                .attrPath = resolvedPath,
                 .extendedOutputsSpec = extendedOutputsSpec,
             },
             ExtraPathInfoFlake::Flake{
@@ -154,36 +222,37 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
 
 std::pair<Value *, PosIdx> InstallableFlake::toValue(EvalState & state)
 {
-    return {&getCursor(state)->forceValue(), noPos};
-}
+    auto evalCache = openTraceCache(state, getLockedFlake());
+    auto * root = evalCache->getRootValue();
+    state.forceValue(*root, noPos);
 
-std::vector<ref<eval_cache::AttrCursor>> InstallableFlake::getCursors(EvalState & state)
-{
-    auto evalCache = openEvalCache(state, getLockedFlake());
-
-    auto root = evalCache->getRoot();
-
-    std::vector<ref<eval_cache::AttrCursor>> res;
-
-    Suggestions suggestions;
     auto attrPaths = getActualAttrPaths();
+    Suggestions suggestions;
+    auto emptyArgs = state.buildBindings(0).finish();
 
+    std::pair<Value *, PosIdx> found{nullptr, noPos};
     for (auto & attrPath : attrPaths) {
         debug("trying flake output attribute '%s'", attrPath);
-
-        auto attr = root->findAlongAttrPath(AttrPath::parse(state, attrPath));
-        if (attr) {
-            res.push_back(ref(*attr));
-        } else {
-            suggestions += attr.getSuggestions();
+        try {
+            found = findAlongAttrPath(state, attrPath, *emptyArgs, *root);
+            resolvedAttrPath_ = attrPath;
+            break;
+        } catch (Error & e) {
+            suggestions += e.info().suggestions;
         }
     }
 
-    if (res.size() == 0)
+    if (!found.first)
         throw Error(suggestions, "flake '%s' does not provide attribute %s", flakeRef, showAttrPaths(attrPaths));
 
-    return res;
+    if (state.settings.verifyTraceCache) {
+        state.forceValue(*found.first, noPos);
+        evalCache->verifyCold(resolvedAttrPath_, *found.first);
+    }
+
+    return found;
 }
+
 
 ref<flake::LockedFlake> InstallableFlake::getLockedFlake() const
 {

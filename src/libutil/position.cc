@@ -50,7 +50,8 @@ std::optional<std::string> Pos::getSource() const
                 } catch (Error &) {
                     return std::nullopt;
                 }
-            }},
+            },
+            [](const Pos::ProvenanceRef &) -> std::optional<std::string> { return std::nullopt; }},
         origin);
 }
 
@@ -69,7 +70,8 @@ void Pos::print(std::ostream & out, bool showOrigin) const
                 [&](const std::monostate &) { out << "«none»"; },
                 [&](const Pos::Stdin &) { out << "«stdin»"; },
                 [&](const Pos::String & s) { out << "«string»"; },
-                [&](const SourcePath & path) { out << path; }},
+                [&](const SourcePath & path) { out << path; },
+                [&](const Pos::ProvenanceRef & pr) { out << "«traced-data:" << pr.id << "»"; }},
             origin);
         out << ":";
     }

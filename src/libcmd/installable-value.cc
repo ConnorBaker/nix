@@ -1,22 +1,7 @@
 #include "nix/cmd/installable-value.hh"
-#include "nix/expr/eval-cache.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 
 namespace nix {
-
-std::vector<ref<eval_cache::AttrCursor>> InstallableValue::getCursors(EvalState & state)
-{
-    auto evalCache =
-        std::make_shared<nix::eval_cache::EvalCache>(std::nullopt, state, [&]() { return toValue(state).first; });
-    return {evalCache->getRoot()};
-}
-
-ref<eval_cache::AttrCursor> InstallableValue::getCursor(EvalState & state)
-{
-    /* Although getCursors should return at least one element, in case it doesn't,
-       bound check to avoid an undefined behavior for vector[0] */
-    return getCursors(state).at(0);
-}
 
 static UsageError nonValueInstallable(Installable & installable)
 {

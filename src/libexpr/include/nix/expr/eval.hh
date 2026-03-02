@@ -25,6 +25,7 @@
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <functional>
 
@@ -52,9 +53,11 @@ enum RepairFlag : bool;
 struct MemorySourceAccessor;
 struct MountedSourceAccessor;
 
-namespace eval_cache {
-class EvalCache;
+namespace eval_trace {
+class TraceCache;
 }
+
+struct EvalTraceContext;
 
 /**
  * Increments a count on construction and decrements on destruction.
@@ -465,9 +468,46 @@ public:
     }
 
     /**
-     * A cache for evaluation caches, so as to reuse the same root value if possible
+     * Trace-aware evaluation context (BSàlC trace store + Adapton DDG).
+     * Holds evalCaches, fileContentHashes, mountToInput, epochMap.
+     * Non-null when eval-trace is enabled (the default); nullptr otherwise.
      */
-    std::map<const Hash, ref<eval_cache::EvalCache>> evalCaches;
+    std::unique_ptr<EvalTraceContext> traceCtx;
+
+    /**
+     * Non-zero only inside TracedExpr::evaluateFresh(), so forceValue
+     * skips replayMemoizedDeps when no DependencyTracker is active.
+     */
+    uint32_t traceActiveDepth = 0;
+
+    /**
+     * Record Content oracle dep for an imported/evaled file path.
+     * Outlined from evalFile() to reduce hot function code size.
+     */
+    [[gnu::noinline]]
+    void recordImportContentDep(const SourcePath & resolvedPath);
+
+    /**
+     * Outlined thunk-forcing path for forceValue (reduces inline code size).
+     */
+    [[gnu::noinline]]
+    void forceThunkValue(Value & v, PosIdx pos);
+
+    /**
+     * Outlined app-forcing path for forceValue (reduces inline code size).
+     */
+    [[gnu::noinline]]
+    void forceAppValue(Value & v, PosIdx pos);
+
+    /**
+     * Get the mount-to-input mapping. Returns an empty map if traceCtx is null.
+     */
+    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & getMountToInput() const;
+
+    /**
+     * Flush trace caches to persist SQLite WAL. Safe to call when traceCtx is null.
+     */
+    void flushTraceContext();
 
 private:
 
@@ -490,7 +530,7 @@ private:
         std::hash<SourcePath>,
         std::equal_to<SourcePath>,
         traceable_allocator<std::pair<const SourcePath, Value *>>>>
-        fileEvalCache;
+        fileTraceCache;
 
     /**
      * Associate source positions of certain AST nodes with their preceding doc comment, if they have one.
@@ -705,6 +745,14 @@ public:
     inline void forceAttrs(Value & v, Callable getPos, std::string_view errorCtx);
 
     inline void forceList(Value & v, const PosIdx pos, std::string_view errorCtx);
+
+    /**
+     * Force a list value and record a #len shape dep if the list has
+     * TracedData provenance. Combines forceList + maybeRecordListLenDep
+     * so primops don't need to remember the hook.
+     */
+    void forceListObserved(Value & v, const PosIdx pos, std::string_view errorCtx);
+
     /**
      * @param v either lambda or primop
      */

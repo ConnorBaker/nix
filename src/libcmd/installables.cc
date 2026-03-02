@@ -17,7 +17,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/main/shared.hh"
 #include "nix/flake/flake.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/util/url.hh"
 #include "nix/fetchers/registry.hh"
 #include "nix/store/build-result.hh"
@@ -349,10 +349,12 @@ void completeFlakeRefWithFragment(
             auto flakeRef =
                 parseFlakeRef(fetchSettings, expandTilde(flakeRefS), std::filesystem::current_path().string());
 
-            auto evalCache = openEvalCache(
+            auto evalCache = openTraceCache(
                 *evalState, make_ref<flake::LockedFlake>(lockFlake(flakeSettings, *evalState, flakeRef, lockFlags)));
 
-            auto root = evalCache->getRoot();
+            auto * root = evalCache->getRootValue();
+            try { evalState->forceValue(*root, noPos); } catch (...) { return; }
+            if (root->type() != nAttrs) return;
 
             if (prefixRoot == ".") {
                 attrPathPrefixes.clear();
@@ -361,6 +363,18 @@ void completeFlakeRefWithFragment(
                attrpath prefixes as well as the root of the
                flake. */
             attrPathPrefixes.push_back("");
+
+            // Navigate along an AttrPath through Value attrsets.
+            auto navigateTo = [&](Value * v, const AttrPath & path) -> Value * {
+                for (auto & sym : path) {
+                    try { evalState->forceValue(*v, noPos); } catch (...) { return nullptr; }
+                    if (v->type() != nAttrs) return nullptr;
+                    auto * attr = v->attrs()->get(sym);
+                    if (!attr) return nullptr;
+                    v = attr->value;
+                }
+                return v;
+            };
 
             for (auto & attrPathPrefixS : attrPathPrefixes) {
                 auto attrPathPrefix = AttrPath::parse(*evalState, attrPathPrefixS);
@@ -373,13 +387,15 @@ void completeFlakeRefWithFragment(
                     attrPath.pop_back();
                 }
 
-                auto attr = root->findAlongAttrPath(attrPath);
-                if (!attr)
-                    continue;
+                auto * v = navigateTo(root, attrPath);
+                if (!v) continue;
+                try { evalState->forceValue(*v, noPos); } catch (...) { continue; }
+                if (v->type() != nAttrs) continue;
 
-                for (auto & attr2 : (*attr)->getAttrs()) {
-                    if (hasPrefix(evalState->symbols[attr2], lastAttr)) {
-                        auto attrPath2 = (*attr)->getAttrPath(attr2);
+                for (auto & attr2 : *v->attrs()) {
+                    if (hasPrefix(evalState->symbols[attr2.name], lastAttr)) {
+                        auto attrPath2 = attrPath;
+                        attrPath2.push_back(attr2.name);
                         /* Strip the attrpath prefix. */
                         attrPath2.erase(attrPath2.begin(), attrPath2.begin() + attrPathPrefix.size());
                         // FIXME: handle names with dots
@@ -392,9 +408,8 @@ void completeFlakeRefWithFragment(
                attrpaths. */
             if (fragment.empty()) {
                 for (auto & attrPath : defaultFlakeAttrPaths) {
-                    auto attr = root->findAlongAttrPath(AttrPath::parse(*evalState, attrPath));
-                    if (!attr)
-                        continue;
+                    auto * v = navigateTo(root, AttrPath::parse(*evalState, attrPath));
+                    if (!v) continue;
                     completions.add(flakeRefS + "#" + prefixRoot);
                 }
             }
@@ -466,16 +481,39 @@ Installables SourceExprCommand::parseInstallables(ref<Store> store, std::vector<
         auto state = getEvalState();
         auto vFile = state->allocValue();
 
+        // When the eval trace is enabled and the source is cacheable (not stdin),
+        // defer evaluation: the rootLoader in getOrCreateTraceCache() will
+        // perform fresh evaluation to record oracle deps (Adapton DDG edges).
+        // Evaluating eagerly here would be wasted work.
+        // Don't defer when pureEval is true: eager evaluation enforces pureEval
+        // restrictions (e.g., no readFile) before the trace is consulted,
+        // preventing previously-traced impure results from being served in
+        // pure eval mode.
+        bool deferEval = evalSettings.useTraceCache && !evalSettings.pureEval
+            && !(file && file->string() == "-");
+
         if (file == "-") {
             auto e = state->parseStdin();
             state->eval(e, *vFile);
         } else if (file) {
-            auto dir = absPath(getCommandBaseDir());
-            state->evalFile(lookupFileArg(*state, file->string(), &dir), *vFile);
+            if (deferEval) {
+                auto dir = absPath(getCommandBaseDir());
+                auto e = state->parseExprFromFile(lookupFileArg(*state, file->string(), &dir));
+                state->mkThunk_(*vFile, e);
+            } else {
+                auto dir = absPath(getCommandBaseDir());
+                state->evalFile(lookupFileArg(*state, file->string(), &dir), *vFile);
+            }
         } else {
-            auto dir = absPath(getCommandBaseDir());
-            auto e = state->parseExprFromString(*expr, state->rootPath(dir.string()));
-            state->eval(e, *vFile);
+            if (deferEval) {
+                auto dir = absPath(getCommandBaseDir());
+                auto e = state->parseExprFromString(*expr, state->rootPath(dir.string()));
+                state->mkThunk_(*vFile, e);
+            } else {
+                auto dir = absPath(getCommandBaseDir());
+                auto e = state->parseExprFromString(*expr, state->rootPath(dir.string()));
+                state->eval(e, *vFile);
+            }
         }
 
         for (auto & s : ss) {

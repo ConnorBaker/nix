@@ -169,6 +169,7 @@ sources = [ config_priv_h ] + files(
   'signature/signer.cc',
   'source-accessor.cc',
   'source-path.cc',
+  'string-intern-table.cc',
   'strings.cc',
   'suggestions.cc',
   'table.cc',

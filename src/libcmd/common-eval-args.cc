@@ -16,6 +16,8 @@
 #include "nix/cmd/compatibility-settings.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/globals.hh"
+#include "nix/util/hash.hh"
+
 
 namespace nix {
 
@@ -150,6 +152,31 @@ MixEvalArgs::MixEvalArgs()
         .labels = {"store-url"},
         .handler = {[this](std::string s) { evalStoreUrl = StoreReference::parse(s); }},
     });
+}
+
+std::optional<std::string> MixEvalArgs::getAutoArgsIdentity() const
+{
+    if (autoArgs.empty())
+        return "";
+    HashSink hasher(HashAlgorithm::BLAKE3);
+    for (auto & [name, arg] : autoArgs) {
+        hasher(name);
+        hasher(std::string_view("\0", 1));
+        if (auto * e = std::get_if<AutoArgExpr>(&arg)) {
+            hasher("expr:");
+            hasher(e->expr);
+        } else if (auto * s = std::get_if<AutoArgString>(&arg)) {
+            hasher("str:");
+            hasher(s->s);
+        } else if (auto * f = std::get_if<AutoArgFile>(&arg)) {
+            hasher("file:");
+            auto content = readFile(f->path.string());
+            hasher(content);
+        } else // AutoArgStdin — not cacheable
+            return std::nullopt;
+        hasher(std::string_view("\0", 1));
+    }
+    return hasher.finish().hash.to_string(HashFormat::Base16, false);
 }
 
 Bindings * MixEvalArgs::getAutoArgs(EvalState & state)

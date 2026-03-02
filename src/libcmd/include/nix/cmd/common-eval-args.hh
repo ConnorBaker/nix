@@ -54,6 +54,13 @@ struct MixEvalArgs : virtual Args, virtual MixRepair
 
     Bindings * getAutoArgs(EvalState & state);
 
+    /**
+     * Serialize auto-args into a stable string for cache identity purposes.
+     * Returns std::nullopt if args contain stdin (not cacheable).
+     * Returns "" if no auto-args are present.
+     */
+    std::optional<std::string> getAutoArgsIdentity() const;
+
     LookupPath lookupPath;
 
     std::optional<StoreReference> evalStoreUrl;

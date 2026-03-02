@@ -3,6 +3,7 @@
 
 #include "nix/expr/print.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-trace/context.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 #include <exception>
@@ -84,32 +85,16 @@ Env & EvalMemory::allocEnv(size_t size)
 }
 
 [[gnu::always_inline]]
-void EvalState::forceValue(Value & v, const PosIdx pos)
+inline void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    if (v.isThunk()) {
-        Env * env = v.thunk().env;
-        assert(env || v.isBlackhole());
-        Expr * expr = v.thunk().expr;
-        try {
-            v.mkBlackhole();
-            if (env) [[likely]]
-                expr->eval(*this, *env, v);
-            else
-                ExprBlackHole::throwInfiniteRecursionError(*this, v);
-        } catch (...) {
-            handleEvalExceptionForThunk(env, expr, v, pos);
-            throw;
-        }
-    } else if (v.isApp()) {
-        Value savedApp = v;
-        try {
-            callFunction(*v.app().left, *v.app().right, v, pos);
-        } catch (...) {
-            handleEvalExceptionForApp(v, savedApp);
-            throw;
-        }
+    if (v.isThunk()) [[unlikely]] {
+        forceThunkValue(v, pos);
+    } else if (v.isApp()) [[unlikely]] {
+        forceAppValue(v, pos);
     } else if (v.isFailed()) {
         handleEvalFailed(v, pos);
+    } else if (traceActiveDepth) {
+        traceCtx->replayMemoizedDeps(v);
     }
 }
 

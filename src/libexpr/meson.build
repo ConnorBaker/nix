@@ -91,6 +91,9 @@ configdata_priv.set(
 
 deps_other += toml11
 
+sqlite = dependency('sqlite3', 'sqlite', version : '>=3.37.0')
+deps_other += sqlite
+
 config_priv_h = configure_file(
   configuration : configdata_priv,
   output : 'expr-config-private.hh',
@@ -154,7 +157,12 @@ sources = files(
   'attr-path.cc',
   'attr-set.cc',
   'diagnose.cc',
-  'eval-cache.cc',
+  'eval-trace/context.cc',
+  'eval-trace/cache/trace-cache.cc',
+  'eval-trace/store/attr-vocab-store.cc',
+  'eval-trace/store/trace-store.cc',
+  'eval-trace/deps/hash.cc',
+  'eval-trace/deps/recording.cc',
   'eval-error.cc',
   'eval-gc.cc',
   'eval-profiler-settings.cc',

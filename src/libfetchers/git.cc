@@ -1079,6 +1079,11 @@ struct GitInputScheme : InputScheme
         return {accessor, std::move(final)};
     }
 
+    std::optional<std::string> getStableIdentity(const Input & input) const override
+    {
+        return fmt("git:%s", getStrAttr(input.attrs, "url"));
+    }
+
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
     {
         auto makeFingerprint = [&](const Hash & rev) {

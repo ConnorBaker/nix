@@ -51,7 +51,21 @@ struct Pos
         }
     };
 
-    typedef std::variant<std::monostate, Stdin, String, SourcePath> Origin;
+    /**
+     * Opaque reference to eval-trace provenance data. The actual
+     * provenance record (source ID, file path, data path, format)
+     * lives in a ProvenanceTable in libexpr. libutil only knows
+     * "this position has provenance" (1 tag bit in PosIdx + this index).
+     */
+    struct ProvenanceRef
+    {
+        uint32_t id;
+
+        bool operator==(const ProvenanceRef &) const = default;
+        auto operator<=>(const ProvenanceRef &) const = default;
+    };
+
+    typedef std::variant<std::monostate, Stdin, String, SourcePath, ProvenanceRef> Origin;
 
     Origin origin = std::monostate();
 

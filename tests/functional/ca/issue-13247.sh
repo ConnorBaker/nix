@@ -15,20 +15,34 @@ nix build -f issue-13247.nix --json a a-prime use-a-more-outputs --no-link > "$T
 
 cache="file://$TEST_ROOT/cache"
 
-# Copy all outputs and realisations to cache
+# Copy all outputs and realisations to cache.
+# First copy the exact drvs from the build JSON.
 declare -a drvs
-for d in "$NIX_STORE_DIR"/*-issue-13247-a.drv "$NIX_STORE_DIR"/*-use-a-more-outputs.drv; do
+while IFS= read -r d; do
     drvs+=("$d" "$d"^*)
-done
+done < <(jq -r '.[] | .drvPath' "$TEST_ROOT"/a.json)
 nix copy --to "$cache" "${drvs[@]}"
+# Also copy resolved drvs (needed for CA early cut-off via derivation
+# resolution). Glob may also match eval trace drvs — copy those
+# best-effort (they are InputAddressed and harmless in the cache).
+for d in "$NIX_STORE_DIR"/*-issue-13247-a.drv "$NIX_STORE_DIR"/*-use-a-more-outputs.drv; do
+    nix copy --to "$cache" "$d" "$d"^* 2>/dev/null || true
+done
 
 function delete () {
+    # The eval trace store backend writes CBOR result files into the store
+    # whose content includes serialized store path strings (drvPath, outPath).
+    # The store's NAR scanner picks these up as references, preventing
+    # deletion of the user paths they mention. Delete referrers first.
+    # shellcheck disable=SC2046
+    nix-store --delete \
+        $(nix-store --query --referrers \
+            $(jq -r <"$TEST_ROOT"/a.json '.[] | .drvPath, .outputs.[]') \
+            2>/dev/null) 2>/dev/null || true
     # Delete local copy
     # shellcheck disable=SC2046
     nix-store --delete \
-        $(jq -r <"$TEST_ROOT"/a.json '.[] | .drvPath, .outputs.[]') \
-        "$NIX_STORE_DIR"/*-issue-13247-a.drv \
-        "$NIX_STORE_DIR"/*-use-a-more-outputs.drv
+        $(jq -r <"$TEST_ROOT"/a.json '.[] | .drvPath, .outputs.[]')
 
     [[ ! -e "$(jq -r <"$TEST_ROOT"/a.json '.[0].outputs.out')" ]]
     [[ ! -e "$(jq -r <"$TEST_ROOT"/a.json '.[1].outputs.out')" ]]

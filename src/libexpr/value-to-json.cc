@@ -1,5 +1,6 @@
 #include "nix/expr/value-to-json.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/signals.hh"
 
@@ -58,6 +59,7 @@ json printValueAsJSON(
         if (auto i = v.attrs()->get(state.s.outPath))
             return printValueAsJSON(state, strict, *i->value, i->pos, context, copyToStore);
         else {
+            if (state.traceActiveDepth) [[unlikely]] maybeRecordAttrKeysDep(state.positions, state.symbols, v);
             out = json::object();
             for (auto & a : v.attrs()->lexicographicOrder(state.symbols)) {
                 try {
@@ -75,6 +77,7 @@ json printValueAsJSON(
     }
 
     case nList: {
+        if (state.traceActiveDepth) [[unlikely]] maybeRecordListLenDep(v);
         out = json::array();
         int i = 0;
         for (auto elem : v.listView()) {
