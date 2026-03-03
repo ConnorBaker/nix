@@ -455,6 +455,7 @@ struct ValueBase
             } catch (...) {
                 throw;
             }
+            std::abort(); // unreachable: rethrow_exception always throws
         }
     };
 };

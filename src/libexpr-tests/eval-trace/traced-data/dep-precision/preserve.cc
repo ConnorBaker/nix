@@ -199,7 +199,7 @@ TEST_F(DepPrecisionPreserveTest, Update_KeyAdded_AttrNames_CacheMiss)
     {
         int loaderCalls = 0;
         auto cache = makeCache(expr, &loaderCalls);
-        auto v = forceRoot(*cache);
+        (void) forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1) << "attrNames must detect key addition via #keys";
     }
 }

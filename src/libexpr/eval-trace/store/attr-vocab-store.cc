@@ -135,13 +135,13 @@ std::string AttrVocabStore::displayPath(AttrPathId id) const
     // Recurse to root first, then append on the way back —
     // the call stack provides root-to-leaf ordering.
     std::string result;
-    auto append = [&](this auto & self, AttrPathId cur) -> void {
+    auto append = [&](auto & self, AttrPathId cur) -> void {
         if (cur == rootPath()) return;
-        self(parentPath(cur));
+        self(self, parentPath(cur));
         if (!result.empty()) result += '.';
         result += resolveName(childName(cur));
     };
-    append(id);
+    append(append, id);
     return result;
 }
 
@@ -149,15 +149,15 @@ void AttrVocabStore::hashPath(HashSink & sink, AttrPathId pathId) const
 {
     // Recurse to root first, then feed on the way back —
     // the call stack provides root-to-leaf ordering.
-    auto feed = [&](this auto const & self, AttrPathId cur) -> void {
+    auto feed = [&](auto const & self, AttrPathId cur) -> void {
         if (cur == rootPath()) return;
-        self(parentPath(cur));
+        self(self, parentPath(cur));
         auto name = resolveName(childName(cur));
         uint32_t len = static_cast<uint32_t>(name.size());
         sink({reinterpret_cast<const char *>(&len), sizeof(len)});
         sink(name);
     };
-    feed(pathId);
+    feed(feed, pathId);
 }
 
 // ── Lookup without interning ─────────────────────────────────────────
