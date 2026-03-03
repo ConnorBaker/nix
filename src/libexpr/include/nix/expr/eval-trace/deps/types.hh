@@ -450,7 +450,7 @@ inline constexpr std::string_view absolutePathDep = "<absolute>";
  * owned strings. DepSourceId and DepKeyId share the same index space as
  * StringId — all three are uint32_t indices into InterningPools::strings.
  * Zero per-dep heap allocation; string data lives in the arena.
- * Resolve via pools.resolve(sourceId) / pools.resolve(keyId).
+ * Resolve via pools.resolve(key.sourceId) / pools.resolve(key.keyId).
  *
  * For file deps (Content/Directory/Existence), keyId resolves to:
  *   - relative path for flake inputs (with non-empty sourceId)
@@ -464,21 +464,38 @@ inline constexpr std::string_view absolutePathDep = "<absolute>";
  *   - UnhashedFetch: the fetch URL
  */
 struct Dep {
-    DepType type;
-    DepSourceId sourceId;    ///< Flake input name (interned in StringInternTable)
-    DepKeyId keyId;          ///< Dep key string (interned in StringInternTable)
-    DepHashValue expectedHash;
+    struct Key {
+        DepType type;
+        DepSourceId sourceId;    ///< Flake input name (interned in StringInternTable)
+        DepKeyId keyId;          ///< Dep key string (interned in StringInternTable)
+
+        auto operator<=>(const Key &) const = default;
+
+        struct Hash {
+            using is_avalanching = void;
+            std::size_t operator()(const Key & k) const noexcept {
+                return hashValues(std::to_underlying(k.type),
+                                  k.sourceId.value, k.keyId.value);
+            }
+        };
+    };
+
+    Key key;
+    DepHashValue hash;
+
+    auto operator<=>(const Dep & o) const { return key <=> o.key; }
+    bool operator==(const Dep & o) const { return key == o.key; }
 
     /// Create a ParentContext dep storing AttrPathId directly in the keyId slot.
     /// SourceId is 0 (empty) by convention for ParentContext deps.
     static Dep makeParentContext(AttrPathId pathId, DepHashValue hash) {
-        return {DepType::ParentContext, DepSourceId(0), DepKeyId(pathId.value), std::move(hash)};
+        return {{DepType::ParentContext, DepSourceId(0), DepKeyId(pathId.value)}, std::move(hash)};
     }
 
     /// Extract the AttrPathId from a ParentContext dep's keyId slot.
     AttrPathId parentContextPath() const {
-        assert(type == DepType::ParentContext);
-        return AttrPathId(keyId.value);
+        assert(key.type == DepType::ParentContext);
+        return AttrPathId(key.keyId.value);
     }
 };
 

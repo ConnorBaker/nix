@@ -92,12 +92,12 @@ TEST_F(DepHashTest, SortAndDedup_SortsCorrectly)
     auto sorted = sortAndDedupDeps(deps);
     ASSERT_EQ(sorted.size(), 3u);
     // Content (type=1) before EnvVar (type=4)
-    EXPECT_EQ(sorted[0].type, DepType::Content);
-    EXPECT_EQ(sorted[1].type, DepType::Content);
-    EXPECT_EQ(sorted[2].type, DepType::EnvVar);
+    EXPECT_EQ(sorted[0].key.type, DepType::Content);
+    EXPECT_EQ(sorted[1].key.type, DepType::Content);
+    EXPECT_EQ(sorted[2].key.type, DepType::EnvVar);
     // Both Content keys present (order depends on intern IDs)
     std::set<std::string_view> contentKeys{
-        pools.resolve(sorted[0].keyId), pools.resolve(sorted[1].keyId)};
+        pools.resolve(sorted[0].key.keyId), pools.resolve(sorted[1].key.keyId)};
     EXPECT_TRUE(contentKeys.count("/a.nix"));
     EXPECT_TRUE(contentKeys.count("/z.nix"));
 }

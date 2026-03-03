@@ -15,14 +15,14 @@ TEST_F(TraceStoreTest, BlobRoundTrip_StructuredContent)
 {
     // StructuredContent deps use Blake3 hashes, like Content.
     // Verify they round-trip correctly through the factored serialization.
-    std::vector<TraceStore::InternedDepKey> keys;
-    std::vector<TraceStore::InternedDep> deps;
+    std::vector<Dep::Key> keys;
+    std::vector<Dep> deps;
 
-    keys.push_back({DepType::StructuredContent, StringId(1), StringId(2)});
-    deps.push_back({{DepType::StructuredContent, StringId(1), StringId(2)}, DepHashValue(depHash("scalar-value"))});
+    keys.push_back({DepType::StructuredContent, DepSourceId(1), DepKeyId(2)});
+    deps.push_back({{DepType::StructuredContent, DepSourceId(1), DepKeyId(2)}, DepHashValue(depHash("scalar-value"))});
 
-    keys.push_back({DepType::Content, StringId(3), StringId(4)});
-    deps.push_back({{DepType::Content, StringId(3), StringId(4)}, DepHashValue(depHash("file-content"))});
+    keys.push_back({DepType::Content, DepSourceId(3), DepKeyId(4)});
+    deps.push_back({{DepType::Content, DepSourceId(3), DepKeyId(4)}, DepHashValue(depHash("file-content"))});
 
     auto keysBlob = TraceStore::serializeKeys(keys);
     auto keysResult = TraceStore::deserializeKeys(keysBlob.data(), keysBlob.size());
@@ -51,16 +51,16 @@ TEST_F(TraceStoreTest, BlobRoundTrip_32ByteStringVsBlake3)
     std::string exactly32 = "abcdefghijklmnopqrstuvwxyz012345"; // 32 chars
     ASSERT_EQ(exactly32.size(), 32u);
 
-    std::vector<TraceStore::InternedDepKey> keys;
-    std::vector<TraceStore::InternedDep> deps;
+    std::vector<Dep::Key> keys;
+    std::vector<Dep> deps;
 
     // CopiedPath with exactly 32-byte string value
-    keys.push_back({DepType::CopiedPath, StringId(1), StringId(2)});
-    deps.push_back({{DepType::CopiedPath, StringId(1), StringId(2)}, DepHashValue(exactly32)});
+    keys.push_back({DepType::CopiedPath, DepSourceId(1), DepKeyId(2)});
+    deps.push_back({{DepType::CopiedPath, DepSourceId(1), DepKeyId(2)}, DepHashValue(exactly32)});
 
     // Content with Blake3 hash (also 32 bytes)
-    keys.push_back({DepType::Content, StringId(3), StringId(4)});
-    deps.push_back({{DepType::Content, StringId(3), StringId(4)}, DepHashValue(depHash("data"))});
+    keys.push_back({DepType::Content, DepSourceId(3), DepKeyId(4)});
+    deps.push_back({{DepType::Content, DepSourceId(3), DepKeyId(4)}, DepHashValue(depHash("data"))});
 
     auto keysBlob = TraceStore::serializeKeys(keys);
     auto keysResult = TraceStore::deserializeKeys(keysBlob.data(), keysBlob.size());
@@ -83,18 +83,18 @@ TEST_F(TraceStoreTest, BlobRoundTrip_32ByteStringVsBlake3)
 TEST_F(TraceStoreTest, BlobRoundTrip_SingleEntry)
 {
     // Boundary: single dep in the serialization.
-    std::vector<TraceStore::InternedDepKey> keys;
-    std::vector<TraceStore::InternedDep> deps;
+    std::vector<Dep::Key> keys;
+    std::vector<Dep> deps;
 
-    keys.push_back({DepType::EnvVar, StringId(42), StringId(99)});
-    deps.push_back({{DepType::EnvVar, StringId(42), StringId(99)}, DepHashValue(depHash("HOME=/home/user"))});
+    keys.push_back({DepType::EnvVar, DepSourceId(42), DepKeyId(99)});
+    deps.push_back({{DepType::EnvVar, DepSourceId(42), DepKeyId(99)}, DepHashValue(depHash("HOME=/home/user"))});
 
     auto keysBlob = TraceStore::serializeKeys(keys);
     auto keysResult = TraceStore::deserializeKeys(keysBlob.data(), keysBlob.size());
     ASSERT_EQ(keysResult.size(), 1u);
     EXPECT_EQ(keysResult[0].type, DepType::EnvVar);
-    EXPECT_EQ(keysResult[0].sourceId, StringId(42));
-    EXPECT_EQ(keysResult[0].keyId, StringId(99));
+    EXPECT_EQ(keysResult[0].sourceId, DepSourceId(42));
+    EXPECT_EQ(keysResult[0].keyId, DepKeyId(99));
 
     auto valsBlob = TraceStore::serializeValues(deps);
     auto valsResult = TraceStore::deserializeValues(valsBlob.data(), valsBlob.size(), keysResult);
@@ -106,16 +106,16 @@ TEST_F(TraceStoreTest, BlobRoundTrip_AllDepTypes)
 {
     // Round-trip test covering every dep type in the DepType enum.
     // This ensures isBlake3Dep is consistent with serialization/deserialization.
-    std::vector<TraceStore::InternedDepKey> keys;
-    std::vector<TraceStore::InternedDep> deps;
+    std::vector<Dep::Key> keys;
+    std::vector<Dep> deps;
 
     auto addBlake3 = [&](DepType type, uint32_t sid, uint32_t kid, std::string_view data) {
-        keys.push_back({type, StringId(sid), StringId(kid)});
-        deps.push_back({{type, StringId(sid), StringId(kid)}, DepHashValue(depHash(data))});
+        keys.push_back({type, DepSourceId(sid), DepKeyId(kid)});
+        deps.push_back({{type, DepSourceId(sid), DepKeyId(kid)}, DepHashValue(depHash(data))});
     };
     auto addString = [&](DepType type, uint32_t sid, uint32_t kid, std::string_view data) {
-        keys.push_back({type, StringId(sid), StringId(kid)});
-        deps.push_back({{type, StringId(sid), StringId(kid)}, DepHashValue(std::string(data))});
+        keys.push_back({type, DepSourceId(sid), DepKeyId(kid)});
+        deps.push_back({{type, DepSourceId(sid), DepKeyId(kid)}, DepHashValue(std::string(data))});
     };
 
     // Blake3 dep types

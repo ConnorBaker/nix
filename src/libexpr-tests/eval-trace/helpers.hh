@@ -260,51 +260,51 @@ inline AttrPathId vocabPath(AttrVocabStore & vocab, std::initializer_list<std::s
 
 inline Dep makeContentDep(InterningPools & p, std::string_view key, std::string_view content)
 {
-    return {DepType::Content, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key), depHash(content)};
+    return {{DepType::Content, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key)}, depHash(content)};
 }
 
 inline Dep makeEnvVarDep(InterningPools & p, std::string_view key, std::string_view value)
 {
-    return {DepType::EnvVar, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key), depHash(value)};
+    return {{DepType::EnvVar, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key)}, depHash(value)};
 }
 
 inline Dep makeExistenceDep(InterningPools & p, std::string_view key, bool exists)
 {
-    return {DepType::Existence, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key),
+    return {{DepType::Existence, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key)},
         DepHashValue(exists ? std::string("type:1") : std::string("missing"))};
 }
 
 inline Dep makeSystemDep(InterningPools & p, std::string_view system)
 {
-    return {DepType::System, p.intern<DepSourceId>(""), p.intern<DepKeyId>(""), depHash(system)};
+    return {{DepType::System, p.intern<DepSourceId>(""), p.intern<DepKeyId>("")}, depHash(system)};
 }
 
 inline Dep makeCurrentTimeDep(InterningPools & p)
 {
-    return {DepType::CurrentTime, p.intern<DepSourceId>(""), p.intern<DepKeyId>(""),
+    return {{DepType::CurrentTime, p.intern<DepSourceId>(""), p.intern<DepKeyId>("")},
         DepHashValue(std::string("volatile"))};
 }
 
 inline Dep makeExecDep(InterningPools & p)
 {
-    return {DepType::Exec, p.intern<DepSourceId>(""), p.intern<DepKeyId>(""),
+    return {{DepType::Exec, p.intern<DepSourceId>(""), p.intern<DepKeyId>("")},
         DepHashValue(std::string("volatile"))};
 }
 
 inline Dep makeCopiedPathDep(InterningPools & p, std::string_view key, std::string_view storePath)
 {
-    return {DepType::CopiedPath, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key),
+    return {{DepType::CopiedPath, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key)},
         DepHashValue(std::string(storePath))};
 }
 
 inline Dep makeNARContentDep(InterningPools & p, std::string_view key, const Blake3Hash & hash)
 {
-    return {DepType::NARContent, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key), hash};
+    return {{DepType::NARContent, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key)}, hash};
 }
 
 inline Dep makeDirectoryDep(InterningPools & p, std::string_view key, const Blake3Hash & hash)
 {
-    return {DepType::Directory, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key), hash};
+    return {{DepType::Directory, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key)}, hash};
 }
 
 /// Create a ParentContext Dep from an AttrPathId and trace hash.
@@ -459,10 +459,10 @@ protected:
         result.reserve(deps.size());
         for (auto & d : deps) {
             result.push_back(ResolvedDep{
-                std::string(pools.resolve(d.sourceId)),
-                std::string(pools.resolve(d.keyId)),
-                d.expectedHash,
-                d.type});
+                std::string(pools.resolve(d.key.sourceId)),
+                std::string(pools.resolve(d.key.keyId)),
+                d.hash,
+                d.key.type});
         }
         return result;
     }

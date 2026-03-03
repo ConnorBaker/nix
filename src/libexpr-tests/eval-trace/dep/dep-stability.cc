@@ -20,7 +20,7 @@ static std::vector<std::string> keys(InterningPools & pools, const std::vector<D
     std::vector<std::string> out;
     out.reserve(deps.size());
     for (auto & d : deps)
-        out.push_back(std::string(pools.resolve(d.keyId)));
+        out.push_back(std::string(pools.resolve(d.key.keyId)));
     return out;
 }
 
@@ -361,7 +361,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
     auto fileHash = StatHashStore::instance().depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
     std::vector<Dep> xDeps = {
-        {DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string()), DepHashValue(fileHash)},
+        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string())}, DepHashValue(fileHash)},
         makeParentContextDep(rootPath(), *rootHash),
     };
     db.record(xPathId, CachedResult(int_t{NixInt(11)}), xDeps, false);
@@ -408,7 +408,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_NoChange_StillValid)
     auto fileHash = StatHashStore::instance().depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
     db.record(xPathId, CachedResult(int_t{NixInt(42)}),
-        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string()), DepHashValue(fileHash)},
+        {{{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string())}, DepHashValue(fileHash)},
          makeParentContextDep(rootPath(), *rootHash)}, false);
     auto xHash = db.getCurrentTraceHash(xPathId);
     ASSERT_TRUE(xHash.has_value());
@@ -447,7 +447,7 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
     auto fileHash = StatHashStore::instance().depHashFile(
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
     db.record(xPathId, CachedResult(string_t{"x_v1", {}}),
-        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string()), DepHashValue(fileHash)},
+        {{{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string())}, DepHashValue(fileHash)},
          makeParentContextDep(rootPath(), *rootHash)},
         false);
     auto xHash = db.getCurrentTraceHash(xPathId);
@@ -504,7 +504,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
         SourcePath(getFSSourceAccessor(), CanonPath(depAFile.path.string())));
     auto xPathId = vpath({"x"});
     db.record(xPathId, CachedResult(int_t{NixInt(11)}),
-        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(depAFile.path.string()), DepHashValue(depAHash)},
+        {{{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(depAFile.path.string())}, DepHashValue(depAHash)},
          makeParentContextDep(rootPath(), *rootTraceHash)},
         false);
     auto xTraceHash = db.getCurrentTraceHash(xPathId);
@@ -515,7 +515,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
         SourcePath(getFSSourceAccessor(), CanonPath(depBFile.path.string())));
     auto zPathId = vpath({"z"});
     db.record(zPathId, CachedResult(int_t{NixInt(99)}),
-        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(depBFile.path.string()), DepHashValue(depBHash)},
+        {{{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(depBFile.path.string())}, DepHashValue(depBHash)},
          makeParentContextDep(rootPath(), *rootTraceHash)},
         false);
 

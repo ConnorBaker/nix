@@ -113,41 +113,6 @@ struct TraceStore {
     AttrVocabStore & vocab;
     int64_t contextHash;
 
-    // Interned dep key (string IDs, no hash value). Used for keys_blob serialization
-    // (positionally in keys_blob, indexed by DepKeySetId in the session cache)
-    // and as the key type for currentDepHashes (replacing string-based DepKey).
-    //
-    // StringId, DepSourceId, and DepKeyId all share the same StringInternTable
-    // index space. We use StringId here for storage; internDeps() converts
-    // DepSourceId/DepKeyId to StringId via raw value copy.
-    struct InternedDepKey {
-        DepType type;
-        StringId sourceId;
-        StringId keyId;
-
-        auto operator<=>(const InternedDepKey &) const = default;
-
-        struct Hash {
-            // TODO: is_avalanching claims the hash is well-distributed, but
-            // hashValues uses boost-style hash_combine which is not avalanching.
-            // Boost skips its internal mixing when this trait is present.
-            using is_avalanching = void;
-            std::size_t operator()(const InternedDepKey & k) const noexcept {
-                return hashValues(std::to_underlying(k.type), k.sourceId.value, k.keyId.value);
-            }
-        };
-    };
-
-    // Interned dep entry (key + hash value — used for full dep reconstruction).
-    // Comparison is by key only (hash is a payload, not identity).
-    struct InternedDep {
-        InternedDepKey key;
-        DepHashValue hash;
-
-        auto operator<=>(const InternedDep & o) const { return key <=> o.key; }
-        bool operator==(const InternedDep & o) const { return key == o.key; }
-    };
-
     struct TraceRow {
         TraceId traceId;
         ResultId resultId;
@@ -164,7 +129,7 @@ struct TraceStore {
     struct CachedTraceData {
         Hash traceHash{HashAlgorithm::BLAKE3};
         Hash structHash{HashAlgorithm::BLAKE3};
-        std::optional<std::vector<InternedDep>> deps;
+        std::optional<std::vector<Dep>> deps;
 
         /** True if hash fields have been populated from DB (non-placeholder).
          *  Checks traceHash — if it's populated, structHash was populated
@@ -198,12 +163,12 @@ struct TraceStore {
     /// DepKeySet session cache: maps DepKeySetId → resolved dep keys.
     /// Keyed by integer ID (not hash) because we look up by ID after DB queries.
     /// Avoids re-decompressing keys_blob when multiple traces share a key set.
-    boost::unordered_flat_map<DepKeySetId, std::vector<InternedDepKey>, DepKeySetId::Hash> depKeySetCache;
+    boost::unordered_flat_map<DepKeySetId, std::vector<Dep::Key>, DepKeySetId::Hash> depKeySetCache;
 
     /// Current dep hash cache (persists across verification → recovery within session).
     /// Value is nullopt if the dep's resource is unavailable (e.g., file deleted);
     /// this caches the failure to avoid re-attempting expensive hash computations.
-    boost::unordered_flat_map<InternedDepKey, std::optional<DepHashValue>, InternedDepKey::Hash> currentDepHashes;
+    boost::unordered_flat_map<Dep::Key, std::optional<DepHashValue>, Dep::Key::Hash> currentDepHashes;
 
     // ── In-memory ID counters (next ID to assign = max(DB IDs) + 1) ──
 
@@ -337,17 +302,17 @@ struct TraceStore {
      * The returned vector is NOT sorted. Callers that need canonical ordering
      * must call sortAndDedupInterned() explicitly.
      */
-    std::vector<InternedDep> loadFullTrace(TraceId traceId);
+    std::vector<Dep> loadFullTrace(TraceId traceId);
 
     /**
      * Load just the dep key set for a DepKeySets row (no hash values).
      *
-     * Returns InternedDepKey entries (type + string IDs). Session-cached:
+     * Returns Dep::Key entries (type + source/key IDs). Session-cached:
      * subsequent calls for the same depKeySetId return from depKeySetCache.
      * Used by structural variant recovery to avoid decompressing
      * values_blob when only dep keys are needed for hash recomputation.
      */
-    std::vector<InternedDepKey> loadKeySet(DepKeySetId depKeySetId);
+    std::vector<Dep::Key> loadKeySet(DepKeySetId depKeySetId);
 
     bool attrExists(AttrPathId pathId);
 
@@ -364,17 +329,17 @@ struct TraceStore {
     /// Serialize dep key set to packed 9-byte entries (type[1] + sourceId[4] + keyId[4]),
     /// zstd compressed. Stored in DepKeySets table, shared across traces with
     /// the same dep structure (same struct_hash).
-    static std::vector<uint8_t> serializeKeys(const std::vector<InternedDepKey> & keys);
-    static std::vector<InternedDepKey> deserializeKeys(const void * blob, size_t size);
+    static std::vector<uint8_t> serializeKeys(const std::vector<Dep::Key> & keys);
+    static std::vector<Dep::Key> deserializeKeys(const void * blob, size_t size);
 
     /// Serialize dep hash values to per-entry hashLen[1] + hashData[hashLen],
     /// zstd compressed. Stored in Traces table. Entries are positionally matched
     /// with keys_blob in the corresponding DepKeySets row.
     /// deserializeValues needs the key types to distinguish Blake3Hash (32 bytes)
     /// from string values that happen to be 32 bytes (e.g., store paths).
-    static std::vector<uint8_t> serializeValues(const std::vector<InternedDep> & deps);
+    static std::vector<uint8_t> serializeValues(const std::vector<Dep> & deps);
     static std::vector<DepHashValue> deserializeValues(
-        const void * blob, size_t size, const std::vector<InternedDepKey> & keys);
+        const void * blob, size_t size, const std::vector<Dep::Key> & keys);
 
     /**
      * Resolved dependency with owned strings. Used by verification code
@@ -388,17 +353,8 @@ struct TraceStore {
         DepType type;
     };
 
-    /// Resolve a single InternedDep to a string-based ResolvedDep.
-    ResolvedDep resolveDep(const InternedDep & idep);
-
-    /// Resolve a StringId to its string value. O(1) lookup via pools.strings.
-    /// Returns string_view into arena memory; lifetime tied to InterningPools.
-    std::string_view resolveString(StringId id) const;
-
-    /// Convert Deps to InternedDeps. DepSourceId/DepKeyId share the same
-    /// index space as StringId (unified StringInternTable), so conversion is
-    /// a raw value copy — no string lookup needed.
-    std::vector<InternedDep> internDeps(const std::vector<Dep> & deps);
+    /// Resolve a single Dep to a string-based ResolvedDep.
+    ResolvedDep resolveDep(const Dep & dep);
 
     /**
      * Verify a single trace: recompute all dep hashes and compare against
@@ -422,6 +378,10 @@ struct TraceStore {
         EvalState & state);
 
     std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);
+
+    /// Feed a dep key ID into a HashSink. For most dep types, resolves
+    /// the ID as a string. For ParentContext, hashes via AttrVocabStore.
+    void feedKey(HashSink & s, DepType type, uint32_t idValue) const;
 
 private:
     std::optional<TraceRow> lookupTraceRow(AttrPathId pathId);

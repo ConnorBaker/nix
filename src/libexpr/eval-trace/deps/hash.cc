@@ -10,42 +10,59 @@ namespace nix::eval_trace {
 std::vector<Dep> sortAndDedupDeps(const std::vector<Dep> & deps)
 {
     auto sorted = deps;
-    std::sort(sorted.begin(), sorted.end(),
-        [](const Dep & a, const Dep & b) {
-            if (auto cmp = a.type <=> b.type; cmp != 0) return cmp < 0;
-            if (a.sourceId != b.sourceId) return a.sourceId < b.sourceId;
-            return a.keyId < b.keyId;
-        });
-    sorted.erase(std::unique(sorted.begin(), sorted.end(),
-        [](const Dep & a, const Dep & b) {
-            return a.type == b.type && a.sourceId == b.sourceId && a.keyId == b.keyId;
-        }), sorted.end());
+    std::sort(sorted.begin(), sorted.end());
+    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
     return sorted;
 }
 
 // ── Trace hashing (BLAKE3 via HashSink, BSàlC §3.2 verifying traces) ──
 
-static void feedDepToSink(HashSink & sink, InterningPools & pools, const Dep & dep, bool includeHash)
+static void feedDepToSink(HashSink & sink, const Dep & dep, bool includeHash,
+                          const KeyFeeder & feedKey)
 {
-    auto typeStr = std::to_string(static_cast<int>(dep.type));
+    auto typeStr = std::to_string(static_cast<int>(dep.key.type));
     sink(std::string_view("T", 1));
     sink(typeStr);
     sink(std::string_view("S", 1));
-    sink(pools.resolve(dep.sourceId));
+    // Source is always a string (even for ParentContext it's empty/"").
+    // Feed via feedKey with a non-ParentContext type to ensure string resolution.
+    feedKey(sink, DepType::Content, dep.key.sourceId.value);
     sink(std::string_view("K", 1));
-    sink(pools.resolve(dep.keyId));
+    feedKey(sink, dep.key.type, dep.key.keyId.value);
     if (includeHash) {
         sink(std::string_view("H", 1));
-        hashDepValue(sink, dep.expectedHash);
+        hashDepValue(sink, dep.hash);
     }
+}
+
+Hash computeTraceHashFromSorted(const std::vector<Dep> & sortedDeps, const KeyFeeder & feedKey)
+{
+    HashSink sink(HashAlgorithm::BLAKE3);
+    for (auto & dep : sortedDeps)
+        feedDepToSink(sink, dep, true, feedKey);
+    return sink.finish().hash;
+}
+
+Hash computeTraceStructHashFromSorted(const std::vector<Dep> & sortedDeps, const KeyFeeder & feedKey)
+{
+    HashSink sink(HashAlgorithm::BLAKE3);
+    for (auto & dep : sortedDeps)
+        feedDepToSink(sink, dep, false, feedKey);
+    return sink.finish().hash;
+}
+
+// ── Convenience overloads (resolve all IDs as strings) ───────────────
+
+static KeyFeeder makePoolFeeder(InterningPools & pools)
+{
+    return [&pools](HashSink & s, DepType, uint32_t idValue) {
+        s(pools.resolve(DepKeyId(idValue)));
+    };
 }
 
 Hash computeTraceHashFromSorted(InterningPools & pools, const std::vector<Dep> & sortedDeps)
 {
-    HashSink sink(HashAlgorithm::BLAKE3);
-    for (auto & dep : sortedDeps)
-        feedDepToSink(sink, pools, dep, true);
-    return sink.finish().hash;
+    return computeTraceHashFromSorted(sortedDeps, makePoolFeeder(pools));
 }
 
 Hash computeTraceHash(InterningPools & pools, const std::vector<Dep> & deps)
@@ -55,10 +72,7 @@ Hash computeTraceHash(InterningPools & pools, const std::vector<Dep> & deps)
 
 Hash computeTraceStructHashFromSorted(InterningPools & pools, const std::vector<Dep> & sortedDeps)
 {
-    HashSink sink(HashAlgorithm::BLAKE3);
-    for (auto & dep : sortedDeps)
-        feedDepToSink(sink, pools, dep, false);
-    return sink.finish().hash;
+    return computeTraceStructHashFromSorted(sortedDeps, makePoolFeeder(pools));
 }
 
 Hash computeTraceStructHash(InterningPools & pools, const std::vector<Dep> & deps)

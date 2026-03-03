@@ -211,16 +211,14 @@ void DependencyTracker::record(InterningPools & pools, DepType type,
     debug("recording %s (%s) dep: input='%s' key='%s'",
         depTypeName(type), depKindName(depKind(type)), source, key);
     sessionTraces.push_back(Dep{
-        type,
-        pools.intern<DepSourceId>(source),
-        pools.intern<DepKeyId>(key),
+        {type, pools.intern<DepSourceId>(source), pools.intern<DepKeyId>(key)},
         std::move(hash)});
 }
 
 void DependencyTracker::record(const Dep & dep)
 {
     if (activeTracker) {
-        uint64_t h = hashValues(std::to_underlying(dep.type), dep.sourceId.value, dep.keyId.value);
+        uint64_t h = hashValues(std::to_underlying(dep.key.type), dep.key.sourceId.value, dep.key.keyId.value);
         if (!activeTracker->depDedup.tryInsert(h))
             return;
     }
@@ -259,7 +257,7 @@ void DependencyTracker::record(const Dep & dep)
 
     auto keyStr = key.dump();
     DependencyTracker::sessionTraces.push_back(
-        Dep{depType, c.sourceId, pools.intern<DepKeyId>(keyStr), hash});
+        Dep{{depType, c.sourceId, pools.intern<DepKeyId>(keyStr)}, hash});
     return true;
 }
 
@@ -276,9 +274,7 @@ void DependencyTracker::recordReplay(InterningPools & pools, DepType type,
                                      const DepHashValue & hash)
 {
     sessionTraces.push_back(Dep{
-        type,
-        pools.intern<DepSourceId>(source),
-        pools.intern<DepKeyId>(key),
+        {type, pools.intern<DepSourceId>(source), pools.intern<DepKeyId>(key)},
         hash});
 }
 
