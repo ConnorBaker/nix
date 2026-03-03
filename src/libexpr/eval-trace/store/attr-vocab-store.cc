@@ -132,36 +132,32 @@ std::string AttrVocabStore::displayPath(AttrPathId id) const
     if (id == rootPath())
         return "\xC2\xABroot\xC2\xBB"; // «root» in UTF-8
 
-    std::vector<std::string_view> components;
-    auto cur = id;
-    while (cur != rootPath()) {
-        components.push_back(resolveName(childName(cur)));
-        cur = parentPath(cur);
-    }
+    // Recurse to root first, then append on the way back —
+    // the call stack provides root-to-leaf ordering.
     std::string result;
-    for (auto it = components.rbegin(); it != components.rend(); ++it) {
+    auto append = [&](this auto & self, AttrPathId cur) -> void {
+        if (cur == rootPath()) return;
+        self(parentPath(cur));
         if (!result.empty()) result += '.';
-        result += *it;
-    }
+        result += resolveName(childName(cur));
+    };
+    append(id);
     return result;
 }
 
 void AttrVocabStore::hashPath(HashSink & sink, AttrPathId pathId) const
 {
-    // Collect components (bottom-up walk).
-    std::vector<AttrNameId> components;
-    auto cur = pathId;
-    while (cur != rootPath()) {
-        components.push_back(childName(cur));
-        cur = parentPath(cur);
-    }
-    // Feed in path order (reversed) with length-prefix framing.
-    for (auto it = components.rbegin(); it != components.rend(); ++it) {
-        auto name = resolveName(*it);
+    // Recurse to root first, then feed on the way back —
+    // the call stack provides root-to-leaf ordering.
+    auto feed = [&](this auto const & self, AttrPathId cur) -> void {
+        if (cur == rootPath()) return;
+        self(parentPath(cur));
+        auto name = resolveName(childName(cur));
         uint32_t len = static_cast<uint32_t>(name.size());
         sink({reinterpret_cast<const char *>(&len), sizeof(len)});
         sink(name);
-    }
+    };
+    feed(pathId);
 }
 
 // ── Lookup without interning ─────────────────────────────────────────
