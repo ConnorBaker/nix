@@ -12,6 +12,7 @@ headers = [ config_pub_h ] + files(
   'attr-set.hh',
   'counter.hh',
   'diagnose.hh',
+  'eval-trace/ids.hh',
   'eval-trace/deps/types.hh',
   'eval-trace/deps/hash.hh',
   'eval-trace/deps/interning-pools.hh',

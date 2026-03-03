@@ -8,7 +8,7 @@
 #include "nix/expr/symbol-table.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/util/string-intern-table.hh"
-#include "nix/util/traced-data-ids.hh"
+#include "nix/expr/eval-trace/ids.hh"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 

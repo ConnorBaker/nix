@@ -5,7 +5,7 @@
 #include "nix/expr/eval-trace/store/attr-vocab-store.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/util/sync.hh"
-#include "nix/util/traced-data-ids.hh"
+#include "nix/expr/eval-trace/ids.hh"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -38,7 +38,7 @@ using TraceId = StrongId<TraceIdTag, uint32_t>;
 /** ID for the Results table (one per unique result content hash). */
 using ResultId = StrongId<ResultIdTag, uint32_t>;
 
-// StringId, AttrNameId, AttrPathId are defined in traced-data-ids.hh.
+// StringId, AttrNameId, AttrPathId are defined in eval-trace/ids.hh.
 
 /** ID for the DepKeySets table (content-addressed dep key sets, keyed by struct_hash). */
 using DepKeySetId = StrongId<DepKeySetIdTag, uint32_t>;

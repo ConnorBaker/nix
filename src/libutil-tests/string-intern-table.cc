@@ -1,5 +1,5 @@
 #include "nix/util/string-intern-table.hh"
-#include "nix/util/traced-data-ids.hh"
+#include "nix/util/strong-id.hh"
 
 #include <gtest/gtest.h>
 
@@ -8,6 +8,16 @@
 #include <vector>
 
 namespace nix {
+
+// Local StrongId instantiations for testing StringInternTable's typed API.
+// The actual eval-trace ID types live in libexpr; these are equivalent
+// test-only substitutes so libutil-tests doesn't depend on libexpr.
+struct TestTagA {};
+struct TestTagB {};
+struct TestTagC {};
+using TestIdA = StrongId<TestTagA, uint32_t>;
+using TestIdB = StrongId<TestTagB, uint32_t>;
+using TestIdC = StrongId<TestTagC, uint32_t>;
 
 // ── Basic intern/resolve ──────────────────────────────────────────────
 
@@ -104,26 +114,26 @@ TEST(StringInternTable, AllStringViewsHaveNonNullData)
 
 // ── Typed intern/resolve (StrongId) ──────────────────────────────────
 
-TEST(StringInternTable, TypedInternDepSourceId)
+TEST(StringInternTable, TypedInternTestIdA)
 {
     StringInternTable table;
-    auto srcId = table.intern<DepSourceId>("nixpkgs");
+    auto srcId = table.intern<TestIdA>("nixpkgs");
     EXPECT_EQ(table.resolve(srcId), "nixpkgs");
     EXPECT_TRUE(static_cast<bool>(srcId)); // non-zero
 }
 
-TEST(StringInternTable, TypedInternDepKeyId)
+TEST(StringInternTable, TypedInternTestIdB)
 {
     StringInternTable table;
-    auto keyId = table.intern<DepKeyId>("/path/to/file");
+    auto keyId = table.intern<TestIdB>("/path/to/file");
     EXPECT_EQ(table.resolve(keyId), "/path/to/file");
     EXPECT_TRUE(static_cast<bool>(keyId));
 }
 
-TEST(StringInternTable, TypedInternStringId)
+TEST(StringInternTable, TypedInternTestIdC)
 {
     StringInternTable table;
-    auto strId = table.intern<StringId>("shared");
+    auto strId = table.intern<TestIdC>("shared");
     EXPECT_EQ(table.resolve(strId), "shared");
     EXPECT_TRUE(static_cast<bool>(strId));
 }
@@ -131,9 +141,9 @@ TEST(StringInternTable, TypedInternStringId)
 TEST(StringInternTable, SharedIndexSpaceAcrossTypes)
 {
     StringInternTable table;
-    auto srcId = table.intern<DepSourceId>("shared-string");
-    auto keyId = table.intern<DepKeyId>("shared-string");
-    auto strId = table.intern<StringId>("shared-string");
+    auto srcId = table.intern<TestIdA>("shared-string");
+    auto keyId = table.intern<TestIdB>("shared-string");
+    auto strId = table.intern<TestIdC>("shared-string");
     // All types share the same dedup — same string returns same raw value
     EXPECT_EQ(srcId.value, keyId.value);
     EXPECT_EQ(keyId.value, strId.value);
@@ -142,8 +152,8 @@ TEST(StringInternTable, SharedIndexSpaceAcrossTypes)
 TEST(StringInternTable, DifferentTypesCompileTimeSafety)
 {
     StringInternTable table;
-    auto srcId = table.intern<DepSourceId>("a");
-    auto keyId = table.intern<DepKeyId>("b");
+    auto srcId = table.intern<TestIdA>("a");
+    auto keyId = table.intern<TestIdB>("b");
     // These are different types — cannot be compared directly
     // (This is a compile-time check, not a runtime test)
     EXPECT_NE(srcId.value, keyId.value); // different strings → different IDs

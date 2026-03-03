@@ -6,7 +6,7 @@
 #include "nix/util/serialise.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/std-hash.hh"
-#include "nix/util/traced-data-ids.hh"
+#include "nix/expr/eval-trace/ids.hh"
 #include "nix/util/util.hh"
 
 #include <array>
