@@ -125,9 +125,12 @@ struct TraceStore {
         StringId sourceId;
         StringId keyId;
 
-        bool operator==(const InternedDepKey &) const = default;
+        auto operator<=>(const InternedDepKey &) const = default;
 
         struct Hash {
+            // TODO: is_avalanching claims the hash is well-distributed, but
+            // hashValues uses boost-style hash_combine which is not avalanching.
+            // Boost skips its internal mixing when this trait is present.
             using is_avalanching = void;
             std::size_t operator()(const InternedDepKey & k) const noexcept {
                 return hashValues(std::to_underlying(k.type), k.sourceId.value, k.keyId.value);
@@ -135,10 +138,14 @@ struct TraceStore {
         };
     };
 
-    // Interned dep entry (key + hash value — used for full dep reconstruction)
+    // Interned dep entry (key + hash value — used for full dep reconstruction).
+    // Comparison is by key only (hash is a payload, not identity).
     struct InternedDep {
         InternedDepKey key;
         DepHashValue hash;
+
+        auto operator<=>(const InternedDep & o) const { return key <=> o.key; }
+        bool operator==(const InternedDep & o) const { return key == o.key; }
     };
 
     struct TraceRow {

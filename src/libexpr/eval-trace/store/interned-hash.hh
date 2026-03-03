@@ -22,20 +22,12 @@ using StringLookup = std::function<std::string_view(StringId)>;
 /// trie-based hashing (independent of string interning order).
 using KeyFeeder = std::function<void(HashSink & sink, DepType type, StringId keyId)>;
 
-/// Sort interned deps by (type, sourceId, keyId) — integer comparison.
-/// Dedup on the same triple (different hash values are collapsed).
+/// Sort interned deps by key (type, sourceId, keyId).
+/// Dedup on the same key (different hash values are collapsed).
 inline void sortAndDedupInterned(std::vector<TraceStore::InternedDep> & deps)
 {
-    std::sort(deps.begin(), deps.end(),
-        [](const TraceStore::InternedDep & a, const TraceStore::InternedDep & b) {
-            if (auto cmp = a.key.type <=> b.key.type; cmp != 0) return cmp < 0;
-            if (a.key.sourceId != b.key.sourceId) return a.key.sourceId < b.key.sourceId;
-            return a.key.keyId < b.key.keyId;
-        });
-    deps.erase(std::unique(deps.begin(), deps.end(),
-        [](const TraceStore::InternedDep & a, const TraceStore::InternedDep & b) {
-            return a.key.type == b.key.type && a.key.sourceId == b.key.sourceId && a.key.keyId == b.key.keyId;
-        }), deps.end());
+    std::sort(deps.begin(), deps.end());
+    deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
 }
 
 inline void feedInternedDepToSink(
@@ -60,15 +52,23 @@ inline void feedInternedDepToSink(
     }
 }
 
+inline Hash computeInternedHash(
+    const std::vector<TraceStore::InternedDep> & sorted,
+    bool includeHash,
+    const KeyFeeder & feedKey)
+{
+    HashSink sink(HashAlgorithm::BLAKE3);
+    for (auto & dep : sorted)
+        feedInternedDepToSink(sink, dep, includeHash, feedKey);
+    return sink.finish().hash;
+}
+
 /// BLAKE3 hash of sorted interned deps INCLUDING hash values.
 inline Hash computeTraceHashFromInterned(
     const std::vector<TraceStore::InternedDep> & sorted,
     const KeyFeeder & feedKey)
 {
-    HashSink sink(HashAlgorithm::BLAKE3);
-    for (auto & dep : sorted)
-        feedInternedDepToSink(sink, dep, true, feedKey);
-    return sink.finish().hash;
+    return computeInternedHash(sorted, true, feedKey);
 }
 
 /// BLAKE3 hash of sorted interned deps EXCLUDING hash values (structure only).
@@ -76,10 +76,7 @@ inline Hash computeStructHashFromInterned(
     const std::vector<TraceStore::InternedDep> & sorted,
     const KeyFeeder & feedKey)
 {
-    HashSink sink(HashAlgorithm::BLAKE3);
-    for (auto & dep : sorted)
-        feedInternedDepToSink(sink, dep, false, feedKey);
-    return sink.finish().hash;
+    return computeInternedHash(sorted, false, feedKey);
 }
 
 } // namespace nix::eval_trace
