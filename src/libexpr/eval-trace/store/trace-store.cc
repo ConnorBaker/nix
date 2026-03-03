@@ -7,17 +7,14 @@
 #include "nix/expr/eval.hh"
 #include "nix/store/globals.hh"
 
-#include "expr-config-private.hh"
 #include "nix/util/users.hh"
 #include "nix/util/util.hh"
 #include "nix/util/hash.hh"
-#include "nix/util/compression.hh"
-#include "nix/util/environment-variables.hh"
-#include "nix/util/source-accessor.hh"
-#include "nix/fetchers/fetchers.hh"
+
+#include "trace-serialize.hh"
+#include "trace-verify-deps.hh"
 
 #include <nlohmann/json.hpp>
-#include <toml.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -45,545 +42,6 @@ static uint64_t elapsedUs(std::chrono::steady_clock::time_point start)
         std::chrono::steady_clock::now() - start).count();
 }
 
-// ── Trace verification helpers (BSàlC verifying trace check) ─────────
-
-static std::optional<SourcePath> resolveDepPath(
-    const TraceStore::ResolvedDep & dep, const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors)
-{
-    if (dep.source == absolutePathDep)
-        return SourcePath(getFSSourceAccessor(), CanonPath(dep.key));
-    auto it = inputAccessors.find(dep.source);
-    if (it != inputAccessors.end())
-        return it->second / CanonPath(dep.key);
-    if (dep.source.empty())
-        return SourcePath(getFSSourceAccessor(), CanonPath(dep.key));
-    return std::nullopt;
-}
-
-// ── Structured content navigation helpers ────────────────────────────
-
-// Stack-local DOM caches: avoid re-parsing the same file when multiple
-// StructuredContent deps reference it within a single verifyTrace() call.
-// Each verifyTrace() invocation (including recursive ParentContext calls)
-// gets its own scope, fixing the reentrancy bug where recursive calls
-// would corrupt the outer invocation's DOM state via shared thread-locals.
-struct VerificationScope {
-    std::unordered_map<std::string, nlohmann::json> jsonDomCache;
-    std::unordered_map<std::string, toml::value> tomlDomCache;
-    std::unordered_map<std::string, SourceAccessor::DirEntries> dirListingCache;
-};
-
-/**
- * Navigate a JSON DOM using a JSON path array. Returns nullptr if path is invalid.
- * Path components: strings for object keys, numbers for array indices.
- */
-static const nlohmann::json * navigateJson(const nlohmann::json & root, const nlohmann::json & pathArray)
-{
-    const nlohmann::json * node = &root;
-    for (auto & component : pathArray) {
-        if (component.is_number()) {
-            if (!node->is_array()) return nullptr;
-            auto idx = component.get<size_t>();
-            if (idx >= node->size()) return nullptr;
-            node = &(*node)[idx];
-        } else {
-            if (!node->is_object()) return nullptr;
-            auto key = component.get<std::string>();
-            auto it = node->find(key);
-            if (it == node->end()) return nullptr;
-            node = &*it;
-        }
-    }
-    return node;
-}
-
-/**
- * Navigate a TOML DOM using a JSON path array. Returns nullptr if path is invalid.
- */
-static const toml::value * navigateToml(const toml::value & root, const nlohmann::json & pathArray)
-{
-    const toml::value * node = &root;
-    for (auto & component : pathArray) {
-        if (component.is_number()) {
-            if (!node->is_array()) return nullptr;
-            auto idx = component.get<size_t>();
-            auto & arr = toml::get<std::vector<toml::value>>(*node);
-            if (idx >= arr.size()) return nullptr;
-            node = &arr[idx];
-        } else {
-            if (!node->is_table()) return nullptr;
-            auto key = component.get<std::string>();
-            auto & table = toml::get<toml::table>(*node);
-            auto it = table.find(key);
-            if (it == table.end()) return nullptr;
-            node = &it->second;
-        }
-    }
-    return node;
-}
-
-/**
- * Canonical string form of a TOML scalar value for hashing.
- * Must match TomlDataNode::canonicalValue() in fromTOML.cc.
- */
-static std::string tomlCanonical(const toml::value & v)
-{
-    std::ostringstream ss;
-    ss << v;
-    return ss.str();
-}
-
-static std::optional<DepHashValue> computeCurrentHash(
-    EvalState & state, const TraceStore::ResolvedDep & dep,
-    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
-    VerificationScope & scope,
-    const boost::unordered_flat_map<std::string, std::string> & dirSets)
-{
-    switch (dep.type) {
-    case DepType::Content:
-    case DepType::RawContent: {
-        auto path = resolveDepPath(dep, inputAccessors);
-        if (!path) return std::nullopt;
-        try {
-            return DepHashValue(StatHashStore::instance().depHashFile(*path));
-        } catch (std::exception &) {
-            return std::nullopt;
-        }
-    }
-    case DepType::NARContent: {
-        auto path = resolveDepPath(dep, inputAccessors);
-        if (!path) return std::nullopt;
-        try {
-            return DepHashValue(StatHashStore::instance().depHashPathCached(*path));
-        } catch (std::exception &) {
-            return std::nullopt;
-        }
-    }
-    case DepType::Directory: {
-        auto path = resolveDepPath(dep, inputAccessors);
-        if (!path) return std::nullopt;
-        try {
-            return DepHashValue(StatHashStore::instance().depHashDirListingCached(*path, path->readDirectory()));
-        } catch (std::exception &) {
-            return std::nullopt;
-        }
-    }
-    case DepType::Existence: {
-        auto path = resolveDepPath(dep, inputAccessors);
-        if (!path) return std::nullopt;
-        auto st = path->maybeLstat();
-        return DepHashValue(st
-            ? fmt("type:%d", static_cast<int>(st->type))
-            : std::string("missing"));
-    }
-    case DepType::EnvVar:
-        return DepHashValue(depHash(getEnv(dep.key).value_or("")));
-    case DepType::System:
-        return DepHashValue(depHash(state.settings.getCurrentSystem()));
-    case DepType::CopiedPath: {
-        auto sourcePath = resolveDepPath(dep, inputAccessors);
-        if (!sourcePath) return std::nullopt;
-        try {
-            auto * storePathStr = std::get_if<std::string>(&dep.expectedHash);
-            if (!storePathStr) return std::nullopt;
-            auto expectedStorePath = state.store->parseStorePath(*storePathStr);
-            auto name2 = std::string(expectedStorePath.name());
-            auto [storePath, hash] = state.store->computeStorePath(
-                name2,
-                sourcePath->resolveSymlinks(SymlinkResolution::Ancestors),
-                ContentAddressMethod::Raw::NixArchive,
-                HashAlgorithm::SHA256, {});
-            return DepHashValue(state.store->printStorePath(storePath));
-        } catch (std::exception &) {
-            return std::nullopt;
-        }
-    }
-    case DepType::UnhashedFetch: {
-        try {
-            auto input = fetchers::Input::fromURL(state.fetchSettings, dep.key);
-            auto [storePath, lockedInput] = input.fetchToStore(
-                state.fetchSettings, *state.store);
-            return DepHashValue(state.store->printStorePath(storePath));
-        } catch (std::exception &) {
-            return std::nullopt;
-        }
-    }
-    case DepType::ImplicitShape:
-        // ImplicitShape uses the same key format and hash computation as
-        // StructuredContent. Verified only for failed sources without SC deps.
-        [[fallthrough]];
-    case DepType::StructuredContent: {
-        // Key format: JSON object {"f":"path","t":"j","p":[...],"s":"keys","h":"key"}
-        // Or aggregated DirSet: {"ds":"<hex>","h":"keyName","t":"d"} (dirs in DirSets table)
-        nlohmann::json j;
-        try {
-            j = nlohmann::json::parse(dep.key);
-        } catch (...) {
-            return std::nullopt;
-        }
-
-        // Aggregated DirSet dep: iterate all directories, check each for the key
-        if (j.contains("ds")) {
-            auto dsHash = j.value("ds", "");
-            auto hasKeyName = j.value("h", "");
-            if (hasKeyName.empty()) return std::nullopt;
-
-            auto it = dirSets.find(dsHash);
-            if (it == dirSets.end()) return std::nullopt;
-            auto dirs = nlohmann::json::parse(it->second);
-            for (auto & dir : dirs) {
-                if (!dir.is_array() || dir.size() != 2) continue;
-                auto source = dir[0].get<std::string>();
-                auto filePath = dir[1].get<std::string>();
-                TraceStore::ResolvedDep fileDep{source, filePath, DepHashValue{Blake3Hash{}}, DepType::Directory};
-                auto path = resolveDepPath(fileDep, inputAccessors);
-                if (!path) continue;
-                try {
-                    auto cacheKey = source + '\t' + filePath;
-                    auto cacheIt = scope.dirListingCache.find(cacheKey);
-                    if (cacheIt == scope.dirListingCache.end())
-                        cacheIt = scope.dirListingCache.emplace(cacheKey, path->readDirectory()).first;
-                    if (cacheIt->second.count(hasKeyName))
-                        return DepHashValue(depHash("1")); // key found in this dir
-                } catch (...) {
-                    continue;
-                }
-            }
-            return DepHashValue(depHash("0")); // key absent in all dirs
-        }
-
-        auto filePath = j.value("f", "");
-        auto formatStr = j.value("t", "");
-        if (formatStr.empty()) return std::nullopt;
-        auto format = parseStructuredFormat(formatStr[0]);
-        if (!format) return std::nullopt;
-        auto pathArray = j.value("p", nlohmann::json::array());
-        auto hasKeyName = j.value("h", "");
-        bool isHasKey = !hasKeyName.empty();
-        auto parseShapeName = [](const std::string & name) -> ShapeSuffix {
-            if (name == "len") return ShapeSuffix::Len;
-            if (name == "keys") return ShapeSuffix::Keys;
-            if (name == "type") return ShapeSuffix::Type;
-            return ShapeSuffix::None;
-        };
-        auto shape = parseShapeName(j.value("s", ""));
-
-        // Construct a synthetic Content dep to resolve the file path
-        TraceStore::ResolvedDep fileDep{dep.source, filePath, DepHashValue{Blake3Hash{}}, DepType::Content};
-        auto path = resolveDepPath(fileDep, inputAccessors);
-        if (!path) return std::nullopt;
-
-        try {
-            // Helper: compute hash for sorted key set (shared across formats)
-            auto hashSortedKeys = [](std::vector<std::string> keys) -> DepHashValue {
-                std::sort(keys.begin(), keys.end());
-                std::string canonical;
-                for (size_t i = 0; i < keys.size(); i++) {
-                    if (i > 0) canonical += '\0';
-                    canonical += keys[i];
-                }
-                return DepHashValue(depHash(canonical));
-            };
-
-            switch (*format) {
-            case StructuredFormat::Json: {
-                // Use DOM cache to avoid re-parsing
-                auto cacheKey = dep.source + '\t' + filePath;
-                auto cacheIt = scope.jsonDomCache.find(cacheKey);
-                if (cacheIt == scope.jsonDomCache.end()) {
-                    auto contents = path->readFile();
-                    cacheIt = scope.jsonDomCache.emplace(cacheKey, nlohmann::json::parse(contents)).first;
-                }
-                auto * node = navigateJson(cacheIt->second, pathArray);
-                if (!node) return std::nullopt;
-                switch (shape) {
-                case ShapeSuffix::Len:
-                    if (!node->is_array()) return std::nullopt;
-                    return DepHashValue(depHash(std::to_string(node->size())));
-                case ShapeSuffix::Keys: {
-                    if (!node->is_object()) return std::nullopt;
-                    std::vector<std::string> keys;
-                    for (auto & [k, _] : node->items())
-                        keys.push_back(k);
-                    return hashSortedKeys(std::move(keys));
-                }
-                case ShapeSuffix::Type:
-                    if (node->is_object()) return DepHashValue(depHash("object"));
-                    if (node->is_array()) return DepHashValue(depHash("array"));
-                    return std::nullopt; // scalar — type changed from container
-                case ShapeSuffix::None:
-                    if (isHasKey) {
-                        if (!node->is_object()) return std::nullopt;
-                        return DepHashValue(depHash(node->contains(hasKeyName) ? "1" : "0"));
-                    }
-                    return DepHashValue(depHash(node->dump()));
-                }
-                break;
-            }
-            case StructuredFormat::Toml: {
-                auto cacheKey = dep.source + '\t' + filePath;
-                auto cacheIt = scope.tomlDomCache.find(cacheKey);
-                if (cacheIt == scope.tomlDomCache.end()) {
-                    auto contents = path->readFile();
-                    std::istringstream stream(std::move(contents));
-                    cacheIt = scope.tomlDomCache.emplace(cacheKey, toml::parse(
-                        stream, "verifyTrace"
-#if HAVE_TOML11_4
-                        , toml::spec::v(1, 0, 0)
-#endif
-                    )).first;
-                }
-                auto * node = navigateToml(cacheIt->second, pathArray);
-                if (!node) return std::nullopt;
-                switch (shape) {
-                case ShapeSuffix::Len:
-                    if (!node->is_array()) return std::nullopt;
-                    return DepHashValue(depHash(std::to_string(toml::get<std::vector<toml::value>>(*node).size())));
-                case ShapeSuffix::Keys: {
-                    if (!node->is_table()) return std::nullopt;
-                    auto & table = toml::get<toml::table>(*node);
-                    std::vector<std::string> keys;
-                    for (auto & [k, _] : table)
-                        keys.push_back(k);
-                    return hashSortedKeys(std::move(keys));
-                }
-                case ShapeSuffix::Type:
-                    if (node->is_table()) return DepHashValue(depHash("object"));
-                    if (node->is_array()) return DepHashValue(depHash("array"));
-                    return std::nullopt;
-                case ShapeSuffix::None:
-                    if (isHasKey) {
-                        if (!node->is_table()) return std::nullopt;
-                        auto & table = toml::get<toml::table>(*node);
-                        return DepHashValue(depHash(table.count(hasKeyName) ? "1" : "0"));
-                    }
-                    return DepHashValue(depHash(tomlCanonical(*node)));
-                }
-                break;
-            }
-            case StructuredFormat::Directory: {
-                // Directory structural dep: re-read listing, look up entry
-                auto cacheKey = dep.source + '\t' + filePath;
-                auto cacheIt = scope.dirListingCache.find(cacheKey);
-                if (cacheIt == scope.dirListingCache.end()) {
-                    auto dirEntries = path->readDirectory();
-                    cacheIt = scope.dirListingCache.emplace(cacheKey, std::move(dirEntries)).first;
-                }
-                auto & entries = cacheIt->second;
-
-                switch (shape) {
-                case ShapeSuffix::Len:
-                    return DepHashValue(depHash(std::to_string(entries.size())));
-                case ShapeSuffix::Keys: {
-                    // std::map is already sorted by key
-                    std::string canonical;
-                    bool first = true;
-                    for (auto & [k, _] : entries) {
-                        if (!first) canonical += '\0';
-                        canonical += k;
-                        first = false;
-                    }
-                    return DepHashValue(depHash(canonical));
-                }
-                case ShapeSuffix::Type:
-                    // Directories are always "object" (key→type mapping)
-                    return DepHashValue(depHash("object"));
-                case ShapeSuffix::None: {
-                    if (isHasKey) {
-                        return DepHashValue(depHash(entries.count(hasKeyName) ? "1" : "0"));
-                    }
-                    // Directory scalar: pathArray should have exactly one string component
-                    if (pathArray.size() != 1 || !pathArray[0].is_string()) return std::nullopt;
-                    auto it = entries.find(pathArray[0].get<std::string>());
-                    if (it == entries.end()) return std::nullopt;
-                    return DepHashValue(depHash(dirEntryTypeString(it->second)));
-                }
-                }
-                break;
-            }
-            }
-            return std::nullopt;
-        } catch (...) {
-            return std::nullopt;
-        }
-    }
-    case DepType::StorePathExistence: {
-        try {
-            auto storePath = state.store->parseStorePath(dep.key);
-            return DepHashValue(state.store->isValidPath(storePath)
-                ? std::string("valid") : std::string("missing"));
-        } catch (std::exception &) {
-            return DepHashValue(std::string("missing"));
-        }
-    }
-    case DepType::CurrentTime:
-    case DepType::Exec:
-    case DepType::ParentContext:
-    case DepType::EndSentinel_:
-        return std::nullopt;
-    }
-    unreachable();
-}
-
-// ── Raw hash helpers ─────────────────────────────────────────────────
-
-static void bindRawHash(SQLiteStmt::Use & use, const Hash & h)
-{
-    use(reinterpret_cast<const unsigned char *>(h.hash),
-        static_cast<size_t>(h.hashSize));
-}
-
-static Hash readRawHash(const void * data, size_t size)
-{
-    if (size != 32)
-        throw Error("expected 32-byte BLAKE3 hash blob, got %d bytes", size);
-    Hash h(HashAlgorithm::BLAKE3);
-    memcpy(h.hash, data, 32);
-    return h;
-}
-
-static Hash computeResultHash(ResultKind type, std::string_view value, std::string_view context)
-{
-    HashSink sink(HashAlgorithm::BLAKE3);
-    sink(std::string_view("T", 1));
-    auto typeStr = std::to_string(std::to_underlying(type));
-    sink(typeStr);
-    sink(std::string_view("V", 1));
-    sink(value);
-    sink(std::string_view("C", 1));
-    sink(context);
-    return sink.finish().hash;
-}
-
-// ── BLOB serialization for dep key sets ──────────────────────────────
-//
-// keys_blob: packed 9-byte entries (type[1] + sourceId[4] + keyId[4]),
-// zstd compressed. Stored in DepKeySets table, shared across traces with
-// the same dep structure (same struct_hash).
-// Note: uses native byte order for uint32_t fields. The database is a
-// local cache (safe to delete), so cross-endianness portability is not required.
-
-struct __attribute__((packed)) DepKeyBlobEntry {
-    uint8_t type;
-    uint32_t sourceId;
-    uint32_t keyId;
-};
-static_assert(sizeof(DepKeyBlobEntry) == 9);
-
-std::vector<uint8_t> TraceStore::serializeKeys(const std::vector<Dep::Key> & keys)
-{
-    std::vector<uint8_t> blob;
-    blob.reserve(keys.size() * sizeof(DepKeyBlobEntry));
-
-    for (auto & key : keys) {
-        DepKeyBlobEntry entry{std::to_underlying(key.type), key.sourceId.value, key.keyId.value};
-        auto * raw = reinterpret_cast<const uint8_t *>(&entry);
-        blob.insert(blob.end(), raw, raw + sizeof(entry));
-    }
-
-    if (!blob.empty()) {
-        auto compressed = nix::compress(
-            CompressionAlgo::zstd,
-            {reinterpret_cast<const char *>(blob.data()), blob.size()},
-            false, 1);
-        return {compressed.begin(), compressed.end()};
-    }
-    return blob;
-}
-
-std::vector<Dep::Key> TraceStore::deserializeKeys(
-    const void * blob, size_t size)
-{
-    if (size == 0)
-        return {};
-
-    auto decompressed = nix::decompress("zstd",
-        {static_cast<const char *>(blob), size});
-
-    std::vector<Dep::Key> keys;
-    const uint8_t * p = reinterpret_cast<const uint8_t *>(decompressed.data());
-    const uint8_t * end = p + decompressed.size();
-
-    while (p + sizeof(DepKeyBlobEntry) <= end) {
-        DepKeyBlobEntry entry;
-        std::memcpy(&entry, p, sizeof(entry));
-        p += sizeof(entry);
-
-        keys.push_back({
-            static_cast<DepType>(entry.type),
-            DepSourceId(entry.sourceId),
-            DepKeyId(entry.keyId)
-        });
-    }
-
-    return keys;
-}
-
-// ── BLOB serialization for dep hash values ───────────────────────────
-//
-// values_blob: per-entry hashLen[1] + hashData[hashLen], zstd compressed.
-// Stored in Traces table. Entries are positionally matched with keys_blob
-// in the corresponding DepKeySets row.
-
-std::vector<uint8_t> TraceStore::serializeValues(const std::vector<Dep> & deps)
-{
-    std::vector<uint8_t> blob;
-    blob.reserve(deps.size() * 33);  // BLAKE3: 1 + 32 bytes typical
-
-    for (auto & dep : deps) {
-        auto [hashData, hashSize] = blobData(dep.hash);
-        assert(hashSize <= 255 && "dep hash value exceeds single-byte length prefix");
-        blob.push_back(static_cast<uint8_t>(hashSize));
-        blob.insert(blob.end(), hashData, hashData + hashSize);
-    }
-
-    if (!blob.empty()) {
-        auto compressed = nix::compress(
-            CompressionAlgo::zstd,
-            {reinterpret_cast<const char *>(blob.data()), blob.size()},
-            false, 1);
-        return {compressed.begin(), compressed.end()};
-    }
-    return blob;
-}
-
-std::vector<DepHashValue> TraceStore::deserializeValues(
-    const void * blob, size_t size, const std::vector<Dep::Key> & keys)
-{
-    if (size == 0)
-        return {};
-
-    auto decompressed = nix::decompress("zstd",
-        {static_cast<const char *>(blob), size});
-
-    std::vector<DepHashValue> values;
-    const uint8_t * p = reinterpret_cast<const uint8_t *>(decompressed.data());
-    const uint8_t * end = p + decompressed.size();
-    size_t idx = 0;
-
-    while (p < end && idx < keys.size()) {
-        uint8_t hashLen = *p++;
-        if (p + hashLen > end) break;
-
-        // Use the dep type from the corresponding key to determine whether
-        // this is a Blake3Hash or a variable-length string. Without this,
-        // a 32-byte store path string would be incorrectly decoded as Blake3.
-        if (isBlake3Dep(keys[idx].type) && hashLen == 32)
-            values.push_back(Blake3Hash::fromBlob(p, 32));
-        else
-            values.push_back(std::string(reinterpret_cast<const char *>(p), hashLen));
-        p += hashLen;
-        idx++;
-    }
-
-    // Warn on key/value count mismatch (could indicate DB corruption)
-    if (values.size() != keys.size())
-        warn("deserializeValues: got %d values but expected %d (keys count)",
-             values.size(), keys.size());
-
-    return values;
-}
-
 // ── Dep key/value resolution ─────────────────────────────────────────
 
 TraceStore::ResolvedDep TraceStore::resolveDep(const Dep & dep)
@@ -597,18 +55,6 @@ TraceStore::ResolvedDep TraceStore::resolveDep(const Dep & dep)
         std::string(pools.resolve(dep.key.keyId)),
         dep.hash,
         dep.key.type};
-}
-
-// ── BLOB binding helper (ensures non-null pointer for empty BLOBs) ───
-
-static void bindBlobVec(SQLiteStmt::Use & use, const std::vector<uint8_t> & blob)
-{
-    // sqlite3_bind_blob with a null pointer binds NULL, not empty BLOB.
-    // Use a sentinel address for empty blobs.
-    static const uint8_t empty = 0;
-    use(reinterpret_cast<const unsigned char *>(
-            blob.empty() ? &empty : blob.data()),
-        blob.size());
 }
 
 // ── Schema ───────────────────────────────────────────────────────────
@@ -1110,155 +556,6 @@ void TraceStore::flush()
     pendingTraces.clear();
 }
 
-// ── CachedResult SQL encoding/decoding ──────────────────────────────────
-
-std::tuple<ResultKind, std::string, std::string> TraceStore::encodeCachedResult(const CachedResult & value)
-{
-    return std::visit(overloaded{
-        [&](const attrs_t & a) -> std::tuple<ResultKind, std::string, std::string> {
-            std::string val;
-            bool first = true;
-            for (auto & sym : a.names) {
-                if (!first) val.push_back('\t');
-                val.append(std::string(symbols[sym]));
-                first = false;
-            }
-            // Encode origins into the context field as JSON when present.
-            std::string ctx;
-            if (!a.origins.empty()) {
-                nlohmann::json originsJson;
-                nlohmann::json origArr = nlohmann::json::array();
-                for (auto & orig : a.origins) {
-                    origArr.push_back({
-                        {"s", orig.depSource},
-                        {"f", orig.depKey},
-                        {"p", orig.dataPath},  // already a JSON array string
-                        {"t", std::string(1, structuredFormatChar(orig.format))},
-                    });
-                }
-                originsJson["origins"] = std::move(origArr);
-                originsJson["indices"] = a.originIndices;
-                ctx = originsJson.dump();
-            }
-            return {ResultKind::FullAttrs, std::move(val), std::move(ctx)};
-        },
-        [&](const string_t & s) -> std::tuple<ResultKind, std::string, std::string> {
-            std::string ctx;
-            bool first = true;
-            for (auto & elem : s.second) {
-                if (!first) ctx.push_back(' ');
-                ctx.append(elem.to_string());
-                first = false;
-            }
-            return {ResultKind::String, s.first, std::move(ctx)};
-        },
-        [&](const placeholder_t &) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::Placeholder, "", ""};
-        },
-        [&](const missing_t &) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::Missing, "", ""};
-        },
-        [&](const misc_t &) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::Misc, "", ""};
-        },
-        [&](const failed_t &) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::Failed, "", ""};
-        },
-        [&](bool b) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::Bool, b ? "1" : "0", ""};
-        },
-        [&](const int_t & i) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::Int, std::to_string(i.x.value), ""};
-        },
-        [&](const std::vector<std::string> & l) -> std::tuple<ResultKind, std::string, std::string> {
-            std::string val;
-            bool first = true;
-            for (auto & s : l) {
-                if (!first) val.push_back('\t');
-                val.append(s);
-                first = false;
-            }
-            return {ResultKind::ListOfStrings, std::move(val), ""};
-        },
-        [&](const path_t & p) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::Path, p.path, ""};
-        },
-        [&](const null_t &) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::Null, "", ""};
-        },
-        [&](const float_t & f) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::Float, std::to_string(f.x), ""};
-        },
-        [&](const list_t & lt) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::List, std::to_string(lt.size), ""};
-        },
-    }, value);
-}
-
-CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
-{
-    switch (row.type) {
-    case ResultKind::FullAttrs: {
-        attrs_t result;
-        if (!row.value.empty()) {
-            for (auto & name : tokenizeString<std::vector<std::string>>(row.value, "\t"))
-                result.names.push_back(symbols.create(name));
-        }
-        // Decode origins from JSON context field when present.
-        if (!row.context.empty()) {
-            auto ctx = nlohmann::json::parse(row.context);
-            for (auto & origJson : ctx["origins"]) {
-                attrs_t::Origin orig;
-                orig.depSource = origJson["s"].get<std::string>();
-                orig.depKey = origJson["f"].get<std::string>();
-                orig.dataPath = origJson["p"].get<std::string>();
-                auto fmt = parseStructuredFormat(origJson["t"].get<std::string>()[0]);
-                if (!fmt) continue;
-                orig.format = *fmt;
-                result.origins.push_back(std::move(orig));
-            }
-            for (auto & idx : ctx["indices"])
-                result.originIndices.push_back(idx.get<int8_t>());
-        }
-        return result;
-    }
-    case ResultKind::String: {
-        NixStringContext context;
-        if (!row.context.empty()) {
-            for (auto & elem : tokenizeString<std::vector<std::string>>(row.context, " "))
-                context.insert(NixStringContextElem::parse(elem));
-        }
-        return string_t{row.value, std::move(context)};
-    }
-    case ResultKind::Bool:
-        return row.value != "0";
-    case ResultKind::Int:
-        return int_t{NixInt{row.value.empty() ? 0L : std::stol(row.value)}};
-    case ResultKind::ListOfStrings:
-        return row.value.empty()
-            ? std::vector<std::string>{}
-            : tokenizeString<std::vector<std::string>>(row.value, "\t");
-    case ResultKind::Path:
-        return path_t{row.value};
-    case ResultKind::Null:
-        return null_t{};
-    case ResultKind::Float:
-        return float_t{row.value.empty() ? 0.0 : std::stod(row.value)};
-    case ResultKind::List:
-        return list_t{row.value.empty() ? (size_t)0 : std::stoull(row.value)};
-    case ResultKind::Missing:
-        return missing_t{};
-    case ResultKind::Misc:
-        return misc_t{};
-    case ResultKind::Failed:
-        return failed_t{};
-    case ResultKind::Placeholder:
-        return placeholder_t{};
-    default:
-        throw Error("unexpected type %d in eval trace", std::to_underlying(row.type));
-    }
-}
-
 // ── Intern methods ───────────────────────────────────────────────────
 
 ResultId TraceStore::doInternResult(ResultKind type, const std::string & value,
@@ -1421,6 +718,48 @@ void TraceStore::feedKey(HashSink & s, DepType type, uint32_t idValue) const
         s(pools.resolve(DepKeyId(idValue)));
 }
 
+// ── Dedup helpers (A1–A4) ────────────────────────────────────────────
+
+Hash TraceStore::computeSortedTraceHash(std::vector<Dep> & deps) const
+{
+    std::sort(deps.begin(), deps.end());
+    deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
+    auto feeder = [this](HashSink & s, DepType type, uint32_t idValue) {
+        feedKey(s, type, idValue);
+    };
+    return computeTraceHashFromSorted(deps, feeder);
+}
+
+std::optional<DepHashValue> TraceStore::resolveCurrentDepHash(
+    const Dep & dep,
+    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
+    EvalState & state, VerificationScope & scope)
+{
+    auto cacheIt = currentDepHashes.find(dep.key);
+    if (cacheIt != currentDepHashes.end())
+        return cacheIt->second;
+    auto resolved = resolveDep(dep);
+    auto current = computeCurrentHash(state, resolved, inputAccessors, scope, pools.dirSets);
+    currentDepHashes[dep.key] = current;
+    return current;
+}
+
+std::optional<Blake3Hash> TraceStore::resolveParentContextHash(
+    const Dep::Key & key,
+    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
+    EvalState & state)
+{
+    auto parentPathId = AttrPathId(key.keyId.value);
+    auto parentRow = lookupTraceRow(parentPathId);
+    if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state))
+        return std::nullopt;
+    auto parentTraceHash = getCurrentTraceHash(parentPathId);
+    if (!parentTraceHash) return std::nullopt;
+    Blake3Hash b3;
+    std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
+    return b3;
+}
+
 DepKeySetId TraceStore::getOrCreateDepKeySet(
     const Hash & structHash,
     const std::vector<uint8_t> & keysBlob)
@@ -1509,7 +848,8 @@ bool TraceStore::verifyTrace(
         return true;
 
     auto vtStart = timerStart();
-    VerificationScope scope;
+    auto scopeOwner = createVerificationScope();
+    auto & scope = *scopeOwner;
 
     // Load the full trace (single DB read via JOIN) — vector<Dep>
     auto fullDeps = loadFullTrace(traceId);
@@ -1547,32 +887,18 @@ bool TraceStore::verifyTrace(
         }
 
         if (depKind(idep.key.type) == DepKind::ParentContext) {
-            auto parentPathId = AttrPathId(idep.key.keyId.value);
-            auto parentRow = lookupTraceRow(parentPathId);
-            if (parentRow && verifyTrace(parentRow->traceId, inputAccessors, state)) {
-                auto parentTraceHash = getCurrentTraceHash(parentPathId);
-                if (parentTraceHash) {
-                    auto * expected = std::get_if<Blake3Hash>(&idep.hash);
-                    if (expected && std::memcmp(expected->bytes.data(), parentTraceHash->hash, 32) == 0) {
-                        continue;
-                    }
-                }
+            auto parentHash = resolveParentContextHash(idep.key, inputAccessors, state);
+            if (parentHash) {
+                auto * expected = std::get_if<Blake3Hash>(&idep.hash);
+                if (expected && std::memcmp(expected->bytes.data(), parentHash->bytes.data(), 32) == 0)
+                    continue;
             }
             nrVerificationsFailed++;
             hasNonContentFailure = true;
             continue;
         }
 
-        // Cache lookup: integer key, zero allocation
-        auto cacheIt = currentDepHashes.find(idep.key);
-        std::optional<DepHashValue> current;
-        if (cacheIt != currentDepHashes.end()) {
-            current = cacheIt->second;
-        } else {
-            auto dep = resolveDep(idep);
-            current = computeCurrentHash(state, dep, inputAccessors, scope, pools.dirSets);
-            currentDepHashes[idep.key] = current;
-        }
+        auto current = resolveCurrentDepHash(idep, inputAccessors, state, scope);
 
         if (!current || *current != idep.hash) {
             nrVerificationsFailed++;
@@ -1601,15 +927,7 @@ bool TraceStore::verifyTrace(
                 if (onlyFiles && !onlyFiles->count(fileKey)) continue;
             }
             nrDepsChecked++;
-            auto cacheIt = currentDepHashes.find(idep.key);
-            std::optional<DepHashValue> current;
-            if (cacheIt != currentDepHashes.end()) {
-                current = cacheIt->second;
-            } else {
-                auto dep = resolveDep(idep);
-                current = computeCurrentHash(state, dep, inputAccessors, scope, pools.dirSets);
-                currentDepHashes[idep.key] = current;
-            }
+            auto current = resolveCurrentDepHash(idep, inputAccessors, state, scope);
             if (!current || *current != idep.hash) {
                 nrVerificationsFailed++;
                 return false;
@@ -1706,30 +1024,15 @@ bool TraceStore::verifyTrace(
         currentDeps.reserve(fullDeps.size());
         for (auto & idep : fullDeps) {
             if (depKind(idep.key.type) == DepKind::ParentContext) {
-                auto parentPathId = AttrPathId(idep.key.keyId.value);
-                auto parentHash = getCurrentTraceHash(parentPathId);
-                if (parentHash) {
-                    Blake3Hash b3;
-                    std::memcpy(b3.bytes.data(), parentHash->hash, 32);
-                    currentDeps.push_back({idep.key, DepHashValue(b3)});
-                } else {
-                    currentDeps.push_back(idep);
-                }
+                auto b3 = resolveParentContextHash(idep.key, inputAccessors, state);
+                currentDeps.push_back(b3 ? Dep{idep.key, DepHashValue(*b3)} : idep);
             } else {
                 auto cacheIt = currentDepHashes.find(idep.key);
-                if (cacheIt != currentDepHashes.end() && cacheIt->second) {
-                    currentDeps.push_back({idep.key, *cacheIt->second});
-                } else {
-                    currentDeps.push_back(idep);
-                }
+                currentDeps.push_back(cacheIt != currentDepHashes.end() && cacheIt->second
+                    ? Dep{idep.key, *cacheIt->second} : idep);
             }
         }
-        std::sort(currentDeps.begin(), currentDeps.end());
-        currentDeps.erase(std::unique(currentDeps.begin(), currentDeps.end()), currentDeps.end());
-        auto feedKeyFn = [this](HashSink & s, DepType type, uint32_t idValue) {
-            feedKey(s, type, idValue);
-        };
-        auto newTraceHash = computeTraceHashFromSorted(currentDeps, feedKeyFn);
+        auto newTraceHash = computeSortedTraceHash(currentDeps);
         auto * data = ensureTraceHashes(traceId);
         if (data) {
             data->traceHash = newTraceHash;
@@ -1805,15 +1108,11 @@ TraceStore::RecordResult TraceStore::record(
     // 1. Sort+dedup deps by key (type, sourceId, keyId)
     auto sorted = sortAndDedupDeps(allDeps);
 
-    // 2. Key feeder for hash computation
+    // 2. Compute trace_hash and struct_hash
     auto feedKeyFn = [this](HashSink & s, DepType type, uint32_t idValue) {
         feedKey(s, type, idValue);
     };
-
-    // 3. Compute trace_hash (BLAKE3 of full sorted deps including hashes)
     auto traceHash = computeTraceHashFromSorted(sorted, feedKeyFn);
-
-    // 4. Compute struct_hash (dep types + sources + keys, without hash values)
     auto structHash = computeTraceStructHashFromSorted(sorted, feedKeyFn);
 
     // 5. Split into keys + values
@@ -1922,7 +1221,8 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
 {
     auto recoveryStart = timerStart();
     nrRecoveryAttempts++;
-    VerificationScope scope;
+    auto scopeOwner = createVerificationScope();
+    auto & scope = *scopeOwner;
 
     // Load old trace's full deps — now vector<Dep>
     auto oldDeps = loadFullTrace(oldTraceId);
@@ -1943,28 +1243,13 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     bool allComputable = true;
     for (auto & idep : oldDeps) {
         if (depKind(idep.key.type) == DepKind::ParentContext) {
-            auto parentPathId = AttrPathId(idep.key.keyId.value);
-            auto parentRow = lookupTraceRow(parentPathId);
-            if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state)) {
-                allComputable = false; break;
-            }
-            auto parentTraceHash = getCurrentTraceHash(parentPathId);
-            if (!parentTraceHash) { allComputable = false; break; }
-            Blake3Hash b3;
-            std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
-            currentDeps.push_back({idep.key, DepHashValue(b3)});
+            auto parentHash = resolveParentContextHash(idep.key, inputAccessors, state);
+            if (!parentHash) { allComputable = false; break; }
+            currentDeps.push_back({idep.key, DepHashValue(*parentHash)});
             continue;
         }
 
-        auto cacheIt = currentDepHashes.find(idep.key);
-        std::optional<DepHashValue> current;
-        if (cacheIt != currentDepHashes.end()) {
-            current = cacheIt->second;
-        } else {
-            auto dep = resolveDep(idep);
-            current = computeCurrentHash(state, dep, inputAccessors, scope, pools.dirSets);
-            currentDepHashes[idep.key] = current;
-        }
+        auto current = resolveCurrentDepHash(idep, inputAccessors, state, scope);
 
         if (!current) {
             allComputable = false;
@@ -2044,17 +1329,10 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         return VerifyResult{decodeCachedResult(newRow), entry.traceId};
     };
 
-    // Key feeder for hash computation
-    auto feedKeyFn = [this](HashSink & s, DepType type, uint32_t idValue) {
-        feedKey(s, type, idValue);
-    };
-
     // === Direct hash recovery (BSàlC CT) ===
     if (allComputable) {
         auto directHashStart = timerStart();
-        std::sort(currentDeps.begin(), currentDeps.end());
-        currentDeps.erase(std::unique(currentDeps.begin(), currentDeps.end()), currentDeps.end());
-        auto newFullHash = computeTraceHashFromSorted(currentDeps, feedKeyFn);
+        auto newFullHash = computeSortedTraceHash(currentDeps);
 
         if (auto * entry = lookupCandidate(newFullHash)) {
             if (auto r = acceptRecoveredTrace(*entry)) {
@@ -2108,33 +1386,14 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             }
 
             if (depKind(key.type) == DepKind::ParentContext) {
-                auto parentPathId = AttrPathId(key.keyId.value);
-                auto parentRow = lookupTraceRow(parentPathId);
-                if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state)) {
-                    repComputable = false; break;
-                }
-                auto parentTraceHash = getCurrentTraceHash(parentPathId);
-                if (!parentTraceHash) { repComputable = false; break; }
-                Blake3Hash b3;
-                std::memcpy(b3.bytes.data(), parentTraceHash->hash, 32);
-                repDeps.push_back({key, DepHashValue(b3)});
+                auto parentHash = resolveParentContextHash(key, inputAccessors, state);
+                if (!parentHash) { repComputable = false; break; }
+                repDeps.push_back({key, DepHashValue(*parentHash)});
                 continue;
             }
 
-            // Direct Dep::Key lookup — zero allocation
-            auto cacheIt = currentDepHashes.find(key);
-            std::optional<DepHashValue> current;
-            if (cacheIt != currentDepHashes.end()) {
-                current = cacheIt->second;
-            } else {
-                // Resolve strings only on cache miss
-                ResolvedDep syntheticDep{
-                    std::string(pools.resolve(key.sourceId)),
-                    std::string(pools.resolve(key.keyId)),
-                    DepHashValue{Blake3Hash{}}, key.type};
-                current = computeCurrentHash(state, syntheticDep, inputAccessors, scope, pools.dirSets);
-                currentDepHashes[key] = current;
-            }
+            auto current = resolveCurrentDepHash(
+                Dep{key, DepHashValue{Blake3Hash{}}}, inputAccessors, state, scope);
 
             if (!current) {
                 repComputable = false;
@@ -2145,9 +1404,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         if (!repComputable)
             continue;
 
-        std::sort(repDeps.begin(), repDeps.end());
-        repDeps.erase(std::unique(repDeps.begin(), repDeps.end()), repDeps.end());
-        auto candidateFullHash = computeTraceHashFromSorted(repDeps, feedKeyFn);
+        auto candidateFullHash = computeSortedTraceHash(repDeps);
 
         if (auto * entry = lookupCandidate(candidateFullHash)) {
             if (auto r = acceptRecoveredTrace(*entry)) {

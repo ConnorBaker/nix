@@ -22,6 +22,8 @@ struct InterningPools;
 
 namespace nix::eval_trace {
 
+struct VerificationScope;
+
 // ── Strongly-typed IDs for trace store entities ──────────────────────
 //
 // Dense uint32_t IDs assigned in-memory (starting at 1). Correspond to
@@ -405,6 +407,21 @@ private:
     CachedResult decodeCachedResult(const TraceRow & row);
 
     Hash getTraceStructHash(TraceId traceId);
+
+    /// Sort+dedup deps in-place and compute trace hash.
+    Hash computeSortedTraceHash(std::vector<Dep> & deps) const;
+
+    /// Cache-or-compute a dep's current hash value.
+    std::optional<DepHashValue> resolveCurrentDepHash(
+        const Dep & dep,
+        const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
+        EvalState & state, VerificationScope & scope);
+
+    /// Verify a parent attr and return its current trace hash as Blake3Hash.
+    std::optional<Blake3Hash> resolveParentContextHash(
+        const Dep::Key & key,
+        const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
+        EvalState & state);
 };
 
 } // namespace nix::eval_trace
