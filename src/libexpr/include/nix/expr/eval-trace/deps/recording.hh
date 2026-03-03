@@ -186,7 +186,7 @@ struct DependencyTracker {
  * in PosTable origins. The record is stored in the given pools' ProvenanceTable.
  */
 Pos::ProvenanceRef allocateProvenanceRef(
-    InterningPools & pools, DepSourceId srcId, FilePathId fpId, DataPathId dpId, char format);
+    InterningPools & pools, DepSourceId srcId, FilePathId fpId, DataPathId dpId, StructuredFormat format);
 
 /**
  * Resolve a Pos::ProvenanceRef to its full ProvenanceRecord.

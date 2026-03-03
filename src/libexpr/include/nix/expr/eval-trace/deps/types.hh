@@ -522,7 +522,7 @@ struct ProvenanceRecord {
     DepSourceId sourceId;
     FilePathId filePathId;
     DataPathId dataPathId;
-    char format;             ///< 'j', 't', 'd' (StructuredFormat char)
+    StructuredFormat format;
 };
 
 /**
@@ -532,7 +532,7 @@ struct ProvenanceRecord {
 struct ProvenanceTable {
     std::vector<ProvenanceRecord> records;
 
-    uint32_t allocate(DepSourceId srcId, FilePathId fpId, DataPathId dpId, char fmt) {
+    uint32_t allocate(DepSourceId srcId, FilePathId fpId, DataPathId dpId, StructuredFormat fmt) {
         uint32_t id = static_cast<uint32_t>(records.size());
         records.push_back({srcId, fpId, dpId, fmt});
         return id;

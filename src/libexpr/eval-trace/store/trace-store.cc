@@ -1133,7 +1133,7 @@ std::tuple<ResultKind, std::string, std::string> TraceStore::encodeCachedResult(
                         {"s", orig.depSource},
                         {"f", orig.depKey},
                         {"p", orig.dataPath},  // already a JSON array string
-                        {"t", std::string(1, orig.format)},
+                        {"t", std::string(1, structuredFormatChar(orig.format))},
                     });
                 }
                 originsJson["origins"] = std::move(origArr);
@@ -1212,7 +1212,9 @@ CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
                 orig.depSource = origJson["s"].get<std::string>();
                 orig.depKey = origJson["f"].get<std::string>();
                 orig.dataPath = origJson["p"].get<std::string>();
-                orig.format = origJson["t"].get<std::string>()[0];
+                auto fmt = parseStructuredFormat(origJson["t"].get<std::string>()[0]);
+                if (!fmt) continue;
+                orig.format = *fmt;
                 result.origins.push_back(std::move(orig));
             }
             for (auto & idx : ctx["indices"])

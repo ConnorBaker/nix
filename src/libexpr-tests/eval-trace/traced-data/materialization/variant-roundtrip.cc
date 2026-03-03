@@ -24,7 +24,7 @@ TEST_F(TraceStoreTest, Attrs_RecordVerifyRoundtrip)
         state.symbols.create("alpha"),
         state.symbols.create("beta"),
     };
-    original.origins.push_back({"input1", "file.json", "", 'j'});
+    original.origins.push_back({"input1", "file.json", "", StructuredFormat::Json});
     original.originIndices = {0, 0};
 
     db.record(vpath({"test_attr"}), CachedResult(original), {}, true);
@@ -42,7 +42,7 @@ TEST_F(TraceStoreTest, Attrs_RecordVerifyRoundtrip)
     EXPECT_EQ(decoded->origins[0].depSource, "input1");
     EXPECT_EQ(decoded->origins[0].depKey, "file.json");
     EXPECT_EQ(decoded->origins[0].dataPath, "");
-    EXPECT_EQ(decoded->origins[0].format, 'j');
+    EXPECT_EQ(decoded->origins[0].format, StructuredFormat::Json);
 
     ASSERT_EQ(decoded->originIndices.size(), 2u);
     EXPECT_EQ(decoded->originIndices[0], 0);
@@ -82,8 +82,8 @@ TEST_F(TraceStoreTest, Attrs_MultiOrigin_PreservesPerAttrMapping)
         state.symbols.create("b"),
         state.symbols.create("c"),
     };
-    original.origins.push_back({"input1", "f1.json", "", 'j'});
-    original.origins.push_back({"input2", "f2.json", "", 'j'});
+    original.origins.push_back({"input1", "f1.json", "", StructuredFormat::Json});
+    original.origins.push_back({"input2", "f2.json", "", StructuredFormat::Json});
     original.originIndices = {0, 1, 0}; // a->origin0, b->origin1, c->origin0
 
     db.record(vpath({"multi_attr"}), CachedResult(original), {}, true);
@@ -111,7 +111,7 @@ TEST_F(TraceStoreTest, Attrs_MixedOrigin_NixAddedAttrsMinusOne)
         state.symbols.create("a"),
         state.symbols.create("extra"),
     };
-    original.origins.push_back({"input1", "f1.json", "", 'j'});
+    original.origins.push_back({"input1", "f1.json", "", StructuredFormat::Json});
     original.originIndices = {0, -1}; // a->origin0, extra->no origin (Nix-added)
 
     db.record(vpath({"mixed_attr"}), CachedResult(original), {}, true);
@@ -174,7 +174,7 @@ TEST_F(MaterializationDepTest, Attrs_StoredResult_HasOrigins)
     EXPECT_EQ(attrs->names.size(), 2u);
     EXPECT_FALSE(attrs->origins.empty()) << "TracedData attrset should have origins";
     EXPECT_EQ(attrs->origins.size(), 1u);
-    EXPECT_EQ(attrs->origins[0].format, 'j');
+    EXPECT_EQ(attrs->origins[0].format, StructuredFormat::Json);
     EXPECT_EQ(attrs->originIndices.size(), 2u);
     EXPECT_EQ(attrs->originIndices[0], 0);
     EXPECT_EQ(attrs->originIndices[1], 0);

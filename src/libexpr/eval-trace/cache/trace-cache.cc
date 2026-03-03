@@ -391,8 +391,6 @@ void TracedExpr::materializeOrigExprAttrs(
     if (!attrs.origins.empty()) {
         for (size_t oidx = 0; oidx < attrs.origins.size(); oidx++) {
             auto & orig = attrs.origins[oidx];
-            auto fmt = parseStructuredFormat(orig.format);
-            if (!fmt) continue;
             // Collect sorted key names for this origin
             std::vector<std::string> keys;
             for (size_t i = 0; i < attrs.names.size(); i++) {
@@ -413,7 +411,7 @@ void TracedExpr::materializeOrigExprAttrs(
             registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
                 keysHash,
                 static_cast<uint32_t>(keys.size()),
-                srcId, fpId, dpId, *fmt,
+                srcId, fpId, dpId, orig.format,
             });
         }
     }
@@ -558,8 +556,6 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
         if (!attrs->origins.empty()) {
             for (size_t oidx = 0; oidx < attrs->origins.size(); oidx++) {
                 auto & orig = attrs->origins[oidx];
-                auto fmt = parseStructuredFormat(orig.format);
-                if (!fmt) continue;
                 std::vector<std::string> keys;
                 for (size_t i = 0; i < attrs->names.size(); i++) {
                     if (!attrs->originIndices.empty() && attrs->originIndices[i] == static_cast<int8_t>(oidx))
@@ -579,7 +575,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
                 registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
                     keysHash,
                     static_cast<uint32_t>(keys.size()),
-                    srcId, fpId, dpId, *fmt,
+                    srcId, fpId, dpId, orig.format,
                 });
             }
         }

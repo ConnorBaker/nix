@@ -42,7 +42,6 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
         if (!pr) continue;
         if (!seen.insert(pr->id).second) continue;
         auto & rec = resolveProvenanceRef(DependencyTracker::activeTracker->pools, *pr);
-        if (!parseStructuredFormat(rec.format)) continue;
         fn(rec);
     }
 }
@@ -106,9 +105,7 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
         auto pcIt = scope->precomputedKeysMap.find(g.originOffset);
         if (pcIt != scope->precomputedKeysMap.end() && pcIt->second.keyCount == g.keys.size()) {
             auto & info = pcIt->second;
-            auto fmt = parseStructuredFormat(g.df->format);
-            if (!fmt) continue;
-            CompactDepComponents c{info.sourceId, info.filePathId, *fmt,
+            CompactDepComponents c{info.sourceId, info.filePathId, g.df->format,
                                    info.dataPathId, ShapeSuffix::Keys, Symbol{}};
             recordStructuredDep(pools, c, DepHashValue(info.hash));
             continue;
@@ -126,9 +123,7 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
     case nAttrs: {
         if (!v.attrs()->hasAnyTracedDataLayer()) return;
         forEachTracedDataOrigin(positions, v, [&](const ProvenanceRecord & df) {
-            auto fmt = parseStructuredFormat(df.format);
-            if (!fmt) return;
-            CompactDepComponents c{df.sourceId, df.filePathId, *fmt, df.dataPathId,
+            CompactDepComponents c{df.sourceId, df.filePathId, df.format, df.dataPathId,
                                    ShapeSuffix::Type, Symbol{}};
             recordStructuredDep(DependencyTracker::activeTracker->pools, c, DepHashValue(kHashObject()));
         });
@@ -185,9 +180,7 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
         if (!pr) continue;
         if (!seen.insert(pr->id).second) continue;
         auto & rec = resolveProvenanceRef(DependencyTracker::activeTracker->pools, *pr);
-        auto fmt = parseStructuredFormat(rec.format);
-        if (!fmt) continue;
-        result.push_back({rec.sourceId, rec.filePathId, rec.dataPathId, *fmt});
+        result.push_back({rec.sourceId, rec.filePathId, rec.dataPathId, rec.format});
     }
     return result;
 }
@@ -218,9 +211,7 @@ static const std::vector<IntersectOriginInfo> & collectOriginsCached(
         auto * pr = std::get_if<Pos::ProvenanceRef>(origin);
         if (!pr) return;
         auto & rec = resolveProvenanceRef(pools, *pr);
-        auto fmt = parseStructuredFormat(rec.format);
-        if (!fmt) return;
-        CompactDepComponents c{rec.sourceId, rec.filePathId, *fmt, rec.dataPathId,
+        CompactDepComponents c{rec.sourceId, rec.filePathId, rec.format, rec.dataPathId,
                                ShapeSuffix::None, attr.name};
         recordStructuredDep(pools, c, DepHashValue(kHashOne()));
     };
@@ -364,9 +355,7 @@ static void recordHasKeyMissDeps(
     std::vector<const ProvenanceRecord *> nonDirOrigins;
 
     forEachTracedDataOrigin(positions, v, [&](const ProvenanceRecord & df) {
-        auto fmt = parseStructuredFormat(df.format);
-        if (!fmt) return;
-        if (*fmt == StructuredFormat::Directory)
+        if (df.format == StructuredFormat::Directory)
             dirOrigins.push_back({df.sourceId, df.filePathId});
         else
             nonDirOrigins.push_back(&df);
@@ -376,9 +365,7 @@ static void recordHasKeyMissDeps(
 
     // Non-directory origins: always individual deps
     for (auto * df : nonDirOrigins) {
-        auto fmt = parseStructuredFormat(df->format);
-        if (!fmt) continue;
-        CompactDepComponents c{df->sourceId, df->filePathId, *fmt, df->dataPathId,
+        CompactDepComponents c{df->sourceId, df->filePathId, df->format, df->dataPathId,
                                ShapeSuffix::None, keyName};
         recordStructuredDep(pools, c, DepHashValue(kHashZero()));
     }
@@ -390,9 +377,8 @@ static void recordHasKeyMissDeps(
         DependencyTracker::record(pools, DepType::StructuredContent, "", key, DepHashValue(kHashZero()));
     } else {
         forEachTracedDataOrigin(positions, v, [&](const ProvenanceRecord & df) {
-            auto fmt = parseStructuredFormat(df.format);
-            if (!fmt || *fmt != StructuredFormat::Directory) return;
-            CompactDepComponents c{df.sourceId, df.filePathId, *fmt, df.dataPathId,
+            if (df.format != StructuredFormat::Directory) return;
+            CompactDepComponents c{df.sourceId, df.filePathId, df.format, df.dataPathId,
                                    ShapeSuffix::None, keyName};
             recordStructuredDep(pools, c, DepHashValue(kHashZero()));
         });
@@ -415,9 +401,7 @@ static void recordHasKeyMissDeps(
         if (!pr) return;
         auto & pools = DependencyTracker::activeTracker->pools;
         auto & rec = resolveProvenanceRef(pools, *pr);
-        auto fmt = parseStructuredFormat(rec.format);
-        if (!fmt) return;
-        CompactDepComponents c{rec.sourceId, rec.filePathId, *fmt, rec.dataPathId,
+        CompactDepComponents c{rec.sourceId, rec.filePathId, rec.format, rec.dataPathId,
                                ShapeSuffix::None, keyName};
         recordStructuredDep(pools, c, DepHashValue(kHashOne()));
     } else {

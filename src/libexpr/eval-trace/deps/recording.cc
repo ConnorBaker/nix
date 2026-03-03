@@ -115,7 +115,7 @@ DataPathId jsonStringToDataPathId(InterningPools & pools, std::string_view jsonS
 }
 
 Pos::ProvenanceRef allocateProvenanceRef(
-    InterningPools & pools, DepSourceId srcId, FilePathId fpId, DataPathId dpId, char format)
+    InterningPools & pools, DepSourceId srcId, FilePathId fpId, DataPathId dpId, StructuredFormat format)
 {
     return Pos::ProvenanceRef{pools.provenanceTable.allocate(srcId, fpId, dpId, format)};
 }

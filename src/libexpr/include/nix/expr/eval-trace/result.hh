@@ -4,6 +4,7 @@
 #include "nix/expr/value.hh"
 #include "nix/expr/value/context.hh"
 #include "nix/expr/symbol-table.hh"
+#include "nix/expr/eval-trace/deps/types.hh"
 
 #include "nix/util/error.hh"
 
@@ -62,7 +63,7 @@ struct attrs_t {
         std::string depSource;  ///< flake input name
         std::string depKey;     ///< file path (resolved via input accessor)
         std::string dataPath;   ///< JSON array of path components, e.g. '["nodes","rev"]'
-        char format;            ///< 'j', 't', 'd' (StructuredFormat char)
+        StructuredFormat format;
     };
     std::vector<Origin> origins;       ///< deduplicated
     std::vector<int8_t> originIndices; ///< per-attr; -1 = no origin. Empty when origins is empty.
