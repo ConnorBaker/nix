@@ -32,6 +32,14 @@ uint32_t StringInternTable::internRaw(std::string_view sv)
     return idx;
 }
 
+uint32_t StringInternTable::findRaw(std::string_view sv) const
+{
+    auto it = dedup.find(sv);
+    if (it != dedup.end())
+        return *it;
+    return 0;
+}
+
 std::string_view StringInternTable::resolveRaw(uint32_t idx) const
 {
     if (idx < strings.size())

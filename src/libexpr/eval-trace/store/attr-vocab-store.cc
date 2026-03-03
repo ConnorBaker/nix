@@ -168,13 +168,7 @@ void AttrVocabStore::hashPath(HashSink & sink, AttrPathId pathId) const
 
 std::optional<AttrNameId> AttrVocabStore::lookupName(std::string_view name) const
 {
-    // Check if it's interned (uses StringInternTable dedup set).
-    // Unfortunately StringInternTable doesn't expose a lookup-only API,
-    // so we use the raw intern and check if the ID is within loaded range.
-    // This is safe because internRaw is idempotent for existing entries.
-    auto id = const_cast<StringInternTable &>(nameTable).internRaw(name);
-    if (id == 0 && !name.empty()) return std::nullopt;
-    return AttrNameId(id);
+    return nameTable.find<AttrNameId>(name);
 }
 
 std::optional<AttrPathId> AttrVocabStore::lookupPath(AttrPathId parent, AttrNameId child) const

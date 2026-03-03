@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory_resource>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -79,6 +80,17 @@ public:
     template<typename Id>
     std::string_view resolve(Id id) const {
         return resolveRaw(id.value);
+    }
+
+    /// Lookup a string without interning. Returns 0 if not found.
+    uint32_t findRaw(std::string_view sv) const;
+
+    /// Typed find: returns nullopt if the string is not interned.
+    template<typename Id>
+    std::optional<Id> find(std::string_view sv) const {
+        auto idx = findRaw(sv);
+        if (idx == 0 && !sv.empty()) return std::nullopt;
+        return Id(idx);
     }
 
     /// Bulk-load a string at a specific index (for DB population).
