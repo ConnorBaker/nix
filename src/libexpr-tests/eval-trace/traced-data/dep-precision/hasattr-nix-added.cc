@@ -72,8 +72,8 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyMismatch_NixAddedKey_FailsVerify)
     auto depKey = makeJsonDepKey(filePath, "j", nlohmann::json::array(), "", "_type");
 
     std::vector<Dep> deps = {{
-        DepType::StructuredContent, pools().intern<DepSourceId>(""),
-        pools().intern<DepKeyId>(depKey), DepHashValue(depHash("1"))
+        {DepType::StructuredContent, pools().intern<DepSourceId>(""),
+         pools().intern<DepKeyId>(depKey)}, DepHashValue(depHash("1"))
     }};
     CachedResult result{int_t{NixInt(42)}};
     auto attrPath = vpath({"test", "standalone"});
@@ -105,10 +105,10 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyMismatch_MultipleDeps_FirstBadBlocks)
     auto depKey2 = makeJsonDepKey(filePath, "j", nlohmann::json::array(), "", "x");
 
     std::vector<Dep> deps = {
-        {DepType::StructuredContent, pools().intern<DepSourceId>(""),
-         pools().intern<DepKeyId>(depKey1), DepHashValue(depHash("1"))},
-        {DepType::StructuredContent, pools().intern<DepSourceId>(""),
-         pools().intern<DepKeyId>(depKey2), DepHashValue(depHash("1"))},
+        {{DepType::StructuredContent, pools().intern<DepSourceId>(""),
+          pools().intern<DepKeyId>(depKey1)}, DepHashValue(depHash("1"))},
+        {{DepType::StructuredContent, pools().intern<DepSourceId>(""),
+          pools().intern<DepKeyId>(depKey2)}, DepHashValue(depHash("1"))},
     };
     CachedResult result{int_t{NixInt(1)}};
     auto attrPath = vpath({"test", "multi"});
@@ -134,8 +134,8 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyCorrect_JsonKey_PassesVerify)
 
     // Hash = depHash("1") — x exists in the JSON
     std::vector<Dep> deps = {{
-        DepType::StructuredContent, pools().intern<DepSourceId>(""),
-        pools().intern<DepKeyId>(depKey), DepHashValue(depHash("1"))
+        {DepType::StructuredContent, pools().intern<DepSourceId>(""),
+         pools().intern<DepKeyId>(depKey)}, DepHashValue(depHash("1"))
     }};
     CachedResult result{int_t{NixInt(1)}};
     auto attrPath = vpath({"test", "control"});
@@ -161,8 +161,8 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyCorrect_MissingKey_PassesVerify)
     // Hash = depHash("0") — _type doesn't exist in the JSON.
     // This is what verification will also compute → match.
     std::vector<Dep> deps = {{
-        DepType::StructuredContent, pools().intern<DepSourceId>(""),
-        pools().intern<DepKeyId>(depKey), DepHashValue(depHash("0"))
+        {DepType::StructuredContent, pools().intern<DepSourceId>(""),
+         pools().intern<DepKeyId>(depKey)}, DepHashValue(depHash("0"))
     }};
     CachedResult result{int_t{NixInt(0)}};
     auto attrPath = vpath({"test", "absent"});
@@ -197,11 +197,11 @@ TEST_F(TraceStoreTest, CoveredSC_HasKeyMismatch_MaskedByContentDep)
 
     std::vector<Dep> deps = {
         // Content dep (covers the file)
-        {DepType::Content, pools().intern<DepSourceId>(""),
-         pools().intern<DepKeyId>(filePath), DepHashValue(contentHash)},
+        {{DepType::Content, pools().intern<DepSourceId>(""),
+          pools().intern<DepKeyId>(filePath)}, DepHashValue(contentHash)},
         // SC dep with wrong hash (Nix-added _type)
-        {DepType::StructuredContent, pools().intern<DepSourceId>(""),
-         pools().intern<DepKeyId>(scDepKey), DepHashValue(depHash("1"))},
+        {{DepType::StructuredContent, pools().intern<DepSourceId>(""),
+          pools().intern<DepKeyId>(scDepKey)}, DepHashValue(depHash("1"))},
     };
     CachedResult result{int_t{NixInt(42)}};
     auto attrPath = vpath({"test", "covered"});

@@ -10,7 +10,7 @@
 
 namespace nix {
 
-struct Bindings;
+class Bindings;
 
 struct DirSetKey {
     std::vector<std::pair<DepSourceId, FilePathId>> sorted;
