@@ -9,15 +9,12 @@
 
 namespace nix::eval_trace {
 extern Counter nrDepTrackerScopes;
-extern Counter nrExcludeChildRangeCalls;
+extern Counter nrOwnDepsTotal;
+extern Counter nrOwnDepsMax;
 } // namespace nix::eval_trace
 
-#include <memory>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
-#include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
 namespace nix {
@@ -26,28 +23,27 @@ namespace nix {
  * RAII tracker that records dynamic dependencies during evaluation
  * (Adapton DDG builder, Shake-style dynamic dep discovery).
  *
- * Analogous to Adapton's demanded computation graph (DCG) construction:
- * as evaluation forces thunks, the active tracker records each dependency
- * (file content, directory listing, env var, etc.) into a trace. Unlike
- * static build systems where deps are declared upfront, deps are discovered
- * dynamically during evaluation — a property shared with Shake (Mitchell,
- * ICFP 2012). The set of deps can vary between evaluations of the same
- * attribute depending on evaluation order and caching state.
+ * Each tracker has its own dep vector (ownDeps). record() appends to the
+ * active tracker's ownDeps AND to the shared epochLog. collectTraces()
+ * returns std::move(ownDeps). Parent-child isolation is structural:
+ * nested trackers have separate ownDeps vectors, eliminating the need
+ * for range exclusion or filtration.
  *
- * All deps are recorded into a single thread-local sessionTraces vector.
- * Each tracker records its startIndex at construction time. The range
- * [startIndex, sessionTraces.size()) represents deps recorded during
- * this tracker's lifetime. Deps from previously-evaluated thunks are
- * replayed via replayedRanges (epoch ranges from before this tracker
- * started). This replay is analogous to Adapton's change propagation:
- * when a cached thunk is served from its trace, its recorded deps are
- * propagated to the parent tracker.
+ * The epochLog is a shared append-only vector used by the epoch map
+ * (thunk memoization). Deps that outlive individual trackers (e.g.,
+ * thunk deps replayed into later trackers) are referenced via epochLog
+ * ranges. replayMemoizedDeps() copies from epochLog into the active
+ * tracker's ownDeps.
  *
  * This is safe because evaluation is single-threaded.
  */
 struct DependencyTracker {
     static thread_local DependencyTracker * activeTracker;
-    static thread_local std::vector<Dep> sessionTraces;
+    /// Shared epoch log: deps that outlive individual trackers.
+    /// Used by epochMap (thunk memoization) to reference deps across
+    /// tracker lifetimes. record() appends here unconditionally;
+    /// recordToEpochLog() appends here only (not to any tracker's ownDeps).
+    static thread_local std::vector<Dep> epochLog;
     /// Nesting depth of live DependencyTracker instances on this thread.
     /// Only the first (depth 0 → 1) is a true root that should call
     /// onRootConstruction(). Trackers created inside a SuspendDepTracking
@@ -57,13 +53,13 @@ struct DependencyTracker {
 
     InterningPools & pools;
     DependencyTracker * previous;
-    std::vector<Dep> * mySessionTraces;
-    uint32_t startIndex;
-    /// Append-only list of dep ranges replayed from memoized thunks.
-    /// Order preserved: ranges are appended in evaluation encounter order,
-    /// then appended by collectTraces() to form the final dep vector
-    /// (filtering out ranges fully within excludedChildRanges).
-    std::vector<DepRange> replayedRanges;
+    /// Per-tracker dep vector: structurally isolated from other trackers.
+    /// record() appends here when this tracker is active.
+    /// collectTraces() returns std::move(ownDeps).
+    std::vector<Dep> ownDeps;
+    /// Index into epochLog at construction time. Used by
+    /// replayMemoizedDeps() to detect deps already captured.
+    uint32_t epochLogStartIndex;
 
     /// Deduplication set: prevents adding the same memoized dep range twice
     /// when a Value is re-forced. Pointer keys are safe because Values are
@@ -71,25 +67,11 @@ struct DependencyTracker {
     /// boost::unordered_flat_set for better cache locality (open addressing).
     boost::unordered_flat_set<const Value *> replayedValues;
 
-    /// Ranges in sessionTraces belonging to child TracedExpr evaluations.
-    /// Excluded from this tracker's collectTraces() output to prevent
-    /// parent traces from inheriting children's dependencies. Each
-    /// TracedExpr manages its own trace; the parent references children
-    /// via ParentContext deps.
-    std::vector<std::pair<uint32_t, uint32_t>> excludedChildRanges;
-
-    void excludeChildRange(uint32_t start, uint32_t end) {
-        if (start < end) {
-            excludedChildRanges.emplace_back(start, end);
-            eval_trace::nrExcludeChildRangeCalls++;
-        }
-    }
-
     /**
      * Hash-based dedup filter: stores uint64_t identity hashes. Both
-     * record() and recordStructuredDep() check membership before appending
-     * to sessionTraces. >90% of recording attempts are duplicates, so
-     * hash-only dedup avoids constructing DepKey strings entirely.
+     * record() and recordStructuredDep() check membership before appending.
+     * >90% of recording attempts are duplicates, so hash-only dedup avoids
+     * constructing DepKey strings entirely.
      *
      * tryInsert returns true if the hash was NOT previously seen.
      */
@@ -102,8 +84,7 @@ struct DependencyTracker {
     explicit DependencyTracker(InterningPools & pools)
         : pools(pools)
         , previous(activeTracker)
-        , mySessionTraces(&sessionTraces)
-        , startIndex(mySessionTraces->size())
+        , epochLogStartIndex(epochLog.size())
     {
         activeTracker = this;
         if (depth++ == 0) onRootConstruction();
@@ -131,42 +112,42 @@ struct DependencyTracker {
     DependencyTracker & operator=(const DependencyTracker &) = delete;
 
     /**
-     * Record a non-StructuredContent dependency into the session-wide dep vector.
+     * Record a dependency into the active tracker's ownDeps and the epochLog.
      * String-accepting overload: interns source and key via the provided pools.
      * Deduplicates by hashing (type, source, key) within the active tracker scope.
      * When no tracker is active (e.g. during SuspendDepTracking), skips dedup
-     * but still interns and appends (needed for epoch tracking).
+     * and ownDeps append but still writes to epochLog (needed for epoch tracking).
      */
     static void record(InterningPools & pools, DepType type,
                        std::string_view source, std::string_view key,
                        DepHashValue hash);
 
     /**
-     * Record a pre-interned dependency into the session-wide dep vector.
-     * Deduplicates by hashing (type, sourceId, keyId) within the active tracker scope.
+     * Record a pre-interned dependency into the active tracker's ownDeps
+     * and the epochLog. Deduplicates within the active tracker scope.
      */
     static void record(const Dep & dep);
 
     /**
-     * Append a dependency to sessionTraces without touching the active
-     * tracker's depDedup filter. String-accepting overload: interns into Dep.
+     * Append a dependency to the epochLog only (not to any tracker's ownDeps).
+     * String-accepting overload: interns source and key.
      * Used by TracedExpr::replayTrace() to propagate a child's cached deps
-     * into the session trace (needed for thunk epoch ranges) without
-     * polluting the parent tracker's dedup state.
+     * into the epoch log (needed for thunk epoch ranges) without adding
+     * them to any tracker's dep set.
      */
-    static void recordReplay(InterningPools & pools, DepType type,
-                             std::string_view source, std::string_view key,
-                             const DepHashValue & hash);
+    static void recordToEpochLog(InterningPools & pools, DepType type,
+                                 std::string_view source, std::string_view key,
+                                 const DepHashValue & hash);
 
     /**
-     * Append a pre-interned dependency to sessionTraces without touching
-     * the active tracker's depDedup filter.
+     * Append a pre-interned dependency to the epochLog only.
      */
-    static void recordReplay(const Dep & dep);
+    static void recordToEpochLog(const Dep & dep);
 
     /**
-     * Collect all deps: session range [startIndex, current) plus
-     * replayed epoch ranges, skipping any regions in excludedChildRanges.
+     * Collect this tracker's deps. Returns std::move(ownDeps).
+     * Replayed epoch deps are already copied into ownDeps by
+     * replayMemoizedDeps().
      */
     std::vector<Dep> collectTraces() const;
 
@@ -176,9 +157,9 @@ struct DependencyTracker {
     static bool isActive() { return activeTracker != nullptr; }
 
     /**
-     * Clear the session-wide dep vector. Called from resetFileCache().
+     * Clear the epoch log. Called from resetFileCache().
      */
-    static void clearSessionTraces();
+    static void clearEpochLog();
 };
 
 /**

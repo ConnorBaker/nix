@@ -1179,7 +1179,7 @@ void EvalState::resetFileCache()
     positions.clear();
     if (traceCtx)
         traceCtx->reset();
-    DependencyTracker::clearSessionTraces();
+    DependencyTracker::clearEpochLog();
 }
 
 void EvalState::recordImportContentDep(const SourcePath & resolvedPath)
@@ -1209,7 +1209,7 @@ void EvalState::forceThunkValue(Value & v, const PosIdx pos)
     // Without this, replayMemoizedDeps() can't find deps for values forced
     // during suspension, causing evaluation-order-dependent dep sets.
     uint32_t epochStart = traceCtx
-        ? DependencyTracker::sessionTraces.size() : 0;
+        ? DependencyTracker::epochLog.size() : 0;
     try {
         v.mkBlackhole();
         if (env) [[likely]]
@@ -1228,7 +1228,7 @@ void EvalState::forceThunkValue(Value & v, const PosIdx pos)
 void EvalState::forceAppValue(Value & v, const PosIdx pos)
 {
     uint32_t epochStart = traceCtx
-        ? DependencyTracker::sessionTraces.size() : 0;
+        ? DependencyTracker::epochLog.size() : 0;
     Value savedApp = v;
     try {
         callFunction(*v.app().left, *v.app().right, v, pos);
@@ -3353,7 +3353,8 @@ void EvalState::printStatistics()
         }},
         {"depTracker", {
             {"scopes", eval_trace::nrDepTrackerScopes.load()},
-            {"excludeChildRangeCalls", eval_trace::nrExcludeChildRangeCalls.load()},
+            {"ownDepsTotal", eval_trace::nrOwnDepsTotal.load()},
+            {"ownDepsMax", eval_trace::nrOwnDepsMax.load()},
         }},
         {"replay", {
             {"totalCalls", eval_trace::nrReplayTotalCalls.load()},

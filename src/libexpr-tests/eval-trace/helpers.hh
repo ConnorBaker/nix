@@ -345,7 +345,7 @@ public:
         pools.filePathPool.clear();
         pools.dataPathPool.clear();
         pools.sessionSymbols = nullptr;
-        DependencyTracker::clearSessionTraces();
+        DependencyTracker::clearEpochLog();
     }
 
 protected:

@@ -18,12 +18,12 @@ protected:
 
     void SetUp() override
     {
-        DependencyTracker::clearSessionTraces();
+        DependencyTracker::clearEpochLog();
     }
 
     void TearDown() override
     {
-        DependencyTracker::clearSessionTraces();
+        DependencyTracker::clearEpochLog();
     }
 };
 
@@ -65,10 +65,10 @@ TEST_F(DependencyTrackerTest, Record_WithActiveTracker)
 
 TEST_F(DependencyTrackerTest, Record_WithoutActiveTracker)
 {
-    // Recording without an active tracker should just append to session traces without crash
+    // Recording without an active tracker appends to epochLog only (no ownDeps)
     auto dep = makeContentDep(pools, "/test.nix", "content");
     DependencyTracker::record(dep);
-    // No crash is the test (dependency recorded to global session trace)
+    // No crash is the test (dependency recorded to epochLog)
 }
 
 TEST_F(DependencyTrackerTest, CollectDeps_OnlyCurrentRange)
@@ -83,8 +83,8 @@ TEST_F(DependencyTrackerTest, CollectDeps_OnlyCurrentRange)
         EXPECT_EQ(pools.resolve(innerDeps[0].key.keyId), "/inner.nix");
     }
     auto outerDeps = outer.collectTraces();
-    // Outer should have both (inner recorded into outer's session range too — Adapton: nested scopes)
-    EXPECT_GE(outerDeps.size(), 1u);
+    // Outer has only its own dep — inner's dep is structurally isolated in inner's ownDeps
+    EXPECT_EQ(outerDeps.size(), 1u);
     EXPECT_EQ(pools.resolve(outerDeps[0].key.keyId), "/outer.nix");
 }
 
@@ -93,9 +93,9 @@ TEST_F(DependencyTrackerTest, ClearSessionDeps)
     DependencyTracker tracker(pools);
     DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
     DependencyTracker::record(makeContentDep(pools, "/b.nix", "b"));
-    DependencyTracker::clearSessionTraces();
-    // After clearing, new tracker should see no old deps
-    // (session trace reset — Adapton: clean DDG slate)
+    DependencyTracker::clearEpochLog();
+    // After clearing, epoch log is empty
+    // (epoch log reset — Adapton: clean DDG slate)
 }
 
 // ── SuspendDepTracking tests (Adapton: suspend DDG recording) ────
@@ -123,19 +123,19 @@ TEST_F(DependencyTrackerTest, Suspend_RestoresOnDestruct)
 
 TEST_F(DependencyTrackerTest, Suspend_RecordStillAppends)
 {
-    // Recording still appends to session traces even when tracker is suspended
-    // (no active tracker scope, but session trace is global)
+    // During suspension, record() appends to epochLog but NOT to any
+    // tracker's ownDeps (activeTracker is null).
     DependencyTracker tracker(pools);
     DependencyTracker::record(makeContentDep(pools, "/before.nix", "a"));
     {
         SuspendDepTracking suspend;
-        // Recording during suspension still pushes to session traces
+        // Recording during suspension pushes to epochLog only, not ownDeps
         DependencyTracker::record(makeContentDep(pools, "/during.nix", "b"));
     }
     DependencyTracker::record(makeContentDep(pools, "/after.nix", "c"));
     auto deps = tracker.collectTraces();
-    // All three should be in session traces and within tracker's range
-    EXPECT_EQ(deps.size(), 3u);
+    // Only /before.nix and /after.nix — during suspend, activeTracker is null so deps go to epochLog only
+    EXPECT_EQ(deps.size(), 2u);
 }
 
 TEST_F(DependencyTrackerTest, Suspend_NestedSuspend)
@@ -296,8 +296,8 @@ TEST_F(DependencyTrackerTest, Record_DedupPerTrackerScope)
         EXPECT_EQ(innerDeps.size(), 1u);
     }
     auto outerDeps = outer.collectTraces();
-    // Outer sees both: one from before inner, one from inner scope
-    EXPECT_EQ(outerDeps.size(), 2u);
+    // Outer has only its own dep — inner's dep is structurally isolated in inner's ownDeps
+    EXPECT_EQ(outerDeps.size(), 1u);
 }
 
 TEST_F(DependencyTrackerTest, Record_DedupWithDifferentSources)

@@ -18,9 +18,9 @@ void EvalTraceContext::recordThunkDeps(const Value & v, uint32_t epochStart)
         skipEpochRecordFor = nullptr;
         return;
     }
-    uint32_t epochEnd = DependencyTracker::sessionTraces.size();
+    uint32_t epochEnd = DependencyTracker::epochLog.size();
     if (epochStart < epochEnd) {
-        epochMap.emplace(&v, DepRange{&DependencyTracker::sessionTraces, epochStart, epochEnd});
+        epochMap.emplace(&v, DepRange{&DependencyTracker::epochLog, epochStart, epochEnd});
         replayBloom.set(&v);
     }
 }
@@ -37,22 +37,19 @@ void EvalTraceContext::replayMemoizedDeps(const Value & v)
     auto & range = it->second;
 
     // Only the innermost (active) tracker receives replayed deps.
-    // The previous implementation walked the full tracker stack, but profiling
-    // across multiple large workloads showed nrReplayStackWalkMultiModify = 0
-    // (the counter tracked cases where more than one tracker on the stack was
-    // modified). This holds because nested trackers (e.g., child TracedExpr
-    // evaluations) exclude their dep ranges from the parent via
-    // excludeChildRange(), so replayed deps only need to reach the innermost.
     auto * tracker = DependencyTracker::activeTracker;
     if (!tracker) return;
 
-    // If the range is within this tracker's session range, skip —
-    // the deps are already captured by [startIndex, sessionTraces.size()).
-    if (range.deps == tracker->mySessionTraces
-        && range.start >= tracker->startIndex)
+    // If the epoch range started after this tracker was created, the deps
+    // are already in ownDeps (they were recorded via record() during this
+    // tracker's lifetime). Skip to avoid double-counting.
+    if (range.start >= tracker->epochLogStartIndex)
         return;
     if (tracker->replayedValues.insert(&v).second) {
-        tracker->replayedRanges.push_back(range);
+        // Copy deps from epochLog range into this tracker's ownDeps.
+        tracker->ownDeps.insert(tracker->ownDeps.end(),
+            range.deps->begin() + range.start,
+            range.deps->begin() + range.end);
         eval_trace::nrReplayAdded++;
     }
 }

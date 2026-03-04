@@ -500,7 +500,7 @@ struct Dep {
 };
 
 /**
- * A half-open range [start, end) into a session-wide dep vector,
+ * A half-open range [start, end) into the epoch log dep vector,
  * representing the deps recorded during a single thunk/app evaluation.
  */
 struct DepRange {

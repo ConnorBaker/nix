@@ -436,7 +436,7 @@ void TracedExpr::replayTrace(TraceId traceId)
         auto deps = cache->dbBackend->loadFullTrace(traceId);
         for (auto & idep : deps) {
             auto resolved = cache->dbBackend->resolveDep(idep);
-            DependencyTracker::recordReplay(pools, resolved.type,
+            DependencyTracker::recordToEpochLog(pools, resolved.type,
                 resolved.source, resolved.key, resolved.expectedHash);
         }
     } catch (std::exception &) {
@@ -849,26 +849,12 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
         return;
     }
 
-    // Exclude this child TracedExpr's dep range from the parent's trace.
-    // Each TracedExpr manages its own deps via its DependencyTracker in
-    // evaluateFresh(); the parent references children via ParentContext
-    // deps (appendParentContextDeps). Without this exclusion, parent
-    // traces inherit ~30K child deps, making them evaluation-order-dependent.
-    auto * parentTracker = DependencyTracker::activeTracker;
-    uint32_t childRangeStart = DependencyTracker::sessionTraces.size();
-    if (parentTracker && state.traceCtx)
+    // Skip epoch recording for this TracedExpr — it manages its own
+    // deps via its DependencyTracker in evaluateFresh(); the parent
+    // references children via ParentContext deps (appendParentContextDeps).
+    // With per-tracker ownDeps, parent-child isolation is structural.
+    if (DependencyTracker::activeTracker && state.traceCtx)
         state.traceCtx->skipEpochRecordFor = &v;
-
-    struct ChildRangeExcluder {
-        DependencyTracker * parentTracker;
-        uint32_t rangeStart;
-        ~ChildRangeExcluder() {
-            if (parentTracker) {
-                uint32_t rangeEnd = DependencyTracker::sessionTraces.size();
-                parentTracker->excludeChildRange(rangeStart, rangeEnd);
-            }
-        }
-    } childExcluder{parentTracker, childRangeStart};
 
     auto & db = *cache->dbBackend;
 

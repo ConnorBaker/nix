@@ -15,12 +15,12 @@ class DependencyTrackerTest : public ::testing::Test
 protected:
     void SetUp() override
     {
-        DependencyTracker::clearSessionTraces();
+        DependencyTracker::clearEpochLog();
     }
 
     void TearDown() override
     {
-        DependencyTracker::clearSessionTraces();
+        DependencyTracker::clearEpochLog();
     }
 };
 

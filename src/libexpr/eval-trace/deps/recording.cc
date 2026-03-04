@@ -7,7 +7,8 @@
 
 namespace nix::eval_trace {
 Counter nrDepTrackerScopes;
-Counter nrExcludeChildRangeCalls;
+Counter nrOwnDepsTotal;
+Counter nrOwnDepsMax;
 } // namespace nix::eval_trace
 
 namespace nix {
@@ -25,8 +26,8 @@ namespace nix {
 // │ machinery. These are independent of any particular EvalState.      │
 // │                                                                    │
 // │ Members:                                                           │
-// │   - sessionTraces      (append-only Dep vector,                    │
-// │                          index-addressed by DepRange)              │
+// │   - epochLog           (append-only Dep vector for thunk           │
+// │                          memoization, index-addressed by DepRange) │
 // │   - activeTracker      (current RAII tracker in the call stack)    │
 // │   - depth              (nesting depth of live trackers)            │
 // ├─────────────────────────────────────────────────────────────────────┤
@@ -75,9 +76,9 @@ namespace nix {
 
 // [Lifetime 1] Per-thread active dependency tracker pointer.
 thread_local DependencyTracker * DependencyTracker::activeTracker = nullptr;
-// [Lifetime 1] Per-thread append-only dep vector. Index-addressed by
-// DepRange; never shrinks in production (only reserved, not cleared).
-thread_local std::vector<Dep> DependencyTracker::sessionTraces;
+// [Lifetime 1] Shared epoch log for thunk memoization across tracker lifetimes.
+// Append-only; index-addressed by DepRange in epochMap.
+thread_local std::vector<Dep> DependencyTracker::epochLog;
 // [Lifetime 1] Nesting depth of live DependencyTracker instances.
 thread_local uint32_t DependencyTracker::depth = 0;
 
@@ -137,8 +138,8 @@ static thread_local std::optional<RootTrackerScope> rootScopeStorage;
 void DependencyTracker::onRootConstruction()
 {
     rootScopeStorage.emplace();
-    // Lifetime 1 state (pools, sessionTraces) is NOT cleared here.
-    sessionTraces.reserve(16384);
+    // Lifetime 1 state (pools, epochLog) is NOT cleared here.
+    epochLog.reserve(16384);
 }
 
 void DependencyTracker::onRootDestruction()
@@ -192,7 +193,7 @@ void clearPrecomputedKeysMap()
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// DependencyTracker::record / recordReplay
+// DependencyTracker::record / recordToEpochLog
 // ═══════════════════════════════════════════════════════════════════════
 
 // Record a non-StructuredContent dependency edge (Adapton: "add-edge").
@@ -210,9 +211,11 @@ void DependencyTracker::record(InterningPools & pools, DepType type,
     }
     debug("recording %s (%s) dep: input='%s' key='%s'",
         depTypeName(type), depKindName(depKind(type)), source, key);
-    sessionTraces.push_back(Dep{
-        {type, pools.intern<DepSourceId>(source), pools.intern<DepKeyId>(key)},
-        std::move(hash)});
+    Dep dep{{type, pools.intern<DepSourceId>(source), pools.intern<DepKeyId>(key)},
+            std::move(hash)};
+    epochLog.push_back(dep);
+    if (activeTracker)
+        activeTracker->ownDeps.push_back(dep);
 }
 
 void DependencyTracker::record(const Dep & dep)
@@ -222,7 +225,9 @@ void DependencyTracker::record(const Dep & dep)
         if (!activeTracker->depDedup.tryInsert(h))
             return;
     }
-    sessionTraces.push_back(dep);
+    epochLog.push_back(dep);
+    if (activeTracker)
+        activeTracker->ownDeps.push_back(dep);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -256,103 +261,60 @@ void DependencyTracker::record(const Dep & dep)
         key["s"] = std::string(shapeSuffixName(c.suffix));
 
     auto keyStr = key.dump();
-    DependencyTracker::sessionTraces.push_back(
-        Dep{{depType, c.sourceId, pools.intern<DepKeyId>(keyStr)}, hash});
+    Dep dep{{depType, c.sourceId, pools.intern<DepKeyId>(keyStr)}, hash};
+    DependencyTracker::epochLog.push_back(dep);
+    if (DependencyTracker::activeTracker)
+        DependencyTracker::activeTracker->ownDeps.push_back(dep);
     return true;
 }
 
-// Replay a child's cached dependency into the session trace without touching the
-// active tracker's dedup filter (depDedup). This prevents parent dedup
-// pollution: the child's deps land in an excluded range in sessionTraces (so
-// they're skipped by collectTraces), but if record() were used instead, the
-// parent's depDedup would reject a later independent recording of the same
-// dep. recordReplay avoids this by only appending to sessionTraces — the dep
-// still participates in thunk epoch ranges (recordThunkDeps) for correct
-// transitive propagation.
-void DependencyTracker::recordReplay(InterningPools & pools, DepType type,
-                                     std::string_view source, std::string_view key,
-                                     const DepHashValue & hash)
+// Append a dep to the epoch log only (not to any tracker's ownDeps).
+// Used by TracedExpr::replayTrace() to propagate a child's cached deps
+// into the epoch log for thunk memoization without adding them to any
+// tracker's dep set.
+void DependencyTracker::recordToEpochLog(InterningPools & pools, DepType type,
+                                         std::string_view source, std::string_view key,
+                                         const DepHashValue & hash)
 {
-    sessionTraces.push_back(Dep{
+    epochLog.push_back(Dep{
         {type, pools.intern<DepSourceId>(source), pools.intern<DepKeyId>(key)},
         hash});
 }
 
-void DependencyTracker::recordReplay(const Dep & dep)
+void DependencyTracker::recordToEpochLog(const Dep & dep)
 {
-    sessionTraces.push_back(dep);
+    epochLog.push_back(dep);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// collectTraces / clearSessionTraces
+// collectTraces / clearEpochLog
 // ═══════════════════════════════════════════════════════════════════════
 
 // Collect the complete trace for this evaluation scope (BSàlC §3.1: a trace
 // is the ordered sequence of (key, hash) pairs observed during evaluation).
-// Combines two sources:
-//   1. Directly recorded deps from this scope [startIndex, endIndex)
-//   2. Replayed deps from previously-verified thunks (Adapton: "demanded
-//      computations" whose cached traces are transitively included)
-// When excludedChildRanges is non-empty, session deps within those ranges
-// are skipped, and replayed ranges fully contained within an excluded range
-// are filtered out. This prevents parent TracedExpr traces from inheriting
-// children's deps (children have their own traces + ParentContext deps).
-// The result is the flattened dependency vector for trace storage.
+// With per-tracker dep vectors, this is simply returning the tracker's own
+// deps. Replayed epoch deps are already copied into ownDeps by
+// replayMemoizedDeps(). Child TracedExpr evaluations record into their own
+// trackers' ownDeps, providing structural isolation without range exclusion.
 std::vector<Dep> DependencyTracker::collectTraces() const
 {
-    uint32_t endIndex = mySessionTraces->size();
-
-    if (excludedChildRanges.empty()) {
-        // Fast path: no child exclusions needed
-        if (replayedRanges.empty())
-            return {mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex};
-
-        std::vector<Dep> result(mySessionTraces->begin() + startIndex, mySessionTraces->begin() + endIndex);
-        for (auto & r : replayedRanges)
-            result.insert(result.end(), r.deps->begin() + r.start, r.deps->begin() + r.end);
-        return result;
+    auto & deps = const_cast<DependencyTracker *>(this)->ownDeps;
+    if (Counter::enabled) {
+        auto n = static_cast<Counter::value_type>(deps.size());
+        eval_trace::nrOwnDepsTotal += n;
+        // Atomic max: load, compare, CAS loop
+        auto cur = eval_trace::nrOwnDepsMax.load();
+        while (n > cur && !eval_trace::nrOwnDepsMax.inner.compare_exchange_weak(cur, n))
+            ;
     }
-
-    // Slow path: skip excluded child ranges to prevent parent traces
-    // from inheriting children's dependencies.
-    std::vector<Dep> result;
-
-    // Copy session deps [startIndex, endIndex) skipping excluded ranges
-    uint32_t pos = startIndex;
-    for (auto & [exStart, exEnd] : excludedChildRanges) {
-        uint32_t s = std::max(exStart, startIndex);
-        uint32_t e = std::min(exEnd, endIndex);
-        if (s > pos)
-            result.insert(result.end(), mySessionTraces->begin() + pos, mySessionTraces->begin() + s);
-        if (e > pos)
-            pos = e;
-    }
-    if (pos < endIndex)
-        result.insert(result.end(), mySessionTraces->begin() + pos, mySessionTraces->begin() + endIndex);
-
-    // Append replayed ranges, filtering out any fully within an excluded range
-    for (auto & r : replayedRanges) {
-        bool excluded = false;
-        if (r.deps == mySessionTraces) {
-            for (auto & [exStart, exEnd] : excludedChildRanges) {
-                if (r.start >= exStart && r.end <= exEnd) {
-                    excluded = true;
-                    break;
-                }
-            }
-        }
-        if (!excluded)
-            result.insert(result.end(), r.deps->begin() + r.start, r.deps->begin() + r.end);
-    }
-
-    return result;
+    return std::move(deps);
 }
 
-// Clear the session dependency vector between evaluation sessions.
+// Clear the epoch log between evaluation sessions.
 // Called when the file cache is reset.
-void DependencyTracker::clearSessionTraces()
+void DependencyTracker::clearEpochLog()
 {
-    sessionTraces.clear();
+    epochLog.clear();
 }
 
 } // namespace nix

@@ -16,12 +16,12 @@ protected:
     void SetUp() override
     {
         // Ensure no lingering dependency tracker from a previous test (Adapton: clean DDG state)
-        DependencyTracker::clearSessionTraces();
+        DependencyTracker::clearEpochLog();
     }
 
     void TearDown() override
     {
-        DependencyTracker::clearSessionTraces();
+        DependencyTracker::clearEpochLog();
     }
 };
 

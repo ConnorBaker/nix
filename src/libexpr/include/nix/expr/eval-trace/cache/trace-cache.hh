@@ -125,7 +125,8 @@ extern Counter nrDataFileContainerChildren;
 
 // DependencyTracker scope operations
 extern Counter nrDepTrackerScopes;
-extern Counter nrExcludeChildRangeCalls;
+extern Counter nrOwnDepsTotal;
+extern Counter nrOwnDepsMax;
 
 // replayMemoizedDeps breakdown
 extern Counter nrReplayTotalCalls;

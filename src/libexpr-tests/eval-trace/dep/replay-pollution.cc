@@ -24,95 +24,89 @@ class ReplayPollutionTest : public ::testing::Test
 {
 protected:
     InterningPools pools;
-    void SetUp() override { DependencyTracker::clearSessionTraces(); }
-    void TearDown() override { DependencyTracker::clearSessionTraces(); }
+    void SetUp() override { DependencyTracker::clearEpochLog(); }
+    void TearDown() override { DependencyTracker::clearEpochLog(); }
 };
 
 // ═════════════════════════════════════════════════════════════════════
-// Test 1: recordReplay does NOT pollute parent dedup set
+// Test 1: Structural isolation — recordToEpochLog does not enter ownDeps
 // ═════════════════════════════════════════════════════════════════════
 
 TEST_F(ReplayPollutionTest, ReplayedDeps_DoNotPolluteParentDedupSet)
 {
     DependencyTracker parent(pools);
 
-    // Parent records dep A
-    DependencyTracker::record(makeContentDep(pools,"/a.nix", "a"));
+    // Parent records dep A into its ownDeps
+    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
 
     // Simulate child TracedExpr cache-hit replay:
-    // record child's deps (including /shared.nix) into excluded range
-    uint32_t childStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::recordReplay(makeContentDep(pools,"/shared.nix", "v1"));
-    DependencyTracker::recordReplay(makeContentDep(pools,"/child-only.nix", "c"));
-    uint32_t childEnd = DependencyTracker::sessionTraces.size();
-    parent.excludeChildRange(childStart, childEnd);
+    // recordToEpochLog() appends to epochLog only,
+    // NOT to any tracker's ownDeps — structural isolation by design.
+    DependencyTracker::recordToEpochLog(makeContentDep(pools, "/shared.nix", "v1"));
+    DependencyTracker::recordToEpochLog(makeContentDep(pools, "/child-only.nix", "c"));
 
-    // Parent independently records /shared.nix — MUST NOT be deduped
-    DependencyTracker::record(makeContentDep(pools,"/shared.nix", "v1"));
-    DependencyTracker::record(makeContentDep(pools,"/b.nix", "b"));
+    // Parent independently records /shared.nix — must succeed (no dedup pollution)
+    DependencyTracker::record(makeContentDep(pools, "/shared.nix", "v1"));
+    DependencyTracker::record(makeContentDep(pools, "/b.nix", "b"));
 
     auto deps = parent.collectTraces();
     auto k = keys(pools, deps);
-    // Parent's trace must contain /a.nix, /shared.nix, /b.nix
+    // Parent's trace must contain exactly its own deps: /a.nix, /shared.nix, /b.nix.
+    // Note: /shared.nix appears because recordToEpochLog() did NOT pollute the
+    // parent's depDedup filter, so the subsequent record() succeeds.
     EXPECT_EQ(k, (std::vector<std::string>{"/a.nix", "/shared.nix", "/b.nix"}));
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Test 2: Documents the bug — record() DOES pollute parent dedup set
+// Test 2: (DELETED) The dedup pollution bug is structurally eliminated
+//   With per-tracker ownDeps, child record() goes into the child
+//   tracker's ownDeps, not the parent's. No test needed.
 // ═════════════════════════════════════════════════════════════════════
 
-TEST_F(ReplayPollutionTest, RecordPollutesParentDedupSet_Demonstration)
-{
-    DependencyTracker parent(pools);
-    DependencyTracker::record(makeContentDep(pools,"/a.nix", "a"));
-
-    // Simulate child replay using record() (the old buggy path)
-    uint32_t childStart = DependencyTracker::sessionTraces.size();
-    DependencyTracker::record(makeContentDep(pools,"/shared.nix", "v1"));
-    uint32_t childEnd = DependencyTracker::sessionTraces.size();
-    parent.excludeChildRange(childStart, childEnd);
-
-    // Parent tries to record /shared.nix — dedup drops it!
-    DependencyTracker::record(makeContentDep(pools,"/shared.nix", "v1"));
-
-    auto deps = parent.collectTraces();
-    // BUG: /shared.nix is missing because record() deduped against recordedKeys
-    // which was polluted by the child's replay
-    EXPECT_EQ(keys(pools, deps), (std::vector<std::string>{"/a.nix"}));
-    // This test documents the bug; it would need updating if we
-    // change record() semantics (but we're adding recordReplay instead).
-}
-
 // ═════════════════════════════════════════════════════════════════════
-// Test 3: recordReplay appends to sessionTraces (needed for epochs)
+// Test 3: recordToEpochLog appends to epochLog,
+//         but NOT to any tracker's ownDeps
 // ═════════════════════════════════════════════════════════════════════
 
-TEST_F(ReplayPollutionTest, RecordReplay_AppendsToSessionTraces)
+TEST_F(ReplayPollutionTest, RecordReplay_AppendsToSessionAndEpochOnly)
 {
     DependencyTracker tracker(pools);
-    uint32_t before = DependencyTracker::sessionTraces.size();
-    DependencyTracker::recordReplay(makeContentDep(pools,"/x.nix", "x"));
-    uint32_t after = DependencyTracker::sessionTraces.size();
-    EXPECT_EQ(after, before + 1);
-    EXPECT_EQ(pools.resolve(DependencyTracker::sessionTraces.back().key.keyId), "/x.nix");
+
+    uint32_t epochBefore = DependencyTracker::epochLog.size();
+
+    DependencyTracker::recordToEpochLog(makeContentDep(pools, "/x.nix", "x"));
+
+    // epochLog grows by 1
+    EXPECT_EQ(DependencyTracker::epochLog.size(), epochBefore + 1);
+    EXPECT_EQ(pools.resolve(DependencyTracker::epochLog.back().key.keyId), "/x.nix");
+
+    // tracker's ownDeps is NOT affected
+    auto deps = tracker.collectTraces();
+    EXPECT_EQ(deps.size(), 0u);
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Test 4: recordReplay does NOT dedup (no interaction with recordedKeys)
+// Test 4: recordToEpochLog does NOT dedup and does NOT enter ownDeps
 // ═════════════════════════════════════════════════════════════════════
 
 TEST_F(ReplayPollutionTest, RecordReplay_NoDedup)
 {
     DependencyTracker tracker(pools);
-    DependencyTracker::recordReplay(makeContentDep(pools,"/x.nix", "v1"));
-    DependencyTracker::recordReplay(makeContentDep(pools,"/x.nix", "v1")); // same dep
-    // Both appended (no dedup for replay)
+    uint32_t epochBefore = DependencyTracker::epochLog.size();
+
+    DependencyTracker::recordToEpochLog(makeContentDep(pools, "/x.nix", "v1"));
+    DependencyTracker::recordToEpochLog(makeContentDep(pools, "/x.nix", "v1")); // same dep
+
+    // Both appended to epochLog (no dedup for replay)
+    EXPECT_EQ(DependencyTracker::epochLog.size(), epochBefore + 2);
+
+    // But tracker's ownDeps has 0 deps — recordToEpochLog doesn't touch ownDeps
     auto deps = tracker.collectTraces();
-    EXPECT_EQ(deps.size(), 2u);
+    EXPECT_EQ(deps.size(), 0u);
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Test 5: Parent deps intact after child replay with excluded range
+// Test 5: Parent deps intact after child replay (no excludeChildRange)
 // ═════════════════════════════════════════════════════════════════════
 
 TEST_F(ReplayPollutionTest, EpochAfterReplay_ParentDepsIntact)
@@ -120,16 +114,13 @@ TEST_F(ReplayPollutionTest, EpochAfterReplay_ParentDepsIntact)
     DependencyTracker parent(pools);
 
     // Parent records before child
-    DependencyTracker::record(makeContentDep(pools,"/before.nix", "b"));
+    DependencyTracker::record(makeContentDep(pools, "/before.nix", "b"));
 
-    // Child cache-hit replay (excluded range)
-    uint32_t cs = DependencyTracker::sessionTraces.size();
-    DependencyTracker::recordReplay(makeContentDep(pools,"/child.nix", "c"));
-    uint32_t ce = DependencyTracker::sessionTraces.size();
-    parent.excludeChildRange(cs, ce);
+    // Child cache-hit replay — goes to session/epoch only, not parent's ownDeps
+    DependencyTracker::recordToEpochLog(makeContentDep(pools, "/child.nix", "c"));
 
     // Parent records after child
-    DependencyTracker::record(makeContentDep(pools,"/after.nix", "a"));
+    DependencyTracker::record(makeContentDep(pools, "/after.nix", "a"));
 
     auto deps = parent.collectTraces();
     EXPECT_EQ(keys(pools, deps), (std::vector<std::string>{"/before.nix", "/after.nix"}));
@@ -142,25 +133,19 @@ TEST_F(ReplayPollutionTest, EpochAfterReplay_ParentDepsIntact)
 TEST_F(ReplayPollutionTest, MultipleChildren_SharedDep_ParentTraceComplete)
 {
     DependencyTracker parent(pools);
-    DependencyTracker::record(makeContentDep(pools,"/parent.nix", "p"));
+    DependencyTracker::record(makeContentDep(pools, "/parent.nix", "p"));
 
     // Child A cache-hit replay (shares /lib.nix with parent)
-    uint32_t c1s = DependencyTracker::sessionTraces.size();
-    DependencyTracker::recordReplay(makeContentDep(pools,"/lib.nix", "lib"));
-    DependencyTracker::recordReplay(makeContentDep(pools,"/a.nix", "a"));
-    uint32_t c1e = DependencyTracker::sessionTraces.size();
-    parent.excludeChildRange(c1s, c1e);
+    DependencyTracker::recordToEpochLog(makeContentDep(pools, "/lib.nix", "lib"));
+    DependencyTracker::recordToEpochLog(makeContentDep(pools, "/a.nix", "a"));
 
     // Child B cache-hit replay (also uses /lib.nix)
-    uint32_t c2s = DependencyTracker::sessionTraces.size();
-    DependencyTracker::recordReplay(makeContentDep(pools,"/lib.nix", "lib"));
-    DependencyTracker::recordReplay(makeContentDep(pools,"/b.nix", "b"));
-    uint32_t c2e = DependencyTracker::sessionTraces.size();
-    parent.excludeChildRange(c2s, c2e);
+    DependencyTracker::recordToEpochLog(makeContentDep(pools, "/lib.nix", "lib"));
+    DependencyTracker::recordToEpochLog(makeContentDep(pools, "/b.nix", "b"));
 
-    // Parent independently reads /lib.nix — must succeed
-    DependencyTracker::record(makeContentDep(pools,"/lib.nix", "lib"));
-    DependencyTracker::record(makeContentDep(pools,"/parent2.nix", "p2"));
+    // Parent independently reads /lib.nix — must succeed (no dedup pollution)
+    DependencyTracker::record(makeContentDep(pools, "/lib.nix", "lib"));
+    DependencyTracker::record(makeContentDep(pools, "/parent2.nix", "p2"));
 
     auto deps = parent.collectTraces();
     EXPECT_EQ(keys(pools, deps),

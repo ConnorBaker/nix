@@ -31,7 +31,7 @@ using FilePathId = StrongId<FilePathTag>;
 using DataPathId = StrongId<DataPathTag, uint32_t>;
 
 /// Interned dep key ID (dep key string index in StringInternTable).
-/// Used by Dep to avoid per-dep string allocation in sessionTraces.
+/// Used by Dep to avoid per-dep string allocation in dep vectors.
 using DepKeyId = StrongId<DepKeyTag, uint32_t>;
 
 /// Interned string ID for DB-level dep source/key storage.

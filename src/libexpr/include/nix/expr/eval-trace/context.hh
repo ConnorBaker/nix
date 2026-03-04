@@ -72,7 +72,7 @@ struct EvalTraceContext {
     /**
      * Epoch-based memoized oracle deps from thunk/app evaluation, keyed by
      * Value address. Each entry records the [start, end) range in the
-     * session-wide dep vector that was produced during the thunk's evaluation.
+     * epochLog that was produced during the thunk's evaluation.
      * Used by replayMemoizedDeps() to propagate deps into active dependency
      * trackers (Adapton DDG: transitive dependency edges).
      */
@@ -119,19 +119,19 @@ struct EvalTraceContext {
 
     /**
      * Record that thunk/app evaluation of `v` produced oracle deps in
-     * [epochStart, sessionTraces.size()). Called from forceValue after
+     * [epochStart, epochLog.size()). Called from forceValue after
      * thunk or app evaluation completes to populate the epoch map
      * (enables dep replay for subsequent forcing).
      */
     void recordThunkDeps(const Value & v, uint32_t epochStart);
 
     /**
-     * Replay memoized oracle deps for an already-forced Value into active
-     * dependency trackers (Adapton: propagating transitive DDG edges).
+     * Replay memoized oracle deps for an already-forced Value into the
+     * active tracker's ownDeps (Adapton: propagating transitive DDG edges).
      * Called when forceValue encounters a non-thunk, non-app Value with
-     * an active DependencyTracker. Adds the value's epoch range to each
-     * active tracker's replayedRanges (skipping trackers that already
-     * include those deps in their session range).
+     * an active DependencyTracker. Copies deps from the epochLog range
+     * into the tracker's ownDeps (skipping if the range was recorded
+     * during this tracker's lifetime).
      */
     void replayMemoizedDeps(const Value & v);
 
