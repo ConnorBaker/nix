@@ -10,6 +10,7 @@
 #include "nix/fetchers/fetchers.hh"
 
 #include <algorithm>
+#include <cassert>
 
 namespace nix::eval_trace {
 
@@ -211,15 +212,10 @@ struct ExprOrigChild : Expr, gc
 
     void eval(EvalState & state, Env &, Value & v) override
     {
-        if (!shared->value) {
-            shared->value = state.allocValue();
-            {
-                SuspendDepTracking suspend;
-                parentOrigExpr->eval(state, *parentOrigEnv, *shared->value);
-                state.forceAttrs(*shared->value, noPos,
-                    "while resolving cached child attribute");
-            }
-        }
+        // SharedParentResult must always be pre-populated by materializeOrigExprAttrs.
+        // If this assertion fires, a code path created ExprOrigChild without
+        // ensuring the parent was evaluated first.
+        assert(shared->value && "ExprOrigChild: SharedParentResult not pre-populated");
         auto * attr = shared->value->attrs()->get(childName);
         if (!attr)
             throw Error("attribute '%s' not found in cached parent",
@@ -338,8 +334,20 @@ void TracedExpr::materializeOrigExprAttrs(
     Value & v, const attrs_t & attrs, Value * prePopulatedParent)
 {
     auto * shared = new SharedParentResult();
-    if (prePopulatedParent)
+    if (prePopulatedParent) {
         shared->value = prePopulatedParent;
+    } else {
+        // Always pre-populate: ExprOrigChild must never re-evaluate parentOrigExpr
+        // from scratch. Without this, a trace-cache hit on a sibling-wrapped
+        // TracedExpr materializes children whose first access triggers a full
+        // re-evaluation of the parent expression (e.g., an entire NixOS closure),
+        // producing thousands of duplicate derivation instantiations.
+        shared->value = cache->state.allocValue();
+        SuspendDepTracking suspend;
+        lazy->origExpr->eval(cache->state, *lazy->origEnv, *shared->value);
+        cache->state.forceAttrs(*shared->value, noPos,
+            "while resolving cached attribute for hit materialization");
+    }
     auto & st = cache->state;
     auto bindings = st.buildBindings(attrs.names.size());
 
@@ -721,7 +729,6 @@ void TracedExpr::evaluateFresh(Value & v)
             if (ec->lazy && ec->lazy->origExpr) {
                 Expr * expr = ec->lazy->origExpr;
                 Env * oenv = ec->lazy->origEnv;
-                target = cache->state.allocValue();
                 expr->eval(cache->state, *oenv, *target);
             }
         }
