@@ -270,13 +270,12 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_MultipleKeys_AccessedKeyChange
     }
 }
 
-TEST_F(MaterializationDepTest, SameKeysDiffValues_TwoChildren_FirstInvalidatesSecondStale)
+TEST_F(MaterializationDepTest, SameKeysDiffValues_TwoChildren_BothInvalidate)
 {
-    // Two children accessing different keys: vx (forced first) correctly
-    // invalidates; vy (forced second) still stale because d was already forced
-    // by vx's evaluation, so vy's navigateToReal doesn't wrap d as a TracedExpr
-    // and the SiblingAccessTracker misses it → vy gets whole-parent
-    // ParentContext("") instead of per-sibling ParentContext("d").
+    // Two children accessing different keys from the same parent. Both correctly
+    // invalidate because sibling detection works for already-materialized siblings:
+    // replayMemoizedDeps checks siblingIdentityMap when the sibling's epoch entry
+    // is found, and the SiblingAccessTracker callback records the sibling access.
     TempJsonFile f(R"({"x":1,"y":2})");
     auto expr = std::format(
         "let d = {}; in {{ inherit d; vx = d.x; vy = d.y; }}", fj(f.path));
@@ -310,9 +309,9 @@ TEST_F(MaterializationDepTest, SameKeysDiffValues_TwoChildren_FirstInvalidatesSe
         state.forceValue(*vy->value, noPos);
         EXPECT_EQ(vx->value->integer().value, 99)
             << "vx (forced first) correctly invalidates via per-sibling ParentContext(d)";
-        EXPECT_EQ(vy->value->integer().value, 2)
-            << "KNOWN: vy (forced second) gets whole-parent ParentContext — d already "
-               "forced, so SiblingAccessTracker misses it";
+        EXPECT_EQ(vy->value->integer().value, 88)
+            << "vy (forced second) correctly invalidates via sibling detection in "
+               "replayMemoizedDeps — siblingIdentityMap lookup triggers callback";
     }
 }
 

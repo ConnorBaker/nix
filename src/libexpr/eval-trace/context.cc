@@ -14,10 +14,6 @@ Counter nrReplayAdded;
 
 void EvalTraceContext::recordThunkDeps(const Value & v, uint32_t epochStart)
 {
-    if (&v == skipEpochRecordFor) {
-        skipEpochRecordFor = nullptr;
-        return;
-    }
     uint32_t epochEnd = DependencyTracker::epochLog.size();
     if (epochStart < epochEnd) {
         epochMap.emplace(&v, DepRange{&DependencyTracker::epochLog, epochStart, epochEnd});
@@ -33,6 +29,18 @@ void EvalTraceContext::replayMemoizedDeps(const Value & v)
     auto it = epochMap.find(&v);
     if (it == epochMap.end()) return;
     eval_trace::nrReplayEpochHits++;
+
+    // Sibling detection: if this value is a registered sibling TracedExpr
+    // and a SiblingAccessTracker is active, record the sibling access and
+    // skip dep copy (the child gets a ParentContext dep instead).
+    // Only skip if the callback succeeds — on failure (parent mismatch,
+    // no traceId), fall through to normal dep replay.
+    if (siblingCallback) {
+        auto sibIt = siblingIdentityMap.find(&v);
+        if (sibIt != siblingIdentityMap.end()
+            && siblingCallback(sibIt->second.tracedExpr, sibIt->second.traceStore))
+            return;
+    }
 
     auto & range = it->second;
 
@@ -61,7 +69,8 @@ void EvalTraceContext::reset()
     mountToInput.clear();
     epochMap.clear();
     replayBloom.reset();
-    skipEpochRecordFor = nullptr;
+    siblingIdentityMap.clear();
+    siblingCallback = nullptr;
 }
 
 void EvalTraceContext::flush()

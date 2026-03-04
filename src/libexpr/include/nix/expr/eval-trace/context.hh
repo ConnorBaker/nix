@@ -106,16 +106,26 @@ struct EvalTraceContext {
      */
     PointerBloomFilter<1 << 23, 16> replayBloom;
 
-    /**
-     * Value pointer for which the next recordThunkDeps() call should be
-     * skipped. Set by TracedExpr::eval() to prevent forceValue's post-eval
-     * recordThunkDeps from creating an epoch map entry for TracedExpr
-     * thunks, which would cause parent dep contamination via
-     * replayMemoizedDeps(). Uses Value pointer (not a boolean flag)
-     * so that sub-thunk recordThunkDeps calls within evaluateFresh()
-     * are not incorrectly suppressed.
-     */
-    const Value * skipEpochRecordFor = nullptr;
+    // ── Sibling identity tracking (for already-materialized sibling detection) ──
+
+    /// Identity of a TracedExpr child thunk, stored by Value* address.
+    /// Uses void* to avoid depending on TracedExpr (defined in trace-cache.cc).
+    struct SiblingIdentity {
+        void * tracedExpr;  // TracedExpr*
+        void * traceStore;  // TraceStore*
+    };
+
+    /// Maps Value* → SiblingIdentity for all TracedExpr child thunks created
+    /// during materialization. Value* is stable across thunk→materialized
+    /// transitions (forceValue mutates in-place). Lifetime 3 (per-EvalState)
+    /// so entries persist across nested root tracker scopes.
+    boost::unordered_flat_map<const void *, SiblingIdentity> siblingIdentityMap;
+
+    /// Callback invoked by replayMemoizedDeps when a registered sibling is
+    /// detected. Returns true if the sibling access was recorded. Set by
+    /// SiblingAccessTracker ctor, cleared by dtor.
+    using SiblingCallback = bool (*)(void * tracedExpr, void * traceStore);
+    SiblingCallback siblingCallback = nullptr;
 
     /**
      * Record that thunk/app evaluation of `v` produced oracle deps in

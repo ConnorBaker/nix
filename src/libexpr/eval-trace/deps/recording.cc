@@ -62,7 +62,7 @@ namespace nix {
 // │   - evalCaches         (flake hash → TraceCache instances)         │
 // │   - fileContentHashes  (SourcePath → BLAKE3 for Content deps)     │
 // │   - mountToInput       (mount point → (inputName, subdir))         │
-// │   - skipEpochRecordFor (TracedExpr anti-contamination guard)       │
+// │   (siblingIdentityMap + siblingCallback live in RootTrackerScope)  │
 // └─────────────────────────────────────────────────────────────────────┘
 //
 // The StatHashStore singleton (stat-hash-store.hh/cc) is a fourth scope

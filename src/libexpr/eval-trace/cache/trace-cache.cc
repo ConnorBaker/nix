@@ -123,6 +123,7 @@ struct TracedExpr : Expr, gc
     void materializeOrigExprAttrs(Value & v, const attrs_t & attrs,
                                    Value * prePopulatedParent = nullptr);
     void replayTrace(TraceId traceId);
+    void installChildThunk(Value * val, Env * env, TracedExpr * child);
 
     /// Convenience accessor for the vocab store (lazy-inits if needed).
     AttrVocabStore & vocab() const { return cache->state.traceCtx->getVocabStore(cache->state.symbols); }
@@ -138,6 +139,16 @@ TracedExpr::TracedExpr(TraceCache * cache, Symbol name, TracedExpr * parentExpr,
     , parentExpr(parentExpr)
     , isListElement(isListElement)
 {
+}
+
+/// Install `child` as a TracedExpr thunk on `val` and register it in
+/// the sibling identity map for already-materialized sibling detection.
+void TracedExpr::installChildThunk(Value * val, Env * env, TracedExpr * child)
+{
+    val->mkThunk(env, child);
+    if (cache->state.traceCtx)
+        cache->state.traceCtx->siblingIdentityMap.emplace(val,
+            EvalTraceContext::SiblingIdentity{child, cache->dbBackend.get()});
 }
 
 // ── SiblingAccessTracker (per-accessed-sibling ParentContext deps) ────
@@ -161,10 +172,24 @@ struct SiblingAccessTracker
 
     static thread_local SiblingAccessTracker * current;
     SiblingAccessTracker * previous;
+    EvalTraceContext::SiblingCallback savedCallback = nullptr;
+    EvalTraceContext * traceCtx = nullptr;
 
-    explicit SiblingAccessTracker(TracedExpr * parent)
-        : parentExpr(parent), previous(current) { current = this; }
-    ~SiblingAccessTracker() { current = previous; }
+    explicit SiblingAccessTracker(TracedExpr * parent, EvalTraceContext * ctx)
+        : parentExpr(parent), previous(current), traceCtx(ctx)
+    {
+        current = this;
+        if (traceCtx) {
+            savedCallback = traceCtx->siblingCallback;
+            traceCtx->siblingCallback = &staticMaybeRecord;
+        }
+    }
+    ~SiblingAccessTracker()
+    {
+        current = previous;
+        if (traceCtx)
+            traceCtx->siblingCallback = savedCallback;
+    }
 
     SiblingAccessTracker(const SiblingAccessTracker &) = delete;
     SiblingAccessTracker & operator=(const SiblingAccessTracker &) = delete;
@@ -184,6 +209,18 @@ struct SiblingAccessTracker
             auto hash = db.getCurrentTraceHash(expr->pathId);
             if (hash) current->recordAccess(expr->pathId, *hash);
         } catch (...) {}
+    }
+
+    /// Static callback for replayMemoizedDeps sibling detection.
+    /// Bridges from context.cc (which can't see TracedExpr) to
+    /// SiblingAccessTracker via opaque void* pointers.
+    static bool staticMaybeRecord(void * tracedExprPtr, void * traceStorePtr)
+    {
+        if (!current) return false;
+        auto before = current->accesses.size();
+        maybeRecord(static_cast<TracedExpr *>(tracedExprPtr),
+                    *static_cast<TraceStore *>(traceStorePtr));
+        return current->accesses.size() > before;
     }
 };
 thread_local SiblingAccessTracker * SiblingAccessTracker::current = nullptr;
@@ -384,7 +421,7 @@ void TracedExpr::materializeOrigExprAttrs(
         nrTracedExprFromOrigAttrs++;
         wrapper->ensureLazy().origExpr = new ExprOrigChild(lazy->origExpr, lazy->origEnv, childName, shared);
         wrapper->ensureLazy().origEnv = lazy->origEnv;
-        childVal->mkThunk(&st.baseEnv, wrapper);
+        installChildThunk(childVal, &st.baseEnv, wrapper);
 
         PosIdx pos = noPos;
         if (!attrs.originIndices.empty() && attrs.originIndices[i] >= 0) {
@@ -492,8 +529,9 @@ Value * TracedExpr::navigateToReal()
                     nrTracedExprCreated++;
                     nrTracedExprFromOrigAttrs++;
                     wrapper->ensureLazy().origExpr = attr.value->thunk().expr;
-                    wrapper->ensureLazy().origEnv = attr.value->thunk().env;
-                    attr.value->mkThunk(attr.value->thunk().env, wrapper);
+                    auto * origEnv = attr.value->thunk().env;
+                    wrapper->ensureLazy().origEnv = origEnv;
+                    installChildThunk(attr.value, origEnv, wrapper);
                 }
                 // Non-thunk siblings are left alone. Each sibling's TracedExpr
                 // handles its own tracing independently when accessed.
@@ -549,7 +587,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
             auto * child = new TracedExpr(cache, childName, this);
             nrTracedExprCreated++;
             nrTracedExprFromMaterialize++;
-            childVal->mkThunk(&st.baseEnv, child);
+            installChildThunk(childVal, &st.baseEnv, child);
 
             PosIdx pos = noPos;
             if (!attrs->originIndices.empty() && attrs->originIndices[i] >= 0) {
@@ -618,7 +656,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
             auto * child = new TracedExpr(cache, sym, this, /*isListElement=*/true);
             nrTracedExprCreated++;
             nrTracedExprFromMaterialize++;
-            elemVal->mkThunk(&st.baseEnv, child);
+            installChildThunk(elemVal, &st.baseEnv, child);
             list[i] = elemVal;
         }
         v.mkList(list);
@@ -683,7 +721,7 @@ void TracedExpr::evaluateFresh(Value & v)
     // avoid cascading invalidation when unrelated siblings are added/removed.
     std::optional<SiblingAccessTracker> siblingTracker;
     if (parentExpr && cache->dbBackend)
-        siblingTracker.emplace(parentExpr);
+        siblingTracker.emplace(parentExpr, cache->state.traceCtx.get());
 
     // Append per-sibling or whole-parent ParentContext deps for children.
     // Called from both the success and error paths of evaluateFresh().
@@ -848,13 +886,6 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
         }
         return;
     }
-
-    // Skip epoch recording for this TracedExpr — it manages its own
-    // deps via its DependencyTracker in evaluateFresh(); the parent
-    // references children via ParentContext deps (appendParentContextDeps).
-    // With per-tracker ownDeps, parent-child isolation is structural.
-    if (DependencyTracker::activeTracker && state.traceCtx)
-        state.traceCtx->skipEpochRecordFor = &v;
 
     auto & db = *cache->dbBackend;
 

@@ -179,10 +179,15 @@ TEST_F(ChildRangeExclusionTest, SingleTrackerNoDeps_FastPath)
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Component 2: skipEpochRecordFor + recordThunkDeps
+// Component 2: recordThunkDeps + replayMemoizedDeps epoch behavior
+//
+// skipEpochRecordFor was removed: TracedExpr thunks now get epoch
+// entries like all other thunks. Sibling detection in replayMemoizedDeps
+// (via siblingIdentityMap + siblingCallback on RootTrackerScope) handles
+// the case where a sibling's epoch entry would cause dep contamination.
 // ═════════════════════════════════════════════════════════════════════
 
-class SkipEpochRecordTest : public ::testing::Test
+class EpochRecordTest : public ::testing::Test
 {
 protected:
     InterningPools pools;
@@ -191,9 +196,9 @@ protected:
     void TearDown() override { DependencyTracker::clearEpochLog(); }
 };
 
-// ── Positive: skip prevents epoch map entry ──────────────────────────
+// ── recordThunkDeps always records when deps exist ───────────────────
 
-TEST_F(SkipEpochRecordTest, SkipMatchingValue_NoEpochEntry)
+TEST_F(EpochRecordTest, AlwaysRecords_SingleValue)
 {
     DependencyTracker tracker(pools);
     Value v;
@@ -201,90 +206,39 @@ TEST_F(SkipEpochRecordTest, SkipMatchingValue_NoEpochEntry)
     uint32_t epochStart = DependencyTracker::epochLog.size();
     DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
 
-    ctx.skipEpochRecordFor = &v;
     ctx.recordThunkDeps(v, epochStart);
 
-    EXPECT_EQ(ctx.epochMap.find(&v), ctx.epochMap.end());
-    EXPECT_EQ(ctx.skipEpochRecordFor, nullptr); // consumed
+    auto it = ctx.epochMap.find(&v);
+    ASSERT_NE(it, ctx.epochMap.end());
+    EXPECT_EQ(it->second.start, epochStart);
+    EXPECT_EQ(it->second.end, DependencyTracker::epochLog.size());
 }
 
-TEST_F(SkipEpochRecordTest, SkipConsumedOnce_SecondCallRecords)
+TEST_F(EpochRecordTest, AlwaysRecords_MultipleValues)
 {
     DependencyTracker tracker(pools);
-    Value v;
-    v.mkInt(42);
-
-    ctx.skipEpochRecordFor = &v;
+    Value v1, v2;
+    v1.mkInt(1);
+    v2.mkInt(2);
 
     uint32_t e1 = DependencyTracker::epochLog.size();
     DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
-    ctx.recordThunkDeps(v, e1);
-    EXPECT_EQ(ctx.epochMap.find(&v), ctx.epochMap.end()); // skipped
+    ctx.recordThunkDeps(v1, e1);
 
     uint32_t e2 = DependencyTracker::epochLog.size();
     DependencyTracker::record(makeContentDep(pools, "/b.nix", "b"));
-    ctx.recordThunkDeps(v, e2);
+    ctx.recordThunkDeps(v2, e2);
 
-    auto it = ctx.epochMap.find(&v);
-    ASSERT_NE(it, ctx.epochMap.end()); // recorded
-    EXPECT_EQ(it->second.start, e2);
-    EXPECT_EQ(it->second.end, DependencyTracker::epochLog.size());
+    // Both values get epoch entries
+    auto it1 = ctx.epochMap.find(&v1);
+    auto it2 = ctx.epochMap.find(&v2);
+    ASSERT_NE(it1, ctx.epochMap.end());
+    ASSERT_NE(it2, ctx.epochMap.end());
+    EXPECT_EQ(it1->second.start, e1);
+    EXPECT_EQ(it2->second.start, e2);
 }
 
-TEST_F(SkipEpochRecordTest, ResetClearsFlag)
-{
-    Value v;
-    v.mkInt(42);
-    ctx.skipEpochRecordFor = &v;
-    ctx.reset();
-    EXPECT_EQ(ctx.skipEpochRecordFor, nullptr);
-    EXPECT_TRUE(ctx.epochMap.empty());
-}
-
-// ── Negative: non-matching values still get recorded ─────────────────
-
-TEST_F(SkipEpochRecordTest, NormalRecording_NoSkip)
-{
-    DependencyTracker tracker(pools);
-    Value v;
-    v.mkInt(42);
-    uint32_t epochStart = DependencyTracker::epochLog.size();
-    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
-
-    EXPECT_EQ(ctx.skipEpochRecordFor, nullptr); // no skip set
-    ctx.recordThunkDeps(v, epochStart);
-
-    auto it = ctx.epochMap.find(&v);
-    ASSERT_NE(it, ctx.epochMap.end());
-    EXPECT_EQ(it->second.start, epochStart);
-    EXPECT_EQ(it->second.end, DependencyTracker::epochLog.size());
-}
-
-TEST_F(SkipEpochRecordTest, SkipTargetsOneValue_OthersUnaffected)
-{
-    DependencyTracker tracker(pools);
-    Value target, other;
-    target.mkInt(1);
-    other.mkInt(2);
-
-    ctx.skipEpochRecordFor = &target;
-
-    uint32_t epochStart = DependencyTracker::epochLog.size();
-    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
-    ctx.recordThunkDeps(other, epochStart);
-
-    // 'other' was recorded despite skip being set (different address)
-    auto it = ctx.epochMap.find(&other);
-    ASSERT_NE(it, ctx.epochMap.end());
-    EXPECT_EQ(it->second.start, epochStart);
-
-    // target was never recorded
-    EXPECT_EQ(ctx.epochMap.find(&target), ctx.epochMap.end());
-    // flag still set (not consumed by non-matching call)
-    EXPECT_EQ(ctx.skipEpochRecordFor, &target);
-}
-
-TEST_F(SkipEpochRecordTest, EmptyEpoch_NoEntryRegardless)
+TEST_F(EpochRecordTest, EmptyEpoch_NoEntry)
 {
     DependencyTracker tracker(pools);
     Value v;
@@ -294,8 +248,208 @@ TEST_F(SkipEpochRecordTest, EmptyEpoch_NoEntryRegardless)
 
     ctx.recordThunkDeps(v, epochStart);
 
-    // epochStart == epochEnd → no entry (not a skip, just nothing to record)
+    // epochStart == epochEnd → no entry (nothing to record)
     EXPECT_EQ(ctx.epochMap.find(&v), ctx.epochMap.end());
+}
+
+TEST_F(EpochRecordTest, ResetClearsEpochState)
+{
+    DependencyTracker tracker(pools);
+    Value v;
+    v.mkInt(42);
+    uint32_t epochStart = DependencyTracker::epochLog.size();
+    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
+    ctx.recordThunkDeps(v, epochStart);
+    ASSERT_FALSE(ctx.epochMap.empty());
+
+    ctx.reset();
+
+    EXPECT_TRUE(ctx.epochMap.empty());
+}
+
+// ── replayMemoizedDeps copies deps from epoch range ──────────────────
+
+TEST_F(EpochRecordTest, ReplayMemoizedDeps_CopiesDeps)
+{
+    // Record deps for a value in an outer tracker
+    DependencyTracker outer(pools);
+    Value v;
+    v.mkInt(42);
+    uint32_t epochStart = DependencyTracker::epochLog.size();
+    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
+    ctx.recordThunkDeps(v, epochStart);
+
+    auto outerDeps = outer.collectTraces();
+
+    // Create a new tracker and replay — deps should be copied
+    DependencyTracker inner(pools);
+    ctx.replayMemoizedDeps(v);
+
+    auto innerDeps = inner.collectTraces();
+    EXPECT_EQ(innerDeps.size(), 1u);
+    EXPECT_EQ(keys(pools, innerDeps), (std::vector<std::string>{"/a.nix"}));
+}
+
+TEST_F(EpochRecordTest, ReplayMemoizedDeps_SkipsOwnEpoch)
+{
+    // If the epoch range was recorded during this tracker's lifetime,
+    // replay should skip (deps already in ownDeps).
+    DependencyTracker tracker(pools);
+    Value v;
+    v.mkInt(42);
+    uint32_t epochStart = DependencyTracker::epochLog.size();
+    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
+    ctx.recordThunkDeps(v, epochStart);
+
+    // Replay within same tracker — range.start >= epochLogStartIndex
+    ctx.replayMemoizedDeps(v);
+
+    // Deps should only appear once (from the direct record, not replay)
+    auto deps = tracker.collectTraces();
+    EXPECT_EQ(deps.size(), 1u);
+}
+
+// ── replayMemoizedDeps sibling detection via siblingCallback ─────────
+//
+// siblingIdentityMap + siblingCallback on EvalTraceContext enable detection
+// of already-materialized siblings in replayMemoizedDeps. When siblingCallback
+// is set (by SiblingAccessTracker) and the replayed Value is in
+// siblingIdentityMap, the callback is invoked. If it returns true (sibling
+// access recorded), replay is skipped (child gets a ParentContext dep instead).
+// If it returns false (parent mismatch, no traceId), normal replay proceeds.
+
+namespace {
+    thread_local bool callbackInvoked;
+    thread_local bool callbackReturnValue;
+
+    bool testCallback(void *, void *)
+    {
+        callbackInvoked = true;
+        return callbackReturnValue;
+    }
+}
+
+TEST_F(EpochRecordTest, SiblingCallback_ReturnsTrue_SkipsReplay)
+{
+    // Record deps for a value in an outer tracker, then collect to end it.
+    DependencyTracker outer(pools);
+    Value v;
+    v.mkInt(42);
+    uint32_t epochStart = DependencyTracker::epochLog.size();
+    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
+    ctx.recordThunkDeps(v, epochStart);
+    auto outerDeps = outer.collectTraces();
+
+    // Set up sibling detection: register v and set callback returning true.
+    ctx.siblingIdentityMap.emplace(&v,
+        EvalTraceContext::SiblingIdentity{nullptr, nullptr});
+    ctx.siblingCallback = &testCallback;
+    callbackInvoked = false;
+    callbackReturnValue = true;
+
+    // Replay in a new tracker — callback should fire, deps NOT copied.
+    DependencyTracker inner(pools);
+    ctx.replayMemoizedDeps(v);
+
+    EXPECT_TRUE(callbackInvoked);
+    auto innerDeps = inner.collectTraces();
+    EXPECT_EQ(innerDeps.size(), 0u)
+        << "siblingCallback returned true → replay skipped, no deps copied";
+}
+
+TEST_F(EpochRecordTest, SiblingCallback_ReturnsFalse_FallsThrough)
+{
+    // Record deps in an outer tracker.
+    DependencyTracker outer(pools);
+    Value v;
+    v.mkInt(42);
+    uint32_t epochStart = DependencyTracker::epochLog.size();
+    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
+    ctx.recordThunkDeps(v, epochStart);
+    auto outerDeps = outer.collectTraces();
+
+    // Set up sibling detection: register v, callback returns FALSE.
+    ctx.siblingIdentityMap.emplace(&v,
+        EvalTraceContext::SiblingIdentity{nullptr, nullptr});
+    ctx.siblingCallback = &testCallback;
+    callbackInvoked = false;
+    callbackReturnValue = false;
+
+    // Replay — callback fires but returns false → normal replay.
+    DependencyTracker inner(pools);
+    ctx.replayMemoizedDeps(v);
+
+    EXPECT_TRUE(callbackInvoked);
+    auto innerDeps = inner.collectTraces();
+    EXPECT_EQ(innerDeps.size(), 1u)
+        << "siblingCallback returned false → fell through to normal dep replay";
+    EXPECT_EQ(keys(pools, innerDeps), (std::vector<std::string>{"/a.nix"}));
+}
+
+TEST_F(EpochRecordTest, NoSiblingCallback_NormalReplay)
+{
+    // Record deps in an outer tracker.
+    DependencyTracker outer(pools);
+    Value v;
+    v.mkInt(42);
+    uint32_t epochStart = DependencyTracker::epochLog.size();
+    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
+    ctx.recordThunkDeps(v, epochStart);
+    auto outerDeps = outer.collectTraces();
+
+    // Register in siblingIdentityMap but leave siblingCallback null.
+    ctx.siblingIdentityMap.emplace(&v,
+        EvalTraceContext::SiblingIdentity{nullptr, nullptr});
+    ASSERT_EQ(ctx.siblingCallback, nullptr);
+
+    // Replay — no callback set, normal dep replay despite map entry.
+    DependencyTracker inner(pools);
+    ctx.replayMemoizedDeps(v);
+
+    auto innerDeps = inner.collectTraces();
+    EXPECT_EQ(innerDeps.size(), 1u)
+        << "siblingCallback null → normal dep replay even when value is in siblingIdentityMap";
+}
+
+TEST_F(EpochRecordTest, SiblingCallback_ValueNotInMap_NormalReplay)
+{
+    // Record deps in an outer tracker.
+    DependencyTracker outer(pools);
+    Value v;
+    v.mkInt(42);
+    uint32_t epochStart = DependencyTracker::epochLog.size();
+    DependencyTracker::record(makeContentDep(pools, "/a.nix", "a"));
+    ctx.recordThunkDeps(v, epochStart);
+    auto outerDeps = outer.collectTraces();
+
+    // Set callback but do NOT register v in siblingIdentityMap.
+    ctx.siblingCallback = &testCallback;
+    callbackInvoked = false;
+    callbackReturnValue = true;
+    ASSERT_TRUE(ctx.siblingIdentityMap.empty());
+
+    // Replay — value not in map, callback never fires, normal replay.
+    DependencyTracker inner(pools);
+    ctx.replayMemoizedDeps(v);
+
+    EXPECT_FALSE(callbackInvoked);
+    auto innerDeps = inner.collectTraces();
+    EXPECT_EQ(innerDeps.size(), 1u)
+        << "value not in siblingIdentityMap → callback not invoked, normal replay";
+}
+
+TEST_F(EpochRecordTest, ResetClearsSiblingState)
+{
+    Value v;
+    v.mkInt(42);
+    ctx.siblingIdentityMap.emplace(&v,
+        EvalTraceContext::SiblingIdentity{nullptr, nullptr});
+    ctx.siblingCallback = &testCallback;
+
+    ctx.reset();
+
+    EXPECT_TRUE(ctx.siblingIdentityMap.empty());
+    EXPECT_EQ(ctx.siblingCallback, nullptr);
 }
 
 // ═════════════════════════════════════════════════════════════════════

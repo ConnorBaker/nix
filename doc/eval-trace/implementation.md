@@ -1201,6 +1201,50 @@ CopiedPath dep is recorded unconditionally after the if-else block that
 handles both the fetchToStore and cache-hit branches.
 *Fix:* Always record dep in `prim_path` regardless of store cache.
 
+**Bug 1: Sibling detection for already-materialized siblings — FIXED.**
+`SiblingAccessTracker` only fired inside `TracedExpr::eval()`, which runs once
+per thunk. After first forcing, the Value is materialized and subsequent forcers
+bypass `TracedExpr::eval()` entirely, so the second child to access the same
+sibling fell back to whole-parent `ParentContext("")` — causing stale cache
+results when only that sibling's file changed.
+
+*Root cause:* `navigateToReal()` wraps sibling thunks as TracedExpr, but skips
+already-materialized values. `SiblingRecordGuard` fires only for TracedExpr
+thunks, not for already-forced values.
+
+*Fix (two-pronged detection):*
+
+1. **`installChildThunk` registers sibling identity at materialization time.**
+   When a parent creates TracedExpr child thunks (in `materializeOrigExprAttrs`,
+   `materializeResult`, `navigateToReal`), `installChildThunk` stores
+   `(Value* → {TracedExpr*, TraceStore*})` in `EvalTraceContext::siblingIdentityMap`.
+   The Value\* is stable across thunk→materialized transitions (forceValue
+   mutates in-place). Lifetime 3 (per-EvalState) so entries persist across
+   nested root tracker scopes.
+
+2. **`skipEpochRecordFor` removed.** TracedExpr thunks now get epoch entries like
+   all other thunks. With per-tracker `ownDeps`, the `epochLogStartIndex` check
+   already prevents parent contamination.
+
+3. **Sibling detection in `replayMemoizedDeps`.** After bloom filter hit and
+   epoch entry lookup, checks `siblingIdentityMap`. If found and
+   `siblingCallback` is set (by `SiblingAccessTracker`), invokes the callback.
+   If it returns true (sibling access recorded), returns early — the child gets
+   a `ParentContext` dep instead of replayed deps. If it returns false (parent
+   mismatch, no traceId), falls through to normal dep replay.
+
+4. **`SiblingAccessTracker` callback bridge.** The tracker is private to
+   `trace-cache.cc`. A function pointer (`SiblingCallback`) on
+   `EvalTraceContext` bridges from `replayMemoizedDeps` (context.cc) to
+   `SiblingAccessTracker::maybeRecord` (trace-cache.cc). `staticMaybeRecord`
+   delegates to the existing `maybeRecord` with `void*` casts.
+
+*Test:* `SameKeysDiffValues_TwoChildren_BothInvalidate` in `error-recovery.cc`.
+Unit tests for callback behavior in `child-range-exclusion.cc`
+(`SiblingCallback_ReturnsTrue_SkipsReplay`, `SiblingCallback_ReturnsFalse_FallsThrough`,
+`NoSiblingCallback_NormalReplay`, `SiblingCallback_ValueNotInMap_NormalReplay`,
+`ResetClearsSiblingState`).
+
 Gap 4 requires deeper design work to distinguish raw vs parsed readFile
 provenance in the two-level override. Gap P1 requires recording the parent's
 result hash alongside per-sibling deps.

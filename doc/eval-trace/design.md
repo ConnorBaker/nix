@@ -1068,32 +1068,34 @@ the child's trace incorrectly validates.
 - **Fix**: Record the parent's evaluation result hash alongside per-sibling
   deps, or add explicit dep tracking for overlay application sites.
 
-##### Gap O1: ParentContext non-transitive verification
+##### Gap O1: ParentContext non-transitive verification — FIXED
 
-`getCurrentTraceHash()` returns the stored `trace_hash` from the `Traces` table
-without recursively verifying the parent trace's own deps. If a parent's deps
-have changed (e.g., a fetchGit input now resolves to a different `narHash`), the
-parent's `trace_hash` is stale, but child traces with ParentContext deps on that
-hash won't detect the staleness because they only compare against the stored
-hash — they don't re-verify the parent's deps.
+`getCurrentTraceHash()` returned the stored `trace_hash` without recursively
+verifying the parent's own deps. Fixed: `verifyTrace()` now recursively verifies
+parent traces when encountering ParentContext deps. `verifiedTraceIds` cache
+prevents infinite loops.
 
-- **Test**: Not yet implemented (documented in `dep-copied-path.cc` as known issue 2)
-- **Severity**: Medium. Occurs when parent inputs change between evaluations
-  (e.g., flake lock updates that change fetchGit results).
-- **Fix**: Recursive parent verification in `verifyTrace()`, or guaranteed
-  bottom-up eval order that ensures parents are verified before children.
+##### Gap O2: Empty sibling traces always verify as valid — FIXED
 
-##### Gap O2: Empty sibling traces always verify as valid
+`recordSiblingTrace()` recorded zero-dep traces for already-forced siblings.
+Fixed: removed `recordSiblingTrace()` entirely. Each sibling's TracedExpr handles
+its own tracing independently when accessed.
 
-`recordSiblingTrace()` records zero-dep traces for already-forced siblings.
-These empty traces always pass verification (no deps to check), even when
-the sibling's actual value would differ on re-evaluation.
+##### Bug 1: Sibling detection for already-materialized siblings — FIXED
 
-- **Test**: Not yet implemented (documented in `dep-copied-path.cc` as known issue 3)
-- **Severity**: Low. Requires a sibling to be pre-forced with one result and
-  then have its inputs change between trace recording and verification.
-- **Fix**: Defer sibling trace recording until the sibling is actually evaluated
-  (architectural change to trace-cache.cc).
+`SiblingAccessTracker` only fired inside `TracedExpr::eval()`, which runs once
+per thunk. After first forcing, subsequent forcers saw a plain value,
+`SiblingAccessTracker` recorded nothing, and the child fell back to whole-parent
+`ParentContext("")` — causing stale cache results.
+
+- **Fix**: Two-pronged detection. `installChildThunk` registers
+  `(Value* → {TracedExpr*, TraceStore*})` in `EvalTraceContext::siblingIdentityMap`
+  at materialization time. `replayMemoizedDeps` checks this map when a
+  `SiblingAccessTracker` is active and invokes its callback to record the sibling
+  access. `skipEpochRecordFor` removed (per-tracker `ownDeps` provides structural
+  isolation).
+- **Test**: `SameKeysDiffValues_TwoChildren_BothInvalidate` in `error-recovery.cc`.
+  Unit tests for callback behavior in `child-range-exclusion.cc`.
 
 ##### Gap O3: `prim_path` expectedHash skips dep recording
 
@@ -1123,10 +1125,11 @@ pre-computed), the trace serves stale results.
 | B3 | **Fixed** | Strict formals |
 | S1 | **Fixed** | `copyPathToStore` CopiedPath dep dropping |
 | S2 | **Fixed** | Path coercion (`./dir + "/file"`) |
-| O1 | **Open** | ParentContext non-transitive verification |
-| O2 | **Open** | Empty sibling traces always valid |
+| O1 | **Fixed** | ParentContext non-transitive verification |
+| O2 | **Fixed** | Empty sibling traces always valid |
 | O3 | **Open** | `prim_path` expectedHash skips dep recording |
 | P1 | **Open** | Parent-mediated changes |
+| Bug 1 | **Fixed** | Already-materialized sibling detection |
 
 ### 9.2 Precision Issues
 
