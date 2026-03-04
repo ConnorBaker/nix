@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 #include <toml.hpp>
 
+#include <algorithm>
 #include <sstream>
 #include <unordered_map>
 
@@ -56,7 +57,7 @@ static std::optional<SourcePath> resolveDepPath(
     return std::nullopt;
 }
 
-// ── Structured content navigation helpers ────────────────────────────
+// ── Structured content navigation helpers (used by TrackedSource) ────
 
 /**
  * Navigate a JSON DOM using a JSON path array. Returns nullptr if path is invalid.
@@ -117,6 +118,138 @@ static std::string tomlCanonical(const toml::value & v)
     ss << v;
     return ss.str();
 }
+
+// ── TrackedSource: navigable DOM view for shape-suffix resolution ────
+
+namespace {
+
+/// Navigable view of a parsed structured source (JSON DOM, TOML DOM,
+/// or directory listing). Created on-stack during verification, holds
+/// a non-owning reference to the cached DOM in VerificationScope.
+struct TrackedSource {
+    virtual ~TrackedSource() = default;
+    virtual bool navigate(const nlohmann::json & pathArray) = 0;
+    virtual std::optional<DepHashValue> hashLeaf() = 0;
+    virtual bool isArray() = 0;
+    virtual bool isObject() = 0;
+    virtual size_t size() = 0;
+    virtual std::vector<std::string> keys() = 0;
+    virtual bool hasKey(const std::string & key) = 0;
+};
+
+struct JsonSource final : TrackedSource {
+    const nlohmann::json & root;
+    const nlohmann::json * node = nullptr;
+    explicit JsonSource(const nlohmann::json & r) : root(r) {}
+    bool navigate(const nlohmann::json & pathArray) override {
+        node = navigateJson(root, pathArray);
+        return node != nullptr;
+    }
+    std::optional<DepHashValue> hashLeaf() override {
+        return DepHashValue(depHash(node->dump()));
+    }
+    bool isArray() override { return node->is_array(); }
+    bool isObject() override { return node->is_object(); }
+    size_t size() override { return node->size(); }
+    std::vector<std::string> keys() override {
+        std::vector<std::string> k;
+        for (auto & [key, _] : node->items()) k.push_back(key);
+        return k;
+    }
+    bool hasKey(const std::string & key) override { return node->contains(key); }
+};
+
+struct TomlSource final : TrackedSource {
+    const toml::value & root;
+    const toml::value * node = nullptr;
+    explicit TomlSource(const toml::value & r) : root(r) {}
+    bool navigate(const nlohmann::json & pathArray) override {
+        node = navigateToml(root, pathArray);
+        return node != nullptr;
+    }
+    std::optional<DepHashValue> hashLeaf() override {
+        return DepHashValue(depHash(tomlCanonical(*node)));
+    }
+    bool isArray() override { return node->is_array(); }
+    bool isObject() override { return node->is_table(); }
+    size_t size() override {
+        if (node->is_array()) return toml::get<std::vector<toml::value>>(*node).size();
+        return toml::get<toml::table>(*node).size();
+    }
+    std::vector<std::string> keys() override {
+        std::vector<std::string> k;
+        for (auto & [key, _] : toml::get<toml::table>(*node)) k.push_back(key);
+        return k;
+    }
+    bool hasKey(const std::string & key) override {
+        return toml::get<toml::table>(*node).count(key) > 0;
+    }
+};
+
+struct DirSource final : TrackedSource {
+    const SourceAccessor::DirEntries & entries;
+    SourceAccessor::DirEntries::const_iterator leafIt;
+    bool atLeaf = false;
+    explicit DirSource(const SourceAccessor::DirEntries & e) : entries(e) {}
+    bool navigate(const nlohmann::json & pathArray) override {
+        if (pathArray.empty()) return true;
+        if (pathArray.size() != 1 || !pathArray[0].is_string()) return false;
+        leafIt = entries.find(pathArray[0].get<std::string>());
+        if (leafIt == entries.end()) return false;
+        atLeaf = true;
+        return true;
+    }
+    std::optional<DepHashValue> hashLeaf() override {
+        if (!atLeaf) return std::nullopt;
+        return DepHashValue(depHash(dirEntryTypeString(leafIt->second)));
+    }
+    bool isArray() override { return false; }
+    bool isObject() override { return true; }
+    size_t size() override { return entries.size(); }
+    std::vector<std::string> keys() override {
+        std::vector<std::string> k;
+        for (auto & [key, _] : entries) k.push_back(key);
+        return k;
+    }
+    bool hasKey(const std::string & key) override {
+        return entries.count(key) > 0;
+    }
+};
+
+static std::optional<DepHashValue> resolveShapeSuffix(
+    TrackedSource & source, ShapeSuffix shape,
+    bool isHasKey, const std::string & hasKeyName)
+{
+    switch (shape) {
+    case ShapeSuffix::Len:
+        if (!source.isArray()) return std::nullopt;
+        return DepHashValue(depHash(std::to_string(source.size())));
+    case ShapeSuffix::Keys: {
+        if (!source.isObject()) return std::nullopt;
+        auto k = source.keys();
+        std::sort(k.begin(), k.end());
+        std::string canonical;
+        for (size_t i = 0; i < k.size(); i++) {
+            if (i > 0) canonical += '\0';
+            canonical += k[i];
+        }
+        return DepHashValue(depHash(canonical));
+    }
+    case ShapeSuffix::Type:
+        if (source.isObject()) return DepHashValue(depHash("object"));
+        if (source.isArray()) return DepHashValue(depHash("array"));
+        return std::nullopt;
+    case ShapeSuffix::None:
+        if (isHasKey) {
+            if (!source.isObject()) return std::nullopt;
+            return DepHashValue(depHash(source.hasKey(hasKeyName) ? "1" : "0"));
+        }
+        return source.hashLeaf();
+    }
+    unreachable();
+}
+
+} // anonymous namespace
 
 // ── computeCurrentHash ───────────────────────────────────────────────
 
@@ -261,51 +394,17 @@ std::optional<DepHashValue> computeCurrentHash(
         if (!path) return std::nullopt;
 
         try {
-            // Helper: compute hash for sorted key set (shared across formats)
-            auto hashSortedKeys = [](std::vector<std::string> keys) -> DepHashValue {
-                std::sort(keys.begin(), keys.end());
-                std::string canonical;
-                for (size_t i = 0; i < keys.size(); i++) {
-                    if (i > 0) canonical += '\0';
-                    canonical += keys[i];
-                }
-                return DepHashValue(depHash(canonical));
-            };
-
             switch (*format) {
             case StructuredFormat::Json: {
-                // Use DOM cache to avoid re-parsing
                 auto cacheKey = dep.source + '\t' + filePath;
                 auto cacheIt = scope.jsonDomCache.find(cacheKey);
                 if (cacheIt == scope.jsonDomCache.end()) {
                     auto contents = path->readFile();
                     cacheIt = scope.jsonDomCache.emplace(cacheKey, nlohmann::json::parse(contents)).first;
                 }
-                auto * node = navigateJson(cacheIt->second, pathArray);
-                if (!node) return std::nullopt;
-                switch (shape) {
-                case ShapeSuffix::Len:
-                    if (!node->is_array()) return std::nullopt;
-                    return DepHashValue(depHash(std::to_string(node->size())));
-                case ShapeSuffix::Keys: {
-                    if (!node->is_object()) return std::nullopt;
-                    std::vector<std::string> keys;
-                    for (auto & [k, _] : node->items())
-                        keys.push_back(k);
-                    return hashSortedKeys(std::move(keys));
-                }
-                case ShapeSuffix::Type:
-                    if (node->is_object()) return DepHashValue(depHash("object"));
-                    if (node->is_array()) return DepHashValue(depHash("array"));
-                    return std::nullopt; // scalar — type changed from container
-                case ShapeSuffix::None:
-                    if (isHasKey) {
-                        if (!node->is_object()) return std::nullopt;
-                        return DepHashValue(depHash(node->contains(hasKeyName) ? "1" : "0"));
-                    }
-                    return DepHashValue(depHash(node->dump()));
-                }
-                break;
+                JsonSource source(cacheIt->second);
+                if (!source.navigate(pathArray)) return std::nullopt;
+                return resolveShapeSuffix(source, shape, isHasKey, hasKeyName);
             }
             case StructuredFormat::Toml: {
                 auto cacheKey = dep.source + '\t' + filePath;
@@ -320,73 +419,20 @@ std::optional<DepHashValue> computeCurrentHash(
 #endif
                     )).first;
                 }
-                auto * node = navigateToml(cacheIt->second, pathArray);
-                if (!node) return std::nullopt;
-                switch (shape) {
-                case ShapeSuffix::Len:
-                    if (!node->is_array()) return std::nullopt;
-                    return DepHashValue(depHash(std::to_string(toml::get<std::vector<toml::value>>(*node).size())));
-                case ShapeSuffix::Keys: {
-                    if (!node->is_table()) return std::nullopt;
-                    auto & table = toml::get<toml::table>(*node);
-                    std::vector<std::string> keys;
-                    for (auto & [k, _] : table)
-                        keys.push_back(k);
-                    return hashSortedKeys(std::move(keys));
-                }
-                case ShapeSuffix::Type:
-                    if (node->is_table()) return DepHashValue(depHash("object"));
-                    if (node->is_array()) return DepHashValue(depHash("array"));
-                    return std::nullopt;
-                case ShapeSuffix::None:
-                    if (isHasKey) {
-                        if (!node->is_table()) return std::nullopt;
-                        auto & table = toml::get<toml::table>(*node);
-                        return DepHashValue(depHash(table.count(hasKeyName) ? "1" : "0"));
-                    }
-                    return DepHashValue(depHash(tomlCanonical(*node)));
-                }
-                break;
+                TomlSource source(cacheIt->second);
+                if (!source.navigate(pathArray)) return std::nullopt;
+                return resolveShapeSuffix(source, shape, isHasKey, hasKeyName);
             }
             case StructuredFormat::Directory: {
-                // Directory structural dep: re-read listing, look up entry
                 auto cacheKey = dep.source + '\t' + filePath;
                 auto cacheIt = scope.dirListingCache.find(cacheKey);
                 if (cacheIt == scope.dirListingCache.end()) {
                     auto dirEntries = path->readDirectory();
                     cacheIt = scope.dirListingCache.emplace(cacheKey, std::move(dirEntries)).first;
                 }
-                auto & entries = cacheIt->second;
-
-                switch (shape) {
-                case ShapeSuffix::Len:
-                    return DepHashValue(depHash(std::to_string(entries.size())));
-                case ShapeSuffix::Keys: {
-                    // std::map is already sorted by key
-                    std::string canonical;
-                    bool first = true;
-                    for (auto & [k, _] : entries) {
-                        if (!first) canonical += '\0';
-                        canonical += k;
-                        first = false;
-                    }
-                    return DepHashValue(depHash(canonical));
-                }
-                case ShapeSuffix::Type:
-                    // Directories are always "object" (key→type mapping)
-                    return DepHashValue(depHash("object"));
-                case ShapeSuffix::None: {
-                    if (isHasKey) {
-                        return DepHashValue(depHash(entries.count(hasKeyName) ? "1" : "0"));
-                    }
-                    // Directory scalar: pathArray should have exactly one string component
-                    if (pathArray.size() != 1 || !pathArray[0].is_string()) return std::nullopt;
-                    auto it = entries.find(pathArray[0].get<std::string>());
-                    if (it == entries.end()) return std::nullopt;
-                    return DepHashValue(depHash(dirEntryTypeString(it->second)));
-                }
-                }
-                break;
+                DirSource source(cacheIt->second);
+                if (!source.navigate(pathArray)) return std::nullopt;
+                return resolveShapeSuffix(source, shape, isHasKey, hasKeyName);
             }
             case StructuredFormat::Nix: {
                 // Nix AST structural dep: re-parse .nix file, compute per-binding hash.
