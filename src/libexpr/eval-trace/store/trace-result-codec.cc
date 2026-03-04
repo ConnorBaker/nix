@@ -28,11 +28,17 @@ std::tuple<ResultKind, std::string, std::string> TraceStore::encodeCachedResult(
 {
     return std::visit(overloaded{
         [&](const attrs_t & a) -> std::tuple<ResultKind, std::string, std::string> {
+            // Encode attr names as space-separated AttrNameId integers via the
+            // AttrVocabStore. This is more compact than raw strings and avoids
+            // delimiter ambiguity (attr names can contain tabs/spaces, but
+            // integer IDs cannot). Requires matching decode via vocab.resolveName.
+            // NOTE: This is a breaking format change — existing SQLite databases
+            // with the old tab-separated string format must be deleted.
             std::string val;
             bool first = true;
             for (auto & sym : a.names) {
-                if (!first) val.push_back('\t');
-                val.append(std::string(symbols[sym]));
+                if (!first) val.push_back(' ');
+                val.append(std::to_string(vocab.internName(sym).value));
                 first = false;
             }
             // Encode origins into the context field as JSON when present.
@@ -113,8 +119,12 @@ CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
     case ResultKind::FullAttrs: {
         attrs_t result;
         if (!row.value.empty()) {
-            for (auto & name : tokenizeString<std::vector<std::string>>(row.value, "\t"))
-                result.names.push_back(symbols.create(name));
+            // Decode space-separated AttrNameId integers back to Symbols
+            // via AttrVocabStore. Matches the encode path above.
+            for (auto & idStr : tokenizeString<std::vector<std::string>>(row.value, " ")) {
+                auto nameId = AttrNameId(std::stoul(idStr));
+                result.names.push_back(symbols.create(vocab.resolveName(nameId)));
+            }
         }
         // Decode origins from JSON context field when present.
         if (!row.context.empty()) {

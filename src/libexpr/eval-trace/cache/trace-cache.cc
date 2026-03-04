@@ -623,6 +623,48 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
 // Fresh evaluation (Adapton demand-driven recomputation)
 void TracedExpr::evaluateFresh(Value & v)
 {
+    // ── Phase 1: Navigate children (before DependencyTracker) ─────────
+    //
+    // For CHILD !hasOrig nodes (from materializeResult, with parentExpr):
+    // navigate to this TracedExpr's value in the real tree BEFORE creating
+    // the DependencyTracker. The tracker doesn't exist yet, so navigation
+    // deps (forceAttrs at intermediate levels, TracedData provenance
+    // registration) structurally cannot enter the child's tracker.
+    // ChildRangeExcluder (from eval()) excludes them from the parent's
+    // tracker. No SuspendDepTracking needed — dep isolation is positional.
+    //
+    // This replaces the old `SuspendDepTracking suspend` that was used
+    // inside the tracker scope. That approach suppressed deps correctly but
+    // was fragile: it silently discarded deps from derivationStrict when
+    // the parent was a derivation (Lesson 1 in the plan). Moving
+    // navigateToReal before the tracker makes dep isolation structural.
+    //
+    // The three node types MUST go to specific phases:
+    //
+    //   !hasOrig && parentExpr  → Phase 1 (child: navigation deps are
+    //     parent-scope infrastructure, must NOT enter child's tracker;
+    //     removing SuspendDepTracking without moving navigateToReal would
+    //     cause TracedData dep leakage — Lesson 2)
+    //
+    //   !hasOrig && !parentExpr → Phase 2 (root: rootLoader() evaluates
+    //     Nix code whose deps — readFile, etc. — MUST be captured in the
+    //     root's own tracker — Lesson 7)
+    //
+    //   hasOrig                 → Phase 2 (sibling-wrapped: origExpr
+    //     evaluates real Nix code whose deps must be captured)
+    Value * target = nullptr;
+    bool hasOrig = lazy && lazy->origExpr;
+    if (!hasOrig && parentExpr) {
+        target = navigateToReal();
+        // NOTE: navigateToReal may wrap sibling thunks as TracedExpr in the
+        // parent's Bindings. If `target` itself is now a TracedExpr thunk
+        // (from a prior sibling's wrapping), the unwrap block in Phase 2
+        // handles it. The unwrap MUST stay in Phase 2 because it evaluates
+        // origExpr (real Nix code — readFile, derivationStrict, etc.) whose
+        // deps must be captured in the child's DependencyTracker (Lesson 8).
+    }
+
+    // ── Phase 2: Evaluate (with DependencyTracker) ───────────────────
     auto & pools = *cache->state.traceCtx->pools;
     DependencyTracker tracker(pools);
     cache->state.traceActiveDepth++;
@@ -655,27 +697,32 @@ void TracedExpr::evaluateFresh(Value & v)
         }
     };
 
-    Value * target;
-    bool hasOrig = lazy && lazy->origExpr;
+    // ── Phase 2 dispatch: all paths below run inside DependencyTracker ──
     if (hasOrig) {
+        // hasOrig (sibling-wrapped): evaluate origExpr — real Nix code whose
+        // deps (readFile, derivationStrict, etc.) must be captured.
         target = cache->state.allocValue();
         lazy->origExpr->eval(cache->state, *lazy->origEnv, *target);
-    } else {
-        if (parentExpr) {
-            SuspendDepTracking suspend;
-            target = navigateToReal();
-        } else {
-            target = navigateToReal();
-        }
+    } else if (!target) {
+        // Root !hasOrig (!parentExpr): navigateToReal calls rootLoader() which
+        // evaluates the Nix expression. Its deps MUST be captured (Lesson 7).
+        target = navigateToReal();
+    }
+    // else: child !hasOrig — target already set by Phase 1's navigateToReal.
 
-        if (target->isThunk()) {
-            if (auto * ec = dynamic_cast<TracedExpr*>(target->thunk().expr)) {
-                if (ec->lazy && ec->lazy->origExpr) {
-                    Expr * expr = ec->lazy->origExpr;
-                    Env * oenv = ec->lazy->origEnv;
-                    target = cache->state.allocValue();
-                    expr->eval(cache->state, *oenv, *target);
-                }
+    // Unwrap TracedExpr thunks created by sibling wrapping (Lesson 8).
+    // navigateToReal may return a value that a prior sibling's wrapping turned
+    // into a TracedExpr thunk. The unwrap evaluates origExpr — real Nix code
+    // (readFile, derivationStrict, etc.) — so it MUST run inside the tracker.
+    // Moving this to Phase 1 would lose those deps, causing stale values on
+    // file changes.
+    if (!hasOrig && target->isThunk()) {
+        if (auto * ec = dynamic_cast<TracedExpr*>(target->thunk().expr)) {
+            if (ec->lazy && ec->lazy->origExpr) {
+                Expr * expr = ec->lazy->origExpr;
+                Env * oenv = ec->lazy->origEnv;
+                target = cache->state.allocValue();
+                expr->eval(cache->state, *oenv, *target);
             }
         }
     }
@@ -685,9 +732,26 @@ void TracedExpr::evaluateFresh(Value & v)
     try {
         st.forceValue(*target, noPos);
 
+        // For hasOrig nodes, assign the result directly. For !hasOrig nodes,
+        // v is set later via materializeResult() using the recorded trace.
         if (hasOrig)
             v = *target;
 
+        // drvPath-forcing guard — CRITICAL CORRECTNESS INVARIANT (Lesson 6).
+        //
+        // For !hasOrig derivation attrs, force drvPath BEFORE sibling wrapping
+        // occurs (sibling wrapping happens in materializeOrigExprAttrs, called
+        // from the recording path below). The `//` operator in derivation.nix
+        // shares Value pointers between the derivation output attrset and the
+        // input drvAttrs. If sibling wrapping replaced raw thunks with
+        // TracedExpr wrappers first, derivationStrict would encounter those
+        // wrappers when forcing drvAttrs → recursive evaluation → blackhole →
+        // infinite recursion. Eager drvPath forcing ensures drvAttrs attrs are
+        // already forced (non-thunks, not wrappable) before wrapping occurs.
+        //
+        // This guard is SKIPPED for hasOrig nodes because they ARE the result
+        // of sibling wrapping — their origExpr evaluates a fresh value
+        // separate from the contaminated tree.
         if (!hasOrig && target->type() == nAttrs && st.isDerivation(*target)) {
             if (auto * dp = target->attrs()->get(st.s.drvPath))
                 st.forceValue(*dp->value, noPos);
