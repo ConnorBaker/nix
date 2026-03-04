@@ -3,6 +3,7 @@
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/nixexpr.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/util/source-accessor.hh"
@@ -24,6 +25,10 @@ struct VerificationScope {
     std::unordered_map<std::string, nlohmann::json> jsonDomCache;
     std::unordered_map<std::string, toml::value> tomlDomCache;
     std::unordered_map<std::string, SourceAccessor::DirEntries> dirListingCache;
+    /// Per-file Nix AST cache: "source\tfilePath" → {bindingName → BLAKE3 hash}.
+    /// Avoids re-parsing when multiple NixBinding deps reference the same file.
+    std::unordered_map<std::string,
+        std::unordered_map<std::string, Blake3Hash>> nixAstCache;
 };
 
 void VerificationScopeDeleter::operator()(VerificationScope * p) const noexcept
@@ -382,6 +387,48 @@ std::optional<DepHashValue> computeCurrentHash(
                 }
                 }
                 break;
+            }
+            case StructuredFormat::Nix: {
+                // Nix AST structural dep: re-parse .nix file, compute per-binding hash.
+                // pathArray has one element: the binding name.
+                if (pathArray.size() != 1 || !pathArray[0].is_string())
+                    return std::nullopt;
+                auto bindingName = pathArray[0].get<std::string>();
+                auto cacheKey = dep.source + '\t' + filePath;
+                auto cacheIt = scope.nixAstCache.find(cacheKey);
+                if (cacheIt == scope.nixAstCache.end()) {
+                    auto source = path->readFile();
+                    auto ast = state.parseExprFromString(
+                        std::move(source), state.rootPath(CanonPath(filePath)));
+                    auto [exprAttrs, scopeExprs] = findNonRecExprAttrs(ast);
+                    std::unordered_map<std::string, Blake3Hash> hashes;
+                    if (exprAttrs) {
+                        auto scopeHash = computeNixScopeHash(scopeExprs, state.symbols);
+                        for (auto & [sym, def] : *exprAttrs->attrs) {
+                            auto name = std::string(state.symbols[sym]);
+                            // Resolve InheritedFrom → source expression, then hash.
+                            // Must use the same function as registerNixBindings.
+                            const Expr * exprToShow = def.e;
+                            if (def.kind == ExprAttrs::AttrDef::Kind::InheritedFrom) {
+                                auto * iv = dynamic_cast<ExprInheritFrom *>(def.e);
+                                if (iv && exprAttrs->inheritFromExprs
+                                    && static_cast<size_t>(iv->displ) < exprAttrs->inheritFromExprs->size())
+                                    exprToShow = (*exprAttrs->inheritFromExprs)[iv->displ];
+                                else
+                                    exprToShow = nullptr;
+                            }
+                            hashes[name] = computeNixBindingHash(
+                                scopeHash, name, static_cast<int>(def.kind),
+                                exprToShow, state.symbols);
+                        }
+                    }
+                    cacheIt = scope.nixAstCache.emplace(cacheKey, std::move(hashes)).first;
+                }
+                auto & hashes = cacheIt->second;
+                if (hashes.empty()) return std::nullopt;  // Structure not eligible
+                auto it = hashes.find(bindingName);
+                if (it == hashes.end()) return std::nullopt;  // Binding removed
+                return DepHashValue(it->second);
             }
             }
             return std::nullopt;

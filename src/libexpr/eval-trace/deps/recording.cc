@@ -138,6 +138,7 @@ static thread_local std::optional<RootTrackerScope> rootScopeStorage;
 void DependencyTracker::onRootConstruction()
 {
     rootScopeStorage.emplace();
+    clearNixBindingRegistry();
     // Lifetime 1 state (pools, epochLog) is NOT cleared here.
     epochLog.reserve(16384);
 }

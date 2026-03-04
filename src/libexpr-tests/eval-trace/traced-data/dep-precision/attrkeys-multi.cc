@@ -26,7 +26,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, MultiProv_Update_AttrNames_KeyAdded_CacheM
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     fileB.modify(R"({"y": 2, "z": 3})");
@@ -37,7 +37,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, MultiProv_Update_AttrNames_KeyAdded_CacheM
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -50,7 +50,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, MultiProv_Update_AttrNames_SameKeys_ValueC
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     fileA.modify(R"({"x": 999, "y": 888})");
@@ -61,7 +61,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, MultiProv_Update_AttrNames_SameKeys_ValueC
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 0);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 }
 
@@ -78,7 +78,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_SameKeys_ValueChanged_Cache
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     fileA.modify(R"({"x": 999, "y": 888})");
@@ -89,7 +89,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_SameKeys_ValueChanged_Cache
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 0);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 }
 
@@ -102,7 +102,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_DisjointKeys_KeyAdded_Cache
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 1);
+        EXPECT_EQ(v.listSize(), 1u);
     }
 
     fileB.modify(R"({"x": 10, "y": 20, "z": 30})");
@@ -113,7 +113,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, IntersectAttrs_DisjointKeys_KeyAdded_Cache
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 }
 
@@ -131,7 +131,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, ChainedUpdate_AttrNames_KeyAdded_CacheMiss
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 
     fileC.modify(R"({"z": 3, "w": 4})");
@@ -142,7 +142,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, ChainedUpdate_AttrNames_KeyAdded_CacheMiss
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 4);
+        EXPECT_EQ(v.listSize(), 4u);
     }
 }
 
@@ -159,7 +159,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, PartialOverlap_AttrNames_ValueChanged_Cach
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 
     fileA.modify(R"({"x": 999, "y": 888})");
@@ -170,7 +170,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, PartialOverlap_AttrNames_ValueChanged_Cach
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 0);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -183,7 +183,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, PartialOverlap_AttrNames_KeyAdded_ReEval)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 
     fileA.modify(R"({"x": 1, "y": 2, "w": 99})");
@@ -194,7 +194,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, PartialOverlap_AttrNames_KeyAdded_ReEval)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 4);
+        EXPECT_EQ(v.listSize(), 4u);
     }
 }
 
@@ -207,7 +207,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, PartialOverlap_AttrNames_KeyRemoved_ReEval
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 
     fileA.modify(R"({"x": 1})");
@@ -218,7 +218,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, PartialOverlap_AttrNames_KeyRemoved_ReEval
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -231,7 +231,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, PartialOverlap_AttrNames_BFileChanged_Cach
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 
     fileB.modify(R"({"y": 999, "z": 888})");
@@ -242,7 +242,7 @@ TEST_F(DepPrecisionAttrKeysMultiTest, PartialOverlap_AttrNames_BFileChanged_Cach
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 0);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 

@@ -36,7 +36,7 @@ TEST_F(TracedDataTest, Propagation_MapAttrs_KeysTracked)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     // File unchanged → serve from cache
@@ -56,7 +56,7 @@ TEST_F(TracedDataTest, Propagation_MapAttrs_KeysTracked)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1); // Must re-evaluate: key set changed
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -106,7 +106,7 @@ TEST_F(TracedDataTest, Propagation_RemoveAttrs_KeysTracked)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     // File unchanged → serve from cache
@@ -143,7 +143,7 @@ TEST_F(TracedDataTest, Propagation_IntersectAttrs_KeysTracked)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     {
@@ -230,7 +230,7 @@ TEST_F(TracedDataTest, Propagation_OpUpdate_KeysTracked)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 
     {
@@ -249,7 +249,7 @@ TEST_F(TracedDataTest, Propagation_OpUpdate_KeysTracked)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 4); // a, b, c, d
+        EXPECT_EQ(v.listSize(), 4u); // a, b, c, d
     }
 }
 
@@ -480,7 +480,7 @@ TEST_F(TracedDataTest, Propagation_Negative_RemoveAttrsNonTracked)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     {
@@ -532,7 +532,7 @@ TEST_F(TracedDataTest, Propagation_OpUpdate_LayerPath)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 3); // x, y, z
+        EXPECT_EQ(v.listSize(), 3u); // x, y, z
     }
 
     {

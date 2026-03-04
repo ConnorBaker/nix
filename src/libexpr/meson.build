@@ -169,6 +169,7 @@ sources = files(
   'eval-trace/deps/input-resolution.cc',
   'eval-trace/deps/recording.cc',
   'eval-trace/deps/shape-deps.cc',
+  'eval-trace/deps/nix-binding.cc',
   'eval-trace/store/stat-hash-store.cc',
   'eval-error.cc',
   'eval-gc.cc',

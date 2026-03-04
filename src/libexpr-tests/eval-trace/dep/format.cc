@@ -31,6 +31,7 @@ TEST_F(DependencyTrackerTest, StructuredFormatChar_Roundtrip)
     EXPECT_EQ(structuredFormatChar(StructuredFormat::Json), 'j');
     EXPECT_EQ(structuredFormatChar(StructuredFormat::Toml), 't');
     EXPECT_EQ(structuredFormatChar(StructuredFormat::Directory), 'd');
+    EXPECT_EQ(structuredFormatChar(StructuredFormat::Nix), 'n');
 }
 
 TEST_F(DependencyTrackerTest, ParseStructuredFormat_ValidChars)
@@ -38,6 +39,7 @@ TEST_F(DependencyTrackerTest, ParseStructuredFormat_ValidChars)
     EXPECT_EQ(parseStructuredFormat('j'), StructuredFormat::Json);
     EXPECT_EQ(parseStructuredFormat('t'), StructuredFormat::Toml);
     EXPECT_EQ(parseStructuredFormat('d'), StructuredFormat::Directory);
+    EXPECT_EQ(parseStructuredFormat('n'), StructuredFormat::Nix);
 }
 
 TEST_F(DependencyTrackerTest, ParseStructuredFormat_InvalidChars)
@@ -52,6 +54,7 @@ TEST_F(DependencyTrackerTest, StructuredFormatName_AllFormats)
     EXPECT_EQ(structuredFormatName(StructuredFormat::Json), "json");
     EXPECT_EQ(structuredFormatName(StructuredFormat::Toml), "toml");
     EXPECT_EQ(structuredFormatName(StructuredFormat::Directory), "directory");
+    EXPECT_EQ(structuredFormatName(StructuredFormat::Nix), "nix");
 }
 
 // ── ShapeSuffix enum tests ────────────────────────────────────────────
@@ -70,9 +73,9 @@ TEST_F(DependencyTrackerTest, StrongId_DefaultZero)
     DepSourceId src{};
     FilePathId fp{};
     DataPathId dp{};
-    EXPECT_EQ(src.value, 0);
-    EXPECT_EQ(fp.value, 0);
-    EXPECT_EQ(dp.value, 0);
+    EXPECT_EQ(src.value, 0u);
+    EXPECT_EQ(fp.value, 0u);
+    EXPECT_EQ(dp.value, 0u);
     EXPECT_FALSE(static_cast<bool>(src));
     EXPECT_FALSE(static_cast<bool>(fp));
     EXPECT_FALSE(static_cast<bool>(dp));

@@ -122,6 +122,11 @@ sources = files(
   'eval-trace/verify/per-sibling-core.cc',
   'eval-trace/verify/per-sibling-edge.cc',
   'eval-trace/verify/integration.cc',
+  # eval-trace/nix-binding/
+  'eval-trace/nix-binding/basic.cc',
+  'eval-trace/nix-binding/precision.cc',
+  'eval-trace/nix-binding/override.cc',
+  'eval-trace/nix-binding/edge-cases.cc',
   'json.cc',
   'main.cc',
   'nix_api_expr.cc',

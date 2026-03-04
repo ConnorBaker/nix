@@ -71,7 +71,7 @@ TEST_F(DepPrecisionPipelinesTest, AttrNamesMapListToAttrs_CacheMiss)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     file.modify(R"({"items": [{"name": "a", "value": 1}, {"name": "b", "value": 2}, {"name": "c", "value": 3}]})");
@@ -82,7 +82,7 @@ TEST_F(DepPrecisionPipelinesTest, AttrNamesMapListToAttrs_CacheMiss)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -106,7 +106,7 @@ TEST_F(DepPrecisionPipelinesTest, UpdateMapAttrsAttrNames_CacheMiss)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     fileB.modify(R"({"y": 2, "z": 3})");
@@ -117,7 +117,7 @@ TEST_F(DepPrecisionPipelinesTest, UpdateMapAttrsAttrNames_CacheMiss)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -158,7 +158,7 @@ TEST_F(DepPrecisionPipelinesTest, ConcatMapGroupByAttrNames_CacheMiss)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2); // ["a", "b"]
+        EXPECT_EQ(v.listSize(), 2u); // ["a", "b"]
     }
 
     file.modify(R"({"items": ["a", "b", "c"]})");
@@ -169,7 +169,7 @@ TEST_F(DepPrecisionPipelinesTest, ConcatMapGroupByAttrNames_CacheMiss)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -256,7 +256,7 @@ TEST_F(DepPrecisionPipelinesTest, MapAttrsFilterAttrNames_CacheMiss)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     file.modify(R"({"a": 1, "b": 2, "c": 3})");
@@ -267,7 +267,7 @@ TEST_F(DepPrecisionPipelinesTest, MapAttrsFilterAttrNames_CacheMiss)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -284,7 +284,7 @@ TEST_F(DepPrecisionPipelinesTest, RemoveAttrsIntersectAttrNames_DisjointKeyAdded
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2); // x, y
+        EXPECT_EQ(v.listSize(), 2u); // x, y
     }
 
     // Adding "w" to a: removeAttrs produces {x,y,w}, intersect with {x,y} = {x,y}
@@ -297,7 +297,7 @@ TEST_F(DepPrecisionPipelinesTest, RemoveAttrsIntersectAttrNames_DisjointKeyAdded
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 0)
             << "Disjoint key w (not in b) should not invalidate intersection";
-        EXPECT_EQ(v.listSize(), 2); // still x, y
+        EXPECT_EQ(v.listSize(), 2u); // still x, y
     }
 }
 

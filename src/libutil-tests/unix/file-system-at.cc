@@ -52,7 +52,7 @@ TEST(fchmodatTryNoFollow, works)
                 throw;
         });
     ASSERT_EQ(stat((tmpDir / "file").c_str(), &st), 0);
-    EXPECT_EQ(st.st_mode & 0777, 0644);
+    EXPECT_EQ(st.st_mode & 0777u, 0644u);
 
     EXPECT_NO_THROW(
         try { fchmodatTryNoFollow(dirFd.get(), CanonPath("dirlink"), 0777); } catch (SysError & e) {

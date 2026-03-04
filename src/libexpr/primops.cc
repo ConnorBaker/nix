@@ -3394,6 +3394,9 @@ void prim_getAttr(EvalState & state, const PosIdx pos, Value ** args, Value & v)
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.getAttr");
     auto i = state.getAttr(state.symbols.create(attr), args[1]->attrs(), "in the attribute set under consideration");
     // !!! add to stack trace?
+    // Record per-binding NixBinding dep (same as ExprSelect).
+    if (state.traceActiveDepth) [[unlikely]]
+        maybeRecordNixBindingDep(i->pos);
     if (state.countCalls && i->pos)
         state.attrSelects[i->pos]++;
     state.forceValue(*i->value, pos);

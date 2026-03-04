@@ -1105,6 +1105,21 @@ struct ExprParseFile : Expr, gc
 
         auto e = state.parseExprFromFile(path);
 
+        // Analyze AST for per-binding NixBinding tracking (Phase 16).
+        // Eligible non-recursive attrsets get per-binding StructuredContent
+        // deps with format tag 'n', enabling two-level verification override.
+        if (state.traceActiveDepth) [[unlikely]] {
+            auto [exprAttrs, scopeExprs] = findNonRecExprAttrs(e);
+            if (exprAttrs && state.traceCtx) {
+                auto resolved = path.resolveSymlinks(SymlinkResolution::Ancestors);
+                auto [depSource, depKey] = resolveProvenance(
+                    CanonPath(resolved.path.abs()), state.getMountToInput());
+                auto scopeHash = computeNixScopeHash(scopeExprs, state.symbols);
+                registerNixBindings(exprAttrs, depSource, depKey, scopeHash,
+                                    state.symbols, *state.traceCtx->pools);
+            }
+        }
+
         try {
             auto dts =
                 state.debugRepl
@@ -1136,9 +1151,10 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
 
     // Record Content oracle dep for eval trace (Adapton DDG edge).
     // Note: the Content dep covers the whole file. For .nix code consumed
-    // via import/evalFile, no fine-grained override exists — any byte change
-    // invalidates the trace. For data files consumed by fromJSON/fromTOML,
-    // ReadFileProvenance enables StructuredContent two-level override.
+    // via import/evalFile, NixBinding (format 'n') provides per-binding
+    // StructuredContent override for eligible non-recursive attrsets.
+    // For data files consumed by fromJSON/fromTOML, ReadFileProvenance
+    // enables StructuredContent two-level override.
     // See design.md Section 4.6 (Dependency Over-Approximation).
     if (traceActiveDepth) [[unlikely]]
         recordImportContentDep(*resolvedPath);
@@ -1540,6 +1556,10 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
             }
             vAttrs = j->value;
             pos2 = j->pos;
+            // Record per-binding NixBinding dep if this attr was defined
+            // in an eligible .nix file (PosIdx registered at parse time).
+            if (state.traceActiveDepth) [[unlikely]]
+                maybeRecordNixBindingDep(j->pos);
             if (state.countCalls)
                 state.attrSelects[pos2]++;
         }
@@ -1612,6 +1632,9 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
         if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
             lastAttrset = vAttrs;
             lastKeyName = name;
+            // Record per-binding NixBinding dep (same as ExprSelect).
+            if (state.traceActiveDepth) [[unlikely]]
+                maybeRecordNixBindingDep(j->pos);
             vAttrs = j->value;
         } else {
             // Record #has:key for the attrset where the key was NOT found.

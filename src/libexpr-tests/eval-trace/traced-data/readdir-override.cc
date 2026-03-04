@@ -135,7 +135,7 @@ TEST_F(TracedDataTest, TracedDir_EmptyDir)
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
         EXPECT_TRUE(v.type() == nAttrs);
-        EXPECT_EQ(v.attrs()->size(), 0);
+        EXPECT_EQ(v.attrs()->size(), 0u);
     }
 
     {

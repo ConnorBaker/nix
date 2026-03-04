@@ -496,7 +496,7 @@ TEST_F(nix_api_expr_test, nix_expr_attrset_update)
     nix_expr_eval_from_string(ctx, state, "{ a = 0; b = 2; } // { a = 1; b = 3; } // { a = 2; }", ".", value);
     assert_ctx_ok();
 
-    ASSERT_EQ(nix_get_attrs_size(ctx, value), 2);
+    ASSERT_EQ(nix_get_attrs_size(ctx, value), 2u);
     assert_ctx_ok();
     std::array<std::pair<std::string_view, nix_value *>, 2> values;
     for (unsigned int i = 0; i < 2; ++i) {

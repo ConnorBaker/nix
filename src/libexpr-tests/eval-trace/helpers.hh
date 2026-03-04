@@ -469,11 +469,13 @@ protected:
 
     std::vector<ResolvedDep> evalAndCollectDeps(const std::string & nixExpr)
     {
-        DependencyTracker tracker(*state.traceCtx->pools);
+        auto & pools = *state.traceCtx->pools;
+        pools.sessionSymbols = &state.symbols;
+        DependencyTracker tracker(pools);
         state.traceActiveDepth++;
         (void) eval(nixExpr, /* forceValue */ true);
         state.traceActiveDepth--;
-        return resolveDeps(*state.traceCtx->pools, tracker.collectTraces());
+        return resolveDeps(pools, tracker.collectTraces());
     }
 
     /**

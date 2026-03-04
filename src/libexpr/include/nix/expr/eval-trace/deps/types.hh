@@ -375,6 +375,7 @@ enum class StructuredFormat : char {
     Json      = 'j',
     Toml      = 't',
     Directory = 'd',
+    Nix       = 'n',
 };
 
 /**
@@ -394,6 +395,7 @@ inline constexpr std::optional<StructuredFormat> parseStructuredFormat(char c)
     case 'j': return StructuredFormat::Json;
     case 't': return StructuredFormat::Toml;
     case 'd': return StructuredFormat::Directory;
+    case 'n': return StructuredFormat::Nix;
     default: return std::nullopt;
     }
 }
@@ -407,6 +409,7 @@ inline constexpr std::string_view structuredFormatName(StructuredFormat f)
     case StructuredFormat::Json: return "json";
     case StructuredFormat::Toml: return "toml";
     case StructuredFormat::Directory: return "directory";
+    case StructuredFormat::Nix: return "nix";
     }
     unreachable();
 }

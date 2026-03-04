@@ -294,7 +294,7 @@ TEST_F(DepPrecisionPreserveTest, RemoveAttrs_AttrNames_KeyAdded_CacheMiss)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 1);
+        EXPECT_EQ(v.listSize(), 1u);
     }
 
     file.modify(R"({"x": 1, "y": 2, "z": 3})");
@@ -305,7 +305,7 @@ TEST_F(DepPrecisionPreserveTest, RemoveAttrs_AttrNames_KeyAdded_CacheMiss)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 }
 
@@ -326,7 +326,7 @@ TEST_F(DepPrecisionPreserveTest, RemoveAttrs_AttrNames_NoopRemove_CacheMiss)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     file.modify(R"({"x": 1, "y": 2, "z": 3})");
@@ -337,7 +337,7 @@ TEST_F(DepPrecisionPreserveTest, RemoveAttrs_AttrNames_NoopRemove_CacheMiss)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -362,7 +362,7 @@ TEST_F(DepPrecisionPreserveTest, MapAttrs_AttrNames_KeyAdded_CacheMiss)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     file.modify(R"({"x": 1, "y": 2, "z": 3})");
@@ -373,7 +373,7 @@ TEST_F(DepPrecisionPreserveTest, MapAttrs_AttrNames_KeyAdded_CacheMiss)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -394,7 +394,7 @@ TEST_F(DepPrecisionPreserveTest, MapAttrs_AttrNames_ValueChanged_CacheHit)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     file.modify(R"({"x": 99, "y": 88})");
@@ -405,7 +405,7 @@ TEST_F(DepPrecisionPreserveTest, MapAttrs_AttrNames_ValueChanged_CacheHit)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 0);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 }
 

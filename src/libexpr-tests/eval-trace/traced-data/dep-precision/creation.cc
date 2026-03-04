@@ -65,7 +65,7 @@ TEST_F(DepPrecisionCreationTest, Object_EmptyObject_BlockingSCKeys_CacheBehavior
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 0);
+        EXPECT_EQ(v.listSize(), 0u);
     }
 
     file.modify(R"({"obj": {"a": 1}})");
@@ -76,7 +76,7 @@ TEST_F(DepPrecisionCreationTest, Object_EmptyObject_BlockingSCKeys_CacheBehavior
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1) << "Key added to empty object must invalidate via #keys";
-        EXPECT_EQ(v.listSize(), 1);
+        EXPECT_EQ(v.listSize(), 1u);
     }
 }
 

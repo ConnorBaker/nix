@@ -219,7 +219,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, NixpkgsAllPackages_MapAttrs_CacheMiss)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     file.modify(R"({"pkg1": {"meta": {"license": "MIT"}}, "pkg2": {"meta": {"license": "GPL"}}, "pkg3": {"meta": {"license": "BSD"}}})");
@@ -230,7 +230,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, NixpkgsAllPackages_MapAttrs_CacheMiss)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -285,7 +285,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, PackageSet_FilterBroken_CacheMiss)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     file.modify(R"({"a": {"broken": false}, "b": {"broken": true}, "c": {"broken": false}})");
@@ -296,7 +296,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, PackageSet_FilterBroken_CacheMiss)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
@@ -351,7 +351,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, WithPackages_Pattern_CacheMiss)
     {
         auto cache = makeCache(expr);
         auto v = forceRoot(*cache);
-        EXPECT_EQ(v.listSize(), 2);
+        EXPECT_EQ(v.listSize(), 2u);
     }
 
     file.modify(R"({"numpy": "1.0", "pandas": "2.0", "scipy": "3.0"})");
@@ -362,7 +362,7 @@ TEST_F(DepPrecisionNixpkgsPatternsTest, WithPackages_Pattern_CacheMiss)
         auto cache = makeCache(expr, &loaderCalls);
         auto v = forceRoot(*cache);
         EXPECT_EQ(loaderCalls, 1);
-        EXPECT_EQ(v.listSize(), 3);
+        EXPECT_EQ(v.listSize(), 3u);
     }
 }
 
