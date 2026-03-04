@@ -1169,15 +1169,15 @@ Added `maybeRecordAttrKeysDep` on argument attrset at `eval.cc:1648`.
 
 #### Open Gaps
 
-**Gap 4: Raw + parsed `readFile` from same file — OPEN.**
-When both raw (e.g., `stringLength`) and parsed (e.g., `fromJSON`) readFile
-reference the same file, SC deps from the parsed path incorrectly cover the
-Content dep failure for the raw path. Unlike gaps 1-3/5/B1-B3, this is NOT
-a missing shape dep — it's a fundamental limitation of the two-level override:
-it cannot distinguish which Content dep failure should be overrideable.
-*Test:* `DISABLED_TracedJSON_RawAndParsedReadFile_ContentChanges`.
-*Positive boundary tests:* 7 tests (`RawOnly_*`, `ParsedOnly_*`,
-`RawAndParsed_*`) verify adjacent non-buggy scenarios.
+**Gap 4: Raw + parsed `readFile` from same file — FIXED.**
+Fixed by introducing `RawContent` (DepType 14). String builtins (`stringLength`,
+`hashString`, `substring`, `match`, `split`, `replaceStrings`) and `eqValues`
+(string case) now record `RawContent` deps via `maybeRecordRawContentDep()`,
+which are distinct from `StructuredContent` deps. The two-level override only
+applies to `StructuredContent` deps, so raw readFile access correctly uses the
+Content dep path — detecting any byte change.
+*Tests:* 5 enabled tests in `gaps-rawcontent.cc`
+(`TracedJSON_RawAndParsedReadFile_ContentChanges` and related).
 
 **Gap P1: Parent-mediated value changes — OPEN.**
 ParentContext deps track only accessed siblings. Parent overlays that change
@@ -1245,9 +1245,9 @@ Unit tests for callback behavior in `child-range-exclusion.cc`
 `NoSiblingCallback_NormalReplay`, `SiblingCallback_ValueNotInMap_NormalReplay`,
 `ResetClearsSiblingState`).
 
-Gap 4 requires deeper design work to distinguish raw vs parsed readFile
-provenance in the two-level override. Gap P1 requires recording the parent's
-result hash alongside per-sibling deps.
+Gap 4 was fixed by the RawContent dep type (DepType 14), which distinguishes
+raw string builtins from parsed StructuredContent deps. Gap P1 requires
+recording the parent's result hash alongside per-sibling deps.
 
 ### 4.8 Two-Object Trace Model (3 pitfalls) -- CAS Blob Era Only
 
@@ -1434,14 +1434,14 @@ structural properties change, plus precision tests verifying cache hits when
 only unrelated fields change.
 
 **Open gap tests** (marked `[SOUNDNESS]` or `DISABLED_`):
-Gaps 4 and P1 remain open with DISABLED tests documenting the known bugs.
+Gap P1 remains open with a DISABLED test documenting the known bug.
 
 | Gap | Status | Soundness Test | Precision Tests |
 |-----|--------|---------------|-----------------|
 | 1 (`==`/`!=`) | **Fixed** | `EqOp_ListLengthGrows`, `EqOp_AttrsetKeyAdded`, `NeqOp_ListLengthGrows` | `EqOp_ListElementChanges`, `EqOp_ListUnrelatedChange`, `EqOp_AttrsetValueChanges`, `EqOp_AttrsetUnrelatedChange` |
 | 2 (`genericClosure`) | **Fixed** | `GenericClosure_StartSetGrows` | `GenericClosure_ElementChanges`, `GenericClosure_CacheHit` |
 | 3 (`listToAttrs`) | **Fixed** | `ListToAttrs_FullResultGrows` | `ListToAttrs_ElementChanges`, `ListToAttrs_UnrelatedChange` |
-| 4 (raw+parsed readFile) | **Open** | `DISABLED_RawAndParsedReadFile_ContentChanges` | `RawOnly_StringLength_ContentChanges`, `RawOnly_Substring_ContentChanges`, `RawOnly_StringLength_SameSizeChange`, `ParsedOnly_UnusedFieldChange_CacheHit`, `RawAndParsed_DifferentFiles_RawFileChanges`, `RawAndParsed_DifferentFiles_ParsedUnusedChange`, `RawAndParsed_SameFile_AccessedFieldChanges` |
+| 4 (raw+parsed readFile) | **Fixed** | `TracedJSON_RawAndParsedReadFile_ContentChanges` | `RawOnly_StringLength_ContentChanges`, `RawOnly_Substring_ContentChanges`, `RawOnly_StringLength_SameSizeChange`, `ParsedOnly_UnusedFieldChange_CacheHit`, `RawAndParsed_DifferentFiles_RawFileChanges`, `RawAndParsed_DifferentFiles_ParsedUnusedChange`, `RawAndParsed_SameFile_AccessedFieldChanges` |
 | 5 (`intersectAttrs`) | **Fixed** | `IntersectAttrs_TracedGainsMatchingKey` | `IntersectAttrs_ValueChanges`, `IntersectAttrs_UnrelatedChange` |
 | B1 (`<`) | **Fixed** | `LessThan_ListLengthGrows` | `LessThan_ListUnrelatedChange` |
 | B2 (`//`) | **Fixed** | `Update_TracedGainsKey` | `Update_UnrelatedChange` |

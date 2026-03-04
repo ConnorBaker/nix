@@ -115,6 +115,48 @@ TEST_F(DepTrackingTest, ContentDep_Import_WarmHit)
     }
 }
 
+// ── P1 Precision: Comment-only .nix change causes re-evaluation ──────
+// Documents the precision gap: whole-file Content dep means any byte change
+// (even a comment edit) invalidates the trace, even when the Nix result
+// is identical. The system is correct (re-evaluates), just imprecise.
+
+TEST_F(DepTrackingTest, ContentDep_Import_CommentChange_ReEvaluates)
+{
+    TempTestFile file("42 # original comment");
+    auto expr = "import " + file.path.string();
+
+    // Fresh evaluation — imports file, records Content dep on whole file
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_THAT(v, IsIntEq(42));
+    }
+
+    // Verify warm hit
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 0);
+        EXPECT_THAT(v, IsIntEq(42));
+    }
+
+    // Modify only the comment — same Nix result, different file bytes.
+    // Use different SIZE to avoid StatHashCache false hit.
+    file.modify("42 # different comment but longer");
+    invalidateFileCache(file.path);
+
+    // P1 precision gap: Content dep covers whole file, so comment change
+    // invalidates trace even though the evaluation result is identical.
+    {
+        int loaderCalls = 0;
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(loaderCalls, 1) << "comment-only change causes re-evaluation (P1 precision gap)";
+        EXPECT_THAT(v, IsIntEq(42));
+    }
+}
+
 // ── Group 3: EnvVar oracle deps via builtins.getEnv ──────────────────
 
 TEST_F(DepTrackingTest, EnvVarDep_WarmHit)

@@ -362,16 +362,13 @@ TEST_F(DepCopiedPathTest, CopiedPath_ThreeTraces_AllInvalidate)
 // Known soundness issues — documented as commented stubs
 // ═══════════════════════════════════════════════════════════════════════
 
-// KNOWN ISSUE 2: ParentContext non-transitive verification
-// getCurrentTraceHash() returns stored hash without recursive parent verification.
-// A parent trace may have stale deps while its trace_hash is unchanged,
-// meaning child traces with ParentContext deps on the parent won't detect
-// the staleness. Separate fix needed in trace-store.cc.
+// KNOWN ISSUE 2: ParentContext non-transitive verification — FIXED (O1)
+// Fixed: verifyTrace() now recursively verifies parent traces when
+// encountering ParentContext deps. verifiedTraceIds cache prevents loops.
 
-// KNOWN ISSUE 3: Empty sibling traces always verify as valid
-// recordSiblingTrace() records zero-dep traces for already-forced siblings.
-// These empty traces always pass verification (no deps to check), even when
-// the sibling's actual value would differ. Separate fix needed in trace-cache.cc.
+// KNOWN ISSUE 3: Empty sibling traces always verify as valid — FIXED (O2)
+// Fixed: recordSiblingTrace() removed entirely. Each sibling's TracedExpr
+// handles its own tracing independently when accessed.
 
 // KNOWN ISSUE 5: Parent overlay gap
 // Parent structural change can invalidate child without changing child's deps.
@@ -379,9 +376,9 @@ TEST_F(DepCopiedPathTest, CopiedPath_ThreeTraces_AllInvalidate)
 // the child's trace deps, but the child's attr path may resolve to a different
 // position. Fundamental design limitation, needs parent-child dep edge.
 
-// KNOWN ISSUE 7: prim_path expectedHash skips dep recording
-// When expectedHash matches and store path is valid, fetchToStore is skipped
-// entirely. No CopiedPath or NARContent dep is recorded for the source path.
-// Separate fix needed in primops.cc (prim_path).
+// KNOWN ISSUE 7: prim_path expectedHash skips dep recording — FIXED (O3)
+// Fixed: CopiedPath dep recording at primops.cc:3160 is outside the if/else
+// block, so the dep is recorded regardless of whether fetchToStore ran.
+// CopiedPath verification rehashes the source via computeStorePath.
 
 } // namespace nix::eval_trace

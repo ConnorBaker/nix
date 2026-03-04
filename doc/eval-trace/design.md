@@ -1118,7 +1118,7 @@ pre-computed), the trace serves stale results.
 | 1 | **Fixed** | `==` / `!=` |
 | 2 | **Fixed** (indirect) | `genericClosure` |
 | 3 | **Fixed** | `listToAttrs` |
-| 4 | **Open** | Raw + parsed readFile (same file) |
+| 4 | **Fixed** | Raw + parsed readFile (same file) |
 | 5 | **Fixed** | `intersectAttrs` |
 | B1 | **Fixed** | `<` (CompareValues) |
 | B2 | **Fixed** | `//` (update) |
@@ -1127,7 +1127,7 @@ pre-computed), the trace serves stale results.
 | S2 | **Fixed** | Path coercion (`./dir + "/file"`) |
 | O1 | **Fixed** | ParentContext non-transitive verification |
 | O2 | **Fixed** | Empty sibling traces always valid |
-| O3 | **Open** | `prim_path` expectedHash skips dep recording |
+| O3 | **Fixed** | `prim_path` expectedHash skips dep recording |
 | P1 | **Open** | Parent-mediated changes |
 | Bug 1 | **Fixed** | Already-materialized sibling detection |
 
