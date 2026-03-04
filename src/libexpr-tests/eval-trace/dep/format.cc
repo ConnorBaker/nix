@@ -10,7 +10,7 @@ namespace nix::eval_trace {
 
 using namespace nix::eval_trace::test;
 
-class DependencyTrackerTest : public ::testing::Test
+class DepFormatTest : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -26,7 +26,7 @@ protected:
 
 // ── StructuredFormat enum tests ───────────────────────────────────────
 
-TEST_F(DependencyTrackerTest, StructuredFormatChar_Roundtrip)
+TEST_F(DepFormatTest, StructuredFormatChar_Roundtrip)
 {
     EXPECT_EQ(structuredFormatChar(StructuredFormat::Json), 'j');
     EXPECT_EQ(structuredFormatChar(StructuredFormat::Toml), 't');
@@ -34,7 +34,7 @@ TEST_F(DependencyTrackerTest, StructuredFormatChar_Roundtrip)
     EXPECT_EQ(structuredFormatChar(StructuredFormat::Nix), 'n');
 }
 
-TEST_F(DependencyTrackerTest, ParseStructuredFormat_ValidChars)
+TEST_F(DepFormatTest, ParseStructuredFormat_ValidChars)
 {
     EXPECT_EQ(parseStructuredFormat('j'), StructuredFormat::Json);
     EXPECT_EQ(parseStructuredFormat('t'), StructuredFormat::Toml);
@@ -42,14 +42,14 @@ TEST_F(DependencyTrackerTest, ParseStructuredFormat_ValidChars)
     EXPECT_EQ(parseStructuredFormat('n'), StructuredFormat::Nix);
 }
 
-TEST_F(DependencyTrackerTest, ParseStructuredFormat_InvalidChars)
+TEST_F(DepFormatTest, ParseStructuredFormat_InvalidChars)
 {
     EXPECT_EQ(parseStructuredFormat('x'), std::nullopt);
     EXPECT_EQ(parseStructuredFormat('J'), std::nullopt);
     EXPECT_EQ(parseStructuredFormat('\0'), std::nullopt);
 }
 
-TEST_F(DependencyTrackerTest, StructuredFormatName_AllFormats)
+TEST_F(DepFormatTest, StructuredFormatName_AllFormats)
 {
     EXPECT_EQ(structuredFormatName(StructuredFormat::Json), "json");
     EXPECT_EQ(structuredFormatName(StructuredFormat::Toml), "toml");
@@ -59,7 +59,7 @@ TEST_F(DependencyTrackerTest, StructuredFormatName_AllFormats)
 
 // ── ShapeSuffix enum tests ────────────────────────────────────────────
 
-TEST_F(DependencyTrackerTest, ShapeSuffixName_AllValues)
+TEST_F(DepFormatTest, ShapeSuffixName_AllValues)
 {
     EXPECT_EQ(shapeSuffixName(ShapeSuffix::None), "");
     EXPECT_EQ(shapeSuffixName(ShapeSuffix::Len), "len");
@@ -68,7 +68,7 @@ TEST_F(DependencyTrackerTest, ShapeSuffixName_AllValues)
 
 // ── StrongId type safety tests ────────────────────────────────────────
 
-TEST_F(DependencyTrackerTest, StrongId_DefaultZero)
+TEST_F(DepFormatTest, StrongId_DefaultZero)
 {
     DepSourceId src{};
     FilePathId fp{};
@@ -81,7 +81,7 @@ TEST_F(DependencyTrackerTest, StrongId_DefaultZero)
     EXPECT_FALSE(static_cast<bool>(dp));
 }
 
-TEST_F(DependencyTrackerTest, StrongId_NonZeroIsTrue)
+TEST_F(DepFormatTest, StrongId_NonZeroIsTrue)
 {
     DepSourceId src(1);
     DataPathId dp(42);
@@ -89,7 +89,7 @@ TEST_F(DependencyTrackerTest, StrongId_NonZeroIsTrue)
     EXPECT_TRUE(static_cast<bool>(dp));
 }
 
-TEST_F(DependencyTrackerTest, StrongId_EqualityAndOrdering)
+TEST_F(DepFormatTest, StrongId_EqualityAndOrdering)
 {
     DepSourceId a(1), b(1), c(2);
     EXPECT_EQ(a, b);

@@ -10,7 +10,7 @@ namespace nix::eval_trace {
 
 using namespace nix::eval_trace::test;
 
-class DepHashTest : public ::testing::Test
+class DepHashBasicTest : public ::testing::Test
 {
 protected:
     void SetUp() override
@@ -27,21 +27,21 @@ protected:
 
 // ── Dep hash function tests (BLAKE3 oracle hashing) ─────────────────
 
-TEST_F(DepHashTest, DepHash_Deterministic)
+TEST_F(DepHashBasicTest, DepHash_Deterministic)
 {
     auto h1 = depHash("hello");
     auto h2 = depHash("hello");
     EXPECT_EQ(h1, h2);
 }
 
-TEST_F(DepHashTest, DepHash_DifferentInputs)
+TEST_F(DepHashBasicTest, DepHash_DifferentInputs)
 {
     auto h1 = depHash("hello");
     auto h2 = depHash("world");
     EXPECT_NE(h1, h2);
 }
 
-TEST_F(DepHashTest, DepHash_EmptyInput)
+TEST_F(DepHashBasicTest, DepHash_EmptyInput)
 {
     auto h = depHash("");
     // Should produce a valid non-zero BLAKE3 hash
@@ -51,13 +51,13 @@ TEST_F(DepHashTest, DepHash_EmptyInput)
     EXPECT_FALSE(allZero);
 }
 
-TEST_F(DepHashTest, DepHash_ToHex_Length)
+TEST_F(DepHashBasicTest, DepHash_ToHex_Length)
 {
     auto h = depHash("test");
     EXPECT_EQ(h.toHex().size(), 64u);
 }
 
-TEST_F(DepHashTest, DepHashPath_CapturesContent)
+TEST_F(DepHashBasicTest, DepHashPath_CapturesContent)
 {
     TempTestFile f("hello world");
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
@@ -66,7 +66,7 @@ TEST_F(DepHashTest, DepHashPath_CapturesContent)
     EXPECT_EQ(h.size(), 32u);
 }
 
-TEST_F(DepHashTest, DepHashPath_CapturesExecBit)
+TEST_F(DepHashBasicTest, DepHashPath_CapturesExecBit)
 {
     TempTestFile f1("#!/bin/sh\necho hi");
     TempTestFile f2("#!/bin/sh\necho hi");
@@ -81,7 +81,7 @@ TEST_F(DepHashTest, DepHashPath_CapturesExecBit)
     EXPECT_NE(h1, h2);
 }
 
-TEST_F(DepHashTest, DepHashDirListing_Deterministic)
+TEST_F(DepHashBasicTest, DepHashDirListing_Deterministic)
 {
     SourceAccessor::DirEntries entries = {
         {"a", SourceAccessor::Type::tRegular},
@@ -92,7 +92,7 @@ TEST_F(DepHashTest, DepHashDirListing_Deterministic)
     EXPECT_EQ(h1, h2);
 }
 
-TEST_F(DepHashTest, DepHashDirListing_OrderSensitive)
+TEST_F(DepHashBasicTest, DepHashDirListing_OrderSensitive)
 {
     SourceAccessor::DirEntries e1 = {
         {"a", SourceAccessor::Type::tRegular},
@@ -108,7 +108,7 @@ TEST_F(DepHashTest, DepHashDirListing_OrderSensitive)
     EXPECT_EQ(h1, h2); // map orders by key, so {a,b} in both cases
 }
 
-TEST_F(DepHashTest, DepHashDirListing_Empty)
+TEST_F(DepHashBasicTest, DepHashDirListing_Empty)
 {
     SourceAccessor::DirEntries empty;
     auto h = depHashDirListing(empty);
@@ -118,14 +118,14 @@ TEST_F(DepHashTest, DepHashDirListing_Empty)
     EXPECT_FALSE(allZero);
 }
 
-TEST_F(DepHashTest, DepHashDirListing_DifferentEntries)
+TEST_F(DepHashBasicTest, DepHashDirListing_DifferentEntries)
 {
     SourceAccessor::DirEntries e1 = {{"a", SourceAccessor::Type::tRegular}};
     SourceAccessor::DirEntries e2 = {{"b", SourceAccessor::Type::tRegular}};
     EXPECT_NE(depHashDirListing(e1), depHashDirListing(e2));
 }
 
-TEST_F(DepHashTest, DepHash_vs_DepHashPath_Different)
+TEST_F(DepHashBasicTest, DepHash_vs_DepHashPath_Different)
 {
     TempTestFile f("hello");
     auto path = SourcePath(getFSSourceAccessor(), CanonPath(f.path.string()));
@@ -137,7 +137,7 @@ TEST_F(DepHashTest, DepHash_vs_DepHashPath_Different)
 
 // ── Blake3Hash tests ─────────────────────────────────────────────────
 
-TEST_F(DepHashTest, Blake3Hash_Equality)
+TEST_F(DepHashBasicTest, Blake3Hash_Equality)
 {
     auto h1 = depHash("test");
     auto h2 = depHash("test");
@@ -145,7 +145,7 @@ TEST_F(DepHashTest, Blake3Hash_Equality)
     EXPECT_FALSE(h1 != h2);
 }
 
-TEST_F(DepHashTest, Blake3Hash_Ordering)
+TEST_F(DepHashBasicTest, Blake3Hash_Ordering)
 {
     auto h1 = depHash("aaa");
     auto h2 = depHash("bbb");
@@ -153,14 +153,14 @@ TEST_F(DepHashTest, Blake3Hash_Ordering)
     [[maybe_unused]] auto cmp = h1 <=> h2;
 }
 
-TEST_F(DepHashTest, Blake3Hash_FromBlob)
+TEST_F(DepHashBasicTest, Blake3Hash_FromBlob)
 {
     auto h1 = depHash("test");
     auto h2 = Blake3Hash::fromBlob(h1.data(), h1.size());
     EXPECT_EQ(h1, h2);
 }
 
-TEST_F(DepHashTest, Blake3Hash_View)
+TEST_F(DepHashBasicTest, Blake3Hash_View)
 {
     auto h = depHash("test");
     auto view = h.view();
@@ -170,7 +170,7 @@ TEST_F(DepHashTest, Blake3Hash_View)
 
 // ── depTypeName tests ────────────────────────────────────────────────
 
-TEST_F(DepHashTest, DepTypeName_AllTypes)
+TEST_F(DepHashBasicTest, DepTypeName_AllTypes)
 {
     EXPECT_EQ(depTypeName(DepType::Content), "content");
     EXPECT_EQ(depTypeName(DepType::Directory), "directory");
@@ -187,7 +187,7 @@ TEST_F(DepHashTest, DepTypeName_AllTypes)
 
 // ── isBlake3Dep tests ────────────────────────────────────────────────
 
-TEST_F(DepHashTest, IsBlake3Dep)
+TEST_F(DepHashBasicTest, IsBlake3Dep)
 {
     EXPECT_TRUE(isBlake3Dep(DepType::Content));
     EXPECT_TRUE(isBlake3Dep(DepType::Directory));
