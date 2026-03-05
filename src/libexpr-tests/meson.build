@@ -72,6 +72,7 @@ sources = files(
   'eval-trace/store/nixpkgs-patterns.cc',
   'eval-trace/store/nixpkgs-optimization.cc',
   'eval-trace/store/hash.cc',
+  'eval-trace/store/git-identity.cc',
   # eval-trace/traced-data/
   'eval-trace/traced-data/json-scalar.cc',
   'eval-trace/traced-data/json-containers.cc',

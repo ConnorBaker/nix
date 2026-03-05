@@ -2,6 +2,8 @@
 #include "root-tracker-scope.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/util/logging.hh"
+#include "nix/fetchers/git-utils.hh"
+#include "nix/util/archive.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -316,6 +318,35 @@ std::vector<Dep> DependencyTracker::collectTraces() const
 void DependencyTracker::clearEpochLog()
 {
     epochLog.clear();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// computeGitIdentityHash — git repo fingerprint for GitIdentity dep
+// ═══════════════════════════════════════════════════════════════════════
+
+std::optional<Blake3Hash> computeGitIdentityHash(const std::filesystem::path & repoRoot)
+{
+    auto wd = GitRepo::getCachedWorkdirInfo(repoRoot);
+    if (!wd.headRev)
+        return std::nullopt;
+
+    // Build identity string: HEAD rev + dirty file fingerprint
+    // (same SHA512 HashSink pattern as git fetcher's getFingerprint)
+    std::string identity = "git-rev=" + wd.headRev->gitRev();
+    if (wd.isDirty) {
+        HashSink hashSink{HashAlgorithm::SHA512};
+        for (auto & file : wd.dirtyFiles) {
+            writeString("modified:", hashSink);
+            writeString(file.abs(), hashSink);
+            dumpPath(repoRoot / file.rel(), hashSink);
+        }
+        for (auto & file : wd.deletedFiles) {
+            writeString("deleted:", hashSink);
+            writeString(file.abs(), hashSink);
+        }
+        identity += ";git-dirty=" + hashSink.finish().hash.to_string(HashFormat::Base16, false);
+    }
+    return depHash(identity);
 }
 
 } // namespace nix

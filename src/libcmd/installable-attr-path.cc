@@ -18,9 +18,8 @@
 #include "nix/util/hash.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/fetchers/registry.hh"
-#include "nix/fetchers/git-utils.hh"
 #include "nix/util/serialise.hh"
-#include "nix/util/archive.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/store/build-result.hh"
 
 #include <filesystem>
@@ -88,37 +87,6 @@ static std::optional<Hash> computeFileEvalIdentity(const SourceExprCommand & cmd
     // Include system to differentiate builtins.currentSystem across --system flags
     identity += ";system=" + state.settings.getCurrentSystem();
 
-    // When the file is inside a git repo, include HEAD rev and dirty state
-    // so different revisions get distinct context_hash values.
-    if (cmd.file) {
-        try {
-            auto resolvedPath = absPath(cmd.file->string());
-            if (auto repoRoot = findGitRepoRoot(resolvedPath)) {
-                auto wd = GitRepo::getCachedWorkdirInfo(*repoRoot);
-                if (wd.headRev)
-                    identity += ";git-rev=" + wd.headRev->gitRev();
-                if (wd.isDirty) {
-                    // Hash dirty/deleted files like git fetcher's getFingerprint
-                    HashSink hashSink{HashAlgorithm::SHA512};
-                    for (auto & file : wd.dirtyFiles) {
-                        writeString("modified:", hashSink);
-                        writeString(file.abs(), hashSink);
-                        dumpPath(*repoRoot / file.rel(), hashSink);
-                    }
-                    for (auto & file : wd.deletedFiles) {
-                        writeString("deleted:", hashSink);
-                        writeString(file.abs(), hashSink);
-                    }
-                    identity += ";git-dirty=" + hashSink.finish().hash.to_string(HashFormat::Base16, false);
-                }
-            }
-        } catch (std::exception & e) {
-            debug("git identity detection failed for '%s': %s", cmd.file->string(), e.what());
-        } catch (...) {
-            debug("git identity detection failed for '%s'", cmd.file->string());
-        }
-    }
-
     return hashString(HashAlgorithm::BLAKE3, identity);
 }
 
@@ -174,6 +142,25 @@ ref<eval_trace::TraceCache> InstallableAttrPath::getOrCreateTraceCache(EvalState
 
         auto result = state.allocValue();
         state.autoCallFunction(*autoArgs, *base, *result);
+
+        // Record git identity as a coarse dep so cross-commit trace reuse
+        // works (context_hash is now path-only, not git-aware).
+        if (stableIdentity && cmdRef.file && state.traceCtx) {
+            try {
+                auto resolvedPath = absPath(cmdRef.file->string());
+                if (auto repoRoot = findGitRepoRoot(resolvedPath)) {
+                    if (auto hash = computeGitIdentityHash(*repoRoot)) {
+                        DependencyTracker::record(
+                            *state.traceCtx->pools,
+                            DepType::GitIdentity, "", repoRoot->string(),
+                            DepHashValue(*hash));
+                    }
+                }
+            } catch (...) {
+                debug("git identity dep recording failed for '%s'", cmdRef.file->string());
+            }
+        }
+
         return result;
     };
 

@@ -46,6 +46,10 @@ struct SourcePath;
  *   ParentContext: Verified by checking parent trace hash.
  *     ParentContext
  *
+ *   ImplicitStructural: Skipped during normal verification. Used for
+ *     conservative shape bounds and coarse identity checks.
+ *     ImplicitShape, GitIdentity
+ *
  * NOTE: Symlink targets are not tracked. resolveSymlinks() follows symlinks
  * but only records the final resolved file as a Content/Directory dep.
  * Changes to intermediate symlink targets will NOT invalidate traced results.
@@ -97,6 +101,10 @@ enum class DepType : uint8_t {
     /** Store path existence check (derivationStrict .drv output).
      *  Hash value: "valid" or "missing" string. Detects GC removal of .drv files. */
     StorePathExistence = 15,
+    /** Git repository identity (HEAD rev + dirty state). Recorded once per
+     *  evaluation of a --file inside a git repo. ImplicitStructural: ignored
+     *  when it doesn't match, enables fast-path skip of Pass 2 when it does. */
+    GitIdentity = 16,
 
     /** Not a real dep type. Must remain last — used to size the descriptor table. */
     EndSentinel_,
@@ -123,6 +131,7 @@ inline std::string depTypeName(DepType type)
     case DepType::ImplicitShape: return "implicitShape";
     case DepType::RawContent: return "rawContent";
     case DepType::StorePathExistence: return "storePathExistence";
+    case DepType::GitIdentity: return "gitIdentity";
     case DepType::EndSentinel_: break;
     }
     unreachable();
@@ -230,7 +239,7 @@ enum class DepKind : uint8_t {
     Structural = 3,
     /** Parent context dep; verified via trace hash lookup (ParentContext). */
     ParentContext = 4,
-    /** Creation-time structural fingerprint; always ignored during verification (ImplicitShape). */
+    /** Not required for correctness; skipped in normal Pass 1/2 override logic (ImplicitShape, GitIdentity). */
     ImplicitStructural = 5,
 };
 
@@ -283,6 +292,8 @@ inline constexpr DepKindDescriptor makeDescriptor(DepType type)
         return {DepKind::Normal, true, false, false};
     case DepType::StorePathExistence:
         return {DepKind::Normal, false, false, false};
+    case DepType::GitIdentity:
+        return {DepKind::ImplicitStructural, true, false, false};
     case DepType::EndSentinel_:
         break;
     }
@@ -309,6 +320,7 @@ inline constexpr auto depDescriptors = [] {
     table[std::to_underlying(DepType::ImplicitShape)] = makeDescriptor(DepType::ImplicitShape);
     table[std::to_underlying(DepType::RawContent)] = makeDescriptor(DepType::RawContent);
     table[std::to_underlying(DepType::StorePathExistence)] = makeDescriptor(DepType::StorePathExistence);
+    table[std::to_underlying(DepType::GitIdentity)] = makeDescriptor(DepType::GitIdentity);
     return table;
 }();
 

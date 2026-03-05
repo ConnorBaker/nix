@@ -307,6 +307,12 @@ inline Dep makeDirectoryDep(InterningPools & p, std::string_view key, const Blak
     return {{DepType::Directory, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key)}, hash};
 }
 
+inline Dep makeGitIdentityDep(InterningPools & p, std::string_view repoPath, std::string_view fingerprint)
+{
+    return {{DepType::GitIdentity, p.intern<DepSourceId>(""), p.intern<DepKeyId>(repoPath)},
+            depHash(fingerprint)};
+}
+
 /// Create a ParentContext Dep from an AttrPathId and trace hash.
 inline Dep makeParentContextDep(AttrPathId pathId, const Hash & traceHash)
 {

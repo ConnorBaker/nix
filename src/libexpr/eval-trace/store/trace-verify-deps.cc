@@ -491,6 +491,14 @@ std::optional<DepHashValue> computeCurrentHash(
             return DepHashValue(std::string("missing"));
         }
     }
+    case DepType::GitIdentity: {
+        try {
+            auto hash = computeGitIdentityHash(std::filesystem::path(dep.key));
+            return hash ? std::optional(DepHashValue(*hash)) : std::nullopt;
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
     case DepType::CurrentTime:
     case DepType::Exec:
     case DepType::ParentContext:

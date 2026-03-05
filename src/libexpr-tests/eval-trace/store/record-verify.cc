@@ -25,6 +25,7 @@ TEST_F(TraceStoreTest, DepTypeName_AllTypes)
     EXPECT_EQ(depTypeName(DepType::Exec), "exec");
     EXPECT_EQ(depTypeName(DepType::NARContent), "narContent");
     EXPECT_EQ(depTypeName(DepType::StructuredContent), "structuredContent");
+    EXPECT_EQ(depTypeName(DepType::GitIdentity), "gitIdentity");
 }
 
 // ── record tests (BSàlC: trace recording / fresh evaluation) ─────

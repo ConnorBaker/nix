@@ -13,6 +13,7 @@ extern Counter nrOwnDepsTotal;
 extern Counter nrOwnDepsMax;
 } // namespace nix::eval_trace
 
+#include <filesystem>
 #include <vector>
 
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -211,6 +212,13 @@ Blake3Hash depHash(std::string_view data);
  * the resulting store path depends on permissions.
  */
 Blake3Hash depHashPath(const SourcePath & path);
+
+/**
+ * Compute a BLAKE3 hash of a git repo's identity (HEAD rev + dirty state).
+ * Returns std::nullopt if the repo has no commits yet.
+ * May throw on git or filesystem errors — callers should catch as appropriate.
+ */
+std::optional<Blake3Hash> computeGitIdentityHash(const std::filesystem::path & repoRoot);
 
 /**
  * Compute a BLAKE3 hash of a directory listing using streaming API.

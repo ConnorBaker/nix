@@ -859,6 +859,7 @@ bool TraceStore::verifyTrace(
     bool hasContentFailure = false;
     bool hasStructuralDeps = false;
     bool hasImplicitShapeDeps = false;
+    bool gitIdentityMatched = false;
 
     std::unordered_set<FileIdentity, FileIdentity::Hash> failedContentFiles;
     // Deferred structural/implicit deps stored as indices into fullDeps
@@ -875,8 +876,17 @@ bool TraceStore::verifyTrace(
         }
 
         if (depKind(idep.key.type) == DepKind::ImplicitStructural) {
-            hasImplicitShapeDeps = true;
-            implicitShapeDepIndices.push_back(i);
+            if (idep.key.type == DepType::GitIdentity) {
+                // Eagerly check GitIdentity for fast-path (don't defer).
+                // Does NOT set hasImplicitShapeDeps — GitIdentity is not a
+                // shape dep and should not trigger Pass 2 shape logic.
+                auto current = resolveCurrentDepHash(idep, inputAccessors, state, scope);
+                if (current && *current == idep.hash)
+                    gitIdentityMatched = true;
+            } else {
+                hasImplicitShapeDeps = true;
+                implicitShapeDepIndices.push_back(i);
+            }
             continue;
         }
 
@@ -910,6 +920,15 @@ bool TraceStore::verifyTrace(
                 hasNonContentFailure = true;
             }
         }
+    }
+
+    // ── GitIdentity fast-path: skip Pass 2 if git identity matches,
+    //    all other deps passed, and no structural/implicit deps need checking.
+    if (gitIdentityMatched && !hasNonContentFailure && !hasContentFailure
+        && structuralDepIndices.empty() && implicitShapeDepIndices.empty()) {
+        verifiedTraceIds.insert(traceId);
+        nrVerifyTraceTimeUs += elapsedUs(vtStart);
+        return true;
     }
 
     // ── Pass 2: Resolve overrides and determine outcome ─────────────
