@@ -18,14 +18,35 @@
 #include "nix/util/hash.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/fetchers/registry.hh"
+#include "nix/fetchers/git-utils.hh"
+#include "nix/util/serialise.hh"
+#include "nix/util/archive.hh"
 #include "nix/store/build-result.hh"
 
+#include <filesystem>
 #include <regex>
 #include <queue>
 
 #include <nlohmann/json.hpp>
 
 namespace nix {
+
+/**
+ * Walk parent directories looking for a .git directory or file (worktrees).
+ * Returns the repo root path, or nullopt if not inside a git repo.
+ */
+static std::optional<std::filesystem::path> findGitRepoRoot(const std::filesystem::path & path)
+{
+    auto dir = std::filesystem::is_directory(path) ? path : path.parent_path();
+    while (true) {
+        if (std::filesystem::exists(dir / ".git"))
+            return dir;
+        auto parent = dir.parent_path();
+        if (parent == dir)
+            return std::nullopt;
+        dir = parent;
+    }
+}
 
 /**
  * Compute a stable identity hash for --file or --expr evaluations.
@@ -66,6 +87,37 @@ static std::optional<Hash> computeFileEvalIdentity(const SourceExprCommand & cmd
 
     // Include system to differentiate builtins.currentSystem across --system flags
     identity += ";system=" + state.settings.getCurrentSystem();
+
+    // When the file is inside a git repo, include HEAD rev and dirty state
+    // so different revisions get distinct context_hash values.
+    if (cmd.file) {
+        try {
+            auto resolvedPath = absPath(cmd.file->string());
+            if (auto repoRoot = findGitRepoRoot(resolvedPath)) {
+                auto wd = GitRepo::getCachedWorkdirInfo(*repoRoot);
+                if (wd.headRev)
+                    identity += ";git-rev=" + wd.headRev->gitRev();
+                if (wd.isDirty) {
+                    // Hash dirty/deleted files like git fetcher's getFingerprint
+                    HashSink hashSink{HashAlgorithm::SHA512};
+                    for (auto & file : wd.dirtyFiles) {
+                        writeString("modified:", hashSink);
+                        writeString(file.abs(), hashSink);
+                        dumpPath(*repoRoot / file.rel(), hashSink);
+                    }
+                    for (auto & file : wd.deletedFiles) {
+                        writeString("deleted:", hashSink);
+                        writeString(file.abs(), hashSink);
+                    }
+                    identity += ";git-dirty=" + hashSink.finish().hash.to_string(HashFormat::Base16, false);
+                }
+            }
+        } catch (std::exception & e) {
+            debug("git identity detection failed for '%s': %s", cmd.file->string(), e.what());
+        } catch (...) {
+            debug("git identity detection failed for '%s'", cmd.file->string());
+        }
+    }
 
     return hashString(HashAlgorithm::BLAKE3, identity);
 }
