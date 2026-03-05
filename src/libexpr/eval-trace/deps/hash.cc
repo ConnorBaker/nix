@@ -38,16 +38,22 @@ static void feedDepToSink(HashSink & sink, const Dep & dep, bool includeHash,
 Hash computeTraceHashFromSorted(const std::vector<Dep> & sortedDeps, const KeyFeeder & feedKey)
 {
     HashSink sink(HashAlgorithm::BLAKE3);
-    for (auto & dep : sortedDeps)
+    for (auto & dep : sortedDeps) {
+        if (depKind(dep.key.type) == DepKind::ImplicitStructural)
+            continue;
         feedDepToSink(sink, dep, true, feedKey);
+    }
     return sink.finish().hash;
 }
 
 Hash computeTraceStructHashFromSorted(const std::vector<Dep> & sortedDeps, const KeyFeeder & feedKey)
 {
     HashSink sink(HashAlgorithm::BLAKE3);
-    for (auto & dep : sortedDeps)
+    for (auto & dep : sortedDeps) {
+        if (depKind(dep.key.type) == DepKind::ImplicitStructural)
+            continue;
         feedDepToSink(sink, dep, false, feedKey);
+    }
     return sink.finish().hash;
 }
 

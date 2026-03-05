@@ -32,12 +32,18 @@ std::vector<Dep> sortAndDedupDeps(const std::vector<Dep> & deps);
 /**
  * Pre-sorted trace hash with KeyFeeder callback (primary API).
  * Computes BLAKE3 hash of all deps INCLUDING hash values.
+ * ImplicitStructural deps (ImplicitShape, GitIdentity) are excluded from
+ * the hash — they don't affect evaluation results and excluding them keeps
+ * trace_hash stable across benign changes (e.g. different git commits
+ * that don't change any evaluated files), which prevents ParentContext
+ * chain breakage.
  */
 Hash computeTraceHashFromSorted(const std::vector<Dep> & sortedDeps, const KeyFeeder & feedKey);
 
 /**
  * Pre-sorted structural hash with KeyFeeder callback (primary API).
  * Computes BLAKE3 hash of all deps EXCLUDING hash values (structure only).
+ * ImplicitStructural deps are excluded (same rationale as computeTraceHashFromSorted).
  */
 Hash computeTraceStructHashFromSorted(const std::vector<Dep> & sortedDeps, const KeyFeeder & feedKey);
 

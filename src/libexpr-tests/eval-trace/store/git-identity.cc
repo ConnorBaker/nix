@@ -275,4 +275,93 @@ TEST_F(TraceStoreTest, GitIdentity_MultiplePassingDeps_Valid)
     EXPECT_TRUE(db.verifiedTraceIds.count(result.traceId));
 }
 
+// ── trace_hash stable across GitIdentity changes (ParentContext chain) ──
+//
+// Two recordings with identical Content+System deps but different GitIdentity
+// fingerprints must produce the same trace_hash. This keeps ParentContext
+// deps stable: children recorded against commit 1's root trace_hash can
+// still be recovered when the root is verified with commit 2's GitIdentity.
+
+TEST_F(TraceStoreTest, GitIdentity_TraceHashStableAcrossCommits)
+{
+    auto db = makeDb();
+    TempTestFile file("stable content");
+    auto filePath = file.path.string();
+
+    auto contentHash = StatHashStore::instance().depHashFile(
+        SourcePath(getFSSourceAccessor(), CanonPath(filePath)));
+    auto systemHash = depHash(state.settings.getCurrentSystem());
+
+    // Record with GitIdentity from "commit 1"
+    std::vector<Dep> deps1 = {
+        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(filePath)}, contentHash},
+        {{DepType::System, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>("")}, systemHash},
+        makeGitIdentityDep(pools(), "/tmp/repo", "commit-1-rev"),
+    };
+    auto result1 = db.record(rootPath(), string_t{"stable content", {}}, deps1, true);
+
+    // Record with GitIdentity from "commit 2" (different fingerprint, same Content+System)
+    std::vector<Dep> deps2 = {
+        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(filePath)}, contentHash},
+        {{DepType::System, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>("")}, systemHash},
+        makeGitIdentityDep(pools(), "/tmp/repo", "commit-2-rev"),
+    };
+    auto result2 = db.record(rootPath(), string_t{"stable content", {}}, deps2, true);
+
+    // Both recordings should produce the same trace_id (same trace_hash)
+    EXPECT_EQ(result1.traceId, result2.traceId)
+        << "Traces differing only in GitIdentity should dedup to same trace_id";
+}
+
+// ── ParentContext recovery across commits ────────────────────────────
+//
+// Verifies the full scenario: record root + child with commit 1,
+// re-record root with commit 2 (deduped), verify child still resolves.
+
+TEST_F(TraceStoreTest, GitIdentity_ParentContextChainSurvivesCommitChange)
+{
+    auto db = makeDb();
+    TempTestFile file("root content");
+    auto filePath = file.path.string();
+
+    auto contentHash = StatHashStore::instance().depHashFile(
+        SourcePath(getFSSourceAccessor(), CanonPath(filePath)));
+
+    // Record root with commit 1
+    std::vector<Dep> rootDeps1 = {
+        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(filePath)}, contentHash},
+        makeGitIdentityDep(pools(), "/tmp/repo", "commit-1"),
+    };
+    auto rootResult = db.record(rootPath(), string_t{"root content", {}}, rootDeps1, true);
+
+    // Get root's trace_hash for the ParentContext dep
+    auto rootTraceHash = db.getCurrentTraceHash(rootPath());
+    ASSERT_TRUE(rootTraceHash.has_value());
+
+    // Record child with ParentContext pointing to root's trace_hash
+    auto childPath = vpath({"child"});
+    std::vector<Dep> childDeps = {
+        makeParentContextDep(rootPath(), *rootTraceHash),
+    };
+    auto childResult = db.record(childPath, int_t{NixInt{42}}, childDeps, false);
+
+    // Re-record root with commit 2 (different GitIdentity)
+    std::vector<Dep> rootDeps2 = {
+        {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(filePath)}, contentHash},
+        makeGitIdentityDep(pools(), "/tmp/repo", "commit-2"),
+    };
+    auto rootResult2 = db.record(rootPath(), string_t{"root content", {}}, rootDeps2, true);
+
+    // Root trace_hash should be unchanged (GitIdentity excluded from hash)
+    auto rootTraceHash2 = db.getCurrentTraceHash(rootPath());
+    ASSERT_TRUE(rootTraceHash2.has_value());
+    EXPECT_EQ(*rootTraceHash, *rootTraceHash2)
+        << "Root trace_hash must be stable across GitIdentity changes";
+
+    // Verify child's trace still passes (ParentContext matches)
+    db.verifiedTraceIds.clear();
+    bool ok = db.verifyTrace(childResult.traceId, {}, state);
+    EXPECT_TRUE(ok) << "Child's ParentContext should still match after root re-recorded with different GitIdentity";
+}
+
 } // namespace nix::eval_trace

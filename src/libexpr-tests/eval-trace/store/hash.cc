@@ -141,4 +141,45 @@ TEST_F(DepHashTest, PreSorted_StructHashMatchesUnsorted)
     EXPECT_EQ(computeTraceStructHash(pools,deps), computeTraceStructHashFromSorted(pools,sorted));
 }
 
+// ── ImplicitStructural deps excluded from hash computation ───────────
+
+TEST_F(DepHashTest, TraceHash_ExcludesImplicitStructural)
+{
+    // Deps with and without GitIdentity should produce the same trace hash
+    std::vector<Dep> depsWithout = {
+        makeContentDep(pools, "/a.nix", "hello"),
+    };
+    std::vector<Dep> depsWith = {
+        makeContentDep(pools, "/a.nix", "hello"),
+        makeGitIdentityDep(pools, "/tmp/repo", "rev-abc"),
+    };
+    EXPECT_EQ(computeTraceHash(pools, depsWithout), computeTraceHash(pools, depsWith));
+}
+
+TEST_F(DepHashTest, StructHash_ExcludesImplicitStructural)
+{
+    std::vector<Dep> depsWithout = {
+        makeContentDep(pools, "/a.nix", "hello"),
+    };
+    std::vector<Dep> depsWith = {
+        makeContentDep(pools, "/a.nix", "hello"),
+        makeGitIdentityDep(pools, "/tmp/repo", "rev-abc"),
+    };
+    EXPECT_EQ(computeTraceStructHash(pools, depsWithout), computeTraceStructHash(pools, depsWith));
+}
+
+TEST_F(DepHashTest, TraceHash_DifferentGitIdentity_SameHash)
+{
+    // Two dep sets differing only in GitIdentity fingerprint → same trace hash
+    std::vector<Dep> deps1 = {
+        makeContentDep(pools, "/a.nix", "hello"),
+        makeGitIdentityDep(pools, "/tmp/repo", "commit-1"),
+    };
+    std::vector<Dep> deps2 = {
+        makeContentDep(pools, "/a.nix", "hello"),
+        makeGitIdentityDep(pools, "/tmp/repo", "commit-2"),
+    };
+    EXPECT_EQ(computeTraceHash(pools, deps1), computeTraceHash(pools, deps2));
+}
+
 } // namespace nix::eval_trace
