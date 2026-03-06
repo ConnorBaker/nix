@@ -445,7 +445,7 @@ std::optional<DepHashValue> computeCurrentHash(
                 if (cacheIt == scope.nixAstCache.end()) {
                     auto source = path->readFile();
                     auto ast = state.parseExprFromString(
-                        std::move(source), state.rootPath(CanonPath(filePath)));
+                        std::move(source), state.rootPath(CanonPath(filePath)).parent());
                     auto [exprAttrs, scopeExprs] = findNonRecExprAttrs(ast);
                     std::unordered_map<std::string, Blake3Hash> hashes;
                     if (exprAttrs) {
