@@ -63,6 +63,7 @@ sources = files(
   'eval-trace/dep/stat-hash-store.cc',
   'eval-trace/dep/replay-pollution.cc',
   'eval-trace/dep/replay-integration.cc',
+  'eval-trace/dep/nix-binding-determinism.cc',
   # eval-trace/store/
   'eval-trace/store/cache.cc',
   'eval-trace/store/record-verify.cc',

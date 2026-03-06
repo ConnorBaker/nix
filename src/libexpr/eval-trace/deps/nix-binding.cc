@@ -133,9 +133,10 @@ Blake3Hash computeNixScopeHash(const std::vector<Expr *> & scopeExprs, const Sym
                 sink(std::string(symbols[lambda->arg]));
             sink(std::string_view("\0", 1));
             if (auto formals = lambda->getFormals()) {
-                // Formals are in parser order (source position), which is
-                // stable across parses of the same file content.
-                for (auto & f : formals->formals) {
+                // Sort by string name for cross-session stability.
+                // validateFormals sorts by Symbol ID (creation-time order),
+                // which varies across EvalState instances.
+                for (auto & f : formals->lexicographicOrder(symbols)) {
                     sink(std::string(symbols[f.name]));
                     if (f.def) {
                         sink("=");
