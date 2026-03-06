@@ -267,4 +267,243 @@ TEST_F(NixBindingDeterminismTest, PreInternedSymbols_StableScopeHash)
         << "\n  hash2=" << scopeHash2.toHex();
 }
 
+// ── Tests for the .parent() base-path fix (Bug 2) ──────────────────
+//
+// parseExprFromFile uses path.parent() as the base for resolving relative
+// paths (eval.cc:3512). The NixBinding verification code in
+// trace-verify-deps.cc must do the same when calling parseExprFromString.
+// Before the fix, it passed the file path itself, causing relative imports
+// like ./sub.nix or ../sibling.nix to resolve with an extra directory
+// segment (e.g., dir/main.nix/sub.nix instead of dir/sub.nix).
+
+// Helper: create a temp directory with a main.nix and a relative import target.
+struct RelativeImportDir {
+    std::filesystem::path dir;
+    std::filesystem::path mainPath;
+
+    RelativeImportDir(
+        const std::string & mainContent,
+        const std::string & relativePath,
+        const std::string & targetContent)
+    {
+        auto base = std::filesystem::temp_directory_path() / "nix-test-eval-trace";
+        std::filesystem::create_directories(base);
+        static int counter = 0;
+        dir = base / ("relimport-" + std::to_string(getpid()) + "-" + std::to_string(counter++));
+        std::filesystem::create_directories(dir);
+
+        mainPath = dir / "main.nix";
+        std::ofstream(mainPath) << mainContent;
+
+        auto targetPath = dir / relativePath;
+        std::filesystem::create_directories(targetPath.parent_path());
+        std::ofstream(targetPath) << targetContent;
+    }
+
+    ~RelativeImportDir() { std::filesystem::remove_all(dir); }
+    RelativeImportDir(const RelativeImportDir &) = delete;
+    RelativeImportDir & operator=(const RelativeImportDir &) = delete;
+};
+
+// Positive: parseExprFromFile and parseExprFromString(content, parent())
+// must produce identical binding hashes when the expression contains
+// relative path imports. This is the exact code path used by recording
+// (parseExprFromFile) vs verification (parseExprFromString with parent).
+TEST_F(NixBindingDeterminismTest, RelativeImport_ParseFileVsParseStringParent_SameHash)
+{
+    RelativeImportDir setup(
+        "{ x = import ./sub.nix; y = 42; }",
+        "sub.nix",
+        "{ val = 1; }");
+
+    auto filePath = CanonPath(setup.mainPath.string());
+    auto sourcePath = SourcePath(getFSSourceAccessor(), filePath);
+
+    // Recording path: parseExprFromFile (uses path.parent() internally)
+    auto ast1 = state.parseExprFromFile(sourcePath);
+    auto [attrs1, scope1] = findNonRecExprAttrs(ast1);
+    ASSERT_NE(attrs1, nullptr);
+    auto scopeHash1 = computeNixScopeHash(scope1, state.symbols);
+
+    std::map<std::string, Blake3Hash> hashes1;
+    for (auto & [sym, def] : *attrs1->attrs) {
+        auto name = std::string(state.symbols[sym]);
+        hashes1[name] = computeNixBindingHash(
+            scopeHash1, name, static_cast<int>(def.kind), def.e, state.symbols);
+    }
+
+    // Verification path (FIXED): parseExprFromString with parent() as base
+    auto contents = sourcePath.readFile();
+    auto ast2 = state.parseExprFromString(
+        std::move(contents), state.rootPath(filePath).parent());
+    auto [attrs2, scope2] = findNonRecExprAttrs(ast2);
+    ASSERT_NE(attrs2, nullptr);
+    auto scopeHash2 = computeNixScopeHash(scope2, state.symbols);
+
+    EXPECT_EQ(scopeHash1, scopeHash2);
+
+    std::map<std::string, Blake3Hash> hashes2;
+    for (auto & [sym, def] : *attrs2->attrs) {
+        auto name = std::string(state.symbols[sym]);
+        hashes2[name] = computeNixBindingHash(
+            scopeHash2, name, static_cast<int>(def.kind), def.e, state.symbols);
+    }
+
+    for (auto & [name, h1] : hashes1) {
+        auto it = hashes2.find(name);
+        ASSERT_NE(it, hashes2.end()) << "Missing binding: " << name;
+        EXPECT_EQ(h1, it->second)
+            << "Binding '" << name << "': parseExprFromFile vs parseExprFromString(.parent())"
+            << "\n  fromFile=" << h1.toHex()
+            << "\n  fromString=" << it->second.toHex();
+    }
+}
+
+// Positive: same test but with parent-relative import (../) to ensure
+// multi-level relative paths are resolved correctly.
+TEST_F(NixBindingDeterminismTest, ParentRelativeImport_ParseFileVsParseStringParent_SameHash)
+{
+    // Create:  dir/inner/main.nix  with  { x = import ../data.nix; }
+    //          dir/data.nix
+    auto base = std::filesystem::temp_directory_path() / "nix-test-eval-trace";
+    std::filesystem::create_directories(base);
+    static int pcounter = 0;
+    auto dir = base / ("parentrel-" + std::to_string(getpid()) + "-" + std::to_string(pcounter++));
+    std::filesystem::create_directories(dir / "inner");
+    auto mainPath = dir / "inner" / "main.nix";
+    std::ofstream(mainPath) << "{ x = import ../data.nix; y = 1; }";
+    std::ofstream(dir / "data.nix") << "42";
+
+    auto filePath = CanonPath(mainPath.string());
+    auto sourcePath = SourcePath(getFSSourceAccessor(), filePath);
+
+    auto ast1 = state.parseExprFromFile(sourcePath);
+    auto [attrs1, scope1] = findNonRecExprAttrs(ast1);
+    ASSERT_NE(attrs1, nullptr);
+    auto scopeHash1 = computeNixScopeHash(scope1, state.symbols);
+
+    std::map<std::string, Blake3Hash> hashes1;
+    for (auto & [sym, def] : *attrs1->attrs) {
+        auto name = std::string(state.symbols[sym]);
+        hashes1[name] = computeNixBindingHash(
+            scopeHash1, name, static_cast<int>(def.kind), def.e, state.symbols);
+    }
+
+    auto contents = sourcePath.readFile();
+    auto ast2 = state.parseExprFromString(
+        std::move(contents), state.rootPath(filePath).parent());
+    auto [attrs2, scope2] = findNonRecExprAttrs(ast2);
+    ASSERT_NE(attrs2, nullptr);
+    auto scopeHash2 = computeNixScopeHash(scope2, state.symbols);
+
+    std::map<std::string, Blake3Hash> hashes2;
+    for (auto & [sym, def] : *attrs2->attrs) {
+        auto name = std::string(state.symbols[sym]);
+        hashes2[name] = computeNixBindingHash(
+            scopeHash2, name, static_cast<int>(def.kind), def.e, state.symbols);
+    }
+
+    // The binding for "x" includes the resolved path in show() output.
+    // With .parent(), both resolve ../data.nix to dir/data.nix.
+    EXPECT_EQ(hashes1.at("x"), hashes2.at("x"))
+        << "Binding 'x' with ../data.nix should match between parseExprFromFile and parseExprFromString(.parent())";
+
+    std::filesystem::remove_all(dir);
+}
+
+// Negative: using the file path itself (old buggy behavior) as base for
+// parseExprFromString produces DIFFERENT binding hashes than
+// parseExprFromFile. This proves the .parent() fix is necessary.
+TEST_F(NixBindingDeterminismTest, WrongBasePath_ProducesDifferentBindingHash)
+{
+    RelativeImportDir setup(
+        "{ x = import ./sub.nix; y = 42; }",
+        "sub.nix",
+        "{ val = 1; }");
+
+    auto filePath = CanonPath(setup.mainPath.string());
+    auto sourcePath = SourcePath(getFSSourceAccessor(), filePath);
+
+    // Recording path: parseExprFromFile (uses path.parent() internally)
+    auto ast1 = state.parseExprFromFile(sourcePath);
+    auto [attrs1, scope1] = findNonRecExprAttrs(ast1);
+    ASSERT_NE(attrs1, nullptr);
+    auto scopeHash1 = computeNixScopeHash(scope1, state.symbols);
+
+    std::map<std::string, Blake3Hash> hashes1;
+    for (auto & [sym, def] : *attrs1->attrs) {
+        auto name = std::string(state.symbols[sym]);
+        hashes1[name] = computeNixBindingHash(
+            scopeHash1, name, static_cast<int>(def.kind), def.e, state.symbols);
+    }
+
+    // WRONG base path: file path instead of parent directory (old bug).
+    // ./sub.nix resolves to dir/main.nix/sub.nix instead of dir/sub.nix.
+    auto contents = sourcePath.readFile();
+    auto ast2 = state.parseExprFromString(
+        std::move(contents), state.rootPath(filePath));  // NO .parent() — old bug
+    auto [attrs2, scope2] = findNonRecExprAttrs(ast2);
+    ASSERT_NE(attrs2, nullptr);
+    auto scopeHash2 = computeNixScopeHash(scope2, state.symbols);
+
+    std::map<std::string, Blake3Hash> hashes2;
+    for (auto & [sym, def] : *attrs2->attrs) {
+        auto name = std::string(state.symbols[sym]);
+        hashes2[name] = computeNixBindingHash(
+            scopeHash2, name, static_cast<int>(def.kind), def.e, state.symbols);
+    }
+
+    // Binding "x" (import ./sub.nix) should DIFFER because the resolved
+    // path differs: dir/sub.nix vs dir/main.nix/sub.nix.
+    EXPECT_NE(hashes1.at("x"), hashes2.at("x"))
+        << "Without .parent(), the relative import path should resolve differently"
+        << "\n  fromFile=" << hashes1.at("x").toHex()
+        << "\n  wrongBase=" << hashes2.at("x").toHex();
+
+    // Binding "y" (= 42, no path) should still match — only path-containing
+    // expressions are affected by the base path difference.
+    EXPECT_EQ(hashes1.at("y"), hashes2.at("y"))
+        << "Binding 'y' (literal value) should not be affected by base path";
+}
+
+// Negative: different relative import targets must produce different
+// binding hashes (sanity check that the path IS part of the hash).
+TEST_F(NixBindingDeterminismTest, DifferentRelativeImports_DifferentBindingHash)
+{
+    auto basePath = state.rootPath(CanonPath("/some/dir"));
+
+    auto ast1 = state.parseExprFromString(
+        "{ x = import ./alpha.nix; }", basePath);
+    auto [attrs1, scope1] = findNonRecExprAttrs(ast1);
+    ASSERT_NE(attrs1, nullptr);
+    auto scopeHash1 = computeNixScopeHash(scope1, state.symbols);
+
+    Blake3Hash hash1;
+    for (auto & [sym, def] : *attrs1->attrs) {
+        auto name = std::string(state.symbols[sym]);
+        if (name == "x")
+            hash1 = computeNixBindingHash(
+                scopeHash1, name, static_cast<int>(def.kind), def.e, state.symbols);
+    }
+
+    auto ast2 = state.parseExprFromString(
+        "{ x = import ./beta.nix; }", basePath);
+    auto [attrs2, scope2] = findNonRecExprAttrs(ast2);
+    ASSERT_NE(attrs2, nullptr);
+    auto scopeHash2 = computeNixScopeHash(scope2, state.symbols);
+
+    Blake3Hash hash2;
+    for (auto & [sym, def] : *attrs2->attrs) {
+        auto name = std::string(state.symbols[sym]);
+        if (name == "x")
+            hash2 = computeNixBindingHash(
+                scopeHash2, name, static_cast<int>(def.kind), def.e, state.symbols);
+    }
+
+    EXPECT_NE(hash1, hash2)
+        << "Different import targets should produce different binding hashes"
+        << "\n  alpha=" << hash1.toHex()
+        << "\n  beta=" << hash2.toHex();
+}
+
 } // namespace nix::eval_trace
