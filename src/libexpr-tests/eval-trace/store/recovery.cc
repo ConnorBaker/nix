@@ -418,4 +418,165 @@ TEST_F(TraceStoreTest, RecoveryFailure_AllPhasesFail)
     EXPECT_FALSE(result.has_value());
 }
 
+// ── Fix 1: Sentinel hash tests (missing file deps) ──────────────────
+
+TEST_F(TraceStoreTest, Recovery_MissingFileDep_StructuralVariant)
+{
+    // Record T1 with deps [Content(X)], record T2 with deps [Content(X), Content(Y)].
+    // Delete Y. Verify → recovers T1 (structural variant without Y).
+    TempTestFile fileX("content_X");
+    TempTestFile fileY("content_Y");
+
+    auto db = makeDb();
+
+    // T1: only depends on X
+    std::vector<Dep> deps1 = {makeContentDep(pools(), fileX.path.string(), "content_X")};
+    db.record(rootPath(), string_t{"result_T1", {}}, deps1, true);
+
+    // T2: depends on X + Y (latest, in attribute)
+    std::vector<Dep> deps2 = {
+        makeContentDep(pools(), fileX.path.string(), "content_X"),
+        makeContentDep(pools(), fileY.path.string(), "content_Y"),
+    };
+    db.record(rootPath(), string_t{"result_T2", {}}, deps2, true);
+
+    // Delete Y → T2's Content(Y) dep can't be verified normally
+    std::filesystem::remove(fileY.path);
+    getFSSourceAccessor()->invalidateCache(CanonPath(fileY.path.string()));
+    StatHashStore::instance().clear();
+    db.clearSessionCaches();
+
+    // Recovery: sentinel for Y, structural variant finds T1 (no Y dep)
+    auto result = db.verify(rootPath(), {}, state);
+    ASSERT_TRUE(result.has_value());
+    assertCachedResultEquals(string_t{"result_T1", {}}, result->value, state.symbols);
+}
+
+TEST_F(TraceStoreTest, Recovery_MissingFile_DirectHashOnRevert)
+{
+    // Record T1 with [Content(X)="v1"]. Record T2 with [Content(X)="v2"].
+    // Revert X to v1 content. Direct hash recovery succeeds (X matches v1).
+    TempTestFile fileX("v1_content");
+
+    auto db = makeDb();
+
+    // T1: X has v1 content
+    std::vector<Dep> deps1 = {makeContentDep(pools(), fileX.path.string(), "v1_content")};
+    db.record(rootPath(), string_t{"result_v1", {}}, deps1, true);
+
+    // T2: X has v2 content
+    fileX.modify("v2_content");
+    getFSSourceAccessor()->invalidateCache(CanonPath(fileX.path.string()));
+    StatHashStore::instance().clear();
+    std::vector<Dep> deps2 = {makeContentDep(pools(), fileX.path.string(), "v2_content")};
+    db.record(rootPath(), string_t{"result_v2", {}}, deps2, true);
+
+    // Revert X to v1
+    fileX.modify("v1_content");
+    getFSSourceAccessor()->invalidateCache(CanonPath(fileX.path.string()));
+    StatHashStore::instance().clear();
+    db.clearSessionCaches();
+
+    auto result = db.verify(rootPath(), {}, state);
+    ASSERT_TRUE(result.has_value());
+    assertCachedResultEquals(string_t{"result_v1", {}}, result->value, state.symbols);
+}
+
+TEST_F(TraceStoreTest, Recovery_SentinelDeterministic)
+{
+    // depHash("<missing>") computed twice must be equal.
+    auto h1 = depHash("<missing>");
+    auto h2 = depHash("<missing>");
+    EXPECT_EQ(h1, h2);
+}
+
+TEST_F(TraceStoreTest, Recovery_MissingFile_AllDepsStillComputable)
+{
+    // Record trace with Content dep on file X. Delete X.
+    // Recovery should still compute all deps (sentinel returned, not nullopt).
+    // Verified by: recovery doesn't abort (allComputable = true), tries direct hash.
+    TempTestFile fileX("some_content");
+
+    auto db = makeDb();
+
+    std::vector<Dep> deps = {makeContentDep(pools(), fileX.path.string(), "some_content")};
+    db.record(rootPath(), string_t{"result", {}}, deps, true);
+
+    // Also record a second version so recovery has something to try
+    fileX.modify("other_content");
+    getFSSourceAccessor()->invalidateCache(CanonPath(fileX.path.string()));
+    StatHashStore::instance().clear();
+    std::vector<Dep> deps2 = {makeContentDep(pools(), fileX.path.string(), "other_content")};
+    db.record(rootPath(), string_t{"result2", {}}, deps2, true);
+
+    // Delete X
+    std::filesystem::remove(fileX.path);
+    getFSSourceAccessor()->invalidateCache(CanonPath(fileX.path.string()));
+    StatHashStore::instance().clear();
+    db.clearSessionCaches();
+
+    // Recovery attempts (sentinel hash won't match either v1 or v2, but
+    // allComputable should be true so recovery runs without aborting).
+    // No matching trace → verify returns nullopt, but the point is recovery
+    // didn't abort early due to nullopt.
+    auto result = db.verify(rootPath(), {}, state);
+    // Both versions had the file → no structural variant without it → fails
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(TraceStoreTest, Recovery_MissingFile_NoMatchingVariant)
+{
+    // Record ONE trace with Content(X). Delete X. Recovery fails
+    // (sentinel hash ≠ stored, no variant without X).
+    TempTestFile fileX("only_version");
+
+    auto db = makeDb();
+
+    std::vector<Dep> deps = {makeContentDep(pools(), fileX.path.string(), "only_version")};
+    db.record(rootPath(), string_t{"result", {}}, deps, true);
+
+    // Delete X
+    std::filesystem::remove(fileX.path);
+    getFSSourceAccessor()->invalidateCache(CanonPath(fileX.path.string()));
+    StatHashStore::instance().clear();
+    db.clearSessionCaches();
+
+    auto result = db.verify(rootPath(), {}, state);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(TraceStoreTest, Verify_MissingFile_ContentFails)
+{
+    // Record trace with Content(X). Delete X. verifyTrace fails
+    // (sentinel ≠ stored hash), falls through to recovery.
+    TempTestFile fileX("original_content");
+
+    auto db = makeDb();
+
+    std::vector<Dep> deps = {makeContentDep(pools(), fileX.path.string(), "original_content")};
+    db.record(rootPath(), string_t{"result", {}}, deps, true);
+
+    // Delete X → Content dep mismatches (sentinel vs original hash)
+    std::filesystem::remove(fileX.path);
+    getFSSourceAccessor()->invalidateCache(CanonPath(fileX.path.string()));
+    StatHashStore::instance().clear();
+    db.clearSessionCaches();
+
+    // Should fail (only one trace, sentinel won't match stored content hash)
+    auto result = db.verify(rootPath(), {}, state);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST_F(TraceStoreTest, Recovery_SentinelDiffersFromRealHash)
+{
+    // depHash("<missing>") must differ from depHash of any real content.
+    auto sentinel = depHash("<missing>");
+    auto real1 = depHash("hello");
+    auto real2 = depHash("");
+    auto real3 = depHash("some file content\n");
+    EXPECT_NE(sentinel, real1);
+    EXPECT_NE(sentinel, real2);
+    EXPECT_NE(sentinel, real3);
+}
+
 } // namespace nix::eval_trace

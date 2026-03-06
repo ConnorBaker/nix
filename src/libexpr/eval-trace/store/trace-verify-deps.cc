@@ -264,6 +264,8 @@ std::optional<DepHashValue> computeCurrentHash(
     case DepType::RawContent: {
         auto path = resolveDepPath(dep, inputAccessors);
         if (!path) return std::nullopt;
+        if (!path->maybeLstat())
+            return DepHashValue(depHash("<missing>"));
         try {
             return DepHashValue(StatHashStore::instance().depHashFile(*path));
         } catch (std::exception &) {
@@ -273,6 +275,8 @@ std::optional<DepHashValue> computeCurrentHash(
     case DepType::NARContent: {
         auto path = resolveDepPath(dep, inputAccessors);
         if (!path) return std::nullopt;
+        if (!path->maybeLstat())
+            return DepHashValue(depHash("<missing>"));
         try {
             return DepHashValue(StatHashStore::instance().depHashPathCached(*path));
         } catch (std::exception &) {
@@ -282,6 +286,8 @@ std::optional<DepHashValue> computeCurrentHash(
     case DepType::Directory: {
         auto path = resolveDepPath(dep, inputAccessors);
         if (!path) return std::nullopt;
+        if (!path->maybeLstat())
+            return DepHashValue(depHash("<missing>"));
         try {
             return DepHashValue(StatHashStore::instance().depHashDirListingCached(*path, path->readDirectory()));
         } catch (std::exception &) {
@@ -392,6 +398,8 @@ std::optional<DepHashValue> computeCurrentHash(
         TraceStore::ResolvedDep fileDep{dep.source, filePath, DepHashValue{Blake3Hash{}}, DepType::Content};
         auto path = resolveDepPath(fileDep, inputAccessors);
         if (!path) return std::nullopt;
+        if (!path->maybeLstat())
+            return DepHashValue(depHash("<missing>"));
 
         try {
             switch (*format) {
