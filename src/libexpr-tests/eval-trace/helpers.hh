@@ -291,8 +291,11 @@ inline Dep makeExecDep(InterningPools & p)
         DepHashValue(std::string("volatile"))};
 }
 
-inline Dep makeCopiedPathDep(InterningPools & p, std::string_view key, std::string_view storePath)
+/// Create a CopiedPath dep. Key format: "sourcePath\tstoreName".
+inline Dep makeCopiedPathDep(InterningPools & p, std::string_view sourcePath,
+                             std::string_view storeName, std::string_view storePath)
 {
+    auto key = std::string(sourcePath) + "\t" + std::string(storeName);
     return {{DepType::CopiedPath, p.intern<DepSourceId>(""), p.intern<DepKeyId>(key)},
         DepHashValue(std::string(storePath))};
 }

@@ -104,24 +104,39 @@ void recordDep(
     const CanonPath & absPath,
     const DepHashValue & hash,
     DepType depType,
-    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput)
+    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput,
+    std::string_view storeName)
 {
     bool recorded = false;
     // Single lstat — reused for both existence gating and stat-hash-cache population
     std::optional<PosixStat> fileStat;
 
+    // For CopiedPath deps, the dep key encodes both the source path and the
+    // store name (tab-separated: "sourcePath\tstoreName"). This allows
+    // computeCurrentHash to derive the store name from the key alone, without
+    // reading expectedHash — enforcing the invariant that computeCurrentHash
+    // is a pure function of (dep.key, current filesystem state).
+    auto appendStoreName = [&](std::string key) -> std::string {
+        if (depType == DepType::CopiedPath && !storeName.empty())
+            return key + "\t" + std::string(storeName);
+        return key;
+    };
+
     if (!mountToInput.empty()) {
         if (auto resolved = resolveToInput(absPath, mountToInput)) {
-            DependencyTracker::record(pools, depType, resolved->first, resolved->second.abs(), hash);
+            DependencyTracker::record(pools, depType, resolved->first,
+                appendStoreName(resolved->second.abs()), hash);
             recorded = true;
             // Flake input path — no lstat needed (accessor provides content)
         } else if ((fileStat = maybeLstat(std::filesystem::path(absPath.abs())))) {
-            DependencyTracker::record(pools, depType, absolutePathDep, absPath.abs(), hash);
+            DependencyTracker::record(pools, depType, absolutePathDep,
+                appendStoreName(absPath.abs()), hash);
             recorded = true;
         }
         // else: virtual file — no filesystem oracle, skip (see above)
     } else if ((fileStat = maybeLstat(std::filesystem::path(absPath.abs())))) {
-        DependencyTracker::record(pools, depType, "", absPath.abs(), hash);
+        DependencyTracker::record(pools, depType, "",
+            appendStoreName(absPath.abs()), hash);
         recorded = true;
     }
     // else: virtual file — no filesystem oracle, skip (see above)

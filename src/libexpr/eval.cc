@@ -2779,7 +2779,7 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
         && !hasPrefix(path.path.abs(), "/nix/store/")) [[unlikely]]
     {
         recordDep(*traceCtx->pools, path.path, DepHashValue(store->printStorePath(dstPath)),
-            DepType::CopiedPath, getMountToInput());
+            DepType::CopiedPath, getMountToInput(), path.baseName());
     }
 
     context.insert(NixStringContextElem::Opaque{.path = dstPath});

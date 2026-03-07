@@ -45,16 +45,23 @@ VerificationScopePtr createVerificationScope()
 // ── Trace verification helpers (BSàlC verifying trace check) ─────────
 
 static std::optional<SourcePath> resolveDepPath(
+    const std::string & source, const std::string & key,
+    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors)
+{
+    if (source == absolutePathDep)
+        return SourcePath(getFSSourceAccessor(), CanonPath(key));
+    auto it = inputAccessors.find(source);
+    if (it != inputAccessors.end())
+        return it->second / CanonPath(key);
+    if (source.empty())
+        return SourcePath(getFSSourceAccessor(), CanonPath(key));
+    return std::nullopt;
+}
+
+static std::optional<SourcePath> resolveDepPath(
     const TraceStore::ResolvedDep & dep, const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors)
 {
-    if (dep.source == absolutePathDep)
-        return SourcePath(getFSSourceAccessor(), CanonPath(dep.key));
-    auto it = inputAccessors.find(dep.source);
-    if (it != inputAccessors.end())
-        return it->second / CanonPath(dep.key);
-    if (dep.source.empty())
-        return SourcePath(getFSSourceAccessor(), CanonPath(dep.key));
-    return std::nullopt;
+    return resolveDepPath(dep.source, dep.key, inputAccessors);
 }
 
 // ── Structured content navigation helpers (used by TrackedSource) ────
@@ -252,6 +259,12 @@ static std::optional<DepHashValue> resolveShapeSuffix(
 } // anonymous namespace
 
 // ── computeCurrentHash ───────────────────────────────────────────────
+//
+// INVARIANT: This function must be a pure function of (dep.key, dep.type,
+// dep.source, current filesystem/environment state). It must NEVER read
+// dep.expectedHash. Structural variant recovery constructs deps with a
+// placeholder expectedHash (Blake3Hash{}), so reading it would silently
+// produce wrong results or type-mismatch failures.
 
 std::optional<DepHashValue> computeCurrentHash(
     EvalState & state, const TraceStore::ResolvedDep & dep,
@@ -307,15 +320,20 @@ std::optional<DepHashValue> computeCurrentHash(
     case DepType::System:
         return DepHashValue(depHash(state.settings.getCurrentSystem()));
     case DepType::CopiedPath: {
-        auto sourcePath = resolveDepPath(dep, inputAccessors);
+        // CopiedPath dep key format: "sourcePath\tstoreName".
+        // Store name is encoded in the key so this function never reads
+        // expectedHash (see invariant above).
+        auto tab = dep.key.find('\t');
+        if (tab == std::string::npos) return std::nullopt;
+        auto filePath = dep.key.substr(0, tab);
+        auto storeName = dep.key.substr(tab + 1);
+        auto sourcePath = resolveDepPath(dep.source, filePath, inputAccessors);
         if (!sourcePath) return std::nullopt;
+        if (!sourcePath->maybeLstat())
+            return DepHashValue(depHash("<missing>"));
         try {
-            auto * storePathStr = std::get_if<std::string>(&dep.expectedHash);
-            if (!storePathStr) return std::nullopt;
-            auto expectedStorePath = state.store->parseStorePath(*storePathStr);
-            auto name2 = std::string(expectedStorePath.name());
             auto [storePath, hash] = state.store->computeStorePath(
-                name2,
+                storeName,
                 sourcePath->resolveSymlinks(SymlinkResolution::Ancestors),
                 ContentAddressMethod::Raw::NixArchive,
                 HashAlgorithm::SHA256, {});

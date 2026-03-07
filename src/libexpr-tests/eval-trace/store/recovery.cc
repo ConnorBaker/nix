@@ -579,4 +579,5 @@ TEST_F(TraceStoreTest, Recovery_SentinelDiffersFromRealHash)
     EXPECT_NE(sentinel, real3);
 }
 
+
 } // namespace nix::eval_trace

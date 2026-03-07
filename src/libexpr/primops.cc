@@ -3160,7 +3160,7 @@ static void addPath(
         if (!filterFun && refs.empty() && state.traceActiveDepth
             && !state.store->isInStore(path.path.abs()))
         {
-            recordDep(*state.traceCtx->pools,path.path, DepHashValue(resultStorePath), DepType::CopiedPath, state.getMountToInput());
+            recordDep(*state.traceCtx->pools,path.path, DepHashValue(resultStorePath), DepType::CopiedPath, state.getMountToInput(), name);
         }
     } catch (Error & e) {
         e.addTrace(state.positions[pos], "while adding path '%s'", path);

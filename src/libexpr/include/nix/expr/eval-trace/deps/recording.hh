@@ -248,7 +248,8 @@ void recordDep(
     const CanonPath & absPath,
     const DepHashValue & hash,
     DepType depType,
-    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
+    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput,
+    std::string_view storeName = {});
 
 /**
  * Provenance information from a readFile call, used to connect
