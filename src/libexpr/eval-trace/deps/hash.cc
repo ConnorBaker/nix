@@ -1,5 +1,6 @@
 #include "nix/expr/eval-trace/deps/hash.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 
 #include <algorithm>
 
@@ -86,5 +87,18 @@ Hash computeTraceStructHash(InterningPools & pools, const std::vector<Dep> & dep
     return computeTraceStructHashFromSorted(pools, sortAndDedupDeps(deps));
 }
 
+
+// ── Canonical keys hash ──────────────────────────────────────────────
+
+Blake3Hash canonicalKeysHash(std::vector<std::string> keys)
+{
+    std::sort(keys.begin(), keys.end());
+    std::string canonical;
+    for (size_t i = 0; i < keys.size(); i++) {
+        if (i > 0) canonical += '\0';
+        canonical += keys[i];
+    }
+    return depHash(canonical);
+}
 
 } // namespace nix::eval_trace

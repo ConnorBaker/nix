@@ -56,4 +56,10 @@ Hash computeTraceStructHash(InterningPools & pools, const std::vector<Dep> & dep
 Hash computeTraceHashFromSorted(InterningPools & pools, const std::vector<Dep> & sortedDeps);
 Hash computeTraceStructHashFromSorted(InterningPools & pools, const std::vector<Dep> & sortedDeps);
 
+/**
+ * Canonical #keys hash: sort keys, join with \0, BLAKE3.
+ * Used for StructuredContent/ImplicitShape #keys deps.
+ */
+Blake3Hash canonicalKeysHash(std::vector<std::string> keys);
+
 } // namespace nix::eval_trace

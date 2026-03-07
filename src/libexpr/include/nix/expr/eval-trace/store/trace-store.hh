@@ -265,8 +265,7 @@ struct TraceStore {
     RecordResult record(
         AttrPathId pathId,
         const CachedResult & value,
-        const std::vector<Dep> & allDeps,
-        bool isRoot);
+        const std::vector<Dep> & allDeps);
 
 
     /**
@@ -386,6 +385,8 @@ struct TraceStore {
     void feedKey(HashSink & s, DepType type, uint32_t idValue) const;
 
 private:
+    void bulkLoadAllLocked(State & st);
+
     std::optional<TraceRow> lookupTraceRow(AttrPathId pathId);
 
     /** Ensure traceDataCache has traceHash + structHash for the given traceId.

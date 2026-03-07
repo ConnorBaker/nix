@@ -1,5 +1,6 @@
 #include "nix/expr/json-to-value.hh"
 #include "nix/expr/eval-trace/data/traced-data.hh"
+#include "nix/expr/eval-trace/deps/hash.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/expr/eval-trace/context.hh"
 #include "nix/expr/eval-trace/cache/trace-cache.hh"
@@ -353,14 +354,7 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
                 recordStructuredDep(pools, keysComp, DepHashValue(depHash("")));
             } else {
                 // Non-empty: ImplicitShape #keys fingerprint at creation time.
-                std::vector<std::string> sortedKeys(keys);
-                std::sort(sortedKeys.begin(), sortedKeys.end());
-                std::string canonical;
-                for (size_t i = 0; i < sortedKeys.size(); i++) {
-                    if (i > 0) canonical += '\0';
-                    canonical += sortedKeys[i];
-                }
-                auto keysHash = depHash(canonical);
+                auto keysHash = eval_trace::canonicalKeysHash(keys);
                 recordStructuredDep(pools, keysComp, DepHashValue(keysHash), DepType::ImplicitShape);
 
                 PosIdx anyKeyPos = v.attrs()->begin()->pos;

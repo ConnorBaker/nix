@@ -62,7 +62,7 @@ TEST_F(DepOverapproxFixture, UnusedFileDep_ContentFailsCausesSpuriousMiss)
     db.record(rootPath(), string_t{"result_from_a", {}}, {
         makeContentDep(pools(), mainFile.path.string(), "main_content_v1"),
         makeContentDep(pools(), aliasesFile.path.string(), "aliases_content_v1"),
-    }, true);
+    });
 
     // Change ONLY aliasesFile (unused dep)
     auto newAliases = TempTestFile("aliases_content_v2");
@@ -86,7 +86,7 @@ TEST_F(DepOverapproxFixture, UsedFileDep_ContentFailsCorrectMiss)
     db.record(rootPath(), string_t{"result_from_main", {}}, {
         makeContentDep(pools(), mainFile.path.string(), "main_content_v1"),
         makeContentDep(pools(), aliasesFile.path.string(), "aliases_content_v1"),
-    }, true);
+    });
 
     // Change mainFile (the dep that actually matters)
     auto newMain = TempTestFile("main_content_v2");
@@ -146,7 +146,7 @@ TEST_F(DepOverapproxFixture, SCOnAccessedFile_UnusedFileStillCausesMiss)
           pools().intern<DepKeyId>(scKey)},
          *bindingHash},
         makeContentDep(pools(), aliasesFile.path.string(), aliasesContent),
-    }, true);
+    });
 
     // Change only the UNUSED file
     auto newAliases = TempTestFile("unused_aliases_v2");
@@ -206,7 +206,7 @@ TEST_F(DepOverapproxFixture, SCOnBothFiles_UnusedFileChangeOverrideAccepts)
         makeScDep(mainFile.path, mainContent, "accessed"),
         makeContentDep(pools(), otherFile.path.string(), otherContent),
         makeScDep(otherFile.path, otherContent, "unrelated"),
-    }, true);
+    });
 
     // Change the OTHER file's binding value
     auto newOther = TempTestFile("{ unrelated = 999; }");
@@ -260,7 +260,7 @@ TEST_F(DepOverapproxFixture, SCOnBothFiles_UnrelatedBindingChange_OverrideAccept
         makeScDep(mainFile.path, mainContent, "accessed"),
         makeContentDep(pools(), otherFile.path.string(), otherContent),
         makeScDep(otherFile.path, otherContent, "tracked"),
-    }, true);
+    });
 
     // Change only the UNTRACKED binding in otherFile
     auto newOther = TempTestFile("{ tracked = 2; untracked = 999; }");

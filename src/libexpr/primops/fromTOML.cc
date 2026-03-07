@@ -3,6 +3,7 @@
 #include "nix/expr/static-string-data.hh"
 #include "nix/expr/eval-trace/data/traced-data.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/toml-canonical.hh"
 
 #include "expr-config-private.hh"
 
@@ -198,9 +199,7 @@ struct TomlDataNode : TracedDataNode {
     }
 
     std::string canonicalValue() const override {
-        std::ostringstream ss;
-        ss << *data;
-        return ss.str();
+        return eval_trace::tomlCanonical(*data);
     }
 };
 

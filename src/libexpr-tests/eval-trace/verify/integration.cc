@@ -43,7 +43,7 @@ TEST_F(TraceCacheIntegrationTest, ColdStore_ThenWarmPath)
     auto db = makeDbBackend();
 
     auto storeResult = db.record(
-        rootPath(), string_t{"hello", {}}, {}, true);
+        rootPath(), string_t{"hello", {}}, {});
 
     auto result = db.verify(rootPath(), {}, state);
     ASSERT_TRUE(result.has_value());
@@ -57,12 +57,12 @@ TEST_F(TraceCacheIntegrationTest, MultipleContextHashes_Isolated)
     // Use separate TraceStore instances with different context hashes (BSàlC: isolated trace stores)
     {
         TraceStore db1(state.symbols, *state.traceCtx->pools, state.traceCtx->getVocabStore(state.symbols), 111);
-        db1.record(rootPath(), string_t{"value-1", {}}, {}, true);
+        db1.record(rootPath(), string_t{"value-1", {}}, {});
     }
 
     {
         TraceStore db2(state.symbols, *state.traceCtx->pools, state.traceCtx->getVocabStore(state.symbols), 222);
-        db2.record(rootPath(), string_t{"value-2", {}}, {}, true);
+        db2.record(rootPath(), string_t{"value-2", {}}, {});
     }
 
     // Verify isolation: each context hash sees its own trace result
@@ -90,12 +90,12 @@ TEST_F(TraceCacheIntegrationTest, ParentChild_AttrChain)
 
     db.record(
         rootPath(), attrs_t{{createSymbol("child")}},
-        {}, true);
+        {});
 
     auto childPathId = vpath({"child"});
     db.record(
         childPathId, int_t{NixInt{42}},
-        {}, false);
+        {});
 
     // Verification for child should work (BSàlC: verify child trace with parent hint)
     auto result = db.verify(childPathId, {}, state);
@@ -114,11 +114,11 @@ TEST_F(TraceCacheIntegrationTest, ParentChild_ValidationCascade)
     auto & p = *state.traceCtx->pools;
     auto dep = makeEnvVarDep(p, "NIX_INT_TEST_VAR", "valid");
     db.record(
-        rootPath(), null_t{}, {dep}, true);
+        rootPath(), null_t{}, {dep});
 
     // Child trace with no deps — always valid (separated dep ownership)
     auto childResult = db.record(
-        vpath({"child"}), int_t{NixInt{1}}, {}, false);
+        vpath({"child"}), int_t{NixInt{1}}, {});
 
     EXPECT_TRUE(db.verifyTrace(childResult.traceId, {}, state));
 }
@@ -132,11 +132,11 @@ TEST_F(TraceCacheIntegrationTest, ChildSurvivesParentInvalidation)
     // Parent trace with stale dep (hash doesn't match current oracle state)
     auto & p = *state.traceCtx->pools;
     auto staleDep = makeEnvVarDep(p, "NIX_INT_CASCADE", "old_value");
-    db.record(rootPath(), null_t{}, {staleDep}, true);
+    db.record(rootPath(), null_t{}, {staleDep});
 
     // Child with no direct deps
     auto childResult = db.record(
-        vpath({"child"}), int_t{NixInt{1}}, {}, false);
+        vpath({"child"}), int_t{NixInt{1}}, {});
 
     // With separated deps, child has no deps → always valid
     // Parent invalidation no longer cascades to children
@@ -268,7 +268,7 @@ TEST_F(TraceCacheIntegrationTest, SessionCache_TraceVerification_SkipsRevalidati
     auto & p = *state.traceCtx->pools;
     auto dep = makeEnvVarDep(p, "NIX_EVAL_SESSION", "ok");
     auto result = db.record(
-        rootPath(), null_t{}, {dep}, true);
+        rootPath(), null_t{}, {dep});
 
     // Recording adds to verifiedTraceIds for non-volatile deps (Salsa: memoize verified query)
     EXPECT_TRUE(db.verifiedTraceIds.count(result.traceId));
@@ -288,7 +288,7 @@ TEST_F(TraceCacheIntegrationTest, SessionCache_VolatileDep_NotCached)
     auto & p = *state.traceCtx->pools;
     auto dep = makeCurrentTimeDep(p);
     auto result = db.record(
-        rootPath(), null_t{}, {dep}, true);
+        rootPath(), null_t{}, {dep});
 
     // Volatile deps should NOT be session-memoized (Salsa: no memoization for volatile)
     EXPECT_FALSE(db.verifiedTraceIds.count(result.traceId));
@@ -311,14 +311,14 @@ TEST_F(TraceCacheIntegrationTest, Recovery_AfterDepChange)
     {
         ScopedEnvVar env("NIX_RECOVERY_TEST", "v1");
         auto dep = makeEnvVarDep(p, "NIX_RECOVERY_TEST", "v1");
-        v1Result = db.record(rootPath(), string_t{"result-v1", {}}, {dep}, true);
+        v1Result = db.record(rootPath(), string_t{"result-v1", {}}, {dep});
     }
 
     // Step 2: Record trace with v2
     {
         ScopedEnvVar env("NIX_RECOVERY_TEST", "v2");
         auto dep = makeEnvVarDep(p, "NIX_RECOVERY_TEST", "v2");
-        db.record(rootPath(), string_t{"result-v2", {}}, {dep}, true);
+        db.record(rootPath(), string_t{"result-v2", {}}, {dep});
     }
 
     // Step 3: Revert to v1 — trigger constructive recovery
@@ -348,7 +348,7 @@ TEST_F(TraceCacheIntegrationTest, Recovery_VolatileFails)
     auto & p = *state.traceCtx->pools;
     auto dep = makeCurrentTimeDep(p);
     auto storeResult = db.record(
-        rootPath(), null_t{}, {dep}, true);
+        rootPath(), null_t{}, {dep});
 
     // Clear session memo cache
     db.clearSessionCaches();

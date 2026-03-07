@@ -24,6 +24,7 @@ headers = [ config_pub_h ] + files(
   'eval-trace/store/trace-store.hh',
   'eval-trace/result.hh',
   'eval-trace/data/traced-data.hh',
+  'eval-trace/toml-canonical.hh',
   'eval-error.hh',
   'eval-gc.hh',
   'eval-inline.hh',

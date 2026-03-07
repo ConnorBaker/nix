@@ -39,7 +39,7 @@ TEST_F(TraceStoreTest, CopiedPath_VerifyPassesWhenFileUnchanged)
 
     db.record(rootPath(), string_t{"result", {}}, {
         makeCopiedPathDep(pools(), file.path.string(), baseName, storePath),
-    }, true);
+    });
 
     db.clearSessionCaches();
 
@@ -58,7 +58,7 @@ TEST_F(TraceStoreTest, CopiedPath_VerifyFailsWhenFileChanges)
 
     db.record(rootPath(), string_t{"result", {}}, {
         makeCopiedPathDep(pools(), file.path.string(), baseName, storePath),
-    }, true);
+    });
 
     // Modify file → store path changes → verification fails
     file.modify("copiedpath_verify_modified_content");
@@ -80,7 +80,7 @@ TEST_F(TraceStoreTest, CopiedPath_VerifyFailsWhenFileDeleted)
 
     db.record(rootPath(), string_t{"result", {}}, {
         makeCopiedPathDep(pools(), file.path.string(), baseName, storePath),
-    }, true);
+    });
 
     std::filesystem::remove(file.path);
     getFSSourceAccessor()->invalidateCache(CanonPath(file.path.string()));
@@ -108,13 +108,13 @@ TEST_F(TraceStoreTest, CopiedPath_DirectHashRecovery)
     db.record(rootPath(), string_t{"result_a1", {}}, {
         makeEnvVarDep(pools(), "NIX_CPDH_A", "a1"),
         makeCopiedPathDep(pools(), file.path.string(), baseName, storePath),
-    }, true);
+    });
 
     setenv("NIX_CPDH_A", "a2", 1);
     db.record(rootPath(), string_t{"result_a2", {}}, {
         makeEnvVarDep(pools(), "NIX_CPDH_A", "a2"),
         makeCopiedPathDep(pools(), file.path.string(), baseName, storePath),
-    }, true);
+    });
 
     setenv("NIX_CPDH_A", "a1", 1);
     db.clearSessionCaches();
@@ -143,13 +143,13 @@ TEST_F(TraceStoreTest, CopiedPath_StructVariantRecovery)
     db.record(rootPath(), string_t{"result_with_copied", {}}, {
         makeEnvVarDep(pools(), "NIX_CPSV_A", "aval"),
         makeCopiedPathDep(pools(), file.path.string(), baseName, storePath),
-    }, true);
+    });
 
     // T2: EnvVar(A) + EnvVar(B) — different structure, no CopiedPath
     db.record(rootPath(), string_t{"result_envonly", {}}, {
         makeEnvVarDep(pools(), "NIX_CPSV_A", "aval"),
         makeEnvVarDep(pools(), "NIX_CPSV_B", "bval"),
-    }, true);
+    });
 
     setenv("NIX_CPSV_B", "bval_new", 1);
     db.clearSessionCaches();
@@ -174,12 +174,12 @@ TEST_F(TraceStoreTest, CopiedPath_StructVariantWithSharedKey)
     db.record(rootPath(), string_t{"result_C", {}}, {
         makeCopiedPathDep(pools(), file.path.string(), baseName, storePath),
         makeEnvVarDep(pools(), "NIX_CPSK_C", "cval"),
-    }, true);
+    });
 
     db.record(rootPath(), string_t{"result_B", {}}, {
         makeCopiedPathDep(pools(), file.path.string(), baseName, storePath),
         makeEnvVarDep(pools(), "NIX_CPSK_B", "bval"),
-    }, true);
+    });
 
     setenv("NIX_CPSK_B", "bval_new", 1);
     db.clearSessionCaches();
@@ -205,12 +205,12 @@ TEST_F(TraceStoreTest, CopiedPath_StructVariantMissingFile)
     // T1: CopiedPath(file) — variant
     db.record(rootPath(), string_t{"result_cp", {}}, {
         makeCopiedPathDep(pools(), file.path.string(), baseName, storePath),
-    }, true);
+    });
 
     // T2: EnvVar(B) — current trace
     db.record(rootPath(), string_t{"result_env", {}}, {
         makeEnvVarDep(pools(), "NIX_CPMF_B", "bval"),
-    }, true);
+    });
 
     // Delete file AND invalidate B → both traces fail verification
     std::filesystem::remove(file.path);

@@ -350,7 +350,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
 
     // Record ROOT trace with zero deps (typical for ROOT)
     // rootPath() provided by fixture
-    db.record(rootPath(), CachedResult(attrs_t{}), {}, true);
+    db.record(rootPath(), CachedResult(attrs_t{}), {});
     auto rootHash = db.getCurrentTraceHash(rootPath());
     ASSERT_TRUE(rootHash.has_value());
 
@@ -362,7 +362,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
         {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string())}, DepHashValue(fileHash)},
         makeParentContextDep(rootPath(), *rootHash),
     };
-    db.record(xPathId, CachedResult(int_t{NixInt(11)}), xDeps, false);
+    db.record(xPathId, CachedResult(int_t{NixInt(11)}), xDeps);
     auto xHash = db.getCurrentTraceHash(xPathId);
     ASSERT_TRUE(xHash.has_value());
 
@@ -371,7 +371,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_FileChange_Detected)
     std::vector<Dep> yDeps = {
         makeParentContextDep(vpath({"x"}), *xHash),
     };
-    db.record(yPathId, CachedResult(int_t{NixInt(10)}), yDeps, false);
+    db.record(yPathId, CachedResult(int_t{NixInt(10)}), yDeps);
 
     // Before file change: y should verify (chain is valid)
     db.clearSessionCaches();
@@ -398,7 +398,7 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_NoChange_StillValid)
     TempExtFile dataFile("json", "42");
     auto db = makeDb();
 
-    db.record(rootPath(), CachedResult(attrs_t{}), {}, true);
+    db.record(rootPath(), CachedResult(attrs_t{}), {});
     auto rootHash = db.getCurrentTraceHash(rootPath());
     ASSERT_TRUE(rootHash.has_value());
 
@@ -407,13 +407,13 @@ TEST_F(DepStabilityStoreTest, PerSiblingChain_NoChange_StillValid)
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
     db.record(xPathId, CachedResult(int_t{NixInt(42)}),
         {{{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string())}, DepHashValue(fileHash)},
-         makeParentContextDep(rootPath(), *rootHash)}, false);
+         makeParentContextDep(rootPath(), *rootHash)});
     auto xHash = db.getCurrentTraceHash(xPathId);
     ASSERT_TRUE(xHash.has_value());
 
     auto yPathId = vpath({"y"});
     db.record(yPathId, CachedResult(int_t{NixInt(41)}),
-        {makeParentContextDep(vpath({"x"}), *xHash)}, false);
+        {makeParentContextDep(vpath({"x"}), *xHash)});
 
     db.clearSessionCaches();
     auto yVerify = db.verify(yPathId, {}, state);
@@ -436,7 +436,7 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
     auto db = makeDb();
 
     // ROOT: stable (no deps that change)
-    db.record(rootPath(), CachedResult(attrs_t{}), {}, true);
+    db.record(rootPath(), CachedResult(attrs_t{}), {});
     auto rootHash = db.getCurrentTraceHash(rootPath());
     ASSERT_TRUE(rootHash.has_value());
 
@@ -446,16 +446,14 @@ TEST_F(DepStabilityStoreTest, Recovery_MustNotBypassRecursiveParentContextVerifi
         SourcePath(getFSSourceAccessor(), CanonPath(dataFile.path.string())));
     db.record(xPathId, CachedResult(string_t{"x_v1", {}}),
         {{{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(dataFile.path.string())}, DepHashValue(fileHash)},
-         makeParentContextDep(rootPath(), *rootHash)},
-        false);
+         makeParentContextDep(rootPath(), *rootHash)});
     auto xHash = db.getCurrentTraceHash(xPathId);
     ASSERT_TRUE(xHash.has_value());
 
     // y: per-sibling ParentContext dep on x only
     auto yPathId = vpath({"y"});
     db.record(yPathId, CachedResult(string_t{"y_v1", {}}),
-        {makeParentContextDep(vpath({"x"}), *xHash)},
-        false);
+        {makeParentContextDep(vpath({"x"}), *xHash)});
 
     // Verify y before change -- should pass
     db.clearSessionCaches();
@@ -493,7 +491,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     auto db = makeDb();
 
     // ROOT trace: no deps (stable)
-    db.record(rootPath(), CachedResult(attrs_t{}), {}, true);
+    db.record(rootPath(), CachedResult(attrs_t{}), {});
     auto rootTraceHash = db.getCurrentTraceHash(rootPath());
     ASSERT_TRUE(rootTraceHash.has_value());
 
@@ -503,8 +501,7 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     auto xPathId = vpath({"x"});
     db.record(xPathId, CachedResult(int_t{NixInt(11)}),
         {{{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(depAFile.path.string())}, DepHashValue(depAHash)},
-         makeParentContextDep(rootPath(), *rootTraceHash)},
-        false);
+         makeParentContextDep(rootPath(), *rootTraceHash)});
     auto xTraceHash = db.getCurrentTraceHash(xPathId);
     ASSERT_TRUE(xTraceHash.has_value());
 
@@ -514,14 +511,12 @@ TEST_F(DepStabilityStoreTest, UnrelatedInputChange_DoesNotInvalidateSibling)
     auto zPathId = vpath({"z"});
     db.record(zPathId, CachedResult(int_t{NixInt(99)}),
         {{{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(depBFile.path.string())}, DepHashValue(depBHash)},
-         makeParentContextDep(rootPath(), *rootTraceHash)},
-        false);
+         makeParentContextDep(rootPath(), *rootTraceHash)});
 
     // "y" trace: per-sibling dep on x only (y = x - 1, doesn't touch z)
     auto yPathId = vpath({"y"});
     db.record(yPathId, CachedResult(int_t{NixInt(10)}),
-        {makeParentContextDep(vpath({"x"}), *xTraceHash)},
-        false);
+        {makeParentContextDep(vpath({"x"}), *xTraceHash)});
 
     // Simulate lockfile change: depB changes, depA stays the same.
     depBFile.modify("{ z = 100; }");

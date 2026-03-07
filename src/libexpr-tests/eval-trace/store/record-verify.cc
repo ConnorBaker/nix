@@ -33,7 +33,7 @@ TEST_F(TraceStoreTest, DepTypeName_AllTypes)
 TEST_F(TraceStoreTest, Record_ReturnsTraceId)
 {
     auto db = makeDb();
-    auto result = db.record(rootPath(), string_t{"hello", {}}, {}, true);
+    auto result = db.record(rootPath(), string_t{"hello", {}}, {});
     // Trace recording returns a positive trace identifier (BSàlC: trace key)
     EXPECT_GT(result.traceId.value, 0u);
 }
@@ -41,7 +41,7 @@ TEST_F(TraceStoreTest, Record_ReturnsTraceId)
 TEST_F(TraceStoreTest, ColdStore_AttrExists)
 {
     auto db = makeDb();
-    db.record(rootPath(), string_t{"hello", {}}, {}, true);
+    db.record(rootPath(), string_t{"hello", {}}, {});
 
     EXPECT_TRUE(db.attrExists(rootPath()));
     EXPECT_FALSE(db.attrExists(vpath({"nonexistent"})));
@@ -55,7 +55,7 @@ TEST_F(TraceStoreTest, ColdStore_WithDeps)
         makeEnvVarDep(pools(), "HOME", "/home"),
     };
 
-    auto result = db.record(rootPath(), int_t{NixInt{42}}, deps, true);
+    auto result = db.record(rootPath(), int_t{NixInt{42}}, deps);
 
     auto loadedDeps = db.loadFullTrace(result.traceId);
     EXPECT_EQ(loadedDeps.size(), 2u);
@@ -66,7 +66,7 @@ TEST_F(TraceStoreTest, ColdStore_VolatileDep_NotSessionCached)
     auto db = makeDb();
     std::vector<Dep> deps = {makeCurrentTimeDep(pools())};
 
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
 
     // Volatile dep (CurrentTime) -> trace NOT marked as verified in session (Salsa: no memoization)
     EXPECT_FALSE(db.verifiedTraceIds.count(result.traceId));
@@ -77,7 +77,7 @@ TEST_F(TraceStoreTest, ColdStore_NonVolatile_SessionCached)
     auto db = makeDb();
     std::vector<Dep> deps = {makeContentDep(pools(), "/a.nix", "a")};
 
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
 
     // Non-volatile dep -> trace marked as verified in session (Salsa: memoized query result)
     EXPECT_TRUE(db.verifiedTraceIds.count(result.traceId));
@@ -91,7 +91,7 @@ TEST_F(TraceStoreTest, ColdStore_ParentContextStored)
         Dep::makeParentContext(AttrPathId{}, DepHashValue(std::string("parent-hash"))),
     };
 
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
 
     auto loadedDeps = db.loadFullTrace(result.traceId);
     // ParentContext deps are now stored (dep separation: children reference parent result hash)
@@ -104,11 +104,11 @@ TEST_F(TraceStoreTest, ColdStore_WithParent)
 
     // Record parent trace (BSàlC: trace for root key)
     db.record(rootPath(), string_t{"parent-val", {}},
-              {makeContentDep(pools(), "/a.nix", "a")}, true);
+              {makeContentDep(pools(), "/a.nix", "a")});
 
     // Record child trace — own deps only, no parent dep inheritance
     auto childResult = db.record(vpath({"child"}), string_t{"child-val", {}},
-                                 {makeEnvVarDep(pools(), "FOO", "bar")}, false);
+                                 {makeEnvVarDep(pools(), "FOO", "bar")});
 
     // loadFullTrace returns only the child's own deps (no parent merging)
     auto childDeps = db.loadFullTrace(childResult.traceId);
@@ -123,8 +123,8 @@ TEST_F(TraceStoreTest, ColdStore_Deterministic)
     std::vector<Dep> deps = {makeContentDep(pools(), "/a.nix", "a")};
     CachedResult value = string_t{"result", {}};
 
-    auto r1 = db.record(rootPath(), value, deps, true);
-    auto r2 = db.record(rootPath(), value, deps, true);
+    auto r1 = db.record(rootPath(), value, deps);
+    auto r2 = db.record(rootPath(), value, deps);
 
     // Same deps + same parent -> same trace (content-addressed deduplication)
     EXPECT_EQ(r1.traceId, r2.traceId);
@@ -136,7 +136,7 @@ TEST_F(TraceStoreTest, ColdStore_AllValueTypes)
 
     auto testRoundtrip = [&](const CachedResult & value, std::string_view name) {
         auto pathId = vpath({name});
-        db.record(pathId, value, {}, false);
+        db.record(pathId, value, {});
 
         auto result = db.verify(pathId, {}, state);
         ASSERT_TRUE(result.has_value()) << "verify failed for " << name;
@@ -165,8 +165,8 @@ TEST_F(TraceStoreTest, TraceDedup_IdenticalDeps)
     std::vector<Dep> deps = {makeContentDep(pools(), "/shared.nix", "shared")};
 
     // Two root attributes with identical deps should share the same trace (BSàlC: trace sharing)
-    auto r1 = db.record(vpath({"a"}), string_t{"val1", {}}, deps, false);
-    auto r2 = db.record(vpath({"b"}), string_t{"val2", {}}, deps, false);
+    auto r1 = db.record(vpath({"a"}), string_t{"val1", {}}, deps);
+    auto r2 = db.record(vpath({"b"}), string_t{"val2", {}}, deps);
 
     // Both should share the same trace ID (content-addressed)
     EXPECT_EQ(r1.traceId, r2.traceId);
@@ -180,7 +180,7 @@ TEST_F(TraceStoreTest, EmptyTrace_HasDbRow)
     // Attributes with zero deps must still get a trace row (BSàlC: empty trace is valid)
     auto db = makeDb();
 
-    auto result = db.record(rootPath(), string_t{"val", {}}, {}, true);
+    auto result = db.record(rootPath(), string_t{"val", {}}, {});
 
     // Loading a trace with no deps should return empty vector (not fail)
     auto deps = db.loadFullTrace(result.traceId);
@@ -198,7 +198,7 @@ TEST_F(TraceStoreTest, VerifyTrace_EnvVar_Valid)
 
     auto db = makeDb();
     std::vector<Dep> deps = {makeEnvVarDep(pools(), "NIX_TEST_CACHE_VAR", "expected_value")};
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
 
     // Clear session memo cache so verifyTrace re-checks all deps (Salsa: force re-verification)
     db.clearSessionCaches();
@@ -214,7 +214,7 @@ TEST_F(TraceStoreTest, VerifyTrace_EnvVar_Invalid)
     auto db = makeDb();
     // Record trace with OLD expected hash — current env has a different value
     std::vector<Dep> deps = {makeEnvVarDep(pools(), "NIX_TEST_CACHE_VAR", "old_value")};
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
 
     // Clear session memo cache so verifyTrace re-checks all deps (Salsa: force re-verification)
     db.clearSessionCaches();
@@ -227,7 +227,7 @@ TEST_F(TraceStoreTest, VerifyTrace_CurrentTime_AlwaysFails)
 {
     auto db = makeDb();
     std::vector<Dep> deps = {makeCurrentTimeDep(pools())};
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
 
     // CurrentTime is volatile — verification always fails (Shake: always-dirty rule)
     bool valid = db.verifyTrace(result.traceId, {}, state);
@@ -238,7 +238,7 @@ TEST_F(TraceStoreTest, VerifyTrace_Exec_AlwaysFails)
 {
     auto db = makeDb();
     std::vector<Dep> deps = {makeExecDep(pools())};
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
 
     bool valid = db.verifyTrace(result.traceId, {}, state);
     EXPECT_FALSE(valid);
@@ -250,7 +250,7 @@ TEST_F(TraceStoreTest, VerifyTrace_SessionCacheHit)
 
     auto db = makeDb();
     std::vector<Dep> deps = {makeEnvVarDep(pools(), "NIX_TEST_CACHE_VAR2", "val")};
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
 
     // Recording with non-volatile deps should session-memo the trace (Salsa: memoization)
     EXPECT_TRUE(db.verifiedTraceIds.count(result.traceId));
@@ -261,7 +261,7 @@ TEST_F(TraceStoreTest, VerifyTrace_SessionCacheHit)
 TEST_F(TraceStoreTest, VerifyTrace_NoDeps_Valid)
 {
     auto db = makeDb();
-    auto result = db.record(rootPath(), string_t{"val", {}}, {}, true);
+    auto result = db.record(rootPath(), string_t{"val", {}}, {});
 
     db.clearSessionCaches();
 
@@ -277,11 +277,11 @@ TEST_F(TraceStoreTest, VerifyTrace_ParentInvalid_ChildSurvives)
 
     // Record parent trace with stale dep
     std::vector<Dep> staleDeps = {makeEnvVarDep(pools(), "NIX_TEST_PARENT", "stale_value")};
-    db.record(rootPath(), string_t{"parent", {}}, staleDeps, true);
+    db.record(rootPath(), string_t{"parent", {}}, staleDeps);
 
     // Record child with no direct deps — child has no deps to invalidate
     auto childResult = db.record(vpath({"child"}), string_t{"child", {}},
-                                 {}, false);
+                                 {});
 
     // Clear session memo cache
     db.clearSessionCaches();
@@ -301,11 +301,11 @@ TEST_F(TraceStoreTest, VerifyTrace_ParentValid)
     // Record parent trace with correct dep (BSàlC: verifying trace succeeds)
     std::vector<Dep> parentDeps = {makeEnvVarDep(pools(), "NIX_TEST_PARENT", "correct_value")};
     db.record(rootPath(), string_t{"parent", {}},
-              parentDeps, true);
+              parentDeps);
 
     // Record child with valid parent (Shake: transitive clean)
     auto childResult = db.record(vpath({"child"}), string_t{"child", {}},
-                                 {}, false);
+                                 {});
 
     // Clear session memo cache
     db.clearSessionCaches();
@@ -324,7 +324,7 @@ TEST_F(TraceStoreTest, VerifyTrace_MultipleDeps_OneInvalid)
         makeEnvVarDep(pools(), "NIX_TEST_VALID", "current_value"),  // dep hash matches current
         makeEnvVarDep(pools(), "NIX_TEST_STALE", "old_value"),      // dep hash stale (Shake: dirty input)
     };
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
 
     db.clearSessionCaches();
 
@@ -342,7 +342,7 @@ TEST_F(TraceStoreTest, ColdWarm_Roundtrip)
     CachedResult input = string_t{"cached value", {}};
     std::vector<Dep> deps = {makeEnvVarDep(pools(), "NIX_WARM_TEST", "stable")};
 
-    db.record(rootPath(), input, deps, true);
+    db.record(rootPath(), input, deps);
 
     // Verification should find and validate the recorded trace (BSàlC: verify trace)
     auto result = db.verify(rootPath(), {}, state);
@@ -358,7 +358,7 @@ TEST_F(TraceStoreTest, RecordVerify_Roundtrip_TraceId)
     CachedResult input = int_t{NixInt{99}};
     std::vector<Dep> deps = {makeEnvVarDep(pools(), "NIX_WARM_TEST2", "stable")};
 
-    auto coldResult = db.record(rootPath(), input, deps, true);
+    auto coldResult = db.record(rootPath(), input, deps);
 
     auto result = db.verify(rootPath(), {}, state);
     ASSERT_TRUE(result.has_value());
@@ -381,7 +381,7 @@ TEST_F(TraceStoreTest, WarmPath_InvalidatedDeps)
 
     auto db = makeDb();
     std::vector<Dep> deps = {makeEnvVarDep(pools(), "NIX_WARM_INVALID", "value1")};
-    db.record(rootPath(), string_t{"old", {}}, deps, true);
+    db.record(rootPath(), string_t{"old", {}}, deps);
 
     // Change env var — invalidates the recorded dep hash
     setenv("NIX_WARM_INVALID", "value2", 1);

@@ -310,59 +310,7 @@ TraceStore::TraceStore(SymbolTable & symbols, InterningPools & pools, AttrVocabS
         StatHashStore::instance().load(std::move(entries));
     }
 
-    // Bulk-load all interned entities into in-memory maps.
-    // Done here (not via bulkLoadAll()) because st already holds the lock.
-    {
-        auto use(st->getAllStrings.use());
-        while (use.next()) {
-            auto id = static_cast<uint32_t>(use.getInt(0));
-            auto value = use.getStr(1);
-            pools.strings.bulkLoad(id, value);
-            if (id > flushedStringHighWaterMark)
-                flushedStringHighWaterMark = id;
-        }
-    }
-    {
-        auto use(st->getAllResults.use());
-        while (use.next()) {
-            auto id = ResultId(static_cast<uint32_t>(use.getInt(0)));
-            auto [hashBlob, hashSize] = use.getBlob(4);
-            if (hashBlob && hashSize == 32) {
-                auto h = readRawHash(hashBlob, hashSize);
-                resultByHash[h] = id;
-            }
-            if (id > nextResultId) nextResultId = id;
-        }
-    }
-    {
-        auto use(st->getAllDepKeySets.use());
-        while (use.next()) {
-            auto id = DepKeySetId(static_cast<uint32_t>(use.getInt(0)));
-            auto [hashBlob, hashSize] = use.getBlob(1);
-            if (hashBlob && hashSize == 32) {
-                auto h = readRawHash(hashBlob, hashSize);
-                depKeySetByStructHash[h] = id;
-            }
-            if (id > nextDepKeySetId) nextDepKeySetId = id;
-        }
-    }
-    {
-        auto use(st->getAllTraces.use());
-        while (use.next()) {
-            auto id = TraceId(static_cast<uint32_t>(use.getInt(0)));
-            auto [hashBlob, hashSize] = use.getBlob(1);
-            if (hashBlob && hashSize == 32) {
-                auto h = readRawHash(hashBlob, hashSize);
-                traceByTraceHash[h] = id;
-            }
-            if (id > nextTraceId) nextTraceId = id;
-        }
-    }
-    {
-        auto use(st->getAllDirSets.use());
-        while (use.next())
-            pools.dirSets.emplace(std::string(use.getStr(0)), std::string(use.getStr(1)));
-    }
+    bulkLoadAllLocked(*st);
 
     _state = std::move(state);
 
@@ -434,13 +382,10 @@ void TraceStore::clearSessionCaches()
 
 // ── Bulk load / flush ────────────────────────────────────────────────
 
-void TraceStore::bulkLoadAll()
+void TraceStore::bulkLoadAllLocked(State & st)
 {
-    auto st(_state->lock());
-
-    // Load Strings into the shared StringInternTable
     {
-        auto use(st->getAllStrings.use());
+        auto use(st.getAllStrings.use());
         while (use.next()) {
             auto id = static_cast<uint32_t>(use.getInt(0));
             auto value = use.getStr(1);
@@ -449,10 +394,8 @@ void TraceStore::bulkLoadAll()
                 flushedStringHighWaterMark = id;
         }
     }
-
-    // Load Results: populate hash → id dedup map
     {
-        auto use(st->getAllResults.use());
+        auto use(st.getAllResults.use());
         while (use.next()) {
             auto id = ResultId(static_cast<uint32_t>(use.getInt(0)));
             auto [hashBlob, hashSize] = use.getBlob(4);
@@ -463,10 +406,8 @@ void TraceStore::bulkLoadAll()
             if (id > nextResultId) nextResultId = id;
         }
     }
-
-    // Load DepKeySets: populate struct_hash → id dedup map
     {
-        auto use(st->getAllDepKeySets.use());
+        auto use(st.getAllDepKeySets.use());
         while (use.next()) {
             auto id = DepKeySetId(static_cast<uint32_t>(use.getInt(0)));
             auto [hashBlob, hashSize] = use.getBlob(1);
@@ -477,10 +418,8 @@ void TraceStore::bulkLoadAll()
             if (id > nextDepKeySetId) nextDepKeySetId = id;
         }
     }
-
-    // Load Traces: populate trace_hash → id dedup map
     {
-        auto use(st->getAllTraces.use());
+        auto use(st.getAllTraces.use());
         while (use.next()) {
             auto id = TraceId(static_cast<uint32_t>(use.getInt(0)));
             auto [hashBlob, hashSize] = use.getBlob(1);
@@ -491,13 +430,17 @@ void TraceStore::bulkLoadAll()
             if (id > nextTraceId) nextTraceId = id;
         }
     }
-
-    // Load DirSets: populate dsHash → dirs JSON cache
     {
-        auto use(st->getAllDirSets.use());
+        auto use(st.getAllDirSets.use());
         while (use.next())
             pools.dirSets.emplace(std::string(use.getStr(0)), std::string(use.getStr(1)));
     }
+}
+
+void TraceStore::bulkLoadAll()
+{
+    auto st(_state->lock());
+    bulkLoadAllLocked(*st);
 }
 
 void TraceStore::flush()
@@ -1118,8 +1061,7 @@ std::optional<Hash> TraceStore::getCurrentTraceHash(AttrPathId pathId)
 TraceStore::RecordResult TraceStore::record(
     AttrPathId pathId,
     const CachedResult & value,
-    const std::vector<Dep> & allDeps,
-    bool isRoot)
+    const std::vector<Dep> & allDeps)
 {
     auto recordStart = timerStart();
     nrRecords++;

@@ -40,7 +40,7 @@ TEST_F(TraceStoreTest, GitIdentity_RecordAndLoad_DepStructure)
         makeGitIdentityDep(pools(), "/tmp/repo", "rev-abc123"),
     };
 
-    auto result = db.record(rootPath(), int_t{NixInt{42}}, deps, true);
+    auto result = db.record(rootPath(), int_t{NixInt{42}}, deps);
     auto loaded = db.loadFullTrace(result.traceId);
     ASSERT_EQ(loaded.size(), 2u);
 
@@ -87,7 +87,7 @@ TEST_F(TraceStoreTest, GitIdentity_ContentPasses_GitUnresolvable_Valid)
         makeGitIdentityDep(pools(), "/nonexistent/repo", "rev-OLD"),
     };
 
-    auto result = db.record(rootPath(), string_t{"hello", {}}, deps, true);
+    auto result = db.record(rootPath(), string_t{"hello", {}}, deps);
     db.verifiedTraceIds.clear();
 
     bool ok = db.verifyTrace(result.traceId, {}, state);
@@ -118,7 +118,7 @@ TEST_F(TraceStoreTest, GitIdentity_ContentChanged_Invalid)
         makeGitIdentityDep(pools(), "/nonexistent/repo", "rev-abc"),
     };
 
-    auto result = db.record(rootPath(), string_t{"original content", {}}, deps, true);
+    auto result = db.record(rootPath(), string_t{"original content", {}}, deps);
     db.verifiedTraceIds.clear();
 
     // Modify file so Content dep fails
@@ -143,7 +143,7 @@ TEST_F(TraceStoreTest, GitIdentity_WithVolatile_AlwaysInvalid)
         makeGitIdentityDep(pools(), "/tmp/repo", "rev-abc123"),
     };
 
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
 
     // Volatile dep → NOT session-cached at record time
     EXPECT_FALSE(db.verifiedTraceIds.count(result.traceId));
@@ -163,7 +163,7 @@ TEST_F(TraceStoreTest, GitIdentity_WithExec_AlwaysInvalid)
         makeGitIdentityDep(pools(), "/tmp/repo", "rev-abc123"),
     };
 
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
     EXPECT_FALSE(db.verifiedTraceIds.count(result.traceId));
 
     bool ok = db.verifyTrace(result.traceId, {}, state);
@@ -187,7 +187,7 @@ TEST_F(TraceStoreTest, GitIdentity_OnlyDep_Valid)
         makeGitIdentityDep(pools(), "/nonexistent/repo", "rev-abc"),
     };
 
-    auto result = db.record(rootPath(), int_t{NixInt{1}}, deps, true);
+    auto result = db.record(rootPath(), int_t{NixInt{1}}, deps);
     db.verifiedTraceIds.clear();
 
     bool ok = db.verifyTrace(result.traceId, {}, state);
@@ -207,7 +207,7 @@ TEST_F(TraceStoreTest, GitIdentity_NormalDepFails_Invalid)
         makeGitIdentityDep(pools(), "/nonexistent/repo", "rev-abc"),
     };
 
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
     db.verifiedTraceIds.clear();
 
     // EnvVar "NIX_TEST_GIT_IDENTITY_XYZ" is unset → hash("") != hash("expected-value")
@@ -229,7 +229,7 @@ TEST_F(TraceStoreTest, GitIdentity_SystemDepPasses_GitMismatch_Valid)
         makeGitIdentityDep(pools(), "/nonexistent/repo", "rev-old"),
     };
 
-    auto result = db.record(rootPath(), null_t{}, deps, true);
+    auto result = db.record(rootPath(), null_t{}, deps);
     db.verifiedTraceIds.clear();
 
     bool ok = db.verifyTrace(result.traceId, {}, state);
@@ -255,7 +255,7 @@ TEST_F(TraceStoreTest, GitIdentity_MultiplePassingDeps_Valid)
         makeGitIdentityDep(pools(), "/nonexistent/repo", "rev-xyz"),
     };
 
-    auto result = db.record(rootPath(), string_t{"multi-dep test", {}}, deps, true);
+    auto result = db.record(rootPath(), string_t{"multi-dep test", {}}, deps);
 
     // Verify loaded trace has all 3 deps with correct types
     auto loaded = db.loadFullTrace(result.traceId);
@@ -298,7 +298,7 @@ TEST_F(TraceStoreTest, GitIdentity_TraceHashStableAcrossCommits)
         {{DepType::System, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>("")}, systemHash},
         makeGitIdentityDep(pools(), "/tmp/repo", "commit-1-rev"),
     };
-    auto result1 = db.record(rootPath(), string_t{"stable content", {}}, deps1, true);
+    auto result1 = db.record(rootPath(), string_t{"stable content", {}}, deps1);
 
     // Record with GitIdentity from "commit 2" (different fingerprint, same Content+System)
     std::vector<Dep> deps2 = {
@@ -306,7 +306,7 @@ TEST_F(TraceStoreTest, GitIdentity_TraceHashStableAcrossCommits)
         {{DepType::System, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>("")}, systemHash},
         makeGitIdentityDep(pools(), "/tmp/repo", "commit-2-rev"),
     };
-    auto result2 = db.record(rootPath(), string_t{"stable content", {}}, deps2, true);
+    auto result2 = db.record(rootPath(), string_t{"stable content", {}}, deps2);
 
     // Both recordings should produce the same trace_id (same trace_hash)
     EXPECT_EQ(result1.traceId, result2.traceId)
@@ -332,7 +332,7 @@ TEST_F(TraceStoreTest, GitIdentity_ParentContextChainSurvivesCommitChange)
         {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(filePath)}, contentHash},
         makeGitIdentityDep(pools(), "/tmp/repo", "commit-1"),
     };
-    auto rootResult = db.record(rootPath(), string_t{"root content", {}}, rootDeps1, true);
+    auto rootResult = db.record(rootPath(), string_t{"root content", {}}, rootDeps1);
 
     // Get root's trace_hash for the ParentContext dep
     auto rootTraceHash = db.getCurrentTraceHash(rootPath());
@@ -343,14 +343,14 @@ TEST_F(TraceStoreTest, GitIdentity_ParentContextChainSurvivesCommitChange)
     std::vector<Dep> childDeps = {
         makeParentContextDep(rootPath(), *rootTraceHash),
     };
-    auto childResult = db.record(childPath, int_t{NixInt{42}}, childDeps, false);
+    auto childResult = db.record(childPath, int_t{NixInt{42}}, childDeps);
 
     // Re-record root with commit 2 (different GitIdentity)
     std::vector<Dep> rootDeps2 = {
         {{DepType::Content, pools().intern<DepSourceId>(""), pools().intern<DepKeyId>(filePath)}, contentHash},
         makeGitIdentityDep(pools(), "/tmp/repo", "commit-2"),
     };
-    auto rootResult2 = db.record(rootPath(), string_t{"root content", {}}, rootDeps2, true);
+    auto rootResult2 = db.record(rootPath(), string_t{"root content", {}}, rootDeps2);
 
     // Root trace_hash should be unchanged (GitIdentity excluded from hash)
     auto rootTraceHash2 = db.getCurrentTraceHash(rootPath());

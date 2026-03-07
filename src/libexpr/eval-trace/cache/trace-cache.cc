@@ -4,6 +4,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-trace/context.hh"
+#include "nix/expr/eval-trace/deps/hash.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/eval-settings.hh"
@@ -365,6 +366,69 @@ static CachedResult buildCachedResult(EvalState & st, Value & target)
     unreachable();
 }
 
+// ── Origin re-internment and precomputed-keys helpers ────────────────
+
+namespace {
+
+struct PerOrigin {
+    PosTable::OriginHandle handle;
+    uint32_t attrCount = 0;
+};
+
+/**
+ * Re-intern cached origins into PosTable so downstream shape dep recording
+ * (SC #keys, #has:key, #type) works. Returns handles indexed by origin index.
+ */
+std::vector<PerOrigin> reinternOrigins(
+    const attrs_t & attrs, EvalState & st, InterningPools & pools)
+{
+    pools.sessionSymbols = &st.symbols;
+    std::vector<PerOrigin> handles;
+    handles.reserve(attrs.origins.size());
+    std::vector<uint32_t> counts(attrs.origins.size(), 0);
+    for (auto idx : attrs.originIndices)
+        if (idx >= 0) counts[idx]++;
+    for (auto & orig : attrs.origins) {
+        auto srcId = pools.intern<DepSourceId>(orig.depSource);
+        auto fpId = pools.filePathPool.intern(orig.depKey);
+        auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
+        auto handle = st.positions.addOriginHandle(
+            allocateProvenanceRef(pools, srcId, fpId, dpId, orig.format),
+            counts[&orig - attrs.origins.data()]);
+        handles.push_back({handle, 0});
+    }
+    return handles;
+}
+
+/**
+ * Register precomputed keys for each origin (mirrors ExprTracedData::eval()
+ * in json-to-value.cc). Computes canonical #keys hash per origin group.
+ */
+void registerAllPrecomputedKeys(
+    const attrs_t & attrs, const std::vector<PerOrigin> & originHandles,
+    EvalState & st, InterningPools & pools)
+{
+    for (size_t oidx = 0; oidx < attrs.origins.size(); oidx++) {
+        auto & orig = attrs.origins[oidx];
+        std::vector<std::string> keys;
+        for (size_t i = 0; i < attrs.names.size(); i++) {
+            if (!attrs.originIndices.empty() && attrs.originIndices[i] == static_cast<int8_t>(oidx))
+                keys.push_back(std::string(st.symbols[attrs.names[i]]));
+        }
+        auto nKeys = static_cast<uint32_t>(keys.size());
+        auto keysHash = canonicalKeysHash(std::move(keys));
+        auto srcId = pools.intern<DepSourceId>(orig.depSource);
+        auto fpId = pools.filePathPool.intern(orig.depKey);
+        auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
+        auto originOffset = originHandles[oidx].handle.offset;
+        registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
+            keysHash, nKeys, srcId, fpId, dpId, orig.format,
+        });
+    }
+}
+
+} // anonymous namespace
+
 // ── TracedExpr implementation (Adapton articulation points) ──────────
 
 void TracedExpr::materializeOrigExprAttrs(
@@ -387,31 +451,11 @@ void TracedExpr::materializeOrigExprAttrs(
     }
     auto & st = cache->state;
     auto bindings = st.buildBindings(attrs.names.size());
-
-    // When origins are present, re-intern and register with PosTable
-    // so that downstream shape dep recording (SC #keys, #has:key, #type) works.
-    struct PerOrigin {
-        PosTable::OriginHandle handle;
-        uint32_t attrCount = 0;
-    };
-    std::vector<PerOrigin> originHandles;
     auto & pools = *st.traceCtx->pools;
-    if (!attrs.origins.empty()) {
-        pools.sessionSymbols = &st.symbols;
-        originHandles.reserve(attrs.origins.size());
-        std::vector<uint32_t> counts(attrs.origins.size(), 0);
-        for (auto idx : attrs.originIndices)
-            if (idx >= 0) counts[idx]++;
-        for (auto & orig : attrs.origins) {
-            auto srcId = pools.intern<DepSourceId>(orig.depSource);
-            auto fpId = pools.filePathPool.intern(orig.depKey);
-            auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
-            auto handle = st.positions.addOriginHandle(
-                allocateProvenanceRef(pools, srcId, fpId, dpId, orig.format),
-                counts[&orig - attrs.origins.data()]);
-            originHandles.push_back({handle, 0});
-        }
-    }
+
+    std::vector<PerOrigin> originHandles;
+    if (!attrs.origins.empty())
+        originHandles = reinternOrigins(attrs, st, pools);
 
     for (size_t i = 0; i < attrs.names.size(); i++) {
         auto childName = attrs.names[i];
@@ -432,34 +476,8 @@ void TracedExpr::materializeOrigExprAttrs(
     }
     v.mkAttrs(bindings.finish());
 
-    // Register precomputed keys per origin (mirrors ExprTracedData::eval() in json-to-value.cc)
-    if (!attrs.origins.empty()) {
-        for (size_t oidx = 0; oidx < attrs.origins.size(); oidx++) {
-            auto & orig = attrs.origins[oidx];
-            // Collect sorted key names for this origin
-            std::vector<std::string> keys;
-            for (size_t i = 0; i < attrs.names.size(); i++) {
-                if (!attrs.originIndices.empty() && attrs.originIndices[i] == static_cast<int8_t>(oidx))
-                    keys.push_back(std::string(st.symbols[attrs.names[i]]));
-            }
-            std::sort(keys.begin(), keys.end());
-            std::string canonical;
-            for (size_t i = 0; i < keys.size(); i++) {
-                if (i > 0) canonical += '\0';
-                canonical += keys[i];
-            }
-            auto keysHash = depHash(canonical);
-            auto srcId = pools.intern<DepSourceId>(orig.depSource);
-            auto fpId = pools.filePathPool.intern(orig.depKey);
-            auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
-            auto originOffset = originHandles[oidx].handle.offset;
-            registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
-                keysHash,
-                static_cast<uint32_t>(keys.size()),
-                srcId, fpId, dpId, orig.format,
-            });
-        }
-    }
+    if (!attrs.origins.empty())
+        registerAllPrecomputedKeys(attrs, originHandles, st, pools);
 }
 
 // Replay trace (Adapton change propagation)
@@ -556,30 +574,11 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
 
     if (auto * attrs = std::get_if<attrs_t>(&cached)) {
         auto bindings = st.buildBindings(attrs->names.size());
-
-        // When origins are present, re-intern and register with PosTable for TracedData provenance
-        struct PerOrigin {
-            PosTable::OriginHandle handle;
-            uint32_t attrCount = 0;
-        };
-        std::vector<PerOrigin> originHandles;
         auto & pools = *st.traceCtx->pools;
-        if (!attrs->origins.empty()) {
-            pools.sessionSymbols = &st.symbols;
-            originHandles.reserve(attrs->origins.size());
-            std::vector<uint32_t> counts(attrs->origins.size(), 0);
-            for (auto idx : attrs->originIndices)
-                if (idx >= 0) counts[idx]++;
-            for (auto & orig : attrs->origins) {
-                auto srcId = pools.intern<DepSourceId>(orig.depSource);
-                auto fpId = pools.filePathPool.intern(orig.depKey);
-                auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
-                auto handle = st.positions.addOriginHandle(
-                    allocateProvenanceRef(pools, srcId, fpId, dpId, orig.format),
-                    counts[&orig - attrs->origins.data()]);
-                originHandles.push_back({handle, 0});
-            }
-        }
+
+        std::vector<PerOrigin> originHandles;
+        if (!attrs->origins.empty())
+            originHandles = reinternOrigins(*attrs, st, pools);
 
         for (size_t i = 0; i < attrs->names.size(); i++) {
             auto childName = attrs->names[i];
@@ -598,33 +597,8 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
         }
         v.mkAttrs(bindings.finish());
 
-        // Register precomputed keys per origin
-        if (!attrs->origins.empty()) {
-            for (size_t oidx = 0; oidx < attrs->origins.size(); oidx++) {
-                auto & orig = attrs->origins[oidx];
-                std::vector<std::string> keys;
-                for (size_t i = 0; i < attrs->names.size(); i++) {
-                    if (!attrs->originIndices.empty() && attrs->originIndices[i] == static_cast<int8_t>(oidx))
-                        keys.push_back(std::string(st.symbols[attrs->names[i]]));
-                }
-                std::sort(keys.begin(), keys.end());
-                std::string canonical;
-                for (size_t i = 0; i < keys.size(); i++) {
-                    if (i > 0) canonical += '\0';
-                    canonical += keys[i];
-                }
-                auto keysHash = depHash(canonical);
-                auto srcId = pools.intern<DepSourceId>(orig.depSource);
-                auto fpId = pools.filePathPool.intern(orig.depKey);
-                auto dpId = jsonStringToDataPathId(pools, orig.dataPath);
-                auto originOffset = originHandles[oidx].handle.offset;
-                registerPrecomputedKeys(originOffset, PrecomputedKeysInfo{
-                    keysHash,
-                    static_cast<uint32_t>(keys.size()),
-                    srcId, fpId, dpId, orig.format,
-                });
-            }
-        }
+        if (!attrs->origins.empty())
+            registerAllPrecomputedKeys(*attrs, originHandles, st, pools);
     } else if (auto * s = std::get_if<string_t>(&cached)) {
         if (s->second.empty())
             v.mkString(s->first, st.mem);
@@ -809,7 +783,7 @@ void TracedExpr::evaluateFresh(Value & v)
 
             try {
                 auto result = cache->dbBackend->record(
-                    pathId, failed_t{}, directDeps, !parentExpr);
+                    pathId, failed_t{}, directDeps);
                 ensureLazy().traceId = result.traceId;
             } catch (std::exception & e) {
                 debug("trace recording failed for '%s': %s", attrPathStr(), e.what());
@@ -842,7 +816,7 @@ void TracedExpr::evaluateFresh(Value & v)
         // Direct record — no deferred writes
         try {
             auto coldResult = cache->dbBackend->record(
-                pathId, attrValue, directDeps, !parentExpr);
+                pathId, attrValue, directDeps);
             ensureLazy().traceId = coldResult.traceId;
         } catch (std::exception & e) {
             debug("trace recording failed for '%s': %s", attrPathStr(), e.what());

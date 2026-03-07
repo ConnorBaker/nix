@@ -174,8 +174,8 @@ TEST_F(TraceStoreTest, DepKeySets_SharedKeysDifferentValues)
         makeEnvVarDep(pools(), "HOME", "/home/user2"),
     };
 
-    auto r1 = db.record(vpath({"attr"}), string_t{"result-1", {}}, depsV1, true);
-    auto r2 = db.record(vpath({"attr"}), string_t{"result-2", {}}, depsV2, true);
+    auto r1 = db.record(vpath({"attr"}), string_t{"result-1", {}}, depsV1);
+    auto r2 = db.record(vpath({"attr"}), string_t{"result-2", {}}, depsV2);
 
     // Different trace IDs (different hash values → different trace_hash)
     EXPECT_NE(r1.traceId, r2.traceId);
@@ -215,7 +215,7 @@ TEST_F(TraceStoreTest, CachedTraceData_HashesPopulated_AfterRecord)
     // After record(), traceDataCache should contain populated hashes.
     auto db = makeDb();
     auto result = db.record(vpath({"test"}), string_t{"value", {}},
-        {makeContentDep(pools(), "/a.nix", "hello")}, true);
+        {makeContentDep(pools(), "/a.nix", "hello")});
 
     auto it = db.traceDataCache.find(result.traceId);
     ASSERT_NE(it, db.traceDataCache.end());
@@ -231,7 +231,7 @@ TEST_F(TraceStoreTest, CachedTraceData_HashesPopulated_AfterEnsure)
     // getCurrentTraceHash calls ensureTraceHashes internally.
     auto db = makeDb();
     auto result = db.record(vpath({"test"}), string_t{"value", {}},
-        {makeContentDep(pools(), "/a.nix", "hello")}, true);
+        {makeContentDep(pools(), "/a.nix", "hello")});
 
     // Clear session caches to force re-read from DB
     db.traceDataCache.clear();
@@ -270,7 +270,7 @@ TEST_F(TraceStoreTest, LoadFullTrace_PopulatesHashes_Opportunistically)
     // loadFullTrace should populate traceHash + structHash + deps in one shot.
     auto db = makeDb();
     std::vector<Dep> deps = {makeContentDep(pools(), "/a.nix", "content")};
-    auto result = db.record(vpath({"test"}), string_t{"val", {}}, deps, true);
+    auto result = db.record(vpath({"test"}), string_t{"val", {}}, deps);
 
     // Clear caches, then use loadFullTrace (not ensureTraceHashes)
     db.traceDataCache.clear();
@@ -292,7 +292,7 @@ TEST_F(TraceStoreTest, TraceDataCache_EnsureThenLoad_SingleDbQuery)
     // reuse cached hashes. Hash fields should be identical regardless of order.
     auto db = makeDb();
     std::vector<Dep> deps = {makeContentDep(pools(), "/a.nix", "content")};
-    auto result = db.record(vpath({"test"}), string_t{"val", {}}, deps, true);
+    auto result = db.record(vpath({"test"}), string_t{"val", {}}, deps);
 
     // Record populates everything; get hashes for comparison
     auto itAfterRecord = db.traceDataCache.find(result.traceId);
@@ -326,7 +326,7 @@ TEST_F(TraceStoreTest, TraceRowCache_HitAfterRecord)
     // After record(), lookupTraceRow should hit the traceRowCache (no DB).
     auto db = makeDb();
     auto result = db.record(vpath({"myattr"}), string_t{"result", {}},
-        {makeEnvVarDep(pools(), "FOO", "bar")}, true);
+        {makeEnvVarDep(pools(), "FOO", "bar")});
 
     // traceRowCache should be populated from record()
     EXPECT_EQ(db.traceRowCache.count(vpath({"myattr"})), 1u)
@@ -341,7 +341,7 @@ TEST_F(TraceStoreTest, TraceRowCache_HitAfterLookup)
 {
     // After a lookupTraceRow miss that hits DB, cache should be populated.
     auto db = makeDb();
-    db.record(vpath({"attr"}), string_t{"val", {}}, {}, true);
+    db.record(vpath({"attr"}), string_t{"val", {}}, {});
 
     // Clear traceRowCache (simulate fresh session lookup, not record)
     db.traceRowCache.clear();
@@ -368,7 +368,7 @@ TEST_F(TraceStoreTest, GetCurrentTraceHash_CachedAfterFirstCall)
     // Record an attr using AttrPathId
     auto pathId = vpath({"packages", "hello"});
     db.record(pathId, string_t{"result", {}},
-        {makeContentDep(pools(), "/hello.nix", "v1")}, true);
+        {makeContentDep(pools(), "/hello.nix", "v1")});
 
     auto hash1 = db.getCurrentTraceHash(pathId);
     ASSERT_TRUE(hash1.has_value());
@@ -388,11 +388,11 @@ TEST_F(TraceStoreTest, TraceRowCache_InvalidatedOnRecovery)
 
     // Record version 1
     std::vector<Dep> depsV1 = {makeEnvVarDep(pools(), "MY_VAR", "v1")};
-    db.record(vpath({"attr"}), string_t{"result-v1", {}}, depsV1, true);
+    db.record(vpath({"attr"}), string_t{"result-v1", {}}, depsV1);
 
     // Record version 2 (different deps → different trace)
     std::vector<Dep> depsV2 = {makeEnvVarDep(pools(), "MY_VAR", "v2")};
-    db.record(vpath({"attr"}), string_t{"result-v2", {}}, depsV2, true);
+    db.record(vpath({"attr"}), string_t{"result-v2", {}}, depsV2);
 
     // Clear session caches to simulate new session
     db.clearSessionCaches();
@@ -433,11 +433,11 @@ TEST_F(TraceStoreTest, InMemoryRecovery_DirectHash)
     // Record two versions
     setenv("INTEST", "alpha", 1);
     std::vector<Dep> depsA = {makeEnvVarDep(pools(), "INTEST", "alpha")};
-    db.record(vpath({"attr"}), string_t{"result-alpha", {}}, depsA, true);
+    db.record(vpath({"attr"}), string_t{"result-alpha", {}}, depsA);
 
     setenv("INTEST", "beta", 1);
     std::vector<Dep> depsB = {makeEnvVarDep(pools(), "INTEST", "beta")};
-    db.record(vpath({"attr"}), string_t{"result-beta", {}}, depsB, true);
+    db.record(vpath({"attr"}), string_t{"result-beta", {}}, depsB);
 
     // Clear session caches
     db.clearSessionCaches();
@@ -463,7 +463,7 @@ TEST_F(TraceStoreTest, InMemoryRecovery_StructuralVariant)
     // Version 1: depends on VAR_A only
     setenv("SVR_A", "a1", 1);
     std::vector<Dep> depsV1 = {makeEnvVarDep(pools(), "SVR_A", "a1")};
-    db.record(vpath({"attr"}), string_t{"r1", {}}, depsV1, true);
+    db.record(vpath({"attr"}), string_t{"r1", {}}, depsV1);
 
     // Version 2: depends on VAR_A + VAR_B (different dep structure)
     setenv("SVR_A", "a2", 1);
@@ -472,7 +472,7 @@ TEST_F(TraceStoreTest, InMemoryRecovery_StructuralVariant)
         makeEnvVarDep(pools(), "SVR_A", "a2"),
         makeEnvVarDep(pools(), "SVR_B", "b2"),
     };
-    db.record(vpath({"attr"}), string_t{"r2", {}}, depsV2, true);
+    db.record(vpath({"attr"}), string_t{"r2", {}}, depsV2);
 
     // Clear caches
     db.clearSessionCaches();
@@ -496,7 +496,7 @@ TEST_F(TraceStoreTest, ClearSessionCaches_ClearsAllNewCaches)
 {
     // clearSessionCaches should clear both traceDataCache and traceRowCache.
     auto db = makeDb();
-    db.record(vpath({"attr"}), string_t{"val", {}}, {makeContentDep(pools(), "/f", "c")}, true);
+    db.record(vpath({"attr"}), string_t{"val", {}}, {makeContentDep(pools(), "/f", "c")});
 
     EXPECT_FALSE(db.traceDataCache.empty());
     EXPECT_FALSE(db.traceRowCache.empty());

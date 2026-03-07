@@ -78,7 +78,7 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyMismatch_NixAddedKey_FailsVerify)
     CachedResult result{int_t{NixInt(42)}};
     auto attrPath = vpath({"test", "standalone"});
 
-    db.record(attrPath, result, deps, /*isRoot=*/false);
+    db.record(attrPath, result, deps);
 
     auto verifyResult = db.verify(attrPath, {}, state);
 
@@ -113,7 +113,7 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyMismatch_MultipleDeps_FirstBadBlocks)
     CachedResult result{int_t{NixInt(1)}};
     auto attrPath = vpath({"test", "multi"});
 
-    db.record(attrPath, result, deps, /*isRoot=*/false);
+    db.record(attrPath, result, deps);
 
     auto verifyResult = db.verify(attrPath, {}, state);
 
@@ -140,7 +140,7 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyCorrect_JsonKey_PassesVerify)
     CachedResult result{int_t{NixInt(1)}};
     auto attrPath = vpath({"test", "control"});
 
-    db.record(attrPath, result, deps, /*isRoot=*/false);
+    db.record(attrPath, result, deps);
 
     auto verifyResult = db.verify(attrPath, {}, state);
     EXPECT_TRUE(verifyResult.has_value())
@@ -167,7 +167,7 @@ TEST_F(TraceStoreTest, StandaloneSC_HasKeyCorrect_MissingKey_PassesVerify)
     CachedResult result{int_t{NixInt(0)}};
     auto attrPath = vpath({"test", "absent"});
 
-    db.record(attrPath, result, deps, /*isRoot=*/false);
+    db.record(attrPath, result, deps);
 
     auto verifyResult = db.verify(attrPath, {}, state);
     EXPECT_TRUE(verifyResult.has_value())
@@ -206,7 +206,7 @@ TEST_F(TraceStoreTest, CoveredSC_HasKeyMismatch_MaskedByContentDep)
     CachedResult result{int_t{NixInt(42)}};
     auto attrPath = vpath({"test", "covered"});
 
-    db.record(attrPath, result, deps, /*isRoot=*/false);
+    db.record(attrPath, result, deps);
 
     auto verifyResult = db.verify(attrPath, {}, state);
     EXPECT_TRUE(verifyResult.has_value())

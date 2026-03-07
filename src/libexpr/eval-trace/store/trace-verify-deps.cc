@@ -1,7 +1,9 @@
 #include "trace-verify-deps.hh"
 #include "nix/expr/eval-trace/store/stat-hash-store.hh"
+#include "nix/expr/eval-trace/deps/hash.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/toml-canonical.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/nixexpr.hh"
 #include "nix/store/store-api.hh"
@@ -115,16 +117,8 @@ static const toml::value * navigateToml(const toml::value & root, const nlohmann
     return node;
 }
 
-/**
- * Canonical string form of a TOML scalar value for hashing.
- * Must match TomlDataNode::canonicalValue() in fromTOML.cc.
- */
-static std::string tomlCanonical(const toml::value & v)
-{
-    std::ostringstream ss;
-    ss << v;
-    return ss.str();
-}
+// tomlCanonical() is in nix/expr/eval-trace/toml-canonical.hh
+// (shared with fromTOML.cc's TomlDataNode::canonicalValue())
 
 // ── TrackedSource: navigable DOM view for shape-suffix resolution ────
 
@@ -233,14 +227,7 @@ static std::optional<DepHashValue> resolveShapeSuffix(
         return DepHashValue(depHash(std::to_string(source.size())));
     case ShapeSuffix::Keys: {
         if (!source.isObject()) return std::nullopt;
-        auto k = source.keys();
-        std::sort(k.begin(), k.end());
-        std::string canonical;
-        for (size_t i = 0; i < k.size(); i++) {
-            if (i > 0) canonical += '\0';
-            canonical += k[i];
-        }
-        return DepHashValue(depHash(canonical));
+        return DepHashValue(canonicalKeysHash(source.keys()));
     }
     case ShapeSuffix::Type:
         if (source.isObject()) return DepHashValue(depHash("object"));

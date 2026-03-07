@@ -114,7 +114,7 @@ struct NixBindingCoverageFixture : TraceStoreFixture
               pools().intern<DepSourceId>(""),
               pools().intern<DepKeyId>(scKey)},
              *bindingHash},
-        }, true);
+        });
         return true;
     }
 };
