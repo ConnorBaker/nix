@@ -15,44 +15,6 @@
 
 namespace nix::eval_trace {
 
-Counter nrTraceCacheHits;
-Counter nrTraceCacheMisses;
-Counter nrTraceVerifications;
-Counter nrVerificationsPassed;
-Counter nrVerificationsFailed;
-Counter nrDepsChecked;
-Counter nrRecoveryFailures;
-
-// Timing accumulators (microseconds)
-Counter nrVerifyTimeUs;
-Counter nrVerifyTraceTimeUs;
-Counter nrRecoveryTimeUs;
-Counter nrRecoveryDirectHashTimeUs;
-Counter nrRecoveryStructVariantTimeUs;
-Counter nrRecordTimeUs;
-Counter nrLoadTraceTimeUs;
-Counter nrDbInitTimeUs;
-Counter nrDbCloseTimeUs;
-
-// Event counters
-Counter nrRecoveryAttempts;
-Counter nrRecoveryDirectHashHits;
-Counter nrRecoveryStructVariantHits;
-Counter nrRecords;
-Counter nrLoadTraces;
-
-// TracedExpr creation/forcing breakdown
-Counter nrTracedExprCreated;
-Counter nrTracedExprFromMaterialize;
-Counter nrTracedExprFromOrigAttrs;
-Counter nrTracedExprFromDataFile;
-Counter nrTracedExprForced;
-Counter nrLazyStateAllocated;
-
-// Data-file node type breakdown
-Counter nrDataFileScalarChildren;
-Counter nrDataFileContainerChildren;
-
 // ── TracedExpr struct definition ─────────────────────────────────────
 
 /**

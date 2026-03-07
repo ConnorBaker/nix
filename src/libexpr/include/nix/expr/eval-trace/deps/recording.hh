@@ -3,15 +3,10 @@
 
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
+#include "nix/expr/eval-trace/counters.hh"
+#include "nix/expr/eval-trace/deps/dep-hash-fns.hh"
 #include "nix/expr/symbol-table.hh"
-#include "nix/expr/counter.hh"
 #include "nix/util/position.hh"
-
-namespace nix::eval_trace {
-extern Counter nrDepTrackerScopes;
-extern Counter nrOwnDepsTotal;
-extern Counter nrOwnDepsMax;
-} // namespace nix::eval_trace
 
 #include <filesystem>
 #include <vector>
@@ -201,34 +196,6 @@ struct SuspendDepTracking {
 };
 
 /**
- * Compute a BLAKE3 hash of data. Zero-allocation, returns stack-allocated Blake3Hash.
- */
-Blake3Hash depHash(std::string_view data);
-
-/**
- * Compute a BLAKE3 hash of a path's NAR serialization using streaming API.
- * Unlike depHash() which hashes raw file bytes, this captures the executable
- * bit via the NAR format. Used for builtins.path filtered file deps where
- * the resulting store path depends on permissions.
- */
-Blake3Hash depHashPath(const SourcePath & path);
-
-/**
- * Compute a BLAKE3 hash of a git repo's identity (HEAD rev + dirty state).
- * Returns std::nullopt if the repo has no commits yet.
- * May throw on git or filesystem errors — callers should catch as appropriate.
- */
-std::optional<Blake3Hash> computeGitIdentityHash(const std::filesystem::path & repoRoot);
-
-/**
- * Compute a BLAKE3 hash of a directory listing using streaming API.
- * Each entry is hashed as "name:typeInt;" where typeInt is the
- * numeric value of the optional file type (-1 if unknown).
- * The entries map is iterated in its natural (lexicographic) order.
- */
-Blake3Hash depHashDirListing(const SourceAccessor::DirEntries & entries);
-
-/**
  * Resolve an absolute path to an (inputName, relativePath) pair using
  * a mount-point-to-input mapping. Walks up the path trying each prefix.
  */
@@ -358,13 +325,6 @@ const TracedContainerProvenance * lookupTracedContainer(const void * key);
  * Called on root DependencyTracker construction.
  */
 void clearTracedContainerMap();
-
-/**
- * Convert a directory entry type to its canonical string form.
- * Must be consistent between DirScalarNode::canonicalValue() (primops.cc)
- * and computeCurrentHash 'd' format handler (trace-store.cc).
- */
-std::string dirEntryTypeString(std::optional<SourceAccessor::Type> type);
 
 class PosTable;
 

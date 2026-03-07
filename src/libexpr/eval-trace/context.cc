@@ -1,16 +1,9 @@
 #include "nix/expr/eval-trace/context.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
-#include "nix/expr/eval-trace/cache/trace-cache.hh"
+#include "nix/expr/eval-trace/counters.hh"
 #include "nix/expr/value.hh"
 
 namespace nix {
-
-namespace eval_trace {
-Counter nrReplayTotalCalls;
-Counter nrReplayBloomHits;
-Counter nrReplayEpochHits;
-Counter nrReplayAdded;
-} // namespace eval_trace
 
 void EvalTraceContext::recordThunkDeps(const Value & v, uint32_t epochStart)
 {

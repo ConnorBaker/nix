@@ -1,5 +1,5 @@
 #include "nix/expr/eval-trace/store/stat-hash-store.hh"
-#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/deps/dep-hash-fns.hh"
 #include "nix/store/globals.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/util/file-system.hh"

@@ -3,42 +3,11 @@
 #include "nix/expr/eval-trace/store/stat-hash-store.hh"
 #include "nix/expr/eval.hh"
 #include "nix/util/file-system.hh"
-#include "nix/util/hash.hh"
 #include "nix/util/source-path.hh"
 
 #include <filesystem>
 
 namespace nix {
-
-// ═══════════════════════════════════════════════════════════════════════
-// Dep hash functions (BLAKE3 oracle hashing)
-// ═══════════════════════════════════════════════════════════════════════
-
-Blake3Hash depHash(std::string_view data)
-{
-    return Blake3Hash::fromHash(hashString(HashAlgorithm::BLAKE3, data));
-}
-
-Blake3Hash depHashPath(const SourcePath & path)
-{
-    HashSink sink(HashAlgorithm::BLAKE3);
-    path.dumpPath(sink);
-    return Blake3Hash::fromHash(sink.finish().hash);
-}
-
-Blake3Hash depHashDirListing(const SourceAccessor::DirEntries & entries)
-{
-    HashSink sink(HashAlgorithm::BLAKE3);
-    for (auto & [name, type] : entries) {
-        sink(name);
-        sink(":");
-        int typeInt = type ? static_cast<int>(*type) : -1;
-        auto typeStr = std::to_string(typeInt);
-        sink(typeStr);
-        sink(";");
-    }
-    return Blake3Hash::fromHash(sink.finish().hash);
-}
 
 // ═══════════════════════════════════════════════════════════════════════
 // Input resolution + dep recording
@@ -228,20 +197,6 @@ std::pair<std::string, std::string> resolveProvenance(
         return {std::string(absolutePathDep), absPath.abs()};
     }
     return {"", absPath.abs()};
-}
-
-std::string dirEntryTypeString(std::optional<SourceAccessor::Type> type)
-{
-    if (!type) return "unknown";
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wswitch-enum"
-    switch (*type) {
-    case SourceAccessor::tRegular: return "regular";
-    case SourceAccessor::tDirectory: return "directory";
-    case SourceAccessor::tSymlink: return "symlink";
-    default: return "unknown";
-    }
-#pragma GCC diagnostic pop
 }
 
 } // namespace nix
