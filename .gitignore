@@ -56,3 +56,9 @@ flake-regressions
 
 # direnv
 .direnv/
+
+# TODO(@connorbaker): Remove after finishing analysis
+cold/
+hot/
+reference/
+research/

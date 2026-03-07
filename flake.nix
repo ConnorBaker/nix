@@ -356,6 +356,44 @@
               )).componentTests
             )
         // devFlake.checks.${system} or { }
+        // (
+          let
+            pkgs = nixpkgsFor.${system}.native;
+            benchmarkPython = pkgs.python3.withPackages (ps: [ ps.rich ]);
+          in
+          let
+            mkPyright = name: src: pkgs.runCommand "${name}-pyright" {
+              nativeBuildInputs = [ pkgs.pyright benchmarkPython ];
+            } ''
+              cp ${src} ${name}.py
+              pyright --pythonpath ${benchmarkPython}/bin/python3
+              touch $out
+            '';
+            mkRuffCheck = name: src: pkgs.runCommand "${name}-ruff-check" {
+              nativeBuildInputs = [ pkgs.ruff ];
+            } ''
+              ruff check ${src}
+              touch $out
+            '';
+            mkRuffFormat = name: src: pkgs.runCommand "${name}-ruff-format" {
+              nativeBuildInputs = [ pkgs.ruff ];
+            } ''
+              ruff format --check ${src}
+              touch $out
+            '';
+          in
+          {
+            generate-runs-pyright = mkPyright "generate-runs" ./generate-runs.py;
+            generate-runs-ruff-check = mkRuffCheck "generate-runs" ./generate-runs.py;
+            generate-runs-ruff-format = mkRuffFormat "generate-runs" ./generate-runs.py;
+            compare-runs-pyright = mkPyright "compare-runs" ./compare-runs.py;
+            compare-runs-ruff-check = mkRuffCheck "compare-runs" ./compare-runs.py;
+            compare-runs-ruff-format = mkRuffFormat "compare-runs" ./compare-runs.py;
+            compare-logs-pyright = mkPyright "compare-logs" ./compare-logs.py;
+            compare-logs-ruff-check = mkRuffCheck "compare-logs" ./compare-logs.py;
+            compare-logs-ruff-format = mkRuffFormat "compare-logs" ./compare-logs.py;
+          }
+        )
       );
 
       packages = forAllSystems (
@@ -489,8 +527,30 @@
         let
           pkgs = nixpkgsFor.${system}.native;
           opener = if pkgs.stdenv.isDarwin then "open" else "xdg-open";
+          benchmarkPython = pkgs.python3.withPackages (ps: [ ps.rich ]);
         in
         {
+          generate-runs = {
+            type = "app";
+            program = "${pkgs.writeShellScript "generate-runs" ''
+              exec ${benchmarkPython}/bin/python3 ${./generate-runs.py} "$@"
+            ''}";
+            meta.description = "Generate eval trace benchmark runs";
+          };
+          compare-runs = {
+            type = "app";
+            program = "${pkgs.writeShellScript "compare-runs" ''
+              exec ${benchmarkPython}/bin/python3 ${./compare-runs.py} "$@"
+            ''}";
+            meta.description = "Compare eval trace benchmark runs";
+          };
+          compare-logs = {
+            type = "app";
+            program = "${pkgs.writeShellScript "compare-logs" ''
+              exec ${benchmarkPython}/bin/python3 ${./compare-logs.py} "$@"
+            ''}";
+            meta.description = "Analyze and compare Nix evaluation debug logs";
+          };
           open-manual = {
             type = "app";
             program = "${pkgs.writeShellScript "open-nix-manual" ''
