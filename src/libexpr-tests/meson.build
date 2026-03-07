@@ -75,6 +75,7 @@ sources = files(
   'eval-trace/store/hash.cc',
   'eval-trace/store/git-identity.cc',
   'eval-trace/store/copied-path.cc',
+  'eval-trace/store/call-arg-nixbinding.cc',
   # eval-trace/traced-data/
   'eval-trace/traced-data/json-scalar.cc',
   'eval-trace/traced-data/json-containers.cc',
