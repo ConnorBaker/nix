@@ -201,59 +201,58 @@ TEST_F(NixBindingCoverageFixture, Eligible_ScopeChange_OverrideRejects)
 
 // ── Call-arg pattern: findNonRecExprAttrs rejects ExprCall ───────────
 
-TEST_F(NixBindingCoverageFixture, CallArg_FindNonRecExprAttrs_ReturnsNull)
+TEST_F(NixBindingCoverageFixture, CallArg_FindNonRecExprAttrs_ReturnsHash)
 {
-    // Directly verify that findNonRecExprAttrs rejects the call-arg pattern.
+    // findNonRecExprAttrs walks into ExprCall arguments to find the attrset.
     auto file = writeCallArgFile("1", "2");
     auto hash = computeRealBindingHash(file.path, "accessed");
-    EXPECT_FALSE(hash.has_value())
-        << "findNonRecExprAttrs should return nullptr for ExprCall body";
+    ASSERT_TRUE(hash.has_value())
+        << "findNonRecExprAttrs should walk into ExprCall arg";
+
+    // The hash should differ from the eligible pattern (different scope:
+    // call-arg includes the call expression in the scope hash).
+    auto eligible = writeEligibleFile("1", "2");
+    auto eligibleHash = computeRealBindingHash(eligible.path, "accessed");
+    ASSERT_TRUE(eligibleHash.has_value());
+    EXPECT_NE(*hash, *eligibleHash)
+        << "Call-arg and eligible should have different scope hashes "
+           "(call expression is part of the scope)";
 }
 
-TEST_F(NixBindingCoverageFixture, CallArg_FindNonRecExprAttrs_EligibleReturnsHash)
+TEST_F(NixBindingCoverageFixture, CallArg_UnrelatedChange_OverrideAccepts)
 {
-    // Contrast: findNonRecExprAttrs accepts the eligible pattern.
-    auto file = writeEligibleFile("1", "2");
-    auto hash = computeRealBindingHash(file.path, "accessed");
-    EXPECT_TRUE(hash.has_value())
-        << "findNonRecExprAttrs should return the attrset for bare body";
-}
-
-TEST_F(NixBindingCoverageFixture, CallArg_UnrelatedChange_MissesWithoutSC)
-{
-    // The call-arg pattern has NO SC coverage. Changing an unrelated
-    // binding → Content fails, no override → miss.
-    // This SHOULD be a hit (like Eligible_UnrelatedChange_OverrideAccepts)
-    // but ISN'T because findNonRecExprAttrs rejects ExprCall.
+    // With findNonRecExprAttrs walking into ExprCall, the call-arg pattern
+    // gets SC coverage. Changing an unrelated binding → SC dep on "accessed"
+    // passes → override accepts → hit. Same behavior as the eligible case.
     auto file = writeCallArgFile("1", "2");
     auto v1 = readFile(file.path);
 
     auto db = makeDb();
-    db.record(rootPath(), string_t{"result", {}}, {
-        makeContentDep(pools(), file.path.string(), v1),
-    }, true);
+    bool ok = recordWithRealSCDep(db, rootPath(), file.path, v1,
+                                  "accessed", string_t{"result", {}});
+    ASSERT_TRUE(ok) << "Call-arg file should now produce NixBinding hash";
 
     auto v2file = writeCallArgFile("1", "999");
     rewriteFile(file.path, v2file);
     db.clearSessionCaches();
 
     auto result = db.verify(rootPath(), {}, state);
-    EXPECT_FALSE(result.has_value())
-        << "Call-arg: misses due to lack of SC coverage. "
-           "Fix: extend findNonRecExprAttrs to walk into ExprCall args.";
+    ASSERT_TRUE(result.has_value())
+        << "Call-arg: unrelated change → SC override accepts → hit";
+    assertCachedResultEquals(string_t{"result", {}}, result->value, state.symbols);
 }
 
-TEST_F(NixBindingCoverageFixture, CallArg_AccessedChange_MissesForWrongReason)
+TEST_F(NixBindingCoverageFixture, CallArg_AccessedChange_OverrideRejects)
 {
-    // Miss is correct in outcome but wrong in mechanism: there's no SC dep
-    // to detect the change. Miss comes from bare Content dep failure.
+    // Changing the accessed binding → SC dep fails → override rejects → miss.
+    // Now the miss is for the RIGHT reason (SC dep detects the change).
     auto file = writeCallArgFile("1", "2");
     auto v1 = readFile(file.path);
 
     auto db = makeDb();
-    db.record(rootPath(), string_t{"result", {}}, {
-        makeContentDep(pools(), file.path.string(), v1),
-    }, true);
+    bool ok = recordWithRealSCDep(db, rootPath(), file.path, v1,
+                                  "accessed", string_t{"result", {}});
+    ASSERT_TRUE(ok);
 
     auto v2file = writeCallArgFile("999", "2");
     rewriteFile(file.path, v2file);
@@ -261,47 +260,35 @@ TEST_F(NixBindingCoverageFixture, CallArg_AccessedChange_MissesForWrongReason)
 
     auto result = db.verify(rootPath(), {}, state);
     EXPECT_FALSE(result.has_value())
-        << "Correct miss, wrong reason: no SC dep to detect binding change.";
+        << "Call-arg: accessed binding changed → SC dep fails → miss";
 }
 
-TEST_F(NixBindingCoverageFixture, CallArg_ManualSCDep_VerificationCannotRecompute)
+TEST_F(NixBindingCoverageFixture, CallArg_CalledFunctionChange_OverrideRejects)
 {
-    // Even if we manually record an SC dep with the correct hash, verification
-    // re-parses the file and calls findNonRecExprAttrs to recompute.
-    // Since findNonRecExprAttrs rejects ExprCall → empty hash map →
-    // computeCurrentHash returns nullopt → SC dep fails → no override.
-    // Both recording AND verification paths need the fix.
-    auto eligible = writeEligibleFile("1", "2");
-    auto callarg = writeCallArgFile("1", "2");
+    // Changing the called function (e.g., mapAliases → mapAliases2) changes
+    // the scope hash → all binding hashes change → SC deps fail → miss.
+    auto file = TempTestFile(
+        "lib:\nlet\n"
+        "  mapAliases = aliases: builtins.mapAttrs (n: v: v) aliases;\n"
+        "in\nmapAliases {\n  accessed = 1;\n  unrelated = 2;\n}\n");
+    auto v1 = readFile(file.path);
 
-    // Compute the hash from the ELIGIBLE version (same binding AST)
-    auto bindingHash = computeRealBindingHash(eligible.path, "accessed");
-    ASSERT_TRUE(bindingHash.has_value());
-
-    // Record against the CALL-ARG file with the eligible file's hash
-    auto v1 = readFile(callarg.path);
     auto db = makeDb();
-    auto scKey = nlohmann::json{
-        {"f", callarg.path.string()}, {"t", "n"},
-        {"p", nlohmann::json::array({"accessed"})}
-    }.dump();
-    db.record(rootPath(), string_t{"result", {}}, {
-        makeContentDep(pools(), callarg.path.string(), v1),
-        {{DepType::StructuredContent,
-          pools().intern<DepSourceId>(""),
-          pools().intern<DepKeyId>(scKey)},
-         *bindingHash},
-    }, true);
+    bool ok = recordWithRealSCDep(db, rootPath(), file.path, v1,
+                                  "accessed", string_t{"result", {}});
+    ASSERT_TRUE(ok);
 
-    // Change only unrelated binding
-    auto v2file = writeCallArgFile("1", "999");
-    rewriteFile(callarg.path, v2file);
+    // Change the called function name
+    auto v2file = TempTestFile(
+        "lib:\nlet\n"
+        "  mapAliases = aliases: builtins.mapAttrs (n: v: v) aliases;\n"
+        "in\nbuiltins.mapAttrs (n: v: v) {\n  accessed = 1;\n  unrelated = 2;\n}\n");
+    rewriteFile(file.path, v2file);
     db.clearSessionCaches();
 
     auto result = db.verify(rootPath(), {}, state);
     EXPECT_FALSE(result.has_value())
-        << "SC dep exists but verification can't recompute: "
-           "findNonRecExprAttrs rejects ExprCall in the verification path.";
+        << "Changing the called function → scope hash changes → miss";
 }
 
 } // namespace nix::eval_trace

@@ -30,19 +30,21 @@ void clearNixBindingRegistry()
 
 std::pair<ExprAttrs *, std::vector<Expr *>> findNonRecExprAttrs(Expr * root)
 {
-    // Walk through scope-introducing expressions (lambda, with, let) and
-    // update (//) chains to find the innermost non-recursive ExprAttrs.
+    // Walk through scope-introducing expressions (lambda, with, let),
+    // update (//) chains, and function call arguments to find the
+    // innermost non-recursive ExprAttrs.
     //
     // Eligible:   { x = 1; }                    (bare attrset)
     //             a: b: { x = a; }              (lambda chain)
     //             let h = 1; in { x = h; }      (let wrapping)
     //             with lib; { x = foo; }         (with wrapping)
     //             { x = 1; } // { y = 2; }      (update — walks LHS)
+    //             f { x = 1; }                   (call — walks last arg)
+    //             f (a: { x = a; })              (call with lambda arg)
     //
     // Ineligible: rec { x = 1; y = x; }         (recursive)
     //             { ${name} = 1; }               (dynamic attrs)
     //             if cond then { ... } else ...  (conditional body)
-    //             f { ... }                      (function call result)
 
     std::vector<Expr *> scopeExprs;
     Expr * current = root;
@@ -66,6 +68,18 @@ std::pair<ExprAttrs *, std::vector<Expr *>> findNonRecExprAttrs(Expr * root)
         } else if (auto * update = dynamic_cast<ExprOpUpdate *>(current)) {
             // { bindings... } // rhs — walk LHS to find the attrset
             current = update->e1;
+        } else if (auto * call = dynamic_cast<ExprCall *>(current)) {
+            // f { bindings... } — walk into the last argument.
+            // The call's function expression is added to scopeExprs so
+            // that computeNixScopeHash includes it: changing the called
+            // function (e.g., mapAliases → mapAliases2) invalidates all
+            // binding hashes. Covers aliases.nix (mapAliases { ... }),
+            // package.nix (stdenv.mkDerivation { ... }), and
+            // mkDerivation (finalAttrs: { ... }).
+            if (!call->args || call->args->empty())
+                return {nullptr, {}};
+            scopeExprs.push_back(current);
+            current = call->args->back();
         } else {
             return {nullptr, {}};
         }
@@ -175,6 +189,15 @@ Blake3Hash computeNixScopeHash(const std::vector<Expr *> & scopeExprs, const Sym
                     sink(std::string_view("\0", 1));
                 }
             }
+        } else if (auto * call = dynamic_cast<ExprCall *>(expr)) {
+            // Hash the function expression so that changing the called
+            // function (e.g., mapAliases → mapAliases2, or
+            // stdenv.mkDerivation → stdenv.mkDerivation2) invalidates
+            // all binding hashes in the argument attrset.
+            sink("call:");
+            std::ostringstream ss;
+            call->fun->show(symbols, ss);
+            sink(ss.str());
         }
         sink(";");
     }
