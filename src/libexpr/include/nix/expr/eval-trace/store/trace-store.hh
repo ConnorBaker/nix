@@ -268,6 +268,14 @@ struct TraceStore {
         const std::vector<Dep> & allDeps);
 
 
+    /// Convenience overload: creates a fresh VerificationScope internally.
+    [[gnu::cold]]
+    std::optional<VerifyResult> recovery(
+        TraceId oldTraceId,
+        AttrPathId pathId,
+        const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
+        EvalState & state);
+
     /**
      * Constructive trace recovery (BSàlC CT recovery).
      *
@@ -291,7 +299,8 @@ struct TraceStore {
         TraceId oldTraceId,
         AttrPathId pathId,
         const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
-        EvalState & state);
+        EvalState & state,
+        VerificationScope & scope);
 
     /**
      * Load the full dependency set for a trace.
@@ -357,6 +366,13 @@ struct TraceStore {
     /// Resolve a single Dep to a string-based ResolvedDep.
     ResolvedDep resolveDep(const Dep & dep);
 
+    /// Convenience overload: creates a fresh VerificationScope internally.
+    [[gnu::cold]]
+    bool verifyTrace(
+        TraceId traceId,
+        const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
+        EvalState & state);
+
     /**
      * Verify a single trace: recompute all dep hashes and compare against
      * stored expected values (BSàlC VT dep-hash verification).
@@ -376,7 +392,8 @@ struct TraceStore {
     bool verifyTrace(
         TraceId traceId,
         const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
-        EvalState & state);
+        EvalState & state,
+        VerificationScope & scope);
 
     std::tuple<ResultKind, std::string, std::string> encodeCachedResult(const CachedResult & value);
 
@@ -422,7 +439,8 @@ private:
     std::optional<Blake3Hash> resolveParentContextHash(
         const Dep::Key & key,
         const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
-        EvalState & state);
+        EvalState & state,
+        VerificationScope & scope);
 };
 
 } // namespace nix::eval_trace

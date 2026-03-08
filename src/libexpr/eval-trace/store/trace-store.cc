@@ -689,11 +689,12 @@ std::optional<DepHashValue> TraceStore::resolveCurrentDepHash(
 std::optional<Blake3Hash> TraceStore::resolveParentContextHash(
     const Dep::Key & key,
     const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
-    EvalState & state)
+    EvalState & state,
+    VerificationScope & scope)
 {
     auto parentPathId = AttrPathId(key.keyId.value);
     auto parentRow = lookupTraceRow(parentPathId);
-    if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state))
+    if (!parentRow || !verifyTrace(parentRow->traceId, inputAccessors, state, scope))
         return std::nullopt;
     auto parentTraceHash = getCurrentTraceHash(parentPathId);
     if (!parentTraceHash) return std::nullopt;
@@ -786,12 +787,20 @@ bool TraceStore::verifyTrace(
     const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
     EvalState & state)
 {
+    auto scopeOwner = createVerificationScope();
+    return verifyTrace(traceId, inputAccessors, state, *scopeOwner);
+}
+
+bool TraceStore::verifyTrace(
+    TraceId traceId,
+    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
+    EvalState & state,
+    VerificationScope & scope)
+{
     if (verifiedTraceIds.count(traceId))
         return true;
 
     auto vtStart = timerStart();
-    auto scopeOwner = createVerificationScope();
-    auto & scope = *scopeOwner;
 
     // Load the full trace (single DB read via JOIN) — vector<Dep>
     auto fullDeps = loadFullTrace(traceId);
@@ -839,7 +848,7 @@ bool TraceStore::verifyTrace(
         }
 
         if (depKind(idep.key.type) == DepKind::ParentContext) {
-            auto parentHash = resolveParentContextHash(idep.key, inputAccessors, state);
+            auto parentHash = resolveParentContextHash(idep.key, inputAccessors, state, scope);
             if (parentHash) {
                 auto * expected = std::get_if<Blake3Hash>(&idep.hash);
                 if (expected && std::memcmp(expected->bytes.data(), parentHash->bytes.data(), 32) == 0)
@@ -985,7 +994,7 @@ bool TraceStore::verifyTrace(
         currentDeps.reserve(fullDeps.size());
         for (auto & idep : fullDeps) {
             if (depKind(idep.key.type) == DepKind::ParentContext) {
-                auto b3 = resolveParentContextHash(idep.key, inputAccessors, state);
+                auto b3 = resolveParentContextHash(idep.key, inputAccessors, state, scope);
                 currentDeps.push_back(b3 ? Dep{idep.key, DepHashValue(*b3)} : idep);
             } else {
                 auto cacheIt = currentDepHashes.find(idep.key);
@@ -1149,11 +1158,16 @@ std::optional<TraceStore::VerifyResult> TraceStore::verify(
 
     nrTraceVerifications++;
 
+    // Shared scope: DOM caches (JSON, TOML, dir listing, Nix AST) persist
+    // across verifyTrace → recovery, avoiding redundant file parsing.
+    auto scopeOwner = createVerificationScope();
+    auto & scope = *scopeOwner;
+
     // 2. Verify trace — compute ALL dep hashes upfront.
     //    With StatHashCache warm, computing all hashes is cheap (~2ms for ~4K deps:
     //    just lstat() + L1 cache lookup per file dep). Computing all hashes upfront
     //    ensures recovery can reuse them immediately via currentDepHashes.
-    if (verifyTrace(row->traceId, inputAccessors, state)) {
+    if (verifyTrace(row->traceId, inputAccessors, state, scope)) {
         nrVerificationsPassed++;
         nrVerifyTimeUs += elapsedUs(verifyStart);
         return VerifyResult{decodeCachedResult(*row), row->traceId};
@@ -1165,7 +1179,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::verify(
     //    No additional hash computation needed unless structural variant recovery
     //    encounters a trace with different dep keys (rare).
     debug("verify: trace validation failed for '%s', attempting constructive recovery", vocab.displayPath(pathId));
-    auto result = recovery(row->traceId, pathId, inputAccessors, state);
+    auto result = recovery(row->traceId, pathId, inputAccessors, state, scope);
     nrVerifyTimeUs += elapsedUs(verifyStart);
     return result;
 }
@@ -1179,14 +1193,22 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
     EvalState & state)
 {
+    auto scopeOwner = createVerificationScope();
+    return recovery(oldTraceId, pathId, inputAccessors, state, *scopeOwner);
+}
+
+std::optional<TraceStore::VerifyResult> TraceStore::recovery(
+    TraceId oldTraceId,
+    AttrPathId pathId,
+    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
+    EvalState & state,
+    VerificationScope & scope)
+{
     auto recoveryStart = timerStart();
     nrRecoveryAttempts++;
-    auto scopeOwner = createVerificationScope();
-    auto & scope = *scopeOwner;
 
     // Load old trace's full deps — now vector<Dep>
     auto oldDeps = loadFullTrace(oldTraceId);
-
 
     // Check for volatile deps → immediate abort
     for (auto & idep : oldDeps) {
@@ -1203,7 +1225,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     bool allComputable = true;
     for (auto & idep : oldDeps) {
         if (depKind(idep.key.type) == DepKind::ParentContext) {
-            auto parentHash = resolveParentContextHash(idep.key, inputAccessors, state);
+            auto parentHash = resolveParentContextHash(idep.key, inputAccessors, state, scope);
             if (!parentHash) { allComputable = false; break; }
             currentDeps.push_back({idep.key, DepHashValue(*parentHash)});
             continue;
@@ -1346,7 +1368,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             }
 
             if (depKind(key.type) == DepKind::ParentContext) {
-                auto parentHash = resolveParentContextHash(key, inputAccessors, state);
+                auto parentHash = resolveParentContextHash(key, inputAccessors, state, scope);
                 if (!parentHash) { repComputable = false; break; }
                 repDeps.push_back({key, DepHashValue(*parentHash)});
                 continue;
