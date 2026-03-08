@@ -429,6 +429,9 @@ private:
     /// Sort+dedup deps in-place and compute trace hash.
     Hash computeSortedTraceHash(std::vector<Dep> & deps) const;
 
+    /// Compute trace hash for already-sorted, deduplicated deps (skips sort+dedup).
+    Hash computePresortedTraceHash(const std::vector<Dep> & deps) const;
+
     /// Cache-or-compute a dep's current hash value.
     std::optional<DepHashValue> resolveCurrentDepHash(
         const Dep & dep,

@@ -672,6 +672,14 @@ Hash TraceStore::computeSortedTraceHash(std::vector<Dep> & deps) const
     return computeTraceHashFromSorted(deps, feeder);
 }
 
+Hash TraceStore::computePresortedTraceHash(const std::vector<Dep> & deps) const
+{
+    auto feeder = [this](HashSink & s, DepType type, uint32_t idValue) {
+        feedKey(s, type, idValue);
+    };
+    return computeTraceHashFromSorted(deps, feeder);
+}
+
 std::optional<DepHashValue> TraceStore::resolveCurrentDepHash(
     const Dep & dep,
     const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
@@ -907,6 +915,10 @@ bool TraceStore::verifyTrace(
     };
 
     VerifyOutcome outcome;
+    // Files whose Content/Directory deps passed — populated in hasContentFailure branch,
+    // used both for skipFiles filtering in verifyDeps and for old-hash shortcutting
+    // in the Invalid pre-compute loop.
+    std::unordered_set<FileIdentity, FileIdentity::Hash> passedContentFiles;
 
     if (hasNonContentFailure) {
         outcome = VerifyOutcome::Invalid;
@@ -925,6 +937,17 @@ bool TraceStore::verifyTrace(
         }
         outcome = standalonePassed ? VerifyOutcome::Valid : VerifyOutcome::Invalid;
     } else if (hasContentFailure && (hasStructuralDeps || hasImplicitShapeDeps)) {
+        // Populate passedContentFiles: unchanged files, safe to skip.
+        // DirSet deps (ds:...) won't match these, so they're always checked.
+        for (auto & idep : fullDeps) {
+            if (isContentOverrideable(idep.key.type)) {
+                auto dep = resolveDep(idep);
+                auto fi = contentFileIdentity(dep);
+                if (!failedContentFiles.count(fi))
+                    passedContentFiles.insert(fi);
+            }
+        }
+
         std::unordered_set<FileIdentity, FileIdentity::Hash> structuralCoveredFiles;
         for (auto idx : structuralDepIndices) {
             auto dep = resolveDep(fullDeps[idx]);
@@ -967,7 +990,7 @@ bool TraceStore::verifyTrace(
 
         if (!allCovered) {
             outcome = VerifyOutcome::Invalid;
-        } else if (!verifyDeps(structuralDepIndices)) {
+        } else if (!verifyDeps(structuralDepIndices, &passedContentFiles)) {
             outcome = VerifyOutcome::Invalid;
         } else if (!verifyDeps(implicitShapeDepIndices, &structuralCoveredFiles, &failedContentFiles)) {
             outcome = VerifyOutcome::Invalid;
@@ -1002,7 +1025,7 @@ bool TraceStore::verifyTrace(
                     ? Dep{idep.key, *cacheIt->second} : idep);
             }
         }
-        auto newTraceHash = computeSortedTraceHash(currentDeps);
+        auto newTraceHash = computePresortedTraceHash(currentDeps);
         auto * data = ensureTraceHashes(traceId);
         if (data) {
             data->traceHash = newTraceHash;
@@ -1012,6 +1035,25 @@ bool TraceStore::verifyTrace(
     }
 
     case VerifyOutcome::Invalid:
+        // Pre-compute remaining deferred dep hashes so recovery
+        // gets L1 cache hits instead of expensive recomputation.
+        // When only content deps failed, unchanged files' structural dep
+        // hashes equal the recorded values — skip expensive recomputation.
+        for (auto * indices : {&structuralDepIndices, &implicitShapeDepIndices}) {
+            for (auto idx : *indices) {
+                auto & idep = fullDeps[idx];
+                if (currentDepHashes.find(idep.key) == currentDepHashes.end()) {
+                    if (!passedContentFiles.empty()) {
+                        auto dep = resolveDep(idep);
+                        if (passedContentFiles.count(scFileIdentity(dep))) {
+                            currentDepHashes[idep.key] = idep.hash;
+                            continue;
+                        }
+                    }
+                    resolveCurrentDepHash(idep, inputAccessors, state, scope);
+                }
+            }
+        }
         break;
     }
 
@@ -1163,10 +1205,9 @@ std::optional<TraceStore::VerifyResult> TraceStore::verify(
     auto scopeOwner = createVerificationScope();
     auto & scope = *scopeOwner;
 
-    // 2. Verify trace — compute ALL dep hashes upfront.
-    //    With StatHashCache warm, computing all hashes is cheap (~2ms for ~4K deps:
-    //    just lstat() + L1 cache lookup per file dep). Computing all hashes upfront
-    //    ensures recovery can reuse them immediately via currentDepHashes.
+    // 2. Verify trace — on Invalid outcome, verifyTrace pre-computes all
+    //    deferred dep hashes (structural + implicit shape) so that recovery
+    //    gets L1 cache hits instead of expensive recomputation.
     if (verifyTrace(row->traceId, inputAccessors, state, scope)) {
         nrVerificationsPassed++;
         nrVerifyTimeUs += elapsedUs(verifyStart);
@@ -1314,7 +1355,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     // === Direct hash recovery (BSàlC CT) ===
     if (allComputable) {
         auto directHashStart = timerStart();
-        auto newFullHash = computeSortedTraceHash(currentDeps);
+        auto newFullHash = computePresortedTraceHash(currentDeps);
 
         if (auto * entry = lookupCandidate(newFullHash)) {
             if (auto r = acceptRecoveredTrace(*entry)) {
@@ -1348,6 +1389,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         groupStructHashes.emplace(e.depKeySetId, e.structHash);
     }
 
+    std::vector<Dep> repDeps;
     for (auto & [depKeySetId, repTraceId] : structGroups) {
         if (triedTraceIds.count(repTraceId))
             continue;
@@ -1359,7 +1401,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         auto repKeys = loadKeySet(depKeySetId);
 
         // Build Dep directly using Dep::Key
-        std::vector<Dep> repDeps;
+        repDeps.clear();
         bool repComputable = true;
         for (auto & key : repKeys) {
             if (isVolatile(key.type)) {
@@ -1386,7 +1428,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         if (!repComputable)
             continue;
 
-        auto candidateFullHash = computeSortedTraceHash(repDeps);
+        auto candidateFullHash = computePresortedTraceHash(repDeps);
 
         if (auto * entry = lookupCandidate(candidateFullHash)) {
             if (auto r = acceptRecoveredTrace(*entry)) {
