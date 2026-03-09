@@ -111,31 +111,11 @@ enum class DepType : uint8_t {
 };
 
 /**
- * Human-readable name for a DepType.
+ * Human-readable name for a DepType. O(1) table lookup via DepKindDescriptor.
+ * Forward-declared here; implementation uses describe() which is defined after
+ * the descriptor table below.
  */
-inline std::string depTypeName(DepType type)
-{
-    switch (type) {
-    case DepType::Content: return "content";
-    case DepType::Directory: return "directory";
-    case DepType::Existence: return "existence";
-    case DepType::EnvVar: return "envvar";
-    case DepType::CurrentTime: return "currentTime";
-    case DepType::System: return "system";
-    case DepType::UnhashedFetch: return "unhashedFetch";
-    case DepType::ParentContext: return "parentContext";
-    case DepType::CopiedPath: return "copiedPath";
-    case DepType::Exec: return "exec";
-    case DepType::NARContent: return "narContent";
-    case DepType::StructuredContent: return "structuredContent";
-    case DepType::ImplicitShape: return "implicitShape";
-    case DepType::RawContent: return "rawContent";
-    case DepType::StorePathExistence: return "storePathExistence";
-    case DepType::GitIdentity: return "gitIdentity";
-    case DepType::EndSentinel_: break;
-    }
-    unreachable();
-}
+inline constexpr std::string_view depTypeName(DepType type);
 
 /**
  * Fixed-size BLAKE3-256 hash. Stack-allocated, no heap allocation.
@@ -191,6 +171,70 @@ struct Blake3Hash {
         }
         return out;
     }
+};
+
+/**
+ * Phantom-typed BLAKE3 hash. Tag prevents cross-domain confusion at compile time.
+ * TraceHash (full trace signature), StructHash (dep structure only), and
+ * ResultHash (result content) are distinct types. Explicit .raw() required
+ * for cross-domain operations (e.g., TraceHash → DepHashValue for ParentContext).
+ */
+template<typename Tag>
+struct TypedHash {
+    Blake3Hash hash{};
+
+    bool operator==(const TypedHash &) const = default;
+    auto operator<=>(const TypedHash &) const = default;
+
+    /// Explicit access to underlying Blake3Hash for cross-domain conversions.
+    const Blake3Hash & raw() const { return hash; }
+    Blake3Hash & raw() { return hash; }
+
+    /// Construct from raw Blake3Hash (explicit).
+    static TypedHash from(Blake3Hash h) { return {h}; }
+
+    /// Construct from HashSink result.
+    static TypedHash fromSink(HashSink & sink) {
+        return {Blake3Hash::fromHash(sink.finish().hash)};
+    }
+
+    /// Construct from raw BLOB.
+    static TypedHash fromBlob(const void * data, size_t len) {
+        return {Blake3Hash::fromBlob(data, len)};
+    }
+
+    /// Format as hex for logging/diagnostics.
+    std::string toHex() const { return hash.toHex(); }
+
+    struct Hasher {
+        using is_avalanching = void;
+        size_t operator()(const TypedHash & h) const noexcept {
+            return Blake3Hash::Hasher{}(h.hash);
+        }
+    };
+};
+
+struct TraceHashTag {};
+struct StructHashTag {};
+struct ResultHashTag {};
+
+using TraceHash = TypedHash<TraceHashTag>;    ///< BLAKE3(deps keys + values)
+using StructHash = TypedHash<StructHashTag>;  ///< BLAKE3(dep keys only, no values)
+using ResultHash = TypedHash<ResultHashTag>;  ///< BLAKE3(type + value + context)
+
+/**
+ * Convenience BLAKE3 hasher. Wraps HashSink and produces Blake3Hash or
+ * TypedHash<Tag> directly, eliminating the verbose fromHash(sink.finish().hash).
+ */
+struct Blake3Hasher {
+    HashSink sink{HashAlgorithm::BLAKE3};
+
+    Blake3Hasher & operator()(std::string_view data) { sink(data); return *this; }
+
+    Blake3Hash finish() { return Blake3Hash::fromHash(sink.finish().hash); }
+
+    template<typename Tag>
+    TypedHash<Tag> finishAs() { return TypedHash<Tag>::from(finish()); }
 };
 
 /**
@@ -253,6 +297,7 @@ struct DepKindDescriptor {
     bool isBlake3;        ///< true = stores BLAKE3 hash; false = stores string
     bool isOverrideable;  ///< true = can be overridden by StructuredContent
     bool isVolatile;      ///< true = always fails verification
+    const char * name;    ///< human-readable name for the DepType
 };
 
 /**
@@ -263,37 +308,37 @@ inline constexpr DepKindDescriptor makeDescriptor(DepType type)
 {
     switch (type) {
     case DepType::Content:
-        return {DepKind::ContentOverrideable, true, true, false};
+        return {DepKind::ContentOverrideable, true, true, false, "content"};
     case DepType::Directory:
-        return {DepKind::ContentOverrideable, true, true, false};
+        return {DepKind::ContentOverrideable, true, true, false, "directory"};
     case DepType::Existence:
-        return {DepKind::Normal, false, false, false};
+        return {DepKind::Normal, false, false, false, "existence"};
     case DepType::EnvVar:
-        return {DepKind::Normal, true, false, false};
+        return {DepKind::Normal, true, false, false, "envvar"};
     case DepType::CurrentTime:
-        return {DepKind::Volatile, false, false, true};
+        return {DepKind::Volatile, false, false, true, "currentTime"};
     case DepType::System:
-        return {DepKind::Normal, true, false, false};
+        return {DepKind::Normal, true, false, false, "system"};
     case DepType::UnhashedFetch:
-        return {DepKind::Normal, false, false, false};
+        return {DepKind::Normal, false, false, false, "unhashedFetch"};
     case DepType::ParentContext:
-        return {DepKind::ParentContext, true, false, false};
+        return {DepKind::ParentContext, true, false, false, "parentContext"};
     case DepType::CopiedPath:
-        return {DepKind::Normal, false, false, false};
+        return {DepKind::Normal, false, false, false, "copiedPath"};
     case DepType::Exec:
-        return {DepKind::Volatile, false, false, true};
+        return {DepKind::Volatile, false, false, true, "exec"};
     case DepType::NARContent:
-        return {DepKind::Normal, true, false, false};
+        return {DepKind::Normal, true, false, false, "narContent"};
     case DepType::StructuredContent:
-        return {DepKind::Structural, true, false, false};
+        return {DepKind::Structural, true, false, false, "structuredContent"};
     case DepType::ImplicitShape:
-        return {DepKind::ImplicitStructural, true, false, false};
+        return {DepKind::ImplicitStructural, true, false, false, "implicitShape"};
     case DepType::RawContent:
-        return {DepKind::Normal, true, false, false};
+        return {DepKind::Normal, true, false, false, "rawContent"};
     case DepType::StorePathExistence:
-        return {DepKind::Normal, false, false, false};
+        return {DepKind::Normal, false, false, false, "storePathExistence"};
     case DepType::GitIdentity:
-        return {DepKind::ImplicitStructural, true, false, false};
+        return {DepKind::ImplicitStructural, true, false, false, "gitIdentity"};
     case DepType::EndSentinel_:
         break;
     }
@@ -336,6 +381,14 @@ inline constexpr const DepKindDescriptor & describe(DepType type)
 inline constexpr DepKind depKind(DepType type)
 {
     return describe(type).kind;
+}
+
+/**
+ * Human-readable name for a DepType. O(1) table lookup.
+ */
+inline constexpr std::string_view depTypeName(DepType type)
+{
+    return describe(type).name;
 }
 
 /**

@@ -1,5 +1,10 @@
 #pragma once
 ///@file
+/// Core dependency tracking: DependencyTracker, SuspendDepTracking, and
+/// provenance helpers. For specific dep recording categories, include:
+///   - input-resolution.hh: file deps, readFile provenance, RawContent
+///   - shape-recording.hh: StructuredContent deps (#len, #keys, #has:key, #type)
+///   - nix-binding.hh: NixBinding per-binding .nix attrset tracking
 
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
@@ -8,7 +13,6 @@
 #include "nix/expr/symbol-table.hh"
 #include "nix/util/position.hh"
 
-#include <filesystem>
 #include <vector>
 
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -41,7 +45,7 @@ struct DependencyTracker {
     /// recordToEpochLog() appends here only (not to any tracker's ownDeps).
     static thread_local std::vector<Dep> epochLog;
     /// Nesting depth of live DependencyTracker instances on this thread.
-    /// Only the first (depth 0 → 1) is a true root that should call
+    /// Only the first (depth 0 -> 1) is a true root that should call
     /// onRootConstruction(). Trackers created inside a SuspendDepTracking
     /// scope see previous == nullptr but depth > 0, so they correctly
     /// skip the session cache reset.
@@ -88,13 +92,13 @@ struct DependencyTracker {
     }
 
     /**
-     * Called when a root DependencyTracker is constructed (depth 0→1).
+     * Called when a root DependencyTracker is constructed (depth 0->1).
      * Creates a RootTrackerScope containing all Lifetime 2 caches.
      */
     static void onRootConstruction();
 
     /**
-     * Called when a root DependencyTracker is destroyed (depth 1→0).
+     * Called when a root DependencyTracker is destroyed (depth 1->0).
      * Destroys the RootTrackerScope, clearing all Lifetime 2 caches.
      */
     static void onRootDestruction();
@@ -194,328 +198,5 @@ struct SuspendDepTracking {
     SuspendDepTracking(const SuspendDepTracking &) = delete;
     SuspendDepTracking & operator=(const SuspendDepTracking &) = delete;
 };
-
-/**
- * Resolve an absolute path to an (inputName, relativePath) pair using
- * a mount-point-to-input mapping. Walks up the path trying each prefix.
- */
-std::optional<std::pair<std::string, CanonPath>> resolveToInput(
-    const CanonPath & absPath,
-    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
-
-/**
- * Record a file dependency, resolving to an input-relative path if possible.
- * In non-flake mode (mountToInput empty), records absolute paths with
- * inputName="". In flake mode, paths that can't be resolved to any input
- * are recorded with inputName="<absolute>" so they are validated directly
- * against the real filesystem.
- */
-void recordDep(
-    InterningPools & pools,
-    const CanonPath & absPath,
-    const DepHashValue & hash,
-    DepType depType,
-    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput,
-    std::string_view storeName = {});
-
-/**
- * Provenance information from a readFile call, used to connect
- * fromJSON/fromTOML to the file that was read. Thread-local, set by
- * prim_readFile and consumed by prim_fromJSON/prim_fromTOML.
- */
-struct ReadFileProvenance {
-    CanonPath path;
-    Blake3Hash contentHash;
-};
-
-/**
- * Add read-file provenance keyed by content hash. Multiple readFile
- * results can coexist; fromJSON/fromTOML look up by content hash.
- */
-void addReadFileProvenance(ReadFileProvenance prov);
-
-/**
- * Look up read-file provenance by content hash. Returns a non-owning
- * pointer (nullptr if not found). Non-consuming: the same provenance
- * can serve multiple fromJSON/fromTOML calls on the same string.
- */
-const ReadFileProvenance * lookupReadFileProvenance(const Blake3Hash & contentHash);
-
-/**
- * Clear the thread-local read-file provenance map.
- * Called on root DependencyTracker construction.
- */
-void clearReadFileProvenanceMap();
-
-/**
- * Register a readFile result's string data pointer for RawContent tracking.
- * Called by prim_readFile after mkString. Maps the Value's c_str() pointer
- * to the content hash already computed by readFile.
- */
-void addReadFileStringPtr(const char * ptr, const Blake3Hash & contentHash);
-
-/**
- * Clear the thread-local readFile string pointer map.
- * Called on root DependencyTracker construction.
- */
-void clearReadFileStringPtrs();
-
-class EvalState;
-
-/**
- * Record a RawContent dep if the string value came from readFile.
- * Checks the readFileStringPtrs map by pointer identity (O(1)).
- * Called by string builtins that observe raw bytes (stringLength,
- * hashString, substring, match, split, replaceStrings) and eqValues.
- * No-op if dep tracking is inactive or the string didn't come from readFile.
- */
-[[gnu::cold]] void maybeRecordRawContentDep(EvalState & state, const Value & v);
-
-/**
- * Resolve an absolute path to a (source, key) pair for dep recording,
- * using the same resolution logic as recordDep. Helper for provenance
- * consumers that need to construct dep keys.
- */
-std::pair<std::string, std::string> resolveProvenance(
-    const CanonPath & absPath,
-    const boost::unordered_flat_map<CanonPath, std::pair<std::string, std::string>> & mountToInput);
-
-/**
- * Provenance information for a container Value (attrset or list) produced
- * by ExprTracedData::eval(). Uses interned IDs matching the session pools.
- * Used by shape-observing builtins (length, attrNames, hasAttr) to record
- * shape deps (#len, #keys, #has:key).
- */
-struct TracedContainerProvenance {
-    DepSourceId sourceId;
-    FilePathId filePathId;
-    DataPathId dataPathId;
-    StructuredFormat format;
-};
-
-/**
- * Non-owning pointer to a GC-stable TracedContainerProvenance.
- * Used for list provenance tracking (lists still use the container map).
- */
-using ProvenanceRef = const TracedContainerProvenance *;
-
-/**
- * Allocate a TracedContainerProvenance in a stable, non-GC thread-local pool.
- * Used for list provenance. Returns a pointer valid until the next root
- * DependencyTracker construction (which clears the pool).
- */
-ProvenanceRef allocateProvenance(DepSourceId sourceId, FilePathId filePathId,
-                                 DataPathId dataPathId, StructuredFormat format);
-
-/**
- * Register a list container in the thread-local provenance map.
- * The key is the first element Value* (heap-allocated, stable across copies).
- * Empty lists cannot be tracked (no stable internal pointer).
- */
-void registerTracedContainer(const void * key, const TracedContainerProvenance * prov);
-
-/**
- * Look up a list container's provenance in the thread-local provenance map.
- * Returns nullptr if not found. For lists only (attrsets use PosIdx).
- */
-const TracedContainerProvenance * lookupTracedContainer(const void * key);
-
-/**
- * Clear the thread-local traced container provenance map.
- * Called on root DependencyTracker construction.
- */
-void clearTracedContainerMap();
-
-class PosTable;
-
-// ═══════════════════════════════════════════════════════════════════════
-// Component interning — zero-allocation dep key construction
-// ═══════════════════════════════════════════════════════════════════════
-
-/**
- * Compact interned representation of a StructuredContent dep key.
- * All fields are process-lifetime pool indices. Zero string allocation.
- * JSON dep key is constructed only for non-duplicate deps at serialization time.
- */
-struct CompactDepComponents {
-    DepSourceId sourceId;
-    FilePathId filePathId;
-    StructuredFormat format;
-    DataPathId dataPathId;
-    ShapeSuffix suffix;     ///< None/Len/Keys/Type
-    Symbol hasKey;           ///< non-zero for #has: deps
-};
-
-/**
- * Convert a DataPath trie node to a JSON array string of path components.
- * Object keys become JSON strings; array indices become JSON numbers.
- * Only called for non-duplicate deps at serialization time.
- * Returns the serialized JSON array, e.g. '["nodes","nixpkgs",0]'.
- */
-std::string dataPathToJsonString(InterningPools & pools, DataPathId nodeId);
-
-/**
- * Convert a JSON array string of path components back to a DataPath trie node ID.
- * Used when replaying cached origins (trace-cache.cc).
- */
-DataPathId jsonStringToDataPathId(InterningPools & pools, std::string_view jsonStr);
-
-/**
- * Record a StructuredContent dep with zero-allocation dedup.
- * Hashes the compact integer components for dedup; only builds JSON
- * dep key string for non-duplicates (confirmed novel deps).
- * Returns true if the dep was recorded (not a duplicate).
- */
-[[gnu::cold]] bool recordStructuredDep(
-    InterningPools & pools,
-    const CompactDepComponents & c,
-    const DepHashValue & hash,
-    DepType depType = DepType::StructuredContent);
-
-/**
- * Precomputed keys hash from ExprTracedData::eval() Object case.
- * Stored in a thread-local side map keyed by PosTable origin offset (stable
- * from PosTable origins vector). At access time, maybeRecordAttrKeysDep compares
- * visible key count to stored count; if equal, uses the precomputed hash directly,
- * avoiding the sort + concat + BLAKE3 hash that dominates its runtime.
- * Uses interned IDs to avoid string allocation.
- */
-struct PrecomputedKeysInfo {
-    Blake3Hash hash;
-    uint32_t keyCount;
-    DepSourceId sourceId;
-    FilePathId filePathId;
-    DataPathId dataPathId;
-    StructuredFormat format;
-};
-
-/**
- * Register a precomputed keys hash for a TracedData origin.
- * Called from ExprTracedData::eval() after recording ImplicitShape #keys.
- * The key is the PosTable origin offset (stable across vector reallocation,
- * unlike raw Origin* pointers which are invalidated by vector growth).
- */
-void registerPrecomputedKeys(uint32_t originOffset, PrecomputedKeysInfo info);
-
-/**
- * Clear the precomputed keys map. Called on root DependencyTracker construction.
- */
-void clearPrecomputedKeysMap();
-
-/**
- * Record a #len StructuredContent dep if the list value came from
- * ExprTracedData (checked via traced container provenance map).
- * No-op if dep tracking is inactive or list is empty (no stable key).
- */
-[[gnu::cold]] void maybeRecordListLenDep(const Value & v);
-
-/**
- * Record a #keys StructuredContent dep if the attrset contains attrs
- * with TracedData provenance (checked via PosTable::originOf on Attr::pos).
- * Groups by origin — mixed-provenance attrsets get partial recording.
- * No-op if dep tracking is inactive or value is not an attrset.
- */
-[[gnu::cold]] void maybeRecordAttrKeysDep(const PosTable & positions, const SymbolTable & symbols, const Value & v);
-
-/**
- * Record per-key #has deps for intersectAttrs in bulk. Pre-computes TracedData
- * origins for each operand (one scan each), then iterates keys recording:
- * - exists=true for intersection keys (tag bit check per attr, no origin scan)
- * - exists=false for disjoint keys (against pre-computed origins only)
- * Skips operands with no TracedData entirely, reducing ~100K deps to ~55
- * in the typical callPackage pattern (50-key functionArgs vs 50K allPackages).
- */
-[[gnu::cold]] void recordIntersectAttrsDeps(const PosTable & positions, const SymbolTable & symbols,
-                                            const Value & left, const Value & right);
-
-/**
- * Record a #has:key StructuredContent dep using PosIdx-based provenance.
- * For exists=true: checks the found attr's PosIdx origin — if TracedData,
- * records depHash("1"); if Nix-added (no TracedData origin), skips.
- * For exists=false: scans all attrs, records depHash("0") against each
- * unique TracedData origin.
- */
-[[gnu::cold]] void maybeRecordHasKeyDep(const PosTable & positions, const SymbolTable & symbols,
-                          const Value & v, Symbol keyName, bool exists);
-
-/**
- * Record a #type StructuredContent dep if the value is a container.
- * For attrsets: uses PosIdx-based TracedData origin scanning.
- * For lists: uses the existing tracedContainerMap lookup.
- * No-op if dep tracking is inactive or value is not a container.
- */
-[[gnu::cold]] void maybeRecordTypeDep(const PosTable & positions, const Value & v);
-
-// ═══════════════════════════════════════════════════════════════════════
-// NixBinding — per-binding .nix attrset tracking
-// ═══════════════════════════════════════════════════════════════════════
-
-struct Expr;
-struct ExprAttrs;
-
-/**
- * Registry entry for a single binding in a non-recursive ExprAttrs.
- * Keyed by PosIdx in the thread-local registry; looked up at attribute
- * access time by maybeRecordNixBindingDep.
- */
-struct NixBindingEntry {
-    DepSourceId sourceId;
-    FilePathId filePathId;
-    DataPathId dataPathId;     ///< internChild(root, bindingName)
-    Blake3Hash bindingHash;    ///< BLAKE3(scopeHash + name + kind + show(expr))
-};
-
-/**
- * Walk AST from root through lambda/with/let/update chains.
- * Returns (exprAttrs, scopeExprs) if an eligible non-recursive ExprAttrs
- * is found; (nullptr, {}) otherwise.
- */
-std::pair<ExprAttrs *, std::vector<Expr *>> findNonRecExprAttrs(Expr * root);
-
-/**
- * Compute a BLAKE3 hash capturing the enclosing scope structure.
- * Any change to the scope (lambda formals, let bindings, with expressions)
- * changes all binding hashes from that file.
- */
-Blake3Hash computeNixScopeHash(const std::vector<Expr *> & scopeExprs, const SymbolTable & symbols);
-
-/**
- * Compute a BLAKE3 hash for a single binding definition.
- * Hash = BLAKE3(scopeHash || '\0' || name || '\0' || kindTag || '\0' || show(expr)).
- *
- * @param exprToShow  The expression to serialize. For plain/inherited bindings
- *   this is def.e directly. For InheritedFrom bindings, callers MUST pass the
- *   resolved source expression from inheritFromExprs[displ] — NOT def.e,
- *   which is an ExprInheritFrom whose show() crashes (Symbol(0) underflow).
- *   Pass nullptr to omit the expression from the hash (conservative fallback).
- */
-Blake3Hash computeNixBindingHash(
-    const Blake3Hash & scopeHash,
-    std::string_view name,
-    int kindTag,
-    const Expr * exprToShow,
-    const SymbolTable & symbols);
-
-/**
- * Register all bindings from an eligible ExprAttrs into the thread-local
- * registry. Called from ExprParseFile::eval at parse time.
- */
-void registerNixBindings(ExprAttrs * exprAttrs,
-                         const std::string & depSource, const std::string & depKey,
-                         const Blake3Hash & scopeHash, const SymbolTable & symbols,
-                         InterningPools & pools);
-
-/**
- * Record a NixBinding StructuredContent dep if the given PosIdx is
- * registered in the thread-local registry. Called from ExprSelect::eval,
- * ExprOpHasAttr::eval, and prim_getAttr.
- */
-[[gnu::cold]] void maybeRecordNixBindingDep(PosIdx pos);
-
-/**
- * Clear the thread-local NixBinding registry.
- * Called on root DependencyTracker construction.
- */
-void clearNixBindingRegistry();
 
 } // namespace nix

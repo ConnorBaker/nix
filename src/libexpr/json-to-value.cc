@@ -2,6 +2,8 @@
 #include "nix/expr/eval-trace/data/traced-data.hh"
 #include "nix/expr/eval-trace/deps/hash.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/deps/shape-recording.hh"
+#include "nix/expr/eval-trace/deps/root-tracker-scope.hh"
 #include "nix/expr/eval-trace/context.hh"
 #include "nix/expr/eval-trace/cache/trace-cache.hh"
 #include "nix/expr/value.hh"
@@ -359,7 +361,8 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
 
                 PosIdx anyKeyPos = v.attrs()->begin()->pos;
                 if (auto off = state.positions.originOffsetOf(anyKeyPos)) {
-                    registerPrecomputedKeys(*off, PrecomputedKeysInfo{
+                    if (auto * scope = RootTrackerScope::current)
+                        scope->registerPrecomputedKeys(*off, PrecomputedKeysInfo{
                         keysHash,
                         static_cast<uint32_t>(keys.size()),
                         sourceId, filePathId, dataPathId, fmt,
@@ -395,8 +398,10 @@ void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
                 // Non-empty: ImplicitShape #len fingerprint at creation time.
                 recordStructuredDep(pools, lenComp, DepHashValue(depHash(std::to_string(sz))), DepType::ImplicitShape);
 
-                auto * prov = allocateProvenance(sourceId, filePathId, dataPathId, fmt);
-                registerTracedContainer((const void *)list[0], prov);
+                if (auto * scope = RootTrackerScope::current) {
+                    auto * prov = scope->allocateProvenance(sourceId, filePathId, dataPathId, fmt);
+                    scope->registerTracedContainer((const void *)list[0], prov);
+                }
             }
         }
         break;

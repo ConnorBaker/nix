@@ -9,7 +9,7 @@ namespace nix::eval_trace {
 
 // ── Result hashing ───────────────────────────────────────────────────
 
-Hash computeResultHash(ResultKind type, std::string_view value, std::string_view context)
+ResultHash computeResultHash(ResultKind type, std::string_view value, std::string_view context)
 {
     HashSink sink(HashAlgorithm::BLAKE3);
     sink(std::string_view("T", 1));
@@ -19,7 +19,7 @@ Hash computeResultHash(ResultKind type, std::string_view value, std::string_view
     sink(value);
     sink(std::string_view("C", 1));
     sink(context);
-    return sink.finish().hash;
+    return ResultHash::fromSink(sink);
 }
 
 // ── CachedResult SQL encoding/decoding ──────────────────────────────────

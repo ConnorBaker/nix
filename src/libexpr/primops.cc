@@ -4,6 +4,10 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
+#include "nix/expr/eval-trace/deps/shape-recording.hh"
+#include "nix/expr/eval-trace/deps/nix-binding.hh"
+#include "nix/expr/eval-trace/deps/root-tracker-scope.hh"
 #include "nix/expr/eval-trace/data/traced-data.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/expr/json-to-value.hh"
@@ -2152,7 +2156,8 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
         recordDep(*state.traceCtx->pools,path.path, hash, DepType::Content, state.getMountToInput());
         // Set provenance so a subsequent fromJSON/fromTOML can produce lazy
         // structural deps instead of relying solely on the whole-file Content dep.
-        addReadFileProvenance({path.path, hash});
+        if (auto * scope = RootTrackerScope::current)
+            scope->addReadFileProvenance({path.path, hash});
         contentHash = hash;
     }
 
@@ -2184,7 +2189,8 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
     // (stringLength, hashString, etc.) check this map to record a RawContent
     // dep that prevents SC two-level override from covering raw byte observations.
     if (contentHash)
-        addReadFileStringPtr(v.c_str(), *contentHash);
+        if (auto * scope = RootTrackerScope::current)
+            scope->addReadFileStringPtr(v.c_str(), *contentHash);
 }
 
 static RegisterPrimOp primop_readFile({
@@ -2846,7 +2852,8 @@ static void prim_fromJSON(EvalState & state, const PosIdx pos, Value ** args, Va
     // If the string came directly from readFile (provenance hash matches),
     // produce lazy traced data with fine-grained StructuredContent deps.
     if (state.traceActiveDepth) [[unlikely]] {
-        if (auto * prov = lookupReadFileProvenance(depHash(s))) {
+        auto * scope = RootTrackerScope::current;
+        if (auto * prov = scope ? scope->lookupReadFileProvenance(depHash(s)) : nullptr) {
             auto [depSource, depKey] = resolveProvenance(prov->path, state.getMountToInput());
             try {
                 parseTracedJSON(state, s, v, depSource, depKey);

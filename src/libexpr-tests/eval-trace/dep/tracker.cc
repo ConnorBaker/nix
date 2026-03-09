@@ -4,6 +4,9 @@
 
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
+#include "nix/expr/eval-trace/deps/shape-recording.hh"
+#include "nix/expr/eval-trace/deps/root-tracker-scope.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/util/source-path.hh"
 
@@ -168,12 +171,14 @@ TEST_F(DependencyTrackerTest, Suspend_TrackerInsideSuspendPreservesSessionCaches
     auto srcId = pools.intern<DepSourceId>("test-input");
     auto fpId = pools.filePathPool.intern("/test.json");
     auto dpId = jsonStringToDataPathId(pools, "[]");
-    auto * prov = allocateProvenance(srcId, fpId, dpId, StructuredFormat::Json);
+    auto * scope = RootTrackerScope::current;
+    ASSERT_NE(scope, nullptr);
+    auto * prov = scope->allocateProvenance(srcId, fpId, dpId, StructuredFormat::Json);
 
     // Use an arbitrary pointer as a list container key.
     int fakeValue = 0;
-    registerTracedContainer(&fakeValue, prov);
-    ASSERT_NE(lookupTracedContainer(&fakeValue), nullptr);
+    scope->registerTracedContainer(&fakeValue, prov);
+    ASSERT_NE(scope->lookupTracedContainer(&fakeValue), nullptr);
 
     // Create a new tracker inside a suspended scope. Without the fix,
     // previous == nullptr triggers onRootConstruction() and wipes the caches.
@@ -182,7 +187,7 @@ TEST_F(DependencyTrackerTest, Suspend_TrackerInsideSuspendPreservesSessionCaches
         DependencyTracker inner(pools);
     }
 
-    EXPECT_EQ(lookupTracedContainer(&fakeValue), prov)
+    EXPECT_EQ(scope->lookupTracedContainer(&fakeValue), prov)
         << "Provenance must survive a DependencyTracker created inside SuspendDepTracking";
 }
 

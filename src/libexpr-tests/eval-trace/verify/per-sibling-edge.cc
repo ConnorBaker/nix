@@ -324,7 +324,7 @@ TEST_F(PerSiblingInvalidationTest, SiblingIdenticalResult_DifferentDeps_Differen
     ASSERT_TRUE(sibHashV2.has_value());
 
     // Trace hashes should differ (deps differ, even though result is same)
-    EXPECT_NE(std::memcmp(sibHashV1->hash, sibHashV2->hash, 32), 0)
+    EXPECT_NE(*sibHashV1, *sibHashV2)
         << "Sibling trace hashes should differ when deps differ";
 
     db.clearSessionCaches();
@@ -636,7 +636,7 @@ TEST_F(PerSiblingInvalidationTest, PerSiblingDep_SiblingResultChanges_SameDeps_C
     ASSERT_TRUE(sibHashAfter.has_value());
 
     // Trace hash unchanged because deps are identical (result not included)
-    EXPECT_EQ(std::memcmp(sibHash->hash, sibHashAfter->hash, 32), 0)
+    EXPECT_EQ(*sibHash, *sibHashAfter)
         << "BUG: trace hash only covers deps, not result — same deps → same hash";
 
     db.clearSessionCaches();

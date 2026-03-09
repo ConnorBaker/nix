@@ -322,7 +322,7 @@ namespace {
     thread_local bool callbackInvoked;
     thread_local bool callbackReturnValue;
 
-    bool testCallback(void *, void *)
+    bool testCallback(eval_trace::TracedExpr *, eval_trace::TraceStore *)
     {
         callbackInvoked = true;
         return callbackReturnValue;

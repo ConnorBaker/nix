@@ -8,23 +8,6 @@
 
 namespace nix::eval_trace {
 
-// ── Raw hash helpers ─────────────────────────────────────────────────
-
-void bindRawHash(SQLiteStmt::Use & use, const Hash & h)
-{
-    use(reinterpret_cast<const unsigned char *>(h.hash),
-        static_cast<size_t>(h.hashSize));
-}
-
-Hash readRawHash(const void * data, size_t size)
-{
-    if (size != 32)
-        throw Error("expected 32-byte BLAKE3 hash blob, got %d bytes", size);
-    Hash h(HashAlgorithm::BLAKE3);
-    memcpy(h.hash, data, 32);
-    return h;
-}
-
 // ── BLOB binding helper (ensures non-null pointer for empty BLOBs) ───
 
 void bindBlobVec(SQLiteStmt::Use & use, const std::vector<uint8_t> & blob)

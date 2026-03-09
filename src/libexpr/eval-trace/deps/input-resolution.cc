@@ -1,5 +1,6 @@
 #include "nix/expr/eval-trace/deps/recording.hh"
-#include "root-tracker-scope.hh"
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
+#include "nix/expr/eval-trace/deps/root-tracker-scope.hh"
 #include "nix/expr/eval-trace/store/stat-hash-store.hh"
 #include "nix/expr/eval.hh"
 #include "nix/util/file-system.hh"
@@ -128,51 +129,6 @@ void recordDep(
 // ReadFile provenance threading
 // ═══════════════════════════════════════════════════════════════════════
 
-// Content hash → ReadFileProvenance (field of RootTrackerScope).
-// Populated by prim_readFile, queried by prim_fromJSON/prim_fromTOML to
-// enable lazy structural dep tracking. Keyed by content hash so multiple
-// readFile results coexist and the same provenance can serve multiple
-// fromJSON/fromTOML calls (non-consuming lookup).
-void addReadFileProvenance(ReadFileProvenance prov)
-{
-    auto * scope = RootTrackerScope::current;
-    if (scope) scope->readFileProvenanceMap.insert_or_assign(prov.contentHash, std::move(prov));
-}
-
-const ReadFileProvenance * lookupReadFileProvenance(const Blake3Hash & contentHash)
-{
-    auto * scope = RootTrackerScope::current;
-    if (!scope) return nullptr;
-    auto it = scope->readFileProvenanceMap.find(contentHash);
-    return it != scope->readFileProvenanceMap.end() ? &it->second : nullptr;
-}
-
-void clearReadFileProvenanceMap()
-{
-    auto * scope = RootTrackerScope::current;
-    if (scope) scope->readFileProvenanceMap.clear();
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// ReadFile string pointer tracking for RawContent deps
-// ═══════════════════════════════════════════════════════════════════════
-
-// String data pointer → content hash (field of RootTrackerScope).
-// Populated by prim_readFile, queried by string builtins that observe raw bytes.
-// Key is a raw const char* — valid because readFile strings are GC-allocated
-// and stable within a root tracker scope. Typically empty or very small.
-void addReadFileStringPtr(const char * ptr, const Blake3Hash & contentHash)
-{
-    auto * scope = RootTrackerScope::current;
-    if (scope) scope->readFileStringPtrs.emplace(ptr, contentHash);
-}
-
-void clearReadFileStringPtrs()
-{
-    auto * scope = RootTrackerScope::current;
-    if (scope) scope->readFileStringPtrs.clear();
-}
-
 [[gnu::cold]] void maybeRecordRawContentDep(EvalState & state, const Value & v)
 {
     if (!DependencyTracker::isActive()) return;
@@ -181,7 +137,7 @@ void clearReadFileStringPtrs()
     if (!scope) return;
     auto it = scope->readFileStringPtrs.find(v.c_str());
     if (it == scope->readFileStringPtrs.end()) return;
-    auto * prov = lookupReadFileProvenance(it->second);
+    auto * prov = scope->lookupReadFileProvenance(it->second);
     if (!prov) return;
     auto [source, key] = resolveProvenance(prov->path, state.getMountToInput());
     DependencyTracker::record(DependencyTracker::activeTracker->pools, DepType::RawContent, source, key, DepHashValue(it->second));

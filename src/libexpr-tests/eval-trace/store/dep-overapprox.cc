@@ -1,6 +1,7 @@
 #include "eval-trace/helpers.hh"
 #include "nix/expr/eval-trace/store/trace-store.hh"
 #include "nix/expr/eval-trace/deps/hash.hh"
+#include "nix/expr/eval-trace/deps/nix-binding.hh"
 
 #include <fstream>
 #include <gtest/gtest.h>

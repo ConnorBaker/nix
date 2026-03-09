@@ -1,5 +1,8 @@
 #include "nix/expr/eval-trace/deps/recording.hh"
-#include "root-tracker-scope.hh"
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
+#include "nix/expr/eval-trace/deps/shape-recording.hh"
+#include "nix/expr/eval-trace/deps/nix-binding.hh"
+#include "nix/expr/eval-trace/deps/root-tracker-scope.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/util/logging.hh"
 
@@ -56,7 +59,9 @@ namespace nix {
 // │   - evalCaches         (flake hash → TraceCache instances)         │
 // │   - fileContentHashes  (SourcePath → BLAKE3 for Content deps)     │
 // │   - mountToInput       (mount point → (inputName, subdir))         │
-// │   (siblingIdentityMap + siblingCallback live in RootTrackerScope)  │
+// │   - siblingIdentityMap (Value* → TracedExpr/TraceStore identity)   │
+// │   - siblingCallback    (sibling detection callback, set by         │
+// │                          SiblingAccessTracker)                      │
 // └─────────────────────────────────────────────────────────────────────┘
 //
 // The StatHashStore singleton (stat-hash-store.hh/cc) is a fourth scope
@@ -140,51 +145,6 @@ void DependencyTracker::onRootConstruction()
 void DependencyTracker::onRootDestruction()
 {
     rootScopeStorage.reset();
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Lifetime 2 accessors
-// ═══════════════════════════════════════════════════════════════════════
-
-ProvenanceRef allocateProvenance(DepSourceId sourceId, FilePathId filePathId,
-                                 DataPathId dataPathId, StructuredFormat format)
-{
-    auto * scope = RootTrackerScope::current;
-    if (!scope) return nullptr;
-    scope->provenancePool.emplace_back(TracedContainerProvenance{sourceId, filePathId, dataPathId, format});
-    return &scope->provenancePool.back();
-}
-
-void registerTracedContainer(const void * key, const TracedContainerProvenance * prov)
-{
-    auto * scope = RootTrackerScope::current;
-    if (scope) scope->tracedContainerMap.emplace(key, prov);
-}
-
-const TracedContainerProvenance * lookupTracedContainer(const void * key)
-{
-    auto * scope = RootTrackerScope::current;
-    if (!scope) return nullptr;
-    auto it = scope->tracedContainerMap.find(key);
-    return it != scope->tracedContainerMap.end() ? it->second : nullptr;
-}
-
-void clearTracedContainerMap()
-{
-    auto * scope = RootTrackerScope::current;
-    if (scope) scope->tracedContainerMap.clear();
-}
-
-void registerPrecomputedKeys(uint32_t originOffset, PrecomputedKeysInfo info)
-{
-    auto * scope = RootTrackerScope::current;
-    if (scope) scope->precomputedKeysMap.emplace(originOffset, std::move(info));
-}
-
-void clearPrecomputedKeysMap()
-{
-    auto * scope = RootTrackerScope::current;
-    if (scope) scope->precomputedKeysMap.clear();
 }
 
 // ═══════════════════════════════════════════════════════════════════════

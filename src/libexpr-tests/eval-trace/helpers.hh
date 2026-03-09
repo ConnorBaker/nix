@@ -317,9 +317,9 @@ inline Dep makeGitIdentityDep(InterningPools & p, std::string_view repoPath, std
 }
 
 /// Create a ParentContext Dep from an AttrPathId and trace hash.
-inline Dep makeParentContextDep(AttrPathId pathId, const Hash & traceHash)
+inline Dep makeParentContextDep(AttrPathId pathId, const TraceHash & traceHash)
 {
-    return Dep::makeParentContext(pathId, DepHashValue(Blake3Hash::fromHash(traceHash)));
+    return Dep::makeParentContext(pathId, DepHashValue(traceHash.raw()));
 }
 
 // ── CachedResult comparison ─────────────────────────────────────────

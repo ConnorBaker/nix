@@ -22,8 +22,8 @@ TEST_F(TraceStoreTest, GetCurrentTraceHash_ReturnsHash)
     // Deterministic: same call returns same hash
     auto hash2 = db.getCurrentTraceHash(vpath({"root"}));
     ASSERT_TRUE(hash2.has_value());
-    EXPECT_EQ(hash->to_string(HashFormat::Base16, false),
-              hash2->to_string(HashFormat::Base16, false));
+    EXPECT_EQ(hash->toHex(),
+              hash2->toHex());
 }
 
 TEST_F(TraceStoreTest, GetCurrentTraceHash_MissingAttr)
@@ -47,8 +47,8 @@ TEST_F(TraceStoreTest, GetCurrentTraceHash_ChangesWithDeps)
     auto hash2 = db.getCurrentTraceHash(vpath({"root"}));
     ASSERT_TRUE(hash2.has_value());
 
-    EXPECT_NE(hash1->to_string(HashFormat::Base16, false),
-              hash2->to_string(HashFormat::Base16, false));
+    EXPECT_NE(hash1->toHex(),
+              hash2->toHex());
 }
 
 TEST_F(TraceStoreTest, GetCurrentTraceHash_DiffersFromResultHash)
@@ -67,8 +67,8 @@ TEST_F(TraceStoreTest, GetCurrentTraceHash_DiffersFromResultHash)
     ASSERT_TRUE(hashB.has_value());
 
     // Same result but different deps → different trace hashes
-    EXPECT_NE(hashA->to_string(HashFormat::Base16, false),
-              hashB->to_string(HashFormat::Base16, false));
+    EXPECT_NE(hashA->toHex(),
+              hashB->toHex());
 }
 
 TEST_F(TraceStoreTest, GetCurrentTraceHash_MultiComponentPath)
@@ -87,8 +87,8 @@ TEST_F(TraceStoreTest, GetCurrentTraceHash_MultiComponentPath)
     // Deterministic: same pathId returns same hash
     auto hash2 = db.getCurrentTraceHash(pathId);
     ASSERT_TRUE(hash2.has_value());
-    EXPECT_EQ(hash->to_string(HashFormat::Base16, false),
-              hash2->to_string(HashFormat::Base16, false));
+    EXPECT_EQ(hash->toHex(),
+              hash2->toHex());
 }
 
 // ── ParentContext dep verification tests ─────────────────────────────
@@ -139,8 +139,8 @@ TEST_F(TraceStoreTest, ParentContext_FailsWhenParentChanges)
     // Verify parent trace hash changed
     auto parentHash2 = db.getCurrentTraceHash(vpath({"parent"}));
     ASSERT_TRUE(parentHash2.has_value());
-    EXPECT_NE(parentHash1->to_string(HashFormat::Base16, false),
-              parentHash2->to_string(HashFormat::Base16, false));
+    EXPECT_NE(parentHash1->toHex(),
+              parentHash2->toHex());
 
     db.clearSessionCaches();
 
@@ -276,8 +276,8 @@ TEST_F(TraceStoreTest, ParentContext_SameResultDifferentDeps_Detects)
     // Parent trace hash changed even though result is identical
     auto parentHash2 = db.getCurrentTraceHash(vpath({"parent"}));
     ASSERT_TRUE(parentHash2.has_value());
-    EXPECT_NE(parentHash1->to_string(HashFormat::Base16, false),
-              parentHash2->to_string(HashFormat::Base16, false));
+    EXPECT_NE(parentHash1->toHex(),
+              parentHash2->toHex());
 
     db.clearSessionCaches();
 

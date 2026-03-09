@@ -1,5 +1,5 @@
 #include "eval-trace/helpers.hh"
-#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/deps/nix-binding.hh"
 #include "nix/expr/nixexpr.hh"
 
 #include <gtest/gtest.h>

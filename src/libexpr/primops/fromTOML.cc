@@ -2,7 +2,9 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/static-string-data.hh"
 #include "nix/expr/eval-trace/data/traced-data.hh"
-#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
+#include "nix/expr/eval-trace/deps/dep-hash-fns.hh"
+#include "nix/expr/eval-trace/deps/root-tracker-scope.hh"
 #include "nix/expr/eval-trace/toml-canonical.hh"
 
 #include "expr-config-private.hh"
@@ -236,7 +238,8 @@ static void prim_fromTOML(EvalState & state, const PosIdx pos, Value ** args, Va
     // If the string came directly from readFile (provenance hash matches),
     // produce lazy traced data with fine-grained StructuredContent deps.
     if (state.traceActiveDepth) [[unlikely]] {
-        if (auto * prov = lookupReadFileProvenance(depHash(toml))) {
+        auto * scope = RootTrackerScope::current;
+        if (auto * prov = scope ? scope->lookupReadFileProvenance(depHash(toml)) : nullptr) {
             auto [depSource, depKey] = resolveProvenance(prov->path, state.getMountToInput());
             try {
                 parseTracedTOML(state, toml, val, depSource, depKey);

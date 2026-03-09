@@ -45,19 +45,6 @@ using ResultId = StrongId<ResultIdTag, uint32_t>;
 /** ID for the DepKeySets table (content-addressed dep key sets, keyed by struct_hash). */
 using DepKeySetId = StrongId<DepKeySetIdTag, uint32_t>;
 
-// ── Hash helpers for boost flat maps ─────────────────────────────────
-
-/** Hash for nix::Hash keys (uses first 8 bytes of BLAKE3 — well-distributed). */
-struct HashKeyHash {
-    using is_avalanching = void;
-
-    std::size_t operator()(const Hash & h) const noexcept {
-        std::size_t result;
-        std::memcpy(&result, h.hash, sizeof(result));
-        return result;
-    }
-};
-
 /** SQLite-backed trace store for the eval trace system.
  *  Not thread-safe: must be used from a single thread. The session caches
  *  (verifiedTraceIds, traceDataCache, traceRowCache, currentDepHashes, etc.)
@@ -125,21 +112,16 @@ struct TraceStore {
 
     // Per-trace session cache: hash fields populated lazily (by ensureTraceHashes,
     // loadFullTrace), deps populated on demand by loadFullTrace only.
-    // Default-constructed entries have placeholder all-zero hashes (overwritten
-    // before use). The hashesPopulated() check detects this sentinel state —
-    // all-zero is never a valid BLAKE3 output (even BLAKE3("") is non-zero).
+    // Default-constructed TypedHash has all-zero Blake3Hash (sentinel).
+    // hashesPopulated() detects this — all-zero is never a valid BLAKE3 output.
     struct CachedTraceData {
-        Hash traceHash{HashAlgorithm::BLAKE3};
-        Hash structHash{HashAlgorithm::BLAKE3};
+        TraceHash traceHash{};
+        StructHash structHash{};
         std::optional<std::vector<Dep>> deps;
 
-        /** True if hash fields have been populated from DB (non-placeholder).
-         *  Checks traceHash — if it's populated, structHash was populated
-         *  at the same time (both are set together in ensureTraceHashes/loadFullTrace). */
+        /** True if hash fields have been populated from DB (non-sentinel). */
         bool hashesPopulated() const {
-            for (size_t i = 0; i < traceHash.hashSize; i++)
-                if (traceHash.hash[i] != 0) return true;
-            return false;
+            return traceHash != TraceHash{};
         }
     };
 
@@ -149,9 +131,9 @@ struct TraceStore {
     boost::unordered_flat_set<TraceId, TraceId::Hash> verifiedTraceIds;
 
     /// Content-addressed dedup maps (in-memory, flushed to DB periodically)
-    boost::unordered_flat_map<Hash, ResultId, HashKeyHash> resultByHash;
-    boost::unordered_flat_map<Hash, DepKeySetId, HashKeyHash> depKeySetByStructHash;
-    boost::unordered_flat_map<Hash, TraceId, HashKeyHash> traceByTraceHash;
+    boost::unordered_flat_map<ResultHash, ResultId, ResultHash::Hasher> resultByHash;
+    boost::unordered_flat_map<StructHash, DepKeySetId, StructHash::Hasher> depKeySetByStructHash;
+    boost::unordered_flat_map<TraceHash, TraceId, TraceHash::Hasher> traceByTraceHash;
 
     /// Unified per-trace cache, keyed by TraceId. Replaces the old separate
     /// traceCache and traceStructHashCache.
@@ -189,20 +171,20 @@ struct TraceStore {
         ResultKind type;
         std::string value;
         std::string context;
-        Hash hash;
+        ResultHash hash;
     };
     std::vector<PendingResult> pendingResults;
 
     struct PendingDepKeySet {
         DepKeySetId id;
-        Hash structHash;
+        StructHash structHash;
         std::vector<uint8_t> keysBlob;
     };
     std::vector<PendingDepKeySet> pendingDepKeySets;
 
     struct PendingTrace {
         TraceId id;
-        Hash traceHash;
+        TraceHash traceHash;
         DepKeySetId depKeySetId;
         std::vector<uint8_t> valuesBlob;
     };
@@ -330,7 +312,7 @@ struct TraceStore {
      *  Returns the trace_hash from the Traces table, which captures the full dep
      *  structure + hashes. Unlike a result hash (which for attrsets only captures
      *  attribute names), the trace hash changes when any dep value changes. */
-    std::optional<Hash> getCurrentTraceHash(AttrPathId pathId);
+    std::optional<TraceHash> getCurrentTraceHash(AttrPathId pathId);
 
     void clearSessionCaches();
 
@@ -411,26 +393,26 @@ private:
     CachedTraceData * ensureTraceHashes(TraceId traceId);
 
     ResultId doInternResult(ResultKind type, const std::string & value,
-                            const std::string & context, const Hash & resultHash);
+                            const std::string & context, const ResultHash & resultHash);
 
     TraceId getOrCreateTrace(
-        const Hash & traceHash,
+        const TraceHash & traceHash,
         DepKeySetId depKeySetId,
         const std::vector<uint8_t> & valuesBlob);
 
     DepKeySetId getOrCreateDepKeySet(
-        const Hash & structHash,
+        const StructHash & structHash,
         const std::vector<uint8_t> & keysBlob);
 
     CachedResult decodeCachedResult(const TraceRow & row);
 
-    Hash getTraceStructHash(TraceId traceId);
+    StructHash getTraceStructHash(TraceId traceId);
 
     /// Sort+dedup deps in-place and compute trace hash.
-    Hash computeSortedTraceHash(std::vector<Dep> & deps) const;
+    TraceHash computeSortedTraceHash(std::vector<Dep> & deps) const;
 
     /// Compute trace hash for already-sorted, deduplicated deps (skips sort+dedup).
-    Hash computePresortedTraceHash(const std::vector<Dep> & deps) const;
+    TraceHash computePresortedTraceHash(const std::vector<Dep> & deps) const;
 
     /// Cache-or-compute a dep's current hash value.
     std::optional<DepHashValue> resolveCurrentDepHash(

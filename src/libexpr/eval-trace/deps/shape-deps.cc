@@ -1,5 +1,6 @@
 #include "nix/expr/eval-trace/deps/recording.hh"
-#include "root-tracker-scope.hh"
+#include "nix/expr/eval-trace/deps/shape-recording.hh"
+#include "nix/expr/eval-trace/deps/root-tracker-scope.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/attr-set.hh"
@@ -51,7 +52,8 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
     if (!DependencyTracker::isActive()) return;
     if (v.listSize() == 0) return; // Empty lists can't be tracked (no stable key)
     // Use first element Value* as key (matches registration in ExprTracedData::eval)
-    auto * prov = lookupTracedContainer((const void *)v.listView()[0]);
+    auto * scope = RootTrackerScope::current;
+    auto * prov = scope ? scope->lookupTracedContainer((const void *)v.listView()[0]) : nullptr;
     if (!prov) return;
     auto hash = depHash(std::to_string(v.listSize()));
     auto & pools = DependencyTracker::activeTracker->pools;
@@ -131,7 +133,8 @@ static void forEachTracedDataOrigin(const PosTable & positions, const Value & v,
     }
     case nList: {
         if (v.listSize() == 0) return;
-        auto * prov = lookupTracedContainer((const void *)v.listView()[0]);
+        auto * scope = RootTrackerScope::current;
+        auto * prov = scope ? scope->lookupTracedContainer((const void *)v.listView()[0]) : nullptr;
         if (!prov) return;
         CompactDepComponents c{prov->sourceId, prov->filePathId, prov->format,
                                prov->dataPathId, ShapeSuffix::Type, Symbol{}};

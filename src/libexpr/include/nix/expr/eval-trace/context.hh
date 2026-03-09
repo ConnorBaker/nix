@@ -18,6 +18,8 @@ struct Value;
 
 namespace eval_trace {
 class TraceCache;
+class TraceStore;
+struct TracedExpr;
 }
 
 /**
@@ -109,10 +111,9 @@ struct EvalTraceContext {
     // ── Sibling identity tracking (for already-materialized sibling detection) ──
 
     /// Identity of a TracedExpr child thunk, stored by Value* address.
-    /// Uses void* to avoid depending on TracedExpr (defined in trace-cache.cc).
     struct SiblingIdentity {
-        void * tracedExpr;  // TracedExpr*
-        void * traceStore;  // TraceStore*
+        eval_trace::TracedExpr * tracedExpr;
+        eval_trace::TraceStore * traceStore;
     };
 
     /// Maps Value* → SiblingIdentity for all TracedExpr child thunks created
@@ -124,7 +125,7 @@ struct EvalTraceContext {
     /// Callback invoked by replayMemoizedDeps when a registered sibling is
     /// detected. Returns true if the sibling access was recorded. Set by
     /// SiblingAccessTracker ctor, cleared by dtor.
-    using SiblingCallback = bool (*)(void * tracedExpr, void * traceStore);
+    using SiblingCallback = bool (*)(eval_trace::TracedExpr *, eval_trace::TraceStore *);
     SiblingCallback siblingCallback = nullptr;
 
     /**

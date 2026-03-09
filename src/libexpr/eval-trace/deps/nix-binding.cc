@@ -1,4 +1,6 @@
 #include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/deps/nix-binding.hh"
+#include "nix/expr/eval-trace/deps/shape-recording.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
 #include "nix/expr/nixexpr.hh"
 #include "nix/expr/symbol-table.hh"
