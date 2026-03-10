@@ -1014,4 +1014,976 @@ TEST_F(TracedDataTest, PointerEquality_ViaCopy_NoFunction)
     doTest("hot run", &loaderCalls);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Group 1: Separate thunks with shared Bindings* (Tier 3 probe)
+//
+// Two sibling attrs are different Value* (separate `id platform` thunks)
+// but share the same Bindings* after forcing. detectAliases misses them
+// (different thunk Value*), so Tier 1 fails. Tests whether Tier 3
+// catches Bindings*-level equality.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_SeparateThunks_SharedBindings)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            id = x: x;
+        in { a = id platform; b = id platform; }
+    )";
+
+    // Cold run
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        state.forceValue(*a->value, noPos);
+        state.forceValue(*b->value, noPos);
+        EXPECT_TRUE(state.eqValues(*a->value, *b->value, noPos,
+            "cold: separate thunks, shared Bindings*"))
+            << "Cold: id platform calls should resolve to same object";
+    }
+
+    // Hot run
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        state.forceValue(*a->value, noPos);
+        state.forceValue(*b->value, noPos);
+        EXPECT_TRUE(state.eqValues(*a->value, *b->value, noPos,
+            "hot: separate thunks, shared Bindings*"))
+            << "Hot: id platform calls should resolve to same object from cache";
+    }
+}
+
+TEST_F(TracedDataTest, PointerEquality_SeparateThunks_SharedBindings_ViaCopy)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            id = x: x;
+        in { a = id platform; b = id platform; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        state.forceValue(*a->value, noPos);
+        state.forceValue(*b->value, noPos);
+
+        Value aCopy = *a->value;
+        Value bCopy = *b->value;
+        EXPECT_TRUE(state.eqValues(aCopy, bCopy, noPos,
+            "separate thunks shared Bindings* via copy"))
+            << label << ": Value copies of id platform must be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_SeparateThunks_SharedBindings_Negative)
+{
+    // Different function calls produce different Bindings*, and canExecute
+    // is a function → element-wise comparison fails.
+    auto expr = R"(
+        let mkPlatform = sys: { system = sys; canExecute = other: other.system == sys; };
+        in { a = mkPlatform "x86_64-linux"; b = mkPlatform "x86_64-linux"; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        state.forceValue(*a->value, noPos);
+        state.forceValue(*b->value, noPos);
+        EXPECT_FALSE(state.eqValues(*a->value, *b->value, noPos,
+            "separate mkPlatform calls"))
+            << label << ": different function calls must produce unequal results";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Group 2: Function default arguments (mirrors nixpkgs stdenv construction)
+//
+// mkStdenv has default args referencing the same let-bound platform.
+// Both defaults evaluate to the same Bindings* via structural copy.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_FunctionDefaults_SharedPlatform)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            mkStdenv = { buildPlatform ? platform, hostPlatform ? platform }: {
+              inherit buildPlatform hostPlatform;
+            };
+        in mkStdenv {}
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        ASSERT_EQ(root.type(), nAttrs) << label;
+
+        auto * bp = root.attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = root.attrs()->get(state.symbols.create("hostPlatform"));
+        ASSERT_NE(bp, nullptr) << label;
+        ASSERT_NE(hp, nullptr) << label;
+
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        EXPECT_TRUE(state.eqValues(*bp->value, *hp->value, noPos,
+            "buildPlatform == hostPlatform via defaults"))
+            << label << ": both defaults reference same platform";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_FunctionDefaults_SharedPlatform_ViaCopy)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            mkStdenv = { buildPlatform ? platform, hostPlatform ? platform }: {
+              inherit buildPlatform hostPlatform;
+            };
+        in mkStdenv {}
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * bp = root.attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = root.attrs()->get(state.symbols.create("hostPlatform"));
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        Value bpCopy = *bp->value;
+        Value hpCopy = *hp->value;
+        EXPECT_TRUE(state.eqValues(bpCopy, hpCopy, noPos,
+            "function defaults shared platform via copy"))
+            << label << ": Value copies from defaults must be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_FunctionDefaults_DifferentPlatforms_Negative)
+{
+    auto expr = R"(
+        let p1 = { system = "x86_64-linux"; canExecute = other: true; };
+            p2 = { system = "aarch64-linux"; canExecute = other: true; };
+            mkStdenv = { buildPlatform ? p1, hostPlatform ? p2 }: {
+              inherit buildPlatform hostPlatform;
+            };
+        in mkStdenv {}
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * bp = root.attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = root.attrs()->get(state.symbols.create("hostPlatform"));
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        EXPECT_FALSE(state.eqValues(*bp->value, *hp->value, noPos,
+            "different platform defaults"))
+            << label << ": different default platforms must not be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Group 3: inherit through function arguments
+//
+// `inherit` preserves pointer equality from the caller's attrset.
+// Both attrs in the caller point to the same `platform` Value*.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_InheritFromArg)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            wrap = { buildPlatform, hostPlatform }: { inherit buildPlatform hostPlatform; };
+        in wrap { buildPlatform = platform; hostPlatform = platform; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * bp = root.attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = root.attrs()->get(state.symbols.create("hostPlatform"));
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        EXPECT_TRUE(state.eqValues(*bp->value, *hp->value, noPos,
+            "inherit from arg preserves pointer equality"))
+            << label << ": inherited attrs should point to same platform";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_InheritFromArg_ViaCopy)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            wrap = { buildPlatform, hostPlatform }: { inherit buildPlatform hostPlatform; };
+        in wrap { buildPlatform = platform; hostPlatform = platform; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * bp = root.attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = root.attrs()->get(state.symbols.create("hostPlatform"));
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        Value bpCopy = *bp->value;
+        Value hpCopy = *hp->value;
+        EXPECT_TRUE(state.eqValues(bpCopy, hpCopy, noPos,
+            "inherit from arg via copy"))
+            << label << ": copies of inherited attrs must be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_InheritFromArg_Negative)
+{
+    auto expr = R"(
+        let p1 = { system = "x86_64-linux"; canExecute = other: true; };
+            p2 = { system = "x86_64-linux"; canExecute = other: true; };
+            wrap = { buildPlatform, hostPlatform }: { inherit buildPlatform hostPlatform; };
+        in wrap { buildPlatform = p1; hostPlatform = p2; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * bp = root.attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = root.attrs()->get(state.symbols.create("hostPlatform"));
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        EXPECT_FALSE(state.eqValues(*bp->value, *hp->value, noPos,
+            "inherit different objects"))
+            << label << ": different platform objects must not be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Group 4: In-expression comparison through function body
+//
+// Comparison happens inside a function body (matches mk-python-derivation.nix).
+// On hot path, the result (bool) may be served from cache directly.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_InExpr_FunctionBody)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            check = { stdenv }: stdenv.buildPlatform == stdenv.hostPlatform;
+        in {
+          result = check { stdenv = { buildPlatform = platform; hostPlatform = platform; }; };
+          stdenv = { buildPlatform = platform; hostPlatform = platform; };
+        }
+    )";
+
+    // Cold run
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * resultAttr = root.attrs()->get(state.symbols.create("result"));
+        ASSERT_NE(resultAttr, nullptr);
+        state.forceValue(*resultAttr->value, noPos);
+        EXPECT_EQ(resultAttr->value->type(), nBool);
+        EXPECT_TRUE(resultAttr->value->boolean())
+            << "Cold: comparison inside function body should return true";
+    }
+
+    // Hot run
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * resultAttr = root.attrs()->get(state.symbols.create("result"));
+        ASSERT_NE(resultAttr, nullptr);
+        state.forceValue(*resultAttr->value, noPos);
+        EXPECT_EQ(resultAttr->value->type(), nBool);
+        EXPECT_TRUE(resultAttr->value->boolean())
+            << "Hot: comparison inside function body should return true from cache";
+    }
+}
+
+TEST_F(TracedDataTest, PointerEquality_InExpr_FunctionDefaults)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            mkDeriv = { stdenv ? { buildPlatform = platform; hostPlatform = platform; } }:
+              stdenv.buildPlatform == stdenv.hostPlatform;
+        in mkDeriv {}
+    )";
+
+    {
+        auto cache = makeCache(expr);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(v.type(), nBool);
+        EXPECT_TRUE(v.boolean())
+            << "Cold: equality inside function body with default arg should be true";
+    }
+
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto v = forceRoot(*cache);
+        EXPECT_EQ(v.type(), nBool);
+        EXPECT_TRUE(v.boolean())
+            << "Hot: equality inside function body with default arg should be true";
+    }
+}
+
+TEST_F(TracedDataTest, PointerEquality_InExpr_FunctionBody_Negative)
+{
+    auto expr = R"(
+        let p1 = { system = "x86_64-linux"; canExecute = other: true; };
+            p2 = { system = "aarch64-linux"; canExecute = other: true; };
+            check = { stdenv }: stdenv.buildPlatform == stdenv.hostPlatform;
+        in {
+          result = check { stdenv = { buildPlatform = p1; hostPlatform = p2; }; };
+        }
+    )";
+
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        auto * resultAttr = root.attrs()->get(state.symbols.create("result"));
+        ASSERT_NE(resultAttr, nullptr);
+        state.forceValue(*resultAttr->value, noPos);
+        EXPECT_EQ(resultAttr->value->type(), nBool);
+        EXPECT_FALSE(resultAttr->value->boolean())
+            << "Cold: different platforms in function body should return false";
+    }
+
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * resultAttr = root.attrs()->get(state.symbols.create("result"));
+        ASSERT_NE(resultAttr, nullptr);
+        state.forceValue(*resultAttr->value, noPos);
+        EXPECT_EQ(resultAttr->value->type(), nBool);
+        EXPECT_FALSE(resultAttr->value->boolean())
+            << "Hot: different platforms in function body should return false";
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Group 5: End-to-end `optionals` pattern (mirrors mk-python-derivation.nix)
+//
+// Tests the exact pattern that drops pythonImportsCheckHook:
+//   nativeBuildInputs ++ optionals (buildPlatform == hostPlatform) [ hook ]
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_Optionals_IncludesHook)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            stdenv = { buildPlatform = platform; hostPlatform = platform; };
+            optionals = cond: list: if cond then list else [];
+        in {
+          nativeBuildInputs = [ "dep1" "dep2" ]
+            ++ optionals (stdenv.buildPlatform == stdenv.hostPlatform) [ "pythonImportsCheckHook" ];
+        }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * nbi = root.attrs()->get(state.symbols.create("nativeBuildInputs"));
+        ASSERT_NE(nbi, nullptr) << label;
+        state.forceValue(*nbi->value, noPos);
+        ASSERT_EQ(nbi->value->type(), nList) << label;
+        EXPECT_EQ(nbi->value->listSize(), 3u)
+            << label << ": nativeBuildInputs should have 3 elements (hook included)";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_Optionals_ExcludesHook_CrossCompile)
+{
+    auto expr = R"(
+        let p1 = { system = "x86_64-linux"; canExecute = other: true; };
+            p2 = { system = "aarch64-linux"; canExecute = other: true; };
+            stdenv = { buildPlatform = p1; hostPlatform = p2; };
+            optionals = cond: list: if cond then list else [];
+        in {
+          nativeBuildInputs = [ "dep1" "dep2" ]
+            ++ optionals (stdenv.buildPlatform == stdenv.hostPlatform) [ "pythonImportsCheckHook" ];
+        }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * nbi = root.attrs()->get(state.symbols.create("nativeBuildInputs"));
+        ASSERT_NE(nbi, nullptr) << label;
+        state.forceValue(*nbi->value, noPos);
+        ASSERT_EQ(nbi->value->type(), nList) << label;
+        EXPECT_EQ(nbi->value->listSize(), 2u)
+            << label << ": cross-compile should exclude hook (2 elements)";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_Optionals_SeparateThunks)
+{
+    // Separate thunks (id platform) but same Bindings* after forcing.
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            id = x: x;
+            stdenv = { buildPlatform = id platform; hostPlatform = id platform; };
+            optionals = cond: list: if cond then list else [];
+        in {
+          nativeBuildInputs = [ "dep1" ]
+            ++ optionals (stdenv.buildPlatform == stdenv.hostPlatform) [ "hook" ];
+        }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * nbi = root.attrs()->get(state.symbols.create("nativeBuildInputs"));
+        ASSERT_NE(nbi, nullptr) << label;
+        state.forceValue(*nbi->value, noPos);
+        ASSERT_EQ(nbi->value->type(), nList) << label;
+        EXPECT_EQ(nbi->value->listSize(), 2u)
+            << label << ": separate thunks with shared Bindings* should include hook (2 elements)";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Group 6: Deep nested sub-attrsets with functions
+//
+// Matches the warning output showing haveSameResolvedTarget falling back
+// for .go, .rust, .rust.platform sub-attrsets.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_DeepNested_SubAttrComparison)
+{
+    auto expr = R"(
+        let platform = {
+              system = "x86_64-linux";
+              go = { CGO_ENABLED = "1"; buildMode = x: x; };
+              rust = { rustcTarget = "x86_64-unknown-linux-gnu"; platform = { check = y: y; }; };
+            };
+        in { buildPlatform = platform; hostPlatform = platform; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+
+        auto * bp = root.attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = root.attrs()->get(state.symbols.create("hostPlatform"));
+        ASSERT_NE(bp, nullptr) << label;
+        ASSERT_NE(hp, nullptr) << label;
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        // Top-level comparison
+        {
+            Value bpCopy = *bp->value;
+            Value hpCopy = *hp->value;
+            EXPECT_TRUE(state.eqValues(bpCopy, hpCopy, noPos,
+                "deep nested: top-level via copy"))
+                << label << ": top-level platform comparison via copy must succeed";
+        }
+
+        // Sub-attr: .go
+        {
+            auto * bpGo = bp->value->attrs()->get(state.symbols.create("go"));
+            auto * hpGo = hp->value->attrs()->get(state.symbols.create("go"));
+            ASSERT_NE(bpGo, nullptr) << label;
+            ASSERT_NE(hpGo, nullptr) << label;
+            state.forceValue(*bpGo->value, noPos);
+            state.forceValue(*hpGo->value, noPos);
+
+            Value bpGoCopy = *bpGo->value;
+            Value hpGoCopy = *hpGo->value;
+            EXPECT_TRUE(state.eqValues(bpGoCopy, hpGoCopy, noPos,
+                "deep nested: .go via copy"))
+                << label << ": .go sub-attr comparison via copy must succeed";
+        }
+
+        // Sub-attr: .rust.platform (deeply nested)
+        {
+            auto * bpRust = bp->value->attrs()->get(state.symbols.create("rust"));
+            auto * hpRust = hp->value->attrs()->get(state.symbols.create("rust"));
+            ASSERT_NE(bpRust, nullptr) << label;
+            ASSERT_NE(hpRust, nullptr) << label;
+            state.forceValue(*bpRust->value, noPos);
+            state.forceValue(*hpRust->value, noPos);
+
+            auto * bpRustPlat = bpRust->value->attrs()->get(state.symbols.create("platform"));
+            auto * hpRustPlat = hpRust->value->attrs()->get(state.symbols.create("platform"));
+            ASSERT_NE(bpRustPlat, nullptr) << label;
+            ASSERT_NE(hpRustPlat, nullptr) << label;
+            state.forceValue(*bpRustPlat->value, noPos);
+            state.forceValue(*hpRustPlat->value, noPos);
+
+            Value bpRpCopy = *bpRustPlat->value;
+            Value hpRpCopy = *hpRustPlat->value;
+            EXPECT_TRUE(state.eqValues(bpRpCopy, hpRpCopy, noPos,
+                "deep nested: .rust.platform via copy"))
+                << label << ": .rust.platform comparison via copy must succeed";
+        }
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_DeepNested_SubAttrComparison_Negative)
+{
+    auto expr = R"(
+        let p1 = {
+              system = "x86_64-linux";
+              go = { CGO_ENABLED = "1"; buildMode = x: x; };
+              rust = { rustcTarget = "x86_64-unknown-linux-gnu"; platform = { check = y: y; }; };
+            };
+            p2 = {
+              system = "aarch64-linux";
+              go = { CGO_ENABLED = "0"; buildMode = x: x; };
+              rust = { rustcTarget = "aarch64-unknown-linux-gnu"; platform = { check = y: y; }; };
+            };
+        in { buildPlatform = p1; hostPlatform = p2; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+
+        auto * bp = root.attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = root.attrs()->get(state.symbols.create("hostPlatform"));
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        Value bpCopy = *bp->value;
+        Value hpCopy = *hp->value;
+        EXPECT_FALSE(state.eqValues(bpCopy, hpCopy, noPos,
+            "deep nested negative: top-level via copy"))
+            << label << ": different platform objects must not be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Group 7: Sibling wrapping interaction
+//
+// Tests whether forcing siblings in different orders corrupts shared
+// Value* objects via sibling wrapping.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_SiblingWrapping_ForceOrder)
+{
+    auto expr = R"(
+        let shared = { f = y: y; val = 42; };
+        in { a = shared; b = shared; c = shared; }
+    )";
+
+    // Cold run
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        for (auto name : {"a", "b", "c"}) {
+            auto * attr = root.attrs()->get(state.symbols.create(name));
+            state.forceValue(*attr->value, noPos);
+        }
+    }
+
+    // Hot run: force b FIRST, then a, then compare a == c via copies
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        state.forceValue(*b->value, noPos);
+
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        state.forceValue(*a->value, noPos);
+
+        auto * c = root.attrs()->get(state.symbols.create("c"));
+        state.forceValue(*c->value, noPos);
+
+        Value aCopy = *a->value;
+        Value cCopy = *c->value;
+        EXPECT_TRUE(state.eqValues(aCopy, cCopy, noPos,
+            "sibling wrapping: force b first, compare a==c"))
+            << "Hot: forcing b first should not corrupt a==c comparison";
+    }
+}
+
+TEST_F(TracedDataTest, PointerEquality_SiblingWrapping_ReverseForceOrder)
+{
+    auto expr = R"(
+        let shared = { f = y: y; val = 42; };
+        in { a = shared; b = shared; c = shared; }
+    )";
+
+    // Cold run
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        for (auto name : {"a", "b", "c"}) {
+            auto * attr = root.attrs()->get(state.symbols.create(name));
+            state.forceValue(*attr->value, noPos);
+        }
+    }
+
+    // Hot run: force c, b, a (reverse order), then compare a == b
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+
+        auto * c = root.attrs()->get(state.symbols.create("c"));
+        state.forceValue(*c->value, noPos);
+
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        state.forceValue(*b->value, noPos);
+
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        state.forceValue(*a->value, noPos);
+
+        Value aCopy = *a->value;
+        Value bCopy = *b->value;
+        EXPECT_TRUE(state.eqValues(aCopy, bCopy, noPos,
+            "sibling wrapping: reverse force order a==b"))
+            << "Hot: reverse force order should not break a==b comparison";
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Group 8: Value copies for lists (potential bindingsIdentityMap gap)
+//
+// bindingsIdentityMap only handles attrsets; list copies need
+// siblingIdentityMap or Tier 1 (canonicalSiblingIdx).
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_ViaCopy_ListWithFunction_Aliased)
+{
+    auto expr = R"(
+        let xs = [ (y: y) 1 2 ];
+        in { a = xs; b = xs; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        state.forceValue(*a->value, noPos);
+        state.forceValue(*b->value, noPos);
+
+        Value aCopy = *a->value;
+        Value bCopy = *b->value;
+        EXPECT_TRUE(state.eqValues(aCopy, bCopy, noPos,
+            "list with function via copy"))
+            << label << ": aliased list copies must be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_ViaCopy_SmallListWithFunction_Aliased)
+{
+    // SmallList (<=2 elements) uses inline storage
+    auto expr = R"(
+        let xs = [ (y: y) ];
+        in { a = xs; b = xs; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        state.forceValue(*a->value, noPos);
+        state.forceValue(*b->value, noPos);
+
+        Value aCopy = *a->value;
+        Value bCopy = *b->value;
+        EXPECT_TRUE(state.eqValues(aCopy, bCopy, noPos,
+            "small list with function via copy"))
+            << label << ": aliased small list copies must be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Group 9: Nested function indirection
+//
+// Deeper thunk evaluation chains: g calls f calls identity.
+// Tests whether the resolution chain preserves pointer equality.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_NestedFunctionIndirection)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            f = x: x;
+            g = x: f x;
+        in { a = g platform; b = g platform; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        state.forceValue(*a->value, noPos);
+        state.forceValue(*b->value, noPos);
+
+        EXPECT_TRUE(state.eqValues(*a->value, *b->value, noPos,
+            "nested function indirection"))
+            << label << ": g(platform) calls should resolve to same object";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_NestedFunctionIndirection_ViaCopy)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            f = x: x;
+            g = x: f x;
+        in { a = g platform; b = g platform; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        state.forceValue(*a->value, noPos);
+        state.forceValue(*b->value, noPos);
+
+        Value aCopy = *a->value;
+        Value bCopy = *b->value;
+        EXPECT_TRUE(state.eqValues(aCopy, bCopy, noPos,
+            "nested function indirection via copy"))
+            << label << ": copies of g(platform) must be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Group 10: Multiple nesting levels with function args
+//
+// Tests deeper nesting (2 levels) through function call boundaries:
+// root → pkg → stdenv → buildPlatform/hostPlatform
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_TwoLevelNesting_FunctionArg)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            mkStdenv = bp: hp: { buildPlatform = bp; hostPlatform = hp; };
+        in {
+          pkg = {
+            stdenv = mkStdenv platform platform;
+          };
+        }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+
+        // Navigate: root → pkg → stdenv
+        auto * pkg = root.attrs()->get(state.symbols.create("pkg"));
+        ASSERT_NE(pkg, nullptr) << label;
+        state.forceValue(*pkg->value, noPos);
+
+        auto * stdenv = pkg->value->attrs()->get(state.symbols.create("stdenv"));
+        ASSERT_NE(stdenv, nullptr) << label;
+        state.forceValue(*stdenv->value, noPos);
+
+        auto * bp = stdenv->value->attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = stdenv->value->attrs()->get(state.symbols.create("hostPlatform"));
+        ASSERT_NE(bp, nullptr) << label;
+        ASSERT_NE(hp, nullptr) << label;
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        Value bpCopy = *bp->value;
+        Value hpCopy = *hp->value;
+        EXPECT_TRUE(state.eqValues(bpCopy, hpCopy, noPos,
+            "two-level nesting: buildPlatform == hostPlatform via copy"))
+            << label << ": nested platform comparison via copy must succeed";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_TwoLevelNesting_FunctionArg_Negative)
+{
+    auto expr = R"(
+        let p1 = { system = "x86_64-linux"; canExecute = other: true; };
+            p2 = { system = "aarch64-linux"; canExecute = other: true; };
+            mkStdenv = bp: hp: { buildPlatform = bp; hostPlatform = hp; };
+        in {
+          pkg = {
+            stdenv = mkStdenv p1 p2;
+          };
+        }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+
+        auto * pkg = root.attrs()->get(state.symbols.create("pkg"));
+        ASSERT_NE(pkg, nullptr) << label;
+        state.forceValue(*pkg->value, noPos);
+
+        auto * stdenv = pkg->value->attrs()->get(state.symbols.create("stdenv"));
+        ASSERT_NE(stdenv, nullptr) << label;
+        state.forceValue(*stdenv->value, noPos);
+
+        auto * bp = stdenv->value->attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = stdenv->value->attrs()->get(state.symbols.create("hostPlatform"));
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        Value bpCopy = *bp->value;
+        Value hpCopy = *hp->value;
+        EXPECT_FALSE(state.eqValues(bpCopy, hpCopy, noPos,
+            "two-level nesting: different platforms via copy"))
+            << label << ": different platforms must not be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Group 11: `with` pattern
+//
+// Tests that `with` preserves pointer equality when both sides
+// reference the same attribute from the `with` scope.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_WithPattern)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            platforms = { native = platform; };
+        in with platforms; { buildPlatform = native; hostPlatform = native; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * bp = root.attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = root.attrs()->get(state.symbols.create("hostPlatform"));
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        EXPECT_TRUE(state.eqValues(*bp->value, *hp->value, noPos,
+            "with pattern preserves pointer equality"))
+            << label << ": with-scoped attrs should point to same platform";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
+TEST_F(TracedDataTest, PointerEquality_WithPattern_ViaCopy)
+{
+    auto expr = R"(
+        let platform = { system = "x86_64-linux"; canExecute = other: true; };
+            platforms = { native = platform; };
+        in with platforms; { buildPlatform = native; hostPlatform = native; }
+    )";
+
+    auto doTest = [&](const char * label, int * loaderCalls) {
+        auto cache = makeCache(expr, loaderCalls);
+        auto root = forceRoot(*cache);
+        auto * bp = root.attrs()->get(state.symbols.create("buildPlatform"));
+        auto * hp = root.attrs()->get(state.symbols.create("hostPlatform"));
+        state.forceValue(*bp->value, noPos);
+        state.forceValue(*hp->value, noPos);
+
+        Value bpCopy = *bp->value;
+        Value hpCopy = *hp->value;
+        EXPECT_TRUE(state.eqValues(bpCopy, hpCopy, noPos,
+            "with pattern via copy"))
+            << label << ": copies of with-scoped attrs must be equal";
+    };
+
+    doTest("cold run", nullptr);
+    int loaderCalls = 0;
+    doTest("hot run", &loaderCalls);
+}
+
 } // namespace nix::eval_trace
