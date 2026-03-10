@@ -102,6 +102,12 @@ struct TracedExpr : Expr, gc
     AttrPathId pathId;           // Trie path in AttrVocabStore (computed at construction)
     TracedExpr * parentExpr;     // GC-traced, nullptr for root
     bool isListElement;          // true = list index, false = attr access
+    /// Index of the canonical sibling this child is aliased to.
+    /// Set during materialization from the parent's aliasOf vector.
+    /// -1 = not set (no alias info). Canonical entries store their own index.
+    /// Two children of the same parent with the same canonicalSiblingIdx
+    /// are aliases (same underlying Value*).
+    int16_t canonicalSiblingIdx = -1;
 
     /**
      * Lazy-initialized state for fields only needed when eval() or
@@ -112,6 +118,13 @@ struct TracedExpr : Expr, gc
         Expr * origExpr = nullptr;
         Env * origEnv = nullptr;
         std::optional<TraceId> traceId;
+        /// The real (non-materialized) Value* this TracedExpr navigates to.
+        /// Set during evaluatePhase2 (cold path) or lazily via getResolvedTarget().
+        /// Used by eqValues() to restore pointer identity: two TracedExpr children
+        /// that navigate to the same underlying Value share the same resolvedTarget,
+        /// allowing the equality check to short-circuit before recursing into
+        /// function-containing containers.
+        Value * resolvedTarget = nullptr;
     };
     LazyState * lazy = nullptr;
 
@@ -140,6 +153,15 @@ struct TracedExpr : Expr, gc
     NavigationResult navigatePhase1();
     void evaluatePhase2(NavigationResult && nav, Value & v);
     Value * navigateToReal();
+
+    /**
+     * Get the real (non-materialized) Value* this TracedExpr navigates to.
+     * Set eagerly during evaluatePhase2 (cold path), or computed lazily
+     * via navigateToReal() on first call (hot path — triggers rootLoader).
+     * Returns nullptr if navigation is not possible (e.g., root node).
+     */
+    Value * getResolvedTarget();
+
     void materializeResult(Value & v, const CachedResult & cached);
     void materializeOrigExprAttrs(Value & v, const attrs_t & attrs,
                                    Value * prePopulatedParent = nullptr);

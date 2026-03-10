@@ -53,6 +53,35 @@ void TracedExpr::installChildThunk(Value * val, Env * env, TracedExpr * child)
             EvalTraceContext::SiblingIdentity{child, cache->dbBackend.get()});
 }
 
+Value * TracedExpr::getResolvedTarget()
+{
+    if (lazy && lazy->resolvedTarget)
+        return lazy->resolvedTarget;
+    // Only child nodes can navigate (root has no parent to navigate from).
+    if (!parentExpr)
+        return nullptr;
+    try {
+        auto * target = navigateToReal();
+        // Unwrap TracedExpr thunks created by sibling wrapping (same as
+        // evaluatePhase2 Lesson 8). A prior sibling's navigateToReal may
+        // have wrapped this attr. Unwrap by evaluating origExpr directly
+        // to preserve the real Value identity (Bindings*/list pointers).
+        if (target->isThunk()) {
+            if (auto * ec = dynamic_cast<TracedExpr*>(target->thunk().expr)) {
+                if (ec->lazy && ec->lazy->origExpr) {
+                    ec->lazy->origExpr->eval(cache->state, *ec->lazy->origEnv, *target);
+                }
+            }
+        }
+        cache->state.forceValue(*target, noPos);
+        ensureLazy().resolvedTarget = target;
+        return target;
+    } catch (std::exception & e) {
+        debug("getResolvedTarget failed for '%s': %s", attrPathStr(), e.what());
+        return nullptr;
+    }
+}
+
 // ── Phase 1: Navigate (outside DependencyTracker) ────────────────────
 //
 // Determines node type and navigates child nodes BEFORE creating the
@@ -134,6 +163,9 @@ void TracedExpr::evaluatePhase2(NavigationResult && nav, Value & v)
     }
 
     auto & st = cache->state;
+
+    // Cache the resolved target for pointer identity restoration in eqValues.
+    ensureLazy().resolvedTarget = target;
 
     try {
         st.forceValue(*target, noPos);
@@ -234,6 +266,20 @@ void TracedExpr::eval(EvalState & state, Env & env, Value & v)
             catch (...) {}
         }
     } siblingGuard{this, db};
+
+    // Register Bindings* → SiblingIdentity on all exit paths.
+    // ExprOpEq::eval creates stack-local Value copies (via ExprSelect's
+    // `v = *vAttrs`), which have different addresses than the originals
+    // in siblingIdentityMap. But copies preserve the Bindings* pointer,
+    // so this secondary map enables haveSameResolvedTarget to find the
+    // TracedExpr that produced a copied attrset Value.
+    Finally registerBindings{[&]{
+        try {
+            if (v.type() == nAttrs && cache->state.traceCtx)
+                cache->state.traceCtx->bindingsIdentityMap.emplace(
+                    v.attrs(), EvalTraceContext::SiblingIdentity{this, cache->dbBackend.get()});
+        } catch (...) {}
+    }};
 
     auto warmResult = db.verify(pathId, cache->inputAccessors, cache->state);
 

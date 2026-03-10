@@ -15,6 +15,7 @@
 namespace nix {
 
 struct Value;
+class Bindings;
 
 namespace eval_trace {
 class TraceCache;
@@ -122,11 +123,42 @@ struct EvalTraceContext {
     /// so entries persist across nested root tracker scopes.
     boost::unordered_flat_map<const void *, SiblingIdentity> siblingIdentityMap;
 
+    /// Secondary identity map: Bindings* → SiblingIdentity.
+    /// Needed because ExprOpEq::eval creates stack-local Value copies via
+    /// ExprSelect, and these copies have different Value* addresses than the
+    /// originals in siblingIdentityMap. However, copies preserve the Bindings*
+    /// pointer (it's a field in the Value struct), so this map enables lookup
+    /// for Value copies. Populated in TracedExpr::eval() after materialization.
+    boost::unordered_flat_map<const Bindings *, SiblingIdentity> bindingsIdentityMap;
+
     /// Callback invoked by replayMemoizedDeps when a registered sibling is
     /// detected. Returns true if the sibling access was recorded. Set by
     /// SiblingAccessTracker ctor, cleared by dtor.
     using SiblingCallback = bool (*)(eval_trace::TracedExpr *, eval_trace::TraceStore *);
     SiblingCallback siblingCallback = nullptr;
+
+    /**
+     * Check whether two Values were produced by TracedExpr thunks that
+     * resolve to the same underlying (non-materialized) Value.
+     *
+     * When eval-trace materialization creates fresh wrappers (Value and
+     * Bindings pointers), pointer identity is lost for aliased values
+     * (e.g., hostPlatform and targetPlatform pointing to the same platform
+     * object). This method restores identity using a three-tier approach:
+     *
+     *   Tier 1: Same parent + same canonicalSiblingIdx → O(1), no rootLoader.
+     *   Tier 2: Both resolvedTargets set (cold path) → pointer compare.
+     *   Tier 3: Navigate via getResolvedTarget → may trigger rootLoader.
+     *
+     * Lookup uses siblingIdentityMap (by Value*) with fallback to
+     * bindingsIdentityMap (by Bindings*) for Value copies created by
+     * ExprSelect::eval (`v = *vAttrs`).
+     *
+     * Returns true if both Values trace back to the same underlying Value.
+     * Returns false if either Value is not tracked, or if they have
+     * different targets.
+     */
+    bool haveSameResolvedTarget(Value & v1, Value & v2);
 
     /**
      * Record that thunk/app evaluation of `v` produced oracle deps in

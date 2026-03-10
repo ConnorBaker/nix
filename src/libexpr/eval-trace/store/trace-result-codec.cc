@@ -41,22 +41,26 @@ std::tuple<ResultKind, std::string, std::string> TraceStore::encodeCachedResult(
                 val.append(std::to_string(vocab.internName(sym).value));
                 first = false;
             }
-            // Encode origins into the context field as JSON when present.
+            // Encode origins and aliases into the context field as JSON when present.
             std::string ctx;
-            if (!a.origins.empty()) {
-                nlohmann::json originsJson;
-                nlohmann::json origArr = nlohmann::json::array();
-                for (auto & orig : a.origins) {
-                    origArr.push_back({
-                        {"s", orig.depSource},
-                        {"f", orig.depKey},
-                        {"p", orig.dataPath},  // already a JSON array string
-                        {"t", std::string(1, structuredFormatChar(orig.format))},
-                    });
+            if (!a.origins.empty() || !a.aliasOf.empty()) {
+                nlohmann::json ctxJson;
+                if (!a.origins.empty()) {
+                    nlohmann::json origArr = nlohmann::json::array();
+                    for (auto & orig : a.origins) {
+                        origArr.push_back({
+                            {"s", orig.depSource},
+                            {"f", orig.depKey},
+                            {"p", orig.dataPath},  // already a JSON array string
+                            {"t", std::string(1, structuredFormatChar(orig.format))},
+                        });
+                    }
+                    ctxJson["origins"] = std::move(origArr);
+                    ctxJson["indices"] = a.originIndices;
                 }
-                originsJson["origins"] = std::move(origArr);
-                originsJson["indices"] = a.originIndices;
-                ctx = originsJson.dump();
+                if (!a.aliasOf.empty())
+                    ctxJson["aliasOf"] = a.aliasOf;
+                ctx = ctxJson.dump();
             }
             return {ResultKind::FullAttrs, std::move(val), std::move(ctx)};
         },
@@ -108,7 +112,13 @@ std::tuple<ResultKind, std::string, std::string> TraceStore::encodeCachedResult(
             return {ResultKind::Float, std::to_string(f.x), ""};
         },
         [&](const list_t & lt) -> std::tuple<ResultKind, std::string, std::string> {
-            return {ResultKind::List, std::to_string(lt.size), ""};
+            std::string ctx;
+            if (!lt.aliasOf.empty()) {
+                nlohmann::json ctxJson;
+                ctxJson["aliasOf"] = lt.aliasOf;
+                ctx = ctxJson.dump();
+            }
+            return {ResultKind::List, std::to_string(lt.size), std::move(ctx)};
         },
     }, value);
 }
@@ -126,21 +136,26 @@ CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
                 result.names.push_back(symbols.create(vocab.resolveName(nameId)));
             }
         }
-        // Decode origins from JSON context field when present.
+        // Decode origins and aliases from JSON context field when present.
         if (!row.context.empty()) {
             auto ctx = nlohmann::json::parse(row.context);
-            for (auto & origJson : ctx["origins"]) {
-                attrs_t::Origin orig;
-                orig.depSource = origJson["s"].get<std::string>();
-                orig.depKey = origJson["f"].get<std::string>();
-                orig.dataPath = origJson["p"].get<std::string>();
-                auto fmt = parseStructuredFormat(origJson["t"].get<std::string>()[0]);
-                if (!fmt) continue;
-                orig.format = *fmt;
-                result.origins.push_back(std::move(orig));
+            if (ctx.contains("origins")) {
+                for (auto & origJson : ctx["origins"]) {
+                    attrs_t::Origin orig;
+                    orig.depSource = origJson["s"].get<std::string>();
+                    orig.depKey = origJson["f"].get<std::string>();
+                    orig.dataPath = origJson["p"].get<std::string>();
+                    auto fmt = parseStructuredFormat(origJson["t"].get<std::string>()[0]);
+                    if (!fmt) continue;
+                    orig.format = *fmt;
+                    result.origins.push_back(std::move(orig));
+                }
+                for (auto & idx : ctx["indices"])
+                    result.originIndices.push_back(idx.get<int8_t>());
             }
-            for (auto & idx : ctx["indices"])
-                result.originIndices.push_back(idx.get<int8_t>());
+            if (ctx.contains("aliasOf"))
+                for (auto & idx : ctx["aliasOf"])
+                    result.aliasOf.push_back(idx.get<int16_t>());
         }
         return result;
     }
@@ -166,8 +181,16 @@ CachedResult TraceStore::decodeCachedResult(const TraceRow & row)
         return null_t{};
     case ResultKind::Float:
         return float_t{row.value.empty() ? 0.0 : std::stod(row.value)};
-    case ResultKind::List:
-        return list_t{row.value.empty() ? (size_t)0 : std::stoull(row.value)};
+    case ResultKind::List: {
+        list_t result{row.value.empty() ? (size_t)0 : std::stoull(row.value)};
+        if (!row.context.empty()) {
+            auto ctx = nlohmann::json::parse(row.context);
+            if (ctx.contains("aliasOf"))
+                for (auto & idx : ctx["aliasOf"])
+                    result.aliasOf.push_back(idx.get<int16_t>());
+        }
+        return result;
+    }
     case ResultKind::Missing:
         return missing_t{};
     case ResultKind::Misc:

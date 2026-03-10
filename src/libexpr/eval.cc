@@ -1580,6 +1580,12 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
         throw;
     }
 
+    // Copy the forced Value into the caller's output. This is a struct copy:
+    // the caller gets the same data (Bindings*, list pointers, etc.) but at
+    // a different Value* address. Code that relies on Value* identity — such
+    // as EvalTraceContext::siblingIdentityMap — cannot find these copies.
+    // See EvalTraceContext::bindingsIdentityMap for the secondary lookup
+    // that handles this for eval-trace pointer equality detection.
     v = *vAttrs;
 }
 
@@ -2033,6 +2039,12 @@ void ExprOpNot::eval(EvalState & state, Env & env, Value & v)
 
 void ExprOpEq::eval(EvalState & state, Env & env, Value & v)
 {
+    // v1 and v2 are stack-local Values. When e1/e2 are ExprSelect, the result
+    // is a struct copy of the Bindings Value (see ExprSelect::eval). These
+    // copies have different Value* addresses than the originals, which matters
+    // for eval-trace's siblingIdentityMap (keyed by Value*). The secondary
+    // bindingsIdentityMap in EvalTraceContext handles this by allowing lookup
+    // via the Bindings* pointer, which is preserved across copies.
     Value v1;
     e1->eval(state, env, v1);
     Value v2;
@@ -3157,14 +3169,13 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
             maybeRecordListLenDep(v1);
             maybeRecordListLenDep(v2);
         }
-        /* TODO: eval-trace materialization breaks Value* pointer identity for
-           list elements, just as it does for attrset attrs. Unlike attrsets
-           (where the shared Bindings* pointer survives shallow copy), lists
-           have no analogous shared pointer to compare — SmallList is inline
-           and materialization allocates fresh backing arrays. A broader fix
-           (e.g., a materialization-level identity map) is needed. */
         if (v1.listSize() != v2.listSize())
             return false;
+        // Eval-trace materialization allocates fresh list backing arrays,
+        // breaking Value pointer identity. Check whether both values were
+        // produced by TracedExpr thunks that navigate to the same real value.
+        if (traceCtx && traceCtx->haveSameResolvedTarget(v1, v2))
+            return true;
         for (size_t n = 0; n < v1.listSize(); ++n)
             if (!eqValues(*v1.listView()[n], *v2.listView()[n], pos, errorCtx))
                 return false;
@@ -3175,11 +3186,12 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
             maybeRecordAttrKeysDep(positions, symbols, v1);
             maybeRecordAttrKeysDep(positions, symbols, v2);
         }
-        /* Eval-trace materialization gives each child attr a fresh Value*,
-           breaking the &v1 == &v2 short-circuit above. The shallow copy
-           preserves the underlying Bindings* pointer, so two aliases that
-           resolve to the same real attrset share the same Bindings*. */
         if (v1.attrs() == v2.attrs())
+            return true;
+        // Eval-trace materialization allocates fresh Bindings, breaking
+        // the pointer check above. Check whether both values were produced
+        // by TracedExpr thunks that navigate to the same real value.
+        if (traceCtx && traceCtx->haveSameResolvedTarget(v1, v2))
             return true;
         /* If both sets denote a derivation (type = "derivation"),
            then compare their outPaths. */

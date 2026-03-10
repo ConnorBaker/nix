@@ -121,6 +121,7 @@ sources = files(
   'eval-trace/traced-data/materialization/multi-source.cc',
   'eval-trace/traced-data/materialization/standalone-verify.cc',
   'eval-trace/traced-data/materialization/error-recovery.cc',
+  'eval-trace/traced-data/materialization/pointer-equality.cc',
   # eval-trace/verify/
   'eval-trace/verify/cold-compare.cc',
   'eval-trace/verify/cold-verify.cc',

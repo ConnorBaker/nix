@@ -13,10 +13,40 @@
 
 #include <algorithm>
 #include <cassert>
+#include <unordered_map>
 
 namespace nix::eval_trace {
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Detect Value* aliases in a container: multiple elements pointing to
+ * the same Value. `getValuePtr(i)` returns the Value* for element i.
+ * Populates aliasOf: -1 = canonical (first occurrence), >= 0 = alias of that index.
+ * Clears aliasOf if no aliases are detected.
+ */
+static void detectAliases(std::vector<int16_t> & aliasOf, size_t n, auto getValuePtr)
+{
+    std::unordered_map<const Value *, size_t> valueToIdx;
+    aliasOf.resize(n, -1);
+    bool hasAliases = false;
+    for (size_t i = 0; i < n; i++) {
+        auto [it, inserted] = valueToIdx.emplace(getValuePtr(i), i);
+        if (!inserted) {
+            aliasOf[i] = static_cast<int16_t>(it->second);
+            hasAliases = true;
+        }
+    }
+    if (!hasAliases) aliasOf.clear();
+}
+
+/// Set canonicalSiblingIdx from an aliasOf vector during materialization.
+static void annotateAlias(TracedExpr * te, const std::vector<int16_t> & aliasOf, size_t i)
+{
+    if (!aliasOf.empty())
+        te->canonicalSiblingIdx = (aliasOf[i] >= 0)
+            ? aliasOf[i] : static_cast<int16_t>(i);
+}
 
 bool isLeafCached(const CachedResult & v)
 {
@@ -64,6 +94,9 @@ CachedResult buildCachedResult(EvalState & st, Value & target)
                 return std::string_view(st.symbols[a])
                      < std::string_view(st.symbols[b]);
             });
+        detectAliases(result.aliasOf, result.names.size(), [&](size_t i) {
+            return target.attrs()->get(result.names[i])->value;
+        });
         // Capture per-attr TracedData origins for cross-scope materialization.
         // Resolve interned IDs back to strings for serialization.
         if (target.attrs()->hasAnyTracedDataLayer()) {
@@ -105,8 +138,14 @@ CachedResult buildCachedResult(EvalState & st, Value & target)
         }
         return result;
     }
-    case nList:
-        return list_t{target.listSize()};
+    case nList: {
+        list_t result{target.listSize()};
+        auto view = target.listView();
+        detectAliases(result.aliasOf, result.size, [&](size_t i) {
+            return view[i];
+        });
+        return result;
+    }
     case nThunk:
     case nFunction:
     case nExternal:
@@ -230,6 +269,7 @@ void TracedExpr::materializeOrigExprAttrs(
         auto * wrapper = new TracedExpr(cache, childName, this);
         nrTracedExprCreated++;
         nrTracedExprFromOrigAttrs++;
+        annotateAlias(wrapper, attrs.aliasOf, i);
         wrapper->ensureLazy().origExpr = new ExprOrigChild(lazy->origExpr, lazy->origEnv, childName, shared);
         wrapper->ensureLazy().origEnv = lazy->origEnv;
         installChildThunk(childVal, &st.baseEnv, wrapper);
@@ -353,6 +393,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
             auto * child = new TracedExpr(cache, childName, this);
             nrTracedExprCreated++;
             nrTracedExprFromMaterialize++;
+            annotateAlias(child, attrs->aliasOf, i);
             installChildThunk(childVal, &st.baseEnv, child);
 
             PosIdx pos = noPos;
@@ -397,6 +438,7 @@ void TracedExpr::materializeResult(Value & v, const CachedResult & cached)
             auto * child = new TracedExpr(cache, sym, this, /*isListElement=*/true);
             nrTracedExprCreated++;
             nrTracedExprFromMaterialize++;
+            annotateAlias(child, lt->aliasOf, i);
             installChildThunk(elemVal, &st.baseEnv, child);
             list[i] = elemVal;
         }

@@ -46,7 +46,12 @@ struct int_t { NixInt x; };
 struct path_t { std::string path; };
 struct null_t {};
 struct float_t { double x; };
-struct list_t { size_t size; };
+struct list_t {
+    size_t size;
+    /// Per-element alias map: aliasOf[i] = j means element i shares the same Value* as element j.
+    /// -1 = canonical (first occurrence). Empty = no aliases detected.
+    std::vector<int16_t> aliasOf;
+};
 
 typedef std::pair<std::string, NixStringContext> string_t;
 
@@ -67,6 +72,9 @@ struct attrs_t {
     };
     std::vector<Origin> origins;       ///< deduplicated
     std::vector<int8_t> originIndices; ///< per-attr; -1 = no origin. Empty when origins is empty.
+    /// Per-attr alias map: aliasOf[i] = j means attr i shares the same Value* as attr j.
+    /// -1 = canonical (first occurrence). Empty = no aliases detected.
+    std::vector<int16_t> aliasOf;
 };
 
 typedef std::variant<
