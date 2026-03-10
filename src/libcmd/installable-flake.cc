@@ -107,9 +107,6 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
 
     state->forceValue(*vp, noPos);
 
-    if (state->settings.verifyTraceCache)
-        evalCache->verifyCold(resolvedPath, *vp);
-
     if (vp->type() != nAttrs || !state->isDerivation(*vp)) {
         if (std::optional derivedPathWithInfo = trySinglePathToDerivedPaths(
                 *vp, noPos, fmt("while evaluating the flake output attribute '%s'", resolvedPath))) {
@@ -244,11 +241,6 @@ std::pair<Value *, PosIdx> InstallableFlake::toValue(EvalState & state)
 
     if (!found.first)
         throw Error(suggestions, "flake '%s' does not provide attribute %s", flakeRef, showAttrPaths(attrPaths));
-
-    if (state.settings.verifyTraceCache) {
-        state.forceValue(*found.first, noPos);
-        evalCache->verifyCold(resolvedAttrPath_, *found.first);
-    }
 
     return found;
 }

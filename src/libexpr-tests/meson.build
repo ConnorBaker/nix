@@ -123,8 +123,6 @@ sources = files(
   'eval-trace/traced-data/materialization/error-recovery.cc',
   'eval-trace/traced-data/materialization/pointer-equality.cc',
   # eval-trace/verify/
-  'eval-trace/verify/cold-compare.cc',
-  'eval-trace/verify/cold-verify.cc',
   'eval-trace/verify/per-sibling-core.cc',
   'eval-trace/verify/per-sibling-edge.cc',
   'eval-trace/verify/integration.cc',

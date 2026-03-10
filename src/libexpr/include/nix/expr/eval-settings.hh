@@ -298,19 +298,6 @@ struct EvalSettings : Config
             Intermediate results are not traced.
         )"};
 
-    Setting<bool> verifyTraceCache{
-        this,
-        false,
-        "verify-eval-trace",
-        R"(
-            When enabled, performs a complete second evaluation with
-            dependency tracking disabled and compares the result against
-            the traced evaluation. Reports the first value divergence
-            with full attribute path, type information, and derivation
-            input diffs. Intended for debugging trace correctness, not
-            production use.
-        )"};
-
     Setting<bool> ignoreExceptionsDuringTry{
         this,
         false,

@@ -46,4 +46,13 @@ std::optional<Blake3Hash> computeGitIdentityHash(const std::filesystem::path & r
  */
 std::string dirEntryTypeString(std::optional<SourceAccessor::Type> type);
 
+/**
+ * Cached constant Blake3Hash values used in shape dep recording and verification.
+ * Function-local statics avoid static initialization order issues across TUs.
+ */
+const Blake3Hash & kHashZero();
+const Blake3Hash & kHashOne();
+const Blake3Hash & kHashObject();
+const Blake3Hash & kHashArray();
+
 } // namespace nix

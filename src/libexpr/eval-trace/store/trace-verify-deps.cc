@@ -231,13 +231,13 @@ static std::optional<DepHashValue> resolveShapeSuffix(
         return DepHashValue(canonicalKeysHash(source.keys()));
     }
     case ShapeSuffix::Type:
-        if (source.isObject()) return DepHashValue(depHash("object"));
-        if (source.isArray()) return DepHashValue(depHash("array"));
+        if (source.isObject()) return DepHashValue(kHashObject());
+        if (source.isArray()) return DepHashValue(kHashArray());
         return std::nullopt;
     case ShapeSuffix::None:
         if (isHasKey) {
             if (!source.isObject()) return std::nullopt;
-            return DepHashValue(depHash(source.hasKey(hasKeyName) ? "1" : "0"));
+            return DepHashValue(source.hasKey(hasKeyName) ? kHashOne() : kHashZero());
         }
         return source.hashLeaf();
     }
@@ -254,6 +254,26 @@ static std::optional<DepHashValue> resolveShapeSuffix(
 // placeholder expectedHash (Blake3Hash{}), so reading it would silently
 // produce wrong results or type-mismatch failures.
 
+/// Shared pattern for Content/RawContent, NARContent, and Directory deps:
+/// resolve path → lstat → hash via StatHashStore, with missing-file and
+/// exception handling.
+template<typename HashFn>
+static std::optional<DepHashValue> computeStatHashedDep(
+    const TraceStore::ResolvedDep & dep,
+    const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
+    HashFn && hashFn)
+{
+    auto path = resolveDepPath(dep, inputAccessors);
+    if (!path) return std::nullopt;
+    if (!path->maybeLstat())
+        return DepHashValue(depHash("<missing>"));
+    try {
+        return DepHashValue(hashFn(*path));
+    } catch (std::exception &) {
+        return std::nullopt;
+    }
+}
+
 std::optional<DepHashValue> computeCurrentHash(
     EvalState & state, const TraceStore::ResolvedDep & dep,
     const boost::unordered_flat_map<std::string, SourcePath> & inputAccessors,
@@ -262,39 +282,15 @@ std::optional<DepHashValue> computeCurrentHash(
 {
     switch (dep.type) {
     case DepType::Content:
-    case DepType::RawContent: {
-        auto path = resolveDepPath(dep, inputAccessors);
-        if (!path) return std::nullopt;
-        if (!path->maybeLstat())
-            return DepHashValue(depHash("<missing>"));
-        try {
-            return DepHashValue(StatHashStore::instance().depHashFile(*path));
-        } catch (std::exception &) {
-            return std::nullopt;
-        }
-    }
-    case DepType::NARContent: {
-        auto path = resolveDepPath(dep, inputAccessors);
-        if (!path) return std::nullopt;
-        if (!path->maybeLstat())
-            return DepHashValue(depHash("<missing>"));
-        try {
-            return DepHashValue(StatHashStore::instance().depHashPathCached(*path));
-        } catch (std::exception &) {
-            return std::nullopt;
-        }
-    }
-    case DepType::Directory: {
-        auto path = resolveDepPath(dep, inputAccessors);
-        if (!path) return std::nullopt;
-        if (!path->maybeLstat())
-            return DepHashValue(depHash("<missing>"));
-        try {
-            return DepHashValue(StatHashStore::instance().depHashDirListingCached(*path, path->readDirectory()));
-        } catch (std::exception &) {
-            return std::nullopt;
-        }
-    }
+    case DepType::RawContent:
+        return computeStatHashedDep(dep, inputAccessors,
+            [](const SourcePath & p) { return StatHashStore::instance().depHashFile(p); });
+    case DepType::NARContent:
+        return computeStatHashedDep(dep, inputAccessors,
+            [](const SourcePath & p) { return StatHashStore::instance().depHashPathCached(p); });
+    case DepType::Directory:
+        return computeStatHashedDep(dep, inputAccessors,
+            [](const SourcePath & p) { return StatHashStore::instance().depHashDirListingCached(p, p.readDirectory()); });
     case DepType::Existence: {
         auto path = resolveDepPath(dep, inputAccessors);
         if (!path) return std::nullopt;

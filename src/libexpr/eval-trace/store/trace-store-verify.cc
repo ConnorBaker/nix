@@ -136,8 +136,6 @@ enum class DepAction {
 struct VerificationState {
     bool hasNonContentFailure = false;
     bool hasContentFailure = false;
-    bool hasStructuralDeps = false;
-    bool hasImplicitShapeDeps = false;
     bool gitIdentityMatched = false;
 
     /// Indices into fullDeps for deferred StructuredContent deps.
@@ -147,10 +145,13 @@ struct VerificationState {
     /// Content/Directory deps that failed hash comparison.
     std::unordered_set<FileIdentity, FileIdentity::Hash> failedContentFiles;
 
+    bool hasStructuralDeps() const { return !structuralDepIndices.empty(); }
+    bool hasImplicitShapeDeps() const { return !implicitShapeDepIndices.empty(); }
+
     /// True when GitIdentity matched and no other failures or deferred deps exist.
     bool canShortCircuit() const {
         return gitIdentityMatched && !hasNonContentFailure && !hasContentFailure
-            && structuralDepIndices.empty() && implicitShapeDepIndices.empty();
+            && !hasStructuralDeps() && !hasImplicitShapeDeps();
     }
 
     /// Pass 1: Classify a dep by kind. Returns what the caller should do.
@@ -164,12 +165,10 @@ struct VerificationState {
         if (depKind(type) == DepKind::ImplicitStructural) {
             if (type == DepType::GitIdentity)
                 return DepAction::CheckGitIdentity;
-            hasImplicitShapeDeps = true;
             implicitShapeDepIndices.push_back(index);
             return DepAction::Done;
         }
         if (depKind(type) == DepKind::Structural) {
-            hasStructuralDeps = true;
             structuralDepIndices.push_back(index);
             return DepAction::Done;
         }
@@ -210,12 +209,12 @@ struct VerificationState {
         if (hasNonContentFailure)
             return VerifyOutcome::Invalid;
         if (!hasContentFailure) {
-            bool depsOk = (!hasStructuralDeps && !hasImplicitShapeDeps)
+            bool depsOk = (!hasStructuralDeps() && !hasImplicitShapeDeps())
                        || (structuralDepsVerified && implicitDepsVerified);
             return depsOk ? VerifyOutcome::Valid : VerifyOutcome::Invalid;
         }
         // hasContentFailure && need structural/implicit coverage
-        if (!hasStructuralDeps && !hasImplicitShapeDeps)
+        if (!hasStructuralDeps() && !hasImplicitShapeDeps())
             return VerifyOutcome::Invalid;
         if (!allFailuresCovered || !structuralDepsVerified || !implicitDepsVerified)
             return VerifyOutcome::Invalid;
@@ -340,7 +339,7 @@ bool TraceStore::verifyTrace(
 
     if (!vs.hasNonContentFailure && !vs.hasContentFailure) {
         // No content failures: verify standalone structural/implicit deps
-        if (vs.hasStructuralDeps || vs.hasImplicitShapeDeps) {
+        if (vs.hasStructuralDeps() || vs.hasImplicitShapeDeps()) {
             std::unordered_set<FileIdentity, FileIdentity::Hash> coveredFiles;
             for (auto & idep : fullDeps) {
                 if (isContentOverrideable(idep.key.type)) {
@@ -353,7 +352,7 @@ bool TraceStore::verifyTrace(
                 && verifyDeps(vs.implicitShapeDepIndices, &coveredFiles);
         }
     } else if (!vs.hasNonContentFailure && vs.hasContentFailure
-               && (vs.hasStructuralDeps || vs.hasImplicitShapeDeps)) {
+               && (vs.hasStructuralDeps() || vs.hasImplicitShapeDeps())) {
         // Content failures with structural/implicit coverage available.
         // Populate passedContentFiles: unchanged files, safe to skip.
         for (auto & idep : fullDeps) {

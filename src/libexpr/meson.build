@@ -159,7 +159,6 @@ sources = files(
   'diagnose.cc',
   'eval-trace/counters.cc',
   'eval-trace/context.cc',
-  'eval-trace/cache/cold-verify.cc',
   'eval-trace/cache/materialize.cc',
   'eval-trace/cache/sibling-tracker.cc',
   'eval-trace/cache/trace-cache.cc',

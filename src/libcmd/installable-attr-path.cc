@@ -185,21 +185,11 @@ std::pair<Value *, PosIdx> InstallableAttrPath::toValue(EvalState & state)
     auto * root = evalCache->getRootValue();
     state.forceValue(*root, noPos);
 
-    if (attrPath.empty()) {
-        if (state.settings.verifyTraceCache)
-            evalCache->verifyCold("", *root);
+    if (attrPath.empty())
         return {root, noPos};
-    }
 
     auto emptyArgs = state.buildBindings(0).finish();
-    auto found = findAlongAttrPath(state, attrPath, *emptyArgs, *root);
-
-    if (state.settings.verifyTraceCache) {
-        state.forceValue(*found.first, noPos);
-        evalCache->verifyCold(attrPath, *found.first);
-    }
-
-    return found;
+    return findAlongAttrPath(state, attrPath, *emptyArgs, *root);
 }
 
 DerivedPathsWithInfo InstallableAttrPath::toDerivedPaths()

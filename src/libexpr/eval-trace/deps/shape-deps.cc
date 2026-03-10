@@ -1,3 +1,4 @@
+#include "nix/expr/eval-trace/deps/dep-hash-fns.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/expr/eval-trace/deps/shape-recording.hh"
 #include "nix/expr/eval-trace/deps/root-tracker-scope.hh"
@@ -14,12 +15,13 @@
 
 namespace nix {
 
-// Cached constant Blake3Hash values used in shape dep recording.
+// Cached constant Blake3Hash values used in shape dep recording and verification.
 // Function-local statics avoid static initialization order issues across TUs.
-static const Blake3Hash & kHashZero()   { static const auto h = depHash("0"); return h; }
-static const Blake3Hash & kHashOne()    { static const auto h = depHash("1"); return h; }
-static const Blake3Hash & kHashObject() { static const auto h = depHash("object"); return h; }
-static const Blake3Hash & kHashArray()  { static const auto h = depHash("array"); return h; }
+// Declared in dep-hash-fns.hh so the verification side shares them.
+const Blake3Hash & kHashZero()   { static const auto h = depHash("0"); return h; }
+const Blake3Hash & kHashOne()    { static const auto h = depHash("1"); return h; }
+const Blake3Hash & kHashObject() { static const auto h = depHash("object"); return h; }
+const Blake3Hash & kHashArray()  { static const auto h = depHash("array"); return h; }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Shape dep recording for traced data containers
