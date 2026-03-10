@@ -1,5 +1,6 @@
 #include "trace-verify-deps.hh"
 #include "nix/expr/eval-trace/store/stat-hash-store.hh"
+#include "nix/expr/eval-trace/counters.hh"
 #include "nix/expr/eval-trace/deps/hash.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/eval-trace/deps/nix-binding.hh"
@@ -343,41 +344,47 @@ std::optional<DepHashValue> computeCurrentHash(
     case DepType::StructuredContent: {
         // Key format: JSON object {"f":"path","t":"j","p":[...],"s":"keys","h":"key"}
         // Or aggregated DirSet: {"ds":"<hex>","h":"keyName","t":"d"} (dirs in DirSets table)
+        auto jsonParseStart = timerStart();
         nlohmann::json j;
         try {
             j = nlohmann::json::parse(dep.key);
         } catch (...) {
             return std::nullopt;
         }
+        nrDepHashScJsonParseUs += elapsedUs(jsonParseStart);
 
         // Aggregated DirSet dep: iterate all directories, check each for the key
         if (j.contains("ds")) {
+            nrDepHashScDirSetMisses++;
             auto dsHash = j.value("ds", "");
             auto hasKeyName = j.value("h", "");
             if (hasKeyName.empty()) return std::nullopt;
 
             auto it = dirSets.find(dsHash);
             if (it == dirSets.end()) return std::nullopt;
+
             auto dirs = nlohmann::json::parse(it->second);
+            bool found = false;
             for (auto & dir : dirs) {
                 if (!dir.is_array() || dir.size() != 2) continue;
                 auto source = dir[0].get<std::string>();
                 auto filePath = dir[1].get<std::string>();
-                TraceStore::ResolvedDep fileDep{source, filePath, DepHashValue{Blake3Hash{}}, DepType::Directory};
-                auto path = resolveDepPath(fileDep, inputAccessors);
+                auto path = resolveDepPath(source, filePath, inputAccessors);
                 if (!path) continue;
                 try {
                     auto cacheKey = source + '\t' + filePath;
                     auto cacheIt = scope.dirListingCache.find(cacheKey);
                     if (cacheIt == scope.dirListingCache.end())
                         cacheIt = scope.dirListingCache.emplace(cacheKey, path->readDirectory()).first;
-                    if (cacheIt->second.count(hasKeyName))
-                        return DepHashValue(depHash("1")); // key found in this dir
+                    if (cacheIt->second.count(hasKeyName)) {
+                        found = true;
+                        break;
+                    }
                 } catch (...) {
                     continue;
                 }
             }
-            return DepHashValue(depHash("0")); // key absent in all dirs
+            return DepHashValue(depHash(found ? "1" : "0"));
         }
 
         auto filePath = j.value("f", "");
@@ -396,30 +403,40 @@ std::optional<DepHashValue> computeCurrentHash(
         };
         auto shape = parseShapeName(j.value("s", ""));
 
-        // Construct a synthetic Content dep to resolve the file path
-        TraceStore::ResolvedDep fileDep{dep.source, filePath, DepHashValue{Blake3Hash{}}, DepType::Content};
-        auto path = resolveDepPath(fileDep, inputAccessors);
-        if (!path) return std::nullopt;
-        if (!path->maybeLstat())
-            return DepHashValue(depHash("<missing>"));
+        // DOM cache key shared across all formats for the same file.
+        auto cacheKey = dep.source + '\t' + filePath;
+
+        // Resolve SourcePath only when needed (DOM cache miss).
+        auto resolveSourcePath = [&]() -> std::optional<SourcePath> {
+            auto resolved = resolveDepPath(dep.source, filePath, inputAccessors);
+            if (resolved && resolved->maybeLstat())
+                return resolved;
+            return std::nullopt;
+        };
 
         try {
             switch (*format) {
             case StructuredFormat::Json: {
-                auto cacheKey = dep.source + '\t' + filePath;
+                auto scStart = timerStart();
                 auto cacheIt = scope.jsonDomCache.find(cacheKey);
                 if (cacheIt == scope.jsonDomCache.end()) {
-                    auto contents = path->readFile();
-                    cacheIt = scope.jsonDomCache.emplace(cacheKey, nlohmann::json::parse(contents)).first;
+                    auto path = resolveSourcePath();
+                    if (!path) return DepHashValue(depHash("<missing>"));
+                    cacheIt = scope.jsonDomCache.emplace(cacheKey,
+                        nlohmann::json::parse(path->readFile())).first;
                 }
                 JsonSource source(cacheIt->second);
-                if (!source.navigate(pathArray)) return std::nullopt;
-                return resolveShapeSuffix(source, shape, isHasKey, hasKeyName);
+                if (!source.navigate(pathArray)) { nrDepHashStructuredJsonUs += elapsedUs(scStart); return std::nullopt; }
+                auto r = resolveShapeSuffix(source, shape, isHasKey, hasKeyName);
+                nrDepHashStructuredJsonUs += elapsedUs(scStart);
+                return r;
             }
             case StructuredFormat::Toml: {
-                auto cacheKey = dep.source + '\t' + filePath;
+                auto scStart = timerStart();
                 auto cacheIt = scope.tomlDomCache.find(cacheKey);
                 if (cacheIt == scope.tomlDomCache.end()) {
+                    auto path = resolveSourcePath();
+                    if (!path) return DepHashValue(depHash("<missing>"));
                     auto contents = path->readFile();
                     std::istringstream stream(std::move(contents));
                     cacheIt = scope.tomlDomCache.emplace(cacheKey, toml::parse(
@@ -430,29 +447,36 @@ std::optional<DepHashValue> computeCurrentHash(
                     )).first;
                 }
                 TomlSource source(cacheIt->second);
-                if (!source.navigate(pathArray)) return std::nullopt;
-                return resolveShapeSuffix(source, shape, isHasKey, hasKeyName);
+                if (!source.navigate(pathArray)) { nrDepHashStructuredTomlUs += elapsedUs(scStart); return std::nullopt; }
+                auto r = resolveShapeSuffix(source, shape, isHasKey, hasKeyName);
+                nrDepHashStructuredTomlUs += elapsedUs(scStart);
+                return r;
             }
             case StructuredFormat::Directory: {
-                auto cacheKey = dep.source + '\t' + filePath;
+                auto scStart = timerStart();
                 auto cacheIt = scope.dirListingCache.find(cacheKey);
                 if (cacheIt == scope.dirListingCache.end()) {
-                    auto dirEntries = path->readDirectory();
-                    cacheIt = scope.dirListingCache.emplace(cacheKey, std::move(dirEntries)).first;
+                    auto path = resolveSourcePath();
+                    if (!path) return DepHashValue(depHash("<missing>"));
+                    cacheIt = scope.dirListingCache.emplace(cacheKey, path->readDirectory()).first;
                 }
                 DirSource source(cacheIt->second);
-                if (!source.navigate(pathArray)) return std::nullopt;
-                return resolveShapeSuffix(source, shape, isHasKey, hasKeyName);
+                if (!source.navigate(pathArray)) { nrDepHashStructuredDirUs += elapsedUs(scStart); return std::nullopt; }
+                auto r = resolveShapeSuffix(source, shape, isHasKey, hasKeyName);
+                nrDepHashStructuredDirUs += elapsedUs(scStart);
+                return r;
             }
             case StructuredFormat::Nix: {
+                auto scStart = timerStart();
                 // Nix AST structural dep: re-parse .nix file, compute per-binding hash.
                 // pathArray has one element: the binding name.
                 if (pathArray.size() != 1 || !pathArray[0].is_string())
-                    return std::nullopt;
+                    { nrDepHashStructuredNixUs += elapsedUs(scStart); return std::nullopt; }
                 auto bindingName = pathArray[0].get<std::string>();
-                auto cacheKey = dep.source + '\t' + filePath;
                 auto cacheIt = scope.nixAstCache.find(cacheKey);
                 if (cacheIt == scope.nixAstCache.end()) {
+                    auto path = resolveSourcePath();
+                    if (!path) return DepHashValue(depHash("<missing>"));
                     auto source = path->readFile();
                     auto ast = state.parseExprFromString(
                         std::move(source), state.rootPath(CanonPath(filePath)).parent());
@@ -481,9 +505,10 @@ std::optional<DepHashValue> computeCurrentHash(
                     cacheIt = scope.nixAstCache.emplace(cacheKey, std::move(hashes)).first;
                 }
                 auto & hashes = cacheIt->second;
-                if (hashes.empty()) return std::nullopt;  // Structure not eligible
+                if (hashes.empty()) { nrDepHashStructuredNixUs += elapsedUs(scStart); return std::nullopt; }
                 auto it = hashes.find(bindingName);
-                if (it == hashes.end()) return std::nullopt;  // Binding removed
+                if (it == hashes.end()) { nrDepHashStructuredNixUs += elapsedUs(scStart); return std::nullopt; }
+                nrDepHashStructuredNixUs += elapsedUs(scStart);
                 return DepHashValue(it->second);
             }
             }

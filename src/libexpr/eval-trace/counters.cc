@@ -52,4 +52,38 @@ Counter nrReplayBloomHits;
 Counter nrReplayEpochHits;
 Counter nrReplayAdded;
 
+// ── Per-dep-type hash computation timing (microseconds) ─────────────
+Counter nrDepHashContentUs;
+Counter nrDepHashDirectoryUs;
+Counter nrDepHashExistenceUs;
+Counter nrDepHashStructuredJsonUs;
+Counter nrDepHashStructuredTomlUs;
+Counter nrDepHashStructuredDirUs;
+Counter nrDepHashStructuredNixUs;
+Counter nrDepHashStorePathUs;
+Counter nrDepHashStructuredOuterUs;
+Counter nrDepHashGitIdentityUs;
+Counter nrDepHashGitIdentityMisses;
+Counter nrDepHashOtherUs;
+
+// ── resolveCurrentDepHash cache tracking ────────────────────────────
+Counter nrDepHashCacheHits;
+Counter nrDepHashCacheMisses;
+Counter nrDepHashStructuredMisses;
+
+// ── Recovery dep recomputation breakdown ────────────────────────────
+Counter nrRecoveryDepRecomputeUs;
+Counter nrRecoveryDepRecomputeCount;
+
+// ── SC/IS dep detail breakdown ──────────────────────────────────────
+Counter nrDepHashScDirSetMisses;
+Counter nrDepHashScJsonParseUs;
+
+// ── Structural variant loop breakdown ───────────────────────────────
+Counter nrStructVariantCandidates;
+Counter nrStructVariantDepsResolved;
+Counter nrStructVariantLoadKeySetUs;
+Counter nrStructVariantHashUs;
+Counter nrStructVariantDepResolveUs;
+
 } // namespace nix::eval_trace

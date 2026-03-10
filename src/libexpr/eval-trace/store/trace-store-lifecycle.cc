@@ -17,25 +17,9 @@
 
 #include "trace-serialize.hh"
 
-#include <chrono>
 #include <filesystem>
 
 namespace nix::eval_trace {
-
-// ── Timing helpers (no-op when NIX_SHOW_STATS is unset) ──────────────
-
-static auto timerStart()
-{
-    return Counter::enabled ? std::chrono::steady_clock::now()
-                            : std::chrono::steady_clock::time_point{};
-}
-
-static uint64_t elapsedUs(std::chrono::steady_clock::time_point start)
-{
-    if (!Counter::enabled) return 0;
-    return std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - start).count();
-}
 
 // ── Schema ───────────────────────────────────────────────────────────
 

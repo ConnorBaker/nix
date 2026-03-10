@@ -16,26 +16,10 @@
 
 #include <nlohmann/json.hpp>
 
-#include <chrono>
 #include <cstring>
 #include <unordered_set>
 
 namespace nix::eval_trace {
-
-// ── Timing helpers (no-op when NIX_SHOW_STATS is unset) ──────────────
-
-static auto timerStart()
-{
-    return Counter::enabled ? std::chrono::steady_clock::now()
-                            : std::chrono::steady_clock::time_point{};
-}
-
-static uint64_t elapsedUs(std::chrono::steady_clock::time_point start)
-{
-    if (!Counter::enabled) return 0;
-    return std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - start).count();
-}
 
 // ── Dep hash resolution (verification support) ──────────────────────
 
@@ -45,10 +29,41 @@ std::optional<DepHashValue> TraceStore::resolveCurrentDepHash(
     EvalState & state, VerificationScope & scope)
 {
     auto cacheIt = currentDepHashes.find(dep.key);
-    if (cacheIt != currentDepHashes.end())
+    if (cacheIt != currentDepHashes.end()) {
+        nrDepHashCacheHits++;
         return cacheIt->second;
+    }
+    nrDepHashCacheMisses++;
+    auto hashStart = timerStart();
     auto resolved = resolveDep(dep);
     auto current = computeCurrentHash(state, resolved, inputAccessors, scope, pools.dirSets);
+    auto us = elapsedUs(hashStart);
+    // Attribute time to dep type (exhaustive to satisfy -Wswitch-enum)
+    switch (dep.key.type) {
+    case DepType::Content: case DepType::RawContent: case DepType::NARContent:
+        nrDepHashContentUs += us; break;
+    case DepType::Directory:
+        nrDepHashDirectoryUs += us; break;
+    case DepType::Existence:
+        nrDepHashExistenceUs += us; break;
+    case DepType::StorePathExistence:
+        nrDepHashStorePathUs += us; break;
+    case DepType::StructuredContent: case DepType::ImplicitShape:
+        // Per-format timing is tracked inside computeCurrentHash.
+        // This captures the outer overhead (key resolution, JSON parsing of dep key).
+        nrDepHashStructuredOuterUs += us;
+        nrDepHashStructuredMisses++;
+        break;
+    case DepType::GitIdentity:
+        nrDepHashGitIdentityUs += us;
+        nrDepHashGitIdentityMisses++;
+        break;
+    case DepType::EnvVar: case DepType::System: case DepType::CopiedPath:
+    case DepType::UnhashedFetch: case DepType::CurrentTime: case DepType::Exec:
+    case DepType::ParentContext:
+    case DepType::EndSentinel_:
+        nrDepHashOtherUs += us; break;
+    }
     currentDepHashes[dep.key] = current;
     return current;
 }
@@ -271,7 +286,11 @@ bool TraceStore::verifyTrace(
                 auto * expected = std::get_if<Blake3Hash>(&idep.hash);
                 matched = expected && std::memcmp(expected->bytes.data(), parentHash->bytes.data(), 32) == 0;
             }
-            if (!matched) nrVerificationsFailed++;
+            if (!matched) {
+                nrVerificationsFailed++;
+                debug("verifyTrace: dep FAILED type=%s key='%s'",
+                    depTypeName(idep.key.type), resolveDep(idep).key);
+            }
             vs.recordParentContext(matched);
             break;
         }
@@ -280,9 +299,11 @@ bool TraceStore::verifyTrace(
             bool matched = current && *current == idep.hash;
             if (!matched) {
                 nrVerificationsFailed++;
+                auto dep = resolveDep(idep);
+                debug("verifyTrace: dep FAILED type=%s key='%s'",
+                    depTypeName(idep.key.type), dep.key);
                 bool overrideable = isContentOverrideable(idep.key.type);
                 if (overrideable) {
-                    auto dep = resolveDep(idep);
                     auto fi = contentFileIdentity(dep);
                     vs.recordNormal(false, true, &fi);
                 } else {
@@ -549,6 +570,7 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
     }
 
     // Build Dep directly with current hash values
+    auto depRecomputeStart = timerStart();
     std::vector<Dep> currentDeps;
     bool allComputable = true;
     for (auto & idep : oldDeps) {
@@ -567,6 +589,9 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
         }
         currentDeps.push_back({idep.key, *current});
     }
+
+    nrRecoveryDepRecomputeUs += elapsedUs(depRecomputeStart);
+    nrRecoveryDepRecomputeCount += currentDeps.size();
 
     debug("recovery: recomputed %d/%d dep hashes for '%s'",
           currentDeps.size(), oldDeps.size(), vocab.displayPath(pathId));
@@ -679,11 +704,15 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             && structHashIt->second == *directHashStructHash)
             continue;
 
+        nrStructVariantCandidates++;
+        auto loadStart = timerStart();
         auto repKeys = loadKeySet(depKeySetId);
+        nrStructVariantLoadKeySetUs += elapsedUs(loadStart);
 
         // Build Dep directly using Dep::Key
         repDeps.clear();
         bool repComputable = true;
+        auto depResolveStart = timerStart();
         for (auto & key : repKeys) {
             if (isVolatile(key.type)) {
                 repComputable = false;
@@ -706,10 +735,14 @@ std::optional<TraceStore::VerifyResult> TraceStore::recovery(
             }
             repDeps.push_back({key, *current});
         }
+        nrStructVariantDepResolveUs += elapsedUs(depResolveStart);
+        nrStructVariantDepsResolved += repDeps.size();
         if (!repComputable)
             continue;
 
+        auto hashStart = timerStart();
         auto candidateFullHash = computePresortedTraceHash(repDeps);
+        nrStructVariantHashUs += elapsedUs(hashStart);
 
         if (auto * entry = lookupCandidate(candidateFullHash)) {
             if (auto r = acceptRecoveredTrace(*entry)) {
