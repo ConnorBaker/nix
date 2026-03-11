@@ -1986,4 +1986,210 @@ TEST_F(TracedDataTest, PointerEquality_WithPattern_ViaCopy)
     doTest("hot run", &loaderCalls);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Group 12: Real-tree contamination regression tests
+//
+// Tests that navigateToReal's sibling wrapping doesn't break pointer
+// equality when a cache-miss sibling triggers wrapping of the real tree,
+// and later getResolvedTarget navigates through contaminated cells.
+//
+// CRITICAL DESIGN: The aliased values must be under DIFFERENT parents
+// (e.g., a.platform vs b.platform) to bypass the canonicalSiblingIdx
+// fast path in haveSameResolvedTarget. Same-parent aliases (like
+// stdenv.buildPlatform and stdenv.hostPlatform) are caught by
+// detectAliases before getResolvedTarget is ever called.
+//
+// The contamination manifests only when:
+//   1. Cold run records traces for target attrs but NOT for a trigger sibling
+//   2. Hot run forces the trigger sibling FIRST (cache miss → navigateToReal
+//      → wraps target's cells in the real tree via installChildThunk)
+//   3. Hot run then compares aliased values under different parents
+//   4. haveSameResolvedTarget → getResolvedTarget navigates through
+//      contaminated cells
+//
+// Without resolveClean(), getResolvedTarget would navigate through
+// materialized (contaminated) cells, producing distinct Bindings* for
+// values that should share the same underlying data.
+// ═══════════════════════════════════════════════════════════════════════
+
+TEST_F(TracedDataTest, PointerEquality_RealTreeContamination_CrossParent)
+{
+    // Aliased values under DIFFERENT parents: a.platform and b.platform
+    // both reference the same localSystem. `trigger` is not forced on
+    // the cold run, so its hot-run eval is a cache miss that triggers
+    // navigateToReal → wraps `a` and `b` in the real tree.
+    //
+    // Different parents → canonicalSiblingIdx fast path does NOT fire →
+    // forces getResolvedTarget to navigate through contaminated cells.
+    auto expr = R"(
+        let localSystem = { system = "x86_64-linux"; canExecute = other: true; };
+        in {
+          a = { platform = localSystem; };
+          b = { platform = localSystem; };
+          trigger = { name = "trigger"; };
+        }
+    )";
+
+    // Cold run: record traces for a.platform and b.platform.
+    // Do NOT force `trigger`.
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        ASSERT_EQ(root.type(), nAttrs);
+
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        ASSERT_NE(a, nullptr);
+        ASSERT_NE(b, nullptr);
+        state.forceValue(*a->value, noPos);
+        state.forceValue(*b->value, noPos);
+
+        auto * ap = a->value->attrs()->get(state.symbols.create("platform"));
+        auto * bp = b->value->attrs()->get(state.symbols.create("platform"));
+        ASSERT_NE(ap, nullptr);
+        ASSERT_NE(bp, nullptr);
+        state.forceValue(*ap->value, noPos);
+        state.forceValue(*bp->value, noPos);
+
+        // Baseline: cold run should always work
+        Value aCopy = *ap->value;
+        Value bCopy = *bp->value;
+        EXPECT_TRUE(state.eqValues(aCopy, bCopy, noPos,
+            "contamination cross-parent: cold run"))
+            << "Cold run: aliased platform attrs under different parents should be equal";
+    }
+
+    // Hot run: force `trigger` FIRST to trigger real-tree contamination.
+    // trigger has no trace → cache miss → navigateToReal → wraps `a` and `b`
+    // in the real tree. Then getResolvedTarget for a.platform and b.platform
+    // must navigate through contaminated `a` and `b` cells.
+    // Without resolveClean, each yields a materialized value with distinct
+    // Bindings* → resolvedTargetsMatch returns false → eqValues returns false.
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+        ASSERT_EQ(root.type(), nAttrs);
+
+        // Force trigger FIRST — contamination trigger
+        auto * trigger = root.attrs()->get(state.symbols.create("trigger"));
+        ASSERT_NE(trigger, nullptr);
+        state.forceValue(*trigger->value, noPos);
+
+        // Now access through contaminated paths
+        auto * a = root.attrs()->get(state.symbols.create("a"));
+        auto * b = root.attrs()->get(state.symbols.create("b"));
+        ASSERT_NE(a, nullptr);
+        ASSERT_NE(b, nullptr);
+        state.forceValue(*a->value, noPos);
+        state.forceValue(*b->value, noPos);
+
+        auto * ap = a->value->attrs()->get(state.symbols.create("platform"));
+        auto * bp = b->value->attrs()->get(state.symbols.create("platform"));
+        ASSERT_NE(ap, nullptr);
+        ASSERT_NE(bp, nullptr);
+        state.forceValue(*ap->value, noPos);
+        state.forceValue(*bp->value, noPos);
+
+        // ViaCopy comparison — matches ExprOpEq::eval behavior
+        Value aCopy = *ap->value;
+        Value bCopy = *bp->value;
+        EXPECT_TRUE(state.eqValues(aCopy, bCopy, noPos,
+            "contamination cross-parent: hot run via copy"))
+            << "Hot run: aliased attrs under different parents must be equal "
+               "despite real-tree contamination";
+    }
+}
+
+TEST_F(TracedDataTest, PointerEquality_RealTreeContamination_CrossParent_ThreeLevel)
+{
+    // Three-level cross-parent structure matching the nixpkgs pattern more closely:
+    // root → {pkg1.stdenv.platform, pkg2.stdenv.platform} share localSystem.
+    // `trigger` contaminates at the root level; contamination cascades
+    // through pkg1, pkg1.stdenv, pkg2, pkg2.stdenv.
+    auto expr = R"(
+        let localSystem = { system = "x86_64-linux"; canExecute = other: true; };
+            mkStdenv = p: { platform = p; name = "stdenv"; };
+        in {
+          pkg1 = { stdenv = mkStdenv localSystem; };
+          pkg2 = { stdenv = mkStdenv localSystem; };
+          trigger = { name = "trigger"; };
+        }
+    )";
+
+    // Cold run: force through both pkg paths. Do NOT force `trigger`.
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+
+        auto * pkg1 = root.attrs()->get(state.symbols.create("pkg1"));
+        auto * pkg2 = root.attrs()->get(state.symbols.create("pkg2"));
+        ASSERT_NE(pkg1, nullptr);
+        ASSERT_NE(pkg2, nullptr);
+        state.forceValue(*pkg1->value, noPos);
+        state.forceValue(*pkg2->value, noPos);
+
+        auto * s1 = pkg1->value->attrs()->get(state.symbols.create("stdenv"));
+        auto * s2 = pkg2->value->attrs()->get(state.symbols.create("stdenv"));
+        ASSERT_NE(s1, nullptr);
+        ASSERT_NE(s2, nullptr);
+        state.forceValue(*s1->value, noPos);
+        state.forceValue(*s2->value, noPos);
+
+        auto * p1 = s1->value->attrs()->get(state.symbols.create("platform"));
+        auto * p2 = s2->value->attrs()->get(state.symbols.create("platform"));
+        ASSERT_NE(p1, nullptr);
+        ASSERT_NE(p2, nullptr);
+        state.forceValue(*p1->value, noPos);
+        state.forceValue(*p2->value, noPos);
+
+        Value c1 = *p1->value;
+        Value c2 = *p2->value;
+        EXPECT_TRUE(state.eqValues(c1, c2, noPos,
+            "3-level cross-parent contamination: cold run"))
+            << "Cold run: aliased platform attrs should be equal";
+    }
+
+    // Hot run: force `trigger` first → wraps pkg1 and pkg2 in real tree.
+    // Navigation through contaminated cells at EVERY intermediate level.
+    int loaderCalls = 0;
+    {
+        auto cache = makeCache(expr, &loaderCalls);
+        auto root = forceRoot(*cache);
+
+        // Force trigger FIRST — contamination trigger
+        auto * trigger = root.attrs()->get(state.symbols.create("trigger"));
+        ASSERT_NE(trigger, nullptr);
+        state.forceValue(*trigger->value, noPos);
+
+        // Navigate through contaminated intermediate levels
+        auto * pkg1 = root.attrs()->get(state.symbols.create("pkg1"));
+        auto * pkg2 = root.attrs()->get(state.symbols.create("pkg2"));
+        ASSERT_NE(pkg1, nullptr);
+        ASSERT_NE(pkg2, nullptr);
+        state.forceValue(*pkg1->value, noPos);
+        state.forceValue(*pkg2->value, noPos);
+
+        auto * s1 = pkg1->value->attrs()->get(state.symbols.create("stdenv"));
+        auto * s2 = pkg2->value->attrs()->get(state.symbols.create("stdenv"));
+        ASSERT_NE(s1, nullptr);
+        ASSERT_NE(s2, nullptr);
+        state.forceValue(*s1->value, noPos);
+        state.forceValue(*s2->value, noPos);
+
+        auto * p1 = s1->value->attrs()->get(state.symbols.create("platform"));
+        auto * p2 = s2->value->attrs()->get(state.symbols.create("platform"));
+        ASSERT_NE(p1, nullptr);
+        ASSERT_NE(p2, nullptr);
+        state.forceValue(*p1->value, noPos);
+        state.forceValue(*p2->value, noPos);
+
+        Value c1 = *p1->value;
+        Value c2 = *p2->value;
+        EXPECT_TRUE(state.eqValues(c1, c2, noPos,
+            "3-level cross-parent contamination: hot run via copy"))
+            << "Hot run: aliased attrs must be equal despite multi-level contamination";
+    }
+}
+
 } // namespace nix::eval_trace

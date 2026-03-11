@@ -2,6 +2,7 @@
 #include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/expr/eval-trace/counters.hh"
 #include "nix/expr/value.hh"
+#include "nix/expr/attr-set.hh"
 #include "nix/util/logging.hh"
 #include "cache/traced-expr.hh"
 
@@ -110,32 +111,25 @@ bool EvalTraceContext::haveSameResolvedTarget(Value & v1, Value & v2)
     auto * te1 = si1->tracedExpr;
     auto * te2 = si2->tracedExpr;
 
-    // Tier 1: Parent-level alias detection (zero navigation, zero rootLoader).
-    // Two children of the same parent with the same canonical sibling index
-    // were aliased in the parent's real Bindings during cold evaluation.
+    // Fast path 1: same canonical sibling (zero navigation, always correct)
     if (te1->parentExpr && te1->parentExpr == te2->parentExpr
         && te1->canonicalSiblingIdx >= 0
         && te1->canonicalSiblingIdx == te2->canonicalSiblingIdx)
         return true;
 
-    // Tier 2: Already-cached resolvedTarget from cold evaluatePhase2
-    // (set eagerly, no navigation triggered here).
-    // resolvedTarget is set from navigateToReal(), which returns the same
-    // Value* for aliased values, so pointer comparison suffices.
-    if (te1->lazy && te1->lazy->resolvedTarget
-        && te2->lazy && te2->lazy->resolvedTarget)
-        return te1->lazy->resolvedTarget == te2->lazy->resolvedTarget;
+    // Fast path 2: cached resolvedTarget pointer match
+    // ONLY returns true on match — mismatch falls through to data comparison
+    Value * t1 = (te1->lazy ? te1->lazy->resolvedTarget : nullptr);
+    Value * t2 = (te2->lazy ? te2->lazy->resolvedTarget : nullptr);
+    if (t1 && t2 && t1 == t2)
+        return true;
 
-    // Tier 3: Navigate to resolve (may trigger rootLoader).
-    // This fallback ensures correctness for cross-parent aliases on hot paths
-    // that aren't covered by tiers 1-2. Log so we can extend the fast paths.
-    // Uses resolvedTargetsMatch instead of pointer comparison because
-    // getResolvedTarget may return different Value* for the same logical value
-    // (ExprOrigChild::eval copies `v = *attr->value`, preserving Bindings*
-    // but not Value* identity).
-    warn("haveSameResolvedTarget: falling back to navigation for '%s' vs '%s'",
-         te1->attrPathStr(), te2->attrPathStr());
-    return resolvedTargetsMatch(te1->getResolvedTarget(), te2->getResolvedTarget());
+    // Resolve targets if not cached
+    if (!t1) t1 = te1->getResolvedTarget();
+    if (!t2) t2 = te2->getResolvedTarget();
+
+    // Data-level comparison (Bindings* for attrsets, element ptrs for lists)
+    return resolvedTargetsMatch(t1, t2);
 }
 
 void EvalTraceContext::reset()

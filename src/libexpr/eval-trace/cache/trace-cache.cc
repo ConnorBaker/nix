@@ -53,29 +53,97 @@ void TracedExpr::installChildThunk(Value * val, Env * env, TracedExpr * child)
             EvalTraceContext::SiblingIdentity{child, cache->dbBackend.get()});
 }
 
+/// Resolve a potentially contaminated real-tree cell to its clean underlying
+/// value WITHOUT modifying the original cell.  Returns `v` itself if clean,
+/// or a newly allocated Value containing the origExpr result if contaminated.
+///
+/// Contamination happens when navigateToReal's sibling wrapping replaces a cell
+/// with a TracedExpr thunk, and that thunk is later force-evaluated through
+/// TracedExpr::eval(), producing a MATERIALIZED value with distinct Bindings*.
+Value * TracedExpr::resolveClean(Value * v)
+{
+    // Case (a): cell is still a TracedExpr thunk (wrapped, not yet forced).
+    if (v->isThunk()) {
+        if (auto * ec = dynamic_cast<TracedExpr*>(v->thunk().expr)) {
+            if (ec->lazy && ec->lazy->origExpr) {
+                auto * clean = cache->state.allocValue();
+                ec->lazy->origExpr->eval(cache->state, *ec->lazy->origEnv, *clean);
+                return clean;
+            }
+        }
+        return v; // vanilla thunk — clean
+    }
+    // Case (b): cell was wrapped + forced → materialized.
+    // Detect via siblingIdentityMap (installChildThunk registers all wrapped cells).
+    if (cache->state.traceCtx) {
+        auto it = cache->state.traceCtx->siblingIdentityMap.find(v);
+        if (it != cache->state.traceCtx->siblingIdentityMap.end()) {
+            auto * ec = it->second.tracedExpr;
+            if (ec->lazy && ec->lazy->origExpr) {
+                auto * clean = cache->state.allocValue();
+                ec->lazy->origExpr->eval(cache->state, *ec->lazy->origEnv, *clean);
+                return clean;
+            }
+        }
+    }
+    return v; // not contaminated
+}
+
 Value * TracedExpr::getResolvedTarget()
 {
-    if (lazy && lazy->resolvedTarget)
+    if (lazy && lazy->resolvedTarget) {
         return lazy->resolvedTarget;
+    }
     // Only child nodes can navigate (root has no parent to navigate from).
     if (!parentExpr)
         return nullptr;
     try {
-        auto * target = navigateToReal();
-        // Unwrap TracedExpr thunks created by sibling wrapping (same as
-        // evaluatePhase2 Lesson 8). A prior sibling's navigateToReal may
-        // have wrapped this attr. Unwrap by evaluating origExpr directly
-        // to preserve the real Value identity (Bindings*/list pointers).
-        if (target->isThunk()) {
-            if (auto * ec = dynamic_cast<TracedExpr*>(target->thunk().expr)) {
-                if (ec->lazy && ec->lazy->origExpr) {
-                    ec->lazy->origExpr->eval(cache->state, *ec->lazy->origEnv, *target);
-                }
+        // Navigate the real tree, resolving contamination at every level.
+        // navigateToReal's sibling wrapping contaminates real-tree cells:
+        // wrapped cells that are subsequently force-evaluated through
+        // TracedExpr::eval() produce MATERIALIZED values with distinct
+        // Bindings*, breaking pointer identity for aliased values.
+        // resolveClean() allocates a temp Value when needed, avoiding
+        // in-place modification that would corrupt other evaluation paths.
+        struct PathStep { Symbol sym; bool isListElement; };
+        std::vector<PathStep> path;
+        for (auto * e = this; e->parentExpr; e = e->parentExpr)
+            path.push_back({e->name, e->isListElement});
+        std::reverse(path.begin(), path.end());
+
+        Value * v = cache->getOrEvaluateRoot();
+
+        for (auto & step : path) {
+            v = resolveClean(v);
+
+            if (step.isListElement) {
+                cache->state.forceValue(*v, noPos);
+                if (v->type() != nList)
+                    throw Error("expected a list but found %s while resolving target",
+                                showType(*v));
+                auto indexStr = std::string(cache->state.symbols[step.sym]);
+                size_t index = std::stoul(indexStr);
+                if (index >= v->listSize())
+                    throw Error("list index %d out of bounds (size %d) while resolving target",
+                                index, v->listSize());
+                v = v->listView()[index];
+            } else {
+                cache->state.forceAttrs(*v, noPos,
+                    "while resolving target for pointer identity");
+                auto * attr = v->attrs()->get(step.sym);
+                if (!attr)
+                    throw Error("attribute '%s' vanished while resolving target",
+                                cache->state.symbols[step.sym]);
+                v = attr->value;
             }
         }
-        cache->state.forceValue(*target, noPos);
-        ensureLazy().resolvedTarget = target;
-        return target;
+
+        // Resolve the final target cell.
+        v = resolveClean(v);
+        cache->state.forceValue(*v, noPos);
+
+        ensureLazy().resolvedTarget = v;
+        return v;
     } catch (std::exception & e) {
         debug("getResolvedTarget failed for '%s': %s", attrPathStr(), e.what());
         return nullptr;

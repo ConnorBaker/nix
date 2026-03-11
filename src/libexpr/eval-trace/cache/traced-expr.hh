@@ -157,10 +157,20 @@ struct TracedExpr : Expr, gc
     /**
      * Get the real (non-materialized) Value* this TracedExpr navigates to.
      * Set eagerly during evaluatePhase2 (cold path), or computed lazily
-     * via navigateToReal() on first call (hot path — triggers rootLoader).
+     * on first call (hot path — triggers rootLoader + clean navigation).
      * Returns nullptr if navigation is not possible (e.g., root node).
+     *
+     * Uses decontaminating navigation: at each step, if a real-tree cell
+     * was contaminated by navigateToReal's sibling wrapping (TracedExpr
+     * thunk still pending, or wrapped-then-forced to materialized value),
+     * re-evaluates the original expression to recover the real shared value.
      */
     Value * getResolvedTarget();
+
+    /// Resolve a potentially contaminated real-tree cell to a clean Value*
+    /// without modifying the original.  Returns `v` if clean, or a newly
+    /// allocated Value with the origExpr result if contaminated.
+    Value * resolveClean(Value * v);
 
     void materializeResult(Value & v, const CachedResult & cached);
     void materializeOrigExprAttrs(Value & v, const attrs_t & attrs,

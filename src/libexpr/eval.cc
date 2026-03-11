@@ -3216,6 +3216,8 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
 
     /* Functions are incomparable. */
     case nFunction:
+        if (traceCtx && traceCtx->haveSameResolvedTarget(v1, v2))
+            return true;
         return false;
 
     case nExternal:
