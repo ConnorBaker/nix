@@ -5,6 +5,7 @@
 #include "nix/expr/attr-set.hh"
 #include "nix/util/logging.hh"
 #include "cache/traced-expr.hh"
+#include "cache/sibling-tracker.hh"
 
 namespace nix {
 
@@ -17,6 +18,24 @@ void EvalTraceContext::recordThunkDeps(const Value & v, uint32_t epochStart)
     }
 }
 
+// ── replayMemoizedDeps and the first-touch asymmetry ─────────────────
+//
+// The sibling callback (lines below, siblingCallback check) only fires
+// for values that are ALREADY forced — i.e., values that have an epochMap
+// entry from a previous forceThunkValue call.  When siblingCallback
+// succeeds, the dep copy is skipped and the child gets a compact
+// ParentContext dep instead of the sibling's full dep set.
+//
+// First-touch thunks never reach this path.  When forceThunkValue forces
+// a sibling thunk for the first time, the sibling's deps flow through
+// record() directly into the child's active DependencyTracker::ownDeps.
+// The epochMap entry is only created AFTER forceThunkValue completes
+// (via recordThunkDeps), so replayMemoizedDeps cannot intercept the
+// first-touch evaluation.  This is the root of the first-touch asymmetry:
+// evaluation order determines whether a sibling access produces a compact
+// ParentContext dep or a full copy of the sibling's deps.
+//
+// See forceThunkValue for why this is accepted as sound-but-imprecise.
 void EvalTraceContext::replayMemoizedDeps(const Value & v)
 {
     eval_trace::nrReplayTotalCalls++;
@@ -34,7 +53,7 @@ void EvalTraceContext::replayMemoizedDeps(const Value & v)
     if (siblingCallback) {
         auto sibIt = siblingIdentityMap.find(&v);
         if (sibIt != siblingIdentityMap.end()
-            && siblingCallback(sibIt->second.tracedExpr, sibIt->second.traceStore))
+            && siblingCallback(sibIt->second))
             return;
     }
 
@@ -58,34 +77,6 @@ void EvalTraceContext::replayMemoizedDeps(const Value & v)
     }
 }
 
-/**
- * Check whether two resolved Values share the same underlying data.
- *
- * getResolvedTarget() may return different Value* addresses for aliased
- * values (e.g., when ExprOrigChild::eval copies `v = *attr->value`).
- * The copies share the same Bindings* (for attrsets) or the same element
- * pointers (for lists), so compare those rather than Value* addresses.
- */
-static bool resolvedTargetsMatch(Value * t1, Value * t2)
-{
-    if (t1 == t2) return true;
-    if (!t1 || !t2) return false;
-    if (t1->type() != t2->type()) return false;
-
-    if (t1->type() == nAttrs)
-        return t1->attrs() == t2->attrs();
-    if (t1->type() == nList) {
-        if (t1->listSize() != t2->listSize()) return false;
-        if (t1->listSize() == 0) return true;
-        auto v1 = t1->listView();
-        auto v2 = t2->listView();
-        for (size_t i = 0; i < v1.size(); i++)
-            if (v1[i] != v2[i]) return false;
-        return true;
-    }
-    return false;
-}
-
 bool EvalTraceContext::haveSameResolvedTarget(Value & v1, Value & v2)
 {
     // Find SiblingIdentity for each value. Try Value* lookup first (works for
@@ -94,43 +85,77 @@ bool EvalTraceContext::haveSameResolvedTarget(Value & v1, Value & v2)
     // The copy preserves the Bindings* pointer, so looking up by v.attrs()
     // finds the TracedExpr that produced the original.
     auto findIdentity = [&](Value & v) -> SiblingIdentity * {
-        auto it = siblingIdentityMap.find(&v);
-        if (it != siblingIdentityMap.end()) return &it->second;
+        // For attrsets, check bindingsIdentityMap first — its entries are
+        // populated in registerBindings after evaluation and carry originalBindings
+        // (needed for Tier 2). siblingIdentityMap entries are registered at
+        // installChildThunk time before evaluation, so they have originalBindings=null.
+        // Both maps store the same parentExpr and canonicalSiblingIdx, so Tier 1
+        // still works correctly when we prefer bindingsIdentityMap.
         if (v.type() == nAttrs) {
             auto bit = bindingsIdentityMap.find(v.attrs());
             if (bit != bindingsIdentityMap.end()) return &bit->second;
         }
+        auto it = siblingIdentityMap.find(&v);
+        if (it != siblingIdentityMap.end()) return &it->second;
         return nullptr;
     };
 
     auto * si1 = findIdentity(v1);
-    if (!si1) return false;
+    if (!si1)
+        return false;
     auto * si2 = findIdentity(v2);
-    if (!si2) return false;
+    if (!si2)
+        return false;
 
-    auto * te1 = si1->tracedExpr;
-    auto * te2 = si2->tracedExpr;
+    // The identity maps use default allocator (mimalloc, GC-invisible), so
+    // stored GC-allocated pointers (TracedExpr*, Bindings*) are not traced.
+    // Tier 1 and Tier 2 only COMPARE these pointers (no deref), so they
+    // won't crash, but pointer reuse after GC collection could cause false
+    // positives. Tier 3 DEREFERENCES tracedExpr and is not GC-safe — it
+    // is best-effort with GC safety deferred to Stage 2.
 
-    // Fast path 1: same canonical sibling (zero navigation, always correct)
-    if (te1->parentExpr && te1->parentExpr == te2->parentExpr
-        && te1->canonicalSiblingIdx >= 0
-        && te1->canonicalSiblingIdx == te2->canonicalSiblingIdx)
+    // Tier 1: same parent + same alias index (O(1), set by detectAliases
+    // during materialization). Handles direct aliases like
+    // { a = platform; b = platform; }.
+    if (si1->parentExpr && si1->parentExpr == si2->parentExpr
+        && si1->canonicalSiblingIdx >= 0
+        && si1->canonicalSiblingIdx == si2->canonicalSiblingIdx)
         return true;
 
-    // Fast path 2: cached resolvedTarget pointer match
-    // ONLY returns true on match — mismatch falls through to data comparison
-    Value * t1 = (te1->lazy ? te1->lazy->resolvedTarget : nullptr);
-    Value * t2 = (te2->lazy ? te2->lazy->resolvedTarget : nullptr);
-    if (t1 && t2 && t1 == t2)
+    // Tier 2: same original Bindings* (pre-materialization). Handles aliases
+    // where different thunks evaluate to the same attrset, like
+    // { buildPlatform = localSystem; hostPlatform = if ... then ... else localSystem; }.
+    // detectAliases misses these because thunks have different Value* before
+    // evaluation. The originalBindings is cached from resolvedTarget->attrs()
+    // at TracedExpr::eval() completion.
+    if (si1->originalBindings && si1->originalBindings == si2->originalBindings)
         return true;
 
-    // Resolve targets if not cached
-    if (!t1) t1 = te1->getResolvedTarget();
-    if (!t2) t2 = te2->getResolvedTarget();
+    // Tier 3: Navigate via getResolvedTarget (lazy — only when eqValues calls us).
+    // Handles cross-parent aliases for NavigatedChild attrsets on the hot path,
+    // where evaluatePhase2 is skipped and originalBindings was not set.
+    // Best-effort: TracedExpr* deref is NOT GC-safe (identity maps use default
+    // allocator, so GC may collect TracedExpr after thunk forcing). Gated on
+    // nAttrs and non-null tracedExpr. GC safety deferred to Stage 2.
+    // getResolvedTarget() caches the result in lazy->resolvedTarget for future calls.
+    if (v1.type() == nAttrs && v2.type() == nAttrs
+        && si1->tracedExpr && si2->tracedExpr)
+    {
+        SuspendDepTracking suspend;
+        auto * t1 = si1->tracedExpr->getResolvedTarget();
+        auto * t2 = si2->tracedExpr->getResolvedTarget();
+        if (t1 && t2) {
+            if (t1 == t2)
+                return true;
+            if (t1->type() == nAttrs && t2->type() == nAttrs
+                && t1->attrs() == t2->attrs())
+                return true;
+        }
+    }
 
-    // Data-level comparison (Bindings* for attrsets, element ptrs for lists)
-    return resolvedTargetsMatch(t1, t2);
+    return false;
 }
+
 
 void EvalTraceContext::reset()
 {

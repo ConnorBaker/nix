@@ -322,7 +322,7 @@ namespace {
     thread_local bool callbackInvoked;
     thread_local bool callbackReturnValue;
 
-    bool testCallback(eval_trace::TracedExpr *, eval_trace::TraceStore *)
+    bool testCallback(const EvalTraceContext::SiblingIdentity &)
     {
         callbackInvoked = true;
         return callbackReturnValue;
@@ -342,7 +342,7 @@ TEST_F(EpochRecordTest, SiblingCallback_ReturnsTrue_SkipsReplay)
 
     // Set up sibling detection: register v and set callback returning true.
     ctx.siblingIdentityMap.emplace(&v,
-        EvalTraceContext::SiblingIdentity{nullptr, nullptr});
+        EvalTraceContext::SiblingIdentity{nullptr, nullptr, nullptr, -1, AttrPathId(), nullptr});
     ctx.siblingCallback = &testCallback;
     callbackInvoked = false;
     callbackReturnValue = true;
@@ -370,7 +370,7 @@ TEST_F(EpochRecordTest, SiblingCallback_ReturnsFalse_FallsThrough)
 
     // Set up sibling detection: register v, callback returns FALSE.
     ctx.siblingIdentityMap.emplace(&v,
-        EvalTraceContext::SiblingIdentity{nullptr, nullptr});
+        EvalTraceContext::SiblingIdentity{nullptr, nullptr, nullptr, -1, AttrPathId(), nullptr});
     ctx.siblingCallback = &testCallback;
     callbackInvoked = false;
     callbackReturnValue = false;
@@ -399,7 +399,7 @@ TEST_F(EpochRecordTest, NoSiblingCallback_NormalReplay)
 
     // Register in siblingIdentityMap but leave siblingCallback null.
     ctx.siblingIdentityMap.emplace(&v,
-        EvalTraceContext::SiblingIdentity{nullptr, nullptr});
+        EvalTraceContext::SiblingIdentity{nullptr, nullptr, nullptr, -1, AttrPathId(), nullptr});
     ASSERT_EQ(ctx.siblingCallback, nullptr);
 
     // Replay — no callback set, normal dep replay despite map entry.
@@ -443,7 +443,7 @@ TEST_F(EpochRecordTest, ResetClearsSiblingState)
     Value v;
     v.mkInt(42);
     ctx.siblingIdentityMap.emplace(&v,
-        EvalTraceContext::SiblingIdentity{nullptr, nullptr});
+        EvalTraceContext::SiblingIdentity{nullptr, nullptr, nullptr, -1, AttrPathId(), nullptr});
     ctx.siblingCallback = &testCallback;
 
     ctx.reset();

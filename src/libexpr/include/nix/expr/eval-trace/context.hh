@@ -111,16 +111,49 @@ struct EvalTraceContext {
 
     // ── Sibling identity tracking (for already-materialized sibling detection) ──
 
-    /// Identity of a TracedExpr child thunk, stored by Value* address.
+    /// Identity of a sibling Value, stored by Value* address.
+    ///
+    /// Populated by two sources:
+    ///   - installChildThunk: TracedExpr children from materializeResult
+    ///     (tracedExpr is set, used for Tier 3 equality recovery)
+    ///   - navigateToReal: real siblings at each navigation level
+    ///     (tracedExpr is null, used for identity recovery only)
+    ///
+    /// Critical fields (parentExpr, canonicalSiblingIdx) are cached here at
+    /// registration time so haveSameResolvedTarget Tier 1 and Tier 2 never
+    /// dereference the TracedExpr pointer. Tier 3 dereferences tracedExpr
+    /// but is best-effort (GC safety deferred to Stage 2).
+    ///
+    /// The maps use default allocator (mimalloc, GC-invisible). TracedExpr*
+    /// may be GC-collected after thunk forcing. Tier 1/2 use cached fields
+    /// only; Tier 3 is not GC-safe for navigateToReal entries (tracedExpr=null)
+    /// or after GC collects installChildThunk entries.
     struct SiblingIdentity {
         eval_trace::TracedExpr * tracedExpr;
         eval_trace::TraceStore * traceStore;
+        /// Cached from TracedExpr at registration time (GC-safe).
+        eval_trace::TracedExpr * parentExpr;
+        int16_t canonicalSiblingIdx;
+        AttrPathId pathId;
+        /// Bindings* from the original (pre-materialization) Value. Cached at
+        /// TracedExpr::eval() completion from resolvedTarget->attrs(). Enables
+        /// Tier 2 alias detection: two TracedExprs that evaluate to the same
+        /// underlying attrset share the same originalBindings, even when
+        /// detectAliases missed the alias (because thunks have different Value*
+        /// before evaluation). The Bindings object is GC-allocated and kept
+        /// alive by the original expression tree for the evaluation's lifetime.
+        const Bindings * originalBindings = nullptr;
     };
 
-    /// Maps Value* → SiblingIdentity for all TracedExpr child thunks created
-    /// during materialization. Value* is stable across thunk→materialized
-    /// transitions (forceValue mutates in-place). Lifetime 3 (per-EvalState)
-    /// so entries persist across nested root tracker scopes.
+    /// Maps Value* → SiblingIdentity for TracedExpr children (from
+    /// installChildThunk) and real siblings (from navigateToReal).
+    /// Value* is stable across thunk→materialized transitions (forceValue
+    /// mutates in-place). Lifetime 3 (per-EvalState) so entries persist
+    /// across nested root tracker scopes.
+    ///
+    /// Keyed by Value*; emplace means first-registration-wins for shared
+    /// values. navigateToReal skips aliases of the navigation target to
+    /// avoid registering the target under a sibling's pathId.
     boost::unordered_flat_map<const void *, SiblingIdentity> siblingIdentityMap;
 
     /// Secondary identity map: Bindings* → SiblingIdentity.
@@ -134,7 +167,10 @@ struct EvalTraceContext {
     /// Callback invoked by replayMemoizedDeps when a registered sibling is
     /// detected. Returns true if the sibling access was recorded. Set by
     /// SiblingAccessTracker ctor, cleared by dtor.
-    using SiblingCallback = bool (*)(eval_trace::TracedExpr *, eval_trace::TraceStore *);
+    ///
+    /// Takes const SiblingIdentity& (not TracedExpr*) so the callback uses
+    /// cached fields and never dereferences the potentially-GC'd TracedExpr.
+    using SiblingCallback = bool (*)(const SiblingIdentity &);
     SiblingCallback siblingCallback = nullptr;
 
     /**
@@ -147,16 +183,18 @@ struct EvalTraceContext {
      * object). This method restores identity using a three-tier approach:
      *
      *   Tier 1: Same parent + same canonicalSiblingIdx → O(1), no rootLoader.
-     *   Tier 2: Both resolvedTargets set (cold path) → pointer compare.
+     *           Handles direct aliases like { a = platform; b = platform; }.
+     *   Tier 2: Same originalBindings (pre-materialization Bindings*) → O(1).
+     *           Handles cross-parent aliases where different thunks evaluate
+     *           to the same attrset. Without real-tree contamination, this is
+     *           reliable since Bindings* matches the real evaluation result.
      *   Tier 3: Navigate via getResolvedTarget → may trigger rootLoader.
+     *           Best-effort fallback. GC safety of TracedExpr* deref is
+     *           not guaranteed (deferred to Stage 2).
      *
      * Lookup uses siblingIdentityMap (by Value*) with fallback to
      * bindingsIdentityMap (by Bindings*) for Value copies created by
      * ExprSelect::eval (`v = *vAttrs`).
-     *
-     * Returns true if both Values trace back to the same underlying Value.
-     * Returns false if either Value is not tracked, or if they have
-     * different targets.
      */
     bool haveSameResolvedTarget(Value & v1, Value & v2);
 

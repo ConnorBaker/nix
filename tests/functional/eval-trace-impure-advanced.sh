@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # Advanced impure eval trace tests: partial tree invalidation via thunk mutation,
-# origExpr deep chain, FullAttrs shared trace, nested FullAttrs, no infinite
-# recursion, deep origExpr O(2^K), dep suspension (fat parent).
+# deep nested trace chain, FullAttrs shared trace, nested FullAttrs, no infinite
+# recursion, deep trace chain O(2^K), dep suspension (fat parent).
 # Terminology follows Build Systems à la Carte (BSàlC) and Adapton.
 
 source common.sh
@@ -62,7 +62,7 @@ echo "modified" > "$testDir/partial-a.txt"
 echo "Test 1 passed: partial trace invalidation via thunk mutation"
 
 ####################################################################
-# Test 2: Child origExpr wrapping enables deep trace verification hits
+# Test 2: Deep nested traces enable cache verification hits
 ####################################################################
 testDir2="$TEST_ROOT/deep-chain"
 mkdir -p "$testDir2"
@@ -99,7 +99,7 @@ NIX_ALLOW_EVAL=0 expectStderr 1 nix eval --impure -f "$testDir2/default.nix" a -
 [[ $(nix eval --impure -f "$testDir2/default.nix" a --json) = '"world\n"' ]]
 [[ $(NIX_ALLOW_EVAL=0 nix eval --impure -f "$testDir2/default.nix" a --json) = '"world\n"' ]]
 
-echo "Test 2 passed: child origExpr wrapping enables deep trace verification hits"
+echo "Test 2 passed: deep nested traces enable cache verification hits"
 
 ####################################################################
 # Test 3: FullAttrs trace verification serves shared dependency
@@ -213,7 +213,7 @@ EOF
 echo "Test 5 passed: FullAttrs trace verification doesn't cause infinite recursion"
 
 ####################################################################
-# Test 6: Deep nested origExpr chain completes without trace dependency explosion
+# Test 6: Deep nested trace chain completes without trace dependency explosion
 ####################################################################
 testDir6="$TEST_ROOT/deep-origexpr"
 mkdir -p "$testDir6"
@@ -268,10 +268,10 @@ NIX_ALLOW_EVAL=0 expectStderr 1 nix eval --impure -f "$testDir6/default.nix" dee
 [[ $(nix eval --impure -f "$testDir6/default.nix" deepLeaf --json) = '"file-6-changed\n"' ]]
 [[ $(NIX_ALLOW_EVAL=0 nix eval --impure -f "$testDir6/default.nix" deepLeaf --json) = '"file-6-changed\n"' ]]
 
-echo "Test 6 passed: deep nested origExpr chain completes without trace dependency explosion"
+echo "Test 6 passed: deep nested trace chain completes without trace dependency explosion"
 
 ####################################################################
-# Test 7: ExprOrigChild doesn't inherit parent's trace dependencies
+# Test 7: Child traces don't inherit parent's trace dependencies
 ####################################################################
 testDir7="$TEST_ROOT/fat-parent"
 mkdir -p "$testDir7"
@@ -339,6 +339,6 @@ NIX_ALLOW_EVAL=0 expectStderr 1 nix eval --impure -f "$testDir7/default.nix" chi
 [[ $(nix eval --impure -f "$testDir7/default.nix" childVal --json) = '"child-data-changed\n"' ]]
 [[ $(NIX_ALLOW_EVAL=0 nix eval --impure -f "$testDir7/default.nix" childVal --json) = '"child-data-changed\n"' ]]
 
-echo "Test 7 passed: ExprOrigChild doesn't inherit parent's trace dependencies"
+echo "Test 7 passed: child traces don't inherit parent's trace dependencies"
 
 echo "All eval-trace-impure-advanced tests passed! (BSàlC: trace isolation, Adapton: selective dirtying)"

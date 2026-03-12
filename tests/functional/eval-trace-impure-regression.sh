@@ -274,4 +274,186 @@ done
 
 echo "Test 5 passed: many siblings all retain their trace dependencies"
 
+###############################################################################
+# Test 6: asciidoc.nativeBuildInputs preserves mk-python-derivation hook list
+#
+# Regression target: the real nixpkgs failure shape for
+# `asciidoc.nativeBuildInputs`, not just a standalone boolean comparison.
+#
+# This models the same layers involved in the bug:
+#   - top-level alias: asciidoc -> asciidoc-full
+#   - package override hop: asciidocBase.override { enableStandardFeatures = true; }
+#   - python3.pkgs.buildPythonApplication finalAttrs fixpoint
+#   - defaulted builder argument: stdenv ? python3.stdenv
+#   - nativeBuildInputs assembled from builder-added hooks, package-supplied
+#     nativeBuildInputs, build-system, and nativeCheckInputs
+#
+# Older pointer/command-path matching could diverge for the
+# stdenv.buildPlatform == stdenv.hostPlatform comparison only on the traced
+# path, dropping pythonImportsCheckHook from `asciidoc.nativeBuildInputs`.
+###############################################################################
+clearStoreIndex
+
+cat >"$testDir/test-asciidoc-nativeBuildInputs-shape.nix" <<'EOF'
+let
+  optionals = cond: list: if cond then list else [];
+  optionalString = cond: s: if cond then s else "";
+  mkPath = name: builtins.toFile name "${name}\n";
+
+  sharedCanExecute = other: other.system == "x86_64-linux";
+  sharedParsed = {
+    cpu = { name = "x86_64"; };
+    kernel = { name = "linux"; };
+  };
+
+  platform = {
+    system = "x86_64-linux";
+    parsed = sharedParsed;
+    isLinux = true;
+    canExecute = sharedCanExecute;
+  };
+
+  python3 = rec {
+    stdenv = {
+      buildPlatform = let p = platform; in p;
+      hostPlatform = let p = platform; in p;
+    };
+
+    pythonOnBuildForHost = {
+      pkgs = {
+        setuptools = mkPath "python3.13-setuptools";
+      };
+    };
+
+    pkgs = rec {
+      python = mkPath "python3";
+      wrapPython = mkPath "wrap-python-hook";
+      ensureNewerSourcesForZipFilesHook = mkPath "ensure-newer-sources-hook";
+      pythonRemoveTestsDirHook = mkPath "python-remove-tests-dir-hook";
+      pythonCatchConflictsHook = mkPath "python-catch-conflicts-hook";
+      pythonRemoveBinBytecodeHook = mkPath "python-remove-bin-bytecode-hook";
+      pypaBuildHook = mkPath "pypa-build-hook.sh";
+      pythonRuntimeDepsCheckHook = mkPath "python-runtime-deps-check-hook.sh";
+      pypaInstallHook = mkPath "pypa-install-hook";
+      pythonImportsCheckHook = mkPath "python-imports-check-hook.sh";
+      pythonNamespacesHook = mkPath "python-namespaces-hook.sh";
+      pythonOutputDistHook = mkPath "python-output-dist-hook";
+      autoreconfHook = mkPath "autoreconf-hook";
+      installShellFiles = mkPath "install-shell-files";
+      unzip = mkPath "unzip";
+      pytest = mkPath "python3.13-pytest";
+      pytestMock = mkPath "python3.13-pytest-mock";
+
+      buildPythonApplication =
+        drvFn: args@{ stdenv ? (python3.stdenv // { }), ... }:
+        let
+          finalAttrs =
+            let
+              baseAttrs = drvFn finalAttrs;
+              stdenv' = stdenv // { };
+              cond =
+                let
+                  cond = stdenv'.buildPlatform == stdenv'.hostPlatform;
+                  bpK = builtins.length (builtins.attrNames (builtins.removeAttrs stdenv'.buildPlatform [ "outPath" ]));
+                  hpK = builtins.length (builtins.attrNames (builtins.removeAttrs stdenv'.hostPlatform [ "outPath" ]));
+                in
+                builtins.trace (
+                  finalAttrs.name
+                  + "::cond=" + builtins.toString cond
+                  + "::bpK=" + builtins.toString bpK
+                  + "::hpK=" + builtins.toString hpK
+                ) cond;
+            in
+            baseAttrs // {
+              stdenv = stdenv';
+              name = baseAttrs.pname + "-" + baseAttrs.version;
+              nativeBuildInputs =
+                [
+                  python
+                  wrapPython
+                  ensureNewerSourcesForZipFilesHook
+                  pythonRemoveTestsDirHook
+                  pythonCatchConflictsHook
+                  pythonRemoveBinBytecodeHook
+                  pypaBuildHook
+                  pythonRuntimeDepsCheckHook
+                  pypaInstallHook
+                ]
+                ++ optionals cond [
+                  pythonImportsCheckHook
+                ]
+                ++ [
+                  pythonNamespacesHook
+                  pythonOutputDistHook
+                ]
+                ++ (baseAttrs.nativeBuildInputs or [])
+                ++ (baseAttrs."build-system" or [])
+                ++ optionals (baseAttrs.doCheck or true) (baseAttrs.nativeCheckInputs or []);
+            };
+        in
+        finalAttrs;
+    };
+  };
+
+  makeAsciidoc =
+    args:
+    let
+      result = python3.pkgs.buildPythonApplication
+        (finalAttrs: {
+          pname =
+            "asciidoc"
+            + optionalString (args.enableStandardFeatures or false) "-full"
+            + optionalString (args.enableExtraPlugins or false) "-with-plugins";
+          version = "10.2.1";
+          pyproject = true;
+
+          nativeBuildInputs = with python3.pkgs; [
+            autoreconfHook
+            installShellFiles
+            unzip
+          ];
+
+          "build-system" = with python3.pythonOnBuildForHost.pkgs; [
+            setuptools
+          ];
+
+          nativeCheckInputs = with python3.pkgs; [
+            pytest
+            pytestMock
+          ];
+
+          doCheck = true;
+        })
+        args;
+    in
+    result // {
+      override = more: makeAsciidoc (args // more);
+    };
+
+  asciidocBase = makeAsciidoc {};
+  asciidocFull = asciidocBase.override {
+    enableStandardFeatures = true;
+  };
+
+  pkgs = rec {
+    asciidoc = asciidocFull;
+    "asciidoc-full" = asciidocFull;
+  };
+in
+pkgs
+EOF
+
+evalNoTraceNative=$(nix eval --json --no-eval-trace -f "$testDir/test-asciidoc-nativeBuildInputs-shape.nix" 'asciidoc.nativeBuildInputs')
+
+# Populate the eval-trace cache for the exact top-level attr path that regressed.
+nix eval --json -f "$testDir/test-asciidoc-nativeBuildInputs-shape.nix" 'asciidoc.nativeBuildInputs' >/dev/null
+
+evalWithTraceNative=$(NIX_ALLOW_EVAL=0 nix eval --json -f "$testDir/test-asciidoc-nativeBuildInputs-shape.nix" 'asciidoc.nativeBuildInputs')
+
+[[ "$evalNoTraceNative" == *python-imports-check-hook.sh* ]]
+[[ "$evalWithTraceNative" == *python-imports-check-hook.sh* ]]
+[[ "$evalNoTraceNative" == "$evalWithTraceNative" ]]
+
+echo "Test 6 passed: asciidoc.nativeBuildInputs keeps pythonImportsCheckHook in traced mode"
+
 echo "All eval-trace-impure-regression tests passed! (BSàlC: trace integrity under sibling recording)"

@@ -206,7 +206,8 @@ struct CmdSearch : InstallableValueCommand, MixJSON
 
         auto [vp, pos] = installable->toValue(*state);
         state->forceValue(*vp, pos);
-        visit(*vp, {}, true);
+        auto baseAttrPath = AttrPath::parse(*state, installable->resolvedAttrPath());
+        visit(*vp, baseAttrPath, true);
 
         if (json)
             printJSON(*jsonOut);

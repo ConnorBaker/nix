@@ -52,7 +52,6 @@ extern Counter nrLoadTraces;
 // ── TracedExpr creation/forcing breakdown ────────────────────────────
 extern Counter nrTracedExprCreated;
 extern Counter nrTracedExprFromMaterialize;
-extern Counter nrTracedExprFromOrigAttrs;
 extern Counter nrTracedExprFromDataFile;
 extern Counter nrTracedExprForced;
 extern Counter nrLazyStateAllocated;

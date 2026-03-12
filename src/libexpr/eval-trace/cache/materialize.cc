@@ -48,17 +48,6 @@ static void annotateAlias(TracedExpr * te, const std::vector<int16_t> & aliasOf,
             ? aliasOf[i] : static_cast<int16_t>(i);
 }
 
-bool isLeafCached(const CachedResult & v)
-{
-    return std::get_if<string_t>(&v)
-        || std::get_if<bool>(&v)
-        || std::get_if<int_t>(&v)
-        || std::get_if<path_t>(&v)
-        || std::get_if<null_t>(&v)
-        || std::get_if<float_t>(&v)
-        || std::get_if<std::vector<std::string>>(&v);
-}
-
 /**
  * Convert a forced Value into a CachedResult for storage/comparison.
  * The value must already be forced. For lists, suspends dep tracking
@@ -219,73 +208,7 @@ void registerAllPrecomputedKeys(
 
 } // anonymous namespace
 
-// ── ExprOrigChild::eval ──────────────────────────────────────────────
-
-void ExprOrigChild::eval(EvalState & state, Env &, Value & v)
-{
-    // SharedParentResult must always be pre-populated by materializeOrigExprAttrs.
-    // If this assertion fires, a code path created ExprOrigChild without
-    // ensuring the parent was evaluated first.
-    assert(shared->value && "ExprOrigChild: SharedParentResult not pre-populated");
-    auto * attr = shared->value->attrs()->get(childName);
-    if (!attr)
-        throw Error("attribute '%s' not found in cached parent",
-                    state.symbols[childName]);
-    state.forceValue(*attr->value, noPos);
-    v = *attr->value;
-}
-
 // ── TracedExpr materialization methods ───────────────────────────────
-
-void TracedExpr::materializeOrigExprAttrs(
-    Value & v, const attrs_t & attrs, Value * prePopulatedParent)
-{
-    auto * shared = new SharedParentResult();
-    if (prePopulatedParent) {
-        shared->value = prePopulatedParent;
-    } else {
-        // Always pre-populate: ExprOrigChild must never re-evaluate parentOrigExpr
-        // from scratch. Without this, a trace-cache hit on a sibling-wrapped
-        // TracedExpr materializes children whose first access triggers a full
-        // re-evaluation of the parent expression (e.g., an entire NixOS closure),
-        // producing thousands of duplicate derivation instantiations.
-        shared->value = cache->state.allocValue();
-        SuspendDepTracking suspend;
-        lazy->origExpr->eval(cache->state, *lazy->origEnv, *shared->value);
-        cache->state.forceAttrs(*shared->value, noPos,
-            "while resolving cached attribute for hit materialization");
-    }
-    auto & st = cache->state;
-    auto bindings = st.buildBindings(attrs.names.size());
-    auto & pools = *st.traceCtx->pools;
-
-    std::vector<PerOrigin> originHandles;
-    if (!attrs.origins.empty())
-        originHandles = reinternOrigins(attrs, st, pools);
-
-    for (size_t i = 0; i < attrs.names.size(); i++) {
-        auto childName = attrs.names[i];
-        auto * childVal = st.allocValue();
-        auto * wrapper = new TracedExpr(cache, childName, this);
-        nrTracedExprCreated++;
-        nrTracedExprFromOrigAttrs++;
-        annotateAlias(wrapper, attrs.aliasOf, i);
-        wrapper->ensureLazy().origExpr = new ExprOrigChild(lazy->origExpr, lazy->origEnv, childName, shared);
-        wrapper->ensureLazy().origEnv = lazy->origEnv;
-        installChildThunk(childVal, &st.baseEnv, wrapper);
-
-        PosIdx pos = noPos;
-        if (!attrs.originIndices.empty() && attrs.originIndices[i] >= 0) {
-            auto oidx = attrs.originIndices[i];
-            pos = st.positions.add(originHandles[oidx].handle, originHandles[oidx].attrCount++);
-        }
-        bindings.insert(childName, childVal, pos);
-    }
-    v.mkAttrs(bindings.finish());
-
-    if (!attrs.origins.empty())
-        registerAllPrecomputedKeys(attrs, originHandles, st, pools);
-}
 
 // Replay trace (Adapton change propagation)
 void TracedExpr::replayTrace(TraceId traceId)
@@ -344,28 +267,63 @@ Value * TracedExpr::navigateToReal()
             cache->state.forceAttrs(*v, noPos, "while navigating to cached attribute");
 
             auto * parentEC = storeExprChain[pathStep];
+            std::vector<Value *> siblingVals;
+            std::vector<Symbol> siblingNames;
+            siblingVals.reserve(v->attrs()->size());
+            siblingNames.reserve(v->attrs()->size());
             for (auto & attr : *v->attrs()) {
-                if (attr.name == step.sym)
-                    continue;
-                if (attr.value->isThunk()
-                    && !dynamic_cast<TracedExpr*>(attr.value->thunk().expr))
-                {
-                    auto * wrapper = new TracedExpr(cache, attr.name, parentEC);
-                    nrTracedExprCreated++;
-                    nrTracedExprFromOrigAttrs++;
-                    wrapper->ensureLazy().origExpr = attr.value->thunk().expr;
-                    auto * origEnv = attr.value->thunk().env;
-                    wrapper->ensureLazy().origEnv = origEnv;
-                    installChildThunk(attr.value, origEnv, wrapper);
-                }
-                // Non-thunk siblings are left alone. Each sibling's TracedExpr
-                // handles its own tracing independently when accessed.
+                siblingVals.push_back(attr.value);
+                siblingNames.push_back(attr.name);
             }
+
+            std::vector<int16_t> aliasOf;
+            detectAliases(aliasOf, siblingVals.size(), [&](size_t i) {
+                return siblingVals[i];
+            });
 
             auto * attr = v->attrs()->get(step.sym);
             if (!attr)
                 throw Error("attribute '%s' vanished during re-evaluation",
                             cache->state.symbols[step.sym]);
+
+            // Register all siblings (thunks and non-thunks) in the identity map
+            // for dep tracking and pointer identity recovery. The real tree is
+            // never mutated — no in-place wrapping with TracedExpr thunks.
+            // Value* addresses are stable through in-place forcing.
+            //
+            // Skip siblings whose Value* is the same as the target's Value*.
+            // This handles aliases like `{ default = foo; foo = ...; }` where
+            // default and foo share the same Value*. Without this check,
+            // the sibling (default) would be registered first (alphabetical),
+            // causing dep isolation in forceThunkValue to record a trace
+            // under default's pathId when foo is forced — without ParentContext
+            // deps. That stale trace survives cascade invalidation.
+            if (cache->state.traceCtx) {
+                auto * targetValue = attr->value;
+                for (size_t i = 0; i < siblingVals.size(); ++i) {
+                    auto * attrValue = siblingVals[i];
+                    auto attrName = siblingNames[i];
+
+                    if (attrName == step.sym)
+                        continue;
+
+                    // Skip aliases of the target: they share the same Value*,
+                    // so registering them would cause the target's thunk to
+                    // be treated as a sibling during forceValue.
+                    if (attrValue == targetValue)
+                        continue;
+
+                    auto sibPathId = vocab().extendPath(parentEC->pathId, attrName);
+                    int16_t canonIdx = -1;
+                    if (!aliasOf.empty())
+                        canonIdx = (aliasOf[i] >= 0) ? aliasOf[i] : static_cast<int16_t>(i);
+                    cache->state.traceCtx->siblingIdentityMap.emplace(attrValue,
+                        EvalTraceContext::SiblingIdentity{
+                            nullptr, cache->dbBackend.get(), parentEC, canonIdx,
+                            sibPathId, nullptr});
+                }
+            }
+
             v = attr->value;
         }
         ++pathStep;

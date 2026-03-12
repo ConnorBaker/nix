@@ -30,15 +30,18 @@ struct TraceStore;
 struct SiblingAccessTracker
 {
     TracedExpr * parentExpr;
+    AttrPathId selfPathId;  // pathId of the TracedExpr being evaluated (skip self in maybeRecord)
     std::vector<std::pair<AttrPathId, TraceHash>> accesses;
     boost::unordered_flat_set<AttrPathId, AttrPathId::Hash> seen;
+    bool hasUntracedAccess = false;  // true if a sibling had no trace hash (cold path soundness)
+    std::vector<std::pair<AttrPathId, eval_trace::TraceStore *>> untracedSiblings;  // for retry
 
     static thread_local SiblingAccessTracker * current;
     SiblingAccessTracker * previous;
     EvalTraceContext::SiblingCallback savedCallback = nullptr;
     EvalTraceContext * traceCtx = nullptr;
 
-    explicit SiblingAccessTracker(TracedExpr * parent, EvalTraceContext * ctx);
+    explicit SiblingAccessTracker(TracedExpr * parent, AttrPathId selfPathId, EvalTraceContext * ctx);
     ~SiblingAccessTracker();
 
     SiblingAccessTracker(const SiblingAccessTracker &) = delete;
@@ -46,10 +49,10 @@ struct SiblingAccessTracker
 
     void recordAccess(AttrPathId pathId, const TraceHash & traceHash);
 
-    static void maybeRecord(TracedExpr * expr, TraceStore & db);
+    static void maybeRecord(const EvalTraceContext::SiblingIdentity & si);
 
     /// Static callback for replayMemoizedDeps sibling detection.
-    static bool staticMaybeRecord(TracedExpr * tracedExpr, TraceStore * traceStore);
+    static bool staticMaybeRecord(const EvalTraceContext::SiblingIdentity & si);
 };
 
 } // namespace nix::eval_trace

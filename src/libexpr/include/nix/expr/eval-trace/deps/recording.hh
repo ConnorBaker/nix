@@ -179,11 +179,11 @@ const ProvenanceRecord & resolveProvenanceRef(InterningPools & pools, const Pos:
  * RAII guard that temporarily suspends dep recording by setting
  * activeTracker to nullptr. On destruction, restores the previous tracker.
  *
- * Used in ExprOrigChild::eval() to prevent recording the parent's massive
- * file deps (e.g., 10K+ deps from evaluating all of nixpkgs). Nested
- * DependencyTrackers created within the suspended scope work correctly:
- * their constructors set activeTracker = this, and their destructors
- * restore nullptr (the suspended value).
+ * Used in haveSameResolvedTarget Tier 3 to prevent navigation side-effects
+ * (getResolvedTarget calls) from being recorded as deps of the current
+ * tracker. Nested DependencyTrackers created within the suspended scope
+ * work correctly: their constructors set activeTracker = this, and their
+ * destructors restore nullptr (the suspended value).
  */
 struct SuspendDepTracking {
     DependencyTracker * saved;

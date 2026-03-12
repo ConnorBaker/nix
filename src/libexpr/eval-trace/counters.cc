@@ -32,7 +32,6 @@ Counter nrLoadTraces;
 // ── TracedExpr creation/forcing breakdown ────────────────────────────
 Counter nrTracedExprCreated;
 Counter nrTracedExprFromMaterialize;
-Counter nrTracedExprFromOrigAttrs;
 Counter nrTracedExprFromDataFile;
 Counter nrTracedExprForced;
 Counter nrLazyStateAllocated;

@@ -6,8 +6,8 @@ namespace nix::eval_trace {
 
 thread_local SiblingAccessTracker * SiblingAccessTracker::current = nullptr;
 
-SiblingAccessTracker::SiblingAccessTracker(TracedExpr * parent, EvalTraceContext * ctx)
-    : parentExpr(parent), previous(current), traceCtx(ctx)
+SiblingAccessTracker::SiblingAccessTracker(TracedExpr * parent, AttrPathId selfPathId, EvalTraceContext * ctx)
+    : parentExpr(parent), selfPathId(selfPathId), previous(current), traceCtx(ctx)
 {
     current = this;
     if (traceCtx) {
@@ -29,22 +29,34 @@ void SiblingAccessTracker::recordAccess(AttrPathId pathId, const TraceHash & tra
         accesses.emplace_back(pathId, traceHash);
 }
 
-void SiblingAccessTracker::maybeRecord(TracedExpr * expr, TraceStore & db)
+void SiblingAccessTracker::maybeRecord(const EvalTraceContext::SiblingIdentity & si)
 {
     if (!current) return;
-    if (expr->parentExpr != current->parentExpr) return;
-    if (!expr->lazy || !expr->lazy->traceId) return;
+    if (si.parentExpr != current->parentExpr) return;
+    if (si.pathId == current->selfPathId) return;  // skip self
     try {
-        auto hash = db.getCurrentTraceHash(expr->pathId);
-        if (hash) current->recordAccess(expr->pathId, *hash);
+        auto hash = si.traceStore->getCurrentTraceHash(si.pathId);
+        if (hash)
+            current->recordAccess(si.pathId, *hash);
+        else {
+            current->hasUntracedAccess = true;
+            current->untracedSiblings.emplace_back(si.pathId, si.traceStore);
+        }
     } catch (...) {}
 }
 
-bool SiblingAccessTracker::staticMaybeRecord(TracedExpr * tracedExpr, TraceStore * traceStore)
+bool SiblingAccessTracker::staticMaybeRecord(const EvalTraceContext::SiblingIdentity & si)
 {
     if (!current) return false;
+    if (si.parentExpr != current->parentExpr) return false;
+    if (si.pathId == current->selfPathId) return false;
+    // Return true for already-seen siblings to prevent replayMemoizedDeps
+    // from falling through to normal epoch replay (which would import the
+    // sibling's direct deps into the current child, defeating per-sibling
+    // ParentContext precision).
+    if (current->seen.count(si.pathId)) return true;
     auto before = current->accesses.size();
-    maybeRecord(tracedExpr, *traceStore);
+    maybeRecord(si);
     return current->accesses.size() > before;
 }
 

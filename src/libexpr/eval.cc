@@ -1217,6 +1217,41 @@ void EvalState::recordImportContentDep(const SourcePath & resolvedPath)
         recordDep(*traceCtx->pools, resolvedPath.path, DepHashValue(*hash), DepType::Content, traceCtx->mountToInput);
 }
 
+// ── First-touch real-sibling precision loss ──────────────────────────
+//
+// When a child expression (e.g. `builtins.attrNames d`) forces a sibling
+// thunk (e.g. `d = builtins.fromJSON ...`) for the first time, the
+// sibling's deps are recorded via record() directly into the child's
+// active DependencyTracker.  There is no sibling-aware isolation here:
+// forceThunkValue does not know whether the thunk being forced is a
+// sibling, a local binding, or something else entirely.
+//
+// For *already-forced* siblings, replayMemoizedDeps() detects the sibling
+// relationship via siblingCallback and replaces the dep copy with a
+// compact ParentContext dep.  But first-touch thunks bypass that path
+// because there is no epochMap entry yet — the deps flow into the child's
+// ownDeps as they are produced.
+//
+// This makes first-touch traces sound but coarser: the child trace
+// contains the sibling's Content/Directory deps in addition to its own
+// structural deps.  Verification remains correct because the structural
+// override in pass-2 treats a StructuredContent #keys pass as covering
+// any Content dep failure on the same file, so the redundant Content dep
+// is harmless — it can only cause a false negative (unnecessary
+// re-evaluation), never a false positive (stale result).
+//
+// Approaches evaluated and rejected:
+//  - Generic quarantine (force sibling thunks under a separate tracker,
+//    then discard their deps): UNSOUND for mixed consumers — if a child
+//    reads both the sibling's value AND its own file deps, quarantining
+//    would drop the sibling's deps even when they are genuinely needed.
+//  - depDedup post-pass (remove Content deps when a covering SC dep
+//    exists): hazardous because the "covering" relationship depends on
+//    which SC variant matched, which is only known at verification time,
+//    not at recording time.
+//
+// The structural override in verification masks the redundancy, so the
+// current behavior is accepted as sound-but-imprecise.
 [[gnu::noinline]]
 void EvalState::forceThunkValue(Value & v, const PosIdx pos)
 {
@@ -1229,6 +1264,7 @@ void EvalState::forceThunkValue(Value & v, const PosIdx pos)
     // during suspension, causing evaluation-order-dependent dep sets.
     uint32_t epochStart = traceCtx
         ? DependencyTracker::epochLog.size() : 0;
+
     try {
         v.mkBlackhole();
         if (env) [[likely]]
@@ -1239,6 +1275,7 @@ void EvalState::forceThunkValue(Value & v, const PosIdx pos)
         handleEvalExceptionForThunk(env, expr, v, pos);
         throw;
     }
+
     if (traceCtx)
         traceCtx->recordThunkDeps(v, epochStart);
 }
@@ -3208,7 +3245,9 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         /* Otherwise, compare the attributes one by one. */
         Bindings::const_iterator i, j;
         for (i = v1.attrs()->begin(), j = v2.attrs()->begin(); i != v1.attrs()->end(); ++i, ++j)
-            if (i->name != j->name || !eqValues(*i->value, *j->value, pos, errorCtx))
+            if (i->name != j->name)
+                return false;
+            else if (!eqValues(*i->value, *j->value, pos, errorCtx))
                 return false;
 
         return true;
@@ -3382,7 +3421,6 @@ void EvalState::printStatistics()
         {"thunks", {
             {"created", eval_trace::nrTracedExprCreated.load()},
             {"fromMaterialize", eval_trace::nrTracedExprFromMaterialize.load()},
-            {"fromOrigAttrs", eval_trace::nrTracedExprFromOrigAttrs.load()},
             {"fromDataFile", eval_trace::nrTracedExprFromDataFile.load()},
             {"forced", eval_trace::nrTracedExprForced.load()},
             {"lazyStateAllocated", eval_trace::nrLazyStateAllocated.load()},
