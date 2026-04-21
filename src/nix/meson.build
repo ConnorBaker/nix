@@ -73,6 +73,7 @@ nix_sources = [ config_priv_h ] + files(
   'config.cc',
   'copy.cc',
   'crash-handler.cc',
+  'debug-attach.cc',
   'derivation-add.cc',
   'derivation-show.cc',
   'derivation.cc',

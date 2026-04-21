@@ -8,7 +8,7 @@ namespace nix {
 #define SERVE_MAGIC_1 0x390c9deb
 #define SERVE_MAGIC_2 0x5452eecb
 
-#define SERVE_PROTOCOL_VERSION (2 << 8 | 8)
+#define SERVE_PROTOCOL_VERSION (2 << 8 | 9)
 #define GET_PROTOCOL_MAJOR(x) ((x) & 0xff00)
 #define GET_PROTOCOL_MINOR(x) ((x) & 0x00ff)
 struct StoreDirConfig;
@@ -69,7 +69,7 @@ struct ServeProto
 
     static constexpr Version latest = {
         .major = 2,
-        .minor = 8,
+        .minor = 9,
     };
 
     /**
@@ -166,6 +166,17 @@ struct ServeProto::BuildOptions
     size_t nrRepeats = -1;
     bool enforceDeterminism = -1;
     bool keepFailed = -1;
+
+    /**
+     * `--build-debugger` propagation. When true on the remote side, the
+     * remote's build runs under the debug wrapper and the paused sandbox
+     * can be attached via `ssh <remote> sudo nix debug-attach <drv>`.
+     *
+     * Defaulted to `false` / empty on read when talking to a protocol
+     * version that doesn't carry the field (pre-2.9).
+     */
+    bool buildDebugger = false;
+    std::string buildDebuggerTarget;
 
     bool operator==(const ServeProto::BuildOptions &) const = default;
 };

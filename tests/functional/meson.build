@@ -154,6 +154,7 @@ suites = [
       'ssh-relay.sh',
       'build.sh',
       'build-cores.sh',
+      'build-debugger.sh',
       'build-delete.sh',
       'output-normalization.sh',
       'selfref-gc.sh',

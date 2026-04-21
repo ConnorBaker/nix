@@ -937,6 +937,15 @@ static void opServe(Strings opFlags, Strings opArgs)
         if (clientVersion >= ServeProto::Version{2, 7}) {
             settings.keepFailed = options.keepFailed;
         }
+        if (clientVersion >= ServeProto::Version{2, 9}) {
+            // Propagate `--build-debugger` from the remote-builder client.
+            // When set, the remote's `DerivationBuildingGoal` will install
+            // the debug wrapper and publish attach-info on this host; the
+            // user then `ssh <this-host> sudo nix debug-attach <drv>` to
+            // enter the paused sandbox.
+            settings.buildDebugger = options.buildDebugger;
+            settings.buildDebuggerTarget = options.buildDebuggerTarget;
+        }
     };
 
     while (true) {

@@ -1,5 +1,7 @@
 #include <nlohmann/json.hpp>
 
+#include <unistd.h>
+
 #include "nix/main/common-args.hh"
 #include "nix/util/args/root.hh"
 #include "nix/util/config-global.hh"
@@ -87,6 +89,17 @@ MixCommonArgs::MixCommonArgs(const std::string & programName)
         longFlags.erase("system");
 
     hiddenCategories.insert(cat);
+
+    // `--build-debugger` and `--build-debugger-target` are scoped to the
+    // `nix build` subcommand only — the attach flow is wired up through
+    // `src/nix/build.cc::CmdBuild::run`, and the other subcommands have
+    // nothing to do with it. Erase the auto-generated flags here so that
+    // e.g. `nix develop --build-debugger ...` errors with "unknown option"
+    // rather than silently no-op'ing. `CmdBuild` re-adds `--build-debugger`
+    // with the richer validation handler.
+    longFlags.erase("build-debugger");
+    longFlags.erase("no-build-debugger");
+    longFlags.erase("build-debugger-target");
 }
 
 void MixCommonArgs::initialFlagsProcessed()

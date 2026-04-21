@@ -4,7 +4,6 @@
 
 #include <fcntl.h>
 #include <unistd.h>
-#include <span>
 
 #include "util-unix-config-private.hh"
 

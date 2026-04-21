@@ -1,6 +1,8 @@
 #pragma once
 ///@file
 
+#include <filesystem>
+
 #include "nix/store/derivations.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/parsed-derivations.hh"
@@ -54,6 +56,15 @@ private:
 
     /** The path of the derivation. */
     const StorePath drvPath;
+
+    /**
+     * Path of the `--build-debugger` redirect attach-info file that this
+     * goal wrote at hook-accept time, or empty. Populated in
+     * `buildWithBuildHook`, removed in the destructor so that the file
+     * doesn't outlive the goal (and therefore the remote build) even if
+     * `buildWithBuildHook` fails mid-flight.
+     */
+    std::filesystem::path debuggerRedirectAttachInfoPath;
 
     /**
      * The derivation stored at drvPath.

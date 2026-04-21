@@ -1,4 +1,5 @@
 #include "nix/store/build/derivation-building-goal.hh"
+#include "nix/store/build-debugger.hh"
 #include "nix/store/build/derivation-env-desugar.hh"
 #ifndef _WIN32 // TODO enable build hook on Windows
 #  include "nix/store/build/hook-instance.hh"
@@ -10,6 +11,7 @@
 #include "nix/util/config-global.hh"
 #include "nix/store/build/worker.hh"
 #include "nix/util/util.hh"
+#include "nix/util/file-system.hh"
 #include "nix/util/compression.hh"
 #include "nix/store/common-protocol.hh"
 #include "nix/store/common-protocol-impl.hh"
@@ -20,6 +22,7 @@
 
 #include <algorithm>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -44,7 +47,18 @@ DerivationBuildingGoal::DerivationBuildingGoal(
     worker.store.addTempRoot(this->drvPath);
 }
 
-DerivationBuildingGoal::~DerivationBuildingGoal() = default;
+DerivationBuildingGoal::~DerivationBuildingGoal()
+{
+    // Clean up the `--build-debugger` redirect attach-info (if any) so
+    // that a failed/cancelled hook-dispatched build doesn't leave a
+    // stale "SSH to <remote>" pointer. The time-based sweep in
+    // `publishDebuggerAttachInfo` would eventually catch this too, but
+    // prompt cleanup avoids user confusion in the intervening window.
+    if (!debuggerRedirectAttachInfoPath.empty()) {
+        std::error_code rmEc;
+        std::filesystem::remove(debuggerRedirectAttachInfoPath, rmEc);
+    }
+}
 
 std::string DerivationBuildingGoal::key()
 {
@@ -658,6 +672,30 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
         throw;
     }
 
+    /* `--build-debugger` redirect: the drv is going off-box, so the paused
+       sandbox will live on `hook->machineName`. Publish a redirect
+       attach-info file locally so `nix debug-attach <drv>` on this host
+       automatically SSHes to the remote and runs the attach there. We
+       capture the target path on the goal so the destructor can unlink
+       it regardless of how this coroutine ends. */
+    if (settings.buildDebugger
+        && settings.buildDebuggerTarget.get() == worker.store.printStorePath(drvPath))
+    {
+        auto printed = worker.store.printStorePath(drvPath);
+        auto target = writeDebuggerRedirectAttachInfo(worker.store, drvPath, hook->machineName);
+        if (!target.empty())
+            debuggerRedirectAttachInfoPath = target;
+        printInfo(
+            "build-debugger: `%s` dispatched to `%s`. To attach when it "
+            "fails, run `sudo nix debug-attach %s` on that host (or "
+            "`sudo nix debug-attach --on %s %s` from here).",
+            printed,
+            hook->machineName,
+            printed,
+            hook->machineName,
+            printed);
+    }
+
     CommonProto::WriteConn conn{hook->sink};
 
     /* Tell the hook all the inputs that have to be copied to the
@@ -981,6 +1019,11 @@ Goal::Co DerivationBuildingGoal::buildLocally(
                 .desugaredEnv = std::move(desugaredEnv),
             };
 
+            /* External-builder + `--build-debugger` refusal lives in
+               `ExternalDerivationBuilder`'s constructor, where it fires
+               only for the instrumented drv (via `shouldApplyBuildDebugger`)
+               and not for any external-builder drv in the closure. */
+
             /* If we have to wait and retry (see below), then `builder` will
                already be created, so we don't need to create it again. */
             builder = localBuildCap.externalBuilder
@@ -1013,7 +1056,20 @@ Goal::Co DerivationBuildingGoal::buildLocally(
 
     actLock.reset();
 
-    worker.childStarted(shared_from_this(), {builderOut}, true, true);
+    {
+        std::set<int> childFds{builderOut};
+        // Suppress timeouts ONLY for the instrumented goal: on failure the
+        // wrapper blocks silently for up to an hour waiting for
+        // `nix debug-attach`. Non-instrumented dependencies build normally
+        // and MUST still respect timeouts — keying on `settings.buildDebugger`
+        // (a process-global) alone would incorrectly disable silent/build
+        // timeouts for the whole closure.
+        bool isDebugTarget =
+            settings.buildDebugger
+            && settings.buildDebuggerTarget.get() == worker.store.printStorePath(drvPath);
+        bool respectTimeouts = !isDebugTarget;
+        worker.childStarted(shared_from_this(), childFds, true, respectTimeouts);
+    }
 
     started();
 
@@ -1032,9 +1088,11 @@ Goal::Co DerivationBuildingGoal::buildLocally(
                 if (logFile->sink)
                     (*logFile->sink)(output->data);
             }
-        } else if (std::get_if<ChildEOF>(&event)) {
-            buildLog->flush();
-            break;
+        } else if (auto * eof = std::get_if<ChildEOF>(&event)) {
+            if (eof->fd == builder->builderOut.get()) {
+                buildLog->flush();
+                break;
+            }
         } else if (auto * timeout = std::get_if<TimedOut>(&event)) {
             builder->killChild();
             co_return doneFailure(std::move(*timeout));
@@ -1249,6 +1307,12 @@ HookReply DerivationBuildingGoal::tryBuildHook(const DerivationOptions<StorePath
             throw;
     }
 
+    /* The hook accepted — the drv will be shipped to a remote builder.
+       If this IS the `--build-debugger` target, the drv's paused sandbox
+       will live on the remote host. We publish a local "redirect"
+       attach-info so `nix debug-attach <drv>` on this host auto-SSHes
+       there. The remote machine name is captured in `buildWithBuildHook`
+       (once the hook writes it on its reverse-channel stdout). */
     return rpAccept;
 #endif
 }

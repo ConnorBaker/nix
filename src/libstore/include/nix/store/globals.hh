@@ -6,6 +6,7 @@
 #include "nix/util/types.hh"
 #include "nix/util/configuration.hh"
 #include "nix/util/environment-variables.hh"
+#include "nix/util/experimental-features.hh"
 #include "nix/store/build/derivation-builder.hh"
 #include "nix/store/local-settings.hh"
 #include "nix/store/store-reference.hh"
@@ -185,6 +186,46 @@ public:
     Setting<bool> useSQLiteWAL{this, !isWSL1(), "use-sqlite-wal", "Whether SQLite should use WAL mode."};
 
     Setting<bool> keepFailed{this, false, "keep-failed", "Whether to keep temporary directories of failed builds."};
+
+    Setting<bool> buildDebugger{
+        this,
+        false,
+        "build-debugger",
+        R"(
+          If set, when the **specific** installable targeted by the user's
+          command fails to build, drop them into an interactive `bash` shell
+          inside the failed sandbox. Dependency derivations in the closure
+          that fail normally do NOT trigger the debugger.
+
+          Normally set via the `--build-debugger` CLI flag rather than via
+          configuration. The CLI also populates
+          [`build-debugger-target`](#conf-build-debugger-target) with the
+          specific store derivation path to instrument. Linux-only; requires
+          the `build-debugger` experimental feature. Daemon-mode clients must
+          be in `trusted-users`.
+        )",
+        {},
+        true,
+        Xp::BuildDebugger};
+
+    Setting<std::string> buildDebuggerTarget{
+        this,
+        "",
+        "build-debugger-target",
+        R"(
+          The store path of the exact `.drv` that should have the
+          `--build-debugger` hook applied. Set automatically by the `nix
+          build` CLI when `--build-debugger` is passed alongside a single
+          installable; overriding this manually in `nix.conf` is unsupported
+          and likely to have surprising effects.
+
+          When empty, `build-debugger` has no effect. When non-empty, the
+          hook fires only for the build of exactly that `.drv` — every other
+          derivation in the closure builds normally.
+        )",
+        {},
+        true,
+        Xp::BuildDebugger};
 
     /**
      * Whether to show build log output in real time.

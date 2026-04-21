@@ -26,8 +26,10 @@ using namespace std::chrono_literals;
 #endif
 
 #ifdef __linux__
+#  include <fcntl.h>
 #  include <sys/prctl.h>
 #  include <sys/mman.h>
+#  include <sys/syscall.h>
 #endif
 
 #include "util-unix-config-private.hh"
@@ -405,5 +407,39 @@ int execvpe(const char * file0, const char * const argv[], const char * const en
     // https://pubs.opengroup.org/onlinepubs/9799919799/functions/exec.html
     return execve(file.c_str(), const_cast<char * const *>(argv), const_cast<char * const *>(envp));
 }
+
+#ifdef __linux__
+
+// Syscall numbers are stable across architectures on Linux for these two
+// calls: `pidfd_open` is 434 and `pidfd_send_signal` is 424 in the common
+// syscall range. Hardcode them here so we don't depend on <bits/syscall.h>
+// being new enough, which was a real portability issue on older glibc.
+#  ifndef SYS_pidfd_open
+#    define SYS_pidfd_open 434
+#  endif
+#  ifndef SYS_pidfd_send_signal
+#    define SYS_pidfd_send_signal 424
+#  endif
+
+int openPidfd(pid_t pid)
+{
+    long fd = ::syscall(SYS_pidfd_open, pid, 0);
+    if (fd < 0)
+        return -1;
+    int rawFd = static_cast<int>(fd);
+    int flags = ::fcntl(rawFd, F_GETFD, 0);
+    if (flags >= 0)
+        (void) ::fcntl(rawFd, F_SETFD, flags | FD_CLOEXEC);
+    return rawFd;
+}
+
+bool pidfdAlive(int pidfd)
+{
+    if (pidfd < 0)
+        return false;
+    return ::syscall(SYS_pidfd_send_signal, pidfd, 0, nullptr, 0) == 0;
+}
+
+#endif // __linux__
 
 } // namespace nix

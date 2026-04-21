@@ -8,7 +8,6 @@
 #include <cstring>
 
 #ifndef _WIN32
-#  include <fcntl.h>
 #  include <stdlib.h>
 #endif
 

@@ -128,6 +128,56 @@ Most Nix commands accept the following command-line options:
   Specifies that in case of a build failure, the temporary directory (usually in `/tmp`) in which the build takes place should not be deleted.
   The path of the build directory is printed as an informational message.
 
+- <span id="opt-build-debugger">[`--build-debugger`](#opt-build-debugger)</span>
+
+  On a failing build of the **specific installable** named on the command line, pause the failed sandbox and print instructions for attaching an interactive `bash` shell to it via a separate [`nix debug-attach`](@docroot@/command-ref/new-cli/nix3-debug-attach.md) invocation.
+  The attached shell inherits the builder's post-failure environment — `$out`, `$NIX_BUILD_TOP`, stdenv phase variables, partial build artifacts — so you can inspect what went wrong and re-run failing commands manually without modifying the derivation.
+  Analogous in spirit to [`breakpointHook`](https://nixos.org/manual/nixpkgs/stable/#ssec-stdenv-hooks-breakpoint) in nixpkgs, but works on any stdenv-style derivation without re-expressing the package.
+
+  **Workflow.** After a failing build prints the attach instructions, run `sudo nix debug-attach <drv>` in another terminal. The command enters the sandbox's Linux namespaces (via `setns(2)` on a `pidfd`-pinned handle to the build process) and execs an interactive `bash`. When you exit the shell, the paused build is signaled to terminate and is reported as failed in the normal way, with the original builder exit code. The sandbox directory is preserved (as with [`--keep-failed`](#opt-keep-failed)) for further inspection.
+
+  **Scoping.** The hook is applied only to the one derivation the user is building.
+  Dependencies in the closure build normally — if they fail, the failure propagates but the debug pause is **not** triggered.
+  This keeps the semantics predictable and lets you use `--build-debugger` alongside `--max-jobs > 1` and `--keep-going`; the parallelism affects only the dependency graph, not the targeted derivation.
+
+  **Restrictions:**
+
+  - Linux only; depends on Linux namespaces + `setns(2)` (requires Linux ≥ 5.3 for `pidfd_open` on the attach side).
+  - Requires the experimental feature [`build-debugger`](@docroot@/contributing/experimental-features.md#xp-feature-build-debugger).
+  - Only accepted on `nix build`; other subcommands (`nix develop`, `nix shell`, `nix run`, `nix-build`) reject the flag.
+  - Must target exactly one installable on the command line.
+  - In daemon mode, the calling user must be in [`trusted-users`](@docroot@/command-ref/conf-file.md#conf-trusted-users). The pause blocks a daemon worker for up to an hour; untrusted users could otherwise DoS the daemon by stacking paused sandboxes.
+  - The `nix debug-attach` invocation must run as `root` on the host that is actually running the build. When the build ran remotely (via `--store ssh-ng://host` or a `nix.buildMachines` dispatch) `nix debug-attach <drv>` on the local host follows the redirect recorded at dispatch time and SSHes to the remote automatically.
+  - Only works when the derivation's `builder` resolves to `bash`; refused for builders that invoke `-c <inline>`, use non-`bash` interpreters, or pass unsupported bash options (anything other than `-e`/`-u`/`-x`/`-o pipefail`).
+  - Refused for external builders (derivations dispatched via the `external-builders` experimental feature).
+  - Refused for content-addressed / fixed-output derivations (at `nix build --build-debugger` parse time): CA resolution renames the derivation at build time and the target-path comparison doesn't follow the rename.
+  - Only fires on builder-process failure (non-zero exit from the builder). Output-verification failures (wrong hash in a fixed-output derivation, missing output, post-build check failures) happen after the builder has already exited successfully and do **not** trigger the debugger.
+  - When the user exits the debug shell without an explicit nonzero exit code (plain `exit` or `exit 0`), the build is reported with the *original* builder failure code — not 0. An explicit `exit N` with `N > 0` is passed through unchanged. The debug shell cannot flip a failed build to successful: the wrapper always reports the original failure once the attached shell exits. To produce a successful build from a failed-build artifact you populated manually, re-run the derivation with the output bundled in (for example, via a `fetchurl`/`fetchzip` referencing your populated `$out`).
+  - The build log and `nix log <drv>` reflect the state at the moment of failure; commands typed into the debug shell are **not** recorded.
+  - Mutually exclusive with [`breakpointHook`](https://nixos.org/manual/nixpkgs/stable/#ssec-stdenv-hooks-breakpoint): the hook's `sleep` fires before this flag's `EXIT` trap and would suppress the debug pause. Remove `breakpointHook` from the derivation when using `--build-debugger`.
+  - Derivations that install their own `EXIT` trap after the wrapper sources the builder script will clobber the debugger's `EXIT` hook. `stdenv.mkDerivation` is handled specially — its `exitHandler` calls `runHook failureHook`, and the wrapper defines `failureHook` as a function so the attach still fires. Non-stdenv scripts that set `trap '...' EXIT` themselves will silently bypass the debugger.
+  - `exec` in the sourced builder script replaces the wrapper's bash with another program, losing the EXIT trap and `failureHook` function. `--build-debugger` cannot intercept `exec` chains; if the exec'd program fails, no debug shell attaches.
+  - After an hour of paused waiting with no attach, the wrapper gives up and lets the build fail in the normal way.
+  - Mutually exclusive with [`--repair`](#opt-repair) and [`--rebuild`](#opt-rebuild) / [`--check`](#opt-check). Both repair and rebuild compare output hashes rather than interpret builder exit status, so the debug wrapper (which fires only on a non-zero builder exit) would add no useful signal in those modes. `nix build --build-debugger --repair` and `nix build --build-debugger --rebuild` are refused at CLI parse time.
+
+  **Overriding the setting per-invocation.** The flag is equivalent to `--option build-debugger true`. To force the debugger OFF for a single invocation when the `build-debugger` setting is enabled in `nix.conf`, pass `--no-build-debugger` (a subcommand-local flag on `nix build`; not gated by the `build-debugger` experimental feature, so disabling is always available).
+
+  **Supported execution contexts.**
+
+  *"Remote builder" and "remote daemon" are two different things:*
+  - A **remote daemon** (`--store ssh-ng://host`) means your entire daemon lives on the far side of an SSH connection — every store operation is remote.
+  - A **remote builder** (`nix.buildMachines = [ … ]`) means your local daemon orchestrates, but schedules specific derivations off-box when their `system`/`requiredSystemFeatures` don't match locally (or when `max-jobs = 0` forces everything remote). Derivations that can build locally still do.
+
+  | Scenario | Status |
+  |---|---|
+  | Local daemon (default `nix-daemon` via unix socket) | **Supported**, covered by end-to-end tests. |
+  | Local-store mode (no daemon, e.g. `nix build --store local:/path`) | **Supported**. Same mechanism as daemon mode. |
+  | Remote daemon via `--store ssh-ng://host` | **Supported.** The local `nix build` writes a redirect file so `sudo nix debug-attach <drv>` on the local host auto-SSHes to the remote and runs the attach session there. |
+  | Remote builder via `nix.buildMachines = [ … ]` — **when the targeted drv itself goes off-box** | **Supported.** The build hook's reply populates a local redirect; `sudo nix debug-attach <drv>` on the local host SSHes to the chosen builder using the same `sshUser`/`sshKey` the hook used. |
+  | Remote builder via `nix.buildMachines = [ … ]` — **when the targeted drv builds locally** (typical case when the drv's system matches the local host) | **Supported.** Only the targeted drv gets the hook; dependencies can still go off-box via the build hook. |
+  | Content-addressed derivation (`__contentAddressed = true`) | **Not supported.** Refused at `nix build --build-debugger` parse time. Workaround: remove `__contentAddressed` while debugging, or target the resolved derivation path directly. |
+  | External builder (`external-builders` experimental feature) | **Not supported.** `ExternalDerivationBuilder` refuses on construction — its JSON-over-stdin dispatch has no seam for the wrapper script. |
+
 - <span id="opt-fallback">[`--fallback`](#opt-fallback)</span>
 
   Whenever Nix attempts to build a derivation for which substitutes are known for each output path, but realising the output paths through the substitutes fails, fall back on building the derivation.

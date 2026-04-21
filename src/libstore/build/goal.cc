@@ -25,21 +25,20 @@ void ChildEvents::pushChildEvent(ChildEOF event)
 {
     if (childTimeout)
         return; // Already timed out, ignore
-    assert(!childEOF);
-    childEOF = std::move(event);
+    childEOFs.push(std::move(event));
 }
 
 void ChildEvents::pushChildEvent(TimedOut event)
 {
     // Timeout is immediate - flush pending events
     childOutputs = {};
-    childEOF.reset();
+    childEOFs = {};
     childTimeout = std::move(event);
 }
 
 bool ChildEvents::hasChildEvent() const
 {
-    return !childOutputs.empty() || childEOF || childTimeout;
+    return !childOutputs.empty() || !childEOFs.empty() || childTimeout;
 }
 
 Goal::ChildEvent ChildEvents::popChildEvent()
@@ -49,8 +48,11 @@ Goal::ChildEvent ChildEvents::popChildEvent()
         childOutputs.pop();
         return event;
     }
-    if (childEOF)
-        return *std::exchange(childEOF, std::nullopt);
+    if (!childEOFs.empty()) {
+        auto event = std::move(childEOFs.front());
+        childEOFs.pop();
+        return event;
+    }
     if (childTimeout)
         return *std::exchange(childTimeout, std::nullopt);
     unreachable();

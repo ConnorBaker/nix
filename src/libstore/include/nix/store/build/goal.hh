@@ -324,11 +324,11 @@ public:
             /**
              * Structured queue of child events:
              * - outputs: stream of data from child
-             * - eof: optional end-of-stream marker
+             * - eofs: end-of-stream markers, one per registered FD that has EOF'd
              * - timeout: optional timeout that flushes/overrides other events
              */
             std::queue<ChildOutput> childOutputs;
-            std::optional<ChildEOF> childEOF;
+            std::queue<ChildEOF> childEOFs;
             std::optional<TimedOut> childTimeout;
 
         public:

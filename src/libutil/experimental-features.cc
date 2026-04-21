@@ -25,7 +25,7 @@ struct ExperimentalFeatureDetails
  * feature, we either have no issue at all if few features are not added
  * at the end of the list, or a proper merge conflict if they are.
  */
-constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::BLAKE3Hashes);
+constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::BuildDebugger);
 
 constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails = {{
     {
@@ -278,6 +278,19 @@ constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails
             Enables support for BLAKE3 hashes.
         )",
         .trackingUrl = "https://github.com/NixOS/nix/milestone/60",
+    },
+    {
+        .tag = Xp::BuildDebugger,
+        .name = "build-debugger",
+        .description = R"(
+            Enables the `--build-debugger` CLI flag, which drops the user into
+            an interactive bash shell inside the failed build sandbox when a
+            local build fails.
+
+            Analogous in spirit to `breakpointHook` in nixpkgs, but does not
+            require modifying the derivation. Linux-only.
+        )",
+        .trackingUrl = "https://github.com/NixOS/nix/milestone/63",
     },
 }};
 

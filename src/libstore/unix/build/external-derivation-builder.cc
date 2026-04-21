@@ -13,6 +13,16 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
         , externalBuilder(std::move(externalBuilder))
     {
         experimentalFeatureSettings.require(Xp::ExternalBuilders);
+        // `--build-debugger` depends on the standard Linux-sandbox startChild
+        // path to run our wrapper script — external builders invoke a separate
+        // program via JSON and ignore `drv.args`, so there's no seam to hook.
+        // Refuse early with a clear error rather than silently no-op.
+        if (shouldApplyBuildDebugger())
+            throw Error(
+                "`--build-debugger` is not supported for external-builder derivations "
+                "(derivation '%s' is dispatched to an external builder — there is no "
+                "in-process sandbox for the debugger to attach to)",
+                store.printStorePath(drvPath));
     }
 
     std::filesystem::path tmpDirInSandbox() override

@@ -165,6 +165,10 @@ ServeProto::Serialise<ServeProto::BuildOptions>::read(const StoreDirConfig & sto
     if (conn.version >= ServeProto::Version{2, 7}) {
         options.keepFailed = (bool) readInt(conn.from);
     }
+    if (conn.version >= ServeProto::Version{2, 9}) {
+        options.buildDebugger = (bool) readInt(conn.from);
+        options.buildDebuggerTarget = readString(conn.from);
+    }
     return options;
 }
 
@@ -179,6 +183,10 @@ void ServeProto::Serialise<ServeProto::BuildOptions>::write(
 
     if (conn.version >= ServeProto::Version{2, 7}) {
         conn.to << ((int) options.keepFailed);
+    }
+    if (conn.version >= ServeProto::Version{2, 9}) {
+        conn.to << ((int) options.buildDebugger);
+        conn.to << options.buildDebuggerTarget;
     }
 }
 

@@ -1,6 +1,12 @@
 #include "nix/store/daemon.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/worker-protocol.hh"
+
+#ifndef _WIN32
+#  include <sys/socket.h>
+#  include <sys/types.h>
+#endif
+
 #include "nix/store/worker-protocol-connection.hh"
 #include "nix/store/worker-protocol-impl.hh"
 #include "nix/store/store-api.hh"
@@ -292,6 +298,16 @@ struct ClientSettings
                     warn(
                         "Ignoring the client-specified plugin-files.\n"
                         "The client specifying plugins to the daemon never made sense, and was removed in Nix >=2.14.");
+                } else if (name == settings.buildDebugger.name) {
+                    // --build-debugger pauses the build indefinitely waiting for
+                    // a human at the other end. An untrusted user requesting
+                    // this could DoS the daemon by stacking paused sandboxes.
+                    // Mirror the `repair` gate pattern and refuse outright.
+                    bool asBool = (value == "true" || value == "yes" || value == "1");
+                    if (!trusted && asBool)
+                        throw Error(
+                            "`--build-debugger` is not allowed because you are not in 'trusted-users'");
+                    settings.set(name, value);
                 } else if (
                     trusted || name == settings.getWorkerSettings().buildTimeout.name
                     || name == settings.getWorkerSettings().maxSilentTime.name

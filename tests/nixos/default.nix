@@ -225,3 +225,38 @@ in
     upgrade-nix.oldNix = pkgs.nixVersions.latest;
   };
 }
+// lib.mapAttrs' (name: _: lib.nameValuePair "build-debugger-${name}"
+  (runNixOSTest (./build-debugger + "/${name}.nix"))
+) {
+  # Static refusals (no builds) — single fast VM.
+  gates = { };
+  # Happy path: one failing stdenv build + attach + inspect + exit.
+  attach-happy = { };
+  # Scoping: dep failure doesn't pause the instrumented parent.
+  attach-scoping = { };
+  # Scoping under parallelism: max-jobs >= 2 doesn't instrument
+  # sibling deps of the target.
+  attach-scoping-parallel = { };
+  # Successful build is a no-op + attach-info dir is 0700.
+  attach-success-noop = { };
+  # Non-stdenv EXIT-trap path.
+  bare-bash = { };
+  # `declare -p` env capture picks up non-exported vars.
+  structured-attrs = { };
+  # `exit N` in buildPhase propagates through the wrapper.
+  exit-code-passthrough = { };
+  # `/proc/<pid>/cmdline` refuses attach on pid reuse / forged info.
+  security-proc-check = { };
+  # Concurrent-attach serialisation via flock.
+  security-flock = { };
+  # Stale-entry sweep correctness: live entries survive, dead & aged
+  # entries removed, fresh redirects preserved.
+  security-sweep = { };
+  # Wrapper "no sleep in PATH" branch.
+  wrapper-no-sleep = { };
+  # `exec` in the sourced builder chains away from the wrapper;
+  # nix debug-attach must produce the exec-specific diagnostic.
+  wrapper-exec-chain = { };
+  # Two-node end-to-end: hook dispatch + auto-SSH + explicit `--on`.
+  remote = { };
+}

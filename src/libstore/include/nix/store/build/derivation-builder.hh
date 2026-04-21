@@ -2,6 +2,8 @@
 ///@file
 
 #include <filesystem>
+#include <functional>
+#include <optional>
 #include <nlohmann/json_fwd.hpp>
 
 #include "nix/store/build-result.hh"
@@ -184,6 +186,7 @@ struct DerivationBuilder : RestrictionContext
      * killed.
      */
     virtual bool killChild() = 0;
+
 };
 
 /**

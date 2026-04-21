@@ -1,4 +1,5 @@
 #include "nix/store/build/derivation-builder.hh"
+#include "nix/store/build-debugger.hh"
 #include "nix/util/file-system-at.hh"
 #include "nix/util/file-system.hh"
 #include "nix/store/local-store.hh"
@@ -25,12 +26,21 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <csignal>
 #ifdef __linux__
 #  include <sys/prctl.h>
 #endif
+
+#include <nlohmann/json.hpp>
+
+#include <atomic>
+
+#include "nix/util/finally.hh"
+#include "nix/util/processes.hh"
 
 #include "store-config-private.hh"
 
@@ -428,8 +438,111 @@ protected:
     /**
      * Execute the derivation builder process. Called by runChild() as
      * its final step. Should not return unless there is an error.
+     *
+     * @param execPath Path to the binary to exec. Normally `drv.builder`;
+     *                 made explicit so future changes cannot silently change
+     *                 the exec target in the `--build-debugger` path.
      */
-    virtual void execBuilder(const Strings & args, const Strings & envStrs);
+    virtual void execBuilder(const std::string & execPath, const Strings & args, const Strings & envStrs);
+
+#ifdef __linux__
+    /**
+     * Result of parsing `drv.args` for the build-debugger path. Only a
+     * conservative subset of bash flags is supported; anything outside the
+     * whitelist causes the preflight gate to refuse.
+     */
+    struct DebugArgsParse
+    {
+        std::string shortFlags;               ///< letters: "e" / "eu" / "eux"
+        std::vector<std::string> longOpts;    ///< e.g. {"pipefail"} for -o pipefail
+        std::string script;                   ///< script path to `source` in the wrapper
+        std::vector<std::string> positionals; ///< $@ passed to the sourced script
+    };
+
+    /**
+     * Parse `drv.args` into a DebugArgsParse structure, or throw.
+     */
+    DebugArgsParse parseDrvArgsForDebug() const;
+
+    /**
+     * Should the `--build-debugger` hook be installed for THIS build?
+     *
+     * True iff the `build-debugger` setting is on AND the `build-debugger-target`
+     * setting names exactly this derivation (by store path). The CLI populates
+     * the target from the one installable the user passed; dependency builds
+     * in the closure see the setting on but their drvPath doesn't match, so
+     * they build normally.
+     *
+     * The answer is cached on first call: `buildDebugger{,Target}` are
+     * read from `settings` (process-global) but do not change over a
+     * single build's lifetime, and the comparison involves a filesystem
+     * `weakly_canonical` of both paths — not cheap to repeat for each
+     * of the ~5 call sites per build.
+     */
+    bool shouldApplyBuildDebugger() const;
+
+    /**
+     * Memoised result of `shouldApplyBuildDebugger()`. `std::nullopt`
+     * until the first call resolves it.
+     *
+     * Cache invariant: `settings.buildDebugger` and
+     * `settings.buildDebuggerTarget` are set by `SetOptions` at daemon
+     * connection start (once per client session), BEFORE any builder is
+     * constructed for that session. They are treated as read-only for
+     * the lifetime of every builder in that session. If a future
+     * refactor made either setting mutable mid-session (e.g., on-the-fly
+     * reconfig from a worker-loop message), this cache would go stale.
+     * In that case, drop the cache and accept the per-call cost, or add
+     * explicit invalidation when the settings change.
+     */
+    mutable std::optional<bool> shouldApplyBuildDebuggerCached;
+
+    /**
+     * Runtime preflight for `--build-debugger`, run when
+     * `shouldApplyBuildDebugger()` returns true. Called early from
+     * `startBuild` before any sandbox state is created. Throws with a
+     * user-facing error on any gate violation.
+     */
+    void validateBuildDebuggerPreflight() const;
+
+    /**
+     * Write `.nix-debug-wrapper.sh` inside `tmpDir`. The wrapper sources the
+     * derivation's script under an EXIT trap; on failure it captures the
+     * shell's state, prints the `nix debug-attach` instructions, and blocks
+     * until signaled (SIGTERM from `nix debug-attach`) or a bounded timeout
+     * elapses. Returns the in-sandbox path to the wrapper.
+     */
+    std::filesystem::path generateDebugWrapperScript();
+
+    /**
+     * Publish the attach-info file (`<nix-state-dir>/debugger/<drv-hash>.attach`)
+     * that `nix debug-attach <drv-path>` consults to locate the paused build.
+     * Called from `startBuild` after `startChild()` has set `pid`.
+     */
+    void publishDebuggerAttachInfo();
+
+    /**
+     * Remove the attach-info file. Idempotent; safe to call when not published.
+     * Called from `cleanupBuild` and on builder teardown.
+     */
+    void unpublishDebuggerAttachInfo() noexcept;
+
+    /**
+     * Once per worker process, scan `<debuggerDir>/*.attach` and remove files
+     * whose embedded pid is dead (or never lived). Callers are expected to
+     * only invoke this from `publishDebuggerAttachInfo`, so the cost is paid
+     * only when the feature is actually used.
+     */
+    static void maybeSweepStaleDebuggerAttachInfo(
+        const std::filesystem::path & debuggerDir);
+
+    /**
+     * Path of the published attach-info file, or empty when not published.
+     * Stored so teardown can remove it without recomputing.
+     */
+    std::filesystem::path debuggerAttachInfoPath;
+
+#endif
 
 private:
 
@@ -828,6 +941,19 @@ std::optional<Descriptor> DerivationBuilderImpl::startBuild()
     /* Construct the environment passed to the builder. */
     initEnv();
 
+#ifdef __linux__
+    /* --build-debugger: validate gates and generate the wrapper script. This
+       runs ONLY for the drv that matches `build-debugger-target`; other
+       derivations in the closure (dependencies) do not get the hook even
+       when `build-debugger` is set globally. Attach-info is published AFTER
+       `startChild()` runs, when we know the builder PID. */
+    bool debuggerInstrumented = shouldApplyBuildDebugger();
+    if (debuggerInstrumented) {
+        validateBuildDebuggerPreflight();
+        (void) generateDebugWrapperScript();
+    }
+#endif
+
     prepareSandbox();
 
     if (needsHashRewrite() && pathExists(homeDir))
@@ -877,6 +1003,14 @@ std::optional<Descriptor> DerivationBuilderImpl::startBuild()
     startChild();
 
     pid.setSeparatePG(true);
+
+#ifdef __linux__
+    /* --build-debugger: publish attach-info now that `pid` is known so
+       `nix debug-attach <drv-path>` can locate this build and `nsenter`
+       into its namespaces. */
+    if (debuggerInstrumented)
+        publishDebuggerAttachInfo();
+#endif
 
     processSandboxSetupMessages();
 
@@ -1281,7 +1415,574 @@ void DerivationBuilderImpl::writeBuilderFile(const std::string & name, std::stri
     chownToBuilder(fd.get(), path);
 }
 
-void DerivationBuilderImpl::runChild(RunChildArgs args)
+#ifdef __linux__
+
+DerivationBuilderImpl::DebugArgsParse DerivationBuilderImpl::parseDrvArgsForDebug() const
+{
+    DebugArgsParse out;
+    auto it = drv.args.begin();
+    auto end = drv.args.end();
+
+    // Flag-parsing phase. Breaks out on:
+    //   - Whitelisted short flag bundle: `-e`, `-eu`, `-eux`, etc.
+    //   - `-o pipefail`
+    //   - `--` (end of options; next arg is the script)
+    //   - The first non-option argument (the script)
+    // Anything unknown (e.g. `-c`, `-r`, `--login`) refuses.
+    bool sawDashDash = false;
+    while (it != end) {
+        const auto & a = *it;
+        if (a == "-c")
+            throw Error(
+                "`--build-debugger` cannot debug `-c`-style inline builders "
+                "(derivation's builder args contain `-c`)");
+        if (a == "--") {
+            ++it;
+            sawDashDash = true;
+            break;
+        }
+        // Long option (`--foo`, `--login`, etc.): reject as a unit rather
+        // than char-by-char, which would otherwise produce a confusing
+        // "bash flag `--`" error.
+        if (a.size() > 2 && a[0] == '-' && a[1] == '-') {
+            throw Error(
+                "`--build-debugger` does not support the bash long option `%s` "
+                "in the derivation's builder args",
+                a);
+        }
+        if (a.size() >= 2 && a[0] == '-' && a != "-") {
+            for (size_t i = 1; i < a.size(); ++i) {
+                char c = a[i];
+                if (c == 'e' || c == 'u' || c == 'x')
+                    out.shortFlags += c;
+                else
+                    throw Error(
+                        "`--build-debugger` does not support the bash flag `-%c` "
+                        "in the derivation's builder args",
+                        c);
+            }
+            ++it;
+            continue;
+        }
+        if (a == "-o") {
+            if (++it == end)
+                throw Error("`--build-debugger`: bash flag `-o` in derivation's builder args missing its argument");
+            if (*it != "pipefail")
+                throw Error(
+                    "`--build-debugger`: only `-o pipefail` is supported; got `-o %s` in derivation's builder args",
+                    *it);
+            out.longOpts.push_back("pipefail");
+            ++it;
+            continue;
+        }
+        // First non-option argument: the script to source.
+        break;
+    }
+
+    // After the flag phase, the first remaining arg (if any) is the script.
+    if (it == end)
+        throw Error(
+            "`--build-debugger` requires the derivation's builder args to name a script to execute; "
+            "none found%s",
+            sawDashDash ? " (nothing after `--`)" : "");
+
+    out.script = *it;
+    ++it;
+
+    // Everything else is positional ($@ to the sourced script).
+    std::copy(it, end, std::back_inserter(out.positionals));
+    return out;
+}
+
+bool DerivationBuilderImpl::shouldApplyBuildDebugger() const
+{
+    if (shouldApplyBuildDebuggerCached)
+        return *shouldApplyBuildDebuggerCached;
+
+    auto compute = [&]() -> bool {
+        // Feature off globally → never instrument.
+        if (!settings.buildDebugger)
+            return false;
+
+        // Only the drvPath the user explicitly targeted is instrumented.
+        // Dependencies built as side-effects share the `build-debugger` setting
+        // (it's a process-global after SetOptions) but their drvPaths don't
+        // match the target, so they build normally.
+        auto target = settings.buildDebuggerTarget.get();
+        if (target.empty()) {
+            // The CLI flag always sets buildDebuggerTarget; users reaching this
+            // branch typically did `--option build-debugger true` without a
+            // scoping target, which is a silent no-op. Warn exactly once per
+            // worker so they don't spend time wondering why nothing paused.
+            static std::atomic<bool> warned{false};
+            bool expected = false;
+            if (warned.compare_exchange_strong(expected, true))
+                logWarning({.msg = HintFmt(
+                    "`build-debugger` is set but `build-debugger-target` is "
+                    "empty — the debug hook has no effect. Use `nix build "
+                    "--build-debugger <installable>` so the CLI can scope the "
+                    "hook to a single drv.")});
+            return false;
+        }
+        // Normalize both sides before comparing: a user passing the drv path
+        // with a trailing slash, through a symlink, or with `.` / `..`
+        // components should still match the scope target. `weakly_canonical`
+        // succeeds on non-existent paths too (unlike `canonical`), so we get
+        // lexical normalization even if the file doesn't exist yet.
+        auto current = store.printStorePath(drvPath);
+        std::error_code ecTarget, ecCurrent;
+        auto normalizedTarget = std::filesystem::weakly_canonical(
+            std::filesystem::path{target}, ecTarget);
+        auto normalizedCurrent = std::filesystem::weakly_canonical(
+            std::filesystem::path{current}, ecCurrent);
+        if (!ecTarget && !ecCurrent) {
+            if (normalizedCurrent != normalizedTarget)
+                return false;
+        } else if (current != target) {
+            // Normalization failed on at least one side; fall back to raw
+            // string comparison so we don't silently skip on a transient
+            // filesystem error.
+            return false;
+        }
+
+        return true;
+    };
+
+    shouldApplyBuildDebuggerCached = compute();
+    return *shouldApplyBuildDebuggerCached;
+}
+
+void DerivationBuilderImpl::validateBuildDebuggerPreflight() const
+{
+    experimentalFeatureSettings.require(Xp::BuildDebugger);
+
+    if (drv.isBuiltin())
+        throw Error(
+            "`--build-debugger` cannot debug builtin derivations (builder = `%s`)", drv.builder);
+
+    // Content-addressed derivations are resolved before they build — the
+    // user targets `<name>-<input-hash>.drv` but the goal that actually
+    // runs this preflight is for the resolved `<name>-<resolved-hash>.drv`,
+    // and `shouldApplyBuildDebugger` compares by store path. Matching at
+    // all (i.e. reaching this preflight) means the user passed the
+    // resolved path or we got lucky with a cached resolution; in the
+    // general case `--build-debugger` silently skips CA drvs today.
+    // Rather than fire inconsistently, refuse outright until the
+    // goal→builder plumbing threads the pre-resolution drvPath through.
+    if (drv.type().isCA())
+        throw Error(
+            "`--build-debugger` does not currently support content-addressed "
+            "derivations. CA resolution renames the derivation at build time "
+            "(`<name>-<input-hash>.drv` -> `<name>-<resolved-hash>.drv`), and "
+            "the debugger's target-path comparison doesn't follow that rename. "
+            "Workaround: rebuild without `__contentAddressed = true` while "
+            "debugging, or invoke `--build-debugger` on the already-resolved "
+            "derivation path.");
+
+    // Require `bash` specifically. `sh` on NixOS may be dash/ash, which
+    // don't support the `-i --init-file` combo the failureHook relies on.
+    auto builderRewritten = rewriteStrings(drv.builder, inputRewrites);
+    auto bn = std::filesystem::path(builderRewritten).filename().string();
+    if (bn != "bash")
+        throw Error(
+            "`--build-debugger` requires the derivation's builder to be `bash`; got `%s`",
+            builderRewritten);
+
+    // drv.args must name a source-able script (not a `-c inline`, not empty).
+    (void) parseDrvArgsForDebug();
+
+    // No max-jobs / --keep-going restriction: only ONE derivation (the one
+    // matching `build-debugger-target`) is ever instrumented, so parallel
+    // and continue-on-error builds of other derivations in the closure are
+    // completely safe.
+}
+
+std::filesystem::path DerivationBuilderImpl::generateDebugWrapperScript()
+{
+    auto parsed = parseDrvArgsForDebug();
+
+    auto bashPath = rewriteStrings(drv.builder, inputRewrites);
+    auto script = rewriteStrings(parsed.script, inputRewrites);
+    std::vector<std::string> positionals;
+    positionals.reserve(parsed.positionals.size());
+    for (auto & p : parsed.positionals)
+        positionals.push_back(rewriteStrings(p, inputRewrites));
+
+    std::string out;
+    out += "# Generated by --build-debugger. Sources the derivation's builder\n";
+    out += "# under an EXIT trap so we can pause the sandbox on failure and\n";
+    out += "# let `nix debug-attach` enter it via `nsenter` to give the user\n";
+    out += "# an interactive shell with the full post-failure environment.\n\n";
+
+    // Apply bash flags the derivation requested (translated to `set` inside
+    // this script so they affect the sourced contents).
+    if (!parsed.shortFlags.empty())
+        out += "set -" + parsed.shortFlags + "\n";
+    for (auto & lo : parsed.longOpts)
+        out += "set -o " + lo + "\n";
+
+    out += "_nix_debug_bash=" + escapeShellArgAlways(bashPath) + "\n";
+    out += "_nix_debug_orig=" + escapeShellArgAlways(script) + "\n";
+    out += "_nix_debug_drvpath=" + escapeShellArgAlways(store.printStorePath(drvPath)) + "\n";
+
+    // Only emit a `set --` line when we actually have positionals to set.
+    if (!positionals.empty()) {
+        out += "set --";
+        for (auto & p : positionals)
+            out += " " + escapeShellArgAlways(p);
+        out += "\n";
+    }
+    out += "\n";
+
+    out += R"sh(
+# Core attach: captures env, prints instructions, blocks waiting for
+# `nix debug-attach` to signal session-end (SIGTERM), then returns with
+# the original exit code so the build is reported as failed.
+#
+# Factored out so both the EXIT-trap path (non-stdenv) and the failureHook
+# path (stdenv) can call it. stdenv's setup.sh installs its own
+# `trap 'exitHandler' EXIT` when sourced, which overwrites ours; its
+# exitHandler runs `runHook failureHook` on failure, which invokes our
+# failureHook function defined below.
+_nix_debug_attach() {
+    local ec="$1"
+    [ "$ec" -eq 0 ] && return 0
+    # Prevent re-entry: clear our EXIT trap before doing anything else so
+    # that a failing command inside this function (e.g. a tripped `set -e`)
+    # cannot recurse.
+    trap - EXIT
+    # Install the TERM/HUP/INT trap FIRST so a `nix debug-attach` that
+    # races ahead and signals us (or an impatient test that wakes the
+    # wrapper as soon as attach-info appears) can't kill bash with
+    # 128+signal before we finish capturing env-vars. The trap stays in
+    # place for the entire duration of this function; we only clear it
+    # after the `wait` returns below.
+    trap ':' TERM HUP INT
+
+    umask 0077
+    # Capture the shell's full post-failure environment — the core value of
+    # `--build-debugger` over an out-of-sandbox attach: phase-local vars,
+    # $out, etc. are all live in THIS shell.
+    #
+    # We want BOTH exported env vars AND plain shell variables. `export -p`
+    # only emits exported ones; for `__structuredAttrs = true` drvs the
+    # derivation's attrs live in `$NIX_ATTRS_SH_FILE` and are declared as
+    # plain shell vars — invisible to `export -p`. `declare -p` captures
+    # everything in scope (exported + unexported), and `declare -f`
+    # preserves stdenv's `genericBuild` / `runHook` / phase functions.
+    #
+    # The bash pattern match drops `declare -[ilnrtux]*r[ilnrtux]*` lines —
+    # readonly variables like `UID`, `EUID`, `SHELLOPTS`, `BASHOPTS` —
+    # which would make the interactive bash's `source` command error out
+    # with "readonly variable" on each. Bash readline-reads the init file;
+    # one readonly error aborts sourcing, so we strip them preemptively.
+    # Implemented using pure bash (no `grep` dependency), so the wrapper
+    # works inside minimal bare-bash sandboxes that don't have coreutils
+    # or gnugrep on PATH.
+    #
+    # The appended `trap ... EXIT` preserves the build's original failure
+    # code: if the user types `exit` (or `exit 0`) after inspecting the
+    # sandbox, we force the interactive bash's exit status back to the
+    # original failure code, so `unprepareBuild` correctly reports the
+    # build as failed. An explicit nonzero `exit N` from the user is
+    # passed through unchanged. `builtin exit` prevents a sourced script
+    # that shadowed `exit` with a function from re-entering the trap.
+    _nix_debug_dump_decls() {
+        local _line
+        while IFS= read -r _line; do
+            [[ "$_line" =~ ^declare\ -[a-zA-Z]*r[a-zA-Z]*(\ |=) ]] && continue
+            printf '%s\n' "$_line"
+        done < <(declare -p)
+    }
+    {
+        _nix_debug_dump_decls
+        declare -f
+        printf 'cd %q\n' "$PWD"
+        printf 'trap '"'"'if [ $? -eq 0 ]; then builtin exit %d; fi'"'"' EXIT\n' "$ec"
+    } > "${NIX_BUILD_TOP:-/tmp}/env-vars" 2>/dev/null || true
+
+    # User-visible attach instructions. Write directly to /dev/tty via FD 2
+    # (the PTY slave), which the daemon forwards to the user's terminal as
+    # part of the normal build log stream.
+    printf '\n\033[31mbuild failed in %s with exit code %d\033[0m\n' "${curPhase:-unknown}" "$ec" >&2
+    printf '\033[32mTo attach an interactive shell to the failed build sandbox, run on this host:\n' >&2
+    printf '    sudo nix debug-attach %s\033[0m\n\n' "$_nix_debug_drvpath" >&2
+
+    # Block until `nix debug-attach` SIGTERMs us (after its interactive
+    # shell exits) or we time out. An hour is generous; a stalled attach
+    # beyond that is indistinguishable from a forgotten build and we'd
+    # rather let the build fail than hang the daemon's worker forever.
+    #
+    # The SIGTERM handler is a no-op that just breaks `wait`. We intercept
+    # SIGHUP and SIGINT as well so a daemon shutdown or Ctrl-C on the
+    # user's `nix build` can also wake us and tear the build down.
+    #
+    # Requires `sleep` in PATH inside the sandbox. stdenv derivations
+    # have coreutils available; a minimal bare-bash derivation must
+    # include coreutils in its closure (e.g. via `${coreutils}/bin` in
+    # `PATH`) for the debugger pause to work. If `sleep` is missing we
+    # surface the gap and let the build fail in the normal way.
+    if ! command -v sleep >/dev/null 2>&1; then
+        printf '\033[33m[build-debugger] no `sleep` in PATH inside the sandbox; cannot pause. Add coreutils to the derivation closure.\033[0m\n' >&2
+        trap - TERM HUP INT
+        return "$ec"
+    fi
+    # `sleep` must be backgrounded: bash only interrupts `wait` on signal
+    # delivery, and only `wait` (not a foreground `sleep`) yields to traps.
+    sleep 3600 &
+    wait "$!" 2>/dev/null || true
+    trap - TERM HUP INT
+    return "$ec"
+}
+
+# stdenv path: stdenv's `exitHandler` EXIT trap (installed when setup.sh
+# is sourced) runs `runHook failureHook` on failure. Defining
+# `failureHook` as a function makes `_callImplicitHook 0 failureHook`
+# resolve to us. We read the failing status from `$exitCode`, which
+# stdenv sets at the top of exitHandler before `set +e`.
+failureHook() { _nix_debug_attach "${exitCode:-1}"; }
+
+# Non-stdenv path: if the sourced script doesn't install an EXIT trap of
+# its own, ours stays in place and fires when the shell exits on a failing
+# command (with `set -e`) or at script end. stdenv overrides this trap
+# when it's sourced, at which point `failureHook` above is the live path.
+trap '_nix_debug_attach "$?"' EXIT
+
+# Source, don't exec: we want the state capture to happen in a shell that
+# has the derivation's phase-local variables.
+source "$_nix_debug_orig"
+)sh";
+
+    writeBuilderFile(".nix-debug-wrapper.sh", out);
+    auto path = tmpDir / ".nix-debug-wrapper.sh";
+    // nix::chmod throws on failure.
+    chmod(path, 0555);
+    return path;
+}
+
+void DerivationBuilderImpl::maybeSweepStaleDebuggerAttachInfo(
+    const std::filesystem::path & debuggerDir)
+{
+    // Time-based guard: sweep at most once every 60 seconds per worker.
+    // A long-lived daemon worker building dozens of drvs in sequence
+    // would otherwise either sweep on every publish (wasteful) or never
+    // sweep after the first (stale entries accumulate). 60s balances
+    // both.
+    using clock = std::chrono::steady_clock;
+    static std::atomic<clock::rep> lastSweepNs{0};
+
+    auto now = clock::now().time_since_epoch();
+    auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    auto prev = lastSweepNs.load(std::memory_order_relaxed);
+    constexpr clock::rep sweepIntervalNs = 60LL * 1'000'000'000LL;
+    if (prev != 0 && nowNs - prev < sweepIntervalNs)
+        return;
+    // CAS so concurrent-worker scenario (future-proofing) doesn't duplicate
+    // the scan. Losers just skip.
+    if (!lastSweepNs.compare_exchange_strong(prev, nowNs, std::memory_order_relaxed))
+        return;
+
+    std::error_code ec;
+    if (!std::filesystem::exists(debuggerDir, ec))
+        return;
+
+    // The wrapper's own pause cap is 1 hour, so any attach-info older
+    // than that cannot correspond to a live paused build. Use 6 hours
+    // as the age cutoff for all entry types (including redirects) so
+    // a daemon that was SIGKILLed mid-dispatch — the only path that
+    // bypasses `~DerivationBuildingGoal` redirect cleanup — can't leak
+    // a redirect indefinitely.
+    constexpr auto maxAge = std::chrono::hours(6);
+
+    // Cap per-sweep processing so a heavily-used daemon with thousands
+    // of accumulated stale entries doesn't spend all its time sweeping
+    // on every publish. The next sweep (60 s later) picks up the rest.
+    constexpr size_t perSweepCap = 1000;
+    size_t processed = 0;
+
+    for (auto & entry : std::filesystem::directory_iterator(debuggerDir, ec)) {
+        if (ec)
+            break;
+        auto path = entry.path();
+        if (path.extension() != ".attach")
+            continue;
+        // Cap counts only `.attach` files — non-.attach entries
+        // (`.lock`, transient `.tmp` files) are cheap to skip.
+        if (++processed > perSweepCap)
+            break;
+
+        // Age-based cull takes precedence over type-specific liveness
+        // checks: a 6-hour-old entry is stale regardless of its shape.
+        std::error_code ageEc;
+        auto mtime = std::filesystem::last_write_time(path, ageEc);
+        if (!ageEc) {
+            auto sys = std::chrono::file_clock::to_sys(mtime);
+            auto age = std::chrono::system_clock::now() - sys;
+            if (age > maxAge) {
+                std::error_code rmEc;
+                std::filesystem::remove(path, rmEc);
+                continue;
+            }
+        }
+
+        auto keep = false;
+        try {
+            auto content = readFile(path.string());
+            auto j = nlohmann::json::parse(content);
+            // Redirect-only entries (remoteHost set) have no local pid;
+            // keep them — the ssh-dispatch path will SSH and ask the
+            // remote. The age-based cull above handles orphaned
+            // redirects left by a daemon that died mid-dispatch.
+            auto remoteHost = j.value<std::string>("remoteHost", "");
+            if (!remoteHost.empty()) {
+                keep = true;
+            } else {
+                pid_t pidRaw = j.value<pid_t>("pid", pid_t{0});
+                // Prefer pidfd-based liveness over `kill(pid, 0)`:
+                // once the pid is opened as a pidfd, the kernel pins
+                // the task_struct, so `pidfd_send_signal(fd, 0, …)`
+                // correctly reports ESRCH even if the pid number has
+                // been reused. `kill(pid, 0)` would happily succeed on
+                // the unrelated reused process and preserve a stale
+                // entry. On pre-5.3 kernels `openPidfd` returns -1 and
+                // we fall back to `kill(pid, 0)` — the sweep's blast
+                // radius is cosmetic (a stale entry survives 60 s
+                // longer than needed), which the feature as a whole
+                // treats as acceptable on legacy kernels.
+                if (pidRaw > 0) {
+                    AutoCloseFD pfd{openPidfd(pidRaw)};
+                    if (pfd.get() >= 0) {
+                        keep = pidfdAlive(pfd.get());
+                    } else {
+                        keep = ::kill(pidRaw, 0) == 0;
+                    }
+                }
+            }
+        } catch (...) {
+            keep = false;
+        }
+
+        if (!keep) {
+            std::error_code rmEc;
+            std::filesystem::remove(path, rmEc);
+            // Silent: this is best-effort cleanup.
+        }
+    }
+}
+
+void DerivationBuilderImpl::publishDebuggerAttachInfo()
+{
+    auto pidRaw = static_cast<pid_t>(pid);
+    if (pidRaw <= 0)
+        return; // startChild hasn't run yet; nothing sensible to publish
+
+    auto bashPath = rewriteStrings(drv.builder, inputRewrites);
+    auto sandboxTmp = tmpDirInSandbox().string();
+    // `tmpDir` is the host-visible build directory (= `topTmpDir/build` in
+    // Linux sandbox mode, or just `topTmpDir` otherwise). It's the same
+    // inode as `tmpDirInSandbox()` via the sandbox's bind mount, so
+    // writing `env-vars` at `${NIX_BUILD_TOP}/env-vars` inside the sandbox
+    // is equivalent to `tmpDir/env-vars` on the host.
+    //
+    // Defence against future sandbox backends breaking that invariant: if
+    // both paths exist and resolve to different inodes, the attach-info
+    // we publish would point debug-attach at the wrong file. Warn, but
+    // don't throw: we're called from `startBuild` AFTER `startChild()`,
+    // and throwing here would leak the already-forked child. The user's
+    // attach will likely still work via `sandboxTmpdir` inside the
+    // sandbox; only the host-side `hostTmpdir` fallback is at risk.
+    {
+        struct stat hostSt{}, sandSt{};
+        if (::stat(tmpDir.c_str(), &hostSt) == 0
+            && ::stat(sandboxTmp.c_str(), &sandSt) == 0
+            && (hostSt.st_dev != sandSt.st_dev || hostSt.st_ino != sandSt.st_ino))
+        {
+            logWarning({.msg = HintFmt(
+                "build-debugger: host tmpdir `%s` and sandbox tmpdir `%s` "
+                "resolve to different inodes. This sandbox backend does "
+                "not bind-mount the build directory at its inside-the-"
+                "sandbox path, or a file named `%s` already exists on the "
+                "host for an unrelated reason. `nix debug-attach` may fall "
+                "back to reading env-vars via the sandbox mount namespace.",
+                tmpDir.string(), sandboxTmp, sandboxTmp)});
+        }
+        // If stat on sandboxTmp fails (e.g. the caller is outside the
+        // sandbox mount namespace, which is normal for the parent
+        // daemon), skip the assertion — the check is opportunistic.
+    }
+    auto hostTmp = tmpDir.string();
+
+    auto dir = std::filesystem::path(settings.nixStateDir) / "debugger";
+    // 0700 on the directory: only the daemon (root, which is the only uid
+    // that can write here in daemon mode) needs to read it, and `nix
+    // debug-attach` also runs as root. Tighter than strictly necessary
+    // but defence-in-depth against local attach-info tampering.
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec)
+        throw SysError(
+            "creating build-debugger attach-info directory '%s': %s",
+            dir.string(), ec.message());
+    // Enforce mode explicitly — create_directories respects the umask, and
+    // daemons typically run with umask 0022 which would leave the dir 0755.
+    if (::chmod(dir.c_str(), 0700) < 0)
+        throw SysError(
+            "setting mode 0700 on build-debugger attach-info directory '%s'",
+            dir.string());
+
+    maybeSweepStaleDebuggerAttachInfo(dir);
+
+    auto hashPart = std::string(drvPath.hashPart());
+    auto target = dir / (hashPart + ".attach");
+
+    // Schema version bumped via `kDebuggerAttachInfoSchemaVersion` in
+    // `build-debugger.hh`. Bump when making incompatible changes so older
+    // `nix debug-attach` binaries can refuse cleanly rather than mis-parsing.
+    nlohmann::json info = {
+        {"schemaVersion", kDebuggerAttachInfoSchemaVersion},
+        {"pid", pidRaw},
+        {"drvPath", store.printStorePath(drvPath)},
+        {"sandboxTmpdir", sandboxTmp},
+        {"hostTmpdir", hostTmp},
+        {"bash", bashPath},
+        // Embedded so `nix debug-attach` can sanity-check the target pid
+        // actually runs our wrapper rather than a reused pid. The name is
+        // the same string `commonChildInit` leaves in /proc/<pid>/comm.
+        {"wrapperScript", (tmpDir / ".nix-debug-wrapper.sh").string()},
+    };
+    auto serialised = info.dump();
+
+    // Write + rename for atomicity: a concurrent `nix debug-attach` must
+    // see the file either absent or fully populated.
+    auto tmp = target;
+    tmp += ".tmp";
+    writeFile(tmp.string(), serialised, /*mode=*/0600);
+    std::filesystem::rename(tmp, target, ec);
+    if (ec) {
+        std::filesystem::remove(tmp);
+        throw SysError(
+            "publishing build-debugger attach-info to '%s': %s",
+            target.string(), ec.message());
+    }
+
+    debuggerAttachInfoPath = std::move(target);
+}
+
+void DerivationBuilderImpl::unpublishDebuggerAttachInfo() noexcept
+{
+    if (debuggerAttachInfoPath.empty())
+        return;
+    std::error_code ec;
+    std::filesystem::remove(debuggerAttachInfoPath, ec);
+    // Best-effort: if removal fails (e.g. the daemon has no write access
+    // because the file was rotated by a different tool), the next startBuild
+    // for the same drv will overwrite it — no need to surface an error here.
+    debuggerAttachInfoPath.clear();
+}
+
+#endif // __linux__
+
+void DerivationBuilderImpl::runChild(RunChildArgs childArgs)
 {
     /* Warning: in the child we should absolutely not make any SQLite
        calls! */
@@ -1300,7 +2001,7 @@ void DerivationBuilderImpl::runChild(RunChildArgs args)
             .hashedMirrors = settings.getLocalSettings().hashedMirrors,
             .tmpDirInSandbox = tmpDirInSandbox(),
 #if NIX_WITH_AWS_AUTH
-            .awsCredentials = args.awsCredentials,
+            .awsCredentials = childArgs.awsCredentials,
 #endif
         };
 
@@ -1375,7 +2076,20 @@ void DerivationBuilderImpl::runChild(RunChildArgs args)
         for (auto & i : env)
             envStrs.push_back(rewriteStrings(i.first + "=" + i.second, inputRewrites));
 
-        execBuilder(args, envStrs);
+#ifdef __linux__
+        /* --build-debugger: replace argv with a call to our wrapper script
+           that sources the original builder under an EXIT trap. drv.builder
+           is guaranteed to be bash by validateBuildDebuggerPreflight(). */
+        if (shouldApplyBuildDebugger()) {
+            args.clear();
+            args.push_back("bash");
+            args.push_back("--norc");
+            args.push_back("--noprofile");
+            args.push_back((tmpDirInSandbox() / ".nix-debug-wrapper.sh").string());
+        }
+#endif
+
+        execBuilder(drv.builder, args, envStrs);
 
         throw SysError("executing '%1%'", drv.builder);
 
@@ -1412,9 +2126,9 @@ void DerivationBuilderImpl::setUser()
     }
 }
 
-void DerivationBuilderImpl::execBuilder(const Strings & args, const Strings & envStrs)
+void DerivationBuilderImpl::execBuilder(const std::string & execPath, const Strings & args, const Strings & envStrs)
 {
-    execve(drv.builder.c_str(), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
+    execve(execPath.c_str(), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
 }
 
 SingleDrvOutputs DerivationBuilderImpl::registerOutputs()
@@ -2007,6 +2721,10 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs()
 
 void DerivationBuilderImpl::cleanupBuild(bool force)
 {
+#ifdef __linux__
+    unpublishDebuggerAttachInfo();
+#endif
+
     if (force) {
         /* Delete unused redirected outputs (when doing hash rewriting). */
         for (auto & i : redirectedOutputs)
@@ -2024,8 +2742,17 @@ void DerivationBuilderImpl::cleanupBuild(bool force)
         chmod(topTmpDir, 0000);
 
         /* Don't keep temporary directories for builtins because they
-           might have privileged stuff (like a copy of netrc). */
-        if (settings.keepFailed && !force && !drv.isBuiltin()) {
+           might have privileged stuff (like a copy of netrc). We preserve
+           the tmpdir either on `--keep-failed` (any build) or on the
+           `--build-debugger`-instrumented build (same rationale as the
+           `keepFailed` flag: the user needs to poke around post-mortem).
+           Dependency builds in the closure are not instrumented and are
+           cleaned up normally. */
+        bool instrumentedForDebugger = false;
+#ifdef __linux__
+        instrumentedForDebugger = shouldApplyBuildDebugger();
+#endif
+        if ((settings.keepFailed || instrumentedForDebugger) && !force && !drv.isBuiltin()) {
             printError("note: keeping build directory %s", PathFmt(tmpDir));
             chmod(topTmpDir, 0755);
             chmod(tmpDir, 0755);

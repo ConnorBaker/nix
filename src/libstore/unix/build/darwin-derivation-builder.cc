@@ -202,7 +202,7 @@ struct DarwinDerivationBuilder : DerivationBuilderImpl
         }
     }
 
-    void execBuilder(const Strings & args, const Strings & envStrs) override
+    void execBuilder(const std::string & execPath, const Strings & args, const Strings & envStrs) override
     {
         posix_spawnattr_t attrp;
 
@@ -225,7 +225,7 @@ struct DarwinDerivationBuilder : DerivationBuilderImpl
         }
 
         posix_spawn(
-            NULL, drv.builder.c_str(), NULL, &attrp, stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
+            NULL, execPath.c_str(), NULL, &attrp, stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
     }
 
     /**

@@ -160,4 +160,27 @@ std::string statusToString(int status);
 
 bool statusOk(int status);
 
+#ifdef __linux__
+/**
+ * Open a Linux pidfd for `pid`. Returns -1 on failure (e.g. ENOSYS on
+ * kernels < 5.3, or ESRCH if `pid` has already exited). The returned
+ * fd has O_CLOEXEC set via fcntl (since `pidfd_open(2)` itself doesn't
+ * expose a flags argument for it on older kernels).
+ *
+ * Callers should wrap the result in `AutoCloseFD` to manage lifetime.
+ * A pidfd pins the kernel task_struct so subsequent probes via
+ * `pidfdAlive(fd)` correctly report ESRCH when the original task has
+ * exited — even if the pid number has been recycled for an unrelated
+ * process.
+ */
+int openPidfd(pid_t pid);
+
+/**
+ * Liveness probe on a pidfd via `pidfd_send_signal(fd, 0, …)`. Returns
+ * false for any negative fd, for any non-zero errno from the syscall,
+ * or on kernels without `pidfd_send_signal` (Linux < 5.1).
+ */
+bool pidfdAlive(int pidfd);
+#endif
+
 } // namespace nix

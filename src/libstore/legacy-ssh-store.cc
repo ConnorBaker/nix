@@ -15,6 +15,10 @@
 #include "nix/util/callback.hh"
 #include "nix/store/store-registration.hh"
 #include "nix/store/globals.hh"
+#include "nix/util/sync.hh"
+
+#include <set>
+#include <string>
 
 namespace nix {
 
@@ -85,6 +89,38 @@ ref<LegacySSHStore::Connection> LegacySSHStore::openConnection()
             "'nix-store --serve' protocol mismatch from '%s', got '%s'", config->authority.host, chomp(saved.s));
     } catch (EndOfFile & e) {
         throw Error("cannot connect to '%1%'", config->authority.host);
+    }
+
+    // Warn if the client set `--build-debugger` but the remote is too
+    // old to honour the propagated settings. Without the warning, the
+    // remote would build normally (without the debug wrapper) and the
+    // user would be puzzled that `nix debug-attach` never finds a
+    // paused build on the remote.
+    //
+    // Dedup per host (not globally): a daemon talking to a mix of new
+    // and legacy peers needs a warning for each legacy peer it hits,
+    // otherwise a first handshake to a new peer would mask all later
+    // warnings about actually-problematic legacy ones.
+    if (settings.buildDebugger
+        && conn->remoteVersion < ServeProto::Version{2, 9})
+    {
+        static Sync<std::set<std::string>> warned;
+        bool firstForThisHost;
+        {
+            auto w(warned.lock());
+            firstForThisHost = w->insert(config->authority.host).second;
+        }
+        if (firstForThisHost)
+            logWarning({.msg = HintFmt(
+                "`--build-debugger` is set, but `%s` speaks serve protocol "
+                "%d.%d (< 2.9) — the remote Nix is too old to receive the "
+                "debugger setting. The remote build will run without the "
+                "debug wrapper and `nix debug-attach` won't find a paused "
+                "session on that host. Upgrade the remote Nix to enable "
+                "remote-builder debugging.",
+                config->authority.host,
+                conn->remoteVersion.major,
+                conn->remoteVersion.minor)});
     }
 
     return conn;
@@ -189,6 +225,13 @@ static ServeProto::BuildOptions buildSettings()
         .nrRepeats = 0, // buildRepeat hasn't worked for ages anyway
         .enforceDeterminism = 0,
         .keepFailed = settings.keepFailed,
+        // `--build-debugger` + its scoped target path. When the remote
+        // runs a new-enough `nix-store --serve` (protocol >= 2.9) it will
+        // set up the debug wrapper and publish attach-info on the remote
+        // host. `nix debug-attach --on <remote>` then SSHes there to run
+        // the attach locally on the remote.
+        .buildDebugger = settings.buildDebugger,
+        .buildDebuggerTarget = settings.buildDebuggerTarget,
     };
 }
 
