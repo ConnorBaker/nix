@@ -129,7 +129,6 @@ LocalStore::LocalStore(ref<const Config> config)
     , _state(make_ref<Sync<State>>())
     , dbDir(config->stateDir.get() / "db")
     , linksDir(config->realStoreDir.get() / ".links")
-    , shardedLinks(experimentalFeatureSettings.isEnabled(Xp::ShardedLinks))
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
@@ -146,34 +145,6 @@ LocalStore::LocalStore(ref<const Config> config)
         makeStoreWritable();
     }
     createDirs(linksDir);
-
-    /* When `sharded-links` is enabled, ensure every 2-character shard
-       directory exists up front. Nix-base32 has 32 symbols, so there
-       are 1024 shards; each is just an empty htree root block until
-       populated (~4 KB each, ~4 MB total). Creating them lazily would
-       open up race windows between concurrent `link(2)` calls where
-       two workers could both try to `mkdir(shard)` at once. */
-    if (shardedLinks && !config->readOnly) {
-        for (char c1 : BaseNix32::characters)
-            for (char c2 : BaseNix32::characters) {
-                char shard[3] = {c1, c2, 0};
-                createDirs(linksDir / shard);
-            }
-    }
-
-    /* Query the filesystem's per-file hardlink ceiling so the
-       replica walk in `optimisePath_` can opportunistically skip
-       saturated slots without a round-trip to the kernel. The
-       commit path in `optimisePath_` handles EMLINK regardless, so
-       this value is advisory — a conservative fallback is safe. */
-#ifndef _WIN32
-    {
-        long pc = ::pathconf(linksDir.string().c_str(), _PC_LINK_MAX);
-        linkMax = pc > 0 ? static_cast<int64_t>(pc) : int64_t{32000};
-    }
-#else
-    linkMax = int64_t{32000};
-#endif
 
     auto profilesDir = config->stateDir.get() / "profiles";
     createDirs(profilesDir);
@@ -432,63 +403,6 @@ AutoCloseFD LocalStore::openGCLock()
     if (!fdGCLock)
         throw SysError("opening global GC lock %1%", PathFmt(fnGCLock));
     return toDescriptor(fdGCLock);
-}
-
-std::filesystem::path LocalStore::legacyFlatLinkPathFor(const Hash & hash) const
-{
-    return linksDir / hash.to_string(HashFormat::Nix32, false);
-}
-
-std::filesystem::path LocalStore::linkPathFor(const Hash & hash, uint8_t replica) const
-{
-    assert(replica < maxLinkReplicas);
-    auto hs = hash.to_string(HashFormat::Nix32, false);
-    if (shardedLinks) {
-        /* Sharded layout invariant: every entry's filename is
-           `<52-char-hash>.<NN>` where `<NN>` is exactly 2 decimal
-           digits. Zero-padding gives us:
-             - O(1) suffix parsing (fixed offsets from the end)
-             - lexicographic order matching numeric order
-             - one unambiguous on-disk form per (hash, replica)
-           See `parseReplicaSuffix` below. */
-        char suffix[4];
-        std::snprintf(suffix, sizeof suffix, ".%02u", static_cast<unsigned>(replica));
-        return linksDir / hs.substr(0, 2) / (hs + suffix);
-    } else {
-        /* Legacy flat layout — only replica 0 is meaningful. Higher
-           replicas on a non-sharded store would blow the 65 000
-           hardlink ceiling since there's nowhere to spill. Callers
-           that want replica support must enable `sharded-links`. */
-        return linksDir / hs;
-    }
-}
-
-std::optional<uint8_t> LocalStore::parseReplicaSuffix(std::string_view name) const
-{
-    /* Under the sharded layout, every filename ends with `.<NN>`
-       where NN is exactly two decimal digits (zero-padded). We
-       read the three trailing chars in constant time:
-         - name[size-3] must be '.'
-         - name[size-2] and name[size-1] must be decimal digits
-
-       A filename that doesn't match this shape is either a legacy
-       flat entry picked up by a mixed-layout walk or something
-       foreign — in both cases we return `std::nullopt` so callers
-       can treat it as a pre-invariant entry. */
-    if (name.size() < 3 || name[name.size() - 3] != '.')
-        return std::nullopt;
-    char d1 = name[name.size() - 2];
-    char d2 = name[name.size() - 1];
-    if (d1 < '0' || d1 > '9' || d2 < '0' || d2 > '9')
-        return std::nullopt;
-    return static_cast<uint8_t>((d1 - '0') * 10 + (d2 - '0'));
-}
-
-std::string_view LocalStore::stripReplicaSuffix(std::string_view name) const
-{
-    if (parseReplicaSuffix(name))
-        return name.substr(0, name.size() - 3);
-    return name;
 }
 
 void LocalStore::deleteStorePath(const std::filesystem::path & path, uint64_t & bytesFreed, bool isKnownPath)
@@ -1508,14 +1422,8 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
 
         printInfo("checking link hashes...");
 
-        /* Check one `.links/` entry's on-disk content against its
-           filename. Entries may be either flat (`<hash>`) or sharded
-           (`<pfx>/<hash>.<N>`); `stripReplicaSuffix` removes the
-           always-present replica suffix from sharded names in
-           constant time. */
         auto checkLink = [&](const std::filesystem::path & link) {
-            auto name = link.filename().string();
-            auto expected = std::string(stripReplicaSuffix(name));
+            auto expected = link.filename().string();
             printMsg(lvlTalkative, "checking contents of %s", PathFmt(link));
             std::string got =
                 hashPath(makeFSSourceAccessor(link), FileIngestionMethod::NixArchive, HashAlgorithm::SHA256)
@@ -1531,19 +1439,9 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
             }
         };
 
-        for (auto & top : DirectoryIterator{linksDir}) {
+        for (auto & link : DirectoryIterator{linksDir}) {
             checkInterrupt();
-            std::error_code ec;
-            if (top.is_directory(ec) && !ec) {
-                /* Shard subdirectory (sharded layout); recurse. */
-                for (auto & link : DirectoryIterator{top.path()}) {
-                    checkInterrupt();
-                    checkLink(link.path());
-                }
-            } else {
-                /* Flat entry directly in `.links/`. */
-                checkLink(top.path());
-            }
+            checkLink(link.path());
         }
 
         printInfo("checking store hashes...");

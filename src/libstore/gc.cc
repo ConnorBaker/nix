@@ -1446,25 +1446,12 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         printInfo("deleting unused links...");
 
         /* Enumerate entries first so the DIR* is released quickly and
-           workers can fan out over independent lstat/unlink pairs. We
-           walk both layouts unconditionally to handle stores that
-           were toggled between sharded and flat modes.
-
-           `DirectoryIterator::is_directory()` is cached from the
-           entry's `d_type` by libstdc++, so no follow-up stat. */
+           workers can fan out over independent lstat/unlink pairs. */
         std::vector<std::filesystem::path> entries;
         entries.reserve(1 << 16);
-        for (auto & top : DirectoryIterator{linksDir}) {
+        for (auto & link : DirectoryIterator{linksDir}) {
             checkInterrupt();
-            std::error_code ec;
-            if (top.is_directory(ec) && !ec) {
-                for (auto & link : DirectoryIterator{top.path()}) {
-                    checkInterrupt();
-                    entries.push_back(link.path());
-                }
-            } else {
-                entries.push_back(top.path());
-            }
+            entries.push_back(link.path());
         }
 
         /* Cache-line-aligned to avoid false sharing between the two

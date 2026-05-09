@@ -106,53 +106,21 @@ void LocalStore::loadInodeHashInto(InodeHash & inodeHash)
 {
     debug("loading hash inodes in memory");
 
-    /* Uses `readdir` directly so we get `dirent::d_ino` for free — we
-       only want inodes, not full `stat()` results. `dirent::d_type`
-       also lets us recognise shard subdirectories in the same pass.
-
-       Both layouts are walked unconditionally: a store can contain
-       entries from a previous session that had `shardedLinks` set
-       differently, and we need every existing canonical inode in
-       the hash so the fast-path in `optimisePath_` works. */
-    std::vector<std::filesystem::path> shards;
-
-    {
-        AutoCloseDir dir(opendir(linksDir.string().c_str()));
-        if (!dir)
-            throw SysError("opening directory %1%", PathFmt(linksDir));
-        struct dirent * dirent;
-        while (errno = 0, dirent = readdir(dir.get())) { /* sic */
-            checkInterrupt();
-            const char * name = dirent->d_name;
-            if (name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0)))
-                continue;
-#ifdef _DIRENT_HAVE_D_TYPE
-            if (dirent->d_type == DT_DIR) {
-                shards.push_back(linksDir / name);
-                continue;
-            }
-#endif
-            inodeHash.insert(dirent->d_ino);
-        }
-        if (errno)
-            throw SysError("reading directory %1%", PathFmt(linksDir));
+    /* Uses `readdir` directly so we get `dirent::d_ino` for free —
+       we only want inodes, not full `stat()` results. */
+    AutoCloseDir dir(opendir(linksDir.string().c_str()));
+    if (!dir)
+        throw SysError("opening directory %1%", PathFmt(linksDir));
+    struct dirent * dirent;
+    while (errno = 0, dirent = readdir(dir.get())) { /* sic */
+        checkInterrupt();
+        const char * name = dirent->d_name;
+        if (name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0)))
+            continue;
+        inodeHash.insert(dirent->d_ino);
     }
-
-    for (auto & shard : shards) {
-        AutoCloseDir dir(opendir(shard.string().c_str()));
-        if (!dir)
-            throw SysError("opening directory %1%", PathFmt(shard));
-        struct dirent * dirent;
-        while (errno = 0, dirent = readdir(dir.get())) { /* sic */
-            checkInterrupt();
-            const char * name = dirent->d_name;
-            if (name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0)))
-                continue;
-            inodeHash.insert(dirent->d_ino);
-        }
-        if (errno)
-            throw SysError("reading directory %1%", PathFmt(shard));
-    }
+    if (errno)
+        throw SysError("reading directory %1%", PathFmt(linksDir));
 
     printMsg(lvlTalkative, "loaded %1% hash inodes", inodeHash.size());
 }
@@ -192,48 +160,26 @@ LocalStore::readDirectoryIgnoringInodes(const std::filesystem::path & path, cons
  * Per-file operation:
  *
  *     hash(file) -> H
- *     for replica = 0 .. maxLinkReplicas - 1:
- *         candidate = linkPathFor(H, replica)
- *         if candidate doesn't exist:
- *             link(file, candidate); done
- *         if inode(file) == inode(candidate):
- *             already deduped; done
- *         if candidate has room:
- *             replace `file` with hardlink to candidate
- *             (tempLink + rename — POSIX atomic replace); done
- *     # fall through: maximum links across all replicas — leave undeduped
+ *     candidate = linksDir / H
+ *     if candidate doesn't exist:
+ *         link(file, candidate); done
+ *     if inode(file) == inode(candidate):
+ *         already deduped; done
+ *     replace `file` with hardlink to candidate
+ *         (tempLink + rename — POSIX atomic replace)
+ *     EMLINK on link(2)/rename(2): give up on dedup for this file.
  *
- * The replica walk replaces the old single-slot scheme: each
- * replica is an independent canonical inode holding up to the
- * filesystem's per-inode hardlink ceiling (ext4 = 65 000), giving
- * ~6.5M total dedupes per logical hash across 100 replicas.
+ * Race tolerance for concurrency with parallel workers and GC:
+ *   - ENOENT on source: source GC'd; benign skip.
+ *   - ENOENT on candidate: GC'd between our lstat and link; recreate.
+ *   - EEXIST on link(2): a concurrent optimiser created the canonical;
+ *     re-inspect and dedupe against it.
+ *   - EMLINK: filesystem hardlink ceiling reached; leave undeduped.
+ *   - ENOSPC on `.links/`: directory index full; abandon this file.
  *
- * Every syscall has at least one race we must handle without
- * aborting the whole optimise run:
- *
- *   - ENOENT (source GC'd mid-op) -> benign skip; ENOENT on
- *     destination means a racing GC unlinked the canonical —
- *     we recreate from our source if possible.
- *   - EEXIST on link(2) -> a concurrent optimiser beat us to
- *     the slot; re-inspect its inode, either dedupe against it
- *     or move to the next replica.
- *   - EMLINK on either the link(2) or the rename(2) -> this
- *     replica is full; advance to the next. No pre-reservation
- *     is needed because the commit path handles EMLINK, so an
- *     opportunistic `st_nlink >= linkMax` pre-flight is just a
- *     free round-trip save, not a correctness requirement.
- *   - ENOSPC on the `.links/` directory's htree (very large
- *     flat stores only) -> abandon the file for this pass.
- *
- * Concurrency with GC is safe by construction: every syscall is
- * retry-tolerant on ENOENT, and GC unlinks only entries with
- * st_nlink == 1 (so we can't race it into deleting a replica
- * another optimiser is mid-link against).
- *
- * Concurrency with *another optimise invocation* (two processes
- * calling `optimiseStore`) is serialised by a per-store advisory
- * file lock in `optimiseStore`. Per-file parallelism inside one
- * invocation remains unlocked. */
+ * Concurrency with another `optimiseStore` invocation is serialised
+ * by a per-store advisory lock in `optimiseStore`. Per-file
+ * parallelism within one invocation is unlocked. */
 void LocalStore::optimisePath_(
     Activity * act,
     OptimiseStats & stats,
@@ -313,216 +259,22 @@ void LocalStore::optimisePath_(
     Hash hash = hashPath(makeFSSourceAccessor(path), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash;
     debug("%s has hash '%s'", PathFmt(path), hash.to_string(HashFormat::Nix32, true));
 
-    /* NB: bulk migration of legacy flat `.links/<H>` entries into the
-       sharded layout happens up-front in `optimiseStore`, before any
-       `optimisePath_` calls, so by the time we're here the inodeHash
-       fast-path above covers both layouts uniformly. */
+    auto candidate = linksDir / hash.to_string(HashFormat::Nix32, false);
 
-    /* Replica walk: we try replica 0 first (the primary entry); on
-       EMLINK — either detected up front via `st_nlink` saturation, or
-       returned from `link(2)` — we fall through to replica 1, and
-       so on, until we find a replica with room or exhaust the cap.
-       Each replica is an independent canonical inode.
-
-       The caller distinguishes three outcomes: `Done` (we're finished
-       with this user file — either linked successfully, or the source
-       vanished, or the FS refused for a terminal reason like ENOSPC);
-       `AlreadyExists` (the slot is occupied — inspect its inode to
-       decide whether to use it or move on); `ReplicaFull` (source or
-       candidate hit the per-inode ceiling — try the next slot). */
-    enum class LinkResult {
-        Done,
-        AlreadyExists,
-        ReplicaFull,
-    };
-
-    auto tryCreateCanonicalAt = [&](const std::filesystem::path & candidate) -> LinkResult {
-        std::error_code ec;
-        std::filesystem::create_hard_link(path, candidate, ec);
-        if (!ec) {
-            inodeHash.insert(st.st_ino);
-            return LinkResult::Done;
+    /* Corruption recovery: size/hash mismatch means a broken entry.
+       Remove it and retry from scratch. */
+    auto stCanon = maybeLstat(candidate);
+    if (stCanon) {
+        bool corrupted = st.st_size != stCanon->st_size;
+        if (!corrupted && repair) {
+            auto linkHash = hashPath(
+                                makeFSSourceAccessor(candidate),
+                                FileSerialisationMethod::NixArchive,
+                                HashAlgorithm::SHA256)
+                                .hash;
+            corrupted = hash != linkHash;
         }
-        if (ec == std::errc::file_exists)
-            return LinkResult::AlreadyExists;
-        if (ec == std::errc::no_such_file_or_directory) {
-            /* POSIX link(2) returns ENOENT in two cases:
-               1. the source (`path`) no longer exists — benign GC race;
-               2. a directory component of the destination (`candidate`)
-                  no longer exists — structural error (e.g. a shard
-                  subdirectory is missing, which should have been
-                  pre-created at store open).
-               Distinguish by re-lstat-ing the source. */
-            if (!maybeLstat(path))
-                return LinkResult::Done; /* case 1 */
-            throw SysError( /* case 2 */
-                "creating hard link from %1% to %2%: destination parent directory missing",
-                PathFmt(candidate),
-                PathFmt(path));
-        }
-        if (ec == std::errc::too_many_links)
-            return LinkResult::ReplicaFull;
-        if (ec == std::errc::no_space_on_device) {
-            printInfo("cannot link %s to %s: %s", PathFmt(candidate), PathFmt(path), ec.message());
-            return LinkResult::Done;
-        }
-        throw SystemError(ec, "creating hard link from %1% to %2%", PathFmt(candidate), PathFmt(path));
-    };
-
-    /* Detect corruption at a given candidate. */
-    auto isCorruptedAt = [&](const std::filesystem::path & candidate, const PosixStat & stLink) -> bool {
-        if (st.st_size != stLink.st_size)
-            return true;
-        if (!repair)
-            return false;
-        auto linkHash = hashPath(
-                            makeFSSourceAccessor(candidate),
-                            FileSerialisationMethod::NixArchive,
-                            HashAlgorithm::SHA256)
-                            .hash;
-        return hash != linkHash;
-    };
-
-    /* Atomically replace `path` with a hardlink to `candidate`. Any
-       EMLINK we get from either the `link(2)` on `tempLink` or the
-       `rename(2)` onto `path` surfaces as `ReplicaFull` so the
-       replica loop can advance — there is no need to "reserve
-       headroom" by pre-checking `st_nlink`; the kernel is the source
-       of truth. */
-    std::optional<MakeReadOnly> perCallReadOnly;
-    bool dirWritabilityEnsured = false;
-    auto ensureDirWritable = [&] {
-        if (dirWritabilityEnsured)
-            return;
-        dirWritabilityEnsured = true;
-        const auto dirOfPath = path.parent_path();
-        if (parentDirWritability) {
-            parentDirWritability->ensureWritable();
-        } else {
-            bool mustToggle = dirOfPath != config->realStoreDir.get();
-            if (mustToggle)
-                makeWritable(dirOfPath);
-            perCallReadOnly.emplace(mustToggle ? dirOfPath : std::filesystem::path{});
-        }
-    };
-
-    auto tryReplaceWith = [&](const std::filesystem::path & candidate) -> LinkResult {
-        ensureDirWritable();
-        auto tempLink = makeTempPath(config->realStoreDir.get(), ".tmp-link");
-
-        /* Record our source inode in `inodeHash` before linking so
-           that sibling files sharing this inode (hardlinked in the
-           user store path) can short-circuit the hash step in their
-           own `optimisePath_` call. This is advisory: if the link or
-           rename below fails, the worst outcome is that siblings
-           briefly skip dedup work that will be re-attempted on the
-           next optimise pass. */
-        inodeHash.insert(st.st_ino);
-
-        /* RAII guard: after `create_hard_link` succeeds the tempLink
-           exists on disk. Any exception that escapes before we
-           reach `release()` must remove it, or we leak an orphan
-           `.tmp-link-*` file every failed optimise. Covers
-           `filesystem_error` from `rename`, plus non-filesystem
-           exceptions (`std::bad_alloc`, interrupts surfaced as
-           `BaseError`, etc.) that the old per-catch cleanup missed. */
-        struct TempLinkGuard
-        {
-            const std::filesystem::path & p;
-            bool armed = false;
-            ~TempLinkGuard()
-            {
-                if (!armed)
-                    return;
-                /* Dtor runs during stack unwinding; swallow
-                   anything `printError` might throw (allocation
-                   failure, etc.) so we don't call std::terminate on
-                   top of the original exception. */
-                try {
-                    std::error_code ec;
-                    std::filesystem::remove(p, ec);
-                    if (ec && ec != std::errc::no_such_file_or_directory)
-                        printError("unable to unlink %1%: %2%", PathFmt(p), ec.message());
-                } catch (...) {
-                    ignoreExceptionInDestructor();
-                }
-            }
-            void arm() { armed = true; }
-            void release() { armed = false; }
-        } tempLinkGuard{tempLink};
-
-        try {
-            std::filesystem::create_hard_link(candidate, tempLink);
-            tempLinkGuard.arm();
-        } catch (std::filesystem::filesystem_error & e) {
-            if (e.code() == std::errc::too_many_links)
-                return LinkResult::ReplicaFull;
-            if (e.code() == std::errc::no_such_file_or_directory) {
-                /* GC unlinked `candidate` while we were working.
-                   Recreate from our own file; if that succeeds the
-                   caller is done, otherwise fall through and let
-                   the replica walk retry. */
-                if (tryCreateCanonicalAt(candidate) == LinkResult::Done)
-                    return LinkResult::Done;
-                return LinkResult::AlreadyExists;
-            }
-            throw SystemError(
-                e.code(), "creating hard link from %1% to %2%", PathFmt(candidate), PathFmt(tempLink));
-        }
-
-        try {
-            std::filesystem::rename(tempLink, path);
-            /* Success: `rename(2)` atomically moved `tempLink` onto
-               `path`, so there's no longer a tempLink name to
-               clean up. Disarm before the guard dtor runs. */
-            tempLinkGuard.release();
-        } catch (std::filesystem::filesystem_error & e) {
-            if (e.code() == std::errc::too_many_links)
-                return LinkResult::ReplicaFull;
-            if (e.code() == std::errc::no_such_file_or_directory) {
-                /* ENOENT from rename(2) can mean the source user file
-                   (`path`) or its parent was GC'd — benign — or that
-                   our freshly-created `tempLink` vanished, which
-                   would indicate a real bug. Disambiguate by
-                   re-lstat-ing `path`. */
-                if (!maybeLstat(path))
-                    return LinkResult::Done; /* source GC'd */
-                throw SystemError(
-                    e.code(),
-                    "renaming %1% to %2%: tempLink disappeared before rename",
-                    PathFmt(tempLink),
-                    PathFmt(path));
-            }
-            throw SystemError(e.code(), "renaming %1% to %2%", PathFmt(tempLink), PathFmt(path));
-        }
-
-        stats.filesLinked.fetch_add(1, std::memory_order_relaxed);
-        stats.bytesFreed.fetch_add(st.st_size, std::memory_order_relaxed);
-
-        if (act)
-            act->result(
-                resFileLinked,
-                st.st_size
-#ifndef _WIN32
-                ,
-                st.st_blocks
-#endif
-            );
-
-        return LinkResult::Done;
-    };
-
-    /* Walk replicas until we find one that's either our inode already
-       (done), has our content and can accept another hardlink
-       (replace), or can host a new canonical entry. EMLINK at any
-       step naturally drives us to the next replica. */
-    for (uint8_t replica = 0; replica < maxLinkReplicas; ++replica) {
-        auto candidate = linkPathFor(hash, replica);
-        auto stOpt = maybeLstat(candidate);
-
-        /* Corruption recovery: size/hash mismatch means a broken
-           entry. Remove it and retry this replica slot as empty. */
-        if (stOpt && isCorruptedAt(candidate, *stOpt)) {
+        if (corrupted) {
             warn("removing corrupted link %s", PathFmt(candidate));
             warn(
                 "There may be more corrupted paths."
@@ -533,174 +285,144 @@ void LocalStore::optimisePath_(
                 if (e.errNo != ENOENT)
                     throw;
             }
-            stOpt.reset();
+            stCanon.reset();
         }
-
-        if (!stOpt) {
-            auto r = tryCreateCanonicalAt(candidate);
-            if (r == LinkResult::Done)
-                return;
-            if (r == LinkResult::ReplicaFull)
-                /* Source inode already has `linkMax` references —
-                   typically because a prior optimise pointed many
-                   user files at it. Next replica has independent
-                   link-count headroom. */
-                continue;
-            /* r == AlreadyExists: a concurrent process created the
-               entry between our lstat and our link. Fall through. */
-            stOpt = maybeLstat(candidate);
-            if (!stOpt)
-                continue; /* vanished again; try next replica */
-        }
-
-        if (st.st_ino == stOpt->st_ino) {
-            debug("%1% is already linked to %2%", PathFmt(path), PathFmt(candidate));
-            return;
-        }
-
-        /* Opportunistic pre-flight: if we can see from the lstat
-           that the candidate inode is already at the filesystem's
-           hardlink ceiling, skip the link(2) attempt entirely. A
-           racing writer that crosses the limit between here and
-           tryReplaceWith is handled by the EMLINK path in that
-           lambda, which advances to the next replica. */
-        if (static_cast<int64_t>(stOpt->st_nlink) >= linkMax) {
-            debug(
-                "replica %1% of %2% has %3%/%4% links, trying next",
-                replica,
-                hash.to_string(HashFormat::Nix32, false),
-                stOpt->st_nlink,
-                linkMax);
-            continue;
-        }
-
-        printMsg(lvlTalkative, "linking %1% to %2%", PathFmt(path), PathFmt(candidate));
-        auto r = tryReplaceWith(candidate);
-        if (r == LinkResult::Done)
-            return;
-        /* ReplicaFull (filled up between our lstat and link(2)) or
-           AlreadyExists (vanished + recreated by a racing optimiser):
-           either way, the current replica is unusable for this file.
-           Move on. */
     }
 
-    /* Exhausted all replicas; leave this file undeduped. */
-    if (st.st_size)
-        printInfo(
-            "%1% has maximum number of links across %2% replicas",
-            hash.to_string(HashFormat::Nix32, false),
-            maxLinkReplicas);
-}
-
-/* Bulk migration of legacy flat `.links/<H>` entries into the
-   sharded layout.
-
-   Normally a flat entry moves to `<pfx>/<H>.00` (the primary replica
-   slot). But if that slot is already occupied — which happens when
-   the feature was toggled off, then on again after new flat entries
-   were created alongside the existing sharded ones — we walk the
-   replica space looking for a free slot (`.01`, `.02`, ...). This
-   preserves dedup: the flat inode becomes an additional replica for
-   the same logical hash rather than being orphaned.
-
-   Idempotent (re-running finds nothing to move). Race-tolerant
-   under concurrent GC: ENOENT / EEXIST on the dst attempt are
-   benign, we skip or retry the next replica slot. */
-void LocalStore::migrateLinksDirToSharded()
-{
-    std::vector<std::filesystem::path> flatEntries;
-    for (auto & ent : DirectoryIterator{linksDir}) {
-        checkInterrupt();
+    /* Create the canonical entry if it doesn't exist. */
+    if (!stCanon) {
         std::error_code ec;
-        if (ent.is_directory(ec) && !ec)
-            continue; /* shard subdir, already migrated */
-        flatEntries.push_back(ent.path());
+        std::filesystem::create_hard_link(path, candidate, ec);
+        if (!ec) {
+            inodeHash.insert(st.st_ino);
+            return;
+        }
+        if (ec == std::errc::no_such_file_or_directory) {
+            /* Source GC'd between our lstat and the link. */
+            if (!maybeLstat(path))
+                return;
+            throw SysError(
+                "creating hard link from %1% to %2%: destination parent missing",
+                PathFmt(candidate),
+                PathFmt(path));
+        }
+        if (ec == std::errc::too_many_links) {
+            if (st.st_size)
+                printInfo("%1% has maximum number of links", PathFmt(candidate));
+            return;
+        }
+        if (ec == std::errc::no_space_on_device) {
+            /* On ext4, `.links/` htree exhaustion. Disable dedup for
+               this file. */
+            printInfo("cannot link %s to %s: %s", PathFmt(candidate), PathFmt(path), ec.message());
+            return;
+        }
+        if (ec != std::errc::file_exists)
+            throw SystemError(ec, "creating hard link from %1% to %2%", PathFmt(candidate), PathFmt(path));
+        /* file_exists: a concurrent optimiser created the entry. Fall
+           through and re-inspect. */
+        stCanon = maybeLstat(candidate);
+        if (!stCanon)
+            return;
     }
 
-    if (flatEntries.empty())
+    if (st.st_ino == stCanon->st_ino) {
+        debug("%1% is already linked to %2%", PathFmt(path), PathFmt(candidate));
         return;
-
-    printInfo("migrating %d flat `.links/` entries to the sharded layout...", flatEntries.size());
-
-    uint64_t migrated = 0;
-    for (auto & src : flatEntries) {
-        checkInterrupt();
-        auto hashStr = src.filename().string();
-        if (hashStr.size() < 2) {
-            /* Malformed entry — skip rather than crash. */
-            continue;
-        }
-        auto shardDir = linksDir / hashStr.substr(0, 2);
-
-        /* Walk replica slots. The common case is `.00` empty → one
-           `rename(2)` and done. If `.00` is occupied we first check
-           for the same-inode corner case (flat entry already
-           hardlinked to its sharded counterpart — outside-of-Nix
-           tampering); otherwise we spill into the next replica. This
-           preserves the flat inode as an additional canonical
-           replica; subsequent `optimiseStore` runs will coalesce
-           user-store-path inodes toward `.00` via the normal replica
-           walk. */
-        bool done = false;
-        for (uint8_t replica = 0; replica < maxLinkReplicas; ++replica) {
-            char suffix[4];
-            std::snprintf(suffix, sizeof suffix, ".%02u", static_cast<unsigned>(replica));
-            auto dst = shardDir / (hashStr + suffix);
-            std::error_code ec;
-            std::filesystem::rename(src, dst, ec);
-            if (!ec) {
-                ++migrated;
-                done = true;
-                break;
-            }
-            if (ec == std::errc::no_such_file_or_directory) {
-                done = true;
-                break;
-            }
-            if (ec == std::errc::file_exists) {
-                /* On `.00` only: check for the same-inode case.
-                   Reaching this branch means a rename already
-                   attempted this slot, so we pay the two lstats
-                   exactly once per migrated entry in the pathological
-                   case — not per entry overall. */
-                if (replica == 0) {
-                    auto srcStat = maybeLstat(src);
-                    if (!srcStat) {
-                        done = true;
-                        break; /* vanished under us */
-                    }
-                    if (auto primaryStat = maybeLstat(dst);
-                        primaryStat && primaryStat->st_ino == srcStat->st_ino) {
-                        warn(
-                            "flat entry %1% shares an inode with its sharded counterpart; "
-                            "removing the redundant flat entry. This should not happen in "
-                            "normal Nix operation — please report if you did not perform "
-                            "manual intervention on `.links/`.",
-                            PathFmt(src));
-                        try {
-                            nix::unlink(src);
-                            ++migrated;
-                        } catch (SysError & e) {
-                            if (e.errNo != ENOENT)
-                                throw;
-                        }
-                        done = true;
-                        break;
-                    }
-                }
-                continue; /* slot taken by different inode — try next */
-            }
-            throw SystemError(ec, "migrating %1% to sharded layout", PathFmt(src));
-        }
-        if (!done) {
-            printInfo(
-                "could not migrate %1%: all %2% replica slots occupied",
-                PathFmt(src),
-                static_cast<unsigned>(maxLinkReplicas));
-        }
     }
 
-    printInfo("migrated %d flat entries to the sharded layout", migrated);
+    /* Replace `path` with a hardlink to `candidate` via tempLink +
+       rename(2). EMLINK at either step is "too many links to the
+       canonical inode" — give up on dedup for this file. */
+    const auto dirOfPath = path.parent_path();
+    std::optional<MakeReadOnly> perCallReadOnly;
+    if (parentDirWritability) {
+        parentDirWritability->ensureWritable();
+    } else {
+        bool mustToggle = dirOfPath != config->realStoreDir.get();
+        if (mustToggle)
+            makeWritable(dirOfPath);
+        perCallReadOnly.emplace(mustToggle ? dirOfPath : std::filesystem::path{});
+    }
+
+    auto tempLink = makeTempPath(config->realStoreDir.get(), ".tmp-link");
+
+    /* Record our source inode in `inodeHash` before linking so sibling
+       files sharing this inode can short-circuit the hash step. */
+    inodeHash.insert(st.st_ino);
+
+    /* RAII guard: after `create_hard_link` succeeds the tempLink
+       exists on disk. Any exception before `release()` must remove it
+       or we leak an orphan `.tmp-link-*`. */
+    struct TempLinkGuard
+    {
+        const std::filesystem::path & p;
+        bool armed = false;
+        ~TempLinkGuard()
+        {
+            if (!armed)
+                return;
+            try {
+                std::error_code ec;
+                std::filesystem::remove(p, ec);
+                if (ec && ec != std::errc::no_such_file_or_directory)
+                    printError("unable to unlink %1%: %2%", PathFmt(p), ec.message());
+            } catch (...) {
+                ignoreExceptionInDestructor();
+            }
+        }
+        void arm() { armed = true; }
+        void release() { armed = false; }
+    } tempLinkGuard{tempLink};
+
+    try {
+        std::filesystem::create_hard_link(candidate, tempLink);
+        tempLinkGuard.arm();
+    } catch (std::filesystem::filesystem_error & e) {
+        if (e.code() == std::errc::too_many_links) {
+            if (st.st_size)
+                printInfo("%1% has maximum number of links", PathFmt(candidate));
+            return;
+        }
+        throw SystemError(
+            e.code(), "creating hard link from %1% to %2%", PathFmt(candidate), PathFmt(tempLink));
+    }
+
+    try {
+        std::filesystem::rename(tempLink, path);
+        tempLinkGuard.release();
+    } catch (std::filesystem::filesystem_error & e) {
+        if (e.code() == std::errc::too_many_links) {
+            /* Some FSes raise EMLINK on rename rather than link, by
+               briefly bumping nlink during the operation. */
+            debug("%s has reached maximum number of links", PathFmt(candidate));
+            return;
+        }
+        if (e.code() == std::errc::no_such_file_or_directory) {
+            /* Source GC'd while we were working. */
+            if (!maybeLstat(path))
+                return;
+            throw SystemError(
+                e.code(),
+                "renaming %1% to %2%: tempLink disappeared before rename",
+                PathFmt(tempLink),
+                PathFmt(path));
+        }
+        throw SystemError(e.code(), "renaming %1% to %2%", PathFmt(tempLink), PathFmt(path));
+    }
+
+    stats.filesLinked.fetch_add(1, std::memory_order_relaxed);
+    stats.bytesFreed.fetch_add(st.st_size, std::memory_order_relaxed);
+
+    if (act)
+        act->result(
+            resFileLinked,
+            st.st_size
+#ifndef _WIN32
+            ,
+            st.st_blocks
+#endif
+        );
 }
 
 void LocalStore::optimiseStore(OptimiseStats & stats)
@@ -722,14 +444,6 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         printInfo("waiting for exclusive access to optimise the Nix store...");
         lockFile(fdOptLock.get(), ltWrite, true);
     }
-
-    /* If the sharded-links feature is enabled, first migrate any
-       pre-existing legacy flat entries into their shards. One-shot;
-       subsequent `optimisePath_` calls use `linkPathFor` exclusively
-       and place new canonical entries directly into the sharded
-       layout. */
-    if (shardedLinks)
-        migrateLinksDirToSharded();
 
     /* `std::set` has no random access, so materialise into a vector
        for index-based partitioning across workers. */

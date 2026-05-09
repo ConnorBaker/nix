@@ -101,14 +101,11 @@ struct FixtureSpec
 struct ContentPool
 {
     static constexpr size_t kPoolSize = 256;
-    static constexpr size_t kHardlinkCap = 4096;
 
     std::vector<std::string> blobs;
-    std::vector<size_t> usage;
     std::discrete_distribution<size_t> picker;
 
     explicit ContentPool(std::mt19937_64 & rng)
-        : usage(kPoolSize, 0)
     {
         std::lognormal_distribution<double> sizeDist(std::log(4096.0), 1.0);
         std::uniform_int_distribution<int> byteDist(0, 255);
@@ -121,36 +118,14 @@ struct ContentPool
             for (auto & c : blob)
                 c = static_cast<char>(byteDist(rng));
             blobs.push_back(std::move(blob));
-            /* sqrt-Zipf: heavy tail, but no single blob dominates
-               enough to blow past kHardlinkCap at the fixture sizes
-               we sweep. */
             weights[i] = 1.0 / std::sqrt(double(i + 1));
         }
         picker = std::discrete_distribution<size_t>(weights.begin(), weights.end());
     }
 
-    /* Returns a blob index. Caps per-blob hardlink count by rotating
-       to the next non-saturated blob. Phase-1-only — must be called
-       sequentially. Phase 2 reads `blobs[idx]` without touching usage. */
     size_t pickIdx(std::mt19937_64 & rng)
     {
-        for (int tries = 0; tries < 16; ++tries) {
-            size_t i = picker(rng);
-            if (usage[i] < kHardlinkCap) {
-                ++usage[i];
-                return i;
-            }
-        }
-        for (size_t i = 0; i < blobs.size(); ++i) {
-            if (usage[i] < kHardlinkCap) {
-                ++usage[i];
-                return i;
-            }
-        }
-        /* Pool exhausted — should be impossible at supported sizes
-           (256 blobs × 4096 cap = 1 048 576 dedup slots, vs ~0.6 ×
-           avgFilesPerPath × nPaths typical demand). */
-        return 0;
+        return picker(rng);
     }
 };
 
@@ -404,12 +379,10 @@ struct SettingsGuard
 {
     size_t savedOptimiseThreads;
     size_t savedGcLinksThreads;
-    std::set<ExperimentalFeature> savedExperimentalFeatures;
 
     SettingsGuard()
         : savedOptimiseThreads(settings.getLocalSettings().optimiseThreads.get())
         , savedGcLinksThreads(settings.getLocalSettings().getGCSettings().gcLinksThreads.get())
-        , savedExperimentalFeatures(experimentalFeatureSettings.experimentalFeatures.get())
     {
     }
 
@@ -417,24 +390,11 @@ struct SettingsGuard
     {
         settings.getLocalSettings().optimiseThreads.override(savedOptimiseThreads);
         settings.getLocalSettings().getGCSettings().gcLinksThreads.override(savedGcLinksThreads);
-        experimentalFeatureSettings.experimentalFeatures.override(savedExperimentalFeatures);
     }
 
     SettingsGuard(const SettingsGuard &) = delete;
     SettingsGuard & operator=(const SettingsGuard &) = delete;
 };
-
-/* Toggle the `sharded-links` experimental feature for the duration of
-   the current benchmark iteration. */
-static void setShardedLinks(bool enabled)
-{
-    auto features = experimentalFeatureSettings.experimentalFeatures.get();
-    if (enabled)
-        features.insert(Xp::ShardedLinks);
-    else
-        features.erase(Xp::ShardedLinks);
-    experimentalFeatureSettings.experimentalFeatures.override(features);
-}
 
 /* Serialise all benchmarks in this file against any future parallel
    benchmark runner. google-benchmark's current behaviour is fully
@@ -506,13 +466,9 @@ static void BM_OptimiseStore(benchmark::State & state)
     const size_t nPaths = state.range(0);
     const size_t nShared = 10;
     const size_t threads = state.range(1);
-    const bool sharded = state.range(2) != 0;
 
     for (auto _ : state) {
         state.PauseTiming();
-        /* Toggle the experimental feature BEFORE opening the store,
-           since `LocalStore::shardedLinks` is captured in the ctor. */
-        setShardedLinks(sharded);
         BenchFixture fixture(nPaths, nShared);
         settings.getLocalSettings().optimiseThreads.override(threads);
         state.ResumeTiming();
@@ -529,33 +485,20 @@ static void BM_OptimiseStore(benchmark::State & state)
 }
 
 BENCHMARK(BM_OptimiseStore)
-    /* (nPaths, threads, sharded). Sharded=1 enables the
-       `sharded-links` experimental feature so `.links/` splits across
-       1024 subdirectories, reducing directory rwsem contention. */
-    ->Args({200, 1, 0})
-    ->Args({200, 4, 0})
-    ->Args({200, 16, 0})
-    ->Args({2000, 1, 0})
-    ->Args({2000, 4, 0})
-    ->Args({2000, 16, 0})
-    ->Args({10000, 1, 0})
-    ->Args({10000, 4, 0})
-    ->Args({10000, 16, 0})
-    ->Args({200, 1, 1})
-    ->Args({200, 4, 1})
-    ->Args({200, 16, 1})
-    ->Args({2000, 1, 1})
-    ->Args({2000, 4, 1})
-    ->Args({2000, 16, 1})
-    ->Args({10000, 1, 1})
-    ->Args({10000, 4, 1})
-    ->Args({10000, 16, 1})
+    /* (nPaths, optimise-threads). */
+    ->Args({200, 1})
+    ->Args({200, 4})
+    ->Args({200, 16})
+    ->Args({2000, 1})
+    ->Args({2000, 4})
+    ->Args({2000, 16})
+    ->Args({10000, 1})
+    ->Args({10000, 4})
+    ->Args({10000, 16})
     /* Large fixtures: only the high-thread cases — single-threaded
        runs at this size are dominated by setup, not signal. */
-    ->Args({50000, 4, 0})
-    ->Args({50000, 16, 0})
-    ->Args({50000, 4, 1})
-    ->Args({50000, 16, 1})
+    ->Args({50000, 4})
+    ->Args({50000, 16})
     ->Unit(benchmark::kMillisecond);
 
 /* ---------- BM_OptimiseConcurrentGC -----------------------------------
@@ -595,11 +538,9 @@ static void BM_OptimiseConcurrentGC(benchmark::State & state)
     const size_t nPaths = state.range(0);
     const size_t optThreads = state.range(1);
     const size_t gcThreads = state.range(2);
-    const bool sharded = state.range(3) != 0;
 
     for (auto _ : state) {
         state.PauseTiming();
-        setShardedLinks(sharded);
         BenchFixture fixture(nPaths, /*nShared=*/8);
         settings.getLocalSettings().optimiseThreads.override(optThreads);
         settings.getLocalSettings().getGCSettings().gcLinksThreads.override(gcThreads);
@@ -644,32 +585,20 @@ static void BM_OptimiseConcurrentGC(benchmark::State & state)
 }
 
 BENCHMARK(BM_OptimiseConcurrentGC)
-    /* (nPaths, optThreads, gcThreads, sharded). */
-    ->Args({200, 1, 1, 0})
-    ->Args({200, 4, 4, 0})
-    ->Args({200, 16, 16, 0})
-    ->Args({2000, 1, 1, 0})
-    ->Args({2000, 4, 4, 0})
-    ->Args({2000, 16, 16, 0})
-    ->Args({2000, 16, 1, 0})
-    ->Args({2000, 1, 16, 0})
-    ->Args({200, 1, 1, 1})
-    ->Args({200, 4, 4, 1})
-    ->Args({200, 16, 16, 1})
-    ->Args({2000, 1, 1, 1})
-    ->Args({2000, 4, 4, 1})
-    ->Args({2000, 16, 16, 1})
-    ->Args({2000, 16, 1, 1})
-    ->Args({2000, 1, 16, 1})
+    /* (nPaths, optimise-threads, gc-links-threads). */
+    ->Args({200, 1, 1})
+    ->Args({200, 4, 4})
+    ->Args({200, 16, 16})
+    ->Args({2000, 1, 1})
+    ->Args({2000, 4, 4})
+    ->Args({2000, 16, 16})
+    ->Args({2000, 16, 1})
+    ->Args({2000, 1, 16})
     /* Larger fixtures — exercise contention at realistic scale. */
-    ->Args({10000, 4, 4, 0})
-    ->Args({10000, 16, 16, 0})
-    ->Args({10000, 4, 4, 1})
-    ->Args({10000, 16, 16, 1})
-    ->Args({50000, 4, 4, 0})
-    ->Args({50000, 16, 16, 0})
-    ->Args({50000, 4, 4, 1})
-    ->Args({50000, 16, 16, 1})
+    ->Args({10000, 4, 4})
+    ->Args({10000, 16, 16})
+    ->Args({50000, 4, 4})
+    ->Args({50000, 16, 16})
     ->Unit(benchmark::kMillisecond);
 
 /* ---------- BM_CollectGarbage -----------------------------------------
@@ -694,11 +623,9 @@ static void BM_CollectGarbage(benchmark::State & state)
 
     const size_t nPaths = state.range(0);
     const size_t threads = state.range(1);
-    const bool sharded = state.range(2) != 0;
 
     for (auto _ : state) {
         state.PauseTiming();
-        setShardedLinks(sharded);
         BenchFixture fixture(nPaths, /*nShared=*/10);
         settings.getLocalSettings().optimiseThreads.override(std::min<size_t>(threads, 8));
         settings.getLocalSettings().getGCSettings().gcLinksThreads.override(threads);
@@ -722,27 +649,17 @@ static void BM_CollectGarbage(benchmark::State & state)
 }
 
 BENCHMARK(BM_CollectGarbage)
-    /* (nPaths, gcLinksThreads, sharded). */
-    ->Args({200, 1, 0})
-    ->Args({200, 16, 0})
-    ->Args({2000, 1, 0})
-    ->Args({2000, 4, 0})
-    ->Args({2000, 16, 0})
-    ->Args({10000, 1, 0})
-    ->Args({10000, 4, 0})
-    ->Args({10000, 16, 0})
-    ->Args({200, 1, 1})
-    ->Args({200, 16, 1})
-    ->Args({2000, 1, 1})
-    ->Args({2000, 4, 1})
-    ->Args({2000, 16, 1})
-    ->Args({10000, 1, 1})
-    ->Args({10000, 4, 1})
-    ->Args({10000, 16, 1})
-    ->Args({50000, 4, 0})
-    ->Args({50000, 16, 0})
-    ->Args({50000, 4, 1})
-    ->Args({50000, 16, 1})
+    /* (nPaths, gc-links-threads). */
+    ->Args({200, 1})
+    ->Args({200, 16})
+    ->Args({2000, 1})
+    ->Args({2000, 4})
+    ->Args({2000, 16})
+    ->Args({10000, 1})
+    ->Args({10000, 4})
+    ->Args({10000, 16})
+    ->Args({50000, 4})
+    ->Args({50000, 16})
     ->Unit(benchmark::kMillisecond);
 
 /* ---------- BM_InvalidatePathsChecked ---------------------------------

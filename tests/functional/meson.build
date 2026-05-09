@@ -90,7 +90,6 @@ suites = [
       'gc-batched-invalidation.sh',
       'gc-optimise-concurrent.sh',
       'gc-keep-flags.sh',
-      'sharded-links.sh',
       'substitute-with-invalid-ca.sh',
       'signing.sh',
       'hash-convert.sh',
