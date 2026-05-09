@@ -10,21 +10,193 @@
 
 #ifndef _WIN32
 
+#  include "nix/util/file-descriptor.hh"
+#  include "nix/util/thread-pool.hh"
+
+#  include <fcntl.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
+
 #  include <algorithm>
+#  include <cmath>
+#  include <cstdint>
 #  include <filesystem>
-#  include <fstream>
 #  include <mutex>
+#  include <random>
 #  include <string>
 #  include <thread>
+#  include <vector>
 
 using namespace nix;
 
 namespace {
 
-/* Create a fresh LocalStore backed by a tmp dir, register `nPaths`
-   each containing `nShared` files with identical content plus a few
-   unique files. This is a tight approximation of a typical Nix store
-   layout post-auto-optimise.
+/* ---------------------------------------------------------------------------
+   Fixture model
+
+   The fixture builds a synthetic Nix store with three properties chosen
+   to stress the same code paths a real store does:
+
+     1. Heavy-tailed in-degree distribution. A small "platform" head
+        (the first `platformSize()` paths, with no references) plays the
+        role of glibc / bash / coreutils. Application paths are added in
+        topological order using Barabási–Albert preferential attachment:
+        each new path's references are sampled from `targets`, where
+        each existing path appears once per incoming edge. The result is
+        a power-law in-degree distribution dominated by a few hubs —
+        which is what the snapshot-driven GC's hot path is amortising
+        across.
+
+     2. Variable file count and size. Per-path file count is geometric
+        with mean `avgFilesPerPath`. Per-file size is log-normal
+        (median ~1 KiB, p99 ~10 KiB), clamped to [32 B, 256 KiB]. Yields
+        the long-tailed "many small files, occasional bigger blob" shape
+        of real packages.
+
+     3. Realistic content sharing. A pool of 256 deterministic blobs
+        (log-normal sized, median ~4 KiB) supplies dedup-eligible
+        content. Each file picks "from the pool" with probability 0.6
+        (weighted by sqrt-Zipf so a few blobs are very popular), or
+        "fresh random" with probability 0.4. Per-blob hardlink usage is
+        capped at 4096 to stay well below ext4's EMLINK ceiling at any
+        fixture size.
+
+   GC roots: ceil(sqrt(nPaths)) randomly selected non-platform paths
+   are registered as permanent roots, so `collectGarbage(gcDeleteDead)`
+   actually exercises the live-closure walk instead of deleting
+   everything.
+
+   Determinism: every random draw is seeded from `(nPaths,
+   avgFilesPerPath)` via the FNV-style mixer in `FixtureSpec::seed()`.
+   Same args ⇒ byte-identical fixture across runs and machines. No
+   files are checked into the tree.
+   --------------------------------------------------------------------------- */
+
+struct FixtureSpec
+{
+    size_t nPaths;
+    size_t avgFilesPerPath;
+
+    size_t platformSize() const
+    {
+        return std::clamp<size_t>(nPaths / 100, 10, 200);
+    }
+
+    size_t nRoots() const
+    {
+        return std::max<size_t>(1, static_cast<size_t>(std::sqrt(double(nPaths))));
+    }
+
+    uint64_t seed() const
+    {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint64_t v : {uint64_t(nPaths), uint64_t(avgFilesPerPath)}) {
+            h ^= v;
+            h *= 0x100000001b3ull;
+        }
+        return h;
+    }
+};
+
+struct ContentPool
+{
+    static constexpr size_t kPoolSize = 256;
+    static constexpr size_t kHardlinkCap = 4096;
+
+    std::vector<std::string> blobs;
+    std::vector<size_t> usage;
+    std::discrete_distribution<size_t> picker;
+
+    explicit ContentPool(std::mt19937_64 & rng)
+        : usage(kPoolSize, 0)
+    {
+        std::lognormal_distribution<double> sizeDist(std::log(4096.0), 1.0);
+        std::uniform_int_distribution<int> byteDist(0, 255);
+        std::vector<double> weights(kPoolSize);
+        blobs.reserve(kPoolSize);
+        for (size_t i = 0; i < kPoolSize; ++i) {
+            size_t sz = std::clamp<size_t>(
+                static_cast<size_t>(sizeDist(rng)), 64, 256 * 1024);
+            std::string blob(sz, '\0');
+            for (auto & c : blob)
+                c = static_cast<char>(byteDist(rng));
+            blobs.push_back(std::move(blob));
+            /* sqrt-Zipf: heavy tail, but no single blob dominates
+               enough to blow past kHardlinkCap at the fixture sizes
+               we sweep. */
+            weights[i] = 1.0 / std::sqrt(double(i + 1));
+        }
+        picker = std::discrete_distribution<size_t>(weights.begin(), weights.end());
+    }
+
+    /* Returns a blob index. Caps per-blob hardlink count by rotating
+       to the next non-saturated blob. Phase-1-only — must be called
+       sequentially. Phase 2 reads `blobs[idx]` without touching usage. */
+    size_t pickIdx(std::mt19937_64 & rng)
+    {
+        for (int tries = 0; tries < 16; ++tries) {
+            size_t i = picker(rng);
+            if (usage[i] < kHardlinkCap) {
+                ++usage[i];
+                return i;
+            }
+        }
+        for (size_t i = 0; i < blobs.size(); ++i) {
+            if (usage[i] < kHardlinkCap) {
+                ++usage[i];
+                return i;
+            }
+        }
+        /* Pool exhausted — should be impossible at supported sizes
+           (256 blobs × 4096 cap = 1 048 576 dedup slots, vs ~0.6 ×
+           avgFilesPerPath × nPaths typical demand). */
+        return 0;
+    }
+};
+
+/* Per-file plan written by phase 1, consumed by phase 2. */
+struct FileSpec
+{
+    int32_t blobIdx;     /* >=0: index into ContentPool::blobs; -1: unique */
+    uint32_t uniqueSize; /* only used if blobIdx == -1 */
+};
+
+struct PathPlan
+{
+    StorePath storePath;
+    std::vector<FileSpec> files;
+    uint64_t fileSeedBase; /* per-path seed for unique-content RNG */
+
+    PathPlan(StorePath sp, uint64_t seed)
+        : storePath(std::move(sp))
+        , fileSeedBase(seed)
+    {
+    }
+};
+
+/* Generate `sz` deterministic-but-unique bytes from `seed` directly
+   into `fd`. 8 bytes per RNG call (vs 1 byte/call when sampling
+   uniform_int<0,255>); ~5× faster end-to-end. */
+static void writeUniqueBytes(int fd, size_t sz, uint64_t seed)
+{
+    std::mt19937_64 rng(seed);
+    constexpr size_t bufBytes = 4096;
+    uint64_t buf[bufBytes / sizeof(uint64_t)];
+    size_t written = 0;
+    while (written < sz) {
+        for (auto & w : buf)
+            w = rng();
+        size_t toWrite = std::min(bufBytes, sz - written);
+        writeFull(fd, std::string_view(reinterpret_cast<const char *>(buf), toWrite));
+        written += toWrite;
+    }
+}
+
+/* Create a fresh LocalStore backed by a tmp dir, populate it with
+   `nPaths` synthetic store entries shaped per the fixture model
+   above. `avgFilesPerPath` sets the geometric-distribution mean for
+   per-path file count; the legacy second argument is repurposed
+   without changing call sites.
 
    Returns a RAII bundle that deletes the tree on destruction. */
 struct BenchFixture
@@ -32,70 +204,158 @@ struct BenchFixture
     std::filesystem::path root;
     ref<Store> store;
 
-    BenchFixture(size_t nPaths, size_t nShared)
+    BenchFixture(size_t nPaths, size_t avgFilesPerPath)
         : root(createTempDir())
         , store(
               (std::filesystem::create_directories(root / "nix/store"),
                openStore(fmt("local?root=%s", root.string()))))
     {
         auto & local = this->local();
+        FixtureSpec spec{nPaths, avgFilesPerPath};
+        std::mt19937_64 rng(spec.seed());
 
-        /* Write N fake store paths, each containing `nShared` files
-           and one unique file. Shared-file contents are parameterised
-           over a "group" id derived from the path index so that:
-             (a) dedup still exercises `.links/` (paths in the same
-                 group get identical shared files), and
-             (b) no single `.links/<hash>` entry exceeds the ext4
-                 65 000-hardlink ceiling even for large fixtures.
+        ContentPool pool(rng);
 
-           Group size = 4096 means `.links/` accumulates ~nPaths*nShared
-           / 4096 distinct hashes. For 10k paths × 10 files that's
-           ~24 entries — more than enough to exercise directory-level
-           contention without hitting EMLINK. */
-        constexpr size_t groupSize = 4096;
+        std::geometric_distribution<size_t> fileCountDist(
+            1.0 / std::max<double>(1.0, double(avgFilesPerPath)));
+        std::poisson_distribution<size_t> outDegreeDist(6.0);
+        std::bernoulli_distribution dedupCoin(0.6);
+        std::bernoulli_distribution uniformRefCoin(0.3);
+        std::lognormal_distribution<double> uniqueSizeDist(std::log(1024.0), 1.0);
+
         ValidPathInfos infos;
-        auto makeReadOnly = [](const std::filesystem::path & p) {
-            /* Store files must be read-only or `optimisePath_` skips
-               them as "suspicious writable files". */
-            std::filesystem::permissions(
-                p,
-                std::filesystem::perms::owner_read
-                | std::filesystem::perms::group_read
-                | std::filesystem::perms::others_read);
-        };
+        std::vector<StorePath> pathByIndex;
+        pathByIndex.reserve(nPaths);
+        std::vector<PathPlan> plans;
+        plans.reserve(nPaths);
+
+        /* Barabási–Albert "targets" pool: each existing path appears
+           once per incoming edge. Sampling uniformly from this list
+           gives selection probability proportional to (in-degree),
+           yielding the heavy-tailed distribution. Mixed with uniform
+           sampling at probability 0.3 so brand-new paths still get
+           occasional references. */
+        std::vector<size_t> targets;
+        targets.reserve(size_t(nPaths * 6 * 1.3));
+
+        const size_t platform = spec.platformSize();
+        const std::string storeDir = (root / "nix/store").string();
+
+        /* ----- Phase 1: sequential plan construction (CPU-only) ----- */
         for (size_t i = 0; i < nPaths; ++i) {
-            auto drvPath = StorePath::random(fmt("optimise-bench-%d", i));
-            auto pathDir = root / "nix/store" / std::string(drvPath.to_string());
-            std::filesystem::create_directory(pathDir);
+            auto storePath = StorePath::random(fmt("optimise-bench-%zu", i));
+            pathByIndex.push_back(storePath);
+            PathPlan plan(storePath, spec.seed() ^ (uint64_t(i) * 0x9e3779b97f4a7c15ull));
 
-            /* Group id varies every `groupSize` paths so the shared
-               content rotates. */
-            auto group = i / groupSize;
-            std::string sharedContent(4096, static_cast<char>('A' + (group % 26)));
-
-            for (size_t j = 0; j < nShared; ++j) {
-                auto p = pathDir / fmt("shared-%d", j);
-                std::ofstream out(p, std::ios::binary);
-                /* Mix group id + file index so each (group, j) pair
-                   hashes distinctly. */
-                out.write(sharedContent.data(), sharedContent.size());
-                out.put(static_cast<char>('a' + j));
-                out.close();
-                makeReadOnly(p);
+            size_t fileCount = 1 + fileCountDist(rng);
+            uint64_t totalBytes = 0;
+            plan.files.reserve(fileCount);
+            for (size_t f = 0; f < fileCount; ++f) {
+                FileSpec fs{};
+                if (dedupCoin(rng)) {
+                    fs.blobIdx = static_cast<int32_t>(pool.pickIdx(rng));
+                    totalBytes += pool.blobs[fs.blobIdx].size();
+                } else {
+                    fs.blobIdx = -1;
+                    fs.uniqueSize = std::clamp<uint32_t>(
+                        static_cast<uint32_t>(uniqueSizeDist(rng)), 32, 256 * 1024);
+                    totalBytes += fs.uniqueSize;
+                }
+                plan.files.push_back(fs);
             }
 
-            std::string unique = fmt("unique-%d", i);
-            auto up = pathDir / "unique";
-            std::ofstream uf(up, std::ios::binary);
-            uf.write(unique.data(), unique.size());
-            uf.close();
-            makeReadOnly(up);
+            ValidPathInfo info{plan.storePath, UnkeyedValidPathInfo(local, Hash::dummy)};
+            info.narSize = totalBytes;
 
-            ValidPathInfo info{drvPath, UnkeyedValidPathInfo(local, Hash::dummy)};
-            info.narSize = (sharedContent.size() + 1) * nShared + unique.size();
-            infos.emplace(drvPath, std::move(info));
+            /* Platform paths (i < platform) have no references — they
+               are the leaves of the dependency DAG, like glibc. */
+            if (i >= platform && i > 0) {
+                size_t k = std::min(outDegreeDist(rng), i);
+                std::set<size_t> chosen;
+                size_t attempts = 0;
+                while (chosen.size() < k && attempts < k * 4) {
+                    ++attempts;
+                    size_t pick;
+                    if (targets.empty() || uniformRefCoin(rng)) {
+                        std::uniform_int_distribution<size_t> u(0, i - 1);
+                        pick = u(rng);
+                    } else {
+                        std::uniform_int_distribution<size_t> u(0, targets.size() - 1);
+                        pick = targets[u(rng)];
+                    }
+                    chosen.insert(pick);
+                }
+                StorePathSet refs;
+                for (size_t idx : chosen) {
+                    refs.insert(pathByIndex[idx]);
+                    targets.push_back(idx);
+                }
+                info.references = std::move(refs);
+            }
+
+            /* Seed the platform layer in `targets` once each so the
+               first application paths can pick them. */
+            if (i < platform)
+                targets.push_back(i);
+
+            infos.emplace(plan.storePath, std::move(info));
+            plans.push_back(std::move(plan));
         }
+
+        /* ----- Phase 2: parallel file I/O ----- */
+        size_t writeThreads = std::clamp<size_t>(
+            std::thread::hardware_concurrency(), 1, 16);
+        parallelForEachChunked(plans, writeThreads, /*maxChunkSize=*/256, [&](const PathPlan & plan) {
+            std::string pathDir = storeDir + "/" + std::string(plan.storePath.to_string());
+            if (::mkdir(pathDir.c_str(), 0755) != 0)
+                throw SysError("mkdir %s", pathDir);
+            for (size_t f = 0; f < plan.files.size(); ++f) {
+                std::string fp = pathDir + "/f-" + std::to_string(f);
+                /* Mode 0444 at create-time avoids a follow-up chmod
+                   call. With normal umask 022 the resulting mode is
+                   0444; with restrictive umasks (077) it's 0400 —
+                   either way it's read-only, which is what
+                   `optimisePath_` requires. */
+                int fd = ::open(fp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0444);
+                if (fd < 0)
+                    throw SysError("open %s", fp);
+                const auto & fs = plan.files[f];
+                try {
+                    if (fs.blobIdx >= 0) {
+                        const auto & blob = pool.blobs[fs.blobIdx];
+                        writeFull(fd, std::string_view(blob.data(), blob.size()));
+                    } else {
+                        writeUniqueBytes(
+                            fd, fs.uniqueSize,
+                            plan.fileSeedBase ^ (uint64_t(f) * 0xbf58476d1ce4e5b9ull));
+                    }
+                } catch (...) {
+                    ::close(fd);
+                    throw;
+                }
+                ::close(fd);
+            }
+        });
+
+        /* ----- Phase 3: register paths and roots ----- */
         local.registerValidPaths(infos);
+
+        /* Register sqrt(nPaths) random non-platform paths as permanent
+           GC roots. Without this, `collectGarbage(gcDeleteDead)` has
+           an empty live set and the liveness traversal does no work. */
+        if (nPaths > platform) {
+            auto rootsDir = root / "gcroots";
+            std::filesystem::create_directories(rootsDir);
+            std::uniform_int_distribution<size_t> rootPick(platform, nPaths - 1);
+            std::set<size_t> rootIndices;
+            size_t want = std::min(spec.nRoots(), nPaths - platform);
+            while (rootIndices.size() < want)
+                rootIndices.insert(rootPick(rng));
+            for (size_t idx : rootIndices) {
+                auto link = rootsDir / fmt("r-%zu", idx);
+                local.addPermRoot(pathByIndex[idx], link);
+            }
+        }
     }
 
     LocalStore & local()
@@ -290,6 +550,12 @@ BENCHMARK(BM_OptimiseStore)
     ->Args({10000, 1, 1})
     ->Args({10000, 4, 1})
     ->Args({10000, 16, 1})
+    /* Large fixtures: only the high-thread cases — single-threaded
+       runs at this size are dominated by setup, not signal. */
+    ->Args({50000, 4, 0})
+    ->Args({50000, 16, 0})
+    ->Args({50000, 4, 1})
+    ->Args({50000, 16, 1})
     ->Unit(benchmark::kMillisecond);
 
 /* ---------- BM_OptimiseConcurrentGC -----------------------------------
@@ -395,6 +661,15 @@ BENCHMARK(BM_OptimiseConcurrentGC)
     ->Args({2000, 16, 16, 1})
     ->Args({2000, 16, 1, 1})
     ->Args({2000, 1, 16, 1})
+    /* Larger fixtures — exercise contention at realistic scale. */
+    ->Args({10000, 4, 4, 0})
+    ->Args({10000, 16, 16, 0})
+    ->Args({10000, 4, 4, 1})
+    ->Args({10000, 16, 16, 1})
+    ->Args({50000, 4, 4, 0})
+    ->Args({50000, 16, 16, 0})
+    ->Args({50000, 4, 4, 1})
+    ->Args({50000, 16, 16, 1})
     ->Unit(benchmark::kMillisecond);
 
 /* ---------- BM_CollectGarbage -----------------------------------------
@@ -464,6 +739,10 @@ BENCHMARK(BM_CollectGarbage)
     ->Args({10000, 1, 1})
     ->Args({10000, 4, 1})
     ->Args({10000, 16, 1})
+    ->Args({50000, 4, 0})
+    ->Args({50000, 16, 0})
+    ->Args({50000, 4, 1})
+    ->Args({50000, 16, 1})
     ->Unit(benchmark::kMillisecond);
 
 /* ---------- BM_InvalidatePathsChecked ---------------------------------
@@ -499,6 +778,7 @@ BENCHMARK(BM_InvalidatePathsChecked)
     ->Arg(500)
     ->Arg(2000)
     ->Arg(10000)
+    ->Arg(50000)
     ->Unit(benchmark::kMillisecond);
 
 #endif
