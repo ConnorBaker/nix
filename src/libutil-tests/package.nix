@@ -34,6 +34,9 @@ mkMesonExecutable (finalAttrs: {
     ../../.version
     ./.version
     ./meson.build
+    ./gdp/meson.build
+    ./session-types/meson.build
+    ./singleton/meson.build
     ./unix/meson.build
     # ./meson.options
     (fileset.fileFilter (file: file.hasExt "cc") ./.)

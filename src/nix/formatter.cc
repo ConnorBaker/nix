@@ -94,10 +94,6 @@ struct CmdFormatterRun : MixFormatter, MixJSON
         StringMap env = getEnv();
         env["PRJ_ROOT"] = flakeDir.string();
 
-        // Release our references to eval caches to ensure they are persisted to disk, because
-        // we are about to exec out of this process without running C++ destructors.
-        evalState->evalCaches.clear();
-
         execProgramInStore(
             store,
             UseLookupPath::DontUse,

@@ -7,6 +7,9 @@
 #include "nix/util/file-content-address.hh"
 #include "nix/fetchers/cache.hh"
 
+#include <optional>
+#include <string>
+
 namespace nix {
 
 enum struct FetchMode { DryRun, Copy };
@@ -32,7 +35,8 @@ std::pair<StorePath, Hash> fetchToStore2(
     std::string_view name = "source",
     ContentAddressMethod method = ContentAddressMethod::Raw::NixArchive,
     PathFilter * filter = nullptr,
-    RepairFlag repair = NoRepair);
+    RepairFlag repair = NoRepair,
+    std::optional<std::string> fingerprintOverride = std::nullopt);
 
 fetchers::Cache::Key
 makeSourcePathToHashCacheKey(std::string_view fingerprint, ContentAddressMethod method, const CanonPath & path);

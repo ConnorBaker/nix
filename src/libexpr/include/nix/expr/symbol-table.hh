@@ -18,7 +18,7 @@ class SymbolValue : protected Value
     friend class SymbolStr;
     friend class SymbolTable;
 
-    uint32_t idx;
+    uint32_t idx = 0;
 
     SymbolValue() = default;
 

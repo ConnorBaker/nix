@@ -44,10 +44,10 @@ struct CmdFlakePrefetchInputs : FlakeCommand
 
             if (auto lockedNode = dynamic_cast<const LockedNode *>(&node)) {
                 try {
-                    Activity act(*logger, lvlInfo, actUnknown, fmt("fetching '%s'", lockedNode->lockedRef));
-                    auto accessor = lockedNode->lockedRef.input.getAccessor(fetchSettings, *store).first;
+                    Activity act(*logger, lvlInfo, actUnknown, fmt("fetching '%s'", lockedNode->lockedRef.value));
+                    auto accessor = lockedNode->lockedRef.value.input.getAccessor(fetchSettings, *store).first;
                     fetchToStore(
-                        fetchSettings, *store, accessor, FetchMode::Copy, lockedNode->lockedRef.input.getName());
+                        fetchSettings, *store, accessor, FetchMode::Copy, lockedNode->lockedRef.value.input.getName());
                 } catch (Error & e) {
                     printError("%s", e.what());
                     nrFailed++;
@@ -55,7 +55,7 @@ struct CmdFlakePrefetchInputs : FlakeCommand
             }
 
             for (auto & [inputName, input] : node.inputs) {
-                if (auto inputNode = std::get_if<0>(&input))
+                if (auto inputNode = edgeChild(input))
                     pool.enqueue(std::bind(visit, **inputNode));
             }
         };

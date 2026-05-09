@@ -90,7 +90,6 @@ Strings EvalSettings::getDefaultNixPath()
             }
         }
     };
-
     add(getNixDefExpr() / "channels");
     auto profilesDirOpts = settings.getProfileDirsOptions();
     add(rootChannelsDir(profilesDirOpts) / "nixpkgs", "nixpkgs");

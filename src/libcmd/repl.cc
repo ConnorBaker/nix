@@ -65,6 +65,7 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
     // Arguments passed to :load-flake, saved so they can be reloaded with :reload
     Strings loadedFlakes;
     fun<AnnotatedValues()> getValues;
+    AnnotatedValues loadedInstallables;
 
     const static int envSize = 32768;
     std::shared_ptr<StaticEnv> staticEnv;
@@ -459,7 +460,6 @@ ProcessLineResult NixRepl::processLine(std::string line)
     }
 
     else if (command == ":r" || command == ":reload") {
-        state->resetFileCache();
         reloadFilesAndFlakes();
     }
 
@@ -740,6 +740,7 @@ void NixRepl::initEnv()
     env->up = &state->baseEnv;
     displ = 0;
     staticEnv->vars.clear();
+    loadedInstallables.clear();
 
     varNames.clear();
     for (auto & i : state->staticBaseEnv->vars)
@@ -766,6 +767,7 @@ void NixRepl::showLastLoaded()
 
 void NixRepl::reloadFilesAndFlakes()
 {
+    state->resetFileCache();
     initEnv();
 
     loadFiles();
@@ -788,10 +790,11 @@ void NixRepl::loadFiles()
         }
     }
 
-    for (auto & [i, what] : getValues()) {
-        notice("Loading installable '%1%'...", what);
+    loadedInstallables = getValues();
+    for (auto & loaded : loadedInstallables) {
+        notice("Loading installable '%1%'...", loaded.what);
         try {
-            addAttrsToScope(*i);
+            addAttrsToScope(*loaded.evaluated.value);
         } catch (Error & e) {
             printMsg(lvlError, e.msg());
         }

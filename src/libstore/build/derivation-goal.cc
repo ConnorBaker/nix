@@ -188,22 +188,13 @@ Goal::Co DerivationGoal::haveDerivation(bool storeDerivation)
                 if (take1)
                     return *take1;
 
-                /* The above `get` should work. But stateful tracking of
-                   outputs in resolvedResult, this can get out of sync with the
-                   store, which is our actual source of truth. For now we just
-                   check the store directly if it fails. */
-                auto take2 = worker.evalStore.queryRealisation(
-                    DrvOutput{
-                        .drvPath = pathResolved,
-                        .outputName = wantedOutput,
-                    });
-                if (take2)
-                    return *take2;
-
-                throw Error(
-                    "derivation '%s' doesn't have expected output '%s' (derivation-goal.cc/realisation)",
-                    worker.store.printStorePath(pathResolved),
-                    wantedOutput);
+                /* The above `get` should work. If it doesn't, assert path
+                   validity on the resolved goal itself before falling back to
+                   the store realisation map. Impure derivations intentionally
+                   do not register drv-output realisations, so querying the
+                   store directly first can spuriously fail even after a
+                   successful build. */
+                return resolvedDrvGoal->assertPathValidity();
             }();
 
             auto status = success.status;

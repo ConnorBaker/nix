@@ -123,9 +123,21 @@ struct PathInputScheme : InputScheme
             return path;
     }
 
+    std::optional<std::string> getStableIdentity(const Input & input) const override
+    {
+        return fmt("path:%s", getStrAttr(input.attrs, "path"));
+    }
+
     bool isLocked(const Settings & settings, const Input & input) const override
     {
         return (bool) input.getNarHash();
+    }
+
+    std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
+    {
+        if (auto narHash = input.getNarHash())
+            return fmt("path:%s", narHash->to_string(HashFormat::SRI, true));
+        return std::nullopt;
     }
 
     std::filesystem::path getAbsPath(const Input & input) const

@@ -130,23 +130,37 @@ std::pair<SourcePath, uint32_t> findPackageFilename(EvalState & state, Value & v
 
     // FIXME: is it possible to extract the Pos object instead of doing this
     //        toString + parsing?
-    NixStringContext context;
-    auto path =
-        state.coerceToPath(noPos, *v2, context, "while evaluating the 'meta.position' attribute of a derivation");
+    auto parseFilename = [&](std::string_view fn, std::optional<SourcePath> path) -> std::pair<SourcePath, uint32_t> {
+        auto fail = [&]() { throw ParseError("cannot parse 'meta.position' attribute '%s'", fn); };
 
-    auto fn = path.path.abs();
+        auto colon = fn.rfind(':');
+        if (colon == std::string::npos)
+            fail();
 
-    auto fail = [fn]() { throw ParseError("cannot parse 'meta.position' attribute '%s'", fn); };
+        auto lineno = string2Int<uint32_t>(fn.substr(colon + 1));
+        if (!lineno)
+            fail();
 
-    auto colon = fn.rfind(':');
-    if (colon == std::string::npos)
-        fail();
+        auto filePath = fn.substr(0, colon);
+        if (path)
+            return {SourcePath{path->accessor, CanonPath(filePath)}, *lineno};
 
-    auto lineno = string2Int<uint32_t>(std::string_view(fn).substr(colon + 1));
-    if (!lineno)
-        fail();
+        if (filePath.empty() || filePath.front() != '/')
+            fail();
 
-    return {SourcePath{path.accessor, CanonPath(fn.substr(0, colon))}, *lineno};
+        return {state.rootPath(CanonPath(filePath)), *lineno};
+    };
+
+    try {
+        NixStringContext context;
+        auto path =
+            state.coerceToPath(noPos, *v2, context, "while evaluating the 'meta.position' attribute of a derivation");
+        return parseFilename(path.path.abs(), path);
+    } catch (Error &) {
+        if (v2->type() == nString)
+            return parseFilename(v2->string_view(), std::nullopt);
+        throw;
+    }
 }
 
 } // namespace nix

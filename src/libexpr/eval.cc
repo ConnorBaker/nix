@@ -1,6 +1,22 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-error.hh"
+#include "nix/expr/eval-environment/authority-internal.hh"
+#include "nix/expr/eval-environment/environment.hh"
+#include "eval-environment/private-errors.hh"
+#include "nix/expr/eval-environment/request-types.hh"
+#include "nix/expr/eval-trace/context.hh"
+#include "nix/expr/eval-trace/cache/derived-container-builder.hh"
+#include "nix/expr/eval-trace/cache/trace-session.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/deps/trace-access.hh"
+#include "nix/expr/eval-trace/deps/replay-publish-scope.hh"
+#include "nix/expr/eval-trace/deps/sibling-force-scope.hh"
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
+#include "nix/expr/eval-trace/deps/shape-recording.hh"
+#include "nix/expr/eval-trace/deps/nix-binding.hh"
+#include "nix/expr/eval-trace/deps/dep-hash-fns.hh"
+#include "nix/expr/eval-trace/hash-spec.hh"
 #include "nix/expr/primops.hh"
 #include "nix/expr/print-options.hh"
 #include "nix/expr/symbol-table.hh"
@@ -53,6 +69,175 @@
 using json = nlohmann::json;
 
 namespace nix {
+
+EvalEnvironmentSharedState::EvalEnvironmentSharedState()
+    : inputCache(fetchers::InputCache::create())
+    , srcToStore(make_ref<SrcToStoreCache>())
+    , importResolutionCache(make_ref<ImportResolutionCache>())
+    , fileTraceCache(make_ref<FileTraceValueCache>())
+    , fileContentHashCache(make_ref<FileContentHashCache>())
+    , lookupPathResolved(make_ref<boost::concurrent_flat_map<std::string, std::optional<SourcePath>>>())
+{
+}
+
+DepHash getOrStoreFileContentHash(
+    EvalState & state,
+    const SourcePath & path,
+    std::string_view bytes)
+{
+    auto & cache = *state.evalEnvironmentSharedState->fileContentHashCache;
+    if (auto cached = getConcurrent(cache, path))
+        return *cached;
+    auto hash = depHash(bytes);
+    cache.try_emplace(path, hash);
+    return hash;
+}
+
+DepHash getOrReadFileContentHash(
+    EvalState & state,
+    const SourcePath & path)
+{
+    auto & cache = *state.evalEnvironmentSharedState->fileContentHashCache;
+    if (auto cached = getConcurrent(cache, path))
+        return *cached;
+    auto bytes = path.readFile();
+    auto hash = depHash(bytes);
+    cache.try_emplace(path, hash);
+    return hash;
+}
+
+static void maybeRecordImportedFileContent(
+    EvalState & state,
+    const SourcePath & path,
+    const std::optional<PathObject> & origin);
+
+/// Copy a path to the store and return the published store path string.
+///
+/// The `context` parameter is an OUTPUT accumulator — the caller's growing
+/// set of string context entries (e.g., from derivationStrict's attribute
+/// iteration).  This function ADDS its result's context to the accumulator
+/// but does NOT pass the accumulator as input to the copy/publish operation.
+///
+/// This separation is critical: the copy operation needs only the context
+/// of the specific path being copied (empty for a local file, one Opaque
+/// entry for a store path root).  Passing the outer accumulator would cause
+/// realiseContextImpl to process Built entries from unrelated derivation
+/// attributes, triggering spurious IFD errors.
+PublishedStorePathString copyPathToStoreViaEvalEnvironment(
+    EvalState & state,
+    NixStringContext & context,
+    const SourcePath & path,
+    std::optional<PathObject> origin)
+{
+    if (nix::isDerivation(path.path.abs()))
+        state.error<EvalError>("file names are not allowed to end in '%1%'", drvExtension).debugThrow();
+
+    EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+    auto storePathAndSubpath = [&]() -> std::optional<std::pair<StorePath, CanonPath>> {
+        try {
+            return state.store->toStorePath(path.path.abs());
+        } catch (Error &) {
+            return std::nullopt;
+        }
+    }();
+    // Fast-path: if the path IS a store path root (not a file within
+    // a store tree), publish it directly without copying.  The subpath
+    // must be root — for files within a store tree (e.g., ./builder.sh
+    // inside a flake source), we must fall through to the slow path
+    // which independently content-addresses the file.  Otherwise the
+    // string context would reference the containing tree root instead
+    // of the individual file, producing wrong derivation hashes.
+    //
+    // Master's EvalState::storePath() routes through `rootFS` (a union
+    // accessor that contains `storeFS`), so we accept either accessor:
+    // both point at the same underlying store tree.
+    if (storePathAndSubpath
+        && storePathAndSubpath->second.isRoot()
+        && state.store->isValidPath(storePathAndSubpath->first)
+        && (path.accessor == state.rootFS
+            || path.accessor == state.storeFS.cast<SourceAccessor>()))
+    {
+        auto [storePath, subpath] = *storePathAndSubpath;
+        // Fresh context for this specific publish operation — NOT the
+        // outer accumulator.  The store path root has no placeholder
+        // rewrites to resolve.
+        NixStringContext publishContext;
+        auto request = StorePathPublishRequest{
+            .coercedPath = CoercedPathRequest{
+                .path = state.storePath(storePath),
+                .context = publishContext,
+            },
+            .pos = noPos,
+        };
+
+        auto published = environment.publishStorePath(request);
+
+        context.insert(published.context().begin(), published.context().end());
+        return published;
+    }
+
+    // Fresh context for this specific copy operation — NOT the outer
+    // accumulator.  The file being copied has its own identity; any
+    // CA derivation placeholder rewrites in its path string (if any)
+    // would come from the path's own provenance, not from unrelated
+    // derivation attributes that happen to have been coerced earlier.
+    NixStringContext copyContext;
+    auto request = CopyPathToStoreRequest{
+        .name = std::string(path.baseName()),
+        .path = path,
+        .origin = std::move(origin),
+        .filterEvaluator = {},
+        .method = ContentAddressMethod::Raw::NixArchive,
+        .expectedHash = std::nullopt,
+        .context = copyContext,
+        .pos = noPos,
+    };
+
+    auto published = environment.copyPathToStore(request);
+
+    printMsg(lvlChatty, "copied source '%1%' -> '%2%'", path, published.renderedPath());
+    context.insert(published.context().begin(), published.context().end());
+    return published;
+}
+
+std::string realiseStringViaEvalEnvironment(
+    EvalState & state,
+    Value & str,
+    StorePathSet * storePathsOutMaybe,
+    bool isIFD,
+    const PosIdx pos)
+{
+    NixStringContext stringContext;
+    auto rawStr = state.coerceToString(pos, str, stringContext, "while realising a string").toOwned();
+    EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+    auto observation = environment.realiseContext(
+        RealiseContextRequest::make(
+            stringContext,
+            isIFD ? StringRealisationMode::ImportFromDerivation
+                  : StringRealisationMode::NonImportFromDerivation));
+    if (storePathsOutMaybe) {
+        for (const auto & path : observation.referencedStorePaths)
+            storePathsOutMaybe->emplace(path);
+    }
+    StringMap rewrites;
+    for (const auto & rewrite : observation.rewrites)
+        rewrites.insert_or_assign(rewrite.placeholder, state.store->printStorePath(rewrite.storePath));
+    return rewriteStrings(rawStr, rewrites);
+}
+
+static std::string readFileViaEvalEnvironment(
+    EvalState & state,
+    const SourcePath & path)
+{
+    EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+    ReadFileRequest request{
+        .coercedPath = CoercedPathRequest{
+            .path = path,
+        },
+    };
+
+    return environment.readFile(observeOnly, request).bytes;
+}
 
 /**
  * Just for doc strings. Not for regular string values.
@@ -299,15 +484,10 @@ EvalState::EvalState(
           )}
     , store(store)
     , buildStore(buildStore ? buildStore : store)
-    , inputCache(fetchers::InputCache::create())
     , debugRepl(nullptr)
     , debugStop(false)
     , trylevel(0)
-    , srcToStore(make_ref<decltype(srcToStore)::element_type>())
-    , importResolutionCache(make_ref<decltype(importResolutionCache)::element_type>())
-    , fileEvalCache(make_ref<decltype(fileEvalCache)::element_type>())
     , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
-    , lookupPathResolved(make_ref<decltype(lookupPathResolved)::element_type>())
     , regexCache(makeRegexCache())
 #if NIX_USE_BOEHMGC
     , baseEnvP(std::allocate_shared<Env *>(traceable_allocator<Env *>(), &mem.allocEnv(BASE_ENV_SIZE)))
@@ -316,6 +496,7 @@ EvalState::EvalState(
     , baseEnv(mem.allocEnv(BASE_ENV_SIZE))
 #endif
     , staticBaseEnv{std::make_shared<StaticEnv>(nullptr, nullptr)}
+    , evalEnvironmentSharedState(std::make_shared<EvalEnvironmentSharedState>())
 {
 #ifndef _WIN32
     static std::once_flag stackSizeBumped;
@@ -353,16 +534,23 @@ EvalState::EvalState(
     }
 
     /* Allow access to all paths in the search path. */
-    if (rootFS.dynamic_pointer_cast<AllowListSourceAccessor>())
-        for (auto & i : lookupPath.elements)
-            resolveLookupPathPath(i.path, true);
+    if (rootFS.dynamic_pointer_cast<AllowListSourceAccessor>()) {
+        EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(*this));
+        auto detached = environment.openDetachedEffectScope();
+        environment.initializeLookupPathAccessControl(detached, lookupPath);
+    }
 
     corepkgsFS->addFile(
         CanonPath("fetchurl.nix"),
 #include "fetchurl.nix.gen.hh"
     );
 
+    eval_trace::setEvalTraceHashAlgorithm(settings.evalTraceHashAlgorithm);
+
     createBaseEnv(settings);
+
+    if (settings.useTraceCache)
+        traceCtx = std::make_unique<TraceRuntime>();
 
     /* Register function call tracer. */
     if (settings.traceFunctionCalls)
@@ -378,97 +566,11 @@ EvalState::EvalState(
     }
 }
 
-EvalState::~EvalState() {}
-
-void EvalState::allowPathLegacy(const std::string & path)
+EvalState::~EvalState()
 {
-    if (auto rootFS2 = rootFS.dynamic_pointer_cast<AllowListSourceAccessor>())
-        rootFS2->allowPrefix(CanonPath(path));
+    releaseSessionEvalEnvironmentState(*this);
 }
 
-void EvalState::allowPath(const StorePath & storePath)
-{
-    if (auto rootFS2 = rootFS.dynamic_pointer_cast<AllowListSourceAccessor>())
-        rootFS2->allowPrefix(CanonPath(store->printStorePath(storePath)));
-}
-
-void EvalState::allowClosure(const StorePath & storePath)
-{
-    if (!rootFS.dynamic_pointer_cast<AllowListSourceAccessor>())
-        return;
-
-    StorePathSet closure;
-    store->computeFSClosure(storePath, closure);
-    for (auto & p : closure)
-        allowPath(p);
-}
-
-void EvalState::allowAndSetStorePathString(const StorePath & storePath, Value & v)
-{
-    allowPath(storePath);
-
-    mkStorePathString(storePath, v);
-}
-
-inline static bool isJustSchemePrefix(std::string_view prefix)
-{
-    return !prefix.empty() && prefix[prefix.size() - 1] == ':'
-           && isValidSchemeName(prefix.substr(0, prefix.size() - 1));
-}
-
-bool isAllowedURI(std::string_view uri, const Strings & allowedUris)
-{
-    /* 'uri' should be equal to a prefix, or in a subdirectory of a
-       prefix. Thus, the prefix https://github.co does not permit
-       access to https://github.com. */
-    for (auto & prefix : allowedUris) {
-        if (uri == prefix
-            // Allow access to subdirectories of the prefix.
-            || (uri.size() > prefix.size() && prefix.size() > 0 && hasPrefix(uri, prefix)
-                && (
-                    // Allow access to subdirectories of the prefix.
-                    prefix[prefix.size() - 1] == '/'
-                    || uri[prefix.size()] == '/'
-
-                    // Allow access to whole schemes
-                    || isJustSchemePrefix(prefix))))
-            return true;
-    }
-
-    return false;
-}
-
-void EvalState::checkURI(const std::string & uri0)
-{
-    if (!settings.restrictEval)
-        return;
-
-    if (isAllowedURI(uri0, settings.allowedUris.get()))
-        return;
-
-    /* If the URI is a path, then check it against allowedPaths as
-       well. */
-    {
-        std::filesystem::path path(uri0);
-        if (path.is_absolute()) {
-            if (auto rootFS2 = rootFS.dynamic_pointer_cast<AllowListSourceAccessor>())
-                rootFS2->checkAccess(CanonPath(path.string()));
-            return;
-        }
-    }
-
-    try {
-        ParsedURL uri = parseURL(uri0);
-        if (uri.scheme == "file") {
-            if (auto rootFS2 = rootFS.dynamic_pointer_cast<AllowListSourceAccessor>())
-                rootFS2->checkAccess(CanonPath(urlPathToPath(uri.path).string()));
-            return;
-        }
-    } catch (BadURL &) {
-    }
-
-    throw RestrictedPathError("access to URI '%s' is forbidden in restricted mode", uri0);
-}
 
 Value * EvalState::addConstant(const std::string & name, Value & v, Constant info)
 {
@@ -876,36 +978,138 @@ DebugTraceStacker::DebugTraceStacker(EvalState & evalState, DebugTrace t)
         evalState.runDebugRepl(nullptr, trace.env, trace.expr);
 }
 
-void Value::mkString(std::string_view s, EvalMemory & mem)
+struct PublicationWarmupScope
+    : private gdp::Certifier<DepRecordingContext::DepCaptureScopeTag>
 {
-    mkStringNoCopy(StringData::make(mem, s));
+    EvalState & state;
+    DepRecordingContext * ctx = nullptr;
+    std::optional<DepRecordingContext::Scope> stashed;
+    uint32_t epochStart = 0;
+    bool closed = false;
+    bool finalized = false;
+
+    PublicationWarmupScope(EvalState & state, DepRecordingContext * ctx)
+        : state(state)
+        , ctx(ctx)
+        , epochStart(ctx ? ctx->epochLog.size() : 0)
+    {
+        if (ctx)
+            Certifier::withProof([&](const auto & proof) { ctx->pushScope(proof); });
+    }
+
+    void close()
+    {
+        if (!ctx || closed)
+            return;
+        assert(!ctx->scopeStack.empty());
+        stashed = std::move(ctx->scopeStack.back());
+        Certifier::withProof([&](const auto & proof) { ctx->popScope(proof); });
+        closed = true;
+    }
+
+    void mergeIntoParent()
+    {
+        close();
+        finalized = true;
+        if (!ctx || !stashed)
+            return;
+        auto * parent = ctx->currentScope();
+        if (!parent) {
+            discard();
+            stashed.reset();
+            return;
+        }
+
+        // Re-record deps to the parent scope. Do NOT rollback the epoch log
+        // or epochMap — rollbackReplayEpoch erases epochMap entries for
+        // sub-thunks forced during the warmup scope. If those thunks are
+        // later re-accessed from a different scope, replayMemoizedDeps finds
+        // no entry and silently skips their deps (BUG-3: stale dep replay).
+        //
+        // The epoch log retains the warmup scope's contributions at their
+        // original positions. The epochMap entries remain valid because they
+        // point to these unchanged positions. The re-record loop below adds
+        // the deps to the parent's ownDeps and dedup state without affecting
+        // the epoch log positions that epochMap references.
+        for (auto & dep : stashed->ownDeps)
+            ctx->record(dep);
+
+        parent->replayedValues.insert(
+            std::make_move_iterator(stashed->replayedValues.begin()),
+            std::make_move_iterator(stashed->replayedValues.end()));
+        parent->unstable = parent->unstable || stashed->unstable;
+        stashed.reset();
+    }
+
+    void discard()
+    {
+        close();
+        finalized = true;
+        if (ctx) {
+            state.rollbackReplayEpoch(epochStart);
+            ctx->epochLog.truncate(epochStart);
+        }
+        stashed.reset();
+    }
+
+    ~PublicationWarmupScope()
+    {
+        if (!ctx || finalized)
+            return;
+        discard();
+    }
+};
+
+void Value::mkString(std::string_view s, EvalMemory & mem, const SemanticHandle * publication)
+{
+    mkStringNoCopy(StringData::make(mem, s), Value::StringWithContext::Context::fromBuilder({}, mem, publication));
 }
 
 Value::StringWithContext::Context *
-Value::StringWithContext::Context::fromBuilder(const NixStringContext & context, EvalMemory & mem)
+Value::StringWithContext::Context::fromBuilder(
+    const NixStringContext & context,
+    EvalMemory & mem,
+    const SemanticHandle * publication)
 {
-    if (context.empty())
+    if (context.empty() && !publication)
         return nullptr;
 
-    auto ctx = new (mem.allocBytes(sizeof(Context) + context.size() * sizeof(value_type))) Context(context.size());
+    auto ctx = new (mem.allocBytes(sizeof(Context) + context.size() * sizeof(value_type))) Context(context.size(), publication);
     std::ranges::transform(
         context, ctx->elems, [&](const NixStringContextElem & elt) { return &StringData::make(mem, elt.to_string()); });
     return ctx;
 }
 
-void Value::mkString(std::string_view s, const NixStringContext & context, EvalMemory & mem)
+void Value::mkString(
+    std::string_view s,
+    const NixStringContext & context,
+    EvalMemory & mem,
+    const SemanticHandle * publication)
 {
-    mkStringNoCopy(StringData::make(mem, s), Value::StringWithContext::Context::fromBuilder(context, mem));
+    mkStringNoCopy(StringData::make(mem, s), Value::StringWithContext::Context::fromBuilder(context, mem, publication));
 }
 
-void Value::mkStringMove(const StringData & s, const NixStringContext & context, EvalMemory & mem)
+void Value::mkStringMove(
+    const StringData & s,
+    const NixStringContext & context,
+    EvalMemory & mem,
+    const SemanticHandle * publication)
 {
-    mkStringNoCopy(s, Value::StringWithContext::Context::fromBuilder(context, mem));
+    mkStringNoCopy(s, Value::StringWithContext::Context::fromBuilder(context, mem, publication));
 }
 
-void Value::mkPath(const SourcePath & path, EvalMemory & mem)
+const Value::Path::Details *
+Value::Path::Details::make(EvalMemory & mem, SourceAccessor * accessor, const SemanticHandle * publication)
 {
-    mkPath(&*path.accessor, StringData::make(mem, path.path.abs()));
+    return new (mem.allocBytes(sizeof(Details))) Details{
+        .accessor = accessor,
+        .publication = publication,
+    };
+}
+
+void Value::mkPath(const SourcePath & path, EvalMemory & mem, const SemanticHandle * publication)
+{
+    mkPath(&*path.accessor, StringData::make(mem, path.path.abs()), mem, publication);
 }
 
 [[gnu::always_inline]] inline Value * EvalState::lookupVar(Env * env, const ExprVar & var, bool noEval)
@@ -941,10 +1145,16 @@ void Value::mkPath(const SourcePath & path, EvalMemory & mem)
     }
 }
 
-ListBuilder::ListBuilder(EvalMemory & mem, size_t size)
+ListBuilder::ListBuilder(EvalMemory & mem, size_t size, bool forceHeap)
     : size(size)
-    , elems(size <= 2 ? inlineElems : (Value **) mem.allocBytes(size * sizeof(Value *)))
+    , forceHeap(forceHeap)
+    , elems(
+        this->forceHeap || size > 2
+            ? (Value **) mem.allocBytes((size == 0 ? 1 : size) * sizeof(Value *))
+            : inlineElems)
 {
+    if (this->forceHeap && size == 0)
+        elems[0] = nullptr;
 }
 
 Value * EvalState::getBool(bool b)
@@ -1045,6 +1255,72 @@ void EvalState::mkSingleDerivedPathString(const SingleDerivedPath & p, Value & v
         mem);
 }
 
+void EvalState::publishPathProvenance(Value & v, PathObject obj)
+{
+    if (traceActiveDepth) [[unlikely]]
+        mergeSemanticHandle(v, SemanticHandle::forPath(std::move(obj)));
+}
+
+void EvalState::publishTextProvenance(Value & v, TextObject obj)
+{
+    if (traceActiveDepth) [[unlikely]]
+        mergeSemanticHandle(v, SemanticHandle::forText(std::move(obj)));
+}
+
+void EvalState::publishStructuredProvenance(Value & v, StructuredObject obj)
+{
+    if (!traceActiveDepth) [[likely]]
+        return;
+
+    // NOTE: No list branch. On x86-64 (useBitPackedValueStorage == true),
+    // the packed setStorage(List) stores only elems and size; any additional
+    // field on the List struct would be silently dropped by the packed
+    // storage round-trip. List provenance is carried entirely via
+    // ContainerProvenanceRegistry (trace-frame.hh), keyed by heap-backed list
+    // storage identity. Both buildCachedResult and materialization's stageContainerProvenance
+    // path use lookupTracedContainer, not publication(). See value.hh, List struct
+    // comment for the full explanation of the asymmetry.
+    //
+    // The attrset branch below works because Bindings is heap-allocated; the
+    // packed Value payload stores only a Bindings*, and publication_ lives on
+    // the heap-allocated Bindings object, not in the payload. The shared
+    // emptyBindings singleton is replaced before publication because it must
+        // never carry per-container provenance.
+    if (v.type() == nAttrs) {
+        if (v.attrs() == &Bindings::emptyBindings)
+            v.mkAttrs(mem.allocBindings(0, EmptyBindingsAllocation::AllocateFresh));
+
+        auto handle = SemanticHandle::forStructured(std::move(obj));
+        auto * allocated = new (mem.allocBytes(sizeof(SemanticHandle)))
+            SemanticHandle(std::move(handle));
+        const_cast<Bindings *>(v.attrs())->setPublication(allocated);
+    }
+}
+
+void EvalState::mkStorePathStringWithProvenance(const StorePath & p, Value & v, PathObject provenance)
+{
+    mkStorePathString(p, v);
+    publishPathProvenance(v, std::move(provenance));
+}
+
+void EvalState::mkOutputStringWithProvenance(
+    Value & v,
+    const SingleDerivedPath::Built & b,
+    std::optional<StorePath> optStaticOutputPath,
+    PathObject provenance,
+    const ExperimentalFeatureSettings & xpSettings)
+{
+    mkOutputString(v, b, std::move(optStaticOutputPath), xpSettings);
+    publishPathProvenance(v, std::move(provenance));
+}
+
+void EvalState::mkSingleDerivedPathStringWithProvenance(const SingleDerivedPath & p, Value & v,
+    PathObject provenance)
+{
+    mkSingleDerivedPathString(p, v);
+    publishPathProvenance(v, std::move(provenance));
+}
+
 Value * Expr::maybeThunk(EvalState & state, Env & env)
 {
     Value * v = state.allocValue();
@@ -1091,57 +1367,137 @@ Value * ExprPath::maybeThunk(EvalState & state, Env & env)
 /**
  * A helper `Expr` class to lets us parse and evaluate Nix expressions
  * from a thunk, ensuring that every file is parsed/evaluated only
- * once (via the thunk stored in `EvalState::fileEvalCache`).
+ * once (via the thunk stored in `EvalEnvironmentSharedState::fileTraceCache`).
  */
 struct ExprParseFile : Expr, gc
 {
-    // FIXME: make this a reference (see below).
-    SourcePath path;
+    SourcePath displayPath;
+    SourcePath physicalPath;
+    SourcePath basePath;
     bool mustBeTrivial;
+    std::optional<PathObject> origin;
 
-    ExprParseFile(SourcePath & path, bool mustBeTrivial)
-        : path(path)
+    ExprParseFile(
+        SourcePath displayPath,
+        SourcePath physicalPath,
+        SourcePath basePath,
+        bool mustBeTrivial,
+        std::optional<PathObject> origin)
+        : displayPath(std::move(displayPath))
+        , physicalPath(std::move(physicalPath))
+        , basePath(std::move(basePath))
         , mustBeTrivial(mustBeTrivial)
+        , origin(std::move(origin))
     {
     }
 
+    void showForHash(const SymbolTable &, std::ostream &, const CanonPath &) const override {}
+
     void eval(EvalState & state, Env & env, Value & v) override
     {
-        printTalkative("evaluating file '%s'", path);
+        printTalkative("evaluating file '%s'", displayPath);
 
-        auto e = state.parseExprFromFile(path);
+        auto e = state.parseExprFromFile(displayPath, physicalPath, basePath);
+
+        // Two-layer dep emission for traced imports (see OR-2 in
+        // src/libexpr/eval-trace/CLAUDE.md):
+        //
+        //   1. `registerNixBindings` runs whenever `hasTraceContext()` is
+        //      true — including during lockFlake, before any trace scope
+        //      starts.  It populates the NixSemanticAnalyzer registry so
+        //      later access-time `maybeRecordNixBindingDep` calls (fired
+        //      from ExprSelect / ExprOpHasAttr / prim_getAttr) can emit
+        //      per-binding StructuredProjection deps.  Provenance
+        //      resolution (source, key) is deferred to access time, when
+        //      the mount table is populated.
+        //
+        //   2. `maybeRecordImportedFileContent` runs only inside a live
+        //      trace scope (`traceActiveDepth`).  It is the FileBytes
+        //      backstop: a coarse content dep that covers bare imports
+        //      whose consumer never fires a Nix-level ExprSelect —
+        //      deepSeq / attrNames / formals / findAlongAttrPath / C++
+        //      attrs()->get paths.  Access-time emission dedups against
+        //      this one via `scopeContainsDepKey`; pass-2 override
+        //      subsumes it when a per-binding SP covers the file.
+        if (state.hasTraceContext()) [[unlikely]] {
+            auto [exprAttrs, scopeExprs] = findNonRecExprAttrs(e);
+            if (exprAttrs) {
+                auto resolved = physicalPath.resolveSymlinks(SymlinkResolution::Ancestors);
+                auto parentDir = resolved.path.parent().value_or(CanonPath::root);
+                auto scopeHash = computeNixScopeHash(scopeExprs, state.symbols, &parentDir);
+                registerNixBindings(
+                    state, exprAttrs, scopeHash, state.symbols,
+                    state.tracingPools(), resolved, origin);
+            }
+            if (state.traceActiveDepth) [[unlikely]] {
+                maybeRecordImportedFileContent(state, physicalPath, origin);
+            }
+        }
 
         try {
             auto dts =
                 state.debugRepl
                     ? makeDebugTraceStacker(
-                          state, *e, state.baseEnv, e->getPos(), "while evaluating the file '%s':", path.to_string())
+                          state,
+                          *e,
+                          state.baseEnv,
+                          e->getPos(),
+                          "while evaluating the file '%s':",
+                          displayPath.to_string())
                     : nullptr;
 
             // Enforce that 'flake.nix' is a direct attrset, not a
             // computation.
             if (mustBeTrivial && !(dynamic_cast<ExprAttrs *>(e)))
-                state.error<EvalError>("file '%s' must be an attribute set", path).debugThrow();
+                state.error<EvalError>("file '%s' must be an attribute set", displayPath).debugThrow();
 
             state.eval(e, v);
         } catch (Error & e) {
-            state.addErrorTrace(e, "while evaluating the file '%s':", path.to_string());
+            state.addErrorTrace(e, "while evaluating the file '%s':", displayPath.to_string());
             throw;
         }
     }
 };
 
-void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
+static void evalFileImpl(
+    EvalState & state,
+    EvalEnvironmentSharedState & envSharedState,
+    const SourcePath & displayPath,
+    const SourcePath & physicalPath,
+    const SourcePath & basePath,
+    Value & v,
+    bool mustBeTrivial,
+    const std::optional<PathObject> & origin)
 {
-    auto resolvedPath = getConcurrent(*importResolutionCache, path);
+    auto & importResolutionCache = *envSharedState.importResolutionCache;
+    auto & fileTraceCache = *envSharedState.fileTraceCache;
+    auto resolvedPath = getConcurrent(importResolutionCache, physicalPath);
 
     if (!resolvedPath) {
-        resolvedPath = resolveExprPath(path);
-        importResolutionCache->emplace(path, *resolvedPath);
+        resolvedPath = resolveExprPath(physicalPath);
+        importResolutionCache.emplace(physicalPath, *resolvedPath);
     }
 
-    if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
-        forceValue(**v2, noPos);
+    FileTraceCacheKey cacheKey{
+        .path = *resolvedPath,
+        .displayPath = displayPath,
+        .basePath = basePath,
+        .mustBeTrivial = mustBeTrivial,
+        .origin = origin,
+    };
+
+    // Content dep recording moved into ExprParseFile::eval (cache-miss only).
+    // NOT recording on cache hits prevents orphaned Content deps in child
+    // scopes. The Content dep covers the whole file. For .nix code consumed
+    // via import/evalFile, NixBinding (format 'n') provides per-binding
+    // StructuredContent override for eligible non-recursive attrsets. For data
+    // files consumed by fromJSON/fromTOML, TextObject enables
+    // StructuredContent two-level override. See design.md §4.6 (Dependency
+    // Over-Approximation). For NixBinding files, the Content dep comes from
+    // maybeRecordNixBindingDep (co-located with the SC dep).
+
+    if (auto v2 = getConcurrent(fileTraceCache, cacheKey)) {
+        state.forceValue(**v2, noPos);
         v = **v2;
         return;
     }
@@ -1151,31 +1507,385 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
     // https://github.com/NixOS/nix/pull/13930 is merged. That will ensure
     // the post-condition that `expr` is unreachable after
     // `forceValue()` returns.
-    auto expr = new ExprParseFile{*resolvedPath, mustBeTrivial};
+    auto expr = new ExprParseFile{displayPath, *resolvedPath, basePath, mustBeTrivial, origin};
 
-    fileEvalCache->try_emplace_and_cvisit(
-        *resolvedPath,
+    fileTraceCache.try_emplace_and_cvisit(
+        std::move(cacheKey),
         nullptr,
         [&](auto & i) {
-            vExpr = allocValue();
-            vExpr->mkThunk(&baseEnv, expr);
+            vExpr = state.allocValue();
+            vExpr->mkThunk(&state.baseEnv, expr);
             i.second = vExpr;
         },
         [&](auto & i) { vExpr = i.second; });
 
-    forceValue(*vExpr, noPos);
+    state.forceValue(*vExpr, noPos);
 
     v = *vExpr;
 }
 
+void EvalState::evalFile(
+    const SourcePath & path,
+    const SourcePath & basePath,
+    Value & v,
+    bool mustBeTrivial,
+    const std::optional<PathObject> & origin)
+{
+    evalFileImpl(*this, *evalEnvironmentSharedState, path, path, basePath, v, mustBeTrivial, origin);
+}
+
+void EvalState::evalFile(
+    const SourcePath & displayPath,
+    const SourcePath & physicalPath,
+    const SourcePath & basePath,
+    Value & v,
+    bool mustBeTrivial,
+    const std::optional<PathObject> & origin)
+{
+    evalFileImpl(*this, *evalEnvironmentSharedState, displayPath, physicalPath, basePath, v, mustBeTrivial, origin);
+}
+
+void EvalState::evalFile(
+    const SourcePath & path,
+    Value & v,
+    bool mustBeTrivial,
+    const std::optional<PathObject> & origin)
+{
+    auto resolvedPath = resolveExprPath(path);
+    auto basePath = resolvedPath.parent();
+    evalFileImpl(*this, *evalEnvironmentSharedState, path, resolvedPath, basePath, v, mustBeTrivial, origin);
+}
+
+static void maybeRecordImportedFileContent(
+    EvalState & state,
+    const SourcePath & path,
+    const std::optional<PathObject> & origin)
+{
+    EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+    // Only record when a trace session is active — without one the read
+    // is pure overhead (the result is discarded).  The auto-dispatch
+    // readFile(request) fallback would perform real I/O via the detached
+    // path, which the old code intentionally skipped.
+    if (!environment.tryBindCurrentEvalSession())
+        return;
+    (void) environment.readFile(ReadFileRequest{
+        .coercedPath = CoercedPathRequest{
+            .path = path,
+            .origin = origin,
+        },
+    });
+}
+
 void EvalState::resetFileCache()
 {
-    importResolutionCache->clear();
-    fileEvalCache->clear();
-    inputCache->clear();
-    lookupPathResolved->clear();
+    evalEnvironmentSharedState->importResolutionCache->clear();
+    evalEnvironmentSharedState->fileTraceCache->clear();
+    evalEnvironmentSharedState->inputCache->clear();
+    evalEnvironmentSharedState->fileContentHashCache->clear();
+    /* `clearEvalEnvironmentState` clears `sharedState->lookupPathResolved`
+       along with `srcToStore`, so no direct clear here. */
+    clearEvalEnvironmentState(*this);
     positions.clear();
     rootFS->invalidateCache();
+    resetTraceContext();
+}
+
+void EvalState::clearCrossSessionCaches()
+{
+    evalEnvironmentSharedState->importResolutionCache->clear();
+    evalEnvironmentSharedState->fileTraceCache->clear();
+    evalEnvironmentSharedState->inputCache->clear();
+    evalEnvironmentSharedState->fileContentHashCache->clear();
+    /* Without this, session-boundary callers that skip `resetFileCache`
+       leak lookup-path resolutions across sessions (AD-6 rule 6). */
+    evalEnvironmentSharedState->lookupPathResolved->clear();
+    rootFS->invalidateCache();
+}
+
+// ── First-touch sibling forcing ──────────────────────────────────────
+//
+// Under an active SiblingReplayCaptureScope, first-touch sibling thunks are
+// evaluated with dep tracking temporarily suspended, then their replay range
+// is published immediately and re-consumed through replayMemoizedDeps(). This
+// gives first-touch and replay-hit siblings the same ValueContext recording
+// path while keeping non-sibling thunk forcing on the ordinary direct-record
+// path.
+
+SiblingForceScope::SiblingForceScope(
+    EvalState & state,
+    const Value & value,
+    uint32_t epochStart)
+    : state(state)
+    , value(value)
+    , epochStart(epochStart)
+{
+    fiberCtx = eval_trace::currentFiberDepCtx();
+    if (!fiberCtx)
+        fiberCtx = eval_trace::currentStandaloneDepCtx();
+    if (fiberCtx)
+        Certifier::withProof([&](const auto & proof) { fiberCtx->pushScope(proof); });
+}
+
+void SiblingForceScope::commit()
+{
+    assert(!committed);
+    // 1. Pop isolated scope — deps from eval are NOT in outer ownDeps.
+    if (fiberCtx)
+        Certifier::withProof([&](const auto & proof) { fiberCtx->popScope(proof); });
+    // 2. Publish epoch range [epochStart, epochLog.size()) to replayStore.
+    state.recordThunkDeps(value, epochStart);
+    // 3. Replay through SiblingReplayCaptureScope → ValueContext dep.
+    state.replayMemoizedDeps(value);
+    committed = true;
+}
+
+// ── Mode-parameterized forceThunkValue ────────────────────────────────
+//
+// Critical: skip TracedExpr verification. Direct eval only.
+// Used inside lock scopes (EvalContext<Critical>) where syncAwait
+// is structurally forbidden.
+template<>
+[[gnu::noinline]]
+void EvalState::forceThunkValue(eval_trace::EvalContext<eval_trace::Critical> &,
+                                 Value & v, const PosIdx pos)
+{
+    Env * env = v.thunk().env;
+    assert(env || v.isBlackhole());
+    Expr * expr = v.thunk().expr;
+
+    try {
+        v.mkBlackhole();
+        if (env) [[likely]]
+            expr->eval(*this, *env, v);
+        else
+            ExprBlackHole::throwInfiniteRecursionError(*this, v);
+    } catch (...) {
+        handleEvalExceptionForThunk(env, expr, v, pos);
+        throw;
+    }
+}
+
+// Suspendable: may verify via TracedExpr.
+//
+// No SuspendableCtxScope needed here: receiving ctx by reference
+// implies a live ancestor scope on this thread's stack (Ref-implies-
+// scope invariant, enforced by EvalContext<Suspendable>'s private
+// ctor + SuspendableCtxScope friend).  The thread-local already
+// points at the innermost scope's ctx.
+template<>
+[[gnu::noinline]]
+void EvalState::forceThunkValue(eval_trace::EvalContext<eval_trace::Suspendable> & ctx,
+                                 Value & v, const PosIdx pos)
+{
+    Env * env = v.thunk().env;
+    assert(env || v.isBlackhole());
+    Expr * expr = v.thunk().expr;
+    const uint32_t epochStart = traceCtx ? traceCtx->currentReplayEpochSize() : 0;
+
+    try {
+        v.mkBlackhole();
+        if (env) [[likely]] {
+            if (traceCtx && traceCtx->shouldIsolateSiblingForce(v)) {
+                SiblingForceScope siblingScope(*this, v, epochStart);
+                expr->eval(*this, *env, v);
+                siblingScope.commit();
+            } else {
+                ReplayPublishScope replayScope([this, &v, epochStart]{
+                    recordThunkDeps(v, epochStart);
+                });
+                expr->eval(*this, *env, v);
+                replayScope.commit();
+            }
+        } else
+            ExprBlackHole::throwInfiniteRecursionError(*this, v);
+    } catch (...) {
+        handleEvalExceptionForThunk(env, expr, v, pos);
+        throw;
+    }
+}
+
+// Backward-compatible bridge (removed when all callers are migrated).
+// Preserves the original body verbatim — does NOT delegate to the
+// template specializations. The Critical specialization intentionally
+// skips dep recording (it's for lock scopes), but uncolored callers
+// that go through this bridge still need dep recording for correctness.
+[[gnu::noinline]]
+void EvalState::forceThunkValue(Value & v, const PosIdx pos)
+{
+    Env * env = v.thunk().env;
+    assert(env || v.isBlackhole());
+    Expr * expr = v.thunk().expr;
+    const uint32_t epochStart = traceCtx ? traceCtx->currentReplayEpochSize() : 0;
+
+    try {
+        v.mkBlackhole();
+        if (env) [[likely]] {
+            if (traceCtx && traceCtx->shouldIsolateSiblingForce(v)) {
+                SiblingForceScope siblingScope(*this, v, epochStart);
+                expr->eval(*this, *env, v);
+                siblingScope.commit();
+            } else {
+                ReplayPublishScope replayScope([this, &v, epochStart]{
+                    recordThunkDeps(v, epochStart);
+                });
+                expr->eval(*this, *env, v);
+                replayScope.commit();
+            }
+        } else
+            ExprBlackHole::throwInfiniteRecursionError(*this, v);
+    } catch (...) {
+        handleEvalExceptionForThunk(env, expr, v, pos);
+        throw;
+    }
+}
+
+[[gnu::noinline]]
+void EvalState::forceAppValue(Value & v, const PosIdx pos)
+{
+    const uint32_t epochStart = traceCtx ? traceCtx->currentReplayEpochSize() : 0;
+    ReplayPublishScope replayScope([this, &v, epochStart]{
+        recordThunkDeps(v, epochStart);
+    });
+    Value savedApp = v;
+    try {
+        callFunction(*v.app().left, *v.app().right, v, pos);
+        replayScope.commit();
+    } catch (...) {
+        handleEvalExceptionForApp(v, savedApp);
+        throw;
+    }
+}
+
+void EvalState::resetTraceContext()
+{
+    if (traceCtx)
+        traceCtx->reset();
+}
+
+std::unique_ptr<eval_trace::TraceBackend> EvalState::makeTraceBackend(const Hash & fingerprint)
+{
+    assert(traceCtx);
+    return traceCtx->makeTraceBackend(fingerprint, symbols);
+}
+
+InterningPools & EvalState::tracingPools()
+{
+    assert(traceCtx);
+    return traceCtx->tracingPools();
+}
+
+std::vector<Dep> & EvalState::replayEpochLog()
+{
+    assert(traceCtx);
+    return traceCtx->replayStore.epochLog_;
+}
+
+eval_trace::AttrVocabStore & EvalState::vocabStore()
+{
+    assert(traceCtx);
+    return traceCtx->getVocabStore(symbols);
+}
+
+void EvalState::registerTracedValueIdentity(const Value * key, const eval_trace::TracedExpr & tracedExpr)
+{
+    if (traceCtx)
+        traceCtx->registerTracedValueIdentity(key, tracedExpr);
+}
+
+void EvalState::registerTracedBindingsValueIdentity(
+    const Bindings * key,
+    const eval_trace::TracedExpr & tracedExpr,
+    const Bindings * originalBindings)
+{
+    if (traceCtx)
+        traceCtx->registerTracedBindingsValueIdentity(key, tracedExpr, originalBindings);
+}
+
+void EvalState::rememberNixBinding(PosIdx pos, const NixBindingEntry & entry)
+{
+    if (traceCtx)
+        traceCtx->rememberNixBinding(pos, entry);
+}
+
+const NixBindingEntry * EvalState::lookupNixBinding(PosIdx pos) const
+{
+    return traceCtx ? traceCtx->lookupNixBinding(pos) : nullptr;
+}
+
+void EvalState::registerMaterializedValueIdentity(
+    const Value * key,
+    eval_trace::TraceBackend * traceBackend,
+    std::optional<SiblingIdentity> siblingIdentity,
+    AttrPathId pathId,
+    std::optional<ValueIdentityStamp> valueIdentityStamp)
+{
+    if (traceCtx)
+        traceCtx->registerMaterializedValueIdentity(
+            key, traceBackend, std::move(siblingIdentity), pathId, valueIdentityStamp);
+}
+
+PublishedMaterializedIdentity EvalState::publishRootMaterializedValueIdentity(
+    const Value * key,
+    eval_trace::TraceBackend * traceBackend,
+    AttrPathId pathId,
+    ValueIdentityStamp valueIdentityStamp)
+{
+    if (!traceCtx)
+        return {};
+    return traceCtx->publishRootMaterializedValueIdentity(
+        key, traceBackend, pathId, valueIdentityStamp);
+}
+
+void EvalState::rollbackRootMaterializedValueIdentity(
+    const PublishedMaterializedIdentity & publication)
+{
+    if (traceCtx)
+        traceCtx->rollbackRootMaterializedValueIdentity(publication);
+}
+
+std::optional<ValueIdentityStamp> EvalState::lookupValueIdentityStamp(const Value & v) const
+{
+    if (traceCtx)
+        return traceCtx->lookupValueIdentityStamp(v);
+    return std::nullopt;
+}
+
+bool EvalState::hasValueIdentityForTest(const Value * key) const
+{
+    return traceCtx && traceCtx->hasValueIdentity_ForTest(key);
+}
+
+bool EvalState::hasBindingsValueIdentityForTest(const Bindings * key) const
+{
+    return traceCtx && traceCtx->hasBindingsValueIdentity_ForTest(key);
+}
+
+void EvalState::recordThunkDeps(const Value & v, uint32_t epochStart)
+{
+    if (traceCtx)
+        traceCtx->recordThunkDeps(v, epochStart);
+}
+
+void EvalState::rollbackReplayEpoch(uint32_t epochStart)
+{
+    if (traceCtx)
+        traceCtx->rollbackReplayEpoch(epochStart);
+}
+
+void EvalState::replayMemoizedDeps(const Value & v)
+{
+    if (traceCtx)
+        traceCtx->replayMemoizedDeps(v);
+}
+
+bool EvalState::mayHaveMemoizedDeps(const Value & v) const
+{
+    return traceCtx && traceCtx->replayStore.replayBloom.test(&v);
+}
+
+bool EvalState::sameValueIdentity(Value & v1, Value & v2)
+{
+    return traceCtx && traceCtx->sameValueIdentity(v1, v2);
 }
 
 void EvalState::eval(Expr * e, Value & v)
@@ -1443,6 +2153,9 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
             if (def) {
                 state.forceValue(*vAttrs, pos);
                 if (vAttrs->type() != nAttrs || !(j = vAttrs->attrs()->get(name))) {
+                    // Record #has:key for traced attrset where key was NOT found
+                    if (state.traceActiveDepth && vAttrs->type() == nAttrs) [[unlikely]]
+                        maybeRecordHasKeyDep(state.positions, state.symbols, *vAttrs, name, false);
                     def->eval(state, env, v);
                     return;
                 }
@@ -1462,6 +2175,12 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
             }
             vAttrs = j->value;
             pos2 = j->pos;
+            // Record per-binding NixBinding dep if this attr was defined
+            // in an eligible .nix file (PosIdx registered at parse time).
+            if (state.traceActiveDepth) [[unlikely]] {
+                if (auto access = eval_trace::TraceAccess::current())
+                    maybeRecordNixBindingDep(*access, state, j->pos);
+            }
             if (state.countCalls)
                 state.attrSelects[pos2]++;
         }
@@ -1479,6 +2198,12 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
         throw;
     }
 
+    // Copy the forced Value into the caller's output. This is a struct copy:
+    // the caller gets the same data (Bindings*, list pointers, etc.) but at
+    // a different Value* address. Code that relies on Value* identity — such
+    // as TraceRuntime::valueIdentityMap — cannot find these copies.
+    // Copied attrsets recover eval-trace pointer equality through the owned
+    // Bindings ValueIdentityStamp instead of a secondary Bindings*-keyed map.
     v = *vAttrs;
 }
 
@@ -1500,8 +2225,30 @@ Symbol ExprSelect::evalExceptFinalSelect(EvalState & state, Env & env, Value & a
 
 void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
 {
+    // Eval-trace soundness for multi-segment ? (e.g., `data ? x.y`):
+    //
+    // Only the FINAL segment records a #has:key dep. Intermediate segments
+    // are navigated without recording #has deps. This is sound because:
+    //
+    // 1. The SC dep key encodes the full path (e.g., `j:x#has:y`).
+    //    During verification, the system navigates the JSON DOM through
+    //    all intermediate segments before checking the leaf. If any
+    //    intermediate key is removed, navigation fails → dep fails →
+    //    re-evaluation.
+    //
+    // 2. For multi-provenance attrsets (via //), ImplicitShape #keys deps
+    //    recorded at creation time serve as a fallback. If a source's key
+    //    set changes (e.g., another source adds a shadowing key), IS #keys
+    //    detects the change → re-evaluation.
+    //
+    // Recording #has:key for intermediate segments would be redundant:
+    // property (1) already catches removal, and property (2) catches
+    // multi-source shadowing.
+
     Value vTmp;
     Value * vAttrs = &vTmp;
+    Value * lastAttrset = nullptr;
+    Symbol lastKeyName;
 
     e->eval(state, env, vTmp);
 
@@ -1510,13 +2257,29 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
         const Attr * j;
         auto name = getName(i, state, env);
         if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
+            lastAttrset = vAttrs;
+            lastKeyName = name;
+            // Record per-binding NixBinding dep (same as ExprSelect).
+            if (state.traceActiveDepth) [[unlikely]] {
+                if (auto access = eval_trace::TraceAccess::current())
+                    maybeRecordNixBindingDep(*access, state, j->pos);
+            }
             vAttrs = j->value;
         } else {
+            // Record #has:key for the attrset where the key was NOT found.
+            // Only the failure point gets a dep — intermediate successes
+            // are covered by SC dep path navigation during verification.
+            if (state.traceActiveDepth && vAttrs->type() == nAttrs) [[unlikely]]
+                maybeRecordHasKeyDep(state.positions, state.symbols, *vAttrs, name, false);
             v.mkBool(false);
             return;
         }
     }
 
+    // Record #has:key for the last attrset where the key was found.
+    // Only the leaf segment gets a dep — see soundness comment above.
+    if (state.traceActiveDepth && lastAttrset) [[unlikely]]
+        maybeRecordHasKeyDep(state.positions, state.symbols, *lastAttrset, lastKeyName, true);
     v.mkBool(true);
 }
 
@@ -1603,6 +2366,7 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
 
                 /* Check that each actual argument is listed as a formal
                    argument (unless the attribute match specifies a `...'). */
+                if (traceActiveDepth && !formals->ellipsis) [[unlikely]] maybeRecordAttrKeysDep(positions, symbols, *args[0]);
                 if (!formals->ellipsis && attrsUsed != args[0]->attrs()->size()) {
                     /* Nope, so show the first unexpected argument to the
                        user. */
@@ -1895,6 +2659,11 @@ void ExprOpNot::eval(EvalState & state, Env & env, Value & v)
 
 void ExprOpEq::eval(EvalState & state, Env & env, Value & v)
 {
+    // v1 and v2 are stack-local Values. When e1/e2 are ExprSelect, the result
+    // is a struct copy of the Bindings Value (see ExprSelect::eval). These
+    // copies have different Value* addresses than the originals, which matters
+    // for eval-trace's valueIdentityMap (keyed by Value*). Attrset copies now
+    // recover identity through the copied value's Bindings-local stamp.
     Value v1;
     e1->eval(state, env, v1);
     Value v2;
@@ -1936,15 +2705,34 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 {
     state.nrOpUpdates++;
 
+    // ExprOpUpdate (//) is a set UNION — the output can contain keys from
+    // both operands, making it potentially larger than either source.  This
+    // violates the shape-preserving requirement (output.keys ⊆ source.keys)
+    // of DerivedContainerBuilder.  Two disjoint subsets of the same traced
+    // container (e.g. removeAttrs x ks1 // removeAttrs x ks2) would reunite
+    // into an output larger than either, triggering the finishAttrs assertion.
+    //
+    // DerivedContainerBuilder is therefore only used for the empty-operand
+    // alias paths where output == one input (trivially shape-preserving).  The
+    // builder is fed only the operand actually returned; the other operand may
+    // have been observed to decide the branch, but it is not the output's
+    // container identity.  For actual merge paths, we call mkAttrs directly.
+    // Per-key attribute-level deps still flow through Attr::pos on those paths.
     const Bindings & bindings1 = *v1.attrs();
     if (bindings1.empty()) {
         v = v2;
+        eval_trace::DerivedAttrsBuilder aliasBuilder;
+        aliasBuilder.addShapePreservingSource(v2);
+        aliasBuilder.registerContainer(v);
         return;
     }
 
     const Bindings & bindings2 = *v2.attrs();
     if (bindings2.empty()) {
         v = v1;
+        eval_trace::DerivedAttrsBuilder aliasBuilder;
+        aliasBuilder.addShapePreservingSource(v1);
+        aliasBuilder.registerContainer(v);
         return;
     }
 
@@ -2053,6 +2841,38 @@ void ExprOpConcatLists::eval(EvalState & state, Env & env, Value & v)
     state.concatLists(v, lists, pos, "while evaluating one of the elements to concatenate");
 }
 
+/// Concatenate multiple lists into one.
+///
+/// NOTE: Does NOT use DerivedContainerBuilder.  The output list's length
+/// is the sum of all input lengths — not a shape property of any single
+/// source.  DerivedContainerBuilder would propagate provenance from one
+/// source, but then maybeRecordListLenDep would record #len = (sum of
+/// all lengths) keyed to that source's identity.  Verification would
+/// re-read that single source and compute its length (not the sum),
+/// producing a hash mismatch.  DerivedContainerBuilder is only correct
+/// for shape-preserving operations where the output's shape is a subset
+/// or reordering of a single source's shape (filter, sort, removeAttrs).
+///
+/// The alias path (single non-empty list, v = *nonEmpty) copies the
+/// Value bitwise, preserving the same heap-backed list-storage pointer.
+///
+/// Container provenance lookup for lists is storage-identity-based:
+/// ContainerRef (trace-frame.hh) uses the heap-backed list-storage pointer as
+/// the hash/eq key, NOT the enclosing Value* address.  Because the
+/// bitwise copy preserves the same storage pointer, lookupTracedContainer
+/// on the alias returns the source's TracedContainerProvenance without
+/// any new registerTracedContainer call.  buildCachedResult therefore
+/// serialises TracedContainerMeta correctly for the alias.
+///
+/// The #len dep is recorded on the source lists (maybeRecordListLenDep
+/// in the loop below) before the alias branch; the dep identity is correct because it uses the source
+/// provenance, which is the same provenance the alias resolves to.
+///
+/// INVARIANT: this alias is correct only because v = *nonEmpty is a
+/// bitwise copy that preserves list storage identity.  Do NOT replace
+/// with a manual rebuild (buildList + memcpy) — that would create a new
+/// elems array with different pointer identity, breaking the storage-keyed
+/// ContainerProvenanceRegistry lookup.  Use the bitwise copy.
 void EvalState::concatLists(Value & v, std::span<Value * const> lists, const PosIdx pos, std::string_view errorCtx)
 {
     nrListConcats++;
@@ -2061,6 +2881,7 @@ void EvalState::concatLists(Value & v, std::span<Value * const> lists, const Pos
     size_t len = 0;
     for (auto * list : lists) {
         forceList(*list, pos, errorCtx);
+        if (traceActiveDepth) [[unlikely]] maybeRecordListLenDep(*list);
         auto l = list->listSize();
         len += l;
         if (l)
@@ -2096,6 +2917,11 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
     bool first = !forceString;
     ValueType firstType = nString;
 
+    /* Accessor of the first element, captured when it's a path, so the
+       result inherits handle identity rather than being rebuilt onto
+       `state.rootFS`. */
+    SourceAccessor * firstPathAccessor = nullptr;
+
     // List of returned strings. References to these Values must NOT be persisted.
     SmallTemporaryValueVector<conservativeStackReservation> values(es.size());
     Value * vTmpP = values.data();
@@ -2110,6 +2936,8 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
            and none of the strings are allowed to have contexts. */
         if (first) {
             firstType = vTmp.type();
+            if (firstType == nPath)
+                firstPathAccessor = vTmp.pathAccessor();
         }
 
         if (firstType == nInt) {
@@ -2172,7 +3000,13 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
         for (const auto & part : strings) {
             resultStr += *part;
         }
-        v.mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
+        assert(firstPathAccessor && "firstType==nPath implies firstPathAccessor was set");
+        v.mkPath(
+            SourcePath{
+                ref(firstPathAccessor->shared_from_this()),
+                CanonPath(resultStr),
+            },
+            state.mem);
     } else {
         auto & resultStr = StringData::alloc(state.mem, sSize);
         auto * tmp = resultStr.data();
@@ -2182,6 +3016,28 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
         }
         *tmp = '\0';
         v.mkStringMove(resultStr, context, state.mem);
+    }
+
+    if (firstType == nPath || firstType == nString) {
+        std::optional<PathObject> propagated;
+        bool ambiguous = false;
+        for (const auto & value : values) {
+            auto pub = state.lookupSemanticHandle(value);
+            auto found = pub ? pub->path : std::optional<PathObject>{};
+            if (!found)
+                continue;
+            if (!propagated) {
+                propagated = *found;
+                continue;
+            }
+            if (propagated->source != found->source || propagated->rootPath != found->rootPath) {
+                ambiguous = true;
+                break;
+            }
+        }
+
+        if (!ambiguous && propagated)
+            state.publishPathProvenance(v, *propagated);
     }
 }
 
@@ -2379,6 +3235,12 @@ bool EvalState::isFunctor(const Value & fun) const
     return fun.type() == nAttrs && fun.attrs()->get(s.functor);
 }
 
+void EvalState::forceListObserved(Value & v, const PosIdx pos, std::string_view errorCtx)
+{
+    forceList(v, pos, errorCtx);
+    if (traceActiveDepth) [[unlikely]] maybeRecordListLenDep(v);
+}
+
 void EvalState::forceFunction(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
     try {
@@ -2415,6 +3277,146 @@ void copyContext(const Value & v, NixStringContext & context, const Experimental
     if (auto * ctx = v.context())
         for (auto * elem : *ctx)
             context.insert(NixStringContextElem::parse(elem->view(), xpSettings));
+}
+
+static const SemanticHandle * allocateSemanticHandle(
+    EvalMemory & mem,
+    const std::optional<SemanticHandle> & publication)
+{
+    if (!publication || publication->empty())
+        return nullptr;
+    return new (mem.allocBytes(sizeof(SemanticHandle))) SemanticHandle(*publication);
+}
+
+std::optional<SemanticHandle> EvalState::lookupSemanticHandle(const Value & v) const
+{
+    if (auto * publication = v.publication()) {
+        if (!publication->empty())
+            return *publication;
+    }
+
+    return std::nullopt;
+}
+
+std::string_view ContextObject::view() const
+{
+    return std::visit(
+        [](const auto & inner) -> std::string_view {
+            return *inner.value;
+        },
+        inner_);
+}
+
+void EvalState::setSemanticHandle(Value & v, const std::optional<SemanticHandle> & publication) const
+{
+    if (!publication || publication->empty())
+        return;
+
+    auto & memRef = const_cast<EvalMemory &>(mem);
+    auto carriedPublication = allocateSemanticHandle(memRef, publication);
+    if (!carriedPublication)
+        return;
+
+    if (v.type() == nString) {
+        auto text = std::string(v.string_view());
+        NixStringContext copied;
+        if (auto * ctx = v.context())
+            for (auto * elem : *ctx)
+                copied.insert(NixStringContextElem::parse(elem->view()));
+        if (copied.empty())
+            v.mkString(text, memRef, carriedPublication);
+        else
+            v.mkString(text, copied, memRef, carriedPublication);
+    } else if (v.type() == nPath) {
+        v.mkPath(v.path(), memRef, carriedPublication);
+    }
+}
+
+void EvalState::mergeSemanticHandle(Value & v, const std::optional<SemanticHandle> & publication) const
+{
+    if (!publication || publication->empty())
+        return;
+
+    auto merged = lookupSemanticHandle(v).value_or(SemanticHandle{});
+    if (publication->path)
+        merged.path = publication->path;
+    if (publication->text)
+        merged.text = publication->text;
+    if (publication->identity)
+        merged.identity = publication->identity;
+
+    // Update the kind discriminator to match the merged fields.
+    if (merged.path && merged.text)
+        merged.kind = SemanticKind::PathText;
+    else if (merged.path)
+        merged.kind = SemanticKind::Path;
+    else if (merged.text)
+        merged.kind = SemanticKind::Text;
+
+    if (v.type() != nString && v.type() != nPath) {
+        return;
+    }
+    setSemanticHandle(v, std::optional<SemanticHandle>(merged));
+}
+
+ContextObject EvalState::captureContextObject(
+    std::string_view value,
+    const Value & source) const
+{
+    return ContextObject{
+        ContextObject::PreservedString{
+            .value = BackedStringView(value),
+            .publication = lookupSemanticHandle(source).value_or(SemanticHandle{}),
+        }};
+}
+
+EvalState::CoercedPath EvalState::captureCoercedPath(
+    SourcePath value,
+    const Value & source) const
+{
+    auto handle = lookupSemanticHandle(source);
+    return capturePathWithObject(std::move(value), handle ? handle->path : std::nullopt);
+}
+
+EvalState::CoercedPath EvalState::capturePathWithObject(
+    SourcePath value,
+    std::optional<PathObject> origin) const
+{
+    return CoercedPath(std::move(value), std::move(origin));
+}
+
+void EvalState::publishContextObject(
+    Value & v,
+    ContextObject && coerced,
+    NixStringContext context)
+{
+    std::visit(
+        [&](const auto & inner) {
+            if (context.empty())
+                v.mkString(*inner.value, mem);
+            else
+                v.mkString(*inner.value, context, mem);
+
+            using Inner = std::decay_t<decltype(inner)>;
+            if constexpr (std::is_same_v<Inner, ContextObject::PreservedString>) {
+                mergeSemanticHandle(v, inner.publication.empty() ? std::nullopt : std::optional<SemanticHandle>(inner.publication));
+            }
+        },
+        coerced.inner_);
+}
+
+void EvalState::publishCoercedPath(
+    Value & v,
+    CoercedPath && coerced)
+{
+    v.mkPath(coerced.value_, mem);
+    if (coerced.origin_)
+        mergeSemanticHandle(v, SemanticHandle::forPath(*coerced.origin_));
+}
+
+bool ContextObject::isDetached() const
+{
+    return std::holds_alternative<DetachedStorePathString>(inner_);
 }
 
 std::string_view EvalState::forceString(
@@ -2458,57 +3460,109 @@ bool EvalState::isDerivation(Value & v)
 }
 
 std::optional<std::string>
-EvalState::tryAttrsToString(const PosIdx pos, Value & v, NixStringContext & context, bool coerceMore, bool copyToStore)
+EvalState::tryAttrsToString(
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    bool coerceMore,
+    bool copyToStore)
+{
+    return tryAttrsToString(pos, v, context, coerceMore, copyToStore, nullptr, nullptr);
+}
+
+std::optional<std::string>
+EvalState::tryAttrsToString(
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    bool coerceMore,
+    bool copyToStore,
+    std::optional<PathObject> * origin,
+    std::optional<TextObject> * readFileProvenance)
 {
     auto i = v.attrs()->get(s.toString);
     if (i) {
         Value v1;
         callFunction(*i->value, v, v1, pos);
-        return coerceToString(
+        return coerceToStringWithProvenance(
                    pos,
                    v1,
                    context,
                    "while evaluating the result of the `__toString` attribute",
                    coerceMore,
-                   copyToStore)
+                   copyToStore,
+                   true,
+                   origin,
+                   readFileProvenance)
             .toOwned();
     }
 
     return {};
 }
 
-BackedStringView EvalState::coerceToString(
+BackedStringView EvalState::coerceToStringWithProvenance(
     const PosIdx pos,
     Value & v,
     NixStringContext & context,
     std::string_view errorCtx,
     bool coerceMore,
     bool copyToStore,
-    bool canonicalizePath)
+    bool canonicalizePath,
+    std::optional<PathObject> * origin,
+    std::optional<TextObject> * readFileProvenance)
 {
     auto _level = addCallDepth(pos);
 
     forceValue(v, pos);
 
+    if (origin)
+        origin->reset();
+    if (readFileProvenance)
+        readFileProvenance->reset();
+
     if (v.type() == nString) {
         copyContext(v, context);
+        if (origin || readFileProvenance) {
+            auto handle = lookupSemanticHandle(v);
+            if (origin)
+                *origin = handle ? handle->path : std::nullopt;
+            if (readFileProvenance)
+                *readFileProvenance = handle ? handle->text : std::nullopt;
+        }
         return v.string_view();
     }
 
     if (v.type() == nPath) {
+        if (origin) {
+            auto handle = lookupSemanticHandle(v);
+            *origin = handle ? handle->path : std::nullopt;
+        }
         if (!canonicalizePath && !copyToStore) {
             // FIXME: hack to preserve path literals that end in a
             // slash, as in /foo/${x}.
             return v.pathStrView();
         } else if (copyToStore) {
-            return store->printStorePath(copyPathToStore(context, v.path()));
+            auto handle = lookupSemanticHandle(v);
+            return BackedStringView(
+                std::string(copyPathToStoreViaEvalEnvironment(
+                    *this,
+                    context,
+                    v.path(),
+                    handle ? handle->path : std::nullopt).renderedPath()));
         } else {
             return std::string{v.path().path.abs()};
         }
     }
 
     if (v.type() == nAttrs) {
-        auto maybeString = tryAttrsToString(pos, v, context, coerceMore, copyToStore);
+        auto maybeString = tryAttrsToString(
+            pos,
+            v,
+            context,
+            coerceMore,
+            copyToStore,
+            origin,
+            readFileProvenance);
         if (maybeString)
             return std::move(*maybeString);
         auto i = v.attrs()->get(s.outPath);
@@ -2518,7 +3572,16 @@ BackedStringView EvalState::coerceToString(
                 .withTrace(pos, errorCtx)
                 .debugThrow();
         }
-        return coerceToString(pos, *i->value, context, errorCtx, coerceMore, copyToStore, canonicalizePath);
+        return coerceToStringWithProvenance(
+            pos,
+            *i->value,
+            context,
+            errorCtx,
+            coerceMore,
+            copyToStore,
+            canonicalizePath,
+            origin,
+            readFileProvenance);
     }
 
     if (v.type() == nExternal) {
@@ -2545,6 +3608,7 @@ BackedStringView EvalState::coerceToString(
             return "";
 
         if (v.isList()) {
+            if (traceActiveDepth) [[unlikely]] maybeRecordListLenDep(v);
             std::string result;
             auto listView = v.listView();
             for (auto [n, v2] : enumerate(listView)) {
@@ -2575,34 +3639,199 @@ BackedStringView EvalState::coerceToString(
         .debugThrow();
 }
 
-StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePath & path)
+BackedStringView EvalState::coerceToString(
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    std::string_view errorCtx,
+    bool coerceMore,
+    bool copyToStore,
+    bool canonicalizePath)
 {
-    if (nix::isDerivation(path.path.abs()))
-        error<EvalError>("file names are not allowed to end in '%1%'", drvExtension).debugThrow();
-
-    auto dstPathCached = getConcurrent(*srcToStore, path);
-
-    auto dstPath = dstPathCached ? *dstPathCached : [&]() {
-        auto dstPath = fetchToStore(
-            fetchSettings,
-            *store,
-            path.resolveSymlinks(SymlinkResolution::Ancestors),
-            settings.isReadOnly() ? FetchMode::DryRun : FetchMode::Copy,
-            path.baseName(),
-            ContentAddressMethod::Raw::NixArchive,
-            nullptr,
-            repair);
-        allowPath(dstPath);
-        srcToStore->try_emplace(path, dstPath);
-        printMsg(lvlChatty, "copied source '%1%' -> '%2%'", path, store->printStorePath(dstPath));
-        return dstPath;
-    }();
-
-    context.insert(NixStringContextElem::Opaque{.path = dstPath});
-    return dstPath;
+    return coerceToStringWithProvenance(pos, v, context, errorCtx,
+        coerceMore, copyToStore, canonicalizePath, nullptr, nullptr);
 }
 
-SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)
+ContextObject EvalState::coerceToContextObject(
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    std::string_view errorCtx,
+    bool coerceMore,
+    bool copyToStore,
+    bool canonicalizePath)
+{
+    auto _level = addCallDepth(pos);
+
+    forceValue(v, pos);
+
+    if (v.type() == nString) {
+        copyContext(v, context);
+        return ContextObject{
+            ContextObject::PreservedString{
+                .value = BackedStringView(v.string_view()),
+                .publication = lookupSemanticHandle(v).value_or(SemanticHandle{}),
+            }};
+    }
+
+    if (v.type() == nPath) {
+        if (!canonicalizePath && !copyToStore) {
+            return ContextObject{
+                ContextObject::PreservedString{
+                    .value = BackedStringView(v.pathStrView()),
+                    .publication = lookupSemanticHandle(v).value_or(SemanticHandle{}),
+                }};
+        } else if (copyToStore) {
+            auto handle = lookupSemanticHandle(v);
+            auto published = copyPathToStoreViaEvalEnvironment(
+                *this,
+                context,
+                v.path(),
+                handle ? handle->path : std::nullopt);
+            return ContextObject{
+                ContextObject::DetachedStorePathString{
+                    .value = BackedStringView(std::string(published.renderedPath())),
+                }};
+        } else {
+            return ContextObject{
+                ContextObject::PreservedString{
+                    .value = BackedStringView(std::string{v.path().path.abs()}),
+                    .publication = lookupSemanticHandle(v).value_or(SemanticHandle{}),
+                }};
+        }
+    }
+
+    if (v.type() == nAttrs) {
+        auto i = v.attrs()->get(s.toString);
+        if (i) {
+            Value v1;
+            callFunction(*i->value, v, v1, pos);
+            return coerceToContextObject(
+                pos,
+                v1,
+                context,
+                "while evaluating the result of the `__toString` attribute",
+                coerceMore,
+                copyToStore,
+                true);
+        }
+
+        auto outPath = v.attrs()->get(s.outPath);
+        if (!outPath) {
+            error<TypeError>(
+                "cannot coerce %1% to a string: %2%",
+                showType(v),
+                ValuePrinter(*this, v, errorPrintOptions))
+                .withTrace(pos, errorCtx)
+                .debugThrow();
+        }
+
+        return coerceToContextObject(
+            pos,
+            *outPath->value,
+            context,
+            errorCtx,
+            coerceMore,
+            copyToStore,
+            canonicalizePath);
+    }
+
+    if (v.type() == nExternal) {
+        try {
+            return ContextObject{
+                ContextObject::PlainString{
+                    .value = BackedStringView(
+                        v.external()->coerceToString(*this, pos, context, coerceMore, copyToStore)),
+                }};
+        } catch (Error & e) {
+            e.addTrace(nullptr, errorCtx);
+            throw;
+        }
+    }
+
+    if (coerceMore) {
+        if (v.type() == nBool && v.boolean())
+            return ContextObject{
+                ContextObject::PlainString{.value = BackedStringView("1")}};
+        if (v.type() == nBool && !v.boolean())
+            return ContextObject{
+                ContextObject::PlainString{.value = BackedStringView("")}};
+        if (v.type() == nInt)
+            return ContextObject{
+                ContextObject::PlainString{
+                    .value = BackedStringView(std::to_string(v.integer().value))}};
+        if (v.type() == nFloat)
+            return ContextObject{
+                ContextObject::PlainString{
+                    .value = BackedStringView(std::to_string(v.fpoint()))}};
+        if (v.type() == nNull)
+            return ContextObject{
+                ContextObject::PlainString{.value = BackedStringView("")}};
+
+        if (v.isList()) {
+            if (traceActiveDepth) [[unlikely]] maybeRecordListLenDep(v);
+            std::string result;
+            auto listView = v.listView();
+            for (auto [n, v2] : enumerate(listView)) {
+                try {
+                    auto part = coerceToContextObject(
+                        pos,
+                        *v2,
+                        context,
+                        "while evaluating one element of the list",
+                        coerceMore,
+                        copyToStore,
+                        canonicalizePath);
+                    result += part.view();
+                } catch (Error & e) {
+                    e.addTrace(positions[pos], errorCtx);
+                    throw;
+                }
+                if (n < v.listSize() - 1
+                    && (!v2->isList() || v2->listSize() != 0))
+                    result += " ";
+            }
+            return ContextObject{
+                ContextObject::PlainString{
+                    .value = BackedStringView(std::move(result))}};
+        }
+    }
+
+    error<TypeError>("cannot coerce %1% to a string: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
+        .withTrace(pos, errorCtx)
+        .debugThrow();
+}
+
+ContextObject EvalState::coerceToContextObjectForUnsafeDiscard(
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    std::string_view errorCtx)
+{
+    auto * depCtx = eval_trace::currentFiberDepCtx();
+    if (!depCtx)
+        depCtx = eval_trace::currentStandaloneDepCtx();
+
+    if (!(traceActiveDepth && depCtx && depCtx->isActive()))
+        return coerceToContextObject(pos, v, context, errorCtx, false, true, true);
+
+    PublicationWarmupScope warmup(*this, depCtx);
+    auto coerced = coerceToContextObject(pos, v, context, errorCtx, false, true, true);
+    if (!coerced.isDetached())
+        warmup.mergeIntoParent();
+    else
+        warmup.discard();
+    return coerced;
+}
+
+
+
+SourcePath EvalState::coerceToPathWithProvenance(
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    std::string_view errorCtx,
+    std::optional<PathObject> * origin)
 {
     try {
         forceValue(v, pos);
@@ -2611,9 +3840,17 @@ SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext
         throw;
     }
 
+    if (origin)
+        origin->reset();
+
     /* Handle path values directly, without coercing to a string. */
-    if (v.type() == nPath)
+    if (v.type() == nPath) {
+        if (origin) {
+            auto handle = lookupSemanticHandle(v);
+            *origin = handle ? handle->path : std::nullopt;
+        }
         return v.path();
+    }
 
     /* Similarly, handle __toString where the result may be a path
        value. */
@@ -2622,16 +3859,36 @@ SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext
         if (i) {
             Value v1;
             callFunction(*i->value, v, v1, pos);
-            return coerceToPath(pos, v1, context, errorCtx);
+            return coerceToPathWithProvenance(pos, v1, context, errorCtx, origin);
         }
     }
 
     /* Any other value should be coercible to a string, interpreted
        relative to the root filesystem. */
-    auto path = coerceToString(pos, v, context, errorCtx, false, false, true).toOwned();
+    auto path = coerceToStringWithProvenance(pos, v, context, errorCtx, false, false, true, origin, nullptr).toOwned();
     if (path == "" || path[0] != '/')
         error<EvalError>("string '%1%' doesn't represent an absolute path", path).withTrace(pos, errorCtx).debugThrow();
     return rootPath(CanonPath(path));
+}
+
+SourcePath EvalState::coerceToPath(
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    std::string_view errorCtx)
+{
+    return coerceToPathWithProvenance(pos, v, context, errorCtx, nullptr);
+}
+
+EvalState::CoercedPath EvalState::coerceToCoercedPath(
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    std::string_view errorCtx)
+{
+    std::optional<PathObject> origin;
+    auto path = coerceToPathWithProvenance(pos, v, context, errorCtx, &origin);
+    return capturePathWithObject(std::move(path), std::move(origin));
 }
 
 StorePath
@@ -2809,6 +4066,9 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
         return;
 
     case nAttrs: {
+        // See comment in eqValues nAttrs case.
+        if (v1.attrs() == v2.attrs())
+            return;
         if (isDerivation(v1) && isDerivation(v2)) {
             auto i = v1.attrs()->get(s.outPath);
             auto j = v2.attrs()->get(s.outPath);
@@ -2947,9 +4207,19 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return v1.boolean() == v2.boolean();
 
     case nString:
+        if (traceActiveDepth) [[unlikely]] {
+            if (auto access = eval_trace::TraceAccess::current()) {
+                maybeRecordRawContentDep(*access, v1);
+                maybeRecordRawContentDep(*access, v2);
+            }
+        }
+        if (sameValueIdentity(v1, v2))
+            return true;
         return v1.string_view() == v2.string_view();
 
     case nPath:
+        if (sameValueIdentity(v1, v2))
+            return true;
         return
             // FIXME: compare accessors by their fingerprint.
             v1.pathAccessor() == v2.pathAccessor() && v1.pathStrView() == v2.pathStrView();
@@ -2958,14 +4228,34 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         return true;
 
     case nList:
+        if (traceActiveDepth) [[unlikely]] {
+            maybeRecordListLenDep(v1);
+            maybeRecordListLenDep(v2);
+        }
         if (v1.listSize() != v2.listSize())
             return false;
+        // Eval-trace materialization allocates fresh list backing arrays,
+        // breaking Value pointer identity. Check whether both values were
+        // produced by TracedExpr thunks that navigate to the same real value.
+        if (sameValueIdentity(v1, v2))
+            return true;
         for (size_t n = 0; n < v1.listSize(); ++n)
             if (!eqValues(*v1.listView()[n], *v2.listView()[n], pos, errorCtx))
                 return false;
         return true;
 
     case nAttrs: {
+        if (traceActiveDepth) [[unlikely]] {
+            maybeRecordAttrKeysDep(positions, symbols, v1);
+            maybeRecordAttrKeysDep(positions, symbols, v2);
+        }
+        if (v1.attrs() == v2.attrs())
+            return true;
+        // Eval-trace materialization allocates fresh Bindings, breaking
+        // the pointer check above. Check whether both values were produced
+        // by TracedExpr thunks that navigate to the same real value.
+        if (sameValueIdentity(v1, v2))
+            return true;
         /* If both sets denote a derivation (type = "derivation"),
            then compare their outPaths. */
         if (isDerivation(v1) && isDerivation(v2)) {
@@ -2981,7 +4271,9 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         /* Otherwise, compare the attributes one by one. */
         Bindings::const_iterator i, j;
         for (i = v1.attrs()->begin(), j = v2.attrs()->begin(); i != v1.attrs()->end(); ++i, ++j)
-            if (i->name != j->name || !eqValues(*i->value, *j->value, pos, errorCtx))
+            if (i->name != j->name)
+                return false;
+            else if (!eqValues(*i->value, *j->value, pos, errorCtx))
                 return false;
 
         return true;
@@ -2989,6 +4281,8 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
 
     /* Functions are incomparable. */
     case nFunction:
+        if (sameValueIdentity(v1, v2))
+            return true;
         return false;
 
     case nExternal:
@@ -3112,6 +4406,170 @@ void EvalState::printStatistics()
     topObj["nrLookups"] = nrLookups.load();
     topObj["nrPrimOpCalls"] = nrPrimOpCalls.load();
     topObj["nrFunctionCalls"] = nrFunctionCalls.load();
+    topObj["evalTrace"] = {
+        {"db", {
+            {"closeTimeUs", eval_trace::nrDbCloseTimeUs.load()},
+            {"initTimeUs", eval_trace::nrDbInitTimeUs.load()},
+        }},
+        {"hits", eval_trace::nrTraceCacheHits.load()},
+        {"loadTrace", {
+            {"count", eval_trace::nrLoadTraces.load()},
+            {"timeUs", eval_trace::nrLoadTraceTimeUs.load()},
+        }},
+        {"loadKeySet", {
+            {"count", eval_trace::nrLoadKeySets.load()},
+            {"cacheHits", eval_trace::nrLoadKeySetCacheHits.load()},
+            {"cacheMisses", eval_trace::nrLoadKeySetCacheMisses.load()},
+            {"timeUs", eval_trace::nrLoadKeySetTimeUs.load()},
+        }},
+        {"misses", eval_trace::nrTraceCacheMisses.load()},
+        {"record", {
+            {"count", eval_trace::nrRecords.load()},
+            {"flushUs", eval_trace::nrRecordFlushUs.load()},
+            {"hashUs", eval_trace::nrRecordHashUs.load()},
+            {"serializeKeysUs", eval_trace::nrRecordSerializeKeysUs.load()},
+            {"serializeValuesUs", eval_trace::nrRecordSerializeValuesUs.load()},
+            {"timeUs", eval_trace::nrRecordTimeUs.load()},
+        }},
+        {"recovery", {
+            {"attempts", eval_trace::nrRecoveryAttempts.load()},
+            {"acceptance", {
+                {"implicitGuardCandidates", eval_trace::nrRecoveryImplicitGuardCandidates.load()},
+                {"implicitGuardChecks", eval_trace::nrRecoveryImplicitGuardChecks.load()},
+                {"implicitGuardFailures", eval_trace::nrRecoveryImplicitGuardFailures.load()},
+                {"implicitGuardFullTraceLoads", eval_trace::nrRecoveryImplicitGuardFullTraceLoads.load()},
+                {"implicitGuardTimeUs", eval_trace::nrRecoveryImplicitGuardTimeUs.load()},
+            }},
+            {"directHash", {
+                {"hits", eval_trace::nrRecoveryDirectHashHits.load()},
+                {"timeUs", eval_trace::nrRecoveryDirectHashTimeUs.load()},
+            }},
+            {"failures", eval_trace::nrRecoveryFailures.load()},
+            {"gitIdentity", {
+                {"accepted", eval_trace::nrRecoveryGitIdentityAccepted.load()},
+                {"attempts", eval_trace::nrRecoveryGitIdentityAttempts.load()},
+                {"candidates", eval_trace::nrRecoveryGitIdentityCandidates.load()},
+                {"rejected", eval_trace::nrRecoveryGitIdentityRejected.load()},
+                {"timeUs", eval_trace::nrRecoveryGitIdentityTimeUs.load()},
+            }},
+            {"gitIdentityHits", eval_trace::nrRecoveryGitIdentityHits.load()},
+            // History-based bootstrap: orchestrator hit scanHistory
+            // after primary lookupCurrentNode missed. Distinct from
+            // attempts/hits, which track the 3-strategy fallback on
+            // verifyTrace failure. See OR-5 closure note.
+            {"historyBootstraps", eval_trace::nrHistoryBootstraps.load()},
+            {"structVariant", {
+                {"hits", eval_trace::nrRecoveryStructVariantHits.load()},
+                {"timeUs", eval_trace::nrRecoveryStructVariantTimeUs.load()},
+            }},
+            {"lookups", {
+                {"directHash", {
+                    {"count", eval_trace::nrRecoveryDirectHashLookupCount.load()},
+                    {"rows", eval_trace::nrRecoveryDirectHashLookupRows.load()},
+                    {"timeUs", eval_trace::nrRecoveryDirectHashLookupUs.load()},
+                }},
+                {"gitIdentity", {
+                    {"count", eval_trace::nrRecoveryGitIdentityLookupCount.load()},
+                    {"rows", eval_trace::nrRecoveryGitIdentityLookupRows.load()},
+                    {"timeUs", eval_trace::nrRecoveryGitIdentityLookupUs.load()},
+                }},
+                {"latestHistory", {
+                    {"count", eval_trace::nrRecoveryLatestHistoryLookupCount.load()},
+                    {"timeUs", eval_trace::nrRecoveryLatestHistoryLookupUs.load()},
+                }},
+                {"scanHistory", {
+                    {"count", eval_trace::nrRecoveryScanHistoryCount.load()},
+                    {"rows", eval_trace::nrRecoveryScanHistoryRows.load()},
+                    {"timeUs", eval_trace::nrRecoveryScanHistoryUs.load()},
+                }},
+            }},
+            {"timeUs", eval_trace::nrRecoveryTimeUs.load()},
+        }},
+        {"verify", {
+            {"count", eval_trace::nrTraceVerifications.load()},
+            {"depsChecked", eval_trace::nrDepsChecked.load()},
+            {"failed", eval_trace::nrVerificationsFailed.load()},
+            {"passed", eval_trace::nrVerificationsPassed.load()},
+            {"timeUs", eval_trace::nrVerifyTimeUs.load()},
+        }},
+        {"verifyTrace", {
+            {"timeUs", eval_trace::nrVerifyTraceTimeUs.load()},
+        }},
+        {"thunks", {
+            {"created", eval_trace::nrTracedExprCreated.load()},
+            {"fromMaterialize", eval_trace::nrTracedExprFromMaterialize.load()},
+            {"fromDataFile", eval_trace::nrTracedExprFromDataFile.load()},
+            {"forced", eval_trace::nrTracedExprForced.load()},
+            {"lazyStateAllocated", eval_trace::nrLazyStateAllocated.load()},
+        }},
+        {"dataFile", {
+            {"scalarChildren", eval_trace::nrDataFileScalarChildren.load()},
+            {"containerChildren", eval_trace::nrDataFileContainerChildren.load()},
+        }},
+        {"depTracker", {
+            {"scopes", eval_trace::nrDepContextScopes.load()},
+            {"ownDepsTotal", eval_trace::nrOwnDepsTotal.load()},
+            {"ownDepsMax", eval_trace::nrOwnDepsMax.load()},
+        }},
+        {"replay", {
+            {"totalCalls", eval_trace::nrReplayTotalCalls.load()},
+            {"bloomHits", eval_trace::nrReplayBloomHits.load()},
+            {"epochHits", eval_trace::nrReplayEpochHits.load()},
+            {"added", eval_trace::nrReplayAdded.load()},
+        }},
+        {"depHash", {
+            {"cacheHits", eval_trace::nrDepHashCacheHits.load()},
+            {"cacheMisses", eval_trace::nrDepHashCacheMisses.load()},
+            {"structuredMisses", eval_trace::nrDepHashStructuredMisses.load()},
+            {"contentSubsumptionSkips", eval_trace::nrContentSubsumptionSkips.load()},
+            {"contentUs", eval_trace::nrDepHashContentUs.load()},
+            {"directoryUs", eval_trace::nrDepHashDirectoryUs.load()},
+            {"existenceUs", eval_trace::nrDepHashExistenceUs.load()},
+            {"storePathUs", eval_trace::nrDepHashStorePathUs.load()},
+            {"structuredJsonUs", eval_trace::nrDepHashStructuredJsonUs.load()},
+            {"structuredTomlUs", eval_trace::nrDepHashStructuredTomlUs.load()},
+            {"structuredDirUs", eval_trace::nrDepHashStructuredDirUs.load()},
+            {"structuredNixUs", eval_trace::nrDepHashStructuredNixUs.load()},
+            {"structuredOuterUs", eval_trace::nrDepHashStructuredOuterUs.load()},
+            {"scDirSetMisses", eval_trace::nrDepHashScDirSetMisses.load()},
+            {"scJsonParseUs", eval_trace::nrDepHashScJsonParseUs.load()},
+            {"gitIdentityUs", eval_trace::nrDepHashGitIdentityUs.load()},
+            {"gitIdentityMisses", eval_trace::nrDepHashGitIdentityMisses.load()},
+            {"otherUs", eval_trace::nrDepHashOtherUs.load()},
+            {"recoveryRecomputeUs", eval_trace::nrRecoveryDepRecomputeUs.load()},
+            {"recoveryRecomputeCount", eval_trace::nrRecoveryDepRecomputeCount.load()},
+            {"structVariantCandidates", eval_trace::nrStructVariantCandidates.load()},
+            {"structVariantDepsResolved", eval_trace::nrStructVariantDepsResolved.load()},
+            {"structVariantLoadKeySetUs", eval_trace::nrStructVariantLoadKeySetUs.load()},
+            {"structVariantHashUs", eval_trace::nrStructVariantHashUs.load()},
+            {"structVariantDepResolveUs", eval_trace::nrStructVariantDepResolveUs.load()},
+            {"backendSetupFailed", eval_trace::nrTraceBackendSetupFailed.load()},
+            {"resolveViaRegistry", eval_trace::nrResolveViaRegistry.load()},
+            {"resolveViaPathObject", eval_trace::nrResolveViaPathObject.load()},
+            {"resolveViaAbsolute", eval_trace::nrResolveViaAbsolute.load()},
+            {"depRecordNoActiveContext", eval_trace::nrDepRecordNoActiveContext.load()},
+        }},
+    };
+
+    // Per-DepKeySetId SV candidate telemetry.  Emitted as an array
+    // (not an object) so the sort-by-`tried`-desc order survives JSON
+    // serialization.  `nlohmann::json::object_t` is `std::map` which
+    // sorts keys alphabetically at emit time, which would destroy the
+    // intended ordering ("10" would sort before "2"); an array pins
+    // the order the analysis scripts consume.
+    //
+    // Emitted only when the map is non-empty — most runs never enter
+    // structural-variant recovery, so this block is absent for them
+    // and the stats schema stays tidy.
+    {
+        auto svMap = eval_trace::snapshotSVCandidateStats();
+        if (!svMap.empty()) {
+            topObj["evalTrace"]["structVariant"] = {
+                {"byDepKeySet", eval_trace::renderSVCandidateStatsJson(svMap)},
+            };
+        }
+    }
+
 #if NIX_USE_BOEHMGC
     topObj["gc"] = {
         {"heapSize", heapSize},
@@ -3182,29 +4640,73 @@ SourcePath resolveExprPath(SourcePath path, bool addDefaultNix)
         if (++followCount >= maxFollow)
             throw Error("too many symbolic links encountered while traversing the path '%s'", path);
         auto p = path.parent().resolveSymlinks() / path.baseName();
+        if (p.path != path.path) {
+            path = p;
+            continue;
+        }
         if (p.lstat().type != SourceAccessor::tSymlink)
             break;
         path = {path.accessor, CanonPath(p.readLink(), path.path.parent().value_or(CanonPath::root))};
     }
 
-    /* If `path' refers to a directory, append `/default.nix'. */
+    /* If `path' refers to a directory, append `/default.nix' and continue
+       resolving symlinks from that file path. Otherwise `<nixpkgs>` and
+       `<foo/dependencies.nix>` can observe different identities when
+       `default.nix` is itself a symlink. */
     if (addDefaultNix && path.resolveSymlinks().lstat().type == SourceAccessor::tDirectory)
-        return path / "default.nix";
+        return resolveExprPath(path / "default.nix", false);
 
     return path;
 }
 
 Expr * EvalState::parseExprFromFile(const SourcePath & path)
 {
-    return parseExprFromFile(path, staticBaseEnv);
+    return parseExprFromFile(path, resolveExprPath(path).parent(), staticBaseEnv);
 }
 
 Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv)
 {
-    auto buffer = path.resolveSymlinks().readFile();
+    return parseExprFromFile(path, resolveExprPath(path).parent(), staticEnv);
+}
+
+Expr * EvalState::parseExprFromFile(
+    const SourcePath & path,
+    const SourcePath & basePath,
+    const std::shared_ptr<StaticEnv> & staticEnv)
+{
+    auto resolvedPath = resolveExprPath(path);
+    auto buffer = readFileViaEvalEnvironment(*this, resolvedPath);
+
     // readFile hopefully have left some extra space for terminators
     buffer.append("\0\0", 2);
-    return parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);
+    return parse(buffer.data(), buffer.size(), Pos::Origin(path), basePath, staticEnv);
+}
+
+Expr * EvalState::parseExprFromFile(
+    const SourcePath & displayPath,
+    const SourcePath & physicalPath,
+    const SourcePath & basePath,
+    const std::shared_ptr<StaticEnv> & staticEnv)
+{
+    auto resolvedPath = resolveExprPath(physicalPath);
+    auto buffer = readFileViaEvalEnvironment(*this, resolvedPath);
+
+    // readFile hopefully have left some extra space for terminators
+    buffer.append("\0\0", 2);
+    return parse(buffer.data(), buffer.size(), Pos::Origin(displayPath), basePath, staticEnv);
+}
+
+Expr * EvalState::parseExprFromFile(const SourcePath & path, const SourcePath & basePath)
+{
+    return parseExprFromFile(path, basePath, staticBaseEnv);
+}
+
+Expr * EvalState::parseExprFromFile(
+    const SourcePath & displayPath,
+    const SourcePath & physicalPath,
+    const SourcePath & basePath)
+{
+    return parseExprFromFile(displayPath, physicalPath, basePath, staticBaseEnv);
 }
 
 Expr * EvalState::parseExprFromString(
@@ -3249,129 +4751,6 @@ Expr * EvalState::parseStdin()
     buffer.append("\0\0", 2);
     auto s = make_ref<std::string>(buffer);
     return parse(buffer.data(), buffer.size(), Pos::Stdin{.source = s}, rootPath("."), staticBaseEnv);
-}
-
-SourcePath EvalState::findFile(const std::string_view path)
-{
-    return findFile(lookupPath, path);
-}
-
-SourcePath EvalState::findFile(const LookupPath & lookupPath, const std::string_view path, const PosIdx pos)
-{
-    for (auto & i : lookupPath.elements) {
-        auto suffixOpt = i.prefix.suffixIfPotentialMatch(path);
-
-        if (!suffixOpt)
-            continue;
-        auto suffix = *suffixOpt;
-
-        auto rOpt = resolveLookupPathPath(i.path);
-        if (!rOpt)
-            continue;
-        auto r = *rOpt;
-
-        auto suffixPath = CanonPath(suffix);
-        if (auto cachedRes = getConcurrent(*rOpt->resolvedPaths, suffixPath)) {
-            if (*cachedRes)
-                return **cachedRes;
-            else
-                // Cached negative lookup.
-                continue;
-        }
-
-        auto res = (r.path / suffixPath).resolveSymlinks();
-        if (res.pathExists()) {
-            r.resolvedPaths->emplace(suffixPath, res);
-            return res;
-        }
-
-        // Backward compatibility hack: throw an exception if access
-        // to this path is not allowed.
-        if (auto accessor = res.accessor.dynamic_pointer_cast<FilteringSourceAccessor>())
-            accessor->checkAccess(res.path);
-
-        // Cache negative lookups too.
-        r.resolvedPaths->emplace(suffixPath, std::nullopt);
-    }
-
-    if (hasPrefix(path, "nix/"))
-        return {corepkgsFS, CanonPath(path.substr(3))};
-
-    error<ThrownError>(
-        settings.pureEval ? "cannot look up '<%s>' in pure evaluation mode (use '--impure' to override)"
-                          : "file '%s' was not found in the Nix search path (add it using $NIX_PATH or -I)",
-        path)
-        .atPos(pos)
-        .debugThrow();
-}
-
-std::shared_ptr<EvalState::LookupPathResolvedState>
-EvalState::resolveLookupPathPath(const LookupPath::Path & value0, bool initAccessControl)
-{
-    auto & value = value0.s;
-    if (auto cached = getConcurrent(*lookupPathResolved, value))
-        return *cached;
-
-    auto finish = [&](std::optional<SourcePath> maybePath) {
-        std::shared_ptr<LookupPathResolvedState> res;
-        if (maybePath) {
-            debug("resolved search path element '%s' to '%s'", value, *maybePath);
-            res = std::make_shared<LookupPathResolvedState>(
-                *maybePath, make_ref<decltype(LookupPathResolvedState::resolvedPaths)::element_type>());
-        } else {
-            debug("failed to resolve search path element '%s'", value);
-        }
-        lookupPathResolved->emplace(std::string(value), res);
-        return res;
-    };
-
-    if (EvalSettings::isPseudoUrl(value)) {
-        try {
-            auto accessor = fetchers::downloadTarball(*store, fetchSettings, EvalSettings::resolvePseudoUrl(value));
-            auto storePath = fetchToStore(fetchSettings, *store, SourcePath(accessor), FetchMode::Copy);
-            return finish(this->storePath(storePath));
-        } catch (Error & e) {
-            logWarning({.msg = HintFmt("Nix search path entry '%1%' cannot be downloaded, ignoring", value)});
-        }
-    }
-
-    if (auto colPos = value.find(':'); colPos != value.npos) {
-        auto scheme = value.substr(0, colPos);
-        auto rest = value.substr(colPos + 1);
-        if (auto * hook = get(settings.lookupPathHooks, scheme)) {
-            auto res = (*hook)(*this, rest);
-            if (res)
-                return finish(std::move(*res));
-        }
-    }
-
-    {
-        auto path = rootPath(value);
-
-        /* Allow access to paths in the search path. */
-        if (initAccessControl) {
-            allowPathLegacy(path.path.abs());
-            if (store->isInStore(path.path.abs())) {
-                try {
-                    allowClosure(store->toStorePath(path.path.abs()).first);
-                } catch (InvalidPath &) {
-                }
-            }
-        }
-
-        if (path.resolveSymlinks().pathExists())
-            return finish(std::move(path));
-        else {
-            // Backward compatibility hack: throw an exception if access
-            // to this path is not allowed.
-            if (auto accessor = path.accessor.dynamic_pointer_cast<FilteringSourceAccessor>())
-                accessor->checkAccess(path.path);
-
-            logWarning({.msg = HintFmt("Nix search path entry '%1%' does not exist, ignoring", value)});
-        }
-    }
-
-    return finish(std::nullopt);
 }
 
 Expr * EvalState::parse(

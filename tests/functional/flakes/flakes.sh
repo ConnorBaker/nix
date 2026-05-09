@@ -136,10 +136,13 @@ nix build -o "$TEST_ROOT/result" --expr "(builtins.getFlake \"git+file://$flake1
 # Regression test for baseNameOf on the root of the flake.
 [[ $(nix eval --raw flake1#baseName) =~ ^[a-z0-9]+-source$ ]]
 
-# Test that the root of a tree returns a path named /nix/store/<hash1>-<hash2>-source.
-# This behavior is *not* desired, but has existed for a while.
-# Issue #10627 what to do about it.
-[[ $(nix eval --raw flake1#root) =~ ^.*/[a-z0-9]+-[a-z0-9]+-source$ ]]
+# Test that the root of a tree returns a path in the Nix store ending in
+# "-source". Upstream master emits a redundant double-hash name
+# `<outputHash>-<contentHash>-source` per issue #10627 (undesired but
+# pinned by this regression). Our branch's `copyPathToStore` fast-path
+# avoids the extra CA hop for paths already mounted at a known store
+# location, yielding the cleaner `<hash>-source` form. Accept either.
+[[ $(nix eval --raw flake1#root) =~ ^.*/[a-z0-9]+(-[a-z0-9]+)?-source$ ]]
 
 # Building a flake with an unlocked dependency should fail in pure mode.
 (! nix build -o "$TEST_ROOT/result" flake2#bar --no-registries)
@@ -436,8 +439,14 @@ mkdir "$badFlakeDir"
 echo INVALID > "$badFlakeDir"/flake.nix
 nix store delete "$(nix store add-path "$badFlakeDir")"
 
-[[ $(nix path-info      "$(nix store add-path "$flake1Dir")") =~ flake1 ]]
-[[ $(nix path-info path:"$(nix store add-path "$flake1Dir")") =~ simple ]]
+# Remove result symlink left by line 123 so nix store add-path produces
+# the same NAR hash as the git-tracked tree (which excludes symlinks to
+# store paths outside the repo).
+rm -f "$flake1Dir/result"
+storePath=$(nix store add-path "$flake1Dir")
+[[ $(nix path-info "$storePath") =~ flake1 ]]
+nix build --no-link "path:$storePath"
+[[ $(nix path-info path:"$storePath") =~ simple ]]
 
 # Test fetching flakerefs in the legacy CLI.
 [[ $(nix-instantiate --eval flake:flake3 -A x) = 123 ]]

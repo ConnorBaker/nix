@@ -17,6 +17,16 @@ GENERATE_CMP_EXT(, std::strong_ordering, SingleBuiltPathBuilt, *me->drvPath, me-
 // Darwin, per header.
 GENERATE_EQUAL(, BuiltPathBuilt ::, BuiltPathBuilt, *me->drvPath, me->outputs);
 
+static StorePath derivationPathOf(const SingleBuiltPath & path)
+{
+    return std::visit(
+        overloaded{
+            [](const SingleBuiltPath::Opaque & p) { return p.path; },
+            [](const SingleBuiltPath::Built & b) { return derivationPathOf(*b.drvPath); },
+        },
+        path.raw());
+}
+
 StorePath SingleBuiltPath::outPath() const
 {
     return std::visit(
@@ -63,7 +73,7 @@ SingleDerivedPath SingleBuiltPath::discardOutputPath() const
 nlohmann::json BuiltPath::Built::toJSON(const StoreDirConfig & store) const
 {
     nlohmann::json res;
-    res["drvPath"] = drvPath->toJSON(store);
+    res["drvPath"] = store.printStorePath(derivationPathOf(*drvPath));
     for (const auto & [outputName, outputPath] : outputs) {
         res["outputs"][outputName] = store.printStorePath(outputPath);
     }
@@ -73,7 +83,7 @@ nlohmann::json BuiltPath::Built::toJSON(const StoreDirConfig & store) const
 nlohmann::json SingleBuiltPath::Built::toJSON(const StoreDirConfig & store) const
 {
     nlohmann::json res;
-    res["drvPath"] = drvPath->toJSON(store);
+    res["drvPath"] = store.printStorePath(derivationPathOf(*drvPath));
     auto & [outputName, outputPath] = output;
     res["output"] = outputName;
     res["outputPath"] = store.printStorePath(outputPath);

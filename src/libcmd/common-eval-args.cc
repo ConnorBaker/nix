@@ -14,6 +14,12 @@
 #include "nix/cmd/compatibility-settings.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/globals.hh"
+#include "nix/util/hash.hh"
+#include "nix/expr/eval-environment/authority-internal.hh"
+#include "nix/expr/eval-environment/environment.hh"
+#include "nix/expr/eval-environment/request-types.hh"
+#include "nix/expr/eval-trace/hash-spec.hh"
+
 
 namespace nix {
 
@@ -39,7 +45,8 @@ EvalSettings evalSettings{
                     SourcePath(accessor),
                     FetchMode::Copy,
                     lockedRef.input.getName());
-                state.allowPath(storePath);
+                EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+                (void) environment.authorizeStorePath(storePath);
                 return state.storePath(storePath);
             },
         },
@@ -150,6 +157,32 @@ MixEvalArgs::MixEvalArgs()
     });
 }
 
+std::optional<std::string> MixEvalArgs::getAutoArgsIdentity() const
+{
+    if (autoArgs.empty())
+        return hashString(eval_trace::toHashAlgorithm(eval_trace::getEvalTraceHashAlgorithm()), "")
+            .to_string(HashFormat::Base16, false);
+    HashSink hasher(eval_trace::toHashAlgorithm(eval_trace::getEvalTraceHashAlgorithm()));
+    for (auto & [name, arg] : autoArgs) {
+        hasher(name);
+        hasher(std::string_view("\0", 1));
+        if (auto * e = std::get_if<AutoArgExpr>(&arg)) {
+            hasher("expr:");
+            hasher(e->expr);
+        } else if (auto * s = std::get_if<AutoArgString>(&arg)) {
+            hasher("str:");
+            hasher(s->s);
+        } else if (auto * f = std::get_if<AutoArgFile>(&arg)) {
+            hasher("file:");
+            auto content = readFile(f->path.string());
+            hasher(content);
+        } else // AutoArgStdin — not cacheable
+            return std::nullopt;
+        hasher(std::string_view("\0", 1));
+    }
+    return hasher.finish().hash.to_string(HashFormat::Base16, false);
+}
+
 Bindings * MixEvalArgs::getAutoArgs(EvalState & state)
 {
     auto res = state.buildBindings(autoArgs.size());
@@ -190,14 +223,21 @@ SourcePath lookupFileArg(EvalState & state, std::string_view s, const std::files
             flakeRef.resolve(fetchSettings, *state.store).lazyFetch(fetchSettings, *state.store);
         auto storePath = nix::fetchToStore(
             state.fetchSettings, *state.store, SourcePath(accessor), FetchMode::Copy, lockedRef.input.getName());
-        state.allowPath(storePath);
+        EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+        (void) environment.authorizeStorePath(storePath);
         return state.storePath(storePath);
     }
 
     else if (s.size() > 2 && s.at(0) == '<' && s.at(s.size() - 1) == '>') {
         // Should perhaps be a `CanonPath`?
         std::string p(s.substr(1, s.size() - 2));
-        return state.findFile(p);
+        EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+        auto request = LookupPathRequest::fromState(state, p, noPos);
+        try {
+            return environment.resolveLookupPath(request).resolvedPath;
+        } catch (Error & e) {
+            state.error<ThrownError>("%s", e.message()).debugThrow();
+        }
     }
 
     else

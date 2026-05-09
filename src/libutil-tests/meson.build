@@ -74,9 +74,11 @@ sources = files(
   'file-system.cc',
   'fun.cc',
   'git.cc',
+  'guarded.cc',
   'hash.cc',
   'hilite.cc',
   'json-utils.cc',
+  'linear.cc',
   'logging.cc',
   'lru-cache.cc',
   'memo.cc',
@@ -92,6 +94,7 @@ sources = files(
   'serialise.cc',
   'sort.cc',
   'source-accessor.cc',
+  'string-intern-table.cc',
   'spawn.cc',
   'strings.cc',
   'suggestions.cc',
@@ -101,6 +104,10 @@ sources = files(
   'util.cc',
   'xml-writer.cc',
 )
+
+subdir('gdp')
+subdir('session-types')
+subdir('singleton')
 
 if host_machine.system() != 'windows'
   subdir('unix')

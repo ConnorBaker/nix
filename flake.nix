@@ -347,6 +347,14 @@
               )).componentTests
             )
         // devFlake.checks.${system} or { }
+        // {
+          # The package's `checkPhase` runs ruff + pyright.  Expose it
+          # as the sole eval-trace-bench check so `nix flake check`
+          # runs them.
+          eval-trace-bench =
+            nixpkgsFor.${system}.native.callPackage ./benchmarks/eval-trace-bench/package.nix
+              { };
+        }
       );
 
       packages = forAllSystems (
@@ -357,6 +365,7 @@
           inherit (nixpkgsFor.${system}.native)
             changelog-d
             ;
+          eval-trace-bench = nixpkgsFor.${system}.native.callPackage ./benchmarks/eval-trace-bench/package.nix { };
           default = self.packages.${system}.nix;
           installerScriptForGHA = self.hydraJobs.installerScriptForGHA.${system};
           binaryTarball = self.hydraJobs.binaryTarball.${system};
@@ -483,8 +492,15 @@
         let
           pkgs = nixpkgsFor.${system}.native;
           opener = if pkgs.stdenv.isDarwin then "open" else "xdg-open";
+          evalTraceBench = pkgs.callPackage ./benchmarks/eval-trace-bench/package.nix { };
         in
         {
+          eval-trace-bench = {
+            type = "app";
+            program = "${evalTraceBench}/bin/eval-trace-bench";
+            meta.description =
+              "Run, compare, and analyse eval-trace benchmarks (generate / runs / logs / classify / series / pairwise / db-inspect / sv / simulate)";
+          };
           open-manual = {
             type = "app";
             program = "${pkgs.writeShellScript "open-nix-manual" ''

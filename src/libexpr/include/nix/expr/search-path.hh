@@ -3,6 +3,7 @@
 
 #include <optional>
 
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
 #include "nix/util/types.hh"
 #include "nix/util/comparator.hh"
 
@@ -87,7 +88,14 @@ struct LookupPath::Path
      * @todo Maybe change this to `std::variant<SourcePath, URL>`.
      */
     std::string s;
+    /// Logical provenance for path-valued search path entries. Parsed/config
+    /// entries leave this empty; `prim_findFile` populates it when the caller
+    /// passes a path/string value that already carries eval-trace provenance.
+    std::optional<PathObject> origin;
 
+    // Comparison stays string-only: physical lookup-path resolution is cached
+    // by the raw path string, while origin is an eval-trace sidecar used only
+    // to label successful matches.
     GENERATE_CMP(LookupPath::Path, me->s);
 };
 

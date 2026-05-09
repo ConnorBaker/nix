@@ -3,6 +3,7 @@
 
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/cmd/installable-value.hh"
+#include "nix/expr/eval-trace/cache/trace-session.hh"
 
 namespace nix {
 
@@ -41,6 +42,7 @@ struct InstallableFlake : InstallableValue
     ExtendedOutputsSpec extendedOutputsSpec;
     const flake::LockFlags & lockFlags;
     mutable std::shared_ptr<flake::LockedFlake> _lockedFlake;
+    mutable std::string resolvedAttrPath_;
 
     InstallableFlake(
         SourceExprCommand * cmd,
@@ -54,6 +56,8 @@ struct InstallableFlake : InstallableValue
 
     std::string what() const override
     {
+        if (attrPaths.size() == 1 && attrPaths.front().starts_with("."))
+            return flakeRef.to_string() + "#" + attrPaths.front().substr(1);
         return flakeRef.to_string() + "#" + *attrPaths.begin();
     }
 
@@ -61,15 +65,12 @@ struct InstallableFlake : InstallableValue
 
     DerivedPathsWithInfo toDerivedPaths() override;
 
-    std::pair<Value *, PosIdx> toValue(EvalState & state) override;
+    EvaluatedInstallableValue toValue(EvalState & state) override;
 
-    /**
-     * Get a cursor to every attrpath in getActualAttrPaths() that
-     * exists. However if none exists, throw an exception.
-     */
-    std::vector<ref<eval_cache::AttrCursor>> getCursors(EvalState & state) override;
+    std::string resolvedAttrPath() const override { return resolvedAttrPath_; }
 
     ref<flake::LockedFlake> getLockedFlake() const;
+    ref<eval_trace::TraceSession> getOrCreateTraceCache(EvalState & state) const override;
 
     FlakeRef nixpkgsFlakeRef() const;
 };

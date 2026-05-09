@@ -167,7 +167,7 @@ static auto * const windowSize = new Sync<std::pair<unsigned short, unsigned sho
 void updateWindowSize()
 {
 #ifndef _WIN32
-    struct winsize ws;
+    struct winsize ws{};
     if (ioctl(2, TIOCGWINSZ, &ws) == 0) {
         auto windowSize_(windowSize->lock());
         windowSize_->first = ws.ws_row;

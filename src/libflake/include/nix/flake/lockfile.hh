@@ -1,7 +1,9 @@
 #pragma once
 ///@file
 
+#include "nix/expr/eval-environment/domains.hh"
 #include "nix/flake/flakeref.hh"
+#include "nix/flake/phase-types.hh"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -104,12 +106,33 @@ struct Node : std::enable_shared_from_this<Node>
     virtual ~Node() {}
 };
 
+inline const ref<LockedNode> * edgeChild(const Node::Edge & edge)
+{
+    return std::get_if<ref<LockedNode>>(&edge);
+}
+
+inline ref<LockedNode> * edgeChild(Node::Edge & edge)
+{
+    return std::get_if<ref<LockedNode>>(&edge);
+}
+
+inline const InputAttrPath * edgeFollows(const Node::Edge & edge)
+{
+    return std::get_if<InputAttrPath>(&edge);
+}
+
+inline InputAttrPath * edgeFollows(Node::Edge & edge)
+{
+    return std::get_if<InputAttrPath>(&edge);
+}
+
 /**
  * A non-root node in the lock file.
  */
 struct LockedNode : Node
 {
-    FlakeRef lockedRef, originalRef;
+    EvaluationLockedFlakeRef lockedRef;
+    OriginalFlakeRef originalRef;
     bool isFlake = true;
 
     /* The node relative to which relative source paths
@@ -117,8 +140,8 @@ struct LockedNode : Node
     std::optional<InputAttrPath> parentInputAttrPath;
 
     LockedNode(
-        const FlakeRef & lockedRef,
-        const FlakeRef & originalRef,
+        EvaluationLockedFlakeRef lockedRef,
+        OriginalFlakeRef originalRef,
         bool isFlake = true,
         std::optional<InputAttrPath> parentInputAttrPath = {})
         : lockedRef(std::move(lockedRef))
@@ -140,7 +163,7 @@ struct LockFile
     LockFile() {};
     LockFile(const fetchers::Settings & fetchSettings, std::string_view contents, std::string_view path);
 
-    typedef std::map<ref<const Node>, std::string> KeyMap;
+    typedef std::map<ref<const Node>, FlakeGraphNodeKey> KeyMap;
 
     std::pair<nlohmann::json, KeyMap> toJSON() const;
 
@@ -150,7 +173,7 @@ struct LockFile
      * Check whether this lock file has any unlocked or non-final
      * inputs. If so, return one.
      */
-    std::optional<FlakeRef> isUnlocked(const fetchers::Settings & fetchSettings) const;
+    std::optional<EvaluationLockedFlakeRef> isUnlocked(const fetchers::Settings & fetchSettings) const;
 
     bool operator==(const LockFile & other) const;
 

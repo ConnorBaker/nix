@@ -29,7 +29,7 @@ subdir('nix-meson-build-support/subprojects')
 subdir('nix-meson-build-support/export-all-symbols')
 subdir('nix-meson-build-support/windows-version')
 
-sqlite = dependency('sqlite3', 'sqlite', version : '>=3.6.19')
+sqlite = dependency('sqlite3', 'sqlite', version : '>=3.37.0')
 deps_private += sqlite
 
 rapidcheck = dependency('rapidcheck')

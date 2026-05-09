@@ -36,7 +36,7 @@ class Pid
     pid_t pid = -1;
     bool separatePG = false;
     int killSignal = SIGKILL;
-    std::chrono::milliseconds killTimeout;
+    std::chrono::milliseconds killTimeout{};
     std::thread killThread;
 #else
     AutoCloseFD pid = INVALID_DESCRIPTOR;

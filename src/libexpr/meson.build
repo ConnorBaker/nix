@@ -95,6 +95,9 @@ cpuid = dependency('libcpuid', 'cpuid', required : false)
 configdata_priv.set('HAVE_LIBCPUID', cpuid.found().to_int())
 deps_private += cpuid
 
+sqlite = dependency('sqlite3', 'sqlite', version : '>=3.37.0')
+deps_other += sqlite
+
 config_priv_h = configure_file(
   configuration : configdata_priv,
   output : 'expr-config-private.hh',
@@ -158,7 +161,37 @@ sources = files(
   'attr-path.cc',
   'attr-set.cc',
   'diagnose.cc',
-  'eval-cache.cc',
+  'eval-environment.cc',
+  'eval-environment/authority.cc',
+  'eval-environment/request-builder.cc',
+  'eval-environment/session-builders.cc',
+  'eval-trace/counters.cc',
+  'eval-trace/hash-spec.cc',
+  'eval-trace/context.cc',
+  'eval-trace/cache/materialize.cc',
+  'eval-trace/cache/trace-session.cc',
+  'eval-trace/data/traced-data-dispatch.cc',
+  'eval-trace/store/attr-vocab-store.cc',
+  'eval-trace/store/session-identity.cc',
+  'eval-trace/store/trace-result-codec.cc',
+  'eval-trace/store/trace-serialize.cc',
+  'eval-trace/store/sqlite-trace-storage.cc',
+  'eval-trace/store/sqlite-trace-storage-lifecycle.cc',
+  'eval-trace/store/in-memory-trace-rows.cc',
+  'eval-trace/store/recorder.cc',
+  'eval-trace/deps/dep-hash-fns.cc',
+  'eval-trace/deps/hash.cc',
+  'eval-trace/deps/input-resolution.cc',
+  'eval-trace/deps/recording.cc',
+  'eval-trace/deps/shape-deps.cc',
+  'eval-trace/deps/nix-binding.cc',
+  'eval-trace/store/verifier.cc',
+  'eval-trace/store/dep-resolution-service.cc',
+  'eval-trace/store/semantic-registry.cc',
+  'eval-trace/store/session-policy.cc',
+  'eval-trace/deps/dep-recording-context.cc',
+  'eval-trace/fiber/fiber-scheduler.cc',
+  'eval-trace/fiber/blocking-scope.cc',
   'eval-error.cc',
   'eval-gc.cc',
   'eval-profiler-settings.cc',

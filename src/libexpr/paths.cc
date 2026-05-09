@@ -1,5 +1,6 @@
 #include "nix/store/store-api.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-settings.hh"
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 
@@ -19,7 +20,10 @@ SourcePath EvalState::rootPath(std::string_view path)
 
 SourcePath EvalState::storePath(const StorePath & path)
 {
-    return {rootFS, CanonPath{store->printStorePath(path)}};
+    /* Use `storeFS` (not `rootFS`) so store-path SourcePaths share
+       accessor identity with paths produced via the flake machinery's
+       mounted-store-path helper. */
+    return {storeFS.cast<SourceAccessor>(), CanonPath{store->printStorePath(path)}};
 }
 
 void EvalState::ensureLazyPathCopied(const StorePath & path)
@@ -58,35 +62,6 @@ void EvalState::ensureLazyPathsCopied(const NixStringContext & context)
         if (auto * o = std::get_if<NixStringContextElem::Opaque>(&c.raw))
             /* TODO: This could be done in parallel. */
             ensureLazyPathCopied(o->path);
-}
-
-StorePath
-EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalInput, ref<SourceAccessor> accessor)
-{
-    /* To mount the input, dryRun is sufficient. We still compute the narHash (to check for mismatches) and the store
-       path to figure out where to mount it. TODO: This could be relaxed in the future by making outPath and narHash
-       lazier. Good code that doesn't do `toString ./.` or otherwise inspects the outPath string and only uses it for
-       doing relative imports does not even require computing the store path. That is a big invasive change though and
-       would require having a special "LazyStorePathString" thunk. narHash also doesn't need to be computed eagerly in
-       case it's not actually specified (like during local development with a dirty tree) - in that case narHash could
-       also become a lazy app/thunk that shares the state with the storePath delayed computation. */
-    auto [storePath, narHash] = fetchToStore2(fetchSettings, *store, accessor, FetchMode::DryRun, input.getName());
-
-    allowPath(storePath); // FIXME: should just whitelist the entire virtual store
-
-    storeFS->mount(CanonPath(store->printStorePath(storePath)), accessor);
-
-    input.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
-
-    if (originalInput.getNarHash() && narHash != *originalInput.getNarHash())
-        throw Error(
-            (unsigned int) 102,
-            "NAR hash mismatch in input '%s', expected '%s' but got '%s'",
-            originalInput.to_string(),
-            narHash.to_string(HashFormat::SRI, true),
-            originalInput.getNarHash()->to_string(HashFormat::SRI, true));
-
-    return storePath;
 }
 
 } // namespace nix

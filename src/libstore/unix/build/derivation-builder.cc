@@ -680,7 +680,7 @@ bool DerivationBuilderImpl::decideWhetherDiskFull()
 #if HAVE_STATVFS
     {
         uint64_t required = 8ULL * 1024 * 1024; // FIXME: make configurable
-        struct statvfs st;
+        struct statvfs st{};
         if (statvfs(store.config->realStoreDir.get().c_str(), &st) == 0
             && (uint64_t) st.f_bavail * st.f_bsize < required)
             diskFull = true;
@@ -979,7 +979,7 @@ void DerivationBuilderImpl::openSlave()
         throw SysError("opening pseudoterminal slave");
 
     // Put the pt into raw mode to prevent \n -> \r\n translation.
-    struct termios term;
+    struct termios term{};
     if (tcgetattr(builderOut.get(), &term))
         throw SysError("getting pseudoterminal attributes");
 
@@ -1185,7 +1185,7 @@ void DerivationBuilderImpl::startDaemon()
         while (true) {
 
             /* Accept a connection. */
-            struct sockaddr_un remoteAddr;
+            struct sockaddr_un remoteAddr{};
             socklen_t remoteAddrLen = sizeof(remoteAddr);
 
             AutoCloseFD remote = accept(daemonSocket.get(), (struct sockaddr *) &remoteAddr, &remoteAddrLen);

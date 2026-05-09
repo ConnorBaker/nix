@@ -39,11 +39,11 @@ struct SubstitutablePathInfo
     /**
      * 0 = unknown or inapplicable
      */
-    uint64_t downloadSize;
+    uint64_t downloadSize = 0;
     /**
      * 0 = unknown
      */
-    uint64_t narSize;
+    uint64_t narSize = 0;
 };
 
 using SubstitutablePathInfos = std::map<StorePath, SubstitutablePathInfo>;

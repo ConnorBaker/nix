@@ -14,7 +14,7 @@ namespace nix {
 StringSet computeLevels()
 {
     StringSet levels;
-    struct cpu_id_t data;
+    struct cpu_id_t data{};
 
     const std::map<cpu_feature_level_t, std::string> feature_strings = {
         {FEATURE_LEVEL_X86_64_V1, "x86_64-v1"},

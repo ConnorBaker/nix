@@ -1,7 +1,10 @@
 #pragma once
 ///@file
 
+#include <algorithm>
+#include <cassert>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "nix/util/lru-cache.hh"
@@ -18,23 +21,33 @@ public:
     {
         friend PosTable;
     private:
-        uint32_t offset;
-
         Origin(Pos::Origin origin, uint32_t offset, size_t size)
             : offset(offset)
-            , origin(origin)
+            , origin(std::move(origin))
             , size(size)
         {
         }
 
     public:
-        const Pos::Origin origin;
-        const size_t size;
+        uint32_t offset;
+        Pos::Origin origin;
+        size_t size;
 
         uint32_t offsetOf(PosIdx p) const
         {
-            return p.id - 1 - offset;
+            return (p.id & ~PosIdx::tracedDataTag) - 1 - offset;
         }
+    };
+
+    /**
+     * Lightweight handle returned by addOrigin(). Contains only the
+     * scalars needed by add() — avoids copying the Pos::Origin variant.
+     */
+    struct OriginHandle
+    {
+        uint32_t offset;
+        size_t size;
+        bool tracedData;
     };
 
 private:
@@ -58,7 +71,7 @@ private:
         if (p.id == 0)
             return nullptr;
 
-        const auto idx = p.id - 1;
+        const auto idx = (p.id & ~PosIdx::tracedDataTag) - 1;
         /* we want the last key <= idx, so we'll take prev(first key > idx).
             this is guaranteed to never rewind origin.begin because the first
             key is always 0. */
@@ -78,20 +91,56 @@ public:
         auto origins(origins_.lock());
         uint32_t offset = 0;
         if (auto it = origins->rbegin(); it != origins->rend())
-            offset = it->first + it->second.size;
+            offset = it->first + std::max(it->second.size, static_cast<size_t>(1));
         // +1 because all PosIdx are offset by 1 to begin with, and
         // another +1 to ensure that all origins can point to EOF, eg
         // on (invalid) empty inputs.
         if (2 + offset + size < offset)
             return Origin{origin, offset, 0};
-        return origins->emplace(offset, Origin{origin, offset, size}).first->second;
+        auto [it, inserted] = origins->emplace(offset, Origin{origin, offset, size});
+        assert(inserted && "PosTable origin offset collision");
+        return it->second;
+    }
+
+    /**
+     * Add an origin and return a lightweight handle (no variant copy).
+     * Use with the OriginHandle overload of add().
+     */
+    OriginHandle addOriginHandle(Pos::Origin origin, size_t size)
+    {
+        bool td = std::holds_alternative<Pos::ProvenanceRef>(origin);
+        auto origins(origins_.lock());
+        uint32_t offset = 0;
+        if (auto it = origins->rbegin(); it != origins->rend())
+            offset = it->first + std::max(it->second.size, static_cast<size_t>(1));
+        if (2 + offset + size < offset) {
+            auto [it, inserted] = origins->emplace(offset, Origin{std::move(origin), offset, 0});
+            assert(inserted && "PosTable origin offset collision");
+            return {offset, 0, td};
+        }
+        auto [it, inserted] = origins->emplace(offset, Origin{std::move(origin), offset, size});
+        assert(inserted && "PosTable origin offset collision");
+        return {offset, size, td};
     }
 
     PosIdx add(const Origin & origin, size_t offset)
     {
         if (offset > origin.size)
             return PosIdx();
-        return PosIdx(1 + origin.offset + offset);
+        uint32_t id = 1 + origin.offset + offset;
+        if (std::holds_alternative<Pos::ProvenanceRef>(origin.origin))
+            id |= PosIdx::tracedDataTag;
+        return PosIdx(id);
+    }
+
+    PosIdx add(const OriginHandle & origin, size_t offset)
+    {
+        if (offset > origin.size)
+            return PosIdx();
+        uint32_t id = 1 + origin.offset + offset;
+        if (origin.tracedData)
+            id |= PosIdx::tracedDataTag;
+        return PosIdx(id);
     }
 
     /**
@@ -112,6 +161,35 @@ public:
         if (auto o = resolve(p))
             return o->origin;
         return std::monostate{};
+    }
+
+    /** Return a pointer to the origin for p, or nullptr. No copies. */
+    const Pos::Origin * originOfPtr(PosIdx p) const
+    {
+        if (auto o = resolve(p))
+            return &o->origin;
+        return nullptr;
+    }
+
+    /** Return the origin offset for p, or nullopt. Stable across vector growth. */
+    std::optional<uint32_t> originOffsetOf(PosIdx p) const
+    {
+        if (auto o = resolve(p))
+            return o->offset;
+        return std::nullopt;
+    }
+
+    /** Combined origin + offset resolution in a single binary search. */
+    struct ResolvedOrigin {
+        const Pos::Origin * origin;
+        uint32_t offset;
+    };
+
+    std::optional<ResolvedOrigin> resolveOriginFull(PosIdx p) const
+    {
+        if (auto o = resolve(p))
+            return ResolvedOrigin{&o->origin, o->offset};
+        return std::nullopt;
     }
 
     /**

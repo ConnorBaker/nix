@@ -51,6 +51,11 @@ doClearStore() {
     mkdir "$NIX_STORE_DIR"
     rm -rf "$NIX_STATE_DIR"
     mkdir "$NIX_STATE_DIR"
+    # Clear eval trace DB: clearStore destroys the store DB, so traced drvPaths
+    # reference store paths that no longer exist. Normal GC doesn't need this
+    # (toDerivedPaths recovery re-evaluates invalid drvPaths), but clearStore's
+    # wholesale destruction of the store DB requires explicit cleanup.
+    clearStoreIndex
     clearProfiles
 }
 
@@ -60,6 +65,37 @@ clearCache() {
 
 clearCacheCache() {
     rm -f "$TEST_HOME/.cache/nix/binary-cache"*
+}
+
+# Clear the eval-trace subsystem's persistent caches. Called between
+# eval-trace functional test cases to ensure a cold first evaluation.
+# Previously this rm included `$TEST_HOME/.cache/nix/stat-hash-cache"*`,
+# dropped 2026-04-19 because StatHashCache was removed from production
+# (see `src/libexpr-tests/eval-trace/CLAUDE.md` §Section 3). If a new
+# persistent cache is added to the eval-trace subsystem, extend this
+# list — `doClearStore` above also calls this helper.
+clearStoreIndex() {
+    rm -rf "$TEST_HOME/.cache/nix/eval-trace"* "$TEST_HOME/.cache/nix/attr-vocab.sqlite"*
+}
+
+# Read a counter from a NIX_SHOW_STATS JSON file by dotted key path.
+# Usage: readEvalTraceCounter <stats-json-path> <dotted-key>
+# Example: readEvalTraceCounter stats.json evalTrace.record.count
+# Prints the integer value to stdout; exits non-zero on parse/missing-key
+# errors. Used by the §N.8 functional-test pattern to discriminate
+# verify paths (primary session / History bootstrap / recovery).
+readEvalTraceCounter() {
+    local statsJson="$1"
+    local dottedKey="$2"
+    python3 -c '
+import json, sys
+path = sys.argv[1].split(".")
+with open(sys.argv[2]) as f:
+    d = json.load(f)
+for p in path:
+    d = d[p]
+print(d)
+' "$dottedKey" "$statsJson"
 }
 
 startDaemon() {

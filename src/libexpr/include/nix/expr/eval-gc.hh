@@ -15,6 +15,10 @@
 #  include <gc/gc_cpp.h>
 #  include <gc/gc_allocator.h>
 
+#  include <memory>
+#  include <new>
+
+
 #else
 
 #  include <memory>

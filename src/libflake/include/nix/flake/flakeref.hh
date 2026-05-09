@@ -73,6 +73,8 @@ struct FlakeRef
 
     fetchers::Attrs toAttrs() const;
 
+    fetchers::Attrs toPersistedAttrs() const;
+
     FlakeRef resolve(
         const fetchers::Settings & fetchSettings,
         Store & store,

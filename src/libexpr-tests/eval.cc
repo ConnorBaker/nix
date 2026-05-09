@@ -3,6 +3,9 @@
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/tests/libexpr.hh"
+#include "nix/util/memory-source-accessor.hh"
+#include "nix/expr/eval-environment/authority-internal.hh"
+#include "nix/expr/eval-environment/environment.hh"
 
 namespace nix {
 
@@ -206,7 +209,10 @@ TEST_F(PureEvalTest, pathExists)
         ASSERT_THAT(eval(fmt("builtins.pathExists %s", printed)), IsFalse());
 
         ASSERT_THROW(eval("builtins.readDir /."), RestrictedPathError);
-        state.allowPath(path); // FIXME: This shouldn't behave this way.
+        { // FIXME: This shouldn't behave this way.
+            EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+            (void) environment.authorizeStorePath(path);
+        }
         ASSERT_THAT(eval("builtins.readDir /."), IsAttrsOfSize(0));
     }
 }

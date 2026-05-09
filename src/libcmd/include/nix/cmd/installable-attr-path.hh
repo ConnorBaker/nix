@@ -13,7 +13,7 @@
 #include "nix/expr/get-drvs.hh"
 #include "nix/store/store-api.hh"
 #include "nix/main/shared.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/expr/eval-trace/cache/trace-session.hh"
 #include "nix/util/url.hh"
 #include "nix/fetchers/registry.hh"
 #include "nix/store/build-result.hh"
@@ -29,6 +29,7 @@ class InstallableAttrPath : public InstallableValue
     RootValue v;
     std::string attrPath;
     ExtendedOutputsSpec extendedOutputsSpec;
+    mutable std::shared_ptr<eval_trace::TraceSession> activeTraceSession_;
 
     InstallableAttrPath(
         ref<EvalState> state,
@@ -42,11 +43,15 @@ class InstallableAttrPath : public InstallableValue
         return attrPath;
     };
 
-    std::pair<Value *, PosIdx> toValue(EvalState & state) override;
+    EvaluatedInstallableValue toValue(EvalState & state) override;
 
     DerivedPathsWithInfo toDerivedPaths() override;
 
 public:
+
+    ref<eval_trace::TraceSession> getOrCreateTraceCache(EvalState & state) const override;
+
+    std::string resolvedAttrPath() const override { return attrPath; }
 
     static InstallableAttrPath parse(
         ref<EvalState> state,

@@ -5,10 +5,33 @@
 
 namespace nix::fetchers {
 
+namespace {
+
+bool shouldCacheInput(const Settings & settings, const Input & input)
+{
+    /* Local source-backed unlocked inputs (e.g. a working tree path or
+       fetchGit on a local repo without a fixed rev) are semantically mutable.
+       Caching their resolved accessor/locked input by the original request
+       silently reuses stale content across tracked dirty changes. */
+    if (input.isLocked(settings))
+        return true;
+
+    if (input.getSourcePath().has_value())
+        return false;
+
+    if (auto url = maybeGetStrAttr(input.attrs, "url"))
+        return !url->starts_with("file://");
+
+    return true;
+}
+
+}
+
 InputCache::CachedResult InputCache::getAccessor(
     const Settings & settings, Store & store, const Input & originalInput, UseRegistries useRegistries)
 {
-    auto fetched = lookup(originalInput);
+    const bool cacheOriginal = shouldCacheInput(settings, originalInput);
+    auto fetched = cacheOriginal ? lookup(originalInput) : std::nullopt;
     Input resolvedInput = originalInput;
 
     if (!fetched) {
@@ -19,20 +42,30 @@ InputCache::CachedResult InputCache::getAccessor(
             if (useRegistries != UseRegistries::No) {
                 auto [res, extraAttrs] = lookupInRegistries(settings, store, originalInput, useRegistries);
                 resolvedInput = std::move(res);
-                fetched = lookup(resolvedInput);
+                const bool cacheResolved = shouldCacheInput(settings, resolvedInput);
+                fetched = cacheResolved ? lookup(resolvedInput) : std::nullopt;
                 if (!fetched) {
                     auto [accessor, lockedInput] = resolvedInput.getAccessor(settings, store);
                     fetched.emplace(
                         CachedInput{.lockedInput = lockedInput, .accessor = accessor, .extraAttrs = extraAttrs});
                 }
-                upsert(resolvedInput, *fetched);
+                else {
+                    // Registry metadata (notably `dir`) belongs to the alias
+                    // resolution edge, not to the resolved input tree itself.
+                    // Preserve the current lookup's extra attrs even when the
+                    // underlying resolved tree came from cache.
+                    fetched->extraAttrs = extraAttrs;
+                }
+                if (cacheResolved)
+                    upsert(resolvedInput, *fetched);
             } else {
                 throw Error(
                     "'%s' is an indirect flake reference, but registry lookups are not allowed",
                     originalInput.to_string());
             }
         }
-        upsert(originalInput, *fetched);
+        if (cacheOriginal)
+            upsert(originalInput, *fetched);
     }
 
     debug("got tree '%s' from '%s'", fetched->accessor, fetched->lockedInput.to_string());

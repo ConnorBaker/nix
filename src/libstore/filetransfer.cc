@@ -120,7 +120,7 @@ using curlMulti = std::unique_ptr<::CURLM, decltype([](::CURLM * multi) { ::curl
 
 struct curlMultiError final : CloneableError<curlMultiError, Error>
 {
-    ::CURLMcode code;
+    ::CURLMcode code{};
 
     curlMultiError(::CURLMcode code)
         : CloneableError{"unexpected curl multi error: %s", ::curl_multi_strerror(code)}
@@ -149,7 +149,7 @@ struct curlFileTransfer : public FileTransfer
         Callback<FileTransferResult> callback;
         CURL * req = 0;
         // buffer to accompany the `req` above
-        char errbuf[CURL_ERROR_SIZE];
+        char errbuf[CURL_ERROR_SIZE]{};
         std::string statusMsg;
 
         uint32_t attempt = 0;

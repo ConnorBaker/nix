@@ -551,20 +551,30 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
            directory is dirty. */
         std::function<int(const char * path, unsigned int statusFlags)> statusCallback = [&](const char * path,
                                                                                              unsigned int statusFlags) {
-            if (!(statusFlags & GIT_STATUS_INDEX_DELETED) && !(statusFlags & GIT_STATUS_WT_DELETED)) {
+            if (statusFlags & GIT_STATUS_WT_NEW) {
+                // Untracked file: not in git index, not in info.files/dirtyFiles.
+                // Tracked separately for eval-trace git identity coverage.
+                // Do NOT set isDirty — untracked files are invisible to the
+                // fetcher's dirty-tree semantics (narHash, fingerprint, lock
+                // behavior). isDirty means "tracked files have been modified."
+                info.untrackedFiles.insert(CanonPath(path));
+            } else if (!(statusFlags & GIT_STATUS_INDEX_DELETED) && !(statusFlags & GIT_STATUS_WT_DELETED)) {
                 info.files.insert(CanonPath(path));
-                if (statusFlags != GIT_STATUS_CURRENT)
+                if (statusFlags != GIT_STATUS_CURRENT) {
                     info.dirtyFiles.insert(CanonPath(path));
-            } else
+                    info.isDirty = true;
+                }
+            } else {
                 info.deletedFiles.insert(CanonPath(path));
-            if (statusFlags != GIT_STATUS_CURRENT)
                 info.isDirty = true;
+            }
             return 0;
         };
 
         git_status_options options = GIT_STATUS_OPTIONS_INIT;
         options.flags |= GIT_STATUS_OPT_INCLUDE_UNMODIFIED;
         options.flags |= GIT_STATUS_OPT_EXCLUDE_SUBMODULES;
+        options.flags |= GIT_STATUS_OPT_INCLUDE_UNTRACKED;
         if (git_status_foreach_ext(*this, &options, &statusCallbackTrampoline, &statusCallback))
             throw GitError("getting working directory status");
 

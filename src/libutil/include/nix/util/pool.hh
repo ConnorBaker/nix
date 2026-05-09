@@ -54,7 +54,7 @@ private:
     struct State
     {
         size_t inUse = 0;
-        size_t max;
+        size_t max = 0;
         std::vector<ref<R>> idle;
     };
 

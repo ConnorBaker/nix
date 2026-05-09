@@ -230,7 +230,7 @@ const static std::string getEnvSh =
  * initial environment variables, that just writes the resulting
  * environment to a file and exits.
  */
-static StorePath getDerivationEnvironment(ref<Store> store, ref<Store> evalStore, const StorePath & drvPath)
+static StorePath getDerivationEnvironment(ref<Store> store, ref<Store> evalStore, EvalState & state, const StorePath & drvPath)
 {
     auto drv = evalStore->derivationFromPath(drvPath);
 
@@ -289,6 +289,7 @@ static StorePath getDerivationEnvironment(ref<Store> store, ref<Store> evalStore
 
     auto shellDrvPath = evalStore->writeDerivation(drv);
 
+    // Flush tracing state before starting the build because building this
     /* Build the derivation. */
     store->buildPaths(
         {DerivedPath::Built{
@@ -474,7 +475,7 @@ struct Common : InstallableCommand, MixProfile
         return res;
     }
 
-    StorePath getShellOutPath(ref<Store> store, ref<Installable> installable)
+    StorePath getShellOutPath(ref<Store> store, ref<Installable> installable, EvalState & state)
     {
         auto path = installable->getStorePath();
         if (path && hasSuffix(path->to_string(), "-env"))
@@ -490,13 +491,13 @@ struct Common : InstallableCommand, MixProfile
 
             auto & drvPath = *drvs.begin();
 
-            return getDerivationEnvironment(store, getEvalStore(), drvPath);
-        }
+            return getDerivationEnvironment(store, getEvalStore(), state, drvPath);
     }
+}
 
-    std::pair<BuildEnvironment, StorePath> getBuildEnvironment(ref<Store> store, ref<Installable> installable)
+    std::pair<BuildEnvironment, StorePath> getBuildEnvironment(ref<Store> store, ref<Installable> installable, EvalState & state)
     {
-        auto shellOutPath = getShellOutPath(store, installable);
+        auto shellOutPath = getShellOutPath(store, installable, state);
 
         updateProfile(*store, shellOutPath);
 
@@ -586,7 +587,7 @@ struct CmdDevelop : Common, MixEnvironment
 
     void run(ref<Store> store, ref<Installable> installable) override
     {
-        auto [buildEnvironment, gcroot] = getBuildEnvironment(store, installable);
+        auto [buildEnvironment, gcroot] = getBuildEnvironment(store, installable, *getEvalState());
 
         auto [rcFileFd, rcFilePath] = createTempFile("nix-shell");
 
@@ -698,7 +699,7 @@ struct CmdDevelop : Common, MixEnvironment
             // chdir if installable is a flake of type git+file or path
             auto installableFlake = installable.dynamic_pointer_cast<InstallableFlake>();
             if (installableFlake) {
-                auto sourcePath = installableFlake->getLockedFlake()->flake.resolvedRef.input.getSourcePath();
+                auto sourcePath = installableFlake->getLockedFlake()->flake.resolvedRef.value.input.getSourcePath();
                 if (sourcePath) {
                     if (chdir(sourcePath->c_str()) == -1) {
                         throw SysError("chdir to %s failed", PathFmt(*sourcePath));
@@ -707,10 +708,8 @@ struct CmdDevelop : Common, MixEnvironment
             }
         }
 
-        // Release our references to eval caches to ensure they are persisted to disk, because
+        // Release our references to trace caches to ensure they are persisted to disk, because
         // we are about to exec out of this process without running C++ destructors.
-        getEvalState()->evalCaches.clear();
-
         execProgramInStore(store, UseLookupPath::Use, shell, args, buildEnvironment.getSystem());
 #endif
     }
@@ -737,7 +736,7 @@ struct CmdPrintDevEnv : Common, MixJSON
 
     void run(ref<Store> store, ref<Installable> installable) override
     {
-        auto buildEnvironment = getBuildEnvironment(store, installable).first;
+        auto buildEnvironment = getBuildEnvironment(store, installable, *getEvalState()).first;
 
         logger->stop();
 

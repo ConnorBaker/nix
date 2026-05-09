@@ -80,6 +80,12 @@ struct GitRepo
         /* The deleted files. */
         std::set<CanonPath> deletedFiles;
 
+        /* Files in the working directory that are not tracked by git
+           (never staged or committed). Populated only when
+           GIT_STATUS_OPT_INCLUDE_UNTRACKED is set. Used by eval-trace
+           to exclude untracked files from git identity coverage. */
+        std::set<CanonPath> untrackedFiles;
+
         /* The submodules listed in .gitmodules of this workdir. */
         std::vector<Submodule> submodules;
     };

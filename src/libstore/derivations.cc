@@ -183,7 +183,7 @@ struct StringViewStream
 
 constexpr struct Escapes
 {
-    char map[256];
+    char map[256]{};
 
     constexpr Escapes()
     {
@@ -526,7 +526,7 @@ static void printString(std::string & res, std::string_view s)
 {
     res += '"';
     static constexpr auto chunkSize = 1024;
-    std::array<char, 2 * chunkSize + 2> buffer;
+    std::array<char, 2 * chunkSize + 2> buffer{};
     while (!s.empty()) {
         auto chunk = s.substr(0, /*n=*/chunkSize);
         s.remove_prefix(chunk.size());

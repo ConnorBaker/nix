@@ -83,17 +83,25 @@ struct CmdRepl : RawInstallablesCommand
                 auto & installable = InstallableValue::require(*installable_);
                 auto what = installable.what();
                 if (file) {
-                    auto [val, pos] = installable.toValue(*state);
-                    auto what = installable.what();
-                    state->forceValue(*val, pos);
+                    auto evaluated = installable.toValue(*state);
+                    state->forceValue(*evaluated.value, evaluated.pos);
                     auto autoArgs = getAutoArgs(*state);
                     auto valPost = state->allocValue();
-                    state->autoCallFunction(*autoArgs, *val, *valPost);
-                    state->forceValue(*valPost, pos);
-                    values.push_back({valPost, what});
+                    state->autoCallFunction(*autoArgs, *evaluated.value, *valPost);
+                    state->forceValue(*valPost, evaluated.pos);
+                    values.push_back(AbstractNixRepl::AnnotatedValue{
+                        .evaluated = EvaluatedInstallableValue{
+                            .value = valPost,
+                            .pos = evaluated.pos,
+                            .traceSessionKeepalive = std::move(evaluated.traceSessionKeepalive),
+                        },
+                        .what = std::move(what),
+                    });
                 } else {
-                    auto [val, pos] = installable.toValue(*state);
-                    values.push_back({val, what});
+                    values.push_back(AbstractNixRepl::AnnotatedValue{
+                        .evaluated = installable.toValue(*state),
+                        .what = std::move(what),
+                    });
                 }
             }
             return values;

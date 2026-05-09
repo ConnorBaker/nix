@@ -32,7 +32,7 @@ try {
 
 static bool checkRlimit(std::size_t reserveSize)
 {
-    struct rlimit rl;
+    struct rlimit rl{};
     if (::getrlimit(RLIMIT_AS, &rl) != 0)
         return true;
     if (rl.rlim_cur == RLIM_INFINITY)

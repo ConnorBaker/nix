@@ -34,12 +34,16 @@ std::pair<StorePath, Hash> fetchToStore2(
     std::string_view name,
     ContentAddressMethod method,
     PathFilter * filter,
-    RepairFlag repair)
+    RepairFlag repair,
+    std::optional<std::string> fingerprintOverride)
 {
     std::optional<fetchers::Cache::Key> cacheKey;
 
     auto [subpath, fingerprint] = filter ? std::pair<CanonPath, std::optional<std::string>>{path.path, std::nullopt}
                                          : path.accessor->getFingerprint(path.path);
+
+    if (!filter && fingerprintOverride)
+        fingerprint = std::move(fingerprintOverride);
 
     if (fingerprint) {
         cacheKey = makeSourcePathToHashCacheKey(*fingerprint, method, subpath);

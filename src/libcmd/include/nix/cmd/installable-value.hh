@@ -3,16 +3,45 @@
 
 #include "nix/cmd/installables.hh"
 #include "nix/flake/flake.hh"
+#include "nix/util/error.hh"
+
+#include <memory>
 
 namespace nix {
 
 struct PackageInfo;
 struct SourceExprCommand;
 
-namespace eval_cache {
-class EvalCache;
-class AttrCursor;
-} // namespace eval_cache
+namespace eval_trace {
+class TraceSession;
+} // namespace eval_trace
+
+struct EvaluatedInstallableValue
+{
+    Value * value = nullptr;
+    PosIdx pos = noPos;
+    std::shared_ptr<eval_trace::TraceSession> traceSessionKeepalive;
+
+    static EvaluatedInstallableValue withoutKeepalive(Value * value, PosIdx pos)
+    {
+        return EvaluatedInstallableValue{
+            .value = value,
+            .pos = pos,
+        };
+    }
+
+    static EvaluatedInstallableValue withKeepalive(
+        Value * value,
+        PosIdx pos,
+        const ref<eval_trace::TraceSession> & traceSession)
+    {
+        return EvaluatedInstallableValue{
+            .value = value,
+            .pos = pos,
+            .traceSessionKeepalive = traceSession.get_ptr(),
+        };
+    }
+};
 
 struct App
 {
@@ -86,20 +115,28 @@ struct InstallableValue : Installable
 
     virtual ~InstallableValue() {}
 
-    virtual std::pair<Value *, PosIdx> toValue(EvalState & state) = 0;
+    virtual EvaluatedInstallableValue toValue(EvalState & state) = 0;
 
     /**
-     * Get a cursor to each value this Installable could refer to.
-     * However if none exists, throw exception instead of returning
-     * empty vector.
+     * The resolved attribute path used to reach this value in the eval tree.
+     * For flake installables, this is the full path after prefix resolution
+     * (e.g., "packages.x86_64-linux.hello"). Empty for non-flake installables.
      */
-    virtual std::vector<ref<eval_cache::AttrCursor>> getCursors(EvalState & state);
+    virtual std::string resolvedAttrPath() const { return ""; }
 
     /**
-     * Get the first and most preferred cursor this Installable could
-     * refer to, or throw an exception if none exists.
+     * Open the eval-trace session associated with this installable without
+     * forcing the attr-path value. Used by read-only diagnostic commands
+     * (e.g. `nix eval-info`) that need the same session key `toValue` would
+     * use so they can look up the cached trace in the SQLite DB.
+     *
+     * The default throws — each subclass that supports trace-cache queries
+     * must override.
      */
-    virtual ref<eval_cache::AttrCursor> getCursor(EvalState & state);
+    virtual ref<eval_trace::TraceSession> getOrCreateTraceCache(EvalState & state) const
+    {
+        throw Error("installable '%s' does not support eval-trace queries", what());
+    }
 
     UnresolvedApp toApp(EvalState & state);
 

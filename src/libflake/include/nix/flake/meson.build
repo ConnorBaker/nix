@@ -6,6 +6,7 @@ headers = files(
   'flake.hh',
   'flakeref.hh',
   'lockfile.hh',
+  'phase-types.hh',
   'settings.hh',
   'url-name.hh',
 )

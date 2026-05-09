@@ -10,7 +10,7 @@ namespace nix {
 struct TarArchive
 {
     struct archive * archive;
-    Source * source;
+    Source * source = nullptr;
     std::vector<unsigned char> buffer;
 
     void check(int err, const std::string & reason = "failed to extract archive (%s)");

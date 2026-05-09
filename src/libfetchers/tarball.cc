@@ -441,6 +441,11 @@ struct FileInputScheme : CurlInputScheme
 
         return {accessor, input};
     }
+
+    std::optional<std::string> getStableIdentity(const Input & input) const override
+    {
+        return fmt("file:%s", getStrAttr(input.attrs, "url"));
+    }
 };
 
 struct TarballInputScheme : CurlInputScheme
@@ -511,6 +516,11 @@ struct TarballInputScheme : CurlInputScheme
             settings.getTarballCache()->treeHashToNarHash(settings, result.treeHash).to_string(HashFormat::SRI, true));
 
         return {result.accessor, input};
+    }
+
+    std::optional<std::string> getStableIdentity(const Input & input) const override
+    {
+        return fmt("tarball:%s", getStrAttr(input.attrs, "url"));
     }
 
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override

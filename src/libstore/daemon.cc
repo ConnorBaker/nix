@@ -219,15 +219,15 @@ struct TunnelSource : BufferedSource
 
 struct ClientSettings
 {
-    bool keepFailed;
-    bool keepGoing;
-    bool tryFallback;
-    Verbosity verbosity;
-    unsigned int maxBuildJobs;
-    time_t maxSilentTime;
-    bool verboseBuild;
-    unsigned int buildCores;
-    bool useSubstitutes;
+    bool keepFailed = false;
+    bool keepGoing = false;
+    bool tryFallback = false;
+    Verbosity verbosity{};
+    unsigned int maxBuildJobs = 0;
+    time_t maxSilentTime = 0;
+    bool verboseBuild = false;
+    unsigned int buildCores = 0;
+    bool useSubstitutes = false;
     StringMap overrides;
 
     void apply(TrustedFlag trusted)

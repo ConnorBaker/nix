@@ -28,6 +28,11 @@ void Expr::show(const SymbolTable & symbols, std::ostream & str) const
     unreachable();
 }
 
+void Expr::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    unreachable();
+}
+
 void ExprInt::show(const SymbolTable & symbols, std::ostream & str) const
 {
     str << v.integer();
@@ -47,6 +52,21 @@ void ExprPath::show(const SymbolTable & symbols, std::ostream & str) const
 {
     str << v.pathStrView();
 }
+
+void ExprPath::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    auto path = CanonPath(CanonPath::unchecked_t(), std::string(v.pathStrView()));
+    if (path.isWithin(basePath))
+        str << path.removePrefix(basePath).abs();
+    else
+        str << v.pathStrView();
+}
+
+void ExprInt::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath &) const { show(symbols, str); }
+void ExprFloat::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath &) const { show(symbols, str); }
+void ExprString::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath &) const { show(symbols, str); }
+void ExprVar::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath &) const { show(symbols, str); }
+void ExprPos::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath &) const { show(symbols, str); }
 
 void ExprVar::show(const SymbolTable & symbols, std::ostream & str) const
 {
@@ -259,6 +279,189 @@ void ExprConcatStrings::show(const SymbolTable & symbols, std::ostream & str) co
 void ExprPos::show(const SymbolTable & symbols, std::ostream & str) const
 {
     str << "__curPos";
+}
+
+// ── showForHash overrides ───────────────────────────────────────────
+// Mirror the show() implementations but recurse via showForHash so
+// ExprPath::showForHash normalizes paths via CanonPath::removePrefix.
+//
+// Every Expr subclass MUST have a showForHash override (the base
+// implementation aborts). The COMMON_METHODS macro adds the declaration.
+// A bug in any override causes NixBinding SC dep hash mismatches.
+// See show-for-hash.cc for round-trip stability tests.
+
+void ExprSelect::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    str << "(";
+    e->showForHash(symbols, str, basePath);
+    str << ")." << showAttrSelectionPath(symbols, getAttrPath());
+    if (def) {
+        str << " or (";
+        def->showForHash(symbols, str, basePath);
+        str << ")";
+    }
+}
+
+void ExprOpHasAttr::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    str << "((";
+    e->showForHash(symbols, str, basePath);
+    str << ") ? " << showAttrSelectionPath(symbols, attrPath) << ")";
+}
+
+void ExprAttrs::showBindingsForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    typedef const AttrDefs::value_type * Attr;
+    std::vector<Attr> sorted;
+    for (auto & i : *attrs)
+        sorted.push_back(&i);
+    std::sort(sorted.begin(), sorted.end(), [&](Attr a, Attr b) {
+        std::string_view sa = symbols[a->first], sb = symbols[b->first];
+        return sa < sb;
+    });
+    std::vector<Symbol> inherits;
+    std::map<Displacement, std::vector<Symbol>> inheritsFrom;
+    for (auto & i : sorted) {
+        switch (i->second.kind) {
+        case AttrDef::Kind::Plain: break;
+        case AttrDef::Kind::Inherited: inherits.push_back(i->first); break;
+        case AttrDef::Kind::InheritedFrom: {
+            auto & select = dynamic_cast<ExprSelect &>(*i->second.e);
+            auto & from = dynamic_cast<ExprInheritFrom &>(*select.e);
+            inheritsFrom[from.displ].push_back(i->first);
+            break;
+        }
+        }
+    }
+    if (!inherits.empty()) {
+        str << "inherit";
+        for (auto sym : inherits) str << " " << symbols[sym];
+        str << "; ";
+    }
+    for (const auto & [from, syms] : inheritsFrom) {
+        str << "inherit (";
+        (*inheritFromExprs)[from]->showForHash(symbols, str, basePath);
+        str << ")";
+        for (auto sym : syms) str << " " << symbols[sym];
+        str << "; ";
+    }
+    for (auto & i : sorted) {
+        if (i->second.kind == AttrDef::Kind::Plain) {
+            str << symbols[i->first] << " = ";
+            i->second.e->showForHash(symbols, str, basePath);
+            str << "; ";
+        }
+    }
+    for (auto & i : *dynamicAttrs) {
+        str << "\"${";
+        i.nameExpr->showForHash(symbols, str, basePath);
+        str << "}\" = ";
+        i.valueExpr->showForHash(symbols, str, basePath);
+        str << "; ";
+    }
+}
+
+void ExprAttrs::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    if (recursive) str << "rec ";
+    str << "{ ";
+    showBindingsForHash(symbols, str, basePath);
+    str << "}";
+}
+
+void ExprList::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    str << "[ ";
+    for (auto & i : elems) {
+        str << "(";
+        i->showForHash(symbols, str, basePath);
+        str << ") ";
+    }
+    str << "]";
+}
+
+void ExprLambda::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    str << "(";
+    if (auto formals = getFormals()) {
+        str << "{ ";
+        bool first = true;
+        for (auto & i : formals->lexicographicOrder(symbols)) {
+            if (first) first = false; else str << ", ";
+            str << symbols[i.name];
+            if (i.def) { str << " ? "; i.def->showForHash(symbols, str, basePath); }
+        }
+        if (ellipsis) { if (!first) str << ", "; str << "..."; }
+        str << " }";
+        if (arg) str << " @ ";
+    }
+    if (arg) str << symbols[arg];
+    str << ": ";
+    body->showForHash(symbols, str, basePath);
+    str << ")";
+}
+
+void ExprCall::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    str << '(';
+    fun->showForHash(symbols, str, basePath);
+    for (auto e : *args) { str << ' '; e->showForHash(symbols, str, basePath); }
+    str << ')';
+}
+
+void ExprLet::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    str << "(let ";
+    attrs->showBindingsForHash(symbols, str, basePath);
+    str << "in ";
+    body->showForHash(symbols, str, basePath);
+    str << ")";
+}
+
+void ExprWith::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    str << "(with ";
+    attrs->showForHash(symbols, str, basePath);
+    str << "; ";
+    body->showForHash(symbols, str, basePath);
+    str << ")";
+}
+
+void ExprIf::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    str << "(if ";
+    cond->showForHash(symbols, str, basePath);
+    str << " then ";
+    then->showForHash(symbols, str, basePath);
+    str << " else ";
+    else_->showForHash(symbols, str, basePath);
+    str << ")";
+}
+
+void ExprAssert::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    str << "assert ";
+    cond->showForHash(symbols, str, basePath);
+    str << "; ";
+    body->showForHash(symbols, str, basePath);
+}
+
+void ExprOpNot::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    str << "(! ";
+    e->showForHash(symbols, str, basePath);
+    str << ")";
+}
+
+void ExprConcatStrings::showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const
+{
+    bool first = true;
+    str << "(";
+    for (auto & i : es) {
+        if (first) first = false; else str << " + ";
+        i.second->showForHash(symbols, str, basePath);
+    }
+    str << ")";
 }
 
 std::string showAttrSelectionPath(const SymbolTable & symbols, std::span<const AttrName> attrPath)

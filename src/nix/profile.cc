@@ -1,5 +1,7 @@
 #include "nix/cmd/command.hh"
 #include "nix/cmd/installable-flake.hh"
+#include "nix/expr/eval-environment/authority-internal.hh"
+#include "nix/expr/eval-environment/environment.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
@@ -178,8 +180,11 @@ struct ProfileManifest
 
         else if (std::filesystem::exists(profile / "manifest.nix")) {
             // FIXME: needed because of pure mode; ugly.
-            state.allowPath(state.store->followLinksToStorePath(profile.string()));
-            state.allowPath(state.store->followLinksToStorePath((profile / "manifest.nix").string()));
+            {
+                EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+                (void) environment.authorizeStorePath(state.store->followLinksToStorePath(profile.string()));
+                (void) environment.authorizeStorePath(state.store->followLinksToStorePath((profile / "manifest.nix").string()));
+            }
 
             auto packageInfos = queryInstalled(state, state.store->followLinksToStore(profile.string()));
 

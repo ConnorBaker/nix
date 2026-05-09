@@ -78,6 +78,13 @@ Checks:
   - performance-use-std-move
   - misc-throw-by-value-catch-by-reference
   - cppcoreguidelines-missing-std-forward
+  # Catches uninitialized scalar fields in classes with a user-provided
+  # ctor (including `Tagged<_, uint32_t>` ID counters).  `Tagged<>` no
+  # longer zero-inits its `value` payload, so every scalar field that
+  # relied on the old implicit zero-init must either declare `{}` on
+  # the field or be listed in every ctor's mem-init-list.  See
+  # `src/libutil/include/nix/util/tagged.hh`.
+  - cppcoreguidelines-pro-type-member-init
   - android-cloexec-open
   - android-cloexec-pipe2
   # Custom nix checks (when added)

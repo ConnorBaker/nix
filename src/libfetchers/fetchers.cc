@@ -5,12 +5,12 @@
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/json-utils.hh"
 #include "nix/fetchers/fetch-settings.hh"
-#include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/url.hh"
 #include "nix/util/users.hh"
 #include "nix/store/pathlocks.hh"
 #include "nix/util/environment-variables.hh"
 
+#include <chrono>
 #include <thread>
 #include <nlohmann/json.hpp>
 
@@ -130,6 +130,11 @@ std::optional<std::string> Input::getFingerprint(Store & store) const
     return fingerprint;
 }
 
+std::optional<std::string> Input::getStableIdentity() const
+{
+    return scheme ? scheme->getStableIdentity(*this) : std::nullopt;
+}
+
 ParsedURL Input::toURL() const
 {
     if (!scheme)
@@ -203,8 +208,17 @@ std::pair<StorePath, Input> Input::fetchToStore(const Settings & settings, Store
         try {
             auto [accessor, result] = getAccessorUnchecked(settings, store);
 
-            auto storePath =
-                nix::fetchToStore(settings, store, SourcePath(accessor), FetchMode::Copy, result.getName());
+            auto fingerprintOverride = result.cachedFingerprint ? *result.cachedFingerprint : std::nullopt;
+            auto [storePath, _] = fetchToStore2(
+                settings,
+                store,
+                SourcePath(accessor),
+                FetchMode::Copy,
+                result.getName(),
+                ContentAddressMethod::Raw::NixArchive,
+                nullptr,
+                NoRepair,
+                std::move(fingerprintOverride));
 
             auto narHash = store.queryPathInfo(storePath)->narHash;
             result.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
@@ -298,6 +312,27 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessor(const Settings & settin
     }
 }
 
+std::optional<std::pair<ref<SourceAccessor>, Input>> Input::getAccessorIfCached(
+    const Settings & settings, Store & store) const
+{
+    // For inputs with a known narHash, check if the store path exists
+    // without fetching. This is the read-only verification path.
+    if (!getNarHash())
+        return std::nullopt;
+
+    try {
+        auto storePath = computeStorePath(store);
+        if (!store.isValidPath(storePath))
+            return std::nullopt;
+
+        auto accessor = store.requireStoreObjectAccessor(storePath);
+        accessor->fingerprint = getFingerprint(store);
+        return {{accessor, *this}};
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings & settings, Store & store) const
 {
     // FIXME: cache the accessor
@@ -363,7 +398,23 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
 
     auto [accessor, result] = scheme->getAccessor(settings, store, *this);
 
-    if (!accessor->fingerprint)
+    const bool trueMutableLocalInput =
+        getSourcePath().has_value() && !isLocked(settings) && !getRef() && !getRev();
+    if (trueMutableLocalInput) {
+        /* Mutable local inputs are no longer cached in InputCache, so the
+           returned accessor should still carry a cacheable fingerprint. Some
+           schemes already attach one directly to the accessor (notably local
+           path inputs copied into the store). Other schemes normalize the
+           returned input while resolving a mutable local source. Preserve
+           pre-normalization worktree identity only for implicit local fetches;
+           explicit local refs/revs must use the normalized resolved result
+           instead of the worktree fingerprint. */
+        auto fingerprint = accessor->fingerprint;
+        if (!fingerprint)
+            fingerprint = getFingerprint(store);
+        result.cachedFingerprint = fingerprint;
+        accessor->fingerprint = fingerprint;
+    } else if (!accessor->fingerprint)
         accessor->fingerprint = result.getFingerprint(store);
     else
         result.cachedFingerprint = accessor->fingerprint;
@@ -375,7 +426,10 @@ Input Input::applyOverrides(std::optional<std::string> ref, std::optional<Hash> 
 {
     if (!scheme)
         return *this;
-    return scheme->applyOverrides(*this, ref, rev);
+    auto result = scheme->applyOverrides(*this, ref, rev);
+    if (ref || rev)
+        result.cachedFingerprint.reset();
+    return result;
 }
 
 void Input::clone(const Settings & settings, Store & store, const std::filesystem::path & destDir) const

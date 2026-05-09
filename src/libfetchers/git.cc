@@ -171,6 +171,85 @@ static LazyAttr makeLazyAttr(fun<ResolvedAttr()> compute)
     });
 }
 
+static std::pair<std::filesystem::path, ref<GitRepo>> requireInitializedSubmoduleRepo(
+    const std::filesystem::path & repoPath,
+    const GitRepo::Submodule & submodule)
+{
+    auto submodulePath = repoPath / submodule.path.rel();
+    if (!std::filesystem::exists(submodulePath) || !std::filesystem::exists(submodulePath / ".git")) {
+        throw Error(
+            "Git input '%s' was requested with submodules enabled, but local submodule '%s' at '%s' is missing, uninitialized, or not a Git checkout; run 'git submodule update --init --recursive' or set 'submodules = false'",
+            repoPath.string(),
+            submodule.path.abs(),
+            submodulePath.string());
+    }
+    return {submodulePath, GitRepo::openRepo(submodulePath, {})};
+}
+
+static MakeNotAllowedError makeRepoNotAllowedError(std::string repoDisplay, std::filesystem::path repoPath)
+{
+    return [repoDisplay{std::move(repoDisplay)}, repoPath{std::move(repoPath)}](const CanonPath & path) -> RestrictedPathError {
+        if (pathExists(repoPath / path.rel()))
+            return RestrictedPathError(
+                "Path '%1%' in the repository \"%2%\" is not tracked by Git.\n"
+                "\n"
+                "To make it visible to Nix, run:\n"
+                "\n"
+                "git -C \"%2%\" add \"%1%\"",
+                path.rel(),
+                repoDisplay);
+        else
+            return RestrictedPathError(
+                "Path '%s' does not exist in Git repository \"%s\".", path.rel(), repoDisplay);
+    };
+}
+
+static ref<SourceAccessor> getWorkdirFingerprintAccessor(
+    const std::filesystem::path & repoPath,
+    GitRepo::WorkdirInfo workdirInfo,
+    bool exportIgnore,
+    bool includeSubmodules)
+{
+    if (includeSubmodules)
+        for (const auto & submodule : workdirInfo.submodules)
+            workdirInfo.files.insert(submodule.path);
+
+    auto repo = GitRepo::openRepo(repoPath, {});
+    ref<SourceAccessor> accessor =
+        repo->getAccessor(
+            workdirInfo,
+            {.exportIgnore = exportIgnore},
+            makeRepoNotAllowedError(repoPath.string(), repoPath));
+
+    if (!includeSubmodules || workdirInfo.submodules.empty())
+        return accessor;
+
+    std::map<CanonPath, nix::ref<SourceAccessor>> mounts;
+    for (const auto & submodule : workdirInfo.submodules) {
+        auto [submodulePath, submoduleRepo] = requireInitializedSubmoduleRepo(repoPath, submodule);
+        mounts.insert_or_assign(
+            submodule.path,
+            getWorkdirFingerprintAccessor(
+                submodulePath,
+                submoduleRepo->getWorkdirInfo(),
+                exportIgnore,
+                true));
+    }
+
+    mounts.insert_or_assign(CanonPath::root, accessor);
+    return makeMountedSourceAccessor(std::move(mounts));
+}
+
+[[maybe_unused]] static bool refMatchesWorkdirRef(std::string_view requestedRef, std::string_view workdirRef)
+{
+    if (requestedRef == "HEAD" || requestedRef == workdirRef)
+        return true;
+
+    constexpr std::string_view headsPrefix{"refs/heads/"};
+    return workdirRef.starts_with(headsPrefix)
+        && requestedRef == workdirRef.substr(headsPrefix.size());
+}
+
 struct GitInputScheme : InputScheme
 {
     std::optional<Input> inputFromURL(const Settings & settings, const ParsedURL & url, bool requireTree) const override
@@ -632,7 +711,7 @@ struct GitInputScheme : InputScheme
         // same as remote URIs, i.e. we don't use the working tree or
         // HEAD). Exception: If _NIX_FORCE_HTTP is set, or the repo is a bare git
         // repo, treat as a remote URI to force a clone.
-        static bool forceHttp = getEnv("_NIX_FORCE_HTTP") == "1"; // for testing
+        bool forceHttp = getEnv("_NIX_FORCE_HTTP") == "1"; // for testing
         auto url = parseURL(getStrAttr(input.attrs, "url"));
 
         // Why are we checking for bare repository?
@@ -702,10 +781,18 @@ struct GitInputScheme : InputScheme
             repoInfo.location = url;
         }
 
-        // If this is a local directory and no ref or revision is
-        // given, then allow the use of an unclean working tree.
-        if (auto repoPath = repoInfo.getPath(); !input.getRef() && !input.getRev() && repoPath)
-            repoInfo.workdirInfo = GitRepo::getCachedWorkdirInfo(*repoPath);
+        // For local repos, always capture current workdir metadata. Even when
+        // the caller provided an explicit ref or rev, we still need accurate
+        // dirty/shallow/workdir-ref state to decide whether the workdir fast
+        // path is legal. Using a default-constructed WorkdirInfo there makes
+        // explicit local refs incorrectly look clean.
+        //
+        // Do not use path-only cached workdir info here: fetcher resolution
+        // needs current tracked dirty state, and stale workdir metadata
+        // silently stabilizes fetchGit/fetchTree across staged or removed
+        // tracked files.
+        if (auto repoPath = repoInfo.getPath(); repoPath)
+            repoInfo.workdirInfo = GitRepo::openRepo(*repoPath, {})->getWorkdirInfo();
 
         return repoInfo;
     }
@@ -779,20 +866,7 @@ struct GitInputScheme : InputScheme
 
     static MakeNotAllowedError makeNotAllowedError(std::filesystem::path repoPath)
     {
-        return [repoPath{std::move(repoPath)}](const CanonPath & path) -> RestrictedPathError {
-            if (pathExists(repoPath / path.rel()))
-                return RestrictedPathError(
-                    "Path '%1%' in the repository %2% is not tracked by Git.\n"
-                    "\n"
-                    "To make it visible to Nix, run:\n"
-                    "\n"
-                    "git -C %2% add \"%1%\"",
-                    path.rel(),
-                    PathFmt(repoPath));
-            else
-                return RestrictedPathError(
-                    "Path '%s' does not exist in Git repository %s.", path.rel(), PathFmt(repoPath));
-        };
+        return makeRepoNotAllowedError(repoPath.string(), std::move(repoPath));
     }
 
     void verifyCommit(const Input & input, std::shared_ptr<GitRepo> repo) const
@@ -812,8 +886,6 @@ struct GitInputScheme : InputScheme
     std::pair<ref<SourceAccessor>, Input>
     getAccessorFromCommit(const Settings & settings, Store & store, RepoInfo & repoInfo, Input && input) const
     {
-        assert(!repoInfo.workdirInfo.isDirty);
-
         auto origRev = input.getRev();
 
         auto originalRef = input.getRef();
@@ -999,7 +1071,10 @@ struct GitInputScheme : InputScheme
         auto exportIgnore = getExportIgnoreAttr(input);
 
         ref<SourceAccessor> accessor =
-            repo->getAccessor(repoInfo.workdirInfo, {.exportIgnore = exportIgnore}, makeNotAllowedError(repoPath));
+            repo->getAccessor(
+                repoInfo.workdirInfo,
+                {.exportIgnore = exportIgnore},
+                makeRepoNotAllowedError(repoInfo.locationToArg(), repoPath));
 
         /* If the repo has submodules, return a mounted input accessor
            consisting of the accessor for the top-level repo and the
@@ -1008,14 +1083,13 @@ struct GitInputScheme : InputScheme
             std::map<CanonPath, nix::ref<SourceAccessor>> mounts;
 
             for (auto & submodule : repoInfo.workdirInfo.submodules) {
-                auto submodulePath = repoPath / submodule.path.rel();
+                auto [submodulePath, submoduleRepo] = requireInitializedSubmoduleRepo(repoPath, submodule);
+                (void) submoduleRepo;
                 fetchers::Attrs attrs;
                 attrs.insert_or_assign("type", "git");
                 attrs.insert_or_assign("url", submodulePath.string());
                 attrs.insert_or_assign("exportIgnore", Explicit<bool>{exportIgnore});
                 attrs.insert_or_assign("submodules", Explicit<bool>{true});
-                // TODO: fall back to getAccessorFromCommit-like fetch when submodules aren't checked out
-                // attrs.insert_or_assign("allRefs", Explicit<bool>{ true });
 
                 auto submoduleInput = fetchers::Input::fromAttrs(settings, std::move(attrs));
                 auto [submoduleAccessor, submoduleInput2] = submoduleInput.getAccessor(settings, store);
@@ -1036,8 +1110,10 @@ struct GitInputScheme : InputScheme
         if (!repoInfo.workdirInfo.isDirty) {
             auto repo = GitRepo::openRepo(repoPath, {});
 
-            if (auto ref = repo->getWorkdirRef())
-                input.attrs.insert_or_assign("ref", *ref);
+            if (!input.getRef()) {
+                if (auto ref = repo->getWorkdirRef())
+                    input.attrs.insert_or_assign("ref", *ref);
+            }
 
             /* Return a rev of 000... if there are no commits yet. */
             auto rev = repoInfo.workdirInfo.headRev.value_or(nullRev);
@@ -1087,11 +1163,35 @@ struct GitInputScheme : InputScheme
             throw UnimplementedError("exportIgnore and submodules are not supported together yet");
         }
 
-        auto [accessor, final] = input.getRef() || input.getRev() || !repoInfo.getPath()
-                                     ? getAccessorFromCommit(settings, store, repoInfo, std::move(input))
-                                     : getAccessorFromWorkdir(settings, store, repoInfo, std::move(input));
+        const auto useWorkdirAccessor = [&]() {
+            if (!repoInfo.getPath())
+                return false;
+            auto repo = GitRepo::openRepo(*repoInfo.getPath(), {});
+            if (repo->isShallow() && !getShallowAttr(input))
+                return false;
+            if (input.getRev())
+                return false;
+            if (input.getRef())
+                return false;
+            return true;
+        }();
+
+        if (useWorkdirAccessor) {
+            auto repoPath = repoInfo.getPath();
+            assert(repoPath);
+            repoInfo.workdirInfo = GitRepo::openRepo(*repoPath, {})->getWorkdirInfo();
+        }
+
+        auto [accessor, final] = useWorkdirAccessor
+            ? getAccessorFromWorkdir(settings, store, repoInfo, std::move(input))
+            : getAccessorFromCommit(settings, store, repoInfo, std::move(input));
 
         return {accessor, std::move(final)};
+    }
+
+    std::optional<std::string> getStableIdentity(const Input & input) const override
+    {
+        return fmt("git:%s", getStrAttr(input.attrs, "url"));
     }
 
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
@@ -1105,9 +1205,16 @@ struct GitInputScheme : InputScheme
             return makeFingerprint(*rev);
         else {
             auto repoInfo = getRepoInfo(input);
-            if (auto repoPath = repoInfo.getPath(); repoPath && repoInfo.workdirInfo.submodules.empty()) {
-                /* Calculate a fingerprint that takes into account the
-                   deleted and modified/added files. */
+            if (auto repoPath = repoInfo.getPath()) {
+                /* Local worktrees without an explicit ref/rev are keyed by
+                   the visible tracked tree, not by HEAD or by a dirty delta.
+                   That keeps the store path stable across dirty->commit
+                   transitions when the fetched tree contents do not change. */
+                auto accessor = getWorkdirFingerprintAccessor(
+                    *repoPath,
+                    repoInfo.workdirInfo,
+                    getExportIgnoreAttr(input),
+                    getSubmodulesAttr(input));
                 HashSink hashSink{HashAlgorithm::SHA512};
                 for (auto & file : repoInfo.workdirInfo.dirtyFiles) {
                     writeString("modified:", hashSink);

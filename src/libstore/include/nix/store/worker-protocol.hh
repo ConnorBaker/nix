@@ -70,8 +70,8 @@ struct WorkerProto
     {
         struct Number
         {
-            unsigned int major;
-            uint8_t minor;
+            unsigned int major = 0;
+            uint8_t minor = 0;
 
             constexpr auto operator<=>(const Number &) const = default;
 

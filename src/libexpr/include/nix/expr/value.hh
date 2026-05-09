@@ -14,6 +14,7 @@
 #include <concepts>
 
 #include "nix/expr/eval-gc.hh"
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
 #include "nix/expr/value/context.hh"
 #include "nix/util/source-path.hh"
 #include "nix/expr/print-options.hh"
@@ -106,6 +107,8 @@ class Printer;
 using NixInt = checked::Checked<int64_t>;
 using NixFloat = double;
 
+struct SemanticHandle;
+
 /**
  * External values must descend from ExternalValueBase, so that
  * type-agnostic nix functions (e.g. showType) can be implemented
@@ -170,15 +173,17 @@ std::ostream & operator<<(std::ostream & str, const ExternalValueBase & v);
 class ListBuilder
 {
     const size_t size;
+    const bool forceHeap;
     Value * inlineElems[2] = {nullptr, nullptr};
 public:
     Value ** elems;
-    ListBuilder(EvalMemory & mem, size_t size);
+    ListBuilder(EvalMemory & mem, size_t size, bool forceHeap = false);
 
     ListBuilder(ListBuilder && x) noexcept
         : size(x.size)
+        , forceHeap(x.forceHeap)
         , inlineElems{x.inlineElems[0], x.inlineElems[1]}
-        , elems(size <= 2 ? inlineElems : x.elems)
+        , elems(forceHeap || size > 2 ? x.elems : inlineElems)
     {
     }
 
@@ -190,6 +195,21 @@ public:
     Value *& operator[](size_t n)
     {
         return elems[n];
+    }
+
+    Value * const & operator[](size_t n) const
+    {
+        return elems[n];
+    }
+
+    size_t listSize() const noexcept
+    {
+        return size;
+    }
+
+    bool hasHeapStorage() const noexcept
+    {
+        return forceHeap || size > 2;
     }
 
     typedef Value ** iterator;
@@ -344,8 +364,9 @@ struct ValueBase
             using size_type = std::size_t;
             using iterator = const value_type *;
 
-            Context(size_type size)
+            Context(size_type size, const SemanticHandle * publication = nullptr)
                 : size_(size)
+                , publication(publication)
             {
             }
 
@@ -354,6 +375,11 @@ struct ValueBase
              * Number of items in the array
              */
             size_type size_;
+
+            /**
+             * Optional carried semantic publication metadata.
+             */
+            const SemanticHandle * publication;
 
             /**
              * @pre must be in sorted order
@@ -376,10 +402,16 @@ struct ValueBase
                 return size_;
             }
 
+            const SemanticHandle * carriedPublication() const
+            {
+                return publication;
+            }
+
             /**
              * @return null pointer when context.empty()
              */
-            static Context * fromBuilder(const NixStringContext & context, EvalMemory & mem);
+            static Context *
+            fromBuilder(const NixStringContext & context, EvalMemory & mem, const SemanticHandle * publication = nullptr);
         };
 
         /**
@@ -390,7 +422,22 @@ struct ValueBase
 
     struct Path
     {
-        SourceAccessor * accessor;
+        struct Details
+        {
+            SourceAccessor * accessor;
+            const SemanticHandle * publication;
+
+            static const Details * make(EvalMemory & mem, SourceAccessor * accessor, const SemanticHandle * publication);
+            static const Details * make(SourceAccessor * accessor, const SemanticHandle * publication)
+            {
+                return new Details{
+                    .accessor = accessor,
+                    .publication = publication,
+                };
+            }
+        };
+
+        const Details * details;
         const StringData * path;
     };
 
@@ -430,7 +477,27 @@ struct ValueBase
     {
         size_t size;
         Value * const * elems;
+
+        // NOTE: The packed ValueStorage specialization (x86-64 production target,
+        // useBitPackedValueStorage == true) stores only elems and size in the
+        // 128-bit Value payload. DO NOT add fields to this struct expecting them
+        // to survive a setStorage/getStorage round-trip on x86-64.
+        //
+        // For extra per-list metadata that must survive across evaluation:
+        //   - Use a heap-allocated header pointed to by elems (e.g., elems[-1]).
+        //   - Or use a side-map keyed by heap-backed list storage identity
+        //     (ContainerProvenanceRegistry).
+        //
+        // List provenance for the trace system uses ContainerProvenanceRegistry
+        // (trace-frame.hh) precisely because it cannot be carried inline here.
     };
+
+    // Packed setStorage(List) stores only elems + size in two 64-bit words.
+    // A third field would be silently dropped on x86-64. This assert fires
+    // if anyone adds a field to List without updating the packed storage.
+    static_assert(
+        sizeof(List) == sizeof(size_t) + sizeof(Value * const *),
+        "List must contain only size + elems; packed ValueStorage silently drops extra fields");
 
     struct Failed : gc_cleanup
     {
@@ -763,11 +830,19 @@ class alignas(16)
     }
 
 public:
+    // `payloadWords` is unconditionally written by `updatePayload`
+    // in every ctor body — a zero-init in the mem-init-list would be
+    // strictly redundant and defeats the MOVDQA/MOVAPS atomic store
+    // optimisation described in the class-level comment.  NOLINT
+    // silences cppcoreguidelines-pro-type-member-init's conservative
+    // view that only sees the mem-init-list.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
     ValueStorage()
     {
         updatePayload({});
     }
 
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
     ValueStorage(const ValueStorage & other)
     {
         updatePayload(other.loadPayload());
@@ -779,6 +854,7 @@ public:
         return *this;
     }
 
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
     ValueStorage(ValueStorage && other) noexcept
     {
         updatePayload(other.loadPayload());
@@ -898,7 +974,7 @@ protected:
     void getStorage(Path & path) const noexcept
     {
         Payload payload = loadPayload();
-        path.accessor = untagPointer<decltype(path.accessor)>(payload[0]);
+        path.details = untagPointer<decltype(path.details)>(payload[0]);
         path.path = std::bit_cast<const StringData *>(payload[1]);
     }
 
@@ -945,6 +1021,9 @@ protected:
 
     void setStorage(List list) noexcept
     {
+        // Only list.elems and list.size are stored in the 128-bit payload.
+        // Any additional fields on the List struct are silently dropped.
+        // See the List struct comment for the design rationale.
         setUntaggablePayload<pdListN>(list.elems, list.size);
     }
 
@@ -955,7 +1034,7 @@ protected:
 
     void setStorage(Path path) noexcept
     {
-        setUntaggablePayload<pdPath>(path.accessor, path.path);
+        setUntaggablePayload<pdPath>(path.details, path.path);
     }
 
     void setStorage(Failed * failed) noexcept
@@ -1191,7 +1270,9 @@ private:
     {
         if (getInternalType() != detail::payloadTypeToInternalType<T>) [[unlikely]]
             nixUnreachableWhenHardened();
-        T out;
+        // `out` is an out-parameter for `ValueStorage::getStorage`;
+        // zero-init here is strictly redundant.
+        T out;  // NOLINT(cppcoreguidelines-pro-type-member-init)
         ValueStorage::getStorage(out);
         return out;
     }
@@ -1318,17 +1399,34 @@ public:
         setStorage(StringWithContext{.str = &s, .context = context});
     }
 
-    void mkString(std::string_view s, EvalMemory & mem);
+    void mkString(std::string_view s, EvalMemory & mem, const SemanticHandle * publication = nullptr);
 
-    void mkString(std::string_view s, const NixStringContext & context, EvalMemory & mem);
+    void mkString(
+        std::string_view s,
+        const NixStringContext & context,
+        EvalMemory & mem,
+        const SemanticHandle * publication = nullptr);
 
-    void mkStringMove(const StringData & s, const NixStringContext & context, EvalMemory & mem);
+    void mkStringMove(
+        const StringData & s,
+        const NixStringContext & context,
+        EvalMemory & mem,
+        const SemanticHandle * publication = nullptr);
 
-    void mkPath(const SourcePath & path, EvalMemory & mem);
+    void mkPath(const SourcePath & path, EvalMemory & mem, const SemanticHandle * publication = nullptr);
+
+    inline void mkPath(
+        SourceAccessor * accessor,
+        const StringData & path,
+        EvalMemory & mem,
+        const SemanticHandle * publication = nullptr)
+    {
+        setStorage(Path{.details = Path::Details::make(mem, accessor, publication), .path = &path});
+    }
 
     inline void mkPath(SourceAccessor * accessor, const StringData & path) noexcept
     {
-        setStorage(Path{.accessor = accessor, .path = &path});
+        setStorage(Path{.details = Path::Details::make(accessor, nullptr), .path = &path});
     }
 
     inline void mkNull() noexcept
@@ -1345,19 +1443,18 @@ public:
 
     void mkList(const ListBuilder & builder) noexcept
     {
+        if (builder.forceHeap || builder.size > 2) {
+            setStorage(List{.size = builder.size, .elems = builder.elems});
+            return;
+        }
+
         switch (builder.size) {
         case 0:
             setStorage(List{.size = 0, .elems = nullptr});
             break;
-        case 1:
-            setStorage(std::array<Value *, 2>{builder.inlineElems[0], nullptr});
-            break;
-        case 2:
-            setStorage(std::array<Value *, 2>{builder.inlineElems[0], builder.inlineElems[1]});
-            break;
-        default:
-            setStorage(List{.size = builder.size, .elems = builder.elems});
-            break;
+        case 1: setStorage(std::array<Value *, 2>{builder.inlineElems[0], nullptr}); break;
+        case 2: setStorage(std::array<Value *, 2>{builder.inlineElems[0], builder.inlineElems[1]}); break;
+        default: unreachable();
         }
     }
 
@@ -1420,6 +1517,13 @@ public:
         return isa<tListSmall>() ? (getStorage<SmallList>()[1] == nullptr ? 1 : 2) : getStorage<List>().size;
     }
 
+    Value * const * listStorageIdentity() const noexcept
+    {
+        if (!isa<tListN>())
+            return nullptr;
+        return getStorage<List>().elems;
+    }
+
     PosIdx determinePos(const PosIdx pos) const;
 
     /**
@@ -1451,6 +1555,12 @@ public:
     }
 
     const Value::StringWithContext::Context * context() const noexcept
+    {
+        auto ctx = getStorage<StringWithContext>().context;
+        return ctx && ctx->size() > 0 ? ctx : nullptr;
+    }
+
+    const Value::StringWithContext::Context * contextStorage() const noexcept
     {
         return getStorage<StringWithContext>().context;
     }
@@ -1517,8 +1627,13 @@ public:
 
     SourceAccessor * pathAccessor() const noexcept
     {
-        return getStorage<Path>().accessor;
+        return getStorage<Path>().details->accessor;
     }
+
+    /// Returns the semantic publication handle for this value, or nullptr.
+    /// Defined in eval-inline.hh (after both Bindings and Value are complete)
+    /// so the implementation can be inlined at all call sites.
+    const SemanticHandle * publication() const noexcept;
 
     Failed & failed() const noexcept
     {

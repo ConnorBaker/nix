@@ -110,7 +110,7 @@ TEST(ReadLine, LineWithNullBytes)
     pipe.writeSide.close();
 
     auto line = readLine(pipe.readSide.get());
-    EXPECT_EQ(line.size(), 3);
+    EXPECT_EQ(line.size(), 3u);
     EXPECT_EQ(
         line,
         std::string(
@@ -252,7 +252,7 @@ TEST(BufferedSourceReadLine, LineWithNullBytes)
     FdSource source(pipe.readSide.get());
 
     auto line = source.readLine();
-    EXPECT_EQ(line.size(), 3);
+    EXPECT_EQ(line.size(), 3u);
     EXPECT_EQ(
         line,
         std::string(

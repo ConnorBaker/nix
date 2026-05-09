@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "eval-trace-bench"
+version = "0.1.0"
+description = "Eval-trace benchmark runner, comparator, and analyzer"
+requires-python = ">=3.12"
+dependencies = [
+    "rich>=13.0",
+    "pydantic>=2.7",
+    "cyclopts>=3.0",
+]
+
+[project.scripts]
+eval-trace-bench = "eval_trace_bench.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eval_trace_bench"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "PL"]
+ignore = [
+    "E501",    # line-too-long: rich strings are allowed to stretch
+    "PLR0913", # many function arguments
+    "PLR0912", # too many branches
+    "PLR0915", # too many statements
+    "PLR2004", # magic-value comparisons in metrics are deliberate
+    "PLR0911", # too many return statements
+]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingImports = true
+reportMissingTypeStubs = false
+# nlohmann-style JSON values surface as object; explicit narrowing is
+# done at call sites via isinstance().
+reportUnknownMemberType = "error"
+reportUnknownVariableType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownParameterType = "error"
+reportUntypedFunctionDecorator = "error"
+reportMissingParameterType = "error"
+# Cyclopts `@app.command` registers functions at import time without
+# an explicit binding; pyright can't see that the nested def is
+# live.  The decorator itself is the use.
+reportUnusedFunction = "none"

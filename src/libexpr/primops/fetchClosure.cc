@@ -1,3 +1,5 @@
+#include "nix/expr/eval-environment/authority-internal.hh"
+#include "nix/expr/eval-environment/environment.hh"
 #include "nix/expr/primops.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/realisation.hh"
@@ -65,7 +67,8 @@ static void runFetchClosureWithRewrite(
              .pos = state.positions[pos]});
     }
 
-    state.allowClosure(toPath);
+    EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+    (void) environment.authorizeStoreClosure(toPath);
 
     state.mkStorePathString(toPath, v);
 }
@@ -95,7 +98,8 @@ static void runFetchClosureWithContentAddressedPath(
              .pos = state.positions[pos]});
     }
 
-    state.allowClosure(fromPath);
+    EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+    (void) environment.authorizeStoreClosure(fromPath);
 
     state.mkStorePathString(fromPath, v);
 }
@@ -122,7 +126,8 @@ static void runFetchClosureWithInputAddressedPath(
              .pos = state.positions[pos]});
     }
 
-    state.allowClosure(fromPath);
+    EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+    (void) environment.authorizeStoreClosure(fromPath);
 
     state.mkStorePathString(fromPath, v);
 }

@@ -7,7 +7,13 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
 #include "nix/flake/flake.hh"
-#include "nix/expr/eval-cache.hh"
+#include "nix/util/url.hh"
+#include "nix/util/environment-variables.hh"
+#include "nix/fetchers/registry.hh"
+#include "nix/store/build-result.hh"
+
+#include <regex>
+#include <queue>
 
 #include <nlohmann/json.hpp>
 
@@ -17,8 +23,7 @@ std::vector<std::string> InstallableFlake::getActualAttrPaths()
 {
     std::vector<std::string> res;
     if (attrPaths.size() == 1 && attrPaths.front().starts_with(".")) {
-        attrPaths.front().erase(0, 1);
-        res.push_back(attrPaths.front());
+        res.push_back(std::string(attrPaths.front().substr(1)));
         return res;
     }
 
@@ -29,6 +34,11 @@ std::vector<std::string> InstallableFlake::getActualAttrPaths()
         res.push_back(s);
 
     return res;
+}
+
+ref<eval_trace::TraceSession> InstallableFlake::getOrCreateTraceCache(EvalState & state) const
+{
+    return openTraceCache(state, getLockedFlake());
 }
 
 static std::string showAttrPaths(const std::vector<std::string> & paths)
@@ -68,35 +78,103 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
 {
     Activity act(*logger, lvlTalkative, actUnknown, fmt("evaluating derivation '%s'", what()));
 
-    auto attr = getCursor(*state);
+    auto evalCache = getOrCreateTraceCache(*state);
+    auto * root = evalCache->getRootValue();
+    state->forceValue(*root, noPos);
 
-    auto attrPath = attr->getAttrPathStr();
+    auto emptyArgs = state->buildBindings(0).finish();
+    auto attrPaths = getActualAttrPaths();
+    Suggestions suggestions;
 
-    if (!attr->isDerivation()) {
+    Value * vp = nullptr;
+    PosIdx vpPos = noPos;
+    std::string resolvedPath;
+    for (auto & ap : attrPaths) {
+        debug("trying flake output attribute '%s'", ap);
+        try {
+            auto [cachedValue, cachedPos] = findAlongAttrPath(*state, ap, *emptyArgs, *root);
 
-        // FIXME: use eval cache?
-        auto v = attr->forceValue();
+            // Confirm the candidate against the real root when evaluation is
+            // allowed so stale traced derivations cannot survive after the
+            // attribute vanishes. When evaluation is explicitly disabled, the
+            // traced root must remain authoritative.
+            if (getEnv("NIX_ALLOW_EVAL").value_or("1") != "0") {
+                auto * realRoot = evalCache->getRealRoot();
+                state->forceValue(*realRoot, noPos);
+                // Only confirm that the attribute still exists on the real
+                // root. Forcing the real child here would pre-evaluate it
+                // outside the traced child scope, dropping its direct deps.
+                (void) findAlongAttrPath(*state, ap, *emptyArgs, *realRoot);
+            }
+            vp = cachedValue;
+            vpPos = cachedPos;
+            resolvedPath = ap;
+            break;
+        } catch (Error & e) {
+            suggestions += e.info().suggestions;
+        }
+    }
 
+    if (!vp)
+        throw Error(suggestions, "flake '%s' does not provide attribute %s", flakeRef, showAttrPaths(attrPaths));
+
+    state->forceValue(*vp, vpPos);
+
+    if (vp->type() != nAttrs || !state->isDerivation(*vp)) {
         if (std::optional derivedPathWithInfo = trySinglePathToDerivedPaths(
-                v, noPos, fmt("while evaluating the flake output attribute '%s'", attrPath))) {
+                *vp, noPos, fmt("while evaluating the flake output attribute '%s'", resolvedPath))) {
             return {*derivedPathWithInfo};
         } else {
             throw Error(
                 "expected flake output attribute '%s' to be a derivation or path but found %s: %s",
-                attrPath,
-                showType(v),
-                ValuePrinter(*this->state, v, errorPrintOptions));
+                resolvedPath,
+                showType(*vp),
+                ValuePrinter(*this->state, *vp, errorPrintOptions));
         }
     }
 
-    auto drvPath = attr->forceDerivation();
+    // Ensure .drv exists in store
+    auto * aDrvPath = vp->attrs()->get(state->s.drvPath);
+    if (!aDrvPath)
+        throw Error("derivation does not have a 'drvPath' attribute");
+    state->forceValue(*aDrvPath->value, aDrvPath->pos);
+    auto drvPath = state->store->parseStorePath(aDrvPath->value->string_view());
+    drvPath.requireDerivation();
+    if (!state->store->isValidPath(drvPath)) {
+        /* The eval trace may have returned a traced drvPath from a previous
+           session, but the .drv file was garbage-collected. Perform fresh
+           evaluation via the rootLoader to regenerate it (BSàlC: rebuild).
+           This also re-copies any source paths without derivers (e.g.,
+           .patch files added via builtins.path or path coercion) that were
+           GC'd along with the .drv that referenced them. */
+        auto * realRoot = evalCache->getRealRoot();
+        state->forceValue(*realRoot, noPos);
+        auto [v2, pos2] = findAlongAttrPath(*state, resolvedPath, *emptyArgs, *realRoot);
+        state->forceValue(*v2, noPos);
+        if (v2->type() == nAttrs) {
+            auto * aDP2 = v2->attrs()->get(state->s.drvPath);
+            if (aDP2) {
+                state->forceValue(*aDP2->value, aDP2->pos);
+                drvPath = state->store->parseStorePath(aDP2->value->string_view());
+            }
+        }
+        if (!state->store->isValidPath(drvPath))
+            throw Error(
+                "don't know how to recreate store derivation '%s'!",
+                state->store->printStorePath(drvPath));
+    }
 
     std::optional<NixInt::Inner> priority;
 
-    if (attr->maybeGetAttr(state->s.outputSpecified)) {
-    } else if (auto aMeta = attr->maybeGetAttr(state->s.meta)) {
-        if (auto aPriority = aMeta->maybeGetAttr("priority"))
-            priority = aPriority->getInt().value;
+    if (vp->attrs()->get(state->s.outputSpecified)) {
+    } else if (auto * aMeta = vp->attrs()->get(state->s.meta)) {
+        state->forceValue(*aMeta->value, aMeta->pos);
+        if (aMeta->value->type() == nAttrs) {
+            if (auto * aPriority = aMeta->value->attrs()->get(state->symbols.create("priority"))) {
+                state->forceValue(*aPriority->value, aPriority->pos);
+                priority = aPriority->value->integer().value;
+            }
+        }
     }
 
     return {{
@@ -105,17 +183,29 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
                 .drvPath = makeConstantStorePathRef(std::move(drvPath)),
                 .outputs = std::visit(
                     overloaded{
-                        [&](const ExtendedOutputsSpec::Default & d) -> OutputsSpec {
+                        [&](const ExtendedOutputsSpec::Default &) -> OutputsSpec {
                             StringSet outputsToInstall;
-                            if (auto aOutputSpecified = attr->maybeGetAttr(state->s.outputSpecified)) {
-                                if (aOutputSpecified->getBool()) {
-                                    if (auto aOutputName = attr->maybeGetAttr("outputName"))
-                                        outputsToInstall = {aOutputName->getString()};
+                            if (auto * aOutputSpecified = vp->attrs()->get(state->s.outputSpecified)) {
+                                state->forceValue(*aOutputSpecified->value, aOutputSpecified->pos);
+                                if (aOutputSpecified->value->type() == nBool && aOutputSpecified->value->boolean()) {
+                                    if (auto * aOutputName = vp->attrs()->get(state->symbols.create("outputName"))) {
+                                        state->forceValue(*aOutputName->value, aOutputName->pos);
+                                        outputsToInstall = {std::string(aOutputName->value->string_view())};
+                                    }
                                 }
-                            } else if (auto aMeta = attr->maybeGetAttr(state->s.meta)) {
-                                if (auto aOutputsToInstall = aMeta->maybeGetAttr("outputsToInstall"))
-                                    for (auto & s : aOutputsToInstall->getListOfStrings())
-                                        outputsToInstall.insert(s);
+                            } else if (auto * aMeta = vp->attrs()->get(state->s.meta)) {
+                                state->forceValue(*aMeta->value, aMeta->pos);
+                                if (aMeta->value->type() == nAttrs) {
+                                    if (auto * aOTI = aMeta->value->attrs()->get(state->symbols.create("outputsToInstall"))) {
+                                        state->forceValue(*aOTI->value, aOTI->pos);
+                                        if (aOTI->value->type() == nList) {
+                                            for (auto elem : aOTI->value->listView()) {
+                                                state->forceValue(*elem, noPos);
+                                                outputsToInstall.insert(std::string(elem->string_view()));
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             if (outputsToInstall.empty())
@@ -130,48 +220,49 @@ DerivedPathsWithInfo InstallableFlake::toDerivedPaths()
         .info = make_ref<ExtraPathInfoFlake>(
             ExtraPathInfoValue::Value{
                 .priority = priority,
-                .attrPath = attrPath,
+                .attrPath = resolvedPath,
                 .extendedOutputsSpec = extendedOutputsSpec,
             },
             ExtraPathInfoFlake::Flake{
                 .originalRef = flakeRef,
-                .lockedRef = getLockedFlake()->flake.lockedRef,
+                .lockedRef = getLockedFlake()->flake.lockedRef.value,
             }),
     }};
 }
 
-std::pair<Value *, PosIdx> InstallableFlake::toValue(EvalState & state)
+EvaluatedInstallableValue InstallableFlake::toValue(EvalState & state)
 {
-    return {&getCursor(state)->forceValue(), noPos};
-}
+    auto evalCache = getOrCreateTraceCache(state);
+    auto * root = evalCache->getRootValue();
+    state.forceValue(*root, noPos);
 
-std::vector<ref<eval_cache::AttrCursor>> InstallableFlake::getCursors(EvalState & state)
-{
-    auto evalCache = openEvalCache(state, getLockedFlake());
-
-    auto root = evalCache->getRoot();
-
-    std::vector<ref<eval_cache::AttrCursor>> res;
-
-    Suggestions suggestions;
     auto attrPaths = getActualAttrPaths();
+    Suggestions suggestions;
+    auto emptyArgs = state.buildBindings(0).finish();
 
+    std::pair<Value *, PosIdx> found{nullptr, noPos};
     for (auto & attrPath : attrPaths) {
         debug("trying flake output attribute '%s'", attrPath);
-
-        auto attr = root->findAlongAttrPath(AttrPath::parse(state, attrPath));
-        if (attr) {
-            res.push_back(ref(*attr));
-        } else {
-            suggestions += attr.getSuggestions();
+        try {
+            found = findAlongAttrPath(state, attrPath, *emptyArgs, *root);
+            resolvedAttrPath_ = attrPath;
+            break;
+        } catch (Error & e) {
+            suggestions += e.info().suggestions;
         }
     }
 
-    if (res.size() == 0)
+    if (!found.first)
         throw Error(suggestions, "flake '%s' does not provide attribute %s", flakeRef, showAttrPaths(attrPaths));
 
-    return res;
+    /* Force the resolved flake attribute so that top-level evaluation errors
+       escape this function. Otherwise the traced-expr thunk is first forced
+       by ValuePrinter, whose `errors = Print` catches the exception and
+       renders it inline while `nix eval` exits 0. */
+    state.forceValue(*found.first, found.second);
+    return EvaluatedInstallableValue::withKeepalive(found.first, found.second, evalCache);
 }
+
 
 ref<flake::LockedFlake> InstallableFlake::getLockedFlake() const
 {
@@ -192,8 +283,8 @@ FlakeRef InstallableFlake::nixpkgsFlakeRef() const
     if (auto nixpkgsInput = lockedFlake->lockFile.findInput({"nixpkgs"})) {
         if (auto lockedNode = std::dynamic_pointer_cast<const flake::LockedNode>(nixpkgsInput)) {
             if (lockedNode->isFlake) {
-                debug("using nixpkgs flake '%s'", lockedNode->lockedRef);
-                return std::move(lockedNode->lockedRef);
+                debug("using nixpkgs flake '%s'", lockedNode->lockedRef.value);
+                return lockedNode->lockedRef.value;
             }
         }
     }

@@ -3,6 +3,7 @@
 
 #include "nix/expr/diagnose.hh"
 #include "nix/expr/eval-profiler-settings.hh"
+#include "nix/expr/eval-trace/hash-spec.hh"
 #include "nix/util/configuration.hh"
 #include "nix/util/source-path.hh"
 
@@ -173,6 +174,14 @@ struct EvalSettings : Config
      */
     const std::string & getCurrentSystem() const;
 
+    // NOTE: pureEval, restrictEval, currentSystem, enableImportFromDerivation,
+    // and allowedUris are hashed together (along with NIX_PATH in impure mode)
+    // to form the policy component of the eval-trace session key. If you add a
+    // new setting that affects evaluation results, also add it to
+    // computePolicyDigest in BOTH of:
+    //   nix/expr/eval-trace/store/session-policy.hh (EvalSettings overload)
+    //   src/libexpr/eval-environment/session-builders.cc (snapshot overload)
+    // and bump kSchemaEpoch in nix/expr/eval-trace/store/trace-store.hh.
     Setting<bool> restrictEval{
         this,
         false,
@@ -293,14 +302,96 @@ struct EvalSettings : Config
           See [`eval-profiler`](#conf-eval-profiler).
         )"};
 
-    Setting<bool> useEvalCache{
+    Setting<bool> useTraceCache{
         this,
         true,
-        "eval-cache",
+        "eval-trace",
         R"(
-            Whether to use the flake evaluation cache.
-            Certain commands won't have to evaluate when invoked for the second time with a particular version of a flake.
-            Intermediate results are not cached.
+            Whether to use the eval trace cache (a deep constructive trace
+            store). When enabled, traced commands can skip fresh evaluation on
+            subsequent invocations by verifying recorded oracle deps and
+            serving cached results. Root values and materialized child
+            attribute values are traced; unforced thunks remain lazy.
+        )"};
+
+    Setting<eval_trace::EvalTraceHashAlgorithm> evalTraceHashAlgorithm{
+        this,
+        eval_trace::EvalTraceHashAlgorithm::Blake3,
+        "eval-trace-hash-algorithm",
+        R"(
+            Hash algorithm used for eval-trace dependency digests, trace
+            hashes, result hashes, session keys, and recovery keys.
+
+            Supported values are `blake3` and `sha256`. The selected value
+            namespaces the eval-trace cache, so changing it will not read or
+            write rows produced by a different hash algorithm.
+
+            Has no effect when [`eval-trace`](#conf-eval-trace) is disabled.
+        )"};
+
+    // NOT added to computePolicyDigest (see note above restrictEval): this
+    // setting gates a cache recovery strategy, not the semantics of
+    // evaluation. Both branches either serve a correct cached result or
+    // fall through to fresh evaluation, so they produce identical outputs
+    // for the same inputs. Cross-session cache identity must not depend on
+    // which recovery strategies were available.
+    Setting<bool> useStructuralRecovery{
+        this,
+        true,
+        "eval-trace-structural-recovery",
+        R"(
+            Whether the eval-trace recovery pipeline may attempt
+            structural-variant recovery after direct-hash recovery misses.
+
+            Structural-variant recovery scans historical candidate traces
+            at the same attribute path, grouping them by historical
+            dependency key set, and accepts one whose dependencies still
+            resolve correctly under the current state. On large histories
+            where most candidate buckets never produce a match, this layer
+            can dominate cold-eval wall time while yielding few cache hits.
+
+            When this setting is `false`, the recovery pipeline stops
+            after direct-hash recovery; a miss falls through to full
+            re-evaluation, which is always sound but loses the cache-hit
+            opportunity that structural-variant recovery provides.
+
+            Scope: this setting gates only the structural-variant layer
+            of recovery. Trace recording, primary verification, git-identity
+            recovery, and direct-hash recovery are unchanged. A disabled
+            structural-variant miss is counted in
+            `evalTrace.recovery.failures` (it is a recovery that produced
+            no result), so benchmarks with this setting off will show
+            that counter climbing relative to the default on.
+
+            Has no effect when [`eval-trace`](#conf-eval-trace) is disabled.
+        )"};
+
+    // NOT added to computePolicyDigest: this setting controls diagnostic
+    // instrumentation inside one recovery strategy, not evaluation semantics
+    // or cache identity.
+    Setting<bool> useStructuralRecoveryMismatchTelemetry{
+        this,
+        false,
+        "eval-trace-structural-recovery-mismatch-telemetry",
+        R"(
+            Whether structural-variant recovery records the first historical
+            hash mismatch index for each candidate bucket.
+
+            This telemetry is useful when studying whether structural-variant
+            recovery should stop after the first dependency whose current hash
+            differs from the candidate's recorded hash.  It requires loading
+            each candidate trace's stored dependency values, while normal
+            structural-variant recovery only needs the dependency keys plus
+            freshly recomputed current hashes.
+
+            Leave this disabled for ordinary benchmarking and production
+            evaluation.  Candidate outcome counters are still recorded in
+            `evalTrace.structVariant.byDepKeySet`; only the mismatch-index
+            savings fields and matching debug log lines require this setting.
+
+            Has no effect when [`eval-trace`](#conf-eval-trace) or
+            [`eval-trace-structural-recovery`](#conf-eval-trace-structural-recovery)
+            is disabled.
         )"};
 
     Setting<bool> ignoreExceptionsDuringTry{

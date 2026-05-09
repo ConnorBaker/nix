@@ -60,7 +60,7 @@ size_t savedStackSize = 0;
 
 void ensureStackSizeAtLeast(size_t stackSize)
 {
-    struct rlimit limit;
+    struct rlimit limit{};
     if (getrlimit(RLIMIT_STACK, &limit) == 0 && static_cast<size_t>(limit.rlim_cur) < stackSize) {
         savedStackSize = limit.rlim_cur;
         if (limit.rlim_max < static_cast<rlim_t>(stackSize)) {
@@ -106,7 +106,7 @@ void restoreProcessContext(bool restoreMounts)
 
 #ifndef _WIN32
     if (savedStackSize) {
-        struct rlimit limit;
+        struct rlimit limit{};
         if (getrlimit(RLIMIT_STACK, &limit) == 0) {
             limit.rlim_cur = savedStackSize;
             setrlimit(RLIMIT_STACK, &limit);

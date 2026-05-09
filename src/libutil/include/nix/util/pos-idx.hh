@@ -21,9 +21,18 @@ private:
     }
 
 public:
+    /// Tag bit set on PosIdx values from TracedData origins (O(1) provenance check).
+    static constexpr uint32_t tracedDataTag = uint32_t(1) << 31;
+
     PosIdx()
         : id(0)
     {
+    }
+
+    /// O(1) check: does this PosIdx belong to a TracedData origin?
+    bool isTracedData() const
+    {
+        return id & tracedDataTag;
     }
 
     explicit operator bool() const

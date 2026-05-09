@@ -10,9 +10,9 @@ Bindings Bindings::emptyBindings;
 /* Allocate a new array of attributes for an attribute set with a specific
    capacity. The space is implicitly reserved after the Bindings
    structure. */
-Bindings * EvalMemory::allocBindings(size_t capacity)
+Bindings * EvalMemory::allocBindings(size_t capacity, EmptyBindingsAllocation emptyAllocation)
 {
-    if (capacity == 0)
+    if (capacity == 0 && emptyAllocation == EmptyBindingsAllocation::ReuseSharedEmpty)
         return &Bindings::emptyBindings;
     if (capacity > std::numeric_limits<Bindings::size_type>::max())
         throw Error("attribute set of size %d is too big", capacity);

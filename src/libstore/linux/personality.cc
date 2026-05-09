@@ -13,7 +13,7 @@ void setPersonality(PersonalityArgs args)
 {
     /* Change the personality to 32-bit if we're doing an
        i686-linux build on an x86_64-linux machine. */
-    struct utsname utsbuf;
+    struct utsname utsbuf{};
     uname(&utsbuf);
     if ((args.system == "i686-linux"
          && (std::string_view(NIX_LOCAL_SYSTEM) == "x86_64-linux"

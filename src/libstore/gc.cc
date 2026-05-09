@@ -876,7 +876,7 @@ void LocalStore::autoGC(bool sync)
         if (fakeFreeSpaceFile)
             return std::stoll(readFile(*fakeFreeSpaceFile));
 
-        struct statvfs st;
+        struct statvfs st{};
         if (statvfs(config->realStoreDir.get().c_str(), &st))
             throw SysError("getting filesystem info about '%s'", PathFmt(config->realStoreDir.get()));
 

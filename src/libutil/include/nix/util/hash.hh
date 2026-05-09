@@ -7,6 +7,9 @@
 #include "nix/util/file-system.hh"
 #include "nix/util/json-impls.hh"
 
+#include <cstdint>
+#include <span>
+
 namespace nix {
 
 MakeError(BadHash, Error);
@@ -125,11 +128,35 @@ public:
     std::strong_ordering operator<=>(const Hash & h2) const noexcept;
 
     /**
+     * View the raw hash bytes as a span. `[[clang::lifetimebound]]`
+     * makes the compiler warn when a caller tries to hold the span
+     * past the hash's lifetime — e.g. `hashString(...).bytes()` used
+     * after the end of the full expression.
+     *
+     * Prefer this over the raw `hash[]` array: the C-array decays to
+     * a pointer with no lifetime information, which is how the class
+     * of bugs around `hashString(..).hash` dangling (committed fix:
+     * eval-info.cc makeSessionConfig) gets introduced.
+     */
+    [[nodiscard]] std::span<const uint8_t> bytes() const [[clang::lifetimebound]]
+    {
+        return {hash, hashSize};
+    }
+
+    /**
      * Return a string representation of the hash, in base-16, base-32
      * or base-64. By default, this is prefixed by the hash algo
      * (e.g. "sha256:").
      */
     [[nodiscard]] std::string to_string(HashFormat hashFormat, bool includeAlgo) const;
+
+    /**
+     * View the raw hash bytes as a string_view (no encoding).
+     */
+    [[nodiscard]] std::string_view hashData() const
+    {
+        return {reinterpret_cast<const char *>(hash), hashSize};
+    }
 
     [[nodiscard]] std::string gitRev() const
     {
@@ -173,7 +200,7 @@ Hash hashFile(HashAlgorithm ha, const std::filesystem::path & path);
 struct HashResult
 {
     Hash hash;
-    uint64_t numBytesDigested;
+    uint64_t numBytesDigested = 0;
 };
 
 /**

@@ -51,10 +51,10 @@ typedef std::chrono::time_point<std::chrono::steady_clock> steady_time_point;
 struct Child
 {
     WeakGoalPtr goal;
-    Goal * goal2; // ugly hackery
+    Goal * goal2 = nullptr; // ugly hackery
     std::set<MuxablePipePollState::CommChannel> channels;
-    bool respectTimeouts;
-    bool inBuildSlot;
+    bool respectTimeouts = false;
+    bool inBuildSlot = false;
     /**
      * Time we last got output on stdout/stderr
      */

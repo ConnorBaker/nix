@@ -58,6 +58,13 @@ fetchers::Attrs FlakeRef::toAttrs() const
     return attrs;
 }
 
+fetchers::Attrs FlakeRef::toPersistedAttrs() const
+{
+    auto attrs = toAttrs();
+    attrs.erase("__final");
+    return attrs;
+}
+
 std::ostream & operator<<(std::ostream & str, const FlakeRef & flakeRef)
 {
     str << flakeRef.to_string();
@@ -246,14 +253,15 @@ std::optional<std::pair<FlakeRef, std::string>> parseURLFlakeRef(
     const fetchers::Settings & fetchSettings,
     const std::string & url,
     const std::optional<std::filesystem::path> & baseDir,
-    bool isFlake)
+    bool isFlake,
+    bool preserveRelativePaths)
 {
     try {
         auto parsed = parseURL(url, /*lenient=*/true);
         if (baseDir && (parsed.scheme == "path" || parsed.scheme == "git+file")) {
             /* Here we know that the path must not contain encoded '/' or NUL bytes. */
             auto path = urlPathToPath(parsed.path);
-            if (!path.is_absolute())
+            if (!path.is_absolute() && !preserveRelativePaths)
                 parsed.path = pathToUrlPath(absPath(path, get(baseDir)));
         }
         return fromParsedURL(fetchSettings, std::move(parsed), isFlake);
@@ -274,7 +282,7 @@ std::pair<FlakeRef, std::string> parseFlakeRefWithFragment(
 
     if (auto res = parseFlakeIdRef(fetchSettings, url, isFlake)) {
         return *res;
-    } else if (auto res = parseURLFlakeRef(fetchSettings, url, baseDir, isFlake)) {
+    } else if (auto res = parseURLFlakeRef(fetchSettings, url, baseDir, isFlake, preserveRelativePaths)) {
         return *res;
     } else {
         return parsePathFlakeRefWithFragment(fetchSettings, url, baseDir, allowMissing, isFlake, preserveRelativePaths);

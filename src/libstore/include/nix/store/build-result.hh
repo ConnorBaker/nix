@@ -122,7 +122,7 @@ struct BuildResult
     {
         using Status = enum BuildResultSuccessStatus;
         using enum Status;
-        Status status;
+        Status status{};
 
         /**
          * For derivations, a mapping from the names of the wanted outputs

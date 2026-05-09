@@ -36,7 +36,7 @@ std::optional<Mode> decodeMode(RawMode m);
  */
 struct TreeEntry
 {
-    Mode mode;
+    Mode mode{};
     Hash hash;
 
     bool operator==(const TreeEntry &) const = default;

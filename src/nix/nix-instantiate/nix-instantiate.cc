@@ -11,6 +11,9 @@
 #include "nix/store/local-fs-store.hh"
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/cmd/legacy.hh"
+#include "nix/expr/eval-environment/authority-internal.hh"
+#include "nix/expr/eval-environment/environment.hh"
+#include "nix/expr/eval-environment/request-types.hh"
 #include "man-pages.hh"
 
 #include <iostream>
@@ -179,7 +182,15 @@ static int main_nix_instantiate(int argc, char ** argv)
 
         if (findFile) {
             for (auto & i : files) {
-                auto p = state->findFile(i);
+                EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(*state));
+                SourcePath p = [&] {
+                    try {
+                        return environment.resolveLookupPath(
+                            LookupPathRequest::fromState(*state, i, noPos)).resolvedPath;
+                    } catch (Error & e) {
+                        state->error<ThrownError>("%s", e.message()).debugThrow();
+                    }
+                }();
                 if (auto fn = p.getPhysicalPath())
                     std::cout << fn->string() << std::endl;
                 else

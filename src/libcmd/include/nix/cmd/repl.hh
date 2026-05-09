@@ -2,6 +2,7 @@
 ///@file
 
 #include "nix/expr/eval.hh"
+#include "nix/cmd/installable-value.hh"
 #include "nix/util/os-string.hh"
 
 namespace nix {
@@ -18,7 +19,13 @@ struct AbstractNixRepl
 
     virtual ~AbstractNixRepl() {}
 
-    typedef std::vector<std::pair<Value *, std::string>> AnnotatedValues;
+    struct AnnotatedValue
+    {
+        EvaluatedInstallableValue evaluated;
+        std::string what;
+    };
+
+    typedef std::vector<AnnotatedValue> AnnotatedValues;
 
     /**
      * Run a nix executable

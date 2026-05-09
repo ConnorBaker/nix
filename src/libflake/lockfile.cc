@@ -42,6 +42,16 @@ class Store;
 
 namespace nix::flake {
 
+static FlakeGraphNodeKey makeFlakeGraphNodeKey(std::string_view value)
+{
+    return FlakeGraphNodeKey{std::string(value)};
+}
+
+static FlakeGraphNodeKey appendFlakeGraphNodeKeySuffix(const FlakeGraphNodeKey & key, int suffix)
+{
+    return FlakeGraphNodeKey{fmt("%s_%d", key.value, suffix)};
+}
+
 static FlakeRef
 getFlakeRef(const fetchers::Settings & fetchSettings, const nlohmann::json & json, const char * attr, const char * info)
 {
@@ -56,39 +66,39 @@ getFlakeRef(const fetchers::Settings & fetchSettings, const nlohmann::json & jso
                     attrs.insert_or_assign(k.first, k.second);
             }
         }
-        return FlakeRef::fromAttrs(fetchSettings, attrs);
+        return FlakeRef::fromAttrs(fetchSettings, attrs).canonicalize();
     }
 
     throw Error("attribute '%s' missing in lock file", attr);
 }
 
 LockedNode::LockedNode(const fetchers::Settings & fetchSettings, const nlohmann::json & json)
-    : lockedRef(getFlakeRef(fetchSettings, json, "locked", "info")) // FIXME: remove "info"
-    , originalRef(getFlakeRef(fetchSettings, json, "original", nullptr))
+    : lockedRef(EvaluationLockedFlakeRef{getFlakeRef(fetchSettings, json, "locked", "info")}) // FIXME: remove "info"
+    , originalRef(OriginalFlakeRef{getFlakeRef(fetchSettings, json, "original", nullptr)})
     , isFlake(json.find("flake") != json.end() ? (bool) json["flake"] : true)
     , parentInputAttrPath(
           json.find("parent") != json.end() ? (std::optional<InputAttrPath>) json["parent"] : std::nullopt)
 {
-    if (!lockedRef.input.isLocked(fetchSettings) && !lockedRef.input.isRelative()) {
-        if (lockedRef.input.getNarHash())
+    if (!lockedRef.value.input.isLocked(fetchSettings) && !lockedRef.value.input.isRelative()) {
+        if (lockedRef.value.input.getNarHash())
             warn(
                 "Lock file entry '%s' is unlocked (e.g. lacks a Git revision) but is checked by NAR hash. "
                 "This is not reproducible and will break after garbage collection or when shared.",
-                lockedRef.to_string());
+                lockedRef.value.to_string());
         else
             throw Error(
                 "Lock file contains unlocked input '%s'. Use '--allow-dirty-locks' to accept this lock file.",
-                fetchers::attrsToJSON(lockedRef.input.toAttrs()));
+                fetchers::attrsToJSON(lockedRef.value.input.toAttrs()));
     }
 
     // For backward compatibility, lock file entries are implicitly final.
-    assert(!lockedRef.input.attrs.contains("__final"));
-    lockedRef.input.attrs.insert_or_assign("__final", Explicit<bool>(true));
+    assert(!lockedRef.value.input.attrs.contains("__final"));
+    lockedRef.value.input.attrs.insert_or_assign("__final", Explicit<bool>(true));
 }
 
 StorePath LockedNode::computeStorePath(Store & store) const
 {
-    return lockedRef.input.computeStorePath(store);
+    return lockedRef.value.input.computeStorePath(store);
 }
 
 static std::shared_ptr<Node>
@@ -108,9 +118,9 @@ doFind(const ref<Node> & root, const InputAttrPath & path, std::vector<InputAttr
 
     for (auto & elem : path) {
         if (auto i = get(pos->inputs, elem)) {
-            if (auto node = std::get_if<0>(&*i))
+            if (auto node = edgeChild(*i))
                 pos = *node;
-            else if (auto follows = std::get_if<1>(&*i)) {
+            else if (auto follows = edgeFollows(*i)) {
                 if (auto p = doFind(root, *follows, visited))
                     pos = ref(p);
                 else
@@ -142,8 +152,8 @@ LockFile::LockFile(const fetchers::Settings & fetchSettings, std::string_view co
     if (version < 5 || version > 7)
         throw Error("lock file '%s' has unsupported version %d", path, version);
 
-    std::string rootKey = json["root"];
-    std::map<std::string, ref<Node>> nodeMap{{rootKey, root}};
+    FlakeGraphNodeKey rootKey = makeFlakeGraphNodeKey(json["root"].get<std::string>());
+    std::map<FlakeGraphNodeKey, ref<Node>> nodeMap{{rootKey, root}};
 
     [&](this const auto & getInputs, Node & node, const nlohmann::json & jsonNode) {
         if (jsonNode.find("inputs") == jsonNode.end())
@@ -155,11 +165,11 @@ LockFile::LockFile(const fetchers::Settings & fetchSettings, std::string_view co
                     path.push_back(j);
                 node.inputs.insert_or_assign(i.key(), path);
             } else {
-                std::string inputKey = i.value();
+                FlakeGraphNodeKey inputKey = makeFlakeGraphNodeKey(i.value().get<std::string>());
                 auto k = nodeMap.find(inputKey);
                 if (k == nodeMap.end()) {
                     auto & nodes = json["nodes"];
-                    auto jsonNode2 = nodes.find(inputKey);
+                    auto jsonNode2 = nodes.find(inputKey.value);
                     if (jsonNode2 == nodes.end())
                         throw Error("lock file references missing node '%s'", inputKey);
                     auto input = make_ref<LockedNode>(fetchSettings, *jsonNode2);
@@ -173,7 +183,7 @@ LockFile::LockFile(const fetchers::Settings & fetchSettings, std::string_view co
                     throw Error("lock file contains cycle to root node");
             }
         }
-    }(*root, json["nodes"][rootKey]);
+    }(*root, json["nodes"][rootKey.value]);
 
     // FIXME: check that there are no cycles in version >= 7. Cycles
     // between inputs are only possible using 'follows' indirections.
@@ -185,18 +195,18 @@ std::pair<nlohmann::json, LockFile::KeyMap> LockFile::toJSON() const
 {
     nlohmann::json nodes;
     KeyMap nodeKeys;
-    boost::unordered_flat_set<std::string> keys;
+    boost::unordered_flat_set<FlakeGraphNodeKey, FlakeGraphNodeKey::Hash> keys;
 
-    auto dumpNode = [&](this auto & dumpNode, std::string key, ref<const Node> node) -> std::string {
+    auto dumpNode = [&](this auto & dumpNode, FlakeGraphNodeKey key, ref<const Node> node) -> FlakeGraphNodeKey {
         auto k = nodeKeys.find(node);
         if (k != nodeKeys.end())
             return k->second;
 
         if (!keys.insert(key).second) {
             for (int n = 2;; ++n) {
-                auto k = fmt("%s_%d", key, n);
-                if (keys.insert(k).second) {
-                    key = k;
+                auto candidate = appendFlakeGraphNodeKeySuffix(key, n);
+                if (keys.insert(candidate).second) {
+                    key = std::move(candidate);
                     break;
                 }
             }
@@ -209,9 +219,9 @@ std::pair<nlohmann::json, LockFile::KeyMap> LockFile::toJSON() const
         if (!node->inputs.empty()) {
             auto inputs = nlohmann::json::object();
             for (auto & i : node->inputs) {
-                if (auto child = std::get_if<0>(&i.second)) {
-                    inputs[i.first] = dumpNode(i.first, *child);
-                } else if (auto follows = std::get_if<1>(&i.second)) {
+                if (auto child = edgeChild(i.second)) {
+                    inputs[i.first] = dumpNode(makeFlakeGraphNodeKey(i.first), *child).value;
+                } else if (auto follows = edgeFollows(i.second)) {
                     auto arr = nlohmann::json::array();
                     for (auto & x : *follows)
                         arr.push_back(x);
@@ -222,27 +232,30 @@ std::pair<nlohmann::json, LockFile::KeyMap> LockFile::toJSON() const
         }
 
         if (auto lockedNode = node.dynamic_pointer_cast<const LockedNode>()) {
-            n["original"] = fetchers::attrsToJSON(lockedNode->originalRef.toAttrs());
-            n["locked"] = fetchers::attrsToJSON(lockedNode->lockedRef.toAttrs());
+            n["original"] = fetchers::attrsToJSON(lockedNode->originalRef.value.toPersistedAttrs());
+            n["locked"] = fetchers::attrsToJSON(lockedNode->lockedRef.value.toPersistedAttrs());
             /* For backward compatibility, omit the "__final"
-               attribute. We never allow non-final inputs in lock files
-               anyway. */
-            assert(lockedNode->lockedRef.input.isFinal() || lockedNode->lockedRef.input.isRelative());
-            n["locked"].erase("__final");
+               attribute. Flake inputs are expected to be final or
+               relative in lock files, but non-flake inputs may
+               legitimately stay locked-but-non-final. */
+            assert(
+                !lockedNode->isFlake
+                || lockedNode->lockedRef.value.input.isFinal()
+                || lockedNode->lockedRef.value.input.isRelative());
             if (!lockedNode->isFlake)
                 n["flake"] = false;
             if (lockedNode->parentInputAttrPath)
                 n["parent"] = *lockedNode->parentInputAttrPath;
         }
 
-        nodes[key] = std::move(n);
+        nodes[key.value] = std::move(n);
 
         return key;
     };
 
     nlohmann::json json;
     json["version"] = 7;
-    json["root"] = dumpNode("root", root);
+    json["root"] = dumpNode(makeFlakeGraphNodeKey("root"), root).value;
     json["nodes"] = std::move(nodes);
 
     return {json, std::move(nodeKeys)};
@@ -260,7 +273,7 @@ std::ostream & operator<<(std::ostream & stream, const LockFile & lockFile)
     return stream;
 }
 
-std::optional<FlakeRef> LockFile::isUnlocked(const fetchers::Settings & fetchSettings) const
+std::optional<EvaluationLockedFlakeRef> LockFile::isUnlocked(const fetchers::Settings & fetchSettings) const
 {
     std::set<ref<const Node>> nodes;
 
@@ -268,7 +281,7 @@ std::optional<FlakeRef> LockFile::isUnlocked(const fetchers::Settings & fetchSet
         if (!nodes.insert(node).second)
             return;
         for (auto & i : node->inputs)
-            if (auto child = std::get_if<0>(&i.second))
+            if (auto child = edgeChild(i.second))
                 visit(*child);
     }(root);
 
@@ -284,8 +297,8 @@ std::optional<FlakeRef> LockFile::isUnlocked(const fetchers::Settings & fetchSet
         if (i == ref<const Node>(root))
             continue;
         auto node = i.dynamic_pointer_cast<const LockedNode>();
-        if (node && (!isConsideredLocked(node->lockedRef.input) || !node->lockedRef.input.isFinal())
-            && !node->lockedRef.input.isRelative())
+        if (node && (!isConsideredLocked(node->lockedRef.value.input) || !node->lockedRef.value.input.isFinal())
+            && !node->lockedRef.value.input.isRelative())
             return node->lockedRef;
     }
 
@@ -337,7 +350,7 @@ std::map<InputAttrPath, Node::Edge> LockFile::getAllInputs() const
             auto inputAttrPath(prefix);
             inputAttrPath.push_back(id);
             res.emplace(inputAttrPath, input);
-            if (auto child = std::get_if<0>(&input))
+            if (auto child = edgeChild(input))
                 recurse(inputAttrPath, *child);
         }
     }({}, root);
@@ -357,20 +370,20 @@ static std::string describe(const FlakeRef & flakeRef)
 
 std::ostream & operator<<(std::ostream & stream, const Node::Edge & edge)
 {
-    if (auto node = std::get_if<0>(&edge))
-        stream << describe((*node)->lockedRef);
-    else if (auto follows = std::get_if<1>(&edge))
+    if (auto node = edgeChild(edge))
+        stream << describe((*node)->lockedRef.value);
+    else if (auto follows = edgeFollows(edge))
         stream << fmt("follows '%s'", printInputAttrPath(*follows));
     return stream;
 }
 
 static bool equals(const Node::Edge & e1, const Node::Edge & e2)
 {
-    if (auto n1 = std::get_if<0>(&e1))
-        if (auto n2 = std::get_if<0>(&e2))
+    if (auto n1 = edgeChild(e1))
+        if (auto n2 = edgeChild(e2))
             return (*n1)->lockedRef == (*n2)->lockedRef;
-    if (auto f1 = std::get_if<1>(&e1))
-        if (auto f2 = std::get_if<1>(&e2))
+    if (auto f1 = edgeFollows(e1))
+        if (auto f2 = edgeFollows(e2))
             return *f1 == *f2;
     return false;
 }
@@ -413,7 +426,7 @@ void LockFile::check()
     auto inputs = getAllInputs();
 
     for (auto & [inputAttrPath, input] : inputs) {
-        if (auto follows = std::get_if<1>(&input)) {
+        if (auto follows = edgeFollows(input)) {
             if (!follows->empty() && !findInput(*follows))
                 throw Error(
                     "input '%s' follows a non-existent input '%s'",

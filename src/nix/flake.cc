@@ -15,7 +15,6 @@
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/registry.hh"
-#include "nix/expr/eval-cache.hh"
 #include "nix/cmd/markdown.hh"
 #include "nix/util/users.hh"
 #include "nix/fetchers/fetch-to-store.hh"
@@ -33,6 +32,9 @@
 
 namespace nix {
 
+using namespace nix::flake;
+using json = nlohmann::json;
+
 struct CmdFlakeUpdate;
 
 FlakeCommand::FlakeCommand()
@@ -48,7 +50,7 @@ FlakeCommand::FlakeCommand()
 
 FlakeRef FlakeCommand::getFlakeRef()
 {
-    return parseFlakeRef(fetchSettings, flakeUrl, std::filesystem::current_path().string()); // FIXME
+    return parseFlakeRef(fetchSettings, flakeUrl, absPath(getCommandBaseDir()).string());
 }
 
 flake::LockedFlake FlakeCommand::lockFlake()
@@ -59,7 +61,7 @@ flake::LockedFlake FlakeCommand::lockFlake()
 std::vector<FlakeRef> FlakeCommand::getFlakeRefsForCompletion()
 {
     return {// Like getFlakeRef but with expandTilde called first
-            parseFlakeRef(fetchSettings, expandTilde(flakeUrl), std::filesystem::current_path().string())};
+            parseFlakeRef(fetchSettings, expandTilde(flakeUrl), absPath(getCommandBaseDir()).string())};
 }
 
 struct CmdFlakeUpdate : FlakeCommand
@@ -172,29 +174,56 @@ struct CmdFlakeLock : FlakeCommand
 
 static void enumerateOutputs(
     EvalState & state,
-    Value & vFlake,
+    Value & vOutputs,
     std::function<void(std::string_view name, Value & vProvide, const PosIdx pos)> callback)
 {
-    auto pos = vFlake.determinePos(noPos);
-    state.forceAttrs(vFlake, pos, "while evaluating a flake to get its outputs");
-
-    auto aOutputs = vFlake.attrs()->get(state.symbols.create("outputs"));
-    assert(aOutputs);
-
-    state.forceAttrs(*aOutputs->value, pos, "while evaluating the outputs of a flake");
+    auto pos = vOutputs.determinePos(noPos);
+    state.forceAttrs(vOutputs, pos, "while evaluating the outputs of a flake");
 
     auto sHydraJobs = state.symbols.create("hydraJobs");
 
     /* Hack: ensure that hydraJobs is evaluated before anything
        else. This way we can disable IFD for hydraJobs and then enable
        it for other outputs. */
-    if (auto attr = aOutputs->value->attrs()->get(sHydraJobs))
+    if (auto attr = vOutputs.attrs()->get(sHydraJobs))
         callback(state.symbols[attr->name], *attr->value, attr->pos);
 
-    for (auto & attr : *aOutputs->value->attrs()) {
+    for (auto & attr : *vOutputs.attrs()) {
         if (attr.name != sHydraJobs)
             callback(state.symbols[attr.name], *attr.value, attr.pos);
     }
+}
+
+static const ResolvedFlakeNode & requireResolvedRootNode(const LockedFlake & lockedFlake)
+{
+    return lockedFlake.resolvedGraph.rootNode();
+}
+
+static StorePath requireCarrierStorePath(Store & store, const ResolvedFlakeNode & node)
+{
+    /* `carrierRoot` may be rooted on `rootFS` for locally-evaluated flakes, in
+       which case `path.abs()` is the live working directory — not a store path.
+       `carrierStorePath` is the authoritative store path recorded during
+       resolution and is always well-formed. */
+    (void) store;
+    return node.carrierStorePath;
+}
+
+static StorePath requireArchiveCarrierStorePath(
+    EvalState & state,
+    Store & store,
+    const ResolvedFlakeNode & node,
+    bool dryRun)
+{
+    auto storePath = requireCarrierStorePath(store, node);
+
+    if (dryRun || store.isValidPath(storePath))
+        return storePath;
+
+    if (node.lockedInput.isRelative())
+        return storePath;
+
+    return node.lockedInput.fetchToStore(state.fetchSettings, store).first;
 }
 
 struct CmdFlakeMetadata : FlakeCommand, MixJSON
@@ -218,28 +247,34 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
 
         /* Flakes do not get copied to the store, but are instead mounted at
            their expected store paths in storeFS. Querying metadata does not
-           force copying to the store, as one would expect. */
-        auto storePath = store->toStorePath(flake.path.path.abs()).first;
+           force copying to the store, as one would expect.
+
+           For locally-evaluated flakes the user-facing `parseRoot` (returned by
+           `flakePath()`) is rooted at the live working directory via `rootFS`,
+           so its `abs()` string is not a store path. `evaluationRoot` is the
+           physical import root mounted on `storeFS` and always has a store
+           path representation. */
+        auto storePath = store->toStorePath(flake.evaluationRoot.value.path.abs()).first;
 
         if (json) {
             nlohmann::json j;
             if (flake.description)
                 j["description"] = *flake.description;
-            j["originalUrl"] = flake.originalRef.to_string();
-            j["original"] = fetchers::attrsToJSON(flake.originalRef.toAttrs());
-            j["resolvedUrl"] = flake.resolvedRef.to_string();
-            j["resolved"] = fetchers::attrsToJSON(flake.resolvedRef.toAttrs());
-            j["url"] = flake.lockedRef.to_string(); // FIXME: rename to lockedUrl
+            j["originalUrl"] = flake.originalRef.value.to_string();
+            j["original"] = fetchers::attrsToJSON(flake.originalRef.value.toPersistedAttrs());
+            j["resolvedUrl"] = flake.resolvedRef.value.to_string();
+            j["resolved"] = fetchers::attrsToJSON(flake.resolvedRef.value.toPersistedAttrs());
+            j["url"] = flake.lockedRef.value.to_string(); // FIXME: rename to lockedUrl
             // "locked" is a misnomer - this is the result of the
             // attempt to lock.
-            j["locked"] = fetchers::attrsToJSON(flake.lockedRef.toAttrs());
-            if (auto rev = flake.lockedRef.input.getRev())
+            j["locked"] = fetchers::attrsToJSON(flake.lockedRef.value.toPersistedAttrs());
+            if (auto rev = flake.lockedRef.value.input.getRev())
                 j["revision"] = rev->to_string(HashFormat::Base16, false);
-            if (auto dirtyRev = fetchers::maybeGetStrAttr(flake.lockedRef.toAttrs(), "dirtyRev"))
+            if (auto dirtyRev = fetchers::maybeGetStrAttr(flake.lockedRef.value.toPersistedAttrs(), "dirtyRev"))
                 j["dirtyRevision"] = *dirtyRev;
-            if (auto revCount = flake.lockedRef.input.getRevCount())
+            if (auto revCount = flake.lockedRef.value.input.getRevCount())
                 j["revCount"] = *revCount;
-            if (auto lastModified = flake.lockedRef.input.getLastModified())
+            if (auto lastModified = flake.lockedRef.value.input.getLastModified())
                 j["lastModified"] = *lastModified;
             j["path"] = store->printStorePath(storePath);
             j["locks"] = lockedFlake.lockFile.toJSON().first;
@@ -247,19 +282,19 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
                 j["fingerprint"] = fingerprint->to_string(HashFormat::Base16, false);
             printJSON(j);
         } else {
-            logger->cout(ANSI_BOLD "Resolved URL:" ANSI_NORMAL "  %s", flake.resolvedRef.to_string());
-            if (flake.lockedRef.input.isLocked(fetchSettings))
-                logger->cout(ANSI_BOLD "Locked URL:" ANSI_NORMAL "    %s", flake.lockedRef.to_string());
+            logger->cout(ANSI_BOLD "Resolved URL:" ANSI_NORMAL "  %s", flake.resolvedRef.value.to_string());
+            if (flake.lockedRef.value.input.isLocked(fetchSettings))
+                logger->cout(ANSI_BOLD "Locked URL:" ANSI_NORMAL "    %s", flake.lockedRef.value.to_string());
             if (flake.description)
                 logger->cout(ANSI_BOLD "Description:" ANSI_NORMAL "   %s", *flake.description);
             logger->cout(ANSI_BOLD "Path:" ANSI_NORMAL "          %s", store->printStorePath(storePath));
-            if (auto rev = flake.lockedRef.input.getRev())
+            if (auto rev = flake.lockedRef.value.input.getRev())
                 logger->cout(ANSI_BOLD "Revision:" ANSI_NORMAL "      %s", rev->to_string(HashFormat::Base16, false));
-            if (auto dirtyRev = fetchers::maybeGetStrAttr(flake.lockedRef.toAttrs(), "dirtyRev"))
+            if (auto dirtyRev = fetchers::maybeGetStrAttr(flake.lockedRef.value.toAttrs(), "dirtyRev"))
                 logger->cout(ANSI_BOLD "Revision:" ANSI_NORMAL "      %s", *dirtyRev);
-            if (auto revCount = flake.lockedRef.input.getRevCount())
+            if (auto revCount = flake.lockedRef.value.input.getRevCount())
                 logger->cout(ANSI_BOLD "Revisions:" ANSI_NORMAL "     %s", *revCount);
-            if (auto lastModified = flake.lockedRef.input.getLastModified())
+            if (auto lastModified = flake.lockedRef.value.input.getLastModified())
                 logger->cout(
                     ANSI_BOLD "Last modified:" ANSI_NORMAL " %s",
                     std::put_time(std::localtime(&*lastModified), "%F %T"));
@@ -276,22 +311,22 @@ struct CmdFlakeMetadata : FlakeCommand, MixJSON
                 for (const auto & [i, input] : enumerate(node.inputs)) {
                     bool last = i + 1 == node.inputs.size();
 
-                    if (auto lockedNode = std::get_if<0>(&input.second)) {
+                    if (auto lockedNode = edgeChild(input.second)) {
                         std::string lastModifiedStr = "";
-                        if (auto lastModified = (*lockedNode)->lockedRef.input.getLastModified())
+                        if (auto lastModified = (*lockedNode)->lockedRef.value.input.getLastModified())
                             lastModifiedStr = fmt(" (%s)", std::put_time(std::gmtime(&*lastModified), "%F %T"));
                         logger->cout(
                             "%s" ANSI_BOLD "%s" ANSI_NORMAL ": %s%s",
                             prefix + (last ? treeLast : treeConn),
                             input.first,
-                            (*lockedNode)->lockedRef,
+                            (*lockedNode)->lockedRef.value,
                             lastModifiedStr);
 
                         bool firstVisit = visited.insert(*lockedNode).second;
 
                         if (firstVisit)
                             recurse(**lockedNode, prefix + (last ? treeNull : treeLine));
-                    } else if (auto follows = std::get_if<1>(&input.second)) {
+                    } else if (auto follows = edgeFollows(input.second)) {
                         logger->cout(
                             "%s" ANSI_BOLD "%s" ANSI_NORMAL " follows input '%s'",
                             prefix + (last ? treeLast : treeConn),
@@ -354,7 +389,7 @@ struct CmdFlakeCheck : FlakeCommand
         auto state = getEvalState();
 
         lockFlags.applyNixConfig = true;
-        auto flake = lockFlake();
+        auto flake = make_ref<LockedFlake>(lockFlake());
         auto localSystem = std::string(settings.thisSystem.get());
 
         bool hasErrors = false;
@@ -374,13 +409,11 @@ struct CmdFlakeCheck : FlakeCommand
 
         StringSet omittedSystems;
 
-        // FIXME: rewrite to use EvalCache.
-
         auto resolve = [&](PosIdx p) { return state->positions[p]; };
 
         auto argHasName = [&](Symbol arg, std::string_view expected) {
             std::string_view name = state->symbols[arg];
-            return name == expected || name == "_" || (hasPrefix(name, "_") && name.substr(1) == expected);
+            return name == expected || name == "_" || (name.size() > 1 && name.front() == '_' && name.substr(1) == expected);
         };
 
         auto checkSystemName = [&](std::string_view system, const PosIdx pos) {
@@ -580,8 +613,8 @@ struct CmdFlakeCheck : FlakeCommand
         {
             Activity act(*logger, lvlInfo, actUnknown, "evaluating flake");
 
-            auto vFlake = state->allocValue();
-            flake::callFlake(*state, flake, *vFlake);
+            auto cache = openTraceCache(*state, flake);
+            auto * vFlake = cache->getRootValue();
 
             enumerateOutputs(*state, *vFlake, [&](std::string_view name, Value & vOutput, const PosIdx pos) {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking flake output '%s'", name));
@@ -898,9 +931,13 @@ struct CmdFlakeInitCommon : virtual Args, EvalCommand
             defaultTemplateAttrPathsPrefixes,
             lockFlags);
 
-        auto cursor = installable.getCursor(*evalState);
-
-        auto templateDirAttr = cursor->getAttr("path")->forceValue();
+        auto evaluated = installable.toValue(*evalState);
+        evalState->forceValue(*evaluated.value, evaluated.pos);
+        auto * aPath = evaluated.value->attrs()->get(evalState->symbols.create("path"));
+        if (!aPath)
+            throw Error("template does not have a 'path' attribute");
+        evalState->forceValue(*aPath->value, aPath->pos);
+        auto & templateDirAttr = *aPath->value;
         NixStringContext context;
         auto templateDir = evalState->coerceToPath(noPos, templateDirAttr, context, "");
 
@@ -973,9 +1010,10 @@ struct CmdFlakeInitCommon : virtual Args, EvalCommand
             runProgram("git", true, args);
         }
 
-        if (auto welcomeText = cursor->maybeGetAttr("welcomeText")) {
+        if (auto * aWelcomeText = evaluated.value->attrs()->get(evalState->symbols.create("welcomeText"))) {
+            evalState->forceValue(*aWelcomeText->value, aWelcomeText->pos);
             notice("\n");
-            notice(renderMarkdownToTerminal(welcomeText->getString()));
+            notice(renderMarkdownToTerminal(std::string(aWelcomeText->value->string_view())));
         }
 
         if (!conflictedFiles.empty())
@@ -1089,38 +1127,49 @@ struct CmdFlakeArchive : FlakeCommand, MixJSON, MixDryRun, MixNoCheckSigs
 
     void run(nix::ref<nix::Store> store) override
     {
-        auto flake = lockFlake();
+        auto lockedFlake = lockFlake();
+        auto & rootNode = requireResolvedRootNode(lockedFlake);
+        auto & state = *getEvalState();
 
         StorePathSet sources;
 
-        auto getStorePath = [&](const FlakeRef & lockedRef) {
-            return dryRun ? lockedRef.input.computeStorePath(*store)
-                          : std::get<StorePath>(lockedRef.input.fetchToStore(fetchSettings, *store));
-        };
-
-        auto storePath = getStorePath(flake.flake.lockedRef);
+        auto storePath = requireArchiveCarrierStorePath(state, *store, rootNode, dryRun);
 
         sources.insert(storePath);
 
-        // FIXME: use graph output, handle cycles.
-        auto traverse = [&store, json = json, &sources, &getStorePath](
-                            this const auto & self, const flake::Node & node) -> nlohmann::json {
-            nlohmann::json jsonObj2 = json ? nlohmann::json::object() : nlohmann::json(nullptr);
-            for (auto & [inputName, input] : node.inputs) {
-                if (auto inputNode = std::get_if<0>(&input)) {
-                    std::optional<StorePath> storePath;
-                    const auto & lockedRef = (*inputNode)->lockedRef;
-                    if (!lockedRef.input.isRelative()) {
-                        storePath = getStorePath(lockedRef);
-                        sources.insert(*storePath);
-                    }
-                    if (json) {
-                        auto & jsonObj3 = jsonObj2[inputName];
-                        if (storePath)
-                            jsonObj3["path"] = store->printStorePath(*storePath);
-                        jsonObj3["inputs"] = self(**inputNode);
-                    } else
-                        self(**inputNode);
+        std::set<FlakeGraphNodeKey> visiting;
+
+        std::function<nlohmann::json(
+            const FlakeGraphNodeKey & visitKey,
+            const ResolvedFlakeNode & node)> traverseNode;
+        traverseNode = [&](const FlakeGraphNodeKey & visitKey, const ResolvedFlakeNode & node) {
+            auto inserted = visiting.insert(visitKey).second;
+            if (!inserted)
+                return json ? json::object() : nlohmann::json(nullptr);
+
+            Finally eraseVisiting([&] {
+                visiting.erase(visitKey);
+            });
+
+            nlohmann::json jsonObj2 = json ? json::object() : nlohmann::json(nullptr);
+            for (auto & [inputName, inputKey] : node.resolvedInputs) {
+                auto inputStorePath = requireArchiveCarrierStorePath(
+                    state,
+                    *store,
+                    lockedFlake.resolvedGraph.requireNode(inputKey),
+                    dryRun);
+                sources.insert(inputStorePath);
+
+                if (json) {
+                    auto & jsonObj3 = jsonObj2[inputName];
+                    jsonObj3["path"] = store->printStorePath(inputStorePath);
+                    jsonObj3["inputs"] = traverseNode(
+                        asFlakeGraphNodeKey(inputKey),
+                        lockedFlake.resolvedGraph.requireNode(inputKey));
+                } else {
+                    traverseNode(
+                        asFlakeGraphNodeKey(inputKey),
+                        lockedFlake.resolvedGraph.requireNode(inputKey));
                 }
             }
             return jsonObj2;
@@ -1129,11 +1178,15 @@ struct CmdFlakeArchive : FlakeCommand, MixJSON, MixDryRun, MixNoCheckSigs
         if (json) {
             nlohmann::json jsonRoot = {
                 {"path", store->printStorePath(storePath)},
-                {"inputs", traverse(*flake.lockFile.root)},
+                {"inputs", traverseNode(
+                    asFlakeGraphNodeKey(lockedFlake.resolvedGraph.rootKey),
+                    rootNode)},
             };
             printJSON(jsonRoot);
         } else {
-            traverse(*flake.lockFile.root);
+            traverseNode(
+                asFlakeGraphNodeKey(lockedFlake.resolvedGraph.rootKey),
+                rootNode);
         }
 
         if (!dryRun && dstUri) {
@@ -1183,7 +1236,7 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
         auto flake = make_ref<flake::LockedFlake>(lockFlake());
         auto localSystem = std::string(settings.thisSystem.get());
 
-        std::function<bool(eval_cache::AttrCursor & visitor, const AttrPath & attrPath, const Symbol & attr)>
+        std::function<bool(Value & v, const AttrPath & attrPath, const Symbol & attr)>
             hasContent;
 
         // For frameworks it's important that structures are as lazy as possible
@@ -1192,20 +1245,25 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
         // to emit more attributes than strictly (sic) necessary.
         // However, these attributes with empty values are not useful to the user
         // so we omit them.
-        hasContent = [&](eval_cache::AttrCursor & visitor, const AttrPath & attrPath, const Symbol & attr) -> bool {
+        hasContent = [&](Value & v, const AttrPath & attrPath, const Symbol & attr) -> bool {
             auto attrPath2(attrPath);
             attrPath2.push_back(attr);
             auto attrPathS = attrPath2.resolve(*state);
             const auto & attrName = state->symbols[attr];
 
-            auto visitor2 = visitor.getAttr(attrName);
+            auto * a = v.attrs()->get(state->symbols.create(attrName));
+            if (!a) return false;
 
             try {
+                state->forceValue(*a->value, a->pos);
+                if (a->value->type() != nAttrs)
+                    return true;
+
                 if ((attrPathS[0] == "apps" || attrPathS[0] == "checks" || attrPathS[0] == "devShells"
                      || attrPathS[0] == "legacyPackages" || attrPathS[0] == "packages")
                     && (attrPathS.size() == 1 || attrPathS.size() == 2)) {
-                    for (const auto & subAttr : visitor2->getAttrs()) {
-                        if (hasContent(*visitor2, attrPath2, subAttr)) {
+                    for (auto & subAttr : *a->value->attrs()) {
+                        if (hasContent(*a->value, attrPath2, subAttr.name)) {
                             return true;
                         }
                     }
@@ -1215,8 +1273,8 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                 if ((attrPathS.size() == 1)
                     && (attrPathS[0] == "formatter" || attrPathS[0] == "nixosConfigurations"
                         || attrPathS[0] == "nixosModules" || attrPathS[0] == "overlays")) {
-                    for (const auto & subAttr : visitor2->getAttrs()) {
-                        if (hasContent(*visitor2, attrPath2, subAttr)) {
+                    for (auto & subAttr : *a->value->attrs()) {
+                        if (hasContent(*a->value, attrPath2, subAttr.name)) {
                             return true;
                         }
                     }
@@ -1224,6 +1282,8 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                 }
 
                 // If we don't recognize it, it's probably content
+                return true;
+            } catch (IFDError & e) {
                 return true;
             } catch (EvalError & e) {
                 // Some attrs may contain errors, e.g. legacyPackages of
@@ -1233,14 +1293,34 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
             }
         };
 
+        auto isDerivation = [&](Value & v) -> bool {
+            if (v.type() != nAttrs) return false;
+            auto * aType = v.attrs()->get(state->symbols.create("type"));
+            if (!aType) return false;
+            try {
+                state->forceValue(*aType->value, aType->pos);
+                return aType->value->type() == nString && aType->value->string_view() == "derivation";
+            } catch (...) {
+                return false;
+            }
+        };
+
+        auto getStringAttr = [&](Value & v, Symbol name) -> std::optional<std::string> {
+            auto * a = v.attrs()->get(name);
+            if (!a) return std::nullopt;
+            state->forceValue(*a->value, a->pos);
+            if (a->value->type() != nString) return std::nullopt;
+            return std::string(a->value->string_view());
+        };
+
         std::function<nlohmann::json(
-            eval_cache::AttrCursor & visitor,
+            Value & v,
             const AttrPath & attrPath,
             const std::string & headerPrefix,
             const std::string & nextPrefix)>
             visit;
 
-        visit = [&](eval_cache::AttrCursor & visitor,
+        visit = [&](Value & v,
                     const AttrPath & attrPath,
                     const std::string & headerPrefix,
                     const std::string & nextPrefix) -> nlohmann::json {
@@ -1251,23 +1331,28 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
             Activity act(*logger, lvlInfo, actUnknown, fmt("evaluating '%s'", attrPath.to_string(*state)));
 
             try {
+                state->forceValue(v, noPos);
+                if (v.type() != nAttrs)
+                    return j;
+
                 auto recurse = [&]() {
                     if (!json)
                         logger->cout("%s", headerPrefix);
                     std::vector<Symbol> attrs;
-                    for (const auto & attr : visitor.getAttrs()) {
-                        if (hasContent(visitor, attrPath, attr))
-                            attrs.push_back(attr);
+                    for (auto & attr : *v.attrs()) {
+                        if (hasContent(v, attrPath, attr.name))
+                            attrs.push_back(attr.name);
                     }
 
                     for (const auto & [i, attr] : enumerate(attrs)) {
                         const auto & attrName = state->symbols[attr];
                         bool last = i + 1 == attrs.size();
-                        auto visitor2 = visitor.getAttr(attrName);
+                        auto * a = v.attrs()->get(attr);
+                        if (!a) continue;
                         auto attrPath2(attrPath);
                         attrPath2.push_back(attr);
                         auto j2 = visit(
-                            *visitor2,
+                            *a->value,
                             attrPath2,
                             fmt(ANSI_GREEN "%s%s" ANSI_NORMAL ANSI_BOLD "%s" ANSI_NORMAL,
                                 nextPrefix,
@@ -1280,13 +1365,15 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                 };
 
                 auto showDerivation = [&]() {
-                    auto name = visitor.getAttr(state->s.name)->getString();
+                    auto name = getStringAttr(v, state->s.name).value_or("???");
 
                     if (json) {
                         std::optional<std::string> description;
-                        if (auto aMeta = visitor.maybeGetAttr(state->s.meta)) {
-                            if (auto aDescription = aMeta->maybeGetAttr(state->s.description))
-                                description = aDescription->getString();
+                        auto * aMeta = v.attrs()->get(state->s.meta);
+                        if (aMeta) {
+                            state->forceValue(*aMeta->value, aMeta->pos);
+                            if (aMeta->value->type() == nAttrs)
+                                description = getStringAttr(*aMeta->value, state->s.description);
                         }
                         j.emplace("type", "derivation");
                         j.emplace("name", name);
@@ -1331,11 +1418,10 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                         }
                     } else {
                         try {
-                            if (visitor.isDerivation())
+                            if (isDerivation(v))
                                 showDerivation();
                             else {
-                                auto name = visitor.getAttrPathStr(state->s.name);
-                                logger->warn(fmt("%s is not a derivation", name));
+                                logger->warn(fmt("%s is not a derivation", attrPath.to_string(*state)));
                             }
                         } catch (IFDError & e) {
                             if (!json) {
@@ -1352,7 +1438,7 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
 
                 else if (attrPath.size() > 0 && attrPathS[0] == "hydraJobs") {
                     try {
-                        if (visitor.isDerivation())
+                        if (isDerivation(v))
                             showDerivation();
                         else
                             recurse();
@@ -1388,7 +1474,7 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                         }
                     } else {
                         try {
-                            if (visitor.isDerivation())
+                            if (isDerivation(v))
                                 showDerivation();
                             else if (attrPath.size() <= 2)
                                 // FIXME: handle recurseIntoAttrs
@@ -1409,13 +1495,15 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                 else if (
                     (attrPath.size() == 2 && attrPathS[0] == "defaultApp")
                     || (attrPath.size() == 3 && attrPathS[0] == "apps")) {
-                    auto aType = visitor.maybeGetAttr("type");
+                    auto aType = getStringAttr(v, state->symbols.create("type"));
                     std::optional<std::string> description;
-                    if (auto aMeta = visitor.maybeGetAttr(state->s.meta)) {
-                        if (auto aDescription = aMeta->maybeGetAttr(state->s.description))
-                            description = aDescription->getString();
+                    auto * aMeta = v.attrs()->get(state->s.meta);
+                    if (aMeta) {
+                        state->forceValue(*aMeta->value, aMeta->pos);
+                        if (aMeta->value->type() == nAttrs)
+                            description = getStringAttr(*aMeta->value, state->s.description);
                     }
-                    if (!aType || aType->getString() != "app")
+                    if (!aType || *aType != "app")
                         state->error<EvalError>("not an app definition").debugThrow();
                     if (json) {
                         j.emplace("type", "app");
@@ -1432,7 +1520,7 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                 else if (
                     (attrPath.size() == 1 && attrPathS[0] == "defaultTemplate")
                     || (attrPath.size() == 2 && attrPathS[0] == "templates")) {
-                    auto description = visitor.getAttr("description")->getString();
+                    auto description = getStringAttr(v, state->symbols.create("description")).value_or("???");
                     if (json) {
                         j.emplace("type", "template");
                         j.emplace("description", description);
@@ -1457,6 +1545,15 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                         logger->cout("%s: " ANSI_WARNING "%s" ANSI_NORMAL, headerPrefix, description);
                     }
                 }
+            } catch (IFDError & e) {
+                if (!json) {
+                    logger->cout(
+                        fmt("%s " ANSI_WARNING "omitted due to use of import from derivation" ANSI_NORMAL,
+                            headerPrefix));
+                } else {
+                    logger->warn(
+                        fmt("%s omitted due to use of import from derivation", attrPath.to_string(*state)));
+                }
             } catch (EvalError & e) {
                 if (!(attrPath.size() > 0 && attrPathS[0] == "legacyPackages"))
                     throw;
@@ -1465,9 +1562,10 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
             return j;
         };
 
-        auto cache = openEvalCache(*state, ref<flake::LockedFlake>(flake));
+        auto cache = openTraceCache(*state, ref<flake::LockedFlake>(flake));
+        auto * root = cache->getRootValue();
 
-        auto j = visit(*cache->getRoot(), {}, fmt(ANSI_BOLD "%s" ANSI_NORMAL, flake->flake.lockedRef), "");
+        auto j = visit(*root, {}, fmt(ANSI_BOLD "%s" ANSI_NORMAL, flake->flake.lockedRef.value), "");
         if (json)
             printJSON(j);
     }
@@ -1514,9 +1612,8 @@ struct CmdFlakePrefetch : FlakeCommand, MixJSON
             auto res = nlohmann::json::object();
             res["storePath"] = store->printStorePath(storePath);
             res["hash"] = hash.to_string(HashFormat::SRI, true);
-            res["original"] = fetchers::attrsToJSON(resolvedRef.toAttrs());
-            res["locked"] = fetchers::attrsToJSON(lockedRef.toAttrs());
-            res["locked"].erase("__final"); // internal for now
+            res["original"] = fetchers::attrsToJSON(resolvedRef.toPersistedAttrs());
+            res["locked"] = fetchers::attrsToJSON(lockedRef.toPersistedAttrs());
             printJSON(res);
         } else {
             notice(

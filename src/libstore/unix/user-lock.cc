@@ -38,8 +38,8 @@ static std::vector<gid_t> get_group_list(const char * username, gid_t group_id)
 struct SimpleUserLock : UserLock
 {
     AutoCloseFD fdUserLock;
-    uid_t uid;
-    gid_t gid;
+    uid_t uid = 0;
+    gid_t gid = 0;
     std::vector<gid_t> supplementaryGIDs;
 
     uid_t getUID() override

@@ -55,7 +55,7 @@ AutoCloseFD createUnixDomainSocket(const std::filesystem::path & path, mode_t mo
 static void
 bindConnectProcHelper(std::string_view operationName, auto && operation, Socket fd, const std::string & path)
 {
-    struct sockaddr_un addr;
+    struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
 
     // Casting between types like these legacy C library interfaces

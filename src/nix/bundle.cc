@@ -75,7 +75,8 @@ struct CmdBundle : InstallableValueCommand
     {
         auto evalState = getEvalState();
 
-        auto val = installable->toValue(*evalState).first;
+        auto evaluatedInstallable = installable->toValue(*evalState);
+        auto * val = evaluatedInstallable.value;
 
         auto [bundlerFlakeRef, bundlerName, extendedOutputsSpec] = parseFlakeRefWithFragmentAndExtendedOutputsSpec(
             fetchSettings, bundler, std::filesystem::current_path().string());
@@ -91,7 +92,8 @@ struct CmdBundle : InstallableValueCommand
             lockFlags};
 
         auto vRes = evalState->allocValue();
-        evalState->callFunction(*bundler.toValue(*evalState).first, *val, *vRes, noPos);
+        auto evaluatedBundler = bundler.toValue(*evalState);
+        evalState->callFunction(*evaluatedBundler.value, *val, *vRes, noPos);
 
         if (!evalState->isDerivation(*vRes))
             throw Error("the bundler '%s' does not produce a derivation", bundler.what());

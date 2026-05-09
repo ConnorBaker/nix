@@ -112,6 +112,13 @@ struct Expr
 
     virtual ~Expr() {};
     virtual void show(const SymbolTable & symbols, std::ostream & str) const;
+    /**
+     * Like show(), but normalizes ExprPath output by stripping basePath
+     * via CanonPath::removePrefix so binding hashes are stable across
+     * accessor types. Every subclass MUST override; missing overrides are
+     * now a compile-time error.
+     */
+    virtual void showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const = 0;
     virtual void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env);
 
     /** Normal evaluation, implemented directly by all subclasses. */
@@ -147,6 +154,7 @@ struct Expr
 
 #define COMMON_METHODS                                                         \
     void show(const SymbolTable & symbols, std::ostream & str) const override; \
+    void showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const override; \
     void eval(EvalState & state, Env & env, Value & v) override;               \
     void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override;
 
@@ -371,8 +379,8 @@ struct ExprAttrs : Expr
             InheritedFrom,
         };
 
-        Kind kind;
-        Expr * e;
+        Kind kind = Kind::Plain;
+        Expr * e = nullptr;
         PosIdx pos;
         Displacement displ = 0; // displacement
         AttrDef(Expr * e, const PosIdx & pos, Kind kind = Kind::Plain)
@@ -439,6 +447,7 @@ struct ExprAttrs : Expr
     std::shared_ptr<const StaticEnv> bindInheritSources(EvalState & es, const std::shared_ptr<const StaticEnv> & env);
     Env * buildInheritFromEnv(EvalState & state, Env & up);
     void showBindings(const SymbolTable & symbols, std::ostream & str) const;
+    void showBindingsForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const;
     void moveDataToAllocator(std::pmr::polymorphic_allocator<char> & alloc);
 };
 
@@ -641,9 +650,9 @@ struct ExprLet : Expr
 struct ExprWith : Expr
 {
     PosIdx pos;
-    uint32_t prevWith;
+    uint32_t prevWith = 0;
     Expr *attrs, *body;
-    ExprWith * parentWith;
+    ExprWith * parentWith = nullptr;
     ExprWith(const PosIdx & pos, Expr * attrs, Expr * body)
         : pos(pos)
         , attrs(attrs)
@@ -722,6 +731,15 @@ struct ExprOpNot : Expr
         e1->show(symbols, str);                                                          \
         str << " " s " ";                                                                \
         e2->show(symbols, str);                                                          \
+        str << ")";                                                                      \
+    }                                                                                    \
+    void showForHash(const SymbolTable & symbols, std::ostream & str,                    \
+                     const CanonPath & basePath) const override                          \
+    {                                                                                    \
+        str << "(";                                                                      \
+        e1->showForHash(symbols, str, basePath);                                         \
+        str << " " s " ";                                                                \
+        e2->showForHash(symbols, str, basePath);                                         \
         str << ")";                                                                      \
     }                                                                                    \
     void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override \
@@ -816,6 +834,7 @@ struct ExprPos : Expr
 struct ExprBlackHole : Expr
 {
     void show(const SymbolTable & symbols, std::ostream & str) const override {}
+    void showForHash(const SymbolTable & symbols, std::ostream & str, const CanonPath & basePath) const override {}
 
     void eval(EvalState & state, Env & env, Value & v) override;
 

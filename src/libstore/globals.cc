@@ -260,7 +260,7 @@ StringSet Settings::getDefaultExtraPlatforms()
 bool Settings::isWSL1()
 {
 #ifdef __linux__
-    struct utsname utsbuf;
+    struct utsname utsbuf{};
     uname(&utsbuf);
     // WSL1 uses -Microsoft suffix
     // WSL2 uses -microsoft-standard suffix

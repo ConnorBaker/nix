@@ -58,3 +58,9 @@ flake-regressions
 
 # direnv
 .direnv/
+
+# eval-trace-bench generated datasets
+/eval-trace-bench-results/
+
+# local analysis scratch
+research/

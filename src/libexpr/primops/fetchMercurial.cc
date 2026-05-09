@@ -1,8 +1,16 @@
 #include "nix/expr/primops.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
+#include "nix/expr/eval-trace/deps/trace-access.hh"
+#include "nix/store/store-api.hh"
 #include "nix/fetchers/fetchers.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/util/url.hh"
 #include "nix/util/url-parts.hh"
+#include "nix/expr/eval-environment/authority-internal.hh"
+#include "nix/expr/eval-environment/environment.hh"
+#include "nix/expr/eval-environment/request-types.hh"
 
 namespace nix {
 
@@ -64,7 +72,8 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
 
     // FIXME: git externals probably can be used to bypass the URI
     // whitelist. Ah well.
-    state.checkURI(url);
+    EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+    (void) environment.authorizeUri(UriPolicyRequest{.uri = url, .scope = UriPolicyScope::General, .pos = pos});
 
     if (state.settings.pureEval && !rev)
         throw Error("in pure evaluation mode, 'fetchMercurial' requires a Mercurial revision");
@@ -81,6 +90,17 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
 
     auto [storePath, input2] = input.fetchToStore(state.fetchSettings, *state.store);
 
+    // Record UnhashedFetch oracle dep for trace verification (re-fetch on verify)
+    if (!input.isLocked(state.fetchSettings) && state.traceActiveDepth) [[unlikely]] {
+        if (auto access = eval_trace::TraceAccess::current()) {
+            auto runtimeKey = RuntimeFetchIdentityDepKey{.inputAttrs = input.toAttrs()};
+            access->record(
+                DepSource::fromRuntimeRoot(makeRuntimeRootSourceKey(runtimeKey)),
+                runtimeKey,
+                DepHashValue(state.store->printStorePath(storePath)));
+        }
+    }
+
     auto attrs2 = state.buildBindings(8);
     state.mkStorePathString(storePath, attrs2.alloc(state.s.outPath));
     if (input2.getRef())
@@ -94,7 +114,7 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
         attrs2.alloc("revCount").mkInt(*revCount);
     v.mkAttrs(attrs2);
 
-    state.allowPath(storePath);
+    (void) environment.authorizeStorePath(storePath);
 }
 
 static RegisterPrimOp r_fetchMercurial({.name = "fetchMercurial", .arity = 1, .impl = prim_fetchMercurial});

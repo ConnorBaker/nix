@@ -41,6 +41,7 @@ endforeach
 
 sources = files(
   'config.cc',
+  'eval-trace-session-open-adapter.cc',
   'flake-primops.cc',
   'flake.cc',
   'flakeref.cc',

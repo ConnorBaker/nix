@@ -21,7 +21,7 @@ std::string getUserName()
 std::filesystem::path getHomeOf(uid_t userId)
 {
     std::vector<char> buf(16384);
-    struct passwd pwbuf;
+    struct passwd pwbuf{};
     struct passwd * pw;
     if (getpwuid_r(userId, &pwbuf, buf.data(), buf.size(), &pw) != 0 || !pw || !pw->pw_dir || !pw->pw_dir[0])
         throw Error("cannot determine user's home directory");

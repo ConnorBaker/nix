@@ -1,4 +1,13 @@
 #include "nix/expr/json-to-value.hh"
+#include "nix/expr/eval-trace/data/traced-data.hh"
+#include "eval-trace/data/traced-data-nodes.hh"
+#include "nix/expr/eval-trace/deps/hash.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
+#include "nix/expr/eval-trace/deps/shape-recording.hh"
+#include "nix/expr/eval-trace/deps/trace-access.hh"
+#include "nix/expr/eval-trace/context.hh"
+#include "nix/expr/eval-trace/cache/trace-session.hh"
+#include "nix/expr/eval-trace/semantic-objects.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/eval.hh"
 
@@ -206,6 +215,168 @@ void parseJSON(EvalState & state, const std::string_view & s_, Value & v)
     bool res = json::sax_parse(s_, &parser);
     if (!res)
         throw JSONParseError("Invalid JSON Value");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Lazy structural dependency tracking for JSON (traced data)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// `JsonDataNode` and its siblings are defined in
+// `eval-trace/data/traced-data-nodes.hh`; payload access for the
+// abstract `TracedDataNode` base is dispatched out-of-line via
+// `traced-data-dispatch.cc`.  No virtuals.
+
+// ── ExprTracedData::eval() ──────────────────────────────────────────
+
+void ExprTracedData::eval(EvalState & state, Env & env, Value & v)
+{
+    auto access = eval_trace::TraceAccess::current();
+    auto & pools = access ? access->tracingPools() : state.tracingPools();
+    auto nodeKind = node->kind();
+    auto fmt = node->formatTag();
+
+    switch (nodeKind) {
+    case TracedDataNode::Kind::Object: {
+        auto keys = node->objectKeys();
+        auto attrs = state.buildBindings(
+            keys.size(),
+            access && keys.empty()
+                ? EmptyBindingsAllocation::AllocateFresh
+                : EmptyBindingsAllocation::ReuseSharedEmpty);
+
+        bool tracking = access && !keys.empty();
+        auto originHandle = tracking
+            ? state.positions.addOriginHandle(
+                  allocateProvenanceRef(pools, sourceId, filePathId, dataPathId, fmt),
+                  keys.size())
+            : PosTable::OriginHandle{};
+
+        for (size_t idx = 0; idx < keys.size(); idx++) {
+            auto & k = keys[idx];
+            auto childPathId = pools.dataPathPool.internChild(dataPathId, k);
+            auto * childNode = node->objectGet(k);
+            auto * childVal = state.allocValue();
+
+            auto * childExpr = new ExprTracedData(
+                childNode, sourceId, filePathId, childPathId);
+            childVal->mkThunk(&state.baseEnv, childExpr);
+            eval_trace::nrTracedExprFromDataFile++;
+            eval_trace::nrDataFileContainerChildren++;
+            forceNoNullByte(k);
+            PosIdx keyPos = tracking ? state.positions.add(originHandle, idx) : PosIdx{};
+            attrs.insert(state.symbols.create(k), childVal, keyPos);
+        }
+        v.mkAttrs(attrs);
+        if (access) {
+            CompactDepComponents keysComp{sourceId, filePathId, fmt, dataPathId,
+                                          ShapeSuffix::Keys, StringId(), StringId()};
+            StructuredObject structured{
+                .source = pools.resolveDepSource(sourceId),
+                .key = std::string(pools.resolve(filePathId)),
+                .dataPath = resolveStructuredPath(pools, dataPathId),
+                .format = fmt,
+            };
+            if (keys.empty()) {
+                // Empty objects: blocking SC #keys so key additions are caught.
+                recordStructuredDep(pools, keysComp, DepHashValue(sentinel(SentinelHash::Empty)));
+
+                state.publishStructuredProvenance(v, structured);
+                auto * prov = access->allocateProvenance(sourceId, filePathId, dataPathId, fmt);
+                access->registerTracedContainer(&v, prov);
+            } else {
+                // Non-empty: ImplicitShape #keys fingerprint at creation time.
+                auto keysHash = eval_trace::canonicalKeysHash(keys);
+                recordStructuredDep(pools, keysComp, DepHashValue(keysHash), CanonicalQueryKind::ImplicitStructure);
+
+                PosIdx anyKeyPos = v.attrs()->begin()->pos;
+                if (auto off = state.positions.originOffsetOf(anyKeyPos))
+                    access->registerPrecomputedKeys(*off, PrecomputedKeysInfo{
+                        keysHash,
+                        static_cast<uint32_t>(keys.size()),
+                        sourceId, filePathId, dataPathId, fmt,
+                    });
+
+                // Attach StructuredObject on the Bindings via the sealed
+                // EvalState::publishStructuredProvenance helper (Bindings::setPublication
+                // is private, friend EvalState only).
+                state.publishStructuredProvenance(v, structured);
+                auto * prov = access->allocateProvenance(sourceId, filePathId, dataPathId, fmt);
+                access->registerTracedContainer(&v, prov);
+            }
+        }
+        break;
+    }
+    case TracedDataNode::Kind::Array: {
+        auto sz = node->arraySize();
+        auto list = state.buildList(sz, access.has_value());
+        for (size_t i = 0; i < sz; i++) {
+            auto childPathId = pools.dataPathPool.internArrayChild(dataPathId, static_cast<int32_t>(i));
+            auto * childNode = node->arrayGet(i);
+            auto * childVal = state.allocValue();
+
+            auto * childExpr = new ExprTracedData(
+                childNode, sourceId, filePathId, childPathId);
+            childVal->mkThunk(&state.baseEnv, childExpr);
+            eval_trace::nrTracedExprFromDataFile++;
+            eval_trace::nrDataFileContainerChildren++;
+            list[i] = childVal;
+        }
+        v.mkList(list);
+        if (access) {
+            CompactDepComponents lenComp{sourceId, filePathId, fmt, dataPathId,
+                                         ShapeSuffix::Len, StringId(), StringId()};
+            if (sz == 0) {
+                // Empty lists: blocking SC #len so element additions are caught.
+                recordStructuredDep(pools, lenComp, DepHashValue(sentinel(SentinelHash::Zero)));
+
+                auto * prov = access->allocateProvenance(sourceId, filePathId, dataPathId, fmt);
+                access->registerTracedContainer(&v, prov);
+            } else {
+                // Non-empty: ImplicitShape #len fingerprint at creation time.
+                recordStructuredDep(pools, lenComp, DepHashValue(depHash(std::to_string(sz))), CanonicalQueryKind::ImplicitStructure);
+
+                auto * prov = access->allocateProvenance(sourceId, filePathId, dataPathId, fmt);
+                access->registerTracedContainer(&v, prov);
+            }
+            // NOTE: publishStructuredProvenance is intentionally not called for list
+            // values. List provenance is carried via ContainerProvenanceRegistry
+            // (registerTracedContainer above). The packed setStorage(List) on x86-64
+            // drops any inline publication field; the registry is the authoritative
+            // mechanism. See value.hh List struct comment.
+        }
+        break;
+    }
+    case TracedDataNode::Kind::String:
+    case TracedDataNode::Kind::Number:
+    case TracedDataNode::Kind::Bool:
+    case TracedDataNode::Kind::Null: {
+        // Scalar leaf — record StructuredContent dep
+        CompactDepComponents scalarComp{sourceId, filePathId, fmt, dataPathId,
+                                        ShapeSuffix::None, StringId(), StringId()};
+        auto hash = depHash(node->canonicalValue());
+        recordStructuredDep(pools, scalarComp, DepHashValue(hash));
+        node->materializeScalar(state, v);
+        eval_trace::nrDataFileScalarChildren++;
+        break;
+    }
+    }
+}
+
+void parseTracedJSON(EvalState & state, const std::string_view & s, Value & v,
+                     const DepSource & depSource, const std::string & depKey)
+{
+    auto j = json::parse(s);
+    if (j.is_object() || j.is_array()) {
+        auto access = eval_trace::TraceAccess::current();
+        auto & pools = access ? access->tracingPools() : state.tracingPools();
+        auto srcId = pools.intern<DepSourceId>(depSource);
+        auto fpId = pools.intern<FilePathId>(depKey);
+        auto * rootNode = new JsonDataNode(std::move(j));
+        auto * rootExpr = new ExprTracedData(rootNode, srcId, fpId, pools.dataPathPool.root());
+        rootExpr->eval(state, state.baseEnv, v);
+    } else {
+        parseJSON(state, s, v);
+    }
 }
 
 } // namespace nix

@@ -33,10 +33,10 @@ struct CmdEdit : InstallableValueCommand
         auto state = getEvalState();
 
         const auto [file, line] = [&] {
-            auto [v, pos] = installable->toValue(*state);
+            auto evaluated = installable->toValue(*state);
 
             try {
-                return findPackageFilename(*state, *v, installable->what());
+                return findPackageFilename(*state, *evaluated.value, installable->what());
             } catch (NoPositionInfo &) {
                 throw Error("cannot find position information for '%s", installable->what());
             }

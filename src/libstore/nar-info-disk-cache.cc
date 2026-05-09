@@ -71,10 +71,10 @@ struct NarInfoDiskCacheImpl : NarInfoDiskCache
 
     struct Cache
     {
-        int id;
+        int id = 0;
         std::string storeDir;
-        bool wantMassQuery;
-        int priority;
+        bool wantMassQuery = false;
+        int priority = 0;
     };
 
     struct State

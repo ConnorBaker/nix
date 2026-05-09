@@ -1,9 +1,15 @@
 #include "nix/expr/value.hh"
 #include "nix/fetchers/attrs.hh"
 #include "nix/expr/primops.hh"
+#include "nix/expr/eval-environment/authority-internal.hh"
+#include "nix/expr/eval-environment/environment.hh"
+#include "nix/expr/eval-environment/request-types.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/fetch-tree.hh"
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
+#include "nix/expr/eval-trace/deps/trace-access.hh"
+#include "nix/expr/eval-trace/deps/recording.hh"
 #include "nix/store/store-api.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/store/filetransfer.hh"
@@ -115,12 +121,22 @@ void emitTreeAttrs(
     const StorePath & storePath,
     const fetchers::Input & input,
     Value & v,
+    std::optional<DepSource> originSource,
     bool emptyRevFallback,
     bool forceDirty)
 {
     auto attrs = state.buildBindings(100);
 
-    state.mkStorePathString(storePath, attrs.alloc(state.s.outPath));
+    auto & outPath = attrs.alloc(state.s.outPath);
+    auto runtimeKey = RuntimeFetchIdentityDepKey{
+        .inputAttrs = input.toAttrs(),
+    };
+    auto source = originSource.value_or(
+        DepSource::fromRuntimeRoot(makeRuntimeRootSourceKey(runtimeKey)));
+    state.mkStorePathStringWithProvenance(storePath, outPath, PathObject{
+        .source = std::move(source),
+        .rootPath = CanonPath(state.store->printStorePath(storePath)),
+    });
 
     // FIXME: support arbitrary input attributes.
 
@@ -303,7 +319,15 @@ static void fetchTree(
                 .debugThrow();
     }
 
-    state.checkURI(input.toURLString());
+    EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+    auto detached = environment.openDetachedEffectScope();
+
+    environment.authorizeUri(
+        detached,
+        UriPolicyRequest::make(
+            input.toURLString(),
+            UriPolicyScope::FetchInput,
+            pos));
 
     if (params.isFinal) {
         input.attrs.insert_or_assign("__final", Explicit<bool>(true));
@@ -312,12 +336,37 @@ static void fetchTree(
             throw Error("input '%s' is not allowed to use the '__final' attribute", input.to_string());
     }
 
-    auto cachedInput =
-        state.inputCache->getAccessor(state.fetchSettings, *state.store, input, fetchers::UseRegistries::No);
+    auto resolved = environment.resolveFetchIdentity(
+        detached,
+        FetchIdentityRequest::make(input));
+    auto fetched = environment.materializeFetch(detached, std::move(resolved.identity));
 
-    auto storePath = state.mountInput(cachedInput.lockedInput, input, cachedInput.accessor);
+    std::shared_ptr<const fetchers::Input> lockedInput;
+    std::optional<StorePath> storePath;
+    std::optional<DepSource> originSource;
+    if (auto session = environment.tryBindCurrentEvalSession()) {
+        auto result = environment.mountAndCompleteRuntimeFetch(
+            std::move(*session), std::move(fetched));
 
-    emitTreeAttrs(state, storePath, cachedInput.lockedInput, v, params.emptyRevFallback, false);
+        std::visit([&](auto & published) {
+            lockedInput = std::move(published.lockedInput.value);
+            storePath = std::move(published.storePath);
+            originSource = published.runtimeSource();
+        }, result);
+    } else {
+        auto mounted = environment.mountFetchedInput(detached, std::move(fetched));
+        lockedInput = std::move(mounted.lockedInput.value);
+        storePath = std::move(mounted.storePath);
+    }
+
+    emitTreeAttrs(
+        state,
+        *storePath,
+        *lockedInput,
+        v,
+        std::move(originSource),
+        params.emptyRevFallback,
+        false);
 }
 
 static void prim_fetchTree(EvalState & state, const PosIdx pos, Value ** args, Value & v)
@@ -509,7 +558,8 @@ static void fetch(
     if (who == "fetchTarball")
         url = state.settings.resolvePseudoUrl(*url);
 
-    state.checkURI(*url);
+    EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(state));
+    (void) environment.authorizeUri(UriPolicyRequest{.uri = *url, .scope = UriPolicyScope::General, .pos = pos});
 
     if (name == "")
         name = baseNameOf(*url);
@@ -558,7 +608,10 @@ static void fetch(
         try {
             state.store->ensurePath(expectedPath);
             debug("using substituted/cached path '%s' for '%s'", state.store->printStorePath(expectedPath), *url);
-            state.allowAndSetStorePathString(expectedPath, v);
+            (void) environment.authorizeStorePath(expectedPath);
+            auto expectedRequest = AuthorizedStorePathRenderRequest::plain(expectedPath);
+            auto expectedPublished = environment.renderAuthorizedStorePath(expectedRequest);
+            v.mkString(expectedPublished.renderedPath(), expectedPublished.context(), state.mem);
             return;
         } catch (Error & e) {
             debug(
@@ -577,6 +630,20 @@ static void fetch(
                                   FetchMode::Copy,
                                   name)
                             : fetchers::downloadFile(*state.store, state.fetchSettings, *url, name).storePath;
+
+    if (!expectedHash && state.traceActiveDepth) [[unlikely]] {
+        if (auto access = eval_trace::TraceAccess::current()) {
+            auto runtimeInput = fetchers::Input::fromURL(state.fetchSettings, *url, unpack);
+            auto runtimeFetchAttrs = runtimeInput.toAttrs();
+            auto runtimeKey = RuntimeFetchIdentityDepKey{
+                .inputAttrs = std::move(runtimeFetchAttrs),
+            };
+            access->record(
+                DepSource::fromRuntimeRoot(makeRuntimeRootSourceKey(runtimeKey)),
+                runtimeKey,
+                DepHashValue(state.store->printStorePath(storePath)));
+        }
+    }
 
     if (expectedHash) {
         auto hash = unpack ? state.store->queryPathInfo(storePath)->narHash
@@ -597,7 +664,10 @@ static void fetch(
         }
     }
 
-    state.allowAndSetStorePathString(storePath, v);
+    (void) environment.authorizeStorePath(storePath);
+    auto request = AuthorizedStorePathRenderRequest::plain(storePath);
+    auto published = environment.renderAuthorizedStorePath(request);
+    v.mkString(published.renderedPath(), published.context(), state.mem);
 }
 
 static void prim_fetchurl(EvalState & state, const PosIdx pos, Value ** args, Value & v)

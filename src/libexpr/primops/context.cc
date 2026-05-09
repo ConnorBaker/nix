@@ -9,9 +9,12 @@ namespace nix {
 static void prim_unsafeDiscardStringContext(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     NixStringContext context;
-    auto s = state.coerceToString(
-        pos, *args[0], context, "while evaluating the argument passed to builtins.unsafeDiscardStringContext");
-    v.mkString(*s, state.mem);
+    auto s = state.coerceToContextObjectForUnsafeDiscard(
+        pos,
+        *args[0],
+        context,
+        "while evaluating the argument passed to builtins.unsafeDiscardStringContext");
+    state.publishContextObject(v, std::move(s));
 }
 
 static RegisterPrimOp primop_unsafeDiscardStringContext({
@@ -56,8 +59,14 @@ static RegisterPrimOp primop_hasContext(
 static void prim_unsafeDiscardOutputDependency(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     NixStringContext context;
-    auto s = state.coerceToString(
-        pos, *args[0], context, "while evaluating the argument passed to builtins.unsafeDiscardOutputDependency");
+    auto s = state.coerceToContextObject(
+        pos,
+        *args[0],
+        context,
+        "while evaluating the argument passed to builtins.unsafeDiscardOutputDependency",
+        false,
+        true,
+        true);
 
     NixStringContext context2;
     for (auto && c : context) {
@@ -69,7 +78,7 @@ static void prim_unsafeDiscardOutputDependency(EvalState & state, const PosIdx p
         }
     }
 
-    v.mkString(*s, context2, state.mem);
+    state.publishContextObject(v, std::move(s), std::move(context2));
 }
 
 static RegisterPrimOp primop_unsafeDiscardOutputDependency(
@@ -97,12 +106,18 @@ static RegisterPrimOp primop_unsafeDiscardOutputDependency(
 static void prim_addDrvOutputDependencies(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     NixStringContext context;
-    auto s = state.coerceToString(
-        pos, *args[0], context, "while evaluating the argument passed to builtins.addDrvOutputDependencies");
+    auto s = state.coerceToContextObject(
+        pos,
+        *args[0],
+        context,
+        "while evaluating the argument passed to builtins.addDrvOutputDependencies",
+        false,
+        true,
+        true);
 
     auto contextSize = context.size();
     if (contextSize != 1) {
-        state.error<EvalError>("context of string '%s' must have exactly one element, but has %d", *s, contextSize)
+        state.error<EvalError>("context of string '%s' must have exactly one element, but has %d", s.view(), contextSize)
             .atPos(pos)
             .debugThrow();
     }
@@ -137,7 +152,7 @@ static void prim_addDrvOutputDependencies(EvalState & state, const PosIdx pos, V
             context.begin()->raw)}),
     };
 
-    v.mkString(*s, context2, state.mem);
+    state.publishContextObject(v, std::move(s), std::move(context2));
 }
 
 static RegisterPrimOp primop_addDrvOutputDependencies(
@@ -261,6 +276,7 @@ static void prim_appendContext(EvalState & state, const PosIdx pos, Value ** arg
     NixStringContext context;
     auto orig = state.forceString(
         *args[0], context, noPos, "while evaluating the first argument passed to builtins.appendContext");
+    auto source = state.captureContextObject(orig, *args[0]);
 
     state.forceAttrs(*args[1], pos, "while evaluating the second argument passed to builtins.appendContext");
 
@@ -321,7 +337,7 @@ static void prim_appendContext(EvalState & state, const PosIdx pos, Value ** arg
         }
     }
 
-    v.mkString(orig, context, state.mem);
+    state.publishContextObject(v, std::move(source), std::move(context));
 }
 
 static RegisterPrimOp primop_appendContext({.name = "__appendContext", .arity = 2, .impl = prim_appendContext});

@@ -4,6 +4,7 @@
 #include "nix/store/path.hh"
 #include "nix/expr/primops.hh"
 #include "nix/expr/value.hh"
+#include "nix/expr/eval-environment/authority-internal.hh"
 
 #include "nix_api_expr.h"
 #include "nix_api_expr_internal.h"
@@ -719,13 +720,10 @@ nix_realised_string * nix_string_realise(nix_c_context * context, EvalState * st
     try {
         auto & v = check_value_in(value);
         nix::StorePathSet storePaths;
-        auto s = state->state.realiseString(v, &storePaths, isIFD);
-
-        // Convert to the C API StorePath type and convert to vector for index-based access
+        auto s = nix::realiseStringViaEvalEnvironment(state->state, v, &storePaths, isIFD);
         std::vector<StorePath> vec;
-        for (auto & sp : storePaths) {
+        for (auto & sp : storePaths)
             vec.push_back(StorePath{sp});
-        }
 
         return new nix_realised_string{.str = s, .storePaths = vec};
     }

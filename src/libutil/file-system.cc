@@ -300,6 +300,7 @@ void writeFile(const std::filesystem::path & path, Source & source, mode_t mode,
     if (!fd)
         throw NativeSysError("opening file %s", PathFmt(path));
 
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): bytes overwritten by source.read() before use
     std::array<char, 64 * 1024> buf;
 
     try {

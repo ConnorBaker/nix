@@ -15,6 +15,11 @@
 #include "nix/util/source-accessor.hh"
 #include "nix/expr/search-path.hh"
 #include "nix/expr/repl-exit-status.hh"
+#include "nix/expr/eval-trace/ids.hh"
+#include "nix/expr/eval-trace/deps/input-resolution.hh"
+#include "nix/expr/eval-trace/deps/types.hh"
+#include "nix/expr/eval-trace/result.hh"
+#include "nix/expr/eval-trace/semantic-objects.hh"
 #include "nix/util/ref.hh"
 #include "nix/expr/counter.hh"
 
@@ -25,9 +30,13 @@
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <functional>
 #include <span>
+#include <variant>
+#include <vector>
 
 namespace nix {
 
@@ -46,16 +55,123 @@ struct InputCache;
 struct Input;
 } // namespace fetchers
 struct EvalSettings;
+struct EvalEnvironmentAuthority;
 class EvalState;
 class StorePath;
 struct SingleDerivedPath;
 enum RepairFlag : bool;
 struct MemorySourceAccessor;
 struct MountedSourceAccessor;
+struct InterningPools;
+struct NixBindingEntry;
+struct PublishedMaterializedIdentity;
 
-namespace eval_cache {
-class EvalCache;
+namespace eval_trace {
+class TraceSession;
+struct AttrVocabStore;
+class TraceBackend;
+struct TracedExpr;
+template<typename> class EvalContext;
+struct Suspendable;
+struct Critical;
 }
+
+struct TraceRuntime;
+
+struct FileTraceCacheKey
+{
+    SourcePath path;
+    SourcePath displayPath;
+    SourcePath basePath;
+    bool mustBeTrivial = false;
+    std::optional<PathObject> origin;
+
+    bool operator==(const FileTraceCacheKey &) const = default;
+
+    struct Hash {
+        size_t operator()(const FileTraceCacheKey & key) const noexcept
+        {
+            std::size_t hash = hashValues(key.path, key.displayPath, key.basePath, key.mustBeTrivial);
+            if (key.origin) {
+                boost::hash_combine(hash, true);
+                boost::hash_combine(hash, DepSource::Hash{}(key.origin->source));
+                boost::hash_combine(hash, key.origin->rootPath);
+            } else {
+                boost::hash_combine(hash, false);
+            }
+            return hash;
+        }
+    };
+};
+
+struct SrcToStoreCacheKey
+{
+    SourcePath path;
+    const Store * store = nullptr;
+
+    bool operator==(const SrcToStoreCacheKey &) const = default;
+
+    struct Hash
+    {
+        size_t operator()(const SrcToStoreCacheKey & key) const
+        {
+            size_t hash = std::hash<SourcePath>{}(key.path);
+            boost::hash_combine(hash, key.store);
+            return hash;
+        }
+    };
+};
+
+using SrcToStoreCache = boost::concurrent_flat_map<
+    SrcToStoreCacheKey,
+    StorePath,
+    SrcToStoreCacheKey::Hash>;
+using ImportResolutionCache = boost::concurrent_flat_map<SourcePath, SourcePath>;
+using FileTraceValueCache = boost::concurrent_flat_map<
+    FileTraceCacheKey,
+    Value *,
+    FileTraceCacheKey::Hash,
+    std::equal_to<FileTraceCacheKey>,
+    traceable_allocator<std::pair<const FileTraceCacheKey, Value *>>>;
+
+/// Session-lifetime cache mapping a (accessor, path) pair to its
+/// eval-trace content hash.
+///
+/// Eliminates redundant content-hash computation for files read many times
+/// during a single eval (e.g., nixpkgs/all-packages.nix accessed per
+/// binding).
+///
+/// Keyed on `SourcePath` (not `CanonPath`) so that two files with the
+/// same canonical path but backed by different accessors (e.g., two
+/// flake inputs mounted at colliding paths) do not share a cache
+/// entry. `SourcePath`'s hash includes `accessor->number`.
+///
+/// CONTRACT: Files are assumed stable for the lifetime of this cache.
+/// If file bytes change after the first access that populates this
+/// cache, subsequent readers of this cache will see the first-observed
+/// hash (NOT the current bytes' hash). File-change-during-eval is
+/// already undefined behavior in Nix's evaluation model; this cache
+/// documents and embraces that invariant rather than defending against
+/// it per-access.
+using FileContentHashCache = boost::concurrent_flat_map<SourcePath, DepHash>;
+
+struct EvalEnvironmentSharedState
+{
+    const ref<fetchers::InputCache> inputCache;
+    const ref<SrcToStoreCache> srcToStore;
+    const ref<ImportResolutionCache> importResolutionCache;
+    const ref<FileTraceValueCache> fileTraceCache;
+    /// Session-wide cache of file content hashes. See FileContentHashCache
+    /// docstring for the stability contract.
+    const ref<FileContentHashCache> fileContentHashCache;
+    /// Cache of lookup-path resolutions keyed by the raw path string.
+    /// Concurrent to match master's thread-safety model for EvalState caches.
+    const ref<boost::concurrent_flat_map<std::string, std::optional<SourcePath>>> lookupPathResolved;
+    std::mutex retainedPathAccessorsMutex;
+    std::vector<ref<SourceAccessor>> retainedPathAccessors;
+
+    EvalEnvironmentSharedState();
+};
 
 /**
  * Increments a count on construction and decrements on destruction.
@@ -328,17 +444,22 @@ public:
     inline Value * allocValue();
     inline Env & allocEnv(size_t size);
 
-    Bindings * allocBindings(size_t capacity);
+    Bindings * allocBindings(
+        size_t capacity,
+        EmptyBindingsAllocation emptyAllocation = EmptyBindingsAllocation::ReuseSharedEmpty);
 
-    BindingsBuilder buildBindings(SymbolTable & symbols, size_t capacity)
+    BindingsBuilder buildBindings(
+        SymbolTable & symbols,
+        size_t capacity,
+        EmptyBindingsAllocation emptyAllocation = EmptyBindingsAllocation::ReuseSharedEmpty)
     {
-        return BindingsBuilder(*this, symbols, allocBindings(capacity), capacity);
+        return BindingsBuilder(*this, symbols, allocBindings(capacity, emptyAllocation), capacity);
     }
 
-    ListBuilder buildList(size_t size)
+    ListBuilder buildList(size_t size, bool forceHeap = false)
     {
         stats.nrListElems += size;
-        return ListBuilder(*this, size);
+        return ListBuilder(*this, size, forceHeap);
     }
 
     const Statistics & getStats() const &
@@ -409,8 +530,6 @@ public:
 
     RootValue vImportedDrvToDerivation = nullptr;
 
-    const ref<fetchers::InputCache> inputCache;
-
     /**
      * Debugger
      */
@@ -429,6 +548,12 @@ public:
         else
             return std::shared_ptr<const StaticEnv>();
         ;
+    }
+
+    void retainPathAccessor(ref<SourceAccessor> accessor)
+    {
+        std::lock_guard lock(evalEnvironmentSharedState->retainedPathAccessorsMutex);
+        evalEnvironmentSharedState->retainedPathAccessors.push_back(std::move(accessor));
     }
 
     /** Whether a debug repl can be started. If `false`, `runDebugRepl(error)` will return without starting a repl. */
@@ -454,33 +579,91 @@ public:
     }
 
     /**
-     * A cache for evaluation caches, so as to reuse the same root value if possible
+     * Trace-aware evaluation context (BSàlC trace store + Adapton DDG).
+     * Holds trace runtime state plus the fingerprint-keyed TraceSession registry.
+     * Non-null when eval-trace is enabled (the default); nullptr otherwise.
      */
-    std::map<const Hash, ref<eval_cache::EvalCache>> evalCaches;
+    std::unique_ptr<TraceRuntime> traceCtx;
+
+    /**
+     * Non-zero only inside TracedExpr::evaluateFresh(), so forceValue
+     * skips replayMemoizedDeps when no DepRecordingContext is active.
+     */
+    uint32_t traceActiveDepth = 0;
+
+    /**
+     * Outlined thunk-forcing path for forceValue (reduces inline code size).
+     *
+     * Backward-compatible bridge. Checks for an active EvalContext<Suspendable>
+     * thread-local. When EvalContext<Mode> propagation is complete (all callers
+     * migrated), this bridge is removed and forceValue takes EvalContext<Mode>&.
+     */
+    [[gnu::noinline]]
+    void forceThunkValue(Value & v, PosIdx pos);
+
+    /**
+     * Mode-parameterized forceThunkValue. Critical skips TracedExpr verification
+     * (direct eval). Suspendable dispatches through TracedExpr (may syncAwait).
+     */
+    template<typename Mode>
+    [[gnu::noinline]]
+    void forceThunkValue(eval_trace::EvalContext<Mode> & ctx, Value & v, PosIdx pos);
+
+    /**
+     * Outlined app-forcing path for forceValue (reduces inline code size).
+     */
+    [[gnu::noinline]]
+    void forceAppValue(Value & v, PosIdx pos);
+
+    /**
+     * Get the mount-to-input mapping. Returns an empty map when tracing is disabled.
+     */
+    bool hasTraceContext() const { return traceCtx != nullptr; }
+    void resetTraceContext();
+    InterningPools & tracingPools();
+    /// Get the MemoReplayStore's owned epoch log vector.
+    /// Used by FiberScheduler::run to bind the fiber's DepRecordingContext.
+    std::vector<Dep> & replayEpochLog();
+    eval_trace::AttrVocabStore & vocabStore();
+    void registerTracedValueIdentity(const Value * key, const eval_trace::TracedExpr & tracedExpr);
+    void registerTracedBindingsValueIdentity(
+        const Bindings * key,
+        const eval_trace::TracedExpr & tracedExpr,
+        const Bindings * originalBindings = nullptr);
+    void rememberNixBinding(PosIdx pos, const NixBindingEntry & entry);
+    const NixBindingEntry * lookupNixBinding(PosIdx pos) const;
+    void registerMaterializedValueIdentity(
+        const Value * key,
+        eval_trace::TraceBackend * traceBackend,
+        std::optional<SiblingIdentity> siblingIdentity,
+        AttrPathId pathId,
+        std::optional<ValueIdentityStamp> valueIdentityStamp = std::nullopt);
+    PublishedMaterializedIdentity publishRootMaterializedValueIdentity(
+        const Value * key,
+        eval_trace::TraceBackend * traceBackend,
+        AttrPathId pathId,
+        ValueIdentityStamp valueIdentityStamp);
+    void rollbackRootMaterializedValueIdentity(
+        const PublishedMaterializedIdentity & publication);
+    std::optional<ValueIdentityStamp> lookupValueIdentityStamp(const Value & v) const;
+    bool hasValueIdentityForTest(const Value * key) const;
+    bool hasBindingsValueIdentityForTest(const Bindings * key) const;
+    void recordThunkDeps(const Value & v, uint32_t epochStart);
+    void rollbackReplayEpoch(uint32_t epochStart);
+    void replayMemoizedDeps(const Value & v);
+    /// Fast bloom filter test: true if v MIGHT have memoized deps.
+    /// False negatives impossible; false positives rare (~0.4%).
+    /// Used by forceValue to skip the replayMemoizedDeps function call
+    /// for the 99%+ of values that definitely have no memoized deps.
+    bool mayHaveMemoizedDeps(const Value & v) const;
+    std::unique_ptr<eval_trace::TraceBackend> makeTraceBackend(const Hash & fingerprint);
+    bool sameValueIdentity(Value & v1, Value & v2);
 
 private:
-
-    /* Cache for calls to addToStore(); maps source paths to the store
-       paths. */
-    const ref<boost::concurrent_flat_map<SourcePath, StorePath>> srcToStore;
-
     /**
      * A cache that maps paths to "resolved" paths for importing Nix
      * expressions, i.e. `/foo` to `/foo/default.nix`.
      */
-    const ref<boost::concurrent_flat_map<SourcePath, SourcePath>> importResolutionCache;
-
-    /**
-     * A cache from resolved paths to values.
-     */
-    const ref<boost::concurrent_flat_map<
-        SourcePath,
-        Value *,
-        std::hash<SourcePath>,
-        std::equal_to<SourcePath>,
-        traceable_allocator<std::pair<const SourcePath, Value *>>>>
-        fileEvalCache;
-
     /**
      * Associate source positions of certain AST nodes with their preceding doc comment, if they have one.
      * Grouped by file.
@@ -488,17 +671,6 @@ private:
     const ref<boost::concurrent_flat_map<SourcePath, ref<DocCommentMap>>> positionToDocComment;
 
     LookupPath lookupPath;
-
-    struct LookupPathResolvedState
-    {
-        SourcePath path;
-        const ref<boost::concurrent_flat_map<CanonPath, std::optional<SourcePath>>> resolvedPaths;
-    };
-
-    const ref<
-        boost::
-            concurrent_flat_map<std::string, std::shared_ptr<LookupPathResolvedState>, StringViewHash, std::equal_to<>>>
-        lookupPathResolved;
 
     /**
      * Cache used by prim_match().
@@ -556,42 +728,24 @@ public:
      */
     SourcePath storePath(const StorePath & path);
 
-    /**
-     * Allow access to a path.
-     *
-     * Only for restrict eval: pure eval just whitelist store paths,
-     * never arbitrary paths.
-     */
-    void allowPathLegacy(const std::string & path);
-
-    /**
-     * Allow access to a store path. Note that this gets remapped to
-     * the real store path if `store` is a chroot store.
-     */
-    void allowPath(const StorePath & storePath);
-
-    /**
-     * Allow access to the closure of a store path.
-     */
-    void allowClosure(const StorePath & storePath);
-
-    /**
-     * Allow access to a store path and return it as a string.
-     */
-    void allowAndSetStorePathString(const StorePath & storePath, Value & v);
-
-    void checkURI(const std::string & uri);
-
-    /**
-     * Mount an input on the Nix store.
-     */
-    StorePath mountInput(fetchers::Input & input, const fetchers::Input & originalInput, ref<SourceAccessor> accessor);
 
     /**
      * Parse a Nix expression from the specified file.
      */
     Expr * parseExprFromFile(const SourcePath & path);
     Expr * parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv);
+    Expr *
+    parseExprFromFile(const SourcePath & path, const SourcePath & basePath, const std::shared_ptr<StaticEnv> & staticEnv);
+    Expr * parseExprFromFile(const SourcePath & path, const SourcePath & basePath);
+    Expr * parseExprFromFile(
+        const SourcePath & displayPath,
+        const SourcePath & physicalPath,
+        const SourcePath & basePath,
+        const std::shared_ptr<StaticEnv> & staticEnv);
+    Expr * parseExprFromFile(
+        const SourcePath & displayPath,
+        const SourcePath & physicalPath,
+        const SourcePath & basePath);
 
     /**
      * Parse a Nix expression from the specified string.
@@ -619,25 +773,42 @@ public:
      * form. Optionally enforce that the top-level expression is
      * trivial (i.e. doesn't require arbitrary computation).
      */
-    void evalFile(const SourcePath & path, Value & v, bool mustBeTrivial = false);
+    void evalFile(
+        const SourcePath & path,
+        const SourcePath & basePath,
+        Value & v,
+        bool mustBeTrivial = false,
+        const std::optional<PathObject> & origin = std::nullopt);
+
+    void evalFile(
+        const SourcePath & displayPath,
+        const SourcePath & physicalPath,
+        const SourcePath & basePath,
+        Value & v,
+        bool mustBeTrivial = false,
+        const std::optional<PathObject> & origin = std::nullopt);
+
+    void evalFile(
+        const SourcePath & path,
+        Value & v,
+        bool mustBeTrivial = false,
+        const std::optional<PathObject> & origin = std::nullopt);
 
     void resetFileCache();
 
     /**
-     * Look up a file in the search path.
-     */
-    SourcePath findFile(const std::string_view path);
-    SourcePath findFile(const LookupPath & lookupPath, const std::string_view path, const PosIdx pos = noPos);
-
-    /**
-     * Try to resolve a search path value (not the optional key part).
+     * Clear the cross-session memo tables that a real subprocess
+     * boundary would start empty:
+     *   - `importResolutionCache` — evalFile resolution memo
+     *   - `fileTraceCache` — evalFile value memo
+     *   - `inputCache` — fetchers::InputCache cross-fetch memo
      *
-     * If the specified search path element is a URI, download it.
-     *
-     * If it is not found, return `nullptr`.
+     * Narrower than `resetFileCache()`: preserves `positions` (PosTable)
+     * and `traceCtx` so this is safe to call mid-evaluation. Used by
+     * test fixtures (`simulateWarmRestart` / `simulateColdProcess`) to match a real new-process
+     * cache-state boundary.
      */
-    std::shared_ptr<LookupPathResolvedState>
-    resolveLookupPathPath(const LookupPath::Path & elem, bool initAccessControl = false);
+    void clearCrossSessionCaches();
 
     /**
      * Evaluate an expression to normal form
@@ -703,6 +874,14 @@ public:
     inline void forceAttrs(Value & v, Callable getPos, std::string_view errorCtx);
 
     inline void forceList(Value & v, const PosIdx pos, std::string_view errorCtx);
+
+    /**
+     * Force a list value and record a #len shape dep if the list has
+     * TracedData provenance. Combines forceList + maybeRecordListLenDep
+     * so primops don't need to remember the hook.
+     */
+    void forceListObserved(Value & v, const PosIdx pos, std::string_view errorCtx);
+
     /**
      * @param v either lambda or primop
      */
@@ -729,6 +908,29 @@ public:
     void addErrorTrace(Error & e, const PosIdx pos, const Args &... formatArgs) const;
 
 public:
+    class CoercedPath {
+        SourcePath value_;
+        std::optional<PathObject> origin_;
+
+        CoercedPath(SourcePath value, std::optional<PathObject> origin)
+            : value_(std::move(value))
+            , origin_(std::move(origin))
+        {
+        }
+
+        friend class EvalState;
+
+    public:
+        CoercedPath() = delete;
+        CoercedPath(const CoercedPath &) = delete;
+        CoercedPath & operator=(const CoercedPath &) = delete;
+        CoercedPath(CoercedPath &&) noexcept = default;
+        CoercedPath & operator=(CoercedPath &&) noexcept = default;
+
+        const SourcePath & path() const { return value_; }
+        const std::optional<PathObject> & origin() const { return origin_; }
+    };
+
     /**
      * @return true iff the value `v` denotes a derivation (i.e. a
      * set with attribute `type = "derivation"`).
@@ -736,7 +938,82 @@ public:
     bool isDerivation(Value & v);
 
     std::optional<std::string> tryAttrsToString(
-        const PosIdx pos, Value & v, NixStringContext & context, bool coerceMore = false, bool copyToStore = true);
+        const PosIdx pos, Value & v, NixStringContext & context,
+        bool coerceMore = false, bool copyToStore = true);
+
+    std::optional<SemanticHandle> lookupSemanticHandle(const Value & v) const;
+
+    /// Low-level write: replace the Value's entire publication slot.
+    /// Used during materialization (replay) where the full SemanticHandle
+    /// is restored from the trace cache.  Re-creates the Value with the
+    /// new publication pointer.
+    void setSemanticHandle(Value & v, const std::optional<SemanticHandle> & publication) const;
+
+    /// Merge fields into the Value's existing SemanticHandle.
+    /// Copies path/text/identity from `publication` into whatever the Value
+    /// already carries, then updates the kind discriminator.  Used during
+    /// coercion and primop publication where the Value may already have
+    /// partial provenance (e.g. a PathObject from fetchTree that now also
+    /// gets a TextObject from readFile).
+    void mergeSemanticHandle(Value & v, const std::optional<SemanticHandle> & publication) const;
+    ContextObject captureContextObject(
+        std::string_view value,
+        const Value & source) const;
+    CoercedPath captureCoercedPath(
+        SourcePath value,
+        const Value & source) const;
+    CoercedPath capturePathWithObject(
+        SourcePath value,
+        std::optional<PathObject> origin) const;
+    void publishContextObject(
+        Value & v,
+        ContextObject && coerced,
+        NixStringContext context = {});
+    void publishCoercedPath(
+        Value & v,
+        CoercedPath && coerced);
+
+    /// Attach PathObject provenance to v, guarded by traceActiveDepth.
+    /// Replaces manual `if (traceActiveDepth) mergeSemanticHandle(v, SemanticHandle::forPath(...))`.
+    void publishPathProvenance(Value & v, PathObject obj);
+
+    /// Attach TextObject provenance to v, guarded by traceActiveDepth.
+    void publishTextProvenance(Value & v, TextObject obj);
+
+    /// Attach StructuredObject provenance to an attrset Value's Bindings.
+    /// Only effective for nAttrs values; silently does nothing for other types.
+    ///
+    /// Provenance carrier asymmetry across Value types:
+    ///
+    /// | Type    | Carrier                               | Works on x86-64? | Why |
+    /// |---------|---------------------------------------|------------------|-----|
+    /// | nString | StringWithContext::Context::publication | Yes | Context is heap-allocated; publication field not in packed payload |
+    /// | nPath   | Path::Details::publication            | Yes | Details is heap-allocated; only Details* in packed payload |
+    /// | nAttrs  | Bindings::publication_                | Yes | Bindings is heap-allocated; only Bindings* in packed payload |
+    /// | nList   | ContainerProvenanceRegistry (side-map) | Yes | Packed payload stores only elems+size; no room for a third pointer |
+    ///
+    /// The pattern: for types where the extra field lives on a separately
+    /// heap-allocated object (string context, path details, bindings), the packed
+    /// payload stores only the pointer to that object, and the publication field
+    /// survives because it is NOT in the payload. For lists, the only pointer in
+    /// the payload IS the elems array itself, with no separately heap-allocated
+    /// header — hence the side-map (ContainerProvenanceRegistry in trace-frame.hh).
+    void publishStructuredProvenance(Value & v, StructuredObject obj);
+
+    /// mkStorePathString + publishPathProvenance in one call.
+    void mkStorePathStringWithProvenance(const StorePath & p, Value & v, PathObject provenance);
+
+    /// mkOutputString + publishPathProvenance in one call.
+    void mkOutputStringWithProvenance(
+        Value & v,
+        const SingleDerivedPath::Built & b,
+        std::optional<StorePath> optStaticOutputPath,
+        PathObject provenance,
+        const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings);
+
+    /// mkSingleDerivedPathString + publishPathProvenance in one call.
+    void mkSingleDerivedPathStringWithProvenance(const SingleDerivedPath & p, Value & v,
+        PathObject provenance);
 
     enum class CopyLazyPaths : bool {
         PreserveLazy = false,
@@ -774,8 +1051,19 @@ public:
         bool coerceMore = false,
         bool copyToStore = true,
         bool canonicalizePath = true);
-
-    StorePath copyPathToStore(NixStringContext & context, const SourcePath & path);
+    ContextObject coerceToContextObject(
+        const PosIdx pos,
+        Value & v,
+        NixStringContext & context,
+        std::string_view errorCtx,
+        bool coerceMore = false,
+        bool copyToStore = true,
+        bool canonicalizePath = true);
+    ContextObject coerceToContextObjectForUnsafeDiscard(
+        const PosIdx pos,
+        Value & v,
+        NixStringContext & context,
+        std::string_view errorCtx);
 
     /**
      * Path coercion.
@@ -784,7 +1072,16 @@ public:
      * path.  The result is guaranteed to be a canonicalised, absolute
      * path.  Nothing is copied to the store.
      */
-    SourcePath coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx);
+    SourcePath coerceToPath(
+        const PosIdx pos,
+        Value & v,
+        NixStringContext & context,
+        std::string_view errorCtx);
+    CoercedPath coerceToCoercedPath(
+        const PosIdx pos,
+        Value & v,
+        NixStringContext & context,
+        std::string_view errorCtx);
 
     /**
      * Like coerceToPath, but the result must be a store path.
@@ -968,14 +1265,16 @@ public:
      */
     void autoCallFunction(const Bindings & args, Value & fun, Value & res);
 
-    BindingsBuilder buildBindings(size_t capacity)
+    BindingsBuilder buildBindings(
+        size_t capacity,
+        EmptyBindingsAllocation emptyAllocation = EmptyBindingsAllocation::ReuseSharedEmpty)
     {
-        return mem.buildBindings(symbols, capacity);
+        return mem.buildBindings(symbols, capacity, emptyAllocation);
     }
 
-    ListBuilder buildList(size_t size)
+    ListBuilder buildList(size_t size, bool forceHeap = false)
     {
-        return mem.buildList(size);
+        return mem.buildList(size, forceHeap);
     }
 
     /**
@@ -1085,11 +1384,44 @@ public:
     realiseString(Value & str, StorePathSet * storePathsOutMaybe, bool isIFD = true, const PosIdx pos = noPos);
 
     /* Call the binary path filter predicate used builtins.path etc. */
-    bool callPathFilter(Value * filterFun, const SourcePath & path, PosIdx pos);
+    bool callPathFilter(
+        Value * filterFun,
+        const SourcePath & path,
+        PosIdx pos,
+        const std::optional<PathObject> & origin = std::nullopt);
 
     DocComment getDocCommentForPos(PosIdx pos);
 
 private:
+
+    const std::shared_ptr<EvalEnvironmentSharedState> evalEnvironmentSharedState;
+
+    friend EvalEnvironmentAuthority makeDetachedEvalEnvironmentAuthority(EvalState & state);
+    friend EvalEnvironmentAuthority makeSessionEvalEnvironmentAuthority(EvalState & state);
+    friend void clearEvalEnvironmentState(EvalState & state);
+    friend void releaseSessionEvalEnvironmentState(EvalState & state);
+    friend DepHash getOrStoreFileContentHash(
+        EvalState & state, const SourcePath & path, std::string_view bytes);
+    friend DepHash getOrReadFileContentHash(
+        EvalState & state, const SourcePath & path);
+
+    /// Internal coercion with provenance out-params — used only by
+    /// coerceToContextObject and coerceToCoercedPath.
+    BackedStringView coerceToStringWithProvenance(
+        const PosIdx pos, Value & v, NixStringContext & context,
+        std::string_view errorCtx, bool coerceMore, bool copyToStore,
+        bool canonicalizePath,
+        std::optional<PathObject> * origin,
+        std::optional<TextObject> * textProvenance);
+    SourcePath coerceToPathWithProvenance(
+        const PosIdx pos, Value & v, NixStringContext & context,
+        std::string_view errorCtx,
+        std::optional<PathObject> * origin);
+    std::optional<std::string> tryAttrsToString(
+        const PosIdx pos, Value & v, NixStringContext & context,
+        bool coerceMore, bool copyToStore,
+        std::optional<PathObject> * origin,
+        std::optional<TextObject> * textProvenance);
 
     /**
      * Like `mkOutputString` but just creates a raw string, not an
@@ -1167,6 +1499,28 @@ struct DebugTraceStacker
  */
 std::string_view showType(ValueType type, bool withArticle = true);
 std::string showType(const Value & v);
+
+/// Returns the cached eval-trace content hash for `path`; computes from `bytes`
+/// on miss and caches before returning.
+///
+/// Use this when the file contents are already in hand (e.g., inside
+/// readFile's observation flow). For the read-if-miss variant, see
+/// getOrReadFileContentHash.
+DepHash getOrStoreFileContentHash(
+    EvalState & state,
+    const SourcePath & path,
+    std::string_view bytes);
+
+/// Returns the cached eval-trace content hash for `path`; on miss reads the
+/// file via its SourceAccessor, hashes the bytes, and caches before
+/// returning.
+///
+/// Throws whatever SourcePath::readFile would throw on IO error — matches
+/// the existing failure mode where callers that used to call
+/// environment.readFile() would have propagated the same exception.
+DepHash getOrReadFileContentHash(
+    EvalState & state,
+    const SourcePath & path);
 
 /**
  * If `path` refers to a directory, then append "/default.nix".

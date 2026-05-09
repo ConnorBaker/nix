@@ -10,7 +10,7 @@ struct ServeProto::BasicClientConnection
 {
     FdSink to;
     FdSource from;
-    ServeProto::Version remoteVersion;
+    ServeProto::Version remoteVersion{};
 
     /**
      * Establishes connection, negotiating version.

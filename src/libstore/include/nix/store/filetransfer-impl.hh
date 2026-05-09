@@ -45,11 +45,11 @@ constexpr uint32_t saturateMs(std::chrono::milliseconds d) noexcept
 struct RetryDelayParams
 {
     /** 1-based retry attempt number (1 = first retry). */
-    uint32_t attempt;
+    uint32_t attempt = 0;
     /** Base delay in ms for this error class. */
-    uint32_t baseMs;
+    uint32_t baseMs = 0;
     /** Per-attempt delay ceiling (does not cap retryAfterMs). */
-    uint32_t ceilMs;
+    uint32_t ceilMs = 0;
     /** Server-provided minimum delay (from Retry-After header). */
     std::optional<uint32_t> retryAfterMs = {};
     /** Apply full jitter (false = deterministic). */

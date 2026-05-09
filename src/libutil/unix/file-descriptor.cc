@@ -173,7 +173,7 @@ void unix::SelfPipe::notify()
 void unix::SelfPipe::drain()
 {
     /* Drain the self-pipe. */
-    std::array<char, 128> buf;
+    std::array<char, 128> buf{};
     while (true) {
         if (::read(pipe.readSide.get(), buf.data(), buf.size()) == -1) {
             if (errno == EAGAIN)

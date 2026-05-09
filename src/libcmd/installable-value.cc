@@ -1,22 +1,9 @@
 #include "nix/cmd/installable-value.hh"
-#include "nix/expr/eval-cache.hh"
-#include "nix/fetchers/fetch-to-store.hh"
+#include "nix/expr/eval-environment/authority-internal.hh"
+#include "nix/expr/eval-environment/environment.hh"
+#include "nix/expr/eval-trace/deps/trace-access.hh"
 
 namespace nix {
-
-std::vector<ref<eval_cache::AttrCursor>> InstallableValue::getCursors(EvalState & state)
-{
-    auto evalCache =
-        std::make_shared<nix::eval_cache::EvalCache>(std::nullopt, state, [&]() { return toValue(state).first; });
-    return {evalCache->getRoot()};
-}
-
-ref<eval_cache::AttrCursor> InstallableValue::getCursor(EvalState & state)
-{
-    /* Although getCursors should return at least one element, in case it doesn't,
-       bound check to avoid an undefined behavior for vector[0] */
-    return getCursors(state).at(0);
-}
 
 static UsageError nonValueInstallable(Installable & installable)
 {
@@ -43,11 +30,26 @@ std::optional<DerivedPathWithInfo>
 InstallableValue::trySinglePathToDerivedPaths(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
     if (v.type() == nPath) {
-        auto storePath = fetchToStore(state->fetchSettings, *state->store, v.path(), FetchMode::Copy);
-        return {{
+        EvalEnvironment environment(makeDetachedEvalEnvironmentAuthority(*state));
+        auto path = v.path();
+        std::optional<PathObject> origin;
+        if (auto handle = state->lookupSemanticHandle(v); handle && handle->hasPath())
+            origin = handle->path;
+        auto request = CopyPathToStoreRequest{
+            .name = std::string(path.baseName()),
+            .path = path,
+            .origin = std::move(origin),
+            .filterEvaluator = std::function<bool(const SourcePath &)>(),
+            .method = ContentAddressMethod::Raw::NixArchive,
+            .expectedHash = std::nullopt,
+            .context = {},
+            .pos = noPos,
+        };
+        auto published = environment.copyPathToStore(request);
+                return {{
             .path =
                 DerivedPath::Opaque{
-                    .path = std::move(storePath),
+                    .path = published.storePath(),
                 },
             .info = make_ref<ExtraPathInfo>(),
         }};

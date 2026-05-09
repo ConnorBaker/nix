@@ -94,6 +94,7 @@ void Source::operator()(std::string_view data)
 
 void Source::drainInto(Sink & sink)
 {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): bytes overwritten by read() before use
     std::array<char, 8192> buf;
     while (true) {
         try {
@@ -107,6 +108,7 @@ void Source::drainInto(Sink & sink)
 
 void Source::drainInto(Sink & sink, uint64_t len)
 {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): bytes overwritten by read() before use
     std::array<char, 65536> buf;
     while (len) {
         checkInterrupt();
@@ -128,6 +130,7 @@ std::string Source::drain()
 
 void Source::skip(size_t len)
 {
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): bytes overwritten by read() before use
     std::array<char, 8192> buf;
     while (len) {
         auto n = read(buf.data(), std::min(len, buf.size()));
@@ -245,7 +248,7 @@ bool FdSource::hasData()
         }
         return FD_ISSET(sock, &fds);
 #else
-        struct pollfd pfd;
+        struct pollfd pfd{};
         pfd.fd = fd;
         pfd.events = POLLIN;
         pfd.revents = 0;

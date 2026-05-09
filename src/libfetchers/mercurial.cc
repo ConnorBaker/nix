@@ -7,6 +7,8 @@
 #include "nix/util/environment-variables.hh"
 #include "nix/util/users.hh"
 #include "nix/fetchers/cache.hh"
+#include "nix/util/archive.hh"
+#include "nix/util/hash.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/url-parts.hh"
 #include "nix/fetchers/fetch-settings.hh"
@@ -38,6 +40,105 @@ static std::string runHg(OsStrings args)
         throw ExecError(res.first, "hg %1%", statusToString(res.first));
 
     return res.second;
+}
+
+static std::optional<std::string> getUnlockedLocalFingerprint(const std::filesystem::path & localPath, const Input & input)
+{
+    try {
+        if (!std::filesystem::exists(localPath / ".hg"))
+            return std::nullopt;
+
+        HashSink hashSink{HashAlgorithm::SHA512};
+        writeString("hg-local-fingerprint:", hashSink);
+
+        auto status = runHg({
+            OS_STR("status"),
+            OS_STR("-R"),
+            localPath.native(),
+            OS_STR("--modified"),
+            OS_STR("--added"),
+            OS_STR("--removed"),
+        });
+
+        if (auto ref = input.getRef()) {
+            writeString("mode:ref;", hashSink);
+            writeString(*ref, hashSink);
+            writeString(";", hashSink);
+            writeString(
+                chomp(runHg({
+                    OS_STR("log"),
+                    OS_STR("-R"),
+                    localPath.native(),
+                    OS_STR("-r"),
+                    string_to_os_string(*ref),
+                    OS_STR("--template"),
+                    OS_STR("{node}"),
+                })),
+                hashSink);
+            return hashSink.finish().hash.to_string(HashFormat::Base16, false);
+        }
+
+        if (status.empty()) {
+            writeString("mode:clean-default;", hashSink);
+            writeString(
+                chomp(runHg({
+                    OS_STR("log"),
+                    OS_STR("-R"),
+                    localPath.native(),
+                    OS_STR("-r"),
+                    OS_STR("default"),
+                    OS_STR("--template"),
+                    OS_STR("{node}"),
+                })),
+                hashSink);
+            return hashSink.finish().hash.to_string(HashFormat::Base16, false);
+        }
+
+        writeString("mode:dirty;", hashSink);
+        writeString(
+            chomp(runHg({
+                OS_STR("id"),
+                OS_STR("-R"),
+                localPath.native(),
+                OS_STR("-i"),
+            })),
+            hashSink);
+
+        auto entries = tokenizeString<StringSet>(status, "\n");
+        for (const auto & line : entries) {
+            if (line.empty())
+                continue;
+
+            if (line.size() < 3 || line[1] != ' ')
+                throw Error("unexpected Mercurial status line '%s'", line);
+
+            auto kind = line[0];
+            auto file = line.substr(2);
+
+            switch (kind) {
+            case 'M':
+                writeString("modified:", hashSink);
+                break;
+            case 'A':
+                writeString("added:", hashSink);
+                break;
+            case 'R':
+                writeString("removed:", hashSink);
+                break;
+            default:
+                continue;
+            }
+
+            writeString(file, hashSink);
+            writeString(";", hashSink);
+
+            if (kind != 'R')
+                dumpPath(localPath / file, hashSink);
+        }
+        return hashSink.finish().hash.to_string(HashFormat::Base16, false);
+    } catch (Error &) {
+        return std::nullopt;
+    }
 }
 
 struct MercurialInputScheme : InputScheme
@@ -146,7 +247,7 @@ struct MercurialInputScheme : InputScheme
     std::optional<std::filesystem::path> getSourcePath(const Input & input) const override
     {
         auto url = parseURL(getStrAttr(input.attrs, "url"));
-        if (url.scheme == "file" && !input.getRef() && !input.getRev())
+        if (url.scheme == "file")
             return urlPathToPath(url.path);
         return {};
     }
@@ -412,12 +513,21 @@ struct MercurialInputScheme : InputScheme
         return (bool) input.getRev();
     }
 
+    std::optional<std::string> getStableIdentity(const Input & input) const override
+    {
+        return fmt("hg:%s", getStrAttr(input.attrs, "url"));
+    }
+
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
     {
         if (auto rev = input.getRev())
             return rev->gitRev();
-        else
-            return std::nullopt;
+
+        auto actualUrl_ = getActualUrl(input);
+        if (auto * localPath = std::get_if<std::filesystem::path>(&actualUrl_))
+            return getUnlockedLocalFingerprint(*localPath, input);
+
+        return std::nullopt;
     }
 };
 

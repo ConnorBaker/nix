@@ -5,6 +5,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/expr/print.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -64,7 +65,9 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
 
         auto state = getEvalState();
 
-        auto [v, pos] = installable->toValue(*state);
+        auto evaluated = installable->toValue(*state);
+        auto * v = evaluated.value;
+        auto pos = evaluated.pos;
         NixStringContext context;
 
         if (apply) {
@@ -88,7 +91,6 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
                     writeFile(path, v.string_view());
                 } else if (v.type() == nAttrs) {
                     [[maybe_unused]] bool directoryCreated = std::filesystem::create_directory(path);
-                    // Directory should not already exist
                     assert(directoryCreated);
                     for (auto & attr : *v.attrs()) {
                         std::string_view name = state->symbols[attr.name];
@@ -106,9 +108,7 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
                     state->error<TypeError>("value at '%s' is not a string or an attribute set", state->positions[pos])
                         .debugThrow();
             }(*v, pos, *writeTo);
-        }
-
-        else if (raw) {
+        } else if (raw) {
             logger->stop();
             auto string = state->coerceToString(noPos, *v, context, "while generating the eval command output");
             writeFull(getStandardOutput(), *string);

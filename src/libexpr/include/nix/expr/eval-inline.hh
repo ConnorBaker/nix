@@ -3,6 +3,7 @@
 
 #include "nix/expr/print.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-trace/context.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 #include <exception>
@@ -93,32 +94,16 @@ Env & EvalMemory::allocEnv(size_t size)
 }
 
 [[gnu::always_inline]]
-void EvalState::forceValue(Value & v, const PosIdx pos)
+inline void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    if (v.isThunk()) {
-        Env * env = v.thunk().env;
-        assert(env || v.isBlackhole());
-        Expr * expr = v.thunk().expr;
-        try {
-            v.mkBlackhole();
-            if (env) [[likely]]
-                expr->eval(*this, *env, v);
-            else
-                ExprBlackHole::throwInfiniteRecursionError(*this, v);
-        } catch (...) {
-            handleEvalExceptionForThunk(env, expr, v, pos);
-            throw;
-        }
-    } else if (v.isApp()) {
-        Value savedApp = v;
-        try {
-            callFunction(*v.app().left, *v.app().right, v, pos);
-        } catch (...) {
-            handleEvalExceptionForApp(v, savedApp);
-            throw;
-        }
+    if (v.isThunk()) [[unlikely]] {
+        forceThunkValue(v, pos);
+    } else if (v.isApp()) [[unlikely]] {
+        forceAppValue(v, pos);
     } else if (v.isFailed()) {
         handleEvalFailed(v, pos);
+    } else if (traceActiveDepth && mayHaveMemoizedDeps(v)) [[unlikely]] {
+        replayMemoizedDeps(v);
     }
 }
 
@@ -160,5 +145,34 @@ inline CallDepth EvalState::addCallDepth(const PosIdx pos)
 
     return CallDepth(callDepth);
 };
+
+// Value::publication() is defined here (not in value.hh) because the nAttrs
+// case calls attrs()->publication(), which requires the complete Bindings type.
+// By the time eval-inline.hh is parsed, both Value (from value.hh) and
+// Bindings (from attr-set.hh) are complete — eval.hh includes attr-set.hh
+// at line 4 and value.hh at line 8, then tail-includes eval-inline.hh at the end.
+[[gnu::always_inline]]
+inline const SemanticHandle * Value::publication() const noexcept
+{
+    switch (type()) {
+    case nThunk:
+    case nFailed:
+    case nInt:
+    case nFloat:
+    case nBool:
+    case nNull:
+    case nFunction:
+    case nExternal:
+    case nList:
+        return nullptr;
+    case nString:
+        return contextStorage() ? contextStorage()->carriedPublication() : nullptr;
+    case nAttrs:
+        return attrs()->publication();
+    case nPath:
+        return getStorage<Path>().details->publication;
+    }
+    unreachable();
+}
 
 } // namespace nix

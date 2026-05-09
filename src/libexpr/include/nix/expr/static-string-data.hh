@@ -14,6 +14,10 @@ struct StringData::Static
     const size_t size = N - 1;
     char data[N];
 
+    // `data[N]` is fully written by `std::copy_n` below; zero-init
+    // would be redundant.  NOLINT silences
+    // cppcoreguidelines-pro-type-member-init's conservative view.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
     consteval Static(const char (&str)[N])
     {
         static_assert(N > 0);

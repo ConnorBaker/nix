@@ -1,6 +1,7 @@
 #pragma once
 ///@file
 
+#include "nix/expr/eval-trace/ids.hh"
 #include "nix/expr/nixexpr.hh"
 #include "nix/expr/symbol-table.hh"
 
@@ -15,7 +16,20 @@
 namespace nix {
 
 class EvalMemory;
+struct SemanticHandle;
 struct Value;
+
+/**
+ * Allocation policy for zero-capacity Bindings.
+ *
+ * Most empty attrsets should reuse Bindings::emptyBindings. Callers that need
+ * per-container identity, such as eval-trace provenance, must request a fresh
+ * empty Bindings object explicitly.
+ */
+enum class EmptyBindingsAllocation {
+    ReuseSharedEmpty,
+    AllocateFresh,
+};
 
 /**
  * Map one attribute name to its value.
@@ -87,14 +101,47 @@ private:
     size_type numAttrsInChain = 0;
 
     /**
-     * Length of the layers list.
+     * Length of the layers list (bits [0:30]) and a flag indicating whether
+     * any Attr in the layer chain has a TracedData PosIdx (bit 31).
+     * The TracedData bit enables O(1) rejection in shape dep functions
+     * (maybeRecordAttrKeysDep, etc.) — >99% of attrsets have no TracedData
+     * attrs and can skip the expensive full-attrset scan.
      */
-    uint32_t numLayers = 1;
+    uint32_t numLayers_ = 1;
+
+    static constexpr uint32_t tracedDataBit = uint32_t(1) << 31;
+    static constexpr uint32_t layerCountMask = ~tracedDataBit;
 
     /**
      * Bindings that this attrset is "layered" on top of.
      */
     const Bindings * baseLayer = nullptr;
+
+    /**
+     * Backing-local traced attrset identity stamp.
+     *
+     * Zero means "unset". Non-zero values round-trip through
+     * eval_trace::ValueIdentityStamp.
+     */
+    uint32_t valueIdentityStamp_ = 0;
+
+    /**
+     * Semantic publication handle for traced structured containers.
+     *
+     * Non-null when this attrset was produced by parsing a structured data
+     * source (JSON/TOML/readDir) and carries a StructuredObject provenance.
+     * GC-allocated alongside the Bindings; null for non-traced attrsets.
+     */
+    const SemanticHandle * publication_ = nullptr;
+
+    /// Private: only EvalState may set publication on Bindings.
+    /// This maintains the sealed provenance boundary — structured
+    /// provenance decisions are made at ExprTracedData::eval and
+    /// materialization time, not scattered across arbitrary code.
+    void setPublication(const SemanticHandle * pub) noexcept
+    {
+        publication_ = pub;
+    }
 
     /**
      * Flexible array member of attributes.
@@ -110,6 +157,7 @@ private:
     ~Bindings() = default;
 
     friend class BindingsBuilder;
+    friend class EvalState;
 
     /**
      * Maximum length of the Bindings layer chains.
@@ -345,6 +393,8 @@ public:
     {
         attrs[numAttrs++] = attr;
         numAttrsInChain = numAttrs;
+        if (attr.pos.isTracedData())
+            numLayers_ |= tracedDataBit;
     }
 
     /**
@@ -377,7 +427,7 @@ public:
      */
     bool isLayerListFull() const noexcept
     {
-        return numLayers == Bindings::maxLayers;
+        return (numLayers_ & layerCountMask) == Bindings::maxLayers;
     }
 
     /**
@@ -385,7 +435,51 @@ public:
      */
     bool isLayered() const noexcept
     {
-        return numLayers > 1;
+        return (numLayers_ & layerCountMask) > 1;
+    }
+
+    /**
+     * O(1) check: does THIS layer have any TracedData PosIdx?
+     */
+    bool hasTracedData() const noexcept
+    {
+        return numLayers_ & tracedDataBit;
+    }
+
+    /**
+     * Walk the layer chain checking each layer's flag (max 8 layers = O(1)).
+     */
+    bool hasAnyTracedDataLayer() const noexcept
+    {
+        const Bindings * layer = this;
+        while (layer) {
+            if (layer->hasTracedData())
+                return true;
+            layer = layer->baseLayer;
+        }
+        return false;
+    }
+
+    std::optional<ValueIdentityStamp> getValueIdentityStamp() const noexcept
+    {
+        if (!valueIdentityStamp_)
+            return std::nullopt;
+        return ValueIdentityStamp(valueIdentityStamp_);
+    }
+
+    void setValueIdentityStamp(ValueIdentityStamp stamp) noexcept
+    {
+        valueIdentityStamp_ = stamp.value;
+    }
+
+    void clearValueIdentityStamp() noexcept
+    {
+        valueIdentityStamp_ = 0;
+    }
+
+    const SemanticHandle * publication() const noexcept
+    {
+        return publication_;
     }
 
     const_iterator begin() const
@@ -543,7 +637,10 @@ public:
     void layerOnTopOf(const Bindings & base) noexcept
     {
         bindings->baseLayer = &base;
-        bindings->numLayers = base.numLayers + 1;
+        // Keep only our own tracedData flag — don't propagate from base.
+        // Use hasAnyTracedDataLayer() to check the full chain.
+        uint32_t ownFlag = bindings->numLayers_ & Bindings::tracedDataBit;
+        bindings->numLayers_ = ((base.numLayers_ & Bindings::layerCountMask) + 1) | ownFlag;
     }
 
     Value & alloc(Symbol name, PosIdx pos = noPos);

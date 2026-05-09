@@ -7,7 +7,7 @@ namespace nix {
 TEST(alignUp, value)
 {
     for (uint64_t i = 1; i <= 8; ++i)
-        EXPECT_EQ(alignUp(i, 8), 8);
+        EXPECT_EQ(alignUp(i, 8), 8u);
 }
 
 TEST(alignUp, notAPowerOf2)

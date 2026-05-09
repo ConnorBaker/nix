@@ -74,7 +74,7 @@ SQLite::SQLite(const std::filesystem::path & path, Settings && settings)
         shmFile += "-shm";
         AutoCloseFD fd = open(shmFile.string().c_str(), O_RDWR | O_CLOEXEC);
         if (fd) {
-            struct statfs fs;
+            struct statfs fs{};
             if (fstatfs(fd.get(), &fs))
                 throw SysError("statfs() on %s", PathFmt(shmFile));
             if (fs.f_type == /* ZFS_SUPER_MAGIC */ 801189825 && fdatasync(fd.get()) != 0)
@@ -93,6 +93,8 @@ SQLite::SQLite(const std::filesystem::path & path, Settings && settings)
     int flags = immutable ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE;
     if (settings.mode == SQLiteOpenMode::Normal)
         flags |= SQLITE_OPEN_CREATE;
+    if (settings.noMutex)
+        flags |= SQLITE_OPEN_NOMUTEX;
     auto uri = "file:" + percentEncode(path.string()) + "?immutable=" + (immutable ? "1" : "0");
     int ret = sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_URI | flags, vfs);
     if (ret != SQLITE_OK) {
@@ -250,18 +252,29 @@ bool SQLiteStmt::Use::isNull(int col)
     return sqlite3_column_type(stmt, col) == SQLITE_NULL;
 }
 
+std::pair<const void *, size_t> SQLiteStmt::Use::getBlob(int col)
+{
+    auto * data = sqlite3_column_blob(stmt, col);
+    auto len = sqlite3_column_bytes(stmt, col);
+    return {data, static_cast<size_t>(len)};
+}
+
 SQLiteTxn::SQLiteTxn(sqlite3 * db)
 {
     this->db = db;
-    if (sqlite3_exec(db, "begin;", 0, 0, 0) != SQLITE_OK)
-        SQLiteError::throw_(db, "starting transaction");
+    retrySQLite<void>([&]() {
+        if (sqlite3_exec(db, "begin;", 0, 0, 0) != SQLITE_OK)
+            SQLiteError::throw_(db, "starting transaction");
+    });
     active = true;
 }
 
 void SQLiteTxn::commit()
 {
-    if (sqlite3_exec(db, "commit;", 0, 0, 0) != SQLITE_OK)
-        SQLiteError::throw_(db, "committing transaction");
+    retrySQLite<void>([&]() {
+        if (sqlite3_exec(db, "commit;", 0, 0, 0) != SQLITE_OK)
+            SQLiteError::throw_(db, "committing transaction");
+    });
     active = false;
 }
 

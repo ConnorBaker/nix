@@ -40,7 +40,7 @@ auto retryOnBlock([[maybe_unused]] Descriptor fd, [[maybe_unused]] PollDirection
             return std::forward<F>(f)();
         } catch (SystemError & e) {
             if (e.is(std::errc::resource_unavailable_try_again) || e.is(std::errc::operation_would_block)) {
-                struct pollfd pfd;
+                struct pollfd pfd{};
                 pfd.fd = fd;
                 pfd.events = dir == PollDirection::In ? POLLIN : POLLOUT;
                 if (poll(&pfd, 1, -1) == -1)
@@ -149,6 +149,7 @@ void drainFD(Descriptor fd, Sink & sink, DrainFdSinkOpts opts)
 #endif
 
     size_t bytesRead = 0;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): bytes overwritten by read() before use
     std::array<std::byte, 64 * 1024> buf;
     while (1) {
         checkInterrupt();
@@ -203,6 +204,7 @@ std::string drainFD(Descriptor fd, DrainFdOpts opts)
 void copyFdRange(Descriptor fd, off_t offset, size_t nbytes, Sink & sink)
 {
     auto left = nbytes;
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init): bytes overwritten by readOffset() before use
     std::array<std::byte, 64 * 1024> buf;
 
     while (left) {
