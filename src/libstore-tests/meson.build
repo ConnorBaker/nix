@@ -67,6 +67,7 @@ sources = files(
   'filetransfer-request.cc',
   'filetransfer-retry.cc',
   'http-binary-cache-store.cc',
+  'invalidate-paths-checked.cc',
   'legacy-ssh-store.cc',
   'local-binary-cache-store.cc',
   'local-fs-store.cc',

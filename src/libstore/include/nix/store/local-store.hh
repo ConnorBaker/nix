@@ -8,10 +8,17 @@
 #include "nix/store/indirect-root-store.hh"
 #include "nix/util/sync.hh"
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <future>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <boost/unordered/unordered_flat_set.hpp>
+#include <boost/unordered/concurrent_flat_map.hpp>
+#include <boost/unordered/concurrent_flat_set.hpp>
 
 namespace nix {
 
@@ -27,8 +34,12 @@ const int nixSchemaVersion = 10;
 
 struct OptimiseStats
 {
-    unsigned long filesLinked = 0;
-    uint64_t bytesFreed = 0;
+    /* Cache-line-aligned so the two counters don't share a line with
+       each other or with surrounding state; under high worker counts,
+       `fetch_add` on a shared line is dominated by cache-coherence
+       traffic rather than the actual arithmetic. */
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> filesLinked{0};
+    alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> bytesFreed{0};
 };
 
 struct LocalSettings;
@@ -238,6 +249,99 @@ public:
 
     const std::filesystem::path dbDir;
     const std::filesystem::path linksDir;
+
+    /**
+     * Whether `linksDir` is organised as a sharded tree
+     * (`<linksDir>/<pfx>/<hash>[.<n>]`) vs. the legacy flat layout
+     * (`<linksDir>/<hash>`). Set at construction time from the
+     * `sharded-links` experimental feature. Both layouts are
+     * readable regardless of this flag; the flag only decides where
+     * newly-created canonical entries land and whether
+     * `optimisePath_` lazily migrates flat entries it encounters.
+     */
+    const bool shardedLinks;
+
+    /**
+     * Cap on the number of replica inodes we'll create for a single
+     * logical hash when the primary hits EMLINK. Each replica can
+     * hold ~65 000 hardlinks on ext4, so 100 replicas ≈ 6.5M
+     * hardlinks per hash — beyond any realistic workload. The
+     * value is 100 because the on-disk filename scheme uses a
+     * 2-digit zero-padded decimal suffix (`.00`..`.99`), and 100
+     * is the natural fill of that space.
+     */
+    static constexpr uint8_t maxLinkReplicas = 100;
+
+    /**
+     * Per-file hardlink ceiling for the filesystem hosting
+     * `linksDir`, queried once at construction via `pathconf(3)`
+     * with `_PC_LINK_MAX`.
+     *
+     * Used as an opportunistic pre-flight in the replica walk: when
+     * we `lstat` a candidate replica and observe `st_nlink >= linkMax`,
+     * we skip to the next replica without issuing a `link(2)` that we
+     * already know the kernel would reject with EMLINK. This is an
+     * optimisation, not a correctness requirement — the commit path
+     * handles EMLINK by advancing to the next replica regardless, so
+     * even a stale or conservative value is safe. That is why there
+     * is no margin: the kernel is the source of truth for the actual
+     * ceiling, so a racing writer that pushes us over between lstat
+     * and link(2) simply surfaces EMLINK and we advance.
+     *
+     * Typical values: ext4 = 65000, tmpfs = INT_MAX, XFS = 2^31-1.
+     * If `pathconf` is unavailable or returns `-1` we fall back to
+     * a conservative hardcoded 32000, which is safe everywhere.
+     */
+    int64_t linkMax;
+
+    /**
+     * Compute the path for a canonical `.links/` entry, given a hash
+     * and a replica index (0..maxLinkReplicas).
+     *
+     * Layout invariants:
+     *   * `shardedLinks == false` (legacy): returns
+     *     `<linksDir>/<hash>`. Only replica 0 is representable.
+     *   * `shardedLinks == true`: returns
+     *     `<linksDir>/<first-2-chars>/<hash>.<NN>`. Every entry in
+     *     a sharded directory MUST follow this pattern; corollary:
+     *     reading a filename in a sharded directory always yields a
+     *     replica index via `parseReplicaSuffix`.
+     */
+    std::filesystem::path linkPathFor(const Hash & hash, uint8_t replica = 0) const;
+
+    /**
+     * Legacy (flat) path for a hash, regardless of `shardedLinks`.
+     * Used by migration code that needs to probe for and rename
+     * pre-existing flat entries into the sharded layout.
+     */
+    std::filesystem::path legacyFlatLinkPathFor(const Hash & hash) const;
+
+    /**
+     * Given the basename of an entry in a sharded `.links/<pfx>/`
+     * directory, return the replica index. Returns `std::nullopt` if
+     * the name doesn't match the sharded invariant (e.g. a legacy
+     * flat entry picked up by a mixed-layout walk).
+     *
+     * Constant-time: examines only the final 3 characters for the
+     * `.<NN>` suffix.
+     */
+    std::optional<uint8_t> parseReplicaSuffix(std::string_view name) const;
+
+    /**
+     * Given a sharded `.links/` entry filename, return the base hash
+     * portion (everything before the `.<N>` replica suffix). If the
+     * name has no replica suffix, returns it unchanged.
+     */
+    std::string_view stripReplicaSuffix(std::string_view name) const;
+
+    /**
+     * Bulk one-shot migration of legacy flat `.links/<H>` entries
+     * into their sharded slots. Called from `optimiseStore` when the
+     * `sharded-links` experimental feature is enabled. Idempotent
+     * and race-tolerant.
+     */
+    void migrateLinksDirToSharded();
+
     const std::filesystem::path reservedPath;
     const std::filesystem::path schemaPath;
     const std::filesystem::path tempRootsDir;
@@ -318,9 +422,17 @@ private:
     Sync<AutoCloseFD> _fdGCLock;
 
     /**
-     * Connection to the garbage collector.
+     * Per-thread connections to the garbage collector. Each thread
+     * that calls `addTempRoot` under an active GC gets its own
+     * socket, so N workers send temp-root announcements in parallel
+     * instead of serialising on one shared `Sync<AutoCloseFD>`.
+     *
+     * Keyed by `std::thread::id`; entries persist for the thread's
+     * lifetime. `boost::concurrent_flat_map` provides lock-free
+     * lookup on the fast path (socket already open); contention
+     * only happens on first-time connect per thread.
      */
-    Sync<AutoCloseFD> _fdRootsSocket;
+    boost::concurrent_flat_map<std::thread::id, AutoCloseFD, std::hash<std::thread::id>> _fdRootsSockets;
 
 public:
 
@@ -365,6 +477,25 @@ public:
      *        garbage/unknown content found in the store directory
      */
     virtual void deleteStorePath(const std::filesystem::path & path, uint64_t & bytesFreed, bool isKnownPath);
+
+    /**
+     * Whether this store supports the two-phase GC deletion scheme
+     * (rename dead paths aside to `.gc-<pid>-<n>-<basename>` under
+     * the GC lock, then recursively delete them outside the hot
+     * path of the traversal).
+     *
+     * Plain `LocalStore` returns true. `LocalOverlayStore` returns
+     * false because the rename-aside would leave a "hole" in the
+     * upper layer that the lower layer would fill from — so a path
+     * present in both layers would appear to "come back to life"
+     * from the overlay view. Overlay-aware deletion has to go
+     * through the overridden `deleteStorePath` which knows how to
+     * create a whiteout instead.
+     */
+    virtual bool supportsTwoPhaseDelete() const
+    {
+        return true;
+    }
 
     /**
      * Optimise the disk space usage of the Nix store by hard-linking
@@ -435,6 +566,29 @@ public:
     void autoGC(bool sync = true);
 
     /**
+     * Delete a path from the Nix store.
+     *
+     * Fails with `PathInUse` if there are paths still referring to
+     * `path`; the caller is responsible for ensuring that isn't the
+     * case (usually by inspecting the referrer graph beforehand).
+     */
+    void invalidatePathChecked(const StorePath & path);
+
+    /**
+     * Batched variant of `invalidatePathChecked`. Runs the whole
+     * list through a single SQLite transaction, amortising the
+     * fsync cost of commit over many paths. In-batch referrers are
+     * tolerated (they'll be invalidated together); out-of-batch
+     * referrers raise `PathInUse` and roll the transaction back
+     * without affecting any path.
+     *
+     * Cache invalidation is deferred until after commit so a
+     * rollback leaves no stale negative entries in the in-memory
+     * path-info cache.
+     */
+    void invalidatePathsChecked(const std::vector<StorePath> & paths);
+
+    /**
      * Register the store path 'output' as the output named 'outputName' of
      * derivation 'deriver'.
      */
@@ -480,11 +634,6 @@ private:
 
     void invalidatePath(State & state, const StorePath & path);
 
-    /**
-     * Delete a path from the Nix store.
-     */
-    void invalidatePathChecked(const StorePath & path);
-
     std::shared_ptr<const ValidPathInfo> queryPathInfoInternal(State & state, const StorePath & path);
 
     void updatePathInfo(State & state, const ValidPathInfo & info);
@@ -497,16 +646,43 @@ private:
 
     std::pair<std::filesystem::path, AutoCloseFD> createTempDirInStore();
 
-    typedef boost::unordered_flat_set<ino_t> InodeHash;
+    /* A set of inodes already present in ‘.links/’. Used as a fast
+       skip check for files that are already deduplicated. The
+       concurrent container allows lock-free reads/writes from
+       multiple optimise worker threads. */
+    using InodeHash = boost::concurrent_flat_set<ino_t>;
 
-    InodeHash loadInodeHash();
-    Strings readDirectoryIgnoringInodes(const std::filesystem::path & path, const InodeHash & inodeHash);
+    void loadInodeHashInto(InodeHash & inodeHash);
+    std::vector<std::string>
+    readDirectoryIgnoringInodes(const std::filesystem::path & path, const InodeHash & inodeHash);
+
+    /* Lazy per-directory writability guard used by `optimisePath_` to
+       batch the chmod(+w) / canonicalise(-w) dance across all files
+       in a directory that need replacement. Declared here (rather
+       than as a file-local struct in `optimise-store.cc`) so the
+       pointer can appear in `optimisePath_`'s signature for
+       recursion. */
+    struct DirWritability
+    {
+        std::filesystem::path dir;
+        bool needsCanonicalise = false;
+        bool isStoreRoot;
+
+        DirWritability(std::filesystem::path dir, const std::filesystem::path & storeRoot);
+        void ensureWritable();
+        ~DirWritability();
+
+        DirWritability(const DirWritability &) = delete;
+        DirWritability & operator=(const DirWritability &) = delete;
+    };
+
     void optimisePath_(
         Activity * act,
         OptimiseStats & stats,
         const std::filesystem::path & path,
         InodeHash & inodeHash,
-        RepairFlag repair);
+        RepairFlag repair,
+        DirWritability * parentDirWritability = nullptr);
 
     // Internal versions that are not wrapped in retry_sqlite.
     bool isValidPath_(State & state, const StorePath & path);

@@ -9,15 +9,20 @@
 #include "nix/util/unix-domain-socket.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/serialise.hh"
+#include "nix/util/thread-pool.hh"
 #include "nix/util/util.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/topo-sort.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
+#include "nix/store/sqlite.hh"
 
 #include "store-config-private.hh"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <boost/regex.hpp>
+#include <algorithm>
+#include <atomic>
 #include <queue>
 #include <thread>
 #include <errno.h>
@@ -77,6 +82,23 @@ void LocalStore::createTempRootsFile()
     }
 }
 
+/* Register `path` as a temporary GC root for the current process.
+ *
+ * Fast path (no GC running): take a shared read lock on the global
+ * GC lock file and append to our per-process temproots file. Cheap,
+ * contention-free across callers.
+ *
+ * Slow path (GC running): send the path over a Unix-domain socket to
+ * the GC server thread, which acknowledges with a single byte. To
+ * keep this slow path from becoming a scalability bottleneck when N
+ * worker threads of a parallel operation (e.g. `optimiseStore`) all
+ * call `addTempRoot` under an active GC, each thread keeps its own
+ * gc-socket connection in `_fdRootsSockets` (keyed by
+ * `std::thread::id`). Without this, the previous shared-socket
+ * design — one `Sync<AutoCloseFD>` — serialised all workers across
+ * blocking writev+read round-trips to the GC server. Measured
+ * impact at 16 workers: ~135× speedup on the concurrent
+ * optimise+GC benchmark (see `src/libstore-tests/optimise-bench.cc`). */
 void LocalStore::addTempRoot(const StorePath & path)
 {
     if (config->readOnly) {
@@ -94,57 +116,98 @@ void LocalStore::addTempRoot(const StorePath & path)
             *fdGCLock = openGCLock();
     }
 
-restart:
-    /* Try to acquire a shared global GC lock (non-blocking). This
-       only succeeds if the garbage collector is not currently
-       running. */
-    FdLock gcLock(_fdGCLock.lock()->get(), ltRead, false, "");
+    /* Reconnect / retry loop. On `goto restart`-equivalent we
+       drop any stale socket for this thread and try again after a
+       small backoff if appropriate. */
+    while (true) {
+        checkInterrupt();
 
-    if (!gcLock.acquired) {
-        /* We couldn't get a shared global GC lock, so the garbage
-           collector is running. So we have to connect to the garbage
-           collector and inform it about our root. */
-        auto fdRootsSocket(_fdRootsSocket.lock());
+        /* Try to acquire a shared global GC lock (non-blocking). This
+           only succeeds if the garbage collector is not currently
+           running. */
+        FdLock gcLock(_fdGCLock.lock()->get(), ltRead, false, "");
 
-        if (!*fdRootsSocket) {
-            auto socketPath = config->stateDir.get() / gcSocketPath;
-            debug("connecting to '%s'", PathFmt(socketPath));
-            *fdRootsSocket = createUnixDomainSocket();
-            try {
-                nix::connect(toSocket(fdRootsSocket->get()), socketPath);
-            } catch (SystemError & e) {
-                /* The garbage collector may have exited or not
-                   created the socket yet, so we need to restart. */
-                if (e.is(std::errc::connection_refused) || e.is(std::errc::no_such_file_or_directory)) {
-                    debug("GC socket connection refused: %s", e.msg());
-                    fdRootsSocket->close();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    goto restart;
+        if (gcLock.acquired)
+            break; /* No GC running; fall through to local temproots write. */
+
+        /* GC is running. Send our new temp root over this thread's
+           own gc-socket so N workers don't serialise on a shared
+           connection. Get-or-connect: each thread owns its entry
+           in `_fdRootsSockets` and mutates only that slot. */
+        auto tid = std::this_thread::get_id();
+        Descriptor sockFd = INVALID_DESCRIPTOR;
+        bool connectFailed = false;
+
+        _fdRootsSockets.try_emplace_and_visit(
+            tid,
+            /*initial value if emplaced:*/ AutoCloseFD{},
+            /*visitor on emplace:*/
+            [&](auto & kv) {
+                auto socketPath = config->stateDir.get() / gcSocketPath;
+                debug("connecting to '%s'", PathFmt(socketPath));
+                kv.second = createUnixDomainSocket();
+                try {
+                    nix::connect(toSocket(kv.second.get()), socketPath);
+                    sockFd = kv.second.get();
+                } catch (SystemError & e) {
+                    if (e.is(std::errc::connection_refused) || e.is(std::errc::no_such_file_or_directory)) {
+                        debug("GC socket connection refused: %s", e.msg());
+                        kv.second.close();
+                        connectFailed = true;
+                    } else {
+                        throw;
+                    }
                 }
-                throw;
-            }
+            },
+            /*visitor on existing entry:*/
+            [&](auto & kv) {
+                if (!kv.second) {
+                    /* Previously closed (e.g. prior disconnect). Reopen. */
+                    auto socketPath = config->stateDir.get() / gcSocketPath;
+                    debug("reconnecting to '%s'", PathFmt(socketPath));
+                    kv.second = createUnixDomainSocket();
+                    try {
+                        nix::connect(toSocket(kv.second.get()), socketPath);
+                        sockFd = kv.second.get();
+                    } catch (SystemError & e) {
+                        if (e.is(std::errc::connection_refused) || e.is(std::errc::no_such_file_or_directory)) {
+                            kv.second.close();
+                            connectFailed = true;
+                        } else {
+                            throw;
+                        }
+                    }
+                } else {
+                    sockFd = kv.second.get();
+                }
+            });
+
+        if (connectFailed) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue; /* restart */
         }
 
+        /* Send the path and await a single-byte ack. On disconnect,
+           drop this thread's fd and retry from the top. */
         try {
             debug("sending GC root '%s'", printStorePath(path));
-            writeFull(fdRootsSocket->get(), printStorePath(path) + "\n", false);
+            writeFull(sockFd, printStorePath(path) + "\n", false);
             char c;
-            readFull(fdRootsSocket->get(), &c, 1);
+            readFull(sockFd, &c, 1);
             assert(c == '1');
             debug("got ack for GC root '%s'", printStorePath(path));
+            break; /* success */
         } catch (SystemError & e) {
-            /* The garbage collector may have exited, so we need to
-               restart. */
             if (e.is(std::errc::broken_pipe) || e.is(std::errc::connection_reset)) {
                 debug("GC socket disconnected");
-                fdRootsSocket->close();
-                goto restart;
+                _fdRootsSockets.visit(tid, [](auto & kv) { kv.second.close(); });
+                continue;
             }
             throw;
         } catch (EndOfFile & e) {
             debug("GC socket disconnected");
-            fdRootsSocket->close();
-            goto restart;
+            _fdRootsSockets.visit(tid, [](auto & kv) { kv.second.close(); });
+            continue;
         }
     }
 
@@ -535,8 +598,339 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     if (auto p = getEnv("_NIX_TEST_GC_SYNC_2"))
         readFile(*p);
 
+    /* Two-phase deletion state.
+
+       Phase 1 (during the traversal, still under `fdGCLock`) renames
+       every dead path to `.gc-<pid>-<counter>-<basename>` under the
+       store dir. The rename is journaled atomically on
+       ext4/XFS/btrfs, so on crash or SIGINT the live namespace is
+       always consistent: the path is either present or gone, never
+       half-deleted. `.gc-` prefix guarantees `maybeParseStorePath`
+       rejects the name (the leading `.` is not in the base-32
+       hash alphabet), so no existing code can misinterpret an
+       orphan as a live path.
+
+       Phase 2 (later in this function, still under `fdGCLock` — a
+       future refinement may release the lock first) recursively
+       removes the renamed-aside orphans in parallel via the
+       thread pool.
+
+       PID reuse safety: the counter is seeded from
+       `phase2DeleteQueue.size()`, which starts at whatever the
+       start-of-run sweep picked up. If an old daemon with the same
+       pid crashed leaving M orphans `.gc-<pid>-0..M-1-*`, the new
+       daemon's sweep enqueues all M, so its first rename starts at
+       counter M — no collision. */
+    std::vector<std::filesystem::path> phase2DeleteQueue;
+    std::string gcOrphanPrefix = fmt(".gc-%d-", getpid());
+
+    /* Start-of-run sweep for orphaned rename-aside entries from a
+       prior GC that crashed between phase 1 (rename) and phase 2
+       (recursive delete). Any `.gc-*` entry in the store dir has
+       an already-invalidated DB row (phase 1 invalidates before
+       renaming), so it's pure filesystem work. Enqueue them into
+       the phase-2 queue so they get deleted alongside the current
+       run's orphans, in parallel.
+
+       Only runs when we're actually going to delete — `gcReturnLive`
+       and `gcReturnDead` both short-circuit before phase 2, so
+       queueing orphans in those modes would silently drop them.
+       Also skip for stores that don't use the two-phase scheme in
+       the first place; they never create `.gc-*` entries. */
+    if (shouldDelete && supportsTwoPhaseDelete()) {
+        AutoCloseDir dir(opendir(config->realStoreDir.get().string().c_str()));
+        if (!dir)
+            throw SysError("opening directory %1%", PathFmt(config->realStoreDir.get()));
+        struct dirent * dirent;
+        size_t reaped = 0;
+        while (errno = 0, dirent = readdir(dir.get())) {
+            checkInterrupt();
+            const char * name = dirent->d_name;
+            if (std::string_view(name).starts_with(".gc-")) {
+                phase2DeleteQueue.push_back(config->realStoreDir.get() / name);
+                ++reaped;
+            }
+        }
+        if (errno)
+            throw SysError("reading directory %1%", PathFmt(config->realStoreDir.get()));
+        if (reaped)
+            printInfo("reaping %d orphans from a previous interrupted GC", reaped);
+    }
+
+    /* Bulk-loaded snapshot of the ValidPaths and Refs tables, taken
+       once while holding `_state`, used for lock-free lookups during
+       the traversal. Replaces millions of per-path SQLite queries
+       (`queryGCReferrers`, `isValidPath`, `topoSortPaths` via
+       `queryPathInfo`) with in-memory hash lookups on identity-hashed
+       int64 ids.
+
+       Consistency is guaranteed because:
+       - We hold the file-based `fdGCLock` exclusively, so no other
+         Nix process can mutate the DB.
+       - Our own process mutates the DB only via `invalidatePathsChecked`
+         in this function, which only removes paths we've already
+         decided are dead (their rows can't be referenced by the
+         traversal any more).
+
+       Memory on a 4M-path / 32M-edge store is ~1.3 GB resident
+       end-to-end:
+         ~500 MB: two path<->id hashmaps (each ~80 B/entry
+                  including the `StorePath` heap string)
+         ~500 MB: two referrer/reference edge-list maps
+         ~150 MB: `deriverById` + `outputsByDrvId` +
+                  `deriversByOutputId` (most paths have a deriver,
+                  DerivationOutputs mirrored in two directions)
+         ~30 MB:  narSizeById
+       Plus ~200 MB transient during scan for the `pendingDerivers`
+       string vector. Amortised against millions of SQLite
+       statement executions and the `_state`-mutex serialisation
+       they imposed. */
+    struct GCRefsSnapshot
+    {
+        /* id -> path, used to materialise `StorePath`s for the traversal
+           boundary (roots lookup, tempRoots lookup, error messages,
+           enqueue, invalidatePathsChecked, deleteFromStore). */
+        boost::unordered_flat_map<int64_t, StorePath> idToPath;
+
+        /* path -> id, used to resolve incoming `StorePath`s (outer
+           walk, `queryPartialDerivationOutputMap`, `queryValidDerivers`)
+           into id space. */
+        boost::unordered_flat_map<StorePath, int64_t> pathToId;
+
+        /* Forward edges (referrer id -> reference ids). Used by the
+           topo-sort pass to linearise the deletion set in refs-first
+           order, and by `markAliveClosure` to walk a live path's
+           forward closure without hitting SQLite. */
+        boost::unordered_flat_map<int64_t, std::vector<int64_t>> referencesById;
+
+        /* Reverse edges (reference id -> referrer ids). Drives the
+           main traversal — replaces `queryGCReferrers`. */
+        boost::unordered_flat_map<int64_t, std::vector<int64_t>> referrersById;
+
+        /* id -> NAR size. Read from `ValidPaths.narSize` for bytes-
+           freed accounting at rename time (two-phase delete can't
+           measure actual FS bytes freed, since the recursive delete
+           runs after the rename and outside the GC lock, so we
+           estimate from narSize which is typically very close). */
+        boost::unordered_flat_map<int64_t, uint64_t> narSizeById;
+
+        /* id -> deriver id (only when the deriver itself is a live
+           ValidPaths entry). Mirrors the
+           `info->deriver && isValidPath(*info->deriver)` filter in
+           the old `computeFSClosure` forward walk. Consulted by
+           `markAliveClosure` when `keepDerivations` is set. */
+        boost::unordered_flat_map<int64_t, int64_t> deriverById;
+
+        /* drv id -> output path ids (pre-filtered to those that are
+           also live ValidPaths entries). Mirrors the
+           `queryPartialDerivationOutputMap + isValidPath` pair in
+           the old `computeFSClosure` forward walk. Consulted by
+           `markAliveClosure` when `keepOutputs` is set. Only
+           populated from `DerivationOutputs`; realisations-resolved
+           outputs (ca-derivations) require reading `.drv` files and
+           are not precomputed here — that case falls back to the
+           SQLite path. */
+        boost::unordered_flat_map<int64_t, std::vector<int64_t>> outputsByDrvId;
+
+        /* output path id -> drv path ids (the reverse of
+           `outputsByDrvId`). Replaces `queryValidDerivers` during
+           the main traversal: given a live output path, pull its
+           derivation(s) alive when `keep-outputs` is set. */
+        boost::unordered_flat_map<int64_t, std::vector<int64_t>> deriversByOutputId;
+    };
+
+    GCRefsSnapshot snapshot;
+    {
+        printInfo("loading valid paths and references...");
+        auto state(_state->lock());
+        /* Collect (referencing-id, deriver-string) pairs during the
+           ValidPaths scan; resolve them against `pathToId` in a
+           post-pass, since the deriver's own id may be interleaved
+           with the row that names it. */
+        std::vector<std::pair<int64_t, std::string>> pendingDerivers;
+        {
+            SQLiteStmt stmt(state->db,
+                "select id, path, narSize, deriver from ValidPaths");
+            auto use(stmt.use());
+            while (use.next()) {
+                checkInterrupt();
+                auto id = use.getInt(0);
+                auto path = parseStorePath(use.getStr(1));
+                auto narSize = static_cast<uint64_t>(use.getInt(2));
+                snapshot.narSizeById.emplace(id, narSize);
+                if (!use.isNull(3))
+                    pendingDerivers.emplace_back(id, use.getStr(3));
+                snapshot.pathToId.emplace(path, id);
+                snapshot.idToPath.emplace(id, std::move(path));
+            }
+        }
+        for (auto & [childId, deriverStr] : pendingDerivers) {
+            checkInterrupt();
+            try {
+                auto deriverPath = parseStorePath(deriverStr);
+                if (auto dIt = snapshot.pathToId.find(deriverPath);
+                    dIt != snapshot.pathToId.end())
+                    snapshot.deriverById.emplace(childId, dIt->second);
+            } catch (BadStorePath &) {
+                /* A malformed deriver string in the DB is a
+                   pre-existing data-corruption condition. The old
+                   `computeFSClosure` path would have surfaced this
+                   as an uncaught `BadStorePath` crashing the whole
+                   GC (its outer catch only matched `InvalidPath`).
+                   We tolerate it here because crashing GC on a
+                   data-integrity problem is user-hostile and the
+                   only consequence is that this particular edge is
+                   missed — the closure walk is still correct for
+                   every well-formed row. */
+            }
+        }
+        {
+            SQLiteStmt stmt(state->db, "select referrer, reference from Refs");
+            auto use(stmt.use());
+            while (use.next()) {
+                checkInterrupt();
+                auto referrer = use.getInt(0);
+                auto reference = use.getInt(1);
+                snapshot.referencesById[referrer].push_back(reference);
+                snapshot.referrersById[reference].push_back(referrer);
+            }
+        }
+        {
+            SQLiteStmt stmt(state->db, "select drv, path from DerivationOutputs");
+            auto use(stmt.use());
+            while (use.next()) {
+                checkInterrupt();
+                auto drvId = use.getInt(0);
+                try {
+                    auto outputPath = parseStorePath(use.getStr(1));
+                    if (auto pIt = snapshot.pathToId.find(outputPath);
+                        pIt != snapshot.pathToId.end()) {
+                        auto outId = pIt->second;
+                        snapshot.outputsByDrvId[drvId].push_back(outId);
+                        snapshot.deriversByOutputId[outId].push_back(drvId);
+                    }
+                } catch (BadStorePath &) {
+                    /* Same tolerance as for deriver strings: the
+                       old path would have crashed GC with an
+                       uncaught `BadStorePath`; we drop the edge
+                       instead. */
+                }
+            }
+        }
+    }
+    debug(
+        "loaded %d valid paths with %d ref edges, %d derivers, %d drv-output rows",
+        snapshot.pathToId.size(),
+        snapshot.referrersById.size(),
+        snapshot.deriverById.size(),
+        snapshot.outputsByDrvId.size());
+
+    /* Whether we can compute derivation-/output-related edges
+       purely in-memory using the snapshot, or whether we need to
+       fall back to the virtual SQLite-backed queries.
+
+       Two reasons to fall back:
+       - `ca-derivations`: `queryPartialDerivationOutputMap` on a
+         ca-derivations store resolves outputs through
+         `Realisations` + `.drv` reads, which we can't amortise via
+         bulk load (realisations are keyed on output-hash, not
+         drv-id). Running `markAlive`'s forward closure from the
+         snapshot alone would miss realisation-resolved outputs.
+       - `LocalOverlayStore`: `queryValidDerivers` is overridden to
+         union upper + lower, and our snapshot is upper-only. Using
+         the snapshot would silently drop lower-store derivers. The
+         same concern doesn't apply to `LocalStore::queryValidDerivers`
+         which is upper-only by construction, so plain `LocalStore`
+         stays on the fast path. */
+    const bool drvClosureFromSnapshot =
+        !experimentalFeatureSettings.isEnabled(Xp::CaDerivations)
+        && supportsTwoPhaseDelete(); /* serves as a "plain LocalStore" proxy */
+
+    /* Whether we can rename dead paths aside and batch-delete them
+       later. False for stores (e.g. `LocalOverlayStore`) where a
+       plain rename within the store dir has different semantics
+       than a full delete — on overlay, renaming a dual-layer path
+       within the upper would reveal the lower copy. Those stores
+       fall back to synchronous `deleteStorePath` per dead path. */
+    const bool twoPhase = supportsTwoPhaseDelete();
+
+    /* Rename a dead store path aside into the phase-2 delete queue,
+       or (for non-two-phase stores) delete it synchronously.
+       Accounts for bytes-to-be-freed using `narSize` from the
+       snapshot (best available estimate — actual FS bytes freed may
+       differ slightly when the path shares inodes via `.links/`).
+       Throws `GCLimitReached` if the estimate crosses `maxFreed`,
+       preserving the pre-two-phase termination semantics. */
+    auto scheduleDelete = [&](const std::filesystem::path & realPath) {
+        auto baseName = realPath.filename().string();
+        auto logicalPath = storeDir + "/" + baseName;
+
+        /* Accounting is based on snapshot narSize whether we rename
+           aside or delete inline. For the two-phase path we must
+           estimate (the real total isn't known until phase 2, after
+           the GCLimitReached decision). For the inline path we
+           *could* use the real subtree total but deliberately
+           don't, so both paths agree on the meaning of
+           `results.bytesFreed`. Under-counting from the `nlink<=2`
+           filter in `_deletePath` would otherwise make overlay
+           stores report smaller byte totals than two-phase stores
+           for identical workloads. */
+        uint64_t estimated = 0;
+        if (auto storePath = maybeParseStorePath(logicalPath))
+            if (auto idIt = snapshot.pathToId.find(*storePath); idIt != snapshot.pathToId.end())
+                if (auto nIt = snapshot.narSizeById.find(idIt->second); nIt != snapshot.narSizeById.end())
+                    estimated = nIt->second;
+
+        if (twoPhase) {
+            auto orphanName =
+                fmt("%s%d-%s",
+                    gcOrphanPrefix,
+                    phase2DeleteQueue.size(),
+                    baseName);
+            auto orphanPath = config->realStoreDir.get() / orphanName;
+
+            std::error_code ec;
+            std::filesystem::rename(realPath, orphanPath, ec);
+            if (ec) {
+                if (ec == std::errc::no_such_file_or_directory)
+                    return; /* concurrent delete or already-gone */
+                throw SystemError(ec, "renaming %1% to %2%", PathFmt(realPath), PathFmt(orphanPath));
+            }
+            phase2DeleteQueue.push_back(orphanPath);
+        } else {
+            /* Store can't safely two-phase; delete synchronously
+               through the virtual path so overlay-aware logic
+               (whiteouts, remount-required flag) runs. We discard
+               the `deleteStorePath`-reported byte total and use the
+               snapshot estimate for `results.bytesFreed` below, to
+               keep accounting consistent with the two-phase branch. */
+            printInfo("deleting '%1%'", logicalPath);
+            uint64_t discardedBytes = 0;
+            try {
+                deleteStorePath(realPath, discardedBytes, /*isKnownPath=*/true);
+            } catch (SysError & e) {
+                if (e.errNo == ENOENT)
+                    return;
+                throw;
+            }
+        }
+
+        results.paths.insert(logicalPath);
+        results.bytesFreed += estimated;
+
+        if (results.bytesFreed > options.maxFreed) {
+            printInfo("freed more than %d bytes for deletion; stopping", options.maxFreed);
+            throw GCLimitReached();
+        }
+    };
+
     /* Helper function that deletes a path from the store and throws
-       GCLimitReached if we've deleted enough garbage. */
+       GCLimitReached if we've deleted enough garbage.
+
+       Used for small-volume, non-batched deletions: orphan FS
+       content found in the store directory (tmp-*, unparseable
+       names, previously-leaked chroot dirs). Batched dead-path
+       deletion goes through `scheduleDelete` above. */
     auto deleteFromStore = [&](std::string_view baseName, bool isKnownPath) {
         assert(!std::filesystem::path(baseName).is_absolute());
         /* Using `std::string` since this is the logical store dir. Hopefully that is the right choice. */
@@ -570,14 +964,18 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         }
     };
 
-    boost::unordered_flat_map<StorePath, StorePathSet, std::hash<StorePath>> referrersCache;
-
     /* Helper function that visits all paths reachable from `start`
        via the referrers edges and optionally derivers and derivation
        output edges. If none of those paths are roots, then all
        visited paths are garbage and are deleted. */
     auto maybeDeleteReferrersClosure = [&](const StorePath & start) {
-        StorePathSet visited;
+        /* Hot-loop sets are int64_t-keyed (identity-hashed) to keep
+           the traversal's per-step cost cache-line-tight. Orphan
+           paths (not in the snapshot because they're rogue FS
+           content rather than DB-registered paths) are tracked in a
+           parallel StorePathSet because they have no id. */
+        boost::unordered_flat_set<int64_t> visitedIds;
+        StorePathSet visitedOrphans;
         std::queue<StorePath> todo;
 
         /* Wake up any GC client waiting for deletion of the paths in
@@ -589,8 +987,18 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         });
 
         auto enqueue = [&](const StorePath & path) {
-            if (visited.insert(path).second)
-                todo.push(path);
+            if (auto idIt = snapshot.pathToId.find(path); idIt != snapshot.pathToId.end()) {
+                if (visitedIds.insert(idIt->second).second)
+                    todo.push(path);
+            } else {
+                if (visitedOrphans.insert(path).second)
+                    todo.push(path);
+            }
+        };
+
+        auto enqueueById = [&](int64_t id) {
+            if (visitedIds.insert(id).second)
+                todo.push(snapshot.idToPath.at(id));
         };
 
         enqueue(start);
@@ -614,19 +1022,83 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             auto markAlive = [&]() {
                 alive.insert(*path);
                 alive.insert(start);
+
+                /* Only include outputs/derivers in the forward
+                   closure for `WholeStore` — `SpecificPaths` runs
+                   never recurse into kept outputs/derivers (matches
+                   the main-traversal gating below). */
+                bool includeOutputs = false;
+                bool includeDerivers = false;
+                std::visit(
+                    overloaded{
+                        [&](const GCOptions::WholeStore &) {
+                            includeOutputs = gcSettings.keepOutputs;
+                            includeDerivers = gcSettings.keepDerivations;
+                        },
+                        [](const GCOptions::SpecificPaths &) {},
+                    },
+                    options.pathsToDelete);
+
+                /* Fast path: traverse the forward closure in memory
+                   against the snapshot's precomputed edges, avoiding
+                   the 2-to-4 SQLite statements per visited path that
+                   `computeFSClosure` would otherwise issue. Only used
+                   when `ca-derivations` is off — see
+                   `drvClosureFromSnapshot` above for the rationale. */
+                if (drvClosureFromSnapshot) {
+                    auto startIdIt = snapshot.pathToId.find(*path);
+                    if (startIdIt == snapshot.pathToId.end())
+                        return; /* orphan / not in ValidPaths */
+
+                    boost::unordered_flat_set<int64_t> closureIds;
+                    std::queue<int64_t> closureTodo;
+                    closureIds.insert(startIdIt->second);
+                    closureTodo.push(startIdIt->second);
+
+                    while (auto idOpt = pop(closureTodo)) {
+                        checkInterrupt();
+                        auto id = *idOpt;
+                        alive.insert(snapshot.idToPath.at(id));
+
+                        /* Forward refs (path depends on these). */
+                        if (auto rIt = snapshot.referencesById.find(id);
+                            rIt != snapshot.referencesById.end())
+                            for (auto refId : rIt->second)
+                                if (refId != id && closureIds.insert(refId).second)
+                                    closureTodo.push(refId);
+
+                        /* keep-outputs: a live derivation keeps its
+                           statically-registered outputs alive too.
+                           Only derivations have entries in
+                           `outputsByDrvId`, but we check the name
+                           first to skip the hashmap lookup on the
+                           overwhelming majority of paths. */
+                        if (includeOutputs && snapshot.idToPath.at(id).isDerivation()) {
+                            if (auto oIt = snapshot.outputsByDrvId.find(id);
+                                oIt != snapshot.outputsByDrvId.end())
+                                for (auto outId : oIt->second)
+                                    if (closureIds.insert(outId).second)
+                                        closureTodo.push(outId);
+                        }
+
+                        /* keep-derivations: a live output keeps its
+                           deriver alive (only when the deriver is
+                           itself a live ValidPaths row). */
+                        if (includeDerivers) {
+                            if (auto dIt = snapshot.deriverById.find(id);
+                                dIt != snapshot.deriverById.end())
+                                if (closureIds.insert(dIt->second).second)
+                                    closureTodo.push(dIt->second);
+                        }
+                    }
+                    return;
+                }
+
+                /* ca-derivations fallback: the realisation-resolved
+                   outputs can't be derived from the snapshot, so use
+                   the SQLite-backed closure walk. */
                 try {
                     StorePathSet closure;
-                    bool includeOutputs = false;
-                    bool includeDerivers = false;
-                    std::visit(
-                        overloaded{
-                            [&](const GCOptions::WholeStore &) {
-                                includeOutputs = gcSettings.keepOutputs;
-                                includeDerivers = gcSettings.keepDerivations;
-                            },
-                            [](const GCOptions::SpecificPaths &) {},
-                        },
-                        options.pathsToDelete);
                     computeFSClosure(
                         *path,
                         closure,
@@ -672,36 +1144,65 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 shared->pending = hashPart;
             }
 
-            if (isValidPath(*path)) {
+            /* Resolve to the snapshot id once; all subsequent
+               per-path lookups use it. An absent id means the path
+               isn't in `ValidPaths` — i.e. it's orphan FS content
+               (the outer store-dir walk may pass us such paths). */
+            if (auto idIt = snapshot.pathToId.find(*path); idIt != snapshot.pathToId.end()) {
+                auto id = idIt->second;
 
-                /* Visit the referrers of this path. */
-                auto i = referrersCache.find(*path);
-                if (i == referrersCache.end()) {
-                    StorePathSet referrers;
-                    queryGCReferrers(*path, referrers);
-                    referrersCache.emplace(*path, std::move(referrers));
-                    i = referrersCache.find(*path);
-                }
-                for (auto & p : i->second)
-                    enqueue(p);
+                /* Visit the referrers of this path. Use the id-keyed
+                   `enqueueById` to skip the path-hash lookup in the
+                   inner loop. */
+                if (auto refIt = snapshot.referrersById.find(id); refIt != snapshot.referrersById.end())
+                    for (auto referrerId : refIt->second)
+                        enqueueById(referrerId);
 
                 std::visit(
                     overloaded{
                         [&](const GCOptions::WholeStore &) {
-                            /* If keep-derivations is set and this is a derivation, then we only want to delete this
-                             * derivation if we can also delete all its outputs, so visit the derivation outputs. */
-                            if (gcSettings.keepDerivations && path->isDerivation())
-                                for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(*path))
-                                    if (maybeOutPath && isValidPath(*maybeOutPath)
-                                        && queryPathInfo(*maybeOutPath)->deriver == path)
-                                        enqueue(*maybeOutPath);
+                            /* keepDerivations: a live derivation pulls its
+                               statically-registered outputs into the traversal.
+                               Preserves the pre-patch filter that the output
+                               must have been registered under *this* derivation
+                               (`info->deriver == *path` in the old code), which
+                               maps to `snapshot.deriverById[outId] == id`. The
+                               ca-derivations realisation path isn't precomputed
+                               in the snapshot — for those stores, fall through
+                               to the SQLite path. */
+                            if (gcSettings.keepDerivations && path->isDerivation()) {
+                                if (drvClosureFromSnapshot) {
+                                    if (auto oIt = snapshot.outputsByDrvId.find(id);
+                                        oIt != snapshot.outputsByDrvId.end())
+                                        for (auto outId : oIt->second)
+                                            if (auto dIt = snapshot.deriverById.find(outId);
+                                                dIt != snapshot.deriverById.end() && dIt->second == id)
+                                                enqueueById(outId);
+                                } else {
+                                    for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(*path))
+                                        if (maybeOutPath && isValidPath(*maybeOutPath)
+                                            && queryPathInfo(*maybeOutPath)->deriver == *path)
+                                            enqueue(*maybeOutPath);
+                                }
+                            }
 
-                            /* If keep-outputs is set, we only want to delete this path if we
-                             * can also delete its derivers, so visit the derivers. */
+                            /* keepOutputs: a live output pulls its derivation
+                               into the traversal. Uses the reverse of
+                               `outputsByDrvId` to skip `queryValidDerivers` on
+                               plain `LocalStore`; on overlay stores (which
+                               union upper+lower derivers) fall back to the
+                               virtual query to preserve the lower-store
+                               contribution. */
                             if (gcSettings.keepOutputs) {
-                                auto derivers = queryValidDerivers(*path);
-                                for (auto & i : derivers)
-                                    enqueue(i);
+                                if (drvClosureFromSnapshot) {
+                                    if (auto dIt = snapshot.deriversByOutputId.find(id);
+                                        dIt != snapshot.deriversByOutputId.end())
+                                        for (auto drvId : dIt->second)
+                                            enqueueById(drvId);
+                                } else {
+                                    for (auto & i : queryValidDerivers(*path))
+                                        enqueue(i);
+                                }
                             }
                         },
                         [](const GCOptions::SpecificPaths &) {},
@@ -709,18 +1210,82 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     options.pathsToDelete);
             }
         }
-        for (auto & path : topoSortPaths(visited)) {
+        /* Collect the set we will actually delete, topologically
+           sorted so refs are dropped before the things they reference.
+           `dead.insert` has side effects (marks as processed), so we
+           must iterate the sorted order even for non-deleting modes.
+
+           Sort directly on the snapshot's id-keyed forward-edge map,
+           avoiding the `queryPathInfo` SQLite round-trip that the
+           generic `topoSortPaths` would do per visited path.
+           Orphans have no ids and no references; they can be appended
+           in any order since they have no dependency edges. */
+        std::set<int64_t> visitedIdsSorted(visitedIds.begin(), visitedIds.end());
+        auto sortedVariant = topoSort(visitedIdsSorted, [&](int64_t id) -> std::set<int64_t> {
+            std::set<int64_t> refs;
+            if (auto rIt = snapshot.referencesById.find(id); rIt != snapshot.referencesById.end())
+                for (auto refId : rIt->second)
+                    refs.insert(refId);
+            return refs;
+        });
+        auto * sortedIds = std::get_if<std::vector<int64_t>>(&sortedVariant);
+        if (!sortedIds) {
+            auto & cycle = std::get<Cycle<int64_t>>(sortedVariant);
+            throw Error(
+                "cycle detected in the references of '%s' from '%s'",
+                printStorePath(snapshot.idToPath.at(cycle.path)),
+                printStorePath(snapshot.idToPath.at(cycle.parent)));
+        }
+
+        std::vector<StorePath> toInvalidate;
+        toInvalidate.reserve(sortedIds->size() + visitedOrphans.size());
+        for (auto id : *sortedIds) {
+            const auto & path = snapshot.idToPath.at(id);
             if (!dead.insert(path).second)
                 continue;
-            if (shouldDelete) {
+            if (shouldDelete)
+                toInvalidate.push_back(path);
+        }
+        for (auto & path : visitedOrphans) {
+            if (!dead.insert(path).second)
+                continue;
+            if (shouldDelete)
+                toInvalidate.push_back(path);
+        }
+
+        if (shouldDelete && !toInvalidate.empty()) {
+            /* Batch DB invalidations to amortise SQLite fsync cost.
+               Interleave with filesystem rename-aside in chunks so
+               GCLimitReached cleanly bounds how much gets queued
+               for phase-2 deletion. */
+            constexpr size_t batchSize = 256;
+
+            auto scheduleDeleteChunk = [&](const std::vector<StorePath> & chunk) {
+                for (auto & path : chunk)
+                    scheduleDelete(config->realStoreDir.get() / path.to_string());
+            };
+
+            for (size_t start = 0; start < toInvalidate.size(); start += batchSize) {
+                size_t end = std::min(start + batchSize, toInvalidate.size());
+                std::vector<StorePath> chunk(
+                    toInvalidate.begin() + start, toInvalidate.begin() + end);
+
                 try {
-                    invalidatePathChecked(path);
-                    deleteFromStore(path.to_string(), true);
-                    referrersCache.erase(path);
-                } catch (PathInUse & e) {
-                    // If we end up here, it's likely a new occurrence
-                    // of https://github.com/NixOS/nix/issues/11923
-                    printError("BUG: %s", e.what());
+                    invalidatePathsChecked(chunk);
+                    scheduleDeleteChunk(chunk);
+                } catch (PathInUse &) {
+                    /* Fall back to per-path to report the offending
+                       path precisely (matches legacy behaviour). */
+                    for (auto & path : chunk) {
+                        try {
+                            invalidatePathChecked(path);
+                        } catch (PathInUse & e) {
+                            // https://github.com/NixOS/nix/issues/11923
+                            printError("BUG: %s", e.what());
+                            continue;
+                        }
+                        scheduleDelete(config->realStoreDir.get() / path.to_string());
+                    }
                 }
             }
         }
@@ -786,6 +1351,16 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                         if (name == "." || name == ".." || name == linksName)
                             continue;
 
+                        /* Skip orphans queued by the start-of-run sweep and
+                           any entries this very readdir might see that were
+                           renamed aside by a prior iteration of this loop
+                           — `scheduleDelete` inside `maybeDeleteReferrersClosure`
+                           creates `.gc-*` entries in the same directory
+                           we're iterating, and POSIX `readdir` may or may
+                           not return newly-added entries. */
+                        if (name.starts_with(".gc-"))
+                            continue;
+
                         if (auto storePath = maybeParseStorePath(storeDir + "/" + name))
                             maybeDeleteReferrersClosure(*storePath);
                         else
@@ -809,43 +1384,127 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         return;
     }
 
+    /* Phase 2 of the two-phase delete: recursively remove every
+       `.gc-*` orphan we queued. The live store namespace has
+       already been made consistent by the phase-1 renames under
+       the GC lock; this step is pure filesystem work. Parallelise
+       across `gc-delete-threads` workers — each store-path subtree
+       is independent, so `_deletePath`'s single-threaded `readdir`
+       per directory remains safe.
+
+       We call `nix::deletePath` directly rather than the virtual
+       `deleteStorePath` for two reasons:
+       1. We already hand-inline the `ignoreGcDeleteFailure` logic
+          below, so the virtual wrapping buys us nothing.
+       2. Phase 2 only runs for stores where
+          `supportsTwoPhaseDelete()` returned true, which excludes
+          `LocalOverlayStore` — whose override of `deleteStorePath`
+          would try to parse the basename as a `StorePath` and
+          throw `BadStorePath` on our `.gc-*` orphan names.
+
+       Bytes-freed accounting is *not* updated here because
+       `_deletePath` accumulates `st_size` per inode only when
+       `nlink <= 2`, under-counting heavily deduped files (ext4's
+       `.links/` hardlinking pushes many of our store files to
+       `nlink = 3`). The narSize estimate charged at rename time
+       is closer to the logical content total; we prefer it for
+       both the `GCLimitReached` rate limit and `results.bytesFreed`
+       reporting. */
+    if (!phase2DeleteQueue.empty()) {
+        printInfo("recursively deleting %d dead paths...", phase2DeleteQueue.size());
+        auto nThreads =
+            Settings::resolveThreadCount(config->getLocalSettings().getGCSettings().gcDeleteThreads.get());
+        parallelForEachChunked(
+            phase2DeleteQueue, nThreads, /*maxChunkSize=*/64, [&](const std::filesystem::path & orphan) {
+                try {
+                    uint64_t bytesFreedTree = 0;
+                    deletePath(orphan, bytesFreedTree);
+                } catch (SysError & e) {
+                    if (e.errNo == ENOENT)
+                        return; /* vanished between rename and delete */
+                    if (config->ignoreGcDeleteFailure) {
+                        logWarning({.msg = HintFmt(
+                                        "ignoring failure to reap orphan %1%: %2%",
+                                        PathFmt(orphan),
+                                        e.info().msg)});
+                        return;
+                    }
+                    throw;
+                }
+            });
+    }
+
     /* Unlink all files in /nix/store/.links that have a link count of 1,
        which indicates that there are no other links and so they can be
-       safely deleted.  FIXME: race condition with optimisePath(): we
-       might see a link count of 1 just before optimisePath() increases
-       the link count. */
+       safely deleted.
+
+       The race condition with optimisePath() where we might see a link
+       count of 1 just before optimisePath() increases it is now handled
+       on the optimise side: optimisePath_ retries canonical-link
+       creation on ENOENT. */
     if (options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific) {
         printInfo("deleting unused links...");
 
-        AutoCloseDir dir(opendir(linksDir.string().c_str()));
-        if (!dir)
-            throw SysError("opening directory %1%", PathFmt(linksDir));
+        /* Enumerate entries first so the DIR* is released quickly and
+           workers can fan out over independent lstat/unlink pairs. We
+           walk both layouts unconditionally to handle stores that
+           were toggled between sharded and flat modes.
 
-        int64_t actualSize = 0, unsharedSize = 0;
-
-        struct dirent * dirent;
-        while (errno = 0, dirent = readdir(dir.get())) {
+           `DirectoryIterator::is_directory()` is cached from the
+           entry's `d_type` by libstdc++, so no follow-up stat. */
+        std::vector<std::filesystem::path> entries;
+        entries.reserve(1 << 16);
+        for (auto & top : DirectoryIterator{linksDir}) {
             checkInterrupt();
-            std::string name = dirent->d_name;
-            if (name == "." || name == "..")
-                continue;
-            auto path = linksDir / name;
+            std::error_code ec;
+            if (top.is_directory(ec) && !ec) {
+                for (auto & link : DirectoryIterator{top.path()}) {
+                    checkInterrupt();
+                    entries.push_back(link.path());
+                }
+            } else {
+                entries.push_back(top.path());
+            }
+        }
 
-            auto st = lstat(path);
+        /* Cache-line-aligned to avoid false sharing between the two
+           counters under high worker counts. */
+        alignas(std::hardware_destructive_interference_size) std::atomic<int64_t> actualSize{0};
+        alignas(std::hardware_destructive_interference_size) std::atomic<int64_t> unsharedSize{0};
 
-            if (st.st_nlink != 1) {
-                actualSize += st.st_size;
-                unsharedSize += (st.st_nlink - 1) * st.st_size;
-                continue;
+        auto nThreads =
+            Settings::resolveThreadCount(config->getLocalSettings().getGCSettings().gcLinksThreads.get());
+
+        /* Cap of 4096: `.links/` per-entry work is light (lstat +
+           maybe unlink), so larger chunks amortise per-task queue
+           overhead without losing parallelism. */
+        parallelForEachChunked(entries, nThreads, /*maxChunkSize=*/4096, [&](const std::filesystem::path & path) {
+            /* A concurrent optimise or another GC pass may have
+               removed this entry; maybeLstat returns std::nullopt
+               for ENOENT/ENOTDIR. */
+            auto stOpt = maybeLstat(path);
+            if (!stOpt)
+                return;
+
+            if (stOpt->st_nlink != 1) {
+                actualSize.fetch_add(stOpt->st_size, std::memory_order_relaxed);
+                unsharedSize.fetch_add(
+                    (stOpt->st_nlink - 1) * stOpt->st_size, std::memory_order_relaxed);
+                return;
             }
 
             printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
 
-            unlink(path);
+            try {
+                nix::unlink(path);
+            } catch (SysError & e) {
+                if (e.errNo != ENOENT)
+                    throw;
+            }
 
-            /* Do not account for deleted file here. Rely on deletePath()
-               accounting.  */
-        }
+            /* Do not account for deleted file here. Rely on
+               deletePath() accounting. */
+        });
 
         int64_t overhead =
 #ifdef _WIN32
@@ -858,7 +1517,11 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 #endif
             ;
 
-        printInfo("note: hard linking is currently saving %s", renderSize(unsharedSize - actualSize - overhead));
+        printInfo(
+            "note: hard linking is currently saving %s",
+            renderSize(
+                unsharedSize.load(std::memory_order_relaxed)
+                - actualSize.load(std::memory_order_relaxed) - overhead));
     }
 
     /* While we're at it, vacuum the database. */

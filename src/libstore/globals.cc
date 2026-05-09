@@ -182,6 +182,13 @@ unsigned int Settings::getDefaultCores()
         return concurrency;
 }
 
+size_t Settings::resolveThreadCount(size_t configured, size_t cap)
+{
+    if (configured > 0)
+        return std::max<size_t>(configured, 1);
+    return std::min<size_t>(cap, getDefaultCores());
+}
+
 #ifdef __APPLE__
 static bool hasVirt()
 {

@@ -3,13 +3,16 @@
 
 #include "nix/util/error.hh"
 #include "nix/util/fun.hh"
+#include "nix/util/signals.hh"
 #include "nix/util/sync.hh"
 
+#include <algorithm>
 #include <queue>
 #include <functional>
 #include <thread>
 #include <map>
 #include <atomic>
+#include <vector>
 
 namespace nix {
 
@@ -80,6 +83,41 @@ private:
 
     void doWork(bool mainThread);
 };
+
+/**
+ * Iterate `items` in parallel via `ThreadPool`, invoking `body(item)`
+ * for each element. Work is partitioned into chunks sized to give
+ * each worker ~4 chunks (rough work-stealing headroom), clamped to
+ * `maxChunkSize` to bound per-task overhead and queue memory.
+ *
+ * `body` runs on worker threads; shared state must be synchronised
+ * by the caller (typically `std::atomic` or `Sync<T>`). Each
+ * per-item iteration calls `checkInterrupt()` so the pool shuts
+ * down promptly on SIGINT.
+ *
+ * Empty input is a no-op. If `nThreads == 1`, the caller's thread
+ * does all the work via `ThreadPool::process()`.
+ */
+template<typename Item, typename Body>
+void parallelForEachChunked(std::vector<Item> & items, size_t nThreads, size_t maxChunkSize, Body && body)
+{
+    if (items.empty())
+        return;
+
+    size_t chunkSize = std::clamp<size_t>(items.size() / (nThreads * 4), 1, maxChunkSize);
+
+    ThreadPool pool(nThreads);
+    for (size_t start = 0; start < items.size(); start += chunkSize) {
+        size_t end = std::min(start + chunkSize, items.size());
+        pool.enqueue([&, start, end] {
+            for (size_t i = start; i < end; ++i) {
+                checkInterrupt();
+                body(items[i]);
+            }
+        });
+    }
+    pool.process();
+}
 
 /**
  * Process in parallel a set of items of type T that have a partial

@@ -161,6 +161,20 @@ public:
     static unsigned int getDefaultCores();
 
     /**
+     * Resolve a "threads" setting value into a concrete worker count.
+     *
+     * * If `configured` is non-zero, returns it clamped to at least 1.
+     * * If `configured` is zero (the usual "auto" sentinel), returns
+     *   `min(cap, getDefaultCores())` — which respects cgroup CPU
+     *   limits, so containerised workloads don't oversubscribe.
+     *
+     * Matches the pattern used by `Executor::getEvalCores` for
+     * `eval-cores`; suitable for any operation-local thread pool
+     * (optimise, GC, etc.).
+     */
+    static size_t resolveThreadCount(size_t configured, size_t cap = 16);
+
+    /**
      * The directory where state is stored.
      */
     std::filesystem::path nixStateDir;

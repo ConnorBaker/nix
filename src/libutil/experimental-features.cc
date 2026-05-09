@@ -25,7 +25,7 @@ struct ExperimentalFeatureDetails
  * feature, we either have no issue at all if few features are not added
  * at the end of the list, or a proper merge conflict if they are.
  */
-constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::BLAKE3Hashes);
+constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::ShardedLinks);
 
 constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails = {{
     {
@@ -278,6 +278,64 @@ constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails
             Enables support for BLAKE3 hashes.
         )",
         .trackingUrl = "https://github.com/NixOS/nix/milestone/60",
+    },
+    {
+        .tag = Xp::ShardedLinks,
+        .name = "sharded-links",
+        .description = R"(
+            Change `/nix/store/.links/` from a single flat directory
+            to a two-level sharded layout
+            `/nix/store/.links/<pfx>/<hash>.<NN>`, where `<pfx>` is
+            the first two Nix-base32 characters of the hash and
+            `<NN>` is a two-digit zero-padded replica index (`.00`
+            is the primary, `.01`, `.02`, … are fallbacks). Reduces
+            kernel VFS rwsem contention on the shared directory
+            under parallel `nix store optimise` and GC, and splits
+            the htree of very large stores (tens of millions of
+            entries) into 1024 smaller directories (pre-created at
+            store open).
+
+            Also enables **replica entries**: when the primary
+            `<pfx>/<hash>.00` canonical link hits the filesystem's
+            hardlink ceiling (65 000 on ext4), `optimise` walks
+            `.01`, `.02`, … creating additional canonical inodes so
+            dedup can continue past the limit. Capped at 100
+            replicas per logical hash (≈ 6.5M hardlinks on ext4).
+
+            ## Migration
+
+            When `nix store optimise` runs with this feature
+            enabled on a store that still has legacy flat
+            `.links/<hash>` entries, it performs a one-shot bulk
+            migration up front — every flat entry is renamed into
+            its corresponding `<pfx>/<hash>.00` slot before any
+            per-path dedup work begins. Rename is atomic on
+            ext4/XFS/btrfs, so interrupting the migration is safe:
+            the next run resumes from whatever wasn't moved. If the
+            primary slot is already taken (e.g. the flag was
+            toggled off, new flat entries were created, then
+            toggled on again) the flat inode spills into the next
+            free replica rather than being clobbered.
+
+            ## Operational notes
+
+            * Both layouts are walked unconditionally by GC and by
+              `optimisePath_`'s inode-hash fast path, so mixed
+              layouts (some hashes flat, others sharded) work
+              correctly. This is what makes the flag safe to toggle
+              on and off.
+            * Disabling the flag after migration leaves sharded
+              entries in place — they remain discoverable by every
+              code path that walks `.links/` — but new canonical
+              entries go flat. There is no reverse-migration tool;
+              a fully flat store requires an empty `.links/` as a
+              starting point.
+            * The shard directories hold the on-disk hash-prefix
+              convention. Do not rename them or their entries
+              manually — Nix assumes a sharded filename always ends
+              in `.<NN>`.
+        )",
+        .trackingUrl = "",
     },
 }};
 

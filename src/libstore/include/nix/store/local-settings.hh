@@ -122,6 +122,51 @@ struct GCSettings : public virtual Config
         "min-free-check-interval",
         "Number of seconds between checking free disk space.",
     };
+
+    Setting<size_t> gcLinksThreads{
+        this,
+        0,
+        "gc-links-threads",
+        R"(
+          Number of threads to use for the `.links/` unused-link
+          cleanup phase of garbage collection. The default of `0`
+          means: use `min(cores, 16)` where `cores` is the number of
+          hardware threads detected at runtime. Set to `1` to
+          restore the legacy single-threaded behaviour.
+
+          This phase is often the longest part of GC on large
+          stores; parallelising it commonly yields 8–12× speedups
+          before hitting filesystem limits.
+        )",
+    };
+
+    Setting<size_t> gcDeleteThreads{
+        this,
+        0,
+        "gc-delete-threads",
+        R"(
+          Number of threads to use for the recursive-delete phase
+          of garbage collection.
+
+          GC runs in two phases under the global GC lock: phase 1
+          invalidates each dead path's database row and atomically
+          renames the on-disk tree to `<storeDir>/.gc-<pid>-<n>-<origname>`;
+          phase 2 recursively removes those orphans in parallel.
+          Because the live store namespace is made consistent by
+          the rename (which is journaled atomically on
+          ext4/XFS/btrfs), interrupting GC mid-phase-2 is safe: a
+          follow-up run readdirs the store dir at startup, finds
+          leftover `.gc-*` entries, and sweeps them alongside the
+          new run's orphans.
+
+          Both phases currently hold the GC lock. A future change
+          may release the lock between phases so phase 2 runs in
+          parallel with new builds.
+
+          The default of `0` means: use `min(cores, 16)`. Set to
+          `1` to restore the legacy single-threaded behaviour.
+        )",
+    };
 };
 
 const uint32_t maxIdsPerBuild =
@@ -251,6 +296,41 @@ struct LocalSettings : public virtual Config, public GCSettings, public AutoAllo
           a single copy. This saves disk space. If set to `false` (the
           default), you can still run `nix-store --optimise` to get rid of
           duplicate files.
+        )"};
+
+    Setting<size_t> optimiseThreads{
+        this,
+        0,
+        "optimise-threads",
+        R"(
+          Number of threads to use when running `nix store optimise`
+          (or `nix-store --optimise`). The default of `0` means: use
+          `min(cores, 16)` where `cores` is the number of hardware
+          threads detected at runtime. Set to `1` to restore the
+          legacy single-threaded behaviour.
+
+          Scaling characteristics are gated by three ceilings, in
+          order of typical appearance:
+
+          1. Kernel rwsem on the `.links/` directory: every `link(2)`
+             and replacement `rename(2)` takes this exclusively. Past
+             ~4 threads, per-syscall latency grows sub-linearly due
+             to contention. On a fast local SSD, peak throughput is
+             typically seen around 4 threads; additional threads
+             mostly wait on each other.
+
+          2. Storage IOPS ceiling (e.g. EBS gp3 = 3000 IOPS without
+             provisioning). On IOPS-limited storage, more threads
+             help overlap latency until the IOPS budget is saturated.
+
+          3. CPU (hash computation). Rarely the bottleneck on modern
+             hardware; dominates only on fixtures where all files
+             have unique content so dedup finds nothing cached.
+
+          Benchmarks on ext4/SSD show ~2.2× speedup at N=4 and
+          regression past that. On a real Hydra master with a large
+          pre-existing `.links/`, the `inodeHash` fast-path skips
+          already-deduped files and thread scaling extends further.
         )"};
 
     Setting<size_t> narBufferSize{
