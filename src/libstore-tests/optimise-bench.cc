@@ -11,7 +11,9 @@
 #ifndef _WIN32
 
 #  include "nix/util/file-descriptor.hh"
-#  include "nix/util/thread-pool.hh"
+
+#  include <oneapi/tbb/parallel_for_each.h>
+#  include <oneapi/tbb/task_arena.h>
 
 #  include <fcntl.h>
 #  include <sys/stat.h>
@@ -280,7 +282,9 @@ struct BenchFixture
         /* ----- Phase 2: parallel file I/O ----- */
         size_t writeThreads = std::clamp<size_t>(
             std::thread::hardware_concurrency(), 1, 16);
-        parallelForEachChunked(plans, writeThreads, /*maxChunkSize=*/256, [&](const PathPlan & plan) {
+        tbb::task_arena arena(static_cast<int>(writeThreads));
+        arena.execute([&] {
+        tbb::parallel_for_each(plans, [&](const PathPlan & plan) {
             std::string pathDir = storeDir + "/" + std::string(plan.storePath.to_string());
             if (::mkdir(pathDir.c_str(), 0755) != 0)
                 throw SysError("mkdir %s", pathDir);
@@ -310,6 +314,7 @@ struct BenchFixture
                 }
                 ::close(fd);
             }
+        });
         });
 
         /* ----- Phase 3: register paths and roots ----- */

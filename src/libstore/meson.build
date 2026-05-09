@@ -159,6 +159,9 @@ deps_public += nlohmann_json
 sqlite = dependency('sqlite3', 'sqlite', version : '>=3.6.19')
 deps_private += sqlite
 
+tbb = dependency('tbb', version : '>= 2022')
+deps_public += tbb
+
 s3_aws_auth = get_option('s3-aws-auth')
 aws_crt_cpp = dependency(
   'aws-crt-cpp',

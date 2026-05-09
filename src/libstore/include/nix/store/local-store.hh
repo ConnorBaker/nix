@@ -17,8 +17,9 @@
 #include <string_view>
 #include <thread>
 #include <boost/unordered/unordered_flat_set.hpp>
-#include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/unordered/concurrent_flat_set.hpp>
+
+#include <oneapi/tbb/enumerable_thread_specific.h>
 
 namespace nix {
 
@@ -335,12 +336,12 @@ private:
      * socket, so N workers send temp-root announcements in parallel
      * instead of serialising on one shared `Sync<AutoCloseFD>`.
      *
-     * Keyed by `std::thread::id`; entries persist for the thread's
-     * lifetime. `boost::concurrent_flat_map` provides lock-free
-     * lookup on the fast path (socket already open); contention
-     * only happens on first-time connect per thread.
+     * Per-thread storage via `tbb::enumerable_thread_specific`: O(1)
+     * `local()` access via TLS, default-constructs `AutoCloseFD{}` on
+     * first access per thread, destructor closes the FD on thread
+     * exit. Works for any thread (TBB-spawned or `std::thread`).
      */
-    boost::concurrent_flat_map<std::thread::id, AutoCloseFD, std::hash<std::thread::id>> _fdRootsSockets;
+    tbb::enumerable_thread_specific<AutoCloseFD> _fdRootsSockets;
 
 public:
 

@@ -2,10 +2,14 @@
 #include "nix/store/local-settings.hh"
 #include "nix/store/pathlocks.hh"
 #include "nix/util/signals.hh"
-#include "nix/util/thread-pool.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/posix-source-accessor.hh"
 #include "nix/util/file-system.hh"
+
+#include <oneapi/tbb/parallel_for_each.h>
+#include <oneapi/tbb/task_arena.h>
+
+#include <boost/scope/scope_exit.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -351,33 +355,25 @@ void LocalStore::optimisePath_(
        files sharing this inode can short-circuit the hash step. */
     inodeHash.insert(st.st_ino);
 
-    /* RAII guard: after `create_hard_link` succeeds the tempLink
-       exists on disk. Any exception before `release()` must remove it
-       or we leak an orphan `.tmp-link-*`. */
-    struct TempLinkGuard
-    {
-        const std::filesystem::path & p;
-        bool armed = false;
-        ~TempLinkGuard()
-        {
-            if (!armed)
-                return;
-            try {
-                std::error_code ec;
-                std::filesystem::remove(p, ec);
-                if (ec && ec != std::errc::no_such_file_or_directory)
-                    printError("unable to unlink %1%: %2%", PathFmt(p), ec.message());
-            } catch (...) {
-                ignoreExceptionInDestructor();
-            }
+    /* Cleanup guard: removes the tempLink if any exception escapes
+       between `create_hard_link` succeeding and the rename completing.
+       Created inactive — armed after the link succeeds, released
+       after the rename succeeds. */
+    auto tempLinkGuard = boost::scope::make_scope_exit([&] {
+        try {
+            std::error_code ec;
+            std::filesystem::remove(tempLink, ec);
+            if (ec && ec != std::errc::no_such_file_or_directory)
+                printError("unable to unlink %1%: %2%", PathFmt(tempLink), ec.message());
+        } catch (...) {
+            ignoreExceptionInDestructor();
         }
-        void arm() { armed = true; }
-        void release() { armed = false; }
-    } tempLinkGuard{tempLink};
+    });
+    tempLinkGuard.set_active(false);
 
     try {
         std::filesystem::create_hard_link(candidate, tempLink);
-        tempLinkGuard.arm();
+        tempLinkGuard.set_active(true);
     } catch (std::filesystem::filesystem_error & e) {
         if (e.code() == std::errc::too_many_links) {
             if (st.st_size)
@@ -390,7 +386,7 @@ void LocalStore::optimisePath_(
 
     try {
         std::filesystem::rename(tempLink, path);
-        tempLinkGuard.release();
+        tempLinkGuard.set_active(false);
     } catch (std::filesystem::filesystem_error & e) {
         if (e.code() == std::errc::too_many_links) {
             /* Some FSes raise EMLINK on rename rather than link, by
@@ -462,22 +458,29 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
 
     auto nThreads = Settings::resolveThreadCount(config->getLocalSettings().optimiseThreads.get());
 
-    /* Cap of 256 reflects that optimise's per-path work (hash +
-       link) is heavy; smaller chunks give better load balancing
-       when some paths take much longer than others.
+    /* TBB's `auto_partitioner` adapts chunk size to per-item work
+       cost, so we don't tune `maxChunkSize` here. The `task_arena`
+       caps concurrency at `nThreads` without touching any global
+       scheduler state — concurrent operations (e.g. a parallel GC
+       running alongside) get their own arenas and share TBB's
+       global thread pool cooperatively.
 
        We skip `isValidPath(path)` here and rely on `optimisePath_`'s
        built-in ENOENT tolerance: if GC deleted the path between
        `queryAllValidPaths` and our `maybeLstat`, the inner function
        returns silently. This saves up to N SQLite point-lookups per
        `optimiseStore` run on cold caches. */
-    parallelForEachChunked(paths, nThreads, /*maxChunkSize=*/256, [&](const StorePath & path) {
-        addTempRoot(path);
-        optimisePath_(
-            nullptr, stats, config->realStoreDir.get() / path.to_string(), inodeHash, NoRepair);
-        auto d = done.fetch_add(1, std::memory_order_relaxed) + 1;
-        if ((d & 1023) == 0 || d == total)
-            act.progress(d, total);
+    tbb::task_arena arena(static_cast<int>(nThreads));
+    arena.execute([&] {
+        tbb::parallel_for_each(paths, [&](const StorePath & path) {
+            checkInterrupt();
+            addTempRoot(path);
+            optimisePath_(
+                nullptr, stats, config->realStoreDir.get() / path.to_string(), inodeHash, NoRepair);
+            auto d = done.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((d & 1023) == 0 || d == total)
+                act.progress(d, total);
+        });
     });
 }
 

@@ -15,6 +15,7 @@
   libseccomp,
   nlohmann_json,
   sqlite,
+  tbb_2022,
   cmake, # for resolving aws-crt-cpp dep
 
   busybox-sandbox-shell ? null,
@@ -84,6 +85,7 @@ mkMesonLibrary (finalAttrs: {
   propagatedBuildInputs = [
     nix-util
     nlohmann_json
+    tbb_2022
   ];
 
   mesonFlags = [

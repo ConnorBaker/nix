@@ -10,6 +10,9 @@
 #include "nix/util/signals.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/thread-pool.hh"
+
+#include <oneapi/tbb/parallel_for_each.h>
+#include <oneapi/tbb/task_arena.h>
 #include "nix/util/util.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/topo-sort.hh"
@@ -132,81 +135,45 @@ void LocalStore::addTempRoot(const StorePath & path)
 
         /* GC is running. Send our new temp root over this thread's
            own gc-socket so N workers don't serialise on a shared
-           connection. Get-or-connect: each thread owns its entry
-           in `_fdRootsSockets` and mutates only that slot. */
-        auto tid = std::this_thread::get_id();
-        Descriptor sockFd = INVALID_DESCRIPTOR;
-        bool connectFailed = false;
-
-        _fdRootsSockets.try_emplace_and_visit(
-            tid,
-            /*initial value if emplaced:*/ AutoCloseFD{},
-            /*visitor on emplace:*/
-            [&](auto & kv) {
-                auto socketPath = config->stateDir.get() / gcSocketPath;
-                debug("connecting to '%s'", PathFmt(socketPath));
-                kv.second = createUnixDomainSocket();
-                try {
-                    nix::connect(toSocket(kv.second.get()), socketPath);
-                    sockFd = kv.second.get();
-                } catch (SystemError & e) {
-                    if (e.is(std::errc::connection_refused) || e.is(std::errc::no_such_file_or_directory)) {
-                        debug("GC socket connection refused: %s", e.msg());
-                        kv.second.close();
-                        connectFailed = true;
-                    } else {
-                        throw;
-                    }
+           connection. */
+        auto & fd = _fdRootsSockets.local();
+        if (!fd) {
+            auto socketPath = config->stateDir.get() / gcSocketPath;
+            debug("connecting to '%s'", PathFmt(socketPath));
+            fd = createUnixDomainSocket();
+            try {
+                nix::connect(toSocket(fd.get()), socketPath);
+            } catch (SystemError & e) {
+                if (e.is(std::errc::connection_refused) || e.is(std::errc::no_such_file_or_directory)) {
+                    debug("GC socket connection refused: %s", e.msg());
+                    fd.close();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
                 }
-            },
-            /*visitor on existing entry:*/
-            [&](auto & kv) {
-                if (!kv.second) {
-                    /* Previously closed (e.g. prior disconnect). Reopen. */
-                    auto socketPath = config->stateDir.get() / gcSocketPath;
-                    debug("reconnecting to '%s'", PathFmt(socketPath));
-                    kv.second = createUnixDomainSocket();
-                    try {
-                        nix::connect(toSocket(kv.second.get()), socketPath);
-                        sockFd = kv.second.get();
-                    } catch (SystemError & e) {
-                        if (e.is(std::errc::connection_refused) || e.is(std::errc::no_such_file_or_directory)) {
-                            kv.second.close();
-                            connectFailed = true;
-                        } else {
-                            throw;
-                        }
-                    }
-                } else {
-                    sockFd = kv.second.get();
-                }
-            });
-
-        if (connectFailed) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue; /* restart */
+                throw;
+            }
         }
 
         /* Send the path and await a single-byte ack. On disconnect,
            drop this thread's fd and retry from the top. */
         try {
             debug("sending GC root '%s'", printStorePath(path));
-            writeFull(sockFd, printStorePath(path) + "\n", false);
+            writeFull(fd.get(), printStorePath(path) + "\n", false);
             char c;
-            readFull(sockFd, &c, 1);
+            readFull(fd.get(), &c, 1);
             assert(c == '1');
             debug("got ack for GC root '%s'", printStorePath(path));
             break; /* success */
         } catch (SystemError & e) {
             if (e.is(std::errc::broken_pipe) || e.is(std::errc::connection_reset)) {
                 debug("GC socket disconnected");
-                _fdRootsSockets.visit(tid, [](auto & kv) { kv.second.close(); });
+                fd.close();
                 continue;
             }
             throw;
-        } catch (EndOfFile & e) {
+        } catch (EndOfFile &) {
             debug("GC socket disconnected");
-            _fdRootsSockets.visit(tid, [](auto & kv) { kv.second.close(); });
+            fd.close();
             continue;
         }
     }
@@ -1414,8 +1381,10 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         printInfo("recursively deleting %d dead paths...", phase2DeleteQueue.size());
         auto nThreads =
             Settings::resolveThreadCount(config->getLocalSettings().getGCSettings().gcDeleteThreads.get());
-        parallelForEachChunked(
-            phase2DeleteQueue, nThreads, /*maxChunkSize=*/64, [&](const std::filesystem::path & orphan) {
+        tbb::task_arena arena(static_cast<int>(nThreads));
+        arena.execute([&] {
+            tbb::parallel_for_each(phase2DeleteQueue, [&](const std::filesystem::path & orphan) {
+                checkInterrupt();
                 try {
                     uint64_t bytesFreedTree = 0;
                     deletePath(orphan, bytesFreedTree);
@@ -1432,6 +1401,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     throw;
                 }
             });
+        });
     }
 
     /* Unlink all files in /nix/store/.links that have a link count of 1,
@@ -1462,10 +1432,10 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         auto nThreads =
             Settings::resolveThreadCount(config->getLocalSettings().getGCSettings().gcLinksThreads.get());
 
-        /* Cap of 4096: `.links/` per-entry work is light (lstat +
-           maybe unlink), so larger chunks amortise per-task queue
-           overhead without losing parallelism. */
-        parallelForEachChunked(entries, nThreads, /*maxChunkSize=*/4096, [&](const std::filesystem::path & path) {
+        tbb::task_arena arena(static_cast<int>(nThreads));
+        arena.execute([&] {
+        tbb::parallel_for_each(entries, [&](const std::filesystem::path & path) {
+            checkInterrupt();
             /* A concurrent optimise or another GC pass may have
                removed this entry; maybeLstat returns std::nullopt
                for ENOENT/ENOTDIR. */
@@ -1491,6 +1461,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
             /* Do not account for deleted file here. Rely on
                deletePath() accounting. */
+        });
         });
 
         int64_t overhead =
