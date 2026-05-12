@@ -227,6 +227,70 @@ needLocalStore() {
   fi
 }
 
+# Find the `.links/<hash>[.NN]` entry whose content matches the file
+# at `$1`. Walks both the flat layout (`<linksDir>/<hash>[.NN]`) and
+# the sharded layout (`<linksDir>/<pfx>/<hash>[.NN]`). Prints the
+# matching path on stdout and returns 0 on success, returns 1 if no
+# entry matches.
+findCanonicalLink() {
+  local target="$1"
+  local targetHash
+  targetHash="$(sha256sum "$target" | awk '{print $1}')"
+  local f h
+  # Prefer the bare-name canonical (replica 0) over `.NN` spillover
+  # entries when both have matching content — the bare name is the
+  # "primary" slot and tests that check `nlink == N+1` only hold on
+  # the primary, since replicas are independent inodes. Glob order
+  # is filesystem-dependent, so we make two passes: first matching
+  # only the bare-name form, then falling back to replicas if no
+  # primary was found.
+  #
+  # The shell glob `*.[0-9][0-9]` matches replica suffixes; the
+  # `!(*.[0-9][0-9])` negation requires extglob to filter them out.
+  shopt -s extglob nullglob
+  # Pass 1: bare-name canonicals only, flat then sharded layout.
+  for f in "$NIX_STORE_DIR"/.links/!(*.[0-9][0-9]) \
+           "$NIX_STORE_DIR"/.links/*/!(*.[0-9][0-9]); do
+    [[ -f "$f" ]] || continue
+    h="$(sha256sum "$f" | awk '{print $1}')"
+    if [[ "$h" == "$targetHash" ]]; then
+      printf '%s\n' "$f"
+      shopt -u extglob nullglob
+      return 0
+    fi
+  done
+  # Pass 2: any replica with matching content.
+  for f in "$NIX_STORE_DIR"/.links/* "$NIX_STORE_DIR"/.links/*/*; do
+    [[ -f "$f" ]] || continue
+    h="$(sha256sum "$f" | awk '{print $1}')"
+    if [[ "$h" == "$targetHash" ]]; then
+      printf '%s\n' "$f"
+      shopt -u extglob nullglob
+      return 0
+    fi
+  done
+  shopt -u extglob nullglob
+  return 1
+}
+
+# Assert that the two files at `$1` and `$2` are deduplicated by the
+# optimise path. All dedup is via `link(2)`, so the check is a
+# straightforward same-inode test. (Earlier branches of this code
+# supported a CoW-reflink path that produced distinct inodes with
+# shared extents; that mechanism was investigated and dropped — see
+# `research/optimise-and-gc-throughput.md` — so the helper is back
+# to the simple form.)
+assertDeduplicated() {
+  local p1="$1" p2="$2"
+  local ino1 ino2
+  ino1="$(stat --format=%i "$p1")"
+  ino2="$(stat --format=%i "$p2")"
+  if [[ "$ino1" == "$ino2" ]]; then
+    return 0
+  fi
+  fail "$p1 and $p2 have distinct inodes ($ino1 vs $ino2) — optimise did not dedup"
+}
+
 # Just to make it easy to find which tests should be fixed
 buggyNeedLocalStore() {
   needLocalStore "$1"

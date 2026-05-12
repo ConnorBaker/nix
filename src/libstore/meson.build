@@ -159,6 +159,20 @@ deps_public += nlohmann_json
 sqlite = dependency('sqlite3', 'sqlite', version : '>=3.6.19')
 deps_private += sqlite
 
+tbb = dependency('tbb', version : '>= 2022')
+deps_public += tbb
+
+# liburing is Linux-only; used to dispatch `.links/` GC cleanup via
+# io_uring (see LocalStore::collectGarbage). Gated by HAVE_LIBURING so
+# non-Linux builds (Windows / macOS / FreeBSD) compile without it.
+liburing_dep = dependency('liburing', required : host_machine.system() == 'linux')
+if liburing_dep.found()
+  deps_private += liburing_dep
+  configdata_priv.set('HAVE_LIBURING', 1)
+else
+  configdata_priv.set('HAVE_LIBURING', 0)
+endif
+
 s3_aws_auth = get_option('s3-aws-auth')
 aws_crt_cpp = dependency(
   'aws-crt-cpp',

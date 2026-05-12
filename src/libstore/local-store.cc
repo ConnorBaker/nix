@@ -1,5 +1,6 @@
 #include "nix/store/local-store.hh"
 #include "nix/store/globals.hh"
+#include "nix/util/base-nix-32.hh"
 #include "nix/util/git.hh"
 #include "nix/util/archive.hh"
 #include "nix/store/pathlocks.hh"
@@ -40,6 +41,8 @@
 #  include <sched.h>
 #  include <sys/statvfs.h>
 #  include <sys/mount.h>
+#  include <sys/ioctl.h>
+#  include <linux/fs.h>
 #endif
 
 #ifdef __CYGWIN__
@@ -128,6 +131,7 @@ LocalStore::LocalStore(ref<const Config> config)
     , _state(make_ref<Sync<State>>())
     , dbDir(config->stateDir.get() / "db")
     , linksDir(config->realStoreDir.get() / ".links")
+    , shardedLinks(experimentalFeatureSettings.isEnabled(Xp::ShardedLinks))
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
@@ -144,6 +148,44 @@ LocalStore::LocalStore(ref<const Config> config)
         makeStoreWritable();
     }
     createDirs(linksDir);
+
+    /* When `sharded-links` is enabled, ensure every 2-character shard
+       directory exists up front. Nix-base32 has 32 symbols, so there
+       are 1024 shards; each is just an empty htree root block until
+       populated (~4 KB each, ~4 MB total). Creating them lazily would
+       open up race windows between concurrent `link(2)` calls where
+       two workers could both try to `mkdir(shard)` at once. */
+    if (shardedLinks && !config->readOnly) {
+        for (char c1 : BaseNix32::characters)
+            for (char c2 : BaseNix32::characters) {
+                char shard[3] = {c1, c2, 0};
+                createDirs(linksDir / shard);
+            }
+    }
+
+    /* Query the filesystem's per-file hardlink ceiling so the
+       replica walk in `optimisePath_` can opportunistically skip
+       saturated slots without a round-trip to the kernel. The
+       commit path in `optimisePath_` handles EMLINK regardless, so
+       this value is advisory — a conservative fallback is safe.
+
+       The `_link-max-override` test setting, when positive, replaces
+       the probed value. Benches use it to force the replica spill
+       path on filesystems with effectively-infinite ceilings
+       (tmpfs, ZFS), so the `sharded_multi_replica_hardlink` vs
+       `sharded_single_replica_hardlink` comparison produces signal at
+       small fixture sizes. */
+#ifndef _WIN32
+    {
+        long pc = ::pathconf(linksDir.string().c_str(), _PC_LINK_MAX);
+        linkMax = pc > 0 ? static_cast<int64_t>(pc) : int64_t{32000};
+    }
+#else
+    linkMax = int64_t{32000};
+#endif
+    if (auto ov = config->getLocalSettings().linkMaxOverride.get(); ov > 0)
+        linkMax = ov;
+
     auto profilesDir = config->stateDir.get() / "profiles";
     createDirs(profilesDir);
     createDirs(tempRootsDir);
@@ -401,6 +443,64 @@ AutoCloseFD LocalStore::openGCLock()
     if (!fdGCLock)
         throw SysError("opening global GC lock %1%", PathFmt(fnGCLock));
     return toDescriptor(fdGCLock);
+}
+
+std::filesystem::path LocalStore::linkPathFor(const Hash & hash, uint8_t replica) const
+{
+    assert(replica < maxReplicaSlots);
+    auto hs = hash.to_string(HashFormat::Nix32, false);
+    /* Directory and filename are independent axes:
+         - directory: flat (linksDir) vs sharded (linksDir/<pfx>)
+         - filename: `<hash>` for replica 0 (the primary), or
+           `<hash>.<NN>` for replica > 0 (a spillover slot)
+       This decouples `sharded-links` (parallelism via 1024-way
+       directory split) from `max-link-replicas` (spillover past the
+       per-inode hardlink ceiling); both can be combined or used
+       independently. Replica 0's lack of suffix preserves backward
+       compatibility with pre-`fffca655b` `.links/<hash>` entries. */
+    auto dir = shardedLinks ? linksDir / hs.substr(0, 2) : linksDir;
+    if (replica == 0)
+        return dir / hs;
+    char suffix[4];
+    std::snprintf(suffix, sizeof suffix, ".%02u", static_cast<unsigned>(replica));
+    return dir / (hs + suffix);
+}
+
+std::string_view LocalStore::stripReplicaSuffix(std::string_view name) const
+{
+    /* Sharded layout filename ends in `.<NN>` where NN is two
+       decimal digits. Constant-time check on the last 3 chars. */
+    if (name.size() >= 3 && name[name.size() - 3] == '.'
+        && name[name.size() - 2] >= '0' && name[name.size() - 2] <= '9'
+        && name[name.size() - 1] >= '0' && name[name.size() - 1] <= '9')
+        return name.substr(0, name.size() - 3);
+    return name;
+}
+
+void LocalStore::forEachLinkEntry(std::function<void(const std::filesystem::path &)> onLink)
+{
+    for (auto & top : DirectoryIterator{linksDir}) {
+        checkInterrupt();
+        std::error_code ec;
+        bool isDir = top.is_directory(ec);
+        if (ec) {
+            logWarning({
+                .msg = HintFmt(
+                    "skipping .links entry %1%: %2%",
+                    PathFmt(top.path()),
+                    ec.message()),
+            });
+            continue;
+        }
+        if (isDir) {
+            for (auto & link : DirectoryIterator{top.path()}) {
+                checkInterrupt();
+                onLink(link.path());
+            }
+        } else {
+            onLink(top.path());
+        }
+    }
 }
 
 void LocalStore::deleteStorePath(const std::filesystem::path & path, uint64_t & bytesFreed, bool isKnownPath)
@@ -1352,6 +1452,58 @@ void LocalStore::invalidatePathChecked(const StorePath & path)
     });
 }
 
+void LocalStore::invalidatePathsChecked(const std::vector<StorePath> & paths)
+{
+    if (paths.empty())
+        return;
+
+    /* Paths in this batch are not considered referrers (they'll be
+       invalidated together). */
+    StorePathSet inBatch(paths.begin(), paths.end());
+
+    /* Paths we actually invalidated — cache flush deferred until
+       after commit so a rollback doesn't leave stale negative cache
+       entries. */
+    std::vector<StorePath> invalidated;
+    invalidated.reserve(paths.size());
+
+    retrySQLite<void>([&]() {
+        invalidated.clear(); /* on retry */
+
+        auto state(_state->lock());
+        SQLiteTxn txn(state->db);
+
+        for (auto & path : paths) {
+            if (!isValidPath_(*state, path))
+                continue;
+
+            StorePathSet referrers;
+            queryReferrers(*state, path, referrers);
+            /* Drop self-references and in-batch referrers. */
+            std::erase_if(referrers, [&](auto & r) { return r == path || inBatch.count(r); });
+
+            if (!referrers.empty())
+                throw PathInUse(
+                    "cannot delete path '%s' because it is in use by %s",
+                    printStorePath(path),
+                    concatMapStringsSep(", ", referrers, [&](auto & p) { return "'" + printStorePath(p) + "'"; }));
+
+            debug("invalidating path '%s'", printStorePath(path));
+            state->stmts->InvalidatePath.use()(printStorePath(path)).exec();
+            invalidated.push_back(path);
+        }
+
+        txn.commit();
+
+        /* Flush cache entries before releasing `_state` so no other
+           thread observes DB-invalidated + cache-valid. The cache's
+           own lock is orthogonal to `_state`, so this is deadlock-
+           safe. */
+        for (auto & path : invalidated)
+            invalidatePathInfoCacheFor(path);
+    });
+}
+
 bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
 {
     printInfo("reading the Nix store...");
@@ -1368,24 +1520,32 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
 
         printInfo("checking link hashes...");
 
-        for (auto & link : DirectoryIterator{linksDir}) {
-            checkInterrupt();
-            auto name = link.path().filename();
-            printMsg(lvlTalkative, "checking contents of %s", PathFmt(name));
-            std::string hash =
-                hashPath(makeFSSourceAccessor(link.path()), FileIngestionMethod::NixArchive, HashAlgorithm::SHA256)
+        /* Check one `.links/` entry's on-disk content against its
+           filename. Entries may be either flat (`<hash>`) or sharded
+           (`<pfx>/<hash>.<N>`); `stripReplicaSuffix` removes the
+           always-present replica suffix from sharded names in
+           constant time. */
+        auto checkLink = [&](const std::filesystem::path & link) {
+            auto name = link.filename().string();
+            auto expected = std::string(stripReplicaSuffix(name));
+            printMsg(lvlTalkative, "checking contents of %s", PathFmt(link));
+            std::string got =
+                hashPath(makeFSSourceAccessor(link), FileIngestionMethod::NixArchive, HashAlgorithm::SHA256)
                     .first.to_string(HashFormat::Nix32, false);
-            if (hash != name.string()) {
-                printError(
-                    "link %s was modified! expected hash %s, got '%s'", PathFmt(link.path()), name.string(), hash);
+            if (got != expected) {
+                printError("link %s was modified! expected hash %s, got '%s'", PathFmt(link), expected, got);
                 if (repair) {
-                    unlinkIfExists(link.path());
-                    printInfo("removed link %s", PathFmt(link.path()));
+                    std::filesystem::remove(link);
+                    printInfo("removed link %s", PathFmt(link));
                 } else {
                     errors = true;
                 }
             }
-        }
+        };
+
+        forEachLinkEntry([&](const std::filesystem::path & p) {
+            checkLink(p);
+        });
 
         printInfo("checking store hashes...");
 

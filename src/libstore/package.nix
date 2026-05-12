@@ -13,8 +13,10 @@
   aws-c-common,
   aws-crt-cpp,
   libseccomp,
+  liburing,
   nlohmann_json,
   sqlite,
+  tbb_2022,
   cmake, # for resolving aws-crt-cpp dep
 
   busybox-sandbox-shell ? null,
@@ -78,12 +80,14 @@ mkMesonLibrary (finalAttrs: {
     sqlite
   ]
   ++ lib.optional stdenv.hostPlatform.isLinux libseccomp
+  ++ lib.optional stdenv.hostPlatform.isLinux liburing
   ++ lib.optional stdenv.hostPlatform.isFreeBSD freebsd.libjail
   ++ lib.optional withAWS aws-crt-cpp;
 
   propagatedBuildInputs = [
     nix-util
     nlohmann_json
+    tbb_2022
   ];
 
   mesonFlags = [

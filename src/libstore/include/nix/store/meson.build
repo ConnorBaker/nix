@@ -87,6 +87,7 @@ headers = [ config_pub_h ] + files(
   'sqlite.hh',
   'ssh-store.hh',
   'ssh.hh',
+  'stage-timer.hh',
   'store-api.hh',
   'store-cast.hh',
   'store-dir-config.hh',

@@ -337,14 +337,30 @@ rec {
   # API docs for Nix's C bindings.
   external-api-docs = nixpkgsFor.x86_64-linux.native.nixComponents2.nix-external-api-docs;
 
-  # System tests.
+  # System tests. Tests from `../tests/nixos` are instantiated per
+  # Linux system and transposed so each entry has Hydra-conventional
+  # `tests.<test>.<system>` shape, matching the other entries in this
+  # block (e.g. `nixpkgsLibTests`, `filetransfer-retry-backoff`).
   tests =
-    import ../tests/nixos {
-      inherit lib nixpkgs;
-      pkgs = nixpkgsFor.x86_64-linux.native;
-      nixComponents = nixpkgsFor.x86_64-linux.native.nixComponents2;
-      inherit (self.inputs) nixpkgs-23-11;
-    }
+    let
+      forLinux = lib.genAttrs linux64BitSystems;
+      testsBySystem = forLinux (
+        system:
+        import ../tests/nixos {
+          inherit lib nixpkgs;
+          pkgs = nixpkgsFor.${system}.native;
+          nixComponents = nixpkgsFor.${system}.native.nixComponents2;
+          inherit (self.inputs) nixpkgs-23-11;
+        }
+      );
+      # Test names are the same across systems — pick any one.
+      testNames = builtins.attrNames (
+        testsBySystem.${builtins.head linux64BitSystems}
+      );
+    in
+    lib.genAttrs testNames (
+      testName: forLinux (system: testsBySystem.${system}.${testName})
+    )
     // {
 
       # Make sure that nix-env still produces the exact same result

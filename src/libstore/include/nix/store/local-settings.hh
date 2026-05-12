@@ -122,6 +122,90 @@ struct GCSettings : public virtual Config
         "min-free-check-interval",
         "Number of seconds between checking free disk space.",
     };
+
+    Setting<size_t> gcLinksThreads{
+        this,
+        0,
+        "gc-links-threads",
+        R"(
+          Number of threads to use for the `.links/` unused-link
+          cleanup phase of garbage collection. The default of `0`
+          means: use `min(cores, 16)` where `cores` is the number of
+          hardware threads detected at runtime. Set to `1` to
+          restore the legacy single-threaded behaviour.
+
+          This phase is often the longest part of GC on large
+          stores; parallelising it commonly yields 8–12× speedups
+          before hitting filesystem limits.
+        )",
+    };
+
+    Setting<bool> gcLinksUseIoUring{
+        this,
+        false,
+        "gc-links-use-io-uring",
+        R"(
+          Dispatch two GC subsystems via `io_uring` instead of the
+          thread-pool paths:
+
+          1. **Phase-2 orphan deletion**: after Phase-1 renames each
+             dead path to `<storeDir>/.gc-<pid>-<n>-<origname>`, the
+             orphan subtrees are recursively unlinked. With this
+             flag on, the per-subtree walk stays in TBB but the
+             actual `unlinkat` calls go via batched
+             `IORING_OP_UNLINKAT` (regular files first, then
+             `AT_REMOVEDIR` for now-empty dirs). Directory u+rwx
+             permissions are restored in-line during the walk to
+             match the thread-pool path's behaviour.
+          2. **`.links/` unused-link sweep**: walk both flat and
+             sharded `.links/` entries, submit batched
+             `IORING_OP_STATX` to identify entries with `nlink==1`,
+             and submit `IORING_OP_UNLINKAT` for those. This is
+             the historically primary motivation for this flag.
+
+          For both subsystems the kernel-side VFS work is identical
+          to the thread-pool path (same `vfs_unlink` calls under
+          the same `i_rwsem`), so the win — if any — comes from
+          cheaper userspace dispatch. On filesystems where the
+          per-directory rwsem is the bottleneck (tmpfs, anything
+          with htree contention), the wall-clock difference is
+          small or negative because io-wq workers serialise on the
+          same lock; on backends where syscall/context-switch cost
+          dominates (real disk with IOPS headroom), the win is
+          larger.
+
+          Only compiled in when `liburing` is available (Linux).
+          No-op on other platforms.
+        )",
+    };
+
+    Setting<size_t> gcDeleteThreads{
+        this,
+        0,
+        "gc-delete-threads",
+        R"(
+          Number of threads to use for the recursive-delete phase
+          of garbage collection.
+
+          GC runs in two phases under the global GC lock: phase 1
+          invalidates each dead path's database row and atomically
+          renames the on-disk tree to `<storeDir>/.gc-<pid>-<n>-<origname>`;
+          phase 2 recursively removes those orphans in parallel.
+          Because the live store namespace is made consistent by
+          the rename (which is journaled atomically on
+          ext4/XFS/btrfs), interrupting GC mid-phase-2 is safe: a
+          follow-up run readdirs the store dir at startup, finds
+          leftover `.gc-*` entries, and sweeps them alongside the
+          new run's orphans.
+
+          Both phases currently hold the GC lock. A future change
+          may release the lock between phases so phase 2 runs in
+          parallel with new builds.
+
+          The default of `0` means: use `min(cores, 16)`. Set to
+          `1` to restore the legacy single-threaded behaviour.
+        )",
+    };
 };
 
 const uint32_t maxIdsPerBuild =
@@ -251,6 +335,90 @@ struct LocalSettings : public virtual Config, public GCSettings, public AutoAllo
           a single copy. This saves disk space. If set to `false` (the
           default), you can still run `nix-store --optimise` to get rid of
           duplicate files.
+        )"};
+
+    Setting<size_t> optimiseThreads{
+        this,
+        0,
+        "optimise-threads",
+        R"(
+          Number of threads to use when running `nix store optimise`
+          (or `nix-store --optimise`). The default of `0` means: use
+          `min(cores, 16)` where `cores` is the number of hardware
+          threads detected at runtime. Set to `1` to restore the
+          legacy single-threaded behaviour.
+
+          Scaling characteristics are gated by three ceilings, in
+          order of typical appearance:
+
+          1. Kernel rwsem on the `.links/` directory: every `link(2)`
+             and replacement `rename(2)` takes this exclusively. Past
+             ~4 threads, per-syscall latency grows sub-linearly due
+             to contention. On a fast local SSD, peak throughput is
+             typically seen around 4 threads; additional threads
+             mostly wait on each other.
+
+          2. Storage IOPS ceiling (e.g. EBS gp3 = 3000 IOPS without
+             provisioning). On IOPS-limited storage, more threads
+             help overlap latency until the IOPS budget is saturated.
+
+          3. CPU (hash computation). Rarely the bottleneck on modern
+             hardware; dominates only on fixtures where all files
+             have unique content so dedup finds nothing cached.
+
+          Benchmarks on ext4/SSD show ~2.2× speedup at N=4 and
+          regression past that. On a real Hydra master with a large
+          pre-existing `.links/`, the `inodeHash` fast-path skips
+          already-deduped files and thread scaling extends further.
+        )"};
+
+    Setting<int64_t> linkMaxOverride{
+        this,
+        0,
+        "_link-max-override",
+        R"(
+          *Test-only.* Artificial cap on the filesystem's per-inode
+          hardlink ceiling. When set to a positive value, overrides
+          the `pathconf(_PC_LINK_MAX)` probe in `LocalStore`'s
+          constructor. `0` (the default) leaves the probe's value
+          in place.
+
+          The leading underscore in the name marks this as an
+          internal knob: production stores should never set it.
+          It exists so benchmarks can exercise the replica-spill
+          path at small scale and on filesystems with
+          effectively-infinite hardlink ceilings (tmpfs, ZFS).
+          Without it, the `sharded_multi_replica_hardlink` vs
+          `sharded_single_replica_hardlink` cells produce identical
+          results because the cap is never reached.
+
+          Read once at LocalStore construction; subsequent changes
+          have no effect until a new store is opened.
+        )"};
+
+    Setting<size_t> maxLinkReplicas{
+        this,
+        100,
+        "max-link-replicas",
+        R"(
+          Maximum number of replica entries to maintain per logical
+          hash in `.links/` to spill past the per-inode hardlink
+          ceiling (ext4: 65 000). Replica 0 has no suffix; replicas
+          1..99 are named `<hash>.<NN>` and walked in order when
+          the primary saturates.
+
+          Works independently of the `sharded-links` experimental
+          feature — the flat and sharded layouts both host the
+          replica scheme. Set to `1` to disable spillover entirely:
+          when the primary's `st_nlink` saturates, subsequent dedup
+          attempts surface EMLINK and the user file is left
+          undeduped (useful for benchmarks that want to isolate the
+          directory-layout cost from the replica-spill cost).
+
+          The default of `100` matches the on-disk encoding cap
+          (two-digit decimal suffix `.00`..`.99`) and gives roughly
+          6.5M dedup slots per hash on ext4. Values are clamped to
+          the encoding cap (100).
         )"};
 
     Setting<size_t> narBufferSize{

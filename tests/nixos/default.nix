@@ -99,6 +99,14 @@ let
         nixpkgs-23-11.legacyPackages.${pkgs.stdenv.hostPlatform.system}.nixVersions.nix_2_18
       );
     };
+
+  # nix-store benchmark VM tests are deliberately NOT registered in
+  # the Hydra jobset. The matrix of (bench × fs × throttle × layout ×
+  # threads) is too large and the thresholds in `decide.py` are tuned
+  # for production-relevant fixture sizes, not the small-fixture
+  # smoke runs that would be cheap enough for CI. Run them ad-hoc via
+  # `tests/nixos/nix-store-bench/adhoc.nix` instead — same code path
+  # (`mk-bench.nix` → `mk-test.nix`) as the previous matrix cells.
 in
 
 {
@@ -207,6 +215,9 @@ in
   chrootStore = runNixOSTest ./chroot-store.nix;
 
   storeRemount = runNixOSTest ./store-remount.nix;
+
+  # nix-store benchmark VM tests are not registered here on purpose;
+  # they're invoked ad-hoc via `tests/nixos/nix-store-bench/adhoc.nix`.
 
   upgrade-nix = runNixOSTest {
     imports = [ ./upgrade-nix.nix ];

@@ -25,7 +25,7 @@ struct ExperimentalFeatureDetails
  * feature, we either have no issue at all if few features are not added
  * at the end of the list, or a proper merge conflict if they are.
  */
-constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::BLAKE3Hashes);
+constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::ShardedLinks);
 
 constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails = {{
     {
@@ -279,6 +279,72 @@ constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails
         )",
         .trackingUrl = "https://github.com/NixOS/nix/milestone/60",
     },
+    {
+        .tag = Xp::ShardedLinks,
+        .name = "sharded-links",
+        .description = R"(
+            Change `/nix/store/.links/` from a single flat directory
+            to a two-level sharded tree
+            `/nix/store/.links/<pfx>/...`, where `<pfx>` is the
+            first two Nix-base32 characters of the hash. Reduces
+            kernel VFS rwsem contention on the shared directory
+            under parallel `nix store optimise` and GC, and splits
+            the htree of very large stores (tens of millions of
+            entries) into 1024 smaller directories (pre-created at
+            store open).
+
+            The entry filename inside each shard is `<hash>` for
+            the primary canonical and `<hash>.<NN>` (zero-padded
+            two-digit decimal) for any replica past the primary,
+            matching the flat layout's encoding. The replica /
+            spillover scheme is governed by the `max-link-replicas`
+            setting and is independent of this feature: a flat
+            store can have replicas, and a sharded store can have
+            `max-link-replicas=1` (no spillover), so the two axes
+            can be combined or used separately.
+
+            ## Migration
+
+            When `nix store optimise` runs with this feature
+            enabled on a store that still has legacy flat
+            `.links/<hash>` entries, it performs a one-shot bulk
+            migration up front — every flat entry is moved (via
+            `link(2)` + `unlink(2)`) into its corresponding
+            `<pfx>/<hash>` slot before any per-path dedup work
+            begins. `link(2)` returns EEXIST without touching the
+            destination if the primary slot is already taken (e.g.
+            the flag was toggled off, new flat entries were
+            created, then toggled on again); in that case the flat
+            inode spills into the next free replica
+            (`<pfx>/<hash>.01`, …) rather than being clobbered. We
+            deliberately avoid `rename(2)` here, which would
+            replace the destination atomically and orphan the
+            user-store hardlinks pointing at it. Crash-recovery is
+            handled by re-running migration: a stranded source +
+            same-inode destination is detected and the source
+            unlinked.
+
+            ## Operational notes
+
+            * Both layouts are walked unconditionally by GC and by
+              `optimisePath_`'s inode-hash fast path, so mixed
+              layouts (some hashes flat, others sharded) work
+              correctly. This is what makes the flag safe to toggle
+              on and off.
+            * Disabling the flag after migration leaves sharded
+              entries in place — they remain discoverable by every
+              code path that walks `.links/` — but new canonical
+              entries go flat. There is no reverse-migration tool;
+              a fully flat store requires an empty `.links/` as a
+              starting point.
+            * The shard directory layer follows a strict
+              `<2-char-prefix>/<hash>[.<NN>]` convention. Do not
+              rename shard directories or their entries manually —
+              parsers rely on the replica suffix (when present)
+              being exactly two decimal digits.
+        )",
+        .trackingUrl = "",
+    },
 }};
 
 static_assert(
@@ -319,8 +385,18 @@ nlohmann::json documentExperimentalFeatures()
     for (auto & xpFeature : xpFeatureDetails) {
         std::stringstream docOss;
         docOss << stripIndentation(xpFeature.description);
-        docOss << fmt(
-            "\nRefer to [%1% tracking issue](%2%) for feature tracking.", xpFeature.name, xpFeature.trackingUrl);
+        /* Only emit the tracking-issue footer when a URL is present.
+           An empty `trackingUrl` would render as the broken markdown
+           link `[<name> tracking issue]()` — better to omit the line
+           entirely than to ship a dead link in the generated manual.
+           Use this for features whose tracking infrastructure
+           doesn't exist yet (e.g. in-development branches). */
+        if (!xpFeature.trackingUrl.empty()) {
+            docOss << fmt(
+                "\nRefer to [%1% tracking issue](%2%) for feature tracking.",
+                xpFeature.name,
+                xpFeature.trackingUrl);
+        }
         res[std::string{xpFeature.name}] = trim(docOss.str());
     }
     return (nlohmann::json) res;

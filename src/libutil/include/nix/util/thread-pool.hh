@@ -3,13 +3,16 @@
 
 #include "nix/util/error.hh"
 #include "nix/util/fun.hh"
+#include "nix/util/signals.hh"
 #include "nix/util/sync.hh"
 
+#include <algorithm>
 #include <queue>
 #include <functional>
 #include <thread>
 #include <map>
 #include <atomic>
+#include <vector>
 
 namespace nix {
 

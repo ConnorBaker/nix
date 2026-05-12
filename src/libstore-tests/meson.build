@@ -67,6 +67,7 @@ sources = files(
   'filetransfer-request.cc',
   'filetransfer-retry.cc',
   'http-binary-cache-store.cc',
+  'invalidate-paths-checked.cc',
   'legacy-ssh-store.cc',
   'local-binary-cache-store.cc',
   'local-fs-store.cc',
@@ -134,6 +135,7 @@ if get_option('benchmarks')
   benchmark_sources = files(
     'bench-main.cc',
     'derivation-parser-bench.cc',
+    'optimise-bench.cc',
     'ref-scan-bench.cc',
     'register-valid-paths-bench.cc',
   )

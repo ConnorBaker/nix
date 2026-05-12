@@ -193,6 +193,16 @@ private:
     void deleteStorePath(const std::filesystem::path & path, uint64_t & bytesFreed, bool isKnownPath) override;
 
     /**
+     * Opt out of the two-phase rename-aside delete — rename within
+     * the overlay can leave a lower-layer shadow visible, which
+     * `deleteStorePath` handles with explicit whiteout logic.
+     */
+    bool supportsTwoPhaseDelete() const override
+    {
+        return false;
+    }
+
+    /**
      * Deduplicate by removing store objects from the upper layer that
      * are now in the lower layer.
      *
