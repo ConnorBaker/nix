@@ -139,8 +139,8 @@ in
       default = "single";
       description = ''
         Replica policy: `single` (max-link-replicas=1) or `multi`
-        (max-link-replicas=100 + _link-max-override=100 so the spill
-        path is exercised even on tmpfs/ZFS).
+        (max-link-replicas=100 + NIX_TEST_LINK_MAX_OVERRIDE=100 so
+        the spill path is exercised even on tmpfs/ZFS).
       '';
     };
 
@@ -309,30 +309,6 @@ in
     let
       isGCBench =
         cfg.benchName == "gc_barabasi" || cfg.benchName == "gc_clusters";
-
-      # Dispatches the rig actually exercises for this scenario. For
-      # GC benches with `dispatchOnly = null` it's both; the valid
-      # nPaths set is the intersection.
-      dispatchesToRun =
-        if !isGCBench then [ null ]
-        else if cfg.dispatchOnly != null then [ cfg.dispatchOnly ]
-        else [ "syscall" "iouring" ];
-
-      # The 200-path cell is only registered on baseline scenarios.
-      # On GC benches it's syscall-only, so a dispatchOnly=null GC
-      # run excludes it (iouring leg would fail).
-      isBaseline = cfg.layout == "flat" && cfg.replica == "single";
-      smallForDispatch = dispatch:
-        (cfg.benchName == "gc_barabasi" && dispatch == "syscall" && isBaseline)
-        || ((cfg.benchName == "optimise"
-              || cfg.benchName == "optimise_with_concurrent_gc")
-            && isBaseline);
-      hasSmallCell = lib.all smallForDispatch dispatchesToRun;
-
-      validNPaths =
-        if cfg.benchName == "invalidate_paths" then [ 100 500 2000 10000 50000 ]
-        else if hasSmallCell                   then [ 200 2000 10000 50000 ]
-        else                                        [ 2000 10000 50000 ];
     in
     [
       {
@@ -351,21 +327,9 @@ in
           "${cfg.benchName}".
         '';
       }
-      {
-        assertion = lib.elem cfg.nPaths validNPaths;
-        message = ''
-          bench.nPaths = ${toString cfg.nPaths} is not a registered
-          BENCHMARK_CAPTURE cell for bench.benchName =
-          "${cfg.benchName}" with bench.layout = "${cfg.layout}",
-          bench.replica = "${cfg.replica}"${
-            if cfg.dispatchOnly != null
-            then " and bench.dispatchOnly = \"${cfg.dispatchOnly}\""
-            else ""
-          }.
-          Valid: ${lib.concatStringsSep ", " (map toString validNPaths)}.
-          See BENCHMARK_CAPTURE rows in
-          src/libstore-tests/optimise-bench.cc.
-        '';
-      }
     ];
+  # `nPaths` is validated by the bench binary itself: an unregistered
+  # value surfaces as "Failed to match any benchmarks" at run time
+  # (see testScript.py). The registered cells live in
+  # `src/libstore-tests/optimise-bench.cc`.
 }

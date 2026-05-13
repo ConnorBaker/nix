@@ -4,6 +4,7 @@
 #include "nix/store/globals.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/store-open.hh"
+#include "nix/util/environment-variables.hh"
 #include "nix/util/experimental-features.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/hash.hh"
@@ -69,8 +70,23 @@ struct SettingsGuard
     SavedSetting<size_t> gcLinksThreads{settings.getLocalSettings().getGCSettings().gcLinksThreads};
     SavedSetting<bool> gcLinksUseIoUring{settings.getLocalSettings().getGCSettings().gcLinksUseIoUring};
     SavedSetting<size_t> maxLinkReplicas{settings.getLocalSettings().maxLinkReplicas};
-    SavedSetting<int64_t> linkMaxOverride{settings.getLocalSettings().linkMaxOverride};
     SavedSetting<std::set<ExperimentalFeature>> xpFeatures{experimentalFeatureSettings.experimentalFeatures};
+
+    /* Snapshot+restore of `NIX_TEST_LINK_MAX_OVERRIDE` (read once by
+       `LocalStore`'s ctor). Preserves the absent/present distinction
+       so a bench that didn't set the var doesn't leak a value into
+       the next one. */
+    struct SavedEnv
+    {
+        std::optional<std::string> saved = getEnv("NIX_TEST_LINK_MAX_OVERRIDE");
+        ~SavedEnv()
+        {
+            if (saved)
+                setEnv("NIX_TEST_LINK_MAX_OVERRIDE", saved->c_str());
+            else
+                ::unsetenv("NIX_TEST_LINK_MAX_OVERRIDE");
+        }
+    } savedLinkMaxOverride;
 
     /* Helper to toggle an experimental feature in/out of the live
        `experimentalFeatures` set. `Xp::ShardedLinks` is read at
@@ -100,47 +116,12 @@ static std::mutex benchSerialiseMutex;
 
 } // namespace
 
-/* ========================================================================
- *   A note on what these benchmarks measure, and what they don't
- * ========================================================================
- *
- * The fixture uses `$TMPDIR` for the store root. On typical NixOS /
- * Linux hosts `$TMPDIR` resolves to `/tmp`, which is almost always a
- * tmpfs (RAM-backed). Benchmarks on tmpfs show the CPU- and
- * kernel-VFS-bound ceiling of the operations, NOT the real-world
- * wall-clock on a large store backed by a block device.
- *
- * Three concrete differences on tmpfs vs ext4 on an IOPS-limited
- * device (e.g. EBS):
- *
- *   1. `link(2)` and `rename(2)` on tmpfs are ~20–100 µs; on ext4
- *      they are 100 µs – several ms (depends on IOPS budget).
- *   2. tmpfs serialises concurrent directory mutations on a kernel
- *      rwsem. At high thread counts (N=16) the `.links/` directory's
- *      rwsem becomes the bottleneck; per-syscall latency rises 3–4×
- *      over N=4. On a real ext4 store the IOPS ceiling kicks in
- *      before the VFS lock does, so the shape of the scaling curve
- *      is different.
- *   3. tmpfs has no journal, no fsync cost. The batched-SQLite win
- *      in Patch G2 is much more visible on ext4 with `data=ordered`
- *      than on tmpfs.
- *
- * Concretely, measurements on an Intel 32-thread host, Linux 6.18,
- * tmpfs `/tmp`:
- *
- *   optimise/10000/1   ~5.5 s
- *   optimise/10000/4   ~2.2 s   (2.5× speedup)
- *   optimise/10000/16  ~2.5 s   (regression vs N=4)
- *
- * The regression at N=16 is VFS-lock contention, not a Nix-side
- * lock. `perf stat` shows 23× more context switches and 3.85× more
- * system CPU at N=16 vs N=4, and `strace -c` shows link/rename
- * per-call latency grows from 14/25 µs to 56/88 µs.
- *
- * On the target production workload (20 TB EBS, ext4, 16k IOPS
- * budget), parallelism is bounded by IOPS, not by tmpfs VFS
- * locks, and we expect the designed 4–8× speedup at N=8–16.
- * ======================================================================== */
+/* The fixture uses `$TMPDIR` (typically tmpfs) for the store root,
+   so these benchmarks measure the CPU- and kernel-VFS-bound ceiling
+   of each operation, not real-world wall-clock on a block-device
+   store. Run on a real backing FS to measure that; see the bench
+   README's "Findings" section for the tmpfs-vs-ext4 differences and
+   the canonical scaling-curve shape. */
 
 /* ---------- optimise ------------------------------------------
  *
@@ -381,8 +362,9 @@ static void truncateBenchTempRoots(const std::filesystem::path & root)
      sharded   100 (multi)     sharded_multi_replica_hardlink       both axes together
 
    The bench rig does not ship reflink-based dedup — that was
-   investigated as a candidate third axis but rejected; see
-   `research/optimise-and-gc-throughput.md`. All dedup goes via `link(2)`. */
+   investigated as a candidate third axis but rejected; see the
+   bench README's "Rejected: CoW reflinks" section. All dedup goes
+   via `link(2)`. */
 enum class Variant {
     FlatSingleReplicaHardlink,
     FlatMultiReplicaHardlink,
@@ -392,18 +374,12 @@ enum class Variant {
 
 /* Variant settings table. Each row is the (sharded, replicaCap,
    linkMaxOverride) tuple to install on the matching `Variant`
-   enumerator. Rows MUST follow the `Variant` enum's declaration
-   order; the static_assert below catches drift.
-
-   `linkMaxOverride=100` on the multi-replica cells forces the
-   replica-spill path on test filesystems with effectively-infinite
-   hardlink ceilings (tmpfs/ZFS). 100 is sized for meaningful spill
-   at every bench size given the sqrt-Zipf math on the 256-blob
-   content pool — top-blob refs ≈ nPaths × 10 × 0.6 / 31 reach
-   ~380 at 2k, ~1900 at 10k, ~9700 at 50k. With cap=100, the
-   multi-replica cells spill across 4/19/97 replica slots at those
-   sizes; the single-replica cells (cap=1) saturate the primary and
-   leave the tail undeduped (visible in `bytesFreed`). */
+   enumerator. The `linkMaxOverride` value is exported via
+   `NIX_TEST_LINK_MAX_OVERRIDE`; `=100` on the multi-replica cells
+   forces the replica-spill path on test filesystems with
+   effectively-infinite hardlink ceilings (tmpfs/ZFS). Rows MUST
+   follow the `Variant` enum's declaration order; the static_assert
+   below catches drift. */
 struct VariantDescriptor
 {
     bool sharded;
@@ -435,23 +411,21 @@ enum class Dispatch {
     IoUring,  // io_uring batched STATX + UNLINKAT
 };
 
-static bool dispatchIoUring(Dispatch d)
-{
-    return d == Dispatch::IoUring;
-}
-
 /* Apply a `Variant` to the live settings. Toggles
-   `Xp::ShardedLinks`, `max-link-replicas`, and `_link-max-override`
-   in a single call so caller bench bodies don't have to remember
-   the coupling rules. Call *before* constructing the BenchFixture —
-   `Xp::ShardedLinks` and `_link-max-override` are both read at
-   LocalStore open time. */
+   `Xp::ShardedLinks`, `max-link-replicas`, and
+   `NIX_TEST_LINK_MAX_OVERRIDE` in a single call so caller bench
+   bodies don't have to remember the coupling rules. Call *before*
+   constructing the BenchFixture — `Xp::ShardedLinks` and the env
+   var are both read at LocalStore open time. */
 static void applyVariant(Variant v)
 {
     const auto & d = variantInfo(v);
     SettingsGuard::setXpFeature(Xp::ShardedLinks, d.sharded);
     settings.getLocalSettings().maxLinkReplicas.override(d.replicaCap);
-    settings.getLocalSettings().linkMaxOverride.override(d.linkMaxOverride);
+    if (d.linkMaxOverride > 0)
+        setEnv("NIX_TEST_LINK_MAX_OVERRIDE", std::to_string(d.linkMaxOverride).c_str());
+    else
+        unsetenv("NIX_TEST_LINK_MAX_OVERRIDE");
 }
 
 static void optimise(benchmark::State & state, Variant variant)
@@ -572,8 +546,9 @@ BENCHMARK_CAPTURE(optimise, sharded_multi_replica_hardlink,
  *   1. Build the fixture with `Xp::ShardedLinks` *off* (legacy flat
  *      layout). Run `optimiseStore()` to populate `.links/<H>` flat
  *      entries — one per deduplicated content hash. The
- *      `_link-max-override` is left at 0 here, so the flat layout's
- *      EMLINK ceiling is the host's pathconf value (tmpfs ≈ INT_MAX,
+ *      `NIX_TEST_LINK_MAX_OVERRIDE` env var is left unset here, so
+ *      the flat layout's EMLINK ceiling is the host's pathconf
+ *      value (tmpfs ≈ INT_MAX,
  *      ext4 = 65 000); on tmpfs/ZFS the dedup is total, so we get
  *      one flat entry per *distinct* (blob, replica) tuple.
  *   2. Drop the legacy LocalStore handle and re-open the same
@@ -899,7 +874,7 @@ static void gc_collect(benchmark::State & state, Variant variant, Dispatch dispa
                              topology, clusterSize);
         settings.getLocalSettings().optimiseThreads.override(std::min<size_t>(threads, 8));
         settings.getLocalSettings().getGCSettings().gcLinksThreads.override(threads);
-        settings.getLocalSettings().getGCSettings().gcLinksUseIoUring.override(dispatchIoUring(dispatch));
+        settings.getLocalSettings().getGCSettings().gcLinksUseIoUring.override(dispatch == Dispatch::IoUring);
         /* Pre-optimise so `.links/` has entries for GC to sweep.
            The warm-up registers every path as a temp root via
            addTempRoot; without the truncate below, the timed GC

@@ -23,8 +23,7 @@ generateDisjoint() {
     local n="$1"
     local tag="$2"
 
-    local expr
-    expr=$(cat <<EOF
+    realiseFromExpr "$tag" <<EOF
 let
   cfg = import ${config_nix};
   mkN = i: cfg.mkDerivation {
@@ -38,14 +37,6 @@ in builtins.listToAttrs (
      map (i: { name = "d\${toString i}"; value = mkN i; })
      (builtins.genList (x: x) ${n}))
 EOF
-)
-    local drvs
-    drvs=$(echo "$expr" | nix-instantiate --expr - --add-root "$TEST_ROOT/$tag.drvs" --indirect 2>/dev/null)
-    while IFS= read -r drv; do
-        [ -z "$drv" ] && continue
-        nix-store --realise "$drv" > /dev/null
-    done <<< "$drvs"
-    rm -f "$TEST_ROOT/$tag.drvs"*
 }
 
 hasGlob() { find "$NIX_STORE_DIR" -maxdepth 1 -name "$1" -print -quit 2>/dev/null | grep -q .; }

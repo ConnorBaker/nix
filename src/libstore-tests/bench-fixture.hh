@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <optional>
@@ -112,7 +113,7 @@ struct ContentPool
        pathological fixture inputs (1M-path stores saturating ext4's
        per-inode hardlink ceiling). At supported sizes (≤50k paths)
        rotation never fires; replica spillover is exercised separately
-       via the `_link-max-override` test setting. */
+       via the `NIX_TEST_LINK_MAX_OVERRIDE` env var. */
     static constexpr size_t kHardlinkCap = 200000;
 
     std::vector<std::string> blobs;
@@ -307,32 +308,33 @@ struct BenchFixture
         if (!ownsRoot)
             return;
 
-        /* optimisePath_ sets subdirectories read-only via
-           MakeReadOnly; make every directory writable again so
-           remove_all can traverse. Each fs call gets a fresh
-           `std::error_code` so a transient EACCES on one path
-           doesn't latch into the iterator's state. Best-effort
-           cleanup — don't throw. */
-        {
-            std::error_code itEc;
-            auto end = std::filesystem::recursive_directory_iterator{};
-            for (auto it = std::filesystem::recursive_directory_iterator(root, itEc);
-                 !itEc && it != end;
-                 it.increment(itEc)) {
-                std::error_code statEc;
-                bool isDir = it->is_directory(statEc);
-                if (statEc || !isDir)
-                    continue;
-                std::error_code permEc;
-                std::filesystem::permissions(
-                    it->path(), std::filesystem::perms::owner_all, permEc);
-            }
-        }
+        /* `optimisePath_` set subdirs read-only via MakeReadOnly;
+           a `chmod -R u+w` is the simplest way to make the tree
+           removable. Best-effort cleanup — `(void)`-casting the rc
+           doesn't suppress GCC's `warn_unused_result` attribute on
+           `system`, so capture into a discarded variable instead. */
+        std::string cmd = "chmod -R u+w " + shellEscape(root.string());
+        [[maybe_unused]] int rc = std::system(cmd.c_str());
         std::error_code rmEc;
         std::filesystem::remove_all(root, rmEc);
     }
 
 private:
+    static std::string shellEscape(std::string_view s)
+    {
+        std::string out;
+        out.reserve(s.size() + 2);
+        out.push_back('\'');
+        for (char c : s) {
+            if (c == '\'')
+                out.append("'\\''");
+            else
+                out.push_back(c);
+        }
+        out.push_back('\'');
+        return out;
+    }
+
     BenchFixture(
         std::pair<std::filesystem::path, bool> rootSpec,
         size_t nPaths,

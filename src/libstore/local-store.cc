@@ -9,6 +9,7 @@
 #include "nix/store/realisation.hh"
 #include "nix/store/references.hh"
 #include "nix/util/callback.hh"
+#include "nix/util/environment-variables.hh"
 #include "nix/util/topo-sort.hh"
 #include "nix/util/finally.hh"
 #include "nix/util/compression.hh"
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <format>
 
 #include <memory>
 #include <new>
@@ -165,16 +167,10 @@ LocalStore::LocalStore(ref<const Config> config)
 
     /* Query the filesystem's per-file hardlink ceiling so the
        replica walk in `optimisePath_` can opportunistically skip
-       saturated slots without a round-trip to the kernel. The
-       commit path in `optimisePath_` handles EMLINK regardless, so
-       this value is advisory — a conservative fallback is safe.
-
-       The `_link-max-override` test setting, when positive, replaces
-       the probed value. Benches use it to force the replica spill
-       path on filesystems with effectively-infinite ceilings
-       (tmpfs, ZFS), so the `sharded_multi_replica_hardlink` vs
-       `sharded_single_replica_hardlink` comparison produces signal at
-       small fixture sizes. */
+       saturated slots without a round-trip to the kernel. EMLINK
+       on link(2) is handled regardless, so this is advisory; a
+       conservative fallback is safe. The `NIX_TEST_LINK_MAX_OVERRIDE`
+       env var lets benches force a low ceiling on tmpfs/ZFS. */
 #ifndef _WIN32
     {
         long pc = ::pathconf(linksDir.string().c_str(), _PC_LINK_MAX);
@@ -183,8 +179,9 @@ LocalStore::LocalStore(ref<const Config> config)
 #else
     linkMax = int64_t{32000};
 #endif
-    if (auto ov = config->getLocalSettings().linkMaxOverride.get(); ov > 0)
-        linkMax = ov;
+    if (auto ov = getEnv("NIX_TEST_LINK_MAX_OVERRIDE"))
+        if (auto n = string2Int<int64_t>(*ov); n && *n > 0)
+            linkMax = *n;
 
     auto profilesDir = config->stateDir.get() / "profiles";
     createDirs(profilesDir);
@@ -445,25 +442,26 @@ AutoCloseFD LocalStore::openGCLock()
     return toDescriptor(fdGCLock);
 }
 
+/* Compose a `.links/` filename: `<base>` for replica 0, `<base>.<NN>`
+   for replicas 1..99. The unsuffixed primary preserves backward
+   compatibility with pre-`fffca655b` `.links/<hash>` entries. */
+std::string LocalStore::replicaFilename(std::string_view base, uint8_t replica)
+{
+    if (replica == 0)
+        return std::string(base);
+    return std::format("{}.{:02}", base, static_cast<unsigned>(replica));
+}
+
 std::filesystem::path LocalStore::linkPathFor(const Hash & hash, uint8_t replica) const
 {
     assert(replica < maxReplicaSlots);
     auto hs = hash.to_string(HashFormat::Nix32, false);
-    /* Directory and filename are independent axes:
-         - directory: flat (linksDir) vs sharded (linksDir/<pfx>)
-         - filename: `<hash>` for replica 0 (the primary), or
-           `<hash>.<NN>` for replica > 0 (a spillover slot)
-       This decouples `sharded-links` (parallelism via 1024-way
-       directory split) from `max-link-replicas` (spillover past the
-       per-inode hardlink ceiling); both can be combined or used
-       independently. Replica 0's lack of suffix preserves backward
-       compatibility with pre-`fffca655b` `.links/<hash>` entries. */
+    /* Directory and filename are independent axes: directory is flat
+       (`linksDir`) vs sharded (`linksDir/<pfx>`); filename is decided
+       by `replicaFilename`. This decouples `sharded-links` from
+       `max-link-replicas`. */
     auto dir = shardedLinks ? linksDir / hs.substr(0, 2) : linksDir;
-    if (replica == 0)
-        return dir / hs;
-    char suffix[4];
-    std::snprintf(suffix, sizeof suffix, ".%02u", static_cast<unsigned>(replica));
-    return dir / (hs + suffix);
+    return dir / replicaFilename(hs, replica);
 }
 
 std::string_view LocalStore::stripReplicaSuffix(std::string_view name) const

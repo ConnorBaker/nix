@@ -273,13 +273,23 @@ findCanonicalLink() {
   return 1
 }
 
+# Instantiate the attribute-set Nix expression on stdin, realise
+# every derivation it produces, and drop the temporary drv roots.
+# `$1` is a tag used to name the temporary drv-root files.
+realiseFromExpr() {
+  local tag="$1"
+  local drvs
+  drvs="$(nix-instantiate --expr - --add-root "$TEST_ROOT/$tag.drvs" --indirect 2>/dev/null)"
+  while IFS= read -r drv; do
+    [ -z "$drv" ] && continue
+    nix-store --realise "$drv" > /dev/null
+  done <<< "$drvs"
+  rm -f "$TEST_ROOT/$tag.drvs"*
+}
+
 # Assert that the two files at `$1` and `$2` are deduplicated by the
 # optimise path. All dedup is via `link(2)`, so the check is a
-# straightforward same-inode test. (Earlier branches of this code
-# supported a CoW-reflink path that produced distinct inodes with
-# shared extents; that mechanism was investigated and dropped — see
-# `research/optimise-and-gc-throughput.md` — so the helper is back
-# to the simple form.)
+# straightforward same-inode test.
 assertDeduplicated() {
   local p1="$1" p2="$2"
   local ino1 ino2

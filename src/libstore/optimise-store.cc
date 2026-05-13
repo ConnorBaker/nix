@@ -1,19 +1,19 @@
 #include "nix/store/local-store.hh"
 #include "nix/store/local-settings.hh"
 #include "nix/store/pathlocks.hh"
-#include "nix/store/stage-timer.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/posix-source-accessor.hh"
 #include "nix/util/file-system.hh"
 
+#include "nix/util/finally.hh"
+
 #include <oneapi/tbb/parallel_for_each.h>
 #include <oneapi/tbb/task_arena.h>
 
-#include <boost/scope/scope_exit.hpp>
-
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -36,76 +36,49 @@ static void makeWritable(const std::filesystem::path & path)
     chmod(path, st.st_mode | S_IWUSR);
 }
 
-struct MakeReadOnly
-{
-    std::filesystem::path path;
+/* Lazy per-directory writability guard. Threaded through
+   `optimisePath_`'s recursion so all sibling-file replacements in
+   one directory share a single chmod(+w)/canonicalise(-w) pair
+   instead of toggling permissions per file (a ~20× reduction in
+   metadata writes on typical stores).
 
-    MakeReadOnly(std::filesystem::path path)
-        : path(std::move(path))
+   Safe under parallel `optimiseStore` because parallelism is at
+   top-level store-path granularity: sibling files in one subdir
+   always land on the same worker. */
+struct LocalStore::DirWritability
+{
+    std::filesystem::path dir;
+    bool needsCanonicalise = false;
+    bool isStoreRoot;
+
+    DirWritability(std::filesystem::path d, const std::filesystem::path & storeRoot)
+        : dir(std::move(d))
+        , isStoreRoot(dir == storeRoot)
     {
     }
 
-    ~MakeReadOnly()
+    void ensureWritable()
     {
+        if (isStoreRoot || needsCanonicalise)
+            return;
+        makeWritable(dir);
+        needsCanonicalise = true;
+    }
+
+    ~DirWritability()
+    {
+        if (!needsCanonicalise)
+            return;
         try {
-            /* This will make the path read-only. */
-            if (!path.empty())
-                canonicaliseTimestampAndPermissions(path.string());
+            canonicaliseTimestampAndPermissions(dir.string());
         } catch (...) {
             ignoreExceptionInDestructor();
         }
     }
+
+    DirWritability(const DirWritability &) = delete;
+    DirWritability & operator=(const DirWritability &) = delete;
 };
-
-/* Lazy per-directory writability guard. Threaded through
-   `optimisePath_`'s recursion so that all sibling-file replacements
-   in one directory share a single chmod(+w) + canonicalise(-w) pair,
-   rather than toggling permissions per file.
-
-   Why this matters: a directory with K files that all need replacing
-   used to incur 2K chmods (one +w, one -w per file) plus 2K journal
-   commits on ext4. On a store with 4M paths containing an average
-   of ~20 files each, that's tens of millions of redundant metadata
-   writes. Batching at the directory level reduces this to 2 chmods
-   per directory — a ~20× reduction on typical stores.
-
-   The guard is safe under parallel `optimiseStore` because we
-   parallelise at top-level store path granularity: sibling files in
-   the same subdirectory always land on the same worker thread, so
-   the ensure/restore sequence is single-threaded per directory.
-
-   Usage:
-     LocalStore::DirWritability w(dirPath, storeRoot);
-     // recurse into children — they may call w.ensureWritable() before
-     // modifying their entries in `dirPath`
-     // dtor canonicalises dir permissions back to read-only if we
-     // actually toggled.
- */
-LocalStore::DirWritability::DirWritability(
-    std::filesystem::path d, const std::filesystem::path & storeRoot)
-    : dir(std::move(d))
-    , isStoreRoot(dir == storeRoot)
-{
-}
-
-void LocalStore::DirWritability::ensureWritable()
-{
-    if (isStoreRoot || needsCanonicalise)
-        return;
-    makeWritable(dir);
-    needsCanonicalise = true;
-}
-
-LocalStore::DirWritability::~DirWritability()
-{
-    if (!needsCanonicalise)
-        return;
-    try {
-        canonicaliseTimestampAndPermissions(dir.string());
-    } catch (...) {
-        ignoreExceptionInDestructor();
-    }
-}
 
 void LocalStore::loadInodeHashInto(InodeHash & inodeHash)
 {
@@ -387,26 +360,21 @@ void LocalStore::optimisePath_(
        `rename(2)` onto `path` surfaces as `ReplicaFull` so the
        replica loop can advance — there is no need to "reserve
        headroom" by pre-checking `st_nlink`; the kernel is the source
-       of truth. */
-    std::optional<MakeReadOnly> perCallReadOnly;
-    bool dirWritabilityEnsured = false;
-    auto ensureDirWritable = [&] {
-        if (dirWritabilityEnsured)
-            return;
-        dirWritabilityEnsured = true;
-        const auto dirOfPath = path.parent_path();
-        if (parentDirWritability) {
-            parentDirWritability->ensureWritable();
-        } else {
-            bool mustToggle = dirOfPath != config->realStoreDir.get();
-            if (mustToggle)
-                makeWritable(dirOfPath);
-            perCallReadOnly.emplace(mustToggle ? dirOfPath : std::filesystem::path{});
-        }
-    };
+       of truth.
+
+       When called recursively from a directory, `parentDirWritability`
+       points at the parent dir's shared guard (one chmod toggle
+       amortised across all siblings). Top-level leaf calls have no
+       parent, so we lazily create our own. */
+    std::optional<DirWritability> ownGuard;
+    DirWritability * dirWritability = parentDirWritability;
+    if (!dirWritability) {
+        ownGuard.emplace(path.parent_path(), config->realStoreDir.get());
+        dirWritability = &*ownGuard;
+    }
 
     auto tryReplaceWith = [&](const std::filesystem::path & candidate) -> LinkResult {
-        ensureDirWritable();
+        dirWritability->ensureWritable();
         auto tempLink = makeTempPath(config->realStoreDir.get(), ".tmp-link");
 
         /* Don't insert into `inodeHash` here. Siblings lstat to
@@ -418,9 +386,13 @@ void LocalStore::optimisePath_(
 
         /* Cleanup guard: removes the tempLink if any exception
            escapes between `create_hard_link` succeeding and the
-           rename completing. Created inactive — armed after the
-           link succeeds, released after the rename succeeds. */
-        auto tempLinkGuard = boost::scope::make_scope_exit([&] {
+           rename completing. `armed` is flipped to `true` after the
+           link succeeds and back to `false` after the rename
+           succeeds. */
+        bool armed = false;
+        Finally tempLinkGuard([&] {
+            if (!armed)
+                return;
             try {
                 std::error_code ec;
                 std::filesystem::remove(tempLink, ec);
@@ -430,13 +402,12 @@ void LocalStore::optimisePath_(
                 ignoreExceptionInDestructor();
             }
         });
-        tempLinkGuard.set_active(false);
 
         std::error_code linkEc;
         std::filesystem::create_hard_link(candidate, tempLink, linkEc);
 
         if (!linkEc) {
-            tempLinkGuard.set_active(true);
+            armed = true;
         } else {
             if (linkEc == std::errc::too_many_links)
                 return LinkResult::ReplicaFull;
@@ -461,7 +432,7 @@ void LocalStore::optimisePath_(
             /* Success: `rename(2)` atomically moved `tempLink` onto
                `path`, so there's no longer a tempLink name to
                clean up. Disarm before the guard dtor runs. */
-            tempLinkGuard.set_active(false);
+            armed = false;
         } catch (std::filesystem::filesystem_error & e) {
             if (e.code() == std::errc::too_many_links)
                 return LinkResult::ReplicaFull;
@@ -516,12 +487,7 @@ void LocalStore::optimisePath_(
             warn(
                 "There may be more corrupted paths."
                 "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
-            try {
-                nix::unlink(candidate);
-            } catch (SysError & e) {
-                if (e.errNo != ENOENT)
-                    throw;
-            }
+            unlinkIfExists(candidate);
             stCanon.reset();
         }
 
@@ -648,27 +614,14 @@ void LocalStore::migrateLinksDirToSharded()
            inode), detects the same-inode case below, and unlinks
            the stranded flat entry — i.e. fully idempotent under
            crash recovery. */
-        auto dstNameFor = [&](uint8_t replica) -> std::string {
-            if (replica == 0)
-                return baseHash;
-            char suffix[4];
-            std::snprintf(suffix, sizeof suffix, ".%02u", static_cast<unsigned>(replica));
-            return baseHash + suffix;
-        };
-
         bool done = false;
         for (uint8_t replica = 0; replica < maxReplicaSlots; ++replica) {
-            auto dst = shardDir / dstNameFor(replica);
+            auto dst = shardDir / replicaFilename(baseHash, replica);
             if (::link(src.string().c_str(), dst.string().c_str()) == 0) {
-                /* Linked; now unlink the source. ENOENT here means a
-                   concurrent GC pulled it out from under us, but the
-                   sharded entry exists and is intact — fine. */
-                try {
-                    nix::unlink(src);
-                } catch (SysError & e) {
-                    if (e.errNo != ENOENT)
-                        throw;
-                }
+                /* Linked; now unlink the source. ENOENT is fine —
+                   a concurrent GC may have pulled it out from under
+                   us, but the sharded entry exists and is intact. */
+                unlinkIfExists(src);
                 ++migrated;
                 done = true;
                 break;
@@ -693,13 +646,8 @@ void LocalStore::migrateLinksDirToSharded()
                     }
                     if (auto primaryStat = maybeLstat(dst);
                         primaryStat && primaryStat->st_ino == srcStat->st_ino) {
-                        try {
-                            nix::unlink(src);
-                            ++migrated;
-                        } catch (SysError & ue) {
-                            if (ue.errNo != ENOENT)
-                                throw;
-                        }
+                        unlinkIfExists(src);
+                        ++migrated;
                         done = true;
                         break;
                     }
@@ -723,7 +671,12 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
 {
     Activity act(*logger, actOptimiseStore);
 
-    StageTimer timer;
+    auto t0 = std::chrono::steady_clock::now();
+    auto stage = [&](uint64_t & f) {
+        auto t1 = std::chrono::steady_clock::now();
+        f += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        t0 = t1;
+    };
 
     /* Serialise whole-store optimise with a process-level advisory
        lock. Otherwise two concurrent optimise runs will ping-pong
@@ -740,7 +693,7 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         printInfo("waiting for exclusive access to optimise the Nix store...");
         lockFile(fdOptLock.get(), ltWrite, true);
     }
-    timer.record(stats.timings.setupNs);
+    stage(stats.timings.setupNs);
 
     /* If the sharded-links feature is enabled, first migrate any
        pre-existing legacy flat entries into their shards. One-shot;
@@ -749,17 +702,17 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
        layout. */
     if (shardedLinks)
         migrateLinksDirToSharded();
-    timer.record(stats.timings.migrateLinksNs);
+    stage(stats.timings.migrateLinksNs);
 
     /* `std::set` has no random access, so materialise into a vector
        for index-based partitioning across workers. */
     auto pathSet = queryAllValidPaths();
     std::vector<StorePath> paths{pathSet.begin(), pathSet.end()};
-    timer.record(stats.timings.queryAllPathsNs);
+    stage(stats.timings.queryAllPathsNs);
 
     InodeHash inodeHash;
     loadInodeHashInto(inodeHash);
-    timer.record(stats.timings.loadInodeHashNs);
+    stage(stats.timings.loadInodeHashNs);
 
     const uint64_t total = paths.size();
     act.progress(0, total);
@@ -794,7 +747,7 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
                 act.progress(d, total);
         });
     });
-    timer.record(stats.timings.parallelOptimiseNs);
+    stage(stats.timings.parallelOptimiseNs);
 }
 
 void LocalStore::optimiseStore()

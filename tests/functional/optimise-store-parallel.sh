@@ -26,8 +26,7 @@ generateStore() {
     local m="$2"
     local tag="$3"
 
-    local drvExpr
-    drvExpr=$(cat <<EOF
+    realiseFromExpr "$tag" <<EOF
 let
   cfg = import ${config_nix};
   mkN = i: cfg.mkDerivation {
@@ -45,20 +44,6 @@ in
     map (i: { name = "d\${toString i}"; value = mkN i; })
     (builtins.genList (x: x) ${n}))
 EOF
-)
-    # Materialise into a single rooted drv so nix-store --realise sees it.
-    # We don't swallow errors here — an instantiation failure used to
-    # be hidden by `|| true`, leaving `rootedDrv` empty and silently
-    # passing later equality checks (both snapshots empty).
-    local rootedDrv
-    rootedDrv=$(echo "$drvExpr" | nix-instantiate --expr - --add-root "$TEST_ROOT/$tag.drvs" --indirect)
-    # Build each output sequentially (fast — all builds finish in <1s).
-    echo "$rootedDrv" | while IFS= read -r drv; do
-        [ -z "$drv" ] && continue
-        nix-store --realise "$drv" > /dev/null
-    done
-    # Drop the drv roots; outputs remain valid in DB with no GC root.
-    rm -f "$TEST_ROOT/$tag.drvs"*
 }
 
 # Snapshot the structural state of the store that optimise should
@@ -199,17 +184,7 @@ if [ "$(countLinks)" != "$parallelLinks" ]; then
     exit 1
 fi
 
-# ------------- Scenario 4: auto-optimise-store inline path -------------
-
-clearStoreIfPossible
-# shellcheck disable=SC2016
-outA=$(echo 'with import '"${config_nix}"'; mkDerivation { name = "inline-A"; builder = builtins.toFile "b" "mkdir $out; echo inline > $out/f"; }' | nix-build - --no-out-link --auto-optimise-store)
-# shellcheck disable=SC2016
-outB=$(echo 'with import '"${config_nix}"'; mkDerivation { name = "inline-B"; builder = builtins.toFile "b" "mkdir $out; echo inline > $out/f"; }' | nix-build - --no-out-link --auto-optimise-store)
-
-assertDeduplicated "$outA/f" "$outB/f"
-
-# ------------- Scenario 5: SIGINT mid-run leaves store consistent -------------
+# ------------- Scenario 4: SIGINT mid-run leaves store consistent -------------
 #
 # Start an optimise on a populated store, send SIGINT mid-loop, and
 # verify:

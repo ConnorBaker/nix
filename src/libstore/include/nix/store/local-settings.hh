@@ -372,30 +372,6 @@ struct LocalSettings : public virtual Config, public GCSettings, public AutoAllo
           already-deduped files and thread scaling extends further.
         )"};
 
-    Setting<int64_t> linkMaxOverride{
-        this,
-        0,
-        "_link-max-override",
-        R"(
-          *Test-only.* Artificial cap on the filesystem's per-inode
-          hardlink ceiling. When set to a positive value, overrides
-          the `pathconf(_PC_LINK_MAX)` probe in `LocalStore`'s
-          constructor. `0` (the default) leaves the probe's value
-          in place.
-
-          The leading underscore in the name marks this as an
-          internal knob: production stores should never set it.
-          It exists so benchmarks can exercise the replica-spill
-          path at small scale and on filesystems with
-          effectively-infinite hardlink ceilings (tmpfs, ZFS).
-          Without it, the `sharded_multi_replica_hardlink` vs
-          `sharded_single_replica_hardlink` cells produce identical
-          results because the cap is never reached.
-
-          Read once at LocalStore construction; subsequent changes
-          have no effect until a new store is opened.
-        )"};
-
     Setting<size_t> maxLinkReplicas{
         this,
         100,

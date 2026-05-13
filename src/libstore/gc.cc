@@ -3,7 +3,6 @@
 #include "nix/store/local-settings.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/path.hh"
-#include "nix/store/stage-timer.hh"
 #include "nix/util/configuration.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/util/finally.hh"
@@ -35,6 +34,7 @@
 #include <boost/regex.hpp>
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -54,6 +54,23 @@
 #include <unistd.h>
 
 namespace nix {
+
+/* Compile-time constant mirroring `HAVE_LIBURING`. Lets the
+   io_uring-vs-syscall dispatches in `collectGarbage` use a plain
+   `if` rather than `#if HAVE_LIBURING`; the stub definitions in the
+   `#else` branch below keep the call sites well-formed when
+   `kHaveLibUring == false`. */
+inline constexpr bool kHaveLibUring = HAVE_LIBURING;
+
+/* Dispatch predicate shared by Phase-2 orphan deletion and Phase-3
+   `.links/` cleanup. Folds the build-time and runtime axes into one
+   bool. When `kHaveLibUring == false` the `&&` is dead so the
+   setting lookup is short-circuited away. */
+static bool useIoUringDispatch(const LocalStoreConfig & cfg)
+{
+    return kHaveLibUring
+        && cfg.getLocalSettings().getGCSettings().gcLinksUseIoUring.get();
+}
 
 #if HAVE_LIBURING
 namespace {
@@ -290,15 +307,13 @@ static void cleanupOrphansIoUring(
     if (orphans.empty())
         return;
 
-    struct OrphanEntries
-    {
-        std::vector<std::string> files;
-        std::vector<std::string> dirs;
-    };
-
+    /* Post-order walk: files first, then their parent dirs. The two
+       lists feed Stage B (`UNLINKAT` on files) and Stage C (`UNLINKAT
+       | AT_REMOVEDIR` on now-empty dirs) of the io_uring pipeline. */
     auto walk = [&](this auto & self,
                     const std::filesystem::path & p,
-                    OrphanEntries & out) -> void {
+                    std::vector<std::string> & files,
+                    std::vector<std::string> & dirs) -> void {
         checkInterrupt();
         struct stat st;
         if (::lstat(p.c_str(), &st) == -1) {
@@ -346,12 +361,12 @@ static void cleanupOrphansIoUring(
                     walkOk = false;
                     break;
                 }
-                self(it->path(), out);
+                self(it->path(), files, dirs);
             }
             if (walkOk)
-                out.dirs.push_back(p.string());
+                dirs.push_back(p.string());
         } else {
-            out.files.push_back(p.string());
+            files.push_back(p.string());
         }
     };
 
@@ -360,24 +375,34 @@ static void cleanupOrphansIoUring(
        mirroring deletePath's structure on the syscall side. Walk
        and submit interleave across orphans rather than running as
        two strict sequential phases over the whole orphan set.
-       Destructor handles cleanup so rings are exited even on the
-       exception path. */
-    struct WorkerRing
+       `std::optional` encodes the lazy-init invariant — an absent
+       slot means the thread hasn't touched a ring yet; `OwnedRing`'s
+       RAII handles cleanup including the exception path. */
+    struct OwnedRing
     {
         io_uring ring;
-        bool initialized = false;
-        WorkerRing() = default;
-        WorkerRing(const WorkerRing &) = delete;
-        WorkerRing & operator=(const WorkerRing &) = delete;
-        ~WorkerRing()
+        explicit OwnedRing(unsigned qd)
         {
-            if (initialized)
-                io_uring_queue_exit(&ring);
+            int rc = io_uring_queue_init(qd, &ring, 0);
+            if (rc < 0) {
+                errno = -rc;
+                throw SysError("io_uring_queue_init");
+            }
         }
+        ~OwnedRing() { io_uring_queue_exit(&ring); }
+        OwnedRing(const OwnedRing &) = delete;
+        OwnedRing & operator=(const OwnedRing &) = delete;
     };
-    tbb::enumerable_thread_specific<WorkerRing> rings;
+    tbb::enumerable_thread_specific<std::optional<OwnedRing>> rings;
 
     constexpr unsigned QD = 1024;
+
+    /* io-wq worker cap per ring. Chosen so the aggregate across all
+       N rings (`N * IOWQ_WORKERS_PER_RING`) tracks the old
+       single-ring total of `N * 16` for typical N — keeps total
+       kernel-side parallelism comparable while letting walks and
+       submits pipeline across the per-worker rings. */
+    constexpr unsigned IOWQ_WORKERS_PER_RING = 2;
 
     /* Cross-thread error reporting. firstErrno wins-first via CAS;
        firstErrorPath/Flags are guarded by errorMutex. */
@@ -462,33 +487,24 @@ static void cleanupOrphansIoUring(
     arena.execute([&] {
         tbb::parallel_for(size_t(0), orphans.size(), [&](size_t i) {
             auto & wr = rings.local();
-            if (!wr.initialized) {
-                int rc = io_uring_queue_init(QD * 2, &wr.ring, 0);
-                if (rc < 0) {
-                    errno = -rc;
-                    throw SysError("io_uring_queue_init");
-                }
-                /* Per-ring io-wq worker cap ≈ old single-ring total
-                   divided across `nThreads` rings (old was
-                   `nThreads*16 = 128` for cores=8). Keeps total
-                   kernel-side parallelism comparable while letting
-                   walks and submits pipeline across worker threads. */
+            if (!wr) {
+                wr.emplace(QD * 2);
                 unsigned vals[2] = {
-                    static_cast<unsigned>(nThreads * 2),
-                    static_cast<unsigned>(nThreads * 2)};
-                io_uring_register_iowq_max_workers(&wr.ring, vals);
-                wr.initialized = true;
+                    static_cast<unsigned>(nThreads * IOWQ_WORKERS_PER_RING),
+                    static_cast<unsigned>(nThreads * IOWQ_WORKERS_PER_RING)};
+                io_uring_register_iowq_max_workers(&wr->ring, vals);
             }
 
-            OrphanEntries entries;
-            walk(orphans[i], entries);
-            submitBatchOnRing(wr.ring, entries.files, 0);
-            submitBatchOnRing(wr.ring, entries.dirs, AT_REMOVEDIR);
+            std::vector<std::string> files, dirs;
+            walk(orphans[i], files, dirs);
+            submitBatchOnRing(wr->ring, files, 0);
+            submitBatchOnRing(wr->ring, dirs, AT_REMOVEDIR);
         });
     });
 
-    /* `rings` going out of scope at function exit runs WorkerRing's
-       destructor on each per-thread instance — RAII cleanup. */
+    /* `rings` going out of scope runs `~OwnedRing` on each engaged
+       per-thread `optional` — RAII cleanup including the exception
+       path. */
 
     if (firstErrno.load() != 0 && !ignoreFailure) {
         std::lock_guard lock(errorMutex);
@@ -507,6 +523,30 @@ static void cleanupOrphansIoUring(
     }
 }
 
+} // namespace
+#else // !HAVE_LIBURING
+namespace {
+/* Stubs so the dispatch call sites in `collectGarbage` compile when
+   `liburing` isn't available. `kHaveLibUring == false` makes the
+   guarding `if` dead at every call site, so these stubs are
+   unreachable; assert that loudly if a future refactor breaks the
+   invariant. */
+static void cleanupLinksIoUring(
+    const std::filesystem::path &,
+    const std::vector<std::filesystem::path> &,
+    std::atomic<int64_t> &,
+    std::atomic<int64_t> &,
+    size_t)
+{
+    assert(false && "cleanupLinksIoUring called without HAVE_LIBURING");
+}
+static void cleanupOrphansIoUring(
+    const std::vector<std::filesystem::path> &,
+    size_t,
+    bool)
+{
+    assert(false && "cleanupOrphansIoUring called without HAVE_LIBURING");
+}
 } // namespace
 #endif // HAVE_LIBURING
 
@@ -872,7 +912,12 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 {
     const auto & gcSettings = config->getLocalSettings().getGCSettings();
 
-    StageTimer timer;
+    auto t0 = std::chrono::steady_clock::now();
+    auto stage = [&](uint64_t & f) {
+        auto t1 = std::chrono::steady_clock::now();
+        f += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        t0 = t1;
+    };
 
     bool shouldDelete = options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific;
 
@@ -1056,7 +1101,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     /* End-of-roots-collection boundary. Everything up to here is
        socket setup + root enumeration. The DB snapshot below is the
        next stage. */
-    timer.record(results.timings.findRootsNs);
+    stage(results.timings.findRootsNs);
 
     /* Two-phase deletion state.
 
@@ -1288,7 +1333,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     /* End-of-snapshot boundary. The traversal + Phase 1 invalidate-
        and-rename starts immediately after the helper closures are
        defined below. */
-    timer.record(results.timings.loadValidPathsNs);
+    stage(results.timings.loadValidPathsNs);
 
     /* Whether we can compute derivation-/output-related edges
        purely in-memory using the snapshot, or whether we need to
@@ -1834,7 +1879,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     /* End-of-traversal boundary. Includes the helper-closure
        definitions, the closure walk, and Phase 1 (invalidate +
        rename-aside) for every dead path. */
-    timer.record(results.timings.traverseAndPhase1Ns);
+    stage(results.timings.traverseAndPhase1Ns);
 
     /* Phase 2 of the two-phase delete: recursively remove every
        `.gc-*` orphan we queued. The live store namespace has
@@ -1867,8 +1912,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         auto nThreads =
             Settings::resolveThreadCount(config->getLocalSettings().getGCSettings().gcDeleteThreads.get());
 
-#if HAVE_LIBURING
-        if (config->getLocalSettings().getGCSettings().gcLinksUseIoUring.get()) {
+        if (useIoUringDispatch(*config)) {
             /* io_uring fanout across orphans: walks subtrees with TBB
                (purely CPU) to collect files+dirs, then bulk-unlinks via
                a single high-QD ring. Across orphans this exposes far
@@ -1878,9 +1922,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                paths. See cleanupOrphansIoUring docstring for caveats. */
             cleanupOrphansIoUring(
                 phase2DeleteQueue, nThreads, config->ignoreGcDeleteFailure);
-        } else
-#endif
-        {
+        } else {
             tbb::task_arena arena(static_cast<int>(nThreads));
             arena.execute([&] {
                 tbb::parallel_for_each(phase2DeleteQueue, [&](const std::filesystem::path & orphan) {
@@ -1907,7 +1949,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
     /* End-of-Phase-2 boundary. The `.links/` sweep below is the
        last stage we time. */
-    timer.record(results.timings.phase2DeleteNs);
+    stage(results.timings.phase2DeleteNs);
 
     /* Unlink all files in /nix/store/.links that have a link count of 1,
        which indicates that there are no other links and so they can be
@@ -1941,13 +1983,10 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         auto nThreads =
             Settings::resolveThreadCount(config->getLocalSettings().getGCSettings().gcLinksThreads.get());
 
-#if HAVE_LIBURING
-        if (config->getLocalSettings().getGCSettings().gcLinksUseIoUring.get()) {
+        if (useIoUringDispatch(*config)) {
             cleanupLinksIoUring(
                 linksDir, entries, actualSize, unsharedSize, nThreads);
-        } else
-#endif
-        {
+        } else {
             tbb::task_arena arena(static_cast<int>(nThreads));
             arena.execute([&] {
             tbb::parallel_for_each(entries, [&](const std::filesystem::path & path) {
@@ -1967,14 +2006,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 }
 
                 printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
-
-                try {
-                    nix::unlink(path);
-                } catch (SysError & e) {
-                    if (e.errNo != ENOENT)
-                        throw;
-                }
-
+                unlinkIfExists(path);
                 /* Do not account for deleted file here. Rely on
                    deletePath() accounting. */
             });
@@ -2001,7 +2033,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
     /* End-of-cleanupLinks boundary. Includes the directory walk and
        the parallel/io_uring stat+unlink pass over all canonicals. */
-    timer.record(results.timings.cleanupLinksNs);
+    stage(results.timings.cleanupLinksNs);
 
     /* While we're at it, vacuum the database. */
     // if (options.action == GCOptions::gcDeleteDead) vacuumDB();

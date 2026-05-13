@@ -87,30 +87,10 @@ struct GCResults
      */
     uint64_t bytesFreed = 0;
 
-    /**
-     * Wall-clock per stage of `collectGarbage`, in nanoseconds.
-     * Populated by store implementations that subdivide the GC
-     * pipeline into discrete phases (currently `LocalStore`); other
-     * implementations leave them at zero.
-     *
-     * Stages, in order:
-     *   - `findRootsNs`: enumerate permanent + temporary roots,
-     *     including the temp-roots socket server setup
-     *   - `loadValidPathsNs`: bulk-load snapshot of `ValidPaths`
-     *     and `Refs` tables for lock-free lookups
-     *   - `traverseAndPhase1Ns`: walk the live set + Phase 1
-     *     invalidate-then-rename-aside (`<storeDir>/.gc-<pid>-<n>-…`)
-     *     of dead paths under the GC lock
-     *   - `phase2DeleteNs`: parallel recursive delete of the
-     *     `.gc-*` orphans (thread-pool or io_uring variant)
-     *   - `cleanupLinksNs`: `.links/` sweep
-     *     (thread-pool or io_uring variant) — walks all canonical
-     *     entries, unlinks those with `st_nlink == 1`
-     *
-     * Benches surface these as `state.counters` so the matrix
-     * can attribute wall-clock differences to specific stages
-     * rather than just the total.
-     */
+    /* Wall-clock per stage of `collectGarbage` in ns. Populated
+       by stores that subdivide GC into phases (currently
+       `LocalStore`); others leave these at zero. Field names
+       match the stage call order in gc.cc. */
     struct Timings
     {
         uint64_t findRootsNs = 0;

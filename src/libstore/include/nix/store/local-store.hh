@@ -36,32 +36,12 @@ const int nixSchemaVersion = 10;
 
 struct OptimiseStats
 {
-    /* Cache-line-aligned so the two counters don't share a line with
-       each other or with surrounding state; under high worker counts,
-       `fetch_add` on a shared line is dominated by cache-coherence
-       traffic rather than the actual arithmetic. */
+    /* Cache-line-aligned to avoid false sharing under high worker counts. */
     alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> filesLinked{0};
     alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> bytesFreed{0};
 
-    /**
-     * Wall-clock per stage of `optimiseStore`, in nanoseconds.
-     * Updated sequentially by the main thread between stage
-     * boundaries — no atomics needed.
-     *
-     * Stages, in order:
-     *   - `setupNs`: lock acquisition + minor bookkeeping
-     *   - `migrateLinksNs`: one-shot `migrateLinksDirToSharded`
-     *     call (zero when `shardedLinks == false`)
-     *   - `queryAllPathsNs`: `queryAllValidPaths()` SQLite scan
-     *   - `loadInodeHashNs`: `loadInodeHashInto()` walk of
-     *     `.links/` (both flat and sharded entries)
-     *   - `parallelOptimiseNs`: the `tbb::parallel_for_each`
-     *     covering `optimisePath_` over every path
-     *
-     * Benches surface these as `state.counters` so the matrix
-     * can attribute wall-clock differences to specific stages
-     * rather than just reporting the total.
-     */
+    /* Wall-clock per stage of `optimiseStore` in ns; field names
+       match the stage call order in optimise-store.cc. */
     struct Timings
     {
         uint64_t setupNs = 0;
@@ -281,108 +261,38 @@ public:
     const std::filesystem::path dbDir;
     const std::filesystem::path linksDir;
 
-    /**
-     * Whether `linksDir` is organised as a sharded tree
-     * (`<linksDir>/<pfx>/<hash>[.<NN>]`) vs. the legacy flat layout
-     * (`<linksDir>/<hash>[.<NN>]`). Set at construction time from
-     * the `sharded-links` experimental feature. Both layouts are
-     * readable regardless of this flag; the flag only decides where
-     * newly-created canonical entries land and whether
-     * `optimiseStore` performs a one-shot migration of pre-existing
-     * flat entries into shards.
-     *
-     * Independent of `maxLinkReplicas` / replica spillover: both
-     * the flat and sharded layouts can host `<hash>` (replica 0)
-     * alongside `<hash>.01`, `<hash>.02`, … when the replica-spill
-     * walk is enabled.
-     */
+    /* Whether `linksDir` uses the sharded layout
+       (`<linksDir>/<pfx>/<hash>[.<NN>]`) vs. the legacy flat layout.
+       Set at construction from the `sharded-links` experimental
+       feature. Both layouts are readable regardless of this flag. */
     const bool shardedLinks;
 
-    /**
-     * Encoding-level cap on the number of replica inodes per hash.
-     * The on-disk filename scheme uses a 2-digit zero-padded decimal
-     * suffix (`.00`..`.99`) for replicas > 0; replica 0 has no
-     * suffix. 100 slots is therefore the maximum that fits in the
-     * path format.
-     *
-     * The *runtime* replica cap (how many replicas `optimise`
-     * actually walks before giving up) is the `max-link-replicas`
-     * setting in `LocalSettings`, clamped to this constant.
-     * Decoupling the runtime cap from the encoding cap is what lets
-     * the bench enumerate `sharded_single_replica_hardlink` (runtime
-     * cap = 1, isolates the directory-layout cost) separately from
-     * `sharded_multi_replica_hardlink` (runtime cap = 100, exercises
-     * spill).
-     */
+    /* Encoding-level cap on replica inodes per hash. The on-disk
+       suffix `.NN` is two decimal digits, so 100 is the maximum. The
+       runtime cap is `max-link-replicas` in `LocalSettings`. */
     static constexpr uint8_t maxReplicaSlots = 100;
 
-    /**
-     * Per-file hardlink ceiling for the filesystem hosting
-     * `linksDir`, queried once at construction via `pathconf(3)`
-     * with `_PC_LINK_MAX`.
-     *
-     * Used as an opportunistic pre-flight in the replica walk: when
-     * we `lstat` a candidate replica and observe `st_nlink >= linkMax`,
-     * we skip to the next replica without issuing a `link(2)` that we
-     * already know the kernel would reject with EMLINK. This is an
-     * optimisation, not a correctness requirement — the commit path
-     * handles EMLINK by advancing to the next replica regardless, so
-     * even a stale or conservative value is safe. That is why there
-     * is no margin: the kernel is the source of truth for the actual
-     * ceiling, so a racing writer that pushes us over between lstat
-     * and link(2) simply surfaces EMLINK and we advance.
-     *
-     * Typical values: ext4 = 65000, tmpfs = INT_MAX, XFS = 2^31-1.
-     * If `pathconf` is unavailable or returns `-1` we fall back to
-     * a conservative hardcoded 32000, which is safe everywhere.
-     */
-    /* Default to the conservative fallback at declaration time. The
-       constructor body overwrites this with the pathconf probe (or
-       `_link-max-override` if set), but if any earlier ctor step
-       throws — `createDirs(linksDir / shard)` for sharded stores
-       can throw EACCES, EIO, ENOSPC — we'd leave the member
-       uninitialised. Today nothing reads `linkMax` during stack
-       unwinding, but a default keeps the field well-defined under
-       all error paths. */
+    /* Filesystem per-inode hardlink ceiling, probed at ctor via
+       `pathconf(_PC_LINK_MAX)`. Advisory pre-flight: EMLINK on
+       `link(2)` is also handled in the commit path. ext4 = 65000;
+       tmpfs / XFS are effectively unbounded. Fallback 32000. */
     int64_t linkMax = 32000;
 
-    /**
-     * Compute the path for a canonical `.links/` entry, given a hash
-     * and a replica index (0..maxReplicaSlots).
-     *
-     * The directory and filename are independent axes:
-     *
-     *   * Directory: `<linksDir>` when `shardedLinks == false`,
-     *     `<linksDir>/<first-2-chars>` when `shardedLinks == true`.
-     *   * Filename: `<hash>` for replica 0, `<hash>.<NN>` for
-     *     replica > 0.
-     *
-     * Combined, the four cases are:
-     *   - flat,    0:    `<linksDir>/<hash>`
-     *   - flat,    N>0:  `<linksDir>/<hash>.<NN>`
-     *   - sharded, 0:    `<linksDir>/<pfx>/<hash>`
-     *   - sharded, N>0:  `<linksDir>/<pfx>/<hash>.<NN>`
-     *
-     * The unsuffixed primary preserves backward compatibility with
-     * pre-`fffca655b` `.links/<hash>` entries: a store toggled into
-     * `sharded-links` keeps the unsuffixed primary form per shard.
-     */
+    /* Canonical `.links/` entry path for `(hash, replica)`. Layout
+       (flat vs sharded) is decided by `shardedLinks`. */
     std::filesystem::path linkPathFor(const Hash & hash, uint8_t replica = 0) const;
 
-    /**
-     * Given a `.links/` entry filename, return the base hash portion
-     * (everything before the `.<NN>` replica suffix, if any). Names
-     * without a replica suffix (the primary slot in either layout)
-     * are returned unchanged.
-     */
+    /* Filename portion of a `.links/` entry. Replica 0 has no
+       suffix; replicas 1..N use `.NN`. Shared between `linkPathFor`
+       and `migrateLinksDirToSharded`. */
+    static std::string replicaFilename(std::string_view base, uint8_t replica);
+
+    /* Strip the `.NN` replica suffix from a `.links/` filename. */
     std::string_view stripReplicaSuffix(std::string_view name) const;
 
-    /**
-     * Bulk one-shot migration of legacy flat `.links/<H>` entries
-     * into their sharded slots. Called from `optimiseStore` when the
-     * `sharded-links` experimental feature is enabled. Idempotent
-     * and race-tolerant.
-     */
+    /* Bulk one-shot migration of legacy flat `.links/` entries into
+       sharded slots. Called from `optimiseStore` when `sharded-links`
+       is on. Idempotent and race-tolerant. */
     void migrateLinksDirToSharded();
 
     const std::filesystem::path reservedPath;
@@ -464,38 +374,12 @@ private:
      */
     Sync<AutoCloseFD> _fdGCLock;
 
-    /**
-     * Per-thread connections to the garbage collector. Each thread
-     * that calls `addTempRoot` under an active GC gets its own
-     * socket, so N workers send temp-root announcements in parallel
-     * instead of serialising on one shared `Sync<AutoCloseFD>`.
-     *
-     * Per-thread storage via `tbb::enumerable_thread_specific`: O(1)
-     * `local()` access via TLS, default-constructs `AutoCloseFD{}`
-     * on first access per thread. Works for any thread (TBB-spawned
-     * or `std::thread`).
-     *
-     * Lifetime caveat: TBB does *not* destroy entries at thread
-     * exit. Per-thread `AutoCloseFD`s live until `~LocalStore` runs
-     * `~enumerable_thread_specific`, which iterates and destroys
-     * each entry. Consequences:
-     *
-     *  - Long-running stores accumulate one fd per distinct worker
-     *    thread that ever called `addTempRoot`. The GC's per-thread
-     *    `connect`-on-demand caps this at the number of unique
-     *    worker IDs the daemon has ever seen for a GC cycle (in
-     *    practice, ≲ the configured `gcLinksThreads` setting), so
-     *    it's bounded but non-zero.
-     *  - On `thread::id` reuse — a new worker thread may receive an
-     *    entry created by a previous thread with the same id — the
-     *    old socket may already be closed daemon-side (the GC
-     *    server tears down inactive client conns). The next
-     *    `writeFull`/`readFull` call will surface `EPIPE` or
-     *    `ECONNRESET`; `addTempRoot`'s catch blocks handle these
-     *    by dropping the fd and reconnecting on the next loop
-     *    iteration. So this is a small extra round-trip, not a
-     *    correctness issue.
-     */
+    /* Per-thread connections to the garbage collector. Each thread
+       that calls `addTempRoot` under an active GC gets its own
+       socket, so N workers send temp-root announcements in parallel
+       instead of serialising on a shared `Sync<AutoCloseFD>`. Entries
+       persist until `~LocalStore`; reconnect-on-EPIPE handles
+       `thread::id` reuse races. */
     tbb::enumerable_thread_specific<AutoCloseFD> _fdRootsSockets;
 
 public:
@@ -726,25 +610,11 @@ private:
        entry are logged and the entry is skipped. */
     void forEachLinkEntry(std::function<void(const std::filesystem::path &)> onLink);
 
-    /* Lazy per-directory writability guard used by `optimisePath_` to
-       batch the chmod(+w) / canonicalise(-w) dance across all files
-       in a directory that need replacement. Declared here (rather
-       than as a file-local struct in `optimise-store.cc`) so the
-       pointer can appear in `optimisePath_`'s signature for
-       recursion. */
-    struct DirWritability
-    {
-        std::filesystem::path dir;
-        bool needsCanonicalise = false;
-        bool isStoreRoot;
-
-        DirWritability(std::filesystem::path dir, const std::filesystem::path & storeRoot);
-        void ensureWritable();
-        ~DirWritability();
-
-        DirWritability(const DirWritability &) = delete;
-        DirWritability & operator=(const DirWritability &) = delete;
-    };
+    /* Per-directory writability guard used by `optimisePath_` to
+       batch the chmod(+w)/canonicalise(-w) dance across sibling
+       files. Defined in optimise-store.cc; forward-declared here
+       because the pointer appears in `optimisePath_`'s signature. */
+    struct DirWritability;
 
     void optimisePath_(
         OptimiseStats & stats,
