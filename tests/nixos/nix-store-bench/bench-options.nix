@@ -24,13 +24,19 @@ in
         # Underscores → hyphens for nix-friendliness.
         let
           dash = s: builtins.replaceStrings [ "_" ] [ "-" ] s;
-          suffix = if cfg.multiProcess then "-multi" else "";
+          # GC benches embed the dispatch; non-GC benches have
+          # `dispatch == null` and skip the suffix.
+          dispatchSuffix =
+            if cfg.dispatch != null then "-${cfg.dispatch}" else "";
+          multiSuffix = if cfg.multiProcess then "-multi" else "";
         in
-        "adhoc-${dash cfg.benchName}-${cfg.fs}-${cfg.throttle}"
+        "adhoc-${dash cfg.benchName}${dispatchSuffix}"
+        + "-${cfg.fs}-${cfg.throttle}"
         + "-${cfg.layout}-${cfg.replica}"
-        + "-n${toString cfg.nPaths}-t${toString cfg.threads}${suffix}";
+        + "-n${toString cfg.nPaths}-t${toString cfg.threads}"
+        + "${multiSuffix}";
       defaultText = lib.literalExpression ''
-        "adhoc-<benchName>-<fs>-<throttle>-<layout>-<replica>-n<nPaths>-t<threads>[-multi]"
+        "adhoc-<benchName>[-<dispatch>]-<fs>-<throttle>-<layout>-<replica>-n<nPaths>-t<threads>[-multi]"
       '';
       description = ''
         Test derivation name. Defaults to an auto-derived string
@@ -117,8 +123,11 @@ in
       default = "gc_barabasi";
       description = ''
         Bench function in `optimise-bench.cc`. GC families
-        (`gc_barabasi`/`gc_clusters`) have an io_uring×syscall A/B
-        axis; others run a single dispatch.
+        (`gc_barabasi`/`gc_clusters`) take a required `dispatch`
+        argument selecting the unlink path (`syscall` or `iouring`);
+        others ignore `dispatch` and must pass `null`. See
+        "One VM = one cell" in the README for why the A/B lives
+        on the host side rather than in one bench invocation.
       '';
     };
 
@@ -178,13 +187,16 @@ in
       '';
     };
 
-    dispatchOnly = mkOption {
+    dispatch = mkOption {
       type = types.nullOr (types.enum [ "syscall" "iouring" ]);
       default = null;
       description = ''
-        Restrict GC benches to one dispatch. `null` runs both for
-        an A/B comparison. Set when a (variant, threads) cell is
-        only registered on one side.
+        GC dispatch to exercise: `syscall` (thread-pool, blocking
+        syscalls) or `iouring` (`io_uring_prep_unlinkat`). Required
+        for GC benches (`gc_barabasi` / `gc_clusters`); must be
+        `null` for non-GC benches. Each VM runs a single cell — the
+        `syscall`-vs-`iouring` A/B is a host-side comparison of two
+        separate VM results via `bench.py ab`.
       '';
     };
 
@@ -216,9 +228,9 @@ in
     fsMkfsFlag = mkOption {
       internal = true;
       readOnly = true;
-      type = types.nullOr types.str;
+      type = types.str;
       description = ''
-        `mkfs.<fs>` flags, or null when no mkfs runs (tmpfs / zfs).
+        `mkfs.<fs>` flags; empty string when no mkfs runs (tmpfs / zfs).
       '';
     };
 
@@ -278,8 +290,8 @@ in
       ext4 = "-F";
       xfs = "-f -m crc=1";
       btrfs = "-f";
-      zfs = null;
-      tmpfs = null;
+      zfs = "";
+      tmpfs = "";
     }.${cfg.fs};
 
     fsModule = {
@@ -294,16 +306,14 @@ in
       cfg.useBlockDev && (cfg.throttleParams != null || cfg.dmDelayMs > 0);
   };
 
-  config.warnings = lib.optionals
-    (cfg.multiProcess && cfg.benchRepetitions != 1)
-    [
-      ''
-        bench.multiProcess = true silently overrides benchRepetitions
-        to 1 (BenchFixture's ctor can't re-init a populated store).
-        You supplied benchRepetitions = ${toString cfg.benchRepetitions};
-        the VM will use 1 anyway. Set benchRepetitions = 1 to silence.
-      ''
-    ];
+  config.warnings = lib.optionals (cfg.multiProcess && cfg.benchRepetitions != 1) [
+    ''
+      bench.multiProcess = true silently overrides benchRepetitions
+      to 1 (BenchFixture's ctor can't re-init a populated store).
+      You supplied benchRepetitions = ${toString cfg.benchRepetitions};
+      the VM will use 1 anyway. Set benchRepetitions = 1 to silence.
+    ''
+  ];
 
   config.assertions =
     let
@@ -320,16 +330,27 @@ in
         '';
       }
       {
-        assertion = cfg.dispatchOnly == null || isGCBench;
+        assertion = isGCBench -> cfg.dispatch != null;
         message = ''
-          bench.dispatchOnly is only meaningful for GC benches
+          bench.benchName = "${cfg.benchName}" is a GC bench and
+          requires bench.dispatch to be set to "syscall" or
+          "iouring" (one cell per VM — run each dispatch as a
+          separate `nix build` and compare the two JSONs with
+          `bench.py ab` on the host).
+        '';
+      }
+      {
+        assertion = !isGCBench -> cfg.dispatch == null;
+        message = ''
+          bench.dispatch is only meaningful for GC benches
           (gc_barabasi / gc_clusters); got bench.benchName =
-          "${cfg.benchName}".
+          "${cfg.benchName}" with bench.dispatch =
+          "${toString cfg.dispatch}".
         '';
       }
     ];
   # `nPaths` is validated by the bench binary itself: an unregistered
   # value surfaces as "Failed to match any benchmarks" at run time
-  # (see testScript.py). The registered cells live in
+  # (see test_script.py). The registered cells live in
   # `src/libstore-tests/optimise-bench.cc`.
 }

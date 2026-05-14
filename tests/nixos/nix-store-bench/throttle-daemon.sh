@@ -48,7 +48,7 @@ set -euo pipefail
 
 # Resolve major:minor for the target device. cgroup v2 `io.max` is
 # keyed by this pair, not by path. THROTTLE_DEV is the underlying
-# virtio disk (set by testScript.py), not the dm-delay wrapper —
+# virtio disk (set by test_script.py), not the dm-delay wrapper —
 # I/O against `/dev/mapper/slow` charges to the underlying disk's
 # major:minor at the block layer, which is what cgroup throttles.
 maj_min=$(stat -c '%t:%T' "$THROTTLE_DEV")

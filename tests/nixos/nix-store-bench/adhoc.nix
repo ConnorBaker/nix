@@ -30,12 +30,12 @@
 # `BENCHMARK_CAPTURE` row in `src/libstore-tests/optimise-bench.cc`;
 # the schema's `nPaths` assertion does not check the thread axes.
 # GC benches without `dispatchOnly` run a regression-gated
-# `bench-decide ab` step (defaults: VFS parity ≤ 5%, syscalls
+# `bench.py ab` step (defaults: VFS parity ≤ 5%, syscalls
 # ≤ 5% increase, wall ≤ 5% slower). Pass `--wall-improvement 0.10`
-# etc. to `bench-decide ab` outside the VM to demand an actual
+# etc. to `bench.py ab` outside the VM to demand an actual
 # win; pass `--argstr dispatchOnly syscall` (or `iouring`) on the
 # adhoc invocation to switch the in-VM post-step to
-# `bench-decide summary` (no thresholds).
+# `bench.py summary` (no thresholds).
 args@{
   # Path to the project root containing this checkout's flake. Only
   # this file's own arg; everything else is forwarded to the schema.

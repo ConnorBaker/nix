@@ -49,15 +49,16 @@ the per-inode hardlink ceiling (ext4: 65000).
 | ---- | ---- |
 | `adhoc.nix`         | Entry point. Takes CLI / Nix args, runs `evalTest`, surfaces assertions + warnings, returns the test derivation. |
 | `bench-options.nix` | Module schema. Declares every user-facing knob (with `type` / `default` / `description`) plus derived data (`useBlockDev`, `throttleParams`, etc.) and cross-option `assertions` / `warnings`. |
-| `mk-test.nix`       | NixOS test module. Reads `config.bench.*`, emits `nodes.machine` and a `testScript` (constants prelude + `readFile ./testScript.py`). |
-| `testScript.py`     | Bulk of the test driver — fixture setup, throttle daemon launch, bench invocation, bpftrace gating, result extraction. Name-bound by `mk-test.nix`'s prelude (see file header). |
-| `decide.py`         | `bench-decide` CLI. Two subcommands: `summary` (one JSON) and `ab` (two JSONs + bpftrace dumps + threshold flags). |
+| `mk-test.nix`       | NixOS test module. Reads `config.bench.*`, emits `nodes.machine` and a `testScript` (constants prelude + `readFile ./test_script.py`). |
+| `test_script.py`    | Bulk of the test driver — fixture setup, throttle daemon launch, bench invocation, bpftrace gating, result extraction, JSON-validity check. Name-bound by `mk-test.nix`'s prelude (see file header). Each VM runs a single cell; comparisons live on the host. |
+| `bench.py`          | **Host-side** CLI. Subcommands: `run` (iterate the axis matrix and build each cell), `summary` (stats for one JSON), `ab` (A/B two JSONs + optional bpftrace dumps), `summary-matrix` (one row per cell in a results dir), `ab-matrix --axis <axis>` (pairwise A/B across every cell that differs only on `<axis>`). Not installed in the VM. |
 | `throttle-daemon.sh`| In-VM daemon that toggles cgroup `io.max` + dm-delay around the measured call. Lock-step protocol with the bench's `ThrottleGate` C++ class. |
 
 There are **no Hydra-jobset cells** here on purpose. The matrix of
 (fs × throttle × layout × replica × benchName) is too large and the
-`decide.py` thresholds are tuned for production-relevant fixture
-sizes, not small-fixture CI smoke runs. Run scenarios via `adhoc.nix`.
+`bench.py ab` / `ab-matrix` thresholds are tuned for
+production-relevant fixture sizes, not small-fixture CI smoke
+runs. Run scenarios via `adhoc.nix` or `bench.py run`.
 
 ## Eval flow
 
@@ -80,7 +81,7 @@ nixos-lib.evalTest
   └──> mk-test.nix
          ─ reads config.bench.*
          ─ emits config.nodes.machine and config.testScript
-         ─ testScript = constants prelude + readFile ./testScript.py
+         ─ testScript = constants prelude + readFile ./test_script.py
 
 after evalTest returns:
   adhoc.nix
@@ -97,9 +98,10 @@ in a separate `mk-bench.nix`, because there's only one entry point.
 
 If the caller doesn't supply `name`, `bench-options.nix` derives one
 from every distinguishing field:
-`adhoc-<benchName>-<fs>-<throttle>-<layout>-<replica>-n<nPaths>-t<threads>[-multi]`.
+`adhoc-<benchName>[-<dispatch>]-<fs>-<throttle>-<layout>-<replica>-n<nPaths>-t<threads>[-multi]`.
 Two scenarios that differ in any visible parameter get different
-derivation hashes — no silent cache collisions.
+derivation hashes — no silent cache collisions. The `-<dispatch>`
+segment only appears for GC benches (which require `dispatch`).
 
 ### Why the assertions are surfaced manually
 
@@ -126,38 +128,92 @@ nix build --no-link -L -f tests/nixos/nix-store-bench/adhoc.nix \
   --argstr benchName gc_clusters \
   --argstr fs btrfs --argstr throttle nvme \
   --argstr layout sharded --argstr replica multi \
-  --argstr dispatchOnly syscall \
+  --argstr dispatch syscall \
   --arg nPaths 10000 --arg threads 4
 ```
 
-Two caveats on these flags:
+### One VM = one cell
 
-- **Neither `nPaths` nor the thread axes are validated at eval time.**
-  Pass a registered combo from `BENCHMARK_CAPTURE` in
-  `src/libstore-tests/optimise-bench.cc`; unregistered values fail
-  at run time with `Failed to match any benchmarks`. `threads = 4`
-  is registered for every cell; `1` / `16` only on parts of the
-  `flat_single_replica_hardlink` baseline (raise `cores` for `16`).
+Every VM run measures exactly one bench cell. There is no in-VM
+comparison — all syscall-vs-iouring / flat-vs-sharded / etc. A/B
+decisions happen on the host by feeding two result JSONs into
+`bench.py ab` (see below). The `dispatch` field is **required**
+for GC benches (`gc_barabasi` / `gc_clusters`) and **must be null**
+for all others; schema assertions enforce both. To A/B two
+dispatches:
 
-- **GC benches without `dispatchOnly` run a regression-gated A/B.**
-  The test feeds both `syscall` and `iouring` JSONs into
-  `bench-decide ab`, which checks three things: VFS-op parity (≤ 5%
-  delta, a correctness check), syscall ratio (`b/a ≤ 1.05`, i.e. up
-  to 5% more syscalls allowed), and wall improvement
-  (`(a-b)/a ≥ -0.05`, i.e. up to 5% slower wall allowed). The
-  defaults are a "no regression vs syscall path" gate, not a
-  "demand a 10% win" gate — io_uring's per-worker-rings design
-  hits parity with the syscall path on the canonical
-  `gc_barabasi/ext4/flat/single` scenario; demanding a win would
-  flag a passing run on the very scenario the code was tuned for.
-  To demand an actual win for performance investigations, pass
-  `--wall-improvement 0.10` etc. when running `bench-decide ab`
-  outside the VM on the copied JSONs. A `VERDICT: FAIL` from the
-  in-VM run is a real regression; check the printed `vfs=` parity
-  first to confirm kernel work is still comparable. To skip the A/B
-  step entirely (e.g. when iterating on something unrelated), pass
-  `--argstr dispatchOnly syscall` (or `iouring`) to switch the
-  in-VM step to `bench-decide summary` (no thresholds).
+```
+nix build -o result-syscall -f tests/nixos/nix-store-bench/adhoc.nix \
+  --argstr benchName gc_barabasi \
+  --argstr fs ext4 --argstr throttle gp3 \
+  --argstr layout flat --argstr replica single \
+  --arg nPaths 10000 --arg threads 4 \
+  --argstr dispatch syscall
+
+nix build -o result-iouring -f tests/nixos/nix-store-bench/adhoc.nix \
+  --argstr benchName gc_barabasi \
+  --argstr fs ext4 --argstr throttle gp3 \
+  --argstr layout flat --argstr replica single \
+  --arg nPaths 10000 --arg threads 4 \
+  --argstr dispatch iouring
+
+tests/nixos/nix-store-bench/bench.py ab \
+  result-syscall/syscall.json result-iouring/iouring.json \
+  result-syscall/syscall.bpf.txt result-iouring/iouring.bpf.txt \
+  --a-name syscall --b-name iouring
+```
+
+Use `bench.py run` for this pattern applied across the full axis
+matrix; it writes one `result-*` symlink per cell and a per-cell
+log under `<results-dir>/logs/`. `bench.py ab-matrix --axis
+dispatch` groups the resulting symlinks into dispatch pairs and
+runs the same A/B on each.
+
+### Portability: point `build-dir` at a tmpfs
+
+The VM's empty disk (`virtualisation.emptyDiskImages`) is a qcow2
+file that QEMU creates at VM-start time inside the test driver's
+build directory. Whatever the host kernel does with that file's
+storage — page-cache it, queue writes behind a real disk's
+elevator, wait on fsyncs — leaks directly into every bench cell's
+measured region. Two hosts with different `build-dir` filesystems
+produce non-comparable numbers on the same `throttle` setting.
+
+To eliminate that variance, point the Nix daemon's build directory
+at a tmpfs before invoking the bench:
+
+```
+nix build --option build-dir /dev/shm \
+          --builders '' -L -f tests/nixos/nix-store-bench/adhoc.nix \
+          --argstr benchName optimise \
+          --arg nPaths 10000 --arg threads 4
+```
+
+or configure the daemon globally by adding `build-dir = /dev/shm`
+to `/etc/nix/nix.conf` (requires daemon restart). On a system
+where `/tmp` is already tmpfs (the NixOS default) the default
+`build-dir = ""` already resolves to a tmpfs and no override is
+needed — check with `findmnt /tmp`.
+
+`bench.py run` doesn't set `build-dir` itself: the daemon-level
+setting is the right layer for "all my builds should live in
+RAM", and wiring it per-invocation inside the script would
+either duplicate per-daemon configuration or silently mask a
+misconfigured host. If `findmnt /tmp` reports a non-tmpfs
+filesystem and `build-dir` isn't explicitly set, your matrix
+results will be host-dependent — the script prints the bench
+cells regardless but you'll see it in the numbers.
+
+Caveat: **Neither `nPaths` nor the thread axes are validated at
+eval time.** Pass a registered combo from `BENCHMARK_CAPTURE` in
+`src/libstore-tests/optimise-bench.cc`; unregistered values fail
+at run time with `Failed to match any benchmarks`. `threads = 4`
+is registered for every cell; `1` / `16` only on parts of the
+`flat_single_replica_hardlink` baseline (raise `cores` for `16`).
+The VM's JSON-validity check catches empty iteration rows and
+uncaught-throw counters (`gc_threw` / `opt_threw` from
+`optimise_with_concurrent_gc`), but does not evaluate thresholds —
+use `bench.py ab` on the host for that.
 
 Programmatic (from another `.nix` file):
 
@@ -171,27 +227,52 @@ import tests/nixos/nix-store-bench/adhoc.nix {
 }
 ```
 
-## `bench-decide`
+## `bench.py`
 
-After a test finishes, the JSON / bpftrace artefacts are decoded by
-`bench-decide`:
+One host-side CLI for the full lifecycle: building matrix cells,
+summarising individual JSONs, A/B-ing pairs, summarising an entire
+results directory, and doing an axis-sliced A/B across a matrix.
+All subcommands share the JSON-parsing, stats, and derivation-name
+primitives so there's one source of truth per concern.
 
 ```
-# Summary of one JSON
-bench-decide summary /tmp/syscall.json
+# Build the matrix (or a filter slice) — one VM per cell.
+bench.py run --bench gc_barabasi --fs ext4 --throttle gp3
 
-# A/B with default thresholds (syscall vs iouring)
-bench-decide ab /tmp/syscall.json /tmp/iouring.json \
-                /tmp/syscall.bpf.txt /tmp/iouring.bpf.txt
+# Preview without executing.
+bench.py run --dry-run | head
 
-# A/B with custom labels and loosened wall-time threshold
-bench-decide ab a.json b.json a.bpf b.bpf \
-                --a-name baseline --b-name patched \
-                --wall-improvement 0.05
+# Summary of one JSON.
+bench.py summary /tmp/syscall.json
+
+# GC A/B with full VFS/syscall parity checks (bpftrace dumps present).
+bench.py ab /tmp/syscall.json /tmp/iouring.json \
+            /tmp/syscall.bpf.txt /tmp/iouring.bpf.txt \
+            --a-name syscall --b-name iouring
+
+# Wall-only A/B (e.g. flat-vs-sharded). bpf dumps are optional
+# positionals — omit them and the VFS/syscall checks are skipped.
+bench.py ab result-flat/single.json result-sharded/single.json \
+            --a-name flat --b-name sharded
+
+# Loosen the wall-time threshold (see `bench.py ab --help`).
+bench.py ab a.json b.json a.bpf b.bpf \
+            --a-name baseline --b-name patched \
+            --wall-improvement 0.05
+
+# One row per cell in ./results (whitespace-aligned; --json for JSONL).
+bench.py summary-matrix
+
+# Pairwise A/B across a matrix axis (dispatch/fs/throttle/layout/replica).
+bench.py ab-matrix --axis dispatch --bench gc_barabasi
 ```
 
-Run `bench-decide ab --help` / `bench-decide summary --help` for the
-full flag list.
+`--a-name` / `--b-name` are **required** on `ab` — labels default
+to nothing so the output can never mislabel an A/B that isn't the
+GC dispatch comparison. `ab-matrix` supplies labels automatically
+from the varying axis.
+
+Run `bench.py <subcommand> --help` for flag details.
 
 ## Running the bench binary directly (no VM)
 
@@ -227,7 +308,9 @@ names show up too.
 `$TMPDIR` selects the test filesystem because `BenchFixture` puts
 the store root under it. tmpfs (default `/tmp` on most distros) is
 fastest and measures the CPU/VFS ceiling. Run on ext4 / xfs /
-btrfs / bcachefs / ZFS to measure those backends.
+btrfs / ZFS to measure those backends — these are the five
+filesystems the VM rig's schema accepts; if you want bcachefs or
+similar, it's a one-line enum extension in `bench-options.nix`.
 
 `NIX_BENCH_VERBOSITY=4` re-enables Nix's `printInfo` / `printError`
 (silenced by `bench-main.cc`) — useful for debugging why a fixture

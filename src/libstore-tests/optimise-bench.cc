@@ -1028,9 +1028,25 @@ static void invalidate_paths(benchmark::State & state)
     for (auto _ : state) {
         state.PauseTiming();
         BenchFixture fixture(nPaths, /*nShared=*/2);
-        /* Collect the registered paths. */
+        /* Topo-sort so referrers come before references. `Refs.reference`
+           has an `on delete restrict` FK, and SQLite evaluates FKs
+           immediately (no `DEFERRABLE INITIALLY DEFERRED` in the
+           schema), so deleting an inner node before its referrers have
+           been deleted fails mid-transaction with
+           `FOREIGN KEY constraint failed`. Production GC mirrors this
+           by running `topoSort` on its dead-path set in gc.cc's main
+           traversal and then calling `invalidatePathsChecked` on
+           batches of 256; our single batch is correct under the same
+           ordering. `topoSortPaths` gives us "p refers to q ⇒ p
+           before q", which is that ordering. Without this, any
+           fixture with cross-references (which here is all `nPaths`
+           > `platformSize()`, i.e. effectively every registered
+           cell) aborts the bench binary with std::terminate. The
+           userspace `PathInUse` check inside `invalidatePathsChecked`
+           short-circuits only the application-level check — SQLite
+           still enforces the FK row-by-row. */
         auto pathSet = fixture.store->queryAllValidPaths();
-        std::vector<StorePath> paths{pathSet.begin(), pathSet.end()};
+        auto paths = fixture.store->topoSortPaths(pathSet);
         state.ResumeTiming();
 
         totalCallSumNs += timedCall(state, [&] {
