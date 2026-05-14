@@ -1,0 +1,6 @@
+# Scoped ruff config for the nix-store-bench Python sources.
+# The default 88-character ceiling produces unreasonable wraps for
+# the shell-heredoc / f-string constructs in `test_script.py`;
+# 120 gives enough headroom without pushing toward "unreadable on
+# a vertical split" territory.
+line-length = 120
