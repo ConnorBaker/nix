@@ -571,8 +571,8 @@ def cmd_ab_matrix(args: argparse.Namespace) -> int:
 # are symmetric at (4,4) and (16,16).
 #
 # For cross-host-comparable wall times, point the Nix daemon's
-# build directory at a tmpfs before invoking (e.g. `--option
-# build-dir /dev/shm`). The qcow2 empty disk
+# build directory at a tmpfs (pass `--build-dir /dev/shm` to the
+# `run` subcommand). The qcow2 empty disk
 # `virtualisation.emptyDiskImages` creates lives under that
 # directory; if it's a real disk the host's disk/page-cache
 # characteristics dominate the measurement.
@@ -635,9 +635,11 @@ _ARG_AXES = {
 }
 
 
-def _cell_cmd(cell: Cell, adhoc_nix: Path, results_dir: Path) -> list[str]:
+def _cell_cmd(cell: Cell, adhoc_nix: Path, results_dir: Path, build_dir: Path | None) -> list[str]:
     """Argv for `nix build` of one cell."""
     cmd = ["nix", "build", "--builders", "", "-L", "-f", str(adhoc_nix)]
+    if build_dir is not None:
+        cmd += ["--option", "build-dir", str(build_dir)]
     for opt, attr in _ARGSTR_AXES.items():
         cmd += ["--argstr", opt, getattr(cell, attr)]
     for opt, attr in _ARG_AXES.items():
@@ -670,11 +672,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Resolve results-dir so the `-o` flag we emit doesn't depend
     # on invocation cwd (makes `--dry-run` output pipeable too).
     results_dir = args.results_dir.resolve()
+    build_dir = args.build_dir.resolve() if args.build_dir is not None else None
     cells = _matrix_cells(args)
 
     if args.dry_run:
         for cell in cells:
-            print(_shell_quote(_cell_cmd(cell, adhoc_nix, results_dir)))
+            print(_shell_quote(_cell_cmd(cell, adhoc_nix, results_dir, build_dir)))
         print(f"total cells: {len(cells)}", file=sys.stderr)
         return 0
 
@@ -687,7 +690,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     failures: list[str] = []
     for i, cell in enumerate(cells, start=1):
-        cmd = _cell_cmd(cell, adhoc_nix, results_dir)
+        cmd = _cell_cmd(cell, adhoc_nix, results_dir, build_dir)
         print(f"[{i}] {cell.name}", file=sys.stderr)
 
         log_path = results_dir / "logs" / f"{cell.name}.log"
@@ -784,6 +787,16 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p = sp.add_parser("run", help="Build VM cells across the matrix.")
     _add_axis_filters(run_p)
     _add_results_dir(run_p)
+    run_p.add_argument(
+        "--build-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Pass `--option build-dir <path>` to each `nix build`. Point at a tmpfs "
+            "(e.g. /dev/shm) so the VM qcow2 empty disks live in RAM — otherwise "
+            "host disk/page-cache characteristics dominate the measurement."
+        ),
+    )
     run_p.add_argument("--dry-run", action="store_true", help="Print nix build commands without executing.")
     run_p.set_defaults(func=cmd_run)
 
