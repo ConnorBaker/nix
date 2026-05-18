@@ -892,67 +892,144 @@ std::optional<Store::ContentStats> LocalStore::queryStoreStats(ContentStatsOptio
         ContentStats::Dedup dedup;
         ContentStats::FullWalk walk;
         /* Hardlinks (every optimised file is one) share an inode;
-           credit their blocks toward totalDiskBytes exactly once. */
+           credit blocks toward totalDiskBytes exactly once. */
         boost::unordered_flat_set<ino_t> seenInodes;
-        const std::string linksDirStr = linksDir.string();
 
-        auto recurse = [&](this auto & self, const std::string & path, bool inLinks) -> void {
-            checkInterrupt();
-            struct stat st;
-            if (lstat(path.c_str(), &st)) {
-                if (errno == ENOENT)
-                    return;
-                throw SysError("statting '%1%'", path);
-            }
-
+        auto creditInode = [&](const struct stat & st) {
             bool firstSighting = st.st_nlink <= 1 || seenInodes.insert(st.st_ino).second;
             if (firstSighting)
                 walk.totalDiskBytes += uint64_t(st.st_blocks) * 512;
+            return firstSighting;
+        };
 
+        auto accountLinksEntry = [&](const struct stat & st) {
+            uint64_t diskBytes = uint64_t(st.st_blocks) * 512;
+            dedup.linksFileCount++;
+            dedup.uniqueBytes += st.st_size;
+            dedup.uniqueDiskBytes += diskBytes;
+            /* .links entry: nlink = 1 (itself) + one per store file
+               sharing its content; real dedup starts at nlink > 2. */
+            if (st.st_nlink > 2) {
+                uint64_t extraCopies = st.st_nlink - 2;
+                dedup.dedupedFileCount++;
+                dedup.inodesSaved += extraCopies;
+                dedup.dedupBytes += extraCopies * uint64_t(st.st_size);
+                dedup.dedupDiskBytes += extraCopies * diskBytes;
+            }
+            if (opts.histograms)
+                dedup.sizeHistogram[ContentStats::bucket(st.st_size)]++;
+        };
+
+        /* Pass 1: walk .links/ via fstatat over a held dirfd. Every
+           optimised store file is hardlinked to a .links entry, so
+           this pass populates seenInodes for the d_ino fast-skip in
+           pass 2. Tolerate the directory not existing (fresh store). */
+        AutoCloseDir linksHandle(opendir(linksDir.string().c_str()));
+        if (linksHandle) {
+            int fd = dirfd(linksHandle.get());
+            struct stat dst;
+            if (fstat(fd, &dst) == 0) {
+                walk.dirInodes++;
+                creditInode(dst);
+            }
+            struct dirent * e;
+            while (errno = 0, e = readdir(linksHandle.get())) {
+                checkInterrupt();
+                if (isDotEntry(e->d_name))
+                    continue;
+                struct stat est;
+                if (fstatat(fd, e->d_name, &est, AT_SYMLINK_NOFOLLOW)) {
+                    if (errno == ENOENT)
+                        continue;
+                    throw SysError("statting '%1%/%2%'", PathFmt(linksDir), e->d_name);
+                }
+                if (!S_ISREG(est.st_mode))
+                    continue;
+                creditInode(est);
+                walk.fileInodes++;
+                accountLinksEntry(est);
+            }
+            if (errno)
+                throw SysError("reading directory %1%", PathFmt(linksDir));
+        } else if (errno != ENOENT) {
+            throw SysError("opening directory %1%", PathFmt(linksDir));
+        }
+
+        /* Headroom for unoptimised files discovered in pass 2. */
+        seenInodes.reserve(seenInodes.size() * 2);
+
+        /* Pass 2: walk the rest of the store with openat/fstatat. Skip
+           .links/ (already done) and skip any regular-file entry whose
+           inode we've already accounted for. */
+        auto recurse = [&](this auto & self, int parentFd, const char * name) -> void {
+            checkInterrupt();
+            struct stat st;
+            if (fstatat(parentFd, name, &st, AT_SYMLINK_NOFOLLOW)) {
+                if (errno == ENOENT)
+                    return;
+                throw SysError("statting entry '%1%'", name);
+            }
+            bool firstSighting = creditInode(st);
             if (S_ISDIR(st.st_mode)) {
                 walk.dirInodes++;
-                AutoCloseDir d(opendir(path.c_str()));
-                if (!d) {
+                int childFd = openat(parentFd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                if (childFd < 0) {
                     if (errno == ENOENT)
                         return;
-                    throw SysError("opening directory %1%", path);
+                    throw SysError("opening directory '%1%'", name);
                 }
-                bool childIsInLinks = inLinks || path == linksDirStr;
+                AutoCloseDir d(fdopendir(childFd));
+                if (!d) {
+                    close(childFd);
+                    throw SysError("fdopendir on '%1%'", name);
+                }
                 struct dirent * e;
                 while (errno = 0, e = readdir(d.get())) {
                     if (isDotEntry(e->d_name))
                         continue;
-                    self(path + "/" + e->d_name, childIsInLinks);
+                    /* Fast-path: optimised file already credited via the
+                       .links pass. Skips an fstatat per hardlinked entry. */
+                    if (e->d_type == DT_REG && seenInodes.contains(e->d_ino))
+                        continue;
+                    self(childFd, e->d_name);
                 }
                 if (errno)
-                    throw SysError("reading directory %1%", path);
+                    throw SysError("reading directory '%1%'", name);
             } else if (S_ISLNK(st.st_mode)) {
                 walk.symlinkInodes++;
             } else if (S_ISREG(st.st_mode)) {
-                if (inLinks) {
-                    /* A .links entry has nlink = 1 (itself) + one per
-                       store file sharing its content; real dedup is
-                       nlink > 2. */
-                    uint64_t diskBytes = uint64_t(st.st_blocks) * 512;
-                    dedup.linksFileCount++;
-                    dedup.uniqueBytes += st.st_size;
-                    dedup.uniqueDiskBytes += diskBytes;
-                    if (st.st_nlink > 2) {
-                        uint64_t extraCopies = st.st_nlink - 2;
-                        dedup.dedupedFileCount++;
-                        dedup.inodesSaved += extraCopies;
-                        dedup.dedupBytes += extraCopies * uint64_t(st.st_size);
-                        dedup.dedupDiskBytes += extraCopies * diskBytes;
-                    }
-                    if (opts.histograms)
-                        dedup.sizeHistogram[ContentStats::bucket(st.st_size)]++;
-                } else if (firstSighting) {
+                if (firstSighting)
                     walk.fileInodes++;
-                }
             }
         };
 
-        recurse(storeDir, /*inLinks=*/false);
+        /* Walk the real (on-disk) store directory, not the virtual
+           `storeDir`. They differ for chroot stores; `.links/` lives
+           under the real path. */
+        const auto & realStore = config->realStoreDir.get();
+        AutoCloseDir storeHandle(opendir(realStore.c_str()));
+        if (!storeHandle)
+            throw SysError("opening directory %1%", PathFmt(realStore));
+        int storeFd = dirfd(storeHandle.get());
+        struct stat sst;
+        if (fstat(storeFd, &sst) == 0) {
+            walk.dirInodes++;
+            creditInode(sst);
+        }
+        struct dirent * e;
+        while (errno = 0, e = readdir(storeHandle.get())) {
+            checkInterrupt();
+            if (isDotEntry(e->d_name))
+                continue;
+            if (std::string_view{e->d_name} == ".links")
+                continue;
+            if (e->d_type == DT_REG && seenInodes.contains(e->d_ino))
+                continue;
+            recurse(storeFd, e->d_name);
+        }
+        if (errno)
+            throw SysError("reading directory %1%", PathFmt(realStore));
+
         stats.dedup = std::move(dedup);
         stats.fullWalk = std::move(walk);
     }
