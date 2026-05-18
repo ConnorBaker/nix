@@ -130,23 +130,45 @@ if [ "$serialLinks" != "$parallelLinks" ]; then
 fi
 
 # Per-file dedup verification — for one sample of shared content,
-# verify a canonical exists in `.links/` and that the canonical's
-# nlink matches the hardlink-mode expectation (N user files + 1
-# canonical entry).
+# verify the total user-file references across all `.links/` replicas
+# of that content equals N.
+#
+# We sum across replicas rather than asserting `primary.nlink == N+1`
+# because the filesystem's `_PC_LINK_MAX` may be lower than `N+1`
+# (e.g., on some ZFS / tmpfs sandbox configurations it can be as low
+# as 128). When that happens the replica-spill walk in `optimisePath_`
+# fills `.00`, `.01`, … and the primary's nlink saturates at the
+# fs cap. The true invariant is `Σ (nlink_i - 1) == N` over the
+# replicas that host this content, where the `-1` per replica is the
+# `.links/` entry name itself.
 sampleShared="$(find "$NIX_STORE_DIR" -name 'shared1' -path '*-paralleltag-*' -print -quit)"
 if [ -z "$sampleShared" ]; then
     echo "FAIL: no shared1 sample file found in store"
     exit 1
 fi
-canonical="$(findCanonicalLink "$sampleShared")"
-if [ -z "$canonical" ]; then
-    echo "FAIL: no canonical .links/ entry for $sampleShared"
+sampleHash="$(sha256sum "$sampleShared" | awk '{print $1}')"
+totalUserRefs=0
+replicaCount=0
+replicaNlinks=""
+shopt -s nullglob
+for f in "$NIX_STORE_DIR"/.links/* "$NIX_STORE_DIR"/.links/*/*; do
+    [ -f "$f" ] || continue
+    h="$(sha256sum "$f" | awk '{print $1}')"
+    if [ "$h" = "$sampleHash" ]; then
+        nl="$(stat --format=%h "$f")"
+        totalUserRefs=$((totalUserRefs + nl - 1))
+        replicaCount=$((replicaCount + 1))
+        replicaNlinks="$replicaNlinks $nl"
+    fi
+done
+shopt -u nullglob
+if [ "$replicaCount" -lt 1 ]; then
+    echo "FAIL: no .links/ entry for shared1 content"
     exit 1
 fi
-expectedNlink="$((N + 1))"
-actualNlink="$(stat --format=%h "$canonical")"
-if [ "$actualNlink" != "$expectedNlink" ]; then
-    echo "FAIL: expected canonical nlink=$expectedNlink, got $actualNlink"
+if [ "$totalUserRefs" != "$N" ]; then
+    echo "FAIL: expected $N user-file references to shared1 content across replicas," \
+         "got $totalUserRefs (replicas=$replicaCount, nlinks=[$replicaNlinks])"
     exit 1
 fi
 
