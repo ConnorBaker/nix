@@ -1,3 +1,4 @@
+#include "nix/store/globals.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/local-settings.hh"
 #include "nix/store/pathlocks.hh"
@@ -721,7 +722,7 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
        locals under high worker counts. */
     alignas(std::hardware_destructive_interference_size) std::atomic<uint64_t> done{0};
 
-    auto nThreads = Settings::resolveThreadCount(config->getLocalSettings().optimiseThreads.get());
+    auto nThreads = nix::Settings::resolveThreadCount(config->getLocalSettings().optimiseThreads.get());
 
     /* TBB's `auto_partitioner` adapts chunk size to per-item work
        cost, so we don't tune `maxChunkSize` here. The `task_arena`

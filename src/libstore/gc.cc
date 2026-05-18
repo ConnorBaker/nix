@@ -1,4 +1,5 @@
 #include "nix/store/gc-store.hh"
+#include "nix/store/globals.hh"
 #include "nix/store/local-gc.hh"
 #include "nix/store/local-settings.hh"
 #include "nix/store/local-store.hh"
@@ -1910,7 +1911,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     if (!phase2DeleteQueue.empty()) {
         printInfo("recursively deleting %d dead paths...", phase2DeleteQueue.size());
         auto nThreads =
-            Settings::resolveThreadCount(config->getLocalSettings().getGCSettings().gcDeleteThreads.get());
+            nix::Settings::resolveThreadCount(config->getLocalSettings().getGCSettings().gcDeleteThreads.get());
 
         if (useIoUringDispatch(*config)) {
             /* io_uring fanout across orphans: walks subtrees with TBB
@@ -1981,7 +1982,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         alignas(std::hardware_destructive_interference_size) std::atomic<int64_t> unsharedSize{0};
 
         auto nThreads =
-            Settings::resolveThreadCount(config->getLocalSettings().getGCSettings().gcLinksThreads.get());
+            nix::Settings::resolveThreadCount(config->getLocalSettings().getGCSettings().gcLinksThreads.get());
 
         if (useIoUringDispatch(*config)) {
             cleanupLinksIoUring(
