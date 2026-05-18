@@ -244,18 +244,18 @@ findCanonicalLink() {
   # is filesystem-dependent, so we make two passes: first matching
   # only the bare-name form, then falling back to replicas if no
   # primary was found.
-  #
-  # The shell glob `*.[0-9][0-9]` matches replica suffixes; the
-  # `!(*.[0-9][0-9])` negation requires extglob to filter them out.
-  shopt -s extglob nullglob
+  shopt -s nullglob
   # Pass 1: bare-name canonicals only, flat then sharded layout.
-  for f in "$NIX_STORE_DIR"/.links/!(*.[0-9][0-9]) \
-           "$NIX_STORE_DIR"/.links/*/!(*.[0-9][0-9]); do
+  # Filter out `.NN` replica suffixes at runtime to avoid extglob,
+  # which would need to be enabled at parse time (not inside this
+  # function body).
+  for f in "$NIX_STORE_DIR"/.links/* "$NIX_STORE_DIR"/.links/*/*; do
     [[ -f "$f" ]] || continue
+    [[ "$f" == *.[0-9][0-9] ]] && continue
     h="$(sha256sum "$f" | awk '{print $1}')"
     if [[ "$h" == "$targetHash" ]]; then
       printf '%s\n' "$f"
-      shopt -u extglob nullglob
+      shopt -u nullglob
       return 0
     fi
   done
@@ -265,11 +265,11 @@ findCanonicalLink() {
     h="$(sha256sum "$f" | awk '{print $1}')"
     if [[ "$h" == "$targetHash" ]]; then
       printf '%s\n' "$f"
-      shopt -u extglob nullglob
+      shopt -u nullglob
       return 0
     fi
   done
-  shopt -u extglob nullglob
+  shopt -u nullglob
   return 1
 }
 
