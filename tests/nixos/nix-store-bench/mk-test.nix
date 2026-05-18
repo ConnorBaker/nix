@@ -92,6 +92,9 @@ in
       # or device topology, so compatible with the default test
       # framework's -pc/-q35/virtio-pci wiring.
       #
+      # x2apic is an x86 feature; on aarch64 qemu rejects the flag.
+      # Use plain `-cpu host` there.
+      #
       # Measured rejected / surprising:
       # - `+invtsc,+tsc-deadline,-pmu` + `-overcommit cpu-pm=on`:
       #     Boot was faster but the bench work itself slowed from
@@ -104,7 +107,10 @@ in
       #     a runtime regression.
       # - `-nodefaults`: haven't measured in isolation; likely
       #     harmless but untested.
-      qemu.options = [ "-cpu" "host,+x2apic" ];
+      qemu.options =
+        if pkgs.stdenv.hostPlatform.isx86_64
+        then [ "-cpu" "host,+x2apic" ]
+        else [ "-cpu" "host" ];
       # No framebuffer / virtio-gpu: the test driver talks to the
       # guest over hvc0, never over a vt. Removing the GPU device
       # also skips a virtio_gpu initrd module.
