@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "nix/store/local-store.hh"
+#include "nix/store/store-api.hh"
 
 // Needed for template specialisations. This is not good! When we
 // overhaul how store configs work, this should be fixed.
@@ -9,6 +10,20 @@
 #include "nix/util/abstract-setting-to-json.hh"
 
 namespace nix {
+
+TEST(ContentStats, bucket_boundaries)
+{
+    using B = Store::ContentStats;
+    EXPECT_EQ(B::bucket(0), 0);
+    EXPECT_EQ(B::bucket(1), 0);
+    EXPECT_EQ(B::bucket(2), 1);
+    EXPECT_EQ(B::bucket(3), 1);
+    EXPECT_EQ(B::bucket(1023), 9);
+    EXPECT_EQ(B::bucket(1024), 10);
+    EXPECT_EQ(B::bucket(1u << 20), 20);
+    EXPECT_EQ(B::bucket(uint64_t{1} << 63), 63);
+    EXPECT_EQ(B::bucket(std::numeric_limits<uint64_t>::max()), 63);
+}
 
 TEST(LocalStore, storeDir_absolutePath)
 {

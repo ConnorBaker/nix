@@ -380,6 +380,8 @@ public:
      */
     void optimisePath(const std::filesystem::path & path, RepairFlag repair);
 
+    std::optional<ContentStats> queryStoreStats(ContentStatsOptions opts) override;
+
     bool verifyStore(bool checkContents, RepairFlag repair) override;
 
 protected:

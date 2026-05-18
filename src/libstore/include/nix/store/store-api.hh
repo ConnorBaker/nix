@@ -17,6 +17,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 #include <atomic>
+#include <bit>
 #include <map>
 #include <memory>
 #include <string>
@@ -875,6 +876,77 @@ public:
      * with the same contents.
      */
     virtual void optimiseStore() {};
+
+    /**
+     * Options for `Store::queryStoreStats`. See `nix store stats --help`
+     * for the user-facing description of each flag.
+     */
+    struct ContentStatsOptions
+    {
+        bool detailed = false;
+        bool histograms = false;
+
+        bool operator==(const ContentStatsOptions &) const = default;
+    };
+
+    /**
+     * Summary statistics for the contents of a store. Field semantics
+     * are documented in `src/nix/store-stats.md`. Distinct from the
+     * I/O-oriented `Store::Stats` defined below.
+     */
+    struct ContentStats
+    {
+        /** Histogram bucketed by `floor(log2(value))`; bucket 0 also holds zeros. */
+        using Histogram = std::map<uint8_t, uint64_t>;
+
+        static constexpr uint8_t bucket(uint64_t value)
+        {
+            return value == 0 ? 0 : std::bit_width(value) - 1;
+        }
+
+        uint64_t pathCount = 0;
+        uint64_t totalNarSize = 0;
+        Histogram narSizeHistogram;
+
+        struct Dedup
+        {
+            uint64_t linksFileCount = 0;
+            uint64_t uniqueBytes = 0;
+            uint64_t uniqueDiskBytes = 0;
+            uint64_t dedupBytes = 0;
+            uint64_t dedupDiskBytes = 0;
+            uint64_t dedupedFileCount = 0;
+            uint64_t inodesSaved = 0;
+            Histogram sizeHistogram;
+
+            bool operator==(const Dedup &) const = default;
+        };
+        std::optional<Dedup> dedup;
+
+        struct FullWalk
+        {
+            uint64_t totalDiskBytes = 0;
+            uint64_t fileInodes = 0;
+            uint64_t dirInodes = 0;
+            uint64_t symlinkInodes = 0;
+
+            uint64_t totalInodes() const
+            {
+                return fileInodes + dirInodes + symlinkInodes;
+            }
+
+            bool operator==(const FullWalk &) const = default;
+        };
+        std::optional<FullWalk> fullWalk;
+
+        bool operator==(const ContentStats &) const = default;
+    };
+
+    /** Returns nullopt for stores that can't provide stats (binary caches, old daemons). */
+    virtual std::optional<ContentStats> queryStoreStats(ContentStatsOptions opts)
+    {
+        return std::nullopt;
+    }
 
     /**
      * Check the integrity of the Nix store.

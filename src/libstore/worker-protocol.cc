@@ -29,6 +29,7 @@ const WorkerProto::Version WorkerProto::latest = {
                 WorkerProto::featureRealisationWithPath,
             },
             std::string{WorkerProto::featureDeleteDeadSpecificReferrers},
+            std::string{WorkerProto::featureQueryStoreStats},
         },
 };
 
@@ -575,6 +576,99 @@ void WorkerProto::Serialise<GCOptions::GCPaths>::write(
             [&](const GCOptions::WholeStore & _) { conn.to << uint8_t{1}; },
         },
         gcPaths);
+}
+
+static void writeHistogram(WorkerProto::WriteConn conn, const Store::ContentStats::Histogram & hist)
+{
+    conn.to << uint64_t{hist.size()};
+    for (auto & [bucket, count] : hist)
+        conn.to << uint64_t{bucket} << count;
+}
+
+static Store::ContentStats::Histogram readHistogram(WorkerProto::ReadConn conn)
+{
+    Store::ContentStats::Histogram hist;
+    auto n = readNum<uint64_t>(conn.from);
+    for (uint64_t i = 0; i < n; ++i) {
+        auto bucket = readNum<uint64_t>(conn.from);
+        auto count = readNum<uint64_t>(conn.from);
+        hist[static_cast<uint8_t>(bucket)] = count;
+    }
+    return hist;
+}
+
+Store::ContentStats
+WorkerProto::Serialise<Store::ContentStats>::read(const StoreDirConfig & store, ReadConn conn)
+{
+    Store::ContentStats stats;
+    stats.pathCount = readNum<uint64_t>(conn.from);
+    stats.totalNarSize = readNum<uint64_t>(conn.from);
+    stats.narSizeHistogram = readHistogram(conn);
+    if (readNum<uint64_t>(conn.from) != 0) {
+        Store::ContentStats::Dedup dedup;
+        dedup.linksFileCount = readNum<uint64_t>(conn.from);
+        dedup.uniqueBytes = readNum<uint64_t>(conn.from);
+        dedup.uniqueDiskBytes = readNum<uint64_t>(conn.from);
+        dedup.dedupBytes = readNum<uint64_t>(conn.from);
+        dedup.dedupDiskBytes = readNum<uint64_t>(conn.from);
+        dedup.dedupedFileCount = readNum<uint64_t>(conn.from);
+        dedup.inodesSaved = readNum<uint64_t>(conn.from);
+        dedup.sizeHistogram = readHistogram(conn);
+        stats.dedup = std::move(dedup);
+    }
+    if (readNum<uint64_t>(conn.from) != 0) {
+        Store::ContentStats::FullWalk walk;
+        walk.totalDiskBytes = readNum<uint64_t>(conn.from);
+        walk.fileInodes = readNum<uint64_t>(conn.from);
+        walk.dirInodes = readNum<uint64_t>(conn.from);
+        walk.symlinkInodes = readNum<uint64_t>(conn.from);
+        stats.fullWalk = std::move(walk);
+    }
+    return stats;
+}
+
+void WorkerProto::Serialise<Store::ContentStats>::write(
+    const StoreDirConfig & store, WriteConn conn, const Store::ContentStats & stats)
+{
+    conn.to << stats.pathCount << stats.totalNarSize;
+    writeHistogram(conn, stats.narSizeHistogram);
+    if (!stats.dedup) {
+        conn.to << uint64_t{0};
+    } else {
+        conn.to << uint64_t{1};
+        conn.to << stats.dedup->linksFileCount << stats.dedup->uniqueBytes << stats.dedup->uniqueDiskBytes
+                << stats.dedup->dedupBytes << stats.dedup->dedupDiskBytes << stats.dedup->dedupedFileCount
+                << stats.dedup->inodesSaved;
+        writeHistogram(conn, stats.dedup->sizeHistogram);
+    }
+    if (!stats.fullWalk) {
+        conn.to << uint64_t{0};
+    } else {
+        conn.to << uint64_t{1};
+        conn.to << stats.fullWalk->totalDiskBytes << stats.fullWalk->fileInodes << stats.fullWalk->dirInodes
+                << stats.fullWalk->symlinkInodes;
+    }
+}
+
+Store::ContentStatsOptions
+WorkerProto::Serialise<Store::ContentStatsOptions>::read(const StoreDirConfig & store, ReadConn conn)
+{
+    Store::ContentStatsOptions opts;
+    auto flags = readNum<uint64_t>(conn.from);
+    opts.detailed = (flags & 0x1) != 0;
+    opts.histograms = (flags & 0x2) != 0;
+    return opts;
+}
+
+void WorkerProto::Serialise<Store::ContentStatsOptions>::write(
+    const StoreDirConfig & store, WriteConn conn, const Store::ContentStatsOptions & opts)
+{
+    uint64_t flags = 0;
+    if (opts.detailed)
+        flags |= 0x1;
+    if (opts.histograms)
+        flags |= 0x2;
+    conn.to << flags;
 }
 
 } // namespace nix

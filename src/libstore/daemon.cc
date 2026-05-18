@@ -893,6 +893,20 @@ static void performOp(
         conn.to << 1;
         break;
 
+    case WorkerProto::Op::QueryStoreStats: {
+        auto opts = WorkerProto::Serialise<Store::ContentStatsOptions>::read(*store, rconn);
+        logger->startWork();
+        auto stats = store->queryStoreStats(opts);
+        logger->stopWork();
+        if (!stats) {
+            conn.to << uint64_t{0};
+        } else {
+            conn.to << uint64_t{1};
+            WorkerProto::write(*store, wconn, *stats);
+        }
+        break;
+    }
+
     case WorkerProto::Op::VerifyStore: {
         bool checkContents, repair;
         conn.from >> checkContents >> repair;

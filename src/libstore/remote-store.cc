@@ -734,6 +734,19 @@ void RemoteStore::optimiseStore()
     readInt(conn->from);
 }
 
+std::optional<Store::ContentStats> RemoteStore::queryStoreStats(ContentStatsOptions opts)
+{
+    auto conn(getConnection());
+    if (!conn->protoVersion.features.contains(WorkerProto::featureQueryStoreStats))
+        return std::nullopt;
+    conn->to << WorkerProto::Op::QueryStoreStats;
+    WorkerProto::write(*this, *conn, opts);
+    conn.processStderr();
+    if (readNum<uint64_t>(conn->from) == 0)
+        return std::nullopt;
+    return WorkerProto::Serialise<ContentStats>::read(*this, *conn);
+}
+
 bool RemoteStore::verifyStore(bool checkContents, RepairFlag repair)
 {
     auto conn(getConnection());

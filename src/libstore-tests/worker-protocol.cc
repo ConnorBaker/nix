@@ -893,6 +893,72 @@ VERSIONED_CHARACTERIZATION_TEST_NO_JSON(
         },
     }))
 
+VERSIONED_CHARACTERIZATION_TEST_NO_JSON(
+    WorkerProtoTest,
+    contentStatsOptions,
+    "content-stats-options",
+    defaultVersion,
+    (std::tuple<
+        Store::ContentStatsOptions,
+        Store::ContentStatsOptions,
+        Store::ContentStatsOptions,
+        Store::ContentStatsOptions>{
+        // All flags off.
+        Store::ContentStatsOptions{},
+        // histograms only (cheap walk-free path).
+        Store::ContentStatsOptions{.histograms = true},
+        // detailed only.
+        Store::ContentStatsOptions{.detailed = true},
+        // detailed + histograms.
+        Store::ContentStatsOptions{.detailed = true, .histograms = true},
+    }))
+
+VERSIONED_CHARACTERIZATION_TEST_NO_JSON(
+    WorkerProtoTest,
+    contentStats,
+    "content-stats",
+    defaultVersion,
+    (std::tuple<Store::ContentStats, Store::ContentStats, Store::ContentStats, Store::ContentStats>{
+        // Empty store: no optional sections.
+        Store::ContentStats{},
+        // Cheap query result: SQL totals + nar histogram, no walks.
+        Store::ContentStats{
+            .pathCount = 42,
+            .totalNarSize = 1024 * 1024,
+            .narSizeHistogram = {{8, 10}, {12, 20}, {20, 12}},
+        },
+        // Detailed (.links walk) result.
+        Store::ContentStats{
+            .pathCount = 42,
+            .totalNarSize = 1024 * 1024,
+            .narSizeHistogram = {{8, 10}, {12, 20}, {20, 12}},
+            .dedup =
+                Store::ContentStats::Dedup{
+                    .linksFileCount = 30,
+                    .uniqueBytes = 65536,
+                    .uniqueDiskBytes = 73728,
+                    .dedupBytes = 8192,
+                    .dedupDiskBytes = 12288,
+                    .dedupedFileCount = 7,
+                    .inodesSaved = 14,
+                    .sizeHistogram = {{0, 3}, {10, 15}, {16, 12}},
+                },
+        },
+        // Full-walk result (also has the dedup section in practice but
+        // we vary it here to exercise the optional separately).
+        Store::ContentStats{
+            .pathCount = 42,
+            .totalNarSize = 1024 * 1024,
+            .fullWalk =
+                Store::ContentStats::FullWalk{
+                    .totalDiskBytes = 1u << 30,
+                    .fileInodes = 100,
+                    .dirInodes = 25,
+                    .symlinkInodes = 8,
+                },
+        },
+    }))
+
 TEST_F(WorkerProtoTest, handshake_log)
 {
     CharacterizationTest::writeTest("handshake-to-client.bin", [&]() -> std::string {

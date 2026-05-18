@@ -46,6 +46,7 @@
 #  include <windows.h>
 #endif
 
+#include <boost/unordered/unordered_flat_set.hpp>
 #include <sqlite3.h>
 
 #include <nlohmann/json.hpp>
@@ -851,6 +852,112 @@ StorePathSet LocalStore::queryAllValidPaths()
             res.insert(parseStorePath(use.getStr(0)));
         return res;
     });
+}
+
+/* True for "." and ".." without allocating a std::string. */
+static bool isDotEntry(const char * name)
+{
+    return name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
+}
+
+std::optional<Store::ContentStats> LocalStore::queryStoreStats(ContentStatsOptions opts)
+{
+    ContentStats stats;
+
+    /* The narSize histogram requires iterating every row; the cheap
+       default uses a single aggregate. */
+    retrySQLite<void>([&]() {
+        auto state(_state->lock());
+        SQLiteStmt stmt;
+        if (opts.histograms) {
+            stmt.create(state->db, "select narSize from ValidPaths");
+            auto use(stmt.use());
+            while (use.next()) {
+                uint64_t narSize = use.getInt(0);
+                stats.pathCount++;
+                stats.totalNarSize += narSize;
+                stats.narSizeHistogram[ContentStats::bucket(narSize)]++;
+            }
+        } else {
+            stmt.create(state->db, "select count(*), coalesce(sum(narSize), 0) from ValidPaths");
+            auto use(stmt.use());
+            if (use.next()) {
+                stats.pathCount = use.getInt(0);
+                stats.totalNarSize = use.getInt(1);
+            }
+        }
+    });
+
+    if (opts.detailed) {
+        ContentStats::Dedup dedup;
+        ContentStats::FullWalk walk;
+        /* Hardlinks (every optimised file is one) share an inode;
+           credit their blocks toward totalDiskBytes exactly once. */
+        boost::unordered_flat_set<ino_t> seenInodes;
+        const std::string linksDirStr = linksDir.string();
+
+        auto recurse = [&](this auto & self, const std::string & path, bool inLinks) -> void {
+            checkInterrupt();
+            struct stat st;
+            if (lstat(path.c_str(), &st)) {
+                if (errno == ENOENT)
+                    return;
+                throw SysError("statting '%1%'", path);
+            }
+
+            bool firstSighting = st.st_nlink <= 1 || seenInodes.insert(st.st_ino).second;
+            if (firstSighting)
+                walk.totalDiskBytes += uint64_t(st.st_blocks) * 512;
+
+            if (S_ISDIR(st.st_mode)) {
+                walk.dirInodes++;
+                AutoCloseDir d(opendir(path.c_str()));
+                if (!d) {
+                    if (errno == ENOENT)
+                        return;
+                    throw SysError("opening directory %1%", path);
+                }
+                bool childIsInLinks = inLinks || path == linksDirStr;
+                struct dirent * e;
+                while (errno = 0, e = readdir(d.get())) {
+                    if (isDotEntry(e->d_name))
+                        continue;
+                    self(path + "/" + e->d_name, childIsInLinks);
+                }
+                if (errno)
+                    throw SysError("reading directory %1%", path);
+            } else if (S_ISLNK(st.st_mode)) {
+                walk.symlinkInodes++;
+            } else if (S_ISREG(st.st_mode)) {
+                if (inLinks) {
+                    /* A .links entry has nlink = 1 (itself) + one per
+                       store file sharing its content; real dedup is
+                       nlink > 2. */
+                    uint64_t diskBytes = uint64_t(st.st_blocks) * 512;
+                    dedup.linksFileCount++;
+                    dedup.uniqueBytes += st.st_size;
+                    dedup.uniqueDiskBytes += diskBytes;
+                    if (st.st_nlink > 2) {
+                        uint64_t extraCopies = st.st_nlink - 2;
+                        dedup.dedupedFileCount++;
+                        dedup.inodesSaved += extraCopies;
+                        dedup.dedupBytes += extraCopies * uint64_t(st.st_size);
+                        dedup.dedupDiskBytes += extraCopies * diskBytes;
+                    }
+                    if (opts.histograms)
+                        dedup.sizeHistogram[ContentStats::bucket(st.st_size)]++;
+                } else if (firstSighting) {
+                    walk.fileInodes++;
+                }
+            }
+        };
+
+        recurse(storeDir, /*inLinks=*/false);
+        stats.dedup = std::move(dedup);
+        stats.fullWalk = std::move(walk);
+    }
+
+    return stats;
 }
 
 void LocalStore::queryReferrers(State & state, const StorePath & path, StorePathSet & referrers)
