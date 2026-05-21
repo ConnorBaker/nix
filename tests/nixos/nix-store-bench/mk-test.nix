@@ -62,6 +62,7 @@ let
     MKFS_FLAG = "${cfg.fsMkfsFlag}"
     NPATHS = ${toString cfg.nPaths}
     THREADS = ${toString cfg.threads}
+    THREADS2: int | None = ${pyVal cfg.threads2}
     REPS = ${toString cfg.benchRepetitions}
     BENCH_NAME = "${cfg.benchName}"
     MULTI_PROCESS = ${pyVal cfg.multiProcess}

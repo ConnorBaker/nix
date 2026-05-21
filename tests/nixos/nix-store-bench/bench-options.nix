@@ -104,9 +104,9 @@ in
       type = types.nullOr types.ints.positive;
       default = null;
       description = ''
-        Vestigial option retained only so
-        `bench.py` run-matrix code that sets `threads2` on non-GC
-        cells doesn't fail at schema time. Unused here.
+        Second thread axis. Required for `optimise_with_concurrent_gc`
+        (recorded in the bench arg list, but inert at this commit —
+        no gc-links-threads setting yet). Ignored otherwise.
       '';
     };
 
@@ -124,17 +124,23 @@ in
         "gc_barabasi"
         "gc_clusters"
         "optimise"
+        "optimise_with_concurrent_gc"
       ];
       default = "gc_barabasi";
       description = ''
         Bench function in `optimise-bench.cc`. The baseline-port
-        bench binary only registers `optimise`, `gc_barabasi`, and
-        `gc_clusters` — all in a single serial variant, since the
-        baseline code pre-dates the sharded-links, replica-spill,
-        and io_uring-dispatch work. The
-        `optimise_migrate` / `optimise_with_concurrent_gc` /
-        `invalidate_paths` benches from the full rig are absent here
-        because the APIs they exercise don't exist at this commit.
+        bench binary registers `optimise`, `gc_barabasi`,
+        `gc_clusters`, and `optimise_with_concurrent_gc` — all in a
+        single serial variant, since the baseline code pre-dates the
+        sharded-links, replica-spill, and io_uring-dispatch work.
+        `optimise_with_concurrent_gc` is included here so the A/B
+        has a fair "before" number for concurrent optimise+GC; at
+        this commit it stresses the shared GC-socket contention
+        that the comparison branch's per-thread-gc-socket rewrite
+        eliminates. The `optimise_migrate` and `invalidate_paths`
+        benches from the full rig remain absent here because the
+        APIs they exercise (sharded migration, exposed
+        `invalidatePathsChecked`) don't exist at this commit.
       '';
     };
 
@@ -287,7 +293,17 @@ in
     ''
   ];
 
-  config.assertions = [ ];
+  config.assertions = [
+    {
+      assertion =
+        cfg.benchName == "optimise_with_concurrent_gc" -> cfg.threads2 != null;
+      message = ''
+        bench.benchName = "${cfg.benchName}" requires bench.threads2
+        (recorded in the BENCHMARK arg list as the third axis even
+        though no thread-count setting consumes it at this commit).
+      '';
+    }
+  ];
   # `nPaths` is validated by the bench binary itself: an unregistered
   # value surfaces as "Failed to match any benchmarks" at run time
   # (see test_script.py). The registered cells live in

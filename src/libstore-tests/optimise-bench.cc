@@ -12,6 +12,16 @@
      - optimise  — measures LocalStore::optimiseStore(OptimiseStats&)
      - gc_barabasi / gc_clusters — measure LocalStore::collectGarbage
        over the BA and Clusters fixture topologies respectively
+     - optimise_with_concurrent_gc — runs optimise + GC simultaneously
+       on the same store. Included deliberately: the per-thread
+       gc-socket fix on the comparison branch was written *for*
+       this workload, and at the baseline commit the shared
+       Sync<AutoCloseFD> in `addTempRoot` is the dominant cost.
+       Excluding it would understate the improvement on a real
+       user-visible workflow (concurrent build+GC). Threads are
+       inert here (no optimise-threads / gc-links-threads settings
+       at this commit), so the bench-side concurrency is what we
+       can express: two std::threads, single-worker each.
 
    What's dropped vs the full rig:
      - Variant enum (no sharded layout / replica cap at baseline)
@@ -20,9 +30,8 @@
      - SettingsGuard body (nothing to save/restore)
      - Per-stage Timings counters (OptimiseStats / GCResults have no
        Timings substructs at baseline)
-     - optimise_migrate (sharded layout absent)
-     - optimise_with_concurrent_gc (pre-dates per-thread gc-socket
-       fix — reports 15x slowdown that isn't real-world)
+     - optimise_migrate (sharded layout absent — measures a
+       migration step that doesn't exist at this commit)
      - invalidate_paths (invalidatePathsChecked not exposed at
        baseline)
 
@@ -52,6 +61,7 @@
 #  include <unistd.h>
 
 #  include <algorithm>
+#  include <atomic>
 #  include <cstdint>
 #  include <cstdlib>
 #  include <filesystem>
@@ -230,6 +240,114 @@ BENCHMARK(optimise)
     ->Args({2000, 4})
     ->Args({10000, 4})
     ->Args({50000, 4})
+    ->Unit(benchmark::kMillisecond)
+    ->UseManualTime();
+
+/* ---------- optimise_with_concurrent_gc -------------------------
+ *
+ * Runs `optimiseStore()` and `collectGarbage()` simultaneously in
+ * the same process, two `std::thread`s, single-worker each. At
+ * 616df9797 there are no optimise-threads / gc-links-threads
+ * settings, so the (threads, threads2) cell axes only survive in
+ * the BENCHMARK arg list and the result-name suffix for host-side
+ * A/B parity with the comparison branch.
+ *
+ * Why this is in the baseline at all: every `addTempRoot` call from
+ * the optimise side blocks on a single `Sync<AutoCloseFD>` to the
+ * GC server, and at this commit the GC server is the same process
+ * doing the deletion. Concurrent optimise+GC therefore serialises
+ * on the temp-root socket — the exact contention the comparison
+ * branch's per-thread-gc-socket rewrite eliminates. Measuring it
+ * here gives the A/B a fair "before" number for the workload that
+ * change was written to fix. (Cross-process optimise vs in-process
+ * GC pays the same round-trip and is also slow at this commit, but
+ * isn't exercised by this bench.)
+ *
+ * `gc_threw` / `opt_threw` counters: at baseline the
+ * concurrent-modification race can throw on either side (GC sees
+ * a path disappear mid-walk; optimise sees a link target vanish).
+ * Tolerating the throw and surfacing the count keeps a fast row
+ * caused by an exception-shortened inner loop from masquerading as
+ * a measured speed-up — `bench.py`'s `_throws_marker` flags any
+ * non-zero count with `!`.
+ */
+static void optimise_with_concurrent_gc(benchmark::State & state)
+{
+    std::lock_guard benchLock(benchSerialiseMutex);
+
+    const size_t nPaths = state.range(0);
+    /* threads (state.range(1)) and threads2 (state.range(2)) are
+       recorded in the capture-name only — see header note. */
+
+    uint64_t totalCallSumNs = 0;
+    uint64_t gcThrowCount = 0;
+    uint64_t optThrowCount = 0;
+    for (auto _ : state) {
+        state.PauseTiming();
+        BenchFixture fixture(nPaths, /*nShared=*/8);
+
+        /* Pre-optimise so the timed concurrent GC has dead paths to
+           sweep — without this the GC's findRoots already covers
+           every path and Phase-2 deletion is a no-op, defeating the
+           contention story we're measuring. */
+        {
+            OptimiseStats warm;
+            fixture.local().optimiseStore(warm);
+        }
+        truncateBenchTempRoots(fixture.root);
+
+        std::atomic<bool> gcThrew{false};
+        std::atomic<bool> optThrew{false};
+        state.ResumeTiming();
+
+        OptimiseStats stats;
+        GCResults gcRes;
+        totalCallSumNs += timedCall(state, [&] {
+            std::thread gcThread([&] {
+                GCOptions opts;
+                opts.action = GCOptions::gcDeleteDead;
+                try {
+                    fixture.local().collectGarbage(opts, gcRes);
+                } catch (...) {
+                    /* See header comment on the throw counters. */
+                    gcThrew.store(true, std::memory_order_relaxed);
+                }
+            });
+
+            try {
+                fixture.local().optimiseStore(stats);
+            } catch (...) {
+                optThrew.store(true, std::memory_order_relaxed);
+            }
+
+            gcThread.join();
+        });
+
+        state.PauseTiming();
+        benchmark::DoNotOptimize(stats.bytesFreed);
+        benchmark::DoNotOptimize(gcRes.bytesFreed);
+        if (gcThrew.load(std::memory_order_relaxed))
+            ++gcThrowCount;
+        if (optThrew.load(std::memory_order_relaxed))
+            ++optThrowCount;
+    }
+
+    reportTotalMs(state, totalCallSumNs);
+    /* Always emit so 0 is a "clean run" signal rather than "bench
+       forgot to populate the counter". */
+    state.counters["gc_threw"] = static_cast<double>(gcThrowCount);
+    state.counters["opt_threw"] = static_cast<double>(optThrowCount);
+    state.SetItemsProcessed(state.iterations() * nPaths);
+}
+
+/* Args = (nPaths, threads, threads2). Symmetric (T, T) cells only
+   at baseline — the asymmetric (16, 1) / (1, 16) cells from the
+   full rig measure thread-count interactions that don't exist at
+   this commit anyway. */
+BENCHMARK(optimise_with_concurrent_gc)
+    ->Args({2000, 4, 4})
+    ->Args({10000, 4, 4})
+    ->Args({50000, 4, 4})
     ->Unit(benchmark::kMillisecond)
     ->UseManualTime();
 

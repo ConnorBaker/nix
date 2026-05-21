@@ -648,6 +648,12 @@ def _cell_cmd(cell: Cell, adhoc_nix: Path, results_dir: Path, build_dir: Path | 
         cmd += ["--argstr", opt, getattr(cell, attr)]
     for opt, attr in _ARG_AXES.items():
         cmd += ["--arg", opt, str(getattr(cell, attr))]
+    # optimise_with_concurrent_gc's BENCHMARK row takes a third Args
+    # entry (threads2). Schema asserts it's non-null for that bench;
+    # other benches pass `null` and the schema ignores it. Pinned to
+    # match `threads` because the registered cells are symmetric.
+    if cell.bench == "optimise_with_concurrent_gc":
+        cmd += ["--arg", "threads2", str(cell.threads)]
     # Cores must cover threads + 2; default cores=8 handles up to
     # threads=6, raise for threads=16.
     if cell.threads >= 16:
