@@ -366,8 +366,15 @@ def _cell_json(entry: Path) -> Path | None:
 def _discover_cached(resolved_dir: Path) -> tuple[Result, ...]:
     """Internal cache keyed on the *resolved* path so different
     spellings (`./results`, `results`, `/abs/results`) collapse onto
-    the same cache entry and the warning side-effects fire once."""
-    out: list[Result] = []
+    the same cache entry and the warning side-effects fire once.
+
+    Sorted by `Cell` (axis-tuple order), not by filename. Lexicographic
+    sort on `result-*` interleaves benches that share a prefix
+    (`optimise` / `optimise_migrate` / `optimise_with_concurrent_gc`)
+    and orders npaths as `n10000` < `n2000` < `n50000`. `Cell` is a
+    frozen ordered dataclass, so sorting by it groups benches first
+    and treats `npaths` as the integer it is."""
+    parsed: list[Result] = []
     for entry in sorted(resolved_dir.iterdir()):
         if not entry.name.startswith("result-"):
             continue
@@ -379,8 +386,9 @@ def _discover_cached(resolved_dir: Path) -> tuple[Result, ...]:
         if jp is None:
             print(f"warning: no JSON inside {entry.name}", file=sys.stderr)
             continue
-        out.append(Result(cell=cell, json_path=jp, entry=entry))
-    return tuple(out)
+        parsed.append(Result(cell=cell, json_path=jp, entry=entry))
+    parsed.sort(key=lambda r: r.cell)
+    return tuple(parsed)
 
 
 def discover(results_dir: Path) -> tuple[Result, ...]:
@@ -417,14 +425,16 @@ def _pair_dirs(dir_a: Path, dir_b: Path, args: argparse.Namespace) -> PairedDirs
     return PairedDirs(pairs=pairs, only_a=only_a, only_b=only_b)
 
 
-def _summarise_unpaired(results: list[Result], side_label: str, show_names: bool) -> None:
-    """Print a per-axis value-distribution of unpaired cells to stderr.
-    Lets you tell "the 1069 unpaired cells are exactly the ones with
-    dispatch=iouring" at a glance, vs "they span every axis". With
-    `show_names` also dumps the directory names."""
+def _summarise_unpaired(results: list[Result], side_label: str, show_names: bool) -> list[str]:
+    """Per-axis value-distribution of unpaired cells. Lets you tell
+    "the 1069 unpaired cells are exactly the ones with dispatch=iouring"
+    at a glance, vs "they span every axis". With `show_names` also
+    includes the directory names. Returns the `#`-prefixed lines so
+    callers can route them — stderr for text-mode tables, fenced code
+    block on stdout for markdown."""
     if not results:
-        return
-    print(f"# {len(results)} cell(s) only in {side_label}:", file=sys.stderr)
+        return []
+    lines = [f"# {len(results)} cell(s) only in {side_label}:"]
     for axis in AXES:
         counts: dict[str, int] = {}
         for r in results:
@@ -432,13 +442,13 @@ def _summarise_unpaired(results: list[Result], side_label: str, show_names: bool
             counts[v] = counts.get(v, 0) + 1
         if len(counts) == 1:
             (only,) = counts
-            print(f"#   {axis} = {only}", file=sys.stderr)
+            lines.append(f"#   {axis} = {only}")
         else:
             joined = ", ".join(f"{v}({n})" for v, n in sorted(counts.items()))
-            print(f"#   {axis} {IN_OP} {{{joined}}}", file=sys.stderr)
+            lines.append(f"#   {axis} {IN_OP} {{{joined}}}")
     if show_names:
-        for r in results:
-            print(f"#     {r.entry.name}", file=sys.stderr)
+        lines.extend(f"#     {r.entry.name}" for r in results)
+    return lines
 
 
 def _require_dirs(*dirs: Path) -> int:
@@ -808,9 +818,17 @@ _TABLE_COLS_AB = (
 )
 
 
-def _render_table(headers: tuple[str, ...], rendered: list[tuple[str, ...]]) -> None:
-    """Print a left-aligned columnar table to stdout."""
+def _render_table(headers: tuple[str, ...], rendered: list[tuple[str, ...]], fmt_kind: str = "text") -> None:
+    """Print a table to stdout in `text` (left-aligned columns) or `md`
+    (GitHub-flavored Markdown). Both shapes accept the same headers
+    and pre-stringified rows."""
     if not rendered:
+        return
+    if fmt_kind == "md":
+        print("| " + " | ".join(headers) + " |")
+        print("| " + " | ".join("---" for _ in headers) + " |")
+        for cells in rendered:
+            print("| " + " | ".join(cells) + " |")
         return
     widths = [max(len(h), *(len(c[i]) for c in rendered)) for i, h in enumerate(headers)]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
@@ -818,6 +836,25 @@ def _render_table(headers: tuple[str, ...], rendered: list[tuple[str, ...]]) -> 
     print(fmt.format(*("-" * w for w in widths)))
     for cells in rendered:
         print(fmt.format(*cells))
+
+
+def _emit_comments(lines: list[str], fmt_kind: str) -> None:
+    """Route `#`-prefixed annotation lines. Text mode keeps them on
+    stderr (historical behavior — keeps the table itself paste-able as
+    fixed-width data). Markdown mode wraps them in a fenced code block
+    on stdout so they survive a single `>` pipe and don't render as
+    headings (`#` would otherwise become an `<h1>`)."""
+    if not lines:
+        return
+    if fmt_kind == "md":
+        print("```")
+        for line in lines:
+            print(line)
+        print("```")
+        print()
+    else:
+        for line in lines:
+            print(line, file=sys.stderr)
 
 
 def cmd_summary_matrix(args: argparse.Namespace) -> int:
@@ -857,11 +894,19 @@ def cmd_summary_matrix(args: argparse.Namespace) -> int:
 
     headers = tuple(h for h, _ in _TABLE_COLS)
     rendered = [tuple(fn(r, s, d) for _, fn in _TABLE_COLS) for r, s, d in rows]
-    _render_table(headers, rendered)
+    _render_table(headers, rendered, args.format)
     # Footer goes to stdout for the same reason as the two-dir branch
-    # (predictable interleaving under `2>&1 |` and `less`).
+    # (predictable interleaving under `2>&1 |` and `less`). Markdown
+    # mode wraps it in a fenced block so the `#` doesn't render as a
+    # heading.
     if any(d.has_throws for _, _, d in rows):
-        print("\n# `!` next to iters = cell reported caught throws; row is suspect")
+        footer = ["# `!` next to iters = cell reported caught throws; row is suspect"]
+        if args.format == "md":
+            print()
+            _emit_comments(footer, args.format)
+        else:
+            print()
+            print(footer[0])
     return 0
 
 
@@ -875,19 +920,24 @@ def _cmd_summary_matrix_two_dir(args: argparse.Namespace) -> int:
             f"(only_in_a={len(paired.only_a)}, only_in_b={len(paired.only_b)})",
             file=sys.stderr,
         )
-        _summarise_unpaired(paired.only_a, a_label, args.show_missing)
-        _summarise_unpaired(paired.only_b, b_label, args.show_missing)
+        # Error-path summaries always go to stderr; markdown's fenced-
+        # block routing only kicks in when we actually emit a table.
+        for line in _summarise_unpaired(paired.only_a, a_label, args.show_missing):
+            print(line, file=sys.stderr)
+        for line in _summarise_unpaired(paired.only_b, b_label, args.show_missing):
+            print(line, file=sys.stderr)
         return 1
 
+    pre_comments: list[str] = []
     if paired.only_a or paired.only_b:
-        print(
+        pre_comments.append(
             f"# {len(paired.pairs)} pair(s); skipping {len(paired.only_a)} cell(s) only in {a_label}, "
             f"{len(paired.only_b)} cell(s) only in {b_label} "
-            f"(--show-missing to list)",
-            file=sys.stderr,
+            f"(--show-missing to list)"
         )
-        _summarise_unpaired(paired.only_a, a_label, args.show_missing)
-        _summarise_unpaired(paired.only_b, b_label, args.show_missing)
+        pre_comments.extend(_summarise_unpaired(paired.only_a, a_label, args.show_missing))
+        pre_comments.extend(_summarise_unpaired(paired.only_b, b_label, args.show_missing))
+    _emit_comments(pre_comments, args.format)
 
     # Use compute_ab so the table shares one source of truth with
     # ab-matrix for "what counts as a regression". The verdict column
@@ -936,21 +986,29 @@ def _cmd_summary_matrix_two_dir(args: argparse.Namespace) -> int:
 
     headers = tuple(_label_header(h) for h, _ in _TABLE_COLS_AB)
     rendered = [tuple(fn(c, r) for _, fn in _TABLE_COLS_AB) for c, r in rows]
-    _render_table(headers, rendered)
+    _render_table(headers, rendered, args.format)
     # Footer notes go to stdout (not stderr) so the table and its
     # legend stay in order when piped through `head`/`less`/etc.
-    if any(r.has_throws for _, r in rows):
-        print("\n# `!` next to iters = cell reported caught throws; row is suspect")
-    if any(_fmt_cv(s).endswith("*") for _, r in rows for s in (r.a_stats, r.b_stats)):
-        print(f"# `*` after a CV value = noise > {NOISY_CV:.0%}; {DELTA}mean is mostly statistical")
     # Compact aggregate footer — full breakdown lives in `ab-matrix`,
     # this is just the one-liner so the table is self-contained.
     totals = {"pass": 0, "fail": 0, "missing": 0}
     for _, r in rows:
         totals[_verdict(r)] += 1
-    print(
+    footer: list[str] = []
+    if any(r.has_throws for _, r in rows):
+        footer.append("# `!` next to iters = cell reported caught throws; row is suspect")
+    if any(_fmt_cv(s).endswith("*") for _, r in rows for s in (r.a_stats, r.b_stats)):
+        footer.append(f"# `*` after a CV value = noise > {NOISY_CV:.0%}; {DELTA}mean is mostly statistical")
+    footer.append(
         f"# {len(rows)} pair(s)  pass: {totals['pass']}  fail: {totals['fail']}  missing: {totals['missing']}"
     )
+    if args.format == "md":
+        print()
+        _emit_comments(footer, args.format)
+    else:
+        print()
+        for line in footer:
+            print(line)
     return 0
 
 
@@ -1556,6 +1614,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # column runs the same gates as ab-matrix); harmless in single-dir.
     _add_thresholds(sm_p)
     sm_p.add_argument("--json", action="store_true", help="JSONL output instead of a table")
+    sm_p.add_argument(
+        "--format",
+        choices=("text", "md"),
+        default="text",
+        help="table shape: `text` = whitespace-aligned columns (default), `md` = GitHub Markdown table",
+    )
     sm_p.set_defaults(func=cmd_summary_matrix)
 
     am_p = sp.add_parser("ab-matrix", help="Pairwise A/B across one axis, or across two dirs.")
