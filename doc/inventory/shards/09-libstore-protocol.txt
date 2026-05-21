@@ -1,0 +1,16 @@
+src/libstore/worker-protocol.cc
+src/libstore/include/nix/store/worker-protocol.hh
+src/libstore/include/nix/store/worker-protocol-impl.hh
+src/libstore/worker-protocol-connection.cc
+src/libstore/include/nix/store/worker-protocol-connection.hh
+src/libstore/include/nix/store/worker-settings.hh
+src/libstore/serve-protocol.cc
+src/libstore/include/nix/store/serve-protocol.hh
+src/libstore/include/nix/store/serve-protocol-impl.hh
+src/libstore/serve-protocol-connection.cc
+src/libstore/include/nix/store/serve-protocol-connection.hh
+src/libstore/common-protocol.cc
+src/libstore/include/nix/store/common-protocol.hh
+src/libstore/include/nix/store/common-protocol-impl.hh
+src/libstore/daemon.cc
+src/libstore/include/nix/store/daemon.hh

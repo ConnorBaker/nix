@@ -1,0 +1,8 @@
+src/libexpr/primops.cc
+src/libexpr/include/nix/expr/primops.hh
+src/libexpr/primops/context.cc
+src/libexpr/primops/fetchClosure.cc
+src/libexpr/primops/fetchMercurial.cc
+src/libexpr/primops/fetchTree.cc
+src/libexpr/primops/fromTOML.cc
+src/libexpr/include/nix/expr/fetch-tree.hh
