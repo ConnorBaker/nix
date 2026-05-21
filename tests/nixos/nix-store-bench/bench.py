@@ -14,14 +14,23 @@ subcommands are:
   ab <a> <b> [a_bpf b_bpf] --a-name N --b-name N
                           A/B two JSONs; bpftrace dumps optional.
   summary-matrix          One row per cell in `--results-dir`.
+                          Add `--results-dir-b` to get a paired
+                          per-cell table with Δmean + verdict.
   ab-matrix --axis <ax>   Pairwise A/B across one axis of the
-                          matrix.
+                          matrix in a single dir.
+  ab-matrix --results-dir-b <dir>
+                          Pairwise A/B across two dirs by full
+                          Cell identity. `--only pass/fail/missing/
+                          nonpass` filters per-pair output; the
+                          aggregate footer spans every pair.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
+import os
 import re
 import shlex
 import shutil
@@ -30,6 +39,23 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+# UTF-8 by default; opt out via BENCH_ASCII=1 for cron/log environments
+# whose locale can't roundtrip Δ, em-dash, ∈, ≥, ≤. Affects display
+# only — failure messages embed numbers we don't translate.
+_ASCII = bool(os.environ.get("BENCH_ASCII"))
+DELTA = "d" if _ASCII else "Δ"
+EM_DASH = "--" if _ASCII else "—"
+GE = ">=" if _ASCII else "≥"
+LE = "<=" if _ASCII else "≤"
+IN_OP = "in" if _ASCII else "∈"
+
+# Cells with `stddev/mean` above this fraction are flagged as noisy
+# (a trailing `*` in tables, "[noisy]" in top-N entries, a count in
+# the aggregate). Tuned so n=3 baseline runs that drift heavily stand
+# out without spamming the whole table. Declared near the other
+# module constants so AbResult.noisy isn't a forward reference.
+NOISY_CV = 0.20
 
 # --- axis taxonomy ---------------------------------------------------------
 #
@@ -102,7 +128,6 @@ NAME_RE = re.compile(
     r"-(?P<replica>single|multi)"
     r"-n(?P<npaths>\d+)"
     r"-t(?P<threads>\d+)"
-    r"(?:-multi)?"
     r"$"
 )
 # If you add a new dispatch to `bench-options.nix` (e.g. "aio-poll"),
@@ -176,6 +201,10 @@ class BenchData:
     and `opt_threw` counters — emitted by `optimise_with_concurrent_gc`
     to expose exceptions the inner loop caught that would otherwise
     masquerade as speed-ups.
+
+    Instances returned from `load()` are cached by resolved path;
+    treat them as read-only — mutating `by_name` or `throws` will
+    corrupt every later call that returns the same instance.
     """
 
     path: Path
@@ -184,25 +213,7 @@ class BenchData:
 
     @classmethod
     def load(cls, path: Path) -> BenchData:
-        data = cls(path=path)
-        for row in json.loads(path.read_text()).get("benchmarks", []):
-            if row.get("run_type") != "iteration":
-                continue
-            if row.get("error_occurred"):
-                print(
-                    f"warning: dropping errored iteration in {path}: "
-                    f"{row.get('name', '?')}: {row.get('error_message', '?')}",
-                    file=sys.stderr,
-                )
-                continue
-            factor = UNIT_FACTOR.get(row.get("time_unit", "ns"))
-            if factor is None:
-                raise ValueError(f"unknown time_unit {row.get('time_unit')!r} in {path} (known: {sorted(UNIT_FACTOR)})")
-            data.by_name.setdefault(row.get("name", "?"), []).append(int(row["real_time"] * factor))
-            for k in data.throws:
-                if k in row:
-                    data.throws[k] += int(row[k])
-        return data
+        return _load_bench_cached(path.resolve())
 
     @property
     def all_samples(self) -> list[int]:
@@ -217,6 +228,34 @@ class BenchData:
             f"FAIL: {label} reported uncaught throws: {self.throws} "
             f"(measurement is suspect; the bench's inner loop caught an exception while running)"
         )
+
+
+@functools.lru_cache(maxsize=None)
+def _load_bench_cached(resolved_path: Path) -> BenchData:
+    """Actual JSON parse, keyed on the resolved path so different
+    spellings of the same file hit one cache entry. Treat the result
+    as immutable — see `BenchData` docstring."""
+    data = BenchData(path=resolved_path)
+    for row in json.loads(resolved_path.read_text()).get("benchmarks", []):
+        if row.get("run_type") != "iteration":
+            continue
+        if row.get("error_occurred"):
+            print(
+                f"warning: dropping errored iteration in {resolved_path}: "
+                f"{row.get('name', '?')}: {row.get('error_message', '?')}",
+                file=sys.stderr,
+            )
+            continue
+        factor = UNIT_FACTOR.get(row.get("time_unit", "ns"))
+        if factor is None:
+            raise ValueError(
+                f"unknown time_unit {row.get('time_unit')!r} in {resolved_path} (known: {sorted(UNIT_FACTOR)})"
+            )
+        data.by_name.setdefault(row.get("name", "?"), []).append(int(row["real_time"] * factor))
+        for k in data.throws:
+            if k in row:
+                data.throws[k] += int(row[k])
+    return data
 
 
 def parse_bpf(path: Path | None) -> tuple[int, int] | None:
@@ -272,8 +311,17 @@ def parse_name(name: str) -> Cell | None:
         head = head[: dm.start()]
     # Schema hyphenates underscores for derivation names; undo so
     # the parsed bench matches the original `benchName` enum.
+    bench = head.replace("-", "_")
+    # Defend against DISPATCH_SUFFIX_RE mis-stripping a future bench
+    # whose canonical name ends in `_syscall`/`_iouring`, and against
+    # benches added to `bench-options.nix` without `ALL_BENCHES`.
+    # Both cases produce a `bench` value that won't appear in the
+    # registry, so refuse to parse and let `_discover_cached` emit
+    # the standard "unparsable result name" warning.
+    if bench not in ALL_BENCHES:
+        return None
     return Cell(
-        bench=head.replace("-", "_"),
+        bench=bench,
         dispatch=dispatch,
         fs=m["fs"],
         throttle=m["throttle"],
@@ -288,7 +336,7 @@ def parse_name(name: str) -> Cell | None:
 class Result:
     cell: Cell
     json_path: Path
-    symlink: Path
+    entry: Path  # the `result-*` symlink or materialized directory
 
     @property
     def bpf_path(self) -> Path | None:
@@ -296,16 +344,17 @@ class Result:
         for non-GC cells or when bpftrace never produced output."""
         if self.cell.dispatch == "none":
             return None
-        p = self.symlink.resolve() / f"{self.cell.dispatch}.bpf.txt"
+        p = self.entry.resolve() / f"{self.cell.dispatch}.bpf.txt"
         return p if p.is_file() else None
 
 
-def _cell_json(symlink: Path) -> Path | None:
-    """The `<dispatch>.json` or `single.json` inside the symlink's
-    target directory."""
-    if not symlink.is_symlink():
+def _cell_json(entry: Path) -> Path | None:
+    """The `<dispatch>.json` or `single.json` inside the entry's
+    target. Accepts both the `nix build -o` symlink shape and a
+    materialized directory (e.g. after `cp -L` of the original tree)."""
+    if not entry.is_dir():  # follows symlinks
         return None
-    target = symlink.resolve()
+    target = entry.resolve()
     for stem in ("syscall", "iouring", "single"):
         p = target / f"{stem}.json"
         if p.is_file():
@@ -313,12 +362,13 @@ def _cell_json(symlink: Path) -> Path | None:
     return None
 
 
-def discover(results_dir: Path) -> list[Result]:
-    """Every parsable `result-*` symlink in `results_dir`, paired
-    with the JSON inside its target. Warns and skips entries that
-    fail either step."""
+@functools.lru_cache(maxsize=None)
+def _discover_cached(resolved_dir: Path) -> tuple[Result, ...]:
+    """Internal cache keyed on the *resolved* path so different
+    spellings (`./results`, `results`, `/abs/results`) collapse onto
+    the same cache entry and the warning side-effects fire once."""
     out: list[Result] = []
-    for entry in sorted(results_dir.iterdir()):
+    for entry in sorted(resolved_dir.iterdir()):
         if not entry.name.startswith("result-"):
             continue
         cell = parse_name(entry.name)
@@ -329,15 +379,115 @@ def discover(results_dir: Path) -> list[Result]:
         if jp is None:
             print(f"warning: no JSON inside {entry.name}", file=sys.stderr)
             continue
-        out.append(Result(cell, jp, entry))
-    return out
+        out.append(Result(cell=cell, json_path=jp, entry=entry))
+    return tuple(out)
 
 
-def _filter_cells(args: argparse.Namespace, results: list[Result]) -> list[Result]:
-    """Apply `--<axis>` filters from `args` to a result list. An axis
-    with no filter = match all; non-empty = membership."""
+def discover(results_dir: Path) -> tuple[Result, ...]:
+    """Every parsable `result-*` symlink in `results_dir`, paired
+    with the JSON inside its target. Warns and skips entries that
+    fail either step. Walks each real directory once even if called
+    multiple times under different path spellings."""
+    return _discover_cached(results_dir.resolve())
+
+
+def _filter_cells(args: argparse.Namespace, results: tuple[Result, ...] | list[Result]) -> list[Result]:
+    """Apply `--<axis>` filters from `args` to a result sequence. An
+    axis with no filter = match all; non-empty = membership."""
     filters = [(axis, getattr(args, axis)) for axis in AXES if getattr(args, axis)]
     return [r for r in results if all(str(getattr(r.cell, axis)) in vs for axis, vs in filters)]
+
+
+@dataclass(frozen=True)
+class PairedDirs:
+    pairs: list[tuple[Result, Result]]
+    only_a: list[Result]
+    only_b: list[Result]
+
+
+def _pair_dirs(dir_a: Path, dir_b: Path, args: argparse.Namespace) -> PairedDirs:
+    """Pair Results from two dirs by full Cell identity (post-filter
+    intersection). Also surfaces the unpaired Results on each side
+    so callers can summarise *what* is missing, not just how many."""
+    by_a = {r.cell: r for r in _filter_cells(args, discover(dir_a))}
+    by_b = {r.cell: r for r in _filter_cells(args, discover(dir_b))}
+    pairs = [(by_a[k], by_b[k]) for k in sorted(by_a.keys() & by_b.keys())]
+    only_a = [by_a[k] for k in sorted(by_a.keys() - by_b.keys())]
+    only_b = [by_b[k] for k in sorted(by_b.keys() - by_a.keys())]
+    return PairedDirs(pairs=pairs, only_a=only_a, only_b=only_b)
+
+
+def _summarise_unpaired(results: list[Result], side_label: str, show_names: bool) -> None:
+    """Print a per-axis value-distribution of unpaired cells to stderr.
+    Lets you tell "the 1069 unpaired cells are exactly the ones with
+    dispatch=iouring" at a glance, vs "they span every axis". With
+    `show_names` also dumps the directory names."""
+    if not results:
+        return
+    print(f"# {len(results)} cell(s) only in {side_label}:", file=sys.stderr)
+    for axis in AXES:
+        counts: dict[str, int] = {}
+        for r in results:
+            v = str(getattr(r.cell, axis))
+            counts[v] = counts.get(v, 0) + 1
+        if len(counts) == 1:
+            (only,) = counts
+            print(f"#   {axis} = {only}", file=sys.stderr)
+        else:
+            joined = ", ".join(f"{v}({n})" for v, n in sorted(counts.items()))
+            print(f"#   {axis} {IN_OP} {{{joined}}}", file=sys.stderr)
+    if show_names:
+        for r in results:
+            print(f"#     {r.entry.name}", file=sys.stderr)
+
+
+def _require_dirs(*dirs: Path) -> int:
+    """Returns rc=2 with a clean message if any path isn't a directory,
+    so callers don't propagate a raw `FileNotFoundError` from `iterdir`."""
+    for d in dirs:
+        if not d.is_dir():
+            print(f"error: not a directory: {d}", file=sys.stderr)
+            return 2
+    return 0
+
+
+def _validate_pair_flags(args: argparse.Namespace) -> int:
+    """Catch flag combinations that used to silently no-op. Returns
+    0 when OK, otherwise an exit code for the caller to propagate."""
+    if args.results_dir_b is None:
+        bad = []
+        if args.a_name or args.b_name:
+            bad.append("--a-name / --b-name")
+        if getattr(args, "show_missing", False):
+            bad.append("--show-missing")
+        if bad:
+            verb = "applies" if len(bad) == 1 else "apply"
+            print(
+                f"error: {' and '.join(bad)} only {verb} with --results-dir-b",
+                file=sys.stderr,
+            )
+            return 2
+        return 0
+    # Same-dir A=B produces an A/B against itself: every Δ is 0%,
+    # every verdict is PASS, with no signal that something's wrong.
+    a_resolved = args.results_dir.resolve()
+    b_resolved = args.results_dir_b.resolve()
+    if a_resolved == b_resolved:
+        print(
+            f"error: --results-dir-a and --results-dir-b both resolve to {a_resolved}; "
+            f"a directory cannot be A/B'd against itself",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+def _throws_marker(throws: dict[str, int]) -> str:
+    """`'!'` when the bench reported caught throws (silently bad
+    data); empty string otherwise. Surfaces what `cmd_summary` /
+    `cmd_ab` already gate on, in the matrix-table context where rows
+    were being shown without complaint."""
+    return "!" if any(v > 0 for v in throws.values()) else ""
 
 
 # --- `summary` (one JSON, possibly multiple named rows) -------------------
@@ -371,7 +521,88 @@ def cmd_summary(args: argparse.Namespace) -> int:
 # --- `ab` (single pair, with or without bpftrace dumps) --------------------
 
 
-def do_ab(
+# Failure categories. Stable strings so aggregate output can be
+# scripted against. Add new categories here when you add new gates.
+FAIL_WALL = "wall"
+FAIL_WALL_ZERO = "wall_zero"
+FAIL_SYSCALL = "syscall"
+FAIL_VFS = "vfs"
+FAIL_BPF_ZERO = "bpf_zero"
+FAIL_BPF_ASYMMETRIC = "bpf_asymmetric"
+FAIL_THROWS = "throws"
+
+
+@dataclass(frozen=True)
+class Failure:
+    """A single gate failure or throws report on an A/B pair. The
+    category drives aggregate counts; the message is the human-
+    readable explanation already shaped for `print_ab`."""
+
+    category: str
+    message: str
+
+
+@dataclass(frozen=True)
+class AbResult:
+    """One A/B comparison, structured so callers can aggregate. `rc`
+    follows the same convention as the old `do_ab` return: 0 PASS,
+    1 FAIL (gate or throws), 2 missing data."""
+
+    a_name: str
+    b_name: str
+    a_stats: Stats
+    b_stats: Stats
+    a_bpf: tuple[int, int] | None
+    b_bpf: tuple[int, int] | None
+    a_throws: dict[str, int]
+    b_throws: dict[str, int]
+    failures: tuple[Failure, ...]
+    missing: bool
+
+    @property
+    def rc(self) -> int:
+        if self.missing:
+            return 2
+        if self.failures:
+            return 1
+        return 0
+
+    @property
+    def has_throws(self) -> bool:
+        return any(f.category == FAIL_THROWS for f in self.failures)
+
+    @property
+    def wall_delta(self) -> float | None:
+        """(b - a) / a as a fraction (multiply by 100 for percent).
+        None when the A side wall is zero."""
+        if self.a_stats.mean == 0:
+            return None
+        return (self.b_stats.mean - self.a_stats.mean) / self.a_stats.mean
+
+    @property
+    def syscall_delta(self) -> float | None:
+        """(b - a) / a syscall count as a fraction. None when either
+        side's bpf is missing OR reads zero (bpftrace failed to
+        attach). The zero-check on the B side matters: without it,
+        a B failure would emit a misleading -100% "improvement" into
+        ranked output."""
+        if self.a_bpf is None or self.b_bpf is None:
+            return None
+        if self.a_bpf[1] == 0 or self.b_bpf[1] == 0:
+            return None
+        return (self.b_bpf[1] - self.a_bpf[1]) / self.a_bpf[1]
+
+    @property
+    def noisy(self) -> bool:
+        """Either side's CV exceeds the noise threshold — Δmean is
+        dominated by sample variance and the verdict is less trustworthy."""
+        for s in (self.a_stats, self.b_stats):
+            if s.mean and s.stddev / s.mean > NOISY_CV:
+                return True
+        return False
+
+
+def compute_ab(
     a_json: Path,
     b_json: Path,
     a_name: str,
@@ -379,73 +610,122 @@ def do_ab(
     a_bpf_path: Path | None,
     b_bpf_path: Path | None,
     thr: Thresholds,
-) -> int:
-    """A/B engine. Returns 0 = PASS, 1 = FAIL, 2 = missing data."""
+) -> AbResult:
+    """Pure computation: parse both sides, run the gates, package the
+    structured result. Doesn't print — see `print_ab`. Throws short-
+    circuit the metric gates: when either side reported caught throws,
+    the data is suspect and we don't bother running wall/syscall/vfs
+    comparisons that would be reading lies."""
     a = BenchData.load(a_json)
     b = BenchData.load(b_json)
+    missing = not a.all_samples or not b.all_samples
 
-    if not a.all_samples or not b.all_samples:
-        print(
-            f"missing iteration rows ({a_name}={len(a.all_samples)} samples, {b_name}={len(b.all_samples)} samples)",
-            file=sys.stderr,
-        )
-        return 2
-
-    throws_seen = False
+    failures: list[Failure] = []
     for label, data in ((a_name, a), (b_name, b)):
         if data.has_throws:
-            print(data.throws_message(label), file=sys.stderr)
-            throws_seen = True
-    if throws_seen:
-        return 1
+            failures.append(Failure(FAIL_THROWS, data.throws_message(label)))
 
-    a_bpf = parse_bpf(a_bpf_path)
-    b_bpf = parse_bpf(b_bpf_path)
-    a_s, b_s = Stats.of(a.all_samples), Stats.of(b.all_samples)
+    a_bpf = parse_bpf(a_bpf_path) if not missing else None
+    b_bpf = parse_bpf(b_bpf_path) if not missing else None
+    a_s = Stats.of(a.all_samples)
+    b_s = Stats.of(b.all_samples)
 
-    print(f"=== A/B: {a_name} vs {b_name} ===")
-    for label, s, bpf in ((a_name, a_s, a_bpf), (b_name, b_s, b_bpf)):
+    has_throws = any(f.category == FAIL_THROWS for f in failures)
+    if not missing and not has_throws:
+        # bpf gates require both sides; if exactly one is missing,
+        # the gate would silently no-op — surface that as a failure
+        # so a partial test run can't pass by accident.
+        if (a_bpf is None) != (b_bpf is None):
+            has, missing_side = (a_name, b_name) if a_bpf is not None else (b_name, a_name)
+            failures.append(
+                Failure(
+                    FAIL_BPF_ASYMMETRIC,
+                    f"bpf data is one-sided ({has} has it, {missing_side} doesn't) {EM_DASH} VFS/syscall gates skipped",
+                )
+            )
+        elif a_bpf is not None and b_bpf is not None:
+            a_vfs, a_sys = a_bpf
+            b_vfs, b_sys = b_bpf
+            # Both sides must have non-zero counts; a zero on either
+            # side is bpftrace failing to attach, not a real metric.
+            # Checking B-side explicitly closes a silent-pass hole:
+            # `ratio = 0 / a_sys = 0` would otherwise be ≤ threshold
+            # and the cell would pass with no bpf data.
+            if a_vfs == 0:
+                failures.append(Failure(FAIL_BPF_ZERO, f"{a_name} VFS count is zero {EM_DASH} bpftrace probably failed to attach"))
+            elif b_vfs == 0:
+                failures.append(Failure(FAIL_BPF_ZERO, f"{b_name} VFS count is zero {EM_DASH} bpftrace probably failed to attach"))
+            elif (delta := abs(a_vfs - b_vfs) / a_vfs) > thr.vfs_tolerance:
+                failures.append(
+                    Failure(
+                        FAIL_VFS,
+                        f"VFS op count diverged: {a_vfs} -> {b_vfs} (delta {delta:.1%}, threshold {LE} {thr.vfs_tolerance:.1%})",
+                    )
+                )
+            if a_sys == 0:
+                failures.append(Failure(FAIL_BPF_ZERO, f"{a_name} syscall count is zero {EM_DASH} bpftrace probably failed"))
+            elif b_sys == 0:
+                failures.append(Failure(FAIL_BPF_ZERO, f"{b_name} syscall count is zero {EM_DASH} bpftrace probably failed"))
+            elif (ratio := b_sys / a_sys) > thr.syscall_ratio:
+                failures.append(
+                    Failure(
+                        FAIL_SYSCALL,
+                        f"syscall regression: {a_sys} -> {b_sys} (ratio {ratio:.1%}, threshold {LE} {thr.syscall_ratio:.1%})",
+                    )
+                )
+        if a_s.mean == 0:
+            failures.append(Failure(FAIL_WALL_ZERO, f"{a_name} wall is zero {EM_DASH} bench probably failed"))
+        elif (improvement := (a_s.mean - b_s.mean) / a_s.mean) < thr.wall_improvement:
+            failures.append(
+                Failure(FAIL_WALL, f"wall regression: {improvement:+.1%} (threshold {GE} {thr.wall_improvement:+.1%})")
+            )
+
+    return AbResult(
+        a_name=a_name,
+        b_name=b_name,
+        a_stats=a_s,
+        b_stats=b_s,
+        a_bpf=a_bpf,
+        b_bpf=b_bpf,
+        a_throws=dict(a.throws),
+        b_throws=dict(b.throws),
+        failures=tuple(failures),
+        missing=missing,
+    )
+
+
+def print_ab(res: AbResult) -> None:
+    """Render one AbResult to stdout/stderr in the historical shape.
+    Throws messages route to stderr and short-circuit the metrics
+    block — matches the prior behaviour where a throws-tainted pair
+    never showed misleading numbers."""
+    if res.missing:
+        print(
+            f"missing iteration rows ({res.a_name}={res.a_stats.n} samples, "
+            f"{res.b_name}={res.b_stats.n} samples)",
+            file=sys.stderr,
+        )
+        return
+    throws_fs = [f for f in res.failures if f.category == FAIL_THROWS]
+    for f in throws_fs:
+        print(f.message, file=sys.stderr)
+    if throws_fs:
+        return
+
+    print(f"=== A/B: {res.a_name} vs {res.b_name} ===")
+    for label, s, bpf in ((res.a_name, res.a_stats, res.a_bpf), (res.b_name, res.b_stats, res.b_bpf)):
         extra = "(no bpftrace)" if bpf is None else f"vfs={bpf[0]:>7d}  syscalls={bpf[1]:>8d}"
         print(f"{label}: wall={fmt_ns(s.mean):>9s}  p99={fmt_ns(s.p99):>9s}  stddev={fmt_ns(s.stddev):>9s}  {extra}")
-
-    failures: list[str] = []
-
-    # VFS/syscall checks only apply when both bpf dumps were supplied.
-    if a_bpf is not None and b_bpf is not None:
-        a_vfs, a_sys = a_bpf
-        b_vfs, b_sys = b_bpf
-
-        if a_vfs == 0:
-            failures.append(f"{a_name} VFS count is zero — bpftrace probably failed to attach")
-        elif (delta := abs(a_vfs - b_vfs) / a_vfs) > thr.vfs_tolerance:
-            failures.append(
-                f"VFS op count diverged: {a_vfs} -> {b_vfs} (delta {delta:.1%}, threshold ≤ {thr.vfs_tolerance:.1%})"
-            )
-
-        if a_sys == 0:
-            failures.append(f"{a_name} syscall count is zero — bpftrace probably failed")
-        elif (ratio := b_sys / a_sys) > thr.syscall_ratio:
-            failures.append(
-                f"syscall regression: {a_sys} -> {b_sys} (ratio {ratio:.1%}, threshold ≤ {thr.syscall_ratio:.1%})"
-            )
-
-    if a_s.mean == 0:
-        failures.append(f"{a_name} wall is zero — bench probably failed")
-    elif (improvement := (a_s.mean - b_s.mean) / a_s.mean) < thr.wall_improvement:
-        failures.append(f"wall regression: {improvement:+.1%} (threshold ≥ {thr.wall_improvement:+.1%})")
-
-    if failures:
+    if res.failures:
         print("\nVERDICT: FAIL")
-        for f in failures:
-            print(f"  - {f}")
-        return 1
-
-    print("\nVERDICT: PASS")
-    return 0
+        for f in res.failures:
+            print(f"  - {f.message}")
+    else:
+        print("\nVERDICT: PASS")
 
 
 def cmd_ab(args: argparse.Namespace) -> int:
-    return do_ab(
+    res = compute_ab(
         args.a_json,
         args.b_json,
         args.a_name,
@@ -454,64 +734,437 @@ def cmd_ab(args: argparse.Namespace) -> int:
         args.b_bpf,
         Thresholds.from_args(args),
     )
+    print_ab(res)
+    return res.rc
 
 
 # --- `summary-matrix` (one row per cell) ----------------------------------
 
+
+def _fmt_cv(stats: Stats) -> str:
+    """Coefficient of variation as a percent. Flagged with `*` when
+    above NOISY_CV — a high-CV row's mean is dominated by noise, and
+    any A/B verdict over it should be taken with a grain of salt."""
+    if stats.mean == 0:
+        return EM_DASH
+    cv = stats.stddev / stats.mean
+    suffix = "*" if cv > NOISY_CV else ""
+    return f"{cv * 100:.0f}%{suffix}"
+
+
+def _fmt_delta_pct(a_mean: int, b_mean: int) -> str:
+    """B vs A as a signed percent, with em-dash when the baseline is zero."""
+    if a_mean == 0:
+        return EM_DASH
+    pct = (b_mean - a_mean) / a_mean * 100.0
+    return f"{pct:+.1f}%"
+
+
+# Single-dir summary-matrix columns. Adds `iters`, `mean`, `p99`,
+# `stddev`, `cv`. `cv` is the headline noise indicator; high CV
+# means the mean isn't trustworthy.
 _TABLE_COLS = (
-    # (header, cell→str extractor)
-    ("bench", lambda r, s: r.cell.bench),
-    ("dispatch", lambda r, s: r.cell.dispatch),
-    ("fs", lambda r, s: r.cell.fs),
-    ("throttle", lambda r, s: r.cell.throttle),
-    ("layout", lambda r, s: r.cell.layout),
-    ("replica", lambda r, s: r.cell.replica),
-    ("n", lambda r, s: str(r.cell.npaths)),
-    ("t", lambda r, s: str(r.cell.threads)),
-    ("iters", lambda r, s: str(s.n)),
-    ("mean", lambda r, s: fmt_ns(s.mean)),
-    ("p99", lambda r, s: fmt_ns(s.p99)),
-    ("stddev", lambda r, s: fmt_ns(s.stddev)),
+    ("bench", lambda r, s, d: r.cell.bench),
+    ("dispatch", lambda r, s, d: r.cell.dispatch),
+    ("fs", lambda r, s, d: r.cell.fs),
+    ("throttle", lambda r, s, d: r.cell.throttle),
+    ("layout", lambda r, s, d: r.cell.layout),
+    ("replica", lambda r, s, d: r.cell.replica),
+    ("n", lambda r, s, d: str(r.cell.npaths)),
+    ("t", lambda r, s, d: str(r.cell.threads)),
+    ("iters", lambda r, s, d: str(s.n) + _throws_marker(d.throws)),
+    ("mean", lambda r, s, d: fmt_ns(s.mean)),
+    ("p99", lambda r, s, d: fmt_ns(s.p99)),
+    ("stddev", lambda r, s, d: fmt_ns(s.stddev)),
+    ("cv", lambda r, s, d: _fmt_cv(s)),
+)
+
+_VERDICT_WORD = {"pass": "pass", "fail": "fail", "missing": "miss"}
+
+
+# Two-dir summary-matrix columns. One row per *paired* cell. Δmean
+# is the headline number; `verdict` runs the same gates as ab-matrix
+# so the table can stand alone for review (no need to also run
+# ab-matrix to know what passed); `cv_a`/`cv_b` flag noise.
+_TABLE_COLS_AB = (
+    ("bench", lambda c, r: c.bench),
+    ("dispatch", lambda c, r: c.dispatch),
+    ("fs", lambda c, r: c.fs),
+    ("throttle", lambda c, r: c.throttle),
+    ("layout", lambda c, r: c.layout),
+    ("replica", lambda c, r: c.replica),
+    ("n", lambda c, r: str(c.npaths)),
+    ("t", lambda c, r: str(c.threads)),
+    ("a_iters", lambda c, r: str(r.a_stats.n) + _throws_marker(r.a_throws)),
+    ("b_iters", lambda c, r: str(r.b_stats.n) + _throws_marker(r.b_throws)),
+    ("a_mean", lambda c, r: fmt_ns(r.a_stats.mean)),
+    ("b_mean", lambda c, r: fmt_ns(r.b_stats.mean)),
+    (f"{DELTA}mean", lambda c, r: _fmt_delta_pct(r.a_stats.mean, r.b_stats.mean)),
+    ("a_p99", lambda c, r: fmt_ns(r.a_stats.p99)),
+    ("b_p99", lambda c, r: fmt_ns(r.b_stats.p99)),
+    ("a_cv", lambda c, r: _fmt_cv(r.a_stats)),
+    ("b_cv", lambda c, r: _fmt_cv(r.b_stats)),
+    ("verdict", lambda c, r: _VERDICT_WORD[_verdict(r)]),
 )
 
 
-def cmd_summary_matrix(args: argparse.Namespace) -> int:
-    results = _filter_cells(args, discover(args.results_dir))
-    if not results:
-        print(f"no cells matched in {args.results_dir}", file=sys.stderr)
-        return 1
-
-    rows = [(r, Stats.of(BenchData.load(r.json_path).all_samples)) for r in results]
-
-    if args.json:
-        for r, s in rows:
-            row = asdict(r.cell) | {
-                "iters": s.n,
-                "mean_ns": s.mean,
-                "p99_ns": s.p99,
-                "stddev_ns": s.stddev,
-                "json_path": str(r.json_path),
-            }
-            print(json.dumps(row))
-        return 0
-
-    headers = tuple(h for h, _ in _TABLE_COLS)
-    rendered = [tuple(fn(r, s) for _, fn in _TABLE_COLS) for r, s in rows]
+def _render_table(headers: tuple[str, ...], rendered: list[tuple[str, ...]]) -> None:
+    """Print a left-aligned columnar table to stdout."""
+    if not rendered:
+        return
     widths = [max(len(h), *(len(c[i]) for c in rendered)) for i, h in enumerate(headers)]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     print(fmt.format(*headers))
     print(fmt.format(*("-" * w for w in widths)))
     for cells in rendered:
         print(fmt.format(*cells))
+
+
+def cmd_summary_matrix(args: argparse.Namespace) -> int:
+    if (rc := _validate_pair_flags(args)) != 0:
+        return rc
+
+    if args.results_dir_b is not None:
+        if (rc := _require_dirs(args.results_dir, args.results_dir_b)) != 0:
+            return rc
+        return _cmd_summary_matrix_two_dir(args)
+
+    if (rc := _require_dirs(args.results_dir)) != 0:
+        return rc
+    results = _filter_cells(args, discover(args.results_dir))
+    if not results:
+        print(f"no cells matched in {args.results_dir}", file=sys.stderr)
+        return 1
+
+    rows: list[tuple[Result, Stats, BenchData]] = []
+    for r in results:
+        d = BenchData.load(r.json_path)
+        rows.append((r, Stats.of(d.all_samples), d))
+
+    if args.json:
+        for r, s, d in rows:
+            row = asdict(r.cell) | {
+                "iters": s.n,
+                "mean_ns": s.mean,
+                "p99_ns": s.p99,
+                "stddev_ns": s.stddev,
+                "cv": (s.stddev / s.mean) if s.mean else None,
+                "throws": d.throws,
+                "json_path": str(r.json_path),
+            }
+            print(json.dumps(row))
+        return 0
+
+    headers = tuple(h for h, _ in _TABLE_COLS)
+    rendered = [tuple(fn(r, s, d) for _, fn in _TABLE_COLS) for r, s, d in rows]
+    _render_table(headers, rendered)
+    # Footer goes to stdout for the same reason as the two-dir branch
+    # (predictable interleaving under `2>&1 |` and `less`).
+    if any(d.has_throws for _, _, d in rows):
+        print("\n# `!` next to iters = cell reported caught throws; row is suspect")
     return 0
+
+
+def _cmd_summary_matrix_two_dir(args: argparse.Namespace) -> int:
+    """Two-dir branch: one row per paired cell, with delta + CV cols."""
+    a_label, b_label = _ab_labels(args)
+    paired = _pair_dirs(args.results_dir, args.results_dir_b, args)
+    if not paired.pairs:
+        print(
+            f"no cells in common between {args.results_dir} and {args.results_dir_b} "
+            f"(only_in_a={len(paired.only_a)}, only_in_b={len(paired.only_b)})",
+            file=sys.stderr,
+        )
+        _summarise_unpaired(paired.only_a, a_label, args.show_missing)
+        _summarise_unpaired(paired.only_b, b_label, args.show_missing)
+        return 1
+
+    if paired.only_a or paired.only_b:
+        print(
+            f"# {len(paired.pairs)} pair(s); skipping {len(paired.only_a)} cell(s) only in {a_label}, "
+            f"{len(paired.only_b)} cell(s) only in {b_label} "
+            f"(--show-missing to list)",
+            file=sys.stderr,
+        )
+        _summarise_unpaired(paired.only_a, a_label, args.show_missing)
+        _summarise_unpaired(paired.only_b, b_label, args.show_missing)
+
+    # Use compute_ab so the table shares one source of truth with
+    # ab-matrix for "what counts as a regression". The verdict column
+    # then reflects the *same* gate decision a separate ab-matrix
+    # would produce.
+    thr = Thresholds.from_args(args)
+    rows: list[tuple[Cell, AbResult]] = []
+    for a_r, b_r in paired.pairs:
+        res = compute_ab(a_r.json_path, b_r.json_path, a_label, b_label, a_r.bpf_path, b_r.bpf_path, thr)
+        rows.append((a_r.cell, res))
+
+    if args.json:
+        for cell, r in rows:
+            row = asdict(cell) | {
+                "a_iters": r.a_stats.n,
+                "b_iters": r.b_stats.n,
+                "a_mean_ns": r.a_stats.mean,
+                "b_mean_ns": r.b_stats.mean,
+                "wall_delta": r.wall_delta,
+                "syscall_delta": r.syscall_delta,
+                "a_p99_ns": r.a_stats.p99,
+                "b_p99_ns": r.b_stats.p99,
+                "a_cv": (r.a_stats.stddev / r.a_stats.mean) if r.a_stats.mean else None,
+                "b_cv": (r.b_stats.stddev / r.b_stats.mean) if r.b_stats.mean else None,
+                "noisy": r.noisy,
+                "a_throws": r.a_throws,
+                "b_throws": r.b_throws,
+                "verdict": _verdict(r),
+                "fail_categories": sorted({f.category for f in r.failures}),
+                "a_name": a_label,
+                "b_name": b_label,
+            }
+            print(json.dumps(row))
+        return 0
+
+    def _label_header(h: str) -> str:
+        # Carry the side labels into the table headers. Prefix-only so
+        # an axis name containing `a_` (none today, but future-proof) or
+        # a user-supplied label that happens to start with `a_`/`b_`
+        # doesn't recurse through str.replace.
+        if h.startswith("a_"):
+            return f"{a_label}_{h[2:]}"
+        if h.startswith("b_"):
+            return f"{b_label}_{h[2:]}"
+        return h
+
+    headers = tuple(_label_header(h) for h, _ in _TABLE_COLS_AB)
+    rendered = [tuple(fn(c, r) for _, fn in _TABLE_COLS_AB) for c, r in rows]
+    _render_table(headers, rendered)
+    # Footer notes go to stdout (not stderr) so the table and its
+    # legend stay in order when piped through `head`/`less`/etc.
+    if any(r.has_throws for _, r in rows):
+        print("\n# `!` next to iters = cell reported caught throws; row is suspect")
+    if any(_fmt_cv(s).endswith("*") for _, r in rows for s in (r.a_stats, r.b_stats)):
+        print(f"# `*` after a CV value = noise > {NOISY_CV:.0%}; {DELTA}mean is mostly statistical")
+    # Compact aggregate footer — full breakdown lives in `ab-matrix`,
+    # this is just the one-liner so the table is self-contained.
+    totals = {"pass": 0, "fail": 0, "missing": 0}
+    for _, r in rows:
+        totals[_verdict(r)] += 1
+    print(
+        f"# {len(rows)} pair(s)  pass: {totals['pass']}  fail: {totals['fail']}  missing: {totals['missing']}"
+    )
+    return 0
+
+
+def _ab_labels(args: argparse.Namespace) -> tuple[str, str]:
+    """Resolve --a-name / --b-name, defaulting to each dir's basename.
+    Warns to stderr when labels collide and need to be auto-suffixed."""
+    a = args.a_name or args.results_dir.name
+    b = args.b_name or (args.results_dir_b.name if args.results_dir_b is not None else "b")
+    if a == b:
+        new_a, new_b = f"{a}-a", f"{b}-b"
+        print(
+            f"warning: --a-name and --b-name both resolve to {a!r}; "
+            f"using {new_a!r} / {new_b!r} so the output is unambiguous",
+            file=sys.stderr,
+        )
+        return new_a, new_b
+    return a, b
 
 
 # --- `ab-matrix` (partition by fixed axes, A/B each pair) -----------------
 
 
+def _verdict(res: AbResult) -> str:
+    if res.missing:
+        return "missing"
+    if res.failures:
+        return "fail"
+    return "pass"
+
+
+def _cell_desc(cell: Cell) -> str:
+    """Compact slash-joined cell description for ranked lists."""
+    return (
+        f"{cell.bench}/{cell.dispatch}/{cell.fs}/{cell.throttle}"
+        f"/{cell.layout}/{cell.replica}/n{cell.npaths}/t{cell.threads}"
+    )
+
+
+def _top_n_flags(r: AbResult) -> str:
+    """Trailing markers for top-N entries: `[noisy]` if either side
+    is over the CV threshold, `[FAIL]` if the gate tripped. Returns
+    empty string when neither applies (the common case)."""
+    flags = []
+    if r.noisy:
+        flags.append("noisy")
+    if _verdict(r) == "fail":
+        flags.append("FAIL")
+    return f"  [{','.join(flags)}]" if flags else ""
+
+
+def _print_per_axis(
+    items: list[tuple[Cell, AbResult]],
+    title: str,
+    delta_getter,
+    show_passes: bool,
+) -> None:
+    """Render one per-axis breakdown table. `show_passes=True` adds
+    the pass-rate ratio next to the avg Δ; `False` shows the avg
+    alone (used by the syscall block, where pass-rate is identical
+    to the wall block and would duplicate)."""
+    rendered: list[tuple[str, list[str]]] = []
+    for axis in AXES:
+        vals = sorted({str(getattr(c, axis)) for c, _ in items})
+        if len(vals) < 2:
+            continue
+        parts: list[str] = []
+        for v in vals:
+            sub = [(c, r) for c, r in items if str(getattr(c, axis)) == v]
+            deltas = [d for _, r in sub if (d := delta_getter(r)) is not None]
+            avg = statistics.fmean(deltas) if deltas else None
+            avg_s = f"{avg * 100:+.1f}%" if avg is not None else EM_DASH
+            if show_passes:
+                passed = sum(1 for _, r in sub if _verdict(r) == "pass")
+                parts.append(f"{v}({passed}/{len(sub)} {avg_s})")
+            else:
+                parts.append(f"{v}({avg_s})")
+        rendered.append((axis, parts))
+    print(f"\n{title}:")
+    if not rendered:
+        print("  (no axis varies in this batch)")
+        return
+    for axis, parts in rendered:
+        print(f"  {axis}: " + "  ".join(parts))
+
+
+def _print_top_n(
+    ranked: list[tuple[Cell, AbResult, float]],
+    metric: str,
+    a_label: str,
+    b_label: str,
+    top_n: int,
+) -> None:
+    """Print top-N regressions and improvements for one delta metric.
+    `ranked` must be pre-sorted ascending by the delta value (negative
+    = improvement, positive = regression)."""
+    wins = [(c, r, d) for c, r, d in ranked if d < 0.0][:top_n]
+    regs = [(c, r, d) for c, r, d in reversed(ranked) if d > 0.0][:top_n]
+    if regs:
+        print(f"\ntop {len(regs)} {metric} regression(s) ({b_label} worse than {a_label}):")
+        for c, r, d in regs:
+            print(f"  {d * 100:+6.1f}%  {_cell_desc(c)}{_top_n_flags(r)}")
+    if wins:
+        print(f"\ntop {len(wins)} {metric} improvement(s) ({b_label} better than {a_label}):")
+        for c, r, d in wins:
+            print(f"  {d * 100:+6.1f}%  {_cell_desc(c)}{_top_n_flags(r)}")
+
+
+def _aggregate_ab(
+    items: list[tuple[Cell, AbResult]], a_label: str, b_label: str, top_n: int, thr: Thresholds
+) -> None:
+    """Post-loop summary: totals, threshold echo, failure breakdown
+    by category, top-N wall + syscall deltas (with noisy/FAIL flags),
+    per-axis pass-rate + avg Δmean, noisy-pair count with overlap on
+    the fail set."""
+    totals = {"pass": 0, "fail": 0, "missing": 0}
+    for _, r in items:
+        totals[_verdict(r)] += 1
+
+    print(f"\n=== aggregate: {a_label} vs {b_label} ===")
+    print(
+        f"{len(items)} pair(s)  pass: {totals['pass']}  "
+        f"fail: {totals['fail']}  missing: {totals['missing']}"
+    )
+
+    # Threshold echo so logs are self-describing — readers can tell
+    # what gate produced the verdict without re-checking the command.
+    print(
+        f"thresholds: wall {GE} {thr.wall_improvement:+.1%}  "
+        f"syscall {LE} {thr.syscall_ratio:.1%}  vfs {LE} {thr.vfs_tolerance:.1%}"
+    )
+
+    # Failure breakdown: count *pairs* that hit each category, not
+    # raw Failure objects (one pair can throw on both sides and would
+    # otherwise double-count). Sum across rows can exceed the number
+    # of failed pairs because a pair can hit multiple categories.
+    if totals["fail"]:
+        cat_pair_counts: dict[str, int] = {}
+        for _, r in items:
+            for cat in {f.category for f in r.failures}:
+                cat_pair_counts[cat] = cat_pair_counts.get(cat, 0) + 1
+        ordered = [FAIL_WALL, FAIL_SYSCALL, FAIL_VFS, FAIL_WALL_ZERO, FAIL_BPF_ZERO, FAIL_BPF_ASYMMETRIC, FAIL_THROWS]
+        joined = ", ".join(f"{c}={cat_pair_counts[c]}" for c in ordered if cat_pair_counts.get(c))
+        if joined:
+            print(f"failure reasons across {totals['fail']} failed pair(s): {joined}")
+        noisy_fails = sum(1 for _, r in items if _verdict(r) == "fail" and r.noisy)
+        if noisy_fails:
+            print(f"# {noisy_fails} of {totals['fail']} fail(s) are noisy (cv > {NOISY_CV:.0%}); treat as unconfirmed")
+
+    # Wall ranking. Bind the non-None delta into the tuple so the
+    # sort key can't see None and we don't need a type: ignore.
+    wall_ranked: list[tuple[Cell, AbResult, float]] = [
+        (c, r, r.wall_delta) for c, r in items if r.wall_delta is not None and not r.missing
+    ]
+    wall_ranked.sort(key=lambda x: x[2])
+    _print_top_n(wall_ranked, "wall", a_label, b_label, top_n)
+
+    # Syscall ranking — only meaningful when bpf data exists on both
+    # sides for at least one pair. The list is empty for pure non-GC
+    # batches and we skip the section entirely.
+    syscall_ranked: list[tuple[Cell, AbResult, float]] = [
+        (c, r, r.syscall_delta) for c, r in items if r.syscall_delta is not None
+    ]
+    syscall_ranked.sort(key=lambda x: x[2])
+    _print_top_n(syscall_ranked, "syscall", a_label, b_label, top_n)
+
+    # Per-axis breakdown: avg Δ along each varying axis. Wall block
+    # also carries pass-rate (which depends on threshold tuning); the
+    # avg Δ doesn't, which makes it the more honest "is this axis
+    # better or worse on B" signal. Syscall block (when bpf exists)
+    # drops pass-rate — it would duplicate the wall block's count.
+    _print_per_axis(items, f"per-axis pass-rate and avg wall {DELTA}mean", lambda r: r.wall_delta, show_passes=True)
+    if any(r.syscall_delta is not None for _, r in items):
+        _print_per_axis(items, f"per-axis avg syscall {DELTA}", lambda r: r.syscall_delta, show_passes=False)
+
+    noisy_total = sum(1 for _, r in items if not r.missing and r.noisy)
+    if noisy_total:
+        print(f"\nnoisy pairs (either side cv > {NOISY_CV:.0%}): {noisy_total}/{len(items)}")
+        print("# headline regressions inside noisy pairs are dominated by sample variance, not real change")
+
+
+def _should_print_pair(res: AbResult, only: str | None) -> bool:
+    """`--only` filter for per-pair printing. `nonpass` covers both
+    `fail` and `missing` so CI can ask "show me everything that
+    isn't passing" without losing missing-data cells."""
+    if only is None:
+        return True
+    v = _verdict(res)
+    if only == "nonpass":
+        return v != "pass"
+    return v == only
+
+
 def cmd_ab_matrix(args: argparse.Namespace) -> int:
-    axis = args.axis
+    if (rc := _validate_pair_flags(args)) != 0:
+        return rc
     thr = Thresholds.from_args(args)
+
+    # Two-dir mode: pair by full Cell identity across --results-dir
+    # and --results-dir-b. `--axis` is meaningless here so we hard-
+    # reject the combo to surface user error.
+    if args.results_dir_b is not None:
+        if args.axis is not None:
+            print("error: --axis is incompatible with --results-dir-b (vary one axis OR vary the dir)", file=sys.stderr)
+            return 2
+        if (rc := _require_dirs(args.results_dir, args.results_dir_b)) != 0:
+            return rc
+        return _cmd_ab_matrix_two_dir(args, thr)
+
+    if args.axis is None:
+        print("error: --axis is required unless --results-dir-b is given", file=sys.stderr)
+        return 2
+    if (rc := _require_dirs(args.results_dir)) != 0:
+        return rc
+    axis = args.axis
     fixed_axes = [a for a in AXES if a != axis]
     results = _filter_cells(args, discover(args.results_dir))
 
@@ -537,24 +1190,69 @@ def cmd_ab_matrix(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    rc_total = 0
     pairs.sort(key=lambda g: tuple(getattr(g[0].cell, a) for a in fixed_axes))
+
+    # Collect results before printing so the aggregate block at the
+    # end has every pair available; also lets `--only` filter the
+    # per-pair output without losing aggregate fidelity.
+    collected: list[tuple[Cell, AbResult]] = []
+    rc_total = 0
+    a_label_for_agg = b_label_for_agg = ""
     for group in pairs:
         group.sort(key=lambda r: getattr(r.cell, axis))
         a, b = group
-        fixed = ", ".join(f"{ax}={getattr(a.cell, ax)}" for ax in fixed_axes)
-        print(f"\n=== {axis}: {getattr(a.cell, axis)} vs {getattr(b.cell, axis)}  [{fixed}] ===")
-        rc = do_ab(
-            a.json_path,
-            b.json_path,
-            str(getattr(a.cell, axis)),
-            str(getattr(b.cell, axis)),
-            a.bpf_path,
-            b.bpf_path,
-            thr,
+        a_name = str(getattr(a.cell, axis))
+        b_name = str(getattr(b.cell, axis))
+        # Aggregate header label: the axis being varied.
+        a_label_for_agg, b_label_for_agg = a_name, b_name
+        res = compute_ab(a.json_path, b.json_path, a_name, b_name, a.bpf_path, b.bpf_path, thr)
+        collected.append((a.cell, res))
+        rc_total = max(rc_total, res.rc)
+
+        if _should_print_pair(res, args.only):
+            fixed = ", ".join(f"{ax}={getattr(a.cell, ax)}" for ax in fixed_axes)
+            print(f"\n=== {axis}: {a_name} vs {b_name}  [{fixed}] ===")
+            print_ab(res)
+
+    _aggregate_ab(collected, f"{axis}={a_label_for_agg}", f"{axis}={b_label_for_agg}", args.top_n, thr)
+    return rc_total
+
+
+def _cmd_ab_matrix_two_dir(args: argparse.Namespace, thr: Thresholds) -> int:
+    """A/B every paired cell across --results-dir vs --results-dir-b."""
+    a_label, b_label = _ab_labels(args)
+    paired = _pair_dirs(args.results_dir, args.results_dir_b, args)
+    if not paired.pairs:
+        print(
+            f"no cells in common between {args.results_dir} and {args.results_dir_b} "
+            f"(only_in_a={len(paired.only_a)}, only_in_b={len(paired.only_b)})",
+            file=sys.stderr,
         )
-        if rc != 0:
-            rc_total = rc
+        _summarise_unpaired(paired.only_a, a_label, args.show_missing)
+        _summarise_unpaired(paired.only_b, b_label, args.show_missing)
+        return 1
+    if paired.only_a or paired.only_b:
+        print(
+            f"# {len(paired.pairs)} pair(s); skipping {len(paired.only_a)} only in {a_label}, "
+            f"{len(paired.only_b)} only in {b_label} (--show-missing to list)",
+            file=sys.stderr,
+        )
+        _summarise_unpaired(paired.only_a, a_label, args.show_missing)
+        _summarise_unpaired(paired.only_b, b_label, args.show_missing)
+
+    collected: list[tuple[Cell, AbResult]] = []
+    rc_total = 0
+    for a, b in paired.pairs:
+        res = compute_ab(a.json_path, b.json_path, a_label, b_label, a.bpf_path, b.bpf_path, thr)
+        collected.append((a.cell, res))
+        rc_total = max(rc_total, res.rc)
+
+        if _should_print_pair(res, args.only):
+            cell_desc = ", ".join(f"{ax}={getattr(a.cell, ax)}" for ax in AXES)
+            print(f"\n=== {a_label} vs {b_label}  [{cell_desc}] ===")
+            print_ab(res)
+
+    _aggregate_ab(collected, a_label, b_label, args.top_n, thr)
     return rc_total
 
 
@@ -743,9 +1441,31 @@ def _add_axis_filters(sub: argparse.ArgumentParser) -> None:
 def _add_results_dir(sub: argparse.ArgumentParser) -> None:
     sub.add_argument(
         "--results-dir",
+        "--results-dir-a",
+        dest="results_dir",
         type=Path,
         default=Path("./results"),
-        help="where `bench.py run` dropped `result-*` symlinks",
+        help="where `bench.py run` dropped `result-*` symlinks (the A side when --results-dir-b is given)",
+    )
+
+
+def _add_dir_pair(sub: argparse.ArgumentParser) -> None:
+    """For summary-matrix and ab-matrix: optional second dir + labels.
+    Pairs cells across --results-dir and --results-dir-b by full Cell
+    identity, no file moves required."""
+    sub.add_argument(
+        "--results-dir-b",
+        dest="results_dir_b",
+        type=Path,
+        default=None,
+        help="optional second results dir; enables two-dir compare mode",
+    )
+    sub.add_argument("--a-name", default=None, help="label for --results-dir (defaults to its basename)")
+    sub.add_argument("--b-name", default=None, help="label for --results-dir-b (defaults to its basename)")
+    sub.add_argument(
+        "--show-missing",
+        action="store_true",
+        help="when running with --results-dir-b, also dump the names of unpaired cells (not just an axis summary)",
     )
 
 
@@ -831,16 +1551,37 @@ def _build_parser() -> argparse.ArgumentParser:
     sm_p = sp.add_parser("summary-matrix", help="One row per cell in a results dir.")
     _add_axis_filters(sm_p)
     _add_results_dir(sm_p)
+    _add_dir_pair(sm_p)
+    # Thresholds are only consulted in two-dir mode (the verdict
+    # column runs the same gates as ab-matrix); harmless in single-dir.
+    _add_thresholds(sm_p)
     sm_p.add_argument("--json", action="store_true", help="JSONL output instead of a table")
     sm_p.set_defaults(func=cmd_summary_matrix)
 
-    am_p = sp.add_parser("ab-matrix", help="Pairwise A/B across one axis.")
+    am_p = sp.add_parser("ab-matrix", help="Pairwise A/B across one axis, or across two dirs.")
     # `choices=` gives argparse a standard error on unknown axes, so
-    # we don't need to re-validate in cmd_ab_matrix.
-    am_p.add_argument("--axis", required=True, choices=AB_AXES, help="axis to vary")
+    # we don't need to re-validate in cmd_ab_matrix. Not required so
+    # the --results-dir-b mode can drop it.
+    am_p.add_argument("--axis", choices=AB_AXES, help="axis to vary (required unless --results-dir-b is given)")
     _add_axis_filters(am_p)
     _add_results_dir(am_p)
+    _add_dir_pair(am_p)
     _add_thresholds(am_p)
+    am_p.add_argument(
+        "--only",
+        choices=("pass", "fail", "missing", "nonpass"),
+        default=None,
+        help=(
+            "restrict the per-pair verdict listing (aggregate still spans all pairs). "
+            "`nonpass` covers fail + missing"
+        ),
+    )
+    am_p.add_argument(
+        "--top-n",
+        type=int,
+        default=10,
+        help="how many entries to show in the top wall-regression and wall-improvement lists (default 10)",
+    )
     am_p.set_defaults(func=cmd_ab_matrix)
 
     return parser
