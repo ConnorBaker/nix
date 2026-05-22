@@ -15,16 +15,13 @@ The other entry points:
 
 ## Currently in flight
 
-- **V2** — verify E4's wire-crossing reachability claim per-site for
-  the 61 positional-format `%N%` sites in `src/libstore/`. Streams to
-  `review/V2-e4-reachability.md`. Spawned during the V-pass; longest
-  of the verifications by design (one row per site).
+(none — integration is the next step.)
 
 ## Queued / blocked
 
-- **Integration into the catalog** — the next step once V2 lands.
-  Folds the 18 review reports (E1-E8, F1-F3, B1-B3, C1, V1, V3, V4,
-  V5, V2) into the candidate sections. Specifically:
+- **Integration into the catalog** — the next step. Folds the 19
+  review reports (E1-E8, F1-F3, B1-B3, C1, V1, V2, V3, V4, V5) into
+  the candidate sections. Specifically:
   - Update #138's body with V1's "5 of 6 C-API libraries install
     `*_internal.h(h)` files" finding; flag the layout-change ABI
     impact in release notes.
@@ -47,6 +44,14 @@ The other entry points:
     coordination needed). Land on a new
     `vibe-coding/cleanup/libstore-impure-hash` branch following the
     cleanup-branch convention.
+  - Apply V2's count corrections to E4's catalog edits: positional
+    `%N%` set is 71 in libstore (not 61), 50 in libutil; net
+    wire-crossing positional ~95 (not 61). E4 missed five
+    categories of sites (`store-api.hh` inline throws,
+    `string2IntMustParse`, `TimedOut` constructor body, `%s`/`%d`
+    non-positional, post-build `BuilderFailureError`). Phase 2 of
+    #125 must batch positional and non-positional together for
+    contract-bearing sites; the text-grep contract spans both forms.
   - Apply E5's verifiable-counts manifest as `doc/inventory/counts.toml`
     and the `verify-catalog-counts.sh` driver. Wire to weekly cron
     + manual pre-PR run.
