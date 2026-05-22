@@ -361,9 +361,45 @@ Candidates reference one another by number (e.g. "compounds with #34"). The
 range column above is the lookup table — find the section file by number,
 then the heading inside that file.
 
+Candidate bodies may also carry a `**Branch:**` line pointing at the
+`vibe-coding/cleanup/<name>` branch on origin that addresses the
+candidate, and a `**See also:**` cross-reference to associated review
+reports under [`../review/`](../review/) (E/F/B/C/V/N series).
+
+## Working on the catalog
+
+If you are picking up this work (whether human or agent), read in
+order:
+
+1. [`../INVENTORY.md`](../INVENTORY.md) — codebase navigation map.
+2. This file — catalog scope, eight-debt-shape framing, evidentiary
+   standard.
+3. [`../STATUS.md`](../STATUS.md) — what's queued, in flight, blocked.
+4. [`../review/00-INDEX.md`](../review/00-INDEX.md) — index of every
+   investigation report.
+5. [`../review/AGENT-CHARTER.md`](../review/AGENT-CHARTER.md) —
+   operational rules for any investigation.
+
+The catalog is being worked through three layers concurrently:
+
+- **Per-candidate refactors landing as PRs.** Each addressed
+  candidate gets a `vibe-coding/cleanup/<name>` branch, pushed to
+  origin, with a worktree under `nix-worktrees/`. The seven branches
+  in flight today are listed in `STATUS.md`.
+- **Investigations producing reports under `review/`.** Adversarial,
+  pattern-discovery, follow-up, and verification passes generate
+  reports that update the catalog. The eight-rule evidentiary
+  standard (above) governs report quality.
+- **Catalog maintenance** as findings land. Counts re-derived, stale
+  references corrected, new candidates added with cross-references
+  to the original 1-217 numbering.
+
 ## Related
 
 - [`../INVENTORY.md`](../INVENTORY.md) — navigation map and preserved
   invariants across the 19 verified shards.
 - [`../verified/`](../verified/) — the per-shard verified inventories that
   the candidates cite.
+- [`../review/`](../review/) — investigation reports.
+- [`../STATUS.md`](../STATUS.md) — running ledger of pending /
+  in-flight / blocked work.
