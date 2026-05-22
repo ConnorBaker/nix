@@ -34,6 +34,19 @@ struct ChunkedCompressionSink : CompressionSink
         }
     }
 
+    /* Flush the buffered tail, then signal end-of-stream to the
+       underlying codec by invoking writeInternal with an empty view —
+       brotli's encoder/decoder loop interprets a zero-length call as
+       "drain remaining state and finalise". This idiom is specific to
+       the chunked-codec subclass, which is why it lives here and not on
+       CompressionSink (where NoneSink/ArchiveCompressionSink/
+       ZstdMultiFrameCompressionSink each have their own trailer). */
+    void finish() override
+    {
+        flush();
+        writeInternal({});
+    }
+
     virtual void writeInternal(std::string_view data) = 0;
 };
 
@@ -216,12 +229,6 @@ struct BrotliDecompressionSink : ChunkedCompressionSink
         BrotliDecoderDestroyInstance(state);
     }
 
-    void finish() override
-    {
-        flush();
-        writeInternal({});
-    }
-
     void writeInternal(std::string_view data) override
     {
         auto next_in = (const uint8_t *) data.data();
@@ -286,12 +293,6 @@ struct BrotliCompressionSink : ChunkedCompressionSink
     ~BrotliCompressionSink()
     {
         BrotliEncoderDestroyInstance(state);
-    }
-
-    void finish() override
-    {
-        flush();
-        writeInternal({});
     }
 
     void writeInternal(std::string_view data) override
