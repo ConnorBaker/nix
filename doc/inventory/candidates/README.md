@@ -95,6 +95,64 @@ C++23" (the U1-U10 series). The N-numbered candidates are *not* a new
 debt class; they are cross-shard instances of the existing classes
 that no per-shard cataloger had in view simultaneously.
 
+## Evidentiary standard
+
+Findings in the catalog must rest on semantic source evidence. Specific
+rules, derived from failure modes seen in prior review passes:
+
+1. **Walk the call graph.** A claim about a function's behaviour must
+   trace at least one level of caller — including across virtual
+   dispatch and static-destruction order. Do not reason about a
+   function in isolation. The `windowSize()` un-leak hazard
+   (#148, INVALID) and E8's `eqValues` short-circuit reasoning are
+   the canonical examples of this failure mode.
+2. **Trace what ships, not what's in src/.** ABI claims must check
+   `meson.build` install rules, library symbol export, and what's
+   visible in the install set. Source-tree contents are not a proxy
+   for ABI surface. E2's "no settings struct type is exposed across
+   the C ABI" was correct about source-text uses but wrong about
+   shipping headers (V1 found 5 of 6 C-API libraries install their
+   `*_internal.h(h)` files).
+3. **Counts require closed enumeration.** When a body cites a count,
+   the next reader must be able to reproduce it. Record the exact
+   grep / filter / canonicalisation. "Approximately N" is acceptable
+   only when an exact count is documented as out of scope and the
+   approximation is bounded. Counts that drift between passes (#169
+   went 13 -> 17 -> 16) should be re-derived against current source
+   on every catalog update.
+4. **Distinguish predicted from verified.** A claim about how a
+   refactor will turn out is a prediction; a claim about how the
+   current code behaves is verifiable. Mark predictions explicitly
+   ("predicted, not verified" or similar). E6's "fits cleanly"
+   classifications were predictions; V5 re-verified each against the
+   fixture body.
+5. **Re-derive inherited claims.** If you rely on a prior pass's
+   finding, verify it against current source. Citation alone is not
+   evidence. The "#136 keystone for #134/#135/#137/#144/#149" chain
+   propagated through three passes before B1 found that #135 does
+   not actually depend on #136.
+6. **"Same shape" is not "same problem".** Structural similarity is
+   a hypothesis to test, not a conclusion. Walk every alleged shared
+   site individually. B2 found that `forceAttrs`/`forceList` use
+   `withTrace` rather than `addTrace + try/catch`, despite the prior
+   reviewer lumping them with the rest of the `force*` family.
+7. **Numbers require measurement.** Performance claims, frequency
+   claims, and quantitative comparisons must be measured or labelled
+   "structural reasoning, unmeasured". Do not invent figures. E8's
+   "1-2 ns" was unsupported and downgraded by V4.
+8. **Comments are hypotheses.** When source comments make a claim
+   about contract or rationale, verify it against source behaviour.
+   Code that contradicts a comment is the truth. The `Value::vTrue`
+   "this is _not_ a singleton" comment is contradicted by every
+   actual consumer; the comment lost.
+
+When verifying a claim, the report should state which of these rules
+was exercised. When proposing a candidate, the body should be
+self-checking against the rules: a candidate that proposes "merge
+these N sites" requires that the reviewer walked the N sites
+individually (rule 6); a candidate that cites a count requires the
+closed enumeration (rule 3).
+
 ## Verdict legend
 
 - **VALID** — claim corroborated by source; refactor is genuinely available.
