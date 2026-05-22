@@ -31,7 +31,7 @@ concentration of trivial-effort wins.
 
 50. **`nix_value_incref`/`_decref` are pure forwarders to the generic `nix_gc_*` helpers.** Documented as the preferred typed API, but currently identical to the generic ones. The header comment notes a migration intent.
     - ../verified/19-c-bindings-misc.md
-    - **Validation:** VALID. Effort: trivial.
+    - **Validation:** VALID — but **the original framing has the migration direction backwards.** The header in `src/libexpr-c/nix_api_expr.h` already marks `nix_gc_decref` itself `@deprecated` and explicitly names `nix_value_decref` as the preferred replacement (with a TODO above `nix_gc_incref` proposing the same). The typed forwarders are the migration *target*, not the debt; deprecating or deleting them would be a regression in API direction, and removing them would break the C ABI. **Recommendation:** no code change. Resolved-by-design; close the inventory entry. Effort: none.
 
 51. **`#if 0` blocks in `github.cc`.** The treeHash-mismatch warning inside `downloadArchive` and the treeHash output attribute inside `getAccessor` are commented out, hinting at unfinished tree-hash propagation.
     - ../verified/14-libfetchers.md
@@ -47,7 +47,7 @@ concentration of trivial-effort wins.
 
 54. **`SQLiteSettings::useWAL` is declared without a default initialiser.** Each constructor of `SQLite` reads it; a constructor that doesn't set it is undefined behaviour.
     - ../verified/07-libstore-local.md
-    - **Validation:** VALID — and a **latent bug**. Currently masked because every caller uses designated initialisers. A positional construction is UB. Add a default: `bool useWAL = true;`. Effort: trivial.
+    - **Validation:** VALID — and a **latent bug**. Currently masked because every caller uses designated initialisers. A positional construction is UB. **Default to `true`** to match the runtime default of `Setting<bool> useSQLiteWAL{this, !isWSL1(), ...}` in `globals.hh`; `false` would silently change behaviour on every non-WSL1 platform if a future caller ever omits the field. Every existing caller (`local-store.cc`, `nar-info-disk-cache.cc`, `eval-cache.cc`, `libfetchers/cache.cc`, `http-binary-cache-store.cc`, `libstore-tests/nar-info-disk-cache.cc`) threads `settings.useSQLiteWAL` explicitly, so the chosen default only matters for hypothetical positional/zero-init constructions. Effort: trivial.
 
 55. **Stale `IndexReferrer` index dropped at runtime.** The `20260309-drop-redundant-indexreferrer` migration in `LocalStore::upgradeDBSchema` cleans up a previous-version index. The matching `create index` is no longer in `schema.sql`. The migration drop is harmless but stale once all stores have run it.
     - ../verified/07-libstore-local.md
