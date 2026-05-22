@@ -423,8 +423,6 @@ void LockFile::check()
     }
 }
 
-void check();
-
 std::string printInputAttrPath(const InputAttrPath & path)
 {
     return concatStringsSep("/", path);
