@@ -42,12 +42,21 @@ struct InterruptCallbacks
 };
 
 /* Required to avoid static initialization order fiasco. This allows global
-   objects to safely register callbacks. */
+   objects to safely register callbacks.
+
+   The leaked allocation here is *load-bearing* and not just the standard
+   Construct On First Use Idiom. `~InterruptCallbackImpl` calls
+   `getInterruptCallbacks().lock()`, and `~InterruptCallbackImpl` runs during
+   static destruction (via `~unique_ptr<Logger>` -> `~ProgressBar` -> the
+   `unique_ptr<InterruptCallback>` member). A function-local `static
+   Sync<InterruptCallbacks> instance;` would be destroyed before those
+   namespace-scope statics, leaving `~InterruptCallbackImpl` to lock a
+   destroyed mutex (UB; surfaces as
+   "std::__1::system_error: mutex lock failed: Invalid argument" during
+   `nix __dump-cli` teardown). The deliberate leak keeps the mutex alive
+   past those destructors. */
 static Sync<InterruptCallbacks> & getInterruptCallbacks()
 {
-    /* Intentionally leak, according to the Construct On First Use Idiom.
-       An alternative is to use the Nifty Counter Idiom, but
-       InterruptCallbacks' destructor is not very important. */
     static Sync<InterruptCallbacks> * _interruptCallbacks = new Sync<InterruptCallbacks>();
     return *_interruptCallbacks;
 }
