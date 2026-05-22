@@ -26,6 +26,9 @@
 #include "self-exe.hh"
 #include "crash-handler.hh"
 #include "cli-config-private.hh"
+#ifndef _WIN32
+#  include "run.hh"
+#endif
 
 #include <sys/types.h>
 #include <nlohmann/json.hpp>
@@ -46,8 +49,6 @@
 namespace nix {
 
 #ifndef _WIN32
-extern std::string chrootHelperName;
-
 void chrootHelper(int argc, char ** argv);
 #endif
 

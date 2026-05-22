@@ -1,9 +1,15 @@
 #pragma once
 ///@file
 
+#include <string_view>
+
 #include "nix/store/store-api.hh"
 
 namespace nix {
+
+#ifndef _WIN32
+inline constexpr std::string_view chrootHelperName = "__run_in_chroot";
+#endif
 
 enum struct UseLookupPath { Use, DontUse };
 

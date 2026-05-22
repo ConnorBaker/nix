@@ -22,8 +22,6 @@ extern char ** environ __attribute__((weak));
 
 namespace nix {
 
-std::string chrootHelperName = "__run_in_chroot";
-
 /* Convert `env` to a list of strings suitable for `execve`'s `envp` argument. */
 Strings toEnvp(StringMap env)
 {
@@ -75,7 +73,7 @@ void execProgramInStore(
 
     if (store->storeDir != store2->getRealStoreDir()) {
         Strings helperArgs = {
-            chrootHelperName,
+            std::string(chrootHelperName),
             store->storeDir,
             store2->getRealStoreDir().string(),
             std::string(system.value_or("")),
@@ -244,13 +242,11 @@ void chrootHelper(int argc, char ** argv)
     writeFile(std::filesystem::path{"/proc/self/uid_map"}, fmt("%d %d %d", uid, uid, 1));
     writeFile(std::filesystem::path{"/proc/self/gid_map"}, fmt("%d %d %d", gid, gid, 1));
 
-#  ifdef __linux__
     if (system != "")
         linux::setPersonality({
             .system = system,
             .impersonateLinux26 = settings.getLocalSettings().impersonateLinux26,
         });
-#  endif
 
     execvp(cmd.c_str(), stringsToCharPtrs(args).data());
 
