@@ -15,7 +15,7 @@ removing the mechanism.
 | 19 | VALID | medium |
 | 20 | VALID | medium |
 | 21 | VALID | small |
-| 22 | VALID | trivial |
+| 22 | VALID | small (in isolation) — subsumed by N8 if asio migration lands first |
 | 23 | VALID | large |
 | 24 | VALID | trivial |
 | 25 | VALID | trivial |
@@ -28,11 +28,11 @@ removing the mechanism.
 
 18. **`MakeError(name, parent)` macro coexists with hand-written `CloneableError<Derived,Parent>` derivations.** Most error types use the macro; a handful (`ExecError`, `MissingExperimentalFeature`, `BuildError`, `BuilderFailureError`, `MissingRealisation`, `AwsAuthError`, `FileTransferError`, `InvalidSSHAuthority`, `NotDeterministic`, `BuildEnvFileConflictError`, `TimedOut`, `curlMultiError`, `SymlinkNotAllowed`, `SQLiteError`) bypass the macro to add fields. A CRTP base could subsume both styles. The `SystemError`/`SysError`/`WinError` triad's `DisambigHintFmt`/`DisambigVarArgs` tag idiom is similarly replicated.
     - ../verified/03-libutil-runtime.md, ../verified/04-libutil-misc.md
-    - **Validation:** VALID. Effort: small.
+    - **Validation:** VALID — but the candidate bundles three sub-axes that should be addressed independently: **(18a)** the macro-driven `MakeError(name, parent)` half (widely used; pure boilerplate-removal candidate; trivial mechanical edit for the no-fields cases); **(18b)** the hand-written `CloneableError`-derived classes that add fields (`ExecError`, `MissingExperimentalFeature`, etc. — medium refactor, separate per-class consideration); **(18c)** the `SystemError`/`SysError`/`WinError` triad's `DisambigHintFmt`/`DisambigVarArgs` tag idiom (its own pattern). The three sub-axes can land independently. **See also:** N22 (macros emitting struct declarations — `MakeError`, `MakeBinOp`, `MAKE_WRAPPER_CONSTRUCTOR` share fate), R9. Effort: small (18a) / medium (18b) / small (18c).
 
 19. **`Setting<T>{this, default, name, R"(doc)", aliases, xpFeature}` initialisers dominate `*Config` boilerplate.** Every store config and settings struct uses this same shape; explicit instantiations for each `T` are scattered across many files. A small flag-builder DSL or constexpr table would shrink the source dramatically, especially in `LocalSettings`, `Settings`, `RemoteStoreConfig`, `BinaryCacheStoreConfig`, `HttpBinaryCacheStoreConfig`, `S3BinaryCacheStoreConfig`, `WorkerSettings`, `flake::Settings`, the `Mix*` command tower.
     - ../verified/03-libutil-runtime.md, ../verified/07-libstore-local.md, ../verified/08-libstore-remote.md, ../verified/09-libstore-protocol.md, ../verified/16-libcmd.md
-    - **Validation:** VALID. Any DSL must respect data-member declaration order — some defaults read earlier settings (e.g. `LocalFSStoreConfig::stateDir` reads `rootDir.get()`). Compounds with #136 (Setting self-registration). Effort: medium.
+    - **Validation:** VALID. Any DSL must respect data-member declaration order — some defaults read earlier settings (e.g. `LocalFSStoreConfig::stateDir` reads `rootDir.get()`). **Blocked by #136:** the X-macro driver doesn't work without #136 because the constructor self-registration prevents declaring settings as plain members. **Count correction:** N4's verified count is 21-22 settings structs (catalog body's "19+" is a mild undercount). **See also:** N4 (X-macro `*Settings` struct driver — alternative keystone), N44 (per-T `BaseSetting<T>::trait` specialisation pattern). Effort: medium.
 
 20. **`MAKE_WRAPPER_CONSTRUCTOR(T)` + `Raw raw` member + visit-with-overloaded idiom appears for every variant-shaped type.** `ContentAddressMethod`, `ContentAddressWithReferences`, `OutputsSpec`, `ExtendedOutputsSpec`, `SingleDerivedPath`/`DerivedPath`, `RealisedPath`, `StorePathWithOutputs::ParseResult`, `StoreReference::Variant`, `BuildResult::inner`, `DrvRef<Item>`, `DerivationOutput::Raw`, `DerivationType::Raw`, `DrvHashModulo::Raw`. Each pair re-defines `==`, `to_string`, and `parse` symmetrically. A tagged-union helper would consolidate.
     - ../verified/05-libstore-core.md, ../verified/06-libstore-derivations.md
@@ -44,7 +44,7 @@ removing the mechanism.
 
 22. **Async/sync pair pattern.** `Store::queryPathInfo` and `Store::queryRealisation` each have a synchronous `promise/future` wrapper around a `Callback`-based async variant; the wrapper code is structurally identical and could be factored into a helper template that turns any async callback into a blocking call.
     - ../verified/05-libstore-core.md
-    - **Validation:** VALID. `HttpBinaryCacheStore::topoSortPaths` already uses `callbackToAwaitable`, so the coroutine helper exists and could be repurposed. Pitfall: `Callback::rethrow` semantics (per-callback exception capture) must be preserved to keep `noexcept` correct. Effort: trivial.
+    - **Validation:** VALID. `HttpBinaryCacheStore::topoSortPaths` already uses `callbackToAwaitable`, so the coroutine helper exists and could be repurposed. Pitfall: `Callback::rethrow` semantics (per-callback exception capture) must be preserved to keep `noexcept` correct (non-trivial reasoning across each call site; trivial undersells it). **Sequencing:** small *if done in isolation*; **subsumed** by N8 if asio migration lands first (the codebase has three async idioms — `Callback<T>`, `awaitable<T>`, `Goal::Co` — and the right move is to converge on `awaitable<T>` rather than invest in a tactical sync wrapper that gets undone by #160). Effort: small (in isolation).
 
 23. **`unsupported(...)` is used as a default for many virtuals.** `Store::queryAllValidPaths`, `Store::queryReferrers`, `Store::addSignatures`, plus the `*::repairPath` and most overrides in `RestrictedStore` and `LegacySSHStore`. This is a workaround in lieu of pure-virtual + capability traits; explicit feature negotiation would be cleaner.
     - ../verified/05-libstore-core.md

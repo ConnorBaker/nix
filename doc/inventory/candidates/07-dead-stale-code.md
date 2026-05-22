@@ -8,7 +8,7 @@ concentration of trivial-effort wins.
 | - | ------- | ------ |
 | 48 | VALID | trivial |
 | 49 | VALID | trivial |
-| 50 | VALID | trivial |
+| 50 | VALID (resolved-by-design) | none |
 | 51 | VALID | small |
 | 52 | VALID | trivial |
 | 53 | VALID | small (latent bug) |
@@ -58,9 +58,9 @@ concentration of trivial-effort wins.
     - ../verified/07-libstore-local.md
     - **Validation:** VALID. Drop the migration once enough time has passed for in-the-wild stores to have run it. Effort: trivial.
 
-56. **`BaseSetting<PathsInChroot>::trait` lives in a different file from `BaseSetting<SandboxMode>::trait`.** The `PathsInChroot` trait is in `local-settings.hh`; `SandboxMode` is only in `globals.cc`. Inconsistent placement; one of them should move.
+56. **`BaseSetting<PathsInChroot>::trait` lived in a different file from `BaseSetting<SandboxMode>::trait` — a real ODR violation.** The `PathsInChroot` trait was in `local-settings.hh`; `SandboxMode` was only in `globals.cc`. Different TUs saw different definitions of the explicit specialisation; the values coincidentally matched `appendable=false` from the primary template, so behaviour was preserved but the program was technically ill-formed. Originally framed as cosmetic-style placement; the deeper observation is that this fits "Latent bugs hiding inside duplication" / "ODR fix" rather than pure dead/stale code. Cross-referenced here because the branch landed in this category's cleanup branch.
     - ../verified/07-libstore-local.md
-    - **Validation:** VALID. The adversarial review pass found this is also a real ODR fix (different TUs previously saw different definitions of the explicit specialisation; the values coincidentally matched `appendable=false` from the primary template, so behaviour was preserved but the program was technically ill-formed). Effort: trivial.
+    - **Validation:** VALID. The adversarial review pass found this is a real ODR fix (different TUs previously saw different definitions of the explicit specialisation; the values coincidentally matched `appendable=false` from the primary template, so behaviour was preserved but the program was technically ill-formed). **See also:** N44 (`BaseSetting<T>::trait` specialisation pattern is one-of and ad-hoc; the layered `parse`/`to_string`/`appendable`/macro split is the underlying debt class). Effort: trivial.
     - **Branch:** `vibe-coding/cleanup/libstore-dead-decls`
 
 57. **Macro hygiene caveats.** All three `*_USE_LENGTH_PREFIX_SERIALISER_COMMA` helpers (`WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA`, `SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA`) are `#define`d but never `#undef`'d in their respective impl headers, leaking into translation units. There is also a stray bare `#undef COMMA_` at the end of `common-protocol.hh` with no matching `#define` in scope.

@@ -8,21 +8,21 @@ OBSOLETE (the `BuildLog`/`LogSink` overlap is genuine but only ~5 lines).
 | 36 | VALID | medium |
 | 37 | VALID | small |
 | 38 | PARTIALLY VALID | small |
-| 39 | VALID | small |
+| 39 | VALID | medium |
 | 40 | PARTIALLY VALID | small |
 | 41 | VALID | medium |
 | 42 | PARTIALLY VALID | medium |
 | 43 | PARTIALLY VALID | medium |
 | 44 | OBSOLETE | — |
 | 45 | PARTIALLY VALID | small |
-| 46 | VALID | trivial |
+| 46 | VALID | small |
 | 47 | VALID | trivial |
 
 ---
 
 36. **Five parallel value renderers.** `Printer::print` (`print.cc`), `printAmbiguous` (`print-ambiguous.cc`), `printValueAsJSON` (`value-to-json.cc`), `printValueAsXML` (`value-to-xml.cc`), plus the AST-side `Expr::show` (`nixexpr.cc`). All five share: `state.forceValue` (or check `force`/`strict` option), `state.settings.maxCallDepth` / `addCallDepth(...)` recursion guard, recursion with a per-printer `seen`/`drvsSeen`/`Done` set, derivation special-casing (`state.s.drvPath` / `state.isDerivation`), per-`nValueType` switch. A shared visitor scaffold could leave each printer implementing only per-type emission.
     - ../verified/12-libexpr-parse.md
-    - **Validation:** VALID. Dispatch is over `v.type() == nValueType`, so CRTP with deducing-this fits better than `std::variant` + `std::visit`. Cross-references #110 (the four parallel "seen" sets). Effort: medium.
+    - **Validation:** VALID. Dispatch is over `v.type() == nValueType`, so CRTP with deducing-this fits better than `std::variant` + `std::visit`. Cross-references #110 (the four parallel "seen" sets). **See also:** N20 (the `nValueType` table-driven dispatch — five renderers here, plus `force*` from #211, plus `prim_is*` from #66, all consume one constexpr `valueTypeTraits[]` table; this candidate is one of three slices). Effort: medium.
 
 37. **NAR-tree walkers in three places.** `NarAccessorImpl::find/get` (in `nar-accessor.cc`), `NarIndexer::createMember` (in `nar-listing.cc`), `MemorySourceAccessor::open` (in `memory-source-accessor.cc`). All walk a path, descend into the `Directory` variant, and either find or insert. A generic helper over `fso::VariantT` could replace all three.
     - ../verified/01-libutil-io.md
@@ -30,11 +30,11 @@ OBSOLETE (the `BuildLog`/`LogSink` overlap is genuine but only ~5 lines).
 
 38. **Source/Sink wrapper hierarchy with many parallel one-shot adapters.** `TeeSink`/`TeeSource`, `LengthSink`/`LengthSource`, `LambdaSink`/`LambdaSource`, `SizedSource`, `EnsureRead`, `ChainSource`. Written one-by-one; a base or generator could reduce repetition.
     - ../verified/01-libutil-io.md
-    - **Validation:** PARTIALLY VALID. Several of these adapters have non-trivial state (chunking, length tracking, error injection); a unifying base would only deduplicate the constructor/forwarding shape, not the semantics. Pitfall: the named structs have stable types that callers store as members (e.g. `LengthSink` inside `HashedSink`-style users); switching to factory-returning-`unique_ptr` breaks ABI. Recommendation: leave as-is unless touching. Effort: small for the boilerplate consolidation only.
+    - **Validation:** PARTIALLY VALID. Several of these adapters have non-trivial state (chunking, length tracking, error injection); a unifying base would only deduplicate the constructor/forwarding shape, not the semantics. Pitfall: the named structs have stable types that callers store as members (e.g. `LengthSink` inside `HashedSink`-style users); switching to factory-returning-`unique_ptr` breaks ABI. **Forward-looking:** new sites continue to grow new single-purpose subclasses (`LogSink`, the Brotli sinks); a `makeObserverSink(innerSink, observer)` factory would prevent that growth without renaming existing types. **See also:** N6 (`WrappingSink<Inner, Observer>` template + `splitOnDelimiter` adapter — `LogSink` and `BuildLog` are two slices of the same line-buffer family), N36 (the `make*Sink` factory pattern is parallel — construction is hand-rolled differently per site). Recommendation: leave as-is unless touching. Effort: small for the boilerplate consolidation only.
 
 39. **`MemorySink`/`RestoreSink` parallel `FileSystemObjectSink` impls.** Both implement essentially the same `FileSystemObjectSink` interface plus their own `CreateRegularFileSink` subclass for byte streams (`RestoreRegularFile` and `CreateMemoryRegularFile`). The bytes-callback boilerplate could be factored.
     - ../verified/01-libutil-io.md
-    - **Validation:** VALID. Effort: small.
+    - **Validation:** VALID. Each `CreateRegularFileSink` subclass is a bytes-callback wrapper threading state through the sink; genuine factoring requires a virtual-or-callback design choice that affects every NAR consumer. **See also:** N6 (the `WrappingSink<Inner, Observer>` template + `splitOnDelimiter` adapter — this is one slice of the broader Source/Sink wrapping pattern). Effort: medium.
 
 40. **Wrapping source accessors clear `displayPrefix` and chain `showPath`/`getPhysicalPath`/`invalidateCache` near-identically.** `UnionSourceAccessor`, `MountedSourceAccessorImpl`, `CachingSourceAccessor` all redo this in their constructors. Their `getFingerprint` implementations diverge: caching is a passthrough; mounted/union apply "own fingerprint else delegate". A `WrappingSourceAccessor` base could absorb all three.
     - ../verified/01-libutil-io.md
@@ -50,7 +50,7 @@ OBSOLETE (the `BuildLog`/`LogSink` overlap is genuine but only ~5 lines).
 
 43. **X-macro setting list.** The `BaseSetting<T>` template-specialisation pattern (`parse`, `to_string`, `appendOrSet`, `convertToArg`, `trait::appendable`, `NIX_DECLARE_CONFIG_SERIALISER`, explicit `template class BaseSetting<...>` instantiations) is replicated for many `T` in `configuration.cc`. The list (`std::list<path>`, `Strings`, `StringSet`, `std::set<path>`, `std::set<ExperimentalFeature>`, `StringMap`, `AbsolutePath`, plus the per-store specialisations) plus the trait specialisations plus the macro plus the explicit instantiations form four near-parallel registers. A single X-macro list would collapse them.
     - ../verified/03-libutil-runtime.md, ../verified/07-libstore-local.md
-    - **Validation:** PARTIALLY VALID. Several specialisations have non-trivial parse semantics (path-list resolution, alias handling) that don't reduce to a single X-macro. Realistic consolidation is to a tag-dispatched template family with X-macro instantiation only for the simple cases. Effort: medium.
+    - **Validation:** PARTIALLY VALID. Several specialisations have non-trivial parse semantics (path-list resolution, alias handling) that don't reduce to a single X-macro. Realistic consolidation is to a tag-dispatched template family with X-macro instantiation only for the simple cases. **The simple-case half is blocked by #136** (the X-macro driver doesn't work without #136 because the constructor self-registration prevents declaring settings as plain members). **See also:** N4 (X-macro `*Settings` struct driver), N22 (macros emitting struct declarations — plus `NIX_DECLARE_CONFIG_SERIALISER` is one of the broader "9 X-macro families" group of N35), N44 (per-T `BaseSetting<T>::trait` ad-hoc specialisation pattern). Effort: medium.
 
 44. **`BuildLog` and `LogSink` are similar line-buffering sinks.** `BuildLog` (in `build-log.{cc,hh}`) and `LogSink` (in `derivation-building-goal.cc`) both implement `Sink::operator()` as a line buffer that splits on `\n`. `BuildLog` adds JSON parsing, tail tracking, and `\r` carriage-return handling; `LogSink` is simpler. They could share a base.
     - ../verified/10-libstore-build.md
@@ -62,7 +62,7 @@ OBSOLETE (the `BuildLog`/`LogSink` overlap is genuine but only ~5 lines).
 
 46. **`builtinBuilders` family share a `RegisterBuiltinBuilder` registration pattern.** All three (`buildenv`, `fetchurl`, `unpack-channel`) follow the same shape: static function `void(const BuiltinBuilderContext &)` plus a file-scope `static RegisterBuiltinBuilder` instance. Each uses a local `getAttr` lambda for env-attribute lookup. The local lambda is a candidate for a shared helper.
     - ../verified/10-libstore-build.md
-    - **Validation:** VALID. Effort: trivial.
+    - **Validation:** VALID. The `getAttr` lambda is genuinely repeated, but each builtin's body has irreducibly per-builtin behaviour; the trivial label assumes the helper extraction is one-line per site, which is true but the helper itself needs design. Effort: small.
 
 47. **`DerivationGoal`/`DerivationBuildingGoal::doneSuccess`/`doneFailure` are paired overrides with mostly-shared bodies.** Both override the protected `doneSuccess`/`doneFailure` with the same shape: drop a `MaintainCount` handle, increment `worker.doneBuilds++` / `failedBuilds++`, call `worker.updateProgress`, then forward to `Goal::doneSuccess`/`doneFailure`. The `doneFailure` bodies are byte-identical except for the handle name (`mcExpectedBuilds.reset()` vs `mcRunningBuilds.reset()`); the `doneSuccess` bodies diverge only in how `builtOutputs` is shaped (one wraps a single output keyed by `wantedOutput`, the other forwards a multi-output map). The other four concrete `Goal` subclasses (`DerivationTrampolineGoal`, `DerivationResolutionGoal`, `PathSubstitutionGoal`, `DrvOutputSubstitutionGoal`) use the base `Goal::doneSuccess`/`doneFailure` directly.
     - ../verified/10-libstore-build.md

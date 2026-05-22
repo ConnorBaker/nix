@@ -7,7 +7,7 @@ Candidates 72-88. All seventeen VALID.
 | 72 | VALID | small |
 | 73 | VALID | medium |
 | 74 | VALID | small |
-| 75 | VALID | trivial (TTY-dedupe) / small (full helper) |
+| 75 | OBSOLETE (trivial half) / VALID (small full helper) | small |
 | 76 | VALID | small |
 | 77 | VALID | trivial |
 | 78 | VALID | small |
@@ -38,7 +38,7 @@ Candidates 72-88. All seventeen VALID.
 
 75. **Three NAR streaming entry points.** `CmdDumpPath::run` (`store dump-path`), `CmdDumpPath2::run` (`nar pack`), `nix-store.cc opDump`. The first two route through `dump-path.cc:getNarSink()`; the third constructs the `FdSink` directly and skips the TTY check. All three then call `narFromPath` or `dumpPath`.
     - ../verified/18-nix-modern-2-legacy.md
-    - **Validation:** VALID — `dump-path.cc:getNarSink` adds the `isTTY` guard that `nix-store.cc opDump` skips. Effort: trivial (just sharing the TTY-check helper) / small (full `runNarDump(SourceLike)` helper).
+    - **Validation:** VALID — `dump-path.cc:getNarSink` adds the `isTTY` guard that `nix-store.cc opDump` skips. **Trivial half OBSOLETE:** the TTY-check sharing is a one-line consolidation; not a debt entry, just a single boolean call — drop. **Small half kept:** the full `runNarDump(SourceLike)` helper covers genuine duplication across the three entry points. Effort: small (full helper).
 
 76. **Closure-walk helpers (BFS over `references`).** `nix-store/dotgraph.cc` and `nix-store/graphml.cc` both implement the same `StorePathSet workList`/`doneSet` BFS over `references`. They differ only in edge-direction and per-node emission. A shared `walkClosure(start, visit)` helper would consolidate.
     - ../verified/18-nix-modern-2-legacy.md
@@ -56,9 +56,9 @@ Candidates 72-88. All seventeen VALID.
     - ../verified/13-libexpr-primops.md
     - **Validation:** VALID. Compounds with #190 (which calls out the per-flavor URL rewrite tangling the helper). **Caveat:** `prim_fetchTree` mutates `nameAttrPassed` and special-cases `url` resolution after the loop; the helper needs a "post-validation" hook. Effort: small.
 
-80. **`logFD` Setting<int> on Unix vs plain `Descriptor logFD` on Windows.** In `LegacySSHStoreConfig`. Inconsistent; the Windows side bypasses the settings system entirely.
+80. **`logFD` Setting<int> on Unix vs plain `Descriptor logFD` on Windows is a latent bug.** In `LegacySSHStoreConfig`, the Windows side bypasses the settings system entirely; the field cannot be set at all from user config (only mutated programmatically in tests) — silently ignores the `log-fd` setting. Cross-class with "Per-platform symmetry" (#27, #29, #81, #161-#164) and "Globals/settings architecture": this is a configuration-surface inconsistency that fits best under "Latent bugs hiding inside duplication". Cleanest fix is a portable `Setting<Descriptor>` specialisation.
     - ../verified/08-libstore-remote.md
-    - **Validation:** VALID. **Latent bug:** the Windows side cannot be set at all from user config (only mutated programmatically in tests) — silently ignores the `log-fd` setting. Cleanest fix is a portable `Setting<Descriptor>` specialisation. Effort: trivial / small.
+    - **Validation:** VALID. **Latent bug:** the Windows side cannot be set at all from user config (only mutated programmatically in tests) — silently ignores the `log-fd` setting. Cleanest fix is a portable `Setting<Descriptor>` specialisation. **See also:** N9 (per-platform `Pid`/`Pipe`/`Process` symmetry — same elephant, no shared interface header), N44 (the per-T `BaseSetting<T>::trait` specialisation pattern). Effort: trivial / small.
 
 81. **`Pid` holds `pid_t` on Unix vs `AutoCloseFD` on Windows.** Mostly fine, but the `release()` method exists only on Unix; `setSeparatePG`/`setKillSignal`/`setKillTimeout` are Unix-only; `wait`'s `allowInterrupts` is unused on Windows.
     - ../verified/04-libutil-misc.md
@@ -66,7 +66,7 @@ Candidates 72-88. All seventeen VALID.
 
 82. **`AutoUserLock`/`SimpleUserLock` `acquire` skeletons.** Both implementations open a per-slot lock file, try non-blocking exclusive lock via `lockFile(ltWrite, false)`, populate the lock object on success. The lock-acquisition skeleton could be shared.
     - ../verified/07-libstore-local.md
-    - **Validation:** VALID. Extract `tryAcquireSlotLock(path) -> std::optional<AutoCloseFD>`; both call sites become a one-liner preceded by per-implementation prelude. Effort: trivial.
+    - **Validation:** VALID — but the win is small (two call sites with one shared body of ~5 lines each). Extract `tryAcquireSlotLock(path) -> std::optional<AutoCloseFD>`; both call sites become a one-liner preceded by per-implementation prelude. Marginal as a debt entry; keep but accept that the duplication factored out is small. Effort: trivial.
 
 83. **`/nix/store` GC roots and runtime roots have three layers of similar logic.** `local-gc.cc::findRuntimeRootsUnchecked`, `gc.cc::requestRuntimeRoots`, and `gc.cc::LocalStore::findRuntimeRoots` form three layers; the first synthesises roots from `/proc` (or `lsof`), the second reads them from a Unix-domain socket, the third dispatches between the two. The `Roots` typedef and the file-local `UncheckedRoots` map use different key types (`StorePath` vs `std::string`).
     - ../verified/07-libstore-local.md

@@ -297,10 +297,11 @@ In [verified/19-c-bindings-misc.md](verified/19-c-bindings-misc.md):
 
 The numbered, prioritised list of refactoring opportunities surfaced by the
 per-shard verified docs and follow-up source audits lives in
-[`candidates/`](candidates/), split into 21 themed section files with an
+[`candidates/`](candidates/), split into 25 themed section files with an
 [index](candidates/README.md). Each candidate carries a validation verdict
 (VALID / PARTIALLY VALID / INVALID / OBSOLETE) and an effort class against
-the source as it exists today. The 217 candidates are grouped as:
+the source as it exists today. The 217 per-shard candidates plus 44
+cross-shard candidates (numbered N1-N44) are grouped as:
 wire/serialisation duplication, parallel store implementations, repeated
 boilerplate, per-platform symmetry, inheritance chains worth flattening,
 multi-implementation patterns, dead/stale code, duplicated parsers,
@@ -310,9 +311,20 @@ workarounds / stdlib replacements, globals/settings architecture,
 libstore/build deep audit, cross-cutting (platforms, headers, magic
 numbers), daemon and protocol-dispatch deep audit, libexpr eval-core
 (fetcher primops, lookup-path, JSON), libexpr eval-core (cache, attr-set,
-profiler), and libexpr eval-core (EvalState and Value). Each candidate
-carries a `**Validation:**` paragraph with the verdict, effort class, and
-any factual corrections folded in from the verification pass.
+profiler), libexpr eval-core (EvalState and Value), cross-shard patterns
+(N1-N23), C-API surface duplication (Cluster E; N24-N25, N29),
+test-infrastructure mirrors (Cluster F; N28, N39, N41), and
+dispatch tables and schemas (Cluster G; N26, N30, N32-N38, N40, N42-N44,
+plus other pass-2 candidates). Each candidate carries a
+`**Validation:**` paragraph with the verdict, effort class, and any
+factual corrections folded in from the verification pass.
+
+The candidates README also documents the **architectural debt themes**
+A1-A7 (cross-cutting roadmap entries that the per-candidate work feeds
+into), the **C++23/Boost uplift series** U1-U10 (a coherent staged
+modernisation series with sequencing), and the **redundant
+abstractions** R1-R10 (cases where 2+ in-tree abstractions solve
+overlapping problems and the choice rule is undocumented).
 
 ## Key invariants and guarantees
 

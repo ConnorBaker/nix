@@ -29,11 +29,17 @@ abstractions. Concretely, the kinds of debt collected here:
   hierarchy is really a Cartesian product (platform × strategy), prefer
   a strategy/policy split with composition. Example: the
   `DerivationBuilder` diamond (chroot strategy × Linux/FreeBSD/Darwin).
-- **Stdlib uplift made possible by C++23.** Defaulted `operator<=>` for
-  the libc++16 workaround sites, `std::move_only_function` for
-  `nix::fun`, `std::ranges::append_range` for the `append` shim,
-  `std::format` for `boost::format` + `HintFmt`, `std::unreachable()`
-  for genuinely-unreachable switch fall-through.
+- **Stdlib uplift made possible by C++23 (and modernisation more
+  broadly).** Defaulted `operator<=>` for the libc++16 workaround sites,
+  `std::move_only_function` for `nix::fun`, `std::ranges::append_range`
+  for the `append` shim, `std::format` for `boost::format` + `HintFmt`,
+  `std::unreachable()` for genuinely-unreachable switch fall-through,
+  `std::jthread` for hand-rolled thread lifecycles. Modernisation is
+  in scope even without an underlying duplication: replacing a
+  Boost-only mechanism with a stdlib mechanism shrinks the dependency
+  surface, replacing a hand-rolled idiom with a stdlib idiom shrinks
+  the volume of bespoke code we maintain, and migrating to a feature
+  the toolchain already supports is a genuine simplification.
 - **Hand-rolled abstractions where Boost or stdlib already has it.**
   Bespoke `Goal::Co` coroutine machinery vs `boost::asio::awaitable`,
   ad-hoc concurrent-map insert-on-miss vs
@@ -54,11 +60,40 @@ abstractions. Concretely, the kinds of debt collected here:
 - **Dead code.** Declarations without definitions, parameters never
   read, `#if 0` blocks, leaked macros, vestigial `extern` globals.
   Smallest tier; usually first to land because it's pure deletion.
+- **Performance.** Wrong-container choices on hot paths (e.g.
+  `std::list<std::string>` vs `std::vector<std::string>` for the
+  canonical `Strings` alias on the CLI/settings path), unnecessary
+  allocations in inner loops, cache-line-aligned counters whose
+  alignment cost is paid even when disabled, missed concurrency where
+  independent operations run sequentially. Performance work belongs
+  in scope even when no duplication backs the change — a measurable
+  improvement to the eval / build / fetch hot paths is an end in
+  itself.
 
 What the catalog does **not** target: cosmetic changes (formatting,
-naming preferences), feature additions, performance work without
-duplication or complexity to fix, or "modernise for its own sake" if the
-existing code is clear and the proposed replacement isn't simpler.
+naming preferences) or feature additions. Performance work and
+modernisation are in scope on their own merits; an entry should still
+explain *why* the change is worth doing (faster hot path, smaller
+dependency surface, simpler abstraction), but the entry is not
+required to point at duplication or hidden complexity.
+
+The eight kinds of debt above also cover the cross-shard candidates
+(N1-N44, sections 22-25). Pattern-discovery passes that surfaced
+"there are five hand-rolled instances of pattern X" reduce to one of
+the eight: typically "Macro-driven boilerplate that should be a
+template" (N3 registries, N4 settings structs, N22 macros, N35
+X-macros, N38 extern-template lists), "Hand-rolled abstractions where
+Boost or stdlib already has it" (N1 `Memo`, N6 `WrappingSink`, N7
+`openAccessor`, N8 asio, N10 `BasicConnection<Proto>`, N13
+`SqliteCache<Schema>`, N17 `LeakedSingleton`, N20
+`valueTypeTraits[]`, N21 metrics, N26 typed extractors, N32 parse/show,
+N36 `makeSink`, N42 `IdGenerator`, N43 `std::jthread`), "Globals-as-
+architecture" (N4, N17, N18, N19), "Latent bugs hiding inside
+duplication" (N3 duplicate-policy drift, N31 orphaned caches, N40
+URL-parser allow-list drift), or "Stdlib uplift made possible by
+C++23" (the U1-U10 series). The N-numbered candidates are *not* a new
+debt class; they are cross-shard instances of the existing classes
+that no per-shard cataloger had in view simultaneously.
 
 ## Verdict legend
 
@@ -68,6 +103,10 @@ existing code is clear and the proposed replacement isn't simpler.
   what.
 - **INVALID** — claim does not hold under closer reading; do not pursue.
 - **OBSOLETE** — duplication is real but too small to justify a refactor.
+- **VALID (resolved-by-design)** — verdict-table marker for entries
+  whose body identifies a refactor target but whose validation paragraph
+  reframes the entry as already-correct or already-resolved. The body is
+  kept for the historical record; the effort label is `none`.
 
 ## Effort classes
 
@@ -99,6 +138,164 @@ existing code is clear and the proposed replacement isn't simpler.
 | [19-eval-core-fetcher-lookup-json.md](19-eval-core-fetcher-lookup-json.md) | 189-200 | libexpr eval-core: fetcher primops, lookup-path, JSON |
 | [20-eval-core-cache-attrset-profiler.md](20-eval-core-cache-attrset-profiler.md) | 201-209 | libexpr eval-core: cache, attr-set, profiler |
 | [21-eval-core-evalstate-value.md](21-eval-core-evalstate-value.md) | 210-217 | libexpr eval-core: EvalState and Value |
+| [22-cross-shard-patterns.md](22-cross-shard-patterns.md) | N1-N23 | Cross-shard patterns (pattern-discovery pass 1) |
+| [23-c-api-debt.md](23-c-api-debt.md) | N24-N25, N29 | C-API surface duplication (Cluster E) |
+| [24-test-infrastructure-mirrors.md](24-test-infrastructure-mirrors.md) | N28, N39, N41 | Test-infrastructure mirrors (Cluster F) |
+| [25-dispatch-tables-and-schemas.md](25-dispatch-tables-and-schemas.md) | N26, N30, N32-N38, N40, N42-N44 | Dispatch tables and schemas (Cluster G) plus other pass-2 candidates |
+
+The N-numbered candidates were generated by a cross-shard pattern-discovery
+pass and intentionally use a separate numbering range (N1-N44) so the
+existing 1-217 cross-references stay stable. N1-N23 are pass-1 candidates;
+N24-N44 are pass-2 candidates.
+
+## Pattern clusters
+
+The 21 per-shard sections plus the four cross-shard sections (22-25)
+group candidates by *symptom location*. Several cross-cutting *patterns*
+span multiple sections:
+
+- **Cluster A — Concurrent state and globals.** `getFileTransfer`
+  (#147), `windowSize` (#148), `getInterruptCallbacks` (#148-note),
+  `logger` (#143), `drvHashes` (#139), `Counter::enabled` (#205),
+  `PosTable::origins_`, the `Sync<map>` vs `concurrent_flat_map`
+  choice (N1), the `ThreadPool` vs `nix::asio` vs `Goal::Co` axis (N8).
+  Architectural direction: name a "global runtime state" subsystem
+  with DI sequencing; covered by N17 / Cluster A.
+- **Cluster B — Variant-shaped types.** #20 (`MAKE_WRAPPER_CONSTRUCTOR`),
+  #94 (`BuiltPath`/`SingleBuiltPath`), #102 (Unkeyed/Keyed),
+  #194 (`LookupPath::Elem`); plus the 13+ ad-hoc typedefs
+  (`SingleDerivedPath`, `DerivedPath`, `OutputsSpec`,
+  `ContentAddressMethod`, `ContentAddressWithReferences`, ...) all want
+  one `TaggedUnion<Tag, Alternatives...>` template.
+- **Cluster C — SourceAccessor and Store factories.** N7
+  (`openAccessor(spec)`), #11/#12 (delegating store), N3 (registries
+  of factories — covers `RegisterCommand`/`RegisterPrimOp`/
+  `RegisterBuiltinBuilder` etc.).
+- **Cluster D — Settings-tied configuration.** The 21-22 `*Settings`
+  structs (N4), the `_NIX_TEST_*` and `NIX_*` env-var protocol
+  (#146 + N18), the SQLite cache schema versions encoded in filenames
+  (N13, N15), the trust-check and version-check ad-hoc dispatches
+  (#178, #179).
+- **Cluster E — C-API surface duplication.** Section 23. N24 (opaque
+  wrappers), N25 (init idempotency), N29 (NIXC_CATCH_ERRS variants);
+  plus the existing #50, #87, #88 forwarder pairs.
+- **Cluster F — Test-infrastructure mirrors.** Section 24. N16
+  (production reflection mirrors test grid), N28 (meson env-var
+  plumbing), N39 (test-grid declarative), N41 (per-fixture
+  unitTestData boilerplate).
+- **Cluster G — Dispatch tables and schemas.** Section 25 plus the
+  catalog's #36, #66, #176, #178, #181, #182, #211, plus pass-1's N3,
+  N12, N20, N23, plus pass-2's N26, N32, N40. Architectural direction:
+  "schema as data, not code" with `boost::describe` (U10) as the
+  enabling technology.
+
+## Architectural debt themes
+
+Six themes that the per-shard sections document at the per-candidate
+level but don't articulate as named architectural debt:
+
+- **A1 — No `EvalContext` separating eval state from settings and
+  primop helpers.** Slices: #131, #132, #133, #138, #209, #210, #212,
+  N19, N33.
+- **A2 — No `IOContext` / `Executor`.** Slices: #147 (curl thread),
+  #160 (Goal coroutine), N8 (three async idioms), N43 (per-subsystem
+  `std::thread` lifecycle).
+- **A3 — No "store wrapper" abstraction.** Slices: #11, #12, N7
+  (`openAccessor(spec)` is the SourceAccessor-side counterpart).
+- **A4 — No `LoggingContext`.** Slices: #143, plus the four
+  orthogonal logging globals named there.
+- **A5 — No unified Configuration architecture.** Slices: #134, #135,
+  #136, #144, N4, N18, N44.
+- **A6 — No declarative protocol schema.** Slices: #176, #177, #178,
+  #179, #181, #182, N12, N23, N32, N40.
+- **A7 — No `SignedFingerprint` / `Keyed` / `Renderable` traits.**
+  Slices: #102, #104, N2, N5.
+
+## C++23 / Boost uplift series
+
+The catalog has scattered C++23/Boost uplift candidates that form a
+coherent staged series. Recommended order is U1 → U4 → U2 → U3 → U6 →
+U5 → U7 → U10 → U8 → U9. U10 is the highest-leverage middle-of-graph
+step; it unblocks generation-of-protocol-code and
+generation-of-JSON-serialisers.
+
+- **U1 (small) — libc++ 16 cleanup.** Cand. #121. Replace 17 `// TODO
+  libc++ 16` workarounds with defaulted `operator<=>`. Risk minimal.
+- **U2 (trivial) — `append` shim deletion.** Cand. #130. Use
+  `std::ranges::append_range`. Already on branch
+  `vibe-coding/cleanup/libutil-misc`.
+- **U3 (small) — `Finally`-as-`MaintainCount`.** Cand. #129. Stack
+  sites only; defer goal-hierarchy `MaintainCount`.
+- **U4 (trivial) — `std::unreachable()` for dead-after-exhaustive
+  switches.** Cand. #172. ~4 of 64 sites; keep `nix::unreachable`
+  helper for any reachable path (UB-vs-panic distinction).
+- **U5 (medium) — `std::move_only_function`.** Cand. #122. Replace
+  `nix::fun<Sig>` at fixed call sites; `std::function` retained for
+  shared/copyable cases. Note layout drift in `PrimOp::impl` and
+  symbol-mangle break in `stackOverflowHandler`.
+- **U6 (trivial) — `gsl::not_null` evaluation.** Cand. #123. Per
+  validation note: keep `nix::ref<T>`, only drop `bad_ref_cast` in
+  favour of `std::bad_cast`.
+- **U7 — `concurrent_flat_map` vs `Sync<map>` rationalisation.** Cand.
+  N1 (split into N1a/N1b per pass 2). Three sub-stages:
+  - **U7a (small):** write the rubric and `getOrInsertConcurrent`
+    helper.
+  - **U7b (medium):** migrate the actual cache sites (4-5 sites).
+  - **U7c (out of scope):** the iteration-needing registries
+    (`gc.cc::connections`, `remote-store.hh::connectionFds`,
+    `filtering-source-accessor.cc::allowedPrefixes`) are *not*
+    candidates for migration — they need ordered iteration semantics
+    that `concurrent_flat_map` doesn't provide; document why.
+- **U8 (structural) — `boost::asio::awaitable` migration.** Cand.
+  #160 + N8. Replace `Goal::Co::SuspendAwaiter` and
+  `ChildEventAwaiter` with asio primitives, keeping the bespoke
+  `final_awaiter`. Migrate `Callback<T>` consumers (N8). Depends on
+  prior #150/#151.
+- **U9 (large; last) — `std::format` migration.** Cand. #125.
+  226 `boost::format`/`HintFmt` matches. Touches every error
+  message; daemon-client error-text preservation matrix (E4) is a
+  prerequisite.
+- **U10 (medium-large) — `boost::describe` reflection.** Cand. #9 +
+  #176 + N12 + N16 + N32 + N35 + N38 + N39. Header-only; auto-derive
+  `nlohmann::json` adl_serializer and protocol Serialise<T>
+  specialisations; eventually auto-derive `*Settings` struct
+  surface. **Highest-leverage middle-of-graph step.**
+
+## Redundant abstractions
+
+Cases where the codebase has 2+ in-tree abstractions solving overlapping
+problems and the choice is not consistent. Each pair needs a documented
+choice rule.
+
+- **R1 — `nix::Sync<T>` vs leaked-pointer + `std::mutex`.** Cands.
+  #147, #148, N17. Rule: `Sync<T>` for ordered-iteration / cv-wait;
+  leaked `Sync<T>` only for SIOF-load-bearing process-wide singletons.
+- **R2 — `nix::ref<T>` vs `gsl::not_null<shared_ptr<T>>` vs
+  `std::shared_ptr<T>`.** Cand. #123. Rule: keep `ref<T>`, drop
+  `bad_ref_cast`.
+- **R3 — `boost::concurrent_flat_map` vs `Sync<unordered_map>` vs
+  `Sync<map>`.** Cand. N1. Rule: see U7.
+- **R4 — `Pool<R>` vs hand-rolled connection cache.** Cands. #16,
+  #184, N10. Rule: `BasicConnection<Proto>` template + `PooledClientStore<C>`.
+- **R5 — `nix::fun<Sig>` vs `std::function<Sig>` vs
+  `std::move_only_function<Sig>` vs templated functor.** Cand. #122.
+  Rule: stable-call-site → templated parameter; one-shot move-only →
+  `std::move_only_function<Sig>`; shared/copyable → `std::function<Sig>`.
+- **R6 — `std::list<std::string>` vs `std::vector<std::string>` vs
+  `boost::container::small_vector<std::string, N>`.** Cand. #171.
+  Choose explicitly per-site; document the rule.
+- **R7 — `Callback<T>` vs `boost::asio::awaitable<T>` vs `Goal::Co`
+  vs `promise/future`.** Cand. N8. Pick `asio::awaitable<T>`.
+- **R8 — `Counter` (libexpr) vs `MaintainCount<T>` vs raw
+  `std::atomic<uint64_t>` vs raw `uint64_t`.** Cands. N14, N21, #205.
+  Pick one shape per axis (per-instance vs RAII vs ID-mint vs metric).
+- **R9 — `MakeError(name, parent)` vs `class X final : public
+  CloneableError<X, BaseError>`.** Cand. #18. Two error-declaration
+  patterns; converge on a single shape.
+- **R10 — `nix::asio` vs `std::async` vs raw `std::thread` /
+  `std::jthread`.** Cands. N8, N43. Migrate the 6+ `std::thread`
+  member fields with hand-rolled lifecycles to `std::jthread` or to
+  asio-managed workers.
 
 ## Cross-references
 
