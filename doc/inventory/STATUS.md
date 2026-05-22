@@ -37,9 +37,9 @@ The other entry points:
   `serve-protocol.cc`, `legacy-ssh-store.cc`) → rename sentinel and
   coordinate the protocol header. Aggregate effort medium because the
   wire-marker half touches a wire-format-adjacent header.
-- **E1 implementation** — `impureOutputHash` deletion. Branch
-  `vibe-coding/cleanup/libstore-impure-hash` (not yet created). E1
-  cleared the prerequisites: internal linkage (verified via `nm -m`
+- **E1 implementation** — `impureOutputHash` deletion. Lands as an
+  additional commit on the long-lived `vibe-coding/cleanup/libstore`
+  branch. E1 cleared the prerequisites: internal linkage (verified via `nm -m`
   on the built dylib); zero in-tree readers; zero references in lix
   or Hydra; commit `50912d02e` (2022-03-31) intended full removal but
   missed the namespace-scope definition in `derivations.cc`. Pure
@@ -94,35 +94,38 @@ The other entry points:
 - **Catalog split into 25 sections** — original monolithic
   `CANDIDATES.md` deleted; 217 + 44 candidates organised by topic.
   (Now 218 + 44 after #218 added during integration.)
-- **Seven cleanup PRs pushed** — `vibe-coding/cleanup/*` branches on
-  origin, ready for upstream review.
+- **Seven cleanup PRs pushed** — `vibe-coding/cleanup/*` shard branches
+  on origin, ready for upstream review.
 
 ## Cleanup branches (live)
 
 These are pushed to `origin` (`ConnorBaker/nix`) and ready for PR
-creation against upstream. Each addresses specific candidates per the
-`**Branch:**` lines in the candidate sections.
+creation against upstream. Each shard branch is **long-lived**: as
+more candidates land in the same shard, they are appended as
+additional commits on the same branch (one PR per shard, multi-commit
+review). Each candidate addressed by a branch carries a `**Branch:**`
+line in its body.
 
-| Branch | Addresses | Status |
-| ------ | --------- | ------ |
-| `vibe-coding/cleanup/libexpr-friend-dup` | #217 | Pushed |
-| `vibe-coding/cleanup/libfetchers-curl-stub` | #52 | Pushed |
-| `vibe-coding/cleanup/libflake-lockfile` | #48 | Pushed |
-| `vibe-coding/cleanup/libmain-shared` | #49, #128 | Pushed |
-| `vibe-coding/cleanup/libstore-dead-decls` | #54, #56, #57, #60 | Pushed |
-| `vibe-coding/cleanup/libutil-misc` | #58, #130 | Pushed |
-| `vibe-coding/cleanup/nix-run` | #127, #142 | Pushed |
+| Branch | Shard | Addresses | Status |
+| ------ | ----- | --------- | ------ |
+| `vibe-coding/cleanup/libexpr` | libexpr | #217 | Pushed |
+| `vibe-coding/cleanup/libfetchers` | libfetchers | #52 | Pushed |
+| `vibe-coding/cleanup/libflake` | libflake | #48 | Pushed |
+| `vibe-coding/cleanup/libmain` | libmain | #49, #128 | Pushed |
+| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60 | Pushed |
+| `vibe-coding/cleanup/libutil` | libutil | #58, #130 | Pushed |
+| `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142 | Pushed |
 
 The branches were pushed to a fork; PRs against upstream NixOS/nix
 have not been opened. The user controls when to open them.
 
 ## Worktree layout
 
-The seven cleanup branches are checked out as worktrees under
-`/Users/cbaker2/ext-sources/nix-worktrees/`. Future agents should use
-`git worktree list` to see what's checked out. New PR work for any
-candidate should follow the same pattern (one worktree per branch off
-master, descriptive name, `**Branch:**` line in the candidate body).
+The seven shard branches are checked out as worktrees under
+`/Users/cbaker2/ext-sources/nix-worktrees/cleanup-<shard>/`. Future
+agents should use `git worktree list` to see what's checked out. New
+work targeting an existing shard should reuse that shard's worktree
+and append a commit; new shards get a new branch and a new worktree.
 
 ## How to pick up this work
 
@@ -153,8 +156,10 @@ propose a new one). Spawn an agent for it with `AGENT-CHARTER.md` as
     of weak/mixed-evidence claims from the prior layers.
   - **N** = new candidate (the cross-shard pattern-discovery passes
     used N1-N44).
-- Cleanup branches: `vibe-coding/cleanup/<name>`. One worktree per
-  branch off master.
+- Cleanup branches: `vibe-coding/cleanup/<shard>` — one branch per
+  shard, long-lived, accumulating commits as more candidates land in
+  that shard. One worktree per branch off master, named
+  `nix-worktrees/cleanup-<shard>/`.
 - Candidate cross-references: bare `#NN` for 1-217, `NN` (no hash)
   for cross-shard `N1-N44`, `EN` / `FN` / `BN` / `CN` / `VN` for
   reports.

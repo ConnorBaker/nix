@@ -281,7 +281,7 @@ generation-of-JSON-serialisers.
   libc++ 16` workarounds with defaulted `operator<=>`. Risk minimal.
 - **U2 (trivial) — `append` shim deletion.** Cand. #130. Use
   `std::ranges::append_range`. Already on branch
-  `vibe-coding/cleanup/libutil-misc`.
+  `vibe-coding/cleanup/libutil`.
 - **U3 (small) — `Finally`-as-`MaintainCount`.** Cand. #129. Stack
   sites only; defer goal-hierarchy `MaintainCount`.
 - **U4 (trivial) — `std::unreachable()` for dead-after-exhaustive
@@ -362,9 +362,12 @@ range column above is the lookup table — find the section file by number,
 then the heading inside that file.
 
 Candidate bodies may also carry a `**Branch:**` line pointing at the
-`vibe-coding/cleanup/<name>` branch on origin that addresses the
-candidate, and a `**See also:**` cross-reference to associated review
-reports under [`../review/`](../review/) (E/F/B/C/V/N series).
+`vibe-coding/cleanup/<shard>` branch on origin that addresses the
+candidate. Cleanup branches are long-lived and shard-scoped — multiple
+candidates in the same shard accumulate as separate commits on a
+single branch, reviewed together as one PR per shard. The `**See also:**`
+line cross-references associated review reports under
+[`../review/`](../review/) (E/F/B/C/V/N series).
 
 ## Working on the catalog
 

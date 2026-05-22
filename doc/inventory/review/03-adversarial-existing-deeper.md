@@ -316,7 +316,7 @@ effort, not optional."
 
 #### #128 (`getIntArg::allowUnit`) — already-landed source-compat break
 
-The branch `vibe-coding/cleanup/libmain-shared` has already landed
+The branch `vibe-coding/cleanup/libmain` has already landed
 (commit `35ab0faaf libmain: drop unused blockInt decl and getIntArg
 allowUnit param`). The commit message correctly notes:
 
@@ -671,7 +671,7 @@ The catalog body has three observations bundled:
    pitfall (build-correctness fix).
 3. The `main.cc` `#include "run.hh"` adjustment (build-system fix).
 
-The branch `vibe-coding/cleanup/nix-run` already addressed all
+The branch `vibe-coding/cleanup/nix-cli` already addressed all
 three. The candidate documentation should split or factor the three
 concerns clearly because they are different kinds of debt.
 
@@ -921,7 +921,7 @@ Waker. **Disagreement on count.**
 ### #128 — branch already landed; agent 1 noted it but didn't push back
 
 Agent 1's PARTIALLY-VALID verdict matches the catalog. The branch
-`vibe-coding/cleanup/libmain-shared` has already shipped the
+`vibe-coding/cleanup/libmain` has already shipped the
 deletion. The commit bundled an unrelated dead-symbol removal
 (`blockInt`). Per the user's CLAUDE.md "Do not bundle unrelated
 cleanup ... into a commit", this is mild but worth flagging.
@@ -1130,7 +1130,7 @@ The minimum set of catalog edits that this pass surfaces:
 12. **#94** split (per agent 1): two candidates.
 13. **#18** split: three candidates.
 14. **#142** factor: clarify three concerns (global, brace-init,
-    include) all addressed by `cleanup/nix-run`.
+    include) all addressed by `cleanup/nix-cli`.
 15. **#65** merge with **#211**: one candidate, structural.
 16. **#134, #135** demote to implementation steps under #144.
 17. **#75** delete trivial half; keep small half if duplication

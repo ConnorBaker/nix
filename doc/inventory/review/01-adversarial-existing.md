@@ -140,7 +140,7 @@ proposed → one-line justification.
   way the paragraph is written invites doing the cache too. Catalog
   should pick one scope and own the effort label.
 - **#142 (`chrootHelperName`, current: trivial → proposed: trivial —
-  matches branch).** Already landed on `vibe-coding/cleanup/nix-run`.
+  matches branch).** Already landed on `vibe-coding/cleanup/nix-cli`.
 - **#172 (`unreachable()` audit, current: small → proposed: small per
   site / medium total).** Validation paragraph correctly elevates the
   count from 25+ to 64, but keeps "small per site". 64 sites × small =
@@ -382,20 +382,20 @@ The brief listed 14 candidates that should carry `**Branch:**` refs
 
 | Candidate | Branch | Notes |
 | --- | --- | --- |
-| #48 | `vibe-coding/cleanup/libflake-lockfile` | Present, matches branch (`513b47628 libflake: remove stray unused free-function forward declaration of check()`) |
-| #49 | `vibe-coding/cleanup/libmain-shared` | Present; branch covers blockInt + getIntArg (`35ab0faaf`) |
+| #48 | `vibe-coding/cleanup/libflake` | Present, matches branch (`513b47628 libflake: remove stray unused free-function forward declaration of check()`) |
+| #49 | `vibe-coding/cleanup/libmain` | Present; branch covers blockInt + getIntArg (`35ab0faaf`) |
 | #50 | none — resolved-by-design | Present; correct |
-| #52 | `vibe-coding/cleanup/libfetchers-curl-stub` | Present, matches (`74e512d11`) |
-| #54 | `vibe-coding/cleanup/libstore-dead-decls` | Present, fix verified in branch diff (`useWAL = true;`) |
-| #56 | `vibe-coding/cleanup/libstore-dead-decls` | Present, fix verified (trait moved to header) |
-| #57 | `vibe-coding/cleanup/libstore-dead-decls` | Present, COMMA_ macros renamed/scoped per branch diff |
-| #58 | `vibe-coding/cleanup/libutil-misc` | Present, fix verified (`ignoreExceptionExceptInterrupt`) |
-| #60 | `vibe-coding/cleanup/libstore-dead-decls` | Present, deletion verified |
-| #127 | `vibe-coding/cleanup/nix-run` | Present, fix verified (#ifdef cleanup) |
-| #128 | `vibe-coding/cleanup/libmain-shared` | Present, fix verified (`allowUnit` removed) |
-| #130 | `vibe-coding/cleanup/libutil-misc` | Present, fix verified (`append` shim deleted) |
-| #142 | `vibe-coding/cleanup/nix-run` | Present, fix verified |
-| #217 | `vibe-coding/cleanup/libexpr-friend-dup` | Present, fix verified (duplicate `friend struct ExprVar` removed) |
+| #52 | `vibe-coding/cleanup/libfetchers` | Present, matches (`74e512d11`) |
+| #54 | `vibe-coding/cleanup/libstore` | Present, fix verified in branch diff (`useWAL = true;`) |
+| #56 | `vibe-coding/cleanup/libstore` | Present, fix verified (trait moved to header) |
+| #57 | `vibe-coding/cleanup/libstore` | Present, COMMA_ macros renamed/scoped per branch diff |
+| #58 | `vibe-coding/cleanup/libutil` | Present, fix verified (`ignoreExceptionExceptInterrupt`) |
+| #60 | `vibe-coding/cleanup/libstore` | Present, deletion verified |
+| #127 | `vibe-coding/cleanup/nix-cli` | Present, fix verified (#ifdef cleanup) |
+| #128 | `vibe-coding/cleanup/libmain` | Present, fix verified (`allowUnit` removed) |
+| #130 | `vibe-coding/cleanup/libutil` | Present, fix verified (`append` shim deleted) |
+| #142 | `vibe-coding/cleanup/nix-cli` | Present, fix verified |
+| #217 | `vibe-coding/cleanup/libexpr` | Present, fix verified (duplicate `friend struct ExprVar` removed) |
 
 All 14 of the brief's listed candidates carry correct branch refs.
 
@@ -404,7 +404,7 @@ doesn't say so:**
 
 - **#148 attempt-and-revert.** The candidate carries a `**Branch:**
   none — attempt-and-revert documented in the second paragraph of
-  `cleanup/libutil-misc`'s primary commit message.` That is consistent
+  `cleanup/libutil`'s primary commit message.` That is consistent
   with the branch's `784a4f4b4 libutil/unix/signals: clarify why
   getInterruptCallbacks leak is load-bearing` commit, which expands a
   comment rather than removing the leak. **No correction needed**, but
