@@ -674,7 +674,7 @@ static void opGC(Strings opFlags, Strings opArgs)
         else if (*i == "--print-dead")
             options.action = GCOptions::gcReturnDead;
         else if (*i == "--max-freed")
-            options.maxFreed = std::max(getIntArg<int64_t>(*i, i, opFlags.end(), true), (int64_t) 0);
+            options.maxFreed = std::max(getIntArg<int64_t>(*i, i, opFlags.end()), (int64_t) 0);
         else
             throw UsageError("bad sub-operation '%1%' in GC", *i);
 

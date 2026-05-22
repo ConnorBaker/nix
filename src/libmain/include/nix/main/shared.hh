@@ -43,7 +43,7 @@ void printMissing(ref<Store> store, const MissingPaths & missing, Verbosity lvl 
 std::string getArg(const std::string & opt, Strings::iterator & i, const Strings::iterator & end);
 
 template<class N>
-N getIntArg(const std::string & opt, Strings::iterator & i, const Strings::iterator & end, bool allowUnit)
+N getIntArg(const std::string & opt, Strings::iterator & i, const Strings::iterator & end)
 {
     ++i;
     if (i == end)
@@ -80,8 +80,6 @@ private:
 #endif
     Descriptor std_out;
 };
-
-extern volatile ::sig_atomic_t blockInt;
 
 /* GC helpers. */
 

@@ -77,7 +77,7 @@ static int main_nix_collect_garbage(int argc, char ** argv)
             } else if (*arg == "--dry-run")
                 dryRun = true;
             else if (*arg == "--max-freed")
-                options.maxFreed = std::max(getIntArg<int64_t>(*arg, arg, end, true), (int64_t) 0);
+                options.maxFreed = std::max(getIntArg<int64_t>(*arg, arg, end), (int64_t) 0);
             else
                 return false;
             return true;
