@@ -15,75 +15,69 @@ The other entry points:
 
 ## Currently in flight
 
-(none — integration is the next step.)
+(none.)
 
 ## Queued / blocked
 
-- **Integration into the catalog** — the next step. Folds the 19
-  review reports (E1-E8, F1-F3, B1-B3, C1, V1, V2, V3, V4, V5) into
-  the candidate sections. Specifically:
-  - Update #138's body with V1's "5 of 6 C-API libraries install
-    `*_internal.h(h)` files" finding; flag the layout-change ABI
-    impact in release notes.
-  - Update #128's commit-bundling caveat per pass-2's note (the
-    `blockInt` deletion was bundled with the `getIntArg` change on
-    `cleanup/libmain-shared`).
-  - Apply B1's correction to the `15-globals-settings.md` keystone
-    block: drop `#135` from the #136-keystone list.
-  - Apply B2's count corrections: #65's "~hundreds" is 79 canonical
-    sites + ~135 bespoke; #211's "10 force* overloads" is 7
-    structurally-shared bodies.
-  - Apply B3's corrections: #18 hand-written `CloneableError`
-    derivations is 22 (not 14); 18a is not a real refactor target;
-    surface the `SQLiteBusy → SQLiteError → MakeError` cross-link.
-  - Apply C1's new candidate proposal: `Hash::dummy` /
-    `StorePath::dummy` placeholder-then-overwrite pattern across 5
-    sites — file as a small candidate.
-  - Apply E1's deletion path for `impureOutputHash` (recommended:
-    drop as a standalone PR; no deprecation cycle; no downstream
-    coordination needed). Land on a new
-    `vibe-coding/cleanup/libstore-impure-hash` branch following the
-    cleanup-branch convention.
-  - Apply V2's count corrections to E4's catalog edits: positional
-    `%N%` set is 71 in libstore (not 61), 50 in libutil; net
-    wire-crossing positional ~95 (not 61). E4 missed five
-    categories of sites (`store-api.hh` inline throws,
-    `string2IntMustParse`, `TimedOut` constructor body, `%s`/`%d`
-    non-positional, post-build `BuilderFailureError`). Phase 2 of
-    #125 must batch positional and non-positional together for
-    contract-bearing sites; the text-grep contract spans both forms.
-  - Apply E5's verifiable-counts manifest as `doc/inventory/counts.toml`
-    and the `verify-catalog-counts.sh` driver. Wire to weekly cron
-    + manual pre-PR run.
-  - Apply E6's "27/28 with (subdir, suffix)" correction to N41's
-    body (V5 verified the count).
-  - Apply E7's "ship `serialise-fwd.hh`, `store-fwd.hh`, AND
-    `eval-fwd.hh` together" recommendation (the original #166
-    omitted `eval-fwd.hh`).
-  - Apply F1+V3's confirmed UAF in `nix_eval_state_builder` to
-    catalog: extend #138's body, propose a fix that folds the UAF
-    repair into #138's `readOnlyMode → Store` migration.
-  - Apply F2's findings: the `"is not valid"` contract is mostly
-    dead code today; flag the surviving `BadStorePathName` case as a
-    pre-existing bug and the `binary-cache-store.cc` finding as
-    not-bug.
-  - Apply E8+V4's downgraded recommendation: keep Direction A on the
-    four non-perf grounds; drop the unsupported "1-2 ns" framing.
-  - Update STATUS.md and `review/00-INDEX.md` after integration to
-    reflect the new state.
-- **#138 implementation** — gated on V1's release-note coordination.
+- **#138 implementation** — relocate `EvalSettings::readOnlyMode` to
+  `Store`/`StoreConfig`. V1's release-note caveat documented in #138's
+  body: deleting the dead `nix::ref<bool> readOnlyMode` field in
+  `nix_eval_state_builder` is a layout change to the publicly-installed
+  `nix_api_expr_internal.h`, must be called out in release notes. The
+  fix folds in the F1+V3 confirmed UAF repair (the dangling pointer in
+  `EvalSettings::readOnlyMode` after `nix_eval_state_builder_free` goes
+  away when the field is removed entirely).
+- **#218 implementation** — `Hash::dummy`/`StorePath::dummy` placeholder
+  pattern (new candidate added during integration). Two halves:
+  placeholder-then-overwrite sites (6, in `local-store.cc`,
+  `derivation-trampoline-goal.cc`, `make-content-addressed.cc`,
+  `unix/build/derivation-builder.cc`, two FIXME-tagged sites in
+  `nar-info.cc`) → migrate to `std::optional<Hash>` /
+  `std::optional<StorePath>`; wire-marker sites (3, in `worker-protocol.cc`,
+  `serve-protocol.cc`, `legacy-ssh-store.cc`) → rename sentinel and
+  coordinate the protocol header. Aggregate effort medium because the
+  wire-marker half touches a wire-format-adjacent header.
+- **E1 implementation** — `impureOutputHash` deletion. Branch
+  `vibe-coding/cleanup/libstore-impure-hash` (not yet created). E1
+  cleared the prerequisites: internal linkage (verified via `nm -m`
+  on the built dylib); zero in-tree readers; zero references in lix
+  or Hydra; commit `50912d02e` (2022-03-31) intended full removal but
+  missed the namespace-scope definition in `derivations.cc`. Pure
+  deletion as a standalone PR — no deprecation cycle, no downstream
+  coordination.
+- **E5 verifiable-counts manifest** — implement `doc/inventory/counts.toml`
+  + `verify-catalog-counts.sh` per E5's specification. Wire to weekly
+  cron + manual pre-PR run. Open questions in E5 (manifest location,
+  new-claim onboarding policy, file-rename handling) need a decision
+  before scripting begins.
 - **Cluster-G uplift series U10 (`boost::describe`)** — flagged as the
   highest-leverage middle-of-graph step in `candidates/README.md`'s
-  uplift series. Not yet scheduled.
-- **E1 implementation** — `impureOutputHash` deletion. Ready as soon
-  as integration lands (E1 cleared the prerequisites: confirmed dead
-  in-tree, internal linkage, no downstream consumers, lix already
-  deleted it).
+  uplift series. Not yet scheduled. Unblocks N16, N32, N35, N38, N39,
+  plus the existing #9, #176, #182.
+- **E3 implementation** — write the `Goal::Co` property test pinning
+  O(1) frame depth, before any partial #160 (`boost::asio::awaitable`)
+  migration. Specification ready in `review/E3-goal-co-property-test.md`.
 
 ## Recently completed
 
 (Most recent first; truncate after a dozen entries.)
 
+- **Integration of 19 review reports** (HEAD) — folded findings from
+  E1-E8, F1-F3, B1-B3, C1, V1-V5 into the candidate bodies. Notable
+  edits: #134 expanded with C-API caveat per V1; #135 corrected per
+  B1 (does NOT depend on #136); #138 expanded with F1+V3 UAF repair
+  + V1 release-note caveat; #65 corrected per B2 (79 canonical sites
+  + ~135 bespoke); #211 corrected per B2 (7 structurally-shared
+  bodies, not 10); #18 corrected per B3 (17 hand-written derivations,
+  not 14; 18a is not a refactor target); #213 expanded with E8+V4
+  Direction A recommendation; #166 expanded with E7's three-header
+  recommendation; #125 expanded with E4+V2+F2's wire-crossing
+  reachability + two text-grep contracts + phasing constraint;
+  #128 noted commit-bundling per CLAUDE.md; #140 expanded with E1
+  verification details. New candidate #218 added (`Hash::dummy`/
+  `StorePath::dummy` placeholder pattern). N41 corrected per E6+V5
+  (28 fixtures, 19 fit cleanly with subdir-only ctor, 27/28 with
+  `(subdir, suffix)` ctor pair, 1 structural hazard).
 - **Evidentiary standard added** (`7cb0eca34`) — eight rules in
   `candidates/README.md` plus operational form in
   `review/AGENT-CHARTER.md`. Derived from failure modes seen across
@@ -99,6 +93,7 @@ The other entry points:
   their own merits.
 - **Catalog split into 25 sections** — original monolithic
   `CANDIDATES.md` deleted; 217 + 44 candidates organised by topic.
+  (Now 218 + 44 after #218 added during integration.)
 - **Seven cleanup PRs pushed** — `vibe-coding/cleanup/*` branches on
   origin, ready for upstream review.
 

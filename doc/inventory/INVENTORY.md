@@ -300,8 +300,10 @@ per-shard verified docs and follow-up source audits lives in
 [`candidates/`](candidates/), split into 25 themed section files with an
 [index](candidates/README.md). Each candidate carries a validation verdict
 (VALID / PARTIALLY VALID / INVALID / OBSOLETE) and an effort class against
-the source as it exists today. The 217 per-shard candidates plus 44
-cross-shard candidates (numbered N1-N44) are grouped as:
+the source as it exists today. The 218 per-shard candidates (1-218; #218
+was added during the V-pass integration documenting the `Hash::dummy`/
+`StorePath::dummy` placeholder pattern) plus 44 cross-shard candidates
+(numbered N1-N44) are grouped as:
 wire/serialisation duplication, parallel store implementations, repeated
 boilerplate, per-platform symmetry, inheritance chains worth flattening,
 multi-implementation patterns, dead/stale code, duplicated parsers,
@@ -325,6 +327,20 @@ into), the **C++23/Boost uplift series** U1-U10 (a coherent staged
 modernisation series with sequencing), and the **redundant
 abstractions** R1-R10 (cases where 2+ in-tree abstractions solve
 overlapping problems and the choice rule is undocumented).
+
+The catalog is being actively worked. The current state — what's
+queued, in flight, blocked, recently completed, plus the cleanup-branch
+table and worktree layout — lives in [`STATUS.md`](STATUS.md). Reports
+from past investigations (adversarial review passes, pattern-discovery
+passes, follow-up agents, verification passes) are indexed in
+[`review/00-INDEX.md`](review/00-INDEX.md). Operational rules for new
+agents working on the catalog (the eight-rule evidentiary standard
+derived from prior failure modes) live in
+[`review/AGENT-CHARTER.md`](review/AGENT-CHARTER.md). A new agent
+picking up this work should read in order: this file (INVENTORY.md) →
+[`candidates/README.md`](candidates/README.md) →
+[`STATUS.md`](STATUS.md) → [`review/00-INDEX.md`](review/00-INDEX.md) →
+[`review/AGENT-CHARTER.md`](review/AGENT-CHARTER.md).
 
 ## Key invariants and guarantees
 

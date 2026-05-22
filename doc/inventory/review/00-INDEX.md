@@ -79,6 +79,13 @@ prior claim.
 | [V4-e8-eqvalues-perf.md](V4-e8-eqvalues-perf.md) | Verify E8's "negligible performance benefit" claim for Direction B | **Inconclusive on perf — downgrade**. Direction A confirmed on four non-perf grounds. **Critical finding**: `ExprOpEq::eval`'s stack-local-copy semantics make the highest-frequency `eqValues` caller immune to canonical pointer-equality regardless of direction |
 | [V5-e6-fixture-recheck.md](V5-e6-fixture-recheck.md) | Verify E6's per-fixture compatibility classifications | All classifications hold; aggregate corrected from "16/22" to "27/28 with (subdir, suffix)". `CaDerivationAdvancedAttrsTest` is the one true structural hazard; needs common abstract base because of `TYPED_TEST_SUITE` parameterisation |
 
+## Integration status
+
+All 19 reports (E1-E8, F1-F3, B1-B3, C1, V1-V5) have been integrated
+into the candidate catalog as in-place body edits. See `STATUS.md`'s
+"Recently completed" entry for the per-report integration summary.
+The reports themselves stay in this directory for traceability.
+
 ## How a new agent should pick a report to read
 
 By question type:
