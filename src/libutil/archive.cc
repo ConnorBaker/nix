@@ -36,6 +36,26 @@ static GlobalConfig::Register rArchiveSettings(&archiveSettings);
    boost coroutine stack. */
 static constexpr size_t narMaxDepth = 64;
 
+template<typename... Args>
+static SerialisationError badArchive(std::string_view s, const Args &... args)
+{
+    return SerialisationError("bad archive: " + s, args...);
+}
+
+/* Two wordings on purpose: write side has the on-disk path, read side
+   raises SerialisationError to match parseDump's other diagnostics. */
+static void checkNarDepthWrite(size_t depth, SourceAccessor & accessor, const CanonPath & path)
+{
+    if (depth >= narMaxDepth)
+        throw Error("path '%s' exceeds maximum NAR directory depth of %d", accessor.showPath(path), narMaxDepth);
+}
+
+static void checkNarDepthRead(size_t depth)
+{
+    if (depth >= narMaxDepth)
+        throw badArchive("NAR directory nesting exceeds maximum depth of %d", narMaxDepth);
+}
+
 PathFilter defaultPathFilter = [](const std::string &) { return true; };
 
 void SourceAccessor::dumpPath(const CanonPath & path, Sink & sink, PathFilter & filter)
@@ -61,8 +81,7 @@ void SourceAccessor::dumpPath(const CanonPath & path, Sink & sink, PathFilter & 
         size_t depth) -> void {
         checkInterrupt();
 
-        if (depth >= narMaxDepth)
-            throw Error("path '%s' exceeds maximum NAR directory depth of %d", accessor.showPath(path), narMaxDepth);
+        checkNarDepthWrite(depth, accessor, path);
 
         auto st = accessor.lstat(path);
 
@@ -133,12 +152,6 @@ void dumpString(std::string_view s, Sink & sink)
     sink << narVersionMagic1 << "(" << "type" << "regular" << "contents" << s << ")";
 }
 
-template<typename... Args>
-static SerialisationError badArchive(std::string_view s, const Args &... args)
-{
-    return SerialisationError("bad archive: " + s, args...);
-}
-
 static void parseContents(CreateRegularFileSink & sink, Source & source)
 {
     uint64_t size = readLongLong(source);
@@ -172,8 +185,7 @@ struct CaseInsensitiveCompare
 
 static void parse(FileSystemObjectSink & sink, Source & source, const CanonPath & path, size_t depth)
 {
-    if (depth >= narMaxDepth)
-        throw badArchive("NAR directory nesting exceeds maximum depth of %d", narMaxDepth);
+    checkNarDepthRead(depth);
 
     /* NAR keywords are all <= 10 bytes; a little slack keeps error
        messages useful for short garbage without allowing large
