@@ -46,7 +46,7 @@ unsigned int getMaxCPU()
         if (quota != "max")
             return std::ceil(std::stoi(quota) / std::stof(period));
     } catch (Error &) {
-        ignoreExceptionInDestructor(lvlDebug);
+        ignoreExceptionExceptInterrupt(lvlDebug);
     }
 #endif
 
