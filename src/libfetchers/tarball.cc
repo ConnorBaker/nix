@@ -252,8 +252,6 @@ struct CurlInputScheme : InputScheme
 
     virtual bool isValidURL(const ParsedURL & url, bool requireTree) const = 0;
 
-    static const StringSet specialParams;
-
     std::optional<Input>
     inputFromURL(const Settings & settings, const ParsedURL & _url, bool requireTree) const override
     {
