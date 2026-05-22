@@ -1,0 +1,62 @@
+# Vestigial code, dead workarounds, stdlib replacements
+
+Candidates 121-130. Eleven VALID; #123 and #128 PARTIALLY VALID.
+
+The toolchain is C++23 (every `meson.build` under `src/` declares
+`cpp_std=c++23`); the `flake.nix` consumes unpinned `llvmPackages` from
+nixpkgs 25.11 (LLVM 19+).
+
+| # | Verdict | Effort |
+| - | ------- | ------ |
+| 121 | VALID | small |
+| 122 | VALID | medium |
+| 123 | PARTIALLY VALID | trivial |
+| 124 | VALID | small |
+| 125 | VALID | large |
+| 126 | VALID | medium |
+| 127 | VALID | trivial |
+| 128 | PARTIALLY VALID | trivial |
+| 129 | VALID | small |
+| 130 | VALID | trivial |
+
+---
+
+121. **The `// TODO libc++ 16` `operator<=>` workarounds across libstore/libcmd are now toolchain-obsolete.** Approximately 17 sites guard out defaulted `operator<=>` because of missing `std::set::operator<=>` / `std::map::operator<=>` / `std::optional::operator<=>` in libc++ 16; the affected files include `derived-path-map.{hh,cc}`, `content-address.hh`, `derivations.hh`, `derived-path.{hh,cc}`, `outputs-spec.hh`, `nar-info.hh`, `built-path.{hh,cc}`, and `nix/profile.cc`. libc++ 17 (July 2023) shipped these and the build is on `cpp_std=c++23` against modern clang. Replace each `// TODO libc++ 16` workaround (hand-written `operator==` plus `#if 0` blocks around `<=>`) with `auto operator<=>(...) const = default;` and drop the `GENERATE_EQUAL`/`GENERATE_ONE_CMP` macro pairs that exist solely to paper over the gap.
+    - ../verified/05-libstore-core.md, ../verified/06-libstore-derivations.md, ../verified/16-libcmd.md
+    - **Validation:** VALID. **Corrections:** `grep -rn "TODO libc++ 16" src/` returns exactly **17** sites. The original candidate listed `realisation.hh` as a workaround site, but `realisation.hh` is **already** on defaulted `operator<=>`; it's the model the others should converge on. The candidate also said `src/libstore/profile.cc`; the actual file is `src/nix/profile.cc`. **Caveat:** the existing `GENERATE_CMP_EXT` macro deliberately compares `*me->drvPath` (deref) instead of the `ref<>` itself; preserve that semantic when migrating to defaulted `operator<=>`. Effort: small.
+
+122. **`nix::fun<Sig>` non-nullable callable wrapper adds heap allocation for tiny lambdas.** Defined in `libutil/include/nix/util/fun.hh`, the class wraps `std::function`, throws `std::invalid_argument` on null at construction, then forwards every call. The cost is that every `fun<...>` parameter forces a heap-allocating type-erased callable even for tiny lambdas; the benefit (no null check at the call site) is tiny because `std::function` already throws `bad_function_call` on a null call. Most usages take a lambda by value at a fixed call site, so a templated callable parameter — or `std::move_only_function<Sig>` from C++23, which rejects `nullptr_t` at the constructor — would be both faster and simpler.
+    - ../verified/04-libutil-misc.md
+    - **Validation:** VALID. `std::move_only_function<Sig>` (C++23, P0288R9) is a drop-in for non-API-exposed callers — rejects `nullptr_t` at construction and is noexcept-move. **No public C-API exposes `fun`** (verified across `libutil-c`/`libstore-c`/`libexpr-c`/`libfetchers-c`). For shared-callback cases (e.g. `stackOverflowHandler` global, `Callback` copies), `std::function` still applies but lift the null check into an opt-in wrapper. Where the call site is a fixed lambda passed by value (most fetcher/visitor patterns), prefer a templated functor parameter — heap allocation for trivially-typed lambdas vanishes entirely. Effort: medium (~60+ sites).
+
+123. **`nix::ref<T>` could collapse to a `std::shared_ptr` plus a free `make_nonnull`.** The class in `libutil/include/nix/util/ref.hh` mostly forwards to the underlying `shared_ptr`; the value-add is the constructor null check, the `cast<T2>` that throws on bad dynamic-cast, an implicit upcast helper, and a custom `bad_ref_cast` exception. The implicit conversion `operator std::shared_ptr<T>()` already collapses much of the type distinction, and `gsl::not_null<std::shared_ptr<T>>` already provides the null-on-construction check. A free function `make_nonnull(shared_ptr)` plus an alias would suffice; `bad_ref_cast` is redundant given `std::bad_cast`.
+    - ../verified/04-libutil-misc.md
+    - **Validation:** PARTIALLY VALID. The proposal to replace with `gsl::not_null<std::shared_ptr<T>>` would be a regression — the codebase has no GSL dep today and would lose the implicit covariant upcast that `not_null<shared_ptr>` doesn't support. **Note:** `ref<T>` *is* used in C-API internal headers (`nix_api_store_internal.h`, `nix_api_expr_internal.h`); these aren't exposed via public `nix_api_*.h` but are compiled by C++ TUs that include the internals. The covariant upcast plus implicit `operator std::shared_ptr<T>()` are the load-bearing affordances that justify the wrapper. **Recommendation:** keep `ref<T>`, only drop `bad_ref_cast` in favour of `std::bad_cast`. Effort: trivial.
+
+124. **`nix::SharedSync<T>` has exactly one in-tree user.** The `SyncBase` template in `libutil/include/nix/util/sync.hh` is parameterised over five mutex/lock-type aliases just to instantiate `Sync` (`std::mutex`) and `SharedSync` (`std::shared_mutex`). `SharedSync` is used only in `FilteringSourceAccessor::allowedPrefixes` (`libfetchers/filtering-source-accessor.cc`). Dropping `SharedSync` and the five-parameter template, and adding a one-off `std::shared_mutex` to `FilteringSourceAccessor`, would simplify the template signature substantially.
+    - ../verified/03-libutil-runtime.md, ../verified/14-libfetchers.md
+    - **Validation:** VALID. **Correction:** there are **two** `SharedSync` users, not one — `AllowListSourceAccessorImpl::allowedPrefixes` in `libfetchers/filtering-source-accessor.cc` and `Store::pathInfoCache` in `libstore/include/nix/store/store-api.hh`. The broader simplification claim still stands. **Mechanism:** `Lock<L>::wait` only legitimately works on `Sync<T>` (with `std::condition_variable`); `SharedSync` instantiations cannot legitimately call `wait` because `std::condition_variable` doesn't bind to `std::shared_lock`. Split: `Sync<T>` keeps the cv methods, standalone `SharedSync<T>` exposes `lock()`/`readLock()` only. Eliminates the five-template-parameter `SyncBase`. Effort: small.
+
+125. **`boost::format` plus `nix::HintFmt` plus `nix::fmt` is a candidate for migration to `std::format`.** The toolchain is C++23 (clangStdenv with LLVM 19+). The custom layer in `libutil/include/nix/util/fmt.hh` exists to interpolate args via `%`, tag args with magenta colouring (`Magenta`/`Uncolored`), and reject `std::filesystem::path` to prevent double-quoting. `std::format`/`std::vformat` plus a `std::formatter<Magenta<T>>` specialisation supports all three. Re-implementing `fmt`, `formatHelper`, `setExceptions`, `HintFmt` internally on top of `std::format` (with no caller changes) would eliminate one Boost dependency and shrink compile times — though the call-site count is large enough that this is a multi-PR migration.
+    - ../verified/04-libutil-misc.md
+    - **Validation:** VALID. **Surface:** 226 `boost::format`/`boost/format`/`HintFmt` matches across the tree; **zero** `std::format` uses today. Migration is mechanical but huge: every `%s`/`%d`/`%1%` format string needs translation to `{}`/`{:d}`. Test coverage in `libutil-tests/hilite.cc` and many functional tests assert exact error message text — must preserve. Header refactor itself is medium; global format-string rewrite is the dominant cost. Effort: large (multi-PR).
+
+126. **`BumpMemoryResource` plus `std::pmr::synchronized_pool_resource` is more machinery than the symbol/AST arena needs.** The bump allocator in `libutil/bump-memory-resource.{cc,hh}` over-commits up to 8 GiB of address space at construction (via `mmap`/`MAP_NORESERVE`), falls back to upstream on overflow, and is wrapped by a synchronized pool resource at the call site (`SymbolTable::buffer`, `Exprs::buffer`). The pool-resource wrapper is used only because `SymbolTable` and `Expr` allocations are append-only. A flat `std::deque<std::vector<std::byte>>` of fixed-size chunks (similar to `ChunkedVector` but for byte allocations) would be simpler, would avoid the `mmap`-based overcommit code path, and would not need the Linux/cgroup detection in `canOvercommitLinux`/`checkRlimit`.
+    - ../verified/04-libutil-misc.md
+    - **Validation:** VALID. Benchmark before committing — the 8 GiB overcommit is a load-bearing performance feature for very large evaluations. **Pointer stability is required** (symbol references), so `std::deque<std::vector<std::byte>>` is the right replacement (vector growth would invalidate). The simpler alternative `std::pmr::monotonic_buffer_resource` is *not* thread-safe; current `BumpMemoryResource` is thread-safe by design (atomic CAS in `do_allocate`). Whether the symbol table needs concurrent allocations is the deciding question. Effort: medium.
+
+127. **Nested `#ifdef __linux__` block in `chrootHelper` is structurally redundant.** In `nix/run.cc::chrootHelper`, the entire function body is wrapped in one `__linux__` block; midway through, a second `# ifdef __linux__ ... # endif` guards the call to `linux::setPersonality`. The inner guard is unreachable on non-Linux because the outer guard already excludes that case. Delete the inner `#ifdef`/`#endif` pair.
+    - ../verified/17-nix-modern-1.md
+    - **Validation:** VALID. Effort: trivial.
+
+128. **`getIntArg`'s `allowUnit` parameter is read-only ignored.** The function template in `libmain/include/nix/main/shared.hh` never references `allowUnit`; the unit prefix is always parsed by the inner `string2IntWithUnitPrefix`. Both call sites (`nix-collect-garbage.cc`, `nix-store.cc`) pass `true`. Delete the parameter and update the two callers.
+    - ../verified/15-libflake-libmain.md
+    - **Validation:** PARTIALLY VALID. Two options: delete the parameter, or honour it (refuse unit suffixes when `allowUnit == false`). Both are trivial; deletion is the simpler choice. Effort: trivial.
+
+129. **`MaintainCount` could be replaced by a `Finally` lambda or `std::experimental::scope_exit`.** The class in `libutil/include/nix/util/util.hh` is a 25-line RAII wrapper that increments a counter on construction and decrements on destruction; it's used as `MaintainCount<uint64_t>` handles across the goal hierarchy. C++23's `std::scope_exit` (or just a `nix::Finally{}` already in `libutil`) plus an explicit `++counter` at the call site removes the need for a dedicated type. This compounds with #33 / #47 (the goal-hierarchy `doneSuccess`/`doneFailure` patterns that mention `MaintainCount` reset).
+    - ../verified/04-libutil-misc.md, ../verified/10-libstore-build.md
+    - **Validation:** VALID. **Note:** `std::scope_exit` is *not* in C++23 — it remains in `std::experimental`. The `Finally` already in `libutil` is the right replacement. **Caveat:** stack-scoped sites (`copyPaths`, `primTryEval`, `verify.cc`) are trivial swaps. The `unique_ptr<MaintainCount<uint64_t>>`-as-member pattern in the goal hierarchy (`mcExpectedBuilds`, `mcRunningBuilds`, etc.) has lifetime decoupled from any scope — goals reset and re-create across `doneSuccess`/`doneFailure`; for that case keep the type or replace with a small `ScopedCounter`. Effort: small (stack sites) / medium (goal hierarchy, compounds with #33/#47).
+
+130. **The `append` shim in `util.hh` is obsolete on C++23.** `libutil/include/nix/util/util.hh` carries `template<class C, typename T> void append(C & c, std::initializer_list<T> l) { c.insert(c.end(), l.begin(), l.end()); }` with the comment `TODO: remove this once we can use C++23's append_range()`. The build is on C++23 — `std::ranges::append_range` (P1206) is available. Migrate call sites and delete the shim.
+    - ../verified/04-libutil-misc.md
+    - **Validation:** VALID. **Confirmed zero in-tree callers.** Pure deletion. Effort: trivial.

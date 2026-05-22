@@ -1,0 +1,68 @@
+# libexpr eval-core: fetcher primops, lookup-path, JSON
+
+Candidates 189-200. Ten VALID; #191 and #195 PARTIALLY VALID.
+
+| # | Verdict | Effort |
+| - | ------- | ------ |
+| 189 | VALID | medium |
+| 190 | VALID | medium |
+| 191 | PARTIALLY VALID | small |
+| 192 | VALID | small |
+| 193 | VALID | medium |
+| 194 | VALID | trivial |
+| 195 | PARTIALLY VALID | small |
+| 196 | VALID | trivial |
+| 197 | VALID | trivial |
+| 198 | VALID | small |
+| 199 | VALID | trivial |
+| 200 | VALID | medium |
+
+---
+
+189. **`FetchTreeParams` is four orthogonal bool flags wrapping a single dispatcher.** [HIGH] `fetchTree.cc::FetchTreeParams` has `emptyRevFallback` / `allowNameArgument` / `isFetchGit` / `isFinal`, and the body of `fetchTree(...)` reads each one at a different decision point: `isFetchGit` switches the diagnostic name (`"fetchGit"` vs `"fetchTree"`), pre-seeds `type = "git"`, applies `fixGitURL`, defaults `exportIgnore`, and takes a different "raw URL" branch; `allowNameArgument` gates an attribute check; `emptyRevFallback` only flows through to `emitTreeAttrs`; `isFinal` flips an `__final` attr. `isFetchGit` is in particular a *flavor*. Splitting `fetchTree` into a small core (attribute coercion + post-process + emit) and per-primop wrappers (`prim_fetchTree`, `prim_fetchGit`, `prim_fetchFinalTree`) that own their own pre/post passes would replace the `params.isFetchGit && ...` chain with explicit per-flavor code paths.
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** VALID. Effort: medium.
+
+190. **`fetchTree.cc::fetchTree` is a 150-line dispatcher whose attribute-iteration body is the longest decision tree.** [MEDIUM] The `for (auto & attr : *args[0]->attrs())` loop in `fetchTree` runs `forceValue` then a five-arm `if/else if` cascade: `nPath || nString` (with `isFetchGit && name == "url"` `fixGitURL` sub-branch); `nBool`; `nInt` (with negative-value diagnostic and uint64 cast); `state.symbols[attr.name] == "publicKeys"` (gated by `Xp::VerifiedFetches`, serialises via `printValueAsJSON`); else `TypeError`. The same shape recurs in `prim_fetchClosure`'s attribute loop and in `prim_fetchMercurial`'s; candidate #79 already calls out the family. The specific issue here is that `fetchTree`'s loop additionally interleaves the per-flavor (`isFetchGit`) URL rewrite, so the loop body cannot be lifted into the generic helper #79 proposes without first separating flavor.
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** VALID. Compounds with #79, #189. Effort: medium.
+
+191. **`emitTreeAttrs` is a single ~50-line builder with no per-attr emitters.** [MEDIUM] `fetch-tree.hh::emitTreeAttrs` (defined in `fetchTree.cc`) hand-allocates a `state.buildBindings(100)`, then issues nine separate `attrs.alloc(name).mkX(...)` calls under nested `if (forceDirty)` / `emptyRevFallback` / `dirtyRev`-present / `lastModified`-present guards. Each emitter knows its own attr name, source, and conditions inline. The function is short enough to be defensible, but it duplicates the `getNarHash` / `getRev` / `getRevCount` / `getLastModified` accessor pattern that `Input::toAttrs` already implements; an `Input::toEmittedAttrSet(emptyRevFallback, forceDirty)` returning a `fetchers::Attrs` plus a generic `attrsToValue` would let `emitTreeAttrs` collapse to two lines.
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** PARTIALLY VALID. The `Input::toAttrs` re-use suggestion is **wrong** — `Input::toAttrs` returns the *input* attribute set (rev, type, owner, repo) used to construct the input, not the *emitted* attribute set (`outPath`/`narHash`/`shortRev`/`lastModifiedDate` are result-only). A separate `EmittedTreeAttrs { fillFrom(input, opts); emitToValue(state, v); }` factoring (rather than reusing `Input::toAttrs`) would consolidate the 9 emitter call sites. Effort: small.
+
+192. **`prim_fetchClosure`'s three-way subroutine split is driven by a two-bit state.** [MEDIUM] The dispatch in `prim_fetchClosure` is `if (toPath) runFetchClosureWithRewrite; else if (inputAddressed) runFetchClosureWithInputAddressedPath; else runFetchClosureWithContentAddressedPath`. The two address-mode subroutines (`runFetchClosureWithContentAddressedPath`, `runFetchClosureWithInputAddressedPath`) are byte-identical except for one `if (info->isContentAddressed(...))` direction flip and the corresponding `HintFmt`. `runFetchClosureWithRewrite` is genuinely different (calls `makeContentAddressed` and compares against an expected `toPath`). The two address-mode functions could collapse to a single `runFetchClosureChecked(state, fromStore, fromPath, expectInputAddressed, v)` differing only by the assertion. Modelling the mode as a `std::variant<Rewrite{toPath}, ExpectInputAddressed, ExpectContentAddressed>` parsed once would replace the boolean-pair dispatch with an exhaustive `std::visit`.
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** VALID. The two address-mode functions (`runFetchClosureWithContentAddressedPath`, `runFetchClosureWithInputAddressedPath`) are mechanically symmetric; only the `if (info->isContentAddressed(...))` direction flip differs. A `std::variant<Rewrite, ExpectInputAddressed, ExpectContentAddressed>` parsed once + `std::visit` replaces the boolean-pair dispatch. Effort: small.
+
+193. **`prim_fetchMercurial` builds attrs and emits the result by hand instead of going through `fetchTree`/`emitTreeAttrs`.** [MEDIUM] `fetchMercurial.cc::prim_fetchMercurial` does its own attribute-iteration loop (with `n == "url"` / `"rev"` / `"name"` arms and a regex-based "rev is a hash or branch name" disambiguation that the generic `fetchTree` does not need), constructs a `fetchers::Attrs{type=hg, url=…, name=…, ref=…, rev=…}` directly, calls `input.fetchToStore(...)`, and then emits a four-attr result (`outPath`/`branch`/`rev`/`shortRev`/`revCount`) via its own `state.buildBindings(8)` block — bypassing `emitTreeAttrs` entirely. The duplication is partly explainable: the "rev is either a SHA1 or a branch name" disambiguation is mercurial-specific. Routing through `fetchTree` with a `MercurialParams` flavor (or, after #189, through a `prim_fetchMercurial` wrapper that calls the shared core) would consolidate.
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** VALID. Effort: medium.
+
+194. **`LookupPath::Elem` is `Prefix` + `Path` where both wrap a single `std::string`.** [DESIGN] `search-path.hh` defines `LookupPath::Prefix { std::string s; ... suffixIfPotentialMatch(...) }`, `LookupPath::Path { std::string s; ... }`, and `LookupPath::Elem { Prefix prefix; Path path; ... parse(...) }`. Both `Prefix` and `Path` are tagged-string newtypes with `GENERATE_CMP` and one helper each. The only distinct behaviour is `Prefix::suffixIfPotentialMatch`. The whole layering (three structs + one public method on each) could collapse to a single `struct Elem { std::string prefix, path; std::optional<std::string_view> suffixIfPotentialMatch(string_view) const; }`. The TODO `// Maybe change this to std::variant<SourcePath, URL>` on `Path::s` further suggests `Path` is a stub awaiting a richer type — it is not pulling its current weight.
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** VALID. Internal types; collapse to a single `Elem { std::string prefix, path; ... }` via `= default` comparators. Effort: trivial.
+
+195. **`LookupPathHooks` is a `std::map<scheme, fun<...>>` constructed once at libcmd init and never mutated.** [MEDIUM] `EvalSettings::LookupPathHooks = std::map<std::string, fun<LookupPathHook>>` (in `eval-settings.hh`) is consulted exactly once, in `EvalState::resolveLookupPathPath`, via `if (auto * hook = get(settings.lookupPathHooks, scheme))`. The `fun<...>` wrapping (see candidate #122) heap-allocates each hook. Three hooks total are registered (in `libcmd/common-eval-args.cc`: `flake`, `path`, `arg` — one parses flakerefs, one calls `fetchToStore`, one calls `state.allowPath`).
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** PARTIALLY VALID. **Correction:** only **one** `lookupPathHooks` entry is registered in-tree (`flake` in `libcmd/common-eval-args.cc`). The `path` and `arg` cited in the original candidate are unrelated `MixEvalArgs` flag handlers, not `LookupPathHook`s. With one entry, `boost::container::flat_map` is overkill — replace `std::map<string, fun<...>>` with a constexpr table or even a single `std::optional<LookupPathHook>` field, eliminating the heap allocation per hook and the `fun<...>` indirection. Compounds with #131. Effort: small.
+
+196. **`EvalState::lookupPathResolved` heterogeneous-hash key is exercised on exactly zero non-allocating call sites.** [MEDIUM] `eval.hh` declares `lookupPathResolved` as `boost::concurrent_flat_map<std::string, std::shared_ptr<LookupPathResolvedState>, StringViewHash, std::equal_to<>>` — heterogeneous lookup via `StringViewHash` plus transparent `std::equal_to<>`. The two consumers are: `getConcurrent(*lookupPathResolved, value)` in `resolveLookupPathPath` (where `value` is `LookupPath::Path::s`, already a `std::string`), and `lookupPathResolved->emplace(std::string(value), res)` in the same function (which constructs a fresh `std::string` regardless). Neither call site benefits from the heterogeneous hash. The `StringViewHash`/`equal_to<>` template arguments are dead weight; a plain `concurrent_flat_map<std::string, shared_ptr<...>>` would behave identically.
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** VALID. Effort: trivial.
+
+197. **`EvalState::findFile(string_view)` is a one-line forwarder to `findFile(this->lookupPath, ...)` with no other callers diverging on the lookup path.** [MEDIUM] `eval.cc::findFile(string_view)` is `return findFile(lookupPath, path);`. The two-arg overload's only non-self callsite is `prim_findFile` (which builds a `LookupPath` from a Nix list and passes it). The one-arg overload exists solely to spell out "use the eval state's own lookupPath", which is the common case. Drop the one-arg overload and have callers pass `state.lookupPath` explicitly.
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** VALID. Effort: trivial.
+
+198. **`json-to-value.cc::JSONSax` builds a hand-rolled stack of `std::unique_ptr<JSONState>` parents instead of using `nlohmann::json::parse` plus a tree walker.** [DESIGN] `JSONSax` derives from `nlohmann::json_sax<json>`, defines an inner `JSONState` base with a `parent` link plus virtual `resolve(EvalState&)` / `add()`, and two derived states `JSONObjectState` (carries a `ValueMap attrs`, attaches each parsed value to a key) and `JSONListState` (carries a `ValueVector values`). `start_object`/`start_array` push a new state onto the chain; `end_object`/`end_array` pop. The result is essentially a manual implementation of `nlohmann::json`'s own tree representation — a `nlohmann::json::parse(s)` followed by a recursive `jsonToValue(j, &v, state)` translator over `j.is_object()` / `is_array()` / `is_string()` would be ~30 lines instead of ~200, and would let `RootValue`/`allocRootValue` wrapping disappear.
+    - ../verified/12-libexpr-parse.md
+    - **Validation:** VALID. `nlohmann::json::parse(s)` + recursive `jsonToValue(j, &v, state)` translator is ~30 lines vs current ~200; perf delta is neutral. No SAX-only streaming consumer. Effort: small.
+
+199. **`JSONSax::end_array` is `return end_object();` — a smell that `JSONState::resolve` is the wrong abstraction.** [MEDIUM] In `json-to-value.cc`, `bool end_array() override { return end_object(); }` because both arms perform the same `rs = rs->resolve(state); rs->add();` sequence. The shared body lives behind a virtual dispatch on `JSONState::resolve` that returns the parent state — i.e., the dispatch encodes "what container kind am I closing". A single `endContainer()` method (or, after #198, a single tree-walker visit) would name the operation directly.
+    - ../verified/12-libexpr-parse.md
+    - **Validation:** VALID. Compounds with #198. Effort: trivial.
+
+200. **`value-to-json.cc::printValueAsJSON` matches the parallel-renderers pattern from #36, plus an extra concern: lossy `nString` `copyContext`.** [MEDIUM] The two `printValueAsJSON` overloads in `value-to-json.cc` (the `json`-returning recursive walker plus the `std::ostream &`-writing thin wrapper) match candidate #36's "five parallel value renderers" shape exactly: per-`nValueType` switch, recursion, derivation special-casing via `state.s.outPath` lookup, `state.tryAttrsToString` short-circuit, `addCallDepth` recursion guard, `nThunk`/`nFailed`/`nFunction` rejection. The JSON-specific wrinkle worth a separate note: the `nString` arm calls `copyContext(v, context)` which appends to a caller-provided `NixStringContext &` — the same out-parameter pattern that `value-to-xml.cc` uses. The shared visitor scaffold #36 proposes would need to thread `context` and the `copyToStore`/`strict` flags through; the JSON variant is the simplest of the five and is a reasonable model for the unified base.
+    - ../verified/12-libexpr-parse.md
+    - **Validation:** VALID. Compounds with #36. Effort: medium.

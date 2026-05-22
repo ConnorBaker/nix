@@ -1,0 +1,45 @@
+# Legacy CLI duplication
+
+Candidates 89-95. Six VALID; #94 PARTIALLY VALID — its named members
+`BuiltPath::parse` and `BuiltPath::to_string` are dead surface (declared in
+the header with no implementation and no caller anywhere in tree).
+
+| # | Verdict | Effort |
+| - | ------- | ------ |
+| 89 | VALID | trivial |
+| 90 | VALID | medium |
+| 91 | VALID | trivial |
+| 92 | VALID | small / medium |
+| 93 | VALID | small (three of four) / medium (`CmdHash`) |
+| 94 | PARTIALLY VALID | medium (with dead-surface deletion) |
+| 95 | VALID | small |
+
+---
+
+89. **`struct MyArgs : LegacyArgs, MixEvalArgs` is declared three times inside legacy entry points.** `main_nix_build` (in `nix-build.cc`), `main_nix_instantiate` (in `nix-instantiate.cc`), and `main_nix_env` (in `nix-env.cc`) each declare an identical inner `struct MyArgs : LegacyArgs, MixEvalArgs { using LegacyArgs::LegacyArgs; ... }`. `nix-build`'s adds a `setBaseDir(std::filesystem::path)` helper for shebang-relative resolution; the other two are bare. A shared `LegacyEvalArgs` (deriving `LegacyArgs, MixEvalArgs`) with an optional `setBaseDir` hook would replace all three.
+    - ../verified/18-nix-modern-2-legacy.md
+    - **Validation:** VALID. Plain extract-base-class. The `nix/prefetch.cc` (`main_nix_prefetch_url`) bare form is also subsumed (covered by #95). Effort: trivial.
+
+90. **`Operation` typedef + flag-to-handler dispatch table is duplicated between `nix-env` and `nix-store`.** `nix-env.cc` defines `typedef void (*Operation)(Globals & globals, Strings opFlags, Strings opArgs)` with 12 operation handlers (`opInstall`, `opUpgrade`, `opSetFlag`, `opSet`, `opQuery`, `opUninstall`, `opSwitchProfile`, `opSwitchGeneration`, `opRollback`, `opListGenerations`, `opDeleteGenerations`, `opVersion`); `nix-store.cc` defines `typedef void (*Operation)(Strings opFlags, Strings opArgs)` with 25 handlers (`opRealise`, `opAdd`, `opAddFixed`, `opPrintFixedPath`, `opQuery`, `opPrintEnv`, `opReadLog`, `opDumpDB`, `opLoadDB`, `opRegisterValidity`, `opCheckValidity`, `opGC`, `opDelete`, `opDump`, `opRestore`, `opExport`, `opImport`, `opInit`, `opVerify`, `opVerifyPath`, `opRepairPath`, `opOptimise`, `opServe`, `opGenerateBinaryCacheKey`, `opVersion`). They differ only in that `nix-env`'s carries a `Globals&` argument while `nix-store` uses a file-scope `static std::shared_ptr<Store> store`. Both also duplicate the "set `op` from flag, throw if set twice" loop. A shared `LegacySubcommandTable<Ctx>` helper would consolidate both.
+    - ../verified/18-nix-modern-2-legacy.md
+    - **Validation:** VALID. **Pitfall:** nix-store's `--max-freed`/`--max-links`/`--max-atime` "hack" pushes back into `opFlags` from the main parser; `LegacySubcommandTable` needs an "extra-flag injection" hook. Compounds with #91 (the `LegacyContext` for nix-store includes `gcRoot`/`rootNr`). Effort: medium.
+
+91. **`std::filesystem::path gcRoot` + `int rootNr` GC-root-naming pair duplicated in two legacy commands.** `nix-store/nix-store.cc` (file-scope `static std::filesystem::path gcRoot; static int rootNr = 0;`) and `nix-instantiate/nix-instantiate.cc` (`std::filesystem::path gcRoot;` external linkage, `static int rootNr = 0;`) both increment `rootNr` and append `-N` for `N > 1` when constructing `result-N`-style root names, then call `LocalFSStore::addPermRoot(path, rootName)`. `nix-store`'s `realisePath` additionally appends `-<outputName>` for non-`out` outputs. A shared `GcRootNamer` (or `addPermRootWithCounter`) helper would consolidate both, and the inconsistent `static`/external-linkage decisions on `gcRoot` could be normalised at the same time.
+    - ../verified/18-nix-modern-2-legacy.md
+    - **Validation:** VALID. The `printGCWarning` call when `gcRoot.empty()` is also duplicated. Refactor: `class GcRootNamer { path baseRoot; int counter = 0; path next(optional<string_view> outputName); };` plus a free `addPermRootWithCounter(LocalFSStore &, StorePath, optional<string_view>)`. Accidental external linkage on nix-instantiate's `gcRoot` disappears in the process. Effort: trivial.
+
+92. **`store {cat,ls}` and `nar {cat,ls}` reuse `MixCat`/`MixLs` but reimplement source-accessor construction four times.** `MixCat::cat(ref<SourceAccessor>, CanonPath)` and `MixLs::list(ref<SourceAccessor>, CanonPath)` are shared, but each `run()` builds the accessor independently: `CmdCatStore`/`CmdLsStore` call `store->toStorePath(path)` then `store->requireStoreObjectAccessor(storePath)`; `CmdCatNar` opens the NAR with `openFileReadonly`, parses it via `parseDump` against an inline `CatRegularFileSink : NullFileSystemObjectSink` to find the requested file; `CmdLsNar` opens the NAR and constructs `makeLazyNarAccessor(parseNarListing(source), seekableGetNarBytes(fd.get()))`. A shared "open `SourceAccessor` over a store path or a NAR" helper would let the four commands share the entire `run()` body.
+    - ../verified/18-nix-modern-2-legacy.md
+    - **Validation:** VALID. **Pitfall:** streaming-cat (`MixCat`) and listing (`MixLs`) have different cost profiles — `MixCat` doesn't want to materialise a listing; the helper needs `NarMode ∈ {Streamed, Random}`. Effort: small / medium.
+
+93. **`NixMultiCommand` parents split into two enumeration styles.** Eight subcommand parents enumerate children dynamically via `RegisterCommand::getCommandsFor({"<name>"})`: `CmdStore` (`store.cc`), `CmdNar` (`nar.cc`), `CmdEnv` (`env.cc`), `CmdRealisation` (`realisation.cc`), `CmdDerivation` (`derivation.cc`), `CmdConfig` (`config.cc`), `CmdFormatter` (`formatter.cc`), `CmdFlake` (`flake.cc`). Four hand-roll an inline `{ {"name", []() { return make_ref<...>(); } }, ... }` factory list instead: `CmdRegistry` (`registry.cc`, 5 children), `CmdProfile` (`profile.cc`, 8 children), `CmdKey` (`sigs.cc`, 2 children), `CmdHash` (`hash.cc`, 7 children — `to-base16/32/64/sri` factories carry a `HashFormat` argument). Three of the four inline-style ones (`CmdRegistry`, `CmdProfile`, `CmdKey`) could trivially switch to `getCommandsFor` plus `registerCommand2` per child; `CmdHash` is the only one whose factories pass non-trivial constructor arguments and would need a more general "registry-with-args" mechanism.
+    - ../verified/17-nix-modern-1.md, ../verified/18-nix-modern-2-legacy.md
+    - **Validation:** VALID. Three of four inline-factory parents (`CmdRegistry`, `CmdProfile`, `CmdKey`) convert trivially via per-child `registerCommand2<>({...})`. `CmdHash` is the genuinely awkward case — `CmdToBase` is parameterised on a runtime `HashFormat`, used four times with different format values; either split into four trivial subclasses or extend `RegisterCommand` to be first-class for parameterised factories. `CmdProfile`'s `aliases` map (`install` → `add`) is orthogonal and stays. Effort: small (three of four) / medium (`CmdHash`).
+
+94. **`BuiltPath`/`SingleBuiltPath` are mirrored variant types with parallel implementations.** Both wrap `std::variant<DerivedPathOpaque, *Built>` (`SingleBuiltPathBuilt` carries `pair<string, StorePath> output`; `BuiltPathBuilt` carries `map<string, StorePath> outputs`); each pair re-implements `outPath`/`outPaths`, `discardOutputPath`, `toJSON`, `parse`, and `to_string` via near-identical `std::visit(overloaded{...}, raw())` dispatchers. A `BuiltPathBase<Many>` template (parametrised on whether outputs are scalar or a map) plus a generic visit-helper would consolidate both type families and their JSON/parse machinery.
+    - ../verified/16-libcmd.md
+    - **Validation:** PARTIALLY VALID. The `outPath`/`outPaths`/`discardOutputPath`/`toJSON` mirroring is real. **Correction:** the `parse` and `to_string` member functions named in the original candidate are declared in `built-path.hh` with **no implementation and no caller anywhere in the tree** — those declarations are dead surface and should simply be deleted. The remaining template factoring stands. Effort: medium (with dead-surface deletion as a separate trivial step).
+
+95. **Legacy CLI shim duplicated between `compatNixHash` and `main_nix_prefetch_url`.** Both hand-roll an iterator-based `parseCmdLine` / `MyArgs::parseCmdline` argv loop that opens with `--help → showManPage(name)`, `--version → printVersion(name)`, dispatches on `--type` via `parseHashAlgo`, and falls through unknown `-`-prefixed flags via `return false`. `main_nix_prefetch_url` additionally derives a `MyArgs : LegacyArgs, MixEvalArgs` (subsumed by candidate #89); `compatNixHash` instead calls free `parseCmdLine(argc, argv, ...)` because it doesn't need eval. A small "legacy CLI shim" helper exposing `--help`/`--version`/algorithm-flag handling plus the iterator-loop scaffolding would consolidate both.
+    - ../verified/17-nix-modern-1.md
+    - **Validation:** VALID. **Pitfall:** `--help` paths in `nix-build` also call `deletePath(tmpDir);` before `showManPage`; the helper needs an optional cleanup hook. With `LegacyEvalArgs` (#89) and `LegacySubcommandTable` (#90), the legacy shim layer becomes a small library. Effort: small.

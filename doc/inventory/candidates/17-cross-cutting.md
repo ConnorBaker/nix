@@ -1,0 +1,82 @@
+# Cross-cutting: platforms, headers, magic numbers
+
+Candidates 161-175. Five VALID; nine PARTIALLY VALID — this is the highest
+PARTIALLY VALID rate of any section, mostly because the original counts
+drifted from current source.
+
+| # | Verdict | Effort |
+| - | ------- | ------ |
+| 161 | PARTIALLY VALID | structural |
+| 162 | PARTIALLY VALID | small |
+| 163 | VALID | small |
+| 164 | PARTIALLY VALID | medium |
+| 165 | VALID | trivial |
+| 166 | PARTIALLY VALID | medium |
+| 167 | VALID | small |
+| 168 | VALID | small |
+| 169 | PARTIALLY VALID | medium |
+| 170 | VALID | small |
+| 171 | PARTIALLY VALID | medium |
+| 172 | PARTIALLY VALID | small |
+| 173 | PARTIALLY VALID | small |
+| 174 | PARTIALLY VALID | medium |
+| 175 | PARTIALLY VALID | medium |
+
+---
+
+161. **The Windows port is a non-blocking, single-target CI lane that builds only `nix-util-tests`.** [DESIGN] `.github/workflows/ci.yml`'s `windows_tests` job sets `continue-on-error: true` and runs only `nix build --file ci/gha/tests/windows.nix unitTests.nix-util-tests`; it does not build libstore, libexpr, libfetchers, libcmd, or any `nix` binary, and a Windows failure cannot break a PR. There is parallel `windows/` source under `libutil/`, `libstore/`, `libcmd/`, `libmain/`, `nix/`, and `libutil-tests/`. Either the Windows port is promoted to a required, end-to-end CI target, or the tree should be honest about the support level.
+    - **Validation:** PARTIALLY VALID. **Correction:** the actual count is **two** `windows/` subdirectories (`libstore/windows`, `libutil/windows`), not five. A Wine CI lane already exists; runs `nix-util-tests` only. The structural critique stands. Effort: structural.
+
+162. **Three Windows-only public headers exist solely to break a circular dependency in `muxable-pipe.hh` / `users.cc` / `globals.cc`.** [HIGH] `libutil/windows/include/nix/util/windows-async-pipe.hh`, `windows-environment.hh`, and `windows-known-folders.hh` are consumed exactly four times outside `windows/`: `libutil/include/nix/util/muxable-pipe.hh` includes `windows-async-pipe.hh`; `libutil/users.cc`, `libstore/globals.cc`, and `libstore/store-api.cc` each include `windows-known-folders.hh`. All five include sites are guarded by `#ifdef _WIN32`. `windows-environment.hh` is consumed only inside `libutil/windows/` itself. Folding the three headers into a single `windows-platform.hh` (or making `windows-environment.hh` a private header) would shrink the public Windows-only API surface from three headers to one.
+    - ../verified/03-libutil-runtime.md, ../verified/04-libutil-misc.md
+    - **Validation:** PARTIALLY VALID. **Correction:** `windows-environment.hh` is **also** included by `libstore/windows/pathlocks.cc`, not only inside `libutil/windows/`. Mechanism still works. Effort: small.
+
+163. **`Pipe::create` arity diverges between Unix and Windows in a public header, and `nix::unix` is wrapped in `#ifndef _WIN32` in the same header.** [HIGH] `libutil/include/nix/util/file-descriptor.hh` declares `Pipe::create` with a `bool nonBlocking = false` parameter only on Unix (the parameter is `#ifndef _WIN32`-guarded). The same header wraps the entire `nix::unix` namespace (`closeExtraFDs`, `closeOnExec`, `SelfPipe`) plus the `lseek` declaration in `#ifndef _WIN32` / `#ifdef _WIN32` blocks. A `Pipe::create(PipeOptions{.nonBlocking = ...})` (with `nonBlocking` ignored on Windows or implemented via `SetNamedPipeHandleState`) would let the header expose one signature.
+    - ../verified/04-libutil-misc.md
+    - **Validation:** VALID. Effort: small.
+
+164. **`file-system.hh` and `file-descriptor.hh` together carry ~24 `#ifdef _WIN32`/`#ifndef _WIN32` switches in two public headers.** [HIGH] `libutil/include/nix/util/file-system.hh` has seven such switches; `file-descriptor.hh` has seventeen across `Descriptor`, `INVALID_DESCRIPTOR`, `toDescriptor`, `Pipe::create`, the entire `nix::unix` block, and `lseek`. Each header declares two parallel APIs.
+    - ../verified/01-libutil-io.md, ../verified/04-libutil-misc.md
+    - **Validation:** PARTIALLY VALID. **Correction:** actual count is ~19 (12 in `file-descriptor.hh`, 7 in `file-system.hh`), not ~24. A header reorg into `file-descriptor-{common,unix,windows}.hh` is the right shape. Effort: medium.
+
+165. **`DerivationOutputs` typedef is duplicated between `derivations.hh` and `parsed-derivations.hh`.** [HIGH] Both `libstore/include/nix/store/derivations.hh` and `libstore/include/nix/store/parsed-derivations.hh` write `typedef std::map<std::string, DerivationOutput> DerivationOutputs;` verbatim. `parsed-derivations.hh` separately forward-declares `struct DerivationOutput;` to avoid pulling in `derivations.hh`. Either `parsed-derivations.hh` should include `derivations.hh` (the typedef has no point without the type), or the typedef should be hoisted into a small `derivation-output-fwd.hh`. Today, modifying the alias requires editing both files in lockstep.
+    - **Validation:** VALID. Effort: trivial.
+
+166. **`struct Source;` / `struct Sink;` / `class Store;` / `class EvalState;` are forward-declared in 14+ headers.** [HIGH] `Source`/`Sink` are forward-declared in `libutil/include/nix/util/file-system.hh`, `file-descriptor.hh`, `processes.hh`, `nar-accessor.hh`, `source-accessor.hh`, plus `libstore/include/nix/store/derivations.hh`, `common-protocol.hh`, `worker-protocol.hh`, `serve-protocol.hh`. `class Store;` is forward-declared in `filetransfer.hh`, `parsed-derivations.hh`, `path-info.hh`, `derivations.hh` (twice — once near the top, once before the `Source`/`Sink` block), `realisation.hh`, `store-api.hh`, `path-with-outputs.hh`, `machines.hh`, `derivation-building-misc.hh`, `derivation-env-desugar.hh`, and `libexpr/include/nix/expr/eval.hh`. A single `libutil/include/nix/util/serialise-fwd.hh` (with `struct Source; struct Sink;`) and `libstore/include/nix/store/store-fwd.hh` (with `class Store;`) consumed by the relevant headers would let each forward-decl appear once.
+    - **Validation:** PARTIALLY VALID. **Correction:** the actual count is ~36 unique headers (9 Source/Sink, 19 Store, 12 EvalState), not "14+". The mechanism stands and is well worth doing. Effort: medium.
+
+167. **Buffer sizes of 65536 bytes appear at four unrelated sites with no shared constant.** [MEDIUM] `Source::drainInto` (in `libutil/serialise.cc`) uses `std::array<char, 65536>`; `libutil/tarfile.cc` defines `constexpr auto defaultBufferSize = std::size_t{65536};` and a separate raw-block `std::vector<unsigned char> buf(128 * 1024)`; `PosTable` (in `libutil/include/nix/util/pos-table.hh`) defaults `linesCacheCapacity = 65536`; `BufferedSink`/`BufferedSource` (in `libutil/include/nix/util/serialise.hh`) default `bufSize = 32 * 1024`; `libutil/compression.cc` uses a `32 * 1024` `outbuf` array. The page-size-derived choice ("multiple of 4 KiB", "fits in L1") is conjectural at every site. A `nix/util/buffer-sizes.hh` collecting `kIoBufferSize`, `kBufferedSinkSize`, `kTarRawBufferSize`, `kCompressionOutBufSize`, `kPosTableLinesCacheSize`, `kNarMaxDepth` would replace ~12 scattered literals and document each rationale once.
+    - ../verified/01-libutil-io.md
+    - **Validation:** VALID. Effort: small.
+
+168. **Cache schema versions are inconsistently named: `binary-cache-v8`, `eval-cache-v6`, `fetcher-cache-v4`, `tarball-cache-v2`, `nixSchemaVersion = 10`, `expectedJsonVersionDerivation = 4`.** [MEDIUM] Each is a `static const`, `constexpr unsigned`, or string literal at its individual site. The naming is ad hoc — none are colocated in a shared "cache-versions.hh" — and the upgrade path is implicit. A `cache-versions.hh` with `constexpr auto kBinaryCacheSchema = 8;` plus a constexpr-formatted filename would make every bump a single-line patch.
+    - ../verified/05-libstore-core.md, ../verified/08-libstore-remote.md, ../verified/11-libexpr-eval.md, ../verified/14-libfetchers.md
+    - **Validation:** VALID. Compounds with #201 (PRAGMA user_version proposal). Effort: small.
+
+169. **`EvalState` declares 13 `friend` types/functions to grant access to `mem`, `symbols`, and per-Expr-kind helpers.** [DESIGN] `libexpr/include/nix/expr/eval.hh` declares `friend struct ExprVar; friend struct ExprAttrs; friend struct ExprLet; friend struct ExprOpUpdate; friend struct ExprOpConcatLists; friend struct ExprString; friend struct ExprInt; friend struct ExprFloat; friend struct ExprPath; friend struct ExprSelect; friend void prim_getAttr(...); friend void prim_match(...); friend void prim_split(...); friend struct Value; friend class ListBuilder;`. The friendship is gratuitous: every `Expr*` only needs to call `state.eval`/`state.callFunction` and to read `state.mem` / `state.symbols`. Promoting `mem` and `symbols` to public `const`-accessor methods (or moving the per-Expr eval bodies onto `EvalState` itself) would remove all 10 `Expr*` friend lines.
+    - ../verified/11-libexpr-eval.md, ../verified/12-libexpr-parse.md
+    - **Validation:** PARTIALLY VALID. **Corrections:** actual count is **17** friend declarations (with one duplicate `friend struct ExprVar` — see #217), not 13. The mechanism claim is wrong: `mem` and `symbols` are **already public**. The friend declarations are redundant for that access. Effort: medium.
+
+170. **`Worker` is `friend` of all four concrete `Goal` subclasses, but the friendship is only used to call private constructors.** [MEDIUM] `libstore/include/nix/store/build/derivation-resolution-goal.hh`, `derivation-building-goal.hh`, `drv-output-substitution-goal.hh`, and `worker.hh` (on the inner `Waker`/event types) each declare `friend class Worker;`. Each goal also has a private constructor invoked from `Worker::makeGoal`/`makeXxxGoal` factories. Moving the factories onto each `Goal` subclass as `static ref<Xxx> make(Worker &, ...)` plus passing `Worker &` as a constructor argument would eliminate every `friend class Worker` and let each goal be constructed in tests without instantiating a `Worker`.
+    - ../verified/10-libstore-build.md
+    - **Validation:** VALID. Falls out of #150/#151 naturally. Effort: small.
+
+171. **`Strings = std::list<std::string>` is the canonical "string list" alias and is the wrong container in the hot CLI/settings path.** [MEDIUM] `libutil/include/nix/util/types.hh` defines `typedef std::list<std::string> Strings;`; `os-string.hh` defines a parallel `OsStrings = std::list<OsString>`. `std::list` is the worst container for sequential token-stream access. Switching `Strings` to `std::vector<std::string>` removes a heap allocation per token; the only behavioural change is iterator-stability semantics that no caller relies on.
+    - ../verified/02-libutil-data.md, ../verified/03-libutil-runtime.md
+    - **Validation:** PARTIALLY VALID. **Correction:** "no caller relies on" is **wrong** — `OsStrings` splice is used twice in `ssh.cc`, plus three other splice sites (`args.cc`, `source-accessor.cc`, `lru-cache.hh`). `std::vector` has no `splice`; migration must rewrite each call as `insert(end(), make_move_iterator(...), ...)` or restructure to avoid the move. Effort: medium.
+
+172. **`unreachable()` is invoked in 25+ switch statements; at least one is reachable from runtime input.** [MEDIUM] Sample classification of five sites: `attrs.cc` in libfetchers (after `std::visit` over an `Attr` variant — exhaustive, dead, both occurrences); the post-debugger-`switch` on `ReplExitStatus` in `EvalState::runDebugRepl` (latent crash on enum extension because `default:` falls through to `unreachable()`); the post-`std::visit` over `Expr*` in `EvalState::callFunction` (exhaustive, dead); the inner-`switch` over user-typed REPL command in `NixRepl::processLine` (the `unreachable()` follows a `default:` that already throws, so dead); the `local-fs-store.cc` test helper (dead). The latent-crash variant in `runDebugRepl` should become `throw EvalError("unsupported repl exit status %d", exitStatus)`. The four dead `unreachable()` calls should become `std::unreachable()` (C++23 is enabled).
+    - ../verified/13-libexpr-primops.md, ../verified/11-libexpr-eval.md
+    - **Validation:** PARTIALLY VALID. **Correction:** actual count is **64 sites**, not "25+". **Critical caveat:** replacing `nix::unreachable()` with `std::unreachable()` is **not** a free swap — `std::unreachable()` is UB; the existing `nix::unreachable` panics with a diagnostic. Keep the helper for any reachable path; only swap the dead-after-exhaustive-switch sites. Effort: small per site.
+
+173. **`#pragma GCC diagnostic ignored "-Wswitch-enum"` is suppressed at eight sites, all to silence intentional non-exhaustive switches.** [MEDIUM] In `libflake/flake.cc` (around `LookedUp`/`Resolved` flake-input dispatch), `libcmd/include/nix/cmd/command.hh` (`-Woverloaded-virtual`, see CANDIDATES #31), `libexpr/lexer.l` (twice, including a `-Wimplicit-fallthrough`), `libexpr/eval.cc` (twice, around `nValueType` exhaustion), `libexpr/primops.cc` (twice, around `nValueType`), `libexpr/parser.y` (around the start-rule alternative dispatch), `libstore/filetransfer.cc` (around the `CURLE_*` enum), and `libstore/build-result.cc` (around the `BuildResult::Status` enum).
+    - ../verified/12-libexpr-parse.md, ../verified/13-libexpr-primops.md, ../verified/15-libflake-libmain.md, ../verified/16-libcmd.md
+    - **Validation:** PARTIALLY VALID. **Correction:** actual count is **10** total pragma sites (8 `-Wswitch-enum`, 1 `-Woverloaded-virtual`, 1 `-Wimplicit-fallthrough`); `lexer.l` has 1 not 2. Effort: small per site.
+
+174. **`HAVE_*` autoconf-style macros encode an unstated build-matrix assumption.** [DESIGN] Many `HAVE_*` configure-style probes (`HAVE_LIBCPUID`, `HAVE_LOWDOWN`, `HAVE_LOWDOWN_3`, `HAVE_LOWDOWN_1_4`, `HAVE_SECCOMP`, `HAVE_LANDLOCK`, `HAVE_PUBSETBUF`, `HAVE_POSIX_FALLOCATE`, `HAVE_TOML11_4`, `HAVE_OPENAT2`, `HAVE_FCHMODAT2`, `HAVE_STATVFS`, `HAVE_PIPE2`, `HAVE_SYSCONF`, `HAVE_STRSIGNAL`, `HAVE_UTIMENSAT`, `HAVE_DECL_AT_SYMLINK_NOFOLLOW`, plus `NIX_USE_BOEHMGC`, `NIX_WITH_AWS_AUTH`, `NIX_SUPPORT_ACL`, `BLAKE3_USE_TBB`, `CAN_LINK_SYMLINK`). With the actual support matrix (Linux, macOS, FreeBSD on glibc-or-newer + clang16+ + meson), at least `HAVE_PIPE2`, `HAVE_PUBSETBUF`, `HAVE_SYSCONF`, `HAVE_STRSIGNAL`, `HAVE_UTIMENSAT`, `HAVE_DECL_AT_SYMLINK_NOFOLLOW`, `HAVE_POSIX_FALLOCATE`, and `HAVE_STATVFS` are always-on. Auditing each macro and inlining the always-on branch would remove ~8 dead fallback paths.
+    - ../verified/03-libutil-runtime.md, ../verified/04-libutil-misc.md, ../verified/07-libstore-local.md
+    - **Validation:** PARTIALLY VALID. **Corrections:** the original list mentioned `HAVE_LIBARCHIVE` which doesn't exist in tree. Missed: `HAVE_F_GETPATH`, `HAVE_LUTIMES`, `HAVE_CLOSE_RANGE`, `HAVE_EMBEDDED_SANDBOX_SHELL`. Also: "shrink `meson.options`" is misframed — these are in per-target `meson.build` `cc.has_*` probes, not `meson.options`. Audit the actual support matrix per probe. Effort: medium.
+
+175. **`Bindings` declares `BindingsBuilder` as friend, plus an inner-class friend chain that spans four levels.** [MEDIUM] `libexpr/include/nix/expr/attr-set.hh` declares `friend class BindingsBuilder;` on `Bindings`; `friend class Bindings;` on the inner `iterator::BindingsCursor` cursor type; `friend class EvalMemory;` on two helper types; and `friend struct ExprAttrs;` on `BindingsBuilder`. The chain (`ExprAttrs` → `BindingsBuilder` → `Bindings` → `iterator::BindingsCursor`) exists because `Bindings` uses a flexible-array member (`Attr attrs[0];`) that can only be sized at allocation time, forcing `BindingsBuilder` to placement-new from outside. A `Bindings::create(EvalMemory &, std::span<Attr>)` static factory would let `BindingsBuilder` be a plain client and remove three of the four friend lines.
+    - ../verified/12-libexpr-parse.md
+    - **Validation:** PARTIALLY VALID. **Correction:** actual is 5 friend lines across 3 levels; **no friend on `BindingsCursor`**. The factoring proposal still works. Effort: medium.

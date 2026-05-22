@@ -295,214 +295,24 @@ In [verified/19-c-bindings-misc.md](verified/19-c-bindings-misc.md):
 
 ## Consolidated duplication and refactoring candidates
 
-Numbered, prioritised list of refactoring opportunities surfaced by the
-per-shard verified docs. Pointers identify the shards where the relevant
-code lives.
-
-### Duplicated wire / serialisation logic
-
-1. **`BuildResult` serialiser duplicated across worker and serve protocols.** Both `WorkerProto::Serialise<BuildResult>` and `ServeProto::Serialise<BuildResult>` are near-byte-identical (same status / errorMsg / timing / builtOutputs sequence, only the version-cutoff literals differ — worker uses `{1,29}`/`{1,37}`/feature `realisation-with-path-not-hash`/`{1,28}`; serve uses `{2,3}`/`{2,8}`/`{2,6}`). Worker has an extra cpu-timing branch and a feature gate; serve does not. The shared `common = [&](errorMsg, isNonDeterministic, builtOutputs) { ... }` lambda is duplicated almost verbatim. The single biggest refactor target in the protocol layer.
-   - verified/09-libstore-protocol.md
-2. **`UnkeyedValidPathInfo` serialiser duplicated across worker and serve protocols.** Both protocols hand-roll the deriver/refs/narHash/narSize/sigs/ca format with cosmetic differences: worker uses `Serialise<std::optional<StorePath>>` for the deriver; serve uses an empty-string sentinel inline; worker uses Base16 narHash without prefix; serve uses Nix32 narHash with prefix; serve emits narSize twice (the second as the obsolete "downloadSize"); worker emits an `ultimate` flag, serve does not.
-   - verified/09-libstore-protocol.md
-3. **`DrvOutput`/`UnkeyedRealisation`/`Realisation` serialisers identical between worker and serve.** Each pair is byte-identical except for the version-gate (`featureRealisationWithPath` for worker, `>= 2.8` for serve). Obvious candidate for promotion to `CommonProto` once a way to thread the per-protocol gate through is found.
-   - verified/09-libstore-protocol.md
-4. **Length-prefixed container serialiser macros are three near-identical copies.** `WORKER_USE_LENGTH_PREFIX_SERIALISER`, `SERVE_USE_LENGTH_PREFIX_SERIALISER`, and `COMMON_USE_LENGTH_PREFIX_SERIALISER` each emit `Serialise<vector<T>>`/`Serialise<set<T>>`/`Serialise<tuple<Ts...>>`/`Serialise<map<K,V>>` specialisations delegating to `LengthPrefixedProtoHelper<Proto, T>`. The macros could be a single template parametrised on the protocol struct.
-   - verified/09-libstore-protocol.md
-5. **`DECLARE_*_SERIALISER` declaration macros are three near-identical copies.** `DECLARE_COMMON_SERIALISER`, `DECLARE_WORKER_SERIALISER`, `DECLARE_SERVE_SERIALISER` differ only in the namespace prefix on `Serialise<T>` and (cosmetically) in the parameter name. Same shape as #4.
-   - verified/09-libstore-protocol.md
-6. **`GET_PROTOCOL_MAJOR`/`GET_PROTOCOL_MINOR` macros duplicated.** Defined identically in both `worker-protocol.hh` and `serve-protocol.hh` (`(x) & 0xff00` and `(x) & 0x00ff`). Including both headers in the same TU works only because the second `#define` produces an identical token sequence.
-   - verified/09-libstore-protocol.md
-7. **Protocol handshake logic is parallel between worker and serve.** `WorkerProto::BasicClientConnection::handshake` and `ServeProto::BasicClientConnection::handshake` both send magic-1, read magic-2, exchange version numbers, take the min. Worker additionally exchanges and intersects a `FeatureSet` (≥1.38) via private `intersectFeatures`; serve has no such step. Server-side mirrors are likewise parallel.
-   - verified/09-libstore-protocol.md
-8. **Three encoders for the same `<algo>:<base>` shape.** `Hash::to_string`/`Hash::parseAny*` use `<algo>:<base*>` (and SRI `<algo>-<base64>`); `Signature` and `Key` use `<name>:<base64>` via the anon-namespace `parseColonBase64`/`serializeColonBase64`. Each module rolls its own. A shared "colon-prefixed Base-N" helper would consolidate these.
-   - verified/02-libutil-data.md
-9. **JSON adl_serializer scaffolding is split across multiple files.** `json-impls.hh` provides the macros, `json-non-null.hh` provides the `json_avoids_null<T>` trait, `json-utils.hh` provides accessor helpers and the generic `adl_serializer<std::optional<T>>`, `abstract-setting-to-json.hh` provides `BaseSetting<T>::toJSONObject`. Each consumer (`hash.cc`, `compression-settings.cc`, `signature/local-keys.cc`, plus most files in shard 05) writes near-identical adl_serializer boilerplate.
-   - verified/02-libutil-data.md, verified/05-libstore-core.md
-10. **`dumpPath`/`restorePath` overload sets scattered across compilation units.** `archive.hh/.cc` exposes `dumpPath(path, Sink, PathFilter)` plus `dumpPathAndGetMtime`; `source-path.hh/.cc` adds `SourcePath::dumpPath`; `source-accessor.hh/.cc` adds `SourceAccessor::dumpPath` (the actual NAR algorithm); `file-content-address.hh/.cc` adds method-dispatched `dumpPath(SourcePath, Sink, FileSerialisationMethod, PathFilter)`. Same shape for `restorePath`. No single header documents the relationship.
-   - verified/01-libutil-io.md
-
-### Parallel store implementations
-
-11. **`LocalOverlayStore` repeats "try upper, fall through to lower" pattern in seven methods.** `queryPathInfoUncached`, `queryRealisationUncached`, `isValidPathUncached`, `queryPathFromHashPart`, `queryReferrers`, `queryValidDerivers`, plus `registerDrvOutput`/`registerValidPaths` (with copy-up). The two callback variants build a chained continuation through `Callback`/captured `callbackPtr`; the synchronous variants short-circuit on the upper hit. A helper for the synchronous shape would consolidate four functions.
-    - verified/07-libstore-local.md
-12. **Three "store wrapper" implementations with no shared abstract base.** `LocalOverlayStore` (delegating to `lowerStore`), `RestrictedStore` (delegating to `next`), `DummyStoreImpl` (no delegation; in-memory). Each redeclares large portions of the `Store` virtual surface. A "DelegatingStore" CRTP or non-virtual base would deduplicate.
-    - verified/07-libstore-local.md
-13. **Binary-cache subclasses duplicate the upsertFile/fileExists/getFile triple.** `LocalBinaryCacheStore`, `HttpBinaryCacheStore`, `S3BinaryCacheStore` each provide their own implementation, but the surrounding logic is mostly cloned: build paths from URL, wrap errors as a per-store `MakeError(UploadTo*)`, handle `NotFound`/`Forbidden` specifically. `HttpBinaryCacheStore::upsertFile` and `S3BinaryCacheStore::upsertFile` share an identical "if compress then compress + Content-Encoding else dispatch upload" skeleton.
-    - verified/08-libstore-remote.md
-14. **`RemoteFSAccessor` constructed identically by `RemoteStore::getRemoteFSAccessor` and `BinaryCacheStore::getRemoteFSAccessor`.** Both pass the `requireValidPath` flag; only difference is `BinaryCacheStore` plumbs through `config.localNarCache`. The corresponding `getFSAccessor` overrides are mechanical wrappers in both. ~10 lines could move into `Store`.
-    - verified/08-libstore-remote.md
-15. **`UDSRemoteStore` and `MountedSSHStore` mix `RemoteStore` with `LocalFSStore` identically.** Both override `getFSAccessor`/`narFromPath` with the same delegate-to-`LocalFSStore` calls. The only meaningful divergence is the GC-root strategy: `UDSRemoteStore` sends `WorkerProto::Op::AddIndirectRoot`; `MountedSSHStore` sends `WorkerProto::Op::AddPermRoot`.
-    - verified/08-libstore-remote.md
-16. **Three SSH-store classes share `CommonSSHStoreConfig` but each rolls its own `Connection`.** `LegacySSHStore::Connection`, `SSHStore::Connection`, and the worker-proto `Connection` inside `RemoteStore` each carry a `unique_ptr<SSHMaster::Connection> sshConn` and pipe wiring. `LegacySSHStore` reimplements its own `Pool<Connection>`, `connect`, `flushBadConnections`-equivalent (`good` flag), and stat reporting (`getConnectionStats`/`getConnectionPid`) instead of leveraging `RemoteStore`.
-    - verified/08-libstore-remote.md
-
-### Repeated boilerplate
-
-17. **`anchor()` vtable-pinning override appears in twelve+ classes.** Every class with virtual functions in the libstore shards defines a private out-of-line `void anchor() override {}` whose only purpose is to pin the vtable. Used in `StoreConfig`, `Store`, `LocalStoreConfig`, `LocalBuildStoreConfig`, `LocalStore`, `LocalFSStoreConfig`, `LocalFSStore`, `LocalOverlayStoreConfig`, `LocalOverlayStore`, `IndirectRootStore`, `GcStore`, `LogStore`, `DummyStoreConfig`, `DummyStore`, `DummyStoreImpl`, `RestrictedStore`, `RemoteStoreConfig`, `RemoteStore`, `UDSRemoteStoreConfig`, `UDSRemoteStore`, `BinaryCacheStoreConfig`, `BinaryCacheStore`, `LocalBinaryCacheStoreConfig`, `LocalBinaryCacheStore`, `HttpBinaryCacheStoreConfig`, `HttpBinaryCacheStore`, `SSHStoreConfig`, `SSHStore`, `MountedSSHStoreConfig`, `MountedSSHStore`, `LegacySSHStoreConfig`, `LegacySSHStore`, `CommonSSHStoreConfig`, `S3BinaryCacheStore`. A macro or CRTP could eliminate this entirely.
-    - verified/05-libstore-core.md, verified/07-libstore-local.md, verified/08-libstore-remote.md
-18. **`MakeError(name, parent)` macro coexists with hand-written `CloneableError<Derived,Parent>` derivations.** Most error types use the macro; a handful (`ExecError`, `MissingExperimentalFeature`, `BuildError`, `BuilderFailureError`, `MissingRealisation`, `AwsAuthError`, `FileTransferError`, `InvalidSSHAuthority`, `NotDeterministic`, `BuildEnvFileConflictError`, `TimedOut`, `curlMultiError`, `SymlinkNotAllowed`, `SQLiteError`) bypass the macro to add fields. A CRTP base could subsume both styles. The `SystemError`/`SysError`/`WinError` triad's `DisambigHintFmt`/`DisambigVarArgs` tag idiom is similarly replicated.
-    - verified/03-libutil-runtime.md, verified/04-libutil-misc.md
-19. **`Setting<T>{this, default, name, R"(doc)", aliases, xpFeature}` initialisers dominate `*Config` boilerplate.** Every store config and settings struct uses this same shape; explicit instantiations for each `T` are scattered across many files. A small flag-builder DSL or constexpr table would shrink the source dramatically, especially in `LocalSettings`, `Settings`, `RemoteStoreConfig`, `BinaryCacheStoreConfig`, `HttpBinaryCacheStoreConfig`, `S3BinaryCacheStoreConfig`, `WorkerSettings`, `flake::Settings`, the `Mix*` command tower.
-    - verified/03-libutil-runtime.md, verified/07-libstore-local.md, verified/08-libstore-remote.md, verified/09-libstore-protocol.md, verified/16-libcmd.md
-20. **`MAKE_WRAPPER_CONSTRUCTOR(T)` + `Raw raw` member + visit-with-overloaded idiom appears for every variant-shaped type.** `ContentAddressMethod`, `ContentAddressWithReferences`, `OutputsSpec`, `ExtendedOutputsSpec`, `SingleDerivedPath`/`DerivedPath`, `RealisedPath`, `StorePathWithOutputs::ParseResult`, `StoreReference::Variant`, `BuildResult::inner`, `DrvRef<Item>`, `DerivationOutput::Raw`, `DerivationType::Raw`, `DrvHashModulo::Raw`. Each pair re-defines `==`, `to_string`, and `parse` symmetrically. A tagged-union helper would consolidate.
-    - verified/05-libstore-core.md, verified/06-libstore-derivations.md
-21. **`Setting<T>` BaseSetting specialisations have a four-times-cut-and-pasted shape.** Each specialisation declares `BaseSetting<T>::trait`, defines `parse`/`to_string`, and (for collections) `appendOrSet`. Repeated for `SandboxMode`, `PathsInChroot`, `LocalSettings::ExternalBuilders`, `StoreReference`, `std::vector<StoreReference>`, `std::set<StoreReference>`, `CompressionAlgo`, `std::optional<CompressionAlgo>`, `S3AddressingStyle`, `Diagnose`. There is no shared template for "tokenise-list setting" or "JSON-roundtripping setting".
-    - verified/02-libutil-data.md, verified/07-libstore-local.md, verified/08-libstore-remote.md, verified/11-libexpr-eval.md
-22. **Async/sync pair pattern.** `Store::queryPathInfo` and `Store::queryRealisation` each have a synchronous `promise/future` wrapper around a `Callback`-based async variant; the wrapper code is structurally identical and could be factored into a helper template that turns any async callback into a blocking call.
-    - verified/05-libstore-core.md
-23. **`unsupported(...)` is used as a default for many virtuals.** `Store::queryAllValidPaths`, `Store::queryReferrers`, `Store::addSignatures`, plus the `*::repairPath` and most overrides in `RestrictedStore` and `LegacySSHStore`. This is a workaround in lieu of pure-virtual + capability traits; explicit feature negotiation would be cleaner.
-    - verified/05-libstore-core.md
-24. **`registerCommand<...>` boilerplate is uniform across 30+ command files.** Every modern `nix` command file ends with `static auto rXxx = registerCommand<CmdXxx>("xxx")`, with naming irregular (`rCmdXxx`, `r2`, `rFormatterRun`, `rShowConfig`, etc.). The legacy bridges follow the same template via `RegisterLegacyCommand`. A macro encoding name + class + category could shrink each file by several lines.
-    - verified/17-nix-modern-1.md, verified/18-nix-modern-2-legacy.md
-25. **`doc()` overrides include a per-command `*.md` (or `*.md.gen.hh`) via `#include`.** Every command does `return ` `#include "name.md"` `;`. Stable but heavy boilerplate.
-    - verified/17-nix-modern-1.md, verified/18-nix-modern-2-legacy.md
-
-### Per-platform symmetry
-
-26. **`pathlocks` Unix vs Windows.** `lockPaths` (sorted iteration, retry on stale lock detected by `<file>.lock` not being empty) and `FdLock`'s constructor (try non-blocking, then blocking with `printInfo(waitMsg)`) are duplicated almost verbatim between `unix/pathlocks.cc` and `windows/pathlocks.cc`. Differences are confined to `flock` vs `LockFileEx` and the test for "lock file became stale" (`fstat().st_size` vs `getFileSize`). Could share a generic skeleton with platform shims for `openLockFile`/`lockFile`/`isStale`.
-    - verified/07-libstore-local.md
-27. **File-system / file-descriptor / processes per-platform implementations parallel each other.** `unix/file-system.cc` vs `windows/file-system.cc`; `unix/file-descriptor.cc` vs `windows/file-descriptor.cc`; `unix/processes.cc` vs `windows/processes.cc`; `unix/environment-variables.cc` vs `windows/environment-variables.cc`; `unix/users.cc` vs `windows/users.cc`. Each pair declares the same logical API but with different signatures (Windows takes wide strings as `OsString`; `Pipe::create` has no `nonBlocking` parameter on Windows; `MuxablePipePollState::poll` takes an extra `HANDLE ioport` on Windows; `Pid` holds a `pid_t` on Unix and an `AutoCloseFD` on Windows).
-    - verified/04-libutil-misc.md
-28. **Goal builders by platform form a diamond hierarchy.** `DerivationBuilderImpl` is the unix base; `ChrootDerivationBuilder` is the Linux/FreeBSD shared chroot fragment; `LinuxDerivationBuilder`/`FreeBSDDerivationBuilder` are the platform-specific siblings; `ChrootLinuxDerivationBuilder`/`ChrootFreeBSDDerivationBuilder` are the diamond merges; `DarwinDerivationBuilder` and `ExternalDerivationBuilder` sit beside as siblings. Many overrides (`setBuildTmpDir`, `tmpDirInSandbox`, `prepareSandbox`, `enterChroot`, `setUser`, `startChild`, `cleanupBuild`, `killSandbox`, `getBuildUser`) follow a pattern of "base then platform-specific suffix" that could be expressed as separable strategy hooks.
-    - verified/10-libstore-build.md
-29. **XDG dirs (Unix) vs known folders (Windows).** `nix::unix::xdg::getCacheHome`/`getConfigHome`/`getConfigDirs`/`getDataHome`/`getStateHome` parallel `nix::windows::known_folders::getLocalAppData`/`getRoamingAppData`/`getProgramData`. The wrapping `getCacheDir`/`getConfigDir`/... in `users.cc` switches on `_WIN32` per call. A platform-conditional table would be cleaner.
-    - verified/03-libutil-runtime.md, verified/04-libutil-misc.md
-
-### Inheritance chains worth flattening
-
-30. **`Installable` chain (Installable → InstallableValue → InstallableAttrPath / InstallableFlake; InstallableDerivedPath sibling).** The two leaves' `toDerivedPaths` perform the same `ExtendedOutputsSpec` visit (`Default` synthesises `outputsToInstall` then defaults to `{"out"}`; `Explicit` returns the spec verbatim) and the same `trySinglePathToDerivedPaths` short-circuit. Extracting an `outputsSpecFromExtended` helper plus a templated `InstallableValue` method would deduplicate.
-    - verified/16-libcmd.md
-31. **Command `run` chain (StoreConfigCommand → StoreCommand → BuiltPathsCommand → StorePathsCommand → StorePathCommand).** Each step does nothing more than narrow the type via virtual `run` overloads. The chain is fragile to GCC's `-Woverloaded-virtual` warning (suppressed by a pragma in `command.hh`). A templated CRTP-style narrowing would flatten it.
-    - verified/16-libcmd.md
-32. **`InputScheme` hierarchy with eight schemes and significant per-scheme rewrite.** Every scheme registers itself at startup via `static auto rXxx = OnStartup([] { registerInputScheme(make_unique<XxxInputScheme>()); });` (the same idiom verbatim across all eight). Every scheme reimplements URL parsing, attribute strip+re-emit, cache-key construction, fingerprint computation. A `BaseInputScheme<T>` CRTP with `urlGrammar`, `cacheKeyDomain`, etc. would replace much of the duplication.
-    - verified/14-libfetchers.md
-33. **`Goal` hierarchy (six concrete goal types).** Common shape across all six: `init`/`gaveUpOnSubstitution`/`tryToBuild`/etc. coroutines, `key` override, `jobCategory` override, `doneSuccess`/`doneFailure` book-keeping calling `worker.doneBuilds++` etc., `MaintainCount<uint64_t>` counter handles. `DerivationGoal::doneSuccess` and `DerivationBuildingGoal::doneSuccess` share their body verbatim with only the counter handle name differing.
-    - verified/10-libstore-build.md
-34. **`DerivationBuilder` diamond (see #28).** A more disciplined strategy/policy split (cgroup strategy vs jail strategy vs sandbox-init strategy, plus a separate "needs hash rewrite" trait) would let a single `UnixDerivationBuilder` be parameterised on the platform pieces.
-    - verified/10-libstore-build.md
-35. **`Store` hierarchy with seven concrete stores (LocalStore, LocalOverlayStore, DummyStore, RestrictedStore, RemoteStore, UDSRemoteStore, BinaryCacheStore + 3 leaves, SSHStore + 1 leaf, LegacySSHStore).** Many concrete stores are "thin override + delegate" or "diamond merge" classes. There is no shared "DelegatingStore" or "FSAccessorStore" base. See #11, #12, #14, #15.
-    - verified/05-libstore-core.md, verified/07-libstore-local.md, verified/08-libstore-remote.md
-
-### Multi-implementation patterns that could share a base
-
-36. **Four parallel value renderers.** `Printer::print` (`print.cc`), `printAmbiguous` (`print-ambiguous.cc`), `printValueAsJSON` (`value-to-json.cc`), `printValueAsXML` (`value-to-xml.cc`), plus the AST-side `Expr::show` (`nixexpr.cc`). All five share: `state.forceValue` (or check `force`/`strict` option), `state.settings.maxCallDepth` / `addCallDepth(...)` recursion guard, recursion with a per-printer `seen`/`drvsSeen`/`Done` set, derivation special-casing (`state.s.drvPath` / `state.isDerivation`), per-`nValueType` switch. A shared visitor scaffold could leave each printer implementing only per-type emission.
-    - verified/12-libexpr-parse.md
-37. **NAR-tree walkers in three places.** `NarAccessorImpl::find/get` (in `nar-accessor.cc`), `NarIndexer::createMember` (in `nar-listing.cc`), `MemorySourceAccessor::open` (in `memory-source-accessor.cc`). All walk a path, descend into the `Directory` variant, and either find or insert. A generic helper over `fso::VariantT` could replace all three.
-    - verified/01-libutil-io.md
-38. **Source/Sink wrapper hierarchy with many parallel one-shot adapters.** `TeeSink`/`TeeSource`, `LengthSink`/`LengthSource`, `LambdaSink`/`LambdaSource`, `SizedSource`, `EnsureRead`, `ChainSource`. Written one-by-one; a base or generator could reduce repetition.
-    - verified/01-libutil-io.md
-39. **`MemorySink`/`RestoreSink` parallel `FileSystemObjectSink` impls.** Both implement essentially the same `FileSystemObjectSink` interface plus their own `CreateRegularFileSink` subclass for byte streams (`RestoreRegularFile` and `CreateMemoryRegularFile`). The bytes-callback boilerplate could be factored.
-    - verified/01-libutil-io.md
-40. **Wrapping source accessors clear `displayPrefix` and chain `showPath`/`getPhysicalPath`/`invalidateCache` near-identically.** `UnionSourceAccessor`, `MountedSourceAccessorImpl`, `CachingSourceAccessor` all redo this in their constructors. Their `getFingerprint` implementations diverge: caching is a passthrough; mounted/union apply "own fingerprint else delegate". A `WrappingSourceAccessor` base could absorb all three.
-    - verified/01-libutil-io.md
-41. **Logger fan-out duplication.** `SimpleLogger`, `JSONLogger`, `TeeLogger` independently implement `startActivity`/`stopActivity`/`result`/`log`/`logEI`/`writeToStdout`/`ask`/`setPrintBuildLogs`. A common base or visitor would deduplicate.
-    - verified/03-libutil-runtime.md
-42. **`Config`/`GlobalConfig` plumbing duplication.** `Config::set`/`getSettings`/`toJSON`/`toKeyValue`/`convertToArgs` and `GlobalConfig::set`/`getSettings`/`toJSON`/`toKeyValue`/`convertToArgs` follow identical loop shapes (one subtle behaviour difference in `toKeyValue`: `Config` only emits aliases; `GlobalConfig` calls `globalConfig.getSettings(...)` and emits all entries). A CRTP base or composition would let `GlobalConfig` simply iterate registered configs.
-    - verified/03-libutil-runtime.md
-43. **X-macro setting list.** The `BaseSetting<T>` template-specialisation pattern (`parse`, `to_string`, `appendOrSet`, `convertToArg`, `trait::appendable`, `NIX_DECLARE_CONFIG_SERIALISER`, explicit `template class BaseSetting<...>` instantiations) is replicated for many `T` in `configuration.cc`. The list (`std::list<path>`, `Strings`, `StringSet`, `std::set<path>`, `std::set<ExperimentalFeature>`, `StringMap`, `AbsolutePath`, plus the per-store specialisations) plus the trait specialisations plus the macro plus the explicit instantiations form four near-parallel registers. A single X-macro list would collapse them.
-    - verified/03-libutil-runtime.md, verified/07-libstore-local.md
-44. **`BuildLog` and `LogSink` are similar line-buffering sinks.** `BuildLog` (in `build-log.{cc,hh}`) and `LogSink` (in `derivation-building-goal.cc`) both implement `Sink::operator()` as a line buffer that splits on `\n`. `BuildLog` adds JSON parsing, tail tracking, and `\r` carriage-return handling; `LogSink` is simpler. They could share a base.
-    - verified/10-libstore-build.md
-45. **Three NAR magic-prefixed switches.** `archive.cc` and `nar-listing.cc` independently implement near-identical switches over file-system-object types (regular/directory/symlink/...); `tarfile.cc` does the same over `archive_entry_filetype`. A unifying visitor over the tri-typed FSO tag would reduce repetition.
-    - verified/01-libutil-io.md
-46. **`builtinBuilders` family share a `RegisterBuiltinBuilder` registration pattern.** All three (`buildenv`, `fetchurl`, `unpack-channel`) follow the same shape: static function `void(const BuiltinBuilderContext &)` plus a file-scope `static RegisterBuiltinBuilder` instance. Each uses a local `getAttr` lambda for env-attribute lookup. The local lambda is a candidate for a shared helper.
-    - verified/10-libstore-build.md
-47. **`*Goal::doneSuccess`/`doneFailure` patterns.** Every `*Goal` defines a `doneSuccess`/`doneFailure` pair that drops `MaintainCount` handles, increments `worker.doneBuilds++` / `failedBuilds++`, calls `exitStatusFlags.updateFromStatus`, calls `updateProgress`, then forwards to `Goal::doneSuccess`/`doneFailure`. `DerivationBuildingGoal` and `DerivationGoal` share this pattern verbatim.
-    - verified/10-libstore-build.md
-
-### Dead or stale code
-
-48. **`void check();` in `lockfile.cc` is an unused forward declaration.** Inside `nix::flake` after `LockFile::check`'s definition; appears to be dead code.
-    - verified/15-libflake-libmain.md
-49. **`blockInt` and similar dead identifiers.** Worth a sweep through the verified shards for any declaration without matching uses.
-50. **`nix_value_incref`/`_decref` are pure forwarders to the generic `nix_gc_*` helpers.** Documented as the preferred typed API, but currently identical to the generic ones. The header comment notes a migration intent.
-    - verified/19-c-bindings-misc.md
-51. **`#if 0` blocks in `github.cc`.** The treeHash-mismatch warning inside `downloadArchive` and the treeHash output attribute inside `getAccessor` are commented out, hinting at unfinished tree-hash propagation.
-    - verified/14-libfetchers.md
-52. **`CurlInputScheme::specialParams` is declared but never defined or referenced.** Compiles only because nothing odr-uses it.
-    - verified/14-libfetchers.md
-53. **`getCustomRegistry` only honours the first call's path.** Memoises in a function-local static; later changes to the registry path are silently ignored.
-    - verified/14-libfetchers.md
-54. **`SQLiteSettings::useWAL` is declared without a default initialiser.** Each constructor of `SQLite` reads it; a constructor that doesn't set it is undefined behaviour.
-    - verified/07-libstore-local.md
-55. **Stale `IndexReferrer` index dropped at runtime.** The `20260309-drop-redundant-indexreferrer` migration in `LocalStore::upgradeDBSchema` cleans up a previous-version index. The matching `create index` is no longer in `schema.sql`.
-    - verified/07-libstore-local.md
-56. **`BaseSetting<PathsInChroot>::trait` lives in a different file from `BaseSetting<SandboxMode>::trait`.** The `PathsInChroot` trait is in `local-settings.hh`; `SandboxMode` is only in `globals.cc`. Inconsistent placement; one of them should move.
-    - verified/07-libstore-local.md
-57. **Macro hygiene caveats.** All three `*_USE_LENGTH_PREFIX_SERIALISER_COMMA` helpers (`WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA`, `SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA`) are `#define`d but never `#undef`'d in their respective impl headers, leaking into translation units. There is also a stray bare `#undef COMMA_` at the end of `common-protocol.hh` with no matching `#define` in scope.
-    - verified/09-libstore-protocol.md
-58. **`getMaxCPU` catches `Error` and routes through `ignoreExceptionInDestructor`, but it is not actually a destructor.** Should use `ignoreExceptionExceptInterrupt` per the `util.hh` comment.
-    - verified/03-libutil-runtime.md
-59. **`useBuildUsers` returns a function-local `static bool`.** Computed once and cached for the process lifetime; changes to `localSettings` after first call are not observed.
-    - verified/07-libstore-local.md
-60. **`SQLiteStmt::create` is called on `purgeCache` but the statement is never used.** In `NarInfoDiskCacheImpl::State`; the periodic purge runs ad-hoc inside the constructor against `LastPurge` rather than via the prepared statement.
-    - verified/08-libstore-remote.md
-
-### Duplicated parsers / regexes
-
-61. **Two regex stash points for git-style refs/revisions.** `url-parts.hh` declares `refRegexS`/`revRegexS`/`refAndOrRevRegex` with `extern std::regex refRegex`/`revRegex` defined in `url.cc`; `git.cc::parseLsRemoteLine` defines its own anonymous `std::regex line_regex`. The `line_regex` matches a different shape (whole ls-remote line) so a direct merge isn't possible, but a shared tokeniser would help.
-    - verified/02-libutil-data.md
-62. **URL vs flakeref vs url-name parsers all walk similar URL shapes.** `tryParseScpStyle` (URL), `parseFlakeRef`/`fromParsedURL`/`parsePathFlakeRefWithFragment`/`parseFlakeIdRef` (flakeref), `getNameFromURL` (url-name), per-`InputScheme` URL handling (fetchers). Five places probe `github|gitlab|sourcehut`-style schemes and the `<owner>/<repo>` path layout.
-    - verified/02-libutil-data.md, verified/14-libfetchers.md, verified/15-libflake-libmain.md
-63. **Path resolution rules sit in two parallel places in libexpr.** `path_start` in `parser.y` (handles absolute, relative, and `~/` paths with their lint diagnoses) and `EvalState::rootPath`/`storePath` in `paths.cc`. The relative-path computation `CanonPath(literal, basePath.path).abs()` has the same shape as `EvalState::rootPath(string_view)`.
-    - verified/12-libexpr-parse.md
-64. **`Formals` and `FormalsBuilder` independently implement `has(Symbol)`.** Two parallel containers exist for function formals: `FormalsBuilder` (`std::vector<Formal>` + ellipsis, used during parsing) and `Formals` (`std::span<Formal>` + ellipsis, used post-allocation). Both implement `has(Symbol)` independently with the same lower-bound predicate.
-    - verified/12-libexpr-parse.md
-65. **`primop_*` argument-validation boilerplate is heavily duplicated.** Almost every `prim_*` opens with `state.forceValue`/`forceAttrs`/`forceList`/`forceString`/`forceStringNoCtx`/`forceBool`/`forceInt`/`forceFloat`, each with a hand-written "while evaluating the Nth argument passed to builtins.<name>" message. Same shape ~hundreds of times. A `validateArg(state, n, primop_name, type)` helper would shrink the binary.
-    - verified/13-libexpr-primops.md
-66. **`prim_isNull` … `prim_isPath` (8 type-predicate primops, plus `prim_isAttrs`/`prim_isList`/`prim_isFunction`).** All identical except for the enum-tag they compare against. A registration macro or table-driven approach would remove the boilerplate.
-    - verified/13-libexpr-primops.md
-67. **Numeric primops (`__add`/`__sub`/`__mul`/`__div`).** Each one is the same template instantiated four times: forceValue both args, dispatch on `nFloat` else int, check overflow with `valueChecked()`, raise `EvalError` with a slightly different verb.
-    - verified/13-libexpr-primops.md
-68. **`prim_ceil` and `prim_floor` are byte-for-byte twins** (only `ceil(value)` vs `floor(value)` differs). The precision-loss/overflow blocks and the GitHub issue link are identical.
-    - verified/13-libexpr-primops.md
-
-### Cache-key construction scattered across modules
-
-69. **Per-fetcher `Cache::Key` schemas with no shared helper.** Each scheme builds `Cache::Key{<domain>, <attrs>}` ad hoc. Domains seen: `sourcePathToHash` (`fetch-to-store.cc`), `gitLastModified`/`gitRevCount` (`git.cc`), `gitRevToTreeHash`/`gitRevToLastModified` (`github.cc`), `treeHashToNarHash` (`git-utils.cc`), `hgRefToRev`/`hgRev` (`mercurial.cc`), `tarball`/`file` (`tarball.cc`). The `Cache` class is shared but each scheme picks its own attribute schema.
-    - verified/14-libfetchers.md
-70. **`makeSourcePathToHashCacheKey` is called from three places with slightly different shapes.** From `Input::getAccessorUnchecked`, `PathInputScheme::getAccessor`, and `fetch-to-store.cc`. They could share a helper.
-    - verified/14-libfetchers.md
-71. **NarInfoDiskCache key plumbing.** `lookupNarInfo`/`upsertNarInfo`/`upsertAbsentNarInfo` and `lookupRealisation`/`upsertRealisation`/`upsertAbsentRealisation` follow identical "TTL + present-bit + reconstruct" patterns. Could share a generic "TTL-cached lookup" base.
-    - verified/08-libstore-remote.md
-
-### Other distinct candidates
-
-72. **`getDefaultFlakeAttrPaths` / `getDefaultFlakeAttrPathPrefixes` is copy-pasted across modern commands.** The `apps.<system>.default` + `defaultApp.<system>` shape appears verbatim in `CmdRun` and `CmdBundle`; `Common` (develop) has the analogous `devShells.<system>.default` + `devShell.<system>`; `MixFormatter` returns `formatter.<system>`; `CmdSearch` returns `packages.<system>` + `legacyPackages.<system>`. Each command also re-walks `SourceExprCommand::getDefaultFlakeAttrPaths()` to merge in base prefixes. A small `MixFlakeAttrPaths` helper would deduplicate.
-    - verified/17-nix-modern-1.md
-73. **JSON-vs-text dual output paths in commands.** A dozen commands (`CmdPathInfo`, `CmdFlakeMetadata`, `CmdFlakeShow`, `CmdFlakePrefetch`, `CmdFlakeArchive`, `CmdRealisationInfo`, `CmdConfigShow`, `CmdStorePrefetchFile`, `CmdProfileList`, `CmdSearch`, `CmdEval`, `CmdBuild`) all branch on `if (json) { printJSON(...) } else { logger->cout(...) }` with identical surrounding control flow.
-    - verified/17-nix-modern-1.md
-74. **GC dispatch logic duplicated three times.** `nix-store.cc opGC`, `nix-collect-garbage.cc main_nix_collect_garbage`, and `store-gc.cc CmdStoreGC::run` all open a `GcStore`, set `pathsToDelete = GCOptions::WholeStore{}`, wrap `collectGarbage` in `Finally`. The result-printing differs (always `printFreed` vs path-by-path).
-    - verified/18-nix-modern-2-legacy.md
-75. **Three NAR streaming entry points.** `CmdDumpPath::run` (`store dump-path`), `CmdDumpPath2::run` (`nar pack`), `nix-store.cc opDump`. The first two route through `dump-path.cc:getNarSink()`; the third constructs the `FdSink` directly and skips the TTY check. All three then call `narFromPath` or `dumpPath`.
-    - verified/18-nix-modern-2-legacy.md
-76. **Closure-walk helpers (BFS over `references`).** `nix-store/dotgraph.cc` and `nix-store/graphml.cc` both implement the same `StorePathSet workList`/`doneSet` BFS over `references`. They differ only in edge-direction and per-node emission. A shared `walkClosure(start, visit)` helper would consolidate.
-    - verified/18-nix-modern-2-legacy.md
-77. **Eval-cache release before `exec*` is duplicated four times.** `CmdRun::run`, `CmdDevelop::run`, `CmdShell::run`, `CmdFormatterRun::run` each call `state->evalCaches.clear()` immediately before exec'ing out of the process; the comment is identical at all four sites.
-    - verified/17-nix-modern-1.md
-78. **Lock-file walks in libflake.** `LockFile::isUnlocked`, `LockFile::getAllInputs`, `doFind` each implement a custom DFS over `Node::inputs` with their own visited-set; only `getAllInputs` is reused. A shared `forEachNode`/`forEachReachableEdge` helper would simplify all three.
-    - verified/15-libflake-libmain.md
-79. **Per-fetcher attrset-iteration with `if (n == "x") ... else if (n == "y") ... else error`.** Every fetcher primop iterates `*args[0]->attrs()` with this chain. `fetchTree`, `fetchClosure`, `fetchMercurial`, `fetch` are ripe for a helper that takes a `{ name → handler }` table and yields a uniform "unsupported argument" error.
-    - verified/13-libexpr-primops.md
-80. **`logFD` Setting<int> on Unix vs plain `Descriptor logFD` on Windows.** In `LegacySSHStoreConfig`. Inconsistent; the Windows side bypasses the settings system entirely.
-    - verified/08-libstore-remote.md
-81. **`Pid` holds `pid_t` on Unix vs `AutoCloseFD` on Windows.** Mostly fine, but the `release()` method exists only on Unix; `setSeparatePG`/`setKillSignal`/`setKillTimeout` are Unix-only; `wait`'s `allowInterrupts` is unused on Windows.
-    - verified/04-libutil-misc.md
-82. **`AutoUserLock`/`SimpleUserLock` `acquire` skeletons.** Both implementations open a per-slot lock file, try non-blocking exclusive lock via `lockFile(ltWrite, false)`, populate the lock object on success. The lock-acquisition skeleton could be shared.
-    - verified/07-libstore-local.md
-83. **`/nix/store` GC roots and runtime roots have three layers of similar logic.** `local-gc.cc::findRuntimeRootsUnchecked`, `gc.cc::requestRuntimeRoots`, and `gc.cc::LocalStore::findRuntimeRoots` form three layers; the first synthesises roots from `/proc` (or `lsof`), the second reads them from a Unix-domain socket, the third dispatches between the two. The `Roots` typedef and the file-local `UncheckedRoots` map use different key types (`StorePath` vs `std::string`).
-    - verified/07-libstore-local.md
-84. **`narHash` / `references` parser duplicates between `path-info.cc` JSON and `nar-info.cc` text.** Both reconstruct the same `UnkeyedValidPathInfo` fields with their own per-format error handling.
-    - verified/05-libstore-core.md, verified/08-libstore-remote.md
-85. **Setting<T> serialisation specialisations duplicated for `StoreReference`.** `BaseSetting<StoreReference>::parse`/`to_string`, `BaseSetting<std::vector<StoreReference>>::parse`/`to_string`/`appendOrSet`, `BaseSetting<std::set<StoreReference>>::parse`/`to_string`/`appendOrSet`. Three near-cut-and-pasted families.
-    - verified/07-libstore-local.md
-86. **`OnStartup` lambda registration pattern.** Used in libfetchers (`OnStartup([] { registerInputScheme(...) })`), libstore (`RegisterStoreImplementation<TConfig>` with a static instance), libcmd (`RegisterCommand` static instance), libexpr (`RegisterPrimOp` static instance), libstore/build (`RegisterBuiltinBuilder`). Each registry is a Meyers singleton with a different signature. A shared `Registry<Key, Factory>` template would consolidate.
-    - verified/04-libutil-misc.md, verified/05-libstore-core.md, verified/14-libfetchers.md, verified/16-libcmd.md, verified/13-libexpr-primops.md
-87. **`Forced vs lazy` value access in C bindings.** `nix_get_list_byidx{,_lazy}`, `nix_get_attr_byname{,_lazy}`, `nix_get_attr_byidx{,_lazy}` are nearly-identical pairs differing only by the presence of `forceValue` and slight error-message variations. The duplication is the most obvious internal symmetry in the C ABI.
-    - verified/19-c-bindings-misc.md
-88. **`nix_<libname>_init` family.** Each library exposes a parallel idempotent init. Could be a single template macro; currently each is a hand-rolled wrapper.
-    - verified/19-c-bindings-misc.md
+The numbered, prioritised list of refactoring opportunities surfaced by the
+per-shard verified docs and follow-up source audits lives in
+[`candidates/`](candidates/), split into 21 themed section files with an
+[index](candidates/README.md). Each candidate carries a validation verdict
+(VALID / PARTIALLY VALID / INVALID / OBSOLETE) and an effort class against
+the source as it exists today. The 217 candidates are grouped as:
+wire/serialisation duplication, parallel store implementations, repeated
+boilerplate, per-platform symmetry, inheritance chains worth flattening,
+multi-implementation patterns, dead/stale code, duplicated parsers,
+scattered cache keys, other distinct candidates, legacy CLI duplication,
+libutil + libstore-core extras, libexpr extras, vestigial code / dead
+workarounds / stdlib replacements, globals/settings architecture,
+libstore/build deep audit, cross-cutting (platforms, headers, magic
+numbers), daemon and protocol-dispatch deep audit, libexpr eval-core
+(fetcher primops, lookup-path, JSON), libexpr eval-core (cache, attr-set,
+profiler), and libexpr eval-core (EvalState and Value). Each candidate
+carries a `**Validation:**` paragraph with the verdict, effort class, and
+any factual corrections folded in from the verification pass.
 
 ## Key invariants and guarantees
 
@@ -511,7 +321,7 @@ in the verified shard cited.
 
 - **`StorePath` is the canonical store identifier.** Every cross-store comparison uses it. `StorePath::dummy` is `"ffffffffffffffffffffffffffffffff-x"`; `StorePath::MissingName = "x"` is the placeholder when only the hash is known. Constants: `StorePath::HashLen = 32` (160 bits), `StorePath::MaxPathLen = 211`. The character set is enforced by `nameRegexStr` in `path-regex.hh`.
   - verified/05-libstore-core.md
-- **Hash algorithms.** SHA-256 is canonical for store paths and NAR hashes. MD5 / SHA-1 are legacy (still used for binary cache MD5 headers and git-tree hashing); BLAKE3 is gated on `Xp::BLAKE3Hashes`. `regularHashSize` returns 32/16/20/32/64 for SHA-256/MD5/SHA-1/SHA-256/SHA-512. `Hash::dummy` is a zero SHA-256.
+- **Hash algorithms.** SHA-256 is canonical for store paths and NAR hashes. MD5 / SHA-1 are legacy (still used for binary cache MD5 headers and git-tree hashing); BLAKE3 is gated on `Xp::BLAKE3Hashes`. `regularHashSize` returns 32/16/20/32/64 for BLAKE3/MD5/SHA-1/SHA-256/SHA-512. `Hash::dummy` is a zero SHA-256.
   - verified/02-libutil-data.md
 - **Wire protocol versioning.** `WorkerProto::Version` is `{Number, FeatureSet}` with **partial** ordering (subset relation on features); `WorkerProto::latest = 1.38` plus features `realisation-with-path-not-hash`, `delete-dead-specific-referrers`. `WorkerProto::minimum = 1.18`. `ServeProto::Version` is `{major, minor}` with **total** ordering and no `FeatureSet`; `ServeProto::latest = {2, 8}`. `CommonProto` has no version field at all (its serialisers are unconditional).
   - verified/09-libstore-protocol.md

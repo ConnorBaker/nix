@@ -1,0 +1,81 @@
+# Daemon and protocol-dispatch deep audit
+
+Candidates 176-188. Ten VALID; #178, #183, #188 PARTIALLY VALID. Several
+latent issues surfaced during validation:
+
+- **`CollectGarbage` `ignoreLiveness` throw is unconditional regardless of
+  `trusted`** (#178). Likely a bug or undocumented choice.
+- **`QueryDeriver` daemon arm is dead code today** (#183). `MINIMUM_-
+  PROTOCOL_VERSION` is already 1.18; `QueryDeriver` was removed at 1.16.
+- **`AuthorizationSettings`'s in-source claim that "no code outside this
+  file knows about these settings" is false** (#188).
+
+| # | Verdict | Effort |
+| - | ------- | ------ |
+| 176 | VALID | medium |
+| 177 | VALID | medium |
+| 178 | PARTIALLY VALID | medium |
+| 179 | VALID | medium |
+| 180 | VALID | medium |
+| 181 | VALID | medium |
+| 182 | VALID | medium |
+| 183 | PARTIALLY VALID | trivial (dead code today) |
+| 184 | VALID | medium |
+| 185 | VALID | small |
+| 186 | VALID | medium |
+| 187 | VALID | trivial |
+| 188 | PARTIALLY VALID | small |
+
+---
+
+176. **`performOp` is a single ~700-line free-function `switch` over 31 live `WorkerProto::Op` cases.** [HIGH] In `libstore/daemon.cc`, `performOp(TunnelLogger *, ref<Store>, TrustedFlag, RecursiveFlag, BasicServerConnection &, Op)` is one giant function with every case body inlined: `IsValidPath`, `QueryValidPaths`, `QuerySubstitutablePaths`, the merged `QueryReferrers`/`QueryValidDerivers`/`QueryDerivationOutputs` arm, `QueryDerivationOutputNames`, `QueryDerivationOutputMap`, `QueryDeriver`, `QueryPathFromHashPart`, `AddToStore`, `AddMultipleToStore`, `AddTextToStore`, `BuildPaths`, `BuildPathsWithResults`, `BuildDerivation`, `EnsurePath`, `AddTempRoot`, `AddPermRoot`, `AddIndirectRoot`, `SyncWithGC`, `FindRoots`, `CollectGarbage`, `SetOptions`, `QuerySubstitutablePathInfo`, `QuerySubstitutablePathInfos`, `QueryAllValidPaths`, `QueryPathInfo`, `OptimiseStore`, `VerifyStore`, `AddSignatures`, `NarFromPath`, `AddToStoreNar`, `QueryMissing`, `RegisterDrvOutput`, `QueryRealisation`, `AddBuildLog`. There is no per-op handler member function, dispatch table, or shared "read args / startWork / call store / stopWork / write response" scaffold. Refactor each arm into a `void handle*(BasicServerConnection &, ServerContext &)` member or a `static const std::array<OpHandler, N> opTable` keyed by `Op`, so that adding a new opcode is one entry instead of one more `case` in a 700-line switch.
+    - ../verified/09-libstore-protocol.md
+    - **Validation:** VALID — confirmed 37 case labels (35 distinct bodies after collapsing the merged Referrers/Derivers/Outputs arm). All-arm context: `(TunnelLogger*, ref<Store>, TrustedFlag, RecursiveFlag, BasicServerConnection&, Op)`. `boost::pfr` is **not** in tree (zero references); `consteval`-built `std::array<OpHandler, 48>` indexed by raw `Op` value is feasible. Effort: medium. Keystone for #178, #179, #181, #183.
+
+177. **The `startWork()` / `store->op(...)` / `stopWork()` / `write(response)` skeleton is repeated verbatim in ~25 of the 31 `performOp` arms.** [HIGH] Each is mechanically expressible as `auto args = read<Args>(rconn); LOGGED(store->method(args)) → write<Resp>(wconn)`. A `dispatch<&Store::method, Args, Resp>(conn, logger)` helper indexed by an `OpDescriptor` table would replace the bulk of `performOp`.
+    - ../verified/09-libstore-protocol.md
+    - **Validation:** VALID. ~22-25 arms fit the idiom; ~10 outliers (`AddToStore` two-branch, `AddToStoreNar` three-branch, `BuildDerivation` drvPath recompute, `CollectGarbage` multi-shape, `SetOptions`, `NarFromPath` empty wrapper, `QueryPathInfo` early-out, etc.). Effort: medium.
+
+178. **Trust-checking is scattered across nine independent ad-hoc sites in `performOp`.** [HIGH] Each opcode hand-rolls its own privilege check rather than going through a single policy table. The sites: `BuildPaths` and `BuildPathsWithResults` (`if (mode == bmRepair && !trusted) throw`), `BuildDerivation` (`if (!(drvType.isCA() || trusted)) throw`, plus a recompute-`drvPath` branch when `!trusted`), `AddPermRoot` (`if (!trusted) throw`), `VerifyStore` (`if (repair && !trusted) throw`), `AddBuildLog` (`if (!trusted) throw`), `AddMultipleToStore` (`if (!trusted && dontCheckSigs) dontCheckSigs = false`), `AddToStoreNar` (`if (!trusted && dontCheckSigs) dontCheckSigs = false; if (!trusted) info.ultimate = false`), `CollectGarbage` (`if (options.ignoreLiveness) throw "you are not allowed to ignore liveness"`), `FindRoots` (passes `!trusted` as the `censor` argument). A declarative `OpTrust { requireTrustedFor: [arg], clampUntrustedField: [&info::ultimate, false] }` table on the opcode descriptor would centralise the policy.
+    - ../verified/09-libstore-protocol.md
+    - **Validation:** PARTIALLY VALID. **Correction:** the actual count is **11 trust-check sites**, not 9 — `AddToStoreNar` has two clamps, `BuildDerivation` has two checks. **Note on `CollectGarbage`:** the `ignoreLiveness` throw is genuinely unconditional regardless of `trusted` and may be a latent bug. Two of the comments at the `BuildPaths` sites already say "FIXME: layer violation in this message". Effort: medium.
+
+179. **Version-gating in `performOp` is hand-rolled at six sites with diverging styles.** [MEDIUM] `AddToStore` branches on `protoVersion >= {1,25}`; `QuerySubstitutablePathInfos` branches on `< {1,22}`; `QueryValidPaths` reads an extra `substitute` flag at `>= {1,27}`; `AddToStoreNar` has a three-way branch at `>= {1,23}` / `>= {1,21}` / older; `CollectGarbage` reads a different `pathsToDelete` shape based on `features.contains(featureDeleteDeadSpecificReferrers)`; `QueryRealisation` `assert`s `featureRealisationWithPath` is on. The mirror sites in `remote-store.cc` hand-roll the symmetric check independently. A per-op record of `{minVersion, requiredFeatures}` plus a "wire-format variant for old clients" hook would let the daemon and the client agree mechanically.
+    - ../verified/09-libstore-protocol.md
+    - **Validation:** VALID — 6 sites in `performOp` and ~10 mirror sites in `remote-store.cc`. `WorkerProto::Version::operator<=>` is `partial_ordering`. Effort: medium.
+
+180. **`TunnelLogger` and `processStderrReturn` hand-roll the same wire framing on opposite ends, with no shared "stderr frame" type.** [HIGH] `TunnelLogger` (`daemon.cc`) writes `STDERR_NEXT`, `STDERR_LAST`, `STDERR_ERROR`, `STDERR_START_ACTIVITY`, `STDERR_STOP_ACTIVITY`, `STDERR_RESULT` framed messages; `TunnelSource` (same file) writes `STDERR_READ`. `WorkerProto::BasicClientConnection::processStderrReturn` (`worker-protocol-connection.cc`) hand-decodes the same six message types plus `STDERR_WRITE`. The ID literals are macro-defined as raw hex (`0x6f6c6d67` etc.) in `worker-protocol.hh`. Promote the IDs to a strongly-typed enum, factor a `Frame` variant with `Serialise<Frame>` specialisations.
+    - ../verified/09-libstore-protocol.md
+    - **Validation:** VALID. STDERR_* framing is independent of WorkerProto::Serialise layering — frames sent only between startWork/stopWork bracketing. Effort: medium.
+
+181. **`ClientSettings::apply` mixes a hard-coded "trusted-only" allowlist, a hard-coded "always-allowed" allowlist, and an inline `setSubstituters` lambda.** [HIGH] In `daemon.cc`, the body iterates `overrides` and dispatches on `name` via an if/else chain: `name == "ssh-auth-sock"` (silently dropped — labelled "obsolete"), `experimentalFeatures` (special-cased to refuse forwarding), `plugin-files` (special-cased to refuse), the trust-aware mass clause `if (trusted || name == buildTimeout.name || name == maxSilentTime.name || name == pollInterval.name || name == "connect-timeout" || (name == "builders" && value == "")) settings.set(...)`, then falls through to `setSubstituters` (a 30-line lambda embedded in the loop). Promoting "untrusted clients may set this" to a flag on the `Setting<T>` declaration plus iterating registered settings would replace the literal allowlist.
+    - ../verified/09-libstore-protocol.md
+    - **Validation:** VALID. `AbstractSetting::isOverridden()` checks the `bool overridden` flag set by `Config::set`. A new `overrideTrusted` method does not conflict semantically. Compounds with #19, #136. Effort: medium.
+
+182. **Each `RemoteStore::*` opcode method hand-rolls "open conn / write op / write args / processStderr / read response" ~25 times.** [HIGH] In `remote-store.cc`, this exact shape recurs in `isValidPathUncached`, `queryAllValidPaths`, `querySubstitutablePaths`, `queryReferrers`, `queryValidDerivers`, `queryDerivationOutputs`, `queryPartialDerivationOutputMap`, `queryPathFromHashPart`, `registerDrvOutput`, `buildPaths`, `buildPathsWithResults`, `buildDerivation`, `ensurePath`, `findRoots`, `collectGarbage`, `optimiseStore`, `verifyStore`, `addSignatures`, `queryMissing`, `addBuildLog`. A template `auto invoke<Op, Resp>(conn, args...)` (or, paired with #176, a generated table that produces both halves of each opcode) would shrink each method to one line.
+    - ../verified/09-libstore-protocol.md
+    - **Validation:** VALID. Effort: medium.
+
+183. **Five obsolete opcodes still carry full daemon implementations.** [MEDIUM] In `daemon.cc`/`worker-protocol.hh`: `AddTextToStore` (#8, marked "obsolete since 1.25"); `QueryDeriver` (#18, marked "obsolete"); `QueryDerivationOutputs` (#22, marked "obsolete"); `QueryDerivationOutputNames` (#28, marked "obsolete"); `SyncWithGC` (#13). `MINIMUM_PROTOCOL_VERSION` is currently `(1 << 8 | 18)`. Bumping the minimum to ≥1.25 lets four of the five `case`s be deleted outright; `SyncWithGC` could be removed from the enum/docs entirely.
+    - ../verified/09-libstore-protocol.md
+    - **Validation:** PARTIALLY VALID. **Correction:** `MINIMUM_PROTOCOL_VERSION = 1.18` *already* excludes `QueryDeriver`-using clients (removed at 1.16) — **the `QueryDeriver` daemon arm is dead code today**. Bumping to 1.22 deletes `QueryDerivationOutputs`/`QueryDerivationOutputNames`; bumping to 1.25 deletes `AddTextToStore`. `RemoteStore::addCAToStore`'s `<1.25` branch is the *client-side* fallback (talking to old daemons) — independent of the daemon-side cleanup. Effort: trivial for the dead `QueryDeriver` arm; small per opcode for the rest.
+
+184. **`Connection`/`ConnectionHandle`/`getConnection`/`processStderr` form a four-layer call stack with the same name reused at each layer.** [DESIGN] `RemoteStore::Connection` (in `remote-store-connection.hh`) inherits both `WorkerProto::BasicClientConnection` and `WorkerProto::ClientHandshakeInfo` plus a `startTime`. `RemoteStore::ConnectionHandle` wraps a `Pool<Connection>::Handle` plus a `daemonException` flag. `RemoteStore::getConnection()` returns a `ConnectionHandle`. `BasicClientConnection::processStderr(bool * daemonException, ...)` calls `processStderrReturn(...)` and rethrows. The `daemonException`-out-parameter convention exists solely so that `~ConnectionHandle()` can know whether the in-flight exception originated from the protocol stream (and therefore must mark the connection bad) or from the caller. A `Result<T, ProtocolError>`-shaped return — or making `BasicClientConnection` track its own bad-connection state — would let `ConnectionHandle` collapse into a thin pool-wrapper.
+    - ../verified/09-libstore-protocol.md
+    - **Validation:** VALID. `Pool<Connection>::markBad` is idempotent so the lifetime model doesn't constrain the refactor. C-API not exposed to ConnectionHandle. Effort: medium.
+
+185. **`ServeProto::BasicClientConnection` does not inherit from a shared base with `WorkerProto::BasicClientConnection`.** [MEDIUM] `WorkerProto::BasicClientConnection : WorkerProto::BasicConnection` carries `to`, `from`, `protoVersion`, plus operator-coercions to `ReadConn`/`WriteConn`. `ServeProto::BasicClientConnection` carries an exact copy: `FdSink to; FdSource from; ServeProto::Version remoteVersion;` plus the same two operator coercions. Despite the literal field-by-field overlap there is no `BasicConnection<Proto>` template and no shared base. Existing candidate #7 covers handshake duplication but not this struct-shape duplication.
+    - ../verified/09-libstore-protocol.md
+    - **Validation:** VALID. `ServeProto::ReadConn` stores `Version` by value, `WorkerProto::ReadConn` stores `const Version &` — both compatible with a `BasicConnection<Proto>` template. Effort: small.
+
+186. **`processConnection` interleaves five concerns in 100 lines: handshake, monitor-fd, logger swap, stderr-reply ordering, op loop.** [MEDIUM] In `daemon.cc`, the function does: (1) `MonitorFdHup` setup, (2) `ReceiveInterrupts` plus a `createInterruptCallback` that does `dynamic_cast<RemoteStore *>` to `shutdownConnections()` on interrupt, (3) handshake via `BasicServerConnection::handshake` and minimum-version check, (4) `TunnelLogger` allocation plus the `recursive`-gated process-wide `logger` swap, (5) `postHandshake` exchange, (6) `tunnelLogger->startWork()` + `stopWork()` to flush startup messages, (7) the `while (true) { read op; performOp; flush }` op loop with three layers of nested try/catch. Splitting into `setupSession()`, `runOpLoop()`, `teardownSession()` (or RAII'ing the logger swap and the interrupt callback into a `DaemonSession` ctor) would let `processConnection` become a 5-line driver.
+    - ../verified/18-nix-modern-2-legacy.md
+    - **Validation:** VALID. Effort: medium. The logger swap RAII'd in `DaemonSession` ctor/dtor is the single biggest readability win — current code has the move-into-global and the `Finally`-restore separated by the 60-line op loop.
+
+187. **`authPeer`/`matchUser` carry an undocumented edge case where `gr_mem` does not list a group's primary-membership users.** [MEDIUM] In `nix/unix/daemon.cc`, `matchUser(user, group, users)` walks `users` looking for either `user` itself, the literal `*`, the `group` name with `@` prefix, or `getgrnam(name+1)` followed by checking `gr_mem`. POSIX `gr_mem` does *not* include users whose *primary* GID equals the group's GID — only secondary members. So the function covers the "secondary group" case via `gr_mem` and the "primary group" case via the `*group == i.substr(1)` check before `getgrnam`. This is correct only because `peer.gid` (the primary group) is passed in via the `group` parameter; nothing in the function or its callers documents the split. Worth a candidate because the security-critical surface relies on a non-obvious POSIX invariant; a comment or unit test pinning both paths would harden it.
+    - ../verified/18-nix-modern-2-legacy.md
+    - **Validation:** VALID. Effort: trivial.
+
+188. **`AuthorizationSettings` lives as a file-scope global in `nix/unix/daemon.cc` despite being a `Config`-derived settings struct.** [MEDIUM] `struct AuthorizationSettings : Config { Setting<Strings> trustedUsers; Setting<Strings> allowedUsers; };` is defined inline, then `AuthorizationSettings authorizationSettings;` plus `static GlobalConfig::Register rAuthorizationSettings(&authorizationSettings);` register it. The header comment says "No code outside of this file knows about these settings (this is not exposed in a header); all authentication and authorization happens in `daemon.cc`."
+    - ../verified/18-nix-modern-2-legacy.md
+    - **Validation:** PARTIALLY VALID. The struct's docstring claim is **false** — `GlobalConfig::Register` exposes them via `globalConfig.getSettings()` to every command (so `nix show-config` lists `trusted-users`/`allowed-users` even when the running command isn't `nix-daemon`). Two options: lift to a public header (consistent with #144), or don't register globally. Effort: small.
