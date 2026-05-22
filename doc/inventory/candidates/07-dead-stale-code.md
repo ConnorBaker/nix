@@ -25,13 +25,16 @@ concentration of trivial-effort wins.
 48. **`void check();` in `lockfile.cc` is an unused forward declaration.** Inside `nix::flake` after `LockFile::check`'s definition; appears to be dead code.
     - ../verified/15-libflake-libmain.md
     - **Validation:** VALID. Whole-tree grep confirms zero references. Pure deletion.
+    - **Branch:** `vibe-coding/cleanup/libflake-lockfile`
 
 49. **`blockInt` and similar dead identifiers.** Worth a sweep through the verified shards for any declaration without matching uses.
     - **Validation:** VALID. `blockInt` in `shared.hh` has zero references in `src/`. Pure deletion.
+    - **Branch:** `vibe-coding/cleanup/libmain-shared`
 
 50. **`nix_value_incref`/`_decref` are pure forwarders to the generic `nix_gc_*` helpers.** Documented as the preferred typed API, but currently identical to the generic ones. The header comment notes a migration intent.
     - ../verified/19-c-bindings-misc.md
     - **Validation:** VALID — but **the original framing has the migration direction backwards.** The header in `src/libexpr-c/nix_api_expr.h` already marks `nix_gc_decref` itself `@deprecated` and explicitly names `nix_value_decref` as the preferred replacement (with a TODO above `nix_gc_incref` proposing the same). The typed forwarders are the migration *target*, not the debt; deprecating or deleting them would be a regression in API direction, and removing them would break the C ABI. **Recommendation:** no code change. Resolved-by-design; close the inventory entry. Effort: none.
+    - **Branch:** none — resolved-by-design.
 
 51. **`#if 0` blocks in `github.cc`.** The treeHash-mismatch warning inside `downloadArchive` and the treeHash output attribute inside `getAccessor` are commented out, hinting at unfinished tree-hash propagation.
     - ../verified/14-libfetchers.md
@@ -40,6 +43,7 @@ concentration of trivial-effort wins.
 52. **`CurlInputScheme::specialParams` is declared but never defined or referenced.** Compiles only because nothing odr-uses it.
     - ../verified/14-libfetchers.md
     - **Validation:** VALID. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libfetchers-curl-stub`
 
 53. **`getCustomRegistry` only honours the first call's path.** Memoises in a function-local static; later changes to the registry path are silently ignored.
     - ../verified/14-libfetchers.md
@@ -48,6 +52,7 @@ concentration of trivial-effort wins.
 54. **`SQLiteSettings::useWAL` is declared without a default initialiser.** Each constructor of `SQLite` reads it; a constructor that doesn't set it is undefined behaviour.
     - ../verified/07-libstore-local.md
     - **Validation:** VALID — and a **latent bug**. Currently masked because every caller uses designated initialisers. A positional construction is UB. **Default to `true`** to match the runtime default of `Setting<bool> useSQLiteWAL{this, !isWSL1(), ...}` in `globals.hh`; `false` would silently change behaviour on every non-WSL1 platform if a future caller ever omits the field. Every existing caller (`local-store.cc`, `nar-info-disk-cache.cc`, `eval-cache.cc`, `libfetchers/cache.cc`, `http-binary-cache-store.cc`, `libstore-tests/nar-info-disk-cache.cc`) threads `settings.useSQLiteWAL` explicitly, so the chosen default only matters for hypothetical positional/zero-init constructions. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libstore-dead-decls`
 
 55. **Stale `IndexReferrer` index dropped at runtime.** The `20260309-drop-redundant-indexreferrer` migration in `LocalStore::upgradeDBSchema` cleans up a previous-version index. The matching `create index` is no longer in `schema.sql`. The migration drop is harmless but stale once all stores have run it.
     - ../verified/07-libstore-local.md
@@ -55,15 +60,18 @@ concentration of trivial-effort wins.
 
 56. **`BaseSetting<PathsInChroot>::trait` lives in a different file from `BaseSetting<SandboxMode>::trait`.** The `PathsInChroot` trait is in `local-settings.hh`; `SandboxMode` is only in `globals.cc`. Inconsistent placement; one of them should move.
     - ../verified/07-libstore-local.md
-    - **Validation:** VALID. Effort: trivial.
+    - **Validation:** VALID. The adversarial review pass found this is also a real ODR fix (different TUs previously saw different definitions of the explicit specialisation; the values coincidentally matched `appendable=false` from the primary template, so behaviour was preserved but the program was technically ill-formed). Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libstore-dead-decls`
 
 57. **Macro hygiene caveats.** All three `*_USE_LENGTH_PREFIX_SERIALISER_COMMA` helpers (`WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA`, `SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA`) are `#define`d but never `#undef`'d in their respective impl headers, leaking into translation units. There is also a stray bare `#undef COMMA_` at the end of `common-protocol.hh` with no matching `#define` in scope.
     - ../verified/09-libstore-protocol.md
-    - **Validation:** VALID. Effort: trivial.
+    - **Validation:** VALID. The implementing PR caught a third issue too: `LENGTH_PREFIXED_PROTO_HELPER_X` in `length-prefixed-protocol-helper.hh` was `#define`d but never `#undef`'d; landed PR normalises all three protocol headers onto a single prefixed-macro convention scoped per-`std::set`/`std::map` pair. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libstore-dead-decls`
 
 58. **`getMaxCPU` catches `Error` and routes through `ignoreExceptionInDestructor`, but it is not actually a destructor.** Should use `ignoreExceptionExceptInterrupt` per the `util.hh` comment.
     - ../verified/03-libutil-runtime.md
     - **Validation:** VALID. **Correction:** the function lives in `current-process.cc`, not `processes.cc`. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libutil-misc`
 
 59. **`useBuildUsers` returns a function-local `static bool`.** Computed once and cached for the process lifetime; changes to `localSettings` after first call are not observed.
     - ../verified/07-libstore-local.md
@@ -72,3 +80,4 @@ concentration of trivial-effort wins.
 60. **`SQLiteStmt::create` is called on `purgeCache` but the statement is never used.** In `NarInfoDiskCacheImpl::State`; the periodic purge runs ad-hoc inside the constructor against `LastPurge` rather than via the prepared statement.
     - ../verified/08-libstore-remote.md
     - **Validation:** VALID, with a sharper finding: the candidate text overstates use — `purgeCache` is the only `SQLiteStmt` member that the constructor never even `.create()`s. Pure deletion. Stretch: extract the inline purge into a `State::purgeIfNeeded(time_t)` method with a properly cached `SQLiteStmt`. Effort: trivial (delete) to small (extract method).
+    - **Branch:** `vibe-coding/cleanup/libstore-dead-decls` (deletion only; the `purgeIfNeeded` extract was deliberately deferred)

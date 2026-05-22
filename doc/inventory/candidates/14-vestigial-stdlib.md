@@ -48,10 +48,12 @@ nixpkgs 25.11 (LLVM 19+).
 127. **Nested `#ifdef __linux__` block in `chrootHelper` is structurally redundant.** In `nix/run.cc::chrootHelper`, the entire function body is wrapped in one `__linux__` block; midway through, a second `# ifdef __linux__ ... # endif` guards the call to `linux::setPersonality`. The inner guard is unreachable on non-Linux because the outer guard already excludes that case. Delete the inner `#ifdef`/`#endif` pair.
     - ../verified/17-nix-modern-1.md
     - **Validation:** VALID. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/nix-run`
 
 128. **`getIntArg`'s `allowUnit` parameter is read-only ignored.** The function template in `libmain/include/nix/main/shared.hh` never references `allowUnit`; the unit prefix is always parsed by the inner `string2IntWithUnitPrefix`. Both call sites (`nix-collect-garbage.cc`, `nix-store.cc`) pass `true`. Delete the parameter and update the two callers.
     - ../verified/15-libflake-libmain.md
-    - **Validation:** PARTIALLY VALID. Two options: delete the parameter, or honour it (refuse unit suffixes when `allowUnit == false`) — there is no `string2IntWithoutUnitPrefix` helper, so honouring would require new parsing logic with no current consumer. Deletion is the simpler choice. **Caveat: source-compat break.** `getIntArg` lives in a public libmain header and is a function template (no exported ABI symbol), but downstream embedders calling `getIntArg<T>(opt, i, end, true)` would fail to compile. Acceptable for an internal cleanup PR; flag in the commit message so packagers notice. Effort: trivial.
+    - **Validation:** PARTIALLY VALID. Two options: delete the parameter, or honour it (refuse unit suffixes when `allowUnit == false`) — there is no `string2IntWithoutUnitPrefix` helper, so honouring would require new parsing logic with no current consumer. Deletion is the simpler choice. **Caveat: source-compat break.** `getIntArg` lives in a public libmain header and is a function template (no exported ABI symbol), but downstream embedders calling `getIntArg<T>(opt, i, end, true)` would fail to compile. Acceptable for an internal cleanup PR; flag in the commit message so packagers notice. Adversarial review note: the parameter wasn't merely unused but actively misleading — callers passing `true` suggested behaviour that didn't exist. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libmain-shared`
 
 129. **`MaintainCount` could be replaced by a `Finally` lambda or `std::experimental::scope_exit`.** The class in `libutil/include/nix/util/util.hh` is a 25-line RAII wrapper that increments a counter on construction and decrements on destruction; it's used as `MaintainCount<uint64_t>` handles across the goal hierarchy. C++23's `std::scope_exit` (or just a `nix::Finally{}` already in `libutil`) plus an explicit `++counter` at the call site removes the need for a dedicated type. This compounds with #33 / #47 (the goal-hierarchy `doneSuccess`/`doneFailure` patterns that mention `MaintainCount` reset).
     - ../verified/04-libutil-misc.md, ../verified/10-libstore-build.md
@@ -60,3 +62,4 @@ nixpkgs 25.11 (LLVM 19+).
 130. **The `append` shim in `util.hh` is obsolete on C++23.** `libutil/include/nix/util/util.hh` carries `template<class C, typename T> void append(C & c, std::initializer_list<T> l) { c.insert(c.end(), l.begin(), l.end()); }` with the comment `TODO: remove this once we can use C++23's append_range()`. The build is on C++23 — `std::ranges::append_range` (P1206) is available. Migrate call sites and delete the shim.
     - ../verified/04-libutil-misc.md
     - **Validation:** VALID. **Confirmed zero in-tree callers.** Pure deletion. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libutil-misc`
