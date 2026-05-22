@@ -359,14 +359,14 @@ DECLARE_WORKER_SERIALISER(GCOptions::GCPaths);
 
 template<typename T>
 DECLARE_WORKER_SERIALISER(std::vector<T>);
-#define COMMA_ ,
+#define DECLARE_WORKER_SERIALISER_COMMA ,
 template<typename T, typename Compare>
-DECLARE_WORKER_SERIALISER(std::set<T COMMA_ Compare>);
+DECLARE_WORKER_SERIALISER(std::set<T DECLARE_WORKER_SERIALISER_COMMA Compare>);
 template<typename... Ts>
 DECLARE_WORKER_SERIALISER(std::tuple<Ts...>);
 
 template<typename K, typename V, typename Compare>
-DECLARE_WORKER_SERIALISER(std::map<K COMMA_ V COMMA_ Compare>);
-#undef COMMA_
+DECLARE_WORKER_SERIALISER(std::map<K DECLARE_WORKER_SERIALISER_COMMA V DECLARE_WORKER_SERIALISER_COMMA Compare>);
+#undef DECLARE_WORKER_SERIALISER_COMMA
 
 } // namespace nix

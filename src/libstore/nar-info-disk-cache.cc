@@ -81,7 +81,7 @@ struct NarInfoDiskCacheImpl : NarInfoDiskCache
     {
         SQLite db;
         SQLiteStmt insertCache, queryCache, insertNAR, insertMissingNAR, queryNAR, insertRealisation,
-            insertMissingRealisation, queryRealisation, purgeCache;
+            insertMissingRealisation, queryRealisation;
         std::map<std::string, Cache> caches;
     };
 

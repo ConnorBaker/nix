@@ -27,17 +27,18 @@ namespace nix {
     }
 
 SERVE_USE_LENGTH_PREFIX_SERIALISER(template<typename T>, std::vector<T>)
-#define COMMA_ ,
-SERVE_USE_LENGTH_PREFIX_SERIALISER(template<typename T COMMA_ typename Compare>, std::set<T COMMA_ Compare>)
-#undef COMMA_
+#define SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA ,
+SERVE_USE_LENGTH_PREFIX_SERIALISER(
+    template<typename T SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA typename Compare>,
+    std::set<T SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA Compare>)
 SERVE_USE_LENGTH_PREFIX_SERIALISER(template<typename... Ts>, std::tuple<Ts...>)
 
-#define SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA ,
 SERVE_USE_LENGTH_PREFIX_SERIALISER(
     template<typename K SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA typename V SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA
              typename Compare>
     ,
     std::map<K SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA V SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA Compare>)
+#undef SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA
 
 /**
  * Use `CommonProto` where possible.

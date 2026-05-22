@@ -311,12 +311,6 @@ SandboxMode BaseSetting<SandboxMode>::parse(const std::string & str) const
 }
 
 template<>
-struct BaseSetting<SandboxMode>::trait
-{
-    static constexpr bool appendable = false;
-};
-
-template<>
 std::string BaseSetting<SandboxMode>::to_string() const
 {
     if (value == smEnabled)

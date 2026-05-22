@@ -223,14 +223,14 @@ DECLARE_SERVE_SERIALISER(ServeProto::BuildOptions);
 
 template<typename T>
 DECLARE_SERVE_SERIALISER(std::vector<T>);
-#define COMMA_ ,
+#define DECLARE_SERVE_SERIALISER_COMMA ,
 template<typename T, typename Compare>
-DECLARE_SERVE_SERIALISER(std::set<T COMMA_ Compare>);
+DECLARE_SERVE_SERIALISER(std::set<T DECLARE_SERVE_SERIALISER_COMMA Compare>);
 template<typename... Ts>
 DECLARE_SERVE_SERIALISER(std::tuple<Ts...>);
 
 template<typename K, typename V, typename Compare>
-DECLARE_SERVE_SERIALISER(std::map<K COMMA_ V COMMA_ Compare>);
-#undef COMMA_
+DECLARE_SERVE_SERIALISER(std::map<K DECLARE_SERVE_SERIALISER_COMMA V DECLARE_SERVE_SERIALISER_COMMA Compare>);
+#undef DECLARE_SERVE_SERIALISER_COMMA
 
 } // namespace nix

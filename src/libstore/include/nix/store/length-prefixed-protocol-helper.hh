@@ -53,17 +53,17 @@ struct LengthPrefixedProtoHelper;
 template<class Inner, typename T>
 LENGTH_PREFIXED_PROTO_HELPER(Inner, std::vector<T>);
 
-#define COMMA_ ,
+#define LENGTH_PREFIXED_PROTO_HELPER_COMMA ,
 template<class Inner, typename T, typename Compare>
-LENGTH_PREFIXED_PROTO_HELPER(Inner, std::set<T COMMA_ Compare>);
+LENGTH_PREFIXED_PROTO_HELPER(Inner, std::set<T LENGTH_PREFIXED_PROTO_HELPER_COMMA Compare>);
 
 template<class Inner, typename... Ts>
 LENGTH_PREFIXED_PROTO_HELPER(Inner, std::tuple<Ts...>);
 
 template<class Inner, typename K, typename V, typename Compare>
-#define LENGTH_PREFIXED_PROTO_HELPER_X std::map<K, V, Compare>
-LENGTH_PREFIXED_PROTO_HELPER(Inner, LENGTH_PREFIXED_PROTO_HELPER_X);
-#undef COMMA_
+LENGTH_PREFIXED_PROTO_HELPER(
+    Inner, std::map<K LENGTH_PREFIXED_PROTO_HELPER_COMMA V LENGTH_PREFIXED_PROTO_HELPER_COMMA Compare>);
+#undef LENGTH_PREFIXED_PROTO_HELPER_COMMA
 
 template<class Inner, typename T>
 std::vector<T>

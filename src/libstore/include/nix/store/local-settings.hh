@@ -24,6 +24,12 @@ template<>
 std::string BaseSetting<SandboxMode>::to_string() const;
 
 template<>
+struct BaseSetting<SandboxMode>::trait
+{
+    static constexpr bool appendable = false;
+};
+
+template<>
 PathsInChroot BaseSetting<PathsInChroot>::parse(const std::string & str) const;
 template<>
 std::string BaseSetting<PathsInChroot>::to_string() const;

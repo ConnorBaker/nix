@@ -36,7 +36,7 @@ enum class SQLiteOpenMode {
 struct SQLiteSettings
 {
     SQLiteOpenMode mode = SQLiteOpenMode::Normal;
-    bool useWAL;
+    bool useWAL = true;
 };
 
 /**

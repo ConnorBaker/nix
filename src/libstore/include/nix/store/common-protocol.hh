@@ -80,17 +80,17 @@ DECLARE_COMMON_SERIALISER(Realisation);
 template<>
 DECLARE_COMMON_SERIALISER(Signature);
 
-#define COMMA_ ,
+#define DECLARE_COMMON_SERIALISER_COMMA ,
 template<typename T>
 DECLARE_COMMON_SERIALISER(std::vector<T>);
 template<typename T, typename Compare>
-DECLARE_COMMON_SERIALISER(std::set<T COMMA_ Compare>);
+DECLARE_COMMON_SERIALISER(std::set<T DECLARE_COMMON_SERIALISER_COMMA Compare>);
 template<typename... Ts>
 DECLARE_COMMON_SERIALISER(std::tuple<Ts...>);
 
 template<typename K, typename V, typename Compare>
-DECLARE_COMMON_SERIALISER(std::map<K COMMA_ V COMMA_ Compare>);
-#undef COMMA_
+DECLARE_COMMON_SERIALISER(std::map<K DECLARE_COMMON_SERIALISER_COMMA V DECLARE_COMMON_SERIALISER_COMMA Compare>);
+#undef DECLARE_COMMON_SERIALISER_COMMA
 
 /**
  * These use the empty string for the null case, relying on the fact
@@ -118,7 +118,5 @@ using BuildResultStatus = std::variant<BuildResultSuccessStatus, BuildResultFail
 
 template<>
 DECLARE_COMMON_SERIALISER(BuildResultStatus);
-
-#undef COMMA_
 
 } // namespace nix
