@@ -125,10 +125,24 @@ The other entry points:
   re-synced (#100 templated, #74 templated, #135 `UidRange` struct,
   #51 `RefInfo` unwrap). **`/code-review` skill brought to parity**
   on libmain (the one shard skipped earlier; commit `35ab0faaf`
-  ships clean per the three-agent fan-out). Final tip SHAs after
-  the orphan-fix rebases: libexpr `9d33402cc`, libfetchers
-  `dc5dc001d`, libflake `fd75c930f`, libmain `f9da47421`, libstore
-  `e7e885bc3`, libutil `18a82b524`, nix-cli `ef3236827`. All seven
+  ships clean per the three-agent fan-out). **Post-audit follow-up
+  sweep**: filed #222 (libmain `--max-freed` clamp oddity), #223
+  (libmain `getIntArg<N>` inline opportunity), #224 (libutil
+  `NarIndexer::createMember` path-depth idiom). Implemented #222 on
+  libmain (`a7bb49f91`); #223 and #224 filed but deferred per their
+  trade-off discussions. Plus four code/doc amends folded into
+  existing commits: libexpr #214 instantiation note, libstore #135
+  `UidRange` nested in `AutoUserLock`, libstore #221 doxygen scope
+  expansion, libutil #163 `PipeOptions` calling-style ambiguity
+  note. **Worktree-source-drift discovered on libmain**: build dir
+  was configured against master rather than the worktree (the
+  HANDOFF.md gotcha) — reconfigured with explicit source dir; the
+  earlier libmain `/code-review` reviewers happened to read post-
+  rebase source via `git show` so their conclusions still hold,
+  but no actual ninja compile of the worktree tree had occurred
+  until this fix. Final tip SHAs: libexpr `c9401c3c4`, libfetchers
+  `dc5dc001d`, libflake `fd75c930f`, libmain `a7bb49f91`, libstore
+  `e5651495a`, libutil `e3f228714`, nix-cli `ef3236827`. All seven
   branches Local-only past their pushed tips; push policy is
   explicit-only and per-commit.
 - **20 trivial candidates landed across 6 shard branches + Pass A review** (May 2026)
