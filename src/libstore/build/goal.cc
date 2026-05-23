@@ -2,6 +2,8 @@
 #include "nix/store/build/worker.hh"
 #include "nix/store/worker-settings.hh"
 
+#include <algorithm>
+
 namespace nix {
 
 TimedOut::TimedOut(time_t maxDuration)
@@ -13,46 +15,73 @@ TimedOut::TimedOut(time_t maxDuration)
 using Co = nix::Goal::Co;
 using promise_type = nix::Goal::promise_type;
 
+/* Convert the structural fd-count bound (every Goal subclass that uses
+   `Worker::childStarted` registers <= 2 fds today) into a runtime check.
+   `popChildEvent` does a linear `find_if` over `events`; if a future
+   subclass registers many fds simultaneously, this assertion catches
+   the regression before the scan becomes a measurable cost. The bound
+   of 16 is a generous headroom over today's worst case (`buildWithHook`
+   with 2 fds). */
+static constexpr size_t childEventsHighWatermark = 16;
+
 void Goal::ChildEvents::pushChildEvent(ChildOutput event)
 {
-    if (childTimeout)
+    if (timedOut)
         return; // Already timed out, ignore
-    childOutputs.push(std::move(event));
+    events.emplace_back(std::move(event));
+    assert(events.size() <= childEventsHighWatermark);
 }
 
 void Goal::ChildEvents::pushChildEvent(ChildEOF event)
 {
-    if (childTimeout)
+    if (timedOut)
         return; // Already timed out, ignore
-    assert(!childEOF);
-    childEOF = std::move(event);
+    events.emplace_back(std::move(event));
+    assert(events.size() <= childEventsHighWatermark);
 }
 
 void Goal::ChildEvents::pushChildEvent(TimedOut event)
 {
     // Timeout is immediate - flush pending events
-    childOutputs = {};
-    childEOF.reset();
-    childTimeout = std::make_unique<TimedOut>(std::move(event));
+    events.clear();
+    events.emplace_back(std::make_unique<TimedOut>(std::move(event)));
+    timedOut = true;
 }
 
 bool Goal::ChildEvents::hasChildEvent() const
 {
-    return !childOutputs.empty() || childEOF || childTimeout;
+    return !events.empty();
 }
 
 Goal::ChildEvent Goal::ChildEvents::popChildEvent()
 {
-    if (!childOutputs.empty()) {
-        auto event = std::move(childOutputs.front());
-        childOutputs.pop();
+    assert(!events.empty());
+    /* Drain ChildOutput events first so the consumer side observes the
+       same order as the pre-FIFO shape: outputs before any EOF/timeout
+       marker, regardless of arrival order. This matters when a goal
+       watches multiple fds (e.g. buildWithHook with hook->fromHook and
+       hook->builderOut): if the producer pushes EOF for one fd in the
+       same poll cycle as buffered output for another, we must still
+       deliver the output before letting the consumer break on EOF.
+
+       The linear scan is bounded by the per-goal registered fd count
+       — at most one ChildOutput plus one ChildEOF per fd per
+       MuxablePipePollState::iterate cycle, and the consumer drains
+       eagerly via WaitForChildEvent. In current code that bound is
+       <=2 (buildWithHook is the worst case). If a future goal
+       subclass watches many fds simultaneously, this needs revisiting
+       — until then, the scan is effectively constant-time. */
+    auto outputIt = std::find_if(events.begin(), events.end(), [](const ChildEvent & e) {
+        return std::holds_alternative<ChildOutput>(e);
+    });
+    if (outputIt != events.end()) {
+        auto event = std::move(*outputIt);
+        events.erase(outputIt);
         return event;
     }
-    if (childEOF)
-        return *std::exchange(childEOF, std::nullopt);
-    if (childTimeout)
-        return std::exchange(childTimeout, nullptr);
-    unreachable();
+    auto event = std::move(events.front());
+    events.pop_front();
+    return event;
 }
 
 using handle_type = nix::Goal::handle_type;

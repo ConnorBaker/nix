@@ -5,7 +5,7 @@
 #include "nix/store/build-result.hh"
 
 #include <coroutine>
-#include <queue>
+#include <deque>
 #include <variant>
 
 namespace nix {
@@ -94,14 +94,29 @@ private:
     class ChildEvents
     {
         /**
-         * Structured queue of child events:
-         * - outputs: stream of data from child
-         * - eof: optional end-of-stream marker
-         * - timeout: optional timeout that flushes/overrides other events
+         * Pending child events. Pushed by the muxable-pipe poll loop
+         * (one fd at a time per poll cycle) and drained by the goal's
+         * coroutine consumer.
+         *
+         * Ordering: `ChildOutput` events are always popped before any
+         * `ChildEOF` or `TimedOut` marker, regardless of arrival order,
+         * to preserve the pre-FIFO behaviour relied on by multi-fd
+         * goals (notably `buildWithHook`, which watches both the build
+         * hook stderr and the wrapped builder stdout/stderr; if the
+         * hook's fd EOFs in the same poll cycle as buffered output on
+         * the builder's fd, the consumer must see the output before
+         * breaking on EOF).
+         *
+         * Once a `TimedOut` is pushed the deque is cleared first and
+         * `timedOut` is set; subsequent `ChildOutput`/`ChildEOF` pushes
+         * early-return so the timeout always wins.
+         *
+         * Producers may push more than one `ChildEOF` per goal — a
+         * multi-fd goal can have multiple fds reach EOF — so EOF is
+         * not a singleton.
          */
-        std::queue<ChildOutput> childOutputs;
-        std::optional<ChildEOF> childEOF;
-        std::unique_ptr<TimedOut> childTimeout;
+        std::deque<ChildEvent> events;
+        bool timedOut = false;
 
     public:
         void pushChildEvent(ChildOutput event);
