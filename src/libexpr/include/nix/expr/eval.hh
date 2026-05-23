@@ -494,10 +494,7 @@ private:
         const ref<boost::concurrent_flat_map<CanonPath, std::optional<SourcePath>>> resolvedPaths;
     };
 
-    const ref<
-        boost::
-            concurrent_flat_map<std::string, std::shared_ptr<LookupPathResolvedState>, StringViewHash, std::equal_to<>>>
-        lookupPathResolved;
+    const ref<boost::concurrent_flat_map<std::string, std::shared_ptr<LookupPathResolvedState>>> lookupPathResolved;
 
     /**
      * Cache used by prim_match().
