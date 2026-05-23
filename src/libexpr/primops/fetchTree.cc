@@ -14,7 +14,7 @@
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/input-cache.hh"
 
-#include "fetcher-attr-iter.hh"
+#include "named-attr-iter.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -487,11 +487,11 @@ static void fetch(
 
     if (isArgAttrs) {
 
-        iterateFetcherAttrs(
+        iterateNamedAttrs(
             state,
             *args[0]->attrs(),
             who,
-            std::array<FetcherAttrHandler, 3>{{
+            std::array<NamedAttrHandler, 3>{{
                 {"url",
                  [&](const Attr & attr) {
                      url =

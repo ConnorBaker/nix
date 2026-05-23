@@ -4,7 +4,7 @@
 #include "nix/fetchers/fetchers.hh"
 #include "nix/util/url-parts.hh"
 
-#include "fetcher-attr-iter.hh"
+#include "named-attr-iter.hh"
 
 #include <array>
 
@@ -22,11 +22,11 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
 
     if (args[0]->type() == nAttrs) {
 
-        iterateFetcherAttrs(
+        iterateNamedAttrs(
             state,
             *args[0]->attrs(),
             "fetchMercurial",
-            std::array<FetcherAttrHandler, 3>{{
+            std::array<NamedAttrHandler, 3>{{
                 {"url",
                  [&](const Attr & attr) {
                      url = state

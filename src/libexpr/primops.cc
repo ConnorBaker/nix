@@ -20,6 +20,8 @@
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/sort.hh"
 
+#include "primops/named-attr-iter.hh" // internal helper, not in install_headers
+
 #include <boost/container/small_vector.hpp>
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -2930,32 +2932,48 @@ static void prim_path(EvalState & state, const PosIdx pos, Value ** args, Value 
 
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to 'builtins.path'");
 
-    for (auto & attr : *args[0]->attrs()) {
-        auto n = state.symbols[attr.name];
-        if (n == "path")
-            path.emplace(state.coerceToPath(
-                attr.pos, *attr.value, context, "while evaluating the 'path' attribute passed to 'builtins.path'"));
-        else if (attr.name == state.s.name)
-            name = state.forceStringNoCtx(
-                *attr.value, attr.pos, "while evaluating the `name` attribute passed to builtins.path");
-        else if (n == "filter")
-            state.forceFunction(
-                *(filterFun = attr.value), attr.pos, "while evaluating the `filter` parameter passed to builtins.path");
-        else if (n == "recursive")
-            method = state.forceBool(
-                         *attr.value, attr.pos, "while evaluating the `recursive` attribute passed to builtins.path")
-                         ? ContentAddressMethod::Raw::NixArchive
-                         : ContentAddressMethod::Raw::Flat;
-        else if (n == "sha256")
-            expectedHash = newHashAllowEmpty(
-                state.forceStringNoCtx(
-                    *attr.value, attr.pos, "while evaluating the `sha256` attribute passed to builtins.path"),
-                HashAlgorithm::SHA256);
-        else
-            state.error<EvalError>("unsupported argument '%1%' to 'builtins.path'", state.symbols[attr.name])
-                .atPos(attr.pos)
-                .debugThrow();
-    }
+    iterateNamedAttrs(
+        state,
+        *args[0]->attrs(),
+        "builtins.path",
+        std::array<NamedAttrHandler, 5>{{
+            {"path",
+             [&](const Attr & attr) {
+                 path.emplace(state.coerceToPath(
+                     attr.pos,
+                     *attr.value,
+                     context,
+                     "while evaluating the 'path' attribute passed to 'builtins.path'"));
+             }},
+            {"name",
+             [&](const Attr & attr) {
+                 name = state.forceStringNoCtx(
+                     *attr.value, attr.pos, "while evaluating the `name` attribute passed to builtins.path");
+             }},
+            {"filter",
+             [&](const Attr & attr) {
+                 state.forceFunction(
+                     *(filterFun = attr.value),
+                     attr.pos,
+                     "while evaluating the `filter` parameter passed to builtins.path");
+             }},
+            {"recursive",
+             [&](const Attr & attr) {
+                 method = state.forceBool(
+                              *attr.value,
+                              attr.pos,
+                              "while evaluating the `recursive` attribute passed to builtins.path")
+                              ? ContentAddressMethod::Raw::NixArchive
+                              : ContentAddressMethod::Raw::Flat;
+             }},
+            {"sha256",
+             [&](const Attr & attr) {
+                 expectedHash = newHashAllowEmpty(
+                     state.forceStringNoCtx(
+                         *attr.value, attr.pos, "while evaluating the `sha256` attribute passed to builtins.path"),
+                     HashAlgorithm::SHA256);
+             }},
+        }});
     if (!path)
         state.error<EvalError>("missing required 'path' attribute in the first argument to 'builtins.path'")
             .atPos(pos)

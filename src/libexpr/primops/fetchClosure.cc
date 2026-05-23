@@ -4,7 +4,7 @@
 #include "nix/store/make-content-addressed.hh"
 #include "nix/util/environment-variables.hh"
 
-#include "fetcher-attr-iter.hh"
+#include "named-attr-iter.hh"
 
 #include <array>
 
@@ -146,11 +146,11 @@ static void prim_fetchClosure(EvalState & state, const PosIdx pos, Value ** args
         return fmt("while evaluating the attribute '%s' passed to builtins.fetchClosure", attrName);
     };
 
-    iterateFetcherAttrs(
+    iterateNamedAttrs(
         state,
         *args[0]->attrs(),
         "fetchClosure",
-        std::array<FetcherAttrHandler, 4>{{
+        std::array<NamedAttrHandler, 4>{{
             {"fromPath",
              [&](const Attr & attr) {
                  NixStringContext context;
