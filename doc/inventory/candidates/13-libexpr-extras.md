@@ -1,6 +1,6 @@
 # libexpr extras
 
-Candidates 105-120. Fourteen VALID; #108 and #111 PARTIALLY VALID.
+Candidates 105-120 plus #220. Fifteen VALID; #108 and #111 PARTIALLY VALID.
 
 | # | Verdict | Effort |
 | - | ------- | ------ |
@@ -20,6 +20,7 @@ Candidates 105-120. Fourteen VALID; #108 and #111 PARTIALLY VALID.
 | 118 | VALID | small (warn/allow + helper) / medium-large (accessor) |
 | 119 | VALID | trivial |
 | 120 | VALID | small |
+| 220 | VALID | trivial |
 
 ---
 
@@ -96,3 +97,8 @@ Candidates 105-120. Fourteen VALID; #108 and #111 PARTIALLY VALID.
 120. **`getConcurrent` is shared, but the surrounding insert-on-miss pattern is hand-rolled at every site.** `getConcurrent(map, key)` (in `libutil/include/nix/util/util.hh`) wraps `boost::concurrent_flat_map::cvisit` to return `std::optional<mapped_type>`; it is used in `libutil/posix-source-accessor.cc::WindowsSourceAccessor::cachedLstat`, `libutil/mounted-source-accessor.cc::MountedSourceAccessorImpl::getMount`, three sites in `libutil/caching-source-accessor.cc::CachingSourceAccessor` (`maybeLstat`, `lstat`, `readLink`), `libstore/dummy-store.cc`, and five sites in `libexpr/eval.cc` (`importResolutionCache`, `fileEvalCache`, `srcToStore`, `resolvedPaths`, `lookupPathResolved`). The lookup half is shared via `getConcurrent`; the insert-on-miss half (`if (auto res = getConcurrent(...)) return *res; auto v = compute(); cache.emplace(...); return v;`) is hand-rolled at each site. A `getOrInsertConcurrent(map, key, compute)` helper would replace ~10 nearly identical bodies.
     - ../verified/01-libutil-io.md, ../verified/05-libstore-core.md, ../verified/11-libexpr-eval.md
     - **Validation:** VALID. **Note:** `eval.cc::evalFile` already uses `try_emplace_and_cvisit` directly, so a helper would also unify with that pattern. **See also:** N1 (the broader concurrent-insert-on-miss vs Sync<map> rubric — pass 2 splits N1 into N1a (insert-on-miss caches) and N1b (registries with ordered iteration); this candidate is squarely under N1a). Cross-references with #139 (`drvHashes`), Cluster A (concurrent state and globals). Effort: small.
+
+220. **`prim_path` shares the iterateFetcherAttrs name-handler-table shape used by #79.** `prim_path` in `libexpr/primops.cc` iterates `*args[0]->attrs()` with a six-way `if (n == "name") ... else if (n == "path") ... else if (n == "filter") ... else if (n == "recursive") ... else if (n == "sha256") ... else if (n == "method") ... else state.error<EvalError>("unsupported argument '%1%' to 'addPath'")` chain — structurally identical to the `fetchClosure`/`fetchMercurial`/`fetch` chains that #79 collapsed into `iterateFetcherAttrs(state, pos, "<fetcher>", attrs, handlers)` with a `FetcherAttrHandler { name, handler }` table. The candidate body of #79 named only the fetcher-primops; this site lives in `primops.cc` under a different category and was missed by both the original cataloging pass and #79's implementation.
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** VALID. The same helper introduced by #79 (`src/libexpr/primops/fetcher-attr-iter.hh`'s `iterateFetcherAttrs` + `FetcherAttrHandler`) covers the shape verbatim; the only deltas are the diagnostic prefix (`"addPath"` instead of a fetcher name) and the per-key handler bodies. The helper's name is fetcher-flavoured but its mechanism is general (name-keyed handler dispatch with uniform "unsupported argument" error); either reuse the helper as-is or rename to a more general `iterateNamedAttrs`. **See also:** #79 (the original migration). **Note:** the helper currently lives under `src/libexpr/primops/`, which `primops.cc` includes; no header relocation needed if the helper is reused. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libexpr` (renamed `iterateFetcherAttrs`/`FetcherAttrHandler` → `iterateNamedAttrs`/`NamedAttrHandler` and `fetcher-attr-iter.hh` → `named-attr-iter.hh`; existing three fetcher call sites updated to the new names; `prim_path` migrated to the helper preserving wording and `.atPos(attr.pos)` semantics)

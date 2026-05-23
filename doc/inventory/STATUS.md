@@ -135,8 +135,9 @@ The other entry points:
   their own merits.
 - **Catalog split into 25 sections** — original monolithic
   `CANDIDATES.md` deleted; 217 + 44 candidates organised by topic.
-  (Now 219 + 44 after #218 added during integration and #219 added
-  during post-cleanup adversarial review.)
+  (Now 221 + 44 after #218 / #219 / #220 / #221 — the latter two
+  added in May 2026 when Pass B reuse review surfaced catalog gaps
+  while landing #79 and #85.)
 - **Seven cleanup PRs pushed** — `vibe-coding/cleanup/*` shard branches
   on origin, ready for upstream review.
 

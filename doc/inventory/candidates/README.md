@@ -186,8 +186,8 @@ closed enumeration (rule 3).
 | [09-cache-keys.md](09-cache-keys.md) | 69-71 | Cache-key construction scattered across modules |
 | [10-other.md](10-other.md) | 72-88 | Other distinct candidates |
 | [11-legacy-cli.md](11-legacy-cli.md) | 89-95 | Legacy CLI duplication |
-| [12-libutil-libstore-core-extras.md](12-libutil-libstore-core-extras.md) | 96-104, 218 | libutil + libstore-core extras |
-| [13-libexpr-extras.md](13-libexpr-extras.md) | 105-120 | libexpr extras |
+| [12-libutil-libstore-core-extras.md](12-libutil-libstore-core-extras.md) | 96-104, 218, 221 | libutil + libstore-core extras |
+| [13-libexpr-extras.md](13-libexpr-extras.md) | 105-120, 220 | libexpr extras |
 | [14-vestigial-stdlib.md](14-vestigial-stdlib.md) | 121-130 | Vestigial code, dead workarounds, stdlib replacements |
 | [15-globals-settings.md](15-globals-settings.md) | 131-149 | Globals, settings architecture, and dependency-injection |
 | [16-libstore-build-audit.md](16-libstore-build-audit.md) | 150-160, 219 | libstore/build deep audit |
