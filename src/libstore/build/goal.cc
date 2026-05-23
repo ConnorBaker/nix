@@ -198,6 +198,32 @@ Goal::Done Goal::doneFailure(ExitCode result, BuildResult::Failure failure)
     return amDone(result);
 }
 
+Goal::Done Goal::doneBuildSuccess(
+    std::unique_ptr<MaintainCount<uint64_t>> & mc, BuildResult::Success success)
+{
+    mc.reset();
+
+    if (success.status == BuildResult::Success::Built)
+        worker.doneBuilds++;
+
+    worker.updateProgress();
+
+    return doneSuccess(std::move(success));
+}
+
+Goal::Done Goal::doneBuildFailure(std::unique_ptr<MaintainCount<uint64_t>> & mc, BuildError ex)
+{
+    mc.reset();
+
+    worker.exitStatusFlags.updateFromStatus(ex.status);
+    if (ex.status != BuildResult::Failure::DependencyFailed)
+        worker.failedBuilds++;
+
+    worker.updateProgress();
+
+    return doneFailure(ecFailed, std::move(ex));
+}
+
 Goal::Done Goal::amDone(ExitCode result)
 {
     trace("done");

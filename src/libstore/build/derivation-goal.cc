@@ -420,14 +420,8 @@ UnkeyedRealisation DerivationGoal::assertPathValidity()
 
 Goal::Done DerivationGoal::doneSuccess(BuildResult::Success::Status status, UnkeyedRealisation builtOutput)
 {
-    mcExpectedBuilds.reset();
-
-    if (status == BuildResult::Success::Built)
-        worker.doneBuilds++;
-
-    worker.updateProgress();
-
-    return Goal::doneSuccess(
+    return doneBuildSuccess(
+        mcExpectedBuilds,
         BuildResult::Success{
             .status = status,
             .builtOutputs = {{wantedOutput, std::move(builtOutput)}},
@@ -436,15 +430,7 @@ Goal::Done DerivationGoal::doneSuccess(BuildResult::Success::Status status, Unke
 
 Goal::Done DerivationGoal::doneFailure(BuildError ex)
 {
-    mcExpectedBuilds.reset();
-
-    worker.exitStatusFlags.updateFromStatus(ex.status);
-    if (ex.status != BuildResult::Failure::DependencyFailed)
-        worker.failedBuilds++;
-
-    worker.updateProgress();
-
-    return Goal::doneFailure(ecFailed, std::move(ex));
+    return doneBuildFailure(mcExpectedBuilds, std::move(ex));
 }
 
 } // namespace nix

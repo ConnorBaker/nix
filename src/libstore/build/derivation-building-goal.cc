@@ -1390,14 +1390,8 @@ DerivationBuildingGoal::checkPathValidity(std::map<std::string, InitialOutput> &
 
 Goal::Done DerivationBuildingGoal::doneSuccess(BuildResult::Success::Status status, SingleDrvOutputs builtOutputs)
 {
-    mcRunningBuilds.reset();
-
-    if (status == BuildResult::Success::Built)
-        worker.doneBuilds++;
-
-    worker.updateProgress();
-
-    return Goal::doneSuccess(
+    return doneBuildSuccess(
+        mcRunningBuilds,
         BuildResult::Success{
             .status = status,
             .builtOutputs = std::move(builtOutputs),
@@ -1406,15 +1400,7 @@ Goal::Done DerivationBuildingGoal::doneSuccess(BuildResult::Success::Status stat
 
 Goal::Done DerivationBuildingGoal::doneFailure(BuildError ex)
 {
-    mcRunningBuilds.reset();
-
-    worker.exitStatusFlags.updateFromStatus(ex.status);
-    if (ex.status != BuildResult::Failure::DependencyFailed)
-        worker.failedBuilds++;
-
-    worker.updateProgress();
-
-    return Goal::doneFailure(ecFailed, std::move(ex));
+    return doneBuildFailure(mcRunningBuilds, std::move(ex));
 }
 
 } // namespace nix

@@ -537,6 +537,29 @@ protected:
      */
     Done doneFailure(ExitCode result, BuildResult::Failure failure);
 
+    /**
+     * Shared bookkeeping for derivation-build success: drop the per-goal
+     * `MaintainCount` slot (e.g. `mcExpectedBuilds`/`mcRunningBuilds`),
+     * bump `worker.doneBuilds`, push a progress update, and forward to
+     * `doneSuccess`.
+     *
+     * Used by `DerivationGoal::doneSuccess` and
+     * `DerivationBuildingGoal::doneSuccess`.
+     */
+    Done doneBuildSuccess(
+        std::unique_ptr<MaintainCount<uint64_t>> & mc, BuildResult::Success success);
+
+    /**
+     * Shared bookkeeping for derivation-build failure: drop the
+     * per-goal `MaintainCount` slot, update `worker.exitStatusFlags`,
+     * bump `worker.failedBuilds` (unless this was a dependency
+     * failure), push a progress update, and forward to `doneFailure`.
+     *
+     * Used by `DerivationGoal::doneFailure` and
+     * `DerivationBuildingGoal::doneFailure`.
+     */
+    Done doneBuildFailure(std::unique_ptr<MaintainCount<uint64_t>> & mc, BuildError ex);
+
 public:
     virtual void cleanup() {}
 
