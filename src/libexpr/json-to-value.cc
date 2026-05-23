@@ -176,16 +176,26 @@ public:
         return true;
     }
 
-    bool end_object() override
+    /* The end-of-container resolution is identical for objects and lists:
+       resolve the current frame against the parser state, then emit it
+       into its parent. Both SAX overrides defer to this helper so the
+       dispatch is named directly rather than `end_array` masquerading as
+       `end_object`. */
+    bool endContainer()
     {
         rs = rs->resolve(state);
         rs->add();
         return true;
     }
 
+    bool end_object() override
+    {
+        return endContainer();
+    }
+
     bool end_array() override
     {
-        return end_object();
+        return endContainer();
     }
 
     bool start_array(size_t len) override
