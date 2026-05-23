@@ -5,6 +5,9 @@ blocked, and pending across the catalog work. Update it whenever a
 phase advances, a verification lands, or a follow-up is queued.
 
 The other entry points:
+- [`HANDOFF.md`](HANDOFF.md) — single entry point for an agent
+  picking up the work without prior context (build invocation,
+  worktree-source gotcha, push policy, common pitfalls).
 - [`INVENTORY.md`](INVENTORY.md) — codebase navigation map.
 - [`candidates/README.md`](candidates/README.md) — catalog scope,
   eight-debt-shape framing, evidentiary standard.
