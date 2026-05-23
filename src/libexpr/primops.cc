@@ -1043,42 +1043,47 @@ static RegisterPrimOp primop_addErrorContext(
         .impl = prim_addErrorContext,
     });
 
-static void prim_ceil(EvalState & state, const PosIdx pos, Value ** args, Value & v)
+/* Factory for `builtins.ceil`/`builtins.floor`: identical bodies modulo
+   the rounding operation and the trace string identifying the caller.
+   Both must surface the same precision-loss / out-of-range diagnostics
+   tied to https://github.com/NixOS/nix/issues/12899. */
+static auto makeRoundingPrimOp(NixFloat (*roundFn)(NixFloat), const char * forceFloatTrace)
 {
-    auto value = state.forceFloat(
-        *args[0], args[0]->determinePos(pos), "while evaluating the first argument passed to builtins.ceil");
-    auto ceilValue = ceil(value);
-    bool isInt = args[0]->type() == nInt;
-    constexpr NixFloat int_min = std::numeric_limits<NixInt::Inner>::min(); // power of 2, so that no rounding occurs
-    if (ceilValue >= int_min && ceilValue < -int_min) {
-        v.mkInt(ceilValue);
-    } else if (isInt) {
-        // a NixInt, e.g. INT64_MAX, can be rounded to -int_min due to the cast to NixFloat
-        state
-            .error<EvalError>(
-                "Due to a bug (see https://github.com/NixOS/nix/issues/12899) the NixInt argument %1% caused undefined behavior in previous Nix versions.\n\tFuture Nix versions might implement the correct behavior.",
-                args[0]->integer().value)
-            .atPos(pos)
-            .debugThrow();
-    } else {
-        state.error<EvalError>("NixFloat argument %1% is not in the range of NixInt", args[0]->fpoint())
-            .atPos(pos)
-            .debugThrow();
-    }
-    // `forceFloat` casts NixInt to NixFloat, but instead NixInt args shall be returned unmodified
-    if (isInt) {
-        auto arg = args[0]->integer();
-        auto res = v.integer();
-        if (arg != res) {
+    return [roundFn, forceFloatTrace](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
+        auto value = state.forceFloat(*args[0], args[0]->determinePos(pos), forceFloatTrace);
+        auto roundedValue = roundFn(value);
+        bool isInt = args[0]->type() == nInt;
+        constexpr NixFloat int_min = std::numeric_limits<NixInt::Inner>::min(); // power of 2, so that no rounding occurs
+        if (roundedValue >= int_min && roundedValue < -int_min) {
+            v.mkInt(roundedValue);
+        } else if (isInt) {
+            // a NixInt, e.g. INT64_MAX, can be rounded to -int_min due to the cast to NixFloat
             state
                 .error<EvalError>(
-                    "Due to a bug (see https://github.com/NixOS/nix/issues/12899) a loss of precision occurred in previous Nix versions because the NixInt argument %1% was rounded to %2%.\n\tFuture Nix versions might implement the correct behavior.",
-                    arg,
-                    res)
+                    "Due to a bug (see https://github.com/NixOS/nix/issues/12899) the NixInt argument %1% caused undefined behavior in previous Nix versions.\n\tFuture Nix versions might implement the correct behavior.",
+                    args[0]->integer().value)
+                .atPos(pos)
+                .debugThrow();
+        } else {
+            state.error<EvalError>("NixFloat argument %1% is not in the range of NixInt", args[0]->fpoint())
                 .atPos(pos)
                 .debugThrow();
         }
-    }
+        // `forceFloat` casts NixInt to NixFloat, but instead NixInt args shall be returned unmodified
+        if (isInt) {
+            auto arg = args[0]->integer();
+            auto res = v.integer();
+            if (arg != res) {
+                state
+                    .error<EvalError>(
+                        "Due to a bug (see https://github.com/NixOS/nix/issues/12899) a loss of precision occurred in previous Nix versions because the NixInt argument %1% was rounded to %2%.\n\tFuture Nix versions might implement the correct behavior.",
+                        arg,
+                        res)
+                    .atPos(pos)
+                    .debugThrow();
+            }
+        }
+    };
 }
 
 static RegisterPrimOp primop_ceil({
@@ -1095,46 +1100,8 @@ static RegisterPrimOp primop_ceil({
         If the datatype of *number* is neither a NixInt (signed 64-bit integer) nor a NixFloat
         (IEEE-754 double-precision floating-point number), an evaluation error is thrown.
     )",
-    .impl = prim_ceil,
+    .impl = makeRoundingPrimOp(ceil, "while evaluating the first argument passed to builtins.ceil"),
 });
-
-static void prim_floor(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    auto value = state.forceFloat(
-        *args[0], args[0]->determinePos(pos), "while evaluating the first argument passed to builtins.floor");
-    auto floorValue = floor(value);
-    bool isInt = args[0]->type() == nInt;
-    constexpr NixFloat int_min = std::numeric_limits<NixInt::Inner>::min(); // power of 2, so that no rounding occurs
-    if (floorValue >= int_min && floorValue < -int_min) {
-        v.mkInt(floorValue);
-    } else if (isInt) {
-        // a NixInt, e.g. INT64_MAX, can be rounded to -int_min due to the cast to NixFloat
-        state
-            .error<EvalError>(
-                "Due to a bug (see https://github.com/NixOS/nix/issues/12899) the NixInt argument %1% caused undefined behavior in previous Nix versions.\n\tFuture Nix versions might implement the correct behavior.",
-                args[0]->integer().value)
-            .atPos(pos)
-            .debugThrow();
-    } else {
-        state.error<EvalError>("NixFloat argument %1% is not in the range of NixInt", args[0]->fpoint())
-            .atPos(pos)
-            .debugThrow();
-    }
-    // `forceFloat` casts NixInt to NixFloat, but instead NixInt args shall be returned unmodified
-    if (isInt) {
-        auto arg = args[0]->integer();
-        auto res = v.integer();
-        if (arg != res) {
-            state
-                .error<EvalError>(
-                    "Due to a bug (see https://github.com/NixOS/nix/issues/12899) a loss of precision occurred in previous Nix versions because the NixInt argument %1% was rounded to %2%.\n\tFuture Nix versions might implement the correct behavior.",
-                    arg,
-                    res)
-                .atPos(pos)
-                .debugThrow();
-        }
-    }
-}
 
 static RegisterPrimOp primop_floor({
     .name = "__floor",
@@ -1150,7 +1117,7 @@ static RegisterPrimOp primop_floor({
         If the datatype of *number* is neither a NixInt (signed 64-bit integer) nor a NixFloat
         (IEEE-754 double-precision floating-point number), an evaluation error will be thrown.
     )",
-    .impl = prim_floor,
+    .impl = makeRoundingPrimOp(floor, "while evaluating the first argument passed to builtins.floor"),
 });
 
 /* Try evaluating the argument. Success => {success=true; value=something;},
