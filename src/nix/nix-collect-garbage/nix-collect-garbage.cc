@@ -21,7 +21,7 @@ static bool dryRun = false;
  * Of course, this makes rollbacks to before this point in time
  * impossible. */
 
-void removeOldGenerations(std::filesystem::path dir)
+static void removeOldGenerations(std::filesystem::path dir)
 {
     if (access(dir.string().c_str(), R_OK) != 0)
         return;
