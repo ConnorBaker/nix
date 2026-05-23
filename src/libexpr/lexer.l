@@ -102,6 +102,9 @@ using YYLTYPE = nix::Parser::location_type;
 
 
 ANY         .|\n
+ /* If this regex changes, update `nix::isVarName` in src/libexpr/print.cc
+    to match — it is the print-side mirror of this rule (decides which
+    attribute names and identifiers can be emitted bare vs. string-quoted). */
 ID          [a-zA-Z\_][a-zA-Z0-9\_\'\-]*
 INT         [0-9]+
 FLOAT       (([1-9][0-9]*\.[0-9]*)|(0?\.[0-9]+))([Ee][+-]?[0-9]+)?

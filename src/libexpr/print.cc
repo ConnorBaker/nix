@@ -87,43 +87,34 @@ bool isReservedKeyword(const std::string_view str)
     return reservedKeywords.contains(str);
 }
 
+bool isVarName(std::string_view s)
+{
+    if (s.empty())
+        return false;
+    if (isReservedKeyword(s))
+        return false;
+    // Matches the lexer's `ID` regex: [a-zA-Z_][a-zA-Z0-9_'-]*.
+    char first = s[0];
+    if (!((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_'))
+        return false;
+    for (auto c : s)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '\''
+              || c == '-'))
+            return false;
+    return true;
+}
+
 std::ostream & printIdentifier(std::ostream & str, std::string_view s)
 {
     if (s.empty())
         str << "\"\"";
     else if (isReservedKeyword(s))
         str << '"' << s << '"';
-    else {
-        char c = s[0];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_')) {
-            printLiteralString(str, s);
-            return str;
-        }
-        for (auto c : s)
-            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '\''
-                  || c == '-')) {
-                printLiteralString(str, s);
-                return str;
-            }
+    else if (isVarName(s))
         str << s;
-    }
+    else
+        printLiteralString(str, s);
     return str;
-}
-
-static bool isVarName(std::string_view s)
-{
-    if (s.size() == 0)
-        return false;
-    if (isReservedKeyword(s))
-        return false;
-    char c = s[0];
-    if ((c >= '0' && c <= '9') || c == '-' || c == '\'')
-        return false;
-    for (auto & i : s)
-        if (!((i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z') || (i >= '0' && i <= '9') || i == '_' || i == '-'
-              || i == '\''))
-            return false;
-    return true;
 }
 
 std::ostream & printAttributeName(std::ostream & str, std::string_view name)

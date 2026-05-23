@@ -55,6 +55,20 @@ std::ostream & printAttributeName(std::ostream & o, std::string_view s);
 bool isReservedKeyword(const std::string_view str);
 
 /**
+ * Returns `true` if `s` is a valid Nix identifier (matching the lexer's `ID`
+ * regex `[a-zA-Z_][a-zA-Z0-9_'-]*`) and is not a reserved keyword.
+ *
+ * Used by attribute-name and identifier printing to decide whether the input
+ * can be emitted bare or must be string-quoted.
+ *
+ * Invariant: this predicate must accept the same set of strings that the
+ * lexer's `ID` rule accepts. If the lexer regex in `lexer.l` ever changes,
+ * this implementation must change with it (and the corresponding pinning
+ * comment in `lexer.l` should be updated).
+ */
+bool isVarName(std::string_view s);
+
+/**
  * Print a string as an identifier in the Nix expression language syntax.
  *
  * FIXME: "identifier" is ambiguous. Identifiers do not have a single
