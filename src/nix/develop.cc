@@ -1,5 +1,6 @@
 #include "nix/cmd/command.hh"
 #include "command-register.hh"
+#include "flake-attr-paths.hh"
 #include "release-eval-caches.hh"
 #include "nix/util/config-global.hh"
 #include "nix/expr/eval.hh"
@@ -460,20 +461,17 @@ struct Common : InstallableCommand, MixProfile
 
     Strings getDefaultFlakeAttrPaths() override
     {
-        Strings paths{
-            "devShells." + settings.thisSystem.get() + ".default",
-            "devShell." + settings.thisSystem.get(),
-        };
-        for (auto & p : SourceExprCommand::getDefaultFlakeAttrPaths())
-            paths.push_back(p);
-        return paths;
+        return prependFlakeAttrPaths(
+            {
+                "devShells." + settings.thisSystem.get() + ".default",
+                "devShell." + settings.thisSystem.get(),
+            },
+            *this);
     }
 
     Strings getDefaultFlakeAttrPathPrefixes() override
     {
-        auto res = SourceExprCommand::getDefaultFlakeAttrPathPrefixes();
-        res.emplace_front("devShells." + settings.thisSystem.get() + ".");
-        return res;
+        return prependFlakeAttrPathPrefixes({"devShells." + settings.thisSystem.get() + "."}, *this);
     }
 
     StorePath getShellOutPath(ref<Store> store, ref<Installable> installable)

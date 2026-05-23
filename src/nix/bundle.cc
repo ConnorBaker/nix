@@ -1,6 +1,7 @@
 #include "nix/cmd/installable-flake.hh"
 #include "nix/cmd/command-installable-value.hh"
 #include "command-register.hh"
+#include "flake-attr-paths.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/local-fs-store.hh"
@@ -55,21 +56,15 @@ struct CmdBundle : InstallableValueCommand
         return catSecondary;
     }
 
-    // FIXME: cut&paste from CmdRun.
     Strings getDefaultFlakeAttrPaths() override
     {
-        Strings res{"apps." + settings.thisSystem.get() + ".default", "defaultApp." + settings.thisSystem.get()};
-        for (auto & s : SourceExprCommand::getDefaultFlakeAttrPaths())
-            res.push_back(s);
-        return res;
+        return prependFlakeAttrPaths(
+            {"apps." + settings.thisSystem.get() + ".default", "defaultApp." + settings.thisSystem.get()}, *this);
     }
 
     Strings getDefaultFlakeAttrPathPrefixes() override
     {
-        Strings res{"apps." + settings.thisSystem.get() + "."};
-        for (auto & s : SourceExprCommand::getDefaultFlakeAttrPathPrefixes())
-            res.push_back(s);
-        return res;
+        return prependFlakeAttrPathPrefixes({"apps." + settings.thisSystem.get() + "."}, *this);
     }
 
     void run(ref<Store> store, ref<InstallableValue> installable) override
