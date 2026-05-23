@@ -15,57 +15,69 @@
 
 namespace nix {
 
-static std::optional<std::string>
-getStringAttr(const StringMap & env, const StructuredAttrs * parsed, const std::string & name)
+/**
+ * Look up `name` in either the parsed structured-attrs JSON or the env
+ * map, depending on which form the derivation uses.
+ *
+ * `jsonGet` extracts a `T` from a `nlohmann::json` node (e.g.
+ * `getString`, `getBoolean`, `getStringSet`). `envFromString` converts
+ * the matching env-string entry to a `T`. Returns `std::nullopt` if the
+ * attribute is not present.
+ */
+template<typename T, typename JsonGet, typename EnvFromString>
+static std::optional<T> getAttr(
+    const StringMap & env,
+    const StructuredAttrs * parsed,
+    const std::string & name,
+    JsonGet jsonGet,
+    EnvFromString envFromString)
 {
     if (parsed) {
         if (auto * i = get(parsed->structuredAttrs, name))
             try {
-                return getString(*i);
+                return jsonGet(*i);
             } catch (Error & e) {
                 e.addTrace({}, "while parsing attribute \"%s\"", name);
                 throw;
             }
     } else {
         if (auto * i = get(env, name))
-            return *i;
+            return envFromString(*i);
     }
     return {};
 }
 
+static std::optional<std::string>
+getStringAttr(const StringMap & env, const StructuredAttrs * parsed, const std::string & name)
+{
+    return getAttr<std::string>(
+        env,
+        parsed,
+        name,
+        [](const auto & j) { return getString(j); },
+        [](const std::string & s) { return s; });
+}
+
 static bool getBoolAttr(const StringMap & env, const StructuredAttrs * parsed, const std::string & name, bool def)
 {
-    if (parsed) {
-        if (auto * i = get(parsed->structuredAttrs, name))
-            try {
-                return getBoolean(*i);
-            } catch (Error & e) {
-                e.addTrace({}, "while parsing attribute \"%s\"", name);
-                throw;
-            }
-    } else {
-        if (auto * i = get(env, name))
-            return *i == "1";
-    }
-    return def;
+    return getAttr<bool>(
+               env,
+               parsed,
+               name,
+               [](const auto & j) { return getBoolean(j); },
+               [](const std::string & s) { return s == "1"; })
+        .value_or(def);
 }
 
 static std::optional<StringSet>
 getStringSetAttr(const StringMap & env, const StructuredAttrs * parsed, const std::string & name)
 {
-    if (parsed) {
-        if (auto * i = get(parsed->structuredAttrs, name))
-            try {
-                return getStringSet(*i);
-            } catch (Error & e) {
-                e.addTrace({}, "while parsing attribute \"%s\"", name);
-                throw;
-            }
-    } else {
-        if (auto * i = get(env, name))
-            return tokenizeString<StringSet>(*i);
-    }
-    return {};
+    return getAttr<StringSet>(
+        env,
+        parsed,
+        name,
+        [](const auto & j) { return getStringSet(j); },
+        [](const std::string & s) { return tokenizeString<StringSet>(s); });
 }
 
 template<typename Inputs>
