@@ -18,7 +18,7 @@ helps less than the original framing suggested.
 
 70. **`makeSourcePathToHashCacheKey` is called from three places with slightly different shapes.** From `Input::getAccessorUnchecked`, `PathInputScheme::getAccessor`, and `fetch-to-store.cc`. They could share a helper.
     - ../verified/14-libfetchers.md
-    - **Validation:** VALID. Effort: small.
+    - **Validation:** VALID — resolved upstream by `de6b5f60c` ("Replace fetchToStore cache by sourcePathToHash cache", Eelco Dolstra, 2025-12-10), which post-dates the catalog snapshot. All three call sites already invoke a shared `makeSourcePathToHashCacheKey` declared in `fetch-to-store.hh` and defined in `fetch-to-store.cc`. No further action; close as resolved-by-upstream. Effort: none.
 
 71. **NarInfoDiskCache key plumbing.** `lookupNarInfo`/`upsertNarInfo`/`upsertAbsentNarInfo` and `lookupRealisation`/`upsertRealisation`/`upsertAbsentRealisation` follow identical "TTL + present-bit + reconstruct" patterns. Could share a generic "TTL-cached lookup" base.
     - ../verified/08-libstore-remote.md

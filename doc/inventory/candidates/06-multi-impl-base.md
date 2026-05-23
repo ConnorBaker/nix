@@ -27,6 +27,7 @@ OBSOLETE (the `BuildLog`/`LogSink` overlap is genuine but only ~5 lines).
 37. **NAR-tree walkers in three places.** `NarAccessorImpl::find/get` (in `nar-accessor.cc`), `NarIndexer::createMember` (in `nar-listing.cc`), `MemorySourceAccessor::open` (in `memory-source-accessor.cc`). All walk a path, descend into the `Directory` variant, and either find or insert. A generic helper over `fso::VariantT` could replace all three.
     - ../verified/01-libutil-io.md
     - **Validation:** VALID. Effort: small.
+    - **Branch:** `vibe-coding/cleanup/libutil` (helper `fso::descendPath<V>(root, path)` extracted in `memory-source-accessor.hh`; only `NarAccessorImpl::find` migrated. `MemorySourceAccessor::open` excluded after Rule-6 walk because it interleaves descent with intermediate-directory creation and throws `SymlinkNotAllowed` on traversed non-leaf symlinks; `NarIndexer::createMember` excluded because it amortizes O(depth) per call to O(1) via a parent-stack driven by `parseDump`'s monotonic-deepening order, and a per-entry root-walk would regress total cost from O(N + total depth) to O(N · avg depth)).
 
 38. **Source/Sink wrapper hierarchy with many parallel one-shot adapters.** `TeeSink`/`TeeSource`, `LengthSink`/`LengthSource`, `LambdaSink`/`LambdaSource`, `SizedSource`, `EnsureRead`, `ChainSource`. Written one-by-one; a base or generator could reduce repetition.
     - ../verified/01-libutil-io.md

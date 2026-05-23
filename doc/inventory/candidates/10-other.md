@@ -27,6 +27,7 @@ Candidates 72-88. All seventeen VALID.
 72. **`getDefaultFlakeAttrPaths` / `getDefaultFlakeAttrPathPrefixes` is copy-pasted across modern commands.** The `apps.<system>.default` + `defaultApp.<system>` shape appears verbatim in `CmdRun` and `CmdBundle`; `Common` (develop) has the analogous `devShells.<system>.default` + `devShell.<system>`; `MixFormatter` returns `formatter.<system>`; `CmdSearch` returns `packages.<system>` + `legacyPackages.<system>`. Each command also re-walks `SourceExprCommand::getDefaultFlakeAttrPaths()` to merge in base prefixes. A small `MixFlakeAttrPaths` helper would deduplicate.
     - ../verified/17-nix-modern-1.md
     - **Validation:** VALID. `bundle.cc` even has a literal `// FIXME: cut&paste from CmdRun.` comment. Effort: small.
+    - **Branch:** `vibe-coding/cleanup/nix-cli` (deviates from the candidate's `MixFlakeAttrPaths` mixin form — a mixin attempt failed because `SourceExprCommand` is non-virtually inherited via `InstallableCommand`/`InstallableValueCommand`, producing diamond errors. Shipped as free helpers in `src/nix/flake-attr-paths.hh`; three sites converted: `CmdRun`, `CmdBundle`, `Common` (develop). `CmdSearch` and `MixFormatter` retain their direct overrides because they intentionally replace rather than augment the base list — asymmetry documented in the helper header).
 
 73. **JSON-vs-text dual output paths in commands.** A dozen commands (`CmdPathInfo`, `CmdFlakeMetadata`, `CmdFlakeShow`, `CmdFlakePrefetch`, `CmdFlakeArchive`, `CmdRealisationInfo`, `CmdConfigShow`, `CmdStorePrefetchFile`, `CmdProfileList`, `CmdSearch`, `CmdEval`, `CmdBuild`) all branch on `if (json) { printJSON(...) } else { logger->cout(...) }` with identical surrounding control flow.
     - ../verified/17-nix-modern-1.md
@@ -35,10 +36,12 @@ Candidates 72-88. All seventeen VALID.
 74. **GC dispatch logic duplicated three times.** `nix-store.cc opGC`, `nix-collect-garbage.cc main_nix_collect_garbage`, and `store-gc.cc CmdStoreGC::run` all open a `GcStore`, set `pathsToDelete = GCOptions::WholeStore{}`, wrap `collectGarbage` in `Finally`. The result-printing differs (always `printFreed` vs path-by-path).
     - ../verified/18-nix-modern-2-legacy.md
     - **Validation:** VALID — confirmed verbatim. Only difference: `opGC` branches its `Finally printer` on `options.action`. Effort: small.
+    - **Branch:** `vibe-coding/cleanup/nix-cli` (header-only `runWholeStoreGC` helper in `src/nix/whole-store-gc.hh`; three call sites consolidated. The `nix-store --gc --print-roots` branch keeps its local `require<GcStore>` because it doesn't run `collectGarbage`; the `else` branch uses the helper with a printer lambda that branches on `options.action` to preserve the existing return-live/dead vs `printFreed` asymmetry).
 
 75. **Three NAR streaming entry points.** `CmdDumpPath::run` (`store dump-path`), `CmdDumpPath2::run` (`nar pack`), `nix-store.cc opDump`. The first two route through `dump-path.cc:getNarSink()`; the third constructs the `FdSink` directly and skips the TTY check. All three then call `narFromPath` or `dumpPath`.
     - ../verified/18-nix-modern-2-legacy.md
     - **Validation:** VALID — `dump-path.cc:getNarSink` adds the `isTTY` guard that `nix-store.cc opDump` skips. **Trivial half OBSOLETE:** the TTY-check sharing is a one-line consolidation; not a debt entry, just a single boolean call — drop. **Small half kept:** the full `runNarDump(SourceLike)` helper covers genuine duplication across the three entry points. Effort: small (full helper).
+    - **Branch:** `vibe-coding/cleanup/nix-cli` (header-only template helper `runNarDump` in `src/nix/run-nar-dump.hh`; three sites consolidated. Asymmetry preserved via `bool checkTTY`: modern commands pass `true`, legacy `nix-store --dump` passes `false` with an explanatory comment at the call site).
 
 76. **Closure-walk helpers (BFS over `references`).** `nix-store/dotgraph.cc` and `nix-store/graphml.cc` both implement the same `StorePathSet workList`/`doneSet` BFS over `references`. They differ only in edge-direction and per-node emission. A shared `walkClosure(start, visit)` helper would consolidate.
     - ../verified/18-nix-modern-2-legacy.md
@@ -52,6 +55,7 @@ Candidates 72-88. All seventeen VALID.
 78. **Lock-file walks in libflake.** `LockFile::isUnlocked`, `LockFile::getAllInputs`, `doFind` each implement a custom DFS over `Node::inputs` with their own visited-set; only `getAllInputs` is reused. A shared `forEachNode`/`forEachReachableEdge` helper would simplify all three.
     - ../verified/15-libflake-libmain.md
     - **Validation:** VALID. Effort: small.
+    - **Branch:** `vibe-coding/cleanup/libflake` (extracted `forEachReachableNode` shared by `isUnlocked` and `getAllInputs` only; `doFind` was excluded after walking all three sites because its DFS is structurally different — name-based path-walk through `node->inputs` that recurses only on `follows` indirections, keys its visited-set on `InputAttrPath` rather than Node identity, and throws on revisit with a rendered cycle path).
 
 79. **Per-fetcher attrset-iteration with `if (n == "x") ... else if (n == "y") ... else error`.** Every fetcher primop iterates `*args[0]->attrs()` with this chain. `fetchTree`, `fetchClosure`, `fetchMercurial`, `fetch` are ripe for a helper that takes a `{ name → handler }` table and yields a uniform "unsupported argument" error.
     - ../verified/13-libexpr-primops.md

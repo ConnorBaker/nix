@@ -126,13 +126,13 @@ line in its body.
 
 | Branch | Shard | Addresses | Status |
 | ------ | ----- | --------- | ------ |
-| `vibe-coding/cleanup/libexpr` | libexpr | #217, #64, #66, #68, #106, #107, #109, #110 (extended to forceValueDeep), #112, #196, #199 | Local-only past `437eea9d0` |
-| `vibe-coding/cleanup/libfetchers` | libfetchers | #52 | Pushed |
-| `vibe-coding/cleanup/libflake` | libflake | #48 | Pushed |
+| `vibe-coding/cleanup/libexpr` | libexpr | #217, #64, #66, #68, #106, #107, #109, #110 (extended to forceValueDeep), #112, #196, #199, #67, #79 (3 of 4 sites; `prim_fetchTree` excluded as misclassified — its loop dispatches on value type, not name), #105, #214 | Local-only past `437eea9d0` |
+| `vibe-coding/cleanup/libfetchers` | libfetchers | #52, #51 (delete-and-trim, scope expanded past the two `#if 0` blocks) | Local-only past `74e512d11` |
+| `vibe-coding/cleanup/libflake` | libflake | #48, #78 (helper covers two of three DFS sites; `doFind` excluded as structurally different) | Local-only past `513b47628` |
 | `vibe-coding/cleanup/libmain` | libmain | #49, #128 | Pushed |
 | `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4 (extended to template form), #5 (extended to template form), #6 (hoist-then-delete), #14, #47, #82, #114, #115, #119, #157, #159, #165 | Local-only past `5f5b8151e` |
-| `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117 | Local-only past `784a4f4b4` |
-| `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142, #24, #77, #89, #91, #187 | Local-only past `48524e038` |
+| `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117, #37 (helper covers one of three NAR walks; other two structurally distinct), #163 (additive `PipeOptions` overload; asymmetric originals retained for source-compat) | Local-only past `784a4f4b4` |
+| `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142, #24, #77, #89, #91, #187, #74, #75, #72 (free helpers, not mixin — diamond inheritance), #93 (3 of 4 parents; `CmdHash` deferred), #141 (per-command `static`-ify subset only) | Local-only past `48524e038` |
 
 The branches whose Status reads "Pushed" are on `origin`
 (`ConnorBaker/nix`) and ready for upstream PR creation. The four

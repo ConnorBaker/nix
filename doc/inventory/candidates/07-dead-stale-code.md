@@ -39,6 +39,7 @@ concentration of trivial-effort wins.
 51. **`#if 0` blocks in `github.cc`.** The treeHash-mismatch warning inside `downloadArchive` and the treeHash output attribute inside `getAccessor` are commented out, hinting at unfinished tree-hash propagation.
     - ../verified/14-libfetchers.md
     - **Validation:** VALID. The `#if 0` blocks suggest an abandoned tree-hash propagation effort. The matching `treeHash` slot in `GitArchiveInputScheme::allowedAttrs` is wired up but unreferenced elsewhere — a delete-and-trim cleanup should also drop that slot (recheck). Either commit to the feature or delete the code. Effort: small (delete-and-trim) or medium (resurrect with the missing `upstreamTreeHash` lookup).
+    - **Branch:** `vibe-coding/cleanup/libfetchers` (delete-and-trim; the trim went past the two `#if 0` blocks to also drop `RefInfo::treeHash`, the `upstreamTreeHash` helper, and the `treeHash` slot in `GitArchiveInputScheme::allowedAttrs`, none of which had any live readers after the `#if 0` blocks were removed).
 
 52. **`CurlInputScheme::specialParams` is declared but never defined or referenced.** Compiles only because nothing odr-uses it.
     - ../verified/14-libfetchers.md
