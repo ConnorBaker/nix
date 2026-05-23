@@ -48,6 +48,33 @@ public:
     }
 };
 
+struct CmdRegistry : NixMultiCommand
+{
+    CmdRegistry()
+        : NixMultiCommand("registry", RegisterCommand::getCommandsFor({"registry"}))
+    {
+    }
+
+    std::string description() override
+    {
+        return "manage the flake registry";
+    }
+
+    std::string doc() override
+    {
+        return
+#include "registry.md"
+            ;
+    }
+
+    Category category() override
+    {
+        return catSecondary;
+    }
+};
+
+NIX_REGISTER_COMMAND(CmdRegistry, "registry");
+
 struct CmdRegistryList : StoreCommand
 {
     std::string description() override
@@ -83,6 +110,8 @@ struct CmdRegistryList : StoreCommand
         }
     }
 };
+
+NIX_REGISTER_COMMAND(CmdRegistryList, "registry", "list");
 
 struct CmdRegistryAdd : MixEvalArgs, Command, RegistryCommand
 {
@@ -120,6 +149,8 @@ struct CmdRegistryAdd : MixEvalArgs, Command, RegistryCommand
     }
 };
 
+NIX_REGISTER_COMMAND(CmdRegistryAdd, "registry", "add");
+
 struct CmdRegistryRemove : RegistryCommand, Command
 {
     std::string url;
@@ -148,6 +179,8 @@ struct CmdRegistryRemove : RegistryCommand, Command
         registry->write(getRegistryPath().string());
     }
 };
+
+NIX_REGISTER_COMMAND(CmdRegistryRemove, "registry", "remove");
 
 struct CmdRegistryPin : RegistryCommand, EvalCommand
 {
@@ -200,6 +233,8 @@ struct CmdRegistryPin : RegistryCommand, EvalCommand
     }
 };
 
+NIX_REGISTER_COMMAND(CmdRegistryPin, "registry", "pin");
+
 struct CmdRegistryResolve : StoreCommand
 {
     std::vector<std::string> urls;
@@ -234,39 +269,6 @@ struct CmdRegistryResolve : StoreCommand
     }
 };
 
-struct CmdRegistry : NixMultiCommand
-{
-    CmdRegistry()
-        : NixMultiCommand(
-              "registry",
-              {
-                  {"list", []() { return make_ref<CmdRegistryList>(); }},
-                  {"add", []() { return make_ref<CmdRegistryAdd>(); }},
-                  {"remove", []() { return make_ref<CmdRegistryRemove>(); }},
-                  {"pin", []() { return make_ref<CmdRegistryPin>(); }},
-                  {"resolve", []() { return make_ref<CmdRegistryResolve>(); }},
-              })
-    {
-    }
-
-    std::string description() override
-    {
-        return "manage the flake registry";
-    }
-
-    std::string doc() override
-    {
-        return
-#include "registry.md"
-            ;
-    }
-
-    Category category() override
-    {
-        return catSecondary;
-    }
-};
-
-NIX_REGISTER_COMMAND(CmdRegistry, "registry");
+NIX_REGISTER_COMMAND(CmdRegistryResolve, "registry", "resolve");
 
 } // namespace nix

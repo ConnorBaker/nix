@@ -475,6 +475,8 @@ struct CmdProfileAdd : InstallablesCommand, MixDefaultProfile
     }
 };
 
+NIX_REGISTER_COMMAND(CmdProfileAdd, "profile", "add");
+
 struct Matcher
 {
     virtual ~Matcher() {}
@@ -691,6 +693,8 @@ struct CmdProfileRemove : virtual EvalCommand, MixProfileElementMatchers
     }
 };
 
+NIX_REGISTER_COMMAND(CmdProfileRemove, "profile", "remove");
+
 struct CmdProfileUpgrade : virtual SourceExprCommand, MixProfileElementMatchers, MixDryRun
 {
     std::string description() override
@@ -802,6 +806,8 @@ struct CmdProfileUpgrade : virtual SourceExprCommand, MixProfileElementMatchers,
     }
 };
 
+NIX_REGISTER_COMMAND(CmdProfileUpgrade, "profile", "upgrade");
+
 struct CmdProfileList : virtual EvalCommand, virtual StoreCommand, MixDefaultProfile, MixJSON
 {
     std::string description() override
@@ -844,6 +850,8 @@ struct CmdProfileList : virtual EvalCommand, virtual StoreCommand, MixDefaultPro
     }
 };
 
+NIX_REGISTER_COMMAND(CmdProfileList, "profile", "list");
+
 struct CmdProfileDiffClosures : virtual StoreCommand, MixDefaultProfile
 {
     std::string description() override
@@ -882,6 +890,8 @@ struct CmdProfileDiffClosures : virtual StoreCommand, MixDefaultProfile
         }
     }
 };
+
+NIX_REGISTER_COMMAND(CmdProfileDiffClosures, "profile", "diff-closures");
 
 struct CmdProfileHistory : virtual StoreCommand, EvalCommand, MixDefaultProfile
 {
@@ -925,6 +935,8 @@ struct CmdProfileHistory : virtual StoreCommand, EvalCommand, MixDefaultProfile
     }
 };
 
+NIX_REGISTER_COMMAND(CmdProfileHistory, "profile", "history");
+
 struct CmdProfileRollback : virtual StoreCommand, MixDefaultProfile, MixDryRun
 {
     std::optional<GenerationNumber> version;
@@ -956,6 +968,8 @@ struct CmdProfileRollback : virtual StoreCommand, MixDefaultProfile, MixDryRun
         switchGeneration(*profile, version, dryRun);
     }
 };
+
+NIX_REGISTER_COMMAND(CmdProfileRollback, "profile", "rollback");
 
 struct CmdProfileWipeHistory : virtual StoreCommand, MixDefaultProfile, MixDryRun
 {
@@ -995,21 +1009,12 @@ struct CmdProfileWipeHistory : virtual StoreCommand, MixDefaultProfile, MixDryRu
     }
 };
 
+NIX_REGISTER_COMMAND(CmdProfileWipeHistory, "profile", "wipe-history");
+
 struct CmdProfile : NixMultiCommand
 {
     CmdProfile()
-        : NixMultiCommand(
-              "profile",
-              {
-                  {"add", []() { return make_ref<CmdProfileAdd>(); }},
-                  {"remove", []() { return make_ref<CmdProfileRemove>(); }},
-                  {"upgrade", []() { return make_ref<CmdProfileUpgrade>(); }},
-                  {"list", []() { return make_ref<CmdProfileList>(); }},
-                  {"diff-closures", []() { return make_ref<CmdProfileDiffClosures>(); }},
-                  {"history", []() { return make_ref<CmdProfileHistory>(); }},
-                  {"rollback", []() { return make_ref<CmdProfileRollback>(); }},
-                  {"wipe-history", []() { return make_ref<CmdProfileWipeHistory>(); }},
-              })
+        : NixMultiCommand("profile", RegisterCommand::getCommandsFor({"profile"}))
     {
         aliases = {
             {"install", {AliasStatus::Deprecated, {"add"}}},

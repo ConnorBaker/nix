@@ -147,6 +147,26 @@ struct CmdSign : StorePathsCommand
 
 NIX_REGISTER_COMMAND(CmdSign, "store", "sign");
 
+struct CmdKey : NixMultiCommand
+{
+    CmdKey()
+        : NixMultiCommand("key", RegisterCommand::getCommandsFor({"key"}))
+    {
+    }
+
+    std::string description() override
+    {
+        return "generate and convert Nix signing keys";
+    }
+
+    Category category() override
+    {
+        return catUtility;
+    }
+};
+
+NIX_REGISTER_COMMAND(CmdKey, "key");
+
 struct CmdKeyGenerateSecret : Command
 {
     std::string keyName;
@@ -181,6 +201,8 @@ struct CmdKeyGenerateSecret : Command
     }
 };
 
+NIX_REGISTER_COMMAND(CmdKeyGenerateSecret, "key", "generate-secret");
+
 struct CmdKeyConvertSecretToPublic : Command
 {
     std::string description() override
@@ -203,29 +225,6 @@ struct CmdKeyConvertSecretToPublic : Command
     }
 };
 
-struct CmdKey : NixMultiCommand
-{
-    CmdKey()
-        : NixMultiCommand(
-              "key",
-              {
-                  {"generate-secret", []() { return make_ref<CmdKeyGenerateSecret>(); }},
-                  {"convert-secret-to-public", []() { return make_ref<CmdKeyConvertSecretToPublic>(); }},
-              })
-    {
-    }
-
-    std::string description() override
-    {
-        return "generate and convert Nix signing keys";
-    }
-
-    Category category() override
-    {
-        return catUtility;
-    }
-};
-
-NIX_REGISTER_COMMAND(CmdKey, "key");
+NIX_REGISTER_COMMAND(CmdKeyConvertSecretToPublic, "key", "convert-secret-to-public");
 
 } // namespace nix
