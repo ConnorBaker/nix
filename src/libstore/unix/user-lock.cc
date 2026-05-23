@@ -35,6 +35,34 @@ static std::vector<gid_t> get_group_list(const char * username, gid_t group_id)
 }
 #endif
 
+/**
+ * Open `path` for writing (creating it if necessary) and try to take a
+ * non-blocking exclusive `lockFile` write lock on it. Returns the
+ * holding `AutoCloseFD` on success, or `std::nullopt` if another
+ * process already holds the lock.
+ *
+ * Used by `SimpleUserLock::acquire` and `AutoUserLock::acquire` to
+ * walk per-slot lock files looking for a free slot.
+ *
+ * Deliberately bypasses the existing `FdLock` RAII wrapper from
+ * `pathlocks.hh`: `FdLock` is non-movable and non-copyable, so it
+ * cannot co-own the descriptor's lifetime with the `AutoCloseFD`
+ * member that `UserLock` stores after a successful acquire. The
+ * caller transfers the returned `AutoCloseFD` into its `fdUserLock`
+ * member and the lock stays held for the lifetime of the `UserLock`,
+ * which is exactly the semantic `FdLock` cannot express.
+ */
+static std::optional<AutoCloseFD> tryAcquireSlotLock(const std::filesystem::path & path)
+{
+    AutoCloseFD fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (!fd)
+        throw SysError("opening user lock %s", PathFmt(path));
+
+    if (!lockFile(fd.get(), ltWrite, false))
+        return std::nullopt;
+    return fd;
+}
+
 struct SimpleUserLock : UserLock
 {
     AutoCloseFD fdUserLock;
@@ -95,14 +123,10 @@ struct SimpleUserLock : UserLock
 
             auto fnUserLock = userPoolDir / std::to_string(pw->pw_uid);
 
-            AutoCloseFD fd = open(fnUserLock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-            if (!fd)
-                throw SysError("opening user lock %s", PathFmt(fnUserLock));
-
-            if (lockFile(fd.get(), ltWrite, false)) {
+            if (auto fd = tryAcquireSlotLock(fnUserLock)) {
                 auto lock = std::make_unique<SimpleUserLock>();
 
-                lock->fdUserLock = std::move(fd);
+                lock->fdUserLock = std::move(*fd);
                 lock->uid = pw->pw_uid;
                 lock->gid = gr->gr_gid;
 
@@ -182,11 +206,7 @@ struct AutoUserLock : UserLock
 
             auto fnUserLock = userPoolDir / fmt("slot-%d", i);
 
-            AutoCloseFD fd = open(fnUserLock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-            if (!fd)
-                throw SysError("opening user lock %s", PathFmt(fnUserLock));
-
-            if (lockFile(fd.get(), ltWrite, false)) {
+            if (auto fd = tryAcquireSlotLock(fnUserLock)) {
 
                 auto firstUid = uidSettings.startId + i * maxIdsPerBuild;
 
@@ -195,7 +215,7 @@ struct AutoUserLock : UserLock
                     throw Error("auto-allocated UID %d clashes with existing user account '%s'", firstUid, pw->pw_name);
 
                 auto lock = std::make_unique<AutoUserLock>();
-                lock->fdUserLock = std::move(fd);
+                lock->fdUserLock = std::move(*fd);
                 lock->firstUid = firstUid;
                 if (useUserNamespace)
                     lock->firstGid = firstUid;
