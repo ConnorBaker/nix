@@ -1,8 +1,9 @@
 # Legacy CLI duplication
 
-Candidates 89-95. Six VALID; #94 PARTIALLY VALID — its named members
-`BuiltPath::parse` and `BuiltPath::to_string` are dead surface (declared in
-the header with no implementation and no caller anywhere in tree).
+Candidates 89-95 plus #222 and #223. Eight VALID; #94 PARTIALLY VALID
+— its named members `BuiltPath::parse` and `BuiltPath::to_string` are
+dead surface (declared in the header with no implementation and no
+caller anywhere in tree).
 
 | # | Verdict | Effort |
 | - | ------- | ------ |
@@ -13,6 +14,8 @@ the header with no implementation and no caller anywhere in tree).
 | 93 | VALID | small (three of four) / medium (`CmdHash`) |
 | 94 | PARTIALLY VALID | medium (with dead-surface deletion) |
 | 95 | VALID | small |
+| 222 | VALID | trivial |
+| 223 | VALID | trivial |
 
 ---
 
@@ -46,3 +49,12 @@ the header with no implementation and no caller anywhere in tree).
 95. **Legacy CLI shim duplicated between `compatNixHash` and `main_nix_prefetch_url`.** Both hand-roll an iterator-based `parseCmdLine` / `MyArgs::parseCmdline` argv loop that opens with `--help → showManPage(name)`, `--version → printVersion(name)`, dispatches on `--type` via `parseHashAlgo`, and falls through unknown `-`-prefixed flags via `return false`. `main_nix_prefetch_url` additionally derives a `MyArgs : LegacyArgs, MixEvalArgs` (subsumed by candidate #89); `compatNixHash` instead calls free `parseCmdLine(argc, argv, ...)` because it doesn't need eval. A small "legacy CLI shim" helper exposing `--help`/`--version`/algorithm-flag handling plus the iterator-loop scaffolding would consolidate both.
     - ../verified/17-nix-modern-1.md
     - **Validation:** VALID. **Pitfall:** `--help` paths in `nix-build` also call `deletePath(tmpDir);` before `showManPage`; the helper needs an optional cleanup hook. With `LegacyEvalArgs` (#89) and `LegacySubcommandTable` (#90), the legacy shim layer becomes a small library. Effort: small.
+
+222. **`--max-freed` parses as `int64_t` then clamps via `std::max(..., 0)` before assigning to `uint64_t`.** Both `nix-store --gc --max-freed N` (`nix/nix-store/nix-store.cc::opGC`) and `nix-collect-garbage --max-freed N` (`nix/nix-collect-garbage/nix-collect-garbage.cc::main_nix_collect_garbage`) parse the argument with `getIntArg<int64_t>(...)` and assign `options.maxFreed = std::max(getIntArg<int64_t>(...), (int64_t) 0)`. `GCOptions::maxFreed` (in `libstore/include/nix/store/gc-store.hh`) is `uint64_t`. A user passing a value above `INT64_MAX` (e.g. ~9.2 EB, hypothetically) overflows the parse to a negative `int64_t`, then `std::max(..., 0)` silently disables `--max-freed` rather than error. Parse as `uint64_t` directly via `getIntArg<uint64_t>(...)` and drop the `std::max` clamp. Fix is one-line at each of the two call sites.
+    - ../verified/18-nix-modern-2-legacy.md
+    - **Validation:** VALID. Pre-existing oddity surfaced by Pass-B reuse review of #128's `getIntArg` parameter cleanup. Both call sites are mechanical edits; `getIntArg<uint64_t>` works fine because `string2IntWithUnitPrefix<uint64_t>` accepts only non-negative values (rejects the leading `-`). Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libmain` (both call sites switched to `getIntArg<uint64_t>(...)` with the `std::max` clamp dropped; user-visible behaviour change for negative or out-of-range values: previously `--max-freed -1` silently disabled the cap, now it errors at parse time, and `--max-freed N` above `int64_t::max()` is now honoured up to `uint64_t::max()`).
+
+223. **`getIntArg<N>` is now a 5-line wrapper around `string2IntWithUnitPrefix<N>` whose only added value is the "requires an argument" error and the iterator advance.** After #128 dropped the `bool allowUnit` parameter, `getIntArg<N>(opt, i, end)` is just an iterator-bump + end-check + call-`string2IntWithUnitPrefix`. Both surviving call sites are legacy `nix-store --gc --max-freed` and `nix-collect-garbage --max-freed`. The function template is in shipped `libmain/include/nix/main/shared.hh`; inlining at the two call sites would let it be deleted from the header. Touches the same shipped header as #49/#128, so any external Hydra/Lix consumer would already need to recompile against the post-#128 header.
+    - ../verified/15-libflake-libmain.md
+    - **Validation:** VALID. **Pitfall:** the inlined form would re-spell the "requires an argument" error at each site — minor stylistic regression, not a behavioural one. Both call sites already use the same wording today via the shared template. **See also:** #49 (the `blockInt` deletion sibling), #128 (the `allowUnit` parameter deletion that surfaced this). Effort: trivial.

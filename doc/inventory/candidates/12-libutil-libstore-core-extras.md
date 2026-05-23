@@ -1,8 +1,8 @@
 # libutil + libstore-core extras
 
-Candidates 96-104 plus #218 and #221. Ten VALID; #104 PARTIALLY VALID
-— the `to_string` / `render` / `to_string_legacy` split is partly
-intentional CLI compat.
+Candidates 96-104 plus #218, #221, and #224. Eleven VALID; #104
+PARTIALLY VALID — the `to_string` / `render` / `to_string_legacy`
+split is partly intentional CLI compat.
 
 | # | Verdict | Effort |
 | - | ------- | ------ |
@@ -17,6 +17,7 @@ intentional CLI compat.
 | 104 | PARTIALLY VALID | medium |
 | 218 | VALID | small |
 | 221 | VALID | small |
+| 224 | VALID | trivial |
 
 ---
 
@@ -65,3 +66,7 @@ intentional CLI compat.
 
 218. **`Hash::dummy` and `StorePath::dummy` are overloaded as both "uninitialised placeholder" and "wire-marker for missing".** The two sentinels — `Hash::dummy` (in `libutil/hash.cc`) and `StorePath::dummy` (in `libstore/path.cc`) — serve two structurally different purposes with one type. **Placeholder-then-overwrite sites** (the value is constructed with `dummy`, then mutated to a real value before any read): `local-store.cc::queryPathInfoInternal` (`auto narHash = Hash::dummy;`), `derivation-trampoline-goal.cc` (`auto drvPath = StorePath::dummy;`), `make-content-addressed.cc` (constructs `ContentAddress` with `Hash::dummy` placeholder), `unix/build/derivation-builder.cc` (`Hash::dummy` slot in `ValidPathInfo` constructor before `narHash` is computed), `nar-info.cc::NarInfo` constructor (carries two `// FIXME: hack` comments adjacent to `UnkeyedValidPathInfo(store, Hash::dummy)` and `ValidPathInfo(StorePath::dummy, ...)`). **Wire-marker sites** (the value is genuinely `dummy` on the wire and decoded back to `dummy` on the other side): `worker-protocol.cc` and `serve-protocol.cc` use `Hash::dummy.to_string(HashFormat::Base16, true)` to mint a wire-format placeholder for `DrvOutput::id`'s missing-hash case, and `legacy-ssh-store.cc` does `if (info.narHash == Hash::dummy)` to detect the no-hash case across the wire. Plus a third class: tests use `Hash::dummy` as a known-canonical hash value. **The pattern is a name-collision smell.** The right factoring is `std::optional<Hash>` / `std::optional<StorePath>` for the placeholder-then-overwrite sites, and a separately-named sentinel (e.g. `Hash::wireUnsetMarker` or a wire-protocol-specific encoding) for the wire-marker sites. The codebase is already signalling discomfort via two `// FIXME: hack` tags in `nar-info.cc`.
     - **Validation:** VALID. **Verified inventory** via `grep -rn "Hash::dummy\|StorePath::dummy" src/ --include="*.cc" --include="*.hh" --include="*.h"`: 16 sites across `src/`, broken into placeholder-then-overwrite (6 sites including the FIXME-tagged `nar-info.cc` constructor), wire-marker (3 sites in `worker-protocol.cc`, `serve-protocol.cc`, `legacy-ssh-store.cc`), test fixture (3 sites in `register-valid-paths-bench.cc` and `serve-protocol.cc`), legitimate constant (`nix-store.cc` for `--add-fixed`), and the two definitions (`hash.cc`, `path.cc`). C1 named the placeholder-then-overwrite half; the wire-marker half is a separate but related observation. **Cross-class:** also "Latent bugs hiding inside duplication" — a wire-format change that touches `Hash::dummy.to_string(...)` while a placeholder-then-overwrite path forgets to overwrite would cause silent confusion between the two roles. **See also:** C1 for the pattern surface; #54 for an adjacent uninitialised-bool latent bug; #102 (`Keyed`/`Signable` mixin) shares the `nar-info.cc` constructor as a touchpoint. Effort: small (pattern is small per-site; aggregated it's medium because the wire-marker rename touches the protocol header).
+
+224. **`NarIndexer::createMember` computes path depth via `for (auto _ : path) (void) _; ++level;`.** In `libutil/nar-listing.cc`, the helper that's called per NAR entry by `parseDump` advances a `std::stack<NarListing*>` to track the current parent. The depth `level` is computed by iterating `path` and incrementing — which works because `CanonPath` is segment-iterable, but the idiomatic spelling is whatever `CanonPath` exposes for "number of segments". `CanonPath` does not currently expose a depth/segment-count accessor; either add one (e.g. `size_t numSegments() const`) and use it here, or rewrite the loop as `std::ranges::distance(path)` once `path` exposes its iterator pair as a forward range. Pre-existing oddity surfaced by Pass-B reuse review of #37. The cosmetic improvement is a one-line edit; the cleaner fix (a `CanonPath::numSegments` accessor) is also one-line in `canon-path.hh`.
+    - ../verified/01-libutil-io.md
+    - **Validation:** VALID. The current shape works; the asymmetry is purely stylistic. The cleaner factor — adding a `CanonPath::numSegments()` accessor — would also serve any future caller asking the same question without re-iterating. **See also:** #37 (the NAR-walk extraction that surfaced this). Effort: trivial.

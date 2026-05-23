@@ -185,8 +185,8 @@ closed enumeration (rule 3).
 | [08-duplicated-parsers.md](08-duplicated-parsers.md) | 61-68 | Duplicated parsers / regexes |
 | [09-cache-keys.md](09-cache-keys.md) | 69-71 | Cache-key construction scattered across modules |
 | [10-other.md](10-other.md) | 72-88 | Other distinct candidates |
-| [11-legacy-cli.md](11-legacy-cli.md) | 89-95 | Legacy CLI duplication |
-| [12-libutil-libstore-core-extras.md](12-libutil-libstore-core-extras.md) | 96-104, 218, 221 | libutil + libstore-core extras |
+| [11-legacy-cli.md](11-legacy-cli.md) | 89-95, 222, 223 | Legacy CLI duplication |
+| [12-libutil-libstore-core-extras.md](12-libutil-libstore-core-extras.md) | 96-104, 218, 221, 224 | libutil + libstore-core extras |
 | [13-libexpr-extras.md](13-libexpr-extras.md) | 105-120, 220 | libexpr extras |
 | [14-vestigial-stdlib.md](14-vestigial-stdlib.md) | 121-130 | Vestigial code, dead workarounds, stdlib replacements |
 | [15-globals-settings.md](15-globals-settings.md) | 131-149 | Globals, settings architecture, and dependency-injection |
