@@ -5,16 +5,9 @@ namespace nix {
 
 static void builtinUnpackChannel(const BuiltinBuilderContext & ctx)
 {
-    auto getAttr = [&](const std::string & name) -> const std::string & {
-        auto i = ctx.drv.env.find(name);
-        if (i == ctx.drv.env.end())
-            throw Error("attribute '%s' missing", name);
-        return i->second;
-    };
-
     std::filesystem::path out{ctx.outputs.at("out")};
-    auto & channelName = getAttr("channelName");
-    auto & src = getAttr("src");
+    auto & channelName = ctx.getEnvAttr("channelName");
+    auto & src = ctx.getEnvAttr("src");
 
     if (std::filesystem::path{channelName}.filename().string() != channelName) {
         throw Error("channelName is not allowed to contain filesystem separators, got %1%", channelName);

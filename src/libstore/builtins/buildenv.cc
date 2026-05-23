@@ -16,6 +16,14 @@ RegisterBuiltinBuilder::BuiltinBuilders & RegisterBuiltinBuilder::builtinBuilder
     return builders;
 }
 
+const std::string & BuiltinBuilderContext::getEnvAttr(const std::string & name) const
+{
+    auto i = drv.env.find(name);
+    if (i == drv.env.end())
+        throw Error("attribute '%s' missing", name);
+    return i->second;
+}
+
 namespace {
 
 struct State
@@ -170,13 +178,6 @@ void buildProfile(const std::filesystem::path & out, Packages && pkgs)
 
 static void builtinBuildenv(const BuiltinBuilderContext & ctx)
 {
-    auto getAttr = [&](const std::string & name) {
-        auto i = ctx.drv.env.find(name);
-        if (i == ctx.drv.env.end())
-            throw Error("attribute '%s' missing", name);
-        return i->second;
-    };
-
     auto out = ctx.outputs.at("out");
     createDirs(out);
 
@@ -184,7 +185,7 @@ static void builtinBuildenv(const BuiltinBuilderContext & ctx)
      * coherent data type. */
     Packages pkgs;
     {
-        auto derivations = tokenizeString<Strings>(getAttr("derivations"));
+        auto derivations = tokenizeString<Strings>(ctx.getEnvAttr("derivations"));
 
         auto itemIt = derivations.begin();
         while (itemIt != derivations.end()) {
@@ -201,7 +202,7 @@ static void builtinBuildenv(const BuiltinBuilderContext & ctx)
 
     buildProfile(out, std::move(pkgs));
 
-    createSymlink(getAttr("manifest"), out + "/manifest.nix");
+    createSymlink(ctx.getEnvAttr("manifest"), out + "/manifest.nix");
 }
 
 static RegisterBuiltinBuilder registerBuildenv("buildenv", builtinBuildenv);

@@ -26,6 +26,13 @@ struct BuiltinBuilderContext
      */
     std::optional<AwsCredentials> awsCredentials;
 #endif
+
+    /**
+     * Look up a required attribute on `drv.env`. Throws `Error` if the
+     * attribute is missing. Returns a reference into `drv.env`, valid
+     * for the lifetime of the context.
+     */
+    const std::string & getEnvAttr(const std::string & name) const;
 };
 
 using BuiltinBuilder = fun<void(const BuiltinBuilderContext &)>;
