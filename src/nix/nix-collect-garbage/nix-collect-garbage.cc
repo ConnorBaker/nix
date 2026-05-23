@@ -2,13 +2,13 @@
 #include "nix/util/signals.hh"
 #include "nix/util/error.hh"
 #include "nix/store/store-open.hh"
-#include "nix/store/store-cast.hh"
 #include "nix/store/gc-store.hh"
 #include "nix/store/profiles.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/globals.hh"
 #include "nix/cmd/legacy.hh"
 #include "man-pages.hh"
+#include "whole-store-gc.hh"
 
 #include <cerrno>
 
@@ -98,12 +98,8 @@ static int main_nix_collect_garbage(int argc, char ** argv)
         }
 
         auto store = openStore();
-        auto & gcStore = require<GcStore>(*store);
         options.action = dryRun ? GCOptions::gcReturnDead : GCOptions::gcDeleteDead;
-        options.pathsToDelete = GCOptions::WholeStore{};
-        GCResults results;
-        Finally printer([&] { printFreed(dryRun, results); });
-        gcStore.collectGarbage(options, results);
+        runWholeStoreGC(*store, options, [&](const GCResults & results) { printFreed(dryRun, results); });
 
         return 0;
     }

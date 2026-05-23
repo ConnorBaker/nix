@@ -24,6 +24,7 @@
 
 #include "man-pages.hh"
 #include "gc-root-namer.hh"
+#include "whole-store-gc.hh"
 
 #ifndef _WIN32 // TODO implement on Windows or provide allowed-to-noop interface
 #  include "nix/util/monitor-fd.hh"
@@ -652,9 +653,6 @@ static void opGC(Strings opFlags, Strings opArgs)
     bool printRoots = false;
     GCOptions options;
     options.action = GCOptions::gcDeleteDead;
-    options.pathsToDelete = GCOptions::WholeStore{};
-
-    GCResults results;
 
     /* Do what? */
     for (auto i = opFlags.begin(); i != opFlags.end(); ++i)
@@ -676,9 +674,8 @@ static void opGC(Strings opFlags, Strings opArgs)
         && (options.action == GCOptions::gcReturnDead || options.action == GCOptions::gcReturnLive || printRoots))
         throw UsageError("option --max-freed cannot be combined with --print-live, --print-dead, or --print-roots");
 
-    auto & gcStore = require<GcStore>(*store);
-
     if (printRoots) {
+        auto & gcStore = require<GcStore>(*store);
         Roots roots = gcStore.findRoots(false);
         std::set<std::pair<std::filesystem::path, StorePath>> roots2;
         // Transpose and sort the roots.
@@ -690,14 +687,13 @@ static void opGC(Strings opFlags, Strings opArgs)
     }
 
     else {
-        Finally printer([&] {
+        runWholeStoreGC(*store, options, [&](const GCResults & results) {
             if (options.action != GCOptions::gcDeleteDead)
                 for (auto & i : results.paths)
                     std::cout << i << std::endl;
             else
                 printFreed(false, results);
         });
-        gcStore.collectGarbage(options, results);
     }
 }
 

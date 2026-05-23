@@ -1,9 +1,9 @@
 #include "nix/cmd/command.hh"
 #include "command-register.hh"
+#include "whole-store-gc.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
-#include "nix/store/store-cast.hh"
 #include "nix/store/gc-store.hh"
 #include "nix/util/error.hh"
 
@@ -40,13 +40,8 @@ struct CmdStoreGC : StoreCommand, MixDryRun
         if (options.maxFreed != std::numeric_limits<uint64_t>::max() && dryRun)
             throw UsageError("options --max and --dry-run cannot be combined");
 
-        auto & gcStore = require<GcStore>(*store);
-
         options.action = dryRun ? GCOptions::gcReturnDead : GCOptions::gcDeleteDead;
-        options.pathsToDelete = GCOptions::WholeStore{};
-        GCResults results;
-        Finally printer([&] { printFreed(dryRun, results); });
-        gcStore.collectGarbage(options, results);
+        runWholeStoreGC(*store, options, [&](const GCResults & results) { printFreed(dryRun, results); });
     }
 };
 
