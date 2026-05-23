@@ -1226,30 +1226,33 @@ Derivation Store::readInvalidDerivation(const StorePath & drvPath)
     return readDerivationCommon(*this, drvPath, false);
 }
 
-void Store::signPathInfo(ValidPathInfo & info)
+/* Iterate the configured secret-key files, constructing a fresh
+   `LocalSigner` for each one and invoking the callback. The
+   per-key-file `SecretKey` construction is intentionally not cached
+   here; that is the substance of the "FIXME: keep secret keys in
+   memory" notes at the call sites and is tracked separately. */
+template<class Callback>
+static void forEachConfiguredSigner(const Callback & callback)
 {
-    // FIXME: keep secret keys in memory.
-
     auto secretKeyFiles = settings.secretKeyFiles;
 
     for (auto & secretKeyFile : secretKeyFiles.get()) {
         SecretKey secretKey(readFile(secretKeyFile));
         LocalSigner signer(std::move(secretKey));
-        info.sign(*this, signer);
+        callback(signer);
     }
+}
+
+void Store::signPathInfo(ValidPathInfo & info)
+{
+    // FIXME: keep secret keys in memory.
+    forEachConfiguredSigner([&](LocalSigner & signer) { info.sign(*this, signer); });
 }
 
 void Store::signRealisation(Realisation & realisation)
 {
     // FIXME: keep secret keys in memory.
-
-    auto secretKeyFiles = settings.secretKeyFiles;
-
-    for (auto & secretKeyFile : secretKeyFiles.get()) {
-        SecretKey secretKey(readFile(secretKeyFile));
-        LocalSigner signer(std::move(secretKey));
-        realisation.sign(realisation.id, signer);
-    }
+    forEachConfiguredSigner([&](LocalSigner & signer) { realisation.sign(realisation.id, signer); });
 }
 
 const std::filesystem::path & StoreConfig::getStateDir() const
