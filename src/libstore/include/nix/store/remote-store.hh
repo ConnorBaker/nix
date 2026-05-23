@@ -203,11 +203,6 @@ protected:
 
 private:
 
-    /**
-     * Same as the default implemenation of `RemoteStore::getFSAccessor`, but with a more preceise return type.
-     */
-    ref<RemoteFSAccessor> getRemoteFSAccessor(bool requireValidPath = true);
-
     std::atomic_bool failed{false};
 
     /**

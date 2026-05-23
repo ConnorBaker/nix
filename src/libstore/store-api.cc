@@ -10,6 +10,7 @@
 #include "nix/store/outputs-query.hh"
 #include "nix/util/util.hh"
 #include "nix/store/nar-info-disk-cache.hh"
+#include "nix/store/remote-fs-accessor.hh"
 #include "nix/util/thread-pool.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/callback.hh"
@@ -362,6 +363,11 @@ void Store::narFromPath(const StorePath & path, Sink & sink)
     auto accessor = requireStoreObjectAccessor(path);
     SourcePath sourcePath{accessor};
     dumpPath(sourcePath, sink, FileSerialisationMethod::NixArchive);
+}
+
+ref<RemoteFSAccessor> Store::getRemoteFSAccessor(bool requireValidPath)
+{
+    return make_ref<RemoteFSAccessor>(ref<Store>(shared_from_this()), requireValidPath, getLocalNarCacheDir());
 }
 
 StringSet Store::Config::getDefaultSystemFeatures()

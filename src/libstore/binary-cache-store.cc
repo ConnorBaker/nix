@@ -564,11 +564,6 @@ void BinaryCacheStore::registerDrvOutput(const Realisation & info)
         "application/json");
 }
 
-ref<RemoteFSAccessor> BinaryCacheStore::getRemoteFSAccessor(bool requireValidPath)
-{
-    return make_ref<RemoteFSAccessor>(ref<Store>(shared_from_this()), requireValidPath, config.localNarCache);
-}
-
 ref<SourceAccessor> BinaryCacheStore::getFSAccessor(bool requireValidPath)
 {
     return getRemoteFSAccessor(requireValidPath);

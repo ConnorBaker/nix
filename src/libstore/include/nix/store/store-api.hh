@@ -42,6 +42,7 @@ struct Derivation;
 struct SourceAccessor;
 struct NarInfoDiskCache;
 struct NarInfoDiskCacheSettings;
+class RemoteFSAccessor;
 class Store;
 
 typedef std::map<std::string, StorePath> OutputPathMap;
@@ -900,6 +901,32 @@ public:
      * given path.
      */
     virtual std::shared_ptr<SourceAccessor> getFSAccessor(const StorePath & path, bool requireValidPath = true) = 0;
+
+protected:
+
+    /**
+     * Hook for subclasses that fetch NARs over the wire to expose a
+     * local on-disk NAR cache directory. Returning `std::nullopt`
+     * (the default) disables the cache.
+     *
+     * Used by `getRemoteFSAccessor`.
+     */
+    virtual std::optional<AbsolutePath> getLocalNarCacheDir() const
+    {
+        return std::nullopt;
+    }
+
+    /**
+     * Construct a `RemoteFSAccessor` over this store, threading the
+     * local NAR cache directory from `getLocalNarCacheDir()`.
+     *
+     * Used by stores that fetch NARs over the wire (`RemoteStore`,
+     * `BinaryCacheStore`) as the implementation of their
+     * `getFSAccessor` overrides.
+     */
+    ref<RemoteFSAccessor> getRemoteFSAccessor(bool requireValidPath = true);
+
+public:
 
     /**
      * Get an accessor for the store object or throw an Error if it's invalid or

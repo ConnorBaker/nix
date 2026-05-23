@@ -186,10 +186,10 @@ private:
     ref<const ValidPathInfo> addToStoreCommon(
         Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(HashResult)> mkInfo);
 
-    /**
-     * Same as `getFSAccessor`, but with a more preceise return type.
-     */
-    ref<RemoteFSAccessor> getRemoteFSAccessor(bool requireValidPath = true);
+    std::optional<AbsolutePath> getLocalNarCacheDir() const override
+    {
+        return config.localNarCache;
+    }
 
 public:
 
