@@ -41,17 +41,17 @@ per-site change.
 4. **Length-prefixed container serialiser macros are three near-identical copies.** `WORKER_USE_LENGTH_PREFIX_SERIALISER`, `SERVE_USE_LENGTH_PREFIX_SERIALISER`, and `COMMON_USE_LENGTH_PREFIX_SERIALISER` each emit `Serialise<vector<T>>`/`Serialise<set<T>>`/`Serialise<tuple<Ts...>>`/`Serialise<map<K,V>>` specialisations delegating to `LengthPrefixedProtoHelper<Proto, T>`. The macros could be a single template parametrised on the protocol struct.
    - ../verified/09-libstore-protocol.md
    - **Validation:** VALID. The three macro families differ only by the `WorkerProto`/`ServeProto`/`CommonProto` token — collapsing to one Proto-parameterised template is mechanical. Effort: trivial.
-   - **Branch:** `vibe-coding/cleanup/libstore`
+   - **Branch:** `vibe-coding/cleanup/libstore` (initially collapsed to one Proto-parameterised macro `USE_LENGTH_PREFIX_SERIALISERS(Proto)`; a follow-up commit replaced the macro entirely with a `LengthPrefixedProtoHelper<Inner, T>` template constrained on a `LengthPrefixContainer` concept, plus a small body-stamping macro `NIX_DEFINE_LENGTH_PREFIX_SERIALISERS(Proto)` invoked once per impl header. Wire format byte-equivalent across all three protocols.)
 
 5. **`DECLARE_*_SERIALISER` declaration macros are three near-identical copies.** `DECLARE_COMMON_SERIALISER`, `DECLARE_WORKER_SERIALISER`, `DECLARE_SERVE_SERIALISER` differ only in the namespace prefix on `Serialise<T>` and (cosmetically) in the parameter name. Same shape as #4.
    - ../verified/09-libstore-protocol.md
    - **Validation:** VALID. Effort: trivial.
-   - **Branch:** `vibe-coding/cleanup/libstore`
+   - **Branch:** `vibe-coding/cleanup/libstore` (collapsed to a single `DECLARE_PROTO_SERIALISER(Proto, T)` macro shared with non-container Serialise<T> declarations; the per-protocol container BODIES were subsequently lifted into the `LengthPrefixedProtoHelper` template per #4's follow-up.)
 
 6. **`GET_PROTOCOL_MAJOR`/`GET_PROTOCOL_MINOR` macros duplicated.** Defined identically in both `worker-protocol.hh` and `serve-protocol.hh` (`(x) & 0xff00` and `(x) & 0x00ff`). Including both headers in the same TU works only because the second `#define` produces an identical token sequence.
    - ../verified/09-libstore-protocol.md
    - **Validation:** VALID. Promote to `common-protocol.hh` (or to a shared `proto-version.hh`). Effort: trivial.
-   - **Branch:** `vibe-coding/cleanup/libstore` (initially hoisted to `common-protocol.hh`; post-cleanup adversarial review found zero call sites tree-wide, so the macros were deleted entirely in a follow-up commit)
+   - **Branch:** `vibe-coding/cleanup/libstore` (initially hoisted to `common-protocol.hh`; post-cleanup adversarial review found zero call sites tree-wide, so the macros were deleted entirely in a follow-up commit. **Deliberate public-API break**: the macros lived in `install_headers`-shipped headers; external consumers (Hydra, Lix, plugins) using `GET_PROTOCOL_MAJOR(x)`/`GET_PROTOCOL_MINOR(x)` will fail to compile after migration. Replacement is `WorkerProto::Version::Number::fromWire(x).major`/`.minor`, but the major-byte semantic differs: the old macro returned the high byte unshifted (`(x) & 0xff00`), while the new accessor returns it shifted to bits 0-7. Migration must be manual, not mechanical.)
 
 7. **Protocol handshake logic is parallel between worker and serve.** `WorkerProto::BasicClientConnection::handshake` and `ServeProto::BasicClientConnection::handshake` both send magic-1, read magic-2, exchange version numbers, take the min. Worker additionally exchanges and intersects a `FeatureSet` (≥1.38) via private `intersectFeatures`; serve has no such step. Server-side mirrors are likewise parallel.
    - ../verified/09-libstore-protocol.md

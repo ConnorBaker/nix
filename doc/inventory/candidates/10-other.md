@@ -68,7 +68,7 @@ Candidates 72-88. All seventeen VALID.
 82. **`AutoUserLock`/`SimpleUserLock` `acquire` skeletons.** Both implementations open a per-slot lock file, try non-blocking exclusive lock via `lockFile(ltWrite, false)`, populate the lock object on success. The lock-acquisition skeleton could be shared.
     - ../verified/07-libstore-local.md
     - **Validation:** VALID — but the win is small (two call sites with one shared body of ~5 lines each). Extract `tryAcquireSlotLock(path) -> std::optional<AutoCloseFD>`; both call sites become a one-liner preceded by per-implementation prelude. Marginal as a debt entry; keep but accept that the duplication factored out is small. Effort: trivial.
-    - **Branch:** `vibe-coding/cleanup/libstore`
+    - **Branch:** `vibe-coding/cleanup/libstore` (file-static helper in `unix/user-lock.cc`. Deliberately bypasses `pathlocks.hh::FdLock` because `FdLock` is non-movable/non-copyable and the lock is handed off to the `UserLock`'s `AutoCloseFD` member for the duration of the build, not RAII-released at scope exit.)
 
 83. **`/nix/store` GC roots and runtime roots have three layers of similar logic.** `local-gc.cc::findRuntimeRootsUnchecked`, `gc.cc::requestRuntimeRoots`, and `gc.cc::LocalStore::findRuntimeRoots` form three layers; the first synthesises roots from `/proc` (or `lsof`), the second reads them from a Unix-domain socket, the third dispatches between the two. The `Roots` typedef and the file-local `UncheckedRoots` map use different key types (`StorePath` vs `std::string`).
     - ../verified/07-libstore-local.md

@@ -127,7 +127,7 @@ line in its body.
 | `vibe-coding/cleanup/libfetchers` | libfetchers | #52 | Pushed |
 | `vibe-coding/cleanup/libflake` | libflake | #48 | Pushed |
 | `vibe-coding/cleanup/libmain` | libmain | #49, #128 | Pushed |
-| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4, #5, #6, #14, #47, #82, #114, #115, #119, #157, #159, #165 | Local-only past `5f5b8151e` |
+| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4 (extended to template form), #5 (extended to template form), #6 (hoist-then-delete), #14, #47, #82, #114, #115, #119, #157, #159, #165 | Local-only past `5f5b8151e` |
 | `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117 | Local-only past `784a4f4b4` |
 | `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142, #24, #77, #89, #91, #187 | Local-only past `48524e038` |
 
