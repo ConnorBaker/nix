@@ -101,6 +101,44 @@ template<typename RegularContents, bool recur>
 inline std::strong_ordering
 VariantT<RegularContents, recur>::operator<=>(const VariantT<RegularContents, recur> &) const noexcept = default;
 
+/**
+ * Walk a `CanonPath` through a tree of `VariantT<...>` nodes, descending
+ * through `Directory` entries by name.
+ *
+ * Returns a pointer to the terminal node, or `nullptr` if any intermediate
+ * node is not a `Directory` or any path segment is missing from a
+ * directory's entries. The traversal does not follow symlinks: if an
+ * intermediate node is a `Symlink` (or `Regular`), the walk silently
+ * fails and returns `nullptr`.
+ *
+ * The returned `V *` aliases internal storage of `root`'s `Directory`
+ * entries (`std::map<Name, Child, std::less<>>`). Per `std::map`'s
+ * iterator-stability rules, inserting other entries does **not**
+ * invalidate it; erasing one of the entries on the walked path, or
+ * destroying/replacing `root` itself, does. Callers that mutate the
+ * tree must not retain the returned pointer across an `erase` of any
+ * entry on the walked path.
+ *
+ * Callers that need richer error reporting (e.g. throwing on intermediate
+ * symlinks) or interleaved creation of missing intermediates should
+ * implement that policy at the call site rather than extend this helper.
+ */
+template<typename V>
+V * descendPath(V & root, const CanonPath & path)
+{
+    V * cur = &root;
+    for (std::string_view name : path) {
+        auto * dir = std::get_if<typename V::Directory>(&cur->raw);
+        if (!dir)
+            return nullptr;
+        auto i = dir->entries.find(name);
+        if (i == dir->entries.end())
+            return nullptr;
+        cur = &i->second;
+    }
+    return cur;
+}
+
 } // namespace fso
 
 /**

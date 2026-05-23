@@ -46,19 +46,7 @@ struct NarAccessorImpl : NarAccessor
 
     NarListing * find(const CanonPath & path)
     {
-        NarListing * current = &root;
-
-        for (const auto & i : path) {
-            auto * dir = std::get_if<NarListing::Directory>(&current->raw);
-            if (!dir)
-                return nullptr;
-            auto * child = nix::get(dir->entries, i);
-            if (!child)
-                return nullptr;
-            current = child;
-        }
-
-        return current;
+        return fso::descendPath(root, path);
     }
 
     NarListing & get(const CanonPath & path)

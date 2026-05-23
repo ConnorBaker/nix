@@ -4,6 +4,11 @@
 
 namespace nix {
 
+/* Intentionally not implemented in terms of `fso::descendPath`: this
+   function interleaves descent with optional intermediate-directory
+   creation, throws `SymlinkNotAllowed` on traversed (non-leaf)
+   symlinks, and tracks per-segment depth to render error paths. None
+   of those policies belong in a generic descend helper. */
 MemorySourceAccessor::File * MemorySourceAccessor::open(const CanonPath & path, std::optional<File> create)
 {
     bool hasRoot = root.has_value();
