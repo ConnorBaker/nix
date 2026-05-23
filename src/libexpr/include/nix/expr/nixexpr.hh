@@ -468,6 +468,18 @@ struct Formal
     Expr * def;
 };
 
+/**
+ * Lower-bound lookup over a `Formal` range that is already sorted by
+ * `name`. Shared between the post-allocation `Formals` view and the
+ * parser-time `FormalsBuilder`.
+ */
+inline bool formalsHas(std::span<const Formal> formals, Symbol arg)
+{
+    auto it = std::lower_bound(
+        formals.begin(), formals.end(), arg, [](const Formal & f, const Symbol & sym) { return f.name < sym; });
+    return it != formals.end() && it->name == arg;
+}
+
 struct FormalsBuilder
 {
     typedef std::vector<Formal> Formals_;
@@ -479,9 +491,7 @@ struct FormalsBuilder
 
     bool has(Symbol arg) const
     {
-        auto it = std::lower_bound(
-            formals.begin(), formals.end(), arg, [](const Formal & f, const Symbol & sym) { return f.name < sym; });
-        return it != formals.end() && it->name == arg;
+        return formalsHas(formals, arg);
     }
 };
 
@@ -496,9 +506,7 @@ struct Formals
 
     bool has(Symbol arg) const
     {
-        auto it = std::lower_bound(
-            formals.begin(), formals.end(), arg, [](const Formal & f, const Symbol & sym) { return f.name < sym; });
-        return it != formals.end() && it->name == arg;
+        return formalsHas(formals, arg);
     }
 
     std::vector<Formal> lexicographicOrder(const SymbolTable & symbols) const
