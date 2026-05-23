@@ -5,10 +5,26 @@
 #include "nix/store/store-api.hh"
 #include "nix/store/ssh.hh"
 #include "nix/util/callback.hh"
+#include "nix/util/configuration.hh"
+#include "nix/util/file-descriptor.hh"
 #include "nix/util/pool.hh"
 #include "nix/store/serve-protocol.hh"
 
 namespace nix {
+
+#ifdef _WIN32
+/* On Windows `Descriptor` is `HANDLE` (an opaque pointer), so the
+   generic integer-only `BaseSetting<T>::parse` does not apply. Provide
+   a specialisation that parses the user-supplied integer file
+   descriptor and converts it to a native handle via `toDescriptor`.
+   On Unix `Descriptor == int`, so `BaseSetting<int>` (already
+   explicitly instantiated in `configuration.cc`) covers the same
+   declaration without needing a separate specialisation. */
+template<>
+Descriptor BaseSetting<Descriptor>::parse(const std::string & str) const;
+template<>
+std::string BaseSetting<Descriptor>::to_string() const;
+#endif
 
 struct LegacySSHStoreConfig : std::enable_shared_from_this<LegacySSHStoreConfig>, virtual CommonSSHStoreConfig
 {
@@ -24,14 +40,20 @@ public:
 
     LegacySSHStoreConfig(const ParsedURL::Authority & authority, const Params & params);
 
-#ifndef _WIN32
-    // Hack for getting remote build log output.
-    // Intentionally not in `LegacySSHStoreConfig` so that it doesn't appear in
-    // the documentation
-    Setting<int> logFD{this, INVALID_DESCRIPTOR, "log-fd", "file descriptor to which SSH's stderr is connected"};
-#else
-    Descriptor logFD = INVALID_DESCRIPTOR;
-#endif
+    /**
+     * Hack for getting remote build log output. Stored as a
+     * `Descriptor` so the same setting works on both Unix
+     * (`Descriptor == int`) and Windows (`Descriptor == HANDLE`); a
+     * `BaseSetting<Descriptor>` specialisation in `legacy-ssh-store.cc`
+     * parses the user-supplied integer FD into a native handle on
+     * Windows and stores it directly on Unix.  The default
+     * `INVALID_DESCRIPTOR` renders as `-1` on both platforms (see
+     * the `BaseSetting<Descriptor>::to_string` Windows specialisation
+     * for the matching INVALID_DESCRIPTOR carve-out), so the
+     * "documented default" pretty-printer keeps its pre-batch shape.
+     */
+    Setting<Descriptor> logFD{
+        this, INVALID_DESCRIPTOR, "log-fd", "file descriptor to which SSH's stderr is connected"};
 
     Setting<Strings> remoteProgram{
         this, {"nix-store"}, "remote-program", "Path to the `nix-store` executable on the remote machine."};

@@ -2,6 +2,7 @@
 #include "nix/store/common-ssh-store-config.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/pool.hh"
+#include "nix/util/util.hh"
 #include "nix/store/remote-store.hh"
 #include "nix/store/common-protocol.hh"
 #include "nix/store/serve-protocol.hh"
@@ -17,6 +18,36 @@
 #include "nix/store/globals.hh"
 
 namespace nix {
+
+#ifdef _WIN32
+template<>
+Descriptor BaseSetting<Descriptor>::parse(const std::string & str) const
+{
+    try {
+        return toDescriptor(string2IntWithUnitPrefix<int>(str));
+    } catch (...) {
+        throw UsageError("setting '%s' has invalid value '%s'", name, str);
+    }
+}
+
+template<>
+std::string BaseSetting<Descriptor>::to_string() const
+{
+    /* The descriptor's textual form is platform-dependent on Windows
+       (it is a `void*`).  This rendering is **one-way**: it is
+       suitable for diagnostic display and config dump only.  A real
+       round-trip through `parse` is impossible because `parse` reads
+       a CRT-FD-sized integer and converts via `_get_osfhandle`,
+       whereas the stored value is a `HANDLE` (full pointer).  The
+       only value that round-trips by accident is `INVALID_DESCRIPTOR
+       == -1`; for any other value, parsing the rendered output would
+       either overflow `int` and throw `UsageError`, or feed a
+       meaningless integer to `_get_osfhandle`. */
+    if (value == INVALID_DESCRIPTOR)
+        return "-1";
+    return std::to_string(reinterpret_cast<intptr_t>(value));
+}
+#endif
 
 LegacySSHStoreConfig::LegacySSHStoreConfig(const ParsedURL::Authority & authority, const Params & params)
     : StoreConfig(params, FilePathType::Unix)
