@@ -581,13 +581,19 @@ static RegisterPrimOp primop_typeOf({
     .impl = prim_typeOf,
 });
 
-/* Determine whether the argument is the null value. */
-static void prim_isNull(EvalState & state, const PosIdx pos, Value ** args, Value & v)
+/* Factory for the family of `builtins.isXxx` type-check primops: each
+   forces the argument and yields `args[0]->type() == target`. Identical
+   bodies for nNull/nFunction/nInt/nFloat/nString/nBool/nPath, plus
+   `isAttrs`/`isList` further down the file. */
+static auto makeTypeCheck(ValueType target)
 {
-    state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nNull);
+    return [target](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
+        state.forceValue(*args[0], pos);
+        v.mkBool(args[0]->type() == target);
+    };
 }
 
+/* Determine whether the argument is the null value. */
 static RegisterPrimOp primop_isNull({
     .name = "isNull",
     .args = {"e"},
@@ -596,103 +602,67 @@ static RegisterPrimOp primop_isNull({
 
       This is equivalent to `e == null`.
     )",
-    .impl = prim_isNull,
+    .impl = makeTypeCheck(nNull),
 });
 
 /* Determine whether the argument is a function. */
-static void prim_isFunction(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nFunction);
-}
-
 static RegisterPrimOp primop_isFunction({
     .name = "__isFunction",
     .args = {"e"},
     .doc = R"(
       Return `true` if *e* evaluates to a function, and `false` otherwise.
     )",
-    .impl = prim_isFunction,
+    .impl = makeTypeCheck(nFunction),
 });
 
 /* Determine whether the argument is an integer. */
-static void prim_isInt(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nInt);
-}
-
 static RegisterPrimOp primop_isInt({
     .name = "__isInt",
     .args = {"e"},
     .doc = R"(
       Return `true` if *e* evaluates to an integer, and `false` otherwise.
     )",
-    .impl = prim_isInt,
+    .impl = makeTypeCheck(nInt),
 });
 
 /* Determine whether the argument is a float. */
-static void prim_isFloat(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nFloat);
-}
-
 static RegisterPrimOp primop_isFloat({
     .name = "__isFloat",
     .args = {"e"},
     .doc = R"(
       Return `true` if *e* evaluates to a float, and `false` otherwise.
     )",
-    .impl = prim_isFloat,
+    .impl = makeTypeCheck(nFloat),
 });
 
 /* Determine whether the argument is a string. */
-static void prim_isString(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nString);
-}
-
 static RegisterPrimOp primop_isString({
     .name = "__isString",
     .args = {"e"},
     .doc = R"(
       Return `true` if *e* evaluates to a string, and `false` otherwise.
     )",
-    .impl = prim_isString,
+    .impl = makeTypeCheck(nString),
 });
 
 /* Determine whether the argument is a Boolean. */
-static void prim_isBool(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nBool);
-}
-
 static RegisterPrimOp primop_isBool({
     .name = "__isBool",
     .args = {"e"},
     .doc = R"(
       Return `true` if *e* evaluates to a bool, and `false` otherwise.
     )",
-    .impl = prim_isBool,
+    .impl = makeTypeCheck(nBool),
 });
 
 /* Determine whether the argument is a path. */
-static void prim_isPath(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nPath);
-}
-
 static RegisterPrimOp primop_isPath({
     .name = "__isPath",
     .args = {"e"},
     .doc = R"(
       Return `true` if *e* evaluates to a path, and `false` otherwise.
     )",
-    .impl = prim_isPath,
+    .impl = makeTypeCheck(nPath),
 });
 
 template<typename Callable>
@@ -3258,19 +3228,13 @@ static RegisterPrimOp primop_hasAttr({
 });
 
 /* Determine whether the argument is a set. */
-static void prim_isAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nAttrs);
-}
-
 static RegisterPrimOp primop_isAttrs({
     .name = "__isAttrs",
     .args = {"e"},
     .doc = R"(
       Return `true` if *e* evaluates to a set, and `false` otherwise.
     )",
-    .impl = prim_isAttrs,
+    .impl = makeTypeCheck(nAttrs),
 });
 
 static void prim_removeAttrs(EvalState & state, const PosIdx pos, Value ** args, Value & v)
@@ -3728,19 +3692,13 @@ static RegisterPrimOp primop_zipAttrsWith({
  *************************************************************/
 
 /* Determine whether the argument is a list. */
-static void prim_isList(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    state.forceValue(*args[0], pos);
-    v.mkBool(args[0]->type() == nList);
-}
-
 static RegisterPrimOp primop_isList({
     .name = "__isList",
     .args = {"e"},
     .doc = R"(
       Return `true` if *e* evaluates to a list, and `false` otherwise.
     )",
-    .impl = prim_isList,
+    .impl = makeTypeCheck(nList),
 });
 
 /* Return the n-1'th element of a list. */
