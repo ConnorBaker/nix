@@ -2,11 +2,22 @@
 /**
  * @file
  *
- * Reusable serialisers for serialization container types in a
- * length-prefixed manner.
+ * Reusable serialisers for length-prefixed container types.
  *
- * Used by both the Worker and Serve protocols.
+ * Used by the worker, serve, and common protocols. Each protocol
+ * declares (via `DECLARE_PROTO_SERIALISER`) the four container
+ * specialisations of `Proto::Serialise<T>` for `std::vector<T>`,
+ * `std::set<T, Compare>`, `std::tuple<Ts...>`, and `std::map<K, V, Compare>`,
+ * then includes this header to define the bodies as forwards to
+ * `LengthPrefixedProtoHelper<Proto, T>::read`/`write`.
  */
+
+#include <map>
+#include <set>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "nix/util/types.hh"
 
@@ -14,184 +25,188 @@ namespace nix {
 
 struct StoreDirConfig;
 
-/**
- * Reusable serialisers for serialization container types in a
- * length-prefixed manner.
- *
- * @param T The type of the collection being serialised
- *
- * @param Inner This the most important parameter; this is the "inner"
- * protocol. The user of this will substitute `MyProtocol` or similar
- * when making a `MyProtocol::Serialiser<Collection<T>>`. Note that the
- * inside is allowed to call to call `Inner::Serialiser` on different
- * types. This is especially important for `std::map` which doesn't have
- * a single `T` but one `K` and one `V`.
- */
-template<class Inner, typename T>
-struct LengthPrefixedProtoHelper;
+namespace length_prefixed_detail {
 
-#define LENGTH_PREFIXED_PROTO_HELPER(Inner, T)                                                          \
-    struct LengthPrefixedProtoHelper<Inner, T>                                                          \
-    {                                                                                                   \
-        static T read(const StoreDirConfig & store, typename Inner::ReadConn conn);                     \
-        static void write(const StoreDirConfig & store, typename Inner::WriteConn conn, const T & str); \
-    private:                                                                                            \
-        /*!                                                                                             \
-         * Read this as simply `using S = Inner::Serialise;`.                                           \
-         *                                                                                              \
-         * It would be nice to use that directly, but C++ doesn't seem to allow                         \
-         * it. The `typename` keyword needed to refer to `Inner` seems to greedy                        \
-         * (low precedence), and then C++ complains that `Serialise` is not a                           \
-         * type parameter but a real type.                                                              \
-         *                                                                                              \
-         * Making this `S` alias seems to be the only way to avoid these issues.                        \
-         */                                                                                             \
-        template<typename U>                                                                            \
-        using S = typename Inner::template Serialise<U>;                                                \
-    }
+template<typename T>
+struct is_vector : std::false_type
+{};
 
-template<class Inner, typename T>
-LENGTH_PREFIXED_PROTO_HELPER(Inner, std::vector<T>);
+template<typename T, typename A>
+struct is_vector<std::vector<T, A>> : std::true_type
+{};
 
-#define LENGTH_PREFIXED_PROTO_HELPER_COMMA ,
-template<class Inner, typename T, typename Compare>
-LENGTH_PREFIXED_PROTO_HELPER(Inner, std::set<T LENGTH_PREFIXED_PROTO_HELPER_COMMA Compare>);
+template<typename T>
+struct is_set : std::false_type
+{};
 
-template<class Inner, typename... Ts>
-LENGTH_PREFIXED_PROTO_HELPER(Inner, std::tuple<Ts...>);
+template<typename T, typename C, typename A>
+struct is_set<std::set<T, C, A>> : std::true_type
+{};
 
-template<class Inner, typename K, typename V, typename Compare>
-LENGTH_PREFIXED_PROTO_HELPER(
-    Inner, std::map<K LENGTH_PREFIXED_PROTO_HELPER_COMMA V LENGTH_PREFIXED_PROTO_HELPER_COMMA Compare>);
-#undef LENGTH_PREFIXED_PROTO_HELPER_COMMA
+template<typename T>
+struct is_map : std::false_type
+{};
+
+template<typename K, typename V, typename C, typename A>
+struct is_map<std::map<K, V, C, A>> : std::true_type
+{};
+
+template<typename T>
+struct is_tuple : std::false_type
+{};
+
+template<typename... Ts>
+struct is_tuple<std::tuple<Ts...>> : std::true_type
+{};
+
+} // namespace length_prefixed_detail
 
 /**
- * Define `Proto::Serialise<T>::read`/`write` as thin forwards to
- * `LengthPrefixedProtoHelper<Proto, T>`.
- *
- * Used by the worker, serve, and common protocol impl headers to lift
- * the four container specialisations (vector, set, tuple, map) out of
- * per-protocol duplication.
- *
- * Like `LENGTH_PREFIXED_PROTO_HELPER` above, this macro and the
- * `USE_LENGTH_PREFIX_SERIALISER_COMMA`/`USE_LENGTH_PREFIX_SERIALISERS`
- * pair are public API of this header: the impl headers expand them at
- * call sites, so they must remain defined for downstream consumers and
- * are deliberately not `#undef`'d.
+ * Concept matching the four container shapes that have length-prefixed
+ * serialisers (`std::vector`, `std::set`, `std::map`, `std::tuple`).
  */
-#define USE_LENGTH_PREFIX_SERIALISER(Proto, TEMPLATE, T)                                  \
-    TEMPLATE T Proto::Serialise<T>::read(const StoreDirConfig & store, Proto::ReadConn conn) \
-    {                                                                                     \
-        return LengthPrefixedProtoHelper<Proto, T>::read(store, conn);                    \
-    }                                                                                     \
-    TEMPLATE void Proto::Serialise<T>::write(                                             \
-        const StoreDirConfig & store, Proto::WriteConn conn, const T & t)                 \
-    {                                                                                     \
-        LengthPrefixedProtoHelper<Proto, T>::write(store, conn, t);                       \
-    }
+template<typename T>
+concept LengthPrefixContainer = length_prefixed_detail::is_vector<T>::value
+                             || length_prefixed_detail::is_set<T>::value
+                             || length_prefixed_detail::is_map<T>::value
+                             || length_prefixed_detail::is_tuple<T>::value;
 
 /**
- * Instantiate the four container serialiser specialisations
- * (`std::vector`, `std::set`, `std::tuple`, `std::map`) for `Proto` via
- * `USE_LENGTH_PREFIX_SERIALISER`.
+ * Reusable read/write helper for length-prefixed container types.
+ *
+ * `Inner` is the protocol class (e.g. `WorkerProto`, `ServeProto`,
+ * `CommonProto`) and `T` is one of the four container specialisations
+ * matching `LengthPrefixContainer`. The element-level (re)dispatch goes
+ * back through `Inner::Serialise<element_type>` so each protocol's
+ * conventions are honoured.
  */
-#define USE_LENGTH_PREFIX_SERIALISER_COMMA ,
-#define USE_LENGTH_PREFIX_SERIALISERS(Proto)                                                                       \
-    USE_LENGTH_PREFIX_SERIALISER(Proto, template<typename T>, std::vector<T>)                                      \
-    USE_LENGTH_PREFIX_SERIALISER(                                                                                  \
-        Proto,                                                                                                     \
-        template<typename T USE_LENGTH_PREFIX_SERIALISER_COMMA typename Compare>,                                  \
-        std::set<T USE_LENGTH_PREFIX_SERIALISER_COMMA Compare>)                                                    \
-    USE_LENGTH_PREFIX_SERIALISER(Proto, template<typename... Ts>, std::tuple<Ts...>)                               \
-    USE_LENGTH_PREFIX_SERIALISER(                                                                                  \
-        Proto,                                                                                                     \
-        template<typename K USE_LENGTH_PREFIX_SERIALISER_COMMA typename V USE_LENGTH_PREFIX_SERIALISER_COMMA       \
-                     typename Compare>,                                                                            \
-        std::map<K USE_LENGTH_PREFIX_SERIALISER_COMMA V USE_LENGTH_PREFIX_SERIALISER_COMMA Compare>)
-
-template<class Inner, typename T>
-std::vector<T>
-LengthPrefixedProtoHelper<Inner, std::vector<T>>::read(const StoreDirConfig & store, typename Inner::ReadConn conn)
+template<class Inner, LengthPrefixContainer T>
+struct LengthPrefixedProtoHelper
 {
-    std::vector<T> resSet;
-    auto size = readNum<size_t>(conn.from);
-    while (size--) {
-        resSet.push_back(S<T>::read(store, conn));
+private:
+    template<typename U>
+    using S = typename Inner::template Serialise<U>;
+
+public:
+    static T read(const StoreDirConfig & store, typename Inner::ReadConn conn)
+    {
+        if constexpr (length_prefixed_detail::is_vector<T>::value) {
+            T result;
+            auto size = readNum<size_t>(conn.from);
+            while (size--)
+                result.push_back(S<typename T::value_type>::read(store, conn));
+            return result;
+        } else if constexpr (length_prefixed_detail::is_set<T>::value) {
+            T result;
+            auto size = readNum<size_t>(conn.from);
+            while (size--)
+                result.insert(S<typename T::value_type>::read(store, conn));
+            return result;
+        } else if constexpr (length_prefixed_detail::is_map<T>::value) {
+            T result;
+            auto size = readNum<size_t>(conn.from);
+            while (size--) {
+                auto k = S<typename T::key_type>::read(store, conn);
+                auto v = S<typename T::mapped_type>::read(store, conn);
+                result.insert_or_assign(std::move(k), std::move(v));
+            }
+            return result;
+        } else /* tuple */ {
+            return [&]<size_t... Is>(std::index_sequence<Is...>) {
+                return T{S<std::tuple_element_t<Is, T>>::read(store, conn)...};
+            }(std::make_index_sequence<std::tuple_size_v<T>>{});
+        }
     }
-    return resSet;
-}
 
-template<class Inner, typename T>
-void LengthPrefixedProtoHelper<Inner, std::vector<T>>::write(
-    const StoreDirConfig & store, typename Inner::WriteConn conn, const std::vector<T> & resSet)
-{
-    conn.to << resSet.size();
-    for (auto & key : resSet) {
-        S<T>::write(store, conn, key);
+    static void write(const StoreDirConfig & store, typename Inner::WriteConn conn, const T & value)
+    {
+        if constexpr (length_prefixed_detail::is_vector<T>::value
+                      || length_prefixed_detail::is_set<T>::value) {
+            conn.to << value.size();
+            for (auto & elem : value)
+                S<typename T::value_type>::write(store, conn, elem);
+        } else if constexpr (length_prefixed_detail::is_map<T>::value) {
+            conn.to << value.size();
+            for (auto & [k, v] : value) {
+                S<typename T::key_type>::write(store, conn, k);
+                S<typename T::mapped_type>::write(store, conn, v);
+            }
+        } else /* tuple */ {
+            std::apply(
+                [&]<typename... Us>(const Us &... args) { (S<Us>::write(store, conn, args), ...); },
+                value);
+        }
     }
-}
-
-template<class Inner, typename T, typename Compare>
-std::set<T, Compare> LengthPrefixedProtoHelper<Inner, std::set<T, Compare>>::read(
-    const StoreDirConfig & store, typename Inner::ReadConn conn)
-{
-    std::set<T, Compare> resSet;
-    auto size = readNum<size_t>(conn.from);
-    while (size--) {
-        resSet.insert(S<T>::read(store, conn));
-    }
-    return resSet;
-}
-
-template<class Inner, typename T, typename Compare>
-void LengthPrefixedProtoHelper<Inner, std::set<T, Compare>>::write(
-    const StoreDirConfig & store, typename Inner::WriteConn conn, const std::set<T, Compare> & resSet)
-{
-    conn.to << resSet.size();
-    for (auto & key : resSet) {
-        S<T>::write(store, conn, key);
-    }
-}
-
-template<class Inner, typename K, typename V, typename Compare>
-std::map<K, V, Compare> LengthPrefixedProtoHelper<Inner, std::map<K, V, Compare>>::read(
-    const StoreDirConfig & store, typename Inner::ReadConn conn)
-{
-    std::map<K, V, Compare> resMap;
-    auto size = readNum<size_t>(conn.from);
-    while (size--) {
-        auto k = S<K>::read(store, conn);
-        auto v = S<V>::read(store, conn);
-        resMap.insert_or_assign(std::move(k), std::move(v));
-    }
-    return resMap;
-}
-
-template<class Inner, typename K, typename V, typename Compare>
-void LengthPrefixedProtoHelper<Inner, std::map<K, V, Compare>>::write(
-    const StoreDirConfig & store, typename Inner::WriteConn conn, const std::map<K, V, Compare> & resMap)
-{
-    conn.to << resMap.size();
-    for (auto & i : resMap) {
-        S<K>::write(store, conn, i.first);
-        S<V>::write(store, conn, i.second);
-    }
-}
-
-template<class Inner, typename... Ts>
-std::tuple<Ts...>
-LengthPrefixedProtoHelper<Inner, std::tuple<Ts...>>::read(const StoreDirConfig & store, typename Inner::ReadConn conn)
-{
-    return std::tuple<Ts...>{
-        S<Ts>::read(store, conn)...,
-    };
-}
-
-template<class Inner, typename... Ts>
-void LengthPrefixedProtoHelper<Inner, std::tuple<Ts...>>::write(
-    const StoreDirConfig & store, typename Inner::WriteConn conn, const std::tuple<Ts...> & res)
-{
-    std::apply([&]<typename... Us>(const Us &... args) { (S<Us>::write(store, conn, args), ...); }, res);
-}
+};
 
 } // namespace nix
+
+/**
+ * Define `Proto::Serialise<T>::read`/`write` bodies for the four
+ * length-prefixed container specialisations (`std::vector<T>`,
+ * `std::set<T, Compare>`, `std::tuple<Ts...>`, `std::map<K, V, Compare>`)
+ * as thin forwards to `nix::LengthPrefixedProtoHelper<Proto, T>`.
+ *
+ * Used by `worker-protocol-impl.hh`, `serve-protocol-impl.hh`, and
+ * `common-protocol-impl.hh`. Each impl header invokes this macro once
+ * with its protocol class to instantiate the four pairs at namespace
+ * scope. The corresponding declarations are emitted by
+ * `DECLARE_PROTO_SERIALISER` in the protocol headers.
+ *
+ * Must be invoked at `nix` namespace scope (not inside `namespace nix
+ * { ... }`).
+ */
+#define NIX_DEFINE_LENGTH_PREFIX_SERIALISERS(Proto)                                                             \
+    namespace nix {                                                                                             \
+    template<typename T>                                                                                        \
+    std::vector<T>                                                                                              \
+    Proto::Serialise<std::vector<T>>::read(const StoreDirConfig & store, Proto::ReadConn conn)                  \
+    {                                                                                                           \
+        return LengthPrefixedProtoHelper<Proto, std::vector<T>>::read(store, conn);                             \
+    }                                                                                                           \
+    template<typename T>                                                                                        \
+    void Proto::Serialise<std::vector<T>>::write(                                                               \
+        const StoreDirConfig & store, Proto::WriteConn conn, const std::vector<T> & v)                          \
+    {                                                                                                           \
+        LengthPrefixedProtoHelper<Proto, std::vector<T>>::write(store, conn, v);                                \
+    }                                                                                                           \
+                                                                                                                \
+    template<typename T, typename Compare>                                                                      \
+    std::set<T, Compare>                                                                                        \
+    Proto::Serialise<std::set<T, Compare>>::read(const StoreDirConfig & store, Proto::ReadConn conn)            \
+    {                                                                                                           \
+        return LengthPrefixedProtoHelper<Proto, std::set<T, Compare>>::read(store, conn);                       \
+    }                                                                                                           \
+    template<typename T, typename Compare>                                                                      \
+    void Proto::Serialise<std::set<T, Compare>>::write(                                                         \
+        const StoreDirConfig & store, Proto::WriteConn conn, const std::set<T, Compare> & v)                    \
+    {                                                                                                           \
+        LengthPrefixedProtoHelper<Proto, std::set<T, Compare>>::write(store, conn, v);                          \
+    }                                                                                                           \
+                                                                                                                \
+    template<typename... Ts>                                                                                    \
+    std::tuple<Ts...>                                                                                           \
+    Proto::Serialise<std::tuple<Ts...>>::read(const StoreDirConfig & store, Proto::ReadConn conn)               \
+    {                                                                                                           \
+        return LengthPrefixedProtoHelper<Proto, std::tuple<Ts...>>::read(store, conn);                          \
+    }                                                                                                           \
+    template<typename... Ts>                                                                                    \
+    void Proto::Serialise<std::tuple<Ts...>>::write(                                                            \
+        const StoreDirConfig & store, Proto::WriteConn conn, const std::tuple<Ts...> & v)                       \
+    {                                                                                                           \
+        LengthPrefixedProtoHelper<Proto, std::tuple<Ts...>>::write(store, conn, v);                             \
+    }                                                                                                           \
+                                                                                                                \
+    template<typename K, typename V, typename Compare>                                                          \
+    std::map<K, V, Compare>                                                                                     \
+    Proto::Serialise<std::map<K, V, Compare>>::read(const StoreDirConfig & store, Proto::ReadConn conn)         \
+    {                                                                                                           \
+        return LengthPrefixedProtoHelper<Proto, std::map<K, V, Compare>>::read(store, conn);                    \
+    }                                                                                                           \
+    template<typename K, typename V, typename Compare>                                                          \
+    void Proto::Serialise<std::map<K, V, Compare>>::write(                                                      \
+        const StoreDirConfig & store, Proto::WriteConn conn, const std::map<K, V, Compare> & v)                 \
+    {                                                                                                           \
+        LengthPrefixedProtoHelper<Proto, std::map<K, V, Compare>>::write(store, conn, v);                       \
+    }                                                                                                           \
+    } /* namespace nix */

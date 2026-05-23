@@ -11,11 +11,9 @@
 #include "nix/store/worker-protocol.hh"
 #include "nix/store/length-prefixed-protocol-helper.hh"
 
+NIX_DEFINE_LENGTH_PREFIX_SERIALISERS(WorkerProto)
+
 namespace nix {
-
-/* protocol-agnostic templates */
-
-USE_LENGTH_PREFIX_SERIALISERS(WorkerProto)
 
 /**
  * Use `CommonProto` where possible.

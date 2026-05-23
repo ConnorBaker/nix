@@ -11,11 +11,9 @@
 #include "nix/store/common-protocol.hh"
 #include "nix/store/length-prefixed-protocol-helper.hh"
 
+NIX_DEFINE_LENGTH_PREFIX_SERIALISERS(CommonProto)
+
 namespace nix {
-
-/* protocol-agnostic templates */
-
-USE_LENGTH_PREFIX_SERIALISERS(CommonProto)
 
 /* protocol-specific templates */
 
