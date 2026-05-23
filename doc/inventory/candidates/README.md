@@ -190,7 +190,7 @@ closed enumeration (rule 3).
 | [13-libexpr-extras.md](13-libexpr-extras.md) | 105-120 | libexpr extras |
 | [14-vestigial-stdlib.md](14-vestigial-stdlib.md) | 121-130 | Vestigial code, dead workarounds, stdlib replacements |
 | [15-globals-settings.md](15-globals-settings.md) | 131-149 | Globals, settings architecture, and dependency-injection |
-| [16-libstore-build-audit.md](16-libstore-build-audit.md) | 150-160 | libstore/build deep audit |
+| [16-libstore-build-audit.md](16-libstore-build-audit.md) | 150-160, 219 | libstore/build deep audit |
 | [17-cross-cutting.md](17-cross-cutting.md) | 161-175 | Cross-cutting: platforms, headers, magic numbers |
 | [18-daemon-protocol-audit.md](18-daemon-protocol-audit.md) | 176-188 | Daemon and protocol-dispatch deep audit |
 | [19-eval-core-fetcher-lookup-json.md](19-eval-core-fetcher-lookup-json.md) | 189-200 | libexpr eval-core: fetcher primops, lookup-path, JSON |
