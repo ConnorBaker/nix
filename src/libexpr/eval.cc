@@ -2271,12 +2271,12 @@ void EvalState::tryFixupBlackHolePos(Value & v, PosIdx pos)
 
 void EvalState::forceValueDeep(Value & v)
 {
-    std::set<const Value *> seen;
+    SeenSet seen;
 
     [&, &state(*this)](this const auto & recurse, Value & v) {
         auto _level = state.addCallDepth(v.determinePos(noPos));
 
-        if (!seen.insert(&v).second)
+        if (!dedupe(seen, &v))
             return;
 
         state.forceValue(v, v.determinePos(noPos));
