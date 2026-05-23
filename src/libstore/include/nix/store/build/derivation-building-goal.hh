@@ -94,6 +94,16 @@ private:
         PathLocks outputLocks);
 
     /**
+     * Run the post-build hook (if configured) over `outputPaths` and
+     * drive the resulting child to completion via `WaitForChildEvent`.
+     *
+     * Used as the tail of both `buildWithHook` and `buildLocally`,
+     * which both produce the same set of outputs and share identical
+     * post-build-hook handling.
+     */
+    Co runPostBuildHookCo(StorePathSet outputPaths);
+
+    /**
      * Is the build hook willing to perform the build?
      */
     HookReply tryBuildHook(const DerivationOptions<StorePath> & drvOptions);

@@ -828,20 +828,7 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
     for (auto & [_, output] : builtOutputs)
         outputPaths.insert(output.outPath);
 
-    if (worker.settings.postBuildHook.get() != "") {
-        auto hookState = runPostBuildHook(worker.settings, worker.store, *logger, drvPath, outputPaths);
-        worker.childStarted(shared_from_this(), {hookState->out->readSide.get()}, false, false);
-        while (true) {
-            auto event = co_await WaitForChildEvent{};
-            if (auto * output = std::get_if<ChildOutput>(&event)) {
-                (*hookState->sink)(output->data);
-            } else if (std::get_if<ChildEOF>(&event)) {
-                hookState->complete();
-                worker.childTerminated(this);
-                break;
-            }
-        }
-    }
+    co_await runPostBuildHookCo(std::move(outputPaths));
 
     /* It is now safe to delete the lock files, since all future
        lockers will see that the output paths are valid; they will
@@ -1072,20 +1059,7 @@ Goal::Co DerivationBuildingGoal::buildLocally(
             outputPaths.insert(output.outPath);
         }
 
-        if (worker.settings.postBuildHook.get() != "") {
-            auto hookState = runPostBuildHook(worker.settings, worker.store, *logger, drvPath, outputPaths);
-            worker.childStarted(shared_from_this(), {hookState->out->readSide.get()}, false, false);
-            while (true) {
-                auto event = co_await WaitForChildEvent{};
-                if (auto * output = std::get_if<ChildOutput>(&event)) {
-                    (*hookState->sink)(output->data);
-                } else if (std::get_if<ChildEOF>(&event)) {
-                    hookState->complete();
-                    worker.childTerminated(this);
-                    break;
-                }
-            }
-        }
+        co_await runPostBuildHookCo(std::move(outputPaths));
 
         /* It is now safe to delete the lock files, since all future
            lockers will see that the output paths are valid; they will
@@ -1096,6 +1070,25 @@ Goal::Co DerivationBuildingGoal::buildLocally(
         co_return doneSuccess(BuildResult::Success::Built, std::move(builtOutputs));
     }
 #endif
+}
+
+Goal::Co DerivationBuildingGoal::runPostBuildHookCo(StorePathSet outputPaths)
+{
+    if (worker.settings.postBuildHook.get() != "") {
+        auto hookState = runPostBuildHook(worker.settings, worker.store, *logger, drvPath, outputPaths);
+        worker.childStarted(shared_from_this(), {hookState->out->readSide.get()}, false, false);
+        while (true) {
+            auto event = co_await WaitForChildEvent{};
+            if (auto * output = std::get_if<ChildOutput>(&event)) {
+                (*hookState->sink)(output->data);
+            } else if (std::get_if<ChildEOF>(&event)) {
+                hookState->complete();
+                worker.childTerminated(this);
+                break;
+            }
+        }
+    }
+    co_return Return{};
 }
 
 static std::unique_ptr<PostBuildHookState> runPostBuildHook(
