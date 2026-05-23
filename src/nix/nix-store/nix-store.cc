@@ -24,6 +24,7 @@
 
 #include "man-pages.hh"
 #include "gc-root-namer.hh"
+#include "run-nar-dump.hh"
 #include "whole-store-gc.hh"
 
 #ifndef _WIN32 // TODO implement on Windows or provide allowed-to-noop interface
@@ -733,10 +734,11 @@ static void opDump(Strings opFlags, Strings opArgs)
     if (opArgs.size() != 1)
         throw UsageError("only one argument allowed");
 
-    FdSink sink(getStandardOutput());
     std::string path = *opArgs.begin();
-    dumpPath(path, sink);
-    sink.flush();
+    /* Legacy CLI: skip the TTY check that the modern `nix store
+       dump-path` / `nix nar pack` apply, preserving historical
+       behaviour. */
+    runNarDump([&](Sink & sink) { dumpPath(path, sink); }, /* checkTTY = */ false);
 }
 
 /* Restore a value from a Nix archive.  The archive is read from stdin. */

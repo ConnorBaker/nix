@@ -1,18 +1,9 @@
 #include "nix/cmd/command.hh"
 #include "command-register.hh"
+#include "run-nar-dump.hh"
 #include "nix/store/store-api.hh"
-#include "nix/util/archive.hh"
-#include "nix/util/terminal.hh"
 
 namespace nix {
-
-static FdSink getNarSink()
-{
-    auto fd = getStandardOutput();
-    if (isTTY(fd))
-        throw UsageError("refusing to write NAR to a terminal");
-    return FdSink(std::move(fd));
-}
 
 struct CmdDumpPath : StorePathCommand
 {
@@ -30,9 +21,7 @@ struct CmdDumpPath : StorePathCommand
 
     void run(ref<Store> store, const StorePath & storePath) override
     {
-        auto sink = getNarSink();
-        store->narFromPath(storePath, sink);
-        sink.flush();
+        runNarDump([&](Sink & sink) { store->narFromPath(storePath, sink); }, /* checkTTY = */ true);
     }
 };
 
@@ -61,9 +50,7 @@ struct CmdDumpPath2 : Command
 
     void run() override
     {
-        auto sink = getNarSink();
-        dumpPath(path, sink);
-        sink.flush();
+        runNarDump([&](Sink & sink) { dumpPath(path, sink); }, /* checkTTY = */ true);
     }
 };
 
