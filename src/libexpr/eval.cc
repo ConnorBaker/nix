@@ -2204,6 +2204,37 @@ void ExprBlackHole::eval(EvalState & state, [[maybe_unused]] Env & env, Value & 
     state.error<InfiniteRecursionError>("infinite recursion encountered").atPos(v.determinePos(noPos)).debugThrow();
 }
 
+/**
+ * Consolidate the "set v to a failed Value carrying the in-flight exception,
+ * with an optional recovery Value if the exception is RecoverableEvalError"
+ * dance shared between handleEvalExceptionForThunk and
+ * handleEvalExceptionForApp.
+ *
+ * `recoveryFactory(Value & recovery)` is invoked iff the in-flight exception
+ * is a `RecoverableEvalError` -- it populates the freshly-allocated recovery
+ * Value (e.g. `recovery.mkThunk(env, expr)` or `recovery = savedApp`).
+ *
+ * Invariant: `v.failed().recoveryValue` is non-null iff the exception was
+ * `RecoverableEvalError`.  All other exception types (including unrelated
+ * `Error`s) reach `v.mkFailed` with `recovery == nullptr`.
+ */
+template<class RecoveryFactory>
+void EvalState::mkFailedFromCurrentException(Value & v, const RecoveryFactory & recoveryFactory)
+{
+    auto e = std::current_exception();
+    Value * recovery = nullptr;
+    try {
+        std::rethrow_exception(e);
+    } catch (const RecoverableEvalError & e) {
+        recovery = allocValue();
+    } catch (...) {
+    }
+    if (recovery) {
+        recoveryFactory(*recovery);
+    }
+    v.mkFailed(e, recovery);
+}
+
 // always force this to be separate, otherwise forceValue may inline it and take
 // a massive perf hit
 [[gnu::noinline]]
@@ -2212,35 +2243,13 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
     if (!env)
         tryFixupBlackHolePos(v, pos);
 
-    auto e = std::current_exception();
-    Value * recovery = nullptr;
-    try {
-        std::rethrow_exception(e);
-    } catch (const RecoverableEvalError & e) {
-        recovery = allocValue();
-    } catch (...) {
-    }
-    if (recovery) {
-        recovery->mkThunk(env, expr);
-    }
-    v.mkFailed(e, recovery);
+    mkFailedFromCurrentException(v, [&](Value & recovery) { recovery.mkThunk(env, expr); });
 }
 
 [[gnu::noinline]]
 void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
 {
-    auto e = std::current_exception();
-    Value * recovery = nullptr;
-    try {
-        std::rethrow_exception(e);
-    } catch (const RecoverableEvalError & e) {
-        recovery = allocValue();
-    } catch (...) {
-    }
-    if (recovery) {
-        *recovery = savedApp;
-    }
-    v.mkFailed(e, recovery);
+    mkFailedFromCurrentException(v, [&](Value & recovery) { recovery = savedApp; });
 }
 
 [[gnu::noinline]]

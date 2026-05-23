@@ -661,6 +661,22 @@ public:
 private:
 
     /**
+     * Shared "set v to a failed Value, populating the recovery slot iff the
+     * in-flight exception is RecoverableEvalError" helper used by both
+     * handleEvalExceptionForThunk and handleEvalExceptionForApp.
+     *
+     * The template is defined in `eval.cc`; only the two on-site lambdas
+     * inside the two callers instantiate it, so keeping the body in the .cc
+     * preserves the noinline boundary the inline forceValue hot path
+     * depends on.
+     */
+    // Only instantiated in eval.cc -- adding a caller in another TU will
+    // fail to link until the body moves into this header or an explicit
+    // instantiation is added.
+    template<class RecoveryFactory>
+    void mkFailedFromCurrentException(Value & v, const RecoveryFactory & recoveryFactory);
+
+    /**
      * Internal support function for forceValue
      *
      * This code is factored out so that it's not in the heavily inlined hot path.
