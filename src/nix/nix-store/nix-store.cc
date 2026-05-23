@@ -23,6 +23,7 @@
 #include "nix/store/gc-store.hh"
 
 #include "man-pages.hh"
+#include "gc-root-namer.hh"
 
 #ifndef _WIN32 // TODO implement on Windows or provide allowed-to-noop interface
 #  include "nix/util/monitor-fd.hh"
@@ -44,8 +45,7 @@ using namespace nix;
 
 typedef void (*Operation)(Strings opFlags, Strings opArgs);
 
-static std::filesystem::path gcRoot;
-static int rootNr = 0;
+static GcRootNamer gcRootNamer;
 static bool noOutput = false;
 static std::shared_ptr<Store> store;
 
@@ -79,7 +79,7 @@ static std::set<std::filesystem::path> realisePath(StorePathWithOutputs path, bo
             store->buildPaths({path.toDerivedPath()});
         auto outputPaths = deepQueryDerivationOutputMap(*store, path.path);
         Derivation drv = store->derivationFromPath(path.path);
-        rootNr++;
+        gcRootNamer.bump();
 
         /* FIXME: Encode this empty special case explicitly in the type. */
         if (path.outputs.empty())
@@ -95,16 +95,10 @@ static std::set<std::filesystem::path> realisePath(StorePathWithOutputs path, bo
             auto outPath = outputPaths.at(i->first);
             std::filesystem::path retPath = store->printStorePath(outPath);
             if (store2) {
-                if (gcRoot == "")
+                if (gcRootNamer.empty())
                     printGCWarning();
-                else {
-                    std::filesystem::path rootName = gcRoot;
-                    if (rootNr > 1)
-                        rootName += "-" + std::to_string(rootNr);
-                    if (i->first != "out")
-                        rootName += "-" + i->first;
-                    retPath = store2->addPermRoot(outPath, rootName);
-                }
+                else
+                    retPath = store2->addPermRoot(outPath, gcRootNamer.nameForCurrent(i->first));
             }
             outputs.insert(retPath);
         }
@@ -117,14 +111,11 @@ static std::set<std::filesystem::path> realisePath(StorePathWithOutputs path, bo
         else if (!store->isValidPath(path.path))
             throw Error("path '%s' does not exist and cannot be created", store->printStorePath(path.path));
         if (store2) {
-            if (gcRoot == "")
+            if (gcRootNamer.empty())
                 printGCWarning();
             else {
-                std::filesystem::path rootName = gcRoot;
-                rootNr++;
-                if (rootNr > 1)
-                    rootName += "-" + std::to_string(rootNr);
-                return {store2->addPermRoot(path.path, rootName)};
+                gcRootNamer.bump();
+                return {store2->addPermRoot(path.path, gcRootNamer.nameForCurrent())};
             }
         }
         return {std::filesystem::path{store->printStorePath(path.path)}};
@@ -1203,7 +1194,7 @@ static int main_nix_store(int argc, char ** argv)
                 op = opGenerateBinaryCacheKey;
                 opName = arg->substr(1);
             } else if (*arg == "--add-root")
-                gcRoot = absPath(getArg(*arg, arg, end));
+                gcRootNamer.baseRoot = absPath(getArg(*arg, arg, end));
             else if (*arg == "--stdin" && !isatty(STDIN_FILENO))
                 readFromStdIn = true;
             else if (*arg == "--indirect")

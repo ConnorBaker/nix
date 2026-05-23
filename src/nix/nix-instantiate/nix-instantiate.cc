@@ -13,13 +13,13 @@
 #include "nix/cmd/legacy.hh"
 #include "man-pages.hh"
 #include "legacy-eval-args.hh"
+#include "gc-root-namer.hh"
 
 #include <iostream>
 
 namespace nix {
 
-std::filesystem::path gcRoot;
-static int rootNr = 0;
+static GcRootNamer gcRootNamer;
 
 enum OutputKind { okPlain, okRaw, okXML, okJSON };
 
@@ -82,15 +82,13 @@ void processExpr(
                 if (outputName == "")
                     throw Error("derivation '%1%' lacks an 'outputName' attribute", drvPathS);
 
-                if (gcRoot.empty())
+                if (gcRootNamer.empty())
                     printGCWarning();
                 else {
-                    auto rootName = absPath(gcRoot);
-                    if (++rootNr > 1)
-                        rootName += "-" + std::to_string(rootNr);
+                    gcRootNamer.bump();
                     auto store2 = state.store.dynamic_pointer_cast<LocalFSStore>();
                     if (store2)
-                        drvPathS = store2->addPermRoot(drvPath, rootName).string();
+                        drvPathS = store2->addPermRoot(drvPath, gcRootNamer.nameForCurrent()).string();
                 }
                 std::cout << fmt("%s%s\n", drvPathS, (outputName != "out" ? "!" + outputName : ""));
             }
@@ -140,7 +138,7 @@ static int main_nix_instantiate(int argc, char ** argv)
             else if (*arg == "--attr" || *arg == "-A")
                 attrPaths.push_back(getArg(*arg, arg, end));
             else if (*arg == "--add-root")
-                gcRoot = getArg(*arg, arg, end);
+                gcRootNamer.baseRoot = absPath(getArg(*arg, arg, end));
             else if (*arg == "--indirect")
                 ;
             else if (*arg == "--raw")
