@@ -14,8 +14,11 @@
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/input-cache.hh"
 
+#include "fetcher-attr-iter.hh"
+
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <ctime>
 #include <iomanip>
 
@@ -484,22 +487,30 @@ static void fetch(
 
     if (isArgAttrs) {
 
-        for (auto & attr : *args[0]->attrs()) {
-            std::string_view n(state.symbols[attr.name]);
-            if (n == "url")
-                url = state.forceStringNoCtx(*attr.value, attr.pos, "while evaluating the url we should fetch");
-            else if (n == "sha256")
-                expectedHash = newHashAllowEmpty(
-                    state.forceStringNoCtx(
-                        *attr.value, attr.pos, "while evaluating the sha256 of the content we should fetch"),
-                    HashAlgorithm::SHA256);
-            else if (n == "name") {
-                nameAttrPassed = true;
-                name = state.forceStringNoCtx(
-                    *attr.value, attr.pos, "while evaluating the name of the content we should fetch");
-            } else
-                state.error<EvalError>("unsupported argument '%s' to '%s'", n, who).atPos(pos).debugThrow();
-        }
+        iterateFetcherAttrs(
+            state,
+            *args[0]->attrs(),
+            who,
+            std::array<FetcherAttrHandler, 3>{{
+                {"url",
+                 [&](const Attr & attr) {
+                     url =
+                         state.forceStringNoCtx(*attr.value, attr.pos, "while evaluating the url we should fetch");
+                 }},
+                {"sha256",
+                 [&](const Attr & attr) {
+                     expectedHash = newHashAllowEmpty(
+                         state.forceStringNoCtx(
+                             *attr.value, attr.pos, "while evaluating the sha256 of the content we should fetch"),
+                         HashAlgorithm::SHA256);
+                 }},
+                {"name",
+                 [&](const Attr & attr) {
+                     nameAttrPassed = true;
+                     name = state.forceStringNoCtx(
+                         *attr.value, attr.pos, "while evaluating the name of the content we should fetch");
+                 }},
+            }});
 
         if (!url)
             state.error<EvalError>("'url' argument required").atPos(pos).debugThrow();

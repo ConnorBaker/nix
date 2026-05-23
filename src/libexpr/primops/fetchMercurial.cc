@@ -4,6 +4,10 @@
 #include "nix/fetchers/fetchers.hh"
 #include "nix/util/url-parts.hh"
 
+#include "fetcher-attr-iter.hh"
+
+#include <array>
+
 namespace nix {
 
 static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** args, Value & v)
@@ -18,35 +22,44 @@ static void prim_fetchMercurial(EvalState & state, const PosIdx pos, Value ** ar
 
     if (args[0]->type() == nAttrs) {
 
-        for (auto & attr : *args[0]->attrs()) {
-            std::string_view n(state.symbols[attr.name]);
-            if (n == "url")
-                url = state
-                          .coerceToString(
-                              attr.pos,
-                              *attr.value,
-                              context,
-                              "while evaluating the `url` attribute passed to builtins.fetchMercurial",
-                              false,
-                              false)
-                          .toOwned();
-            else if (n == "rev") {
-                // Ugly: unlike fetchGit, here the "rev" attribute can
-                // be both a revision or a branch/tag name.
-                auto value = state.forceStringNoCtx(
-                    *attr.value, attr.pos, "while evaluating the `rev` attribute passed to builtins.fetchMercurial");
-                if (std::regex_match(value.begin(), value.end(), revRegex))
-                    rev = Hash::parseAny(value, HashAlgorithm::SHA1);
-                else
-                    ref = value;
-            } else if (n == "name")
-                name = state.forceStringNoCtx(
-                    *attr.value, attr.pos, "while evaluating the `name` attribute passed to builtins.fetchMercurial");
-            else
-                state.error<EvalError>("unsupported argument '%s' to 'fetchMercurial'", state.symbols[attr.name])
-                    .atPos(attr.pos)
-                    .debugThrow();
-        }
+        iterateFetcherAttrs(
+            state,
+            *args[0]->attrs(),
+            "fetchMercurial",
+            std::array<FetcherAttrHandler, 3>{{
+                {"url",
+                 [&](const Attr & attr) {
+                     url = state
+                               .coerceToString(
+                                   attr.pos,
+                                   *attr.value,
+                                   context,
+                                   "while evaluating the `url` attribute passed to builtins.fetchMercurial",
+                                   false,
+                                   false)
+                               .toOwned();
+                 }},
+                {"rev",
+                 [&](const Attr & attr) {
+                     // Ugly: unlike fetchGit, here the "rev" attribute can
+                     // be both a revision or a branch/tag name.
+                     auto value = state.forceStringNoCtx(
+                         *attr.value,
+                         attr.pos,
+                         "while evaluating the `rev` attribute passed to builtins.fetchMercurial");
+                     if (std::regex_match(value.begin(), value.end(), revRegex))
+                         rev = Hash::parseAny(value, HashAlgorithm::SHA1);
+                     else
+                         ref = value;
+                 }},
+                {"name",
+                 [&](const Attr & attr) {
+                     name = state.forceStringNoCtx(
+                         *attr.value,
+                         attr.pos,
+                         "while evaluating the `name` attribute passed to builtins.fetchMercurial");
+                 }},
+            }});
 
         if (url.empty())
             state.error<EvalError>("'url' argument required").atPos(pos).debugThrow();

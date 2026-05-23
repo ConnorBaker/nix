@@ -4,6 +4,10 @@
 #include "nix/store/make-content-addressed.hh"
 #include "nix/util/environment-variables.hh"
 
+#include "fetcher-attr-iter.hh"
+
+#include <array>
+
 namespace nix {
 
 /**
@@ -138,39 +142,40 @@ static void prim_fetchClosure(EvalState & state, const PosIdx pos, Value ** args
     std::optional<StorePathOrGap> toPath;
     std::optional<bool> inputAddressedMaybe;
 
-    for (auto & attr : *args[0]->attrs()) {
-        const auto & attrName = state.symbols[attr.name];
-        auto attrHint = [&]() -> std::string {
-            return fmt("while evaluating the attribute '%s' passed to builtins.fetchClosure", attrName);
-        };
+    auto attrHint = [&](std::string_view attrName) -> std::string {
+        return fmt("while evaluating the attribute '%s' passed to builtins.fetchClosure", attrName);
+    };
 
-        if (attrName == "fromPath") {
-            NixStringContext context;
-            fromPath = state.coerceToStorePath(attr.pos, *attr.value, context, attrHint());
-        }
-
-        else if (attrName == "toPath") {
-            state.forceValue(*attr.value, attr.pos);
-            bool isEmptyString = attr.value->type() == nString && attr.value->string_view() == "";
-            if (isEmptyString) {
-                toPath = StorePathOrGap{};
-            } else {
-                NixStringContext context;
-                toPath = state.coerceToStorePath(attr.pos, *attr.value, context, attrHint());
-            }
-        }
-
-        else if (attrName == "fromStore")
-            fromStoreUrl = state.forceStringNoCtx(*attr.value, attr.pos, attrHint());
-
-        else if (attrName == "inputAddressed")
-            inputAddressedMaybe = state.forceBool(*attr.value, attr.pos, attrHint());
-
-        else
-            throw Error(
-                {.msg = HintFmt("attribute '%s' isn't supported in call to 'fetchClosure'", attrName),
-                 .pos = state.positions[pos]});
-    }
+    iterateFetcherAttrs(
+        state,
+        *args[0]->attrs(),
+        "fetchClosure",
+        std::array<FetcherAttrHandler, 4>{{
+            {"fromPath",
+             [&](const Attr & attr) {
+                 NixStringContext context;
+                 fromPath = state.coerceToStorePath(attr.pos, *attr.value, context, attrHint("fromPath"));
+             }},
+            {"toPath",
+             [&](const Attr & attr) {
+                 state.forceValue(*attr.value, attr.pos);
+                 bool isEmptyString = attr.value->type() == nString && attr.value->string_view() == "";
+                 if (isEmptyString) {
+                     toPath = StorePathOrGap{};
+                 } else {
+                     NixStringContext context;
+                     toPath = state.coerceToStorePath(attr.pos, *attr.value, context, attrHint("toPath"));
+                 }
+             }},
+            {"fromStore",
+             [&](const Attr & attr) {
+                 fromStoreUrl = state.forceStringNoCtx(*attr.value, attr.pos, attrHint("fromStore"));
+             }},
+            {"inputAddressed",
+             [&](const Attr & attr) {
+                 inputAddressedMaybe = state.forceBool(*attr.value, attr.pos, attrHint("inputAddressed"));
+             }},
+        }});
 
     if (!fromPath)
         throw Error(
