@@ -2,6 +2,7 @@
 
 #include "nix/expr/value.hh"
 #include "nix/expr/symbol-table.hh"
+#include "nix/expr/print.hh"
 
 namespace nix {
 
@@ -21,7 +22,7 @@ void printAmbiguous(
     EvalState & state,
     Value & v,
     std::ostream & str,
-    std::set<const void *> * seen,
+    SeenSet * seen,
     NixStringContext * context = nullptr,
     size_t depth = 0);
 

@@ -313,8 +313,10 @@ void PackageInfo::setMeta(const std::string & name, Value * v)
     meta = attrs.finish();
 }
 
-/* Cache for already considered attrsets. */
-typedef std::set<const Bindings *> Done;
+/* Cache for already considered attrsets. Keys are `Bindings *` here, but the
+   shared `SeenSet` alias type-erases to `const void *` so other recursive
+   walkers can use the same helper. */
+using Done = SeenSet;
 
 /* Evaluate value `v'.  If it evaluates to a set of type `derivation',
    then put information about it in `drvs' (unless it's already in `done').
@@ -335,7 +337,7 @@ static bool getDerivation(
 
         /* Remove spurious duplicates (e.g., a set like `rec { x =
            derivation {...}; y = x;}'. */
-        if (!done.insert(v.attrs()).second)
+        if (!dedupe(done, v.attrs()))
             return false;
 
         PackageInfo drv(state, attrPath, v.attrs());

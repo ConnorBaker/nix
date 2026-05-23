@@ -65,7 +65,7 @@ void processExpr(
             } else {
                 if (strict)
                     state.forceValueDeep(vRes);
-                std::set<const void *> seen;
+                SeenSet seen;
                 printAmbiguous(state, vRes, std::cout, &seen, &context);
                 std::cout << std::endl;
             }

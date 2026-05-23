@@ -144,7 +144,6 @@ struct ImportantFirstAttrNameCmp
     }
 };
 
-typedef std::set<const void *> ValuesSeen;
 typedef std::vector<std::pair<std::string, Value *>> AttrVec;
 
 class Printer
@@ -154,7 +153,7 @@ private:
     EvalState & state;
     PrintOptions options;
     NixStringContext * context;
-    std::optional<ValuesSeen> seen;
+    std::optional<SeenSet> seen;
     size_t totalAttrsPrinted = 0;
     size_t totalListItemsPrinted = 0;
     std::string indent;
@@ -322,7 +321,7 @@ private:
 
     void printAttrs(Value & v, size_t depth)
     {
-        if (seen && !seen->insert(v.attrs()).second) {
+        if (seen && !dedupe(*seen, v.attrs())) {
             printRepeated();
             return;
         }
@@ -400,7 +399,7 @@ private:
 
     void printList(Value & v, size_t depth)
     {
-        if (seen && v.listSize() && !seen->insert(&v).second) {
+        if (seen && v.listSize() && !dedupe(*seen, &v)) {
             printRepeated();
             return;
         }
@@ -647,7 +646,7 @@ public:
             seen.reset();
         }
 
-        ValuesSeen seen;
+        SeenSet seen;
         print(v, 0);
     }
 };

@@ -11,7 +11,7 @@ void printAmbiguous(
     EvalState & state,
     Value & v,
     std::ostream & str,
-    std::set<const void *> * seen,
+    SeenSet * seen,
     NixStringContext * context,
     size_t depth)
 {
@@ -38,7 +38,7 @@ void printAmbiguous(
         str << "null";
         break;
     case nAttrs: {
-        if (seen && !v.attrs()->empty() && !seen->insert(v.attrs()).second)
+        if (seen && !v.attrs()->empty() && !dedupe(*seen, v.attrs()))
             str << "«repeated»";
         else {
             str << "{ ";
@@ -54,7 +54,7 @@ void printAmbiguous(
     case nList:
         /* Use pointer to the Value instead of pointer to the elements, because
            that would need to explicitly handle the case of SmallList. */
-        if (seen && v.listSize() && !seen->insert(&v).second)
+        if (seen && v.listSize() && !dedupe(*seen, &v))
             str << "«repeated»";
         else {
             str << "[ ";

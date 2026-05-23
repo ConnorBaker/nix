@@ -8,6 +8,7 @@
  */
 
 #include <iostream>
+#include <set>
 
 #include "nix/util/fmt.hh"
 #include "nix/expr/value/context.hh"
@@ -17,6 +18,26 @@ namespace nix {
 
 class EvalState;
 struct Value;
+
+/**
+ * A pointer-keyed "already seen" set used by recursive value/attrset
+ * walkers to break cycles and de-duplicate visits. Elements are typically
+ * `const Bindings *` or `const Value *` pointers.
+ *
+ * Each call site should only insert one of the two pointer kinds — the set
+ * is type-erased to `const void *` so a `Bindings *` and a `Value *` could
+ * in principle collide on identity, but no in-tree caller mixes them.
+ */
+using SeenSet = std::set<const void *>;
+
+/**
+ * Try to record `p` in `seen`. Returns `true` if `p` was newly inserted,
+ * `false` if it was already present.
+ */
+inline bool dedupe(SeenSet & seen, const void * p)
+{
+    return seen.insert(p).second;
+}
 
 /**
  * Print a string as a Nix string literal.
