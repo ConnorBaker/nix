@@ -1043,10 +1043,14 @@ static RegisterPrimOp primop_addErrorContext(
         .impl = prim_addErrorContext,
     });
 
+/* Reference URL for the precision/UB hazards in the integer-rounding
+   primops. Used to keep `__ceil` and `__floor` diagnostic strings in sync. */
+constexpr std::string_view bug12899Url = "https://github.com/NixOS/nix/issues/12899";
+
 /* Factory for `builtins.ceil`/`builtins.floor`: identical bodies modulo
    the rounding operation and the trace string identifying the caller.
    Both must surface the same precision-loss / out-of-range diagnostics
-   tied to https://github.com/NixOS/nix/issues/12899. */
+   tied to bug12899Url. */
 static auto makeRoundingPrimOp(NixFloat (*roundFn)(NixFloat), const char * forceFloatTrace)
 {
     return [roundFn, forceFloatTrace](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
@@ -1060,7 +1064,8 @@ static auto makeRoundingPrimOp(NixFloat (*roundFn)(NixFloat), const char * force
             // a NixInt, e.g. INT64_MAX, can be rounded to -int_min due to the cast to NixFloat
             state
                 .error<EvalError>(
-                    "Due to a bug (see https://github.com/NixOS/nix/issues/12899) the NixInt argument %1% caused undefined behavior in previous Nix versions.\n\tFuture Nix versions might implement the correct behavior.",
+                    "Due to a bug (see %1%) the NixInt argument %2% caused undefined behavior in previous Nix versions.\n\tFuture Nix versions might implement the correct behavior.",
+                    bug12899Url,
                     args[0]->integer().value)
                 .atPos(pos)
                 .debugThrow();
@@ -1076,7 +1081,8 @@ static auto makeRoundingPrimOp(NixFloat (*roundFn)(NixFloat), const char * force
             if (arg != res) {
                 state
                     .error<EvalError>(
-                        "Due to a bug (see https://github.com/NixOS/nix/issues/12899) a loss of precision occurred in previous Nix versions because the NixInt argument %1% was rounded to %2%.\n\tFuture Nix versions might implement the correct behavior.",
+                        "Due to a bug (see %1%) a loss of precision occurred in previous Nix versions because the NixInt argument %2% was rounded to %3%.\n\tFuture Nix versions might implement the correct behavior.",
+                        bug12899Url,
                         arg,
                         res)
                     .atPos(pos)
