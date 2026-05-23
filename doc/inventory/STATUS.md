@@ -108,16 +108,19 @@ line in its body.
 
 | Branch | Shard | Addresses | Status |
 | ------ | ----- | --------- | ------ |
-| `vibe-coding/cleanup/libexpr` | libexpr | #217 | Pushed |
+| `vibe-coding/cleanup/libexpr` | libexpr | #217, #64, #66, #68, #106, #107, #109, #110, #112, #196, #199 | Local-only past `437eea9d0` |
 | `vibe-coding/cleanup/libfetchers` | libfetchers | #52 | Pushed |
 | `vibe-coding/cleanup/libflake` | libflake | #48 | Pushed |
 | `vibe-coding/cleanup/libmain` | libmain | #49, #128 | Pushed |
-| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60 | Pushed |
-| `vibe-coding/cleanup/libutil` | libutil | #58, #130 | Pushed |
-| `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142 | Pushed |
+| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4, #5, #6, #14, #47, #82, #114, #115, #119, #157, #159, #165 | Local-only past `5f5b8151e` |
+| `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117 | Local-only past `784a4f4b4` |
+| `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142, #24, #77, #89, #91, #187 | Local-only past `48524e038` |
 
-The branches were pushed to a fork; PRs against upstream NixOS/nix
-have not been opened. The user controls when to open them.
+The branches whose Status reads "Pushed" are on `origin`
+(`ConnorBaker/nix`) and ready for upstream PR creation. The four
+Status: Local-only branches each have additional commits beyond
+the pushed tip and have not been pushed yet — push policy is
+explicit-only.
 
 ## Worktree layout
 

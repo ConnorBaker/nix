@@ -30,6 +30,7 @@ Candidates 61-68. All eight VALID, with one file-path correction (#61).
 64. **`Formals` and `FormalsBuilder` independently implement `has(Symbol)`.** Two parallel containers exist for function formals: `FormalsBuilder` (`std::vector<Formal>` + ellipsis, used during parsing) and `Formals` (`std::span<Formal>` + ellipsis, used post-allocation). Both implement `has(Symbol)` independently with the same lower-bound predicate.
     - ../verified/12-libexpr-parse.md
     - **Validation:** VALID. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libexpr` (free `formalsHas(span<const Formal>, Symbol)` inline next to `Formal`)
 
 65. **`primop_*` argument-validation boilerplate is heavily duplicated.** Almost every `prim_*` opens with `state.forceValue`/`forceAttrs`/`forceList`/`forceString`/`forceStringNoCtx`/`forceBool`/`forceInt`/`forceFloat`, each with a hand-written "while evaluating the Nth argument passed to builtins.<name>" message. A `validateArg(state, n, primop_name, type)` helper would shrink the binary.
     - ../verified/13-libexpr-primops.md
@@ -38,6 +39,7 @@ Candidates 61-68. All eight VALID, with one file-path correction (#61).
 66. **`prim_isNull` … `prim_isPath` (8 type-predicate primops, plus `prim_isAttrs`/`prim_isList`/`prim_isFunction`).** All identical except for the enum-tag they compare against. A registration macro or table-driven approach would remove the boilerplate.
     - ../verified/13-libexpr-primops.md
     - **Validation:** VALID. Effort: small.
+    - **Branch:** `vibe-coding/cleanup/libexpr` (`makeTypeCheck(ValueType)` factory drives nine `RegisterPrimOp`s)
 
 67. **Numeric primops (`__add`/`__sub`/`__mul`/`__div`).** Each one is the same template instantiated four times: forceValue both args, dispatch on `nFloat` else int, check overflow with `valueChecked()`, raise `EvalError` with a slightly different verb.
     - ../verified/13-libexpr-primops.md
@@ -46,3 +48,4 @@ Candidates 61-68. All eight VALID, with one file-path correction (#61).
 68. **`prim_ceil` and `prim_floor` are byte-for-byte twins** (only `ceil(value)` vs `floor(value)` differs). The precision-loss/overflow blocks and the GitHub issue link are identical.
     - ../verified/13-libexpr-primops.md
     - **Validation:** VALID. Compounds with #112 (the four-times-cited issue link). Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libexpr` (`makeRoundingPrimOp(NixFloat (*)(NixFloat), const char *)` factory; both registrations preserved)

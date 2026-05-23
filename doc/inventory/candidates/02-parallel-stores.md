@@ -32,6 +32,7 @@ Candidates 11-16. All six VALID against `src/libstore/local-overlay-store.cc`,
 14. **`RemoteFSAccessor` constructed identically by `RemoteStore::getRemoteFSAccessor` and `BinaryCacheStore::getRemoteFSAccessor`.** Both pass the `requireValidPath` flag; only difference is `BinaryCacheStore` plumbs through `config.localNarCache`. The corresponding `getFSAccessor` overrides are mechanical wrappers in both. ~10 lines could move into `Store`.
     - ../verified/08-libstore-remote.md
     - **Validation:** VALID. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libstore` (lifted `getRemoteFSAccessor` to `Store` plus a virtual `getLocalNarCacheDir()` hook; left the trivial 1-line `getFSAccessor` overrides per-class)
 
 15. **`UDSRemoteStore` and `MountedSSHStore` mix `RemoteStore` with `LocalFSStore` identically.** Both override `getFSAccessor`/`narFromPath` with the same delegate-to-`LocalFSStore` calls. The only meaningful divergence is the GC-root strategy: `UDSRemoteStore` sends `WorkerProto::Op::AddIndirectRoot`; `MountedSSHStore` sends `WorkerProto::Op::AddPermRoot`.
     - ../verified/08-libstore-remote.md

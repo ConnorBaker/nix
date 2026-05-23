@@ -53,6 +53,7 @@ removing the mechanism.
 24. **`registerCommand<...>` boilerplate is uniform across 30+ command files.** Every modern `nix` command file ends with `static auto rXxx = registerCommand<CmdXxx>("xxx")`, with naming irregular (`rCmdXxx`, `r2`, `rFormatterRun`, `rShowConfig`, etc.). The legacy bridges follow the same template via `RegisterLegacyCommand`. A macro encoding name + class + category could shrink each file by several lines.
     - ../verified/17-nix-modern-1.md, ../verified/18-nix-modern-2-legacy.md
     - **Validation:** VALID. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/nix-cli` (`NIX_REGISTER_COMMAND(ClassName, "command-name")` macro in `src/nix/command-register.hh` replaces ~50 ad-hoc registrations across 30+ command files; libcmd is left untouched per the shard boundary)
 
 25. **`doc()` overrides include a per-command `*.md` (or `*.md.gen.hh`) via `#include`.** Every command does `return ` `#include "name.md"` `;`. Stable but heavy boilerplate.
     - ../verified/17-nix-modern-1.md, ../verified/18-nix-modern-2-legacy.md

@@ -47,6 +47,7 @@ Candidates 72-88. All seventeen VALID.
 77. **Eval-cache release before `exec*` is duplicated four times.** `CmdRun::run`, `CmdDevelop::run`, `CmdShell::run`, `CmdFormatterRun::run` each call `state->evalCaches.clear()` immediately before exec'ing out of the process; the comment is identical at all four sites.
     - ../verified/17-nix-modern-1.md
     - **Validation:** VALID. The verbatim comment is "Release our references to eval caches to ensure they are persisted to disk, because we are about to exec out of this process without running C++ destructors." A `releaseEvalCachesBeforeExec(state)` helper or RAII guard would consolidate. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/nix-cli` (helper in `src/nix/release-eval-caches.hh`; replaces the verbatim comment + `evalCaches.clear()` pair at four sites)
 
 78. **Lock-file walks in libflake.** `LockFile::isUnlocked`, `LockFile::getAllInputs`, `doFind` each implement a custom DFS over `Node::inputs` with their own visited-set; only `getAllInputs` is reused. A shared `forEachNode`/`forEachReachableEdge` helper would simplify all three.
     - ../verified/15-libflake-libmain.md
@@ -67,6 +68,7 @@ Candidates 72-88. All seventeen VALID.
 82. **`AutoUserLock`/`SimpleUserLock` `acquire` skeletons.** Both implementations open a per-slot lock file, try non-blocking exclusive lock via `lockFile(ltWrite, false)`, populate the lock object on success. The lock-acquisition skeleton could be shared.
     - ../verified/07-libstore-local.md
     - **Validation:** VALID — but the win is small (two call sites with one shared body of ~5 lines each). Extract `tryAcquireSlotLock(path) -> std::optional<AutoCloseFD>`; both call sites become a one-liner preceded by per-implementation prelude. Marginal as a debt entry; keep but accept that the duplication factored out is small. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libstore`
 
 83. **`/nix/store` GC roots and runtime roots have three layers of similar logic.** `local-gc.cc::findRuntimeRootsUnchecked`, `gc.cc::requestRuntimeRoots`, and `gc.cc::LocalStore::findRuntimeRoots` form three layers; the first synthesises roots from `/proc` (or `lsof`), the second reads them from a Unix-domain socket, the third dispatches between the two. The `Roots` typedef and the file-local `UncheckedRoots` map use different key types (`StorePath` vs `std::string`).
     - ../verified/07-libstore-local.md

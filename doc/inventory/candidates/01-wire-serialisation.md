@@ -41,14 +41,17 @@ per-site change.
 4. **Length-prefixed container serialiser macros are three near-identical copies.** `WORKER_USE_LENGTH_PREFIX_SERIALISER`, `SERVE_USE_LENGTH_PREFIX_SERIALISER`, and `COMMON_USE_LENGTH_PREFIX_SERIALISER` each emit `Serialise<vector<T>>`/`Serialise<set<T>>`/`Serialise<tuple<Ts...>>`/`Serialise<map<K,V>>` specialisations delegating to `LengthPrefixedProtoHelper<Proto, T>`. The macros could be a single template parametrised on the protocol struct.
    - ../verified/09-libstore-protocol.md
    - **Validation:** VALID. The three macro families differ only by the `WorkerProto`/`ServeProto`/`CommonProto` token — collapsing to one Proto-parameterised template is mechanical. Effort: trivial.
+   - **Branch:** `vibe-coding/cleanup/libstore`
 
 5. **`DECLARE_*_SERIALISER` declaration macros are three near-identical copies.** `DECLARE_COMMON_SERIALISER`, `DECLARE_WORKER_SERIALISER`, `DECLARE_SERVE_SERIALISER` differ only in the namespace prefix on `Serialise<T>` and (cosmetically) in the parameter name. Same shape as #4.
    - ../verified/09-libstore-protocol.md
    - **Validation:** VALID. Effort: trivial.
+   - **Branch:** `vibe-coding/cleanup/libstore`
 
 6. **`GET_PROTOCOL_MAJOR`/`GET_PROTOCOL_MINOR` macros duplicated.** Defined identically in both `worker-protocol.hh` and `serve-protocol.hh` (`(x) & 0xff00` and `(x) & 0x00ff`). Including both headers in the same TU works only because the second `#define` produces an identical token sequence.
    - ../verified/09-libstore-protocol.md
    - **Validation:** VALID. Promote to `common-protocol.hh` (or to a shared `proto-version.hh`). Effort: trivial.
+   - **Branch:** `vibe-coding/cleanup/libstore`
 
 7. **Protocol handshake logic is parallel between worker and serve.** `WorkerProto::BasicClientConnection::handshake` and `ServeProto::BasicClientConnection::handshake` both send magic-1, read magic-2, exchange version numbers, take the min. Worker additionally exchanges and intersects a `FeatureSet` (≥1.38) via private `intersectFeatures`; serve has no such step. Server-side mirrors are likewise parallel.
    - ../verified/09-libstore-protocol.md
