@@ -190,46 +190,31 @@ inline std::ostream & operator<<(std::ostream & s, ServeProto::Command op)
     return s << (uint64_t) op;
 }
 
-/**
- * Declare a canonical serialiser pair for the worker protocol.
- *
- * We specialise the struct merely to indicate that we are implementing
- * the function for the given type.
- *
- * Some sort of `template<...>` must be used with the caller for this to
- * be legal specialization syntax. See below for what that looks like in
- * practice.
- */
-#define DECLARE_SERVE_SERIALISER(T)                                                               \
-    struct ServeProto::Serialise<T>                                                               \
-    {                                                                                             \
-        static T read(const StoreDirConfig & store, ServeProto::ReadConn conn);                   \
-        static void write(const StoreDirConfig & store, ServeProto::WriteConn conn, const T & t); \
-    };
+/* Canonical serialiser pairs for the serve protocol use the shared
+   `DECLARE_PROTO_SERIALISER` macro from `common-protocol.hh`. */
 
 template<>
-DECLARE_SERVE_SERIALISER(BuildResult);
+DECLARE_PROTO_SERIALISER(ServeProto, BuildResult);
 template<>
-DECLARE_SERVE_SERIALISER(DrvOutput);
+DECLARE_PROTO_SERIALISER(ServeProto, DrvOutput);
 template<>
-DECLARE_SERVE_SERIALISER(UnkeyedRealisation);
+DECLARE_PROTO_SERIALISER(ServeProto, UnkeyedRealisation);
 template<>
-DECLARE_SERVE_SERIALISER(Realisation);
+DECLARE_PROTO_SERIALISER(ServeProto, Realisation);
 template<>
-DECLARE_SERVE_SERIALISER(UnkeyedValidPathInfo);
+DECLARE_PROTO_SERIALISER(ServeProto, UnkeyedValidPathInfo);
 template<>
-DECLARE_SERVE_SERIALISER(ServeProto::BuildOptions);
+DECLARE_PROTO_SERIALISER(ServeProto, ServeProto::BuildOptions);
 
 template<typename T>
-DECLARE_SERVE_SERIALISER(std::vector<T>);
-#define DECLARE_SERVE_SERIALISER_COMMA ,
+DECLARE_PROTO_SERIALISER(ServeProto, std::vector<T>);
 template<typename T, typename Compare>
-DECLARE_SERVE_SERIALISER(std::set<T DECLARE_SERVE_SERIALISER_COMMA Compare>);
+DECLARE_PROTO_SERIALISER(ServeProto, std::set<T DECLARE_PROTO_SERIALISER_COMMA Compare>);
 template<typename... Ts>
-DECLARE_SERVE_SERIALISER(std::tuple<Ts...>);
+DECLARE_PROTO_SERIALISER(ServeProto, std::tuple<Ts...>);
 
 template<typename K, typename V, typename Compare>
-DECLARE_SERVE_SERIALISER(std::map<K DECLARE_SERVE_SERIALISER_COMMA V DECLARE_SERVE_SERIALISER_COMMA Compare>);
-#undef DECLARE_SERVE_SERIALISER_COMMA
+DECLARE_PROTO_SERIALISER(
+    ServeProto, std::map<K DECLARE_PROTO_SERIALISER_COMMA V DECLARE_PROTO_SERIALISER_COMMA Compare>);
 
 } // namespace nix

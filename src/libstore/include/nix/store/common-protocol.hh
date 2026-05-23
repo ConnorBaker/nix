@@ -70,37 +70,48 @@ struct CommonProto
     }
 };
 
-#define DECLARE_COMMON_SERIALISER(T)                                                                 \
-    struct CommonProto::Serialise<T>                                                                 \
-    {                                                                                                \
-        static T read(const StoreDirConfig & store, CommonProto::ReadConn conn);                     \
-        static void write(const StoreDirConfig & store, CommonProto::WriteConn conn, const T & str); \
+/**
+ * Declare a canonical serialiser pair for `Proto::Serialise<T>`.
+ *
+ * Used by the worker, serve, and common protocol headers via the
+ * `DECLARE_PROTO_SERIALISER_COMMA` token to embed commas inside `T`.
+ *
+ * Some sort of `template<...>` must precede the invocation for the
+ * struct specialisation to be legal C++ syntax.
+ */
+#define DECLARE_PROTO_SERIALISER(Proto, T)                                            \
+    struct Proto::Serialise<T>                                                        \
+    {                                                                                 \
+        static T read(const StoreDirConfig & store, Proto::ReadConn conn);            \
+        static void write(const StoreDirConfig & store, Proto::WriteConn conn, const T & str); \
     }
 
-template<>
-DECLARE_COMMON_SERIALISER(std::string);
-template<>
-DECLARE_COMMON_SERIALISER(StorePath);
-template<>
-DECLARE_COMMON_SERIALISER(ContentAddress);
-template<>
-DECLARE_COMMON_SERIALISER(DrvOutput);
-template<>
-DECLARE_COMMON_SERIALISER(Realisation);
-template<>
-DECLARE_COMMON_SERIALISER(Signature);
+#define DECLARE_PROTO_SERIALISER_COMMA ,
 
-#define DECLARE_COMMON_SERIALISER_COMMA ,
+template<>
+DECLARE_PROTO_SERIALISER(CommonProto, std::string);
+template<>
+DECLARE_PROTO_SERIALISER(CommonProto, StorePath);
+template<>
+DECLARE_PROTO_SERIALISER(CommonProto, ContentAddress);
+template<>
+DECLARE_PROTO_SERIALISER(CommonProto, DrvOutput);
+template<>
+DECLARE_PROTO_SERIALISER(CommonProto, Realisation);
+template<>
+DECLARE_PROTO_SERIALISER(CommonProto, Signature);
+
 template<typename T>
-DECLARE_COMMON_SERIALISER(std::vector<T>);
+DECLARE_PROTO_SERIALISER(CommonProto, std::vector<T>);
 template<typename T, typename Compare>
-DECLARE_COMMON_SERIALISER(std::set<T DECLARE_COMMON_SERIALISER_COMMA Compare>);
+DECLARE_PROTO_SERIALISER(CommonProto, std::set<T DECLARE_PROTO_SERIALISER_COMMA Compare>);
 template<typename... Ts>
-DECLARE_COMMON_SERIALISER(std::tuple<Ts...>);
+DECLARE_PROTO_SERIALISER(CommonProto, std::tuple<Ts...>);
 
 template<typename K, typename V, typename Compare>
-DECLARE_COMMON_SERIALISER(std::map<K DECLARE_COMMON_SERIALISER_COMMA V DECLARE_COMMON_SERIALISER_COMMA Compare>);
-#undef DECLARE_COMMON_SERIALISER_COMMA
+DECLARE_PROTO_SERIALISER(
+    CommonProto,
+    std::map<K DECLARE_PROTO_SERIALISER_COMMA V DECLARE_PROTO_SERIALISER_COMMA Compare>);
 
 /**
  * These use the empty string for the null case, relying on the fact
@@ -117,9 +128,9 @@ DECLARE_COMMON_SERIALISER(std::map<K DECLARE_COMMON_SERIALISER_COMMA V DECLARE_C
  * specializations may not be allowed.
  */
 template<>
-DECLARE_COMMON_SERIALISER(std::optional<StorePath>);
+DECLARE_PROTO_SERIALISER(CommonProto, std::optional<StorePath>);
 template<>
-DECLARE_COMMON_SERIALISER(std::optional<ContentAddress>);
+DECLARE_PROTO_SERIALISER(CommonProto, std::optional<ContentAddress>);
 
 /**
  * The success and failure codes never overlay in enum tag values in the wire formats
@@ -127,6 +138,6 @@ DECLARE_COMMON_SERIALISER(std::optional<ContentAddress>);
 using BuildResultStatus = std::variant<BuildResultSuccessStatus, BuildResultFailureStatus>;
 
 template<>
-DECLARE_COMMON_SERIALISER(BuildResultStatus);
+DECLARE_PROTO_SERIALISER(CommonProto, BuildResultStatus);
 
 } // namespace nix

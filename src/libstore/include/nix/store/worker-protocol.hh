@@ -304,68 +304,53 @@ inline std::ostream & operator<<(std::ostream & s, WorkerProto::Op op)
     return s << static_cast<uint64_t>(op);
 }
 
-/**
- * Declare a canonical serialiser pair for the worker protocol.
- *
- * We specialise the struct merely to indicate that we are implementing
- * the function for the given type.
- *
- * Some sort of `template<...>` must be used with the caller for this to
- * be legal specialization syntax. See below for what that looks like in
- * practice.
- */
-#define DECLARE_WORKER_SERIALISER(T)                                                               \
-    struct WorkerProto::Serialise<T>                                                               \
-    {                                                                                              \
-        static T read(const StoreDirConfig & store, WorkerProto::ReadConn conn);                   \
-        static void write(const StoreDirConfig & store, WorkerProto::WriteConn conn, const T & t); \
-    };
+/* Canonical serialiser pairs for the worker protocol use the shared
+   `DECLARE_PROTO_SERIALISER` macro from `common-protocol.hh`. */
 
 template<>
-DECLARE_WORKER_SERIALISER(DerivedPath);
+DECLARE_PROTO_SERIALISER(WorkerProto, DerivedPath);
 template<>
-DECLARE_WORKER_SERIALISER(BuildResult);
+DECLARE_PROTO_SERIALISER(WorkerProto, BuildResult);
 template<>
-DECLARE_WORKER_SERIALISER(KeyedBuildResult);
+DECLARE_PROTO_SERIALISER(WorkerProto, KeyedBuildResult);
 template<>
-DECLARE_WORKER_SERIALISER(ValidPathInfo);
+DECLARE_PROTO_SERIALISER(WorkerProto, ValidPathInfo);
 template<>
-DECLARE_WORKER_SERIALISER(UnkeyedValidPathInfo);
+DECLARE_PROTO_SERIALISER(WorkerProto, UnkeyedValidPathInfo);
 template<>
-DECLARE_WORKER_SERIALISER(DrvOutput);
+DECLARE_PROTO_SERIALISER(WorkerProto, DrvOutput);
 template<>
-DECLARE_WORKER_SERIALISER(UnkeyedRealisation);
+DECLARE_PROTO_SERIALISER(WorkerProto, UnkeyedRealisation);
 template<>
-DECLARE_WORKER_SERIALISER(Realisation);
+DECLARE_PROTO_SERIALISER(WorkerProto, Realisation);
 template<>
-DECLARE_WORKER_SERIALISER(std::optional<UnkeyedRealisation>);
+DECLARE_PROTO_SERIALISER(WorkerProto, std::optional<UnkeyedRealisation>);
 template<>
-DECLARE_WORKER_SERIALISER(BuildMode);
+DECLARE_PROTO_SERIALISER(WorkerProto, BuildMode);
 template<>
-DECLARE_WORKER_SERIALISER(GCAction);
+DECLARE_PROTO_SERIALISER(WorkerProto, GCAction);
 template<>
-DECLARE_WORKER_SERIALISER(std::optional<TrustedFlag>);
+DECLARE_PROTO_SERIALISER(WorkerProto, std::optional<TrustedFlag>);
 template<>
-DECLARE_WORKER_SERIALISER(std::optional<std::chrono::microseconds>);
+DECLARE_PROTO_SERIALISER(WorkerProto, std::optional<std::chrono::microseconds>);
 template<>
-DECLARE_WORKER_SERIALISER(WorkerProto::ClientHandshakeInfo);
+DECLARE_PROTO_SERIALISER(WorkerProto, WorkerProto::ClientHandshakeInfo);
 
 template<>
-DECLARE_WORKER_SERIALISER(GCOptions::SpecificPaths);
+DECLARE_PROTO_SERIALISER(WorkerProto, GCOptions::SpecificPaths);
 
 template<>
-DECLARE_WORKER_SERIALISER(GCOptions::GCPaths);
+DECLARE_PROTO_SERIALISER(WorkerProto, GCOptions::GCPaths);
 
 template<typename T>
-DECLARE_WORKER_SERIALISER(std::vector<T>);
-#define DECLARE_WORKER_SERIALISER_COMMA ,
+DECLARE_PROTO_SERIALISER(WorkerProto, std::vector<T>);
 template<typename T, typename Compare>
-DECLARE_WORKER_SERIALISER(std::set<T DECLARE_WORKER_SERIALISER_COMMA Compare>);
+DECLARE_PROTO_SERIALISER(WorkerProto, std::set<T DECLARE_PROTO_SERIALISER_COMMA Compare>);
 template<typename... Ts>
-DECLARE_WORKER_SERIALISER(std::tuple<Ts...>);
+DECLARE_PROTO_SERIALISER(WorkerProto, std::tuple<Ts...>);
 
 template<typename K, typename V, typename Compare>
-DECLARE_WORKER_SERIALISER(std::map<K DECLARE_WORKER_SERIALISER_COMMA V DECLARE_WORKER_SERIALISER_COMMA Compare>);
-#undef DECLARE_WORKER_SERIALISER_COMMA
+DECLARE_PROTO_SERIALISER(
+    WorkerProto, std::map<K DECLARE_PROTO_SERIALISER_COMMA V DECLARE_PROTO_SERIALISER_COMMA Compare>);
 
 } // namespace nix
