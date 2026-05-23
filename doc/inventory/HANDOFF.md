@@ -116,6 +116,11 @@ For every code change on a cleanup branch:
      also see these headers; deletions or signature changes are
      public-API breaks even if zero in-tree call sites exist.
 
+`ninja` confirms the code compiles but does **not** run the test
+suite. Per-change `ninja` is necessary but not sufficient. End-of-batch
+verification — including the test suite — is described under "Review
+passes (end of batch)" below.
+
 ### clang-tidy invocation
 
 ```
@@ -132,6 +137,39 @@ do — filter them out:
 
 Any other error in your changed files needs to be fixed before
 landing the commit.
+
+### Review passes (end of batch)
+
+After the candidates in a batch land but before reporting done, run
+these four review passes in order. Per-shard means once per active
+cleanup worktree.
+
+- **Pass A — adversarial review (parallel, one agent per shard).**
+  Walk every commit's diff against the eight rules in
+  `review/AGENT-CHARTER.md`. Run a full ninja at the end. Report
+  per-commit verdict (clean / minor / blocker) plus a punch list.
+- **Pass B — `/code-review` skill (sequential, one shard at a time).**
+  Invoke the skill in the foreground per shard; trust the harness's
+  three-agent fan-out (reuse / quality / efficiency). Capture
+  non-blocker findings as follow-ups; do not auto-fix.
+- **Pass C — clang-tidy (sequential, one shard at a time).** Run
+  `nix develop <worktree> --command ninja -C <worktree>/build
+  clang-tidy` per shard. Filter the 5 pre-existing master errors
+  above; everything else in your changed files is on you. Sequential
+  because parallel runs across worktrees on the same machine compete
+  for cores and produce noisy output.
+- **Pass D — `nix build -L .` (sequential, one shard at a time).**
+  Run `nix develop <worktree> --command nix build -L .` (or
+  `cd <worktree> && nix build -L .`) per shard. This is the source
+  of truth for "would CI pass" — it builds via the flake AND runs the
+  full test suite, neither of which `ninja` covers. Per-change `ninja`
+  alone has reported "build green" while the test suite was broken.
+  Sequential because each invocation is heavyweight and concurrent
+  flake builds compete for the build daemon and disk.
+
+The chain is A (parallel) → B (sequential) → C (sequential) →
+D (sequential). Do not declare the batch done until D is green for
+every active shard.
 
 ### Commit message convention
 
