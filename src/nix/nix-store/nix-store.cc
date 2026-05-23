@@ -503,8 +503,8 @@ static void opQuery(Strings opFlags, Strings opArgs)
                 args.insert(p);
 
         StorePathSet referrers;
-        auto & gcSettings = settings.getLocalSettings().getGCSettings();
-        store->computeFSClosure(args, referrers, true, gcSettings.keepOutputs, gcSettings.keepDerivations);
+        auto & localSettings = settings.getLocalSettings();
+        store->computeFSClosure(args, referrers, true, localSettings.keepOutputs, localSettings.keepDerivations);
 
         auto & gcStore = require<GcStore>(*store);
         Roots roots = gcStore.findRoots(false);

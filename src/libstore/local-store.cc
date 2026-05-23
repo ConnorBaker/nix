@@ -150,7 +150,6 @@ LocalStore::LocalStore(ref<const Config> config)
     createDirs(dbDir);
     auto gcRootsDir = config->stateDir.get() / "gcroots";
     const auto & localSettings = config->getLocalSettings();
-    const auto & gcSettings = localSettings.getGCSettings();
     createDirs(gcRootsDir);
 
     for (auto & perUserDir : {profilesDir / "per-user", gcRootsDir / "per-user"}) {
@@ -205,7 +204,7 @@ LocalStore::LocalStore(ref<const Config> config)
        before doing a garbage collection. */
     try {
         auto st = maybeStat(reservedPath);
-        if (!st || st->st_size != gcSettings.reservedSize) {
+        if (!st || st->st_size != localSettings.reservedSize) {
             AutoCloseFD fd = toDescriptor(open(
                 reservedPath.string().c_str(),
                 O_WRONLY | O_CREAT
@@ -216,16 +215,16 @@ LocalStore::LocalStore(ref<const Config> config)
                 0600));
             int res = -1;
 #if HAVE_POSIX_FALLOCATE
-            res = posix_fallocate(fd.get(), 0, gcSettings.reservedSize);
+            res = posix_fallocate(fd.get(), 0, localSettings.reservedSize);
 #endif
             if (res != 0) {
-                writeFull(fd.get(), std::string(gcSettings.reservedSize, 'X'));
+                writeFull(fd.get(), std::string(localSettings.reservedSize, 'X'));
                 [[gnu::unused]] auto res2 =
 
 #ifdef _WIN32
                     SetEndOfFile(fd.get())
 #else
-                    ftruncate(fd.get(), gcSettings.reservedSize)
+                    ftruncate(fd.get(), localSettings.reservedSize)
 #endif
                     ;
             }

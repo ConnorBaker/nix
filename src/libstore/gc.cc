@@ -365,7 +365,7 @@ struct GCLimitReached
 
 void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 {
-    const auto & gcSettings = config->getLocalSettings().getGCSettings();
+    const auto & localSettings = config->getLocalSettings();
 
     bool shouldDelete = options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific;
 
@@ -632,8 +632,8 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     std::visit(
                         overloaded{
                             [&](const GCOptions::WholeStore &) {
-                                includeOutputs = gcSettings.keepOutputs;
-                                includeDerivers = gcSettings.keepDerivations;
+                                includeOutputs = localSettings.keepOutputs;
+                                includeDerivers = localSettings.keepDerivations;
                             },
                             [](const GCOptions::SpecificPaths &) {},
                         },
@@ -701,7 +701,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                         [&](const GCOptions::WholeStore &) {
                             /* If keep-derivations is set and this is a derivation, then we only want to delete this
                              * derivation if we can also delete all its outputs, so visit the derivation outputs. */
-                            if (gcSettings.keepDerivations && path->isDerivation())
+                            if (localSettings.keepDerivations && path->isDerivation())
                                 for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(*path))
                                     if (maybeOutPath && isValidPath(*maybeOutPath)
                                         && queryPathInfo(*maybeOutPath)->deriver == path)
@@ -709,7 +709,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
                             /* If keep-outputs is set, we only want to delete this path if we
                              * can also delete its derivers, so visit the derivers. */
-                            if (gcSettings.keepOutputs) {
+                            if (localSettings.keepOutputs) {
                                 auto derivers = queryValidDerivers(*path);
                                 for (auto & i : derivers)
                                     enqueue(i);
@@ -879,7 +879,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 void LocalStore::autoGC(bool sync)
 {
 #if HAVE_STATVFS
-    const auto & gcSettings = config->getLocalSettings().getGCSettings();
+    const auto & localSettings = config->getLocalSettings();
 
     static auto fakeFreeSpaceFile = getEnv("_NIX_TEST_FREE_SPACE_FILE");
 
@@ -907,14 +907,14 @@ void LocalStore::autoGC(bool sync)
 
         auto now = std::chrono::steady_clock::now();
 
-        if (now < state->lastGCCheck + std::chrono::seconds(gcSettings.minFreeCheckInterval))
+        if (now < state->lastGCCheck + std::chrono::seconds(localSettings.minFreeCheckInterval))
             return;
 
         auto avail = getAvail();
 
         state->lastGCCheck = now;
 
-        if (avail >= gcSettings.minFree || avail >= gcSettings.maxFree)
+        if (avail >= localSettings.minFree || avail >= localSettings.maxFree)
             return;
 
         if (avail > state->availAfterGC * 0.97)
@@ -925,7 +925,7 @@ void LocalStore::autoGC(bool sync)
         std::promise<void> promise;
         future = state->gcFuture = promise.get_future().share();
 
-        std::thread([promise{std::move(promise)}, this, avail, getAvail, &gcSettings]() mutable {
+        std::thread([promise{std::move(promise)}, this, avail, getAvail, &localSettings]() mutable {
             try {
 
                 /* Wake up any threads waiting for the auto-GC to finish. */
@@ -937,7 +937,7 @@ void LocalStore::autoGC(bool sync)
                 });
 
                 GCOptions options;
-                options.maxFreed = gcSettings.maxFree - avail;
+                options.maxFreed = localSettings.maxFree - avail;
 
                 printInfo("running auto-GC to free %d bytes", options.maxFreed);
 

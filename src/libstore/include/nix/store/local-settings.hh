@@ -43,8 +43,31 @@ struct BaseSetting<PathsInChroot>::trait
 template<>
 void BaseSetting<PathsInChroot>::appendOrSet(PathsInChroot newValue, bool append);
 
-struct GCSettings : public virtual Config
+const uint32_t maxIdsPerBuild =
+#ifdef __linux__
+    1 << 16
+#else
+    1
+#endif
+    ;
+
+/**
+ * Either about local store or local building
+ *
+ * These are things that should not be part of the global settings, but
+ * should be per-local-store at a minimum. We expose them from
+ * `settings` with `settings.getLocalSettings()` for now, but we also
+ * have `localStore.config->getLocalSettings()` as a way to get them
+ * too. Even though both ways will actually draw from the same global
+ * variable, we would much prefer if you use the second one, because
+ * this will prepare the code base to making these *actual*, rather than
+ * pretend, per-store settings.
+ */
+struct LocalSettings : public virtual Config
 {
+    /* GC settings. The user-facing setting names retain their
+       `gc-`/`min-free`/`max-free` prefixes (encoded in each
+       `Setting<T>`'s `name` argument). */
     Setting<off_t> reservedSize{
         this,
         8 * 1024 * 1024,
@@ -128,18 +151,10 @@ struct GCSettings : public virtual Config
         "min-free-check-interval",
         "Number of seconds between checking free disk space.",
     };
-};
 
-const uint32_t maxIdsPerBuild =
-#ifdef __linux__
-    1 << 16
-#else
-    1
-#endif
-    ;
-
-struct AutoAllocateUidSettings : public virtual Config
-{
+    /* Auto-allocate-UIDs settings. The `autoAllocateUids` flag below
+       governs whether the rest of these are honoured; callers should
+       gate use of `startId`/`uidCount` on `autoAllocateUids` first. */
     Setting<uint32_t> startId{
         this,
 #ifdef __linux__
@@ -159,43 +174,6 @@ struct AutoAllocateUidSettings : public virtual Config
 #endif
         "id-count",
         "The number of UIDs/GIDs to use for dynamic ID allocation."};
-};
-
-/**
- * Either about local store or local building
- *
- * These are things that should not be part of the global settings, but
- * should be per-local-store at a minimum. We expose them from
- * `settings` with `settings.getLocalSettings()` for now, but we also
- * have `localStore.config->getLocalSettings()` as a way to get them
- * too. Even though both ways will actually draw from the same global
- * variable, we would much prefer if you use the second one, because
- * this will prepare the code base to making these *actual*, rather than
- * pretend, per-store settings.
- */
-struct LocalSettings : public virtual Config, public GCSettings, public AutoAllocateUidSettings
-{
-    /**
-     * Get the GC settings.
-     */
-    GCSettings & getGCSettings()
-    {
-        return *this;
-    }
-
-    const GCSettings & getGCSettings() const
-    {
-        return *this;
-    }
-
-    /**
-     * Get AutoAllocateUidSettings if auto-allocate-uids is enabled.
-     * @return Pointer to settings if enabled, nullptr otherwise.
-     */
-    const AutoAllocateUidSettings * getAutoAllocateUidSettings() const
-    {
-        return autoAllocateUids ? this : nullptr;
-    }
 
     Setting<unsigned int> buildCores{
         this,

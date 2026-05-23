@@ -155,6 +155,15 @@ struct SimpleUserLock : UserLock
 
 struct AutoUserLock : UserLock
 {
+    /* The first UID and the count of UIDs to draw from for
+       auto-allocated builds.  Bundled so the two `uint32_t` values
+       cannot be passed in the wrong order to `acquire` below. */
+    struct UidRange
+    {
+        uint32_t startId;
+        uint32_t count;
+    };
+
     AutoCloseFD fdUserLock;
     uid_t firstUid = 0;
     gid_t firstGid = 0;
@@ -187,19 +196,19 @@ struct AutoUserLock : UserLock
         const std::string & buildUsersGroup,
         uid_t nrIds,
         bool useUserNamespace,
-        const AutoAllocateUidSettings & uidSettings)
+        UidRange range)
     {
 #if !defined(__linux__)
         useUserNamespace = false;
 #endif
 
         experimentalFeatureSettings.require(Xp::AutoAllocateUids);
-        assert(uidSettings.startId > 0);
-        assert(uidSettings.uidCount % maxIdsPerBuild == 0);
-        assert((uint64_t) uidSettings.startId + (uint64_t) uidSettings.uidCount <= std::numeric_limits<uid_t>::max());
+        assert(range.startId > 0);
+        assert(range.count % maxIdsPerBuild == 0);
+        assert((uint64_t) range.startId + (uint64_t) range.count <= std::numeric_limits<uid_t>::max());
         assert(nrIds <= maxIdsPerBuild);
 
-        size_t nrSlots = uidSettings.uidCount / maxIdsPerBuild;
+        size_t nrSlots = range.count / maxIdsPerBuild;
 
         for (size_t i = 0; i < nrSlots; i++) {
             debug("trying user slot '%d'", i);
@@ -208,7 +217,7 @@ struct AutoUserLock : UserLock
 
             if (auto fd = tryAcquireSlotLock(fnUserLock)) {
 
-                auto firstUid = uidSettings.startId + i * maxIdsPerBuild;
+                auto firstUid = range.startId + i * maxIdsPerBuild;
 
                 auto pw = getpwuid(firstUid);
                 if (pw)
@@ -237,10 +246,15 @@ struct AutoUserLock : UserLock
 std::unique_ptr<UserLock> acquireUserLock(
     const std::filesystem::path & stateDir, const LocalSettings & localSettings, uid_t nrIds, bool useUserNamespace)
 {
-    if (auto * uidSettings = localSettings.getAutoAllocateUidSettings()) {
+    if (localSettings.autoAllocateUids) {
         auto userPoolDir = stateDir / "userpool2";
         createDirs(userPoolDir);
-        return AutoUserLock::acquire(userPoolDir, localSettings.buildUsersGroup, nrIds, useUserNamespace, *uidSettings);
+        return AutoUserLock::acquire(
+            userPoolDir,
+            localSettings.buildUsersGroup,
+            nrIds,
+            useUserNamespace,
+            AutoUserLock::UidRange{localSettings.startId, localSettings.uidCount});
     } else {
         auto userPoolDir = stateDir / "userpool";
         createDirs(userPoolDir);
