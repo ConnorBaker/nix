@@ -15,30 +15,7 @@ namespace nix {
 
 /* protocol-agnostic templates */
 
-#define SERVE_USE_LENGTH_PREFIX_SERIALISER(TEMPLATE, T)                                                \
-    TEMPLATE T ServeProto::Serialise<T>::read(const StoreDirConfig & store, ServeProto::ReadConn conn) \
-    {                                                                                                  \
-        return LengthPrefixedProtoHelper<ServeProto, T>::read(store, conn);                            \
-    }                                                                                                  \
-    TEMPLATE void ServeProto::Serialise<T>::write(                                                     \
-        const StoreDirConfig & store, ServeProto::WriteConn conn, const T & t)                         \
-    {                                                                                                  \
-        LengthPrefixedProtoHelper<ServeProto, T>::write(store, conn, t);                               \
-    }
-
-SERVE_USE_LENGTH_PREFIX_SERIALISER(template<typename T>, std::vector<T>)
-#define SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA ,
-SERVE_USE_LENGTH_PREFIX_SERIALISER(
-    template<typename T SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA typename Compare>,
-    std::set<T SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA Compare>)
-SERVE_USE_LENGTH_PREFIX_SERIALISER(template<typename... Ts>, std::tuple<Ts...>)
-
-SERVE_USE_LENGTH_PREFIX_SERIALISER(
-    template<typename K SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA typename V SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA
-             typename Compare>
-    ,
-    std::map<K SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA V SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA Compare>)
-#undef SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA
+USE_LENGTH_PREFIX_SERIALISERS(ServeProto)
 
 /**
  * Use `CommonProto` where possible.

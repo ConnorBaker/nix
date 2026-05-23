@@ -15,30 +15,7 @@ namespace nix {
 
 /* protocol-agnostic templates */
 
-#define WORKER_USE_LENGTH_PREFIX_SERIALISER(TEMPLATE, T)                                                 \
-    TEMPLATE T WorkerProto::Serialise<T>::read(const StoreDirConfig & store, WorkerProto::ReadConn conn) \
-    {                                                                                                    \
-        return LengthPrefixedProtoHelper<WorkerProto, T>::read(store, conn);                             \
-    }                                                                                                    \
-    TEMPLATE void WorkerProto::Serialise<T>::write(                                                      \
-        const StoreDirConfig & store, WorkerProto::WriteConn conn, const T & t)                          \
-    {                                                                                                    \
-        LengthPrefixedProtoHelper<WorkerProto, T>::write(store, conn, t);                                \
-    }
-
-WORKER_USE_LENGTH_PREFIX_SERIALISER(template<typename T>, std::vector<T>)
-#define WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA ,
-WORKER_USE_LENGTH_PREFIX_SERIALISER(
-    template<typename T WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA typename Compare>,
-    std::set<T WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA Compare>)
-WORKER_USE_LENGTH_PREFIX_SERIALISER(template<typename... Ts>, std::tuple<Ts...>)
-
-WORKER_USE_LENGTH_PREFIX_SERIALISER(
-    template<typename K WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA typename V WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA
-             typename Compare>
-    ,
-    std::map<K WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA V WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA Compare>)
-#undef WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA
+USE_LENGTH_PREFIX_SERIALISERS(WorkerProto)
 
 /**
  * Use `CommonProto` where possible.

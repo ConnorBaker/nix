@@ -65,6 +65,50 @@ LENGTH_PREFIXED_PROTO_HELPER(
     Inner, std::map<K LENGTH_PREFIXED_PROTO_HELPER_COMMA V LENGTH_PREFIXED_PROTO_HELPER_COMMA Compare>);
 #undef LENGTH_PREFIXED_PROTO_HELPER_COMMA
 
+/**
+ * Define `Proto::Serialise<T>::read`/`write` as thin forwards to
+ * `LengthPrefixedProtoHelper<Proto, T>`.
+ *
+ * Used by the worker, serve, and common protocol impl headers to lift
+ * the four container specialisations (vector, set, tuple, map) out of
+ * per-protocol duplication.
+ *
+ * Like `LENGTH_PREFIXED_PROTO_HELPER` above, this macro and the
+ * `USE_LENGTH_PREFIX_SERIALISER_COMMA`/`USE_LENGTH_PREFIX_SERIALISERS`
+ * pair are public API of this header: the impl headers expand them at
+ * call sites, so they must remain defined for downstream consumers and
+ * are deliberately not `#undef`'d.
+ */
+#define USE_LENGTH_PREFIX_SERIALISER(Proto, TEMPLATE, T)                                  \
+    TEMPLATE T Proto::Serialise<T>::read(const StoreDirConfig & store, Proto::ReadConn conn) \
+    {                                                                                     \
+        return LengthPrefixedProtoHelper<Proto, T>::read(store, conn);                    \
+    }                                                                                     \
+    TEMPLATE void Proto::Serialise<T>::write(                                             \
+        const StoreDirConfig & store, Proto::WriteConn conn, const T & t)                 \
+    {                                                                                     \
+        LengthPrefixedProtoHelper<Proto, T>::write(store, conn, t);                       \
+    }
+
+/**
+ * Instantiate the four container serialiser specialisations
+ * (`std::vector`, `std::set`, `std::tuple`, `std::map`) for `Proto` via
+ * `USE_LENGTH_PREFIX_SERIALISER`.
+ */
+#define USE_LENGTH_PREFIX_SERIALISER_COMMA ,
+#define USE_LENGTH_PREFIX_SERIALISERS(Proto)                                                                       \
+    USE_LENGTH_PREFIX_SERIALISER(Proto, template<typename T>, std::vector<T>)                                      \
+    USE_LENGTH_PREFIX_SERIALISER(                                                                                  \
+        Proto,                                                                                                     \
+        template<typename T USE_LENGTH_PREFIX_SERIALISER_COMMA typename Compare>,                                  \
+        std::set<T USE_LENGTH_PREFIX_SERIALISER_COMMA Compare>)                                                    \
+    USE_LENGTH_PREFIX_SERIALISER(Proto, template<typename... Ts>, std::tuple<Ts...>)                               \
+    USE_LENGTH_PREFIX_SERIALISER(                                                                                  \
+        Proto,                                                                                                     \
+        template<typename K USE_LENGTH_PREFIX_SERIALISER_COMMA typename V USE_LENGTH_PREFIX_SERIALISER_COMMA       \
+                     typename Compare>,                                                                            \
+        std::map<K USE_LENGTH_PREFIX_SERIALISER_COMMA V USE_LENGTH_PREFIX_SERIALISER_COMMA Compare>)
+
 template<class Inner, typename T>
 std::vector<T>
 LengthPrefixedProtoHelper<Inner, std::vector<T>>::read(const StoreDirConfig & store, typename Inner::ReadConn conn)
