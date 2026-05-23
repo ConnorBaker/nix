@@ -5,16 +5,6 @@
 
 #include <variant>
 
-/**
- * Extract the major/minor halves of a protocol version word.
- *
- * The wire format packs major into the high byte and minor into the low
- * byte: `(major << 8) | minor`. These macros are shared by the worker
- * and serve protocols, both of which use this layout.
- */
-#define GET_PROTOCOL_MAJOR(x) ((x) & 0xff00)
-#define GET_PROTOCOL_MINOR(x) ((x) & 0x00ff)
-
 namespace nix {
 
 struct StoreDirConfig;

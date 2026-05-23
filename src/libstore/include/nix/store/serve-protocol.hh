@@ -9,7 +9,7 @@ namespace nix {
 #define SERVE_MAGIC_2 0x5452eecb
 
 #define SERVE_PROTOCOL_VERSION (2 << 8 | 8)
-/* GET_PROTOCOL_MAJOR/MINOR are defined in common-protocol.hh. */
+
 struct StoreDirConfig;
 struct Source;
 
