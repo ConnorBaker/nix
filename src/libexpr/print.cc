@@ -292,31 +292,38 @@ private:
     }
 
     /**
+     * Shared decision for `shouldPrettyPrintAttrs`/`shouldPrettyPrintList`.
+     * `size` is the container size (assumed >= 1); `onlyItem` is the single
+     * element pointer if `size == 1`, otherwise unused.
+     *
+     * @note This may force the single item.
+     */
+    bool shouldPrettyPrintNonEmpty(size_t size, Value * onlyItem)
+    {
+        // Pretty-print containers with more than one item.
+        if (size > 1)
+            return true;
+
+        if (!onlyItem)
+            return true;
+
+        // It is ok to force the item here, because it will be printed anyway.
+        state.forceValue(*onlyItem, onlyItem->determinePos(noPos));
+
+        // Pretty-print single-item containers only if they contain nested
+        // structures.
+        auto itemType = onlyItem->type();
+        return itemType == nList || itemType == nAttrs || itemType == nThunk;
+    }
+
+    /**
      * @note This may force items.
      */
     bool shouldPrettyPrintAttrs(AttrVec & v)
     {
-        if (!options.shouldPrettyPrint() || v.empty()) {
+        if (!options.shouldPrettyPrint() || v.empty())
             return false;
-        }
-
-        // Pretty-print attrsets with more than one item.
-        if (v.size() > 1) {
-            return true;
-        }
-
-        auto item = v[0].second;
-        if (!item) {
-            return true;
-        }
-
-        // It is ok to force the item(s) here, because they will be printed anyway.
-        state.forceValue(*item, item->determinePos(noPos));
-
-        // Pretty-print single-item attrsets only if they contain nested
-        // structures.
-        auto itemType = item->type();
-        return itemType == nList || itemType == nAttrs || itemType == nThunk;
+        return shouldPrettyPrintNonEmpty(v.size(), v[0].second);
     }
 
     void printAttrs(Value & v, size_t depth)
@@ -374,27 +381,9 @@ private:
      */
     bool shouldPrettyPrintList(std::span<Value * const> list)
     {
-        if (!options.shouldPrettyPrint() || list.empty()) {
+        if (!options.shouldPrettyPrint() || list.empty())
             return false;
-        }
-
-        // Pretty-print lists with more than one item.
-        if (list.size() > 1) {
-            return true;
-        }
-
-        auto item = list[0];
-        if (!item) {
-            return true;
-        }
-
-        // It is ok to force the item(s) here, because they will be printed anyway.
-        state.forceValue(*item, item->determinePos(noPos));
-
-        // Pretty-print single-item lists only if they contain nested
-        // structures.
-        auto itemType = item->type();
-        return itemType == nList || itemType == nAttrs || itemType == nThunk;
+        return shouldPrettyPrintNonEmpty(list.size(), list[0]);
     }
 
     void printList(Value & v, size_t depth)
