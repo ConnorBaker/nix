@@ -30,6 +30,7 @@
 #include "nix/cmd/compatibility-settings.hh"
 #include "nix/util/fun.hh"
 #include "man-pages.hh"
+#include "legacy-eval-args.hh"
 
 using namespace std::string_literals;
 
@@ -198,9 +199,9 @@ static void main_nix_build(int argc, char ** argv)
         }
     }
 
-    struct MyArgs : LegacyArgs, MixEvalArgs
+    struct MyArgs : LegacyEvalArgs
     {
-        using LegacyArgs::LegacyArgs;
+        using LegacyEvalArgs::LegacyEvalArgs;
 
         void setBaseDir(std::filesystem::path baseDir)
         {

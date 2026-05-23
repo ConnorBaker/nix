@@ -1,5 +1,6 @@
 #include "nix/cmd/command.hh"
 #include "command-register.hh"
+#include "legacy-eval-args.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-open.hh"
@@ -165,9 +166,9 @@ static int main_nix_prefetch_url(int argc, char ** argv)
         bool executable = false;
         std::optional<std::string> name;
 
-        struct MyArgs : LegacyArgs, MixEvalArgs
+        struct MyArgs : LegacyEvalArgs
         {
-            using LegacyArgs::LegacyArgs;
+            using LegacyEvalArgs::LegacyEvalArgs;
         };
 
         MyArgs myArgs(std::string(baseNameOf(argv[0])), [&](Strings::iterator & arg, const Strings::iterator & end) {

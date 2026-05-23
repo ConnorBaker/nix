@@ -21,6 +21,7 @@
 #include "nix/util/table.hh"
 #include "nix/util/terminal.hh"
 #include "man-pages.hh"
+#include "legacy-eval-args.hh"
 
 #include <cerrno>
 #include <ctime>
@@ -1428,9 +1429,9 @@ static int main_nix_env(int argc, char ** argv)
         globals.removeAll = false;
         globals.prebuiltOnly = false;
 
-        struct MyArgs : LegacyArgs, MixEvalArgs
+        struct MyArgs : LegacyEvalArgs
         {
-            using LegacyArgs::LegacyArgs;
+            using LegacyEvalArgs::LegacyEvalArgs;
         };
 
         MyArgs myArgs(std::string(baseNameOf(argv[0])), [&](Strings::iterator & arg, const Strings::iterator & end) {

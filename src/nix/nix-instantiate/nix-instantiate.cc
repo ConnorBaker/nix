@@ -12,6 +12,7 @@
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/cmd/legacy.hh"
 #include "man-pages.hh"
+#include "legacy-eval-args.hh"
 
 #include <iostream>
 
@@ -114,9 +115,9 @@ static int main_nix_instantiate(int argc, char ** argv)
         Strings attrPaths;
         bool wantsReadWrite = false;
 
-        struct MyArgs : LegacyArgs, MixEvalArgs
+        struct MyArgs : LegacyEvalArgs
         {
-            using LegacyArgs::LegacyArgs;
+            using LegacyEvalArgs::LegacyEvalArgs;
         };
 
         MyArgs myArgs(std::string(baseNameOf(argv[0])), [&](Strings::iterator & arg, const Strings::iterator & end) {
