@@ -714,58 +714,129 @@ struct ExprOpNot : Expr
     COMMON_METHODS
 };
 
-#define MakeBinOpMembers(name, s)                                                        \
-    PosIdx pos;                                                                          \
-    Expr *e1, *e2;                                                                       \
-    name(Expr * e1, Expr * e2)                                                           \
-        : e1(e1)                                                                         \
-        , e2(e2){};                                                                      \
-    name(const PosIdx & pos, Expr * e1, Expr * e2)                                       \
-        : pos(pos)                                                                       \
-        , e1(e1)                                                                         \
-        , e2(e2){};                                                                      \
-    void show(const SymbolTable & symbols, std::ostream & str) const override            \
-    {                                                                                    \
-        str << "(";                                                                      \
-        e1->show(symbols, str);                                                          \
-        str << " " s " ";                                                                \
-        e2->show(symbols, str);                                                          \
-        str << ")";                                                                      \
-    }                                                                                    \
-    void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override \
-    {                                                                                    \
-        e1->bindVars(es, env);                                                           \
-        e2->bindVars(es, env);                                                           \
-    }                                                                                    \
-    void eval(EvalState & state, Env & env, Value & v) override;                         \
-    PosIdx getPos() const override                                                       \
-    {                                                                                    \
-        return pos;                                                                      \
-    }
-
-#define MakeBinOp(name, s)        \
-    struct name : Expr            \
-    {                             \
-        MakeBinOpMembers(name, s) \
-    }
-
-MakeBinOp(ExprOpEq, "==");
-MakeBinOp(ExprOpNEq, "!=");
-MakeBinOp(ExprOpAnd, "&&");
-MakeBinOp(ExprOpOr, "||");
-MakeBinOp(ExprOpImpl, "->");
-MakeBinOp(ExprOpConcatLists, "++");
-
-struct ExprOpUpdate : Expr
+/**
+ * CRTP base for binary-operator AST nodes that share the
+ *
+ *     pos, e1, e2  +  show "(e1 SYM e2)"  +  bindVars(e1, e2)  +  getPos()
+ *
+ * shape.  Each derived class must provide:
+ *   - `static constexpr std::string_view symbol` (the operator spelling
+ *     used in `show`),
+ *   - its own `eval` override (declared per-subclass; the body lives in
+ *     `eval.cc` next to the other AST node implementations).
+ *
+ * Replaces the legacy `MakeBinOp` / `MakeBinOpMembers` macros.  Derived
+ * subclasses that need additional virtuals (e.g. `ExprOpUpdate` overriding
+ * `evalForUpdate`) inherit and add them directly.
+ */
+template<class Derived>
+struct BinOp : Expr
 {
+    PosIdx pos;
+    Expr *e1, *e2;
+
+    /* The constructors are public so that `Exprs::add<Derived>(...)` can
+       construct a `Derived` through the polymorphic allocator's
+       `construct_at` path, which bypasses `friend Derived` access to a
+       protected base ctor.  The `bugprone-crtp-constructor-accessibility`
+       warning suggests making them protected with `friend Derived`; that
+       form fails to compile here because libcxx's `polymorphic_allocator`
+       call site is not the friend.  `BinOp<X>` is unusable as a real
+       `Expr` without `X::symbol` and `X::eval`, so the "regular
+       instantiation" foot-gun the lint protects against is not
+       reachable in practice. */
+    // NOLINTNEXTLINE(bugprone-crtp-constructor-accessibility)
+    BinOp(Expr * e1, Expr * e2)
+        : e1(e1)
+        , e2(e2)
+    {
+    }
+
+    // NOLINTNEXTLINE(bugprone-crtp-constructor-accessibility)
+    BinOp(const PosIdx & pos, Expr * e1, Expr * e2)
+        : pos(pos)
+        , e1(e1)
+        , e2(e2)
+    {
+    }
+
+    void show(const SymbolTable & symbols, std::ostream & str) const override
+    {
+        str << "(";
+        e1->show(symbols, str);
+        str << " " << Derived::symbol << " ";
+        e2->show(symbols, str);
+        str << ")";
+    }
+
+    void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override
+    {
+        e1->bindVars(es, env);
+        e2->bindVars(es, env);
+    }
+
+    PosIdx getPos() const override
+    {
+        return pos;
+    }
+};
+
+struct ExprOpEq : BinOp<ExprOpEq>
+{
+    using BinOp::BinOp;
+    static constexpr std::string_view symbol = "==";
+    void eval(EvalState & state, Env & env, Value & v) override;
+};
+
+struct ExprOpNEq : BinOp<ExprOpNEq>
+{
+    using BinOp::BinOp;
+    static constexpr std::string_view symbol = "!=";
+    void eval(EvalState & state, Env & env, Value & v) override;
+};
+
+struct ExprOpAnd : BinOp<ExprOpAnd>
+{
+    using BinOp::BinOp;
+    static constexpr std::string_view symbol = "&&";
+    void eval(EvalState & state, Env & env, Value & v) override;
+};
+
+struct ExprOpOr : BinOp<ExprOpOr>
+{
+    using BinOp::BinOp;
+    static constexpr std::string_view symbol = "||";
+    void eval(EvalState & state, Env & env, Value & v) override;
+};
+
+struct ExprOpImpl : BinOp<ExprOpImpl>
+{
+    using BinOp::BinOp;
+    static constexpr std::string_view symbol = "->";
+    void eval(EvalState & state, Env & env, Value & v) override;
+};
+
+struct ExprOpConcatLists : BinOp<ExprOpConcatLists>
+{
+    using BinOp::BinOp;
+    static constexpr std::string_view symbol = "++";
+    void eval(EvalState & state, Env & env, Value & v) override;
+};
+
+struct ExprOpUpdate : BinOp<ExprOpUpdate>
+{
+    using BinOp::BinOp;
+    static constexpr std::string_view symbol = "//";
+
+    void eval(EvalState & state, Env & env, Value & v) override;
+
 private:
     /** Special case for merging of two attrsets. */
     void eval(EvalState & state, Value & v, Value & v1, Value & v2);
     void evalForUpdate(EvalState & state, Env & env, UpdateQueue & q);
 
 public:
-    MakeBinOpMembers(ExprOpUpdate, "//");
-    virtual void evalForUpdate(EvalState & state, Env & env, UpdateQueue & q, std::string_view errorCtx) override;
+    void evalForUpdate(EvalState & state, Env & env, UpdateQueue & q, std::string_view errorCtx) override;
 };
 
 struct ExprConcatStrings : Expr
