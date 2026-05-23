@@ -62,6 +62,20 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
+- **30 trivial candidates landed across 4 shard branches** (May 2026)
+  — libexpr +11 (#64, #66, #68, #106, #107, #109, #110, #112, #196,
+  #199, plus a forceValueDeep-to-SeenSet follow-up), libstore +14
+  (#4, #5, #6 hoist-then-delete, #14, #47, #82, #114, #115, #119,
+  #157, #159, #165, plus a macro→template follow-up and a
+  GET_PROTOCOL_*-deletion follow-up), libutil +3 (#29, #99, #117),
+  nix-cli +5 (#24, #77, #89, #91, #187). Two skipped on rule
+  grounds: #194 (search-path.hh ships via install_headers, not
+  internal as the candidate framing claimed) and #197 (lookupPath
+  is private). Each shard went through 4 adversarial review agents
+  + 4 `/code-review` skill passes (12 agent runs total); 20
+  nits/deferrals were captured and addressed in a final polish
+  pass. New candidate #219 (post-build-hook timeout silently
+  dropped) added to the catalog from post-cleanup review.
 - **Integration of 19 review reports** (HEAD) — folded findings from
   E1-E8, F1-F3, B1-B3, C1, V1-V5 into the candidate bodies. Notable
   edits: #134 expanded with C-API caveat per V1; #135 corrected per
@@ -109,7 +123,7 @@ line in its body.
 
 | Branch | Shard | Addresses | Status |
 | ------ | ----- | --------- | ------ |
-| `vibe-coding/cleanup/libexpr` | libexpr | #217, #64, #66, #68, #106, #107, #109, #110, #112, #196, #199 | Local-only past `437eea9d0` |
+| `vibe-coding/cleanup/libexpr` | libexpr | #217, #64, #66, #68, #106, #107, #109, #110 (extended to forceValueDeep), #112, #196, #199 | Local-only past `437eea9d0` |
 | `vibe-coding/cleanup/libfetchers` | libfetchers | #52 | Pushed |
 | `vibe-coding/cleanup/libflake` | libflake | #48 | Pushed |
 | `vibe-coding/cleanup/libmain` | libmain | #49, #128 | Pushed |

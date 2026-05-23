@@ -300,10 +300,12 @@ per-shard verified docs and follow-up source audits lives in
 [`candidates/`](candidates/), split into 25 themed section files with an
 [index](candidates/README.md). Each candidate carries a validation verdict
 (VALID / PARTIALLY VALID / INVALID / OBSOLETE) and an effort class against
-the source as it exists today. The 218 per-shard candidates (1-218; #218
+the source as it exists today. The 219 per-shard candidates (1-219; #218
 was added during the V-pass integration documenting the `Hash::dummy`/
-`StorePath::dummy` placeholder pattern) plus 44 cross-shard candidates
-(numbered N1-N44) are grouped as:
+`StorePath::dummy` placeholder pattern, and #219 was added during
+post-cleanup adversarial review documenting the post-build-hook
+timeout silent-drop bug) plus 44 cross-shard candidates (numbered
+N1-N44) are grouped as:
 wire/serialisation duplication, parallel store implementations, repeated
 boilerplate, per-platform symmetry, inheritance chains worth flattening,
 multi-implementation patterns, dead/stale code, duplicated parsers,

@@ -51,7 +51,7 @@ per-site change.
 6. **`GET_PROTOCOL_MAJOR`/`GET_PROTOCOL_MINOR` macros duplicated.** Defined identically in both `worker-protocol.hh` and `serve-protocol.hh` (`(x) & 0xff00` and `(x) & 0x00ff`). Including both headers in the same TU works only because the second `#define` produces an identical token sequence.
    - ../verified/09-libstore-protocol.md
    - **Validation:** VALID. Promote to `common-protocol.hh` (or to a shared `proto-version.hh`). Effort: trivial.
-   - **Branch:** `vibe-coding/cleanup/libstore`
+   - **Branch:** `vibe-coding/cleanup/libstore` (initially hoisted to `common-protocol.hh`; post-cleanup adversarial review found zero call sites tree-wide, so the macros were deleted entirely in a follow-up commit)
 
 7. **Protocol handshake logic is parallel between worker and serve.** `WorkerProto::BasicClientConnection::handshake` and `ServeProto::BasicClientConnection::handshake` both send magic-1, read magic-2, exchange version numbers, take the min. Worker additionally exchanges and intersects a `FeatureSet` (≥1.38) via private `intersectFeatures`; serve has no such step. Server-side mirrors are likewise parallel.
    - ../verified/09-libstore-protocol.md
