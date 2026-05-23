@@ -14,8 +14,8 @@
 
 namespace nix {
 
-std::string deleteOlderThan;
-bool dryRun = false;
+static std::string deleteOlderThan;
+static bool dryRun = false;
 
 /* If `-d' was specified, remove all old generations of all profiles.
  * Of course, this makes rollbacks to before this point in time
