@@ -1,4 +1,5 @@
 #include "nix/cmd/common-eval-args.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/expr/eval.hh"
@@ -1561,17 +1562,17 @@ struct CmdFlake : NixMultiCommand
     }
 };
 
-static auto rCmdFlake = registerCommand<CmdFlake>("flake");
-static auto rCmdFlakeArchive = registerCommand2<CmdFlakeArchive>({"flake", "archive"});
-static auto rCmdFlakeCheck = registerCommand2<CmdFlakeCheck>({"flake", "check"});
-static auto rCmdFlakeClone = registerCommand2<CmdFlakeClone>({"flake", "clone"});
-static auto rCmdFlakeInfo = registerCommand2<CmdFlakeInfo>({"flake", "info"});
-static auto rCmdFlakeInit = registerCommand2<CmdFlakeInit>({"flake", "init"});
-static auto rCmdFlakeLock = registerCommand2<CmdFlakeLock>({"flake", "lock"});
-static auto rCmdFlakeMetadata = registerCommand2<CmdFlakeMetadata>({"flake", "metadata"});
-static auto rCmdFlakeNew = registerCommand2<CmdFlakeNew>({"flake", "new"});
-static auto rCmdFlakePrefetch = registerCommand2<CmdFlakePrefetch>({"flake", "prefetch"});
-static auto rCmdFlakeShow = registerCommand2<CmdFlakeShow>({"flake", "show"});
-static auto rCmdFlakeUpdate = registerCommand2<CmdFlakeUpdate>({"flake", "update"});
+NIX_REGISTER_COMMAND(CmdFlake, "flake");
+NIX_REGISTER_COMMAND(CmdFlakeArchive, "flake", "archive");
+NIX_REGISTER_COMMAND(CmdFlakeCheck, "flake", "check");
+NIX_REGISTER_COMMAND(CmdFlakeClone, "flake", "clone");
+NIX_REGISTER_COMMAND(CmdFlakeInfo, "flake", "info");
+NIX_REGISTER_COMMAND(CmdFlakeInit, "flake", "init");
+NIX_REGISTER_COMMAND(CmdFlakeLock, "flake", "lock");
+NIX_REGISTER_COMMAND(CmdFlakeMetadata, "flake", "metadata");
+NIX_REGISTER_COMMAND(CmdFlakeNew, "flake", "new");
+NIX_REGISTER_COMMAND(CmdFlakePrefetch, "flake", "prefetch");
+NIX_REGISTER_COMMAND(CmdFlakeShow, "flake", "show");
+NIX_REGISTER_COMMAND(CmdFlakeUpdate, "flake", "update");
 
 } // namespace nix

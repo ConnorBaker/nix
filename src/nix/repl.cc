@@ -2,6 +2,7 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/util/config-global.hh"
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/cmd/installable-value.hh"
 #include "nix/cmd/repl.hh"
 #include "nix/util/os-string.hh"
@@ -105,6 +106,6 @@ struct CmdRepl : RawInstallablesCommand
     }
 };
 
-static auto rCmdRepl = registerCommand<CmdRepl>("repl");
+NIX_REGISTER_COMMAND(CmdRepl, "repl");
 
 } // namespace nix

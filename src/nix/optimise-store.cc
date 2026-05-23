@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 
@@ -24,6 +25,6 @@ struct CmdOptimiseStore : StoreCommand
     }
 };
 
-static auto rCmdOptimiseStore = registerCommand2<CmdOptimiseStore>({"store", "optimise"});
+NIX_REGISTER_COMMAND(CmdOptimiseStore, "store", "optimise");
 
 } // namespace nix

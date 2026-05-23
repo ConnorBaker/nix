@@ -1,4 +1,5 @@
 #include "nix/cmd/command-installable-value.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
@@ -127,6 +128,6 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
     }
 };
 
-static auto rCmdEval = registerCommand<CmdEval>("eval");
+NIX_REGISTER_COMMAND(CmdEval, "eval");
 
 } // namespace nix

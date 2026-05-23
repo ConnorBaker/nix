@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 
 #include <nlohmann/json.hpp>
@@ -23,7 +24,7 @@ struct CmdRealisation : NixMultiCommand
     }
 };
 
-static auto rCmdRealisation = registerCommand<CmdRealisation>("realisation");
+NIX_REGISTER_COMMAND(CmdRealisation, "realisation");
 
 struct CmdRealisationInfo : BuiltPathsCommand, MixJSON
 {
@@ -77,6 +78,6 @@ struct CmdRealisationInfo : BuiltPathsCommand, MixJSON
     }
 };
 
-static auto rCmdRealisationInfo = registerCommand2<CmdRealisationInfo>({"realisation", "info"});
+NIX_REGISTER_COMMAND(CmdRealisationInfo, "realisation", "info");
 
 } // namespace nix

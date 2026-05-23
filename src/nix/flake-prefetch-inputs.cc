@@ -1,4 +1,5 @@
 #include "flake-command.hh"
+#include "command-register.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/thread-pool.hh"
 #include "nix/store/filetransfer.hh"
@@ -68,6 +69,6 @@ struct CmdFlakePrefetchInputs : FlakeCommand
     }
 };
 
-static auto rCmdFlakePrefetchInputs = registerCommand2<CmdFlakePrefetchInputs>({"flake", "prefetch-inputs"});
+NIX_REGISTER_COMMAND(CmdFlakePrefetchInputs, "flake", "prefetch-inputs");
 
 } // namespace nix

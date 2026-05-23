@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/cmd/installable-flake.hh"
 #include "nix/cmd/installable-value.hh"
 #include "nix/expr/eval.hh"
@@ -27,7 +28,7 @@ struct CmdFormatter : NixMultiCommand
     }
 };
 
-static auto rCmdFormatter = registerCommand<CmdFormatter>("formatter");
+NIX_REGISTER_COMMAND(CmdFormatter, "formatter");
 
 /** Common implementation bits for the `nix formatter` subcommands. */
 struct MixFormatter : SourceExprCommand
@@ -108,7 +109,7 @@ struct CmdFormatterRun : MixFormatter, MixJSON
     };
 };
 
-static auto rFormatterRun = registerCommand2<CmdFormatterRun>({"formatter", "run"});
+NIX_REGISTER_COMMAND(CmdFormatterRun, "formatter", "run");
 
 struct CmdFormatterBuild : MixFormatter, MixOutLinkByDefault
 {
@@ -147,7 +148,7 @@ struct CmdFormatterBuild : MixFormatter, MixOutLinkByDefault
     };
 };
 
-static auto rFormatterBuild = registerCommand2<CmdFormatterBuild>({"formatter", "build"});
+NIX_REGISTER_COMMAND(CmdFormatterBuild, "formatter", "build");
 
 struct CmdFmt : CmdFormatterRun
 {
@@ -157,6 +158,6 @@ struct CmdFmt : CmdFormatterRun
     }
 };
 
-static auto rFmt = registerCommand<CmdFmt>("fmt");
+NIX_REGISTER_COMMAND(CmdFmt, "fmt");
 
 } // namespace nix

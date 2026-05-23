@@ -3,6 +3,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/expr/eval.hh"
 #include "run.hh"
 #include "nix/util/strings.hh"
@@ -30,7 +31,7 @@ struct CmdEnv : NixMultiCommand
     }
 };
 
-static auto rCmdEnv = registerCommand<CmdEnv>("env");
+NIX_REGISTER_COMMAND(CmdEnv, "env");
 
 struct CmdShell : InstallablesCommand, MixEnvironment
 {
@@ -120,6 +121,6 @@ struct CmdShell : InstallablesCommand, MixEnvironment
     }
 };
 
-static auto rCmdShell = registerCommand2<CmdShell>({"env", "shell"});
+NIX_REGISTER_COMMAND(CmdShell, "env", "shell");
 
 } // namespace nix

@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/store-cast.hh"
@@ -64,6 +65,6 @@ struct CmdStoreDelete : StorePathsCommand
     }
 };
 
-static auto rCmdStoreDelete = registerCommand2<CmdStoreDelete>({"store", "delete"});
+NIX_REGISTER_COMMAND(CmdStoreDelete, "store", "delete");
 
 } // namespace nix

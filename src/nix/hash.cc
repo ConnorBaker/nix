@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/util/hash.hh"
 #include "nix/cmd/legacy.hh"
 #include "nix/main/shared.hh"
@@ -285,7 +286,7 @@ struct CmdHash : NixMultiCommand
     }
 };
 
-static auto rCmdHash = registerCommand<CmdHash>("hash");
+NIX_REGISTER_COMMAND(CmdHash, "hash");
 
 /* Legacy nix-hash command. */
 static int compatNixHash(int argc, char ** argv)

@@ -1,5 +1,6 @@
 #include "nix/util/current-process.hh"
 #include "nix/cmd/command-installable-value.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/attr-path.hh"
@@ -58,6 +59,6 @@ struct CmdEdit : InstallableValueCommand
     }
 };
 
-static auto rCmdEdit = registerCommand<CmdEdit>("edit");
+NIX_REGISTER_COMMAND(CmdEdit, "edit");
 
 } // namespace nix

@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/local-fs-store.hh"
@@ -74,6 +75,6 @@ struct CmdCopy : virtual CopyCommand, virtual BuiltPathsCommand, MixProfile, Mix
     }
 };
 
-static auto rCmdCopy = registerCommand<CmdCopy>("copy");
+NIX_REGISTER_COMMAND(CmdCopy, "copy");
 
 } // namespace nix

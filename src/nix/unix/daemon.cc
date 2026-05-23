@@ -2,6 +2,7 @@
 
 #include "nix/util/signals.hh"
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/uds-remote-store.hh"
@@ -654,6 +655,6 @@ struct CmdDaemon : StoreConfigCommand
     }
 };
 
-static auto rCmdDaemon = registerCommand2<CmdDaemon>({"daemon"});
+NIX_REGISTER_COMMAND(CmdDaemon, "daemon");
 
 } // namespace nix

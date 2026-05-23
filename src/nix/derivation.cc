@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 
 namespace nix {
 
@@ -20,6 +21,6 @@ struct CmdDerivation : NixMultiCommand
     }
 };
 
-static auto rCmdDerivation = registerCommand<CmdDerivation>("derivation");
+NIX_REGISTER_COMMAND(CmdDerivation, "derivation");
 
 } // namespace nix

@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/names.hh"
@@ -144,6 +145,6 @@ struct CmdDiffClosures : SourceExprCommand, MixOperateOnOptions
     }
 };
 
-static auto rCmdDiffClosures = registerCommand2<CmdDiffClosures>({"store", "diff-closures"});
+NIX_REGISTER_COMMAND(CmdDiffClosures, "store", "diff-closures");
 
 } // namespace nix

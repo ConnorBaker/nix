@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
@@ -49,6 +50,6 @@ struct CmdStoreGC : StoreCommand, MixDryRun
     }
 };
 
-static auto rCmdStoreGC = registerCommand2<CmdStoreGC>({"store", "gc"});
+NIX_REGISTER_COMMAND(CmdStoreGC, "store", "gc");
 
 } // namespace nix

@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-open.hh"
@@ -348,6 +349,6 @@ struct CmdStorePrefetchFile : StoreCommand, MixJSON
     }
 };
 
-static auto rCmdStorePrefetchFile = registerCommand2<CmdStorePrefetchFile>({"store", "prefetch-file"});
+NIX_REGISTER_COMMAND(CmdStorePrefetchFile, "store", "prefetch-file");
 
 } // namespace nix

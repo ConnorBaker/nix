@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/expr/eval.hh"
 #include "nix/store/store-api.hh"
@@ -266,6 +267,6 @@ struct CmdRegistry : NixMultiCommand
     }
 };
 
-static auto rCmdRegistry = registerCommand<CmdRegistry>("registry");
+NIX_REGISTER_COMMAND(CmdRegistry, "registry");
 
 } // namespace nix

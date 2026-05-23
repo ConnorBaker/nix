@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-open.hh"
 #include "nix/util/thread-pool.hh"
@@ -185,6 +186,6 @@ struct CmdVerify : StorePathsCommand
     }
 };
 
-static auto rCmdVerify = registerCommand2<CmdVerify>({"store", "verify"});
+NIX_REGISTER_COMMAND(CmdVerify, "store", "verify");
 
 } // namespace nix

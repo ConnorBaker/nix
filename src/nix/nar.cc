@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 
 namespace nix {
 
@@ -27,6 +28,6 @@ struct CmdNar : NixMultiCommand
     }
 };
 
-static auto rCmdNar = registerCommand<CmdNar>("nar");
+NIX_REGISTER_COMMAND(CmdNar, "nar");
 
 } // namespace nix

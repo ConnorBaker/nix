@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/util/config-global.hh"
 #include "nix/expr/eval.hh"
 #include "nix/cmd/installable-flake.hh"
@@ -750,7 +751,7 @@ struct CmdPrintDevEnv : Common, MixJSON
     }
 };
 
-static auto rCmdPrintDevEnv = registerCommand<CmdPrintDevEnv>("print-dev-env");
-static auto rCmdDevelop = registerCommand<CmdDevelop>("develop");
+NIX_REGISTER_COMMAND(CmdPrintDevEnv, "print-dev-env");
+NIX_REGISTER_COMMAND(CmdDevelop, "develop");
 
 } // namespace nix

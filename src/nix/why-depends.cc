@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/path-references.hh"
 #include "nix/util/source-accessor.hh"
@@ -294,6 +295,6 @@ struct CmdWhyDepends : SourceExprCommand, MixOperateOnOptions
     }
 };
 
-static auto rCmdWhyDepends = registerCommand<CmdWhyDepends>("why-depends");
+NIX_REGISTER_COMMAND(CmdWhyDepends, "why-depends");
 
 } // namespace nix

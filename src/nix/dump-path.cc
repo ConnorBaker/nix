@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/terminal.hh"
@@ -35,7 +36,7 @@ struct CmdDumpPath : StorePathCommand
     }
 };
 
-static auto rDumpPath = registerCommand2<CmdDumpPath>({"store", "dump-path"});
+NIX_REGISTER_COMMAND(CmdDumpPath, "store", "dump-path");
 
 struct CmdDumpPath2 : Command
 {
@@ -75,7 +76,7 @@ struct CmdNarDumpPath : CmdDumpPath2
     }
 };
 
-static auto rCmdNarPack = registerCommand2<CmdDumpPath2>({"nar", "pack"});
-static auto rCmdNarDumpPath = registerCommand2<CmdNarDumpPath>({"nar", "dump-path"});
+NIX_REGISTER_COMMAND(CmdDumpPath2, "nar", "pack");
+NIX_REGISTER_COMMAND(CmdNarDumpPath, "nar", "dump-path");
 
 } // namespace nix

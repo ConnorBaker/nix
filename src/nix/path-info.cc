@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/main/common-args.hh"
@@ -237,6 +238,6 @@ struct CmdPathInfo : StorePathsCommand, MixJSON
     }
 };
 
-static auto rCmdPathInfo = registerCommand<CmdPathInfo>("path-info");
+NIX_REGISTER_COMMAND(CmdPathInfo, "path-info");
 
 } // namespace nix

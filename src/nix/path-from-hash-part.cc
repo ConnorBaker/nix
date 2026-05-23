@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/store/store-api.hh"
 
 namespace nix {
@@ -36,6 +37,6 @@ struct CmdPathFromHashPart : StoreCommand
     }
 };
 
-static auto rCmdPathFromHashPart = registerCommand2<CmdPathFromHashPart>({"store", "path-from-hash-part"});
+NIX_REGISTER_COMMAND(CmdPathFromHashPart, "store", "path-from-hash-part");
 
 } // namespace nix

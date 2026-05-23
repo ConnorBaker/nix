@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/finally.hh"
@@ -44,6 +45,6 @@ struct CmdInfoStore : StoreCommand, MixJSON
     }
 };
 
-static auto rCmdInfoStore = registerCommand2<CmdInfoStore>({"store", "info"});
+NIX_REGISTER_COMMAND(CmdInfoStore, "store", "info");
 
 } // namespace nix

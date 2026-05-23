@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/cmd/unix-socket-server.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/store-api.hh"
@@ -64,6 +65,6 @@ struct CmdRootsDaemon : StoreConfigCommand
     }
 };
 
-static auto rCmdStoreRootsDaemon = registerCommand2<CmdRootsDaemon>({"store", "roots-daemon"});
+NIX_REGISTER_COMMAND(CmdRootsDaemon, "store", "roots-daemon");
 
 } // namespace nix

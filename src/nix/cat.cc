@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/serialise.hh"
@@ -118,7 +119,7 @@ struct CmdCatNar : StoreCommand, MixCat
     }
 };
 
-static auto rCmdCatStore = registerCommand2<CmdCatStore>({"store", "cat"});
-static auto rCmdCatNar = registerCommand2<CmdCatNar>({"nar", "cat"});
+NIX_REGISTER_COMMAND(CmdCatStore, "store", "cat");
+NIX_REGISTER_COMMAND(CmdCatNar, "nar", "cat");
 
 } // namespace nix

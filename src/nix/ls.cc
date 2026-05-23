@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/nar-accessor.hh"
 #include "nix/main/common-args.hh"
@@ -158,7 +159,7 @@ struct CmdLsNar : Command, MixLs
     }
 };
 
-static auto rCmdLsStore = registerCommand2<CmdLsStore>({"store", "ls"});
-static auto rCmdLsNar = registerCommand2<CmdLsNar>({"nar", "ls"});
+NIX_REGISTER_COMMAND(CmdLsStore, "store", "ls");
+NIX_REGISTER_COMMAND(CmdLsNar, "nar", "ls");
 
 } // namespace nix

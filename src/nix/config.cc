@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 #include "nix/util/config-global.hh"
 
@@ -77,7 +78,7 @@ struct CmdConfigShow : Command, MixJSON
     }
 };
 
-static auto rCmdConfig = registerCommand<CmdConfig>("config");
-static auto rShowConfig = registerCommand2<CmdConfigShow>({"config", "show"});
+NIX_REGISTER_COMMAND(CmdConfig, "config");
+NIX_REGISTER_COMMAND(CmdConfigShow, "config", "show");
 
 } // namespace nix

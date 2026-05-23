@@ -2,6 +2,7 @@
 // FIXME: rename to 'nix store derivation show'?
 
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/derivations.hh"
@@ -68,6 +69,6 @@ struct CmdShowDerivation : InstallablesCommand, MixPrintJSON
     }
 };
 
-static auto rCmdShowDerivation = registerCommand2<CmdShowDerivation>({"derivation", "show"});
+NIX_REGISTER_COMMAND(CmdShowDerivation, "derivation", "show");
 
 } // namespace nix

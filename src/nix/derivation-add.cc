@@ -1,6 +1,7 @@
 // FIXME: rename to 'nix plan add' or 'nix derivation add'?
 
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/derivations.hh"
@@ -43,6 +44,6 @@ struct CmdAddDerivation : MixDryRun, StoreCommand
     }
 };
 
-static auto rCmdAddDerivation = registerCommand2<CmdAddDerivation>({"derivation", "add"});
+NIX_REGISTER_COMMAND(CmdAddDerivation, "derivation", "add");
 
 } // namespace nix

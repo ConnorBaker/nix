@@ -1,5 +1,6 @@
 #include "nix/util/signals.hh"
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-open.hh"
 #include "nix/util/thread-pool.hh"
@@ -95,7 +96,7 @@ struct CmdCopySigs : StorePathsCommand
     }
 };
 
-static auto rCmdCopySigs = registerCommand2<CmdCopySigs>({"store", "copy-sigs"});
+NIX_REGISTER_COMMAND(CmdCopySigs, "store", "copy-sigs");
 
 struct CmdSign : StorePathsCommand
 {
@@ -144,7 +145,7 @@ struct CmdSign : StorePathsCommand
     }
 };
 
-static auto rCmdSign = registerCommand2<CmdSign>({"store", "sign"});
+NIX_REGISTER_COMMAND(CmdSign, "store", "sign");
 
 struct CmdKeyGenerateSecret : Command
 {
@@ -225,6 +226,6 @@ struct CmdKey : NixMultiCommand
     }
 };
 
-static auto rCmdKey = registerCommand<CmdKey>("key");
+NIX_REGISTER_COMMAND(CmdKey, "key");
 
 } // namespace nix

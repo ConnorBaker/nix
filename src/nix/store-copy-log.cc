@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/store-cast.hh"
@@ -36,6 +37,6 @@ struct CmdCopyLog : virtual CopyCommand, virtual InstallablesCommand
     }
 };
 
-static auto rCmdCopyLog = registerCommand2<CmdCopyLog>({"store", "copy-log"});
+NIX_REGISTER_COMMAND(CmdCopyLog, "store", "copy-log");
 
 } // namespace nix

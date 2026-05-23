@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/cmd/get-build-log.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/globals.hh"
@@ -46,6 +47,6 @@ struct CmdLog : InstallableCommand
     }
 };
 
-static auto rCmdLog = registerCommand<CmdLog>("log");
+NIX_REGISTER_COMMAND(CmdLog, "log");
 
 } // namespace nix

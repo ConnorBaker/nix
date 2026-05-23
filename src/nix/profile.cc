@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/cmd/installable-flake.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
@@ -1028,6 +1029,6 @@ struct CmdProfile : NixMultiCommand
     }
 };
 
-static auto rCmdProfile = registerCommand<CmdProfile>("profile");
+NIX_REGISTER_COMMAND(CmdProfile, "profile");
 
 } // namespace nix

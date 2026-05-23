@@ -23,6 +23,7 @@
 #include "nix/flake/flake.hh"
 #include "nix/flake/settings.hh"
 
+#include "command-register.hh"
 #include "self-exe.hh"
 #include "crash-handler.hh"
 #include "cli-config-private.hh"
@@ -337,7 +338,7 @@ struct CmdHelp : Command
     }
 };
 
-static auto rCmdHelp = registerCommand<CmdHelp>("help");
+NIX_REGISTER_COMMAND(CmdHelp, "help");
 
 struct CmdHelpStores : Command
 {
@@ -364,7 +365,7 @@ struct CmdHelpStores : Command
     }
 };
 
-static auto rCmdHelpStores = registerCommand<CmdHelpStores>("help-stores");
+NIX_REGISTER_COMMAND(CmdHelpStores, "help-stores");
 
 void mainWrapped(int argc, char ** argv)
 {

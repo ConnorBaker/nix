@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/make-content-addressed.hh"
 #include "nix/main/common-args.hh"
@@ -55,6 +56,6 @@ struct CmdMakeContentAddressed : virtual CopyCommand, virtual StorePathsCommand,
     }
 };
 
-static auto rCmdMakeContentAddressed = registerCommand2<CmdMakeContentAddressed>({"store", "make-content-addressed"});
+NIX_REGISTER_COMMAND(CmdMakeContentAddressed, "store", "make-content-addressed");
 
 } // namespace nix

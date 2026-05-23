@@ -1,5 +1,6 @@
 #include "nix/cmd/installable-flake.hh"
 #include "nix/cmd/command-installable-value.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/local-fs-store.hh"
@@ -130,6 +131,6 @@ struct CmdBundle : InstallableValueCommand
     }
 };
 
-static auto r2 = registerCommand<CmdBundle>("bundle");
+NIX_REGISTER_COMMAND(CmdBundle, "bundle");
 
 } // namespace nix

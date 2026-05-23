@@ -1,6 +1,7 @@
 #include "nix/util/current-process.hh"
 #include "run.hh"
 #include "nix/cmd/command-installable-value.hh"
+#include "command-register.hh"
 #include "nix/main/shared.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/store-api.hh"
@@ -167,7 +168,7 @@ struct CmdRun : InstallableValueCommand, MixEnvironment
     }
 };
 
-static auto rCmdRun = registerCommand<CmdRun>("run");
+NIX_REGISTER_COMMAND(CmdRun, "run");
 
 void chrootHelper(int argc, char ** argv)
 {

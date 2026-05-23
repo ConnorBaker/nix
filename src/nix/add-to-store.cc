@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/posix-source-accessor.hh"
@@ -81,8 +82,8 @@ struct CmdAddPath : CmdAddToStore
     }
 };
 
-static auto rCmdAddFile = registerCommand2<CmdAddFile>({"store", "add-file"});
-static auto rCmdAddPath = registerCommand2<CmdAddPath>({"store", "add-path"});
-static auto rCmdAdd = registerCommand2<CmdAdd>({"store", "add"});
+NIX_REGISTER_COMMAND(CmdAddFile, "store", "add-file");
+NIX_REGISTER_COMMAND(CmdAddPath, "store", "add-path");
+NIX_REGISTER_COMMAND(CmdAdd, "store", "add");
 
 } // namespace nix

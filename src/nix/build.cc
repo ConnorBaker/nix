@@ -1,4 +1,5 @@
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
@@ -185,6 +186,6 @@ struct CmdBuild : InstallablesCommand, MixOutLinkByDefault, MixDryRun, MixJSON, 
     }
 };
 
-static auto rCmdBuild = registerCommand<CmdBuild>("build");
+NIX_REGISTER_COMMAND(CmdBuild, "build");
 
 } // namespace nix

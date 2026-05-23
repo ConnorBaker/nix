@@ -1,4 +1,5 @@
 #include "nix/cmd/command-installable-value.hh"
+#include "command-register.hh"
 #include "nix/store/globals.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
@@ -197,6 +198,6 @@ struct CmdSearch : InstallableValueCommand, MixJSON
     }
 };
 
-static auto rCmdSearch = registerCommand<CmdSearch>("search");
+NIX_REGISTER_COMMAND(CmdSearch, "search");
 
 } // namespace nix

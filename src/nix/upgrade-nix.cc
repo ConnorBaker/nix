@@ -1,6 +1,7 @@
 #include "nix/util/os-string.hh"
 #include "nix/util/processes.hh"
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/main/common-args.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/filetransfer.hh"
@@ -209,6 +210,6 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
     }
 };
 
-static auto rCmdUpgradeNix = registerCommand<CmdUpgradeNix>("upgrade-nix");
+NIX_REGISTER_COMMAND(CmdUpgradeNix, "upgrade-nix");
 
 } // namespace nix

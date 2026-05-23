@@ -1,6 +1,7 @@
 #include <sstream>
 
 #include "nix/cmd/command.hh"
+#include "command-register.hh"
 #include "nix/util/exit.hh"
 #include "nix/util/logging.hh"
 #include "nix/store/serve-protocol.hh"
@@ -177,6 +178,6 @@ struct CmdConfigCheck : StoreCommand
     }
 };
 
-static auto rCmdConfigCheck = registerCommand2<CmdConfigCheck>({"config", "check"});
+NIX_REGISTER_COMMAND(CmdConfigCheck, "config", "check");
 
 } // namespace nix
