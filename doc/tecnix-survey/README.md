@@ -14,7 +14,7 @@ Every claim is grounded in code I read end-to-end[^codebases] or behaviour I rep
 
 Determinate Systems' lazy-trees is a lazy filesystem with materialised views over content-addressed sources. Tecnix is using it to back a monorepo. What would upstream Nix need to support these use-cases natively, without the bespoke `__unsafeTectonixInternal*` builtins?
 
-The answer is structured as: §2 establishes the substrate (the layered model, the L2 design split, the `SourceAccessor` algebra) needed to read the rest. §3 inventories tecnix's patches and §4 maps each one to a missing abstraction — the document's payoff table. §5 catalogues sixteen accessor-algebra rows (twelve real asymmetries plus four symmetric operations for completeness) — the codified evidence behind the missing abstractions. §6 shows the empirical reproduction of five findings. §7 is the patterns-Nix-is-missing rollup. §8 is the priority-ranked wishlist. §9 is what I did not verify.
+The answer is structured as: §2 establishes the substrate (the layered model, the L2 design split, the `SourceAccessor` algebra, and a concrete map of where each cache and accessor lives) needed to read the rest. §3 inventories tecnix's patches and §4 maps each one to a missing abstraction — the document's payoff table. §5 catalogues sixteen accessor-algebra rows (twelve real asymmetries plus four symmetric operations for completeness) — the codified evidence behind the missing abstractions. §6 shows the empirical reproduction of five findings. §7 is the patterns-Nix-is-missing rollup. §8 is the priority-ranked wishlist. §9 is what I did not verify.
 
 ---
 
@@ -80,6 +80,35 @@ A subtle point: `nix eval` and `nix-instantiate` both materialise every L2 path 
 [^cli-devirtualize]: Both master and DetSys materialise at CLI output, with different function names: DetSys [eval.cc#L115](https://github.com/DeterminateSystems/nix-src/blob/11f3aff904f84ae612e36e8bc578ac421fca74fa/src/nix/eval.cc#L115) calls `state->devirtualize(...)`; [nix-instantiate.cc#L61](https://github.com/DeterminateSystems/nix-src/blob/11f3aff904f84ae612e36e8bc578ac421fca74fa/src/nix/nix-instantiate/nix-instantiate.cc#L61), [#L69](https://github.com/DeterminateSystems/nix-src/blob/11f3aff904f84ae612e36e8bc578ac421fca74fa/src/nix/nix-instantiate/nix-instantiate.cc#L69), [#L72](https://github.com/DeterminateSystems/nix-src/blob/11f3aff904f84ae612e36e8bc578ac421fca74fa/src/nix/nix-instantiate/nix-instantiate.cc#L72) do the same. Master uses `ensureLazyPathsCopied(context)`: [eval.cc#L126](https://github.com/NixOS/nix/blob/2d309b18e5a3a8734f4e64e659dac1813964c241/src/nix/eval.cc#L126), [nix-instantiate.cc#L98](https://github.com/NixOS/nix/blob/2d309b18e5a3a8734f4e64e659dac1813964c241/src/nix/nix-instantiate/nix-instantiate.cc#L98), [app.cc#L98](https://github.com/NixOS/nix/blob/2d309b18e5a3a8734f4e64e659dac1813964c241/src/nix/app.cc#L98). So `nix eval -f x.nix --raw` of `someInput.outPath` always materialises that input. Confirmed empirically — the eval logs show `hashing` followed by `copying` even for a bare `.outPath` access.
 
 This means: virtual paths are an *evaluator-internal* optimisation. They never escape to user-visible CLI output. Whether tecnix's "lazy" mode is faster than master's "lazy" mode depends on whether the saved NAR-hash walks are dominated by paths that *do* end up in final output (which would be hashed anyway).
+
+### 2.5 Where the caches and accessors live
+
+The L1/L2/L3 picture above is the type level. Concretely, Nix maintains several on-disk stores plus several in-process structures, each mapped to a layer:
+
+| What | Where | Lifetime | Identity |
+| --- | --- | --- | --- |
+| Real working tree, build outputs | `/`, `/tmp/...` | Filesystem | Path on disk |
+| **Tarball cache** (a bare git ODB)[^tarball-cache-loc] | `~/.cache/nix/tarball-cache-v2` | Filesystem | git tree-SHA |
+| **Per-URL git fetch cache**[^gitv3-cache] | `~/.cache/nix/gitv3/<hashed-url>/` | Filesystem | URL → bare git repo |
+| **Tecnix's worldRepo** | `~/world/git` (configurable) | Filesystem | Same as the above two: a bare git ODB |
+| **Fetcher-cache projection memo** | `~/.cache/nix/fetcher-cache-v4.sqlite` | Filesystem | One key-attr-set domain per projection (10+) |
+| **L1 `SourceAccessor` instance** | RAM | EvalState | Accessor pointer + opaque `fingerprint` field |
+| **L2 `storeFS` mount table** | RAM (`MountedSourceAccessor`) | EvalState | Synthetic store path → L1 accessor |
+| **Tecnix's `tectonixZoneCache_`** | RAM (`SharedSync<map<Hash, StorePath>>`) | EvalState | tree-SHA → synthetic store path |
+| **L3 real store** | `/nix/store` | Filesystem | Content-addressed store path |
+| **Eval cache** | `~/.cache/nix/eval-cache-v6/<flake-fp>.sqlite` | Filesystem | Flake fingerprint → cached evaluated values (orthogonal to L1/L2/L3) |
+
+[^tarball-cache-loc]: Opened via `Settings::getTarballCache()` at [DetSys:git-utils.cc#L1514-L1525](https://github.com/DeterminateSystems/nix-src/blob/11f3aff904f84ae612e36e8bc578ac421fca74fa/src/libfetchers/git-utils.cc#L1514-L1525) (master [#L1493-L1502](https://github.com/NixOS/nix/blob/2d309b18e5a3a8734f4e64e659dac1813964c241/src/libfetchers/git-utils.cc#L1493-L1502)). Bare repo, packfiles-only, populated by `tarball.cc` on tarball download and by `github.cc` on archive-tarball fetches.
+
+[^gitv3-cache]: `getCachePath(url, shallow)` returns `~/.cache/nix/gitv3/<hashed-url>/`: master at [git.cc#L36-L40](https://github.com/NixOS/nix/blob/2d309b18e5a3a8734f4e64e659dac1813964c241/src/libfetchers/git.cc#L36-L40), DetSys at [git.cc#L41-L45](https://github.com/DeterminateSystems/nix-src/blob/11f3aff904f84ae612e36e8bc578ac421fca74fa/src/libfetchers/git.cc#L41-L45). Used by the git fetcher when fetching by URL.
+
+Two observations follow:
+
+**Three on-disk bare-git ODBs of the same shape, three different lifetimes.** The tarball cache, the per-URL gitv3 cache, and tecnix's worldRepo are all bare git repositories accessed via `GitSourceAccessor` and identified by tree-SHA. They differ only in *where* they sit and *who* writes to them. The mechanism is uniform.
+
+**The fetcher-cache sqlite is the L1↔L2 projection layer.** Each cache "domain" memoises one projection between identity schemes. `treeHashToNarHash` is the canonical example: tree-SHA → NAR hash. `sourcePathToHash` (used by `fetchToStore`) is the most general: `(fingerprint, method, subpath) → NAR hash`. The ten domains visible in §7.3's footnote are ten ad-hoc instances of the same projection pattern. **Tecnix's `tectonixZoneCache_` is a fourth instance — same shape, EvalState lifetime instead of persistent — because the persistent projection layer isn't reachable from user-space code.**
+
+This is the bridge between the abstract L1/L2/L3 model in §2.1 and the missing-abstractions catalogue in §6/§7: the surfacing work in §8 Tier 1 #3 ("expose `treeHashToNarHash` for arbitrary git subtrees") is, mechanically, "let user-space tree-SHA → store-path projections write to the same fetcher-cache sqlite that the tarball cache already writes to."
 
 ---
 
