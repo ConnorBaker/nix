@@ -260,17 +260,40 @@ std::ostream & operator<<(std::ostream & stream, const LockFile & lockFile)
     return stream;
 }
 
+/**
+ * Walk every node reachable from `root` exactly once, recording each
+ * visited node in `seen` (which doubles as the dedup set), and
+ * invoking `visit(prefix, node)` for each newly seen node.
+ *
+ * Recurses through `LockedNode`-ref edges only; `follows` indirections
+ * (the `InputAttrPath` alternative of `Node::Edge`) are not traversed
+ * here.
+ *
+ * `NodeRefT` is `ref<Node>` or `ref<const Node>`; `seen` and the
+ * visitor receive the same node-ref type. Callers that only need the
+ * collected node set can pass an empty-body visitor and iterate `seen`
+ * directly afterwards (which sorts by node-pointer address).
+ */
+template<typename NodeRefT, typename Visit>
+static void forEachReachableNode(NodeRefT root, std::set<NodeRefT> & seen, const Visit & visit)
+{
+    [&](this const auto & recurse, const InputAttrPath & prefix, NodeRefT node) -> void {
+        if (!seen.insert(node).second)
+            return;
+        visit(prefix, node);
+        for (auto & [id, edge] : node->inputs)
+            if (auto child = std::get_if<0>(&edge)) {
+                auto childPath(prefix);
+                childPath.push_back(id);
+                recurse(childPath, *child);
+            }
+    }({}, root);
+}
+
 std::optional<FlakeRef> LockFile::isUnlocked(const fetchers::Settings & fetchSettings) const
 {
     std::set<ref<const Node>> nodes;
-
-    [&](this const auto & visit, ref<const Node> node) {
-        if (!nodes.insert(node).second)
-            return;
-        for (auto & i : node->inputs)
-            if (auto child = std::get_if<0>(&i.second))
-                visit(*child);
-    }(root);
+    forEachReachableNode(ref<const Node>(root), nodes, [](const InputAttrPath &, ref<const Node>) {});
 
     /* Return whether the input is either locked, or, if
        `allow-dirty-locks` is enabled, it has a NAR hash. In the
@@ -326,22 +349,15 @@ std::optional<NonEmptyInputAttrPath> NonEmptyInputAttrPath::make(InputAttrPath p
 
 std::map<InputAttrPath, Node::Edge> LockFile::getAllInputs() const
 {
-    std::set<ref<Node>> done;
     std::map<InputAttrPath, Node::Edge> res;
-
-    [&](this const auto & recurse, const InputAttrPath & prefix, ref<Node> node) {
-        if (!done.insert(node).second)
-            return;
-
-        for (auto & [id, input] : node->inputs) {
+    std::set<ref<Node>> seen;
+    forEachReachableNode(root, seen, [&](const InputAttrPath & prefix, ref<Node> node) {
+        for (auto & [id, edge] : node->inputs) {
             auto inputAttrPath(prefix);
             inputAttrPath.push_back(id);
-            res.emplace(inputAttrPath, input);
-            if (auto child = std::get_if<0>(&input))
-                recurse(inputAttrPath, *child);
+            res.emplace(inputAttrPath, edge);
         }
-    }({}, root);
-
+    });
     return res;
 }
 
