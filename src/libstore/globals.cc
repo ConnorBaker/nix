@@ -449,6 +449,33 @@ struct BaseSetting<std::set<StoreReference>>::trait
     static constexpr bool appendable = true;
 };
 
+/* Shared helpers for the StoreReference container `BaseSetting`
+   specialisations below. All three (vector, set; the singular
+   StoreReference is below for completeness) use the same
+   space-separated render format and `StoreReference::parse` per
+   token. */
+template<typename C>
+static C parseStoreReferenceCollection(const std::string & str)
+{
+    C res;
+    for (const auto & s : tokenizeString<Strings>(str)) {
+        if constexpr (requires { res.push_back(StoreReference::parse(s)); })
+            res.push_back(StoreReference::parse(s));
+        else
+            res.insert(StoreReference::parse(s));
+    }
+    return res;
+}
+
+template<typename C>
+static std::string renderStoreReferenceCollection(const C & value)
+{
+    Strings ss;
+    for (const auto & ref : value)
+        ss.push_back(ref.render());
+    return concatStringsSep(" ", ss);
+}
+
 template<>
 StoreReference BaseSetting<StoreReference>::parse(const std::string & str) const
 {
@@ -464,19 +491,13 @@ std::string BaseSetting<StoreReference>::to_string() const
 template<>
 std::vector<StoreReference> BaseSetting<std::vector<StoreReference>>::parse(const std::string & str) const
 {
-    std::vector<StoreReference> res;
-    for (const auto & s : tokenizeString<Strings>(str))
-        res.push_back(StoreReference::parse(s));
-    return res;
+    return parseStoreReferenceCollection<std::vector<StoreReference>>(str);
 }
 
 template<>
 std::string BaseSetting<std::vector<StoreReference>>::to_string() const
 {
-    Strings ss;
-    for (const auto & ref : value)
-        ss.push_back(ref.render());
-    return concatStringsSep(" ", ss);
+    return renderStoreReferenceCollection(value);
 }
 
 template<>
@@ -491,19 +512,13 @@ void BaseSetting<std::vector<StoreReference>>::appendOrSet(std::vector<StoreRefe
 template<>
 std::set<StoreReference> BaseSetting<std::set<StoreReference>>::parse(const std::string & str) const
 {
-    std::set<StoreReference> res;
-    for (const auto & s : tokenizeString<Strings>(str))
-        res.insert(StoreReference::parse(s));
-    return res;
+    return parseStoreReferenceCollection<std::set<StoreReference>>(str);
 }
 
 template<>
 std::string BaseSetting<std::set<StoreReference>>::to_string() const
 {
-    Strings ss;
-    for (const auto & ref : value)
-        ss.push_back(ref.render());
-    return concatStringsSep(" ", ss);
+    return renderStoreReferenceCollection(value);
 }
 
 template<>
