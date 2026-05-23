@@ -175,6 +175,32 @@ static bool matchUser(std::string_view user, const struct group & gr)
  * If the user is in another group which is in the set: yes.
  *
  * Otherwise: No.
+ *
+ * Implementation note (security-critical): a `@groupname` entry is
+ * resolved against POSIX group membership in two distinct steps,
+ * because `getgrnam(3)`'s `gr_mem` array lists *secondary* members
+ * only. POSIX records primary-group membership separately, in the
+ * user's `pw_gid` field of `passwd`; it is **not** present in
+ * `gr_mem`. The two cases are handled as follows:
+ *
+ *  - **Primary group.** The caller (`authPeer`) resolves
+ *    `peer.gid` (the kernel-supplied primary GID of the connecting
+ *    process) via `getgrgid` and passes the resulting group name in
+ *    via the `group` parameter. We compare it directly against
+ *    `i.substr(1)` (the literal name after the `@`). If the primary
+ *    group matches the entry, that path returns `true` *without*
+ *    looking at `gr_mem`.
+ *
+ *  - **Secondary groups.** Only after the primary check fails do we
+ *    call `getgrnam(name)` and walk `gr_mem`, which is the canonical
+ *    POSIX way to enumerate the *secondary* members of a group.
+ *
+ * Both branches must be present: dropping the primary check would
+ * silently exclude users whose only membership in the listed group
+ * is via `pw_gid`, and dropping the `gr_mem` walk would silently
+ * exclude users who joined the group via `/etc/group`'s member list.
+ * `peer.gid` plumbed in through the `group` parameter is what makes
+ * the primary case reachable here at all.
  */
 static bool
 matchUser(const std::optional<std::string> & user, const std::optional<std::string> & group, const Strings & users)
