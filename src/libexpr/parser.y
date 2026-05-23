@@ -594,7 +594,13 @@ formal
 
 namespace nix {
 
-Expr * parseExprFromBuf(
+/* Shared driver for the two `parseFromBuf` entry points. The two public
+   functions only differ by whether the lexer is switched into
+   REPL_BINDINGS mode before parsing; the surrounding scanner setup,
+   `LexerState`/`ParserState` construction, `yy_scan_buffer` call,
+   `Parser::parse()` invocation and `Finally` for `yylex_destroy` are
+   shared. */
+static Expr * parseFromBuf(
     char * text,
     size_t length,
     Pos::Origin origin,
@@ -604,7 +610,8 @@ Expr * parseExprFromBuf(
     const EvalSettings & settings,
     PosTable & positions,
     DocCommentMap & docComments,
-    const ref<SourceAccessor> rootFS)
+    const ref<SourceAccessor> rootFS,
+    bool replMode)
 {
     yyscan_t scanner;
     LexerState lexerState {
@@ -627,10 +634,28 @@ Expr * parseExprFromBuf(
     Finally _destroy([&] { yylex_destroy(scanner); });
 
     yy_scan_buffer(text, length, scanner);
+    if (replMode)
+        setReplBindingsMode(scanner);
     Parser parser(scanner, &state);
     parser.parse();
 
     return state.result;
+}
+
+Expr * parseExprFromBuf(
+    char * text,
+    size_t length,
+    Pos::Origin origin,
+    const SourcePath & basePath,
+    Exprs & exprs,
+    SymbolTable & symbols,
+    const EvalSettings & settings,
+    PosTable & positions,
+    DocCommentMap & docComments,
+    const ref<SourceAccessor> rootFS)
+{
+    return parseFromBuf(
+        text, length, origin, basePath, exprs, symbols, settings, positions, docComments, rootFS, /*replMode=*/false);
 }
 
 ExprAttrs * parseReplBindingsFromBuf(
@@ -645,35 +670,12 @@ ExprAttrs * parseReplBindingsFromBuf(
     DocCommentMap & docComments,
     const ref<SourceAccessor> rootFS)
 {
-    yyscan_t scanner;
-    LexerState lexerState {
-        .positionToDocComment = docComments,
-        .positions = positions,
-        .origin = positions.addOrigin(origin, length),
-    };
-    ParserState state {
-        .lexerState = lexerState,
-        .exprs = exprs,
-        .symbols = symbols,
-        .positions = positions,
-        .basePath = basePath,
-        .origin = lexerState.origin,
-        .rootFS = rootFS,
-        .settings = settings,
-    };
-
-    yylex_init_extra(&lexerState, &scanner);
-    Finally _destroy([&] { yylex_destroy(scanner); });
-
-    yy_scan_buffer(text, length, scanner);
-    setReplBindingsMode(scanner);
-    Parser parser(scanner, &state);
-    parser.parse();
-
-    assert(state.result);
-    // state.result is Expr *, but the REPL_BINDINGS grammar rule
+    auto * result = parseFromBuf(
+        text, length, origin, basePath, exprs, symbols, settings, positions, docComments, rootFS, /*replMode=*/true);
+    assert(result);
+    // `result` is Expr *, but the REPL_BINDINGS grammar rule
     // always produces an ExprAttrs via the binds1 production.
-    auto bindings = dynamic_cast<ExprAttrs *>(state.result);
+    auto bindings = dynamic_cast<ExprAttrs *>(result);
     assert(bindings);
     return bindings;
 }
