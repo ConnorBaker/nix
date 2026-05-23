@@ -5,15 +5,13 @@
 
 #include "nix/util/types.hh"
 #include "nix/store/path.hh"
+#include "nix/store/derivation-output-fwd.hh"
 
 namespace nix {
 
 class Store;
 template<typename Input>
 struct DerivationOptions;
-struct DerivationOutput;
-
-typedef std::map<std::string, DerivationOutput> DerivationOutputs;
 
 struct StructuredAttrs
 {

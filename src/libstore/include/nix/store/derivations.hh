@@ -6,6 +6,7 @@
 #include "nix/util/hash.hh"
 #include "nix/store/content-address.hh"
 #include "nix/util/repair-flag.hh"
+#include "nix/store/derivation-output-fwd.hh"
 #include "nix/store/derived-path-map.hh"
 #include "nix/store/parsed-derivations.hh"
 #include "nix/util/sync.hh"
@@ -135,8 +136,6 @@ struct DerivationOutput
     std::optional<StorePath>
     path(const StoreDirConfig & store, std::string_view drvName, OutputNameView outputName) const;
 };
-
-typedef std::map<std::string, DerivationOutput> DerivationOutputs;
 
 /**
  * These are analogues to the previous DerivationOutputs data type,

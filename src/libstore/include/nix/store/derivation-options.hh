@@ -7,6 +7,7 @@
 
 #include "nix/util/types.hh"
 #include "nix/util/json-impls.hh"
+#include "nix/store/derivation-output-fwd.hh"
 #include "nix/store/store-dir-config.hh"
 #include "nix/store/downstream-placeholder.hh"
 #include "nix/store/worker-settings.hh"
@@ -192,8 +193,6 @@ struct DerivationOptions
 
 extern template struct DerivationOptions<StorePath>;
 extern template struct DerivationOptions<SingleDerivedPath>;
-
-struct DerivationOutput;
 
 /**
  * Parse this information from its legacy encoding as part of the
