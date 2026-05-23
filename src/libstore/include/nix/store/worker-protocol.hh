@@ -17,8 +17,7 @@ namespace nix {
    new `WorkerProto::Feature` instead. */
 #define PROTOCOL_VERSION (1 << 8 | 39)
 #define MINIMUM_PROTOCOL_VERSION (1 << 8 | 18)
-#define GET_PROTOCOL_MAJOR(x) ((x) & 0xff00)
-#define GET_PROTOCOL_MINOR(x) ((x) & 0x00ff)
+/* GET_PROTOCOL_MAJOR/MINOR are defined in common-protocol.hh. */
 #define STDERR_NEXT 0x6f6c6d67
 #define STDERR_READ 0x64617461  // data needed from source
 #define STDERR_WRITE 0x64617416 // data for sink
