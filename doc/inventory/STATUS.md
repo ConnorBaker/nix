@@ -107,11 +107,30 @@ The other entry points:
   invalidation, fixed); libexpr 2 minor (#220 commit body factual
   error "six-way" → "five-way", + ANSI-coloring drift acknowledgement
   for primop name now interpolated as `'%s'` instead of being baked
-  into the format string; both fixed via amend). Final tip SHAs:
-  libexpr `04f4a67fd`, libfetchers `5df2ffc93`, libflake
-  `02b9065c4`, libstore `52963ff79`, libutil `3e1bc0186`, nix-cli
-  `6692dfa88`. All six branches Local-only; push policy is
-  explicit-only.
+  into the format string; both fixed via amend). **Bidirectional
+  traceability audit + orphan-commit cleanup** (final): a
+  general-purpose audit walked every commit on every cleanup branch
+  against every catalog Branch line. Findings: zero phantom Branch
+  lines, zero wrong-fix commits; 7 orphan commits across 5 shards
+  (commit bodies missing the `Refs candidate #NN` line) and 4 stale
+  Branch line texts where Pass-B amends shifted the implementation
+  but the catalog text didn't update. **All 7 orphans fixed** via
+  per-shard rebase amends adding the missing references: `437eea9d0`
+  → #217 (libexpr), `74e512d11` → #52 (libfetchers), `513b47628` →
+  #48 (libflake), `35ab0faaf` → #49 + #128 (libmain), `5f5b8151e` →
+  #54 + #56 + #57 + #60 (libstore, four bundled), `52be6d116` → #58
+  + #130 + the documented #148 attempt-and-revert (libutil),
+  `784a4f4b4` → catalog cleanup tied to #148 (libutil),
+  `48524e038` → #127 + #142 (nix-cli). All 4 stale Branch lines
+  re-synced (#100 templated, #74 templated, #135 `UidRange` struct,
+  #51 `RefInfo` unwrap). **`/code-review` skill brought to parity**
+  on libmain (the one shard skipped earlier; commit `35ab0faaf`
+  ships clean per the three-agent fan-out). Final tip SHAs after
+  the orphan-fix rebases: libexpr `9d33402cc`, libfetchers
+  `dc5dc001d`, libflake `fd75c930f`, libmain `f9da47421`, libstore
+  `e7e885bc3`, libutil `18a82b524`, nix-cli `ef3236827`. All seven
+  branches Local-only past their pushed tips; push policy is
+  explicit-only and per-commit.
 - **20 trivial candidates landed across 6 shard branches + Pass A review** (May 2026)
   — libexpr +4 (#67, #79, #105, #214; 3 skipped: #63 Rule 6, #194/#197 Rule 2 install_headers; doxygen `MakeBinOp` follow-up landed after Pass A), libstore +7 (#26, #46, #80, #83, #85, #100, #135; 1 skipped: #84 prescription doesn't shrink either body), libfetchers +1 (#51 expanded; #70 closed as resolved-upstream by `de6b5f60c`), libflake +1 (#78), libutil +2 (#37, #163), nix-cli +5 (#72, #74, #75, #93, #141; 1 skipped: #25 preprocessor cannot embed `#include` in macro args; `removeOldGenerations` `static`-ify follow-up landed after Pass A). Pass A adversarial review found 13 follow-ups across the six shards (no blockers): 4 real concerns on libstore (#80 false round-trip comment, #80 ABI break in shipped `legacy-ssh-store.hh`, #80 Unix `documentDefault` regression, #135 ABI break in shipped `local-settings.hh` for `GCSettings`/`AutoAllocateUidSettings` removal), 1 real concern on libexpr (#79 exception-type change shifts cacheability), and 8 minor items; all amended via `git rebase -i` in their respective shard branches. Build verified green (`ninja`) on every shard after each amend. Pass B (`/code-review` skill, sequential per shard), Pass C (clang-tidy, sequential), Pass D (`nix build -L .`, sequential) still pending.
 - **30 trivial candidates landed across 4 shard branches** (May 2026)
