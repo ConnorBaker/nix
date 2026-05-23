@@ -65,7 +65,7 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
-- **20 trivial candidates landed across 6 shard branches + 4-pass review** (May 2026)
+- **20 trivial candidates landed + 4-pass review + Pass-B-follow-up amends + new candidates #220/#221** (May 2026)
   — landed batch (above) plus full Pass A (adversarial, parallel),
   Pass B (`/code-review` skill, sequential), Pass C (clang-tidy,
   sequential), Pass D (`nix build -L .` flake build + full test
@@ -84,10 +84,34 @@ The other entry points:
   fixed by accepting `const &`; CRTP fixed via `NOLINTNEXTLINE`
   with documented rationale (the lint's recommended fix breaks
   `polymorphic_allocator::construct`). **Pass D** green on all six
-  shards. Final tip SHAs: libexpr `7ca64b62e`, libfetchers
-  `d77c48632`, libflake `02b9065c4`, libstore `9e32c2480`, libutil
-  `3e0d943dd`, nix-cli `db79e0246`. All six branches Local-only;
-  push policy is explicit-only.
+  shards. **Pass-B-follow-up amends** (categorised after the user
+  asked which follow-ups were caused by our changes versus
+  pre-existing): six commits amended in place — libfetchers #51
+  unwrapping single-field RefInfo to `Hash` (caused by #51's trim);
+  libexpr #67 transposing the four parallel constexpr ladders into
+  a single per-`Op` `NumOpDiag` struct (surfaced by #67's collapse);
+  libutil #37/#163 docstring polish (lifetime contract + Windows
+  ignore note + class-doc rewrite); libstore #100 templating
+  `forEachConfiguredSigner` (caused by #100's helper extraction);
+  libstore #135 bundling `startId`/`uidCount` into a `UidRange`
+  struct (caused by #135's flatten); nix-cli #74 templating
+  `runWholeStoreGC`'s printer (caused by #74's helper extraction).
+  Two new catalog candidates filed and landed: **#220** (libexpr,
+  extending the renamed `iterateNamedAttrs` helper to `prim_path`)
+  and **#221** (libstore→libutil, lifting
+  `parseSettingTokens`/`renderSettingTokens` into shipped
+  `configuration.hh` so future `BaseSetting<C<T>>` specialisations
+  can reuse the helper). **Final adversarial review pass** over the
+  six amends + two new commits: libfetchers/libstore/nix-cli clean;
+  libutil 1 minor (docstring overclaimed `std::map::insert`
+  invalidation, fixed); libexpr 2 minor (#220 commit body factual
+  error "six-way" → "five-way", + ANSI-coloring drift acknowledgement
+  for primop name now interpolated as `'%s'` instead of being baked
+  into the format string; both fixed via amend). Final tip SHAs:
+  libexpr `04f4a67fd`, libfetchers `5df2ffc93`, libflake
+  `02b9065c4`, libstore `52963ff79`, libutil `3e1bc0186`, nix-cli
+  `6692dfa88`. All six branches Local-only; push policy is
+  explicit-only.
 - **20 trivial candidates landed across 6 shard branches + Pass A review** (May 2026)
   — libexpr +4 (#67, #79, #105, #214; 3 skipped: #63 Rule 6, #194/#197 Rule 2 install_headers; doxygen `MakeBinOp` follow-up landed after Pass A), libstore +7 (#26, #46, #80, #83, #85, #100, #135; 1 skipped: #84 prescription doesn't shrink either body), libfetchers +1 (#51 expanded; #70 closed as resolved-upstream by `de6b5f60c`), libflake +1 (#78), libutil +2 (#37, #163), nix-cli +5 (#72, #74, #75, #93, #141; 1 skipped: #25 preprocessor cannot embed `#include` in macro args; `removeOldGenerations` `static`-ify follow-up landed after Pass A). Pass A adversarial review found 13 follow-ups across the six shards (no blockers): 4 real concerns on libstore (#80 false round-trip comment, #80 ABI break in shipped `legacy-ssh-store.hh`, #80 Unix `documentDefault` regression, #135 ABI break in shipped `local-settings.hh` for `GCSettings`/`AutoAllocateUidSettings` removal), 1 real concern on libexpr (#79 exception-type change shifts cacheability), and 8 minor items; all amended via `git rebase -i` in their respective shard branches. Build verified green (`ninja`) on every shard after each amend. Pass B (`/code-review` skill, sequential per shard), Pass C (clang-tidy, sequential), Pass D (`nix build -L .`, sequential) still pending.
 - **30 trivial candidates landed across 4 shard branches** (May 2026)
