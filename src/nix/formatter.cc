@@ -1,5 +1,6 @@
 #include "nix/cmd/command.hh"
 #include "command-register.hh"
+#include "release-eval-caches.hh"
 #include "nix/cmd/installable-flake.hh"
 #include "nix/cmd/installable-value.hh"
 #include "nix/expr/eval.hh"
@@ -95,9 +96,7 @@ struct CmdFormatterRun : MixFormatter, MixJSON
         StringMap env = getEnv();
         env["PRJ_ROOT"] = flakeDir.string();
 
-        // Release our references to eval caches to ensure they are persisted to disk, because
-        // we are about to exec out of this process without running C++ destructors.
-        evalState->evalCaches.clear();
+        releaseEvalCachesBeforeExec(*evalState);
 
         execProgramInStore(
             store,

@@ -2,6 +2,7 @@
 #include "run.hh"
 #include "nix/cmd/command-installable-value.hh"
 #include "command-register.hh"
+#include "release-eval-caches.hh"
 #include "nix/main/shared.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/store-api.hh"
@@ -158,9 +159,7 @@ struct CmdRun : InstallableValueCommand, MixEnvironment
         for (auto & i : args)
             allArgs.push_back(i);
 
-        // Release our references to eval caches to ensure they are persisted to disk, because
-        // we are about to exec out of this process without running C++ destructors.
-        state->evalCaches.clear();
+        releaseEvalCachesBeforeExec(*state);
 
         setEnviron();
 

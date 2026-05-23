@@ -4,6 +4,7 @@
 
 #include "nix/cmd/command.hh"
 #include "command-register.hh"
+#include "release-eval-caches.hh"
 #include "nix/expr/eval.hh"
 #include "run.hh"
 #include "nix/util/strings.hh"
@@ -113,9 +114,7 @@ struct CmdShell : InstallablesCommand, MixEnvironment
         for (auto & arg : command)
             args.push_back(arg);
 
-        // Release our references to eval caches to ensure they are persisted to disk, because
-        // we are about to exec out of this process without running C++ destructors.
-        state->evalCaches.clear();
+        releaseEvalCachesBeforeExec(*state);
 
         execProgramInStore(store, UseLookupPath::Use, *command.begin(), args);
     }

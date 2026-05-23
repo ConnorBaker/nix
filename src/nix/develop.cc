@@ -1,5 +1,6 @@
 #include "nix/cmd/command.hh"
 #include "command-register.hh"
+#include "release-eval-caches.hh"
 #include "nix/util/config-global.hh"
 #include "nix/expr/eval.hh"
 #include "nix/cmd/installable-flake.hh"
@@ -708,9 +709,7 @@ struct CmdDevelop : Common, MixEnvironment
             }
         }
 
-        // Release our references to eval caches to ensure they are persisted to disk, because
-        // we are about to exec out of this process without running C++ destructors.
-        getEvalState()->evalCaches.clear();
+        releaseEvalCachesBeforeExec(*getEvalState());
 
         execProgramInStore(store, UseLookupPath::Use, shell, args, buildEnvironment.getSystem());
 #endif
