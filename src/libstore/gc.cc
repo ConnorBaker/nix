@@ -327,6 +327,25 @@ static Roots requestRuntimeRoots(const LocalStoreConfig & config, const std::fil
     return roots;
 }
 
+/* Filter `unchecked` runtime roots through `LocalStore::isValidPath`
+   and merge the survivors into `roots`. Each `unchecked` entry is
+   already keyed on `StorePath` (parsed once at source by either
+   `findRuntimeRootsUnchecked` or `requestRuntimeRoots`), so this
+   helper only validates and projects link metadata according to
+   `censor`. */
+static void validateRuntimeRoots(LocalStore & store, Roots unchecked, bool censor, Roots & roots)
+{
+    for (auto & [path, links] : unchecked) {
+        if (!store.isValidPath(path))
+            continue;
+        debug("got additional root '%1%'", store.printStorePath(path));
+        if (censor)
+            roots[path].insert(censored);
+        else
+            roots[path].insert(links.begin(), links.end());
+    }
+}
+
 void LocalStore::findRuntimeRoots(Roots & roots, bool censor)
 {
     Roots unchecked;
@@ -338,15 +357,7 @@ void LocalStore::findRuntimeRoots(Roots & roots, bool censor)
         unchecked = findRuntimeRootsUnchecked(*config);
     }
 
-    for (auto & [path, links] : unchecked) {
-        if (!isValidPath(path))
-            continue;
-        debug("got additional root '%1%'", printStorePath(path));
-        if (censor)
-            roots[path].insert(censored);
-        else
-            roots[path].insert(links.begin(), links.end());
-    }
+    validateRuntimeRoots(*this, std::move(unchecked), censor, roots);
 }
 
 struct GCLimitReached
