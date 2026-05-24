@@ -57,9 +57,9 @@ struct ChrootDerivationBuilder : virtual DerivationBuilderImpl
     void prepareSandbox() override
     {
         // Set up chroot parameters
-        BuildChrootParams params{
-            .chrootParentDir = store.toRealPath(drvPath) + ".chroot",
-            .useUidRange = drvOptions.useUidRange(drv),
+        BuildChrootParams chrootParams{
+            .chrootParentDir = store.toRealPath(params.drvPath) + ".chroot",
+            .useUidRange = params.drvOptions.useUidRange(params.drv),
             .isSandboxed = derivationType.isSandboxed(),
             .buildUser = buildUser.get(),
             .storeDir = store.storeDir,
@@ -67,14 +67,14 @@ struct ChrootDerivationBuilder : virtual DerivationBuilderImpl
         };
 
         // Create the chroot
-        auto [rootDir, cleanup] = setupBuildChroot(params);
+        auto [rootDir, cleanup] = setupBuildChroot(chrootParams);
         chrootRootDir = std::move(rootDir);
         autoDelChroot.emplace(std::move(cleanup));
 
         // Start with the default sandbox paths
         pathsInChroot = getPathsInSandbox();
 
-        for (auto & i : inputPaths) {
+        for (auto & i : params.inputPaths) {
             auto p = store.printStorePath(i);
             pathsInChroot.insert_or_assign(p, ChrootPath{.source = store.toRealPath(i)});
         }
@@ -84,7 +84,7 @@ struct ChrootDerivationBuilder : virtual DerivationBuilderImpl
            rebuilding a path that is in settings.sandbox-paths
            (typically the dependencies of /bin/sh).  Throw them
            out. */
-        for (auto & i : drv.outputsAndOptPaths(store)) {
+        for (auto & i : params.drv.outputsAndOptPaths(store)) {
             /* If the name isn't known a priori (i.e. floating
                content-addressing derivation), the temporary location we use
                should be fresh.  Freshness means it is impossible that the path
@@ -98,7 +98,7 @@ struct ChrootDerivationBuilder : virtual DerivationBuilderImpl
     Strings getPreBuildHookArgs() override
     {
         assert(!chrootRootDir.empty());
-        return Strings({store.printStorePath(drvPath), chrootRootDir.native()});
+        return Strings({store.printStorePath(params.drvPath), chrootRootDir.native()});
     }
 
     std::filesystem::path realPathInHost(const std::filesystem::path & p) override
@@ -114,11 +114,11 @@ struct ChrootDerivationBuilder : virtual DerivationBuilderImpl
 
         /* Move paths out of the chroot for easier debugging of
            build failures. */
-        if (!force && buildMode == bmNormal)
-            for (auto & [_, status] : initialOutputs) {
+        if (!force && params.buildMode == bmNormal)
+            for (auto & [_, status] : params.initialOutputs) {
                 if (!status.known)
                     continue;
-                if (buildMode != bmCheck && status.known->isValid())
+                if (params.buildMode != bmCheck && status.known->isValid())
                     continue;
                 std::filesystem::path p = store.toRealPath(status.known->path);
                 std::filesystem::path chrootPath = chrootRootDir / p.relative_path();

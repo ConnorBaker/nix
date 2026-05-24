@@ -30,16 +30,16 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
 
     void startChild() override
     {
-        if (drvOptions.getRequiredSystemFeatures(drv).count("recursive-nix"))
+        if (params.drvOptions.getRequiredSystemFeatures(params.drv).count("recursive-nix"))
             throw Error("'recursive-nix' is not supported yet by external derivation builders");
 
         auto json = nlohmann::json::object();
 
         json.emplace("version", 1);
-        json.emplace("builder", drv.builder);
+        json.emplace("builder", params.drv.builder);
         {
             auto l = nlohmann::json::array();
-            for (auto & i : drv.args)
+            for (auto & i : params.drv.args)
                 l.push_back(rewriteStrings(i, inputRewrites));
             json.emplace("args", std::move(l));
         }
@@ -54,10 +54,10 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
         json.emplace("tmpDirInSandbox", tmpDirInSandbox().native());
         json.emplace("storeDir", store.storeDir);
         json.emplace("realStoreDir", store.config->realStoreDir.get());
-        json.emplace("system", drv.platform);
+        json.emplace("system", params.drv.platform);
         {
             auto l = nlohmann::json::array();
-            for (auto & i : inputPaths)
+            for (auto & i : params.inputPaths)
                 l.push_back(store.printStorePath(i));
             json.emplace("inputPaths", std::move(l));
         }

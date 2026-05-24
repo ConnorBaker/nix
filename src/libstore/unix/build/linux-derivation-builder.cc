@@ -272,7 +272,7 @@ struct LinuxDerivationBuilder : virtual DerivationBuilderImpl
 #  endif
 
         linux::setPersonality({
-            .system = drv.platform,
+            .system = params.drv.platform,
             .impersonateLinux26 = localSettings.impersonateLinux26,
         });
     }
@@ -327,7 +327,7 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
     std::unique_ptr<UserLock> getBuildUser() override
     {
         return acquireUserLock(
-            settings.nixStateDir, store.config->getLocalSettings(), drvOptions.useUidRange(drv) ? 65536 : 1, true);
+            settings.nixStateDir, store.config->getLocalSettings(), params.drvOptions.useUidRange(params.drv) ? 65536 : 1, true);
     }
 
     void prepareUser() override
@@ -638,7 +638,7 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
             createDirs(chrootRootDir / "dev" / "shm");
             createDirs(chrootRootDir / "dev" / "pts");
             ss.push_back("/dev/full");
-            if (systemFeatures.count("kvm")) {
+            if (params.systemFeatures.count("kvm")) {
                 if (pathExists("/dev/kvm")) {
                     ss.push_back("/dev/kvm");
                 } else {
@@ -758,7 +758,7 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
         }
 
         /* Make /etc unwritable */
-        if (!drvOptions.useUidRange(drv))
+        if (!params.drvOptions.useUidRange(params.drv))
             chmod(chrootRootDir / "etc", 0555);
 
         /* Unshare this mount namespace. This is necessary because
@@ -828,8 +828,8 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
         if (cgroup) {
             auto stats = linux::destroyCgroup(*cgroup);
             if (getStats) {
-                buildResult.cpuUser = stats.cpuUser;
-                buildResult.cpuSystem = stats.cpuSystem;
+                params.buildResult.cpuUser = stats.cpuUser;
+                params.buildResult.cpuSystem = stats.cpuSystem;
             }
             return;
         }

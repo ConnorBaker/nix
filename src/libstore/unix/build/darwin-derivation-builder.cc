@@ -89,7 +89,7 @@ struct DarwinDerivationBuilder : DerivationBuilderImpl
             }
 
             /* Add all our input paths to the chroot */
-            for (auto & i : inputPaths) {
+            for (auto & i : params.inputPaths) {
                 auto p = store.printStorePath(i);
                 pathsInChroot.insert_or_assign(p, ChrootPath{.source = p});
             }
@@ -162,7 +162,7 @@ struct DarwinDerivationBuilder : DerivationBuilderImpl
             }
             sandboxProfile += ")\n";
 
-            sandboxProfile += drvOptions.additionalSandboxProfile;
+            sandboxProfile += params.drvOptions.additionalSandboxProfile;
         } else
             sandboxProfile +=
 #  include "sandbox-minimal.sb"
@@ -187,7 +187,7 @@ struct DarwinDerivationBuilder : DerivationBuilderImpl
             sandboxArgs.push_back(tmpDir.native());
             sandboxArgs.push_back("_GLOBAL_TMP_DIR");
             sandboxArgs.push_back(globalTmpDirStr);
-            if (drvOptions.allowLocalNetworking) {
+            if (params.drvOptions.allowLocalNetworking) {
                 sandboxArgs.push_back("_ALLOW_LOCAL_NETWORKING");
                 sandboxArgs.push_back("1");
             }
@@ -212,20 +212,20 @@ struct DarwinDerivationBuilder : DerivationBuilderImpl
         if (posix_spawnattr_setflags(&attrp, POSIX_SPAWN_SETEXEC))
             throw SysError("failed to initialize builder");
 
-        if (drv.platform == "aarch64-darwin") {
+        if (params.drv.platform == "aarch64-darwin") {
             // Unset kern.curproc_arch_affinity so we can escape Rosetta
             int affinity = 0;
             sysctlbyname("kern.curproc_arch_affinity", NULL, NULL, &affinity, sizeof(affinity));
 
             cpu_type_t cpu = CPU_TYPE_ARM64;
             posix_spawnattr_setbinpref_np(&attrp, 1, &cpu, NULL);
-        } else if (drv.platform == "x86_64-darwin") {
+        } else if (params.drv.platform == "x86_64-darwin") {
             cpu_type_t cpu = CPU_TYPE_X86_64;
             posix_spawnattr_setbinpref_np(&attrp, 1, &cpu, NULL);
         }
 
         posix_spawn(
-            NULL, drv.builder.c_str(), NULL, &attrp, stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
+            NULL, params.drv.builder.c_str(), NULL, &attrp, stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
     }
 
     /**
