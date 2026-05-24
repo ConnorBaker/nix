@@ -1,14 +1,53 @@
 #pragma once
 ///@file
 
+#include "nix/util/error.hh"
 #include "nix/util/serialise.hh"
 
+#include <algorithm>
+#include <string_view>
 #include <variant>
 
 namespace nix {
 
 struct StoreDirConfig;
 struct Source;
+
+/**
+ * Bounds-check `remoteVersion` against `localMin` and return
+ * `min(remoteVersion, localLatest)`.
+ *
+ * Both `WorkerProto::BasicClientConnection::handshake` and
+ * `ServeProto::BasicClientConnection::handshake` perform exactly this
+ * lower-bound + take-min step. The version type is templated because
+ * `WorkerProto` uses `Version::Number` (major/minor only, total order)
+ * here while `ServeProto` uses its full `Version` (also major/minor
+ * only).
+ *
+ * @param localMin the minimum `Version` this side supports.
+ * @param localLatest the latest `Version` this side supports; used as
+ * the upper bound returned.
+ * @param remoteVersion the version reported by the remote peer.
+ * @param tooOldMsg the error message if `remoteVersion < localMin`.
+ * The protocols use different protocol-flavored phrasing so this is
+ * passed in by the caller. Format-string substitution is the caller's
+ * responsibility.
+ *
+ * Pre-checks unique to one protocol (e.g. WorkerProto's "major must
+ * equal latest.major" check) stay at the caller, since their error
+ * messages and conditions differ.
+ */
+template<class VersionT>
+inline VersionT negotiateVersion(
+    const VersionT & localMin,
+    const VersionT & localLatest,
+    const VersionT & remoteVersion,
+    std::string_view tooOldMsg)
+{
+    if (remoteVersion < localMin)
+        throw Error("%s", tooOldMsg);
+    return std::min(remoteVersion, localLatest);
+}
 
 // items being serialized
 class StorePath;

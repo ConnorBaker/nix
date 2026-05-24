@@ -15,9 +15,10 @@ ServeProto::Version ServeProto::BasicClientConnection::handshake(
     if (magic != SERVE_MAGIC_2)
         throw Error("'nix-store --serve' protocol mismatch from '%s'", host);
     auto remoteVersion = ServeProto::Version::fromWire(readInt(from));
-    if (remoteVersion.major != 2 || remoteVersion < ServeProto::Version{2, 5})
+    if (remoteVersion.major != 2)
         throw Error("unsupported 'nix-store --serve' protocol version on '%s'", host);
-    return std::min(remoteVersion, localVersion);
+    return negotiateVersion(
+        ServeProto::Version{2, 5}, localVersion, remoteVersion, fmt("unsupported 'nix-store --serve' protocol version on '%s'", host));
 }
 
 ServeProto::Version

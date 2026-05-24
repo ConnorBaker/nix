@@ -167,10 +167,12 @@ WorkerProto::Version WorkerProto::BasicClientConnection::handshake(
 
     if (daemonVersion.major != WorkerProto::latest.number.major)
         throw Error("Nix daemon protocol version not supported");
-    if (daemonVersion < WorkerProto::Version::Number{1, 10})
-        throw Error("the Nix daemon version is too old");
 
-    auto protoVersionNumber = std::min(daemonVersion, localVersion.number);
+    auto protoVersionNumber = negotiateVersion(
+        WorkerProto::Version::Number{1, 10},
+        localVersion.number,
+        daemonVersion,
+        "the Nix daemon version is too old");
 
     /* Exchange features. */
     WorkerProto::Version::FeatureSet daemonFeatures;
