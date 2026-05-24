@@ -2,6 +2,7 @@
 #include <archive_entry.h>
 
 #include "nix/util/finally.hh"
+#include "nix/util/io-buffer-sizes.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/tarfile.hh"
 #include "nix/util/file-system.hh"
@@ -44,7 +45,6 @@ void checkLibArchive(archive * archive, int err, const std::string & reason)
         throw Error(reason, archive_error_string(archive));
 }
 
-constexpr auto defaultBufferSize = std::size_t{65536};
 } // namespace
 
 void TarArchive::check(int err, const std::string & reason)
@@ -82,7 +82,7 @@ static void enableSupportedFormats(struct archive * archive)
 TarArchive::TarArchive(Source & source, bool raw, std::optional<std::string> compression_method)
     : archive{archive_read_new()}
     , source{&source}
-    , buffer(defaultBufferSize)
+    , buffer(kDefaultIOBlockSize)
 {
     if (!compression_method) {
         archive_read_support_filter_all(archive);
@@ -105,7 +105,7 @@ TarArchive::TarArchive(Source & source, bool raw, std::optional<std::string> com
 
 TarArchive::TarArchive(const std::filesystem::path & path)
     : archive{archive_read_new()}
-    , buffer(defaultBufferSize)
+    , buffer(kDefaultIOBlockSize)
 {
     archive_read_support_filter_all(archive);
     enableSupportedFormats(archive);

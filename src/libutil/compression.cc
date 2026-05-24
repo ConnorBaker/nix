@@ -1,4 +1,5 @@
 #include "nix/util/compression.hh"
+#include "nix/util/io-buffer-sizes.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/tarfile.hh"
 #include "nix/util/logging.hh"
@@ -22,7 +23,7 @@ static const int COMPRESSION_LEVEL_DEFAULT = -1;
 // Don't feed brotli too much at once.
 struct ChunkedCompressionSink : CompressionSink
 {
-    uint8_t outbuf[32 * 1024];
+    uint8_t outbuf[kBufferedStreamSize];
 
     void writeUnbuffered(std::string_view data) override
     {

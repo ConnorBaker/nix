@@ -1,5 +1,6 @@
 #include "nix/util/serialise.hh"
 #include "nix/util/file-descriptor.hh"
+#include "nix/util/io-buffer-sizes.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/socket.hh"
 #include "nix/util/util.hh"
@@ -107,7 +108,7 @@ void Source::drainInto(Sink & sink)
 
 void Source::drainInto(Sink & sink, uint64_t len)
 {
-    std::array<char, 65536> buf;
+    std::array<char, kDefaultIOBlockSize> buf;
     while (len) {
         checkInterrupt();
         // Until std::saturate_cast is available (C++26)

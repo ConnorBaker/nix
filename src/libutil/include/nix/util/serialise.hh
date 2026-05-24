@@ -5,6 +5,7 @@
 #include <type_traits>
 
 #include "nix/util/fun.hh"
+#include "nix/util/io-buffer-sizes.hh"
 #include "nix/util/types.hh"
 #include "nix/util/util.hh"
 #include "nix/util/file-descriptor.hh"
@@ -52,7 +53,7 @@ struct BufferedSink : virtual Sink
     size_t bufSize, bufPos;
     std::unique_ptr<char[]> buffer;
 
-    BufferedSink(size_t bufSize = 32 * 1024)
+    BufferedSink(size_t bufSize = kBufferedStreamSize)
         : bufSize(bufSize)
         , bufPos(0)
         , buffer(nullptr)
@@ -123,7 +124,7 @@ struct BufferedSource : virtual Source
     size_t bufSize, bufPosIn, bufPosOut;
     std::unique_ptr<char[]> buffer;
 
-    BufferedSource(size_t bufSize = 32 * 1024)
+    BufferedSource(size_t bufSize = kBufferedStreamSize)
         : bufSize(bufSize)
         , bufPosIn(0)
         , bufPosOut(0)

@@ -3,6 +3,7 @@
 #include "nix/util/file-path-impl.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/finally.hh"
+#include "nix/util/io-buffer-sizes.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/util.hh"
 
@@ -300,7 +301,7 @@ void writeFile(const std::filesystem::path & path, Source & source, mode_t mode,
     if (!fd)
         throw NativeSysError("opening file %s", PathFmt(path));
 
-    std::array<char, 64 * 1024> buf;
+    std::array<char, kDefaultIOBlockSize> buf;
 
     try {
         while (true) {

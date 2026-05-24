@@ -55,6 +55,7 @@ headers = [ config_pub_h ] + files(
   'git.hh',
   'hash.hh',
   'hilite.hh',
+  'io-buffer-sizes.hh',
   'json-impls.hh',
   'json-non-null.hh',
   'json-utils.hh',
