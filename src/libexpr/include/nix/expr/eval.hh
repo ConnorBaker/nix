@@ -1134,8 +1134,28 @@ private:
     typedef boost::unordered_flat_map<ExprLambda *, size_t> FunctionCalls;
     FunctionCalls functionCalls;
 
-    /** Evaluation/call profiler. */
-    MultiEvalProfiler profiler;
+    /**
+     * Function-call tracer profiler hook (`trace-function-calls` setting).
+     * Set during `EvalState` construction iff `settings.traceFunctionCalls`.
+     */
+    std::optional<ref<EvalProfiler>> functionCallTrace;
+
+    /**
+     * Stack-sampling profiler hook (`eval-profiler = flamegraph` setting).
+     * Set during `EvalState` construction iff `settings.evalProfilerMode ==
+     * EvalProfilerMode::flamegraph`.
+     */
+    std::optional<ref<EvalProfiler>> sampleStackProfiler;
+
+    /**
+     * The hooks each profiler wants invoked, captured at `EvalState`
+     * construction time. Pre-computing the per-profiler bitsets and their
+     * union lets `callFunction`'s hot path test a single `Hooks` value (and
+     * skip the virtual `getNeededHooks` dispatches) per call.
+     */
+    EvalProfiler::Hooks functionCallTraceHooks;
+    EvalProfiler::Hooks sampleStackProfilerHooks;
+    EvalProfiler::Hooks profilerHooks;
 
     void incrFunctionCall(ExprLambda * fun);
 

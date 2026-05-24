@@ -11,38 +11,6 @@ void EvalProfiler::postFunctionCallHook(EvalState & state, const Value & v, std:
 {
 }
 
-void MultiEvalProfiler::preFunctionCallHook(
-    EvalState & state, const Value & v, std::span<Value *> args, const PosIdx pos)
-{
-    for (auto & profiler : profilers) {
-        if (profiler->getNeededHooks().test(Hook::preFunctionCall))
-            profiler->preFunctionCallHook(state, v, args, pos);
-    }
-}
-
-void MultiEvalProfiler::postFunctionCallHook(
-    EvalState & state, const Value & v, std::span<Value *> args, const PosIdx pos)
-{
-    for (auto & profiler : profilers) {
-        if (profiler->getNeededHooks().test(Hook::postFunctionCall))
-            profiler->postFunctionCallHook(state, v, args, pos);
-    }
-}
-
-EvalProfiler::Hooks MultiEvalProfiler::getNeededHooksImpl() const
-{
-    Hooks hooks;
-    for (auto & p : profilers)
-        hooks |= p->getNeededHooks();
-    return hooks;
-}
-
-void MultiEvalProfiler::addProfiler(ref<EvalProfiler> profiler)
-{
-    profilers.push_back(profiler);
-    invalidateNeededHooks();
-}
-
 namespace {
 
 class PosCache : private LRUCache<PosIdx, Pos>

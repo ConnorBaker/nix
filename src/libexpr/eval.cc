@@ -370,16 +370,22 @@ EvalState::EvalState(
 
     /* Register function call tracer. */
     if (settings.traceFunctionCalls)
-        profiler.addProfiler(make_ref<FunctionCallTrace>());
+        functionCallTrace = ref<EvalProfiler>(make_ref<FunctionCallTrace>());
 
     switch (settings.evalProfilerMode) {
     case EvalProfilerMode::flamegraph:
-        profiler.addProfiler(
-            makeSampleStackProfiler(*this, settings.evalProfileFile.get(), settings.evalProfilerFrequency));
+        sampleStackProfiler =
+            makeSampleStackProfiler(*this, settings.evalProfileFile.get(), settings.evalProfilerFrequency);
         break;
     case EvalProfilerMode::disabled:
         break;
     }
+
+    if (functionCallTrace)
+        functionCallTraceHooks = (*functionCallTrace)->getNeededHooks();
+    if (sampleStackProfiler)
+        sampleStackProfilerHooks = (*sampleStackProfiler)->getNeededHooks();
+    profilerHooks = functionCallTraceHooks | sampleStackProfilerHooks;
 }
 
 EvalState::~EvalState() {}
@@ -1533,13 +1539,20 @@ void EvalState::callFunction(Value & fun, std::span<Value *> args, Value & vRes,
 {
     auto _level = addCallDepth(pos);
 
-    auto neededHooks = profiler.getNeededHooks();
-    if (neededHooks.test(EvalProfiler::preFunctionCall)) [[unlikely]]
-        profiler.preFunctionCallHook(*this, fun, args, pos);
+    if (profilerHooks.test(EvalProfiler::preFunctionCall)) [[unlikely]] {
+        if (functionCallTraceHooks.test(EvalProfiler::preFunctionCall))
+            (*functionCallTrace)->preFunctionCallHook(*this, fun, args, pos);
+        if (sampleStackProfilerHooks.test(EvalProfiler::preFunctionCall))
+            (*sampleStackProfiler)->preFunctionCallHook(*this, fun, args, pos);
+    }
 
     Finally traceExit_{[&]() {
-        if (profiler.getNeededHooks().test(EvalProfiler::postFunctionCall)) [[unlikely]]
-            profiler.postFunctionCallHook(*this, fun, args, pos);
+        if (profilerHooks.test(EvalProfiler::postFunctionCall)) [[unlikely]] {
+            if (functionCallTraceHooks.test(EvalProfiler::postFunctionCall))
+                (*functionCallTrace)->postFunctionCallHook(*this, fun, args, pos);
+            if (sampleStackProfilerHooks.test(EvalProfiler::postFunctionCall))
+                (*sampleStackProfiler)->postFunctionCallHook(*this, fun, args, pos);
+        }
     }};
 
     forceValue(fun, pos);
