@@ -24,12 +24,16 @@ The other entry points:
 
 ## Currently in flight
 
-- **Holistic-review follow-up batches** — five batches of work
-  raised by the May 2026 whole-branch reviewer pass; full
+- **Holistic-review follow-up batches** — seven batches of work
+  raised by the May 2026 whole-branch reviewer passes; full
   checklist in [`FOLLOWUPS.md`](FOLLOWUPS.md). Sequence: A
   (correctness amends) → B (doc-branch corrections) → C
   (in-source docs + rl-next) → D (file new catalog
-  candidates #227-#233) → E (implementation).
+  candidates #227-#233) → E (implementation) → F (clang-tidy +
+  boost-flat audit) → G (adversarial value-review gaps; revert
+  libutil #163, add libstore #80 + libmain `getIntArg` rl-next
+  entries, capture #97 latent-bug fixes). All seven batches
+  closed.
 
 ## Queued / blocked
 
@@ -76,6 +80,33 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
+- **Adversarial whole-branch value review + Batch G gap-closure** (May 2026)
+  — ran a parallel adversarial value-review (one reviewer per shard,
+  seven total) asking whether each commit meaningfully helps or is
+  effectively churn, whether semantics are preserved, and whether
+  follow-on simplifications are unlocked. Aggregate verdict across
+  the seven shards was **substantive value, not churn**, with one
+  actual churn case (libutil #163's speculative `Pipe::create(PipeOptions)`
+  overload — zero in-tree consumers; the legacy `nonBlocking` flag
+  was already dead) plus three disclosure gaps. **Batch G** closed
+  all four: (1) reverted libutil #163's overload commit
+  (`e3f228714` dropped via non-interactive rebase; new libutil tip
+  `7399593ce`); (2) added libstore rl-next entry
+  `legacy-ssh-store-windows-logfd.md` documenting the user-visible
+  Windows `log-fd=N` behaviour change from #80 (committed as
+  `a3ed63c01`); (3) added libmain rl-next entry
+  `getIntArg-allowunit-removed.md` documenting the public-header
+  4-arg signature break for out-of-tree consumers (Hydra, Lix,
+  plugins; committed as `b1a14158f`); (4) updated #97's Branch line
+  on the doc branch to capture two latent-bug fixes folded in via
+  the `parseEnum` migration (`parseHashFormat` was missing
+  `'nix32'` from its accepted-values error tail; `parseFileSerialisationMethod`
+  had a `"serialiation"` typo). clang-tidy + `nix build -L .`
+  green on libutil/libstore/libmain post-Batch-G. Final tip SHAs
+  after Batch G: libexpr `76b6808f0` (unchanged), libfetchers
+  `d1a856c3f` (unchanged), libflake `fd6749635` (unchanged),
+  libmain `b1a14158f`, libstore `a3ed63c01`, libutil `7399593ce`,
+  nix-cli `2a34c3148` (unchanged).
 - **20 GREEN+YELLOW candidates (18 commits) landed + 4-pass review + Pass-A/B/C amends + new candidates #225/#226** (May 2026, this batch)
   — bucket sweep over the catalog: triaged 28 small-effort candidates
   into GREEN (15)/YELLOW (5)/RED (8). Landed all GREEN+YELLOW: libstore
@@ -287,9 +318,9 @@ line in its body.
 | `vibe-coding/cleanup/libexpr` | libexpr | #217, #64, #66, #68, #106, #107, #109, #110 (extended to forceValueDeep), #112, #196, #199, #67, #79 (3 of 4 sites; `prim_fetchTree` excluded as misclassified — its loop dispatches on value type, not name), #105 (with doxygen `EXPAND_AS_DEFINED` follow-up), #214, #220, #192, #202+#203 (folded — drop failure-cache machinery, bump v6→v7, wrap `getAttr` in `doSQLite`, rl-next entry), #204 (drop `MultiEvalProfiler`; ctor-frozen `profilerHooks` cache); plus Batch-C doc fixes (lexer.l ID retarget, primop diagnostic rl-next); plus Batch-E compound-win cleanups #227 (drop dead `EvalProfiler` NVI cache + default no-op virtuals; rl-next entry), #228 (extend `NumOp` to `BitAnd`/`BitOr`/`BitXor`), #229 (parameterise `SeenSet` template + migrate underlying container to `boost::unordered_flat_set`) | Local-only past `76b6808f0` |
 | `vibe-coding/cleanup/libfetchers` | libfetchers | #52, #51 (delete-and-trim, scope expanded past the two `#if 0` blocks), #53 (latent-bug fix in `getCustomRegistry`); plus Batch-C rl-next extension noting treeHash rejection | Local-only past `d1a856c3f` |
 | `vibe-coding/cleanup/libflake` | libflake | #48, #78 (helper covers two of three DFS sites; `doFind` excluded as structurally different), #133 (rename only; deviation from prescribed end state documented) | Local-only past `fd6749635` |
-| `vibe-coding/cleanup/libmain` | libmain | #49, #128, #222 (`--max-freed` clamp), #223 (`getIntArg` wrapper around `getArg`); plus Batch-C max-freed-clamp rl-next entry | Local-only past `0b66d94ce` (was Pushed; Batch-C added rl-next on top) |
-| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4 (extended to template form), #5 (extended to template form), #6 (hoist-then-delete), #14, #47, #82, #114, #115, #119, #157, #159, #165, #26 (Linux only — Windows untested under current CI), #46 (buildenv + unpack-channel; `fetchurl` excluded — different lookup shape), #80 (Windows behaviour change: `log-fd` now respected), #83, #85, #100 (helper-only scope), #135 (option (a) flatten), #1+#3 (BuildResult/DrvOutput/Realisation templates with cpu-timing-as-callback), #7 (`negotiateVersion` client-side helper), #11 (`tryUpperFallLower` returning `std::pair<R, bool>`), #55 (stale migration drop), #59 (`useBuildUsers` static drop), #101 (`partitionRealisedPaths` + `registerCopiedRealisations`), #153 (`DerivationBuilderImpl` composition), #185 (`ServeProto::BasicConnection` + `protoVersion` rename); plus Batch-C doc fixes (worker-protocol-connection wrong-shard wording, negotiateVersion docstring) | Local-only past `3123c3c9f` |
-| `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117, #37 (helper covers one of three NAR walks; other two structurally distinct), #163 (additive `PipeOptions` overload; asymmetric originals retained for source-compat), #221, #97 (new `parse-enum.hh`; migrated 5 parsers including file-content-address pair from Pass-B sweep), #124 (drop `SyncBase`; `Sync<T>::ConstLock` + `mutable mutex`), #167 (`io-buffer-sizes.hh` + 6 site migrations), #224 (`CanonPath::numSegments` + 4 migrations) | Local-only past `2c9005abe` |
+| `vibe-coding/cleanup/libmain` | libmain | #49, #128, #222 (`--max-freed` clamp), #223 (`getIntArg` wrapper around `getArg`); plus Batch-C max-freed-clamp rl-next entry; plus Batch-G `getIntArg` 4-arg-signature-break rl-next entry | Local-only past `b1a14158f` |
+| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4 (extended to template form), #5 (extended to template form), #6 (hoist-then-delete), #14, #47, #82, #114, #115, #119, #157, #159, #165, #26 (Linux only — Windows untested under current CI), #46 (buildenv + unpack-channel; `fetchurl` excluded — different lookup shape), #80 (Windows behaviour change: `log-fd` now respected), #83, #85, #100 (helper-only scope), #135 (option (a) flatten), #1+#3 (BuildResult/DrvOutput/Realisation templates with cpu-timing-as-callback), #7 (`negotiateVersion` client-side helper), #11 (`tryUpperFallLower` returning `std::pair<R, bool>`), #55 (stale migration drop), #59 (`useBuildUsers` static drop), #101 (`partitionRealisedPaths` + `registerCopiedRealisations`), #153 (`DerivationBuilderImpl` composition), #185 (`ServeProto::BasicConnection` + `protoVersion` rename); plus Batch-C doc fixes (worker-protocol-connection wrong-shard wording, negotiateVersion docstring); plus Batch-G #80 Windows-`log-fd` rl-next entry | Local-only past `a3ed63c01` |
+| `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117, #37 (helper covers one of three NAR walks; other two structurally distinct), #221, #97 (new `parse-enum.hh`; migrated 5 parsers including file-content-address pair from Pass-B sweep; folded in two latent-bug fixes — `parseHashFormat` `nix32` omission and `parseFileSerialisationMethod` typo), #124 (drop `SyncBase`; `Sync<T>::ConstLock` + `mutable mutex`), #167 (`io-buffer-sizes.hh` + 6 site migrations), #224 (`CanonPath::numSegments` + 4 migrations); Batch-G dropped #163 `PipeOptions` overload (zero in-tree consumers) | Local-only past `7399593ce` |
 | `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142, #24, #77, #89, #91, #187, #74, #75, #72 (free helpers, not mixin — diamond inheritance), #93 (3 of 4 parents; `CmdHash` deferred), #141 (per-command `static`-ify subset only — extended to `removeOldGenerations` after Pass A) | Local-only past `2a34c3148` |
 
 The branches whose Status reads "Pushed" are on `origin`

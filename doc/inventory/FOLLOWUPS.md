@@ -439,6 +439,89 @@ host).
   `std::map<const Hash, ref<EvalCache>>` (eval.hh) were not
   modified by Batch E and are out of scope.
 
+## Batch G — adversarial value-review gaps (May 2026)
+
+Spawned in parallel after Batches A-F closed; one reviewer per shard
+asked: "Does each commit meaningfully help/simplify/improve/correct
+the code, or is it effectively churn? Does it unlock further
+simplifications? Are semantics preserved? Why?". Aggregate verdict
+across the seven shards: **substantive value, not churn**, with a
+small set of disclosure / under-documentation gaps and one actual
+churn case. The four gaps below close those out.
+
+- [x] ~~**libutil #163 — revert the `Pipe::create(PipeOptions)`
+  overload.** Reviewer flagged this as actual churn: zero in-tree
+  consumers of either the new overload or the legacy
+  `pipe.create(true)` form. The Unix `nonBlocking` parameter was
+  already dead. The overload was speculative public-header surface
+  for hypothetical future code, not a fix for any present-day call
+  site. Drop the commit (`e3f228714`) via `git rebase -i master`.
+  Update #163's Branch line on the doc branch to record
+  "landed and reverted" rather than "additive overload available".
+  The design (`PipeOptions{.nonBlocking = ...}` ignored on Windows
+  or implemented via `SetNamedPipeHandleState`) is still right;
+  re-file when an actual consumer needs the cross-platform shape.~~
+  Done. Commit dropped via non-interactive rebase
+  (`GIT_SEQUENCE_EDITOR=sed -i.bak '/e3f228714/s/^pick/drop/'`).
+  New libutil tip `7399593ce`. clang-tidy + `nix build -L .` post-
+  revert green (5 known pre-existing errors only). #163 Branch
+  line updated on `vibe-coding/simplifications`.
+- [x] ~~**libstore #80 — missing rl-next entry for the Windows
+  `log-fd=N` behavioural change.** `legacy-ssh://` URL parameter
+  was silently dropped on Windows pre-#80 because
+  `LegacySSHStoreConfig::logFD` was a plain `Descriptor` field
+  with no parser; #80 promoted it to a `Setting<Descriptor>` so
+  the URL parameter is now parsed via `toDescriptor`. This is a
+  user-visible behaviour change on Windows: configurations that
+  previously set `log-fd=N` expecting it to be ignored will now
+  honour it. Add `doc/manual/rl-next/legacy-ssh-store-windows-logfd.md`
+  on the libstore cleanup branch.~~ Done. Committed as
+  `a3ed63c01` on `vibe-coding/cleanup/libstore`. clang-tidy +
+  `nix build -L .` green.
+- [x] ~~**libmain — missing rl-next entry for the `getIntArg<N>`
+  4-argument signature break.** `src/libmain/include/nix/main/shared.hh`
+  is shipped via `install_headers`. The previous signature took a
+  trailing `bool allowUnit` parameter; the migration dropped it
+  outright (the body always parses unit suffixes; both in-tree
+  callers passed `true`, so the parameter was dead surface).
+  Out-of-tree consumers — Hydra, Lix, plugins — that pass a fourth
+  argument will fail to compile until they drop it. Add
+  `doc/manual/rl-next/getIntArg-allowunit-removed.md` on the libmain
+  cleanup branch. Same rl-next entry should also note the related
+  `nix::blockInt` extern declaration removal (never defined
+  anywhere).~~ Done. Committed as `b1a14158f` on
+  `vibe-coding/cleanup/libmain`. `nix build -L .` green.
+- [x] ~~**libutil #97 — capture two latent-bug fixes folded in via
+  the migration.** Adversarial review of the `parseEnum` migration
+  found two pre-existing latent bugs that were silently fixed by
+  regenerating the error-message tail from the source-of-truth
+  `EnumNames<E>` table: (a) `parseHashFormat`'s pre-batch error
+  tail listed `'base16', 'base32', 'base64', or 'sri'` but the
+  actual accepted set also included `'nix32'` — the new generated
+  tail enumerates the table directly, so `'nix32'` is now correctly
+  listed; (b) `parseFileSerialisationMethod`'s pre-batch error
+  message had a typo (`"file serialiation method"`) that the
+  migration silently corrected to `"file serialisation method"`.
+  Neither was the candidate's stated goal; both are genuine bug
+  fixes that emerged from the unification. Update #97's Branch
+  line on the doc branch to call them out so future readers know
+  the migration carried bug-fix freight beyond the consolidation.~~
+  Done. #97 Branch line on `vibe-coding/simplifications`
+  expanded with both bug-fix bullets.
+
+(Optional, deferred — the reviewers also surfaced these but they
+are non-blocking and either moot or low-value:)
+
+- [ ] (N) **libexpr #79 exception-type cacheability shift** — a
+  Pass-A finding noted that #79's migration to `EvalErrorBuilder`
+  shifted the cached error type (subtle effect on `eval-cache`'s
+  error-replay round-trip). Pass-A landed an amend; subsequent
+  follow-ups on libexpr have not regressed. End-state moot but
+  worth noting in the candidate body if a future reader encounters
+  the cache-replay machinery.
+
+---
+
 ## Batch tracking / sequencing
 
 - **A → B → C in any order.** Independent fixes; no behavioural
