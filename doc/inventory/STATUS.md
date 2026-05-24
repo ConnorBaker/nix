@@ -65,6 +65,67 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
+- **20 GREEN+YELLOW candidates (18 commits) landed + 4-pass review + Pass-A/B/C amends + new candidates #225/#226** (May 2026, this batch)
+  — bucket sweep over the catalog: triaged 28 small-effort candidates
+  into GREEN (15)/YELLOW (5)/RED (8). Landed all GREEN+YELLOW: libstore
+  +8 (#1+#3 BuildResult/DrvOutput/Realisation templates with
+  `readBuildResult`/`writeBuildResult` cpu-timing-as-callback;
+  #7 `negotiateVersion`; #11 `tryUpperFallLower` returning
+  `std::pair<R, bool>`; #55 stale migration drop; #59 `useBuildUsers`
+  static drop; #101 `partitionRealisedPaths` + `registerCopiedRealisations`;
+  #153 `DerivationBuilderImpl` composition; #185 `ServeProto::BasicConnection`
+  + `protoVersion` rename); libexpr +3 covering 4 candidates (#192
+  fetchClosure-mode collapse via `bool expectInputAddressed`;
+  #202+#203 drop failure-cache machinery, bump v6→v7, wrap `getAttr`
+  in `doSQLite`; #204 drop `MultiEvalProfiler`, two named optional
+  members, ctor-frozen `profilerHooks` cache); libutil +4 (#97 new
+  `parse-enum.hh` migrating `parseHashAlgo`/`parseHashFormat`/
+  `parseCompressionAlgo`/`parseFileSerialisationMethod`/
+  `parseFileIngestionMethod`; #124 `Sync<T>::ConstLock` + drop
+  `SyncBase`; #167 `io-buffer-sizes.hh` with `kDefaultIOBlockSize` +
+  `kBufferedStreamSize`; #224 `CanonPath::numSegments`); libfetchers
+  +1 (#53 latent-bug fix in `getCustomRegistry`); libflake +1 (#133
+  rename `configureEvalSettings` → `populateExtraPrimOps`); libmain
+  +1 (#223 `getIntArg` wrapper around `getArg`). Skipped #76 (libc++
+  in dev shell lacks `<generator>`) and several others as RED.
+  **Pass A** (adversarial, parallel, 6 reviewers) found 2 BLOCKERS
+  (libstore #153 over-broad rename corrupted the `external-builders`
+  JSON wire-key from `"inputPaths"` to `"params.inputPaths"`; libutil
+  #97 dropped the inline allowed-name list breaking
+  `eval-fail-hashString-2.err.exp`) and ~12 minor items. Both
+  blockers fixed via amend; `parseEnumOrThrow` extended to render
+  `'a', 'b', or 'c'` with Oxford comma + best-match suggestions.
+  **Pass B** (`/code-review` skill, sequential, 18 reviewers) found
+  no blockers; substantive concerns amended: libexpr `callFunction`
+  hot-path now reads a ctor-frozen `profilerHooks` snapshot (drops
+  per-call virtual `getNeededHooks()` dispatches) and the
+  `runFetchClosureChecked` local-shadow `bool isContentAddressed`
+  renamed to `contentAddressed`; libstore `tryUpperFallLower`
+  returns `std::pair<R, bool>` instead of threading a flag through
+  a captured lambda, dead `swallowMissingCaDerivations` parameter
+  dropped, narrative comments stripped from
+  `derivation-builder.cc`/`serve-protocol-connection.hh`/
+  `local-overlay-store.cc`; libutil completed three migration gaps
+  (file-content-address parsers via `parseEnumOrThrow`; 5 dead
+  `assert(s)` lines on `Sync<T>::Lock::wait*`; rename
+  `kCompressionOutBufSize` → `kBufferedStreamSize` and 4 more sites
+  adopt the constants; 3 more `numSegments` adopters); libflake
+  added a docstring on `populateExtraPrimOps` documenting the
+  lifetime contract. **Pass C** (clang-tidy, sequential) found one
+  real error in libutil — `parse-enum.hh` missing
+  `nix/util/configuration.hh` include for
+  `ExperimentalFeatureSettings`. Amended into #97. Other shards
+  showed only the 5 known pre-existing master errors.
+  **Pass D** (`nix build -L .`, sequential, full flake build + test
+  suite) green on all 6 shards. **New catalog candidates from
+  Pass-B review:** #225 (libfetchers `getUserRegistry`/
+  `getSystemRegistry`/`getGlobalRegistry` share #53's first-call-wins
+  shape but on the hot path), #226 (libutil `showCompressionAlgo`
+  vs `printHashAlgo` enum-rendering inconsistency — the inverse
+  direction wasn't migrated to a table-driven helper). Final tip
+  SHAs: libexpr `adc7301d1`, libfetchers `f39f6486e`, libflake
+  `fd6749635`, libmain `8f2494f61`, libstore `075a0479a`, libutil
+  `d7e3fdc6d`. All seven branches Local-only past their pushed tips.
 - **20 trivial candidates landed + 4-pass review + Pass-B-follow-up amends + new candidates #220/#221** (May 2026)
   — landed batch (above) plus full Pass A (adversarial, parallel),
   Pass B (`/code-review` skill, sequential), Pass C (clang-tidy,
@@ -192,9 +253,11 @@ The other entry points:
   their own merits.
 - **Catalog split into 25 sections** — original monolithic
   `CANDIDATES.md` deleted; 217 + 44 candidates organised by topic.
-  (Now 221 + 44 after #218 / #219 / #220 / #221 — the latter two
-  added in May 2026 when Pass B reuse review surfaced catalog gaps
-  while landing #79 and #85.)
+  (Now 226 + 44 after #218–#226 — #220–#221 added when Pass B
+  reuse review surfaced catalog gaps while landing #79 / #85;
+  #222–#224 surfaced by the post-audit follow-up sweep around #128;
+  #225–#226 surfaced by the May 2026 Pass-B sweep on #53 and #97
+  respectively.)
 - **Seven cleanup PRs pushed** — `vibe-coding/cleanup/*` shard branches
   on origin, ready for upstream review.
 
@@ -209,12 +272,12 @@ line in its body.
 
 | Branch | Shard | Addresses | Status |
 | ------ | ----- | --------- | ------ |
-| `vibe-coding/cleanup/libexpr` | libexpr | #217, #64, #66, #68, #106, #107, #109, #110 (extended to forceValueDeep), #112, #196, #199, #67, #79 (3 of 4 sites; `prim_fetchTree` excluded as misclassified — its loop dispatches on value type, not name), #105 (with doxygen `EXPAND_AS_DEFINED` follow-up), #214 | Local-only past `437eea9d0` |
-| `vibe-coding/cleanup/libfetchers` | libfetchers | #52, #51 (delete-and-trim, scope expanded past the two `#if 0` blocks) | Local-only past `74e512d11` |
-| `vibe-coding/cleanup/libflake` | libflake | #48, #78 (helper covers two of three DFS sites; `doFind` excluded as structurally different) | Local-only past `513b47628` |
-| `vibe-coding/cleanup/libmain` | libmain | #49, #128 | Pushed |
-| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4 (extended to template form), #5 (extended to template form), #6 (hoist-then-delete), #14, #47, #82, #114, #115, #119, #157, #159, #165, #26 (Linux only — Windows untested under current CI), #46 (buildenv + unpack-channel; `fetchurl` excluded — different lookup shape), #80 (Windows behaviour change: `log-fd` now respected), #83, #85, #100 (helper-only scope), #135 (option (a) flatten) | Local-only past `5f5b8151e` |
-| `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117, #37 (helper covers one of three NAR walks; other two structurally distinct), #163 (additive `PipeOptions` overload; asymmetric originals retained for source-compat) | Local-only past `784a4f4b4` |
+| `vibe-coding/cleanup/libexpr` | libexpr | #217, #64, #66, #68, #106, #107, #109, #110 (extended to forceValueDeep), #112, #196, #199, #67, #79 (3 of 4 sites; `prim_fetchTree` excluded as misclassified — its loop dispatches on value type, not name), #105 (with doxygen `EXPAND_AS_DEFINED` follow-up), #214, #220, #192, #202+#203 (folded — drop failure-cache machinery, bump v6→v7, wrap `getAttr` in `doSQLite`, rl-next entry), #204 (drop `MultiEvalProfiler`; ctor-frozen `profilerHooks` cache) | Local-only past `adc7301d1` |
+| `vibe-coding/cleanup/libfetchers` | libfetchers | #52, #51 (delete-and-trim, scope expanded past the two `#if 0` blocks), #53 (latent-bug fix in `getCustomRegistry`) | Local-only past `f39f6486e` |
+| `vibe-coding/cleanup/libflake` | libflake | #48, #78 (helper covers two of three DFS sites; `doFind` excluded as structurally different), #133 (rename only; deviation from prescribed end state documented) | Local-only past `fd6749635` |
+| `vibe-coding/cleanup/libmain` | libmain | #49, #128, #222 (`--max-freed` clamp), #223 (`getIntArg` wrapper around `getArg`) | Pushed |
+| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4 (extended to template form), #5 (extended to template form), #6 (hoist-then-delete), #14, #47, #82, #114, #115, #119, #157, #159, #165, #26 (Linux only — Windows untested under current CI), #46 (buildenv + unpack-channel; `fetchurl` excluded — different lookup shape), #80 (Windows behaviour change: `log-fd` now respected), #83, #85, #100 (helper-only scope), #135 (option (a) flatten), #1+#3 (BuildResult/DrvOutput/Realisation templates with cpu-timing-as-callback), #7 (`negotiateVersion` client-side helper), #11 (`tryUpperFallLower` returning `std::pair<R, bool>`), #55 (stale migration drop), #59 (`useBuildUsers` static drop), #101 (`partitionRealisedPaths` + `registerCopiedRealisations`), #153 (`DerivationBuilderImpl` composition), #185 (`ServeProto::BasicConnection` + `protoVersion` rename) | Local-only past `075a0479a` |
+| `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117, #37 (helper covers one of three NAR walks; other two structurally distinct), #163 (additive `PipeOptions` overload; asymmetric originals retained for source-compat), #221, #97 (new `parse-enum.hh`; migrated 5 parsers including file-content-address pair from Pass-B sweep), #124 (drop `SyncBase`; `Sync<T>::ConstLock` + `mutable mutex`), #167 (`io-buffer-sizes.hh` + 6 site migrations), #224 (`CanonPath::numSegments` + 4 migrations) | Local-only past `d7e3fdc6d` |
 | `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142, #24, #77, #89, #91, #187, #74, #75, #72 (free helpers, not mixin — diamond inheritance), #93 (3 of 4 parents; `CmdHash` deferred), #141 (per-command `static`-ify subset only — extended to `removeOldGenerations` after Pass A) | Local-only past `48524e038` |
 
 The branches whose Status reads "Pushed" are on `origin`

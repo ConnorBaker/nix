@@ -300,16 +300,21 @@ per-shard verified docs and follow-up source audits lives in
 [`candidates/`](candidates/), split into 25 themed section files with an
 [index](candidates/README.md). Each candidate carries a validation verdict
 (VALID / PARTIALLY VALID / INVALID / OBSOLETE) and an effort class against
-the source as it exists today. The 224 per-shard candidates (1-224;
+the source as it exists today. The 226 per-shard candidates (1-226;
 #218 was added during the V-pass integration documenting the
 `Hash::dummy`/`StorePath::dummy` placeholder pattern, #219 was added
 during post-cleanup adversarial review documenting the post-build-hook
 timeout silent-drop bug, #220/#221 were added during the May 2026
 Pass B reuse review when the catalog gaps surfaced in the course of
-landing #79 and #85, and #222/#223/#224 were added during the
+landing #79 and #85, #222/#223/#224 were added during the
 follow-up sweep when the libmain `--max-freed` clamp oddity, the
 `getIntArg` inline opportunity, and the `NarIndexer::createMember`
-path-depth idiom all surfaced from /code-review and Pass-B reviews)
+path-depth idiom all surfaced from /code-review and Pass-B reviews,
+and #225/#226 were added during the May 2026 Pass-B sweep when
+the latent-bug shape on the libfetchers `getUserRegistry`/
+`getSystemRegistry`/`getGlobalRegistry` triple and the asymmetric
+`showCompressionAlgo` vs `printHashAlgo` enum-rendering pattern
+surfaced from /code-review review of #53 and #97)
 plus 44 cross-shard candidates (numbered N1-N44) are grouped as:
 wire/serialisation duplication, parallel store implementations, repeated
 boilerplate, per-platform symmetry, inheritance chains worth flattening,
