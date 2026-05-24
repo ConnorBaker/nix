@@ -10,6 +10,27 @@
 
 namespace nix {
 
+namespace {
+
+/**
+ * Try `upperLookup()`; if its result is falsy, fall through to
+ * `lowerLookup()`. Both must return the same (truthy-testable) type.
+ * Returns `(result, fellThroughToLower)`: callers that need to do
+ * post-fallback work (e.g. materialise the lower-store hit into the
+ * upper DB) can branch on the second element without rerunning the
+ * lookups or threading state through closures.
+ */
+template<class UpperLookup, class LowerLookup>
+auto tryUpperFallLower(UpperLookup upperLookup, LowerLookup lowerLookup)
+{
+    auto upper = upperLookup();
+    if (upper)
+        return std::make_pair(std::move(upper), false);
+    return std::make_pair(lowerLookup(), true);
+}
+
+} // namespace
+
 void LocalOverlayStoreConfig::anchor() {}
 
 void LocalOverlayStore::anchor() {}
@@ -142,14 +163,16 @@ void LocalOverlayStore::queryRealisationUncached(
 
 bool LocalOverlayStore::isValidPathUncached(const StorePath & path)
 {
-    auto res = LocalStore::isValidPathUncached(path);
-    if (res)
-        return res;
-    res = lowerStore->isValidPath(path);
-    if (res) {
-        // Get path info from lower store so upper DB genuinely has it.
+    auto [res, fellThroughToLower] = tryUpperFallLower(
+        [&] { return LocalStore::isValidPathUncached(path); },
+        [&] { return lowerStore->isValidPath(path); });
+
+    if (fellThroughToLower && res) {
         auto p = lowerStore->queryPathInfo(path);
-        // recur on references, syncing entire closure.
+        /* Recurse on references via the public `isValidPath` so the
+           in-process cache layer participates; using
+           `isValidPathUncached` would bypass it and re-check the lower
+           store from scratch on every reference. */
         for (auto & r : p->references)
             if (r != path)
                 isValidPath(r);
@@ -179,11 +202,10 @@ StorePathSet LocalOverlayStore::queryValidDerivers(const StorePath & path)
 
 std::optional<StorePath> LocalOverlayStore::queryPathFromHashPart(const std::string & hashPart)
 {
-    auto res = LocalStore::queryPathFromHashPart(hashPart);
-    if (res)
-        return res;
-    else
-        return lowerStore->queryPathFromHashPart(hashPart);
+    return tryUpperFallLower(
+                [&] { return LocalStore::queryPathFromHashPart(hashPart); },
+                [&] { return lowerStore->queryPathFromHashPart(hashPart); })
+        .first;
 }
 
 void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos)
