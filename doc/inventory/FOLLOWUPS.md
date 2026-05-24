@@ -80,7 +80,7 @@ change to any code; safe to run independently.
 Edits to `doc/inventory/candidates/*.md` and `doc/inventory/STATUS.md`
 on `vibe-coding/simplifications`. No cleanup-branch impact.
 
-- [ ] **#159 Branch line** in `12-libutil-libstore-core-extras.md`
+- [x] ~~**#159 Branch line** in `12-libutil-libstore-core-extras.md`
   says "`std::queue<ChildEvent>` plus `bool timedOut`; pop order
   preserved by FIFO insertion semantics; the old
   `assert(!childEOF)` defensive check was dropped". Actual
@@ -89,8 +89,10 @@ on `vibe-coding/simplifications`. No cleanup-branch impact.
   draining `ChildOutput` events ahead of markers, and a new
   `assert(events.size() <= childEventsHighWatermark)` (high-watermark
   16) replaces the dropped EOF assertion. Three points stale; fix
-  Branch line to match shipped code.
-- [ ] **#226 candidate body** in
+  Branch line to match shipped code.~~ Done. (Branch line lives
+  in `16-libstore-build-audit.md`, not the file the reviewer
+  named — found via grep.)
+- [x] ~~**#226 candidate body** in
   `12-libutil-libstore-core-extras.md` cites only `printHashAlgo` /
   `printHashFormat` / `showCompressionAlgo`. Two sibling
   switch-based renderers exist in the same file
@@ -100,30 +102,37 @@ on `vibe-coding/simplifications`. No cleanup-branch impact.
   #97). Expand #226's body to cite all five sites and explicitly
   include the file-content-address pair as scope. The proposed
   `renderEnum<E>(E, EnumNames<E>) -> std::string_view` helper
-  unifies all five.
-- [ ] **#148 Branch line** in `07-dead-stale-code.md` (or wherever
+  unifies all five.~~ Done.
+- [x] ~~**#148 Branch line** in `07-dead-stale-code.md` (or wherever
   it lives — verify the file) names a "primary commit message"
   that doesn't exist as a singular concept. The actual
   attempt-and-revert is documented in `efd3e2613`'s third
-  paragraph. Fix by naming the SHA `efd3e2613` directly.
-- [ ] **#128 Branch line** in `11-legacy-cli.md` flags the
+  paragraph. Fix by naming the SHA `efd3e2613` directly.~~ Done;
+  Branch line lives in `15-globals-settings.md`. Names commit
+  `efd3e2613` and its third paragraph explicitly.
+- [x] ~~**#128 Branch line** in `11-legacy-cli.md` flags the
   `#49+#128` bundling as "soft style issue", reading as
   if-not-fixed. The bundling shipped that way and #222/#223
   landed as separate commits with no further pushback. One-line
   nuance edit clarifying that the bundling was accepted, so
-  future readers don't reopen the discussion.
-- [ ] **#225 candidate body** (filed last batch) — add a note
+  future readers don't reopen the discussion.~~ Done. (Edit
+  was in `14-vestigial-stdlib.md`, where #128's body actually
+  lives — the candidate-body framing reads "History note"
+  rather than "Note (per pass-2 finding)" now.)
+- [x] ~~**#225 candidate body** (filed last batch) — add a note
   that any mtime-keyed cache helper introduced to fix
   `getUserRegistry`/`getSystemRegistry`/`getGlobalRegistry`
   belongs in libutil, not libfetchers, since it is a pure
   FS-stat-keyed memo of `T(Path)`. Keeps a future implementor
-  from cross-locating the helper.
-- [ ] **#89 Branch line** in `11-legacy-cli.md` — same mistake as
+  from cross-locating the helper.~~ Done.
+- [x] ~~**#89 Branch line** in `11-legacy-cli.md` — same mistake as
   the nix-cli commit body in Batch A: says "prefetch.cc deferred
   to #95" when prefetch.cc was actually migrated. Update Branch
   line to reflect that all four legacy entry points
   (`nix-build`, `nix-instantiate`, `nix-env`, `nix-prefetch-url`)
-  were converted.
+  were converted.~~ Done. Also added a propagation note to #95's
+  Validation paragraph noting the scope shrunk (only the
+  `compatNixHash` shim remains).
 
 ---
 
