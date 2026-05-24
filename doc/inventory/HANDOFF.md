@@ -17,10 +17,14 @@ live in the in-tree docs themselves.
    (live)" table is the source of truth for which shard branches
    exist, what they address, and whether they're pushed. The "Queued
    / blocked" and "Recently completed" sections track work-in-flight.
-4. [`review/00-INDEX.md`](review/00-INDEX.md) — index of every review
+4. [`FOLLOWUPS.md`](FOLLOWUPS.md) — if any "Currently in flight"
+   entry on `STATUS.md` points here, this is the per-batch
+   item-by-item checklist for the active follow-up round. Strike
+   items as they land. Skip it if the active round is empty.
+5. [`review/00-INDEX.md`](review/00-INDEX.md) — index of every review
    report under `review/`. Use this to find prior investigation of a
    candidate before doing your own.
-5. [`review/AGENT-CHARTER.md`](review/AGENT-CHARTER.md) — the
+6. [`review/AGENT-CHARTER.md`](review/AGENT-CHARTER.md) — the
    eight-rule evidentiary standard. Every claim you make in a report
    should address each rule where it applies.
 

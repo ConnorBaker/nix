@@ -9,6 +9,12 @@ The other entry points:
   picking up the work without prior context (build invocation,
   worktree-source gotcha, push policy, common pitfalls).
 - [`INVENTORY.md`](INVENTORY.md) — codebase navigation map.
+- [`FOLLOWUPS.md`](FOLLOWUPS.md) — current-round follow-up
+  ledger. Active item-by-item checklist of correctness amends,
+  doc-branch corrections, in-source doc fixes, missing
+  release-note entries, new catalog candidates, and
+  compound-win cleanups raised by the holistic-review pass.
+  Strike items off as they land.
 - [`candidates/README.md`](candidates/README.md) — catalog scope,
   eight-debt-shape framing, evidentiary standard.
 - [`review/00-INDEX.md`](review/00-INDEX.md) — index of every review
@@ -18,7 +24,12 @@ The other entry points:
 
 ## Currently in flight
 
-(none.)
+- **Holistic-review follow-up batches** — five batches of work
+  raised by the May 2026 whole-branch reviewer pass; full
+  checklist in [`FOLLOWUPS.md`](FOLLOWUPS.md). Sequence: A
+  (correctness amends) → B (doc-branch corrections) → C
+  (in-source docs + rl-next) → D (file new catalog
+  candidates #227-#233) → E (implementation).
 
 ## Queued / blocked
 
