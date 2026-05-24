@@ -509,6 +509,38 @@ churn case. The four gaps below close those out.
   Done. #97 Branch line on `vibe-coding/simplifications`
   expanded with both bug-fix bullets.
 
+### Batch G follow-ups (post-audit)
+
+A bidirectional traceability audit run after Batch G's commit
+landed surfaced two more items, both addressed.
+
+- [x] ~~**Phantom claim in STATUS.md cleanup-branches table.**
+  `#221` was credited to the libutil row, but the actual commit
+  (`ae7167e8c` "libutil/configuration: lift parseSettingTokens /
+  renderSettingTokens (#221)") lives on the libstore branch — it
+  edits a shipped libutil header but the consumer it unblocks is
+  libstore's `globals.cc`. Re-shelve from libutil row to libstore
+  row with cross-shard notes on each side.~~ Done in `0bdf836ea`.
+- [x] ~~**Missing rl-next entry for `BaseSetting<T>::overrideIfSet`.**
+  Commit `aa00e072e` on `vibe-coding/cleanup/libstore` added a new
+  public member function on `BaseSetting<T>` in the shipped
+  `configuration.hh` header. The addition is purely additive (no
+  breakage for out-of-tree consumers) but matches the disclosure
+  standard applied to other shipped-header changes in this batch.
+  Add `doc/manual/rl-next/baseSetting-overrideIfSet.md` on the
+  libstore cleanup branch.~~ Done. Committed as `b9a750f00` on
+  `vibe-coding/cleanup/libstore`. `nix build -L .` green.
+- [x] ~~**Stylistic non-canonical commit-body form on three libutil
+  commits.** Bodies on `4212ac8c7` (#29), `7bfd6d15b` (#99), and
+  `fe96867de` (#117) used `Candidate #NN in doc/inventory/candidates/.`
+  instead of the canonical `Refs candidate #NN.`. Reword via
+  non-interactive `git rebase -i master` with sed-based
+  GIT_SEQUENCE_EDITOR + GIT_EDITOR.~~ Done. New libutil tip
+  `da1e0d7d9` (no tree change; metadata only). clang-tidy and
+  `nix build -L .` post-reword green. Three rewritten SHAs:
+  `34b02c3f7` (was `4212ac8c7`, #29), `309faf880` (was `7bfd6d15b`,
+  #99), `b0574ddc5` (was `fe96867de`, #117).
+
 (Optional, deferred — the reviewers also surfaced these but they
 are non-blocking and either moot or low-value:)
 
