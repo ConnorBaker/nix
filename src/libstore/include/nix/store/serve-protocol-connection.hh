@@ -6,12 +6,67 @@
 
 namespace nix {
 
-struct ServeProto::BasicClientConnection
+/**
+ * Stripped down serve-protocol connection state, mirroring
+ * `WorkerProto::BasicConnection`. Holds the `to`/`from` sinks plus the
+ * negotiated `protoVersion`, and exposes the two coercions to
+ * `ServeProto::ReadConn`/`WriteConn` used by the canonical
+ * serialisers.
+ *
+ * Unlike `WorkerProto::BasicConnection`, the embedded `ReadConn`/
+ * `WriteConn` here store `Version` *by value* (Worker's store a
+ * `const Version &` because the Worker negotiates a `FeatureSet`
+ * alongside the version number, which the caller updates after
+ * handshake). That asymmetry is why this base is per-protocol rather
+ * than a `BasicConnection<Proto>` template.
+ */
+struct ServeProto::BasicConnection
 {
     FdSink to;
     FdSource from;
-    ServeProto::Version remoteVersion;
 
+    /**
+     * The protocol version agreed by both sides — the negotiated
+     * value, not the raw peer-reported one. Mirrors
+     * `WorkerProto::BasicConnection::protoVersion`.
+     */
+    ServeProto::Version protoVersion;
+
+    /**
+     * Coercion to `ServeProto::ReadConn`. This makes it easy to use the
+     * factored out serve protocol serializers with a
+     * `LegacySSHStore::Connection`.
+     *
+     * The serve protocol connection types are unidirectional, unlike
+     * this type.
+     */
+    operator ServeProto::ReadConn()
+    {
+        return ServeProto::ReadConn{
+            .from = from,
+            .version = protoVersion,
+        };
+    }
+
+    /**
+     * Coercion to `ServeProto::WriteConn`. This makes it easy to use the
+     * factored out serve protocol serializers with a
+     * `LegacySSHStore::Connection`.
+     *
+     * The serve protocol connection types are unidirectional, unlike
+     * this type.
+     */
+    operator ServeProto::WriteConn()
+    {
+        return ServeProto::WriteConn{
+            .to = to,
+            .version = protoVersion,
+        };
+    }
+};
+
+struct ServeProto::BasicClientConnection : ServeProto::BasicConnection
+{
     /**
      * Establishes connection, negotiating version.
      *
@@ -30,38 +85,6 @@ struct ServeProto::BasicClientConnection
      */
     static ServeProto::Version
     handshake(BufferedSink & to, Source & from, ServeProto::Version localVersion, std::string_view host);
-
-    /**
-     * Coercion to `ServeProto::ReadConn`. This makes it easy to use the
-     * factored out serve protocol serializers with a
-     * `LegacySSHStore::Connection`.
-     *
-     * The serve protocol connection types are unidirectional, unlike
-     * this type.
-     */
-    operator ServeProto::ReadConn()
-    {
-        return ServeProto::ReadConn{
-            .from = from,
-            .version = remoteVersion,
-        };
-    }
-
-    /**
-     * Coercion to `ServeProto::WriteConn`. This makes it easy to use the
-     * factored out serve protocol serializers with a
-     * `LegacySSHStore::Connection`.
-     *
-     * The serve protocol connection types are unidirectional, unlike
-     * this type.
-     */
-    operator ServeProto::WriteConn()
-    {
-        return ServeProto::WriteConn{
-            .to = to,
-            .version = remoteVersion,
-        };
-    }
 
     StorePathSet queryValidPaths(
         const StoreDirConfig & remoteStore, bool lock, const StorePathSet & paths, SubstituteFlag maybeSubstitute);
