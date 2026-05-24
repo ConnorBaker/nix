@@ -1,6 +1,6 @@
 # Legacy CLI duplication
 
-Candidates 89-95 plus #222 and #223. Eight VALID; #94 PARTIALLY VALID
+Candidates 89-95 plus #222, #223, #231. Nine VALID; #94 PARTIALLY VALID
 — its named members `BuiltPath::parse` and `BuiltPath::to_string` are
 dead surface (declared in the header with no implementation and no
 caller anywhere in tree).
@@ -16,6 +16,7 @@ caller anywhere in tree).
 | 95 | VALID | small |
 | 222 | VALID | trivial |
 | 223 | VALID | trivial |
+| 231 | VALID | trivial |
 
 ---
 
@@ -59,3 +60,7 @@ caller anywhere in tree).
     - ../verified/15-libflake-libmain.md
     - **Validation:** VALID. **Pitfall:** the inlined form would re-spell the "requires an argument" error at each site — minor stylistic regression, not a behavioural one. Both call sites already use the same wording today via the shared template. **See also:** #49 (the `blockInt` deletion sibling), #128 (the `allowUnit` parameter deletion that surfaced this). Effort: trivial.
     - **Branch:** `vibe-coding/cleanup/libmain` (kept `getIntArg<N>` as a one-line wrapper rather than inlining at the two call sites; refactored the body to `return string2IntWithUnitPrefix<N>(getArg(opt, i, end));`. The wrapper exists to avoid the candidate's flagged "stylistic regression" of re-spelling the `'%1%' requires an argument` error at each call site. `getArg`'s `++i` and end-check happen before the result is consumed by the parser; argument-evaluation order is well-defined per C++17 sequenced-before rules. Public template signature unchanged, so external consumers see no source/ABI break.)
+
+231. **`nix-env --priority` open-codes the `getArg`+`string2Int` pattern that `getIntArg<N>` was meant to encapsulate.** [LOW] After libmain #223 turned `getIntArg<N>` into a one-line wrapper around `getArg(opt, i, end)` + `string2IntWithUnitPrefix<N>(...)`, exactly one in-tree CLI-arg-parse site still hand-rolls the same advance + end-check + parse: `src/nix/nix-env/nix-env.cc::opSetFlag`. It does manual end-check, throws `UsageError("'%1%' requires an argument", arg)`, then `priority = string2Int<int>(*i++)` followed by another `UsageError` if the parse returned `nullopt`. It cannot use `getIntArg` directly: `getIntArg` calls `string2IntWithUnitPrefix<N>` (which accepts `K`/`M`/`G` suffixes that don't make sense for a profile priority) and throws on bad input, whereas `opSetFlag` wants `string2Int` (no unit prefix) with explicit `nullopt`-handling. The cleanest fix is a one-liner via `getArg(arg, i, opFlags.end())` + `string2Int<int>(...)`, optionally accompanied by a sibling `getIntArgNoUnit<N>` template if a second similar caller appears. Pre-existing oddity surfaced by libmain reviewer in the holistic-review pass.
+    - ../verified/18-nix-modern-2-legacy.md
+    - **Validation:** VALID. The fix is mechanical at the single call site. **See also:** #128 (the original `allowUnit` parameter deletion), #223 (the wrapper refactor that surfaced this). Effort: trivial.

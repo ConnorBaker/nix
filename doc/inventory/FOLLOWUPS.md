@@ -220,7 +220,7 @@ doc branch, continuing from #226. Filing them makes the work
 visible in the "Queued / blocked" surface so it doesn't get
 forgotten.
 
-- [ ] **#227 — `EvalProfiler`'s NVI cache + default-no-op virtuals
+- [x] ~~**#227 — `EvalProfiler`'s NVI cache + default-no-op virtuals
   are dead post-#204.** With `profilerHooks` snapshotted into
   `EvalState` once at construction, the
   `private std::optional<Hooks> neededHooks` cache, the
@@ -231,8 +231,9 @@ forgotten.
   the NVI to one direct virtual, mark hook virtuals pure.
   `eval-profiler.hh` ships via `install_headers`, so this is a
   public-API tightening — coordinate with rl-next. Effort:
-  small. **See also:** #204.
-- [ ] **#228 — `bitAnd`/`bitOr`/`bitXor` are an unfinished twin
+  small. **See also:** #204.~~ Filed in
+  `20-eval-core-cache-attrset-profiler.md`.
+- [x] ~~**#228 — `bitAnd`/`bitOr`/`bitXor` are an unfinished twin
   family adjacent to `primNumeric<NumOp>`.** Three lines below
   the new template, `prim_bitAnd` / `prim_bitOr` / `prim_bitXor`
   (`primops.cc:4587-4635`) sit as byte-identical free functions
@@ -240,8 +241,10 @@ forgotten.
   `forceInt`, applies the op, emits an int. Extend the `NumOp`
   enum with `BitAnd`/`BitOr`/`BitXor`, give each row a
   `firstIntCtx`/`secondIntCtx`, let `primNumeric<Op>` handle
-  int-only as a third arm. Effort: small. **See also:** #67.
-- [ ] **#229 — `SeenSet = set<const void *>` widening
+  int-only as a third arm. Effort: small. **See also:** #67.~~
+  Filed in `08-duplicated-parsers.md`. (Line numbers replaced
+  with "adjacent to" framing per the no-line-numbers rule.)
+- [x] ~~**#229 — `SeenSet = set<const void *>` widening
   type-erases at the boundary.** Promoted in #110 to handle
   `printAmbiguous` and `getDerivations::done`'s parallel
   visited sets. The `void *` widening means anyone adding a
@@ -252,8 +255,9 @@ forgotten.
   (`SeenSet<Bindings>`, `SeenSet<Value>`). Preserves the
   consolidation while keeping each caller's element type
   pinned. **See also:** #110, the analogous pointer-keyed
-  visited sets in libstore/libutil if any.
-- [ ] **#230 — GitArchive subclass DRY-ing post-#51 trim.**
+  visited sets in libstore/libutil if any.~~ Filed in
+  `13-libexpr-extras.md`.
+- [x] ~~**#230 — GitArchive subclass DRY-ing post-#51 trim.**
   After #51 trimmed `RefInfo` to a single `Hash` field, the
   duplication across `GitHubInputScheme`, `GitLabInputScheme`,
   `SourceHutInputScheme` becomes legible: host default
@@ -263,8 +267,9 @@ forgotten.
   `getStrAttr(input.attrs, "owner"|"repo")` 4-6×, `getDownloadUrl`
   shape uniform with only the format string varying. Promote
   to a base virtual with per-scheme overrides for the
-  load-bearing differences. Effort: small. **See also:** #51.
-- [ ] **#231 — `nix-env --priority` open-codes the
+  load-bearing differences. Effort: small. **See also:** #51.~~
+  Filed in `03-repeated-boilerplate.md`.
+- [x] ~~**#231 — `nix-env --priority` open-codes the
   `getArg`+`string2Int` pattern.** `src/nix/nix-env/nix-env.cc::
   opSetFlag` does manual end-check + throw +
   `string2Int<int>(*i++)`. After libmain #223 turned `getIntArg`
@@ -273,16 +278,18 @@ forgotten.
   `getIntArg` directly (different `string2Int` vs
   `string2IntWithUnitPrefix`, and `nullopt` handling) but is a
   one-liner via `getArg(arg, i, opFlags.end())` +
-  `string2Int<int>`. Effort: trivial. **See also:** #128, #223.
-- [ ] **#232 — `ignoreExceptionInDestructor` non-destructor
+  `string2Int<int>`. Effort: trivial. **See also:** #128, #223.~~
+  Filed in `11-legacy-cli.md`.
+- [x] ~~**#232 — `ignoreExceptionInDestructor` non-destructor
   audit.** ~14 invocation sites in libstore alone (counted via
   `grep -rn` from libstore reviewer). Most are genuinely in
   destructors; some are not. The libutil branch shipped #58
   converting one libutil non-destructor site (`getMaxCPU`) to
   `ignoreExceptionExceptInterrupt`. Walk all remaining sites
   in libstore and reclassify any that aren't destructors.
-  Effort: small. **See also:** #58.
-- [ ] **#233 — Schema-migration-style scaffolding repeats
+  Effort: small. **See also:** #58.~~ Filed in
+  `07-dead-stale-code.md`.
+- [x] ~~**#233 — Schema-migration-style scaffolding repeats
   thrice (cross-shard).** `LocalStore::upgradeDBSchema`'s
   `SchemaMigrations` table + `doUpgrade` closure pattern,
   `nar-info-disk-cache.cc::LastPurge` table-keyed periodic
@@ -294,7 +301,7 @@ forgotten.
   Lift into a shared helper, or note explicitly that the
   three are deliberately separate. **See also:** N13
   (cache-base / doSQLite consistency), #168 (cache schema
-  versions). Effort: medium.
+  versions). Effort: medium.~~ Filed in `17-cross-cutting.md`.
 
 (Optional for a future filing pass — not blocking on this round:)
 

@@ -1,6 +1,6 @@
 # Repeated boilerplate
 
-Candidates 17-25. All nine VALID. Note that #17 (`anchor()` vtable-pinning) is
+Candidates 17-25 plus #230. All ten VALID. Note that #17 (`anchor()` vtable-pinning) is
 boilerplate that **cannot be removed** — the comment on `Store::anchor()`
 documents that it exists "to avoid weak linkage of the vtable - it breaks
 dynamic_cast across shared libraries on Darwin", and modern lld on Darwin
@@ -19,6 +19,7 @@ removing the mechanism.
 | 23 | VALID | large |
 | 24 | VALID | trivial |
 | 25 | VALID | trivial |
+| 230 | VALID | small |
 
 ---
 
@@ -58,3 +59,7 @@ removing the mechanism.
 25. **`doc()` overrides include a per-command `*.md` (or `*.md.gen.hh`) via `#include`.** Every command does `return ` `#include "name.md"` `;`. Stable but heavy boilerplate.
     - ../verified/17-nix-modern-1.md, ../verified/18-nix-modern-2-legacy.md
     - **Validation:** VALID, but the prescribed `NIX_COMMAND_DOC("name")` form is **not implementable in C++**: the preprocessor explicitly rejects `#include` directives inside macro argument lists ("embedding a #include directive within macro arguments is not supported"). A different mechanism would be needed — e.g. a build-system-generated lookup table keyed by command class, or a BEGIN/END pair where the `#include` lives between two distinct macros — but neither is the trivial-effort consolidation the candidate envisages. **Reclassify as effectively unimplementable in its current shape; effort: medium** (requires either a build-system contribution or a multi-macro pattern). Original framing: a `NIX_COMMAND_DOC(name)` macro (ideally folded into the #24 registration macro so name and doc filename share one source of truth) replaces the body. Pitfall: Meson's `*.md.gen.hh` generation expects the include path to match the source file, so any macro-stringified parameter has to match what the build system already recognises.
+
+230. **GitArchive subclasses (`GitHubInputScheme`, `GitLabInputScheme`, `SourceHutInputScheme`) duplicate per-host scaffolding now that #51's trim made the duplication legible.** [LOW] After #51 trimmed `RefInfo` down to a single `Hash` field and removed the abandoned tree-hash propagation, four duplications across the three GitArchive-derived schemes in `src/libfetchers/github.cc` become visible: (a) the host default `maybeGetStrAttr(input.attrs, "host").value_or("github.com" | "gitlab.com" | "git.sr.ht")` is repeated seven times — extracted to `getHost()` on `GitHubInputScheme` only, inlined elsewhere; (b) `clone()` is a ~3-line near-clone across all three, differing only in host default and `.git` suffix presence (github/gitlab keep it; sourcehut omits it); (c) `getOwner` / `getRepo` helpers exist only on `GitHubInputScheme`, while the other two inline `getStrAttr(input.attrs, "owner"|"repo")` 4-6 times each; (d) `getDownloadUrl` returns `DownloadUrl{parseURL(url), makeHeadersWithAuthTokens(...)}` after building a host-and-path with the same shape across all three, varying only in the format string. Promote `getHost`, `getOwner`, `getRepo`, and a `defaultCloneUrl()` virtual onto the base; let `clone()` and `getDownloadUrl` reduce to base-class bodies that delegate to per-subclass overrides for the load-bearing differences. **See also:** #51 (the trim that surfaced this).
+    - ../verified/14-libfetchers.md
+    - **Validation:** VALID. Three subclasses with mechanical duplication; the per-host overrides confine to host string, `.git` suffix, and URL format. Effort: small.

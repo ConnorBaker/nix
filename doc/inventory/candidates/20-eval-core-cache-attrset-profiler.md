@@ -1,6 +1,6 @@
 # libexpr eval-core: cache, attr-set, profiler
 
-Candidates 201-209. Seven VALID; #205, #206, #208 PARTIALLY VALID.
+Candidates 201-209 plus #227. Eight VALID; #205, #206, #208 PARTIALLY VALID.
 
 **Latent bug surfaced:** #203 — `AttrDb::getAttr` does not honour the
 `doSQLite` failed-flag protocol that every writer uses. Asymmetric error
@@ -17,6 +17,7 @@ handling between read and write paths.
 | 207 | VALID | small |
 | 208 | PARTIALLY VALID | small |
 | 209 | VALID | medium |
+| 227 | VALID | small |
 
 ---
 
@@ -58,3 +59,8 @@ handling between read and write paths.
 209. **`EvalSettings` mixes 9 tracing/debug toggles with 7 eval-semantics settings on one struct; carving out an `EvalDebugSettings` would isolate the debug surface.** [DESIGN] Of the 23 settings on `EvalSettings`, the eval-semantics core is `nixPath`, `currentSystem`, `restrictEval`, `pureEval`, `allowedUris`, `useEvalCache`, `maxCallDepth` (7); the IFD pair is `traceImportFromDerivation`, `enableImportFromDerivation` (2); the lint family is `lintShortPathLiterals`, `lintAbsolutePathLiterals`, `lintUrlLiterals`, plus the deprecated `warnShortPathLiterals` alias (4); the tuning knob is `bindingsUpdateLayerRhsSizeThreshold` (1); and the rest — `traceFunctionCalls`, `traceVerbose`, `builtinsTraceDebugger`, `builtinsDebuggerOnWarn`, `builtinsAbortOnWarn`, `ignoreExceptionsDuringTry`, `evalProfilerMode`, `evalProfileFile`, `evalProfilerFrequency` — are all debug/trace/profiler toggles (9). The debug nine could move to a `EvalDebugSettings` struct hung off `EvalState::debugSettings`. The win is that `EvalSettings` becomes a stable "what does the language do" surface vs `EvalDebugSettings` becomes a "how does the evaluator report itself" surface — relevant for the C API ambition called out in the `// FIXME: This really shouldn't be public` comment on `readOnlyMode`.
     - ../verified/11-libexpr-eval.md
     - **Validation:** VALID. Compounds with #138, #144. Effort: medium.
+
+
+227. **`EvalProfiler`'s NVI cache + default no-op virtuals are dead surface after #204.** [LOW] Post-#204, both profiler hooks (`functionCallTrace`, `sampleStackProfiler`) are constructed exactly once, in the `EvalState` ctor. Their `getNeededHooks()` results are snapshotted into `functionCallTraceHooks` / `sampleStackProfilerHooks` / `profilerHooks` immediately after construction and never re-queried. Three pieces of `EvalProfiler` infrastructure are now unreachable: (a) the `private std::optional<Hooks> neededHooks;` cache field with its lazy "compute-once-and-store" body in `getNeededHooks()`, (b) the `protected virtual Hooks getNeededHooksImpl() const { return Hooks{}; }` indirection (NVI to nothing — both subclasses override the public hooks directly, never the impl), and (c) the default no-op `pre/postFunctionCallHook` bodies in `eval-profiler.cc` (both subclasses override). Drop the cache, collapse `getNeededHooks()` to a direct virtual, mark the hook virtuals pure. `eval-profiler.hh` ships via `install_headers` so this is a public-API tightening — coordinate with rl-next for any external embedders subclassing `EvalProfiler`.
+    - ../verified/11-libexpr-eval.md
+    - **Validation:** VALID. Compounds with #204. Effort: small.

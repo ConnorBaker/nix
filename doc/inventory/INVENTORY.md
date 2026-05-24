@@ -300,7 +300,7 @@ per-shard verified docs and follow-up source audits lives in
 [`candidates/`](candidates/), split into 25 themed section files with an
 [index](candidates/README.md). Each candidate carries a validation verdict
 (VALID / PARTIALLY VALID / INVALID / OBSOLETE) and an effort class against
-the source as it exists today. The 226 per-shard candidates (1-226;
+the source as it exists today. The 233 per-shard candidates (1-233;
 #218 was added during the V-pass integration documenting the
 `Hash::dummy`/`StorePath::dummy` placeholder pattern, #219 was added
 during post-cleanup adversarial review documenting the post-build-hook
@@ -314,7 +314,11 @@ and #225/#226 were added during the May 2026 Pass-B sweep when
 the latent-bug shape on the libfetchers `getUserRegistry`/
 `getSystemRegistry`/`getGlobalRegistry` triple and the asymmetric
 `showCompressionAlgo` vs `printHashAlgo` enum-rendering pattern
-surfaced from /code-review review of #53 and #97)
+surfaced from /code-review review of #53 and #97; and #227-#233 were
+filed as Batch D of the May 2026 whole-branch holistic-review pass —
+covering follow-up cleanups unlocked by #204 / #67 / #110 / #51 / #128,
+the libstore non-destructor `ignoreExceptionInDestructor` audit, and
+the cross-shard schema-migration scaffolding pattern)
 plus 44 cross-shard candidates (numbered N1-N44) are grouped as:
 wire/serialisation duplication, parallel store implementations, repeated
 boilerplate, per-platform symmetry, inheritance chains worth flattening,

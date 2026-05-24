@@ -1,8 +1,8 @@
 # Cross-cutting: platforms, headers, magic numbers
 
-Candidates 161-175. Six VALID; eight PARTIALLY VALID — this is the highest
-PARTIALLY VALID rate of any section, mostly because the original counts
-drifted from current source.
+Candidates 161-175 plus #233. Seven VALID; eight PARTIALLY VALID —
+this is the highest PARTIALLY VALID rate of any section, mostly because
+the original counts drifted from current source.
 
 | # | Verdict | Effort |
 | - | ------- | ------ |
@@ -21,6 +21,7 @@ drifted from current source.
 | 173 | PARTIALLY VALID | small |
 | 174 | PARTIALLY VALID | medium |
 | 175 | PARTIALLY VALID | medium |
+| 233 | VALID | medium |
 
 ---
 
@@ -83,3 +84,7 @@ drifted from current source.
 175. **`Bindings` declares `BindingsBuilder` as friend, plus an inner-class friend chain that spans four levels.** [MEDIUM] `libexpr/include/nix/expr/attr-set.hh` declares `friend class BindingsBuilder;` on `Bindings`; `friend class Bindings;` on the inner `iterator::BindingsCursor` cursor type; `friend class EvalMemory;` on two helper types; and `friend struct ExprAttrs;` on `BindingsBuilder`. The chain (`ExprAttrs` → `BindingsBuilder` → `Bindings` → `iterator::BindingsCursor`) exists because `Bindings` uses a flexible-array member (`Attr attrs[0];`) that can only be sized at allocation time, forcing `BindingsBuilder` to placement-new from outside. A `Bindings::create(EvalMemory &, std::span<Attr>)` static factory would let `BindingsBuilder` be a plain client and remove three of the four friend lines.
     - ../verified/12-libexpr-parse.md
     - **Validation:** PARTIALLY VALID. **Correction:** actual is 5 friend lines across 3 levels; **no friend on `BindingsCursor`**. The factoring proposal still works. Effort: medium.
+
+233. **Three "named-once-and-marked-done" bookkeeping patterns repeat across libstore and libexpr.** [LOW] After candidate #55 dropped the stale `20260309-drop-redundant-indexreferrer` migration, `LocalStore::upgradeDBSchema`'s `SchemaMigrations` table + `doUpgrade` closure scaffolding now drives exactly one migration (`20251017-ca-derivations`, gated on `Xp::CaDerivations`). That scaffolding is structurally similar to two other patterns in the codebase: `nar-info-disk-cache.cc::LastPurge` (a table-keyed periodic-refresh check that runs `delete from NARs where ...` once per day) and `eval-cache.cc::AttrDb::_state` (a mutex-guarded "have we initialised this row yet" check on first access). All three encode "this maintenance step has already happened" as a row in a SQLite cache, all three keep the maintenance body close to the call site, and all three are mutually independent (no shared utility). Lift into a single helper (e.g. `template<class K> class OnceTable` exposing `markDone(key)` + `isDone(key)`) or accept the divergence and document each as deliberately separate. **Cross-shard:** spans libstore (two sites) and libexpr (one). **Compounds with:** N13 (the broader cache-base / `SqliteCache<Schema>` template proposal), #168 (cache schema versions), #201 (the `eval-cache.cc` schema mismatch detection). Surfaced by the holistic libstore reviewer in the May 2026 review pass after #55 collapsed `upgradeDBSchema` to a single migration.
+    - ../verified/05-libstore-core.md, ../verified/07-libstore-local.md, ../verified/11-libexpr-eval.md
+    - **Validation:** VALID. Three sites with structurally similar bookkeeping; the lift is non-trivial because each site has different "and-do-the-maintenance" body shapes (DDL vs DELETE vs SELECT/INSERT) and different value semantics (one-shot vs daily vs per-access). The win is consolidation; the cost is a templated helper that has to be parameterised on the maintenance-body callable. Effort: medium.

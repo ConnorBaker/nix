@@ -1,6 +1,6 @@
 # libexpr extras
 
-Candidates 105-120 plus #220. Fifteen VALID; #108 and #111 PARTIALLY VALID.
+Candidates 105-120 plus #220, #229. Sixteen VALID; #108 and #111 PARTIALLY VALID.
 
 | # | Verdict | Effort |
 | - | ------- | ------ |
@@ -21,6 +21,7 @@ Candidates 105-120 plus #220. Fifteen VALID; #108 and #111 PARTIALLY VALID.
 | 119 | VALID | trivial |
 | 120 | VALID | small |
 | 220 | VALID | trivial |
+| 229 | VALID | small |
 
 ---
 
@@ -102,3 +103,7 @@ Candidates 105-120 plus #220. Fifteen VALID; #108 and #111 PARTIALLY VALID.
     - ../verified/13-libexpr-primops.md
     - **Validation:** VALID. The same helper introduced by #79 (`src/libexpr/primops/fetcher-attr-iter.hh`'s `iterateFetcherAttrs` + `FetcherAttrHandler`) covers the shape verbatim; the only deltas are the diagnostic prefix (`"addPath"` instead of a fetcher name) and the per-key handler bodies. The helper's name is fetcher-flavoured but its mechanism is general (name-keyed handler dispatch with uniform "unsupported argument" error); either reuse the helper as-is or rename to a more general `iterateNamedAttrs`. **See also:** #79 (the original migration). **Note:** the helper currently lives under `src/libexpr/primops/`, which `primops.cc` includes; no header relocation needed if the helper is reused. Effort: trivial.
     - **Branch:** `vibe-coding/cleanup/libexpr` (renamed `iterateFetcherAttrs`/`FetcherAttrHandler` → `iterateNamedAttrs`/`NamedAttrHandler` and `fetcher-attr-iter.hh` → `named-attr-iter.hh`; existing three fetcher call sites updated to the new names; `prim_path` migrated to the helper preserving wording and `.atPos(attr.pos)` semantics)
+
+229. **`SeenSet = std::set<const void *>` widening type-erases at the call boundary.** [LOW] Promoted in #110 to handle `printAmbiguous`'s pointer-keyed visited set and the analogous `getDerivations::done` set in `get-drvs.cc`. The shared alias takes `const void *`, so any caller can insert any pointer kind without compile-time enforcement. The candidate-body for #110 acknowledges this ("the only inserted key in get-drvs is `v.attrs()` which is already a `const Bindings *`, so the widening type-erases at the boundary without changing behaviour") and the new docstring on `print.hh` warns callers not to mix pointer kinds, but the type itself can no longer enforce the contract. A parameterised `template<class T> using SeenSet = std::set<const T *>;` plus per-call-site instantiations (`SeenSet<Bindings>`, `SeenSet<Value>`) preserves the consolidation while keeping each caller's element type pinned. Pre-existing oddity surfaced by Pass-B review of #110.
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** VALID. The widening was deliberate (to share the alias across two callers with different pointer kinds), but the parameterised form serves the same purpose and reinstates type safety. Migration is mechanical at each consumer. Effort: small. **See also:** #110.

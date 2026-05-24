@@ -1,8 +1,8 @@
 # Dead or stale code
 
-Candidates 48-60. All thirteen VALID. The validation pass surfaced four
-**latent bugs** in this group (#53, #54, #58, #59 — see notes). High
-concentration of trivial-effort wins.
+Candidates 48-60 plus #225 and #232. Fifteen VALID. The validation pass
+surfaced five **latent bugs** in this group (#53, #54, #58, #59, #225 —
+see notes). High concentration of trivial-effort wins.
 
 | # | Verdict | Effort |
 | - | ------- | ------ |
@@ -19,6 +19,8 @@ concentration of trivial-effort wins.
 | 58 | VALID | trivial |
 | 59 | VALID | small (latent bug) |
 | 60 | VALID | trivial |
+| 225 | VALID | medium (latent bug family) |
+| 232 | VALID | small |
 
 ---
 
@@ -89,3 +91,7 @@ concentration of trivial-effort wins.
 225. **`getUserRegistry`/`getSystemRegistry`/`getGlobalRegistry` share #53's first-call-wins memoisation pattern, with worse blast radius.** All three use the same `static auto X = Registry::read(settings, ...)` shape that #53 just removed from `getCustomRegistry`, but unlike `getCustomRegistry` (called once per `nix registry <subcmd>`) these are reached on every `lookupInRegistries()` — i.e. on every flake-resolve, lockfile-load, and `fetchTree` callsite. Worse, they capture `settings` from the **first** caller and ignore subsequent `Settings &` arguments entirely. `getGlobalRegistry` additionally captures `Store & store` from the first call. Long-lived processes (daemons, the repl, test harnesses doing multiple resolves) silently get the first call's view. Pre-existing oddity surfaced by the Pass-B review of #53. Same fix shape: drop the `static` and let each call re-load (since these are called on the lookup hot path, this may need a finer-grained cache — e.g. mtime-keyed — rather than naive removal).
     - ../verified/14-libfetchers.md
     - **Validation:** VALID — and a **latent bug** family. Same shape as #53. **Pitfall:** unlike #53, these three are on the hot path (`lookupInRegistries` is called per `fetchTree`/per-flake-resolve), so naive `static` removal trades correctness for re-parsing the registry JSON on every call. The right fix probably involves an mtime-keyed cache rather than a static-init memo. **Helper location:** any new mtime-keyed cache utility introduced for this fix belongs in **libutil**, not libfetchers — it is a pure FS-stat-keyed memo of `T(Path)` with no fetcher-specific behaviour. The existing `Cache` in `src/libfetchers/include/nix/fetchers/cache.hh` is `Attrs`-keyed with TTL semantics, not a drop-in. Effort: small per function; medium across all three because of the cache-invalidation policy decision.
+
+232. **`ignoreExceptionInDestructor` is invoked from non-destructor sites in libstore.** [LOW] After libutil #58 reclassified `getMaxCPU` (one libutil non-destructor site) to use `ignoreExceptionExceptInterrupt` instead, a tree-wide grep shows ~17 invocations of `ignoreExceptionInDestructor` across libstore alone (sites in `pathlocks.cc`, `local-store.cc`, `filetransfer.cc`, `optimise-store.cc`, `sqlite.cc` (×3), `s3-binary-cache-store.cc`, `gc.cc`, `worker-protocol-connection.cc`, `unix/build/derivation-builder.cc` (×3), `unix/build/hook-instance.cc`, `build/substitution-goal.cc`, `build/derivation-building-goal.cc`). Spot-check confirms most are genuinely in destructors (`~PathLocks` etc.) — but at least the `worker-protocol-connection.cc` site warrants verification, and the `filetransfer.cc` and `derivation-builder.cc` clusters need a per-site audit. Walk every libstore call and reclassify any that aren't called from a destructor (or destructor-equivalent — e.g. an unwinding-safe cleanup path) to `ignoreExceptionExceptInterrupt`. Pre-existing oddity surfaced by the holistic libstore reviewer in the May 2026 review pass.
+    - ../verified/05-libstore-core.md, ../verified/07-libstore-local.md
+    - **Validation:** VALID. Per-site audit; mostly mechanical conversion. The semantic difference matters: `ignoreExceptionInDestructor` swallows interrupts (because they're already-fatal in destructor context), whereas `ignoreExceptionExceptInterrupt` lets interrupts propagate (correct for non-destructor cleanup paths). The libutil branch's #58 is the precedent. **See also:** #58. Effort: small.

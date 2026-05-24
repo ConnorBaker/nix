@@ -1,6 +1,6 @@
 # Duplicated parsers / regexes
 
-Candidates 61-68. All eight VALID, with one file-path correction (#61).
+Candidates 61-68 plus #228. Nine VALID, with one file-path correction (#61).
 
 | # | Verdict | Effort |
 | - | ------- | ------ |
@@ -12,6 +12,7 @@ Candidates 61-68. All eight VALID, with one file-path correction (#61).
 | 66 | VALID | small |
 | 67 | VALID | small |
 | 68 | VALID | trivial |
+| 228 | VALID | small |
 
 ---
 
@@ -51,3 +52,7 @@ Candidates 61-68. All eight VALID, with one file-path correction (#61).
     - ../verified/13-libexpr-primops.md
     - **Validation:** VALID. Compounds with #112 (the four-times-cited issue link). Effort: trivial.
     - **Branch:** `vibe-coding/cleanup/libexpr` (`makeRoundingPrimOp(NixFloat (*)(NixFloat), const char *)` factory; both registrations preserved)
+
+228. **`prim_bitAnd` / `prim_bitOr` / `prim_bitXor` are byte-identical twins of the `primNumeric<NumOp>` family but were left out of #67's collapse.** [LOW] Adjacent to the new `primNumeric<NumOp>` template in `src/libexpr/primops.cc`, `prim_bitAnd` / `prim_bitOr` / `prim_bitXor` sit as three free functions differing only by `&`/`|`/`^`. Each forces both args via `forceInt`, applies `i1.value <op> i2.value`, and emits an int. They were not in #67's prescribed scope (which named only the four arithmetic ops with their float arm and overflow path), but the shape is the same minus the float arm and minus `valueChecked`. Extend `NumOp` with `BitAnd` / `BitOr` / `BitXor`, give each row a `firstIntCtx` / `secondIntCtx`, and let `primNumeric<Op>` handle int-only as a third arm (no float path, no overflow check). Effort: small. **See also:** #67 (the parent collapse), #105 (the related `MakeBinOp` macro family).
+    - ../verified/13-libexpr-primops.md
+    - **Validation:** VALID. The shape match is exact — three byte-identical functions with one operator differing. The third-arm extension to `primNumeric<Op>` keeps the existing four arithmetic-op rows untouched. Effort: small.
