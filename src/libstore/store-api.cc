@@ -953,6 +953,70 @@ void copyStorePath(
     dstStore.addToStore(*info, *source, repair, checkSigs);
 }
 
+namespace {
+
+/**
+ * Split a `RealisedPath::Set` into the underlying `StorePathSet` plus
+ * the bare-pointer view of the embedded `Realisation`s. Used by both
+ * `copyPaths(RealisedPath::Set)` and `copyClosure(RealisedPath::Set)`.
+ *
+ * Visiting a `Realisation` arm eagerly requires `Xp::CaDerivations`;
+ * the post-copy hook then re-registers each realisation on the
+ * destination store and tolerates `MissingExperimentalFeature{CaDerivations}`
+ * coming back from the remote.
+ */
+struct PartitionedRealisedPaths
+{
+    StorePathSet storePaths;
+    std::vector<const Realisation *> realisations;
+};
+
+PartitionedRealisedPaths partitionRealisedPaths(const RealisedPath::Set & paths)
+{
+    PartitionedRealisedPaths res;
+    for (auto & path : paths) {
+        std::visit(
+            overloaded{
+                [&](const Realisation & realisation) {
+                    experimentalFeatureSettings.require(Xp::CaDerivations);
+                    res.realisations.push_back(&realisation);
+                    res.storePaths.insert(realisation.outPath);
+                },
+                [&](const OpaquePath & op) { res.storePaths.insert(op.path); },
+            },
+            path.raw);
+    }
+    return res;
+}
+
+/**
+ * Re-register the realisations of a `RealisedPath::Set` on `dstStore`
+ * after the underlying `StorePathSet` has been copied. A
+ * `MissingExperimentalFeature{Xp::CaDerivations}` from
+ * `dstStore.registerDrvOutput` is silently dropped: the remote may
+ * not support CA derivations, and we still want the output paths
+ * copied even when realisation registration fails. Other
+ * `MissingExperimentalFeature` instances re-throw.
+ */
+void registerCopiedRealisations(
+    Store & dstStore,
+    const std::vector<const Realisation *> & realisations,
+    CheckSigsFlag checkSigs)
+{
+    try {
+        // TODO batch this
+        for (const auto * realisation : realisations)
+            dstStore.registerDrvOutput(*realisation, checkSigs);
+    } catch (MissingExperimentalFeature & e) {
+        if (e.missingFeature == Xp::CaDerivations)
+            ignoreExceptionExceptInterrupt();
+        else
+            throw;
+    }
+}
+
+} // namespace
+
 std::map<StorePath, StorePath> copyPaths(
     Store & srcStore,
     Store & dstStore,
@@ -961,37 +1025,9 @@ std::map<StorePath, StorePath> copyPaths(
     CheckSigsFlag checkSigs,
     SubstituteFlag substitute)
 {
-    StorePathSet storePaths;
-    std::vector<const Realisation *> realisations;
-    for (auto & path : paths) {
-        std::visit(
-            overloaded{
-                [&](const Realisation & realisation) {
-                    experimentalFeatureSettings.require(Xp::CaDerivations);
-                    realisations.push_back(&realisation);
-                    storePaths.insert(realisation.outPath);
-                },
-                [&](const OpaquePath & op) { storePaths.insert(op.path); },
-            },
-            path.raw);
-    }
-
-    auto pathsMap = copyPaths(srcStore, dstStore, storePaths, repair, checkSigs, substitute);
-
-    try {
-        // Copy the realisations. TODO batch this
-        for (const auto * realisation : realisations)
-            dstStore.registerDrvOutput(*realisation, checkSigs);
-    } catch (MissingExperimentalFeature & e) {
-        // Don't fail if the remote doesn't support CA derivations is it might
-        // not be within our control to change that, and we might still want
-        // to at least copy the output paths.
-        if (e.missingFeature == Xp::CaDerivations)
-            ignoreExceptionExceptInterrupt();
-        else
-            throw;
-    }
-
+    auto split = partitionRealisedPaths(paths);
+    auto pathsMap = copyPaths(srcStore, dstStore, split.storePaths, repair, checkSigs, substitute);
+    registerCopiedRealisations(dstStore, split.realisations, checkSigs);
     return pathsMap;
 }
 
@@ -1096,19 +1132,9 @@ void copyClosure(
     if (&srcStore == &dstStore)
         return;
 
-    StorePathSet closure0;
-    for (auto & path : paths) {
-        closure0.insert(path.path());
-    }
-
-    StorePathSet closure1;
-    srcStore.computeFSClosure(closure0, closure1);
-
-    RealisedPath::Set closure = paths;
-    for (auto && path : closure1)
-        closure.insert({std::move(path)});
-
-    copyPaths(srcStore, dstStore, closure, repair, checkSigs, substitute);
+    auto split = partitionRealisedPaths(paths);
+    copyClosure(srcStore, dstStore, split.storePaths, repair, checkSigs, substitute);
+    registerCopiedRealisations(dstStore, split.realisations, checkSigs);
 }
 
 void copyClosure(
