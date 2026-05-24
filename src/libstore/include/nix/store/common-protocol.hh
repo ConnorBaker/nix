@@ -36,6 +36,14 @@ struct Source;
  * Pre-checks unique to one protocol (e.g. WorkerProto's "major must
  * equal latest.major" check) stay at the caller, since their error
  * messages and conditions differ.
+ *
+ * Client-side only: server-side handshakes
+ * (`WorkerProto::BasicServerConnection::handshake`,
+ * `ServeProto::BasicServerConnection::handshake`) call bare
+ * `std::min(remoteVersion, localLatest)` instead — servers accept
+ * any client version (the client has already committed to its end
+ * of the protocol by the time the server reads its version), so
+ * the lower-bound check is the wrong shape there.
  */
 template<class VersionT>
 inline VersionT negotiateVersion(

@@ -25,11 +25,9 @@ struct WorkerProto::BasicConnection
 
     /**
      * Coercion to `WorkerProto::ReadConn`. This makes it easy to use the
-     * factored out serve protocol serializers with a
-     * `LegacySSHStore::Connection`.
-     *
-     * The serve protocol connection types are unidirectional, unlike
-     * this type.
+     * factored out worker protocol serializers (which take a
+     * `WorkerProto::ReadConn` rather than a full `BasicConnection`)
+     * with this bidirectional connection type.
      */
     operator WorkerProto::ReadConn()
     {
@@ -41,11 +39,9 @@ struct WorkerProto::BasicConnection
 
     /**
      * Coercion to `WorkerProto::WriteConn`. This makes it easy to use the
-     * factored out serve protocol serializers with a
-     * `LegacySSHStore::Connection`.
-     *
-     * The serve protocol connection types are unidirectional, unlike
-     * this type.
+     * factored out worker protocol serializers (which take a
+     * `WorkerProto::WriteConn` rather than a full `BasicConnection`)
+     * with this bidirectional connection type.
      */
     operator WorkerProto::WriteConn()
     {
