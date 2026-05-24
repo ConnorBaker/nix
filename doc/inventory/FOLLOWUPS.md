@@ -143,13 +143,13 @@ for user-visible behaviour changes that didn't get release notes.
 
 ### In-source comment fixes
 
-- [ ] **libexpr** `lexer.l:105-107` says "If this regex changes,
+- [x] ~~**libexpr** `lexer.l:105-107` says "If this regex changes,
   update `nix::isVarName` in src/libexpr/print.cc to match — it
   is the print-side mirror of this rule …". After #109, the
   canonical declaration with the lexer-mirror invariant lives in
   `src/libexpr/include/nix/expr/print.hh`. Retarget the pinning
-  comment from `print.cc` to `print.hh`.
-- [ ] **libstore** `worker-protocol-connection.hh` — both
+  comment from `print.cc` to `print.hh`.~~ Done in `2064c3a35`.
+- [x] ~~**libstore** `worker-protocol-connection.hh` — both
   `operator WorkerProto::ReadConn()` and
   `operator WorkerProto::WriteConn()` doxygen blocks read
   "easy to use the factored out **serve protocol** serializers
@@ -159,46 +159,57 @@ for user-visible behaviour changes that didn't get release notes.
   Worker docstring also claims "The serve protocol connection
   types are unidirectional, unlike this type" — same problem.
   Replace "serve" → "worker" (and verify the unidirectional
-  claim against the post-#185 code).
-- [ ] **libstore** `common-protocol.hh` — `negotiateVersion`
+  claim against the post-#185 code).~~ Done in `3123c3c9f`.
+  The unidirectional-claim sentence was rewritten to refer to
+  "this bidirectional connection type" since the prior framing
+  was load-bearingly tied to the wrong-shard claim.
+- [x] ~~**libstore** `common-protocol.hh` — `negotiateVersion`
   helper documents the `localMin` lower-bound but doesn't
   explain why the server-side handshakes
   (`worker-protocol-connection.cc:201`,
   `serve-protocol-connection.cc:33`) call bare `std::min`
   instead. Add one sentence explaining "servers accept any
-  client version and don't need the lower-bound check".
-- [ ] **libfetchers** `github.cc:328-329` FIXME ("we may want
+  client version and don't need the lower-bound check".~~
+  Done in `3123c3c9f` (same commit as the worker-coercion fix).
+- [x] ~~**libfetchers** `github.cc:328-329` FIXME ("we may want
   to require a Git tree hash instead of a NAR hash") is mildly
   orphaned by #51's deletion of the `RefInfo::treeHash`
   scaffolding. Comment isn't wrong, but a reader walking via
   `git blame` finds no obvious starting point. If the FIXME
   region is touched in any future commit, append "(an earlier
   scaffolding for this was removed in #51 as it never wired
-  up the upstream-tree-hash lookup)".
+  up the upstream-tree-hash lookup)".~~ Deferred per the
+  reviewer's own conditional framing ("if the FIXME region is
+  touched"). Editing only the FIXME annotation would be the
+  sole touch on libfetchers' source for this batch — borderline
+  cost-benefit. The next code change in the region picks it up.
 
 ### rl-next entries
 
-- [ ] **libmain** `--max-freed` user-visible behaviour change
+- [x] ~~**libmain** `--max-freed` user-visible behaviour change
   (#222): previously `--max-freed -1` silently disabled the cap;
   now errors at parse. Values above `INT64_MAX` previously
   silently disabled; now honoured up to `UINT64_MAX`. Affects
   both `nix-store --gc --max-freed` and `nix-collect-garbage
   --max-freed`. Add `doc/manual/rl-next/max-freed-clamp.md` (or
-  similar) on the libmain cleanup branch.
-- [ ] **libfetchers** `treeHash` attribute now rejected by
+  similar) on the libmain cleanup branch.~~ Done in `0b66d94ce`
+  as `doc/manual/rl-next/max-freed-clamp.md`.
+- [x] ~~**libfetchers** `treeHash` attribute now rejected by
   `allowedAttrs` enforcement on github/gitlab/sourcehut inputs
   (#51). Previously silently accepted and ignored; now throws
   on parse. Extend the existing
   `doc/manual/rl-next/github-fetcher-param-validation.md` (which
   already documents `tag` rejection) with one line covering
-  `treeHash`.
-- [ ] **libexpr** diagnostic position + ANSI colouring shift
+  `treeHash`.~~ Done in `d1a856c3f`.
+- [x] ~~**libexpr** diagnostic position + ANSI colouring shift
   across `prim_path` (#220) and the four fetcher primops
   migrated under #79. Diagnostics previously anchored at the
   call site; now anchor at the offending attribute. Primop name
   ANSI rendering also shifted from baked-into-format-string to
   `'%s'` interpolation. Add an rl-next entry covering the four
-  primops and the diagnostic-position promise.
+  primops and the diagnostic-position promise.~~ Done in
+  `2064c3a35` as
+  `doc/manual/rl-next/primop-diagnostic-position.md`.
 
 ---
 
