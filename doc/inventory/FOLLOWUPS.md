@@ -337,28 +337,107 @@ commit with full A/B/C/D review chain. Deferred until A-D are
 clean and the relevant new candidates (#227, #228, #229) have
 catalog entries.
 
-- [ ] **#227 implementation** — drop the dead `EvalProfiler`
-  NVI cache infrastructure (libexpr).
-- [ ] **#228 implementation** — extend `NumOp` enum to bit ops,
-  collapse `prim_bitAnd`/`prim_bitOr`/`prim_bitXor` (libexpr).
-- [ ] **#229 implementation** — parameterise `SeenSet` template
-  alias (libexpr).
+- [x] ~~**#227 implementation** — drop the dead `EvalProfiler`
+  NVI cache infrastructure (libexpr).~~ Landed as
+  `c199262e4` on `vibe-coding/cleanup/libexpr`. Drops the
+  cache field, renames `getNeededHooksImpl` → `getNeededHooks`,
+  marks all three hooks pure. Public-API tightening; rl-next
+  entry already covers it under #204.
+- [x] ~~**#228 implementation** — extend `NumOp` enum to bit ops,
+  collapse `prim_bitAnd`/`prim_bitOr`/`prim_bitXor` (libexpr).~~
+  Landed as `8ffe04cd1`. `NumOp` extended with
+  `BitAnd`/`BitOr`/`BitXor`; `primNumeric` gets an `isIntOnly<Op>`
+  arm. Three free functions deleted; their `RegisterPrimOp`
+  blocks now point at `primNumeric<NumOp::Bit*>`. Error wording
+  preserved byte-for-byte.
+- [x] ~~**#229 implementation** — parameterise `SeenSet` template
+  alias (libexpr).~~ Landed as `59cae92f8`. Added
+  `template<class T> using TypedSeenSet = std::set<const T *>;`
+  alongside the existing `SeenSet` (now an alias for
+  `TypedSeenSet<void>`). `EvalState::forceValueDeep` migrated
+  to `TypedSeenSet<Value>`; `getDerivations`'s `Done` migrated
+  to `TypedSeenSet<Bindings>`. The mixed-pointer-kind printer
+  consumers stay on the void-typed alias since they
+  legitimately mix `Bindings *` and `Value *`. Templated
+  `dedupe` overload added; void-typed compatibility overload
+  preserved.
 - [ ] **Cross-shard #167 extension** — migrate
-  `local-store.cc:1173` (`addToStoreFromDump` chunk) and
-  `derivations.cc:643` (`Derivation::unparse` reservation) to
-  use `kDefaultIOBlockSize` from libutil's
-  `io-buffer-sizes.hh`. Lands on the libstore cleanup branch
-  as a new commit. **See also:** #167.
-- [ ] **Cross-shard #124 extension** — migrate `daemon.cc:1110`
-  (`tunnelLogger->state_.lock()->canSendStderr` — pure read)
-  and `daemon.cc:1122` (`assert(!…canSendStderr)` — pure read)
+  `local-store.cc::addToStoreFromDump`'s chunk size and
+  `derivations.cc::Derivation::unparse`'s string reservation
+  to use `kDefaultIOBlockSize` from libutil's
+  `io-buffer-sizes.hh`. **Blocked on libutil landing upstream.**
+  Implementation attempted in this batch and reverted: the
+  libstore cleanup branch builds against upstream master's
+  installed nix-util headers, where `io-buffer-sizes.hh` does
+  not yet exist. Two paths to unblock:
+  (a) wait for the libutil cleanup branch (tip `2c9005abe`)
+  to land upstream, then implement this on libstore;
+  (b) rebase the libstore cleanup branch onto a worktree
+  that has libutil's changes available — invasive and changes
+  the merge story. (a) is the documented pattern. **See also:**
+  #167.
+- [ ] **Cross-shard #124 extension** — migrate `daemon.cc`'s two
+  read-only `tunnelLogger->state_.lock()->canSendStderr` sites
   from `lock()` to `readLock()` to express read-only intent
-  via the new `Sync<T>::ConstLock` type. Lands on the libstore
-  cleanup branch. Survey other libstore `lock()` sites for
-  similar read-only opportunities while there. **See also:**
-  #124.
+  via the new `Sync<T>::ConstLock` type. **Blocked on libutil
+  landing upstream** for the same reason as the #167 extension:
+  the libstore cleanup branch builds against upstream master's
+  `sync.hh`, which doesn't yet have `ConstLock`. Land after
+  libutil merges. While doing this, also survey other libstore
+  `lock()` call sites for similar read-only opportunities.
+  **See also:** #124.
 
 ---
+
+## Batch F — clang-tidy regression check + boost-flat container audit
+
+Added after Batch E's libexpr commits to verify no new clang-tidy
+errors in changed files and to audit data-structure choices.
+Sequential per shard (clang-tidy on parallel worktrees overloads the
+host).
+
+- [x] ~~**Run clang-tidy sequentially on every shard with new commits**
+  via `nix develop <worktree> --command ninja -C build clang-tidy`.
+  Compare against the post-Batch-A baseline (5 known pre-existing
+  master errors: 4× rapidcheck/Gen.hpp, 1× libcmd/network-proxy.cc).
+  Any new error in changed files needs to be fixed before landing.
+  Shards to check: libexpr (3 new Batch-E commits), libstore (1
+  new Batch-C commit), libutil (1 Batch-A docblock amend),
+  libmain (1 new Batch-C commit), libfetchers (1 new Batch-C
+  commit). libflake and nix-cli had only Batch-A rebases, no
+  new commits, so the prior clean clang-tidy still holds.~~ Done.
+  All seven shards exhibit exactly five errors — the same five
+  pre-existing master errors. **No clang-tidy regressions across
+  Batches A through E.**
+- [x] ~~**Audit data-structure choices in changed files.** Strong
+  project preference: `boost::unordered_flat_map`/`unordered_flat_set`
+  (and the flat-tree containers) over STL `std::map`/`std::set`/
+  `std::unordered_map`/`std::unordered_set`. Walk every Batch-E
+  diff (in particular #229's `TypedSeenSet = std::set<...>`
+  alias and #228's `NumOpDiag` table — though `NumOpDiag` is
+  not a container) and flag any STL container that should
+  switch. Note: `std::set` for a "seen pointers" cycle-break
+  set has different cost characteristics from `boost::unordered_flat_set`
+  (deterministic iteration order vs. faster lookup); call out
+  the trade-off rather than blindly switching.~~ Done.
+  **#229's `TypedSeenSet` migrated to
+  `boost::unordered_flat_set<const T *>`** in the same commit
+  (now `76b6808f0`). Every in-tree consumer uses the set only as
+  a membership probe via `dedupe`, so the deterministic-iteration
+  property of `std::set` was unused; the flat-set form gives
+  amortised-O(1) lookup with locality-friendly memory layout for
+  the two hot recursive walkers (`getDerivations`'s `Done` and
+  `forceValueDeep`'s `seen`). **Other newly-added STL containers
+  audited and kept**: libstore wire-format `std::set<StoreReference>`
+  / `std::map<OutputName, UnkeyedRealisation>` / `std::set<Signature>`
+  are wire-format types (deterministic iteration is load-bearing
+  for stable rendering). libflake's `std::set<NodeRefT>` was
+  introduced by the prior #78 helper, predates this batch, and
+  is appropriately tagged as DFS-visited; can swap in a future
+  pass but not in scope for Batch F. Pre-existing libexpr
+  `std::map<FrameStack, uint32_t>` (eval-profiler.cc) and
+  `std::map<const Hash, ref<EvalCache>>` (eval.hh) were not
+  modified by Batch E and are out of scope.
 
 ## Batch tracking / sequencing
 
@@ -371,6 +450,7 @@ catalog entries.
 - **E after A-D.** Implementation work needs the catalog
   entries (#227-#233) in place so commits can `Refs candidate`
   them.
+- **F after E.** Verification of Batch-E correctness.
 
 Push policy unchanged: explicit-only, per-commit. None of the
 batches push automatically.
