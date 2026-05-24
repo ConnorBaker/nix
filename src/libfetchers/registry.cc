@@ -120,9 +120,8 @@ std::shared_ptr<Registry> getUserRegistry(const Settings & settings)
 
 std::shared_ptr<Registry> getCustomRegistry(const Settings & settings, const std::filesystem::path & p)
 {
-    static auto customRegistry = Registry::read(
+    return Registry::read(
         settings, SourcePath{getFSSourceAccessor(), CanonPath{p.string()}}.resolveSymlinks(), Registry::Custom);
-    return customRegistry;
 }
 
 std::shared_ptr<Registry> getFlagRegistry()
