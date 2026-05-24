@@ -43,8 +43,11 @@ public:
 /**
  * `EvalError` is the base class for almost all errors that occur during evaluation.
  *
- * All instances of `EvalError` should show a degree of purity that allows them to be
- * cached in pure mode. This means that they should not depend on the configuration or the overall environment.
+ * The hierarchy distinguishes user-expression errors (catchable as
+ * `EvalError`) from environmental errors (`IFDError`,
+ * `RecoverableEvalError`, `StackOverflowError`, which inherit
+ * `EvalBaseError` directly). Callers that handle one but not the
+ * other rely on this split.
  */
 MakeError(EvalError, EvalBaseError);
 MakeError(ParseError, Error);
@@ -58,8 +61,8 @@ MakeError(InfiniteRecursionError, EvalError);
 
 /**
  * Resource exhaustion error when evaluation exceeds max-call-depth.
- * Inherits from EvalBaseError (not EvalError) because resource exhaustion
- * should not be cached.
+ * Inherits from `EvalBaseError` rather than `EvalError` so it is not
+ * caught as a user-expression error (see `EvalError` above).
  */
 struct StackOverflowError : public CloneableError<StackOverflowError, EvalBaseError>
 {
@@ -73,9 +76,8 @@ MakeError(IFDError, EvalBaseError);
 
 /**
  * An evaluation error which should be retried instead of rethrown.
- *
- * A RecoverableEvalError is not an EvalError, because we shouldn't cache it in
- * the eval cache, as it should be retried anyway.
+ * Inherits from `EvalBaseError` rather than `EvalError` so it is not
+ * caught as a user-expression error (see `EvalError` above).
  */
 MakeError(RecoverableEvalError, EvalBaseError);
 

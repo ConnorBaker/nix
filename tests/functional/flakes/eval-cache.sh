@@ -38,13 +38,14 @@ git -C "$flake1Dir" commit -m "Init"
 expect 1 nix build "$flake1Dir#foo.bar" 2>&1 | grepQuiet 'error: breaks'
 expect 1 nix build "$flake1Dir#foo.bar" 2>&1 | grepQuiet 'error: breaks'
 
-# Stack overflow error must not be cached
+# Stack overflow: fails at depth 50, then succeeds at the default limit.
+# The eval cache does not memoise failures, so the second call re-evaluates.
 expect 1 nix build --max-call-depth 50 "$flake1Dir#stack-depth" 2>&1 \
   | grepQuiet 'error: stack overflow; max-call-depth exceeded'
-# If the SO is cached, the following invocation will produce a cached failure; we expect it to succeed
 nix build --no-link "$flake1Dir#stack-depth"
 
-# Conditional error should not be cached
+# IFD: fails with allow-import-from-derivation disabled, then succeeds with
+# it enabled. Same fail-then-succeed shape via re-evaluation.
 expect 1 nix build "$flake1Dir#ifd" --option allow-import-from-derivation false 2>&1 \
   | grepQuiet 'error: cannot build .* during evaluation because the option '\''allow-import-from-derivation'\'' is disabled'
 nix build --no-link "$flake1Dir#ifd"

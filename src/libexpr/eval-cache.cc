@@ -10,28 +10,6 @@
 
 namespace nix::eval_cache {
 
-CachedEvalError::CachedEvalError(ref<AttrCursor> cursor, Symbol attr)
-    : CloneableError(cursor->root->state, "cached failure of attribute '%s'", cursor->getAttrPathStr(attr))
-    , cursor(cursor)
-    , attr(attr)
-{
-}
-
-void CachedEvalError::force()
-{
-    auto & v = cursor->forceValue();
-
-    if (v.type() == nAttrs) {
-        auto a = v.attrs()->get(this->attr);
-
-        state.forceValue(*a->value, a->pos);
-    }
-
-    // Shouldn't happen.
-    throw EvalError(
-        state, "evaluation of cached failed attribute '%s' unexpectedly succeeded", cursor->getAttrPathStr(attr));
-}
-
 static const char * schema = R"sql(
 create table if not exists Attributes (
     parent      integer not null,
@@ -70,7 +48,7 @@ struct AttrDb
     {
         auto state(_state->lock());
 
-        auto cacheDir = getCacheDir() / "eval-cache-v6";
+        auto cacheDir = getCacheDir() / "eval-cache-v7";
         createDirs(cacheDir);
 
         auto dbPath = cacheDir / (fingerprint.to_string(HashFormat::Base16, false) + ".sqlite");
@@ -106,16 +84,17 @@ struct AttrDb
     }
 
     template<typename F>
-    AttrId doSQLite(const F & fun)
+    auto doSQLite(const F & fun) -> decltype(fun())
     {
+        using R = decltype(fun());
         if (failed)
-            return 0;
+            return R{};
         try {
             return fun();
         } catch (SQLiteError &) {
             ignoreExceptionExceptInterrupt();
             failed = true;
-            return 0;
+            return R{};
         }
     }
 
@@ -229,61 +208,50 @@ struct AttrDb
         });
     }
 
-    AttrId setFailed(AttrKey key)
-    {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::Failed) (0, false).exec();
-
-            return state->db.getLastInsertedRowId();
-        });
-    }
-
     std::optional<std::pair<AttrId, AttrValue>> getAttr(AttrKey key)
     {
-        auto state(_state->lock());
+        return doSQLite([&]() -> std::optional<std::pair<AttrId, AttrValue>> {
+            auto state(_state->lock());
 
-        auto queryAttribute(state->queryAttribute.use()(key.first)(symbols[key.second]));
-        if (!queryAttribute.next())
-            return {};
+            auto queryAttribute(state->queryAttribute.use()(key.first)(symbols[key.second]));
+            if (!queryAttribute.next())
+                return std::nullopt;
 
-        auto rowId = (AttrId) queryAttribute.getInt(0);
-        auto type = (AttrType) queryAttribute.getInt(1);
+            auto rowId = (AttrId) queryAttribute.getInt(0);
+            auto type = (AttrType) queryAttribute.getInt(1);
 
-        switch (type) {
-        case AttrType::Placeholder:
-            return {{rowId, placeholder_t()}};
-        case AttrType::FullAttrs: {
-            // FIXME: expensive, should separate this out.
-            std::vector<Symbol> attrs;
-            auto queryAttributes(state->queryAttributes.use()(rowId));
-            while (queryAttributes.next())
-                attrs.emplace_back(symbols.create(queryAttributes.getStr(0)));
-            return {{rowId, attrs}};
-        }
-        case AttrType::String: {
-            NixStringContext context;
-            if (!queryAttribute.isNull(3))
-                for (auto & s : tokenizeString<std::vector<std::string>>(queryAttribute.getStr(3), " "))
-                    context.insert(NixStringContextElem::parse(s));
-            return {{rowId, string_t{queryAttribute.getStr(2), context}}};
-        }
-        case AttrType::Bool:
-            return {{rowId, queryAttribute.getInt(2) != 0}};
-        case AttrType::Int:
-            return {{rowId, int_t{NixInt{queryAttribute.getInt(2)}}}};
-        case AttrType::ListOfStrings:
-            return {{rowId, tokenizeString<std::vector<std::string>>(queryAttribute.getStr(2), "\t")}};
-        case AttrType::Missing:
-            return {{rowId, missing_t()}};
-        case AttrType::Misc:
-            return {{rowId, misc_t()}};
-        case AttrType::Failed:
-            return {{rowId, failed_t()}};
-        default:
-            throw Error("unexpected type in evaluation cache");
-        }
+            switch (type) {
+            case AttrType::Placeholder:
+                return {{rowId, placeholder_t()}};
+            case AttrType::FullAttrs: {
+                // FIXME: expensive, should separate this out.
+                std::vector<Symbol> attrs;
+                auto queryAttributes(state->queryAttributes.use()(rowId));
+                while (queryAttributes.next())
+                    attrs.emplace_back(symbols.create(queryAttributes.getStr(0)));
+                return {{rowId, attrs}};
+            }
+            case AttrType::String: {
+                NixStringContext context;
+                if (!queryAttribute.isNull(3))
+                    for (auto & s : tokenizeString<std::vector<std::string>>(queryAttribute.getStr(3), " "))
+                        context.insert(NixStringContextElem::parse(s));
+                return {{rowId, string_t{queryAttribute.getStr(2), context}}};
+            }
+            case AttrType::Bool:
+                return {{rowId, queryAttribute.getInt(2) != 0}};
+            case AttrType::Int:
+                return {{rowId, int_t{NixInt{queryAttribute.getInt(2)}}}};
+            case AttrType::ListOfStrings:
+                return {{rowId, tokenizeString<std::vector<std::string>>(queryAttribute.getStr(2), "\t")}};
+            case AttrType::Missing:
+                return {{rowId, missing_t()}};
+            case AttrType::Misc:
+                return {{rowId, misc_t()}};
+            default:
+                throw Error("unexpected type in evaluation cache");
+            }
+        });
     }
 };
 
@@ -335,7 +303,8 @@ AttrKey AttrCursor::getKey()
         return {0, root->state.s.epsilon};
     if (!parent->first->cachedValue) {
         parent->first->cachedValue = root->db->getAttr(parent->first->getKey());
-        assert(parent->first->cachedValue);
+        if (!parent->first->cachedValue)
+            throw Error("evaluation cache lookup for parent of '%s' failed", getAttrPathStr());
     }
     return {parent->first->cachedValue->first, parent->second};
 }
@@ -360,8 +329,6 @@ void AttrCursor::fetchCachedValue()
 {
     if (!cachedValue)
         cachedValue = root->db->getAttr(getKey());
-    if (cachedValue && std::get_if<failed_t>(&cachedValue->second) && parent)
-        throw CachedEvalError(parent->first, parent->second);
 }
 
 AttrPath AttrCursor::getAttrPath() const
@@ -397,14 +364,7 @@ Value & AttrCursor::forceValue()
 
     auto & v = getValue();
 
-    try {
-        root->state.forceValue(v, noPos);
-    } catch (EvalError &) {
-        debug("setting '%s' to failed", getAttrPathStr());
-        if (root->db)
-            cachedValue = {root->db->setFailed(getKey()), failed_t()};
-        throw;
-    }
+    root->state.forceValue(v, noPos);
 
     if (root->db && (!cachedValue || std::get_if<placeholder_t>(&cachedValue->second))) {
         if (v.type() == nString)
@@ -451,8 +411,6 @@ std::shared_ptr<AttrCursor> AttrCursor::maybeGetAttr(Symbol name)
                 if (attr) {
                     if (std::get_if<missing_t>(&attr->second))
                         return nullptr;
-                    else if (std::get_if<failed_t>(&attr->second))
-                        throw CachedEvalError(ref(shared_from_this()), name);
                     else
                         return std::make_shared<AttrCursor>(
                             root, std::make_pair(ref(shared_from_this()), name), nullptr, std::move(attr));
