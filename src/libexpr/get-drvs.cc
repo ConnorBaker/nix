@@ -313,10 +313,10 @@ void PackageInfo::setMeta(const std::string & name, Value * v)
     meta = attrs.finish();
 }
 
-/* Cache for already considered attrsets. Keys are `Bindings *` here, but the
-   shared `SeenSet` alias type-erases to `const void *` so other recursive
-   walkers can use the same helper. */
-using Done = SeenSet;
+/* Cache for already considered attrsets. The pointer kind is fixed to
+   `Bindings *` via `TypedSeenSet<Bindings>`; nothing in this walker
+   visits raw `Value *`s. */
+using Done = TypedSeenSet<Bindings>;
 
 /* Evaluate value `v'.  If it evaluates to a set of type `derivation',
    then put information about it in `drvs' (unless it's already in `done').

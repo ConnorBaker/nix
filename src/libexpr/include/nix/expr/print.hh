@@ -8,7 +8,8 @@
  */
 
 #include <iostream>
-#include <set>
+
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include "nix/util/fmt.hh"
 #include "nix/expr/value/context.hh"
@@ -16,24 +17,51 @@
 
 namespace nix {
 
+class Bindings;
 class EvalState;
 struct Value;
 
 /**
  * A pointer-keyed "already seen" set used by recursive value/attrset
- * walkers to break cycles and de-duplicate visits. Elements are typically
- * `const Bindings *` or `const Value *` pointers.
+ * walkers to break cycles and de-duplicate visits.
  *
- * Each call site should only insert one of the two pointer kinds — the set
- * is type-erased to `const void *` so a `Bindings *` and a `Value *` could
- * in principle collide on identity, but no in-tree caller mixes them.
+ * `TypedSeenSet<T>` pins the element pointer type so each call site
+ * declares which pointer kind it visits. `SeenSet` is the
+ * compatibility alias for walkers that legitimately mix two pointer
+ * kinds in the same set (the value-printer family visits attrsets
+ * through `v.attrs()` and lists through `&v`); it is `TypedSeenSet<void>`.
+ *
+ *   - `TypedSeenSet<Value>` for walkers that visit only `Value` nodes
+ *     (e.g. `EvalState::forceValueDeep`).
+ *   - `TypedSeenSet<Bindings>` for walkers that visit only attrset
+ *     bodies (e.g. `getDerivations`'s `Done` alias).
+ *   - `SeenSet` (alias for `TypedSeenSet<void>`) for walkers that mix
+ *     the two pointer kinds in one set.
+ *
+ * Backed by `boost::unordered_flat_set` for amortised-O(1) insert/lookup
+ * and locality-friendly memory layout. Iteration order is unspecified
+ * — every in-tree consumer uses the set only as a membership probe,
+ * never iterates it.
  */
-using SeenSet = std::set<const void *>;
+template<class T>
+using TypedSeenSet = boost::unordered_flat_set<const T *>;
+
+using SeenSet = TypedSeenSet<void>;
 
 /**
  * Try to record `p` in `seen`. Returns `true` if `p` was newly inserted,
- * `false` if it was already present.
+ * `false` if it was already present. The template parameter follows
+ * `seen`'s element type so callers can `dedupe(seen, &v)` without
+ * having to spell out the pointer kind.
  */
+template<class T>
+inline bool dedupe(TypedSeenSet<T> & seen, const T * p)
+{
+    return seen.insert(p).second;
+}
+
+/* The void-typed compatibility overload accepts any pointer kind via
+   implicit conversion to `const void *`, matching the original API. */
 inline bool dedupe(SeenSet & seen, const void * p)
 {
     return seen.insert(p).second;
