@@ -45,10 +45,7 @@ std::string getArg(const std::string & opt, Strings::iterator & i, const Strings
 template<class N>
 N getIntArg(const std::string & opt, Strings::iterator & i, const Strings::iterator & end)
 {
-    ++i;
-    if (i == end)
-        throw UsageError("'%1%' requires an argument", opt);
-    return string2IntWithUnitPrefix<N>(*i);
+    return string2IntWithUnitPrefix<N>(getArg(opt, i, end));
 }
 
 struct LegacyArgs : public MixCommonArgs, public RootArgs
