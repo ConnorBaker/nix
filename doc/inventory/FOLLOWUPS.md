@@ -23,51 +23,55 @@ Commit-body and orphan-ref fixes on the seven cleanup branches. All
 land via `git rebase -i` per shard. Self-contained; no behavioural
 change to any code; safe to run independently.
 
-- [ ] **libexpr** `437eea9d0` — orphan commit. Body has no
+- [x] ~~**libexpr** `437eea9d0` — orphan commit. Body has no
   `Refs candidate` line. Candidate #217 (in
   `21-eval-core-evalstate-value.md`) explicitly names the duplicate
   `friend struct ExprVar` decl this commit removes, and the catalog
   Branch line ascribes the work to `vibe-coding/cleanup/libexpr`.
-  Amend the body to include `Refs candidate #217.`
-- [ ] **libstore** `5f5b8151e` — orphan commit. Body claims
+  Amend the body to include `Refs candidate #217.`~~ Done; new SHA
+  `bfc3c23a1c2` (libexpr tip `380b33252`).
+- [x] ~~**libstore** `5f5b8151e` — orphan commit. Body claims
   to address #54+#56+#57+#60 per STATUS.md (the bidirectional
   audit), but `git log -1 --format=%B` shows no `Refs candidate`
   line in the actual commit message. STATUS asserts a prior amend
   pass fixed this; the fix appears lost across a later rebase.
-  Amend with `Refs candidate #54 + #56 + #57 + #60.`
-- [ ] **libstore** `3a9406f58` body — references the
+  Amend with `Refs candidate #54 + #56 + #57 + #60.`~~ Done;
+  new libstore tip `e2d92cbe0`.
+- [x] ~~**libstore** `3a9406f58` body — references the
   `swallowMissingCaDerivations = true` parameter on
   `registerCopiedRealisations`. Pass-B dropped that parameter
   (the toggle was dead surface; no caller passed `false`) but the
   commit body wasn't reflowed. Amend the body to remove the
-  parameter mention; the swallow is now unconditional.
-- [ ] **nix-cli** `92df34fb2` body — says "prefetch.cc deferred to
+  parameter mention; the swallow is now unconditional.~~ Done.
+- [x] ~~**nix-cli** `92df34fb2` body — says "prefetch.cc deferred to
   #95", but the diff actually converts `main_nix_prefetch_url`'s
   `MyArgs` to `LegacyEvalArgs`. Two consequences: the commit body
   factually misstates its own diff, and #95's remaining scope
   shrinks (only the `compatNixHash` / `parseCmdLine` shim remains).
   Amend body to read e.g. *"all four legacy entry points
   converted; #95's remaining scope is the `compatNixHash` /
-  `parseCmdLine` shim only."*
-- [ ] **libutil** `e3c18fe5a` body — uses `kCompressionOutBufSize`,
+  `parseCmdLine` shim only."*~~ Done; new nix-cli tip `2a34c3148`.
+- [x] ~~**libutil** `e3c18fe5a` body — uses `kCompressionOutBufSize`,
   the constant name that existed mid-Pass-B before being renamed
   to `kBufferedStreamSize`. Same body says "Four sites" while the
   diff stat shows six. Re-flow body to use the post-rename name
-  and the post-Pass-B count of six migrated sites.
-- [ ] **libutil** `d7e3fdc6d` body — says "Migrate the single
+  and the post-Pass-B count of six migrated sites.~~ Done; new
+  SHA `03a269a0a`.
+- [x] ~~**libutil** `d7e3fdc6d` body — says "Migrate the single
   existing call site in nar-listing.cc" but the diff migrates
   four (`nar-listing.cc`, `canon-path.cc::fromFilename`,
   `unix/file-system-at.cc`, `windows/file-system-at.cc`).
   Re-flow body to list all four sites and note that whole-tree
-  `std::ranges::distance` over CanonPath now has zero hits.
-- [ ] **libutil** `io-buffer-sizes.hh` docblock for
+  `std::ranges::distance` over CanonPath now has zero hits.~~
+  Done; new libutil tip `2c9005abe`.
+- [x] ~~**libutil** `io-buffer-sizes.hh` docblock for
   `kDefaultIOBlockSize` lists 2 of 6 actual users (says
   "`Source::drainInto` and `tarfile.cc`'s default libarchive
   read/write buffer"; missing `file-system.cc::writeFile`,
   `file-descriptor.cc::drainFD`, `file-descriptor.cc::copyFdRange`,
   and the second `tarfile.cc` ctor). Amend the docblock; lands on
   the libutil cleanup branch as part of the same commit-body
-  reflow above.
+  reflow above.~~ Done; folded into the same #167 amend.
 
 ---
 
