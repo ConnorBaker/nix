@@ -18,6 +18,16 @@ struct Settings : public Config
 {
     Settings();
 
+    /**
+     * Append the flake-related primops (`getFlake`, `parseFlakeRef`,
+     * `flakeRefToString`) to `evalSettings.extraPrimOps`. Existing
+     * entries are preserved.
+     *
+     * `getFlake` captures `*this` by reference, so this `flake::Settings`
+     * instance must outlive any `EvalState` constructed from
+     * `evalSettings` afterwards. (`parseFlakeRef` and `flakeRefToString`
+     * are stateless and do not capture.)
+     */
     void configureEvalSettings(nix::EvalSettings & evalSettings) const;
 
     Setting<bool> useRegistries{
