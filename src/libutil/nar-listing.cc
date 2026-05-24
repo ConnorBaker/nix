@@ -54,11 +54,7 @@ NarListing parseNarListing(Source & source)
 
         NarListing & createMember(const CanonPath & path, NarListing member)
         {
-            size_t level = 0;
-            for (auto _ : path) {
-                (void) _;
-                ++level;
-            }
+            size_t level = path.numSegments();
 
             while (parents.size() > level)
                 parents.pop();

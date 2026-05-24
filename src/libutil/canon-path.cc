@@ -28,7 +28,7 @@ CanonPath CanonPath::fromFilename(std::string_view segment)
     auto res = CanonPath(segment);
     /* Use existing canonicalisation logic for CanonPath to check that the segment
        is already a valid filename. */
-    if (segment != res.rel() || std::ranges::distance(res) != 1)
+    if (segment != res.rel() || res.numSegments() != 1)
         throw BadCanonPath("invalid filename '%s'", segment);
     return res;
 }

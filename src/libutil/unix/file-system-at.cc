@@ -148,7 +148,7 @@ static AutoCloseFD openFileEnsureBeneathNoSymlinksIterative(
     std::function<void(AutoCloseFD dirFd, CanonPath relPath)> dirFdCallback)
 {
     AutoCloseFD parentFd;
-    auto nrComponents = std::ranges::distance(path);
+    auto nrComponents = path.numSegments();
     assert(nrComponents >= 1);
     auto components = std::views::take(path, nrComponents - 1); /* Everything but last component */
     auto getParentFd = [&]() { return parentFd ? parentFd.get() : dirFd; };

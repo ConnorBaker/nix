@@ -241,7 +241,7 @@ AutoCloseFD openFileEnsureBeneathNoSymlinks(
     assert(!path.rel().starts_with('/')); /* Just in case the invariant is somehow broken. */
 
     AutoCloseFD parentFd;
-    auto nrComponents = std::ranges::distance(path);
+    auto nrComponents = path.numSegments();
     assert(nrComponents >= 1);
     auto components = std::views::take(path, nrComponents - 1); /* Everything but last component */
     auto getParentFd = [&]() { return parentFd ? parentFd.get() : dirFd; };

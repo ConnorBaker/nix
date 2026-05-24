@@ -104,6 +104,14 @@ TEST(CanonPath, removePrefix)
     ASSERT_EQ(p1.removePrefix(CanonPath("/")).abs(), "/foo/bar");
 }
 
+TEST(CanonPath, numSegments)
+{
+    ASSERT_EQ(CanonPath("/").numSegments(), 0u);
+    ASSERT_EQ(CanonPath("/foo").numSegments(), 1u);
+    ASSERT_EQ(CanonPath("/foo/bar").numSegments(), 2u);
+    ASSERT_EQ(CanonPath("a//foo/bar//").numSegments(), 3u);
+}
+
 TEST(CanonPath, iter)
 {
     {

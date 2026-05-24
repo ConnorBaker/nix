@@ -2,6 +2,7 @@
 ///@file
 
 #include "nix/util/error.hh"
+#include <algorithm>
 #include <string>
 #include <optional>
 #include <cassert>
@@ -90,6 +91,21 @@ public:
     bool isRoot() const
     {
         return path.size() <= 1;
+    }
+
+    /**
+     * Number of path segments. The root has zero segments; every
+     * non-root path has one segment per `/` in the underlying
+     * representation (because the path always starts with `/` and
+     * never ends with one). Equivalent to
+     * `std::ranges::distance(begin(), end())` but O(N) on the byte
+     * count rather than per-segment iterator advance.
+     */
+    size_t numSegments() const
+    {
+        if (isRoot())
+            return 0;
+        return std::count(path.begin(), path.end(), '/');
     }
 
     explicit operator std::string_view() const
