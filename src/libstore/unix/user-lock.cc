@@ -265,11 +265,9 @@ std::unique_ptr<UserLock> acquireUserLock(
 bool useBuildUsers(const LocalSettings & localSettings)
 {
 #ifdef __linux__
-    static bool b = (localSettings.buildUsersGroup != "" || localSettings.autoAllocateUids) && isRootUser();
-    return b;
+    return (localSettings.buildUsersGroup != "" || localSettings.autoAllocateUids) && isRootUser();
 #elif defined(__APPLE__) || defined(__FreeBSD__)
-    static bool b = localSettings.buildUsersGroup != "" && isRootUser();
-    return b;
+    return localSettings.buildUsersGroup != "" && isRootUser();
 #else
     return false;
 #endif
