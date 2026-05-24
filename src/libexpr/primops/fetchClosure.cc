@@ -75,10 +75,18 @@ static void runFetchClosureWithRewrite(
 }
 
 /**
- * Fetch the closure and make sure it's content addressed.
+ * Fetch the closure and assert it has the expected addressing mode.
+ *
+ * @param expectInputAddressed If true, fail if the path is content-addressed.
+ *                             If false, fail if the path is input-addressed.
  */
-static void runFetchClosureWithContentAddressedPath(
-    EvalState & state, const PosIdx pos, Store & fromStore, const StorePath & fromPath, Value & v)
+static void runFetchClosureChecked(
+    EvalState & state,
+    const PosIdx pos,
+    Store & fromStore,
+    const StorePath & fromPath,
+    bool expectInputAddressed,
+    Value & v)
 {
     state.store->addTempRoot(fromPath);
 
@@ -87,7 +95,16 @@ static void runFetchClosureWithContentAddressedPath(
 
     auto info = state.store->queryPathInfo(fromPath);
 
-    if (!info->isContentAddressed(*state.store)) {
+    bool contentAddressed = info->isContentAddressed(*state.store);
+
+    if (expectInputAddressed && contentAddressed) {
+        throw Error(
+            {.msg = HintFmt(
+                 "The store object referred to by 'fromPath' at '%s' is not input-addressed, but 'inputAddressed' is set to 'true'.\n\n"
+                 "Remove the 'inputAddressed' attribute (it defaults to 'false') to expect 'fromPath' to be content-addressed",
+                 state.store->printStorePath(fromPath)),
+             .pos = state.positions[pos]});
+    } else if (!expectInputAddressed && !contentAddressed) {
         throw Error(
             {.msg = HintFmt(
                  "The 'fromPath' value '%s' is input-addressed, but 'inputAddressed' is set to 'false' (default).\n\n"
@@ -95,33 +112,6 @@ static void runFetchClosureWithContentAddressedPath(
                  "    inputAddressed = true;\n\n"
                  "to the 'fetchClosure' arguments.\n\n"
                  "Note that to ensure authenticity input-addressed store paths, users must configure a trusted binary cache public key on their systems. This is not needed for content-addressed paths.",
-                 state.store->printStorePath(fromPath)),
-             .pos = state.positions[pos]});
-    }
-
-    state.allowClosure(fromPath);
-
-    state.mkStorePathString(fromPath, v);
-}
-
-/**
- * Fetch the closure and make sure it's input addressed.
- */
-static void runFetchClosureWithInputAddressedPath(
-    EvalState & state, const PosIdx pos, Store & fromStore, const StorePath & fromPath, Value & v)
-{
-    state.store->addTempRoot(fromPath);
-
-    if (!state.store->isValidPath(fromPath))
-        copyClosure(fromStore, *state.store, RealisedPath::Set{fromPath});
-
-    auto info = state.store->queryPathInfo(fromPath);
-
-    if (info->isContentAddressed(*state.store)) {
-        throw Error(
-            {.msg = HintFmt(
-                 "The store object referred to by 'fromPath' at '%s' is not input-addressed, but 'inputAddressed' is set to 'true'.\n\n"
-                 "Remove the 'inputAddressed' attribute (it defaults to 'false') to expect 'fromPath' to be content-addressed",
                  state.store->printStorePath(fromPath)),
              .pos = state.positions[pos]});
     }
@@ -221,10 +211,8 @@ static void prim_fetchClosure(EvalState & state, const PosIdx pos, Value ** args
 
     if (toPath)
         runFetchClosureWithRewrite(state, pos, *fromStore, *fromPath, *toPath, v);
-    else if (inputAddressed)
-        runFetchClosureWithInputAddressedPath(state, pos, *fromStore, *fromPath, v);
     else
-        runFetchClosureWithContentAddressedPath(state, pos, *fromStore, *fromPath, v);
+        runFetchClosureChecked(state, pos, *fromStore, *fromPath, inputAddressed, v);
 }
 
 static RegisterPrimOp primop_fetchClosure({
