@@ -4423,20 +4423,31 @@ static RegisterPrimOp primop_concatMap({
  * Integer arithmetic
  *************************************************************/
 
-/* Shared template for the four numeric primops (`__add`, `__sub`, `__mul`,
-   `__div`): force both args, dispatch on `nFloat` else int, overflow-check
-   via `valueChecked()`, raise `EvalError` with the per-operation verb. The
-   error wording is preserved verbatim — including the pre-existing
-   "first of the multiplication" phrasing — so that user-visible diagnostics
+/* Shared template for the seven numeric primops. The four arithmetic
+   ops (`__add`, `__sub`, `__mul`, `__div`) force both args, dispatch
+   on `nFloat` else int, and overflow-check via `valueChecked()`,
+   raising `EvalError` with the per-operation verb. The three bitwise
+   ops (`__bitAnd`, `__bitOr`, `__bitXor`) take an int-only short-cut:
+   they skip the explicit `forceValue` (`forceInt` forces internally)
+   and skip the float arm and `valueChecked` (bitwise on `NixInt`
+   always succeeds). The `isIntOnly<Op>` predicate selects between
+   the two paths via `if constexpr`. Error wording is preserved
+   verbatim — including the pre-existing "first of the multiplication"
+   phrasing on `Mul.firstFloatCtx` — so that user-visible diagnostics
    are unchanged. */
 
-enum class NumOp { Add, Sub, Mul, Div };
+enum class NumOp { Add, Sub, Mul, Div, BitAnd, BitOr, BitXor };
+
+template<NumOp Op>
+inline constexpr bool isIntOnly = Op == NumOp::BitAnd || Op == NumOp::BitOr || Op == NumOp::BitXor;
 
 /* Per-operation diagnostic phrases, indexed by NumOp. Error wording is
-   preserved byte-for-byte from the four hand-rolled primops -- including
-   `Mul.firstFloatCtx`, which is asymmetric with the other three rows
-   ("first of the multiplication", missing "argument of"). The
-   one-row-per-Op layout makes that asymmetry visible at a glance. */
+   preserved byte-for-byte from the seven hand-rolled primops -- including
+   `Mul.firstFloatCtx`, which is asymmetric with the other arithmetic rows
+   ("first of the multiplication", missing "argument of"). The bit-op
+   rows have no float context (the operations are int-only) and no
+   overflow message (bitwise ops on NixInt always succeed); the
+   one-row-per-Op layout makes the asymmetries visible at a glance. */
 struct NumOpDiag
 {
     const char * firstFloatCtx;
@@ -4472,7 +4483,7 @@ inline constexpr NumOpDiag numOpDiag = [] {
             "while evaluating the second argument of the multiplication",
             "integer overflow in multiplying %1% * %2%",
         };
-    else
+    else if constexpr (Op == NumOp::Div)
         return NumOpDiag{
             "while evaluating the first operand of the division",
             "while evaluating the second operand of the division",
@@ -4480,69 +4491,111 @@ inline constexpr NumOpDiag numOpDiag = [] {
             "while evaluating the second operand of the division",
             "integer overflow in dividing %1% / %2%",
         };
+    else if constexpr (Op == NumOp::BitAnd)
+        return NumOpDiag{
+            nullptr,
+            nullptr,
+            "while evaluating the first argument passed to builtins.bitAnd",
+            "while evaluating the second argument passed to builtins.bitAnd",
+            nullptr,
+        };
+    else if constexpr (Op == NumOp::BitOr)
+        return NumOpDiag{
+            nullptr,
+            nullptr,
+            "while evaluating the first argument passed to builtins.bitOr",
+            "while evaluating the second argument passed to builtins.bitOr",
+            nullptr,
+        };
+    else
+        return NumOpDiag{
+            nullptr,
+            nullptr,
+            "while evaluating the first argument passed to builtins.bitXor",
+            "while evaluating the second argument passed to builtins.bitXor",
+            nullptr,
+        };
 }();
 
 template<NumOp Op>
 static void primNumeric(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
-    state.forceValue(*args[0], pos);
-    state.forceValue(*args[1], pos);
-
     constexpr auto & diag = numOpDiag<Op>;
-    constexpr const char * firstFloatCtx = diag.firstFloatCtx;
-    constexpr const char * secondFloatCtx = diag.secondFloatCtx;
     constexpr const char * firstIntCtx = diag.firstIntCtx;
     constexpr const char * secondIntCtx = diag.secondIntCtx;
-    constexpr const char * overflowMsg = diag.overflowMsg;
 
-    if constexpr (Op == NumOp::Div) {
-        /* Division force-evaluates the divisor up front so that the
-           divide-by-zero check fires before the int/float dispatch. The
-           subsequent forceFloat/forceInt on the same argument is cheap
-           because the value has already been forced. */
-        NixFloat f2 = state.forceFloat(*args[1], pos, secondFloatCtx);
-        if (f2 == 0)
-            state.error<EvalError>("division by zero").atPos(pos).debugThrow();
-
-        if (args[0]->type() == nFloat || args[1]->type() == nFloat) {
-            v.mkFloat(state.forceFloat(*args[0], pos, firstFloatCtx) / f2);
-        } else {
-            NixInt i1 = state.forceInt(*args[0], pos, firstIntCtx);
-            NixInt i2 = state.forceInt(*args[1], pos, secondIntCtx);
-            /* Avoid division overflow as it might raise SIGFPE. */
-            auto result_ = i1 / i2;
-            if (auto result = result_.valueChecked(); result.has_value()) {
-                v.mkInt(*result);
-            } else {
-                state.error<EvalError>(overflowMsg, i1, i2).atPos(pos).debugThrow();
-            }
-        }
+    if constexpr (isIntOnly<Op>) {
+        auto i1 = state.forceInt(*args[0], pos, firstIntCtx);
+        auto i2 = state.forceInt(*args[1], pos, secondIntCtx);
+        if constexpr (Op == NumOp::BitAnd)
+            v.mkInt(i1.value & i2.value);
+        else if constexpr (Op == NumOp::BitOr)
+            v.mkInt(i1.value | i2.value);
+        else
+            v.mkInt(i1.value ^ i2.value);
+        return;
     } else {
-        if (args[0]->type() == nFloat || args[1]->type() == nFloat) {
-            NixFloat f1 = state.forceFloat(*args[0], pos, firstFloatCtx);
-            NixFloat f2 = state.forceFloat(*args[1], pos, secondFloatCtx);
-            if constexpr (Op == NumOp::Add)
-                v.mkFloat(f1 + f2);
-            else if constexpr (Op == NumOp::Sub)
-                v.mkFloat(f1 - f2);
-            else
-                v.mkFloat(f1 * f2);
-        } else {
-            auto i1 = state.forceInt(*args[0], pos, firstIntCtx);
-            auto i2 = state.forceInt(*args[1], pos, secondIntCtx);
+        state.forceValue(*args[0], pos);
+        state.forceValue(*args[1], pos);
 
-            auto result_ = [&] {
-                if constexpr (Op == NumOp::Add)
-                    return i1 + i2;
-                else if constexpr (Op == NumOp::Sub)
-                    return i1 - i2;
-                else
-                    return i1 * i2;
-            }();
-            if (auto result = result_.valueChecked(); result.has_value()) {
-                v.mkInt(*result);
+        constexpr const char * firstFloatCtx = diag.firstFloatCtx;
+        constexpr const char * secondFloatCtx = diag.secondFloatCtx;
+        constexpr const char * overflowMsg = diag.overflowMsg;
+
+        if constexpr (Op == NumOp::Div) {
+            /* Division force-evaluates the divisor up front so that the
+               divide-by-zero check fires before the int/float dispatch. The
+               subsequent forceFloat/forceInt on the same argument is cheap
+               because the value has already been forced. */
+            NixFloat f2 = state.forceFloat(*args[1], pos, secondFloatCtx);
+            if (f2 == 0)
+                state.error<EvalError>("division by zero").atPos(pos).debugThrow();
+
+            if (args[0]->type() == nFloat || args[1]->type() == nFloat) {
+                v.mkFloat(state.forceFloat(*args[0], pos, firstFloatCtx) / f2);
             } else {
-                state.error<EvalError>(overflowMsg, i1, i2).atPos(pos).debugThrow();
+                NixInt i1 = state.forceInt(*args[0], pos, firstIntCtx);
+                NixInt i2 = state.forceInt(*args[1], pos, secondIntCtx);
+                /* Avoid division overflow as it might raise SIGFPE. */
+                auto result_ = i1 / i2;
+                if (auto result = result_.valueChecked(); result.has_value()) {
+                    v.mkInt(*result);
+                } else {
+                    state.error<EvalError>(overflowMsg, i1, i2).atPos(pos).debugThrow();
+                }
+            }
+        } else {
+            if (args[0]->type() == nFloat || args[1]->type() == nFloat) {
+                NixFloat f1 = state.forceFloat(*args[0], pos, firstFloatCtx);
+                NixFloat f2 = state.forceFloat(*args[1], pos, secondFloatCtx);
+                if constexpr (Op == NumOp::Add)
+                    v.mkFloat(f1 + f2);
+                else if constexpr (Op == NumOp::Sub)
+                    v.mkFloat(f1 - f2);
+                else
+                    v.mkFloat(f1 * f2);
+            } else {
+                auto i1 = state.forceInt(*args[0], pos, firstIntCtx);
+                auto i2 = state.forceInt(*args[1], pos, secondIntCtx);
+
+                auto result_ = [&] {
+                    static_assert(
+                        Op == NumOp::Add || Op == NumOp::Sub || Op == NumOp::Mul,
+                        "the int-arm result lambda assumes Op is one of Add/Sub/Mul; "
+                        "Div is handled in its own arm above and the bit ops are routed "
+                        "through the isIntOnly arm at the top of primNumeric");
+                    if constexpr (Op == NumOp::Add)
+                        return i1 + i2;
+                    else if constexpr (Op == NumOp::Sub)
+                        return i1 - i2;
+                    else
+                        return i1 * i2;
+                }();
+                if (auto result = result_.valueChecked(); result.has_value()) {
+                    v.mkInt(*result);
+                } else {
+                    state.error<EvalError>(overflowMsg, i1, i2).atPos(pos).debugThrow();
+                }
             }
         }
     }
@@ -4584,29 +4637,14 @@ static RegisterPrimOp primop_div({
     .impl = primNumeric<NumOp::Div>,
 });
 
-static void prim_bitAnd(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    auto i1 = state.forceInt(*args[0], pos, "while evaluating the first argument passed to builtins.bitAnd");
-    auto i2 = state.forceInt(*args[1], pos, "while evaluating the second argument passed to builtins.bitAnd");
-    v.mkInt(i1.value & i2.value);
-}
-
 static RegisterPrimOp primop_bitAnd({
     .name = "__bitAnd",
     .args = {"e1", "e2"},
     .doc = R"(
       Return the bitwise AND of the integers *e1* and *e2*.
     )",
-    .impl = prim_bitAnd,
+    .impl = primNumeric<NumOp::BitAnd>,
 });
-
-static void prim_bitOr(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    auto i1 = state.forceInt(*args[0], pos, "while evaluating the first argument passed to builtins.bitOr");
-    auto i2 = state.forceInt(*args[1], pos, "while evaluating the second argument passed to builtins.bitOr");
-
-    v.mkInt(i1.value | i2.value);
-}
 
 static RegisterPrimOp primop_bitOr({
     .name = "__bitOr",
@@ -4614,16 +4652,8 @@ static RegisterPrimOp primop_bitOr({
     .doc = R"(
       Return the bitwise OR of the integers *e1* and *e2*.
     )",
-    .impl = prim_bitOr,
+    .impl = primNumeric<NumOp::BitOr>,
 });
-
-static void prim_bitXor(EvalState & state, const PosIdx pos, Value ** args, Value & v)
-{
-    auto i1 = state.forceInt(*args[0], pos, "while evaluating the first argument passed to builtins.bitXor");
-    auto i2 = state.forceInt(*args[1], pos, "while evaluating the second argument passed to builtins.bitXor");
-
-    v.mkInt(i1.value ^ i2.value);
-}
 
 static RegisterPrimOp primop_bitXor({
     .name = "__bitXor",
@@ -4631,7 +4661,7 @@ static RegisterPrimOp primop_bitXor({
     .doc = R"(
       Return the bitwise XOR of the integers *e1* and *e2*.
     )",
-    .impl = prim_bitXor,
+    .impl = primNumeric<NumOp::BitXor>,
 });
 
 static void prim_lessThan(EvalState & state, const PosIdx pos, Value ** args, Value & v)
