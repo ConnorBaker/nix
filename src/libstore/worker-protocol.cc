@@ -5,6 +5,7 @@
 #include "nix/store/gc-store.hh"
 #include "nix/store/build-result.hh"
 #include "nix/store/common-protocol.hh"
+#include "nix/store/common-protocol-impl.hh"
 #include "nix/store/worker-protocol.hh"
 #include "nix/store/worker-protocol-impl.hh"
 #include "nix/store/path-info.hh"
@@ -247,107 +248,40 @@ void WorkerProto::Serialise<KeyedBuildResult>::write(
 
 BuildResult WorkerProto::Serialise<BuildResult>::read(const StoreDirConfig & store, WorkerProto::ReadConn conn)
 {
-    BuildResult res;
-    BuildResult::Success success;
-
-    // Temp variables for failure fields since BuildError uses methods
-    std::string errorMsg;
-    bool isNonDeterministic = false;
-
     auto status = WorkerProto::Serialise<BuildResultStatus>::read(store, conn);
-    conn.from >> errorMsg;
-
-    if (conn.version >= WorkerProto::Version{.number = {1, 29}}) {
-        conn.from >> res.timesBuilt >> isNonDeterministic >> res.startTime >> res.stopTime;
-    }
-    if (conn.version >= WorkerProto::Version{.number = {1, 37}}) {
-        res.cpuUser = WorkerProto::Serialise<std::optional<std::chrono::microseconds>>::read(store, conn);
-        res.cpuSystem = WorkerProto::Serialise<std::optional<std::chrono::microseconds>>::read(store, conn);
-    }
-
-    if (conn.version.features.contains(WorkerProto::featureRealisationWithPath)) {
-        success.builtOutputs = WorkerProto::Serialise<std::map<OutputName, UnkeyedRealisation>>::read(store, conn);
-    } else if (conn.version >= WorkerProto::Version{.number = {1, 28}}) {
-        for (auto && [output, realisation] : WorkerProto::Serialise<StringMap>::read(store, conn)) {
-            size_t n = output.find("!");
-            if (n == output.npos)
-                throw Error("Invalid derivation output id %s", output);
-            success.builtOutputs.insert_or_assign(
-                output.substr(n + 1),
-                UnkeyedRealisation{
-                    StorePath{getString(valueAt(getObject(nlohmann::json::parse(realisation)), "outPath"))}});
-        }
-    }
-
-    res.inner = std::visit(
-        overloaded{
-            [&](BuildResult::Success::Status s) -> decltype(res.inner) {
-                success.status = s;
-                return std::move(success);
-            },
-            [&](BuildResult::Failure::Status s) -> decltype(res.inner) {
-                return BuildResult::Failure{{
-                    .status = s,
-                    .msg = HintFmt(std::move(errorMsg)),
-                    .isNonDeterministic = isNonDeterministic,
-                }};
-            },
+    bool hasCpuTiming = conn.version >= WorkerProto::Version{.number = {1, 37}};
+    return readBuildResult<WorkerProto>(
+        store,
+        conn,
+        status,
+        /*hasV2Fields=*/conn.version >= WorkerProto::Version{.number = {1, 29}},
+        [&](BuildResult & res) {
+            if (hasCpuTiming) {
+                res.cpuUser = WorkerProto::Serialise<std::optional<std::chrono::microseconds>>::read(store, conn);
+                res.cpuSystem = WorkerProto::Serialise<std::optional<std::chrono::microseconds>>::read(store, conn);
+            }
         },
-        status);
-
-    return res;
+        /*hasNewBuiltOutputs=*/conn.version.features.contains(WorkerProto::featureRealisationWithPath),
+        /*hasOldBuiltOutputs=*/conn.version >= WorkerProto::Version{.number = {1, 28}});
 }
 
 void WorkerProto::Serialise<BuildResult>::write(
     const StoreDirConfig & store, WorkerProto::WriteConn conn, const BuildResult & res)
 {
-    /* The protocol predates the use of sum types (std::variant) to
-       separate the success or failure cases. As such, it transits some
-       success- or failure-only fields in both cases. This helper
-       function helps support this: in each case, we just pass the old
-       default value for the fields that don't exist in that case. */
-    auto common = [&](std::string_view errorMsg, bool isNonDeterministic, const auto & builtOutputs) {
-        conn.to << errorMsg;
-        if (conn.version >= WorkerProto::Version{.number = {1, 29}}) {
-            conn.to << res.timesBuilt << isNonDeterministic << res.startTime << res.stopTime;
-        }
-        if (conn.version >= WorkerProto::Version{.number = {1, 37}}) {
-            WorkerProto::write(store, conn, res.cpuUser);
-            WorkerProto::write(store, conn, res.cpuSystem);
-        }
-
-        if (conn.version.features.contains(WorkerProto::featureRealisationWithPath)) {
-            WorkerProto::write(store, conn, builtOutputs);
-        } else if (conn.version >= WorkerProto::Version{.number = {1, 28}}) {
-            // Old clients read `builtOutputs` as a `StringMap` keyed
-            // by `sha256:<hex>!<outputName>` with JSON-encoded
-            // realisations. The derivation hash no longer exists, but
-            // old clients only extract `outputName` and `outPath`, so
-            // a dummy hash suffices.
-            StringMap sm;
-            for (auto & [outputName, realisation] : builtOutputs) {
-                auto dummyId = Hash::dummy.to_string(HashFormat::Base16, true) + "!" + outputName;
-                nlohmann::json j;
-                j["id"] = dummyId;
-                j["outPath"] = realisation.outPath.to_string();
-                sm[dummyId] = j.dump();
+    bool hasCpuTiming = conn.version >= WorkerProto::Version{.number = {1, 37}};
+    writeBuildResult<WorkerProto>(
+        store,
+        conn,
+        res,
+        /*hasV2Fields=*/conn.version >= WorkerProto::Version{.number = {1, 29}},
+        [&](const BuildResult & res) {
+            if (hasCpuTiming) {
+                WorkerProto::write(store, conn, res.cpuUser);
+                WorkerProto::write(store, conn, res.cpuSystem);
             }
-            WorkerProto::write(store, conn, sm);
-        }
-    };
-
-    std::visit(
-        overloaded{
-            [&](const BuildResult::Failure & failure) {
-                WorkerProto::write(store, conn, BuildResultStatus{failure.status});
-                common(failure.message(), failure.isNonDeterministic, decltype(BuildResult::Success::builtOutputs){});
-            },
-            [&](const BuildResult::Success & success) {
-                WorkerProto::write(store, conn, BuildResultStatus{success.status});
-                common(/*errorMsg=*/"", /*isNonDeterministic=*/false, success.builtOutputs);
-            },
         },
-        res.inner);
+        /*hasNewBuiltOutputs=*/conn.version.features.contains(WorkerProto::featureRealisationWithPath),
+        /*hasOldBuiltOutputs=*/conn.version >= WorkerProto::Version{.number = {1, 28}});
 }
 
 ValidPathInfo WorkerProto::Serialise<ValidPathInfo>::read(const StoreDirConfig & store, ReadConn conn)
@@ -435,14 +369,7 @@ UnkeyedRealisation WorkerProto::Serialise<UnkeyedRealisation>::read(const StoreD
             "the daemon is missing the '%s' protocol feature, needed to understand build trace",
             WorkerProto::featureRealisationWithPath);
     }
-
-    auto outPath = WorkerProto::Serialise<StorePath>::read(store, conn);
-    auto signatures = WorkerProto::Serialise<std::set<Signature>>::read(store, conn);
-
-    return UnkeyedRealisation{
-        .outPath = std::move(outPath),
-        .signatures = std::move(signatures),
-    };
+    return readUnkeyedRealisation<WorkerProto>(store, conn);
 }
 
 void WorkerProto::Serialise<UnkeyedRealisation>::write(
@@ -453,8 +380,7 @@ void WorkerProto::Serialise<UnkeyedRealisation>::write(
             "the daemon is missing the '%s' protocol feature, needed to understand build trace",
             WorkerProto::featureRealisationWithPath);
     }
-    WorkerProto::write(store, conn, info.outPath);
-    WorkerProto::write(store, conn, info.signatures);
+    writeUnkeyedRealisation<WorkerProto>(store, conn, info);
 }
 
 std::optional<UnkeyedRealisation>
@@ -495,14 +421,7 @@ DrvOutput WorkerProto::Serialise<DrvOutput>::read(const StoreDirConfig & store, 
             "the daemon is missing the '%s' protocol feature, needed to support content-addressing derivations",
             WorkerProto::featureRealisationWithPath);
     }
-
-    auto drvPath = WorkerProto::Serialise<StorePath>::read(store, conn);
-    auto outputName = WorkerProto::Serialise<std::string>::read(store, conn);
-
-    return DrvOutput{
-        .drvPath = std::move(drvPath),
-        .outputName = std::move(outputName),
-    };
+    return readDrvOutput<WorkerProto>(store, conn);
 }
 
 void WorkerProto::Serialise<DrvOutput>::write(const StoreDirConfig & store, WriteConn conn, const DrvOutput & info)
@@ -512,25 +431,17 @@ void WorkerProto::Serialise<DrvOutput>::write(const StoreDirConfig & store, Writ
             "the daemon is missing the '%s' protocol feature, needed to support content-addressing derivations",
             WorkerProto::featureRealisationWithPath);
     }
-    WorkerProto::write(store, conn, info.drvPath);
-    WorkerProto::write(store, conn, info.outputName);
+    writeDrvOutput<WorkerProto>(store, conn, info);
 }
 
 Realisation WorkerProto::Serialise<Realisation>::read(const StoreDirConfig & store, ReadConn conn)
 {
-    auto id = WorkerProto::Serialise<DrvOutput>::read(store, conn);
-    auto unkeyed = WorkerProto::Serialise<UnkeyedRealisation>::read(store, conn);
-
-    return Realisation{
-        std::move(unkeyed),
-        std::move(id),
-    };
+    return readRealisation<WorkerProto>(store, conn);
 }
 
 void WorkerProto::Serialise<Realisation>::write(const StoreDirConfig & store, WriteConn conn, const Realisation & info)
 {
-    WorkerProto::write(store, conn, info.id);
-    WorkerProto::write(store, conn, static_cast<const UnkeyedRealisation &>(info));
+    writeRealisation<WorkerProto>(store, conn, info);
 }
 
 GCOptions::SpecificPaths

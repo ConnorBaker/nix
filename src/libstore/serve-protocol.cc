@@ -3,6 +3,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/store/build-result.hh"
 #include "nix/store/common-protocol.hh"
+#include "nix/store/common-protocol-impl.hh"
 #include "nix/store/serve-protocol.hh"
 #include "nix/store/serve-protocol-impl.hh"
 #include "nix/store/path-info.hh"
@@ -16,98 +17,28 @@ namespace nix {
 
 BuildResult ServeProto::Serialise<BuildResult>::read(const StoreDirConfig & store, ServeProto::ReadConn conn)
 {
-    BuildResult res;
-    BuildResult::Success success;
-
-    // Temp variables for failure fields since BuildError uses methods
-    std::string errorMsg;
-    bool isNonDeterministic = false;
-
-    auto status = ServeProto::Serialise<BuildResultStatus>::read(store, {conn.from});
-    conn.from >> errorMsg;
-
-    if (conn.version >= ServeProto::Version{2, 3})
-        conn.from >> res.timesBuilt >> isNonDeterministic >> res.startTime >> res.stopTime;
-
-    if (conn.version >= ServeProto::Version{2, 8}) {
-        success.builtOutputs = ServeProto::Serialise<std::map<OutputName, UnkeyedRealisation>>::read(store, conn);
-    } else if (conn.version >= ServeProto::Version{2, 6}) {
-        for (auto & [output, realisation] : ServeProto::Serialise<StringMap>::read(store, conn)) {
-            size_t n = output.find("!");
-            if (n == output.npos)
-                throw Error("Invalid derivation output id %s", output);
-            success.builtOutputs.insert_or_assign(
-                output.substr(n + 1),
-                UnkeyedRealisation{
-                    StorePath{getString(valueAt(getObject(nlohmann::json::parse(realisation)), "outPath"))}});
-        }
-    }
-
-    res.inner = std::visit(
-        overloaded{
-            [&](BuildResult::Success::Status s) -> decltype(res.inner) {
-                success.status = s;
-                return std::move(success);
-            },
-            [&](BuildResult::Failure::Status s) -> decltype(res.inner) {
-                return BuildResult::Failure{{
-                    .status = s,
-                    .msg = HintFmt(std::move(errorMsg)),
-                    .isNonDeterministic = isNonDeterministic,
-                }};
-            },
-        },
-        status);
-
-    return res;
+    auto status = ServeProto::Serialise<BuildResultStatus>::read(store, conn);
+    return readBuildResult<ServeProto>(
+        store,
+        conn,
+        status,
+        /*hasV2Fields=*/conn.version >= ServeProto::Version{2, 3},
+        /*readCpuTiming=*/[](BuildResult &) {}, // serve protocol does not carry cpu timing
+        /*hasNewBuiltOutputs=*/conn.version >= ServeProto::Version{2, 8},
+        /*hasOldBuiltOutputs=*/conn.version >= ServeProto::Version{2, 6});
 }
 
 void ServeProto::Serialise<BuildResult>::write(
     const StoreDirConfig & store, ServeProto::WriteConn conn, const BuildResult & res)
 {
-    /* The protocol predates the use of sum types (std::variant) to
-       separate the success or failure cases. As such, it transits some
-       success- or failure-only fields in both cases. This helper
-       function helps support this: in each case, we just pass the old
-       default value for the fields that don't exist in that case. */
-    auto common = [&](std::string_view errorMsg, bool isNonDeterministic, const auto & builtOutputs) {
-        conn.to << errorMsg;
-
-        if (conn.version >= ServeProto::Version{2, 3})
-            conn.to << res.timesBuilt << isNonDeterministic << res.startTime << res.stopTime;
-
-        if (conn.version >= ServeProto::Version{2, 8}) {
-            ServeProto::write(store, conn, builtOutputs);
-        } else if (conn.version >= ServeProto::Version{2, 6}) {
-            // Old clients read `builtOutputs` as a `StringMap` keyed
-            // by `sha256:<hex>!<outputName>` with JSON-encoded
-            // realisations.  The derivation hash no longer exists, but
-            // old clients only extract `outputName` and `outPath`, so
-            // a dummy hash suffices.
-            StringMap sm;
-            for (auto & [outputName, realisation] : builtOutputs) {
-                auto dummyId = Hash::dummy.to_string(HashFormat::Base16, true) + "!" + outputName;
-                nlohmann::json j;
-                j["id"] = dummyId;
-                j["outPath"] = realisation.outPath.to_string();
-                sm[dummyId] = j.dump();
-            }
-            ServeProto::write(store, conn, sm);
-        }
-    };
-
-    std::visit(
-        overloaded{
-            [&](const BuildResult::Failure & failure) {
-                ServeProto::write(store, {conn.to}, BuildResultStatus{failure.status});
-                common(failure.message(), failure.isNonDeterministic, decltype(BuildResult::Success::builtOutputs){});
-            },
-            [&](const BuildResult::Success & success) {
-                ServeProto::write(store, {conn.to}, BuildResultStatus{success.status});
-                common(/*errorMsg=*/"", /*isNonDeterministic=*/false, success.builtOutputs);
-            },
-        },
-        res.inner);
+    writeBuildResult<ServeProto>(
+        store,
+        conn,
+        res,
+        /*hasV2Fields=*/conn.version >= ServeProto::Version{2, 3},
+        /*writeCpuTiming=*/[](const BuildResult &) {}, // serve protocol does not carry cpu timing
+        /*hasNewBuiltOutputs=*/conn.version >= ServeProto::Version{2, 8},
+        /*hasOldBuiltOutputs=*/conn.version >= ServeProto::Version{2, 6});
 }
 
 UnkeyedValidPathInfo ServeProto::Serialise<UnkeyedValidPathInfo>::read(const StoreDirConfig & store, ReadConn conn)
@@ -190,14 +121,7 @@ UnkeyedRealisation ServeProto::Serialise<UnkeyedRealisation>::read(const StoreDi
             conn.version.major,
             conn.version.minor);
     }
-
-    auto outPath = ServeProto::Serialise<StorePath>::read(store, conn);
-    auto signatures = ServeProto::Serialise<std::set<Signature>>::read(store, conn);
-
-    return UnkeyedRealisation{
-        .outPath = std::move(outPath),
-        .signatures = std::move(signatures),
-    };
+    return readUnkeyedRealisation<ServeProto>(store, conn);
 }
 
 void ServeProto::Serialise<UnkeyedRealisation>::write(
@@ -209,8 +133,7 @@ void ServeProto::Serialise<UnkeyedRealisation>::write(
             conn.version.major,
             conn.version.minor);
     }
-    ServeProto::write(store, conn, info.outPath);
-    ServeProto::write(store, conn, info.signatures);
+    writeUnkeyedRealisation<ServeProto>(store, conn, info);
 }
 
 DrvOutput ServeProto::Serialise<DrvOutput>::read(const StoreDirConfig & store, ReadConn conn)
@@ -221,14 +144,7 @@ DrvOutput ServeProto::Serialise<DrvOutput>::read(const StoreDirConfig & store, R
             conn.version.major,
             conn.version.minor);
     }
-
-    auto drvPath = ServeProto::Serialise<StorePath>::read(store, conn);
-    auto outputName = ServeProto::Serialise<std::string>::read(store, conn);
-
-    return DrvOutput{
-        .drvPath = std::move(drvPath),
-        .outputName = std::move(outputName),
-    };
+    return readDrvOutput<ServeProto>(store, conn);
 }
 
 void ServeProto::Serialise<DrvOutput>::write(const StoreDirConfig & store, WriteConn conn, const DrvOutput & info)
@@ -239,25 +155,17 @@ void ServeProto::Serialise<DrvOutput>::write(const StoreDirConfig & store, Write
             conn.version.major,
             conn.version.minor);
     }
-    ServeProto::write(store, conn, info.drvPath);
-    ServeProto::write(store, conn, info.outputName);
+    writeDrvOutput<ServeProto>(store, conn, info);
 }
 
 Realisation ServeProto::Serialise<Realisation>::read(const StoreDirConfig & store, ReadConn conn)
 {
-    auto id = ServeProto::Serialise<DrvOutput>::read(store, conn);
-    auto unkeyed = ServeProto::Serialise<UnkeyedRealisation>::read(store, conn);
-
-    return Realisation{
-        std::move(unkeyed),
-        std::move(id),
-    };
+    return readRealisation<ServeProto>(store, conn);
 }
 
 void ServeProto::Serialise<Realisation>::write(const StoreDirConfig & store, WriteConn conn, const Realisation & info)
 {
-    ServeProto::write(store, conn, info.id);
-    ServeProto::write(store, conn, static_cast<const UnkeyedRealisation &>(info));
+    writeRealisation<ServeProto>(store, conn, info);
 }
 
 } // namespace nix
