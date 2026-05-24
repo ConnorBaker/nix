@@ -9,7 +9,6 @@
 
 #include <span>
 #include <bitset>
-#include <optional>
 #include <filesystem>
 
 namespace nix {
@@ -29,58 +28,39 @@ public:
     static constexpr std::size_t numHooks = Hook::postFunctionCall + 1;
     using Hooks = std::bitset<numHooks>;
 
-private:
-    std::optional<Hooks> neededHooks;
-
-protected:
     /**
-     * Get which hooks need to be called.
-     *
-     * This is the actual implementation which has to be defined by subclasses.
-     * Public API goes through `getNeededHooks`, a non-virtual interface (NVI)
-     * which caches the return value. The cache is populated lazily on first
-     * call and never invalidated; in-tree subclasses (`FunctionCallTrace`,
-     * `SampleStack`) return constants, so a single virtual dispatch suffices.
+     * Get which hooks need to be invoked for this EvalProfiler instance.
+     * Subclasses return a constant; the result is captured into
+     * `EvalState`'s `profilerHooks` snapshot at construction time and
+     * never re-queried, so per-instance caching here is unnecessary.
      */
-    virtual Hooks getNeededHooksImpl() const
-    {
-        return Hooks{};
-    }
+    virtual Hooks getNeededHooks() const = 0;
 
-public:
     /**
      * Hook called in the EvalState::callFunction preamble.
-     * Gets called only if (getNeededHooks().test(Hook::preFunctionCall)) is true.
+     * Gets called only if `getNeededHooks().test(Hook::preFunctionCall)`
+     * was true at `EvalState` construction.
      *
      * @param state Evaluator state.
      * @param v Function being invoked.
      * @param args Function arguments.
      * @param pos Function position.
      */
-    virtual void preFunctionCallHook(EvalState & state, const Value & v, std::span<Value *> args, const PosIdx pos);
+    virtual void preFunctionCallHook(EvalState & state, const Value & v, std::span<Value *> args, const PosIdx pos) = 0;
 
     /**
      * Hook called on EvalState::callFunction exit.
-     * Gets called only if (getNeededHooks().test(Hook::postFunctionCall)) is true.
+     * Gets called only if `getNeededHooks().test(Hook::postFunctionCall)`
+     * was true at `EvalState` construction.
      *
      * @param state Evaluator state.
      * @param v Function being invoked.
      * @param args Function arguments.
      * @param pos Function position.
      */
-    virtual void postFunctionCallHook(EvalState & state, const Value & v, std::span<Value *> args, const PosIdx pos);
+    virtual void postFunctionCallHook(EvalState & state, const Value & v, std::span<Value *> args, const PosIdx pos) = 0;
 
     virtual ~EvalProfiler() = default;
-
-    /**
-     * Get which hooks need to be invoked for this EvalProfiler instance.
-     */
-    Hooks getNeededHooks()
-    {
-        if (neededHooks.has_value())
-            return *neededHooks;
-        return *(neededHooks = getNeededHooksImpl());
-    }
 };
 
 ref<EvalProfiler> makeSampleStackProfiler(EvalState & state, std::filesystem::path profileFile, uint64_t frequency);

@@ -5,12 +5,6 @@
 
 namespace nix {
 
-void EvalProfiler::preFunctionCallHook(EvalState & state, const Value & v, std::span<Value *> args, const PosIdx pos) {}
-
-void EvalProfiler::postFunctionCallHook(EvalState & state, const Value & v, std::span<Value *> args, const PosIdx pos)
-{
-}
-
 namespace {
 
 class PosCache : private LRUCache<PosIdx, Pos>
@@ -93,14 +87,14 @@ class SampleStack : public EvalProfiler
        of periodically flushing data to disk. */
     static constexpr std::chrono::microseconds profileDumpInterval = std::chrono::milliseconds(2000);
 
-    Hooks getNeededHooksImpl() const override
+    FrameInfo getPrimOpFrameInfo(const PrimOp & primOp, std::span<Value *> args, PosIdx pos);
+
+public:
+    Hooks getNeededHooks() const override
     {
         return Hooks().set(preFunctionCall).set(postFunctionCall);
     }
 
-    FrameInfo getPrimOpFrameInfo(const PrimOp & primOp, std::span<Value *> args, PosIdx pos);
-
-public:
     SampleStack(EvalState & state, const std::filesystem::path & profileFile, std::chrono::nanoseconds period)
         : state(state)
         , sampleInterval(period)

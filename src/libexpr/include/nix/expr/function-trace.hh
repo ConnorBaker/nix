@@ -8,12 +8,12 @@ namespace nix {
 
 class FunctionCallTrace : public EvalProfiler
 {
-    Hooks getNeededHooksImpl() const override
+public:
+    Hooks getNeededHooks() const override
     {
         return Hooks().set(preFunctionCall).set(postFunctionCall);
     }
 
-public:
     FunctionCallTrace() = default;
 
     [[gnu::noinline]] void
