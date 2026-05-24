@@ -1,45 +1,41 @@
 #include "nix/util/compression-algo.hh"
 #include "nix/util/error.hh"
+#include "nix/util/parse-enum.hh"
 #include "nix/util/types.hh"
-
-#include <unordered_map>
 
 namespace nix {
 
-CompressionAlgo parseCompressionAlgo(std::string_view method, bool suggestions)
-{
-#define NIX_COMPRESSION_ALGO_FROM_STRING(name, value) {name, CompressionAlgo::value},
-    static const std::unordered_map<std::string_view, CompressionAlgo> lookupTable = {
-        NIX_FOR_EACH_COMPRESSION_ALGO(NIX_COMPRESSION_ALGO_FROM_STRING)};
-#undef NIX_COMPRESSION_ALGO_FROM_STRING
+static const EnumNames<CompressionAlgo> compressionAlgoTable{
+    {"none", CompressionAlgo::none},
+    {"br", CompressionAlgo::brotli},
+    {"bzip2", CompressionAlgo::bzip2},
+    {"compress", CompressionAlgo::compress},
+    {"grzip", CompressionAlgo::grzip},
+    {"gzip", CompressionAlgo::gzip},
+    {"lrzip", CompressionAlgo::lrzip},
+    {"lz4", CompressionAlgo::lz4},
+    {"lzip", CompressionAlgo::lzip},
+    {"lzma", CompressionAlgo::lzma},
+    {"lzop", CompressionAlgo::lzop},
+    {"xz", CompressionAlgo::xz},
+    {"zstd", CompressionAlgo::zstd},
+};
 
-    if (auto it = lookupTable.find(method); it != lookupTable.end())
-        return it->second;
+CompressionAlgo parseCompressionAlgo(std::string_view method)
+{
+    if (auto v = parseEnumOpt<CompressionAlgo>(method, compressionAlgoTable))
+        return *v;
 
     ErrorInfo err = {.level = lvlError, .msg = HintFmt("unknown compression method '%s'", method)};
-
-    if (suggestions) {
-        static const StringSet allNames = [&]() {
-            StringSet res;
-            for (auto & [name, _] : lookupTable)
-                res.emplace(name);
-            return res;
-        }();
-        err.suggestions = Suggestions::bestMatches(allNames, method);
-    }
-
+    err.suggestions = Suggestions::bestMatches(enumNames<CompressionAlgo>(compressionAlgoTable), method);
     throw UnknownCompressionMethod(std::move(err));
 }
 
 std::string showCompressionAlgo(CompressionAlgo method)
 {
-    switch (method) {
-#define NIX_COMPRESSION_ALGO_TO_STRING(name, value) \
-    case CompressionAlgo::value:                    \
-        return name;
-        NIX_FOR_EACH_COMPRESSION_ALGO(NIX_COMPRESSION_ALGO_TO_STRING);
-#undef NIX_COMPRESSION_ALGO_TO_STRING
-    }
+    for (const auto & entry : compressionAlgoTable)
+        if (entry.value == method)
+            return std::string(entry.name);
     unreachable();
 }
 

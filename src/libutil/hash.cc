@@ -8,6 +8,7 @@
 #include "nix/util/args.hh"
 #include "nix/util/hash.hh"
 #include "nix/util/configuration.hh"
+#include "nix/util/parse-enum.hh"
 #include "nix/util/split.hh"
 #include "nix/util/base-n.hh"
 #include "nix/util/base-nix-32.hh"
@@ -420,29 +421,31 @@ Hash compressHash(const Hash & hash, unsigned int newSize)
     return h;
 }
 
+/**
+ * `base32` is a deprecated alias for `nix32`; emit a one-shot warning
+ * when matched. The lambda ignores its xpSettings argument because
+ * hash formats have no experimental-feature gating.
+ */
+static const EnumNames<HashFormat> hashFormatTable{
+    {"base16", HashFormat::Base16},
+    {"nix32", HashFormat::Nix32},
+    {"base32",
+     HashFormat::Nix32,
+     [](const ExperimentalFeatureSettings &) {
+         warn(R"("base32" is a deprecated alias for hash format "nix32".)");
+     }},
+    {"base64", HashFormat::Base64},
+    {"sri", HashFormat::SRI},
+};
+
 std::optional<HashFormat> parseHashFormatOpt(std::string_view hashFormatName)
 {
-    if (hashFormatName == "base16")
-        return HashFormat::Base16;
-    if (hashFormatName == "nix32")
-        return HashFormat::Nix32;
-    if (hashFormatName == "base32") {
-        warn(R"("base32" is a deprecated alias for hash format "nix32".)");
-        return HashFormat::Nix32;
-    }
-    if (hashFormatName == "base64")
-        return HashFormat::Base64;
-    if (hashFormatName == "sri")
-        return HashFormat::SRI;
-    return std::nullopt;
+    return parseEnumOpt<HashFormat>(hashFormatName, hashFormatTable);
 }
 
 HashFormat parseHashFormat(std::string_view hashFormatName)
 {
-    auto opt_f = parseHashFormatOpt(hashFormatName);
-    if (opt_f)
-        return *opt_f;
-    throw UsageError("unknown hash format '%1%', expect 'base16', 'base32', 'base64', or 'sri'", hashFormatName);
+    return parseEnumOrThrow<HashFormat>(hashFormatName, hashFormatTable, "hash format");
 }
 
 std::string_view printHashFormat(HashFormat HashFormat)
@@ -463,30 +466,29 @@ std::string_view printHashFormat(HashFormat HashFormat)
     }
 }
 
+/**
+ * `blake3` is gated behind the BLAKE3Hashes experimental feature; the
+ * gate fires from the per-row `onMatch` callback so both the throwing
+ * and `Opt` parse paths refuse the algorithm without the xp feature.
+ */
+static const EnumNames<HashAlgorithm> hashAlgoTable{
+    {"blake3",
+     HashAlgorithm::BLAKE3,
+     [](const ExperimentalFeatureSettings & xpSettings) { xpSettings.require(Xp::BLAKE3Hashes); }},
+    {"md5", HashAlgorithm::MD5},
+    {"sha1", HashAlgorithm::SHA1},
+    {"sha256", HashAlgorithm::SHA256},
+    {"sha512", HashAlgorithm::SHA512},
+};
+
 std::optional<HashAlgorithm> parseHashAlgoOpt(std::string_view s, const ExperimentalFeatureSettings & xpSettings)
 {
-    if (s == "blake3") {
-        xpSettings.require(Xp::BLAKE3Hashes);
-        return HashAlgorithm::BLAKE3;
-    }
-    if (s == "md5")
-        return HashAlgorithm::MD5;
-    if (s == "sha1")
-        return HashAlgorithm::SHA1;
-    if (s == "sha256")
-        return HashAlgorithm::SHA256;
-    if (s == "sha512")
-        return HashAlgorithm::SHA512;
-    return std::nullopt;
+    return parseEnumOpt<HashAlgorithm>(s, hashAlgoTable, xpSettings);
 }
 
 HashAlgorithm parseHashAlgo(std::string_view s, const ExperimentalFeatureSettings & xpSettings)
 {
-    auto opt_h = parseHashAlgoOpt(s, xpSettings);
-    if (opt_h)
-        return *opt_h;
-    else
-        throw UsageError("unknown hash algorithm '%1%', expect 'blake3', 'md5', 'sha1', 'sha256', or 'sha512'", s);
+    return parseEnumOrThrow<HashAlgorithm>(s, hashAlgoTable, "hash algorithm", xpSettings);
 }
 
 std::string_view printHashAlgo(HashAlgorithm ha)

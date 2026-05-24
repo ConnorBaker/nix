@@ -1,41 +1,35 @@
 #include "nix/util/file-content-address.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/git.hh"
+#include "nix/util/parse-enum.hh"
 #include "nix/util/source-path.hh"
 
 namespace nix {
 
+static const EnumNames<FileSerialisationMethod> fileSerialisationMethodTable{
+    {"flat", FileSerialisationMethod::Flat},
+    {"nar", FileSerialisationMethod::NixArchive},
+};
+
+static const EnumNames<FileIngestionMethod> fileIngestionMethodTable{
+    {"flat", FileIngestionMethod::Flat},
+    {"nar", FileIngestionMethod::NixArchive},
+    {"git", FileIngestionMethod::Git},
+};
+
 static std::optional<FileSerialisationMethod> parseFileSerialisationMethodOpt(std::string_view input)
 {
-    if (input == "flat") {
-        return FileSerialisationMethod::Flat;
-    } else if (input == "nar") {
-        return FileSerialisationMethod::NixArchive;
-    } else {
-        return std::nullopt;
-    }
+    return parseEnumOpt<FileSerialisationMethod>(input, fileSerialisationMethodTable);
 }
 
 FileSerialisationMethod parseFileSerialisationMethod(std::string_view input)
 {
-    auto ret = parseFileSerialisationMethodOpt(input);
-    if (ret)
-        return *ret;
-    else
-        throw UsageError("Unknown file serialiation method '%s', expect `flat` or `nar`", input);
+    return parseEnumOrThrow<FileSerialisationMethod>(input, fileSerialisationMethodTable, "file serialisation method");
 }
 
 FileIngestionMethod parseFileIngestionMethod(std::string_view input)
 {
-    if (input == "git") {
-        return FileIngestionMethod::Git;
-    } else {
-        auto ret = parseFileSerialisationMethodOpt(input);
-        if (ret)
-            return static_cast<FileIngestionMethod>(*ret);
-        else
-            throw UsageError("Unknown file ingestion method '%s', expect `flat`, `nar`, or `git`", input);
-    }
+    return parseEnumOrThrow<FileIngestionMethod>(input, fileIngestionMethodTable, "file ingestion method");
 }
 
 std::string_view renderFileSerialisationMethod(FileSerialisationMethod method)

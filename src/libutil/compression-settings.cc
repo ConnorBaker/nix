@@ -11,7 +11,7 @@ namespace nix {
 template<>
 CompressionAlgo BaseSetting<CompressionAlgo>::parse(const std::string & str) const
 try {
-    return parseCompressionAlgo(str, /*suggestions=*/true);
+    return parseCompressionAlgo(str);
 } catch (UnknownCompressionMethod & e) {
     throw UsageError(e.info().suggestions, "option '%s' has invalid value '%s'", name, str);
 }
@@ -21,7 +21,7 @@ std::optional<CompressionAlgo> BaseSetting<std::optional<CompressionAlgo>>::pars
 try {
     if (str.empty())
         return std::nullopt;
-    return parseCompressionAlgo(str, /*suggestions=*/true);
+    return parseCompressionAlgo(str);
 } catch (UnknownCompressionMethod & e) {
     throw UsageError(e.info().suggestions, "option '%s' has invalid value '%s'", name, str);
 }
@@ -52,9 +52,23 @@ std::string BaseSetting<std::optional<CompressionAlgo>>::to_string() const
     return "";
 }
 
-#define NIX_COMPRESSION_JSON(name, value) {CompressionAlgo::value, name},
-NLOHMANN_JSON_SERIALIZE_ENUM(CompressionAlgo, {NIX_FOR_EACH_COMPRESSION_ALGO(NIX_COMPRESSION_JSON)});
-#undef NIX_COMPRESSION_JSON
+NLOHMANN_JSON_SERIALIZE_ENUM(
+    CompressionAlgo,
+    {
+        {CompressionAlgo::none, "none"},
+        {CompressionAlgo::brotli, "br"},
+        {CompressionAlgo::bzip2, "bzip2"},
+        {CompressionAlgo::compress, "compress"},
+        {CompressionAlgo::grzip, "grzip"},
+        {CompressionAlgo::gzip, "gzip"},
+        {CompressionAlgo::lrzip, "lrzip"},
+        {CompressionAlgo::lz4, "lz4"},
+        {CompressionAlgo::lzip, "lzip"},
+        {CompressionAlgo::lzma, "lzma"},
+        {CompressionAlgo::lzop, "lzop"},
+        {CompressionAlgo::xz, "xz"},
+        {CompressionAlgo::zstd, "zstd"},
+    });
 
 /* Explicit instantiation of templates */
 template class BaseSetting<CompressionAlgo>;

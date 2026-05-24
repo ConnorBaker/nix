@@ -68,6 +68,7 @@ headers = [ config_pub_h ] + files(
   'nar-cache.hh',
   'nar-listing.hh',
   'os-string.hh',
+  'parse-enum.hh',
   'pool.hh',
   'pos-idx.hh',
   'pos-table.hh',
