@@ -22,6 +22,7 @@
 
 #include "store-config-private.hh"
 
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <filesystem>
 #include <nlohmann/json.hpp>
 
@@ -1252,32 +1253,55 @@ Derivation Store::readInvalidDerivation(const StorePath & drvPath)
     return readDerivationCommon(*this, drvPath, false);
 }
 
-/* Iterate the configured secret-key files, constructing a fresh
-   `LocalSigner` for each one and invoking the callback. The
-   per-key-file `SecretKey` construction is intentionally not cached
-   here; that is the substance of the "FIXME: keep secret keys in
-   memory" notes at the call sites and is tracked separately. */
+/* Process-wide cache of parsed secret keys, keyed by the file path
+   from which the key was read. The cache is mutation-safe with
+   respect to `settings.secretKeyFiles`: each entry's validity depends
+   only on the contents of `path`, not on which paths the setting
+   currently lists, so a daemon client that reconfigures
+   `secret-key-files` mid-session simply uses a different subset of
+   the cache. The cache is *not* invalidated if a file on disk is
+   rewritten mid-session — secret-key files are immutable in
+   practice, and any concurrent rewrite already races with the
+   pre-cache implementation that re-read the file at every sign.
+
+   Values are heap-allocated via `std::unique_ptr` so the
+   `LocalSigner *` snapshot returned from `getCachedSigner` stays valid
+   after the lock is released, even if a concurrent first-time sign on
+   another thread inserts and triggers a rehash of
+   `boost::unordered_flat_map`. Holding the lock through the actual
+   signing call would serialise every worker-thread sign through one
+   mutex; this shape keeps the lock scope to map mutation only. */
+static Sync<boost::unordered_flat_map<std::filesystem::path, std::unique_ptr<LocalSigner>>> signerCache;
+
+static LocalSigner * getCachedSigner(const std::filesystem::path & path)
+{
+    auto cache(signerCache.lock());
+    auto it = cache->find(path);
+    if (it == cache->end())
+        it = cache->emplace(path, std::make_unique<LocalSigner>(SecretKey(readFile(path)))).first;
+    return it->second.get();
+}
+
 template<class Callback>
 static void forEachConfiguredSigner(const Callback & callback)
 {
-    auto secretKeyFiles = settings.secretKeyFiles;
-
-    for (auto & secretKeyFile : secretKeyFiles.get()) {
-        SecretKey secretKey(readFile(secretKeyFile));
-        LocalSigner signer(std::move(secretKey));
-        callback(signer);
-    }
+    /* Copy the configured paths before iterating: `BaseSetting<T>::get`
+       returns `const T &` with no synchronisation, and a trusted daemon
+       client can mutate the setting mid-session via
+       `ClientSettings::apply`. Iterating the live setting reference
+       would race the underlying `std::list` re-assignment. */
+    auto secretKeyFiles = settings.secretKeyFiles.get();
+    for (auto & secretKeyFile : secretKeyFiles)
+        callback(*getCachedSigner(secretKeyFile));
 }
 
 void Store::signPathInfo(ValidPathInfo & info)
 {
-    // FIXME: keep secret keys in memory.
     forEachConfiguredSigner([&](LocalSigner & signer) { info.sign(*this, signer); });
 }
 
 void Store::signRealisation(Realisation & realisation)
 {
-    // FIXME: keep secret keys in memory.
     forEachConfiguredSigner([&](LocalSigner & signer) { realisation.sign(realisation.id, signer); });
 }
 
