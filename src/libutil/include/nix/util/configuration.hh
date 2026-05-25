@@ -9,6 +9,7 @@
 
 #include "nix/util/error.hh"
 #include "nix/util/json-non-null.hh"
+#include "nix/util/strings.hh"
 #include "nix/util/types.hh"
 #include "nix/util/fmt.hh"
 #include "nix/util/experimental-features.hh"
@@ -538,6 +539,56 @@ public:
         return this->value.path();
     }
 };
+
+/**
+ * Parse a whitespace-separated list of tokens into a container `C` of
+ * `T`, applying `parser` to each token. Used by the
+ * `BaseSetting<C<T>>::parse` specialisations whose `parser` is a
+ * single-token-to-`T` function (e.g. `StoreReference::parse`).
+ *
+ * Selects between `push_back` and `insert` via a `requires`-expression
+ * so the same template covers `std::vector<T>` and `std::set<T>`.
+ *
+ * Specialisations whose per-token parser can fail (e.g.
+ * `parseExperimentalFeature`, which warns on unknown features and
+ * silently drops them) need their own `parse` body and should not
+ * call this helper. The other libutil collection specialisations
+ * (`Strings`, `StringSet`, `std::list<std::filesystem::path>`,
+ * `std::set<std::filesystem::path>`) are intentionally NOT migrated:
+ * their bodies are already one-liners over `tokenizeString<C>`, so
+ * routing through this helper would only add an extra lambda
+ * indirection without shrinking either the parse or the to_string
+ * side. New external `BaseSetting<C<T>>` specialisations whose
+ * per-token parser is a plain `T(string)` function should reuse
+ * this helper.
+ */
+template<class C, class Parser>
+inline C parseSettingTokens(const std::string & str, const Parser & parser)
+{
+    C res;
+    for (const auto & s : tokenizeString<Strings>(str)) {
+        if constexpr (requires { res.push_back(parser(s)); })
+            res.push_back(parser(s));
+        else
+            res.insert(parser(s));
+    }
+    return res;
+}
+
+/**
+ * Render a container `C` of `T` as a single space-separated string,
+ * applying `render` to each element. The matching helper for
+ * `parseSettingTokens` -- used by `BaseSetting<C<T>>::to_string`
+ * specialisations.
+ */
+template<class C, class Render>
+inline std::string renderSettingTokens(const C & value, const Render & render)
+{
+    Strings ss;
+    for (const auto & elem : value)
+        ss.push_back(render(elem));
+    return concatStringsSep(" ", ss);
+}
 
 /* Delete these overloads to avoid footguns with implicit quoting of Setting<AbsolutePath> in fmt(). */
 
