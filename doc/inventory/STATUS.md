@@ -80,6 +80,45 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
+- **Post-batch-H Pass-2 adversarial review — fix #234 iteration-safety + #224 commit body + 4 doc gaps** (May 2026)
+  — second adversarial-review pass after the user said "dig
+  deeper" caught a real iteration-safety regression and three
+  doc gaps that the first pass missed.
+  **Real bug:** #234's `forEachConfiguredSigner` removed the
+  pre-existing `auto secretKeyFiles = settings.secretKeyFiles;`
+  snapshot copy that #100 had, replacing it with a direct
+  `settings.secretKeyFiles.get()` iteration that holds a `const
+  std::list<std::string> &` to live `Setting<T>` state.
+  `BaseSetting<T>::get()` returns `const T &` with no
+  synchronisation, and a trusted daemon client can mutate
+  `secret-key-files` mid-session via `ClientSettings::apply`.
+  Iterating a live setting reference would race the
+  `std::list` re-assignment. Fixed by restoring the snapshot
+  copy before the for-range. Amended in place; new libstore tip
+  `6022c2925`.
+  **Stale commit-message body:** #224's commit message claimed
+  "Migrate the single existing call site in nar-listing.cc"
+  while the diff actually migrated four sites
+  (`NarIndexer::createMember`, `CanonPath::fromFilename`,
+  `unix/file-system-at.cc::openFileEnsureBeneathNoSymlinksIterative`,
+  the equivalent on Windows) plus a unit test. FOLLOWUPS Batch A
+  recorded this as fixed but the fix had only been a metadata
+  rebase that bumped the SHA without touching the message body.
+  Reworded via non-interactive `GIT_SEQUENCE_EDITOR` + sed-based
+  `GIT_EDITOR`; new libutil tip `834a52639`. The reword cascade
+  bumped all five libutil commits past #224.
+  **Doc gaps closed:** #97 Branch line had `parseCompressionAlgo`
+  in `compression-settings.cc` (actual: `compression-algo.cc`);
+  fixed. #226 Branch line gained a latent-fragility note —
+  `renderEnum`'s first-match correctness depends on alias rows
+  following canonical rows in the table, with no compile-time
+  enforcement; flagged for future hardening (`static_assert` or
+  alias-tag pattern). #239 added the libutil SHA citation
+  `f2ead5163` for parity with #240's `1ac18fe9a`. STATUS.md
+  gained a "Current tip SHAs (as of last edit)" block at the
+  document tail to disambiguate against the chronological log's
+  intermediate-tip claims. clang-tidy and `nix build -L .`
+  green on libutil and libstore post-rebase + post-amend.
 - **Post-batch-H adversarial review — fix #234 thread-safety bug + doc gaps** (May 2026)
   — adversarial review across the doc-branch and seven cleanup
   branches caught one real bug and several documentation gaps.
@@ -446,8 +485,8 @@ line in its body.
 | `vibe-coding/cleanup/libfetchers` | libfetchers | #52, #51 (delete-and-trim, scope expanded past the two `#if 0` blocks), #53 (latent-bug fix in `getCustomRegistry`), #230 (GitArchive subclass DRY: getHost/getOwner/getRepo + clone() promoted to base; defaultHost() + cloneUrlSuffix() per subclass; GitLab `// FIXME: get username somewhere` preserved as a class-level comment); plus Batch-C rl-next extension noting treeHash rejection | Local-only past `572e8fde8` |
 | `vibe-coding/cleanup/libflake` | libflake | #48, #78 (helper covers two of three DFS sites; `doFind` excluded as structurally different), #133 (rename only; deviation from prescribed end state documented) | Local-only past `fd6749635` |
 | `vibe-coding/cleanup/libmain` | libmain | #49, #128, #222 (`--max-freed` clamp), #223 (`getIntArg` wrapper around `getArg`); plus Batch-C max-freed-clamp rl-next entry; plus Batch-G `getIntArg` 4-arg-signature-break rl-next entry | Local-only past `b1a14158f` |
-| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4 (extended to template form), #5 (extended to template form), #6 (hoist-then-delete), #14, #47, #82, #114, #115, #157, #159, #165, #26 (Linux only — Windows untested under current CI), #46 (buildenv + unpack-channel; `fetchurl` excluded — different lookup shape), #80 (Windows behaviour change: `log-fd` now respected), #83, #85, #100 (helper-only scope), #135 (option (a) flatten), #1+#3 (BuildResult/DrvOutput/Realisation templates with cpu-timing-as-callback), #7 (`negotiateVersion` client-side helper), #11 (`tryUpperFallLower` returning `std::pair<R, bool>`), #55 (stale migration drop), #59 (`useBuildUsers` static drop), #101 (`partitionRealisedPaths` + `registerCopiedRealisations`), #153 (`DerivationBuilderImpl` composition), #185 (`ServeProto::BasicConnection` + `protoVersion` rename), #183 (drop dead `QueryDeriver` opcode arm in daemon.cc::performOp), #234 (cache parsed secret keys per-file in store-api.cc; mutation-safe wrt `secret-key-files` setting; pointer-stable via `std::unique_ptr` values to keep the lock scope at map-mutation only); plus Batch-C doc fixes (worker-protocol-connection wrong-shard wording, negotiateVersion docstring); plus Batch-G #80 Windows-`log-fd` rl-next entry. **Cross-shard cleanup** (May 2026): two libutil-touching commits dropped from this branch so it can land independently — #119's `BaseSetting<T>::overrideIfSet` libutil header addition + the `HttpBinaryCacheStore` consumer (former commit `aa00e072e`); #221's `parseSettingTokens`/`renderSettingTokens` libutil header lift + the `globals.cc` consumer (former commit `ae7167e8c`); plus the dropped #119 rl-next entry. The libutil header halves moved to the libutil branch; the libstore consumer halves were dropped and re-filed as queued candidates #239 (#119's consumer) and #240 (#221's consumer), both blocked on libutil upstream merge | Local-only past `689effee2` |
-| `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117, #37 (helper covers one of three NAR walks; other two structurally distinct), #97 (new `parse-enum.hh`; migrated 5 parsers including file-content-address pair from Pass-B sweep; folded in two latent-bug fixes — `parseHashFormat` `nix32` omission and `parseFileSerialisationMethod` typo), #124 (drop `SyncBase`; `Sync<T>::ConstLock` + `mutable mutex`), #167 (`io-buffer-sizes.hh` + 6 site migrations), #224 (`CanonPath::numSegments` + 4 migrations), #119 (`BaseSetting<T>::overrideIfSet` libutil header addition; consumer migration deferred to libstore as queued #239), #221 (`parseSettingTokens`/`renderSettingTokens` libutil header lift; consumer migration deferred to libstore as queued #240), #226 (`renderEnum<E>` helper in `parse-enum.hh` + 5 site migrations completing the parse/show symmetry from #97); plus #119 rl-next entry. Batch-G dropped #163 `PipeOptions` overload (zero in-tree consumers); Batch-G follow-up reworded #29/#99/#117 commit bodies to canonical `Refs candidate` form. **Cross-shard cleanup** (May 2026): #119 and #221 moved from libstore to here (header-only halves); the libstore consumer halves are queued as #239/#240 blocked on libutil upstream merge | Local-only past `190b08372` |
+| `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4 (extended to template form), #5 (extended to template form), #6 (hoist-then-delete), #14, #47, #82, #114, #115, #157, #159, #165, #26 (Linux only — Windows untested under current CI), #46 (buildenv + unpack-channel; `fetchurl` excluded — different lookup shape), #80 (Windows behaviour change: `log-fd` now respected), #83, #85, #100 (helper-only scope), #135 (option (a) flatten), #1+#3 (BuildResult/DrvOutput/Realisation templates with cpu-timing-as-callback), #7 (`negotiateVersion` client-side helper), #11 (`tryUpperFallLower` returning `std::pair<R, bool>`), #55 (stale migration drop), #59 (`useBuildUsers` static drop), #101 (`partitionRealisedPaths` + `registerCopiedRealisations`), #153 (`DerivationBuilderImpl` composition), #185 (`ServeProto::BasicConnection` + `protoVersion` rename), #183 (drop dead `QueryDeriver` opcode arm in daemon.cc::performOp), #234 (cache parsed secret keys per-file in store-api.cc; mutation-safe wrt `secret-key-files` setting; pointer-stable via `std::unique_ptr` values to keep the lock scope at map-mutation only); plus Batch-C doc fixes (worker-protocol-connection wrong-shard wording, negotiateVersion docstring); plus Batch-G #80 Windows-`log-fd` rl-next entry. **Cross-shard cleanup** (May 2026): two libutil-touching commits dropped from this branch so it can land independently — #119's `BaseSetting<T>::overrideIfSet` libutil header addition + the `HttpBinaryCacheStore` consumer (former commit `aa00e072e`); #221's `parseSettingTokens`/`renderSettingTokens` libutil header lift + the `globals.cc` consumer (former commit `ae7167e8c`); plus the dropped #119 rl-next entry. The libutil header halves moved to the libutil branch; the libstore consumer halves were dropped and re-filed as queued candidates #239 (#119's consumer) and #240 (#221's consumer), both blocked on libutil upstream merge | Local-only past `6022c2925` |
+| `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117, #37 (helper covers one of three NAR walks; other two structurally distinct), #97 (new `parse-enum.hh`; migrated 5 parsers including file-content-address pair from Pass-B sweep; folded in two latent-bug fixes — `parseHashFormat` `nix32` omission and `parseFileSerialisationMethod` typo), #124 (drop `SyncBase`; `Sync<T>::ConstLock` + `mutable mutex`), #167 (`io-buffer-sizes.hh` + 6 site migrations), #224 (`CanonPath::numSegments` + 4 migrations), #119 (`BaseSetting<T>::overrideIfSet` libutil header addition; consumer migration deferred to libstore as queued #239), #221 (`parseSettingTokens`/`renderSettingTokens` libutil header lift; consumer migration deferred to libstore as queued #240), #226 (`renderEnum<E>` helper in `parse-enum.hh` + 5 site migrations completing the parse/show symmetry from #97); plus #119 rl-next entry. Batch-G dropped #163 `PipeOptions` overload (zero in-tree consumers); Batch-G follow-up reworded #29/#99/#117 commit bodies to canonical `Refs candidate` form. **Cross-shard cleanup** (May 2026): #119 and #221 moved from libstore to here (header-only halves); the libstore consumer halves are queued as #239/#240 blocked on libutil upstream merge. **Post-Pass-2 review** (May 2026): #224 commit-message body reworded — claimed "Migrate the single existing call site in nar-listing.cc" but the diff actually migrated four sites (this had been recorded as fixed in FOLLOWUPS Batch A but a metadata-only rebase had bumped the SHA without touching the message body). All five upstream commit SHAs moved by one rebase pass | Local-only past `834a52639` |
 | `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142, #24, #77, #89, #91, #187, #74, #75, #72 (free helpers, not mixin — diamond inheritance), #93 (3 of 4 parents; `CmdHash` retained inline deliberately — see #236 declined), #141 (per-command `static`-ify subset only — extended to `removeOldGenerations` after Pass A), #231 (`nix-env --priority` `getArg` substitution at `opInstall`), #235 (consolidate `printGCWarning` gating in `nix-store` and `nix-instantiate`; rl-next disclosure for the user-visible warning-on-non-LocalFSStore behaviour change) | Local-only past `24ebbcc35` |
 
 The branches whose Status reads "Pushed" are on `origin`
@@ -500,3 +539,21 @@ propose a new one). Spawn an agent for it with `AGENT-CHARTER.md` as
 - Candidate cross-references: bare `#NN` for 1-217, `NN` (no hash)
   for cross-shard `N1-N44`, `EN` / `FN` / `BN` / `CN` / `VN` for
   reports.
+
+## Current tip SHAs (as of last edit)
+
+| Branch | Tip |
+| ------ | --- |
+| `vibe-coding/cleanup/libexpr` | `76b6808f0` |
+| `vibe-coding/cleanup/libfetchers` | `572e8fde8` |
+| `vibe-coding/cleanup/libflake` | `fd6749635` |
+| `vibe-coding/cleanup/libmain` | `b1a14158f` |
+| `vibe-coding/cleanup/libstore` | `6022c2925` |
+| `vibe-coding/cleanup/libutil` | `834a52639` |
+| `vibe-coding/cleanup/nix-cli` | `24ebbcc35` |
+
+The chronological narrative above carries intermediate tip claims
+("Final tip SHAs after Batch G", etc.) that are no longer current.
+This block is the single source of truth; verify against
+`git rev-parse HEAD` on the corresponding worktree before acting on
+any tip-SHA claim elsewhere in this file.
