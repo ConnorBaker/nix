@@ -33,10 +33,7 @@ CompressionAlgo parseCompressionAlgo(std::string_view method)
 
 std::string showCompressionAlgo(CompressionAlgo method)
 {
-    for (const auto & entry : compressionAlgoTable)
-        if (entry.value == method)
-            return std::string(entry.name);
-    unreachable();
+    return std::string(renderEnum<CompressionAlgo>(method, compressionAlgoTable));
 }
 
 } // namespace nix

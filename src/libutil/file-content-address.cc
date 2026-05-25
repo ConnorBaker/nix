@@ -34,27 +34,12 @@ FileIngestionMethod parseFileIngestionMethod(std::string_view input)
 
 std::string_view renderFileSerialisationMethod(FileSerialisationMethod method)
 {
-    switch (method) {
-    case FileSerialisationMethod::Flat:
-        return "flat";
-    case FileSerialisationMethod::NixArchive:
-        return "nar";
-    default:
-        assert(false);
-    }
+    return renderEnum<FileSerialisationMethod>(method, fileSerialisationMethodTable);
 }
 
 std::string_view renderFileIngestionMethod(FileIngestionMethod method)
 {
-    switch (method) {
-    case FileIngestionMethod::Flat:
-    case FileIngestionMethod::NixArchive:
-        return renderFileSerialisationMethod(static_cast<FileSerialisationMethod>(method));
-    case FileIngestionMethod::Git:
-        return "git";
-    default:
-        unreachable();
-    }
+    return renderEnum<FileIngestionMethod>(method, fileIngestionMethodTable);
 }
 
 void dumpPath(const SourcePath & path, Sink & sink, FileSerialisationMethod method, PathFilter & filter)

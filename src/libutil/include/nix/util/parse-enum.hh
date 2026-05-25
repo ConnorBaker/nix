@@ -105,6 +105,30 @@ std::string formatEnumNameList(EnumNames<E> table)
 }
 
 /**
+ * Inverse of `parseEnumOpt` / `parseEnumOrThrow`: given an enum
+ * value, return the `name` from the first row whose `value` matches.
+ * Aborts (via `unreachable()`) if no row matches — every reachable
+ * enumerator should appear in the table, and a missing one is a
+ * programming error caught at the first call. The returned view
+ * points into the table's storage, which is required to outlive the
+ * caller (the in-tree tables are `static const` `initializer_list`s,
+ * so this is satisfied at every site).
+ *
+ * Pairs with `parseEnumOpt` and `parseEnumOrThrow`: a single table
+ * drives both directions, so adding a new enumerator only requires
+ * a row in the table — the parser, the renderer, and the
+ * "expected …" error tail all pick up the change automatically.
+ */
+template<typename E>
+std::string_view renderEnum(E value, EnumNames<E> table)
+{
+    for (const auto & entry : table)
+        if (entry.value == value)
+            return entry.name;
+    unreachable();
+}
+
+/**
  * Like `parseEnumOpt` but throws `UsageError` on no match. The
  * thrown error carries best-match suggestions derived from the
  * table's name set, quotes `settingName` in the message so the

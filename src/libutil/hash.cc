@@ -448,22 +448,9 @@ HashFormat parseHashFormat(std::string_view hashFormatName)
     return parseEnumOrThrow<HashFormat>(hashFormatName, hashFormatTable, "hash format");
 }
 
-std::string_view printHashFormat(HashFormat HashFormat)
+std::string_view printHashFormat(HashFormat hashFormat)
 {
-    switch (HashFormat) {
-    case HashFormat::Base64:
-        return "base64";
-    case HashFormat::Nix32:
-        return "nix32";
-    case HashFormat::Base16:
-        return "base16";
-    case HashFormat::SRI:
-        return "sri";
-    default:
-        // illegal hash base enum value internally, as opposed to external input
-        // which should be validated with nice error message.
-        assert(false);
-    }
+    return renderEnum<HashFormat>(hashFormat, hashFormatTable);
 }
 
 /**
@@ -493,22 +480,7 @@ HashAlgorithm parseHashAlgo(std::string_view s, const ExperimentalFeatureSetting
 
 std::string_view printHashAlgo(HashAlgorithm ha)
 {
-    switch (ha) {
-    case HashAlgorithm::BLAKE3:
-        return "blake3";
-    case HashAlgorithm::MD5:
-        return "md5";
-    case HashAlgorithm::SHA1:
-        return "sha1";
-    case HashAlgorithm::SHA256:
-        return "sha256";
-    case HashAlgorithm::SHA512:
-        return "sha512";
-    default:
-        // illegal hash type enum value internally, as opposed to external input
-        // which should be validated with nice error message.
-        assert(false);
-    }
+    return renderEnum<HashAlgorithm>(ha, hashAlgoTable);
 }
 
 } // namespace nix
