@@ -243,6 +243,48 @@ struct GitArchiveInputScheme : InputScheme
 
     virtual DownloadUrl getDownloadUrl(const Settings & settings, const Input & input) const = 0;
 
+    /**
+     * Default host for this scheme (`github.com`, `gitlab.com`, `git.sr.ht`).
+     * Overridden via the `host` URL parameter or input attribute.
+     */
+    virtual std::string_view defaultHost() const = 0;
+
+    /**
+     * Append `".git"` to the clone URL? GitHub and GitLab keep the
+     * suffix; SourceHut omits it. The trailing-suffix difference is
+     * the only structural variation in `clone()` once the host /
+     * owner / repo accessors are shared.
+     */
+    virtual std::string_view cloneUrlSuffix() const
+    {
+        return ".git";
+    }
+
+    std::string getHost(const Input & input) const
+    {
+        return maybeGetStrAttr(input.attrs, "host").value_or(std::string{defaultHost()});
+    }
+
+    std::string getOwner(const Input & input) const
+    {
+        return getStrAttr(input.attrs, "owner");
+    }
+
+    std::string getRepo(const Input & input) const
+    {
+        return getStrAttr(input.attrs, "repo");
+    }
+
+    void clone(const Settings & settings, Store & store, const Input & input, const std::filesystem::path & destDir)
+        const override
+    {
+        auto host = getHost(input);
+        Input::fromURL(
+            settings, fmt("git+https://%s/%s/%s%s", host, getOwner(input), getRepo(input), cloneUrlSuffix()))
+            .applyOverrides(input.getRef(), input.getRev())
+            .clone(settings, store, destDir);
+    }
+
     struct TarballInfo
     {
         Hash treeHash;
@@ -368,19 +410,9 @@ struct GitHubInputScheme : GitArchiveInputScheme
         return std::pair<std::string, std::string>("Authorization", fmt("token %s", token));
     }
 
-    std::string getHost(const Input & input) const
+    std::string_view defaultHost() const override
     {
-        return maybeGetStrAttr(input.attrs, "host").value_or("github.com");
-    }
-
-    std::string getOwner(const Input & input) const
-    {
-        return getStrAttr(input.attrs, "owner");
-    }
-
-    std::string getRepo(const Input & input) const
-    {
-        return getStrAttr(input.attrs, "repo");
+        return "github.com";
     }
 
     Hash getRevFromRef(const Settings & settings, nix::Store & store, const Input & input) const override
@@ -419,15 +451,6 @@ struct GitHubInputScheme : GitArchiveInputScheme
 
         return DownloadUrl{parseURL(url), headers};
     }
-
-    void clone(const Settings & settings, Store & store, const Input & input, const std::filesystem::path & destDir)
-        const override
-    {
-        auto host = getHost(input);
-        Input::fromURL(settings, fmt("git+https://%s/%s/%s.git", host, getOwner(input), getRepo(input)))
-            .applyOverrides(input.getRef(), input.getRev())
-            .clone(settings, store, destDir);
-    }
 };
 
 struct GitLabInputScheme : GitArchiveInputScheme
@@ -462,15 +485,23 @@ struct GitLabInputScheme : GitArchiveInputScheme
         return std::make_pair(token.substr(0, fldsplit), token.substr(fldsplit + 1));
     }
 
+    std::string_view defaultHost() const override
+    {
+        return "gitlab.com";
+    }
+
+    // FIXME: get username somewhere. The base-class clone() builds
+    // `git+https://<host>/<owner>/<repo>.git` for GitLab; some GitLab
+    // setups require a username in the URL for clone over HTTPS.
     Hash getRevFromRef(const Settings & settings, nix::Store & store, const Input & input) const override
     {
-        auto host = maybeGetStrAttr(input.attrs, "host").value_or("gitlab.com");
+        auto host = getHost(input);
         // See rate limiting note below
         auto url =
             fmt("https://%s/api/v4/projects/%s%%2F%s/repository/commits?ref_name=%s",
                 host,
-                getStrAttr(input.attrs, "owner"),
-                getStrAttr(input.attrs, "repo"),
+                getOwner(input),
+                getRepo(input),
                 *input.getRef());
 
         Headers headers = makeHeadersWithAuthTokens(settings, host, input);
@@ -496,28 +527,16 @@ struct GitLabInputScheme : GitArchiveInputScheme
         // authenticated via an accessToken or not, but the usual rate
         // is 10 reqs/sec/ip-addr.  See
         // https://docs.gitlab.com/ee/user/gitlab_com/index.html#gitlabcom-specific-rate-limits
-        auto host = maybeGetStrAttr(input.attrs, "host").value_or("gitlab.com");
+        auto host = getHost(input);
         auto url =
             fmt("https://%s/api/v4/projects/%s%%2F%s/repository/archive.tar.gz?sha=%s",
                 host,
-                getStrAttr(input.attrs, "owner"),
-                getStrAttr(input.attrs, "repo"),
+                getOwner(input),
+                getRepo(input),
                 input.getRev()->to_string(HashFormat::Base16, false));
 
         Headers headers = makeHeadersWithAuthTokens(settings, host, input);
         return DownloadUrl{parseURL(url), headers};
-    }
-
-    void clone(const Settings & settings, Store & store, const Input & input, const std::filesystem::path & destDir)
-        const override
-    {
-        auto host = maybeGetStrAttr(input.attrs, "host").value_or("gitlab.com");
-        // FIXME: get username somewhere
-        Input::fromURL(
-            settings,
-            fmt("git+https://%s/%s/%s.git", host, getStrAttr(input.attrs, "owner"), getStrAttr(input.attrs, "repo")))
-            .applyOverrides(input.getRef(), input.getRev())
-            .clone(settings, store, destDir);
     }
 };
 
@@ -544,6 +563,16 @@ struct SourceHutInputScheme : GitArchiveInputScheme
         // Once it is implemented, however, should work as expected.
     }
 
+    std::string_view defaultHost() const override
+    {
+        return "git.sr.ht";
+    }
+
+    std::string_view cloneUrlSuffix() const override
+    {
+        return "";
+    }
+
     Hash getRevFromRef(const Settings & settings, nix::Store & store, const Input & input) const override
     {
         // TODO: In the future, when the sourcehut graphql API is implemented for mercurial
@@ -551,9 +580,8 @@ struct SourceHutInputScheme : GitArchiveInputScheme
 
         auto ref = *input.getRef();
 
-        auto host = maybeGetStrAttr(input.attrs, "host").value_or("git.sr.ht");
-        auto base_url =
-            fmt("https://%s/%s/%s", host, getStrAttr(input.attrs, "owner"), getStrAttr(input.attrs, "repo"));
+        auto host = getHost(input);
+        auto base_url = fmt("https://%s/%s/%s", host, getOwner(input), getRepo(input));
 
         Headers headers = makeHeadersWithAuthTokens(settings, host, input);
 
@@ -592,27 +620,16 @@ struct SourceHutInputScheme : GitArchiveInputScheme
 
     DownloadUrl getDownloadUrl(const Settings & settings, const Input & input) const override
     {
-        auto host = maybeGetStrAttr(input.attrs, "host").value_or("git.sr.ht");
+        auto host = getHost(input);
         auto url =
             fmt("https://%s/%s/%s/archive/%s.tar.gz",
                 host,
-                getStrAttr(input.attrs, "owner"),
-                getStrAttr(input.attrs, "repo"),
+                getOwner(input),
+                getRepo(input),
                 input.getRev()->to_string(HashFormat::Base16, false));
 
         Headers headers = makeHeadersWithAuthTokens(settings, host, input);
         return DownloadUrl{parseURL(url), headers};
-    }
-
-    void clone(const Settings & settings, Store & store, const Input & input, const std::filesystem::path & destDir)
-        const override
-    {
-        auto host = maybeGetStrAttr(input.attrs, "host").value_or("git.sr.ht");
-        Input::fromURL(
-            settings,
-            fmt("git+https://%s/%s/%s", host, getStrAttr(input.attrs, "owner"), getStrAttr(input.attrs, "repo")))
-            .applyOverrides(input.getRef(), input.getRev())
-            .clone(settings, store, destDir);
     }
 };
 
