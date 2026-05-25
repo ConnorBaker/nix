@@ -524,12 +524,13 @@ landed surfaced two more items, both addressed.
   **Post-cleanup correction (May 2026):** this re-shelve was the
   *opposite* of what the cross-shard-independence rule requires.
   `ae7167e8c` was dropped from the libstore branch entirely; the
-  libutil header half was replayed as `1ac18fe9a` on the libutil
-  branch and the libstore consumer half is now queued candidate
-  **#240** blocked on libutil upstream merge. The "phantom claim"
-  framing of this item is no longer accurate — `#221` belongs on
-  the libutil row because that is where the only landed code
-  lives, not because of a re-shelving decision.
+  libutil header half was replayed on the libutil branch
+  (currently `3f893878b` post-pass-2 #224-reword cascade) and the
+  libstore consumer half is now queued candidate **#240** blocked
+  on libutil upstream merge. The "phantom claim" framing of this
+  item is no longer accurate — `#221` belongs on the libutil row
+  because that is where the only landed code lives, not because of
+  a re-shelving decision.
 - [x] ~~**Missing rl-next entry for `BaseSetting<T>::overrideIfSet`.**
   Commit `aa00e072e` on `vibe-coding/cleanup/libstore` added a new
   public member function on `BaseSetting<T>` in the shipped
@@ -542,12 +543,12 @@ landed surfaced two more items, both addressed.
   **Post-cleanup correction (May 2026):** `aa00e072e` (the API
   addition) and `b9a750f00` (this rl-next entry) were dropped
   from the libstore branch during the cross-shard cleanup. The
-  rl-next entry was replayed as `fdb46ab33` on the libutil branch
-  alongside the API addition (`f2ead5163`), with the body
-  tightened to describe the consumer migration as
-  planned-once-libutil-merges rather than already-done. The
-  libstore consumer half is queued candidate **#239** blocked on
-  libutil upstream merge.
+  rl-next entry was replayed on the libutil branch (currently
+  `3b6cdf3d1` post-pass-2 #224-reword cascade) alongside the API
+  addition (currently `2bc3e21e0`), with the body tightened to
+  describe the consumer migration as planned-once-libutil-merges
+  rather than already-done. The libstore consumer half is queued
+  candidate **#239** blocked on libutil upstream merge.
 - [x] ~~**Stylistic non-canonical commit-body form on three libutil
   commits.** Bodies on `4212ac8c7` (#29), `7bfd6d15b` (#99), and
   `fe96867de` (#117) used `Candidate #NN in doc/inventory/candidates/.`

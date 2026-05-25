@@ -80,6 +80,34 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
+- **Post-batch-H Pass-3 adversarial review — refresh stale SHAs after #224-reword cascade + document #234 snapshot-iterate discipline** (May 2026)
+  — third adversarial-review pass after the user said "another
+  adversarial review" caught a second-order-staleness pattern.
+  The Pass-2 #224 commit-message reword was a `git rebase -i
+  master` with `reword`, which rewrote the metadata of #224 and
+  every commit past it on the libutil branch — bumping five SHAs
+  including #119's API addition (`f2ead5163` → `2bc3e21e0`),
+  #221's API lift (`1ac18fe9a` → `3f893878b`), and #119's
+  rl-next entry (`fdb46ab33` → `3b6cdf3d1`).
+  The Pass-2 fixes had cited the *pre-reword-cascade* SHAs in
+  six places, leaving them dangling-in-the-object-store with no
+  branch reachability. **Six citations refreshed** in this round:
+  #239 body and validation (3 citations), #240 body (1 citation),
+  FOLLOWUPS Batch-G #221 phantom-claim post-cleanup correction,
+  FOLLOWUPS Batch-G #119 missing-rl-next post-cleanup correction.
+  All now point at current libutil-branch SHAs, with a note that
+  the SHAs may move again before the libutil branch merges
+  upstream.
+  **Doc gap closed:** #234 Branch line documented pointer-stability
+  via `std::unique_ptr` but not the snapshot-iterate discipline
+  added by the Pass-2 iteration-safety fix. Branch line now
+  describes both safety properties.
+  **Bonus narrative refresh:** STATUS.md's Pass-2 entry self-
+  description ("#239 added the libutil SHA citation `f2ead5163`")
+  reworded to avoid pinning to specific SHAs that have since
+  moved.
+  No code changes this round. Tip SHAs unchanged: libstore
+  `6022c2925`, libutil `834a52639`, others unchanged.
 - **Post-batch-H Pass-2 adversarial review — fix #234 iteration-safety + #224 commit body + 4 doc gaps** (May 2026)
   — second adversarial-review pass after the user said "dig
   deeper" caught a real iteration-safety regression and three
@@ -113,12 +141,14 @@ The other entry points:
   `renderEnum`'s first-match correctness depends on alias rows
   following canonical rows in the table, with no compile-time
   enforcement; flagged for future hardening (`static_assert` or
-  alias-tag pattern). #239 added the libutil SHA citation
-  `f2ead5163` for parity with #240's `1ac18fe9a`. STATUS.md
-  gained a "Current tip SHAs (as of last edit)" block at the
-  document tail to disambiguate against the chronological log's
-  intermediate-tip claims. clang-tidy and `nix build -L .`
-  green on libutil and libstore post-rebase + post-amend.
+  alias-tag pattern). #239 / #240 gained their libutil SHA
+  citations for parity (the SHAs themselves were rewritten by the
+  same #224-reword cascade and were re-refreshed in pass-3; see
+  the next entry). STATUS.md gained a "Current tip SHAs (as of
+  last edit)" block at the document tail to disambiguate against
+  the chronological log's intermediate-tip claims. clang-tidy and
+  `nix build -L .` green on libutil and libstore post-rebase +
+  post-amend.
 - **Post-batch-H adversarial review — fix #234 thread-safety bug + doc gaps** (May 2026)
   — adversarial review across the doc-branch and seven cleanup
   branches caught one real bug and several documentation gaps.
