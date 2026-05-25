@@ -15,6 +15,15 @@ ordered by risk and by logical grouping, not by priority.
 fix landed and verified. Strike-through marks completion. New items
 go at the bottom of their batch with a `(N)` tag.
 
+**SHA citation note:** strike-through items record the SHAs that were
+current at the time the item was completed. Many of those SHAs have
+since been rewritten by subsequent rebases (notably the post-pass-2
+#224 commit-body reword cascade on libutil). Verify against
+`STATUS.md`'s "Current tip SHAs (as of last edit)" block before
+acting on any historical SHA cited here. Forward-looking ("active")
+items should always cite current SHAs; if you find one that doesn't,
+that's a bug — please refresh.
+
 ---
 
 ## Batch A — branch-correctness amends
@@ -370,8 +379,10 @@ catalog entries.
   libstore cleanup branch builds against upstream master's
   installed nix-util headers, where `io-buffer-sizes.hh` does
   not yet exist. Two paths to unblock:
-  (a) wait for the libutil cleanup branch (tip `2c9005abe`)
-  to land upstream, then implement this on libstore;
+  (a) wait for the libutil cleanup branch (current tip
+  `834a52639` per STATUS.md's Current tip SHAs block; rebases
+  may bump this further) to land upstream, then implement this
+  on libstore;
   (b) rebase the libstore cleanup branch onto a worktree
   that has libutil's changes available — invasive and changes
   the merge story. (a) is the documented pattern. **See also:**
