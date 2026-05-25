@@ -342,7 +342,12 @@ ExternalValue * nix_get_external(nix_c_context * context, nix_value * value)
     NIXC_CATCH_ERRS_NULL;
 }
 
-nix_value * nix_get_list_byidx(nix_c_context * context, const nix_value * value, EvalState * state, unsigned int ix)
+/* Shared body for `nix_get_list_byidx` and `nix_get_list_byidx_lazy`. The
+   `force` flag controls whether the returned element is forced before
+   being wrapped; the rest of the behaviour (including the bounds-check
+   error message) is identical across both public symbols. */
+static nix_value * get_list_byidx_impl(
+    nix_c_context * context, const nix_value * value, EvalState * state, unsigned int ix, bool force)
 {
     if (context)
         context->last_err_code = NIX_OK;
@@ -356,68 +361,55 @@ nix_value * nix_get_list_byidx(nix_c_context * context, const nix_value * value,
         auto * p = v.listView()[ix];
         if (p == nullptr)
             return nullptr;
-        state->state.forceValue(*p, nix::noPos);
+        if (force)
+            state->state.forceValue(*p, nix::noPos);
         return new_nix_value(p, state->state.mem);
     }
     NIXC_CATCH_ERRS_NULL
 }
 
+nix_value * nix_get_list_byidx(nix_c_context * context, const nix_value * value, EvalState * state, unsigned int ix)
+{
+    return get_list_byidx_impl(context, value, state, ix, /*force=*/true);
+}
+
 nix_value *
 nix_get_list_byidx_lazy(nix_c_context * context, const nix_value * value, EvalState * state, unsigned int ix)
+{
+    return get_list_byidx_impl(context, value, state, ix, /*force=*/false);
+}
+
+/* Shared body for `nix_get_attr_byname` and `nix_get_attr_byname_lazy`. */
+static nix_value * get_attr_byname_impl(
+    nix_c_context * context, const nix_value * value, EvalState * state, const char * name, bool force)
 {
     if (context)
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_in(value);
-        assert(v.type() == nix::nList);
-        if (ix >= v.listSize()) {
-            nix_set_err_msg(context, NIX_ERR_KEY, "list index out of bounds");
-            return nullptr;
+        assert(v.type() == nix::nAttrs);
+        nix::Symbol s = state->state.symbols.create(name);
+        auto attr = v.attrs()->get(s);
+        if (attr) {
+            if (force)
+                state->state.forceValue(*attr->value, nix::noPos);
+            return new_nix_value(attr->value, state->state.mem);
         }
-        auto * p = v.listView()[ix];
-        // Note: intentionally NOT calling forceValue() to keep the element lazy
-        return new_nix_value(p, state->state.mem);
+        nix_set_err_msg(context, NIX_ERR_KEY, "missing attribute");
+        return nullptr;
     }
     NIXC_CATCH_ERRS_NULL
 }
 
 nix_value * nix_get_attr_byname(nix_c_context * context, const nix_value * value, EvalState * state, const char * name)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        assert(v.type() == nix::nAttrs);
-        nix::Symbol s = state->state.symbols.create(name);
-        auto attr = v.attrs()->get(s);
-        if (attr) {
-            state->state.forceValue(*attr->value, nix::noPos);
-            return new_nix_value(attr->value, state->state.mem);
-        }
-        nix_set_err_msg(context, NIX_ERR_KEY, "missing attribute");
-        return nullptr;
-    }
-    NIXC_CATCH_ERRS_NULL
+    return get_attr_byname_impl(context, value, state, name, /*force=*/true);
 }
 
 nix_value *
 nix_get_attr_byname_lazy(nix_c_context * context, const nix_value * value, EvalState * state, const char * name)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        assert(v.type() == nix::nAttrs);
-        nix::Symbol s = state->state.symbols.create(name);
-        auto attr = v.attrs()->get(s);
-        if (attr) {
-            // Note: intentionally NOT calling forceValue() to keep the attribute lazy
-            return new_nix_value(attr->value, state->state.mem);
-        }
-        nix_set_err_msg(context, NIX_ERR_KEY, "missing attribute");
-        return nullptr;
-    }
-    NIXC_CATCH_ERRS_NULL
+    return get_attr_byname_impl(context, value, state, name, /*force=*/false);
 }
 
 bool nix_has_attr_byname(nix_c_context * context, const nix_value * value, EvalState * state, const char * name)
@@ -446,8 +438,19 @@ static void collapse_attrset_layer_chain_if_needed(nix::Value & v, EvalState * s
     }
 }
 
-nix_value *
-nix_get_attr_byidx(nix_c_context * context, nix_value * value, EvalState * state, unsigned int i, const char ** name)
+/* Shared body for `nix_get_attr_byidx` and `nix_get_attr_byidx_lazy`. The
+   bounds-check error message differs between the two public symbols
+   (the `_lazy` form's message claims a "Nix C API contract violation"
+   while the eager form does not); the message is taken as a parameter
+   to preserve both wordings exactly as shipped pre-dedup. */
+static nix_value * get_attr_byidx_impl(
+    nix_c_context * context,
+    nix_value * value,
+    EvalState * state,
+    unsigned int i,
+    const char ** name,
+    bool force,
+    const char * out_of_bounds_msg)
 {
     if (context)
         context->last_err_code = NIX_OK;
@@ -455,35 +458,29 @@ nix_get_attr_byidx(nix_c_context * context, nix_value * value, EvalState * state
         auto & v = check_value_in(value);
         collapse_attrset_layer_chain_if_needed(v, state);
         if (i >= v.attrs()->size()) {
-            nix_set_err_msg(context, NIX_ERR_KEY, "attribute index out of bounds");
+            nix_set_err_msg(context, NIX_ERR_KEY, out_of_bounds_msg);
             return nullptr;
         }
         const nix::Attr & a = (*v.attrs())[i];
         *name = state->state.symbols[a.name].c_str();
-        state->state.forceValue(*a.value, nix::noPos);
+        if (force)
+            state->state.forceValue(*a.value, nix::noPos);
         return new_nix_value(a.value, state->state.mem);
     }
     NIXC_CATCH_ERRS_NULL
 }
 
+nix_value *
+nix_get_attr_byidx(nix_c_context * context, nix_value * value, EvalState * state, unsigned int i, const char ** name)
+{
+    return get_attr_byidx_impl(context, value, state, i, name, /*force=*/true, "attribute index out of bounds");
+}
+
 nix_value * nix_get_attr_byidx_lazy(
     nix_c_context * context, nix_value * value, EvalState * state, unsigned int i, const char ** name)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        collapse_attrset_layer_chain_if_needed(v, state);
-        if (i >= v.attrs()->size()) {
-            nix_set_err_msg(context, NIX_ERR_KEY, "attribute index out of bounds (Nix C API contract violation)");
-            return nullptr;
-        }
-        const nix::Attr & a = (*v.attrs())[i];
-        *name = state->state.symbols[a.name].c_str();
-        // Note: intentionally NOT calling forceValue() to keep the attribute lazy
-        return new_nix_value(a.value, state->state.mem);
-    }
-    NIXC_CATCH_ERRS_NULL
+    return get_attr_byidx_impl(
+        context, value, state, i, name, /*force=*/false, "attribute index out of bounds (Nix C API contract violation)");
 }
 
 const char * nix_get_attr_name_byidx(nix_c_context * context, nix_value * value, EvalState * state, unsigned int i)
