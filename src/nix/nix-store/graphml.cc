@@ -1,4 +1,5 @@
 #include "graphml.hh"
+#include "closure-walk.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/derivations.hh"
 
@@ -34,12 +35,13 @@ static std::string makeNode(const ValidPathInfo & info)
         (info.path.isDerivation() ? "derivation" : "output-path"));
 }
 
+static std::string makeEdge(std::string_view src, std::string_view dst)
+{
+    return fmt("  <edge source=\"%1%\" target=\"%2%\"/>\n", xmlQuote(src), xmlQuote(dst));
+}
+
 void printGraphML(ref<Store> store, StorePathSet && roots)
 {
-    StorePathSet workList(std::move(roots));
-    StorePathSet doneSet;
-    std::pair<StorePathSet::iterator, bool> ret;
-
     cout << "<?xml version='1.0' encoding='utf-8'?>\n"
          << "<graphml xmlns='http://graphml.graphdrawing.org/xmlns'\n"
          << "    xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'\n"
@@ -49,28 +51,13 @@ void printGraphML(ref<Store> store, StorePathSet && roots)
          << "<key id='type' for='node' attr.name='type' attr.type='string'/>"
          << "<graph id='G' edgedefault='directed'>\n";
 
-    while (!workList.empty()) {
-        auto path = std::move(workList.extract(workList.begin()).value());
-
-        ret = doneSet.insert(path);
-        if (ret.second == false)
-            continue;
-
-        auto info = store->queryPathInfo(path);
-        cout << makeNode(*info);
-
-        for (auto & p : info->references) {
-            if (p != path) {
-                workList.insert(p);
-
-                auto makeEdge = [](std::string_view src, std::string_view dst) -> std::string {
-                    return fmt("  <edge source=\"%1%\" target=\"%2%\"/>\n", xmlQuote(src), xmlQuote(dst));
-                };
-
-                cout << makeEdge(path.to_string(), p.to_string());
-            }
-        }
-    }
+    walkClosure(
+        store,
+        std::move(roots),
+        [&](const StorePath &, const ValidPathInfo & info) { cout << makeNode(info); },
+        [&](const StorePath & path, const StorePath & reference) {
+            cout << makeEdge(path.to_string(), reference.to_string());
+        });
 
     cout << "</graph>\n";
     cout << "</graphml>\n";

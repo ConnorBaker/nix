@@ -1,4 +1,5 @@
 #include "dotgraph.hh"
+#include "closure-walk.hh"
 #include "nix/store/store-api.hh"
 
 #include <iostream>
@@ -36,26 +37,18 @@ static std::string makeNode(std::string_view id, std::string_view label, std::st
 
 void printDotGraph(ref<Store> store, StorePathSet && roots)
 {
-    StorePathSet workList(std::move(roots));
-    StorePathSet doneSet;
-
     cout << "digraph G {\n";
 
-    while (!workList.empty()) {
-        auto path = std::move(workList.extract(workList.begin()).value());
-
-        if (!doneSet.insert(path).second)
-            continue;
-
-        cout << makeNode(std::string(path.to_string()), path.name(), "#ff0000");
-
-        for (auto & p : store->queryPathInfo(path)->references) {
-            if (p != path) {
-                workList.insert(p);
-                cout << makeEdge(std::string(p.to_string()), std::string(path.to_string()));
-            }
-        }
-    }
+    walkClosure(
+        store,
+        std::move(roots),
+        [&](const StorePath & path, const ValidPathInfo &) {
+            cout << makeNode(std::string(path.to_string()), path.name(), "#ff0000");
+        },
+        // Edges in the dot output are reversed: the reference points at the path that holds it.
+        [&](const StorePath & path, const StorePath & reference) {
+            cout << makeEdge(std::string(reference.to_string()), std::string(path.to_string()));
+        });
 
     cout << "}\n";
 }
