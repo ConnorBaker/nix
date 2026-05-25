@@ -80,6 +80,33 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
+- **Sprint 1 — single-shard cleanup pass (May 2026)**
+  — five-candidate sweep filtered to single-shard, no-blocker work
+  per the user's "we must defer cross-shard work" rule. Three
+  shipped: **#87** (libexpr-c eager/lazy accessor pair dedup via
+  private impl helpers preserving error wording byte-for-byte;
+  libexpr commit `374e9db5e`); **#111** (`withRegex<Body>` template
+  helper extracting `prim_match`/`prim_split` regex-fetch + try/catch
+  scaffold; `RegexCache &` parameter sidesteps the existing private-
+  member friend cluster, no friend additions, deferring the cleaner
+  `EvalState::compileRegex` accessor to whenever #169 lands; libexpr
+  commit `418272080`); **#76** (`walkClosure` template helper
+  deduplicating the dotgraph/graphml BFS scaffold; helper kept in a
+  new file-local `nix-store/closure-walk.hh` rather than promoted to
+  `libstore/include/nix/store/store-api.hh` per the validation's
+  original sketch, because the latter would be a cross-shard libstore
+  change; nix-cli commit `705114e2c`). One **already shipped** in
+  Batch E but missing a Branch line: #229 (parameterised `SeenSet<T>`
+  on libexpr; commit `76b6808f0` ships the implementation; Branch
+  line added to candidate body in this round). One **declined**:
+  #156 (fan-out idiom dedup) — re-reading the two sites with fresh
+  eyes shows the "shared" block reduces to ~6 lines before the two
+  callers diverge into different `doneFailure` overload shapes;
+  extraction is cosmetic, doesn't unlock anything. Re-evaluate when
+  the surrounding `doneFailure` overloads unify or a third caller
+  adopts the same shape. New tip SHAs: libexpr `418272080`, nix-cli
+  `705114e2c`. `nix build -L .` green on both branches; libstore /
+  libutil / libfetchers / libmain / libflake unchanged.
 - **Post-batch-H Pass-4 adversarial review — file missing rl-next for #185 + record three coverage-gap findings** (May 2026)
   — fourth adversarial-review pass biased toward areas no prior
   reviewer had touched. **BLOCKER caught:** #185's `d313a74c6`
@@ -547,13 +574,13 @@ line in its body.
 
 | Branch | Shard | Addresses | Status |
 | ------ | ----- | --------- | ------ |
-| `vibe-coding/cleanup/libexpr` | libexpr | #217, #64, #66, #68, #106, #107, #109, #110 (extended to forceValueDeep), #112, #196, #199, #67, #79 (3 of 4 sites; `prim_fetchTree` excluded as misclassified — its loop dispatches on value type, not name), #105 (with doxygen `EXPAND_AS_DEFINED` follow-up), #214, #220, #192, #202+#203 (folded — drop failure-cache machinery, bump v6→v7, wrap `getAttr` in `doSQLite`, rl-next entry), #204 (drop `MultiEvalProfiler`; ctor-frozen `profilerHooks` cache); plus Batch-C doc fixes (lexer.l ID retarget, primop diagnostic rl-next); plus Batch-E compound-win cleanups #227 (drop dead `EvalProfiler` NVI cache + default no-op virtuals; rl-next entry), #228 (extend `NumOp` to `BitAnd`/`BitOr`/`BitXor`), #229 (parameterise `SeenSet` template + migrate underlying container to `boost::unordered_flat_set`) | Local-only past `76b6808f0` |
+| `vibe-coding/cleanup/libexpr` | libexpr | #217, #64, #66, #68, #106, #107, #109, #110 (extended to forceValueDeep), #112, #196, #199, #67, #79 (3 of 4 sites; `prim_fetchTree` excluded as misclassified — its loop dispatches on value type, not name), #105 (with doxygen `EXPAND_AS_DEFINED` follow-up), #214, #220, #192, #202+#203 (folded — drop failure-cache machinery, bump v6→v7, wrap `getAttr` in `doSQLite`, rl-next entry), #204 (drop `MultiEvalProfiler`; ctor-frozen `profilerHooks` cache); plus Batch-C doc fixes (lexer.l ID retarget, primop diagnostic rl-next); plus Batch-E compound-win cleanups #227 (drop dead `EvalProfiler` NVI cache + default no-op virtuals; rl-next entry), #228 (extend `NumOp` to `BitAnd`/`BitOr`/`BitXor`), #229 (parameterise `SeenSet` template + migrate underlying container to `boost::unordered_flat_set`); plus Sprint-1 cleanups: #87 (libexpr-c eager/lazy accessor pair dedup via private impls preserving error wording), #111 (`withRegex<Body>` template helper extracting the prim_match/prim_split regex-fetch + try/catch scaffold; `RegexCache &` parameter sidesteps the existing friend-cluster, no friend additions) | Local-only past `418272080` |
 | `vibe-coding/cleanup/libfetchers` | libfetchers | #52, #51 (delete-and-trim, scope expanded past the two `#if 0` blocks), #53 (latent-bug fix in `getCustomRegistry`), #230 (GitArchive subclass DRY: getHost/getOwner/getRepo + clone() promoted to base; defaultHost() + cloneUrlSuffix() per subclass; GitLab `// FIXME: get username somewhere` preserved as a class-level comment); plus Batch-C rl-next extension noting treeHash rejection | Local-only past `572e8fde8` |
 | `vibe-coding/cleanup/libflake` | libflake | #48, #78 (helper covers two of three DFS sites; `doFind` excluded as structurally different), #133 (rename only; deviation from prescribed end state documented) | Local-only past `fd6749635` |
 | `vibe-coding/cleanup/libmain` | libmain | #49, #128, #222 (`--max-freed` clamp), #223 (`getIntArg` wrapper around `getArg`); plus Batch-C max-freed-clamp rl-next entry; plus Batch-G `getIntArg` 4-arg-signature-break rl-next entry | Local-only past `b1a14158f` |
 | `vibe-coding/cleanup/libstore` | libstore | #54, #56, #57, #60, #4 (extended to template form), #5 (extended to template form), #6 (hoist-then-delete), #14, #47, #82, #114, #115, #157, #159, #165, #26 (Linux only — Windows untested under current CI), #46 (buildenv + unpack-channel; `fetchurl` excluded — different lookup shape), #80 (Windows behaviour change: `log-fd` now respected), #83, #85, #100 (helper-only scope), #135 (option (a) flatten), #1+#3 (BuildResult/DrvOutput/Realisation templates with cpu-timing-as-callback), #7 (`negotiateVersion` client-side helper), #11 (`tryUpperFallLower` returning `std::pair<R, bool>`), #55 (stale migration drop), #59 (`useBuildUsers` static drop), #101 (`partitionRealisedPaths` + `registerCopiedRealisations`), #153 (`DerivationBuilderImpl` composition), #185 (`ServeProto::BasicConnection` + `protoVersion` rename), #183 (drop dead `QueryDeriver` opcode arm in daemon.cc::performOp), #234 (cache parsed secret keys per-file in store-api.cc; mutation-safe wrt `secret-key-files` setting; pointer-stable via `std::unique_ptr` values to keep the lock scope at map-mutation only); plus Batch-C doc fixes (worker-protocol-connection wrong-shard wording, negotiateVersion docstring); plus Batch-G #80 Windows-`log-fd` rl-next entry. **Cross-shard cleanup** (May 2026): two libutil-touching commits dropped from this branch so it can land independently — #119's `BaseSetting<T>::overrideIfSet` libutil header addition + the `HttpBinaryCacheStore` consumer (former commit `aa00e072e`); #221's `parseSettingTokens`/`renderSettingTokens` libutil header lift + the `globals.cc` consumer (former commit `ae7167e8c`); plus the dropped #119 rl-next entry. The libutil header halves moved to the libutil branch; the libstore consumer halves were dropped and re-filed as queued candidates #239 (#119's consumer) and #240 (#221's consumer), both blocked on libutil upstream merge. **Pass-4 review** (May 2026): added `serve-protocol-protoversion-rename.md` rl-next entry disclosing #185's `remoteVersion`→`protoVersion` field rename in shipped `serve-protocol-connection.hh` (a public-API break for Hydra/Lix/plugin consumers; the gap was the same shape as Batch-G's systematic disclosure-fix pass and fell through) | Local-only past `09abb8158` |
 | `vibe-coding/cleanup/libutil` | libutil | #58, #130, #29, #99, #117, #37 (helper covers one of three NAR walks; other two structurally distinct), #97 (new `parse-enum.hh`; migrated 5 parsers including file-content-address pair from Pass-B sweep; folded in two latent-bug fixes — `parseHashFormat` `nix32` omission and `parseFileSerialisationMethod` typo), #124 (drop `SyncBase`; `Sync<T>::ConstLock` + `mutable mutex`), #167 (`io-buffer-sizes.hh` + 6 site migrations), #224 (`CanonPath::numSegments` + 4 migrations), #119 (`BaseSetting<T>::overrideIfSet` libutil header addition; consumer migration deferred to libstore as queued #239), #221 (`parseSettingTokens`/`renderSettingTokens` libutil header lift; consumer migration deferred to libstore as queued #240), #226 (`renderEnum<E>` helper in `parse-enum.hh` + 5 site migrations completing the parse/show symmetry from #97); plus #119 rl-next entry. Batch-G dropped #163 `PipeOptions` overload (zero in-tree consumers); Batch-G follow-up reworded #29/#99/#117 commit bodies to canonical `Refs candidate` form. **Cross-shard cleanup** (May 2026): #119 and #221 moved from libstore to here (header-only halves); the libstore consumer halves are queued as #239/#240 blocked on libutil upstream merge. **Post-Pass-2 review** (May 2026): #224 commit-message body reworded — claimed "Migrate the single existing call site in nar-listing.cc" but the diff actually migrated four sites (this had been recorded as fixed in FOLLOWUPS Batch A but a metadata-only rebase had bumped the SHA without touching the message body). All five upstream commit SHAs moved by one rebase pass | Local-only past `834a52639` |
-| `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142, #24, #77, #89, #91, #187, #74, #75, #72 (free helpers, not mixin — diamond inheritance), #93 (3 of 4 parents; `CmdHash` retained inline deliberately — see #236 declined), #141 (per-command `static`-ify subset only — extended to `removeOldGenerations` after Pass A), #231 (`nix-env --priority` `getArg` substitution at `opInstall`), #235 (consolidate `printGCWarning` gating in `nix-store` and `nix-instantiate`; rl-next disclosure for the user-visible warning-on-non-LocalFSStore behaviour change) | Local-only past `24ebbcc35` |
+| `vibe-coding/cleanup/nix-cli` | `src/nix/` (modern + legacy CLI) | #127, #142, #24, #77, #89, #91, #187, #74, #75, #72 (free helpers, not mixin — diamond inheritance), #93 (3 of 4 parents; `CmdHash` retained inline deliberately — see #236 declined), #141 (per-command `static`-ify subset only — extended to `removeOldGenerations` after Pass A), #231 (`nix-env --priority` `getArg` substitution at `opInstall`), #235 (consolidate `printGCWarning` gating in `nix-store` and `nix-instantiate`; rl-next disclosure for the user-visible warning-on-non-LocalFSStore behaviour change), #76 (Sprint-1: `walkClosure` template helper in new file-local `nix-store/closure-walk.hh` deduplicating the dotgraph/graphml BFS scaffold; helper kept in `nix-store/` rather than promoted to `store-api.hh` to keep single-shard) | Local-only past `705114e2c` |
 
 The branches whose Status reads "Pushed" are on `origin`
 (`ConnorBaker/nix`) and ready for upstream PR creation. The four
@@ -610,13 +637,13 @@ propose a new one). Spawn an agent for it with `AGENT-CHARTER.md` as
 
 | Branch | Tip |
 | ------ | --- |
-| `vibe-coding/cleanup/libexpr` | `76b6808f0` |
+| `vibe-coding/cleanup/libexpr` | `418272080` |
 | `vibe-coding/cleanup/libfetchers` | `572e8fde8` |
 | `vibe-coding/cleanup/libflake` | `fd6749635` |
 | `vibe-coding/cleanup/libmain` | `b1a14158f` |
 | `vibe-coding/cleanup/libstore` | `09abb8158` |
 | `vibe-coding/cleanup/libutil` | `834a52639` |
-| `vibe-coding/cleanup/nix-cli` | `24ebbcc35` |
+| `vibe-coding/cleanup/nix-cli` | `705114e2c` |
 
 The chronological narrative above carries intermediate tip claims
 ("Final tip SHAs after Batch G", etc.) that are no longer current.

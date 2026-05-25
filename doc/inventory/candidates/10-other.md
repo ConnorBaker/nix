@@ -46,6 +46,7 @@ Candidates 72-88. All seventeen VALID.
 76. **Closure-walk helpers (BFS over `references`).** `nix-store/dotgraph.cc` and `nix-store/graphml.cc` both implement the same `StorePathSet workList`/`doneSet` BFS over `references`. They differ only in edge-direction and per-node emission. A shared `walkClosure(start, visit)` helper would consolidate.
     - ../verified/18-nix-modern-2-legacy.md
     - **Validation:** VALID — byte-identical iteration scaffold. Edge direction differs (dotgraph reverses `p -> path`; graphml keeps `path -> p`). A `std::generator<StorePath> walkClosure(ref<Store>, StorePathSet roots)` coroutine in `store-api.hh` (next to `computeFSClosure`) is the cleanest fit. Effort: small.
+    - **Branch:** `vibe-coding/cleanup/nix-cli` (added a header-only template helper `walkClosure(store, roots, onPath, onEdge)` in a new `src/nix/nix-store/closure-walk.hh` — file-local to the `nix-store/` directory rather than promoted to `store-api.hh` per the validation's original sketch, because the latter would be a cross-shard libstore change. The helper takes per-path and per-edge callbacks so each caller emits its own format; queries `queryPathInfo` once per visited path and passes the `ValidPathInfo &` through (dotgraph ignores most fields, graphml uses them). Both consumer files now call `walkClosure(...)` with their own lambdas; node-emission and edge-direction divergence preserved. Output is byte-for-byte identical pre/post.)
 
 77. **Eval-cache release before `exec*` is duplicated four times.** `CmdRun::run`, `CmdDevelop::run`, `CmdShell::run`, `CmdFormatterRun::run` each call `state->evalCaches.clear()` immediately before exec'ing out of the process; the comment is identical at all four sites.
     - ../verified/17-nix-modern-1.md
@@ -98,6 +99,7 @@ Candidates 72-88. All seventeen VALID.
 87. **`Forced vs lazy` value access in C bindings.** `nix_get_list_byidx{,_lazy}`, `nix_get_attr_byname{,_lazy}`, `nix_get_attr_byidx{,_lazy}` are nearly-identical pairs differing only by the presence of `forceValue` and slight error-message variations. The duplication is the most obvious internal symmetry in the C ABI.
     - ../verified/19-c-bindings-misc.md
     - **Validation:** VALID. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libexpr` (three file-static private impl helpers — `get_list_byidx_impl`, `get_attr_byname_impl`, `get_attr_byidx_impl` — each carrying the shared body with a `bool force` parameter; the six public symbols become one-line wrappers selecting `force=true` or `force=false`. ABI and signature unchanged. Error wording preserved exactly: `nix_get_attr_byidx_lazy`'s "(Nix C API contract violation)" suffix on the bounds-check error message — divergent from `nix_get_attr_byidx`'s plain "attribute index out of bounds" — is threaded through the impl helper as a parameter rather than collapsed.)
 
 88. **`nix_<libname>_init` family.** Each library exposes a parallel idempotent init. Could be a single template macro; currently each is a hand-rolled wrapper.
     - ../verified/19-c-bindings-misc.md
