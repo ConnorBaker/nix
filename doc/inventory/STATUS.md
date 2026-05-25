@@ -177,19 +177,24 @@ The other entry points:
   libmain `b1a14158f`, libstore `a3ed63c01`, libutil `7399593ce`,
   nix-cli `2a34c3148` (unchanged). **Post-Batch-G audit follow-up:**
   a bidirectional traceability audit (independent agent) surfaced
-  one phantom claim — `#221` was shelved under STATUS' libutil row
-  but the commit lives on libstore — re-shelved with cross-shard
-  notes on both rows; one missing rl-next disclosure for the
-  additive `BaseSetting<T>::overrideIfSet` member added in commit
+  one phantom claim (`#221` shelved under STATUS' libutil row
+  while the commit lived on libstore — re-shelved at the time
+  with cross-shard notes; **superseded** by the later cross-shard
+  cleanup entry below, which dropped the libstore commit
+  entirely); one missing rl-next disclosure for the additive
+  `BaseSetting<T>::overrideIfSet` member added in commit
   `aa00e072e` (#119) on a shipped header (libstore tip moves to
-  `b9a750f00`); and one stylistic gap — three libutil commits used
-  the non-canonical `Candidate #NN in doc/inventory/candidates/.`
-  form rather than `Refs candidate #NN.` — reworded via
-  metadata-only `git rebase -i master` (libutil tip moves to
+  `b9a750f00` — **superseded** by cross-shard cleanup; this
+  commit was dropped); and one stylistic gap — three libutil
+  commits used the non-canonical `Candidate #NN in doc/inventory/
+  candidates/.` form rather than `Refs candidate #NN.` — reworded
+  via metadata-only `git rebase -i master` (libutil tip moves to
   `da1e0d7d9`; trees unchanged). clang-tidy + `nix build -L .`
   re-verified post-rebase; 5 known pre-existing master errors
   only. Final tip SHAs after follow-up: libstore `b9a750f00`,
-  libutil `da1e0d7d9`; other five branches unchanged.
+  libutil `da1e0d7d9`; other five branches unchanged. (Tip SHAs
+  in this paragraph are stale post-cross-shard-cleanup; see the
+  next entry for current tips.)
 - **20 GREEN+YELLOW candidates (18 commits) landed + 4-pass review + Pass-A/B/C amends + new candidates #225/#226** (May 2026, this batch)
   — bucket sweep over the catalog: triaged 28 small-effort candidates
   into GREEN (15)/YELLOW (5)/RED (8). Landed all GREEN+YELLOW: libstore
