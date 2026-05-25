@@ -541,6 +541,43 @@ landed surfaced two more items, both addressed.
   `34b02c3f7` (was `4212ac8c7`, #29), `309faf880` (was `7bfd6d15b`,
   #99), `b0574ddc5` (was `fe96867de`, #117).
 
+### Batch G follow-ups (adversarial-audit second pass)
+
+The user asked for an inventory of unfiled opportunities and asked
+the auditor to scrutinise everything I claimed was untracked. The
+auditor confirmed three items genuinely lacked candidate numbers
+and named two more whose framing/SHA had errors but were also
+untracked. All five filed as #234-#238 on the doc branch.
+
+- [x] ~~**#234 — `Store::signPathInfo` / `Store::signRealisation`
+  re-read every secret-key file from disk on every signing call;
+  #100's helper-only landing intentionally deferred the cache.**
+  FIXME comment in `store-api.cc` is the canonical pointer; #100's
+  body explicitly chose "helper extraction only" as the landing
+  scope. Filed in `12-libutil-libstore-core-extras.md`.~~
+- [x] ~~**#235 — `addPermRoot` GC-root-naming has three behavioural
+  divergences across the two legacy CLI sites that #91's helper
+  extraction deliberately left unresolved.** Counter-increment
+  timing, `absPath` timing, and `printGCWarning` gating each
+  diverge between `nix-store` and `nix-instantiate`. Filed in
+  `11-legacy-cli.md`.~~
+- [x] ~~**#236 — `CmdHash` is the only `getCommandsFor`-eligible
+  `NixMultiCommand` that can't migrate without a registry-with-args
+  mechanism.** #93's Branch line names this as deferred but no
+  separate candidate tracked it. Filed in `11-legacy-cli.md`.~~
+- [x] ~~**#237 — Two libstore call sites still use bare `65536`
+  literals for I/O buffer sizing where #167's `kDefaultIOBlockSize`
+  is the canonical name.** Cross-shard, blocked on libutil
+  upstream merge per Batch-E ledger. Now has a tracking number
+  beyond the FOLLOWUPS-ledger entry. Filed in
+  `17-cross-cutting.md`.~~
+- [x] ~~**#238 — `GitArchiveInputScheme::isLocked` carries an
+  in-source FIXME proposing Git tree hashes as the locking
+  primitive instead of NAR hashes.** Predates #51 and is
+  independent of it (different function, different scope).
+  Now has a tracking number rather than living only in the
+  source FIXME. Filed in `19-eval-core-fetcher-lookup-json.md`.~~
+
 (Optional, deferred — the reviewers also surfaced these but they
 are non-blocking and either moot or low-value:)
 
