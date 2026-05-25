@@ -4968,20 +4968,47 @@ ref<RegexCache> makeRegexCache()
     return make_ref<RegexCache>();
 }
 
+/* Fetch a regex from `cache`, run `body` with the compiled
+   `std::regex &`, and translate any `std::regex_error` thrown from
+   inside `body` (or from the cache fetch itself) into a uniform
+   `EvalError` keyed on the regex source string. The body callback is
+   invoked at most once. The two consumers share only the regex-fetch
+   and catch-arm scaffolding; their post-match assembly is structurally
+   distinct (regex_match vs cregex_iterator) and stays inline.
+
+   `cache` is taken by reference instead of via `EvalState::regexCache`
+   directly because that member is private; the calling primops are
+   `EvalState`'s friends (see `friend void prim_match` /
+   `friend void prim_split` in `eval.hh`) and pass `*state.regexCache`
+   from inside the friended scope. A future cleanup that lands a public
+   `EvalState::compileRegex` accessor (alongside #169's friend-cluster
+   reduction) can collapse the `cache` parameter. */
+template<class Body>
+static void withRegex(EvalState & state, const PosIdx pos, std::string_view re, RegexCache & cache, Body && body)
+{
+    try {
+        auto regex = cache.get(re);
+        body(*regex);
+    } catch (std::regex_error & e) {
+        if (e.code() == std::regex_constants::error_space) {
+            // limit is _GLIBCXX_REGEX_STATE_LIMIT for libstdc++
+            state.error<EvalError>("memory limit exceeded by regular expression '%s'", re).atPos(pos).debugThrow();
+        } else
+            state.error<EvalError>("invalid regular expression '%s'", re).atPos(pos).debugThrow();
+    }
+}
+
 void prim_match(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto re = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.match");
 
-    try {
-
-        auto regex = state.regexCache->get(re);
-
+    withRegex(state, pos, re, *state.regexCache, [&](const std::regex & regex) {
         NixStringContext context;
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.match");
 
         std::cmatch match;
-        if (!std::regex_match(str.begin(), str.end(), match, *regex)) {
+        if (!std::regex_match(str.begin(), str.end(), match, regex)) {
             v.mkNull();
             return;
         }
@@ -4994,14 +5021,7 @@ void prim_match(EvalState & state, const PosIdx pos, Value ** args, Value & v)
             else
                 v2 = mkString(state, match[i + 1]);
         v.mkList(list);
-
-    } catch (std::regex_error & e) {
-        if (e.code() == std::regex_constants::error_space) {
-            // limit is _GLIBCXX_REGEX_STATE_LIMIT for libstdc++
-            state.error<EvalError>("memory limit exceeded by regular expression '%s'", re).atPos(pos).debugThrow();
-        } else
-            state.error<EvalError>("invalid regular expression '%s'", re).atPos(pos).debugThrow();
-    }
+    });
 }
 
 static RegisterPrimOp primop_match({
@@ -5046,15 +5066,12 @@ void prim_split(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto re = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.split");
 
-    try {
-
-        auto regex = state.regexCache->get(re);
-
+    withRegex(state, pos, re, *state.regexCache, [&](const std::regex & regex) {
         NixStringContext context;
         const auto str =
             state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.split");
 
-        auto begin = std::cregex_iterator(str.begin(), str.end(), *regex);
+        auto begin = std::cregex_iterator(str.begin(), str.end(), regex);
         auto end = std::cregex_iterator();
 
         // Any matches results are surrounded by non-matching results.
@@ -5097,14 +5114,7 @@ void prim_split(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         assert(idx == 2 * len + 1);
 
         v.mkList(list);
-
-    } catch (std::regex_error & e) {
-        if (e.code() == std::regex_constants::error_space) {
-            // limit is _GLIBCXX_REGEX_STATE_LIMIT for libstdc++
-            state.error<EvalError>("memory limit exceeded by regular expression '%s'", re).atPos(pos).debugThrow();
-        } else
-            state.error<EvalError>("invalid regular expression '%s'", re).atPos(pos).debugThrow();
-    }
+    });
 }
 
 static RegisterPrimOp primop_split({
