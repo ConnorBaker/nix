@@ -96,12 +96,10 @@ static std::set<std::filesystem::path> realisePath(StorePathWithOutputs path, bo
                 throw Error("derivation '%s' does not have an output named '%s'", store2->printStorePath(path.path), j);
             auto outPath = outputPaths.at(i->first);
             std::filesystem::path retPath = store->printStorePath(outPath);
-            if (store2) {
-                if (gcRootNamer.empty())
-                    printGCWarning();
-                else
-                    retPath = store2->addPermRoot(outPath, gcRootNamer.nameForCurrent(i->first));
-            }
+            if (gcRootNamer.empty())
+                printGCWarning();
+            else if (store2)
+                retPath = store2->addPermRoot(outPath, gcRootNamer.nameForCurrent(i->first));
             outputs.insert(retPath);
         }
         return outputs;
@@ -112,13 +110,11 @@ static std::set<std::filesystem::path> realisePath(StorePathWithOutputs path, bo
             store->ensurePath(path.path);
         else if (!store->isValidPath(path.path))
             throw Error("path '%s' does not exist and cannot be created", store->printStorePath(path.path));
-        if (store2) {
-            if (gcRootNamer.empty())
-                printGCWarning();
-            else {
-                gcRootNamer.bump();
-                return {store2->addPermRoot(path.path, gcRootNamer.nameForCurrent())};
-            }
+        if (gcRootNamer.empty())
+            printGCWarning();
+        else if (store2) {
+            gcRootNamer.bump();
+            return {store2->addPermRoot(path.path, gcRootNamer.nameForCurrent())};
         }
         return {std::filesystem::path{store->printStorePath(path.path)}};
     }

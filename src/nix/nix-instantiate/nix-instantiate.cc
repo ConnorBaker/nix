@@ -84,11 +84,9 @@ void processExpr(
 
                 if (gcRootNamer.empty())
                     printGCWarning();
-                else {
+                else if (auto store2 = state.store.dynamic_pointer_cast<LocalFSStore>()) {
                     gcRootNamer.bump();
-                    auto store2 = state.store.dynamic_pointer_cast<LocalFSStore>();
-                    if (store2)
-                        drvPathS = store2->addPermRoot(drvPath, gcRootNamer.nameForCurrent()).string();
+                    drvPathS = store2->addPermRoot(drvPath, gcRootNamer.nameForCurrent()).string();
                 }
                 std::cout << fmt("%s%s\n", drvPathS, (outputName != "out" ? "!" + outputName : ""));
             }
