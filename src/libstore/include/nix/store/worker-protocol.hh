@@ -224,7 +224,7 @@ enum struct WorkerProto::Op : uint64_t {
     SyncWithGC = 13,
     FindRoots = 14,
     // ExportPath = 16, // removed
-    QueryDeriver = 18, // obsolete
+    // QueryDeriver = 18, // removed at protocol 1.16; daemon arm last deleted by #183
     SetOptions = 19,
     CollectGarbage = 20,
     QuerySubstitutablePathInfo = 21,

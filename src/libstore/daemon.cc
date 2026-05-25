@@ -380,15 +380,6 @@ static void performOp(
         break;
     }
 
-    case WorkerProto::Op::QueryDeriver: {
-        auto path = WorkerProto::Serialise<StorePath>::read(*store, rconn);
-        logger->startWork();
-        auto info = store->queryPathInfo(path);
-        logger->stopWork();
-        WorkerProto::write(*store, conn, info->deriver);
-        break;
-    }
-
     case WorkerProto::Op::QueryPathFromHashPart: {
         auto hashPart = readString(conn.from);
         logger->startWork();
