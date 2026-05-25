@@ -598,9 +598,7 @@ static void opInstall(Globals & globals, Strings opFlags, Strings opArgs)
         else if (arg == "--remove-all" || arg == "-r")
             globals.removeAll = true;
         else if (arg == "--priority") {
-            if (i == opFlags.end())
-                throw UsageError("'%1%' requires an argument", arg);
-            priority = string2Int<int>(*i++);
+            priority = string2Int<int>(needArg(i, opFlags, arg));
             if (!priority)
                 throw UsageError("'--priority' requires an integer argument");
         } else
