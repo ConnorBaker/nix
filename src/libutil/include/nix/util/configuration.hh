@@ -414,6 +414,24 @@ public:
     }
 
     /**
+     * If this setting was explicitly overridden by the user, copy its
+     * current value into `dest`. Otherwise leave `dest` unchanged.
+     *
+     * Used by call sites that want to propagate user-specified
+     * overrides into a downstream object while letting the downstream
+     * object's own defaulting logic take effect when the setting
+     * carries the default value. The template parameter `U` lets
+     * `dest` be any type assignable from `T` (notably `std::optional<T>`,
+     * which is what the file-transfer request uses).
+     */
+    template<typename U>
+    void overrideIfSet(U & dest) const
+    {
+        if (overridden)
+            dest = value;
+    }
+
+    /**
      * Require any experimental feature the setting depends on
      *
      * Uses `parse()` to get the value from `str`, and `appendOrSet()`
