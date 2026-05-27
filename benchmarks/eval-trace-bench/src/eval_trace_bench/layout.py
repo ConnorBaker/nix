@@ -25,10 +25,11 @@ Layout:
                     state/                # NIX_STATE_HOME / NIX_STATE_DIR
                     log/                  # NIX_LOG_DIR
                 {commit_sha}/
-                    stats.json
-                    timing.json
                     eval.json
-                    debug.log
+                    timing.json
+                    stderr.log              # default wall-only run
+                    stats.json              # --with-stats or --with-debug
+                    debug.log               # --with-debug only
 
 The run-number sub-directory is omitted for `reference` runs, matching
 the legacy layout that the analysis subcommands still understand.  The `_state/`

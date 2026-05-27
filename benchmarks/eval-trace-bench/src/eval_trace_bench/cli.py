@@ -18,8 +18,6 @@ from .subcommands import (
     pairwise_cmd,
     runs_cmd,
     series_cmd,
-    simulate_cmd,
-    sv_cmd,
 )
 
 
@@ -36,8 +34,6 @@ def _build_app() -> App:
         series_cmd,
         pairwise_cmd,
         db_inspect_cmd,
-        sv_cmd,
-        simulate_cmd,
         export_cmd,
     ):
         mod.register(app)

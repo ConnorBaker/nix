@@ -19,6 +19,10 @@ def has_commit_dirs(path: Path) -> bool:
     return path.is_dir() and any(is_commit_hash(p.name) for p in path.iterdir() if p.is_dir())
 
 
+def has_run_manifest(path: Path) -> bool:
+    return path.is_dir() and (path / MANIFEST_FILE).is_file()
+
+
 @dataclass(frozen=True)
 class Run:
     """A discovered run directory."""
@@ -47,13 +51,13 @@ def discover_runs(nix_root: Path) -> list[Run]:
             continue
         if entry.name in _RESERVED_LEAF:
             continue
-        if has_commit_dirs(entry):
+        if has_commit_dirs(entry) or has_run_manifest(entry):
             runs.append(Run(entry.name, entry))
             continue
         for sub in sorted(entry.iterdir()):
             if not sub.is_dir() or sub.name in _RESERVED_LEAF:
                 continue
-            if has_commit_dirs(sub):
+            if has_commit_dirs(sub) or has_run_manifest(sub):
                 runs.append(Run(f"{entry.name}/{sub.name}", sub))
     return runs
 
@@ -69,6 +73,7 @@ def discover_commits(runs: list[Run]) -> set[str]:
     commits: set[str] = set()
     for run in runs:
         commits |= run.commits()
+        commits.update(run_manifest_commit_order(run))
     return commits
 
 
@@ -104,22 +109,33 @@ def order_commits(
     return ordered
 
 
-def _manifest_commit_order(run: Run) -> list[str]:
+def run_manifest_payload(run: Run) -> dict[str, Any] | None:
     path = run.path / MANIFEST_FILE
     if not path.is_file():
-        return []
+        return None
     try:
         payload_raw: Any = json.loads(path.read_text())
     except json.JSONDecodeError:
-        return []
+        return None
     if not isinstance(payload_raw, dict):
+        return None
+    return cast(dict[str, Any], payload_raw)
+
+
+def _manifest_commit_order(run: Run) -> list[str]:
+    payload = run_manifest_payload(run)
+    if payload is None:
         return []
-    payload: dict[str, Any] = payload_raw  # pyright: ignore[reportAssignmentType, reportUnknownVariableType]
     raw_order: Any = payload.get("commitOrder")
     if not isinstance(raw_order, list):
         return []
     order_items = cast(list[object], raw_order)
     return [c for c in order_items if isinstance(c, str) and is_commit_hash(c)]
+
+
+def run_manifest_commit_order(run: Run) -> list[str]:
+    """Return the exact commit order recorded in one run manifest."""
+    return _manifest_commit_order(run)
 
 
 def manifest_commit_order(runs: list[Run], candidates: set[str]) -> list[str] | None:
@@ -151,9 +167,14 @@ def manifest_commit_order(runs: list[Run], candidates: set[str]) -> list[str] | 
 def classify_run_mode(run_name: str) -> str | None:
     """Return the underlying mode (reference/cold/hot/warm) or None.
 
-    Accepts both "cold/0" and "sibling-heavy-cold/0" style names.
+    Accepts "cold/0", "cold-debug/0", "cold-stats/0", and
+    "sibling-heavy-cold-debug/0" style names.
     """
     stem = run_name.split("/", 1)[0]
+    if stem.endswith("-debug"):
+        stem = stem[: -len("-debug")]
+    elif stem.endswith("-stats"):
+        stem = stem[: -len("-stats")]
     for mode in ("reference", "cold", "hot", "warm"):
         if stem == mode or stem.endswith(f"-{mode}"):
             return mode

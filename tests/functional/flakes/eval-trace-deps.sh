@@ -1672,4 +1672,48 @@ result25b_warm="$(NIX_ALLOW_EVAL=0 nix eval --impure \
 
 echo "Test 25 passed: --allowed-uris produces isolated primary + recovery keys (A records=$records_a, B records=$records_b)"
 
+###############################################################################
+# Test 26: Flake source fingerprint isolates exact-session hits
+###############################################################################
+#
+# `openTraceCache` evaluates flake outputs through a root thunk, but lockFlake
+# may already have parsed flake.nix before that traced thunk runs. Exact-session
+# identity therefore has to include the locked flake fingerprint; otherwise a
+# rewritten path flake can reuse a stale root and only fail later as a vanished
+# child attribute. The stable recovery key remains original-source based, so this
+# only tightens primary exact hits.
+###############################################################################
+clearStoreIndex
+
+t26Dir="$TEST_ROOT/deps-flake-source-fingerprint"
+mkdir -p "$t26Dir"
+
+cat >"$t26Dir/flake.nix" <<'EOF'
+{
+  outputs = { self }: {
+    value = "v1";
+  };
+}
+EOF
+
+[[ "$(nix eval --json "$t26Dir#value")" == '"v1"' ]]
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json "$t26Dir#value")" == '"v1"' ]]
+
+cat >"$t26Dir/flake.nix" <<'EOF'
+{
+  outputs = { self }: {
+    value = "v2";
+  };
+}
+EOF
+
+# The old exact-session row must not be selected for the rewritten flake.
+expectStderr 1 env NIX_ALLOW_EVAL=0 nix eval --json "$t26Dir#value" \
+  | grepQuiet -E "not everything is cached|cannot call .* without allowing evaluation"
+
+[[ "$(nix eval --json "$t26Dir#value")" == '"v2"' ]]
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json "$t26Dir#value")" == '"v2"' ]]
+
+echo "Test 26 passed: flake fingerprint participates in exact-session identity"
+
 echo "All eval-trace-deps tests passed! (BSàlC: verifying traces with fine-grained dependencies)"

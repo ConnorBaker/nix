@@ -21,9 +21,10 @@ Design notes:
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _MODEL_CONFIG = ConfigDict(
     extra="allow",
@@ -224,11 +225,16 @@ class DataFileCounters(BaseModel):
     container_children: int = Field(default=0, validation_alias="containerChildren")
 
 
-class ByDepKeySetEntry(BaseModel):
-    """One row of `evalTrace.structVariant.byDepKeySet` (plan D series)."""
+class StructVariantCandidates(BaseModel):
+    """Aggregate counters for `evalTrace.structVariant.candidates`.
+
+    One firing per SV candidate considered during the session.  Fields
+    are summed over every firing; `avg_deps` / `avg_us` are weighted
+    averages computed by the C++ emitter (see
+    `renderSVCandidateStatsJson` in `src/libexpr/eval-trace/counters.cc`).
+    """
 
     model_config = _MODEL_CONFIG
-    dep_key_set_id: int = Field(validation_alias="depKeySetId")
     tried: int = 0
     succeeded: int = 0
     aborted_early: int = Field(default=0, validation_alias="abortedEarly")
@@ -248,9 +254,7 @@ class ByDepKeySetEntry(BaseModel):
 
 class StructVariantSummary(BaseModel):
     model_config = _MODEL_CONFIG
-    by_dep_key_set: list[ByDepKeySetEntry] = Field(
-        default_factory=list[ByDepKeySetEntry], validation_alias="byDepKeySet"
-    )
+    candidates: StructVariantCandidates = Field(default_factory=StructVariantCandidates)
 
 
 class EvalTraceStats(BaseModel):
@@ -318,7 +322,17 @@ class RunStats(BaseModel):
 
 class Timing(BaseModel):
     model_config = _MODEL_CONFIG
-    wall_time: float | None = Field(default=None, validation_alias="wallTime")
+    wall_time: float = Field(validation_alias="wallTime")
+
+    @field_validator("wall_time", mode="before")
+    @classmethod
+    def _validate_wall_time(cls, value: Any) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("wallTime must be a JSON number")
+        wall_time = float(value)
+        if not math.isfinite(wall_time) or wall_time <= 0:
+            raise ValueError("wallTime must be finite and positive")
+        return wall_time
 
 
 def load_stats(payload: dict[str, Any]) -> RunStats:

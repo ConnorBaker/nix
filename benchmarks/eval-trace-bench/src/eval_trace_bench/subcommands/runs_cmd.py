@@ -11,9 +11,16 @@ from rich.console import Console
 from rich.text import Text
 
 from ..cliutil import DEFAULT_NIX, DEFAULT_NIXPKGS, DatasetArgs, report_dataset_issues
+from ..compat import run_analysis_compatibility_issue
 from ..dataframe import Dataset, Record
 from ..diff import eval_diff_detail
-from ..discovery import expects_cache_misses
+from ..discovery import (
+    discover_runs,
+    expects_cache_misses,
+    run_manifest_commit_order,
+    select_runs,
+)
+from ..layout import existing_results_root
 from ..metrics import DEP_HASH_US_METRICS, EVAL_TRACE_METRICS, PERF_METRICS
 from ..render import (
     MetricRow,
@@ -567,6 +574,114 @@ def render_regressions(console: Console, ds: Dataset) -> None:
     console.print()
 
 
+def _commits_from_reference_manifest(
+    nix_root: Path,
+    selected_runs: list[str] | None,
+    reference: str,
+) -> list[str] | None:
+    """Use an explicit reference run's manifest as the comparison window.
+
+    This keeps the fast iteration workflow useful: a 10-commit candidate run
+    can be compared directly against a 100-commit baseline by passing
+    `--reference cold/<candidate>`. Without this, the dataset loader sees the
+    baseline's extra commit directories and reports the candidate as incomplete.
+    """
+    selected = select_runs(discover_runs(existing_results_root(nix_root)), selected_runs)
+    for run in selected:
+        if run.name != reference:
+            continue
+        order = run_manifest_commit_order(run)
+        return order or None
+    return None
+
+
+def _runs_including_reference_if_available(
+    nix_root: Path,
+    selected_runs: list[str] | None,
+    reference: str,
+) -> list[str] | None:
+    if selected_runs is None or reference in selected_runs:
+        return selected_runs
+    if any(run.name == reference for run in discover_runs(existing_results_root(nix_root))):
+        return [*selected_runs, reference]
+    return selected_runs
+
+
+def _baseline_counterpart(run_name: str, baseline_run: int) -> str | None:
+    if "/" not in run_name:
+        return None
+    stem, number = run_name.rsplit("/", 1)
+    if not number.isdigit():
+        return None
+    return f"{stem}/{baseline_run}"
+
+
+def _runs_including_baseline_run_if_available(
+    nix_root: Path,
+    selected_runs: list[str] | None,
+    baseline_run: int | None,
+) -> list[str] | None:
+    if selected_runs is None or baseline_run is None:
+        return selected_runs
+
+    expanded = list(selected_runs)
+    seen = set(expanded)
+    for run_name in selected_runs:
+        baseline_name = _baseline_counterpart(run_name, baseline_run)
+        if baseline_name is None or baseline_name in seen:
+            continue
+        expanded.append(baseline_name)
+        seen.add(baseline_name)
+    return expanded
+
+
+def _reference_issue(run_names: list[str], reference: str) -> str | None:
+    if reference in run_names:
+        return None
+    return f"reference run {reference!r} was not found; refuse to compare against {run_names[0]!r}."
+
+
+def render_baseline_run_performance(console: Console, ds: Dataset, baseline_run: int) -> None:
+    rows: list[list[str | Text]] = []
+    run_names = set(ds.run_names)
+    for name in ds.run_names:
+        baseline_name = _baseline_counterpart(name, baseline_run)
+        if baseline_name is None or baseline_name == name or baseline_name not in run_names:
+            continue
+
+        values = [rec.wall for rec in ds.records_for(name) if rec.wall is not None]
+        baseline_values = [
+            rec.wall for rec in ds.records_for(baseline_name) if rec.wall is not None
+        ]
+        if not values or not baseline_values:
+            continue
+
+        mean = statistics.mean(values)
+        baseline_mean = statistics.mean(baseline_values)
+        ratio = mean / baseline_mean if baseline_mean else 0.0
+        rows.append(
+            [
+                name,
+                baseline_name,
+                f"{mean:.3f}",
+                f"{baseline_mean:.3f}",
+                Text(
+                    ratio_str(mean, baseline_mean),
+                    style="green" if ratio < 1 else "red" if ratio > 1 else "",
+                ),
+            ]
+        )
+
+    if not rows:
+        return
+
+    section(console, f"Performance vs run {baseline_run}")
+    console.print(
+        simple_table(["Run", "Baseline", "wall mean (s)", "baseline mean (s)", "ratio"], rows)
+    )
+    console.print()
+
+
 def register(app: App) -> None:
     @app.command
     def runs(
@@ -577,7 +692,10 @@ def register(app: App) -> None:
         runs_: str | None = None,
         output: Path | None = None,
         reference: str = "reference",
+        baseline_run: int | None = None,
         commits: list[str] | None = None,
+        allow_intersection: bool = False,
+        allow_provenance_mismatch: bool = False,
         verbose: bool = False,
     ) -> int:
         """Compare multiple runs (soundness + cache + performance).
@@ -591,7 +709,13 @@ def register(app: App) -> None:
         runs_: Comma-separated run names (default: auto-discover).
         output: Save report (.html for rich markup, else plain text).
         reference: Run name used as soundness reference.
+        baseline_run: Run number used as the same-mode performance baseline.
         commits: Restrict to specific commits.
+        allow_intersection: Permit legacy best-effort comparison when stateful
+            run manifests are missing or have different commit orders.
+        allow_provenance_mismatch: Permit deliberate A/B comparisons across
+            different benchmark binaries or benchmark env flags. Source repo
+            provenance must still match.
         verbose: Show per-commit eval-trace metric tables.
         """
         ds_args = DatasetArgs.from_strings(
@@ -602,6 +726,20 @@ def register(app: App) -> None:
             runs=runs_,
             output=output,
         )
+        ds_args = DatasetArgs(
+            nix=ds_args.nix,
+            nixpkgs=ds_args.nixpkgs,
+            nixpkgs_branch=ds_args.nixpkgs_branch,
+            nixpkgs_base=ds_args.nixpkgs_base,
+            runs=_runs_including_baseline_run_if_available(
+                ds_args.nix,
+                _runs_including_reference_if_available(ds_args.nix, ds_args.runs, reference),
+                baseline_run,
+            ),
+            output=ds_args.output,
+        )
+        if commits is None:
+            commits = _commits_from_reference_manifest(ds_args.nix, ds_args.runs, reference)
         ds = ds_args.load(commits=commits)
         if report_dataset_issues(ds, sys.stderr, requested_runs=ds_args.runs):
             return 1
@@ -612,7 +750,20 @@ def register(app: App) -> None:
             print("No commits found.", file=sys.stderr)
             return 1
 
-        ref_name = reference if reference in ds.run_names else ds.run_names[0]
+        if issue := _reference_issue(ds.run_names, reference):
+            print(issue, file=sys.stderr)
+            return 1
+        if issue := run_analysis_compatibility_issue(
+            ds.runs,
+            ds.run_names,
+            allow_intersection=allow_intersection,
+            allow_provenance_mismatch=allow_provenance_mismatch,
+            comparison_commits=ds.commits,
+        ):
+            print(issue, file=sys.stderr)
+            return 1
+
+        ref_name = reference
 
         issues: dict[str, list[str]] = {}
         for commit in ds.commits:
@@ -641,6 +792,8 @@ def register(app: App) -> None:
             render_dep_hash_kinds(console, ds, ref_name)
             render_recovery_phases(console, ds)
         render_performance(console, ds, ref_name)
+        if baseline_run is not None:
+            render_baseline_run_performance(console, ds, baseline_run)
         render_regressions(console, ds)
 
         if ds_args.output is not None:

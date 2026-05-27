@@ -1,0 +1,4 @@
+# Reproduce the v11 tail duplicate where 345... prints the same JSON/context
+# as 1cfd... but rejects the prior certificate due exact package-file guards.
+1cfdcfa5620e13451b5c869742dd7cc00fb02e81
+34513330fcc124d7f204d4621cb71f3e42d59020

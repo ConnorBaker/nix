@@ -20,7 +20,9 @@ from rich.text import Text
 
 from ..classify import OutcomeClass, classify_eval_trace
 from ..cliutil import DEFAULT_NIX, DEFAULT_NIXPKGS, DatasetArgs, report_record_issues
-from ..dataframe import Record
+from ..compat import run_analysis_compatibility_issue, stateful_manifest_order_issue
+from ..dataframe import Dataset, Record
+from ..discovery import Run, classify_run_mode, run_manifest_commit_order
 from ..models import EvalTraceStats
 from ..render import (
     delta_text,
@@ -74,6 +76,68 @@ DELTA_KEYS: list[tuple[str, Callable[[EvalTraceStats], int]]] = [
     ("loadTrace.timeUs", lambda et: et.load_trace.time_us),
     ("loadKeySet.timeUs", lambda et: et.load_key_set.time_us),
 ]
+
+
+def _stateful_pairwise_order_issue(
+    runs: list[Run],
+    baseline: str,
+    target: str,
+    *,
+    allow_intersection: bool,
+) -> str | None:
+    return stateful_manifest_order_issue(
+        runs,
+        [baseline, target],
+        allow_intersection=allow_intersection,
+    )
+
+
+def _pairwise_comparison_commits(
+    pairs: list[tuple[str, Record, Record]],
+) -> list[str]:
+    return [commit for commit, _base, _target in pairs]
+
+
+def _run_declared_commits(run: Run) -> set[str]:
+    manifest_order = run_manifest_commit_order(run)
+    if manifest_order:
+        return set(manifest_order)
+    return run.commits()
+
+
+def _pairwise_candidate_commits(ds: Dataset, baseline: str, target: str) -> list[str]:
+    baseline_run = next(run for run in ds.runs if run.name == baseline)
+    target_run = next(run for run in ds.runs if run.name == target)
+    stateful_modes = {"cold", "hot", "warm"}
+    baseline_order = run_manifest_commit_order(baseline_run)
+    target_order = run_manifest_commit_order(target_run)
+    if (
+        classify_run_mode(baseline_run.name) in stateful_modes
+        and classify_run_mode(target_run.name) in stateful_modes
+        and baseline_order
+        and target_order
+    ):
+        prefix: list[str] = []
+        for baseline_commit, target_commit in zip(baseline_order, target_order, strict=False):
+            if baseline_commit != target_commit:
+                break
+            prefix.append(baseline_commit)
+        return prefix
+    shared = _run_declared_commits(baseline_run) & _run_declared_commits(target_run)
+    return [commit for commit in ds.commits if commit in shared]
+
+
+def _pairwise_no_pairs_issue(
+    pairs: list[tuple[str, Record, Record]],
+    baseline: str,
+    target: str,
+) -> str | None:
+    if pairs:
+        return None
+    return (
+        f"no complete same-commit pairs for {target} vs {baseline}; "
+        "refuse to render an empty comparison."
+    )
 
 
 def _render_g1(
@@ -333,6 +397,8 @@ def register(app: App) -> None:
         nixpkgs_base: str | None = None,
         runs: str | None = None,
         output: Path | None = None,
+        allow_intersection: bool = False,
+        allow_provenance_mismatch: bool = False,
     ) -> int:
         """Same-commit A/B deltas (G1-G2).
 
@@ -346,6 +412,11 @@ def register(app: App) -> None:
         nixpkgs_base: Optional nixpkgs commit/ref to use as the newest commit.
         runs: Comma-separated run names (default: auto-discover).
         output: Save report (.html for rich markup, else plain text).
+        allow_intersection: Permit legacy best-effort pairing when stateful
+            run manifests are missing or have different commit orders.
+        allow_provenance_mismatch: Permit deliberate A/B comparisons across
+            different benchmark binaries or benchmark env flags. Source repo
+            provenance must still match.
         """
         ds_args = DatasetArgs.from_strings(
             nix=nix,
@@ -360,18 +431,36 @@ def register(app: App) -> None:
             print(f"missing runs. discovered: {ds.run_names}", file=sys.stderr)
             return 1
         pair_runs = {baseline, target}
-        relevant = [rec for rec in ds.incomplete_records if rec.run_name in pair_runs]
+        candidate_commits = _pairwise_candidate_commits(ds, baseline, target)
+        candidate_set = set(candidate_commits)
+        relevant = [
+            rec
+            for rec in ds.incomplete_records
+            if rec.run_name in pair_runs and rec.commit in candidate_set
+        ]
         if report_record_issues(relevant, sys.stderr):
             return 1
 
         pairs: list[tuple[str, Record, Record]] = []
-        for commit in ds.commits:
+        for commit in candidate_commits:
             recs = ds.by_commit_map.get(commit, {})
             base = recs.get(baseline)
             tgt = recs.get(target)
             if base is None or tgt is None or base.data is None or tgt.data is None:
                 continue
             pairs.append((commit, base, tgt))
+        if issue := _pairwise_no_pairs_issue(pairs, baseline, target):
+            print(issue, file=sys.stderr)
+            return 1
+        if issue := run_analysis_compatibility_issue(
+            ds.runs,
+            [baseline, target],
+            allow_intersection=allow_intersection,
+            allow_provenance_mismatch=allow_provenance_mismatch,
+            comparison_commits=_pairwise_comparison_commits(pairs),
+        ):
+            print(issue, file=sys.stderr)
+            return 1
 
         console = Console(record=True)
         _render_g1(console, pairs, baseline, target)

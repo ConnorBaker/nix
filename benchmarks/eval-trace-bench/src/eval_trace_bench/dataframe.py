@@ -45,11 +45,11 @@ class Record:
 
     @property
     def stats(self) -> RunStats | None:
-        return self.data.stats if self.data else None
+        return self.data.stats if self.data and self.data.stats_present else None
 
     @property
     def et(self) -> EvalTraceStats | None:
-        return self.data.stats.eval_trace if self.data else None
+        return self.data.stats.eval_trace if self.data and self.data.stats_present else None
 
     @property
     def wall(self) -> float | None:
@@ -57,7 +57,7 @@ class Record:
 
     @property
     def cpu(self) -> float | None:
-        return self.data.stats.cpu_time if self.data else None
+        return self.data.stats.cpu_time if self.data and self.data.stats_present else None
 
 
 @dataclass
@@ -160,8 +160,9 @@ def tidy_rows(records: Iterable[Record]) -> list[dict[str, Any]]:
             "present": rec.present,
             "wall": rec.wall,
             "cpu": rec.cpu,
+            "stats_present": rec.data.stats_present if rec.data else False,
         }
-        if rec.data is not None:
+        if rec.data is not None and rec.data.stats_present:
             row.update(flatten(rec.data.stats.raw))
         rows.append(row)
     return rows
