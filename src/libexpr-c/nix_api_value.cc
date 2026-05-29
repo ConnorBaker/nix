@@ -344,8 +344,16 @@ ExternalValue * nix_get_external(nix_c_context * context, nix_value * value)
 
 /* Shared body for `nix_get_list_byidx` and `nix_get_list_byidx_lazy`. The
    `force` flag controls whether the returned element is forced before
-   being wrapped; the rest of the behaviour (including the bounds-check
-   error message) is identical across both public symbols. */
+   being wrapped; the bounds-check error message is identical across both
+   public symbols.
+
+   One deliberate behaviour change: the `if (p == nullptr) return nullptr;`
+   guard for an in-bounds NULL list element now applies to BOTH symbols.
+   The eager `nix_get_list_byidx` always had it; the lazy
+   `nix_get_list_byidx_lazy` previously did not (it wrapped the null
+   pointer and returned a non-null `nix_value` over it with NIX_OK).
+   Unifying the body extends the eager guard to the lazy path — a more
+   defensive, observable change for that edge case. */
 static nix_value * get_list_byidx_impl(
     nix_c_context * context, const nix_value * value, EvalState * state, unsigned int ix, bool force)
 {
