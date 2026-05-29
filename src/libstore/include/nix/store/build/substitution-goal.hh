@@ -52,10 +52,8 @@ public:
      * The states.
      */
     Co init();
-    Co gotInfo();
     Co tryToRun(
         StorePath subPath, nix::ref<Store> sub, std::shared_ptr<const ValidPathInfo> info, bool & substituterFailed);
-    Co finished();
 
     /* Called by destructor, can't be overridden */
     void cleanup() override final;
