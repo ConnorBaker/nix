@@ -21,7 +21,7 @@ static std::string symbolicName(std::string_view p)
     return std::string(p.substr(0, p.find('-') + 1));
 }
 
-static std::string makeNode(const ValidPathInfo & info)
+static std::string makeGraphMLNode(const ValidPathInfo & info)
 {
     return fmt(
         "  <node id=\"%1%\">\n"
@@ -35,7 +35,7 @@ static std::string makeNode(const ValidPathInfo & info)
         (info.path.isDerivation() ? "derivation" : "output-path"));
 }
 
-static std::string makeEdge(std::string_view src, std::string_view dst)
+static std::string makeGraphMLEdge(std::string_view src, std::string_view dst)
 {
     return fmt("  <edge source=\"%1%\" target=\"%2%\"/>\n", xmlQuote(src), xmlQuote(dst));
 }
@@ -54,9 +54,9 @@ void printGraphML(ref<Store> store, StorePathSet && roots)
     walkClosure(
         store,
         std::move(roots),
-        [&](const StorePath &, const ValidPathInfo & info) { cout << makeNode(info); },
+        [&](const StorePath &, const ValidPathInfo & info) { cout << makeGraphMLNode(info); },
         [&](const StorePath & path, const StorePath & reference) {
-            cout << makeEdge(path.to_string(), reference.to_string());
+            cout << makeGraphMLEdge(path.to_string(), reference.to_string());
         });
 
     cout << "</graph>\n";
