@@ -119,7 +119,7 @@ static CgroupStats destroyCgroup(const std::filesystem::path & cgroup, bool retu
             if (auto o = string2Int<pid_t>(pid_s))
                 pid = *o;
             else
-                throw Error("invalid pid '%s'", pid);
+                throw Error("invalid pid '%s'", pid_s);
             if (pidsShown.insert(pid).second) {
                 try {
                     auto cmdline = readFile(fmt("/proc/%d/cmdline", pid));
