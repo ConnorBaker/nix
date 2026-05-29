@@ -145,11 +145,11 @@ struct ParseUnquoted : public Parser
         case '\r':
             if (!acc.empty())
                 r.push_back(acc);
-            state = std::make_shared<ParseUnquoted>(ParseUnquoted(remaining.substr(1)));
+            state = std::make_shared<ParseUnquoted>(remaining.substr(1));
             return;
         case '`':
             if (remaining.size() > 1 && remaining[1] == '`') {
-                state = std::make_shared<ParseQuoted>(ParseQuoted(remaining.substr(2)));
+                state = std::make_shared<ParseQuoted>(remaining.substr(2));
                 return;
             } else
                 throw Error("single backtick is not a supported syntax in the nix shebang.");
@@ -205,7 +205,7 @@ void ParseQuoted::operator()(std::shared_ptr<Parser> & state, Strings & r)
         if ((remaining.size() == 3 && remaining[1] == '`' && remaining[2] == '`')
             || (remaining.size() > 3 && remaining[1] == '`' && remaining[2] == '`' && remaining[3] != '`')) {
             // exactly two backticks mark the end of a quoted string, but a preceding space is ignored if present.
-            state = std::make_shared<ParseUnquoted>(ParseUnquoted(remaining.substr(3)));
+            state = std::make_shared<ParseUnquoted>(remaining.substr(3));
             r.push_back(acc);
             return;
         } else {
@@ -218,7 +218,7 @@ void ParseQuoted::operator()(std::shared_ptr<Parser> & state, Strings & r)
         // exactly two backticks mark the end of a quoted string
         if ((remaining.size() == 2 && remaining[1] == '`')
             || (remaining.size() > 2 && remaining[1] == '`' && remaining[2] != '`')) {
-            state = std::make_shared<ParseUnquoted>(ParseUnquoted(remaining.substr(2)));
+            state = std::make_shared<ParseUnquoted>(remaining.substr(2));
             r.push_back(acc);
             return;
         }
@@ -252,7 +252,7 @@ void ParseQuoted::operator()(std::shared_ptr<Parser> & state, Strings & r)
 Strings parseShebangContent(std::string_view s)
 {
     Strings result;
-    std::shared_ptr<Parser> parserState(std::make_shared<ParseUnquoted>(ParseUnquoted(s)));
+    std::shared_ptr<Parser> parserState(std::make_shared<ParseUnquoted>(s));
 
     // trampoline == iterated strategy pattern
     while (parserState) {
