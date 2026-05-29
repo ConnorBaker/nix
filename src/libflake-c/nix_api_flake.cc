@@ -97,17 +97,42 @@ void nix_flake_reference_free(nix_flake_reference * flakeReference)
     delete flakeReference;
 }
 
+namespace {
+
+/* The four mode bits the three set_mode_* entry points toggle. */
+struct LockMode
+{
+    bool updateLockFile, writeLockFile, failOnUnlocked, allowUnlocked;
+};
+
+constexpr LockMode lockModeVirtual{.updateLockFile = true, .writeLockFile = false, .failOnUnlocked = false, .allowUnlocked = true};
+constexpr LockMode lockModeWriteAsNeeded{.updateLockFile = true, .writeLockFile = true, .failOnUnlocked = false, .allowUnlocked = true};
+constexpr LockMode lockModeCheck{.updateLockFile = false, .writeLockFile = false, .failOnUnlocked = true, .allowUnlocked = false};
+
+void applyLockMode(nix::flake::LockFlags & flags, const LockMode & mode)
+{
+    flags.updateLockFile = mode.updateLockFile;
+    flags.writeLockFile = mode.writeLockFile;
+    flags.failOnUnlocked = mode.failOnUnlocked;
+    flags.allowUnlocked = mode.allowUnlocked;
+}
+
+} // namespace
+
 nix_flake_lock_flags * nix_flake_lock_flags_new(nix_c_context * context, nix_flake_settings * settings)
 {
     nix_clear_err(context);
     try {
+        // Note: the default is close to write-as-needed but NOT identical —
+        // allowUnlocked is false here, whereas set_mode_write_as_needed sets
+        // it true.
         auto lockSettings = nix::make_ref<nix::flake::LockFlags>(nix::flake::LockFlags{
             .recreateLockFile = false,
-            .updateLockFile = true,  // == `nix_flake_lock_flags_set_mode_write_as_needed`
-            .writeLockFile = true,   // == `nix_flake_lock_flags_set_mode_write_as_needed`
-            .failOnUnlocked = false, // == `nix_flake_lock_flags_set_mode_write_as_needed`
+            .updateLockFile = true,
+            .writeLockFile = true,
+            .failOnUnlocked = false,
             .useRegistries = false,
-            .allowUnlocked = false, // == `nix_flake_lock_flags_set_mode_write_as_needed`
+            .allowUnlocked = false,
             .commitLockFile = false,
 
         });
@@ -125,10 +150,7 @@ nix_err nix_flake_lock_flags_set_mode_virtual(nix_c_context * context, nix_flake
 {
     nix_clear_err(context);
     try {
-        flags->lockFlags->updateLockFile = true;
-        flags->lockFlags->writeLockFile = false;
-        flags->lockFlags->failOnUnlocked = false;
-        flags->lockFlags->allowUnlocked = true;
+        applyLockMode(*flags->lockFlags, lockModeVirtual);
     }
     NIXC_CATCH_ERRS
 }
@@ -137,10 +159,7 @@ nix_err nix_flake_lock_flags_set_mode_write_as_needed(nix_c_context * context, n
 {
     nix_clear_err(context);
     try {
-        flags->lockFlags->updateLockFile = true;
-        flags->lockFlags->writeLockFile = true;
-        flags->lockFlags->failOnUnlocked = false;
-        flags->lockFlags->allowUnlocked = true;
+        applyLockMode(*flags->lockFlags, lockModeWriteAsNeeded);
     }
     NIXC_CATCH_ERRS
 }
@@ -149,10 +168,7 @@ nix_err nix_flake_lock_flags_set_mode_check(nix_c_context * context, nix_flake_l
 {
     nix_clear_err(context);
     try {
-        flags->lockFlags->updateLockFile = false;
-        flags->lockFlags->writeLockFile = false;
-        flags->lockFlags->failOnUnlocked = true;
-        flags->lockFlags->allowUnlocked = false;
+        applyLockMode(*flags->lockFlags, lockModeCheck);
     }
     NIXC_CATCH_ERRS
 }
