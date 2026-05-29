@@ -80,6 +80,40 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
+- **Per-commit value/churn review + remaining-work inventory (2026-05-29)**
+  — independent per-shard pass (one agent per branch) over all 116
+  landed commits, re-deriving value verdicts rather than inheriting the
+  earlier whole-branch value review. **Verdict: substantively valuable,
+  not churn — 87 substantive / 19 marginal / 4 churn / 3 concern
+  (1 genuine code-level).** The flagged seven were all fixable in place:
+  **(churn)** libflake #133 `configureEvalSettings`→`populateExtraPrimOps`
+  was a pure public-header rename (source-compat break, zero payoff) —
+  **reverted to the original name, docstring kept**, #133 reframed
+  resolved-by-design; libmain `0b66d94ce` was the known-wrong
+  `--max-freed` rl-next, wholly superseded — **squashed** into its
+  rewrite (`998a763cc`); libutil #119/#221 header-only commits have zero
+  in-tree callers on-branch (same shape as the reverted #163) — **kept**
+  by decision, since the consumers are filed/tracked (#239/#240) and
+  dropping would override the deliberate cross-shard-cleanup split
+  (rationale recorded on #239). **(concern)** nix-cli `ffb5ea72b` had
+  shipped the `--priority` regression then-fixed two commits later —
+  **squashed** so the broken state never appears in history (`9f70a07f1`
+  now carries the correct `needArg` form); libexpr #87's
+  `get_list_byidx_impl` comment falsely claimed identical behaviour
+  across both symbols — **corrected** via a follow-up commit
+  (`b9095c56b`) documenting the lazy-path null-guard change. All four
+  rewritten/extended branches rebuilt green via `nix build -L .`; the
+  libflake/libmain/nix-cli rewrites preserve a byte-identical final tree
+  vs their pre-rewrite backups (verified). **Remaining-work inventory:**
+  the catalog is NOT down to only cross-shard work — **~36
+  single-shard-actionable candidates remain as the foundation** (libexpr
+  ~15, libstore ~7, libutil ~5, nix-cli ~5, libfetchers/libflake ~2
+  each, libmain 0), to land before the separately-tracked cross-shard /
+  blocked-on-merge / needs-decision work. Highest-value foundation items
+  are largely the #241-#259 audit candidates plus pre-existing ones
+  (#211, #198, #190 libexpr; #245/#247/#186 libstore; #243/#244/#242
+  libutil; #90/#141 nix-cli).
+
 - **Whole-branch adversarial audit + fresh-eyes catalog audit (2026-05-29)**
   — independent multi-agent pass (22 discovery agents → dedup →
   per-finding adversarial verify): re-verified the 104 landed commits
@@ -715,17 +749,22 @@ propose a new one). Spawn an agent for it with `AGENT-CHARTER.md` as
 
 | Branch | Tip |
 | ------ | --- |
-| `vibe-coding/cleanup/libexpr` | `b3b02e9a9` |
+| `vibe-coding/cleanup/libexpr` | `b9095c56b` |
 | `vibe-coding/cleanup/libfetchers` | `572e8fde8` |
-| `vibe-coding/cleanup/libflake` | `fd6749635` |
-| `vibe-coding/cleanup/libmain` | `9495181a4` |
+| `vibe-coding/cleanup/libflake` | `ff9daabbd` |
+| `vibe-coding/cleanup/libmain` | `998a763cc` |
 | `vibe-coding/cleanup/libstore` | `410107979` |
 | `vibe-coding/cleanup/libutil` | `b96eda936` |
-| `vibe-coding/cleanup/nix-cli` | `fd60a040b` |
+| `vibe-coding/cleanup/nix-cli` | `2cbb7af04` |
 
-(Tips for libexpr, libmain, libstore, libutil, nix-cli advanced in the
-2026-05-29 audit; libfetchers and libflake unchanged. All `nix build -L .`
-green on their committed tips.)
+(Tips advanced through the 2026-05-29 audit and the follow-on value/churn
+pass. The value pass rewrote history on four branches: libflake (reverted
+the #133 rename, kept the docstring), libmain (squashed the known-wrong
+`--max-freed` rl-next into its rewrite), nix-cli (squashed the `--priority`
+regression into its fix), libexpr (added a #87-comment follow-up). All
+`nix build -L .` green on their current tips. NOTE: the libflake/libmain/
+nix-cli rewrites mean origin diverges and these three need a FORCE-push
+when published; libexpr is a fast-forward.)
 
 The chronological narrative above carries intermediate tip claims
 ("Final tip SHAs after Batch G", etc.) that are no longer current.
