@@ -80,6 +80,37 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
+- **Single-shard foundation batch 2 + scope triage (2026-05-29)** —
+  worked the "green tier" (candidates scoped as small/contained). The
+  honest outcome: only **#216** landed; the tier was smaller than first
+  estimated. **Landed:** #216 (libexpr `c3820c35d`) — namespace-scope
+  `static_assert`s pinning `sizeof(Value) == 2*sizeof(void*)`, a
+  bit-packed-guarded `alignof(Value) == 16`, and the relocated
+  `sizeof(Env) <= 16`; the round-trip-test half is deferred medium.
+  Also #248 (libexpr `e247a4cb3`, from earlier in this session) —
+  `Expr::registerDebugEnv` helper replacing the 19-copy bindVars
+  debug-env idiom + binop registration; its build hit a **transient
+  `new-build-cmd` flake** (sandbox-FIFO test) that reproduced on the
+  unchanged base tip and cleared on re-run, confirmed not caused by the
+  change. **Declined after attempt:** #255 (why-depends `resolveToStorePath`)
+  — the audit's "four sites" was two, and a `StorePath`-returning helper
+  discards the `Installable` objects reused later for `->what()` error
+  messages; caught at build time, reverted. **Reclassified small→medium
+  after per-site reading** (NOT done as quick batch): #232
+  (`ignoreExceptionInDestructor` — several sites are genuinely
+  non-destructor, e.g. `S3BinaryCacheStore::abortMultipartUpload`,
+  `PathSubstitutionGoal::cleanup`; per-site interrupt-semantics audit
+  needed), #95 (legacy-CLI shim with a cleanup-hook pitfall), #45
+  (NAR FSO visitor), #201 (eval-cache schema version — touches cache
+  invalidation), #208 (installed-header factory), #60-stretch. **Process
+  note:** a `nix build` returned exit 1 and was nearly misread green off
+  a filtered error-grep — always read the literal "build exit: N" line.
+  **Large items #90 + #141 (legacy-CLI structural) deferred** per user
+  decision: interlocking multi-file refactors (LegacySubcommandTable +
+  handler-context threading), to be their own dedicated pass; left as
+  open single-shard-structural candidates. ~20 single-shard candidates
+  (mostly medium) remain as foundation work.
+
 - **Single-shard foundation batch 1 (2026-05-29)** — first tranche of
   the per-shard foundation work the value-review inventory surfaced,
   landed as one commit per candidate. **libutil +3:** #259 (`LocalSigner`
@@ -773,7 +804,7 @@ propose a new one). Spawn an agent for it with `AGENT-CHARTER.md` as
 
 | Branch | Tip |
 | ------ | --- |
-| `vibe-coding/cleanup/libexpr` | `e247a4cb3` |
+| `vibe-coding/cleanup/libexpr` | `c3820c35d` |
 | `vibe-coding/cleanup/libfetchers` | `572e8fde8` |
 | `vibe-coding/cleanup/libflake` | `b29de9420` |
 | `vibe-coding/cleanup/libmain` | `998a763cc` |
