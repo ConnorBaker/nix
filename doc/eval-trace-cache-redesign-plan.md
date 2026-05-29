@@ -1495,3 +1495,262 @@ Next actions refined from this data:
 - Then identify the 30 lost cold hits in 902 versus 900 using `eval-trace-bench logs`/stats before doing performance-only work.
 - Treat no-dirty shutdown and lazy SQLite payload reads as worthwhile, but secondary to restoring cold precision.
 - Continue the custom generation backend direction because even the better completed runs remain cold-mean dominated by miss/outlier behavior and hot mean remains close to a second.
+
+## 2026-05-29 deep-research synthesis: fix authorization before storage
+
+A deep-research pass (107 agents, 24/25 claims confirmed against primary sources: rustc
+incremental dev guide, Salsa, Adapton, BSalC paper, RocksDB BlockBasedTable, Lucene codecs,
+Cap'n Proto, Bazel BzlLoadFunction/Skyframe) was cross-referenced against the live tree. The
+throughline reorders the plan: **the hot path is slow because it re-derives authority it could
+compare in one fixed-size step, and the prior storage experiments failed because they optimized
+payload access without first making authorization cheap. Fix authorization first; storage second.**
+
+### Finding 1 — the unimplemented lever: compact certificate before `loadFullTrace`
+
+Every mature incremental engine reuses a result by comparing a small fixed-size fingerprint and
+stopping there: rustc compares a 128-bit `Fingerprint`; Salsa serves the memoized return value
+when inputs are unchanged; the BSalC verifying trace stores hashes only. Our hot path does not do
+this. The live sequence is:
+
+```
+verify()        store/verifier.cc:1909   lookupCurrentNode (cheap) -> loadTraceKeysAndHeader
+                                          -> containsVolatileDep -> verifyTrace()
+verifyTrace()   store/verifier.cc:1778   loadFullTrace(ea, traceId) at verifier.cc:1806  <-- EAGER
+                                          then runPass1/runPass2 walk ALL deps
+loadFullTrace() store/sqlite-trace-storage.cc:236   deserializeKeys + deserializeValues -> vector<Dep>
+```
+
+Every hot hit pays full key+value deserialization and a full dependency walk (~842k deps /
+~53.5 MiB decoded; redesign-plan.md "skip decode-time sort" section) even though only
+~38346/842775 current dep hashes miss the session L1 cache. The "full-trace verification memo"
+candidate above is the embryonic form, still benchmark-pending.
+
+**Action.** Make `verify()` authorize a hot hit by a fixed-size `FullTraceHash` compare against
+session-L1-resident dep hashes, skipping `loadFullTrace` + the dep walk on certificate hit; decode
+the result payload lazily only AFTER authorization. This is pure libexpr, needs no storage-format
+change, and is transparent to all consumers — which also solves the long-standing "the
+action-cache win lived above libexpr" problem (it serves `nix-eval-jobs` and every other
+`libexpr` consumer, not just `nix eval --json`). Lazy payload WITHOUT lazy authorization is what
+run 137 already tried and it did not beat SQLite, so both must be lazy.
+
+### Finding 2 — precision is a projection problem, not a payload-size problem
+
+Firewalling/early cutoff in mature engines comes from PROJECTION queries layered over a coarse
+node, not from finer whole-trace payloads: rustc `no_hash` nodes are shielded by output-hashed
+projection "firewall" queries; Salsa backdates by comparing tracked-struct fields one by one;
+Adapton `force_map` projects a sub-field so changes to UNOBSERVED fields never enter the dirtying
+phase at all. We already have the primitive (`StructuredProjection`, per-binding NixBinding AST
+hashes, `fromJSON`/`fromTOML` leaf projections). Therefore the §8.2 over-invalidation issues
+(whole-file `.nix` content dep, session-level lock-file invalidation, `callFunction` `#keys`)
+should be attacked with MORE and FINER projections — not bigger traces. This is the precise reason
+the v53 capsule rewrite failed (it preserved too much full source-specific payload). Note the
+Adapton distinction: `force_map` prunes the dirtying phase, whereas our `markFileVerified`
+subsumption is dirty-then-clean; a projection-only "prune dirtying" path is strictly cheaper.
+
+### Finding 3 — the sound derivation-boundary proof, and an early-cutoff warning
+
+The repeatedly-falsified by-name / current-package shortcut should be replaced by a Bazel-style
+recursively-composed content-addressed transitive digest under a Skyframe-style strict
+dependency-capture invariant: inputs may be read ONLY via registered dependencies (direct
+filesystem reads silently break incremental correctness — exactly what the unsafe oracles did).
+Warning from Bazel itself: a content digest gives soundness but NOT early cutoff — Bazel's
+compiled-`.bzl` layer has no early cutoff because `BzlCompileValue` lacks a meaningful equality
+relation, so any file change propagates fully. Early cutoff requires an explicit
+output-equality/fingerprint relation at EACH layer; our `FullTraceHash` is that relation and must
+be kept.
+
+### Finding 4 — storage format is downstream of authorization, not a parallel track
+
+SSTable/Lucene-`segments_N`/Git-pack startup (tiny generation pointer read with no log replay;
+footer -> binary-search index -> bloom filter to jump to one block) and a zero-copy mmap payload
+layout (Cap'n Proto/FlatBuffers — but only unpacked single-segment is truly parse-free; PACKED
+mode and ~4 KiB page granularity are caveats) are confirmed design properties of other systems —
+but NONE is benchmarked against this cache. Run 137 already showed lazy-payload-over-immutable-
+objects does not beat SQLite without the authorization fix. Per `eval-trace-cache-findings.md`,
+the custom generation backend should NOT return until the proof model first proves a win. The
+lock-free reader / atomic-`CURRENT`-publication angle returned ZERO surviving verified claims and
+is deferred until a custom store exists.
+
+### Live-code correction (not visible to web research)
+
+The `rearchitecture-proposal.md` §2.1 plan to make `TraceStorage` an abstract base with ~23
+virtuals was implemented and then REVERSED: `store/trace-storage.hh:1-46` documents that the vptr
+"measurably perturbed register allocation in the hot `verifyTrace` loop." It is now a
+non-polymorphic `TraceStorageBase` + a `TraceStorageLike` C++20 concept. Consequence: in this hot
+loop struct layout and field offsets are measurable, so the certificate fast path must preserve
+`SqliteTraceStorage`'s tight layout. Do not re-propose abstracting the backend.
+
+### Recommended sequence (each gated by the 10-commit correctness + benchmark gate)
+
+1. Certificate-before-payload fast path (pure libexpr; finding 1).
+2. Projection-coverage precision pass, including a `force_map`-style prune-dirtying path (finding 2).
+3. Sound derivation-boundary transitive digest (Bazel/Skyframe), only after the gate harness is trusted (finding 3).
+4. Custom immutable-segment store + zero-copy mmap + lock-free readers — only if 1-3 prove the proof model wins (finding 4).
+
+## 2026-05-29 CORRECTION after thorough work-log read
+
+The synthesis above was written from the distilled docs before reading the body of
+`eval-trace-cache-work-log.md` (16k lines). A subsequent thorough read of the work log corrects
+two of the four findings. The principles from the research are sound, but the prior work already
+explored them and the measured results invert the priority order. **This block supersedes the
+sequence above where they conflict.**
+
+### Finding 1 (certificate before `loadFullTrace`) — already explored, every SOUND form refuted
+
+Not a fresh idea. The mechanism is proven but does not pay for itself soundly on this workload:
+
+- Unsound oracle (run 1015, `NIX_EVAL_TRACE_TRUST_CURRENT_NODE_FOR_BENCHMARK`) skips the walk and
+  decodes only the result: **hot 0.678s vs 0.880s baseline**. So the dep walk genuinely is the hot
+  cost for true exact hits — but the oracle "is unsound by construction because it trusts
+  current-node metadata and does not prove dependency coverage."
+- Cheap fingerprint (the `verifiedTraceIds` session memo) — runs 909, 980, 987, 1032, 1125 — did
+  NOT move hot wall, because once the memo is in place `loadTrace.count` is already minimal (7) and
+  the residual hot cost is result decode/materialization + scheduler/startup fixed cost, not the
+  walk. Several of these regressed cold and were reverted.
+- Authoritative fingerprint (`ExactReplayDescriptor`) — run 1042 persisted it: **cold 9.67s** vs
+  6.06s baseline; run 1133 built it at record time: **first cold commit 38.1s**, reverted.
+- Direct-serving / fusing the authority ahead of the decode — runs 1107/1108 (hot regressed to
+  ~0.92s), 967/976/983/1104/1116 (hot improved ~20-50ms, cold wrecked every time). Explicit reason:
+  "descriptor validation plus candidate lookup is too expensive to add ahead of the existing capsule
+  decode unless direct payload eligibility is both common and cheaply known."
+- The entire exact-replay-descriptor layer was **removed as inactive dead code in the 2026-05-27
+  cleanup**.
+- Soundness bar (run 993): a trace-row exact-replay class stored in manifest metadata "is an
+  index/projection, not hash-bound proof material" — L1 residency is not proof of current dependency
+  coverage. A `FullTraceHash`-vs-resident-state compare faces the same bar.
+
+The ONLY un-refuted shape is the one the log names as future work: precompute hit eligibility into a
+**cheaper per-current-node bit/index** so the fixed-size compare needs no descriptor reconstruction
+on hot and no descriptor construction/persistence on cold, while still clearing the run-993 coverage
+bar. Low priority regardless, since the residual hot cost is decode/startup, not the walk.
+
+### Finding 2 (precision) — INVERTED. Prune coarse deps; do not add finer ones
+
+The synthesis above said "add more/finer projections." The work log shows the **opposite**, decisively:
+
+- Adding finer/fuller projection or sidecar data NEVER improved the benchmark: probe prefilter (918),
+  bounded full-dependency probe projection (921), probe cap 65536 (925), naive StructuredProjection
+  spot-checks (1034 — hot regressed to ~0.95s), v10 maintainer observed-keys (no change), Lead G
+  widened `sourceContentHash` reuse (zero hits). Recurring measured reason: "the extra sidecar work
+  costs more than the avoided full trace materialization."
+- The single biggest lever in the entire log is the **observed-key / observed-directory proof**
+  (v6->v11), which is exactly the Adapton `force_map` "prune the dirtying phase" idea: authorize
+  serving when only UNOBSERVED sub-fields (attrset bindings, by-name directory children) changed.
+  It drove cold 3.32s -> 1.88s and hot 0.88s -> 0.38s. It works by **slicing/removing coarse deps**
+  (suppress construction-only `#keys` at `splice.nix`/`customisation.nix`; slice `DirectoryEntries`
+  to the observed child names; ignore unobserved-binding churn), NOT by layering finer deps over a
+  coarse node. The one finer *gate* added for soundness (v7 `#keys` suppression) cost 0.84s cold.
+
+Two refinements (verified 2026-05-29 by reading the run passages directly, not just the agent summary):
+
+- **The cold win is a tail-rescue, not a distribution shift.** `cold/46` vs `cold/47` improves the
+  MEAN (1.92s vs 2.97s) but the MEDIAN (0.45s vs 0.47s) and p90 (~12.3s for both) are nearly
+  identical. The gain comes entirely from converting ~9 catastrophic by-name-churn miss commits into
+  proof hits (12 slow cold stores vs 21). It kills the worst cold outliers; it does not make every
+  hit cheaper. Pitch it as outlier-elimination, not hot-path speedup.
+- **The soundness boundary is narrower than "just wire it up."** The work log (lines 969-974) states
+  the proof is sound ONLY for the observed key universe — NOT for `attrNames`, missing-attr
+  suggestions, or complete negative membership — and it depends on successfully parsing simple
+  non-recursive attrset files (falls back if parsing fails). So `attrNames` / negative-membership /
+  recursive-attrset coverage is genuinely UNSOLVED, not merely un-wired.
+
+Three caveats therefore keep this from being done: (a) it is currently **command-JSON-only** — above
+libexpr, i.e. the disqualified layer per `eval-trace-cache-findings.md`; (b) it is gated behind
+Nixpkgs path heuristics and env vars, so it is not yet **sound by construction**; (c) its coverage
+stops at the observed-key universe. The real work is a producer-side "construction-only vs
+result-visible shape observation" provenance fact that makes the unobserved-change proof sound by
+construction, transparent to `libexpr`, and extensible past the observed-key boundary.
+
+### Finding 3 (semantic derivation-boundary digest) — survives; the genuinely-open frontier
+
+The Bazel/Skyframe recursively-composed transitive digest under strict dependency capture is the
+SEMANTIC producer-side proof that the work log independently concluded it needs: the remaining cold
+tail is whole-file `FileBytes` rejection on by-name `package.nix` files whose source changed but
+whose demanded output is unchanged (runs 87/88), and the changed-package oracle (~run 10114) was
+rejected because "a parent can depend on a package's non-output attrs or passthru... accepting
+because only the own package drv is unchanged would serve stale parent output." Both point at the
+same fix: a semantic drvPath/output-facet proof with a facet mask, not a file whitelist. This is the
+research's strongest non-redundant contribution.
+
+### Finding 4 — unchanged (storage downstream of the proof model).
+
+### Corrected sequence
+
+1. Make the observed-key / unobserved-change PRUNING proof (the log's #1 win) sound-by-construction
+   and transparent to `libexpr` — lift it out of the command-JSON layer and off the path heuristics.
+2. Semantic derivation-boundary transitive digest (Bazel/Skyframe) for the whole-file `FileBytes`
+   tail — what runs 87/88 and the changed-package oracle both concluded they need.
+3. Certificate-before-payload ONLY as the un-refuted per-current-node eligibility bit/index; low
+   priority (residual hot cost is decode/startup, not the dep walk).
+4. Custom immutable-segment store / mmap / lock-free readers — only if 1-3 prove the win.
+
+## 2026-05-29 scoped research + code audit on the pruning frontier (GAP 1 / GAP 2)
+
+Two scoped deep-research rounds (GHC/OCaml/Unison/Cargo interface hashing; Shake/Adapton/Bazel/Buck2
+negative + enumeration deps) plus a primary-source-verified adversarial review and a direct code
+audit. All claims below were cross-checked against primary sources and our own code; the prose
+summaries of the research were NOT trusted (one round's synthesis output was malformed). Net: the
+corrected sequence above does not change — these findings sharpen the soundness constraints on
+finding 2 (the prune-the-dirtying-phase / observed-key proof).
+
+### The observed-key / by-name slicing proof is MORE aggressive than any production build system
+
+The decisive research result: NO surveyed production system (Bazel, Buck2, Shake) does
+"only unobserved members of an enumerated set changed -> reuse" at the glob/directory-listing layer.
+They all conservatively invalidate on ANY directory-entry-set change — Bazel `GlobValue` depends on
+the entire `DirectoryListingValue` (verified: any add/remove, even of a non-matching file,
+invalidates, because `DirectoryListingStateValue.equals` compares the whole sorted dirent set);
+Buck2 DICE dirties both `ReadDirKey` variants of the parent on any entry change; Shake's
+`getDirectoryFiles` rebuilds on any matched-set change. Every documented stale-result bug in those
+systems traces to a missing dependency edge, untracked existence, or an under-reporting watcher —
+never to intentional fine-grained reuse despite a known membership change.
+
+Consequence for us: the work log's v6->v11 observed-key / by-name directory-slicing proof (which
+reuses across changes to unobserved directory children / unobserved attrset bindings) has NO
+battle-tested precedent. The orthodox-sound move is the conservative one (invalidate on any set
+change) — and that is exactly the direction the work log measured as expensive (v7 `#keys` hardening
+cost 0.84s cold). So our winning optimization is genuinely novel, and the entire soundness argument
+reduces to proving a provenance distinction with zero external validation: that a
+"construction-only" enumeration (a listing/keyset used only to build an index, never to drive a
+result-visible decision) is distinguishable from a "result-visible" enumeration. That provenance
+fact is the real work behind making the pruning proof sound by construction.
+
+Failure-mode catalog our negative/keyset/enumeration deps must be tested against (each a real
+documented bug): missing dependency edge (Bazel #6351); untracked existence of empty dirs (Bazel
+PR #15774); watcher under-report (Buck2 watchman workaround); symlink-following set expansion
+(Bazel #11875); child-state node independent of parent (Bazel #26863).
+
+### GAP 1: GHC gives the soundness FLOOR, not a speedup — and a verified-firewalled local gap
+
+GHC's per-declaration interface hash deliberately folds in everything a consumer could observe
+(exported unfoldings, RULES, instances, fixity) and serializes the HASH of each referenced name so a
+declaration's fingerprint changes if anything in its transitive closure changes (verified verbatim:
+the user's guide states a change to A's inlining "may conceivably not change B.hi one jot" yet C
+must still recompile). Orphan instances can't be located per-name and force a transitive,
+module-level `mi_orphan_hash` (verified verbatim) — a real soundness bug (#12733) came from getting
+that wrong. Lesson: this tells us the MINIMUM we must observe to stay sound (it CAPS how aggressive
+pruning can be); it does not hand us a faster hot path. GHC folds MORE in to stay safe; our problem
+is the opposite tail (we already have soundness via the FileBytes backstop and want LESS
+invalidation).
+
+Code audit of our analogue (`computeNixScopeHash` / `computeNixBindingHash` / `showForHash`): the
+"`ExprVar::showForHash` hashes the variable name, not its referent" gap is REAL but NOT independently
+exploitable — it is firewalled. `maybeRecordNixBindingDep` unconditionally co-records a `FileBytes`
+dep on the same file alongside the binding hash; the structural override is per-file
+(`FileIdentity = (sourceId, pathId)`) and re-verifies the covering dep, forgiving a FileBytes failure
+only when a binding hash for that same file passes; and `findNonRecExprAttrs` is fail-safe (any
+expression shape it doesn't understand yields no binding hash -> FileBytes-only). The genuine
+residual gap is a referent reachable neither through the file's own bytes nor the enumerated scope
+chain — i.e. an attribute injected by an overlay / `//` merge evaluated elsewhere. That is exactly
+GHC's orphan-instance case, and it is the SAME gap already documented as OR-4 / parent-mediated value
+change (§8.1, low severity). So GHC's orphan-hash / transitive-discriminator prior art applies to
+OR-4, not to in-file `ExprVar`. Any future overlay-precision work needs a transitive discriminator,
+per that prior art — but it is a precision/soundness item, not a hot-path speedup.
+
+### Unison caveat
+
+Unison's "content-address the definition, the interface/impl question vanishes" is over-applicable:
+it works because Unison resolves names->dependency-hashes at codegen time (a closed, resolved graph).
+Nix evaluation is lazy/dynamic — dependency hashes are not known until evaluation — so adopt only the
+local idea (key on the content-hash of the observed sub-expression, which our NixBinding hash already
+approximates), not the full transitive-baking model.
