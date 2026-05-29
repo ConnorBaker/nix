@@ -238,6 +238,8 @@ extern "C" {
 nix_err
 nix_store_path_hash(nix_c_context * context, const StorePath * store_path, nix_store_path_hash_part * hash_part_out)
 {
+    if (context)
+        context->last_err_code = NIX_OK;
     try {
         auto hashPart = store_path->path.hashPart();
         // Decode from Nix32 (base32) encoding to raw bytes
