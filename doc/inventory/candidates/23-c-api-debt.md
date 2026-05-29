@@ -1,10 +1,11 @@
 # C-API surface duplication
 
-Candidates N24, N25, N29 (Cluster E). Pass 2's deeper exploration found
-a recognisable cluster of duplication inside the C-API libraries
-(`libutil-c`, `libstore-c`, `libexpr-c`, `libfetchers-c`, `libflake-c`,
-`libmain-c`) that the per-shard 1-217 catalog touches only obliquely
-(via #50, #87, #88, and the resolved-by-design pair forwarders).
+Candidates N24, N25, N29 (Cluster E) plus #257, #258 (2026-05 audit).
+Pass 2's deeper exploration found a recognisable cluster of duplication
+inside the C-API libraries (`libutil-c`, `libstore-c`, `libexpr-c`,
+`libfetchers-c`, `libflake-c`, `libmain-c`) that the per-shard 1-217
+catalog touches only obliquely (via #50, #87, #88, and the
+resolved-by-design pair forwarders).
 
 Pass 1 explicitly named the C-API as "out of scope but flagged for
 follow-up"; this section is the follow-up.
@@ -14,6 +15,8 @@ follow-up"; this section is the follow-up.
 | N24 | VALID | small (helpers + comment) / medium (migrate all 14) |
 | N25 | VALID | small |
 | N29 | VALID | small (rename) / medium (port 270+ call sites) |
+| 257 | VALID | medium (cross-shard; deferred) |
+| 258 | VALID | small |
 
 ---
 
@@ -25,3 +28,11 @@ N25. **The C-API per-library `nix_<lib>_init` is hand-rolled idempotency.** Ever
 
 N29. **The `NIXC_CATCH_ERRS` family is three near-identical macros with subtly different calling conventions.** The C API has three closely related error-catch macros defined in `nix_api_util_internal.h`: `NIXC_CATCH_ERRS` (catch then `return NIX_OK;`), `NIXC_CATCH_ERRS_RES(def)` (catch then return `def`; no trailing `return`), `NIXC_CATCH_ERRS_NULL` (alias for `_RES(nullptr)`). The first two differ only in (a) does the catch return `def` or `NIX_OK`, and (b) does the function return after the catch. The third is an alias. Independent grep confirms ~270+ uses across the C API libraries. The hidden duplication: `NIXC_CATCH_ERRS` (no return value) and `NIXC_CATCH_ERRS_RES(NIX_OK)` (return `NIX_OK`) are not quite identical — `NIXC_CATCH_ERRS` *also* implicitly returns `NIX_OK` after the catch block (via `return NIX_OK;`), so the calling function must end at the macro. `NIXC_CATCH_ERRS_RES(def)` does *not* contain the trailing return — the caller must spell it out. This is "two macros for the same thing, with subtle calling conventions differing" — a coding trap.
 - **Validation:** VALID. Unify the macros (or convert to a single `scope-exit`/`std::exception_ptr`-based RAII helper). Specifically: a `template<auto DefValue> struct CCatchScope { /* catches and converts */ };` plus `#define NIXC_CATCH(Default) catch (...) { return nix::cCatchAndReturn(context, Default); }`. Or — preferred — port the C-API to use a `try { ... } catch(...) { return cContextFromException(context); }` template helper. The trailing `return NIX_OK;` of `NIXC_CATCH_ERRS` is a footgun. Sites: `src/libutil-c/nix_api_util_internal.h` (definition) plus all usage in `src/libstore-c/`, `src/libexpr-c/`, `src/libfetchers-c/`, `src/libflake-c/`, `src/libmain-c/`. **Compounds with N24, N25 (the C-API follow-up cluster). See also:** Cluster E. Effort: small (rename) / medium (port 270+ call sites).
+
+257. **The C-API entry-side "clear `last_err_code` on entry" preamble is ~85 inline copies.** [cross-shard; deferred] Across the six `*-c` libraries, fallible exported functions open with `if (context) context->last_err_code = NIX_OK;` (or `nix_clear_err(context)` in libflake-c) — ~85 inline copies + 12 `nix_clear_err` calls — paired with the `NIXC_CATCH_ERRS` family on the exit side. N29 names the catch (exit) half; this names the entry-clear half N29 omits. Surfaced by the 2026-05 audit (F038).
+    - ../verified/19-c-bindings-misc.md
+    - **Validation:** VALID. Introduce a single RAII helper (e.g. `NixCApiScope` guard, or a wrapping template taking the lambda body) that clears `last_err_code` on construction and converts exceptions via `nix_context_error` on exit, replacing both the entry preambles and the `NIXC_CATCH_ERRS` family. Pairs with N29 for one combined helper. **Correction:** libfetchers-c uses neither inline spelling (its only fallible fn is the drift site `nix_fetchers_settings_new`). The two drift sites — `nix_store_path_hash` (fixed inline on `vibe-coding/cleanup/libstore` during the audit, F052) and `nix_fetchers_settings_new` (still open) — are independent one-liner fixes: add `if (context) context->last_err_code = NIX_OK;` at the top of each. Tagged cross-shard (spans all `*-c` libraries) — defer. **See also:** N29. Effort: medium.
+
+258. **Flake `LockFlags` mode setters are a 4-field boolean table written four times.** In `src/libflake-c/nix_api_flake.cc`, the three exported mode setters (`set_mode_virtual`/`_write_as_needed`/`_check`) are structurally identical (`nix_clear_err` + try{4 bool assignments to `updateLockFile`/`writeLockFile`/`failOnUnlocked`/`allowUnlocked`} + `NIXC_CATCH_ERRS`), differing only in a 4-bool tuple. Surfaced by the 2026-05 audit (F039).
+    - ../verified/19-c-bindings-misc.md
+    - **Validation:** VALID. Define a static `mode → 4-bool tuple` table + one `applyLockMode(LockFlags&, mode)` helper; the three exported entry points all call it (ABI-preserving — same exported functions). **Correction (Rule 8):** `nix_flake_lock_flags_new` is NOT a fourth copy of `write_as_needed` — its mode fields are `{true, true, false, false}`, differing from `write_as_needed`'s `{true, true, false, true}` on `allowUnlocked`; its `// == set_mode_write_as_needed` comments are stale/incorrect and should be fixed. Cross-reference N24 (struct shape, distinct). Effort: small.

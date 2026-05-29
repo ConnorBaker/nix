@@ -196,13 +196,20 @@ for user-visible behaviour changes that didn't get release notes.
 ### rl-next entries
 
 - [x] ~~**libmain** `--max-freed` user-visible behaviour change
-  (#222): previously `--max-freed -1` silently disabled the cap;
-  now errors at parse. Values above `INT64_MAX` previously
-  silently disabled; now honoured up to `UINT64_MAX`. Affects
-  both `nix-store --gc --max-freed` and `nix-collect-garbage
+  (#222): previously `--max-freed -1` clamped to `0` (a no-op
+  collection — the strictest cap, *not* a disabled cap); now
+  errors at parse. Values above `INT64_MAX` previously errored at
+  parse (`boost::lexical_cast<int64_t>` rejects out-of-range, it
+  does not wrap); now honoured up to `UINT64_MAX`. Affects both
+  `nix-store --gc --max-freed` and `nix-collect-garbage
   --max-freed`. Add `doc/manual/rl-next/max-freed-clamp.md` (or
   similar) on the libmain cleanup branch.~~ Done in `0b66d94ce`
-  as `doc/manual/rl-next/max-freed-clamp.md`.
+  as `doc/manual/rl-next/max-freed-clamp.md`. **Corrected by the
+  2026-05 audit (F002):** the original rl-next prose described the
+  old behaviour as "silently disabled the cap" and "overflowed to
+  negative then clamped" — both wrong (see #222 body); the rl-next
+  was rewritten and the dangerous "drop the flag entirely" migration
+  advice removed (dropping the flag performs an *unbounded* GC).
 - [x] ~~**libfetchers** `treeHash` attribute now rejected by
   `allowedAttrs` enforcement on github/gitlab/sourcehut inputs
   (#51). Previously silently accepted and ignored; now throws

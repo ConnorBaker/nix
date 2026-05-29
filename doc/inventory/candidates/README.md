@@ -298,12 +298,26 @@ generation-of-JSON-serialisers.
   N1 (split into N1a/N1b per pass 2). Three sub-stages:
   - **U7a (small):** write the rubric and `getOrInsertConcurrent`
     helper.
-  - **U7b (medium):** migrate the actual cache sites (4-5 sites).
-  - **U7c (out of scope):** the iteration-needing registries
-    (`gc.cc::connections`, `remote-store.hh::connectionFds`,
-    `filtering-source-accessor.cc::allowedPrefixes`) are *not*
-    candidates for migration — they need ordered iteration semantics
-    that `concurrent_flat_map` doesn't provide; document why.
+  - **U7b (medium):** migrate the 2 migratable `Sync<std::map>`
+    cache sites (`input-cache.cc::cache_`,
+    `git-utils.cc::workdirInfoCache_`), both flat insert-on-miss.
+    (Corrected per the 2026-05 audit, F017: the prior "4-5 sites"
+    over-counted; `grep -rn 'Sync<std::map' src/` returns 4 writers,
+    of which `gc.cc::connections` is a thread registry and
+    `pos-table.hh::origins_` needs ordered access — `PosTable::resolve`
+    uses `upper_bound`+`std::prev`, `addOrigin` uses `rbegin`/`rend` —
+    so neither is migratable, leaving 2.)
+  - **U7c (out of scope):** three sites are *not* candidates for
+    migration, for two distinct reasons (corrected per F018 — the
+    prior "all need ordered iteration" reason held for only one):
+    `filtering-source-accessor.cc::allowedPrefixes` needs an ordered
+    `std::set` because `CanonPath::isAllowed` uses
+    `allowed.lower_bound(*this)`; `remote-store.hh::connectionFds`
+    and `gc.cc::connections` instead need full iteration under lock
+    (shutdown-all via `::shutdown(SHUT_RDWR)` / join-all teardown)
+    and carry non-cache values (`Descriptor` set / `std::thread`
+    map) — not ordered iteration. `concurrent_flat_map` is wrong for
+    all three, but state the right reason per site.
 - **U8 (structural) — `boost::asio::awaitable` migration.** Cand.
   #160 + N8. Replace `Goal::Co::SuspendAwaiter` and
   `ChildEventAwaiter` with asio primitives, keeping the bespoke

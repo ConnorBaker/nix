@@ -1,6 +1,6 @@
 # libexpr eval-core: cache, attr-set, profiler
 
-Candidates 201-209 plus #227. Eight VALID; #205, #206, #208 PARTIALLY VALID.
+Candidates 201-209 plus #227 and #250/#252 (2026-05 audit). Ten VALID; #205, #206, #208 PARTIALLY VALID.
 
 **Latent bug surfaced:** #203 — `AttrDb::getAttr` does not honour the
 `doSQLite` failed-flag protocol that every writer uses. Asymmetric error
@@ -18,6 +18,8 @@ handling between read and write paths.
 | 208 | PARTIALLY VALID | small |
 | 209 | VALID | medium |
 | 227 | VALID | small |
+| 250 | VALID | small |
+| 252 | VALID | small |
 
 ---
 
@@ -64,3 +66,11 @@ handling between read and write paths.
 227. **`EvalProfiler`'s NVI cache + default no-op virtuals are dead surface after #204.** [LOW] Post-#204, both profiler hooks (`functionCallTrace`, `sampleStackProfiler`) are constructed exactly once, in the `EvalState` ctor. Their `getNeededHooks()` results are snapshotted into `functionCallTraceHooks` / `sampleStackProfilerHooks` / `profilerHooks` immediately after construction and never re-queried. Three pieces of `EvalProfiler` infrastructure are now unreachable: (a) the `private std::optional<Hooks> neededHooks;` cache field with its lazy "compute-once-and-store" body in `getNeededHooks()`, (b) the `protected virtual Hooks getNeededHooksImpl() const { return Hooks{}; }` indirection (NVI to nothing — both subclasses override the public hooks directly, never the impl), and (c) the default no-op `pre/postFunctionCallHook` bodies in `eval-profiler.cc` (both subclasses override). Drop the cache, collapse `getNeededHooks()` to a direct virtual, mark the hook virtuals pure. `eval-profiler.hh` ships via `install_headers` so this is a public-API tightening — coordinate with rl-next for any external embedders subclassing `EvalProfiler`.
     - ../verified/11-libexpr-eval.md
     - **Validation:** VALID. Compounds with #204. Effort: small.
+
+250. **`AttrCursor`'s typed cache getters repeat a cached-lookup + force + typecheck shell.** In `libexpr/eval-cache.cc`, `getBool`/`getInt`/`getString`/`getStringWithContext`/`getListOfStrings` (and `getAttrs`) repeat the `if (root->db) { fetchCachedValue(); if (cachedValue && !get_if<placeholder_t>) { if (auto x = get_if<T>) {debug; return x} else error<TypeError>(noun) } }` + force + typecheck shell. Surfaced by the 2026-05 audit (F031).
+    - ../verified/11-libexpr-eval.md
+    - **Validation:** VALID. Full-shell consolidation is clean for `getBool`/`getInt`/`getString` via a private `getTyped<Variant, VT, Accessor>(noun)` dispatcher; `getStringWithContext` (context store-path re-validation loop) and `getListOfStrings`/`getAttrs` (listView iteration + persistence) keep bespoke eval-branch tails but can share the cached-branch head. This is the eval-cache analog of #211 and is NOT covered by #211/N26/#114; should consume N20's `valueTypeTraits` table. Orthogonal to #202/#203 (the duplication survives post-`failed_t`-removal — verified — so no sequencing dependency). **See also:** #211, N20, N26. Effort: small.
+
+252. **eval-cache `AttrDb` tag-only setters are byte-identical.** In `libexpr/eval-cache.cc`, `setPlaceholder`/`setMissing`/`setMisc`/`setFailed` (and the value-carrying `setBool`/`setInt`) share one body modulo the `AttrType` tag. Surfaced by the 2026-05 audit (F033).
+    - ../verified/20-eval-core-cache-attrset-profiler.md
+    - **Validation:** VALID. A private `AttrId setTagged(AttrKey key, AttrType type)` helper collapses the tag-only setters to one-line wrappers; `setBool`/`setInt` optionally fold in via a value+notNull overload. **Sequencing:** best landed *after* #203 (which removes `setFailed`), so post-merge scope is 3 tag-only + 2 value-carrying. Distinct from N13 (the `SqliteCache<Schema>` base — a cross-cache abstraction this does not duplicate). **See also:** #202, #203, N13. Effort: small.

@@ -1,8 +1,8 @@
 # libstore/build deep audit
 
-Candidates 150-160. Eight VALID; #152, #156, #160 PARTIALLY VALID with
-significant qualifications. These are the highest-stakes refactors in the
-catalog.
+Candidates 150-160 plus #219 and #245/#247 (2026-05 audit). #152, #156,
+#160 PARTIALLY VALID with significant qualifications; #219 RESOLVED as
+dead-code defence. These are the highest-stakes refactors in the catalog.
 
 **Keystone:** #150/#151 (`WeakGoalCache<G, Key>` collaborator on `Worker`,
 turning `removeGoal`'s `dynamic_pointer_cast` chain into a single virtual
@@ -22,6 +22,9 @@ concrete `Goal` subclass fall out naturally.
 | 158 | VALID | medium |
 | 159 | VALID | trivial |
 | 160 | PARTIALLY VALID | structural |
+| 219 | RESOLVED (dead-code defence) | do not ship standalone |
+| 245 | VALID | medium |
+| 247 | VALID | medium |
 
 ---
 
@@ -76,3 +79,11 @@ concrete `Goal` subclass fall out naturally.
 219. **The post-build hook consumer in `runPostBuildHookCo` silently drops `TimedOut` events.** [MEDIUM] `derivation-building-goal.cc::runPostBuildHookCo` (and pre-extraction, the inline post-build-hook loops in `buildWithHook` and `buildLocally`) consumes `co_await WaitForChildEvent{}` in a `while (true)` loop that branches only on `ChildOutput` and `ChildEOF`. A `TimedOut` event delivered to the goal during the post-build hook phase falls through both branches and the loop spins. This is a pre-existing latent bug — present in both inline copies before the #157 extraction and preserved verbatim in the extracted helper. Not in scope for #157's pure dedup; surfaces here because the post-build hook can run for many seconds and the goal's overall timeout machinery (`pushChildEvent(TimedOut)`) still fires during the hook. The fix is to add a `if (auto * timeout = std::get_if<std::unique_ptr<TimedOut>>(&event)) { hookState->complete(); worker.childTerminated(this); co_return doneFailure(std::move(**timeout)); }` arm, matching the timeout-handling pattern in `buildLocally`'s build phase.
     - ../verified/10-libstore-build.md
     - **Validation:** RESOLVED as dead-code defence (post-Batch-G adversarial-review verdict; reachability question now answered). The post-build hook child is registered via `worker.childStarted(shared_from_this(), {hookState->out->readSide.get()}, false, false)` — the fourth argument is `respectTimeouts`, set to `false`. `Worker::waitForInput` only fires `goal->timedOut(TimedOut(...))` for goals whose `j->respectTimeouts` is `true`, so the post-build hook child cannot generate a `TimedOut` event on its goal. The `if (output)` / `if (eof)` arms in `runPostBuildHookCo` therefore exhaustively cover the reachable variants. Adding the timeout arm would be defensive coding for an unreachable path — not a present-day latent bug. **Recommended action:** do not ship as a "bug fix"; if folded into #157's extraction it could be a one-line `else if (timeout)` arm preserving symmetry with `buildLocally`'s build-phase loop, but on its own it is not a fix. **See also:** #157 (extraction parent). Effort: do not ship standalone.
+
+245. **The during-build child-event consumption loop is duplicated between `buildWithHook` and `buildLocally`.** [MEDIUM] In `libstore/build/derivation-building-goal.cc`, both `DerivationBuildingGoal::buildWithHook` and `buildLocally` contain a `while(true)` loop over the `ChildEvent` variant with the same ~16-line skeleton: `maxLogSize`/`doneFailureLogTooLong` gating, `(*buildLog)(data)` + `logFile->sink` tee, `ChildEOF` flush+break, `TimedOut` kill+`doneFailure`. They diverge in three places: the fd source, the kill action (`hook.reset()` vs `builder->killChild()`), and the hook-only `fromHook` JSON channel. Surfaced by the 2026-05 audit (F026). Distinct from #157's *post-build-hook* loop, #219's `TimedOut` arm, and #44's sinks — this is the *during-build* consumer.
+    - ../verified/10-libstore-build.md
+    - **Validation:** VALID (MEDIUM). Propose a member coroutine `Co consumeBuilderOutput(Descriptor logFd, BuildLog & buildLog, LogFile * logFile, fun<void()> onKill, fun<void(std::string_view)> extraChannel = {})` parametrizing the fd, the kill action (shared by the `maxLogSize` and `TimedOut` arms), and an optional extra-channel callback for `buildWithHook`'s JSON demux. Does NOT subsume #157/#44/#219. **Catalog note:** #157's `runPostBuildHookCo` is on `vibe-coding/cleanup/libstore` only, not master — the inline post-build loops still exist in the master tree. **See also:** #157, #44, #219. Effort: medium.
+
+247. **Per-`JobCategory` slot dispatch (counter + limit + waiting-set) is hand-rolled at four sites in `Worker`.** [MEDIUM] `libstore/build/worker.cc`'s `childStarted`/`childTerminated`/`waitForBuildSlot` each branch on `JobCategory` to select the matching counter (`nrLocalBuilds`/`nrSubstitutions`), limit, and waiting-set. The branching is duplicated and easy to drift. Surfaced by the 2026-05 audit (F028).
+    - ../verified/10-libstore-build.md
+    - **Validation:** VALID (MEDIUM). Introduce `struct Slot { size_t & nr; unsigned int limit; WeakGoals & waiting; }` returned by `Slot slotFor(JobCategory cat)` (asserting `cat != Administration`): `childStarted` → `slotFor(cat).nr++`; `childTerminated` → `slotFor(cat).nr--` + wake from `slotFor(cat).waiting`; `waitForBuildSlot` → `slotFor(cat).nr < slotFor(cat).limit` then `addToWeakGoals(slotFor(cat).waiting, goal)`. **Destructor-safety contract:** `slotFor` must take `JobCategory` *by value* (not derive it from the goal) so the two-arg `childTerminated` stays safe to call from partially-destroyed goals. Overlaps N14 (the `nr*` counters are the `Slot::nr` field) — sequence after or jointly with N14's counter-family rework. **See also:** N14. Effort: medium.

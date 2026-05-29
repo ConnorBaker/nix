@@ -1,6 +1,6 @@
 # Other distinct candidates
 
-Candidates 72-88. All seventeen VALID.
+Candidates 72-88 plus #253, #255 (2026-05 audit). All nineteen VALID.
 
 | # | Verdict | Effort |
 | - | ------- | ------ |
@@ -21,6 +21,8 @@ Candidates 72-88. All seventeen VALID.
 | 86 | VALID | medium |
 | 87 | VALID | trivial |
 | 88 | VALID | trivial |
+| 253 | VALID (disclosure-gap) | small |
+| 255 | VALID | trivial-small |
 
 ---
 
@@ -99,8 +101,16 @@ Candidates 72-88. All seventeen VALID.
 87. **`Forced vs lazy` value access in C bindings.** `nix_get_list_byidx{,_lazy}`, `nix_get_attr_byname{,_lazy}`, `nix_get_attr_byidx{,_lazy}` are nearly-identical pairs differing only by the presence of `forceValue` and slight error-message variations. The duplication is the most obvious internal symmetry in the C ABI.
     - ../verified/19-c-bindings-misc.md
     - **Validation:** VALID. Effort: trivial.
-    - **Branch:** `vibe-coding/cleanup/libexpr` (three file-static private impl helpers — `get_list_byidx_impl`, `get_attr_byname_impl`, `get_attr_byidx_impl` — each carrying the shared body with a `bool force` parameter; the six public symbols become one-line wrappers selecting `force=true` or `force=false`. ABI and signature unchanged. Error wording preserved exactly: `nix_get_attr_byidx_lazy`'s "(Nix C API contract violation)" suffix on the bounds-check error message — divergent from `nix_get_attr_byidx`'s plain "attribute index out of bounds" — is threaded through the impl helper as a parameter rather than collapsed.)
+    - **Branch:** `vibe-coding/cleanup/libexpr` (three file-static private impl helpers — `get_list_byidx_impl`, `get_attr_byname_impl`, `get_attr_byidx_impl` — each carrying the shared body with a `bool force` parameter; the six public symbols become one-line wrappers selecting `force=true` or `force=false`. ABI and signature unchanged. Error wording preserved exactly: `nix_get_attr_byidx_lazy`'s "(Nix C API contract violation)" suffix on the bounds-check error message — divergent from `nix_get_attr_byidx`'s plain "attribute index out of bounds" — is threaded through the impl helper as a parameter rather than collapsed. **2026-05 audit note (F044):** the shared `get_list_byidx_impl` also extends the eager path's `if (p == nullptr) return nullptr;` null-element guard to the lazy symbol `nix_get_list_byidx_lazy`, which on master lacked it — a benign, more-defensive but observable public-C-API change (in-bounds NULL element: master returned a non-null `new_nix_value` wrapper over nullptr with `NIX_OK`; the dedup returns raw nullptr with `NIX_OK`). The `get_list_byidx_impl` source comment "the rest of the behaviour ... is identical across both public symbols" should be amended to record this third collapsed asymmetry. No source-regression fix needed — the new behaviour is preferable.)
 
 88. **`nix_<libname>_init` family.** Each library exposes a parallel idempotent init. Could be a single template macro; currently each is a hand-rolled wrapper.
     - ../verified/19-c-bindings-misc.md
     - **Validation:** VALID. Effort: trivial.
+
+253. **`showVersions` / `printClosureDiff` are declared in the installed libcmd public header but defined in the `nix` binary.** [DISCLOSURE-GAP] `src/libcmd/include/nix/cmd/command.hh` declares `nix::showVersions(const StringSet&)` and `nix::printClosureDiff(ref<Store>, const StorePath&, const StorePath&, std::string_view)`, but both definitions and both callers live in the `nix` executable (`src/nix/diff-closures.cc`, `profile.cc`) — so the shipped declaration is backed by no libcmd symbol. An external consumer that includes the header and references either symbol gets a link error. Surfaced by the 2026-05 audit (F034).
+    - ../verified/16-libcmd.md, ../verified/17-nix-modern-1.md
+    - **Validation:** VALID (disclosure-gap). Fix (a) — smaller, matches usage: move the two declarations out of the public `command.hh` into a nix-binary-private header beside `src/nix/diff-closures.cc` (e.g. `src/nix/diff-closures.hh`, included by `diff-closures.cc` and `profile.cc`). This closes the public-header/private-symbol gap without expanding libcmd's API surface. (Alternative (b), moving the definitions into libcmd, is larger and expands the API.) Effort: small.
+
+255. **`parseInstallable` + `Installable::toStorePath` is open-coded at four sites in `why-depends.cc`.** `SourceExprCommand::parseInstallable(store, x)` followed by `Installable::toStorePath(getEvalStore(), store, Realise, operateOn, ...)` recurs four times. Surfaced by the 2026-05 audit (F036).
+    - ../verified/17-nix-modern-1.md
+    - **Validation:** VALID. Add a protected helper on `SourceExprCommand` (or a free helper) `StorePath resolveToStorePath(ref<Store> store, const std::string & arg, Realise mode)` wrapping `parseInstallable` + `toStorePath(...)`, converting the four call sites to one-liners and centralising error mapping. Effort: trivial-small.

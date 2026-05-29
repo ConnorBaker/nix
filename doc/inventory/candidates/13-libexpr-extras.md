@@ -1,6 +1,6 @@
 # libexpr extras
 
-Candidates 105-120 plus #220, #229. Sixteen VALID; #108 and #111 PARTIALLY VALID.
+Candidates 105-120 plus #220, #229, and #248/#249/#251 (2026-05 audit). Nineteen VALID; #108 and #111 PARTIALLY VALID.
 
 | # | Verdict | Effort |
 | - | ------- | ------ |
@@ -22,6 +22,9 @@ Candidates 105-120 plus #220, #229. Sixteen VALID; #108 and #111 PARTIALLY VALID
 | 120 | VALID | small |
 | 220 | VALID | trivial |
 | 229 | VALID | small |
+| 248 | VALID | small |
+| 249 | VALID | small |
+| 251 | VALID | trivial |
 
 ---
 
@@ -109,3 +112,15 @@ Candidates 105-120 plus #220, #229. Sixteen VALID; #108 and #111 PARTIALLY VALID
     - ../verified/13-libexpr-primops.md
     - **Validation:** VALID. The widening was deliberate (to share the alias across two callers with different pointer kinds), but the parameterised form serves the same purpose and reinstates type safety. Migration is mechanical at each consumer. Effort: small. **See also:** #110.
     - **Branch:** `vibe-coding/cleanup/libexpr` (added `template<class T> using TypedSeenSet = boost::unordered_flat_set<const T *>;` next to the existing `SeenSet` alias in `print.hh`. `SeenSet` is now a compatibility alias for `TypedSeenSet<void>` so the mixed-kind printer consumers — `Printer::seen`, `printAmbiguous`'s out-parameter, and `nix-instantiate.cc`'s call site — keep their existing void-typed contract. `EvalState::forceValueDeep`'s `seen` set migrated to `TypedSeenSet<Value>`; `getDerivations`'s `Done` alias migrated to `TypedSeenSet<Bindings>`. The compatibility-`void` alias survives because the print consumers legitimately mix `Bindings *` and `Value *` in the same set. Underlying container also switched from `std::set` to `boost::unordered_flat_set` per the project data-structure preference; deterministic iteration order was unused at every consumer (membership-probe via `dedupe` only). `dedupe` got a templated overload alongside the void-typed compatibility form.)
+
+248. **Debug-env registration `if (es.debugRepl) es.exprEnvs.insert(std::make_pair(this, env));` is hand-copied across ~19 `bindVars` overrides.** In `libexpr/nixexpr.cc`, 19 node-pointer registrations (18 against `env` + `ExprLet`'s 1 against `newEnv`) repeat the same debug-env registration idiom; the `MakeBinOpMembers` macro in `nixexpr.hh` omits it entirely, so binop nodes silently do not register. `getStaticEnv` tolerates a miss (returns an empty `shared_ptr`, guarded by `if (se)`), so the only effect of the macro omission is degraded debugger output (no variable bindings), not a crash. `ExprBlackHole::bindVars` is a deliberate empty non-registrant. Surfaced by the 2026-05 audit (F029).
+    - ../verified/12-libexpr-parse.md
+    - **Validation:** VALID. Fold registration into an `Expr::bindVars` NVI wrapper (calling a `bindVarsImpl`) or a protected `registerDebugEnv(EvalState&, const std::shared_ptr<const StaticEnv>&)` helper that every override calls, and add the call to `BinOp<Derived>::bindVars` so binop nodes conform — closing the macro divergence and removing the 19 copies. Distinct from #105's macro→CRTP work. **See also:** #105, #249. Effort: small.
+
+249. **The four literal AST nodes (`ExprInt`/`ExprFloat`/`ExprString`/`ExprPath`) have byte-identical `eval`/`maybeThunk` and a shared `Value v`.** In `libexpr/eval.cc` and `nixexpr.cc`, the four literal nodes each carry a `Value v` member and repeat identical `eval` (`v = this->v`), `maybeThunk` (`state.nrAvoided++; return &v`), and (leaf) `bindVars` bodies — 12 byte-identical bodies (verified) across the three. Surfaced by the 2026-05 audit (F030).
+    - ../verified/13-libexpr-primops.md, ../verified/21-eval-core-evalstate-value.md
+    - **Validation:** VALID. Introduce `template<class Derived> struct LiteralExpr : Expr { Value v; ... }` (CRTP, mirroring #105's `BinOp<Derived>`) holding `Value v` and the shared `eval`/`maybeThunk`/`bindVars`. Each derived node keeps only its constructor(s) and `::show`. Collapses 12 bodies to 3. Two notes: (a) the `Value v` access is what the `EvalState` friend lines (#217/#169) exist for — this refactor and the friend-removal compound; (b) the leaf `bindVars` body also appears in `ExprInheritFrom`/`ExprPos`, so the maximally-DRY `bindVars` move is broader (a default `Expr` leaf `bindVars`, cf. #248) than the literal family. **See also:** #105, #169, #217, #248. Effort: small.
+
+251. **`PackageInfo::queryMetaInt`/`queryMetaFloat`/`queryMetaBool` share one shape three times.** In `libexpr/get-drvs.cc`, the three repeat `if (!v) return def; if (type == nT) return accessor(); if (type == nString) { back-compat parse; } return def;` with a verbatim-copied back-compat comment. Surfaced by the 2026-05 audit (F032).
+    - ../verified/12-libexpr-parse.md
+    - **Validation:** VALID (LOW leverage — legacy nix-env path). Collapse via `template<ValueType VT, class T> T queryMetaTyped(name, T def, accessor, std::function<std::optional<T>(std::string_view)> parseString)` (or a small overload set): int passes `nInt`/`integer()`/`string2Int`-then-wrap, float passes `nFloat`/`fpoint()`/`string2Float`, bool passes `nBool`/`boolean()`/custom true-false parse. `queryMetaFloat` has zero in-tree callers but is public API, so it stays as a one-liner rather than being deleted. Distinct from #114/N26/N11 (string-keyed-bag extractors, not `Value*` meta accessors). Effort: trivial.

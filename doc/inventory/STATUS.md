@@ -80,6 +80,70 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
+- **Whole-branch adversarial audit + fresh-eyes catalog audit (2026-05-29)**
+  — independent multi-agent pass (22 discovery agents → dedup →
+  per-finding adversarial verify): re-verified the 104 landed commits
+  across all seven cleanup branches for semantics-preserving
+  regressions, re-derived load-bearing catalog claims/counts against
+  master, and fresh-audited each shard for new opportunities. 70
+  findings; **63 confirmed, 7 refuted/downgraded.** **Three blockers
+  fixed inline** (uncommitted, pending review): **F001** — a real
+  regression on `vibe-coding/cleanup/nix-cli` `ffb5ea72b`: `opInstall`'s
+  `--priority` arm used `getArg` (pre-increments) inside an
+  `auto arg = *i++` loop, so every `nix-env -i --priority N pkg` threw
+  "requires an argument" (test-covered by `user-envs-test-case.sh`);
+  fixed to `needArg`; catalog #231 corrected (it had recommended the
+  buggy `getArg` form + an `opSetFlag` misnomer). **F002** —
+  `--max-freed` rl-next/catalog prose was wrong and dangerous: old
+  `-1` was a no-op GC (not "disabled the cap"), `> INT64_MAX` already
+  errored at parse (boost throws, doesn't wrap), and the "drop the flag"
+  migration advice would trigger an *unbounded* GC; rl-next rewritten,
+  #222/FOLLOWUPS/STATUS corrected; the #222 *code* was always fine.
+  **F003** — pre-existing master bug: `nix_get_external` used
+  `check_value_out` (throws when valid) then asserted validity →
+  always failed for legit input; public C-API, no in-tree caller so CI
+  never caught it; fixed to `check_value_in`. **Two more latent master
+  bugs fixed inline:** **F025** (`destroyCgroup` threw interpolating an
+  *uninitialised* `pid` — UB; → `pid_s`) and **F052**
+  (`nix_store_path_hash` missing the `last_err_code = NIX_OK` entry
+  preamble every sibling has). Plus five sub-trivial behaviour-
+  preserving cleanups fixed inline (no candidate number): **F065**
+  (`printCodeLines` indent loop → `std::string(n, ' ')`), **F066**
+  (shebang parser redundant `make_shared<T>(T(…))` temporaries, 5
+  sites), **F067** (`ExperimentalFeatureSettings::isEnabled` linear
+  `std::find` over a `std::set` → `.contains()`), **F069**
+  (`search.cc::wrap` accidental external linkage → `static`), **F070**
+  (`nix_value_call` deprecated `Value` alias → `nix_value *`). All four
+  changed shards rebuilt green via `nix build -L .` (full flake +
+  test suite: libutil, libexpr, libstore exit 0; libmain doc-only).
+  **Catalog corrections folded into the existing sections:** #65 grep
+  was malformed and returned 2 not 79 (F014, unanchored form restored);
+  #18 count was 17, actual 23 hand-written (F016); #169/#217/N33 friend
+  count was "10 lines/9 distinct", actual 11/10 (F013); #103/N6
+  `RewritingSink` "tracks match positions" was stale dead code (F019);
+  #138 read-site named a nonexistent `addToStore` (F006, → `copyPathToStore`);
+  #218's placeholder inventory undercounted (6 → 7-8) and mischaracterised
+  the wire-marker as a `DrvOutput` serialisation (it's the `BuildResult`
+  compat StringMap) and misfiled `nix-store.cc` as a "legitimate
+  constant" (F007-F011); U7b/U7c counts and exclusion reasons (F017/F018).
+  **19 new candidates filed** (#241-#259), distributed into their
+  *topical* sections (per the catalog's group-by-symptom principle, not
+  a provenance-grouped file): 03 (#244), 07 (#246, fixed inline), 08
+  (#243), 10 (#253, #255), 12 (#241, #242, #259), 13 (#248, #249, #251),
+  16 (#245, #247), 17 (#254, #256; cross-shard ones tagged deferred), 20
+  (#250, #252), 23 (#257, #258). **7 refuted/downgraded** (the audit's
+  own false positives, kept out of the catalog): F015 ("count is 87" was
+  itself a methodology artifact), F046/F047 (#97 wording "undisclosed"
+  but actually cataloged), F048 (#119/#221 speculative-API already
+  tracked as #239/#240), F053 (`sizeof(Goal)` change real but no
+  actionable gap), F054 (#26 Windows `.lock` literal narrowing verified
+  harmless), and **F062 — which *confirmed* the #122/U5
+  `stackOverflowHandler` symbol-mangle caveat is correct as written**
+  (no change needed). Also fixed: the in-tree docs cited macOS
+  `/Users/cbaker2/` paths throughout HANDOFF.md/STATUS.md — this machine
+  is Linux `/home/cbaker2/`; all references converted. Code fixes are
+  uncommitted on their cleanup worktrees; push policy remains
+  explicit-only.
 - **Sprint 1 — single-shard cleanup pass (May 2026)**
   — five-candidate sweep filtered to single-shard, no-blocker work
   per the user's "we must defer cross-shard work" rule. Three
@@ -142,7 +206,13 @@ The other entry points:
   `worker-protocol.cc` as a wire-marker site; post-#1+#3
   template-lift the marker now lives in `common-protocol-impl.hh`.
   #218 is queued/unimplemented; verify the body before the
-  implementation lands.)
+  implementation lands.) **[Corrected by the 2026-05 audit, F007/F010:**
+  on master the marker is in `worker-protocol.cc` inside the
+  `Serialise<BuildResult>::write` `common` lambda; the cleanup-branch
+  template-lift moves it into `writeBuildResult<Proto>` in
+  `common-protocol-impl.hh` — the `BuildResult` serialiser, NOT
+  `Serialise<DrvOutput>`. The #218 body now carries the corrected
+  inventory.**]
 - **Post-batch-H Pass-3 adversarial review — refresh stale SHAs after #224-reword cascade + document #234 snapshot-iterate discipline** (May 2026)
   — third adversarial-review pass after the user said "another
   adversarial review" caught a second-order-staleness pattern.
@@ -591,7 +661,7 @@ explicit-only.
 ## Worktree layout
 
 The seven shard branches are checked out as worktrees under
-`/Users/cbaker2/ext-sources/nix-worktrees/cleanup-<shard>/`. Future
+`/home/cbaker2/ext-sources/nix-worktrees/cleanup-<shard>/`. Future
 agents should use `git worktree list` to see what's checked out. New
 work targeting an existing shard should reuse that shard's worktree
 and append a commit; new shards get a new branch and a new worktree.

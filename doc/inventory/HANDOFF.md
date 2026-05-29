@@ -53,7 +53,7 @@ real bugs as "build green."
 
 Each shard has a long-lived branch `vibe-coding/cleanup/<shard>` and
 a corresponding worktree at
-`/Users/cbaker2/ext-sources/nix-worktrees/cleanup-<shard>/`. Active
+`/home/cbaker2/ext-sources/nix-worktrees/cleanup-<shard>/`. Active
 shards (as of last update): `libexpr`, `libfetchers`, `libflake`,
 `libmain`, `libstore`, `libutil`, `nix-cli`. New candidates that
 target an existing shard land as new commits on that branch (one
@@ -68,8 +68,8 @@ the **worktree's** build dir, with a Nix dev shell that has the
 toolchain:
 
 ```
-nix develop /Users/cbaker2/ext-sources/nix-worktrees/cleanup-<shard> \
-  --command ninja -C /Users/cbaker2/ext-sources/nix-worktrees/cleanup-<shard>/build
+nix develop /home/cbaker2/ext-sources/nix-worktrees/cleanup-<shard> \
+  --command ninja -C /home/cbaker2/ext-sources/nix-worktrees/cleanup-<shard>/build
 ```
 
 Capture full output to `/tmp/<something>.log`; do NOT pipe through
@@ -100,7 +100,7 @@ Pass the source dir **explicitly**. Verify after reconfigure:
 python3 -c "import json; m = json.load(open('<worktree>/build/meson-info/meson-info.json')); print(m['directories']['source'])"
 ```
 
-The output must be the worktree path. If it's `/Users/cbaker2/ext-sources/nix`,
+The output must be the worktree path. If it's `/home/cbaker2/ext-sources/nix`,
 your build dir is misconfigured.
 
 ### Verification protocol per change
@@ -238,8 +238,8 @@ question is open-ended ("what would break if we …", "is there an
 existing utility for …", "walk every call site of X"). Always:
 
 1. Pin the worktree explicitly in the prompt: `read source from
-   /Users/cbaker2/ext-sources/nix-worktrees/cleanup-<shard>/, never
-   /Users/cbaker2/ext-sources/nix/`. Source-tree drift between agents
+   /home/cbaker2/ext-sources/nix-worktrees/cleanup-<shard>/, never
+   /home/cbaker2/ext-sources/nix/`. Source-tree drift between agents
    has been a recurring failure mode.
 2. Hand the agent the AGENT-CHARTER.md path so its claims are
    evidence-based.

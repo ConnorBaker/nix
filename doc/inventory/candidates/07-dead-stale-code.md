@@ -1,8 +1,9 @@
 # Dead or stale code
 
-Candidates 48-60 plus #225 and #232. Fifteen VALID. The validation pass
-surfaced five **latent bugs** in this group (#53, #54, #58, #59, #225 —
-see notes). High concentration of trivial-effort wins.
+Candidates 48-60 plus #225, #232, and #246 (2026-05 audit). Sixteen
+VALID. The validation pass surfaced five **latent bugs** in this group
+(#53, #54, #58, #59, #225 — see notes). High concentration of
+trivial-effort wins.
 
 | # | Verdict | Effort |
 | - | ------- | ------ |
@@ -21,6 +22,7 @@ see notes). High concentration of trivial-effort wins.
 | 60 | VALID | trivial |
 | 225 | VALID | medium (latent bug family) |
 | 232 | VALID | small |
+| 246 | VALID | trivial (fixed inline) |
 
 ---
 
@@ -95,3 +97,8 @@ see notes). High concentration of trivial-effort wins.
 232. **`ignoreExceptionInDestructor` is invoked from non-destructor sites in libstore.** [LOW] After libutil #58 reclassified `getMaxCPU` (one libutil non-destructor site) to use `ignoreExceptionExceptInterrupt` instead, a tree-wide grep shows ~17 invocations of `ignoreExceptionInDestructor` across libstore alone (sites in `pathlocks.cc`, `local-store.cc`, `filetransfer.cc`, `optimise-store.cc`, `sqlite.cc` (×3), `s3-binary-cache-store.cc`, `gc.cc`, `worker-protocol-connection.cc`, `unix/build/derivation-builder.cc` (×3), `unix/build/hook-instance.cc`, `build/substitution-goal.cc`, `build/derivation-building-goal.cc`). Spot-check confirms most are genuinely in destructors (`~PathLocks` etc.) — but at least the `worker-protocol-connection.cc` site warrants verification, and the `filetransfer.cc` and `derivation-builder.cc` clusters need a per-site audit. Walk every libstore call and reclassify any that aren't called from a destructor (or destructor-equivalent — e.g. an unwinding-safe cleanup path) to `ignoreExceptionExceptInterrupt`. Pre-existing oddity surfaced by the holistic libstore reviewer in the May 2026 review pass.
     - ../verified/05-libstore-core.md, ../verified/07-libstore-local.md
     - **Validation:** VALID. Per-site audit; mostly mechanical conversion. The semantic difference matters: `ignoreExceptionInDestructor` swallows interrupts (because they're already-fatal in destructor context), whereas `ignoreExceptionExceptInterrupt` lets interrupts propagate (correct for non-destructor cleanup paths). The libutil branch's #58 is the precedent. **See also:** #58. Effort: small.
+
+246. **Dead code: `PathSubstitutionGoal::gotInfo()` and `finished()` are declared but never defined or called.** In `libstore/include/nix/store/build/substitution-goal.hh`, `Co gotInfo();` and `Co finished();` are declared but have no definition and no caller (`grep -rn gotInfo src tests` = 1 hit, the declaration; 0 definitions/calls). They are not virtual overrides of `Goal`, so never ODR-used; vestigial from an older explicit-state-machine design. Same "declared-but-never-defined" category as #52 (`CurlInputScheme::specialParams`). Surfaced by the 2026-05 audit (F027); `verified/10` had already noted them as "declared but not defined" without filing a candidate.
+    - ../verified/10-libstore-build.md
+    - **Validation:** VALID (dead code). Pure deletion of the two declaration lines, no `.cc` change. Effort: trivial.
+    - **Branch:** `vibe-coding/cleanup/libstore` (deleted the `Co gotInfo();` and `Co finished();` declarations from `substitution-goal.hh`; applied during the 2026-05 audit, uncommitted pending review. `nix build -L .` green.)

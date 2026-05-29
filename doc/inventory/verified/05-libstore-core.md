@@ -646,7 +646,7 @@ None defined.
 - `void RewritingSink::flush()` — drain trailing buffer.
 - `HashModuloSink::HashModuloSink(HashAlgorithm ha, const std::string & modulus)` (ctor) — composes hash sink with rewriting sink that zeros out the modulus pattern.
 - `void HashModuloSink::operator()(std::string_view data) override` — forward to `rewritingSink`.
-- `HashResult HashModuloSink::finish() override` — flush, hash positions of self-references stored in `rewritingSink.matches` (writes `|<pos>` strings), return `{hash, numBytesDigested = rewritingSink.pos}`.
+- `HashResult HashModuloSink::finish() override` — flush, then iterate `rewritingSink.matches` to hash `|<pos>` strings, return `{hash, numBytesDigested = rewritingSink.pos}`. **NOTE (2026-05 audit, F019/F020):** the `matches` loop is inert dead code — since commit `3ebe1341a`, `RewritingSink::operator()` rewrites via `rewriteStrings` and never writes `matches`, so the vector is always empty and the position-hashing loop is a no-op. The original self-reference-vs-zeroed collision protection it implemented is silently disabled (open question whether it should be restored; see F020).
 
 ### Type aliases
 None.
@@ -666,7 +666,7 @@ None.
   - Inline `StringSet & getResult() { return seen; }`.
   - `void operator()(std::string_view) override`.
 - `struct RewritingSink : Sink`:
-  - Fields: `const StringMap rewrites`; `std::string::size_type maxRewriteSize`; `std::string prev`; `Sink & nextSink`; `uint64_t pos = 0`; `std::vector<uint64_t> matches`.
+  - Fields: `const StringMap rewrites`; `std::string::size_type maxRewriteSize`; `std::string prev`; `Sink & nextSink`; `uint64_t pos = 0`; `std::vector<uint64_t> matches` (**dead** — never written since `3ebe1341a`; only read by the inert `HashModuloSink::finish()` loop; see F020).
   - Ctor `RewritingSink(const std::string & from, const std::string & to, Sink & nextSink)`.
   - Ctor `RewritingSink(const StringMap & rewrites, Sink & nextSink)`.
   - `void operator()(std::string_view) override`.
