@@ -21,7 +21,7 @@ using json = nlohmann::json;
 
 namespace nix {
 
-std::string wrap(std::string prefix, std::string s)
+static std::string wrap(std::string prefix, std::string s)
 {
     return concatStrings(prefix, s, ANSI_NORMAL);
 }
