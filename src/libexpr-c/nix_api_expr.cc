@@ -54,7 +54,7 @@ nix_err nix_expr_eval_from_string(
     NIXC_CATCH_ERRS
 }
 
-nix_err nix_value_call(nix_c_context * context, EvalState * state, Value * fn, nix_value * arg, nix_value * value)
+nix_err nix_value_call(nix_c_context * context, EvalState * state, nix_value * fn, nix_value * arg, nix_value * value)
 {
     if (context)
         context->last_err_code = NIX_OK;
