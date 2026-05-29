@@ -177,6 +177,11 @@ struct Env
     Value * values[0];
 };
 
+/* The flexible-array `values` is allocated inline after the `Env` header
+   (see `allocEnv`), so the fixed part must stay one pointer wide. The
+   allocator and GC accounting in eval.cc assume this layout. */
+static_assert(sizeof(Env) <= 16, "environment header must be <= 16 bytes");
+
 void printEnvBindings(const EvalState & es, const Expr & expr, const Env & env);
 void printEnvBindings(const SymbolTable & st, const StaticEnv & se, const Env & env, int lvl = 0);
 

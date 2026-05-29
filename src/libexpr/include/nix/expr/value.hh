@@ -1528,6 +1528,22 @@ public:
     }
 };
 
+/* `Value` is engineered to be exactly two machine words: the
+   `ValueStorage<sizeof(void *)>` base packs a discriminator and a
+   pair-of-pointers payload into that budget (see the payload-layout
+   comments above). The evaluator allocates Values in bulk and treats
+   the size as fixed, so pin the invariant here rather than discover a
+   regression later via slower allocation or GC accounting drift. */
+static_assert(sizeof(Value) == 2 * sizeof(void *), "Value must be two machine words wide");
+
+/* The bit-packed storage specialisation is declared `alignas(16)` to
+   permit the 128-bit aligned load/store fast path; pin that too, but
+   only where that layout is actually selected (the generic fallback has
+   no such requirement). */
+static_assert(
+    !detail::useBitPackedValueStorage<sizeof(void *)> || alignof(Value) == 16,
+    "bit-packed Value must be 16-byte aligned");
+
 extern ExprBlackHole eBlackHole;
 
 bool Value::isBlackhole() const
