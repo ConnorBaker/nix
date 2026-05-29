@@ -175,37 +175,33 @@ struct AttrDb
         });
     }
 
-    AttrId setPlaceholder(AttrKey key)
+    /* Insert a value-less attribute carrying only its type tag
+       (Placeholder/Missing/Misc all store `(0, false)` for the value
+       column + null flag). */
+    AttrId setTagged(AttrKey key, AttrType type)
     {
         return doSQLite([&]() {
             auto state(_state->lock());
 
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::Placeholder) (0, false).exec();
+            state->insertAttribute.use()(key.first)(symbols[key.second])(type) (0, false).exec();
 
             return state->db.getLastInsertedRowId();
         });
+    }
+
+    AttrId setPlaceholder(AttrKey key)
+    {
+        return setTagged(key, AttrType::Placeholder);
     }
 
     AttrId setMissing(AttrKey key)
     {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::Missing) (0, false).exec();
-
-            return state->db.getLastInsertedRowId();
-        });
+        return setTagged(key, AttrType::Missing);
     }
 
     AttrId setMisc(AttrKey key)
     {
-        return doSQLite([&]() {
-            auto state(_state->lock());
-
-            state->insertAttribute.use()(key.first)(symbols[key.second])(AttrType::Misc) (0, false).exec();
-
-            return state->db.getLastInsertedRowId();
-        });
+        return setTagged(key, AttrType::Misc);
     }
 
     std::optional<std::pair<AttrId, AttrValue>> getAttr(AttrKey key)
