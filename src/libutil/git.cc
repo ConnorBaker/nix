@@ -1,11 +1,13 @@
 #include <cerrno>
 #include <algorithm>
+#include <charconv>
 #include <regex>
 #include <strings.h> // for strcasecmp
 
 #include "nix/util/signals.hh"
 #include "nix/util/configuration.hh"
 #include "nix/util/hash.hh"
+#include "nix/util/util.hh"
 
 #include "nix/util/git.hh"
 #include "nix/util/serialise.hh"
@@ -40,6 +42,20 @@ static std::string getStringUntil(Source & source, char byte)
     return s;
 }
 
+/* Parse the decimal object-header size that precedes a Git blob/tree
+   body. Uses string2Int<uint64_t> rather than std::stoi: std::stoi
+   returns int (so a >= 2 GiB object throws std::out_of_range instead of
+   yielding the value) and both its overflow and malformed-input
+   exceptions are std::logic_error, escaping nix's structured error path.
+   A bad header is a corrupt stream, so report it as SerialisationError. */
+static uint64_t getSizeUntil(Source & source, char byte)
+{
+    auto s = getStringUntil(source, byte);
+    if (auto n = string2Int<uint64_t>(s))
+        return *n;
+    throw SerialisationError("invalid Git object size '%s'", s);
+}
+
 static std::string getString(Source & source, int n)
 {
     std::string v;
@@ -57,7 +73,7 @@ void parseBlob(
 {
     xpSettings.require(Xp::GitHashing);
 
-    const unsigned long long size = std::stoi(getStringUntil(source, 0));
+    const uint64_t size = getSizeUntil(source, 0);
 
     auto doRegularFile = [&](bool executable) {
         sink.createRegularFile(sinkPath, [&](auto & crf) {
@@ -106,8 +122,8 @@ void parseTree(
     fun<SinkHook> hook,
     const ExperimentalFeatureSettings & xpSettings)
 {
-    const unsigned long long size = std::stoi(getStringUntil(source, 0));
-    unsigned long long left = size;
+    const uint64_t size = getSizeUntil(source, 0);
+    uint64_t left = size;
 
     sink.createDirectory(sinkPath);
 
@@ -116,7 +132,10 @@ void parseTree(
         left -= perms.size();
         left -= 1;
 
-        RawMode rawMode = std::stoi(perms, 0, 8);
+        RawMode rawMode;
+        if (auto [_, ec] = std::from_chars(perms.data(), perms.data() + perms.size(), rawMode, 8);
+            ec != std::errc{})
+            throw SerialisationError("invalid Git permission '%s'", perms);
         auto modeOpt = decodeMode(rawMode);
         if (!modeOpt)
             throw Error("Unknown Git permission: %o", rawMode);
