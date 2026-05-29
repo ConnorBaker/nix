@@ -773,7 +773,7 @@ propose a new one). Spawn an agent for it with `AGENT-CHARTER.md` as
 
 | Branch | Tip |
 | ------ | --- |
-| `vibe-coding/cleanup/libexpr` | `411cc11ec` |
+| `vibe-coding/cleanup/libexpr` | `e247a4cb3` |
 | `vibe-coding/cleanup/libfetchers` | `572e8fde8` |
 | `vibe-coding/cleanup/libflake` | `b29de9420` |
 | `vibe-coding/cleanup/libmain` | `998a763cc` |
