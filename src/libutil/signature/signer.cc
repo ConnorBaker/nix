@@ -5,8 +5,10 @@
 namespace nix {
 
 LocalSigner::LocalSigner(SecretKey && privateKey)
-    : privateKey(privateKey)
-    , publicKey(privateKey.toPublicKey())
+    : privateKey(std::move(privateKey))
+    // Derive from the member (already initialised above in declaration
+    // order), not the moved-from parameter.
+    , publicKey(this->privateKey.toPublicKey())
 {
 }
 
