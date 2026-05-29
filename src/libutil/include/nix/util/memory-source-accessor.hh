@@ -198,6 +198,22 @@ struct MemorySink : FileSystemObjectSink
     void createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)>) override;
 
     void createSymlink(const CanonPath & path, const std::string & target) override;
+
+private:
+
+    /**
+     * Shared open-for-creation prelude for the three `create*` methods:
+     * opens `path` with `initial` as the new node, raising the
+     * missing-parents error and the "while creating ..." trace wrapper.
+     * The caller performs the variant-specific type check on the result.
+     * `createNoun`/`traceNoun` name the kind in the two messages
+     * respectively (they differ only for regular files).
+     */
+    MemorySourceAccessor::File & openForCreate(
+        const CanonPath & path,
+        MemorySourceAccessor::File initial,
+        std::string_view createNoun,
+        std::string_view traceNoun);
 };
 
 template<>

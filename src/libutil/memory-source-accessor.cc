@@ -184,19 +184,35 @@ SourcePath MemorySourceAccessor::addFile(CanonPath path, std::string && contents
 
 using File = MemorySourceAccessor::File;
 
-void MemorySink::createDirectory(const CanonPath & path)
+/* Open `path` for creation with `initial` as the new node, sharing the
+   missing-parents check and the "while creating ..." trace wrapper across
+   createDirectory/createRegularFile/createSymlink. The caller does the
+   variant-specific type-check on the returned node. `createNoun` names
+   the kind in the cannot-be-created message and `traceNoun` in the trace;
+   they differ only for regular files ("file" vs "regular file"), so both
+   are passed to preserve the existing diagnostics byte-for-byte. */
+MemorySourceAccessor::File &
+MemorySink::openForCreate(const CanonPath & path, File initial, std::string_view createNoun, std::string_view traceNoun)
 {
     MemorySourceAccessor::File * f = nullptr;
     try {
-        f = dst.open(path, File{File::Directory{}});
+        f = dst.open(path, std::move(initial));
         if (!f)
             throw Error(
-                "directory '%s' cannot be created because some parent directories don't exist", dst.showPath(path));
+                "%s '%s' cannot be created because some parent directories don't exist",
+                createNoun,
+                dst.showPath(path));
     } catch (SourceAccessorError & e) {
-        e.addTrace({}, "while creating directory '%s'", dst.showPath(path));
+        e.addTrace({}, "while creating %s '%s'", traceNoun, dst.showPath(path));
         throw;
     }
-    if (!std::holds_alternative<File::Directory>(f->raw))
+    return *f;
+}
+
+void MemorySink::createDirectory(const CanonPath & path)
+{
+    auto & f = openForCreate(path, File{File::Directory{}}, "directory", "directory");
+    if (!std::holds_alternative<File::Directory>(f.raw))
         throw NotADirectory("file '%s' is not a directory", dst.showPath(path));
 };
 
@@ -216,16 +232,8 @@ struct CreateMemoryRegularFile : CreateRegularFileSink
 
 void MemorySink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
 {
-    MemorySourceAccessor::File * f = nullptr;
-    try {
-        f = dst.open(path, File{File::Regular{}});
-        if (!f)
-            throw Error("file '%s' cannot be created because some parent directories don't exist", dst.showPath(path));
-    } catch (SourceAccessorError & e) {
-        e.addTrace({}, "while creating regular file '%s'", dst.showPath(path));
-        throw;
-    }
-    if (auto * rp = std::get_if<File::Regular>(&f->raw)) {
+    auto & f = openForCreate(path, File{File::Regular{}}, "file", "regular file");
+    if (auto * rp = std::get_if<File::Regular>(&f.raw)) {
         CreateMemoryRegularFile crf{*rp};
         func(crf);
     } else
@@ -251,17 +259,8 @@ void CreateMemoryRegularFile::operator()(std::string_view data)
 
 void MemorySink::createSymlink(const CanonPath & path, const std::string & target)
 {
-    MemorySourceAccessor::File * f = nullptr;
-    try {
-        f = dst.open(path, File{File::Symlink{}});
-        if (!f)
-            throw Error(
-                "symlink '%s' cannot be created because some parent directories don't exist", dst.showPath(path));
-    } catch (SourceAccessorError & e) {
-        e.addTrace({}, "while creating symlink '%s'", dst.showPath(path));
-        throw;
-    }
-    if (auto * s = std::get_if<File::Symlink>(&f->raw))
+    auto & f = openForCreate(path, File{File::Symlink{}}, "symlink", "symlink");
+    if (auto * s = std::get_if<File::Symlink>(&f.raw))
         s->target = target;
     else
         throw NotASymlink("file '%s' is not a symbolic link", dst.showPath(path));
