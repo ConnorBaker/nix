@@ -87,15 +87,9 @@ void printCodeLines(std::ostream & out, const std::string & prefix, const Pos & 
         out << std::endl << fmt("%1% %|2$5d|| %3%", prefix, (errPos.line), *loc.errLineOfCode);
         // error arrows for the column range.
         if (errPos.column > 0) {
-            int start = errPos.column;
-            std::string spaces;
-            for (int i = 0; i < start; ++i) {
-                spaces.append(" ");
-            }
+            std::string spaces(errPos.column, ' ');
 
-            std::string arrows("^");
-
-            out << std::endl << fmt("%1%      |%2%" ANSI_RED "%3%" ANSI_NORMAL, prefix, spaces, arrows);
+            out << std::endl << fmt("%1%      |%2%" ANSI_RED "^" ANSI_NORMAL, prefix, spaces);
         }
     }
 
