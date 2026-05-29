@@ -552,8 +552,7 @@ template class BaseSetting<std::optional<std::string>>;
 
 bool ExperimentalFeatureSettings::isEnabled(const ExperimentalFeature & feature) const
 {
-    auto & f = experimentalFeatures.get();
-    return std::find(f.begin(), f.end(), feature) != f.end();
+    return experimentalFeatures.get().contains(feature);
 }
 
 void ExperimentalFeatureSettings::require(const ExperimentalFeature & feature, std::string reason) const
