@@ -80,6 +80,30 @@ The other entry points:
 
 (Most recent first; truncate after a dozen entries.)
 
+- **Single-shard foundation batch 1 (2026-05-29)** — first tranche of
+  the per-shard foundation work the value-review inventory surfaced,
+  landed as one commit per candidate. **libutil +3:** #259 (`LocalSigner`
+  moves the `SecretKey` instead of copying; `publicKey` derived from the
+  member to avoid use-of-moved-from without a member reorder), #243
+  (latent bug — `git::parseBlob`/`parseTree` size parse via a checked
+  `getSizeUntil`/`string2Int<uint64_t>` throwing `SerialisationError`
+  instead of `std::stoi`'s `std::logic_error`; octal mode via
+  `std::from_chars`), #244 (`MemorySink::openForCreate` prelude extracted
+  from the three `create*` methods, both diagnostic nouns preserved
+  byte-for-byte). **libexpr +1:** #252 (`setTagged` collapses the three
+  tag-only `AttrDb` setters). **libflake +1:** #258 (`applyLockMode` +
+  mode table for the three `set_mode_*` C entry points, ABI-preserving;
+  fixed the stale `nix_flake_lock_flags_new` "== write_as_needed"
+  comments — the fields actually differ on `allowUnlocked`). **Deferred:**
+  #251 (`queryMetaTyped`) — re-judged marginal against the churn
+  standard (two callables threaded per site ≈ as much plumbing as the
+  three short bodies, legacy path, no extra caller); left inline with a
+  note. All changed shards `nix build -L .` green (full flake + test
+  suite). Tips: libutil `a16c0a75a`, libexpr `411cc11ec`, libflake
+  `b29de9420`. New tips are fast-forward over the pushed libutil/libexpr
+  origin tips; libflake needs force-push (history rewritten earlier in
+  the value pass). ~31 single-shard-actionable foundation candidates
+  remain after this batch.
 - **Per-commit value/churn review + remaining-work inventory (2026-05-29)**
   — independent per-shard pass (one agent per branch) over all 116
   landed commits, re-deriving value verdicts rather than inheriting the
@@ -749,22 +773,25 @@ propose a new one). Spawn an agent for it with `AGENT-CHARTER.md` as
 
 | Branch | Tip |
 | ------ | --- |
-| `vibe-coding/cleanup/libexpr` | `b9095c56b` |
+| `vibe-coding/cleanup/libexpr` | `411cc11ec` |
 | `vibe-coding/cleanup/libfetchers` | `572e8fde8` |
-| `vibe-coding/cleanup/libflake` | `ff9daabbd` |
+| `vibe-coding/cleanup/libflake` | `b29de9420` |
 | `vibe-coding/cleanup/libmain` | `998a763cc` |
 | `vibe-coding/cleanup/libstore` | `410107979` |
-| `vibe-coding/cleanup/libutil` | `b96eda936` |
+| `vibe-coding/cleanup/libutil` | `a16c0a75a` |
 | `vibe-coding/cleanup/nix-cli` | `2cbb7af04` |
 
-(Tips advanced through the 2026-05-29 audit and the follow-on value/churn
-pass. The value pass rewrote history on four branches: libflake (reverted
-the #133 rename, kept the docstring), libmain (squashed the known-wrong
-`--max-freed` rl-next into its rewrite), nix-cli (squashed the `--priority`
-regression into its fix), libexpr (added a #87-comment follow-up). All
-`nix build -L .` green on their current tips. NOTE: the libflake/libmain/
-nix-cli rewrites mean origin diverges and these three need a FORCE-push
-when published; libexpr is a fast-forward.)
+(Tips advanced through the 2026-05-29 audit, the follow-on value/churn
+pass, and the first single-shard foundation batch. The value pass
+rewrote history on three branches: libflake (reverted the #133 rename,
+kept the docstring), libmain (squashed the known-wrong `--max-freed`
+rl-next into its rewrite), nix-cli (squashed the `--priority` regression
+into its fix). The foundation batch then appended new commits: libutil
++3 (#259, #243, #244), libexpr +2 (#87 comment, #252), libflake +1
+(#258). All `nix build -L .` green on their current tips. PUSH MODES when
+published: libflake/libmain/nix-cli need a **FORCE-push** (history
+rewritten); libutil/libexpr/libstore are **fast-forward**;
+libfetchers unchanged.)
 
 The chronological narrative above carries intermediate tip claims
 ("Final tip SHAs after Batch G", etc.) that are no longer current.
