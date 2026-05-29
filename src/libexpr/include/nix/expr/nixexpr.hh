@@ -114,6 +114,16 @@ struct Expr
     virtual void show(const SymbolTable & symbols, std::ostream & str) const;
     virtual void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env);
 
+protected:
+    /**
+     * Record this expression's static environment for the debugger, if
+     * one is attached. Every `bindVars` override calls this first; it is
+     * a no-op unless `es.debugRepl` is set.
+     */
+    void registerDebugEnv(EvalState & es, const std::shared_ptr<const StaticEnv> & env) const;
+
+public:
+
     /** Normal evaluation, implemented directly by all subclasses. */
     virtual void eval(EvalState & state, Env & env, Value & v);
 
@@ -771,6 +781,7 @@ struct BinOp : Expr
 
     void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override
     {
+        registerDebugEnv(es, env);
         e1->bindVars(es, env);
         e2->bindVars(es, env);
     }
