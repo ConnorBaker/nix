@@ -164,6 +164,18 @@ caching. Full sketch + slices + open questions:
 **`plans/lever2-derivation-boundary-caching.md`**. lever1 doc §"Design-question 1
 RESOLVED — THE REFRAME" has the reasoning.
 
+**O1 (keying) RESOLVED by schema study (2026-05-30, lever2 doc §2b):** NOT the
+schema-change blocker first feared. `Traces` are already content-addressed
+(dedup by `full_hash`) and attr-path-independent — two paths producing the same
+derivation already share a Traces row. Only the `Sessions`/`History` ROUTING
+layer is attr-path-keyed. Recommended fix = Design A: mint a synthetic `__drv`
+namespace in the attr-vocab (`internName` accepts arbitrary strings, so
+`"__drv:<contenthash>"` is a valid `AttrNameId`), routing derivation traces
+through the EXISTING Sessions/History/recovery pipeline with zero schema change.
+Remaining true blockers are the facet mask (§3) and the storage budget (6,419
+derivations/commit × fat blobs = v53 explosion → needs compact per-derivation
+records first), not keying.
+
 ## Current benchmark anchors
 
 | Run | Backend shape | Cold wall | Hot wall | Notes |

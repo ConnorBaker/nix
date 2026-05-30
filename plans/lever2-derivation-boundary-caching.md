@@ -53,6 +53,69 @@ derivation subtree would be reused instead of re-evaluated.
 - `DerivedStorePath` CQK exists (`input-resolution.cc:143`) but is an input dep
   (a parent depending on a child's output path), not an output-serving record.
 
+## 2b. O1 (keying) RESOLVED by schema study (2026-05-30) — more favorable than feared
+
+Read the DDL (`sqlite-trace-storage-lifecycle.cc:149-243`) and lookup paths. The
+trace store is **already a two-layer design that separates content-addressed
+trace bodies from attr-path routing** — exactly what a derivation needs:
+
+- **`Traces`** (body layer) is content-addressed and **attr-path-independent**:
+  `id, trace_hash, full_hash UNIQUE, dep_key_set_id → DepKeySets, values_blob`.
+  No `attr_path_id` column. `getOrCreateTrace` (sqlite-trace-storage.cc:540)
+  dedups by `full_hash` via `traceByFullHash`, so **two attr-paths that produce
+  the identical derivation result ALREADY share one Traces row.** The body layer
+  needs no change for derivations.
+- **`Sessions(session_key, attr_path_id) → trace_id`** and
+  **`History(recovery_key, attr_path_id, …)`** are the ROUTING layer. This is the
+  only place `attr_path_id` appears, and it is the sole obstacle: lookup is
+  driven per-attr-path (`lookupCurrentNode` binds `(session_key, pathId)`,
+  lifecycle.cc:361-364), so a derivation reached at a different path — or the
+  same path after the parent's deps shifted — can't FIND the shared body trace.
+- **`AttrPathId`** (attr-vocab-store.hh) is a trie node `(parent AttrPathId,
+  child AttrNameId)` interned to a dense int — structurally a *tree-path*
+  identity, positional not content-addressed. A derivation reached from many
+  paths cannot be one `AttrPathId`. So the routing key must be generalized.
+
+**Two viable designs (O1 is a routing change, NOT a body-table change):**
+
+- **Design A — synthetic derivation namespace in `AttrPathId`.** Mint a reserved
+  vocab subtree (e.g. root child `"__drv"`) and intern each derivation identity
+  (content hash of observed inputs) as an `AttrNameId` under it, yielding a real
+  `AttrPathId`. Then derivation traces flow through the EXISTING
+  `Sessions`/`History` routing unchanged — `lookupCurrentNode`, recovery, history
+  bootstrap all work as-is. **Cheapest: zero schema change, reuses every existing
+  query.** Cost: `AttrNames` grows by one row per distinct derivation identity
+  (6,419/commit — but interned/deduped, and `Strings`/`DataPaths` already hold
+  27 K / 68 K rows, so the order of magnitude is in line). Risk: pollutes the
+  attr-path vocab with non-attr-path entries; `displayPath`/`parentPath`
+  semantics must tolerate the synthetic subtree. **Mechanically feasible:**
+  `internName(std::string_view)` (attr-vocab-store.cc) interns arbitrary strings
+  via `nameTable.intern`, so `"__drv:<contenthash>"` is a valid `AttrNameId`
+  directly. **Caveat to verify:** the `internName(Symbol)` overload maintains a
+  `symbolToName`/`nameToSymbol` mapping, and `childSymbol(AttrPathId)` assumes a
+  backing Nix `Symbol`; a raw-string-interned derivation name has no Symbol, so
+  any routing/recovery code that calls `childSymbol`/`displayPath` on a synthetic
+  node must be audited (it may only need `feedPath` for hashing, which takes IDs
+  not Symbols — confirm during prototype).
+- **Design B — parallel derivation routing table.** Add
+  `DerivationTraces(deriv_key BLOB, session_key BLOB, trace_id, …)` keyed by
+  content hash. Cleaner separation, but a schema epoch bump + parallel
+  lookup/recovery/history code paths (the verifier's whole
+  Sessions/History/recovery machinery would need a derivation-keyed twin).
+  **More code, more correct-by-construction.**
+
+**Recommendation: prototype Design A.** It reuses the entire existing routing +
+recovery + history pipeline by making a derivation "look like" an attr-path node
+in a reserved namespace. The content-addressed body layer already does the
+dedup. This drops O1 from "likely a schema change" (my earlier pessimistic
+sketch) to "a vocab-namespacing change + a recording-site hook in
+`derivationStrictInternal`." If Design A's vocab pollution proves problematic,
+fall back to B. Either way, **O1 is no longer the blocker I feared** — the
+two-layer schema was already built for content-addressed bodies.
+
+Remaining true blockers are §3 (facet mask) and §5-O4 (storage budget /
+compact records), not keying.
+
 ## 3. The hard obstacle: a derivation result is not soundly reusable by drvPath alone
 
 The repeatedly-falsified shortcut (work-log runs 87/88/114, redesign-plan
@@ -115,9 +178,13 @@ warm-hits. Sketch, in dependency order:
 
 ## 5. Open questions (must resolve before/during prototype)
 
-- **O1 (keying, the big one):** derivation traces need content-addressed,
-  path-independent keys, unlike today's `AttrPathId` model. Does the existing
-  trace store support a non-attr-path key kind, or is this a schema change?
+- **O1 (keying) — RESOLVED (see §2b).** NOT a body-table change: `Traces` are
+  already content-addressed (dedup by `full_hash`) and attr-path-independent.
+  Only the `Sessions`/`History` ROUTING layer is attr-path-keyed. Recommended
+  fix = Design A (synthetic `__drv` namespace in the attr-vocab, derivation
+  identity interned as an `AttrNameId`), reusing the entire existing routing +
+  recovery pipeline with zero schema change. Fallback = Design B (parallel
+  derivation routing table, schema bump). O1 is no longer the primary blocker.
 - **O2 (facet mask granularity):** is per-result-attr `StructuredProjection`
   recording already emitted when a consumer does `drv.outPath` / `drv.meta`? If
   so, the mask is mostly free; if not, it must be added at the derivation-result
@@ -176,8 +243,10 @@ warm-hits. Sketch, in dependency order:
 ## 6. Honest assessment
 
 - This is a **large** lever — it brings `derivationStrict` into scope (CLAUDE.md
-  currently excludes it), likely needs a new trace key kind (O1), and risks the
-  v53 storage-explosion failure (O4). It is not a small prototype.
+  currently excludes it) and risks the v53 storage-explosion failure (O4). It is
+  not a small prototype. (O1/keying turned out NOT to need a new trace-key kind —
+  §2b — which lowers the cost somewhat, but the facet mask and storage budget
+  remain.)
 - It is, however, the lever the evidence points to for the *only* measured pain
   on this workload (the cold outliers). Lever 1 (enumerated-set) and the original
   Lever 5 (attrset sub-trace) do not fit `closures.gnome`'s computation-heavy,
