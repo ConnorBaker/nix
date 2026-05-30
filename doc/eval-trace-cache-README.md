@@ -84,6 +84,54 @@ findings-doc "Promising Directions". Each lever traces to repo text; the
 | **3** | **Certificate-before-payload** fast path (fixed-size `FullTraceHash` compare before `loadFullTrace` + dep walk) | LOW priority. Every *sound* form was already refuted on this workload (runs 909/980/987/1032/1042/1133/1107/1108…). The dep walk IS the hot cost for true exact hits (unsound oracle run 1015: hot 0.68 vs 0.88 s), but the residual hot cost is decode/startup, not the walk, once the `verifiedTraceIds` memo is in place. Only un-refuted shape: a cheap per-current-node eligibility bit/index that clears the run-993 coverage bar. | redesign-plan §2026-05-29 CORRECTION finding 1 |
 | **4** | **Custom immutable-segment store** (generation packs, mmap fixed-width indexes, lock-free readers, atomic `CURRENT`) | Deferred until 1–3 prove the proof model wins. Storage format is **downstream of authorization**: run 137 showed lazy-payload-over-immutable-objects does NOT beat SQLite without the authorization fix. Do NOT re-abstract `TraceStorage` (the vptr was added per rearch-proposal §2.1, measurably hurt the hot loop, and was reversed). | redesign-plan "Architectural direction" + §2026-05-29 finding 4; storage-backend-research.md |
 
+## Where the research stands (2026-05-30) and the remaining options
+
+After establishing the first current-tree baseline (Ledger D) and diagnosing
+the cold tail, the lever picture resolved as follows. The cold cost is
+concentrated in ~23 outlier commits (mean 3.72 s vs median 1.11 s; hot is a flat
+~0.95 s and needs no work). Each outlier re-evaluates ~20 M thunks because a
+change to a few system-assembly derivations fails one of only ~7 coarse closure
+traces, and **that re-eval is semantically correct** (the failed root traces
+genuinely changed — recovery is not buggy; verified via the outlier's recovery
+counters: 4 failures = the 4 changed system-assembly roots). So the cold tail can
+only shrink by caching at a **finer granularity than the ~7 closure roots** — and
+the only finer boundary inside the computation is the derivation, which Lever 2's
+spike proved is blocked by the attr-path-shaped `TracedExpr` identity model.
+
+**The honest standing: no cheap lever remains for the `closures.gnome` cold tail.**
+The bounded cost (23 outliers, soundness-correct) is the rational thing to leave
+in place. The remaining options, in rough order of effort/payoff:
+
+1. **Accept the cold tail (recommended default).** It is bounded, sound, and the
+   hot path — the case that matters for repeated CI/`nix-eval-jobs` use — is
+   already ~7× faster than no-cache and flat. Spend effort elsewhere.
+
+2. **Lever 1 on a different workload.** The observed-key/by-name pruning proof
+   (the biggest historical win) targets deep-*attrset* enumeration, NOT
+   `closures.gnome`. Its natural workload is `nix-eval-jobs`-shape evaluation
+   over a wide package set (`pkgs.*`). **Action: benchmark a deep-attrset workload
+   before assuming the cold tail generalizes** — `closures.gnome` may be
+   unrepresentative of the consumers that matter. This is the single most
+   valuable *cheap* next step: it could show the levers that don't help GNOME do
+   help the real target. (`eval-trace-bench --workloads` over a package set.)
+
+3. **The content-addressed trace-node RFC** (unblocks Lever 2 / Lever 5). A second
+   `TracedExpr` identity keyed by content (derivation-input hash) rather than
+   attr-path, with `navigateToReal` → re-invoke the producer. RFC-scale,
+   hot-path, with the v53/vptr precedent warning. Only justified if (2) shows the
+   derivation boundary is the dominant cost across real workloads, not just GNOME.
+
+4. **Lever 3 (certificate-before-payload), low priority.** Targets hot, which is
+   already flat — every sound form was refuted (see table). Not worth it absent a
+   latency-sensitive small-query workload.
+
+5. **Lever 4 (custom storage backend), deferred.** Downstream of authorization;
+   does not address the cold tail (which is re-eval, not storage). Out of scope
+   until 1–3 prove a proof-model win.
+
+The keyset-downgrade harness work (landed) is the soundness scaffolding option 2
+would build on. See "How the keyset work fits" below.
+
 ### Rejected / disqualified (do not re-propose without new evidence)
 
 Command-only `nix eval --json` action cache (above libexpr); whole-output JSON
