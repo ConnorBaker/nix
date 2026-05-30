@@ -215,32 +215,39 @@ tail left as a bounded, soundness-correct cost. Spike code is throwaway
 
 ## 2026-05-30 deep-attrset workload finding — cache is net-negative on nix-eval-jobs shape
 
-Ran the deep-attrset workload (python3Packages outPaths, ~3,000 packages, the
-nix-eval-jobs shape) the GNOME diagnosis implied we should test. Wall clock,
-commit 9b9f7241:
+Ran the deep-attrset workload (python3Packages outPaths, ~11K packages, the
+nix-eval-jobs shape) the GNOME diagnosis implied we should test.
 
-| Mode | Wall | vs ref |
-|---|---:|---|
-| reference (--no-eval-trace) | 1:38 (98s) | 1.00x |
-| cold (trace) | 19:43 (1183s) | 12x SLOWER |
-| hot (warm, same commit) | 1:36 (96s) | break-even |
+NOTE: the first run used an -O0 debug meson build and commits whose delta didn't
+touch python3Packages; both invalidated it (see retraction). The numbers below
+are the CORRECTED RELEASE-binary re-run (result/bin/nix, the Ledger-D binary),
+with a real python3Packages.streamz bump for the incremental test, hit/miss +
+soundness captured. n=1.
 
-CROSS-COMMIT follow-up (the decisive test): commit A cold 19:49, commit B
-reusing A's cache 1:36, commit B no-trace 1:40 -> B-hot ~= B-ref. Cross-commit
-reuse delivers nothing even in the intended N+1-reuses-N case, so the 12x cold
-cost never amortizes. eval-trace is net-negative for the nix-eval-jobs shape and
-should likely be disabled for it pending a redesign that shows a hot win.
+| Scenario | Wall | hits/misses | sound |
+|---|---:|---|---|
+| reference (--no-eval-trace) | 0:18 | - | - |
+| cold (trace, empty) | 2:34 | 0/11062 | - |
+| hot (same commit) | 0:14 | 11062/0 | served==truth |
+| incremental (parent cold -> streamz bump) | 0:17 | 11062/1 | served==truth |
+| incremental reference | 0:18 | - | - |
 
-Opposite of closures.gnome (hot 7x faster). A package set is attr-path-addressable
-so materialize wraps each child as a TracedExpr -> ~3,000 traces recorded (vs 6 for
-GNOME). Cold wall (19:43) >> cold CPU (388s) -> recording is I/O-bound (SQLite +
-per-package dep-blob serialize). Hot recovers the overhead but yields NO net
-speedup over no-cache.
+Findings (sound): cold ~8.6x slower (not 12x); the cache is SOUND and PRECISE
+(a 1-package bump invalidates exactly 1 trace, reuses 11062, served byte-identical
+to ground truth); hot AND incremental are ~= break-even with no-trace (14-17s vs
+18s). With ~100% hits the verification overhead roughly equals the eval cost it
+avoids, so no net win -- but NOT net-negative and NOT a disaster. The retracted
+"12x / net-negative / disable it" was an -O0 + no-op-delta artifact.
+
+Opposite of closures.gnome only in cold magnitude: a package set is
+attr-path-addressable so materialize wraps each child as a TracedExpr -> ~11K
+traces recorded (vs 6 for GNOME). Cold wall >> cold CPU -> recording is I/O-bound
+(SQLite + per-package dep-blob serialize).
 
 Implications: (1) the deep-attrset case does not want Lever 1 (finer pruning) -
-it already has maximal granularity, which is what makes cold catastrophic; it
-wants cheaper/fewer per-trace recording. (2) The decisive unmeasured experiment is
-CROSS-COMMIT incremental (commit N+1 reusing N's cache) - same-commit hot
+it already has maximal granularity, which is what makes cold expensive; it
+wants cheaper/fewer per-trace recording AND amortization. (2) The decisive
+experiment WAS the real incremental test above (done); the prior same-commit hot
 break-even doesn't capture the real nix-eval-jobs value case. (3) The cache's value
 is workload-shape-dependent and currently inverted for the most important consumer.
 See eval-trace-cache-README.md "DEEP-ATTRSET WORKLOAD FINDING" for the full table +

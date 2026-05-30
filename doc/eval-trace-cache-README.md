@@ -97,11 +97,40 @@ findings-doc "Promising Directions". Each lever traces to repo text; the
 > matched ~nothing in A's cache"; (b) n=1, no repetition; (c) shared
 > `NIX_CACHE_HOME`/system store vs GNOME's isolated `_state` harness; (d) the
 > workload's `tryEval`+`?outPath` guard may short-circuit an unknown fraction.
-> **The DIRECTIONAL structural fact survives** (a deep attrset records ~3,000
+> **The DIRECTIONAL structural fact survives** (a deep attrset records ~11 K
 > per-package traces vs 6 for GNOME — build-independent, from `record.count`), but
 > every wall-time magnitude and the "net-negative / disable it" conclusion are
-> RETRACTED pending a release-binary re-run with hit/miss capture and repeats.
-> Original (unsound) text retained below struck-through for the audit trail.
+> RETRACTED. **Corrected by the release-binary re-run below.**
+>
+> **RELEASE-BINARY RE-RUN (2026-05-30, `result/bin/nix` = the Ledger-D release
+> binary; same workload/commits; hit/miss + soundness captured; n=1).**
+> `python3Packages` outPaths (~11,062 entries, 91 % produce real outPaths):
+>
+> | Scenario | wall | hits / misses | sound? |
+> |---|---:|---|---|
+> | reference (no-trace) | **0:18** | — | — |
+> | cold (trace, empty cache) | **2:34** | 0 / 11,062 | — |
+> | hot (same commit) | **0:14** | 11,062 / 0 | served == truth ✓ |
+> | incremental (parent cold → `streamz` bump) | **0:17** | 11,062 / **1** | served == truth ✓ |
+> | incremental reference (no-trace) | 0:18 | — | — |
+>
+> **Corrected, sound conclusions:**
+> 1. Cold is **~8.6× slower** (154 s vs 18 s), not 12× — `-O0` inflated it. Still a
+>    real, large recording cost (~11 K per-package traces; I/O-heavy).
+> 2. **The cache is SOUND and PRECISE here** (the unsound run never checked this):
+>    a one-package bump invalidates **exactly 1** trace and reuses 11,062; served
+>    values byte-identical to ground truth in hot AND incremental.
+> 3. **Hot/incremental ≈ break-even with no-trace** (14–17 s vs 18 s) — with ~100 %
+>    hits, verification overhead roughly equals the eval cost it avoids. The
+>    retracted "net-negative, disable it" verdict was WRONG; the corrected reading
+>    is "no net win on this workload, but sound and precise."
+> 4. A win would require amortization (many warm re-evals per cold) and/or lower
+>    cold cost (option 2''). Workload-dependent, NOT "disable it."
+>
+> Open caveats (honest, not retractions): n=1, no repetition; `python3Packages`
+> specifically; warm OS disk cache; cold cost may be reducible.
+>
+> Original (unsound `-O0`) text retained below struck-through for the audit trail.
 
 ~~Option 2 below (benchmark a deep-attrset workload) was run. **Result: on the
 workload that matters most for the cache's purpose, the cache is all cost and no
@@ -131,23 +160,31 @@ shape-dependent and currently inverted for the most important consumer:
 - `python3Packages` (deep *attrset*, the `nix-eval-jobs` shape): cold 12× slower,
   hot break-even. **Cache is a net loss.**
 
-**Cross-commit verdict (2026-05-30, the decisive follow-up — option 2'):** ran
+**Cross-commit verdict — SUPERSEDED by the release re-run above; the unsound
+`-O0` cross-commit run additionally picked commits (`d9e9`→`9b9f`) whose delta
+(a NixOS module) does not touch `python3Packages` at all, so it tested a no-op
+delta, not real incremental reuse. The corrected release re-run uses a
+`python3Packages.streamz` bump (`2b93ef`→`f37d`) and finds `misses=1` (precise,
+sound) with incremental wall ≈ no-trace. Struck-through original below.**
+
+~~Cross-commit verdict (2026-05-30, the decisive follow-up — option 2'):~~ ran
 commit A cold (populate cache) → commit B reusing A's cache → B no-trace.
 A-cold **19:49**, B-hot-reuse-A **1:36**, B-reference **1:40**. **B-hot ≈
 B-reference** — cross-commit reuse delivers essentially nothing even in the
-intended N+1-reuses-N case. **So the 12× cold cost never amortizes: the cache is
-all cost, no benefit, on the `nix-eval-jobs` shape, full stop.**
+intended N+1-reuses-N case. ~~**So the 12× cold cost never amortizes: the cache is
+all cost, no benefit, on the `nix-eval-jobs` shape, full stop.**~~ *(WRONG — `-O0`
+artifact + no-op delta; see corrected re-run)*
 
-This reframes the option list. The deep-attrset case does NOT want Lever 1
+~~This reframes the option list.~~ The deep-attrset case does NOT want Lever 1
 (finer pruning) — it already has maximal per-package granularity and that
-granularity is precisely what makes cold catastrophic while the hot side proved
-worthless. The only lever that could help is **drastically cheaper / fewer
-per-trace recording** (cold-write path) AND a hot path that actually beats
-no-trace — but the cross-commit result shows the hot side has no win to deliver
-here regardless of recording cost, so even that is dubious. Practical
+granularity is precisely what makes cold catastrophic ~~while the hot side proved
+worthless~~ *(corrected: hot ≈ break-even, not worthless)*. The only lever that
+could help is **drastically cheaper / fewer per-trace recording** (cold-write
+path) plus amortization across many warm re-evals. ~~Practical
 consequence: **eval-trace should likely be disabled (or never enabled) for
-`nix-eval-jobs`-shape evaluation** until a redesign demonstrates a hot win on
-this shape. Caveat: `python3Packages` specifically; another deep attrset could
+`nix-eval-jobs`-shape evaluation**~~ *(retracted — the cache is sound and
+break-even, not net-negative; "disable it" was unsupported)* until a redesign
+demonstrates a hot win on this shape. Caveat: `python3Packages` specifically; another deep attrset could
 differ, but it is the canonical shape.
 
 ## Where the research stands (2026-05-30) and the remaining options
@@ -173,22 +210,21 @@ in place. The remaining options, in rough order of effort/payoff:
    already ~7× faster than no-cache and flat. Spend effort elsewhere.
 
 2. ~~Benchmark a deep-attrset workload~~ **DONE (see finding above).** Outcome
-   overturned the expectation: the cache is 12× slower cold / break-even hot on
-   `python3Packages`. The deep-attrset case is bottlenecked by per-package
-   RECORDING cost, not by pruning precision. Superseded by 2'.
+   **CORRECTED (release re-run):** cold **~8.6×** slower (not 12×); hot AND
+   incremental ≈ break-even with no-trace; the cache is **sound and precise**
+   (incremental `misses=1` on a 1-package bump). The deep-attrset case is
+   dominated by per-package RECORDING cost; the warm path neither wins nor loses
+   much. See the corrected re-run table at the top of this section.
 
-2'. ~~Cross-commit incremental measurement~~ **DONE (2026-05-30) — VERDICT: cache
-   is net-negative for deep-attrset, no amortization path.** Ran commit A cold
-   (populate cache), then commit B reusing A's cache, vs commit B no-trace:
-   - A cold: **19:49** (1,189 s)
-   - B hot (reuse A): **1:36** (96 s)
-   - B reference (no-trace): **1:40** (100 s)
-   **B-hot ≈ B-reference (96 s vs 100 s, ~4 % = noise).** Cross-commit reuse
-   delivers essentially NOTHING even in the intended N+1-reuses-N case. So the
-   12× cold cost never recoups: the cache is all cost, no benefit, on the
-   `nix-eval-jobs` shape. (Same workload/commits as the GNOME diagnostic, so
-   directly comparable. Caveat: `python3Packages` specifically; a different deep
-   attrset could differ, but this is the canonical eval-jobs shape.)
+2'. **DONE + CORRECTED (2026-05-30).** Both a same-commit and a real incremental
+   (`python3Packages.streamz` bump, `2b93ef`→`f37d`) cross-commit run, release
+   binary, with hit/miss + soundness:
+   - parent cold: **2:34**; incremental (reuse parent): **0:17**, `hits=11062
+     misses=1`, served == truth; incremental no-trace: **0:18**.
+   - Incremental reuse WORKS and is SOUND/PRECISE (exactly the one changed package
+     re-evaluated), but incremental wall ≈ no-trace — **no net win, not a net
+     loss.** (The earlier "net-negative, full stop" used an `-O0` build AND a
+     no-op delta; retracted.)
 
 2''. **Cheaper per-trace recording (if 2' shows cross-commit value but cold cost
    blocks adoption).** The cold path serializes a fat dep blob + SQLite write per
