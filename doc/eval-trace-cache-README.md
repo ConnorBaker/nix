@@ -254,12 +254,17 @@ in place. The remaining options, in rough order of effort/payoff:
      loss.** (The earlier "net-negative, full stop" used an `-O0` build AND a
      no-op delta; retracted.)
 
-2''. **Cheaper per-trace recording (if 2' shows cross-commit value but cold cost
-   blocks adoption).** The cold path serializes a fat dep blob + SQLite write per
-   package trace (~3,000 for python3Packages); cold wall ≫ cold CPU ⇒ I/O-bound.
-   Reducing per-trace recording cost (batch writes, compact dep encoding, or
-   recording FEWER traces) is the lever for the deep-attrset shape — the opposite
-   of Lever 1's finer granularity.
+2''. **Make cold AND hot faster — see `plans/perf-levers-cold-and-hot.md`.**
+   Root cause (DB-confirmed): 36.5 M deps recorded from only ~60 K distinct atoms
+   ⇒ each shared-closure dep (stdenv/glibc/python) recorded & re-hashed **~607×**.
+   Cold = 3 hash passes over every trace's full dep vector; hot = walking 36.9 M
+   dep-checks. Levers, ordered: **(L-C)** fuse the 3 recording hashes into 1 pass
+   (cold, cheap, safe, ship first); **(L-B)** per-session dep-verdict memo so each
+   distinct dep is verified once not 607× (hot, cheap); **(L-A)** shared-closure
+   dep-fragment factoring — the structural fix for BOTH cold + hot + storage, but
+   needs sub-set factoring since whole keysets are all distinct (RFC-ish);
+   **(L-D)** skip recording trivially-cheap leaves; **(L-E)** batched writeback;
+   **(L-F)** `mapAttrs`-style access guidance (already half-proven, zero-code).
 
 3. **The content-addressed trace-node RFC** (unblocks Lever 2 / Lever 5). A second
    `TracedExpr` identity keyed by content (derivation-input hash) rather than
