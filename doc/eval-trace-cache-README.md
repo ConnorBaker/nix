@@ -303,6 +303,39 @@ capsule envelopes; fused load+verify; full-trace-hash verification memo;
 re-abstracting the storage backend behind a vptr. (Sources: catalog.md
 "Non-transferable", redesign-plan "Rejected experiment" sections.)
 
+## Architectural root cause (2026-05-30) — `plans/architecture-trace-model-vs-CA.md`
+
+The deepest finding of the whole arc, and it unifies the others. Verified
+against code + the cold DB:
+
+- **eval-trace flattens the transitive dep closure into every trace node**
+  (`replayMemoizedRange` copies a child's full dep range into the parent,
+  dep-recording-context.hh:307). A trace stores ~95 % leaf observations (decoded
+  dep-kind histogram: StructProj 48 % + StorePathAvail 35 % + FileBytes 7 % + …),
+  avg 3,376 deps/trace = a transitive closure, not direct deps. The cross-trace
+  EDGE dep kinds (`TraceValueContext`/`ParentSlot`) are **~0 % used**.
+- **The build layer does the opposite:** a derivation references its inputs **by
+  hash/edge** (`Derivation::inputDrvs` keyed by input drvPath), and
+  `hashDerivationModulo` recursively substitutes input-drv hashes **memoized in
+  `drvHashes`** — shared stdenv is hashed once and referenced N times. That is
+  the short-circuit eval-trace lacks: cold re-hashes / hot re-walks the shared
+  closure ~607× instead of referencing one shared sub-result.
+- **The unifying root cause:** a `TracedExpr` (hence a hash-identified trace) is
+  created ONLY for attr-path-addressable values (root + attrset/list children in
+  `materialize.cc`). Shared closure reached by function application / `import`
+  has **no trace identity to edge-reference**, so it gets flattened. This SAME
+  constraint blocks Lever 2 (derivations aren't attr-path-addressable) and leaves
+  the (fully-built, memoized) edge-verify machinery `resolveTraceContextHash`
+  unused. **eval-trace ties identity to syntactic position in the output tree;
+  the build layer ties it to content of inputs.** That is the architectural gap.
+- **Direction:** lift the build layer's CA model to evaluation — content-address
+  sub-results as trace-DAG nodes referenced by edge, not flattened. RFC-scale
+  (it's the `content-addressed-trace-node` work Lever 2 also needs), but it is
+  the only lever that attacks the root rather than symptoms, and it has a
+  precedent to copy: `hashDerivationModulo` + `drvHashes`. Soundness prerequisite
+  = the keyset-provenance / cross-trace-escape work (a node can observe a child's
+  shape, not just value — unlike builds).
+
 ## How the keyset work fits
 
 Lever 1 is split across two design docs and a soundness scaffold:
