@@ -213,6 +213,33 @@ structurally excludes non-attr-path values. **Verdict: Lever 2 not pursued; cold
 tail left as a bounded, soundness-correct cost. Spike code is throwaway
 (measurement-only counters).**
 
+## 2026-05-30 deep-attrset workload finding — cache is net-negative on nix-eval-jobs shape
+
+Ran the deep-attrset workload (python3Packages outPaths, ~3,000 packages, the
+nix-eval-jobs shape) the GNOME diagnosis implied we should test. Wall clock,
+commit 9b9f7241:
+
+| Mode | Wall | vs ref |
+|---|---:|---|
+| reference (--no-eval-trace) | 1:38 (98s) | 1.00x |
+| cold (trace) | 19:43 (1183s) | 12x SLOWER |
+| hot (warm) | 1:36 (96s) | break-even |
+
+Opposite of closures.gnome (hot 7x faster). A package set is attr-path-addressable
+so materialize wraps each child as a TracedExpr -> ~3,000 traces recorded (vs 6 for
+GNOME). Cold wall (19:43) >> cold CPU (388s) -> recording is I/O-bound (SQLite +
+per-package dep-blob serialize). Hot recovers the overhead but yields NO net
+speedup over no-cache.
+
+Implications: (1) the deep-attrset case does not want Lever 1 (finer pruning) -
+it already has maximal granularity, which is what makes cold catastrophic; it
+wants cheaper/fewer per-trace recording. (2) The decisive unmeasured experiment is
+CROSS-COMMIT incremental (commit N+1 reusing N's cache) - same-commit hot
+break-even doesn't capture the real nix-eval-jobs value case. (3) The cache's value
+is workload-shape-dependent and currently inverted for the most important consumer.
+See eval-trace-cache-README.md "DEEP-ATTRSET WORKLOAD FINDING" for the full table +
+option list (2', 2'').
+
 ## Current benchmark anchors
 
 | Run | Backend shape | Cold wall | Hot wall | Notes |

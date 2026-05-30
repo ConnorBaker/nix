@@ -84,6 +84,47 @@ findings-doc "Promising Directions". Each lever traces to repo text; the
 | **3** | **Certificate-before-payload** fast path (fixed-size `FullTraceHash` compare before `loadFullTrace` + dep walk) | LOW priority. Every *sound* form was already refuted on this workload (runs 909/980/987/1032/1042/1133/1107/1108…). The dep walk IS the hot cost for true exact hits (unsound oracle run 1015: hot 0.68 vs 0.88 s), but the residual hot cost is decode/startup, not the walk, once the `verifiedTraceIds` memo is in place. Only un-refuted shape: a cheap per-current-node eligibility bit/index that clears the run-993 coverage bar. | redesign-plan §2026-05-29 CORRECTION finding 1 |
 | **4** | **Custom immutable-segment store** (generation packs, mmap fixed-width indexes, lock-free readers, atomic `CURRENT`) | Deferred until 1–3 prove the proof model wins. Storage format is **downstream of authorization**: run 137 showed lazy-payload-over-immutable-objects does NOT beat SQLite without the authorization fix. Do NOT re-abstract `TraceStorage` (the vptr was added per rearch-proposal §2.1, measurably hurt the hot loop, and was reversed). | redesign-plan "Architectural direction" + §2026-05-29 finding 4; storage-backend-research.md |
 
+## DEEP-ATTRSET WORKLOAD FINDING (2026-05-30) — the cache is net-negative on `nix-eval-jobs`-shape loads
+
+Option 2 below (benchmark a deep-attrset workload) was run. **Result: on the
+workload that matters most for the cache's purpose, the cache is all cost and no
+benefit.** Measured on `python3Packages` outPaths (a ~3,000-package deep attrset,
+the `nix-eval-jobs` shape), nixpkgs commit `9b9f7241`, wall clock:
+
+| Mode | Wall | vs reference |
+|---|---:|---|
+| reference (`--no-eval-trace`) | **1:38** (98 s) | 1.00× |
+| cold (trace, recording) | **19:43** (1,183 s) | **12× SLOWER** |
+| hot (warm cache) | **1:36** (96 s) | 0.98× (break-even) |
+
+Two facts, both the opposite of `closures.gnome` (where hot was ~7× faster):
+1. **Cold recording is catastrophic: 12× slower.** It records ~3,000 per-package
+   traces (vs 6 for GNOME — because a package set IS an attr-path-addressable
+   deep attrset, so `materialize.cc` wraps each child as a `TracedExpr` and each
+   records its own trace). Cold *wall* (19:43) ≫ cold *CPU* (388 s from the stats
+   run) ⇒ the cost is **I/O wait: SQLite writes + per-package dep-blob
+   serialization**, not CPU.
+2. **Hot is merely break-even (96 s vs 98 s) — NO net speedup.** The warm cache
+   recovers exactly the recording overhead and nothing more.
+
+**Strategic consequence:** the eval-trace cache's measured profile is workload-
+shape-dependent and currently inverted for the most important consumer:
+- `closures.gnome` (deep *computation*, shallow data): hot 7× faster, cold tail
+  bounded. Cache is a win.
+- `python3Packages` (deep *attrset*, the `nix-eval-jobs` shape): cold 12× slower,
+  hot break-even. **Cache is a net loss.**
+
+This reframes the option list. The deep-attrset case does NOT want Lever 1
+(finer pruning) — it already has maximal per-package granularity and that
+granularity is precisely what makes cold catastrophic. It wants the OPPOSITE:
+**drastically cheaper per-trace recording** (the cold-write path), or a way to
+NOT record a trace per package. Caveats before over-generalizing: (a) single
+run, one commit, same-commit hot (not cross-commit incremental — the real
+`nix-eval-jobs` benefit case is a SECOND commit reusing the first's cache, not
+yet measured); (b) `python3Packages` may itself be unrepresentative; (c) the
+12× cold cost might be acceptable IF cross-commit hot delivers a large win — that
+is the decisive unmeasured experiment (see option 2' below).
+
 ## Where the research stands (2026-05-30) and the remaining options
 
 After establishing the first current-tree baseline (Ledger D) and diagnosing
@@ -106,14 +147,27 @@ in place. The remaining options, in rough order of effort/payoff:
    hot path — the case that matters for repeated CI/`nix-eval-jobs` use — is
    already ~7× faster than no-cache and flat. Spend effort elsewhere.
 
-2. **Lever 1 on a different workload.** The observed-key/by-name pruning proof
-   (the biggest historical win) targets deep-*attrset* enumeration, NOT
-   `closures.gnome`. Its natural workload is `nix-eval-jobs`-shape evaluation
-   over a wide package set (`pkgs.*`). **Action: benchmark a deep-attrset workload
-   before assuming the cold tail generalizes** — `closures.gnome` may be
-   unrepresentative of the consumers that matter. This is the single most
-   valuable *cheap* next step: it could show the levers that don't help GNOME do
-   help the real target. (`eval-trace-bench --workloads` over a package set.)
+2. ~~Benchmark a deep-attrset workload~~ **DONE (see finding above).** Outcome
+   overturned the expectation: the cache is 12× slower cold / break-even hot on
+   `python3Packages`. The deep-attrset case is bottlenecked by per-package
+   RECORDING cost, not by pruning precision. Superseded by 2'.
+
+2'. **Cross-commit incremental measurement on the deep-attrset workload (the
+   decisive open experiment).** The break-even hot above was a *same-commit*
+   re-eval. The real `nix-eval-jobs` value case is commit N+1 reusing commit N's
+   cache, where most packages are unchanged. IF cross-commit hot delivers a large
+   win, the 12× cold cost may amortize; if it is also break-even, the cache is
+   simply wrong for this shape. **This is the single most decisive cheap next
+   step.** (Run cold on commit A, then "hot" on commit B with A's warm cache;
+   compare B-hot vs B-reference.) Until measured, the cache's value for
+   `nix-eval-jobs` is unknown — possibly negative.
+
+2''. **Cheaper per-trace recording (if 2' shows cross-commit value but cold cost
+   blocks adoption).** The cold path serializes a fat dep blob + SQLite write per
+   package trace (~3,000 for python3Packages); cold wall ≫ cold CPU ⇒ I/O-bound.
+   Reducing per-trace recording cost (batch writes, compact dep encoding, or
+   recording FEWER traces) is the lever for the deep-attrset shape — the opposite
+   of Lever 1's finer granularity.
 
 3. **The content-addressed trace-node RFC** (unblocks Lever 2 / Lever 5). A second
    `TracedExpr` identity keyed by content (derivation-input hash) rather than
