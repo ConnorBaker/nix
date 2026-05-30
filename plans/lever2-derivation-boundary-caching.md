@@ -514,3 +514,66 @@ package derivation pulled in by the fixpoint). No cheaper boundary reaches it.
 The decision is unchanged: the next step is the hot-path feasibility spike (§9),
 which requires sign-off; absent that, the cold tail stays as-is (bounded,
 soundness-correct).
+
+## 11. FEASIBILITY SPIKE (2026-05-30, branch `spike/lever2-derivation-feasibility`) — MATERIAL BLOCKER HIT
+
+Built incrementally, measurement-first. Result: **hit a material architectural
+blocker; the spike stops here.** Findings are durable; the code is throwaway.
+
+### Step 1 (landed, measured): how many derivations does a traced GNOME eval evaluate?
+Added throwaway counters `nrSpikeDrvStrictTraced/Untraced` at `prim_derivationStrict`
+(guarded on `Counter::enabled`, off the hot inner loop), emitted under
+`evalTrace.spike`. Built (meson, clang) and ran `nix eval -f release.nix
+closures.gnome.x86_64-linux` with `NIX_SHOW_STATS`:
+- **`drvStrictTraced = 10,455`** derivation evaluations on the eval path
+  (`drvStrictUntraced = 0`).
+- Same run: **`record.count = 6`** traces, `depTracker.scopes = 8,183`,
+  `hits=0 misses=6`.
+- So **~10,449 derivations evaluated with NO recorded trace.** Confirms the
+  Lever-2 target size empirically (vs the 6,419 *distinct* instantiated drvs —
+  the ~1.6× gap is within-eval repeat `derivationStrict` calls that Nix's
+  `drvHashes` dedups at the .drv-write level but still re-invokes).
+
+### Step 2 (blocked): can a derivation thunk become a cache-routed `TracedExpr`?
+To verify-before-force a derivation (the actual speedup), its thunk must be a
+`TracedExpr` (the only pre-force interception hook, §9). Reading the identity
+model (`traced-expr.hh:100-184`, `trace-session.cc::makeChild`):
+
+- `TracedExpr` has exactly two kinds: **Root** (one per session, `pathId=0`,
+  value from `rootLoader`) and **Child** (`parentExpr` + `Symbol name` +
+  `pathId = extendPath(parent.pathId, name)`).
+- A Child's `navigateToReal()` **walks up the parentExpr chain and re-traverses
+  the real root through named attr/list selectors** (`traverseRealTree`). Its
+  whole identity is *a position in the attr-path tree rooted at the eval root.*
+- A `derivationStrict` thunk is created deep inside `make-derivation.nix` via
+  function application / `let` / `map` / the module fixpoint
+  (`derivation.nix`: `strict = derivationStrict drvAttrs`). It has **no
+  parent-chain of `TracedExpr`s and no attr-path of named selectors from the
+  root.** `makeChild` cannot be called for it (no parent `TracedExpr`, no name,
+  no path); `navigateToReal` could not reconstruct it.
+
+**THE MATERIAL BLOCKER (architectural, not incidental):** the entire `TracedExpr`
+cache is premised on cacheable nodes being addressable by an **attr-path from the
+evaluation root**. Derivations have no such identity — they are values produced
+by arbitrary computation. Caching them requires a SECOND, content-addressed
+`TracedExpr` identity model (parentless; keyed by derivation-input hash;
+`navigateToReal` replaced by "re-invoke `derivationStrict`"; recording keyed by
+that hash instead of `pathId`), threaded through evaluator thunk creation in
+`derivation.nix`/`ExprApp`. That is a foundational redesign of `TracedExpr`'s
+identity, not a localized prototype — and it lands on the hottest evaluator path.
+
+This is consistent with, and now concretely explains, the CLAUDE.md note that
+`derivationStrict` is "outside the plan's stated scope": the cache's addressing
+model structurally excludes non-attr-path values.
+
+### Verdict
+- The cold tail (23 outlier commits, ~halving ceiling) is real but its fix
+  requires a content-addressed `TracedExpr` identity — a foundational change to
+  the cache's addressing model, on the hot eval path, with the v53/vptr precedent
+  warning that hot-path perturbation tends to eat such wins.
+- **Recommendation: do NOT pursue Lever 2 as currently scoped.** Leave the cold
+  tail as a known, bounded, soundness-correct cost. If revisited, the prerequisite
+  is a design for content-addressed (derivation-keyed) trace nodes — a separate
+  RFC-scale effort, not an incremental lever.
+- The Step-1 counter is the only code; it is measurement-only and will be reverted
+  (kept on the throwaway branch for reproducibility).

@@ -194,6 +194,25 @@ non-regression — before any real wiring. If it perturbs the hot path (likely),
 leave the cold tail as-is (23 outliers, soundness-correct, bounded). Facet mask
 (§3) + storage budget (6,419 derivs/commit) remain on top of all this.
 
+**SPIKE RAN (2026-05-30, branch `spike/lever2-derivation-feasibility`) — MATERIAL
+BLOCKER (lever2 doc §11).** Step 1 measured: a traced `nix eval
+closures.gnome.x86_64-linux` evaluates **10,455 derivations** but records only
+**6 traces** (counter added at `prim_derivationStrict`, `evalTrace.spike`). Step 2
+blocked: to verify-before-force a derivation it must be a `TracedExpr`, but
+`TracedExpr` identity is attr-path-tree-shaped (`makeChild` needs a parent
+`TracedExpr` + `Symbol name` + `extendPath`; `navigateToReal` walks the parent
+chain through named selectors). A `derivationStrict` thunk created deep in
+`make-derivation.nix` (via app/`let`/`map`/fixpoint) has NO attr-path from the
+root and NO parent `TracedExpr` — `makeChild` cannot construct it. **Caching
+derivations requires a SECOND content-addressed `TracedExpr` identity model
+(derivation-input-hash keyed, parentless, `navigateToReal` → re-invoke
+`derivationStrict`) threaded through evaluator thunk creation — a foundational
+redesign on the hot eval path, RFC-scale, not a lever.** This concretely explains
+the CLAUDE.md "derivationStrict outside scope" note: the cache's addressing model
+structurally excludes non-attr-path values. **Verdict: Lever 2 not pursued; cold
+tail left as a bounded, soundness-correct cost. Spike code is throwaway
+(measurement-only counters).**
+
 ## Current benchmark anchors
 
 | Run | Backend shape | Cold wall | Hot wall | Notes |
