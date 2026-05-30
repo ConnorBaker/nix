@@ -82,15 +82,66 @@ Findings:
   NixOS *system closures*; a change anywhere reachable by the closure defeats
   recovery for the whole closure.
 
-Redirect: the outlier lever is **closure-localization of a deep change**
-(lever-2-adjacent: why does a one-module edit force 20M-thunk re-eval?), NOT
-lever-1 enumerated-set pruning. Two hypotheses to resolve via per-commit `logs`
-on an outlier before any build: (1) an over-coarse top-level dep (whole
-`nixos/modules` set) that any module edit invalidates — enumerated-set lever
-applies but at module-set granularity; (2) recovery genuinely can't localize the
-changed subtree — a structural-variant precision gap. See
-`plans/lever1-observed-key-pruning.md` §0 for the full evidence and the next
-diagnostic step.
+Redirect: the outlier lever is **closure-localization of a deep change**, NOT
+lever-1 enumerated-set pruning. Two hypotheses, now RESOLVED (below).
+
+### Step-1 diagnostic — RESOLVED (2026-05-30, stats.json drill-down on `9b9f7241`)
+
+H1 (over-coarse top-level dep) **rejected**; H2 (recovery can't localize)
+**confirmed and sharpened into a new lever**.
+
+The mechanism (outlier stats.json): the eval records **16,352 trace scopes** but
+verifies only **7 at the top level** — the monolithic `closures.gnome` roots,
+~1,278 thunks each. **`verify.failed=222` of `233481` deps (0.10%)**, spread
+(not one coarse listing → H1 dead; `ownDepsMax=48738` = fine-grained per-trace
+deps), fail **4 of 7 roots**. Recovery (DirectHash/gitIdentity/structVariant)
+fails on all 4 → each re-evals its **entire** subtree. Machinery is cheap
+(recovery 0.75 s + verify 0.99 s); **~13 s is raw re-eval** (cpuTime 14.6 s).
+Fast commit `f37d` for contrast: 7/7 roots verify clean, **nrThunks=1**,
+verify.failed=0. Binary per root.
+
+**Root cause: all-or-nothing verification/recovery at coarse closure roots, with
+no partial reuse of the 16K fine-grained sub-traces.** The sub-traces are
+recorded cold but not independently re-verified warm — only the 7 roots are. A
+0.10%-of-deps change pays a full closure re-eval because nothing descends into a
+failed root to reuse the 99.9% unchanged sub-traces.
+
+**New lever (call it Lever 5 — incremental sub-trace reuse / partial recovery):**
+on root-trace verify failure, descend and re-verify only the changed sub-traces
+instead of re-evaluating the whole root. This is distinct from lever 1
+(enumerated-set pruning) and lever 2 (derivation-boundary digest), and it is the
+**measured outlier lever for `closures.gnome`** — the 23 outliers are exactly the
+commits where a root verify fails.
+
+**Code-grounded refinement (trace-session.cc).** The gap is now located:
+- Warm hit → `materializeResult` (cheap). Verify miss →
+  `evaluateFresh` (trace-session.cc:667-669).
+- A per-leaf lazy-verification contract DOES exist (CLAUDE.md OR-3,
+  `ParentChild_PerLeafLazyVerification`): forcing a *child through the cache*
+  verifies that child's own trace. BUT it only helps when children are reached
+  *via the cache*. When a **root** trace fails verify, `evaluateFresh` walks
+  `navigateToReal`'s `realRoot` = **fresh thunks** (trace-session.cc:654-655),
+  which **bypass the cache for the entire subtree** — the 16K recorded
+  sub-traces are never consulted. The benchmark's `--json` deep-forces the whole
+  structure, so a failed root re-evals its complete subtree fresh.
+- So Lever 5 ≈ "**on root verify miss, re-enter the cache per-child instead of
+  fresh-walking the realRoot**" — make `evaluateFresh`'s subtree walk go back
+  through `TracedExpr` cache lookups so each unchanged child warm-hits, instead
+  of a monolithic fresh eval.
+
+Design questions before any build (the next research step, not yet taken):
+1. Can `evaluateFresh` (or `navigateToReal`) re-enter per-child cache lookups
+   for a failed root's children, so the 99.9% unchanged sub-traces warm-hit?
+   What breaks the realRoot-walk's freshness assumption if it does?
+2. Soundness: serving a sub-trace whose parent root failed verify — the
+   keyset-escape / cross-trace work is directly relevant (a child's validity
+   must rest on its own deps, not the parent's invalidated state; the
+   per-leaf contract already asserts this for cache-reached children).
+3. Is the cost of 16K per-child verifies (vs 7 root verifies) less than the
+   ~13 s re-eval it avoids? The diagnostic says machinery is ~ms/trace, so
+   16K × ~ms could still beat 20M-thunk re-eval — but must be measured.
+
+See `plans/lever1-observed-key-pruning.md` §0 for the full counter dump.
 
 ## Current benchmark anchors
 

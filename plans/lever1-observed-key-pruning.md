@@ -47,17 +47,47 @@ changed and the recovery path couldn't localize it. This points at **lever 2
 (semantic derivation-boundary / closure-localization)**, not lever 1, as the
 outlier lever for this workload.
 
-**Open question for the next step:** *why* does a one-module change cause 100%
-recovery failure + 20M-thunk re-eval, when the GNOME closure's dependence on
-that module is narrow or nil? Two hypotheses to test before any build:
-1. **Over-coarse top-level dep:** the system-closure trace records a coarse dep
-   (whole `nixos/modules` listing, or the module-set attrset) that any module
-   edit invalidates — the enumerated-set lever WOULD then apply, but at the
-   module-set granularity, not by-name packages. (Re-examine with `--with-stats`
-   + per-commit `logs` on `9b9f7241`.)
-2. **Recovery can't localize:** the change genuinely flows into the closure but
-   recovery re-evals far more than the changed subtree — a precision gap in
-   structural-variant recovery, distinct from both levers.
+**Open question — RESOLVED 2026-05-30 (stats.json drill-down on `9b9f7241`).**
+The two hypotheses were:
+1. **Over-coarse top-level dep** (one `nixos/modules` listing any edit
+   invalidates → enumerated-set lever at module-set granularity).
+2. **Recovery can't localize** (precision gap; re-evals more than the changed
+   subtree).
+
+**Verdict: H1 REJECTED, H2 CONFIRMED and sharpened into a distinct lever.**
+
+Evidence from the outlier's `cold-stats/2` stats.json:
+- The eval records **16,352 trace scopes** (`depTracker.scopes`) but verifies
+  only **7 at the top level** (`loadTrace.count=7`, `verify.count=7`). Those 7
+  are the monolithic `closures.gnome` roots (2 system closures + sub-attrs),
+  averaging **~1,278 thunks each** (20.9M / 16,352).
+- **`verify.failed=222` of `verify.depsChecked=233481` = 0.10%.** Those 222
+  failed deps are spread (not one coarse listing → H1 rejected;
+  `depTracker.ownDepsMax=48738` shows fine-grained per-trace deps), and they
+  fail **4 of the 7 roots**.
+- Each failed root attempts recovery (DirectHash 3 hits; the 4 failures fall
+  through gitIdentity @ 294 µs and structVariant @ 0.48 s) and **all 4 fail** →
+  each re-evals its **entire** subtree. Machinery is cheap (recovery 0.75 s +
+  verify 0.99 s); the **~13 s is raw re-eval** (`cpuTime` 14.6 s).
+- Contrast the fast commit `f37d`: 7/7 roots verify clean, **`nrThunks=1`**,
+  `verify.failed=0`, 0 recovery attempts. Binary per root: verify clean → ~free;
+  one dep fails under a root → whole root re-evals.
+
+**Root cause (the real lever): all-or-nothing verification/recovery at coarse
+closure roots, with no partial reuse of the 16K fine-grained sub-traces.** The
+sub-traces are *recorded* on the cold pass but are not independently re-verified
+on the warm path — only the 7 roots are. So a change touching 0.10% of deps
+pays a full closure re-eval because there is no mechanism to descend into a
+failed root and reuse the 99.9% of unchanged sub-traces.
+
+**This is neither lever 1 (enumerated-set pruning) nor classic lever 2
+(derivation-boundary digest). It is a THIRD lever: incremental sub-trace reuse /
+partial recovery** — on root-trace verify failure, descend and re-verify only the
+changed sub-traces instead of re-evaluating the whole root. See the redesign-plan
+2026-05-30 "Step-1 diagnostic — RESOLVED" section for the lever statement and the
+design questions it opens (why aren't the 16,352 sub-traces independently
+verifiable on the warm path? is it a recording-granularity, a
+verification-entry-point, or a materialization-boundary limitation?).
 
 The §1–§7 below are **retained as the enumerated-set design** (still valid IF
 hypothesis 1 holds at module-set granularity, and still the right home for the
