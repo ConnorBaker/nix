@@ -114,16 +114,24 @@ shape-dependent and currently inverted for the most important consumer:
 - `python3Packages` (deep *attrset*, the `nix-eval-jobs` shape): cold 12× slower,
   hot break-even. **Cache is a net loss.**
 
+**Cross-commit verdict (2026-05-30, the decisive follow-up — option 2'):** ran
+commit A cold (populate cache) → commit B reusing A's cache → B no-trace.
+A-cold **19:49**, B-hot-reuse-A **1:36**, B-reference **1:40**. **B-hot ≈
+B-reference** — cross-commit reuse delivers essentially nothing even in the
+intended N+1-reuses-N case. **So the 12× cold cost never amortizes: the cache is
+all cost, no benefit, on the `nix-eval-jobs` shape, full stop.**
+
 This reframes the option list. The deep-attrset case does NOT want Lever 1
 (finer pruning) — it already has maximal per-package granularity and that
-granularity is precisely what makes cold catastrophic. It wants the OPPOSITE:
-**drastically cheaper per-trace recording** (the cold-write path), or a way to
-NOT record a trace per package. Caveats before over-generalizing: (a) single
-run, one commit, same-commit hot (not cross-commit incremental — the real
-`nix-eval-jobs` benefit case is a SECOND commit reusing the first's cache, not
-yet measured); (b) `python3Packages` may itself be unrepresentative; (c) the
-12× cold cost might be acceptable IF cross-commit hot delivers a large win — that
-is the decisive unmeasured experiment (see option 2' below).
+granularity is precisely what makes cold catastrophic while the hot side proved
+worthless. The only lever that could help is **drastically cheaper / fewer
+per-trace recording** (cold-write path) AND a hot path that actually beats
+no-trace — but the cross-commit result shows the hot side has no win to deliver
+here regardless of recording cost, so even that is dubious. Practical
+consequence: **eval-trace should likely be disabled (or never enabled) for
+`nix-eval-jobs`-shape evaluation** until a redesign demonstrates a hot win on
+this shape. Caveat: `python3Packages` specifically; another deep attrset could
+differ, but it is the canonical shape.
 
 ## Where the research stands (2026-05-30) and the remaining options
 
@@ -152,15 +160,18 @@ in place. The remaining options, in rough order of effort/payoff:
    `python3Packages`. The deep-attrset case is bottlenecked by per-package
    RECORDING cost, not by pruning precision. Superseded by 2'.
 
-2'. **Cross-commit incremental measurement on the deep-attrset workload (the
-   decisive open experiment).** The break-even hot above was a *same-commit*
-   re-eval. The real `nix-eval-jobs` value case is commit N+1 reusing commit N's
-   cache, where most packages are unchanged. IF cross-commit hot delivers a large
-   win, the 12× cold cost may amortize; if it is also break-even, the cache is
-   simply wrong for this shape. **This is the single most decisive cheap next
-   step.** (Run cold on commit A, then "hot" on commit B with A's warm cache;
-   compare B-hot vs B-reference.) Until measured, the cache's value for
-   `nix-eval-jobs` is unknown — possibly negative.
+2'. ~~Cross-commit incremental measurement~~ **DONE (2026-05-30) — VERDICT: cache
+   is net-negative for deep-attrset, no amortization path.** Ran commit A cold
+   (populate cache), then commit B reusing A's cache, vs commit B no-trace:
+   - A cold: **19:49** (1,189 s)
+   - B hot (reuse A): **1:36** (96 s)
+   - B reference (no-trace): **1:40** (100 s)
+   **B-hot ≈ B-reference (96 s vs 100 s, ~4 % = noise).** Cross-commit reuse
+   delivers essentially NOTHING even in the intended N+1-reuses-N case. So the
+   12× cold cost never recoups: the cache is all cost, no benefit, on the
+   `nix-eval-jobs` shape. (Same workload/commits as the GNOME diagnostic, so
+   directly comparable. Caveat: `python3Packages` specifically; a different deep
+   attrset could differ, but this is the canonical eval-jobs shape.)
 
 2''. **Cheaper per-trace recording (if 2' shows cross-commit value but cold cost
    blocks adoption).** The cold path serializes a fat dep blob + SQLite write per

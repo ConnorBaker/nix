@@ -223,7 +223,13 @@ commit 9b9f7241:
 |---|---:|---|
 | reference (--no-eval-trace) | 1:38 (98s) | 1.00x |
 | cold (trace) | 19:43 (1183s) | 12x SLOWER |
-| hot (warm) | 1:36 (96s) | break-even |
+| hot (warm, same commit) | 1:36 (96s) | break-even |
+
+CROSS-COMMIT follow-up (the decisive test): commit A cold 19:49, commit B
+reusing A's cache 1:36, commit B no-trace 1:40 -> B-hot ~= B-ref. Cross-commit
+reuse delivers nothing even in the intended N+1-reuses-N case, so the 12x cold
+cost never amortizes. eval-trace is net-negative for the nix-eval-jobs shape and
+should likely be disabled for it pending a redesign that shows a hot win.
 
 Opposite of closures.gnome (hot 7x faster). A package set is attr-path-addressable
 so materialize wraps each child as a TracedExpr -> ~3,000 traces recorded (vs 6 for
