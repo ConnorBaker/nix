@@ -88,6 +88,7 @@ sources = files(
   'eval-trace/store/git-identity-recovery.cc',
   'eval-trace/store/trace-value-context.cc',
   'eval-trace/store/trace-parent-slot.cc',
+  'eval-trace/store/keyset-escape.cc',
   'eval-trace/store/copied-path.cc',
   'eval-trace/store/nar-identity.cc',
   'eval-trace/store/derived-store-path.cc',
