@@ -41,6 +41,8 @@
 
 #include <gtest/gtest.h>
 
+#include <deque>
+
 namespace nix::eval_trace {
 
 using namespace nix::eval_trace::test;
@@ -100,21 +102,28 @@ TEST_F(TraceStoreTest, DerivationEdge_ProducerSourceChanges_ConsumerInvalidates)
     }
 }
 
-// ── C2: producer output unchanged ⇒ consumer hits (the reuse win) ────────────
+// ── C2: producer unchanged ⇒ consumer hits via a SINGLE edge dep ─────────────
+//
+// IMPORTANT framing correction (verified against verifier.cc:243-278): a
+// TraceValueContext edge to B does NOT let A "skip B's closure." B's trace hash
+// is f(B's INPUT deps), and `resolveTraceContextHash` RECURSIVELY VERIFIES B's
+// closure before resolving the edge. What the edge buys is NOT "don't verify B"
+// — it is "A stores ONE edge dep instead of a COPY of B's whole closure" (the
+// recording/storage win) and "B's closure is verified ONCE and the verdict is
+// memoized" (traceContextMemo + verifiedTraceIds) so N consumers share it rather
+// than each re-walking B (the amortization win — pinned in C2b below). This
+// test pins the recording-side claim: A's entire dep set is one edge, and that
+// alone authorizes reuse.
 
-TEST_F(TraceStoreTest, DerivationEdge_ProducerUnchanged_ConsumerHitsWithoutClosureWalk)
+TEST_F(TraceStoreTest, DerivationEdge_ProducerUnchanged_ConsumerHitsViaSingleEdge)
 {
-    // The win: A reuses via the edge when B is unchanged, WITHOUT A re-recording
-    // or re-walking B's input closure. A holds exactly ONE edge dep (to B), not
-    // a copy of B's deps. We assert A hits across a session boundary with only
-    // that single edge present — proving the edge alone authorizes reuse.
     TempTextFile bSrc("stable");
     auto & p = pools();
     auto db = makeDb();
 
     auto bHash = withExclusiveStore(*db, [&](const auto & ea) {
-        // B's trace carries B's OWN closure (here one content dep; in reality
-        // thousands). The point of the edge is that A does NOT copy these.
+        // B's trace carries B's OWN closure (one content dep here; ~thousands in
+        // reality). A will store ONE edge to B, not a copy of these deps.
         db->record(ea, vpath({"B"}), string_t{"b-out", {}},
             {makeContentDep(p, bSrc.path.string(), "stable")});
         return db->getCurrentTraceHash(ea, vpath({"B"}));
@@ -130,12 +139,108 @@ TEST_F(TraceStoreTest, DerivationEdge_ProducerUnchanged_ConsumerHitsWithoutClosu
     recreateDb(db);
     auto r = test::TraceStorageTestAccess::verify(*db, vpath({"A"}), state);
     EXPECT_TRUE(r.has_value())
-        << "C2: with B unchanged, A's single output-identity edge authorizes "
-           "reuse without inlining/re-walking B's closure";
+        << "C2: with B unchanged, A's single edge dep authorizes reuse (A stores "
+           "one edge, not a copy of B's closure)";
     ASSERT_TRUE(r.has_value());
     ASSERT_TRUE(std::holds_alternative<string_t>(r->value));
     EXPECT_EQ(std::get<string_t>(r->value).first, "a-out")
         << "C2: A serves its own cached result via the edge";
+}
+
+// ── C2b: the AMORTIZATION win — a SHARED producer's closure is verified once per
+//    session and reused (traceContextMemo / verifiedTraceIds), vs re-walked per
+//    consumer when producers are DISTINCT. The build-layer drvHashes-memo
+//    property, lifted to eval.
+//
+// ADVERSARIAL DESIGN NOTE (a first attempt at this test was VACUOUS): naively
+// asserting "later consumer checks fewer deps than first" PASSES even with
+// distinct producers, because the pre-existing L1 dep-hash cache
+// (`currentDepHashes_`) already memoizes a file-hash by dep KEY — so distinct
+// producers reading the SAME file share L1 and the later-consumer count drops
+// for a reason unrelated to the trace-context memo. To isolate the memo, this
+// test runs BOTH arms with producers reading DISTINCT files, and compares the
+// SHARED-producer arm against the DISTINCT-producer arm directly. Only the
+// trace-context memo distinguishes them.
+
+TEST_F(TraceStoreTest, DerivationEdge_SharedProducer_VerifiedOncePerSession)
+{
+    auto & p = pools();
+
+    // Helper: build a producer with a multi-file closure (so the closure, not a
+    // single L1-cached file, dominates the dep-check count), and N consumers
+    // each edging to a producer. `shared` controls whether all consumers edge to
+    // ONE producer or to N DISTINCT producers (each with its OWN distinct files).
+    // Returns max deps-checked by a NON-first consumer in one shared session.
+    auto measureLaterConsumerDeps = [&](bool shared, std::deque<TempTextFile> & files) -> Counter::value_type {
+        auto db = makeDb();
+        // Each producer reads 3 DISTINCT files (no cross-producer L1 sharing).
+        auto recordProducer = [&](const char * bn, size_t fileBase) {
+            return withExclusiveStore(*db, [&](const auto & ea) {
+                db->record(ea, vpath({bn}), string_t{"b", {}}, {
+                    makeContentDep(p, files[fileBase + 0].path.string(), "c0"),
+                    makeContentDep(p, files[fileBase + 1].path.string(), "c1"),
+                    makeContentDep(p, files[fileBase + 2].path.string(), "c2"),
+                });
+                return db->getCurrentTraceHash(ea, vpath({bn}));
+            });
+        };
+        std::vector<std::string> consumerNames = {"A1", "A2", "A3"};
+        if (shared) {
+            auto bh = recordProducer("B", 0);
+            withExclusiveStore(*db, [&](const auto & ea) {
+                for (auto & n : consumerNames)
+                    db->record(ea, vpath({n}), string_t{"a", {}},
+                        {Dep::makeValueContext(vpath({"B"}), DepHashValue(DepHash{bh->value}))});
+            });
+        } else {
+            // Distinct producers B1/B2/B3, each reading its OWN 3 files.
+            std::vector<const char *> bns = {"B1", "B2", "B3"};
+            std::vector<std::optional<TraceHash>> bhs;
+            for (size_t i = 0; i < bns.size(); ++i) bhs.push_back(recordProducer(bns[i], i * 3));
+            withExclusiveStore(*db, [&](const auto & ea) {
+                for (size_t i = 0; i < consumerNames.size(); ++i)
+                    db->record(ea, vpath({consumerNames[i]}), string_t{"a", {}},
+                        {Dep::makeValueContext(vpath({bns[i]}), DepHashValue(DepHash{bhs[i]->value}))});
+            });
+        }
+        recreateDb(db);
+        VerificationSession session;
+        PathCountersSnapshot counters;
+        // First consumer warms the session.
+        (void) test::TraceStorageTestAccess::verify(*db, vpath({"A1"}), state, session);
+        Counter::value_type laterMax = 0;
+        for (auto * n : {"A2", "A3"}) {
+            auto before = nrDepsChecked.load();
+            auto r = test::TraceStorageTestAccess::verify(*db, vpath({n}), state, session);
+            EXPECT_TRUE(r.has_value()) << "C2b: " << n << " must reuse via its edge";
+            laterMax = std::max(laterMax, nrDepsChecked.load() - before);
+        }
+        return laterMax;
+    };
+
+    // 9 distinct files for the distinct arm (3 producers x 3); the shared arm
+    // uses the first 3.
+    std::deque<TempTextFile> files;
+    for (int i = 0; i < 9; ++i) files.emplace_back("c" + std::to_string(i));
+
+    auto sharedLater   = measureLaterConsumerDeps(/*shared=*/true,  files);
+    // Fresh files for the distinct arm so there is NO L1 carryover between arms.
+    std::deque<TempTextFile> files2;
+    for (int i = 0; i < 9; ++i) files2.emplace_back("d" + std::to_string(i));
+    auto distinctLater = measureLaterConsumerDeps(/*shared=*/false, files2);
+
+    GTEST_LOG_(INFO) << "C2b sharedLater=" << sharedLater
+                     << " distinctLater=" << distinctLater;
+
+    // The memo's effect, isolated from L1: a later consumer of a SHARED producer
+    // re-checks FEWER deps than a later consumer of a DISTINCT producer, because
+    // the shared producer's closure was already verified+memoized this session.
+    // (With distinct producers each later consumer must verify its own
+    // producer's closure; with shared, the memo skips it.)
+    EXPECT_LT(sharedLater, distinctLater)
+        << "C2b: shared-producer later-consumer deps (" << sharedLater
+        << ") must be < distinct-producer later-consumer deps (" << distinctLater
+        << ") — the trace-context memo amortizes a shared closure across consumers";
 }
 
 // ── C3 (ADVERSARIAL): an output-only edge is UNSOUND for a facet-observing
