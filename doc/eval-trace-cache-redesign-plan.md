@@ -13,6 +13,50 @@
 This is the living plan for the eval-trace cache redesign. Update it when
 benchmarks, implementation work, or adversarial review changes the direction.
 
+## 2026-05-30 CURRENT-TREE baseline (HEAD `9f7311129`) — Ledger D
+
+The first benchmark of the actual current tree (every earlier anchor predates
+HEAD; see README gate item 6). This is its own ledger — **do not compare its
+numbers against Ledger A/B/C**. It is the fixed reference point future lever
+work measures against.
+
+- **Harness:** `eval-trace-bench generate --nix . --nixpkgs
+  ~/ext-sources/nixpkgs --num-commits 100 --run-number 1`, `NIX_CONFIG="builders
+  ="`, no debug, no `NIX_SHOW_STATS`. Binary under test:
+  `nix-2.35.0pre20260530_9f73111`.
+- **Workload:** `nixos/release.nix closures.gnome`, 100-commit nixpkgs window
+  ending `8f443eb47dcb`. (NOTE: `closures.gnome`, not full `closures` — narrower
+  than some Ledger-B runs; do not compare totals.)
+- **Soundness: PASS on all 100 commits** (cold and hot byte-identical to
+  `--no-eval-trace`).
+
+| Mode | Wall mean | Wall median | vs reference (mean) | hits/misses |
+|---|---:|---:|---:|---|
+| reference (no trace) | 6.47 s | ~6.45 s | 1.00× | n/a |
+| cold/1 (record) | 3.72 s | 1.11 s | 0.58× | (incremental) |
+| hot/1 (replay) | 0.96 s | ~0.95 s | 0.15× | 100/0 |
+
+Distribution (the load-bearing observation): cold is **bimodal** — median 1.11 s,
+mean 3.72 s. The gap is ~23 catastrophic re-record commits at 7–17.6 s
+(worst `9b9f7241` 17.58 s, +1481% over median); the other ~77 commits sit at
+~1.0 s. **Hot is flat ~0.95 s, zero variance, zero misses.**
+
+Lever implications, now quantified against HEAD:
+- **Lever 1 (observed-key pruning)** is a tail-rescue and the baseline proves
+  it: the cold median is already ~1.1 s; the entire cold-mean prize is in
+  collapsing the ~23 outliers toward the median. Confirms the work-log's
+  "tail-rescue, not distribution shift" framing on the current tree.
+- **Lever 3 (certificate-before-payload)** targets hot, but hot is already a
+  flat ~0.95 s — confirming the residual hot cost is decode/startup, not the
+  dep walk, and that this lever is low-priority (matches the 2026-05-29
+  CORRECTION finding 1).
+
+Caveats: single run (wall noise; use `pairwise` paired medians for A/B later);
+stats columns intentionally blank (ranking run); the reference outlier on the
+first commit (`8f443eb` 10.3 s vs 6.4 s median) is checkout/cold-disk warmup,
+not signal. Run data on disk under `eval-trace-bench-results/{reference,cold/1,
+hot/1}/` (gitignored, ~2.5 GB; manifests carry full provenance).
+
 ## Current benchmark anchors
 
 | Run | Backend shape | Cold wall | Hot wall | Notes |

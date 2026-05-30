@@ -30,8 +30,13 @@ current tree, reconciles the ledgers, and carries the canonical lever list.
   they conflict. The canonical lever ordering below is taken from it.
 - **No perf code has changed since the squash.** HEAD = baseline + doc/test
   commits only (the keyset-provenance harness, the cross-trace keyset-escape
-  tests, and these docs). There is **no fresh benchmark of the current tree**;
-  every number in every ledger predates it.
+  tests, and these docs).
+- **A current-tree baseline now exists (2026-05-30, HEAD `9f7311129`).** See
+  the redesign-plan's *"2026-05-30 CURRENT-TREE baseline — Ledger D"* section.
+  100-commit `closures.gnome`: soundness PASS on all 100; cold mean 3.72 s
+  (median 1.11 s — bimodal, ~23 catastrophic outliers), hot mean 0.96 s
+  (0.15× reference, flat). This is the fixed reference point for future lever
+  work; the older ledgers (A/B/C) still predate HEAD.
 
 ## Document map
 
@@ -112,8 +117,10 @@ From `findings.md` "Implementation Discipline" and the redesign-plan, unchanged:
 4. Gate every change on the **10-commit correctness run** (byte-identical
    `nix eval` output vs `--no-eval-trace`) plus a no-debug benchmark.
 5. Revert/archive anything that fails the gate before building on top of it.
-6. **Establish a fresh baseline for the current tree before claiming any lever
-   win** — every number on file predates HEAD.
+6. ~~Establish a fresh baseline for the current tree before claiming any lever
+   win~~ — **DONE 2026-05-30** (Ledger D in the redesign-plan, HEAD
+   `9f7311129`). Future lever work compares against that anchor via
+   `eval-trace-bench pairwise` on paired same-commit medians.
 
 ## Maintenance
 
