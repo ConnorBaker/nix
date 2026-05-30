@@ -4,6 +4,33 @@ Based on measured cost structure of the deep-attrset workload (`python3Packages`
 outPaths via `mapAttrs`, release binary, 10,397 traces). Each claim ties to a
 counter or DB query, not speculation.
 
+> **DEEP-DIVE UPDATE (2026-05-30): six parallel sub-investigations + independent
+> verification of each load-bearing claim (file:line spot-checks by the author,
+> not just the subagents). The verified results REORDER the levers and demote
+> three of them. Summary table; per-lever detail revised below.**
+>
+> | Lever | Prior rank | VERIFIED verdict | Why |
+> |---|---|---|---|
+> | **L-C** fuse 3 hashes | 1st (cheap win) | **DEMOTED — ~30-45% of `record.hashUs` at best, not 2/3; needs a new multi-sink builder** | The 3 hashes hash DIFFERENT dep subsets (`contributesToTraceHash` excludes ImplicitStructural — verified types.hh:254-257) and write different per-dep framing (positional `dep.ordinal` + value present/absent — verified hash.hh:61-72). Only the dep-KEY *construction* is shareable; digest-update bytes are not. |
+> | **L-B** session dep-verdict memo | 2nd (cheap hot win) | **REFUTED — do not build** | The L1 cache (`currentDepHashes_`) ALREADY memoizes distinct-dep compute once per session, and the session IS shared across all 10,397 traces (verified verifier.cc:2103-2107). Per-dep residual is already a single flat_map `find` + 32-byte compare (verified verification-session.hh:72-76). L-B would add a second same-shaped hashmap, not remove work, and can't soundly skip the per-trace `idep.hash` compare. |
+> | **L-A** dep-fragment factoring | 3rd (structural fix) | **HARDEST — schema-epoch RFC with TWO blockers, not the clean win hoped** | (1) No clean fragment boundary: deps are globally sorted by `(key,hash)` (verified hash.cc:18) so a shared closure is non-contiguous AND each trace reads a different file-SUBSET of the same closure → fragments don't content-address (set-cover/frequent-itemset problem). (2) Fragment hashes can't compose: `feedDep` writes a positional `dep.ordinal` binding each dep to global rank (verified hash.hh:68) → same fragment hashes differently per trace. Storage-only variant possible but zstd already dedups intra-blob; cross-row win unquantified. |
+> | **L-D** skip cheap leaves | opportunistic | **REFUTED for this workload — wrong lever** | Distribution IS bimodal (verified: ~28% tiny <200B, ~67% large ≥2000B keys_blob) BUT lopsided: the tiny ~30% of traces hold **0.2%** of all deps. Skipping them saves ~0.2% of cold cost. Cost is in the large mode (top 50% of traces = ~79% of deps). Also: no per-trace eval-cost signal exists at record time to gate on. |
+> | **L-E** batched writeback | opportunistic | **REAL but SMALL — bounded by ~3.8s `flushUs` (single-digit % of cold)** | `flush()` IS per-trace (verified recorder.cc:77) and DOES a real COMMIT (verified lifecycle.cc:644/714), so batching is mechanically easy (pending buffers already accumulate). BUT `synchronous=off`+WAL (verified sqlite.cc) → no per-commit fsync, so the "10K fsyncs" cost model was WRONG. Recoverable cost is begin/commit + per-flush `vocab.checkpoint()`, not durability. The big cold costs (serialize ~7s + hash ~30s) are in `record()` before flush, untouched by L-E. |
+> | **L-F** access-pattern guidance | zero-code | **REFRAMED — it's about the EXPRESSION's internal access, not the consumer** | Verified: `nix eval --json` walks result attrsets via C++ `Bindings` iteration with NO per-child ExprSelect (value-to-json.cc:54-78), identical for both workloads — so the printer can't be the 3× source. The 3× came from the WORKLOAD's own `attrNames`+`${name}`-select (keyset + per-key deps) vs `mapAttrs`'s C++ iteration. So the lever is "the per-attrset access idiom used ANYWHERE in the evaluated Nixpkgs tree", and nix-eval-jobs benefits per how the *packages it evaluates* access inner sets, not per its own outer loop. |
+>
+> **Net reordering after verification:** the two I'd called cheap wins (L-C, L-B)
+> are demoted/refuted; the structural fix (L-A) is harder than hoped (epoch RFC,
+> two blockers); L-D/L-E are small or wrong here. **The honest headline: there is
+> no cheap, high-impact lever for the deep-attrset cold cost.** The cost is the
+> ~607× shared-closure dep duplication, and removing it requires either L-A's
+> epoch-RFC fragment store OR attacking the per-dep *construction* cost (L-C's
+> real but minority slice) — both real work, neither a quick win. The clearest
+> actionable items are: (1) L-F as zero-code consumer guidance (use C++ iteration
+> / avoid `attrNames`+select in hot Nixpkgs paths), and (2) a measurement of where
+> the unattributed ~3.6s of hot `verify.timeUs` actually goes (coroBlock/
+> exclusive-access hops + `loadFullTrace` deserialize, per the L-B agent) before
+> picking a hot lever — that, not L-B, is the hot opportunity. Detail below.
+
 ## The single root cause both cold and hot share
 
 Measured facts:
