@@ -256,3 +256,222 @@ warm-hits. Sketch, in dependency order:
   thunks are derivation evaluation and that a handful of derivations actually
   changed (vs. a module-fixpoint blow-up that no derivation boundary localizes).
   Do this before committing to Slice A. Needs sign-off for the build itself.
+
+---
+
+## 7. Adversarial pass over the code (2026-05-30) — what nearly breaks the design, and the mechanism it reveals
+
+A deliberate hunt for reasons Lever 2 *won't* work. Two findings invalidate
+parts of the earlier sketch; the net is a STRONGER foundation than §4 assumed,
+plus three real hazards.
+
+### Finding A — dep attribution is per-thunk via the epoch log, NOT per-trace-scope (this is GOOD)
+
+The earlier sketch assumed the recording boundary had to be *added* at
+`derivationStrict`. Reading the recording machinery shows it already exists at a
+finer level:
+
+- `DepRecordingContext::Scope` (dep-recording-context.hh:160) holds `ownDeps`;
+  `record()`/`replayMemoizedRange()` write ONLY to `currentScope()` (the back of
+  the stack). `popScope()` (dep-recording-context.hh:348) **discards** the scope
+  — child scope deps do NOT merge upward through scope nesting.
+- So how does the root trace accumulate ~233 K flat deps? Via the **epoch log**,
+  not scope nesting. `forceThunkValue` (eval.cc:1677-1705):
+  1. snapshots `epochStart = traceCtx->currentReplayEpochSize()` BEFORE eval
+     (eval.cc:1683),
+  2. evaluates the thunk (deps append to the per-EvalState epoch log),
+  3. `recordThunkDeps(v, epochStart)` (eval.cc:1694) records the range
+     `[epochStart, epochEnd)` keyed by the thunk's `Value*`
+     (`MemoReplayStore::recordThunkDeps`, memo-replay-store.hh:93 →
+     `epochMap[&v] = DepRange{...}`).
+- **Consequence: every forced thunk already has a precise, isolated dep range =
+  exactly the deps that computation read.** The string thunk that computes a
+  derivation's `outPath` already owns a clean `DepRange` of just that
+  derivation's input observations. The 16 K `depTracker.scopes` are these
+  transient capture frames; the flattening into 7 fat root traces happens when
+  the root scope replays child ranges via `replayMemoizedRange`
+  (dep-recording-context.hh:307-310).
+- **So Lever 2 does NOT need to invent dep attribution at `derivationStrict`.**
+  The per-derivation dep set already exists as an epoch range. What is missing is
+  (i) *persisting* a derivation-keyed trace from that range and (ii) *looking it
+  up* on re-eval to skip the re-force. This is a smaller change than §4's
+  "open a recording scope" framing.
+
+### Finding B — `derivationStrict` is the WRONG hook point; the thunk-force boundary is right
+
+§2/§4 named `derivationStrictInternal` (primops.cc:1624) as the choke point. The
+adversarial read shows the inputs are already forced by `forceAttrs(args[0])` at
+primops.cc:1552 *before* `derivationStrictInternal` runs, and the result attrset
+is returned directly (not behind a thunk the primop controls). So hooking inside
+`derivationStrict` would capture deps recorded AFTER the expensive input force —
+too late to skip it. The reuse decision must happen at the **thunk that produces
+the derivation value**, i.e. at the `forceThunkValue` boundary that already
+snapshots `epochStart`, BEFORE the input attrs are forced. This realigns the
+lever onto existing machinery: it is a specialization of the per-thunk epoch
+capture, gated to "this thunk is a derivation".
+
+### Hazard 1 — identifying the derivation BEFORE forcing it (the chicken-and-egg)
+
+To skip forcing a derivation's inputs, we must recognize "this thunk will produce
+derivation D" *without* forcing it — but the derivation's identity (input
+content hash) is only known AFTER forcing the inputs. This is the core tension:
+- The current cache keys a thunk by its `AttrPathId` (position), which IS known
+  before forcing. A position-keyed derivation cache would work for "same attr
+  path as last eval" but NOT for "same derivation reached at a new path" — and
+  the outlier benefit needs the latter (a moved/renamed module shifts paths).
+- Resolution options: (a) accept position-keying (`AttrPathId`) and get partial
+  benefit — likely still large, since most of the 6,397 unchanged derivations
+  ARE at stable paths commit-to-commit; (b) a two-phase scheme: force inputs
+  once to get the identity, then short-circuit *downstream* re-derivation —
+  but that doesn't save the input force, which is the cost. **(a) is the
+  realistic first slice.** This also dissolves O1: position-keying means the
+  EXISTING `AttrPathId` routing works unchanged, and Design A's synthetic `__drv`
+  namespace is only needed if/when we pursue cross-path reuse (b).
+- **This is the biggest correction to the lever:** the realistic, soundly-keyable
+  win is "an unchanged derivation AT THE SAME ATTR PATH skips re-forcing its
+  inputs" — which is just the existing per-`TracedExpr` trace working at
+  derivation granularity. The question collapses back to: *why isn't the
+  derivation's own `TracedExpr` trace already being reused?* Because there is no
+  `TracedExpr` at the derivation — the closure has only 7. See Hazard 2.
+
+### Hazard 2 — there is no `TracedExpr` at the derivation, so no per-derivation trace is recorded
+
+Confirmed earlier (record.count=7). `TracedExpr` nodes are created only by
+`materialize.cc` for attrset/list CHILDREN of a cached result. A derivation
+reached deep inside a string computation is not an attrset child of any cached
+node, so no `TracedExpr` wraps it, so no trace is recorded for it, so there is
+nothing to reuse. **This is the actual root cause and the actual work:** make
+the derivation-producing thunk a trace boundary (record a trace keyed by its
+`AttrPathId`, with its epoch-range deps as the trace's deps), so next eval can
+verify-and-skip it. Mechanism reuse: `recordThunkDeps` already has the range;
+the new code path turns "thunk at a derivation" into a `publishTrace.publish`
+with that range, and a verify-before-force lookup.
+
+### Hazard 3 — soundness: a derivation value escaping via context (the keyset-escape analogue)
+
+A served derivation result must re-verify if a consumer observed a non-output
+facet (`meta`/`passthru`/`attrNames`). The epoch-range deps capture what the
+derivation's OWN eval read, but NOT what consumers later read off the result
+attrset. The facet mask (§3) is still required, and the keyset-escape tests are
+still the soundness floor: a derivation trace consumed via `TraceValueContext`
+must re-verify the context. Finding A does not remove this obligation.
+
+## 8. Refined implementation sketch (mechanism-aligned)
+
+Supersedes §4. Smallest sound slice, reusing existing machinery:
+
+### Slice A' — record a trace at the derivation-producing thunk (position-keyed)
+1. In `forceThunkValue` (or a TracedExpr-aware wrapper), detect when the thunk's
+   result is a derivation (the result attrset has `type = "derivation"` / a
+   `drvPath` attr — checkable right after `expr->eval`).
+2. On that boundary, instead of only `recordThunkDeps(v, epochStart)`, also
+   `publish` a trace keyed by the thunk's `AttrPathId` whose deps are the epoch
+   range `[epochStart, epochEnd)` and whose `CachedResult` is the derivation
+   result attrset (drvPath + outputs — small, NOT the 233 K-dep monster). This
+   reuses `getOrCreateTrace` (content-addressed body dedup is automatic) and the
+   existing `Sessions` routing.
+   - **Why this is small:** the dep range and the result already exist in hand at
+     this point; this is a `publish` call + a derivation-detect predicate, not new
+     dep-tracking.
+3. Gate behind a new setting (default off) so it is A/B-measurable and revertible.
+
+### Slice B' — verify-before-force at the derivation thunk
+1. Before forcing a derivation-producing thunk, look up its `AttrPathId` trace
+   (existing `lookupCurrentNode` / verify path).
+2. If it verifies (its epoch-range input deps all match current state) → serve
+   the recorded result attrset, skipping the input force. This is where the
+   per-derivation input-eval (~the 58 % `make-derivation` cost) is saved for the
+   6,397 unchanged derivations.
+3. Facet-mask gate (Hazard 3): only serve if consumer-observed facets verify;
+   else fall back to fresh force. Reuse the StructuredProjection/keyset machinery
+   for the mask (O2 — confirm it already fires on `drv.<attr>` access).
+
+### Slice C' — measure, bounded
+- Storage (Hazard/O4): position-keying means ~one trace per derivation-bearing
+  attr path. Measure DB growth: if it approaches 6,419 × current blob size, the
+  result MUST be the compact `{drvPath, outputs}` (small), NOT a fat dep blob —
+  the deps live in the shared `DepKeySets`/epoch range, and the per-trace
+  `values_blob` for a derivation result is tiny. Verify the blob size is small
+  before scaling.
+- Gate: 10-commit correctness (byte-identical) + `pairwise cold/<new> vs cold/1`
+  on the outliers; the 77 fast commits must not regress from added recording.
+
+### What changed from §4 (honesty ledger)
+- §4 said "hook `derivationStrict`" → wrong; the hook is the thunk-force boundary
+  (Finding B), and dep attribution is already done (Finding A).
+- §2b's Design-A synthetic namespace is NOT needed for the first slice
+  (position-keying via existing `AttrPathId` works — Hazard 1); it is deferred to
+  a possible cross-path-reuse follow-on.
+- The lever is therefore SMALLER than first sketched for the same-path case
+  (reuse `recordThunkDeps`'s range + `publish` + verify-before-force), but its
+  CEILING is also bounded: position-keying captures the same-path unchanged
+  derivations (likely most of the 6,397) but not derivations that move paths.
+- Still gated on sign-off: it touches `forceThunkValue` (the hottest eval path),
+  so the fast-commit non-regression measurement (Slice C') is mandatory before
+  it can land.
+
+## 9. Decisive feasibility finding — Slice B' has a chicken-and-egg (verified)
+
+A deeper read of the interception mechanism exposes a fundamental obstacle that
+§8's Slice B' glossed over.
+
+**How the cache intercepts before forcing:** `TracedExpr::eval` (the `Expr::eval`
+override) is the ONLY pre-force hook — it runs verify → materialize-or-fresh
+*instead of* the real evaluator, and it works ONLY because the value is a
+`TracedExpr` thunk (`v.mkThunk(env, tracedExpr)`). Plain Nix thunks have
+`expr = ExprCall/ExprAttrs/...` and `forceThunkValue` dispatches straight to the
+real evaluator — no interception possible.
+
+**The chicken-and-egg:** to verify-before-force a derivation (and thereby skip
+its input force — the actual ~58 % saving), the derivation's thunk must BE a
+`TracedExpr`. But `TracedExpr` thunks are installed ONLY by `materialize.cc`
+(`installChildThunk`), and ONLY for attrset/list children of an
+already-materialized cached result. A derivation reached deep inside a
+string-producing computation is NOT an attrset child of any cached node — so
+nothing installs a `TracedExpr` there, so there is no pre-force hook, so Slice B'
+cannot intercept it.
+
+**What Slice B' actually requires:** installing `TracedExpr` wrappers at
+derivation-producing thunks *during the cold/prior eval* — i.e. intercepting
+derivation thunk CREATION in the core evaluator (where `mkThunk` builds the
+derivation's thunk), not in the eval-trace materialize layer. That is a far more
+invasive change: it touches `EvalState`'s thunk allocation / `ExprCall` handling
+for `derivation`/`derivationStrict`, threading a `TracedExpr` wrapper into a hot,
+central evaluator path used by ALL evaluation, not just warm cache hits.
+
+**Honest consequence:** Lever 2 is bigger than §8 implied.
+- Slice A' (RECORD a derivation-keyed trace from the existing epoch range) is
+  still feasible and small — but recording alone yields NO speedup (it is the
+  passive-metadata trap the work-log already hit: a recorded trace that nothing
+  consumes). Recording is only worth doing if B' can consume it.
+- Slice B' (the speedup) needs core-evaluator interception to put a `TracedExpr`
+  at the derivation, which is the genuinely hard, high-blast-radius part. The
+  v53-era work and the CLAUDE.md "derivationStrict outside scope" note are
+  consistent with this being deliberately avoided.
+- **Alternative worth considering instead of evaluator interception:** rather
+  than per-derivation `TracedExpr` wrapping, attack the SAME outlier via the
+  existing 7-trace structure made finer at the ATTRSET boundaries that DO exist
+  between the root and the string leaves (the `closures`/`gnome`/`<system>` attr
+  path has a few real attrset levels). But the diagnostic showed those levels are
+  shallow (the cost is below them, in the string computation), so this likely
+  does not reach the derivation cost. Confirm with a per-attr-level trace count
+  before pursuing.
+
+**Revised recommendation.** Do NOT start Lever 2 as a quick prototype. The
+recording half is cheap but inert; the consuming half requires core-evaluator
+surgery (TracedExpr at derivation creation) that is the largest-blast-radius
+change considered in this whole research arc. Before any build, the decisive
+cheap experiment is: **a throwaway spike that installs a `TracedExpr` wrapper at
+derivation thunks and counts how many derivations become cache-verifiable** —
+measuring feasibility + the fast-path non-regression on the 77 fast commits —
+WITHOUT yet wiring full verify/serve. If that spike shows the evaluator
+interception is tractable and non-regressing, proceed; if it perturbs the hot
+path measurably (likely, given the vptr-in-hot-loop lesson from the
+rearchitecture reversal), Lever 2 is not worth it and the cold tail stays a
+known, bounded cost (23 outlier commits, soundness-correct, just slow).
+
+This is the most important finding of the adversarial pass: **the lever's
+speedup half is gated on core-evaluator interception, not an eval-trace-layer
+change — reclassifying Lever 2 from "large but localized" to "high-blast-radius
+core-evaluator work," and strengthening the case to leave the cold tail as-is
+unless a cheap feasibility spike proves otherwise.**

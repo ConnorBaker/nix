@@ -164,17 +164,35 @@ caching. Full sketch + slices + open questions:
 **`plans/lever2-derivation-boundary-caching.md`**. lever1 doc §"Design-question 1
 RESOLVED — THE REFRAME" has the reasoning.
 
-**O1 (keying) RESOLVED by schema study (2026-05-30, lever2 doc §2b):** NOT the
-schema-change blocker first feared. `Traces` are already content-addressed
-(dedup by `full_hash`) and attr-path-independent — two paths producing the same
-derivation already share a Traces row. Only the `Sessions`/`History` ROUTING
-layer is attr-path-keyed. Recommended fix = Design A: mint a synthetic `__drv`
-namespace in the attr-vocab (`internName` accepts arbitrary strings, so
-`"__drv:<contenthash>"` is a valid `AttrNameId`), routing derivation traces
-through the EXISTING Sessions/History/recovery pipeline with zero schema change.
-Remaining true blockers are the facet mask (§3) and the storage budget (6,419
-derivations/commit × fat blobs = v53 explosion → needs compact per-derivation
-records first), not keying.
+**O1 (keying) RESOLVED (2026-05-30, lever2 doc §2b):** not a schema change —
+`Traces` are already content-addressed/attr-path-independent; only Sessions/
+History routing is attr-path-keyed (Design A reuses it).
+
+**ADVERSARIAL PASS (2026-05-30, lever2 doc §7-9) RECLASSIFIES Lever 2 from
+"large but localized" to "high-blast-radius core-evaluator work."** Key findings:
+- (GOOD) Dep attribution is ALREADY per-thunk: `forceThunkValue` (eval.cc:1683-94)
+  snapshots `epochStart` then `recordThunkDeps(v,epochStart)` captures each
+  thunk's own dep range. A derivation's input deps already exist as a clean epoch
+  range — no new dep-tracking needed.
+- (CORRECTION) The hook is NOT `derivationStrict` (its inputs are already forced
+  by `forceAttrs` at primops.cc:1552 before it runs); it is the thunk-force
+  boundary.
+- (DECISIVE) The speedup needs verify-BEFORE-force, and the ONLY pre-force hook
+  is `TracedExpr::eval` — which works only if the derivation's thunk IS a
+  `TracedExpr`. Those are installed only by `materialize.cc` for attrset children
+  of a cached result; a derivation deep in a string computation is not such a
+  child. So Slice B' (the speedup) requires installing `TracedExpr` wrappers at
+  derivation thunk CREATION in the core evaluator — high-blast-radius, touching
+  the hot path used by ALL eval (cf. the rearchitecture vptr-in-hot-loop reversal).
+- Recording alone (Slice A') is cheap but INERT (passive-metadata trap the
+  work-log already hit). 
+
+Revised recommendation: do NOT prototype Lever 2 directly. The cheap decisive
+experiment is a throwaway spike installing `TracedExpr` at derivation thunks,
+counting how many become cache-verifiable AND measuring fast-commit
+non-regression — before any real wiring. If it perturbs the hot path (likely),
+leave the cold tail as-is (23 outliers, soundness-correct, bounded). Facet mask
+(§3) + storage budget (6,419 derivs/commit) remain on top of all this.
 
 ## Current benchmark anchors
 
