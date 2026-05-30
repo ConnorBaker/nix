@@ -1,5 +1,17 @@
 # Eval-trace Cache Findings
 
+> **Provenance — read `eval-trace-cache-README.md` first.** This doc records
+> durable conclusions from the **abandoned transparent-rewrite / command-JSON /
+> v53 lineage** (Ledger A). The conclusions are valid and the baseline commit
+> (`92a3df1ab`) is the current tree's base, but the experiment *code* this doc
+> discusses is not in the tree, and its "back on origin src" framing is
+> lineage-historical, not a description of HEAD. The authoritative forward
+> ordering lives in the README's canonical lever list and in
+> `eval-trace-cache-redesign-plan.md` (the 2026-05-29 CORRECTION supersedes the
+> "Promising Directions" below where they conflict). Numbers here are per-commit
+> **means** on `closures.gnome`; do not compare them against the redesign-plan's
+> run **totals**.
+
 This document extracts durable decisions from the raw work log. It is backed by
 the more detailed experiment catalog in `eval-trace-cache-experiment-catalog.md`.
 Routine command transcripts belong in `eval-trace-cache-work-log.md`.

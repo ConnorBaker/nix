@@ -1,5 +1,11 @@
 # Eval-trace SQLite writeback findings
 
+> **Provenance — read `eval-trace-cache-README.md` first.** Storage-lineage
+> (Ledger B) checkpoint for the SQLite writeback refactor. SQLite is the
+> current tree's backend, so the architecture notes here are live, but the
+> forward direction and lever ordering are owned by
+> `eval-trace-cache-redesign-plan.md` (2026-05-29 synthesis).
+
 This is a checkpoint for the SQLite eval-trace refactor and writeback-performance investigation.
 
 ## Replacement task list

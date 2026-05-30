@@ -1,5 +1,12 @@
 # Eval-trace Cache Experiment Catalog
 
+> **Provenance — read `eval-trace-cache-README.md` first.** Decision-level
+> extraction for the **abandoned transparent-rewrite / command-JSON / v53
+> lineage** (Ledger A, per-commit means). Conclusions and the "Transferable
+> Ideas" / "Non-transferable" lists are durable; the experiment code is not in
+> the tree. For the current forward ordering see the README's canonical lever
+> list and the redesign-plan's 2026-05-29 CORRECTION.
+
 This is a decision-level extraction from `eval-trace-cache-work-log.md`. It is
 not a replacement for the raw log; it captures benchmark-significant results,
 rejected paths, and ideas that may transfer to the next implementation slice.

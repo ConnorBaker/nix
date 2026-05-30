@@ -1,5 +1,14 @@
 # Eval-trace cache rewrite task list
 
+> **Provenance — read `eval-trace-cache-README.md` first.** This is the raw
+> 16k-line running log underlying BOTH research lineages (storage and
+> transparent-rewrite). It is primary evidence, not a conclusion source — the
+> distilled conclusions live in `eval-trace-cache-findings.md`,
+> `eval-trace-cache-experiment-catalog.md`, and the authoritative 2026-05-29
+> synthesis in `eval-trace-cache-redesign-plan.md`. Run numbers here span all
+> three benchmark ledgers; always check which ledger a number belongs to before
+> quoting it.
+
 ## Goal
 
 Replace mutable SQLite/session-row cache authority with immutable,

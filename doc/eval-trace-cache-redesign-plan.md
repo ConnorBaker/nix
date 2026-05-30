@@ -1,5 +1,15 @@
 # Eval-trace cache redesign plan
 
+> **This is the living plan and the authoritative forward doc for the current
+> tree.** Start at `eval-trace-cache-README.md` for the consolidated index and
+> benchmark-ledger reconciliation. Within this file, the two closing
+> 2026-05-29 sections (*deep-research synthesis* and *CORRECTION after thorough
+> work-log read*) are the current canonical direction; the CORRECTION
+> supersedes earlier sections where they conflict. Benchmark anchors here are
+> Ledger B (storage lineage): 100-commit `closures` run **totals** and means,
+> not the findings-doc per-commit means. No perf code has changed since
+> baseline `92a3df1ab`; every anchor predates HEAD.
+
 This is the living plan for the eval-trace cache redesign. Update it when
 benchmarks, implementation work, or adversarial review changes the direction.
 

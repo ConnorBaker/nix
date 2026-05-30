@@ -1,5 +1,12 @@
 # Evaluation trace storage backend research
 
+> **Provenance — read `eval-trace-cache-README.md` first.** Storage-lineage
+> (Ledger B) backend survey (Git pack / LSM / mmap design priors). This is
+> lever 4 in the canonical list — explicitly deferred until the proof model
+> (levers 1–3) demonstrates a win; per the 2026-05-29 synthesis, storage format
+> is downstream of authorization. Direction only; the backend is not replaced
+> in the current tree.
+
 This note records the current performance findings and the proposed direction for
 moving eval-trace storage away from SQLite when a custom format is the better
 fit. The benchmark target is not to match the pre-schema SQLite cache. The target
