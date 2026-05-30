@@ -97,15 +97,26 @@ re-abstracting the storage backend behind a vptr. (Sources: catalog.md
 
 ## How the keyset work fits
 
-The keyset-dep **downgrade** (harness + design landed; prototype deferred —
-`plans/keyset-provenance-differential-harness.md`,
-`plans/keyset-downgrade-sound-by-construction.md`) is the test/soundness
-groundwork for **lever 1**: pruning a construction-only `#keys` observation is
-exactly the "prune coarse deps" move, and the cross-trace keyset-escape tests
-(`src/libexpr-tests/eval-trace/store/keyset-escape.cc`) pin the soundness floor
-that any such prune must respect. Lever 1's unsolved `attrNames` /
-negative-membership / recursive-attrset coverage is the same complete-keyset
-authority gap tracked there and in OR-4.
+Lever 1 is split across two design docs and a soundness scaffold:
+
+- **`plans/lever1-observed-key-pruning.md`** — the lever-1 design draft. Frames
+  it as greenfield on HEAD (the v6→v11 machinery was removed with the
+  command-JSON layer, 2026-05-27), names the two sub-levers (2a attrset `#keys`,
+  2b by-name `DirectoryEntries`), and gates the build on the Step-1 diagnostic.
+  The **by-name directory case (2b)** is the net-new surface here — no other doc
+  covers it, and it is the likely driver of the cold outliers.
+- **`plans/keyset-downgrade-sound-by-construction.md`** + **`…-differential-
+  harness.md`** — the attrset-`#keys` sub-lever (2a) design + test harness
+  (prototype deferred). Pruning a construction-only `#keys` observation is
+  exactly the "prune coarse deps" move.
+- **`src/libexpr-tests/eval-trace/store/keyset-escape.cc`** — pins the
+  cross-trace soundness floor any prune must respect (a coarse dep can escape
+  via `TraceValueContext`/`ParentSlot` to a consumer that doesn't exist at the
+  producer's finalization). Lever 1's 2b case needs its own by-name escape test.
+
+Lever 1's unsolved `attrNames` / negative-membership / recursive-attrset
+coverage is the same complete-keyset authority gap tracked in those docs and in
+OR-4.
 
 ## Discipline (applies to every lever)
 
