@@ -84,11 +84,28 @@ findings-doc "Promising Directions". Each lever traces to repo text; the
 | **3** | **Certificate-before-payload** fast path (fixed-size `FullTraceHash` compare before `loadFullTrace` + dep walk) | LOW priority. Every *sound* form was already refuted on this workload (runs 909/980/987/1032/1042/1133/1107/1108…). The dep walk IS the hot cost for true exact hits (unsound oracle run 1015: hot 0.68 vs 0.88 s), but the residual hot cost is decode/startup, not the walk, once the `verifiedTraceIds` memo is in place. Only un-refuted shape: a cheap per-current-node eligibility bit/index that clears the run-993 coverage bar. | redesign-plan §2026-05-29 CORRECTION finding 1 |
 | **4** | **Custom immutable-segment store** (generation packs, mmap fixed-width indexes, lock-free readers, atomic `CURRENT`) | Deferred until 1–3 prove the proof model wins. Storage format is **downstream of authorization**: run 137 showed lazy-payload-over-immutable-objects does NOT beat SQLite without the authorization fix. Do NOT re-abstract `TraceStorage` (the vptr was added per rearch-proposal §2.1, measurably hurt the hot loop, and was reversed). | redesign-plan "Architectural direction" + §2026-05-29 finding 4; storage-backend-research.md |
 
-## DEEP-ATTRSET WORKLOAD FINDING (2026-05-30) — the cache is net-negative on `nix-eval-jobs`-shape loads
+## DEEP-ATTRSET WORKLOAD FINDING (2026-05-30) — ⚠️ METHODOLOGY UNSOUND, NUMBERS RETRACTED, RE-RUN PENDING
 
-Option 2 below (benchmark a deep-attrset workload) was run. **Result: on the
+> **RETRACTION (2026-05-30, self-audit):** the magnitude numbers below were
+> produced with a **`-O0` debug meson build** (`build/`, `buildtype=debug,
+> optimization=0, b_ndebug=false`), whereas the GNOME Ledger-D baseline used a
+> **release** `nix build` binary. The eval-trace recording path is exactly the
+> code `-O0` penalizes most, so **"12× cold" is inflated by an unknown factor and
+> the deep-attrset-vs-GNOME comparison is invalid** (two different compilers'
+> output). Additionally: (a) the cross-commit A→B run captured only wall time, NOT
+> hit/miss counters, so "reuse delivers nothing" cannot be distinguished from "B
+> matched ~nothing in A's cache"; (b) n=1, no repetition; (c) shared
+> `NIX_CACHE_HOME`/system store vs GNOME's isolated `_state` harness; (d) the
+> workload's `tryEval`+`?outPath` guard may short-circuit an unknown fraction.
+> **The DIRECTIONAL structural fact survives** (a deep attrset records ~3,000
+> per-package traces vs 6 for GNOME — build-independent, from `record.count`), but
+> every wall-time magnitude and the "net-negative / disable it" conclusion are
+> RETRACTED pending a release-binary re-run with hit/miss capture and repeats.
+> Original (unsound) text retained below struck-through for the audit trail.
+
+~~Option 2 below (benchmark a deep-attrset workload) was run. **Result: on the
 workload that matters most for the cache's purpose, the cache is all cost and no
-benefit.** Measured on `python3Packages` outPaths (a ~3,000-package deep attrset,
+benefit.**~~ *(retracted — see above)* Measured on `python3Packages` outPaths (a ~3,000-package deep attrset,
 the `nix-eval-jobs` shape), nixpkgs commit `9b9f7241`, wall clock:
 
 | Mode | Wall | vs reference |
