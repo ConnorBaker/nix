@@ -328,6 +328,9 @@ against code + the cold DB:
   the (fully-built, memoized) edge-verify machinery `resolveTraceContextHash`
   unused. **eval-trace ties identity to syntactic position in the output tree;
   the build layer ties it to content of inputs.** That is the architectural gap.
+- **Concrete design:** `plans/compositional-trace-dag-design.md` — what to
+  capture and why it's tractable (you do NOT hash every value; you edge to the
+  ~thousands of boundary-eligible nodes that already have stable identities).
 - **Direction:** lift the build layer's CA model to evaluation — content-address
   sub-results as trace-DAG nodes referenced by edge, not flattened. RFC-scale
   (it's the `content-addressed-trace-node` work Lever 2 also needs), but it is
