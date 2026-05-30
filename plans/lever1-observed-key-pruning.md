@@ -91,79 +91,71 @@ partial recovery** — on root-trace verify failure, descend and re-verify only 
 changed sub-traces instead of re-evaluating the whole root. See the redesign-plan
 2026-05-30 "Step-1 diagnostic — RESOLVED" section.
 
-### Design-question 1 RESOLVED (2026-05-30, code feasibility study)
+### Design-question 1 RESOLVED (2026-05-30, code + DB study) — THE REFRAME
 
-*Why aren't the 16,352 recorded sub-traces independently verifiable on the warm
-path, and can a failed root re-enter per-child cache lookups?*
+*Why only ~7 traces, and can a failed root reuse finer sub-traces?* Resolved
+definitively against the code AND the cold-stats SQLite DB. **This supersedes
+both earlier passes in this section's git history; the "wrap attrset children"
+framing was on the right track but mislocated the cost.**
 
-Traced through `trace-session.cc` + `materialize.cc`:
-- **Cache-routing = `TracedExpr` child thunks.** A child verifies per-leaf (the
-  OR-3 contract) ONLY when its `Value` is a `TracedExpr` thunk. Those are
-  installed by `installChildThunk` → `TracedExpr::makeChild`, called from
-  **`materialize.cc` only** (lines 414/486), i.e. only when a trace VERIFIES and
-  its `CachedResult` is materialized — iterating the *cached* `attrs->entries`.
-- **A failed root produces plain thunks.** Root verify miss →
-  `evaluateFresh` (trace-session.cc:236-239) → `getRealRoot()` →
-  `rootLoader()` (trace-session.cc:448-455) = the **plain Nix evaluator**. Its
-  attrset children are ordinary Nix thunks, NOT `TracedExpr`. The benchmark's
-  `--json` deep-forces the whole structure with the ordinary evaluator, which
-  **never touches the cache** — so the 16K sub-traces are unreachable not because
-  they're un-verifiable but because the *values aren't cache-routed*.
+The hard evidence (full-cold first commit `8f443eb` + DB `db-inspect`):
+- `thunks.forced = 7`, `thunks.created = 55`, `record.count = 7`. Across all 100
+  commits the DB holds **`Traces = 93`, `Results = 38`, `DepKeySets = 70`** — a
+  handful of distinct trace structures total.
+- Each trace's `values_blob` is **100 KiB–1 MiB** (87 of 93 rows): one
+  system-closure trace carries a **flat ~233 K-dep** set. `DataPaths = 67,881`
+  (structured-projection dep-key granularity) and `depTracker.scopes = 16,357`
+  are **dep-key / dep-recording-frame** counts, NOT trace counts. They fold into
+  the 7 traces.
+- **The killer fact:** `closures.gnome.<system>` is a **string** (a store path
+  `/nix/store/…-nixos-system-…`), not an attrset. Computing that string forces
+  the ENTIRE NixOS system derivation — ~10 M thunks of module-system + package
+  evaluation — **inside a single `TracedExpr` leaf**. `thunks.fromDataFile =
+  26,386` are structured-data nodes, not cache-routed attr children.
 
-**Verdict (CORRECTED): Lever 5 is a RECORDING-granularity change, not a
-warm-path reuse change.** The original framing assumed 16K recorded sub-traces
-existed to reuse; they don't (record.count≈7). So the lever is two-sided:
-1. **Record finer:** the cold pass must record more than 7 coarse traces — it
-   must persist addressable sub-traces at intermediate attr-path nodes
-   (`makeChild` already builds the pathIds; the question is which nodes get a
-   *recorded trace* vs collapse into a transient `DepCaptureScope`).
-2. **Reuse finer:** on root verify miss, wrap the fresh `rootLoader()` attrset's
-   children as `TracedExpr` thunks (same `makeChild`/`installChildThunk`, driven
-   by fresh keys) so each child force re-enters the cache and warm-hits its own
-   recorded sub-trace.
+**The reframe.** The cost is NOT a deep attrset *data structure* whose children
+we failed to wrap (`installChildThunk` correctly wraps the ~55 attrset children
+that exist). The cost is a deep *computation* behind ~7 coarse leaf traces:
+`closures.gnome` is structurally shallow (root → a few attrset levels → 2 string
+leaves) but each leaf string is the output of evaluating a whole OS. There are
+**no intermediate `TracedExpr` data nodes inside the system-closure computation
+to reuse** — you cannot sub-trace an attrset that does not exist. So the
+"wrap attrset children as `TracedExpr` in both passes" plan from the prior pass
+**does not address the outlier**: there are no unwrapped attrset children on the
+hot path; there is one giant string-producing computation.
 
-Both are needed: (2) without (1) finds nothing to hit; (1) without (2) records
-sub-traces that the fresh-walk still bypasses.
+**What the real lever therefore is.** To reuse work when 0.1 % of a system
+closure's inputs change, the cache must record at boundaries that exist *inside
+the computation*, not on the (nearly absent) output data structure. The only
+natural such boundary is the **derivation**: a NixOS system closure is a DAG of
+~thousands of `derivation` calls, and a one-module change perturbs a handful of
+them. Caching keyed by **derivation identity / output-path** (each `mkDerivation`
+result as a reusable unit) is **lever 2 (semantic derivation-boundary)**, not a
+`TracedExpr`-child change. Lever 5 as "incremental sub-trace reuse" only helps
+workloads whose cost is a deep *attrset* (e.g. `nixpkgs.<pkg>` enumeration);
+`closures.gnome` is the opposite shape.
 
-The likely reason only ~7 traces record today (to confirm next): a trace is
-recorded per `TracedExpr` that is *forced through the cache*, and on the cold
-pass only the 7 roots are `TracedExpr`s — the deep `--json` force of each root
-runs the ordinary evaluator over plain thunks, opening 16K transient
-`DepCaptureScope`s that all fold into the one root trace. So **finer recording
-ALSO requires installing `TracedExpr` children on the cold pass**, not just the
-warm path. That makes (1) and (2) the same mechanism applied in both passes:
-wrap attrset children as `TracedExpr` whenever an attrset is produced (cold) or
-re-entered (warm-miss).
+**Consequence for the lever ranking (corrected again, honestly):** for the
+`closures.gnome` benchmark, the outlier lever is **lever 2 (derivation-boundary
+caching)**, because the re-eval cost lives inside derivation computations behind
+string leaves. Lever 5 (finer attrset sub-trace reuse) is real but targets a
+DIFFERENT workload shape (deep attrset enumeration like `nix-eval-jobs` over
+`pkgs`), where it would convert root-level misses into per-package hits. Both are
+worth stating; neither is lever 1.
 
-Open sub-questions (the NEXT step, needs prototyping + measurement):
-1. **Granularity/overhead tradeoff.** Recording a trace per intermediate node
-   across a NixOS system closure could be a LOT of traces (the 16K scope count
-   is the upper bound). Recording + storing 16K traces/commit has cold-write and
-   DB cost — the v53 capsule rewrite failed exactly by storing too much. What
-   intermediate granularity captures the reuse win without exploding storage?
-   (e.g. record at module / derivation boundaries, not every attr.) This ties
-   Lever 5 to lever 2's derivation-boundary idea.
-2. **`rootLoader` shallow-force.** To wrap children we force the fresh root one
-   level (enumerate keys) without deep-forcing. Is a shallow force cheap, or does
-   the `closures.gnome` root force children eagerly? (Measure: shallow
-   `forceValue(root, noPos)` thunk count.)
-3. **pathId stability.** A re-entered child must get the same `AttrPathId` the
-   cold pass recorded under. Confirm `makeChild`'s parent-chain pathId is stable
-   across cold-record vs warm-fresh-reentry.
-4. **Soundness vs the failed parent (design-q 2).** A child served while its
-   parent failed verify: validity must rest on the child's OWN deps. Exactly the
-   keyset-escape / cross-trace concern — a child depending on a parent-mediated
-   value (TraceValueContext / ParentSlot) must still re-verify that context. An
-   analogous "parent-failed, child-served" test is owed.
-5. **Recursion.** Naturally recursive if every `TracedExpr` child wraps its own
-   children on force — confirm it falls out for free.
-
-Cost model: machinery is ~ms/trace; reusing N unchanged sub-traces at ~50 µs
-each must beat the ~13 s re-eval. BUT the recording side adds cold-write cost for
-the finer traces, and we have NO datapoint for how many sub-traces a real outlier
-would verify (only 7 roots are entered today). Both the reuse win AND the
-recording cost must be measured on a prototype before committing — this is the
-gating experiment, and it is squarely a hot/cold-path build (needs sign-off).
+Open sub-questions, now split by lever:
+- **Lever 2 (the `closures.gnome` outlier fix):** does any derivation-level
+  identity already get recorded (`DerivedStorePath` deps exist — do they enable
+  output-path reuse, or only invalidation)? Can a `mkDerivation` result be served
+  from cache by drvPath without re-evaluating its inputs? What is the soundness
+  obligation (the changed-package oracle was rejected because parents depend on
+  non-output attrs/passthru — a facet mask is needed)? This is the open frontier
+  the redesign-plan 2026-05-29 finding 3 already named.
+- **Lever 5 (different workload):** to validate it helps `nix-eval-jobs`-shape
+  loads, benchmark a DEEP-ATTRSET workload (e.g. `--workloads` over a wide
+  package set), not `closures.gnome`. Only then do the child-wrap sub-questions
+  (shallow-force cost, pathId stability, parent-failed-child-served soundness,
+  recursion) become the gating experiment.
 
 The §1–§7 below are **retained as the enumerated-set design** (still valid IF
 hypothesis 1 holds at module-set granularity, and still the right home for the

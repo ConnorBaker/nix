@@ -139,19 +139,30 @@ root verify fails.
   the cold record pass and the warm-miss fresh pass produce plain Nix thunks that
   bypass the cache. Lever 5 = apply the child-wrap in both passes.
 
-Design questions before any build (the next research step, not yet taken):
-1. Can `evaluateFresh` (or `navigateToReal`) re-enter per-child cache lookups
-   for a failed root's children, so the 99.9% unchanged sub-traces warm-hit?
-   What breaks the realRoot-walk's freshness assumption if it does?
-2. Soundness: serving a sub-trace whose parent root failed verify — the
-   keyset-escape / cross-trace work is directly relevant (a child's validity
-   must rest on its own deps, not the parent's invalidated state; the
-   per-leaf contract already asserts this for cache-reached children).
-3. Is the cost of 16K per-child verifies (vs 7 root verifies) less than the
-   ~13 s re-eval it avoids? The diagnostic says machinery is ~ms/trace, so
-   16K × ~ms could still beat 20M-thunk re-eval — but must be measured.
+**SUPERSEDED 2026-05-30 by a deeper code+DB+profiler study — the outlier lever
+is LEVER 2 (derivation-boundary), not Lever 5.** The "wrap attrset children"
+framing was mislocated. Decisive evidence:
+- `closures.gnome.<system>` is a **string** (a store path), not an attrset.
+  Producing it forces the whole NixOS system derivation (~20 M thunks) inside a
+  single `TracedExpr` leaf. There are NO intermediate attrset sub-traces to
+  reuse — the closure is data-shallow but computation-deep. `installChildThunk`
+  already wraps the ~55 attrset children that exist; the cost isn't there.
+- DB: `Traces=93` total across 100 commits, each `values_blob` 100 KiB–1 MiB
+  (~233 K flat deps). The 16 K `depTracker.scopes` are dep-keys, not traces.
+- The only reuse boundary INSIDE the computation is the **derivation**.
+  `closures.gnome.x86_64-linux` = **6,419 derivations**; between an outlier and
+  its predecessor **6,397 are identical, 22 changed (99.66 % reuse opportunity)**.
+- Flamegraph (leaf-frame): **~58 % of eval cost is `make-derivation`/pkgs**
+  (cacheable at the derivation boundary), ~25 % is the `lib/modules.nix`
+  fixpoint (the floor that re-runs anyway). Realistic ceiling: ~halve the
+  outlier re-eval, not eliminate it.
 
-See `plans/lever1-observed-key-pruning.md` §0 for the full counter dump.
+So Lever 5 (attrset sub-trace reuse) is real but targets a DIFFERENT workload
+(deep-attrset enumeration, e.g. `nix-eval-jobs` over `pkgs`), NOT
+`closures.gnome`. The `closures.gnome` outlier fix is derivation-boundary
+caching. Full sketch + slices + open questions:
+**`plans/lever2-derivation-boundary-caching.md`**. lever1 doc §"Design-question 1
+RESOLVED — THE REFRAME" has the reasoning.
 
 ## Current benchmark anchors
 
