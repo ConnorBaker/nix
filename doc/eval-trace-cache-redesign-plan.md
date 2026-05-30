@@ -57,6 +57,41 @@ first commit (`8f443eb` 10.3 s vs 6.4 s median) is checkout/cold-disk warmup,
 not signal. Run data on disk under `eval-trace-bench-results/{reference,cold/1,
 hot/1}/` (gitignored, ~2.5 GB; manifests carry full provenance).
 
+## 2026-05-30 Step-1 diagnostic — what the cold outliers actually are
+
+Follow-up to the Ledger-D baseline: a `--with-stats` run (`cold-stats/2`,
+written to a separate namespace so it can't contaminate clean wall runs) +
+`classify`. This is the first phase-level decomposition of the current tree's
+cold tail, and it **redirects the lever choice** away from the prior lineage's
+assumption.
+
+Findings:
+- The 23 cold outliers are `partial-miss` (15 commits, 11.75 s, 47.6% hit,
+  **55% recovery failure**) and `full-miss` (7 commits, 12.14 s, 36.7% hit,
+  **100% recovery failure**). The 78 fast commits run ~1.0–1.8 s.
+- **`nrThunks`: ~20.9M on outliers vs ~268K on fast commits (78×).** The cost is
+  the **re-evaluation itself** (CPU 13–14 s), not trace machinery — recovery
+  329–615 ms, structural-variant 170–380 ms, verify ~580–844 ms are all
+  milliseconds against seconds of miss cost.
+- Hit-path: **primary cache 0%**; DirectHash recovery 98.4%, StructVariant
+  37.7%, history bootstrap 67.2%. Everything is served via recovery; outliers
+  are recovery *failures* cascading to full re-eval.
+- **The outliers are NOT by-name / enumerated-set churn.** Worst outlier
+  `9b9f7241` (17.6 s) changes only `nixos/.../autossh-ng.nix` (one NixOS module,
+  zero packages) yet re-evals ~20M thunks. The workload is `closures.gnome` = 2
+  NixOS *system closures*; a change anywhere reachable by the closure defeats
+  recovery for the whole closure.
+
+Redirect: the outlier lever is **closure-localization of a deep change**
+(lever-2-adjacent: why does a one-module edit force 20M-thunk re-eval?), NOT
+lever-1 enumerated-set pruning. Two hypotheses to resolve via per-commit `logs`
+on an outlier before any build: (1) an over-coarse top-level dep (whole
+`nixos/modules` set) that any module edit invalidates — enumerated-set lever
+applies but at module-set granularity; (2) recovery genuinely can't localize the
+changed subtree — a structural-variant precision gap. See
+`plans/lever1-observed-key-pruning.md` §0 for the full evidence and the next
+diagnostic step.
+
 ## Current benchmark anchors
 
 | Run | Backend shape | Cold wall | Hot wall | Notes |

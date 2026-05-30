@@ -1,7 +1,77 @@
 # Lever 1 — observed-key / unobserved-change pruning, sound by construction
 
-**Status:** DESIGN DRAFT. No production code. Companion to the diagnostic run
-(Step 1 below) that must land before any prototype.
+**Status:** DESIGN DRAFT — **PARTIALLY REDIRECTED by the 2026-05-30 diagnostic
+(§0). Read §0 first.** The Step-1 diagnostic has run; its evidence falsifies
+this draft's original assumption that by-name directory churn drives the cold
+outliers. Lever 1 as written (enumerated-set pruning) is **not** the main prize
+on the `closures.gnome` workload. No production code. 
+
+## 0. Step-1 diagnostic results (2026-05-30, `cold-stats/2`/`hot-stats/2`, HEAD `9f7311129`)
+
+Ran `generate --with-stats` (writes to `cold-stats/<n>` / `hot-stats/<n>` — a
+separate namespace, so stats never contaminate clean wall runs) + `classify`.
+**This redirects the lever.**
+
+What the 23 cold outliers actually are (`classify` B0–B4):
+- They split into `partial-miss` (15 commits, 11.75 s mean, 47.6% hit rate,
+  **55% recovery failure**) and `full-miss` (7 commits, 12.14 s, 36.7% hit,
+  **100% recovery failure**). The 78 fast commits are `hit-only`/`no-recovery`
+  at ~1.0–1.8 s.
+- **`nrThunks` is the smoking gun:** outliers evaluate **~20.9M thunks vs ~268K**
+  for fast commits — a **78× re-eval blowup**. The cost is dominated by the
+  **re-evaluation itself** (CPU 13–14 s), NOT trace machinery: the miss-cost
+  decomposition shows recovery 329–615 ms, structural-variant 170–380 ms, verify
+  ~580–844 ms — all *milliseconds* against *seconds* of miss cost.
+- **Hit-path distribution:** primary cache **0%**; DirectHash recovery 98.4%,
+  StructVariant recovery 37.7%, history bootstrap 67.2%. Even fast commits are
+  served via *recovery*, never primary. The outliers are where recovery *fails*
+  and cascades to full re-eval.
+
+What the outlier commits actually change (checked against nixpkgs):
+- Worst outlier `9b9f7241` (17.6 s): touches **only `nixos/.../autossh-ng.nix`**
+  — one NixOS module, **zero by-name files, not even a package**. Yet it
+  re-evals ~20M thunks.
+- Others are mixed: `8824e633` (element-call bump, 2 by-name files),
+  `dfbd61a9` (streamz bump, **0 by-name**), `b1f9d94c` (opencode bump, 1 by-name).
+- **The workload is `closures.gnome` = 2 NixOS *system closures*
+  (`aarch64-linux`, `x86_64-linux`).** A change anywhere reachable by the GNOME
+  system closure (a module, a transitively-included package) defeats recovery
+  for that whole closure and forces near-full re-eval.
+
+**Conclusion / redirect:** the outliers are **recovery failures on the deep
+NixOS system-closure structure**, not enumerated-set (by-name / `#keys`) churn.
+The original §1–§6 framing (prune coarse `DirectoryEntries`/`#keys` when only
+unobserved members changed) does **not** address `9b9f7241` — there is no
+enumerated set whose unobserved member changed; a module deep in the closure
+changed and the recovery path couldn't localize it. This points at **lever 2
+(semantic derivation-boundary / closure-localization)**, not lever 1, as the
+outlier lever for this workload.
+
+**Open question for the next step:** *why* does a one-module change cause 100%
+recovery failure + 20M-thunk re-eval, when the GNOME closure's dependence on
+that module is narrow or nil? Two hypotheses to test before any build:
+1. **Over-coarse top-level dep:** the system-closure trace records a coarse dep
+   (whole `nixos/modules` listing, or the module-set attrset) that any module
+   edit invalidates — the enumerated-set lever WOULD then apply, but at the
+   module-set granularity, not by-name packages. (Re-examine with `--with-stats`
+   + per-commit `logs` on `9b9f7241`.)
+2. **Recovery can't localize:** the change genuinely flows into the closure but
+   recovery re-evals far more than the changed subtree — a precision gap in
+   structural-variant recovery, distinct from both levers.
+
+The §1–§7 below are **retained as the enumerated-set design** (still valid IF
+hypothesis 1 holds at module-set granularity, and still the right home for the
+2a `#keys` / keyset-downgrade work), but they are no longer claimed as the
+outlier fix until a follow-up diagnostic (per-commit `logs` on an outlier)
+resolves the open question above.
+
+---
+
+**Goal.** Reduce the cold-eval tail: authorize serving a cached result when only
+*unobserved* members of an enumerated set changed — unobserved attrset bindings,
+or unobserved `pkgs/by-name/` directory children. This is the single biggest
+lever in the prior research (work-log v6→v11: cold 3.32→1.88 s, hot 0.88→0.38 s),
+but it must be rebuilt here: it does **not exist in the current tree**.
 
 **Goal.** Reduce the cold-eval tail: authorize serving a cached result when only
 *unobserved* members of an enumerated set changed — unobserved attrset bindings,
