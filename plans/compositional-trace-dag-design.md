@@ -4,6 +4,38 @@
 actually capture? "Hash every value/env" is intractable (hundreds of millions);
 so what is the boundary, and why does it not blow up? Grounded in code.
 
+> **PROTOTYPE RESULT (2026-05-30, spike branch `spike/tier1-edge-recorder`,
+> commit 2ca68c498, throwaway) — the minimal recorder widening is DEAD on
+> reachable paths; the real blocker is confirmed by running code.**
+>
+> Built the smallest Tier-1 recorder: in `replayMemoizedDeps` (context.cc),
+> env-gated `NIX_EVAL_TRACE_TIER1_EDGES=1` default-off, when a forced
+> sub-result has a registered trace identity, record a `TraceValueContext`
+> edge to its trace hash (reaching the colored ctx via
+> `SuspendableCtxScope::innermost()`) and skip the flattened range copy.
+> It compiled and the default-off invariant held (20 tests unchanged). But
+> measured behavior shows it adds nothing reachable:
+> - **Scalar producers — the dominant shared case (`pkg.outPath` is a STRING,
+>   ints) — have NO trace identity.** `materialize.cc:414/486` registers a
+>   `TracedExpr`/identity only for attrset/list children; scalars get none.
+>   Forcing a consumer over `top.prod` where `prod` is scalar replays the bare
+>   scalar Value (no identity) → the edge can't fire → the producer's file deps
+>   still flatten in. (Test: a `{prod = (fromJSON…).v; cons = prod+1;}` shape;
+>   cons still carried FileBytes+StructProj on the shared file with the flag on.)
+> - **Attrset/list producers — which DO have identity — already avoid flattening
+>   via the existing parentSlot path.** Measured flag-on == flag-off (cons trace
+>   byte-identical: only `traceParentSlot «root»`). The new edge never fires
+>   because the parentSlot mechanism handled it first.
+>
+> So the cases the edge could help lack identity; the cases with identity are
+> already handled. **MATERIAL BLOCKER, now proven by running code (not
+> inference): edging the common shared sub-results (scalar/string `outPath`s)
+> requires giving SCALAR sub-results a trace identity — the
+> `TracedExpr`-identity-for-non-attr-path-values work, the SAME wall Lever 2
+> hit.** A `replayMemoizedDeps` widening cannot reach it. The prototype is
+> throwaway (not merged); §2b/§9 below already named this identity constraint —
+> the spike upgrades it from analysis to a measured fact.
+
 > **VERIFICATION PASS (2026-05-30) — claim #1 checked against the recorder; two
 > findings sharpen and partly correct the design below. Read this box first.**
 >
