@@ -475,3 +475,42 @@ speedup half is gated on core-evaluator interception, not an eval-trace-layer
 change — reclassifying Lever 2 from "large but localized" to "high-blast-radius
 core-evaluator work," and strengthening the case to leave the cold tail as-is
 unless a cheap feasibility spike proves otherwise.**
+
+## 10. Change-locality structure (2026-05-30, measured) — sharpens the target AND the obstacle
+
+Inspected WHAT the 22 changed derivations are (one-module `autossh-ng` change,
+outlier `9b9f7241` vs predecessor `d9e9954c`):
+
+- **All 22 changed derivations are the top of the DAG** — `nixos-system` (the
+  root) + its direct system-assembly constituents: `activate`, `etc`,
+  `system-path`, `system-units`, `user-units`, `set-environment`, `dbus-1`,
+  `unit-*.service`, `X-Restart-Triggers-*`, plus doc derivations
+  (`options.json`, `nixos-manual-html`, `nixos-help`). **Zero packages changed.**
+  These are exactly the outputs of the NixOS module fixpoint.
+- **The 6,397 unchanged derivations are the dependency closure below** — packages,
+  patches, build inputs (sampled: hundreds of `*.patch`, package drvs). This is
+  the cacheable bulk and aligns with the ~58 % `make-derivation`/pkgs flamegraph
+  cost.
+
+**What this sharpens:**
+- The localization opportunity is real and well-shaped: a change ripples through
+  a THIN system-assembly cap (22 drvs = fixpoint outputs) while the BROAD package
+  base (6,397 drvs, ~58 % of cost) is untouched. Reusing the package base is the
+  prize.
+- **But it confirms §9's obstacle is exactly where the value is.** The 6,397
+  unchanged package derivations are reached THROUGH the module fixpoint's
+  evaluation (`system-path` forces `environment.systemPackages` → each package's
+  `mkDerivation`). To skip re-forcing a package, interception must happen BEFORE
+  the fixpoint pulls it in — i.e. the core-evaluator `TracedExpr`-at-derivation
+  hook (§9), on the hot path. The cheap boundaries (attrset levels between root
+  and string leaves) are ABOVE the fixpoint and do not localize this.
+- Corollary: the ~25 % module-fixpoint cost is an unavoidable floor (the 22
+  changed drvs ARE its outputs; it must re-run to produce them). So the realistic
+  ceiling stands at ~halving the outlier, consistent with §O5.
+
+**Net:** the target is confirmed (reuse the 6,397-package base) and so is the
+single hard obstacle (core-evaluator interception to verify-before-force a
+package derivation pulled in by the fixpoint). No cheaper boundary reaches it.
+The decision is unchanged: the next step is the hot-path feasibility spike (§9),
+which requires sign-off; absent that, the cold tail stays as-is (bounded,
+soundness-correct).
