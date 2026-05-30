@@ -4,6 +4,51 @@
 actually capture? "Hash every value/env" is intractable (hundreds of millions);
 so what is the boundary, and why does it not blow up? Grounded in code.
 
+> **VERIFICATION PASS (2026-05-30) — claim #1 checked against the recorder; two
+> findings sharpen and partly correct the design below. Read this box first.**
+>
+> **(V1) The existing edge mechanism is STRUCTURALLY NARROW — sibling-only.**
+> `SiblingReplayCaptureScope::maybeCapture` records a `TraceValueContext` edge
+> only when `shouldCapture` holds (context.cc:116-124), which REQUIRES
+> `parentSlot.value == current_->parentSlot.value` (context.cc:121) — the
+> accessed value must be a **sibling under the same parent attrset**. So edges
+> are recorded ONLY for sibling-to-sibling access within one attrset, NOT for
+> arbitrary cross-package or function-result dependencies. This is why edges are
+> ~0 % on `python3Packages` (`mapAttrs (p: p.outPath)` accesses each package from
+> its own scope, no sibling cross-access → `shouldCapture` false → everything
+> flattens). **Correction to the design's optimism: edges do NOT "already
+> partially work" between arbitrary nodes; the mechanism is a narrow sibling
+> optimization. A general dependency-edge system is genuinely new work, though it
+> can reuse the `makeValueContext` dep kind + `resolveTraceContextHash` verify
+> path.**
+>
+> **(V2) The Tier-1 "derivation edge" does NOT exist as a drvPath edge today, and
+> the existing `DerivedStorePath` dep is NOT it.** `DerivedStorePath`
+> (dep-resolution-service.cc:411-433) verifies by **re-coercing a SOURCE path to
+> a store path** (`${./dir}` copy-to-store), keyed on a source path — it is the
+> `./src`-to-store case, not "package A references package B's drvPath." When A's
+> `derivationStrict` consumes B as a buildInput, B's `{drvPath,outPath,…}` is a
+> PLAIN attrset (primops.cc:2034, no TracedData layer), and B's deps were
+> recorded into whatever scope forced B — if B is an attr-path node forced in its
+> own scope, B has its own trace; if B is forced inline within A, B's deps
+> FLATTEN into A. There is no recorded "A depends on B's drv-identity" edge.
+> **So Tier-1 is not "consume an identity that already exists" — the drvPath
+> identity exists in the STORE layer (`hashDerivationModulo`), but eval-trace does
+> not record an edge to it. Creating that edge is the new work.** The good news
+> (unchanged): the identity to point at (drvPath) is already computed
+> (primops.cc:1994) and shape-observation-free (output-like), so Tier-1 remains
+> the lowest-soundness-risk starting point — but it is a recorder change to EMIT
+> the edge, not merely a consumer change to use one.
+>
+> Net: the design's DIRECTION holds (flatten → edge; boundary selection is the
+> key; ~thousands of nodes not millions), and the tractability argument is intact.
+> But two specifics were too optimistic: (a) the edge machinery is sibling-narrow,
+> not general; (b) no derivation-identity edge is recorded today. Both are
+> additive recorder work, not "wire up what exists." The verify side
+> (`resolveTraceContextHash`, recursive+memoized) genuinely does exist and is
+> reusable. Detail below is otherwise accurate; treat its "already wired" phrasings
+> as corrected by this box.
+
 ## Why "hash every value" is the wrong frame — and what the build layer actually does
 
 The build layer does NOT hash every intermediate value. `closures.gnome` forces
