@@ -90,6 +90,7 @@ sources = files(
   'eval-trace/store/trace-parent-slot.cc',
   'eval-trace/store/keyset-escape.cc',
   'eval-trace/store/derivation-edge-soundness.cc',
+  'eval-trace/store/derivation-observation-facets.cc',
   'eval-trace/store/copied-path.cc',
   'eval-trace/store/nar-identity.cc',
   'eval-trace/store/derived-store-path.cc',
