@@ -233,6 +233,7 @@ sources = files(
   'eval-trace/property/invariant/determinism.cc',
   'eval-trace/property/invariant/idempotence.cc',
   'eval-trace/property/invariant/invalidation.cc',
+  'eval-trace/property/invariant/keyset-provenance.cc',
   'eval-trace/property/invariant/monotonicity.cc',
   'eval-trace/property/invariant/precision.cc',
   'eval-trace/property/invariant/recovery.cc',
