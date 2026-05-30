@@ -254,17 +254,26 @@ in place. The remaining options, in rough order of effort/payoff:
      loss.** (The earlier "net-negative, full stop" used an `-O0` build AND a
      no-op delta; retracted.)
 
-2''. **Make cold AND hot faster — see `plans/perf-levers-cold-and-hot.md`.**
+2''. **Make cold AND hot faster — see `plans/perf-levers-cold-and-hot.md`
+   (REORDERED after a 6-lever deep-dive + independent file:line verification).**
    Root cause (DB-confirmed): 36.5 M deps recorded from only ~60 K distinct atoms
    ⇒ each shared-closure dep (stdenv/glibc/python) recorded & re-hashed **~607×**.
-   Cold = 3 hash passes over every trace's full dep vector; hot = walking 36.9 M
-   dep-checks. Levers, ordered: **(L-C)** fuse the 3 recording hashes into 1 pass
-   (cold, cheap, safe, ship first); **(L-B)** per-session dep-verdict memo so each
-   distinct dep is verified once not 607× (hot, cheap); **(L-A)** shared-closure
-   dep-fragment factoring — the structural fix for BOTH cold + hot + storage, but
-   needs sub-set factoring since whole keysets are all distinct (RFC-ish);
-   **(L-D)** skip recording trivially-cheap leaves; **(L-E)** batched writeback;
-   **(L-F)** `mapAttrs`-style access guidance (already half-proven, zero-code).
+   **Verified verdicts (most prior "cheap wins" demoted):** L-C (fuse 3 hashes) =
+   ~30-45% of `record.hashUs` only, not 2/3, + needs a new multi-sink builder
+   (the 3 hashes cover different dep subsets); **L-B REFUTED** (the L1 cache
+   already memoizes distinct deps once per shared session; per-dep residual is
+   already a hashmap find + compare); **L-A** = schema-epoch RFC with two blockers
+   (global sort + positional `dep.ordinal` prevent fragment-hash composition);
+   **L-D REFUTED here** (bimodal but lopsided — the cheap ~30% of traces hold 0.2%
+   of deps); **L-E** real but small (`flush` is per-trace but `synchronous=off` ⇒
+   no fsync; bounded by ~3.8s); **L-F** reframed (the 3× came from the workload
+   expr's `attrNames`+select, not the printer — guidance applies to access idioms
+   anywhere in the evaluated Nixpkgs tree). **No cheap high-impact lever exists for
+   the cold cost.** The clearest actionable items: **L-F** (zero-code consumer
+   guidance) and **attributing the unmeasured ~3.6s of hot `verify.timeUs`**
+   (coroBlock / `withExclusiveAccess` hops + `loadFullTrace` blob deserialize) —
+   that, not L-B, is the real hot opportunity, and it needs a `runs --verbose`
+   measurement first.
 
 3. **The content-addressed trace-node RFC** (unblocks Lever 2 / Lever 5). A second
    `TracedExpr` identity keyed by content (derivation-input hash) rather than
