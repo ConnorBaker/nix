@@ -127,8 +127,36 @@ findings-doc "Promising Directions". Each lever traces to repo text; the
 > 4. A win would require amortization (many warm re-evals per cold) and/or lower
 >    cold cost (option 2''). Workload-dependent, NOT "disable it."
 >
-> Open caveats (honest, not retractions): n=1, no repetition; `python3Packages`
-> specifically; warm OS disk cache; cold cost may be reducible.
+> **ACCESS-PATTERN FOLLOW-UP (2026-05-30): `mapAttrs` instead of `attrNames` +
+> per-key select changes the verdict from break-even to a CLEAR WIN.** Same
+> workload semantics (11,061 identical entries, byte-verified), release binary,
+> same commits. `builtins.mapAttrs (n: p: …outPath…) python3Packages` iterates via
+> the C++ Bindings API — no `attrNames` keyset dep, no per-package `ExprSelect`:
+>
+> | Scenario | `listToAttrs` (attrNames+select) | **`mapAttrs`** (C++ iter) |
+> |---|---:|---:|
+> | reference (no-trace) | 0:18 | 0:18 |
+> | cold | 2:34 | **1:15** (~2× cheaper) |
+> | hot (same commit) | 0:14 | **0:05** (~3.3× vs ref) |
+> | incremental (`streamz` bump) | 0:17 (≈ break-even) | **0:08** (~2.2× vs ref) |
+> | deps recorded (ownDepsTotal) | 110.9 M | **36.5 M** (3× fewer) |
+> | record.hashUs | 91 s | **30 s** |
+> | sound / precise | ✓ misses=1 | ✓ misses=1 |
+>
+> Why: `attrNames`+`${name}` select recorded ~3× more deps per trace (keyset dep +
+> per-access deps); `mapAttrs`'s C++ iteration records only each package's intrinsic
+> deps. That over-recording was BOTH the bulk of cold cost AND what dragged the
+> `listToAttrs` warm path to break-even. **Corrected meta-conclusion: the
+> deep-attrset verdict is access-pattern-dependent. On the C++-iteration pattern
+> (closer to how `nix-eval-jobs` actually walks the set), the cache delivers a
+> clear, sound, ~2× incremental win** — the eval-jobs value case the earlier runs
+> failed to demonstrate. The `listToAttrs` "break-even" was partly a
+> workload-authoring artifact, not just the `-O0` artifact.
+>
+> Open caveats (honest): n=1, no repetition; `python3Packages` specifically; warm
+> OS disk cache; cold cost still ~4× reference even with `mapAttrs` (recording is
+> the lever, option 2''). `nix-eval-jobs`'s real iteration pattern should be
+> confirmed against these two bracketing cases.
 >
 > Original (unsound `-O0`) text retained below struck-through for the audit trail.
 
