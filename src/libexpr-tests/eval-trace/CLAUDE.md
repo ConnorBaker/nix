@@ -250,6 +250,7 @@ digest (BUG-11 regression guard), and that `nixPath` is ignored in pure mode.
 | `store/nar-identity.cc` | `TraceStoreTest` | `NarIdentity` dep record/verify warm-hit + hash-change invalidation round-trip |
 | `store/sv-telemetry.cc` | `TraceStoreTest` | Structural-variant byDepKeySet telemetry aggregation and early-exit signal counters |
 | `store/trace-parent-slot.cc` | `TraceStoreTest` | `TraceParentSlot` parent-fingerprint encoding + verification (relevant to OR-4) |
+| `store/keyset-escape.cc` | `TraceStoreTest` | Cross-trace keyset-escape soundness (OR-4 residual / keyset-downgrade guard): a `StructuredProjection #keys` dep that escapes a parent trace via `TraceValueContext`/`TraceParentSlot`. 5 synthetic tests — key add/remove/value-context + parent-slot invalidate the consumer (soundness, fail-closed); value-only change keeping keys still hits (precision anti-vacuity); depth-2 chain transitive escape. Positive control complementing `verify/integration.cc::Integration_ParentSlot_DoesNotCaptureKeySetRemoval`. Guards `plans/keyset-downgrade-sound-by-construction.md` §3 against an unsound single-trace reachability prune |
 | `store/verification-phases.cc` | `TraceStoreTest` | Per-round recovery-pipeline counter assertions across pass-1 / recovery phases (OR-10 Group B); uses the `nrRecoveryGitIdentity*` counter family |
 
 ### traced-data/
@@ -768,7 +769,20 @@ All four properties are implemented:
 - **Recovery** (P5): `∀E, v1, v2: record(v1), record(v2), revert(v1) → recover(v1)` — `property/invariant/recovery.cc`
 - **Idempotence** (P4): `∀E: cached_eval(cached_eval(E)) == cached_eval(E)` — `property/invariant/idempotence.cc`
 
-Additional property invariants present (not in the P1-P5 taxonomy): `commutativity.cc`, `cross-session-soundness.cc`, `determinism.cc`, `dep-correctness.cc`, `monotonicity.cc`, `structural-override.cc`, `trace-hash-determinism.cc`, `trace-transparency.cc`.
+Additional property invariants present (not in the P1-P5 taxonomy): `commutativity.cc`, `cross-session-soundness.cc`, `determinism.cc`, `dep-correctness.cc`, `monotonicity.cc`, `structural-override.cc`, `trace-hash-determinism.cc`, `trace-transparency.cc`, `keyset-provenance.cc`.
+
+`keyset-provenance.cc` is the differential harness for the keyset-dep
+**downgrade** (the v6→v11 "prune-don't-add" perf lever): a value-comparing
+oracle (deep-forced served value vs post-mutation ground truth, NOT a path
+counter — the counter is confounded by per-leaf lazy re-derivation, DEF-6)
+across keyset mutations. 19 enabled tests + 1 DISABLED red pin
+(`DISABLED_SeqDiscardedAttrNames_UnobservedSiblingAdded_StillHits`) that
+flips green when the downgrade lands. Cross-trace escape cases live
+separately in `store/keyset-escape.cc` (real-eval cross-trace reproduction
+is impossible — FileBytes backstop). Design + decision:
+`plans/keyset-provenance-differential-harness.md` and
+`plans/keyset-downgrade-sound-by-construction.md` (prototype DEFERRED
+2026-05-30).
 
 ## Section D: Deferred Work Index
 
@@ -927,7 +941,17 @@ authoritative source.
     subprocess-per-commit reproduction.
   - **OR-4** (TraceParentSlot key-set gap). Storage-layer gap pinned
     by synthetic test; shielded in real evaluation by the same
-    FileBytes backstop. Not demonstrably reachable.
+    FileBytes backstop. Not demonstrably reachable.  The *cross-trace
+    keyset-escape* residual it represents is now pinned by
+    `store/keyset-escape.cc` (5 synthetic tests) as the soundness
+    floor for the deferred keyset-downgrade lever — a `#keys` dep
+    escapes a parent trace via the trace-hash channel
+    (`TraceValueContext`/`TraceParentSlot`) to consumer traces that
+    don't exist at the parent's finalization, so any downgrade prune
+    must fail-closed.  Design + decision:
+    `plans/keyset-downgrade-sound-by-construction.md` (prototype
+    DEFERRED 2026-05-30, option B — architecture sound + guarded,
+    narrow tail gain).
   - **OR-7** (epoch-log truncation on exception). Performance-only;
     no benchmark motivates landing.
   - **OR-11** (`path_t` materialization rebuilds with `rootFS`).

@@ -562,6 +562,28 @@ path. An in-process test going through `TraceSession::makeCache`
 and real `nix eval`-style forcing cannot reproduce the stale serve
 because FileBytes-backstop catches source edits.
 
+**Cross-trace keyset-escape residual (the keyset-downgrade soundness
+floor).** `src/libexpr-tests/eval-trace/store/keyset-escape.cc` (5
+synthetic `TraceStoreTest` tests, landed 2026-05-29) pins the
+COMPLEMENTARY positive case: a parent recorded WITH a
+`StructuredProjection #keys` dep folds the key set into its trace hash,
+so a consumer that escapes the parent via `TraceValueContext` /
+`TraceParentSlot` correctly invalidates on a key add/remove (and still
+hits on a value-only change preserving the key set). This is the
+residual that matters for the **keyset-dep downgrade** (the v6→v11
+"prune-don't-add" perf lever): a downgrade that pruned the parent's
+`#keys` dep using a single-trace reachability check would reproduce
+exactly the `Integration_ParentSlot_DoesNotCaptureKeySetRemoval`
+stale-serve, because the keyset escapes via the trace-hash channel to
+consumer traces that do not exist yet at the parent's finalization
+(undecidable locally → must fail-closed). Design + decision artifact:
+`plans/keyset-downgrade-sound-by-construction.md` (prototype DEFERRED
+2026-05-30 — architecture sound and fully guarded, but the gain is a
+narrow seq-discard tail that does not justify touching the hot
+recorder/finalization path). Differential harness for the same lever:
+`src/libexpr-tests/eval-trace/property/invariant/keyset-provenance.cc`
++ `plans/keyset-provenance-differential-harness.md`.
+
 **Why TVC doesn't have the same gap.** `TraceValueContext(siblingPathId)`
 re-verifies the sibling's own trace via `resolveTraceContextHash` in
 `src/libexpr/eval-trace/store/verifier.cc`.  The sibling's
