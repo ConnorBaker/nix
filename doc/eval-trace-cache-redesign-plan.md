@@ -100,18 +100,26 @@ fails on all 4 → each re-evals its **entire** subtree. Machinery is cheap
 Fast commit `f37d` for contrast: 7/7 roots verify clean, **nrThunks=1**,
 verify.failed=0. Binary per root.
 
-**Root cause: all-or-nothing verification/recovery at coarse closure roots, with
-no partial reuse of the 16K fine-grained sub-traces.** The sub-traces are
-recorded cold but not independently re-verified warm — only the 7 roots are. A
-0.10%-of-deps change pays a full closure re-eval because nothing descends into a
-failed root to reuse the 99.9% unchanged sub-traces.
+**Root cause (CORRECTED after checking `record.count`): the cache records only
+~7 COARSE traces for the whole eval — there is no sub-trace granularity to
+reuse.** Full-cold first commit: `record.count=7` vs `depTracker.scopes=16357`.
+The 16K scopes are transient `DepCaptureScope` frames that collapse into the 7
+recorded traces, NOT addressable sub-traces. A 0.10%-of-deps change fails one of
+only 7 monolithic root traces and there is nothing finer recorded to fall back
+to. (Earlier wording "16K recorded sub-traces unreachable" was wrong — verified
+via stats.json `record.count`.)
 
-**New lever (call it Lever 5 — incremental sub-trace reuse / partial recovery):**
-on root-trace verify failure, descend and re-verify only the changed sub-traces
-instead of re-evaluating the whole root. This is distinct from lever 1
-(enumerated-set pruning) and lever 2 (derivation-boundary digest), and it is the
-**measured outlier lever for `closures.gnome`** — the 23 outliers are exactly the
-commits where a root verify fails.
+**New lever (Lever 5 — finer recording + incremental sub-trace reuse):** record
+addressable traces at intermediate nodes (not just 7 roots) AND, on root verify
+miss, re-enter per-child cache lookups so unchanged sub-traces warm-hit. It is a
+RECORDING-granularity change, not merely a warm-path reuse change — both sides
+are needed (reuse finds nothing without finer recording; finer recording is
+bypassed without warm re-entry). Distinct from lever 1 (enumerated-set) and
+lever 2 (derivation-boundary), though §1 of the lever doc ties the granularity
+choice to lever 2's derivation-boundary idea (record at drv/module boundaries,
+not every attr, to avoid the v53 "store too much" failure). It is the **measured
+outlier lever for `closures.gnome`** — the 23 outliers are the commits where a
+root verify fails.
 
 **Code-grounded refinement (trace-session.cc).** The gap is now located:
 - Warm hit → `materializeResult` (cheap). Verify miss →
@@ -124,10 +132,12 @@ commits where a root verify fails.
   which **bypass the cache for the entire subtree** — the 16K recorded
   sub-traces are never consulted. The benchmark's `--json` deep-forces the whole
   structure, so a failed root re-evals its complete subtree fresh.
-- So Lever 5 ≈ "**on root verify miss, re-enter the cache per-child instead of
-  fresh-walking the realRoot**" — make `evaluateFresh`'s subtree walk go back
-  through `TracedExpr` cache lookups so each unchanged child warm-hits, instead
-  of a monolithic fresh eval.
+- So Lever 5 ≈ "**record finer (intermediate `TracedExpr` nodes, not just 7
+  roots) AND on verify miss re-enter the cache per-child instead of fresh-walking
+  the realRoot**". `installChildThunk`/`makeChild` is called only from
+  `materialize.cc` today, so children are cache-routed ONLY on warm hits; both
+  the cold record pass and the warm-miss fresh pass produce plain Nix thunks that
+  bypass the cache. Lever 5 = apply the child-wrap in both passes.
 
 Design questions before any build (the next research step, not yet taken):
 1. Can `evaluateFresh` (or `navigateToReal`) re-enter per-child cache lookups

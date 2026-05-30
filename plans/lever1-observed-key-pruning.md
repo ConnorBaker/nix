@@ -73,21 +73,97 @@ Evidence from the outlier's `cold-stats/2` stats.json:
   `verify.failed=0`, 0 recovery attempts. Binary per root: verify clean → ~free;
   one dep fails under a root → whole root re-evals.
 
-**Root cause (the real lever): all-or-nothing verification/recovery at coarse
-closure roots, with no partial reuse of the 16K fine-grained sub-traces.** The
-sub-traces are *recorded* on the cold pass but are not independently re-verified
-on the warm path — only the 7 roots are. So a change touching 0.10% of deps
-pays a full closure re-eval because there is no mechanism to descend into a
-failed root and reuse the 99.9% of unchanged sub-traces.
+**Root cause (CORRECTED 2026-05-30 after checking `record.count`): the cache
+records only ~7 COARSE traces for the whole `closures.gnome` eval — there is no
+fine-grained sub-trace granularity to reuse.** Earlier wording here ("16K
+recorded sub-traces are unreachable") was WRONG. The numbers: the full-cold
+first commit has `record.count=7` against `depTracker.scopes=16357`. The 16,352
+scopes are *transient `DepCaptureScope` frames* that open/close during the deep
+force and **collapse into the 7 recorded traces** — they are NOT independently
+addressable sub-traces. So a change touching 0.10% of deps pays a full closure
+re-eval because the cache's recording granularity is the whole closure root: a
+single failed dep invalidates one of only 7 monolithic traces, and there is
+nothing finer recorded to fall back to.
 
 **This is neither lever 1 (enumerated-set pruning) nor classic lever 2
 (derivation-boundary digest). It is a THIRD lever: incremental sub-trace reuse /
 partial recovery** — on root-trace verify failure, descend and re-verify only the
 changed sub-traces instead of re-evaluating the whole root. See the redesign-plan
-2026-05-30 "Step-1 diagnostic — RESOLVED" section for the lever statement and the
-design questions it opens (why aren't the 16,352 sub-traces independently
-verifiable on the warm path? is it a recording-granularity, a
-verification-entry-point, or a materialization-boundary limitation?).
+2026-05-30 "Step-1 diagnostic — RESOLVED" section.
+
+### Design-question 1 RESOLVED (2026-05-30, code feasibility study)
+
+*Why aren't the 16,352 recorded sub-traces independently verifiable on the warm
+path, and can a failed root re-enter per-child cache lookups?*
+
+Traced through `trace-session.cc` + `materialize.cc`:
+- **Cache-routing = `TracedExpr` child thunks.** A child verifies per-leaf (the
+  OR-3 contract) ONLY when its `Value` is a `TracedExpr` thunk. Those are
+  installed by `installChildThunk` → `TracedExpr::makeChild`, called from
+  **`materialize.cc` only** (lines 414/486), i.e. only when a trace VERIFIES and
+  its `CachedResult` is materialized — iterating the *cached* `attrs->entries`.
+- **A failed root produces plain thunks.** Root verify miss →
+  `evaluateFresh` (trace-session.cc:236-239) → `getRealRoot()` →
+  `rootLoader()` (trace-session.cc:448-455) = the **plain Nix evaluator**. Its
+  attrset children are ordinary Nix thunks, NOT `TracedExpr`. The benchmark's
+  `--json` deep-forces the whole structure with the ordinary evaluator, which
+  **never touches the cache** — so the 16K sub-traces are unreachable not because
+  they're un-verifiable but because the *values aren't cache-routed*.
+
+**Verdict (CORRECTED): Lever 5 is a RECORDING-granularity change, not a
+warm-path reuse change.** The original framing assumed 16K recorded sub-traces
+existed to reuse; they don't (record.count≈7). So the lever is two-sided:
+1. **Record finer:** the cold pass must record more than 7 coarse traces — it
+   must persist addressable sub-traces at intermediate attr-path nodes
+   (`makeChild` already builds the pathIds; the question is which nodes get a
+   *recorded trace* vs collapse into a transient `DepCaptureScope`).
+2. **Reuse finer:** on root verify miss, wrap the fresh `rootLoader()` attrset's
+   children as `TracedExpr` thunks (same `makeChild`/`installChildThunk`, driven
+   by fresh keys) so each child force re-enters the cache and warm-hits its own
+   recorded sub-trace.
+
+Both are needed: (2) without (1) finds nothing to hit; (1) without (2) records
+sub-traces that the fresh-walk still bypasses.
+
+The likely reason only ~7 traces record today (to confirm next): a trace is
+recorded per `TracedExpr` that is *forced through the cache*, and on the cold
+pass only the 7 roots are `TracedExpr`s — the deep `--json` force of each root
+runs the ordinary evaluator over plain thunks, opening 16K transient
+`DepCaptureScope`s that all fold into the one root trace. So **finer recording
+ALSO requires installing `TracedExpr` children on the cold pass**, not just the
+warm path. That makes (1) and (2) the same mechanism applied in both passes:
+wrap attrset children as `TracedExpr` whenever an attrset is produced (cold) or
+re-entered (warm-miss).
+
+Open sub-questions (the NEXT step, needs prototyping + measurement):
+1. **Granularity/overhead tradeoff.** Recording a trace per intermediate node
+   across a NixOS system closure could be a LOT of traces (the 16K scope count
+   is the upper bound). Recording + storing 16K traces/commit has cold-write and
+   DB cost — the v53 capsule rewrite failed exactly by storing too much. What
+   intermediate granularity captures the reuse win without exploding storage?
+   (e.g. record at module / derivation boundaries, not every attr.) This ties
+   Lever 5 to lever 2's derivation-boundary idea.
+2. **`rootLoader` shallow-force.** To wrap children we force the fresh root one
+   level (enumerate keys) without deep-forcing. Is a shallow force cheap, or does
+   the `closures.gnome` root force children eagerly? (Measure: shallow
+   `forceValue(root, noPos)` thunk count.)
+3. **pathId stability.** A re-entered child must get the same `AttrPathId` the
+   cold pass recorded under. Confirm `makeChild`'s parent-chain pathId is stable
+   across cold-record vs warm-fresh-reentry.
+4. **Soundness vs the failed parent (design-q 2).** A child served while its
+   parent failed verify: validity must rest on the child's OWN deps. Exactly the
+   keyset-escape / cross-trace concern — a child depending on a parent-mediated
+   value (TraceValueContext / ParentSlot) must still re-verify that context. An
+   analogous "parent-failed, child-served" test is owed.
+5. **Recursion.** Naturally recursive if every `TracedExpr` child wraps its own
+   children on force — confirm it falls out for free.
+
+Cost model: machinery is ~ms/trace; reusing N unchanged sub-traces at ~50 µs
+each must beat the ~13 s re-eval. BUT the recording side adds cold-write cost for
+the finer traces, and we have NO datapoint for how many sub-traces a real outlier
+would verify (only 7 roots are entered today). Both the reuse win AND the
+recording cost must be measured on a prototype before committing — this is the
+gating experiment, and it is squarely a hot/cold-path build (needs sign-off).
 
 The §1–§7 below are **retained as the enumerated-set design** (still valid IF
 hypothesis 1 holds at module-set granularity, and still the right home for the
