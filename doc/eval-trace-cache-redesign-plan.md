@@ -2727,3 +2727,46 @@ over "instrument the event I think corresponds to it."
 
 **What stays in tree:** the decisive unit test (regression guard for the sharing
 mechanism). The confounded probe was removed.
+
+### 2026-05-31 follow-up #11: workload-scale derivation-sharing FIRMED from already-decoded artifacts — N≫1 robustly (cheap path)
+
+Follow-up #10 proved the sharing MECHANISM (unit test: a shared derivation flattens into
+every consumer). This firms the POPULATION at workload scale WITHOUT a new probe or run —
+by reasoning over the architecture doc's already-decoded python3Packages numbers (decoded
+from stored `keys_blob`s, the faithful artifact-based method, not a guessed-site probe).
+
+Inputs (architecture-trace-model-vs-CA.md, decoded python3Packages cold DB):
+- 36.5M flattened deps, ~60K distinct atoms (the 608× duplication), ~10,397 traces.
+- StorePathAvailability (.drv-existence) = 34.9% of deps; avg 3,376 deps/trace.
+
+Derivation: SPA deps ARE the per-derivation `.drv` references. So:
+- per trace: ~3,376 × 0.349 ≈ **1,178 distinct derivations referenced** (distinct because
+  within-scope `seenDeps` dedup makes each `.drv` key appear once per trace — verified).
+- total derivation-flatten-instances across all traces: 36.5M × 0.349 ≈ **12.7M**.
+- mean consumers per derivation = 12.7M / (distinct derivations).
+
+The one unpinned input is the distinct-derivation count for python3Packages. The estimate is
+INSENSITIVE to it across the whole plausible range (adversarially bounded):
+
+| distinct derivations | mean consumers/derivation |
+|---|---:|
+| 6,419 (closures.gnome analogue) | ~1,984 |
+| 20,000 | ~637 |
+| 60,000 (impossible upper bound — ALL distinct atoms = derivations) | ~212 |
+
+Even the impossible worst case gives **mean ~212 consumers/derivation**; realistically 200–2,000.
+**N≫1 robustly** — three orders of magnitude above the confounded probe's false "1.33." The
+RFC §7.7b sharing premise is confirmed at BOTH unit scale (#10, mechanism) and workload scale
+(#11, population). A derivation-edge that replaces the flattened closure with one reference
+would collapse ~12.7M derivation-flatten-instances toward ~thousands of distinct producer
+traces — the 608× duplication is overwhelmingly derivation-closure sharing.
+
+**Method note (the lesson applied):** this number came from re-deriving over FAITHFULLY-DECODED
+stored artifacts (the arch doc's blob decode), NOT a new live probe — after three probe
+confounds, the artifact-based path is the trustworthy one. It needed no new build or run.
+
+**What this resolves and what it does NOT.** RESOLVED: the sharing premise (§7.7b) holds, at
+scale. NOT resolved: the args-force sub-scope HOT-PATH COST (§6) — the genuine remaining go/no-go,
+which requires the throwaway prototype that touches the hot eval path. The cheap analysis has
+taken the sharing question as far as artifacts allow; the cost question needs the prototype, a
+deliberate larger investment (RFC §8 step 3).

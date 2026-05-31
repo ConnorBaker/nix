@@ -60,11 +60,16 @@ only the current settled state:
   one shared derivation, two consumers reading the SAME `.outPath`, BOTH traces
   independently carry its input closure (`cxHasFile=1 cyHasFile=1`). So **the 607×
   consumer-sharing is REAL** — `replayMemoizedRange` flattens a shared derivation's
-  closure into EVERY consumer trace, decisively at unit scale. §7.7b premise HOLDS.
-  STILL OPEN (the real remaining work, no longer behind a false STOP): the
-  WORKLOAD-SCALE sharing distribution (the unit test proves the MECHANISM, not the
-  population) and the args-force sub-scope hot-path cost (§6). See
-  `doc/eval-trace-cache-redesign-plan.md` follow-up #10.
+  closure into EVERY consumer trace, decisively at unit scale. §7.7b premise HOLDS at
+  unit scale (#10) AND at WORKLOAD scale (#11): re-deriving over the architecture doc's
+  already-decoded python3Packages numbers (SPA = 34.9% of 36.5M flattened deps ≈ 12.7M
+  derivation-flatten-instances over ~thousands of distinct derivations) gives **mean
+  ~200–2,000 consumers per derivation** — insensitive to the one unpinned input across
+  its whole plausible range; N≫1 robustly. **So sharing is no longer open at all.** The
+  SOLE remaining go/no-go is the args-force sub-scope HOT-PATH COST (§6), which needs the
+  throwaway prototype (RFC §8 step 3) — a deliberate larger investment touching the hot
+  eval path. See `doc/eval-trace-cache-redesign-plan.md` follow-ups #10 (mechanism) + #11
+  (population).
 - **Honest scope:** ALT-4 (verify-time fragment sharing, §7.8) remains a real
   alternative regardless.
 
