@@ -3190,3 +3190,50 @@ uncertainty toward "needs the prototype" rather than resolving it. The other cav
 conservative toward the edge model (producer-once is an upper bound; loadTrace savings unmodelled
 would help the edge side). Net: the qualitative verdict — verify gate UNDECIDED, settling it
 requires the real edge-emitting prototype measured hot — is robust to all of these.
+
+### 2026-05-31 follow-up #21: M MEASURED ≈ 1 (verify gate SETTLED — edge ≈ flat per item) — via store microbenchmark, after catching an L1-warmth confound
+
+Did the build that settles #20's verify gate — but as a STORE-LEVEL microbenchmark (the verify
+constant M is a verify-path quantity, measurable on the real store/verify pipeline WITHOUT touching
+the hot eval path). New test `store/ca-edge-verify-cost.cc` (env-gated `NIX_BENCH_EDGE_VERIFY=1`;
+a non-timed correctness check runs always + validates the harness — both a K-flat-dep consumer and
+a K-edge consumer verify). Mirrors `ca-trace-key-routing.cc`.
+
+**First result was CONFOUNDED — caught before recording.** Fresh-session-per-iter gave flat
+18,463 ns/dep vs the doc's ~131 ns warm-walk (~140×) → it measured COLD recompute (re-read +
+re-hash each file every iter, no L1 warmth), flattering the edge to M=0.03. The fair comparison is
+STEADY STATE for BOTH: flat with L1 dep-hash cache warm (the real hot path is L1-warm — 21.3M hits
+/ 61K misses), edge with `verifiedTraceIds` memo warm. Caught by the sanity check (flat ns/dep
+must be ~hundreds, not ~18,000). Fixed: ONE session per side, warm it, then time repeated
+re-verifies of the same consumer.
+
+**Corrected result, with a two-point decomposition to isolate per-item slope from fixed overhead**
+(K = 50 and 800; `time = F + K·c`):
+
+| side | K=50 | K=800 | per-item slope c | fixed F |
+|---|---:|---:|---:|---:|
+| flat (L1-warm) | 5,448 ns | 12,271 ns | **9.1 ns/dep** | ~4,994 ns |
+| edge (memo-warm) | 5,432 ns | 12,149 ns | **9.0 ns/edge** | ~4,984 ns |
+
+**M ≈ 1.0 on the per-item slope** (not just the F-contaminated total — the ~5µs fixed F, shared by
+both, had inflated the K=200 figure; the slope is the thing that scales with the ~63% dep-count
+reduction). So: **a memo-warm edge costs essentially the same per item as an L1-warm flat dep.**
+
+**VERDICT — the verify-benefit gate is SETTLED (favorably).** At M≈1, the edge model's verify cost
+scales with edge-count, so the ~63% dep-count reduction (#15) translates to a **~63% verify-walk
+reduction** — a real hot win, NOT the net loss the M≈3–4 confound scenario briefly suggested
+(that scenario is now ruled out). #20's gate (M<~2 ⇒ win) resolves to WIN.
+
+**Honest scope:** this is a store-level microbenchmark of the verify constant — faithful to the
+real `resolveTraceContextHash` + `verifiedTraceIds` path, but (a) in-process tight loop (so the
+ABSOLUTE ns are lower than a full eval; only the RATIO M matters and it's robust across K), (b)
+memo-HIT steady state (the N>1 common case; the memo-MISS first-consumer cost is the producer's
+own-dep verify, a once-per-session term already in the #20 model), (c) does NOT include loadTrace
+blob effects. The RATIO M≈1 is the load-bearing number and it is solid.
+
+**Net state of the two gates now:**
+- Verify-benefit gate: **SETTLED — WIN** (M≈1 ⇒ ~63% verify reduction translates through). [#21]
+- Cost gate (producer recordSync, sync): still the open blocker — async/batched recording unbuilt.
+So the direction is: **verify-side is now a measured win; the remaining gate is purely the
+producer-RECORD cost** (§3b's dominant term), settled only by building async recording. The
+benefit case is materially stronger than #19/#20 left it (verify win confirmed, not just storage).
