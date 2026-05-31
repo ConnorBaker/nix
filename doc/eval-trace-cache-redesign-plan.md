@@ -2556,3 +2556,62 @@ consumer; the flattening is attached to consuming the output string's context, n
 The blocker for §3b is now precisely located and is prototype-sized, not RFC-scale: a
 recording-side edge at the string-coercion boundary, gated by the output-only facet rule, whose
 hot-path cost is the one unmeasured number that decides it.
+
+### 2026-05-31 follow-up #8: RETRACTION — #7 was confounded; the flatten is force-of-args-driven, so #6's coercion hook is ADDITIVE not flatten-replacing
+
+An adversarial pass on the "finalized" #6/#7 proposal found a confound in #7's own test and
+**refutes the hook-site claim**. This entry retracts the #6/#7 conclusion. The honest verdict
+reverts toward #5: the re-keying is genuinely hard, not prototype-sized at a coercion boundary.
+
+**The confound.** #7 concluded "flatten is output-read-driven" from a single discriminator
+`cz = builtins.attrNames d` measuring `FileBytes=0`. But cz differs from cx/cy (`d.outPath`/
+`d.drvPath`) on **two** axes at once: (a) it reads no output string, AND (b) `attrNames` does not
+force the derivation's `args` at all (it needs only the attrset keys). cz=0 is consistent with
+*either* cause. #7 picked (a) and called the hook site confirmed. That was reasoning from a
+confounded test — exactly the failure mode these adversarial passes exist to catch.
+
+**The confound-split (committed, real evaluator —
+`DrvInput_FlattenSite_ForceVsOutputRead`, extended with cw/cv):**
+
+| consumer | expression | forces args? | reads output string? | `FileBytes`? |
+|---|---|:---:|:---:|:---:|
+| cx | `d.outPath` | yes | yes | 1 |
+| cy | `d.drvPath` | yes | yes | 1 |
+| **cw** | `deepSeq (removeAttrs d [outputs]) null` | **yes** | **no** | **1** |
+| cz | `builtins.attrNames d` | no | no | 0 |
+| cv | `seq d null` | no (WHNF) | no | 0 |
+
+**cw is decisive and was missing from #7.** It forces the derivation's args deeply but reads NO
+output string — and STILL carries `FileBytes`. So the input flatten is **force-of-args-driven**,
+not output-read-driven. cz=0 was because `attrNames` doesn't force the args (identical to cv), not
+because it skipped an output read. #7's verdict is **wrong**.
+
+**Consequence — #6's hook site is refuted, and the idea collapses into the already-reverted
+aggressive shape.** The FileBytes is recorded into the consumer's scope during
+`forceAttrs(*args[0])` inside `prim_derivationStrict` (primops.cc:1602). A `coerceToContextObject`
+edge at a later output-string read fires *after* that recording already happened — it is
+**additive, not flatten-replacing** (the exact trap #6 talked itself out of). The ONLY place an
+edge could *replace* the flatten is a dep-capture sub-scope around `forceAttrs(*args[0])` +
+`derivationStrictInternal` — which is precisely the **"aggressive shape" already tried and reverted
+as unsound** (primops.cc:1554-1568: it under-records ambient-eval deps that legitimately flow into
+the consumer scope but aren't tied to the producer's content). There is no new flatten-replacing
+site downstream of the args-force.
+
+**Also corrects #6's narrower sub-claim.** #6 noted the consumed string carries the drvPath in its
+context (`DrvDeep`/`Built`) — that fact is TRUE and unretracted. What is retracted is the inference
+that an edge keyed off that context, emitted at the read, could replace the flatten. It can't: the
+flatten is upstream of the read, at args-force.
+
+**Net verdict (reverts to #5, now fully grounded).** The CA-producer direction's blocker is NOT a
+prototype-sized coercion hook. To replace (not duplicate) the flatten requires isolating the
+derivation's input-reads at the args-force boundary, which is the aggressive shape — and that is
+unsound as-built because it cannot distinguish the producer's own input-reads from ambient-eval
+deps that legitimately flow into the consumer. Making it sound requires partitioning those two
+classes of dep at record time — which is the genuine, unsolved, RFC-scale problem. #5's "RFC-scale"
+framing was right; #6/#7 were an over-optimistic detour produced by a confounded test.
+
+**Process note.** #6 and #7 were committed as findings and are now partially retracted by #8. The
+test (`DrvInput_FlattenSite_ForceVsOutputRead`) is KEPT — its confound-split matrix is the durable
+artifact and a regression guard for the force-of-args attribution. The lesson: a one-variable
+discriminator that actually varies two hidden axes will manufacture a clean-looking but false
+verdict; split every axis before concluding.
