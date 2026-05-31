@@ -3337,3 +3337,59 @@ should not be the headline). The −9% wall is the honest, teardown-inclusive nu
 flattering number that excluded a cost (teardown), and only the end-to-end wall measurement was
 trustworthy. The #22 commit should have led with wall, not the stat. The win is real but ~9%, not
 the ~40% the stat suggested.
+
+### 2026-05-31 follow-up #24: DEEP adversarial pass on Layer 1 — found a crash-consistency hazard my validation missed
+
+Read the flush + publishStateChange code end-to-end (not from prior reasoning). Found a real
+semantic issue in the COMMITTED Layer 1 change + an incompleteness in my #22/#23 validation.
+
+**The ordering inversion (verified, sqlite-trace-storage.cc:695-724 + lifecycle.cc:623-714).**
+`Recorder::record` step 8 `publishRecord → publishStateChange` commits its OWN per-producer
+`SQLiteTxn` writing the durable `Sessions` (upsertAttr) + `History` (insertHistory=true,
+sqlite-trace-storage.cc:683) rows. Baseline order: step-7 `flush()` makes the Traces row durable
+FIRST, then step-8 commits the Sessions/History row. **My `deferFlush` inverts this:**
+publishStateChange still commits per-producer (I only gated step-7 flush), so the durable
+History/Sessions row (trace_id=N) is written while N's Traces row sits in `pendingTraces`,
+unflushed until the teardown `flushExclusive()` (lifecycle.cc:464).
+
+**The crash-only stale-serve hazard.** `nextTraceId` is loaded at open as `MAX(Traces.id)`
+(lifecycle.cc:611). So: crash between publishStateChange (History(N) durable) and teardown flush
+(Traces(N) lost) → next process sees `MAX(Traces.id) < N` → REUSES id N for a different trace N'
+→ the stale durable History(N) row now aliases N'. On a `__ca:` producer lookup, `lookupCurrentNode`
+returns the stale Sessions row, `ensureTraceHeader(N)` returns N' (the reused trace), and the
+producer verify uses the WRONG trace's deps. Baseline does NOT have this (Traces durable before
+History).
+
+**My #22/#23 validation was INCOMPLETE — it could not have caught this.** byte-identical eval +
+identical Traces/Sessions row counts + cross-process warm-HIT all ran on CLEAN exit, where teardown
+flushes N and the window never opens. The hazard is CRASH-ONLY. I claimed "soundness-clean" on
+clean-exit evidence alone — an overclaim.
+
+**Severity, bounded honestly:**
+- TODAY: LATENT. (a) §3b is default-OFF; (b) even ON, the §3b CONSERVATIVE shape keeps the
+  consumer's flattened deps, so a mis-resolved producer edge is independently caught — the aliasing
+  can't reach a wrong serve; (c) requires a crash AND a later eval reusing id N. Narrow.
+- UNDER THE AGGRESSIVE SHAPE (the goal of this whole arc — consumer edge REPLACES the flattened
+  deps): backstop (b) is removed BY DESIGN → the aliasing becomes a candidate STALE SERVE. So this
+  MUST be fixed before the aggressive shape ships.
+
+**The fix reframes Layer 2a.** Deferring `publishStateChange` too — buffering Sessions/History rows
+and writing them in the teardown txn AFTER the Traces rows — RESTORES the Traces-before-History
+ordering and closes the hazard. So Layer 2a is not "optional perf on top of Layer 1"; it is the
+**correctness completion** of Layer 1: Layer 1 alone (flush-only defer) opens the inversion, Layer
+2a closes it. Either ship them together, or (cheaper interim) make trace-id allocation
+crash-safe-monotonic so reuse can't alias.
+
+**Action items:**
+1. Add a CRASH/abrupt-exit soundness test (kill before teardown, reopen, verify no stale serve) —
+   the test class #22/#23 lacked. Hard to do in-process; may need a subprocess-kill functional test.
+2. Treat Layer 1 as INCOMPLETE on its own for the aggressive-shape future: pair it with Layer 2a
+   (defer+order publishStateChange) OR monotonic IDs. Do NOT enable the aggressive shape on Layer 1
+   alone.
+3. The committed Layer 1 stays (it's correct for clean exit + latent-only today, env-gated
+   default-off), but its doc must carry this caveat (done here).
+
+**Process note:** this is the pattern again, sharper — I validated only the easy (clean-exit) path
+and called it "soundness-clean." The crash path is exactly where a deferred-durability change is
+most dangerous, and I didn't test it. The user's instruction to re-examine semantics found a real
+hole reasoning-from-the-happy-path had missed.
