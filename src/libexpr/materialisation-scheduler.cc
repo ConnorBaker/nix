@@ -358,6 +358,16 @@ void MaterialisationScheduler::materialiseGroup(
     auto * localStore = dynamic_cast<LocalStore *>(&*state.store);
     auto cached = peekNarHash(regs.at(firstPh)->contentId);
 
+    /* narSize is name-independent (the NAR doesn't encode the store path), so
+       every linked sibling's narSize is the first sibling's. `firstPath` is
+       loop-invariant, so query it ONCE here rather than once per sibling — the
+       cargo-workspace shape can have hundreds of siblings, each `queryPathInfo`
+       being a path-info DB / cache lookup. Only needed when we'll actually link
+       (a valid `firstPath` + LocalStore + cached narHash). */
+    std::optional<uint64_t> firstNarSize;
+    if (localStore && cached)
+        firstNarSize = state.store->queryPathInfo(firstPath)->narSize;
+
     if (group.size() >= 2)
         debug(
             "materialise: contentId group of %d siblings — copied '%s' once, %s the rest",
@@ -391,9 +401,9 @@ void MaterialisationScheduler::materialiseGroup(
 
         try {
             auto toInfo = ValidPathInfo::makeFromCA(*state.store, reg->name, std::move(desc), *cached);
-            /* narSize is name-independent (the NAR doesn't encode the
-               store path), so the first sibling's narSize is this one's. */
-            toInfo.narSize = state.store->queryPathInfo(firstPath)->narSize;
+            /* Hoisted above the loop (see `firstNarSize`); `linkable` implies
+               it's set. */
+            toInfo.narSize = *firstNarSize;
             localStore->registerLinkedCAPath(firstPath, toInfo);
             debug(
                 "materialise: hardlinked sibling '%s' from '%s' (no re-walk, no re-copy)",

@@ -86,14 +86,21 @@ struct MaterialisationScheduler
     Hash narHashOf(const SourceContentId &);
 
 private:
+    /* These three are read-mostly (written once at registerView / once per
+       cold walk, READ on every demand — including concurrently by the parallel
+       `outPathsOf` group threads). `SharedSync` (not `Sync`) so `.readLock()` is
+       a genuine shared lock: under `Sync`, `readLock()` is an *exclusive*
+       std::mutex acquire, serialising the per-group lookups. Write sites use
+       `.lock()` (exclusive) under both, so the change is API-compatible. */
+
     /* contentId → narHash. Cached in-process; backed by Track D's
        persistent filteredSourcePathToHash projection so cross-
        process sharing is automatic. */
-    Sync<std::unordered_map<SourceContentId, Hash>> narHashByContent_;
+    SharedSync<std::unordered_map<SourceContentId, Hash>> narHashByContent_;
 
     /* placeholder → registration. Constructed at registerView,
        consulted at outPathOf. */
-    Sync<std::unordered_map<SourcePlaceholder, std::shared_ptr<Registration>>> registrations_;
+    SharedSync<std::unordered_map<SourcePlaceholder, std::shared_ptr<Registration>>> registrations_;
 
     /* contentId → registrations sharing it. A secondary index built
        alongside `registrations_` so `narHashOf`'s walk-winner can find
@@ -102,7 +109,7 @@ private:
        share one contentId (the cargo-workspace shape), hence multimap;
        any of them suffices as the walk source (same contentId ⇒ same
        narHash). */
-    Sync<std::unordered_multimap<SourceContentId, std::shared_ptr<Registration>>> regsByContent_;
+    SharedSync<std::unordered_multimap<SourceContentId, std::shared_ptr<Registration>>> regsByContent_;
 
     /* In-flight walks: shared_future for coalescing. Keyed on
        contentId — concurrent demands for the same content share
