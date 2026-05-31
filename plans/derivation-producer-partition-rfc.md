@@ -232,6 +232,27 @@ specified; it is enforced at the consumer's edge-recording site, and is
 mechanically checkable from the recorded dep set (a recorded facet dep is the
 signal the observation was not output-only).
 
+> **Load-bearing assumption made explicit (adversarial pass #4, Attack I).** "Facet
+> reads happen OUTSIDE `derivationStrict`" is NOT an intrinsic property of the
+> primop — `derivationStrictInternal`'s attr loop (primops.cc:1747) forces EVERY
+> attr of the arg attrset (the default case at ~:1902 `coerceToString`s unknown
+> attrs into `drv.env`). If `meta`/`passthru` were passed in the arg attrset, they
+> WOULD be forced inside `derivationStrict` and their reads trapped in the producer.
+> The gate is sound only because the Nix-level wrapper STRIPS them: nixpkgs
+> `mkDerivation` builds `derivationArg = makeDerivationArgument (removeAttrs attrs
+> ["meta" "passthru" …])` (make-derivation.nix:828-831), and the in-tree test shim
+> does the same — `derivation (… // removeAttrs args ["builder" "meta"]) // { meta
+> = args.meta or {}; }` (tests/functional/config.nix.in:29-30) — re-attaching
+> `meta` only on the OUTER package attrset. So facet reads land in the consumer
+> scope via the outer attrset, as §5 claims. CAVEAT: a hand-written
+> `derivationStrict`/`derivation` call that passes `meta` directly (bypassing
+> `mkDerivation`) would force the facet inside the boundary → over-capture into the
+> producer. That is still SOUND (the facet read becomes a recorded producer dep, so
+> a change invalidates via producer verification; the gate's "recorded facet dep ⇒
+> not output-only" detection still fires) — it is a precision cost, not a hole. But
+> the gate's CLEAN output-only case relies on the `removeAttrs` convention, which a
+> prototype must not assume holds for arbitrary `derivation` callers.
+
 ## 6. Blast radius / cost (must be measured, not assumed)
 
 - A new `DepCaptureScope` per `derivationStrict` call (~10,455/closure measured,
