@@ -178,6 +178,12 @@ in
 
   fetch-git = runNixOSTest ./fetch-git;
 
+  git-lazy-fetch = runNixOSTest ./git-lazy-fetch.nix;
+
+  # Opt-in 3-way comparison (ours-on/ours-off by default; pass `extraNixes`
+  # to add the upstream baseline + the DetSys fork — see the file header).
+  git-lazy-fetch-compare = runNixOSTest (import ./git-lazy-fetch-compare.nix { });
+
   ca-fd-leak = runNixOSTest ./ca-fd-leak;
 
   content-encoding = runNixOSTest ./content-encoding.nix;
