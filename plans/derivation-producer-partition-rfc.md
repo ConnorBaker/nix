@@ -265,26 +265,44 @@ signal the observation was not output-only).
    `__ignoreNulls` force at primops.cc:1796 happens AFTER the sub-scope is pushed
    and that its dep isn't diverted (e.g., by a `PublicationWarmupScope` or
    replay-publish path). UNVERIFIED.
-3. **Ambient deps forced during the per-attr loop that are NOT the producer's.**
-   §1 argued the arg attrset spine is built pre-boundary (WHNF before the primop,
-   eval.cc:2445). But the per-attr force can trigger lazy thunks that read ambient
-   state shared with the consumer (e.g. a `with pkgs;` lookup deferred into an attr
-   value). PARTIALLY RESOLVED (pass #2 Attack F) for the SHARED-THUNK sub-case: a
-   thunk `x` used both in the derivation args AND elsewhere in the consumer
-   (`{ drv = mkDerivation { buildCommand = x; }; other = x; }`) is precision-safe
-   under isolation, because deps are recorded to TWO orthogonal channels — the
-   per-scope `ownDeps` (popped with the producer sub-scope → producer trace) AND
-   the durable global `epochLog_` (`recordThunkDeps` memoizes `x`'s range, keyed by
-   Value; `popScope`/`takeDeps` at dep-recording-context.hh:348-372 do NOT touch
-   `epochLog_`). So `other` re-forcing `x` replays `x`'s range from the epoch log
-   into `other`'s scope regardless of the producer sub-scope having popped. The
-   shared thunk is covered for both the producer AND the independent consumer use.
-   STILL UNCHARACTERIZED: a dep forced inside the sub-scope that is
-   consumer-legitimate but the consumer does NOT independently re-force (so it never
-   replays out of the epoch log into a consumer scope). Whether such a dep exists,
-   and whether losing it from the consumer is a soundness hole or only an
-   over-capture into the producer, is the residual hard part. This is the one place
-   the original vague revert comment still points at something real and unresolved.
+3. **Deps forced inside the sub-scope that aren't producer-intrinsic — RESOLVED to
+   PRECISION, not soundness (pass #2 Attack F + pass #3 Attacks G/H).**
+   CORRECTION to an earlier draft assumption: the arg attrset is NOT WHNF before
+   `prim_derivationStrict`. Primops receive raw `Value*` (eval.cc:2445 dispatches
+   `fn->impl(...args.data()...)` without forcing), so `forceAttrs(*args[0])`
+   (primops.cc:1602) is the FIRST force — meaning the attrset-construction work (the
+   `mkDerivation` `//` merge, `with pkgs;` lookups) runs INSIDE the would-be producer
+   sub-scope, not before it. So those deps DO fire inside the boundary. Measured
+   (Attack H): a `readFile(which.txt)` used in the consumer's `//` merge fires inside
+   `forceAttrs`; two contents that produce the identical drv (`my1sjwlvz…`) both
+   record it into the boundary.
+   But this is a PRECISION cost, not a soundness hole, by the following dichotomy
+   (Attack G). Every dep forced inside the sub-scope lands in exactly one of:
+   - **`ownDeps`** (the producer sub-scope's) → the producer trace, verified by its
+     `trace_hash` (which folds in ALL its deps, drvPath-folding or not — §3). A change
+     to any such dep → producer re-verify (re-reads current FS, Attack C) → producer
+     hash changes → consumer edge mismatch → consumer invalidates. SOUND. Covers both
+     Case 1 (folds into drvPath) and Case 2 (`__ignoreNulls` dropped-read, §2) and the
+     Attack-H merge-dep.
+   - **`epochLog_`** (the durable global log) → replayable. If the consumer
+     independently re-forces the thunk, it replays the range into the consumer scope
+     (Attack F: `popScope`/`takeDeps` at dep-recording-context.hh:348-372 don't touch
+     `epochLog_`). SOUND for the shared-thunk case.
+   - **neither** → dropped. This is the PRE-EXISTING `nrDepRecordNoActiveContext` path
+     (recording.cc:404-412): fires only when NO `DepRecordingContext` is active
+     (manual/internal evals), independent of any sub-scope. A producer sub-scope is
+     itself a `DepCaptureScope` on the stack, so in-boundary reads route to it, not to
+     nothing. Isolation introduces no NEW drop here; whatever this path loses today,
+     the conservative shape loses identically.
+   Net: isolation introduces **no new soundness hole** — every in-boundary dep is
+   either in the producer trace (sound via producer verification) or replays to the
+   consumer (sound) or was already dropped pre-isolation. What isolation DOES introduce
+   is **over-capture**: a purely-consumer dep (e.g. the Attack-H merge `readFile`) gets
+   trapped in the producer trace, so a change to it over-invalidates the producer (and
+   thus its consumers) even though no consumer's OWN observation changed. That is a
+   precision cost in the same family as §3b/Attack D, bounded and measurable, NOT a
+   correctness problem. The residual question is therefore quantitative (how much
+   over-capture on a real workload), folded into §7.6 + §6, not a soundness blocker.
 4. **Hot-path cost (§6).** The one number that decides go/no-go. Needs a throwaway
    prototype + Ledger-D bench, exactly the §7 slice shape.
 5. **Nested derivations.** A buildInput is itself a derivation forced inside the
@@ -314,11 +332,26 @@ signal the observation was not output-only).
    suite + byte-identical gate, and only then consider default-on.
 
 ## 9. What this RFC does NOT claim
-- NOT that the partition is definable — §7.3 is genuinely open; the ambient-vs-
-  intrinsic boundary is the residual hard part and may not be cleanly separable.
-- NOT that the hot-path cost is acceptable — §6 is unmeasured.
+- NOT that the hot-path cost is acceptable — §6 is unmeasured and is the go/no-go.
 - NOT that drvPath is the verification key — §2 disproves that; drvPath is routing
   only, trace_hash is verification.
-- It DOES claim: the soundness obligation is now concrete and reproducible (§2),
-  the design that discharges it for the dropped-read case is specified (§3), and
-  the remaining unknowns are enumerated as gated, testable steps (§7/§8).
+- NOT that precision is preserved — the design has TWO measured over-capture /
+  over-invalidation sources (§3b/§7.6 routing-key aliasing; §7.3 in-boundary
+  consumer-dep capture). Both are SOUND (over-invalidate, never stale-serve) but
+  eat into the amortization win, so the NET benefit is unproven pending §6/§7.6
+  measurement.
+- It DOES claim (and these are now grounded, not aspirational):
+  - The soundness obligation is concrete and reproducible (§2) and pinned by a
+    committed test (`DrvIgnoreNullsDroppedRead_ChangeInvalidatesConsumer`).
+  - The design discharges it by decoupling routing (drvPath) from verification
+    (trace_hash over the recorded sub-scope deps), and that decoupling is sound by
+    the recompute-and-compare in the existing verifier (§3, Attack C).
+  - Isolation introduces **no new soundness hole** vs the conservative shape — every
+    in-boundary dep is covered by producer verification, consumer replay, or was
+    already dropped pre-isolation (§7.3 dichotomy, Attacks F/G/H). The earlier
+    "ambient-vs-intrinsic boundary may not be cleanly separable" worry is RESOLVED:
+    it need not be separated for SOUNDNESS; separation only buys PRECISION.
+  - The remaining unknowns are the hot-path cost (§6/§7.4) and the magnitude of the
+    two precision costs (§7.6) — all quantitative, gated, and testable. There is no
+    remaining open SOUNDNESS question; the blocker is now "is the net perf win real,"
+    which only a prototype + Ledger-D bench answers.
