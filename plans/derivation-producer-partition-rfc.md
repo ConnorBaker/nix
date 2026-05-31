@@ -276,22 +276,34 @@ about, NOT a mitigation to build).
 > key.** The earlier "granularity is a tuning parameter" framing is withdrawn — the
 > parameter has a determined value.
 
-## 4. What this buys (the benefit §3b couldn't deliver)
+## 4. What this buys — IF the consumer-sharing exists (the benefit §3b couldn't deliver)
 
-Under §3b conservative, the consumer kept the flattened closure AND a producer
-was recorded → strictly more work, the measured net loss. Under this design the
-consumer keeps ONE edge instead of the flattened producer closure:
+Every benefit in this section is CONDITIONAL on producers being consumed by N>1
+distinct consumers per eval (§7.7, the master go/no-go, UNMEASURED; RP#5 measured the
+as-built gate firing ~0). Stated as the mechanism that WOULD deliver the win where
+sharing exists, not as a delivered win — §4 is the design's promise, §6/§7.7 are the
+unmet measurement bar.
+
+Under §3b conservative, the consumer kept the flattened closure AND a producer was
+recorded → strictly more work, the measured net loss. Under this design the consumer
+keeps ONE edge instead of the flattened producer closure, SO WHERE a producer is
+shared by N>1 consumers:
 - The 607× shared-closure duplication collapses to 1 edge per consumer per
   producer (the `dep-flattening-baseline.cc` "before" this is designed to move).
+  For singly-consumed producers (N=1) it is a small net add, not a collapse (§6).
 - `resolveTraceContextHash` verifies each producer ONCE per session and memoizes
   (verifier.cc:255-276 + `verifiedTraceIds` early-out at :1786) — the build-layer
-  `hashDerivationModulo`+`drvHashes` amortization lifted to eval, already proven
-  reachable by `ca-trace-key-routing.cc` R2.
-- Storage drops: producers are content-addressed/deduped; each carries its own
-  input deps once instead of N copies in N consumers.
+  `hashDerivationModulo`+`drvHashes` amortization lifted to eval, proven REACHABLE by
+  `ca-trace-key-routing.cc` R2. "Reachable" ≠ "triggers on the workload": whether a
+  consumer at the args-force boundary actually edges to a SHARED producer is exactly
+  the §7.7b open question (RP#5's as-built gate did not).
+- Storage drops IN AGGREGATE because the 607× is dominated by high-N shared infra
+  (§6 refinement); per singly-consumed producer it is a small add.
 
-This is the first shape where the producer trace REPLACES consumer work rather
-than adding to it — the precondition for any net win.
+This is the first shape where the producer trace COULD replace consumer work rather
+than add to it — the precondition for any net win, contingent on §7.7. If §7.7
+measures sharing ~1 at the args-force boundary, this section's benefits do not
+materialize and the design reduces to §3b's net loss (§9).
 
 ## 5. Facet gate (unchanged, still binds)
 
