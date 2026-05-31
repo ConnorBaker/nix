@@ -47,22 +47,26 @@ only the current settled state:
   passes #2/#3; design positively confirmed by pass #13/Attack Q — `computeTraceHash`
   is over the dep vector, so `__ignoreNulls`-dropped reads fold in). Routing key is
   `drvPath`, determinate; do NOT fold deps into it (pass #12).
-- **The blocker is PERF, not soundness. §8 step 0 was attempted and the first verdict
-  was RETRACTED — the measurement was confounded (2026-05-31).** A probe hooked at
-  `prim_derivationStrict` reported "mean 1.33 consumers/producer, 85.9% singly-consumed
-  → STOP." **That verdict is INVALID.** `prim_derivationStrict` runs ONCE per derivation
-  (thunk memoization); the second+ consumer of a shared derivation gets the
-  already-evaluated Value and never re-runs the primop, so the probe counted only the
-  FIRST forcer of each derivation and was structurally blind to exactly the
-  memoized-thunk sharing the RFC targets. Controlled test: one derivation consumed by
-  three sibling scopes was reported as N=1. The "86% singly-consumed" is a memoization
-  artifact, not a workload property. The faithful site is the per-consumer re-force
-  (`replayMemoizedDeps` epoch-range replay of a memoized derivation-result Value), where
-  the closure actually flattens into each consumer. **Re-measurement is in progress; the
-  go/no-go (§7.7b) is OPEN again, NOT decided.** See `doc/eval-trace-cache-redesign-plan.md`
-  follow-up #9 (the retraction) + #10 (the corrected measurement, when done).
+- **The blocker is PERF, not soundness. §8 step 0's first probe gave a FALSE STOP
+  (retracted); the corrected measurement shows the sharing premise HOLDS (2026-05-31).**
+  A probe at `prim_derivationStrict` reported "85.9% singly-consumed → STOP" — INVALID:
+  the primop runs ONCE per derivation (memoization), so it counted only first-forcers
+  and was blind to the memoized-thunk sharing the RFC targets (redesign-plan follow-up
+  #9 retraction; a re-hook at `replayMemoizedDeps` ALSO failed a controlled case because
+  the re-forced Value is the output STRING, not the derivation attrset — the probe was
+  removed). The faithful measurement is a UNIT test through the real
+  `makeCache`/`TracedExpr` consumer machinery
+  (`dep-flattening-baseline.cc::SharedDrv_SameOutPath_BothConsumersFlattenInputClosure`):
+  one shared derivation, two consumers reading the SAME `.outPath`, BOTH traces
+  independently carry its input closure (`cxHasFile=1 cyHasFile=1`). So **the 607×
+  consumer-sharing is REAL** — `replayMemoizedRange` flattens a shared derivation's
+  closure into EVERY consumer trace, decisively at unit scale. §7.7b premise HOLDS.
+  STILL OPEN (the real remaining work, no longer behind a false STOP): the
+  WORKLOAD-SCALE sharing distribution (the unit test proves the MECHANISM, not the
+  population) and the args-force sub-scope hot-path cost (§6). See
+  `doc/eval-trace-cache-redesign-plan.md` follow-up #10.
 - **Honest scope:** ALT-4 (verify-time fragment sharing, §7.8) remains a real
-  alternative regardless of how the re-measurement lands.
+  alternative regardless.
 
 ## 1. Why this is the only remaining shape (the funnel)
 

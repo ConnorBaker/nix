@@ -110,4 +110,66 @@ TEST_F(MaterializationDepTest, SharedFileDep_CountScalesWithConsumers)
            "would collapse to one reference)";
 }
 
+// DECISIVE for the producer-partition RFC's sharing premise (added 2026-05-31 after
+// the §8-step-0 probe was retracted for memoization-confounding): when a SHARED
+// derivation `d` is consumed by TWO siblings BOTH reading the SAME `.outPath`, does
+// the second consumer's trace ALSO independently carry `d`'s INPUT closure (the
+// shared readFile), or does thunk memoization mean only the FIRST consumer flattens
+// it (and the second gets nothing / a memoized-cheap dep)?
+//
+// This is the question the retracted probe failed to answer. If BOTH carry it, the
+// 607× is real consumer-sharing the RFC could collapse (sharing exists, go). If only
+// ONE carries it, the "shared derivation re-flattened by N consumers" premise is
+// wrong for the same-output case — the flattening is per-distinct-force, and the RFC's
+// amortization target is narrower than assumed.
+TEST_F(MaterializationDepTest, SharedDrv_SameOutPath_BothConsumersFlattenInputClosure)
+{
+    TempTextFile shared("payload-v1");
+    // d is a SHARED derivation whose args embed the shared file's content. cx and cy
+    // BOTH read d.outPath (the SAME field) — so d is forced once (memoized) and both
+    // siblings select the same output string.
+    auto expr = std::format(
+        R"(let
+             content = builtins.readFile {0};
+             d = derivation {{
+               name = "shared-drv";
+               builder = "/bin/sh";
+               system = builtins.currentSystem;
+               args = [ content ];
+             }};
+           in {{ cx = d.outPath; cy = d.outPath; }})",
+        shared.path.string());
+
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        state.forceAttrs(root, noPos, "test");
+        for (auto * name : {"cx", "cy"}) {
+            auto * a = root.attrs()->get(state.symbols.create(name));
+            ASSERT_NE(a, nullptr);
+            state.forceValue(*a->value, noPos);
+        }
+    }
+
+    auto cxDeps = getStoredDeps("cx");
+    auto cyDeps = getStoredDeps("cy");
+    auto fileName = std::string(shared.path.filename());
+
+    bool cxHasFile = hasDep(cxDeps, CanonicalQueryKind::FileBytes, fileName);
+    bool cyHasFile = hasDep(cyDeps, CanonicalQueryKind::FileBytes, fileName);
+
+    // Characterization — log the finding; assert only the weakest true fact so this
+    // records reality rather than a presumed answer.
+    GTEST_LOG_(INFO) << "SHARED-DRV SAME-OUTPATH FLATTEN: cxHasFile=" << cxHasFile
+                     << " cyHasFile=" << cyHasFile
+                     << "  (both true => 607× consumer-sharing is real for the RFC; "
+                        "only one => same-output flatten is NOT re-duplicated, RFC target narrower)";
+    GTEST_LOG_(INFO) << "cx deps:\n" << dumpDeps(cxDeps);
+    GTEST_LOG_(INFO) << "cy deps:\n" << dumpDeps(cyDeps);
+
+    EXPECT_TRUE(cxHasFile || cyHasFile)
+        << "at least one consumer must carry the shared derivation's input dep\n"
+        << dumpDeps(cxDeps) << "\n--\n" << dumpDeps(cyDeps);
+}
+
 } // namespace nix::eval_trace

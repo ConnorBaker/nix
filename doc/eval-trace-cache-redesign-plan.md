@@ -2681,3 +2681,49 @@ record-time producer edge is measured not-worth-building. Probe + soundness scaf
 tree. Reproduce: `NIX_MEASURE_DRV_SHARING=1 NIX_MEASURE_DRV_SHARING_PATH=/tmp/r.txt nix eval
 --impure --json --expr 'builtins.mapAttrs (n: v: (builtins.tryEval (v.outPath or "")).value)
 (import <nixpkgs> {}).python3Packages'`.
+
+### 2026-05-31 follow-up #10: consumer-sharing RE-MEASURED correctly — the RFC's sharing premise HOLDS (unit scale, decisive)
+
+Follow-up #9's probe was retracted (confounded by thunk memoization — it hooked the
+one-time `prim_derivationStrict`). Re-hooking it at `replayMemoizedDeps` ALSO failed a
+controlled-case validation (still reported a 3-consumer-shared derivation as N=1),
+because the per-consumer event re-forces the OUTPUT STRING, not the derivation
+attrset — three confounds, all from trying to count via the wrong Value/site. The
+probe was REMOVED (confounded instrumentation is worse than none).
+
+The faithful measurement is a UNIT test through the real `makeCache`/`TracedExpr`
+consumer-trace machinery (where each consumer is a genuine attr-path trace and the
+materialize path replays a memoized derivation's dep range into each consumer's
+scope): `dep-flattening-baseline.cc::SharedDrv_SameOutPath_BothConsumersFlattenInputClosure`.
+
+Shape: one SHARED derivation `d` (args embed `readFile(shared)`), consumed by two
+siblings BOTH reading the SAME `d.outPath` (d forced once, memoized). Question: does
+the second consumer's trace ALSO carry d's input closure, or does memoization mean
+only the first flattens?
+
+**MEASURED: cxHasFile=1, cyHasFile=1** — BOTH consumers independently carry the shared
+derivation's input `FileBytes` (and the `.drv` dep), even reading the identical output
+off a once-forced derivation. So **the 607× consumer-sharing the RFC targets is REAL**:
+a shared derivation's input closure flattens into EVERY consumer trace via
+`replayMemoizedRange`, not just the first forcer. The §7.7b go/no-go premise (producers
+are consumed by N>1 distinct consumers, and each re-flattens) HOLDS at unit scale,
+decisively.
+
+**Net correction to #9:** the STOP was a measurement artifact, fully retracted. The
+sharing exists; the direction is NOT killed. What remains genuinely open (and is the
+real §7.7b/§6 work) is the WORKLOAD-SCALE distribution + the hot-path cost — i.e. how
+many consumers share each derivation across a full python3Packages eval (the unit test
+proves the MECHANISM, not the population), and whether the args-force sub-scope's
+overhead is acceptable. Those still need measurement, but they are no longer gated
+behind a false STOP.
+
+**Lesson (the third confound in this arc, now costly):** a measurement probe must be
+validated against a CONTROLLED case with a known answer BEFORE its verdict is trusted —
+the #9 probe, the replayMemoizedDeps re-hook, and the original prim_derivationStrict
+hook all looked plausible and all measured the wrong event. The unit test through the
+real consumer-trace path is faithful because it inspects STORED per-consumer traces, not
+a probe at a guessed site. Prefer "inspect the artifact the system actually produced"
+over "instrument the event I think corresponds to it."
+
+**What stays in tree:** the decisive unit test (regression guard for the sharing
+mechanism). The confounded probe was removed.

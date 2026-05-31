@@ -9,7 +9,6 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-trace/context.hh"
-#include "nix/expr/eval-trace/drv-sharing-probe.hh"
 #include "nix/expr/eval-trace/deps/dep-capture-scope.hh"
 #include "nix/expr/eval-trace/deps/trace-activation-scope.hh"
 #include "nix/expr/eval-trace/deps/trace-access.hh"
@@ -96,11 +95,6 @@ void TracedExpr::evaluateResolvedTarget(EvalContext<Suspendable> & ctx, Value & 
     TraceSessionActivationScope activeSession(*cache);
     DepCaptureScope depCapture(cache->state.tracingPools(), cache->registry_);
     TraceActivationScope traceActivation(cache->state);
-
-    // MEASUREMENT-ONLY (RFC §8 step 0, env-gated NIX_MEASURE_DRV_SHARING=1; no-op
-    // otherwise): mark this consumer TracedExpr's pathId as the current consumer,
-    // so derivations forced during its evaluation attribute their sharing to it.
-    drv_sharing_probe::ConsumerScope drvSharingConsumer(pathId.value);
 
     // Lock-file dep precision: flake.lock changes are tracked via per-key
     // StructuredContent deps recorded during callFlake graph traversal.
