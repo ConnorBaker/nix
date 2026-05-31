@@ -37,6 +37,14 @@ bool enabled();
 /// process-global per-kind histogram + per-derivation total. No-op when disabled.
 void recordDerivationRange(const std::vector<Dep> & deps);
 
+/// Tally the dep-kind breakdown of one CONSUMER trace's full dep set (the deps a
+/// `TracedExpr` finalizes at `evaluateResolvedTarget`). This is the DENOMINATOR of
+/// the benefit ratio — total flattening per consumer trace — vs `recordDerivationRange`
+/// (the numerator: derivation-closure deps an edge would remove). Comparing the two
+/// aggregate breakdowns is what answers "what fraction of consumer flattening is
+/// edge-removable." No-op when disabled.
+void recordConsumerTrace(const std::vector<Dep> & deps);
+
 /// Dump the aggregate breakdown (per-kind dep counts + the implied
 /// edge-removable fraction) at process exit. No-op when disabled.
 void dump();
