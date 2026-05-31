@@ -48,10 +48,34 @@ measured or code-traced to failure. Summarizing so this RFC doesn't re-walk them
 The flatten happens at `forceAttrs(*args[0])` + the per-attr force loop inside
 `prim_derivationStrict` (primops.cc:1602 + the `lexicographicOrder` loop at
 :1747). Confirmed by the cw discriminator (RP#8): a consumer that forces the args
-deeply but reads no output string still carries the input `FileBytes`. **The only
-site at which an edge can replace that flatten is a dep-capture sub-scope around
-that force.** That is the aggressive shape. So the design space has funneled to:
-"make the aggressive shape sound," and nothing else.
+deeply but reads no output string still carries the input `FileBytes`. The only
+site at which a RECORD-TIME edge can replace that flatten is a dep-capture sub-scope
+around that force — the aggressive shape. So within the *record-time-edge* family,
+the design space has funneled to "make the aggressive shape sound."
+
+> **Scope honesty (adversarial pass #9, Attack M — the funnel is NOT the whole
+> design space).** The funnel above exhausts the RECORD-TIME-edge family (replace the
+> flatten as it is recorded). It does NOT exhaust ways to attack the 607× cost. The
+> notable un-refuted alternative is **ALT-4: verify-time fragment sharing** — keep
+> the conservative flattened recording, but at VERIFY collapse identical shared
+> sub-closures so a shared closure (stdenv) is verified ONCE per session instead of
+> re-walked in all 607 consumers. This attacks the same 607× re-verify cost WITHOUT a
+> record-time sub-scope, so it SIDESTEPS the vptr-in-hot-loop hazard that is this
+> RFC's biggest risk (§6). It is materially different from the aggressive shape and
+> is NOT cleanly refuted: it is adjacent to L-A (dep-fragment factoring, refuted
+> because the global dep sort + positional `dep.ordinal` prevent fragment
+> composition — `perf-levers-cold-and-hot.md`) and to L-B (session dep-verdict memo,
+> refuted because L1 `currentDepHashes_` already memoizes per-DEP), but ALT-4 is
+> per-FRAGMENT (a shared sub-closure verified once), which neither refutation
+> directly covers. Why this RFC pursues the record-time edge anyway: ALT-4 inherits
+> L-A's unsolved blocker (the flat global dep vector has no fragment boundaries to
+> share — the trace stores a flattened set, not a sub-closure DAG), so ALT-4 needs
+> the SAME compositional-trace-node identity this RFC's producer trace provides. The
+> two converge: a producer trace IS the verify-once fragment. So the RFC's design is
+> a prerequisite for ALT-4, not an alternative to it — but the RFC should not claim
+> "nothing else," and the verify-only variant (conservative record + edge only at
+> verify) is a real fallback if the record-time hot-path cost (§6) proves
+> prohibitive. Added as §7.8.
 
 ## 2. The core soundness obligation (REPRODUCER, corrects the revert prose)
 
@@ -416,6 +440,15 @@ signal the observation was not output-only).
    exists; then the only remaining question is whether the args-force edge CAPTURES
    that sharing, which needs the prototype. If even the conservative-recorder sharing
    count is ~1 across the board, STOP.
+8. **Verify-time-only fallback (pass #9, Attack M / ALT-4).** If the record-time
+   hot-path cost (§6) proves prohibitive, the fallback is: keep conservative flattened
+   recording (no sub-scope, no hot-eval-path change) and collapse shared sub-closures
+   at VERIFY time, so a shared producer is verified once per session. This needs the
+   SAME compositional fragment identity the producer trace provides (it inherits
+   L-A's unsolved "flat dep vector has no fragment boundaries" blocker — §1 note), so
+   it is downstream of, not independent of, this RFC's identity work. Worth keeping on
+   the table explicitly because it trades the §6 hot-eval-path risk for verify-path
+   work, which is a different and possibly safer risk profile. UNDESIGNED.
 
 ## 8. Recommended sequence (each gated by the standing soundness suite)
 
