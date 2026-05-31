@@ -659,7 +659,8 @@ struct SqliteTraceStorage
         const ExclusiveTraceStorageAccess &,
         AttrPathId pathId,
         const CachedResult & value,
-        const std::vector<Dep> & allDeps);
+        const std::vector<Dep> & allDeps,
+        bool deferFlush = false);
 
 
     /**

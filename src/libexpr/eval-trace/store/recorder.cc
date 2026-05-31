@@ -27,7 +27,8 @@ RecordResult Recorder::record(
     AttrPathId pathId,
     const CachedResult & value,
     const std::vector<Dep> & allDeps,
-    TraceObserver * observer)
+    TraceObserver * observer,
+    bool deferFlush)
 {
     auto recordStart = timerStart();
     nrRecords++;
@@ -74,7 +75,22 @@ RecordResult Recorder::record(
 
     // 7. Flush pending entities to DB (IDs must exist before FK references).
     // flush() also flushes vocab entries via the ATTACH'd connection.
-    storage_.flush(ea);
+    //
+    // `deferFlush` (async-producer-recording-plan Layer 1): skip this per-record
+    // flush. Entities remain buffered in `pending*` and are drained by the next
+    // non-deferred flush or the destructor's `flushExclusive()`. SOUNDNESS: the
+    // step-8 `publishRecord` below still updates in-memory caches synchronously
+    // (within-session verify + getCurrentTraceHash read those, not SQLite), and
+    // its `publishStateChange` Sessions/History write has NO foreign key to Traces
+    // (schema: Sessions.trace_id is a bare INTEGER, no REFERENCES; only
+    // Traces.dep_key_set_id → DepKeySets is FK-constrained, and those flush together
+    // in dependency order). So a deferred entity flush cannot FK-violate the Sessions
+    // write. The only behavioural change is durability timing: buffered entities
+    // become durable at the batched/destructor flush instead of immediately — a crash
+    // mid-eval loses buffered producer traces (acceptable for a CACHE: a lost producer
+    // is a future cache miss, never a wrong answer).
+    if (!deferFlush)
+        storage_.flush(ea);
 
     // 8. Atomically publish: DB writes + all session cache updates.
     // `publishRecord` takes header/sorted/keys by value and moves from

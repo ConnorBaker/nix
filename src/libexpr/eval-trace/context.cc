@@ -9,6 +9,7 @@
 #include "nix/expr/value.hh"
 #include "nix/expr/attr-set.hh"
 #include "nix/util/logging.hh"
+#include "nix/util/environment-variables.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/store/store-api.hh"
 #include "nix/expr/eval.hh"
@@ -412,10 +413,17 @@ eval_trace::TraceBackend::recordSync(
     // Both `store->record` and `store->getCurrentTraceHash` run under the
     // same `withExclusiveAccess` scope so callers receive the freshly-
     // recorded trace's content hash without a second mutex acquisition.
+    // Layer 1 batching (async-producer-recording-plan): env-gated. When
+    // NIX_PRODUCER_DEFER_FLUSH=1, skip the per-producer flush — entities buffer in
+    // `pending*` and drain at the destructor's `flushExclusive()`. getCurrentTraceHash
+    // below still works (it reads in-memory caches populated by publishRecord, not
+    // SQLite), so the producerMap edge is still registered synchronously.
+    static const bool deferProducerFlush =
+        getEnv("NIX_PRODUCER_DEFER_FLUSH").value_or("") == "1";
     std::optional<RecordSyncResult> out;
     gdp::Certifier<BlockingTag>::withProof([&](const auto & bs) {
         store->withExclusiveAccess(bs, [&](const auto & ea) {
-            auto rec = store->record(ea, pathId, value, allDeps);
+            auto rec = store->record(ea, pathId, value, allDeps, deferProducerFlush);
             auto hash = store->getCurrentTraceHash(ea, pathId);
             if (!hash) return;
             out = RecordSyncResult{rec, *hash};

@@ -3247,3 +3247,44 @@ benefit case is materially stronger than #19/#20 left it (verify win confirmed, 
   FileBytes, real flat per-dep is costlier → real M < 1 → the verify win is STRONGER. So M≈1 is an
   edge-UNFAVORABLE estimate; it cannot flip the WIN verdict, only improve it.
 The verify-gate = WIN verdict is robust to both.
+
+### 2026-05-31 follow-up #22: async-recording Layer 1 (batch the flush) IMPLEMENTED + measured — −40% record cost, soundness-clean
+
+Implemented Layer 1 of the async-producer-recording plan: a `deferFlush` flag threaded
+`recordSync` → `SqliteTraceStorage::record` → `Recorder::record` (all defaulted false, zero blast
+radius — 181 record/CA tests pass). Env-gated `NIX_PRODUCER_DEFER_FLUSH=1`. When set, the producer
+path skips the per-record `storage_.flush(ea)` (recorder.cc step 7); entities stay buffered in
+`pending*` and drain at the destructor's `flushExclusive()`. In-memory caches still update
+synchronously via `publishRecord`, so `getCurrentTraceHash` (→ the producerMap edge) is unaffected.
+
+**Soundness (validated, not assumed):**
+- Byte-identical eval output, defer-flush ON vs OFF (numpy/scipy/pandas outPaths). ✓
+- Cross-process warm-HIT preserved: on a baseline-warm-hitting file eval (derivation outPath),
+  proc-1 cold-record (defer-flush) → proc-2 `NIX_ALLOW_EVAL=0` warm verify HITS — same as baseline.
+  So the teardown flush durably writes the buffered producers for the next process. ✓ (Verified the
+  control: the python3Packages `--expr` shape warm-MISSES even at baseline — a workload artifact,
+  not defer-flush — so I used a shape that baseline-HITS to fairly test durability.)
+- Schema check: `Sessions.trace_id` has NO foreign key (bare INTEGER), so deferring the entity
+  flush cannot FK-violate publishStateChange's Sessions write. Only `Traces.dep_key_set_id →
+  DepKeySets` is FK-constrained, and those flush together in dependency order.
+- Durability-timing change stated: a crash mid-eval loses buffered producers (acceptable for a
+  CACHE — a lost producer is a future miss, never a wrong answer).
+
+**Cost (measured, python3Packages 5-package map, 3,201 producers):**
+
+| | record.timeUs | flushUs | hashUs |
+|---|---:|---:|---:|
+| defer-flush OFF | 2.699s | 1.126s | 0.781s |
+| defer-flush ON | 1.623s | 0.046s | 0.784s |
+| Δ | **−40%** | −96% (gone; 0.046s = the one teardown flush) | unchanged |
+
+**Layer 1 delivers −40% of producer-record cost**, exactly as the §3a split predicted (flush was
+~44%). The residual is hashUs (~0.78s, unchanged — Layer 1 doesn't touch CPU) + the publish/encode
+CPU. So the remaining ~60% is the CPU that only Layer 2 (off-thread hash+serialize) addresses.
+
+**Honest state:** Layer 1 is a real, soundness-clean −40% on the §3b-dominant record cost. It does
+NOT alone make the direction net-positive (the end-to-end net still needs the full aggressive
+recorder + this batching + the §21 verify win combined, and likely Layer 2 for the CPU). But it
+materially shrinks the last gate, and it's a shippable, low-risk improvement to the §3b
+infrastructure on its own (default-off, env-gated). Layer 2 is the next step IF a net-win
+calculation shows the remaining CPU is the deciding margin.

@@ -45,11 +45,19 @@ public:
     /// is non-null, fires `onNewTrace` and `onPublishCurrent` after
     /// the backend publish returns so downstream caches can mirror the
     /// backend's state atomically.
+    /// `deferFlush` (async-producer-recording-plan Layer 1): when true, SKIP the
+    /// per-record `storage_.flush(ea)` (step 7). Entities still BUFFER in `pending*`
+    /// and are drained by the next non-deferred flush or the destructor's
+    /// `flushExclusive()`; in-memory caches (which within-session verify +
+    /// `getCurrentTraceHash` read) are still updated synchronously via
+    /// `publishRecord`. Used by `recordSync` for producer traces to avoid N
+    /// checkpoints+COMMITs (one per producer). Env-gated at the call site.
     RecordResult record(const ExclusiveTraceStorageAccess & ea,
                         AttrPathId pathId,
                         const CachedResult & value,
                         const std::vector<Dep> & allDeps,
-                        TraceObserver * observer = nullptr);
+                        TraceObserver * observer = nullptr,
+                        bool deferFlush = false);
 
 private:
     SqliteTraceStorage & storage_;

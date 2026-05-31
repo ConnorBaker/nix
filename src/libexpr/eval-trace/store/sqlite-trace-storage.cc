@@ -655,11 +655,12 @@ SqliteTraceStorage::RecordResult SqliteTraceStorage::record(
     const ExclusiveTraceStorageAccess & ea,
     AttrPathId pathId,
     const CachedResult & value,
-    const std::vector<Dep> & allDeps)
+    const std::vector<Dep> & allDeps,
+    bool deferFlush)
 {
     // Thin delegate — the pipeline lives in `Recorder`
     // (rearchitecture-proposal.md §14 step 7 + §2.3).
-    return Recorder{*this, pools, vocab}.record(ea, pathId, value, allDeps);
+    return Recorder{*this, pools, vocab}.record(ea, pathId, value, allDeps, nullptr, deferFlush);
 }
 
 SqliteTraceStorage::CurrentNodeRef SqliteTraceStorage::publishRecord(
