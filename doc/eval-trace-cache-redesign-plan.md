@@ -2818,3 +2818,47 @@ derivation's flattened closure FileBytes/SPA (derivation-closure, edge-removable
 (possibly consumer-intrinsic)?
 
 python3Packages measurement: IN PROGRESS (next follow-up records the breakdown + verdict).
+
+### 2026-05-31 follow-up #12 part 2: benefit-probe RESULT + an adversarial self-correction (the "benefit" it measures is narrower than benefit)
+
+python3Packages run (52,184 derivationStrict calls, complete — atexit dump fired, eval exited
+clean). Per-kind breakdown of deps captured INSIDE derivationStrict ranges:
+
+| kind | % | edge-removable? |
+|---|---:|---|
+| storePathAvailability | 43.6% | yes (the `.drv` deps) |
+| structuredProjection | 40.3% | (see correction) |
+| derivedStorePath | 6.8% | yes |
+| fileBytes | 6.7% | yes |
+| implicitStructure | 2.4% | yes |
+| (rest) | <0.1% | — |
+
+mean 16.4 deps per derivationStrict range; max 10,695 (a top-level derivation whose range nests
+all its transitive derivations).
+
+**What this DOES establish (refutes #11's specific fear):** #11's correction worried StructProj
+(~48% arch-doc-wide) might be CONSUMER-INTRINSIC (the consumer's own `fromJSON`, NOT removable by
+a derivation edge). This shows StructProj appears at 40.3% INSIDE derivationStrict ranges — i.e.
+it IS substantially part of derivation closures (structured reads during derivation construction),
+not purely consumer-side. So the "StructProj is unremovable" pessimism is not supported.
+
+**ADVERSARIAL SELF-CORRECTION (caught before recording a circular claim):** it is TEMPTING to read
+this as "the edge removes ~100% of the flattening (everything in the range)." That is CIRCULAR —
+the range IS what the edge removes, by the probe's definition. The actual BENEFIT is
+(flattening removed from CONSUMER traces) / (total consumer flattening), and this probe measured
+the DERIVATION-RANGE composition, NOT the consumer-trace composition. They are different objects.
+
+**The number that should give pause:** mean 16.4 deps/derivation-range vs the arch doc's ~3,376
+deps/consumer-trace — a ~200× gap. A consumer trace's 3,376 deps are NOT one derivation's 16; they
+are the union of MANY derivations' ranges (a package transitively forces hundreds of derivations)
+plus the consumer's own reads. So benefit = (sum of the consumer's referenced derivation-ranges,
+deduped to edges) / 3,376. Whether that is most of the 3,376 (high benefit) or a minority (low
+benefit) is NOT answered by this probe — it needs correlating which derivation ranges a consumer
+trace actually flattens. UNMEASURED.
+
+**Honest status of benefit magnitude:** narrowed, not resolved. #11's worst-case fear (StructProj
+unremovable) is eased, but the consumer-trace removable FRACTION — the real benefit number — still
+needs a measurement that correlates derivation ranges with consumer-trace contents (or, more
+simply, the prototype that actually emits edges and measures the consumer-trace size delta).
+The clean way to get it is the EDGE prototype itself (measure consumer trace dep-count with vs
+without edges), which folds benefit and the part-2 hot-cost question into one build.
