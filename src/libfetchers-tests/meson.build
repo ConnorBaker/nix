@@ -104,6 +104,7 @@ if get_option('benchmarks')
     'bench-main.cc',
     'fingerprint-bench.cc',
     'filtered-shape-bench.cc',
+    'git-mechanism-bench.cc',
     'operator-stack-bench.cc',
     'projection-bench.cc',
   )
