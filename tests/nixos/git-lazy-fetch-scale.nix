@@ -2,20 +2,22 @@
 #
 # The other two lazy-fetch tests use toy repos (a few KB) — enough to prove
 # correctness and that the filter fires, but NOT to show the saving matters. This
-# one generates a deliberately large repo (thousands of files, hundreds of MB of
-# blob bytes, with Nix expressions to evaluate) on a Gitea HTTP server, then
-# measures — for `git-lazy-fetch` ON vs OFF — what three realistic access
-# patterns actually pull:
+# one generates a deliberately large repo (~48 MiB of incompressible blob bytes)
+# on a Gitea HTTP server, then measures — for `git-lazy-fetch` ON vs OFF — what
+# the LOCKED-vs-UNLOCKED × access-pattern matrix actually pulls, capturing both
+# where lazy-fetch wins and where it doesn't:
 #
-#   metadata : read only `.rev`              (no file bytes wanted)
-#   subtree  : materialise ONE small subdir  (a fraction of the tree)
-#   full     : materialise the whole tree    (everything wanted)
+#   LOCKED   (rev-pinned)   metadata / subfile-read / full  → the NEGATIVE case:
+#     isLocked() ⇒ mountInput materialises eagerly, so no pattern saves bytes.
+#   UNLOCKED (ref, no rev), impure   metadata / full        → the POSITIVE case:
+#     hits mountInput's defer path (the only quadrant where deferral fires today),
+#     so a metadata-only read pulls far fewer blobs than full materialisation.
 #
 # Metric = the on-disk size of Nix's gitv3 cache repo after the access (a
 # faithful proxy for bytes-on-wire: a blobless partial clone stores commit+tree
-# objects but defers blob packs) plus wall-clock. This empirically answers
-# "does lazy fetch save real bytes/time at scale, and on which access patterns?"
-# — including surfacing the pinned-rev-metadata-backfill behaviour on real data.
+# objects but defers blob packs) plus wall-clock. Asserts the POSITIVE win
+# (unlocked metadata-only defers the bulk), SOUNDNESS (lazy == eager path+hash),
+# and reports the locked-rev negative (the Option-A deferral gap).
 #
 # Run: nix build .#hydraJobs.tests.git-lazy-fetch-scale
 # Knobs (env, baked at eval): SCALE_DIRS, SCALE_FILES_PER_DIR, SCALE_FILE_BYTES.
@@ -162,58 +164,80 @@ in
       #     Reading `(input).outPath` instead would copy the WHOLE tree (all blobs),
       #     so it deliberately is NOT how the subtree pattern is expressed.
       #   - `.outPath` : materialise everything → all blobs wanted, no saving.
+      # LOCKED input (pinned rev): isLocked() ⇒ mountInput materialises eagerly,
+      # so lazy-fetch is pre-empted at every access pattern (the negative case).
       base = f'builtins.fetchGit {{ url = "{repo_url}"; rev = "{rev}"; }}'
+      # UNLOCKED input (ref, NO rev): in impure eval this hits mountInput's defer
+      # path — the ONLY quadrant where the blob deferral currently fires. A
+      # metadata-only read should pull dramatically fewer blobs (the positive case).
+      unlocked = f'builtins.fetchGit {{ url = "{repo_url}"; ref = "main"; }}'
       patterns = {
-          "metadata":     f'({base}).rev',
-          "subfile-read": f'builtins.readFile (({base}) + "/small/one.txt")',
-          "full":         f'({base}).outPath',
+          # locked (rev-pinned) — expected: no saving, every pattern ~= full
+          "lk-metadata":     f'({base}).rev',
+          "lk-subfile-read": f'builtins.readFile (({base}) + "/small/one.txt")',
+          "lk-full":         f'({base}).outPath',
+          # unlocked (ref, no rev), impure — expected: metadata read defers blobs
+          "ul-metadata":     f'({unlocked}).rev',
+          "ul-full":         f'({unlocked}).outPath',
       }
 
       results = {}
       print("\n=== large-repo lazy-fetch: gitv3 cache size + wall-clock ===")
-      print(f"{'pattern':10} {'lazy':5} {'cache MiB':10} {'wall s':8}")
+      print(f"{'pattern':16} {'lazy':5} {'cache MiB':10} {'wall s':8}")
       for pat, expr in patterns.items():
           for lazy in (True, False):
               kib, secs = measure(pat, expr, lazy)
               results[(pat, lazy)] = (kib, secs)
-              print(f"{pat:10} {str(lazy):5} {kib/1024:<10.1f} {secs:<8.2f}")
+              print(f"{pat:16} {str(lazy):5} {kib/1024:<10.1f} {secs:<8.2f}")
 
-      full_lazy = results[("full", True)][0]
-      full_eager = results[("full", False)][0]
-      meta_lazy = results[("metadata", True)][0]
-      sub_lazy = results[("subfile-read", True)][0]
+      lk_full_eager = results[("lk-full", False)][0]
+      lk_meta_lazy = results[("lk-metadata", True)][0]
+      lk_sub_lazy = results[("lk-subfile-read", True)][0]
+      ul_meta_lazy = results[("ul-metadata", True)][0]
+      ul_full_eager = results[("ul-full", False)][0]
 
       # Sanity: the repo really is large on the wire (incompressible content).
-      assert full_eager > 20 * 1024, f"repo too small to be meaningful: {full_eager} KiB"
+      assert lk_full_eager > 20 * 1024, f"repo too small to be meaningful: {lk_full_eager} KiB"
 
-      # MEASURED REALITY (this is the point of the test — report it, don't fake a
-      # win): for a pinned-rev `builtins.fetchGit {{ rev = ...; }}`, git-lazy-fetch
-      # pulls ~the SAME bytes as a full clone at EVERY access pattern, because the
-      # input's revCount/lastModified computation walks + backfills the whole tree
-      # before any narrow per-file prefetch runs (git.cc; see the test header and
-      # the project notes). The filtered partial clone IS created and the fetch IS
-      # `--filter=blob:none` (proven in git-lazy-fetch.nix) — but the saving is
-      # pre-empted. So the bandwidth benefit is currently UNREALISED for this
-      # dominant access pattern.
       pct = lambda a, b: (100.0 * a / b) if b else 0.0
-      print("\n--- measured reality (pinned-rev fetchGit over git-lazy-fetch) ---")
-      print(f"  metadata lazy     : {meta_lazy/1024:6.1f} MiB ({pct(meta_lazy, full_eager):.0f}% of full eager)")
-      print(f"  subfile-read lazy : {sub_lazy/1024:6.1f} MiB ({pct(sub_lazy, full_eager):.0f}% of full eager)")
-      print(f"  full eager        : {full_eager/1024:6.1f} MiB (100%)")
+      print("\n--- LOCKED (pinned-rev) input: the NEGATIVE case ---")
+      print(f"  lk-metadata lazy  : {lk_meta_lazy/1024:6.1f} MiB ({pct(lk_meta_lazy, lk_full_eager):.0f}% of full eager)")
+      print(f"  lk-subfile  lazy  : {lk_sub_lazy/1024:6.1f} MiB ({pct(lk_sub_lazy, lk_full_eager):.0f}% of full eager)")
+      print(f"  lk-full     eager : {lk_full_eager/1024:6.1f} MiB (100%)")
+      print("--- UNLOCKED (ref, no rev), impure: the POSITIVE case ---")
+      print(f"  ul-metadata lazy  : {ul_meta_lazy/1024:6.1f} MiB ({pct(ul_meta_lazy, ul_full_eager):.0f}% of full eager)")
+      print(f"  ul-full     eager : {ul_full_eager/1024:6.1f} MiB (100%)")
 
-      if sub_lazy * 2 < full_eager:
-          print("\nNOTE: lazy fetch DID defer the bulk of blobs for a single-file read.")
+      # ASSERTION 1 (the NEGATIVE, documented in git-lazy-fetch-scale's header and
+      # the project notes): a LOCKED pinned-rev input does NOT save bytes — mountInput
+      # materialises it eagerly (isLocked ⇒ no defer). We report it; if a future fix
+      # (Option A: defer locked-rev like unlocked) lands, this branch flips and the
+      # message below should be updated.
+      if lk_sub_lazy * 2 < lk_full_eager:
+          print("\nNOTE: locked-rev lazy fetch DID defer blobs — the locked-rev deferral fix has landed; update this test.")
       else:
           print(
-              "\nFINDING: git-lazy-fetch did NOT reduce bytes for a pinned-rev input at any\n"
-              "access pattern — revCount/lastModified backfill the whole tree first. The\n"
-              "mechanism is wired and sound (see git-lazy-fetch.nix); realising the saving\n"
-              "needs revCount/lastModified deferred over promisor remotes. Recorded, not hidden."
+              "\nFINDING (locked-rev, expected): git-lazy-fetch did NOT reduce bytes for a\n"
+              "pinned-rev input — mountInput materialises eagerly (isLocked ⇒ no defer).\n"
+              "Realising it needs the locked-rev deferral (Option A). Recorded, not hidden."
           )
 
-      # The assertion that MUST hold regardless of the byte finding: SOUNDNESS.
-      # Lazy and eager full materialisation produce the same store path + hash.
-      full_expr = patterns["full"]
+      # ASSERTION 2 (the POSITIVE — the win this feature is FOR): an UNLOCKED input
+      # (ref, no rev) read for metadata only, in impure eval, hits mountInput's defer
+      # path and must pull DRAMATICALLY fewer blobs than a full materialisation.
+      # This is the quadrant where lazy-fetch actually delivers. If this regresses,
+      # the feature is doing nothing useful anywhere.
+      print(f"\nunlocked metadata-only = {ul_meta_lazy/1024:.1f} MiB vs its full = {ul_full_eager/1024:.1f} MiB")
+      assert ul_meta_lazy * 2 < ul_full_eager, (
+          f"POSITIVE case FAILED: an unlocked metadata-only read ({ul_meta_lazy} KiB) should "
+          f"pull far less than full materialisation ({ul_full_eager} KiB) — lazy-fetch's "
+          f"deferral is not firing even where it's supposed to (unlocked + impure)."
+      )
+      print("OK (positive): unlocked metadata-only read defers the bulk of blobs.")
+
+      # ASSERTION 3 — SOUNDNESS regardless of byte findings: lazy and eager full
+      # materialisation of the locked input produce the same store path + hash.
+      full_expr = patterns["lk-full"]
       nixenv = "HOME=/root NIX_CONFIG='experimental-features = nix-command flakes'"
 
       def eval_full(lazy):
