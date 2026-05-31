@@ -184,6 +184,10 @@ in
   # to add the upstream baseline + the DetSys fork — see the file header).
   git-lazy-fetch-compare = runNixOSTest (import ./git-lazy-fetch-compare.nix { });
 
+  # Large-repo (~48 MB) scale measurement: what each access pattern pulls
+  # lazy-vs-eager (metadata / one-file-read / full materialise).
+  git-lazy-fetch-scale = runNixOSTest ./git-lazy-fetch-scale.nix;
+
   ca-fd-leak = runNixOSTest ./ca-fd-leak;
 
   content-encoding = runNixOSTest ./content-encoding.nix;
