@@ -132,6 +132,7 @@ if get_option('benchmarks')
     'bench-main.cc',
     'derivation-parser-bench.cc',
     'ref-scan-bench.cc',
+    'register-linked-ca-path-bench.cc',
     'register-valid-paths-bench.cc',
   )
 
