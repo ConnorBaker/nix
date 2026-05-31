@@ -2757,16 +2757,34 @@ INSENSITIVE to it across the whole plausible range (adversarially bounded):
 Even the impossible worst case gives **mean ~212 consumers/derivation**; realistically 200–2,000.
 **N≫1 robustly** — three orders of magnitude above the confounded probe's false "1.33." The
 RFC §7.7b sharing premise is confirmed at BOTH unit scale (#10, mechanism) and workload scale
-(#11, population). A derivation-edge that replaces the flattened closure with one reference
-would collapse ~12.7M derivation-flatten-instances toward ~thousands of distinct producer
-traces — the 608× duplication is overwhelmingly derivation-closure sharing.
+(#11, population). The SPA (`.drv`-existence) deps that drive this are genuinely per-derivation
+and shared N≫1 — confirmed by the unit test (the SPA dep flattens into every consumer).
 
-**Method note (the lesson applied):** this number came from re-deriving over FAITHFULLY-DECODED
-stored artifacts (the arch doc's blob decode), NOT a new live probe — after three probe
-confounds, the artifact-based path is the trustworthy one. It needed no new build or run.
+> **ADVERSARIAL-PASS CORRECTION (2026-05-31, on #11 itself — Attack B).** The original #11
+> draft said a derivation edge "would collapse the 608× — the duplication is overwhelmingly
+> derivation-closure sharing." That OVERSTATED the benefit by conflating two distinct claims:
+> (i) "derivations are shared N≫1" (ESTABLISHED — the SPA deps prove it) and (ii) "a derivation
+> edge removes the 608×" (NOT established). A derivation edge only removes deps that are part of a
+> DERIVATION's flattened closure. The arch-doc dep-kind split (sampled, n=1) is StructProj 48.4%,
+> SPA 34.9%, FileBytes 7.0%, DerivedStorePath 4.8%, ImplicitStruct 4.3%. SPA (34.9%) is
+> per-derivation → removed. But **StructProj is the PLURALITY at 48.4%, and whether it is
+> derivation-closure (removed by an edge) or the CONSUMER's own structured reads (e.g. `fromJSON`
+> on a package-set, NOT removed) is UNVERIFIED.** So the fraction of the 36.5M flattening a
+> derivation edge actually removes is **35–90%, unpinned** (35% = SPA only; 42% = +FileBytes;
+> 90% = if StructProj is also derivation-closure), NOT ~100%. Determining which requires decoding
+> real python3Packages StructProj keys (needs a python3Packages DB / generate run — not cheap).
+> So the BENEFIT MAGNITUDE is a SECOND unmeasured number, alongside the hot-path cost. N≫1 sharing
+> is unaffected; only the "how much does the edge save" claim is corrected.
+
+**Method note (the lesson applied):** the sharing number came from re-deriving over
+FAITHFULLY-DECODED stored artifacts (the arch doc's blob decode), NOT a new live probe — after
+three probe confounds, the artifact-based path is the trustworthy one. It needed no new build or
+run. (And this adversarial pass shows even the artifact-derived number needed scrutiny: the
+arithmetic was right but the INTERPRETATION — SPA-sharing ⇒ edge-removes-607× — over-reached.)
 
 **What this resolves and what it does NOT.** RESOLVED: the sharing premise (§7.7b) holds, at
-scale. NOT resolved: the args-force sub-scope HOT-PATH COST (§6) — the genuine remaining go/no-go,
-which requires the throwaway prototype that touches the hot eval path. The cheap analysis has
-taken the sharing question as far as artifacts allow; the cost question needs the prototype, a
-deliberate larger investment (RFC §8 step 3).
+scale (N≫1). NOT resolved: (1) the args-force sub-scope HOT-PATH COST (§6); (2) the BENEFIT
+MAGNITUDE (what % of flattening a derivation edge removes — 35–90%, gated on what StructProj is).
+Both need work touching real python3Packages data / the hot path (RFC §8 step 3 prototype). The
+cheap analysis took sharing as far as artifacts allow and surfaced that benefit magnitude is a
+separate open question; it did NOT establish the edge collapses the whole 607×.

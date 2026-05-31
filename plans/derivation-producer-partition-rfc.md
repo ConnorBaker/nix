@@ -65,11 +65,17 @@ only the current settled state:
   already-decoded python3Packages numbers (SPA = 34.9% of 36.5M flattened deps ≈ 12.7M
   derivation-flatten-instances over ~thousands of distinct derivations) gives **mean
   ~200–2,000 consumers per derivation** — insensitive to the one unpinned input across
-  its whole plausible range; N≫1 robustly. **So sharing is no longer open at all.** The
-  SOLE remaining go/no-go is the args-force sub-scope HOT-PATH COST (§6), which needs the
-  throwaway prototype (RFC §8 step 3) — a deliberate larger investment touching the hot
-  eval path. See `doc/eval-trace-cache-redesign-plan.md` follow-ups #10 (mechanism) + #11
-  (population).
+  its whole plausible range; N≫1 robustly. So the SHARING premise is settled.
+  TWO go/no-go numbers remain UNMEASURED (an adversarial pass on #11 corrected an
+  overstatement — see follow-up #11's correction box): (1) the args-force sub-scope
+  HOT-PATH COST (§6); (2) the BENEFIT MAGNITUDE — a derivation edge removes only the
+  *derivation-closure* portion of the 607× flattening, which is **35–90%, unpinned**
+  (SPA 34.9% removed for sure; StructProj 48.4% is the plurality and whether it is
+  derivation-closure or the consumer's own `fromJSON` reads is UNVERIFIED). #11 first
+  implied the edge collapses the whole 607× — that was wrong; sharing-exists ≠
+  edge-removes-everything. Both numbers need the §8-step-3 prototype + real
+  python3Packages data. See `doc/eval-trace-cache-redesign-plan.md` follow-ups #10
+  (mechanism), #11 (population + the benefit-magnitude correction).
 - **Honest scope:** ALT-4 (verify-time fragment sharing, §7.8) remains a real
   alternative regardless.
 
