@@ -340,20 +340,18 @@ in
           )
           print(f"OK (ssh soundness): ssh fetch agrees with http on {ssh_out}")
 
-          # WHETHER the ssh fetch was BLOBLESS (--filter) is REPORTED, not hard
-          # asserted: the ssh promisor's v2 capability probe goes through Nix's
-          # SSHMaster (honouring NIX_SSHOPTS) and its negotiation against a given
-          # sshd is environment-sensitive; the filter wiring itself has unit
-          # coverage (git-promisor-wiring.cc / pkt-line.cc). If the probe engaged,
-          # we say so; if not, we record it rather than flaking the suite.
-          if "--filter=blob:none" in ssh_trace:
-              print("OK (ssh filtered): git-lazy-fetch issued a --filter=blob:none fetch over ssh")
-          else:
-              print(
-                  "NOTE: the ssh fetch was NOT blobless in this VM — Nix's SSHMaster v2 "
-                  "capability probe did not detect `filter` against this sshd. The ssh "
-                  "transport is still exercised end-to-end (soundness asserted above); "
-                  "the filter-probe wiring has unit coverage. Recorded, not flaked."
-              )
+          # The ssh fetch must be BLOBLESS. This was a soft-report until the
+          # SSHMaster SetEnv fix (GIT_PROTOCOL must be set on the control-master,
+          # not just per-session, or OpenSSH drops it for a multiplexed session →
+          # v0 advertisement → no `filter`). With the fix the v2 probe detects
+          # `filter` over ssh and the fetch is filtered; hard-assert it so the
+          # fix can't silently regress.
+          assert "--filter=blob:none" in ssh_trace, (
+              "git-lazy-fetch over ssh did NOT issue a --filter=blob:none fetch — "
+              "the ssh promisor's v2 capability probe failed to detect `filter`. "
+              "Regression of the SSHMaster GIT_PROTOCOL-on-the-master fix? Trace:\n"
+              + ssh_trace[-2000:]
+          )
+          print("OK (ssh filtered): git-lazy-fetch issued a --filter=blob:none fetch over ssh")
     '';
 }
