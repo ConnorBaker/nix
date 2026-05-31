@@ -294,6 +294,18 @@ public:
     void registerProducer(const Value & v, AttrPathId caKey, DepHash traceHash)
     { replayStore.registerProducer(v, caKey, traceHash); }
 
+    /// Read-only access to a slice of the epoch log [start, end). Used by
+    /// `prim_derivationStrict` to capture the deps recorded during a
+    /// derivation's evaluation as the CA producer trace's deps. Returns a
+    /// fresh copy — caller owns the resulting vector.
+    std::vector<Dep> snapshotEpochRange(uint32_t start, uint32_t end) const
+    {
+        const auto & log = replayStore.epochLog_;
+        if (end > log.size()) end = static_cast<uint32_t>(log.size());
+        if (start >= end) return {};
+        return std::vector<Dep>(log.begin() + start, log.begin() + end);
+    }
+
 private:
     // ── Test-only accessors (reached via TraceRuntimeTestAccess) ─────
     // Exposed to test code through the friend struct in

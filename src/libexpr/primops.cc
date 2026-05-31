@@ -14,6 +14,8 @@
 #include "nix/expr/eval-trace/deps/shape-recording.hh"
 #include "nix/expr/eval-trace/deps/nix-binding.hh"
 #include "nix/expr/eval-trace/deps/trace-access.hh"
+#include "nix/expr/eval-trace/cache/trace-session.hh"
+#include "nix/expr/eval-trace/deps/dep-capture-scope.hh"
 #include "nix/expr/eval-trace/data/traced-data.hh"
 #include "eval-trace/data/traced-data-nodes.hh"
 #include "nix/expr/gc-small-vector.hh"
@@ -1549,6 +1551,26 @@ static void derivationStrictInternal(EvalState & state, std::string_view name, c
    derivation. */
 static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
+    // RFC §3b producer-trace boundary (conservative shape, 2026-05-31):
+    // We track the epoch-log range that grows during this derivation's
+    // evaluation as the PRODUCER's deps, but DO NOT isolate them from the
+    // consumer's recording scope. This preserves the consumer's existing
+    // flattened deps (soundness floor) while ALSO publishing a CA-keyed
+    // producer trace for sibling-share amortization via the
+    // `replayMemoizedDeps` gate. The aggressive shape (sub-scope isolation
+    // + edge-instead-of-flatten) was tried and reverted because it
+    // under-records: any ambient-eval dep that legitimately flowed into the
+    // consumer scope but ISN'T tied to the producer's content would be lost.
+    //
+    // Net: the consumer's scope shape is unchanged (zero precision loss).
+    // The amortization win comes from siblings sharing the producer trace
+    // — that benefit is dormant until the gate fires for them, and zero
+    // cost when it doesn't.
+    auto * session = eval_trace::currentTraceSession();
+    bool registerProducer = session && state.traceCtx;
+
+    uint32_t epochStart = registerProducer ? state.traceCtx->currentReplayEpochSize() : 0;
+
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.derivationStrict");
 
     auto attrs = args[0]->attrs();
@@ -1595,6 +1617,26 @@ static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** 
                 drvName,
                 pos));
         throw;
+    }
+
+    // RFC §3b producer-boundary finalize. Captures the epoch-log range that
+    // grew during this derivationStrict call (= the producer's deps) without
+    // isolating them from the consumer scope. Persists as a CA-keyed
+    // producer trace for sibling-share amortization. Soundness is preserved
+    // unconditionally because the consumer's scope still carries the
+    // flattened deps (RFC §3b conservative shape — see ctor comment).
+    if (registerProducer && v.type() == nAttrs) {
+        if (auto * drvPathAttr = v.attrs()->get(state.s.drvPath)) {
+            if (drvPathAttr->value->type() == nString) {
+                std::string_view drvPathS = drvPathAttr->value->string_view();
+
+                // Snapshot the epoch range [epochStart, currentSize) — these
+                // are the deps recorded during this derivationStrict call.
+                uint32_t epochEnd = state.traceCtx->currentReplayEpochSize();
+                auto innerDeps = state.traceCtx->snapshotEpochRange(epochStart, epochEnd);
+                (void) session->recordCAProducer(v, drvPathS, innerDeps);
+            }
+        }
     }
 }
 

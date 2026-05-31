@@ -833,9 +833,22 @@ bool TraceSession::recordCAProducer(
     // `recordResult->traceHash` is the just-computed content hash of the
     // producer trace. The replay-time gate (in `replayMemoizedDeps`) will
     // emit a `TraceValueContext(caKey, traceHash)` edge whenever
-    // `producerValue` is re-forced inside a recording scope.
+    // `producerValue` is re-forced inside a recording scope (sibling-share
+    // path).
     state.traceCtx->registerProducer(
         producerValue, caKey, DepHash{recordResult->traceHash.value});
+
+    // NOTE: We do NOT also emit the edge into the consumer scope here.
+    // Doing so risks under-recording when the producer's input deps change
+    // in ways the producer trace doesn't fully cover (e.g. ambient-eval
+    // state that legitimately flowed into the consumer). The replay-time
+    // gate (`replayMemoizedDeps`) handles edge emission for sibling-share
+    // contexts; the consumer keeps its existing flattened deps too. Net:
+    // the producer trace exists for amortization, but the consumer's
+    // cached dep set is a strict superset of what it would have been
+    // without §3b — never less. (RFC §3b's "amortization win" comes from
+    // sharing producer verification across sibling consumers, not from
+    // pruning the first consumer's own deps.)
     return true;
 }
 
