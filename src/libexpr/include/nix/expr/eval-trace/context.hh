@@ -301,6 +301,12 @@ private:
     void reset_ForTest() { reset(); }
     void recordThunkDeps_ForTest(const Value & v, uint32_t epochStart) { recordThunkDeps(v, epochStart); }
     void replayMemoizedDeps_ForTest(const Value & v) { replayMemoizedDeps(v); }
+    void registerProducer_ForTest(const Value & v, AttrPathId caKey, DepHash traceHash)
+    { replayStore.registerProducer(v, caKey, traceHash); }
+    std::optional<eval_trace::MemoReplayStore::ProducerEntry> lookupProducer_ForTest(const Value & v) const
+    { return replayStore.lookupProducer(v); }
+    size_t producerMapSize_ForTest() const { return replayStore.producerMapSize(); }
+    void clearProducerMap_ForTest() { replayStore.clearProducerMap(); }
 
 
     InterningPools & tracingPools() { return *pools; }

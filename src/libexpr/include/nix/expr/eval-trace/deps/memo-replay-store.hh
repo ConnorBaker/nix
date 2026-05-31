@@ -39,6 +39,27 @@ struct MemoReplayStore {
         epochMap;
     PointerBloomFilter<1 << 23, 16> replayBloom;
 
+    /// Producer side-table: maps a forced derivation Value to its CA producer
+    /// trace identity. Populated when a producer-trace boundary finalizes (RFC
+    /// §3b); consulted in `replayMemoizedDeps` to route between flatten-replay
+    /// (no entry → today's path) and edge-emission (entry → record one
+    /// `TraceValueContext` dep targeting the producer's CA key, skip the dep
+    /// copy). Same lifetime + traceable_allocator concerns as `epochMap`:
+    /// keyed Value*s must stay live across GC. Independent of `epochMap` —
+    /// a Value can be in producerMap without being in epochMap (a producer
+    /// whose deps were already consumed via outer takeDeps).
+    struct ProducerEntry {
+        AttrPathId caKey;
+        DepHash traceHash;
+    };
+    boost::unordered_flat_map<
+        const Value *,
+        ProducerEntry,
+        boost::hash<const Value *>,
+        std::equal_to<const Value *>,
+        traceable_allocator<std::pair<const Value * const, ProducerEntry>>>
+        producerMap;
+
     void clearReplayIndex()
     {
         epochMap.clear();
@@ -46,10 +67,17 @@ struct MemoReplayStore {
         replayBloom.reset();
     }
 
+    void clearProducerMap()
+    {
+        producerMap.clear();
+        producerMap.rehash(0);
+    }
+
     void clear()
     {
         epochLog_.clear();
         clearReplayIndex();
+        clearProducerMap();
     }
 
     MemoReplayStore() = default;
@@ -130,6 +158,30 @@ struct MemoReplayStore {
             return {};
         return it->second;
     }
+
+    /// Bind a forced Value to its CA producer trace identity. Called from the
+    /// producer-trace boundary finalization (RFC §3b) after `Recorder::record`
+    /// publishes the producer trace. Subsequent `lookupProducer(v)` calls
+    /// return the binding; `replayMemoizedDeps` will emit a single edge dep
+    /// targeting the CA key instead of copying the producer's flattened deps.
+    ///
+    /// Uses `insert_or_assign` (mirroring `recordThunkDeps`) for the BUG-7
+    /// GC-address-reuse hazard: if a Value* is reclaimed and reused, the
+    /// stale producer binding must be overwritten by the new one.
+    void registerProducer(const Value & v, AttrPathId caKey, DepHash traceHash)
+    {
+        producerMap.insert_or_assign(&v, ProducerEntry{caKey, traceHash});
+    }
+
+    std::optional<ProducerEntry> lookupProducer(const Value & v) const
+    {
+        auto it = producerMap.find(&v);
+        if (it == producerMap.end())
+            return {};
+        return it->second;
+    }
+
+    size_t producerMapSize() const { return producerMap.size(); }
 };
 
 } // namespace eval_trace

@@ -26,6 +26,16 @@ struct TraceRuntimeTestAccess {
     { r.recordThunkDeps_ForTest(v, epochStart); }
     static void replayMemoizedDeps(TraceRuntime & r, const Value & v)
     { r.replayMemoizedDeps_ForTest(v); }
+    static void registerProducer(TraceRuntime & r, const Value & v,
+                                  AttrPathId caKey, DepHash traceHash)
+    { r.registerProducer_ForTest(v, caKey, traceHash); }
+    static std::optional<MemoReplayStore::ProducerEntry> lookupProducer(
+        const TraceRuntime & r, const Value & v)
+    { return r.lookupProducer_ForTest(v); }
+    static size_t producerMapSize(const TraceRuntime & r)
+    { return r.producerMapSize_ForTest(); }
+    static void clearProducerMap(TraceRuntime & r)
+    { r.clearProducerMap_ForTest(); }
 };
 
 } // namespace nix::eval_trace::test

@@ -73,6 +73,7 @@ sources = files(
   'eval-trace/dep/dep-stability.cc',
   'eval-trace/dep/epoch-stability.cc',
   'eval-trace/dep/epoch-bugs.cc',
+  'eval-trace/dep/producer-side-table.cc',
   'eval-trace/dep/nix-binding-determinism.cc',
   'eval-trace/dep/show-for-hash.cc',
   # eval-trace/store/
