@@ -2320,3 +2320,125 @@ sibling consumers) requires sibling re-forces of the producer Value within one
 recording session — rare in current `nix eval` invocations against `closures.gnome`.
 A workload like `nix-eval-jobs` with deep sibling attrsets might exercise it more.
 Until measured, default-off is the right shipping state.
+
+### 2026-05-31 follow-up #5: sibling-share workload MEASURED — gate does not invert (MATERIAL BLOCKER)
+
+Follow-up #4 closed on a hypothesis: a `nix-eval-jobs`-shaped deep-sibling-attrset
+workload "might exercise [the gate] more … until measured, default-off is the right
+state." This is that measurement. It uses the existing Ledger-D binary
+(`result/bin/nix`, §3b present, default-OFF) with no rebuild: the env var
+`NIX_ENABLE_CA_PRODUCER=1` flips the hook, and two readily-available counters
+decompose the result.
+
+**Method (no rebuild — measured against the existing binary).** Evaluate
+`map (n: python3Packages.${n}.outPath) [pkgs…]` over a growing package list, twice per
+size (§3b OFF vs ON), each from a fresh isolated cache (`XDG_CACHE_HOME=$(mktemp -d)`),
+`--impure` (the workload imports nixpkgs via `getEnv`). Two derived quantities:
+
+- **P (producer records)** = `evalTrace.record.count(ON) − record.count(OFF)`. The
+  consumer-trace count is identical across modes (the gate changes dep *content*, not
+  the number of consumer traces), so the delta is exactly the producer traces §3b adds.
+- **E (gate fires)** = `evalTrace.replay.producerEdges`.
+
+The go/no-go is whether **E:P** climbs toward (and past) the `closures.gnome` baseline
+of `614:6419 ≈ 0.096` as sibling count grows. The amortization thesis predicts P
+plateaus (shared closure recorded once via `Bindings*` dedup) while E grows (each added
+sibling re-forces the shared closure and fires the gate).
+
+**Result — the thesis is falsified on this workload.**
+
+| pkgs | rec OFF | rec ON | P (prod) | E (fires) | E:P |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 2 | 2020 | 2018 | 65 | 0.032 |
+| 2 | 3 | 2104 | 2101 | 65 | 0.031 |
+| 3 | 4 | 2117 | 2113 | 65 | 0.031 |
+| 5 | 6 | 3201 | 3195 | 105 | 0.033 |
+| 8 | 9 | 4259 | 4250 | 118 | 0.028 |
+
+| marginal step | ΔP | ΔE | ΔE:ΔP |
+|---|---:|---:|---:|
+| 1→2 | 83 | 0 | 0.000 |
+| 2→3 | 12 | 0 | 0.000 |
+| 3→5 | 1082 | 40 | 0.037 |
+| 5→8 | 1055 | 13 | 0.012 |
+
+E:P stays ~0.03 — **worse** than the 0.096 baseline — and the *marginal* ΔE:ΔP trends
+toward zero. Adding scipy after numpy re-forced ~1935 shared derivations (ΔP=83 proves
+`Bindings*` dedup works: numpy/scipy share most of their closure at record time) yet
+fired the gate **0 additional times** (ΔE=0). Sibling sharing is large and real; the
+gate is blind to it.
+
+**Counter decomposition — WHERE it fails (not just that it fails).** The replay-path
+counters (all ON-mode) localize the miss inside `replayMemoizedDeps`:
+
+| pkgs | totalCalls | bloomHits | added | producerEdges |
+|---:|---:|---:|---:|---:|
+| 3 | 75,132 | 75,067 | 259 | 65 |
+| 5 | 127,828 | 127,718 | 848 | 105 |
+| 8 | 180,554 | 180,344 | 1,797 | 118 |
+
+`totalCalls` (gate *reached*) grows ~50k per sibling batch — so re-forces DO reach the
+gate. But `bloomHits ≈ totalCalls` at every row: ~99.9% of gate-entries fall straight
+through the producer branch into `getReplayRange` (the **flatten/epoch** path), which
+succeeds. The producer branch (`lookupProducer`) is reached and returns empty almost
+every time. The re-forces take the existing Value*-keyed epoch-replay path, not the
+producer path.
+
+**Root cause — the keying split is structural, traced to `derivation.nix`.** Two
+independent keyspaces that never meet on the re-force path:
+
+- The **entry gate** keys on `Value *`: `mayHaveMemoizedDeps(v) = replayBloom.test(&v)`
+  (eval.cc:1883), and `replayBloom` is set **only** by `recordThunkDeps(&v)`
+  (memo-replay-store.hh:169). `registerProducer` sets `producerBloom`, never
+  `replayBloom` (memo-replay-store.hh:228-232).
+- The **producer lookup** keys on `Bindings *`: `producerKeyFor(v)=v.attrs()` →
+  `producerMap[Bindings*]`. The producer is registered on the **`strict`** attrset —
+  the raw `derivationStrict` result (`outputs`+`drvPath`+`type`, ~3 attrs).
+
+But `src/libexpr/primops/derivation.nix:36-50` shows what consumers actually touch:
+```nix
+strict = derivationStrict drvAttrs;                 # ← producer keyed on THIS Bindings*
+commonAttrs = drvAttrs // { … } // (builtins.listToAttrs outputsList) // { … };
+in commonAttrs // {
+    outPath = builtins.getAttr outputName strict;   # consumer reads a STRING off the //-wrapper
+    drvPath = strict.drvPath;
+}
+```
+A consumer (`numpy.outPath`) forces the **`commonAttrs // {…}`** wrapper — a *different*
+`Bindings*` built by `//` (measured: the numpy package attrset has **76 attrs**, not 3)
+— and ultimately reads `.outPath`, a **string** with no `Bindings*` at all. The `strict`
+attrset is forced once when `derivation` is first applied, and **never re-forced by
+siblings**. So `producerKeyFor(v)` on what siblings re-force never matches the registered
+producer key. The gate cannot fire on sibling sharing **by construction of the wrapper**,
+independent of workload depth. This is the same "derivation result is a `//`-wrapper, the
+addressable identity is one layer below what consumers see" shape that the
+`compositional-trace-dag-design.md` Tier-1 analysis circles — re-confirmed here as the
+reason the *replay* gate (not just the *record* cost) is the binding constraint.
+
+**Consequence for the re-enable conditions (corrects follow-up #4 condition c).** A
+sibling-share-heavy workload does NOT rescue §3b: it is not that the gate fires too rarely
+to amortize, it is that the gate is keyed to a value siblings never re-force. Async/batched
+recording (condition a) and suppress-on-warm-served (condition b) would reduce the *cost*
+of producer records but cannot create *benefit* — they make a near-zero-fire gate cheaper,
+not more effective. **The CA-producer direction as currently keyed has no benefit channel
+proportional to its cost on either measured workload.**
+
+**What this does NOT rule out.** The architecture's *thesis* (edge-not-flatten) is
+untouched; what is blocked is the specific keying (`strict`-result `Bindings*`). A viable
+variant would have to register identity on the value consumers actually re-force — the
+`.outPath`/`.drvPath` **string** (Tier-1's "scalar producer has no identity" wall from
+`compositional-trace-dag-design.md`'s spike, now re-confirmed from the replay side) or the
+`commonAttrs //` wrapper attrset. Both are larger than a hook re-key: the string case needs
+the scalar-identity work the Tier-1 spike already found dead on `replayMemoizedDeps`
+widening; the wrapper case needs the producer keyed on a `Bindings*` that doesn't exist until
+*after* `derivation.nix` runs in the language layer, outside the `derivationStrict` primop.
+
+**Verdict.** §3b stays default-OFF. The blocker is upgraded from "cost ≫ benefit on this
+workload" (#4) to "**the replay gate is structurally keyed to a value that sibling consumers
+never re-force; no measured workload inverts E:P, and the two candidate re-keyings are each
+their own RFC-scale identity problem**". Infrastructure stays in tree as scaffolding; the
+next real step is a re-keying design, not a cost optimization.
+
+Reproduction: `/tmp/cap_sweep.sh` shape (isolated `XDG_CACHE_HOME` per run,
+`NIX_SHOW_STATS_PATH` capture, OFF/ON pairs, `record.count` delta = P,
+`replay.producerEdges` = E). n=1 wall noise; counts are deterministic across re-runs.

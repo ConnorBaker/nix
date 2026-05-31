@@ -338,14 +338,27 @@ identity) get lost when isolated. Functional tests `eval-trace-core` /
   stores the pointer.
 - `82713fd91` — default-off via `NIX_ENABLE_CA_PRODUCER=1`. Bench-driven.
 
-**Conditions for re-enabling.** The infrastructure is sound; the cost
-profile is the blocker. Re-enabling becomes attractive when one or more
-of: (a) producer-trace recording is async/batched (current `recordSync`
-runs synchronously on the eval thread per derivation), (b) the hook is
-suppressed when the caller's consumer trace is already being warm-served
-(detection requires plumbing not present today), (c) workload shifts to
-sibling-share-heavy patterns where the gate fires more frequently
-(`nix-eval-jobs`'s deep-attrset enumeration may exercise it).
+**Conditions for re-enabling — REVISED 2026-05-31 after sibling-workload
+measurement.** The blocker is NOT (just) the cost profile; it is the
+replay-gate keying. Measured on a `python3Packages.${n}.outPath` sweep
+(n=1..8, the nix-eval-jobs shape): the gate-fire to producer-record ratio
+`E:P ≈ 0.03` flat — *worse* than the 0.096 `closures.gnome` baseline —
+because the producer is keyed on the `strict` (`derivationStrict`-result)
+`Bindings*`, while `derivation.nix:36-50` hands consumers a `commonAttrs //
+{ outPath = …; }` wrapper (76 attrs) and a **string** `outPath`. Siblings
+re-force the wrapper/string, never the keyed `strict` value, so the gate is
+structurally blind to sibling sharing. Therefore:
+- (a) async/batched recording and (b) suppress-on-warm-served reduce
+  producer-record *cost* but cannot create *benefit* against a near-zero-fire
+  gate — necessary-not-sufficient at best.
+- (c) sibling-share-heavy workloads — **FALSIFIED as a rescue**; the gate
+  does not fire on the shared re-forces (see below).
+The real next step is a **re-keying** design: register identity on the value
+consumers actually re-force (the `.outPath`/`.drvPath` string — the Tier-1
+scalar-identity wall — or the `commonAttrs //` wrapper attrset, which exists
+only in the language layer after the `derivationStrict` primop returns). Both
+are RFC-scale, not a hook re-key. Full data + counter decomposition + code
+trace: `doc/eval-trace-cache-redesign-plan.md` "2026-05-31 follow-up #5".
 
 **Test surface** — see `src/libexpr-tests/eval-trace/CLAUDE.md` for the
 full test guide. 22 tests across 4 files
@@ -359,7 +372,8 @@ plus 6 store-level tests (`store/ca-producer-boundary-recording.cc`,
 - Architectural backstory: `plans/architecture-trace-model-vs-CA.md`,
   `plans/compositional-trace-dag-design.md`
 - Bench data + history: `doc/eval-trace-cache-redesign-plan.md`
-  "2026-05-31 follow-up #4"
+  "2026-05-31 follow-up #4" (bench + default-off) and "follow-up #5"
+  (sibling-workload falsification + keying-split root cause)
 - Soundness floor: `store/derivation-edge-soundness.cc`,
   `store/derivation-observation-facets.cc`,
   `store/dep-flattening-baseline.cc`,

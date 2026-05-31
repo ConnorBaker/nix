@@ -283,12 +283,30 @@ cost is the blocker. Re-enabling becomes attractive when one or more of:
 3. **Sibling-share-heavy workloads.** The gate fires from `SiblingForceScope` and
    `forceValue`'s replay branch (bloom-gated). On `closures.gnome` it fires ~614
    times/commit. A `nix-eval-jobs`-style deep attrset enumeration might exercise
-   it more. NOT MEASURED on that workload yet.
+   it more. ~~NOT MEASURED on that workload yet.~~
+   **MEASURED 2026-05-31 — FALSIFIED. This condition does NOT rescue §3b.** A
+   `python3Packages.${n}.outPath` sweep (n=1..8, the nix-eval-jobs shape) gave
+   `E:P ≈ 0.03` flat — *worse* than the 0.096 `closures.gnome` baseline — with
+   marginal ΔE:ΔP → 0. Root cause is structural, not workload-thinness: the
+   producer is keyed on the `strict` (`derivationStrict`-result) `Bindings*`, but
+   `derivation.nix:36-50` wraps it as `commonAttrs // { outPath = …; }`, so every
+   sibling consumer forces a *different* `//`-wrapper attrset (measured 76 attrs vs
+   `strict`'s ~3) and reads a **string** `outPath` — never re-forcing the keyed
+   `strict` value. The gate is keyed to a value siblings never touch. Async/batched
+   recording (cond. 1) and suppress-on-warm (cond. 2) reduce producer-record *cost*
+   but cannot create *benefit* against a near-zero-fire gate. **The binding
+   constraint is the replay-gate keying, not the record cost.** Full data, counter
+   decomposition, and code trace: `doc/eval-trace-cache-redesign-plan.md`
+   "2026-05-31 follow-up #5". A viable variant must re-key identity onto the value
+   consumers re-force (the `.outPath` string — the Tier-1 scalar-identity wall in
+   `compositional-trace-dag-design.md` — or the `commonAttrs //` wrapper, which
+   only exists in the language layer after the `derivationStrict` primop returns).
 
 **Cross-references.**
 - Production code documented: `src/libexpr/eval-trace/CLAUDE.md` "RFC §3b" section.
 - Test guide: `src/libexpr-tests/eval-trace/CLAUDE.md` `dep/` section.
 - Bench data + adversarial-fix narrative: `doc/eval-trace-cache-redesign-plan.md`
-  "2026-05-31 follow-up #4".
+  "2026-05-31 follow-up #4"; sibling-workload falsification + keying-split root
+  cause in "2026-05-31 follow-up #5".
 - Architectural backstory: `plans/architecture-trace-model-vs-CA.md`,
   `plans/compositional-trace-dag-design.md`.
