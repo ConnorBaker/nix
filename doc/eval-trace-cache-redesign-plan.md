@@ -3090,3 +3090,44 @@ confound #7/#8; benefit-circularity #12; re-record 23× artifact #14), each caug
 against a controlled/known case before trusting. Plus two overstatements caught by adversarial
 pass (#11 "edge removes 607×"; #13 "~99%"). The discipline of "validate the probe, then pass the
 finding" was load-bearing throughout — most committed numbers were wrong on first cut.
+
+### 2026-05-31 follow-up #19: adversarial pass — CORRECTS #12–#18's framing (proxies, not an end-to-end prototype; benefit is storage-count not measured verify-win)
+
+A confirming adversarial pass on the "material blocker" verdict found the verdict's REASONING
+sound but its FRAMING overstated. Three corrections.
+
+**(1) No end-to-end aggressive prototype was ever built/run.** What was built: two PROXIES — the
+`drv-benefit-probe` (READS the conservative-shape flattened range = what an edge WOULD remove;
+never emits an edge) and a throwaway cost sub-scope (opened + DISCARDED; never recorded a producer
+from isolated deps, never emitted a consumer edge, since removed #17). The real aggressive shape
+(isolate → record producer from isolated deps → emit consumer edge → verify THROUGH the edge) was
+NOT built. So #13/#14/#18's "the §8-step-3 prototype … both numbers measured" OVERSTATES: the
+~63% and ~11% are PROXY measurements, and the verdict is a SYNTHESIS of (benefit proxy) + (cost
+proxy) + (§3b's measured recordSync), not an end-to-end prototype result. The synthesis is
+reasonable but must be labelled as such.
+
+**(2) The ~63% is a STORAGE/dep-COUNT reduction, not a measured verify-time (hot) win.** Edge
+verify (`resolveTraceContextHash`, verifier.cc:267) RECURSIVELY verifies the producer; 1,213 edges
+are not cheaper than 3,296 flat deps UNLESS the cross-consumer memo (`verifiedTraceIds` early-out,
+verifier.cc:1786) short-circuits shared producers. So the verify win = session memo-hit-rate (the
+C2b amortization, proven REACHABLE by ca-trace-key-routing R2 but UNMEASURED in magnitude), NOT
+63%. #15/#16 let the storage-count number stand in for a perf win without separating them.
+
+**(3) Therefore TWO open gates, not one.** #18 named only the COST gate (async recording). There is
+ALSO a BENEFIT gate: whether the verify-memo hit-rate on a real workload makes 1,213-edges-verify
+actually cheaper than 3,296-deps-verify. Both are unmeasured; both require the real edge-emitting
+prototype + a hot run to settle.
+
+**Corrected verdict:** the §8-step-3 work produced PROXY evidence that (a) derivation-closure
+sharing is real and large (~63% of consumer deps are derivation-attributable; #10/#11/#13 — solid,
+artifact/test-based) and (b) the per-derivation sub-scope structural cost is ~11% (proxy). It did
+NOT build the end-to-end shape, did NOT measure the verify-time benefit, and did NOT measure on the
+Ledger-D anchor. The material blocker stands but is broader than #18 said: **a real go/no-go needs
+the end-to-end edge-emitting prototype measured on a hot workload (verify-memo benefit) AND async
+producer recording (cost) — two builds, not one.** What's genuinely settled: soundness (closed),
+sharing-exists (~63% removable, solid), structural cost order (~11%, proxy). What's NOT: any
+end-to-end or hot-path net number.
+
+**Process note:** this is the case where the adversarial-pass-before-finalizing caught the most
+consequential error of the arc — not a wrong number, but presenting proxy-synthesis as a built
+prototype. The numbers are fine as proxies; the framing was the bug.
