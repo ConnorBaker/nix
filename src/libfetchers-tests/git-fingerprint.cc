@@ -238,6 +238,46 @@ TEST_F(GitFingerprintTest, RootTreeHashSurvivesSourceViewWrapper)
         << "Root SourceView did not forward the git root tree OID — Track Z.gap1 bridge is dead on the wrapped path";
 }
 
+/* Forge inputs (github:/gitlab:/sourcehut:) end up as a `GitSourceAccessor`
+   rooted at the TARBALL-CACHE TREE OID, not a commit — see github.cc's
+   `tarballCache->getAccessor(treeHash, ...)`. The PROPOSAL §6.3 claim is that
+   forge inputs "get the tree-OID bridge for free": a forge input and a plain
+   git input that resolve to the same tree must key the SAME
+   `treeHashToNarHash` row. The load-bearing fact is that a TREE-rooted accessor
+   (forge shape) reports the same `getRootTreeHash()` as a COMMIT-rooted
+   accessor of the same tree — otherwise the two would never share a bridge row.
+   Adversarial gap #3: nothing tested the tree-rooted (forge) accessor shape. */
+TEST_F(GitFingerprintTest, ForgeTreeRootedAccessorSharesRootTreeHashWithCommit)
+{
+    writeWorktreeFile("hello.txt", "hi");
+    writeWorktreeFile("sub/inner.txt", "deep");
+    auto commit = commitWorktree("first");
+    auto rev = toHash(commit);
+    auto rootTree = treeOidOf(commit);
+
+    auto gitRepo = GitRepo::openRepo(tmpDir, {});
+
+    /* The plain git-input shape: accessor rooted at the COMMIT. */
+    auto commitAccessor = gitRepo->getAccessor(rev, {}, "");
+
+    /* The forge/tarball shape: accessor rooted at the TREE OID directly
+       (exactly what github.cc/tarball.cc construct via
+       `tarballCache->getAccessor(treeHash, ...)`). */
+    auto treeAccessor = gitRepo->getAccessor(rootTree, {}, "");
+
+    /* Both must surface the same root tree OID → both key the same
+       treeHashToNarHash bridge row → a forge input and a git input of the same
+       tree share one NAR-hash walk. */
+    ASSERT_EQ(commitAccessor->getRootTreeHash(), rootTree);
+    EXPECT_EQ(treeAccessor->getRootTreeHash(), rootTree)
+        << "Tree-rooted (forge) accessor did not report the root tree OID — forge inputs would not hit the tree-OID bridge";
+
+    /* And they must read byte-identically (same tree ⇒ same NAR), the soundness
+       premise of sharing a bridge row. */
+    EXPECT_EQ(commitAccessor->hashPath(CanonPath::root), treeAccessor->hashPath(CanonPath::root))
+        << "commit-rooted and tree-rooted accessors of the same tree produced different NARs";
+}
+
 TEST_F(GitFingerprintTest, NarAlteringAccessorOptionsSuppressRootTreeHash)
 {
     /* SOUNDNESS regression (adversarial review): `getRootTreeHash`
