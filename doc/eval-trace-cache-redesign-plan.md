@@ -3180,3 +3180,13 @@ Caveats: M-band {1,2,3} is a reasoned guess at the find-count ratio, not measure
 term uses the nested-inflated 0.857M upper bound; loadTrace savings (smaller blobs) not modelled
 (would help the edge side). The qualitative finding (gate undecided, hinges on M) is robust to
 these; the exact crossover M is not.
+
+**Confirming-pass addendum to #20 (one omitted term, finding reinforced):** the estimate modelled
+M as the per-edge memo-HIT cost but omitted a THIRD term — the recursion SETUP overhead of
+`verifyTrace` on memo-MISS (first consumer of each distinct producer): scope setup + coroBlock
+hops per ~thousands of distinct producers, a fixed cost the flat model doesn't pay. Including it
+makes the edge side MORE expensive (crossover M lower → loss more likely), so it WIDENS the
+uncertainty toward "needs the prototype" rather than resolving it. The other caveats are
+conservative toward the edge model (producer-once is an upper bound; loadTrace savings unmodelled
+would help the edge side). Net: the qualitative verdict — verify gate UNDECIDED, settling it
+requires the real edge-emitting prototype measured hot — is robust to all of these.
