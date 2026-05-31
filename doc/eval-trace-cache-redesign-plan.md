@@ -3393,3 +3393,36 @@ crash-safe-monotonic so reuse can't alias.
 and called it "soundness-clean." The crash path is exactly where a deferred-durability change is
 most dangerous, and I didn't test it. The user's instruction to re-examine semantics found a real
 hole reasoning-from-the-happy-path had missed.
+
+#### follow-up #24, confirming pass: the hazard is NARROWER than first stated (primary path self-heals; recovery-path-only)
+
+Standing discipline — confirming adversarial pass on #24 itself. Traced two SQL facts I'd asserted
+around but not read (sqlite-trace-storage-lifecycle.cc:366-385):
+
+1. **`upsertAttr` (Sessions) is a true upsert** — `INSERT … ON CONFLICT(session_key, attr_path_id)
+   DO UPDATE SET trace_id = excluded.trace_id, …` (:369). The PRIMARY lookup (`lookupCurrentNode`,
+   keyed `(session_key, attr_path_id)`) therefore always reflects the LAST writer. A deterministic
+   re-eval of the same producer overwrites the Sessions row with the correct current trace_id → the
+   primary path SELF-HEALS. The stale row cannot win on the primary path.
+2. **History bootstrap JOINs Traces** — `lookupLatestHistoryForAttr` is
+   `… FROM History h JOIN Traces t ON h.trace_id = t.id WHERE h.recovery_key=? AND h.attr_path_id=?
+   ORDER BY h.trace_id DESC LIMIT 1` (:380-385). A stale History(N) row whose Traces(N) was lost in
+   the crash is JOIN-DROPPED (invisible) UNTIL some later trace reanimates id N (recreating Traces(N)).
+
+**Refined manifestation.** The wrong serve is reachable ONLY through the recovery / History-bootstrap
+path, AND only after id N is reused for a new trace N'. Sequence required: (a) crash after
+`publishStateChange(N)` commits but before teardown flush; (b) Traces(N) [and Results(M)] lost; (c) a
+later process reuses id N (Traces(N') created) — note Traces+Results are buffered together in
+pending*, so both id spaces reanimate together → the reused row points at internally-consistent NEW
+content, not a Frankenstein; (d) a lookup for the STALE row's (recovery_key, attr_path_id) that falls
+through to History bootstrap (primary Sessions miss) → serves N'/M' under the old key. That is a wrong
+serve iff the old key's correct answer ≠ the reused-id content.
+
+**Net.** #24's bald "stale History aliases a new trace → mis-resolve" overstated the primary path.
+Corrected: primary path self-heals (upsert); the residual is recovery-path-only and gated behind
+double-id-reanimation. Still a candidate STALE SERVE under the aggressive shape (which leans on the
+recovery/History path and removes the flattened-dep backstop), so the DISPOSITION is unchanged — fix
+via Layer 2a (restore Traces-before-History ordering) before the aggressive shape ships — but the
+severity is now precisely bounded: crash-only, recovery-path-only, post-reanimation, default-off,
+latent today. The confirming pass tightened the claim rather than finding a new defect; per the
+discipline, this closes the #24 thread.
