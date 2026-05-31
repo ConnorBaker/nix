@@ -4516,6 +4516,7 @@ void EvalState::printStatistics()
             {"bloomHits", eval_trace::nrReplayBloomHits.load()},
             {"epochHits", eval_trace::nrReplayEpochHits.load()},
             {"added", eval_trace::nrReplayAdded.load()},
+            {"producerEdges", eval_trace::nrReplayProducerEdges.load()},
         }},
         {"depHash", {
             {"cacheHits", eval_trace::nrDepHashCacheHits.load()},

@@ -57,7 +57,7 @@ static AttrPathId caKey(AttrVocabStore & vocab, std::string_view drvHash)
         vocab.internName(std::string("__ca:") + std::string(drvHash)));
 }
 
-class ReplayProducerGateTest : public LibExprTest
+class ReplayProducerGateTest : public EvalTraceTest
 {
 protected:
     InterningPools pools;
