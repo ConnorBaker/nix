@@ -803,4 +803,46 @@ void TraceSession::releaseBackend()
     tracedRoot.reset();
 }
 
+bool TraceSession::recordCAProducer(
+    const Value & producerValue,
+    std::string_view drvHash,
+    const std::vector<Dep> & innerDeps)
+{
+    if (!runtime_) return false;
+    if (!state.traceCtx) return false;
+
+    // Compute the CA routing key: a single-component path off root named
+    // `__ca:<drvHash>`. Mirrors the construction proven in
+    // `store/ca-trace-key-routing.cc`. `internName` accepts arbitrary
+    // strings, so the namespace requires no schema change.
+    auto & vocab = state.vocabStore();
+    auto caKey = vocab.internPath(
+        AttrVocabStore::rootPath(),
+        vocab.internName(std::string("__ca:") + std::string(drvHash)));
+
+    // Use a sentinel `string_t` as the CachedResult — producer traces are
+    // never materialized directly (they're only referenced by edges), so
+    // the result content doesn't matter. We store a constant marker so
+    // dump/inspection reveals these rows clearly.
+    CachedResult value{string_t{"<ca-producer>", {}}};
+
+    auto recordResult = runtime_->recordSync(caKey, value, innerDeps);
+    if (!recordResult) return false;
+
+    // Bind producerValue → {caKey, traceHash} in the side-table.
+    // `recordResult->traceHash` is the just-computed content hash of the
+    // producer trace. The replay-time gate (in `replayMemoizedDeps`) will
+    // emit a `TraceValueContext(caKey, traceHash)` edge whenever
+    // `producerValue` is re-forced inside a recording scope.
+    state.traceCtx->registerProducer(
+        producerValue, caKey, DepHash{recordResult->traceHash.value});
+    return true;
+}
+
+bool TraceSession::verifyAttrPathForTest(AttrPathId pathId)
+{
+    if (!runtime_) return false;
+    return runtime_->verifySync(pathId).has_value();
+}
+
 } // namespace nix::eval_trace

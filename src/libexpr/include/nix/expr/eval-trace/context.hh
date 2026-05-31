@@ -286,6 +286,14 @@ public:
     /// thread.
     void clearFileContentHashes() { fileContentHashes.clear(); }
 
+    /// Public producer-side-table API (RFC §3b). Bind a forced Value to its
+    /// CA producer trace identity so subsequent re-forces emit a single
+    /// `TraceValueContext` edge via the gate in `replayMemoizedDeps`.
+    /// Called from `TraceSession::recordCAProducer` after the producer
+    /// trace is persisted via `TraceBackend::recordSync`.
+    void registerProducer(const Value & v, AttrPathId caKey, DepHash traceHash)
+    { replayStore.registerProducer(v, caKey, traceHash); }
+
 private:
     // ── Test-only accessors (reached via TraceRuntimeTestAccess) ─────
     // Exposed to test code through the friend struct in

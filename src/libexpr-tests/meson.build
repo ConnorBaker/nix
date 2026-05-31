@@ -76,6 +76,7 @@ sources = files(
   'eval-trace/dep/producer-side-table.cc',
   'eval-trace/dep/replay-producer-gate.cc',
   'eval-trace/dep/ca-producer-scope.cc',
+  'eval-trace/dep/trace-session-record-ca-producer.cc',
   'eval-trace/dep/nix-binding-determinism.cc',
   'eval-trace/dep/show-for-hash.cc',
   # eval-trace/store/

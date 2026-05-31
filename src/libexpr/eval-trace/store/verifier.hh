@@ -83,6 +83,14 @@ public:
     /// code should go through the typed verify/recovery interface).
     VerificationSession & sessionForTest() { return session_; }
 
+    /// Synchronous verify for the test-only `TraceBackend::verifySync`
+    /// path. Caller (TraceBackend) supplies the exclusive-access capability
+    /// (since `Verifier` doesn't inherit `Certifier<BlockingTag>`). Uses
+    /// the bound `registry_`/`state_` (set via `bindSession`) and the
+    /// existing `session_`. Returns nullopt if the session is unbound.
+    std::optional<SqliteTraceStorage::VerifyResult> verifyAttrSync(
+        const ExclusiveTraceStorageAccess & ea, AttrPathId pathId);
+
     /// Bind per-session state used by subsequent verify/prefetch calls.
     void bindSession(const SemanticRegistry & registry, EvalState & state);
 

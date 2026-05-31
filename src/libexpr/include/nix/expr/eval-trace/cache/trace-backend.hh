@@ -97,6 +97,39 @@ public:
         const CachedResult & value,
         const std::vector<Dep> & allDeps);
 
+    /// Synchronous record entry point for callers that don't have an
+    /// `EvalContext<Suspendable>` — primops, in particular. Mirrors the
+    /// `recordRuntimeRoot` shape: `Certifier<BlockingTag>::withProof` +
+    /// `withExclusiveAccess` directly, with no `coroBlock`/`syncAwait`.
+    /// Safe because (a) the recorder pipeline (sort/hash/serialize/intern/
+    /// publish/flush) only needs `ExclusiveTraceStoreAccess`, no fiber
+    /// context, and (b) the caller (e.g. `prim_derivationStrict`) is not
+    /// already inside a `withExclusiveAccess` scope on this store
+    /// (debug builds assert via the thread_local re-entrancy detector;
+    /// release would deadlock on the non-recursive `storeMutex_`).
+    /// Used by `TraceSession::recordCAProducer` for RFC §3b producer-trace
+    /// boundaries.
+    ///
+    /// Returns `(RecordResult, TraceHash)`: the producer's trace ID and
+    /// content hash, both fetched inside the same `withExclusiveAccess`
+    /// scope so callers don't pay a second mutex acquisition. The trace
+    /// hash is what the replay-time gate emits as the value of the
+    /// `TraceValueContext` edge.
+    struct RecordSyncResult {
+        SqliteTraceStorage::RecordResult record;
+        TraceHash traceHash;
+    };
+    std::optional<RecordSyncResult> recordSync(
+        AttrPathId pathId,
+        const CachedResult & value,
+        const std::vector<Dep> & allDeps);
+
+    /// Synchronous verify (sibling of `recordSync`). Uses the verifier's
+    /// own `VerificationSession`. No `EvalContext<Suspendable>` required.
+    /// Currently used only by tests asserting that producer traces
+    /// recorded via `recordSync` survive a session boundary.
+    std::optional<SqliteTraceStorage::VerifyResult> verifySync(AttrPathId pathId);
+
     std::shared_ptr<const std::vector<Dep>> loadFullTrace(
         EvalContext<Suspendable> & ctx, TraceId traceId);
 

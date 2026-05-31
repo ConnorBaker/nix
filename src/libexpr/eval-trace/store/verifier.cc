@@ -1999,6 +1999,13 @@ Verifier::verifyAttr(AttrPathId pathId)
     co_return co_await verifyAttrImpl(pathId);
 }
 
+std::optional<SqliteTraceStorage::VerifyResult>
+Verifier::verifyAttrSync(const ExclusiveTraceStorageAccess & ea, AttrPathId pathId)
+{
+    if (!registry_ || !state_) return std::nullopt;
+    return store_.verify(ea, pathId, *registry_, *state_, session_);
+}
+
 void Verifier::submitPrefetchHints(const std::vector<AttrPathId> & pathIds)
 {
     Verifier::withProof([&](const auto & tok) {

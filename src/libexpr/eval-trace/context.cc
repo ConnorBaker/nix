@@ -395,6 +395,48 @@ void eval_trace::TraceBackend::recordRuntimeRoot(
     });
 }
 
+std::optional<eval_trace::TraceBackend::RecordSyncResult>
+eval_trace::TraceBackend::recordSync(
+    AttrPathId pathId,
+    const CachedResult & value,
+    const std::vector<Dep> & allDeps)
+{
+    // Sync record path for callers without `EvalContext<Suspendable>` —
+    // RFC §3b producer-trace boundaries from primops. Same shape as
+    // `recordRuntimeRoot`: direct `withProof` + `withExclusiveAccess`,
+    // no async runtime indirection. The recorder pipeline only requires
+    // exclusive store access; the existing async `record()` path uses
+    // `coroBlock` purely so a fiber can yield while the blocking pool
+    // runs the work, which doesn't apply here (no fiber to yield).
+    //
+    // Both `store->record` and `store->getCurrentTraceHash` run under the
+    // same `withExclusiveAccess` scope so callers receive the freshly-
+    // recorded trace's content hash without a second mutex acquisition.
+    std::optional<RecordSyncResult> out;
+    gdp::Certifier<BlockingTag>::withProof([&](const auto & bs) {
+        store->withExclusiveAccess(bs, [&](const auto & ea) {
+            auto rec = store->record(ea, pathId, value, allDeps);
+            auto hash = store->getCurrentTraceHash(ea, pathId);
+            if (!hash) return;
+            out = RecordSyncResult{rec, *hash};
+        });
+    });
+    return out;
+}
+
+std::optional<eval_trace::SqliteTraceStorage::VerifyResult>
+eval_trace::TraceBackend::verifySync(AttrPathId pathId)
+{
+    if (!infra_ || !infra_->verifier) return std::nullopt;
+    std::optional<SqliteTraceStorage::VerifyResult> out;
+    gdp::Certifier<BlockingTag>::withProof([&](const auto & bs) {
+        store->withExclusiveAccess(bs, [&](const auto & ea) {
+            out = infra_->verifier->verifyAttrSync(ea, pathId);
+        });
+    });
+    return out;
+}
+
 const eval_trace::SemanticSessionKey &
 eval_trace::TraceBackend::currentSemanticSessionKey() const noexcept
 {

@@ -146,6 +146,41 @@ public:
     void flush();
 
     /**
+     * Record a content-addressed producer trace and bind a Value to it
+     * (RFC §3b). Persists `innerDeps` as a trace under the synthetic CA
+     * key `__ca:<drvHash>` (Design A from the RFC) and registers
+     * `producerValue` in `MemoReplayStore::producerMap` so subsequent
+     * re-forces of the same Value emit a single `TraceValueContext` edge
+     * (via the gate in `TraceRuntime::replayMemoizedDeps`) instead of
+     * flattening the producer's inputs into each consumer.
+     *
+     * Synchronous — uses `TraceBackend::recordSync` (mirroring
+     * `recordRuntimeRoot`); does NOT require `EvalContext<Suspendable>`,
+     * so primops may call it directly. Returns true on success; false if
+     * no backend is bound (session was released, or makeCache had no
+     * backend).
+     *
+     * Soundness floor pinned by `dep/trace-session-record-ca-producer.cc`
+     * (R1-R4) + `dep/ca-producer-scope.cc` (S1-S3). Inert when
+     * `producerValue` is never re-forced (the gate fires lazily) — so
+     * adding this call to `prim_derivationStrict` is safe to ship even
+     * before consumers benefit from it (zero observable change).
+     */
+    bool recordCAProducer(
+        const Value & producerValue,
+        std::string_view drvHash,
+        const std::vector<Dep> & innerDeps);
+
+    /**
+     * Test-only: synchronously verify that a trace at `pathId` is valid
+     * in the current store (mirrors `TraceStorageTestAccess::verify`).
+     * Used by `dep/trace-session-record-ca-producer.cc` to confirm that
+     * a producer trace persisted by `recordCAProducer` survives across
+     * a session boundary.
+     */
+    bool verifyAttrPathForTest(AttrPathId pathId);
+
+    /**
      * Flush and release the trace backend, leaving this session in a
      * no-backend state. After this call, any TracedExpr thunks still
      * referencing this session will use evaluateDirect() (no trace cache,
