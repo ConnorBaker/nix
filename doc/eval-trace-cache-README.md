@@ -8,6 +8,119 @@ reader (and one assistant) to conflate lineages and quote the wrong numbers.
 This file is the authoritative entry point: it says which doc describes the
 current tree, reconciles the ledgers, and carries the canonical lever list.
 
+## Picking this up — start here (2026-05-31)
+
+If you're a new agent or contributor inheriting this branch, this is the
+shortest path to context.
+
+**Branch state.** `vibe-coding/file-based-eval-cache`, ~17 commits ahead of
+origin since the §3b implementation slice. Tree clean. Run `git log --oneline
+master..HEAD | head -25` for the chronological story.
+
+**The active work.** RFC §3b (content-addressed producer-trace boundary) is
+**implemented + benchmarked + DEFAULT-OFF** behind `NIX_ENABLE_CA_PRODUCER=1`.
+Bench measured a 3.6× cold / 14× hot regression on the Ledger-D anchor — a
+real net loss, soundness PASS. Shipping default-off was the right call. The
+infrastructure (~22 unit tests + production code in `MemoReplayStore`,
+`TraceBackend`, `TraceSession`, `prim_derivationStrict`) stays in tree as
+proven scaffolding. See "Option 3" below + the redesign-plan §"2026-05-31
+follow-up #4" for the full bench table + adversarial-fix history.
+
+**Where production code lives.** `src/libexpr/eval-trace/CLAUDE.md` has a
+"RFC §3b" section near the top describing the code surface
+(`producerMap`/`producerBloom`/`recordSync`/`recordCAProducer`/the gate),
+the bench outcome, and the conditions for re-enabling.
+
+**Where tests live.** `src/libexpr-tests/eval-trace/CLAUDE.md` indexes the 28
+§3b-related tests (4 test files in `dep/` + 2 in `store/`). All probe-verified.
+
+**Reproducing the bench.** From this directory:
+```bash
+nix build -L .                                           # build result/bin/nix
+NIX_CONFIG="builders =" nix run .#eval-trace-bench -- generate \
+  --nix . --nixpkgs ~/ext-sources/nixpkgs \
+  --num-commits 100 --run-number 3                       # generate run-3
+nix run .#eval-trace-bench -- runs \
+  --runs reference,cold/1,hot/1,cold/3,hot/3 \
+  --reference reference --allow-provenance-mismatch      # compare
+```
+Run-1 is the pre-§3b baseline (2026-05-30). Run-2 is the post-§3b
+measurement that drove the default-off decision. Pick a fresh run-number
+≥ 3. Both run dirs and analysis tools document themselves via `--help`.
+
+To toggle §3b on for a specific eval:
+```bash
+NIX_ENABLE_CA_PRODUCER=1 result/bin/nix eval -f ~/nixpkgs/default.nix \
+  --system x86_64-linux asciidoc.outPath
+NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/tmp/s.json $abovecmd
+python3 -c 'import json; print(json.load(open("/tmp/s.json"))["evalTrace"]["replay"])'
+```
+The `producerEdges` counter under `evalTrace.replay` shows gate fire count.
+
+**Decision tree for what to do next** — pick one based on what's true:
+
+1. **"§3b is dead weight, rip it out."** Defensible if you accept the bench
+   verdict and don't want code paths gated on env vars in production. The
+   cleanup is mechanical: revert commits `13cf303d2`, `82713fd91` (the hook
+   in `prim_derivationStrict`), `baa35bbf9` (`recordCAProducer` +
+   `recordSync`), `9241013bc` (the gate in `replayMemoizedDeps`),
+   `70c4591cc` (the `producerMap` API), and clean up the tests in
+   `dep/{producer-side-table,replay-producer-gate,ca-producer-scope,
+   trace-session-record-ca-producer}.cc`. Keep the consume-side tests
+   (`store/ca-trace-key-routing.cc`, `store/ca-producer-boundary-recording.cc`)
+   as a soundness floor for any future shape — they're scope-level synthetic
+   and don't depend on the production hook.
+
+2. **"§3b's idea is right; the cost shape is wrong — try (1)/(2)/(3) below."**
+   Defensible if you believe a future cost reduction unlocks the win. The RFC
+   §8 + production CLAUDE.md "RFC §3b" section both list:
+   - **(1) Async/batched producer recording** — `recordSync` runs synchronously
+     per derivation. Batching at session end (or running on a background
+     thread with `traceId` reconciliation deferred) collapses ~6,419 SQLite
+     transactions into one. Lowest-risk improvement.
+   - **(2) Suppress on warm-served derivations** — when the consumer's
+     `TracedExpr` is serving from cache, derivation thunks inside re-run as
+     part of `materializeResult`. The hook firing here costs 100% (every
+     record) for 0% benefit (the consumer isn't recording a new trace). A
+     thread-local flag set by `materializeResult` and read by the hook would
+     skip cleanly. Higher-impact.
+   - **(3) Measure on a sibling-share-heavy workload** — `closures.gnome` is
+     deep-computation, shallow-data; the gate fires only ~614 times/commit.
+     `nix-eval-jobs`-style deep attrset enumeration may exercise the gate
+     much more heavily. Run the bench on `python3Packages` outPaths (see
+     `MEMORY.md` / `project_eval_trace_perf_baseline_lever5.md` for the
+     workload definition).
+
+3. **"§3b is the wrong abstraction — different design."** Defensible if you
+   believe the underlying flattening (607×) needs a different fix entirely.
+   Read `plans/architecture-trace-model-vs-CA.md` (the architectural
+   diagnosis) + `plans/compositional-trace-dag-design.md` (the broader
+   compositional-trace-DAG direction the RFC was a slice of). The
+   prerequisite for any of these is **the keyset-provenance soundness
+   floor** (`plans/keyset-downgrade-sound-by-construction.md`,
+   `store/keyset-escape.cc`).
+
+4. **"Stay where we are; switch focus."** Defensible: §3b is dormant +
+   correctness-safe, the broader cache is solid (1844/1847 unit tests pass,
+   byte-identical eval). The 23 cold outliers in run-1 are the natural next
+   target if perf is the goal — they're not §3b-related; see the
+   redesign-plan's outlier diagnosis and the lever 1 / 2 / 3 / 4 ranking
+   below.
+
+**Reading order** for a new contributor unfamiliar with this whole arc:
+1. This README (you are here) — full lever list + reconciliation.
+2. `src/libexpr/eval-trace/CLAUDE.md` "Architecture Overview" + "RFC §3b" —
+   what production code looks like.
+3. `doc/eval-trace-cache-redesign-plan.md` — chronological synthesis,
+   including the 2026-05-31 follow-up #4 with bench table.
+4. `plans/content-addressed-trace-identity-rfc.md` — the §3b proposal +
+   its §8 outcome.
+5. Specific test files when looking at specific behaviors.
+
+`MEMORY.md` (in `~/.claude/projects/.../memory/`) has session-spanning
+context if you're using Claude Code with the same user; otherwise the
+in-tree docs above are self-contained.
+
 ## TL;DR — what is true of the current tree
 
 - **Shared baseline commit:** `92a3df1ab` ("File-based eval-trace cache",
