@@ -107,11 +107,24 @@ bool createUserEnv(
 
     /* Also write a copy of the list of user environment elements to
        the store; we need it for future modifications of the
-       environment. */
+       environment.
+
+       Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+       sites): `printAmbiguous` previously took nullptr context — the
+       context of any leaf string in the manifest (e.g. a
+       `meta.description` carrying a `SourceVirtual` placeholder)
+       was dropped. The serialised manifest persisted the
+       placeholder render verbatim into `env-manifest.nix` in the
+       store. Now we accumulate context, resolve, and rewrite the
+       serialised text before writing to the store. */
     auto manifestFile = ({
         std::ostringstream str;
-        printAmbiguous(state, manifest, str, nullptr);
-        StringSource source{str.view()};
+        NixStringContext context;
+        printAmbiguous(state, manifest, str, nullptr, &context);
+        auto rewrites = state.resolveSourceVirtualContext(context);
+        state.ensureLazyPathsCopied(context);
+        auto rewritten = rewriteStrings(str.str(), rewrites);
+        StringSource source{rewritten};
         state.store->addToStoreFromDump(
             source,
             "env-manifest.nix",

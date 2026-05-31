@@ -52,7 +52,33 @@ std::optional<LazyAttr> maybeGetLazyAttr(const Attrs & attrs, const std::string 
 
 Attrs jsonToAttrs(const nlohmann::json & json);
 
+/**
+ * Force every lazy attr and produce JSON suitable for persistent
+ * lock files and registry writes. Cross-process determinism: two
+ * processes evaluating the same flake produce byte-identical JSON
+ * because both force every attr.
+ */
 nlohmann::json attrsToJSON(const Attrs & attrs);
+
+/**
+ * As `attrsToJSON`, but stable under unforced lazy attrs: emits
+ * `null` for any LazyAttr instead of forcing. Use for cache keys
+ * and error formatting where forcing would be wasteful or
+ * recursive.
+ *
+ * Sentinel choice: `null` (not the string `"<lazy>"`) because cache
+ * keys are SHA-256'd and we want unforced/forced attrs to produce
+ * **different** keys — a key based on the unforced state must not
+ * collide with one for a known-but-different value. A miss followed
+ * by a force, lockfile write, and reload by the consumer process
+ * legitimately produces a cache miss, which is correct.
+ *
+ * Cross-process determinism: holds because two processes evaluating
+ * the same flake see the same input attrs at the same evaluation
+ * points (final-input reconciliation is deterministic). Lazy
+ * thunks are emitted as `null` in both processes.
+ */
+nlohmann::json attrsToJSONForKey(const Attrs & attrs);
 
 std::optional<std::string> maybeGetStrAttr(const Attrs & attrs, const std::string & name);
 

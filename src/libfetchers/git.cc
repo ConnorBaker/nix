@@ -3,18 +3,25 @@
 #include "nix/fetchers/fetchers.hh"
 #include "nix/util/users.hh"
 #include "nix/fetchers/cache.hh"
+#include "nix/fetchers/projection.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/pathlocks.hh"
 #include "nix/util/os-string.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/git.hh"
+#include "nix/fetchers/git-promisor.hh"
 #include "nix/fetchers/git-utils.hh"
+#include "nix/fetchers/source-view-git.hh"
 #include "nix/util/logging.hh"
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/util/json-utils.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/memo.hh"
-#include "nix/util/mounted-source-accessor.hh"
+#include "nix/util/switch-source-accessor.hh"
+#include "nix/util/sync.hh"
+
+#include <chrono>
+#include <unordered_map>
 
 #include <sys/time.h>
 
@@ -38,6 +45,35 @@ std::filesystem::path getCachePath(std::string_view key, bool shallow)
     auto name =
         hashString(HashAlgorithm::SHA256, key).to_string(HashFormat::Nix32, false) + (shallow ? "-shallow" : "");
     return getCacheDir() / "gitv3" / std::move(name);
+}
+
+/* ---------- per-URL protocol-v2 capability cache ----------
+ *
+ * Probing the remote's `info/refs?service=git-upload-pack` for v2
+ * capabilities is one HTTP round-trip per URL. We cache the result
+ * for `kV2ProbeTtl` so multiple inputs against the same partial-
+ * clone remote (e.g. nixpkgs across many inputs) share a single
+ * probe within a process.
+ */
+
+constexpr std::chrono::minutes kV2ProbeTtl{30};
+
+/* A *transient* probe failure (network/auth blip, not an authoritative
+   "no filter") is cached only briefly: long enough to coalesce a burst
+   of inputs in one evaluation, short enough that a later retry re-probes
+   rather than being stuck with a false negative for the full TTL. */
+constexpr std::chrono::seconds kV2ProbeFailureTtl{5};
+
+static Sync<std::unordered_map<std::string, V2ProbeResult>> v2ProbeCache_;
+
+/* The default probe just constructs a provider and asks it. Tests
+   can override this via `setV2ProbeForTest` to inject a stub. */
+static V2ProbeFn & v2ProbeFnSlot()
+{
+    static V2ProbeFn fn = [](const std::string & url) -> bool {
+        return makeGitPromisorProvider(url, {})->supportsFilteredFetch();
+    };
+    return fn;
 }
 
 // Returns the name of the HEAD branch.
@@ -161,6 +197,63 @@ std::vector<PublicKey> getPublicKeys(const Attrs & attrs)
 }
 
 } // end namespace
+
+V2ProbeResult gitV2CapsCache(const std::string & url)
+{
+    /* First, try to read from the cache. */
+    {
+        auto cache(v2ProbeCache_.lock());
+        auto it = cache->find(url);
+        if (it != cache->end()) {
+            auto age = std::chrono::steady_clock::now() - it->second.probedAt;
+            /* Authoritative results live for the full TTL; a transient
+               failure expires quickly so a retry re-probes. */
+            auto ttl = it->second.probeFailed ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                           kV2ProbeFailureTtl)
+                                              : std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                    kV2ProbeTtl);
+            if (age < ttl)
+                return it->second;
+        }
+    }
+
+    /* Probe (potentially network IO; runs without the cache lock). */
+    bool supports = false;
+    bool failed = false;
+    try {
+        supports = v2ProbeFnSlot()(url);
+    } catch (Error & e) {
+        debug("partial-clone capability probe for '%s' failed (transient — short TTL): %s", url, e.what());
+        failed = true;
+    }
+
+    V2ProbeResult result{
+        .supportsFilter = supports,
+        .probeFailed = failed,
+        .probedAt = std::chrono::steady_clock::now(),
+    };
+
+    {
+        auto cache(v2ProbeCache_.lock());
+        cache->insert_or_assign(url, result);
+    }
+
+    return result;
+}
+
+V2ProbeFn setV2ProbeForTest(V2ProbeFn fn)
+{
+    auto & slot = v2ProbeFnSlot();
+    auto prev = std::move(slot);
+    slot = std::move(fn);
+    return prev;
+}
+
+void gitV2CapsCacheClearForTest()
+{
+    auto cache(v2ProbeCache_.lock());
+    cache->clear();
+}
 
 static const Hash nullRev{HashAlgorithm::SHA1};
 
@@ -716,39 +809,24 @@ struct GitInputScheme : InputScheme
         const std::filesystem::path & repoDir,
         const Hash & rev) const
     {
-        Cache::Key key{"gitLastModified", {{"rev", rev.gitRev()}}};
-
-        auto cache = settings.getCache();
-
-        if (auto res = cache->lookup(key))
-            return getIntAttr(*res, "lastModified");
-
-        auto lastModified = GitRepo::openRepo(repoDir, {})->getLastModified(rev);
-
-        cache->upsert(key, {{"lastModified", lastModified}});
-
-        return lastModified;
+        return GitLastModified::lookup(
+            settings, rev, [&] { return GitRepo::openRepo(repoDir, {})->getLastModified(rev); });
     }
 
     uint64_t getRevCount(
-        ref<Cache> cache, const RepoInfo & repoInfo, const std::filesystem::path & repoDir, const Hash & rev) const
+        const Settings & settings,
+        const RepoInfo & repoInfo,
+        const std::filesystem::path & repoDir,
+        const Hash & rev) const
     {
-        if (GitRepo::openRepo(repoDir, {})->isShallow())
-            throw Error("'%s' is a shallow Git repository, so 'revCount' is not available", repoInfo.locationToArg());
-
-        Cache::Key key{"gitRevCount", {{"rev", rev.gitRev()}}};
-
-        if (auto revCountAttrs = cache->lookup(key))
-            return getIntAttr(*revCountAttrs, "revCount");
-
-        Activity act(
-            *logger, lvlChatty, actUnknown, fmt("getting Git revision count of '%s'", repoInfo.locationToArg()));
-
-        auto revCount = GitRepo::openRepo(repoDir, {})->getRevCount(rev);
-
-        cache->upsert(key, Attrs{{"revCount", revCount}});
-
-        return revCount;
+        return GitRevCount::lookup(settings, rev, [&] {
+            if (GitRepo::openRepo(repoDir, {})->isShallow())
+                throw Error(
+                    "'%s' is a shallow Git repository, so 'revCount' is not available", repoInfo.locationToArg());
+            Activity act(
+                *logger, lvlChatty, actUnknown, fmt("getting Git revision count of '%s'", repoInfo.locationToArg()));
+            return GitRepo::openRepo(repoDir, {})->getRevCount(rev);
+        });
     }
 
     LazyAttr lazyRevCount(
@@ -757,9 +835,8 @@ struct GitInputScheme : InputScheme
         const std::filesystem::path & repoDir,
         const Hash & rev) const
     {
-        auto cache = settings.getCache();
-        return makeLazyAttr([this, cache, repoInfo, repoDir, rev]() -> ResolvedAttr {
-            return getRevCount(cache, repoInfo, repoDir, rev);
+        return makeLazyAttr([this, &settings, repoInfo, repoDir, rev]() -> ResolvedAttr {
+            return getRevCount(settings, repoInfo, repoDir, rev);
         });
     }
 
@@ -863,6 +940,45 @@ struct GitInputScheme : InputScheme
 
             if (doFetch) {
                 bool shallow = getShallowAttr(input);
+
+                /* Decide whether to fetch this remote as a partial
+                   (blob-less) clone so blobs are backfilled on demand
+                   (the `git-lazy-fetch` setting / `NIX_GIT_LAZY_FETCH`).
+                   Gate on the SAME condition the on-demand backfill
+                   below (the `GitPromisorProvider`) requires: an
+                   http(s)- or ssh-transported remote advertising
+                   protocol-v2 with the `filter` capability. Marking a
+                   remote we can't actually backfill from (e.g.
+                   `file://`, `git://`, or a filter-less server) would
+                   route a later missing-blob read to a provider that
+                   throws, so we only mark when the provider will
+                   succeed. For every other remote we fall through to a
+                   normal full fetch.
+
+                   The `gitV2CapsCache` probe is a single cached
+                   round-trip per URL (30-min TTL), transport-matched to
+                   the URL scheme (an HTTP GET for http(s); an ssh
+                   `git-upload-pack` advertisement read for ssh) and
+                   shared with the provider-attach probe in
+                   `getAccessor` below, so this adds no extra network
+                   cost in the common case. */
+                bool lazyFetch = false;
+                if (settings.gitLazyFetch
+                    && (repoUrl.scheme == "https" || repoUrl.scheme == "http" || repoUrl.scheme == "ssh")) {
+                    if (gitV2CapsCache(repoUrl.to_string()).supportsFilter) {
+                        repo->markAsPartialClone("origin");
+                        lazyFetch = true;
+                        debug(
+                            "git-lazy-fetch: remote '%s' supports filtered fetch — fetching as a partial clone "
+                            "(blobs on demand)",
+                            repoUrl.to_string());
+                    } else {
+                        debug(
+                            "git-lazy-fetch: remote '%s' does not advertise protocol-v2 'filter'; doing a full fetch",
+                            repoUrl.to_string());
+                    }
+                }
+
                 try {
                     auto fetchRef = getAllRefsAttr(input)             ? "refs/*:refs/*"
                                     : input.getRev()                  ? input.getRev()->gitRev()
@@ -870,7 +986,7 @@ struct GitInputScheme : InputScheme
                                     : ref == "HEAD"                   ? "HEAD:HEAD"
                                                                       : fmt("%1%:%1%", "refs/heads/" + ref);
 
-                    repo->fetch(repoUrl.to_string(), fetchRef, shallow);
+                    repo->fetch(repoUrl.to_string(), fetchRef, shallow, lazyFetch);
                 } catch (Error & e) {
                     if (!std::filesystem::exists(localRefFile))
                         throw;
@@ -931,8 +1047,59 @@ struct GitInputScheme : InputScheme
 
         bool exportIgnore = getExportIgnoreAttr(input);
         bool smudgeLfs = getLfsAttr(input);
+
+        /* If this is a partial clone (`extensions.partialClone` names a
+           remote in the repo's git config), build a `GitPromisorProvider`
+           against that remote so missing blobs can be fetched on
+           demand. We only attach the provider if the remote actually
+           supports protocol-v2 with `filter` capability — otherwise
+           `ensureObjects` would throw. The capability probe is cached
+           per-URL with a 30-minute TTL. */
+        std::shared_ptr<GitPromisorProvider> provider;
+        if (auto remoteUrl = repo->getPartialCloneRemoteUrl()) {
+            /* This repo IS already a partial clone (the remote is marked
+               as a promisor), so it WILL have missing blobs that only the
+               provider can backfill. `makeGitPromisorProvider` may throw
+               on an unsupported transport scheme (e.g. an externally
+               created `git://`/`file://` partial clone) — catch that and
+               leave `provider` null with a clear warning rather than
+               aborting the fetch. */
+            try {
+                provider = makeGitPromisorProvider(*remoteUrl, repoDir);
+            } catch (Error & e) {
+                warn(
+                    "cannot attach a lazy-fetch provider to partial-clone remote '%s' (%s); "
+                    "missing blobs will not be fetched on demand",
+                    *remoteUrl,
+                    e.what());
+            }
+            if (provider) {
+                auto caps = gitV2CapsCache(*remoteUrl);
+                /* Detach ONLY on an authoritative "no filter" answer. On a
+                   transient probe failure keep the provider: per-blob
+                   on-demand backfill (each read re-attempts and surfaces a
+                   clear error if the remote truly can't serve it) is
+                   strictly better than no provider on a clone that is
+                   already missing blobs. */
+                if (!caps.supportsFilter && !caps.probeFailed) {
+                    debug(
+                        "partial-clone remote '%s' does not advertise protocol v2 with fetch filters; "
+                        "missing blobs will not be fetched on demand",
+                        *remoteUrl);
+                    provider.reset();
+                } else if (caps.probeFailed) {
+                    debug(
+                        "partial-clone capability probe for '%s' failed transiently; keeping the backfill provider "
+                        "(per-blob on-demand fetch)",
+                        *remoteUrl);
+                }
+            }
+        }
+
         auto accessor = repo->getAccessor(
-            rev, {.exportIgnore = exportIgnore, .smudgeLfs = smudgeLfs}, "«" + input.to_string() + "»");
+            rev,
+            {.exportIgnore = exportIgnore, .smudgeLfs = smudgeLfs, .provider = provider},
+            "«" + input.to_string() + "»");
 
         /* If the repo has submodules, fetch them and return a mounted
            input accessor consisting of the accessor for the top-level
@@ -975,7 +1142,10 @@ struct GitInputScheme : InputScheme
 
             if (!mounts.empty()) {
                 mounts.insert_or_assign(CanonPath::root, accessor);
-                accessor = makeMountedSourceAccessor(std::move(mounts));
+                /* The submodule mount set is fixed at construction (no
+                   runtime `mount()` calls follow), so use the immutable
+                   `Switch` rather than the mutable `Mounted`. */
+                accessor = makeSwitch(std::move(mounts));
             }
         }
 
@@ -998,8 +1168,40 @@ struct GitInputScheme : InputScheme
 
         auto exportIgnore = getExportIgnoreAttr(input);
 
-        ref<SourceAccessor> accessor =
+        ref<SourceAccessor> diskAccessor =
             repo->getAccessor(repoInfo.workdirInfo, {.exportIgnore = exportIgnore}, makeNotAllowedError(repoPath));
+
+        /* If the workdir is dirty AND the repo has a base commit,
+           wrap the disk accessor in a SourceView Overlay rooted at
+           the committed tree. The overlay's base is the committed
+           tree (content-addressed, cacheable); reads of dirty paths
+           route to the disk accessor; deletions become whiteouts.
+           Soundness: the overlay's getFingerprint returns nullopt
+           (or the wrapper's Input-level fingerprint when set) for
+           any path within overlay reach, so cache rows keyed on
+           `tree:<headRev>` don't hit for dirty content.
+
+           Clean (`!isDirty`) and no-headRev cases bypass the overlay
+           — the disk accessor flows through unchanged. */
+        ref<SourceAccessor> accessor = diskAccessor;
+        if (repoInfo.workdirInfo.isDirty && repoInfo.workdirInfo.headRev) {
+            try {
+                auto baseAccessor = repo->getAccessor(
+                    *repoInfo.workdirInfo.headRev,
+                    {.exportIgnore = exportIgnore},
+                    "«" + input.to_string() + " @ " + repoInfo.workdirInfo.headRev->gitShortRev() + "»");
+                accessor = makeWorkdirOverlay(baseAccessor, diskAccessor, repoInfo.workdirInfo).cast<SourceAccessor>();
+            } catch (Error & e) {
+                /* If the committed tree can't be read (corrupt repo
+                   or missing object), fall back to the flat path
+                   rather than fail eval. Same bytes, just no
+                   cache-row reuse for clean siblings. */
+                debug(
+                    "workdir-overlay failed for '%s'; falling back to flat workdir accessor: %s",
+                    repoPath.string(),
+                    e.what());
+            }
+        }
 
         /* If the repo has submodules, return a mounted input accessor
            consisting of the accessor for the top-level repo and the
@@ -1030,7 +1232,9 @@ struct GitInputScheme : InputScheme
             }
 
             mounts.insert_or_assign(CanonPath::root, accessor);
-            accessor = makeMountedSourceAccessor(std::move(mounts));
+            /* Fixed mount set (no runtime `mount()` follows) — immutable
+               `Switch`, not the mutable `Mounted`. */
+            accessor = makeSwitch(std::move(mounts));
         }
 
         if (!repoInfo.workdirInfo.isDirty) {

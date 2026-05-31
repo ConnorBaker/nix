@@ -3,6 +3,7 @@
 
 #include "nix/util/comparator.hh"
 #include "nix/store/derived-path.hh"
+#include "nix/store/source-placeholder.hh"
 #include "nix/util/variant-wrapper.hh"
 
 #include <nlohmann/json_fwd.hpp>
@@ -64,7 +65,32 @@ struct NixStringContextElem
      */
     using Built = SingleDerivedPath::Built;
 
-    using Raw = std::variant<Opaque, DrvDeep, Built>;
+    /**
+     * Source view that has not yet been materialised to a real
+     * store path. Carries an opaque placeholder string identifying
+     * the registered view in `MaterialisationScheduler` plus a
+     * per-output `name` for disambiguation when several outputs
+     * share one `SourceContentId` (the cargo-workspace pattern).
+     *
+     * Encoded in the form `~<base32-hash>:<name>` where the hash is
+     * the placeholder's render() body (52 base32 chars). The leading
+     * '~' is the sigil; ':' separates the hash from the name.
+     *
+     * On context realisation (`realiseContext`), the placeholder is
+     * resolved to a real `StorePath` via the eval state's
+     * `MaterialisationScheduler`. See `doc/tecnix-survey/PROPOSAL.md`
+     * §"O' SourcePlaceholder + MaterialisationScheduler" for the
+     * design.
+     */
+    struct SourceVirtual
+    {
+        SourcePlaceholder placeholder;
+        std::string name;
+
+        GENERATE_CMP(SourceVirtual, me->placeholder, me->name);
+    };
+
+    using Raw = std::variant<Opaque, DrvDeep, Built, SourceVirtual>;
 
     Raw raw;
 
@@ -77,6 +103,7 @@ struct NixStringContextElem
      * - `<path>`
      * - `=<path>`
      * - `!<name>!<path>`
+     * - `~<base32-hash>:<name>` (SourceVirtual)
      *
      * @param xpSettings Stop-gap to avoid globals during unit tests.
      */

@@ -3,6 +3,12 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/materialisation-scheduler.hh"
+#include "nix/store/source-content-id.hh"
+#include "nix/store/source-placeholder.hh"
+#include "nix/fetchers/filtered-shape.hh"
+#include "nix/util/fingerprint.hh"
+#include "nix/util/source-view.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/expr/json-to-value.hh"
 #include "nix/expr/static-string-data.hh"
@@ -91,8 +97,19 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
                 [&](const NixStringContextElem::Opaque & o) {
                     /* If the path happens to be mounted on the storeFS, that means it's lazy path string and would get
                        copied to the store on-demand (when referenced in a derivation). The string is equal to final
-                       store path where the store object would end up (the path is hashed before mounting). */
-                    if (!storeFS->getMount(CanonPath(store->printStorePath(o.path))))
+                       store path where the store object would end up (the path is hashed before mounting).
+
+                       For an Item 2 deferred-mount stand-in (§6.1.1) the
+                       string is NOT the final store path — but we still
+                       do not rewrite it here. This map feeds READ sites
+                       (`realisePath`, `findFile`) which read through the
+                       fake mount (always live, even under PreserveLazy);
+                       rewriting to the real path would point reads at a
+                       not-yet-mounted path. Text that escapes into a
+                       derivation or `toFile` is rewritten at those
+                       boundaries instead (see derivationStrictInternal /
+                       prim_toFile), where the real path is required. */
+                    if (!storeFS->getMount(storeMountKey(*store, o.path)))
                         ensureValid(o.path);
                     if (maybePathsOut)
                         maybePathsOut->emplace(o.path);
@@ -103,12 +120,43 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
                     if (maybePathsOut)
                         maybePathsOut->emplace(d.drvPath);
                 },
+                [&](const NixStringContextElem::SourceVirtual & sv) {
+                    /* Demand the placeholder's storePath via the
+                       MaterialisationScheduler. This walks the
+                       registered SourceView (or hits the persistent
+                       projection cache), copies into the store, and
+                       returns the realised CA path.
+
+                       Record the rewrite from the placeholder's
+                       render string to the materialised storePath.
+                       Callers (like `realisePath`) use the rewrite
+                       map to substitute the placeholder text in
+                       paths and strings before further processing,
+                       so e.g. `(builtins.path {...}) + "/file"`
+                       becomes `/nix/store/<hash>-name/file`. */
+                    auto storePath = materialisationScheduler->outPathOf(sv.placeholder);
+                    if (!store->isValidPath(storePath))
+                        error<InvalidPathError>(storePath).debugThrow();
+                    /* Whitelist the materialised storePath in
+                       restricted/pure-eval mode. Without this the
+                       eval can compute the path but rootFS rejects
+                       reads under it ("access to absolute path X is
+                       forbidden in pure evaluation mode"). */
+                    allowPath(storePath);
+                    res.insert_or_assign(sv.placeholder.render(), store->printStorePath(storePath));
+                    if (maybePathsOut)
+                        maybePathsOut->emplace(storePath);
+                },
             },
             c.raw);
     }
 
+    /* If no Built drvs to realise, return whatever rewrites we've
+       already collected (e.g. SourceVirtual placeholder rewrites).
+       Without this, SourceVirtual-only contexts would lose their
+       placeholder→storePath rewrites. */
     if (drvs.empty())
-        return {};
+        return res;
 
     if (isIFD) {
         if (!settings.enableImportFromDerivation)
@@ -988,10 +1036,18 @@ static RegisterPrimOp primop_abort(
       Abort Nix expression evaluation and print the error message *s*.
     )",
      .impl = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
+         /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 /
+            Tradeoff 7). The abort message is embedded in the error
+            shown to the user; resolve SourceVirtual context so the
+            user sees real storepath text, not the placeholder. */
          NixStringContext context;
          auto s =
              state.coerceToString(pos, *args[0], context, "while evaluating the error message passed to builtins.abort")
                  .toOwned();
+         auto rewrites = state.resolveSourceVirtualContext(context);
+         state.ensureLazyPathsCopied(context);
+         if (!rewrites.empty())
+             s = rewriteStrings(s, rewrites);
          state.error<Abort>("evaluation aborted with the following error message: '%1%'", s)
              .setIsFromExpr()
              .debugThrow();
@@ -1008,10 +1064,18 @@ static RegisterPrimOp primop_throw(
       (which is not the case for `abort`).
     )",
      .impl = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
+         /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 /
+            Tradeoff 7). The throw message is shown verbatim to the
+            user; resolve SourceVirtual context so the message
+            displays real storepath text. */
          NixStringContext context;
          auto s =
              state.coerceToString(pos, *args[0], context, "while evaluating the error message passed to builtin.throw")
                  .toOwned();
+         auto rewrites = state.resolveSourceVirtualContext(context);
+         state.ensureLazyPathsCopied(context);
+         if (!rewrites.empty())
+             s = rewriteStrings(s, rewrites);
          state.error<ThrownError>(s).setIsFromExpr().debugThrow();
      }});
 
@@ -1021,6 +1085,10 @@ static void prim_addErrorContext(EvalState & state, const PosIdx pos, Value ** a
         state.forceValue(*args[1], pos);
         v = *args[1];
     } catch (Error & e) {
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 /
+           Tradeoff 7). The error-context message is embedded into
+           the error trace shown to the user; resolve SourceVirtual
+           context so trace frames display real storepath text. */
         NixStringContext context;
         auto message = state
                            .coerceToString(
@@ -1031,6 +1099,10 @@ static void prim_addErrorContext(EvalState & state, const PosIdx pos, Value ** a
                                false,
                                false)
                            .toOwned();
+        auto rewrites = state.resolveSourceVirtualContext(context);
+        state.ensureLazyPathsCopied(context);
+        if (!rewrites.empty())
+            message = rewriteStrings(message, rewrites);
         e.addTrace(nullptr, HintFmt(message), TracePrint::Always);
         throw;
     }
@@ -1308,9 +1380,19 @@ static RegisterPrimOp primop_deepSeq({
 static void prim_trace(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    if (args[0]->type() == nString)
-        printError("trace: %1%", args[0]->string_view());
-    else
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 / Tradeoff
+       7). The string body is embedded in the trace line on stderr;
+       a SourceVirtual placeholder render would be displayed verbatim.
+       Resolve before embedding so traces show real paths. */
+    if (args[0]->type() == nString) {
+        NixStringContext context;
+        copyContext(*args[0], context);
+        auto rewrites = state.resolveSourceVirtualContext(context);
+        state.ensureLazyPathsCopied(context);
+        auto body = rewrites.empty() ? std::string{args[0]->string_view()}
+                                     : rewriteStrings(std::string{args[0]->string_view()}, rewrites);
+        printError("trace: %1%", body);
+    } else
         printError("trace: %1%", ValuePrinter(state, *args[0]));
     if (state.settings.builtinsTraceDebugger) {
         state.runDebugRepl(nullptr);
@@ -1340,13 +1422,21 @@ static void prim_warn(EvalState & state, const PosIdx pos, Value ** args, Value 
 {
     // We only accept a string argument for now. The use case for pretty printing a value is covered by `trace`.
     // By rejecting non-strings we allow future versions to add more features without breaking existing code.
-    auto msgStr =
-        state.forceString(*args[0], pos, "while evaluating the first argument; the message passed to builtins.warn");
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 / Tradeoff
+       7). The warning body is rendered to stderr/the warn-log; a
+       SourceVirtual placeholder render would be displayed verbatim.
+       Resolve before embedding. */
+    NixStringContext context;
+    auto msgStr = state.forceString(
+        *args[0], context, pos, "while evaluating the first argument; the message passed to builtins.warn");
+    auto rewrites = state.resolveSourceVirtualContext(context);
+    state.ensureLazyPathsCopied(context);
+    std::string msg = rewrites.empty() ? std::string{msgStr} : rewriteStrings(std::string{msgStr}, rewrites);
 
     {
         ErrorInfo info{
             .level = lvlWarn,
-            .msg = HintFmt(std::string(msgStr)),
+            .msg = HintFmt(msg),
             .pos = state.positions[pos],
             .isFromExpr = true,
         };
@@ -1733,7 +1823,24 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
 
     /* Everything in the context of the strings in the derivation
        attributes should be added as dependencies of the resulting
-       derivation. */
+       derivation.
+
+       For SourceVirtual placeholders, we batch their resolution
+       through `outPathsOf` so independent placeholders can share
+       walks (the cargo-workspace 200-package property). The
+       resolved storePath then takes the same path as Opaque: added
+       to inputSrcs and rewritten in derivation attrs. */
+    std::vector<SourcePlaceholder> svBatch;
+    for (auto & c : context)
+        if (auto * sv = std::get_if<NixStringContextElem::SourceVirtual>(&c.raw))
+            svBatch.push_back(sv->placeholder);
+
+    std::unordered_map<SourcePlaceholder, StorePath> svResolved;
+    if (!svBatch.empty())
+        svResolved = state.materialisationScheduler->outPathsOf(svBatch);
+
+    StringMap svRewrites;
+
     for (auto & c : context) {
         std::visit(
             overloaded{
@@ -1758,10 +1865,73 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                 },
                 [&](const NixStringContextElem::Opaque & o) {
                     state.ensureLazyPathCopied(o.path);
-                    drv.inputSrcs.insert(o.path);
+                    /* If `o.path` is an Item 2 deferred-mount stand-in,
+                       `ensureLazyPathCopied` above has materialised it;
+                       insert the *real* CA path so a valid path lands
+                       in `inputSrcs` (the fake stand-in is never built).
+                       For an ordinary real path this is the identity. */
+                    auto realPath = state.devirtualizeStorePath(o.path);
+                    drv.inputSrcs.insert(realPath);
+                    /* And rewrite the fake path text wherever it was
+                       interpolated into the derivation (builder/args/
+                       env), so the builder sees the real store path —
+                       the same rewrite SourceVirtual does, keyed on the
+                       fake store-path string instead of a placeholder
+                       render. No-op when not a stand-in. */
+                    if (realPath != o.path)
+                        svRewrites.insert_or_assign(
+                            state.store->printStorePath(o.path), state.store->printStorePath(realPath));
+                },
+                [&](const NixStringContextElem::SourceVirtual & sv) {
+                    auto it = svResolved.find(sv.placeholder);
+                    assert(it != svResolved.end());
+                    drv.inputSrcs.insert(it->second);
+                    /* Rewrite the placeholder string in derivation
+                       env / args to the resolved storePath. */
+                    svRewrites.insert_or_assign(sv.placeholder.render(), state.store->printStorePath(it->second));
                 },
             },
             c.raw);
+    }
+
+    /* Apply placeholder → storePath rewrites to derivation attrs.
+       This must happen after the visit loop so all svRewrites are
+       collected before any string is rewritten.
+
+       Every persisted derivation field that could have interpolated a
+       placeholder render (SourceVirtual) or an Item-2 deferred-mount
+       fake-path string MUST be rewritten here — otherwise the
+       placeholder leaks into the on-disk `.drv` and the builder's
+       environment, referencing a path that does not exist. The fields
+       are: `builder`, `args`, `env`, `platform`, and `structuredAttrs`
+       (the JSON the builder sees via `__json`/`.attrs.json`). This
+       mirrors `Derivation::applyRewrites` (derivations.cc), which
+       rewrites the same field set for output-placeholder resolution. */
+    if (!svRewrites.empty()) {
+        drv.builder = rewriteStrings(drv.builder, svRewrites);
+        for (auto & a : drv.args)
+            a = rewriteStrings(a, svRewrites);
+        for (auto & [_, value] : drv.env)
+            value = rewriteStrings(value, svRewrites);
+        /* `platform` (the `system` attr) is a separate Derivation field,
+           not stored in `env`. In the `__structuredAttrs` path it is read
+           with `forceStringNoCtx` (so it cannot carry a placeholder), but
+           in the plain path it comes from a context-bearing
+           `coerceToString`, so rewrite it for safety/symmetry. */
+        drv.platform = rewriteStrings(drv.platform, svRewrites);
+        /* `structuredAttrs` is serialised into the `.drv` independently
+           of `env` (derivations.cc unparse), so it needs its own rewrite.
+           Round-trip through the JSON dump exactly as
+           `Derivation::applyRewrites` does. */
+        if (drv.structuredAttrs) {
+            auto [_, jsonS] = drv.structuredAttrs->unparse();
+            jsonS = rewriteStrings(std::move(jsonS), svRewrites);
+            drv.structuredAttrs = StructuredAttrs::parse(jsonS);
+        }
+        debug(
+            "derivation '%s': rewrote %d source placeholder(s) into builder/args/env/platform/structuredAttrs",
+            drvName,
+            svRewrites.size());
     }
 
     /* Do we have all required attributes? */
@@ -2057,11 +2227,31 @@ static std::string_view legacyBaseNameOf(std::string_view path)
 static void prim_baseNameOf(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     NixStringContext context;
-    v.mkString(
-        legacyBaseNameOf(*state.coerceToString(
-            pos, *args[0], context, "while evaluating the first argument passed to builtins.baseNameOf", false, false)),
-        context,
-        state.mem);
+    auto s = state.coerceToString(
+        pos, *args[0], context, "while evaluating the first argument passed to builtins.baseNameOf", false, false);
+
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+       sites). Body-slicing primops reject SourceVirtual context to
+       preserve the deferred-materialisation invariant — see
+       Tradeoff 8. The output body is a slice of the input body, so
+       the placeholder render text would be truncated and
+       `rewriteStrings` (literal substring search) would fail to
+       match. Throwing here forces callers to materialise the source
+       up front via `builtins.path` or an explicit derivation. */
+    for (auto & c : context) {
+        if (std::get_if<NixStringContextElem::SourceVirtual>(&c.raw)) {
+            state
+                .error<EvalError>(
+                    "the string '%s' contains an unresolved source-virtual placeholder; "
+                    "slicing primops require resolved store paths. Use builtins.path or "
+                    "an explicit derivation to materialise the source first.",
+                    *s)
+                .atPos(pos)
+                .debugThrow();
+        }
+    }
+
+    v.mkString(legacyBaseNameOf(*s), context, state.mem);
 }
 
 static RegisterPrimOp primop_baseNameOf({
@@ -2095,6 +2285,29 @@ static void prim_dirOf(EvalState & state, const PosIdx pos, Value ** args, Value
         NixStringContext context;
         auto path = state.coerceToString(
             pos, *args[0], context, "while evaluating the first argument passed to 'builtins.dirOf'", false, false);
+
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+           sites). Body-slicing primops reject SourceVirtual context
+           to preserve the deferred-materialisation invariant — see
+           Tradeoff 8. `path->substr(0, lastSlash)` chops off the
+           placeholder body's tail, so `rewriteStrings` (literal
+           substring search) would fail to match. Throwing here
+           forces callers to materialise the source up front. The
+           `nPath` branch above is unaffected — paths don't carry
+           SourceVirtual context. */
+        for (auto & c : context) {
+            if (std::get_if<NixStringContextElem::SourceVirtual>(&c.raw)) {
+                state
+                    .error<EvalError>(
+                        "the string '%s' contains an unresolved source-virtual placeholder; "
+                        "slicing primops require resolved store paths. Use builtins.path or "
+                        "an explicit derivation to materialise the source first.",
+                        *path)
+                    .atPos(pos)
+                    .debugThrow();
+            }
+        }
+
         auto pos = path->rfind('/');
         if (pos == path->npos)
             v.mkStringMove("."_sds, context, state.mem);
@@ -2120,6 +2333,10 @@ static RegisterPrimOp primop_dirOf({
 static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto path = state.realisePath(pos, *args[0]);
+    /* Coalesce the about-to-happen blob fetch with neighbour blobs in
+       the same directory — the configuration/manifest pattern. */
+    if (auto parent = path.path.parent())
+        path.accessor->prefetchSubtree(*parent, /*depth=*/1);
     auto s = path.readFile();
     if (s.find((char) 0) != std::string::npos)
         state.error<EvalError>("the contents of the file '%1%' cannot be represented as a Nix string", path)
@@ -2144,6 +2361,17 @@ static void prim_readFile(EvalState & state, const PosIdx pos, Value ** args, Va
             });
     }
     v.mkString(s, context, state.mem);
+
+    /* Record this StringData* → fingerprint association so a downstream
+       `prim_fromJSON` can construct a content-keyed parse-cache key.
+       Skip empty strings: master's `StringData::make` short-circuits
+       to a static empty StringData, so allocation identity is shared
+       across all empty `readFile` results — not a useful key. */
+    if (!s.empty()) {
+        auto fp = path.accessor->getFingerprint(path.path);
+        if (fp.second)
+            state.stringFingerprints->try_emplace(&v.string_data(), StringFingerprint{fp.first, std::move(*fp.second)});
+    }
 }
 
 static RegisterPrimOp primop_readFile({
@@ -2426,6 +2654,13 @@ static void prim_readDir(EvalState & state, const PosIdx pos, Value ** args, Val
 {
     auto path = state.realisePath(pos, *args[0]);
 
+    /* Hint to the underlying accessor that we're about to scan this
+       directory's entries. For partial-clone Git accessors this lets
+       a single coalesced fetch grab all neighbour blobs that the
+       caller will likely read next. No-op for accessors that don't
+       implement prefetchSubtree. */
+    path.accessor->prefetchSubtree(path.path, /*depth=*/1);
+
     // Retrieve directory entries for all nodes in a directory.
     // This is similar to `getFileType` but is optimized to reduce system calls
     // on many systems.
@@ -2668,11 +2903,32 @@ static RegisterPrimOp primop_toJSON({
 static void prim_fromJSON(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto s = state.forceStringNoCtx(*args[0], pos, "while evaluating the first argument passed to builtins.fromJSON");
+
+    /* Content-keyed parse cache: when this string came from
+       `prim_readFile` against a content-fingerprintable source, the
+       parse output can be reused across processes. */
+    constexpr std::string_view kFormat = "json";
+    constexpr std::string_view kParserKey = "json-v1";
+
+    std::optional<StringFingerprint> fp;
+    state.stringFingerprints->cvisit(&args[0]->string_data(), [&](auto & ent) { fp = ent.second; });
+
+    if (fp) {
+        auto cache = getParseCache();
+        if (cache->lookup(fp->fingerprint, kFormat, kParserKey, fp->returnedPath, state, v))
+            return;
+    }
+
     try {
         parseJSON(state, s, v);
     } catch (JSONParseError & e) {
         e.addTrace(state.positions[pos], "while decoding a JSON string");
         throw;
+    }
+
+    if (fp) {
+        auto cache = getParseCache();
+        cache->upsert(fp->fingerprint, kFormat, kParserKey, fp->returnedPath, state, v);
     }
 }
 
@@ -2700,12 +2956,32 @@ static void prim_toFile(EvalState & state, const PosIdx pos, Value ** args, Valu
     auto contents =
         state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.toFile");
 
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+       sites). Resolve `SourceVirtual` placeholders to real
+       storepaths, rewrite the body, and treat resolved paths as
+       Opaque references. Without this fix, the loop below would
+       throw on a `SourceVirtual` element with a placeholder render
+       in the error message, and `contents` would carry the
+       placeholder body verbatim into both `hashString` (wrong hash)
+       and `addToStoreFromDump` (wrong persisted file). */
+    auto rewrites = state.resolveSourceVirtualContext(context);
+    std::string contentsRewritten =
+        rewrites.empty() ? std::string{contents} : rewriteStrings(std::string{contents}, rewrites);
+
     StorePathSet refs;
 
     for (auto c : context) {
         if (auto p = std::get_if<NixStringContextElem::Opaque>(&c.raw)) {
             state.ensureLazyPathCopied(p->path);
-            refs.insert(p->path);
+            /* Insert the real CA path (identity for a non-deferred
+               path; the materialised path for an Item 2 stand-in). */
+            refs.insert(state.devirtualizeStorePath(p->path));
+        } else if (auto * sv = std::get_if<NixStringContextElem::SourceVirtual>(&c.raw)) {
+            /* Resolved above; just record the resolved storepath as
+               a reference. The placeholder render in `contents` was
+               rewritten to the real storepath text by the
+               `rewriteStrings` call above. */
+            refs.insert(state.materialisationScheduler->outPathOf(sv->placeholder));
         } else
             state
                 .error<EvalError>(
@@ -2720,11 +2996,11 @@ static void prim_toFile(EvalState & state, const PosIdx pos, Value ** args, Valu
     auto storePath = settings.readOnlyMode ? state.store->makeFixedOutputPathFromCA(
                                                  name,
                                                  TextInfo{
-                                                     .hash = hashString(HashAlgorithm::SHA256, contents),
+                                                     .hash = hashString(HashAlgorithm::SHA256, contentsRewritten),
                                                      .references = std::move(refs),
                                                  })
                                            : ({
-                                                 StringSource s{contents};
+                                                 StringSource s{contentsRewritten};
                                                  state.store->addToStoreFromDump(
                                                      s,
                                                      name,
@@ -2875,32 +3151,155 @@ static void addPath(
             expectedStorePath = state.store->makeFixedOutputPathFromCA(
                 name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
 
-        if (!expectedHash || !state.store->isValidPath(*expectedStorePath)) {
-            // FIXME: support refs in fetchToStore()?
-            auto dstPath = refs.empty() ? fetchToStore(
-                                              state.fetchSettings,
-                                              *state.store,
-                                              path.resolveSymlinks(),
-                                              settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy,
-                                              name,
-                                              method,
-                                              filter.get(),
-                                              state.repair)
-                                        : state.store->addToStore(
-                                              name,
-                                              path.resolveSymlinks(),
-                                              method,
-                                              HashAlgorithm::SHA256,
-                                              refs,
-                                              filter ? *filter.get() : defaultPathFilter,
-                                              state.repair);
-            if (expectedHash && expectedStorePath != dstPath)
-                state.error<EvalError>("store path mismatch in (possibly filtered) path added from '%s'", path)
-                    .atPos(pos)
-                    .debugThrow();
-            state.allowAndSetStorePathString(dstPath, v);
-        } else
-            state.allowAndSetStorePathString(*expectedStorePath, v);
+        /* Eager paths (fall through to existing fetchToStore +
+           allowAndSetStorePathString):
+             - `expectedHash` set: storepath known up front, deferring
+               adds no value;
+             - source has no content-determined fingerprint
+               (LocalCapability accessor): we can't form a
+               `SourceContentId`, so the placeholder is uncomputable.
+           Otherwise (Item 1 deferred path): register a SourceView,
+           emit a `SourceVirtual` placeholder, defer the walk to the
+           consumer's observation boundary. The cargo-workspace
+           property follows from the content-determined `SourceContentId`
+           plus `MaterialisationScheduler`'s coalescing (one shared
+           narHash walk; see §4 for the honest cold-vs-warm shape). */
+
+        /* Resolve symlinks on the root path ONCE, up front, so the
+           fingerprint, the eager `fetchToStore`, and the deferred
+           `SourceView` all see the same resolved source. The eager
+           branch previously resolved inline (`path.resolveSymlinks()`)
+           while the deferred branch used the raw `path` — a symlinked
+           source root (`builtins.path { path = ./symlink-to-dir; }`)
+           then hashed differently between the two branches. Resolving
+           the root is O(path-depth) lstat calls (bounded, cheap); it
+           does NOT force the O(tree) content walk, so deferral is
+           preserved. For the common non-symlink path this is an
+           identity re-canonicalisation. */
+        path = path.resolveSymlinks();
+
+        auto [_subpath, fingerprint] = path.accessor->getFingerprint(path.path);
+
+        if (expectedHash || !fingerprint) {
+            if (!expectedHash || !state.store->isValidPath(*expectedStorePath)) {
+                auto dstPath = fetchToStore(
+                    state.fetchSettings,
+                    *state.store,
+                    path, // symlinks already resolved above
+                    settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy,
+                    name,
+                    method,
+                    filter.get(),
+                    state.repair,
+                    refs);
+                if (expectedHash && expectedStorePath != dstPath)
+                    state.error<EvalError>("store path mismatch in (possibly filtered) path added from '%s'", path)
+                        .atPos(pos)
+                        .debugThrow();
+                state.allowAndSetStorePathString(dstPath, v);
+            } else
+                state.allowAndSetStorePathString(*expectedStorePath, v);
+            return;
+        }
+
+        /* Deferred path. Build the view + shape, register, emit
+           SourceVirtual. Construction is metadata-only:
+             - Filtered: `collectFilteredShape` is one filter pass
+               (no blob reads), and `sourceViewSubset` is just
+               operator-stack assembly.
+             - Unfiltered: a sentinel shapeHash so `SourceContentId`
+               distinguishes filtered subsets from the unfiltered
+               whole. `sourceViewSubtree` is identity-or-Translate
+               assembly.
+           No *content* (blob/NAR) walk happens here — that is deferred
+           until a consumer calls `outPathOf`/`outPathsOf` against the
+           placeholder. The filtered branch DOES eagerly walk directory
+           *structure* and run the user filter (`collectFilteredShape`
+           lstats/reads-dirs the tree, no blob bytes); the unfiltered
+           branch is truly walk-free here. Root-symlink resolution
+           already happened above (shared with the eager branch). */
+        ref<SourceViewAccessor> view = [&]() -> ref<SourceViewAccessor> {
+            if (filter) {
+                auto shape = collectFilteredShape(*path.accessor, path.path, *filter);
+                /* `acceptedPaths` from the walker are absolute paths
+                   on `path.accessor`; rebase to the wrapper-root
+                   namespace by stripping the `path.path` prefix.
+                   See the test at
+                   `src/libfetchers-tests/algebra-cross-cutting.cc:435-446`
+                   for the convention: `sourceViewSubset` expects
+                   subpath-relative paths in the accepted set, and
+                   `Translate(subpath)` rewrites queries before
+                   `Restrict` checks them. */
+                std::set<CanonPath> acceptedRebased;
+                for (auto & abs : shape.accepted) {
+                    if (!abs.isWithin(path.path))
+                        /* Should not happen: walker is rooted at
+                           `path.path` so every accepted path is
+                           either == or a descendant of it. */
+                        throw Error(
+                            "filtered-shape walker produced path '%s' outside root '%s'", abs.abs(), path.path.abs());
+                    /* `removePrefix(prefix)` returns the path unchanged
+                       when prefix is root, otherwise strips the prefix.
+                       For root prefix, the path is already
+                       wrapper-relative (since base is rooted at /, the
+                       absolute path on base equals the root-relative
+                       view path). For non-root prefix, removePrefix
+                       returns the suffix as a CanonPath. */
+                    acceptedRebased.insert(abs.removePrefix(path.path));
+                }
+                return sourceViewSubset(path.accessor, shape.shapeHash, std::move(acceptedRebased), path.path);
+            } else {
+                return sourceViewSubtree(path.accessor, path.path);
+            }
+        }();
+
+        /* Sentinel shapeHash for unfiltered: distinguishes the
+           unfiltered whole from any filtered subset. The string
+           is fixed and version-tagged so future schema changes
+           can cleanly invalidate. */
+        Hash shapeHash = filter ? std::get<recipe::Subset>(view->recipe).shapeHash
+                                : hashString(HashAlgorithm::SHA256, "addPath-unfiltered-v1");
+
+        /* Splice the shapeHash into the view's fingerprint so
+           `fetchToStore2`'s `sourcePathToHash` cache (keyed on
+           `(fingerprint, method, subpath)`) doesn't collide with the
+           unfiltered base's cached narHash. Without this, the
+           DryRun walk inside `MaterialisationScheduler::computeNarHash`
+           would hit the unfiltered base's cache row (same fingerprint,
+           same `subpath="/"`) and return the *unfiltered* narHash —
+           producing a CA storepath that doesn't match what the Copy
+           walk subsequently writes. The shape suffix ordering follows
+           L9 (alphabetical merge via `mergeFingerprintSuffix`) so
+           multiple wrappers stack independent of order. */
+        view->fingerprint =
+            mergeFingerprintSuffix(*fingerprint, ";shape=" + shapeHash.to_string(HashFormat::SRI, true));
+
+        StoreReferences storeRefs{.others = refs, .self = false};
+        auto contentId = SourceContentId::compute(*fingerprint, shapeHash, method, storeRefs);
+
+        auto placeholder = state.materialisationScheduler->registerView(
+            MaterialisationScheduler::Registration{
+                .contentId = contentId,
+                .name = std::string{name},
+                .method = method,
+                .refs = storeRefs,
+                .view = view,
+            });
+
+        /* The ENTRY to the lazy-source pipeline: addPath deferred this
+           source as a placeholder rather than copying it now. No walk
+           happens here; the walk (if any) is coalesced by `contentId` at
+           the first `outPathOf`/`outPathsOf` demand. Logging it makes the
+           cargo-workspace dedup observable from the start (200 packages
+           with the same contentId → one shared walk later). */
+        debug(
+            "virtualise: addPath deferred '%s' (%s) as placeholder %s, contentId %s — no walk at registration",
+            name,
+            filter ? "filtered" : "unfiltered",
+            placeholder.render(),
+            contentId.to_string());
+
+        state.mkSourcePlaceholderString(placeholder, name, v);
     } catch (Error & e) {
         e.addTrace(state.positions[pos], "while adding path '%s'", path);
         throw;
@@ -4754,6 +5153,29 @@ static void prim_substring(EvalState & state, const PosIdx pos, Value ** args, V
     auto s = state.coerceToString(
         pos, *args[2], context, "while evaluating the third argument (the string) passed to builtins.substring");
 
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+       sites). Body-slicing primops reject SourceVirtual context to
+       preserve the deferred-materialisation invariant — see
+       Tradeoff 8. `s->substr(start, _len)` carves user-controlled
+       bytes out of the body; if a placeholder render is in the
+       slice's range it will be partial, defeating the literal
+       substring rewrite by `rewriteStrings`. Throwing here forces
+       callers to materialise the source up front. The `start`/`len`
+       arguments are integers (forceInt above) and carry no context;
+       only the string-typed third argument needs the check. */
+    for (auto & c : context) {
+        if (std::get_if<NixStringContextElem::SourceVirtual>(&c.raw)) {
+            state
+                .error<EvalError>(
+                    "the string '%s' contains an unresolved source-virtual placeholder; "
+                    "slicing primops require resolved store paths. Use builtins.path or "
+                    "an explicit derivation to materialise the source first.",
+                    *s)
+                .atPos(pos)
+                .debugThrow();
+        }
+    }
+
     v.mkString(NixUInt(start) >= s->size() ? "" : s->substr(start, _len), context, state.mem);
 }
 
@@ -4805,11 +5227,20 @@ static void prim_hashString(EvalState & state, const PosIdx pos, Value ** args, 
     if (!ha)
         state.error<EvalError>("unknown hash algorithm '%1%'", algo).atPos(pos).debugThrow();
 
-    NixStringContext context; // discarded
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+       sites). Previously context was discarded — if the input
+       string carries a `SourceVirtual` placeholder, hashing the body
+       produced `hash("/<base32>")` instead of `hash(realStorePath)`.
+       DetSys hit this in production (#160). Now we resolve the
+       context and rewrite the body before hashing. */
+    NixStringContext context;
     auto s =
         state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.hashString");
+    auto rewrites = state.resolveSourceVirtualContext(context);
+    state.ensureLazyPathsCopied(context);
+    auto rewritten = rewriteStrings(std::string{s}, rewrites);
 
-    v.mkString(hashString(*ha, s).to_string(HashFormat::Base16, false), state.mem);
+    v.mkString(hashString(*ha, rewritten).to_string(HashFormat::Base16, false), state.mem);
 }
 
 static RegisterPrimOp primop_hashString({
@@ -5189,11 +5620,44 @@ static void prim_replaceStrings(EvalState & state, const PosIdx pos, Value ** ar
             .atPos(pos)
             .debugThrow();
 
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+       sites and Tradeoff 8). `replaceStrings` is structurally
+       harder than baseNameOf/dirOf/substring: `from[i]` bodies are
+       used as literal search keys, `to[j]` bodies are spliced into
+       the result, and `s` carries the input context. A SourceVirtual
+       placeholder render in any list-element body could be
+       misinterpreted as a search key; the cargo-workspace pattern
+       (multiple SourceVirtual elems sharing a render) compounds the
+       confusion. Per Tradeoff 8's deferral rationale, the safest
+       stop-gap is Option-B (throw on any SourceVirtual context in
+       any of the three inputs); a future Phase-3 typestate could
+       distinguish "search key" vs "context-bearing reference" intent
+       and relax this. */
+    auto rejectIfSourceVirtual = [&](const NixStringContext & ctx, std::string_view body, const char * argDesc) {
+        for (auto & c : ctx) {
+            if (std::get_if<NixStringContextElem::SourceVirtual>(&c.raw)) {
+                state
+                    .error<EvalError>(
+                        "the string '%s' (passed as %s) contains an unresolved source-virtual placeholder; "
+                        "builtins.replaceStrings requires resolved store paths in all of its arguments. "
+                        "Use builtins.path or an explicit derivation to materialise the source first.",
+                        body,
+                        argDesc)
+                    .atPos(pos)
+                    .debugThrow();
+            }
+        }
+    };
+
     std::vector<std::string_view> from;
     from.reserve(args[0]->listSize());
-    for (auto elem : args[0]->listView())
-        from.emplace_back(state.forceString(
-            *elem, pos, "while evaluating one of the strings to replace passed to builtins.replaceStrings"));
+    for (auto elem : args[0]->listView()) {
+        NixStringContext fromCtx;
+        auto body = state.forceString(
+            *elem, fromCtx, pos, "while evaluating one of the strings to replace passed to builtins.replaceStrings");
+        rejectIfSourceVirtual(fromCtx, body, "an element of the 'from' list");
+        from.emplace_back(body);
+    }
 
     boost::unordered_flat_map<size_t, std::string_view> cache;
     auto to = args[1]->listView();
@@ -5201,6 +5665,7 @@ static void prim_replaceStrings(EvalState & state, const PosIdx pos, Value ** ar
     NixStringContext context;
     auto s = state.forceString(
         *args[2], context, pos, "while evaluating the third argument passed to builtins.replaceStrings");
+    rejectIfSourceVirtual(context, s, "the third argument (the haystack)");
 
     std::string res;
     // Loops one past last character to handle the case where 'from' contains an empty string.
@@ -5220,6 +5685,7 @@ static void prim_replaceStrings(EvalState & state, const PosIdx pos, Value ** ar
                         ctx,
                         pos,
                         "while evaluating one of the replacement strings passed to builtins.replaceStrings");
+                    rejectIfSourceVirtual(ctx, ts, "an element of the 'to' list");
                     v = (cache.emplace(j_index, ts)).first;
                     for (auto & path : ctx)
                         context.insert(path);

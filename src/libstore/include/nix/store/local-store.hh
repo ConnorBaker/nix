@@ -420,6 +420,32 @@ public:
 
     virtual void registerValidPaths(const ValidPathInfos & infos);
 
+    /**
+     * Register `toInfo.path` as a content-addressed copy of an
+     * already-valid path `from`, materialising its bytes by HARDLINKING
+     * `from`'s file tree into `toInfo.path`'s real location (copying any
+     * leaf that can't be linked, e.g. cross-device). This is the
+     * copy-once-link-N primitive (PROPOSAL.md §6.10.2 / Perf #1): N store
+     * paths that share one `SourceContentId` have byte-identical NARs and
+     * differ only by name, so the sibling's content can be hardlinked
+     * from the first rather than re-walked + re-copied.
+     *
+     * Preconditions (caller-enforced; this asserts them):
+     *   - `from` is valid in this store.
+     *   - `toInfo.references.self == false` — a self-reference would make
+     *     B's NAR differ from A's (the embedded self-path hash-part
+     *     differs), breaking byte-identity and the CA check.
+     *   - `toInfo.narHash` / `toInfo.narSize` / `toInfo.ca` describe the
+     *     SAME content as `from` (the NAR is name-independent), so the
+     *     linked tree is content-correct under `toInfo.path`.
+     *
+     * Registers `toInfo` via `registerValidPath` (GC sees it as a
+     * first-class path; hardlinks keep inodes alive even if `from` is
+     * later collected). Throws on a read-only store — caller should gate
+     * on a writable `LocalStore` and fall back to an independent copy.
+     */
+    void registerLinkedCAPath(const StorePath & from, const ValidPathInfo & toInfo);
+
     unsigned int getProtocol() override;
 
     std::optional<TrustedFlag> isTrustedClient() override;

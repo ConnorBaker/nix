@@ -47,16 +47,42 @@ config_priv_h = configure_file(
 subdir('nix-meson-build-support/common')
 
 sources = files(
+  'boundary-audit-attrcursor-getstring.cc',
+  'boundary-audit-attrdb-setstring.cc',
+  'boundary-audit-body-slicing.cc',
+  'boundary-audit-builtins-getflake.cc',
+  'boundary-audit-builtins-hashstring.cc',
+  'boundary-audit-builtins-tofile.cc',
+  'boundary-audit-derivation-strict.cc',
+  'boundary-audit-eval-json.cc',
+  'boundary-audit-eval-raw.cc',
+  'boundary-audit-flake-input-attrs.cc',
+  'boundary-audit-flake-ref-to-string.cc',
+  'boundary-audit-instantiate-eval.cc',
+  'boundary-audit-nix-env-query-json.cc',
+  'boundary-audit-nix-env-query-xml.cc',
+  'boundary-audit-nix-prefetch.cc',
+  'boundary-audit-nix-run-program.cc',
+  'boundary-audit-prim-import.cc',
+  'boundary-audit-property.cc',
+  'boundary-audit-repl-print.cc',
+  'boundary-audit-replace-strings.cc',
+  'boundary-audit-trace-warn-throw.cc',
+  'boundary-audit-user-env-manifest.cc',
+  'boundary-audit-value-to-xml-derivation.cc',
   'derived-path.cc',
   'error_traces.cc',
   'eval.cc',
   'json.cc',
   'lazy-fetcher-attr.cc',
+  'input-materialisation.cc',
   'main.cc',
+  'materialisation-scheduler.cc',
   'nix_api_expr.cc',
   'nix_api_external.cc',
   'nix_api_value.cc',
   'nix_api_value_internal.cc',
+  'parse-cache.cc',
   'primops.cc',
   'search-path.cc',
   'trivial.cc',
@@ -115,8 +141,5 @@ if get_option('benchmarks')
     cpp_pch : do_pch ? [ 'pch/precompiled-headers.hh' ] : [],
   )
 
-  benchmark(
-    'nix-expr-benchmarks',
-    benchmark_exe,
-  )
+  benchmark('nix-expr-benchmarks', benchmark_exe)
 endif

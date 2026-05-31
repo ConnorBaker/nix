@@ -394,7 +394,9 @@ struct CurlInputScheme : InputScheme
 
     bool isLocked(const Settings & settings, const Input & input) const override
     {
-        return (bool) input.getNarHash();
+        /* Presence-only check — uses `hasNarHashAttr` so a lazy
+           narHash thunk doesn't trigger a force. */
+        return input.hasNarHashAttr();
     }
 };
 

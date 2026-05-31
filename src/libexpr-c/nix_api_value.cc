@@ -258,6 +258,14 @@ nix_get_string(nix_c_context * context, const nix_value * value, nix_get_string_
     try {
         auto & v = check_value_in(value);
         assert(v.type() == nix::nString);
+        /* The callback sees `v.string_view()` verbatim — the raw
+           body, including any placeholder render text from
+           DownstreamPlaceholder (unbuilt drv outputs) or
+           SourcePlaceholder (unmaterialised lazy source trees, see
+           PROPOSAL.md §6.4.3). Callers that need the resolved store
+           path text must use `nix_string_realise` which routes
+           through `EvalState::realiseString`. The header doc on
+           `nix_get_string` spells this out. */
         call_nix_get_string_callback(v.string_view(), callback, user_data);
     }
     NIXC_CATCH_ERRS

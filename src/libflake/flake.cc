@@ -93,9 +93,23 @@ static void parseFlakeInputAttr(EvalState & state, const Attr & attr, fetchers::
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (attr.value->type()) {
-    case nString:
-        attrs.emplace(state.symbols[attr.name], std::string(attr.value->string_view()));
+    case nString: {
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+           sites). The body is persisted into the `fetchers::Attrs`
+           map (which gets serialised into flake.lock); without this
+           resolution a `SourceVirtual` placeholder render would land
+           in the lockfile verbatim. Resolve per-call: this is
+           suboptimal for batching, but `parseFlakeInputAttr` processes
+           one attr at a time and `outPathOf`'s per-element coalescing
+           in the scheduler mitigates the cost. */
+        NixStringContext context;
+        copyContext(*attr.value, context);
+        auto rewrites = state.resolveSourceVirtualContext(context);
+        state.ensureLazyPathsCopied(context);
+        std::string body = rewriteStrings(std::string{attr.value->string_view()}, rewrites);
+        attrs.emplace(state.symbols[attr.name], std::move(body));
         break;
+    }
     case nBool:
         attrs.emplace(state.symbols[attr.name], Explicit<bool>{attr.value->boolean()});
         break;
@@ -149,9 +163,23 @@ static FlakeInput parseFlakeInput(
         try {
             if (attr.name == sUrl) {
                 forceTrivialValue(state, *attr.value, pos);
-                if (attr.value->type() == nString)
-                    url = attr.value->string_view();
-                else if (attr.value->type() == nPath) {
+                if (attr.value->type() == nString) {
+                    /* Boundary cover-fix (Item 1, see PROPOSAL.md
+                       §6.4.3 bypass sites). The url body is fed both
+                       into `attrs["url"]` (and thence
+                       `FlakeRef::fromAttrs` → flake.lock) and into
+                       `parseFlakeRef` below; either path leaks the
+                       placeholder render if context is not resolved
+                       here. Per-call resolution (one Value per attr)
+                       is suboptimal for batching but matches the
+                       existing call shape; per-element coalescing in
+                       `outPathOf` mitigates. */
+                    NixStringContext context;
+                    copyContext(*attr.value, context);
+                    auto rewrites = state.resolveSourceVirtualContext(context);
+                    state.ensureLazyPathsCopied(context);
+                    url = rewriteStrings(std::string{attr.value->string_view()}, rewrites);
+                } else if (attr.value->type() == nPath) {
                     auto path = attr.value->path();
                     if (path.accessor != flakeDir.accessor)
                         throw Error(
@@ -261,7 +289,16 @@ static Flake readFlake(
 
     if (auto description = vInfo.attrs()->get(state.s.description)) {
         expectType(state, nString, *description->value, description->pos);
-        flake.description = description->value->string_view();
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+           sites). `flake.description` is stored in the Flake struct
+           and propagated into lockfile metadata; without resolving
+           context here, a `SourceVirtual` placeholder render in the
+           description string would persist into flake.lock. */
+        NixStringContext context;
+        copyContext(*description->value, context);
+        auto rewrites = state.resolveSourceVirtualContext(context);
+        state.ensureLazyPathsCopied(context);
+        flake.description = rewriteStrings(std::string{description->value->string_view()}, rewrites);
     }
 
     auto sInputs = state.symbols.create("inputs");

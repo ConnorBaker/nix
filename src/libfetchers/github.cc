@@ -130,9 +130,13 @@ struct GitArchiveInputScheme : InputScheme
         auto ref = maybeGetStrAttr(attrs, "ref");
         auto rev = maybeGetStrAttr(attrs, "rev");
         if (ref && rev)
+            /* Error paths — non-forcing variant: the message renders
+               an attrset that may legitimately contain a lazy
+               `narHash` we don't want to force just to print a URL
+               diagnostic. */
             throw BadURL(
                 "input %s contains both a commit hash ('%s') and a branch/tag name ('%s')",
-                attrsToJSON(attrs),
+                attrsToJSONForKey(attrs),
                 *rev,
                 *ref);
 
@@ -140,10 +144,10 @@ struct GitArchiveInputScheme : InputScheme
             Hash::parseAny(*rev, HashAlgorithm::SHA1);
 
         if (ref && !isLegalRefName(*ref))
-            throw BadURL("input %s contains an invalid branch/tag name", attrsToJSON(attrs));
+            throw BadURL("input %s contains an invalid branch/tag name", attrsToJSONForKey(attrs));
 
         if (auto host = maybeGetStrAttr(attrs, "host"); host && !std::regex_match(*host, hostRegex))
-            throw BadURL("input %s contains an invalid instance host", attrsToJSON(attrs));
+            throw BadURL("input %s contains an invalid instance host", attrsToJSONForKey(attrs));
 
         Input input{};
         input.attrs = attrs;

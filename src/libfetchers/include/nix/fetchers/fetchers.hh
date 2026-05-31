@@ -160,6 +160,44 @@ public:
     // Convenience functions for common attributes.
     std::string getType() const;
     std::optional<Hash> getNarHash() const;
+
+    /**
+     * Like `getNarHash`, but never forces a lazy attr. Returns:
+     *   - `nullopt` if the attr is missing or is a lazy thunk that
+     *     hasn't been forced.
+     *   - the parsed `Hash` if the attr is a concrete string
+     *     (including `""` → all-zero hash).
+     *
+     * Use this in callers that want to *test* whether `narHash` is
+     * known without triggering the materialisation walk. If you need
+     * the value and are willing to force (e.g. lockfile write), call
+     * `getNarHash()` instead.
+     */
+    std::optional<Hash> peekNarHashAttr() const;
+
+    /**
+     * True iff the `narHash` attr is present in any form (concrete
+     * string or lazy thunk).
+     *
+     * Use this for "is this input lockable / locked?" predicates that
+     * don't care about the actual hash value — e.g. an `isLocked`
+     * predicate that asks "did the user supply a NAR hash?". The four
+     * states callers may need to distinguish:
+     *   - **No attr** — newly fetched, no narHash known →
+     *     `peekNarHashAttr() == nullopt`, `hasNarHashAttr() == false`.
+     *   - **Empty string** — legacy placeholder set by some paths →
+     *     `peekNarHashAttr() == Hash(SHA256)` (zero),
+     *     `hasNarHashAttr() == true`.
+     *   - **Real SRI string** — concrete locked hash →
+     *     `peekNarHashAttr() == Hash(parsed)`,
+     *     `hasNarHashAttr() == true`.
+     *   - **LazyAttr** (introduced by Item 2) —
+     *     `peekNarHashAttr() == nullopt`, `hasNarHashAttr() == true`.
+     *     Combine the two predicates to distinguish "absent" from
+     *     "present-but-unforced".
+     */
+    bool hasNarHashAttr() const;
+
     std::optional<std::string> getRef() const;
     std::optional<Hash> getRev() const;
     std::optional<uint64_t> getRevCount() const;

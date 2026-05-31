@@ -13,6 +13,7 @@
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/materialisation-scheduler.hh"
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/value.hh"
 #include "nix/fetchers/attrs.hh"
@@ -44,8 +45,25 @@ PrimOp getFlake(const Settings & settings)
             auto path = state.realisePath(pos, *args[0]);
             callFlake(state, lockFlake(settings, state, path, lockFlags), v);
         } else {
-            std::string flakeRefS(
-                state.forceStringNoCtx(*args[0], pos, "while evaluating the argument passed to builtins.getFlake"));
+            /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3
+               bypass sites). DetSys hit this in production (commit
+               bb3846e6d, #302). Previously `forceStringNoCtx`
+               rejected any context, throwing with the placeholder
+               wire form `~<hash>:<name>` embedded in the error
+               message when a flakeref carried a `SourceVirtual`
+               element. Switch to `forceString` + explicit context
+               handling: resolve `SourceVirtual` placeholders,
+               rewrite the body, and proceed. Note that we still
+               don't accept arbitrary context: a flakeref that
+               references a derivation output (Built/DrvDeep) is
+               nonsensical and should still be rejected — but we let
+               `parseFlakeRef` reject it via its own validation. */
+            NixStringContext context;
+            auto raw =
+                state.forceString(*args[0], context, pos, "while evaluating the argument passed to builtins.getFlake");
+            auto rewrites = state.resolveSourceVirtualContext(context);
+            state.ensureLazyPathsCopied(context);
+            std::string flakeRefS = rewriteStrings(std::string{raw}, rewrites);
 
             auto flakeRef = nix::parseFlakeRef(state.fetchSettings, flakeRefS, {}, true);
             if (state.settings.pureEval && !flakeRef.input.isLocked(state.fetchSettings))
@@ -61,7 +79,7 @@ PrimOp getFlake(const Settings & settings)
             if (auto sourcePath = flakeRef.input.getSourcePath();
                 flakeRef.input.getType() == "path" && sourcePath && state.store->isInStore(sourcePath->string())) {
                 auto [storePath, subPath] = state.store->toStorePath(sourcePath->string());
-                if (auto mount = state.storeFS->getMount(CanonPath(state.store->printStorePath(storePath)))) {
+                if (auto mount = state.storeFS->getMount(storeMountKey(*state.store, storePath))) {
                     auto path = state.storePath(storePath) / CanonPath(subPath);
                     if (!flakeRef.subdir.empty())
                         path = path / flakeRef.subdir;
@@ -141,6 +159,25 @@ nix::PrimOp parseFlakeRef({
 static void prim_flakeRefToString(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.flakeRefToString");
+
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+       sites). String-valued attrs (e.g. `path`, `url`, `dir`) may
+       carry a `SourceVirtual` context. Reading `string_view()` raw
+       and stuffing it into the `Attrs` map would persist the
+       placeholder render `/<base32>` into the resulting flakeref
+       URL. Accumulate context across all `nString` attrs, resolve
+       SourceVirtual placeholders, rewrite each body before emplacing
+       into `attrs`, and propagate Opaque-only context to the result
+       string. */
+    NixStringContext context;
+
+    struct StringEntry
+    {
+        std::string name;
+        std::string body;
+    };
+
+    std::vector<StringEntry> stringEntries;
     fetchers::Attrs attrs;
     for (const auto & attr : *args[0]->attrs()) {
         state.forceValue(*attr.value, attr.pos);
@@ -160,7 +197,12 @@ static void prim_flakeRefToString(EvalState & state, const PosIdx pos, Value ** 
         } else if (t == nBool) {
             attrs.emplace(state.symbols[attr.name], Explicit<bool>{attr.value->boolean()});
         } else if (t == nString) {
-            attrs.emplace(state.symbols[attr.name], std::string(attr.value->string_view()));
+            copyContext(*attr.value, context);
+            stringEntries.push_back(
+                StringEntry{
+                    .name = std::string(static_cast<std::string_view>(state.symbols[attr.name])),
+                    .body = std::string(attr.value->string_view()),
+                });
         } else {
             state
                 .error<EvalError>(
@@ -171,8 +213,25 @@ static void prim_flakeRefToString(EvalState & state, const PosIdx pos, Value ** 
                 .debugThrow();
         }
     }
+    auto rewrites = state.resolveSourceVirtualContext(context);
+    state.ensureLazyPathsCopied(context);
+    for (auto & entry : stringEntries)
+        attrs.emplace(entry.name, rewriteStrings(entry.body, rewrites));
     auto flakeRef = FlakeRef::fromAttrs(state.fetchSettings, attrs);
-    v.mkString(flakeRef.to_string(), state.mem);
+
+    /* Build the result context: substitute each `SourceVirtual` with
+       `Opaque{resolvedStorePath}` so the result Value carries
+       Opaque-only context. Same pattern as `AttrCursor::forceValue`
+       (eval-cache.cc:442-450). */
+    NixStringContext resultContext;
+    for (auto & c : context) {
+        if (auto * sv = std::get_if<NixStringContextElem::SourceVirtual>(&c.raw)) {
+            auto storePath = state.materialisationScheduler->outPathOf(sv->placeholder);
+            resultContext.insert(NixStringContextElem{NixStringContextElem::Opaque{storePath}});
+        } else
+            resultContext.insert(c);
+    }
+    v.mkString(flakeRef.to_string(), resultContext, state.mem);
 }
 
 nix::PrimOp flakeRefToString({

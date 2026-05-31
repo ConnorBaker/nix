@@ -16,7 +16,15 @@
 #include "nix/expr/search-path.hh"
 #include "nix/expr/repl-exit-status.hh"
 #include "nix/util/ref.hh"
+#include "nix/util/sync.hh"
 #include "nix/expr/counter.hh"
+#include "nix/expr/parse-cache.hh"
+
+namespace nix {
+struct MaterialisationScheduler;
+struct SourcePlaceholder;
+class InputMaterialisation;
+} // namespace nix
 
 // For `NIX_USE_BOEHMGC`, and if that's set, `GC_THREADS`
 #include "nix/expr/config.hh"
@@ -28,6 +36,7 @@
 #include <optional>
 #include <functional>
 #include <span>
+#include <unordered_map>
 
 namespace nix {
 
@@ -50,6 +59,22 @@ class EvalState;
 class StorePath;
 struct SingleDerivedPath;
 enum RepairFlag : bool;
+
+/**
+ * The store-relative key under which a store path is mounted in
+ * `storeFS` (and looked up via `getMount`). After the root-keyed
+ * reshape, `storeFS`'s inner accessor is keyed at `CanonPath::root` and
+ * the eval-root re-root (the pure-eval Switch's `<storeDir>` mount, or
+ * the impure-eval `StripPrefix(<storeDir>)`) strips the store-dir
+ * prefix, so the inner mounts see a single-component, leading-slash-
+ * rooted store path `/<hash>-<name>` — i.e. `CanonPath(p.to_string())`,
+ * NOT the absolute `CanonPath(printStorePath(p))`. Every mount/getMount
+ * site keys on this so the lookup key matches the mount key. (The
+ * `store` argument is unused today — `to_string()` is store-independent
+ * — but kept for call-site clarity and future store-relative
+ * encodings.)
+ */
+CanonPath storeMountKey(const Store & store, const StorePath & path);
 struct MemorySourceAccessor;
 struct MountedSourceAccessor;
 
@@ -507,6 +532,99 @@ private:
 public:
 
     /**
+     * Side-table from `prim_readFile` result strings (keyed on
+     * StringData* allocation identity) to the source's content
+     * fingerprint. Read by `prim_fromJSON` to construct the
+     * cross-process `parse-cache-v1.sqlite` key.
+     *
+     * Cleared on `resetFileCache` — that's the safe boundary against
+     * GC StringData address reuse. Within an eval session the
+     * fileEvalCache plus normal Value lifetimes keep StringData live;
+     * the side-table relies on that without holding GC roots itself.
+     */
+    const ref<StringFingerprintMap> stringFingerprints;
+
+    /**
+     * Source-side floating-CA realisation registry. `builtins.path`
+     * (and similar source-injection sites) register a `SourceView`
+     * here keyed by content-determined `SourceContentId` and obtain
+     * a `SourcePlaceholder`. Demanding the placeholder's storePath
+     * triggers — at most once per contentId — a walk that populates
+     * the persistent realisation row.
+     *
+     * Cargo-workspace property: 200 packages all referencing the
+     * same source + filter share one contentId, hence one walk for
+     * the whole workspace.
+     */
+    const std::shared_ptr<MaterialisationScheduler> materialisationScheduler;
+
+    /**
+     * Per-input lazy `narHash` materialisations, keyed by the input's
+     * pre-narHash attrs JSON. Reused across `mountInput` calls so
+     * multiple references to the same input share one mat (and
+     * therefore one walk).
+     *
+     * Coalescing axis is **per-input** — distinct from the
+     * `materialisationScheduler` above, which coalesces across
+     * registrations sharing a `SourceContentId`. Item 2's
+     * `InputMaterialisation` is deliberately decoupled from the
+     * scheduler (different axes; see DEFERRED-WORK.md §"Relationship
+     * to MaterialisationScheduler"); merging them is a future Item 1
+     * follow-up.
+     *
+     * Lifetime: cleared at `EvalState` destruction. Each entry is a
+     * `ref<InputMaterialisation>` so the `LazyAttr` closures
+     * backed by it can outlive `mountInput`'s stack frame.
+     */
+    Sync<std::unordered_map<std::string, ref<InputMaterialisation>>> inputMaterialisations_;
+
+    /**
+     * Deferred-mount registry for Item 2's *defer-past-mount* tail
+     * (PROPOSAL.md §6.1.1, Design C). When `mountInput` takes the
+     * UNLOCKED slow path it no longer forces the dryRun walk to learn a
+     * concrete store path; instead it mints a content-deterministic
+     * *fake* store path from the input's pre-narHash `inputMaterialisations_`
+     * key, mounts the live accessor under that fake key (so reads
+     * resolve), and records `fakePath → mat` here.
+     *
+     * This map IS the discriminator (PROPOSAL.md §6.4.7(c) option ii):
+     * a store path is a deferred-mount stand-in **iff** it is a key
+     * here. It is NOT the §6.4.7(c) failure mode because:
+     *   - it never persists (an unlocked flake has no eval cache —
+     *     `getFingerprint`→nullopt — and the fake path is rewritten to
+     *     the real CA path at every hard-demand boundary before it can
+     *     reach a derivation, a `toFile`, or the lockfile);
+     *   - the fast (locked) path is untouched and keeps minting real
+     *     `Opaque{realPath}` values.
+     *
+     * `devirtualizeStorePath` consults this map; `ensureLazyPathCopied`
+     * is the chokepoint that forces the mat, re-mounts the *real* path,
+     * caches the `fakePath → realPath` rewrite below, and runs the
+     * panic-on-mismatch copy against the real key (so the existing
+     * check still fires). The lock-narHash mismatch check (carried by
+     * `mat->force()`'s `expectedNarHash`) thus fires at first hard
+     * demand exactly as required by soundness obligation (a).
+     */
+    Sync<std::unordered_map<StorePath, ref<InputMaterialisation>>> virtualMounts_;
+
+    /**
+     * Memoised `fakePath → realPath` rewrites produced when a deferred
+     * mount is devirtualized. Lets `devirtualizeStorePath` return the
+     * real path without re-forcing the mat after the first demand.
+     */
+    Sync<std::unordered_map<StorePath, StorePath>> virtualPathRewrites_;
+
+    /**
+     * If `path` is a deferred-mount stand-in (registered in
+     * `virtualMounts_`), force its materialisation and return the
+     * real CA store path; otherwise return `path` unchanged. Used at
+     * derivation-input boundaries (`derivationStrictInternal`,
+     * `builtins.toFile`) so a real, valid path lands in `inputSrcs` /
+     * `references` rather than the fake stand-in. Idempotent.
+     */
+    StorePath devirtualizeStorePath(const StorePath & path);
+
+    /**
      * @param lookupPath     Only used during construction.
      * @param store          The store to use for instantiation
      * @param fetchSettings  Must outlive the lifetime of this EvalState!
@@ -748,6 +866,14 @@ public:
      * store eagerly. This saves on needless I/O and possibly IPC if all the
      * evaluator does is just evaluate nix expressions from those locations.
      * This function copies such store objects to the store if they aren't already valid.
+     *
+     * For an Item 2 deferred-mount stand-in (a fake path in
+     * `virtualMounts_`), this is also the devirtualisation
+     * chokepoint: it forces the backing materialisation, re-mounts the
+     * accessor under the *real* CA store path, allowPaths it, records
+     * the `fake → real` rewrite, and runs the panic-on-mismatch copy
+     * against the real key. Callers that need the resulting real path
+     * (to put in `inputSrcs`/`references`) use `devirtualizeStorePath`.
      */
     void ensureLazyPathCopied(const StorePath & path);
 
@@ -994,6 +1120,20 @@ public:
     void mkStorePathString(const StorePath & storePath, Value & v);
 
     /**
+     * Create a string representing a deferred source placeholder.
+     *
+     * The string body is `placeholder.render()` (the `/<base32>`
+     * deterministic render of `SourcePlaceholder`) and the context
+     * is a single `NixStringContextElem::SourceVirtual{placeholder,
+     * name}` element. Mirrors `mkStorePathString` for the deferred
+     * (Item 1) variant of source materialisation: the body is what
+     * intermediate Nix expressions see; the context carries the
+     * resolution metadata for downstream observation boundaries
+     * (see PROPOSAL.md §6.4 and `resolveSourceVirtualContext`).
+     */
+    void mkSourcePlaceholderString(const SourcePlaceholder & placeholder, std::string_view name, Value & v);
+
+    /**
      * Create a string representing a `SingleDerivedPath::Built`.
      *
      * The string is the printed store path with a context containing a
@@ -1060,6 +1200,39 @@ public:
      */
     [[nodiscard]] StringMap
     realiseContext(const NixStringContext & context, StorePathSet * maybePaths = nullptr, bool isIFD = true);
+
+    /**
+     * Resolve only `SourceVirtual` placeholders in `context` to real
+     * store paths via `MaterialisationScheduler::outPathOf`. Unlike
+     * `realiseContext`, this never builds `Built` drv-path elements
+     * (no IFD), never validates `Opaque` paths, and never throws on
+     * missing `Built`/`Opaque` registrations — it is safe to call in
+     * read-only eval contexts (e.g. `nix eval`, `nix-instantiate
+     * --eval`) where IFD must not be triggered as a side effect of
+     * serialisation.
+     *
+     * Each resolved placeholder is also `allowPath`'d so subsequent
+     * reads through `rootFS` succeed under restricted/pure-eval.
+     *
+     * Returns the placeholder-render → store-path rewrite map. The
+     * map's keys are the 53-character `/<base32>` render strings;
+     * `rewriteStrings(text, map)` substitutes them for the real
+     * store-path strings in any serialised output. See the boundary
+     * cover-fix in `src/nix/eval.cc` and `nix-instantiate.cc`.
+     */
+    [[nodiscard]] StringMap resolveSourceVirtualContext(const NixStringContext & context);
+
+    /**
+     * Canonical choke-point for emitting a context-bearing string:
+     * resolves + materialises every placeholder in `context` and returns
+     * `text` rewritten to the real store paths (a fused
+     * `resolveSourceVirtualContext` + `ensureLazyPathsCopied` +
+     * `rewriteStrings`). New serialisation boundaries should prefer this
+     * over re-spelling the triple by hand. Callers rewriting a structured
+     * value (e.g. derivation env + structuredAttrs together) still use the
+     * two lower-level calls and apply the map field-by-field.
+     */
+    [[nodiscard]] std::string resolveAndRewrite(std::string text, const NixStringContext & context);
 
     /**
      * Coerce `v` to a path and realise it, i.e. build anything in the value's string context using `realiseContext()`.

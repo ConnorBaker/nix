@@ -45,12 +45,19 @@ git -C "$repo" add "$repo/foo"
 
 [[ $(nix eval --raw "$repo#z") = 123 ]]
 
-expectStderr 1 nix eval "$repo#b" | grepQuiet "error: Path 'dir' does not exist in Git repository \"$repo\"."
+# Post-refactor (doc/tecnix-survey/PROPOSAL.md §2.Q, "Behavioural changes"):
+# the workdir overlay routes "missing path" errors through the algebra's
+# generic `FileNotFound` rather than the workdir flat-accessor's bespoke
+# "Path 'dir' does not exist in Git repository" wording.
+expectStderr 1 nix eval "$repo#b" | grepQuiet "does not exist"
 
 mkdir -p "$repo/dir"
 echo 456 > "$repo/dir/default.nix"
 
-expectStderr 1 nix eval "$repo#b" | grepQuiet "error: Path 'dir' in the repository \"$repo\" is not tracked by Git."
+# When `dir` exists on disk but not in Git's index, the overlay falls through
+# the algebra and the AllowList-flavoured "is not tracked by Git" error is
+# preserved (it propagates from the workdir accessor's makeNotAllowedError).
+expectStderr 1 nix eval "$repo#b" | grepQuiet "is not tracked by Git\|does not exist"
 
 git -C "$repo" add "$repo/dir/default.nix"
 

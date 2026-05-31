@@ -66,21 +66,13 @@ if run_clang_tidy.found()
 
   run_target(
     'clang-tidy',
-    command : [
-      python,
-      run_clang_tidy_args,
-      '--werror',
-    ],
+    command : [ python, run_clang_tidy_args, '--werror' ],
     depends : clang_tidy_deps,
   )
 
   run_target(
     'clang-tidy-fix',
-    command : [
-      python,
-      run_clang_tidy_args,
-      '--fix',
-    ],
+    command : [ python, run_clang_tidy_args, '--fix' ],
     depends : clang_tidy_deps,
   )
 endif

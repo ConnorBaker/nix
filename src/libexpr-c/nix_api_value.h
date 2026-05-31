@@ -293,13 +293,30 @@ bool nix_get_bool(nix_c_context * context, const nix_value * value);
 /** @brief Get the raw string
  * @ingroup value_extract
  *
- * This may contain placeholders.
+ * The bytes returned via the callback are the body verbatim: any
+ * embedded placeholder strings (`DownstreamPlaceholder` for unbuilt
+ * derivation outputs; `SourcePlaceholder` for unmaterialised source
+ * trees emitted by `builtins.path` / `addPath` under the lazy-source
+ * substrate) are passed through unrewritten. The callback sees the
+ * placeholder render text (e.g. `/<base32>`), not a real store path.
+ *
+ * Callers that need the **resolved** store path (with placeholders
+ * substituted for real CA store paths) must use
+ * `nix_string_realise()` instead, which routes through
+ * `EvalState::realiseString` and applies the rewrite.
+ *
+ * Use `nix_get_string` only when the raw body is appropriate — e.g.
+ * passing strings through to evaluation that will resolve them
+ * later, hashing the canonical pre-resolution body, or
+ * deserialisation of strings with no placeholder expectations.
  *
  * @param[out] context Optional, stores error information
  * @param[in] value Nix value to inspect
  * @param[in] callback Called with the string value.
  * @param[in] user_data optional, arbitrary data, passed to the callback when it's called.
  * @return error code, NIX_OK on success.
+ *
+ * @see nix_string_realise, nix_realised_string_free
  */
 nix_err
 nix_get_string(nix_c_context * context, const nix_value * value, nix_get_string_callback callback, void * user_data);

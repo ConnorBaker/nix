@@ -1,4 +1,5 @@
 #include <iostream>
+#include <sstream>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -106,9 +107,16 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
     {
         // Hide the progress bar during printing because it might interfere
         auto suspension = logger->suspend();
+        /* Boundary cover-fix (Item 1): like the `:p`/`:print` path below,
+           the default expression-print path must not leak `SourceVirtual`
+           placeholder render strings. Print into a buffer with a context
+           accumulator, resolve+materialise the placeholders, then rewrite
+           the output to real store paths before writing to `str`. */
+        NixStringContext context;
+        std::ostringstream buf;
         ::nix::printValue(
             *state,
-            str,
+            buf,
             v,
             PrintOptions{
                 .ansiColors = true,
@@ -117,7 +125,11 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
                 .maxDepth = maxDepth,
                 .prettyIndent = 2,
                 .errors = ErrorPrintBehavior::ThrowTopLevel,
-            });
+            },
+            &context);
+        auto rewrites = state->resolveSourceVirtualContext(context);
+        state->ensureLazyPathsCopied(context);
+        str << rewriteStrings(buf.str(), rewrites);
     }
 };
 
@@ -581,11 +593,34 @@ ProcessLineResult NixRepl::processLine(std::string line)
         Value v;
         evalString(arg, v);
         auto suspension = logger->suspend();
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+           sites). Both arms used to leak `SourceVirtual` placeholder
+           render strings: the nString fast-path wrote `v.string_view()`
+           raw, and `printValue` was called with no context. Now both
+           accumulate context, resolve via `resolveSourceVirtualContext`,
+           and rewrite the output before writing. */
+        NixStringContext context;
+        std::ostringstream buf;
         if (v.type() == nString) {
-            std::cout << v.string_view();
+            copyContext(v, context);
+            buf << v.string_view();
         } else {
-            printValue(std::cout, v);
+            ::nix::printValue(
+                *state,
+                buf,
+                v,
+                PrintOptions{
+                    .ansiColors = true,
+                    .force = true,
+                    .derivationPaths = true,
+                    .prettyIndent = 2,
+                    .errors = ErrorPrintBehavior::ThrowTopLevel,
+                },
+                &context);
         }
+        auto rewrites = state->resolveSourceVirtualContext(context);
+        state->ensureLazyPathsCopied(context);
+        std::cout << rewriteStrings(buf.str(), rewrites);
         std::cout << std::endl;
     }
 

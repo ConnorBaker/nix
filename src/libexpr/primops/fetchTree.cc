@@ -124,7 +124,14 @@ void emitTreeAttrs(
 
     // FIXME: support arbitrary input attributes.
 
-    if (auto narHash = input.getNarHash())
+    /* Mirror revCount handling below: prefer the lazy form if
+       present so observers who don't read narHash don't trigger the
+       walk. Falls back to a concrete string for inputs whose narHash
+       was set eagerly (lockfile inputs, mountInput's known-narHash
+       fast path, fetchToStore reconciliation). */
+    if (auto narHashLazy = fetchers::maybeGetLazyAttr(input.attrs, "narHash"))
+        emitLazyAttrThunk(state, *narHashLazy, attrs.alloc("narHash"));
+    else if (auto narHash = input.peekNarHashAttr())
         attrs.alloc("narHash").mkString(narHash->to_string(HashFormat::SRI, true), state.mem);
 
     if (input.getType() == "git")

@@ -84,6 +84,8 @@ headers = [ config_pub_h ] + files(
   'serve-protocol-connection.hh',
   'serve-protocol-impl.hh',
   'serve-protocol.hh',
+  'source-content-id.hh',
+  'source-placeholder.hh',
   'sqlite.hh',
   'ssh-store.hh',
   'ssh.hh',

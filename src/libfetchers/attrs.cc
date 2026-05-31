@@ -51,6 +51,24 @@ nlohmann::json attrsToJSON(const Attrs & attrs)
     return json;
 }
 
+nlohmann::json attrsToJSONForKey(const Attrs & attrs)
+{
+    nlohmann::json json;
+    for (auto & [name, val] : attrs) {
+        std::visit(
+            overloaded{
+                [&](const std::string & v) { json[name] = v; },
+                [&](uint64_t v) { json[name] = v; },
+                [&](const Explicit<bool> & v) { json[name] = v.t; },
+                /* Sentinel for unforced lazy attrs — see header
+                   comment for why `null` (not `"<lazy>"`). */
+                [&](const LazyAttr &) { json[name] = nullptr; },
+            },
+            val);
+    }
+    return json;
+}
+
 std::optional<LazyAttr> maybeGetLazyAttr(const Attrs & attrs, const std::string & name)
 {
     auto i = attrs.find(name);
@@ -69,7 +87,10 @@ std::optional<std::string> maybeGetStrAttr(const Attrs & attrs, const std::strin
     auto resolved = forceAttr(i->second);
     if (auto v = std::get_if<std::string>(&resolved))
         return *v;
-    throw Error("input attribute '%s' is not a string %s", name, attrsToJSON(attrs).dump());
+    /* Error path: use the non-forcing variant so we don't recurse
+       through the lazy-attr forcer (which itself calls back into
+       this attrs map). */
+    throw Error("input attribute '%s' is not a string %s", name, attrsToJSONForKey(attrs).dump());
 }
 
 std::string getStrAttr(const Attrs & attrs, const std::string & name)

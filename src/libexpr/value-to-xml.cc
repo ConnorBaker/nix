@@ -99,19 +99,33 @@ static void printValueAsXML(
         if (state.isDerivation(v)) {
             XMLAttrs xmlAttrs;
 
+            /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3
+               bypass sites). The drvPath/outPath bodies under the
+               isDerivation arm are written into XML attributes
+               without going through the leaf-string nString case
+               above; thread `copyContext` defensively so any
+               SourceVirtual elements reach the caller's
+               accumulator. In normal flows drvPath/outPath bodies
+               are derivation-side context (Built/DrvDeep/Opaque)
+               not source-side, so this is symmetry rather than a
+               known leak path. */
             std::string drvPath;
             if (auto a = v.attrs()->get(state.s.drvPath)) {
                 if (strict)
                     state.forceValue(*a->value, a->pos);
-                if (a->value->type() == nString)
+                if (a->value->type() == nString) {
+                    copyContext(*a->value, context);
                     xmlAttrs["drvPath"] = drvPath = a->value->string_view();
+                }
             }
 
             if (auto a = v.attrs()->get(state.s.outPath)) {
                 if (strict)
                     state.forceValue(*a->value, a->pos);
-                if (a->value->type() == nString)
+                if (a->value->type() == nString) {
+                    copyContext(*a->value, context);
                     xmlAttrs["outPath"] = a->value->string_view();
+                }
             }
 
             XMLOpenElement _(doc, "derivation", xmlAttrs);

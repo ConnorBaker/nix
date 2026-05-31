@@ -523,3 +523,40 @@ EOF
 
 # Regression test for https://github.com/NixOS/nix/issues/13918
 [[ "$(nix eval --inputs-from "$subdirFlakeDir2" foo1#shouldBeOne)" = 1 ]]
+
+# Item 2 lockfile assertion: a flake with a lazy-narHash input writes
+# a lockfile whose `locked.narHash` field is a concrete SRI string.
+# Lockfile writes go through `attrsToJSON` (forces), so even when the
+# input's narHash is a LazyAttr at runtime, the persisted form must
+# be concrete. This guards against accidentally migrating the
+# lockfile-writing call site to `attrsToJSONForKey`.
+flake8Dir=$TEST_ROOT/flake8
+createGitRepo "$flake8Dir" ""
+cat > "$flake8Dir/flake.nix" <<EOF
+{
+  outputs = { self }: { out = "hello"; };
+}
+EOF
+git -C "$flake8Dir" add flake.nix
+git -C "$flake8Dir" commit -m 'initial'
+
+flake9Dir=$TEST_ROOT/flake9
+mkdir -p "$flake9Dir"
+cat > "$flake9Dir/flake.nix" <<EOF
+{
+  inputs.dep.url = "git+file://$flake8Dir";
+  inputs.dep.flake = false;
+  # Outputs reference dep only via outPath, so any narHash thunk
+  # would not be observed during eval — but the lockfile writer
+  # must force it before persisting.
+  outputs = { self, dep }: { out = builtins.readFile "\${dep.outPath}/flake.nix"; };
+}
+EOF
+
+nix flake lock "path:$flake9Dir"
+[[ -f "$flake9Dir/flake.lock" ]]
+
+# Assert the lockfile has a concrete sha256-... narHash for `dep`.
+lockedNarHash=$(jq -r '.nodes.dep.locked.narHash' "$flake9Dir/flake.lock")
+[[ "$lockedNarHash" =~ ^sha256- ]] \
+    || fail "expected concrete sha256 narHash in lockfile after lazy-thunk install, got '$lockedNarHash'"

@@ -40,12 +40,31 @@ subdir('nix-meson-build-support/common')
 
 sources = files(
   'access-tokens.cc',
+  'algebra-cross-cutting.cc',
   'attrs.cc',
+  'directory-synthesizer-source-accessor.cc',
+  'factory-fusion.cc',
+  'fetch-to-store-bridge.cc',
+  'filtered-shape.cc',
+  'git-fingerprint.cc',
+  'git-lazy-fetch-setting.cc',
+  'git-promisor-wiring.cc',
   'git-utils.cc',
   'git.cc',
   'input.cc',
+  'layer-source-accessor.cc',
+  'mask-source-accessor.cc',
   'nix_api_fetchers.cc',
+  'path-set.cc',
+  'pkt-line.cc',
+  'projection.cc',
   'public-key.cc',
+  'restrict-source-accessor.cc',
+  'soundness-guard-source-accessor.cc',
+  'source-view.cc',
+  'strip-prefix-source-accessor.cc',
+  'translate-source-accessor.cc',
+  'workdir-overlay.cc',
 )
 
 include_dirs = [ include_directories('.') ]

@@ -81,6 +81,42 @@ struct Settings : public Config
 
     Setting<bool> allowDirty{this, true, "allow-dirty", "Whether to allow dirty Git/Mercurial trees."};
 
+    Setting<bool> gitLazyFetch{
+        this,
+        false,
+        "git-lazy-fetch",
+        R"(
+          If enabled, Nix fetches remote Git repositories as *partial
+          clones*: it pulls the commit and tree objects but defers blob
+          (file-content) downloads, fetching each blob on demand the
+          first time evaluation reads it. This can dramatically cut the
+          cost of the first evaluation of a large monorepo when only a
+          few files are actually read (e.g. a `flake.nix` plus one
+          subdirectory).
+
+          Concretely, when this is on Nix configures its on-disk cache
+          repository with `extensions.partialClone` and fetches with
+          `--filter=blob:none`. Missing blobs are then backfilled by
+          Nix's own protocol-v2 client (see the Git "promisor"
+          machinery), one coalesced request per directory read.
+
+          This only takes effect for remotes served over HTTP(S) or
+          ssh whose server advertises Git protocol v2 with the `filter`
+          capability (e.g. `uploadpack.allowFilter = true`). For any
+          other remote — `file://`, `git://`, or a server without
+          filter support — Nix transparently falls back to a normal
+          full fetch, so enabling this is always safe.
+
+          For ssh remotes, the on-demand blob fetch authenticates via
+          Nix's ssh machinery (honoring `NIX_SSHOPTS`, `~/.ssh/config`,
+          and ssh-agent), the same as Nix's ssh stores.
+
+          Defaults to the value of the `NIX_GIT_LAZY_FETCH` environment
+          variable (`1` to enable), or `false` if unset. An explicit
+          setting in the configuration always takes precedence over the
+          environment variable.
+        )"};
+
     Setting<bool> warnDirty{this, true, "warn-dirty", "Whether to warn about dirty Git/Mercurial trees."};
 
     Setting<bool> allowDirtyLocks{

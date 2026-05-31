@@ -55,8 +55,15 @@ InstallableValue::trySinglePathToDerivedPaths(Value & v, const PosIdx pos, std::
 
     else if (v.type() == nString) {
         auto path = state->coerceToSingleDerivedPath(pos, v, errorCtx);
-        if (auto o = std::get_if<SingleDerivedPath::Opaque>(&path.raw()))
+        if (auto o = std::get_if<SingleDerivedPath::Opaque>(&path.raw())) {
             state->ensureLazyPathCopied(o->path);
+            /* If this is an Item 2 deferred-mount stand-in (§6.1.1),
+               build the *real* CA path — the fake stand-in is never a
+               valid store object. Identity for an ordinary path. */
+            auto realPath = state->devirtualizeStorePath(o->path);
+            if (realPath != o->path)
+                path = SingleDerivedPath{SingleDerivedPath::Opaque{.path = std::move(realPath)}};
+        }
         return {{
             .path = DerivedPath::fromSingle(path),
             .info = make_ref<ExtraPathInfo>(),

@@ -629,6 +629,12 @@ struct curlFileTransfer : public FileTransfer
                 if (request.method == HttpMethod::Post) {
                     curl_easy_setopt(req, CURLOPT_POST, 1L);
                     curl_easy_setopt(req, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) request.data->sizeHint);
+                    /* Without POSTREDIR, curl turns POST into GET on 301/302/303 and
+                       drops the request body — fatal for protocol-v2 git upload-pack. */
+                    curl_easy_setopt(
+                        req,
+                        CURLOPT_POSTREDIR,
+                        (long) (CURL_REDIR_POST_301 | CURL_REDIR_POST_302 | CURL_REDIR_POST_303));
                 } else if (request.method == HttpMethod::Put) {
                     curl_easy_setopt(req, CURLOPT_UPLOAD, 1L);
                     curl_easy_setopt(req, CURLOPT_INFILESIZE_LARGE, (curl_off_t) request.data->sizeHint);

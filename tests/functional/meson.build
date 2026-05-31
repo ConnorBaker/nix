@@ -78,6 +78,7 @@ suites = [
       'tarball.sh',
       'fetchGit.sh',
       'fetchGitShallow.sh',
+      'fetchGitLazy.sh',
       'fetchurl.sh',
       'fetchPath.sh',
       'fetchTree-file.sh',
@@ -229,6 +230,7 @@ subdir('flakes')
 subdir('git')
 subdir('git-hashing')
 subdir('local-overlay-store')
+subdir('source')
 
 foreach suite : suites
   workdir = suite['workdir']

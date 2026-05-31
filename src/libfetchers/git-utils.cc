@@ -1,9 +1,12 @@
 #include "nix/fetchers/git-utils.hh"
 #include "nix/fetchers/git-lfs-fetch.hh"
+#include "nix/fetchers/git-promisor.hh"
 #include "nix/fetchers/cache.hh"
+#include "nix/fetchers/projection.hh"
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/util/base-n.hh"
 #include "nix/util/finally.hh"
+#include "nix/util/fingerprint.hh"
 #include "nix/util/os-string.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/signals.hh"
@@ -19,6 +22,7 @@
 #include <git2/blob.h>
 #include <git2/branch.h>
 #include <git2/commit.h>
+#include <git2/common.h>
 #include <git2/config.h>
 #include <git2/describe.h>
 #include <git2/errors.h>
@@ -130,6 +134,20 @@ static void initLibGit2()
     std::call_once(initialized, []() {
         if (git_libgit2_init() < 0)
             throw GitError("initialising libgit2");
+
+        /* Allow opening repos with `extensions.partialClone` set —
+           libgit2 strict-validates extensions and rejects unknown
+           ones by default. The whitelist lets us *open* such repos;
+           fetching missing objects is our `GitPromisorProvider`'s
+           job (the whitelist installs no fetcher).
+         *
+           Note: this mutates a process-global vector inside libgit2
+           (`user_extensions` in `repository.c`). If the host process
+           later calls `GIT_OPT_SET_EXTENSIONS` with a different list
+           it will overwrite ours. Document for embedders. */
+        const char * exts[] = {"partialclone"};
+        if (git_libgit2_opts(GIT_OPT_SET_EXTENSIONS, (const char **) exts, sizeof(exts) / sizeof(exts[0])))
+            throw GitError("setting libgit2 partialclone extension whitelist");
     });
 }
 
@@ -616,6 +634,130 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
     }
 
     /**
+     * Read this repo's git config and return the URL of the remote it
+     * is a partial clone of, or `nullopt` if it is not a partial clone.
+     *
+     * Two conventions are recognised:
+     *   1. `extensions.partialClone = <remote>` — what Nix's own
+     *      `markAsPartialClone` writes (and what some tooling sets).
+     *   2. `remote.<name>.promisor = true` — what stock
+     *      `git clone --filter=…` records (it does NOT set
+     *      `extensions.partialClone`; verified against git 2.53). We
+     *      scan for any promisor remote and use the first one's URL.
+     *
+     * This is the trigger for constructing a `GitPromisorProvider` —
+     * see `GitInputScheme::getAccessorFromCommit` in `git.cc`. We
+     * do *not* probe the network here; capability detection is
+     * separate (see the per-URL TTL cache in `git.cc`).
+     */
+    std::optional<std::string> getPartialCloneRemoteUrl() override
+    {
+        GitConfig config;
+        if (git_repository_config(Setter(config), *this) != 0)
+            return std::nullopt;
+
+        /* Resolve `remote.<name>.url`, returning nullopt if unset/empty. */
+        auto remoteUrl = [&](const std::string & name) -> std::optional<std::string> {
+            std::string urlKey = "remote." + name + ".url";
+            git_buf url = GIT_BUF_INIT;
+            Finally urlDispose([&] { git_buf_dispose(&url); });
+            if (git_config_get_string_buf(&url, config.get(), urlKey.c_str()) != 0 || url.size == 0)
+                return std::nullopt;
+            return std::string(url.ptr, url.size);
+        };
+
+        /* 1. `extensions.partialClone` names the remote directly. */
+        {
+            git_buf remoteName = GIT_BUF_INIT;
+            Finally remoteNameDispose([&] { git_buf_dispose(&remoteName); });
+            if (git_config_get_string_buf(&remoteName, config.get(), "extensions.partialClone") == 0
+                && remoteName.size != 0) {
+                auto url = remoteUrl(std::string(remoteName.ptr, remoteName.size));
+                if (url)
+                    debug(
+                        "lazy-fetch: recognised partial clone via extensions.partialClone='%s' (remote '%s')",
+                        std::string(remoteName.ptr, remoteName.size),
+                        *url);
+                return url;
+            }
+        }
+
+        /* 2. Fall back to the stock-Git convention: any
+           `remote.<name>.promisor = true`. Iterate the matching keys
+           and return the first remote whose `.url` resolves. The key
+           name is `remote.<name>.promisor`; extract `<name>` (the
+           segment between the first and last dot). */
+        ConfigIterator it;
+        if (git_config_iterator_glob_new(Setter(it), config.get(), "^remote\\..*\\.promisor$") != 0)
+            return std::nullopt;
+        while (true) {
+            git_config_entry * entry = nullptr;
+            if (auto err = git_config_next(&entry, it.get())) {
+                if (err == GIT_ITEROVER)
+                    break;
+                return std::nullopt;
+            }
+            /* Only `true` promisor remotes count. */
+            int isPromisor = 0;
+            if (git_config_parse_bool(&isPromisor, entry->value) != 0 || !isPromisor)
+                continue;
+            std::string_view key = entry->name; // remote.<name>.promisor
+            auto firstDot = key.find('.');
+            auto lastDot = key.rfind('.');
+            if (firstDot == std::string_view::npos || lastDot <= firstDot)
+                continue;
+            auto name = std::string(key.substr(firstDot + 1, lastDot - firstDot - 1));
+            if (auto url = remoteUrl(name)) {
+                debug(
+                    "lazy-fetch: recognised partial clone via remote.%s.promisor (no extensions.partialClone — "
+                    "externally created, e.g. stock 'git clone --filter'); remote '%s'",
+                    name,
+                    *url);
+                return url;
+            }
+        }
+        return std::nullopt;
+    }
+
+    void markAsPartialClone(const std::string & remoteName) override
+    {
+        GitConfig config;
+        if (git_repository_config(Setter(config), *this) != 0)
+            throw GitError("opening Git config to mark repo as a partial clone");
+
+        /* Repository format version must be 1 for `extensions.*` to be
+           honoured; a fresh `git init` leaves it at 0. */
+        if (git_config_set_int32(config.get(), "core.repositoryformatversion", 1))
+            throw GitError("setting core.repositoryformatversion");
+
+        /* The marker our own `getPartialCloneRemoteUrl()` keys on, and
+           the one plain `git` honours to allow opening + lazy backfill.
+           libgit2 strict-validates extensions, but `initLibGit2`
+           whitelists `partialclone`, so the repo still opens here. */
+        if (git_config_set_string(config.get(), "extensions.partialClone", remoteName.c_str()))
+            throw GitError("setting extensions.partialClone");
+
+        /* Mark the remote as a promisor with a blob-less filter — the
+           two keys stock `git clone --filter=blob:none` records
+           (verified against git 2.53). We ALSO set
+           `extensions.partialClone` above, which stock Git does NOT, so
+           our config is a superset: recognised both by our own
+           `getPartialCloneRemoteUrl` (either branch) and by plain Git's
+           promisor machinery. */
+        auto promisorKey = "remote." + remoteName + ".promisor";
+        if (git_config_set_bool(config.get(), promisorKey.c_str(), 1))
+            throw GitError("setting %s", promisorKey);
+        auto filterKey = "remote." + remoteName + ".partialclonefilter";
+        if (git_config_set_string(config.get(), filterKey.c_str(), "blob:none"))
+            throw GitError("setting %s", filterKey);
+
+        debug(
+            "lazy-fetch: marked cache repo as a partial clone of remote '%s' "
+            "(repositoryformatversion=1, extensions.partialClone, blob:none filter)",
+            remoteName);
+    }
+
+    /**
      * A 'GitSourceAccessor' with no regard for export-ignore.
      */
     ref<GitSourceAccessor> getRawAccessor(const Hash & rev, const GitAccessorOptions & options);
@@ -628,7 +770,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 
     ref<GitFileSystemObjectSink> getFileSystemObjectSink() override;
 
-    void fetch(const std::string & url, const std::string & refspec, bool shallow) override
+    void fetch(const std::string & url, const std::string & refspec, bool shallow, bool filtered) override
     {
         Activity act(*logger, lvlTalkative, actFetchTree, fmt("fetching Git repository '%s'", url));
 
@@ -654,6 +796,14 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         if (shallow) {
             gitArgs.push_back(OS_STR("--depth"));
             gitArgs.push_back(OS_STR("1"));
+        }
+        if (filtered) {
+            /* Partial (blob-less) clone: pull commits + trees but no
+               blobs; blobs are backfilled on demand. If the remote
+               doesn't advertise the `filter` capability, Git warns
+               ("filtering not recognized by server, ignoring") and
+               falls back to a full fetch — never fatal. */
+            gitArgs.push_back(OS_STR("--filter=blob:none"));
         }
         gitArgs.push_back(OS_STR("--"));
         gitArgs.push_back(string_to_os_string(url));
@@ -741,18 +891,8 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 
     Hash treeHashToNarHash(const fetchers::Settings & settings, const Hash & treeHash) override
     {
-        auto accessor = getAccessor(treeHash, {}, "");
-
-        fetchers::Cache::Key cacheKey{"treeHashToNarHash", {{"treeHash", treeHash.gitRev()}}};
-
-        if (auto res = settings.getCache()->lookup(cacheKey))
-            return Hash::parseAny(fetchers::getStrAttr(*res, "narHash"), HashAlgorithm::SHA256);
-
-        auto narHash = accessor->hashPath(CanonPath::root);
-
-        settings.getCache()->upsert(cacheKey, fetchers::Attrs({{"narHash", narHash.to_string(HashFormat::SRI, true)}}));
-
-        return narHash;
+        return fetchers::TreeHashToNarHash::lookup(
+            settings, treeHash, [&] { return getAccessor(treeHash, {}, "")->hashPath(CanonPath::root); });
     }
 
     Hash dereferenceSingletonDirectory(const Hash & oid_) override
@@ -770,6 +910,109 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         }
 
         return toHash(oid);
+    }
+
+    /* Path trie: each node is a directory with a map of children
+       (string → trie node). A leaf has no children. Used to drive
+       synthesiseTree's recursive walk. */
+    struct PathTrie
+    {
+        std::map<std::string, PathTrie> children;
+    };
+
+    static PathTrie buildPathTrie(const std::set<CanonPath> & paths)
+    {
+        PathTrie root;
+        for (auto & p : paths) {
+            if (p.isRoot())
+                continue; // root is implicit; nothing to add
+            PathTrie * cur = &root;
+            for (auto & segment : p)
+                cur = &cur->children[std::string(segment)];
+        }
+        return root;
+    }
+
+    /* Recursively synthesise a tree containing only entries from
+       `baseTree` whose paths are present in the trie. */
+    git_oid synthesiseTreeRecursive(git_tree * baseTree, const PathTrie & trie)
+    {
+        TreeBuilder builder;
+        if (git_treebuilder_new(Setter(builder), *this, nullptr))
+            throw GitError("creating tree builder for synthesiseTree");
+
+        size_t count = git_tree_entrycount(baseTree);
+        for (size_t i = 0; i < count; ++i) {
+            auto * entry = git_tree_entry_byindex(baseTree, i);
+            std::string name(git_tree_entry_name(entry));
+            auto childIt = trie.children.find(name);
+            if (childIt == trie.children.end())
+                continue; // not in accepted set
+
+            auto mode = git_tree_entry_filemode(entry);
+            auto entryOid = git_tree_entry_id(entry);
+
+            if (mode == GIT_FILEMODE_TREE) {
+                /* An accepted DIRECTORY. Recurse into it: the synthesised
+                   subtree contains exactly the accepted descendants.
+
+                   Crucially this is correct even when the trie child is a
+                   LEAF (the directory was accepted but none of its
+                   children were — e.g. a filter that accepts `/dir` but
+                   rejects `/dir/*`). In that case the recursion finds no
+                   matching entries and produces an EMPTY tree, matching
+                   the filtered NAR walk (which renders such a directory
+                   empty). The earlier code took the verbatim-splice
+                   `else` branch for a trie-leaf directory, pulling in the
+                   whole base subtree incl. filter-rejected files — a
+                   narHash divergence from the walk (PROPOSAL.md §6.4.9).
+                   Splicing verbatim is sound ONLY for non-tree entries
+                   (a file/symlink/gitlink has no contents to filter). */
+                auto subTreeObj = lookupObject(*this, *entryOid, GIT_OBJECT_TREE);
+                auto * subTree = (git_tree *) &*subTreeObj;
+                auto syntheticSub = synthesiseTreeRecursive(subTree, childIt->second);
+                if (git_treebuilder_insert(nullptr, builder.get(), name.c_str(), &syntheticSub, GIT_FILEMODE_TREE))
+                    throw GitError("inserting synthesised subtree '%s'", name);
+            } else {
+                /* Non-tree entry (regular file, symlink, or gitlink/
+                   submodule). It has no contents to filter, so take it
+                   verbatim — same OID, same mode. */
+                if (git_treebuilder_insert(nullptr, builder.get(), name.c_str(), entryOid, mode))
+                    throw GitError("inserting verbatim entry '%s'", name);
+            }
+        }
+
+        git_oid syntheticOid;
+        if (git_treebuilder_write(&syntheticOid, builder.get()))
+            throw GitError("writing synthesised tree");
+        return syntheticOid;
+    }
+
+    Hash synthesiseTreeOid(const Hash & baseTreeHash, const std::set<CanonPath> & acceptedPaths) override
+    {
+        auto baseObj = lookupObject(*this, hashToOID(baseTreeHash), GIT_OBJECT_TREE);
+        auto * baseTree = (git_tree *) &*baseObj;
+        auto trie = buildPathTrie(acceptedPaths);
+        auto syntheticOid = synthesiseTreeRecursive(baseTree, trie);
+        /* NO flush(): `git_treebuilder_write` already made `syntheticOid`
+           readable from the mempack backend in-process, and the Track
+           Z.gap5 caller only needs the OID as a `treeHashToNarHash`
+           cache key — it never re-opens the object. Flushing would
+           write a permanent, un-GC'd packfile for an object nobody
+           retrieves. See the `synthesiseTreeOid` docstring. */
+        return toHash(syntheticOid);
+    }
+
+    Hash synthesiseTree(const Hash & baseTreeHash, const std::set<CanonPath> & acceptedPaths) override
+    {
+        auto hash = synthesiseTreeOid(baseTreeHash, acceptedPaths);
+
+        /* The synthesised tree was written into the mempack backend.
+           Flush to disk so subsequent reads (and other GitRepo
+           handles) can find it. */
+        flush();
+
+        return hash;
     }
 };
 
@@ -794,6 +1037,11 @@ struct GitSourceAccessor : SourceAccessor
 
     Sync<State> state_;
 
+    /* Cache the repo's git_odb pointer so phase-2 reads don't need to
+       re-acquire it. libgit2's git_odb is internally thread-safe and
+       safe to share across threads. */
+    git_odb * sharedOdb;
+
     GitSourceAccessor(ref<GitRepoImpl> repo_, const Hash & rev, const GitAccessorOptions & options)
         : state_{State{
               .repo = repo_,
@@ -802,38 +1050,96 @@ struct GitSourceAccessor : SourceAccessor
               .options = options,
           }}
     {
+        /* git_repository_odb borrows a pointer; lifetime is tied to the
+           repository, which we hold a ref to. */
+        if (git_repository_odb(&sharedOdb, *repo_))
+            throw GitError("getting Git object database");
     }
 
+    /**
+     * Phase 1 / Phase 2 split.
+     *
+     * Phase 1 runs under `state_`'s mutex: walk the tree to resolve
+     * `path` to a `git_oid`, capture the LFS-smudge decision (which
+     * needs `state->options` and `lfsFetch`).
+     *
+     * Phase 2 runs lock-free: `git_odb_read` against the shared
+     * thread-safe `git_odb`, plus the LFS HTTPS fetch (which is
+     * self-contained network IO).
+     *
+     * The State lock is held only for the brief tree walk; concurrent
+     * readers contend only there, not on byte transfer.
+     */
     void readBlob(const CanonPath & path, bool symlink, Sink & sink, std::function<void(uint64_t)> sizeCallback)
     {
-        auto state(state_.lock());
+        git_oid oid;
+        bool wantsLfsSmudge = false;
+        const lfs::Fetch * lfsFetchPtr = nullptr;
+        std::shared_ptr<GitPromisorProvider> provider;
 
-        const auto blob = getBlob(*state, path, symlink);
-
-        if (state->lfsFetch) {
-            if (state->lfsFetch->shouldFetch(path)) {
-                StringSink s;
-                try {
-                    // FIXME: do we need to hold the state lock while
-                    // doing this?
-                    auto contents =
-                        std::string((const char *) git_blob_rawcontent(blob.get()), git_blob_rawsize(blob.get()));
-                    state->lfsFetch->fetch(contents, path, s, [&s](uint64_t size) { s.s.reserve(size); });
-                } catch (Error & e) {
-                    e.addTrace({}, "while smudging git-lfs file '%s'", path);
-                    throw;
-                }
-                sizeCallback(s.s.size());
-                StringSource source{s.s};
-                source.drainInto(sink);
-                return;
+        {
+            auto state(state_.lock());
+            /* Resolve the OID and validate the entry kind without
+               touching ODB-backed blob bytes. On a partial clone the
+               blob may not be present locally; we look it up only
+               after Phase 2 (potentially via the provider). */
+            getBlobOid(*state, path, symlink, oid);
+            if (state->lfsFetch && state->lfsFetch->shouldFetch(path)) {
+                wantsLfsSmudge = true;
+                /* Borrow: lfs::Fetch is owned by state and outlives
+                   this call (the accessor owns state by value). */
+                lfsFetchPtr = &*state->lfsFetch;
             }
+            provider = state->options.provider;
         }
 
-        auto view = std::string_view((const char *) git_blob_rawcontent(blob.get()), git_blob_rawsize(blob.get()));
-        sizeCallback(view.size());
-        StringSource source{view};
-        source.drainInto(sink);
+        /* Phase 2: lock-free read against the shared git_odb. */
+        git_odb_object * raw = nullptr;
+        auto err = git_odb_read(&raw, sharedOdb, &oid);
+        if (err == GIT_ENOTFOUND && provider) {
+            /* On-demand single-OID fetch via the partial-clone
+               provider. `prefetchSubtree` already pulled the bulk;
+               this catches blobs missed by that walk (e.g. fetched
+               under a different `depth` than the read site). This is
+               the SLOW path — one round-trip for one blob; seeing it
+               fire repeatedly means a `prefetchSubtree` coalescing
+               opportunity was missed, so log it at debug. */
+            debug(
+                "lazy-fetch: blob '%s' missing locally — single-blob on-demand backfill (slow path; "
+                "bulk prefetch missed it)",
+                oid);
+            try {
+                std::array<Hash, 1> wants{toHash(oid)};
+                provider->ensureObjects(wants, FetchFilter::Blobless);
+                git_odb_refresh(sharedOdb);
+                err = git_odb_read(&raw, sharedOdb, &oid);
+            } catch (Error & e) {
+                e.addTrace({}, "while fetching missing Git blob '%s' from partial-clone remote", oid);
+                throw;
+            }
+        }
+        if (err)
+            throw GitError("reading git blob '%s'", oid);
+        Finally cleanup([&] { git_odb_object_free(raw); });
+
+        auto view = std::string_view((const char *) git_odb_object_data(raw), git_odb_object_size(raw));
+
+        if (wantsLfsSmudge) {
+            StringSink s;
+            try {
+                lfsFetchPtr->fetch(std::string(view), path, s, [&s](uint64_t size) { s.s.reserve(size); });
+            } catch (Error & e) {
+                e.addTrace({}, "while smudging git-lfs file '%s'", path);
+                throw;
+            }
+            sizeCallback(s.s.size());
+            StringSource source{s.s};
+            source.drainInto(sink);
+        } else {
+            sizeCallback(view.size());
+            StringSource source{view};
+            source.drainInto(sink);
+        }
     }
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
@@ -924,6 +1230,198 @@ struct GitSourceAccessor : SourceAccessor
             return std::nullopt;
 
         return toHash(*git_tree_entry_id(entry));
+    }
+
+    /**
+     * Walk the tree at `subpath` to depth `depth`, enumerate blob
+     * OIDs that aren't yet in the local ODB, and ask the
+     * `GitPromisorProvider` to fetch them in one coalesced request.
+     *
+     * No-op when no provider is configured (the common case for
+     * fully-cloned repos). When configured, this is the seam that
+     * makes partial clone work transparently for evaluator reads
+     * triggered by `prim_readDir`/`prim_readFile` (Track K).
+     *
+     * Walk happens under the State lock to use the shared tree-
+     * lookup cache safely; the provider call (network I/O) runs
+     * outside the lock.
+     */
+    void prefetchSubtree(const CanonPath & subpath, unsigned depth) override
+    {
+        std::shared_ptr<GitPromisorProvider> provider;
+        std::vector<Hash> missing;
+
+        {
+            auto state(state_.lock());
+            provider = state->options.provider;
+            if (!provider)
+                return;
+            enumerateMissingBlobs(*state, subpath, depth, missing);
+        }
+
+        if (missing.empty())
+            return;
+
+        debug(
+            "lazy-fetch: prefetchSubtree at '%s' depth %d found %d missing blob(s) — coalescing into one backfill",
+            subpath,
+            depth,
+            missing.size());
+
+        try {
+            provider->ensureObjects(missing, FetchFilter::Blobless);
+            /* Refresh the ODB so subsequent reads see the new
+               objects. Outside libgit2's ODB callbacks (we're not
+               in one — this is `prefetchSubtree`, called from
+               eval triggers). */
+            git_odb_refresh(sharedOdb);
+        } catch (Error & e) {
+            /* Don't fail eval just because prefetch failed — fall back to
+               per-blob on-demand fetching (readBlob's ENOTFOUND backfill),
+               which still works but pays one round-trip PER blob. That is
+               the exact pathology this coalesced prefetch exists to avoid,
+               so warn (not debug): a whole-bulk-fetch failure means every
+               subsequent read on this subtree is slow, and the user should
+               see why (e.g. an expired credential or a dropped
+               connection — the field-bug class this subsystem was bitten
+               by). The per-blob slow path itself stays at debug. */
+            warn(
+                "lazy-fetch prefetch of %d object(s) under '%s' failed (%s); falling back to slower per-blob "
+                "on-demand fetching",
+                missing.size(),
+                subpath.abs(),
+                e.what());
+        }
+    }
+
+    /* Walk tree to `depth`, collecting blob OIDs not in the local
+       ODB. Depth 0 = subpath only; depth N = subpath and N levels
+       of descendants. Caller holds `state_` lock. */
+    void enumerateMissingBlobs(State & state, const CanonPath & subpath, unsigned depth, std::vector<Hash> & missing)
+    {
+        if (subpath.isRoot() && git_object_type(state.root.get()) != GIT_OBJECT_TREE)
+            return;
+        std::variant<Tree, Submodule> tv;
+        try {
+            tv = getTree(state, subpath);
+        } catch (Error &) {
+            return;
+        }
+        auto * tree = std::get_if<Tree>(&tv);
+        if (!tree)
+            return;
+        auto count = git_tree_entrycount(tree->get());
+        for (size_t i = 0; i < count; ++i) {
+            auto * entry = git_tree_entry_byindex(tree->get(), i);
+            auto type = git_tree_entry_type(entry);
+            auto * oid = git_tree_entry_id(entry);
+            if (type == GIT_OBJECT_BLOB) {
+                if (!git_odb_exists(sharedOdb, oid))
+                    missing.push_back(toHash(*oid));
+            } else if (type == GIT_OBJECT_TREE && depth > 0) {
+                enumerateMissingBlobs(state, subpath / git_tree_entry_name(entry), depth - 1, missing);
+            }
+        }
+    }
+
+    /**
+     * Subpath-aware fingerprint. For root paths, return the
+     * input-level fingerprint (master's existing behaviour). For
+     * tree-rooted subpaths, return `tree:<sha><flagSuffix>`; for blob-
+     * rooted subpaths, return `blob:<sha>;m=<mode><flagSuffix>`. This
+     * is the change that makes `${input}/sub` cache-share across revs
+     * whose subtree-SHA matches.
+     *
+     * The mode is required on the blob branch because Git blob OIDs do
+     * not encode the executable bit or symlink-vs-regular
+     * interpretation; NAR serialisation distinguishes those.
+     */
+    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    {
+        if (path.isRoot() || !fingerprint)
+            return {path, fingerprint};
+
+        auto state(state_.lock());
+        auto entry = lookup(*state, path);
+        if (!entry)
+            return {path, fingerprint}; // not found — fall back
+
+        /* Extract the input-level flag suffix (everything from the
+           first `;` on); these flags (`;e` export-ignore, `;l` LFS,
+           `;s` submodules) carry through to subpath fingerprints. */
+        std::string_view flagSuffix;
+        if (auto semi = fingerprint->find(';'); semi != std::string::npos)
+            flagSuffix = std::string_view(*fingerprint).substr(semi);
+
+        auto type = git_tree_entry_type(entry);
+        auto oid = toHash(*git_tree_entry_id(entry)).gitRev();
+
+        if (type == GIT_OBJECT_TREE) {
+            std::string fp = treeFingerprint(oid);
+            fp.append(flagSuffix);
+            return {CanonPath::root, std::move(fp)};
+        }
+
+        if (type == GIT_OBJECT_BLOB) {
+            auto mode = git_tree_entry_filemode(entry);
+            char modeBuf[8];
+            std::snprintf(modeBuf, sizeof(modeBuf), "%o", (unsigned) mode);
+            std::string fp = blobFingerprint(oid, modeBuf);
+            fp.append(flagSuffix);
+            return {CanonPath::root, std::move(fp)};
+        }
+
+        /* Submodule (GIT_OBJECT_COMMIT) and other types fall back to
+           the parent-rev-keyed input fingerprint. */
+        return {path, fingerprint};
+    }
+
+    /**
+     * Track Z.gap1: surface the root tree OID so whole git inputs (keyed
+     * in the fetcher cache on the commit rev, not the tree OID) can
+     * share one NAR walk per distinct tree across revs/pipelines.
+     *
+     * Only fires for the whole-input/root case: returns the OID of the
+     * commit's root tree (`state.root` after `peelToTreeOrBlob`). Guards:
+     *   - root must be a TREE (a blob-rooted accessor has no tree OID,
+     *     and the blob bridge is a separate concern);
+     *   - the input-level `fingerprint` must NOT already be `tree:`-shaped
+     *     — a subtree-rooted accessor's fingerprint is `tree:<sub-sha>`
+     *     and already bridges via `getFingerprint`, so we return nullopt
+     *     to avoid double-handling.
+     */
+    std::optional<Hash> getRootTreeHash() override
+    {
+        if (fingerprint && fingerprint->starts_with("tree:"))
+            return std::nullopt; // subtree already bridges via the tree: fingerprint
+
+        auto state(state_.lock());
+
+        /* SOUNDNESS: `getRootTreeHash` advertises "the NAR of this
+           accessor's whole tree equals the vanilla NAR of git tree
+           OID T", which is what keys the shared `treeHashToNarHash`
+           bridge (consumed cross-pipeline by tarballs + plain git).
+           Any option that alters the bytes while leaving the tree OID
+           unchanged breaks that equality and would POISON the row.
+
+           LFS smudging is exactly such an option: `readBlob` replaces
+           pointer-file bytes with the real object content, so the NAR
+           differs but the tree still points at the pointer blobs (same
+           OID). Returning the OID here would let a non-LFS source that
+           resolves to the same tree read back the smudged narHash —
+           wrong content, wrong store path. So bail to nullopt under
+           LFS (the input's `;l`-suffixed fingerprint keeps its own
+           cache rows distinct; only this OID bridge is unsafe).
+
+           Export-ignore is handled structurally (it's a wrapper that
+           inherits the base `nullopt`), but guard it here too as cheap
+           defence-in-depth against a future inline refactor. */
+        if (state->options.smudgeLfs || state->options.exportIgnore)
+            return std::nullopt;
+
+        if (git_object_type(state->root.get()) != GIT_OBJECT_TREE)
+            return std::nullopt; // blob-rooted: no root tree OID
+        return toHash(*git_tree_id((const git_tree *) state->root.get()));
     }
 
     boost::unordered_flat_map<CanonPath, TreeEntry> lookupCache;
@@ -1058,6 +1556,46 @@ struct GitSourceAccessor : SourceAccessor
 
         return blob;
     }
+
+    /**
+     * Variant of `getBlob` that returns *only* the blob's OID (and
+     * validates the mode/type), without instantiating a `git_blob`.
+     * On a partial clone the blob bytes may not be in the local ODB;
+     * `git_tree_entry_to_object` would fail, but we don't need that
+     * — `git_tree_entry_id` reads the OID from the tree entry
+     * itself (which is already locally available since we walked
+     * the tree to find the entry).
+     */
+    void getBlobOid(State & state, const CanonPath & path, bool expectSymlink, git_oid & oidOut)
+    {
+        if (!expectSymlink && git_object_type(state.root.get()) == GIT_OBJECT_BLOB) {
+            oidOut = *git_object_id(state.root.get());
+            return;
+        }
+
+        auto notExpected = [&]() {
+            throw Error(expectSymlink ? "'%s' is not a symlink" : "'%s' is not a regular file", showPath(path));
+        };
+
+        if (path.isRoot())
+            notExpected();
+
+        auto entry = need(state, path);
+
+        if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB)
+            notExpected();
+
+        auto mode = git_tree_entry_filemode(entry);
+        if (expectSymlink) {
+            if (mode != GIT_FILEMODE_LINK)
+                notExpected();
+        } else {
+            if (mode != GIT_FILEMODE_BLOB && mode != GIT_FILEMODE_BLOB_EXECUTABLE)
+                notExpected();
+        }
+
+        oidOut = *git_tree_entry_id(entry);
+    }
 };
 
 struct GitExportIgnoreSourceAccessor : CachingFilteringSourceAccessor
@@ -1119,6 +1657,26 @@ struct GitExportIgnoreSourceAccessor : CachingFilteringSourceAccessor
         return !isExportIgnored(path);
     }
 };
+
+GitRepo * getGitRepoOf(SourceAccessor & accessor)
+{
+    /* The raw tree accessor: holds its `ref<GitRepoImpl>` inside the
+       Sync<State> (under a mutex). Locking just to read the ref is
+       cheap and the ref outlives the lock. */
+    if (auto * git = dynamic_cast<GitSourceAccessor *>(&accessor))
+        return &*git->state_.lock()->repo;
+
+    /* The export-ignore wrapper: a FilteringSourceAccessor over a
+       GitSourceAccessor that ALSO holds the `ref<GitRepoImpl>` directly
+       (`GitRepoImpl::getAccessor` constructs it as
+       `GitExportIgnoreSourceAccessor(self, rawGitAccessor, rev)`). So we
+       recover the repo straight off the wrapper — no need to unwrap its
+       inner `next` accessor. */
+    if (auto * exp = dynamic_cast<GitExportIgnoreSourceAccessor *>(&accessor))
+        return &*exp->repo;
+
+    return nullptr;
+}
 
 struct GitFileSystemObjectSinkImpl : GitFileSystemObjectSink
 {

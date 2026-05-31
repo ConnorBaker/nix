@@ -133,7 +133,10 @@ std::optional<std::string> Input::getFingerprint(Store & store) const
 ParsedURL Input::toURL() const
 {
     if (!scheme)
-        throw Error("cannot show unsupported input '%s'", attrsToJSON(attrs));
+        /* Error path — use the non-forcing variant so a lazy attr in
+           an unsupported input doesn't trigger a walk just to render
+           the error message. */
+        throw Error("cannot show unsupported input '%s'", attrsToJSONForKey(attrs));
     return scheme->toURL(*this);
 }
 
@@ -197,7 +200,8 @@ bool Input::contains(const Input & other) const
 std::pair<StorePath, Input> Input::fetchToStore(const Settings & settings, Store & store) const
 {
     if (!scheme)
-        throw Error("cannot fetch unsupported input '%s'", attrsToJSON(toAttrs()));
+        /* Error path — non-forcing variant. */
+        throw Error("cannot fetch unsupported input '%s'", attrsToJSONForKey(toAttrs()));
 
     auto [storePath, input] = [&]() -> std::pair<StorePath, Input> {
         try {
@@ -246,6 +250,13 @@ void Input::checkLocks(Input specified, Input & result)
         for (auto & field : specified.attrs) {
             auto field2 = result.attrs.find(field.first);
             if (field2 != result.attrs.end() && field.second != field2->second)
+                /* `attrsToJSON` (forces) is correct here: this is a
+                   comparison of fetched fields post-fetch. Lazy attrs
+                   should not appear at this point — they're inserted
+                   by `mountInput`, which runs after final-input
+                   reconciliation (`getAccessorUnchecked`). If a lazy
+                   attr did somehow leak here, forcing it gives the
+                   most informative error text. */
                 throw Error(
                     "mismatch in field '%s' of input '%s', got '%s'",
                     field.first,
@@ -303,7 +314,8 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
     // FIXME: cache the accessor
 
     if (!scheme)
-        throw Error("cannot fetch unsupported input '%s'", attrsToJSON(toAttrs()));
+        /* Error path — non-forcing variant. */
+        throw Error("cannot fetch unsupported input '%s'", attrsToJSONForKey(toAttrs()));
 
     /* The tree may already be in the Nix store, or it could be
        substituted (which is often faster than fetching from the
@@ -348,10 +360,15 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
 
     /* Acquire a path lock on this input. Note that fetching the same input in parallel is supposed to be safe (it's up
      * to the fetchers to guarantee this), so this is merely intended to avoid work duplication. Note that we don't need
-     * this when substituting the input. */
+     * this when substituting the input.
+     *
+     * Use `attrsToJSONForKey` so the lock filename does not depend on
+     * whether `narHash` has been forced — two processes evaluating
+     * the same input must contend on the same lock regardless of force
+     * ordering. */
     auto lockFilePath =
         getCacheDir() / "fetcher-locks"
-        / hashString(HashAlgorithm::SHA256, attrsToJSON(toAttrs()).dump()).to_string(HashFormat::Base16, false);
+        / hashString(HashAlgorithm::SHA256, attrsToJSONForKey(toAttrs()).dump()).to_string(HashFormat::Base16, false);
     createDirs(lockFilePath.parent_path());
     PathLocks lock(
         {lockFilePath.string()}, fmt("waiting for another Nix process to finish fetching input '%s'...", to_string()));
@@ -431,6 +448,29 @@ std::optional<Hash> Input::getNarHash() const
     return {};
 }
 
+std::optional<Hash> Input::peekNarHashAttr() const
+{
+    auto it = attrs.find("narHash");
+    if (it == attrs.end())
+        return std::nullopt;
+    /* Concrete string — parse without forcing. */
+    if (auto * s = std::get_if<std::string>(&it->second)) {
+        auto hash = s->empty() ? Hash(HashAlgorithm::SHA256) : Hash::parseSRI(*s);
+        if (hash.algo != HashAlgorithm::SHA256)
+            throw UsageError("narHash must use SHA-256");
+        return hash;
+    }
+    /* LazyAttr — present but not forced; refuse to peek. The caller
+       must combine with `hasNarHashAttr()` to distinguish absent
+       from present-but-unforced. */
+    return std::nullopt;
+}
+
+bool Input::hasNarHashAttr() const
+{
+    return attrs.find("narHash") != attrs.end();
+}
+
 std::optional<std::string> Input::getRef() const
 {
     if (auto s = maybeGetStrAttr(attrs, "ref"))
@@ -471,7 +511,8 @@ std::optional<time_t> Input::getLastModified() const
 
 ParsedURL InputScheme::toURL(const Input & input) const
 {
-    throw Error("don't know how to convert input '%s' to a URL", attrsToJSON(input.attrs));
+    /* Error path — non-forcing variant. */
+    throw Error("don't know how to convert input '%s' to a URL", attrsToJSONForKey(input.attrs));
 }
 
 Input InputScheme::applyOverrides(const Input & input, std::optional<std::string> ref, std::optional<Hash> rev) const

@@ -140,6 +140,12 @@ struct SQLiteStmt
         bool next();
 
         std::string getStr(int col);
+        /**
+         * Read a binary BLOB column. Unlike `getStr`, this does not
+         * stop at embedded NUL bytes — required for any column whose
+         * payload is not UTF-8 text.
+         */
+        std::string getBlob(int col);
         int64_t getInt(int col);
         bool isNull(int col);
     };

@@ -1,4 +1,5 @@
 #include "nix/expr/eval.hh"
+#include "nix/expr/materialisation-scheduler.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/primops.hh"
@@ -12,14 +13,17 @@
 #include "nix/store/store-api.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/downstream-placeholder.hh"
+#include "nix/store/source-placeholder.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/store/filetransfer.hh"
 #include "nix/expr/function-trace.hh"
 #include "nix/store/profiles.hh"
 #include "nix/expr/print.hh"
 #include "nix/fetchers/filtering-source-accessor.hh"
+#include "nix/fetchers/strip-prefix-source-accessor.hh"
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/util/mounted-source-accessor.hh"
+#include "nix/util/switch-source-accessor.hh"
 #include "nix/expr/gc-small-vector.hh"
 #include "nix/util/url.hh"
 #include "nix/fetchers/fetch-to-store.hh"
@@ -244,39 +248,69 @@ EvalState::EvalState(
     , symbols(StaticEvalSymbols::staticSymbolTable())
     , repair(NoRepair)
     , storeFS(makeMountedSourceAccessor({
-          {CanonPath::root, makeEmptySourceAccessor()},
-          /* In the pure eval case, we can simply require
-             valid paths. However, in the *impure* eval
-             case this gets in the way of the union
-             mechanism, because an invalid access in the
-             upper layer will *not* be caught by the union
-             source accessor, but instead abort the entire
-             lookup.
+          /* Root-keyed reshape (Item 5): the store FS accessor is the
+             sole mount, keyed at `CanonPath::root`. The eval-root re-root
+             (the pure-eval Switch's `<storeDir>` mount, or the impure-eval
+             `StripPrefix(<storeDir>)`, see `rootFS` below) strips the
+             store-dir prefix before dispatching here, so this accessor
+             receives store-relative, single-component paths
+             `/<hash>-<name>` — which the inner `LocalStoreAccessor`
+             re-prepends `<storeDir>` to, mapping back to the on-disk
+             object. Lazy `fetchTree`/`builtins.path` mounts are added at
+             `storeMountKey(...)` (the same `/<hash>-<name>` key) so a
+             query resolves to the most-specific mount.
 
-             This happens when the store dir in the
-             ambient file system has a path (e.g. because
-             another Nix store there), but the relocated
-             store does not.
-
-             TODO make the various source accessors doing
-             access control all throw the same type of
-             exception, and make union source accessor
-             catch it, so we don't need to do this hack.
-           */
-          {CanonPath(store->storeDir), store->getFSAccessor(settings.pureEval)},
+             In the pure eval case the FS accessor requires valid paths;
+             in impure eval it does not, so an invalid upper-layer access
+             falls through the eval-root Union to posixFS rather than
+             aborting the whole lookup (e.g. a physical /nix/store path
+             absent from a relocated store). */
+          {CanonPath::root, store->getFSAccessor(settings.pureEval)},
       }))
     , rootFS([&] {
-        /* In pure eval mode, we provide a filesystem that only
-           contains the Nix store.
+        /* The eval root maps the absolute store path `<storeDir>` to the
+           now root-keyed `storeFS` (see ctor above). Exactly one prefix
+           strip happens here; `storeFS`'s inner accessor and lazy mounts
+           are keyed store-relative (`storeMountKey`).
 
-           Otherwise, use a union accessor to make the augmented store
-           available at its logical location while still having the
-           underlying directory available. This is necessary for
-           instance if we're evaluating a file from the physical
-           /nix/store while using a chroot store, and also for lazy
-           mounted fetchTree. */
-        auto accessor = settings.pureEval ? storeFS.cast<SourceAccessor>()
-                                          : makeUnionSourceAccessor({getFSSourceAccessor(), storeFS});
+           Pure eval — `Switch` keyed at `<storeDir>`. The store is the
+           only filesystem. We use a `Switch` (= `Mounted`, the immutable
+           face) rather than a `Union` so the dispatch is a DIRECT FORWARD
+           to the resolved mount: a read of `<storeDir>/X/f` strips
+           `<storeDir>` and forwards `X/f` straight to `storeFS`, whose
+           errors (e.g. the Git workdir accessor's "Path 'foo' does not
+           exist in Git repository") propagate verbatim. A `Union` would
+           gate every read on `maybeLstat` and, on a miss, throw its own
+           generic `FileNotFound`, masking those bespoke errors (regressing
+           flakes/source-paths.sh). The empty-root mount answers ancestor
+           paths (`/`, `/nix`) as an empty directory — `StripPrefix` alone
+           cannot, since its Prism gate denies ancestors of `<storeDir>`,
+           and it is what makes pure-eval `pathExists /.` / `readDir /.`
+           resolve rather than error.
+
+           Impure eval — `Union(posixFS, StripPrefix(<storeDir>)(storeFS))`.
+           Here we MUST fall through: a physical `/nix/store/X` that the
+           relocated `storeFS` misses has to resolve against the on-disk
+           posixFS. `Union` (Alternative `<|>`) provides that fall-through;
+           `StripPrefix(<storeDir>)` is the named, law-tested re-root for
+           the store branch (its `maybeLstat` returns nullopt off-prefix,
+           so Union cleanly falls through). This matches the prior impure
+           behaviour, which was already a `Union` that resolved store reads
+           via `maybeLstat` dispatch. `composeFingerprint`'s Union case (no
+           own suffix; first child with identity wins) is unchanged. See
+           doc/tecnix-survey/PROPOSAL.md §6.7/§6.8 for the source-view
+           algebra and the Layer-vs-Switch distinction. */
+        auto accessor =
+            settings.pureEval
+                ? makeSwitch({
+                      {CanonPath::root, makeEmptySourceAccessor()},
+                      {CanonPath(store->storeDir), storeFS.cast<SourceAccessor>()},
+                  })
+                : makeUnionSourceAccessor(
+                      {getFSSourceAccessor(),
+                       makeStripPrefix(storeFS, CanonPath(store->storeDir), adaptToNotAllowed([](const CanonPath & p) {
+                                           return FileNotFound("path '%s' does not exist", p);
+                                       }))});
         /* Cache positive lstat/readlink results to speed up resolveSymlinks. */
         accessor = makeCachingSourceAccessor(accessor);
 
@@ -313,6 +347,8 @@ EvalState::EvalState(
     , positionToDocComment(make_ref<decltype(positionToDocComment)::element_type>())
     , lookupPathResolved(make_ref<decltype(lookupPathResolved)::element_type>())
     , regexCache(makeRegexCache())
+    , stringFingerprints(make_ref<StringFingerprintMap>())
+    , materialisationScheduler(std::make_shared<MaterialisationScheduler>(*this))
 #if NIX_USE_BOEHMGC
     , baseEnvP(std::allocate_shared<Env *>(traceable_allocator<Env *>(), &mem.allocEnv(BASE_ENV_SIZE)))
     , baseEnv(**baseEnvP)
@@ -991,6 +1027,19 @@ void EvalState::mkStorePathString(const StorePath & p, Value & v)
         mem);
 }
 
+void EvalState::mkSourcePlaceholderString(const SourcePlaceholder & placeholder, std::string_view name, Value & v)
+{
+    v.mkString(
+        placeholder.render(),
+        NixStringContext{
+            NixStringContextElem::SourceVirtual{
+                .placeholder = placeholder,
+                .name = std::string{name},
+            },
+        },
+        mem);
+}
+
 std::string EvalState::mkOutputStringRaw(
     const SingleDerivedPath::Built & b,
     std::optional<StorePath> optStaticOutputPath,
@@ -1177,8 +1226,32 @@ void EvalState::resetFileCache()
     importResolutionCache->clear();
     fileEvalCache->clear();
     inputCache->clear();
+    /* The lazy-input materialisation map is keyed on the input's
+       pre-narHash attrs JSON, but the storePath it caches depends on
+       the *content* of that path (because `path::getAccessor` re-dumps
+       the disk path on each call into a fresh CA store path whenever
+       the contents change). Across `resetFileCache()` boundaries the
+       on-disk content may have moved (e.g. a write to `flake.lock`
+       between consecutive `nix_flake_lock` calls), so we must drop
+       cached mats — otherwise `mountInput` returns the previous
+       evaluation's storePath and `flake.path` points at a stale
+       directory in the store, which causes the lockfile read to miss.
+       This clear matches the lifetime of `inputCache` above. */
+    inputMaterialisations_.lock()->clear();
+    /* Same staleness reasoning for the Item 2 defer-past-mount registry
+       (§6.1.1): the fake store path is keyed on the input's (stable)
+       attrs JSON, but the mat it points at — and the real path that mat
+       resolved to — depend on the on-disk *content*, which may have
+       moved across this boundary. Drop both so a fresh `mountInput`
+       re-mints against the new content rather than devirtualising to a
+       stale path. */
+    virtualMounts_.lock()->clear();
+    virtualPathRewrites_.lock()->clear();
     lookupPathResolved->clear();
     positions.clear();
+    /* Clear before any GC pass that could reclaim StringData backing
+       parse-cache side-table entries. */
+    stringFingerprints->clear();
     rootFS->invalidateCache();
 }
 
@@ -2668,6 +2741,13 @@ std::pair<SingleDerivedPath, std::string_view> EvalState::coerceToSingleDerivedP
                     .debugThrow();
             },
             [&](NixStringContextElem::Built && b) -> SingleDerivedPath { return std::move(b); },
+            [&](NixStringContextElem::SourceVirtual && sv) -> SingleDerivedPath {
+                /* Resolve the placeholder to a real store path via
+                   the scheduler. After resolution, the path is just
+                   an Opaque derived-path. */
+                auto storePath = materialisationScheduler->outPathOf(sv.placeholder);
+                return SingleDerivedPath::Opaque{.path = std::move(storePath)};
+            },
         },
         ((NixStringContextElem &&) *context.begin()).raw);
     return {
@@ -2681,6 +2761,14 @@ SingleDerivedPath EvalState::coerceToSingleDerivedPath(const PosIdx pos, Value &
     auto [derivedPath, s_] = coerceToSingleDerivedPathUnchecked(pos, v, errorCtx);
     auto s = s_;
     auto sExpected = mkSingleDerivedPathStringRaw(derivedPath);
+    /* A `SourceVirtual` string's *body* is the opaque placeholder render
+       (`/<52-base32>`), while its context resolves to a real store path —
+       so `s != sExpected` legitimately, and the check below must not
+       reject it. `SourcePlaceholder::tryParse` is an EXACT match (it
+       rejects any `/` or `-` in the body), so a mangled body like
+       `"${virtualSrc}/bin"` still fails it and is correctly rejected. */
+    if (s != sExpected && SourcePlaceholder::tryParse(s))
+        return derivedPath;
     if (s != sExpected) {
         /* `std::visit` is used here just to provide a more precise
            error message. */

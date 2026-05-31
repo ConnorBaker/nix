@@ -59,8 +59,18 @@ struct CacheImpl : Cache
 
     void upsert(const Key & key, const Attrs & value) override
     {
+        /* Key: `attrsToJSONForKey` so an unforced lazy attr in the
+           key produces a stable `null` sentinel — keys with the
+           same observable concrete content match across processes
+           regardless of force ordering.
+
+           Value: `attrsToJSON` (forces) — values are retrieved with
+           `jsonToAttrs` which only accepts concrete strings/ints/
+           bools, so a `null` written here would round-trip into
+           `jsonToAttrs` and throw. Values must be concrete at
+           insert time. */
         _state.lock()
-            ->upsert.use()(key.first)(attrsToJSON(key.second).dump())(attrsToJSON(value).dump())(time(nullptr))
+            ->upsert.use()(key.first)(attrsToJSONForKey(key.second).dump())(attrsToJSON(value).dump())(time(nullptr))
             .exec();
     }
 
@@ -76,7 +86,9 @@ struct CacheImpl : Cache
         if (auto res = lookupExpired(key)) {
             if (!res->expired)
                 return std::move(res->value);
-            debug("ignoring expired cache entry '%s:%s'", key.first, attrsToJSON(key.second).dump());
+            /* Debug log: stable key serialisation so messages are
+               consistent across force/no-force states. */
+            debug("ignoring expired cache entry '%s:%s'", key.first, attrsToJSONForKey(key.second).dump());
         }
         return {};
     }
@@ -85,7 +97,9 @@ struct CacheImpl : Cache
     {
         auto state(_state.lock());
 
-        auto keyJSON = attrsToJSON(key.second).dump();
+        /* The key bytes used for the SQLite lookup must match what
+           `upsert` wrote — both use `attrsToJSONForKey`. */
+        auto keyJSON = attrsToJSONForKey(key.second).dump();
 
         auto stmt(state->lookup.use()(key.first)(keyJSON));
         if (!stmt.next()) {
@@ -134,7 +148,7 @@ struct CacheImpl : Cache
             debug(
                 "ignoring disappeared cache entry '%s:%s' -> '%s'",
                 key.first,
-                attrsToJSON(key.second).dump(),
+                attrsToJSONForKey(key.second).dump(),
                 store.printStorePath(res2.storePath));
             return std::nullopt;
         }
@@ -142,7 +156,10 @@ struct CacheImpl : Cache
         debug(
             "using cache entry '%s:%s' -> '%s', '%s'",
             key.first,
-            attrsToJSON(key.second).dump(),
+            attrsToJSONForKey(key.second).dump(),
+            /* Value side: `attrsToJSON` because the cached value
+               was serialised by the forcing variant; matching the
+               original serialisation keeps log output consistent. */
             attrsToJSON(res2.value).dump(),
             store.printStorePath(res2.storePath));
 

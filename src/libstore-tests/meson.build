@@ -83,9 +83,11 @@ sources = files(
   'path.cc',
   'realisation.cc',
   'references.cc',
+  'register-linked-ca-path.cc',
   's3-binary-cache-store.cc',
   's3-url.cc',
   'serve-protocol.cc',
+  'source-content-id.cc',
   'ssh-store.cc',
   'store-open.cc',
   'store-reference.cc',
@@ -120,12 +122,7 @@ if host_machine.system() != 'windows'
   test_env += {'NIX_REMOTE' : meson.current_build_dir() / 'test-home' / 'store'}
 endif
 
-test(
-  meson.project_name(),
-  this_exe,
-  env : test_env,
-  protocol : 'gtest',
-)
+test(meson.project_name(), this_exe, env : test_env, protocol : 'gtest')
 
 # Build benchmarks if enabled
 if get_option('benchmarks')
@@ -154,8 +151,6 @@ if get_option('benchmarks')
   benchmark(
     'nix-store-benchmarks',
     benchmark_exe,
-    env : {
-      '_NIX_TEST_UNIT_DATA' : meson.current_source_dir() / 'data',
-    },
+    env : {'_NIX_TEST_UNIT_DATA' : meson.current_source_dir() / 'data'},
   )
 endif

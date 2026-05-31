@@ -88,16 +88,22 @@ struct CmdShell : InstallablesCommand, MixEnvironment
             if (!done.insert(path).second)
                 continue;
 
-            auto binDir = state->storeFS->resolveSymlinks(CanonPath(store->printStorePath(path)) / "bin");
+            /* Route through `rootFS` (the re-rooted eval root) with the
+               absolute store path rather than `storeFS` directly: after
+               the root-keyed reshape `storeFS` expects store-relative
+               `/<hash>-<name>` keys, and `resolveSymlinks` chases absolute
+               symlink targets (`/nix/store/...`) that only re-resolve
+               correctly through the eval-root re-root. */
+            auto binDir = state->rootFS->resolveSymlinks(CanonPath(store->printStorePath(path)) / "bin");
             if (!store->isInStore(binDir.abs()))
                 throw Error("path '%s' is not in the Nix store", binDir);
 
             pathAdditions.push_back(binDir.abs());
 
-            auto propPath = state->storeFS->resolveSymlinks(
+            auto propPath = state->rootFS->resolveSymlinks(
                 CanonPath(store->printStorePath(path)) / "nix-support" / "propagated-user-env-packages");
-            if (auto st = state->storeFS->maybeLstat(propPath); st && st->type == SourceAccessor::tRegular) {
-                for (auto & p : tokenizeString<Strings>(state->storeFS->readFile(propPath)))
+            if (auto st = state->rootFS->maybeLstat(propPath); st && st->type == SourceAccessor::tRegular) {
+                for (auto & p : tokenizeString<Strings>(state->rootFS->readFile(propPath)))
                     todo.push(store->parseStorePath(p));
             }
         }

@@ -2,6 +2,8 @@
 #include <rapidcheck.h>
 
 #include "nix/expr/tests/value/context.hh"
+#include "nix/store/source-content-id.hh"
+#include "nix/util/hash.hh"
 
 namespace rc {
 using namespace nix;
@@ -12,6 +14,26 @@ Gen<NixStringContextElem::DrvDeep> Arbitrary<NixStringContextElem::DrvDeep>::arb
         return NixStringContextElem::DrvDeep{
             .drvPath = drvPath,
         };
+    });
+}
+
+Gen<NixStringContextElem::SourceVirtual> Arbitrary<NixStringContextElem::SourceVirtual>::arbitrary()
+{
+    /* Generate a deterministic placeholder from a random fingerprint
+       string. Names are simple ASCII to satisfy the parser's
+       no-space-in-name and no-empty-name constraints. */
+    return gen::mapcat(gen::nonEmpty(gen::string<std::string>()), [](std::string fingerprint) {
+        return gen::map(
+            gen::nonEmpty(
+                gen::container<std::string>(gen::elementOf(std::string("abcdefghijklmnopqrstuvwxyz0123456789")))),
+            [fingerprint = std::move(fingerprint)](std::string name) {
+                auto cid = SourceContentId::compute(
+                    fingerprint, Hash(HashAlgorithm::SHA256), ContentAddressMethod::Raw::NixArchive, StoreReferences{});
+                return NixStringContextElem::SourceVirtual{
+                    .placeholder = SourcePlaceholder::make(cid, name),
+                    .name = name,
+                };
+            });
     });
 }
 
@@ -30,6 +52,9 @@ Gen<NixStringContextElem> Arbitrary<NixStringContextElem>::arbitrary()
             case 2:
                 return gen::map(
                     gen::arbitrary<NixStringContextElem::Built>(), [](NixStringContextElem a) { return a; });
+            case 3:
+                return gen::map(
+                    gen::arbitrary<NixStringContextElem::SourceVirtual>(), [](NixStringContextElem a) { return a; });
             default:
                 assert(false);
             }

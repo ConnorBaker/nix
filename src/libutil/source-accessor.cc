@@ -1,7 +1,32 @@
 #include <atomic>
 #include "nix/util/source-accessor.hh"
+#include "nix/util/fingerprint.hh"
 
 namespace nix {
+
+std::pair<CanonPath, std::optional<std::string>> composeFingerprint(
+    SourceAccessor & wrapper, SourceAccessor & inner, const CanonPath & outerPath, const CanonPath & innerPath)
+{
+    auto [returnedPath, innerFp] = inner.getFingerprint(innerPath);
+
+    if (!innerFp) {
+        /* Inner has no content-keyed identity (e.g. PosixSourceAccessor
+           for a workdir input). Fall back to the wrapper's
+           input-level fingerprint, if any. The returned path here is
+           the *outer* path because the wrapper's fingerprint is
+           anchored at the wrapper, not the inner. */
+        return {outerPath, wrapper.fingerprint};
+    }
+
+    auto suffix = wrapper.computeOwnSuffix(outerPath);
+    if (!suffix)
+        return {returnedPath, std::nullopt}; // wrapper signals bypass
+
+    if (suffix->empty())
+        return {returnedPath, innerFp};
+
+    return {returnedPath, mergeFingerprintSuffix(*innerFp, *suffix)};
+}
 
 static std::atomic<size_t> nextNumber{0};
 

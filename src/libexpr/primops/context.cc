@@ -1,5 +1,6 @@
 #include "nix/expr/primops.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/materialisation-scheduler.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/globals.hh"
@@ -133,6 +134,14 @@ static void prim_addDrvOutputDependencies(EvalState & state, const PosIdx pos, V
                      above does not make much sense. */
                     return std::move(c);
                 },
+                [&](const NixStringContextElem::SourceVirtual & c) -> NixStringContextElem::DrvDeep {
+                    state
+                        .error<EvalError>(
+                            "`addDrvOutputDependencies` can only act on derivations, not on an unmaterialised source '%1%'",
+                            c.name)
+                        .atPos(pos)
+                        .debugThrow();
+                },
             },
             context.begin()->raw)}),
     };
@@ -201,6 +210,17 @@ static void prim_getContext(EvalState & state, const PosIdx pos, Value ** args, 
                     contextInfos[std::move(drvPath)].outputs.emplace_back(std::move(b.output));
                 },
                 [&](NixStringContextElem::Opaque && o) { contextInfos[std::move(o.path)].path = true; },
+                [&](NixStringContextElem::SourceVirtual && sv) {
+                    /* Resolve the placeholder to a real storePath so
+                       `getContext` can report it like an Opaque
+                       context elem. The user-facing surface
+                       (`getContext` returns paths and metadata about
+                       the build closure) doesn't have a sensible
+                       representation for unmaterialised sources, so
+                       we materialise here. */
+                    auto storePath = state.materialisationScheduler->outPathOf(sv.placeholder);
+                    contextInfos[std::move(storePath)].path = true;
+                },
             },
             ((NixStringContextElem &&) i).raw);
     }

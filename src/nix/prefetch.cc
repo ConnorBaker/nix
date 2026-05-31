@@ -49,8 +49,17 @@ std::string resolveMirrorUrl(EvalState & state, const std::string & url)
     if (mirrorList->value->listSize() < 1)
         throw Error("mirror URL '%s' did not expand to anything", url);
 
-    std::string mirror(
-        state.forceString(*mirrorList->value->listView()[0], noPos, "while evaluating the first available mirror"));
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+       sites). The mirror string is concatenated into a URL and
+       fetched, so a `SourceVirtual` placeholder in the body would
+       leak into the network request as `/<base32>`. Resolve the
+       placeholder context and rewrite the body before returning. */
+    NixStringContext context;
+    auto mirrorView = state.forceString(
+        *mirrorList->value->listView()[0], context, noPos, "while evaluating the first available mirror");
+    auto rewrites = state.resolveSourceVirtualContext(context);
+    state.ensureLazyPathsCopied(context);
+    std::string mirror = rewriteStrings(std::string{mirrorView}, rewrites);
     return mirror + (hasSuffix(mirror, "/") ? "" : "/") + s.substr(p + 1);
 }
 
@@ -220,6 +229,19 @@ static int main_nix_prefetch_url(int argc, char ** argv)
             Value & v(*findAlongAttrPath(*state, attrPath, autoArgs, vRoot).first);
             state->forceAttrs(v, noPos, "while evaluating the source attribute to prefetch");
 
+            /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3
+               bypass sites). The URL extracted from `urls` is
+               handed to `prefetchFile` and downloaded; the
+               `outputHashMode` value is compared to "recursive";
+               and the `name` attr (when present) is forwarded into
+               `prefetchFile` as the storepath name. Any of these
+               could carry a `SourceVirtual` placeholder if the
+               source attribute is constructed from a placeholder
+               body. Accumulate context across all three
+               `forceString` calls, resolve once, and rewrite the
+               bodies before use. */
+            NixStringContext context;
+
             /* Extract the URL. */
             auto * attr = v.attrs()->get(state->symbols.create("urls"));
             if (!attr)
@@ -227,24 +249,47 @@ static int main_nix_prefetch_url(int argc, char ** argv)
             state->forceList(*attr->value, noPos, "while evaluating the urls to prefetch");
             if (attr->value->listSize() < 1)
                 throw Error("'urls' list is empty");
-            url = state->forceString(
-                *attr->value->listView()[0], noPos, "while evaluating the first url from the urls list");
+            auto urlView = state->forceString(
+                *attr->value->listView()[0], context, noPos, "while evaluating the first url from the urls list");
+            std::string urlRaw{urlView};
 
             /* Extract the hash mode. */
             auto attr2 = v.attrs()->get(state->symbols.create("outputHashMode"));
+            std::string hashModeRaw;
             if (!attr2)
                 printInfo("warning: this does not look like a fetchurl call");
             else
-                unpack = state->forceString(
-                             *attr2->value, noPos, "while evaluating the outputHashMode of the source to prefetch")
-                         == "recursive";
+                hashModeRaw = std::string{state->forceString(
+                    *attr2->value, context, noPos, "while evaluating the outputHashMode of the source to prefetch")};
 
-            /* Extract the name. */
+            /* Resolve any `SourceVirtual` placeholders accumulated
+               from the URL and hash-mode reads, then rewrite both
+               bodies before they're used. */
+            auto rewrites = state->resolveSourceVirtualContext(context);
+            state->ensureLazyPathsCopied(context);
+            url = rewriteStrings(std::move(urlRaw), rewrites);
+            if (attr2)
+                unpack = rewriteStrings(std::move(hashModeRaw), rewrites) == "recursive";
+
+            /* Extract the name. The `if (!attr3)` was inverted — the
+               body would dereference `attr3->value` precisely when
+               `attr3 == nullptr`, so the only way to reach the
+               `forceString` was to crash. In practice the line never
+               fired because most fetchurl-style derivations carry a
+               `name` attr (branch skipped) or callers passed `--name`
+               explicitly. Fixed to `if (attr3)`; threaded through the
+               cover-fix's `context` accumulator so a `SourceVirtual`
+               body in the `name` attr also resolves before reaching
+               `prefetchFile`. */
             if (!name) {
                 auto attr3 = v.attrs()->get(state->symbols.create("name"));
-                if (!attr3)
-                    name =
-                        state->forceString(*attr3->value, noPos, "while evaluating the name of the source to prefetch");
+                if (attr3) {
+                    auto nameView = state->forceString(
+                        *attr3->value, context, noPos, "while evaluating the name of the source to prefetch");
+                    auto nameRewrites = state->resolveSourceVirtualContext(context);
+                    state->ensureLazyPathsCopied(context);
+                    name = rewriteStrings(std::string{nameView}, nameRewrites);
+                }
             }
         }
 

@@ -1,4 +1,1 @@
-sources += files(
-  'file-system-at.cc',
-  'unix-domain-socket.cc',
-)
+sources += files('file-system-at.cc', 'unix-domain-socket.cc')

@@ -3,8 +3,10 @@
 #include "nix/store/sqlite.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/materialisation-scheduler.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/globals.hh"
+#include "nix/util/util.hh"
 // Need specialization involving `SymbolStr` just in this one module.
 #include "nix/util/strings-inline.hh"
 
@@ -407,9 +409,61 @@ Value & AttrCursor::forceValue()
     }
 
     if (root->db && (!cachedValue || std::get_if<placeholder_t>(&cachedValue->second))) {
-        if (v.type() == nString)
-            cachedValue = {root->db->setString(getKey(), v.string_view(), v.context()), string_t{v.string_view(), {}}};
-        else if (v.type() == nPath) {
+        if (v.type() == nString) {
+            /* Boundary cover-fix (Item 1): resolve any `SourceVirtual`
+               placeholders in the value's context to real storePaths
+               *before* persisting to SQLite. The cache row outlives
+               the `MaterialisationScheduler`'s in-process registration,
+               so a fresh process reading the cache row would otherwise
+               see a placeholder with no live registration backing it.
+               After resolution the persisted body is a real CA store-
+               path string and the persisted context contains only
+               `Opaque{realStorePath}` elements — the in-memory shape
+               every existing eval-cache reader already knows how to
+               handle (the SourceVirtual-invalidates-cache branch in
+               `getStringWithContext` becomes unreachable for
+               post-fix rows). Same shape as `derivationStrictInternal`'s
+               batch step: collect → outPathsOf → rewrite. */
+            NixStringContext context;
+            copyContext(v, context);
+            auto rewrites = root->state.resolveSourceVirtualContext(context);
+            std::string body = rewrites.empty() ? std::string{v.string_view()}
+                                                : rewriteStrings(std::string{v.string_view()}, rewrites);
+            const Value::StringWithContext::Context * persistedCtx = v.context();
+            std::optional<NixStringContext> canonicalCtx;
+            const Value::StringWithContext::Context * builtCtx = nullptr;
+            if (!rewrites.empty()) {
+                /* Replace SourceVirtual elements with Opaque{resolvedPath},
+                   keeping the persisted context consistent with the
+                   rewritten body. The resolved paths come from in-process
+                   caches (`MaterialisationScheduler` / Item 2's
+                   `virtualPathRewrites_`, both already populated by
+                   `resolveSourceVirtualContext` above), so this is just a
+                   parsing reconstruction, not a second walk.
+
+                   The deferred-mount `Opaque{fakePath}` arm
+                   (`devirtualizeStorePath`) is currently unreachable here
+                   — the defer is gated on impure eval (see `mountInput`)
+                   and impure eval has no eval cache (PROPOSAL.md
+                   §6.4.7(c) reason 2) — but we map it anyway so body and
+                   context stay consistent if that gate is ever
+                   broadened. For a non-deferred path it is the identity. */
+                canonicalCtx.emplace();
+                for (auto & c : context) {
+                    if (auto * sv = std::get_if<NixStringContextElem::SourceVirtual>(&c.raw)) {
+                        auto storePath = root->state.materialisationScheduler->outPathOf(sv->placeholder);
+                        canonicalCtx->insert(NixStringContextElem{NixStringContextElem::Opaque{storePath}});
+                    } else if (auto * o = std::get_if<NixStringContextElem::Opaque>(&c.raw)) {
+                        canonicalCtx->insert(NixStringContextElem{
+                            NixStringContextElem::Opaque{root->state.devirtualizeStorePath(o->path)}});
+                    } else
+                        canonicalCtx->insert(c);
+                }
+                builtCtx = Value::StringWithContext::Context::fromBuilder(*canonicalCtx, root->state.mem);
+                persistedCtx = builtCtx;
+            }
+            cachedValue = {root->db->setString(getKey(), body, persistedCtx), string_t{std::move(body), {}}};
+        } else if (v.type() == nPath) {
             auto path = v.path().path;
             cachedValue = {root->db->setString(getKey(), path.abs()), string_t{path.abs(), {}}};
         } else if (v.type() == nBool)
@@ -543,7 +597,31 @@ std::string AttrCursor::getString()
     if (v.type() != nString && v.type() != nPath)
         root->state.error<TypeError>("'%s' is not a string but %s", getAttrPathStr(), showType(v)).debugThrow();
 
-    return v.type() == nString ? std::string(v.string_view()) : v.path().to_string();
+    if (v.type() == nPath)
+        return v.path().to_string();
+
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+       sites). `forceValue` above persists a SourceVirtual-resolved
+       body to the cache (lines 411-453), but on the *uncached* path
+       — when `root->db` is null, when the row was just written this
+       evaluation, or when the cached arm above didn't fire — we are
+       still holding the original `Value` whose body is the
+       placeholder render `/<base32>` and whose context still carries
+       `SourceVirtual` elements. Returning `v.string_view()` raw
+       leaks that placeholder text to callers like
+       `flake.cc:welcomeText`, `nix flake show`, and `nix search`,
+       which use the body for terminal/JSON output without ever
+       inspecting context (that's why they call this overload, not
+       `getStringWithContext`). Resolve here so this method's
+       contract — "the string body" — means the materialised text,
+       same shape as `forceValue`'s persistence step. */
+    NixStringContext context;
+    copyContext(v, context);
+    auto rewrites = root->state.resolveSourceVirtualContext(context);
+    if (rewrites.empty())
+        return std::string{v.string_view()};
+    root->state.ensureLazyPathsCopied(context);
+    return rewriteStrings(std::string{v.string_view()}, rewrites);
 }
 
 string_t AttrCursor::getStringWithContext()
@@ -554,6 +632,17 @@ string_t AttrCursor::getStringWithContext()
             if (auto s = std::get_if<string_t>(&cachedValue->second)) {
                 bool valid = true;
                 for (auto & c : s->second) {
+                    /* `SourceVirtual` placeholders can't be cached
+                       — they need write-time materialisation. If we
+                       see one in a cached string, treat the cache
+                       entry as invalid so the value is re-evaluated.
+                       This branch is reachable only for caches
+                       written before write-time materialisation
+                       landed. */
+                    if (std::get_if<NixStringContextElem::SourceVirtual>(&c.raw)) {
+                        valid = false;
+                        break;
+                    }
                     const StorePath & path = std::visit(
                         overloaded{
                             [&](const NixStringContextElem::DrvDeep & d) -> const StorePath & { return d.drvPath; },
@@ -561,6 +650,11 @@ string_t AttrCursor::getStringWithContext()
                                 return b.drvPath->getBaseStorePath();
                             },
                             [&](const NixStringContextElem::Opaque & o) -> const StorePath & { return o.path; },
+                            [&](const NixStringContextElem::SourceVirtual &) -> const StorePath & {
+                                /* Unreachable: the if-guard above
+                                   already broke out on this case. */
+                                throw Error("internal error: SourceVirtual reached cache visitor");
+                            },
                         },
                         c.raw);
                     if (!root->state.store->isValidPath(path)) {

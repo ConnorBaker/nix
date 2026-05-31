@@ -30,6 +30,7 @@ subdir('nix-meson-build-support/common')
 
 sources = files(
   'hash.cc',
+  'source-accessor.cc',
   'string_callback.cc',
 )
 

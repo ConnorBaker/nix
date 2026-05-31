@@ -1,5 +1,6 @@
 #include "nix/store/local-store.hh"
 #include "nix/store/local-settings.hh"
+#include "nix/store/pathlocks.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/posix-source-accessor.hh"
@@ -323,6 +324,116 @@ void LocalStore::optimisePath(const std::filesystem::path & path, RepairFlag rep
 
     if (config->getLocalSettings().autoOptimiseStore)
         optimisePath_(nullptr, stats, path, inodeHash, repair);
+}
+
+/* Recreate `src`'s file tree at `dst`, hardlinking leaves (regular files
+   and symlinks) and recursing into directories. On any link failure
+   (EXDEV cross-device, EMLINK too-many-links, …) copy that one leaf's
+   bytes instead — unlike `optimisePath_`, which can `return` and leave
+   the pre-existing file, `dst` has NO pre-existing file, so we MUST
+   produce it or `dst` is an incomplete/corrupt store path.
+
+   Caller toggles the parent dir writable around the whole operation (the
+   directories we `createDirs` here are freshly created and writable). */
+static void linkOrCopyTree(const std::filesystem::path & src, const std::filesystem::path & dst)
+{
+    auto st = lstat(src);
+    if (S_ISDIR(st.st_mode)) {
+        createDirs(dst);
+        /* `directory_iterator` construction/iteration throws
+           `std::filesystem::filesystem_error` (a `std::system_error`, NOT
+           a nix `Error`) on a transient read failure. The scheduler's
+           per-sibling fallback (`materialiseGroup`) catches `Error` only,
+           so an unwrapped `filesystem_error` would escape and abort the
+           whole batch instead of degrading to a copy. Wrap it into a nix
+           `SysError` so the intended "any link-time failure → copy"
+           contract holds. */
+        try {
+            for (auto & entry : std::filesystem::directory_iterator{src})
+                linkOrCopyTree(entry.path(), dst / entry.path().filename());
+        } catch (std::filesystem::filesystem_error & e) {
+            /* `e.what()` already carries the system error string, so use a
+               plain `Error` rather than `SysError` (which would append a
+               possibly-stale `errno`). */
+            throw Error("iterating directory '%s' while linking store path: %s", src.string(), e.what());
+        }
+    } else {
+        /* Regular file or symlink. */
+        try {
+            std::filesystem::create_hard_link(src, dst);
+        } catch (std::filesystem::filesystem_error &) {
+            /* EXDEV / EMLINK / etc. — fall back to a byte copy that
+               preserves mode (incl. +x) and symlink targets.
+               `andDelete=false`: we're creating, not moving. */
+            copyFile(src, dst, /*andDelete=*/false);
+        }
+    }
+}
+
+void LocalStore::registerLinkedCAPath(const StorePath & from, const ValidPathInfo & toInfo)
+{
+    if (config->readOnly)
+        throw Error("cannot register a linked store path in a read-only store");
+
+    /* A self-reference would make toInfo's NAR differ from `from`'s (the
+       embedded self-path hash-part differs), so byte-identity — the whole
+       premise of linking — fails. Caller must filter these out. */
+    assert(!toInfo.references.count(toInfo.path));
+
+    assert(isValidPath(from));
+
+    if (isValidPath(toInfo.path))
+        return; /* already materialised (e.g. a concurrent sibling) */
+
+    auto srcReal = toRealPath(from);
+    auto dstReal = toRealPath(toInfo.path);
+
+    /* Pin the destination before any bytes exist so a concurrent GC
+       can't race the half-built path away. Held until registerValidPath
+       commits below (all within this call). */
+    addTempRoot(toInfo.path);
+
+    /* Serialise concurrent writers of the SAME destination path. Two
+       evaluations of one workspace (cross-process, or two scheduler
+       threads) resolve identical sibling paths (same name + contentId),
+       so without this lock both could enter the delete+link region on
+       `dstReal` at once and corrupt the tree. Every other LocalStore
+       byte-writer (`addToStoreFromDump`, `addToStore`) takes this lock;
+       `addTempRoot` only guards against GC, not against other writers.
+       Re-check validity UNDER the lock: a racer may have committed the
+       path while we waited. */
+    PathLocks outputLock({dstReal});
+
+    if (isValidPath(toInfo.path))
+        return; /* a concurrent sibling won the race and committed it */
+
+    if (pathExists(dstReal)) {
+        /* A stale/aborted prior attempt; clear it so the link tree is
+           clean. (isValidPath was false above, so this isn't a live
+           store object.) */
+        deletePath(dstReal);
+    }
+
+    /* Toggle the parent dir writable while we create `dstReal`, then
+       restore it (the store root itself is never chmod'd — guard like
+       optimisePath_). */
+    const auto dirOfDst = std::filesystem::path{dstReal}.parent_path();
+    bool mustToggle = dirOfDst != config->realStoreDir.get();
+    if (mustToggle)
+        makeWritable(dirOfDst);
+    MakeReadOnly makeReadOnly(mustToggle ? dirOfDst : std::filesystem::path{});
+
+    linkOrCopyTree(srcReal, dstReal);
+
+    /* Canonicalise (1970 mtime, 444/555 perms) so the tree matches what
+       a fresh addToStoreFromDump would have produced, then register so
+       GC + isValidPath see it as a first-class path. */
+    canonicalisePathMetaData(dstReal, {NIX_WHEN_SUPPORT_ACLS(config->getLocalSettings().ignoredAcls)});
+
+    /* `registerValidPath` re-derives the path from toInfo.ca + narHash
+       and asserts it equals toInfo.path (via makeFromCA in the caller),
+       so a mis-derived link is caught here, not silently committed. */
+    registerValidPath(toInfo);
 }
 
 } // namespace nix

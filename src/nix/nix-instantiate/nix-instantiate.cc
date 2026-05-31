@@ -14,6 +14,7 @@
 #include "man-pages.hh"
 
 #include <iostream>
+#include <sstream>
 
 namespace nix {
 
@@ -53,22 +54,38 @@ void processExpr(
                 vRes = v;
             else
                 state.autoCallFunction(autoArgs, v, vRes);
-            if (output == okRaw)
-                std::cout << *state.coerceToString(noPos, vRes, context, "while generating the nix-instantiate output");
-            // We intentionally don't output a newline here. The default PS1 for Bash in NixOS starts with a newline
-            // and other interactive shells like Zsh are smart enough to print a missing newline before the prompt.
-            else if (output == okXML)
-                printValueAsXML(state, strict, location, vRes, std::cout, context, noPos);
-            else if (output == okJSON) {
-                printValueAsJSON(state, strict, vRes, v.determinePos(noPos), std::cout, context);
-                std::cout << std::endl;
+
+            /* Boundary cover-fix (Item 1): capture the serialised
+               output, resolve any `SourceVirtual` placeholders in
+               the context, then rewrite the body before writing.
+               See `src/libexpr-tests/boundary-audit-instantiate-eval.cc`
+               and `src/nix/eval.cc`'s parallel comment.
+
+               We use `resolveSourceVirtualContext` (not
+               `realiseContext`) because `realiseContext` builds any
+               `Built` drv-path elements (IFD), which
+               `nix-instantiate --eval` historically does not do. */
+            std::ostringstream buf;
+            if (output == okRaw) {
+                buf << *state.coerceToString(noPos, vRes, context, "while generating the nix-instantiate output");
+                // We intentionally don't output a newline here. The default PS1 for Bash in NixOS starts with a newline
+                // and other interactive shells like Zsh are smart enough to print a missing newline before the prompt.
+            } else if (output == okXML) {
+                printValueAsXML(state, strict, location, vRes, buf, context, noPos);
+            } else if (output == okJSON) {
+                printValueAsJSON(state, strict, vRes, v.determinePos(noPos), buf, context);
+                buf << std::endl;
             } else {
                 if (strict)
                     state.forceValueDeep(vRes);
                 std::set<const void *> seen;
-                printAmbiguous(state, vRes, std::cout, &seen, &context);
-                std::cout << std::endl;
+                printAmbiguous(state, vRes, buf, &seen, &context);
+                buf << std::endl;
             }
+
+            auto rewrites = state.resolveSourceVirtualContext(context);
+            state.ensureLazyPathsCopied(context);
+            std::cout << rewriteStrings(buf.str(), rewrites);
         } else {
             PackageInfos drvs;
             getDerivations(state, v, "", autoArgs, drvs, false);

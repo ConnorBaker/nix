@@ -61,6 +61,7 @@ sources = files(
   'args.cc',
   'base-n.cc',
   'bump-memory-resource.cc',
+  'caching-source-accessor.cc',
   'canon-path.cc',
   'checked-arithmetic.cc',
   'chunked-vector.cc',
@@ -72,6 +73,8 @@ sources = files(
   'file-descriptor.cc',
   'file-system-at.cc',
   'file-system.cc',
+  'fingerprint-composition.cc',
+  'fingerprint.cc',
   'fun.cc',
   'git.cc',
   'hash.cc',
@@ -87,6 +90,7 @@ sources = files(
   'nix_api_util_internal.cc',
   'pool.cc',
   'position.cc',
+  'prefetch-forwarding.cc',
   'processes.cc',
   'ref.cc',
   'serialise.cc',
@@ -95,6 +99,7 @@ sources = files(
   'spawn.cc',
   'strings.cc',
   'suggestions.cc',
+  'switch-source-accessor.cc',
   'terminal.cc',
   'topo-sort.cc',
   'url.cc',
@@ -125,9 +130,7 @@ this_exe = executable(
 test(
   meson.project_name(),
   this_exe,
-  env : {
-    '_NIX_TEST_UNIT_DATA' : meson.current_source_dir() / 'data',
-  },
+  env : {'_NIX_TEST_UNIT_DATA' : meson.current_source_dir() / 'data'},
   protocol : 'gtest',
 )
 
@@ -147,9 +150,7 @@ if host_machine.system() == 'linux'
         '--',
         this_exe,
       ],
-      env : {
-        '_NIX_TEST_UNIT_DATA' : meson.current_source_dir() / 'data',
-      },
+      env : {'_NIX_TEST_UNIT_DATA' : meson.current_source_dir() / 'data'},
       protocol : 'gtest',
     )
   endif

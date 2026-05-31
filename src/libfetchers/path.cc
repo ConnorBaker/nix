@@ -125,7 +125,11 @@ struct PathInputScheme : InputScheme
 
     bool isLocked(const Settings & settings, const Input & input) const override
     {
-        return (bool) input.getNarHash();
+        /* Presence-only check — uses `hasNarHashAttr` so a lazy
+           narHash thunk doesn't trigger a force. The `path` scheme
+           regards an input as locked iff a narHash is recorded in
+           any form (concrete or lazy). */
+        return input.hasNarHashAttr();
     }
 
     std::filesystem::path getAbsPath(const Input & input) const

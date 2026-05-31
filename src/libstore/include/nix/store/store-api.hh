@@ -769,7 +769,7 @@ public:
         std::shared_ptr<Store> evalStore = nullptr);
 
     /**
-     * Build a single non-materialized derivation (i.e. not from an
+     * Build a single non-materialised derivation (i.e. not from an
      * on-disk .drv file).
      *
      * @param drvPath This is used to deduplicate worker goals so it is

@@ -49,6 +49,26 @@ NixStringContextElem NixStringContextElem::parse(std::string_view s0, const Expe
             .drvPath = StorePath{s.substr(1)},
         };
     }
+    case '~': {
+        /* SourceVirtual: `~<base32-hash>:<name>`. */
+        s = s.substr(1);
+        auto colon = s.find(':');
+        if (colon == std::string_view::npos)
+            throw BadNixStringContextElem(s0, "SourceVirtual context element missing ':' name separator");
+        auto hashStr = s.substr(0, colon);
+        auto nameStr = s.substr(colon + 1);
+        if (nameStr.empty())
+            throw BadNixStringContextElem(s0, "SourceVirtual context element has empty name");
+        if (nameStr.find(' ') != std::string_view::npos)
+            throw BadNixStringContextElem(s0, "SourceVirtual context element name contains a space");
+        auto ph = SourcePlaceholder::tryParse("/" + std::string(hashStr));
+        if (!ph)
+            throw BadNixStringContextElem(s0, "SourceVirtual context element hash unparseable");
+        return NixStringContextElem::SourceVirtual{
+            .placeholder = *ph,
+            .name = std::string(nameStr),
+        };
+    }
     default: {
         // Ensure no '!'
         if (s.find("!") != std::string_view::npos) {
@@ -89,6 +109,16 @@ std::string NixStringContextElem::to_string() const
                 res += '=';
                 res += d.drvPath.to_string();
             },
+            [&](const NixStringContextElem::SourceVirtual & sv) {
+                /* `~<hash>:<name>`. The placeholder's render() is
+                   `/<hash>` — strip the leading slash since `~` is
+                   already our sigil. */
+                res += '~';
+                auto rendered = sv.placeholder.render();
+                res += rendered.substr(1);
+                res += ':';
+                res += sv.name;
+            },
         },
         raw);
 
@@ -106,6 +136,9 @@ std::string NixStringContextElem::display(const StoreDirConfig & store) const
                 return store.printStorePath(d.drvPath) + " (deep)";
             },
             [&](const NixStringContextElem::Built & b) -> std::string { return SingleDerivedPath{b}.to_string(store); },
+            [&](const NixStringContextElem::SourceVirtual & sv) -> std::string {
+                return "<unmaterialised source: " + sv.name + ">";
+            },
         },
         raw);
 }

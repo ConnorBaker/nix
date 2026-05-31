@@ -4,6 +4,15 @@
 
 namespace nix {
 
+/**
+ * The mutable face of `Switch`: a `boost::concurrent_flat_map` of
+ * mounts that grows at runtime via `mount()`. All resolve + strip +
+ * dispatch is inherited from `SwitchSourceAccessor`; this impl only
+ * supplies the mount storage, the runtime mutator, and the exact-key
+ * lookup `getMount` (O(1) — relied on as a membership test by
+ * `EvalState::ensureLazyPathCopied` and friends, so it must stay a
+ * direct lookup, never a prefix scan).
+ */
 struct MountedSourceAccessorImpl : MountedSourceAccessor
 {
     boost::concurrent_flat_map<CanonPath, ref<SourceAccessor>> mounts;
@@ -21,72 +30,19 @@ struct MountedSourceAccessorImpl : MountedSourceAccessor
         // FIXME: return dummy parent directories automatically?
     }
 
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
-    {
-        auto [accessor, subpath] = resolve(path);
-        return accessor->readFile(subpath, sink, sizeCallback);
-    }
-
-    Stat lstat(const CanonPath & path) override
-    {
-        auto [accessor, subpath] = resolve(path);
-        return accessor->lstat(subpath);
-    }
-
-    std::optional<Stat> maybeLstat(const CanonPath & path) override
-    {
-        auto [accessor, subpath] = resolve(path);
-        return accessor->maybeLstat(subpath);
-    }
-
-    DirEntries readDirectory(const CanonPath & path) override
-    {
-        auto [accessor, subpath] = resolve(path);
-        return accessor->readDirectory(subpath);
-    }
-
-    std::string readLink(const CanonPath & path) override
-    {
-        auto [accessor, subpath] = resolve(path);
-        return accessor->readLink(subpath);
-    }
-
-    std::string showPath(const CanonPath & path) override
-    {
-        auto [accessor, subpath] = resolve(path);
-        return displayPrefix + accessor->showPath(subpath) + displaySuffix;
-    }
-
-    std::pair<ref<SourceAccessor>, CanonPath> resolve(CanonPath path)
-    {
-        // Find the nearest parent of `path` that is a mount point.
-        std::vector<std::string> subpath;
-        while (true) {
-            if (auto mount = getMount(path)) {
-                std::reverse(subpath.begin(), subpath.end());
-                return {ref(mount), CanonPath(subpath)};
-            }
-
-            assert(!path.isRoot());
-            subpath.push_back(std::string(*path.baseName()));
-            path.pop();
-        }
-    }
-
-    void invalidateCache() override
-    {
-        mounts.visit_all([](auto & kv) { kv.second->invalidateCache(); });
-    }
-
-    std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
-    {
-        auto [accessor, subpath] = resolve(path);
-        return accessor->getPhysicalPath(subpath);
-    }
-
     void mount(CanonPath mountPoint, ref<SourceAccessor> accessor) override
     {
-        mounts.emplace(std::move(mountPoint), std::move(accessor));
+        /* `insert_or_assign`, not `emplace`: mounting a key establishes
+           that accessor at the key, overwriting any prior mount. For
+           content-keyed real store paths this is observably identical
+           to `emplace` (the same key implies the same content, hence an
+           equivalent accessor). It matters for Item 2's identity-keyed
+           deferred-mount stand-ins (§6.1.1): after a `resetFileCache`
+           (REPL `:reload`, `nix_flake_lock`) the on-disk content may
+           have moved while the (attrs-stable) fake key is unchanged, so
+           a re-mint must replace the now-stale accessor rather than be
+           silently dropped. */
+        mounts.insert_or_assign(std::move(mountPoint), std::move(accessor));
     }
 
     std::shared_ptr<SourceAccessor> getMount(CanonPath mountPoint) override
@@ -97,12 +53,20 @@ struct MountedSourceAccessorImpl : MountedSourceAccessor
             return nullptr;
     }
 
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    void forEachMountUnder(const CanonPath & subpath, fun<void(const CanonPath &, SourceAccessor &)> fn) override
     {
-        if (fingerprint)
-            return {path, fingerprint};
-        auto [accessor, subpath] = resolve(path);
-        return accessor->getFingerprint(subpath);
+        /* Enumerate sub-mounts so an exhaustive `prefetchSubtree`
+           reaches them (see `SwitchSourceAccessor::prefetchSubtree`).
+           `visit_all` is the concurrent-map iteration primitive. */
+        mounts.visit_all([&](auto & kv) {
+            if (kv.first != subpath && kv.first.isWithin(subpath))
+                fn(kv.first, *kv.second);
+        });
+    }
+
+    void invalidateCache() override
+    {
+        mounts.visit_all([](auto & kv) { kv.second->invalidateCache(); });
     }
 };
 

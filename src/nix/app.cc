@@ -4,6 +4,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-cache.hh"
+#include "nix/expr/materialisation-scheduler.hh"
 #include "nix/store/names.hh"
 #include "nix/cmd/command.hh"
 #include "nix/store/derivations.hh"
@@ -68,6 +69,18 @@ UnresolvedApp InstallableValue::toApp(EvalState & state)
     if (type == "app") {
         auto [program, context] = cursor->getAttr("program")->getStringWithContext();
 
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3
+           bypass sites). DetSys hit this in production (commit
+           5d6ab843d, "Fix `nix run` on an app with lazy trees
+           enabled", Feb 2026). Previously the `SourceVirtual` arm
+           below resolved the placeholder for the *context* (so
+           `inputSrcs`/dependencies were correct) but the **body**
+           string `program` still contained the placeholder render
+           verbatim. `nix run` would then try to `exec` the
+           placeholder path and fail. Resolve up front so we can
+           rewrite `program` before stashing it into UnresolvedApp. */
+        auto rewrites = state.resolveSourceVirtualContext(context);
+
         std::vector<DerivedPath> context2;
         for (auto & c : context) {
             context2.emplace_back(
@@ -91,6 +104,15 @@ UnresolvedApp InstallableValue::toApp(EvalState & state)
                                 .path = o.path,
                             };
                         },
+                        [&](const NixStringContextElem::SourceVirtual & sv) -> DerivedPath {
+                            /* Already resolved above via
+                               resolveSourceVirtualContext. Look up
+                               the resolved path so the app can
+                               reference it like an Opaque source. */
+                            return DerivedPath::Opaque{
+                                .path = state.materialisationScheduler->outPathOf(sv.placeholder),
+                            };
+                        },
                     },
                     c.raw));
         }
@@ -99,7 +121,7 @@ UnresolvedApp InstallableValue::toApp(EvalState & state)
 
         return UnresolvedApp{App{
             .context = std::move(context2),
-            .program = program,
+            .program = rewriteStrings(program, rewrites),
         }};
     }
 

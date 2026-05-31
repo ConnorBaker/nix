@@ -47,6 +47,42 @@ TEST(LazyAttr, attrsToJSONForcesLazy)
     EXPECT_EQ(json["x"], 99);
 }
 
+TEST(LazyAttr, attrsToJSONForKeyDoesNotForce)
+{
+    int calls = 0;
+    Attrs attrs;
+    attrs.insert_or_assign("plain", std::string("hello"));
+    attrs.insert_or_assign(
+        "lazy", LazyAttr(make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&calls]() -> ResolvedAttr {
+            calls++;
+            return uint64_t(42);
+        }})));
+    auto json = attrsToJSONForKey(attrs);
+    EXPECT_EQ(calls, 0);                 // never forced
+    EXPECT_EQ(json["plain"], "hello");   // concrete preserved
+    EXPECT_TRUE(json["lazy"].is_null()); // sentinel for unforced
+}
+
+TEST(LazyAttr, attrsToJSONForKeyEmitsNullSentinel)
+{
+    /* The R3 sentinel choice: `null`, not the string "<lazy>". This
+       test pins the choice so a future refactor can't silently shift
+       to a colliding placeholder. */
+    Attrs attrs;
+    attrs.insert_or_assign(
+        "x", LazyAttr(make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = []() -> ResolvedAttr {
+            return std::string("forced-value");
+        }})));
+    auto unforced = attrsToJSONForKey(attrs);
+    auto forced = attrsToJSON(attrs);
+    EXPECT_TRUE(unforced["x"].is_null());
+    EXPECT_EQ(forced["x"], "forced-value");
+    /* Cache-key invariant: unforced JSON is byte-distinct from
+       forced JSON. A consumer cache hit on the unforced key cannot
+       collide with a hit on the forced key for the same input. */
+    EXPECT_NE(unforced.dump(), forced.dump());
+}
+
 TEST(LazyAttr, attrsToQueryForcesLazy)
 {
     Attrs attrs;

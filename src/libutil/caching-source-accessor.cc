@@ -4,7 +4,23 @@
 
 namespace nix {
 
-class CachingSourceAccessor : public SourceAccessor
+/**
+ * Caches POSITIVE lstat/readlink results only. This is the
+ * lstat/readlink-cache half of the cache-accessor algebra (Phase 3 /
+ * PROPOSAL.md §6.6): a transparent wrapper that memoises existence +
+ * metadata, distinct from the predicate-caching
+ * `CachingFilteringSourceAccessor` (libfetchers, both-polarity).
+ *
+ * Invariant C3 (positive-only): a MISS (`maybeLstat` → nullopt) is NEVER
+ * cached as "absent", because the evaluator may observe a path appear
+ * later (e.g. a lazily-materialised store mount added after the first
+ * probe). Caching a negative would mask that appearance. Positive
+ * lookups, by contrast, are stable for the eval — the evaluator relies on
+ * them not changing — so they are cached and never evicted (until
+ * `invalidateCache`). The C1–C6 laws are pinned in
+ * `src/libutil-tests/caching-source-accessor.cc`.
+ */
+class CachingSourceAccessor final : public SourceAccessor
 {
     ref<SourceAccessor> next;
 
@@ -91,6 +107,11 @@ public:
     std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
     {
         return next->getFingerprint(path);
+    }
+
+    void prefetchSubtree(const CanonPath & subpath, unsigned depth) override
+    {
+        next->prefetchSubtree(subpath, depth);
     }
 };
 
