@@ -66,19 +66,21 @@ only the current settled state:
   derivation-flatten-instances over ~thousands of distinct derivations) gives **mean
   ~200–2,000 consumers per derivation** — insensitive to the one unpinned input across
   its whole plausible range; N≫1 robustly. So the SHARING premise is settled.
-  Both go/no-go numbers are now MEASURED (§8-step-3 prototype built, follow-ups #12–#15):
-  - **BENEFIT ≈ 63% per-consumer dep reduction** (+ a separate, larger producer-closure
-    STORAGE dedup). The edge model keeps ONE edge per DISTINCT derivation a consumer
-    references (mean ~1,213), collapsing mean ~3,296 consumer deps → ~1,213 edges = ~63%.
-    NOT the ~99% an earlier pass briefly claimed (that conflated "fraction that is
-    derivation-closure" with "fraction removed" — corrected #15), and above the 37%
-    SPA-only floor. Bounded by distinct-derivations-per-consumer, a measured quantity.
-  - **HOT COST ≥ 11% scope-structural** (per-derivation sub-scope ctor/accumulate/take/dtor,
-    measured python3Packages; a LOWER bound — the real shape adds the §3b-measured
-    producer-recordSync on top; a 23× re-record proxy was caught + discarded, #14).
-  Net: plausibly positive on dep-count/storage, but the net WIN is gated on the
-  producer-record cost (§3b's dominant net-loss term) coming down via async/batched
-  recording — §3b's condition (a), never built. See follow-ups #12–#15.
+  PROXY measurements taken (NO end-to-end aggressive shape was built — two proxies +
+  synthesis; framing corrected in follow-up #19; #12–#18):
+  - **Sharing/benefit: ~63% of consumer deps are derivation-attributable** (consumer
+    flattens mean ~3,296 deps referencing ~1,213 distinct derivations → an edge model
+    keeps ~1,213 edges = ~63% dep-COUNT/storage reduction). SOLID (artifact/test-based,
+    #10/#11/#13). NOT the ~99% briefly claimed (retracted #15); above the 37% SPA floor.
+    CAVEAT (#19): this is a STORAGE/count number — the VERIFY-time (hot) win is the
+    cross-consumer memo dedup (verifiedTraceIds), reachable but UNMEASURED in magnitude.
+  - **Structural cost ~11%** (per-derivation sub-scope, proxy: open+discard; a 23×
+    re-record proxy was caught + discarded #14). A LOWER bound; real adds §3b recordSync.
+  Net: NOT measured end-to-end. The direction is net-negative at synchronous recording
+  (it pays §3b's same dominant recordSync cost) — so a real go/no-go needs TWO builds,
+  neither done: (a) the end-to-end edge-emitting prototype measured on a HOT workload
+  (the verify-memo benefit magnitude), and (b) async/batched producer recording (the
+  cost; §3b condition a). See follow-ups #12–#19.
 - **Honest scope:** ALT-4 (verify-time fragment sharing, §7.8) remains a real
   alternative regardless.
 
