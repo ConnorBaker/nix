@@ -3288,3 +3288,13 @@ recorder + this batching + the §21 verify win combined, and likely Layer 2 for 
 materially shrinks the last gate, and it's a shippable, low-risk improvement to the §3b
 infrastructure on its own (default-off, env-gated). Layer 2 is the next step IF a net-win
 calculation shows the remaining CPU is the deciding margin.
+
+**Confirming-pass addendum to #22 (both attacks resolved favorably):**
+- *Did defer-flush DROP producers (speedup = silent data loss)?* NO. Identical DB end-state:
+  OFF and ON both produce the same Traces + Sessions row counts on a controlled derivation eval.
+  The teardown flush genuinely drains the deferred producers; the −40% is batching, not skipping.
+- *Does the record-timer win show up in WALL time?* YES. Derivation-dense python3Packages, 3 runs:
+  OFF ~12.09s → ON ~10.97s = ~1.1s / ~9% wall reduction, consistent with flush being ~1.1s of the
+  ~2.7s record cost. The −40% record / −96% flush is real and translates to wall.
+Layer 1 stands: soundness-clean (no drop, byte-identical, cross-process hit preserved), and a
+measured ~9% wall / −40% record / −96% flush win on the producer-record cost.
