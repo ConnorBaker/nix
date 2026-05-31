@@ -182,6 +182,18 @@ Concretely, the producer-trace boundary becomes:
    exact edge mechanism already proven by `ca-trace-key-routing.cc` (R1/R2/R3)
    and verified recursively + memoized by `resolveTraceContextHash`
    (verifier.cc:243-278).
+   **Why dropping the consumer's flattened closure is sound** (the load-bearing
+   step — full argument in §7.3, dichotomy from passes #2/#3 Attacks F/G): every dep
+   the consumer would have flattened lands in EITHER the producer sub-scope's
+   `ownDeps` (→ the producer trace, carried transitively by the edge via the
+   recursive `resolveTraceContextHash`) OR the durable global `epochLog_` (→ replayed
+   into the consumer's own scope if the consumer independently re-forces the thunk —
+   `popScope` doesn't touch `epochLog_`). There is no third bucket except the
+   pre-existing no-active-context drop, which isolation does not widen. So the edge
+   carries, or the consumer independently re-records, everything the closure held;
+   the drop loses nothing the conservative shape kept. (Over-CAPTURE — a
+   consumer-incidental dep trapped in the producer — is possible but is precision,
+   not soundness; §7.3.)
 
 The key insight vs §3a/§3b: **the routing/dedup key (`drvPath`) is SEPARATE from the
 verification key (`trace_hash` over the recorded sub-scope deps).** §3b conflated
