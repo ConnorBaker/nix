@@ -2179,3 +2179,86 @@ differently. Approaches under consideration:
    already has `EvalContext<Suspendable>`) and detect derivation results post-eval.
 3. Defer until the §7 measurement decides whether the dormant gate's overhead is worth
    shipping the producer-side wiring at all.
+
+### 2026-05-31 follow-up #3: production caller wired into prim_derivationStrict
+
+The four-way investigation (commit `baa35bbf9` and prior) eliminated approaches (a) and
+(c): (a) is killed by the C-extension API (PrimOp signature is frozen by external
+plugins); (c) is structurally wrong (misses non-attr-path derivations, runs after deps
+flatten, can't partition producer-vs-consumer reads). Approach (b) is the right shape and
+has a direct precedent in `TraceBackend::recordRuntimeRoot`: `Certifier<BlockingTag>::
+withProof` + `withExclusiveAccess`, no fiber color required, no `coroBlock` indirection.
+
+**Sync API on `TraceBackend` (commit `baa35bbf9`):**
+- `TraceBackend::recordSync(pathId, value, allDeps) → optional<{RecordResult, TraceHash}>`
+  mirrors `recordRuntimeRoot`. One mutex acquisition fetches the trace + its content
+  hash; the trace hash is what `replayMemoizedDeps`'s gate emits as the value of the
+  TraceValueContext edge.
+- `TraceBackend::verifySync(pathId)` — sibling sync entry point used by tests asserting
+  cross-session persistence.
+- `TraceSession::recordCAProducer(value, drvHash, innerDeps)` — primop-friendly
+  facade. Computes `__ca:<drvHash>` CA routing key, persists producer trace, registers
+  Value*→{caKey, traceHash} in `producerMap`. Returns false when no backend is bound.
+
+Test surface — `dep/trace-session-record-ca-producer.cc`, 4 tests, all probe-verified:
+R1 round-trip, R2 distinct drvHashes → distinct keys, R3 cross-session persistence, R4
+input-mutation invalidates the persisted producer.
+
+**The `prim_derivationStrict` hook (commit `13cf303d2`):**
+After `derivationStrictInternal` returns, snapshot the epoch-log range
+`[epochStart, epochEnd)` that grew during the call (= the producer's deps) and call
+`session->recordCAProducer(v, drvPath, innerDeps)`. Active only when a TraceSession is
+bound; `--no-eval-trace` short-circuits to no-op.
+
+**Conservative shape — soundness floor unconditional.** The hook does NOT isolate the
+producer's input-reads from the consumer scope. The deps still flow into the consumer's
+existing scope as before. An aggressive shape (sub-scope isolation in the producer +
+edge-instead-of-flatten in the consumer) was tried and reverted because it under-records:
+any ambient-eval dep that legitimately flowed into the consumer scope but isn't tied to
+the producer's content is lost. The conservative shape preserves the consumer's existing
+scope shape exactly (zero precision loss); the amortization win comes from siblings
+sharing the producer trace via the gate when re-forced.
+
+**Production additions (since the dormant infra commits):**
+- `TraceRuntime::snapshotEpochRange(start, end)` — public read accessor for an epoch-log
+  slice. Used by `prim_derivationStrict` to capture the deps recorded during a single
+  derivation's evaluation.
+- `Verifier::verifyAttrSync(ea, pathId)` — sibling of `verifyAttr` taking an explicit
+  exclusive-access capability instead of awaiting on the colored ctx. Used by
+  `TraceBackend::verifySync` (test-only).
+
+**Soundness gates passed:**
+- Sandboxed `.#checks.x86_64-linux.nix-expr-tests-run`: 1847 tests, 3 documented skips,
+  0 failures.
+- Full `nix build -L .#default`: PASSES — including all 226 functional tests
+  (eval-trace-core, eval-trace-deps, etc.).
+- Canonical correctness: `nix eval -f ~/nixpkgs/default.nix --system x86_64-linux
+  asciidoc.nativeBuildInputs --json` BYTE-IDENTICAL between `--no-eval-trace` and
+  trace-on.
+- `producerEdges = 0` in real eval: confirms the gate is correctly conservative. The
+  gate fires only from `SiblingForceScope::commit` (sibling-shared values) — narrow
+  scenario. The ~thousands of `derivationStrict` calls per closure all register
+  producers; the SQLite store now holds a CA-keyed producer trace per derivation; the
+  consumer-side scope shape is unchanged.
+
+**Observation: the gate doesn't fire much in current workloads.** `replayMemoizedDeps`
+is called only from `SiblingForceScope::commit`, which fires for explicitly
+sibling-isolated thunks under a `SiblingReplayCaptureScope`. To benefit measurably from
+the producerMap registration, either (a) more producer Values must end up in
+sibling-share contexts, or (b) the gate must fire from a broader site (e.g., a
+post-`derivationStrictInternal` pass that emits the edge for sibling consumers
+specifically detected via a new mechanism). The amortization win is theoretically
+present but quantitatively small in the current eval pipeline. Benchmarking on the
+Ledger-D anchor is the next concrete step to decide whether the wiring is worth
+keeping or whether the gate site needs widening.
+
+**Async/off-thread recording — investigated, NOT pursued (reframed correction).** The
+parallel investigation surfaced that `TraceBackend::record` is ALREADY off-thread via
+`coroBlock(blockingPool, ...)` — what's synchronous is the eval thread's `syncAwait`
+*wait*. Removing the wait (true fire-and-forget recording) is reachable in principle but
+has a `traceId` back-write reconciliation hazard: the recorder writes
+`expr.ensureLazy().traceId` after publish, and a later sibling's prefetch/replay reads
+it. Per perf-lever L-E (cold cost is hash + serialize CPU, not flush I/O — flush is
+already non-fsyncing under WAL+`synchronous=off`), making recording asynchronous would
+not reduce CPU cost; the win would be eval/record overlap, bounded by the single
+`storeMutex_` serialization. Not pursued in this slice.
