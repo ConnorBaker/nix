@@ -2615,3 +2615,56 @@ test (`DrvInput_FlattenSite_ForceVsOutputRead`) is KEPT — its confound-split m
 artifact and a regression guard for the force-of-args attribution. The lesson: a one-variable
 discriminator that actually varies two hidden axes will manufacture a clean-looking but false
 verdict; split every axis before concluding.
+
+### 2026-05-31 follow-up #9: consumer-sharing MEASURED — derivations are 86% singly-consumed → producer-partition direction STOP
+
+`plans/derivation-producer-partition-rfc.md` (the forward design through 18 adversarial
+passes) reduced its blocker to one quantitative go/no-go (RFC §7.7b): how many DISTINCT
+attr-path consumer traces force each producer drvPath? If ~1, the producer-partition design
+adds per-producer overhead (record + edge + routing row) without amortizing, reducing to §3b's
+net loss. RFC §8 step 0 specified measuring this BEFORE any prototype. This is that measurement.
+
+**Instrumentation (measurement-only, env-gated, no behaviour change):**
+`src/libexpr/eval-trace/drv-sharing-probe.{hh,cc}`, gated on `NIX_MEASURE_DRV_SHARING=1`
+(no-op otherwise). A `ConsumerScope` RAII guard in `TracedExpr::evaluateResolvedTarget`
+pushes the consumer's `pathId`; `prim_derivationStrict` calls `recordProducer(drvPath)` which
+accumulates `drvPath → set<consumer pathId>`; dumps a histogram at process exit. Faithfulness
+validated pre-build (pass #18): on the mapAttrs-over-python3Packages workload each package is a
+distinct attr-path consumer trace, so a shared infra derivation forced under many package
+scopes registers many distinct consumers — the infra-sharing signal §7.7b needs. (closures.gnome
+is the WRONG workload — one coarse string-leaf scope — so this is measured on python3Packages.)
+
+**Result (clean run, full `mapAttrs (n: v: v.outPath) python3Packages`, exit 0):**
+
+| metric | value |
+|---|---:|
+| distinct producer drvPaths | 35,383 |
+| mean distinct consumers / producer | **1.33** |
+| singly-consumed (N=1) | **30,409 (85.9%)** |
+| multiply-consumed (N>1) | 4,974 (14.1%) |
+| max consumers for one producer | 135 |
+
+Weighted: of 46,980 (producer,consumer) flatten-pairs, only ~35% are on shared (N>1)
+producers. So under the RFC, ~86% of producers are PURE ADDED COST (producer-trace record +
+consumer edge + routing row vs just the consumer's flattened closure today), while the design
+could collapse at most ~a third of the flattening even granting the heavy tail full weight.
+
+**VERDICT: STOP — the record-time producer-partition direction does not pay off**, on its OWN
+most-favorable workload (python3Packages, the 607×-flattening case; worse on closures.gnome).
+The build-layer "hashDerivationModulo amortizes across hundreds of consumers" analogy does NOT
+lift to eval: derivations are overwhelmingly singly-consumed PER EVAL. The mean of 1.33 is far
+from the N≫1 the design needs. This is the §8-step-0 kill-switch firing as designed —
+empirical, not a soundness failure (soundness was CLOSED).
+
+**Caveat (honest):** the proxy counts distinct consumer pathIds, not closure-byte volume per
+consumer. A few huge-closure shared producers (stdenv at N=135) save disproportionately, so the
+flatten-pair fraction slightly under-credits the tail. But 85.9% singly-consumed dead weight is
+decisive regardless of tail weighting.
+
+**What survives:** ALT-4 (verify-time fragment sharing, RFC §7.8) is NOT killed by this — it
+keeps conservative recording and dedups at verify, so it adds NO per-singly-consumed-producer
+overhead. If the eval-trace perf effort continues, ALT-4 is the better-motivated branch; the
+record-time producer edge is measured not-worth-building. Probe + soundness scaffolding stay in
+tree. Reproduce: `NIX_MEASURE_DRV_SHARING=1 NIX_MEASURE_DRV_SHARING_PATH=/tmp/r.txt nix eval
+--impure --json --expr 'builtins.mapAttrs (n: v: (builtins.tryEval (v.outPath or "")).value)
+(import <nixpkgs> {}).python3Packages'`.

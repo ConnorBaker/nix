@@ -15,6 +15,7 @@
 #include "nix/expr/eval-trace/deps/nix-binding.hh"
 #include "nix/expr/eval-trace/deps/trace-access.hh"
 #include "nix/expr/eval-trace/cache/trace-session.hh"
+#include "nix/expr/eval-trace/drv-sharing-probe.hh"
 #include "nix/expr/eval-trace/deps/dep-capture-scope.hh"
 #include "nix/expr/eval-trace/data/traced-data.hh"
 #include "eval-trace/data/traced-data-nodes.hh"
@@ -1676,6 +1677,17 @@ static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** 
                 (void) session->recordCAProducer(v, drvPathS, innerDeps);
             }
         }
+    }
+
+    // MEASUREMENT-ONLY (RFC §8 step 0; env-gated NIX_MEASURE_DRV_SHARING=1, no-op
+    // otherwise). Independent of the §3b producer path above — runs on the DEFAULT
+    // conservative shape to answer "how many distinct consumer traces force each
+    // producer drvPath?" (§7.7b master go/no-go). Reads the current consumer pathId
+    // set by the ConsumerScope guard in evaluateResolvedTarget.
+    if (eval_trace::drv_sharing_probe::enabled() && v.type() == nAttrs) {
+        if (auto * drvPathAttr = v.attrs()->get(state.s.drvPath))
+            if (drvPathAttr->value->type() == nString)
+                eval_trace::drv_sharing_probe::recordProducer(drvPathAttr->value->string_view());
     }
 }
 

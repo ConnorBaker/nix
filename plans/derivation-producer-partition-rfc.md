@@ -47,17 +47,30 @@ only the current settled state:
   passes #2/#3; design positively confirmed by pass #13/Attack Q — `computeTraceHash`
   is over the dep vector, so `__ignoreNulls`-dropped reads fold in). Routing key is
   `drvPath`, determinate; do NOT fold deps into it (pass #12).
-- **The blocker is PERF, not soundness, and it is UNMEASURED:** (1) the master
-  go/no-go is the consumer-sharing ratio at the args-force boundary (§7.7b) — RP#5
-  measured the as-built gate firing ~0; if sharing is ~1 the design reduces to §3b's
-  net loss; (2) the per-`derivationStrict` sub-scope hot-path cost (§6). Storage drops
-  in aggregate (§6, the 607× is high-N-dominated) but storage-drop ≠ perf-win.
-- **Honest scope:** this is one of (at least) two directions; ALT-4 (verify-time
-  fragment sharing, §7.8) is a real mutually-exclusive alternative, undesigned, and
-  should be prototype-costed against this. This RFC is preferred on MATURITY (reuses
-  proven edge-verify machinery), not proven dominance.
-- **Next step:** §8 step 0 — the cheap kill-switch: instrument the conservative
-  recorder to count distinct consumers per producer drvPath, BEFORE any prototype.
+- **The blocker was PERF, not soundness — and §8 step 0 MEASURED IT: STOP signal
+  (2026-05-31).** The master go/no-go (§7.7b: distinct consumer traces per producer
+  drvPath) was measured on full python3Packages via the `drv-sharing-probe`
+  (`NIX_MEASURE_DRV_SHARING=1`, measurement-only instrumentation). Result over 35,383
+  producers: **mean 1.33 consumers/producer; 85.9% singly-consumed (N=1); only 14.1%
+  shared; max 135.** Weighted: only ~35% of flatten-pairs are on shared producers, so
+  even granting the heavy tail full weight, ~86% of producers would be PURE ADDED COST
+  under the RFC (producer record + edge + routing row vs just the consumer's closure),
+  while the design could collapse at most ~a third of the flattening. The build-layer
+  "amortize across hundreds of consumers" analogy does not hold for eval — derivations
+  are overwhelmingly singly-consumed per eval. **This is the cheap kill-switch firing:
+  the producer-partition direction does not pay off, on its OWN most-favorable
+  workload.** Caveat: the proxy counts distinct consumer pathIds, not closure-byte
+  volume per consumer, so it could under-credit a few huge-closure shared producers
+  (stdenv at N=135); but 86% singly-consumed dead weight is decisive regardless.
+- **Honest scope:** ALT-4 (verify-time fragment sharing, §7.8) remains the
+  un-killed alternative — it does NOT add per-singly-consumed-producer overhead (it
+  keeps conservative recording, dedups at verify), so the 86%-singly-consumed result
+  does NOT kill it the way it kills this RFC. If the direction is pursued further,
+  ALT-4 is now the better-motivated branch.
+- **Status: this RFC's direction is measured NOT-WORTH-PURSUING** as the record-time
+  producer edge. Soundness work + the probe stay in tree as scaffolding; the verdict
+  is empirical, not a soundness failure. See `doc/eval-trace-cache-redesign-plan.md`
+  follow-up #9 for the measurement.
 
 ## 1. Why this is the only remaining shape (the funnel)
 
