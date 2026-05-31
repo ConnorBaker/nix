@@ -66,6 +66,7 @@ Counter nrReplayTotalCalls;
 Counter nrReplayBloomHits;
 Counter nrReplayEpochHits;
 Counter nrReplayAdded;
+Counter nrReplayProducerEdges;
 
 // ── Per-dep-type hash computation timing (microseconds) ─────────────
 Counter nrDepHashContentUs;

@@ -937,6 +937,23 @@ bool TraceRuntime::shouldIsolateSiblingForce(const Value & v) const
 void TraceRuntime::replayMemoizedDeps(const Value & v)
 {
     eval_trace::nrReplayTotalCalls++;
+
+    // RFC §3b producer gate: if `v` was registered as a CA producer (e.g.,
+    // its derivation-strict force opened a producer-trace boundary that
+    // finalized to a CA-keyed trace), emit ONE TraceValueContext edge into
+    // the consumer's recording scope and skip the flatten path entirely.
+    // The gate is INDEPENDENT of `epochMap` — a producer whose deps were
+    // already consumed via outer takeDeps may have no epoch range, but we
+    // still want the edge. See `dep/replay-producer-gate.cc::G4`.
+    if (auto producer = replayStore.lookupProducer(v)) {
+        if (auto access = eval_trace::TraceAccess::current()) {
+            access->record(Dep::makeValueContext(
+                producer->caKey, DepHashValue(producer->traceHash)));
+            eval_trace::nrReplayProducerEdges++;
+            return;
+        }
+    }
+
     auto rangeOpt = replayStore.getReplayRange(v);
     if (!rangeOpt) return;
     eval_trace::nrReplayBloomHits++;

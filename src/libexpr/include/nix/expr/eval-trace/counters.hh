@@ -85,6 +85,10 @@ extern Counter nrReplayTotalCalls;
 extern Counter nrReplayBloomHits;
 extern Counter nrReplayEpochHits;
 extern Counter nrReplayAdded;
+/// RFC §3b: how often the producer-side-table gate fired during a force,
+/// emitting a single TraceValueContext edge instead of flattening the
+/// producer's deps into the consumer scope. Diagnostic only.
+extern Counter nrReplayProducerEdges;
 
 // ── Per-dep-type hash computation timing (microseconds) ─────────────
 extern Counter nrDepHashContentUs;
