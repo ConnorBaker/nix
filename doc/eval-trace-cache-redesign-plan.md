@@ -3298,3 +3298,42 @@ calculation shows the remaining CPU is the deciding margin.
   ~2.7s record cost. The −40% record / −96% flush is real and translates to wall.
 Layer 1 stands: soundness-clean (no drop, byte-identical, cross-process hit preserved), and a
 measured ~9% wall / −40% record / −96% flush win on the producer-record cost.
+
+### 2026-05-31 follow-up #23: adversarial pass on the Layer 1 benchmark — the STAT overstates, the WALL is honest (and confirms the win)
+
+Adversarially re-examined #22's numbers (the user asked specifically to validate the perf claim).
+Found a real measurement-honesty issue in the STATS, resolved by the wall number.
+
+**The stats (`flushUs −96%`, `record.timeUs −40%`) EXCLUDE the teardown flush — they overstate.**
+`maybePrintStats` is called from the CLI command (command.cc:156, nix-build.cc:447, …) which runs
+BEFORE the `EvalState`/`SqliteTraceStorage` destructor. With defer-flush, the buffered producers
+drain in `~SqliteTraceStorage::flushExclusive()` (lifecycle.cc:464) — AFTER stats are captured. So
+the printed `flushUs` = 0.047s is only the residual in-eval flushes; the batched teardown drain of
+~3,201 producers is NOT in that number. Taken alone, `flushUs −96%` is misleading (it moved cost to
+an uncounted teardown, didn't all vanish).
+
+**The WALL number is honest and IS the real win.** Wall time (measured by `date` around the whole
+process, teardown included): OFF 12.11s → ON 10.97s = **−1.14s / −9%**, tight across 3 runs
+(OFF 12.05/12.11/12.12, ON 10.88/11.02/11.00; gap ≫ variance). Crucially, the −1.14s wall ≈ the
+1.086s flushUs drop — so the batched teardown flush (ONE checkpoint+COMMIT draining all 3,201) is
+genuinely ~1.1s cheaper than 3,201 individual checkpoint+COMMIT pairs. The cost was BATCHED-AWAY,
+not hidden — confirmed by wall, not just the stat.
+
+**Corrected Layer 1 claim: ~9% / ~1.1s WALL reduction on cold derivation-dense record** (supersedes
+#22's stat-led "−40% record / −96% flush" framing — those internal timers exclude teardown and
+should not be the headline). The −9% wall is the honest, teardown-inclusive number.
+
+**Scope caveats (also from this pass):**
+- COLD-record win only. Hot re-eval re-runs derivations during materialize, but `recordCAProducer`'s
+  in-session dedup (producerMap hit) skips re-recording, so hot barely hits the flush path — Layer 1
+  is a cold-record optimization, not a hot one. (§3b's 14× hot problem is a DIFFERENT issue —
+  derivation thunks re-running during materialize — that Layer 1 does not address.)
+- Semantics CONFIRMED unchanged (not just benchmarked): byte-identical eval + identical
+  Traces/Sessions row counts (#22 confirming pass) prove `deferFlush` changes WHEN (durability
+  timing), never WHAT (recorded content). Clean-exit teardown always flushes; crash loses buffered
+  producers = future miss, never wrong answer.
+
+**Process note:** this is the recurring lesson again — an internal counter (`flushUs`) gave a
+flattering number that excluded a cost (teardown), and only the end-to-end wall measurement was
+trustworthy. The #22 commit should have led with wall, not the stat. The win is real but ~9%, not
+the ~40% the stat suggested.
