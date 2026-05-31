@@ -47,30 +47,22 @@ only the current settled state:
   passes #2/#3; design positively confirmed by pass #13/Attack Q — `computeTraceHash`
   is over the dep vector, so `__ignoreNulls`-dropped reads fold in). Routing key is
   `drvPath`, determinate; do NOT fold deps into it (pass #12).
-- **The blocker was PERF, not soundness — and §8 step 0 MEASURED IT: STOP signal
-  (2026-05-31).** The master go/no-go (§7.7b: distinct consumer traces per producer
-  drvPath) was measured on full python3Packages via the `drv-sharing-probe`
-  (`NIX_MEASURE_DRV_SHARING=1`, measurement-only instrumentation). Result over 35,383
-  producers: **mean 1.33 consumers/producer; 85.9% singly-consumed (N=1); only 14.1%
-  shared; max 135.** Weighted: only ~35% of flatten-pairs are on shared producers, so
-  even granting the heavy tail full weight, ~86% of producers would be PURE ADDED COST
-  under the RFC (producer record + edge + routing row vs just the consumer's closure),
-  while the design could collapse at most ~a third of the flattening. The build-layer
-  "amortize across hundreds of consumers" analogy does not hold for eval — derivations
-  are overwhelmingly singly-consumed per eval. **This is the cheap kill-switch firing:
-  the producer-partition direction does not pay off, on its OWN most-favorable
-  workload.** Caveat: the proxy counts distinct consumer pathIds, not closure-byte
-  volume per consumer, so it could under-credit a few huge-closure shared producers
-  (stdenv at N=135); but 86% singly-consumed dead weight is decisive regardless.
-- **Honest scope:** ALT-4 (verify-time fragment sharing, §7.8) remains the
-  un-killed alternative — it does NOT add per-singly-consumed-producer overhead (it
-  keeps conservative recording, dedups at verify), so the 86%-singly-consumed result
-  does NOT kill it the way it kills this RFC. If the direction is pursued further,
-  ALT-4 is now the better-motivated branch.
-- **Status: this RFC's direction is measured NOT-WORTH-PURSUING** as the record-time
-  producer edge. Soundness work + the probe stay in tree as scaffolding; the verdict
-  is empirical, not a soundness failure. See `doc/eval-trace-cache-redesign-plan.md`
-  follow-up #9 for the measurement.
+- **The blocker is PERF, not soundness. §8 step 0 was attempted and the first verdict
+  was RETRACTED — the measurement was confounded (2026-05-31).** A probe hooked at
+  `prim_derivationStrict` reported "mean 1.33 consumers/producer, 85.9% singly-consumed
+  → STOP." **That verdict is INVALID.** `prim_derivationStrict` runs ONCE per derivation
+  (thunk memoization); the second+ consumer of a shared derivation gets the
+  already-evaluated Value and never re-runs the primop, so the probe counted only the
+  FIRST forcer of each derivation and was structurally blind to exactly the
+  memoized-thunk sharing the RFC targets. Controlled test: one derivation consumed by
+  three sibling scopes was reported as N=1. The "86% singly-consumed" is a memoization
+  artifact, not a workload property. The faithful site is the per-consumer re-force
+  (`replayMemoizedDeps` epoch-range replay of a memoized derivation-result Value), where
+  the closure actually flattens into each consumer. **Re-measurement is in progress; the
+  go/no-go (§7.7b) is OPEN again, NOT decided.** See `doc/eval-trace-cache-redesign-plan.md`
+  follow-up #9 (the retraction) + #10 (the corrected measurement, when done).
+- **Honest scope:** ALT-4 (verify-time fragment sharing, §7.8) remains a real
+  alternative regardless of how the re-measurement lands.
 
 ## 1. Why this is the only remaining shape (the funnel)
 

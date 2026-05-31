@@ -2616,7 +2616,20 @@ artifact and a regression guard for the force-of-args attribution. The lesson: a
 discriminator that actually varies two hidden axes will manufacture a clean-looking but false
 verdict; split every axis before concluding.
 
-### 2026-05-31 follow-up #9: consumer-sharing MEASURED — derivations are 86% singly-consumed → producer-partition direction STOP
+### 2026-05-31 follow-up #9: consumer-sharing measurement — RETRACTED (confounded by thunk memoization)
+
+> **RETRACTED 2026-05-31 — see follow-up #10 for the corrected measurement.** The probe below
+> hooked `prim_derivationStrict`, which runs ONCE per derivation (thunk memoization). The 2nd+
+> consumer of a shared derivation gets the already-evaluated Value and never re-runs the primop,
+> so the probe recorded only the FIRST forcer of each derivation and was BLIND to the
+> memoized-thunk sharing the RFC targets — exactly the 607× shared-closure case. Controlled test:
+> one derivation consumed by three sibling scopes (`{a=d.outPath; b=d.outPath; c=d.drvPath;}`) was
+> reported as N=1. So "85.9% singly-consumed → STOP" is a MEASUREMENT ARTIFACT, not a workload
+> property; the verdict is INVALID. The faithful site is the per-consumer re-force
+> (`replayMemoizedDeps` epoch-range replay of a memoized derivation-result Value). The §7.7b
+> go/no-go is OPEN again. Original (wrong) write-up retained below for the audit trail — DO NOT
+> CITE its numbers. Same confound class as #7 (a clean-looking metric that measures the wrong
+> event); the lesson recurs: validate the probe against a controlled case BEFORE trusting it.
 
 `plans/derivation-producer-partition-rfc.md` (the forward design through 18 adversarial
 passes) reduced its blocker to one quantitative go/no-go (RFC §7.7b): how many DISTINCT
