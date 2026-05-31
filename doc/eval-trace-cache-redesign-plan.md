@@ -2511,3 +2511,48 @@ cost/benefit is unmeasured." That is a prototype-sized question (the same shape 
 is the reason the as-built gate fires ~0; it does not apply to the *string-context* channel, which
 is the correct next thing to prototype. Soundness floor unchanged
 (`derivation-edge-soundness.cc` + `derivation-observation-facets.cc` already pin the contract).
+
+### 2026-05-31 follow-up #7: flatten-site discriminator MEASURED — confirms the coercion hook is flatten-replacing, not additive
+
+Before trusting #6, an adversarial pass raised the make-or-break objection: #6 wants to hook
+the output-string read (`coerceToContextObject`/`copyContext`) to emit an edge *instead of*
+flattening. But if the shared input `FileBytes` flattens into the consumer at FORCE of the
+derivation attrset (the RFC §1 "primop has no sub-scope, input-reads land in the consumer's
+scope" mechanism), then the coercion hook fires DOWNSTREAM of where the FileBytes was already
+copied — additive again, and #6 would be wrong in the same way #5's value-channel gate is.
+
+Settled by measurement, not argument — a new discriminator test
+(`store/derivation-input-flattening.cc::DrvInput_FlattenSite_ForceVsOutputRead`, real evaluator,
+committed). Three sibling consumers over the SAME shared-input derivation `d`:
+
+| consumer | expression | forces `d`? | reads output string? | recorded `FileBytes`? | recorded `.drv`? |
+|---|---|:---:|:---:|:---:|:---:|
+| cx | `d.outPath` | yes | yes (output) | **1** | 1 |
+| cy | `d.drvPath` | yes | yes (drvPath) | **1** | 1 |
+| cz | `builtins.attrNames d` | yes | **no** | **0** | **0** |
+
+`cz` forces the derivation (adversarially confirmed: `attrnames` and `outpath` both evaluate
+14 thunks — `derivationStrict` ran in both; the cz trace exists, it just carries no leaf obs) but
+reads NO output string, and carries **neither** the input `FileBytes` **nor** the `.drv` dep. The
+shared `FileBytes` lands in a consumer's trace **only when it reads an output string**.
+
+**Verdict: the flatten is output-read-driven, NOT force-driven.** This is the opposite of the
+adversarial worry and it CONFIRMS #6's hook placement: `coerceToContextObject`/`copyContext` is
+exactly where the input observation enters the consumer's recording scope, so an edge emitted
+there is **flatten-replacing, not additive**. (It also corrects a latent assumption from the RFC
+§1 framing — forcing the derivation attrset does not itself flatten the input closure into the
+consumer; the flattening is attached to consuming the output string's context, not to the force.)
+
+**What's now settled vs still open for the prototype:**
+- SETTLED: identity exists on the consumed string (#6); the flatten site is the output-string
+  coercion, reachable and flatten-replacing (#7); the facet gate is mechanically checkable
+  (`derivation-observation-facets.cc`); soundness floor pinned (`derivation-edge-soundness.cc`,
+  `ca-trace-key-routing.cc`).
+- STILL OPEN (the genuine go/no-go, needs the prototype): (1) is `TraceAccess::current()` live at
+  the coercion site during cold recording? (2) the per-read context-inspection cost on the hot
+  coercion path vs the flattening it removes — the same vptr-in-hot-loop hazard, UNMEASURED;
+  (3) the edge must remain additive to any *non-output* facet dep the same consumer records.
+
+The blocker for §3b is now precisely located and is prototype-sized, not RFC-scale: a
+recording-side edge at the string-coercion boundary, gated by the output-only facet rule, whose
+hot-path cost is the one unmeasured number that decides it.

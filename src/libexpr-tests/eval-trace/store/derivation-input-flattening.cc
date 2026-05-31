@@ -98,6 +98,72 @@ TEST_F(MaterializationDepTest, DrvInputFile_ConsumedByOutPath_FlattenOrEdge)
         << "cy must carry SOME dep tying it to the derivation\n" << dumpDeps(cyDeps);
 }
 
+// DISCRIMINATOR (2026-05-31, follow-up #6 feasibility): WHERE does the shared
+// input FileBytes flatten into a consumer — at the OUTPUT-STRING read
+// (.outPath / .drvPath, the coerceToContextObject site #6 proposes hooking),
+// or at FORCE of the derivation attrset (replayMemoizedDeps, decoupled from any
+// output read)?
+//
+// Three sibling consumers over the SAME shared-input derivation `d`:
+//   cx = d.outPath           -- reads an output string (DrvDeep/Built context)
+//   cy = d.drvPath           -- reads the drv string (different output, context)
+//   cz = builtins.attrNames d -- FORCES d, reads NO output string at all
+//
+// If cz (no output-string read) STILL carries the shared FileBytes, the flatten
+// happened at FORCE time, decoupled from the output read. Then a coerceToContextObject
+// hook (#6) fires DOWNSTREAM of where the FileBytes was already copied into the
+// consumer scope — i.e. the edge would be ADDITIVE, not flatten-replacing, and
+// #6's "prototype-sized re-key at the coercion boundary" is WRONG. Conversely, if
+// cz does NOT carry FileBytes but cx/cy do, the flatten is tied to the output-string
+// observation and the coercion hook is correctly placed.
+//
+// Characterization: logs the per-consumer shape (the finding), asserts only the
+// weakest true fact, like the sibling test above.
+TEST_F(MaterializationDepTest, DrvInput_FlattenSite_ForceVsOutputRead)
+{
+    TempTextFile shared("payload-v1");
+    auto expr = std::format(
+        R"(let
+             content = builtins.readFile {0};
+             d = derivation {{
+               name = "p";
+               builder = "/bin/sh";
+               system = builtins.currentSystem;
+               args = [ content ];
+             }};
+           in {{ cx = d.outPath; cy = d.drvPath; cz = builtins.attrNames d; }})",
+        shared.path.string());
+
+    {
+        auto cache = makeCache(expr);
+        auto root = forceRoot(*cache);
+        state.forceAttrs(root, noPos, "test");
+        for (auto * name : {"cx", "cy", "cz"}) {
+            auto * a = root.attrs()->get(state.symbols.create(name));
+            ASSERT_NE(a, nullptr);
+            state.forceValue(*a->value, noPos);
+        }
+    }
+
+    auto fileName = std::string(shared.path.filename());
+    for (auto * name : {"cx", "cy", "cz"}) {
+        auto deps = getStoredDeps(name);
+        bool hasFile = hasDep(deps, CanonicalQueryKind::FileBytes, fileName);
+        bool hasDrv = countDepsByType(deps, CanonicalQueryKind::StorePathAvailability) >= 1;
+        GTEST_LOG_(INFO) << name << " deps (hasFile=" << hasFile
+                         << " hasDrv=" << hasDrv << "):\n" << dumpDeps(deps);
+    }
+
+    // FLATTEN-SITE VERDICT is in the logs above. cz = attrNames d forces the
+    // derivation WITHOUT reading any output string; if cz.hasFile is true the
+    // flatten is force-driven (coercion hook would be downstream/additive).
+    auto czDeps = getStoredDeps("cz");
+    GTEST_LOG_(INFO) << "FLATTEN-SITE VERDICT: cz(attrNames, no output read) hasFile="
+                     << hasDep(czDeps, CanonicalQueryKind::FileBytes, fileName)
+                     << " — if 1, flatten is FORCE-driven, coercion hook (#6) is downstream/additive.";
+    SUCCEED();
+}
+
 // Soundness anchor regardless of flatten-vs-edge: changing the derivation's input
 // file MUST invalidate a consumer of its outPath (drvPath is input-addressed).
 // This is the property the RFC's edge must preserve; if it already holds via
