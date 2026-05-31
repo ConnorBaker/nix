@@ -3023,3 +3023,28 @@ gated on async/batched producer recording. The hedge stands; no correction.
 Net of this pass: ~63% confirmed (not corrected); one structural insight added (cross-derivation
 leaf overlap, 2.7 vs 16.4). The benefit/cost numbers are stable. Remaining genuine unknown is
 unchanged: the record-cost-vs-verify-savings net, gated on async recording (not built).
+
+### 2026-05-31 follow-up #17: adversarial pass — remove the cost-prototype footgun; cross-follow-up consistency confirmed
+
+Next mandated pass, on the prototype CODE disposition + numeric consistency.
+
+**Attack 5 (acted on): removed the `NIX_PROTOTYPE_DRV_SUBSCOPE=cost` hot-path branch.** It was
+env-gated but NOT soundness-neutral — it discarded the sub-scope's deps, so an enabled run loses
+the consumer's derivation deps and could stale-serve. That is the same misleading-instrumentation
+risk that got the `drv-sharing-probe` removed (#9). Its number (~11%, #14) is recorded; the code
+is not kept. The `drv-benefit-probe` STAYS — it is measurement-only AND soundness-neutral
+(reads the range, changes nothing), validated against controlled cases, and reproducible.
+(Also dropped the now-unused `finally.hh` include.) Build clean; 5 derivation/flattening tests pass.
+
+**Attack 6 (consistency, confirmed): the numbers agree across #11–#16.** #11 (consumers-per-
+derivation ~200–2,000) and #15 (derivations-per-consumer ~1,213) are two views of the same
+13.4M (derivation,consumer) incidence total: distinct-derivations = 13.4M / [200..2000] ≈
+6.7K–67K, matching #11's independently-bounded 6.4K–60K. No inconsistency.
+
+**Final measured picture (stable across the last 3 passes):**
+- Benefit: **~63%** per-consumer dep reduction (3,296 → ~1,213 edges), + separate producer-closure
+  storage dedup. Floor 37% (SPA-only); the "~99%" was retracted (#15). Bounded by
+  distinct-derivations-per-consumer; tempered by heavy cross-derivation leaf overlap (#16).
+- Cost: **≥11%** scope-structural (lower bound; real adds §3b producer-recordSync); python3Packages,
+  not Ledger-D (gap noted #15 Attack 1).
+- Net win gated on producer-record cost (async/batched — §3b condition a, unbuilt).

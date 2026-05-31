@@ -16,7 +16,6 @@
 #include "nix/expr/eval-trace/deps/trace-access.hh"
 #include "nix/expr/eval-trace/cache/trace-session.hh"
 #include "nix/expr/eval-trace/drv-benefit-probe.hh"
-#include "nix/util/finally.hh"
 #include "nix/expr/eval-trace/deps/dep-capture-scope.hh"
 #include "nix/expr/eval-trace/data/traced-data.hh"
 #include "eval-trace/data/traced-data-nodes.hh"
@@ -1606,33 +1605,15 @@ static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** 
     uint32_t epochStart = (registerProducer || measureBenefit)
         ? state.traceCtx->currentReplayEpochSize() : 0;
 
-    // PROTOTYPE/MEASUREMENT-ONLY (RFC §8 step 3 hot-path COST; env-gated, no-op
-    // otherwise). Opens the per-derivation dep-capture sub-scope the AGGRESSIVE shape
-    // requires (the vptr-in-hot-loop hazard the RFC flags), to MEASURE its STRUCTURAL
-    // cost (scope ctor + push + accumulate-into-sub + take + dtor) per derivationStrict.
-    //
-    // CRITICAL (corrected after a re-record proxy gave a 23× artifact, follow-up #14):
-    // we do NOT re-record the taken deps into the consumer. The original re-record-N
-    // proxy was O(closure) per derivation (and quadratic under nesting — a top-level
-    // derivation re-recorded its whole ~10K-dep closure), which measured the PROXY's
-    // cost, not the design's. The real aggressive shape emits ONE edge (O(1)), not N
-    // re-records. So here we measure ONLY the scope structural cost and DISCARD the
-    // sub-scope deps. CONSEQUENCE: this mode is NOT soundness-neutral (the consumer
-    // loses the derivation's deps) — it is a COST microbenchmark ONLY, never for
-    // correctness. NIX_PROTOTYPE_DRV_SUBSCOPE=cost selects it explicitly.
-    static const std::string subscopeMode =
-        getEnv("NIX_PROTOTYPE_DRV_SUBSCOPE").value_or("");
-    std::optional<eval_trace::DepCaptureScope> protoSub;
-    if (subscopeMode == "cost" && session && state.traceCtx) {
-        protoSub.emplace(state.tracingPools(), session->registry());
-    }
-    Finally restoreProtoSub([&] {
-        if (protoSub) {
-            // Take + discard: measures scope structural cost only (NOT O(N) re-record).
-            (void) protoSub->finalizeAndTakeDeps();
-            protoSub.reset();
-        }
-    });
+    // NOTE (RFC §8 step 3 hot-path COST — measured, prototype REMOVED): the
+    // per-derivation sub-scope cost was measured at ~11% scope-structural on
+    // python3Packages (redesign-plan follow-up #14). The throwaway
+    // `NIX_PROTOTYPE_DRV_SUBSCOPE=cost` branch that produced that number was REMOVED
+    // (adversarial pass, follow-up #17): it was env-gated but NOT soundness-neutral
+    // (it discarded the sub-scope's deps, so the consumer lost them) — a footgun if
+    // enabled expecting correctness, the same misleading-instrumentation risk that
+    // got the drv-sharing-probe removed. The measurement is recorded; the code is not
+    // kept. (The drv-benefit-probe stays — it IS measurement-only + soundness-neutral.)
 
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.derivationStrict");
 
