@@ -3237,3 +3237,13 @@ blob effects. The RATIO M≈1 is the load-bearing number and it is solid.
 So the direction is: **verify-side is now a measured win; the remaining gate is purely the
 producer-RECORD cost** (§3b's dominant term), settled only by building async recording. The
 benefit case is materially stronger than #19/#20 left it (verify win confirmed, not just storage).
+
+**Confirming-pass addendum to #21 (both attacks reinforce the WIN):**
+- *Producer size (Attack 17, resolved in code):* a memo-HIT edge is `traceContextMemo.find` →
+  return cached hash (verifier.cc:255-258) — O(1) in the producer's closure size. So M≈1 holds for
+  REAL producers (mean 16.4 own-deps, nested up to ~10K), not just the microbench's 1-dep producers.
+- *Kind representativeness (Attack 16, makes M≈1 conservative):* the flat baseline is all-FileBytes;
+  real consumers are mixed-kind (StructProj 46%, SPA 37%...). If StructProj verify costs MORE than
+  FileBytes, real flat per-dep is costlier → real M < 1 → the verify win is STRONGER. So M≈1 is an
+  edge-UNFAVORABLE estimate; it cannot flip the WIN verdict, only improve it.
+The verify-gate = WIN verdict is robust to both.
