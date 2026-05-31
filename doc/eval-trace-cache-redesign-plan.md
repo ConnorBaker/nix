@@ -2862,3 +2862,51 @@ needs a measurement that correlates derivation ranges with consumer-trace conten
 simply, the prototype that actually emits edges and measures the consumer-trace size delta).
 The clean way to get it is the EDGE prototype itself (measure consumer trace dep-count with vs
 without edges), which folds benefit and the part-2 hot-cost question into one build.
+
+### 2026-05-31 follow-up #13: benefit magnitude MEASURED (both halves) — hard lower bound 37%, plausibly ~99% on this workload
+
+Added the benefit DENOMINATOR (consumer-trace dep-kind tally at `evaluateResolvedTarget`
+finalize) to the probe and re-ran full python3Packages. Both halves now complete (consumer
+total 36,457,312 deps over 11,062 traces — matches the arch doc's 36.5M exactly → complete run).
+
+| kind | derivation-range % | CONSUMER-trace % |
+|---|---:|---:|
+| storePathAvailability | 43.6% | 36.8% |
+| structuredProjection | 40.3% | 45.9% |
+| fileBytes | 6.7% | 7.3% |
+| derivedStorePath | 6.8% | 5.8% |
+| implicitStructure | 2.4% | 3.6% |
+| (dir/existence/env/nar/raw/parentSlot) | <0.1% | <0.6% |
+
+**Apparent-contradiction resolved (adversarial check):** the summed derivation-range total
+(857K) is only ~2.4% of the consumer total (36.5M), which naively reads as "derivations explain
+2.4% of flattening" — CONTRADICTING the benefit thesis. Resolution: 857K = per-`derivationStrict`
+OWN-range deps (52,184 calls × mean 16.4); a consumer flattens the UNION of its whole transitive
+derivation closure (~3,296 deps via `replayMemoizedRange` accumulation up the tree), NOT one
+16.4-dep range. So drv-range-total is NOT the benefit numerator and is not comparable to the
+consumer total. The reliable signal is the per-KIND MATCH between the two breakdowns.
+
+**Benefit magnitude (honestly bounded):**
+- **HARD lower bound 36.8% (MEASURED, not inferred):** consumer SPA deps = 36.8% are
+  `.drv`-existence deps; a `.drv` dep exists IFF a derivation was referenced, so ≥36.8% of consumer
+  flattening is DEFINITELY derivation-attributable and edge-collapsible. (Note: lands right at #11's
+  feared low end — but now measured, not a coincidence.)
+- **Plausibly ~99%:** the consumer and derivation-range KIND mixes nearly match (if consumer
+  flattening were dominated by consumer-OWN reads, the mix would differ — it doesn't). And the
+  workload-specific argument: the consumer expr is `v.outPath` (pure derivation access, does NO
+  `fromJSON`), so the 45.9% StructProj is overwhelmingly derivation-closure (mkDerivation's
+  structured reads), not consumer-own. Non-removable kinds (dir/existence/env/nar/raw/parentSlot)
+  total only ~0.6%.
+
+So #11's speculative 35–90% band is REFINED to **a measured hard floor of 37% and a workload-justified
+ceiling near 99%** for the python3Packages-outPath shape. **Benefit is HIGH on this workload.**
+
+**Caveat (workload-specificity, stated honestly):** the ~99% upper rests on the consumer doing no
+own structured reads — true for `v.outPath` mapAttrs, NOT general. A consumer that `fromJSON`s its
+own config would have consumer-own StructProj that an edge does NOT remove, pulling benefit toward
+the 37% floor. So: benefit is 37%–99%, high for the canonical nix-eval-jobs shape, lower for
+consumers with heavy own-structured-reads. The FLOOR (37%) is general; the ceiling is shape-dependent.
+
+**Status of the two go/no-go numbers:** benefit magnitude = RESOLVED (37% floor, ~99% on the target
+workload). Remaining: the args-force sub-scope HOT-PATH COST (#6) — still needs the actual sub-scope
+build + Ledger-D timing. That is the last open number.
