@@ -135,10 +135,13 @@ Concretely, the producer-trace boundary becomes:
    and verified recursively + memoized by `resolveTraceContextHash`
    (verifier.cc:243-278).
 
-The key insight vs §3a/§3b: **`drvPath` is the routing/dedup key; the
-`trace_hash` over the recorded sub-scope deps is the verification key.** §3b
-conflated them by assuming drvPath-identity implies dep-set-identity. §2's
-reproducer shows it doesn't. Decoupling routing from verification is the fix.
+The key insight vs §3a/§3b: **a content-addressed routing/dedup key (derived from
+at least `drvPath` — exact granularity is a measured tuning parameter, see the
+key-granularity note below) is SEPARATE from the verification key, which is the
+`trace_hash` over the recorded sub-scope deps.** §3b conflated them by assuming
+drvPath-identity implies dep-set-identity. §2's reproducer shows it doesn't.
+Decoupling routing from verification is the fix; the routing granularity itself is
+a precision-vs-storage knob that does not affect soundness.
 
 **Why decoupling is sound — the compare is stored-vs-recomputed (verified, adversarial pass #1 Attack C).**
 The consumer's edge is a `TraceValueContext` dep whose stored hash is the producer
@@ -200,6 +203,26 @@ dep set into the interned `__ca:` name (`internName` accepts arbitrary strings,
 RFC §3a), so `aaa` and `bbb` route to distinct CurrentNode rows and neither
 over-invalidates the other. This trades a small key-space increase for precision;
 it does not affect soundness either way. Open item §7.6.
+
+> **Three-way key-granularity tension (adversarial pass #7, Attack L — reconciling
+> §3 vs §3b vs §6).** Three forces pull the routing-key granularity in conflicting
+> directions, and they must be decided together, not in isolation:
+> - §3's stated insight wants `drvPath` as the routing key (coarse) so the
+>   verification/routing decoupling is clean.
+> - §3b/§7.6's Attack-D mitigation wants `H(drvPath, dep-set-digest)` (fine) to stop
+>   same-drvPath producers from over-invalidating each other.
+> - §6's storage win wants the COARSEST key that still dedups (fewer producer rows).
+> These are not independent knobs: a finer key reduces aliasing (precision↑) but
+> reduces cross-dep-set dedup (storage↓) and adds routing rows. The resolution is
+> that **soundness is invariant under ALL of them** (verification is by recomputed
+> `trace_hash` regardless of routing granularity — §3/Attack C), so the key
+> granularity is a pure PRECISION-vs-STORAGE tuning choice to be made FROM
+> MEASUREMENT (§7.6 aliasing frequency + §7.7 sharing), not fixed in the design.
+> The RFC therefore specifies "route by some content-addressed key derived from at
+> least drvPath; the exact granularity is a measured tuning parameter," and drops
+> the earlier unqualified "drvPath is THE routing key" as over-specified. Default to
+> drvPath-only (coarsest, best dedup) and refine to fold in a dep-set digest only if
+> §7.6 measures aliasing to matter.
 
 ## 4. What this buys (the benefit §3b couldn't deliver)
 
@@ -303,10 +326,15 @@ signal the observation was not output-only).
    alone loses this read. Still unverified FOR the isolation path (no prototype yet)
    — verified for the conservative path by construction + this test.
 2. **Does the sub-scope actually capture the dropped-attr read?** §3 assumes the
-   forced-then-dropped value's dep lands in the producer sub-scope. Must verify the
-   `__ignoreNulls` force at primops.cc:1796 happens AFTER the sub-scope is pushed
-   and that its dep isn't diverted (e.g., by a `PublicationWarmupScope` or
-   replay-publish path). UNVERIFIED.
+   forced-then-dropped value's dep lands in the producer sub-scope. PARTIALLY VERIFIED
+   by inspection (pass #7, Attack K): nothing between `prim_derivationStrict` entry
+   and the `__ignoreNulls` force (primops.cc:1602 `forceAttrs` → :1796 per-attr force)
+   pushes or swaps a recording scope, so a sub-scope pushed at primop entry WOULD be
+   the active scope at the force, and reads route to it. RESIDUAL (needs the
+   prototype): whether `forceValue`'s internal machinery (`PublicationWarmupScope`,
+   the replay-publish path in `forceThunkValue`) diverts the dep to a different scope
+   for the specific values forced here. Inspectable structurally but cleanest to
+   confirm with the throwaway prototype's counters.
 3. **Deps forced inside the sub-scope that aren't producer-intrinsic — RESOLVED to
    PRECISION, not soundness (pass #2 Attack F + pass #3 Attacks G/H).**
    CORRECTION to an earlier draft assumption: the arg attrset is NOT WHNF before
