@@ -528,18 +528,39 @@ signal the observation was not output-only).
 
 ## 8. Recommended sequence (each gated by the standing soundness suite)
 
-0. **CHEAPEST KILL-SWITCH FIRST (§7.7):** instrument the conservative-shape recorder
-   to count distinct consumers per producer drvPath on Ledger-D + python3Packages.
-   No isolation, no new scope — just a counter. If the ratio is ~1 (derivations
-   predominantly singly-consumed per eval), STOP: the design adds storage and never
-   amortizes (Attack J), reducing to §3b's net loss. This gates everything below.
+0. **CHEAPEST KILL-SWITCH FIRST (§7.7) — but on the RIGHT workload, with the RIGHT
+   metric (corrected by a pre-build adversarial check, pass #18).**
+   WORKLOAD: measure on **python3Packages, NOT Ledger-D/closures.gnome.** closures.gnome
+   is a single coarse string-leaf trace (~6,419 derivations forced inside ONE
+   `evaluateResolvedTarget` scope, RP#8), so "distinct consumer traces per drvPath"
+   reads ~1 there as a SHAPE ARTIFACT, not evidence of no sharing — and closures.gnome's
+   cost is outlier re-eval, not flattening anyway. The 607× flattening this RFC targets
+   is a python3Packages phenomenon (~10K distinct attr-path traces each flattening shared
+   stdenv); that is where the metric is meaningful.
+   METRIC PITFALL: "the DepCaptureScope active at `derivationStrict`" is NOT a faithful
+   consumer identity by itself — the active scope can be one coarse leaf even when many
+   logical consumers share a producer (the same conflation that made closures.gnome
+   misleading, applied per-package). The faithful metric is "how many distinct attr-path
+   CONSUMER TRACES have the derivation's closure flattened into them," which is NOT
+   recoverable from the unmodified recorder (flattened deps carry no source-derivation
+   tag). So step 0 needs EITHER (a) source-tagging flattened deps with their producing
+   drvPath (more instrumentation than "just a counter"), OR (b) a proxy: count, per
+   drvPath, the distinct attr-path TracedExpr scopes whose `evaluateResolvedTarget`
+   transitively triggered that `derivationStrict` — which requires threading the
+   current-consumer-pathId and is only faithful if derivations are forced under their
+   consuming package's child scope (must verify, not assume). Either way step 0 is
+   "small measurement-only instrumentation," NOT "just a counter" as earlier drafts
+   said. If the faithful sharing ratio is ~1, STOP. This gates everything below.
 1. Land the §7.1 red test — DONE (`DrvIgnoreNullsDroppedRead_ChangeInvalidatesConsumer`).
 2. Answer §7.2 (does the dropped read land in the sub-scope?) by characterization
    test — pure measurement, no production change.
-3. ONLY if 0 shows N>1 sharing AND 2 confirms capture: throwaway prototype of the
-   sub-scope + trace_hash-keyed producer + consumer edge, behind an env gate,
-   default-off. Measure §6/§7.4 hot-path cost + §7.6 aliasing frequency on Ledger-D.
-   Go/no-go.
+3. ONLY if 0 shows N>1 sharing (on python3Packages) AND 2 confirms capture: throwaway
+   prototype of the sub-scope + trace_hash-keyed producer + consumer edge, behind an
+   env gate, default-off. Measure the §6/§7.4 hot-path COST on Ledger-D/closures.gnome
+   (the established hot anchor — the sub-scope-per-derivationStrict overhead shows up
+   there regardless of sharing) AND the net win on python3Packages (where the sharing
+   benefit, if any, materializes). §7.6 aliasing frequency is almost certainly
+   negligible (pass #12) — measure only if cheap. Go/no-go.
 4. If go: wire the facet gate (§5, respecting the §5 removeAttrs caveat), keep the
    §7.1 red test green, run the full suite + byte-identical gate, and only then
    consider default-on.
