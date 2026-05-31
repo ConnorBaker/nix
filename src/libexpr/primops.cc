@@ -1620,20 +1620,31 @@ static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** 
     }
 
     // RFC §3b producer-boundary finalize. Captures the epoch-log range that
-    // grew during this derivationStrict call (= the producer's deps) without
-    // isolating them from the consumer scope. Persists as a CA-keyed
+    // grew during this derivationStrict call as the producer trace's deps,
+    // without isolating them from the consumer scope. Persists as a CA-keyed
     // producer trace for sibling-share amortization. Soundness is preserved
     // unconditionally because the consumer's scope still carries the
     // flattened deps (RFC §3b conservative shape — see ctor comment).
+    //
+    // The captured range is a SUPERSET of A's own input-reads: it also
+    // includes any nested `derivationStrict` calls' deps (transitive
+    // producers' inputs) and warm-hit `replayMemoizedDeps` copies that
+    // fired in this window. Conservative/sound — the producer trace
+    // verifies against the live filesystem, so a superset can only
+    // over-invalidate (drop a cache hit), never stale-serve. Tightening to
+    // a producer-only range would require sub-scope isolation, which was
+    // tried and reverted (under-records ambient-eval deps that consumers
+    // legitimately need).
     if (registerProducer && v.type() == nAttrs) {
         if (auto * drvPathAttr = v.attrs()->get(state.s.drvPath)) {
             if (drvPathAttr->value->type() == nString) {
                 std::string_view drvPathS = drvPathAttr->value->string_view();
-
-                // Snapshot the epoch range [epochStart, currentSize) — these
-                // are the deps recorded during this derivationStrict call.
                 uint32_t epochEnd = state.traceCtx->currentReplayEpochSize();
                 auto innerDeps = state.traceCtx->snapshotEpochRange(epochStart, epochEnd);
+                // Silent failure (returns false) is by design: when no
+                // backend is bound (--no-eval-trace, session released),
+                // recording is a no-op and the conservative consumer scope
+                // already preserves soundness. No fatal-error path.
                 (void) session->recordCAProducer(v, drvPathS, innerDeps);
             }
         }

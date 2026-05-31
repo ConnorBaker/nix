@@ -60,6 +60,23 @@ struct MemoReplayStore {
         traceable_allocator<std::pair<const Value * const, ProducerEntry>>>
         producerMap;
 
+    /// Pointer bloom for fast-rejecting `lookupProducer` calls on the hot
+    /// `replayMemoizedDeps` path. Sized for ~thousands of producers (one
+    /// per `derivationStrict` call); 64K slots × 4 hashes ≈ 8 KB and gives
+    /// a vanishing false-positive rate for the expected population.
+    /// Without this, every replayMemoizedDeps call (~22M on closures.gnome)
+    /// pays a full `unordered_flat_map::find` — a measurable hot-path cost
+    /// even when the map is non-empty but rarely matches `&v`.
+    PointerBloomFilter<1 << 16, 4> producerBloom;
+
+    /// Reset the per-replay state (epoch index + bloom). Called from
+    /// `rollbackEpoch` when the epoch log is fully unwound, and from the
+    /// `_ForTest` access shim. Deliberately does NOT touch `producerMap`:
+    /// producer bindings (RFC §3b) are scoped to the trace-runtime's
+    /// lifetime, not to a single replay window. Clearing them on a
+    /// rollback-empty path would erase legitimate producer registrations
+    /// from earlier successful `derivationStrict` calls. Tests that need
+    /// producerMap reset call `clearProducerMap` explicitly.
     void clearReplayIndex()
     {
         epochMap.clear();
@@ -67,10 +84,14 @@ struct MemoReplayStore {
         replayBloom.reset();
     }
 
+    /// Reset the producer side-table. Called from `clear()` (full lifecycle
+    /// reset) and from test fixtures that need a fresh slate per-test.
+    /// NOT called from `clearReplayIndex` — see that method's comment.
     void clearProducerMap()
     {
         producerMap.clear();
         producerMap.rehash(0);
+        producerBloom.reset();
     }
 
     void clear()
@@ -132,6 +153,21 @@ struct MemoReplayStore {
         }
     }
 
+    /// Rollback the epoch log to `epochStart`, dropping any `epochMap` entries
+    /// whose ranges fall in (or cross) the rolled-back region. Called from
+    /// exception-unwind paths (e.g., `tryEval`-swallowed errors).
+    ///
+    /// Intentional asymmetry vs `producerMap`: rollback does NOT scrub
+    /// producer bindings. The §3b producer-trace hook in
+    /// `prim_derivationStrict` registers a producer only AFTER
+    /// `derivationStrictInternal` returns successfully (the catch block
+    /// re-throws without registering). So a rolled-back force never had a
+    /// producer registration to scrub, and the rollback path can't reach
+    /// stale bindings. If a future caller registers a producer BEFORE its
+    /// success-or-throw decision is final, this asymmetry must be revisited
+    /// — the rollback would need to scrub `producerMap` entries whose
+    /// epoch-range falls in the rolled-back region (analogous to BUG-8 for
+    /// the epoch log itself).
     void rollbackEpoch(uint32_t epochStart)
     {
         if (epochStart >= epochLog_.size())
@@ -171,10 +207,19 @@ struct MemoReplayStore {
     void registerProducer(const Value & v, AttrPathId caKey, DepHash traceHash)
     {
         producerMap.insert_or_assign(&v, ProducerEntry{caKey, traceHash});
+        producerBloom.set(&v);
     }
 
+    /// Hot-path call site: `replayMemoizedDeps` invokes `lookupProducer`
+    /// before its bloom-gated `getReplayRange`. closures.gnome fires
+    /// `replayMemoizedDeps` ~22M times across ~thousands of registered
+    /// producers; the bloom rejects ~all non-producer Values without paying
+    /// the `unordered_flat_map::find` cost. Mirror's `getReplayRange`'s
+    /// `replayBloom` discipline.
     std::optional<ProducerEntry> lookupProducer(const Value & v) const
     {
+        if (!producerBloom.test(&v)) [[likely]]
+            return {};
         auto it = producerMap.find(&v);
         if (it == producerMap.end())
             return {};

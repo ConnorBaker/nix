@@ -50,9 +50,21 @@ static AttrPathId caKey(AttrVocabStore & vocab, std::string_view drvHash)
 
 // ── S1: open scope, finalize as CA producer, register in producerMap ────────
 //
-// This is the PROTOTYPE the §3b production helper grows from. Currently
-// expressed inline; once the test passes it will move into a reusable
-// `CAProducerScope` class in production code.
+// This test pins the AGGRESSIVE-shape composition: a nested DepCaptureScope
+// captures the producer's input-reads in isolation, the producer trace
+// persists those isolated deps, and the consumer scope holds own + edge
+// (NOT the flattened producer deps). This shape was tried in production
+// (`prim_derivationStrict` with sub-scope isolation) and REVERTED —
+// the `forceAttrs(*args[0])` inside derivationStrict pulls in ambient-
+// eval deps that legitimately belong to the consumer, and isolating them
+// under-records. Production today uses the conservative shape (epoch-
+// range snapshot WITHOUT isolation; consumer keeps its flattened deps).
+//
+// S1 is retained as a regression guard for the recording-side primitives:
+// `pushScope`/`takeDeps`/`registerProducer`/`recordSync` compose cleanly
+// when the caller chooses to isolate. If a future caller needs aggressive
+// shape (e.g., an alternative producer hook with stronger isolation
+// guarantees), this test pins that the primitives support it.
 
 TEST_F(TraceStoreTest, CAProducerScope_OpenFinalizeRegister_RoundTrips)
 {
