@@ -307,6 +307,11 @@ cost is the blocker. Re-enabling becomes attractive when one or more of:
 - Test guide: `src/libexpr-tests/eval-trace/CLAUDE.md` `dep/` section.
 - Bench data + adversarial-fix narrative: `doc/eval-trace-cache-redesign-plan.md`
   "2026-05-31 follow-up #4"; sibling-workload falsification + keying-split root
-  cause in "2026-05-31 follow-up #5".
+  cause in "follow-up #5". Follow-ups #6/#7 explored a string-coercion re-keying
+  and were RETRACTED by "follow-up #8" (confounded discriminator; the flatten is
+  force-of-args-driven, so the coercion hook is additive — the edge-replaces-flatten
+  site is the already-reverted aggressive shape). Net verdict stands at #5/#8:
+  RFC-scale (partition producer input-reads from ambient consumer deps at record
+  time), not a prototype coercion hook.
 - Architectural backstory: `plans/architecture-trace-model-vs-CA.md`,
   `plans/compositional-trace-dag-design.md`.
