@@ -117,12 +117,114 @@ hyperfine mean, cold (store+cache wiped per run) and warm:
   parsing at start-up); at the tiny default scale that floor dominates, which is
   why timing uses the `big` scale.
 
-## What this harness does *not* cover
+### Additional comparator workloads
 
-The on-demand blob-fetch / blobless-clone path (`NIX_GIT_LAZY_FETCH`,
-`GitPromisorProvider`) is **not exercised here** — `file://` repos never trigger
-the promisor. That is the job of the NixOS VM test
-(`tests/nixos/git-lazy-fetch.nix`), which stands up a real git HTTP server
-(Gitea) advertising protocol-v2 `filter`. See that test for the filtered-fetch
-proof (via GIT_TRACE), the lazy-vs-eager soundness check, and
-`git-lazy-fetch-compare.nix` for the in-VM object-count comparison.
+| workload | what it shows | result |
+| --- | --- | --- |
+| `filtersource` | real `builtins.filterSource` (the `lib.cleanSourceWith` primitive) | same win as `filtered`: ours warm copies 0 / uncacheable 0; baseline + DetSys re-copy |
+| `parsecache` | `fromJSON (readFile X)` — the parse cache | walk-count parity (the saving is parse *time*, not walks; see microbench below) |
+| `drv` | a derivation whose `src` is a filtered subtree — the `.drv` boundary | parity at walk level; exercises `derivationStrict` placeholder resolution end-to-end |
+
+## Component microbenchmarks (Google Benchmark, single-tree)
+
+Built with `withBenchmarks = true` (see README). These measure *our* mechanisms
+directly — the cross-tree comparison can't (gbench links one tree). Numbers from
+the i9-14900K; representative, not a CI gate.
+
+### Copy-once-link-N — the cargo win, measured directly (`nix-store-benchmarks`)
+
+64 KiB sibling files, N siblings of identical content:
+
+| N | `CopyN_Independent` (eager) | `CopyOnceLinkN` (ours) | speedup |
+| --- | --- | --- | --- |
+| 4 | 495 µs | 333 µs | 1.5× |
+| 16 | 1719 µs | 913 µs | 1.9× |
+| 64 | 6924 µs | 3204 µs | **2.2×** |
+
+The gap widens with N — copy cost is amortised as siblings grow, exactly the
+copy-once-link-N thesis. (`SourceContentId::compute` = 188 ns.)
+
+### MaterialisationScheduler + parse-cache (`nix-expr-benchmarks`)
+
+| benchmark | N=4 | N=16 | N=64 |
+| --- | --- | --- | --- |
+| `OutPathsOf_SharedContent` (cold: walk + link-N) | 400 µs | 1009 µs | 3465 µs |
+| `OutPathsOf_Warm` (peek-hit steady state) | 5.3 µs | 12.5 µs | 43 µs |
+
+Cold scales sub-linearly in N (link-N amortising); warm is ~75× faster than cold
+(the materialised-then-reused path). `ParseCacheRoundTrip` (upsert + lookup of a
+Value tree in the persistent SQLite) = 8.6 µs.
+
+### Operator-stack read path (`nix-fetchers-benchmarks`)
+
+The proposal claims the operator algebra is a cheap "pure forward". Measured:
+
+| benchmark | 16 files | 256 files |
+| --- | --- | --- |
+| `Read_BareMemory` (baseline) | 939 ns | 948 ns |
+| `Read_SubsetStack` (DirectorySynthesizer∘Restrict∘Translate) | 1003 ns | 1056 ns |
+
+The full operator stack adds only **~7–11%** over a bare read and barely grows
+with tree size — direct evidence the per-read overhead is small. Plus the pure
+helpers: `mergeFingerprintSuffix` 44 ns, `bareTreeOid` reject 2.5 ns,
+`collectFilteredShape` ~4.5–5.9 M entries/s.
+
+## Large-repo lazy-fetch at scale (`tests/nixos/git-lazy-fetch-scale.nix`)
+
+A ~48 MiB repo of incompressible content (~2056 git objects) served over real
+HTTP (Gitea), fetched with `git-lazy-fetch` on vs off, measuring the gitv3 cache
+size (a bytes-on-wire proxy) per access pattern.
+
+**Finding (negative — and the most important result here).** For a pinned-rev
+`builtins.fetchGit { rev = …; }`, lazy-fetch pulls **~the same ~48 MiB at every
+access pattern** (metadata-only, single-file read, full) as a full clone:
+
+| access pattern | lazy fetch | full eager |
+| --- | --- | --- |
+| metadata (`.rev`) | ~48 MiB | — |
+| single-file read | ~48 MiB | — |
+| full materialise | ~48 MiB | ~48 MiB |
+
+The protocol-level filter genuinely works (a `--filter=blob:none` probe pulls
+**53 objects / 52 KiB** vs **2056 objects / 48 MiB** for a full clone), and the
+partial clone *is* created — but the input's `revCount`/`lastModified`
+computation walks and backfills the whole tree before any narrow per-file
+prefetch runs. So **the bandwidth benefit is currently unrealised for the
+dominant `fetchGit{rev}` access pattern.** Realising it needs `revCount` /
+`lastModified` deferred over promisor remotes. The test asserts soundness (lazy
+== eager store path + NAR hash) and reports this table; it does not fabricate a
+saving.
+
+## Coverage matrix (mechanism × covered-by)
+
+What exercises each load-bearing mechanism, after this round of work:
+
+| Mechanism (PROPOSAL §) | gbench (ours) | CLI comparator (3-way) | VM (real net) |
+| --- | --- | --- | --- |
+| Fingerprint composition (§1.1/§2.B) | ✅ fingerprint-bench | — (implicit) | — |
+| Projection key encoding (§0/§2.A) | ✅ projection-bench | ✅ via cache rows | — |
+| Filtered-shape walk (§2.D) | ✅ filtered-shape-bench | ✅ `filtered`/`filtersource` | — |
+| Filtered-cache bypass (§6.6/§7.12) | — | ✅ `filtered`/`filtersource` | — |
+| copy-once-link-N (§4/§2.O) | ✅ register-linked-ca-path-bench | ✅ `cargo` | — |
+| MaterialisationScheduler `outPathsOf` (§2.O) | ✅ materialisation-scheduler-bench | ✅ `cargo` | — |
+| `SourceContentId::compute` (§1.1) | ✅ | — | — |
+| Operator-stack read path (§1.2–§1.4) | ✅ operator-stack-bench | — (implicit) | — |
+| Parse cache (§2.E) | ✅ (round-trip) | ✅ `parsecache` (parity) | — |
+| Virtual-source interpolation (§8.2) | — | ✅ `interp` | — |
+| `.drv` boundary / derivationStrict | — | ✅ `drv` | — |
+| Cross-rev subtree (§6.1) | — | ✅ `crossrev` (honest non-win) | — |
+| Pure-eval flake-input parity (§8.5) | — | ✅ `pureflake` | — |
+| Blobless partial clone + soundness (§6.3) | — | — | ✅ git-lazy-fetch.nix |
+| Lazy-fetch 3-way object count | — | — | ✅ git-lazy-fetch-compare.nix |
+| Lazy-fetch at scale (bytes) | — | — | ✅ git-lazy-fetch-scale.nix |
+| `synthesiseTree` (§2.H) | ❌ not yet (git-fixture cost) | — | — |
+| `readBlob` Phase-1/2 concurrency (§2.G) | ❌ not yet (needs parallel driver) | — | — |
+| eval-cache warm path | ❌ (`--expr` isn't a flake; flake workload TODO) | — | — |
+
+Remaining gaps are noted honestly rather than implied-covered:
+`synthesiseTree` and `readBlob` concurrency have no microbenchmark yet (both need
+a real git fixture / parallel driver), and the eval-cache warm path isn't in the
+comparator because every workload uses `nix eval --expr` (not a flake
+installable, so `openEvalCache` is never called). The on-demand blob-fetch path
+itself is covered only by the VM tests — `file://` repos never trigger the
+promisor.

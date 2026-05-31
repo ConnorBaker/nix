@@ -8,17 +8,21 @@ empirics.
 
 | Layer | Tool | What it measures | Cross-tree? |
 | --- | --- | --- | --- |
-| **CLI semantic + wall-clock** | this dir (`run.sh`) | tree *walks*, *copies*, cache-writes, and hyperfine time on representative workloads | **3-way** (ours / upstream-master / DetSys) |
-| **Component microbench** | `src/libfetchers-tests/*-bench.cc` (gbench, `-Dbenchmarks=true`) | in-process cost of *our* mechanisms (copy-once-link-N, fingerprint composition, projection cache, filtered-shape walk, lock-free reads) | single-tree (regression guard) |
-| **Real-network e2e** | `tests/nixos/git-lazy-fetch.nix` | blobless/partial-clone correctness + object accounting over a real git HTTP server | 3-way object-count in-VM |
+| **CLI semantic + wall-clock** | this dir (`run.sh`) | tree *walks*, *copies*, cache-writes, and hyperfine time across 8 workloads | **3-way** (ours / upstream-master / DetSys) |
+| **Component microbench** | `src/lib{store,expr,fetchers}-tests/*-bench.cc` (gbench, `-Dbenchmarks=true`) | in-process cost of *our* mechanisms: copy-once-link-N, the MaterialisationScheduler, the parse cache, the operator-stack read path, fingerprint composition, projection cache, filtered-shape walk | single-tree (regression guard) |
+| **Real-network e2e** | `tests/nixos/git-lazy-fetch{,-compare,-scale}.nix` | blobless/partial-clone correctness + soundness, a 3-way object count, and a ~48 MiB scale measurement over a real git HTTP server | in-VM |
 
 Why three layers and not one: gbench links one tree's libraries, so a benchmark
 using our `SourceContentId` / `MaterialisationScheduler` types cannot compile
 against DetSys or upstream-master — it is inherently single-tree. The
 cross-tree comparison is therefore a black-box CLI job (`run.sh`). And neither
 of those exercises the on-demand blob-fetch path at all: that needs a real git
-server advertising protocol-v2 `filter`, which only the NixOS VM test provides
+server advertising protocol-v2 `filter`, which only the NixOS VM tests provide
 (`file://` repos never trigger the promisor).
+
+[`RESULTS.md`](./RESULTS.md) has a **coverage matrix** (mechanism × which layer
+exercises it), captured numbers for every layer, and the large-repo finding —
+including which mechanisms are *not* yet covered, stated explicitly.
 
 ## The three trees
 
@@ -85,8 +89,12 @@ dominated by process start-up, so use `BENCH_SCALE=big` for timing.
 | `crossrev` | §6.1 | same subtree across two revs — see the honest note in `run.sh`; the cross-pipeline bridge does *not* fire for a subtree sliced off a materialised input |
 | `pureflake` | §8.5 | metadata-only read of a flake input → 0 copies on all lazy trees (**parity**) |
 | `interp` | §8.2(2) | interpolate a virtual source into a discarded string → **0 copies** (ours) vs 1 (eager trees, incl. DetSys) — the ZonePath footgun |
+| `parsecache` | §2.E | `fromJSON (readFile X)` — the parse cache (walk-count parity; the win is parse *time*, see the gbench round-trip) |
+| `drv` | — | a derivation whose `src` is a filtered subtree — the `.drv` write / `derivationStrict` placeholder-resolution path |
+| `filtersource` | §6.6 | real `builtins.filterSource` (the `lib.cleanSourceWith` primitive) — same cache-bypass win as `filtered` |
 
-See [`RESULTS.md`](./RESULTS.md) for a captured run and interpretation.
+See [`RESULTS.md`](./RESULTS.md) for captured runs across all layers, the
+coverage matrix, and the large-repo scale finding.
 
 ## Files
 
