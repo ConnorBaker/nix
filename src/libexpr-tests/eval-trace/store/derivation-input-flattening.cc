@@ -232,4 +232,68 @@ TEST_F(MaterializationDepTest, DrvInputFile_Change_InvalidatesOutPathConsumer)
     }
 }
 
+// RFC obligation pin (derivation-producer-partition-rfc.md §2/§7.1): a derivation
+// forces input-reads that do NOT fold into its drvPath. With __ignoreNulls=true
+// (nixpkgs mkDerivation DEFAULT), derivationStrict forces each attr to test for
+// null and DROPS it via `continue` if null (primops.cc:1795-1798) — so a
+// file-backed attr that evaluates to null records a readFile dep but does not
+// affect drvPath. Two different file contents that both keep the attr null yield
+// the IDENTICAL drvPath, yet the consumer MUST invalidate when that file changes.
+//
+// This test pins the CONSERVATIVE-shape soundness for that case (it must hold
+// today) AND is the red obligation any future producer-ISOLATION prototype must
+// keep green: if isolation keys the producer by drvPath alone, this read is lost
+// and the consumer would stale-serve. Verified end-to-end by adversarial pass #2
+// (Attack E): the conservative shape re-records on the cond change.
+TEST_F(MaterializationDepTest, DrvIgnoreNullsDroppedRead_ChangeInvalidatesConsumer)
+{
+    TempTextFile cond("aaa");
+    // optionalAttr is null unless cond=="yes\n"; with __ignoreNulls it is dropped
+    // from the derivation, so cond's content does NOT change drvPath while staying
+    // non-"yes". But derivationStrict forces optionalAttr (to test null), recording
+    // a readFile dep on cond. Consumer reads drvPath.
+    auto expr = std::format(
+        R"(let
+             condStr = builtins.readFile {0};
+             optionalAttr = if condStr == "yes\n" then "present" else null;
+             d = derivation {{
+               name = "nulltest";
+               builder = "/bin/sh";
+               system = builtins.currentSystem;
+               __ignoreNulls = true;
+               extra = optionalAttr;
+               args = [ "x" ];
+             }};
+           in d.drvPath)",
+        cond.path.string());
+
+    // Cold record (cond="aaa").
+    { auto cache = makeCache(expr); forceRoot(*cache); }
+
+    // Warm-hit precondition: cond unchanged ⇒ hit.
+    {
+        int calls = 0;
+        auto cache = makeCache(expr, &calls);
+        forceRoot(*cache);
+        EXPECT_EQ(calls, 0) << "precondition: unchanged cond ⇒ warm hit";
+    }
+
+    // Mutate cond "aaa" -> "bbb": optionalAttr stays null (dropped), so drvPath is
+    // UNCHANGED — but the recorded readFile(cond) dep changed. The consumer MUST
+    // re-evaluate. A producer keyed by drvPath alone would NOT (that is the RFC's
+    // core soundness obligation).
+    cond.modify("bbb");
+    invalidateFileCache(cond.path);
+
+    {
+        int calls = 0;
+        auto cache = makeCache(expr, &calls);
+        forceRoot(*cache);
+        EXPECT_EQ(calls, 1)
+            << "RFC §2 obligation: a __ignoreNulls-dropped file-backed attr's read "
+               "must invalidate the consumer even though drvPath is unchanged "
+               "(drvPath does not encode dropped-attr reads)";
+    }
+}
+
 } // namespace nix::eval_trace

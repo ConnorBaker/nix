@@ -250,13 +250,16 @@ signal the observation was not output-only).
 
 ## 7. Open problems / what must be proven before building
 
-1. **The §2 dropped-read obligation must become a failing test FIRST.** Add a unit
-   reproducer (`__ignoreNulls` drops a file-backed attr; two non-null-triggering
-   contents with identical drvPath) asserting that under any producer-isolation
-   prototype the consumer STILL invalidates when the dropped read changes. This is
-   the red test the design in §3 must turn green. Until it exists, §3's "trace_hash
-   folds in dropped reads" is unverified for the isolation path (it's verified for
-   the conservative path by construction).
+1. **The §2 dropped-read obligation — DONE as a committed test (pass #2 Attack E).**
+   `DrvIgnoreNullsDroppedRead_ChangeInvalidatesConsumer`
+   (`store/derivation-input-flattening.cc`) pins it end-to-end: `__ignoreNulls`
+   drops a file-backed `extra` attr; `cond.txt` "aaa"→"bbb" keeps drvPath identical
+   but the consumer re-records (`calls==1`). Verified the conservative shape is
+   SOUND for this case TODAY (not a pre-existing bug — Attack E ruled that out: the
+   readFile dep IS kept in the consumer scope). This is now the red obligation any
+   producer-ISOLATION prototype must keep green: keying the producer by drvPath
+   alone loses this read. Still unverified FOR the isolation path (no prototype yet)
+   — verified for the conservative path by construction + this test.
 2. **Does the sub-scope actually capture the dropped-attr read?** §3 assumes the
    forced-then-dropped value's dep lands in the producer sub-scope. Must verify the
    `__ignoreNulls` force at primops.cc:1796 happens AFTER the sub-scope is pushed
@@ -266,11 +269,22 @@ signal the observation was not output-only).
    §1 argued the arg attrset spine is built pre-boundary (WHNF before the primop,
    eval.cc:2445). But the per-attr force can trigger lazy thunks that read ambient
    state shared with the consumer (e.g. a `with pkgs;` lookup deferred into an attr
-   value). Need to characterize whether ANY such dep is consumer-legitimate-but-not-
-   producer-intrinsic. If yes, §3's "producer trace = sub-scope deps" over-captures
-   (a precision loss / over-invalidation, not a soundness hole) and may need a
-   finer partition. UNCHARACTERIZED — this is the residual of the original vague
-   revert comment that §2 only partially sharpened.
+   value). PARTIALLY RESOLVED (pass #2 Attack F) for the SHARED-THUNK sub-case: a
+   thunk `x` used both in the derivation args AND elsewhere in the consumer
+   (`{ drv = mkDerivation { buildCommand = x; }; other = x; }`) is precision-safe
+   under isolation, because deps are recorded to TWO orthogonal channels — the
+   per-scope `ownDeps` (popped with the producer sub-scope → producer trace) AND
+   the durable global `epochLog_` (`recordThunkDeps` memoizes `x`'s range, keyed by
+   Value; `popScope`/`takeDeps` at dep-recording-context.hh:348-372 do NOT touch
+   `epochLog_`). So `other` re-forcing `x` replays `x`'s range from the epoch log
+   into `other`'s scope regardless of the producer sub-scope having popped. The
+   shared thunk is covered for both the producer AND the independent consumer use.
+   STILL UNCHARACTERIZED: a dep forced inside the sub-scope that is
+   consumer-legitimate but the consumer does NOT independently re-force (so it never
+   replays out of the epoch log into a consumer scope). Whether such a dep exists,
+   and whether losing it from the consumer is a soundness hole or only an
+   over-capture into the producer, is the residual hard part. This is the one place
+   the original vague revert comment still points at something real and unresolved.
 4. **Hot-path cost (§6).** The one number that decides go/no-go. Needs a throwaway
    prototype + Ledger-D bench, exactly the §7 slice shape.
 5. **Nested derivations.** A buildInput is itself a derivation forced inside the
