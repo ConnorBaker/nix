@@ -2439,6 +2439,75 @@ never re-force; no measured workload inverts E:P, and the two candidate re-keyin
 their own RFC-scale identity problem**". Infrastructure stays in tree as scaffolding; the
 next real step is a re-keying design, not a cost optimization.
 
-Reproduction: `/tmp/cap_sweep.sh` shape (isolated `XDG_CACHE_HOME` per run,
-`NIX_SHOW_STATS_PATH` capture, OFF/ON pairs, `record.count` delta = P,
-`replay.producerEdges` = E). n=1 wall noise; counts are deterministic across re-runs.
+Reproduction: `benchmarks/eval-trace-bench/experiments/ca-producer-sibling-firerate.sh`
+(isolated `XDG_CACHE_HOME` per run, `NIX_SHOW_STATS_PATH` capture, OFF/ON pairs,
+`record.count` delta = P, `replay.producerEdges` = E). n=1 wall noise; counts are
+deterministic across re-runs (n=3 reproduces P=2113 E=65 exactly).
+
+### 2026-05-31 follow-up #6: re-keying feasibility — the consumed string is NOT identity-free (softens #5's wall)
+
+Follow-up #5 closed by calling both re-keying candidates "RFC-scale," and asserted the
+string case "needs the scalar-identity work the Tier-1 spike found dead." A code read of
+the derivation-result construction (`primops.cc:2104-2115` + `mkOutputString` at
+`primops.cc:218-231`) shows that assertion was **too strong** and must be corrected.
+
+**The strings consumers read already carry the derivation's content-addressed identity —
+in their string context, not as a trace identity:**
+- `result.drvPath` is `mkString(drvPathS, { NixStringContextElem::DrvDeep{.drvPath = drvPath} })`
+  (primops.cc:2105-2111). The drvPath store path IS the content address
+  (`hashDerivationModulo`, memoized in `drvHashes` at primops.cc:2100-2101).
+- `result.<output>` (e.g. `outPath`) is built by `mkOutputString` →
+  `state.mkOutputString(…, SingleDerivedPath::Built{ .drvPath = makeConstantStorePathRef(drvPath),
+  .output = o.first }, …)` (primops.cc:224-230). The output string's context carries the
+  producing drvPath + output name.
+
+So the value a sibling consumer actually re-forces/reads (`pkg.outPath`, a string) is **not**
+identity-free in the way the Tier-1 `replayMemoizedDeps`-widening spike concluded. That spike
+keyed on the *Value's trace identity* (the `TracedExpr`/materialize stamp), which scalars lack
+— a true statement about *that* channel. It did not consider the **string-context channel**,
+which carries `drvPath`/`SingleDerivedPath::Built` — exactly the content address §3a's CA key
+(`__ca:<drvHash>`) is derived from. The identity the producer is keyed by and the identity the
+consumed string carries are the SAME drvPath; they are simply attached to different things
+(the `strict` `Bindings*` vs the output string's context).
+
+**Revised feasibility of the re-keying.** The blocker is narrower than "RFC-scale scalar
+identity":
+- **Producer side is unchanged** — keep recording the CA producer trace keyed by `__ca:<drvHash>`
+  (already built, already proven by `ca-trace-key-routing.cc` R1/R2/R3).
+- **Consume side becomes a context-read, not a new identity scheme.** The edge could be emitted
+  when a consumer's recording scope observes a string whose context contains a
+  `DrvDeep`/`SingleDerivedPath::Built` referring to a drvPath that has a registered producer
+  trace — emit `TraceValueContext(__ca:<drvHash>)` instead of flattening that observation.
+- This moves the gate from "Value re-forced under `replayMemoizedDeps`" (which sees the wrong
+  value) to "string-context observed at the coercion/selection boundary" (which sees the
+  drvPath). The hook site is the open question, not the identity.
+
+**The genuinely hard part that remains (this IS still a real design problem, not a quick fix):**
+1. **Where is the context observed at record time?** A consumer reads `pkg.outPath` and then
+   *does something* with the string (interpolates into a builder, passes as a buildInput). The
+   drvPath context flows through string coercion (`coerceToContextObject`,
+   eval-trace/CLAUDE.md "Provenance Publication Semantics"). The edge-emission site must be where
+   that context is first consumed into the recording scope — likely the string-coercion /
+   `ExprConcatStrings` boundary, not `replayMemoizedDeps`. Unverified which site, and whether it
+   has an active recording scope + `TraceAccess::current()`.
+2. **Facet soundness still binds.** The §3b facet gate (`derivation-observation-facets.cc`)
+   showed `outPath` is output-only (records only `StorePathAvailability(.drv)` + system) so an
+   edge drops nothing — GOOD. But a consumer that reads `pkg.drvPath` *and also* `pkg.meta`
+   (a non-output facet) must keep the facet dep. The context-read edge must be additive to facet
+   deps, never a replacement, unless the observation is provably output-only. This is the same
+   gate, now enforced at a different site.
+3. **The win is bounded by what flattening the context-edge removes.** #5 showed the gate as-built
+   fires ~0 on the value channel. The string-context channel *would* fire on every `.outPath`
+   read — but whether that nets out positive depends on (a) how many flattened deps an edge
+   replaces (the producer's input closure, which IS the 607× — potentially large win) vs (b) the
+   per-read context-inspection cost on the hot coercion path (the vptr-in-hot-loop hazard again).
+   UNMEASURED. This is the real go/no-go and it requires a prototype, not just analysis.
+
+**Net correction to #5's verdict.** The re-keying is NOT "its own RFC-scale identity problem" —
+the identity already exists on the consumed string (drvPath in context). It IS "a hot-path
+recorder change at the string-coercion boundary, gated by the existing facet rule, whose
+cost/benefit is unmeasured." That is a prototype-sized question (the same shape as the original
+§7 slice), not a foundational identity redesign. The #5 wall was real for the *value* channel and
+is the reason the as-built gate fires ~0; it does not apply to the *string-context* channel, which
+is the correct next thing to prototype. Soundness floor unchanged
+(`derivation-edge-soundness.cc` + `derivation-observation-facets.cc` already pin the contract).
