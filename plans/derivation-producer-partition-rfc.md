@@ -130,9 +130,15 @@ Mechanism, cited:
   is not a corner case — it is the dominant real-world shape.
 - The forced-then-dropped value's deps land in whatever scope is active during
   the force. Under the conservative shape that is the consumer scope (kept,
-  sound). Under isolation that would be the producer sub-scope, but the producer
-  trace's identity (`drvPath`) and content (`{drvPath, outputs}`) do not reflect
-  the dropped attr — so the dep is lost at the producer boundary too.
+  sound). Under isolation that would be the producer sub-scope. The hazard this
+  motivates is specifically a producer keyed/verified by `drvPath` (or by its
+  result payload `{drvPath, outputs}`): neither reflects the dropped attr, so such
+  a producer loses the dep. NOTE (clarified pass #13, Attack Q): this RFC's design
+  (§3) does NOT lose it — the producer's verification key is the `trace_hash` over
+  its recorded DEPS (`computeTraceHash` over the dep vector, hash.cc:46-48), and the
+  dropped-attr `readFile` IS one of those recorded deps, so it folds into the hash.
+  The "dep lost at the producer boundary" failure is the motivation for rejecting
+  drvPath-keying (§3), not a property of the RFC's trace_hash-keyed producer.
 
 **This is the obligation the RFC must discharge:** the producer trace must be
 keyed/verified by something that changes whenever ANY input-read it performed
