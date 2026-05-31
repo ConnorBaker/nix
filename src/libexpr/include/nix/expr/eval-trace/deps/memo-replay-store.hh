@@ -62,12 +62,16 @@ struct MemoReplayStore {
 
     /// Pointer bloom for fast-rejecting `lookupProducer` calls on the hot
     /// `replayMemoizedDeps` path. Sized for ~thousands of producers (one
-    /// per `derivationStrict` call); 64K slots × 4 hashes ≈ 8 KB and gives
-    /// a vanishing false-positive rate for the expected population.
-    /// Without this, every replayMemoizedDeps call (~22M on closures.gnome)
-    /// pays a full `unordered_flat_map::find` — a measurable hot-path cost
-    /// even when the map is non-empty but rarely matches `&v`.
-    PointerBloomFilter<1 << 16, 4> producerBloom;
+    /// per `derivationStrict` call). Template params are
+    /// `<Bits, PointerAlignment>`: 65536 bits ≈ 8 KB; alignment 16 matches
+    /// Boehm-GC Value allocation (mirrors `replayBloom`'s alignment, since
+    /// both filters key on the SAME GC-allocated `Value*` keys). The
+    /// filter is k=2 (hard-coded in PointerBloomFilter); FPR at n=6,419
+    /// producers in m=65,536 bits is ≈ 3% — net win on the ~22M-call hot
+    /// path because the bloom-then-find combo skips the
+    /// `unordered_flat_map::find` for ~97% of non-producer Values, and
+    /// `find` would otherwise hash + probe a group on every miss.
+    PointerBloomFilter<1 << 16, 16> producerBloom;
 
     /// Reset the per-replay state (epoch index + bloom). Called from
     /// `rollbackEpoch` when the epoch log is fully unwound, and from the
@@ -213,9 +217,9 @@ struct MemoReplayStore {
     /// Hot-path call site: `replayMemoizedDeps` invokes `lookupProducer`
     /// before its bloom-gated `getReplayRange`. closures.gnome fires
     /// `replayMemoizedDeps` ~22M times across ~thousands of registered
-    /// producers; the bloom rejects ~all non-producer Values without paying
-    /// the `unordered_flat_map::find` cost. Mirror's `getReplayRange`'s
-    /// `replayBloom` discipline.
+    /// producers. The bloom rejects ~97% of non-producer Values without
+    /// paying the `unordered_flat_map::find` cost; mirrors `getReplayRange`'s
+    /// `replayBloom` discipline (same `Value*` keys, same alignment).
     std::optional<ProducerEntry> lookupProducer(const Value & v) const
     {
         if (!producerBloom.test(&v)) [[likely]]
