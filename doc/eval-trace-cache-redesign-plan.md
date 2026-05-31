@@ -2071,3 +2071,50 @@ invalidates via input deps, not bypassed by the SPA existence check), `store/ca-
 (this section), and `store/keyset-escape.cc` (cross-trace escape — a shape-carrying edge must
 fail-closed). This relocates the README's abstract Option 3 / Lever 2 RFC into a concrete,
 half-proven proposal with a defined hot-path measurement as its only remaining gate.
+
+### 2026-05-30 follow-up: §3b recording-side composition proven (`store/ca-producer-boundary-recording.cc`)
+
+Drove the REAL `DepRecordingContext` via `TestScopeAccess` — same calls a §3b recorder would make
+(`pushScope`/`record`/`takeDeps`/`popScope`) — to prove the recording-side composition the consume-
+side floor leaves open: capture a sub-computation's input-reads in an isolated nested scope, finalize
+those isolated deps as a CA-keyed producer trace, and emit a SINGLE edge into the parent's stored dep
+set (not the flattened inner deps). Six tests, all probe-then-revert verified for non-vacuity:
+
+- **P1 ScopeIsolatedProducer_ParentEdgesNotFlattens** — nested scope captures inputs in isolation;
+  parent records exactly own-dep + edge; verify routes through. Probe (inline inner deps): caught
+  (size 4, innerLeak 2).
+- **P2 ConsumerDepCount_IndependentOfClosureSize** — same composition with M=2 and M=50 input deps
+  yields the SAME consumer dep count (1 own + 1 edge). The 607×→1 collapse made concrete at unit
+  scale. Probe: caught (large=52 ≠ small=2).
+- **P3 ProducerInputChange_InvalidatesConsumerViaEdge** — real-eval mutation propagates: producer
+  trace hash changes → consumer's edge-stored old hash mismatches → invalidates. Probe (skip
+  mutation): caught.
+- **P4 NestedProducers_ChainInvalidatesFromDeepest** — depth-2 edge chain (C→A→B); mutation at B's
+  deepest input invalidates C through both edges. The build-layer `hashDerivationModulo` recursion
+  lifted to eval, exercised through the real verifier's `resolveTraceContextHash`. Probe: caught.
+- **P5 RepeatedEdgeRecord_DedupesToOne** — 3 `ctx.record(edge)` calls dedupe to 1 stored dep. The
+  recorder's `Dep::Key` dedup contract holds for edge deps identical to content deps. Probe (3
+  different keys): caught (3 deps).
+- **P6 ProducerSideTable_RoutesEdgeVsFlatten** — sketches the `Value*→{caKey, traceHash}` side-table
+  interface a production §3b recorder needs to route between edge-emission (producer) and flatten-
+  replay (non-producer) at force time. Drives both routes through the real context + verify; both
+  halves resolve. Probe (disable gate): caught.
+
+**Net: §3b's RECORDING composition WORKS in synthetic.** The shape that the production recorder
+must produce (`pushScope` → capture inputs → finalize as CA producer trace → record edge in parent)
+is fully reachable through the existing scope + store machinery with zero production change. The
+composition is sound, idempotent, recursive-correct, and dedup-safe.
+
+**Material blocker reached for the test-only phase.** What remains for production §3b is the
+hot-path glue: a `Value*→(caKey, traceHash)` side table populated when a producer scope finalizes,
+consulted in `replayMemoizedRange` to route between flatten and edge-emission at force time. This
+requires modifications to `MemoReplayStore`, `replayMemoizedRange`, and the producer-scope opener
+in `forceThunkValue` — all hot-path production code that carries the v53/vptr precedent warning
+(reversed a hot-loop structure change in the past). Per the established discipline:
+1. Encode the routing decision in the type system (not "the recorder remembers to consult the side
+   table") — make illegal states unrepresentable.
+2. Measure against the Ledger-D baseline (current-tree benchmark anchor at HEAD `9f7311129`).
+3. Pass the 10-commit correctness gate (byte-identical `nix eval` output vs `--no-eval-trace`).
+
+P6's interface sketch + P1-P5's correctness floor define exactly what the production prototype must
+produce. The next slice is hot-path territory and exits the test-only zone.
