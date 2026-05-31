@@ -78,17 +78,33 @@ RecordResult Recorder::record(
     //
     // `deferFlush` (async-producer-recording-plan Layer 1): skip this per-record
     // flush. Entities remain buffered in `pending*` and are drained by the next
-    // non-deferred flush or the destructor's `flushExclusive()`. SOUNDNESS: the
-    // step-8 `publishRecord` below still updates in-memory caches synchronously
+    // non-deferred flush or the destructor's `flushExclusive()`. The step-8
+    // `publishRecord` below still updates in-memory caches synchronously
     // (within-session verify + getCurrentTraceHash read those, not SQLite), and
     // its `publishStateChange` Sessions/History write has NO foreign key to Traces
     // (schema: Sessions.trace_id is a bare INTEGER, no REFERENCES; only
     // Traces.dep_key_set_id → DepKeySets is FK-constrained, and those flush together
     // in dependency order). So a deferred entity flush cannot FK-violate the Sessions
-    // write. The only behavioural change is durability timing: buffered entities
-    // become durable at the batched/destructor flush instead of immediately — a crash
-    // mid-eval loses buffered producer traces (acceptable for a CACHE: a lost producer
-    // is a future cache miss, never a wrong answer).
+    // write — and on a CLEAN exit the teardown flush drains pendingTraces, so the DB
+    // is byte-identical to the per-record-flush path.
+    //
+    // CRASH-CONSISTENCY CAVEAT (redesign-plan follow-up #24 — supersedes the earlier
+    // "a lost producer is a future cache miss, never a wrong answer" comment, which was
+    // an OVERCLAIM). Deferring flush() ALONE (this branch) leaves an ordering inversion:
+    // step 6 (`getOrCreateTrace`) buffers trace-id N into pendingTraces, this flush is
+    // skipped, then step 8's `publishStateChange` COMMITS a durable Sessions/History(N)
+    // row in its own per-producer txn (sqlite-trace-storage.cc:704-724) while Traces(N)
+    // is still unflushed. `nextTraceId` is reloaded as MAX(Traces.id) at open
+    // (sqlite-trace-storage-lifecycle.cc:611), so a crash between that commit and the
+    // teardown flush makes the next process REUSE id N for a different trace → the stale
+    // durable History(N) aliases it. Baseline (per-record flush) is safe (Traces durable
+    // BEFORE History). LATENT today: §3b is default-off, and the §3b CONSERVATIVE shape
+    // keeps the consumer's flattened deps, which independently catch a mis-resolved
+    // producer edge. But the AGGRESSIVE shape removes that backstop by design → the
+    // aliasing becomes a candidate STALE SERVE. THEREFORE: do NOT enable the aggressive
+    // shape on Layer 1 alone. The fix is Layer 2a (defer publishStateChange too, draining
+    // Sessions/History in the teardown txn AFTER the Traces rows) which restores the
+    // baseline ordering — see plans/async-producer-recording-plan.md §6.
     if (!deferFlush)
         storage_.flush(ea);
 
