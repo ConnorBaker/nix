@@ -261,9 +261,22 @@ signal the observation was not output-only).
   per-derivation (~10⁴), not per-thunk (~10⁷), so bounded — but UNMEASURED and
   the deciding number, exactly as the original §7 slice was.
 - Producer-trace recording cost: same `recordSync` cost as §3b, but now the
-  consumer's flattened closure is REMOVED, so net storage/record work should drop
-  rather than double. Must measure cold storage + record time vs the Ledger-D
-  baseline.
+  consumer's flattened closure is REMOVED. **CORRECTION (adversarial pass #5, Attack
+  J): net storage drops ONLY for multiply-consumed (N>1) producers.** The arithmetic:
+  conservative today = N consumers × full closure (the 607×). Proposed = 1 producer
+  closure + N edges + 1 producer routing row (`Sessions` + `Traces` + `Results` rows,
+  sqlite-trace-storage-lifecycle.cc:170-191). For N>1 this is a clear win
+  (closure + N·edge ≪ N·closure). For **N=1 (singly-consumed derivation) it is a
+  small net ADD** — closure + 1 edge + producer routing rows vs just the consumer's
+  flattened closure. So "storage drops" is CONDITIONAL on derivations being
+  multiply-consumed within one eval. That is the SAME sharing property #5 measured
+  for the as-built gate (E:P), where the gate fired ~0 because consumers re-force the
+  wrapper not the `strict` attrset. THIS RFC edges at the args-force boundary instead,
+  so the consumer-sharing count COULD differ — but it is UNMEASURED, and it is the
+  same number that decides whether the design is a net win at all. If most
+  derivations are singly-consumed per eval, this design ADDS storage rather than
+  dropping it. Must measure consumer-sharing (distinct consumers per producer
+  drvPath) on Ledger-D BEFORE assuming any storage benefit.
 - The isolation changes consumer trace SHAPE (fewer leaf deps, one edge). This is
   a precision-neutral change ONLY if §3's trace_hash argument holds and the facet
   gate (§5) is correct. The standing correctness gate (byte-identical `nix eval`)
@@ -339,21 +352,43 @@ signal the observation was not output-only).
    is the one finding from adversarial pass #1 that the original draft missed
    entirely — it is precision-only, but should be measured before claiming the
    design delivers a NET win (spurious misses eat into the amortization benefit).
+7. **Consumer-sharing ratio is the master go/no-go number (pass #5, Attack J).**
+   The entire benefit — storage drop (§6), verify amortization (§4), fewer recorded
+   deps — is conditional on producers being consumed by N>1 distinct consumers per
+   eval. #5 measured the as-built gate fires ~0 because consumers re-force the
+   wrapper, not the `strict` attrset; this RFC moves the edge to the args-force
+   boundary, which MAY change the count, but it is UNMEASURED. If derivations are
+   predominantly singly-consumed per eval, the design is a net storage/work ADD
+   (Attack J) AND the verify amortization never triggers — i.e. it reduces to §3b's
+   net loss in a different costume. **This measurement (distinct consumers per
+   producer drvPath, on Ledger-D + python3Packages) must precede the prototype**; it
+   can be taken cheaply by instrumenting the conservative-shape recorder to count,
+   without building the isolation. If the ratio is ~1, STOP — the direction is dead
+   regardless of hot-path cost.
 
 ## 8. Recommended sequence (each gated by the standing soundness suite)
 
-1. Land the §7.1 red test (`__ignoreNulls` dropped-read invalidation) — pure test,
-   no production change. Establishes the obligation.
-2. Answer §7.2 + §7.3 by characterization tests (where do dropped/ambient deps
-   land relative to a hypothetical sub-scope) — pure measurement.
-3. ONLY if 1–2 show the partition is cleanly definable: throwaway prototype of the
+0. **CHEAPEST KILL-SWITCH FIRST (§7.7):** instrument the conservative-shape recorder
+   to count distinct consumers per producer drvPath on Ledger-D + python3Packages.
+   No isolation, no new scope — just a counter. If the ratio is ~1 (derivations
+   predominantly singly-consumed per eval), STOP: the design adds storage and never
+   amortizes (Attack J), reducing to §3b's net loss. This gates everything below.
+1. Land the §7.1 red test — DONE (`DrvIgnoreNullsDroppedRead_ChangeInvalidatesConsumer`).
+2. Answer §7.2 (does the dropped read land in the sub-scope?) by characterization
+   test — pure measurement, no production change.
+3. ONLY if 0 shows N>1 sharing AND 2 confirms capture: throwaway prototype of the
    sub-scope + trace_hash-keyed producer + consumer edge, behind an env gate,
-   default-off. Measure §6/§7.4 on Ledger-D. Go/no-go.
-4. If go: wire the facet gate (§5), turn the §7.1 red test green, run the full
-   suite + byte-identical gate, and only then consider default-on.
+   default-off. Measure §6/§7.4 hot-path cost + §7.6 aliasing frequency on Ledger-D.
+   Go/no-go.
+4. If go: wire the facet gate (§5, respecting the §5 removeAttrs caveat), keep the
+   §7.1 red test green, run the full suite + byte-identical gate, and only then
+   consider default-on.
 
 ## 9. What this RFC does NOT claim
-- NOT that the hot-path cost is acceptable — §6 is unmeasured and is the go/no-go.
+- NOT that there is a net win at all — that hinges on the consumer-sharing ratio
+  (§7.7), UNMEASURED, and is the master go/no-go: if derivations are mostly
+  singly-consumed per eval the design adds cost and never amortizes (Attack J).
+- NOT that the hot-path cost is acceptable — §6 is unmeasured.
 - NOT that drvPath is the verification key — §2 disproves that; drvPath is routing
   only, trace_hash is verification.
 - NOT that precision is preserved — the design has TWO measured over-capture /
