@@ -122,6 +122,7 @@ hyperfine mean, cold (store+cache wiped per run) and warm:
 The on-demand blob-fetch / blobless-clone path (`NIX_GIT_LAZY_FETCH`,
 `GitPromisorProvider`) is **not exercised here** — `file://` repos never trigger
 the promisor. That is the job of the NixOS VM test
-(`tests/nixos/git-lazy-fetch.nix`), which stands up a real git HTTP+SSH server
-advertising protocol-v2 `filter`. See that test for blob/byte accounting and the
-3-way real-network wall-clock.
+(`tests/nixos/git-lazy-fetch.nix`), which stands up a real git HTTP server
+(Gitea) advertising protocol-v2 `filter`. See that test for the filtered-fetch
+proof (via GIT_TRACE), the lazy-vs-eager soundness check, and
+`git-lazy-fetch-compare.nix` for the in-VM object-count comparison.

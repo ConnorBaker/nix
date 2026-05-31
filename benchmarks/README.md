@@ -10,7 +10,7 @@ empirics.
 | --- | --- | --- | --- |
 | **CLI semantic + wall-clock** | this dir (`run.sh`) | tree *walks*, *copies*, cache-writes, and hyperfine time on representative workloads | **3-way** (ours / upstream-master / DetSys) |
 | **Component microbench** | `src/libfetchers-tests/*-bench.cc` (gbench, `-Dbenchmarks=true`) | in-process cost of *our* mechanisms (copy-once-link-N, fingerprint composition, projection cache, filtered-shape walk, lock-free reads) | single-tree (regression guard) |
-| **Real-network e2e** | `tests/nixos/git-lazy-fetch.nix` | blobless/partial-clone correctness + blob/byte accounting over a real git HTTP+SSH server | 3-way wall-clock in-VM |
+| **Real-network e2e** | `tests/nixos/git-lazy-fetch.nix` | blobless/partial-clone correctness + object accounting over a real git HTTP server | 3-way object-count in-VM |
 
 Why three layers and not one: gbench links one tree's libraries, so a benchmark
 using our `SourceContentId` / `MaterialisationScheduler` types cannot compile
