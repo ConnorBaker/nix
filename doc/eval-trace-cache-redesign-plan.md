@@ -3048,3 +3048,45 @@ derivation ~200–2,000) and #15 (derivations-per-consumer ~1,213) are two views
 - Cost: **≥11%** scope-structural (lower bound; real adds §3b producer-recordSync); python3Packages,
   not Ledger-D (gap noted #15 Attack 1).
 - Net win gated on producer-record cost (async/batched — §3b condition a, unbuilt).
+
+### 2026-05-31 follow-up #18: MATERIAL BLOCKER reached — net win requires async producer recording (a separate unbuilt project)
+
+The prototype has measured both go/no-go numbers (benefit ~63%, cost ≥11% structural). This pass
+establishes — from §3b's MEASURED numbers, not assertion — that the remaining gate is a material
+blocker, and names it precisely.
+
+**The aggressive shape pays the same dominant cost §3b did.** §3b (follow-up #4) measured the
+conservative shape as net-NEGATIVE (3.6× cold / 14× hot), with the dominant term being ~6,419
+producer `recordSync` calls/commit (~1.5 ms each). The aggressive shape records the SAME
+~thousands of producer traces (one per distinct derivation) — so it pays that SAME recordSync
+cost, PLUS the ~11% sub-scope structural cost (#14). Therefore, **without a cheaper recording
+path, the aggressive shape is net-negative like §3b** — the ~63% verify/storage benefit does not
+overcome the per-derivation recordSync term at synchronous cost.
+
+**So the net win is genuinely gated on async/batched producer recording** (§3b's re-enable
+condition (a)), which was never built. That is a SEPARATE, substantial piece of work (background
+recording thread + deferred traceId reconciliation, OR batch-persist at session end), NOT a
+measurement or a prototype tweak. Estimating it from existing numbers without building it is not
+possible — the whole question is whether moving recordSync off the eval thread / batching it
+recovers more than the ~63% benefit needs.
+
+**MATERIAL BLOCKER (per the stop condition):** the prototype answered everything answerable WITHOUT
+building async recording. Going further = building async recording = a new project. Stop here.
+
+**Net deliverable of the §8-step-3 prototype work (#12–#18):**
+- Benefit MEASURED: ~63% per-consumer dep reduction + separate producer-closure storage dedup
+  (floor 37%; "99%" retracted; bounded by ~1,213 distinct-derivations-per-consumer).
+- Cost MEASURED: ≥11% scope-structural (lower bound) + the §3b-measured producer-recordSync on top.
+- VERDICT: the direction is **net-negative at synchronous recording (like §3b), and its viability
+  hinges entirely on async/batched recording** — a separate unbuilt project. The soundness is
+  closed; the sharing is real (~63% removable); the structural cost is modest (~11%); the ONE thing
+  standing between here and a shippable win is async recording. That is the precise, measured
+  handoff point.
+- Scaffolding kept: `drv-benefit-probe` (validated, reproducible). Removed: the cost-prototype
+  footgun and (earlier) the confounded sharing probe.
+
+**Process note — confound count this arc: FOUR** (sharing-probe memoization #9; coercion-hook
+confound #7/#8; benefit-circularity #12; re-record 23× artifact #14), each caught by validating
+against a controlled/known case before trusting. Plus two overstatements caught by adversarial
+pass (#11 "edge removes 607×"; #13 "~99%"). The discipline of "validate the probe, then pass the
+finding" was load-bearing throughout — most committed numbers were wrong on first cut.
