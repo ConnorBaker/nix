@@ -2910,3 +2910,50 @@ consumers with heavy own-structured-reads. The FLOOR (37%) is general; the ceili
 **Status of the two go/no-go numbers:** benefit magnitude = RESOLVED (37% floor, ~99% on the target
 workload). Remaining: the args-force sub-scope HOT-PATH COST (#6) — still needs the actual sub-scope
 build + Ledger-D timing. That is the last open number.
+
+### 2026-05-31 follow-up #14: hot-path COST measured — scope-structural ≈ 11% (after a 23× proxy artifact was caught + corrected)
+
+Built the per-derivation sub-scope (the aggressive shape's structural requirement; the
+vptr-in-hot-loop hazard the RFC flags) env-gated at prim_derivationStrict, to measure its cost.
+
+**First proxy was a 23× ARTIFACT — caught before recording.** Initial design: open the
+sub-scope, capture the derivation's deps, RE-RECORD them into the consumer (so net behaviour
+is soundness-neutral — verified byte-identical on numpy/scipy/pandas). Measured OFF 13s →
+ON 305s (**23×**). Diagnosed: the re-record loop is O(closure) per derivation and QUADRATIC
+under nesting (a top-level derivation re-records its whole ~10K-dep transitive closure, at
+every nesting level). That is the PROXY's cost, not the design's — the real aggressive shape
+emits ONE edge (O(1)), not N re-records. 4th confound in this arc: a measurement choice that
+looks faithful (soundness-neutral) but measures the wrong thing.
+
+**Corrected measurement (NIX_PROTOTYPE_DRV_SUBSCOPE=cost):** open the sub-scope, take+DISCARD
+its deps (no re-record). This measures scope ctor/push/accumulate-into-sub/take/dtor — the
+structural per-derivationStrict cost — and the accumulate-into-sub IS part of the real design
+(it's where the producer trace's deps come from). NOT soundness-neutral (consumer loses deps),
+so it is a COST microbenchmark ONLY.
+
+Result (python3Packages, 8-package map, fresh cache, 3 runs each, low variance):
+
+| mode | runs | mean |
+|---|---|---:|
+| OFF | 12.91 / 13.51 / 13.06 | 13.16s |
+| COST (sub-scope) | 14.64 / 14.64 / 14.69 | 14.66s |
+
+**Overhead ≈ 1.5s on 13.2s = ~11%.** Confirmed the sub-scopes actually fired (unambiguous,
+not inferred from timing): `depContextScopes` 971 → 3072 at identical nrThunks (745,708), the
++2,101 being the per-derivationStrict sub-scopes.
+
+**Honest bounding:**
+- ~11% is the SCOPE-STRUCTURAL cost ALONE. The real aggressive shape ADDS, on top: the
+  producer-trace recordSync per distinct derivation (which §3b measured as the dominant
+  net-loss cost) + 1 edge emit. So **~11% is a LOWER bound** on the real aggressive hot cost.
+- Indicative, not the Ledger-D number — measured on python3Packages (derivation-dense);
+  closures.gnome has different derivation-density-per-eval-second. Right ORDER (~10⁴
+  derivations/eval), not the exact closures.gnome figure.
+
+**Interpretation:** the scope structure alone is ~11% — already non-trivial for a hot-path
+change, and on TOP of it sits the §3b-measured producer-record cost that made §3b net-negative.
+So the aggressive shape's hot cost is *at least* ~11% and realistically more once producer
+recording is added. This does NOT by itself kill the direction (benefit is high, #13: 37–99%),
+but it confirms the hazard is real and the net win requires the producer-record cost to come
+WAY down (async/batched — the §3b condition (a) that was never built). The two go/no-go numbers
+are now BOTH measured: benefit 37–99% (high), hot cost ≥11% structural + producer-record on top.
