@@ -2957,3 +2957,41 @@ recording is added. This does NOT by itself kill the direction (benefit is high,
 but it confirms the hazard is real and the net win requires the producer-record cost to come
 WAY down (async/batched — the §3b condition (a) that was never built). The two go/no-go numbers
 are now BOTH measured: benefit 37–99% (high), hot cost ≥11% structural + producer-record on top.
+
+### 2026-05-31 follow-up #15: adversarial pass on #13/#14 — corrects benefit "~99%" → ~63% (edges-per-derivation, not kind-fraction)
+
+The mandated adversarial pass on the combined prototype findings (#13 benefit + #14 cost) found
+a real refinement to #13. NOT done — addressed here.
+
+**Attack 2 (material): #13's "~99%" conflated "fraction of consumer deps that is
+derivation-closure" with "fraction REMOVED."** The edge model does NOT collapse a consumer's
+derivation-closure deps to ONE edge — it keeps ONE EDGE PER DISTINCT DERIVATION the consumer
+references. Measured: a consumer references mean ~1,213 distinct derivations (its SPA count =
+distinct derivations, within-trace deduped). So the edge model collapses mean ~3,296 consumer
+deps → ~1,213 edges:
+
+- **Per-consumer dep-count reduction ≈ 63%** (3,296 → 1,213), bounded by
+  distinct-derivations-per-consumer — NOT the 99% dep-kind fraction (#13 wrong) and NOT the 37%
+  SPA-only floor (that was a strict subset). **~63% is the honest realistic figure.**
+- **Storage: flattened-dep count 36.5M → ~13.4M edge-deps (≈63% fewer), PLUS the separate
+  producer-dedup win** (each of the ~1,213 producer closures recorded ONCE globally rather than
+  copied into every consumer — the 607× storage win, which is distinct from and larger than the
+  per-consumer count reduction). #13 conflated these two wins.
+
+So the corrected benefit picture: **~63% per-consumer dep reduction + a large separate
+producer-closure storage dedup.** Still substantial, materially below #13's "~99%", above the
+37% floor. The number is set by distinct-derivations-per-consumer (~1,213), a measured quantity.
+
+**Attack 1 (gap, lower severity): the ~11% cost (#14) was measured on python3Packages, not the
+Ledger-D/closures.gnome anchor** where §3b's 14× hot blowup was measured. The per-derivation
+scope cost is workload-portable in order-of-magnitude (~10⁴ derivations/eval both), but the exact
+closures.gnome figure for THIS prototype is unmeasured. Noted as a gap, not corrected (would need
+a bench-harness run; the order is established).
+
+**Both numbers, final honest state:**
+- Benefit: **~63%** per-consumer dep reduction (+ separate producer-storage dedup). [floor 37% SPA-only; #13's 99% retracted]
+- Cost: **≥11%** scope-structural (python3Packages; lower bound — real adds §3b producer-recordSync on top).
+
+The direction is **plausibly net-positive on dep-count/storage but gated on the producer-record
+cost** (§3b's measured dominant cost) coming down via async/batched recording — the never-built
+§3b condition (a). The prototype has measured what it can without building async recording.
