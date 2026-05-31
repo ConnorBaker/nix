@@ -12,7 +12,19 @@ static void prim_unsafeDiscardStringContext(EvalState & state, const PosIdx pos,
     NixStringContext context;
     auto s = state.coerceToString(
         pos, *args[0], context, "while evaluating the argument passed to builtins.unsafeDiscardStringContext");
-    v.mkString(*s, state.mem);
+
+    /* Devirtualise BEFORE discarding the context. Every other serialisation
+       boundary (CLI output, `.drv` fields) rewrites a deferred `SourceVirtual`
+       placeholder / `Opaque{fakePath}` stand-in to its real store path by
+       keying off the string context. Discarding the context here without first
+       resolving would strip the very element those rewrites depend on, leaving
+       the fake `/​<base32>` (or the deferred-mount stand-in) as a *dangling*
+       string that then gets baked verbatim into a `.drv`/output — a path that
+       does not and cannot exist. So resolve+materialise+rewrite the body via the
+       canonical choke-point first, THEN drop the (now-irrelevant) context. For a
+       plain string with no virtual context this is a no-op. */
+    auto resolved = state.resolveAndRewrite(std::string(*s), context);
+    v.mkString(resolved, state.mem);
 }
 
 static RegisterPrimOp primop_unsafeDiscardStringContext({

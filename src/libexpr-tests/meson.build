@@ -63,6 +63,7 @@ sources = files(
   'boundary-audit-nix-env-query-xml.cc',
   'boundary-audit-nix-prefetch.cc',
   'boundary-audit-nix-run-program.cc',
+  'boundary-audit-discard-context.cc',
   'boundary-audit-prim-import.cc',
   'boundary-audit-property.cc',
   'boundary-audit-repl-print.cc',
