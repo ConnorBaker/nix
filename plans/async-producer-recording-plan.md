@@ -67,9 +67,19 @@ Layer 2 is materially harder and is GATED on Layer 1's measurement showing CPU s
   later consumer in the SAME session. Since in-memory caches are updated immediately (Layer 1),
   this holds without the flush. MUST test.
 - **Crash durability**: a deferred flush means a crash mid-eval loses buffered producers. Today's
-  per-record flush makes each producer durable immediately. Is that a regression? For a CACHE it is
-  acceptable (a lost producer = a cache miss next run, not a wrong answer) — but must be stated, and
-  the session-end flush must be on the SUCCESS path (a failed eval shouldn't half-write).
+  per-record flush makes each producer durable immediately. **CORRECTION (follow-up #24, supersedes
+  the earlier "lost producer = a cache miss, not a wrong answer" claim — that was an OVERCLAIM):**
+  Layer 1 as built (defer `flush()` ONLY, leave `publishStateChange` per-producer) is NOT
+  crash-clean. It inverts the durability order: `publishStateChange` commits a durable per-producer
+  `Sessions`/`History(trace_id=N)` row (sqlite-trace-storage.cc:683) while N's `Traces` row stays
+  in `pendingTraces` until teardown. `nextTraceId = MAX(Traces.id)` at open (lifecycle.cc:611), so a
+  crash between the two → next process REUSES id N → the stale durable `History(N)` aliases a
+  different trace → a `__ca:` producer lookup mis-resolves. Baseline is SAFE (flushes Traces FIRST).
+  So a crash here is NOT merely "a miss next run" — under the aggressive shape (no flattened-dep
+  backstop) it is a candidate STALE SERVE (wrong answer). Latent today (default-off + conservative
+  backstop + needs crash AND id-reuse), but it MUST be closed before the aggressive shape ships.
+  Layer 2a (below) closes it. The session-end flush must also be on the SUCCESS path (a failed eval
+  shouldn't half-write).
 - **Cross-session**: the batched flush at session end must produce byte-identical DB state to N
   per-record flushes (same rows, same FK graph). MUST verify byte-identical eval + a warm-hit test
   across the session boundary.
@@ -145,14 +155,22 @@ other two hashes + both serializes (static, no shared state) CAN defer.
 
 **Layer 2 splits into two sub-pieces with very different risk:**
 
-### Layer 2a — batch the SECOND per-producer txn (~24%). LOW RISK, do first.
+### Layer 2a — batch the SECOND per-producer txn (~24%). LOW RISK, do first. ALSO the correctness completion of Layer 1.
 `publishStateChange` (sqlite-trace-storage.cc:695-704) runs its OWN `SQLiteTxn` per producer
 (Sessions/History rows) — the ~24% "unaccounted" from §3a. This is a pure Layer-1-style extension:
 defer the DB write, buffer the CurrentNode/History rows into a new `pendingCurrentNodes`, drain in
-the batched `flush` (FK-safe — `Sessions.trace_id` has no FK, #22). Keep the in-memory
-`currentNodeIndex` update synchronous. NO new thread, Layer-1-level risk. Captures most of ~24%.
-Env-gate `NIX_PRODUCER_DEFER_PUBLISH` (or fold into the existing flag). **This is the high-value,
-low-risk core of Layer 2 — recommended next step.**
+the batched `flush` (FK-safe — `Sessions.trace_id` has no FK, #22) **AFTER the Traces rows**. Keep
+the in-memory `currentNodeIndex` update synchronous. NO new thread, Layer-1-level risk. Captures most
+of ~24%. Env-gate `NIX_PRODUCER_DEFER_PUBLISH` (or fold into the existing flag).
+**REFRAMED (follow-up #24): this is not optional perf — it is the CORRECTNESS COMPLETION of Layer 1.**
+Layer 1 (defer `flush()` only) leaves `publishStateChange` committing the durable History/Sessions
+row per-producer while the Traces row defers → a History-before-Traces durability inversion → on
+crash + trace-id reuse (`nextTraceId = MAX(Traces.id)`, lifecycle.cc:611) a stale History row aliases
+a different trace. Draining the buffered CurrentNode/History rows in the SAME teardown txn, ordered
+after the Traces rows, restores the baseline Traces-before-History ordering and closes the hazard. So
+Layer 2a must ship WITH Layer 1 before the aggressive shape can rely on the deferred path (the
+aggressive shape removes the conservative flattened-dep backstop that masks the aliasing today).
+**This is the recommended next step — high-value, low-risk, AND it closes the #24 hazard.**
 
 ### Layer 2b — move FullTraceHash + DepKeySetHash + serialize off-thread (~20-23%). HIGH RISK, defer.
 A background worker doing the deferred CPU. **The blocker the subagent found (verified):**
