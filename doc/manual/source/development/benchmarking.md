@@ -42,8 +42,11 @@ ninja
 
 This will create benchmark executables in the build directory. Currently available:
 - `build/src/libstore-tests/nix-store-benchmarks` - Store-related performance benchmarks
+- `build/src/libfetchers-tests/nix-fetchers-benchmarks` - Source-materialisation mechanism benchmarks (fingerprint composition, projection key encoding, the filtered-shape walk)
 
 Additional benchmark executables will be created as more benchmarks are added to the codebase.
+
+For the cross-implementation comparison (this Nix vs. upstream vs. the Determinate Systems fork) on whole-evaluation workloads, see the separate harness under [`benchmarks/`](https://github.com/NixOS/nix/tree/master/benchmarks) in the repository root, which is a black-box CLI comparator (Google Benchmark links a single tree's libraries and so cannot compare across forks).
 
 ## Running Benchmarks
 

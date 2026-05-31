@@ -91,3 +91,40 @@ test(
   },
   protocol : 'gtest',
 )
+
+# Build benchmarks if enabled. These microbenchmark OUR source-materialisation
+# mechanisms (fingerprint composition, projection key encoding, the
+# filtered-shape walk) as a single-tree regression guard. The cross-tree
+# comparison lives in benchmarks/ (gbench links one tree's libs and so cannot
+# compare across forks).
+if get_option('benchmarks')
+  gbenchmark = dependency('benchmark', required : true)
+
+  benchmark_sources = files(
+    'bench-main.cc',
+    'fingerprint-bench.cc',
+    'filtered-shape-bench.cc',
+    'projection-bench.cc',
+  )
+
+  benchmark_exe = executable(
+    'nix-fetchers-benchmarks',
+    benchmark_sources,
+    dependencies : deps_private_subproject + deps_private + deps_other + [
+      gbenchmark,
+    ],
+    include_directories : include_dirs,
+    link_args : linker_export_flags,
+    install : true,
+  )
+
+  benchmark(
+    'nix-fetchers-benchmarks',
+    benchmark_exe,
+    env : {
+      '_NIX_TEST_UNIT_DATA' : meson.current_source_dir() / 'data',
+      'HOME' : meson.current_build_dir() / 'bench-home',
+      'NIX_STORE' : '',
+    },
+  )
+endif
