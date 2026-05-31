@@ -92,6 +92,8 @@ sources = files(
   'eval-trace/store/derivation-edge-soundness.cc',
   'eval-trace/store/derivation-observation-facets.cc',
   'eval-trace/store/dep-flattening-baseline.cc',
+  'eval-trace/store/derivation-input-flattening.cc',
+  'eval-trace/store/derivation-edge-loadbearing.cc',
   'eval-trace/store/derivation-outpath-soundness.cc',
   'eval-trace/store/copied-path.cc',
   'eval-trace/store/nar-identity.cc',
