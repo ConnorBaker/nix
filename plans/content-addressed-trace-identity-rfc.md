@@ -217,3 +217,78 @@ Caveats: all counts are n=1 on `closures.gnome`/`python3Packages`; drvPath is
 verified content-addressed (`DrvPath_IsContentAddressedByInputs`); the
 per-derivation scope overhead is the one number that decides this and is
 UNMEASURED.
+
+## 8. Outcome (2026-05-31): MEASURED, NET LOSS, DEFAULT-OFF
+
+The §7 measurement was completed. The conservative shape (no consumer-side
+isolation; producer trace persisted alongside flattened consumer deps) measured
+as a NET LOSS on the Ledger-D anchor (`closures.gnome`, 100 commits):
+
+| | reference (no-trace) | cold (mean / median) | hot (mean) |
+|---|---:|---:|---:|
+| pre-§3b (run-1)  | 6.47s | 3.72s / 1.11s | **0.96s** (cache works) |
+| with §3b (run-2) | 6.23s | **13.44s / 13.32s** | **13.47s** (cache mostly bypassed) |
+| Δ                | (noise) | **3.6× slower** | **14× slower** |
+
+Soundness PASS — `nix eval` is byte-identical with vs without the hook.
+Performance regression is real and large.
+
+**Decision: ship default-OFF.** The hook is gated on
+`NIX_ENABLE_CA_PRODUCER=1`. The infrastructure (~17 commits, ~22 production
+tests across 4 test files, plus 6 store-level tests) stays in tree as proven
+scaffolding. Default behavior is identical to pre-§3b.
+
+**Why the conservative shape lost.** The consumer keeps its flattened deps
+(soundness floor unconditional), and the producer trace is persisted in
+addition. So every `derivationStrict` call now records TWO traces: the
+consumer's (as before) and a new CA-keyed producer. Cost: ~6,419 producer
+records/commit. Benefit: the gate (`replayMemoizedDeps`) fires ~614 times per
+commit on average — small. Hot is especially bad because cache-hit at the root
+trace materializes a STRING (`closures.gnome.x86_64-linux`), but evaluating
+that string still re-runs derivation thunks deep in `make-derivation.nix`, and
+the hook fires for each. Per-session in-memory dedup helps within one process
+but each `nix eval` is a fresh process, so the dedup doesn't span invocations.
+
+**Why the aggressive shape was reverted earlier.** Sub-scope isolation around
+`forceAttrs(*args[0])` + `derivationStrictInternal` was tried before the
+conservative shape. It under-records ambient-eval deps that legitimately flow
+into the consumer scope but aren't tied to the producer's content (e.g.,
+`config.nix` reads from `mkDerivation`'s body, the flake source path identity).
+Functional tests `eval-trace-core` and `eval-trace-deps` failed under the
+aggressive shape — the consumer lost deps it needed.
+
+**Critical adversarial-fix history (committed):**
+- `8d393a1e9` — `producerBloom` template params were misread:
+  `<Bits, PointerAlignment>` not `<NumSlots, NumHashes>`. Initial alignment 4
+  (wrong); fixed to 16 to match GC-allocated `Bindings *`.
+- `b8ae91b12` — `producerMap` keyed by `Bindings *`, not `Value *`. With
+  `Value *` keying the gate **never fired** in real eval (`producerEdges = 0`
+  despite 1129 producers persisted). Root cause: `prim_derivationStrict` receives
+  `&v` that is `&vCur` — `callFunction`'s stack-local. After return,
+  `vRes = vCur` (eval.cc:2530) COPIES the result; `&vCur` becomes stale.
+  `Bindings *` is stable across the copy.
+- `82713fd91` — default-off via `NIX_ENABLE_CA_PRODUCER=1` after bench measurement.
+
+**Conditions that would justify re-enabling.** The infrastructure is sound; the
+cost is the blocker. Re-enabling becomes attractive when one or more of:
+1. **Async/batched producer recording.** `recordSync` runs synchronously per
+   derivation. If producer-trace persistence batches at session end (or runs on
+   a background thread with `traceId` reconciliation deferred), the per-call cost
+   drops dramatically.
+2. **Suppress on warm-served derivations.** When the consumer's TracedExpr is
+   serving from cache, derivation thunks inside re-run as part of materialize.
+   The hook firing here costs 100% (every record) for 0% benefit (the consumer
+   isn't recording a new trace anyway). Detection requires plumbing not present
+   today.
+3. **Sibling-share-heavy workloads.** The gate fires from `SiblingForceScope` and
+   `forceValue`'s replay branch (bloom-gated). On `closures.gnome` it fires ~614
+   times/commit. A `nix-eval-jobs`-style deep attrset enumeration might exercise
+   it more. NOT MEASURED on that workload yet.
+
+**Cross-references.**
+- Production code documented: `src/libexpr/eval-trace/CLAUDE.md` "RFC §3b" section.
+- Test guide: `src/libexpr-tests/eval-trace/CLAUDE.md` `dep/` section.
+- Bench data + adversarial-fix narrative: `doc/eval-trace-cache-redesign-plan.md`
+  "2026-05-31 follow-up #4".
+- Architectural backstory: `plans/architecture-trace-model-vs-CA.md`,
+  `plans/compositional-trace-dag-design.md`.

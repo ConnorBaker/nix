@@ -80,7 +80,7 @@ findings-doc "Promising Directions". Each lever traces to repo text; the
 | # | Lever | Status / evidence | Source |
 |---|---|---|---|
 | **1** | **Observed-key / unobserved-change PRUNING proof**, made sound-by-construction and transparent to `libexpr` | The single biggest measured win in the whole log (cold 3.32→1.88 s, hot 0.88→0.38 s, v6→v11). Works by **slicing/removing coarse deps**, NOT adding finer ones. **Caveats:** (a) was command-JSON-only (disqualified layer); (b) gated on Nixpkgs path heuristics + env vars, not sound by construction; (c) coverage stops at the observed-key universe — `attrNames`/negative-membership/recursive-attrset are UNSOLVED. It is a tail-rescue (kills ~9 catastrophic outliers; median/p90 barely move), not a hot-path median mover. | redesign-plan §2026-05-29 CORRECTION finding 2; work-log v6→v11 |
-| **2** | **Semantic derivation-boundary caching** (Bazel/Skyframe strict dependency capture + facet mask) | **NOT VIABLE as scoped — feasibility spike hit a material architectural blocker (2026-05-30).** Outliers re-eval ~20 M thunks; the 6,419 derivations inside (99.66 % unchanged) have no reuse boundary, ~58 % of cost is cacheable derivation eval. Spike (branch `spike/lever2-derivation-feasibility`) measured 10,455 derivations evaluated vs 6 traces recorded, then hit the blocker: to verify-before-force a derivation it must be a `TracedExpr`, but `TracedExpr` identity is **attr-path-tree-shaped** (Root or Child-with-parent-and-name), and a `derivationStrict` thunk created deep in `make-derivation.nix` has no attr-path from the eval root — `makeChild` cannot construct it. Caching derivations needs a **second content-addressed `TracedExpr` identity model** threaded through evaluator thunk creation = foundational redesign on the hot path, RFC-scale, not a lever. Verdict: leave the cold tail bounded + sound. Full chain: `plans/lever2-derivation-boundary-caching.md` §7-11. **UPDATE 2026-05-30: that "second identity model" is now the written RFC `plans/content-addressed-trace-identity-rfc.md`, and its CONSUME side is proven (`store/ca-trace-key-routing.cc` R1/R2/R3) — only the `derivationStrict` producer boundary is net-new+unbuilt, gated on the RFC §7 hot-path measurement. See Option 3 below.** | redesign-plan §2026-05-30 spike + §2026-05-30 RFC convergence; findings.md "Derivation Boundary Proof" |
+| **2** | **Semantic derivation-boundary caching** (Bazel/Skyframe strict dependency capture + facet mask) | **NOT VIABLE as scoped — feasibility spike hit a material architectural blocker (2026-05-30).** Outliers re-eval ~20 M thunks; the 6,419 derivations inside (99.66 % unchanged) have no reuse boundary, ~58 % of cost is cacheable derivation eval. Spike (branch `spike/lever2-derivation-feasibility`) measured 10,455 derivations evaluated vs 6 traces recorded, then hit the blocker: to verify-before-force a derivation it must be a `TracedExpr`, but `TracedExpr` identity is **attr-path-tree-shaped** (Root or Child-with-parent-and-name), and a `derivationStrict` thunk created deep in `make-derivation.nix` has no attr-path from the eval root — `makeChild` cannot construct it. Caching derivations needs a **second content-addressed `TracedExpr` identity model** threaded through evaluator thunk creation = foundational redesign on the hot path, RFC-scale, not a lever. Verdict: leave the cold tail bounded + sound. Full chain: `plans/lever2-derivation-boundary-caching.md` §7-11. **UPDATE 2026-05-31: the §3b producer-trace boundary IS implemented + benchmarked, but is a NET LOSS on Ledger-D (cold 3.6× / hot 14× slower) and ships DEFAULT-OFF behind `NIX_ENABLE_CA_PRODUCER=1`. The cost (one persisted CA producer trace per derivation) far exceeds the benefit (the replay-time gate fires only ~614 times per commit). Soundness PASS. See Option 3 below.** | redesign-plan §2026-05-30 spike + §2026-05-31 follow-up #4 bench; findings.md "Derivation Boundary Proof" |
 | **3** | **Certificate-before-payload** fast path (fixed-size `FullTraceHash` compare before `loadFullTrace` + dep walk) | LOW priority. Every *sound* form was already refuted on this workload (runs 909/980/987/1032/1042/1133/1107/1108…). The dep walk IS the hot cost for true exact hits (unsound oracle run 1015: hot 0.68 vs 0.88 s), but the residual hot cost is decode/startup, not the walk, once the `verifiedTraceIds` memo is in place. Only un-refuted shape: a cheap per-current-node eligibility bit/index that clears the run-993 coverage bar. | redesign-plan §2026-05-29 CORRECTION finding 1 |
 | **4** | **Custom immutable-segment store** (generation packs, mmap fixed-width indexes, lock-free readers, atomic `CURRENT`) | Deferred until 1–3 prove the proof model wins. Storage format is **downstream of authorization**: run 137 showed lazy-payload-over-immutable-objects does NOT beat SQLite without the authorization fix. Do NOT re-abstract `TraceStorage` (the vptr was added per rearch-proposal §2.1, measurably hurt the hot loop, and was reversed). | redesign-plan "Architectural direction" + §2026-05-29 finding 4; storage-backend-research.md |
 
@@ -275,34 +275,35 @@ in place. The remaining options, in rough order of effort/payoff:
    that, not L-B, is the real hot opportunity, and it needs a `runs --verbose`
    measurement first.
 
-3. **The content-addressed trace-node RFC — WRITTEN + consume-side PROVEN
-   (2026-05-30), `plans/content-addressed-trace-identity-rfc.md`.** Give a small
-   principled set of non-attr-path values (derivations, keyed by the existing
-   `drvPath = hashDerivationModulo(inputs)`) a content-addressed trace identity, so
-   a value reached from N attr-paths records ONCE and is referenced by N EDGES
-   instead of flattening its closure into each consumer. This is the direct answer
-   to the "you can't cache hundreds of millions of values" barrier — it caches
-   FEWER nodes (≈6,419 derivations/closure, same order as today's ≈10,397 attr-path
-   nodes) and BOUNDS the flattening rather than eliminating it. **State of the
-   proof:**
+3. **The content-addressed trace-node RFC — IMPLEMENTED + BENCHMARKED + DEFAULT-OFF
+   (2026-05-31), `plans/content-addressed-trace-identity-rfc.md`.** The infrastructure
+   shipped in tree (~17 commits past origin), gated on `NIX_ENABLE_CA_PRODUCER=1`.
+   **State of the proof:**
    - **Consume side DONE** (`store/ca-trace-key-routing.cc`, 3 tests): Design A (a
-     synthetic `"__ca:<drvHash>"` vocab key via `internName`) round-trips, two
-     cross-scope consumers share one CA producer via a `TraceValueContext` edge and
-     both hit (R1/R2), and a producer-input change invalidates both (R3). The
-     existing `resolveTraceContextHash` edge-verify machinery carries it with **zero
-     production change**.
+     synthetic `"__ca:<drvHash>"` vocab key via `internName`) round-trips through
+     the existing pipeline.
    - **The edge must be a trace-hash edge, not the existing SPA dep**
-     (`store/derivation-input-flattening.cc`, 2 tests): the
-     `StorePathAvailability(.drv)` dep is an INERT existence check (identical
-     before/after an input change); the load-bearing carrier is the flattened
-     `FileBytes`. So the producer edge folds in input deps — additive recorder work.
-   - **Net-new + unbuilt:** ONLY the §3b producer-trace boundary at
-     `derivationStrict` (a `DepCaptureScope` on the hot eval path, ~10 K/closure).
-     Carries the v53/vptr precedent warning. **Go/no-go = the RFC §7 smallest-slice
-     measurement** (does it record ~6,419 deduped producer traces; per-derivation
-     scope overhead on Ledger-D; does cold storage drop). Still gated on (2) showing
-     the derivation boundary is the dominant cost across real workloads, not just
-     GNOME. Full direction: redesign-plan §"2026-05-30 — the arc converges".
+     (`store/derivation-input-flattening.cc`, 2 tests): SPA is an inert existence
+     check; load-bearing carrier is the flattened `FileBytes`.
+   - **Producer side WIRED into `prim_derivationStrict`** with synchronous
+     `TraceSession::recordCAProducer` API (mirrors `recordRuntimeRoot`'s shape — no
+     `EvalContext<Suspendable>` threading, no C-extension API breakage). Producer
+     keyed by `Bindings *` (stable across the `vRes = vCur` copy in `callFunction`;
+     `Value *` was tried first and gave `producerEdges = 0` always). Bloom-fast-
+     rejected lookup on the hot path. 22 production tests (all probe-verified).
+   - **§7 measurement DONE — net loss on closures.gnome.** Bench (Ledger-D anchor,
+     100 commits): cold 3.72s → 13.44s (3.6× slower); hot 0.96s → 13.47s (14× slower;
+     cache mostly bypassed because derivation thunks re-run during materialize and
+     trigger the hook even on warm-verify). Soundness PASS (byte-identical eval).
+     The conservative shape's cost (~6,419 producer trace records/commit) far
+     exceeds its benefit (~614 gate fires/commit).
+   - **Decision: default-OFF via `NIX_ENABLE_CA_PRODUCER=1`.** The infrastructure
+     stays in tree as proven scaffolding. Re-enable becomes attractive when the
+     cost profile changes — async/batched producer recording, suppress-on-warm-
+     verify-served, or sibling-share-heavy workloads (`nix-eval-jobs`-style)
+     where the gate fires frequently enough to amortize. Full bench detail +
+     adversarial-fix history: redesign-plan "2026-05-31 follow-up #4". Production
+     code documented in `src/libexpr/eval-trace/CLAUDE.md` "RFC §3b" section.
 
 4. **Lever 3 (certificate-before-payload), low priority.** Targets hot, which is
    already flat — every sound form was refuted (see table). Not worth it absent a

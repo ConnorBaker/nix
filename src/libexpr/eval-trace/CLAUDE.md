@@ -260,6 +260,112 @@ boundary APIs.
   `fetchClosure` are outside the plan's stated scope (store writes /
   legacy builtins).
 
+## RFC §3b — content-addressed producer-trace boundary (DEFAULT-OFF)
+
+Implementation lives in tree but is gated on `NIX_ENABLE_CA_PRODUCER=1`.
+Default behavior is identical to pre-§3b. The infrastructure stays in
+tree as proven scaffolding.
+
+**What it does (when enabled).** After `prim_derivationStrict` produces
+a derivation result Value, the hook (in `src/libexpr/primops.cc:1554`)
+snapshots the epoch-log range that grew during the call and persists it
+as a CA-keyed producer trace via `TraceSession::recordCAProducer`. The
+result Value's `Bindings *` is registered in `MemoReplayStore::producerMap`.
+Subsequent `replayMemoizedDeps` calls on the same Value emit a single
+`TraceValueContext` edge to the CA producer trace instead of replaying
+the flattened deps.
+
+**Code surface (production):**
+- `MemoReplayStore::producerMap` (`Bindings *` → `{caKey, traceHash}`)
+  in `src/libexpr/include/nix/expr/eval-trace/deps/memo-replay-store.hh`
+  — `traceable_allocator`, BUG-7 hazard handled by `insert_or_assign`.
+- `MemoReplayStore::producerBloom` — `PointerBloomFilter<1<<16, 16>`
+  for fast-rejecting `lookupProducer` on the ~22M-call hot path. k=2
+  hashes (filter is hard-coded that way), aligned 16 to match
+  GC-allocated `Bindings *`. ~3% FPR at n=6,419 producers.
+- `TraceBackend::recordSync` / `verifySync` — synchronous mirror of
+  `recordRuntimeRoot`'s `Certifier<BlockingTag>::withProof` +
+  `withExclusiveAccess` shape; no `EvalContext<Suspendable>` required.
+- `TraceSession::recordCAProducer` — primop-friendly facade computing
+  `__ca:<drvHash>` CA key, persisting trace, registering Value's
+  `Bindings *`. Per-session in-memory dedup via `lookupProducer`
+  short-circuits when the same derivation is forced multiple times in
+  one process.
+- The replay-time gate in `TraceRuntime::replayMemoizedDeps` extracts
+  `producerKeyFor(v) = v.attrs() if nAttrs else nullptr` and consults
+  `lookupProducer` (bloom-fast-rejected). Fires from
+  `SiblingForceScope::commit` and `EvalState::forceValue`'s
+  `replayMemoizedDeps` branch (when `traceActiveDepth && bloom hit`).
+- `nrReplayProducerEdges` counter under `evalTrace.replay.producerEdges`
+  in NIX_SHOW_STATS JSON.
+
+**Why DEFAULT-OFF — bench measurement (Ledger-D, 100 commits
+closures.gnome, 2026-05-31).** Soundness PASS (byte-identical eval).
+Wall-time:
+
+| | reference (no-trace) | cold | hot |
+|---|---:|---:|---:|
+| pre-§3b (run-1) | 6.47s | 3.72s mean / 1.11s median | 0.96s |
+| with §3b (run-2) | 6.23s | 13.44s mean / 13.32s median | 13.47s |
+| Δ | (noise) | **3.6× slower** | **14× slower** |
+
+The conservative shape (no consumer-side dep isolation; producer trace
+persisted alongside flattened consumer deps) costs ~6,419 producer trace
+records per commit. The replay-time gate fires only ~614 times per commit
+(small benefit). Hot is especially bad because cache-hit on the root
+trace still re-runs derivation thunks during materialize, triggering
+the hook even when the consumer trace would otherwise serve from cache.
+
+**Why the aggressive shape was reverted.** Sub-scope isolation around
+`forceAttrs(*args[0])` + `derivationStrictInternal` was tried (commit
+`13cf303d2` initial version, reverted in `13cf303d2`'s amended form).
+It under-records: ambient-eval deps that legitimately flow into the
+consumer scope but aren't tied to the producer's content (e.g.,
+`config.nix` reads from `mkDerivation`'s body, the flake source path
+identity) get lost when isolated. Functional tests `eval-trace-core` /
+`eval-trace-deps` failed under the aggressive shape.
+
+**Critical adversarial-fix history (committed):**
+- `8d393a1e9` — `producerBloom` template params: `<Bits,
+  PointerAlignment>` not `<NumSlots, NumHashes>`. Initial alignment 4
+  (wrong); fixed to 16 to match GC `Bindings *`.
+- `b8ae91b12` — `producerMap` keyed by `Bindings *`, not `Value *`.
+  With `Value *` keying the gate **never fired** in real eval (`producerEdges
+  = 0` despite 1129 producers persisted) because `prim_derivationStrict`
+  receives `&vCur` — `callFunction`'s stack-local. After return, `vRes
+  = vCur` (eval.cc:2530) COPIES the result; `&vCur` becomes stale.
+  `Bindings *` is stable across the copy because `Value::mkAttrs(b)`
+  stores the pointer.
+- `82713fd91` — default-off via `NIX_ENABLE_CA_PRODUCER=1`. Bench-driven.
+
+**Conditions for re-enabling.** The infrastructure is sound; the cost
+profile is the blocker. Re-enabling becomes attractive when one or more
+of: (a) producer-trace recording is async/batched (current `recordSync`
+runs synchronously on the eval thread per derivation), (b) the hook is
+suppressed when the caller's consumer trace is already being warm-served
+(detection requires plumbing not present today), (c) workload shifts to
+sibling-share-heavy patterns where the gate fires more frequently
+(`nix-eval-jobs`'s deep-attrset enumeration may exercise it).
+
+**Test surface** — see `src/libexpr-tests/eval-trace/CLAUDE.md` for the
+full test guide. 22 tests across 4 files
+(`dep/producer-side-table.cc`, `dep/replay-producer-gate.cc`,
+`dep/ca-producer-scope.cc`, `dep/trace-session-record-ca-producer.cc`)
+plus 6 store-level tests (`store/ca-producer-boundary-recording.cc`,
+`store/ca-trace-key-routing.cc`). All probe-verified.
+
+**Cross-references.**
+- RFC: `plans/content-addressed-trace-identity-rfc.md`
+- Architectural backstory: `plans/architecture-trace-model-vs-CA.md`,
+  `plans/compositional-trace-dag-design.md`
+- Bench data + history: `doc/eval-trace-cache-redesign-plan.md`
+  "2026-05-31 follow-up #4"
+- Soundness floor: `store/derivation-edge-soundness.cc`,
+  `store/derivation-observation-facets.cc`,
+  `store/dep-flattening-baseline.cc`,
+  `store/derivation-outpath-soundness.cc`,
+  `store/keyset-escape.cc`.
+
 ## Open research: known soundness and precision gaps
 
 These are verified-real gaps that the short-commit sequence of mechanical
