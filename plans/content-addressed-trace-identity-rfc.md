@@ -29,12 +29,33 @@ CHILDREN; nothing else gets one. Verified three ways:
   (`recordThunkDeps`, memo-replay-store.hh:93) flattens (copies) into every
   consumer that forces it. THAT is the per-derivation 607×.
 
-Crucially: the content-addressed identity already EXISTS and is already recorded
-— `drvPath = hashDerivationModulo(inputs)` (primops.cc:1994), emitted as a
+Crucially: the content-addressed identity already EXISTS as a *value* —
+`drvPath = hashDerivationModulo(inputs)` (primops.cc:1994), emitted as a
 `StorePathAvailability(.drv)` dep (primops.cc:2003-2011). The gap is not "compute
 an identity"; it is "**the derivation's input-reads are recorded against the
 consumer's positional trace instead of against the derivation's existing
 content identity.**"
+
+> **MEASURED CORRECTION (2026-05-30, real evaluator — see
+> `store/derivation-input-flattening.cc` + `store/derivation-edge-loadbearing.cc`):**
+> The `StorePathAvailability(.drv)` dep is NOT a usable input-identity edge.
+> It verifies by `isValidPath(oldDrvString)` — a pure EXISTENCE check
+> (store-path-availability.cc) — so its answer is *identical before and after*
+> the derivation's input changes (the old `.drv` string is what's recorded; in a
+> real store it stays valid). Two real-eval facts now pinned:
+> 1. A derivation whose `args` embed `readFile(shared)`, consumed by two siblings
+>    via `.outPath`, flattens the shared `FileBytes` into BOTH consumer traces
+>    (the 607× mechanism is REAL for derivations) — *alongside* an inert SPA dep.
+> 2. The flattened `FileBytes` is therefore **load-bearing** for soundness; the
+>    SPA dep cannot distinguish v1-input from v2-input.
+>
+> **Consequence for the design:** the producer-trace edge in §3 must be a
+> producer-TRACE-HASH edge (a `TraceValueContext`-style dep whose value folds in
+> the derivation's input deps), NOT the existing SPA dep. `drvPath`-the-string is
+> input-addressed, but the SPA *dep* discards that. §3b already specifies a
+> trace-hash edge, so the design target is unchanged — but the "already recorded"
+> framing above was an over-claim: only the trace-hash edge tracks inputs, and it
+> does not exist yet. This is additive recorder work, confirmed by measurement.
 
 ## 2. What is being proposed (one sentence)
 
@@ -66,6 +87,18 @@ Add a parallel routing key: a content-addressed identity
 recovery pipeline works unchanged). The spike confirmed
 `resolveTraceContextHash` already does recursive, memoized, cycle-broken edge
 verification (verifier.cc:243-278) — the consume side needs NO new machinery.
+
+> **PINNED (2026-05-30, `store/ca-trace-key-routing.cc`):** Design A's
+> routing mechanism is proven against the real store/vocab/verify pipeline
+> with no production change: (R1) a producer trace recorded under a synthetic
+> `"__ca:<drvHash>"` key round-trips and verifies as a first-class trace
+> identity; (R2) TWO consumers at genuinely DIFFERENT attr-path positions both
+> edge to the SAME CA producer (via the `TraceValueContext` trace-hash edge)
+> and BOTH hit — the cross-scope sharing C2b could not show with a literal
+> vpath; (R3) mutating the shared producer's input changes its trace hash and
+> invalidates BOTH consumers' edges. The edge is load-bearing, not vacuous:
+> corrupting the stored producer hash flips R2 to a miss. This is the
+> consume-side floor; only the §3b producer-trace boundary is net-new.
 
 ### 3b. A producer-trace boundary at `derivationStrict`
 Wrap the `derivationStrict` result evaluation in its own dep-capture scope (the
