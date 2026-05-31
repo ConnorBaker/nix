@@ -66,16 +66,19 @@ only the current settled state:
   derivation-flatten-instances over ~thousands of distinct derivations) gives **mean
   ~200–2,000 consumers per derivation** — insensitive to the one unpinned input across
   its whole plausible range; N≫1 robustly. So the SHARING premise is settled.
-  TWO go/no-go numbers remain UNMEASURED (an adversarial pass on #11 corrected an
-  overstatement — see follow-up #11's correction box): (1) the args-force sub-scope
-  HOT-PATH COST (§6); (2) the BENEFIT MAGNITUDE — a derivation edge removes only the
-  *derivation-closure* portion of the 607× flattening, which is **35–90%, unpinned**
-  (SPA 34.9% removed for sure; StructProj 48.4% is the plurality and whether it is
-  derivation-closure or the consumer's own `fromJSON` reads is UNVERIFIED). #11 first
-  implied the edge collapses the whole 607× — that was wrong; sharing-exists ≠
-  edge-removes-everything. Both numbers need the §8-step-3 prototype + real
-  python3Packages data. See `doc/eval-trace-cache-redesign-plan.md` follow-ups #10
-  (mechanism), #11 (population + the benefit-magnitude correction).
+  Both go/no-go numbers are now MEASURED (§8-step-3 prototype built, follow-ups #12–#15):
+  - **BENEFIT ≈ 63% per-consumer dep reduction** (+ a separate, larger producer-closure
+    STORAGE dedup). The edge model keeps ONE edge per DISTINCT derivation a consumer
+    references (mean ~1,213), collapsing mean ~3,296 consumer deps → ~1,213 edges = ~63%.
+    NOT the ~99% an earlier pass briefly claimed (that conflated "fraction that is
+    derivation-closure" with "fraction removed" — corrected #15), and above the 37%
+    SPA-only floor. Bounded by distinct-derivations-per-consumer, a measured quantity.
+  - **HOT COST ≥ 11% scope-structural** (per-derivation sub-scope ctor/accumulate/take/dtor,
+    measured python3Packages; a LOWER bound — the real shape adds the §3b-measured
+    producer-recordSync on top; a 23× re-record proxy was caught + discarded, #14).
+  Net: plausibly positive on dep-count/storage, but the net WIN is gated on the
+  producer-record cost (§3b's dominant net-loss term) coming down via async/batched
+  recording — §3b's condition (a), never built. See follow-ups #12–#15.
 - **Honest scope:** ALT-4 (verify-time fragment sharing, §7.8) remains a real
   alternative regardless.
 
