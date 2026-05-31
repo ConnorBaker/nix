@@ -53,29 +53,38 @@ site at which a RECORD-TIME edge can replace that flatten is a dep-capture sub-s
 around that force — the aggressive shape. So within the *record-time-edge* family,
 the design space has funneled to "make the aggressive shape sound."
 
-> **Scope honesty (adversarial pass #9, Attack M — the funnel is NOT the whole
-> design space).** The funnel above exhausts the RECORD-TIME-edge family (replace the
-> flatten as it is recorded). It does NOT exhaust ways to attack the 607× cost. The
-> notable un-refuted alternative is **ALT-4: verify-time fragment sharing** — keep
-> the conservative flattened recording, but at VERIFY collapse identical shared
-> sub-closures so a shared closure (stdenv) is verified ONCE per session instead of
-> re-walked in all 607 consumers. This attacks the same 607× re-verify cost WITHOUT a
-> record-time sub-scope, so it SIDESTEPS the vptr-in-hot-loop hazard that is this
-> RFC's biggest risk (§6). It is materially different from the aggressive shape and
-> is NOT cleanly refuted: it is adjacent to L-A (dep-fragment factoring, refuted
-> because the global dep sort + positional `dep.ordinal` prevent fragment
-> composition — `perf-levers-cold-and-hot.md`) and to L-B (session dep-verdict memo,
-> refuted because L1 `currentDepHashes_` already memoizes per-DEP), but ALT-4 is
-> per-FRAGMENT (a shared sub-closure verified once), which neither refutation
-> directly covers. Why this RFC pursues the record-time edge anyway: ALT-4 inherits
-> L-A's unsolved blocker (the flat global dep vector has no fragment boundaries to
-> share — the trace stores a flattened set, not a sub-closure DAG), so ALT-4 needs
-> the SAME compositional-trace-node identity this RFC's producer trace provides. The
-> two converge: a producer trace IS the verify-once fragment. So the RFC's design is
-> a prerequisite for ALT-4, not an alternative to it — but the RFC should not claim
-> "nothing else," and the verify-only variant (conservative record + edge only at
-> verify) is a real fallback if the record-time hot-path cost (§6) proves
-> prohibitive. Added as §7.8.
+> **Scope honesty (adversarial pass #9, Attack M; CORRECTED by pass #10, Attack N —
+> the funnel is NOT the whole design space, and the first correction over-reached).**
+> The funnel above exhausts the RECORD-TIME-edge family (replace the flatten as it is
+> recorded). It does NOT exhaust ways to attack the 607× cost. The notable
+> alternative is **ALT-4: verify-time fragment sharing** — at VERIFY, recognize that
+> consumers C1, C2 both contain stdenv's flattened sub-closure and verify it ONCE per
+> session instead of re-walking it in all 607 consumers.
+>
+> Pass #9 claimed ALT-4 "needs no record-time change" and "this RFC is a prerequisite
+> for ALT-4." Pass #10 (Attack N) found BOTH claims wrong — they were rationalizations
+> to keep this RFC central:
+> 1. **This RFC and ALT-4 are MUTUALLY-EXCLUSIVE ALTERNATIVES, not prerequisite +
+>    dependent.** This RFC makes the consumer store an EDGE (no flattened closure);
+>    ALT-4 keeps the consumer's flattened closure and dedups it at verify. If you do
+>    this RFC, there is no flattened closure left for ALT-4 to dedup — ALT-4 is
+>    MOOTED, not enabled. "A producer trace IS the verify-once fragment" conflated two
+>    designs that store different things in the consumer.
+> 2. **ALT-4 is NOT record-change-free.** Per the L-A refutation
+>    (`perf-levers-cold-and-hot.md`: the global dep sort + positional `dep.ordinal`
+>    mean a sub-closure is NOT a contiguous run in the flat vector), ALT-4 would need
+>    the recorder to MARK fragment boundaries — a record-time change too, just not a
+>    force-time sub-scope. So ALT-4 trades the §6 force-time-sub-scope hazard for a
+>    different record-time change + verify-time fragment-matching cost; it does not
+>    avoid touching the recorder.
+> Honest standing: ALT-4 is a genuine, materially-different alternative (not refuted,
+> not a mere prerequisite step) whose cost profile (record-mark + verify-dedup) vs
+> this RFC's (force-time sub-scope) is unmeasured on both sides. This RFC pursues the
+> record-time edge because it reuses the already-proven edge-verify machinery
+> (`ca-trace-key-routing.cc`, `resolveTraceContextHash`) end-to-end, whereas ALT-4's
+> verify-time fragment matcher is undesigned. That is a maturity argument, NOT a
+> dominance argument. §7.8 records ALT-4 as a real competing direction to evaluate,
+> not a fallback that this RFC unlocks.
 
 ## 2. The core soundness obligation (REPRODUCER, corrects the revert prose)
 
@@ -440,15 +449,20 @@ signal the observation was not output-only).
    exists; then the only remaining question is whether the args-force edge CAPTURES
    that sharing, which needs the prototype. If even the conservative-recorder sharing
    count is ~1 across the board, STOP.
-8. **Verify-time-only fallback (pass #9, Attack M / ALT-4).** If the record-time
-   hot-path cost (§6) proves prohibitive, the fallback is: keep conservative flattened
-   recording (no sub-scope, no hot-eval-path change) and collapse shared sub-closures
-   at VERIFY time, so a shared producer is verified once per session. This needs the
-   SAME compositional fragment identity the producer trace provides (it inherits
-   L-A's unsolved "flat dep vector has no fragment boundaries" blocker — §1 note), so
-   it is downstream of, not independent of, this RFC's identity work. Worth keeping on
-   the table explicitly because it trades the §6 hot-eval-path risk for verify-path
-   work, which is a different and possibly safer risk profile. UNDESIGNED.
+8. **ALT-4: verify-time fragment sharing — a competing direction, not a fallback
+   (pass #9 Attack M, corrected by pass #10 Attack N).** Keep conservative flattened
+   recording but mark shared sub-closure boundaries at record time, then at VERIFY
+   dedup so a shared closure is verified once per session. This is MUTUALLY EXCLUSIVE
+   with this RFC (this RFC removes the consumer's flattened closure, which ALT-4 needs
+   to dedup), NOT a step this RFC unlocks. Its cost profile — a record-time
+   fragment-boundary mark (it still touches the recorder; the flat global dep vector
+   has no fragment boundaries today, the L-A blocker) plus a verify-time
+   fragment-matcher (undesigned) — trades this RFC's force-time-sub-scope hot-eval
+   hazard (§6) for verify-path work. Neither side is measured. This RFC pursues the
+   record-time edge for MATURITY (it reuses proven edge-verify machinery —
+   `ca-trace-key-routing.cc`, `resolveTraceContextHash`) not DOMINANCE. A serious
+   evaluation should prototype-cost both before committing. UNDESIGNED on the ALT-4
+   side; this is the most important "what else" the RFC leaves open.
 
 ## 8. Recommended sequence (each gated by the standing soundness suite)
 
