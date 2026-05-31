@@ -184,6 +184,16 @@ emit_expr() {  # <workload>
 # strings → --raw. All --impure (impure fetchGit + no flake lock).
 eval_one() {  # <tree> <root> <workload> <logfile>
     local tree="$1" root="$2" wl="$3" log="$4"
+    # The eval-cache workload is a FLAKE installable (not --expr): only
+    # `nix eval <flakeref>#attr` opens the eval cache (openEvalCache is gated on a
+    # flake fingerprint). It evaluates the fixture flake's `cleaned` output (a
+    # filtered source). The eval cache persists evaluated values keyed on the
+    # locked-flake fingerprint, so a warm re-eval can skip re-evaluation entirely.
+    if [[ "$wl" == evalcache ]]; then
+        nix_run "$tree" "$root" eval --raw \
+            "git+file://$FLAKE_REPO?rev=$FLAKE_REV#cleaned" -vvvv >/dev/null 2>"$log"
+        return
+    fi
     local expr fmt; expr="$(emit_expr "$wl")"
     case "$wl" in
         interp|parsecache) fmt=--json ;;  # return ints
@@ -230,8 +240,15 @@ run_timing() {  # <tree> <workload>
     command -v hyperfine >/dev/null || { note "hyperfine missing; skipping timing"; return; }
     local tree="$1" wl="$2"
     local root="$WORK/time-$wl-$tree"; make_sandbox "$tree" "$root"
-    local expr fmt; expr="$(emit_expr "$wl")"
-    case "$wl" in interp) fmt=--json ;; *) fmt=--raw ;; esac
+    # The eval-cache workload is a flake installable; the rest are --expr.
+    local nixargs
+    if [[ "$wl" == evalcache ]]; then
+        nixargs="eval --raw 'git+file://$FLAKE_REPO?rev=$FLAKE_REV#cleaned'"
+    else
+        local expr fmt; expr="$(emit_expr "$wl")"
+        case "$wl" in interp|parsecache) fmt=--json ;; *) fmt=--raw ;; esac
+        nixargs="eval --impure $fmt --expr '$expr'"
+    fi
     # Write a tiny runner script so hyperfine invokes the isolated env.
     local runner="$root/run.sh"
     {
@@ -240,7 +257,7 @@ run_timing() {  # <tree> <workload>
         echo "  HOME='$root/home' XDG_CACHE_HOME='$root/cache' \\"
         echo "  NIX_STORE_DIR='$root/store' NIX_STATE_DIR='$root/var/nix' \\"
         echo "  NIX_LOG_DIR='$root/var/log/nix' NIX_CONF_DIR='$root/conf' NIX_REMOTE='' \\"
-        echo "  '$(bin_for "$tree")' eval --impure $fmt --expr '$expr' >/dev/null"
+        echo "  '$(bin_for "$tree")' $nixargs >/dev/null"
     } > "$runner"; chmod +x "$runner"
     # WARM timing: store/cache pre-populated (one untimed run), then measured.
     "$runner" >/dev/null 2>&1 || true
@@ -266,7 +283,7 @@ run_timing() {  # <tree> <workload>
 }
 
 # ---------------------------------------------------------------------------
-ALL_WORKLOADS=(filtered cargo crossrev pureflake interp parsecache drv filtersource)
+ALL_WORKLOADS=(filtered cargo crossrev pureflake interp parsecache drv filtersource evalcache)
 echo "Trees: $BENCH_TREES"
 for t in $BENCH_TREES; do tree_available "$t" || echo "  WARNING: tree '$t' unavailable, skipping"; done
 echo

@@ -142,6 +142,15 @@ fetchercache_rows() {  # <root>  ->  integer (0 if no db yet)
     sqlite3 "$db" "SELECT COUNT(*) FROM Cache;" 2>/dev/null || echo 0
 }
 
+# Whether an eval-cache SQLite exists + has attributes (the warm-eval substrate).
+# A populated eval-cache means a warm flake-attr re-eval can skip re-evaluation.
+evalcache_rows() {  # <root>  ->  integer (0 if none)
+    local db
+    db=$(find "$1/cache/nix/eval-cache-v6" -name '*.sqlite' 2>/dev/null | head -1)
+    [[ -n "$db" ]] || { echo 0; return; }
+    sqlite3 "$db" "SELECT COUNT(*) FROM Attributes;" 2>/dev/null || echo 0
+}
+
 # Remove a sandbox/fixture dir. Nix writes store paths read-only, so chmod first.
 cleanup_dir() {  # <dir>
     [[ -n "${1:-}" && -e "$1" ]] || return 0
