@@ -2995,3 +2995,31 @@ a bench-harness run; the order is established).
 The direction is **plausibly net-positive on dep-count/storage but gated on the producer-record
 cost** (§3b's measured dominant cost) coming down via async/batched recording — the never-built
 §3b condition (a). The prototype has measured what it can without building async recording.
+
+### 2026-05-31 follow-up #16: adversarial pass on #15 — the ~63% survives; new insight: heavy cross-derivation leaf overlap within a consumer
+
+Next mandated pass, on #15's two new claims (~63% benefit, "plausibly net-positive").
+
+**Attack 3 — ~63% STRESS-TESTED, stands; but surfaced a structural insight.** Checked whether
+"~63%" wrongly assumes an edge removes a derivation's NON-SPA flattened deps (FileBytes/StructProj
+from the derivation's inputs) and not just the SPA. It does remove them — that IS the
+aggressive-shape mechanism (the sub-scope isolates ALL of D's input-reads, replaced by 1 edge),
+and the 63% arithmetic (consumer-distinct-deps → consumer-distinct-derivations) is correct.
+
+The NEW insight from the check: mean deps-per-derivation IN THE CONSUMER = 3,296/1,213 = **2.7**,
+vs the benefit probe's **16.4** deps-per-derivation-RANGE. The 6× gap means derivation ranges
+OVERLAP heavily within a consumer — a consumer's flattened closure dedups shared leaves (stdenv
+files etc.) that belong to MANY derivations' ranges. Consequence: you cannot "remove a shared leaf
+twice"; the per-consumer edge win (~63%) is genuinely smaller than the raw 607× duplication would
+naively suggest, because much of a consumer's flattening is shared-leaf deps that multiple
+derivation-edges each cover. The ~63% already accounts for this (distinct-deps → distinct-derivations);
+the insight is WHY 63% and not more — and it tempers any "collapse the whole 607×" framing.
+
+**Attack 4 — "plausibly net-positive" hedge is appropriate.** Dep-count/storage reduction (~63%)
+helps VERIFY time + storage, but §3b's net-loss was RECORD time (producer recordSync) + hot
+re-eval. So net-positive requires verify-savings > record-cost, which is UNMEASURED and (per #15)
+gated on async/batched producer recording. The hedge stands; no correction.
+
+Net of this pass: ~63% confirmed (not corrected); one structural insight added (cross-derivation
+leaf overlap, 2.7 vs 16.4). The benefit/cost numbers are stable. Remaining genuine unknown is
+unchanged: the record-cost-vs-verify-savings net, gated on async recording (not built).
