@@ -33,6 +33,32 @@ stale-serve; routing MAY use `drvPath` because routing granularity doesn't affec
 soundness (§3, the verifier recomputes-and-compares the trace_hash). The RFC
 specifies that decoupling so isolation loses nothing the conservative shape keeps.
 
+## 0.5 Settled position (the current conclusion, without re-executing the pass history)
+
+The numbered sections carry an inline adversarial-pass trail ("pass #N found X,
+pass #M corrected it") — deliberately, as the audit record. For a reader who wants
+only the current settled state:
+
+- **Design:** open a dep-capture sub-scope at `prim_derivationStrict` entry
+  (the "aggressive shape"); finalize it as a producer trace; route by `drvPath`,
+  **verify by `trace_hash`** over the recorded sub-scope deps; the consumer records
+  one `TraceValueContext` edge instead of the flattened closure.
+- **Soundness: CLOSED.** No new hole vs the conservative shape (§3 + §7.3 dichotomy,
+  passes #2/#3; design positively confirmed by pass #13/Attack Q — `computeTraceHash`
+  is over the dep vector, so `__ignoreNulls`-dropped reads fold in). Routing key is
+  `drvPath`, determinate; do NOT fold deps into it (pass #12).
+- **The blocker is PERF, not soundness, and it is UNMEASURED:** (1) the master
+  go/no-go is the consumer-sharing ratio at the args-force boundary (§7.7b) — RP#5
+  measured the as-built gate firing ~0; if sharing is ~1 the design reduces to §3b's
+  net loss; (2) the per-`derivationStrict` sub-scope hot-path cost (§6). Storage drops
+  in aggregate (§6, the 607× is high-N-dominated) but storage-drop ≠ perf-win.
+- **Honest scope:** this is one of (at least) two directions; ALT-4 (verify-time
+  fragment sharing, §7.8) is a real mutually-exclusive alternative, undesigned, and
+  should be prototype-costed against this. This RFC is preferred on MATURITY (reuses
+  proven edge-verify machinery), not proven dominance.
+- **Next step:** §8 step 0 — the cheap kill-switch: instrument the conservative
+  recorder to count distinct consumers per producer drvPath, BEFORE any prototype.
+
 ## 1. Why this is the only remaining shape (the funnel)
 
 Each prior attempt to get *benefit* (edge replaces flatten) out of §3b was
