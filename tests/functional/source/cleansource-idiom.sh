@@ -82,17 +82,32 @@ test ! -e "$out/.svn"          || fail "cleanSource KEPT the .svn dir"
 echo "cleansource-idiom: realistic filter dropped all junk classes, kept real files"
 
 # (2) Warm re-eval: ours folds ;shape into the fingerprint, so the filtered
-# source is CACHEABLE — the second eval re-copies nothing. (On master/DetSys
-# this hits the fetch-to-store filter-bypass and re-copies; this test runs in
-# OUR tree, so we assert the cacheable behaviour.)
+# source is CACHEABLE. To make "cacheable" NON-VACUOUS we CLEAR THE STORE (but
+# NOT the fetcher cache) between the two evals: the filtered tree's store path is
+# now gone, so the only thing that can save the re-walk+re-copy is the persistent
+# `sourceContentToNarHash` row keyed on the `;shape` fingerprint. If the source
+# were uncacheable (the master/DetSys fetch-to-store.cc:41 filter-bypass), eval2
+# would re-copy into the empty store. We assert BOTH: a positive
+# sourceContentToNarHash cache-hit marker AND no re-copy. (Asserting only
+# copies==0 against a SHARED store would be vacuous — eval2 copies nothing just
+# because eval1 already populated the store, regardless of the fingerprint fix.)
+clearStore
 log2=$TEST_ROOT/eval2.log
 out2=$(nix eval --impure --raw --expr "$expr" -vvvv 2> "$log2")
 [[ "$out" == "$out2" ]] || fail "warm re-eval produced a different store path: $out vs $out2"
 
-copies2=$(count_matches "copying '" "$log2")
-[[ "$copies2" -eq 0 ]] \
-    || fail "warm re-eval of a realistic cleanSource re-copied ($copies2 'copying' lines); the filtered source is not cacheable. Log:
+# The decisive, non-vacuous signal: the filtered source resolved via the
+# persistent content-keyed cache row, not a fresh walk.
+command grep -qE "using cache entry 'sourceContentToNarHash" "$log2" \
+    || fail "warm re-eval (store cleared) did NOT hit the sourceContentToNarHash cache — the realistic filtered source is not cacheable. Log:
 $(cat "$log2")"
-echo "cleansource-idiom: warm re-eval of the realistic filtered source did 0 copies (cacheable)"
+
+# And with the store cleared, a cacheable source still must not re-COPY via a
+# NAR walk (a cache hit reconstructs the path without re-reading blobs).
+copies2=$(count_matches "copying '[^']*-cleaned'" "$log2")
+[[ "$copies2" -eq 0 ]] \
+    || fail "warm re-eval re-copied the filtered tree ($copies2 lines) despite a cleared store; not cacheable. Log:
+$(cat "$log2")"
+echo "cleansource-idiom: warm re-eval (store cleared) hit sourceContentToNarHash, no re-copy (cacheable)"
 
 echo "cleansource-idiom: ok"
