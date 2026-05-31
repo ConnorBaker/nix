@@ -9,20 +9,29 @@ re-keyings were refuted).
 All mechanism claims are cited to code at `file:line` or to a committed test /
 reproducer. Where this RFC corrects earlier in-tree prose, it says so explicitly.
 
+> **Numbering convention (two distinct sequences — do not conflate).** `RP#N`
+> refers to `doc/eval-trace-cache-redesign-plan.md` "follow-up #N" (the §3b arc,
+> RP#4–RP#8). "pass #N" / "Attack X" refers to THIS RFC's own adversarial-review
+> passes (recorded in its git commit series). Earlier drafts used a bare `#N` that
+> ambiguously straddled both; this pass (the RFC's own fresh-eyes pass) disambiguated
+> them.
+
 ## 0. One-paragraph summary
 
-§3b's measured net loss (#4) and the two refuted re-keyings (#5 value channel,
-#6/#7/#8 coercion channel) leave exactly one way for a derivation producer trace
+§3b's measured net loss (RP#4) and the two refuted re-keyings (RP#5 value channel,
+RP#6/#7/#8 coercion channel) leave exactly one way for a derivation producer trace
 to *replace* (not duplicate) the 607× flattening: isolate the derivation's
 input-reads into a producer sub-scope at the `derivationStrict` args-force
 boundary, and have each consumer record a single edge to the producer trace
 instead of the flattened closure. That isolation is the previously-reverted
 "aggressive shape." This RFC's job is to make the isolation **sound** — which
 requires solving one concrete problem, now backed by a reproducer: **a
-derivation forces input-reads that do NOT fold into its `drvPath`**, so a
-producer trace keyed by `drvPath` alone would drop them and stale-serve. The
-RFC specifies what the producer trace must be keyed/hashed by so that isolation
-loses nothing the conservative shape keeps.
+derivation forces input-reads that do NOT fold into its `drvPath`**. Verification
+must therefore be keyed by the producer's recorded dep-set hash (`trace_hash`), NOT
+by `drvPath` — a producer *verified* by `drvPath` alone would drop those reads and
+stale-serve; routing MAY use `drvPath` because routing granularity doesn't affect
+soundness (§3, the verifier recomputes-and-compares the trace_hash). The RFC
+specifies that decoupling so isolation loses nothing the conservative shape keeps.
 
 ## 1. Why this is the only remaining shape (the funnel)
 
@@ -31,14 +40,14 @@ measured or code-traced to failure. Summarizing so this RFC doesn't re-walk them
 
 | Attempt | Channel | Outcome | Evidence |
 |---|---|---|---|
-| §3b as-built (conservative) | record producer ALONGSIDE flattened consumer deps | net loss; gate fires ~614 vs ~6,419 records/commit | redesign-plan #4 |
-| sibling-share workload | replay gate on re-forced producer Value | E:P ≈ 0.03 flat, worse than baseline; gate keyed to `strict` attrset siblings never re-force | #5 + `ca-producer-sibling-firerate.sh` |
-| value-channel re-key | key producer on consumed Value identity | scalars/strings have no Value trace-identity (Tier-1 spike, dead) | spike `2ca68c498`, #5 |
-| coercion-channel re-key | edge at `coerceToContextObject` output-string read | flatten is force-of-args-driven, NOT output-read-driven → edge is additive not replacing | #6/#7 RETRACTED by #8 + `DrvInput_FlattenSite_ForceVsOutputRead` (cw case) |
+| §3b as-built (conservative) | record producer ALONGSIDE flattened consumer deps | net loss; gate fires ~614 vs ~6,419 records/commit | RP#4 |
+| sibling-share workload | replay gate on re-forced producer Value | E:P ≈ 0.03 flat, worse than baseline; gate keyed to `strict` attrset siblings never re-force | RP#5 + `ca-producer-sibling-firerate.sh` |
+| value-channel re-key | key producer on consumed Value identity | scalars/strings have no Value trace-identity (Tier-1 spike, dead) | spike `2ca68c498`, RP#5 |
+| coercion-channel re-key | edge at `coerceToContextObject` output-string read | flatten is force-of-args-driven, NOT output-read-driven → edge is additive not replacing | RP#6/#7 RETRACTED by RP#8 + `DrvInput_FlattenSite_ForceVsOutputRead` (cw case) |
 
 The flatten happens at `forceAttrs(*args[0])` + the per-attr force loop inside
 `prim_derivationStrict` (primops.cc:1602 + the `lexicographicOrder` loop at
-:1747). Confirmed by the cw discriminator (#8): a consumer that forces the args
+:1747). Confirmed by the cw discriminator (RP#8): a consumer that forces the args
 deeply but reads no output string still carries the input `FileBytes`. **The only
 site at which an edge can replace that flatten is a dep-capture sub-scope around
 that force.** That is the aggressive shape. So the design space has funneled to:
@@ -304,7 +313,7 @@ signal the observation was not output-only).
   but I overstated it to "doesn't drop." Corrected.
   CRUCIAL distinction this refinement must NOT blur: storage-drop ≠ net-PERF-win. The
   607× says the bytes are shared; it does NOT say the §4 verify-amortization or the
-  edge-emission actually TRIGGER at the args-force boundary. #5 measured the as-built
+  edge-emission actually TRIGGER at the args-force boundary. RP#5 measured the as-built
   gate fired ~0 (E:P) on this exact workload because re-forces hit the wrapper not the
   `strict` attrset. Whether moving the edge to args-force makes the amortization fire
   is the genuinely open §7.7 question; the storage arithmetic does not answer it.
@@ -396,7 +405,7 @@ signal the observation was not output-only).
    - (b) AMORTIZATION TRIGGERING — OPEN and the real go/no-go: does a consumer at the
      args-force boundary actually emit an edge to a SHARED producer (so verify runs
      once, §4), or does each derivation get its own producer with no cross-consumer
-     reuse? #5 showed the as-built gate fired ~0 because re-forces hit the wrapper;
+     reuse? RP#5 showed the as-built gate fired ~0 because re-forces hit the wrapper;
      this RFC edges at args-force, which is a DIFFERENT site, but whether that site
      is reached once-per-distinct-producer (good) or once-per-consumer-occurrence
      (no reuse) is UNMEASURED. If the latter, the design adds the producer-record cost
@@ -429,7 +438,7 @@ signal the observation was not output-only).
 ## 9. What this RFC does NOT claim
 - NOT that there is a net PERF win — storage clearly drops (§6, 607× is dominated by
   high-N shared infra), but whether the §4 verify-amortization TRIGGERS at the
-  args-force edge is open (§7.7b): #5 showed the as-built gate fired ~0. Storage-drop
+  args-force edge is open (§7.7b): RP#5 showed the as-built gate fired ~0. Storage-drop
   does NOT imply perf-win; the two are separate and only the latter is the blocker.
 - NOT that the hot-path cost is acceptable — §6 is unmeasured.
 - NOT that drvPath is the verification key — §2 disproves that; drvPath is routing
