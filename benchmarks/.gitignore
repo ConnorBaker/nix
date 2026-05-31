@@ -1,0 +1,8 @@
+# Generated / local artifacts — never committed.
+.fixtures/
+.work/
+.baseline-nix
+.baseline-nix-*
+*.json
+result
+result-*
