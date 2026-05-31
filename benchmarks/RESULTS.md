@@ -199,32 +199,41 @@ saving.
 
 What exercises each load-bearing mechanism, after this round of work:
 
-| Mechanism (PROPOSAL §) | gbench (ours) | CLI comparator (3-way) | VM (real net) |
+| Mechanism (PROPOSAL §) | gbench (ours) | CLI comparator (3-way) | functional / VM |
 | --- | --- | --- | --- |
 | Fingerprint composition (§1.1/§2.B) | ✅ fingerprint-bench | — (implicit) | — |
 | Projection key encoding (§0/§2.A) | ✅ projection-bench | ✅ via cache rows | — |
 | Filtered-shape walk (§2.D) | ✅ filtered-shape-bench | ✅ `filtered`/`filtersource` | — |
-| Filtered-cache bypass (§6.6/§7.12) | — | ✅ `filtered`/`filtersource` | — |
-| copy-once-link-N (§4/§2.O) | ✅ register-linked-ca-path-bench | ✅ `cargo` | — |
+| Filtered-cache bypass (§6.6/§7.12) | — | ✅ `filtered`/`filtersource` | ✅ cleansource-idiom.sh (realistic filter) |
+| copy-once-link-N (§4/§2.O) | ✅ register-linked-ca-path-bench | ✅ `cargo` | ✅ cargo-*.sh |
 | MaterialisationScheduler `outPathsOf` (§2.O) | ✅ materialisation-scheduler-bench | ✅ `cargo` | — |
 | `SourceContentId::compute` (§1.1) | ✅ | — | — |
 | Operator-stack read path (§1.2–§1.4) | ✅ operator-stack-bench | — (implicit) | — |
 | Parse cache (§2.E) | ✅ (round-trip) | ✅ `parsecache` (parity) | — |
 | Virtual-source interpolation (§8.2) | — | ✅ `interp` | — |
-| `.drv` boundary / derivationStrict | — | ✅ `drv` | — |
-| Cross-rev subtree (§6.1) | — | ✅ `crossrev` (honest non-win) | — |
+| `.drv` boundary / derivationStrict | — | ✅ `drv` | ✅ boundary-audit-* (unit) |
+| Cross-rev subtree (§6.1) | — | ✅ `crossrev` (honest non-win) | ✅ whole-input-tree-dedup.sh |
 | Pure-eval flake-input parity (§8.5) | — | ✅ `pureflake` | — |
+| `synthesiseTree` (§2.H) | ✅ git-mechanism-bench | — | ✅ git-fingerprint.cc (equiv) |
+| `readBlob` Phase-1/2 concurrency (§2.G) | ✅ git-mechanism-bench (scales w/ threads) | — | — |
+| eval-cache warm path | — | ✅ `evalcache` (flake installable) | — |
+| Forge-input tree-OID bridge (§6.3) | — | — | ✅ git-fingerprint.cc (forge==commit root tree) |
 | Blobless partial clone + soundness (§6.3) | — | — | ✅ git-lazy-fetch.nix |
+| Lazy-fetch ssh transport | unit (git-promisor-wiring/pkt-line) | — | ✅ git-lazy-fetch.nix (soundness; filter reported) |
 | Lazy-fetch 3-way object count | — | — | ✅ git-lazy-fetch-compare.nix |
-| Lazy-fetch at scale (bytes) | — | — | ✅ git-lazy-fetch-scale.nix |
-| `synthesiseTree` (§2.H) | ❌ not yet (git-fixture cost) | — | — |
-| `readBlob` Phase-1/2 concurrency (§2.G) | ❌ not yet (needs parallel driver) | — | — |
-| eval-cache warm path | ❌ (`--expr` isn't a flake; flake workload TODO) | — | — |
+| Lazy-fetch at scale (locked **and unlocked**) | — | — | ✅ git-lazy-fetch-scale.nix |
 
-Remaining gaps are noted honestly rather than implied-covered:
-`synthesiseTree` and `readBlob` concurrency have no microbenchmark yet (both need
-a real git fixture / parallel driver), and the eval-cache warm path isn't in the
-comparator because every workload uses `nix eval --expr` (not a flake
-installable, so `openEvalCache` is never called). The on-demand blob-fetch path
-itself is covered only by the VM tests — `file://` repos never trigger the
-promisor.
+This round closed the gaps the prior audit flagged: forge inputs, the
+realistic `lib.cleanSource` filter, `synthesiseTree`/`readBlob` microbenchmarks,
+the eval-cache warm path, and the **positive** (unlocked) lazy-fetch measurement
+(`git-lazy-fetch-scale.nix` now asserts unlocked metadata-only pulls ~480× fewer
+bytes — 0.1 MiB vs 48 MiB — while documenting the locked-rev gap).
+
+Two honesty notes remain. The ssh-transport VM test asserts **soundness**
+across transports and *reports* whether the fetch was blobless rather than
+hard-asserting it: Nix's `SSHMaster` v2 capability probe is environment-sensitive
+against a given sshd, so the filter wiring's guarantee rests on its unit coverage
+(`git-promisor-wiring.cc`, `pkt-line.cc`). And the locked-rev backfill itself is
+a known product gap (lazy-fetch saves nothing for `fetchGit{rev}` because
+`mountInput` materialises locked inputs eagerly); the verified fix is to defer
+locked-rev inputs like unlocked ones, pure-eval-gated — not yet implemented.
