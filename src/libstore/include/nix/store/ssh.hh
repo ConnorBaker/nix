@@ -27,6 +27,17 @@ private:
     const bool compress;
     const Descriptor logFD;
 
+    /**
+     * Extra ssh options applied to BOTH the control-master connection and every
+     * multiplexed session (via `addCommonSSHOpts`). This matters for options
+     * that OpenSSH only honours at master-creation time — notably
+     * `-oSetEnv=…` / environment forwarding: a session multiplexed over an
+     * existing master inherits the master's environment decisions, so a
+     * per-session `-oSetEnv` passed only to `startCommand` is silently dropped.
+     * Put such options here so they take effect on the master too.
+     */
+    const OsStrings extraSshArgs;
+
     const ref<const AutoDelete> tmpDir;
 
     struct State
@@ -54,7 +65,8 @@ public:
         std::string_view sshPublicHostKey,
         bool useMaster,
         bool compress,
-        Descriptor logFD = INVALID_DESCRIPTOR);
+        Descriptor logFD = INVALID_DESCRIPTOR,
+        OsStrings extraSshArgs = {});
 
     struct Connection
     {

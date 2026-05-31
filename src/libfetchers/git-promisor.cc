@@ -398,12 +398,21 @@ struct HttpGitPromisorProvider : GitPromisorProvider
  *    only `git-upload-pack`/`git-receive-pack`/`git-upload-archive` as
  *    the first word — any prefix (e.g. an inline `env VAR=… `) is
  *    rejected (this was a field failure against GitHub Enterprise;
- *    pinned by `GitUploadPackCommand.IsBareNoPrefix`). This is exactly
- *    how Git itself negotiates v2 over ssh (it uses `SendEnv` with the
- *    var set; we use `SetEnv` so we needn't have it in our own env). If
- *    the server's sshd lacks `AcceptEnv GIT_PROTOCOL` the var is dropped
- *    and the exchange degrades to v0 (no `filter` cap → probe false →
- *    full fetch), which is safe.
+ *    pinned by `GitUploadPackCommand.IsBareNoPrefix`).
+ *
+ *    CRITICAL: the `-oSetEnv` must be applied to the ssh CONTROL-MASTER,
+ *    not just the per-session command — so it is passed as the
+ *    `SSHMaster` `extraSshArgs` (see `master()`), NOT as `startCommand`'s
+ *    per-session `extraSshArgs`. OpenSSH fixes environment forwarding at
+ *    master-creation time; a session multiplexed over an existing master
+ *    inherits the master's env decisions and SILENTLY DROPS a per-session
+ *    `-oSetEnv`. (This differs from how git negotiates v2 over ssh: git
+ *    uses a one-shot, NON-multiplexed ssh, so its per-session `SendEnv`
+ *    is honoured; we multiplex via `SSHMaster`, where only the master's
+ *    options take effect.) If the server's sshd lacks
+ *    `AcceptEnv GIT_PROTOCOL` the var is still dropped and the exchange
+ *    degrades to v0 (no `filter` cap → probe false → full fetch), which
+ *    is safe.
  *
  * Auth, host-key checking, `~/.ssh/config`, ssh-agent, and connection
  * sharing are all delegated to Nix's `SSHMaster` (the same path the
@@ -462,7 +471,14 @@ struct SshGitPromisorProvider : GitPromisorProvider
                 /*keyFile=*/std::nullopt,
                 /*sshPublicHostKey=*/"",
                 /*useMaster=*/true,
-                /*compress=*/false);
+                /*compress=*/false,
+                /*logFD=*/INVALID_DESCRIPTOR,
+                /* extraSshArgs: GIT_PROTOCOL must be set on the MASTER, not just
+                   per-session. OpenSSH fixes env-forwarding at master-creation
+                   time, so a session multiplexed over the master silently drops
+                   a per-session `-oSetEnv`; passing it here makes the v2
+                   advertisement (and thus `filter` detection) actually work. */
+                /*extraSshArgs=*/sshEnvArgs());
         } else
             debug("lazy-fetch: reusing multiplexed ssh control-master for '%s'", authority.to_string());
         return **m;
@@ -477,7 +493,10 @@ struct SshGitPromisorProvider : GitPromisorProvider
         /* Open a connection, read + parse the advertisement, then drop
            the connection (we send no command). */
         try {
-            auto conn = master().startCommand(remoteCommand(), sshEnvArgs());
+            /* No per-session env args: GIT_PROTOCOL is set on the master (see
+               `master()`), which is the only place OpenSSH honours it for a
+               multiplexed connection. */
+            auto conn = master().startCommand(remoteCommand());
             FdSource source(conn->out.get());
             auto adv = readAdvertisement(source);
             return adv.v2 && adv.fetchSupportsFilter;
@@ -497,7 +516,7 @@ struct SshGitPromisorProvider : GitPromisorProvider
             wants.size(),
             authority.to_string());
 
-        auto conn = master().startCommand(remoteCommand(), sshEnvArgs());
+        auto conn = master().startCommand(remoteCommand()); // GIT_PROTOCOL is on the master
 
         /* ONE `FdSource` spans the whole connection: it buffers ahead,
            so the advertisement read and the pack drain must come from

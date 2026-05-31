@@ -69,7 +69,8 @@ SSHMaster::SSHMaster(
     std::string_view sshPublicHostKey,
     bool useMaster,
     bool compress,
-    Descriptor logFD)
+    Descriptor logFD,
+    OsStrings extraSshArgs)
     : authority(authority)
     , hostnameAndUser([authority]() {
         std::ostringstream oss;
@@ -84,6 +85,7 @@ SSHMaster::SSHMaster(
     , useMaster(useMaster && !fakeSSH)
     , compress(compress)
     , logFD(logFD)
+    , extraSshArgs(std::move(extraSshArgs))
     , tmpDir(make_ref<AutoDelete>(createTempDir("", "nix", 0700)))
 {
     checkValidAuthority(authority);
@@ -93,6 +95,12 @@ void SSHMaster::addCommonSSHOpts(OsStrings & args)
 {
     auto sshArgs = getNixSshOpts();
     args.insert(args.end(), sshArgs.begin(), sshArgs.end());
+
+    /* Options that must take effect on the control-master too (e.g. SetEnv /
+       env-forwarding, which OpenSSH only honours at master-creation time).
+       Applied via this shared helper so they reach both `startMaster` and
+       `startCommand`. */
+    args.insert(args.end(), extraSshArgs.begin(), extraSshArgs.end());
 
     if (keyFile)
         args.insert(args.end(), {OS_STR("-i"), keyFile->native()});
