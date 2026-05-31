@@ -2262,3 +2262,61 @@ it. Per perf-lever L-E (cold cost is hash + serialize CPU, not flush I/O — flu
 already non-fsyncing under WAL+`synchronous=off`), making recording asynchronous would
 not reduce CPU cost; the win would be eval/record overlap, bounded by the single
 `storeMutex_` serialization. Not pursued in this slice.
+
+### 2026-05-31 follow-up #4: bench measurement + adversarial fixes + DEFAULT-OFF
+
+**Bench results (Ledger-D anchor, 100 commits closures.gnome, no `--with-stats`):**
+
+| Phase | run-1 (pre-§3b) | run-2 (post-§3b) | Δ |
+|---|---|---|---|
+| reference (no-trace) | 6.47s mean / 6.43s med | 6.23s mean / 6.18s med | (noise) |
+| cold | 3.72s mean / 1.11s med | 13.44s mean / 13.32s med | **3.6× slower** |
+| hot | 0.96s mean | 13.47s mean | **14× slower** |
+
+Soundness PASS (byte-identical) on all 100 commits. The §3b hook is correctness-safe
+but a major perf regression. Hot is especially bad because: (a) cache-hit at the root
+trace materializes a `closures.gnome.x86_64-linux` STRING, but (b) evaluating that
+string still re-runs derivation thunks deep in `make-derivation.nix`, and (c) my hook
+fires for each `prim_derivationStrict` call regardless of whether the consumer trace is
+serving from cache. Result: hot loses ~12.5s/commit recording producer traces.
+
+In-session dedup helped within one process (~6,419 derivations recorded once per fresh
+process), but each `nix eval` is fresh — dedup doesn't span invocations.
+
+**Adversarial-review fixes that landed during this slice (commits `e9d01d892`,
+`8d393a1e9`, `b8ae91b12`):**
+
+- `producerBloom` template params were misread: `<Bits, PointerAlignment>` not
+  `<NumSlots, NumHashes>`. Fixed alignment from 4 to 16 (correct for GC-allocated
+  `Bindings*` keys); FPR ~3% at n=6,419 in m=65,536 with k=2. Net win on the ~22M-call
+  hot path even before dedup.
+- `clearReplayIndex` deliberately does NOT touch `producerMap` — clearing producer
+  bindings on a rollback-empty path would erase legitimate registrations. Documented
+  the intentional asymmetry inline.
+- `rollbackEpoch` doesn't scrub `producerMap` either; safe today because
+  `prim_derivationStrict` registers only on the success path. Documented as a future-
+  proof note: if registration moves before the success/throw decision, rollback must
+  scrub `producerMap` analogously.
+- **CRITICAL fix:** `producerMap` keyed by `Bindings *`, not `Value *`. With `Value *`
+  keying the gate NEVER fired in real eval (`producerEdges = 0` despite 1129
+  producers persisted). Root cause: `prim_derivationStrict(state, pos, args, v)`
+  receives `&v` that is `&vCur` — `callFunction`'s STACK-LOCAL Value (eval.cc:2306).
+  After `callFunction` returns, `vRes = vCur` (eval.cc:2530) COPIES the result to
+  `&vRes`; `&vCur` becomes stale. `Bindings *` is stable across the copy because
+  `Value::mkAttrs(b)` stores the pointer. With this fix, `producerEdges = 69` per
+  asciidoc eval (gate fires).
+
+**DEFAULT-OFF decision (commit `82713fd91`).** Hook gated on
+`NIX_ENABLE_CA_PRODUCER=1`. Default behavior is identical to pre-§3b. The
+infrastructure (producerMap + bloom + gate + recordSync + recordCAProducer + ~22 unit
+tests) stays in tree as proven scaffolding. Re-enabling is one env-var away once the
+cost profile changes — e.g., async/batched producer recording, or a hook that skips
+re-recording when the caller's consumer trace is being warm-served, or a workload
+where sibling-share contexts dominate so the gate fires frequently enough to amortize.
+
+The §3b conservative shape is **structurally sound but cost-prohibitive on this
+workload**. The §3b RFC's amortization claim (sharing producer verification across
+sibling consumers) requires sibling re-forces of the producer Value within one
+recording session — rare in current `nix eval` invocations against `closures.gnome`.
+A workload like `nix-eval-jobs` with deep sibling attrsets might exercise it more.
+Until measured, default-off is the right shipping state.
