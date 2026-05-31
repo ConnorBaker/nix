@@ -130,3 +130,52 @@ end-flush writes pending entities (trace/result IDs) BEFORE the batched CurrentN
 - A net-win number — that needs Layer 1 built + the full aggressive shape (still unbuilt) to
   measure end-to-end. This plan reduces the RECORD cost; the end-to-end net still needs the
   recorder + the §21-confirmed verify win combined.
+
+## 6. Layer 2 plan (from a planning subagent, 2026-05-31; code-grounded, verified key claims)
+
+A planning pass on Layer 2 (move the residual CPU off-thread). Its central code finding —
+verified — reshapes Layer 2 into two very different sub-pieces.
+
+**Key verified finding: only ONE of the three hashes is on the synchronous critical path.** The
+consumer edge reads `producer->traceHash` from `producerMap` (context.cc:1058), which is the CHEAP
+`computeTraceHash` (recorder.cc:45). `FullTraceHash` and `DepKeySetHash` are consumed ONLY as
+in-store dedup keys (`traceByFullHash` sqlite-trace-storage.cc:546, `depKeySetByHash` :530) —
+neither flows to the edge. So `computeTraceHash` + `sortAndDedupDeps` must stay synchronous; the
+other two hashes + both serializes (static, no shared state) CAN defer.
+
+**Layer 2 splits into two sub-pieces with very different risk:**
+
+### Layer 2a — batch the SECOND per-producer txn (~24%). LOW RISK, do first.
+`publishStateChange` (sqlite-trace-storage.cc:695-704) runs its OWN `SQLiteTxn` per producer
+(Sessions/History rows) — the ~24% "unaccounted" from §3a. This is a pure Layer-1-style extension:
+defer the DB write, buffer the CurrentNode/History rows into a new `pendingCurrentNodes`, drain in
+the batched `flush` (FK-safe — `Sessions.trace_id` has no FK, #22). Keep the in-memory
+`currentNodeIndex` update synchronous. NO new thread, Layer-1-level risk. Captures most of ~24%.
+Env-gate `NIX_PRODUCER_DEFER_PUBLISH` (or fold into the existing flag). **This is the high-value,
+low-risk core of Layer 2 — recommended next step.**
+
+### Layer 2b — move FullTraceHash + DepKeySetHash + serialize off-thread (~20-23%). HIGH RISK, defer.
+A background worker doing the deferred CPU. **The blocker the subagent found (verified):**
+`feedKey` → `feedCanonicalDepKeyMaterial` (input-resolution.cc:107,121) calls
+`pools.dataPathPool.collectPath(...)` for every StructuredProjection dep (~40% of producer deps),
+and `DataPathPool` (interning-pools.hh:48-118) is NOT thread-safe (plain vector+map, no lock;
+`governingRepoCache_` explicitly documents a single-threaded-writer invariant, :296-305). A worker
+hashing structured deps races eval-thread interning → vector-realloc UAF. Two escapes, each costly:
+(i) make `DataPathPool` concurrent — a hot-path change to a ~10⁷-read structure (the
+vptr-in-hot-loop regression class); (ii) eager-`collectPath` on the eval thread before handoff —
+keeps the worker self-contained but does the `collectPath` work on the eval thread anyway, shrinking
+the win (and it's UNVERIFIED whether `collectPath` or the BLAKE3 digest dominates `hashUs` — needs
+a micro-measurement first). Plus: deferring `FullTraceHash` breaks the `getOrCreateTrace`/
+`getOrCreateDepKeySet` dedup (those key on it), forcing speculative-id allocation + reconciliation —
+a correctness surface Layer 1 never had. Plus: worker timers (`nrRecordHashUs`) become wrong
+(eval-thread-assumed, non-atomic Counter) — measurement methodology must split wall vs eval-thread.
+
+**Subagent recommendation (concur): build Layer 2a; DEFER Layer 2b** until an end-to-end net-win
+calculation (full aggressive recorder + Layer 1 + 2a + the §21 verify win) shows the residual CPU is
+the deciding margin. Layer 2b is the smallest remaining lever carrying the entire concurrency risk
+budget; optimizing it first would be optimizing the smallest term at the largest risk.
+
+Touch points (verified file:line): 2a — `publishStateChange` sqlite-trace-storage.cc:695, `flush`
+lifecycle.cc:623, `publishRecord` :665, `recordSync` context.cc:421. 2b (if ever) — `Recorder::record`
+recorder.cc split, a new record-cpu-pool mirroring `BlockingThreadPool`, `BackendAsyncInfra`
+context.cc:245 teardown, and the `DataPathPool` concurrency prerequisite.
