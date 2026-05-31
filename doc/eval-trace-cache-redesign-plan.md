@@ -3131,3 +3131,52 @@ end-to-end or hot-path net number.
 **Process note:** this is the case where the adversarial-pass-before-finalizing caught the most
 consequential error of the arc — not a wrong number, but presenting proxy-synthesis as a built
 prototype. The numbers are fine as proxies; the framing was the bug.
+
+### 2026-05-31 follow-up #20: cheap ESTIMATE of the verify-memo benefit gate — it's genuinely UNDECIDED (flips +61% ↔ −11% on one unmeasured constant)
+
+The #19 correction surfaced a second open gate (besides async recording): does the edge model's
+verify-time cost actually beat the flat model's, given edge verify recurses + relies on the
+cross-consumer memo? Rather than build, estimate it from measured anchors — labelled ESTIMATE,
+with the validate-before-trust discipline.
+
+**Mechanism, grounded in code (the two amortization layers — must NOT conflate):**
+- L1 `currentDepHashes_` (session-wide, verifier.cc; L-B refutation) already dedups RECOMPUTE of a
+  distinct dep across traces. So the flat model is NOT recompute-bound (measured: depHash.cacheHits
+  21.3M, only 61K misses). Hot verify is **WALK-bound**: `verify.depsChecked = 36.9M` entries at
+  `verify.timeUs = 4.85s` ⇒ **~131 ns per dep-walk entry** (a flat_map find + 32-byte compare).
+- The edge win is the SECOND layer: `verifiedTraceIds` early-out (verifier.cc:1786) dedups
+  VERIFYING a whole producer across consumers. So the edge model replaces a consumer's ~3,296
+  flat dep-walks with ~1,213 edge-resolves (the #15 number).
+
+**The estimate, and its load-bearing unmeasured constant M.** A memo-HIT edge is NOT free like a
+flat dep: `resolveTraceContextHash` (verifier.cc:250-258) does `lookupCurrentNode` (a
+`currentNodeIndex.find`, hashmap on the hot path) + a `traceContextMemo.find` + a `nodeStamp`
+compare — i.e. MORE work than a flat dep's single find+compare. Let M = (memo-hit edge cost) /
+(flat dep cost); M>1 for certain, exact value UNMEASURED. Sensitivity (edge-equiv walk = 13.4M
+edges × M + ~0.86M producer-own-deps-verified-once, vs flat 36.9M):
+
+| M (per-edge vs flat-dep) | edge-equiv walk | vs flat 36.9M | est. hot verify |
+|---:|---:|---:|---:|
+| 1× | 14.3M | **−61%** (win) | ~1.87s |
+| 2× | 27.7M | −25% (win) | ~3.64s |
+| 3× | 41.1M | **+11%** (LOSS) | ~5.40s |
+
+**FINDING: the verify-benefit gate is genuinely UNDECIDED.** It flips from a large win (M=1) to a
+net loss (M≈3) across a plausible range of ONE unmeasured constant (the per-edge resolution cost
+vs a flat dep). The cheap estimate therefore does NOT settle "worth building" in either direction
+— it establishes that the verify gate is REAL and LIVE (not pre-decided), so settling it requires
+measuring M, which requires the actual edge-emitting prototype + a hot run. (M is also why the §3b
+producer-gate, which emits edges, never showed a hot win — its gate fired ~0, so M was never even
+exercised at scale.)
+
+**Decision input this provides:** of the two gates, async-recording (cost) and verify-memo
+(benefit), NEITHER is settled and BOTH need the real prototype. The estimate did its job — it
+showed the verify benefit is not a free ~63% (the storage number does NOT carry to verify time
+without M≤~2), so a go-decision cannot lean on "63% verify win." Honest status unchanged from #19:
+no end-to-end or hot net number; two live gates; a real go/no-go needs the edge-emitting prototype
+measured hot (settles M AND the verify benefit) + async recording (settles cost).
+
+Caveats: M-band {1,2,3} is a reasoned guess at the find-count ratio, not measured; producer-once
+term uses the nested-inflated 0.857M upper bound; loadTrace savings (smaller blobs) not modelled
+(would help the edge side). The qualitative finding (gate undecided, hinges on M) is robust to
+these; the exact crossover M is not.
