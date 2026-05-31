@@ -2004,3 +2004,70 @@ it works because Unison resolves names->dependency-hashes at codegen time (a clo
 Nix evaluation is lazy/dynamic — dependency hashes are not known until evaluation — so adopt only the
 local idea (key on the content-hash of the observed sub-expression, which our NixBinding hash already
 approximates), not the full transitive-baking model.
+
+## 2026-05-30 — the arc converges: content-addressed trace identity RFC + consume-side proof
+
+The architectural root cause (`plans/architecture-trace-model-vs-CA.md`: eval-trace flattens the
+transitive dep closure because identity is tied to attr-path POSITION, while the build layer
+references inputs BY HASH/EDGE) was reached independently THREE times this session — by the Lever 2
+spike, the Lever 5 analysis, and the Tier-1 edge-recorder prototype — each blocked on the same wall:
+non-attr-path values (derivations, scalar `outPath`s, function results) have no trace identity to
+edge-reference. The session's closing work turns that diagnosis into a concrete, test-backed proposal
+and proves the half of it that needs no hot-path change.
+
+**The RFC: `plans/content-addressed-trace-identity-rfc.md`.** Give a small, principled set of
+non-attr-path values a content-addressed trace identity (derivations, keyed by the EXISTING `drvPath
+= hashDerivationModulo(inputs)`), so a value reached from N attr-paths records ONCE and is referenced
+by N edges instead of flattening its whole closure into each consumer. This is the direct answer to
+the "you can't cache hundreds of millions of intermediate values" barrier: the proposal caches FEWER
+nodes (≈6,419 derivations / closure ≈ the same order as today's ≈10,397 attr-path nodes, a ~3,500:1
+reduction vs the 22.9 M thunks), and the flattening is BOUNDED rather than eliminated — it stops at
+the first content-addressed node below instead of spanning the transitive closure. The recursion that
+would explode is cut at the identity boundary, exactly as `hashDerivationModulo` recurses on input
+drvs and not on every value that produced them.
+
+**Two real-evaluator corrections landed as tests (commit 694fbd827):**
+
+- **`store/derivation-input-flattening.cc` (2 tests).** A derivation whose `args` embed
+  `readFile(shared)`, consumed by two siblings via `.outPath`, flattens the shared `FileBytes` into
+  BOTH consumer traces (the 607× mechanism is REAL for derivations) — *alongside* an inert
+  `StorePathAvailability(.drv)` dep. The SPA dep verifies by `isValidPath(oldDrvString)` — a pure
+  EXISTENCE check — so its answer is identical before and after the input changes; it CANNOT
+  distinguish a v1-input from a v2-input. The load-bearing soundness carrier is the flattened
+  `FileBytes`, NOT the SPA dep. (Diagnostic confirmed both consumers carry `[fileBytes]` AND
+  `[storePathAvailability …-p.drv]`.) **Consequence:** the producer edge in the RFC must be a
+  producer-TRACE-HASH edge (a `TraceValueContext`-style dep that folds in the derivation's input
+  deps), NOT the existing SPA dep. This corrects an "already recorded" over-claim in an earlier RFC
+  draft — only the trace-hash edge tracks inputs, and it does not exist yet (additive recorder work).
+
+- **`store/ca-trace-key-routing.cc` (3 tests — the consume-side floor, commit c77064387).** Design A
+  (a reserved `AttrVocabStore` namespace `"__ca:<drvHash>"` interned via `internName`, which accepts
+  arbitrary `string_view`) is proven against the REAL store/vocab/verify pipeline with zero production
+  change: **(R1)** a producer trace recorded under a synthetic CA key round-trips and verifies — the
+  CA key is a first-class trace identity; **(R2)** TWO consumers at genuinely DIFFERENT attr-path
+  positions both edge to the SAME CA producer via the existing `TraceValueContext` trace-hash edge and
+  BOTH hit (the cross-scope sharing the earlier C2b test could not show with a literal vpath);
+  **(R3)** mutating the shared producer's input changes its trace hash and invalidates BOTH consumers'
+  edges. The edge is load-bearing, not vacuous — a probe-then-revert pass confirmed that corrupting
+  the stored producer hash flips R2 to a miss. The existing recursive/memoized/cycle-broken
+  `resolveTraceContextHash` (verifier.cc:243-278) carries the consume side; it needs NO new machinery.
+
+**Net standing of this direction.** The consume side is DONE and proven (routing key + edge-verify
+machinery work unchanged). The ONLY net-new piece is the RFC's §3b: a producer-trace boundary at
+`derivationStrict` (open a `DepCaptureScope` around the input force, record a `CATraceKey(drvPath)`
+producer trace, content-addressed-deduped). That is the single hot-path change, and it carries the
+v53/vptr precedent warning (a hot-loop structure change that regressed and was reversed). It is
+**NOT BUILT**: the go/no-go is the RFC §7 smallest-slice measurement — prototype ONLY the producer
+boundary (no consumer edges yet) and measure (i) does it record ~6,419 deduped producer traces, (ii)
+the per-derivation scope overhead on the Ledger-D benchmark, (iii) does cold storage drop. If the
+scope overhead is acceptable, wire the consumer edge + the facet gate and re-run the soundness suite.
+
+**Soundness floor is the test suite built BEFORE the design** (all non-vacuous, probe-verified):
+`store/derivation-edge-soundness.cc` (C1/C2/C2b/C3 — edge invalidation, single-edge storage,
+shared-producer amortization, the output-only facet hazard), `store/derivation-observation-facets.cc`
+(the output-only gate is real AND detectable from the recorded dep set), `store/dep-flattening-
+baseline.cc` (the 607× duplication to beat), `store/derivation-outpath-soundness.cc` (input change
+invalidates via input deps, not bypassed by the SPA existence check), `store/ca-trace-key-routing.cc`
+(this section), and `store/keyset-escape.cc` (cross-trace escape — a shape-carrying edge must
+fail-closed). This relocates the README's abstract Option 3 / Lever 2 RFC into a concrete,
+half-proven proposal with a defined hot-path measurement as its only remaining gate.

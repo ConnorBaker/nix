@@ -232,11 +232,25 @@ and its nearest boundary children — small and non-recurring.
 
 ## Sequenced plan (each independently shippable, gated by the correctness + keyset-escape suite)
 
+> **STATUS 2026-05-30 — productized as `plans/content-addressed-trace-identity-rfc.md`;
+> step 1's consume side is PROVEN.** The RFC formalizes step 1 (Tier-1 derivation
+> edges) with a concrete routing mechanism (Design A: a synthetic `"__ca:<drvHash>"`
+> vocab key). Two real-evaluator findings landed as tests: (a) the edge must fold in
+> the producer's INPUT deps — the existing `StorePathAvailability(.drv)` dep is an
+> inert existence check, not an input-identity edge (`store/derivation-input-
+> flattening.cc`); (b) a CA-keyed producer with cross-scope consumer edges
+> round-trips, shares, and invalidates correctly through the existing pipeline with
+> zero production change (`store/ca-trace-key-routing.cc`, R1/R2/R3). What remains
+> net-new is ONLY the `derivationStrict` producer-trace boundary (the hot-path
+> change), gated on the RFC §7 measurement.
+
 1. **Tier-1 derivation edges (highest payoff, smallest soundness risk).** When a
    node observes a derivation, edge to its `drvPath` (already computed) and stop
    flattening its closure. Derivations have NO shape-observation hazard (you
    observe `outPath`/`drvPath`, value-like) — so the soundness risk is minimal
    and the keyset machinery isn't even needed. Measure the 607× reduction.
+   **(Consume side proven; the edge is a producer-TRACE-HASH edge, not the SPA
+   dep — see the status note above and the RFC.)**
 2. **Tier-2 import/file edges.** Edge to (resolved file path + arg-identity
    fingerprint via the existing `computeNixScopeHash`). Soundness: a file's
    result can be shape-observed → needs the keyset-escape facet rule.

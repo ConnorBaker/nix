@@ -211,6 +211,21 @@ symptoms, and unlike the derivation-boundary Lever 2 (blocked by attr-path-shape
 `TracedExpr` identity), this one has a precedent to copy almost verbatim:
 `hashDerivationModulo` + `drvHashes`.
 
+> **FOLLOW-UP 2026-05-30 — written up as an RFC; the consume side is now proven.**
+> `plans/content-addressed-trace-identity-rfc.md` is the productized form of this
+> recommendation (the Tier-1 derivation slice of `compositional-trace-dag-design.md`).
+> Of the three blockers above, the consume-side ones are discharged by test:
+> a CA-keyed producer trace (synthetic `"__ca:<drvHash>"` vocab key) round-trips,
+> two cross-scope consumers share one producer via a `TraceValueContext` edge and
+> both hit, and a producer-input change invalidates both — through the EXISTING
+> `resolveTraceContextHash` machinery with zero production change
+> (`store/ca-trace-key-routing.cc`). A measured correction also refines the
+> recommendation: the edge must be a producer-TRACE-HASH edge that folds in input
+> deps, because the existing `StorePathAvailability(.drv)` dep is an inert
+> existence check, NOT an input-identity edge (`store/derivation-input-flattening.cc`).
+> The remaining net-new work is ONLY the `derivationStrict` producer-trace boundary
+> (the hot-path change), gated on the RFC §7 smallest-slice measurement.
+
 Caveats: the 607× / dep-kind histogram / zero-edge-usage are measured on
 `python3Packages` (n=1, sampled 2,000 traces for the histogram). The build-layer
 mechanism citations are verified. Whether a compositional trace hash is

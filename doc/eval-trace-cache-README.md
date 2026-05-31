@@ -80,7 +80,7 @@ findings-doc "Promising Directions". Each lever traces to repo text; the
 | # | Lever | Status / evidence | Source |
 |---|---|---|---|
 | **1** | **Observed-key / unobserved-change PRUNING proof**, made sound-by-construction and transparent to `libexpr` | The single biggest measured win in the whole log (cold 3.32→1.88 s, hot 0.88→0.38 s, v6→v11). Works by **slicing/removing coarse deps**, NOT adding finer ones. **Caveats:** (a) was command-JSON-only (disqualified layer); (b) gated on Nixpkgs path heuristics + env vars, not sound by construction; (c) coverage stops at the observed-key universe — `attrNames`/negative-membership/recursive-attrset are UNSOLVED. It is a tail-rescue (kills ~9 catastrophic outliers; median/p90 barely move), not a hot-path median mover. | redesign-plan §2026-05-29 CORRECTION finding 2; work-log v6→v11 |
-| **2** | **Semantic derivation-boundary caching** (Bazel/Skyframe strict dependency capture + facet mask) | **NOT VIABLE as scoped — feasibility spike hit a material architectural blocker (2026-05-30).** Outliers re-eval ~20 M thunks; the 6,419 derivations inside (99.66 % unchanged) have no reuse boundary, ~58 % of cost is cacheable derivation eval. Spike (branch `spike/lever2-derivation-feasibility`) measured 10,455 derivations evaluated vs 6 traces recorded, then hit the blocker: to verify-before-force a derivation it must be a `TracedExpr`, but `TracedExpr` identity is **attr-path-tree-shaped** (Root or Child-with-parent-and-name), and a `derivationStrict` thunk created deep in `make-derivation.nix` has no attr-path from the eval root — `makeChild` cannot construct it. Caching derivations needs a **second content-addressed `TracedExpr` identity model** threaded through evaluator thunk creation = foundational redesign on the hot path, RFC-scale, not a lever. Verdict: leave the cold tail bounded + sound. Full chain: `plans/lever2-derivation-boundary-caching.md` §7-11. | redesign-plan §2026-05-30 spike; findings.md "Derivation Boundary Proof" |
+| **2** | **Semantic derivation-boundary caching** (Bazel/Skyframe strict dependency capture + facet mask) | **NOT VIABLE as scoped — feasibility spike hit a material architectural blocker (2026-05-30).** Outliers re-eval ~20 M thunks; the 6,419 derivations inside (99.66 % unchanged) have no reuse boundary, ~58 % of cost is cacheable derivation eval. Spike (branch `spike/lever2-derivation-feasibility`) measured 10,455 derivations evaluated vs 6 traces recorded, then hit the blocker: to verify-before-force a derivation it must be a `TracedExpr`, but `TracedExpr` identity is **attr-path-tree-shaped** (Root or Child-with-parent-and-name), and a `derivationStrict` thunk created deep in `make-derivation.nix` has no attr-path from the eval root — `makeChild` cannot construct it. Caching derivations needs a **second content-addressed `TracedExpr` identity model** threaded through evaluator thunk creation = foundational redesign on the hot path, RFC-scale, not a lever. Verdict: leave the cold tail bounded + sound. Full chain: `plans/lever2-derivation-boundary-caching.md` §7-11. **UPDATE 2026-05-30: that "second identity model" is now the written RFC `plans/content-addressed-trace-identity-rfc.md`, and its CONSUME side is proven (`store/ca-trace-key-routing.cc` R1/R2/R3) — only the `derivationStrict` producer boundary is net-new+unbuilt, gated on the RFC §7 hot-path measurement. See Option 3 below.** | redesign-plan §2026-05-30 spike + §2026-05-30 RFC convergence; findings.md "Derivation Boundary Proof" |
 | **3** | **Certificate-before-payload** fast path (fixed-size `FullTraceHash` compare before `loadFullTrace` + dep walk) | LOW priority. Every *sound* form was already refuted on this workload (runs 909/980/987/1032/1042/1133/1107/1108…). The dep walk IS the hot cost for true exact hits (unsound oracle run 1015: hot 0.68 vs 0.88 s), but the residual hot cost is decode/startup, not the walk, once the `verifiedTraceIds` memo is in place. Only un-refuted shape: a cheap per-current-node eligibility bit/index that clears the run-993 coverage bar. | redesign-plan §2026-05-29 CORRECTION finding 1 |
 | **4** | **Custom immutable-segment store** (generation packs, mmap fixed-width indexes, lock-free readers, atomic `CURRENT`) | Deferred until 1–3 prove the proof model wins. Storage format is **downstream of authorization**: run 137 showed lazy-payload-over-immutable-objects does NOT beat SQLite without the authorization fix. Do NOT re-abstract `TraceStorage` (the vptr was added per rearch-proposal §2.1, measurably hurt the hot loop, and was reversed). | redesign-plan "Architectural direction" + §2026-05-29 finding 4; storage-backend-research.md |
 
@@ -275,11 +275,34 @@ in place. The remaining options, in rough order of effort/payoff:
    that, not L-B, is the real hot opportunity, and it needs a `runs --verbose`
    measurement first.
 
-3. **The content-addressed trace-node RFC** (unblocks Lever 2 / Lever 5). A second
-   `TracedExpr` identity keyed by content (derivation-input hash) rather than
-   attr-path, with `navigateToReal` → re-invoke the producer. RFC-scale,
-   hot-path, with the v53/vptr precedent warning. Only justified if (2) shows the
-   derivation boundary is the dominant cost across real workloads, not just GNOME.
+3. **The content-addressed trace-node RFC — WRITTEN + consume-side PROVEN
+   (2026-05-30), `plans/content-addressed-trace-identity-rfc.md`.** Give a small
+   principled set of non-attr-path values (derivations, keyed by the existing
+   `drvPath = hashDerivationModulo(inputs)`) a content-addressed trace identity, so
+   a value reached from N attr-paths records ONCE and is referenced by N EDGES
+   instead of flattening its closure into each consumer. This is the direct answer
+   to the "you can't cache hundreds of millions of values" barrier — it caches
+   FEWER nodes (≈6,419 derivations/closure, same order as today's ≈10,397 attr-path
+   nodes) and BOUNDS the flattening rather than eliminating it. **State of the
+   proof:**
+   - **Consume side DONE** (`store/ca-trace-key-routing.cc`, 3 tests): Design A (a
+     synthetic `"__ca:<drvHash>"` vocab key via `internName`) round-trips, two
+     cross-scope consumers share one CA producer via a `TraceValueContext` edge and
+     both hit (R1/R2), and a producer-input change invalidates both (R3). The
+     existing `resolveTraceContextHash` edge-verify machinery carries it with **zero
+     production change**.
+   - **The edge must be a trace-hash edge, not the existing SPA dep**
+     (`store/derivation-input-flattening.cc`, 2 tests): the
+     `StorePathAvailability(.drv)` dep is an INERT existence check (identical
+     before/after an input change); the load-bearing carrier is the flattened
+     `FileBytes`. So the producer edge folds in input deps — additive recorder work.
+   - **Net-new + unbuilt:** ONLY the §3b producer-trace boundary at
+     `derivationStrict` (a `DepCaptureScope` on the hot eval path, ~10 K/closure).
+     Carries the v53/vptr precedent warning. **Go/no-go = the RFC §7 smallest-slice
+     measurement** (does it record ~6,419 deduped producer traces; per-derivation
+     scope overhead on Ledger-D; does cold storage drop). Still gated on (2) showing
+     the derivation boundary is the dominant cost across real workloads, not just
+     GNOME. Full direction: redesign-plan §"2026-05-30 — the arc converges".
 
 4. **Lever 3 (certificate-before-payload), low priority.** Targets hot, which is
    already flat — every sound form was refuted (see table). Not worth it absent a
@@ -330,14 +353,16 @@ against code + the cold DB:
   the build layer ties it to content of inputs.** That is the architectural gap.
 - **Concrete design:** `plans/compositional-trace-dag-design.md` — what to
   capture and why it's tractable (you do NOT hash every value; you edge to the
-  ~thousands of boundary-eligible nodes that already have stable identities).
+  ~thousands of boundary-eligible nodes that already have stable identities) — and
+  its productized form `plans/content-addressed-trace-identity-rfc.md` (the RFC,
+  with the consume side now proven by `store/ca-trace-key-routing.cc`; see Option 3).
 - **Direction:** lift the build layer's CA model to evaluation — content-address
   sub-results as trace-DAG nodes referenced by edge, not flattened. RFC-scale
-  (it's the `content-addressed-trace-node` work Lever 2 also needs), but it is
-  the only lever that attacks the root rather than symptoms, and it has a
-  precedent to copy: `hashDerivationModulo` + `drvHashes`. Soundness prerequisite
-  = the keyset-provenance / cross-trace-escape work (a node can observe a child's
-  shape, not just value — unlike builds).
+  (it's the `content-addressed-trace-node` work Lever 2 also needs) and now WRITTEN
+  as the RFC above; it is the only lever that attacks the root rather than
+  symptoms, and it has a precedent to copy: `hashDerivationModulo` + `drvHashes`.
+  Soundness prerequisite = the keyset-provenance / cross-trace-escape work (a node
+  can observe a child's shape, not just value — unlike builds).
 
 ## How the keyset work fits
 
