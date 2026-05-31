@@ -820,6 +820,22 @@ bool TraceSession::recordCAProducer(
         AttrVocabStore::rootPath(),
         vocab.internName(std::string("__ca:") + std::string(drvHash)));
 
+    // Defensive: only attrset producerValues are valid (derivation results
+    // are always attrsets). Short-circuit non-attrset.
+    if (producerValue.type() != nAttrs) return false;
+
+    // Dedup: if `producerMap` already has an entry for this Bindings*,
+    // the producer was already recorded in this session. Skip the SQLite
+    // write — it's the same content (same drvHash → same caKey → same
+    // input deps). This avoids the cold-record-style cost on warm-verify
+    // re-evaluation of the same closure: when the cache hits at the root,
+    // derivations inside still get forced (their thunks re-run), and
+    // without dedup we'd re-persist ~thousands of producer traces per
+    // re-evaluation. The Bindings* lookup is bloom-fast-rejected for
+    // non-producers.
+    if (state.traceCtx->lookupProducer(producerValue.attrs()).has_value())
+        return true;
+
     // Use a sentinel `string_t` as the CachedResult — producer traces are
     // never materialized directly (they're only referenced by edges), so
     // the result content doesn't matter. We store a constant marker so
@@ -832,9 +848,7 @@ bool TraceSession::recordCAProducer(
     // Bind producerValue's Bindings* → {caKey, traceHash} in the side-table.
     // Keying by Bindings* (not Value*) survives the `vRes = vCur` copy in
     // `callFunction` (eval.cc:2530) — Value::mkAttrs(b) stores the pointer,
-    // so copies share the same Bindings*. Non-attrset producerValues
-    // short-circuit (no derivation result is ever non-attrset, but defend).
-    if (producerValue.type() != nAttrs) return false;
+    // so copies share the same Bindings*.
     state.traceCtx->registerProducer(
         producerValue.attrs(), caKey, DepHash{recordResult->traceHash.value});
 

@@ -1566,8 +1566,36 @@ static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** 
     // The amortization win comes from siblings sharing the producer trace
     // — that benefit is dormant until the gate fires for them, and zero
     // cost when it doesn't.
+    // RFC §3b producer-trace boundary: env-gated, OFF by default.
+    //
+    // The conservative shape (no consumer-side dep isolation; producer
+    // trace persisted alongside flattened consumer deps) measured as a
+    // NET LOSS on closures.gnome (Ledger-D anchor):
+    //   reference (no-trace):     6.23s mean
+    //   cold WITHOUT §3b (run-1): 3.72s mean / 1.11s median (cache works)
+    //   cold WITH    §3b (run-2): 13.44s mean / 13.32s median (3.6× slower)
+    //   hot  WITHOUT §3b (run-1): 0.96s mean (cache serves)
+    //   hot  WITH    §3b (run-2): 13.47s mean (cache mostly bypassed —
+    //     producer-trace record fires per derivation force even on
+    //     warm-verify, where derivation thunks re-run during materialize)
+    //
+    // The gate (`replayMemoizedDeps`) fires ~614 times/commit (small
+    // amortization win), but the recording cost is ~6,419 producer
+    // traces/commit (large cost). Cost ≫ benefit on this workload.
+    //
+    // Until either (a) the cost is reduced (e.g., async/batched producer
+    // recording, or skipping recording entirely on warm-verify-served
+    // derivations) or (b) the gate's fire rate increases (sibling-share-
+    // heavy workloads), keep §3b OFF in production. The infrastructure
+    // (producerMap + gate + recordCAProducer + tests) stays in tree as
+    // proven scaffolding for a future hook with better cost profile.
+    //
+    // Set `NIX_ENABLE_CA_PRODUCER=1` to opt in for experimentation/
+    // benchmarking.
+    static const bool caProducerEnabled =
+        getEnv("NIX_ENABLE_CA_PRODUCER").value_or("") == "1";
     auto * session = eval_trace::currentTraceSession();
-    bool registerProducer = session && state.traceCtx;
+    bool registerProducer = caProducerEnabled && session && state.traceCtx;
 
     uint32_t epochStart = registerProducer ? state.traceCtx->currentReplayEpochSize() : 0;
 

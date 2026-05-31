@@ -311,6 +311,15 @@ public:
     void registerProducer(const ::nix::Bindings * b, AttrPathId caKey, DepHash traceHash)
     { replayStore.registerProducer(b, caKey, traceHash); }
 
+    /// Public lookup for producer-trace dedup in `recordCAProducer`. Returns
+    /// the binding for `b` if registered (skip re-recording when same
+    /// derivation result is forced multiple times in one session — the
+    /// cache-hit-but-children-re-force scenario costs ~3-4× more without
+    /// this dedup).
+    std::optional<eval_trace::MemoReplayStore::ProducerEntry>
+    lookupProducer(const ::nix::Bindings * b) const
+    { return replayStore.lookupProducer(b); }
+
     /// Read-only access to a slice of the epoch log [start, end). Used by
     /// `prim_derivationStrict` to capture the deps recorded during a
     /// derivation's evaluation as the CA producer trace's deps. Returns a
