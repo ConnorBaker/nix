@@ -123,13 +123,59 @@ in builtins.stringLength "prefix:\${p}:suffix"
 NIX
 }
 
+expr_parsecache() {
+    # Parse-cache (PROPOSAL §2.E): builtins.fromJSON (builtins.readFile X) over a
+    # content-fingerprintable git source. On ours the parsed Value tree persists
+    # under the content fingerprint, so a warm re-eval skips the parse; master/
+    # DetSys re-read + re-parse every time. Output the parsed value's length.
+    cat <<NIX
+let
+  t = builtins.fetchGit { url = "file://$FLAKE_REPO"; rev = "$FLAKE_REV"; };
+  j = builtins.fromJSON (builtins.readFile (t.outPath + "/data.json"));
+in builtins.length (builtins.attrNames j)
+NIX
+}
+
+expr_drv() {
+    # Derivation boundary (the .drv write path): a derivation whose src is a
+    # filtered git subtree. Exercises derivationStrict placeholder resolution
+    # (builder/args/env/structuredAttrs) — the path the structuredAttrs leak
+    # fix lives on. Output the drvPath (forces .drv to be written).
+    cat <<NIX
+let
+  t = builtins.fetchGit { url = "file://$MONO_REPO"; rev = "$MONO_REV"; };
+  src = builtins.path { path = t.outPath + "/pkgs/pkg1"; name = "pkg1-src"; };
+in (derivation {
+  name = "bench-drv";
+  system = "x86_64-linux";
+  builder = "/bin/sh";
+  args = [ "-c" ":" ];
+  inherit src;
+}).drvPath
+NIX
+}
+
+expr_filtersource() {
+    # Real builtins.filterSource (not just builtins.path filter) over a git
+    # subtree — the lib.cleanSourceWith primitive. Same cache-bypass axis as
+    # `filtered` but via the older filterSource entry point.
+    cat <<NIX
+let
+  t = builtins.fetchGit { url = "file://$MONO_REPO"; rev = "$MONO_REV"; };
+in builtins.filterSource (p: type: true) (t.outPath + "/pkgs/pkg1")
+NIX
+}
+
 emit_expr() {  # <workload>
     case "$1" in
-        filtered) expr_filtered ;;
-        cargo)    expr_cargo ;;
-        crossrev) expr_crossrev ;;
-        pureflake)expr_pureflake ;;
-        interp)   expr_interp ;;
+        filtered)     expr_filtered ;;
+        cargo)        expr_cargo ;;
+        crossrev)     expr_crossrev ;;
+        pureflake)    expr_pureflake ;;
+        interp)       expr_interp ;;
+        parsecache)   expr_parsecache ;;
+        drv)          expr_drv ;;
+        filtersource) expr_filtersource ;;
         *) echo "no expr for workload $1" >&2; return 1 ;;
     esac
 }
@@ -140,8 +186,8 @@ eval_one() {  # <tree> <root> <workload> <logfile>
     local tree="$1" root="$2" wl="$3" log="$4"
     local expr fmt; expr="$(emit_expr "$wl")"
     case "$wl" in
-        interp) fmt=--json ;;
-        *)      fmt=--raw ;;
+        interp|parsecache) fmt=--json ;;  # return ints
+        *)                 fmt=--raw ;;   # return strings/paths
     esac
     nix_run "$tree" "$root" eval --impure "$fmt" --expr "$expr" -vvvv >/dev/null 2>"$log"
 }
@@ -201,17 +247,26 @@ run_timing() {  # <tree> <workload>
     local warm_json="$root/warm.hf.json"
     hyperfine --warmup 1 --runs 8 --export-json "$warm_json" "$runner" >/dev/null 2>&1 || { note "$tree warm timing failed"; return; }
     local warm_mean; warm_mean=$(jq -r '.results[0].mean' "$warm_json" 2>/dev/null)
-    # COLD timing: wipe store+cache before each run via --prepare.
+    # COLD timing: wipe store+cache before each run via --prepare. By default
+    # "cold" means a fresh store/cache but a WARM page cache (the bytes are still
+    # in RAM), so cold wall-clock understates a true first-touch fetch. Set
+    # BENCH_DROP_CACHES=1 (needs privilege to write /proc/sys/vm/drop_caches; uses
+    # sudo -n if available) to also evict the page cache for a genuine cold-disk
+    # measurement. Best-effort: if the drop can't run, the wipe still happens.
+    local drop=""
+    if [[ "${BENCH_DROP_CACHES:-0}" == "1" ]]; then
+        drop="sync; { echo 3 > /proc/sys/vm/drop_caches || sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'; } 2>/dev/null || true; "
+    fi
     local cold_json="$root/cold.hf.json"
     hyperfine --runs 5 \
-        --prepare "chmod -R u+w '$root/store' '$root/cache' 2>/dev/null; rm -rf '$root/store' '$root/cache'; mkdir -p '$root/store' '$root/cache'" \
+        --prepare "${drop}chmod -R u+w '$root/store' '$root/cache' 2>/dev/null; rm -rf '$root/store' '$root/cache'; mkdir -p '$root/store' '$root/cache'" \
         --export-json "$cold_json" "$runner" >/dev/null 2>&1 || { note "$tree cold timing failed"; return; }
     local cold_mean; cold_mean=$(jq -r '.results[0].mean' "$cold_json" 2>/dev/null)
     printf "  %-9s | cold %8.3f s | warm %8.3f s\n" "$tree" "$cold_mean" "$warm_mean"
 }
 
 # ---------------------------------------------------------------------------
-ALL_WORKLOADS=(filtered cargo crossrev pureflake interp)
+ALL_WORKLOADS=(filtered cargo crossrev pureflake interp parsecache drv filtersource)
 echo "Trees: $BENCH_TREES"
 for t in $BENCH_TREES; do tree_available "$t" || echo "  WARNING: tree '$t' unavailable, skipping"; done
 echo

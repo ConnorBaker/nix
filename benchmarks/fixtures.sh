@@ -116,6 +116,10 @@ cat > "$R3/flake.nix" <<'NIX'
   };
 }
 NIX
+# A JSON file for the parse-cache workload (fromJSON over readFile).
+cat > "$R3/data.json" <<'JSON'
+{ "alpha": 1, "beta": [2, 3, 4], "gamma": { "nested": true }, "delta": "a string value", "epsilon": null }
+JSON
 git -C "$R3" add -A; git_commit "$R3" "flake"
 REV_FLAKE=$(git -C "$R3" rev-parse HEAD)
 
