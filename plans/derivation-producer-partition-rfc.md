@@ -177,13 +177,13 @@ Concretely, the producer-trace boundary becomes:
    and verified recursively + memoized by `resolveTraceContextHash`
    (verifier.cc:243-278).
 
-The key insight vs §3a/§3b: **a content-addressed routing/dedup key (derived from
-at least `drvPath` — exact granularity is a measured tuning parameter, see the
-key-granularity note below) is SEPARATE from the verification key, which is the
-`trace_hash` over the recorded sub-scope deps.** §3b conflated them by assuming
-drvPath-identity implies dep-set-identity. §2's reproducer shows it doesn't.
-Decoupling routing from verification is the fix; the routing granularity itself is
-a precision-vs-storage knob that does not affect soundness.
+The key insight vs §3a/§3b: **the routing/dedup key (`drvPath`) is SEPARATE from the
+verification key (`trace_hash` over the recorded sub-scope deps).** §3b conflated
+them by assuming drvPath-identity implies dep-set-identity. §2's reproducer shows it
+doesn't. Decoupling routing (drvPath) from verification (trace_hash) is the fix.
+Routing stays drvPath — coarsest, best dedup, and folding deps into it would
+re-couple the two (pass #12, Attack P / the routing-key note below); the trace_hash
+compare alone carries verification soundness regardless of routing granularity.
 
 **Why decoupling is sound — the compare is stored-vs-recomputed (verified, adversarial pass #1 Attack C).**
 The consumer's edge is a `TraceValueContext` dep whose stored hash is the producer
@@ -236,35 +236,39 @@ Consequence, verified by case analysis (NOT a soundness hole):
   longer matches the filesystem. Soundness is preserved by the recompute-and-compare
   in §3; only precision suffers from the routing alias.
 
-**Severity: MEDIUM, needs measurement.** The trigger is two derivations sharing a
-drvPath but recording different deps — which §2 shows is reachable via
-`__ignoreNulls`-dropped file-backed attrs (nixpkgs `mkDerivation` default). How
-often this occurs on a real workload is UNMEASURED. Mitigation if measured to
-matter: make the routing key finer than `drvHash` — fold a digest of the recorded
-dep set into the interned `__ca:` name (`internName` accepts arbitrary strings,
-RFC §3a), so `aaa` and `bbb` route to distinct CurrentNode rows and neither
-over-invalidates the other. This trades a small key-space increase for precision;
-it does not affect soundness either way. Open item §7.6.
+**Severity: LOW (downgraded from MEDIUM by pass #12, Attack P), needs measurement.**
+The trigger is two same-drvPath-different-deps derivations BOTH evaluated in ONE
+session (cross-process, the warm consumer's edge points at a routing row a different
+variant last wrote). How often is UNMEASURED, but pass #12 showed the consequence is
+milder than first stated: even when the routing alias misdirects, the routed
+producer is RE-VERIFIED against the current FS (Attack C), so it returns nullopt
+unless its recorded deps match disk — i.e. the consumer gets a sound MISS and
+re-records correctly. The alias costs at most a spurious miss in the rare
+both-variants-coexist session; it does not persist.
+~~Mitigation: fold a dep-set digest into the `__ca:` routing key.~~ **REJECTED (pass
+#12, Attack P):** folding the trace_hash into the routing key RE-COUPLES routing and
+verification — the exact thing §3 decouples. It would make the routing pathId
+unstable across content changes and rely on lookup-miss instead of the clean
+hash-compare, and it is architecturally at odds with the design's core principle for
+no soundness gain (both are sound). The correct stance: keep drvPath-only routing;
+the trace_hash compare (Attack C) already distinguishes the variants on verify. The
+aliasing is a rare, non-persisting precision blip, not something to re-couple the
+architecture to fix. Open item §7.6 (now: measure whether it's even worth caring
+about, NOT a mitigation to build).
 
-> **Three-way key-granularity tension (adversarial pass #7, Attack L — reconciling
-> §3 vs §3b vs §6).** Three forces pull the routing-key granularity in conflicting
-> directions, and they must be decided together, not in isolation:
-> - §3's stated insight wants `drvPath` as the routing key (coarse) so the
->   verification/routing decoupling is clean.
-> - §3b/§7.6's Attack-D mitigation wants `H(drvPath, dep-set-digest)` (fine) to stop
->   same-drvPath producers from over-invalidating each other.
-> - §6's storage win wants the COARSEST key that still dedups (fewer producer rows).
-> These are not independent knobs: a finer key reduces aliasing (precision↑) but
-> reduces cross-dep-set dedup (storage↓) and adds routing rows. The resolution is
-> that **soundness is invariant under ALL of them** (verification is by recomputed
-> `trace_hash` regardless of routing granularity — §3/Attack C), so the key
-> granularity is a pure PRECISION-vs-STORAGE tuning choice to be made FROM
-> MEASUREMENT (§7.6 aliasing frequency + §7.7 sharing), not fixed in the design.
-> The RFC therefore specifies "route by some content-addressed key derived from at
-> least drvPath; the exact granularity is a measured tuning parameter," and drops
-> the earlier unqualified "drvPath is THE routing key" as over-specified. Default to
-> drvPath-only (coarsest, best dedup) and refine to fold in a dep-set digest only if
-> §7.6 measures aliasing to matter.
+> **Routing key = drvPath, full stop (adversarial pass #7 raised a granularity
+> tension; pass #12 Attack P RESOLVED it).** Pass #7 framed a three-way tension —
+> §3 wants coarse drvPath routing, §3b wanted a finer `H(drvPath, dep-set-digest)` to
+> cut aliasing, §6 wants the coarsest key for dedup — and called granularity a
+> measured tuning knob. Pass #12 collapsed the tension: the finer-key option is
+> SELF-DEFEATING (folding the trace_hash into the routing key re-couples routing and
+> verification, the exact thing §3 decouples — Attack P), and it buys nothing because
+> the trace_hash compare already distinguishes same-drvPath variants on verify
+> (Attack C) and the residual aliasing is a rare non-persisting precision blip (§3b,
+> downgraded to LOW). So there is no real tension: **route by drvPath (coarsest, best
+> dedup, §6-optimal); verify by trace_hash (§3); do NOT fold deps into the routing
+> key.** The earlier "granularity is a tuning parameter" framing is withdrawn — the
+> parameter has a determined value.
 
 ## 4. What this buys (the benefit §3b couldn't deliver)
 
@@ -423,13 +427,15 @@ signal the observation was not output-only).
    `ca-producer-boundary-recording.cc` P4 proved nested producer chains verify;
    must confirm the sub-scope nesting composes (inner producer edge inside outer
    producer trace). UNVERIFIED for this isolation shape.
-6. **Routing-key aliasing precision cost (§3b, Attack D).** Same-drvPath producers
-   with different recorded dep sets share a `__ca:<drvHash>` routing row and can
-   over-invalidate each other (sound, but spurious misses). Measure frequency on a
-   real workload; if it matters, fold a dep-set digest into the routing key. This
-   is the one finding from adversarial pass #1 that the original draft missed
-   entirely — it is precision-only, but should be measured before claiming the
-   design delivers a NET win (spurious misses eat into the amortization benefit).
+6. **Routing-key aliasing precision blip (§3b, Attack D; downgraded by pass #12,
+   Attack P).** Same-drvPath-different-deps producers sharing a `__ca:<drvHash>`
+   routing row can cause a spurious consumer miss IN the rare session where both
+   variants coexist — but it doesn't persist (the misdirected producer is re-verified
+   vs FS and the consumer re-records correctly, Attack C). The pass-#1 "fold a dep-set
+   digest into the routing key" mitigation is REJECTED (Attack P: re-couples routing
+   and verification for no soundness gain). Remaining work is only to MEASURE whether
+   the blip is frequent enough to matter on a real workload — NOT a mitigation to
+   build. Almost certainly negligible; listed for completeness, not as a blocker.
 7. **Does the amortization actually TRIGGER at the args-force boundary? (pass #5
    Attack J, refined by pass #6.)** Two sub-questions, now separated:
    - (a) STORAGE sharing — ANSWERED by the existing 607× measurement (§6 refinement):
