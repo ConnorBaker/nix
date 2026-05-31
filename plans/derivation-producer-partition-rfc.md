@@ -268,15 +268,23 @@ signal the observation was not output-only).
   sqlite-trace-storage-lifecycle.cc:170-191). For N>1 this is a clear win
   (closure + N·edge ≪ N·closure). For **N=1 (singly-consumed derivation) it is a
   small net ADD** — closure + 1 edge + producer routing rows vs just the consumer's
-  flattened closure. So "storage drops" is CONDITIONAL on derivations being
-  multiply-consumed within one eval. That is the SAME sharing property #5 measured
-  for the as-built gate (E:P), where the gate fired ~0 because consumers re-force the
-  wrapper not the `strict` attrset. THIS RFC edges at the args-force boundary instead,
-  so the consumer-sharing count COULD differ — but it is UNMEASURED, and it is the
-  same number that decides whether the design is a net win at all. If most
-  derivations are singly-consumed per eval, this design ADDS storage rather than
-  dropping it. Must measure consumer-sharing (distinct consumers per producer
-  drvPath) on Ledger-D BEFORE assuming any storage benefit.
+  flattened closure. So per-producer, "storage drops" is CONDITIONAL on N>1.
+  **REFINEMENT (adversarial pass #6, self-check on Attack J — the pass #5 edit was
+  too pessimistic):** in AGGREGATE storage clearly drops, because the consumer-
+  sharing distribution is bimodal and the high-N side dominates. The 607× figure
+  (architecture-trace-model-vs-CA.md: 36.5M flattened vs ~60K distinct = 99.8%
+  duplication) IS producer-sharing for shared-infra derivations: a stdenv file
+  appearing in 607 package traces means stdenv-the-producer is consumed by N≈607.
+  Removing that duplication removes ~99.8% of the flattened bytes; Attack J's N=1
+  net-add applies only to the ~0.2% distinct tail (leaf packages nothing builds on).
+  So **net storage drops** — Attack J was directionally right (N=1 is a per-item add)
+  but I overstated it to "doesn't drop." Corrected.
+  CRUCIAL distinction this refinement must NOT blur: storage-drop ≠ net-PERF-win. The
+  607× says the bytes are shared; it does NOT say the §4 verify-amortization or the
+  edge-emission actually TRIGGER at the args-force boundary. #5 measured the as-built
+  gate fired ~0 (E:P) on this exact workload because re-forces hit the wrapper not the
+  `strict` attrset. Whether moving the edge to args-force makes the amortization fire
+  is the genuinely open §7.7 question; the storage arithmetic does not answer it.
 - The isolation changes consumer trace SHAPE (fewer leaf deps, one edge). This is
   a precision-neutral change ONLY if §3's trace_hash argument holds and the facet
   gate (§5) is correct. The standing correctness gate (byte-identical `nix eval`)
@@ -352,19 +360,25 @@ signal the observation was not output-only).
    is the one finding from adversarial pass #1 that the original draft missed
    entirely — it is precision-only, but should be measured before claiming the
    design delivers a NET win (spurious misses eat into the amortization benefit).
-7. **Consumer-sharing ratio is the master go/no-go number (pass #5, Attack J).**
-   The entire benefit — storage drop (§6), verify amortization (§4), fewer recorded
-   deps — is conditional on producers being consumed by N>1 distinct consumers per
-   eval. #5 measured the as-built gate fires ~0 because consumers re-force the
-   wrapper, not the `strict` attrset; this RFC moves the edge to the args-force
-   boundary, which MAY change the count, but it is UNMEASURED. If derivations are
-   predominantly singly-consumed per eval, the design is a net storage/work ADD
-   (Attack J) AND the verify amortization never triggers — i.e. it reduces to §3b's
-   net loss in a different costume. **This measurement (distinct consumers per
-   producer drvPath, on Ledger-D + python3Packages) must precede the prototype**; it
-   can be taken cheaply by instrumenting the conservative-shape recorder to count,
-   without building the isolation. If the ratio is ~1, STOP — the direction is dead
-   regardless of hot-path cost.
+7. **Does the amortization actually TRIGGER at the args-force boundary? (pass #5
+   Attack J, refined by pass #6.)** Two sub-questions, now separated:
+   - (a) STORAGE sharing — ANSWERED by the existing 607× measurement (§6 refinement):
+     shared-infra producers have N≈607, the flattened total is 99.8% duplication, so
+     replacing it with edges drops aggregate storage. Not the blocker.
+   - (b) AMORTIZATION TRIGGERING — OPEN and the real go/no-go: does a consumer at the
+     args-force boundary actually emit an edge to a SHARED producer (so verify runs
+     once, §4), or does each derivation get its own producer with no cross-consumer
+     reuse? #5 showed the as-built gate fired ~0 because re-forces hit the wrapper;
+     this RFC edges at args-force, which is a DIFFERENT site, but whether that site
+     is reached once-per-distinct-producer (good) or once-per-consumer-occurrence
+     (no reuse) is UNMEASURED. If the latter, the design adds the producer-record cost
+     without the verify saving — §3b's net loss in a new costume.
+   **Cheap pre-prototype measurement:** instrument the conservative recorder to count,
+   per producer drvPath, how many distinct consumer traces flatten its closure
+   (Ledger-D + python3Packages). High N for infra derivations confirms the SHARING
+   exists; then the only remaining question is whether the args-force edge CAPTURES
+   that sharing, which needs the prototype. If even the conservative-recorder sharing
+   count is ~1 across the board, STOP.
 
 ## 8. Recommended sequence (each gated by the standing soundness suite)
 
@@ -385,9 +399,10 @@ signal the observation was not output-only).
    consider default-on.
 
 ## 9. What this RFC does NOT claim
-- NOT that there is a net win at all — that hinges on the consumer-sharing ratio
-  (§7.7), UNMEASURED, and is the master go/no-go: if derivations are mostly
-  singly-consumed per eval the design adds cost and never amortizes (Attack J).
+- NOT that there is a net PERF win — storage clearly drops (§6, 607× is dominated by
+  high-N shared infra), but whether the §4 verify-amortization TRIGGERS at the
+  args-force edge is open (§7.7b): #5 showed the as-built gate fired ~0. Storage-drop
+  does NOT imply perf-win; the two are separate and only the latter is the blocker.
 - NOT that the hot-path cost is acceptable — §6 is unmeasured.
 - NOT that drvPath is the verification key — §2 disproves that; drvPath is routing
   only, trace_hash is verification.
