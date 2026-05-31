@@ -175,25 +175,34 @@ A ~48 MiB repo of incompressible content (~2056 git objects) served over real
 HTTP (Gitea), fetched with `git-lazy-fetch` on vs off, measuring the gitv3 cache
 size (a bytes-on-wire proxy) per access pattern.
 
-**Finding (negative — and the most important result here).** For a pinned-rev
-`builtins.fetchGit { rev = …; }`, lazy-fetch pulls **~the same ~48 MiB at every
-access pattern** (metadata-only, single-file read, full) as a full clone:
+The test measures a locked × unlocked matrix (gitv3 cache size as a
+bytes-on-wire proxy). Two distinct results:
 
-| access pattern | lazy fetch | full eager |
-| --- | --- | --- |
-| metadata (`.rev`) | ~48 MiB | — |
-| single-file read | ~48 MiB | — |
-| full materialise | ~48 MiB | ~48 MiB |
+| input | access pattern | lazy fetch | eager / full |
+| --- | --- | --- | --- |
+| **locked** (`rev = …`) | metadata `.rev` | ~48 MiB | — |
+| locked | single-file read | ~48 MiB | — |
+| locked | full materialise | ~48 MiB | ~48 MiB |
+| **unlocked** (`ref`, no rev) | metadata `.rev` | **~0.1 MiB** | — |
+| unlocked | full materialise | ~48 MiB | ~48 MiB |
 
-The protocol-level filter genuinely works (a `--filter=blob:none` probe pulls
-**53 objects / 52 KiB** vs **2056 objects / 48 MiB** for a full clone), and the
-partial clone *is* created — but the input's `revCount`/`lastModified`
-computation walks and backfills the whole tree before any narrow per-file
-prefetch runs. So **the bandwidth benefit is currently unrealised for the
-dominant `fetchGit{rev}` access pattern.** Realising it needs `revCount` /
-`lastModified` deferred over promisor remotes. The test asserts soundness (lazy
-== eager store path + NAR hash) and reports this table; it does not fabricate a
-saving.
+**Positive (the win, asserted):** an UNLOCKED input read for metadata only, under
+impure eval, hits `mountInput`'s defer path and pulls **~0.1 MiB vs ~48 MiB** — the
+one quadrant where the deferral fires. The protocol-level filter genuinely works
+(a `--filter=blob:none` probe pulls **53 objects / 52 KiB** vs **2056 / 48 MiB**
+for a full clone). *Caveat on the magnitude:* the test **asserts a 2× threshold**
+(`ul_meta_lazy * 2 < ul_full_eager`), not the observed ~480× — the large ratio is
+reported, the regression guard is the conservative 2×.
+
+**Negative (the gap, documented not asserted-away):** a LOCKED pinned-rev input
+pulls the full ~48 MiB at *every* access pattern. The cause is **not**
+`revCount`/`lastModified` (verified: `lazyRevCount` is a deferred `LazyAttr` and
+`getLastModified` reads only the commit object — neither touches blobs). It is
+that `mountInput` materialises a locked input **eagerly** (`isLocked ⇒ no defer`,
+paths.cc), doing a whole-tree NAR walk before any narrow prefetch. Closing it is
+the verified "Option A" deferral (drop `!isLocked`, keep `!pureEval`) — not yet
+implemented. The test asserts soundness (lazy == eager store path + NAR hash) and
+reports the locked table; it does not fabricate a saving.
 
 ## Coverage matrix (mechanism × covered-by)
 
@@ -219,21 +228,23 @@ What exercises each load-bearing mechanism, after this round of work:
 | eval-cache warm path | — | ✅ `evalcache` (flake installable) | — |
 | Forge-input tree-OID bridge (§6.3) | — | — | ✅ git-fingerprint.cc (forge==commit root tree) |
 | Blobless partial clone + soundness (§6.3) | — | — | ✅ git-lazy-fetch.nix |
-| Lazy-fetch ssh transport | unit (git-promisor-wiring/pkt-line) | — | ✅ git-lazy-fetch.nix (soundness; filter reported) |
+| Lazy-fetch ssh transport | unit (git-promisor-wiring/pkt-line) | — | ✅ git-lazy-fetch.nix (soundness **+ hard-asserted ssh --filter**, after the SSHMaster fix) |
 | Lazy-fetch 3-way object count | — | — | ✅ git-lazy-fetch-compare.nix |
 | Lazy-fetch at scale (locked **and unlocked**) | — | — | ✅ git-lazy-fetch-scale.nix |
 
 This round closed the gaps the prior audit flagged: forge inputs, the
 realistic `lib.cleanSource` filter, `synthesiseTree`/`readBlob` microbenchmarks,
 the eval-cache warm path, and the **positive** (unlocked) lazy-fetch measurement
-(`git-lazy-fetch-scale.nix` now asserts unlocked metadata-only pulls ~480× fewer
-bytes — 0.1 MiB vs 48 MiB — while documenting the locked-rev gap).
+(`git-lazy-fetch-scale.nix` asserts a conservative 2× threshold on unlocked
+metadata-only — observed ~480× / 0.1 vs 48 MiB — while documenting the locked-rev
+gap). The ssh transport bug found this round (GIT_PROTOCOL dropped by the SSH
+control-master → ssh fetch never blobless) is **fixed**, and the VM test now
+hard-asserts the ssh `--filter`.
 
-Two honesty notes remain. The ssh-transport VM test asserts **soundness**
-across transports and *reports* whether the fetch was blobless rather than
-hard-asserting it: Nix's `SSHMaster` v2 capability probe is environment-sensitive
-against a given sshd, so the filter wiring's guarantee rests on its unit coverage
-(`git-promisor-wiring.cc`, `pkt-line.cc`). And the locked-rev backfill itself is
-a known product gap (lazy-fetch saves nothing for `fetchGit{rev}` because
-`mountInput` materialises locked inputs eagerly); the verified fix is to defer
-locked-rev inputs like unlocked ones, pure-eval-gated — not yet implemented.
+One honesty note remains. The locked-rev backfill is a known product gap
+(lazy-fetch saves nothing for `fetchGit{rev}` because `mountInput` materialises
+locked inputs eagerly — the eager NAR walk, not `revCount`); the verified fix is
+to defer locked-rev inputs like unlocked ones, pure-eval-gated — not yet
+implemented. (The ssh filter-probe gap from the prior round turned out to be a
+real bug — the SSH control-master dropped `GIT_PROTOCOL` — and is now fixed, so
+the ssh `--filter` is hard-asserted rather than soft-reported.)

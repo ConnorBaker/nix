@@ -243,10 +243,16 @@ TEST_F(GitFingerprintTest, RootTreeHashSurvivesSourceViewWrapper)
    `tarballCache->getAccessor(treeHash, ...)`. The PROPOSAL §6.3 claim is that
    forge inputs "get the tree-OID bridge for free": a forge input and a plain
    git input that resolve to the same tree must key the SAME
-   `treeHashToNarHash` row. The load-bearing fact is that a TREE-rooted accessor
-   (forge shape) reports the same `getRootTreeHash()` as a COMMIT-rooted
-   accessor of the same tree — otherwise the two would never share a bridge row.
-   Adversarial gap #3: nothing tested the tree-rooted (forge) accessor shape. */
+   `treeHashToNarHash` row, which requires a TREE-rooted accessor to report the
+   same `getRootTreeHash()` + same NAR as a COMMIT-rooted accessor of that tree.
+
+   This pins that property directly via the two accessor SHAPES — it does NOT go
+   through github.cc / the InputScheme (a faked-forge VM test's job). It holds
+   because `GitSourceAccessor`'s ctor peels a commit to its root tree
+   (peelToTreeOrBlob), so both accessors wrap the identical tree object; that
+   peel is precisely the invariant the bridge relies on, and a regression that
+   broke it (or made a tree-rooted accessor report a different OID/NAR) fails
+   here. Adversarial gap #3: nothing tested the tree-rooted (forge) shape. */
 TEST_F(GitFingerprintTest, ForgeTreeRootedAccessorSharesRootTreeHashWithCommit)
 {
     writeWorktreeFile("hello.txt", "hi");

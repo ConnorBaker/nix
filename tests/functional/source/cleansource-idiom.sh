@@ -4,13 +4,15 @@
 # (`p: type: true`) over synthetic toy trees. The README's HEADLINE workload is
 # `mkDerivation { src = lib.cleanSource ./.; }` — a REALISTIC, non-trivial
 # predicate (reject .git, editor swap/backup files, .o/.so, result symlinks)
-# over a real-shaped source tree. This test runs the ACTUAL nixpkgs
-# `cleanSourceFilter` logic (inlined verbatim from nixpkgs lib/sources.nix, so
-# no nixpkgs dependency) over a git-backed tree that CONTAINS each junk class,
+# over a real-shaped source tree. This test runs nixpkgs's `cleanSourceFilter`
+# logic — its core cases (.git/.svn/CVS/.hg, editor ~/.swp, .o/.so) adapted from
+# lib/sources.nix so there's no nixpkgs dependency (NOT verbatim: it omits the
+# newer .jj/.pijul/_darcs VCS dirs, which this test doesn't stage) — over a
+# git-backed tree that CONTAINS each junk class,
 # and asserts:
 #   1. the filter actually drops the junk (the result store path excludes it),
 #   2. ours keeps the filtered source CACHEABLE (warm re-eval = no re-copy),
-#      where master/DetSys hit the fetch-to-store.cc:41 filter-bypass.
+#      where master/DetSys hit the fetch-to-store `filter ? nullopt` bypass.
 #
 # This is the realistic-filter counterpart to filtered-cache.sh's trivial one.
 
@@ -86,7 +88,7 @@ echo "cleansource-idiom: realistic filter dropped all junk classes, kept real fi
 # NOT the fetcher cache) between the two evals: the filtered tree's store path is
 # now gone, so the only thing that can save the re-walk+re-copy is the persistent
 # `sourceContentToNarHash` row keyed on the `;shape` fingerprint. If the source
-# were uncacheable (the master/DetSys fetch-to-store.cc:41 filter-bypass), eval2
+# were uncacheable (the master/DetSys fetch-to-store `filter ? nullopt` bypass), eval2
 # would re-copy into the empty store. We assert BOTH: a positive
 # sourceContentToNarHash cache-hit marker AND no re-copy. (Asserting only
 # copies==0 against a SHARED store would be vacuous — eval2 copies nothing just

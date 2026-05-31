@@ -8,8 +8,11 @@
  * makes a wrapper allocate or re-dispatch per read shows up.
  *
  *   BM_Read_BareMemory     — baseline: readFile straight through MemorySourceAccessor
- *   BM_Read_SubsetStack    — readFile through a sourceViewSubset (the
- *                            DirectorySynthesizer∘Restrict∘Translate stack)
+ *   BM_Read_SubsetStack    — readFile through a sourceViewSubset (a Subset at
+ *                            root: Restrict over the base; Translate(/) is
+ *                            identity and DirectorySynthesizer is a pure
+ *                            readFile forward — so this isolates Restrict's
+ *                            per-read membership cost; see the call site)
  *   BM_Lstat_SubsetStack   — maybeLstat through the same (the synthesis path)
  *
  * Single-tree regression guard.
@@ -63,7 +66,14 @@ static void BM_Read_SubsetStack(benchmark::State & state)
     const size_t n = (size_t) state.range(0);
     auto m = makeTree(n);
     auto shape = hashString(HashAlgorithm::SHA256, "bench-shape");
-    /* Subset over the whole /sub subtree → DirectorySynthesizer∘Restrict∘Translate. */
+    /* Subset at root → DirectorySynthesizer ∘ Restrict ∘ Translate, but
+       Translate(/) collapses to identity (translate-source-accessor.cc), so the
+       live readImpl is DirectorySynthesizer ∘ Restrict ∘ base. And readFile is a
+       pure forward through DirectorySynthesizer (its overrides are on
+       maybeLstat/readDirectory), so this readFile path effectively measures
+       Restrict's accepted-set membership check over the base — the dominant
+       per-read operator cost. (BM_Lstat_SubsetStack below exercises the
+       DirectorySynthesizer synthesis path.) */
     auto view = sourceViewSubset(m, shape, acceptedUnder(n), CanonPath::root);
     /* The accepted set is /-rooted; read via the same namespace. */
     auto path = CanonPath("/sub") / ("f" + std::to_string(n / 2) + ".txt");

@@ -121,24 +121,44 @@ static void BM_OutPathsOf_Warm(benchmark::State & state)
 }
 BENCHMARK(BM_OutPathsOf_Warm)->Arg(4)->Arg(16)->Arg(64);
 
-/* Parse cache: upsert a Value tree then look it up (the fromJSON-over-readFile
-   warm path). Uses a private HOME so the persistent SQLite is isolated. */
+/* Parse cache: upsert a parsed Value then look it up (the persistent SQLite
+   behind fromJSON-over-readFile). To actually exercise the SQLite — not a no-op
+   — point XDG_CACHE_HOME at a temp dir BEFORE the first getParseCache() (the
+   cache is a singleton that resolves its dir on first open) and assert the cache
+   is `functional`; if the dir were unwritable the cache silently no-ops, which
+   would make this measure `encode` + an early return rather than a round-trip. */
 static void BM_ParseCacheRoundTrip(benchmark::State & state)
 {
     auto root = createTempDir();
+    setenv("XDG_CACHE_HOME", (root / "cache").string().c_str(), /*overwrite=*/1);
+    createDirs(root / "cache");
     auto st = makeEvalState(root / "store");
     auto cache = getParseCache();
 
-    /* A modest attrset Value to round-trip. */
+    /* A small attrset Value (closer to a real fromJSON result than a scalar). */
+    Value a, b, c;
+    a.mkInt(1);
+    b.mkString("two", st->mem);
+    c.mkBool(true);
+    auto builder = st->buildBindings(3);
+    builder.insert(st->symbols.create("alpha"), &a);
+    builder.insert(st->symbols.create("beta"), &b);
+    builder.insert(st->symbols.create("gamma"), &c);
     Value v;
-    v.mkInt(424242);
+    v.mkAttrs(builder.finish());
+
+    /* Fail loudly rather than silently measure a no-op: prove the SQLite round
+       trip actually happens once before timing. */
+    if (!cache->upsert("bench:probe", "json", "json-v1", CanonPath::root, *st, v))
+        throw Error("parse cache is not functional (XDG_CACHE_HOME unwritable?) — benchmark would be a no-op");
 
     size_t i = 0;
     for (auto _ : state) {
         auto fp = fmt("bench:%d", i++);
-        cache->upsert(fp, "json", "json-v1", CanonPath::root, *st, v);
+        bool up = cache->upsert(fp, "json", "json-v1", CanonPath::root, *st, v);
         Value out;
         bool hit = cache->lookup(fp, "json", "json-v1", CanonPath::root, *st, out);
+        benchmark::DoNotOptimize(up);
         benchmark::DoNotOptimize(hit);
     }
     state.SetItemsProcessed(state.iterations());
