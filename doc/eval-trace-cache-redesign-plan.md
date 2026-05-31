@@ -2788,3 +2788,33 @@ MAGNITUDE (what % of flattening a derivation edge removes — 35–90%, gated on
 Both need work touching real python3Packages data / the hot path (RFC §8 step 3 prototype). The
 cheap analysis took sharing as far as artifacts allow and surfaced that benefit magnitude is a
 separate open question; it did NOT establish the edge collapses the whole 607×.
+
+### 2026-05-31 follow-up #12: §8-step-3 prototype, part 1 — benefit-magnitude probe (dep-kind breakdown)
+
+Following the user's go-ahead to build the §8-step-3 prototype + measure the two open
+go/no-go numbers (hot-path cost #6; benefit magnitude — the 35–90% StructProj question from
+#11's correction). This is PART 1: the benefit-magnitude probe (lower-risk; reads the dep
+range the conservative hook already snapshots, no hot-path restructure).
+
+**Instrumentation:** `src/libexpr/eval-trace/drv-benefit-probe.{hh,cc}`, env-gated
+`NIX_MEASURE_DRV_BENEFIT=1` (no-op otherwise; independent of NIX_ENABLE_CA_PRODUCER). At
+`prim_derivationStrict` finalize, tallies the dep-KIND histogram of the epoch-log range that
+grew during the call — the derivation-closure deps a producer-edge would remove from the
+consumer. Dumps at atexit.
+
+**Validated against known-answer cases BEFORE trusting (the recurring lesson):**
+- Single derivation reading one file: range = {fileBytes×1, storePathAvailability×1} — exactly
+  the input file + the `.drv` dep. Faithful.
+- NESTED derivations (outer has an inner derivation as buildInput): 2 derivations, total 6 deps,
+  outer's range (max=4) INCLUDES inner's closure (inner forced inside outer's window). So ranges
+  NEST/overlap — outer's range double-counts inner's deps.
+
+**Interpretation caveat (from the nested-validation):** the per-derivation ranges OVERLAP
+(an outer derivation's range contains its nested derivations' ranges), so the ABSOLUTE total
+across all ranges is inflated by nesting and must NOT be summed to "total flattening removed."
+What IS faithful is the per-KIND fraction (what kinds of deps populate derivation closures) —
+which is exactly what the §0.5/#11 benefit-magnitude question needs: is the plurality of a
+derivation's flattened closure FileBytes/SPA (derivation-closure, edge-removable) or StructProj
+(possibly consumer-intrinsic)?
+
+python3Packages measurement: IN PROGRESS (next follow-up records the breakdown + verdict).
