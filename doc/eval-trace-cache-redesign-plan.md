@@ -2118,3 +2118,64 @@ in `forceThunkValue` — all hot-path production code that carries the v53/vptr 
 
 P6's interface sketch + P1-P5's correctness floor define exactly what the production prototype must
 produce. The next slice is hot-path territory and exits the test-only zone.
+
+### 2026-05-30 follow-up #2: §3b hot-path infrastructure landed (dormant, byte-identical)
+
+The `Value*→(caKey, traceHash)` side table and the `replayMemoizedDeps` gate are now in
+production code. Currently DORMANT — no caller registers into `producerMap` yet — but the
+infrastructure is sound, probe-verified, and adds no observable change to real evaluation.
+
+**Production additions:**
+- `MemoReplayStore::producerMap` — `boost::unordered_flat_map<const Value *, ProducerEntry,
+  ..., traceable_allocator<...>>` mirroring the lifetime/GC-hazard discipline of `epochMap`.
+- `MemoReplayStore::registerProducer(value, caKey, traceHash)` — `insert_or_assign` for the
+  BUG-7 GC-address-reuse hazard.
+- `MemoReplayStore::lookupProducer(value)` — nullopt for unregistered Values; the gate's
+  fall-through.
+- `MemoReplayStore::clearProducerMap()` — wired into `clear()`.
+- `TraceRuntime::replayMemoizedDeps` — gate fires BEFORE the existing `getReplayRange` lookup.
+  When a producer is registered AND a recording scope is active, emits ONE
+  `TraceValueContext` edge dep targeting the CA key and returns. Independent of `epochMap`
+  (the producer can have no epoch entry). Bounded by `nrReplayBloomHits`-style fast paths.
+- `nrReplayProducerEdges` counter — surfaced under `evalTrace.replay.producerEdges` in
+  `NIX_SHOW_STATS` JSON.
+
+**Hot-path cost when producerMap is empty (steady state today):** one
+`boost::unordered_flat_map::find()` per `replayMemoizedDeps` call. Bounded by the same set
+of forces that today pay the existing bloom+epochMap lookup. Effectively zero in benchmark
+terms; will be remeasured once a §3b producer-trace boundary registers Values.
+
+**Test floor (all probe-verified, all fail under deliberate-bug probes):**
+- `dep/producer-side-table.cc` — 5 tests: register/lookup round-trip, distinct keys, BUG-7
+  hazard, lookup-unregistered nullopt, lifecycle clear.
+- `dep/replay-producer-gate.cc` — 4 tests: G1 registered Value emits edge not flatten; G2
+  unregistered still flattens (control); G3 no recording scope → no-op; G4 no epoch range
+  still emits edge.
+- `dep/ca-producer-scope.cc` — 3 tests: end-to-end through `state.traceCtx` — boundary
+  shape, replay-gate-emits-edge through production replayMemoizedDeps, producer-input
+  mutation invalidates consumer via gate-emitted edge through `resolveTraceContextHash`.
+
+**Soundness gates passed:**
+- Sandboxed `.#checks.x86_64-linux.nix-expr-tests-run`: 1840 tests, 3 documented skips,
+  0 failures.
+- Canonical correctness check (per the test-discipline section above): `nix eval -f
+  ~/nixpkgs/default.nix --system x86_64-linux asciidoc.nativeBuildInputs --json` produces
+  BYTE-IDENTICAL output between `--no-eval-trace` and trace-on. The hot-path change
+  introduces zero observable difference in real evaluation.
+
+**Material blocker for the next slice — production-side §3b boundary:** wiring a CALLER
+into `producerMap` requires an integration point that knows (a) when a Value is a
+derivation result, (b) the drvHash for the CA key, and (c) the deps recorded during that
+derivation's evaluation. The natural shape is wrapping `forceAttrs(args[0])` +
+`derivationStrictInternal` in `prim_derivationStrict` with a sub-scope that captures the
+input deps, persists them as a CA producer trace via the active `TraceBackend`, and
+registers the result Value. That requires threading `EvalContext<Suspendable>` (or an
+equivalent backend-access capability) into the primop, which is the same hot-path
+session-integration question the prior spike's "second TracedExpr identity model" framed
+differently. Approaches under consideration:
+1. New lightweight "record-producer-trace" path that doesn't require `EvalContext<Suspendable>`
+   threading (uses the active session via a TLS or capability lookup).
+2. Lift the producer-scope OUT of `prim_derivationStrict` to `evaluateResolvedTarget` (which
+   already has `EvalContext<Suspendable>`) and detect derivation results post-eval.
+3. Defer until the §7 measurement decides whether the dormant gate's overhead is worth
+   shipping the producer-side wiring at all.
