@@ -951,6 +951,57 @@ void TraceRuntime::rollbackReplayEpoch(uint32_t epochStart)
     replayStore.rollbackEpoch(epochStart);
 }
 
+// Test-only mirror of `replayMemoizedDeps` using `testProducerKey` for
+// non-attrset Values. Production `replayMemoizedDeps` uses
+// `producerKeyFor(v)` which returns nullptr for non-attrset Values; tests
+// that drive the gate with `mkInt`/`mkString` Values would otherwise
+// short-circuit. The body is otherwise identical to `replayMemoizedDeps`
+// (intentional duplication; small enough that abstracting risks
+// destabilising the hot path).
+void TraceRuntime::replayMemoizedDeps_ForTest(const Value & v)
+{
+    eval_trace::nrReplayTotalCalls++;
+
+    if (auto producer = replayStore.lookupProducer(TraceRuntime::testProducerKey(v))) {
+        if (auto access = eval_trace::TraceAccess::current()) {
+            access->record(Dep::makeValueContext(
+                producer->caKey, DepHashValue(producer->traceHash)));
+            eval_trace::nrReplayProducerEdges++;
+            return;
+        }
+    }
+
+    auto rangeOpt = replayStore.getReplayRange(v);
+    if (!rangeOpt) return;
+    eval_trace::nrReplayBloomHits++;
+    eval_trace::nrReplayEpochHits++;
+
+    if (auto * captureScope = eval_trace::SiblingReplayCaptureScope::innermost()) {
+    if (auto sibling = lookupCapturedValueIdentity(v)) {
+        if (sibling->siblingIdentity) {
+            auto & ctx = captureScope->ctx();
+            auto traceHash = sibling->traceBackend
+                ? sibling->traceBackend->getCurrentTraceHash(ctx, sibling->valueContext.value)
+                : std::optional<TraceHash>{};
+            if (eval_trace::SiblingReplayCaptureScope::maybeCapture(
+                    sibling->siblingIdentity->parentSlot,
+                    sibling->valueContext,
+                    traceHash)) {
+                return;
+            }
+        }
+    }
+    }
+
+    auto & range = *rangeOpt;
+
+    auto access = eval_trace::TraceAccess::current();
+    if (!access) return;
+    if (access->replayMemoizedRange(v, range)) {
+        eval_trace::nrReplayAdded++;
+    }
+}
+
 bool TraceRuntime::shouldIsolateSiblingForce(const Value & v) const
 {
     // Fast reject: no capture scope active → sibling isolation impossible.
@@ -980,19 +1031,28 @@ void TraceRuntime::replayMemoizedDeps(const Value & v)
 {
     eval_trace::nrReplayTotalCalls++;
 
-    // RFC §3b producer gate: if `v` was registered as a CA producer (e.g.,
-    // its derivation-strict force opened a producer-trace boundary that
-    // finalized to a CA-keyed trace), emit ONE TraceValueContext edge into
-    // the consumer's recording scope and skip the flatten path entirely.
+    // RFC §3b producer gate: if `v` is a derivation result whose
+    // identity-key was registered as a CA producer (by
+    // `prim_derivationStrict` via `recordCAProducer`), emit ONE
+    // TraceValueContext edge into the consumer's recording scope and
+    // skip the flatten path entirely.
+    //
+    // Production uses `Bindings *` for derivation result identity (via
+    // `producerKeyFor(v)`) — stable across the `vRes = vCur` copy in
+    // `callFunction` (eval.cc:2530), since `Value::mkAttrs(b)` stores
+    // the pointer.
+    //
     // The gate is INDEPENDENT of `epochMap` — a producer whose deps were
     // already consumed via outer takeDeps may have no epoch range, but we
-    // still want the edge. See `dep/replay-producer-gate.cc::G4`.
-    if (auto producer = replayStore.lookupProducer(v)) {
-        if (auto access = eval_trace::TraceAccess::current()) {
-            access->record(Dep::makeValueContext(
-                producer->caKey, DepHashValue(producer->traceHash)));
-            eval_trace::nrReplayProducerEdges++;
-            return;
+    // still want the edge.
+    if (auto key = eval_trace::producerKeyFor(v)) {
+        if (auto producer = replayStore.lookupProducer(key)) {
+            if (auto access = eval_trace::TraceAccess::current()) {
+                access->record(Dep::makeValueContext(
+                    producer->caKey, DepHashValue(producer->traceHash)));
+                eval_trace::nrReplayProducerEdges++;
+                return;
+            }
         }
     }
 

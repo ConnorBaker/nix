@@ -42,6 +42,21 @@ struct SiblingReplayCaptureScope;
 
 namespace eval_trace {
 
+/// Extract a stable identity key for the §3b producer side-table from a
+/// Value. Returns the Value's `Bindings *` for attrset Values (the only
+/// kind a derivation result has — `prim_derivationStrict` always produces
+/// `nAttrs`), and nullptr otherwise.
+///
+/// The `Bindings *` is stable across the `vRes = vCur` copy in
+/// `callFunction` (eval.cc:2530), since `Value::mkAttrs(b)` stores the
+/// pointer and copies share it. This is what makes the gate's later
+/// `lookupProducer(producerKeyFor(forced_value))` find the binding that
+/// `prim_derivationStrict` registered.
+inline const ::nix::Bindings * producerKeyFor(const ::nix::Value & v)
+{
+    return v.type() == ::nix::nAttrs ? v.attrs() : nullptr;
+}
+
 /**
  * Sibling capture scope for navigated child evaluation.
  *
@@ -286,13 +301,15 @@ public:
     /// thread.
     void clearFileContentHashes() { fileContentHashes.clear(); }
 
-    /// Public producer-side-table API (RFC §3b). Bind a forced Value to its
-    /// CA producer trace identity so subsequent re-forces emit a single
-    /// `TraceValueContext` edge via the gate in `replayMemoizedDeps`.
-    /// Called from `TraceSession::recordCAProducer` after the producer
-    /// trace is persisted via `TraceBackend::recordSync`.
-    void registerProducer(const Value & v, AttrPathId caKey, DepHash traceHash)
-    { replayStore.registerProducer(v, caKey, traceHash); }
+    /// Public producer-side-table API (RFC §3b). Bind a derivation result's
+    /// `Bindings *` to its CA producer trace identity so subsequent re-forces
+    /// emit a single `TraceValueContext` edge via the gate in
+    /// `replayMemoizedDeps`. Called from `TraceSession::recordCAProducer`
+    /// after the producer trace is persisted via `TraceBackend::recordSync`.
+    /// Keyed by Bindings* for stability across the `vRes = vCur` copy in
+    /// `callFunction` — see `MemoReplayStore::producerMap` doc.
+    void registerProducer(const ::nix::Bindings * b, AttrPathId caKey, DepHash traceHash)
+    { replayStore.registerProducer(b, caKey, traceHash); }
 
     /// Read-only access to a slice of the epoch log [start, end). Used by
     /// `prim_derivationStrict` to capture the deps recorded during a
@@ -320,13 +337,46 @@ private:
     bool hasBindingsValueIdentity_ForTest(const Bindings * key) const;
     void reset_ForTest() { reset(); }
     void recordThunkDeps_ForTest(const Value & v, uint32_t epochStart) { recordThunkDeps(v, epochStart); }
-    void replayMemoizedDeps_ForTest(const Value & v) { replayMemoizedDeps(v); }
+    /// Production gate keys producerMap by `Bindings *` (stable across the
+    /// `vRes = vCur` copy in callFunction); see `producerKeyFor()`. For
+    /// non-attrset Values, production returns nullptr and the gate
+    /// short-circuits. Tests that drive `replayMemoizedDeps` directly with
+    /// `mkInt`/`mkString` Values via `_ForTest` need a synthetic-key path
+    /// to exercise the gate; this method routes through the same gate
+    /// logic but uses `testProducerKey` (which falls back to the Value
+    /// address for non-attrset Values). Production code never goes through
+    /// this path.
+    void replayMemoizedDeps_ForTest(const Value & v);
+    /// Test-only: register/lookup keyed by Value (extracts Bindings* for
+    /// attrset Values; uses a synthetic per-Value Bindings* otherwise so
+    /// existing tests that pass int/string Values continue to work). The
+    /// production API (`registerProducer(Bindings *)`) is the canonical
+    /// shape; these wrappers exist purely for test ergonomics.
     void registerProducer_ForTest(const Value & v, AttrPathId caKey, DepHash traceHash)
-    { replayStore.registerProducer(v, caKey, traceHash); }
+    {
+        replayStore.registerProducer(testProducerKey(v), caKey, traceHash);
+    }
     std::optional<eval_trace::MemoReplayStore::ProducerEntry> lookupProducer_ForTest(const Value & v) const
-    { return replayStore.lookupProducer(v); }
+    {
+        return replayStore.lookupProducer(testProducerKey(v));
+    }
     size_t producerMapSize_ForTest() const { return replayStore.producerMapSize(); }
     void clearProducerMap_ForTest() { replayStore.clearProducerMap(); }
+
+private:
+    /// For test ergonomics: derive a Bindings*-shaped key from a Value.
+    /// Attrset values use their actual `Bindings *` (matching production);
+    /// non-attrset Values fall back to the Value's address reinterpreted.
+    /// Tests using `mkInt`/`mkString` Values rely on this fallback for
+    /// stable per-Value keys; production paths only ever register attrset
+    /// Values (derivation results), so the fallback is never used.
+    static const Bindings * testProducerKey(const Value & v)
+    {
+        if (v.type() == nAttrs)
+            return v.attrs();
+        return reinterpret_cast<const Bindings *>(&v);
+    }
+public:
 
 
     InterningPools & tracingPools() { return *pools; }

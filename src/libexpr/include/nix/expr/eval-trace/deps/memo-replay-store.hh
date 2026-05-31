@@ -39,25 +39,38 @@ struct MemoReplayStore {
         epochMap;
     PointerBloomFilter<1 << 23, 16> replayBloom;
 
-    /// Producer side-table: maps a forced derivation Value to its CA producer
-    /// trace identity. Populated when a producer-trace boundary finalizes (RFC
-    /// §3b); consulted in `replayMemoizedDeps` to route between flatten-replay
-    /// (no entry → today's path) and edge-emission (entry → record one
-    /// `TraceValueContext` dep targeting the producer's CA key, skip the dep
-    /// copy). Same lifetime + traceable_allocator concerns as `epochMap`:
-    /// keyed Value*s must stay live across GC. Independent of `epochMap` —
-    /// a Value can be in producerMap without being in epochMap (a producer
-    /// whose deps were already consumed via outer takeDeps).
+    /// Producer side-table: maps a forced derivation result's `Bindings *`
+    /// to its CA producer trace identity. Populated when a producer-trace
+    /// boundary finalizes (RFC §3b); consulted in `replayMemoizedDeps` to
+    /// route between flatten-replay and edge-emission.
+    ///
+    /// **Why `Bindings*` and not `Value*`** — primops are dispatched as
+    /// `fn->impl(state, pos, args, vCur)` where `vCur` is `callFunction`'s
+    /// stack-local Value. After `callFunction` returns, `vRes = vCur`
+    /// COPIES the value into the caller's slot (eval.cc:2530); `&vCur`
+    /// becomes stale and is reused by the next callFunction invocation.
+    /// Subsequent `forceValue(vRes)` uses `&vRes` — a different pointer.
+    /// Keying by `&v` would make every gate lookup miss.
+    ///
+    /// `Bindings *` is stable across `Value` copies: `Value::mkAttrs(b)`
+    /// stores `b` in the Value's payload, so copies share the same
+    /// `Bindings *`. For derivation results (always attrsets), the
+    /// `Bindings *` is the stable content-identity across the Value's
+    /// lifetime in the eval graph.
+    ///
+    /// Same lifetime + traceable_allocator concerns as `epochMap`:
+    /// keyed `Bindings *`s must stay live across GC. Independent of
+    /// `epochMap`.
     struct ProducerEntry {
         AttrPathId caKey;
         DepHash traceHash;
     };
     boost::unordered_flat_map<
-        const Value *,
+        const Bindings *,
         ProducerEntry,
-        boost::hash<const Value *>,
-        std::equal_to<const Value *>,
-        traceable_allocator<std::pair<const Value * const, ProducerEntry>>>
+        boost::hash<const Bindings *>,
+        std::equal_to<const Bindings *>,
+        traceable_allocator<std::pair<const Bindings * const, ProducerEntry>>>
         producerMap;
 
     /// Pointer bloom for fast-rejecting `lookupProducer` calls on the hot
@@ -199,32 +212,39 @@ struct MemoReplayStore {
         return it->second;
     }
 
-    /// Bind a forced Value to its CA producer trace identity. Called from the
-    /// producer-trace boundary finalization (RFC §3b) after `Recorder::record`
-    /// publishes the producer trace. Subsequent `lookupProducer(v)` calls
-    /// return the binding; `replayMemoizedDeps` will emit a single edge dep
-    /// targeting the CA key instead of copying the producer's flattened deps.
+    /// Bind a forced derivation result's `Bindings *` to its CA producer
+    /// trace identity. Called from the producer-trace boundary finalization
+    /// (RFC §3b, `prim_derivationStrict`) after `Recorder::record` publishes
+    /// the producer trace. Subsequent `lookupProducer(b)` calls return the
+    /// binding; `replayMemoizedDeps` will emit a single edge dep targeting
+    /// the CA key instead of copying the producer's flattened deps.
     ///
-    /// Uses `insert_or_assign` (mirroring `recordThunkDeps`) for the BUG-7
-    /// GC-address-reuse hazard: if a Value* is reclaimed and reused, the
-    /// stale producer binding must be overwritten by the new one.
-    void registerProducer(const Value & v, AttrPathId caKey, DepHash traceHash)
+    /// Keyed by `Bindings *` (not `Value *`) for stability across the
+    /// `vRes = vCur` copy in `callFunction` — see `producerMap` doc above.
+    ///
+    /// Uses `insert_or_assign` for the BUG-7 GC-address-reuse hazard: if a
+    /// Bindings* is reclaimed and reused, the stale binding must be
+    /// overwritten by the new one.
+    void registerProducer(const Bindings * b, AttrPathId caKey, DepHash traceHash)
     {
-        producerMap.insert_or_assign(&v, ProducerEntry{caKey, traceHash});
-        producerBloom.set(&v);
+        producerMap.insert_or_assign(b, ProducerEntry{caKey, traceHash});
+        producerBloom.set(b);
     }
 
     /// Hot-path call site: `replayMemoizedDeps` invokes `lookupProducer`
     /// before its bloom-gated `getReplayRange`. closures.gnome fires
     /// `replayMemoizedDeps` ~22M times across ~thousands of registered
-    /// producers. The bloom rejects ~97% of non-producer Values without
-    /// paying the `unordered_flat_map::find` cost; mirrors `getReplayRange`'s
-    /// `replayBloom` discipline (same `Value*` keys, same alignment).
-    std::optional<ProducerEntry> lookupProducer(const Value & v) const
+    /// producers. The bloom rejects ~97% of non-attrset/non-producer Values
+    /// without paying the `unordered_flat_map::find` cost.
+    ///
+    /// The caller passes `v.attrs()` for attrset Values (the only kind a
+    /// derivation result has); other Values short-circuit to nullopt before
+    /// this is called.
+    std::optional<ProducerEntry> lookupProducer(const Bindings * b) const
     {
-        if (!producerBloom.test(&v)) [[likely]]
+        if (!producerBloom.test(b)) [[likely]]
             return {};
-        auto it = producerMap.find(&v);
+        auto it = producerMap.find(b);
         if (it == producerMap.end())
             return {};
         return it->second;

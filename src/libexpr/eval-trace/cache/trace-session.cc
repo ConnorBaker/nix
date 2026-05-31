@@ -829,14 +829,14 @@ bool TraceSession::recordCAProducer(
     auto recordResult = runtime_->recordSync(caKey, value, innerDeps);
     if (!recordResult) return false;
 
-    // Bind producerValue → {caKey, traceHash} in the side-table.
-    // `recordResult->traceHash` is the just-computed content hash of the
-    // producer trace. The replay-time gate (in `replayMemoizedDeps`) will
-    // emit a `TraceValueContext(caKey, traceHash)` edge whenever
-    // `producerValue` is re-forced inside a recording scope (sibling-share
-    // path).
+    // Bind producerValue's Bindings* → {caKey, traceHash} in the side-table.
+    // Keying by Bindings* (not Value*) survives the `vRes = vCur` copy in
+    // `callFunction` (eval.cc:2530) — Value::mkAttrs(b) stores the pointer,
+    // so copies share the same Bindings*. Non-attrset producerValues
+    // short-circuit (no derivation result is ever non-attrset, but defend).
+    if (producerValue.type() != nAttrs) return false;
     state.traceCtx->registerProducer(
-        producerValue, caKey, DepHash{recordResult->traceHash.value});
+        producerValue.attrs(), caKey, DepHash{recordResult->traceHash.value});
 
     // NOTE: We do NOT also emit the edge into the consumer scope here.
     // Doing so risks under-recording when the producer's input deps change

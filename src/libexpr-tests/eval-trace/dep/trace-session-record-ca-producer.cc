@@ -80,8 +80,11 @@ TEST_F(TraceSessionRecordCAProducerTest, RecordCAProducer_RoundTripsAndRegisters
         ctx.record(makeContentDep(state.tracingPools(), inputSrc.path.string(), "R1-v1"));
     });
 
+    // Use an attrset Value: production `recordCAProducer` requires nAttrs
+    // (derivation results are always attrsets) to extract a stable
+    // `Bindings *` key. `mkInt` Values short-circuit early.
     Value producerV;
-    producerV.mkInt(0);
+    producerV.mkAttrs(state.buildBindings(0, EmptyBindingsAllocation::AllocateFresh).finish());
 
     bool ok = session->recordCAProducer(producerV, "drv-R1", innerDeps);
     ASSERT_TRUE(ok)
@@ -118,7 +121,10 @@ TEST_F(TraceSessionRecordCAProducerTest, RecordCAProducer_DistinctDrvHashes_Dist
     });
 
     Value vA, vB;
-    vA.mkInt(1); vB.mkInt(2);
+    // Attrset Values for the production gate. Each gets its own fresh
+    // `Bindings*` so distinct registrations don't collide on key.
+    vA.mkAttrs(state.buildBindings(0, EmptyBindingsAllocation::AllocateFresh).finish());
+    vB.mkAttrs(state.buildBindings(0, EmptyBindingsAllocation::AllocateFresh).finish());
     ASSERT_TRUE(session->recordCAProducer(vA, "drv-A", depsA));
     ASSERT_TRUE(session->recordCAProducer(vB, "drv-B", depsB));
 
@@ -143,7 +149,7 @@ TEST_F(TraceSessionRecordCAProducerTest, RecordCAProducer_PersistedTraceVerifies
         ctx.record(makeContentDep(state.tracingPools(), inputSrc.path.string(), "R3-stable"));
     });
     Value v;
-    v.mkInt(0);
+    v.mkAttrs(state.buildBindings(0, EmptyBindingsAllocation::AllocateFresh).finish());
     ASSERT_TRUE(session->recordCAProducer(v, "drv-R3", deps));
 
     releaseActiveSession();
@@ -164,7 +170,7 @@ TEST_F(TraceSessionRecordCAProducerTest, RecordCAProducer_InputMutation_Invalida
         ctx.record(makeContentDep(state.tracingPools(), inputSrc.path.string(), "R4-v1"));
     });
     Value v;
-    v.mkInt(0);
+    v.mkAttrs(state.buildBindings(0, EmptyBindingsAllocation::AllocateFresh).finish());
     ASSERT_TRUE(session->recordCAProducer(v, "drv-R4", deps));
 
     // Precondition — unchanged ⇒ verifies.
