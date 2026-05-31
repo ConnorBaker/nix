@@ -14,6 +14,7 @@ suites += {
     'unfiltered-subtree-bridge.sh',
     'whole-input-tree-dedup.sh',
     'cargo-cold-link.sh',
+    'cleansource-idiom.sh',
   ],
   'workdir' : meson.current_source_dir(),
 }
