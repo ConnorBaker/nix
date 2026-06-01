@@ -888,3 +888,116 @@ soundness test below (producer-input-changed still invalidates after bootstrap).
 
 ### Disposition: the §10 blocker is CLOSED. Aggressive shape: implemented, sound, default-OFF, flake
 re-eval WORKING. Remaining is perf validation (the hot bench) + the two additional test coverages.
+
+## §13. HOT BENCH — the go/no-go measurement (2026-05-31). VERDICT: aggressive shape is a NET LOSS; direction does not pay off on this workload.
+
+Now that the §10 blocker is closed (flake re-eval works under aggressive), the hot bench is meaningful.
+Ran the Ledger-D anchor (`closures.gnome`, nixpkgs-release suite) at 25 commits (pilot scale; machine had
+concurrent other work, so leading with medians + the component breakdown, not absolute wall), three
+configs in an ISOLATED results root (`--nix .aggr-bench`, own result-symlink → fix binary 458e271, so
+no collision with prior runs), SEQUENTIAL (no timing contention), `--with-stats` (uniform overhead
+across configs → fair relative comparison). Env-passthrough validated first (producerEdges=614 fires
+through the harness).
+
+### Wall time (median per commit, ×reference)
+| config | cold median | hot median | hot ×ref |
+|---|---:|---:|---:|
+| reference (no-trace) | 6.79s | — | — |
+| no-§3b (cache on) | 1.01s | **0.97s** | 0.14× |
+| §3b conservative | 7.94s | 7.95s | 8.2× |
+| §3b **AGGRESSIVE** | 16.98s | **16.42s** | **16.9×** |
+
+**The aggressive shape is ~2× WORSE than conservative on BOTH cold and hot, and ~17× worse than
+no-§3b on hot.** It does not beat materialize-time re-execution — it makes it worse.
+
+### Why (component breakdown, hot, median per commit)
+| counter | no-§3b | conservative | AGGRESSIVE |
+|---|---:|---:|---:|
+| record.count | 0 | 8,448 | **18,906** |
+| record.timeUs | 0 | 0.77s | **1.71s** |
+| verify.timeUs | 0.37s | 0.50s | **1.08s** |
+| root hits / misses | 7 / 0 | 5 / 2 | **3 / 4** |
+
+The smoking gun: on the HOT path the aggressive shape **records 18,906 traces** (more than conservative's
+8,448, vs 0 for no-§3b) and suffers MORE root cache misses (4 vs 0). The edge-emit + producer-record +
+(now recovery-aware) edge-resolution all fire DURING materialize-time re-execution — the derivation
+thunks re-run on warm serve (the §3b/#23 hot pathology), and the aggressive machinery adds cost on top
+of that re-execution instead of replacing it. verify.timeUs also doubles (the History-bootstrap edge
+resolution is not free).
+
+### This CONFIRMS the §11/#25 prediction, empirically
+The hot regression was always going to be dominated by materialize-time re-execution, NOT by the
+flattened-dep verify cost the edge reduces. The edge collapses storage/dep-count (the ~63% number) and
+the verify-walk per-item cost (M≈1) — but those are NOT the hot bottleneck on this workload. The hot
+bottleneck is that warm-served consumers RE-RUN derivation thunks during materialize, and every re-run
+re-fires the producer hook. The edge makes each re-run MORE expensive (emit + filter + bootstrap), not
+cheaper. "63% storage reduction" never translated to a hot win here — exactly the conflation trap
+flagged in #25/§B.
+
+### SOUNDNESS: PASS (the fix holds at scale)
+All 25 commits × {cold, hot} × aggressive produce byte-identical eval output to the no-trace reference
+("All outputs match reference"), with producerEdges=614 confirming the gate fired. The recovery-aware
+edge resolution (§12) is sound at workload scale — the §10 blocker is genuinely closed. The verdict is
+purely PERFORMANCE.
+
+### VERDICT (go/no-go): NO-GO for the aggressive shape on derivation-dense flake re-eval.
+The producer-partition direction, as built, is a net loss on the Ledger-D anchor — worse than the
+already-net-loss conservative §3b, because it adds cost to the materialize-time-re-execution path that
+dominates hot cost. The direction's benefit (storage dedup + verify-walk reduction) is real but
+addresses a cost that is NOT the bottleneck on this workload. To ever pay off, the PREREQUISITE is
+eliminating materialize-time re-execution of derivation thunks on warm serve (so the producer hook
+fires ~once, not ~thousands of times per hot eval) — that is a separate, larger evaluator change
+(suppress-on-warm-served, or async/batched producer recording that doesn't block the eval thread), and
+until it lands, NO producer-trace shape (conservative or aggressive) is net-positive hot. The aggressive
+edge-recorder + recovery fix stay in tree as gated, default-OFF, SOUND scaffolding (mirroring §3b
+conservative's disposition), now with a measured hot cost so the next person doesn't re-run this.
+
+### Caveats (honest scope)
+- 25-commit pilot, not the documented 100-commit run; medians are stable across the 25 but absolute
+  numbers are this-machine/this-rev with concurrent load. The 2× aggressive-vs-conservative and 17×
+  vs-no-§3b ratios are far larger than any plausible noise, so the VERDICT is robust; a 100-commit run
+  would refine magnitudes, not flip the sign.
+- `--with-stats` adds uniform overhead; the relative ratios are unaffected. A `--with-stats`-free run
+  would lower all absolute numbers but not the ordering.
+- Data + harness: `.aggr-bench/eval-trace-bench-results/{reference,cold,hot}-stats/{1,2,3}`. Reproduce:
+  the three `generate` invocations in §13's preamble (isolated root + the two env vars for run 3).
+
+### §13b. Adversarial pass on the §13 verdict — mechanism CORRECTED (the NO-GO stands, stronger)
+
+Before trusting §13, checked whether the bench measured the REAL aggressive shape or "conservative +
+dead edge code." Two findings that refine (and strengthen) the verdict:
+
+**Finding A — the filter BARELY changes stored deps on this workload.** Final cold DB: conservative
+12,987 traces / 3,300,644 keysblob bytes; aggressive 12,986 / 3,306,944 (aggressive marginally
+LARGER). So B2's dep-removal produces ~zero net storage benefit here. Root cause: the producer gate
+fires on only ~3% of traces (cold producerEdges=614 vs record.count=18,906) — the §3b/#5 finding that
+on `closures.gnome`, consumers force the `commonAttrs //`-wrapper / string `outPath`, NOT the keyed
+`strict` value, so the edge rarely replaces anything. The aggressive benefit mechanism is structurally
+near-absent on this workload (independent of the §10 fix).
+
+**Finding B — the §13 stated mechanism was IMPRECISE; corrected.** Aggressive records 2.24× MORE
+traces than conservative (cold record.count 18,906 vs 8,448; record.timeUs 1.81s vs 0.76s) yet the
+final DB has the SAME trace count. The extra ~10,458 record calls are NOT edges (producerEdges only
++308). Mechanism: `replaceWindowWithEdge` mutates consumer `ownDeps` → changes consumer trace HASHES →
+consumers that deduped against each other / prior-commit traces under conservative now hash distinct →
+~2× more distinct record() calls (which then dedup down in the final DB, but the RECORD WORK is already
+paid). So §13's "edge adds cost to the re-execution path" is right in direction but the dominant term
+is actually FILTER-INDUCED RECORD-VOLUME INFLATION (cold) + edge-resolution verify cost (hot), not the
+edge-emit itself.
+
+**Net effect on the verdict: UNCHANGED and STRENGTHENED.** The aggressive shape pays ~2× the cold
+record cost and ~2× the hot cost for a storage/edge benefit that is structurally near-absent on
+`closures.gnome` (gate fires ~3%). It is strictly worse than conservative here with ~no offsetting
+benefit. NO-GO confirmed, and the reason is now precise: not "the edge is expensive" but "the edge
+rarely fires on this workload (the §5 keying problem) AND the filter inflates record volume by
+perturbing consumer trace identity." 
+
+**Crucial scope correction this surfaces:** the gate-fires-only-3% problem is the SAME §3b follow-up #5
+keying issue (producer keyed on `strict`, consumers force the wrapper) — it was never fixed, and the
+aggressive shape inherits it. So this bench does NOT prove "producer-partition can't work"; it proves
+"producer-partition built on the CURRENT gate keying doesn't fire enough on closures.gnome to pay for
+itself." A workload where consumers DO re-force the keyed value (or a re-keying per #5's "register
+identity on the .outPath string / wrapper attrset") could change the benefit side — but that is the
+SAME unbuilt re-keying prerequisite §3b already identified, now with a measured confirmation that
+without it the edge is inert. The materialize-time-re-execution point from §13 still holds as the hot
+ceiling; this adds that even the cold/storage benefit is gated on re-keying.
