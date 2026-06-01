@@ -1001,3 +1001,125 @@ identity on the .outPath string / wrapper attrset") could change the benefit sid
 SAME unbuilt re-keying prerequisite §3b already identified, now with a measured confirmation that
 without it the edge is inert. The materialize-time-re-execution point from §13 still holds as the hot
 ceiling; this adds that even the cold/storage benefit is gated on re-keying.
+
+## §14. ROOT CAUSE of the hot regression — found, validated in code + artifact (2026-05-31)
+
+The §13 NO-GO verdict said "the edge adds cost to materialize-time re-execution." A deeper adversarial
+pass (decomposing the hot wall against internal timers) found that was a SYMPTOM, not the cause. The
+real cause is a **fixable correctness defect in §3b producer recording**, not an inherent cost.
+
+### The decomposition that cracked it
+Hot wall vs eval-trace internal timers (median/commit, 25-commit bench):
+| config | wall | record+verify+verifyTrace | UNACCOUNTED (= re-eval) | verify.failed (per-dep) | root hits/misses |
+|---|---:|---:|---:|---:|---:|
+| no-§3b | 0.97s | 0.73s | 0.24s (24%) | **0** | 7/0 |
+| conservative | 7.95s | 1.65s | **6.30s (79%)** | **364** | 5/2 |
+| aggressive | 16.42s | 5.06s | **11.36s (69%)** | **25,780** | 3/4 |
+
+no-§3b serves `closures.gnome` hot in ~1s with ZERO dep-verify failures (uniform 0.95–1.01s across all
+25 commits — pure cache serve, no re-eval). Enabling §3b introduces hundreds-to-tens-of-thousands of
+PER-DEP verify failures (`nrVerificationsFailed`, verifier.cc:625/660/706/734), which cascade to trace
+misses → fresh re-eval → the 6–11s of UNACCOUNTED wall. **§3b is DEFEATING the cache, not just adding
+overhead.**
+
+### The mechanism (subagent diagnosis, INDEPENDENTLY VALIDATED against code + the bench DB)
+The failing dep kind is `TraceValueContext` — the producer EDGE itself, not a perturbed consumer dep
+(grep confirmed 0 Normal-dep failures; all failures are `__ca:<drvPath>` edges).
+
+Root defect = TWO violated invariants, both confirmed:
+1. **`snapshotEpochRange(epochStart,epochEnd)` (primops.cc:1695, context.hh:327) is NON-DETERMINISTIC
+   per caKey.** It returns a slice of the GLOBAL epoch log during the derivationStrict call window —
+   NOT the derivation's own input closure. Same drvPath forced when inputs are fresh → captures inputs
+   (non-empty); forced when inputs are already memoized → grows the log by nothing (EMPTY). The
+   primops.cc:1681 comment already admits the range is a non-reproducible superset.
+2. **`recordCAProducer` dedups on `Bindings*`, NOT caKey (trace-session.cc:845).** A re-forced
+   derivation gets a fresh `Bindings*` → dedup misses → `recordSync(caKey,…,innerDeps)`
+   (trace-session.cc:860) RE-RUNS with a different (often empty) innerDeps → overwrites the caKey's
+   CurrentNode last-writer-wins (Traces are content-addressed, so all empty-range recordings collapse
+   to ONE zero-dep trace).
+
+Consumers embed the FIRST (real, non-empty) producer trace_hash in their edge; warm
+`resolveTraceContextHash` resolves the caKey's CURRENT CurrentNode = the overwritten EMPTY trace →
+hash mismatch → edge FAILS → consumer invalidates → re-eval.
+
+**ARTIFACT VALIDATION (I verified in the bench's own hot-stats/2 DB, not just the subagent's word):**
+`SELECT t.id, COUNT(*) n, LENGTH(d.keys_blob) FROM Sessions s JOIN Traces t … GROUP BY t.id ORDER BY n
+DESC` → **trace_id 12, keysblob_len=0 (zero-dep), is the CurrentNode for 30,629 Sessions rows.** One
+empty producer trace became the routing target for 30K+ producer keys via last-writer-wins overwrite.
+Exactly the predicted collapse. Dedup-on-Bindings* confirmed at trace-session.cc:845.
+
+### This REFRAMES the §13 NO-GO: the hot regression is a DEFECT, not an inherent cost.
+§13 concluded "producer-partition can't pay off because materialize re-execution dominates." Corrected:
+the materialize re-execution is CAUSED by §3b's own unverifiable edges defeating the cache. Fix the
+edge warm-stability and the re-execution it induces goes away — at which point the real
+benefit/cost tradeoff can finally be measured. The §13 numbers measured a BROKEN recorder, not the
+direction's ceiling.
+
+## §15. IMPLEMENTING THE PREREQUISITES — scoped by the artifact (2026-05-31)
+
+Before designing, I quantified the defect's shape in the reproduced cold DB (8-package minimal case)
+to decide whether the fix is narrow (caKey-dedup) or architectural (sub-scope isolation):
+
+```
+caKeys with BOTH empty+non-empty traces in History: 336   (overwrite victims)
+caKeys empty-only:                                    0
+caKeys non-empty-only:                             1211   (recorded consistently, never overwritten)
+caKeys recorded as >1 distinct trace:               341
+```
+
+**Decisive finding: EVERY empty producer trace is an overwrite victim (336 both-shapes, 0 empty-only).**
+An empty `__ca:` trace never arises on its own — it is always a caKey that ALSO had a legitimate
+non-empty recording, then got overwritten (last-writer-wins) by a later empty-range recording. So the
+30,629-session zero-dep-trace collapse (§14) is entirely an OVERWRITE artifact, not a "the deps were
+genuinely empty" artifact.
+
+### Prerequisite 1 (warm-stability) = two fixes, the first NARROW and primary
+
+**Fix 1a — caKey-keyed, write-once producer recording (NARROW, the primary fix).**
+Change `recordCAProducer` (trace-session.cc:845) to dedup on **caKey**, not `Bindings*`, AND to be
+WRITE-ONCE per caKey per session: the first recording of a `__ca:<drvHash>` wins; later forces of the
+same derivation (fresh `Bindings*`, possibly empty/different range) MUST NOT re-`recordSync` and
+overwrite the CurrentNode. Implementation:
+- Add a session-scoped `Set<AttrPathId>` (or reuse a caKey→ProducerEntry index) of already-recorded
+  caKeys. On entry, if caKey already recorded this session → return the existing edge (from the
+  side-table / a caKey→entry map), do NOT recordSync.
+- Also register the NEW `Bindings*` → existing entry in `producerMap` (so the gate still fires for this
+  re-forced value), but pointing at the FIRST trace.
+- Soundness: caKey = `__ca:<drvHash>` is a content address; "same caKey → same derivation" is sound by
+  construction (drvHash folds in the derivation's inputs). Write-once is therefore correct: the first
+  recording's deps are A valid input-closure for that derivation; later recordings can only be equal-or-
+  subset (memoized), so keeping the first (most complete) is the right choice.
+- This fixes all 336/2213 overwrite victims (the bulk of the 30,629-session collapse). Estimated NARROW:
+  ~one session-scoped set + the dedup-branch rewrite + a unit pin (record same caKey twice with
+  different ranges → CurrentNode unchanged, edge stable). NOT architectural.
+
+**Fix 1b — deterministic / self-verifiable producer deps (HARDER, needed for the 1211 non-empty too).**
+Even write-once, the FIRST recording captures `snapshotEpochRange` = an ambient global-log slice
+(superset: nested derivations + warm-hit replays), which may not fully re-verify warm (the subagent's
+"shape 1"). Whether 1a ALONE suffices depends on how many of the 1211 non-empty producers fail warm
+re-verify — UNMEASURED yet (next step: apply 1a, re-bench, see if verify.failed drops to ~0 or only to
+~1211-scale). If non-empty producers also fail, 1b is required: build the producer trace from the
+derivation's OWN input closure (sub-scope isolation at the args-force), not the ambient epoch slice —
+the §9/§10 aggressive-recorder machinery, but applied to make the PRODUCER deps deterministic rather
+than to filter the consumer. The §9 work + the §12 recovery fix are the substrate for this.
+
+### Prerequisite 2 (gate-fire rate, ORTHOGONAL) — the §3b/#5 re-keying
+Independent of warm-stability: even a perfectly warm-stable edge only helps if the gate FIRES. On
+closures.gnome it fires on ~3% of traces because consumers force the `commonAttrs //`-wrapper / string
+`outPath`, not the keyed `strict` value (§3b follow-up #5). Register producer identity on the value
+consumers actually re-force (the `.outPath`/`.drvPath` string identity, or the wrapper attrset). This
+is the harder, separately-designed re-keying; it does not block measuring 1a's effect on the
+already-firing 3%.
+
+### Recommended implementation order
+1. **Fix 1a** (caKey write-once) — narrow, high-confidence, fixes the 30K-collapse. Unit-pin it.
+2. **Re-bench hot** under 1a-only. Measure: does verify.failed drop to ~0 (1a sufficient) or to a
+   ~1211-scale floor (1b also needed)? This is the cheap experiment that decides 1b's necessity.
+3. **Fix 1b** only if step 2 shows non-empty producers also fail warm — and only then is the
+   §9 sub-scope-isolation work on the critical path.
+4. **Prerequisite 2 (re-keying)** is the separate benefit-side lever, tackled after warm-stability.
+
+The key reframing: the FIRST prerequisite (warm-stability) is mostly a NARROW correctness fix (1a),
+not the "architectural re-keying" the §13b/#5 framing implied. The architectural part (1b sub-scope +
+2 re-keying) may not even be needed for warm-stability — step 2 decides. This is a much more tractable
+path than the NO-GO verdict suggested.
