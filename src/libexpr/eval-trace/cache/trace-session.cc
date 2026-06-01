@@ -814,7 +814,8 @@ void TraceSession::releaseBackend()
 bool TraceSession::recordCAProducer(
     const Value & producerValue,
     std::string_view drvHash,
-    const std::vector<Dep> & innerDeps)
+    const std::vector<Dep> & innerDeps,
+    ProducerEdge * edgeOut)
 {
     if (!runtime_) return false;
     if (!state.traceCtx) return false;
@@ -841,8 +842,14 @@ bool TraceSession::recordCAProducer(
     // without dedup we'd re-persist ~thousands of producer traces per
     // re-evaluation. The Bindings* lookup is bloom-fast-rejected for
     // non-producers.
-    if (state.traceCtx->lookupProducer(producerValue.attrs()).has_value())
+    if (auto existing = state.traceCtx->lookupProducer(producerValue.attrs())) {
+        // Already recorded this session. A DIFFERENT cold consumer of the same
+        // producer still needs the edge info (RFC §9 B1) — supply it from the
+        // side-table entry so the aggressive shape can emit+filter.
+        if (edgeOut)
+            *edgeOut = ProducerEdge{existing->caKey, existing->traceHash};
         return true;
+    }
 
     // Use a sentinel `string_t` as the CachedResult — producer traces are
     // never materialized directly (they're only referenced by edges), so
@@ -857,20 +864,27 @@ bool TraceSession::recordCAProducer(
     // Keying by Bindings* (not Value*) survives the `vRes = vCur` copy in
     // `callFunction` (eval.cc:2530) — Value::mkAttrs(b) stores the pointer,
     // so copies share the same Bindings*.
-    state.traceCtx->registerProducer(
-        producerValue.attrs(), caKey, DepHash{recordResult->traceHash.value});
+    auto traceHash = DepHash{recordResult->traceHash.value};
+    state.traceCtx->registerProducer(producerValue.attrs(), caKey, traceHash);
 
-    // NOTE: We do NOT also emit the edge into the consumer scope here.
-    // Doing so risks under-recording when the producer's input deps change
-    // in ways the producer trace doesn't fully cover (e.g. ambient-eval
-    // state that legitimately flowed into the consumer). The replay-time
-    // gate (`replayMemoizedDeps`) handles edge emission for sibling-share
-    // contexts; the consumer keeps its existing flattened deps too. Net:
-    // the producer trace exists for amortization, but the consumer's
-    // cached dep set is a strict superset of what it would have been
-    // without §3b — never less. (RFC §3b's "amortization win" comes from
-    // sharing producer verification across sibling consumers, not from
-    // pruning the first consumer's own deps.)
+    if (edgeOut)
+        *edgeOut = ProducerEdge{caKey, traceHash};
+
+    // This method only PERSISTS the producer trace + registers the side-table
+    // entry. It does NOT itself mutate the consumer scope. Two consumer-side
+    // shapes use the result:
+    //  - CONSERVATIVE (default when §3b enabled): the consumer keeps its
+    //    flattened deps; the producer trace exists only for sibling-share
+    //    amortization via the replay gate (`replayMemoizedDeps`). The
+    //    consumer's cached dep set is a strict SUPERSET of the non-§3b set —
+    //    never less, so soundness is unconditional.
+    //  - AGGRESSIVE (RFC §9, NIX_CA_PRODUCER_AGGRESSIVE=1): the caller
+    //    (`prim_derivationStrict`) uses `edgeOut` to emit ONE TraceValueContext
+    //    edge into the consumer scope AND filter the producer's `innerDeps` out
+    //    of the consumer's `ownDeps` (replaceWindowWithEdge). The edge REPLACES
+    //    the flattened closure. Sound because the producer `trace_hash` folds in
+    //    exactly `innerDeps`, and the edge's verification recomputes-and-compares
+    //    that set against the live FS (RFC §9 soundness argument).
     return true;
 }
 

@@ -165,11 +165,23 @@ public:
      * `producerValue` is never re-forced (the gate fires lazily) — so
      * adding this call to `prim_derivationStrict` is safe to ship even
      * before consumers benefit from it (zero observable change).
+     *
+     * If `edgeOut` is non-null and recording succeeded, it is populated with
+     * the `{caKey, traceHash}` the consumer needs to emit a `TraceValueContext`
+     * edge to this producer (RFC §9 B1 — the cold first-consumer edge). The
+     * conservative shape ignores it; the aggressive shape uses it to emit +
+     * filter. Populated on the dedup-hit path too (the producer already exists
+     * this session, but the consumer still needs the edge).
      */
+    struct ProducerEdge {
+        AttrPathId caKey{};
+        DepHash traceHash{};
+    };
     bool recordCAProducer(
         const Value & producerValue,
         std::string_view drvHash,
-        const std::vector<Dep> & innerDeps);
+        const std::vector<Dep> & innerDeps,
+        ProducerEdge * edgeOut = nullptr);
 
     /**
      * Test-only: synchronously verify that a trace at `pathId` is valid

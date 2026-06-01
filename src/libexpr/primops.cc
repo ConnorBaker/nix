@@ -1595,8 +1595,16 @@ static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** 
     // benchmarking.
     static const bool caProducerEnabled =
         getEnv("NIX_ENABLE_CA_PRODUCER").value_or("") == "1";
+    // RFC §9 aggressive edge-recorder sub-gate. Independent switch (implies
+    // caProducerEnabled). When on, the consumer emits ONE TraceValueContext edge
+    // to the producer AND filters the producer's innerDeps out of its own scope
+    // (flatten-REPLACE). When off, the conservative shape keeps flattened deps.
+    // Both default OFF, so production behaviour is unchanged.
+    static const bool caProducerAggressive =
+        getEnv("NIX_CA_PRODUCER_AGGRESSIVE").value_or("") == "1";
     auto * session = eval_trace::currentTraceSession();
-    bool registerProducer = caProducerEnabled && session && state.traceCtx;
+    bool registerProducer = (caProducerEnabled || caProducerAggressive)
+        && session && state.traceCtx;
 
     // MEASUREMENT-ONLY (RFC §8 step 3 benefit magnitude): the benefit probe needs
     // the epoch range regardless of NIX_ENABLE_CA_PRODUCER, to tally the dep-KIND
@@ -1689,7 +1697,23 @@ static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** 
                 // backend is bound (--no-eval-trace, session released),
                 // recording is a no-op and the conservative consumer scope
                 // already preserves soundness. No fatal-error path.
-                (void) session->recordCAProducer(v, drvPathS, innerDeps);
+                eval_trace::TraceSession::ProducerEdge edge;
+                bool recorded = session->recordCAProducer(
+                    v, drvPathS, innerDeps,
+                    caProducerAggressive ? &edge : nullptr);
+                // RFC §9 B1+B2 (aggressive): emit ONE edge into the consumer
+                // scope and filter the producer's innerDeps out of it, so the
+                // edge REPLACES the flattened closure. Sound: the producer
+                // trace_hash folds in exactly innerDeps; the edge's verify
+                // recomputes-and-compares that set against the live FS.
+                if (caProducerAggressive && recorded) {
+                    if (auto access = eval_trace::TraceAccess::current()) {
+                        auto edgeDep = Dep::makeValueContext(
+                            edge.caKey, DepHashValue(edge.traceHash));
+                        access->depRecordingContext().replaceWindowWithEdge(
+                            innerDeps, edgeDep);
+                    }
+                }
             }
         }
     }

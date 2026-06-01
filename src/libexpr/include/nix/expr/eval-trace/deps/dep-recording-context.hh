@@ -284,6 +284,23 @@ public:
 
     void record(const Dep & dep);
 
+    /// RFC §9 B2 (aggressive edge-recorder, flatten-replace): in the current
+    /// scope, remove every `ownDeps` entry whose KEY appears in
+    /// `producerInnerDeps`, then record `edge` (one TraceValueContext dep to the
+    /// producer trace). The edge REPLACES the producer's flattened closure.
+    ///
+    /// Sound by construction: a key in `producerInnerDeps` was first-seen inside
+    /// the producer's [epochStart,epochEnd) window, so by the `seenDeps` dedup it
+    /// was NOT already in `ownDeps` before the window — erasing ownDeps-by-key-in-
+    /// set removes only deps the producer `trace_hash` covers, and the edge's
+    /// verification recomputes-and-compares exactly that set against the live FS.
+    /// Facet reads (meta/passthru on the outer `drv // {…}` attrset) are recorded
+    /// OUTSIDE the window → not in `producerInnerDeps` → never removed.
+    ///
+    /// No-op (records nothing, removes nothing) if no scope is active.
+    void replaceWindowWithEdge(const std::vector<Dep> & producerInnerDeps,
+                               const Dep & edge);
+
     // ── Replay (public — memoization needs this from any call site) ──
 
     bool replayMemoizedRange(const Value & value, const DepRange & range)

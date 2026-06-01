@@ -690,3 +690,63 @@ sound (edge re-verifies), only a precision loss.
 - no-under-record differential: set of files whose mutation invalidates the consumer under aggressive
   ⊇ under conservative (never fewer). Over-invalidation allowed, counted.
 - functional eval-trace-core / eval-trace-deps stay green (the suites the revert failed).
+
+## §10. Aggressive edge-recorder — IMPLEMENTED + BLOCKED on a recovery-resolution gap (2026-05-31)
+
+Implemented §9 B1 (cold first-consumer edge at `recordCAProducer` finalize) + B2 (filter consumer
+`ownDeps` by producer key-set), gated behind `NIX_CA_PRODUCER_AGGRESSIVE=1` (independent of, but
+implying, `NIX_ENABLE_CA_PRODUCER`). Both default OFF — shipped behaviour unchanged (functional flakes
++ impure suites green with no env; 404 unit tests pass).
+
+### What works (validated end-to-end)
+- **Soundness on the reproduced revert case.** The `marker`-in-`args` derivation (readFile folds into
+  drvPath) that STALE-SERVED under the old isolate-and-discard shape now correctly INVALIDATES under
+  the real edge-recorder (`NIX_ALLOW_EVAL=0` refuses the stale value after the marker changes), and
+  HITS when unchanged. The edge's recursive producer verify re-checks `innerDeps` against the live FS.
+- **The filter fires + shrinks the consumer.** Direct DB inspection: the consumer trace's `keys_blob`
+  shrinks under aggressive (e.g. 43→27 bytes), removing the producer's `StorePathAvailability` deps and
+  adding one `TraceValueContext` edge. B2 is real, not a no-op.
+- **Impure (`-f`, non-flake) suites pass** under full aggressive.
+
+### The blocker (empirically isolated, code-confirmed): edge resolution is NOT recovery-aware
+The **flake** suites `eval-trace-core` / `eval-trace-deps` FAIL under aggressive (both pass
+conservative). Symptom: editing an UNRELATED sibling's input (`b-data.txt`) over-invalidates `drvA`
+(`drvA` does not read `b-data.txt`). It fails CLOSED (over-invalidation, never a stale serve) — sound
+but precision-destroying.
+
+**Bisected to B1, not B2:** `NIX_CA_PRODUCER_EMIT_ONLY=1` (emit the edge, keep flattened deps, NO
+filter) ALSO fails the flake suites. So the bug is the EDGE itself, not the dep removal.
+
+**Root cause (confirmed by reading verifier.cc:243-278):** a flake-source edit changes the flake
+fingerprint → the eval's **session key changes** → the warm eval is a different session. The consumer
+trace (`drvA`) recovers across that boundary via **History bootstrap** (its `stableRecoveryKey` is
+source-identity-based, stable across the edit). But the consumer's `TraceValueContext` edge to the
+`__ca:<drvHash>` producer is resolved by `resolveTraceContextHash`, which does ONLY
+`lookupCurrentNode(producerKey)` + `verifyTrace` — it calls NONE of `scanHistory` /
+`lookupLatestHistoryForAttr` / `recovery` (verifier.cc:251,267). The producer's CurrentNode lives
+under the OLD session key, so `lookupCurrentNode` returns `nullopt` in the new session →
+`resolveTraceContextHash` returns `nullopt` → the edge can't resolve → the consumer misses. The
+conservative shape is immune because it keeps the flattened deps, each of which recovers via History
+independently; the edge collapses N deps into one resolution path that has no recovery fallback.
+
+Impure suites pass because `-f` non-flake eval keys the session on the absolute file path, which does
+NOT change when a sibling data file is edited — so no session-key rotation, no recovery needed, the
+producer's CurrentNode is found directly.
+
+### What closing it requires (NOT a quick fix — a design extension)
+The `__ca:<drvHash>` producer trace needs to be **recovery-resolvable** across session-key changes:
+`resolveTraceContextHash` must fall back to a History/recovery lookup for the producer (keyed by a
+stable producer recovery key — e.g. `__ca:<drvHash>` is already content-stable, so a History row keyed
+on it would bootstrap correctly). This is the same recovery machinery the consumer already uses, lifted
+to the edge-resolution path. Until that lands, the aggressive shape is unusable for flake eval (the
+dominant real workload). The conservative shape + Layer 1/2a async recording remains the shippable
+state; the aggressive recorder stays in tree as gated scaffolding (mirroring the §3b conservative
+disposition).
+
+### Disposition
+Aggressive shape: IMPLEMENTED, SOUND, gated default-OFF, BLOCKED on recovery-aware edge resolution.
+The earlier "soundness is the only closed gate, perf is the blocker" framing was incomplete: there is
+ALSO a precision/recovery-correctness gap that only manifests under session-key rotation (flake edits),
+which neither the microcase nor the impure suites exposed. Found by running the functional suites the
+original revert failed — the right oracle. Next step is the recovery-aware producer resolution above,
+THEN the hot bench (§9 task 5) — benching now would measure a shape that breaks flake re-eval.

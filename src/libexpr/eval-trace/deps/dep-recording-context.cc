@@ -1,6 +1,7 @@
 /// dep-recording-context.cc — Dependency recording context implementation.
 
 #include "nix/expr/eval-trace/deps/dep-recording-context.hh"
+
 #include "nix/expr/eval-trace/deps/dep-hash-fns.hh"
 #include "nix/expr/eval-trace/deps/input-resolution.hh"
 #include "nix/expr/eval-trace/counters.hh"
@@ -132,6 +133,34 @@ void DepRecordingContext::record(const Dep & dep)
             scope->ownDeps.push_back(dep);
         epochLog.append(proof, dep);
     });
+}
+
+void DepRecordingContext::replaceWindowWithEdge(
+    const std::vector<Dep> & producerInnerDeps, const Dep & edge)
+{
+    auto * scope = currentScope();
+    if (!scope)
+        return;
+
+    // Build a key-set of the producer's deps (Dep::Key::operator== compares the
+    // key identity; hashes are irrelevant for membership). Keep it local — this
+    // is per-derivation, not a hot per-dep structure.
+    boost::unordered_flat_set<Dep::Key, Dep::Key::Hash> producerKeys;
+    producerKeys.reserve(producerInnerDeps.size());
+    for (const auto & d : producerInnerDeps)
+        producerKeys.insert(d.key);
+
+    // Erase the producer's deps from the consumer's ownDeps. std::erase_if
+    // preserves the relative order of the survivors.
+    std::erase_if(scope->ownDeps, [&](const Dep & d) {
+        return producerKeys.contains(d.key);
+    });
+
+    // Record the replacing edge through the normal path (scope dedup +
+    // epochLog append). If the same producer edge was already recorded in this
+    // scope (a second consumer of the same producer in one scope), the dedup
+    // collapses it — correct.
+    record(edge);
 }
 
 } // namespace nix
