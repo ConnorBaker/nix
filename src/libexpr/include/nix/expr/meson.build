@@ -26,6 +26,7 @@ headers = [ config_pub_h ] + files(
   'eval-trace/deps/sibling-force-scope.hh',
   'eval-trace/deps/semantic-analyzer.hh',
   'eval-trace/deps/trace-activation-scope.hh',
+  'eval-trace/deps/data-path-node.hh',
   'eval-trace/deps/input-resolution.hh',
   'eval-trace/deps/input-resolution-internal.hh',
   'eval-trace/deps/nix-binding.hh',
