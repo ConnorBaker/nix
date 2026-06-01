@@ -73,6 +73,21 @@ struct MemoReplayStore {
         traceable_allocator<std::pair<const Bindings * const, ProducerEntry>>>
         producerMap;
 
+    /// caKey → ProducerEntry index (RFC §15 Fix 1a, warm-stability). The
+    /// `producerMap` above is keyed by `Bindings *`, which is FRESH each time a
+    /// derivation result is re-forced (a new thunk). That made `recordCAProducer`
+    /// dedup miss on re-force → it re-`recordSync`'d the same `__ca:<drvHash>`
+    /// caKey with a DIFFERENT (often empty) `snapshotEpochRange` → last-writer-wins
+    /// OVERWROTE the producer CurrentNode → consumer edges (which embed the FIRST
+    /// trace hash) failed warm verify (§14: trace_id-12 zero-dep collapse, 30,629
+    /// sessions). caKey = `__ca:<drvHash>` is a CONTENT ADDRESS, so it is the
+    /// correct dedup identity: "same caKey → same derivation → keep the first
+    /// (most-complete) recording, never overwrite." This index makes the producer
+    /// recording WRITE-ONCE per caKey per session. No Bindings* (so no
+    /// traceable_allocator needed — AttrPathId is a plain id).
+    boost::unordered_flat_map<AttrPathId, ProducerEntry, AttrPathId::Hash>
+        producerByCaKey;
+
     /// Pointer bloom for fast-rejecting `lookupProducer` calls on the hot
     /// `replayMemoizedDeps` path. Sized for ~thousands of producers (one
     /// per `derivationStrict` call). Template params are
@@ -108,6 +123,8 @@ struct MemoReplayStore {
     {
         producerMap.clear();
         producerMap.rehash(0);
+        producerByCaKey.clear();
+        producerByCaKey.rehash(0);
         producerBloom.reset();
     }
 
@@ -229,6 +246,26 @@ struct MemoReplayStore {
     {
         producerMap.insert_or_assign(b, ProducerEntry{caKey, traceHash});
         producerBloom.set(b);
+        // RFC §15 Fix 1a: index by caKey, WRITE-ONCE (emplace, not assign). The
+        // first recording of a `__ca:<drvHash>` wins; a later re-force of the same
+        // derivation (fresh Bindings*) must NOT replace the caKey→entry mapping,
+        // so `lookupProducerByCaKey` keeps returning the first trace hash and the
+        // producer CurrentNode is never overwritten with a stale/empty range.
+        producerByCaKey.emplace(caKey, ProducerEntry{caKey, traceHash});
+    }
+
+    /// Look up a producer by its CA key (RFC §15 Fix 1a). Used by
+    /// `recordCAProducer` to dedup WRITE-ONCE per caKey per session: if this
+    /// caKey was already recorded, skip the SQLite re-record (which would
+    /// overwrite the CurrentNode) and reuse the first recording's edge. Unlike
+    /// `lookupProducer`, this is NOT a hot-path call (once per derivationStrict),
+    /// so no bloom gate.
+    std::optional<ProducerEntry> lookupProducerByCaKey(AttrPathId caKey) const
+    {
+        auto it = producerByCaKey.find(caKey);
+        if (it == producerByCaKey.end())
+            return {};
+        return it->second;
     }
 
     /// Hot-path call site: `replayMemoizedDeps` invokes `lookupProducer`

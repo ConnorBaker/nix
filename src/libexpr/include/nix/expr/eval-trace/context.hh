@@ -320,6 +320,13 @@ public:
     lookupProducer(const ::nix::Bindings * b) const
     { return replayStore.lookupProducer(b); }
 
+    /// RFC §15 Fix 1a: caKey-keyed producer lookup for write-once dedup in
+    /// `recordCAProducer` (avoids the Bindings*-keyed dedup missing on re-force
+    /// and overwriting the producer CurrentNode with a stale/empty range).
+    std::optional<eval_trace::MemoReplayStore::ProducerEntry>
+    lookupProducerByCaKey(AttrPathId caKey) const
+    { return replayStore.lookupProducerByCaKey(caKey); }
+
     /// Read-only access to a slice of the epoch log [start, end). Used by
     /// `prim_derivationStrict` to capture the deps recorded during a
     /// derivation's evaluation as the CA producer trace's deps. Returns a

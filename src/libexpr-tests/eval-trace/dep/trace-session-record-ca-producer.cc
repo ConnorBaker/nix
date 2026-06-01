@@ -236,4 +236,60 @@ TEST_F(TraceSessionRecordCAProducerTest, RecordCAProducer_EdgeOut_PopulatedOnFre
         << "R5(b): dedup-hit edgeOut.traceHash must match the fresh-record hash";
 }
 
+// ── R6: caKey WRITE-ONCE recording (RFC §15 Fix 1a, the warm-stability fix) ──
+//
+// The §14 root cause: a re-forced derivation gets a FRESH Bindings* (new thunk),
+// so the Bindings*-keyed dedup misses, and recordCAProducer re-recordSync'd the
+// same caKey with a DIFFERENT (often EMPTY) innerDeps — overwriting the producer
+// CurrentNode last-writer-wins. Consumers embedded the FIRST trace hash; warm
+// verify then resolved the OVERWRITTEN (empty) trace → mismatch → cache defeat
+// (30,629-session zero-dep collapse).
+//
+// Fix 1a: dedup on caKey (write-once). The first recording of a __ca:<drvHash>
+// wins; a later force of the SAME derivation via a DIFFERENT Bindings* with
+// DIFFERENT/EMPTY innerDeps must NOT overwrite it.
+TEST_F(TraceSessionRecordCAProducerTest, RecordCAProducer_CaKeyWriteOnce_NotOverwrittenByLaterEmptyRange)
+{
+    TempTextFile inputSrc("R6-stable");
+    auto session = makeCache("42");
+    forceRoot(*session);
+
+    // First recording: NON-EMPTY innerDeps (inputs fresh — the cold first force).
+    auto fullDeps = captureProducerInputs([&](auto & ctx) {
+        ctx.record(makeContentDep(state.tracingPools(), inputSrc.path.string(), "R6-stable"));
+    });
+    Value v1;
+    v1.mkAttrs(state.buildBindings(0, EmptyBindingsAllocation::AllocateFresh).finish());
+    TraceSession::ProducerEdge edge1;
+    ASSERT_TRUE(session->recordCAProducer(v1, "drv-R6", fullDeps, &edge1));
+    EXPECT_NE(edge1.traceHash.value, EvalTraceHash{})
+        << "R6: first recording must persist a real (non-empty) producer trace";
+
+    // Second recording: SAME drvHash (⇒ same caKey), but a DIFFERENT Bindings*
+    // (fresh thunk on re-force) AND EMPTY innerDeps (inputs already memoized).
+    // Pre-Fix-1a this re-recordSync'd and overwrote the CurrentNode with an empty
+    // trace. With Fix 1a it must be a write-once no-op returning the FIRST edge.
+    std::vector<Dep> emptyDeps;
+    Value v2;
+    v2.mkAttrs(state.buildBindings(0, EmptyBindingsAllocation::AllocateFresh).finish());
+    TraceSession::ProducerEdge edge2;
+    ASSERT_TRUE(session->recordCAProducer(v2, "drv-R6", emptyDeps, &edge2));
+
+    EXPECT_EQ(edge2.caKey.value, edge1.caKey.value)
+        << "R6: second recording (different Bindings*, empty range) must reuse the caKey";
+    EXPECT_EQ(edge2.traceHash.value, edge1.traceHash.value)
+        << "R6: WRITE-ONCE — the second (empty-range) recording must NOT change the "
+           "producer trace hash. A mismatch here is the §14 overwrite bug.";
+
+    // The decisive end-to-end check: the persisted producer trace must STILL be the
+    // first (non-empty) one and verify across a session boundary. If the empty range
+    // had overwritten it, the consumer edge (embedding edge1.traceHash) would fail to
+    // resolve warm — exactly the §14 cache-defeat.
+    releaseActiveSession();
+    auto session2 = makeCache("42");
+    EXPECT_TRUE(session2->verifyAttrPathForTest(expectedCAKey("drv-R6")))
+        << "R6: the first (non-empty) producer trace must survive — not be overwritten "
+           "by the later empty-range recording (write-once).";
+}
+
 } // namespace nix::eval_trace

@@ -833,21 +833,34 @@ bool TraceSession::recordCAProducer(
     // are always attrsets). Short-circuit non-attrset.
     if (producerValue.type() != nAttrs) return false;
 
-    // Dedup: if `producerMap` already has an entry for this Bindings*,
-    // the producer was already recorded in this session. Skip the SQLite
-    // write — it's the same content (same drvHash → same caKey → same
-    // input deps). This avoids the cold-record-style cost on warm-verify
-    // re-evaluation of the same closure: when the cache hits at the root,
-    // derivations inside still get forced (their thunks re-run), and
-    // without dedup we'd re-persist ~thousands of producer traces per
-    // re-evaluation. The Bindings* lookup is bloom-fast-rejected for
-    // non-producers.
+    // Dedup pass 1 (Bindings*, fast bloom-gated): if THIS exact Bindings* was
+    // already registered, the producer was recorded earlier in this session and
+    // re-forced to the same value. Return its edge.
     if (auto existing = state.traceCtx->lookupProducer(producerValue.attrs())) {
-        // Already recorded this session. A DIFFERENT cold consumer of the same
-        // producer still needs the edge info (RFC §9 B1) — supply it from the
-        // side-table entry so the aggressive shape can emit+filter.
         if (edgeOut)
             *edgeOut = ProducerEdge{existing->caKey, existing->traceHash};
+        return true;
+    }
+
+    // Dedup pass 2 (caKey, WRITE-ONCE — RFC §15 Fix 1a, the warm-stability fix):
+    // a re-force of the same derivation produces a FRESH `Bindings*` (a new
+    // thunk), so pass 1 misses — but the caKey (`__ca:<drvHash>`, a content
+    // address) is identical. Before Fix 1a this missed dedup re-ran recordSync
+    // with a DIFFERENT `snapshotEpochRange` (often EMPTY, because the inputs were
+    // already memoized on the re-force) and OVERWROTE the producer CurrentNode
+    // last-writer-wins → consumer edges (which embedded the FIRST trace hash)
+    // failed warm verify (§14: trace_id-12 zero-dep collapse, 30,629 sessions).
+    // Now: if this caKey was already recorded this session, KEEP the first
+    // recording — do NOT recordSync again. Register the new Bindings* → the
+    // first entry so the replay gate still fires for this re-forced value, and
+    // hand back the first recording's edge. Sound: same caKey ⇒ same derivation
+    // ⇒ the first (input-fresh) recording is an equal-or-more-complete dep set
+    // than any later (memoized) re-force, so keeping it is the correct choice.
+    if (auto firstRec = state.traceCtx->lookupProducerByCaKey(caKey)) {
+        state.traceCtx->registerProducer(
+            producerValue.attrs(), firstRec->caKey, firstRec->traceHash);
+        if (edgeOut)
+            *edgeOut = ProducerEdge{firstRec->caKey, firstRec->traceHash};
         return true;
     }
 
