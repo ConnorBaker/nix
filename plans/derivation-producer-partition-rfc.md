@@ -1276,3 +1276,56 @@ The genuinely valuable artifact from this whole arc is FIX 1A (the write-once ca
 correctness fix that makes §3b hot-neutral and is independent of whether the edge direction is pursued.
 It should stay. The aggressive edge-recorder + recovery fix stay as gated, default-OFF, SOUND
 scaffolding with a now-complete measured cost profile, so no future session re-runs this blind.
+
+## §18. STRUCTURAL CATCH-22 + arc conclusion (2026-05-31)
+
+§17b established the edge is hot-negative on closures.gnome because producer-consumer sharing is
+absent (~306 edges / ~12K producers). The natural rescue — "find/target a high-fan-out workload" —
+hits a structural catch-22:
+
+- An edge to a LOW-fan-out producer (≤1 consumer) is pure cost: a separate trace load+verify with
+  nothing to amortize it against. On closures.gnome ~97% of producers are low-fan-out.
+- An edge to a HIGH-fan-out producer (e.g. glibc, read by hundreds of packages) WOULD amortize — the
+  per-producer load is shared across its consumers (the memo works, §17b). BUT consumers reference such
+  a derivation via its OUTPUT STRING (`outPath`), which does not fire the gate without the
+  Prerequisite-2 re-keying.
+- Re-keying to make the gate fire on output-string consumption fires it for ALL producers — including
+  the 12K low-fan-out ones — making hot WORSE.
+- To edge ONLY the high-fan-out producers, you'd need to know each producer's consumer count AT RECORD
+  TIME — but that's not known until all consumers are seen (undecidable locally; the same fail-closed
+  class as the keyset-downgrade lever). There is no tractable record-time discriminator.
+
+So the producer-partition edge is not merely unprofitable on this workload — it has a structural
+obstruction: the cases where it pays (high fan-out) are exactly the cases the gate can't selectively
+target, and targeting them broadly drags in the majority low-fan-out cases that lose. MATERIAL BLOCKER,
+structural, confirmed.
+
+### Arc conclusion (RFC §3b producer-partition, §9→§18)
+FULLY EXPLORED + MEASURED. Outcomes:
+1. **Soundness: CLOSED** (conservative always; aggressive via §12 recovery-aware edge resolution).
+   Every shape produces byte-identical eval output. This was hard-won and is solid.
+2. **Hot correctness: FIX 1A** (caKey write-once dedup, commit 868038369) — the one durable win.
+   Eliminated the 30K-session overwrite collapse; §3b conservative is now hot-neutral (1.09s vs 1.00s).
+   Correctness fix, independent of the edge direction.
+3. **Edge benefit: BLOCKED** (structural catch-22 above). The aggressive edge is hot-negative; the
+   conservative shape is hot-neutral-but-pointless (no realized amortization). Neither is net-positive
+   end-to-end on closures.gnome (or, per §5, the python3Packages sibling shape).
+
+### What this does NOT solve, and what the actual open problem is
+The branch exists because eval-trace COLD+HOT perf is unsatisfactory. After this arc:
+- HOT is already good WITHOUT §3b (no-§3b serves closures.gnome warm in ~1.0s, 7/7 hits, 0 re-eval).
+  So there is no hot problem to solve via producer-partition; §3b only ever risked making hot worse.
+- COLD is the real cost (recording the trace the first time: ~6.7s over the ~1s eval), and §3b does
+  not help it (it adds cold recording). The cold cost is the dep-recording + hashing + SQLite-flush of
+  the full trace — addressed (partially) only by the async-recording work (Layer 1/2a landed, 2b
+  deferred), which is ORTHOGONAL to producer-partition.
+
+### Recommendation (honest)
+- KEEP Fix 1a (correctness; harmless when §3b off; necessary if §3b ever enabled).
+- KEEP the aggressive recorder + recovery fix as gated default-OFF scaffolding with this complete
+  measured cost profile (so no one re-runs the arc).
+- Do NOT invest further in the edge/re-keying/sub-scope/cold-recording-for-§3b items — they are
+  measured-dead (structural blocker) or polishing a net-negative feature.
+- The actual lever for the branch's cold-perf problem is the async-recording line (off-thread hash +
+  serialize, Layer 2b) and/or reducing what cold records — NOT producer-partition. That is a separate
+  investigation; this arc is concluded.
