@@ -351,3 +351,61 @@ exception-path stays sync, session-end barrier joins outstanding DB writes befor
 Env-gate `NIX_TRACE_ASYNC_RECORD=1`, default off. Then bench the cold delta; pursue B only if the
 hash+serialize residual is still a measured critical-path cost AND the thread-safe-vocab cost is
 justified.
+
+## STEP 1 RESULT — the split INVERTS the C1 plan. The cold cost is HASHING, not I/O. (2026-05-31)
+
+Measured the MAIN record path (cold no-§3b = pure consumer/root traces). Genuinely-cold single
+closures.gnome eval (record.count=7 traces, record.timeUs=1.55s):
+- **record.hashUs = 57%** (0.89s) — the dominant cost
+- record.flushUs = **4%** (I/O)
+- serialize = 3%
+- 2nd-txn/other = 35% (publishStateChange txn + interning)
+
+This INVERTS the §3b producer-path split (flush ~44%) that the Option-A recommendation rested on. On
+the consumer path, the cost is CPU hashing, not SQLite I/O. WHY: ownDepsTotal=172,670 across 7 traces
+(max 48,745 deps in one trace) — the 607× flattening, now as a RECORD-side cost. recorder.cc:45-47
+computes THREE hashes (traceHash + fullHash + depKeySetHash) each in a SEPARATE full pass over the
+~20K-dep sorted vector, and each pass calls feedKey → feedCanonicalDepKeyMaterial → collectPath (pool
+resolution) PER DEP. So the expensive pool resolution runs 3× per dep (3 × 48,745 = 146K resolutions
+for one trace).
+
+### CONSEQUENCE: Option A is nearly worthless (moves the 4% I/O); the real lever is the HASHING.
+- Option A (off-thread the SQLite write) addresses ~4% flush + part of the 35% txn — NOT the 57% hash.
+  ABANDON A as the first move.
+- Option B (off-thread the hashing) addresses the 57% but (a) hits the pool+vocab thread-safety wall
+  and (b) only HIDES the latency — the CPU work still happens, competing with eval. Not the first move.
+- **NEW first move — H-cold-1: dedup the 3× redundant key resolution into ONE pass.** The 3 hashes
+  feed the SAME key material into 3 separate builders (different domains/ordinals — can't merge the
+  builders), but the EXPENSIVE part (feedCanonicalDepKeyMaterial: pools.resolve + collectPath, the
+  documented-costly pool walk) is IDENTICAL across all three and currently runs 3×. Resolve each key's
+  pool-dependent material ONCE into a reusable `ResolvedKeyMaterial` (resolved source string, collected
+  path nodes, resolved hasKey/dirSet), then feed it cheaply into all 3 builders. Eliminates 2/3 of the
+  collectPath/resolve work. BYTE-PRESERVING: the same bytes are fed in the same order into each builder;
+  only the resolution is deduplicated → the 3 hashes are unchanged → NO schema break, NO cache
+  invalidation. Pure CPU win, no async, no threading, no soundness surface. THIS is the tractable cold
+  win step-1 revealed.
+
+### ADVERSARIAL on H-cold-1 (before implementing)
+- MUST stay byte-identical (the hashes are persisted content addresses; any change invalidates every
+  cached trace). The per-hash DIFFERENCES are all cheap and stay per-builder: traceHash skips
+  `!contributesToTraceHash(kind)` deps + its own ordinal sequence (TraceHashV2 domain); fullHash = all
+  deps + value; depKeySetHash = all deps, no value. The SHARED expensive part is feedKey(dep.key). So
+  the refactor is: compute ResolvedKeyMaterial once per dep; each builder still makes its own
+  builder.field() calls (preserving domain/ordinal/value framing) but from the pre-resolved material
+  instead of re-walking the pool. Verify by a golden-hash test: same (traceHash, fullHash, keySetHash)
+  before/after on a fixture trace.
+- RISK: feedCanonicalDepKeyMaterial interleaves pools.resolve(...) with builder.field(...) — the
+  resolution and the framing are entangled in the current code. The refactor must SPLIT them: a
+  `resolveKeyMaterial(pools, key) -> ResolvedKeyMaterial` (pool reads only) + a `feedResolved(builder,
+  material)` (builder.field only, no pool). Mechanical but touches the hot hash path — measure it
+  didn't regress single-hash cost.
+- RISK: the 35% "2nd-txn/other" includes interning (getOrCreateDepKeySet/getOrCreateTrace/doInternResult)
+  which ALSO walks the deps — H-cold-1 doesn't touch that. After H-cold-1, re-measure; the 35% may
+  become the new dominant term (then C1-async or interning dedup is the next lever).
+
+### REVISED cold plan (replaces "implement A then B")
+1. DONE: measure the split → it's hashing (57%), not I/O.
+2. **H-cold-1: single-pass key resolution** (split resolve from feed; resolve once, feed 3×). Sound,
+   byte-preserving, no threading. Golden-hash test + cold re-bench.
+3. Re-measure. If the residual (the 35% txn+interning, or remaining hash) still dominates → THEN
+   consider C1-async (Option A for the I/O txn) or interning-dedup. Decide from data, not the §3b split.
