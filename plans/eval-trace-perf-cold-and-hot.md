@@ -188,3 +188,166 @@ path — EVEN SIMPLER, no git needed, and H1 keyed on store path works directly.
 because it changes H2' from "surface a git OID API" to "key the content cache on the already-present
 store path." NEXT STEP: instrument/trace a locked-flake hot eval to see whether closures.gnome source
 reads come from the git ODB or from a store-copied tree — that single fact decides the whole hot design.
+
+## C1 — fire-and-forget cold recording: implementation sketch (2026-05-31)
+
+Grounded in: `TraceBackend::record` (context.cc:333-345), `TracePublishScope::publish` +
+`evaluateResolvedTarget` (trace-session.cc:59-188), `Recorder::record` (recorder.cc), the blocking pool
+(context.cc:247-261, `kBlockingThreads=2`, `BlockingThreadPool::post` already exists, blocking-scope.hh:69).
+
+### What blocks the eval thread today, and what's actually needed synchronously
+`publish()` → `backend.record` → `ctx.syncAwait(coroBlock(pool, …store->record…))`. `syncAwait`
+block-waits the eval fiber until the whole record (CPU: sort+3 hashes+serialize+intern; I/O: SQLite
+write under `storeMutex_`) completes. Of `publish`'s outputs:
+- **`result->traceId`** (set into `expr.ensureLazy().traceId`, trace-session.cc:63) — VERIFIED NOT
+  consumed on the cold path. The only reads of `lazy.traceId` (trace-session.cc:619-620, 670) are the
+  WARM-HIT branch, which gets `cachedTraceId` from the warm lookup, not from this cold record. So the
+  traceId is write-only cold → does NOT need to be available synchronously.
+- **`publish()`'s bool** (`hasBackendRecord`, trace-session.cc:175) — IS consumed synchronously: it
+  gates `materializeResult(v, attrValue)` vs the passthrough `v = *target` (line 183-187). BUT the bool
+  is `depCapture.isStable() && (record succeeded)`, and "record succeeded" only fails when no real
+  backend is bound (NullTraceBackend) — knowable WITHOUT doing the DB write. And `materializeResult`
+  builds `v` from `attrValue` (already in hand, line 173), NOT from the record result.
+
+So the synchronous needs are: (a) is a backend bound? (b) are deps stable? — both known pre-write.
+Everything else (hash/serialize/intern/SQLite) can move off the critical path.
+
+### The sketch (C1, env-gated `NIX_TRACE_ASYNC_RECORD=1`, default off)
+1. `publish()` computes `bool willRecord = depCapture.isStable() && backend.hasBoundBackend()`
+   synchronously (no DB). Returns `willRecord` for the materialize gate. (Matches today's bool for the
+   common case; the only behavioral diff is it no longer waits for the write.)
+2. Instead of `syncAwait`, hand `(pathId, std::move(value), std::move(deps))` to a new
+   `backend.recordAsync(...)` that `pool.post(...)`s the `store->record` work (fire-and-forget). The
+   eval continues immediately.
+3. **Barrier at session end:** `TraceSession::flush()`/`releaseBackend()` (trace-session.cc:792/803)
+   already run "after all eval work completes" (the shutdown comment, context.cc:369). Add a join:
+   block until all posted records drain before the final teardown flush. The pool join + a posted-task
+   counter (or `asio` work-tracking) is the barrier.
+4. `expr.lazy.traceId` is left unset cold (it's write-only cold anyway). If a future cold consumer ever
+   needs it, the async result can backfill it — but today nothing does.
+
+### Why this is C1 and not Layer 2b
+Layer 2b tried to move the CPU (hash/serialize) off-thread and hit the `DataPathPool` non-thread-safety
+wall (`feedKey`→`collectPath` mutates shared pools, recorder.cc:42 + interning-pools.hh single-writer
+invariant). C1 has the SAME wall IF the posted task touches the pools concurrently with the eval thread.
+So C1 is NOT free of the race — see the adversarial pass. The naive "just post it" is unsound.
+
+## C1 — ADVERSARIAL PASS on the sketch (2026-05-31). Naive fire-and-forget is UNSOUND; refined below.
+
+Hammered the sketch against the code. Findings, severity-ranked:
+
+### BLOCKER — ADV-1: the posted record races the eval thread on the shared InterningPools.
+`makeTraceBackend` passes `tracingPools()` BY REFERENCE into the `SqliteTraceStorage`/`Recorder`
+(context.cc:179-182). It is the SAME `InterningPools` instance the eval thread keeps interning new deps
+into as eval continues (`recordInterned` → `pools.intern`). The posted record does `feedKey` →
+`collectPath(key.dataPathId)` (input-resolution.cc:121) and `encodeCachedResult` — `collectPath` is
+`const` (reads `dataPathPool.nodes`, a `std::vector`), but a concurrent eval-thread `push_back` can
+REALLOC that vector → the record thread reads freed memory. `DataPathPool` is documented "NOT
+thread-safe … single-threaded-writer invariant" (interning-pools.hh:296,314). So "just `pool.post` the
+record and continue eval" is a DATA RACE / UAF — the SAME wall that blocked Layer 2b. The sketch's
+step-2 as written is unsound. THIS is the crux and the sketch's step-2 must change.
+
+### MAJOR — ADV-4: the exception/failed-eval publish (trace-session.cc:139) must NOT be async.
+On `EvalError`, `publish(failed_t…)` runs then `throw`. If async, the posted task captures `deps` while
+the stack unwinds and the DepCaptureScope/pools may be torn down → use-after-free during unwind. The
+failed-eval record is rare (not a hot cost) — keep it SYNCHRONOUS. C1 applies only to the
+success-path publish (line 176).
+
+### MINOR — ADV-3: within-session ordering is SAFE (verified).
+A later step re-reading a just-recorded cold trace would race an in-flight async write. But: the cold
+traceId is write-only (established); within-session re-forces hit the IN-MEMORY `epochMap`/`replayBloom`
+(context.cc:982/1067), NOT the store; warm-hit reads come from a PRIOR process. So no within-session
+store re-read of a freshly-async-recorded trace. The barrier at session end (sketch step 3) covers
+cross-process durability. Ordering is not a blocker — but the barrier MUST run before the teardown
+flush, and the teardown flush must see all posted entities (so post into the SAME store the teardown
+flushes — it does).
+
+### MINOR — ADV-5: the payload is movable but pool-relative.
+`Dep` = interned IDs + owned `DepHashValue` bytes (types.hh:794-804) — no live `Value*`/`Bindings*`, so
+`std::move(deps)` into the task is memory-safe. BUT resolving those IDs to bytes (serialize) still needs
+the pool → doesn't escape ADV-1.
+
+### REFINED DESIGN (resolves ADV-1) — two options, recommend B.
+
+**Option A — snapshot the pool-dependent material on the eval thread, post only pool-FREE work.**
+Before posting, do the pool-touching steps (feedKey/collectPath/serializeKeys/serializeValues/
+encodeCachedResult — everything that reads `pools`/`vocab`) SYNCHRONOUSLY on the eval thread, producing
+a fully self-contained `RecordPayload{traceHash, fullHash, keySetHash, keysBlob, valuesBlob, payload,
+resultHash}` (all owned bytes, no pool refs). Post ONLY the SQLite write (getOrCreate* + publish) — which
+touches the DB under `storeMutex_`, not the pools. This removes the I/O + flush (the §3b-measured ~44%
+flush + ~24% second-txn) from the eval critical path while keeping the pool-racing CPU on the eval
+thread. Net: partial win (removes I/O wait, keeps hash/serialize inline). SOUND (no pool race; the
+posted task is pure DB). Smaller than full fire-and-forget but no thread-safety work needed.
+
+**Option B (recommended) — single-writer record queue drained by ONE dedicated thread, with the pool
+made safe for one concurrent reader.** Keep ALL record work (incl. pool reads) off the eval thread, but
+serialize records onto ONE record thread (not the 2-thread pool) and make `DataPathPool` reads safe
+against eval-thread appends. The minimal safe structure: `DataPathPool.nodes` is append-only; a
+concurrent reader is safe IF the vector never reallocates under it. Two sub-options:
+  (b1) `std::deque` (stable element addresses on append) instead of `std::vector` for `nodes` → a reader
+       holding an index is never invalidated by an append. Cheap, surgical, removes the UAF. (collectPath
+       walks parent links by id → index access; deque keeps those valid.)
+  (b2) reserve-and-cap / chunked storage (the `ChunkedVector` the StringInternTable already uses,
+       interning-pools.hh) — same stable-address property.
+  With stable addresses, ONE record-reader thread racing the eval-writer is safe for the append-only
+  pools (the eval thread only ever APPENDS; it never mutates existing nodes). `governingRepoCache_`
+  (the other non-thread-safe member) is written during dep RESOLUTION (verify), not record — confirm it
+  is not touched on the record path (it isn't: record reads via collectPath, not resolveRepoRoot). 
+  Net: full fire-and-forget cold recording, sound. Larger change (data-structure swap + a record thread
+  + the session-end join), but it's the real "cold off the critical path" win.
+
+**Recommendation: B (with b1, the deque swap)** is the real fix; A is the safe partial fallback if b1's
+append/read concurrency proves to have a sharp edge (e.g. collectPath touches more than nodes[]).
+Validate b1 FIRST with a focused TSan run: eval-thread appends + concurrent collectPath reads on a
+deque-backed DataPathPool, under `-Db_sanitize=thread`. If clean, B; else A.
+
+### Adversarial pass on the REFINEMENT itself (don't trust B blindly)
+- B's soundness rests on "eval thread only APPENDS to DataPathPool, never mutates existing nodes." If
+  any record-relevant pool (Strings, the DepKeySet/Trace/Result intern maps inside the store) is mutated
+  by BOTH threads, the deque swap is insufficient. The STORE's own intern maps (getOrCreateDepKeySet/
+  getOrCreateTrace) are under `storeMutex_` already (only the record thread touches them) — safe. The
+  shared one is `tracingPools` (eval appends, record reads) — the deque covers it. But VERIFY there is
+  no OTHER shared-mutable touched by record: `vocab` (AttrVocabStore) — does record WRITE it
+  (internName) or only read? `internName` for `__ca:` is §3b; the main record path's `encodeCachedResult`
+  → `hasherVocab()` — must confirm read-only. THIS is the remaining unknown to check before B.
+- A is unconditionally sound but its win is bounded by how much of the 6.7s is I/O-vs-CPU. The §3b
+  split (flush ~44% + 2nd-txn ~24% = ~68% I/O-ish, hash ~26% + serialize ~5% CPU) suggests A removes
+  ~68% of the per-record cost from the critical path — already most of it. So A may be the
+  better effort/risk trade: ~2/3 of the win, zero thread-safety work. Re-measure the split on the
+  MAIN record path (not the §3b producer path) to decide A-vs-B.
+
+### Revised C1 plan
+1. Measure the I/O-vs-CPU split of the MAIN `backend.record` path (the §3b split was the producer path;
+   confirm it holds for the consumer-trace record). Decides A-vs-B leverage.
+2. Implement A first (post-only-the-DB-write): sound, no data-structure change, removes the I/O wait.
+   Bench. If A captures most of the 6.7s → done.
+3. Only if CPU (hash/serialize) is still a critical-path bottleneck after A → B (deque swap + record
+   thread), gated behind the vocab-write check + a TSan validation.
+4. Exception-path publish stays synchronous (ADV-4). Session-end barrier before teardown flush (ADV-3).
+
+### C1 refinement — the vocab-write check KILLS Option B's "surgical" framing → recommend A decisively.
+Checked the open question (ADV-pass-on-refinement: does the main record path WRITE shared mutable
+state beyond DataPathPool?). It does: `encodeCachedResult` for an `attrs_t` result →
+`encodeAttrEntries` → `vocab.internName(entry.name)` (trace-result-codec.cc:327) is a MUTATING intern
+on the shared `AttrVocabStore`, concurrent with the eval thread's own vocab writes. So Option B is NOT
+just "swap DataPathPool's vector for a deque" — it ALSO needs a thread-safe `AttrVocabStore` (or
+pre-interning all result attr-names on the eval thread before handoff). That is materially more work +
+risk (a second shared-mutable structure on the hot path, the vptr/lock-on-hot-loop hazard class).
+
+CONSEQUENCE: Option A is now the clear recommendation. A does ALL pool/vocab-touching work
+(feedKey/collectPath/serialize/encodeCachedResult/internName) SYNCHRONOUSLY on the eval thread —
+producing a self-contained `RecordPayload` of owned bytes + already-interned ids — and posts ONLY the
+SQLite write (getOrCreate* + publishStateChange), which touches the DB under `storeMutex_`, never the
+pools/vocab. No thread-safety work on pools or vocab; sound by construction.
+
+A's win, quantified against the §3b record split (flush ~44% + 2nd-txn ~24% = ~68% is the SQLite I/O
+that A moves off-thread; hash ~26% + serialize ~5% stays on the eval thread). So A removes ~2/3 of the
+per-record cost from the eval critical path with ZERO concurrency risk. The residual ~1/3 (hash+
+serialize CPU) only comes off-thread via B, which now requires the thread-safe-vocab work — defer B
+until A is measured and only if the residual CPU is shown to still matter.
+
+FINAL C1 recommendation: implement Option A (post-only-the-DB-write, sync everything pool/vocab-touching),
+exception-path stays sync, session-end barrier joins outstanding DB writes before teardown flush.
+Env-gate `NIX_TRACE_ASYNC_RECORD=1`, default off. Then bench the cold delta; pursue B only if the
+hash+serialize residual is still a measured critical-path cost AND the thread-safe-vocab cost is
+justified.
