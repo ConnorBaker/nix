@@ -295,4 +295,71 @@ NIX_ALLOW_EVAL=0 expectStderr 1 nix eval --json "$t4Dir#result" \
 
 echo "Test 4 passed: JSON unrelated key change hits cache, accessed key change invalidates"
 
-echo "All eval-trace-soundness tests passed! (BUG-1, schema migration, constructive recovery, structural override)"
+###############################################################################
+# Test 5: H1 — persisted file-content-hash cache (store-path immutability)
+###############################################################################
+#
+# H1 persists (store_path -> depHash(readFile())) so warm verification of a
+# FileBytes dep on a store-resident flake source skips the re-read. Soundness
+# rests on store-path immutability: editing the source produces a DIFFERENT
+# /nix/store/<narhash>-source path, so the H1 entry is a clean MISS (never a
+# stale serve), and the consumer correctly re-evaluates.
+#
+# This pins the immutability invariant the unit test (file-content-cache.cc)
+# cannot — that fixture uses fake store paths with mutable content. Here the
+# store path is real, so a content edit genuinely changes the key.
+#
+# Scenario:
+#   1. Cold eval → records the FileBytes dep + persists the H1 entry
+#   2. Warm eval (fully warm) → H1 SERVES the hash (fileContentCacheHits > 0)
+#   3. Edit the source file + commit → new store path
+#   4. Warm verify MUST miss ("not everything is cached") — soundness: the H1
+#      entry for the OLD store path is never consulted for the NEW one
+#   5. Cold re-eval → new value; warm verify → new value (no stale serve)
+
+clearStoreIndex
+
+t5Dir="$TEST_ROOT/soundness-h1-content"
+createGitRepo "$t5Dir" ""
+
+echo -n "h1-source-v1" >"$t5Dir/data.txt"
+cat >"$t5Dir/flake.nix" <<'EOF'
+{
+  description = "H1 store-path immutability test";
+  outputs = { self }: { value = builtins.readFile ./data.txt; };
+}
+EOF
+git -C "$t5Dir" add .
+git -C "$t5Dir" commit -m "Init v1"
+
+# Step 1: cold eval records the trace + the H1 entry.
+[[ "$(nix eval --json "$t5Dir#value")" == '"h1-source-v1"' ]]
+# Step 2: warm eval — must hit cache AND fire H1 (the flake source is
+# store-resident, so the FileBytes dep is H1-eligible and served, not re-read).
+NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH="$TEST_HOME/soundness-t5-warm.json" \
+    env NIX_ALLOW_EVAL=0 nix eval --json "$t5Dir#value" | grepQuiet "h1-source-v1"
+t5_h1_hits="$(readEvalTraceCounter "$TEST_HOME/soundness-t5-warm.json" evalTrace.depHash.fileContentCacheHits)"
+t5_h1_eligible="$(readEvalTraceCounter "$TEST_HOME/soundness-t5-warm.json" evalTrace.depHash.fileContentCacheEligible)"
+# At least one FileBytes dep on the store-resident source must be eligible AND
+# served by H1 (non-vacuity: if H1 never fired, hits would be 0).
+[[ "$t5_h1_eligible" -ge 1 ]] || { echo "Test 5 FAIL: expected H1-eligible dep, got $t5_h1_eligible"; exit 1; }
+[[ "$t5_h1_hits" -ge 1 ]] || { echo "Test 5 FAIL: expected H1 cache hit, got $t5_h1_hits"; exit 1; }
+
+# Step 3: edit the source → new commit → new /nix/store/<narhash>-source path.
+echo -n "h1-source-v2" >"$t5Dir/data.txt"
+git -C "$t5Dir" add data.txt
+git -C "$t5Dir" commit -m "Edit to v2"
+
+# Step 4: warm verify MUST miss — the new store path has no H1 entry, and the
+# OLD entry (keyed on the old store path) is never consulted. Soundness: no
+# stale "h1-source-v1" serve.
+NIX_ALLOW_EVAL=0 expectStderr 1 nix eval --json "$t5Dir#value" \
+  | grepQuiet "not everything is cached"
+
+# Step 5: cold re-eval → new value; warm verify → new value (still no stale serve).
+[[ "$(nix eval --json "$t5Dir#value")" == '"h1-source-v2"' ]]
+[[ "$(NIX_ALLOW_EVAL=0 nix eval --json "$t5Dir#value")" == '"h1-source-v2"' ]]
+
+echo "Test 5 passed: H1 serves store-resident content hashes warm AND a source edit (new store path) cleanly misses — no stale serve"
+
+echo "All eval-trace-soundness tests passed! (BUG-1, schema migration, constructive recovery, structural override, H1 content cache)"

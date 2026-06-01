@@ -227,6 +227,12 @@ static std::optional<std::string> h1StorePathKey(
     const InterningPools & pools,
     const Store & store)
 {
+    // FileBytes and RawBytes both compute `depHash(p.readFile())` on the verify
+    // path (dep-resolution-service.cc, the shared computePathHashedDep lambda),
+    // so they can share one store-path-keyed entry with NO kind discriminator:
+    // serving a RawBytes-stored value for a FileBytes key (or vice versa) yields
+    // the identical hash. If either kind's verify compute ever diverges from
+    // `depHash(readFile())`, this key would need a kind tag — add one then.
     if (key.kind != CanonicalQueryKind::FileBytes
         && key.kind != CanonicalQueryKind::RawBytes)
         return std::nullopt;

@@ -172,7 +172,31 @@ both, and avoids the edge's hot-verify penalty (the dep set is still inline-reso
 once). Distinct from the producer edge (which moved verification into a separate trace); this is pure
 record-time dedup of identical dep VECTORS across traces. Unexplored.
 
-## H1 — IMPLEMENTATION DESIGN (2026-06-01, after the store-copy resolution + 3-agent code map)
+## H1 — LANDED 2026-06-01 (commit on `vibe-coding/file-based-eval-cache`)
+
+**Status: implemented, tested, adversarially reviewed, committed + pushed.** The design below was
+realized exactly as specified. Summary of what shipped:
+- New SQLite table `FileContentHashes(store_path TEXT PRIMARY KEY, content_hash BLOB)` mirroring the
+  `DirSets` shape (additive, no `kSchemaEpoch` bump — pure accelerator, not trace identity).
+- `SqliteTraceStorage::{lookupFileContentHash,putFileContentHash}` + in-memory
+  `fileContentHashByStorePath` (bulk-loaded at open) + `pendingFileContentHashes` (drained in flush).
+- `h1StorePathKey` gate + the H1 block in `resolveCurrentDepHash` (verifier.cc) — in FRONT of the L1
+  miss path; ZERO change to the free `resolveDepHash`. On a hit it mirrors `cacheComputedHash` into L1.
+- Counters `depHash.fileContentCache{Hits,Stores,Eligible}` in NIX_SHOW_STATS.
+- Unit tests `store/file-content-cache.cc` (3, NON-VACUITY PROVEN by neutering the lookup) + functional
+  Test 5 in `flakes/eval-trace-soundness.sh` (pins store-path immutability: a source edit → new store
+  path → clean miss, no stale serve).
+- **Measured firing** on a real flake hot eval: `fileContentCacheHits=2, eligible=2, stores=0` on the
+  warm run (both flake source files served from the persisted cache, zero re-reads), output
+  byte-identical to `--no-eval-trace`. Adversarial review: no soundness hole (every Registered key
+  resolves to a NAR-content-addressed flake path or narHash-verified runtime root).
+- **NOT yet bench-measured on the Ledger-D `closures.gnome` flake workload** — the next step to quantify
+  the hot-wall-time win at scale (the unit/functional firing proves correctness + that it fires; the
+  aggregate Δ on 170K-dep traces is unmeasured). See "Recommended order" below.
+
+Original design (realized as-is):
+
+### H1 — IMPLEMENTATION DESIGN (2026-06-01, after the store-copy resolution + 3-agent code map)
 
 **The gap, pinned in code.** The warm-verify FileBytes/RawBytes path does NOT consult ANY content-hash
 cache. `dep-resolution-service.cc:371-377` calls `computePathHashedDep(... [](p){ return
@@ -230,9 +254,11 @@ the physical store path instead of the logical dep key, and is the cross-process
   won't show it — store-copy only happens for flake/git inputs; `-f /abs/nixpkgs` reads posix, not
   store). Soundness: store-path immutability (no token), pinned by a record→evict-L1→verify test.
 
-## Recommended order (tractable → architectural) — REVISED 2026-06-01 (H1 design resolved)
-1. **H1 (persist store-path→depHash, gated on isInStore)** — IN PROGRESS. The hot fix for the flake/store
-   workload; design above. Sound by store-path immutability, no freshness token, no epoch bump.
+## Recommended order (tractable → architectural) — REVISED 2026-06-01 (H1 LANDED)
+1. **H1 (persist store-path→depHash, gated on isInStore)** — ✅ LANDED + committed (correctness proven,
+   fires on real flakes). NEXT for H1: bench it on the Ledger-D `closures.gnome` flake workload to
+   quantify the hot-wall-time Δ at 170K-dep scale (warm verify re-hashed ~29K source files/process; H1
+   should erase most of `depHash.contentUs` + the readFile syscalls behind it on the 2nd+ process).
 2. ~~H2' (git blob OID)~~ — RETIRED on this fork (no lazy-trees; store-copy makes the store path the
    token). Only relevant to a lazy-trees fork or the dirty/`-f /abs` path (where H1's isInStore gate
    declines and the read path stands).

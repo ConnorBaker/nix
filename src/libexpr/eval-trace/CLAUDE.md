@@ -2999,6 +2999,35 @@ hash; the placeholder path is retired.)
   call `fileContentHashCache->clear()`, so the cache's effective
   lifetime is bounded by whichever cleanup point fires first.
 
+- **H1: cross-process file-content-hash cache (verify side).** The
+  per-process `fileContentHashCache` above is RECORD-side only and dies
+  with the process; the warm-verify FileBytes/RawBytes path
+  (`dep-resolution-service.cc` → `computePathHashedDep`) re-reads +
+  re-hashes unconditionally, and the per-session L1
+  (`VerificationSession::currentDepHashes_`) is keyed on the logical dep
+  key and starts empty each process — so neither served content hashes
+  across the process boundary. H1 adds a PERSISTED SQLite table
+  `FileContentHashes(store_path TEXT PRIMARY KEY, content_hash BLOB)`
+  consulted in `SqliteTraceStorage::resolveCurrentDepHash` (verifier.cc),
+  in FRONT of the L1 miss path, keyed on the resolved store-path string.
+  Sound by store-path immutability: the store path is the NAR content
+  address, so a content change yields a different path = a different key
+  = a clean miss (an entry is never stale; no freshness token). Gate
+  (`h1StorePathKey`): kind ∈ {FileBytes, RawBytes} AND source is
+  Registered (NOT Absolute — an absolute store path could be an
+  input-addressed build output) AND `store->isInStore(resolved)`;
+  the Missing sentinel is never cached. Purely additive +
+  correctness-independent (a miss re-reads), so it does NOT participate
+  in trace identity and needs no `kSchemaEpoch` bump. Counters:
+  `depHash.fileContentCache{Hits,Stores,Eligible}`. Tests:
+  `store/file-content-cache.cc` (unit, non-vacuity proven) +
+  `flakes/eval-trace-soundness.sh` Test 5 (functional, store-path
+  immutability). Design + measurement: `plans/eval-trace-perf-cold-and-hot.md`
+  "H1 — LANDED 2026-06-01". This is the hot fix from the store-copy
+  resolution (no lazy-trees ⇒ flake source is `fetchToStore`'d and read
+  via `storeFS`, so the store path IS the content address; the git-OID
+  alternative H2' was retired as unnecessary on this fork).
+
 ### Diagnostic counters
 
 The following five counters in
