@@ -99,6 +99,7 @@ sources = files(
   'eval-trace/store/derivation-input-flattening.cc',
   'eval-trace/store/derivation-edge-loadbearing.cc',
   'eval-trace/store/ca-trace-key-routing.cc',
+  'eval-trace/store/ca-producer-edge-recovery.cc',
   'eval-trace/store/ca-producer-boundary-recording.cc',
   'eval-trace/store/ca-edge-verify-cost.cc',
   'eval-trace/store/derivation-outpath-soundness.cc',

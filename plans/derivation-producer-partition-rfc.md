@@ -833,3 +833,58 @@ precision/cache-effectiveness on flake re-eval.
 ### Disposition unchanged: aggressive shape IMPLEMENTED, SOUND, gated default-OFF, BLOCKED — but the
 blocker is now a CONFIRMED, well-characterized, fixable gap (recovery-unaware edge resolution) with a
 validated fix path, not an open mystery.
+
+## §12. Recovery-aware producer-edge resolution — IMPLEMENTED + TESTED (2026-05-31)
+
+Landed the §11-step-1 fix. The §10 blocker (aggressive shape over-invalidates on flake re-eval) is
+CLOSED.
+
+### The change (verifier.cc `resolveTraceContextHash`)
+When `lookupCurrentNode(parentPathId)` returns null (the parent — typically a `__ca:<drvHash>`
+producer — has no CurrentNode in this session, because a source edit rotated the session key), fall
+back to `lookupLatestHistoryForAttr(parentPathId)` (the parent's History row under the current
+stableRecoveryKey). On a successful nested `verifyTrace`, re-publish the parent's CurrentNode
+(`publishStateChange(insertHistory=false)`) so this session — and the `traceContextMemo` — resolve it.
+This MIRRORS `verify()`'s own history-bootstrap (verifier.cc ~1920-1937), lifted to edge resolution.
+
+UNCONDITIONAL (not gated to the aggressive path): it also benefits sibling-`TraceValueContext` /
+`TraceParentSlot` edges on the default path, and was verified to NOT regress the default path. The fix
+increments `nrHistoryBootstraps` when it fires.
+
+### Why it is sound
+The bootstrapped parent is still fully VERIFIED: the nested `verifyTrace` recomputes the parent's deps
+against the live FS, so a stale bootstrapped producer fails verify exactly as a current-session one
+would → the consumer's edge resolves to nullopt → invalidate. History bootstrap changes only WHERE the
+candidate trace is found (CurrentNode vs History), never WHETHER it's checked. Confirmed by the
+soundness test below (producer-input-changed still invalidates after bootstrap).
+
+### Validation
+- **The oracle:** `eval-trace-core` + `eval-trace-deps` (the flake suites that FOUND the blocker) now
+  PASS under `NIX_CA_PRODUCER_AGGRESSIVE=1`. Default path: all 16 eval-trace functional suites green;
+  786 eval-trace unit tests green.
+- **New unit pins (`store/ca-producer-edge-recovery.cc`, 2 tests):**
+  `CAProducerEdge_SessionKeyRotation_ResolvesViaHistoryBootstrap` reproduces session-key rotation via
+  `SessionConfig::forTest(<distinct policy>, <shared stable key>)` (the recovery.cc cross-session
+  pattern) — a producer+consumer-edge recorded in session 1, verified in session 2 (rotated key),
+  must hit ONLY because the producer bootstraps from History. **NON-VACUITY PROVEN:** reverting the fix
+  makes this test FAIL (the other soundness test still passes — it guards that the fix doesn't break
+  invalidation). `CAProducerEdge_SessionKeyRotation_ProducerInputChanged_Invalidates` pins soundness
+  (bootstrapped producer with a changed input still invalidates).
+- **EdgeOut pin (`dep/trace-session-record-ca-producer.cc` R5):** `recordCAProducer` populates the
+  `{caKey, traceHash}` out-param on BOTH the fresh-record AND the per-session dedup-hit paths (Finding
+  5 — a 2nd cold consumer of a shared producer). **NON-VACUITY PROVEN:** breaking the dedup-hit
+  population makes R5(b) FAIL (it would otherwise emit an edge to caKey=0/root and mis-resolve).
+
+### Still open (deferred, in dependency order)
+1. **Cross-rev producer-reuse test (Finding 3b).** The session-key-rotation tests cover the rotation;
+   a dedicated same-flake-rev-drift test (producer recorded at rev R1, reused at R2 with the
+   derivation unchanged, then R2 changes the producer's input) would pin the recompute-and-compare on
+   the bootstrapped producer end-to-end. The R5 + soundness tests cover the mechanism; this is
+   additional coverage, not a gap in soundness.
+2. **No-under-record differential property (§9).** A differential oracle (files-that-invalidate under
+   aggressive ⊇ under conservative) — now buildable since the flake suites pass.
+3. **Hot bench (§9 task 5).** NOW MEANINGFUL — the aggressive shape no longer breaks flake re-eval, so
+   a Ledger-D hot measurement would measure a correct shape. This is the next major step.
+
+### Disposition: the §10 blocker is CLOSED. Aggressive shape: implemented, sound, default-OFF, flake
+re-eval WORKING. Remaining is perf validation (the hot bench) + the two additional test coverages.

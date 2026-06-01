@@ -195,4 +195,45 @@ TEST_F(TraceSessionRecordCAProducerTest, RecordCAProducer_InputMutation_Invalida
     }
 }
 
+// ── R5: edgeOut out-param (RFC §9 B1 / §11 Finding 5) ────────────────────────
+//
+// The aggressive shape needs `{caKey, traceHash}` from recordCAProducer to emit
+// the consumer's TraceValueContext edge. It must be populated on BOTH paths:
+//  (a) the fresh-record path, and
+//  (b) the per-session DEDUP-HIT path (a SECOND cold consumer of the same
+//      producer in one session — the 607× sharing case). If the dedup-hit path
+//      left edgeOut at its default {caKey=0(root), traceHash=0}, the second
+//      consumer would emit an edge to the ROOT trace and mis-resolve.
+TEST_F(TraceSessionRecordCAProducerTest, RecordCAProducer_EdgeOut_PopulatedOnFreshAndDedupHit)
+{
+    TempTextFile inputSrc("R5-v1");
+    auto session = makeCache("42");
+    forceRoot(*session);
+    auto deps = captureProducerInputs([&](auto & ctx) {
+        ctx.record(makeContentDep(state.tracingPools(), inputSrc.path.string(), "R5-v1"));
+    });
+
+    // First (fresh-record) call — edgeOut populated from the freshly persisted trace.
+    Value v;
+    v.mkAttrs(state.buildBindings(0, EmptyBindingsAllocation::AllocateFresh).finish());
+    TraceSession::ProducerEdge edgeFresh;
+    ASSERT_TRUE(session->recordCAProducer(v, "drv-R5", deps, &edgeFresh));
+    EXPECT_EQ(edgeFresh.caKey.value, expectedCAKey("drv-R5").value)
+        << "R5(a): fresh-record edgeOut.caKey must be the producer's CA key";
+    EXPECT_NE(edgeFresh.caKey.value, AttrVocabStore::rootPath().value)
+        << "R5(a): edgeOut.caKey must NOT be the root (caKey=0) sentinel";
+    EXPECT_NE(edgeFresh.traceHash.value, EvalTraceHash{})
+        << "R5(a): fresh-record edgeOut.traceHash must be the real producer hash";
+
+    // Second call, SAME Bindings* ⇒ dedup-hit path (trace-session.cc:849). edgeOut
+    // must be supplied from the side-table, matching the fresh-record values.
+    TraceSession::ProducerEdge edgeDedup;
+    ASSERT_TRUE(session->recordCAProducer(v, "drv-R5", deps, &edgeDedup));
+    EXPECT_EQ(edgeDedup.caKey.value, edgeFresh.caKey.value)
+        << "R5(b): dedup-hit edgeOut.caKey must match the fresh-record caKey "
+           "(NOT the default root sentinel — Finding 5 regression guard)";
+    EXPECT_EQ(edgeDedup.traceHash.value, edgeFresh.traceHash.value)
+        << "R5(b): dedup-hit edgeOut.traceHash must match the fresh-record hash";
+}
+
 } // namespace nix::eval_trace

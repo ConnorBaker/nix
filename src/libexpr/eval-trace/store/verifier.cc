@@ -248,10 +248,38 @@ std::optional<EvalTraceHash> SqliteTraceStorage::resolveTraceContextHash(
     VerificationSession & session)
 {
     auto parentPathId = key.attrPathId;
-    auto parentRow = lookupCurrentNode(ea.blockingProof(), parentPathId);
-    if (!parentRow)
-        return std::nullopt;
+    auto & bs = ea.blockingProof();
+    auto parentRow = lookupCurrentNode(bs, parentPathId);
 
+    // Recovery-aware edge resolution (RFC §11 fix). The parent of a
+    // TraceValueContext/TraceParentSlot edge may have no CurrentNode in THIS
+    // session — most acutely a CA producer (`__ca:<drvHash>`) recorded under a
+    // different session key after a source edit rotated the key (RFC §10). The
+    // consumer reaches this point via History bootstrap, but the producer's
+    // CurrentNode lives under the old key, so `lookupCurrentNode` misses and the
+    // edge would be unresolvable → the consumer over-invalidates (fails closed,
+    // never stale). Mirror `verify()`'s history-bootstrap (this file, ~1920-1937):
+    // fall back to the parent's History row under the current stableRecoveryKey,
+    // verify it, and re-publish its CurrentNode so this session (and the memo
+    // below) resolve it. Soundness is unchanged: `verifyTrace` still recomputes
+    // the parent's deps against the live FS, so a bootstrapped-but-stale parent
+    // fails verify exactly as a current-session one would.
+    bool bootstrappedParent = false;
+    if (!parentRow) {
+        parentRow = lookupLatestHistoryForAttr(ea, parentPathId);
+        if (!parentRow)
+            return std::nullopt;
+        bootstrappedParent = true;
+    }
+
+    // Memo fast path. NOTE on the bootstrap interaction: a History-bootstrapped
+    // `parentRow` carries nodeStamp==0 (lookupLatestHistoryForAttr leaves it
+    // default), while a real CurrentNode's stamp is always ≥1 (allocateNodeStamp
+    // starts at 1). Memo entries are only ever inserted with `parentRow->nodeStamp`
+    // AFTER a successful re-publish (≥1) or from a real lookupCurrentNode (≥1) — a
+    // failed/negative resolution memoizes the stamp-0 bootstrap row. So a stamp-0
+    // bootstrap check matches ONLY a prior stamp-0 (failed) entry for the same
+    // parentPathId — correct negative-result caching — never a stale positive.
     auto memoIt = session.traceContextMemo.find(parentPathId);
     if (memoIt != session.traceContextMemo.end()
         && memoIt->second.nodeStamp == parentRow->nodeStamp)
@@ -265,6 +293,15 @@ std::optional<EvalTraceHash> SqliteTraceStorage::resolveTraceContextHash(
     // entry breaks mutual recursion via `session.inProgressTraceIds`.
     std::optional<EvalTraceHash> resolved;
     if (verifyTrace(ea, parentRow->traceId, registry, state, session)) {
+        // If the parent was bootstrapped from History, publish its CurrentNode
+        // under the current session key so getCurrentTraceHash (and subsequent
+        // edges to the same producer this session) resolve it. insertHistory=false
+        // — the History row already exists; we only refresh the current pointer.
+        if (bootstrappedParent) {
+            nrHistoryBootstraps++;
+            parentRow = publishStateChange(bs, parentPathId, parentRow->traceId,
+                parentRow->resultId, /*insertHistory=*/false);
+        }
         auto parentTraceHash = getCurrentTraceHash(ea, parentPathId);
         if (parentTraceHash)
             resolved = parentTraceHash->value;
