@@ -376,6 +376,10 @@ struct SqliteTraceStorage
         SQLiteStmt insertDirSet;
         SQLiteStmt getAllDirSets;
 
+        // FileContentHashes (H1: cross-process store-path -> content-hash cache)
+        SQLiteStmt insertFileContentHash;
+        SQLiteStmt getAllFileContentHashes;
+
         // Vocab (on vocab.* schema, ATTACH'd from attr-vocab.sqlite)
         SQLiteStmt insertVocabName;
         SQLiteStmt insertVocabPath;
@@ -468,6 +472,17 @@ struct SqliteTraceStorage
     };
     boost::unordered_flat_map<TraceId, DeferredTraceBlob, TraceId::Hash> deferredTraceBlobs;
 
+    /// H1: cross-process content-hash cache for store-resident source files.
+    /// Maps the FULL store-path string (/nix/store/<narhash>-source/<rel>) to
+    /// its `depHash(readFile())`. Bulk-loaded at open from FileContentHashes,
+    /// consulted by `lookupFileContentHash` on the warm-verify FileBytes path
+    /// (in front of L1's miss → readFile), populated by `putFileContentHash`
+    /// after a cold compute. Sound by store-path immutability: a content change
+    /// yields a different store path = a different key = a clean miss, so an
+    /// entry is never stale and no freshness token is needed. Keyed by string
+    /// (not a hash) because the store path is itself the content address.
+    boost::unordered_flat_map<std::string, DepHash> fileContentHashByStorePath;
+
     // ── In-memory ID counters (next ID to assign = max(DB IDs) + 1) ──
     //
     // NodeStamp counter is base-owned (see TraceStorage::allocateNodeStamp).
@@ -544,6 +559,15 @@ struct SqliteTraceStorage
         std::optional<EvalTraceHash> gitIdentityHash;
     };
     std::vector<PendingCurrentNode> pendingCurrentNodes;
+
+    // H1 pending writes: (store_path, content_hash) rows drained in flush().
+    // No ordering constraint vs other tables (FileContentHashes is referenced
+    // by nothing); INSERT OR IGNORE makes re-inserting an existing row a no-op.
+    struct PendingFileContentHash {
+        std::string storePath;
+        DepHash contentHash{};
+    };
+    std::vector<PendingFileContentHash> pendingFileContentHashes;
 
     // ── Capability minting ────────────────────────────────────────────
 
@@ -843,6 +867,21 @@ private:
     DepKeySetId getOrCreateDepKeySet(
         const DepKeySetHash & keySetHash,
         const std::vector<uint8_t> & keysBlob);
+
+    /// H1 cross-process content-hash cache (store-resident files only).
+    ///
+    /// `lookupFileContentHash` returns the persisted `depHash(readFile())` for
+    /// a store-path string if cached (in-memory map populated at open from the
+    /// FileContentHashes table). `putFileContentHash` records a freshly-computed
+    /// hash for a store path (in-memory immediately + buffered to
+    /// `pendingFileContentHashes` for the next flush). Both are sound ONLY for
+    /// store-resident paths: the caller (resolveCurrentDepHash) gates on
+    /// `store->isInStore(...)` so the key is content-addressed and immutable.
+    /// These are private helpers reached only from inside an exclusive-access
+    /// scope (resolveCurrentDepHash), so they take no `ea` — mirroring
+    /// getOrCreateDepKeySet.
+    std::optional<DepHash> lookupFileContentHash(const std::string & storePath);
+    void putFileContentHash(const std::string & storePath, const DepHash & hash);
 
     /// Atomic record publication: DB writes + all session cache updates.
     /// Called only from record(). `deferPublish` (Layer 2a) forwards to

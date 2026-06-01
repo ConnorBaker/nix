@@ -207,6 +207,41 @@ class FileStrandGate : private gdp::Certifier<FileStrandTag> {
     }
 };
 
+/// H1: if this dep is a FileBytes/RawBytes content dep on a STORE-RESIDENT,
+/// fetched (Registered-source) path, return that path's absolute string — the
+/// content-addressed, immutable key for the cross-process content-hash cache.
+/// Returns nullopt for any dep that is NOT safe to serve from the persisted
+/// cache, so the caller falls through to the normal compute path:
+///   - non-FileBytes/RawBytes kinds (their hash isn't `depHash(readFile())`);
+///   - Absolute-source deps (an absolute store path could name an
+///     input-addressed build output whose bytes can differ across rebuilds at
+///     the same path; only fetched/Registered sources are narHash-addressed);
+///   - paths that don't resolve, or don't resolve under /nix/store (dirty
+///     working dirs, `-f /abs` posix reads — mutable, not content-addressed).
+/// The store-path string for a Registered source is `/nix/store/<narhash>-…`,
+/// which changes iff content changes ⇒ a stale entry is never consulted, so no
+/// freshness token is needed.
+static std::optional<std::string> h1StorePathKey(
+    const Dep::Key & key,
+    const SemanticRegistry & registry,
+    const InterningPools & pools,
+    const Store & store)
+{
+    if (key.kind != CanonicalQueryKind::FileBytes
+        && key.kind != CanonicalQueryKind::RawBytes)
+        return std::nullopt;
+    auto source = pools.resolveDepSource(key.sourceId);
+    if (isAbsoluteDepSource(source))
+        return std::nullopt;
+    auto path = registry.resolve(source, std::string(pools.resolve(key.simpleKeyId())));
+    if (!path)
+        return std::nullopt;
+    auto abs = path->path.abs();
+    if (!store.isInStore(abs))
+        return std::nullopt;
+    return std::string(abs);
+}
+
 /// External callers use this; the typestate is internal.
 template<typename TaggedDepType>
 std::optional<DepHashValue> SqliteTraceStorage::resolveCurrentDepHash(
@@ -215,17 +250,52 @@ std::optional<DepHashValue> SqliteTraceStorage::resolveCurrentDepHash(
     const SemanticRegistry & registry,
     EvalState & state, VerificationSession & session)
 {
-    return FileStrandGate::ifPassed(ea, [&](const auto & fileTok) {
-        if (auto cached = session.lookupDepHash(dep.value().key)) {
+    return FileStrandGate::ifPassed(ea, [&](const auto & fileTok) -> std::optional<DepHashValue> {
+        const auto & key = dep.value().key;
+        if (auto cached = session.lookupDepHash(key)) {
             nrDepHashCacheHits++;
             return *cached;
         }
         nrDepHashCacheMisses++;
+
+        // H1: cross-process content-hash cache for store-resident sources.
+        // Sits in FRONT of the per-session L1 miss path, keyed on the physical
+        // (immutable, content-addressed) store path rather than the logical dep
+        // key — the cross-process layer L1 (currentDepHashes_) never was. On a
+        // hit we skip the readFile()+depHash() recompute entirely; on a miss we
+        // compute as usual and persist the result for the next process.
+        auto h1Key = h1StorePathKey(key, registry, pools, *state.store);
+        if (h1Key) {
+            nrFileContentCacheEligible++;
+            if (auto cached = lookupFileContentHash(*h1Key)) {
+                nrFileContentCacheHits++;
+                // Mirror resolveDepHash's compute-path L1 write so repeat
+                // same-key lookups in this session stay L1 hits.
+                DepHashValue value{*cached};
+                session.cacheComputedHash(key, ComputedHash{value});
+                return value;
+            }
+        }
+
         auto hashStart = timerStart();
         auto current = resolveDepHash(state, session, dep, registry, pools, parseCachesFor(session), fileTok);
-        attributeDepHashTime(dep.value().key.kind, elapsedUs(hashStart));
+        attributeDepHashTime(key.kind, elapsedUs(hashStart));
         // resolveDepHash caches internally via cacheComputedHash /
-        // cacheVerifiedHash — no write needed here.
+        // cacheVerifiedHash — no L1 write needed here.
+
+        // H1: persist a freshly-computed content hash for a store-resident
+        // path. Only a concrete DepHash digest is cached — never the Missing
+        // sentinel (a GC'd-then-refetched store path reappears with its
+        // addressed content, so a cached "missing" could go stale) and never a
+        // string-variant value (those kinds don't reach h1StorePathKey anyway).
+        if (h1Key && current) {
+            if (auto * digest = std::get_if<DepHash>(&*current)) {
+                if (*digest != sentinel(SentinelHash::Missing)) {
+                    putFileContentHash(*h1Key, *digest);
+                    nrFileContentCacheStores++;
+                }
+            }
+        }
         return current;
     });
 }

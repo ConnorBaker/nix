@@ -172,17 +172,70 @@ both, and avoids the edge's hot-verify penalty (the dep set is still inline-reso
 once). Distinct from the producer edge (which moved verification into a separate trace); this is pure
 record-time dedup of identical dep VECTORS across traces. Unexplored.
 
-## Recommended order (tractable → architectural) — REVISED after the mtime rejection
-1. **H1 (persist the content-hash cache across processes)** — now the most tractable hot win that works
-   on EVERY accessor (incl. the bench's `-f /path` posix path, where H2' can't get an OID). Persist
-   `(path_identity → depHash)` keyed by a content-stable key. The key question H1 must answer is the
-   SAME one mtime failed: what makes the cache entry reusable across processes/checkouts? For git-aware
-   accessors the key is the blob OID (H2'); for posix it's… the content hash itself, which is circular
-   (you'd have to read+hash to know the key → no saving). **So H1 alone does NOT help the posix `-f`
-   path** — its reuse key needs H2' (git OID) or a flake/store content-address. H1+H2' together are the
-   real hot fix, scoped to git-aware/flake reads.
-2. **H2' (git blob OID freshness token)** — the content-addressed, checkout-stable token. Scoped to
-   git-aware accessors (flake/git+file). Requires benching a FLAKE-shaped workload (not the `-f` bench).
+## H1 — IMPLEMENTATION DESIGN (2026-06-01, after the store-copy resolution + 3-agent code map)
+
+**The gap, pinned in code.** The warm-verify FileBytes/RawBytes path does NOT consult ANY content-hash
+cache. `dep-resolution-service.cc:371-377` calls `computePathHashedDep(... [](p){ return
+depHash(p.readFile()); })`, and `computePathHashedDep` (`:281-299`) is an unconditional
+`resolve→maybeLstat→readFile→depHash` — no cache lookup. The per-process `fileContentHashCache`
+(eval.cc:83-107) is consulted ONLY on the RECORD path (`recordFileBytesDepViaCache`,
+`EvalEnvironment::readFile`); it is structurally unreachable from the verifier. The 29K hot
+"cacheMisses" are L1 (`VerificationSession::currentDepHashes_`, keyed on the LOGICAL dep key) first-touch
+misses (`verifier.cc:223`); each FileBytes one among them ⇒ exactly one disk re-read at
+`dep-resolution-service.cc:294`. L1 only dedups repeat lookups of the same key WITHIN one session; it's
+empty each process and never content-addressed. **⇒ H1 = a PERSISTED, content-addressed
+store-path→depHash table that the FileBytes verify path consults before reading.**
+
+**The key (RESOLVED, with a correction to the agent's first cut).** Key = the resolved **store-path
+string** `p.path.abs()` (= `/nix/store/<narhash>-source/<relpath>`), where `p =
+resolver.resolve(source, key)` at the verify site. NOT `(DepSource, key)`: a `fromNodeKey` DepSource is
+the lockfile node NAME (`"nixpkgs"`), stable across content edits (types.hh:535-541) → not
+content-addressed → unsound as a cache key. The store-path string embeds the NAR content hash → changes
+iff content changes → content-addressed AND immutable.
+
+**GATE — must be "path is under /nix/store", NOT getFingerprint().** The agent suggested gating on
+`p.accessor->getFingerprint(p.path).second.has_value()` (the `srcToStore` precedent). That is WRONG
+here: storeFS returns `nullopt` for getFingerprint (verified this session — MountedSourceAccessor →
+LocalStoreAccessor → posix → base default nullopt), so that gate would reject exactly the store paths we
+want. The correct gate is **`state.store->isInStore(p.path.abs())`** — store objects are immutable by
+Nix's core invariant, so a hash keyed on the full store-path string is sound FOREVER (no freshness
+token, ever; a content change yields a different store path = a different key = a clean miss; stale
+entries are harmlessly orphaned). Non-store paths (AbsoluteDepSource `getFSSourceAccessor()`, dirty
+`-f /abs`) are NOT cached — they fall through to the existing read path (same conservatism as
+`srcToStore`'s dirty-accessor bypass). This is why H1 helps the FLAKE/store workload (the
+production-relevant repeated-eval case) and is a safe no-op for the `-f /abs` bench — which is correct,
+not a limitation.
+
+**Persistence layer.** New SQLite table `FileContentHashes(store_path TEXT PRIMARY KEY, content_hash
+BLOB NOT NULL)` in the eval-trace store, mirroring the `DirSets` shape (text PK + blob, `INSERT OR
+IGNORE`, eager bulk-load into an in-memory map at open, drained in `flush()`). **No kSchemaEpoch bump:**
+the table is purely additive (schema is `CREATE TABLE IF NOT EXISTS`, runs every open,
+lifecycle.cc:284) AND correctness-independent — it is a pure accelerator (a miss re-reads; an entry is
+never stale because store paths are immutable), so it does NOT participate in trace identity / the
+session-key fold-in. An old DB simply gains an empty table; a new DB read by old code ignores it. (Bump
+would be required only if it fed verification OUTCOME — it does not; it only feeds the HASH VALUE, which
+is then compared exactly as before.)
+
+**Wiring (minimal blast radius — the cleanest seam).** All H1 logic lives in
+`SqliteTraceStorage::resolveCurrentDepHash` (verifier.cc:212) — a METHOD ON THE STORE, so it already has
+the new cache methods, `registry`, `pools`, `state.store`, and runs inside `ExclusiveTraceStorageAccess`.
+ZERO changes to the free `resolveDepHash`, its friend decl, or template instantiations. Shape: for a
+FileBytes/RawBytes dep, resolve the SourcePath, if `isInStore` → check the persisted map (hit: return
+stored depHash, no read); on miss, compute as today via `resolveDepHash`, then if `isInStore` persist
+`(abs, hash)`. Non-FileBytes and non-store deps are untouched. The L1 (`currentDepHashes_`) and
+subsumption logic in `resolveDepHash` stay exactly as-is — H1 sits in FRONT of L1's miss path, keyed on
+the physical store path instead of the logical dep key, and is the cross-process layer L1 never was.
+- Leverage: removes the ~29K re-reads on the production flake hot path (the `depHash.contentUs` ~0.12s
+  plus the readFile syscalls + L1-miss recompute behind them). Bench on a FLAKE workload (the `-f` bench
+  won't show it — store-copy only happens for flake/git inputs; `-f /abs/nixpkgs` reads posix, not
+  store). Soundness: store-path immutability (no token), pinned by a record→evict-L1→verify test.
+
+## Recommended order (tractable → architectural) — REVISED 2026-06-01 (H1 design resolved)
+1. **H1 (persist store-path→depHash, gated on isInStore)** — IN PROGRESS. The hot fix for the flake/store
+   workload; design above. Sound by store-path immutability, no freshness token, no epoch bump.
+2. ~~H2' (git blob OID)~~ — RETIRED on this fork (no lazy-trees; store-copy makes the store path the
+   token). Only relevant to a lazy-trees fork or the dirty/`-f /abs` path (where H1's isInStore gate
+   declines and the read path stands).
 3. **C1 (fire-and-forget recording)** — the cold fix; removes recording from the eval critical path.
    Accessor-independent (helps every workload).
 4. **H3 / C2 / C3** — architectural follow-ons.

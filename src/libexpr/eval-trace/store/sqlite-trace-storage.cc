@@ -537,6 +537,26 @@ DepKeySetId SqliteTraceStorage::getOrCreateDepKeySet(
     return id;
 }
 
+// H1: the whole table is bulk-loaded into `fileContentHashByStorePath` at open
+// (see bulkLoadAllLocked), so a lookup is purely in-memory — a DB miss here
+// means the row genuinely does not exist, no fallback query needed.
+std::optional<DepHash> SqliteTraceStorage::lookupFileContentHash(const std::string & storePath)
+{
+    auto it = fileContentHashByStorePath.find(storePath);
+    if (it != fileContentHashByStorePath.end())
+        return it->second;
+    return std::nullopt;
+}
+
+void SqliteTraceStorage::putFileContentHash(const std::string & storePath, const DepHash & hash)
+{
+    // write-once: first writer wins; later identical computes are no-ops
+    // (store paths are immutable, so the value can never legitimately differ).
+    auto [it, inserted] = fileContentHashByStorePath.try_emplace(storePath, hash);
+    if (inserted)
+        pendingFileContentHashes.push_back({storePath, hash});
+}
+
 TraceId SqliteTraceStorage::getOrCreateTrace(
     const TraceHash & traceHash,
     const FullTraceHash & fullHash,

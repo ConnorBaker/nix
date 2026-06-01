@@ -240,6 +240,23 @@ static const char * schema = R"sql(
         dirs    BLOB NOT NULL
     ) STRICT;
 
+    -- H1: cross-process content-hash cache for store-resident source files.
+    -- Keyed by the FULL store path string (/nix/store/<narhash>-source/<rel>),
+    -- which is a content address: store objects are immutable, so a recorded
+    -- (store_path -> content_hash) entry is sound FOREVER (a content change
+    -- yields a different store path = a different key = a clean miss; stale
+    -- entries are harmlessly orphaned). This lets warm verification skip the
+    -- readFile()+depHash() recompute that dep-resolution-service.cc otherwise
+    -- runs unconditionally for every FileBytes dep. PURE ACCELERATOR: a miss
+    -- re-reads, and the stored value feeds the HASH only (never the verify
+    -- OUTCOME directly), so it does NOT participate in trace identity and
+    -- needs no kSchemaEpoch bump. Only store-resident paths are cached
+    -- (isInStore gate); non-store/dirty paths fall through to the read path.
+    CREATE TABLE IF NOT EXISTS FileContentHashes (
+        store_path   TEXT PRIMARY KEY,
+        content_hash BLOB NOT NULL
+    ) STRICT;
+
 )sql";
 
 // ── Constructor / Destructor ─────────────────────────────────────────
@@ -424,6 +441,12 @@ SqliteTraceStorage::SqliteTraceStorage(
         "INSERT OR IGNORE INTO DirSets(ds_hash, dirs) VALUES (?, ?)");
     st.getAllDirSets.create(st.db,
         "SELECT ds_hash, dirs FROM DirSets");
+
+    // FileContentHashes (H1: cross-process store-path -> content-hash cache)
+    st.insertFileContentHash.create(st.db,
+        "INSERT OR IGNORE INTO FileContentHashes(store_path, content_hash) VALUES (?, ?)");
+    st.getAllFileContentHashes.create(st.db,
+        "SELECT store_path, content_hash FROM FileContentHashes");
 
     // SessionRuntimeRoots (session metadata for runtime-fetched inputs)
     st.insertRuntimeRoot.create(st.db,
@@ -618,6 +641,21 @@ void SqliteTraceStorage::bulkLoadAllLocked(State & st)
             pools.dirSets.emplace(std::string(use.getStr(0)), deserializeDirSet(blob, size));
         }
     }
+    // H1: bulk-load (store_path -> content_hash) into the in-memory map so the
+    // warm-verify lookup is purely in-memory (no per-dep DB query). Only
+    // well-formed digest-sized rows are loaded; anything else is skipped (it
+    // would just be re-read + re-recorded, harmless).
+    {
+        auto use(st.getAllFileContentHashes.use());
+        while (use.next()) {
+            auto storePath = std::string(use.getStr(0));
+            auto [hashBlob, hashSize] = use.getBlob(1);
+            if (hashBlob && hashSize == kEvalTraceDigestSize) {
+                fileContentHashByStorePath.emplace(
+                    std::move(storePath), evalTraceHashFromBlob<DepHash>(hashBlob, hashSize));
+            }
+        }
+    }
 }
 
 void SqliteTraceStorage::flush(const ExclusiveTraceStorageAccess & ea)
@@ -699,6 +737,17 @@ void SqliteTraceStorage::flush(const ExclusiveTraceStorageAccess & ea)
         use.exec();
     }
     pendingDepKeySets.clear();
+
+    // H1: drain (store_path, content_hash) rows. INSERT OR IGNORE — no ordering
+    // constraint (FileContentHashes is referenced by no other table), and a
+    // crash that loses these is harmless (next eval re-reads + re-records).
+    for (auto & fc : pendingFileContentHashes) {
+        auto use(st.insertFileContentHash.use());
+        use(fc.storePath);
+        bindTaggedEvalTraceHash(use, fc.contentHash);
+        use.exec();
+    }
+    pendingFileContentHashes.clear();
 
     for (auto & t : pendingTraces) {
         auto use(st.insertTraceWithId.use());

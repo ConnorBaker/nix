@@ -110,6 +110,16 @@ extern Counter nrDepHashCacheMisses;
 extern Counter nrDepHashStructuredMisses;
 extern Counter nrContentSubsumptionSkips;
 
+// ── H1: cross-process store-path content-hash cache ─────────────────
+// `Hits` = a FileBytes/RawBytes verify served the content hash from the
+// persisted store-path cache (no readFile). `Stores` = a cold compute
+// recorded a new (store_path -> hash) entry. `Eligible` = FileBytes/RawBytes
+// deps that resolved to a store-resident Registered path (the population H1
+// can serve from); compare against Hits to see the cross-process hit rate.
+extern Counter nrFileContentCacheHits;
+extern Counter nrFileContentCacheStores;
+extern Counter nrFileContentCacheEligible;
+
 // ── Recovery dep recomputation breakdown ────────────────────────────
 extern Counter nrRecoveryDepRecomputeUs;
 extern Counter nrRecoveryDepRecomputeCount;

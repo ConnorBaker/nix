@@ -88,6 +88,11 @@ Counter nrDepHashCacheMisses;
 Counter nrDepHashStructuredMisses;
 Counter nrContentSubsumptionSkips;
 
+// ── H1: cross-process store-path content-hash cache ─────────────────
+Counter nrFileContentCacheHits;
+Counter nrFileContentCacheStores;
+Counter nrFileContentCacheEligible;
+
 // ── Recovery dep recomputation breakdown ────────────────────────────
 Counter nrRecoveryDepRecomputeUs;
 Counter nrRecoveryDepRecomputeCount;

@@ -107,6 +107,7 @@ sources = files(
   'eval-trace/store/nar-identity.cc',
   'eval-trace/store/derived-store-path.cc',
   'eval-trace/store/store-path-availability.cc',
+  'eval-trace/store/file-content-cache.cc',
   'eval-trace/store/runtime-fetch-identity.cc',
   'eval-trace/store/call-arg-nixbinding.cc',
   'eval-trace/store/dep-overapprox.cc',
