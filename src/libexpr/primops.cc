@@ -1036,8 +1036,8 @@ static RegisterPrimOp primop_abort(
       Abort Nix expression evaluation and print the error message *s*.
     )",
      .impl = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
-         /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 /
-            Tradeoff 7). The abort message is embedded in the error
+         /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2).
+            The abort message is embedded in the error
             shown to the user; resolve SourceVirtual context so the
             user sees real storepath text, not the placeholder. */
          NixStringContext context;
@@ -1064,8 +1064,8 @@ static RegisterPrimOp primop_throw(
       (which is not the case for `abort`).
     )",
      .impl = [](EvalState & state, const PosIdx pos, Value ** args, Value & v) {
-         /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 /
-            Tradeoff 7). The throw message is shown verbatim to the
+         /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2).
+            The throw message is shown verbatim to the
             user; resolve SourceVirtual context so the message
             displays real storepath text. */
          NixStringContext context;
@@ -1085,8 +1085,8 @@ static void prim_addErrorContext(EvalState & state, const PosIdx pos, Value ** a
         state.forceValue(*args[1], pos);
         v = *args[1];
     } catch (Error & e) {
-        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 /
-           Tradeoff 7). The error-context message is embedded into
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2).
+           The error-context message is embedded into
            the error trace shown to the user; resolve SourceVirtual
            context so trace frames display real storepath text. */
         NixStringContext context;
@@ -1380,7 +1380,7 @@ static RegisterPrimOp primop_deepSeq({
 static void prim_trace(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     state.forceValue(*args[0], pos);
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 / Tradeoff
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2
        7). The string body is embedded in the trace line on stderr;
        a SourceVirtual placeholder render would be displayed verbatim.
        Resolve before embedding so traces show real paths. */
@@ -1422,7 +1422,7 @@ static void prim_warn(EvalState & state, const PosIdx pos, Value ** args, Value 
 {
     // We only accept a string argument for now. The use case for pretty printing a value is covered by `trace`.
     // By rejecting non-strings we allow future versions to add more features without breaking existing code.
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 / Tradeoff
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2
        7). The warning body is rendered to stderr/the warn-log; a
        SourceVirtual placeholder render would be displayed verbatim.
        Resolve before embedding. */
@@ -2230,10 +2230,10 @@ static void prim_baseNameOf(EvalState & state, const PosIdx pos, Value ** args, 
     auto s = state.coerceToString(
         pos, *args[0], context, "while evaluating the first argument passed to builtins.baseNameOf", false, false);
 
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
        sites). Body-slicing primops reject SourceVirtual context to
-       preserve the deferred-materialisation invariant — see
-       Tradeoff 8. The output body is a slice of the input body, so
+       preserve the deferred-materialisation invariant — see §6.2.
+       The output body is a slice of the input body, so
        the placeholder render text would be truncated and
        `rewriteStrings` (literal substring search) would fail to
        match. Throwing here forces callers to materialise the source
@@ -2286,10 +2286,10 @@ static void prim_dirOf(EvalState & state, const PosIdx pos, Value ** args, Value
         auto path = state.coerceToString(
             pos, *args[0], context, "while evaluating the first argument passed to 'builtins.dirOf'", false, false);
 
-        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
            sites). Body-slicing primops reject SourceVirtual context
-           to preserve the deferred-materialisation invariant — see
-           Tradeoff 8. `path->substr(0, lastSlash)` chops off the
+           to preserve the deferred-materialisation invariant — see §6.2.
+           `path->substr(0, lastSlash)` chops off the
            placeholder body's tail, so `rewriteStrings` (literal
            substring search) would fail to match. Throwing here
            forces callers to materialise the source up front. The
@@ -2956,7 +2956,7 @@ static void prim_toFile(EvalState & state, const PosIdx pos, Value ** args, Valu
     auto contents =
         state.forceString(*args[1], context, pos, "while evaluating the second argument passed to builtins.toFile");
 
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
        sites). Resolve `SourceVirtual` placeholders to real
        storepaths, rewrite the body, and treat resolved paths as
        Opaque references. Without this fix, the loop below would
@@ -5153,10 +5153,10 @@ static void prim_substring(EvalState & state, const PosIdx pos, Value ** args, V
     auto s = state.coerceToString(
         pos, *args[2], context, "while evaluating the third argument (the string) passed to builtins.substring");
 
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
        sites). Body-slicing primops reject SourceVirtual context to
-       preserve the deferred-materialisation invariant — see
-       Tradeoff 8. `s->substr(start, _len)` carves user-controlled
+       preserve the deferred-materialisation invariant — see §6.2.
+       `s->substr(start, _len)` carves user-controlled
        bytes out of the body; if a placeholder render is in the
        slice's range it will be partial, defeating the literal
        substring rewrite by `rewriteStrings`. Throwing here forces
@@ -5227,7 +5227,7 @@ static void prim_hashString(EvalState & state, const PosIdx pos, Value ** args, 
     if (!ha)
         state.error<EvalError>("unknown hash algorithm '%1%'", algo).atPos(pos).debugThrow();
 
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
        sites). Previously context was discarded — if the input
        string carries a `SourceVirtual` placeholder, hashing the body
        produced `hash("/<base32>")` instead of `hash(realStorePath)`.
@@ -5620,15 +5620,15 @@ static void prim_replaceStrings(EvalState & state, const PosIdx pos, Value ** ar
             .atPos(pos)
             .debugThrow();
 
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
-       sites and Tradeoff 8). `replaceStrings` is structurally
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
+       sites). `replaceStrings` is structurally
        harder than baseNameOf/dirOf/substring: `from[i]` bodies are
        used as literal search keys, `to[j]` bodies are spliced into
        the result, and `s` carries the input context. A SourceVirtual
        placeholder render in any list-element body could be
        misinterpreted as a search key; the cargo-workspace pattern
        (multiple SourceVirtual elems sharing a render) compounds the
-       confusion. Per Tradeoff 8's deferral rationale, the safest
+       confusion. Per §6.2's deferral rationale, the safest
        stop-gap is Option-B (throw on any SourceVirtual context in
        any of the three inputs); a future Phase-3 typestate could
        distinguish "search key" vs "context-bearing reference" intent

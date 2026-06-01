@@ -15,7 +15,7 @@ namespace nix {
  * (`switch-source-accessor.hh`): Layer retries on a miss (fall-through),
  * whereas Switch commits to the longest-prefix-matching child
  * authoritatively. The two N-ary combinators are distinct; neither
- * reduces to the other. See `doc/tecnix-survey/PROPOSAL.md` §6.7.
+ * reduces to the other. See `doc/tecnix-survey/PROPOSAL.md` §1.3.
  *
  * The struct is exposed here (rather than hidden in the `.cc`) so
  * verification tests can `dynamic_pointer_cast<UnionSourceAccessor>`

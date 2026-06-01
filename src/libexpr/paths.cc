@@ -286,7 +286,7 @@ StringMap EvalState::resolveSourceVirtualContext(const NixStringContext & contex
     /* Item 2 (§6.1.1): a deferred-mount `Opaque{fakePath}` stand-in
        must be rewritten to its real CA path before its text is
        serialised. This is the SINGLE point that covers every
-       boundary, because the §6.4.3 cover-fix sweep made
+       boundary, because the §6.2 cover-fix sweep made
        `resolveSourceVirtualContext` the universal pre-serialise step:
        every CLI output mode, eval-cache write, and diagnostic embedder
        calls it (paired with `ensureLazyPathsCopied`) and applies the
@@ -465,7 +465,7 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
                the slow-path Item-2 fake stand-in, `candidate` is the REAL
                canonical CA path keyed on the known narHash, so no fake
                path can persist into a `.drv`, lockfile, or eval cache, and
-               it is sound in pure eval too (no §6.4.7(c) hazard). The
+               it is sound in pure eval too (no §6.1 hazard). The
                (pathological) stale-lock mismatch — a rev whose recorded
                narHash disagrees with the rev's actual content, i.e. a
                corrupted lock — still fires at the copy boundary
@@ -509,8 +509,9 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
        fake. A consumer that reads only metadata (`outPath`/`rev`/
        `lastModified`, never `narHash`, never bytes, never a
        derivation) then walks ZERO times. This closes the one axis
-       where DetSys `lazy-trees=true` is more lazy than us (§8.6 gap
-       1) — but soundly: the fake path carries a registry discriminator
+       where DetSys `lazy-trees=true` is more lazy than us (the
+       pure-eval flake-input row, §8.5) — but soundly: the fake path
+       carries a registry discriminator
        (`virtualMounts_`) and is rewritten to the real CA path by
        `ensureLazyPathCopied`/`devirtualizeStorePath` at every hard
        demand, so it never reaches a derivation or the lockfile.
@@ -541,7 +542,7 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
        reach this slow path unlocked is the flake-self of a relative
        `path:` flake; such a flake CAN have a fully-locked `flake.lock`
        and thus an eval cache, into which a fake `Opaque` store path
-       would persist unsoundly (PROPOSAL.md §6.4.7(c) reason 2). Impure
+       would persist unsoundly (PROPOSAL.md §6.1 reason 2). Impure
        eval has no eval cache (`useEvalCache && pureEval` gate, see
        `openEvalCache`), so the fake path can never persist there.
        Extending the defer to the pure-eval flake-self is a sound
@@ -585,7 +586,7 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
        guaranteeing `devirtualizeStorePath`'s rewrite is a genuine
        substitution. The `virtualMounts_` registry below is the
        discriminator; see its doc-comment for why this is not the
-       §6.4.7(c) failure mode. */
+       §6.1 failure mode. */
     auto storePath = [&] {
         if (!deferStorePath) {
             debug(

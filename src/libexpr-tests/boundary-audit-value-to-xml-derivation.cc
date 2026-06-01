@@ -57,7 +57,7 @@ TEST_F(BoundaryAuditValueToXmlDerivationTest, DerivationDrvPathOutPathContextThr
        contains a SourceVirtual element. The XML output itself will
        contain placeholder bodies (XML attribute values are not
        resolved by this serialiser; resolution is the caller's
-       responsibility post-§6.4.3 — see boundary-audit-nix-env-query-xml.cc).
+       responsibility post-§6.2 — see boundary-audit-nix-env-query-xml.cc).
        What this audit verifies is that the cover-fix shape (defensive
        copyContext on the isDerivation arm) successfully threads the
        SourceVirtual element through to the caller's accumulator so

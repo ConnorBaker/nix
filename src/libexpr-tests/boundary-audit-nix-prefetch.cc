@@ -19,12 +19,12 @@ namespace nix {
  *     `outputHashMode` body is compared to `"recursive"`. A
  *     `SourceVirtual` placeholder render wouldn't equal the literal
  *     `"recursive"` so the comparison is structurally safe — but
- *     the cover-fix discipline (PROPOSAL.md §6.4.3) is to thread
+ *     the cover-fix discipline (PROPOSAL.md §6.2) is to thread
  *     the accumulator through every observation site uniformly,
  *     and the line shares the function-scope context with the URL
  *     site at zero extra cost.
  *
- * Cover-fix shape (matches §6.4.3 canonical: `getFlake`,
+ * Cover-fix shape (matches §6.2 canonical: `getFlake`,
  * `hashString`): switch each 3-arg `forceString` to the 4-arg form
  * with a `NixStringContext &` accumulator, then call
  * `resolveSourceVirtualContext` + `ensureLazyPathsCopied` +
@@ -37,7 +37,7 @@ namespace nix {
  * value, drives the same `forceString` + resolve + rewrite +
  * `rewriteStrings` sequence, and asserts the resulting URL string
  * contains no placeholder text. This is regression-gate framing
- * (PROPOSAL.md §6.4.2.1): if the cover-fix is removed or skewed
+ * (PROPOSAL.md §6.2): if the cover-fix is removed or skewed
  * (3-arg `forceString` reintroduced, resolve step elided),
  * `detectLeak` flags the placeholder render in the URL bytes.
  */

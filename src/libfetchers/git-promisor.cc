@@ -419,7 +419,7 @@ struct HttpGitPromisorProvider : GitPromisorProvider
  * ssh stores use), so a user who relies on git+ssh for authentication
  * gets exactly their normal ssh behaviour. `SSHMaster` honours
  * `NIX_SSHOPTS`; it does NOT read git's `GIT_SSH_COMMAND` /
- * `core.sshCommand` (a deliberate scope choice — see PROPOSAL §6.2.1).
+ * `core.sshCommand` (a deliberate scope choice — see PROPOSAL §6.3).
  */
 
 struct SshGitPromisorProvider : GitPromisorProvider

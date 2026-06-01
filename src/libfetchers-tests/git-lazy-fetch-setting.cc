@@ -1,5 +1,5 @@
 /* The `git-lazy-fetch` setting and its `NIX_GIT_LAZY_FETCH` env-var
- * default (PROPOSAL.md §6.2.1).
+ * default (PROPOSAL.md §6.3).
  *
  * These pin the precedence contract directly on `fetchers::Settings`,
  * which is the only NON-VACUOUS way to test it: the functional test

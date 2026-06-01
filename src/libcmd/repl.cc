@@ -593,7 +593,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
         Value v;
         evalString(arg, v);
         auto suspension = logger->suspend();
-        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
            sites). Both arms used to leak `SourceVirtual` placeholder
            render strings: the nString fast-path wrote `v.string_view()`
            raw, and `printValue` was called with no context. Now both

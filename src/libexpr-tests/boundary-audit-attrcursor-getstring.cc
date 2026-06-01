@@ -17,7 +17,7 @@ namespace nix {
  *                                : v.path().to_string();
  *
  * `forceValue()` (eval-cache.cc:411-453) was patched in PROPOSAL.md
- * §6.4.3 to resolve `SourceVirtual` placeholders at write time so
+ * §6.2 to resolve `SourceVirtual` placeholders at write time so
  * the cache row is clean. But the fall-through return at line 588
  * uses `v.string_view()` directly on the in-memory `Value`, which
  * still carries the original placeholder render in its body and

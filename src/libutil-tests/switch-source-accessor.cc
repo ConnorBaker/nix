@@ -6,7 +6,7 @@
    the nearest-prefix mount's answer (a miss is final), whereas a Layer
    would fall through to a shorter-prefix child. This is the correct
    mount semantics — and the reason MountedSourceAccessor is NOT a
-   Layer([StripPrefix...]). See doc/tecnix-survey/PROPOSAL.md §6.7.
+   Layer([StripPrefix...]). See doc/tecnix-survey/PROPOSAL.md §1.3.
 
    Property tests (the category theory tells us what to check):
    - Sw1 (resolution law): ∀ mounts,x — read == nearest-prefix owner's
@@ -41,7 +41,7 @@ namespace {
    that every existing `catch (Error&); compare bool threw` property
    collapses to) but that the EXACT dynamic type and the inner accessor's
    own message survived the combinator unchanged (the Either-equivalence
-   that the §6.8.1 Item-5 regression violated: a Union masked the git
+   that the §6.6 Item-5 regression violated: a Union masked the git
    workdir's RestrictedPathError as a generic FileNotFound).
 
    `CustomBespokeError` sits under `SourceAccessorError` (a sibling of
@@ -166,7 +166,7 @@ TEST(SwitchSourceAccessor, AuthoritativeCommitNoFallthrough)
 }
 
 /* Contrast: a Layer over the same data DOES fall through. Pins the
-   behavioural difference that the §6.7 counterexample rests on. */
+   behavioural difference that the §1.3 counterexample rests on. */
 TEST(SwitchSourceAccessor, LayerWouldFallThroughUnlikeSwitch)
 {
     auto a = withFiles({{"a/b/c", "from-root"}});
@@ -696,7 +696,7 @@ RC_GTEST_PROP(SwitchSourceAccessor, SiblingConesIndependent, (const CanonPath & 
     RC_ASSERT(sw1->readFile(query) == sw2->readFile(query));
 }
 
-/* ---------- ERROR-CHANNEL laws (PROPOSAL §6.8.1, the Item-5 regression) ---------- */
+/* ---------- ERROR-CHANNEL laws (PROPOSAL §6.6, the Item-5 regression) ---------- */
 
 /* L-ErrPreserve (Switch arm) — Switch DIRECT-FORWARDS reads, so the inner
    accessor's bespoke exception type AND its message survive the
@@ -707,7 +707,7 @@ RC_GTEST_PROP(SwitchSourceAccessor, SiblingConesIndependent, (const CanonPath & 
    succeeds) AND that the leaf's own message was derived from — not
    replaced by — the wrapper (the nonce is still present).
 
-   NON-VACUITY: this is the property that the §6.8.1 regression shape — a
+   NON-VACUITY: this is the property that the §6.6 regression shape — a
    Switch that did maybeLstat-then-read and rethrew the miss as its own
    generic `FileNotFound`, the way Union does — fails, while passing all
    seven existing Sw1–Sw7 props (those only compare a BOOLEAN `threw` /
@@ -754,7 +754,7 @@ RC_GTEST_PROP(SwitchSourceAccessor, ErrorTypePreservedAcrossForward, (const Cano
        Union try the next accessor (the root), which serves it — so
        `maybeLstat` succeeds and `readFile` returns the root's bytes.
 
-   This pins the Layer-vs-Switch asymmetry of PROPOSAL §6.7 on the error
+   This pins the Layer-vs-Switch asymmetry of PROPOSAL §1.3 on the error
    channel (Sw2 pinned it only on presence). `lstat` is included in the
    surface to show the throwing-method dual as well as the silent probe. */
 RC_GTEST_PROP(SwitchSourceAccessor, DualSwitchCommitsLayerFallsThrough, (const CanonPath & mp, const CanonPath & p))

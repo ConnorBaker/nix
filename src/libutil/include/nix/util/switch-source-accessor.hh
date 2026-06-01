@@ -31,7 +31,7 @@ namespace nix {
  * `Switch.read(/a/b/c)` is not-found, but the Layer falls through to
  * `A` and finds it). Authoritative-commit is the correct mount
  * semantics — a filesystem mounted at `/mnt` shadows whatever lay
- * beneath it. See `doc/tecnix-survey/PROPOSAL.md` §6.7.
+ * beneath it. See `doc/tecnix-survey/PROPOSAL.md` §1.3.
  *
  * The per-mount identity that DOES hold: a single mount's path-action
  * is exactly `StripPrefix(p)(a)` (no shadowing is possible with one

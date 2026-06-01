@@ -49,7 +49,7 @@ std::string resolveMirrorUrl(EvalState & state, const std::string & url)
     if (mirrorList->value->listSize() < 1)
         throw Error("mirror URL '%s' did not expand to anything", url);
 
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
        sites). The mirror string is concatenated into a URL and
        fetched, so a `SourceVirtual` placeholder in the body would
        leak into the network request as `/<base32>`. Resolve the
@@ -229,7 +229,7 @@ static int main_nix_prefetch_url(int argc, char ** argv)
             Value & v(*findAlongAttrPath(*state, attrPath, autoArgs, vRoot).first);
             state->forceAttrs(v, noPos, "while evaluating the source attribute to prefetch");
 
-            /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3
+            /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2
                bypass sites). The URL extracted from `urls` is
                handed to `prefetchFile` and downloaded; the
                `outputHashMode` value is compared to "recursive";

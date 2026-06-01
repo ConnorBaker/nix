@@ -298,7 +298,7 @@ EvalState::EvalState(
            behaviour, which was already a `Union` that resolved store reads
            via `maybeLstat` dispatch. `composeFingerprint`'s Union case (no
            own suffix; first child with identity wins) is unchanged. See
-           doc/tecnix-survey/PROPOSAL.md §6.7/§6.8 for the source-view
+           doc/tecnix-survey/PROPOSAL.md §1.3/§6.6 for the source-view
            algebra and the Layer-vs-Switch distinction. */
         auto accessor =
             settings.pureEval

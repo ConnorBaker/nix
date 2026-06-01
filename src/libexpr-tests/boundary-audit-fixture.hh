@@ -164,7 +164,7 @@ protected:
     };
 
     /**
-     * Brittleness note (PROPOSAL.md §6.4.3 follow-up):
+     * Brittleness note (PROPOSAL.md §6.2 follow-up):
      * `detectLeak` does literal substring search for two forms only:
      *   - body form `/<base32>` from `placeholder.render()`
      *   - context wire form `~<base32>:<name>` from
@@ -174,7 +174,7 @@ protected:
      * (`/<base32>` → `\/<base32>` in some emitters), hex-decodes,
      * or otherwise mutates the placeholder bytes between rendering
      * and serialisation, the audit will silently pass a real leak.
-     * No current §6.4.3 boundary applies such transforms — but the
+     * No current §6.2 boundary applies such transforms — but the
      * detector is hard-coupled to today's render format. If the
      * placeholder format ever extends (longer hash, structured
      * suffix, alternative encoding), detectLeak must be updated to

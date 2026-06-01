@@ -264,7 +264,7 @@ TEST_F(ParseCacheTest, SideTableClearedOnResetFileCache)
     /* The side-table maps StringData* → fingerprint. It must be
        cleared on `resetFileCache` (the REPL :reload hook) so that
        GC StringData address reuse can't poison cross-eval reads.
-       PROPOSAL.md §4.5 calls this out explicitly. */
+       PROPOSAL.md §2.E calls this out explicitly. */
     EXPECT_EQ(state.stringFingerprints->size(), 0u);
 
     /* Manually inject an entry using a string we keep alive. */

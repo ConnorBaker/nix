@@ -9,8 +9,10 @@ the dirty store path from it: files unchanged from the last commit are
 reflinked (copy-on-write, on filesystems such as btrfs/xfs) or hardlinked from
 the base, and only the changed files are written. Editing one file in a large
 monorepo therefore allocates storage for that one file rather than for the
-whole tree. The assembled path's NAR hash is recomputed and verified before it
-is registered, so its content always matches its store-path name.
+whole tree. The assembled path is named from the recomputed NAR hash of its
+actual contents, so its content always matches its store-path name; if the
+assembled result would not match the path the evaluator expects, Nix falls
+back to a full copy.
 
 Relatedly, a flake input that is already locked to a Git revision is no longer
 walked an extra time on a cold store just to recompute the NAR hash that the

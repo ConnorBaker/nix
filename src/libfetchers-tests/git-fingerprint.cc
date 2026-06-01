@@ -639,7 +639,7 @@ TEST_F(GitFingerprintTest, ResolveSubsetSubpathViewToSyntheticGitTree)
    only check pathExists/readFile, never narHash, and hand-pick accept-sets
    where every accepted directory has an accepted child.
 
-   The bug (PROPOSAL.md §6.4.9): when an accepted path is a DIRECTORY with
+   The bug (PROPOSAL.md §6.3): when an accepted path is a DIRECTORY with
    NO accepted children (a trie leaf), `synthesiseTreeRecursive` splices
    the entire base subtree verbatim by OID — including filter-rejected
    files — whereas the filtered walk renders that directory empty. So the
@@ -692,7 +692,7 @@ TEST_F(GitFingerprintTest, SynthesiseTreeNarHashMatchesFilteredWalk_DirectoryLea
 
     EXPECT_EQ(syntheticNar, filteredWalkNar)
         << "synthetic-tree narHash differs from the filtered-walk narHash — the synthesiseTree "
-           "shortcut is NOT equivalent to the walk it replaces (directory-leaf divergence, §6.4.9)";
+           "shortcut is NOT equivalent to the walk it replaces (directory-leaf divergence, §6.3)";
 
     /* Bonus invariant: the synthetic narHash must not depend on a
        FILTER-REJECTED file's content (it isn't in the synthetic tree). */
@@ -742,7 +742,7 @@ TEST_F(GitFingerprintTest, ReadBlobConcurrent)
     EXPECT_EQ(mismatches.load(), 0);
 }
 
-/* The verbatim-splice leaves the §6.4.9 audit flagged as having ZERO
+/* The verbatim-splice leaves the §6.3 audit flagged as having ZERO
    narHash-equivalence coverage: a SYMLINK (mode 120000) and an
    EXECUTABLE regular file (mode 100755) are taken through
    `synthesiseTreeRecursive`'s `else` branch (git-utils.cc ~877) by OID +
@@ -781,7 +781,7 @@ TEST_F(GitFingerprintTest, SynthesiseTreeNarHashMatchesFilteredWalk_SymlinkAndEx
    input-materialisation.cc / derived-path.cc. */
 TEST_F(GitFingerprintTest, _RapidCheckInit) {}
 
-/* THE load-bearing property (the deliverable §6.11/§6.4.9 demanded, for
+/* THE load-bearing property (the deliverable §6.3 demanded, for
    which only hand-picked TEST_F cases existed):
 
      narHash(synthesiseTree(base, S)'s tree) == narHash(filtered walk of
@@ -816,7 +816,7 @@ TEST_F(GitFingerprintTest, _RapidCheckInit) {}
        spurious divergence (synthesise descends by OID; the walk can't
        reach a child under a rejected dir). Because directories are
        independently acceptable, S can still accept a directory while
-       rejecting all its children — the §6.4.9 DIRECTORY-LEAF case
+       rejecting all its children — the §6.3 DIRECTORY-LEAF case
        (accepted dir, no accepted children ⇒ must synthesise an EMPTY
        dir). RC's shrinker drives toward minimal counterexamples.
 

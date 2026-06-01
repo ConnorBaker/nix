@@ -425,7 +425,7 @@ public:
      * already-valid path `from`, materialising its bytes by HARDLINKING
      * `from`'s file tree into `toInfo.path`'s real location (copying any
      * leaf that can't be linked, e.g. cross-device). This is the
-     * copy-once-link-N primitive (PROPOSAL.md §6.10.2 / Perf #1): N store
+     * copy-once-link-N primitive (PROPOSAL.md §2.O / Perf #1): N store
      * paths that share one `SourceContentId` have byte-identical NARs and
      * differ only by name, so the sibling's content can be hardlinked
      * from the first rather than re-walked + re-copied.

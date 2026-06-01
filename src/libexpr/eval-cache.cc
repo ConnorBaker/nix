@@ -445,7 +445,7 @@ Value & AttrCursor::forceValue()
                    (`devirtualizeStorePath`) is currently unreachable here
                    — the defer is gated on impure eval (see `mountInput`)
                    and impure eval has no eval cache (PROPOSAL.md
-                   §6.4.7(c) reason 2) — but we map it anyway so body and
+                   §6.1 reason 2) — but we map it anyway so body and
                    context stay consistent if that gate is ever
                    broadened. For a non-deferred path it is the identity. */
                 canonicalCtx.emplace();
@@ -600,7 +600,7 @@ std::string AttrCursor::getString()
     if (v.type() == nPath)
         return v.path().to_string();
 
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
        sites). `forceValue` above persists a SourceVirtual-resolved
        body to the cache (lines 411-453), but on the *uncached* path
        — when `root->db` is null, when the row was just written this

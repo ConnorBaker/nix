@@ -965,7 +965,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
                    empty). The earlier code took the verbatim-splice
                    `else` branch for a trie-leaf directory, pulling in the
                    whole base subtree incl. filter-rejected files — a
-                   narHash divergence from the walk (PROPOSAL.md §6.4.9).
+                   narHash divergence from the walk (PROPOSAL.md §6.3).
                    Splicing verbatim is sound ONLY for non-tree entries
                    (a file/symlink/gitlink has no contents to filter). */
                 auto subTreeObj = lookupObject(*this, *entryOid, GIT_OBJECT_TREE);

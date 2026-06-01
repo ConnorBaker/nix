@@ -899,7 +899,7 @@ queryJSON(Globals & globals, std::vector<PackageInfo> & elems, bool printOutPath
 {
     using nlohmann::json;
     json topObj = json::object();
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
        sites). Previously the inner loop constructed a fresh
        `NixStringContext` per meta attribute and threw it away,
        leaking any `SourceVirtual` placeholder render strings into
@@ -1090,7 +1090,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
 
     Table table;
     std::ostringstream dummy;
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
        sites). The XML mode writes meta string bodies into XML
        attribute values (`v->string_view()` at the various meta-arm
        sites below) without context accumulation. After Item 1

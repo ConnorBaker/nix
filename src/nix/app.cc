@@ -69,7 +69,7 @@ UnresolvedApp InstallableValue::toApp(EvalState & state)
     if (type == "app") {
         auto [program, context] = cursor->getAttr("program")->getStringWithContext();
 
-        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2
            bypass sites). DetSys hit this in production (commit
            5d6ab843d, "Fix `nix run` on an app with lazy trees
            enabled", Feb 2026). Previously the `SourceVirtual` arm

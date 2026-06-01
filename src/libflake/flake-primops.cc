@@ -45,7 +45,7 @@ PrimOp getFlake(const Settings & settings)
             auto path = state.realisePath(pos, *args[0]);
             callFlake(state, lockFlake(settings, state, path, lockFlags), v);
         } else {
-            /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3
+            /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2
                bypass sites). DetSys hit this in production (commit
                bb3846e6d, #302). Previously `forceStringNoCtx`
                rejected any context, throwing with the placeholder
@@ -160,7 +160,7 @@ static void prim_flakeRefToString(EvalState & state, const PosIdx pos, Value ** 
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.flakeRefToString");
 
-    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+    /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
        sites). String-valued attrs (e.g. `path`, `url`, `dir`) may
        carry a `SourceVirtual` context. Reading `string_view()` raw
        and stuffing it into the `Attrs` map would persist the

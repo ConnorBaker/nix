@@ -3,7 +3,7 @@
 namespace nix {
 
 /**
- * Bypass-site boundary: `builtins.replaceStrings` (Tradeoff 8).
+ * Bypass-site boundary: `builtins.replaceStrings` (§6.2).
  *
  * `prim_replaceStrings` (`src/libexpr/primops.cc:5382-5462`) is the
  * structurally-hardest body-slicing primop:
@@ -17,13 +17,13 @@ namespace nix {
  *   - `to[j]` bodies are spliced into the result wherever the
  *     corresponding `from[i]` matches. Splicing a placeholder render
  *     into the result would defeat downstream `rewriteStrings` for
- *     the same reason as baseNameOf/dirOf/substring (Tradeoff 8) —
+ *     the same reason as baseNameOf/dirOf/substring (§6.2) —
  *     the spliced fragment may be partial, mid-match, or duplicated.
  *   - `s` (the haystack, third arg) carries its own SourceVirtual
  *     context that we'd need to resolve before searching, lest the
  *     match window straddle a placeholder boundary.
  *
- * Per Tradeoff 8's deferral rationale, the post-fix uses Option-B:
+ * Per §6.2's deferral rationale, the post-fix uses Option-B:
  * throw EvalError if any of the three inputs carries SourceVirtual
  * context. The error message points users at `builtins.path` or an
  * explicit derivation. Reversible by a future Phase-3 typestate

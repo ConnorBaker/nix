@@ -451,7 +451,7 @@ RC_GTEST_PROP(StripPrefixSourceAccessor, ActionFaithful, (const CanonPath & p, c
    assert BOTH the exact dynamic type (typed catch) AND that the message
    was derived-from (nonce still present), not replaced.
 
-   This arm catches the §6.8.1 regression purely via the no-rewrite
+   This arm catches the §6.6 regression purely via the no-rewrite
    in-prefix forward: unlike Union, the in-prefix StripPrefix path has no
    `maybeLstat`-then-substitute step that could mask the inner error. The
    off-prefix deny (its own RestrictedPathError) is the SP3 tests above;

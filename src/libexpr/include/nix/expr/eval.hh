@@ -587,9 +587,9 @@ public:
      * key, mounts the live accessor under that fake key (so reads
      * resolve), and records `fakePath → mat` here.
      *
-     * This map IS the discriminator (PROPOSAL.md §6.4.7(c) option ii):
+     * This map IS the discriminator (PROPOSAL.md §6.1 option ii):
      * a store path is a deferred-mount stand-in **iff** it is a key
-     * here. It is NOT the §6.4.7(c) failure mode because:
+     * here. It is NOT the §6.1 failure mode because:
      *   - it never persists (an unlocked flake has no eval cache —
      *     `getFingerprint`→nullopt — and the fake path is rewritten to
      *     the real CA path at every hard-demand boundary before it can
@@ -1146,7 +1146,7 @@ public:
      * (Item 1) variant of source materialisation: the body is what
      * intermediate Nix expressions see; the context carries the
      * resolution metadata for downstream observation boundaries
-     * (see PROPOSAL.md §6.4 and `resolveSourceVirtualContext`).
+     * (see PROPOSAL.md §6.2 and `resolveSourceVirtualContext`).
      */
     void mkSourcePlaceholderString(const SourcePlaceholder & placeholder, std::string_view name, Value & v);
 

@@ -66,7 +66,7 @@ inline void plantOpFiles(MemorySourceAccessor & base, const std::set<CanonPath> 
 /// its message. Lets the error-channel laws assert not merely that
 /// "something threw" (Maybe-equivalence) but that the EXACT dynamic type
 /// AND the inner accessor's own message survived the combinator unchanged
-/// (Either-equivalence — the channel the §6.8.1 Item-5 regression broke
+/// (Either-equivalence — the channel the §6.6 Item-5 regression broke
 /// when a Union masked a git workdir's RestrictedPathError as a generic
 /// FileNotFound). Defined here (rather than per-file) because the
 /// libfetchers-tests build is a unity build (see file header).

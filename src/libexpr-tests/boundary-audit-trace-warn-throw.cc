@@ -3,8 +3,8 @@
 namespace nix {
 
 /**
- * Bypass-site boundary: diagnostic-embedding primops (Tradeoff 7
- * family).
+ * Bypass-site boundary: diagnostic-embedding primops (the
+ * diagnostic-embedding boundary family, PROPOSAL.md §6.2).
  *
  * `prim_trace`, `prim_warn`, `prim_abort`, `prim_throw`, and
  * `prim_addErrorContext` (`src/libexpr/primops.cc`) all embed a
@@ -13,7 +13,7 @@ namespace nix {
  * resolving SourceVirtual context, so a placeholder render would
  * appear verbatim in user-visible diagnostics.
  *
- * Tradeoff 7's original framing classified these as cosmetic — they
+ * Their original framing classified these as cosmetic — they
  * don't persist into derivation hashes or lockfiles. The
  * adversarial-second-pass mitigation switched all five to the
  * canonical resolve-then-rewrite pattern (`copyContext` /

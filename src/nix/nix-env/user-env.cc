@@ -109,7 +109,7 @@ bool createUserEnv(
        the store; we need it for future modifications of the
        environment.
 
-       Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+       Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
        sites): `printAmbiguous` previously took nullptr context — the
        context of any leaf string in the manifest (e.g. a
        `meta.description` carrying a `SourceVirtual` placeholder)

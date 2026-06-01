@@ -967,7 +967,7 @@ TEST(Algebra, SwitchBranchEqualsStripPrefix)
     EXPECT_EQ(swFp, stripFp);
 }
 
-/* ---------- ERROR-CHANNEL laws (PROPOSAL §6.8.1, the Item-5 regression) ----------
+/* ---------- ERROR-CHANNEL laws (PROPOSAL §6.6, the Item-5 regression) ----------
 
    These pin the documented Layer-vs-operator asymmetry on the EXCEPTION
    channel — the channel that every existing equivalence property
@@ -983,7 +983,7 @@ TEST(Algebra, SwitchBranchEqualsStripPrefix)
    reaches the leaf's `readFile`, it throws `FileNotFound` from its own
    miss handler. We assert the thrown type is `FileNotFound` and NOT
    `CustomBespokeError` — pinning that Union MAY mask. This is the
-   DOCUMENTED asymmetry (§6.7 Layer = Alternative/fall-through), not a bug;
+   DOCUMENTED asymmetry (§1.3 Layer = Alternative/fall-through), not a bug;
    it is the contrast partner to the Switch/StripPrefix L-ErrPreserve
    props, and what made the eval-root reshape regress when a git workdir
    accessor was wrapped in a Union. */

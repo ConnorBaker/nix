@@ -94,7 +94,7 @@ static void parseFlakeInputAttr(EvalState & state, const Attr & attr, fetchers::
 #pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (attr.value->type()) {
     case nString: {
-        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
            sites). The body is persisted into the `fetchers::Attrs`
            map (which gets serialised into flake.lock); without this
            resolution a `SourceVirtual` placeholder render would land
@@ -165,7 +165,7 @@ static FlakeInput parseFlakeInput(
                 forceTrivialValue(state, *attr.value, pos);
                 if (attr.value->type() == nString) {
                     /* Boundary cover-fix (Item 1, see PROPOSAL.md
-                       §6.4.3 bypass sites). The url body is fed both
+                       §6.2 bypass sites). The url body is fed both
                        into `attrs["url"]` (and thence
                        `FlakeRef::fromAttrs` → flake.lock) and into
                        `parseFlakeRef` below; either path leaks the
@@ -289,7 +289,7 @@ static Flake readFlake(
 
     if (auto description = vInfo.attrs()->get(state.s.description)) {
         expectType(state, nString, *description->value, description->pos);
-        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3 bypass
+        /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2 bypass
            sites). `flake.description` is stored in the Flake struct
            and propagated into lockfile metadata; without resolving
            context here, a `SourceVirtual` placeholder render in the

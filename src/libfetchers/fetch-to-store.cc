@@ -140,9 +140,10 @@ FilteredShape collectFilteredShape(SourceAccessor & accessor, const CanonPath & 
     accepted.insert(root);
     walkShape(accessor, root, CanonPath::root, filter, sink, accepted);
     auto shape = FilteredShape{sink.finish().hash, std::move(accepted)};
-    /* The filtered-shape walk is the per-eval *structure* cost (§8.6 gap
-       2): the user filter runs over every entry to derive the accepted
-       set + shapeHash, even when blob bytes are deferred. Logging it
+    /* The filtered-shape walk is the per-eval *structure* cost (the
+       filtered-`builtins.path` warm row, §8.5): the user filter runs
+       over every entry to derive the accepted set + shapeHash, even
+       when blob bytes are deferred. Logging it
        makes "why is my filtered source slow?" answerable — it shows the
        walk happened and how large the accepted shape is. */
     debug(

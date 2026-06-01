@@ -99,7 +99,7 @@ static void printValueAsXML(
         if (state.isDerivation(v)) {
             XMLAttrs xmlAttrs;
 
-            /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.4.3
+            /* Boundary cover-fix (Item 1, see PROPOSAL.md §6.2
                bypass sites). The drvPath/outPath bodies under the
                isDerivation arm are written into XML attributes
                without going through the leaf-string nString case

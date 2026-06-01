@@ -20,7 +20,7 @@ namespace nix {
  * `rewrites = { placeholder.render() → resolvedStorePath }`) finds
  * nothing to substitute and the truncated placeholder text leaks
  * downstream. This is `rewriteStrings`' literal-substring failure
- * mode — see PROPOSAL.md §6.4.3 / Tradeoff 8.
+ * mode — see PROPOSAL.md §6.2.
  *
  * Two design options were considered for the cover-fix at these
  * sites:
@@ -28,7 +28,7 @@ namespace nix {
  *   - **Option A — eager resolve before slice.** Resolve the
  *     SourceVirtual context and `rewriteStrings` over the body
  *     *before* slicing. Pro: works as today. Con: defeats the
- *     deferred-materialisation invariant (§6.4.4 — "per-observation,
+ *     deferred-materialisation invariant (§6.2 — "per-observation,
  *     not per-force"); `builtins.baseNameOf src` materialises even
  *     when the result is never observed.
  *   - **Option B — throw on SourceVirtual context (chosen).**
@@ -40,10 +40,10 @@ namespace nix {
  * The audit tests below mint a placeholder, build a string `Value`
  * carrying it, and replay the primop's throw-check inline. Each
  * asserts the throw fires (regression-gate framing per
- * PROPOSAL.md §6.4.2.1 — drive the primop's logic in-process, not
+ * PROPOSAL.md §6.2 — drive the primop's logic in-process, not
  * via shell-out, so the test is decoupled from build-system
  * activation order). `prim_replaceStrings` is intentionally
- * deferred — see Tradeoff 8.
+ * deferred — see §6.2.
  */
 class BoundaryAuditBodySlicingTest : public BoundaryAuditTest
 {

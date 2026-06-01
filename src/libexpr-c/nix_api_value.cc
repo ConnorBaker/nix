@@ -262,7 +262,7 @@ nix_get_string(nix_c_context * context, const nix_value * value, nix_get_string_
            body, including any placeholder render text from
            DownstreamPlaceholder (unbuilt drv outputs) or
            SourcePlaceholder (unmaterialised lazy source trees, see
-           PROPOSAL.md §6.4.3). Callers that need the resolved store
+           PROPOSAL.md §6.2). Callers that need the resolved store
            path text must use `nix_string_realise` which routes
            through `EvalState::realiseString`. The header doc on
            `nix_get_string` spells this out. */
