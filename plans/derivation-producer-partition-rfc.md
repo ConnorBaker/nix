@@ -750,3 +750,86 @@ ALSO a precision/recovery-correctness gap that only manifests under session-key 
 which neither the microcase nor the impure suites exposed. Found by running the functional suites the
 original revert failed — the right oracle. Next step is the recovery-aware producer resolution above,
 THEN the hot bench (§9 task 5) — benching now would measure a shape that breaks flake re-eval.
+
+## §11. Adversarial pass on §9/§10 (2026-05-31) — root cause CONFIRMED by observation, fix VALIDATED viable, with caveats
+
+Re-examined the §10 implementation, my approach, and the proposed fix. The §10 root cause was an
+inference from code-reading; this pass CONFIRMED it by direct instrumentation + DB inspection, and
+surfaced concerns the inference glossed.
+
+### Finding 1 [CONFIRMED, was inferred]: the edge fails at H1, not H2/H3.
+Instrumented the three failure branches of `resolveTraceContextHash` (verifier.cc:251/267) with
+distinguishing warns, ran the failing flake test in the harness. Result: **`H1 lookupCurrentNode(parent=20)
+NULL`** fires (twice — drvA + the other consumer); H2 (verifyTrace fail) and H3 (hash null) never fire.
+So the edge is unresolvable because the producer's CurrentNode is absent in the warm session — NOT
+because the producer verify fails or the hash mismatches. My §10 story holds at the symptom level.
+
+### Finding 2 [CONFIRMED]: session-key rotation is the cause; the producer IS in History under a STABLE key.
+DB inspection of the failing run's cache (Sessions + History):
+- Sessions has **3 distinct session_keys** (record / warm-A / warm-B evals); the producer (attr_path 20)
+  has a Sessions row under **exactly one** (`F67A5FA7…`). The warm eval that failed runs under a
+  different key → `lookupCurrentNode(20)` misses. Session-key rotation CONFIRMED (not just inferred).
+- The producer IS in **History** (count=1), and — decisively — it shares the **same stableRecoveryKey
+  (`89745B…`) as its consumers** (attr_paths 18/19/20/27/… all `89745B…`). The two recovery keys in
+  History are the test's TWO repos (core-basic vs core-fine-grained), not a per-eval rotation.
+- ⇒ A recovery-aware `resolveTraceContextHash` calling `lookupLatestHistoryForAttr(20)` with the
+  consumer's `currentStableRecoveryKey()` WOULD find the producer's History row. **The proposed fix is
+  viable — validated against the artifact, not just plausible.** History PK is
+  `(recovery_key, attr_path_id, trace_id)` and the producer's attr_path is the per-drvHash
+  `__ca:<drvHash>`, so the lookup identity is correct granularity.
+
+### Finding 3 [NEW CONCERN the §10 fix-proposal missed]: the producer's recovery key is the CONSUMER's source identity, not the producer's content.
+The producer's History `recovery_key` is whatever session recorded it FIRST — i.e. the source-identity
+recovery key of the flake that first forced that derivation. Two soundness/precision questions the fix
+must answer BEFORE implementation:
+- (a) **Cross-flake collision:** two different flakes producing a byte-identical derivation (same
+  `__ca:<drvHash>`) would write History rows under DIFFERENT recovery keys (different sources) — so a
+  consumer in flake X looking up by X's recovery key finds only X's producer row. SAFE (correct
+  separation), but it means the producer trace is NOT shared cross-flake (a minor amortization loss,
+  not unsound).
+- (b) **Same-flake rev drift:** flake source rev R1 records producer P@R1 (recovery_key K, since
+  stableRecoveryKey is source-identity-stable across revs of the same flake). At rev R2, if the
+  derivation is unchanged (same drvHash) it's NOT re-recorded (recordCAProducer dedups on Bindings*
+  per-session, and cross-session the History row under K persists) — consumer at R2 bootstraps P@R1 via
+  K. The producer trace's innerDeps were captured at R1; verifyTrace re-checks them against R2's live
+  FS. SOUND (recompute-and-compare), but if R1's innerDeps referenced an R1-specific store path that R2
+  changed, the producer verify correctly fails → consumer re-evals. Correct, possibly imprecise. NEEDS
+  A TEST (the cross-rev producer-reuse case).
+
+### Finding 4 [APPROACH CRITIQUE]: I over-relied on hand-rolled repros that didn't match the oracle.
+I burned significant effort on dir-flake hand-repros that DON'T reproduce the harness's caching
+(TEST_HOME/NIX_STORE_DIR isolation, no substituters) — they missed even under conservative, and an
+inserted `eval-info` probe PERTURBED session state into a spurious pass. Only the meson functional test
+is faithful. LESSON (reinforces the standing one): for cache-state-dependent behaviour, instrument the
+REAL oracle in-place (warns in the code path, DB inspection of the harness's own cache dir) — do not
+build a parallel repro whose caching you haven't proven equivalent.
+
+### Finding 5 [IMPLEMENTATION审, minor]: the dedup-hit edgeOut path is correct but untested.
+`recordCAProducer` populates `edgeOut` from the side-table on the dedup-hit branch
+(trace-session.cc:849) so a SECOND cold consumer of the same producer in one session still emits its
+edge. This path is real (the 607× sharing case) but has no unit pin — if it regressed to leaving
+`edgeOut` default, the second consumer would emit an edge to caKey=0 (root) and mis-resolve. Add a pin.
+
+### Finding 6 [SCOPE, was already known but worth restating]: soundness is preserved throughout.
+Every failure mode observed is fail-CLOSED (over-invalidation / cache miss), never a stale serve. The
+H1-null edge yields `std::nullopt` → consumer miss → fresh eval. So shipping the aggressive shape
+default-OFF carries zero soundness risk to the default path; the blocker is purely
+precision/cache-effectiveness on flake re-eval.
+
+### Synthesized next steps (revised, in dependency order)
+1. **Recovery-aware producer-edge resolution (the fix).** In `resolveTraceContextHash`, when
+   `lookupCurrentNode(parent)` returns null, fall back to `lookupLatestHistoryForAttr(parent)` (the
+   producer's History row under the consumer's stableRecoveryKey), then `verifyTrace` that traceId +
+   publish a CurrentNode for it (mirroring the consumer's history-bootstrap in `verify()`,
+   verifier.cc:1921-1937). Gated to the aggressive path. This is ~the same bootstrap the consumer
+   already does, lifted to the edge.
+2. **Tests, BEFORE re-enabling:** (a) the functional flake suites must pass under aggressive (the
+   oracle that found the bug); (b) cross-rev producer-reuse pin (Finding 3b); (c) dedup-hit edgeOut pin
+   (Finding 5); (d) the no-under-record differential property (§9). 
+3. **Only then** the hot bench (§9 task 5). Benching before the fix measures a flake-broken shape.
+4. **Open the cross-flake amortization question (Finding 3a)** as explicitly out-of-scope-for-now
+   (correctness is fine; it's a sharing-ceiling note).
+
+### Disposition unchanged: aggressive shape IMPLEMENTED, SOUND, gated default-OFF, BLOCKED — but the
+blocker is now a CONFIRMED, well-characterized, fixable gap (recovery-unaware edge resolution) with a
+validated fix path, not an open mystery.
