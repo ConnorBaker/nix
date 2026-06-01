@@ -52,46 +52,64 @@ freshness discriminator or it's unsound (serving a stale hash for a changed file
 - Leverage: removes ~0.12s+ of the 0.40s verify directly; more on file-heavier workloads.
 - Risk: soundness of the freshness key (H2). Storage growth (bounded by distinct source files).
 
-### H2. mtime/inode/size fast-path: skip the re-read when the cheap signal is unchanged (the core fix)
-This is what makes hot ~instant and is the standard trick (Shake/Bazel/ccache all do it). Store, with
-each FileBytes dep, a cheap freshness token — `(mtime, size, inode)` (a single `lstat`, ~ns) — alongside
-the content hash. On verify: `lstat` the file; if `(mtime,size,inode)` matches the recorded token,
-TRUST the recorded content hash (no read, no hash). Only re-read+re-hash when the token differs.
-- This collapses the 29K content re-hashes (0.12s + the readFile I/O) to 29K stat()s (microseconds
-  total) for the overwhelmingly-common unchanged case.
-- Soundness: mtime can be forged (mtime-preserving edits). Two postures: (a) trust mtime (Bazel/Shake
-  default — fast, standard, accepts the adversarial-mtime edge as out-of-scope, which Nix's eval model
-  already does for file-changes-during-eval); (b) mtime as a NEGATIVE filter only (mtime changed ⇒
-  definitely re-hash; mtime same ⇒ still re-hash but this is useless). (a) is the real win and matches
-  every production build cache. Gate behind a setting if conservatism is wanted.
-- Implementation site: `dep-resolution-service.cc:375` (the FileBytes computePathHashedDep lambda) +
-  the FileBytes dep record needs to carry the token (schema bump: add a stat-token column or fold into
-  the dep value). The verify path already has `maybeLstat()` in hand (line 291) — the lstat is ALREADY
-  being done for existence; this reuses its result instead of discarding it.
-- Leverage: this is THE hot fix. Combined with H1's persistence it makes warm verify O(stat per file)
-  not O(read+hash per file). Hot should drop from ~1.0s toward the stat-floor.
+### H2. ~~mtime/inode fast-path~~ — REJECTED (2026-05-31). Use the git blob OID instead (H2').
 
-**H2 PREMISE VALIDATED (adversarial pass, 2026-05-31).** Confirmed the 29K expensive content re-hashes
-are on mtime-STABLE files, not mtime-useless store paths:
-- The interned dep-key strings (Strings table, hot-stats/1 DB) point at nixpkgs SOURCE files
-  (`/home/cbaker2/ext-sources/nixpkgs/pkgs/top-level/all-packages.nix`, `lib/default.nix`, …) — read
-  through the source accessor. `/nix/store` builds are the CHEAP `StorePathAvailability` existence
-  checks (`storePathUs`=0.6ms), NOT the expensive FileBytes (`contentUs`=0.12s). So the expensive
-  re-hashes are SOURCE files.
-- Those source files have real, stable mtimes (set at git-checkout, unchanged across read-only eval
-  processes). So mtime IS a trustworthy freshness signal for exactly the files that dominate hot cost.
-  My initial worry (store paths have epoch-1 normalized mtimes → mtime useless) does NOT apply — store
-  paths aren't the expensive deps.
+**mtime is DEAD for this workload, two independent reasons (user critique, confirmed):**
+1. **`git checkout <commit>` rewrites mtime on every touched file.** The bench (and the real "evaluate a
+   run of commits, then evaluate them again" scenario) checks out each commit → the 2nd pass sees fresh
+   mtimes on files whose CONTENT is byte-identical across commits → ZERO reuse, which is the entire
+   point. Confirmed: a checkout of a different commit rewrites the working-tree mtimes.
+2. **Portability/granularity:** mtime granularity is 1–2s on some filesystems (sub-second edits
+   invisible → unsound) and mtime is unreliable/absent on others. A content cache keyed on mtime is
+   both unsound (coarse granularity) and useless (checkout churn) here.
 
-**Accessor nuance (design must handle):** eval reads source via a `SourceAccessor` (FS accessor for
-dirty `git+file` worktrees; possibly content-addressed/store-backed for locked flake inputs). The
-freshness token must come from the ACCESSOR's `getFingerprint`/lstat, not a raw POSIX `lstat` on a
-reconstructed path — `SourceAccessor::getFingerprint` already exists (used by the `srcToStore` guard,
-eval-environment.cc) and returns nullopt for unfingerprinted (dirty) accessors. Design: token =
-accessor fingerprint if present, else `(mtime,size,inode)` via the accessor's lstat. For the
-content-addressed-source case the accessor fingerprint IS the content identity → even cheaper (no
-stat). This aligns the token source with how the dep's path identity is already resolved
-(`SemanticRegistry`/`input-resolution.cc`).
+So mtime fails on exactly the reuse case we need. The freshness token must be CONTENT-DERIVED but
+cheap-to-obtain (not a re-hash by us).
+
+### H2'. git blob OID as the freshness token (the right design — content-addressed, checkout-stable)
+Git already content-addresses every file: the blob OID (`git rev-parse <rev>:<path>` / index entry) is
+a hash of the file content, **identical across commits when content is identical**, and git computed it
+at checkout (we read it from the index/tree, O(1), NO content hashing by us). VALIDATED: `lib/default.nix`
+has blob OID `15949d1c…` at BOTH HEAD and HEAD~5 (unchanged content → same OID → reuse mtime can't give);
+`git ls-files --stage` / `git rev-parse <rev>:<path>` return it from the index without reading the file.
+
+Design (two-level token, because the OID ≠ the dep hash):
+- The FileBytes dep hash is `depHash(p.readFile())` (blake3/sha256 over raw content,
+  dep-resolution-service.cc:376) — NOT the git blob OID (sha1/sha256 over `"blob <len>\0"+content`, a
+  different preimage). So we can't store the OID AS the hash.
+- Instead: persist a `(path_identity, blob_OID) → depHash` mapping. On verify: get the file's current
+  blob OID cheaply (git index/tree lookup); if it matches the recorded OID, TRUST the recorded `depHash`
+  (no read, no content-hash). Re-read+re-hash only on OID mismatch (genuine content change). The OID is
+  the FRESHNESS KEY; the depHash is the cached VALUE. Survives checkout (content-addressed, not mtime).
+- Cross-commit reuse: this is what makes "evaluate N commits, then again" fast — identical files across
+  commits share an OID → share the cached depHash → no re-hash on the 2nd pass.
+
+**LOAD-BEARING PREREQUISITE (confirmed blocker for the bench's path, viable for flakes):** getting the
+OID cheaply requires the source be read through a GIT-AWARE accessor.
+- The bench uses `nix eval -f /abs/path` → `getFSSourceAccessor()` = plain `PosixSourceAccessor`
+  (eval.cc:464), wrapped in a union with `storeFS`. A posix accessor has NO git awareness;
+  `SourceAccessor::getFingerprint` returns the default `nullopt` (source-accessor.hh:221). So at read
+  time there is NO OID — getting one would require shelling to `git` per file (defeats "cheap"). For the
+  raw `-f /path` and dirty/non-git cases, NO git-OID token → must fall back to content-hash (H1
+  persistence is the only lever there).
+- The FLAKE path (`git+file://` input, locked rev) reads via `GitSourceAccessor` (git-utils.cc), which
+  IS git-aware (has the repo object DB, looks up blob OIDs per path). For locked-git-input flake evals —
+  the production-relevant repeated-eval case — the OID IS available. This is where H2' pays off.
+- So H2' applicability = "source read through a git-aware accessor" (flake/git+file, lazy-trees). The
+  bench's `-f /abs/nixpkgs` does NOT qualify as-is — which means to even MEASURE H2' we must bench a
+  flake-shaped workload (git+file input), not the `-f` shape. Note this before implementing.
+
+Implementation site: the FileBytes verify lambda (dep-resolution-service.cc:375-376) gains an OID
+fast-path; the dep record carries the blob OID (schema addition); the accessor must expose a
+`getBlobOID(path)`-style cheap lookup (GitSourceAccessor has it internally; needs surfacing on the
+SourceAccessor interface or via the SemanticRegistry/input-resolution path that already resolves the
+dep's source identity). The GitRevisionIdentity dep machinery (types.hh) is the existing precedent for
+git-identity-keyed verification — but it's per-REPO (the rev), not per-FILE (the blob); H2' is the
+per-file blob granularity, finer than the existing GitRevisionIdentity.
+
+**Soundness:** the blob OID is a content hash → OID match ⇒ content unchanged (modulo git's
+sha1-collision resistance, same trust class as any content cache). No mtime forgeability. Sound by
+construction; no setting/conservatism needed (unlike mtime).
 
 ### H3. Don't re-verify the whole closure on every hit: a trace-level validity short-circuit
 Even with H1+H2, warm verify still WALKS 170,670 deps (per-dep stat/lookup). The deeper question: can a
@@ -140,15 +158,33 @@ both, and avoids the edge's hot-verify penalty (the dep set is still inline-reso
 once). Distinct from the producer edge (which moved verification into a separate trace); this is pure
 record-time dedup of identical dep VECTORS across traces. Unexplored.
 
-## Recommended order (tractable → architectural)
-1. **H2 (mtime fast-path)** — the core hot fix, standard, highest leverage/cost ratio. Reuses the
-   already-performed `maybeLstat`. Start here.
-2. **H1 (persist content-hash cache)** — complements H2 (persist the (path, token, hash) triple).
-3. **C1 (fire-and-forget recording)** — the core cold fix; removes recording from the eval critical path.
-4. **H3 / C2 / C3** — architectural follow-ons once 1-3 are measured.
+## Recommended order (tractable → architectural) — REVISED after the mtime rejection
+1. **H1 (persist the content-hash cache across processes)** — now the most tractable hot win that works
+   on EVERY accessor (incl. the bench's `-f /path` posix path, where H2' can't get an OID). Persist
+   `(path_identity → depHash)` keyed by a content-stable key. The key question H1 must answer is the
+   SAME one mtime failed: what makes the cache entry reusable across processes/checkouts? For git-aware
+   accessors the key is the blob OID (H2'); for posix it's… the content hash itself, which is circular
+   (you'd have to read+hash to know the key → no saving). **So H1 alone does NOT help the posix `-f`
+   path** — its reuse key needs H2' (git OID) or a flake/store content-address. H1+H2' together are the
+   real hot fix, scoped to git-aware/flake reads.
+2. **H2' (git blob OID freshness token)** — the content-addressed, checkout-stable token. Scoped to
+   git-aware accessors (flake/git+file). Requires benching a FLAKE-shaped workload (not the `-f` bench).
+3. **C1 (fire-and-forget recording)** — the cold fix; removes recording from the eval critical path.
+   Accessor-independent (helps every workload).
+4. **H3 / C2 / C3** — architectural follow-ons.
 
-H2+H1 target "hot should be instant"; C1 targets "cold shouldn't block eval". Both are independent of
-(and more valuable than) the dead producer-partition direction. NEXT: validate H2's premise with a
-measurement — what fraction of the 29K content misses are on files whose mtime is genuinely unchanged
-across the prime→hot boundary (i.e. how much H2 would actually save). Then implement H2 behind a
-setting + bench.
+REVISED framing: "hot instant" for REPEATED FLAKE evals (the production-relevant case) = H1+H2' (git-OID
+content cache). The bench's `-f /abs/path` posix path is a measurement artifact that CANNOT benefit from
+any content-stable token (no git awareness, mtime-churned) — to measure the hot win we must use a
+flake/git+file workload where the accessor exposes OIDs. C1 (cold) is the accessor-independent win.
+
+OPEN QUESTION before implementing (the load-bearing uncertainty): does a locked-git-input flake eval
+actually read each source file through GitSourceAccessor with a cheap per-file OID lookup, on the hot
+path, WITHOUT having already copied the whole tree to the store (in which case the read is from a store
+path and the "OID" is the store path itself)? If lazy-trees reads blobs on demand from the git ODB, H2'
+is a cheap ODB lookup. If the flake source is eagerly copied to /nix/store first, then the source reads
+are store reads (immutable, already content-addressed by store path) and the cache key is the store
+path — EVEN SIMPLER, no git needed, and H1 keyed on store path works directly. MUST determine which,
+because it changes H2' from "surface a git OID API" to "key the content cache on the already-present
+store path." NEXT STEP: instrument/trace a locked-flake hot eval to see whether closures.gnome source
+reads come from the git ODB or from a store-copied tree — that single fact decides the whole hot design.
