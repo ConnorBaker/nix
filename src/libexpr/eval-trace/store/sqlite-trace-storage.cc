@@ -706,12 +706,19 @@ SqliteTraceStorage::CurrentNodeRef SqliteTraceStorage::publishStateChange(
     auto nodeStamp = allocateNodeStamp();
     if (buffer) {
         // Layer 2a (redesign-plan #24 fix): defer the Sessions/History SQL
-        // writes into pendingCurrentNodes, capturing the session/recovery keys
-        // NOW so the drain depends on nothing live. flush() drains these in the
-        // same txn STRICTLY AFTER pendingTraces, restoring Traces-before-Sessions
+        // writes into pendingCurrentNodes. flush() drains these in the same txn
+        // STRICTLY AFTER pendingTraces, restoring Traces-before-Sessions
         // ordering. The in-memory currentNodeIndex update below still happens
         // synchronously, so lookupCurrentNode/getCurrentTraceHash within this
         // session are unaffected.
+        //
+        // We snapshot sessionKeyDigest + recoveryKey here rather than re-read at
+        // drain. This is NOT a soundness requirement — both derive from the
+        // SetOnce<SessionConfig> set at session open (trace-storage.hh:201-205),
+        // immutable thereafter, so capture-at-buffer == read-at-drain within a
+        // session. It is a defensive snapshot that keeps the drain self-contained
+        // (depends on no live session state). `gitIdentityHash` IS a per-record
+        // arg and must be carried regardless.
         pendingCurrentNodes.push_back(PendingCurrentNode{
             .pathId = pathId,
             .traceId = traceId,

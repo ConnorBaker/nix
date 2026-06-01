@@ -3426,3 +3426,102 @@ via Layer 2a (restore Traces-before-History ordering) before the aggressive shap
 severity is now precisely bounded: crash-only, recovery-path-only, post-reanimation, default-off,
 latent today. The confirming pass tightened the claim rather than finding a new defect; per the
 discipline, this closes the #24 thread.
+
+### 2026-05-31 follow-up #25: parallel research — edge-recorder design, hot net-cost measurement, Layer 2a adversarial review
+
+After Layer 2a landed (commit d77ef9610), ran three parallel investigations: design the unbuilt
+aggressive edge-recorder, scope the end-to-end hot net-cost measurement, and independently
+adversarially review the Layer 2a implementation + tests. All three are code-grounded; the actionable
+outcomes are folded back here and into the plan/source.
+
+**(A) Aggressive edge-recorder design (research, reproduced the leak).** A subagent BUILT a throwaway
+env-gated sub-scope at `prim_derivationStrict` (isolate-and-discard), ran it on a real `mkDerivation`
+-shaped eval, and REPRODUCED the exact revert leak end-to-end with `NIX_ALLOW_EVAL=0` (then reverted
+— tree clean). Findings, each `file:line`-cited:
+- **The RFC §2 prose about the leak is WRONG in an important way.** The reverted shape did NOT lose
+  *consumer-incidental* deps ("config.nix reads, flake source path") as CLAUDE.md/RFC say — those are
+  forced at `cfg.mkDrv` deref OUTSIDE the args-force window and are KEPT. It lost a PRODUCER-INTRINSIC
+  dep: a `readFile` whose value is embedded in the derivation's `args` (forced inside
+  `derivationStrictInternal`'s coerce loop, primops.cc:1850/1932), which folds into drvPath. The
+  discard-style isolation captured it and re-attached it NOWHERE → stale serve. So the RFC's own
+  design (re-attach via a producer trace whose trace_hash folds those deps in) targets the right
+  thing; the revert failed on under-attachment, not over-capture.
+- **The partition rule (sharp, validated):** producer deps = exactly those first-forced inside the
+  `forceAttrs(*args[0])` + `derivationStrictInternal` window (confirmed by a second probe variant:
+  `seq marker` OUTSIDE the window keeps the FileBytes on the consumer; inside, it moves to producer).
+- **Soundness is closed by route-by-drvPath / verify-by-trace_hash** (the `__ignoreNulls` obligation
+  walks green — `computeTraceHash` folds the dropped read in, `resolveTraceContextHash` verifier.cc:267
+  recompute-and-compares). The reproduction confirms the design is sound.
+- **The RFC UNDER-SPECIFIES a soundness-critical site (the highest-risk gap):** the COLD first-consumer
+  edge. The only edge-emission code today is the replay gate (context.cc:1038-1065), which fires on
+  RE-force; the cold forcer hits `forceThunkValue` (eval-inline.hh:96-108), never the gate. So the
+  aggressive shape must ALSO emit the edge at `recordCAProducer` finalize (trace-session.cc:863-873,
+  which today deliberately does NOT, because the conservative shape keeps the flat deps). Miss this →
+  stale-serve on EVERY singly-forced derivation. New test #6.3 (cold trace has the edge, not the flat
+  closure) targets it.
+- **Cheaper hot structure than a per-derivation sub-scope (the §6 ~11% cost):** the producer's deps
+  are already the `epochLog` range `recordCAProducer` snapshots; the only thing the sub-scope ADDS is
+  removing them from the consumer's `ownDeps`. That removal can be a post-finalize FILTER of the
+  consumer `ownDeps` against the producer range — no per-derivation pushScope/popScope (whose
+  `Scope`-map allocation is the actual cost), and it sidesteps the vptr-class hot-loop hazard. Most
+  important cost idea; the RFC assumed a real sub-scope.
+- **Over-capture is a precision (not soundness) tax that fans out:** any consumer-incidental read
+  forced inside the args window gets trapped in the producer → over-invalidates ALL N consumers of
+  that shared producer. Magnitude unmeasured; erodes the ~63% benefit by an unknown amount.
+
+**(B) Hot net-cost measurement (research, RAN a real A/B).** A subagent ran the measurable-now
+experiment: §3b conservative shape, three arms (A no-§3b / B §3b-no-defer / C §3b+defer), teardown-
+inclusive WALL, 5 cold + 3 hot reps interleaved, isolated caches, against a store nixpkgs
+`closures.gnome.x86_64-linux`. Non-vacuity validated first (B and C have IDENTICAL record.count=10,556
+→ defer changes timing not content). Numbers (this-machine/this-rev, tiny variance, deltas 20–50×
+stdev):
+- **COLD:** A 6.68s / B 9.83s (+3.15s, 1.47×) / C 7.17s (+0.48s, 1.07×). **Layer 1+2a recovers 84.6%
+  of the §3b cold record overhead (−2.66s of +3.15s); B→C wall −27.1%.** Teardown-inclusive, so NOT
+  the #23 stat-overstatement — this is the honest wall recovery.
+- **HOT:** A 0.41s / B 7.83s (19×) / C 7.27s (18×). **Defer barely helps hot (−7%)** — confirmed
+  mechanism: hot re-eval still records ~10,553 producers because derivation thunks RE-RUN during
+  materialize in a fresh process (producerMap dedup doesn't span the prime→hot boundary). This
+  EMPIRICALLY CONFIRMS #23/§3b: the 14–19× hot regression is a SEPARATE mechanism (materialize-time
+  re-execution) that Layer 1/2a does not touch.
+- **M reproduced fresh:** `NIX_BENCH_EDGE_VERIFY=1` → M = 0.99 (K=50) / 0.96 (K=800), slope ≈ 0.93.
+  M≈1 is now re-measured, not just cited.
+- **Net projection (measured/projected/assumed separated):** COLD net — moderately likely POSITIVE
+  (record cost measured-down to +0.5s with defer; ~63% verify-walk reduction via M≈1 IF the
+  workload-scale memo-hit materializes [assumed/unmeasured]). HOT net — LOW confidence, could still be
+  a LOSS: the §3b 18–19× hot pathology is materialize-time re-execution, which neither Layer 1/2a nor
+  the storage-count benefit addresses; whether the aggressive edge actually suppresses that re-run is
+  UNBUILT and UNMEASURED. Do NOT headline "63% hot win" — that conflates the storage/dep-count number
+  with hot time (the recurring trap).
+- **Blocked:** the true end-to-end hot net needs the aggressive edge-recorder (unbuilt) + the
+  workload-scale verify-memo-hit measurement. `generate --num-commits 100` was skipped (nixpkgs-git-
+  mutation risk + ~30 min); the direct `-f` A/B measures the same workload isolating the record-cost
+  variable.
+
+**(C) Layer 2a adversarial review (independent, VERDICT: sound, no blockers).** A subagent re-verified
+the fix against code and traced every `publishStateChange` caller. Independently confirmed: the drain
+is strictly after `pendingTraces` in the same txn; `currentNodeIndex` update is synchronous in BOTH
+branches; drain SQL byte-mirrors the sync path; ALL other callers (publishFreshRecord/
+publishHistoryBootstrap/verify-bootstrap/nodeStamp-backfill) target already-durable traceIds and
+cannot re-open the inversion; no orphaned `pendingCurrentNodes` across deferred→nondeferred→deferred;
+clang-tidy member-init clean; 420 pass / 2 skip. It also PROVED the 3 unit tests don't discriminate #24
+(forced deferPublish=false, rebuilt, all 3 still pass — confirming the honest docstring). Three minor
+findings, all addressed:
+- F1 (minor): #24 has no committed reproducible test, only the recorded SIGKILL writeup. ADDRESSED —
+  preserved the harness as `benchmarks/eval-trace-bench/experiments/layer2a-crash-consistency.sh`
+  (reproducible, with the L1-alone-vs-L2a contrast via REBUILD_L1_ALONE=1) + README row. Recommendation
+  recorded: promote to a committed (even DISABLED_) test before the aggressive shape flips the gate.
+- F2 (minor): the "capture keys at buffer time so the drain reads nothing live" comment overstated
+  capture as a SOUNDNESS requirement. ADDRESSED — corrected both comment sites (sqlite-trace-storage.cc
+  + .hh): keys derive from the SetOnce<SessionConfig> (trace-storage.hh:201-225, immutable post-open),
+  so capture-at-buffer == read-at-drain; the snapshot is defensive, not load-bearing (gitIdentityHash
+  is a per-record arg, carried of necessity).
+- F3 (minor): a transient `zz-aggressive-leak-probe.cc` the reviewer saw was the (A) agent's throwaway
+  research probe, observed mid-run; (A) cleaned it up before finishing. Tree confirmed pristine
+  (git status empty) after all three agents completed. No action.
+
+**Net for the direction:** soundness CLOSED (now reproduced end-to-end, not just argued). The remaining
+go/no-go is the HOT net, which has TWO unbuilt pieces and one assumed term — and the measured hot
+mechanism (materialize-time re-execution, 18–19× under conservative) is the real risk the aggressive
+shape must beat, not merely the record cost Layer 1/2a already recovered. The two next builds, in order:
+(1) the cold first-consumer edge + facet gate + epoch-range-filter cost structure (design (A)), then
+(2) bench it HOT on the Ledger-D anchor to settle whether the edge suppresses materialize re-run.

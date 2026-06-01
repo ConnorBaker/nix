@@ -528,8 +528,11 @@ struct SqliteTraceStorage
     // drained by `flush()` in the SAME txn, STRICTLY AFTER `pendingTraces` — so a
     // crash loses a producer's Traces row and its Sessions/History row TOGETHER
     // (no Sessions-before-Traces inversion, no trace-id-reuse aliasing). The
-    // session/recovery keys are CAPTURED here (not re-read at drain) so the drain
-    // depends on nothing live. `insertHistory` mirrors the publishStateChange arg.
+    // session/recovery keys are snapshotted here as a defensive measure (the
+    // drain then reads no live session state) — NOT for soundness: both derive
+    // from the SetOnce<SessionConfig> fixed at session open, so capture-at-buffer
+    // equals read-at-drain. `gitIdentityHash` is a per-record arg, carried here
+    // of necessity. `insertHistory` mirrors the publishStateChange arg.
     struct PendingCurrentNode {
         AttrPathId pathId{};
         TraceId traceId{};
