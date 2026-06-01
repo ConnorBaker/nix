@@ -119,17 +119,22 @@ RecordResult Recorder::record(
         .keySetHash = keySetHash,
         .depKeySetId = depKeySetId,
     };
+    // Layer 2a (redesign-plan #24 fix): `deferFlush` now ALSO defers the
+    // Sessions/History write (publishStateChange) via `deferPublish`, so the
+    // deferred path writes Traces and Sessions/History together in the batched
+    // flush — restoring Traces-before-Sessions ordering. Layer-1-alone (defer
+    // flush, sync publish) was the #24-hazardous state; this couples them.
     CurrentNodeRef ref{};
     if (observer) {
         ref = storage_.publishRecord(
             ea.blockingProof(), pathId, traceId, resultId,
-            header, sorted, depKeySetId, keys);
+            header, sorted, depKeySetId, keys, /*deferPublish=*/deferFlush);
         observer->onNewTrace(traceId, header, sorted, depKeySetId, keys);
         observer->onPublishCurrent(pathId, ref);
     } else {
         ref = storage_.publishRecord(
             ea.blockingProof(), pathId, traceId, resultId,
-            header, std::move(sorted), depKeySetId, std::move(keys));
+            header, std::move(sorted), depKeySetId, std::move(keys), /*deferPublish=*/deferFlush);
     }
 
     nrRecordTimeUs += elapsedUs(recordStart);

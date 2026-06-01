@@ -711,6 +711,39 @@ void SqliteTraceStorage::flush(const ExclusiveTraceStorageAccess & ea)
     }
     pendingTraces.clear();
 
+    // Layer 2a (redesign-plan #24 fix): drain the deferred Sessions/History
+    // (current-node) writes STRICTLY AFTER the Traces loop, in this SAME txn.
+    // This is what restores the baseline Traces-before-Sessions durability
+    // ordering: a buffered producer's Traces row and its Sessions/History row
+    // become durable together (or are lost together on crash) — no
+    // Sessions-before-Traces inversion, hence no trace-id-reuse aliasing (#24).
+    // The session/recovery keys were captured at buffer time (publishStateChange,
+    // buffer=true), so this drain reads nothing live. Each row mirrors the
+    // synchronous publishStateChange SQL exactly (same columns, same binds) →
+    // byte-identical DB on clean exit.
+    for (auto & cn : pendingCurrentNodes) {
+        auto upsert(st.upsertAttr.use());
+        bindEvalTraceHash(upsert, cn.sessionKeyDigest);
+        upsert(static_cast<int64_t>(cn.pathId.value))
+            (static_cast<int64_t>(cn.traceId.value))
+            (static_cast<int64_t>(cn.resultId.value))
+            (static_cast<int64_t>(cn.nodeStamp.value))
+            .exec();
+        if (cn.insertHistory) {
+            auto use(st.insertHistory.use());
+            bindTaggedEvalTraceHash(use, cn.recoveryKey);
+            use(static_cast<int64_t>(cn.pathId.value));
+            use(static_cast<int64_t>(cn.traceId.value));
+            use(static_cast<int64_t>(cn.resultId.value));
+            if (cn.gitIdentityHash)
+                use(cn.gitIdentityHash->data(), cn.gitIdentityHash->size());
+            else
+                use.bind();  // NULL
+            use.exec();
+        }
+    }
+    pendingCurrentNodes.clear();
+
     txn.commit();
     nrRecordFlushUs += elapsedUs(flushStart);
 }

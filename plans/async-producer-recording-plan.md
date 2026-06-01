@@ -197,3 +197,123 @@ Touch points (verified file:line): 2a — `publishStateChange` sqlite-trace-stor
 lifecycle.cc:623, `publishRecord` :665, `recordSync` context.cc:421. 2b (if ever) — `Recorder::record`
 recorder.cc split, a new record-cpu-pool mirroring `BlockingThreadPool`, `BackendAsyncInfra`
 context.cc:245 teardown, and the `DataPathPool` concurrency prerequisite.
+
+## 7. Layer 2a — CONCRETE DESIGN (2026-05-31, code-read-grounded, ready to implement)
+
+Read end-to-end before designing: `flush()` (lifecycle.cc:623-716), `publishStateChange`
+(sqlite-trace-storage.cc:695-729), `publishRecord` (:666-693), `lookupCurrentNode` (:558-592),
+`recordSync` (context.cc:399-429), the `pending*` decls (sqlite-trace-storage.hh:500-521), and the
+Sessions/History schema (lifecycle.cc:203-219).
+
+**Adversarial findings from the read (each changes the design):**
+1. **`lookupCurrentNode` reads `currentNodeIndex` (in-memory) FIRST** (sqlite-trace-storage.cc:563-565)
+   → deferring only the *SQL* writes while keeping the synchronous `currentNodeIndex[pathId] = ref`
+   update (line 727) preserves within-session lookup AND `getCurrentTraceHash`. This is the soundness
+   pivot — confirmed in code, not assumed.
+2. **`context.cc:380` `store->flush(ea)` is `TraceBackend::flush()`, a SHUTDOWN op** (called from
+   trace-session.cc:795/806), NOT inside `recordSync`. So the deferral is genuine — `recordSync`
+   (context.cc:399-429) does `record(...deferProducerFlush)` then `getCurrentTraceHash`, no inline
+   flush. The only `pendingTraces` drains are the per-record `flush()` (skipped when deferred) and
+   teardown `flushExclusive()`.
+3. **`publishFreshRecord`/`publishHistoryBootstrap` (sqlite-trace-storage.cc:977-996) are
+   verify/recovery-time** callers of `publishStateChange`, NOT the producer hot path. They must stay
+   synchronous → the `buffer` param defaults false; only `publishRecord` (the `Recorder::record`
+   path) passes it true.
+4. **`recordSync` reads the env flag ONCE (static, context.cc:421).** In a real eval the async
+   `record()` path (consumer/thunk records, always `deferFlush=false`) interleaves and its step-7
+   `flush()` drains the producers' buffers too. Draining `pendingTraces` THEN `pendingCurrentNodes`
+   in one txn keeps Traces-before-Sessions ordering at EVERY drain, not just teardown — which is why
+   2a fully closes #24 and why Layer-1-alone can't be rescued by interleaving (its Sessions write
+   already happened synchronously, before any later flush).
+5. **Sessions PK `(session_key, attr_path_id)` upsert + History PK `(recovery_key, attr_path_id,
+   trace_id)` INSERT OR IGNORE** → buffering and draining in vector (insertion = call) order
+   preserves "last writer wins" for Sessions and is a no-op for duplicate History rows. No
+   drain-order hazard.
+
+**Decision: fold 2a into the EXISTING `deferFlush` flag — do NOT add `NIX_PRODUCER_DEFER_PUBLISH`.**
+Layer-1-alone (defer flush, sync publish) IS the #24-hazardous state. Making one flag defer BOTH the
+entity flush and the Sessions/History write means there is never a shippable "Layer 1 without 2a"
+configuration. One flag, one coherent deferred path.
+
+**Capture resolved bind-values at buffer time** (`sessionKeyDigest = currentSemanticSessionKey().digest`,
+`recoveryKey = currentStableRecoveryKey()`, plus the already-param `gitIdentityHash`) so the drain
+depends on nothing live. `allocateNodeStamp()` + `currentNodeIndex[pathId] = ref` stay synchronous.
+
+**Mechanics:**
+- New `struct PendingCurrentNode { AttrPathId pathId; TraceId traceId; ResultId resultId; NodeStamp
+  nodeStamp; bool insertHistory; EvalTraceHash sessionKeyDigest; SessionRecoveryKey recoveryKey;
+  std::optional<EvalTraceHash> gitIdentityHash; };` + `std::vector<PendingCurrentNode>
+  pendingCurrentNodes;` (sqlite-trace-storage.hh, beside the other `pending*`).
+- `publishStateChange` gains `bool buffer = false`. When true: allocate nodeStamp, build `ref`,
+  capture the two keys, `pendingCurrentNodes.push_back(...)`, set `currentNodeIndex[pathId] = ref`,
+  return — NO `SQLiteTxn`, no SQL. When false: unchanged (synchronous txn).
+- `publishRecord` gains `bool deferPublish = false`, forwards to `publishStateChange(..., buffer=deferPublish)`.
+- `Recorder::record`: when `deferFlush`, pass `deferPublish=true` to `publishRecord` (both observer
+  and non-observer branches, recorder.cc:108/114).
+- `flush()`: after `pendingTraces.clear()` (lifecycle.cc:712), inside the SAME txn, drain
+  `pendingCurrentNodes` — for each: `upsertAttr` (bind captured sessionKeyDigest), and if
+  `insertHistory`, `insertHistory` (bind captured recoveryKey + gitIdentityHash). Then `.clear()`.
+  Ordered strictly AFTER the Traces loop → Traces-before-Sessions restored.
+
+**Byte-identity argument:** the drained SQL binds the same columns with the same values
+(`bindEvalTraceHash`/`bindTaggedEvalTraceHash`, trace-serialize.hh:33-42) as the synchronous path;
+only the *timing and the enclosing txn* differ. On clean exit the teardown flush drains everything →
+DB byte-identical to the synchronous path (same assertion as Layer 1's #22 validation, now extended
+to Sessions/History rows). On crash: Traces and Sessions/History for buffered producers are lost
+TOGETHER (same txn) → no orphan, no inversion, no id-reuse aliasing → #24 closed.
+
+**Soundness tests to add (the class #22/#23 lacked):** (a) within-session: a producer recorded under
+the deferred path is verifiable by a later consumer in the SAME session (exercises the synchronous
+`currentNodeIndex`/`traceCache` path under defer) — unit. (b) cross-session byte-identity: deferred
+vs synchronous produce identical Sessions+History+Traces row counts AND identical row contents — unit
+or functional. (c) crash/abrupt-exit: the genuinely new one — kill before teardown, reopen, assert no
+stale serve (no Sessions/History row referencing a missing Traces id). Hard in-process; likely a
+subprocess-kill functional test. At minimum assert the invariant structurally (no
+`pendingCurrentNodes` entry outlives its `pendingTraces` entry — they drain in the same loop).
+
+## 8. Layer 2a — IMPLEMENTED + VALIDATED (2026-05-31)
+
+Implemented exactly as §7: `PendingCurrentNode` struct + `pendingCurrentNodes` vector
+(sqlite-trace-storage.hh); `publishStateChange` gained `bool buffer` (captures session/recovery keys
++ allocates NodeStamp + updates `currentNodeIndex` synchronously, defers only the SQL);
+`publishRecord` gained `bool deferPublish`; `Recorder::record` passes `deferPublish=deferFlush` (one
+flag couples flush + publish deferral — there is no shippable Layer-1-alone state); `flush()` drains
+`pendingCurrentNodes` STRICTLY AFTER `pendingTraces` in the same txn. Build green; 427/427 eval-trace
+unit tests pass (2 pre-existing env-gated skips).
+
+**Clean-exit soundness (sync vs deferred, real nixpkgs `-f` eval, isolated caches):**
+- (a) byte-identical eval output: PASS (936 B identical).
+- (b) identical row counts all 5 tables: Traces 1649, Sessions 1531, History 1881, DepKeySets 1649,
+  Results 2 — sync == defer.
+- (b+) identical row CONTENTS (content-hash per table): Traces, Sessions (incl `node_stamp`), History
+  all IDENTICAL → byte-identical DB, not merely same counts. (`node_stamp` matching confirms keeping
+  `allocateNodeStamp()` synchronous was correct — stamps allocate in the same order regardless of
+  when the SQL write lands.)
+- (c) cross-process warm: deferred cold DB serves byte-identical output in a 2nd process; deferred-warm
+  vs sync-warm produce identical output AND DB content stayed in lockstep through a warm pass; row
+  counts did not grow (no double-recording).
+
+**Crash-path validation — the genuinely new test, and the only one that discriminates the #24 fix.**
+Mid-eval `SIGKILL` (interleaved `-f` attrset workload so consumer `flush()`es drain producer buffers
+mid-flight) + reopen + query `COUNT(*) FROM {Sessions,History} WHERE trace_id NOT IN (SELECT id FROM
+Traces)`. Ran the SAME harness against two builds:
+
+| build | non-empty crashes | dangling Sessions | dangling History |
+|---|---|---|---|
+| **Layer-1-alone** (defer flush, sync publish) | 6/6 | 175 → 760 | 194 → 1024 |
+| **Layer 2a** (defer flush + publish, same-txn drain) | 6/6 | **0** | **0** |
+
+The Layer-1-alone column reproduces the #24 hazard empirically (durable Sessions/History rows whose
+Traces rows are unflushed: Traces=1 while Sessions=761). Layer 2a leaves zero dangling at every kill
+point. This contrast is the proof: the harness is non-vacuous (it CATCHES the hazard), and Layer 2a
+closes it. The Layer-1-alone build was produced by a temporary `deferPublish=false` patch
+(reverted; 0 markers remain). Bare `--expr` evals keep the DB empty until teardown (no interleaved
+non-deferred `flush()` mid-eval), so the crash window only opens under multi-TracedExpr (`-f` / flake)
+workloads — noted because it bounds where #24 is reachable at all.
+
+**Unit tests** (`store/deferred-publish-ordering.cc`, 3 tests): within-session lookup under defer,
+cross-session durability, interleaved-records post-flush consistency. VERIFIED non-discriminating for
+#24 (all 3 pass under Layer-1-alone too — clean flush drains both orderings identically); they are
+regression guards for the deferred path's within-session + durability semantics, and the file's
+docstring says so explicitly. The crash-ordering fix itself is pinned only by the out-of-process
+contrast above, which is recorded here rather than as a flaky SIGKILL CI test.

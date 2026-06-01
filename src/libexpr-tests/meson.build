@@ -118,6 +118,7 @@ sources = files(
   'eval-trace/store/session-config.cc',
   'eval-trace/store/concurrency.cc',
   'eval-trace/store/error-handling.cc',
+  'eval-trace/store/deferred-publish-ordering.cc',
   'eval-trace/store/multi-session.cc',
   'eval-trace/store/large-trace.cc',
   'eval-trace/store/cross-session-subsumption.cc',

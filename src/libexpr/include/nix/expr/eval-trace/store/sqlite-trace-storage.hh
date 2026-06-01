@@ -520,6 +520,28 @@ struct SqliteTraceStorage
     };
     std::vector<PendingTrace> pendingTraces;
 
+    // async-producer-recording-plan Layer 2a (redesign-plan follow-up #24 fix):
+    // the deferred Sessions/History (current-node) writes. `publishStateChange`
+    // with `buffer=true` allocates the NodeStamp + updates the in-memory
+    // `currentNodeIndex` synchronously (so within-session lookup +
+    // getCurrentTraceHash are unaffected) but defers the SQL writes here, to be
+    // drained by `flush()` in the SAME txn, STRICTLY AFTER `pendingTraces` — so a
+    // crash loses a producer's Traces row and its Sessions/History row TOGETHER
+    // (no Sessions-before-Traces inversion, no trace-id-reuse aliasing). The
+    // session/recovery keys are CAPTURED here (not re-read at drain) so the drain
+    // depends on nothing live. `insertHistory` mirrors the publishStateChange arg.
+    struct PendingCurrentNode {
+        AttrPathId pathId{};
+        TraceId traceId{};
+        ResultId resultId{};
+        NodeStamp nodeStamp{};
+        bool insertHistory = false;
+        EvalTraceHash sessionKeyDigest{};
+        SessionRecoveryKey recoveryKey{};
+        std::optional<EvalTraceHash> gitIdentityHash;
+    };
+    std::vector<PendingCurrentNode> pendingCurrentNodes;
+
     // ── Capability minting ────────────────────────────────────────────
 
     // `withExclusiveAccess`, `currentSemanticSessionKey`,
@@ -820,12 +842,17 @@ private:
         const std::vector<uint8_t> & keysBlob);
 
     /// Atomic record publication: DB writes + all session cache updates.
-    /// Called only from record(). All parameters mandatory.
+    /// Called only from record(). `deferPublish` (Layer 2a) forwards to
+    /// `publishStateChange`'s `buffer` arg: when true, the Sessions/History SQL
+    /// writes are buffered into `pendingCurrentNodes` and drained by `flush()`
+    /// (the in-memory `currentNodeIndex`/`traceCache`/`depKeySetCache` updates
+    /// still happen synchronously). Used by the deferred producer-record path.
     CurrentNodeRef publishRecord(
         const gdp::Proof<BlockingTag> &,
         AttrPathId pathId, TraceId traceId, ResultId resultId,
         TraceHeader header, std::vector<Dep> fullDeps,
-        DepKeySetId depKeySetId, std::vector<Dep::Key> keys);
+        DepKeySetId depKeySetId, std::vector<Dep::Key> keys,
+        bool deferPublish = false);
 
     /// Low-level DB operation. Allocates NodeStamp, writes Sessions,
     /// optionally writes History.  Also used directly as the "recovery
@@ -833,11 +860,19 @@ private:
     /// current-node pointer without inserting a new History row
     /// (publishRecord inserts; constructive recovery reuses an existing
     /// History row).
+    ///
+    /// `buffer` (Layer 2a, redesign-plan #24 fix): when true, allocate the
+    /// NodeStamp and update the in-memory `currentNodeIndex` synchronously but
+    /// DEFER the Sessions/History SQL writes into `pendingCurrentNodes` (drained
+    /// by `flush()` after `pendingTraces`, in the same txn). Only the deferred
+    /// producer-record path sets this; verify/recovery callers
+    /// (publishFreshRecord/publishHistoryBootstrap) leave it false.
     CurrentNodeRef publishStateChange(
         const gdp::Proof<BlockingTag> &,
         AttrPathId pathId, TraceId traceId, ResultId resultId,
         bool insertHistory,
-        std::optional<EvalTraceHash> gitIdentityHash = std::nullopt);
+        std::optional<EvalTraceHash> gitIdentityHash = std::nullopt,
+        bool buffer = false);
 
     /// Load payload from DB by ResultId, then decode.
     CachedResult decodeCachedResult(const gdp::Proof<BlockingTag> &, ResultId resultId);

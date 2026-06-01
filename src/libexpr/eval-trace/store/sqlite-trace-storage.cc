@@ -667,7 +667,8 @@ SqliteTraceStorage::CurrentNodeRef SqliteTraceStorage::publishRecord(
     const gdp::Proof<BlockingTag> & bs,
     AttrPathId pathId, TraceId traceId, ResultId resultId,
     TraceHeader header, std::vector<Dep> fullDeps,
-    DepKeySetId depKeySetId, std::vector<Dep::Key> keys)
+    DepKeySetId depKeySetId, std::vector<Dep::Key> keys,
+    bool deferPublish)
 {
     // Use the free-fn form (deps/analysis.hh). Unqualified lookup inside
     // a SqliteTraceStorage member would otherwise resolve to the deprecated
@@ -680,8 +681,11 @@ SqliteTraceStorage::CurrentNodeRef SqliteTraceStorage::publishRecord(
         ? std::optional{recoveryIndexHash->value}
         : std::nullopt;
 
+    // Layer 2a: `deferPublish` buffers the Sessions/History SQL writes (drained
+    // by flush() after pendingTraces). The traceCache/depKeySetCache updates
+    // below stay synchronous regardless — within-session verify reads those.
     auto ref = publishStateChange(bs, pathId, traceId, resultId, /*insertHistory=*/true,
-        rawRecoveryHash);
+        rawRecoveryHash, /*buffer=*/deferPublish);
     traceCache.insert_or_assign(traceId, TraceCacheEntry{
         std::move(header),
         std::make_shared<const std::vector<Dep>>(std::move(fullDeps)),
@@ -696,10 +700,29 @@ SqliteTraceStorage::CurrentNodeRef SqliteTraceStorage::publishStateChange(
     const gdp::Proof<BlockingTag> & bs,
     AttrPathId pathId, TraceId traceId, ResultId resultId,
     bool insertHistory,
-    std::optional<EvalTraceHash> gitIdentityHash)
+    std::optional<EvalTraceHash> gitIdentityHash,
+    bool buffer)
 {
     auto nodeStamp = allocateNodeStamp();
-    {
+    if (buffer) {
+        // Layer 2a (redesign-plan #24 fix): defer the Sessions/History SQL
+        // writes into pendingCurrentNodes, capturing the session/recovery keys
+        // NOW so the drain depends on nothing live. flush() drains these in the
+        // same txn STRICTLY AFTER pendingTraces, restoring Traces-before-Sessions
+        // ordering. The in-memory currentNodeIndex update below still happens
+        // synchronously, so lookupCurrentNode/getCurrentTraceHash within this
+        // session are unaffected.
+        pendingCurrentNodes.push_back(PendingCurrentNode{
+            .pathId = pathId,
+            .traceId = traceId,
+            .resultId = resultId,
+            .nodeStamp = nodeStamp,
+            .insertHistory = insertHistory,
+            .sessionKeyDigest = currentSemanticSessionKey().digest,
+            .recoveryKey = currentStableRecoveryKey(),
+            .gitIdentityHash = gitIdentityHash,
+        });
+    } else {
         auto & st = *_state;
         SQLiteTxn txn(st.db);
         auto upsert(st.upsertAttr.use());
