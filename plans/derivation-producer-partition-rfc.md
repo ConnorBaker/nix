@@ -618,3 +618,75 @@ signal the observation was not output-only).
     two precision costs (§7.6) — all quantitative, gated, and testable. There is no
     remaining open SOUNDNESS question; the blocker is now "is the net perf win real,"
     which only a prototype + Ledger-D bench answers.
+
+## §9. Aggressive edge-recorder — GROUNDED IMPLEMENTATION DESIGN (2026-05-31, code-verified)
+
+Written after reading the actual record/replay/snapshot code (not the isolate-and-discard research
+probe). Supersedes the §3-step-4 hand-wave about "where the consumer records the edge".
+
+### Mechanism facts (verified file:line)
+- `DepRecordingContext::record` (dep-recording-context.cc:62/128): a dep is appended to BOTH the
+  global `epochLog` AND the active consumer scope's `ownDeps` **iff** it passes the scope's `seenDeps`
+  dedup (`observeRecordedDep`). Same dep, same guard, both buckets.
+- `prim_derivationStrict` hook (primops.cc:1605/1686): `epochStart = currentReplayEpochSize()` before
+  the force; after `derivationStrictInternal`, `innerDeps = snapshotEpochRange(epochStart, epochEnd)`
+  (context.hh:327) is the producer's deps; `recordCAProducer(v, drvPath, innerDeps)` persists the
+  producer trace whose `trace_hash` folds in EXACTLY `innerDeps` (recordSync → computeTraceHash over
+  that vector). Today the consumer scope KEEPS those same deps flattened (conservative shape).
+- `Dep::operator==` (types.hh:1013) compares KEY ONLY (not hash). `Dep::Key::Hash` exists (types.hh:977).
+- Edge dep: `Dep::makeValueContext(caKey, traceHash)`, recorded via `TraceAccess::current()->record(...)`
+  — the exact shape the replay gate already emits (context.cc:1059).
+- Facets (`meta`/`passthru`) live on the OUTER `drv // {meta=…;}` attrset, created AFTER
+  derivationStrict returns → forced in the CONSUMER scope OUTSIDE [epochStart,epochEnd) → NOT in
+  `innerDeps` (pinned by derivation-observation-facets.cc::DrvOutPath_DoesNotForceSiblingMeta).
+
+### The two builds
+**B1 — cold first-consumer edge.** After `recordCAProducer` succeeds, record ONE
+`makeValueContext(caKey, traceHash)` into the consumer's active scope. Without this the cold first
+forcer (which hits `forceThunkValue`, never the replay gate) records no tie to the producer → the
+aggressive shape would stale-serve every singly-forced derivation. (RFC §3-step-4 omitted this site.)
+
+**B2 — filter (flatten-replace).** Remove from the consumer scope's `ownDeps` exactly the deps whose
+KEY is in `innerDeps` (build a `Key`-set from the producer snapshot, erase matching ownDeps). The edge
+then REPLACES the flattened closure instead of adding to it. This is the benefit.
+
+### Why filter-by-key-set is sound (the subtlety the revert missed)
+A key in `innerDeps` was first-seen INSIDE the window → by the dedup guard it was NOT already in the
+consumer's `ownDeps` before `epochStart` (if it had been, the in-window record would be dedup-blocked
+and absent from the epoch range). So erasing ownDeps-by-key-∈-innerDeps removes ONLY deps the producer
+range covers. The producer `trace_hash` folds in `innerDeps`; the edge's verification
+(`resolveTraceContextHash` → recursive `verifyTrace` of the producer → recompute trace_hash, compare)
+re-checks exactly the removed set against the live FS. Remove-set == producer-trace-hash-covered-set →
+sound. The reverted "isolate-and-discard" shape removed the deps and re-attached them NOWHERE (no
+producer trace) — THAT was the leak, not the removal itself.
+
+The `__ignoreNulls` dropped-read is in `innerDeps` (forced inside the window, primops.cc:1825) → folded
+into trace_hash → the edge invalidates on it. drvPath-routing never enters the soundness decision.
+
+Facet gate is AUTOMATIC: facet reads are outside the window → not in `innerDeps` → never filtered →
+stay on the consumer (the C3-hole guard). A facet forced INSIDE derivationStrict (non-nixpkgs
+`derivation{meta=readFile…}`) lands in `innerDeps` → folded into trace_hash → filtering it is still
+sound (edge re-verifies), only a precision loss.
+
+### Implementation surface
+- New `DepRecordingContext::replaceWindowWithEdge(const std::vector<Dep> & producerInnerDeps, const Dep
+  & edge)`: build a `Key`-hash-set from producerInnerDeps; erase current-scope `ownDeps` whose key is
+  in it; push the edge (subject to the scope dedup). Encapsulates the ownDeps mutation in its owner.
+- `recordCAProducer` returns the `{caKey, traceHash}` (or success+out-params) so the primop can build
+  the edge.
+- primop hook: when the (new) aggressive sub-gate is on AND the producer recorded, call
+  `access.depRecordingContext().replaceWindowWithEdge(innerDeps, edge)`.
+- Gate: a sub-flag of NIX_ENABLE_CA_PRODUCER (e.g. NIX_CA_PRODUCER_AGGRESSIVE=1) so the conservative
+  shape stays the default-on-when-§3b-enabled behaviour and the aggressive shape is independently
+  switchable for A/B. Both default OFF.
+- Composition: runs on Layer 1+2a deferred recording (the producer recordSync already threads
+  deferFlush); getCurrentTraceHash reads in-memory caches so the edge's traceHash is available.
+
+### Soundness pins (tests, B-tasks)
+- cold edge present + flat closure absent (the B1 site).
+- marker-in-args invalidation (the reproduced stale-serve, now must pass).
+- cross-producer memoized-thunk routing (two distinct drvs sharing a thunk → both invalidate).
+- facet stays on consumer (nixpkgs `// {meta}` shape).
+- no-under-record differential: set of files whose mutation invalidates the consumer under aggressive
+  ⊇ under conservative (never fewer). Over-invalidation allowed, counted.
+- functional eval-trace-core / eval-trace-deps stay green (the suites the revert failed).
