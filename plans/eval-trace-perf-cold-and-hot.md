@@ -409,3 +409,40 @@ for one trace).
    byte-preserving, no threading. Golden-hash test + cold re-bench.
 3. Re-measure. If the residual (the 35% txn+interning, or remaining hash) still dominates → THEN
    consider C1-async (Option A for the I/O txn) or interning-dedup. Decide from data, not the §3b split.
+
+## H-cold-1 IMPLEMENTED + MEASURED (2026-05-31) — real but small (−10% cold); the bulk is BLAKE3, not resolution.
+
+Implemented: split `feedCanonicalDepKeyMaterial` into `resolveDepKeyMaterial` (pool reads: pools.resolve
++ dataPathPool.collectPath + encoded-blob build) + `feedResolvedDepKeyMaterial` (builder.field only),
+and a fused `computeRecordHashesFromSorted` that resolves each dep key ONCE and feeds all 3 record
+builders (traceHash/fullHash/depKeySetHash) in a single pass. `recorder.cc` uses it. Extracted
+`DataPathNode` to a minimal `data-path-node.hh` to break an include cycle
+(interning-pools.hh→input-resolution-internal.hh→input-resolution.hh).
+
+BYTE-PRESERVATION: VALIDATED — 1349 eval-trace unit tests + 5 cross-process warm-hit functional suites
+pass. Warm verify recomputes hashes and compares to the recorded ones; any byte drift → universal warm
+miss → test failures. None. (The fused output is byte-identical to the 3 separate passes by
+construction: same builders, same field order, same per-hash filtering/ordinals/value-inclusion.)
+
+PAYOFF (genuinely-cold closures.gnome, 2 trials): record.hashUs **0.889s → 0.75s (−15%)**, total
+record.timeUs **1.55s → 1.39s (−10%)**. Real, sound, zero-risk.
+
+### ADVERSARIAL on the payoff — why only −15%, and what it means
+hashUs = resolution (collectPath+pools.resolve, now 1× — H-cold-1's target) + builder.field framing +
+BLAKE3 finish (still 3×, irreducibly). The −15% IS the deduped resolution; the remaining ~85% is the
+3× BLAKE3 over ~146K framed fields (48,745 deps × 3 builders). Fusion CANNOT cut that — the 3 hashes
+are distinct (different domains/content) and each must be computed. So H-cold-1 captured its target but
+the target was a minority of hashUs.
+
+CONSEQUENCE: H-cold-1 is worth keeping (−10% cold, byte-identical, no risk) but is NOT the cold
+breakthrough. The bulk cold cost is BLAKE3 throughput over the FLATTENED 48K-dep vectors — the 607×
+again, now on the record/hash side. To cut it materially you must either:
+- **C3: hash LESS — reduce the flattened dep COUNT** (record-time dedup of identical dep sub-vectors
+  across the 7 traces; the 172,670 total deps over 7 traces means massive overlap). This attacks the
+  root (count), not the constant. Biggest remaining cold lever; unexplored; needs design.
+- **C1/B: move the 3× BLAKE3 off the eval thread** — the pool+vocab thread-safety wall (now also the
+  vocab.internName write, established earlier). Hides latency, doesn't reduce work; harder.
+
+H-cold-1 is the cheap sound first cut; the real cold win is C3 (reduce dep count) — which is the SAME
+flattening the producer-partition arc failed to fix via edges, approached differently (record-time
+sub-vector dedup, not consumer edges). That's the next design.

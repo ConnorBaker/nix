@@ -5,6 +5,7 @@
 
 #include "nix/expr/eval-trace/deps/input-resolution-internal.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
+#include "nix/expr/eval-trace/deps/data-path-node.hh"  // DataPathNode / DataPathNodeKey (extracted to break an include cycle)
 #include "nix/expr/symbol-table.hh"
 #include "nix/util/error.hh"
 #include "nix/util/string-intern-table.hh"
@@ -19,31 +20,6 @@
 #include <vector>
 
 namespace nix {
-
-struct DataPathNode {
-    uint32_t parentId = 0;  ///< 0 = root
-    std::string component;  ///< object key (resolved string, not Symbol)
-    int32_t arrayIndex = -1; ///< -1 if object key, >=0 if array index
-};
-
-struct DataPathNodeKey {
-    uint32_t parentId = 0;
-    std::string component;
-    int32_t arrayIndex = -1;
-
-    bool operator==(const DataPathNodeKey &) const = default;
-
-    struct Hash {
-        // No `is_avalanching` marker.  `hashValues` is `hash_combine`
-        // over `std::hash<size_t>`; on libstdc++ `std::hash<size_t>` is
-        // identity, so the combine does not avalanche.  Entries
-        // sharing a `parentId` would cluster without a post-mixer.
-        size_t operator()(const DataPathNodeKey & key) const noexcept
-        {
-            return hashValues(key.parentId, key.arrayIndex, key.component);
-        }
-    };
-};
 
 struct DataPathPool {
     std::vector<DataPathNode> nodes;

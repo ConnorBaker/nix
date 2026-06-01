@@ -73,6 +73,72 @@ inline void feedDep(
 
 } // namespace detail
 
+/// The three record-path hashes computed together (RFC-perf H-cold-1).
+struct RecordHashes {
+    TraceHash traceHash;
+    FullTraceHash fullHash;
+    DepKeySetHash depKeySetHash;
+};
+
+/**
+ * Compute traceHash + fullTraceHash + depKeySetHash in a SINGLE pass over the
+ * sorted deps, resolving each dep key's (expensive) material ONCE and feeding it
+ * into all three builders (RFC-perf H-cold-1). Byte-identical to calling
+ * computeTraceHashFromSorted / computeFullTraceHashFromSorted /
+ * computeDepKeySetHashFromSorted separately — same builders, same field order,
+ * same per-hash filtering (traceHash skips !contributesToTraceHash deps with its
+ * own ordinal; full/keySet include all; keySet omits the value).
+ *
+ * `feed3` is a callable `(CanonicalHashBuilder & traceB, bool feedTrace,
+ * CanonicalHashBuilder & fullB, CanonicalHashBuilder & keySetB, const Dep::Key &)`
+ * that resolves the key ONCE and feeds each builder it is told to. The recorder
+ * supplies one that resolves via the pools a single time (vs the 3× of the
+ * separate calls — the documented `collectPath`/`pools.resolve` cost).
+ */
+template<typename Feed3>
+RecordHashes computeRecordHashesFromSorted(const std::vector<Dep> & sortedDeps, const Feed3 & feed3)
+{
+    auto traceB  = makeDomainBuilder<hash_domain::TraceHashV2>();
+    auto fullB   = makeDomainBuilder<hash_domain::FullTraceHashV1>();
+    auto keySetB = makeDomainBuilder<hash_domain::DepKeySetHashV1>();
+
+    // dep-count fields — same as the standalone functions (trace uses the
+    // hashable subset count; full/keySet use the full size).
+    traceB.field("dep-count", static_cast<uint64_t>(detail::hashableDepCount(sortedDeps)));
+    fullB.field("dep-count", static_cast<uint64_t>(sortedDeps.size()));
+    keySetB.field("dep-count", static_cast<uint64_t>(sortedDeps.size()));
+
+    uint64_t traceOrdinal = 0;   // traceHash: own ordinal, advances only on contributing deps
+    uint64_t fullOrdinal = 0;    // full/keySet: ordinal over all deps (shared sequence)
+    for (auto & dep : sortedDeps) {
+        bool feedTrace = contributesToTraceHash(dep.key.kind);
+
+        // Ordinal + value framing per builder, identical to detail::feedDep:
+        //   trace:  field("dep.ordinal", traceOrdinal); <key>; feedDepValue(hash)   [only if feedTrace]
+        //   full:   field("dep.ordinal", fullOrdinal);  <key>; feedDepValue(hash)
+        //   keySet: field("dep.ordinal", fullOrdinal);  <key>                        (no value)
+        if (feedTrace)
+            traceB.field("dep.ordinal", traceOrdinal);
+        fullB.field("dep.ordinal", fullOrdinal);
+        keySetB.field("dep.ordinal", fullOrdinal);
+
+        // Resolve the key ONCE, feed it into trace (if contributing), full, keySet.
+        feed3(feedTrace ? &traceB : nullptr, fullB, keySetB, dep.key);
+
+        if (feedTrace) {
+            detail::feedDepValue(traceB, dep.hash);
+            ++traceOrdinal;
+        }
+        detail::feedDepValue(fullB, dep.hash);
+        ++fullOrdinal;
+    }
+    return RecordHashes{
+        TraceHash{traceB.finish()},
+        FullTraceHash{fullB.finish()},
+        DepKeySetHash{keySetB.finish()},
+    };
+}
+
 /**
  * Pre-sorted trace hash with KeyFeeder callback (primary API).
  * Computes the canonical framed active-backend hash of all deps INCLUDING hash values.

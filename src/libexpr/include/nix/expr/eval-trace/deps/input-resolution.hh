@@ -4,6 +4,7 @@
 
 #include "nix/expr/eval-trace/semantic-objects.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
+#include "nix/expr/eval-trace/deps/data-path-node.hh"  // DataPathNode (held by-value in ResolvedDepKeyMaterial)
 #include "nix/fetchers/attrs.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/store/path.hh"
@@ -141,9 +142,53 @@ std::optional<fetchers::Input> makeRuntimeFetchIdentityInput(
     const fetchers::Settings & settings,
     const RuntimeFetchIdentityDepKey & key);
 
+/// Pool-resolved canonical dep-key material (RFC-perf H-cold-1). The expensive
+/// part of hashing a dep key is the pool resolution (`pools.resolve` +
+/// `dataPathPool.collectPath` + the encoded-blob construction), and the record
+/// path hashes the SAME key into THREE builders (traceHash, fullTraceHash,
+/// depKeySetHash). This struct caches the resolution so it runs ONCE per key
+/// instead of once per builder. Holds `string_view`s into the (append-only,
+/// stable) intern tables plus owned path-node/blob vectors. Valid only while the
+/// `InterningPools` and the source `Dep::Key` outlive it.
+struct ResolvedDepKeyMaterial
+{
+    CanonicalQueryKind kind = CanonicalQueryKind::FileBytes;  // always overwritten by resolveDepKeyMaterial
+    std::string_view source;          ///< pools.resolve(sourceId)
+
+    // Structured-dep fields (valid iff `structured`).
+    bool structured = false;
+    std::string_view structuredFile;  ///< pools.resolve(filePathId)
+    uint8_t format = 0;               ///< raw stored format byte (Dep::Key::format)
+    std::vector<DataPathNode> path;   ///< collectPath(dataPathId) — owned
+    ShapeSuffix suffix = ShapeSuffix::None;
+    bool hasKeyPresent = false;
+    std::string_view hasKey;          ///< pools.resolve(hasKeyId) iff present
+    bool dirSetPresent = false;
+    std::string_view dirSet;          ///< pools.resolve(dirSetHashId) iff present
+
+    // Encoded-blob simple-dep fields (valid iff !structured). Exactly one of
+    // {encodedBlob, simpleKey} carries the payload depending on `kind`.
+    std::vector<uint8_t> encodedBlob; ///< owned encoded blob (DerivedStorePath/StorePathAvail/RuntimeFetch)
+    std::string_view simpleKey;       ///< pools.resolve(simpleKeyId()) for the simple kinds
+    bool isEncodedBlob = false;       ///< true ⇒ feed encodedBlob; false ⇒ feed simpleKey
+    std::string_view encodedBlobTag;  ///< the field tag for the encoded-blob case
+};
+
+/// Resolve a dep key's canonical material from the pools ONCE (the costly step).
+ResolvedDepKeyMaterial resolveDepKeyMaterial(
+    const InterningPools & pools,
+    const Dep::Key & key);
+
+/// Feed pre-resolved material into a framed hash builder. Produces byte-identical
+/// output to `feedCanonicalDepKeyMaterial` — only the resolution is hoisted out.
+void feedResolvedDepKeyMaterial(
+    eval_trace::CanonicalHashBuilder & builder,
+    const ResolvedDepKeyMaterial & material);
+
 /// Feed the canonical non-trace-context dep-key material into a framed hash builder.
 /// Keeps typed dep-key structure alive until the actual hashing boundary
-/// instead of reaching for the raw encoded blob substrate.
+/// instead of reaching for the raw encoded blob substrate. Equivalent to
+/// `feedResolvedDepKeyMaterial(builder, resolveDepKeyMaterial(pools, key))`.
 void feedCanonicalDepKeyMaterial(
     eval_trace::CanonicalHashBuilder & builder,
     const InterningPools & pools,

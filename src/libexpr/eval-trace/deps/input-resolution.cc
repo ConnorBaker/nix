@@ -104,57 +104,48 @@ static std::string_view encodedKeyBlobView(const std::vector<uint8_t> & blob)
     return {reinterpret_cast<const char *>(blob.data()), blob.size()};
 }
 
-void feedCanonicalDepKeyMaterial(
-    eval_trace::CanonicalHashBuilder & builder,
+ResolvedDepKeyMaterial resolveDepKeyMaterial(
     const InterningPools & pools,
     const Dep::Key & key)
 {
     if (key.isTraceContext())
         throw Error("internal error: trace-context dep key requires vocab-aware hashing");
 
-    builder.field("dep.key.kind", key.kind);
-    builder.field("dep.key.source", pools.resolve(key.sourceId));
+    ResolvedDepKeyMaterial m;
+    m.kind = key.kind;
+    m.source = pools.resolve(key.sourceId);
 
     if (key.isStructured()) {
-        builder.field("dep.key.structured.file", pools.resolve(key.filePathId));
-        builder.field("dep.key.structured.format", static_cast<uint8_t>(key.format));
-        auto path = pools.dataPathPool.collectPath(key.dataPathId);
-        builder.field("dep.key.structured.path.count", static_cast<uint64_t>(path.size()));
-        for (auto & node : path) {
-            if (node.arrayIndex >= 0) {
-                builder.field("dep.key.structured.path.component.type", std::string_view("array-index"));
-                builder.field("dep.key.structured.path.component.index", node.arrayIndex);
-            } else {
-                builder.field("dep.key.structured.path.component.type", std::string_view("object-key"));
-                builder.field("dep.key.structured.path.component.key", node.component);
-            }
-        }
-        builder.field("dep.key.structured.suffix", key.suffix);
-        builder.field("dep.key.structured.has-key.present", key.hasKeyId.value != 0);
-        if (key.hasKeyId.value != 0)
-            builder.field("dep.key.structured.has-key", pools.resolve(key.hasKeyId));
-        builder.field("dep.key.structured.dir-set.present", key.dirSetHashId.value != 0);
-        if (key.dirSetHashId.value != 0)
-            builder.field("dep.key.structured.dir-set", pools.resolve(key.dirSetHashId));
-        return;
+        m.structured = true;
+        m.structuredFile = pools.resolve(key.filePathId);
+        m.format = key.format;
+        m.path = pools.dataPathPool.collectPath(key.dataPathId);  // the costly walk — ONCE
+        m.suffix = key.suffix;
+        m.hasKeyPresent = key.hasKeyId.value != 0;
+        if (m.hasKeyPresent)
+            m.hasKey = pools.resolve(key.hasKeyId);
+        m.dirSetPresent = key.dirSetHashId.value != 0;
+        if (m.dirSetPresent)
+            m.dirSet = pools.resolve(key.dirSetHashId);
+        return m;
     }
 
     switch (key.kind) {
     case CanonicalQueryKind::DerivedStorePath:
-        builder.field("dep.key.derived-store-path",
-            encodedKeyBlobView(encodeDerivedStorePathDepKey(
-                pools.resolve(key.derivedStorePathKeyId())).value));
-        return;
+        m.isEncodedBlob = true;
+        m.encodedBlobTag = "dep.key.derived-store-path";
+        m.encodedBlob = encodeDerivedStorePathDepKey(pools.resolve(key.derivedStorePathKeyId())).value;
+        return m;
     case CanonicalQueryKind::StorePathAvailability:
-        builder.field("dep.key.store-path-availability",
-            encodedKeyBlobView(encodeStorePathAvailabilityDepKey(
-                pools.resolve(key.storePathAvailabilityKeyId())).value));
-        return;
+        m.isEncodedBlob = true;
+        m.encodedBlobTag = "dep.key.store-path-availability";
+        m.encodedBlob = encodeStorePathAvailabilityDepKey(pools.resolve(key.storePathAvailabilityKeyId())).value;
+        return m;
     case CanonicalQueryKind::RuntimeFetchIdentity:
-        builder.field("dep.key.runtime-fetch-identity",
-            encodedKeyBlobView(encodeRuntimeFetchIdentityDepKey(
-                pools.resolve(key.runtimeFetchIdentityKeyId())).value));
-        return;
+        m.isEncodedBlob = true;
+        m.encodedBlobTag = "dep.key.runtime-fetch-identity";
+        m.encodedBlob = encodeRuntimeFetchIdentityDepKey(pools.resolve(key.runtimeFetchIdentityKeyId())).value;
+        return m;
     case CanonicalQueryKind::FileBytes:
     case CanonicalQueryKind::DirectoryEntries:
     case CanonicalQueryKind::ExistenceCheck:
@@ -165,14 +156,64 @@ void feedCanonicalDepKeyMaterial(
     case CanonicalQueryKind::RawBytes:
     case CanonicalQueryKind::GitRevisionIdentity:
     case CanonicalQueryKind::VolatileTime:
-        builder.field("dep.key.simple", pools.resolve(key.simpleKeyId()));
-        return;
+        m.isEncodedBlob = false;
+        m.simpleKey = pools.resolve(key.simpleKeyId());
+        return m;
     case CanonicalQueryKind::StructuredProjection:
     case CanonicalQueryKind::ImplicitStructure:
     case CanonicalQueryKind::TraceValueContext:
     case CanonicalQueryKind::TraceParentSlot:
         unreachable();
     }
+    unreachable();
+}
+
+void feedResolvedDepKeyMaterial(
+    eval_trace::CanonicalHashBuilder & builder,
+    const ResolvedDepKeyMaterial & m)
+{
+    // Byte-identical to the pre-H-cold-1 feedCanonicalDepKeyMaterial: same field
+    // tags, same order, same values — only the resolution was hoisted into
+    // resolveDepKeyMaterial. Any deviation here is a schema break (invalidates
+    // every cached trace) and is pinned by the golden-equivalence test.
+    builder.field("dep.key.kind", m.kind);
+    builder.field("dep.key.source", m.source);
+
+    if (m.structured) {
+        builder.field("dep.key.structured.file", m.structuredFile);
+        builder.field("dep.key.structured.format", static_cast<uint8_t>(m.format));
+        builder.field("dep.key.structured.path.count", static_cast<uint64_t>(m.path.size()));
+        for (auto & node : m.path) {
+            if (node.arrayIndex >= 0) {
+                builder.field("dep.key.structured.path.component.type", std::string_view("array-index"));
+                builder.field("dep.key.structured.path.component.index", node.arrayIndex);
+            } else {
+                builder.field("dep.key.structured.path.component.type", std::string_view("object-key"));
+                builder.field("dep.key.structured.path.component.key", node.component);
+            }
+        }
+        builder.field("dep.key.structured.suffix", m.suffix);
+        builder.field("dep.key.structured.has-key.present", m.hasKeyPresent);
+        if (m.hasKeyPresent)
+            builder.field("dep.key.structured.has-key", m.hasKey);
+        builder.field("dep.key.structured.dir-set.present", m.dirSetPresent);
+        if (m.dirSetPresent)
+            builder.field("dep.key.structured.dir-set", m.dirSet);
+        return;
+    }
+
+    if (m.isEncodedBlob)
+        builder.field(m.encodedBlobTag, encodedKeyBlobView(m.encodedBlob));
+    else
+        builder.field("dep.key.simple", m.simpleKey);
+}
+
+void feedCanonicalDepKeyMaterial(
+    eval_trace::CanonicalHashBuilder & builder,
+    const InterningPools & pools,
+    const Dep::Key & key)
+{
+    feedResolvedDepKeyMaterial(builder, resolveDepKeyMaterial(pools, key));
 }
 
 EncodedDerivedStorePathDepKeyBlob encodeDerivedStorePathDepKey(const DerivedStorePathDepKey & key)

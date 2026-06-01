@@ -182,6 +182,57 @@ TEST_F(DepHashTest, Hash_PreSorted_ContentHashMatchesUnsorted)
     EXPECT_EQ(computeTraceHash(pools,deps), computeTraceHashFromSorted(pools,sorted));
 }
 
+// RFC-perf H-cold-1 GOLDEN EQUIVALENCE: the fused single-pass
+// computeRecordHashesFromSorted (resolve each key once, feed 3 builders) MUST be
+// byte-identical to the 3 separate computeTraceHash/computeFullTrace/computeDepKeySet
+// passes. Any divergence is a schema break (every cached trace invalidated), so this
+// pins it directly (the warm-hit functional tests catch it end-to-end; this is the
+// fast, focused unit guard). Uses a representative mixed dep vector INCLUDING a
+// multi-component structured dep — the case that exercises dataPathPool.collectPath,
+// the resolution H-cold-1 dedups.
+TEST_F(DepHashTest, Hash_RecordHashesFused_MatchesSeparatePasses)
+{
+    StructuredPath dataPath = {
+        StructuredPathComponent::makeKey("pkgs"),
+        StructuredPathComponent{.key = "", .index = 3},  // array index component
+        StructuredPathComponent::makeKey("outPath"),
+    };
+    std::vector<Dep> deps = {
+        makeContentDep(pools, "/a.nix", "content-a"),
+        makeEnvVarDep(pools, "HOME", "/home/u"),
+        makeExistenceDep(pools, "/maybe", true),
+        makeSystemDep(pools, "x86_64-linux"),
+        makeGitIdentityDep(pools, "/repo", "rev-abc"),       // ImplicitStructural (trace-skipped, full/keySet kept)
+        makeStructuredDepForTest(pools, CanonicalQueryKind::StructuredProjection,
+            DepSource::fromNodeKey("root"), "/data.json", StructuredFormat::Json,
+            dataPath, DepHashValue(depHash("v"))),           // exercises collectPath
+        makeCopiedPathDep(pools, "/src", "name", "/nix/store/xxx-name"),  // DerivedStorePath (encoded blob)
+    };
+    auto sorted = sortAndDedupDeps(deps);
+
+    // Reference: the 3 standalone passes (each re-resolves keys via feedCanonicalDepKeyMaterial).
+    auto refTrace  = computeTraceHashFromSorted(pools, sorted);
+    auto refFull   = computeFullTraceHashFromSorted(pools, sorted);
+    auto refKeySet = computeDepKeySetHashFromSorted(pools, sorted);
+
+    // Fused: resolve once, feed 3 builders (mirrors Recorder::feed3's non-trace-context branch).
+    auto feed3 = [this](CanonicalHashBuilder * traceB, CanonicalHashBuilder & fullB,
+                        CanonicalHashBuilder & keySetB, const Dep::Key & key) {
+        auto material = resolveDepKeyMaterial(pools, key);
+        if (traceB) feedResolvedDepKeyMaterial(*traceB, material);
+        feedResolvedDepKeyMaterial(fullB, material);
+        feedResolvedDepKeyMaterial(keySetB, material);
+    };
+    auto fused = computeRecordHashesFromSorted(sorted, feed3);
+
+    EXPECT_EQ(fused.traceHash, refTrace)
+        << "H-cold-1: fused traceHash must be byte-identical to the standalone pass";
+    EXPECT_EQ(fused.fullHash, refFull)
+        << "H-cold-1: fused fullTraceHash must be byte-identical to the standalone pass";
+    EXPECT_EQ(fused.depKeySetHash, refKeySet)
+        << "H-cold-1: fused depKeySetHash must be byte-identical to the standalone pass";
+}
+
 TEST_F(DepHashTest, Hash_TraceHash_FramesDepValueVariant)
 {
     auto key = Dep::Key::makeSimple(

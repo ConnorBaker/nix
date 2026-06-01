@@ -37,14 +37,36 @@ RecordResult Recorder::record(
     // 1. Sort deps canonically and drop only exact duplicate observations.
     auto sorted = sortAndDedupDeps(allDeps);
 
-    // 2. Compute canonical recovery hash plus exact storage hashes.
-    auto feedKeyFn = [this](CanonicalHashBuilder & builder, const Dep::Key & key) {
-        feedKey(builder, key);
+    // 2. Compute canonical recovery hash + the two exact storage hashes in a
+    //    SINGLE pass, resolving each dep key's pool material ONCE and feeding it
+    //    into all three builders (RFC-perf H-cold-1). The 3-separate-passes shape
+    //    re-resolved each key (feedCanonicalDepKeyMaterial: pools.resolve +
+    //    dataPathPool.collectPath) 3× — the dominant cold-record cost on the
+    //    flattened 48K-dep vectors. Byte-identical output; see
+    //    computeRecordHashesFromSorted. Trace-context keys (cheap, no collectPath)
+    //    are fed via vocab.feedPath, matching VocabAwareHasher::feedKey.
+    auto feed3 = [this](CanonicalHashBuilder * traceB, CanonicalHashBuilder & fullB,
+                        CanonicalHashBuilder & keySetB, const Dep::Key & key) {
+        if (key.isTraceContext()) {
+            // Cheap path: no pool resolution to dedup; feed each builder directly,
+            // matching VocabAwareHasher::feedKey's trace-context branch.
+            auto feedTc = [&](CanonicalHashBuilder & b) {
+                b.field("dep.key.kind", key.kind);
+                hasherVocab().feedPath(b, key.attrPathId);
+            };
+            if (traceB) feedTc(*traceB);
+            feedTc(fullB);
+            feedTc(keySetB);
+            return;
+        }
+        // Expensive path: resolve ONCE, feed the (byte-identical) material thrice.
+        auto material = resolveDepKeyMaterial(hasherPools(), key);
+        if (traceB) feedResolvedDepKeyMaterial(*traceB, material);
+        feedResolvedDepKeyMaterial(fullB, material);
+        feedResolvedDepKeyMaterial(keySetB, material);
     };
     auto hashStart = timerStart();
-    auto traceHash = computeTraceHashFromSorted(sorted, feedKeyFn);
-    auto fullHash = computeFullTraceHashFromSorted(sorted, feedKeyFn);
-    auto keySetHash = computeDepKeySetHashFromSorted(sorted, feedKeyFn);
+    auto [traceHash, fullHash, keySetHash] = computeRecordHashesFromSorted(sorted, feed3);
     nrRecordHashUs += elapsedUs(hashStart);
 
     // 3. Split into keys + values.
