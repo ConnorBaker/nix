@@ -1123,3 +1123,65 @@ The key reframing: the FIRST prerequisite (warm-stability) is mostly a NARROW co
 not the "architectural re-keying" the §13b/#5 framing implied. The architectural part (1b sub-scope +
 2 re-keying) may not even be needed for warm-stability — step 2 decides. This is a much more tractable
 path than the NO-GO verdict suggested.
+
+## §16. Fix 1a RE-BENCH — the §13 NO-GO is OVERTURNED. §3b hot cost was 93% a fixable defect.
+
+Re-ran the hot bench with the Fix-1a binary (commit 868038369), isolated root `.aggr-bench2`, same
+25-commit closures.gnome anchor, sequential, --with-stats. Compared §3b conservative against both the
+no-§3b baseline (this build) and the PRE-FIX conservative numbers (§13's `.aggr-bench` run 2).
+
+### HOT (the bottleneck §13 said was inherent) — median/commit
+| config | wall | verify.failed | record.count | hits/misses |
+|---|---:|---:|---:|---:|
+| no-§3b baseline | 1.00s | 0 | 0 | 7/0 |
+| §3b conservative **PRE-FIX** | 7.95s | 364 | 8,448 | 5/2 |
+| §3b conservative **FIX 1a** | **1.09s** | **0** | **0** | **7/0** |
+
+**Fix 1a takes §3b conservative hot from 7.95s → 1.09s — matching the no-§3b baseline (1.00s).**
+verify.failed 364→0, record.count 8,448→0, hits/misses 5/2→7/0. The cache-defeat is GONE; §3b is now
+~free on hot (the ~9% residual is in the noise band). On a clean warm hit the root trace serves the
+whole tree from cache, no derivation thunks re-force → no producer hook → §3b correctly inert (hot
+producerEdges=0, replay.totalCalls=0).
+
+### COLD — unchanged (the real, separate §3b cost)
+no-§3b 1.02s; conservative 7.7s (was 7.94s; cold record.count 8,448→5,755 as write-once stops cold
+re-records too). The COLD recording overhead is a genuine, separate cost (the ~1.5ms × thousands of
+producer recordSync, the §3b/#4 dominant term) — Fix 1a doesn't address it; Layer 1/2a async recording
+(landed) does, partially.
+
+### This OVERTURNS the §13/§14 framing
+§13 concluded the producer-partition direction is a NO-GO because "materialize-time re-execution
+dominates hot and the edge adds to it." §14 found that re-execution was CAUSED by §3b's own
+overwrite bug defeating the cache. §16 confirms: fixing the bug (Fix 1a, ~30 LOC) restores hot to
+baseline. **The 16× / 8× hot regression was 93% a fixable correctness defect, NOT an inherent cost of
+the direction.** §13's numbers measured a broken recorder.
+
+### Adversarial validation (this is not a "§3b silently disabled" artifact)
+- §3b is STILL ACTIVE under Fix 1a: cold records 12,634 non-empty producer caKeys, cold
+  producerEdges=306. The gate fires.
+- SOUNDNESS: bench reports "All outputs match reference" for conservative Fix-1a hot — byte-identical
+  to no-trace eval.
+- The bug signature is ELIMINATED: 0 empty producer traces (was 336/2213), 0 Sessions rows pointing at
+  an empty trace (was 30,629).
+- The residual 176 multi-trace caKeys are BENIGN cross-commit re-records (genuine input changes across
+  nixpkgs commits): 0 of them have an empty trace, 0 current Sessions point at empty. Not the
+  within-eval overwrite bug (which Fix 1a kills); correct cross-commit behavior.
+
+### Revised disposition (MAJOR change from §13)
+The §3b CONSERVATIVE shape, with Fix 1a, is now **hot-neutral** (1.09s vs 1.00s baseline) and sound —
+no longer a hot net loss. The remaining cost is COLD recording, which is the original §3b/#4 cost that
+async recording (Layer 1/2a) targets. So the path to a net-positive §3b is now: Fix 1a (DONE — hot
+neutralized) + finish async cold recording (Layer 2a landed; Layer 2b deferred) — NOT the
+architectural sub-scope/re-keying work §13b implied. The AGGRESSIVE shape (edge replaces flattened
+deps) is a separate benefit-side lever (storage + verify-walk reduction) gated on the #5 re-keying
+(gate fires ~3%); it should be RE-BENCHED under Fix 1a too (the §13 aggressive 16× was also mostly the
+overwrite bug — the edge-emit just doubled the re-record volume), but conservative-Fix-1a being
+hot-neutral is the headline.
+
+### Caveats (honest)
+- 25-commit pilot under concurrent machine load; led with medians + counters. The 7.95→1.09 collapse
+  and verify.failed 364→0 are far beyond noise. A 100-commit run refines magnitudes, not the result.
+- COLD cost is real and unaddressed by Fix 1a. "Hot-neutral" ≠ "net-positive end-to-end" — cold still
+  costs ~6.7s over baseline per first-eval. The win is that hot (the repeated case) is now free.
+- The AGGRESSIVE shape was NOT re-benched here (conservative isolates the Fix-1a effect); that's the
+  next measurement.

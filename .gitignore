@@ -65,3 +65,4 @@ flake-regressions
 # local analysis scratch
 research/
 .aggr-bench/
+.aggr-bench2/
