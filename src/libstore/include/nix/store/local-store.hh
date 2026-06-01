@@ -446,6 +446,56 @@ public:
      */
     void registerLinkedCAPath(const StorePath & from, const ValidPathInfo & toInfo);
 
+    /**
+     * Materialise a store path by ASSEMBLING it from an already-valid base
+     * store path plus a small set of changed files — the dirty-tree
+     * analogue of `registerLinkedCAPath`. Where the byte-identical-sibling
+     * case (`registerLinkedCAPath`) hardlinks an entire tree from `base`,
+     * this targets the incremental-edit shape (item (b)): a working tree
+     * (`accessor`) that differs from its committed `base` by a handful of
+     * files. The structure to reproduce is taken from `accessor`; `base`
+     * supplies the bytes of the unchanged majority.
+     *
+     * Construction of the result tree:
+     *   - every path NOT in `changedFiles`/`deletedFiles` is reflinked
+     *     (copy-on-write, `tryCloneFile`) or hardlinked from `base` — O(1)
+     *     per file, no data blocks copied;
+     *   - every path in `changedFiles` (added or modified) is written from
+     *     `accessor`;
+     *   - paths in `deletedFiles` are simply absent.
+     *
+     * It assembles into a store scratch dir, hashes the result ONCE (NAR,
+     * SHA-256), derives the NixArchive CA `ValidPathInfo` from that hash,
+     * and registers it. That single hash IS the soundness guard: unlike
+     * `registerLinkedCAPath` (byte-identical by construction), this builds
+     * a NOVEL tree, and `ValidPathInfo::makeFromCA` stores `narHash`
+     * VERBATIM (never re-hashing the bytes), so deriving the path from the
+     * *measured* hash is what guarantees the registered path's name
+     * matches its content. There is no separate dryRun, so no double walk;
+     * (b) saves the byte-COPY of the unchanged majority, not the hash read.
+     *
+     * @param expectedPath if set, the assembled path's derived store path
+     * MUST equal it (the name the evaluator already minted from the lock
+     * narHash); a mismatch throws (errno 102 — the content does not hash
+     * to the expected name). If unset, whatever path the content hashes to
+     * is used (the caller then compares / falls back as it sees fit).
+     *
+     * @param name the store-path name (e.g. "source").
+     *
+     * Preconditions (asserted): `base` valid; writable store.
+     *
+     * @return the assembled `StorePath` on success; `std::nullopt` if
+     * assembly was not applicable (base not a usable prefix of the target)
+     * — caller falls back to a full copy.
+     */
+    std::optional<StorePath> assembleCAPathFromBase(
+        const StorePath & base,
+        ref<SourceAccessor> accessor,
+        const std::set<CanonPath> & changedFiles,
+        const std::set<CanonPath> & deletedFiles,
+        std::string_view name,
+        std::optional<StorePath> expectedPath);
+
     unsigned int getProtocol() override;
 
     std::optional<TrustedFlag> isTrustedClient() override;

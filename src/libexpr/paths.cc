@@ -1,8 +1,10 @@
 #include "nix/store/store-api.hh"
+#include "nix/store/local-store.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/input-materialisation.hh"
 #include "nix/expr/materialisation-scheduler.hh"
 #include "nix/util/mounted-source-accessor.hh"
+#include "nix/util/source-view.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/fetchers.hh"
 
@@ -114,24 +116,140 @@ void EvalState::ensureLazyPathCopied(const StorePath & path)
        lazy-fetch and tree materialisation compose efficiently. */
     mount->prefetchSubtree(CanonPath::root, std::numeric_limits<unsigned>::max());
 
-    /* TODO: We could memoise this in-memory if necessary. */
-    auto storePath = fetchToStore(
-        fetchSettings,
-        *store,
-        SourcePath{ref(mount)},
-        /* Force a copy. mountInput does a dryRun to just calculate the storePath and narHash. */
-        FetchMode::Copy,
-        realPath.name());
+    /* Item (b): base-plus-overlay assembly. When the mounted accessor is a
+       dirty git working tree (a `SourceViewAccessor` with a `recipe::Overlay`
+       over a committed-tree base), most files are unchanged from the base.
+       Rather than re-copy the WHOLE tree, materialise the committed base
+       ONCE (cached across edits by the tree-OID bridge) and ASSEMBLE the
+       dirty store path from it: reflink/hardlink the unchanged majority,
+       write only the changed files. The assembler hashes the result once
+       (the unavoidable read — no double walk) and verifies it against the
+       evaluator-minted name (`realPath`). On any non-applicability (no
+       LocalStore, base not materialisable, base not a usable prefix) we
+       fall through to the plain full copy below. */
+    std::optional<StorePath> assembled;
+    if (auto * localStore = dynamic_cast<LocalStore *>(&*store)) {
+        if (auto * view = dynamic_cast<SourceViewAccessor *>(&*mount)) {
+            if (auto * ov = std::get_if<recipe::Overlay>(&view->recipe)) {
+                try {
+                    /* Materialise the committed base tree to a store path.
+                       This is a full copy of the base, content-addressed by
+                       its tree OID. The base accessor carries no fingerprint
+                       (`GitRepoImpl::getRawAccessor`), so `fetchToStore`'s
+                       own cache can't dedup it and would re-walk the whole
+                       committed tree on every edit. The committed tree OID
+                       is stable across edits and O(1) via `getRootTreeHash`,
+                       so memoise the base store path on it (per EvalState):
+                       materialise once per (process, tree OID), reuse
+                       thereafter. The memo value is re-validated (a GC may
+                       have reaped it) before trusting it. */
+                    auto baseTreeOid = view->base->getRootTreeHash();
+                    std::optional<StorePath> basePathOpt;
+                    if (baseTreeOid) {
+                        auto bases = materialisedBases_.readLock();
+                        if (auto it = bases->find(*baseTreeOid);
+                            it != bases->end() && store->isValidPath(it->second))
+                            basePathOpt = it->second;
+                    }
+                    auto basePath = basePathOpt ? *basePathOpt
+                                                : fetchToStore(
+                                                      fetchSettings,
+                                                      *store,
+                                                      SourcePath{view->base},
+                                                      FetchMode::Copy,
+                                                      realPath.name() + "-base");
+                    if (baseTreeOid && !basePathOpt)
+                        materialisedBases_.lock()->insert_or_assign(*baseTreeOid, basePath);
+                    /* No `expectedPath`: the assembler computes the true
+                       narHash of the assembled tree and returns whatever
+                       path that content names. We then CHECK it equals the
+                       `realPath` the evaluator already minted. A dirty
+                       workdir overlay is never `rev`-locked, so `realPath`
+                       here was produced by the slow path's own force over
+                       this same accessor — i.e. a divergence would be an
+                       ASSEMBLER bug, not a stale lock. So on any divergence
+                       we fall back to the full copy (always correct) rather
+                       than surfacing a misleading mismatch error. */
+                    auto candidate = localStore->assembleCAPathFromBase(
+                        basePath, ref(mount), ov->entries, ov->whiteouts, realPath.name(), std::nullopt);
+                    if (candidate && *candidate == realPath) {
+                        assembled = candidate;
+                        debug(
+                            "virtual-mount: assembled '%s' from base '%s' (+%d changed, %d whiteouts) — unchanged "
+                            "files reflinked/hardlinked, not re-copied",
+                            store->printStorePath(*assembled),
+                            store->printStorePath(basePath),
+                            ov->entries.size(),
+                            ov->whiteouts.size());
+                    } else if (candidate) {
+                        debug(
+                            "virtual-mount: assembled path '%s' != expected '%s' (assembler/overlay disagreement) — "
+                            "full copy",
+                            store->printStorePath(*candidate),
+                            store->printStorePath(realPath));
+                    }
+                } catch (Error & e) {
+                    /* "Not applicable" returns nullopt (handled above).
+                       Any thrown error: fall back to the full copy, which
+                       is unconditionally correct. */
+                    debug(
+                        "virtual-mount: base-overlay assembly failed for '%s' (%s) — full copy",
+                        realPath.name(),
+                        e.what());
+                }
+            }
+        }
+    }
 
-    /* Catch hash mismatches more loudly. This is more likely caused by unsound
-       caching of different accessor types that fetch the same repo with
-       the same git revision, but with different kinds of accessors (think
-       tarball-based fetchers vs local/remote git accessors). */
+    /* TODO: We could memoise this in-memory if necessary. */
+    auto storePath = assembled ? *assembled
+                               : fetchToStore(
+                                     fetchSettings,
+                                     *store,
+                                     SourcePath{ref(mount)},
+                                     /* Force a copy. mountInput does a dryRun to just calculate the storePath and narHash. */
+                                     FetchMode::Copy,
+                                     realPath.name());
+
+    /* The copied path must equal the name we minted. A mismatch means the
+       bytes we just hashed do not match the narHash that named `realPath`.
+
+       Two distinct causes, distinguished by whether `realPath` was a
+       deferred stand-in:
+
+       - For a `virtualMounts_` stand-in (slow-path Item-2 defer),
+         `realPath` came from `mat->force()`, which already verified the
+         content against the input's `expectedNarHash`; a mismatch here
+         can then only be an internal inconsistency (e.g. unsound caching
+         across accessor types that fetch the same git rev differently —
+         tarball vs local/remote git). That is a bug: panic.
+
+       - For the known-narHash DEFER (item (c)), `realPath` is the real CA
+         path minted directly from the lock's narHash, and no force ran
+         before this copy. A mismatch then means the source CONTENT
+         changed since it was locked (a stale lock over a `path:`/dirty
+         input). That is a user-facing condition, not a bug — report it as
+         the same NAR-hash-mismatch error the eager path raises (errno
+         102), naming the expected (locked) vs actual store path. */
     if (storePath != realPath) {
-        panic(fmt(
-            "hashed store path computed by the evaluator ('%1%') does not match what was computed when copying to the store ('%2%'), this is a bug",
+        bool wasStandIn;
+        {
+            auto rewrites = virtualPathRewrites_.readLock();
+            wasStandIn = rewrites->find(path) != rewrites->end() && path != realPath;
+        }
+        if (wasStandIn)
+            panic(fmt(
+                "hashed store path computed by the evaluator ('%1%') does not match what was computed when copying to the store ('%2%'), this is a bug",
+                store->printStorePath(realPath),
+                store->printStorePath(storePath)));
+        throw Error(
+            (unsigned int) 102,
+            "NAR hash mismatch for '%s': the source content does not match the hash it was locked with "
+            "(expected store path '%s' but the content hashes to '%s'). The input may have changed since "
+            "its hash was recorded; re-lock it (e.g. `nix flake update`) or remove the stale lock.",
+            realPath.name(),
             store->printStorePath(realPath),
-            store->printStorePath(storePath)));
+            store->printStorePath(storePath));
     }
 }
 
@@ -244,6 +362,16 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
        `getNarHash` will not actually trigger a force here, and using
        it preserves identical behaviour with master's check. */
     if (auto knownHash = originalInput.getNarHash()) {
+        /* Whether the input pins IMMUTABLE content — the precondition for
+           deferring the narHash-vs-content check past mount (see the defer
+           branch below). A git/treeOID `rev` denotes a fixed object, so a
+           rev present is the signal — EXCEPT for a `path:` input, which
+           accepts a user-supplied "fake" `rev` attr (path.cc) while
+           pointing at a MUTABLE directory; its narHash is only a snapshot.
+           So a `path:` input is never treated as immutable here regardless
+           of a pasted `rev`, and falls through to the slow path's eager
+           verification. */
+        bool immutableRev = originalInput.getRev() && originalInput.getType() != "path";
         try {
             auto candidate = store->makeFixedOutputPathFromCA(
                 input.getName(),
@@ -259,8 +387,25 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
                 input.attrs.insert_or_assign("narHash", knownHash->to_string(HashFormat::SRI, true));
                 return candidate;
             }
-            /* Try substitution before falling through. */
-            store->ensurePath(candidate);
+            /* Try substitution before deferring. `ensurePath` THROWS when
+               there is no substituter that can provide the path (the cold
+               local-only case) — catch that here so we proceed to the
+               defer branch below rather than escaping to the slow-path
+               dryRun. Any other store error also falls through to defer:
+               we hold the narHash, so the name is sound regardless. Skip
+               the substitution attempt entirely for an input that won't
+               defer (no `rev`, see the gate below) — no point paying a
+               substituter round-trip; the slow path handles it. */
+            if (immutableRev) {
+                try {
+                    store->ensurePath(candidate);
+                } catch (Error & e) {
+                    debug(
+                        "mountInput known-narHash: substitution unavailable for '%s' (%s) — deferring copy",
+                        store->printStorePath(candidate),
+                        e.what());
+                }
+            }
             if (store->isValidPath(candidate)) {
                 debug(
                     "virtual-mount: input '%s' known-narHash fast path, store path '%s' substituted — no walk",
@@ -271,6 +416,81 @@ EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalI
                 input.attrs.insert_or_assign("narHash", knownHash->to_string(HashFormat::SRI, true));
                 return candidate;
             }
+
+            /* Known-narHash DEFER (item (c)): the CA path is neither
+               valid locally nor substitutable, but we already hold its
+               narHash, so we already know its store-path NAME. Rather
+               than fall through to the slow path's eager dryRun walk —
+               which would re-derive the very narHash we are holding —
+               mint the real `candidate` now (no walk), mount the live
+               accessor under it, and DEFER the byte-copy to the first
+               hard demand (`ensureLazyPathCopied` at the derivation
+               boundary). A consumer that reads only metadata
+               (`outPath`/`rev`/`lastModified`) then walks ZERO times; a
+               build copies exactly ONCE (the unavoidable ingestion),
+               versus the two walks (dryRun-to-name + copy) the slow path
+               would pay.
+
+               GATE — `immutableRev` (see its definition above): the input
+               carries a git/treeOID `rev` AND is not a `path:` input. This
+               is STRICTER than `isLocked`, and than a bare `getRev()`,
+               deliberately so. Deferring moves the narHash-vs-content check
+               from mount time to the copy boundary, which a metadata-only
+               consumer never reaches — so the defer is only sound when the
+               content cannot have drifted from the narHash that names it.
+
+               A `rev`-pinned git/github/etc. input satisfies that: the rev
+               addresses a fixed object, immutable under us. But the bare
+               `getRev()` is NOT sufficient, because a `path:` input accepts
+               a user-supplied "fake" `rev` attr (path.cc's allowed-attrs)
+               while pointing at a MUTABLE directory whose narHash was only
+               a snapshot. If we deferred such a `path:` input and its
+               directory changed after locking (without a re-lock), a
+               metadata-only read (`.rev`/`.lastModified`) would silently
+               accept the stale-locked value instead of throwing the
+               NAR-hash mismatch the eager slow path raises. So `path:` is
+               excluded by `getType() != "path"` in `immutableRev`, and
+               falls through to the slow path, whose `InputMaterialisation`
+               carries `expectedNarHash` and verifies eagerly when bytes are
+               demanded, exactly as master. (A rev-less tarball/`path:`/etc.
+               also falls through — a missed optimisation, not a soundness
+               gap; conservative on purpose.)
+
+               An UNLOCKED input that merely CARRIES a `narHash` attr
+               (e.g. `fetchTree { url=…; narHash=…; }` with no `rev`) is the
+               same: the hash is an UNVERIFIED claim over non-pinned
+               content, so it must keep eager verification.
+
+               Soundness of the rev-pinned defer beyond the gate: unlike
+               the slow-path Item-2 fake stand-in, `candidate` is the REAL
+               canonical CA path keyed on the known narHash, so no fake
+               path can persist into a `.drv`, lockfile, or eval cache, and
+               it is sound in pure eval too (no §6.4.7(c) hazard). The
+               (pathological) stale-lock mismatch — a rev whose recorded
+               narHash disagrees with the rev's actual content, i.e. a
+               corrupted lock — still fires at the copy boundary
+               (`ensureLazyPathCopied`) as a graceful `Error(102)`.
+               `devirtualizeStorePath(candidate)` is the identity here
+               (candidate is not a stand-in), so the existing copy boundary
+               already does the right thing with no extra registration.
+
+               If the input is not `immutableRev` we deliberately do nothing
+               here and let control fall out of the fast-path block to the
+               slow path below. */
+            if (immutableRev) {
+                debug(
+                    "virtual-mount: input '%s' known-narHash, deferring copy of '%s' (no walk to name)",
+                    input.to_string(),
+                    store->printStorePath(candidate));
+                allowPath(candidate);
+                storeFS->mount(storeMountKey(*store, candidate), accessor);
+                input.attrs.insert_or_assign("narHash", knownHash->to_string(HashFormat::SRI, true));
+                return candidate;
+            }
+            debug(
+                "mountInput known-narHash: input '%s' is UNLOCKED (narHash is an unverified claim) — not deferring; "
+                "slow path will verify against expectedNarHash",
+                input.to_string());
         } catch (Error & e) {
             debug("mountInput fast-path failed for '%s': %s — falling back to dryRun", input.to_string(), e.what());
         }

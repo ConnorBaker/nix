@@ -83,6 +83,7 @@ sources = files(
   'path.cc',
   'realisation.cc',
   'references.cc',
+  'register-assembled-ca-path.cc',
   'register-linked-ca-path.cc',
   's3-binary-cache-store.cc',
   's3-url.cc',
@@ -129,6 +130,7 @@ if get_option('benchmarks')
   gbenchmark = dependency('benchmark', required : true)
 
   benchmark_sources = files(
+    'assemble-ca-path-bench.cc',
     'bench-main.cc',
     'derivation-parser-bench.cc',
     'ref-scan-bench.cc',

@@ -28,6 +28,11 @@
 #  include <sys/mount.h>
 #endif
 
+#ifdef __linux__
+#  include <sys/ioctl.h>
+#  include <linux/fs.h> // FICLONE
+#endif
+
 #ifdef _WIN32
 #  include <io.h>
 #endif
@@ -618,6 +623,55 @@ void copyFile(const std::filesystem::path & from, const std::filesystem::path & 
                 std::filesystem::perm_options::add | std::filesystem::perm_options::nofollow);
         std::filesystem::remove(from);
     }
+}
+
+bool tryCloneFile(const std::filesystem::path & src, const std::filesystem::path & dst)
+{
+#if defined(__linux__) && defined(FICLONE)
+    /* Open the source read-only and the destination freshly created
+       (O_EXCL: `dst` must not pre-exist, matching the contract). Mode is
+       copied from `src` below on success. */
+    AutoCloseFD srcFd{open(src.c_str(), O_RDONLY | O_CLOEXEC)};
+    if (!srcFd)
+        throw SysError("opening '%s' for reflink", src.string());
+
+    struct stat srcSt;
+    if (fstat(srcFd.get(), &srcSt) == -1)
+        throw SysError("statting '%s' for reflink", src.string());
+    /* FICLONE is only meaningful for regular files; symlinks/dirs/etc.
+       are the caller's job (a symlink has no extents to share). */
+    if (!S_ISREG(srcSt.st_mode))
+        return false;
+
+    AutoCloseFD dstFd{open(dst.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, srcSt.st_mode & 07777)};
+    if (!dstFd) {
+        if (errno == EEXIST)
+            throw SysError("reflink destination '%s' already exists", dst.string());
+        throw SysError("creating reflink destination '%s'", dst.string());
+    }
+
+    if (ioctl(dstFd.get(), FICLONE, srcFd.get()) == 0)
+        return true;
+
+    /* Not a clonable pair: cross-filesystem (EXDEV), filesystem without
+       CoW (EOPNOTSUPP/ENOTTY/EINVAL on ext4 etc.). Remove the empty
+       destination we created and report "must copy". Any other errno is
+       a genuine failure worth surfacing. */
+    auto savedErrno = errno;
+    if (savedErrno == EXDEV || savedErrno == EOPNOTSUPP || savedErrno == ENOTTY || savedErrno == EINVAL
+        || savedErrno == ENOSYS) {
+        dstFd.close();
+        unlink(dst.c_str());
+        return false;
+    }
+    errno = savedErrno;
+    throw SysError("reflinking '%s' to '%s'", src.string(), dst.string());
+#else
+    /* No FICLONE on this platform; caller falls back to a byte copy. */
+    (void) src;
+    (void) dst;
+    return false;
+#endif
 }
 
 void moveFile(const std::filesystem::path & oldName, const std::filesystem::path & newName)

@@ -349,6 +349,26 @@ void copyFile(
     const std::filesystem::path & from, const std::filesystem::path & to, bool andDelete, bool contents = false);
 
 /**
+ * Try to create `dst` as a reflink (copy-on-write clone) of the regular
+ * file `src`: same contents, independent metadata, sharing physical
+ * extents until one side is written. This is O(1) and allocates no data
+ * blocks, unlike a byte copy.
+ *
+ * `dst` must not already exist. The caller is responsible for the file
+ * MODE: a successful clone copies `src`'s permission bits, but store
+ * canonicalisation (read-only, 1970 mtime) is applied separately by the
+ * caller, as for any other store write.
+ *
+ * @return `true` if the reflink succeeded. `false` (no side effect, `dst`
+ * not created) if reflinking is unavailable for this pair — a different
+ * filesystem, a filesystem without CoW (ext4, …), or a non-Linux/
+ * unsupported platform — so the caller must fall back to a byte copy.
+ * Throws `SysError` only on an unexpected error (e.g. `src` unreadable),
+ * never for "reflink not supported here".
+ */
+bool tryCloneFile(const std::filesystem::path & src, const std::filesystem::path & dst);
+
+/**
  * Automatic cleanup of resources.
  */
 class AutoDelete

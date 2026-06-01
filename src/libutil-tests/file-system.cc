@@ -347,4 +347,51 @@ TEST(createTempDir, works)
     ASSERT_TRUE(std::filesystem::is_directory(tmpDir));
 }
 
+/* ----------------------------------------------------------------------------
+ * tryCloneFile
+ * --------------------------------------------------------------------------*/
+
+TEST(tryCloneFile, clonesOrFallsBackButContentsMatch)
+{
+    auto tmpDir = createTempDir();
+    nix::AutoDelete delTmpDir(tmpDir, /*recursive=*/true);
+
+    auto src = tmpDir / "src";
+    auto dst = tmpDir / "dst";
+    writeFile(src, "reflink me");
+
+    bool cloned = tryCloneFile(src, dst);
+
+    /* Whether or not the filesystem supports reflinking (tmp may be ext4,
+       tmpfs, btrfs, xfs, …), the contract is: on success `dst` exists with
+       identical contents; on failure `dst` was NOT created and the caller
+       must copy. We assert the success-side invariant when it cloned, and
+       the no-side-effect invariant when it didn't. */
+    if (cloned) {
+        ASSERT_TRUE(std::filesystem::exists(dst));
+        EXPECT_EQ(readFile(dst), "reflink me");
+        /* A reflink is an independent inode (CoW), not a hardlink. */
+        struct stat sSrc, sDst;
+        ASSERT_EQ(::lstat(src.c_str(), &sSrc), 0);
+        ASSERT_EQ(::lstat(dst.c_str(), &sDst), 0);
+        EXPECT_NE(sSrc.st_ino, sDst.st_ino) << "reflink should be a distinct inode, not a hardlink";
+    } else {
+        EXPECT_FALSE(std::filesystem::exists(dst)) << "failed tryCloneFile must leave no destination";
+    }
+}
+
+TEST(tryCloneFile, nonRegularSourceReturnsFalse)
+{
+    auto tmpDir = createTempDir();
+    nix::AutoDelete delTmpDir(tmpDir, /*recursive=*/true);
+
+    /* A directory is not a regular file: reflink is N/A, must return false
+       with no destination created (not throw). */
+    auto srcDir = tmpDir / "adir";
+    createDirs(srcDir);
+    auto dst = tmpDir / "dst";
+    EXPECT_FALSE(tryCloneFile(srcDir, dst));
+    EXPECT_FALSE(std::filesystem::exists(dst));
+}
+
 } // namespace nix

@@ -10,6 +10,8 @@ suites += {
     'lazy-narhash-cache-key.sh',
     'symlink-root.sh',
     'single-walk-fusion.sh',
+    'known-narhash-defer.sh',
+    'dirty-tree-assemble.sh',
     'storefs-root-key.sh',
     'unfiltered-subtree-bridge.sh',
     'whole-input-tree-dedup.sh',

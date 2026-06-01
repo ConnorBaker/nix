@@ -1247,6 +1247,7 @@ void EvalState::resetFileCache()
        stale path. */
     virtualMounts_.lock()->clear();
     virtualPathRewrites_.lock()->clear();
+    materialisedBases_.lock()->clear();
     lookupPathResolved->clear();
     positions.clear();
     /* Clear before any GC pass that could reclaim StringData backing

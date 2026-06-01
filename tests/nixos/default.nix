@@ -188,6 +188,16 @@ in
   # lazy-vs-eager (metadata / one-file-read / full materialise).
   git-lazy-fetch-scale = runNixOSTest ./git-lazy-fetch-scale.nix;
 
+  # Dirty-tree base-plus-overlay assembly (item (b)): editing one file in a
+  # large git working tree hardlinks the unchanged majority from the
+  # materialised committed base instead of re-copying the whole tree.
+  dirty-tree-assemble = runNixOSTest ./dirty-tree-assemble.nix;
+
+  # Same, but with the store on a btrfs (copy-on-write) filesystem, where
+  # the unchanged files are REFLINKED (shared extents) rather than
+  # hardlinked — the tree-size-independent win the host gbench can't show.
+  dirty-tree-assemble-cow = runNixOSTest ./dirty-tree-assemble-cow.nix;
+
   ca-fd-leak = runNixOSTest ./ca-fd-leak;
 
   content-encoding = runNixOSTest ./content-encoding.nix;

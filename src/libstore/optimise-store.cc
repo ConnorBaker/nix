@@ -4,7 +4,11 @@
 #include "nix/util/signals.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/posix-source-accessor.hh"
+#include "nix/util/source-accessor.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/file-content-address.hh"
+#include "nix/util/hash.hh"
+#include "nix/util/serialise.hh"
 
 #include <cstdlib>
 #include <cstring>
@@ -368,6 +372,178 @@ static void linkOrCopyTree(const std::filesystem::path & src, const std::filesys
             copyFile(src, dst, /*andDelete=*/false);
         }
     }
+}
+
+/* Recursively assemble `dst` (a freshly-created, writable directory tree)
+   to mirror `accessor`'s structure rooted at `relPath`, sourcing the
+   bytes of UNCHANGED regular files from the corresponding file under
+   `baseReal` (reflink, else hardlink, else copy) and writing CHANGED
+   files from `accessor`. `relPath` is the path relative to the tree root
+   (used to look up `baseReal / relPath` and to test membership in
+   `changedFiles`).
+
+   Returns false if assembly cannot proceed for this subtree (e.g. an
+   unchanged file is absent from `base` — a sign the base is not actually
+   a prefix of the target), so the caller can fall back to a full copy. */
+static bool assembleTree(
+    SourceAccessor & accessor,
+    const CanonPath & relPath,
+    const std::filesystem::path & baseReal,
+    const std::filesystem::path & dst,
+    const std::set<CanonPath> & changedFiles)
+{
+    auto st = accessor.lstat(relPath);
+
+    switch (st.type) {
+
+    case SourceAccessor::tDirectory: {
+        createDirs(dst);
+        for (auto & [name, _] : accessor.readDirectory(relPath)) {
+            if (!assembleTree(accessor, relPath / name, baseReal / name, dst / name, changedFiles))
+                return false;
+        }
+        return true;
+    }
+
+    case SourceAccessor::tSymlink: {
+        /* Symlinks are tiny; always write fresh from the accessor (the
+           target string is what matters; there are no extents to share). */
+        createSymlink(accessor.readLink(relPath), dst);
+        return true;
+    }
+
+    case SourceAccessor::tRegular: {
+        bool changed = changedFiles.count(relPath) > 0;
+        if (!changed) {
+            /* Unchanged: source the bytes from base. Reflink (CoW) if the
+               filesystem supports it, else hardlink, else byte-copy. If
+               the base file is missing entirely, the base is not a valid
+               prefix of this target — bail so the caller copies. */
+            if (!pathExists(baseReal))
+                return false;
+            if (!tryCloneFile(baseReal, dst)) {
+                try {
+                    std::filesystem::create_hard_link(baseReal, dst);
+                } catch (std::filesystem::filesystem_error &) {
+                    copyFile(baseReal, dst, /*andDelete=*/false);
+                }
+            }
+            /* Match the source's executable bit (clone/hardlink already
+               carry it; an EXDEV copyFile preserves mode too — this is a
+               cheap belt-and-braces before canonicalisation overwrites
+               perms anyway). */
+            return true;
+        }
+        /* Changed (added/modified): write the new bytes from the accessor,
+           preserving the executable bit. */
+        {
+            AutoCloseFD fd{open(dst.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, st.isExecutable ? 0777 : 0666)};
+            if (!fd)
+                throw SysError("creating assembled file '%s'", dst.string());
+            FdSink sink{fd.get()};
+            accessor.readFile(relPath, sink);
+            sink.flush();
+        }
+        return true;
+    }
+
+    case SourceAccessor::tChar:
+    case SourceAccessor::tBlock:
+    case SourceAccessor::tSocket:
+    case SourceAccessor::tFifo:
+    case SourceAccessor::tUnknown:
+        /* Char/block/socket/fifo/unknown have no place in a store path. */
+        throw Error("assembling store path: unsupported file type at '%s'", relPath.abs());
+    }
+    unreachable();
+}
+
+std::optional<StorePath> LocalStore::assembleCAPathFromBase(
+    const StorePath & base,
+    ref<SourceAccessor> accessor,
+    const std::set<CanonPath> & changedFiles,
+    const std::set<CanonPath> & deletedFiles,
+    std::string_view name,
+    std::optional<StorePath> expectedPath)
+{
+    if (config->readOnly)
+        throw Error("cannot assemble a store path in a read-only store");
+    assert(isValidPath(base));
+
+    (void) deletedFiles; // deletions are implicit: absent from the accessor walk
+
+    auto baseReal = toRealPath(base);
+
+    /* Assemble into a temp dir in the store, hash it ONCE, derive the CA
+       path from that hash, then atomically move it into place. We cannot
+       name the destination before hashing (NAR-CA identity is content),
+       so unlike the `toInfo` overload we build in a scratch location and
+       relocate. The single hash here IS the re-hash guard — there is no
+       separate DryRun, so no double walk. */
+    auto [scratchParent, scratchFd] = createTempDirInStore();
+    AutoDelete delScratch(scratchParent, /*recursive=*/true);
+    auto scratch = std::filesystem::path{scratchParent} / "x";
+
+    if (!assembleTree(*accessor, CanonPath::root, baseReal, scratch, changedFiles)) {
+        debug("assembleCAPathFromBase: base '%s' not a usable prefix — caller should copy", baseReal.string());
+        return std::nullopt;
+    }
+
+    auto h = hashPath(makeFSSourceAccessor(scratch), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256);
+
+    auto ca = ContentAddressWithReferences::fromParts(
+        ContentAddressMethod::Raw::NixArchive, h.hash, StoreReferences{.others = {}, .self = false});
+    auto info = ValidPathInfo::makeFromCA(*this, name, std::move(ca), h.hash);
+    info.narSize = h.numBytesDigested;
+
+    /* If the evaluator already minted a name from the lock's narHash, the
+       assembled content MUST hash to it; otherwise the source changed vs
+       its lock (a stale lock). Report as the canonical NAR-hash mismatch. */
+    if (expectedPath && info.path != *expectedPath)
+        throw Error(
+            (unsigned int) 102,
+            "NAR hash mismatch for '%s': the source content does not match the hash it was locked with "
+            "(expected store path '%s' but the content hashes to '%s'). Re-lock the input or remove the stale lock.",
+            name,
+            printStorePath(*expectedPath),
+            printStorePath(info.path));
+
+    auto dstReal = toRealPath(info.path);
+    addTempRoot(info.path);
+    PathLocks outputLock({dstReal});
+
+    if (isValidPath(info.path))
+        return info.path; /* a concurrent writer committed identical content */
+
+    if (pathExists(dstReal))
+        deletePath(dstReal);
+
+    /* Move the assembled (still-writable) tree into place, THEN canonicalise
+       at the destination — the same order `addToStoreFromDump` uses. Doing
+       it the other way (canonicalise → rename) makes the scratch tree
+       read-only first, and renaming a 0555 directory into the store fails
+       with EACCES on the directory's own write bit. The rename is within
+       the store (one filesystem) so it is atomic; we hold the parent dir
+       writable across it. */
+    const auto dirOfDst = std::filesystem::path{dstReal}.parent_path();
+    bool mustToggle = dirOfDst != config->realStoreDir.get();
+    if (mustToggle)
+        makeWritable(dirOfDst);
+    {
+        MakeReadOnly makeReadOnly(mustToggle ? dirOfDst : std::filesystem::path{});
+        std::filesystem::rename(scratch, dstReal);
+    }
+    /* `delScratch` still fires (we do NOT cancel it): the rename moved
+       `scratchParent/x` into place, leaving `scratchParent` an EMPTY dir,
+       and `AutoDelete(recursive)` removes that leftover. Cancelling here
+       would leak an empty `tmp-*` dir in the store on every assembly
+       (matching `addToStoreFromDump`, which likewise lets its temp parent
+       be cleaned). */
+
+    canonicalisePathMetaData(dstReal, {NIX_WHEN_SUPPORT_ACLS(config->getLocalSettings().ignoredAcls)});
+
+    registerValidPath(info);
+    return info.path;
 }
 
 void LocalStore::registerLinkedCAPath(const StorePath & from, const ValidPathInfo & toInfo)

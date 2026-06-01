@@ -17,6 +17,7 @@ suites += {
     'derivation-json.sh',
     'duplicate-realisation-in-closure.sh',
     'eval-store.sh',
+    'floating-git.sh',
     'gc.sh',
     'import-from-derivation.sh',
     'issue-13247.sh',

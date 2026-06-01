@@ -615,6 +615,23 @@ public:
     Sync<std::unordered_map<StorePath, StorePath>> virtualPathRewrites_;
 
     /**
+     * Memoised `committed-tree-OID → materialised base store path`, for
+     * item (b) base-plus-overlay assembly (`ensureLazyPathCopied`). The
+     * committed base of a dirty git workdir is materialised by a full
+     * `fetchToStore(Copy)`, but the base accessor carries NO fingerprint
+     * (`GitRepoImpl::getRawAccessor` doesn't set one), so `fetchToStore`'s
+     * own `sourcePathToHash` cache treats it as uncacheable and re-walks
+     * the whole committed tree on EVERY edit of the workdir. Since the
+     * committed tree OID is stable across edits (only the workdir changes)
+     * and available O(1) via `getRootTreeHash`, we memoise the base store
+     * path on it here so the base is materialised once per (process, tree
+     * OID) — the resulting store PATH is content-addressed and identical
+     * anyway; this just skips the redundant re-walk. Cleared by
+     * `resetFileCache` alongside the other virtual-mount state.
+     */
+    Sync<std::unordered_map<Hash, StorePath>> materialisedBases_;
+
+    /**
      * If `path` is a deferred-mount stand-in (registered in
      * `virtualMounts_`), force its materialisation and return the
      * real CA store path; otherwise return `path` unchanged. Used at
