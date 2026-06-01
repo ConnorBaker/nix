@@ -1185,3 +1185,94 @@ hot-neutral is the headline.
   costs ~6.7s over baseline per first-eval. The win is that hot (the repeated case) is now free.
 - The AGGRESSIVE shape was NOT re-benched here (conservative isolates the Fix-1a effect); that's the
   next measurement.
+
+## §17. AGGRESSIVE re-bench under Fix 1a — MATERIAL BLOCKER: the edge is hot-NEGATIVE vs conservative
+
+Re-ran the aggressive shape (NIX_CA_PRODUCER_AGGRESSIVE=1) under the Fix-1a binary, same isolated root
+`.aggr-bench2`, 25-commit closures.gnome, vs the no-§3b baseline + conservative (all Fix-1a).
+
+### HOT (median/commit)
+| config | wall | verify.failed | hits/misses | verify.depsChecked | loadTrace.count | verifyTrace.timeUs |
+|---|---:|---:|---:|---:|---:|---:|
+| no-§3b | 1.00s | 0 | 7/0 | 170,670 | 7 | 0.39s |
+| conservative Fix-1a | 1.09s | 0 | 7/0 | 277,349 | 431 | 0.55s |
+| **aggressive Fix-1a** | **1.81s** | **0** | **7/0** | **672,498** | **12,186** | **2.88s** |
+
+### Two findings
+1. **Fix 1a fixed the catastrophe.** Aggressive hot went §13's 16.42s → 1.81s (Fix 1a). verify.failed
+   25,780 → 0, hits/misses 3/4 → 7/0. The §13 16× was ~90% the overwrite bug, confirmed for aggressive
+   too. SOUNDNESS PASS (verify.failed=0, byte-identical).
+2. **But the edge is HOT-NEGATIVE vs conservative — a MATERIAL BLOCKER.** Aggressive hot (1.81s) is
+   ~1.7× conservative (1.09s) and ~1.8× baseline (1.00s). The cause is precise and INHERENT (not a
+   bug): the edge replaces the consumer's INLINE flattened deps with a pointer to a SEPARATE producer
+   trace that warm verify must LOAD + recursively verify (`resolveTraceContextHash` → `verifyTrace`).
+   loadTrace.count 431 → 12,186 (≈1 per distinct producer trace; the memo IS amortizing per-producer,
+   it's just that there are ~12,836 distinct producer traces each loaded once); verifyTrace.timeUs
+   0.55s → 2.88s; depsChecked 277K → 672K.
+
+### Why M≈1 was optimistic (the microbench missed the real cost)
+The verify-gate was settled "WIN" on M≈1 (ca-edge-verify-cost.cc microbench: per-edge verify cost ≈
+per-flat-dep). At workload scale that is FALSE: an edge's warm verify is NOT one hash-compare — it is
+a full `loadTrace` (zstd-decompress the producer's keyset + values blob from SQLite) + recursive
+`verifyTrace` of the producer's whole dep set. The microbench measured steady-state per-item slope
+with the producer ALREADY loaded + verified in-session; it did not capture the 12K cold trace LOADS
+(SQLite read + decompress) that dominate at scale. The ~63% storage/dep-count reduction is REAL but
+does NOT translate to a verify-time win — it translates to a verify-time LOSS, because inline flattened
+deps (already in the consumer's values_blob, one decompress) are cheaper to check than a pointer
+chased into a separate trace (another row load + decompress + recursive verify).
+
+### Disposition: the AGGRESSIVE shape is a NET LOSS on hot even after Fix 1a + recovery fix.
+Not catastrophic (1.8× not 16×), sound, but strictly worse than conservative with no offsetting hot
+benefit (the storage win doesn't pay back the trace-load cost). This is a MATERIAL BLOCKER for the
+aggressive direction, distinct from and surviving the Fix-1a + §12 recovery fixes. The remaining
+theoretical lever (avoid the per-edge loadTrace by keeping the producer's verified-hash hot in a
+cross-consumer cache so the 2nd..Nth consumer's edge resolves without a reload) is exactly the
+`verifiedTraceIds`/`traceContextMemo` that IS already amortizing per-producer — and it still leaves
+~1 load per distinct producer, which at ~12K producers is the cost. There is no obvious way to make an
+edge-to-separate-trace cheaper than inline-deps-already-in-the-blob for the FIRST consumer of each
+producer, and most producers on this workload have few consumers (the sharing is leaf-dep sharing, not
+producer-consumer sharing — the RP#7 confound class).
+
+### What DOES pay off: conservative + Fix 1a (hot-neutral) — but that has no storage win either.
+The honest end state: §3b conservative+Fix1a is hot-neutral (1.09s) and sound, but stores MORE
+(flattened deps + producer traces) — its only value was the never-realized sibling-share amortization.
+The aggressive shape gets the storage win but loses it back (and more) on hot trace-load. NEITHER shape
+is net-positive end-to-end on closures.gnome. The COLD cost (7.7s conservative / 9.5s aggressive vs 1s
+baseline) remains the dominant first-eval cost for both, addressed only partially by async recording.
+
+### §17b. The blocker is INHERENT + workload-structural, not a fixable defect (adversarially confirmed)
+
+I held §17's "material blocker" to the same skepticism that overturned §13 (where "16× inherent" was
+actually the Fix-1a bug). It survives:
+
+- `loadTrace.count`=12,186 ≈ distinct traces 12,836 → the memo IS amortizing (each producer trace
+  loaded ~once, NOT re-loaded per consumer). The 1.81s hot is NOT a memo-miss defect.
+- COLD aggressive emitted only **306 consumer edges** (producerEdges) across the whole eval, against
+  ~12,836 producer traces. So ~97% of producer traces have ≤1 consumer edge — the edge's
+  amortization premise (1 producer ↔ N consumers) is STRUCTURALLY ABSENT on closures.gnome.
+- 305,386 Sessions / 12,836 traces = heavy ATTR-PATH aliasing (same trace = current node for ~24 attr
+  paths) but that is content-addressed trace dedup, NOT producer-consumer edge sharing — the edge
+  doesn't help it.
+
+Conclusion: the aggressive edge converts cheap inline flattened deps (one decompress, already in the
+consumer's blob) into a pointer to a separate producer trace that must be loaded+verified, and there
+is almost no consumer-sharing to amortize that load against. This is the RP#7/§5 "leaf-dep sharing ≠
+producer-consumer sharing" finding, now CONFIRMED at hot-verify scale on the bug-fixed binary. It is
+inherent to the workload's shape, not a fixable bug. Re-keying (Prerequisite 2) would make MORE edges
+fire — but to mostly-singly-consumed producers — so it cannot rescue the hot cost; it would likely
+make it worse.
+
+### FINAL disposition of the producer-partition direction (post-Fix-1a, fully measured)
+- CONSERVATIVE + Fix 1a: hot-NEUTRAL (1.09s vs 1.00s), sound. No storage win, no hot win — net zero
+  hot, net cost cold. Shippable but pointless (its only value, sibling amortization, never materializes).
+- AGGRESSIVE + Fix 1a + recovery fix: hot-NEGATIVE (1.81s), sound. Storage win (~63% dep-count) that
+  costs MORE back on hot trace-load. Net loss.
+- The direction does not pay off on closures.gnome because producer-consumer SHARING is absent (~306
+  edges / ~12K producers). It could only pay off on a workload with high producer-consumer fan-out
+  (one derivation read by many distinct consumer traces) — which closures.gnome (and, per §5, the
+  python3Packages sibling shape) are NOT. This is now MEASURED at hot scale, not projected.
+
+The genuinely valuable artifact from this whole arc is FIX 1A (the write-once caKey dedup) — a real
+correctness fix that makes §3b hot-neutral and is independent of whether the edge direction is pursued.
+It should stay. The aggressive edge-recorder + recovery fix stay as gated, default-OFF, SOUND
+scaffolding with a now-complete measured cost profile, so no future session re-runs this blind.
