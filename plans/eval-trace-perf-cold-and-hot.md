@@ -43,14 +43,23 @@ The §3b/#4 data put this at ~726µs–1.5ms/producer × thousands. The eval THR
 
 ## Avenues — HOT (highest leverage; hot should be ~instant)
 
-### H1. PERSIST the content-hash cache across processes (biggest, most direct win)
+### H1. PERSIST the content-hash cache across processes (biggest, most direct win — and the CONFIRMED hot design as of 2026-06-01)
 The 29K re-hashes exist only because `fileContentHashCache` dies with the process. Persist
-`SourcePath → DepHash` (keyed by a stable path identity + a cheap freshness token — see H2) so the
-warm process reads hashes instead of recomputing. The eval-trace SQLite store already persists far more;
-a `(path_identity, freshness) → content_hash` table is a small addition. Caveat: the key must include a
-freshness discriminator or it's unsound (serving a stale hash for a changed file) — which is H2.
+`SourcePath → DepHash` (keyed by a stable path identity + a freshness token) so the warm process reads
+hashes instead of recomputing. The eval-trace SQLite store already persists far more; a
+`(path_identity, freshness) → content_hash` table is a small addition.
+
+**The freshness key is RESOLVED (see the "RESOLVED 2026-06-01" block at the end of the HOT section):**
+flake source is eagerly store-copied to `/nix/store/<narhash>-source` (no lazy-trees), read through
+`storeFS`/`LocalStoreAccessor`. **The store path is ITSELF the content address** — so the key is the
+DepSource-root store path + relative subpath (exactly what the dep keys already record: `dsrc2root` +
+`/data.txt`), and freshness is automatic: a content change ⇒ a different store path ⇒ a cache miss by
+construction. No mtime (H2, rejected), no git OID (H2', unnecessary on this fork), no schema OID field.
+For the dirty/`-f /abs` non-store path the store-path key is absent → fall back to keying on the
+content-hash itself (still removes the cross-process redundant re-hash within a stable tree).
 - Leverage: removes ~0.12s+ of the 0.40s verify directly; more on file-heavier workloads.
-- Risk: soundness of the freshness key (H2). Storage growth (bounded by distinct source files).
+- Risk: storage growth (bounded by distinct source files). Soundness is by-construction for the
+  store-path-keyed case (store path = content address); the only care is the non-store fallback key.
 
 ### H2. ~~mtime/inode fast-path~~ — REJECTED (2026-05-31). Use the git blob OID instead (H2').
 
@@ -66,7 +75,12 @@ freshness discriminator or it's unsound (serving a stale hash for a changed file
 So mtime fails on exactly the reuse case we need. The freshness token must be CONTENT-DERIVED but
 cheap-to-obtain (not a re-hash by us).
 
-### H2'. git blob OID as the freshness token (the right design — content-addressed, checkout-stable)
+### H2'. git blob OID as the freshness token — SUPERSEDED 2026-06-01 by the store-copy finding (see "RESOLVED" block below)
+**On this fork H2' is unnecessary: flake source is store-copied (no lazy-trees), so the store path is
+already the content address — H1 keyed on it gets cross-commit reuse for free, no git OID needed.** H2'
+would only apply on a lazy-trees fork or the dirty/`-f /abs` non-store path. Retained below as the
+analysis of why a git-OID token *would* be the answer IF reads came from the ODB — they don't. Original
+framing (content-addressed, checkout-stable):
 Git already content-addresses every file: the blob OID (`git rev-parse <rev>:<path>` / index entry) is
 a hash of the file content, **identical across commits when content is identical**, and git computed it
 at checkout (we read it from the index/tree, O(1), NO content hashing by us). VALIDATED: `lib/default.nix`
@@ -178,16 +192,46 @@ content cache). The bench's `-f /abs/path` posix path is a measurement artifact 
 any content-stable token (no git awareness, mtime-churned) — to measure the hot win we must use a
 flake/git+file workload where the accessor exposes OIDs. C1 (cold) is the accessor-independent win.
 
-OPEN QUESTION before implementing (the load-bearing uncertainty): does a locked-git-input flake eval
-actually read each source file through GitSourceAccessor with a cheap per-file OID lookup, on the hot
-path, WITHOUT having already copied the whole tree to the store (in which case the read is from a store
-path and the "OID" is the store path itself)? If lazy-trees reads blobs on demand from the git ODB, H2'
-is a cheap ODB lookup. If the flake source is eagerly copied to /nix/store first, then the source reads
-are store reads (immutable, already content-addressed by store path) and the cache key is the store
-path — EVEN SIMPLER, no git needed, and H1 keyed on store path works directly. MUST determine which,
-because it changes H2' from "surface a git OID API" to "key the content cache on the already-present
-store path." NEXT STEP: instrument/trace a locked-flake hot eval to see whether closures.gnome source
-reads come from the git ODB or from a store-copied tree — that single fact decides the whole hot design.
+~~OPEN QUESTION before implementing~~ — **RESOLVED 2026-06-01 (from code + strace; the answer kills H2'
+and confirms H1).** The question was: does a locked-git-input flake hot eval read each source file
+through `GitSourceAccessor` with a cheap per-file OID lookup (→ H2' ODB lookup), or from an eagerly
+store-COPIED tree (→ store path IS the content address, H1 keyed on store path, no git)? **Answer: the
+latter — store-copied, read through `storeFS`, NOT GitSourceAccessor, NOT the bare PosixSourceAccessor.**
+
+Resolution chain (all grounded in code; the user's framing question was "is it using the posix accessor
+or something else?"):
+1. **No lazy-trees on this fork** (`nix config show` shows no such setting). The `git+file://` flake
+   source is EAGERLY `Input::fetchToStore`'d (fetchers.cc:202) into `/nix/store/<narhash>-source` — a
+   real materialized dir (verified: `/nix/store/asi31…-source/{data.txt,flake.nix}`, mode `r--r--r--`,
+   mtime epoch-1). strace of `nix eval git+file://$repo#val` showed 0 non-`.git` workdir source opens
+   and a `/nix/store/*-source` copy → eval reads the COPY, not the workdir, not lazily from the ODB.
+2. **The eval reads `./data.txt` through `storeFS`, not posix.** For a flake, `rootFS` takes the
+   pure-eval branch `accessor = storeFS` directly (eval.cc:463) — flake eval is always `pureEval`
+   ([[project_locked_rev_deferral_design]]). The `getFSSourceAccessor()` (= bare `PosixSourceAccessor`)
+   upper union layer (eval.cc:464) is ONLY used for impure `-f /abs/path` (what the `-f` bench used).
+   `storeFS = makeMountedSourceAccessor({…, {storeDir, store->getFSAccessor(pureEval)}})` (eval.cc:431/451);
+   `LocalFSStore::getFSAccessor` returns a **`LocalStoreAccessor`** (local-fs-store.cc:127) — posix is
+   the bottom I/O layer, but the accessor the eval HOLDS is the mounted `LocalStoreAccessor`, gating
+   every read through `requireStoreObject` (store-path validity), wrapped in `makeCachingSourceAccessor`
+   + (pure) `AllowListSourceAccessor`.
+3. **No accessor fingerprint, but none is needed.** `MountedSourceAccessor::getFingerprint`
+   (mounted-source-accessor.cc:100) forwards to `LocalStoreAccessor::getFingerprint` → inner posix →
+   base default `nullopt` (source-accessor.hh:221). The `accessor->fingerprint = getFingerprint(store)`
+   writes (fetchers.cc:329/364) land on the FETCHER's accessor DURING fetch, not on the eval's `storeFS`
+   view of the copied result. So there is NO git-OID token at FileBytes-verify time through this
+   accessor. **BUT the store path is itself the NAR-hash content address** — `/nix/store/<narhash>-source`,
+   identical across commits for identical content. The eval-trace dep keys already record source as a
+   `dsrc2root` DepSource + relative subpath (`/data.txt`, `/flake.nix`), resolved by SemanticRegistry to
+   that store path — NOT a raw posix path, NOT a git OID.
+
+**Consequence — H2' is UNNECESSARY (retire it), H1 is the design:** the hot fix is a PERSISTED
+content-hash cache keyed on the store-path/DepSource content identity `(DepSource-root-store-path,
+relative-subpath) → DepHash`. Stable across commits for unchanged content FOR FREE, because the store
+path already is the content address — no git-OID API, no `GitSourceAccessor` surfacing, no schema OID
+field, and the git ODB is never on the hot read path. H2' would only matter on a lazy-trees fork (we
+don't have one) or the dirty/`-f /abs` non-store path (where H1-keyed-on-content-hash is the only lever
+anyway). NEXT: design H1's persisted table + the verify-time freshness check (store-path identity is the
+freshness key; the recorded depHash is the cached value).
 
 ## C1 — fire-and-forget cold recording: implementation sketch (2026-05-31)
 
