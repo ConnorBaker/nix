@@ -190,6 +190,24 @@ realized exactly as specified. Summary of what shipped:
   warm run (both flake source files served from the persisted cache, zero re-reads), output
   byte-identical to `--no-eval-trace`. Adversarial review: no soundness hole (every Registered key
   resolves to a NAR-content-addressed flake path or narHash-verified runtime root).
+- **POPULATION TIMING (empirical, important):** H1 is a VERIFY-side cache. Cold RECORDING does NOT go
+  through `resolveCurrentDepHash` (it records via `recordFileBytesDepViaCache`), so cold stores NOTHING
+  into H1. Per-process counters on a fresh flake:
+  - process 1 (cold record): `eligible=0 stores=0 hits=0` — verify path not exercised.
+  - process 2 (FIRST warm verify): `eligible=2 stores=2 hits=0` — first run of the verify path
+    computes + STORES the hashes (populating the table), no hit yet.
+  - process 3+ (subsequent warm verify): `eligible=2 stores=0 hits=2` — served from the persisted cache.
+  So **H1 pays off from the 2nd warm verify onward**, not the 1st. For the bench (cold→hot, 2 processes)
+  this means the FIRST hot process still recomputes (it's the populating run); a 2nd hot process would
+  show the win. The functional test (Test 5) pins exactly this: store on warm-1, hit on warm-2.
+- **FOLLOW-UP OPTIMISATION (H1b, not yet done):** the cold RECORD path already computes
+  `depHash(readFile())` via `recordFileBytesDepViaCache` → `getOrReadFileContentHash` (eval.cc). H1 could
+  populate `FileContentHashes` from THERE (for store-resident Registered sources), so the entry exists
+  after cold — making the FIRST warm verify a hit instead of the second. That removes the one-process
+  warmup lag and would make the bench's single hot process show the full win. Needs the record-side
+  call site to resolve the DepSource→store-path + isInStore gate (the same `h1StorePathKey` logic, on
+  the record side). Deferred: correctness is unaffected (it's a warmup-latency optimization); the
+  verify-side store already converges after one warm run.
 - **NOT yet bench-measured on the Ledger-D `closures.gnome` flake workload** — the next step to quantify
   the hot-wall-time win at scale (the unit/functional firing proves correctness + that it fires; the
   aggregate Δ on 170K-dep traces is unmeasured). See "Recommended order" below.
