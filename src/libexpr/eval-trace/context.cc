@@ -339,7 +339,16 @@ eval_trace::TraceBackend::record(
 {
     return ctx.syncAwait(coroBlock(infra_->blockingPool, [&](const gdp::Proof<BlockingTag> & bs) {
         return store->withExclusiveAccess(bs, [&](const auto & ea) {
-            return store->record(ea, pathId, value, allDeps);
+            auto result = store->record(ea, pathId, value, allDeps);
+            // H1b: populate the persisted content-hash cache from this trace's
+            // recorded deps (store-resident FileBytes/RawBytes only), so the
+            // FIRST warm verify hits H1 instead of recomputing. The verify path
+            // does not run during cold recording, so without this H1 only pays
+            // off from the 2nd warm verify. Same withExclusiveAccess scope, uses
+            // the bound registry/state — no-op if the session is unbound.
+            if (infra_->verifier)
+                infra_->verifier->populateFileContentCacheFromRecordedDeps(ea, allDeps);
+            return result;
         });
     }));
 }

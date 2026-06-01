@@ -113,6 +113,15 @@ despite volatile sibling; volatile exec dep.
 - Test 2: Schema migration — old DB coexists with new schema, evaluation succeeds
 - Test 3: Precision — constructive recovery after v1→v2→v1 revert
 - Test 4: Precision — unrelated JSON key change hits cache via structural override
+- Test 5: H1/H1b — persisted file-content-hash cache + store-path immutability.
+  Cold record populates H1 (H1b: `fileContentCachePopulated>=1`); first warm
+  verify hits (`fileContentCacheHits>=1`); editing the source (new commit → new
+  `/nix/store/<narhash>-source` path) makes warm verify cleanly MISS ("not
+  everything is cached") — proving the old entry is never consulted for the new
+  path (no stale serve). This is the integration-level pin for H1b's record-side
+  population (the unit test `store/file-content-cache.cc` pins H1's lookup/store
+  mechanism but goes through `db->record` directly, bypassing the `TraceBackend`
+  layer where H1b is wired).
 
 **eval-trace-flake-inputs.sh** — Real-world flake input mutation scenarios (F-1 through F-7):
 - F-1: `path:` input with dirty git working tree — session invalidation

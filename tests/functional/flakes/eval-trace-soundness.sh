@@ -332,29 +332,24 @@ EOF
 git -C "$t5Dir" add .
 git -C "$t5Dir" commit -m "Init v1"
 
-# Step 1: cold eval records the trace. NOTE: cold RECORDING does not go through
-# the verify path (resolveCurrentDepHash), so it does NOT populate H1 — H1 is a
-# verify-side cache. The first WARM verify is what computes-and-stores the
-# entry; the SECOND warm verify is the first one that can serve from it.
-[[ "$(nix eval --json "$t5Dir#value")" == '"h1-source-v1"' ]]
+# Step 1: cold eval records the trace AND (via H1b) populates the persisted
+# content-hash cache from the record path for store-resident FileBytes deps —
+# so the FIRST warm verify can hit immediately (without H1b, cold records
+# nothing into H1 and the 1st warm verify only stores). Assert the populate.
+NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH="$TEST_HOME/soundness-t5-cold.json" \
+    nix eval --json "$t5Dir#value" | grepQuiet "h1-source-v1"
+t5_h1_populated="$(readEvalTraceCounter "$TEST_HOME/soundness-t5-cold.json" evalTrace.depHash.fileContentCachePopulated)"
+[[ "$t5_h1_populated" -ge 1 ]] || { echo "Test 5 FAIL: expected H1b populate on cold record, got $t5_h1_populated"; exit 1; }
 
-# Step 2: first warm verify — must hit cache; on the verify path the
-# store-resident FileBytes dep is H1-ELIGIBLE and the computed hash is STORED
-# (populating the persisted table), but not yet a hit (nothing was there).
-NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH="$TEST_HOME/soundness-t5-warm1.json" \
+# Step 2: first warm verify — must hit cache AND serve the content hash from H1
+# (H1b populated it on cold). Non-vacuity: if H1 never served, hits would be 0
+# (neutering lookupFileContentHash flips this red, as the unit test proves).
+NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH="$TEST_HOME/soundness-t5-warm.json" \
     env NIX_ALLOW_EVAL=0 nix eval --json "$t5Dir#value" | grepQuiet "h1-source-v1"
-t5_h1_eligible="$(readEvalTraceCounter "$TEST_HOME/soundness-t5-warm1.json" evalTrace.depHash.fileContentCacheEligible)"
-t5_h1_stores="$(readEvalTraceCounter "$TEST_HOME/soundness-t5-warm1.json" evalTrace.depHash.fileContentCacheStores)"
+t5_h1_hits="$(readEvalTraceCounter "$TEST_HOME/soundness-t5-warm.json" evalTrace.depHash.fileContentCacheHits)"
+t5_h1_eligible="$(readEvalTraceCounter "$TEST_HOME/soundness-t5-warm.json" evalTrace.depHash.fileContentCacheEligible)"
 [[ "$t5_h1_eligible" -ge 1 ]] || { echo "Test 5 FAIL: expected H1-eligible dep, got $t5_h1_eligible"; exit 1; }
-[[ "$t5_h1_stores" -ge 1 ]] || { echo "Test 5 FAIL: expected H1 store on first warm verify, got $t5_h1_stores"; exit 1; }
-
-# Step 2b: second warm verify — now the persisted entry SERVES (the cross-process
-# win). Non-vacuity: if H1 never served, hits would be 0 (neutering
-# lookupFileContentHash flips this red, as the unit test proves).
-NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH="$TEST_HOME/soundness-t5-warm2.json" \
-    env NIX_ALLOW_EVAL=0 nix eval --json "$t5Dir#value" | grepQuiet "h1-source-v1"
-t5_h1_hits="$(readEvalTraceCounter "$TEST_HOME/soundness-t5-warm2.json" evalTrace.depHash.fileContentCacheHits)"
-[[ "$t5_h1_hits" -ge 1 ]] || { echo "Test 5 FAIL: expected H1 cache hit on 2nd warm verify, got $t5_h1_hits"; exit 1; }
+[[ "$t5_h1_hits" -ge 1 ]] || { echo "Test 5 FAIL: expected H1 cache hit on 1st warm verify (H1b), got $t5_h1_hits"; exit 1; }
 
 # Step 3: edit the source → new commit → new /nix/store/<narhash>-source path.
 echo -n "h1-source-v2" >"$t5Dir/data.txt"

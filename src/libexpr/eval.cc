@@ -4526,6 +4526,7 @@ void EvalState::printStatistics()
             {"fileContentCacheHits", eval_trace::nrFileContentCacheHits.load()},
             {"fileContentCacheStores", eval_trace::nrFileContentCacheStores.load()},
             {"fileContentCacheEligible", eval_trace::nrFileContentCacheEligible.load()},
+            {"fileContentCachePopulated", eval_trace::nrFileContentCachePopulated.load()},
             {"contentUs", eval_trace::nrDepHashContentUs.load()},
             {"directoryUs", eval_trace::nrDepHashDirectoryUs.load()},
             {"existenceUs", eval_trace::nrDepHashExistenceUs.load()},

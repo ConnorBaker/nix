@@ -119,6 +119,9 @@ extern Counter nrContentSubsumptionSkips;
 extern Counter nrFileContentCacheHits;
 extern Counter nrFileContentCacheStores;
 extern Counter nrFileContentCacheEligible;
+// H1b: entries populated from the cold RECORD path (vs `Stores`, which counts
+// verify-path populations). Lets the FIRST warm verify hit instead of recompute.
+extern Counter nrFileContentCachePopulated;
 
 // ── Recovery dep recomputation breakdown ────────────────────────────
 extern Counter nrRecoveryDepRecomputeUs;

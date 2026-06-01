@@ -548,13 +548,14 @@ std::optional<DepHash> SqliteTraceStorage::lookupFileContentHash(const std::stri
     return std::nullopt;
 }
 
-void SqliteTraceStorage::putFileContentHash(const std::string & storePath, const DepHash & hash)
+bool SqliteTraceStorage::putFileContentHash(const std::string & storePath, const DepHash & hash)
 {
     // write-once: first writer wins; later identical computes are no-ops
     // (store paths are immutable, so the value can never legitimately differ).
     auto [it, inserted] = fileContentHashByStorePath.try_emplace(storePath, hash);
     if (inserted)
         pendingFileContentHashes.push_back({storePath, hash});
+    return inserted;
 }
 
 TraceId SqliteTraceStorage::getOrCreateTrace(

@@ -2093,6 +2093,36 @@ void Verifier::bindSession(
           registry.size(), registry.mountPointCount());
 }
 
+void Verifier::populateFileContentCacheFromRecordedDeps(
+    const ExclusiveTraceStorageAccess & ea, const std::vector<Dep> & deps)
+{
+    // No-op if unbound (no registry to resolve dep→store-path). `ea` is held by
+    // the caller (TraceBackend::record's withExclusiveAccess), satisfying the
+    // store-mutation precondition; putFileContentHash needs no separate proof.
+    (void)ea;
+    if (!registry_ || !state_)
+        return;
+    const auto & pools = state_->tracingPools();
+    for (const auto & dep : deps) {
+        // Only a concrete digest is the content hash; string-variant values
+        // (which don't occur for FileBytes/RawBytes anyway) and the Missing
+        // sentinel must never populate H1 — same exclusions as the verify-side
+        // store. h1StorePathKey already gates kind + Registered + isInStore.
+        auto * digest = std::get_if<DepHash>(&dep.hash);
+        if (!digest || *digest == sentinel(SentinelHash::Missing))
+            continue;
+        auto h1Key = h1StorePathKey(dep.key, *registry_, pools, *state_->store);
+        if (!h1Key)
+            continue;
+        // Write-once inside putFileContentHash (try_emplace): a no-op if the
+        // verify path or a prior record already stored this path. Counted on
+        // its own `Populated` counter (NOT `Eligible`/`Stores`, which are the
+        // verify-path signals) to keep the hit-rate ratios clean.
+        if (store_.putFileContentHash(*h1Key, *digest))
+            nrFileContentCachePopulated++;
+    }
+}
+
 void Verifier::resetVerificationState()
 {
     session_ = VerificationSession{};

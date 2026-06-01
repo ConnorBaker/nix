@@ -881,7 +881,9 @@ private:
     /// scope (resolveCurrentDepHash), so they take no `ea` — mirroring
     /// getOrCreateDepKeySet.
     std::optional<DepHash> lookupFileContentHash(const std::string & storePath);
-    void putFileContentHash(const std::string & storePath, const DepHash & hash);
+    /// Returns true iff this call inserted a new entry (write-once; a repeat
+    /// store of the same path is a no-op and returns false).
+    bool putFileContentHash(const std::string & storePath, const DepHash & hash);
 
     /// Atomic record publication: DB writes + all session cache updates.
     /// Called only from record(). `deferPublish` (Layer 2a) forwards to

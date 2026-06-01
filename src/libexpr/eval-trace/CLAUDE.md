@@ -3028,6 +3028,28 @@ hash; the placeholder path is retired.)
   via `storeFS`, so the store path IS the content address; the git-OID
   alternative H2' was retired as unnecessary on this fork).
 
+- **H1b: populate H1 from the COLD RECORD path (closes the warmup lag).**
+  H1 is verify-side; cold recording does not run the verify path, so without
+  H1b the first warm verify only POPULATES H1 (computes+stores) and the SECOND
+  warm verify is the first to SERVE — useless for a single cold→hot transition.
+  H1b populates `FileContentHashes` during cold recording so the FIRST warm
+  verify hits. Mechanism: `Verifier::populateFileContentCacheFromRecordedDeps(
+  ea, deps)` (verifier.cc) — for each recorded FileBytes/RawBytes dep it runs
+  the SAME `h1StorePathKey` gate the verify path uses (so keys match by
+  construction) and stores `(store_path, dep.hash)`; the dep's hash is already
+  `depHash(readFile())` = the byte-identical value the verify path computes.
+  Called from `TraceBackend::record` (context.cc) inside the same
+  `withExclusiveAccess` after `store->record`, purely additive (the recorded
+  trace is unchanged). Counter `depHash.fileContentCachePopulated` (record-side
+  inserts; `putFileContentHash` returns whether it inserted). SOUNDNESS rests
+  on the round-trip `registry.resolve(resolveDepPathKey(path)) == path` being
+  content-exact for store-resident Registered sources (carrier root is required
+  store-backed; phase-2 reads physically from `evaluationRoot` via storeFS; no
+  lazy-trees) — adversarially reviewed clean. Measured: cold `populated=2` →
+  first warm verify `hits=2` (was `stores=2, hits=0` pre-H1b). NOTE: the
+  DEFAULT-OFF §3b CA-producer `recordSync` path does not call this (effectiveness
+  gap, not soundness).
+
 ### Diagnostic counters
 
 The following five counters in

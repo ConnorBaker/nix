@@ -92,6 +92,7 @@ Counter nrContentSubsumptionSkips;
 Counter nrFileContentCacheHits;
 Counter nrFileContentCacheStores;
 Counter nrFileContentCacheEligible;
+Counter nrFileContentCachePopulated;
 
 // ── Recovery dep recomputation breakdown ────────────────────────────
 Counter nrRecoveryDepRecomputeUs;

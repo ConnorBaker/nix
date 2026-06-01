@@ -200,14 +200,34 @@ realized exactly as specified. Summary of what shipped:
   So **H1 pays off from the 2nd warm verify onward**, not the 1st. For the bench (cold→hot, 2 processes)
   this means the FIRST hot process still recomputes (it's the populating run); a 2nd hot process would
   show the win. The functional test (Test 5) pins exactly this: store on warm-1, hit on warm-2.
-- **FOLLOW-UP OPTIMISATION (H1b, not yet done):** the cold RECORD path already computes
-  `depHash(readFile())` via `recordFileBytesDepViaCache` → `getOrReadFileContentHash` (eval.cc). H1 could
-  populate `FileContentHashes` from THERE (for store-resident Registered sources), so the entry exists
-  after cold — making the FIRST warm verify a hit instead of the second. That removes the one-process
-  warmup lag and would make the bench's single hot process show the full win. Needs the record-side
-  call site to resolve the DepSource→store-path + isInStore gate (the same `h1StorePathKey` logic, on
-  the record side). Deferred: correctness is unaffected (it's a warmup-latency optimization); the
-  verify-side store already converges after one warm run.
+- **H1b — LANDED 2026-06-01 (closes the warmup lag; makes the FIRST hot eval hit).** The cold RECORD
+  path already computes `depHash(readFile())` (the dep carries it), so H1b populates `FileContentHashes`
+  from there for store-resident Registered-source FileBytes/RawBytes deps — the entry exists after cold,
+  so the FIRST warm verify HITS instead of recomputing. Wiring: `Verifier::
+  populateFileContentCacheFromRecordedDeps(ea, deps)` (uses the bound `registry_`/`state_` + the SAME
+  `h1StorePathKey` gate the verify path uses, so keys match by construction) called from
+  `TraceBackend::record` (context.cc) inside the same `withExclusiveAccess` after `store->record`. New
+  counter `depHash.fileContentCachePopulated` (record-side inserts; disjoint from the verify-side
+  Eligible/Stores/Hits). `putFileContentHash` now returns `bool` (inserted) for honest counting.
+  - **MEASURED per-process** (release binary, 2-file flake): process 1 cold → `populated=2`; process 2
+    FIRST warm verify → `hits=2, stores=0` (previously `stores=2, hits=0` — needed a 3rd process). The
+    cold→hot transition now wins on the first hot eval. Soundness preserved: a source edit (new store
+    path) still cleanly misses (Test 5 step 4).
+  - **ADVERSARIAL REVIEW: SOUND, no holes.** The crux (record-side key/hash must match the verify side)
+    is closed: (A) same registry/pools/store instances within a process → byte-identical keys, and
+    cross-process keys are globally-unique store paths (no content collision); (B)+(C) the round-trip
+    `registry.resolve(resolveDepPathKey(path)) == path` is content-EXACT for store-resident Registered
+    sources — carrier root is required store-backed (flake.cc throws otherwise), phase-2 reads
+    physically from `evaluationRoot` via the same storeFS accessor (flake.cc:474-484), and no lazy-trees
+    on this fork → record-side `sp` and verify-side `resolve(key)` read byte-identical content;
+    immutability closes the rest. The dep.hash recorded into the trace is unchanged (H1b is purely
+    additive after `store->record`). One noted non-issue: the DEFAULT-OFF §3b CA-producer `recordSync`
+    path doesn't pre-populate H1 (effectiveness gap, not soundness).
+  - Test 5 (functional) updated to the H1b shape: cold record `populated>=1`, FIRST warm verify
+    `hits>=1`. Unit + full suite (1858 pass / 4 documented skips / 0 fail) green.
+- **NEXT (still open):** bench H1+H1b on the Ledger-D `closures.gnome` flake workload to quantify the
+  hot-wall-time Δ at 170K-dep scale. The unit/functional firing proves correctness + that it fires on
+  the first hot eval; the aggregate wall Δ on the real workload is the remaining measurement.
 - **NOT yet bench-measured on the Ledger-D `closures.gnome` flake workload** — the next step to quantify
   the hot-wall-time win at scale (the unit/functional firing proves correctness + that it fires; the
   aggregate Δ on 170K-dep traces is unmeasured). See "Recommended order" below.
