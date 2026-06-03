@@ -956,6 +956,16 @@ public:
     virtual StorePath writeDerivation(const Derivation & drv, RepairFlag repair = NoRepair);
 
     /**
+     * Hook for the lazy-derivations write-queue: if `path` is a `.drv` whose
+     * write was deferred (see `AsyncPathWriter`/`makeLazyDrvStore`), materialise
+     * it (and its pending closure) to the store now. A no-op for ordinary
+     * stores. Called by the build goal when it commits to building a
+     * derivation, so a built `.drv` is registered (doc C1) while a
+     * substitutable target's `.drv` — never built — stays elided.
+     */
+    virtual void materialiseDeferred(const StorePath & path) {}
+
+    /**
      * Read a derivation (which must already be valid).
      */
     virtual Derivation readDerivation(const StorePath & drvPath);

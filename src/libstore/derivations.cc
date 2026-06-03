@@ -1,6 +1,7 @@
 #include "nix/store/derivations.hh"
 #include "nix/store/downstream-placeholder.hh"
 #include "nix/store/store-api.hh"
+#include "nix/store/async-path-writer.hh"
 #include "nix/util/types.hh"
 #include "nix/util/util.hh"
 #include "nix/store/common-protocol.hh"
@@ -154,6 +155,18 @@ StorePath Store::writeDerivation(const Derivation & drv, RepairFlag repair)
         repair);
     assert(path2 == path);
 
+    return path;
+}
+
+StorePath
+writeDerivation(AsyncPathWriter & writer, const StoreDirConfig & store, const Derivation & drv, RepairFlag repair)
+{
+    auto [suffix, contents, references, path] = infoForDerivation(store, drv);
+    /* The write-queue computes the same content-addressed path from the same
+       bytes + references, so `path2 == path` by construction (the deferred
+       analogue of the eager `assert(path2 == path)` above). */
+    auto path2 = writer.addPath(std::move(contents), suffix, std::move(references), repair);
+    assert(path2 == path);
     return path;
 }
 

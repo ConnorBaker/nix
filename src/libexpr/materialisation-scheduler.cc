@@ -502,4 +502,37 @@ MaterialisationScheduler::outPathsOf(std::span<const SourcePlaceholder> placehol
     return out;
 }
 
+std::unordered_map<SourcePlaceholder, Hash>
+MaterialisationScheduler::narHashesOf(std::span<const SourcePlaceholder> placeholders)
+{
+    std::unordered_map<SourceContentId, std::vector<SourcePlaceholder>> byContent;
+    std::unordered_map<SourcePlaceholder, std::shared_ptr<const Registration>> regs;
+    for (auto & p : placeholders) {
+        auto reg = lookup(p);
+        if (!reg)
+            throw Error("placeholder %s has no registration", p.render());
+        byContent[reg->contentId].push_back(p);
+        regs.emplace(p, reg);
+    }
+
+    /* Pre-compute the distinct contentIds' narHashes IN PARALLEL — exactly as
+       `outPathsOf`'s prelude (above) does. Each distinct contentId's walk is
+       independent, so fanning out overlaps their I/O instead of serialising it
+       on the single eval thread. For ONE distinct contentId there is nothing to
+       overlap (N placeholders sharing a source coalesce onto one walk via
+       `inFlight_`), so skip the pool and let the gather loop walk it once. */
+    if (byContent.size() > 1) {
+        ThreadPool pool;
+        for (auto & [cid, _] : byContent)
+            pool.enqueue([this, cid] { (void) narHashOf(cid); });
+        pool.process();
+    }
+
+    std::unordered_map<SourcePlaceholder, Hash> out;
+    out.reserve(placeholders.size());
+    for (auto & p : placeholders)
+        out.emplace(p, narHashOf(regs.at(p)->contentId)); // cached after the prelude
+    return out;
+}
+
 } // namespace nix

@@ -224,6 +224,23 @@ struct EvalSettings : Config
           regardless of the state of the store.
         )"};
 
+    Setting<bool> lazyDerivations{
+        this,
+        false,
+        "lazy-derivations",
+        R"(
+          When enabled, evaluating a `derivation` does not write its `.drv`
+          file to the store eagerly. Instead the derivation's `drvPath` is
+          computed in memory — content-addressing makes this exact — and the
+          `.drv` write is deferred to a background queue, flushed in bulk at
+          resolution boundaries (a build, a read-back, value output).
+
+          This is an optimisation for evaluation-heavy, build-free workloads
+          (for example mass instantiation for CI). It is experimental and
+          defaults to `false`; the observable results (`drvPath`, `outPath`,
+          the built outputs) are identical either way.
+        )"};
+
     Setting<Strings> allowedUris{
         this,
         {},

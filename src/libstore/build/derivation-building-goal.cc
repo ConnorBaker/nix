@@ -144,6 +144,13 @@ Goal::Co DerivationBuildingGoal::gaveUpOnSubstitution(bool storeDerivation)
 {
     Goals waitees;
 
+    /* We are committing to BUILD this derivation (substitution was not
+       possible), so its `.drv` must be a real store object — materialise it if
+       its write was deferred (lazy-derivations). A fully-substitutable target
+       never reaches here, so its `.drv` closure stays elided (LD-S2). For an
+       ordinary store this is a no-op. */
+    worker.evalStore.materialiseDeferred(drvPath);
+
     /* Copy the input sources from the eval store to the build
        store.
 

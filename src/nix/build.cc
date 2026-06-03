@@ -1,4 +1,6 @@
 #include "nix/cmd/command.hh"
+#include "nix/cmd/installable-value.hh"
+#include "nix/store/async-path-writer.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
@@ -146,10 +148,24 @@ struct CmdBuild : InstallablesCommand, MixOutLinkByDefault, MixDryRun, MixJSON, 
                 for (auto & b : i->toDerivedPaths())
                     pathsToBuild.push_back(b.path);
 
-            printMissing(store, pathsToBuild, lvlError);
+            /* `queryMissing`/`printMissing` read each `.drv` to classify it as
+               will-build / will-substitute. Under lazy-derivations the `.drv`s
+               were only enqueued, so let the report read them through the
+               lazy-`.drv` overlay (no writes — this is a dry run); otherwise a
+               deferred `.drv` would be misreported as "don't know how to build"
+               (LD-S9). A no-op when nothing was deferred. */
+            ref<Store> reportStore = store;
+            for (auto & i : installables)
+                if (auto * iv = dynamic_cast<InstallableValue *>(&*i)) {
+                    if (iv->state->settings.lazyDerivations)
+                        reportStore = makeLazyDrvStore(store, iv->state->asyncPathWriter);
+                    break;
+                }
+
+            printMissing(reportStore, pathsToBuild, lvlError);
 
             if (json)
-                printJSON(derivedPathsToJSON(pathsToBuild, *store));
+                printJSON(derivedPathsToJSON(pathsToBuild, *reportStore));
 
             return;
         }

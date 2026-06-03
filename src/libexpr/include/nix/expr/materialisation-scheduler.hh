@@ -85,6 +85,17 @@ struct MaterialisationScheduler
      *  but not a storePath. */
     Hash narHashOf(const SourceContentId &);
 
+    /** Batch narHash demand — the hash-only analogue of `outPathsOf`.
+     *  Pre-computes the narHashes of `placeholders`' distinct contentIds
+     *  IN PARALLEL (the same `ThreadPool` prelude `outPathsOf` uses), then
+     *  returns placeholder → narHash. This is for `lazy-derivations`'
+     *  deferred-source path: it needs each source's narHash (intrinsic — it
+     *  NAMES the `inputSrc` CA path in the eagerly-computed `drvPath`) but NOT
+     *  a copy (deferred). Without it the caller would walk the sources serially
+     *  on the single eval thread; with it the intrinsic hash IO is fanned out,
+     *  matching the eager `outPathsOf`. */
+    std::unordered_map<SourcePlaceholder, Hash> narHashesOf(std::span<const SourcePlaceholder>);
+
 private:
     /* These three are read-mostly (written once at registerView / once per
        cold walk, READ on every demand — including concurrently by the parallel

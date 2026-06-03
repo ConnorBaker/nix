@@ -3,6 +3,8 @@
 include_dirs = [ include_directories('../../..') ]
 
 headers = files(
+  'counting-store.hh',
+  'derivation.hh',
   'derived-path.hh',
   'https-store.hh',
   'libstore-network.hh',

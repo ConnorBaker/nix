@@ -24,6 +24,7 @@ namespace nix {
 struct MaterialisationScheduler;
 struct SourcePlaceholder;
 class InputMaterialisation;
+struct AsyncPathWriter;
 } // namespace nix
 
 // For `NIX_USE_BOEHMGC`, and if that's set, `GC_THREADS`
@@ -557,6 +558,19 @@ public:
      * the whole workspace.
      */
     const std::shared_ptr<MaterialisationScheduler> materialisationScheduler;
+
+    /**
+     * The deferred `.drv` write-queue (PROPOSAL-LAZY-DERIVATIONS.md §4.1).
+     * When `settings.lazyDerivations` is set, `derivationStrict` enqueues
+     * each `.drv` here — its `drvPath` is computed eagerly (content-addressing
+     * makes this exact); only the *write* is deferred — instead of writing it
+     * synchronously. Drained in bulk at the resolution boundaries (§4.2) and
+     * at `resetFileCache`; the worker also flushes any remainder when the
+     * `EvalState` is destroyed. Unlike `materialisationScheduler` this is a
+     * write-back queue, not a scheduler: a `.drv` already knows its path, so
+     * there is no walk to coalesce (Finding S1).
+     */
+    const ref<AsyncPathWriter> asyncPathWriter;
 
     /**
      * Per-input lazy `narHash` materialisations, keyed by the input's

@@ -2,6 +2,7 @@
 #include "nix/expr/print-ambiguous.hh"
 #include "nix/main/shared.hh"
 #include "nix/expr/eval.hh"
+#include "nix/store/async-path-writer.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/expr/attr-path.hh"
@@ -89,6 +90,25 @@ void processExpr(
         } else {
             PackageInfos drvs;
             getDerivations(state, v, "", autoArgs, drvs, false);
+            /* Overlap the `.drv` writes with the rest of instantiation (§7
+               async overlap). This is a write-everything workload — every
+               forced `.drv` is materialised by the `waitForAllPaths` below and
+               nothing is elided — so a background drain is pure latency hiding,
+               not a correctness change. Gated like the deferral itself; the
+               build path never starts it (so its selective elision is intact). */
+            if (state.settings.lazyDerivations && getEnv("_NIX_LAZY_DRV_NO_OVERLAP").value_or("") != "1")
+                state.asyncPathWriter->startBackgroundDrain();
+            /* Force every `.drv` path first — `requireDrvPath` is what runs
+               `derivationStrict` and ENQUEUES a deferred `.drv` — so the
+               write-queue is fully populated... */
+            for (auto & i : drvs)
+                (void) i.requireDrvPath();
+            /* ...then materialise the whole queue in a single bulk submission
+               before any path is printed/rooted (the lazy-derivations
+               observation boundary for `nix-instantiate`'s output; otherwise a
+               deferred `.drv` would be dropped unwritten). A no-op when nothing
+               was deferred. */
+            state.asyncPathWriter->waitForAllPaths();
             for (auto & i : drvs) {
                 auto drvPath = i.requireDrvPath();
                 auto drvPathS = state.store->printStorePath(drvPath);

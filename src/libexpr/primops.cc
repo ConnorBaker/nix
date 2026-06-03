@@ -1,5 +1,6 @@
 #include "nix/store/derivations.hh"
 #include "nix/store/downstream-placeholder.hh"
+#include "nix/store/async-path-writer.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
@@ -78,6 +79,36 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
 {
     std::vector<DerivedPath::Built> drvs;
     StringMap res;
+
+    /* Flush the deferred `.drv`s / sources THIS context names (and their
+       transitive pending closure), before the per-element `ensureValid` checks
+       and any build read them back as files — the monadic-escape boundary
+       (PROPOSAL-LAZY-DERIVATIONS.md §4.2 item 3, LD-S5). Previously this was a
+       `waitForAllPaths()` SLEDGEHAMMER: one incidental IFD / `readFile` on a
+       context path mid-eval flushed EVERY pending `.drv`, which (a) un-batches
+       the value-output drain and serialises the writes on the eval thread
+       (e.g. `nix eval` of a large attrset materialised the whole queue at the
+       first context realisation), and (b) defeats selective elision on the
+       build path (a substitutable target's input `.drv`s get written by an
+       unrelated IFD). We need only the paths in `context` valid here; collect
+       them and issue ONE batched `waitForPaths` (its `materialise` pulls in
+       each root's pending references, so the closure is covered). The rest of
+       the queue stays deferred — drained in the background or at its own
+       boundary. A no-op when nothing was deferred. */
+    {
+        StorePathSet needed;
+        for (auto & c : context) {
+            if (auto * b = std::get_if<NixStringContextElem::Built>(&c.raw))
+                needed.insert(b->drvPath->getBaseStorePath());
+            else if (auto * o = std::get_if<NixStringContextElem::Opaque>(&c.raw))
+                needed.insert(o->path);
+            else if (auto * d = std::get_if<NixStringContextElem::DrvDeep>(&c.raw))
+                needed.insert(d->drvPath);
+            /* SourceVirtual is materialised separately below via `outPathOf`. */
+        }
+        if (!needed.empty())
+            asyncPathWriter->waitForPaths(needed);
+    }
 
     for (auto & c : context) {
         auto ensureValid = [&](const StorePath & p) {
@@ -169,7 +200,8 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
             warn("built '%1%' during evaluation due to an import from derivation", drvs.begin()->to_string(*store));
     }
 
-    /* Build/substitute the context. */
+    /* Build/substitute the context. (Deferred `.drv` writes were already
+       flushed at the top of this function.) */
     std::vector<DerivedPath> buildReqs;
     buildReqs.reserve(drvs.size());
     for (auto & d : drvs)
@@ -1836,8 +1868,43 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             svBatch.push_back(sv->placeholder);
 
     std::unordered_map<SourcePlaceholder, StorePath> svResolved;
-    if (!svBatch.empty())
-        svResolved = state.materialisationScheduler->outPathsOf(svBatch);
+    if (!svBatch.empty()) {
+        if (state.settings.lazyDerivations && !settings.readOnlyMode) {
+            /* Increment 6 — defer the source copy. Name each source by its CA
+               path now (its narHash is the unavoidable eval-time hash: computing
+               `drvPath` eagerly needs its `inputSrcs` named) but do NOT copy the
+               bytes into the store. Register a deferred copy with the
+               asyncPathWriter; it rides this `.drv`'s referential closure —
+               materialised iff the `.drv` is (a target built from source), and
+               discarded with it when the target is substitutable, so the source
+               copy is elided too (LD-S2, extended to sources). The copy thunk
+               re-demands the placeholder through the scheduler, which
+               walks+ingests once and is idempotent.
+
+               `narHashesOf` fans the intrinsic hash walks out across distinct
+               sources on a ThreadPool (as the eager `outPathsOf` does); doing
+               `narHashOf` in this loop instead would serialise that IO on the
+               single eval thread. Only the hash is computed on the eval thread
+               (intrinsic); the copy + the `.drv` write are off it (deferred). */
+            auto narHashes = state.materialisationScheduler->narHashesOf(svBatch);
+            for (auto & ph : svBatch) {
+                auto reg = state.materialisationScheduler->lookup(ph);
+                /* Every SourceVirtual placeholder in `context` was minted by
+                   `addPath`'s `registerView`, so a lookup miss is a logic error;
+                   `narHashesOf` already threw on a miss, but guard defensively. */
+                if (!reg)
+                    throw Error("lazy-derivations: source placeholder '%s' has no registration", ph.render());
+                auto storePath = state.asyncPathWriter->addSource(
+                    reg->name,
+                    narHashes.at(ph),
+                    reg->method,
+                    reg->refs,
+                    [scheduler = state.materialisationScheduler, ph] { (void) scheduler->outPathOf(ph); });
+                svResolved.emplace(ph, std::move(storePath));
+            }
+        } else
+            svResolved = state.materialisationScheduler->outPathsOf(svBatch);
+    }
 
     StringMap svRewrites;
 
@@ -1851,6 +1918,12 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                    available when the builder runs. */
                 [&](const NixStringContextElem::DrvDeep & d) {
                     /* !!! This doesn't work if readOnlyMode is set. */
+                    /* The whole-closure edge reads `d.drvPath`'s `.drv` and
+                       its input-`.drv` closure as files (computeFSClosure +
+                       readDerivation below), so flush any deferred writes
+                       first (lazy-derivations; LD-S5). A no-op when nothing
+                       was deferred. */
+                    state.asyncPathWriter->waitForAllPaths();
                     StorePathSet refs;
                     state.store->computeFSClosure(d.drvPath, refs);
                     for (auto & j : refs) {
@@ -2025,8 +2098,15 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
        Unless we are in read-only mode, that is, in which case we do not
        write anything. Users commonly do this to speed up evaluation in
        contexts where they don't actually want to build anything. */
-    auto drvPath =
-        settings.readOnlyMode ? computeStorePath(*state.store, drv) : state.store->writeDerivation(drv, state.repair);
+    /* `drvPath` is content-addressed, so it can always be computed in memory
+       without writing anything (read-only mode does exactly this). Otherwise
+       we either defer the `.drv` write to the batched write-queue
+       (PROPOSAL-LAZY-DERIVATIONS.md §4.1) or write it eagerly; all three
+       branches yield the identical content-addressed path. */
+    auto drvPath = settings.readOnlyMode ? computeStorePath(*state.store, drv)
+                   : state.settings.lazyDerivations
+                       ? writeDerivation(*state.asyncPathWriter, *state.store, drv, state.repair)
+                       : state.store->writeDerivation(drv, state.repair);
     auto drvPathS = state.store->printStorePath(drvPath);
 
     printMsg(lvlChatty, "instantiated '%1%' -> '%2%'", drvName, drvPathS);
@@ -3178,7 +3258,7 @@ static void addPath(
            identity re-canonicalisation. */
         path = path.resolveSymlinks();
 
-        auto [_subpath, fingerprint] = path.accessor->getFingerprint(path.path);
+        auto [subpath, fingerprint] = path.accessor->getFingerprint(path.path);
 
         if (expectedHash || !fingerprint) {
             if (!expectedHash || !state.store->isValidPath(*expectedStorePath)) {
@@ -3275,7 +3355,21 @@ static void addPath(
             mergeFingerprintSuffix(*fingerprint, ";shape=" + shapeHash.to_string(HashFormat::SRI, true));
 
         StoreReferences storeRefs{.others = refs, .self = false};
-        auto contentId = SourceContentId::compute(*fingerprint, shapeHash, method, storeRefs);
+        /* Fold the SUBPATH into the contentId. `getFingerprint` returns the
+           *root accessor* fingerprint (e.g. the whole flake/git tree) plus the
+           subpath within it (`subpath`); two different subtrees of one tree
+           (`builtins.path ./a` vs `./b`) share the root fingerprint, and for an
+           unfiltered source `shapeHash` is a fixed sentinel — so without the
+           subpath their `SourceContentId`s COLLIDE. The scheduler is keyed on
+           contentId, so it then caches the first subtree's narHash under the
+           shared id and names the second source with it, yielding a storePath
+           whose bytes were never written → `path '…src' is not valid` in
+           `derivationStrict` for the 2nd+ source (the monorepo / many-local-
+           sources shape; upstream nix is unaffected). `fetchToStore2`'s
+           sourcePathToHash cache already keys on the subpath (see the
+           `;shape=` note above); the contentId must too. */
+        auto contentId = SourceContentId::compute(
+            mergeFingerprintSuffix(*fingerprint, ";subpath=" + subpath.abs()), shapeHash, method, storeRefs);
 
         auto placeholder = state.materialisationScheduler->registerView(
             MaterialisationScheduler::Registration{
@@ -3293,11 +3387,12 @@ static void addPath(
            cargo-workspace dedup observable from the start (200 packages
            with the same contentId → one shared walk later). */
         debug(
-            "virtualise: addPath deferred '%s' (%s) as placeholder %s, contentId %s — no walk at registration",
+            "virtualise: addPath deferred '%s' (%s) as placeholder %s, contentId %s, subpath %s — no walk at registration",
             name,
             filter ? "filtered" : "unfiltered",
             placeholder.render(),
-            contentId.to_string());
+            contentId.to_string(),
+            subpath.abs());
 
         state.mkSourcePlaceholderString(placeholder, name, v);
     } catch (Error & e) {

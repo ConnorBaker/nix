@@ -67,6 +67,8 @@ sources = files(
   'filetransfer-request.cc',
   'filetransfer-retry.cc',
   'http-binary-cache-store.cc',
+  'lazy-derivation-async-writer.cc',
+  'lazy-derivation-projection.cc',
   'legacy-ssh-store.cc',
   'local-binary-cache-store.cc',
   'local-fs-store.cc',

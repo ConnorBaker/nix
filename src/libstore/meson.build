@@ -278,6 +278,7 @@ config_priv_h = configure_file(
 subdir('nix-meson-build-support/common')
 
 sources = files(
+  'async-path-writer.cc',
   'binary-cache-store.cc',
   'build-result.cc',
   'build/build-log.cc',

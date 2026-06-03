@@ -475,6 +475,19 @@ class Store;
  */
 StorePath computeStorePath(const StoreDirConfig & store, const Derivation & drv);
 
+struct AsyncPathWriter;
+
+/**
+ * Like `Store::writeDerivation`, but *enqueue* the `.drv` on an
+ * `AsyncPathWriter` (the deferred/batched write-queue) instead of writing it
+ * synchronously. The returned `drvPath` is identical to the eager write's
+ * (both are `makeFixedOutputPathFromCA(SHA256, unparse(drv))`); only the
+ * bytes hit the store later, at a flush boundary. See
+ * PROPOSAL-LAZY-DERIVATIONS.md §4.1.
+ */
+StorePath writeDerivation(
+    AsyncPathWriter & writer, const StoreDirConfig & store, const Derivation & drv, RepairFlag repair = NoRepair);
+
 /**
  * Read a derivation from a file.
  */

@@ -6,6 +6,7 @@
 #include "nix/expr/materialisation-scheduler.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/globals.hh"
+#include "nix/store/async-path-writer.hh"
 #include "nix/util/util.hh"
 // Need specialization involving `SymbolStr` just in this one module.
 #include "nix/util/strings-inline.hh"
@@ -802,11 +803,22 @@ StorePath AttrCursor::forceDerivation()
     auto drvPath = root->state.store->parseStorePath(aDrvPath->getString());
     drvPath.requireDerivation();
     if (!settings.readOnlyMode) {
+        /* If this `.drv`'s write was deferred (lazy-derivations), it is not on
+           disk yet but is known to the write-queue; that is fine — the build
+           reads it back through the lazy-`.drv` store and materialises it only
+           if it is actually built (substitutable targets stay deferred and are
+           elided, LD-S2/LD-S6). So treat "pending" as "valid enough" here
+           (Finding C2: without this, the warm eval-cache hit would fall into
+           the "recreate" path and throw). */
+        if (root->state.asyncPathWriter->isPending(drvPath))
+            return drvPath;
         root->state.store->addTempRoot(drvPath);
         if (!root->state.store->isValidPath(drvPath)) {
             /* The eval cache contains 'drvPath', but the actual path has
                been garbage-collected. So force it to be regenerated. */
             aDrvPath->forceValue();
+            if (root->state.asyncPathWriter->isPending(drvPath))
+                return drvPath; // regenerated as a deferred write
             if (!root->state.store->isValidPath(drvPath))
                 throw Error(
                     "don't know how to recreate store derivation '%s'!", root->state.store->printStorePath(drvPath));

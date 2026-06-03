@@ -5,6 +5,10 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/store/async-path-writer.hh"
+#include "nix/util/environment-variables.hh"
+#include "nix/util/finally.hh"
+#include "nix/util/util.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -65,6 +69,41 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
             throw UsageError("--raw and --json are mutually exclusive");
 
         auto state = getEvalState();
+
+        /* `nix eval` is observably eager: the `.drv`s instantiated during
+           evaluation ARE left in the store (the classic "eval to populate, then
+           build/process the result" flow). With lazy-derivations we keep that
+           contract but take the writes OFF the eval hot path — `derivationStrict`
+           only enqueues, and this background drain materialises the queue on a
+           separate thread while evaluation continues (§7 async overlap), so the
+           write IO overlaps the eval instead of blocking it. No-op for a
+           daemon/remote store (a drain there fragments the framed flush — the
+           Finally below batches it instead); `_NIX_LAZY_DRV_NO_OVERLAP=1` opts
+           out of the overlap. (`--read-only` is the opt-out for callers that
+           want only the values and not the `.drv`s.) */
+        bool lazyDrain =
+            state->settings.lazyDerivations && getEnv("_NIX_LAZY_DRV_NO_OVERLAP").value_or("") != "1";
+        if (lazyDrain)
+            state->asyncPathWriter->startBackgroundDrain();
+
+        /* Completion barrier covering BOTH exits, so the store matches eager
+           whether or not evaluation succeeds. On success it joins the background
+           drain and flushes any not-yet-written tail in one batch. On an
+           in-`run()` throw — e.g. a deep force in `--json`/`--raw`/the printer
+           that instantiated some `.drv`s and then threw — the unwind still
+           flushes them, instead of dropping the queue at EvalState teardown and
+           leaving FEWER `.drv`s than eager. (The complementary PRE-run throw —
+           the `--expr`/`--file` source itself throwing during `parseInstallable`,
+           which runs before this body — is flushed there.) No-op when nothing
+           was deferred; flush errors during an unwind are swallowed in favour of
+           the original error. */
+        Finally flushDeferred([&]() {
+            try {
+                state->asyncPathWriter->waitForAllPaths();
+            } catch (...) {
+                ignoreExceptionInDestructor();
+            }
+        });
 
         auto [v, pos] = installable->toValue(*state);
         NixStringContext context;
@@ -187,6 +226,9 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
             state->ensureLazyPathsCopied(context);
             logger->cout("%s", rewriteStrings(oss.str(), rewrites));
         }
+
+        /* `.drv` materialisation happens at `flushDeferred` (declared above): it
+           runs on scope exit for success and on unwind for an in-`run()` throw. */
     }
 };
 

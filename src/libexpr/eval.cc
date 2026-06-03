@@ -12,6 +12,7 @@
 #include "nix/util/environment-variables.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/derivations.hh"
+#include "nix/store/async-path-writer.hh"
 #include "nix/store/downstream-placeholder.hh"
 #include "nix/store/source-placeholder.hh"
 #include "nix/expr/eval-inline.hh"
@@ -349,6 +350,7 @@ EvalState::EvalState(
     , regexCache(makeRegexCache())
     , stringFingerprints(make_ref<StringFingerprintMap>())
     , materialisationScheduler(std::make_shared<MaterialisationScheduler>(*this))
+    , asyncPathWriter(AsyncPathWriter::make(store))
 #if NIX_USE_BOEHMGC
     , baseEnvP(std::allocate_shared<Env *>(traceable_allocator<Env *>(), &mem.allocEnv(BASE_ENV_SIZE)))
     , baseEnv(**baseEnvP)
@@ -1238,6 +1240,12 @@ void EvalState::resetFileCache()
        directory in the store, which causes the lockfile read to miss.
        This clear matches the lifetime of `inputCache` above. */
     inputMaterialisations_.lock()->clear();
+    /* The deferred `.drv` write-queue is intentionally NOT drained here: a
+       pending `.drv`'s path is content-addressed (stable across cache resets),
+       and an un-demanded `.drv` should stay deferred so it can be elided (a
+       fresh evaluation re-mints the identical path if needed). Demanded `.drv`s
+       are materialised at their observation boundaries; the queue's un-demanded
+       entries are elided when the EvalState is destroyed. */
     /* Same staleness reasoning for the Item 2 defer-past-mount registry
        (§6.1.1): the fake store path is keyed on the input's (stable)
        attrs JSON, but the mat it points at — and the real path that mat

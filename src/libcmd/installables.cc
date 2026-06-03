@@ -3,6 +3,9 @@
 #include "nix/cmd/installable-derived-path.hh"
 #include "nix/cmd/installable-attr-path.hh"
 #include "nix/cmd/installable-flake.hh"
+#include "nix/cmd/installable-value.hh"
+#include "nix/store/async-path-writer.hh"
+#include "nix/store/local-store.hh"
 #include "nix/store/outputs-spec.hh"
 #include "nix/util/users.hh"
 #include "nix/util/util.hh"
@@ -461,16 +464,35 @@ Installables SourceExprCommand::parseInstallables(ref<Store> store, std::vector<
         auto state = getEvalState();
         auto vFile = state->allocValue();
 
-        if (file == "-") {
-            auto e = state->parseStdin();
-            state->eval(e, *vFile);
-        } else if (file) {
-            auto dir = absPath(getCommandBaseDir());
-            state->evalFile(lookupFileArg(*state, file->string(), &dir), *vFile);
-        } else {
-            auto dir = absPath(getCommandBaseDir());
-            auto e = state->parseExprFromString(*expr, state->rootPath(dir.string()));
-            state->eval(e, *vFile);
+        /* Error-path eager-match (lazy-derivations): this WHNF eval of the
+           `--file`/`--expr`/stdin source can instantiate `.drv`s — which are
+           enqueued, not yet written — and THEN throw. Eager writes each `.drv`
+           inline as `derivationStrict` runs, so on a throw it leaves them in the
+           store; to leave the same store state, flush the deferred queue before
+           the throw propagates. This is the PRE-run eval (parseInstallable runs
+           before the command's `run(store, installable)`), so a barrier inside
+           the command body cannot cover it. No-op in eager mode (nothing is ever
+           enqueued) and when nothing was deferred; flush errors during the
+           unwind are swallowed in favour of the original eval error. */
+        try {
+            if (file == "-") {
+                auto e = state->parseStdin();
+                state->eval(e, *vFile);
+            } else if (file) {
+                auto dir = absPath(getCommandBaseDir());
+                state->evalFile(lookupFileArg(*state, file->string(), &dir), *vFile);
+            } else {
+                auto dir = absPath(getCommandBaseDir());
+                auto e = state->parseExprFromString(*expr, state->rootPath(dir.string()));
+                state->eval(e, *vFile);
+            }
+        } catch (...) {
+            try {
+                state->asyncPathWriter->waitForAllPaths();
+            } catch (...) {
+                ignoreExceptionExceptInterrupt();
+            }
+            throw;
         }
 
         for (auto & s : ss) {
@@ -614,6 +636,44 @@ std::vector<std::pair<ref<Installable>, BuiltPathWithResult>> Installable::build
         }
     }
 
+    /* Selective elision of deferred `.drv`s on the build path
+       (PROPOSAL-LAZY-DERIVATIONS.md §4.2 item 1 / LD-S2/LD-S6). Under
+       `lazy-derivations` the `.drv`s evaluated above were only enqueued. Rather
+       than flush the whole queue, wrap `evalStore` so the Worker can *read* a
+       deferred `.drv` (e.g. to substitute its output) without writing it: a
+       fully-substitutable target then never materialises its `.drv` closure
+       (elided), while a target built from source materialises its `.drv` (and,
+       by referential integrity, its input closure) when the building goal reads
+       it back as a file. The queue lives on the EvalState behind value
+       installables; store-path installables carry no deferred derivations.
+       `Realise::Nothing` already forced read-only mode above, so nothing was
+       deferred there and this wrap is inert. */
+    for (auto & i : installables)
+        if (auto * iv = dynamic_cast<InstallableValue *>(&*i)) {
+            if (iv->state->settings.lazyDerivations) {
+                if (dynamic_cast<LocalStore *>(&*store)) {
+                    /* In-process build: the Worker reads deferred `.drv`s through
+                       this overlay and elides substitutable subtrees (LD-S2). */
+                    evalStore = makeLazyDrvStore(evalStore, iv->state->asyncPathWriter);
+                } else {
+                    /* Remote build store (daemon / SSH): the build runs in the
+                       daemon, whose Worker can't see the client's pending queue,
+                       so the `.drv` closure must be SHIPPED to it (LD-S6 — this
+                       forfeits elision for the remote regime, which the daemon
+                       does anyway). Flush it cleanly HERE rather than letting
+                       `RemoteStore::copyDrvsFromEvalStore`'s `copyClosure` pull
+                       each pending object via `narFromPath`: for a deferred
+                       SOURCE that re-enters the daemon connection (materialise →
+                       `outPathOf` → `addToStore`) while the copy holds one, which
+                       deadlocks. After the flush the queue is empty and the
+                       closure is in the (eval) store, so the copy is a plain
+                       present-path copy (or a no-op when eval store == daemon). */
+                    iv->state->asyncPathWriter->waitForAllPaths();
+                }
+            }
+            break;
+        }
+
     std::vector<std::pair<ref<Installable>, BuiltPathWithResult>> res;
 
     switch (mode) {
@@ -751,19 +811,38 @@ StorePathSet Installable::toDerivations(ref<Store> store, const Installables & i
 {
     StorePathSet drvPaths;
 
+    /* Collect the derived paths first — `toDerivedPaths()` is what runs
+       `derivationStrict` and ENQUEUES any deferred `.drv` — so the write-queue
+       is populated before we materialise it below. */
+    std::vector<std::pair<Installable *, DerivedPath>> derivedPaths;
     for (const auto & i : installables)
-        for (const auto & b : i->toDerivedPaths())
-            std::visit(
-                overloaded{
-                    [&](const DerivedPath::Opaque & bo) {
-                        drvPaths.insert(
-                            bo.path.isDerivation() ? bo.path
-                            : useDeriver           ? getDeriver(store, *i, bo.path)
-                                         : throw Error("argument '%s' did not evaluate to a derivation", i->what()));
-                    },
-                    [&](const DerivedPath::Built & bfd) { drvPaths.insert(resolveDerivedPath(*store, *bfd.drvPath)); },
+        for (auto & b : i->toDerivedPaths())
+            derivedPaths.emplace_back(&*i, std::move(b.path));
+
+    /* This resolves installables to `.drv` paths that the caller reads back as
+       files (e.g. `nix derivation show`), and the resolution below
+       (`resolveDerivedPath`) reads them too. So materialise any deferred
+       `.drv`s now (lazy-derivations observation boundary); otherwise a deferred
+       `.drv` would be reported "not a valid store path". A no-op when nothing
+       was deferred. */
+    for (const auto & i : installables)
+        if (auto * iv = dynamic_cast<InstallableValue *>(&*i)) {
+            iv->state->asyncPathWriter->waitForAllPaths();
+            break;
+        }
+
+    for (auto & [i, path] : derivedPaths)
+        std::visit(
+            overloaded{
+                [&](const DerivedPath::Opaque & bo) {
+                    drvPaths.insert(
+                        bo.path.isDerivation() ? bo.path
+                        : useDeriver           ? getDeriver(store, *i, bo.path)
+                                     : throw Error("argument '%s' did not evaluate to a derivation", i->what()));
                 },
-                b.path.raw());
+                [&](const DerivedPath::Built & bfd) { drvPaths.insert(resolveDerivedPath(*store, *bfd.drvPath)); },
+            },
+            path.raw());
 
     return drvPaths;
 }

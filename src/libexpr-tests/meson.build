@@ -75,6 +75,7 @@ sources = files(
   'error_traces.cc',
   'eval.cc',
   'json.cc',
+  'lazy-derivation-defer.cc',
   'lazy-fetcher-attr.cc',
   'input-materialisation.cc',
   'main.cc',

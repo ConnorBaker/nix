@@ -1,5 +1,6 @@
 #include "nix/store/store-api.hh"
 #include "nix/store/local-store.hh"
+#include "nix/store/async-path-writer.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/input-materialisation.hh"
 #include "nix/expr/materialisation-scheduler.hh"
@@ -255,6 +256,15 @@ void EvalState::ensureLazyPathCopied(const StorePath & path)
 
 void EvalState::ensureLazyPathsCopied(const NixStringContext & context)
 {
+    /* Collect the deferred `.drv`s demanded by this context and flush them in
+       ONE batched call (below) rather than one `waitForPath` per element. Over
+       a daemon/remote eval-store the loop-of-`waitForPath` shape issued one
+       `addMultipleToStore` round-trip per `.drv` — so `nix eval --json` of an
+       attrset of N derivations paid N round-trips and lazy-derivations lost to
+       eager (which streams the writes inline). `waitForPaths` coalesces them
+       into a single framed transfer; only the demanded set is flushed, so
+       un-demanded pending entries stay deferred (elision preserved). */
+    StorePathSet deferredDrvs;
     for (const auto & c : context) {
         if (auto * o = std::get_if<NixStringContextElem::Opaque>(&c.raw))
             /* TODO: This could be done in parallel. */
@@ -265,7 +275,19 @@ void EvalState::ensureLazyPathsCopied(const NixStringContext & context)
                lookup; the side effect we want is mounting the
                accessor in storeFS so subsequent reads find it. */
             (void) materialisationScheduler->outPathOf(sv->placeholder);
+        else if (auto * dd = std::get_if<NixStringContextElem::DrvDeep>(&c.raw))
+            /* A `.drv` whose write was deferred (`lazy-derivations`) must be
+               materialised before this context is consumed — output to the
+               user, persisted, or read back (PROPOSAL-LAZY-DERIVATIONS.md
+               §4.2 item 5, the derivation-side twin of the source cover-fix).
+               This is the universal pre-serialise drain: every CLI output
+               mode routes through here. */
+            deferredDrvs.insert(dd->drvPath);
     }
+    /* No-op if nothing was deferred / all already written; the worker batches
+       the actual writes, so this does not un-batch. */
+    if (!deferredDrvs.empty())
+        asyncPathWriter->waitForPaths(deferredDrvs);
 }
 
 StringMap EvalState::resolveSourceVirtualContext(const NixStringContext & context)

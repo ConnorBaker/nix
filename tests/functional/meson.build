@@ -231,6 +231,7 @@ subdir('git')
 subdir('git-hashing')
 subdir('local-overlay-store')
 subdir('source')
+subdir('lazy-derivations')
 
 foreach suite : suites
   workdir = suite['workdir']

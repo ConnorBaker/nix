@@ -35,7 +35,12 @@ nix-instantiate --eval -E "builtins.readFile ((builtins.fetchGit \"file://$TEST_
 
 # Fetch a worktree.
 unset _NIX_FORCE_HTTP
-expectStderr 0 nix eval -vvvv --impure --raw --expr "(builtins.fetchGit \"file://$TEST_ROOT/worktree\").outPath" | grepQuiet "copying '$TEST_ROOT/worktree' to the store"
+# The lazy source-materialisation work copies the worktree through its git
+# accessor, so the progress marker names the git input
+# («git+file://…/worktree?… @ <rev>») rather than the bare worktree path. We
+# still assert that a copy of the worktree to the store happens here (i.e. this
+# is a real fetch, not a cache hit).
+expectStderr 0 nix eval -vvvv --impure --raw --expr "(builtins.fetchGit \"file://$TEST_ROOT/worktree\").outPath" | grepQuiet "copying.*$TEST_ROOT/worktree.* to the store"
 path0=$(nix eval --impure --raw --expr "(builtins.fetchGit \"file://$TEST_ROOT/worktree\").outPath")
 path0_=$(nix eval --impure --raw --expr "(builtins.fetchTree { type = \"git\"; url = \"file://$TEST_ROOT/worktree\"; }).outPath")
 [[ $path0 = "$path0_" ]]
