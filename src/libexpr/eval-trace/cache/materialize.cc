@@ -442,23 +442,6 @@ void TracedExpr::materializeResult(EvalContext<Suspendable> & ctx, Value & v, co
         materializationScope.stagePrecomputedKeys(
             collectPrecomputedKeys(*attrs, originHandles, childOriginIndices, st, pools));
         materializationScope.commit();
-
-        // Submit prefetch hints for all child attrs. The orchestrator may
-        // start speculative verification before children are forced.
-        // Collect pathIds from the already-created TracedExpr child thunks.
-        if (attrs->entries.size() > 1) {
-            std::vector<AttrPathId> childPathIds;
-            childPathIds.reserve(attrs->entries.size());
-            for (auto it = v.attrs()->begin(); it != v.attrs()->end(); ++it) {
-                if (it->value->isThunk()) {
-                    auto * expr = dynamic_cast<TracedExpr *>(it->value->thunk().expr);
-                    if (expr)
-                        childPathIds.push_back(expr->pathId);
-                }
-            }
-            if (!childPathIds.empty())
-                cache->runtime_->submitPrefetchHints(childPathIds);
-        }
     } else if (auto * s = std::get_if<string_t>(&cached)) {
         if (s->second.empty())
             v.mkString(s->first, st.mem);

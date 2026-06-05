@@ -45,6 +45,7 @@
 #include "nix/util/source-path.hh"
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 #include <optional>
 #include <string>
 #include <utility>
@@ -58,6 +59,15 @@ class SemanticRegistry
 {
     boost::unordered_flat_map<DepSource, SourcePath, DepSource::Hash> entries_;
     boost::unordered_flat_map<CanonPath, std::vector<std::pair<DepSource, RegistryMountSubdir>>, std::hash<CanonPath>> mountPoints_;
+
+    /// Sources whose store path is NOT a faithful content address — flake
+    /// nodes whose input is not locked (dirty git worktree / dirty submodule).
+    /// eval-trace mounts these at a STABLE carrier store path with live backing
+    /// content, so H1 (store-path→content-hash cache, sound only under
+    /// store-path immutability) must skip them. Populated at session open from
+    /// `FlakeGraphAuthorityNodeSpec::sourceIsImmutable`. Empty for file-eval and
+    /// fully-locked flakes ⇒ H1 behaviour unchanged in those cases.
+    boost::unordered_flat_set<DepSource, DepSource::Hash> nonImmutableSources_;
 
     /// Mutation is restricted to session-open (TraceSession) and
     /// runtime-root registration (TraceRuntime).  DepCaptureScope takes
@@ -90,9 +100,18 @@ public:
     SemanticRegistry() = default;
 
     explicit SemanticRegistry(
-        boost::unordered_flat_map<DepSource, SourcePath, DepSource::Hash> entries)
+        boost::unordered_flat_map<DepSource, SourcePath, DepSource::Hash> entries,
+        boost::unordered_flat_set<DepSource, DepSource::Hash> nonImmutableSources = {})
         : entries_(std::move(entries))
+        , nonImmutableSources_(std::move(nonImmutableSources))
     {}
+
+    /// True iff `source` is a flake node whose input is not locked, so its
+    /// resolved store path is stable-but-mutable and must NOT be cached by H1.
+    bool isNonImmutableSource(const DepSource & source) const
+    {
+        return nonImmutableSources_.contains(source);
+    }
 
     /// Forward: resolve (source, key) → SourcePath.
     std::optional<SourcePath> resolve(

@@ -1,5 +1,5 @@
 #pragma once
-/// store/verifier.hh — Async verification pipeline orchestrator.
+/// store/verifier.hh — Synchronous verification pipeline.
 ///
 /// Rearchitecture-proposal.md §14 step 7. Renamed from
 /// `VerificationOrchestrator`. The verify/recovery phase functions
@@ -12,27 +12,21 @@
 /// require the full §2.1 virtual surface on `TraceStorage`, which is
 /// deferred until a second verification-capable backend materialises.
 ///
-/// Orchestrates direct typed verification and recovery calls by
-/// delegating I/O to other services:
-///   - `TraceStorage` (via the shared blocking pool) for trace
-///     loading/publishing
+/// Drives direct typed verification and recovery calls:
+///   - `SqliteTraceStorage` for trace loading/publishing
 ///   - direct dep-resolution calls for dep hash computation
 ///
-/// VerificationSession state is accessed from a single eval thread at
-/// a time; concurrency safety comes from `syncAwait`'s future.get()
-/// barrier, not from strand serialization (the original design used
-/// boost::asio strands; those members were removed).
+/// VerificationSession state is accessed from a single eval thread at a
+/// time; verification runs synchronously on the eval thread under the
+/// store's `ExclusiveTraceStorageAccess` (the original async io_context /
+/// strand orchestrator was removed — see context.cc `verify`).
 
-#include "../cache/prefetch-pool.hh"
 #include "nix/expr/eval-trace/store/verification-session.hh"
 #include "nix/expr/eval-trace/store/sqlite-trace-storage.hh"
-#include "nix/expr/eval-trace/strand-local.hh"
 #include "nix/expr/eval-trace/deps/types.hh"
 #include "nix/expr/eval-trace/ids.hh"
 
 #include "nix/expr/eval-trace/store/semantic-registry.hh"
-
-#include <boost/asio/awaitable.hpp>
 
 #include <optional>
 #include <vector>
@@ -43,34 +37,15 @@ class EvalState;
 
 namespace nix::eval_trace {
 
-namespace asio = boost::asio;
-
-class BlockingThreadPool;
-
-/// Async verification pipeline orchestrator.
+/// Synchronous verification pipeline.
 ///
-/// VerificationSession state is accessed from a single eval thread at
-/// a time; `syncAwait`'s future.get() provides the sequencing barrier
-/// between the eval thread and the blocking pool workers.
+/// VerificationSession state is accessed from a single eval thread at a
+/// time; verification and dep hash computation (`resolveDepHash`) run
+/// synchronously inside `verifyTrace` under the store's exclusive access.
 ///
-/// The verifier delegates blocking store I/O to `SqliteTraceStorage` via the
-/// shared blocking pool. Dep hash computation (`resolveDepHash`)
-/// happens synchronously inside `verifyTrace` on the blocking pool.
-///
-class Verifier : private gdp::Certifier<VerificationAccessTag> {
+class Verifier {
 public:
-    /// Configuration for the verifier.
-    struct Config {
-        /// Maximum outstanding prefetch hints per eval coroutine.
-        uint32_t maxPrefetchHints;
-    };
-
-    static constexpr Config defaultConfig() { return {16}; }
-
-    Verifier(
-        SqliteTraceStorage & store,
-        BlockingThreadPool & blockingPool,
-        Config config = defaultConfig());
+    Verifier(SqliteTraceStorage & store);
 
     ~Verifier();
 
@@ -83,11 +58,11 @@ public:
     /// code should go through the typed verify/recovery interface).
     VerificationSession & sessionForTest() { return session_; }
 
-    /// Synchronous verify for the test-only `TraceBackend::verifySync`
-    /// path. Caller (TraceBackend) supplies the exclusive-access capability
-    /// (since `Verifier` doesn't inherit `Certifier<BlockingTag>`). Uses
-    /// the bound `registry_`/`state_` (set via `bindSession`) and the
-    /// existing `session_`. Returns nullopt if the session is unbound.
+    /// The production verify path (driven by `TraceBackend::verify` ->
+    /// `verifySync`, context.cc). Caller (TraceBackend) supplies the
+    /// exclusive-access capability (since `Verifier` doesn't inherit
+    /// `Certifier<BlockingTag>`). Uses the bound `registry_`/`state_` (set via
+    /// `bindSession`) and the existing `session_`. Returns nullopt if unbound.
     std::optional<SqliteTraceStorage::VerifyResult> verifyAttrSync(
         const ExclusiveTraceStorageAccess & ea, AttrPathId pathId);
 
@@ -112,32 +87,18 @@ public:
     /// Keeps the bound registry/state pointers intact.
     void resetVerificationState();
 
-    /// Verify an attr path using the currently bound session state.
-    asio::awaitable<std::optional<SqliteTraceStorage::VerifyResult>>
-    verifyAttr(AttrPathId pathId);
-
-    /// Submit prefetch hints for a batch of sibling attr paths.
-    void submitPrefetchHints(const std::vector<AttrPathId> & pathIds);
-
 private:
     // ── State ───────────────────────────────────────────────────────
 
     SqliteTraceStorage & store_;
-    BlockingThreadPool & blockingPool_;
     VerificationSession session_;
-    Config config_;
 
     /// Bound per-session state. Set once via bindSession(), used by all
-    /// subsequent verifyAttr/prefetch calls. Eliminates per-call reference
+    /// subsequent verifyAttrSync calls. Eliminates per-call reference
     /// parameters and the lifetime bugs they cause.
     const SemanticRegistry * registry_ = nullptr;
     EvalState * state_ = nullptr;
 
-    StrandLocal<PrefetchPool, VerificationAccessTag> prefetchPool_;
-
-    /// Internal implementation — shared by the public verify entry point.
-    asio::awaitable<std::optional<SqliteTraceStorage::VerifyResult>> verifyAttrImpl(
-        AttrPathId pathId);
 };
 
 } // namespace nix::eval_trace

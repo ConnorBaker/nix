@@ -64,6 +64,25 @@ public:
         writeFrame(tag, value);
     }
 
+    /// String-literal / `const char *` values MUST hash as their string content,
+    /// not as a bool. Without this overload, `field("k", "literal")` resolves to
+    /// `field(std::string_view, bool)` — `const char *`→`bool` is a *standard*
+    /// conversion that beats the *user-defined* `const char *`→`string_view` — so
+    /// every literal value hashed as `true`, and distinct literals collided (e.g.
+    /// "git-rev" vs "dirty-rev" in flake `computeLockedVersionIdentity`). This
+    /// corrects EVERY string-literal field value across all hash domains (session
+    /// keys, result/policy digests, flake locked-version identity, …), which is why
+    /// it required the kSchemaEpoch 25→26 bump. Regression test: store/hash.cc
+    /// `CanonicalHashBuilderOverload`. See flake-in-submodule-stale-2026-06-04.md,
+    /// Finding 1.
+    void field(std::string_view tag, const char * value)
+    {
+        // `std::string_view(nullptr)` is UB (calls strlen on null); a null `const
+        // char *` value hashes as the empty string instead. No current caller passes
+        // a runtime (non-literal) pointer, but guard defensively.
+        writeFrame(tag, value ? std::string_view(value) : std::string_view{});
+    }
+
     void field(std::string_view tag, const EvalTraceHash & value)
     {
         writeFrame(tag, value.view());

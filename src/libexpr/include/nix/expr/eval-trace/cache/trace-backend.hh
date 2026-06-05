@@ -143,10 +143,6 @@ public:
     /// Safe to call from any thread without an EvalContext.
     void flush();
 
-    /// Submit prefetch hints for speculative verification of sibling attrs.
-    /// Called from materialization after creating child TracedExpr thunks.
-    void submitPrefetchHints(const std::vector<AttrPathId> & pathIds);
-
     /// Bind the per-session eval state to the verifier.
     /// Called once after construction when the TraceSession is set up.
     void bindSession(

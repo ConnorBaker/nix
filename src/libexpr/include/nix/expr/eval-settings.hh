@@ -394,6 +394,33 @@ struct EvalSettings : Config
             is disabled.
         )"};
 
+    Setting<bool> evalTraceDeferFlush{
+        this,
+        true,
+        "eval-trace-defer-flush",
+        R"(
+            Whether eval-trace batches per-record SQLite flushes during cold
+            recording instead of committing once per recorded trace.
+
+            When `true` (default), recorded trace entities are buffered and the
+            durable Sessions/History rows are deferred alongside them
+            (async-producer-recording-plan "Layer 2a"), then drained together in
+            dependency order at session teardown. This turns N per-record commits
+            into a small number of batched commits — measured ~7-8s faster on a
+            cold python3Packages eval (~32,518 records). Output is byte-identical
+            to per-record flushing, and the Traces-before-Sessions/History
+            ordering is preserved (a crash before teardown loses unflushed records
+            as a future cache miss, never a wrong answer).
+
+            COST: the buffered entities are held in memory until teardown, so peak
+            RSS grows with the number of records recorded in one eval (measured
+            +~376MB at ~32,518 records; negligible at typical scale). Set to
+            `false` for very large single cold evals on memory-constrained hosts.
+
+            Has no effect when [`eval-trace`](#conf-eval-trace) is disabled or on
+            the warm/hot path (which records few or no traces).
+        )"};
+
     Setting<bool> ignoreExceptionsDuringTry{
         this,
         false,

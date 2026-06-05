@@ -89,8 +89,9 @@ struct RecordHashes {
  * same per-hash filtering (traceHash skips !contributesToTraceHash deps with its
  * own ordinal; full/keySet include all; keySet omits the value).
  *
- * `feed3` is a callable `(CanonicalHashBuilder & traceB, bool feedTrace,
- * CanonicalHashBuilder & fullB, CanonicalHashBuilder & keySetB, const Dep::Key &)`
+ * `feed3` is a callable `(CanonicalHashBuilder * traceB, CanonicalHashBuilder & fullB,
+ * CanonicalHashBuilder & keySetB, const Dep::Key &)` where a null `traceB` skips the
+ * trace builder.
  * that resolves the key ONCE and feeds each builder it is told to. The recorder
  * supplies one that resolves via the pools a single time (vs the 3× of the
  * separate calls — the documented `collectPath`/`pools.resolve` cost).

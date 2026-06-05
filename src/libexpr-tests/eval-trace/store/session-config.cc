@@ -328,9 +328,11 @@ TEST(SessionKeyDeterminismTest, SessionKey_PinnedDigest_RegressionGuard)
         .stableRecoveryKey = SessionRecoveryKey{depHash("hash-domain-baseline-recovery").value},
     };
 
-    // Expected digest pinned at branch-creation time against:
+    // Expected digest pinned against:
     //   hash-algorithm = blake3
-    //   kSchemaEpoch = 25
+    //   kSchemaEpoch = 26   (was 25; bumped for the CanonicalHashBuilder const char*
+    //                        overload fix — string-literal field values now hash as
+    //                        their content, not bool, changing every literal preimage)
     //   kProviderEpoch = 1
     //
     // Rebuild instructions if this assertion fires intentionally:
@@ -339,7 +341,7 @@ TEST(SessionKeyDeterminismTest, SessionKey_PinnedDigest_RegressionGuard)
     //      as the new expected value.
     //   3. Commit both changes together.
     const std::string_view expectedHex =
-        "a4084e6e4b290491f4c6169fdbabe4a2df603ee7d6446db960a01150c670141a";
+        "f2d7840994de8f9d9037279be3655bc0f8eaad743646781fba185632495ddb4e";
     auto key = cfg.buildSemanticSessionKey(EvalTraceHashAlgorithm::Blake3);
     EXPECT_EQ(key.digest.toHex(), expectedHex)
         << "SessionConfig::buildSemanticSessionKey digest changed. "

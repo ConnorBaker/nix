@@ -166,7 +166,6 @@ sources = files(
   'eval-environment/request-builder.cc',
   'eval-environment/session-builders.cc',
   'eval-trace/counters.cc',
-  'eval-trace/drv-benefit-probe.cc',
   'eval-trace/hash-spec.cc',
   'eval-trace/context.cc',
   'eval-trace/cache/materialize.cc',

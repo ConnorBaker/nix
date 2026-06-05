@@ -607,3 +607,889 @@ again, now on the record/hash side. To cut it materially you must either:
 H-cold-1 is the cheap sound first cut; the real cold win is C3 (reduce dep count) — which is the SAME
 flattening the producer-partition arc failed to fix via edges, approached differently (record-time
 sub-vector dedup, not consumer edges). That's the next design.
+
+## ADVERSARIAL PASS + ARM RE-RANKING (2026-06-01) — H1-for-`-f` is REFUTED; the hot cost is verify COORDINATION, not file hashing
+
+**Trigger.** After H1/H1b landed, the plan was "bench H1 on a flake workload." User pushback: *"Why do
+you need a flake-shaped workload? Our evaluation cache should work for all inputs."* Correct — H1's
+store-path gate (`isInStore`) means it fires ONLY for store-resident (flake) paths; on `-f /abs/nixpkgs`
+(posix accessor, mutable path) it is inert. The proposed fix was H2' (git blob OID freshness token,
+already in this doc) extended to `-f` git trees. This section adversarially tests that proposal with
+measurement. **Verdict: the proposal targets ~0.3% of the hot cost and is dropped. The real lever is the
+verify execution model.**
+
+### Measurement 1 — H1 is provably inert on `-f` (confirms the gap, refutes "flakes only" as the answer)
+`-f closures.gnome`, HEAD binary, cold→hot→hot, isolated cache:
+- EVERY run: `fileContentCacheEligible = 0` (H1 never fires on posix paths — gate declines).
+- Warm runs: `depHash.contentUs ≈ 0.11s`, `cacheMisses = 23,192`, `verify.depsChecked = 128,028`,
+  `hits=7 misses=0`. The overall cache SERVES correctly on `-f`; only the file-rehash *avoidance* is absent.
+
+### Measurement 2 — matched hot decomposition (wall + cpuTime + verify, one run)
+`-f closures.gnome` warm: **wall = 0.96s, cpuTime = 0.47s ⇒ ~0.49s (51%) is NON-CPU wait.**
+- `verify.timeUs = 0.30s` (≈64% of CPU); within it `contentUs = 0.125s` (the H1/A target), `structOuterUs
+  = 0.047s`, `directoryUs = 0.015s`. `loadTrace = 0.0045s`, `db.init = 0.024s`, `record = 0`, `recovery
+  = 0`. Eval itself is trivial (`thunks.forced = 7`, `nrThunks = 1`) — the cache serves the value; the
+  0.96s is almost entirely verify + coordination, not evaluation.
+- `--no-eval-trace` forces release.nix to its top attrset in **0.01s** vs **0.63s** with eval-trace —
+  i.e. the eval-trace machinery, not parsing, owns the non-verify time too.
+
+### Measurement 3 — `strace -f -c` decomposes the 0.49s wait (THE decisive datum)
+| syscall | %time | calls | meaning |
+|---|---:|---:|---|
+| futex | 73.7% | 874 | blocking/contention on the verify pools (few calls, long waits) |
+| sched_yield | 16.5% | **26,334** | **spin-waiting** in the async machinery |
+| newfstatat | 3.5% | **177,290** | per-dep `lstat` (the 128K-dep walk + path-resolution probing) |
+| getdents64 | 3.3% | 75,298 | `DirectoryEntries` deps |
+| pread64 | **0.28%** | **8,167** | **the actual file-content reads — all H1/A can ever remove** |
+
+Caveat: `strace` serializes threads and INFLATES futex/sched_yield (unstraced wall is 0.96s; strace shows
+5.86s futex alone). So the 74%/16% are distorted upward. **What is NOT inflated: the call counts.** File
+content I/O is 8,167 reads (`pread`) — tiny. The walk is 177K stats. Spinning happens 26K times. The
+qualitative split is robust regardless of strace distortion: **file hashing is a rounding error; the cost
+is the verify walk executed through a multi-thread async machinery.**
+
+### Architecture (code-confirmed) — why coordination dominates
+`SqliteTraceStorage::verifyTrace` (verifier.cc:2192-2280) does ~7-8 `coroBlock` calls PER TRACE (×7
+traces ≈ ~50 handoffs); inside the big `verified = co_await coroBlock(…)` the 128K-dep walk runs
+SYNCHRONOUSLY on one BlockingThreadPool thread (`runPass1`/`runPass2` loops over `fullDeps` calling
+`resolveCurrentDepHash` per dep — verifier.cc:685/728/775/801…). Execution model (context.cc:247 +
+eval-context.hh:169 + blocking-scope.hh:124): eval thread → `syncAwait` (`co_spawn` onto a 2-thread
+`io_context`, then `future.get()` blocks) → verify coroutine on an io_context worker → `coroBlock` posts
+each blocking op to a 2-thread `BlockingThreadPool` → result `post`ed back to the io_context executor.
+So FOUR thread groups (eval + 2 io_context + 2 pool) coordinate around a walk whose real I/O is 0.28%.
+The 26K `sched_yield` is the io_context/asio scheduler spinning while idle workers await cross-thread
+completion posts. (Doc inconsistency found: fiber-scheduler.hh:8 says syncAwait "polls inline" but the
+code is `future.get()` (blocking) — the comment is stale; the spin is in the asio worker idle/handoff,
+not syncAwait. Pin precisely with an off-CPU profile.)
+
+### Arm re-ranking (measured ceilings, confidence)
+- **A — H1/H2' for `-f` (git-OID freshness): DROPPED.** Ceiling = the 8,167 `pread`s + `contentUs`
+  (0.125s CPU) = **~0.3% of hot syscalls / ~13% of CPU**, but the wall is dominated by coordination it
+  does not touch. PLUS the soundness refinement I claimed is wrong: the git index OID is the STAGED
+  blob; for a DIRTY work-tree file it is stale, so trusting it requires git's racy-clean check
+  (mtime/size/inode vs the index's cached stat) — which RE-INTRODUCES exactly the mtime trust class H2
+  was rejected for. So A is *both* low-value *and* not "sound by construction" on a work tree. (H1 for
+  store/flake paths already landed and is fine; do NOT extend to `-f`.) Confidence: HIGH.
+- **H4 — reduce the verify EXECUTION-MODEL coordination overhead.** The real hot lever, input-agnostic
+  (flake + `-f`), pure perf (no cache-semantics/soundness surface). Two shapes:
+  - **H4a (synchronous/low-thread hot verify):** on a warm hit the I/O is page-cached (0.28%), so the
+    async-overlap machinery's coordination cost exceeds the I/O it hides. A synchronous (or 1-thread)
+    verify path for warm hits should erase most of futex+sched_yield. Hypothesis; needs the A/B below.
+  - **H4b (collapse handoffs):** fewer io_context/pool threads, or coalesce the ~50 per-trace coroBlocks.
+  Confidence the lever is here: HIGH. Confidence on the specific fix/size: MEDIUM (needs profile + A/B).
+- **H3 — short-circuit the 128K-dep walk.** Attacks the dep COUNT, which removes the 177K stats AND
+  shrinks the coordination (fewer items). Complementary to H4. Bigger ceiling but soundness-hard
+  (certificate-before-load refuted in naive forms; needs the per-current-node eligibility-bit shape from
+  README lever-3). Confidence: MEDIUM; effort: HIGH.
+
+**Priority: H4a > H3 > A(dropped).** H4 is pure-perf, input-agnostic, and attacks the measured 90%; it
+also helps COLD (record uses the same syncAwait/coroBlock machinery). H3 is the deeper but harder
+count-reduction. A is closed.
+
+### Additional analysis REQUIRED before committing to H4
+1. **Off-CPU profile WITHOUT strace** (`perf record -g` / `perf sched` / off-CPU flamegraph) of the warm
+   `-f` hot run, to get the true futex-vs-sched_yield-vs-stat split and pin the spin (asio idle-worker
+   spin? cross-thread post wakeups? io_context queue-mutex contention?). strace's inflation makes the
+   absolute split unreliable.
+2. **H4a A/B spike:** an env-gated synchronous-verify path (walk deps + stat/read/hash inline on the
+   eval thread, no io_context/BlockingThreadPool/coroBlock) vs the current async path, measured on the
+   warm `-f` hot. Directly sizes the coordination overhead and tests "the async machinery is net-negative
+   on warm hits." Cheapest decisive experiment; also try `kBlockingThreads=1` / io_context single-thread
+   as a one-constant probe.
+3. **Cold check:** confirm record's syncAwait/coroBlock pays the same coordination tax (it should), so
+   H4 is scored against cold (6.7s) too, not just hot.
+4. Resolve the fiber-scheduler.hh "polls inline" vs eval-context.hh `future.get()` doc inconsistency.
+
+**Net:** the "make the cache work for all inputs" answer is NOT extending H1 to `-f` (that optimizes
+0.28%); it is fixing the verify execution model (H4), which is input-agnostic and attacks the measured
+bottleneck. Pending the off-CPU profile + the synchronous-verify A/B before committing.
+
+### EXPERIMENT 1 RESULT (2026-06-01) — perf CORRECTS the strace section: cost is STATS + HASHING; concurrency is ZERO-benefit
+perf 6.19 (paranoid lowered via sudo), warm `-f closures.gnome`, RELEASE binary (libnixexpr symbols
+resolved from the in-store `-debug` outputs). **This supersedes the strace-based ranking above on two
+counts — the strace split was a thread-serialization artifact.**
+
+**On-CPU `perf record` self-time (real, un-inflated):**
+| theme | on-CPU | strace had |
+|---|---:|---:|
+| blake3 hashing | 13.6% | (invisible — pure CPU, no syscall) |
+| tbb:: (parallel-hash coordination) | 13.2% | — |
+| malloc/gc/memcpy | 13.0% | — |
+| stat/getdents | 4.6% | 6.8% |
+| futex/mutex | **2.6%** | 73.7% |
+| sched_yield | **0.1%** | 16.5% |
+| asio/io_context | 0.2% | — |
+
+On-CPU coordination (futex+yield+asio) ≈ **3%**, NOT 90%. strace inflated the syscall WAITS by
+serializing threads. blake3 caller (resolved): `blake3_hash_many_avx2 ← TBB ←
+BlockingThreadPool::Work<coroBlock<verifyAttrImpl::lambda#4>> ← SqliteTraceStorage::verifyTrace` — the
+verify re-hashing content/trace, TBB-parallelized inside the pool task; TBB burns ~as much CPU
+coordinating (13.2%) as hashing (13.6%).
+
+**`time -v` decomposition (no idle):** wall 0.94s = **user 0.45s + sys 0.40s**. The earlier "0.49s
+off-CPU wait" was a MISREAD — the matched run's `cpuTime`=0.47 was USER-only; the "gap" is SYS time
+(0.40s ≈ the 177,290 `newfstatat` + 8K reads + getdents). Minimal true idle.
+
+**Concurrency delivers ZERO wall benefit (decisive `taskset`):**
+| config | wall |
+|---|---:|
+| NORMAL (32 CPU: asio pool + BlockingThreadPool + TBB blake3 + parallel GC) | 0.94–0.97s |
+| `taskset -c 0` (1 CPU, fully serial) | **0.92–0.94s** (slightly FASTER) |
+| `taskset -c 0-1` (2 CPU) | 0.92–0.93s |
+
+The entire multi-thread machinery is net-neutral-to-negative on warm hot — coordination overhead ≈ the
+parallel speedup.
+
+**CORRECTED arm ranking (supersedes the strace-based ranking):**
+- **H3 (reduce the dep walk): #1.** `sys` 0.40s (≈43% of wall) is 177,290 `newfstatat` — per-dep stat
+  + **35,931 ENOENT** path-resolution probing. The single biggest cost. Cutting the walk attacks it
+  directly; the 35K failed path-probes are a separately-cacheable sub-lever. Soundness-hard, biggest payoff.
+- **H4 RE-SCOPED to "REMOVE the async machinery," not "fix coordination": #2, cheap.** Since 1-CPU ==
+  32-CPU wall, a SYNCHRONOUS single-thread verify is as fast (likely faster), simpler, and deletes the
+  futex/TBB/asio overhead + off-thread complexity. Low-risk simplification. Bundle with **serial blake3**
+  (disable TBB for hashing — 13.2% coordination is wasted; serial is same-speed at these sizes).
+- **H1/A (file-hash cache): #3, smaller than H3 but NOT 0.28%.** strace's `pread=0.28%` hid that the
+  file cost is the blake3 HASHING (CPU, ≈13% of user), which H1/A removes — but it is smaller than the
+  177K-stat `sys` cost, and the `-f` freshness complication (dirty-file → stat trust class) stands.
+  Reconsider after H3/H4.
+
+**My strace-driven adversarial pass was wrong on two counts:** (1) it dismissed H1/A on `pread=0.28%`,
+but the file cost is CPU hashing (invisible to strace); (2) it proposed "fix the coordination," but
+on-CPU coordination is ~3% and the concurrency is *removable* (zero benefit). The real levers are **H3
+(the 177K-stat walk)** and a **synchronous-verify simplification (+ serial blake3)**. Experiment 2
+(synchronous-verify A/B) is now strongly pre-justified by the `taskset` result — it should match wall
+while removing the entire async/TBB apparatus.
+
+### EXPERIMENTS 1+2 (the spikes) — DONE 2026-06-01. See `plans/verify-execution-model-spike.md`.
+- **Spike 1 (synchronous verify, `NIX_EVAL_TRACE_SYNC_VERIFY=1`):** byte-identical output +
+  identical counters + SAME wall (0.93 vs 0.94s) as async. The io_context/coroBlock/prefetch
+  apparatus is **removable with zero warm regression** — confirmed as a real code path, not just
+  a `taskset` artifact. Win = simplicity, not wall.
+- **Spike 2 (parallel ceiling, proxy micro-bench):** stat+read+hash parallelizes ~5–8x, but the
+  dominant STAT cost plateaus at **~4x** (VFS contention) → realistic **~2x hot ceiling**
+  (0.94→~0.45s), gated on a concurrent-L1 thread-safety refactor (the L1 dedups the 607×
+  duplicates, so it can't be skipped). Real but bounded; H3 (cut the dep count) is more
+  fundamental.
+- **Synthesis:** async pays only for COLD disk I/O; the WARM path wants data-parallelism (or
+  fewer deps). Current design applied the cold tool to the warm path. Decision point (uncommitted):
+  (1) land Spike-1 simplification, (2) H3 root-cause, (3) parallel-verify refactor for ~2x warm.
+
+### STAT-SOURCE PROFILE (2026-06-01) — the 177K stats are GIT, not verify. CORRECTS Experiment 1; introduces G1.
+`perf record -e syscalls:sys_enter_newfstatat -g` (under sudo for complete tracefs metadata; the
+unprivileged record produced "broken trace data"), warm `-f closures.gnome`, 176,935 stat samples:
+
+| call site | % of stats |
+|---|---:|
+| `getOrCreateTraceCache -> observeGitIdentity -> computeGitIdentityHash -> GitRepoImpl::getWorkdirInfo -> libgit2 git_status` | **89.4%** |
+| `TracedExpr::eval -> TraceBackend::verify -> verifySync -> SqliteTraceStorage::verify(Trace)` | **~5–8%** |
+
+**CORRECTION to EXPERIMENT 1 above:** I attributed `sys` 0.40s (the 177K `newfstatat` + 35K ENOENT
++ 75K getdents) to "the per-dep verify stat walk." **WRONG.** It is the eval-trace SESSION-KEY's
+git-dirty marker: `InstallableAttrPath::getOrCreateTraceCache` calls `observeGitIdentity ->
+computeGitIdentityHash`, which runs libgit2 `git status` (diff index↔workdir) over the **42K-file
+nixpkgs working tree** — stat + getdents every file/dir + .gitignore/attr lookups (the 20% ENOENT
+are ignore/attr probes) — ONCE per eval. The verify dep-walk does only ~9K stats. So H3-stat (cache
+verify canonicalization) is REFUTED; the verify walk's real cost is hashing/CPU, not stats.
+
+**This is the single biggest hot-STAT lever: G1 — the git-identity worktree scan (~0.35s ≈ ~38% of
+the 0.94s wall).** It is:
+- **eval-trace-specific** (the session key's dirty-marker; `--no-eval-trace` skips
+  `getOrCreateTraceCache` → skips it) — part of eval-trace's "always-on" tax.
+- **`-f`-git-worktree-specific / "works for all inputs":** a FLAKE input (locked rev / store-copied,
+  immutable) has no worktree to dirty-check → pays ~0 here. So the COMMON interactive `nix eval -f
+  /git-repo` dev path pays a ~0.35s/eval scan the flake/CI path does not. (Connects to the user's
+  "should work for all inputs" — this is a real per-input asymmetry.)
+- **uncached cross-process:** `computeGitIdentityHash` (dep-hash-fns.cc:57) calls `getWorkdirInfo()`
+  DIRECTLY, bypassing the per-process `workdirInfoCache_` (git-utils.cc:1515); and it's called once
+  per eval, so the within-process `session.gitIdentityCache` (verification-session.hh:106) doesn't
+  help it. Every eval re-scans the whole worktree.
+
+**G1 lever options (uncommitted; scope before building):**
+1. **Cross-process cache** the identity keyed on a cheap freshness token (`.git/index`
+   mtime+size + HEAD oid) → reuse if unchanged. SAME freshness hazard as H1/H2: an UNSTAGED edit
+   doesn't touch `.git/index`, so an index-mtime token is UNSOUND (a dirty edit wouldn't
+   invalidate). Needs a token that catches unstaged edits → likely back to a scan or git fsmonitor.
+2. **git fsmonitor** (libgit2 `core.fsmonitor` / a daemon) → `git status` becomes O(changes) not
+   O(42K worktree). The proper fix for repeated evals on a stable tree; nontrivial integration.
+3. **Trim the scan** — libgit2 `git_status_options` flags to skip untracked-file detection +
+   ignore processing (~20% of the stats are .gitignore/attr). Partial, cheap, sound.
+4. **Opt-out fast path** — `--eval-trace-assume-clean` (key on HEAD oid only) for clean CI; unsound
+   for dirty worktrees, so gated/explicit.
+
+**Needed analysis before committing G1:** confirm the scan is O(worktree) wall (time
+`getWorkdirInfo` directly) and that a flake input skips it (measure `nixpkgs?rev=X#…` stat count);
+then prototype option 3 (trim flags, cheapest+sound) and measure the wall delta vs option 2
+(fsmonitor, bigger). **Ranking update: G1 now leads the hot levers for the `-f /git` workload**
+(~30%), ahead of H3-arch (the verify/cold root fix) and parallel-verify (~2x warm). They are
+orthogonal — G1 is session-key setup, H3/H4 are verify.
+
+#### CONFIRMATION (2026-06-01) — G1 is eval-trace's, `-f`-git-only; flakes skip it (and their cost is nix-core)
+Trivial-eval A/B (`lib.version`, isolates session setup from eval), `newfstatat` via `strace -c`:
+| eval | WITH eval-trace | `--no-eval-trace` |
+|---|---:|---:|
+| `-f /abs/nixpkgs lib.version` (git worktree) | **159,545** | **1,848** |
+| flake `git+file://…?rev=X#lib.version` (store-copied) | 1,585,273 | 1,585,236 |
+
+- **G1 is 100% eval-trace's:** `--no-eval-trace` collapses the `-f` scan 159,545 → 1,848. It is the
+  session-key git-dirty marker, fully removable (it's not nix-core eval cost).
+- **Flakes skip G1 — definitively:** the locked flake source in the store
+  (`/nix/store/…-source`) has **no `.git`** (verified `ls`), so libgit2 `git_status` is impossible.
+- **The flake's own 1.58M stats are nix-CORE, not eval-trace** (1,585,273 vs 1,585,236 —
+  identical): flake narHash / store-accessor machinery scanning the 86,753-entry store tree per
+  eval (`getdents64` 716K, `openat` 359K). eval-trace adds ~0 stats on flakes. (A separate, larger
+  nix-flake perf issue — OUT OF SCOPE for eval-trace, but worth flagging: the flake path is NOT
+  cheaper than `-f`; it's heavier, just not because of eval-trace.)
+- `git status --porcelain` on the worktree = **0.27s** (50,931 tracked files) — the G1 magnitude.
+
+**Net "works for all inputs":** eval-trace's per-eval STAT tax is entirely the `-f`-git-worktree G1
+(~0.27–0.36s ≈ ~30% of the closures.gnome hot wall); on flakes eval-trace is stat-free. So **G1 is
+the lever for the common interactive `nix eval -f /git-repo` dev path.** Options unchanged (trim
+libgit2 status flags = cheapest sound; fsmonitor = biggest; cross-process cache = freshness-hazard;
+`--assume-clean` opt-out).
+
+#### G1 PROTOTYPE (2026-06-01) — skipping the scan is a 2.8× warm win, correct + sound. `result-g1/bin/nix`.
+Two env-gated prototypes in `GitRepoImpl::getWorkdirInfo` (git-utils.cc, default-off):
+- `NIX_EVAL_TRACE_GIT_HEAD_ONLY=1` — skip the `git_status` scan, return `headRev` + empty
+  dirty/deleted (== a CLEAN full-scan's identity, so caches interchangeable on a clean tree).
+- `NIX_EVAL_TRACE_GIT_NO_UNTRACKED=1` — drop `GIT_STATUS_OPT_INCLUDE_UNTRACKED`.
+
+**Measured (release `result-g1/bin/nix`):**
+| metric | baseline | NO_UNTRACKED | HEAD_ONLY |
+|---|---:|---:|---:|
+| `-f lib.version` newfstatat | 159,545 | **159,545 (no-op)** | **1,105** |
+| closures.gnome COLD wall | 11.80s | — | 10.74s (−9%) |
+| closures.gnome WARM wall | **0.94s** | — | **0.34s (−64%, 2.8×)** |
+
+- **HEAD_ONLY removes the scan entirely** (159,545→1,105 stats) and the git scan was **~0.60s =
+  64% of the 0.94s warm hot wall** — bigger than the ~30% estimate. closures.gnome WARM
+  0.94→**0.34s**, byte-identical to `--no-eval-trace`. Cold −9% (scan paid there too; ~1.06s cold).
+- **NO_UNTRACKED is a NO-OP** — my hypothesis was wrong: the `.gitignore`/attr work in the profile
+  is part of the filesystem *iteration* (statting/ignore-classifying every dir during the
+  index↔workdir diff), not gated on untracked *reporting*. Dropping `INCLUDE_UNTRACKED` doesn't
+  skip it. (Still safe to drop — `untrackedFiles` is dead — but it buys nothing.)
+- **SOUNDNESS (edit-detection test, `/tmp/g1-edittest`):** cold-eval `val`=v1; unstaged edit
+  `data.txt`→v2 (HEAD unchanged → HEAD_ONLY keeps the session key stable, so the git-identity does
+  NOT see the edit); warm-eval returned **v2** — the FileBytes backstop caught it. Both DEFAULT
+  (via session-key change) and HEAD_ONLY (via the backstop) are SOUND for this case.
+- **Residual soundness caveat:** HEAD_ONLY trades the git-identity coarse backstop for the
+  FileBytes/DirectoryEntries backstops. Normal `.nix` eval is covered (every parsed file → FileBytes;
+  dir listings → DirectoryEntries). The narrow OR-1 (toFile literal) / OR-4 (untracked-file-import
+  keyset add) theoretical edges — "not demonstrably reachable" per the OR docs — lose their extra
+  net. Making HEAD_ONLY the DEFAULT needs the full test suite + the user's risk call.
+
+**Production options (ranked):**
+1. **HEAD_ONLY as default** — biggest win (2.8× warm), simplest; relies on FileBytes/DirEntries
+   backstops; the edit-heavy nixpkgs-dev user loses dirty-partition precision (cache churn on edit,
+   self-healing). Needs suite + risk sign-off.
+2. **Cross-process cache** the identity keyed on (`headRev` + `.git/index` mtime/size) — skip the
+   scan when nothing staged changed; keeps dirty-precision for staged changes; unstaged edits still
+   rely on the FileBytes backstop (same floor as #1) but only between index changes. More
+   conservative, keeps the backstop for the common git-operation cases. Bigger change (persist).
+3. fsmonitor — O(changes) scan; biggest infra lift; orthogonal (helps even if we keep the scan).
+NO_UNTRACKED is dropped (no-op). Recommend prototyping #2 next (keeps soundness margin) OR landing
+#1 default-off→opt-in first and measuring real-world churn.
+
+#### G1 #2 IMPLEMENTED + VALIDATED (2026-06-01) — cross-process clean-marker cache. The SOUND production design.
+`NIX_EVAL_TRACE_GIT_CACHE=1` (dep-hash-fns.cc `computeGitIdentityHash`, default-off): a cross-process
+cache of the "worktree clean" verdict, marker = a 0-byte file under `getCacheDir()/
+eval-trace-git-clean-v1/<sha(repo+token)>`, token = `HEAD oid + .git/index mtime+size`. On a clean
+hit, build the IDENTICAL clean identity (synthetic clean `WorkdirInfo` → same `buildGitIdentityFromWorkdirInfo`)
+and skip the scan. `getWorkdirInfo` was refactored: the identity builder is extracted so cache and
+scan produce byte-identical clean identities.
+
+**Measured (`result/bin/nix` = nix-cli with #2):**
+| | baseline | HEAD_ONLY | **#2 cache** |
+|---|---:|---:|---:|
+| `-f lib.version` newfstatat, eval1 / eval2 (new process) | 159,545 / 159,545 | 1,105 / — | **164,912 / 1,120** |
+| closures.gnome cold | 11.80s | 10.74s | 11.52s (scan+mark) |
+| closures.gnome WARM | 0.94s | 0.34s | **0.35s** |
+
+- **Cross-process cache works:** eval-1 scans + writes the marker (164,912 stats); eval-2, a SEPARATE
+  process, reads the marker and skips the scan (1,120). closures.gnome warm 0.94 → **0.35s** (same win
+  as HEAD_ONLY), byte-identical to `--no-eval-trace`. One marker for the clean nixpkgs token.
+- **SOUND + more conservative than HEAD_ONLY:** the token is HEAD+index-sensitive (2 markers across
+  v1/v3 commits prove it). A `git add`/commit bumps the token → marker miss → re-scan → precise
+  dirty-partition. Only an UNSTAGED edit between index changes reuses a stale "clean" marker, and the
+  FileBytes backstop catches it (edit-test: unstaged v1→v2 returned **v2**). Dirty worktrees never cache.
+  So #2 leans on the backstop strictly LESS than HEAD_ONLY (which never scans), at the same warm speed.
+- **Cost vs HEAD_ONLY:** #2's first eval per (HEAD,index) token scans (cold ≈ baseline 11.52s);
+  HEAD_ONLY never scans (cold 10.74s). #2 trades ~0.8s cold for keeping the soundness margin.
+
+**(c) — HEAD_ONLY does NOT regress the unit suite.** `nix-expr-tests` with
+`NIX_EVAL_TRACE_GIT_HEAD_ONLY=1`: **1859 passed / 4 skipped / 0 failed** (identical to baseline). All 24
+git-identity tests pass under HEAD_ONLY, incl. `Recovery_GitIdentity_StaleHash_FileMatches_
+ValidViaContentDep` — the test that literally encodes the backstop HEAD_ONLY relies on. (Caveat: these
+are synthetic `TraceStoreTest` fixtures; they validate the GitRevisionIdentity-DEP recovery, not
+necessarily the session-key `getWorkdirInfo` scan path. The integration evidence — asciidoc
+byte-identical + the `-f /git` edit test — is the real soundness check, and both pass.)
+
+**RECOMMENDATION:** ship **#2** — it delivers the full 2.7× warm win, is cross-process, preserves the
+git-identity dirty-partition for git operations, and narrows the backstop reliance to unstaged edits
+only (vs HEAD_ONLY dropping the git-identity entirely). It is the sound production design and a viable
+DEFAULT (env-gated now; flipping to default-on needs a broader edit-case soundness pass + sign-off).
+HEAD_ONLY stays as the aggressive max-speed (cold too) opt-in. NO_UNTRACKED dropped (no-op). fsmonitor
+is OUT (not acceptable for this deployment).
+
+#### G1 #2 SOUNDNESS PASS + made DEFAULT (2026-06-02)
+**Broader edit-case pass** — every dep kind, UNSTAGED change (so the #2 marker HITS and the per-file
+backstop is what must catch it, not the coarse session-key change), baseline as control. CAUGHT =
+warm reflects the change; a "regression" = #2 STALE where baseline CAUGHT (the only thing that would
+block defaulting):
+| case | dep kind | baseline | #2 | 
+|---|---|---|---|
+| readFile content edit | FileBytes | CAUGHT | CAUGHT |
+| import content edit | FileBytes | CAUGHT | CAUGHT |
+| readDir add untracked file | DirectoryEntries (OR-4 keyset-add) | CAUGHT | CAUGHT |
+| store-copy `${./asset}` content | DerivedStorePath (narhash) | CAUGHT | CAUGHT |
+| delete imported file | (import error) | CAUGHT | CAUGHT |
+| toFile literal in imported file | FileBytes (OR-1) | CAUGHT | CAUGHT |
+| pathExists create | ExistenceCheck | CAUGHT | CAUGHT |
+| dynamic-path readFile | FileBytes | CAUGHT | CAUGHT |
+| symlink target content | FileBytes | CAUGHT | CAUGHT |
+| deep-nested file | FileBytes | CAUGHT | CAUGHT |
+
+**0 regressions across 11 cases — #2 is byte-identical to baseline on every reachable shape.** (The
+OR-1 toFile and OR-4 keyset-add "theoretical edges" are CAUGHT here, via the imported file's FileBytes
+and the readDir's DirectoryEntries respectively.) Made #2 the **default path** (dep-hash-fns.cc):
+`computeGitIdentityHash` caches by default; `NIX_EVAL_TRACE_GIT_NO_CACHE=1` forces the always-scan
+path (escape hatch). HEAD_ONLY/NO_UNTRACKED prototypes reverted from git-utils.cc.
+
+#### ADVERSARIAL PASS over the G1 work + the whole arc (2026-06-02)
+Self-interrogation, harshest-first:
+
+1. **The soundness equivalence is EMPIRICAL, not a proof — and #2 *does* shrink defense-in-depth.**
+   The honest mechanism: for an UNSTAGED edit, the always-scan path invalidates the WHOLE session
+   (worktree dirty → git-identity changes → new session key → the cold trace is in another partition,
+   never consulted → fresh eval). #2 keeps the session key and relies on per-dep verify. These are
+   equivalent ONLY IF per-dep capture is complete. The OR-4 residual (a key change where the
+   `ExprParseFile` FileBytes-backstop does NOT fire) is exactly the case where the always-scan's
+   COARSE net catches it and #2's FINE net might not — for unstaged edits. Mitigations that make it
+   acceptable: (a) it is "not demonstrably reachable" (OR-4 doc); (b) the closest reachable shape
+   (readDir keyset-add) is CAUGHT; (c) it only applies to unstaged edits (staged/committed bump the
+   token → re-scan → identical to baseline). But it is a real reduction in coarse safety margin, not
+   zero. A defensible default given (a)–(c); NOT a proof of equivalence.
+2. **Does the coarse net even add value, or is it illusory?** Baseline's git-identity only changes for
+   WORKTREE-FILE changes — which are ALSO caught by FileBytes. So the coarse net adds soundness ONLY
+   where a worktree-file change escapes FileBytes (OR-4 condition 1). So #2 loses nothing for every
+   case where FileBytes fires (≈ all normal eval), and loses the net only for the unreachable OR-4
+   shape. This narrows the risk but confirms it is non-zero.
+3. **The win is REPEATED-eval / amortized, not universal.** #2 skips the scan only on a token HIT
+   (same HEAD+index). One-shot eval of a FRESH commit (CI walking commits) → new token → scan every
+   time → no win (no worse than baseline). It wins the dev loop (re-eval same commit) and CI that
+   evaluates many attrs of one commit (first attr scans+marks, rest hit). Framed honestly: a fixed
+   ~0.6s removed from REPEATED `-f /git` evals; 2.8× on closures.gnome, more on smaller evals.
+4. **The marker cache has rough edges for a production default:** (a) UNBOUNDED growth — one 0-byte
+   file per (repo, HEAD, index) ever seen; needs a TTL/GC (follow-up; space is trivial but inodes
+   aren't). (b) token = `.git/index` mtime+size — a coarse-mtime FS + a same-size index rewrite within
+   one mtime tick could collide (rare; git itself trusts index-stat for racy-clean; add ctime if
+   paranoid). (c) `.git` as a FILE (linked worktree/submodule) → `repoRoot/.git/index` absent →
+   `:noindex` token → HEAD-only (re-scans only on commit; sound, less precise). (d) concurrent writers
+   → idempotent 0-byte marker, fine.
+5. **I OWN that the git-scan finding INVALIDATES my own earlier priorities.** H1/H3/H4 and the
+   parallel-verify "~2× ceiling" were built on a WRONG attribution: I called the 177K stats "the verify
+   dep-walk" when they were 89% the git scan. Consequences I must propagate: (a) H3-arch's HOT payoff
+   is far smaller than scoped (the dep walk is ~5% of stats, not the bottleneck); the H3 doc's
+   stat-based framing is RETRACTED for hot (it stands only for COLD recording / the flattening). (b)
+   The parallel-verify spike measured git-inflated stats → its ceiling claim is suspect for hot. (c)
+   Spike-1 (sync verify) was always going to be ~0 wall win because the git scan dominated, not the
+   async machinery. The earlier "verify is the hot cost" framing was wrong end-to-end; G1 is the hot
+   cost, and it is now addressed.
+6. **Process critique.** Four times I formed a lever hypothesis from PARTIAL signal (strace-inflated
+   futex; counters; code-reading; an untested flag) and was WRONG until I MEASURED the attribution
+   (perf on-CPU, A/B, the stat-source profile). The recurring failure mode: scoping a lever before
+   profiling where the cost actually is. The git scan was the FIRST thing every `-f /git` eval does and
+   sat unmeasured for the whole arc until the stat-source profile forced it out. Lesson, now applied:
+   attribute cost by direct profiling before designing the fix.
+7. **Revised next steps (the old ones are demoted):** (a) COLD recording (~6.7s) is the real remaining
+   eval-trace cost — UNTOUCHED by G1 (the git scan is ~1s of cold) and the ORIGINAL concern; it is the
+   next lever, via record-time dep dedup (C3) or the compositional DAG (H3-arch, whose payoff is now
+   COLD not hot). (b) The nix-CORE flake narHash/store-tree scan (1.58M stats/eval, LARGER than the
+   git scan, affects ALL flake evals, identical with/without eval-trace) is a real nix-flake perf bug —
+   out of eval-trace scope but worth flagging upstream. (c) Marker GC/TTL for the #2 default. H3-arch
+   and parallel-verify are NOT the priority; cold recording is.
+
+### ADVERSARIAL PASS ON (a) "COLD RECORDING" (2026-06-02) — (a) IS MIS-SCOPED. Recording is 0.2s; cold is GC-bound (inherent).
+Per the standing discipline (measure the attribution before scoping the lever), I re-measured cold
+BEFORE touching it. Three findings, each overturning the prior framing:
+
+1. **"~6.7s recording" is WRONG. `record.timeUs` (the store write) = 0.20s** (hashUs 0.11, flush 0.06,
+   serialize 0.01, count=7), on a 11.98s cold closures.gnome. The 6.7s figure was stale (old docs /
+   different baseline). Recording the trace to SQLite is cheap; it is NOT a lever.
+2. **Cold decomposition (current binary):** pure eval (merge-base, no eval-trace) 4.5s; HEAD
+   `--no-eval-trace` 7.5s ⇒ **always-on tax ≈ 3s** (EvalEnvironment routing + semantic objects, paid
+   even DISABLED); HEAD cold 12.0s ⇒ +4.5s = git scan ~1s (now #2-cached) + recording-path eval ~3.3s
+   (dep-capture building the 131,782 flattened deps + TracedExpr wrapping) + store-write 0.2s.
+3. **~54% of cold CPU is `GC_add_to_black_list_normal` (Boehm conservative-GC black-listing) — and it
+   is INHERENT, not eval-trace's.** perf self-time `GC_add_to_black_list_normal`: merge-base **54.1%**,
+   HEAD `--no-eval-trace` **59.9%**, HEAD cold **53.2%** (all-GC ~110-120% via parallel GC-marker
+   threads). SAME in plain pre-eval-trace nix. It is the Boehm conservative GC scanning the hash-/
+   string-heavy nixpkgs heap and black-listing integers that look like pointers — a NIX-CORE pathology
+   on closures.gnome, the single biggest cost of ANY closures.gnome eval. (My "eval-trace hash data
+   causes the black-listing" hypothesis was FALSIFIED by the merge-base profile.)
+
+**Consequence — (a) re-scoped:**
+- The biggest cold cost (~54% GC black-listing) is **nix-core, out of eval-trace scope** — flag
+  upstream alongside flake-narHash. (Fixing it — precise GC, black-list tuning, or GC_malloc_atomic for
+  blob/string data — would ~2x ALL large nix evals, but is an RFC-scale nix-core change.)
+- The eval-trace-SPECIFIC cold overhead is the **always-on tax (~3s, paid even `--no-eval-trace`) +
+  the recording-path dep-capture (~3.3s)** — both ALLOCATION-bound, and ~½ of each is the proportional
+  inherent GC. The tractable eval-trace lever is **reduce allocation**: (i) the always-on tax's
+  per-observation/semantic-object allocation on the DISABLED path (a regression for ALL users: ~0.9s
+  non-GC + ~2.1s the GC it induces); (ii) the 607× dep flattening (compositional DAG / record-less,
+  RFC-scale). Recording (0.2s) is a non-lever.
+- **Do NOT pursue "(a) cold recording" as named.** Honest re-scope: the cheapest eval-trace cold win is
+  trimming the ALWAYS-ON TAX (disabled-path allocation, also helps `--no-eval-trace` users); the deep
+  win is the dep-flattening (now a COLD lever, ex-H3-arch). The dominant cost is nix-core GC, to flag.
+  Needs the user's call on which — or whether the cold cost (half unfixable-here GC) is worth it at all.
+
+### VERIFICATION OF SUB-AGENT FINDINGS (2026-06-02) — two sub-agents ran (1)=trim-always-on-tax, (3)=flag-nix-core; parent re-verified everything. Corrected BOTH agents AND the parent's own "54% GC" finding.
+- **CONFIRMED: the "54% GC" was a hybrid-CPU artifact.** This box is a 13th-gen i9-13900K (P+E cores;
+  `/sys/devices/cpu_core` + `cpu_atom`). `perf report --sort=symbol` emits TWO ~100%-summing PMU blocks;
+  the parent's awk summed both (→ the bogus "107.8%") and the "54%" was the cpu_atom/E-core block where
+  the GC mark thread is pinned. **The GC is PARALLEL, ~1s, and NOT on the wall critical path** —
+  re-measured: baseline cpuTime 6.17s/wall 4.87s (gap 1.3s), HEAD `--no-eval-trace` 8.82s/7.94s (gap
+  0.88s); the +3.07s WALL regression ≈ the +2.65s cpuTime regression with the parallel gap SHRINKING,
+  so the cold-tax wall is **SERIAL eval-trace work, not the inherent GC.** ⇒ the parent's earlier "half
+  the cold is unfixable GC, leave it" was WALL-MISLEADING; the ~3s tax is mostly RECOVERABLE serial work.
+- **Agent (1) — trustworthy; refuted the parent's own hypothesis.** The "per-observation EvalEnvironment
+  routing/semantic-object allocation" hypothesis is REFUTED: an env-gated routing fast-path
+  (`NIX_EVAL_TRACE_FASTPATH`) gave ZERO win (counters identical). The real tax: (a) **`Bindings` grew +16B
+  — CONFIRMED** (`valueIdentityStamp_` attr-set.hh:126 + `publication_` :135) × 4.07M attrsets = +65MB,
+  one extra GC cycle; a side-table off the hot 24B struct recovers ~1.16s cpuTime but only **~0.3s wall**
+  (the GC is parallel). (b) **diffuse SERIAL instrumentation ~2s** — import classifying sources via
+  throwing `parseStorePath` (primops.cc:386-388; 4× exception-unwinding), extra MountedSource/Caching
+  accessor layers, `forceListObserved`/`coerceToStringWithProvenance`. NO landed fix (the prototype is a
+  no-op by design); concrete file:line targets only. The agent's worktree patch is a NO-OP — do NOT apply.
+- **Agent (3) — GC + upstream issues VERIFIED; the flake "cold-only" claim REFUTED.** GC mechanism
+  (eval-gc.cc:53/57 conservative-GC config) and the cited issues are real + relevant: **#3121** "Copy
+  local flakes to the store lazily" (open), **#13225** "Lazy trees v2" (open), **#14088** "Managed Heap"
+  (open) — all WebFetch-confirmed. BUT agent 3's claim that the flake 1.58M-stat scan is COLD-CACHE-ONLY
+  (warm=3.6K via `sourcePathToHash`) is **REFUTED**: re-measured **1.58M newfstatat on EVERY eval** here —
+  cold isolated 1,589,837 / warm-2nd-eval isolated 1,585,273 / warm SHARED `~/.cache` (fetcher-cache-v4
+  present) 1,585,277. Agent 3's 3.6K is NOT reproducible in this environment; the flake-scan cacheability
+  is now UNCERTAIN (is the fetch/eval cache not hitting on this fork? agent 3 may have hit the flake
+  EVAL-cache, not the source cache). The flake upstream draft must NOT assert "cold-only" until this is
+  resolved. The GC upstream draft is sound.
+- **Net corrected next-steps:** (1) the always-on tax (~3s) is mostly RECOVERABLE serial work, not GC —
+  quick win = move the 2 Bindings fields to a `Bindings*`-keyed side-table (~0.3s wall, +1.16s cpuTime);
+  bigger = the diffuse serial instrumentation (import-throwing first — non-throwing `maybeParseStorePath`).
+  (3) GC draft ready to flag (#14088 etc.); flake draft BLOCKED on resolving the 1.58M-every-eval-vs-3.6K
+  cacheability discrepancy. Do NOT trust the sub-agents' un-reverified specifics — esp. agent 3's flake numbers.
+
+### (a)+(b) ATTEMPTED + ADVERSARIAL PASS (2026-06-02) — both (a) fixes collapse on inspection; cold has NO clean lever. STOP.
+**(a) — both concrete fixes REFUTED by code inspection (before building):**
+- (a2) "import throws via parseStorePath, fix = maybeParseStorePath": REFUTED. `isStorePath` ALREADY
+  calls `maybeParseStorePath` (store-dir-config.cc:39). The throw is INSIDE `maybeParseStorePath`
+  (`try { parseStorePath } catch`, store-dir-config.cc) — nix-CORE, present in the merge-base, and the
+  import primop only `parseStorePath`s AFTER `isStorePath` is true (primops.cc:385-388), so no
+  throw-as-control-flow there. The unwinding is real for `-f` (non-store import paths hit
+  maybeParseStorePath's internal throw) but it is nix-core; a real fix = a non-throwing StorePath
+  parser (~0.14s, broad, libstore-scope), NOT eval-trace's tax. Where eval-trace ADDS the 4× is unidentified.
+- (a1) "move the +16B Bindings fields to a side-table (~0.3s)": NOT a clean win. The footprint win is
+  ~0.3s but PARALLEL-GC (largely wall-hidden, per the cpuTime/wall verification). And `Bindings::
+  publication()` is READ on the DISABLED path: `Value::publication()` (eval-inline.hh:155) ← `EvalState::
+  lookupSemanticHandle` (eval.cc:3293) ← coercion/primops (eval.cc:3025, primops.cc:2420), the single
+  provenance entry point that runs on string coercion even with `--no-eval-trace`. A side-table turns
+  each into a (missing-key) concurrent-map lookup → adds disabled-path cost that likely NEGATES the
+  parallel footprint win. Net ≈ wash. (Inferred from call-sites, not measured — see self-critique #6.)
+**(b):** flake mechanism REFUTED (`sourcePathToHash` cache HITS per `--debug`, yet 1.58M happens —
+NOT the NAR walk; source unidentified). Upstream drafts in `plans/upstream-nix-core-findings.md`: GC
+READY (magnitude caveated — the "54%" was a hybrid-CPU/E-core PMU artifact; GC is parallel, ~20% wall);
+flake NOT READY (needs the stat-source profile to pin the 1.58M).
+
+**ADVERSARIAL PASS over the cold arc:**
+1. **Meta-pattern: SIX consecutive refutations.** "6.7s recording"→0.2s; "54% GC, leave it"→hybrid
+   artifact + parallel GC; routing-hypothesis→no-op fast-path; Bindings side-table→disabled-path read,
+   wash; import-throwing→already maybeParseStorePath, nix-core; flake NAR-walk→cache hits. **The cold
+   path has NO clean, high-value eval-trace lever.** The +3s always-on tax is genuinely DIFFUSE serial
+   instrumentation (no single function dominates the non-GC serial time) + ~1s parallel inherent GC.
+2. **Was it worth it?** No landed cold win — but real VALUE: the cold path is now RULED OUT with
+   evidence (vs the prior "6.7s recording" framing that would have optimized a 0.2s non-cost), and the
+   GC/flake framing is corrected. Knowing a path is a dead-end is a result. The eval-trace WINS stand:
+   #2 git-identity cache (2.7× warm, f615911dc + GC 3a4c5a46d) and Spike-1 sync-verify (7f44193fb).
+3. **Process failure I own:** I let the sub-agents PROTOTYPE on hypotheses (agent-1 fast-path, agent-3
+   NAR-walk) before profile-confirming the mechanism — the same "scope before profiling" error, just
+   delegated. Verification caught it, but at the cost of build cycles. The discipline holds:
+   profile-confirm the mechanism BEFORE prototyping.
+4. **Honest residual:** the only quantified eval-trace-specific cold allocation is the +16B Bindings
+   (~0.3s parallel GC, side-table = wash); the deep lever is the 607× dep flattening (RFC-scale
+   compositional DAG, payoff bounded by the GC floor). Neither is high-value.
+5. **RECOMMENDATION: STOP chasing cold.** Declare it investigated + dead-end. Hot is solved (#2).
+   Nix-core findings flagged (GC ready-with-caveat; flake needs one more profile). Spend effort
+   elsewhere or wrap up.
+6. **Self-critique of THIS pass:** "no clean lever" is well-supported but NOT exhaustively proven — I
+   INFERRED the Bindings publication-read is hot-on-disabled from call-sites (didn't measure read
+   frequency under `--no-eval-trace`), and agent-1's diffuse +0.67s "other-eval" residual was never
+   bisected. A determined bisection + a measured Bindings-read-frequency could still surface a small
+   lever. But expected value is low (a ~3s, half-parallel-GC cold path on a research branch), so
+   stopping beats the opportunity cost. If cold ever matters: bisect the +0.67s with profile-confirmed
+   attribution first; do not prototype on a hypothesis.
+
+## (b) FLAKE FIX — PROTOTYPED + MEASURED (2026-06-02): 9.95× fewer stats, **~9× WALL**. + ADVERSARIAL PASS re-opening cold & hot.
+
+### (b) result — the redundant-`getRepoInfo` fix WORKS, and the win is WALL, not just stats
+`git.cc` `getRepoInfo` workdir token-cache (env `NIX_GIT_WORKDIR_CACHE=1`, default-off, `result-flakefix`),
+keyed on `HEAD oid + .git/index mtime+size` (= eval-trace #2's `gitCleanToken` pattern). Warm
+`git+file://~/nixpkgs?rev=HEAD#lib.version`:
+
+| | newfstatat | ENOENT probes | WALL (warm) |
+|---|---:|---:|---:|
+| gate OFF (baseline) | 1,585,265 | 358,204 | 5.8–6.8s (~6.5s) |
+| gate ON (cached) | 159,327 | 35,977 | **0.71s** |
+| ratio | **9.95×** | 9.96× | **~9×** |
+
+Output byte-identical. The wall win (6.5→0.71s) **exceeds** the stat ratio because each `git status` scan is
+~0.6s of real work (stat + 716K getdents + 359K openat + libgit2 diff), not just stats — so ~9 redundant
+scans ≈ 5.8s of a 6.5s warm flake-eval wall. **A trivial `lib.version` flake eval of nixpkgs spends ~90% of
+its wall re-scanning the worktree ~10×.** nix-CORE (libfetchers); `--no-eval-trace` identical.
+
+**Soundness.** Within ONE eval (one-shot `nix eval`) the ~10 calls share a token (worktree provably stable
+mid-eval) → collapse to 1 → trivially sound; this is the dominant case and the entire measured win. The
+process-local static cache resets per process, so a one-shot CLI eval never reuses a token across a worktree
+change. CROSS-eval reuse (repl / `nix develop` / daemon) is governed by the token: HEAD-change + staged/removed
+(.git/index mtime) correctly invalidate — exactly the git.cc:790-793 concern — leaving only
+unstaged-content-edit-without-index-change as the residual (identical trade-off to eval-trace #2). The
+fully-sound production form is a WITHIN-EVAL memoization (clear at the eval boundary; the redundancy only
+exists within one eval, so no token + no cross-eval residual at all). Prototype committed default-off as the
+measurement artifact; productionization (within-eval memo) is a nix-core change.
+
+### ADVERSARIAL PASS (2026-06-02) — the user is right: cold is NOT a dead-end, hot is NOT solved. I shipped both conclusions on inference, not profiling.
+
+The discipline I keep re-owning ("profile-confirm the mechanism before scoping a lever") applies
+**symmetrically to NEGATIVE conclusions**. "Dead-end" and "solved" are attribution claims and deserve the same
+profile-confirmation as a lever. I shipped both on inference + low-EV reasoning. Both re-open.
+
+**COLD is under-investigated, not dead.** The "SIX refutations" refuted six specific FIXES, not the existence
+of a lever. The always-on tax is real and LARGE: merge-base 4.5s → `--no-eval-trace` 7.5s = **+3s / +67% cold
+regression, paid by every user even cache-OFF.** A 67% regression is not a dead-end; it's an unattributed cost
+I stopped bisecting. Three unprofiled pieces:
+1. **The +0.67s "other-eval" residual — NEVER BISECTED** (my own self-critique #6, line ~1122). The largest
+   unexplained serial component of the tax. Declaring dead-end with the biggest piece unprofiled IS the
+   meta-pattern — 7th instance.
+2. **The +16B Bindings side-table — INFERRED a wash, never measured.** "`publication()` read on the disabled
+   path negates the win" ignores that reading a null ptr is ~free; the real cost is CACHE FOOTPRINT on the
+   multi-million-`Bindings` nixpkgs working set (unmeasured), and "parallel-GC hides it" is the SAME
+   hybrid-CPU reasoning that already burned me once.
+3. **Source-accessor layers (+0.29s, a NAMED subsystem) — dismissed as "diffuse."** MountedSource/CachingSource
+   wrapping + FD-cache rb-tree + path-splitting is a specific stack eval-trace interposes, not diffuse.
+
+Verdict: cold EV is lower than hot (a half-parallel-GC path) but "low EV" ≠ "dead-end" — I conflated them.
+Re-open with the **+0.67s bisection FIRST** (profile-confirmed attribution), then measure the Bindings footprint.
+
+**HOT is not solved — #2 fixed the git-scan; the verify-rehash is wide open.** Post-#2 warm = 0.35s; the verify
+dep-walk is ~85% (≈0.30s; #2 removed only the 0.60s git scan, not the 0.30s verify). The verify cost is NOT
+stats (the stat-source profile proved those were GIT, now cached) — it is **blake3 re-hashing**: per
+`src/libexpr/eval-trace/CLAUDE.md`, warm-verify FileBytes "re-reads + re-hashes UNCONDITIONALLY." The cache
+that would skip it (H1) fires ONLY for Registered store-path sources (`isInStore` gate) → **inert on
+`-f /git-repo` posix paths** = the user's "should work for all inputs," undone:
+- **HOT-1 (the headline): extend the content-hash cache to posix `-f` paths**, freshness token =
+  mtime+size+inode (standard Nix; this fork's #2 git cache already uses the identical HEAD+index-mtime token
+  pattern). Removes the blake3 re-hash on the dev/`-f` warm path. Literally "make the cache work for all inputs."
+- **HOT-2: serial blake3 on verify.** taskset proved 1-CPU == 32-CPU wall → the TBB-parallel blake3 coord
+  (~13% wall) is pure overhead at per-file sizes. Spike-1 landed sync-verify (removed io_context) but
+  blake3-in-verify may still pay TBB coord. Cheap, untested in isolation.
+
+**Meta-lesson (owned, again).** A dead-end is a claim about attribution; profile-confirm it like a lever.
+Corrective: ground HOT-1 (re-measure the post-#2 verify-rehash share) BEFORE prototyping; bisect cold's +0.67s
+BEFORE concluding. NEXT: ground HOT-1 (the user's stated goal + the 85%-of-hot lever) and re-open the cold
++0.67s bisection.
+
+### COLD BISECTION DONE (2026-06-02) — the +0.67s residual is NOT diffuse: ~40% source-accessor layers + ~23% Bindings footprint. COLD HAS A REAL LEVER.
+
+Reproduced the always-on tax on a NEW workload (`firefox.drvPath`, not closures.gnome) with both binaries
+(`result-mergebase` 616df97 = pre-eval-trace, `result` = HEAD #2): median merge-base **1.015s** → HEAD
+`--no-eval-trace` **1.726s** = **+0.711s / +70% tax, paid cache-OFF**. Proportional + real, not a
+closures.gnome artifact (the merge-base evaluates current nixpkgs fine; firefox-147 drv byte-matches HEAD).
+
+**perf stat A/B** (cpu_core = P-core eval thread, 98.76% of work; cpu_atom/GC = 1.3%, barely grew):
+
+| cpu_core | merge-base | HEAD-disabled | Δ |
+|---|---:|---:|---:|
+| instructions | 8.74B | 12.19B | **+3.45B (1.39×)** |
+| cache-references | 47.1M | 113.9M | **+66.8M (2.42×)** |
+| L1-dcache-misses | 57.3M | 94.0M | 1.64× |
+| LLC-load-misses | 0.69M | 0.81M | 1.17× |
+
+⇒ the tax is on the EVAL THREAD, NOT GC — **refutes the "diffuse half-parallel-GC dead-end."** It is +3.45B
+real instructions (~0.49s) + a footprint component (2.4× cache-refs, 1.64× L1 misses; LLC barely moves → the
+extra footprint is L1→L2, still cache-resident).
+
+**perf-report bucket attribution** (% cpu_core samples; HEAD pie is 1.74× bigger, so the abs Δ ≈ %·wall):
+
+| bucket | mb % | HEAD % | ~abs Δ |
+|---|---:|---:|---:|
+| **source-accessor layers** (MountedSource / PosixDirectory FD-cache / FdSource / CanonPath) | 3.73% | **19.13%** | **~+0.30s (~40%)** |
+| **Bindings +16B footprint** (ExprAttrs::eval / BindingsBuilder / __adjust_heap / intersectAttrs) | 12.64% | 17.31% | ~+0.18s (~23%) |
+| GC (proportional to the added allocation) | 3.96% | 10.25% | ~+0.14s |
+| EvalEnvironment routing (`copyPathToStoreImpl(EvalEnvironmentState&)` — eval-trace-ONLY, **absent in mb**) | 0% | 3.69% | ~+0.07s |
+| coercion/publication (eval-trace-ONLY) | 0% | 1.79% | ~+0.03s |
+
+Σ Δ ≈ 0.69s ≈ the +0.711s tax (buckets account for the regression).
+
+**RETRACTIONS (the user was right both times):**
+1. **"+0.67s residual is diffuse" — FALSE.** Dominated by the source-accessor layers (5.1× explosion,
+   3.73→19.13%) = ~40% of the tax in ONE named subsystem. eval-trace routes every FS observation through
+   `EvalEnvironment`, which wraps the accessor in Mounted/Caching layers + an FD-cache rb-tree + CanonPath
+   ops — active even `--no-eval-trace` (same files read, 5× the accessor cost = pure wrapping/routing overhead).
+2. **"+16B Bindings side-table = a wash" — FALSE.** Measured +4.67pp / ~+0.18s footprint (the 2.4× cache-refs
+   + 1.64× L1 misses corroborate). Measured, not inferred.
+
+**COLD LEVERS (real, ranked):**
+- **COLD-1: source-accessor layers (~+0.30s).** Make the EvalEnvironment FS routing zero-overhead when no
+  session is active — skip the Mounted/Caching wrap + FD-cache rb-tree on the disabled path, or hoist accessor
+  resolution out of the per-access hot path. Biggest single recoverable bucket; benefits ALL users cache-OFF.
+- **COLD-2: Bindings +16B side-table (~+0.18s).** The footprint lever, now measured-real (not a wash).
+
+Cold is NOT a dead-end — it's a **70% always-on regression** with two named, recoverable subsystems. LESSON
+(owned): a dead-end is an attribution claim; I shipped it without the perf-stat A/B that would have shown
++3.45B instr / 2.4× cache-refs on the eval thread. The discipline applies to negative conclusions too.
+
+### HOT-1 IMPLEMENTED + VALIDATED (2026-06-02) — posix content cache: warm-verify FileBytes rehash on `-f` ELIMINATED (contentUs 22765→0), cross-process, sound. [⛔ "sound"/"default-on" RETRACTED 2026-06-04 — see banner ↓]
+
+> **⛔ RETRACTED 2026-06-04 — HOT-1 is now DEFAULT-OFF; the "sound" / "VALIDATED
+> default-on" / "SOUND (same-size edit invalidate)" claims in THIS section and in the
+> "#4 (default-on) DONE + VALIDATED" section below are WRONG.** HOT-1's freshness token
+> (mtime+ctime+size+inode) has a real stat-race: on a COARSE-mtime filesystem (ZFS-on-Linux
+> rides the kernel coarse realtime clock, ~10ms tick at HZ=100; tmpfs is fine), two same-size
+> writes within a tick produce a BYTE-IDENTICAL token, so the cached hash stale-serves.
+> Measured: ZFS 1888/2000 same-size-rewrite collisions, tmpfs 0/2000. The
+> `EvalTraceProperty_FilterList/SortList` tests caught exactly this and were wrongly dismissed
+> as "expectation bugs." **Item 5 below ("Soundness caveats … (a) coarse-ctime filesystems …
+> → stale … Default-on needs a bench soundness pass") was CORRECT and was overridden by the
+> #4 default-on flip** — the "#4 VALIDATED SOUND (same-size edit invalidate)" pass must have
+> run on a fine-grained FS (or dismissed the failing property tests). Cross-process eval is
+> sound (an edit gets a strictly-later mtime than the recording process); only intra-process
+> re-eval within a tick collides (`nix repl :reload`, watch). It is a cache CLASS — the #2
+> git-clean marker shares the assumption and is coupled (HOT-1 voided the FileBytes content
+> backstop the marker relies on). FIX: default-off (commit `1c667c664`). Re-enable path =
+> git-style racy-clean guard (window ≥ the tick, ≥1s safe — the granularity IS boundable by
+> HZ). Full analysis: `doc/eval-trace/measurements/property-test-overinvalidation-2026-06-04.md`.
+
+Extends H1 to NON-store posix paths (the `-f` / dirty-worktree case H1's `isInStore` gate leaves on the
+read path). Sibling gate `hot1PosixKey` in `verifier.cc`, REUSING H1's `FileContentHashes` table / map /
+flush (store-path and `"posix:"`-prefixed keys are disjoint). Key = `"posix:" + len(abs) + ":" + abs + ":"
++ mtime + ":" + size + ":" + ctime + ":" + inode` — a freshness token, because posix paths are MUTABLE
+(unlike content-addressed store paths). Env-gated `NIX_EVAL_TRACE_POSIX_CONTENT_CACHE=1`, default OFF.
+
+A/B (warm `asciidoc.nativeBuildInputs`):
+
+| | eligible | hits | depHash.contentUs |
+|---|---:|---:|---:|
+| gate OFF (H1 only) | 0 | 0 | 22765 (re-hashes every FileBytes on every warm eval) |
+| gate ON, hot1 (FRESH process) | 220 | **220** | **0** (rehash ELIMINATED) |
+
+Cross-process: cold populates 219 (H1b-style, from the record path), and the FIRST warm verify in a fresh
+process hits 220/220. Byte-identical to `--no-eval-trace`. **SOUND**: a SAME-SIZE in-place edit (AAAA→BBBB)
+correctly invalidates (afterEdit=BBBB) — the ctime/mtime token catches a content change a size-only token
+would miss.
+
+**Two bugs found + fixed during validation** (the "verify, don't trust" discipline earned its keep):
+1. Copied H1's `isAbsoluteDepSource` exclusion — but `-f /abs` FileBytes ARE Absolute-source, so eligible
+   stayed 0. Removed it; the `isInStore` check still excludes absolute STORE paths (H1's input-addressed
+   hazard), so only non-store posix paths are cached.
+2. The token used a NUL separator (copied from `gitCleanToken`, where it feeds a HASH). A NUL TRUNCATES a
+   SQLite TEXT key on `column_text` load, so the cold-stored full token loaded back truncated and every
+   cross-process lookup missed (cold pop=219 but hot hits=1). Fixed: length-prefixed path, NO NUL
+   (SQLite-safe + collision-free for any path bytes; a collision would be a stale serve).
+
+This IS the user's "works for all inputs": the content-hash cache now fires on `-f` posix paths, not only
+store-resident sources. Covers FileBytes/RawBytes; DirectoryEntries (`directoryUs`) is a follow-up (a dir
+freshness token + dir-listing cache). Default-ON flip is gated on a full functional-test + bench soundness
+pass (the freshness-token policy is a soundness decision — though the same-size-edit test + ctime semantics
+make it robust for normal operation).
+
+### productionize-(b) DONE (2026-06-02) — path-only `getRepoInfo` split: 9.97× stat / ~9× wall, DEFAULT-ON, provably sound (no caching at all).
+
+The token-cache (b24c2f105) proved the win but carried a cross-eval soundness caveat (unstaged edits in a
+long-running process). The SOUND production fix is simpler AND cache-free: `getSourcePath` does
+`getRepoInfo(input).getPath()`, and `getPath()` (git.cc:651) reads ONLY `repoInfo.location` — NEVER
+`workdirInfo` (the `isDirty` check lives in a separate `warnDirty()` that `getSourcePath` never calls). So
+`getSourcePath` does not need the O(worktree) git_status scan **at all**. Added a `needWorkdirInfo` param to
+`getRepoInfo` (default true); `getSourcePath` passes false → skips the scan. The stat-source profile showed
+`getSourcePath` drives ~all the ~10 redundant scans, so this alone gets the full win:
+
+| warm `lib.version` flake eval | newfstatat | wall |
+|---|---:|---:|
+| baseline (token-cache off) | 1,585,265 | ~6.5s |
+| **path-only split, DEFAULT (no env)** | **158,911** | **0.716s** |
+| + NIX_GIT_WORKDIR_CACHE=1 | 158,915 | — |
+
+9.97× stat / ~9× wall, byte-identical. The token-cache adds nothing now (the residual ~159K is the ONE
+genuine-workdir fetch scan, which the path-only split doesn't touch and the token-cache can't reduce further
+in one process). **PROVABLY SOUND** — no token, no staleness, no cross-eval residual: `getPath()` is
+independent of `workdirInfo`. The token-cache stays env-gated default-off as an opt-in for genuine-workdir
+callers (inert here). This is the cleanest upstream fix — better than memoization (no cache at all). The
+`getPath()`/`workdirInfo` independence makes it a near-trivial, obviously-correct upstream PR.
+
+### HOT-2 SUBSUMED (2026-06-02) — no wasted TBB coordination remains on the warm path; serial-blake3 would be a no-op or a regression.
+
+HOT-2 targeted the "13.2% TBB coord wasted at these sizes" from the OLD hot profile. That TBB was the verify
+POOL (`BlockingThreadPool` / `coroBlock`), NOT blake3's internals. Two committed changes already removed it:
+- **Spike-1 (7f44193fb):** `verifySync → verifyAttrSync` is the DEFAULT and does NOT use `coroBlock`/`blockingPool`
+  (those are record-side only — context.cc:353/373/384). The async verify pool is off the warm path.
+- **HOT-1 (f4527def4):** the warm-`-f` FileBytes blake3 rehash is eliminated (contentUs→0).
+
+And blake3's OWN TBB is threshold-gated to ≥128KB (hash.cc:320, `blake3TbbThreshold=128000`) — i.e., only where
+parallel hashing IS faster; most nixpkgs files are smaller and already hash serially.
+
+**VERIFIED:** a perf profile of 20 warm `-f` evals (HOT-1 on) shows NO tbb / NO blake3 / NO BlockingThreadPool /
+NO coroBlock on the warm path — the only hash symbol is `sha256_block_data_order` at 0.14% (nix-core store
+hashing, negligible). So there is no wasted coordination left to remove; forcing blake3 fully serial would
+REGRESS large-file (≥128KB) hashing on the cold/record path where the threshold currently picks the faster mode.
+**HOT-2 is done-by-subsumption — correctly NOT implemented.**
+
+---
+
+## ALL FOUR LEVERS RESOLVED (2026-06-02) — summary
+
+| Lever | Outcome | Commit |
+|---|---|---|
+| **HOT-1** posix content cache | warm-verify FileBytes rehash on `-f` ELIMINATED (contentUs 22765→0, 220/220 cross-process hits). ⛔ "sound same-size-edit" RETRACTED 2026-06-04 — coarse-mtime stat-race (see banner above); now DEFAULT-OFF (`1c667c664`) | f4527def4 |
+| **Productionize (b)** | path-only `getRepoInfo` split: 1.585M→158,911 newfstatat (9.97×), ~6.5s→0.716s wall, DEFAULT-ON, provably sound (cache-free) | 8fa80ce14 |
+| **Cold bisect** | +0.711s/+70% always-on tax = source-accessor layers ~40% (COLD-1) + Bindings +16B footprint ~23% (COLD-2), on the eval thread (NOT GC). Real levers identified | bc91b4d1a |
+| **HOT-2** serial blake3 | SUBSUMED by Spike-1 (verify pool) + HOT-1 (rehash) + the 128KB blake3-TBB threshold; would regress if forced | (none) |
+
+Adversarial pass (both user pushbacks VINDICATED): cold is a 70% always-on regression with named recoverable
+subsystems (NOT a dead-end); hot's verify-rehash was wide open (NOT solved by #2 alone). Remaining implementable
+work, ranked: COLD-1 (source-accessor zero-overhead-when-disabled, ~+0.30s, all-users), HOT-1 default-on flip
+[⛔ was flipped on (#4) then REVERTED 2026-06-04 — coarse-mtime stat-race; needs a racy-clean guard first, see
+the RETRACTED banner], HOT-1 DirectoryEntries extension, COLD-2 (Bindings side-table, ~+0.18s).
+
+## QUANTIFICATION ON THE RELEASE BINARY (2026-06-02, ab175bc / result rebuilt) + ADVERSARIAL PASS + PLAN
+
+### Quantified wins (release `result/bin/nix`)
+
+**productionize-(b)** — flake `lib.version`, DEFAULT (no env): **158,954 newfstatat (9.97×), 0.728s wall median (~9×)**. Solid, headline, default-on. ✓
+
+**HOT-1** — measured on TWO heavy `-f` workloads (closures.gnome is gone from release.nix's evaluated
+top-level at HEAD — `hasAttr "closures"` is false; used `firefox.drvPath` and a gnome NixOS-container
+system closure, the closures.gnome equivalent at HEAD):
+
+| workload (warm hot) | contentUs off→on | posix hits | hot wall off→on |
+|---|---|---|---|
+| firefox.drvPath | 55013→92 | 1050/1050 | 0.292→0.272s (**~7%**) |
+| gnome system closure | 79243→150 | 3877/3877 | 0.296→0.262s (**~11.5%**) |
+
+The FileBytes rehash is ELIMINATED (contentUs→~0, all eligible deps hit cross-process). Syscall trade
+(gnome, strace): `close` 8033→2516 (~5500 file reads skipped); newfstatat UNCHANGED (11631→11630 — the
+read path already stat'd, so HOT-1 adds NO stat overhead). Symlink soundness RE-TESTED: a symlink-target
+content change is correctly detected (the FileBytes dep resolves to the target, so the token tracks it).
+
+### ADVERSARIAL PASS over the quantification
+
+1. **HOT-1's WALL win is modest (~7–11%), NOT the large number "verify is 85% of hot" implied.** Honest
+   decomposition (gnome hot 0.296s): verifyTrace=219ms, of which FileBytes contentUs=79ms ≈ **36% of the
+   verify, ~27% of the wall**. HOT-1 removes the FileBytes rehash but the wall drops only ~34ms because (a)
+   path-resolution/stat still runs (newfstatat unchanged), (b) page-cached small-file read+hash is cheap,
+   (c) the OTHER ~64% of the verify — `directoryUs`, `structuredNixUs`/`structuredOuterUs`, `loadTrace` — is
+   untouched. So HOT-1 is a **~10% hot-wall win**, useful but not transformative. I'd implied bigger.
+2. **The `contentUs` counter OVERSTATES the win — lead with WALL.** "contentUs 79ms→0" reads like a 79ms
+   win; the wall moved 34ms. The counter times code (resolve/stat) that partially still runs. Report the wall.
+3. **HOT-1 and productionize-(b) are DIFFERENT workloads — don't conflate.** (b) = flake fetcher (git+file),
+   9×. HOT-1 = `-f` hot verify, ~10%. A combined "9× + HOT-1" number would be wrong.
+4. **The bigger lever is COLD-1, not HOT-1.** The cold bisection's source-accessor bucket is ~+0.30s and paid
+   by ALL users on EVERY eval (cache on or off) — an order of magnitude more impact than HOT-1's ~34ms hot
+   win on a cache hit. The quantification reinforces: COLD-1 is where the leverage is.
+5. **Soundness caveats that keep HOT-1 env-gated:** (a) coarse-ctime filesystems (network/old FS w/o ns
+   ctime) → a same-second same-size edit could collide → stale; (b) extends the record-side "file-change-
+   during-eval is UB" contract cross-process (a policy choice). Symlink hole REFUTED by test. Default-on
+   needs a bench soundness pass.
+6. **Workload caveat:** gnome-container ≠ closures.gnome (isContainer), HEAD ≠ the bench's pinned nixpkgs, so
+   these are NOT comparable to the historical 0.35s hot. The ~7–11% RELATIVE win (same binary, off vs on) is
+   the honest, cross-binary-consistent number.
+
+### PLAN — remaining work, ranked by value/effort
+
+1. **COLD-1 (HIGHEST VALUE) — source-accessor zero-overhead-when-disabled (~+0.30s, ALL users).** Profile-
+   confirm WHY eval-trace's EvalEnvironment FS routing adds ~5× accessor cost even `--no-eval-trace`
+   (MountedSource/CachingSource wrap vs FD-cache rb-tree vs CanonPath ops — the perf-report buckets), then
+   make the routing a zero-cost pass-through when no session is active. Biggest impact; needs a careful
+   investigation + a targeted fix. **Recommended next.**
+2. **HOT-1 DirectoryEntries extension (moderate, cheap) — cache `directoryUs` too.** Same freshness-token
+   pattern keyed on the dir; ~doubles HOT-1's hot win by covering the second-biggest verify bucket.
+3. **Upstream productionize-(b)** — clean, obviously-correct nix-core PR (getPath/workdirInfo independence).
+   Outward-facing → user sign-off on the patch + text first.
+4. **HOT-1 default-on flip** — ⛔ was done (#4) then REVERTED 2026-06-04 (coarse-mtime stat-race; now
+   default-off, `1c667c664`). A re-flip REQUIRES a git-style racy-clean guard first (persist each posix
+   entry's write time; re-read files whose mtime is within the FS granularity / coarse-clock tick of it —
+   window ≥1s is safe) AND a soundness pass run ON A COARSE-MTIME FS (ZFS), not just tmpfs.
+5. **COLD-2 (Bindings +16B side-table, ~+0.18s)** — lower priority; more invasive (touches the Bindings
+   layout + every accessor); footprint win partially GC-proportional.
+
+Net: HOT-1 + productionize-(b) are landed + quantified (b is a real 9× nix-core win; HOT-1 a ~10% hot win,
+env-gated). The remaining leverage is COLD-1 (the all-users always-on tax), then HOT-1's DirectoryEntries
+extension. Hot is genuinely faster (HOT-1) and the flake path much faster (b); cold is the next frontier.
+
+### HOT-1 REFACTORED + #2 (DirectoryEntries) + #4 (default-on) — DONE + VALIDATED (2026-06-02, 47ecfdfd4) [⛔ #4 default-on REVERTED 2026-06-04 — see banner at section end]
+
+Adversarial pass over the IMPLEMENTATION (the user flagged it wasn't concise/principled — correctly) →
+cleaned up and landed #2/#4:
+- **DELETED the dead git.cc token-cache.** productionize-(b)'s path-only split measured it adding NOTHING
+  (158,911 vs 158,915), yet it was 24 env-gated lines + a cross-eval soundness caveat + a `static Sync<map>`
+  (process-global mutable state) + a 2nd env var + a 3rd hand-rolled token. Only the cache-free path-only
+  split remains (−33 lines + 2 orphaned includes removed).
+- **HOT-1 (verifier.cc):** one `posixFreshnessToken(abs)` helper (was a 3rd hand-rolled, NUL-bug-prone token),
+  reused for files AND dirs; `posixContentCacheEnabled()` — **DEFAULT-ON** [⛔ reverted to default-off
+  2026-06-04, opt-in `NIX_EVAL_TRACE_POSIX_CONTENT_CACHE=1`] + escape hatch
+  `NIX_EVAL_TRACE_NO_POSIX_CONTENT_CACHE=1` (#4, was a default-off getEnv read in TWO places);
+  `posixHashCacheKey` extended to **DirectoryEntries** (#2; "pfb:"/"pdir:" class prefixes keep the two hashFns'
+  keys disjoint); unified the 2 duplicate store blocks; fixed the populate hook's `h1Key`-misnaming.
+- Counters kept UNIFIED (`nrFileContentCache*` span all tiers — rename = ~30-site churn + the H1 test, no gain);
+  DDL documents the shared key space (store-path | pfb:token | pdir:token).
+
+Net **−24 lines while ADDING #2+#4**. VALIDATED default-on: warm asciidoc `contentUs 29455→0 AND
+directoryUs 11204→0` (987/987 hits); escape hatch restores both; byte-identical to `--no-eval-trace`; SOUND
+(file same-size edit, dir entry add/remove all invalidate; file-content-inside-dir still hits — unit
+`EvalTraceProperty_ReadDir`); **nix-expr-tests 1859 pass/4 skip**; **all 16 eval-trace FUNCTIONAL tests pass**
+(cross-process pipeline incl. soundness/impure-soundness/recovery/deps). #2 + #4 COMPLETE. NEXT: #1 COLD-1.
+
+> **⛔ #4 (default-on) REVERTED 2026-06-04 (`1c667c664`).** The "SOUND (file same-size edit …
+> invalidate)" claim above is WRONG on a coarse-mtime filesystem: that soundness pass evidently
+> ran on a fine-grained FS (tmpfs: 0/2000 collisions) — on ZFS (1888/2000) a same-size edit
+> within the ~10ms coarse-clock tick produces an identical freshness token and stale-serves.
+> `EvalTraceProperty_FilterList/SortList` were failing on this exact case and I wrongly dismissed
+> them. HOT-1 is back to DEFAULT-OFF. See the RETRACTED banner under "HOT-1 IMPLEMENTED" above and
+> `doc/eval-trace/measurements/property-test-overinvalidation-2026-06-04.md`.
+
+### #1 COLD-1 REFUTED + COLD BISECTION ATTRIBUTION CORRECTED (2026-06-02) — the buckets were OVER-COUNTED; the tax is DIFFUSE, no clean lever.
+
+Started #1 (COLD-1 = "source-accessor zero-overhead, ~+0.30s") by profiling the source-accessor on
+`--no-eval-trace` firefox — and found my OWN COLD BISECTION's bucket attribution was WRONG:
+- The bisection regex (`...|CanonPath|SourceAccessor|readFile|...`) SIGNATURE-MATCHES: `CanonPath` matches
+  EVERY function taking a `CanonPath` arg (readFile, lstat, resolve, …), not just CanonPath operations.
+  Re-running that exact regex on a fresh HEAD profile sums to **4.82%** (not 19.13%), and the matches are all
+  genuinely small REAL accessor ops (`resolve` 0.42%, `insertIntoDirFdCache` 0.49%, FD-cache rb-trees ~1.9%).
+  The earlier "19.13%" was inflated — signature over-match + a likely hybrid-PMU/inclusive-time artifact (the
+  SAME hybrid-CPU trap that already burned the "54% GC").
+- RIGOROUS re-measurement (`-e cpu_core/cycles/`, leaf-EXACT accessor matching, HEAD-disabled vs merge-base,
+  converted to ABSOLUTE via %·wall on the 1.0s→1.7s evals):
+
+  | bucket | merge-base | HEAD-disabled | ~abs Δ |
+  |---|---:|---:|---:|
+  | source-accessor (real) | 1.1% | 2.9% | **+0.04s** (NOT +0.30s) |
+  | exception-unwinding | 0.4% | 2.1% | +0.03s (5× relative — the only concentrated eval-trace signal) |
+  | operator new (alloc) | 2.9% | 3.4% | +0.03s |
+  | **Bindings::get** | 2.4% | 1.3% | **~0** (NOT the +0.18s COLD-2 footprint lever) |
+  | __tls_get_addr | 1.6% | 1.5% | ~0 |
+
+  These named buckets sum to ~0.10s of the +0.71s tax. The REST (~0.6s) is a **~1.7× PROPORTIONAL increase
+  across ALL eval functions** (cpu_core top-10 are core eval — ExprVar/callFunction/Bindings::get/yylex — at
+  similar % in BOTH binaries). The +3.45B instructions / 2.4× cache-refs are SPREAD, not concentrated.
+
+**Honest synthesis (cold arc, fully corrected).** The +70% always-on tax is REAL (perf stat, reproducible —
+the user was right it isn't "dead"), but it is DIFFUSE pervasive integration overhead (routing + the +16B
+footprint's diffuse cache cost + per-op checks), NOT a targeted subsystem. The COLD BISECTION buckets
+(source-accessor 40%, Bindings 23%) were a FLAWED measurement; **COLD-1 and COLD-2 are NOT the +0.30s/+0.18s
+levers I claimed (real: +0.04s / ~0). There is NO clean high-value cold lever** — the original "diffuse, no
+clean lever" was correct, and the bucket attribution under pushback was the error.
+
+**META-LESSON (owned):** re-opening under valid pushback does NOT excuse a sloppy measurement. A
+signature-matching regex over-counts (every `f(CanonPath)` is not an accessor op), and the hybrid-PMU trap
+recurs if you don't pin cpu_core. Attribute on cpu_core, leaf-exact, converted to absolute — every time.
+
+**Cold options (all low-EV):** (a) the exception-unwinding (+0.03s, 5× growth) is the only concentrated
+eval-trace signal — if a throw-as-control-flow eval-trace adds on the disabled path, removing it is ~2% +
+a code-smell fix, but small; (b) a pervasive trim of the always-on routing/footprint (many ~1% changes);
+(c) accept the tax (research branch; cache-ON is the point, where HOT-1/#2/(b) offset it). RECOMMENDATION:
+do NOT chase a targeted cold lever — there isn't one. Addressing cold is an architectural "compile/route the
+integration out when `--no-eval-trace`" project, not a lever.

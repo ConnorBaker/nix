@@ -1,5 +1,78 @@
 # Eval-trace cache performance research — consolidated index
 
+> **⛔ STATUS BANNER (2026-06-02) — READ BEFORE THE REST OF THIS FILE.**
+>
+> **0. MEASURED 2026-06-02 — the entire arc below was benched on closures.gnome
+> (7 traces) ONLY. First off-closures bench (python3Packages, ~66K traces): §3b
+> WARM-THRASHES at scale — never converges, 6–21× slower than no-§3b, sound,
+> mechanism unrooted; SCALE-dependent (stable ≤~8K traces). Data:
+> `doc/eval-trace/measurements/3b-at-scale-2026-06-02.md`. So the closures-derived
+> verdict (items 1–2 below) does NOT generalize; treat it as closures-only.**
+>
+> **0b. MEASURED 2026-06-03 (adversarially re-reviewed) — cold tax is eval-trace's
+> per-attr work at scale, recording-dominated; GC is NOT it; hot is NOT regressed
+> (canonical bench 0.34–0.9s).** Cold python3Packages: no-trace 19.1s → eval-trace 66.9s (+47s).
+> Clean split via the CORRECT gate (STUB_RECORD: keep materialize, stub only the
+> record pipeline): **capture+materialize +13.2s / record-pipeline +34.2s** (of
+> ~47s); memory is also record-dominated (eval-trace cold 4.4GB vs no-trace 1.4GB,
+> +3GB). **GC is not the tax** (7→2 GC cycles leaves it unchanged; "libgc +30.9s"
+> was marker spin-wait — RETRACTED). **LANDED: `eval-trace-defer-flush` setting
+> (default true)** — batches per-record flushes (Layer-2a, crash-safe): −8s cold
+> (58.6 vs 66.6s), byte-identical (python3Packages + closures.gnome + asciidoc
+> cold/warm), unit tests pass; +376MB at 32K-record scale (disable for huge cold
+> evals). **Two earlier claims were withdrawn**: (a) "capture=+1.0s/record=+46.9s"
+> was a CONFOUND (NO_RECORD also skipped `materializeResult`) — corrected to the
+> +13.2/+34.2 split above; (b) "record cpu ~5–6s" is inconsistent with GC≈0.3s. **Hot is
+> NOT regressed**: canonical `eval-trace-bench` `closures.gnome` HOT = 0.9s (bench) /
+> 0.34s (raw), matching the 0.85s baseline; code unchanged (f1398d126). My earlier
+> "hot 3.7s" was python3Packages (32K traces / 18.7M deps) — a ~4600×-larger workload
+> I did NOT run through the bench. Hot is O(total deps verified/run); 3.7s is the
+> large-workload point, not a regression. Full corrected decomposition + methodology:
+> `doc/eval-trace/measurements/cold-tax-decomposition-2026-06-03.md`.
+>
+> Two things below this banner are STALE and have caused a duplicated effort:
+> 1. **The producer-partition / CA-producer / compositional-trace-DAG /
+>    "content-addressed trace identity" / re-keying direction is UNPROMISING —
+>    but NOT cleanly "structurally dead."** Chain:
+>    `plans/derivation-producer-partition-rfc.md` §16–§18 +
+>    `plans/compositional-trace-dag-implementation-sketch.md` §10/§10.7. The
+>    §3b "3.6× cold / 14× hot" numbers quoted throughout this file are
+>    **pre-Fix-1a** (commit `82713fd91`); Fix 1a (`868038369`) made conservative
+>    §3b hot-neutral and showed the 14× was 93% a cache-defeat bug. **Not pursued
+>    because the measured *proxy* leans negative — "don't invest," not "proven to
+>    lose":** post-Fix-1a, conservative §3b is hot-neutral (1.09s ≈ baseline — NO
+>    win) and the as-built **mis-keyed** aggressive edge is hot-negative (1.81s vs
+>    1.09s, loading ~12K separate producer-trace blobs that inline conservative
+>    avoids; capped per producer, so re-keying wouldn't reduce them — projected,
+>    not benched). **OSPI's own re-keyed shape was never benched.** **CAUTION:**
+>    §17b/§18's "97% singly-consumed
+>    → no sharing → structural catch-22" is **confounded** (it reads the mis-keyed
+>    gate's 306 fires as fan-out, contradicting §11's 200–2000 estimate; the
+>    correctly-keyed shape was never benched — §10.7). (§3b also adds a cold cost,
+>    but the "+6.7s recording" figure once cited here is STALE — the live perf doc
+>    re-measured store-write at 0.2s; cold is the always-on tax + dep-capture, not
+>    recording. Don't cite +6.7s.) **Do not pursue Option 3 / lever 2 / the
+>    "Architectural root cause" CA-edge prescription / re-keying below**, and do
+>    not chase a high-fan-out workload on the confounded reason. A 2026-06-02 pass
+>    re-derived this as "OSPI" and retracted it (§10).
+> 2. **The LIVE perf direction is `plans/eval-trace-perf-cold-and-hot.md`** (cold
+>    recording cost + hot verification), orthogonal to producer-partition. HOT
+>    levers landed (persisted content-hash cache H1; HOT-1 posix tier now
+>    **DEFAULT-OFF** 2026-06-04 — coarse-mtime stat-race soundness bug, see
+>    `doc/eval-trace/measurements/property-test-overinvalidation-2026-06-04.md`;
+>    H1 store-path tier unaffected/sound; productionize-(b), #2 git-clean marker,
+>    Spike-1 sync-verify). COLD is MEASURED at ~57% BLAKE3
+>    hashing of the 607×-flattened dep vectors / ~4% I/O — so "async recording"
+>    is low-leverage and off-thread hashing is thread-safety-blocked; H-cold-1
+>    landed (−10%). The doc's named next cold lever is **C3, reduce the
+>    flattened dep count via record-time dedup** (unexplored; the 607× root
+>    again, needs fragment-hash composition which the positional `dep.ordinal`
+>    blocks). Read its COLD section before acting; do not start blind.
+>
+> The ledger reconciliation, discipline, and "rejected/disqualified" sections
+> below remain valid. The lever table and Options are valid EXCEPT where they
+> point at the CA-edge/re-keying direction (struck by item 1).
+
 **Read this first.** The eval-trace cache performance work is spread across six
 documents written over a long research arc. They use **three different
 benchmark ledgers** and describe **two abandoned experiment lineages** plus one
@@ -17,14 +90,20 @@ shortest path to context.
 origin since the §3b implementation slice. Tree clean. Run `git log --oneline
 master..HEAD | head -25` for the chronological story.
 
-**The active work.** RFC §3b (content-addressed producer-trace boundary) is
-**implemented + benchmarked + DEFAULT-OFF** behind `NIX_ENABLE_CA_PRODUCER=1`.
-Bench measured a 3.6× cold / 14× hot regression on the Ledger-D anchor — a
-real net loss, soundness PASS. Shipping default-off was the right call. The
-infrastructure (~22 unit tests + production code in `MemoReplayStore`,
-`TraceBackend`, `TraceSession`, `prim_derivationStrict`) stays in tree as
-proven scaffolding. See "Option 3" below + the redesign-plan §"2026-05-31
-follow-up #4" for the full bench table + adversarial-fix history.
+**The active work (CORRECTED 2026-06-02).** RFC §3b
+(content-addressed producer-trace boundary) is **implemented, fully measured,
+and a CONCLUDED DEAD END** — see the status banner at the top of this file and
+`plans/derivation-producer-partition-rfc.md` §16–§18. The "3.6× cold / 14× hot"
+figure repeated throughout this file is **pre-Fix-1a**; Fix 1a (`868038369`)
+made conservative §3b hot-neutral and proved the 14× was 93% a cache-defeat bug,
+and the post-Fix-1a re-bench showed the *edge* direction is inherently
+hot-negative and structurally blocked. §3b stays in tree DEFAULT-OFF behind
+`NIX_ENABLE_CA_PRODUCER=1` as gated scaffolding; **do not invest in re-enabling
+or re-keying it.** The live work is `plans/eval-trace-perf-cold-and-hot.md` —
+HOT levers landed (persisted content-hash cache); COLD is measured at ~57%
+BLAKE3 hashing of the flattened deps (not I/O), H-cold-1 landed (−10%), and the
+named next lever is C3 (reduce the flattened dep count) — read that doc's COLD
+section before acting.
 
 **Where production code lives.** `src/libexpr/eval-trace/CLAUDE.md` has a
 "RFC §3b" section near the top describing the code surface
@@ -168,6 +247,19 @@ items, all closed against commits in this branch) and the OR-N "Open research"
 section in `src/libexpr/eval-trace/CLAUDE.md`. Those describe the current tree's
 code directly and are the right home for code-level soundness/precision gaps.
 
+### `plans/` docs (not in the table above — index added 2026-06-02)
+
+| Doc | Role | Status |
+|---|---|---|
+| **`plans/eval-trace-perf-cold-and-hot.md`** | **THE LIVE perf doc.** Cold recording + hot verify avenues, grounded in code + the §17 bench. | **CURRENT — start here for perf work** |
+| `plans/derivation-producer-partition-rfc.md` | The producer-partition arc, §9→§18. §16 (Fix 1a re-bench: conservative hot-neutral); §17 (as-built edge hot-negative via loadTrace); §17b/§18 ("no sharing / catch-22" — CONFOUNDED, see sketch §10.7). | CONCLUDED UNPROMISING (measured hot non-wins); NOT cleanly "structurally dead" |
+| `plans/content-addressed-trace-identity-rfc.md` | The §3b CA-producer proposal (§8 = pre-Fix-1a net-loss). | Superseded by the §16–§18 conclusion |
+| `plans/compositional-trace-dag-design.md` | The 607× → edge architectural prescription. | Diagnosis sound; "edge fixes it" refuted by §17b (leaf-dep ≠ producer-consumer sharing) |
+| `plans/compositional-trace-dag-implementation-sketch.md` | 2026-06-02 second-pass re-derivation ("OSPI") + 3 adversarial reviews + **§10 retraction**. | RETRACTED — the record of the duplicated effort |
+| `plans/architecture-trace-model-vs-CA.md` | The flatten-vs-CA-edge diagnosis. | Diagnosis valid; prescription dead (see above) |
+| `plans/async-producer-recording-plan.md` | Async/batched recording (Layer 1/2a landed, 2b deferred). | Layer mechanism is reusable for the live cold lever |
+| `plans/perf-levers-cold-and-hot.md`, `plans/lever1-observed-key-pruning.md`, `plans/lever2-derivation-boundary-caching.md`, `plans/keyset-*.md` | Lever-specific designs/harnesses (see lever table). | Mixed; lever 2 (derivation boundary) is dead per §16–§18 |
+
 ## Benchmark-ledger reconciliation
 
 The three ledgers are NOT directly comparable. Always state which one a number
@@ -193,7 +285,7 @@ findings-doc "Promising Directions". Each lever traces to repo text; the
 | # | Lever | Status / evidence | Source |
 |---|---|---|---|
 | **1** | **Observed-key / unobserved-change PRUNING proof**, made sound-by-construction and transparent to `libexpr` | The single biggest measured win in the whole log (cold 3.32→1.88 s, hot 0.88→0.38 s, v6→v11). Works by **slicing/removing coarse deps**, NOT adding finer ones. **Caveats:** (a) was command-JSON-only (disqualified layer); (b) gated on Nixpkgs path heuristics + env vars, not sound by construction; (c) coverage stops at the observed-key universe — `attrNames`/negative-membership/recursive-attrset are UNSOLVED. It is a tail-rescue (kills ~9 catastrophic outliers; median/p90 barely move), not a hot-path median mover. | redesign-plan §2026-05-29 CORRECTION finding 2; work-log v6→v11 |
-| **2** | **Semantic derivation-boundary caching** (Bazel/Skyframe strict dependency capture + facet mask) | **NOT VIABLE as scoped — feasibility spike hit a material architectural blocker (2026-05-30).** Outliers re-eval ~20 M thunks; the 6,419 derivations inside (99.66 % unchanged) have no reuse boundary, ~58 % of cost is cacheable derivation eval. Spike (branch `spike/lever2-derivation-feasibility`) measured 10,455 derivations evaluated vs 6 traces recorded, then hit the blocker: to verify-before-force a derivation it must be a `TracedExpr`, but `TracedExpr` identity is **attr-path-tree-shaped** (Root or Child-with-parent-and-name), and a `derivationStrict` thunk created deep in `make-derivation.nix` has no attr-path from the eval root — `makeChild` cannot construct it. Caching derivations needs a **second content-addressed `TracedExpr` identity model** threaded through evaluator thunk creation = foundational redesign on the hot path, RFC-scale, not a lever. Verdict: leave the cold tail bounded + sound. Full chain: `plans/lever2-derivation-boundary-caching.md` §7-11. **UPDATE 2026-05-31: the §3b producer-trace boundary IS implemented + benchmarked, but is a NET LOSS on Ledger-D (cold 3.6× / hot 14× slower) and ships DEFAULT-OFF behind `NIX_ENABLE_CA_PRODUCER=1`. The cost (one persisted CA producer trace per derivation) far exceeds the benefit (the replay-time gate fires only ~614 times per commit). Soundness PASS. See Option 3 below.** | redesign-plan §2026-05-30 spike + §2026-05-31 follow-up #4 bench; findings.md "Derivation Boundary Proof" |
+| **2** | **Semantic derivation-boundary caching** (Bazel/Skyframe strict dependency capture + facet mask) | **NOT VIABLE as scoped — feasibility spike hit a material architectural blocker (2026-05-30).** Outliers re-eval ~20 M thunks; the 6,419 derivations inside (99.66 % unchanged) have no reuse boundary, ~58 % of cost is cacheable derivation eval. Spike (branch `spike/lever2-derivation-feasibility`) measured 10,455 derivations evaluated vs 6 traces recorded, then hit the blocker: to verify-before-force a derivation it must be a `TracedExpr`, but `TracedExpr` identity is **attr-path-tree-shaped** (Root or Child-with-parent-and-name), and a `derivationStrict` thunk created deep in `make-derivation.nix` has no attr-path from the eval root — `makeChild` cannot construct it. Caching derivations needs a **second content-addressed `TracedExpr` identity model** threaded through evaluator thunk creation = foundational redesign on the hot path, RFC-scale, not a lever. Verdict: leave the cold tail bounded + sound. Full chain: `plans/lever2-derivation-boundary-caching.md` §7-11. **UPDATE 2026-05-31 (numbers STALE — pre-Fix-1a; see the top status banner + §16–§18 + sketch §10.7): the §3b producer-trace boundary IS implemented + benchmarked. The often-quoted "cold 3.6× / hot 14× slower" is PRE-Fix-1a — Fix 1a (`868038369`) made conservative §3b hot-neutral and showed the 14× was 93% a since-fixed cache-defeat bug. Post-Fix-1a verdict: UNPROMISING (the measured hot non-wins — conservative neutral, aggressive negative; the "+6.7s cold recording" figure once cited is STALE, see §10.7), not "structurally dead" (the "no sharing" reason is confounded). Ships DEFAULT-OFF behind `NIX_ENABLE_CA_PRODUCER=1`. Soundness PASS.** | redesign-plan §2026-05-30 spike + §2026-05-31 follow-up #4 bench; findings.md "Derivation Boundary Proof" |
 | **3** | **Certificate-before-payload** fast path (fixed-size `FullTraceHash` compare before `loadFullTrace` + dep walk) | LOW priority. Every *sound* form was already refuted on this workload (runs 909/980/987/1032/1042/1133/1107/1108…). The dep walk IS the hot cost for true exact hits (unsound oracle run 1015: hot 0.68 vs 0.88 s), but the residual hot cost is decode/startup, not the walk, once the `verifiedTraceIds` memo is in place. Only un-refuted shape: a cheap per-current-node eligibility bit/index that clears the run-993 coverage bar. | redesign-plan §2026-05-29 CORRECTION finding 1 |
 | **4** | **Custom immutable-segment store** (generation packs, mmap fixed-width indexes, lock-free readers, atomic `CURRENT`) | Deferred until 1–3 prove the proof model wins. Storage format is **downstream of authorization**: run 137 showed lazy-payload-over-immutable-objects does NOT beat SQLite without the authorization fix. Do NOT re-abstract `TraceStorage` (the vptr was added per rearch-proposal §2.1, measurably hurt the hot loop, and was reversed). | redesign-plan "Architectural direction" + §2026-05-29 finding 4; storage-backend-research.md |
 
@@ -388,10 +480,25 @@ in place. The remaining options, in rough order of effort/payoff:
    that, not L-B, is the real hot opportunity, and it needs a `runs --verbose`
    measurement first.
 
-3. **The content-addressed trace-node RFC — IMPLEMENTED + BENCHMARKED + DEFAULT-OFF
-   (2026-05-31), `plans/content-addressed-trace-identity-rfc.md`.** The infrastructure
-   shipped in tree (~17 commits past origin), gated on `NIX_ENABLE_CA_PRODUCER=1`.
-   **State of the proof:**
+3. **The content-addressed trace-node RFC — IMPLEMENTED, then FULLY MEASURED +
+   CONCLUDED (`plans/content-addressed-trace-identity-rfc.md`).**
+   > **⚠ THIS WHOLE OPTION IS SUPERSEDED — see the top status banner +
+   > `plans/derivation-producer-partition-rfc.md` §16–§18 + sketch §10.7.** The
+   > "§7 measurement / net loss / 3.6×/14×" numbers below are **PRE-Fix-1a**;
+   > Fix 1a (`868038369`) made conservative §3b hot-neutral (the 14× was 93% a
+   > cache-defeat bug). The "re-enable when the cost profile changes —
+   > async/batched recording / suppress-on-warm / sibling-share workloads"
+   > conditions below are **all refuted** (§5 falsified sibling-share; §16
+   > neutralized hot; the re-key that would fire the gate is unpromising + the
+   > "no sharing" reason is confounded). Net: don't re-enable, don't re-key — the
+   > measured proxy (mis-keyed aggressive) is hot-negative, conservative gives no
+   > win, and §3b adds a cold cost; that justifies "don't invest", not "proven to
+   > lose" (OSPI's re-keyed shape was never benched). (The "+6.7s recording" figure
+   > once cited is STALE — store-write is 0.2s; §10.7.)
+   > The bullets below are kept as the implementation record only.
+   The infrastructure
+   shipped in tree, gated on `NIX_ENABLE_CA_PRODUCER=1`.
+   **State of the proof (pre-Fix-1a framing — see marker above):**
    - **Consume side DONE** (`store/ca-trace-key-routing.cc`, 3 tests): Design A (a
      synthetic `"__ca:<drvHash>"` vocab key via `internName`) round-trips through
      the existing pipeline.
@@ -470,11 +577,15 @@ against code + the cold DB:
   ~thousands of boundary-eligible nodes that already have stable identities) — and
   its productized form `plans/content-addressed-trace-identity-rfc.md` (the RFC,
   with the consume side now proven by `store/ca-trace-key-routing.cc`; see Option 3).
-- **Direction:** lift the build layer's CA model to evaluation — content-address
-  sub-results as trace-DAG nodes referenced by edge, not flattened. RFC-scale
-  (it's the `content-addressed-trace-node` work Lever 2 also needs) and now WRITTEN
-  as the RFC above; it is the only lever that attacks the root rather than
-  symptoms, and it has a precedent to copy: `hashDerivationModulo` + `drvHashes`.
+- **Direction — IMPLEMENTED + MEASURED + CONCLUDED UNPROMISING (see top banner).**
+  The "lift the build layer's CA model to evaluation — edge, not flatten"
+  prescription was built (RFC §3b) and benchmarked post-Fix-1a: the as-built edge
+  is hot-NEGATIVE (a separate-trace `loadTrace` on warm verify costs more than
+  inline deps, `…rfc.md` §17), and conservative §3b gives no hot win — the
+  measured non-wins are the reason. **The diagnosis above (the 607× flattening, the build-layer contrast)
+  is sound; the "edge fixes it" prescription does NOT pay off** on closures.gnome.
+  (`…rfc.md` §17b/§18's "no sharing" *reason* is confounded — sketch §10.7 — but
+  the directional outcome stands.) Do not pursue this as a live lever.
   Soundness prerequisite = the keyset-provenance / cross-trace-escape work (a node
   can observe a child's shape, not just value — unlike builds).
 

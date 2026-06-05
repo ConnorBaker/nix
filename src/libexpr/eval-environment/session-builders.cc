@@ -5,6 +5,8 @@
 #include "nix/expr/search-path.hh"
 #include "nix/expr/eval-trace/store/session-identity.hh"
 
+#include <boost/unordered/unordered_flat_set.hpp>
+
 namespace nix {
 
 namespace {
@@ -201,6 +203,7 @@ std::tuple<EvalTraceSessionAuthority, FlakeSessionReuseDecision> assembleFlakeTr
     std::vector<EvalTraceInputAccessorBinding> inputAccessors;
     std::vector<EvalTraceMountBinding> mountedInputs;
     boost::unordered_flat_map<DepSource, SourcePath, DepSource::Hash> registryEntries;
+    boost::unordered_flat_set<DepSource, DepSource::Hash> nonImmutableSources;
     inputAccessors.reserve(authorityRequestPayload.nodes.size());
     mountedInputs.reserve(authorityRequestPayload.nodes.size());
 
@@ -216,6 +219,12 @@ std::tuple<EvalTraceSessionAuthority, FlakeSessionReuseDecision> assembleFlakeTr
             .subdir = node.mountSubdir,
         });
         registryEntries.insert_or_assign(source, node.evaluationRoot.value);
+        // An unlocked node's carrier mount is stable-but-mutable ⇒ its store
+        // path is not a content address ⇒ H1 must skip it (flake-in-submodule
+        // stale serve). Recorded here so the verifier's `h1StorePathKey` gate
+        // can exclude it.
+        if (!node.sourceIsImmutable)
+            nonImmutableSources.insert(source);
     }
 
     std::optional<EvalTraceSessionConfigInput> sessionConfig;
@@ -233,7 +242,8 @@ std::tuple<EvalTraceSessionAuthority, FlakeSessionReuseDecision> assembleFlakeTr
             .inputAccessors = std::move(inputAccessors),
             .mountedInputs = std::move(mountedInputs),
             .rootLoadDeps = std::move(authorityRequestPayload.rootLoadDeps),
-            .registrySeed = eval_trace::SemanticRegistry(std::move(registryEntries)),
+            .registrySeed = eval_trace::SemanticRegistry(
+                std::move(registryEntries), std::move(nonImmutableSources)),
             .sessionConfig = std::move(sessionConfig),
         });
 

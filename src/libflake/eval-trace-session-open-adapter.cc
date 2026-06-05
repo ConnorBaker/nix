@@ -88,7 +88,8 @@ static FlakeSourceIdentity computeFlakeSourceIdentity(
 }
 
 std::vector<FlakeGraphAuthorityNodeSpec> buildAuthorityNodeSpecs(
-    const LockedFlake & lockedFlake)
+    const LockedFlake & lockedFlake,
+    const fetchers::Settings & fetchSettings)
 {
     std::vector<FlakeGraphAuthorityNodeSpec> nodes;
     nodes.reserve(lockedFlake.resolvedGraph.nodes.size());
@@ -103,6 +104,13 @@ std::vector<FlakeGraphAuthorityNodeSpec> buildAuthorityNodeSpecs(
                     ? CanonPath::root
                     : CanonPath("/" + node.relativePath.value),
             },
+            // A node whose input is not locked (dirty git worktree, dirty
+            // submodule, etc.) is mounted at a stable carrier store path with
+            // live backing content — NOT a faithful content address. Mark it
+            // non-immutable so H1's store-path content-hash cache skips it
+            // (see flake-in-submodule-stale-2026-06-04.md: H1 over a
+            // stable-but-mutable carrier mount is the stale-serve root cause).
+            .sourceIsImmutable = node.lockedInput.isLocked(fetchSettings),
         });
     }
 
@@ -123,9 +131,10 @@ FlakeTraceSessionConfigRequest buildTraceSessionConfigRequest(
 }
 
 std::vector<FlakeGraphAuthorityNodeSpec> buildFlakeAuthorityNodeSpecs(
-    const LockedFlake & lockedFlake)
+    const LockedFlake & lockedFlake,
+    const fetchers::Settings & fetchSettings)
 {
-    return buildAuthorityNodeSpecs(lockedFlake);
+    return buildAuthorityNodeSpecs(lockedFlake, fetchSettings);
 }
 
 } // namespace nix::flake

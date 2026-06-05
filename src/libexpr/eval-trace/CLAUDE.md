@@ -262,6 +262,54 @@ boundary APIs.
 
 ## RFC §3b — content-addressed producer-trace boundary (DEFAULT-OFF)
 
+> **⛔⛔ MEASURED 2026-06-02 — THE ENTIRE ARC + CALIBRATION BELOW WAS
+> CLOSURES.GNOME-ONLY. First off-closures measurement: §3b WARM-THRASHES AT
+> SCALE.** Data: `doc/eval-trace/measurements/3b-at-scale-2026-06-02.md`.
+> On python3Packages (~66K traces) BOTH §3b shapes (conservative + mis-keyed
+> aggressive) never reach a clean warm serve — 10 hot passes oscillate
+> 192↔20,637 misses, re-recording 9.5K–54K traces each, 21–87s vs no-§3b's
+> stable 3.7s. **Scale-dependent** (stable ≤~8K traces under both `mapAttrs`/
+> `listToAttrs`; thrashes at ~66K), **sound** (byte-identical), and the
+> **mechanism is NOT root-caused** (the obvious "nondeterministic recording"
+> hypothesis was REFUTED — cold is ~deterministic, 876/876/877 edges). Caveats:
+> this is the MIS-KEYED proxy, not OSPI (unimplemented); n=1/phase. **Net: the
+> closures-derived "unpromising/hot-neutral/Fix-1a-closed-it" verdict does NOT
+> generalize — at scale §3b is warm-broken** (matches §14's 30,629-session
+> cache-defeat that Fix 1a validated only on 8 pkgs). The two calibrations below
+> that this falsifies: pass-3 "no-sharing confounded" (closures IS genuinely
+> low-fan-out — §17b was right; §11's 200–2000 was python3Packages) and pass-6
+> "recording is 0.2s" (closures-only; py recording is 29–44s). **Root cause +
+> arc conclusion: `derivation-producer-partition-rfc.md` §19. Alternative design
+> (what a sound one looks like): `plans/eval-trace-alternative-design-2026-06-03.md`
+> — keep flattened+inline verification (measured stable+fast: no-§3b serves 18.7M
+> deps warm in 3.7s); make any shared identity STRUCTURAL (drvPath), never
+> eval-context; the real lever is async cold recording (Tier 0), NOT edges.**
+
+> **⛔ ARC UNPROMISING — do NOT extend the producer-edge / re-keying direction
+> (but "structurally dead" is CALIBRATED-DOWN — see the caution).**
+> Chain: `plans/derivation-producer-partition-rfc.md` §16–§18 +
+> `plans/compositional-trace-dag-implementation-sketch.md` §10/§10.7. Headline:
+> the §3b 14× hot was **93% a since-fixed cache-defeat bug** (Fix 1a, commit
+> `868038369`); conservative §3b is now **hot-neutral** (1.09s vs 1.00s). The
+> as-built (mis-keyed) edge is hot-NEGATIVE (§17: 1.81s) because warm verify must
+> `loadTrace` ~12K separate producer-trace blobs that inline conservative avoids
+> — capped per distinct producer, so re-keying wouldn't reduce them. **CAUTION:**
+> §17b/§18's "97% singly-consumed → no sharing → structural catch-22" is
+> **confounded** — it reads the mis-keyed gate's 306 fires as fan-out,
+> contradicting §11's 200–2000 estimate; the correctly-keyed shape was never
+> benched (§10.7). Not pursued because the measured *proxy* (mis-keyed aggressive,
+> 1.81s) is negative, conservative gives no win (1.09s), and §3b adds a cold cost
+> — "don't invest," not "proven to lose" (OSPI's own re-keyed shape is unmeasured).
+> NOT because of "no sharing" (confounded).
+> (§3b also adds a cold cost, but the "+6.7s recording" figure is STALE — the perf
+> doc re-measured store-write at 0.2s; cold is the always-on tax + dep-capture.
+> Don't cite +6.7s.) A
+> 2026-06-02 second pass re-derived this as "OSPI" and retracted it (§10). The
+> live perf direction is `plans/eval-trace-perf-cold-and-hot.md` (cold recording
+> + hot verify), ORTHOGONAL. Keep Fix 1a + the gated default-OFF scaffolding;
+> don't implement OSPI and don't chase a high-fan-out workload (confounded
+> reason).
+
 Implementation lives in tree but is gated on `NIX_ENABLE_CA_PRODUCER=1`.
 Default behavior is identical to pre-§3b. The infrastructure stays in
 tree as proven scaffolding.
@@ -338,27 +386,50 @@ identity) get lost when isolated. Functional tests `eval-trace-core` /
   stores the pointer.
 - `82713fd91` — default-off via `NIX_ENABLE_CA_PRODUCER=1`. Bench-driven.
 
-**Conditions for re-enabling — REVISED 2026-05-31 after sibling-workload
-measurement.** The blocker is NOT (just) the cost profile; it is the
-replay-gate keying. Measured on a `python3Packages.${n}.outPath` sweep
-(n=1..8, the nix-eval-jobs shape): the gate-fire to producer-record ratio
-`E:P ≈ 0.03` flat — *worse* than the 0.096 `closures.gnome` baseline —
-because the producer is keyed on the `strict` (`derivationStrict`-result)
-`Bindings*`, while `derivation.nix:36-50` hands consumers a `commonAttrs //
-{ outPath = …; }` wrapper (76 attrs) and a **string** `outPath`. Siblings
-re-force the wrapper/string, never the keyed `strict` value, so the gate is
-structurally blind to sibling sharing. Therefore:
-- (a) async/batched recording and (b) suppress-on-warm-served reduce
-  producer-record *cost* but cannot create *benefit* against a near-zero-fire
-  gate — necessary-not-sufficient at best.
-- (c) sibling-share-heavy workloads — **FALSIFIED as a rescue**; the gate
-  does not fire on the shared re-forces (see below).
-The real next step is a **re-keying** design: register identity on the value
-consumers actually re-force (the `.outPath`/`.drvPath` string — the Tier-1
-scalar-identity wall — or the `commonAttrs //` wrapper attrset, which exists
-only in the language layer after the `derivationStrict` primop returns). Both
-are RFC-scale, not a hook re-key. Full data + counter decomposition + code
-trace: `doc/eval-trace-cache-redesign-plan.md` "2026-05-31 follow-up #5".
+**Re-enabling — do NOT (unpromising + a real COLD blocker), but the verdict is
+CALIBRATED, not "structurally dead" (see the §10.7 caution at the end of this
+list).** History of how it was reached, kept so it is not re-litigated:
+- §5 (2026-05-31): the replay gate is keyed on the `strict` `Bindings*`, but
+  `derivation.nix:36-50` hands consumers a `commonAttrs // { outPath = …; }`
+  wrapper (76 attrs) and a **string** `outPath`; siblings re-force the
+  wrapper/string, never `strict`. So `E:P ≈ 0.03` (gate ~blind to sharing).
+  This *looked* like "just re-key onto the output string and it'll fire."
+- §16 (post-Fix-1a re-bench): the 3.6×/14× from #4 was measured on a binary
+  with the §14 cache-defeat bug; Fix 1a (`868038369`) makes conservative §3b
+  **hot-neutral** (1.09s). The 14× was 93% a fixable defect, not inherent.
+- §17: the AGGRESSIVE shape (edge replaces flatten — what re-keying would feed),
+  as-built with the mis-keyed gate, is hot-NEGATIVE (1.81s vs 1.09s): warm verify
+  must `loadTrace` (SQLite read + zstd-decompress) ~12K SEPARATE producer-trace
+  blobs that inline conservative avoids; loadTrace is capped per distinct
+  producer (memo), so re-keying wouldn't reduce it.
+- §17b/§18 CLAIMED "306 edges / ~12,836 producers ⇒ ~97% singly-consumed ⇒ no
+  producer-consumer sharing ⇒ structural catch-22." **This is CONFOUNDED** (3rd
+  pass, §10.7): 306 is the *mis-keyed gate's fire count* (§5), not fan-out; it
+  contradicts §11's 200–2000-consumers/derivation estimate. (An earlier draft also
+  claimed "306 edges → 12,186 loads ⇒ inconsistent" — STRUCK, 4th pass: the 12K
+  loads are ≈1 per *recorded* producer trace (§17:1209), not caused by the 306
+  edges.) The correctly-keyed shape was never benched. So "no sharing" is not
+  established.
+- §18 "structural catch-22" (re-keying fires for all producers incl. low-fan-out
+  → hot worse; high-fan-out can't be targeted at record time): rests on §17b's
+  confounded fan-out, so it is NOT a proven structural obstruction.
+- 2026-06-02 passes: a 2nd pass re-derived the re-key as "OSPI" and retracted it
+  (§16–§18); a 3rd pass (§10.7) found §16–§18's "structurally dead" was itself an
+  uncritical acceptance and CALIBRATED it down; a 4th pass (independent review)
+  struck the bad "306→12,186" leg and demoted the stale "+6.7s cold". **Settled
+  state:** unpromising ("don't invest", NOT "proven to lose") — the measured
+  *proxy* leans negative (conservative no-win 1.09s; mis-keyed-aggressive hot-loss
+  1.81s) but OSPI's own correctly-keyed shape is **unmeasured**; "no sharing" is
+  confounded; §3b's cold cost is real but the "+6.7s"
+  magnitude is stale (perf doc: store-write 0.2s). Don't implement OSPI; don't
+  chase a high-fan-out workload on the confounded reason. Full record:
+  `plans/compositional-trace-dag-implementation-sketch.md` §10/§10.7.
+
+The one durable win is **Fix 1a** (write-once caKey dedup, correctness; harmless
+when §3b off). The actual cold-perf lever is ORTHOGONAL — see
+`plans/eval-trace-perf-cold-and-hot.md`: COLD is measured ~57% BLAKE3 hashing of
+the 607×-flattened deps (not I/O), H-cold-1 landed (−10%), next lever is C3
+(reduce flattened dep count); HOT verify = persisted content-hash cache (landed).
 
 **Test surface** — see `src/libexpr-tests/eval-trace/CLAUDE.md` for the
 full test guide. 22 tests across 4 files
@@ -368,12 +439,24 @@ plus 6 store-level tests (`store/ca-producer-boundary-recording.cc`,
 `store/ca-trace-key-routing.cc`). All probe-verified.
 
 **Cross-references.**
-- RFC: `plans/content-addressed-trace-identity-rfc.md`
+- **Arc conclusion (READ THIS FIRST — but note the §10.7 calibration below
+  corrects its "no sharing" framing):** `plans/derivation-producer-partition-rfc.md`
+  §16 (Fix 1a re-bench), §17 (aggressive edge hot-negative via loadTrace),
+  §17b/§18 (the "no producer-consumer sharing / structural catch-22" — CONFOUNDED,
+  see §10.7).
+- Second-pass re-derivation + retraction (OSPI):
+  `plans/compositional-trace-dag-implementation-sketch.md` §10.
+- Fix 1a (the one durable win): commit `868038369`.
+- RFC: `plans/content-addressed-trace-identity-rfc.md` (§8 = pre-Fix-1a
+  net-loss; superseded by the arc conclusion above)
 - Architectural backstory: `plans/architecture-trace-model-vs-CA.md`,
-  `plans/compositional-trace-dag-design.md`
+  `plans/compositional-trace-dag-design.md` (the 607× diagnosis is sound;
+  its "edge fixes it" prescription is refuted by §17b — the sharing is
+  leaf-dep, not producer-consumer)
 - Bench data + history: `doc/eval-trace-cache-redesign-plan.md`
-  "2026-05-31 follow-up #4" (bench + default-off) and "follow-up #5"
-  (sibling-workload falsification + keying-split root cause)
+  "2026-05-31 follow-up #4" (PRE-Fix-1a bench; numbers superseded by §16)
+  and "follow-up #5" (keying-split root cause)
+- Live perf direction (orthogonal): `plans/eval-trace-perf-cold-and-hot.md`
 - Soundness floor: `store/derivation-edge-soundness.cc`,
   `store/derivation-observation-facets.cc`,
   `store/dep-flattening-baseline.cc`,
@@ -1629,7 +1712,7 @@ Precise terminology (these terms have specific meanings — do not conflate):
   writes), `RecordingScopeActiveTag` (replayTrace + epoch log replay
   writes), `DepCaptureScopeTag` (scope management), `FileStrandTag`
   (ParseCaches access, derived from BlockingTag), `BlockingTag` (SQLite
-  access), `VerificationAccessTag` (orchestrator state).
+  access).
 
 - **Session type**: A type-level description of a communication protocol.
   Each protocol step is a type constructor (Send, Recv, Choose, Offer,
@@ -2127,15 +2210,6 @@ The holder of `ea` has exclusive access to this `TraceStore`, including
 its `ParseCaches`; deriving `FileStrandTag` from `ea` means a thread
 cannot mint a `FileStrandTag` proof without also serialising against
 every other mutation of the same store.
-
-**`VerificationAccessTag`** for orchestrator state (PrefetchPool):
-Certifier: `Verifier`. Access-control proof — the
-orchestrator's `PrefetchPool` is only accessible to code with proof.
-Actual thread serialization is provided by `syncAwait`'s `future.get()`
-blocking: the eval thread blocks while the io_context worker runs,
-ensuring they never access PrefetchPool concurrently. The strand
-members have been removed; `syncAwait` is the sole serialization
-mechanism.
 
 **`BlockingTag`** certifies "I can block safely" (blocking-thread context —
 a thread that is NOT on the io_context event loop; filesystem, daemon

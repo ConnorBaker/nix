@@ -9,7 +9,6 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-trace/context.hh"
-#include "nix/expr/eval-trace/drv-benefit-probe.hh"
 #include "nix/expr/eval-trace/deps/dep-capture-scope.hh"
 #include "nix/expr/eval-trace/deps/trace-activation-scope.hh"
 #include "nix/expr/eval-trace/deps/trace-access.hh"
@@ -163,12 +162,6 @@ void TracedExpr::evaluateResolvedTarget(EvalContext<Suspendable> & ctx, Value & 
     }
 
     auto directDeps = depCapture.finalizeAndTakeDeps();
-
-    // MEASUREMENT-ONLY (RFC §8 step 3 benefit denominator; env-gated, no-op otherwise):
-    // tally this consumer trace's full dep-kind breakdown — the total flattening per
-    // consumer that an edge model would reduce. Read before the move into publish().
-    if (eval_trace::drv_benefit_probe::enabled())
-        eval_trace::drv_benefit_probe::recordConsumerTrace(directDeps);
 
     CachedResult attrValue = buildCachedResult(st, *target);
 

@@ -292,6 +292,7 @@ public:
     TraceRuntime();
 
     uint32_t currentReplayEpochSize() const { return replayStore.epochSize(); }
+
     void rollbackReplayEpoch(uint32_t epochStart);
     std::unique_ptr<eval_trace::TraceBackend> makeTraceBackend(
         const Hash & fingerprint, SymbolTable & symbols);

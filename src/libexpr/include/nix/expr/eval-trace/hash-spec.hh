@@ -26,6 +26,13 @@ EvalTraceHashAlgorithm parseEvalTraceHashAlgorithmTag(char tag);
 EvalTraceHashAlgorithm getEvalTraceHashAlgorithm();
 void setEvalTraceHashAlgorithm(EvalTraceHashAlgorithm algorithm);
 
+/// Process-global eval-trace runtime config (set once at eval startup from
+/// EvalSettings, read on the record path). Mirrors the hash-algorithm global
+/// above. `eval-trace-defer-flush` — batch per-record SQLite flushes during cold
+/// recording (Layer 2a). Default true. See the setting doc in eval-settings.hh.
+bool getEvalTraceDeferFlush();
+void setEvalTraceDeferFlush(bool deferFlush);
+
 } // namespace nix::eval_trace
 
 namespace nix {

@@ -1,6 +1,7 @@
 #include "eval-trace/helpers.hh"
 #include "nix/expr/eval-trace/deps/hash.hh"
 #include "nix/expr/eval-trace/deps/interning-pools.hh"
+#include "nix/expr/eval-trace/canonical-hash.hh"
 
 #include <gtest/gtest.h>
 #include <set>
@@ -305,6 +306,31 @@ TEST_F(DepHashTest, TraceHash_DifferentGitIdentity_SameHash)
         makeGitIdentityDep(pools, "/tmp/repo", "commit-2"),
     };
     EXPECT_EQ(computeTraceHash(pools, deps1), computeTraceHash(pools, deps2));
+}
+
+// Overload-resolution regression: a string LITERAL field VALUE must hash as its
+// string content, not bind to field(std::string_view, bool). Without a const char*
+// overload, field("k","lit") binds to field(sv,bool) (const char*->bool is a
+// STANDARD conversion that beats the user-defined const char*->string_view), so
+// every literal value hashes as `true` and distinct literals collide. This caused
+// the flake-in-submodule git-rev/dirty-rev identity collapse (Finding 1 in
+// doc/eval-trace/measurements/flake-in-submodule-stale-2026-06-04.md). FAILS on the
+// buggy code; passes once a `field(std::string_view, const char*)` overload exists.
+TEST(CanonicalHashBuilderOverload, StringLiteralFieldValueIsNotHashedAsBool)
+{
+    auto hexOf = [](auto value) {
+        CanonicalHashBuilder b("overload-test-domain");
+        b.field("k", value);
+        return b.finish().toHex();
+    };
+    // Distinct string literals MUST hash differently.
+    EXPECT_NE(hexOf("alpha"), hexOf("beta"))
+        << "distinct string literals collide -> field(sv, literal) bound to field(sv, bool)";
+    // Control: an explicit string_view always distinguishes (proves the builder works).
+    EXPECT_NE(hexOf(std::string_view("alpha")), hexOf(std::string_view("beta")));
+    // A literal must NOT hash identically to an actual bool true.
+    EXPECT_NE(hexOf("alpha"), hexOf(true))
+        << "string literal hashes identically to bool true";
 }
 
 } // namespace nix::eval_trace

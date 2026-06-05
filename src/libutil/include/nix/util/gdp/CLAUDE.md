@@ -55,7 +55,7 @@ duplicated.
 | `DedupCheckedTag` proof | `Certifier<DedupCheckedTag>::withProofIf` on `DedupGate` |
 | `RecordingScopeActiveTag` proof | `Certifier<RecordingScopeActiveTag>` on `RecordingScopeGuard` |
 | `DepCaptureScopeTag` proof | `Certifier<DepCaptureScopeTag>` on `DepCaptureScope` and `SiblingForceScope` |
-| Strand tokens | `Certifier<FileStrandTag>` on `FileStrandGate`, `Certifier<VerificationAccessTag>` on `Verifier` |
+| Strand tokens | `Certifier<FileStrandTag>` on `FileStrandGate` |
 | Test blocking proofs | `Certifier<BlockingTag>` inheritance + `withProof` (scoped in each test method) |
 | File subsumption | Not GDP: eval-trace uses an opaque capability type (`VerifiedFileDep`) because public proof tags are subclass-forgeable in C++ |
 

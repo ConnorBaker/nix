@@ -15,7 +15,6 @@
 #include "nix/expr/eval-trace/deps/nix-binding.hh"
 #include "nix/expr/eval-trace/deps/trace-access.hh"
 #include "nix/expr/eval-trace/cache/trace-session.hh"
-#include "nix/expr/eval-trace/drv-benefit-probe.hh"
 #include "nix/expr/eval-trace/deps/dep-capture-scope.hh"
 #include "nix/expr/eval-trace/data/traced-data.hh"
 #include "eval-trace/data/traced-data-nodes.hh"
@@ -1606,11 +1605,7 @@ static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** 
     bool registerProducer = (caProducerEnabled || caProducerAggressive)
         && session && state.traceCtx;
 
-    // MEASUREMENT-ONLY (RFC §8 step 3 benefit magnitude): the benefit probe needs
-    // the epoch range regardless of NIX_ENABLE_CA_PRODUCER, to tally the dep-KIND
-    // breakdown of what this derivation flattens (what an edge would remove).
-    bool measureBenefit = eval_trace::drv_benefit_probe::enabled() && state.traceCtx;
-    uint32_t epochStart = (registerProducer || measureBenefit)
+    uint32_t epochStart = registerProducer
         ? state.traceCtx->currentReplayEpochSize() : 0;
 
     // NOTE (RFC §8 step 3 hot-path COST — measured, prototype REMOVED): the
@@ -1621,7 +1616,7 @@ static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** 
     // (it discarded the sub-scope's deps, so the consumer lost them) — a footgun if
     // enabled expecting correctness, the same misleading-instrumentation risk that
     // got the drv-sharing-probe removed. The measurement is recorded; the code is not
-    // kept. (The drv-benefit-probe stays — it IS measurement-only + soundness-neutral.)
+    // kept.
 
     state.forceAttrs(*args[0], pos, "while evaluating the argument passed to builtins.derivationStrict");
 
@@ -1719,18 +1714,6 @@ static void prim_derivationStrict(EvalState & state, const PosIdx pos, Value ** 
     }
 
     // MEASUREMENT-ONLY (RFC §8 step 3 benefit magnitude; env-gated, no-op otherwise).
-    // Tally the dep-KIND breakdown of the range that grew during this derivationStrict
-    // call — the derivation-closure deps a producer-edge would remove from the consumer.
-    // Independent of registerProducer (runs on the default shape). NOTE this range is the
-    // SAME superset the conservative producer snapshots (incl nested derivations' deps +
-    // any ambient reads during the force); it bounds what an edge could remove. The
-    // dep-kind %% split answers the §0.5/#11 35–90% question.
-    if (measureBenefit) {
-        uint32_t epochEnd = state.traceCtx->currentReplayEpochSize();
-        eval_trace::drv_benefit_probe::recordDerivationRange(
-            state.traceCtx->snapshotEpochRange(epochStart, epochEnd));
-    }
-
 }
 
 /**

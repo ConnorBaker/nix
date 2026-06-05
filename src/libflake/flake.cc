@@ -2850,7 +2850,7 @@ ref<eval_trace::TraceSession> openTraceCache(EvalState & state, ref<const Locked
     auto sessionConfigRequest = buildTraceSessionConfigRequest(
         *lockedFlake,
         lockedFlake->getFingerprint(*state.store, state.fetchSettings));
-    auto authorityNodes = buildFlakeAuthorityNodeSpecs(*lockedFlake);
+    auto authorityNodes = buildFlakeAuthorityNodeSpecs(*lockedFlake, state.fetchSettings);
     auto rootLoader = RootLoaderCapability::create(
         std::make_unique<FlakeRootLoaderHolder>(state, lockedFlake));
     auto authorityRequest = FlakeGraphTraceSessionAuthorityRequest::create(

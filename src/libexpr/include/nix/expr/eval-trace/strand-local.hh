@@ -9,7 +9,6 @@
 /// WHAT BECOMES A COMPILE ERROR:
 ///   parseCaches.jsonDomCache.access();         // missing StrandToken
 ///   parseCaches.jsonDomCache.access(gitToken); // wrong tag type
-///   prefetchPool_.access();                     // missing StrandToken
 
 #include "nix/util/gdp/proof.hh"
 #include "nix/util/gdp/proof-guarded.hh"
@@ -26,6 +25,5 @@ using StrandLocal = gdp::ProofGuarded<T, Tag>;
 
 // Tag types for specific strands
 struct FileStrandTag {};
-struct VerificationAccessTag {};
 
 } // namespace nix::eval_trace

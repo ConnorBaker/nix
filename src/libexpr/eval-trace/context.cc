@@ -1,4 +1,5 @@
 #include "nix/expr/eval-trace/context.hh"
+#include "nix/expr/eval-trace/hash-spec.hh"
 #include "nix/expr/eval-trace/deps/input-resolution.hh"
 #include "nix/expr/eval-trace/deps/trace-access.hh"
 #include "nix/expr/eval-trace/deps/recording.hh"
@@ -260,7 +261,7 @@ struct BackendAsyncInfra {
         , iocWorkers_(ioc_, workGuard_, kIocThreads)
         , blockingPool(ioc_, kBlockingThreads)
     {
-        verifier = std::make_unique<Verifier>(store, blockingPool);
+        verifier = std::make_unique<Verifier>(store);
     }
 
     ~BackendAsyncInfra()
@@ -305,19 +306,18 @@ eval_trace::TraceBackend::verify(
     // the assert catches violations in debug builds if that guard is
     // ever removed or bypassed.
     assert(sessionBound_ && "verify() called before bindSession() — backend not bound");
-    return ctx.syncAwait(infra_->verifier->verifyAttr(pathId));
+    // Warm-hit verify runs synchronously: the async io_context/coroBlock orchestrator
+    // (Spike 1, plans/verify-execution-model-spike.md) was measured to overlap only
+    // page-cached I/O (~0.28% of warm-verify cost) and deliver zero warm benefit
+    // (1-CPU == 32-CPU wall), so it was removed. `verifySync` -> `store_.verify` runs the
+    // same lookupCurrentNode -> loadTraceKeysAndHeader -> verifyTrace -> decode|recovery.
+    (void) ctx;
+    return verifySync(pathId);
 }
 
 eval_trace::FiberScheduler * eval_trace::TraceBackend::getScheduler()
 {
     return infra_ ? &infra_->scheduler : nullptr;
-}
-
-void eval_trace::TraceBackend::submitPrefetchHints(
-    const std::vector<AttrPathId> & pathIds)
-{
-    if (sessionBound_ && infra_ && infra_->verifier)
-        infra_->verifier->submitPrefetchHints(pathIds);
 }
 
 void eval_trace::TraceBackend::bindSession(
@@ -337,9 +337,17 @@ eval_trace::TraceBackend::record(
     const CachedResult & value,
     const std::vector<Dep> & allDeps)
 {
+    // Batch per-record SQLite flushes during cold recording (Layer-2a deferFlush:
+    // buffer pending entities + Sessions/History together, drain in dependency
+    // order at teardown). Measured ~7-8s faster on cold python3Packages (32,518
+    // records), byte-identical, crash-safe (Traces-before-Sessions preserved).
+    // Gated by the `eval-trace-defer-flush` setting (default true); see its doc in
+    // eval-settings.hh for the memory tradeoff. Read once per call from the
+    // process-global set at eval startup.
+    const bool deferFlush = eval_trace::getEvalTraceDeferFlush();
     return ctx.syncAwait(coroBlock(infra_->blockingPool, [&](const gdp::Proof<BlockingTag> & bs) {
         return store->withExclusiveAccess(bs, [&](const auto & ea) {
-            auto result = store->record(ea, pathId, value, allDeps);
+            auto result = store->record(ea, pathId, value, allDeps, deferFlush);
             // H1b: populate the persisted content-hash cache from this trace's
             // recorded deps (store-resident FileBytes/RawBytes only), so the
             // FIRST warm verify hits H1 instead of recomputing. The verify path

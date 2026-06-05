@@ -547,7 +547,10 @@ struct GitInputScheme : InputScheme
 
     std::optional<std::filesystem::path> getSourcePath(const Input & input) const override
     {
-        return getRepoInfo(input).getPath();
+        // needWorkdirInfo=false: getPath() never reads workdirInfo, so skip the O(worktree)
+        // git_status scan that otherwise runs ~10x redundantly per flake eval (stat-source
+        // profile). Cache-free and provably sound — nothing dirty-state-dependent is consulted.
+        return getRepoInfo(input, /*needWorkdirInfo=*/false).getPath();
     }
 
     void putFile(
@@ -693,7 +696,7 @@ struct GitInputScheme : InputScheme
         return maybeGetBoolAttr(input.attrs, "allRefs").value_or(false);
     }
 
-    RepoInfo getRepoInfo(const Input & input) const
+    RepoInfo getRepoInfo(const Input & input, bool needWorkdirInfo = true) const
     {
         auto checkHashAlgorithm = [&](const std::optional<Hash> & hash) {
             if (hash.has_value() && !(hash->algo == HashAlgorithm::SHA1 || hash->algo == HashAlgorithm::SHA256))
@@ -791,8 +794,17 @@ struct GitInputScheme : InputScheme
         // needs current tracked dirty state, and stale workdir metadata
         // silently stabilizes fetchGit/fetchTree across staged or removed
         // tracked files.
-        if (auto repoPath = repoInfo.getPath(); repoPath)
-            repoInfo.workdirInfo = GitRepo::openRepo(*repoPath, {})->getWorkdirInfo();
+        //
+        // getSourcePath (and other path-only callers) pass needWorkdirInfo=false to SKIP this
+        // O(worktree) git_status scan: getPath() reads only repoInfo.location, never workdirInfo.
+        // The stat-source profile (plans/upstream-nix-core-findings.md Finding B) showed
+        // getSourcePath drives ~all the ~10 redundant scans per flake eval, so this cache-free
+        // split alone gives the full win (~1.58M -> ~159K newfstatat, ~9x wall) and is provably
+        // sound (getPath() is independent of workdirInfo).
+        if (needWorkdirInfo) {
+            if (auto repoPath = repoInfo.getPath(); repoPath)
+                repoInfo.workdirInfo = GitRepo::openRepo(*repoPath, {})->getWorkdirInfo();
+        }
 
         return repoInfo;
     }

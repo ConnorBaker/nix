@@ -546,6 +546,7 @@ EvalState::EvalState(
     );
 
     eval_trace::setEvalTraceHashAlgorithm(settings.evalTraceHashAlgorithm);
+    eval_trace::setEvalTraceDeferFlush(settings.evalTraceDeferFlush);
 
     createBaseEnv(settings);
 

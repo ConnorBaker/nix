@@ -16,6 +16,7 @@ FlakeTraceSessionConfigRequest buildTraceSessionConfigRequest(
     std::optional<Fingerprint> lockedFlakeFingerprint);
 
 std::vector<FlakeGraphAuthorityNodeSpec> buildFlakeAuthorityNodeSpecs(
-    const LockedFlake & lockedFlake);
+    const LockedFlake & lockedFlake,
+    const fetchers::Settings & fetchSettings);
 
 } // namespace nix::flake

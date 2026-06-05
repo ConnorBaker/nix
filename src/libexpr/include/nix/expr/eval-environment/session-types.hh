@@ -252,6 +252,14 @@ struct FlakeGraphAuthorityNodeSpec
     EvalTraceFlakeEvaluationRootPath evaluationRoot;
     EvalTraceFlakeCarrierRootPath carrierRoot;
     RegistryMountSubdir mountSubdir;
+    /// Whether this node's locked input pins its content (`Input::isLocked`).
+    /// FALSE for a dirty/unlocked source (e.g. a git working tree, or a flake
+    /// whose submodule worktree is dirty): eval-trace mounts such a source at a
+    /// STABLE carrier store path whose backing content is live, so that path is
+    /// NOT a faithful content address. H1 (the store-path→content-hash cache)
+    /// must skip non-immutable sources — its soundness rests on store-path
+    /// immutability. Default true: any unset path keeps H1's prior behaviour.
+    bool sourceIsImmutable = true;
 };
 
 class FlakeGraphTraceSessionAuthorityRequest final : public Linear<FlakeGraphTraceSessionAuthorityRequest>

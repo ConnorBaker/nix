@@ -19,7 +19,7 @@
 ///   - resolveCurrentDepHash / resolveTraceContextHash
 ///   - verifyTrace (two-pass verification with structural override)
 ///   - recovery (typestate-driven: RecoveryState<Stage>)
-///   - Verifier::verifyAttr (async orchestrator with prefetch pool)
+///   - Verifier::verifyAttrSync (the synchronous verify entry point)
 
 #include "verifier.hh"
 
@@ -239,6 +239,14 @@ static std::optional<std::string> h1StorePathKey(
     auto source = pools.resolveDepSource(key.sourceId);
     if (isAbsoluteDepSource(source))
         return std::nullopt;
+    // H1's soundness rests on store-path immutability. A non-locked flake node
+    // (dirty git worktree / dirty submodule) is mounted at a STABLE carrier
+    // store path with live backing content — its store path is not a content
+    // address, so a cached entry would stale-serve. Skip H1 for it; the dep
+    // falls through to the live re-hash on every verify (correct, just not
+    // cached). See doc/eval-trace/measurements/flake-in-submodule-stale-2026-06-04.md.
+    if (registry.isNonImmutableSource(source))
+        return std::nullopt;
     auto path = registry.resolve(source, std::string(pools.resolve(key.simpleKeyId())));
     if (!path)
         return std::nullopt;
@@ -289,10 +297,9 @@ std::optional<DepHashValue> SqliteTraceStorage::resolveCurrentDepHash(
         // resolveDepHash caches internally via cacheComputedHash /
         // cacheVerifiedHash — no L1 write needed here.
 
-        // H1: persist a freshly-computed content hash for a store-resident
-        // path. Only a concrete DepHash digest is cached — never the Missing
-        // sentinel (a GC'd-then-refetched store path reappears with its
-        // addressed content, so a cached "missing" could go stale) and never a
+        // H1: persist a freshly-computed content hash for a store-resident path.
+        // Never the Missing sentinel (a GC'd-then-refetched store path reappears
+        // with its addressed content, so a cached "missing" could go stale) nor a
         // string-variant value (those kinds don't reach h1StorePathKey anyway).
         if (h1Key && current) {
             if (auto * digest = std::get_if<DepHash>(&*current)) {
@@ -2067,21 +2074,13 @@ static bool verifierContainsVolatileDep(const std::vector<Dep::Key> & keys)
     });
 }
 
-Verifier::Verifier(
-    SqliteTraceStorage & store,
-    BlockingThreadPool & blockingPool,
-    Config config)
+Verifier::Verifier(SqliteTraceStorage & store)
     : store_(store)
-    , blockingPool_(blockingPool)
-    , config_(config)
 {
 }
 
 Verifier::~Verifier() = default;
 
-// All blocking store access goes through coroBlock(blockingPool_, ...).
-// parallel_group captures EvalState& and session_ by reference — safe
-// because session caches are concurrent_flat_map and EvalState is thread-safe.
 void Verifier::bindSession(
     const SemanticRegistry & registry,
     EvalState & state)
@@ -2104,21 +2103,20 @@ void Verifier::populateFileContentCacheFromRecordedDeps(
         return;
     const auto & pools = state_->tracingPools();
     for (const auto & dep : deps) {
-        // Only a concrete digest is the content hash; string-variant values
-        // (which don't occur for FileBytes/RawBytes anyway) and the Missing
-        // sentinel must never populate H1 — same exclusions as the verify-side
-        // store. h1StorePathKey already gates kind + Registered + isInStore.
+        // Only a concrete digest is the content hash; string-variant values and the Missing
+        // sentinel must never populate the cache — same exclusions as the verify-side store.
         auto * digest = std::get_if<DepHash>(&dep.hash);
         if (!digest || *digest == sentinel(SentinelHash::Missing))
             continue;
-        auto h1Key = h1StorePathKey(dep.key, *registry_, pools, *state_->store);
-        if (!h1Key)
+        // h1StorePathKey gates kind + Registered + isInStore; non-store/dirty
+        // paths fall through to the read path (uncached).
+        auto cacheKey = h1StorePathKey(dep.key, *registry_, pools, *state_->store);
+        if (!cacheKey)
             continue;
-        // Write-once inside putFileContentHash (try_emplace): a no-op if the
-        // verify path or a prior record already stored this path. Counted on
-        // its own `Populated` counter (NOT `Eligible`/`Stores`, which are the
-        // verify-path signals) to keep the hit-rate ratios clean.
-        if (store_.putFileContentHash(*h1Key, *digest))
+        // Write-once inside putFileContentHash (try_emplace): a no-op if the verify path or a
+        // prior record already stored this key. Counted on its own `Populated` counter (NOT
+        // `Eligible`/`Stores`, the verify-path signals) to keep the hit-rate ratios clean.
+        if (store_.putFileContentHash(*cacheKey, *digest))
             nrFileContentCachePopulated++;
     }
 }
@@ -2126,20 +2124,11 @@ void Verifier::populateFileContentCacheFromRecordedDeps(
 void Verifier::resetVerificationState()
 {
     session_ = VerificationSession{};
-    Verifier::withProof([&](const auto & tok) {
-        prefetchPool_.access(tok).clear();
-    });
     // Per-DepKeySetId SV telemetry is process-scoped by design (the
     // map lives in counters.cc).  Reset on session open so that
     // `NIX_SHOW_STATS` output describes only the just-started session,
     // not whatever prior session ran in this process.
     clearSVCandidateStats();
-}
-
-asio::awaitable<std::optional<SqliteTraceStorage::VerifyResult>>
-Verifier::verifyAttr(AttrPathId pathId)
-{
-    co_return co_await verifyAttrImpl(pathId);
 }
 
 std::optional<SqliteTraceStorage::VerifyResult>
@@ -2148,145 +2137,5 @@ Verifier::verifyAttrSync(const ExclusiveTraceStorageAccess & ea, AttrPathId path
     if (!registry_ || !state_) return std::nullopt;
     return store_.verify(ea, pathId, *registry_, *state_, session_);
 }
-
-void Verifier::submitPrefetchHints(const std::vector<AttrPathId> & pathIds)
-{
-    Verifier::withProof([&](const auto & tok) {
-        auto & pool = prefetchPool_.access(tok);
-        for (auto pathId : pathIds) {
-            if (pool.size() >= config_.maxPrefetchHints)
-                return;
-            pool.submit(pathId);
-        }
-    });
-}
-
-asio::awaitable<std::optional<SqliteTraceStorage::VerifyResult>>
-Verifier::verifyAttrImpl(AttrPathId pathId)
-{
-    assert(registry_ && state_ && "verifyAttrImpl called before bindSession");
-    auto & registry = *registry_;
-    auto & state = *state_;
-    bool bootstrappedFromHistory = false;
-
-    // 0. Check prefetch pool.
-    {
-        auto earlyResult = gdp::Certifier<VerificationAccessTag>::withProof(
-            [&](const auto & verifyTok) -> std::optional<std::optional<SqliteTraceStorage::VerifyResult>> {
-                auto & prefetchPool = prefetchPool_.access(verifyTok);
-                if (auto * token = prefetchPool.lookup(pathId)) {
-                    if (token->completed) {
-                        auto result = std::move(token->result);
-                        prefetchPool.remove(pathId);
-                        return result;
-                    }
-                    prefetchPool.remove(pathId);
-                }
-                return std::nullopt;
-            });
-        if (earlyResult)
-            co_return *earlyResult;
-    }
-
-    // 1. Look up current node from the trace store on the blocking pool.
-    auto currentNode = co_await coroBlock(blockingPool_, [&](const gdp::Proof<BlockingTag> & bs) {
-        return store_.withExclusiveAccess(bs, [&](const auto & ea) {
-            return store_.lookupCurrentNode(ea.blockingProof(), pathId);
-        });
-    });
-
-    // 2. Verification pipeline.
-    // Pre-population happens inside verifyTrace, coupled to the correct
-    // traceId. No cross-trace L1 interference possible.
-    auto verifyStart = timerStart();
-    nrTraceVerifications++;
-
-    if (!currentNode) {
-        // Semantic flake sessions intentionally split CurrentTraces across
-        // lock-graph changes. When that happens, bootstrap verification from
-        // the stable recovery namespace instead of treating the attr as
-        // entirely uncached.
-        auto latestHistory = co_await coroBlock(blockingPool_, [&](const gdp::Proof<BlockingTag> & bs) {
-            return store_.withExclusiveAccess(bs, [&](const auto & ea) {
-                return store_.lookupLatestHistoryForAttr(ea, pathId);
-            });
-        });
-        if (!latestHistory) {
-            debug("eval-trace/verifier: verifyAttr pathId=%u primary miss + no history — fresh eval",
-                  pathId.value);
-            co_return std::nullopt;
-        }
-        currentNode = *latestHistory;
-        bootstrappedFromHistory = true;
-        debug("eval-trace/verifier: verifyAttr pathId=%u primary miss — bootstrapping from history (traceId=%u)",
-              pathId.value, currentNode->traceId.value);
-        // NB: nrHistoryBootstraps is incremented AFTER the bootstrapped
-        // trace successfully verifies (see branch below), not here — so
-        // the counter means "history-served result," not merely
-        // "history lookup returned a row." If verifyTrace fails, recovery()
-        // runs and `nrRecoveryAttempts` is the correct signal, NOT
-        // nrHistoryBootstraps.
-    }
-
-    if (!currentNode)
-        co_return std::nullopt;
-
-    auto traceId = currentNode->traceId;
-    auto kh = co_await coroBlock(blockingPool_, [&](const gdp::Proof<BlockingTag> & bs) {
-            return store_.withExclusiveAccess(bs, [&](const auto & ea) {
-                return store_.loadTraceKeysAndHeader(ea, traceId);
-            });
-        });
-    if (!kh) {
-        debug("eval-trace/verifier: verifyAttr pathId=%u traceId=%u missing trace metadata — fresh eval",
-              pathId.value, traceId.value);
-        co_return std::nullopt;
-    }
-    if (verifierContainsVolatileDep(*kh->keys)) {
-        debug("eval-trace/verifier: verifyAttr pathId=%u traceId=%u has volatile deps — skipping cache",
-              pathId.value, traceId.value);
-        co_return std::nullopt;
-    }
-
-    // 3b. Full verification pipeline on the blocking pool. No direct blocking
-    //     store or filesystem work happens on the io_context workers.
-    bool verified = co_await coroBlock(blockingPool_, [&](const gdp::Proof<BlockingTag> & bs) {
-        return store_.withExclusiveAccess(bs, [&](const auto & ea) {
-            return store_.verifyTrace(ea, traceId, registry, state, session_);
-        });
-    });
-
-    // 3c. Construct result or run recovery.
-    std::optional<SqliteTraceStorage::VerifyResult> result;
-    if (verified) {
-        nrVerificationsPassed++;
-        if (bootstrappedFromHistory) {
-            nrHistoryBootstraps++;
-            currentNode = co_await coroBlock(blockingPool_, [&](const gdp::Proof<BlockingTag> & bs) {
-                return store_.withExclusiveAccess(bs, [&](const auto & ea) {
-                    return store_.publishStateChange(
-                        ea.blockingProof(), pathId, currentNode->traceId, currentNode->resultId,
-                        /*insertHistory=*/false);
-                });
-            });
-        }
-        auto cachedResult = co_await coroBlock(blockingPool_, [&](const gdp::Proof<BlockingTag> & bs) {
-            return store_.withExclusiveAccess(bs, [&](const auto & ea) {
-                return store_.decodeCachedResult(ea.blockingProof(), currentNode->resultId);
-            });
-        });
-        result.emplace(SqliteTraceStorage::VerifyResult{std::move(cachedResult), traceId});
-    } else {
-        result = co_await coroBlock(blockingPool_, [&](const gdp::Proof<BlockingTag> & bs) {
-            return store_.withExclusiveAccess(bs, [&](const auto & ea) {
-                return store_.recovery(ea, traceId, pathId, registry, state, session_);
-            });
-        });
-    }
-
-    nrVerifyTimeUs += elapsedUs(verifyStart);
-    co_return result;
-}
-
 
 } // namespace nix::eval_trace

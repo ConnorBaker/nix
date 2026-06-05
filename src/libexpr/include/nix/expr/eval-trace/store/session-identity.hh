@@ -31,7 +31,12 @@ namespace nix::eval_trace {
 /// Epoch 25: schema cleanups (P-SK): Results.encoding column dropped
 ///           (encoding version is global per kSemanticResultEncodingVersion);
 ///           Strings.value UNIQUE replaced with an ordinary index.
-inline constexpr uint32_t kSchemaEpoch = 25;
+/// Epoch 26: CanonicalHashBuilder::field gained a `const char*` overload — string
+///           literal field values previously hashed as bool `true` (overload bound
+///           to field(sv,bool)), so EVERY literal-valued hash preimage changes. See
+///           flake-in-submodule-stale-2026-06-04.md Finding 1 + the
+///           CanonicalHashBuilderOverload regression test.
+inline constexpr uint32_t kSchemaEpoch = 26;
 inline constexpr uint32_t kProviderEpoch = 1;
 
 using SessionSourceDigest = Tagged<struct SessionSourceDigestTag_, EvalTraceHash>;

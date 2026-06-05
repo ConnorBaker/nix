@@ -12,6 +12,7 @@ namespace nix::eval_trace {
 namespace {
 
 std::atomic<EvalTraceHashAlgorithm> activeAlgorithm{EvalTraceHashAlgorithm::Blake3};
+std::atomic<bool> activeDeferFlush{true};
 
 }
 
@@ -74,6 +75,16 @@ EvalTraceHashAlgorithm getEvalTraceHashAlgorithm()
 void setEvalTraceHashAlgorithm(EvalTraceHashAlgorithm algorithm)
 {
     activeAlgorithm.store(algorithm, std::memory_order_relaxed);
+}
+
+bool getEvalTraceDeferFlush()
+{
+    return activeDeferFlush.load(std::memory_order_relaxed);
+}
+
+void setEvalTraceDeferFlush(bool deferFlush)
+{
+    activeDeferFlush.store(deferFlush, std::memory_order_relaxed);
 }
 
 } // namespace nix::eval_trace

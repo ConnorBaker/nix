@@ -1329,3 +1329,46 @@ The branch exists because eval-trace COLD+HOT perf is unsatisfactory. After this
 - The actual lever for the branch's cold-perf problem is the async-recording line (off-thread hash +
   serialize, Layer 2b) and/or reducing what cold records — NOT producer-partition. That is a separate
   investigation; this arc is concluded.
+
+## §19. AT-SCALE ROOT CAUSE (2026-06-03) — the entire arc above was closures.gnome-ONLY; at scale §3b warm-thrashes from a context-dependent producer hash
+
+**The whole §9–§18 arc, and seven follow-on doc-calibration passes, were
+benched/reasoned on closures.gnome (7 attr-path traces) ONLY.** The first
+off-closures measurement (python3Packages, ~66K traces) overturns the
+generality of every closures-derived statement here. Full data + method:
+`doc/eval-trace/measurements/3b-at-scale-2026-06-02.md`.
+
+**What was measured.** §3b (BOTH conservative and mis-keyed-aggressive)
+warm-THRASHES at scale: 10 hot passes never converge (misses oscillate
+192↔20,637, re-recording 9.5K–54K traces each, 21–87s) vs no-§3b's stable 3.7s.
+SOUND throughout (byte-identical). SCALE-dependent (count, not a pathological
+package): stable ≤~53K traces under two different package slices; thrashes only
+at ~66K.
+
+**Root cause (CONFIRMED — code + direct DB diff).** A producer trace's deps are
+`innerDeps = snapshotEpochRange(epochStart, epochEnd)` (primops.cc:1690) — a slice
+of the GLOBAL `replayStore.epochLog_`, which grows from BOTH fresh recording AND
+`replayMemoizedDeps` replay. So a producer's hash is a function of the global
+eval-context STATE when `derivationStrict` runs — **NOT a pure content-address of
+the derivation's inputs.** The non-determinism is concrete: a nested derivation
+is sometimes FLATTENED into the producer's epoch slice and sometimes EDGED
+(depending on the process-local `producerMap` state, which differs cold↔warm). So
+the same `__ca:<drvHash>` records different deps → different hash cold vs warm.
+Direct DB diff (cold vs first warm): **503 producers recorded a different trace
+hash for the same drvHash**, cascading to 7,646 consumer changes → thrash. This
+is NOT the §14 empty-trace defect (Fix 1a holds — no empty traces); it is a
+distinct, deeper flaw.
+
+**This is the arc's own unsolved problem, now shown fatal at scale.** Making
+`innerDeps` context-independent = isolating the derivation's own input-reads from
+ambient eval context = the aggressive sub-scope isolation that §3b TRIED AND
+REVERTED as unsound (under-records ambient deps). So §3b's two shapes are a
+dilemma: the conservative shape's innerDeps are context-dependent (→ thrash at
+scale); the aggressive isolation is unsound (→ wrong results). There is no sound
++ deterministic point in the §3b design space.
+
+**Corrected conclusion.** The direction is not merely "unpromising on closures" —
+its core artifact (the producer trace) is **not a content-address**, which breaks
+warm caching at scale. OSPI/re-keying inherits `recordCAProducer`, so it inherits
+this; the edge direction is design-blocked at scale regardless of keying. The
+alternative-design analysis is `plans/eval-trace-alternative-design-2026-06-03.md`.
