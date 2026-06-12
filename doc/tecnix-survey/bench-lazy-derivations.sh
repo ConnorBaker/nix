@@ -3,10 +3,10 @@
 # Benchmark the eval-store mass-instantiation headline (PROPOSAL-LAZY-DERIVATIONS
 # §7): instantiate M distinct, source-free, build-free derivations to `.drv`
 # files with `lazy-derivations` OFF (eager: M per-`.drv` writes) vs ON (deferred
-# → one bulk `addMultipleToStore` + optional background-drain overlap), against
-# BOTH a local store and a daemon store. The headline win is claimed for the
-# DAEMON case (M protocol round-trips → one framed bulk op); the local case is
-# the control (no round-trips, so the bulk machinery's overhead shows).
+# to a demand boundary; LocalStore uses flat per-item writes with optional
+# background overlap, daemon stores use one framed `addMultipleToStore` op).
+# The headline round-trip win is claimed for the DAEMON case; the local case is
+# the control where there is no protocol round-trip to coalesce.
 #
 # NOT a correctness test (not wired into meson). Run from a built tree:
 #     doc/tecnix-survey/bench-lazy-derivations.sh [M] [reps]
@@ -35,14 +35,16 @@
 #       local    eager=2.835  lazy+overlap=2.579 (1.10x)  lazy-noov=2.772 (1.02x)
 #       daemon   eager=2.832  lazy+overlap=2.521 (1.12x)  lazy-noov=2.821 (1.00x)
 #   [elision] substitutable target, 100MB source (bench-elision.sh):
-#       eager=0.197 (source COPIED)   lazy=0.037 (source ELIDED)  → ~5x
+#       best-of-N warm runs measured ~1.4-1.7x after effect-count verification
 #
-# Read: lazy is neutral-to-faster on instantiation EVERYWHERE (the local case
-# was a ~31% regression until `writePaths` stopped routing LocalStore flushes
-# through `addMultipleToStore`'s heavyweight NAR-import path and used the flat
-# `addToStoreFromDump` instead). The async overlap (`startBackgroundDrain`) is
+# Read: lazy is neutral-to-faster in the eval-heavy and daemon regimes, but can
+# be slightly slower on tiny/write-heavy local cases. The local case was a ~31%
+# regression until `writePaths` stopped routing LocalStore flushes through
+# `addMultipleToStore`'s heavyweight NAR-import path and used the flat
+# `addToStoreFromDump` instead. The async overlap (`startBackgroundDrain`) is
 # LOAD-BEARING in the eval-heavy regime ([B]: noov ~1.00x → overlap ~1.10-1.12x,
-# hiding writes behind eval) and neutral on write-heavy ([A]); it is opt-in
+# hiding writes behind eval) and neutral-to-slightly-negative on write-heavy
+# ([A]); it is opt-in
 # (nix-instantiate only) and the build path never starts it (overlap would
 # defeat elision). The headline is [elision]: avoided source/`.drv` copies for
 # substitutable targets, dwarfing the instantiation deltas and scaling with

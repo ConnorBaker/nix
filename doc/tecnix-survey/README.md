@@ -6,8 +6,19 @@ Every claim is grounded in code read end-to-end[^codebases] or behaviour reprodu
 
 ---
 
+## TLDR
+
+- This `README.md` is the survey and motivation: Tecnix's private builtins are symptoms of missing upstream `SourceAccessor` abstractions, and the proposed upstream shape is to finish `SourceAccessor` as a lazy, composable filesystem.
+- [PROPOSAL.md](./PROPOSAL.md) is the implemented source-materialisation design: virtual source views, content-keyed projections, stable placeholders, the materialisation scheduler, filtered-shape caching, parse caching, and on-demand source copies.
+- [PROPOSAL-LAZY-DERIVATIONS.md](./PROPOSAL-LAZY-DERIVATIONS.md) is the implemented lazy `.drv` design: `AsyncPathWriter`, `makeLazyDrvStore`, deferred source copies tied to derivation materialisation, and observation-boundary drains. It is behind `lazy-derivations`, which remains default-off pending benchmark/default-policy gates.
+- Read this file for why the work exists and how it relates to Tecnix/DetSys/upstream; read the two proposals for the branch implementation details and test/law inventories.
+
+---
+
 ## Contents
 
+- [TLDR](#tldr)
+- [Document map and branch status](#document-map-and-branch-status)
 - [Review discipline](#review-discipline)
 - [1. The question](#1-the-question)
   - [1.1 Why this matters beyond tecnix](#11-why-this-matters-beyond-tecnix)
@@ -70,9 +81,20 @@ Every claim is grounded in code read end-to-end[^codebases] or behaviour reprodu
 
 ---
 
+## Document map and branch status
+
+This directory has three layers:
+
+- This `README.md` is the survey and motivation document. It compares Tecnix, Determinate Systems Nix, and upstream Nix; its upstream baseline is the local `master` branch at `NixOS/nix@2d309b18e`, which is also the merge-base of this feature branch.
+- `PROPOSAL.md` is the implementation-facing source-materialisation design. It describes the virtualising `SourceAccessor`, placeholder, scheduler, projection, filtered-shape, and parse-cache machinery implemented on this branch.
+- `PROPOSAL-LAZY-DERIVATIONS.md` is the implementation-facing lazy `.drv` materialisation design. The core design is implemented behind the `lazy-derivations` setting, which remains default-off while benchmark and review gates decide whether it should become default behaviour.
+- `REVIEW-DISCIPLINE.md` records the adversarial review method used for these documents. The benchmark scripts in this directory are supporting tools, not separate design sources of truth.
+
+---
+
 ## Review discipline
 
-Adversarial review of this document and PROPOSAL.md is governed by the rules in [REVIEW-DISCIPLINE.md](./REVIEW-DISCIPLINE.md). Read that file before editing either document. Reviews that do not exercise rules R1–R6 against load-bearing claims are rejected as citation audits.
+Adversarial review of this document and the proposal documents is governed by the rules in [REVIEW-DISCIPLINE.md](./REVIEW-DISCIPLINE.md). Read that file before editing them. Reviews that do not exercise rules R1–R6 against load-bearing claims are rejected as citation audits.
 
 ---
 

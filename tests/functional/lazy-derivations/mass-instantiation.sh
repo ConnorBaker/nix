@@ -3,7 +3,7 @@
 # LD-S1 / LD-S3 — eval-store mass instantiation (the headline lazy-derivations
 # workload, PROPOSAL-LAZY-DERIVATIONS.md §2/§7): evaluate many derivations to
 # `.drv` files with no builds. Under `lazy-derivations` the writes are deferred
-# and bulk-flushed at the resolution boundary, and the result must be
+# and drained at the resolution boundary, and the result must be
 # OBSERVATIONALLY IDENTICAL to the eager path:
 #
 #   - the same drvPaths (content-addressing ⇒ deferral cannot change identity),

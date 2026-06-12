@@ -564,11 +564,12 @@ public:
      * When `settings.lazyDerivations` is set, `derivationStrict` enqueues
      * each `.drv` here — its `drvPath` is computed eagerly (content-addressing
      * makes this exact); only the *write* is deferred — instead of writing it
-     * synchronously. Drained in bulk at the resolution boundaries (§4.2) and
-     * at `resetFileCache`; the worker also flushes any remainder when the
-     * `EvalState` is destroyed. Unlike `materialisationScheduler` this is a
-     * write-back queue, not a scheduler: a `.drv` already knows its path, so
-     * there is no walk to coalesce (Finding S1).
+     * synchronously. Drained in bulk at the resolution boundaries (§4.2).
+     * `resetFileCache` deliberately does not drain it: un-demanded `.drv`s stay
+     * deferred and may be elided when the queue is destroyed. Unlike
+     * `materialisationScheduler` this is a write-back queue, not a scheduler: a
+     * `.drv` already knows its path, so there is no walk to coalesce (Finding
+     * S1).
      */
     const ref<AsyncPathWriter> asyncPathWriter;
 
