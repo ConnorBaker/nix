@@ -2,6 +2,8 @@
 
 namespace nix {
 
+MaskSourceAccessor::~MaskSourceAccessor() = default;
+
 ref<SourceAccessor> makeMask(
     ref<SourceAccessor> base, std::shared_ptr<const std::set<CanonPath>> paths, MakeNotAllowedError makeNotAllowedError)
 {

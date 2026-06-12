@@ -30,6 +30,8 @@ struct SoundnessGuardSourceAccessor final : PathSetOp<SoundnessGuardSourceAccess
 {
     using PathSetOp::PathSetOp;
 
+    ~SoundnessGuardSourceAccessor() override;
+
     /* Algebraic shape: Layer-2-only Writer-style decoration.
        Layer-1 identity (admit everything; reads pass through);
        Layer-2 bypass on closure(R) — the cross-set fingerprint

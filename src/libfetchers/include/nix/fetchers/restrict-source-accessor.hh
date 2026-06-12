@@ -41,6 +41,8 @@ struct RestrictSourceAccessor final : PathSetOp<RestrictSourceAccessor>
 {
     using PathSetOp::PathSetOp;
 
+    ~RestrictSourceAccessor() override;
+
     /* Algebraic shape: Prism on `(sets, ∩)`.
        Layer-1 admit-closure (S ∪ ancestors-of-S ∪ {root});
        Layer-2 bypass on closure(S);

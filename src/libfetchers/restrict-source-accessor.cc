@@ -2,6 +2,8 @@
 
 namespace nix {
 
+RestrictSourceAccessor::~RestrictSourceAccessor() = default;
+
 ref<SourceAccessor> makeRestrict(
     ref<SourceAccessor> base, std::shared_ptr<const std::set<CanonPath>> paths, MakeNotAllowedError makeNotAllowedError)
 {

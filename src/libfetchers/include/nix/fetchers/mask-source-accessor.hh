@@ -29,6 +29,8 @@ struct MaskSourceAccessor final : PathSetOp<MaskSourceAccessor>
 {
     using PathSetOp::PathSetOp;
 
+    ~MaskSourceAccessor() override;
+
     /* Algebraic shape: Prism dual on `(sets, ∪)`.
        Layer-1 deny-closure (W ∪ descendants-of-W);
        Layer-2 bypass on closure(W);
