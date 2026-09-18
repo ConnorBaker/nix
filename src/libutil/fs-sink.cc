@@ -26,45 +26,7 @@ void CreateRegularFileSink::anchor() {}
 
 void RestoreSinkHooks::anchor() {}
 
-void copyRecursive(SourceAccessor & accessor, const CanonPath & from, FileSystemObjectSink & sink, const CanonPath & to)
-{
-    auto stat = accessor.lstat(from);
-
-    switch (stat.type) {
-    case SourceAccessor::tSymlink: {
-        sink.createSymlink(to, accessor.readLink(from));
-        break;
-    }
-
-    case SourceAccessor::tRegular: {
-        sink.createRegularFile(to, [&](CreateRegularFileSink & crf) {
-            if (stat.isExecutable)
-                crf.isExecutable();
-            accessor.readFile(from, crf, [&](uint64_t size) { crf.preallocateContents(size); });
-        });
-        break;
-    }
-
-    case SourceAccessor::tDirectory: {
-        sink.createDirectory(to, [&](FileSystemObjectSink & dirSink, const CanonPath & relDirPathTo) {
-            accessor.readDirectory(from, [&](SourceAccessor & subdirAccessor, const CanonPath & relDirPathFrom) {
-                for (auto & [name, _] : subdirAccessor.readDirectory(relDirPathFrom)) {
-                    copyRecursive(subdirAccessor, relDirPathFrom / name, dirSink, relDirPathTo / name);
-                }
-            });
-        });
-        break;
-    }
-
-    case SourceAccessor::tChar:
-    case SourceAccessor::tBlock:
-    case SourceAccessor::tSocket:
-    case SourceAccessor::tFifo:
-    case SourceAccessor::tUnknown:
-    default:
-        throw Error("file '%1%' has an unsupported type of %2%", from, stat.typeString());
-    }
-}
+void RegularFileWriter::anchor() {}
 
 namespace {
 
@@ -141,9 +103,20 @@ getParentFdAndName(Descriptor dirFd, const std::filesystem::path & dstPath, cons
     auto fd = parentFd.get();
     return {std::move(parentFd), fd, CanonPath::fromFilename(p.filename().native())};
 }
+
+std::tuple<AutoCloseFD, Descriptor, CanonPath> RestoreSink::parentOf(const CanonPath & path) const
+{
+    return getParentFdAndName(dirFd.get(), dstPath, path);
+}
 #endif
 
 void RestoreSink::createDirectory(const CanonPath & path, DirectoryCreatedCallback callback)
+{
+    createSubdirectory(
+        path, SubdirectoryCallback{[&](RestoreSink & subSink, const CanonPath & rel) { callback(subSink, rel); }});
+}
+
+void RestoreSink::createSubdirectory(const CanonPath & path, SubdirectoryCallback callback)
 {
     if (path.isRoot()) {
         createDirectory(path);
@@ -207,22 +180,34 @@ void RestoreSink::createDirectory(const CanonPath & path)
 #endif
 };
 
-struct RestoreRegularFile : CreateRegularFileSink, FdSink
+struct RestoreRegularFile : RegularFileWriter, FdSink
 {
     AutoCloseFD fd;
     bool startFsync = false;
     bool executable = false;
+    RestoreSinkHooks * hooks = nullptr;
+    bool finished = false;
 
-    RestoreRegularFile(bool startFSync_, AutoCloseFD fd_)
+    RestoreRegularFile(bool startFSync_, RestoreSinkHooks * hooks_, AutoCloseFD fd_)
         : FdSink(fd_.get())
         , fd(std::move(fd_))
         , startFsync(startFSync_)
         , executable(false)
+        , hooks(hooks_)
     {
         isRegularFile = true; /* Hint for copying contents via CoW copy_file_range. */
     }
 
     void anchor() override;
+
+    void finish() override
+    {
+        assert(!finished);
+        finished = true;
+        flush();
+        if (hooks)
+            hooks->regularFileCreated(fd.get(), executable);
+    }
 
     ~RestoreRegularFile()
     {
@@ -250,10 +235,11 @@ struct RestoreRegularFile : CreateRegularFileSink, FdSink
 
 void RestoreRegularFile::anchor() {}
 
-void RestoreSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
+std::unique_ptr<RegularFileWriter> RestoreSink::beginRegularFile(const CanonPath & path)
 {
-    auto crf = RestoreRegularFile(
+    auto crf = std::make_unique<RestoreRegularFile>(
         startFsync,
+        hooks,
 #ifdef _WIN32
         CreateFileW(
             append(dstPath, path).c_str(),
@@ -273,12 +259,16 @@ void RestoreSink::createRegularFile(const CanonPath & path, fun<void(CreateRegul
         }()
 #endif
     );
-    if (!crf.fd)
+    if (!crf->fd)
         throw NativeSysError("creating file %1%", PathFmt(append(dstPath, path)));
-    func(crf);
-    crf.flush();
-    if (hooks)
-        hooks->regularFileCreated(crf.fd.get(), crf.executable);
+    return crf;
+}
+
+void RestoreSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
+{
+    auto writer = beginRegularFile(path);
+    func(*writer);
+    writer->finish();
 }
 
 void RestoreRegularFile::isExecutable()

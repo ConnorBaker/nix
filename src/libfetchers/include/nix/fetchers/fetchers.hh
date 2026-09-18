@@ -77,7 +77,7 @@ public:
 
     /**
      * Return whether this is a "locked" input, that is, it has
-     * attributes like a Git revision or NAR hash that uniquely
+     * attributes like a Git revision or tree hash that uniquely
      * identify its contents.
      */
     bool isLocked(const Settings & settings) const;
@@ -155,10 +155,31 @@ public:
 
     std::string getName() const;
 
+    /**
+     * The store path of the input's tree, from its `treeHash`:
+     * `makeFixedOutputPathFromCA(name, {Git, treeHash})`.
+     *
+     * @throws Error when the input has no `treeHash`.
+     */
     StorePath computeStorePath(Store & store) const;
 
     // Convenience functions for common attributes.
     std::string getType() const;
+
+    /**
+     * The attribute `treeHash`: the git tree (object) hash of the input's
+     * root, SHA-256 in SRI form -- the value the store's object hash
+     * renders (doc/lazy-store/01-specification.md, section 9.11).
+     *
+     * @throws UsageError when it is not SHA-256.
+     */
+    std::optional<Hash> getTreeHash() const;
+
+    /**
+     * The attribute `narHash`: an old assertion (a version-7 lock, a
+     * `?narHash=`), verified by the shim `assertNarHash` and never set by
+     * a fetch.
+     */
     std::optional<Hash> getNarHash() const;
     std::optional<std::string> getRef() const;
     std::optional<Hash> getRev() const;
@@ -216,13 +237,21 @@ struct InputScheme
     };
 
     /**
+     * The scheme's own attributes; `allowedAttrs` adds the ones every
+     * scheme accepts.
+     */
+    virtual const std::map<std::string, AttributeInfo> & schemeAttrs() const = 0;
+
+    /**
      * Allowed attributes in an attribute set that is converted to an
-     * input, and documentation for each attribute.
+     * input, and documentation for each attribute: the scheme's own and
+     * the content hashes every scheme accepts, `narHash` and `treeHash`
+     * (01 §9.11), in one place.
      *
      * `type` is not included from this map, because the `type` field is
       parsed first to choose which scheme; `type` is always required.
      */
-    virtual const std::map<std::string, AttributeInfo> & allowedAttrs() const = 0;
+    std::map<std::string, AttributeInfo> allowedAttrs() const;
 
     virtual ParsedURL toURL(const Input & input) const;
 

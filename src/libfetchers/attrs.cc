@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <limits>
+
 namespace nix::fetchers {
 
 ResolvedAttr forceAttr(const Attr & attr)
@@ -49,6 +51,147 @@ nlohmann::json attrsToJSON(const Attrs & attrs)
             unreachable();
     }
     return json;
+}
+
+static void appendLengthPrefixed(std::string & out, std::string_view bytes)
+{
+    out += std::to_string(bytes.size());
+    out += ':';
+    out += bytes;
+}
+
+std::string encodeAttrs(const Attrs & attrs)
+{
+    std::string out;
+    for (auto & [name, attr] : attrs) {
+        auto resolved = forceAttr(attr);
+        std::visit(
+            overloaded{
+                [&](const std::string & v) {
+                    out += 's';
+                    appendLengthPrefixed(out, name);
+                    appendLengthPrefixed(out, v);
+                },
+                [&](uint64_t v) {
+                    out += 'i';
+                    appendLengthPrefixed(out, name);
+                    out += std::to_string(v);
+                    out += ';';
+                },
+                [&](const Explicit<bool> & v) {
+                    out += 'b';
+                    appendLengthPrefixed(out, name);
+                    out += v.t ? '1' : '0';
+                },
+            },
+            resolved);
+    }
+    return out;
+}
+
+namespace {
+
+/**
+ * A cursor over an encoding; every read checks the end first.
+ */
+struct AttrsDecoder
+{
+    std::string_view rest;
+
+    [[noreturn]] void fail(const char * what)
+    {
+        throw Error("malformed attribute encoding: %s", what);
+    }
+
+    char byte()
+    {
+        if (rest.empty())
+            fail("unexpected end");
+        char c = rest.front();
+        rest.remove_prefix(1);
+        return c;
+    }
+
+    /**
+     * A canonical decimal number up to and including `terminator`: at
+     * least one digit, no leading zero unless the number is zero, and
+     * fitting a `uint64_t`.
+     */
+    uint64_t decimal(char terminator)
+    {
+        uint64_t value = 0;
+        size_t digits = 0;
+        for (;;) {
+            char c = byte();
+            if (c == terminator)
+                break;
+            if (c < '0' || c > '9')
+                fail("expected a digit");
+            if (digits == 1 && value == 0)
+                fail("a number with a leading zero");
+            uint64_t digit = c - '0';
+            if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10)
+                fail("a number too large");
+            value = value * 10 + digit;
+            digits++;
+        }
+        if (digits == 0)
+            fail("expected a number");
+        return value;
+    }
+
+    std::string_view bytes(uint64_t length)
+    {
+        if (length > rest.size())
+            fail("a length past the end");
+        auto result = rest.substr(0, length);
+        rest.remove_prefix(length);
+        return result;
+    }
+
+    std::string_view lengthPrefixed()
+    {
+        return bytes(decimal(':'));
+    }
+};
+
+} // namespace
+
+Attrs decodeAttrs(std::string_view encoded)
+{
+    AttrsDecoder in{encoded};
+    Attrs attrs;
+    std::optional<std::string_view> previousName;
+    while (!in.rest.empty()) {
+        char tag = in.byte();
+        auto name = in.lengthPrefixed();
+        if (previousName && !(*previousName < name))
+            in.fail("attribute names out of order");
+        Attr value;
+        switch (tag) {
+        case 's':
+            value = std::string(in.lengthPrefixed());
+            break;
+        case 'i':
+            value = in.decimal(';');
+            break;
+        case 'b': {
+            char c = in.byte();
+            if (c == '0')
+                value = Explicit<bool>{false};
+            else if (c == '1')
+                value = Explicit<bool>{true};
+            else
+                in.fail("expected '0' or '1' for a Boolean");
+            break;
+        }
+        default:
+            in.fail("unknown type tag");
+        }
+        attrs.emplace_hint(attrs.end(), std::string(name), std::move(value));
+        previousName = name;
+    }
+    return attrs;
 }
 
 std::optional<LazyAttr> maybeGetLazyAttr(const Attrs & attrs, const std::string & name)

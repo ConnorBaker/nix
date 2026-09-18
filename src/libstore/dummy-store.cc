@@ -1,5 +1,6 @@
 #include "nix/store/store-registration.hh"
 #include "nix/util/archive.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/callback.hh"
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/util/json-utils.hh"
@@ -165,10 +166,10 @@ public:
             if (auto accessor_ = getMemoryFSAccessor(path)) {
                 ref<MemorySourceAccessor> accessor = ref{std::move(accessor_)};
                 /* compute path info on demand */
-                auto narHash =
-                    hashPath({accessor, CanonPath::root}, FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256);
-                auto info = std::make_shared<ValidPathInfo>(path, UnkeyedValidPathInfo{*this, narHash.hash});
-                info->narSize = narHash.numBytesDigested;
+                auto object = objectHashOf(*accessor, CanonPath::root);
+                auto info =
+                    std::make_shared<ValidPathInfo>(path, UnkeyedValidPathInfo{*this, ObjectHash::of(object.root)});
+                info->narSize = object.narSize;
                 info->ca = ContentAddress{
                     .method = ContentAddressMethod::Raw::Text,
                     .hash = hashString(
@@ -281,7 +282,7 @@ public:
         }
 
         auto hash = hashPath({temp, CanonPath::root}, hashMethod.getFileIngestionMethod(), hashAlgo).first;
-        auto narHash = hashPath({temp, CanonPath::root}, FileIngestionMethod::NixArchive, HashAlgorithm::SHA256);
+        auto object = objectHashOf(*temp, CanonPath::root);
 
         auto info = ValidPathInfo::makeFromCA(
             *this,
@@ -295,9 +296,9 @@ public:
                     // this is content-addressed without modulus
                     .self = false,
                 }),
-            std::move(narHash.first));
+            ObjectHash::of(object.root));
 
-        info.narSize = narHash.second.value();
+        info.narSize = object.narSize;
 
         auto path = info.path;
         auto accessor = make_ref<MemorySourceAccessor>(std::move(*temp));

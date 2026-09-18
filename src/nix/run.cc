@@ -1,5 +1,7 @@
 #include "nix/util/current-process.hh"
 #include "run.hh"
+
+#include <type_traits>
 #include "nix/cmd/command-installable-value.hh"
 #include "nix/main/shared.hh"
 #include "nix/util/signals.hh"
@@ -35,11 +37,23 @@ Strings toEnvp(StringMap env)
     return envStrs;
 }
 
+int execvpAfterEvaluation(const char * program, char * const * argv, FinishedEvaluation)
+{
+    return execvp(program, argv);
+}
+
+/* An exec compiles only after `EvalState::finish()`: neither helper is callable without the token. */
+static_assert(
+    !std::
+        is_invocable_v<decltype(execProgramInStore), ref<Store>, UseLookupPath, const std::string &, const Strings &>);
+static_assert(!std::is_invocable_v<decltype(execvpAfterEvaluation), const char *, char * const *>);
+
 void execProgramInStore(
     ref<Store> store,
     UseLookupPath useLookupPath,
     const std::string & program,
     const Strings & args,
+    FinishedEvaluation,
     std::optional<std::string_view> system,
     std::optional<StringMap> env)
 {
@@ -160,13 +174,13 @@ struct CmdRun : InstallableValueCommand, MixEnvironment
         for (auto & i : args)
             allArgs.push_back(i);
 
-        // Release our references to eval caches to ensure they are persisted to disk, because
-        // we are about to exec out of this process without running C++ destructors.
-        state->evalCaches.clear();
+        /* Finished before the environment is replaced: the final write may
+           open a store connection that needs it.  Nothing evaluates after. */
+        auto finished = state->finish();
 
         setEnviron();
 
-        execProgramInStore(store, UseLookupPath::DontUse, app.program.string(), allArgs);
+        execProgramInStore(store, UseLookupPath::DontUse, app.program.string(), allArgs, std::move(finished));
     }
 };
 

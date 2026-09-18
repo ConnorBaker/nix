@@ -241,7 +241,9 @@ std::string SQLiteStmt::Use::getStr(int col)
     auto s = (const char *) sqlite3_column_text(stmt, col);
     // FIXME: Don't crash on nulls?
     assert(s);
-    return s;
+    /* The length, not the first NUL: the fetcher cache's rows may hold one.
+       (`sqlite3_column_bytes` after `sqlite3_column_text`, as SQLite asks.) */
+    return std::string(s, sqlite3_column_bytes(stmt, col));
 }
 
 int64_t SQLiteStmt::Use::getInt(int col)

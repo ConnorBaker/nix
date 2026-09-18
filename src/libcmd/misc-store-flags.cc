@@ -82,6 +82,11 @@ Args::Flag fileIngestionMethod(FileIngestionMethod * method)
       Assumes that the input is a single file and
       [directly passes](@docroot@/store/file-system-object/content-address.md#serial-flat)
       it to the hash function.
+
+    - `git`:
+      Hashes the input as Git does, files as blobs and directories as trees
+      ([Git](@docroot@/store/file-system-object/content-address.md#git)).
+      SHA-256 only.
         )",
         .labels = {"file-ingestion-method"},
         .handler = {[method](std::string s) { *method = parseFileIngestionMethod(s); }},
@@ -107,6 +112,11 @@ Args::Flag contentAddressMethod(ContentAddressMethod * method)
       Assumes that the input is a single file and
       [directly passes](@docroot@/store/file-system-object/content-address.md#serial-flat)
       it to the hash function.
+
+    - [`git`](@docroot@/store/store-object/content-address.md#method-git):
+      Hashes the input as Git does, files as blobs and directories as trees;
+      the method by which the store names every object.
+      SHA-256 only.
 
     - [`text`](@docroot@/store/store-object/content-address.md#method-text):
       Like `flat`, but used for

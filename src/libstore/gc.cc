@@ -695,9 +695,13 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                              * derivation if we can also delete all its outputs, so visit the derivation outputs. */
                             if (gcSettings.keepDerivations && path->isDerivation())
                                 for (auto & [name, maybeOutPath] : queryPartialDerivationOutputMap(*path))
-                                    if (maybeOutPath && isValidPath(*maybeOutPath)
-                                        && queryPathInfo(*maybeOutPath)->deriver == path)
-                                        enqueue(*maybeOutPath);
+                                    if (maybeOutPath && isValidPath(*maybeOutPath))
+                                        /* The row as it is: the output may be
+                                           garbage too, and its deriver is a row
+                                           field (`queryPathInfoUnmigrated`). */
+                                        if (auto out = queryPathInfoUnmigrated(*maybeOutPath);
+                                            out && out->deriver == path)
+                                            enqueue(*maybeOutPath);
 
                             /* If keep-outputs is set, we only want to delete this path if we
                              * can also delete its derivers, so visit the derivers. */
@@ -712,7 +716,18 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     options.pathsToDelete);
             }
         }
-        for (auto & path : topoSortPaths(visited)) {
+        /* Every path in `visited` is about to be deleted, and the sort needs
+           its references alone, a row field: the rows are read as the
+           database has them, so a schema-10 row is not migrated -- the
+           walk reading and hashing every byte of a path on its way out --
+           before it is deleted (`queryPathInfoUnmigrated`; the live rows
+           `computeFSClosure` reached above are migrated by its queries, and
+           kept). */
+        auto unmigratedReferences = [&](const StorePath & path) -> StorePathSet {
+            auto info = queryPathInfoUnmigrated(path);
+            return info ? info->references : StorePathSet{};
+        };
+        for (auto & path : topoSortPathsBy(visited, unmigratedReferences)) {
             if (!dead.insert(path).second)
                 continue;
             if (shouldDelete) {
@@ -807,12 +822,13 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     /* Read the store and delete all paths that are invalid or
                     unreachable. We don't use readDirectory() here so that
                     GCing can start faster. */
-                    auto linksName = linksDir.filename();
+                    /* `.links` is the legacy table `removeLegacyLinks` removes below. */
+                    auto objectsName = objects.dir.filename();
                     struct dirent * dirent;
                     while (errno = 0, dirent = readdir(dir.get())) {
                         checkInterrupt();
                         std::string name = dirent->d_name;
-                        if (name == "." || name == ".." || name == linksName)
+                        if (name == "." || name == ".." || name == ".links" || name == objectsName)
                             continue;
 
                         if (auto storePath = maybeParseStorePath(storeDir + "/" + name))
@@ -838,56 +854,54 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         return;
     }
 
-    /* Unlink all files in /nix/store/.links that have a link count of 1,
-       which indicates that there are no other links and so they can be
-       safely deleted.  FIXME: race condition with optimisePath(): we
-       might see a link count of 1 just before optimisePath() increases
-       the link count. */
-    if (options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific) {
-        printInfo("deleting unused links...");
+    /* The figure a specific delete reports counts a file at two links as
+       freed on the assumption that the other link is the object store's
+       (`deletePath`, unix/file-system.cc); no sweep follows here (01 §10,
+       *The object store is swept on whole-store collections only*), so
+       those bytes are freed at the next whole-store collection.  The
+       accounting stays physical (01 §10, *`max-free` counts the bytes a
+       deletion frees on the disk*); the report says when the bytes go. */
+    if (options.action == GCOptions::gcDeleteSpecific && results.bytesFreed)
+        /* At `notice`: the new CLI runs at that level on a terminal
+           (main.cc), and the note is for the interactive user who reads
+           the freed figure `printFreed` writes to stdout. */
+        notice("note: bytes the deleted paths shared with the object store are reclaimed at the next `nix-store --gc`");
 
-        AutoCloseDir dir(opendir(linksDir.string().c_str()));
-        if (!dir)
-            throw SysError("opening directory %1%", PathFmt(linksDir));
+    if (options.action == GCOptions::gcDeleteDead && !ownsObjectStore())
+        /* The overlay store (`ownsObjectStore`): what the merged store
+           directory shows under `.objects` and `.links` is the lower
+           store's as well, and an unlink there is a whiteout of a shared
+           file. */
+        printInfo("note: the object store is shared with the lower store and is not swept here");
 
-        int64_t actualSize = 0, unsharedSize = 0;
+    if (options.action == GCOptions::gcDeleteDead && ownsObjectStore()) {
+        /* An older Nix's `.links` (01 §10, *the collector removes a legacy
+           `.links` directory*): master unlinked its dead entries on every
+           collection; the whole directory goes here. */
+        removeLegacyLinks();
 
-        struct dirent * dirent;
-        while (errno = 0, dirent = readdir(dir.get())) {
-            checkInterrupt();
-            std::string name = dirent->d_name;
-            if (name == "." || name == "..")
-                continue;
-            auto path = linksDir / name;
-
-            auto st = lstat(path);
-
-            if (st.st_nlink != 1) {
-                actualSize += st.st_size;
-                unsharedSize += (st.st_nlink - 1) * st.st_size;
-                continue;
-            }
-
-            printMsg(lvlTalkative, "deleting unused link %1%", PathFmt(path));
-
-            unlink(path);
-
-            /* Do not account for deleted file here. Rely on deletePath()
-               accounting.  */
-        }
-
-        int64_t overhead =
-#ifdef _WIN32
-            0
-#else
-            [&] {
-                auto st = stat(linksDir);
-                return st.st_blocks * 512ULL;
-            }()
-#endif
-            ;
-
-        printInfo("note: hard linking is currently saving %s", renderSize(unsharedSize - actualSize - overhead));
+        /* The object store's sweep (01 §9.10, "Collection"; `sweep` in
+           git-object-store.hh), on a whole-store collection alone (01 §10,
+           *The object store is swept on whole-store collections only*): its
+           cost is the store's, which `nix store delete` of one path must not
+           pay. */
+        auto swept =
+            objects.sweep([&](fun<void(const ObjectHash &)> live) { return forEachValidObjectHash(std::move(live)); });
+        /* Two commands migrate rows (`nix store migrate`, and `--optimise`,
+           which enters the paths too); a row neither can migrate -- its
+           path modified or its files missing (`walkOldRow`) -- needs the
+           verifier: `--check-contents --repair` for the former, plain
+           `--verify`, which removes the row, for the latter. */
+        if (swept.unmigrated)
+            printInfo(
+                "note: %d paths not yet migrated to the object hash; the object store was not swept. "
+                "Run `nix store migrate` or `nix-store --optimise`; a path they report as modified needs "
+                "`nix-store --verify --check-contents --repair`, one whose files are missing `nix-store --verify`.",
+                swept.unmigrated);
+        if (swept.treesRemoved || swept.blobsRemoved)
+            printInfo("removed %d unreferenced objects (%d trees)", swept.blobsRemoved, swept.treesRemoved);
+        if (swept.blobsKept)
+            printInfo("note: the object store is currently saving %s", renderSize(swept.sharedBytes));
     }
 
     /* While we're at it, vacuum the database. */
@@ -899,9 +913,13 @@ void LocalStore::autoGC(bool sync)
 #if HAVE_STATVFS
     const auto & gcSettings = config->getLocalSettings().getGCSettings();
 
-    static auto fakeFreeSpaceFile = getEnv("_NIX_TEST_FREE_SPACE_FILE");
+    /* Read here and carried into the collector thread by value: that thread
+       can outlive `main` (the destructor joins it during static
+       destruction), so a function-local static read there is a use after
+       its destruction. */
+    auto fakeFreeSpaceFile = getEnv("_NIX_TEST_FREE_SPACE_FILE");
 
-    auto getAvail = [this]() -> uint64_t {
+    auto getAvail = [this, fakeFreeSpaceFile]() -> uint64_t {
         if (fakeFreeSpaceFile)
             return std::stoll(readFile(*fakeFreeSpaceFile));
 

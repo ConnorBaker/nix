@@ -1,12 +1,13 @@
 #include "nix/util/nar-listing.hh"
 #include "nix/util/archive.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/error.hh"
 
 #include <stack>
 
 namespace nix {
 
-NarListing parseNarListing(Source & source)
+static NarListing parseNarListing(Source & source, FileSystemObjectSink * also)
 {
     struct NarMemberConstructor : CreateRegularFileSink
     {
@@ -121,8 +122,22 @@ NarListing parseNarListing(Source & source)
     };
 
     NarIndexer indexer(source);
-    parseDump(indexer, indexer);
+    if (also) {
+        TeeFileSystemObjectSink both{indexer, *also};
+        parseDump(both, indexer);
+    } else
+        parseDump(indexer, indexer);
     return std::move(*indexer.root);
+}
+
+NarListing parseNarListing(Source & source)
+{
+    return parseNarListing(source, nullptr);
+}
+
+NarListing parseNarListing(Source & source, FileSystemObjectSink & also)
+{
+    return parseNarListing(source, &also);
 }
 
 template<bool deep>

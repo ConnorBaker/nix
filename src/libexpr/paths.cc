@@ -2,6 +2,8 @@
 #include "nix/expr/eval.hh"
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/fetchers/fetch-to-store.hh"
+#include "nix/fetchers/fetch-settings.hh"
+#include "nix/fetchers/attrs.hh"
 
 namespace nix {
 
@@ -36,7 +38,7 @@ void EvalState::ensureLazyPathCopied(const StorePath & path)
         fetchSettings,
         *store,
         SourcePath{ref(mount)},
-        /* Force a copy. mountInput does a dryRun to just calculate the storePath and narHash. */
+        /* Force a copy. mountInput does a dryRun to just calculate the storePath and tree hash. */
         FetchMode::Copy,
         path.name());
 
@@ -60,31 +62,23 @@ void EvalState::ensureLazyPathsCopied(const NixStringContext & context)
             ensureLazyPathCopied(o->path);
 }
 
-StorePath
-EvalState::mountInput(fetchers::Input & input, const fetchers::Input & originalInput, ref<SourceAccessor> accessor)
+StorePath EvalState::mountInput(fetchers::Input & input, ref<SourceAccessor> accessor)
 {
-    /* To mount the input, dryRun is sufficient. We still compute the narHash (to check for mismatches) and the store
-       path to figure out where to mount it. TODO: This could be relaxed in the future by making outPath and narHash
-       lazier. Good code that doesn't do `toString ./.` or otherwise inspects the outPath string and only uses it for
-       doing relative imports does not even require computing the store path. That is a big invasive change though and
-       would require having a special "LazyStorePathString" thunk. narHash also doesn't need to be computed eagerly in
-       case it's not actually specified (like during local development with a dirty tree) - in that case narHash could
-       also become a lazy app/thunk that shares the state with the storePath delayed computation. */
-    auto [storePath, narHash] = fetchToStore2(fetchSettings, *store, accessor, FetchMode::DryRun, input.getName());
+    /* A dry run names the tree: the store path, to know where to mount it,
+       and the tree hash (doc/lazy-store/04-derivation.md, section 1.9). */
+    auto [storePath, hash] = fetchToStore2(fetchSettings, *store, accessor, FetchMode::DryRun, input.getName());
 
     allowPath(storePath); // FIXME: should just whitelist the entire virtual store
 
     storeFS->mount(CanonPath(store->printStorePath(storePath)), accessor);
 
-    input.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
-
-    if (originalInput.getNarHash() && narHash != *originalInput.getNarHash())
-        throw Error(
-            (unsigned int) 102,
-            "NAR hash mismatch in input '%s', expected '%s' but got '%s'",
-            originalInput.to_string(),
-            narHash.to_string(HashFormat::SRI, true),
-            originalInput.getNarHash()->to_string(HashFormat::SRI, true));
+    /* `input` is what `Input::getAccessor` returned: whatever the original
+       asserted has been verified there and the `narHash` replaced by
+       `treeHash`.  The tree hash is set here too, for an input that asserted
+       neither. */
+    if (input.getNarHash())
+        throw Error("input '%s' still carries a narHash after verification", input.to_string());
+    input.attrs.insert_or_assign("treeHash", hash.to_string(HashFormat::SRI, true));
 
     return storePath;
 }

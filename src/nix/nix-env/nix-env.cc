@@ -900,6 +900,7 @@ queryJSON(Globals & globals, std::vector<PackageInfo> & elems, bool printOutPath
 {
     using nlohmann::json;
     json topObj = json::object();
+    NixStringContext context;
     for (auto & i : elems) {
         try {
             if (i.hasFailed())
@@ -942,10 +943,8 @@ queryJSON(Globals & globals, std::vector<PackageInfo> & elems, bool printOutPath
                     if (!v) {
                         printError("derivation '%s' has invalid meta attribute '%s'", i.queryName(), j);
                         metaObj[j] = nullptr;
-                    } else {
-                        NixStringContext context;
+                    } else
                         metaObj[j] = printValueAsJSON(*globals.state, true, *v, noPos, context);
-                    }
                 }
             }
         } catch (AssertionError & e) {
@@ -955,7 +954,7 @@ queryJSON(Globals & globals, std::vector<PackageInfo> & elems, bool printOutPath
             throw;
         }
     }
-    std::cout << topObj.dump(2);
+    std::cout << globals.state->realise(topObj.dump(2));
 }
 
 static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
@@ -1232,7 +1231,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
                         else {
                             if (v->type() == nString) {
                                 attrs2["type"] = "string";
-                                attrs2["value"] = v->string_view();
+                                attrs2["value"] = globals.state->realise(*v).view();
                                 xml.writeEmptyElement("meta", attrs2);
                             } else if (v->type() == nInt) {
                                 attrs2["type"] = "int";
@@ -1253,7 +1252,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
                                     if (elem->type() != nString)
                                         continue;
                                     XMLAttrs attrs3;
-                                    attrs3["value"] = elem->string_view();
+                                    attrs3["value"] = globals.state->realise(*elem).view();
                                     xml.writeEmptyElement("string", attrs3);
                                 }
                             } else if (v->type() == nAttrs) {
@@ -1264,7 +1263,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
                                         continue;
                                     XMLAttrs attrs3;
                                     attrs3["type"] = globals.state->symbols[i.name];
-                                    attrs3["value"] = i.value->string_view();
+                                    attrs3["value"] = globals.state->realise(*i.value).view();
                                     xml.writeEmptyElement("string", attrs3);
                                 }
                             }
@@ -1530,6 +1529,9 @@ static int main_nix_env(int argc, char ** argv)
         }
 
         op(globals, std::move(opFlags), std::move(opArgs));
+
+        /* Written before the command ends, and a failure is the command's failure. */
+        globals.state->flushPendingWrites();
 
         globals.state->maybePrintStats();
 

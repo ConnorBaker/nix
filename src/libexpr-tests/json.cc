@@ -10,10 +10,8 @@ class JSONValueTest : public LibExprTest
 protected:
     std::string getJSONValue(Value & value)
     {
-        std::stringstream ss;
         NixStringContext ps;
-        printValueAsJSON(state, true, value, noPos, ss, ps);
-        return ss.str();
+        return renderValueAsJSON(state, true, value, noPos, ps);
     }
 };
 

@@ -33,8 +33,10 @@ json printValueAsJSON(
         break;
 
     case nString:
-        copyContext(v, context);
-        out = v.string_view();
+        /* Not a sink, in either overload: the result may become a value again
+           (`builtins.toJSON`, structured attributes).  Whoever emits it
+           realises with `context`. */
+        out = state.forceString(v, context, pos, "while serialising a string to JSON");
         break;
 
     case nPath:
@@ -112,17 +114,11 @@ json printValueAsJSON(
 
 void JSONSerializationError::anchor() {}
 
-void printValueAsJSON(
-    EvalState & state,
-    bool strict,
-    Value & v,
-    const PosIdx pos,
-    std::ostream & str,
-    NixStringContext & context,
-    bool copyToStore)
+std::string renderValueAsJSON(
+    EvalState & state, bool strict, Value & v, const PosIdx pos, NixStringContext & context, bool copyToStore)
 {
     try {
-        str << printValueAsJSON(state, strict, v, pos, context, copyToStore);
+        return printValueAsJSON(state, strict, v, pos, context, copyToStore).dump();
     } catch (nlohmann::json::exception & e) {
         throw JSONSerializationError("JSON serialization error: %s", e.what());
     }

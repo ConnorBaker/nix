@@ -190,7 +190,26 @@ private:
      * corresponding `NarInfo`. The returned `NarInfo` is neither signed
      * nor published yet; call `uploadNarInfo()` to do that.
      */
-    ref<NarInfo> uploadData(Source & narSource, RepairFlag repair, fun<ValidPathInfo(HashResult)> mkInfo);
+    /**
+     * What one pass over an uploaded NAR yields besides the compressed
+     * file: its NAR hash and size from the tee, and its object hash from
+     * the `ObjectHashSink` driven beside the listing indexer.
+     */
+    struct UploadedNar
+    {
+        HashResult nar;
+        ObjectHash objectHash;
+    };
+
+    /**
+     * Upload the NAR and return its `.narinfo`.  The info `mkInfo`
+     * returns is checked against the stream: an `objectHash` or an
+     * `assertedNarHash` it carries must match what was hashed, and a
+     * non-zero `narSize` the size; then the `.narinfo` gets both hashes
+     * (`ObjectHash:` and `NarHash:`, the latter free from the tee) and
+     * the size.
+     */
+    ref<NarInfo> uploadData(Source & narSource, RepairFlag repair, fun<ValidPathInfo(const UploadedNar &)> mkInfo);
 
     /**
      * Sign and publish the `.narinfo` file for a path whose NAR has
@@ -201,7 +220,7 @@ private:
     void uploadNarInfo(ref<NarInfo> narInfo);
 
     ref<const ValidPathInfo> addToStoreCommon(
-        Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(HashResult)> mkInfo);
+        Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(const UploadedNar &)> mkInfo);
 
     /**
      * Same as `getFSAccessor`, but with a more preceise return type.

@@ -50,7 +50,8 @@ std::string resolveMirrorUrl(EvalState & state, const std::string & url)
         throw Error("mirror URL '%s' did not expand to anything", url);
 
     std::string mirror(
-        state.forceString(*mirrorList->value->listView()[0], noPos, "while evaluating the first available mirror"));
+        state.realise(*mirrorList->value->listView()[0], noPos, "while evaluating the first available mirror")
+            .toOwned());
     return mirror + (hasSuffix(mirror, "/") ? "" : "/") + s.substr(p + 1);
 }
 
@@ -227,24 +228,29 @@ static int main_nix_prefetch_url(int argc, char ** argv)
             state->forceList(*attr->value, noPos, "while evaluating the urls to prefetch");
             if (attr->value->listSize() < 1)
                 throw Error("'urls' list is empty");
-            url = state->forceString(
-                *attr->value->listView()[0], noPos, "while evaluating the first url from the urls list");
+            url =
+                state->realise(*attr->value->listView()[0], noPos, "while evaluating the first url from the urls list")
+                    .toOwned();
 
             /* Extract the hash mode. */
             auto attr2 = v.attrs()->get(state->symbols.create("outputHashMode"));
             if (!attr2)
                 printInfo("warning: this does not look like a fetchurl call");
             else
-                unpack = state->forceString(
-                             *attr2->value, noPos, "while evaluating the outputHashMode of the source to prefetch")
-                         == "recursive";
+                unpack =
+                    state
+                        ->realise(*attr2->value, noPos, "while evaluating the outputHashMode of the source to prefetch")
+                        .view()
+                    == "recursive";
 
-            /* Extract the name. */
+            /* Extract the name.  The condition was inverted: the attribute
+               was read exactly when it was missing, which dereferenced a null
+               pointer, and ignored when present. */
             if (!name) {
                 auto attr3 = v.attrs()->get(state->symbols.create("name"));
-                if (!attr3)
-                    name =
-                        state->forceString(*attr3->value, noPos, "while evaluating the name of the source to prefetch");
+                if (attr3)
+                    name = state->realise(*attr3->value, noPos, "while evaluating the name of the source to prefetch")
+                               .toOwned();
             }
         }
 

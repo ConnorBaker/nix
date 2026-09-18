@@ -17,7 +17,7 @@
 #include "nix/util/thread-pool.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/callback.hh"
-#include "nix/util/git.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/environment-variables.hh"
@@ -304,16 +304,18 @@ digraph graphname {
     node [shape=box]
     fileSource -> narSink
     narSink [style=dashed]
-    narSink -> unusualHashTee [style = dashed, label = "Recursive && !SHA-256"]
-    narSink -> narHashSink [style = dashed, label = "else"]
-    unusualHashTee -> narHashSink
-    unusualHashTee -> caHashSink
+    narSink -> caHashSink [style = dashed, label = "Recursive && !SHA-256"]
+    narSink -> narHashSink [style = dashed, label = "Recursive && SHA-256"]
     fileSource -> parseSink
     parseSink [style=dashed]
     parseSink-> fileSink [style = dashed, label = "Flat"]
-    parseSink -> blank [style = dashed, label = "Recursive"]
+    parseSink -> objectSink [style = dashed, label = "Recursive or Git"]
     fileSink -> caHashSink
 }
+
+For the git method under SHA-256 the content address is the object hash of
+the root `objectSink` computed from the same stream, so this is one walk of
+the source to name it and one to add it.
 */
 ValidPathInfo Store::addToStoreSlow(
     std::string_view name,
@@ -323,18 +325,29 @@ ValidPathInfo Store::addToStoreSlow(
     const StorePathSet & references,
     std::optional<Hash> expectedCAHash)
 {
-    HashSink narHashSink{HashAlgorithm::SHA256};
+    checkIngestionAlgorithm(method.getFileIngestionMethod(), hashAlgo);
+
+    /* The NAR stream is hashed only where the result is used: it is the
+       content hash under the NAR method with SHA-256.  Under the NAR method
+       with another algorithm the stream is the content hash's input
+       instead. */
+    bool narHashIsCA = method == ContentAddressMethod::Raw::NixArchive && hashAlgo == HashAlgorithm::SHA256;
+    bool caFromNar = method == ContentAddressMethod::Raw::NixArchive && hashAlgo != HashAlgorithm::SHA256;
+    std::optional<HashSink> narHashSink;
+    if (narHashIsCA)
+        narHashSink.emplace(HashAlgorithm::SHA256);
     HashSink caHashSink{hashAlgo};
 
-    /* Note that fileSink and unusualHashTee must be mutually exclusive, since
-       they both write to caHashSink. Note that that requisite is currently true
-       because the former is only used in the flat case. */
+    /* Note that fileSink and narSink must never both write to caHashSink;
+       they do not, since the former is used only in the flat case and the
+       latter feeds it only under the NAR method. */
     RegularFileSink fileSink{caHashSink};
-    TeeSink unusualHashTee{narHashSink, caHashSink};
-
-    auto & narSink = method == ContentAddressMethod::Raw::NixArchive && hashAlgo != HashAlgorithm::SHA256
-                         ? static_cast<Sink &>(unusualHashTee)
-                         : narHashSink;
+    LambdaSink narSink{[&](std::string_view data) {
+        if (narHashSink)
+            (*narHashSink)(data);
+        if (caFromNar)
+            caHashSink(data);
+    }};
 
     /* Functionally, this means that fileSource will yield the content of
        srcPath. The fact that we use scratchpadSink as a temporary buffer here
@@ -345,21 +358,28 @@ ValidPathInfo Store::addToStoreSlow(
        information to narSink. */
     TeeSource tapped{*fileSource, narSink};
 
-    NullFileSystemObjectSink blank;
+    /* The object hash is computed for every method; the flat method's
+       content hash needs the file's bytes as well, through `fileSink`, so
+       there the parse is delivered to both. */
+    ObjectHashSink objectSink;
+    TeeFileSystemObjectSink flatTee{fileSink, objectSink};
     auto & parseSink = method.getFileIngestionMethod() == FileIngestionMethod::Flat
-                           ? (FileSystemObjectSink &) fileSink
-                           : (FileSystemObjectSink &) blank; // for recursive or git we do recursive
+                           ? (FileSystemObjectSink &) flatTee
+                           : (FileSystemObjectSink &) objectSink; // for recursive or git we do recursive
 
     /* The information that flows from tapped (besides being replicated in
        narSink), is now put in parseSink. */
     parseDump(parseSink, tapped);
 
-    /* We extract the result of the computation from the sink by calling
-       finish. */
-    auto [narHash, narSize] = narHashSink.finish();
+    /* We extract the result of the computation from the sinks by calling
+       finish; the NAR size is the object sink's. */
+    auto object = objectSink.finish();
+    std::optional<Hash> narHash;
+    if (narHashSink)
+        narHash = narHashSink->finish().hash;
 
-    auto hash = method == ContentAddressMethod::Raw::NixArchive && hashAlgo == HashAlgorithm::SHA256 ? narHash
-                : method == ContentAddressMethod::Raw::Git ? git::dumpHash(hashAlgo, srcPath).hash
+    auto hash = narHashIsCA                                ? *narHash
+                : method == ContentAddressMethod::Raw::Git ? merkle::objectHash(object.root)
                                                            : caHashSink.finish().hash;
 
     if (expectedCAHash && expectedCAHash != hash)
@@ -375,15 +395,63 @@ ValidPathInfo Store::addToStoreSlow(
                 .others = references,
                 .self = false,
             }),
-        narHash);
-    info.narSize = narSize;
+        ObjectHash::of(object.root));
+    info.narSize = object.narSize;
 
     if (!isValidPath(info.path)) {
+        /* For a peer speaking only the old forms: the NAR hash computed
+           above when it is the address, else one more walk. */
+        auto described = info;
+        described.lazyNarHash = [&]() -> Hash {
+            if (narHash)
+                return *narHash;
+            HashSink sink{HashAlgorithm::SHA256};
+            srcPath.dumpPath(sink);
+            return sink.finish().hash;
+        };
         auto source = sinkToSource([&](Sink & scratchpadSink) { srcPath.dumpPath(scratchpadSink); });
-        addToStore(info, *source);
+        addToStore(described, *source);
     }
 
     return info;
+}
+
+ObjectHash Store::queryObjectHash(const StorePath & path)
+{
+    auto info = queryPathInfo(path);
+    if (info->objectHash)
+        return *info->objectHash;
+    /* The peer described the path by its NAR hash alone (the shim): the
+       object hash is the walk's, over the object it holds. */
+    return ObjectHash::of(objectHashOf(*requireStoreObjectAccessor(path), CanonPath::root).root);
+}
+
+Hash narHashOf(Store & store, const StorePath & path)
+{
+    HashSink sink{HashAlgorithm::SHA256};
+    store.narFromPath(path, sink);
+    return sink.finish().hash;
+}
+
+std::optional<std::pair<std::string, std::string>> Store::contentMismatch(const ValidPathInfo & info)
+{
+    if (info.objectHash) {
+        auto current = ObjectHash::of(
+            objectHashOf(*requireStoreObjectAccessor(info.path, /*requireValidPath=*/false), CanonPath::root).root);
+        if (current == *info.objectHash)
+            return std::nullopt;
+        return std::pair{info.objectHash->render(), current.render()};
+    }
+    if (info.assertedNarHash) {
+        HashSink sink(info.assertedNarHash->algo);
+        narFromPath(info.path, sink);
+        auto current = sink.finish().hash;
+        if (current == *info.assertedNarHash)
+            return std::nullopt;
+        return std::pair{
+            info.assertedNarHash->to_string(HashFormat::Nix32, true), current.to_string(HashFormat::Nix32, true)};
+    }
+    throw Error("path '%s' has neither an object hash nor a NAR hash to check", printStorePath(info.path));
 }
 
 void Store::narFromPath(const StorePath & path, Sink & sink)
@@ -835,7 +903,13 @@ std::string Store::makeValidityRegistration(const StorePathSet & paths, bool sho
         auto info = queryPathInfo(i);
 
         if (showHash) {
-            s += info->narHash.to_string(HashFormat::Base16, false) + "\n";
+            /* The object hash's rendering; for a description without one
+               (an old peer's), the NAR hash it asserted. */
+            s += (info->objectHash ? info->objectHash->render()
+                  : info->assertedNarHash
+                      ? info->assertedNarHash->to_string(HashFormat::Base16, false)
+                      : throw Error("path '%s' has neither an object hash nor a NAR hash", printStorePath(i)))
+                 + "\n";
             s += fmt("%1%\n", info->narSize);
         }
 
@@ -954,6 +1028,14 @@ void copyStorePath(
     if (info->ultimate) {
         auto info2 = make_ref<ValidPathInfo>(*info);
         info2->ultimate = false;
+        info = info2;
+    }
+
+    /* For a destination speaking only the old forms: the shim's walk of
+       the source, when its writer asks. */
+    if (!info->assertedNarHash) {
+        auto info2 = make_ref<ValidPathInfo>(*info);
+        info2->lazyNarHash = [&srcStore, storePath] { return narHashOf(srcStore, storePath); };
         info = info2;
     }
 
@@ -1078,6 +1160,8 @@ std::map<StorePath, StorePath> copyPaths(
 
         ValidPathInfo infoForDst = *info;
         infoForDst.path = storePathForDst;
+        if (!infoForDst.assertedNarHash)
+            infoForDst.lazyNarHash = [&srcStore, missingPath] { return narHashOf(srcStore, missingPath); };
 
         auto source = sinkToSource([&, narSize = info->narSize](Sink & sink) {
             // We can reasonably assume that the copy will happen whenever we
@@ -1162,18 +1246,32 @@ decodeValidPathInfo(const Store & store, std::istream & str, std::optional<HashR
     if (str.eof()) {
         return {};
     }
+    /* The registration's hash line is the object hash's rendering when a
+       Nix of this version wrote it, and a NAR hash when an older one did:
+       the first is the row's value, the second an assertion the caller's
+       walk verifies while computing the object hash. */
+    std::optional<ObjectHash> objectHash;
+    std::optional<Hash> assertedNarHash;
+    uint64_t narSize;
     if (!hashGiven) {
         std::string s;
         getline(str, s);
-        auto narHash = Hash::parseAny(s, HashAlgorithm::SHA256);
+        if (auto oh = ObjectHash::parse(s))
+            objectHash = *oh;
+        else
+            assertedNarHash = Hash::parseAny(s, HashAlgorithm::SHA256);
         getline(str, s);
-        auto narSize = string2Int<uint64_t>(s);
-        if (!narSize)
+        auto size = string2Int<uint64_t>(s);
+        if (!size)
             throw Error("number expected");
-        hashGiven = {narHash, *narSize};
+        narSize = *size;
+    } else {
+        assertedNarHash = hashGiven->hash;
+        narSize = hashGiven->numBytesDigested;
     }
-    ValidPathInfo info(store.parseStorePath(path), {store, hashGiven->hash});
-    info.narSize = hashGiven->numBytesDigested;
+    ValidPathInfo info(store.parseStorePath(path), {store, objectHash});
+    info.assertedNarHash = assertedNarHash;
+    info.narSize = narSize;
     std::string deriver;
     getline(str, deriver);
     if (deriver != "")

@@ -2,6 +2,7 @@
 
 #include "nix/store/local-overlay-store.hh"
 #include "nix/util/callback.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/os-string.hh"
 #include "nix/store/realisation.hh"
 #include "nix/util/processes.hh"
@@ -103,7 +104,9 @@ void LocalOverlayStore::queryPathInfoUncached(
             } catch (...) {
                 return callbackPtr->rethrow();
             }
-            // If we don't have it, check lower store
+            // If we don't have it, check lower store.  Its info arrives with
+            // its object hash: the lower store migrates an old row on read,
+            // in memory when it is read-only.
             lowerStore->queryPathInfo(path, {[path, callbackPtr](std::future<ref<const ValidPathInfo>> fut) {
                                           try {
                                               (*callbackPtr)(fut.get().get_ptr());
@@ -140,6 +143,26 @@ void LocalOverlayStore::queryRealisationUncached(
         }});
 }
 
+/**
+ * The lower store's description of `path` with its object hash, as
+ * `registerValidPath` requires.  A local lower store has it (migrated on
+ * read); a lower store that is a daemon without
+ * `WorkerProto::featureObjectHash` describes the path by its NAR hash
+ * alone, so the object hash is computed by a walk of its object then.
+ */
+static ValidPathInfo lowerPathInfo(Store & lower, const StorePath & path)
+{
+    auto info = lower.queryPathInfo(path);
+    if (info->objectHash)
+        return *info;
+    ValidPathInfo res{*info};
+    auto object = objectHashOf(*lower.requireStoreObjectAccessor(path), CanonPath::root);
+    res.objectHash = ObjectHash::of(object.root);
+    if (!res.narSize)
+        res.narSize = object.narSize;
+    return res;
+}
+
 bool LocalOverlayStore::isValidPathUncached(const StorePath & path)
 {
     auto res = LocalStore::isValidPathUncached(path);
@@ -148,12 +171,12 @@ bool LocalOverlayStore::isValidPathUncached(const StorePath & path)
     res = lowerStore->isValidPath(path);
     if (res) {
         // Get path info from lower store so upper DB genuinely has it.
-        auto p = lowerStore->queryPathInfo(path);
+        auto p = lowerPathInfo(*lowerStore, path);
         // recur on references, syncing entire closure.
-        for (auto & r : p->references)
+        for (auto & r : p.references)
             if (r != path)
                 isValidPath(r);
-        LocalStore::registerValidPath(*p);
+        LocalStore::registerValidPath(p);
     }
     return res;
 }
@@ -197,7 +220,7 @@ void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos)
         auto pathsInLower = lowerStore->queryValidPaths(notInUpper);
         ValidPathInfos inLower;
         for (auto & p : pathsInLower)
-            inLower.insert_or_assign(p, *lowerStore->queryPathInfo(p));
+            inLower.insert_or_assign(p, lowerPathInfo(*lowerStore, p));
         LocalStore::registerValidPaths(inLower);
     }
     // Then do original request

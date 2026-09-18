@@ -22,7 +22,6 @@ enum struct ExperimentalFeature {
     Flakes,
     FetchTree,
     NixCommand,
-    GitHashing,
     RecursiveNix,
     FetchClosure,
     AutoAllocateUids,

@@ -314,6 +314,22 @@ struct ClientSettings
     }
 };
 
+/**
+ * The info as this client reads it: without `WorkerProto::featureObjectHash` the hash slot is a NAR hash, supplied
+ * by one rooted walk when the info asserts none; with the feature, the info as it is.  Call it in the work section.
+ */
+static std::shared_ptr<const ValidPathInfo> withNarHashForOldClient(
+    Store & store, const WorkerProto::BasicServerConnection & conn, std::shared_ptr<const ValidPathInfo> info)
+{
+    if (conn.protoVersion.features.contains(WorkerProto::featureObjectHash) || info->assertedNarHash)
+        return info;
+    auto res = std::make_shared<ValidPathInfo>(*info);
+    /* Rooted for the walk: the collector must not take the path from under it. */
+    store.addTempRoot(res->path);
+    res->assertedNarHash = narHashOf(store, res->path);
+    return res;
+}
+
 static void performOp(
     TunnelLogger * logger,
     ref<Store> store,
@@ -457,7 +473,7 @@ static void performOp(
             auto repair = RepairFlag{repairBool};
 
             logger->startWork();
-            auto pathInfo = [&]() {
+            auto pathInfo = withNarHashForOldClient(*store, conn, [&]() {
                 // NB: FramedSource must be out of scope before logger->stopWork();
                 // FIXME: this means that if there is an error
                 // half-way through, the client will keep sending
@@ -483,7 +499,7 @@ static void performOp(
                 auto path =
                     store->addToStoreFromDump(source, name, dumpMethod, contentAddressMethod, hashAlgo, refs, repair);
                 return store->queryPathInfo(path);
-            }();
+            }());
             logger->stopWork();
 
             WorkerProto::Serialise<ValidPathInfo>::write(*store, wconn, *pathInfo);
@@ -544,11 +560,16 @@ static void performOp(
             FramedSource source(conn.from);
             auto expected = readNum<uint64_t>(source);
             for (uint64_t i = 0; i < expected; ++i) {
+                /* The framed stream is read at a fixed version number, but
+                   under the connection's negotiated features: the hash slot
+                   is the feature's form. */
+                WorkerProto::Version multiVersion{
+                    .number = {.major = 1, .minor = 16}, .features = conn.protoVersion.features};
                 auto info = WorkerProto::Serialise<ValidPathInfo>::read(
                     *store,
                     WorkerProto::ReadConn{
                         .from = source,
-                        .version = {.number = {.major = 1, .minor = 16}},
+                        .version = multiVersion,
                     });
                 info.ultimate = false;
                 EnsureRead wrapper{source, info.narSize};
@@ -904,7 +925,9 @@ static void performOp(
         std::shared_ptr<const ValidPathInfo> info;
         logger->startWork();
         try {
-            info = store->queryPathInfo(path);
+            /* The client's form is computed inside the work section; a
+               path deleted between the query and its walk is not found. */
+            info = withNarHashForOldClient(*store, conn, store->queryPathInfo(path));
         } catch (InvalidPath &) {
         }
         logger->stopWork();
@@ -958,8 +981,9 @@ static void performOp(
         bool repair, dontCheckSigs;
         auto path = WorkerProto::Serialise<StorePath>::read(*store, rconn);
         auto deriver = WorkerProto::Serialise<std::optional<StorePath>>::read(*store, rconn);
-        auto narHash = Hash::parseAny(readString(conn.from), HashAlgorithm::SHA256);
-        ValidPathInfo info{path, {*store, narHash}};
+        auto [objectHash, assertedNarHash] = WorkerProto::readPathInfoHashes(rconn);
+        ValidPathInfo info{path, {*store, std::move(objectHash)}};
+        info.assertedNarHash = std::move(assertedNarHash);
         info.deriver = std::move(deriver);
         info.references = WorkerProto::Serialise<StorePathSet>::read(*store, rconn);
         conn.from >> info.registrationTime >> info.narSize >> info.ultimate;
@@ -1073,7 +1097,7 @@ static void performOp(
         auto & submitStore = require<SubmitStore>(*store);
 
         logger->startWork();
-        auto pathInfo = [&]() {
+        auto pathInfo = withNarHashForOldClient(*store, conn, [&]() {
             // NB: FramedSource must be out of scope before logger->stopWork();
             // FIXME: this means that if there is an error
             // half-way through, the client will keep sending
@@ -1082,7 +1106,7 @@ static void performOp(
             FramedSource source(conn.from);
             FileSerialisationMethod dumpMethod = contentAddressMethod.getFileSerialisationMethod();
             return submitStore.addToStoreScanning(source, name, dumpMethod, contentAddressMethod, hashAlgo);
-        }();
+        }());
         logger->stopWork();
 
         WorkerProto::Serialise<ValidPathInfo>::write(*store, wconn, *pathInfo);

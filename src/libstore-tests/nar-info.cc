@@ -61,8 +61,11 @@ static NarInfo makeNarInfo(const Store & store, bool includeImpureInfo)
                     .self = true,
                 },
         },
-        Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="));
+        std::nullopt);
     info.narSize = 34878;
+    /* The json-1..3 fixtures are the old forms: a NAR hash and no object
+       hash, which reads as `assertedNarHash` (04 section 1.9). */
+    info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
     if (includeImpureInfo) {
         info.deriver = StorePath{
             "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar.drv",

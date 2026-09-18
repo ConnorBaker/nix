@@ -479,10 +479,9 @@ Value & AttrCursor::forceValue()
     if (root->db && (!cachedValue || std::get_if<placeholder_t>(&cachedValue->second))) {
         if (v.type() == nString) {
             NixStringContext context;
-            copyContext(v, context);
+            auto text = root->state.forceString(v, context, noPos, "while caching a string attribute");
             cachedValue = {
-                root->db->setString(getKey(), v.string_view(), v.context()),
-                string_t{v.string_view(), std::move(context)}};
+                root->db->setString(getKey(), text, v.context()), string_t{std::string(text), std::move(context)}};
         } else if (v.type() == nPath) {
             auto path = v.path().path;
             cachedValue = {root->db->setString(getKey(), path.abs()), string_t{path.abs(), {}}};
@@ -617,7 +616,8 @@ std::string AttrCursor::getString()
     if (v.type() != nString && v.type() != nPath)
         root->state.error<TypeError>("'%s' is not a string but %s", getAttrPathStr(), showType(v)).debugThrow();
 
-    return v.type() == nString ? std::string(v.string_view()) : v.path().to_string();
+    /* The text leaves the evaluator without its provenance: a door. */
+    return v.type() == nString ? root->state.realise(v).toOwned() : root->state.realise(v.path().to_string()).toOwned();
 }
 
 string_t AttrCursor::getStringWithContext()
@@ -656,10 +656,10 @@ string_t AttrCursor::getStringWithContext()
 
     if (v.type() == nString) {
         NixStringContext context;
-        copyContext(v, context);
-        return {std::string{v.string_view()}, std::move(context)};
+        auto text = root->state.realise(v, &context).toOwned();
+        return {std::move(text), std::move(context)};
     } else if (v.type() == nPath)
-        return {v.path().to_string(), {}};
+        return {root->state.realise(v.path().to_string()).toOwned(), {}};
     else
         root->state.error<TypeError>("'%s' is not a string but %s", getAttrPathStr(), showType(v)).debugThrow();
 }
@@ -730,8 +730,7 @@ std::vector<std::string> AttrCursor::getListOfStrings()
     std::vector<std::string> res;
 
     for (auto elem : v.listView())
-        res.push_back(
-            std::string(root->state.forceStringNoCtx(*elem, noPos, "while evaluating an attribute for caching")));
+        res.push_back(root->state.realiseNoCtx(*elem, noPos, "while evaluating an attribute for caching").toOwned());
 
     if (root->db)
         cachedValue = {root->db->setListOfStrings(getKey(), res), res};
@@ -788,6 +787,8 @@ StorePath AttrCursor::forceDerivation()
             /* The eval cache contains 'drvPath', but the actual path has
                been garbage-collected. So force it to be regenerated. */
             aDrvPath->forceValue();
+            /* The regenerated derivation may be pending in the write buffer. */
+            root->state.flushPendingWrites();
             if (!root->state.store->isValidPath(drvPath))
                 throw Error(
                     "don't know how to recreate store derivation '%s'!", root->state.store->printStorePath(drvPath));

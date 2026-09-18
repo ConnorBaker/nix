@@ -37,6 +37,39 @@ struct BaseSetting<PathsInChroot>::trait
 template<>
 void BaseSetting<PathsInChroot>::appendOrSet(PathsInChroot newValue, bool append);
 
+/**
+ * A setting this Nix no longer has: a configuration or a command line
+ * that still gives it is accepted, the value ignored, and one warning
+ * says why when the value is `true` (the pattern of
+ * `DeprecatedWarnSetting`, with no target); `false` asks for nothing and
+ * is silent.  The value is never stored, so its rendering is the default
+ * -- what the build hook hands its child -- and the child, which re-reads
+ * the configuration, warns nothing (`Settings::configurationDiagnosedByParent`):
+ * one warning per top-level process.  Excluded from the key=value dump
+ * (`nix config show`) as `DeprecatedWarnSetting` is; present in the JSON,
+ * which the manual's settings page is generated from, and by name.
+ */
+struct RemovedSetting : public BaseSetting<bool>
+{
+    const std::string why;
+
+    RemovedSetting(Config * options, const std::string & name, const std::string & why)
+        : BaseSetting<bool>(false, false, name, "Removed; accepted and ignored: " + why + ".", {}, std::nullopt)
+        , why(why)
+    {
+        options->addSetting(this);
+    }
+
+    void assign(const bool & v) override;
+    void appendOrSet(bool newValue, bool append) override;
+    void override(const bool & v) override;
+
+    bool excludedFromFullSerialisation() const override
+    {
+        return true;
+    }
+};
+
 struct GCSettings : public virtual Config
 {
 private:
@@ -253,20 +286,15 @@ public:
         this, false, "sync-before-registering", "Whether to call `sync()` before registering a path as valid."};
 #endif
 
-    Setting<bool> autoOptimiseStore{
-        this,
-        false,
-        "auto-optimise-store",
-        R"(
-          If set to `true`, Nix automatically detects files in the store
-          that have identical contents, and replaces them with hard links to
-          a single copy. This saves disk space. If set to `false` (the
-          default), you can still run `nix-store --optimise` to get rid of
-          duplicate files.
-        )"};
-
     Setting<size_t> narBufferSize{
         this, 32 * 1024 * 1024, "nar-buffer-size", "Maximum size of NARs before spilling them to disk."};
+
+    /* The object store is unconditional (01 §9.10, "No setting"); the pass
+       this switched on is gone, and so is its meaning. */
+    RemovedSetting autoOptimiseStore{
+        this,
+        "auto-optimise-store",
+        "the object store shares identical files unconditionally, and `nix-store --optimise` migrates a store an older Nix wrote"};
 
     Setting<bool> allowSymlinkedStore{
         this,

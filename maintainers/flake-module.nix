@@ -37,6 +37,15 @@
               fi
             ''}";
           };
+          # The lazy store's string kernel (doc/lazy-store/04-derivation.md,
+          # section 0.1): outside libexpr and libflake a value's text comes only
+          # through the doors.  The compiler holds that on `Value`; this holds it
+          # on the evaluator's byte accessors, which C++ cannot scope to a library.
+          check-string-kernel = {
+            enable = true;
+            pass_filenames = false;
+            entry = "${pkgs.runtimeShell} maintainers/check-string-kernel.sh";
+          };
           meson-format = {
             enable = true;
             files = "(meson.build|meson.options)$";

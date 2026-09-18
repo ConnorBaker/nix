@@ -37,6 +37,7 @@ subdir('nix-meson-build-support/common')
 
 sources = files(
   'flakeref.cc',
+  'lockfile-v8.cc',
   'nix_api_flake.cc',
   'url-name.cc',
 )

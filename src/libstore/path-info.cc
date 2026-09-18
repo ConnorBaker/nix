@@ -21,13 +21,15 @@ PathInfoJsonFormat parsePathInfoJsonFormat(uint64_t version)
         return PathInfoJsonFormat::V2;
     case 3:
         return PathInfoJsonFormat::V3;
+    case 4:
+        return PathInfoJsonFormat::V4;
     default:
-        throw Error("unsupported path info JSON format version %d; supported versions are 1, 2 and 3", version);
+        throw Error("unsupported path info JSON format version %d; supported versions are 1, 2, 3 and 4", version);
     }
 }
 
-UnkeyedValidPathInfo::UnkeyedValidPathInfo(const StoreDirConfig & store, Hash narHash)
-    : UnkeyedValidPathInfo{store.storeDir, narHash}
+UnkeyedValidPathInfo::UnkeyedValidPathInfo(const StoreDirConfig & store, std::optional<ObjectHash> objectHash)
+    : UnkeyedValidPathInfo{store.storeDir, std::move(objectHash)}
 {
 }
 
@@ -37,7 +39,8 @@ GENERATE_CMP_EXT(
     UnkeyedValidPathInfo,
     me->storeDir,
     me->deriver,
-    me->narHash,
+    me->objectHash,
+    me->assertedNarHash,
     me->references,
     me->registrationTime,
     me->narSize,
@@ -46,7 +49,20 @@ GENERATE_CMP_EXT(
     me->sigs,
     me->ca);
 
+const ObjectHash & ValidPathInfo::requireObjectHash(const StoreDirConfig & store) const
+{
+    if (!objectHash)
+        throw Error("store path '%s' has no object hash", store.printStorePath(path));
+    return *objectHash;
+}
+
 std::string ValidPathInfo::fingerprint(const StoreDirConfig & store) const
+{
+    return "2;" + store.printStorePath(path) + ";" + requireObjectHash(store).render() + ";"
+           + concatStringsSep(",", store.printStorePathSet(references));
+}
+
+std::string ValidPathInfo::fingerprintV1(const StoreDirConfig & store, const Hash & narHash) const
 {
     if (narSize == 0)
         throw Error(
@@ -66,6 +82,11 @@ void ValidPathInfo::sign(const Store & store, const std::vector<std::unique_ptr<
     for (auto & signer : signers) {
         sigs.insert(signer->signDetached(fingerprint));
     }
+}
+
+void ValidPathInfo::signV1(const StoreDirConfig & store, const Hash & narHash, const Signer & signer)
+{
+    sigs.insert(signer.signDetached(fingerprintV1(store, narHash)));
 }
 
 std::optional<ContentAddressWithReferences> ValidPathInfo::contentAddressWithReferences() const
@@ -122,22 +143,52 @@ bool ValidPathInfo::isContentAddressed(const StoreDirConfig & store) const
     return res;
 }
 
-size_t ValidPathInfo::checkSignatures(const StoreDirConfig & store, const PublicKeys & publicKeys) const
+size_t ValidPathInfo::checkSignatures(
+    const StoreDirConfig & store, const PublicKeys & publicKeys, std::optional<NarHashThunk> narHashFor) const
 {
     if (isContentAddressed(store))
         return maxSigs;
 
-    size_t good = 0;
+    /* The caller's walk, once for every signature that needs it. */
+    std::optional<Hash> walked;
+    std::optional<NarHashThunk> once;
+    if (narHashFor)
+        once = NarHashThunk{[&]() -> Hash {
+            if (!walked)
+                walked = (*narHashFor)();
+            return *walked;
+        }};
+
+    /* Keys, not signatures: one key may have signed both fingerprints. */
+    std::set<std::string> keys;
     for (auto & sig : sigs)
-        if (checkSignature(store, publicKeys, sig))
-            good++;
-    return good;
+        if (!keys.count(sig.keyName) && checkSignature(store, publicKeys, sig, once))
+            keys.insert(sig.keyName);
+    return keys.size();
 }
 
 bool ValidPathInfo::checkSignature(
-    const StoreDirConfig & store, const PublicKeys & publicKeys, const Signature & sig) const
+    const StoreDirConfig & store,
+    const PublicKeys & publicKeys,
+    const Signature & sig,
+    std::optional<NarHashThunk> narHashFor) const
 {
-    return verifyDetached(fingerprint(store), sig, publicKeys);
+    /* Over the version-2 fingerprint when the object hash is known; over
+       the version-1 fingerprint when the NAR hash is: asserted by this
+       description (the shim: a signature made before the object hash, on
+       a description that still carries the NAR hash it signed), else
+       given by the caller's walk -- paid only for a signature one of the
+       trusted keys made, since a signature by any other key verifies
+       under no fingerprint (`verifyDetached` finds the key by name). */
+    if (objectHash && verifyDetached(fingerprint(store), sig, publicKeys))
+        return true;
+    if (narSize == 0)
+        return false;
+    if (assertedNarHash)
+        return verifyDetached(fingerprintV1(store, *assertedNarHash), sig, publicKeys);
+    if (narHashFor && publicKeys.count(sig.keyName))
+        return verifyDetached(fingerprintV1(store, (*narHashFor)()), sig, publicKeys);
+    return false;
 }
 
 Strings ValidPathInfo::shortRefs() const
@@ -149,11 +200,14 @@ Strings ValidPathInfo::shortRefs() const
 }
 
 ValidPathInfo ValidPathInfo::makeFromCA(
-    const StoreDirConfig & store, std::string_view name, ContentAddressWithReferences && ca, Hash narHash)
+    const StoreDirConfig & store,
+    std::string_view name,
+    ContentAddressWithReferences && ca,
+    std::optional<ObjectHash> objectHash)
 {
     ValidPathInfo res{
         store.makeFixedOutputPathFromCA(name, ca),
-        UnkeyedValidPathInfo(store, narHash),
+        UnkeyedValidPathInfo(store, std::move(objectHash)),
     };
     res.ca = ContentAddress{
         .method = ca.getMethod(),
@@ -173,8 +227,11 @@ ValidPathInfo ValidPathInfo::makeFromCA(
     return res;
 }
 
-nlohmann::json
-UnkeyedValidPathInfo::toJSON(const StoreDirConfig * store, bool includeImpureInfo, PathInfoJsonFormat format) const
+nlohmann::json UnkeyedValidPathInfo::toJSON(
+    const StoreDirConfig * store,
+    bool includeImpureInfo,
+    PathInfoJsonFormat format,
+    std::optional<NarHashThunk> narHashFor) const
 {
     using nlohmann::json;
 
@@ -187,9 +244,29 @@ UnkeyedValidPathInfo::toJSON(const StoreDirConfig * store, bool includeImpureInf
 
     jsonObject["storeDir"] = storeDir;
 
-    jsonObject["narHash"] = format == PathInfoJsonFormat::V1
-                                ? static_cast<json>(narHash.to_string(HashFormat::SRI, true))
-                                : static_cast<json>(narHash);
+    if (format == PathInfoJsonFormat::V4) {
+        if (!objectHash)
+            throw Error(
+                "cannot render path info as JSON format 4: the object hash is not known (the description came from a peer that does not carry one; use a lower format)");
+        jsonObject["objectHash"] = objectHash->render();
+        if (assertedNarHash)
+            jsonObject["narHash"] = *assertedNarHash;
+    } else {
+        /* Formats 1 to 3 require the NAR hash: the one asserted to us, else
+           the shim's walk, else nothing to write. */
+        auto narHash = [&]() -> Hash {
+            if (assertedNarHash)
+                return *assertedNarHash;
+            if (narHashFor)
+                return (*narHashFor)();
+            throw Error(
+                "cannot render path info as JSON format %d: it requires a NAR hash, and none is known (use format 4, or supply the shim)",
+                static_cast<int>(format));
+        }();
+        jsonObject["narHash"] = format == PathInfoJsonFormat::V1
+                                    ? static_cast<json>(narHash.to_string(HashFormat::SRI, true))
+                                    : static_cast<json>(narHash);
+    }
 
     jsonObject["narSize"] = narSize;
 
@@ -217,7 +294,8 @@ UnkeyedValidPathInfo::toJSON(const StoreDirConfig * store, bool includeImpureInf
 
         jsonObject["ultimate"] = ultimate;
 
-        if (format == PathInfoJsonFormat::V3) {
+        if (format >= PathInfoJsonFormat::V3) {
+            /* Structured signatures from version 3 on; version 4 keeps version 3's shape. */
             jsonObject["signatures"] = sigs;
         } else {
             auto & sigsObj = jsonObject["signatures"] = json::array();
@@ -249,11 +327,31 @@ UnkeyedValidPathInfo UnkeyedValidPathInfo::fromJSON(const StoreDirConfig * store
             else
                 throw Error("'storeDir' field is required in path info JSON format version 2");
         }(),
-        [&] {
-            return format == PathInfoJsonFormat::V1 ? Hash::parseSRI(getString(valueAt(json, "narHash")))
-                                                    : Hash(valueAt(json, "narHash"));
+        [&]() -> std::optional<ObjectHash> {
+            if (format != PathInfoJsonFormat::V4)
+                return std::nullopt;
+            try {
+                return ObjectHash::parseOrThrow(getString(valueAt(json, "objectHash")));
+            } catch (Error & e) {
+                e.addTrace({}, "while reading key 'objectHash'");
+                throw;
+            }
         }(),
     };
+
+    try {
+        if (format == PathInfoJsonFormat::V4) {
+            if (auto * rawNarHash = optionalValueAt(json, "narHash"))
+                if (auto * narHash = getNullable(*rawNarHash))
+                    res.assertedNarHash = Hash(*narHash);
+        } else {
+            res.assertedNarHash = format == PathInfoJsonFormat::V1 ? Hash::parseSRI(getString(valueAt(json, "narHash")))
+                                                                   : Hash(valueAt(json, "narHash"));
+        }
+    } catch (Error & e) {
+        e.addTrace({}, "while reading key 'narHash'");
+        throw;
+    }
 
     res.narSize = getUnsigned(valueAt(json, "narSize"));
 
@@ -323,7 +421,7 @@ nix::UnkeyedValidPathInfo adl_serializer<nix::UnkeyedValidPathInfo>::from_json(c
 
 void adl_serializer<nix::UnkeyedValidPathInfo>::to_json(json & json, const nix::UnkeyedValidPathInfo & c)
 {
-    json = c.toJSON(nullptr, true, nix::PathInfoJsonFormat::V3);
+    json = c.toJSON(nullptr, true, nix::PathInfoJsonFormat::V4);
 }
 
 nix::ValidPathInfo adl_serializer<nix::ValidPathInfo>::from_json(const json & json0)

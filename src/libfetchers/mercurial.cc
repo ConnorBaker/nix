@@ -75,7 +75,7 @@ struct MercurialInputScheme : InputScheme
         return "";
     }
 
-    const std::map<std::string, AttributeInfo> & allowedAttrs() const override
+    const std::map<std::string, AttributeInfo> & schemeAttrs() const override
     {
         static const std::map<std::string, AttributeInfo> attrs = {
             {
@@ -92,10 +92,6 @@ struct MercurialInputScheme : InputScheme
             },
             {
                 "revCount",
-                {},
-            },
-            {
-                "narHash",
                 {},
             },
             {
@@ -259,7 +255,7 @@ struct MercurialInputScheme : InputScheme
                 return store.addToStore(
                     input.getName(),
                     {accessor, CanonPath::root},
-                    ContentAddressMethod::Raw::NixArchive,
+                    ContentAddressMethod::Raw::Git,
                     HashAlgorithm::SHA256,
                     {},
                     filter);

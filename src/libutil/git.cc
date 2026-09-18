@@ -5,10 +5,10 @@
 #include <strings.h> // for strcasecmp
 
 #include "nix/util/signals.hh"
-#include "nix/util/configuration.hh"
 #include "nix/util/hash.hh"
 
 #include "nix/util/git.hh"
+#include "nix/util/merkle-hash.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/util.hh"
 
@@ -34,10 +34,8 @@ static std::string getString(Source & source, int n)
     return v;
 }
 
-uint64_t parseBlob(Source & source, const ExperimentalFeatureSettings & xpSettings)
+uint64_t parseBlob(Source & source)
 {
-    xpSettings.require(Xp::GitHashing);
-
     auto sizeStr = getStringUntil(source, 0);
     auto size = string2Int<uint64_t>(sizeStr);
     if (!size)
@@ -45,14 +43,8 @@ uint64_t parseBlob(Source & source, const ExperimentalFeatureSettings & xpSettin
     return *size;
 }
 
-void parseTree(
-    merkle::DirectorySink & sink,
-    Source & source,
-    HashAlgorithm hashAlgo,
-    const ExperimentalFeatureSettings & xpSettings)
+void parseTree(merkle::DirectorySink & sink, Source & source, HashAlgorithm hashAlgo)
 {
-    xpSettings.require(Xp::GitHashing);
-
     auto sizeStr = getStringUntil(source, 0);
     auto leftOpt = string2Int<uint64_t>(sizeStr);
     if (!leftOpt)
@@ -93,10 +85,8 @@ void parseTree(
     }
 }
 
-ObjectType parseObjectType(Source & source, const ExperimentalFeatureSettings & xpSettings)
+ObjectType parseObjectType(Source & source)
 {
-    xpSettings.require(Xp::GitHashing);
-
     auto type = getString(source, 5);
 
     if (type == "blob ") {
@@ -107,125 +97,9 @@ ObjectType parseObjectType(Source & source, const ExperimentalFeatureSettings & 
         throw Error("input doesn't look like a Git object");
 }
 
-std::optional<Mode> convertMode(SourceAccessor::Type type)
-{
-    switch (type) {
-    case SourceAccessor::tSymlink:
-        return Mode::Symlink;
-    case SourceAccessor::tRegular:
-        return Mode::Regular;
-    case SourceAccessor::tDirectory:
-        return Mode::Directory;
-    case SourceAccessor::tChar:
-    case SourceAccessor::tBlock:
-    case SourceAccessor::tSocket:
-    case SourceAccessor::tFifo:
-        return std::nullopt;
-    case SourceAccessor::tUnknown:
-    default:
-        unreachable();
-    }
-}
-
-void dumpBlobPrefix(uint64_t size, Sink & sink, const ExperimentalFeatureSettings & xpSettings)
-{
-    using namespace std::string_literals;
-    xpSettings.require(Xp::GitHashing);
-    auto s = fmt("blob %d\0"s, std::to_string(size));
-    sink(s);
-}
-
-void dumpTree(const Tree & entries, Sink & sink, const ExperimentalFeatureSettings & xpSettings)
-{
-    using namespace std::string_literals;
-    xpSettings.require(Xp::GitHashing);
-
-    std::string v1;
-
-    for (auto & [name, entry] : entries) {
-        auto name2 = name;
-        if (entry.mode == Mode::Directory) {
-            assert(!name2.empty());
-            assert(name2.back() == '/');
-            name2.pop_back();
-        }
-        v1 += fmt("%o %s\0"s, static_cast<RawMode>(entry.mode), name2);
-        std::copy(entry.hash.hash, entry.hash.hash + entry.hash.hashSize, std::back_inserter(v1));
-    }
-
-    {
-        auto s = fmt("tree %d\0"s, v1.size());
-        sink(s);
-    }
-
-    sink(v1);
-}
-
-Mode dump(
-    const SourcePath & path,
-    Sink & sink,
-    fun<DumpHook> hook,
-    PathFilter & filter,
-    const ExperimentalFeatureSettings & xpSettings)
-{
-    auto st = path.lstat();
-
-    switch (st.type) {
-    case SourceAccessor::tRegular: {
-        path.readFile(sink, [&](uint64_t size) { dumpBlobPrefix(size, sink, xpSettings); });
-        return st.isExecutable ? Mode::Executable : Mode::Regular;
-    }
-
-    case SourceAccessor::tDirectory: {
-        Tree entries;
-        for (auto & [name, _] : path.readDirectory()) {
-            auto child = path / name;
-            if (!filter(child.path.abs()))
-                continue;
-
-            auto entry = hook(child);
-
-            auto name2 = name;
-            if (entry.mode == Mode::Directory)
-                name2 += "/";
-
-            entries.insert_or_assign(std::move(name2), std::move(entry));
-        }
-        dumpTree(entries, sink, xpSettings);
-        return Mode::Directory;
-    }
-
-    case SourceAccessor::tSymlink: {
-        auto target = path.readLink();
-        dumpBlobPrefix(target.size(), sink, xpSettings);
-        sink(target);
-        return Mode::Symlink;
-    }
-
-    case SourceAccessor::tChar:
-    case SourceAccessor::tBlock:
-    case SourceAccessor::tSocket:
-    case SourceAccessor::tFifo:
-    case SourceAccessor::tUnknown:
-    default:
-        throw Error("file '%1%' has an unsupported type of %2%", path, st.typeString());
-    }
-}
-
-TreeEntry dumpHash(HashAlgorithm ha, const SourcePath & path, PathFilter & filter)
-{
-    fun<DumpHook> hook = [&](const SourcePath & path) -> TreeEntry {
-        auto hashSink = HashSink(ha);
-        auto mode = dump(path, hashSink, hook, filter);
-        auto hash = hashSink.finish().hash;
-        return {
-            .mode = mode,
-            .hash = hash,
-        };
-    };
-
-    return hook(path);
-}
+/* The readers above (`parseObjectType`, `parseBlob`, `parseTree`) only
+   read; hashing lives in `objectHashOf` (`object-hash-sink.cc`) over
+   `merkle-hash.hh`, under SHA-256. */
 
 std::optional<LsRemoteRefLine> parseLsRemoteLine(std::string_view line)
 {

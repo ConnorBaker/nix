@@ -2,6 +2,7 @@
 #include "nix/cmd/command.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-open.hh"
+#include "nix/store/store-api.hh"
 #include "nix/util/thread-pool.hh"
 #include "nix/store/filetransfer.hh"
 
@@ -61,14 +62,31 @@ struct CmdCopySigs : StorePathsCommand
 
             std::set<Signature> newSigs;
 
+            /* This store's NAR hash of the path, when a substituter
+               describes it by that alone: one walk, at most once. */
+            std::optional<Hash> walkedNarHash;
+            auto localNarHash = [&]() -> const Hash & {
+                if (info->assertedNarHash)
+                    return *info->assertedNarHash;
+                if (!walkedNarHash)
+                    walkedNarHash = narHashOf(*store, storePath);
+                return *walkedNarHash;
+            };
+
             for (auto & store2 : substituters) {
                 try {
                     auto info2 = store2->queryPathInfo(info->path);
 
                     /* Don't import signatures that don't match this
-                       binary. */
-                    if (info->narHash != info2->narHash || info->narSize != info2->narSize
-                        || info->references != info2->references)
+                       binary: the same object hash when both descriptions
+                       carry one; else the same NAR hash, the substituter's
+                       asserted one (an older cache's `NarHash:`) against
+                       ours, asserted or walked; else nothing establishes
+                       identity. */
+                    bool sameContent = info->objectHash && info2->objectHash ? *info->objectHash == *info2->objectHash
+                                       : info2->assertedNarHash              ? localNarHash() == *info2->assertedNarHash
+                                                                             : false;
+                    if (!sameContent || info->narSize != info2->narSize || info->references != info2->references)
                         continue;
 
                     for (auto & sig : info2->sigs)
@@ -119,6 +137,13 @@ struct CmdSign : StorePathsCommand
         return "sign store paths with a local key";
     }
 
+    std::string doc() override
+    {
+        return
+#include "store-sign.md"
+            ;
+    }
+
     void run(ref<Store> store, StorePaths && storePaths) override
     {
         SecretKey secretKey(readFile(secretKeyFile));
@@ -131,11 +156,32 @@ struct CmdSign : StorePathsCommand
 
             auto info2(*info);
             info2.sigs.clear();
-            info2.sign(*store, signer);
-            assert(!info2.sigs.empty());
+            /* Over the version-2 fingerprint when the description carries
+               the object hash (a cache written by an older Nix does not),
+               and over the version-1 fingerprint -- the only form clients
+               before the object hash verify -- when the NAR size is known:
+               over the NAR hash the info asserts, else one walk of the path. */
+            if (info->objectHash)
+                info2.sign(*store, signer);
+            if (info->narSize == 0)
+                warn(
+                    "not signing '%s' over the version-1 fingerprint: its NAR size is not known",
+                    store->printStorePath(storePath));
+            else {
+                auto narHash = info->assertedNarHash ? *info->assertedNarHash : narHashOf(*store, storePath);
+                info2.signV1(*store, narHash, signer);
+            }
+            if (info2.sigs.empty())
+                throw Error(
+                    "cannot sign '%s': it has neither an object hash nor a NAR size", store->printStorePath(storePath));
 
-            if (!info->sigs.count(*info2.sigs.begin())) {
-                store->addSignatures(storePath, info2.sigs);
+            std::set<Signature> newSigs;
+            for (auto & sig : info2.sigs)
+                if (!info->sigs.count(sig))
+                    newSigs.insert(sig);
+
+            if (!newSigs.empty()) {
+                store->addSignatures(storePath, newSigs);
                 added++;
             }
         }

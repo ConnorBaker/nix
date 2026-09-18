@@ -47,6 +47,7 @@ config_priv_h = configure_file(
 subdir('nix-meson-build-support/common')
 
 sources = files(
+  'add-path.cc',
   'derived-path.cc',
   'error_traces.cc',
   'eval.cc',
@@ -64,6 +65,7 @@ sources = files(
   'value/context.cc',
   'value/print.cc',
   'value/value.cc',
+  'write-buffer.cc',
 )
 
 include_dirs = [ include_directories('.') ]

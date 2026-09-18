@@ -113,13 +113,26 @@ enum struct FileIngestionMethod : uint8_t {
     /**
      * Git hashing.
      *
-     * Part of `ExperimentalFeature::GitHashing`.
-     *
-     * See `file-system-object/content-address.md#serial-git` in the
+     * See `file-system-object/content-address.md#git` in the
      * manual.
      */
     Git,
 };
+
+/**
+ * The git method admits SHA-256 alone: the object hash is SHA-256, the
+ * store's own algorithm (doc/lazy-store/01-specification.md, section 9.9
+ * "The algorithm"; section 10, *The git method is SHA-256 only*), and no
+ * other is computed.
+ * Every entry that creates a git-addressed object, name or derivation
+ * output calls this; what reads one an older Nix made under SHA-1 -- a
+ * database row, a narinfo, a derivation, a wire description -- does not,
+ * so that the collector and the verifier run on a store holding one.
+ * The other methods admit every algorithm.
+ *
+ * @throws Error naming the remedy.
+ */
+void checkIngestionAlgorithm(FileIngestionMethod method, HashAlgorithm algo);
 
 /**
  * Parse a `FileIngestionMethod` by name. Choice of:

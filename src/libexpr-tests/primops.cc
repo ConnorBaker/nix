@@ -160,7 +160,7 @@ TEST_F(PrimOpTest, unsafeGetAttrPos)
     auto file = v.attrs()->get(createSymbol("file"));
     ASSERT_NE(file, nullptr);
     ASSERT_THAT(*file->value, IsString());
-    auto s = baseNameOf(file->value->string_view());
+    auto s = baseNameOf(RawValueBytes::view(*file->value));
     ASSERT_EQ(s, "foo.nix");
 
     auto line = v.attrs()->get(createSymbol("line"));
@@ -828,7 +828,7 @@ TEST_F(PrimOpTest, replaceStrings)
     // FIXME: add a test that verifies the string context is as expected
     auto v = eval("builtins.replaceStrings [\"oo\" \"a\"] [\"a\" \"i\"] \"foobar\"");
     ASSERT_EQ(v.type(), nString);
-    ASSERT_EQ(v.string_view(), "fabir");
+    ASSERT_EQ(RawValueBytes::view(v), "fabir");
 }
 
 TEST_F(PrimOpTest, concatStringsSep)
@@ -836,7 +836,7 @@ TEST_F(PrimOpTest, concatStringsSep)
     // FIXME: add a test that verifies the string context is as expected
     auto v = eval("builtins.concatStringsSep \"%\" [\"foo\" \"bar\" \"baz\"]");
     ASSERT_EQ(v.type(), nString);
-    ASSERT_EQ(v.string_view(), "foo%bar%baz");
+    ASSERT_EQ(RawValueBytes::view(v), "foo%bar%baz");
 }
 
 TEST_F(PrimOpTest, split1)

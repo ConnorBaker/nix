@@ -13,7 +13,10 @@
 #include "nix/util/url.hh"
 #include "nix/expr/value-to-json.hh"
 #include "nix/fetchers/fetch-to-store.hh"
+#include "nix/fetchers/fetch-settings.hh"
 #include "nix/fetchers/input-cache.hh"
+#include "nix/util/mounted-source-accessor.hh"
+#include "nix/util/memo.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -132,8 +135,31 @@ void emitTreeAttrs(
 
     // FIXME: support arbitrary input attributes.
 
+    /* `treeHash` is the tree's name; `narHash` is a thunk computed through
+       the shim when asked for, and it lives on this attribute set only, never
+       on `Input::attrs`, which `attrsToJSON` would force
+       (doc/lazy-store/04-derivation.md, section 1.9).  An input that still
+       carries a `narHash` string emits it as it is. */
+    auto treeHash = input.getTreeHash();
+    if (treeHash)
+        attrs.alloc("treeHash", callPos).mkString(treeHash->to_string(HashFormat::SRI, true), state.mem);
+
     if (auto narHash = input.getNarHash())
         attrs.alloc("narHash", callPos).mkString(narHash->to_string(HashFormat::SRI, true), state.mem);
+    else if (treeHash) {
+        auto lazy = make_ref<fetchers::LazyAttrComputation>(fetchers::LazyAttrComputation{
+            .compute =
+                memo<fetchers::ResolvedAttr>([&state, storePath, treeHash = *treeHash]() -> fetchers::ResolvedAttr {
+                    /* The mounted accessor when there is one (the shim memoises
+                       by its fingerprint), else the store's own object. */
+                    auto mount = state.storeFS->getMount(CanonPath(state.store->printStorePath(storePath)));
+                    SourcePath tree =
+                        mount ? SourcePath{ref(mount)} : SourcePath{state.store->requireStoreObjectAccessor(storePath)};
+                    return narHashOf(state.fetchSettings, *state.store, tree, treeHash)
+                        .to_string(HashFormat::SRI, true);
+                })});
+        emitLazyAttrThunk(state, lazy, attrs.alloc("narHash", callPos));
+    }
 
     if (input.getType() == "git")
         attrs.alloc("submodules", callPos)
@@ -304,9 +330,9 @@ static void fetchTree(
         input = lookupInRegistries(state.fetchSettings, *state.store, input, fetchers::UseRegistries::Limited).first;
 
     if (state.settings.pureEval && !input.isLocked(state.fetchSettings)) {
-        if (input.getNarHash())
+        if (input.getTreeHash() || input.getNarHash())
             warn(
-                "Input '%s' is unlocked (e.g. lacks a Git revision) but is checked by NAR hash. "
+                "Input '%s' is unlocked (e.g. lacks a Git revision) but is checked by a content hash. "
                 "This is not reproducible and will break after garbage collection or when shared.",
                 input.to_string());
         else
@@ -326,10 +352,21 @@ static void fetchTree(
             throw Error("input '%s' is not allowed to use the '__final' attribute", input.to_string());
     }
 
+    /* The fetcher reads whatever store paths the attributes named (a
+       `path` input is copied from the store, for instance), so they must be
+       there first.  Nothing is built: a derivation output in the context is
+       read unbuilt, as before. */
+    if (!context.empty())
+        state.flushPendingWrites();
+    /* A local input is read from the disk: if it names a pending object, the
+       object is written first, as at every dereference. */
+    if (auto p = input.getSourcePath(); p && p->is_absolute())
+        state.writePendingBeforeRead(state.rootPath(CanonPath(p->string())));
+
     auto cachedInput =
         state.inputCache->getAccessor(state.fetchSettings, *state.store, input, fetchers::UseRegistries::No);
 
-    auto storePath = state.mountInput(cachedInput.lockedInput, input, cachedInput.accessor);
+    auto storePath = state.mountInput(cachedInput.lockedInput, cachedInput.accessor);
 
     emitTreeAttrs(state, callSite.pos, storePath, cachedInput.lockedInput, v, params.emptyRevFallback, false);
 }
@@ -347,7 +384,8 @@ static RegisterPrimOp primop_fetchTree({
           Fetch a file system tree or a plain file using one of the supported backends and return an attribute set with:
 
           - the resulting fixed-output [store path](@docroot@/store/store-path.md)
-          - the corresponding [NAR](@docroot@/store/file-system-object/content-address.md#serial-nix-archive) hash
+          - the tree hash (`treeHash`), the [git tree hash](@docroot@/store/file-system-object/content-address.md#git) the store path is named by
+          - the corresponding [NAR](@docroot@/store/file-system-object/content-address.md#serial-nix-archive) hash (`narHash`), computed from the tree when it is used
           - backend-specific metadata (currently not documented). <!-- TODO: document output attributes -->
 
           *input* must be an attribute set with the following attributes:
@@ -357,11 +395,17 @@ static RegisterPrimOp primop_fetchTree({
             One of the [supported source types](#source-types).
             This determines other required and allowed input attributes.
 
+          - `treeHash` (String, optional)
+
+            The [git tree hash](@docroot@/store/file-system-object/content-address.md#git) of the tree (SHA-256, in SRI form), the hash the store names the tree by.
+            It can be used to substitute the source of the tree, and it verifies tree contents that may not be verified by the underlying transfer mechanism.
+            If `treeHash` is set, the source is first looked up in the Nix store and [substituters](@docroot@/command-ref/conf-file.md#conf-substituters), and only fetched if not available.
+
           - `narHash` (String, optional)
 
-            The `narHash` parameter can be used to substitute the source of the tree.
-            It also allows for verification of tree contents that may not be provided by the underlying transfer mechanism.
-            If `narHash` is set, the source is first looked up is the Nix store and [substituters](@docroot@/command-ref/conf-file.md#conf-substituters), and only fetched if not available.
+            An older assertion than `treeHash`: the hash of the tree's [NAR serialisation](@docroot@/store/file-system-object/content-address.md#serial-nix-archive).
+            It is accepted and verified by a walk of the fetched tree (once per tree; the result is remembered), and the result carries `treeHash` in its place.
+            A tree already in the store is found by a `narHash` only if it was verified by one before; a `treeHash` names it directly.
 
           A subset of the output attributes of `fetchTree` can be re-used for subsequent calls to `fetchTree` to produce the same result again.
           That is, `fetchTree` is idempotent.
@@ -449,8 +493,11 @@ static RegisterPrimOp primop_fetchTree({
           >   outPath = "/nix/store/l5m6qlvfs9sdw14ja3qbzpglcjlb6j1x-source";
           >   rev = "ae2e6b3958682513d28f7d633734571fb18285dd";
           >   shortRev = "ae2e6b3";
+          >   treeHash = "sha256-…";
           > }
           > ```
+          >
+          > `treeHash` is the tree hash the store path is named by (its value is elided here); `narHash` is computed from the tree when it is used.
 
           > **Example**
           >
@@ -484,6 +531,7 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
 {
     std::optional<std::string> url;
     std::optional<Hash> expectedHash;
+    std::optional<Hash> expectedTreeHash;
 
     state.forceValue(*args[0], noPos);
 
@@ -501,6 +549,11 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
                     state.forceStringNoCtx(
                         *attr.value, attr.pos, "while evaluating the sha256 of the content we should fetch"),
                     HashAlgorithm::SHA256);
+            else if (n == "treeHash" && unpack)
+                expectedTreeHash = Hash::parseAny(
+                    state.forceStringNoCtx(
+                        *attr.value, attr.pos, "while evaluating the treeHash of the tree we should fetch"),
+                    HashAlgorithm::SHA256);
             else if (n == "name") {
                 nameAttrPassed = true;
                 name = state.forceStringNoCtx(
@@ -516,6 +569,10 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
 
     if (who == "fetchTarball")
         url = state.settings.resolvePseudoUrl(*url);
+
+    /* A `file:` URL is read from the disk: the dereference rule. */
+    if (url->starts_with("file:///"))
+        state.writePendingBeforeRead(state.rootPath(CanonPath(url->substr(7))));
 
     state.checkURI(*url);
 
@@ -548,32 +605,59 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
             .debugThrow();
     }
 
-    if (state.settings.pureEval && !expectedHash)
-        state.error<EvalError>("in pure evaluation mode, '%s' requires a 'sha256' argument", who)
-            .atPos(noPos)
-            .debugThrow();
+    if (state.settings.pureEval && !expectedHash && !expectedTreeHash) {
+        if (unpack)
+            state.error<EvalError>("in pure evaluation mode, '%s' requires a 'treeHash' or 'sha256' argument", who)
+                .atPos(noPos)
+                .debugThrow();
+        else
+            state.error<EvalError>("in pure evaluation mode, '%s' requires a 'sha256' argument", who)
+                .atPos(noPos)
+                .debugThrow();
+    }
 
-    // early exit if pinned and already in the store
-    if (expectedHash && expectedHash->algo == HashAlgorithm::SHA256) {
-        auto expectedPath = state.store->makeFixedOutputPath(
-            name,
-            FixedOutputInfo{
-                .method = unpack ? FileIngestionMethod::NixArchive : FileIngestionMethod::Flat,
-                .hash = *expectedHash,
-                .references = {}});
+    // early exit if pinned and already in the store (doc/lazy-store/04-derivation.md,
+    // section 1.9, the fetchers' and the language's representation): an unpacked tree is named by
+    // its tree hash -- given as `treeHash`, or known to the memoised
+    // bijection from a `sha256` (its NAR hash) it verified before; a flat
+    // file is named by its `sha256`.
+    {
+        std::optional<StorePath> expectedPath;
+        if (unpack) {
+            if (expectedTreeHash)
+                expectedPath = gitTreePath(*state.store, name, *expectedTreeHash);
+            else if (expectedHash && expectedHash->algo == HashAlgorithm::SHA256)
+                if (auto hash = lookupTreeAddress(state.fetchSettings, *expectedHash))
+                    expectedPath = gitTreePath(*state.store, name, *hash);
+        } else if (expectedHash && expectedHash->algo == HashAlgorithm::SHA256)
+            expectedPath = state.store->makeFixedOutputPath(
+                name, FixedOutputInfo{.method = FileIngestionMethod::Flat, .hash = *expectedHash, .references = {}});
 
         // Try to get the path from the local store or substituters
-        try {
-            state.store->getBuilder()->ensurePath(expectedPath);
-            debug("using substituted/cached path '%s' for '%s'", state.store->printStorePath(expectedPath), *url);
-            state.allowAndSetStorePathString(expectedPath, v);
-            return;
-        } catch (Error & e) {
-            debug(
-                "substitution of '%s' failed, will try to download: %s",
-                state.store->printStorePath(expectedPath),
-                e.what());
-            // Fall through to download
+        if (expectedPath) {
+            try {
+                state.store->getBuilder()->ensurePath(*expectedPath);
+                debug("using substituted/cached path '%s' for '%s'", state.store->printStorePath(*expectedPath), *url);
+                /* Both assertions given: the tree is named by `treeHash`; the
+                   `sha256` is verified too, by the shim (the memo answers
+                   first, else a walk of the store object). */
+                if (expectedTreeHash && expectedHash)
+                    assertNarHash(
+                        state.fetchSettings,
+                        *state.store,
+                        SourcePath{state.store->requireStoreObjectAccessor(*expectedPath)},
+                        *expectedTreeHash,
+                        *expectedHash,
+                        *url);
+                state.allowAndSetStorePathString(*expectedPath, v);
+                return;
+            } catch (Error & e) {
+                debug(
+                    "substitution of '%s' failed, will try to download: %s",
+                    state.store->printStorePath(*expectedPath),
+                    e.what());
+                // Fall through to the download
+            }
         }
     }
 
@@ -583,12 +667,17 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
             {"url", *url},
             {"name", name},
         };
+        /* The assertions ride into `Input::getAccessor`: `treeHash` is
+           compared with the tree's name, `narHash` (the older form) verified
+           by the shim's walk and replaced. */
+        if (expectedTreeHash)
+            attrs.emplace("treeHash", expectedTreeHash->to_string(HashFormat::SRI, true));
         if (expectedHash)
             attrs.emplace("narHash", expectedHash->to_string(HashFormat::SRI, true));
         auto input = fetchers::Input::fromAttrs(std::move(attrs));
         auto cachedInput =
             state.inputCache->getAccessor(state.fetchSettings, *state.store, input, fetchers::UseRegistries::No);
-        auto storePath = state.mountInput(cachedInput.lockedInput, input, cachedInput.accessor);
+        auto storePath = state.mountInput(cachedInput.lockedInput, cachedInput.accessor);
         state.mkStorePathString(storePath, v);
     } else {
         auto storePath = fetchers::downloadFile(*state.store, state.fetchSettings, *url, name).storePath;
@@ -672,7 +761,16 @@ static RegisterPrimOp primop_fetchTarball({
 
       This function can also verify the contents against a hash. In that
       case, the function takes a set instead of a URL. The set requires
-      the attribute `url` and the attribute `sha256`, e.g.
+      the attribute `url` and one of the attributes `treeHash` and `sha256`:
+
+      - `treeHash` is the [git tree hash](@docroot@/store/file-system-object/content-address.md#git)
+        of the unpacked tree (SHA-256, in SRI form), the hash the store names
+        it by. A tree already in the store is found without downloading.
+
+      - `sha256` is the hash of the unpacked tree's
+        [NAR serialisation](@docroot@/store/file-system-object/content-address.md#serial-nix-archive),
+        an older assertion; it is verified by a walk of the downloaded tree
+        (once; the result is remembered), e.g.
 
       ```nix
       with import (fetchTarball {
@@ -682,6 +780,10 @@ static RegisterPrimOp primop_fetchTarball({
 
       stdenv.mkDerivation { … }
       ```
+
+      The tree hash to pin is the `treeHash` that `builtins.fetchTree`
+      returns for the same URL, or the `hash` that `nix flake prefetch`
+      prints.
 
       Not available in [restricted evaluation mode](@docroot@/command-ref/conf-file.md#conf-restrict-eval).
     )",

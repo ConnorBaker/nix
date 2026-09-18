@@ -160,7 +160,9 @@ static void prim_flakeRefToString(EvalState & state, CallSite callSite, Value * 
         } else if (t == nBool) {
             attrs.emplace(state.symbols[attr.name], Explicit<bool>{attr.value->boolean()});
         } else if (t == nString) {
-            attrs.emplace(state.symbols[attr.name], std::string(attr.value->string_view()));
+            attrs.emplace(
+                state.symbols[attr.name],
+                std::string(state.forceString(*attr.value, attr.pos, "while evaluating a flake reference attribute")));
         } else {
             state
                 .error<EvalError>(

@@ -6,6 +6,9 @@
 #include "nix/store/pathlocks.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/indirect-root-store.hh"
+#include "nix/store/git-object-store.hh"
+#include "nix/util/object-hash-sink.hh"
+#include "nix/util/fun.hh"
 #include "nix/util/sync.hh"
 
 #include <chrono>
@@ -22,13 +25,22 @@ namespace nix {
  * 0.7.  Version 2 was Nix 0.8 and 0.9.  Version 3 is Nix 0.10.
  * Version 4 is Nix 0.11.  Version 5 is Nix 0.12-0.16.  Version 6 is
  * Nix 1.0.  Version 7 is Nix 1.3. Version 10 is 2.0.
+ *
+ * Version 11 changes no table: `ValidPaths.hash` holds the object hash (01 section 9.11, `git:sha256:<base16>`)
+ * where 10 held the NAR hash (`sha256:<base16>`); a version-10 row is migrated on first query or by `nix store
+ * migrate`.  Bumped, against the additive-migration convention below, because the column's meaning changed.
  */
-const int nixSchemaVersion = 10;
+const int nixSchemaVersion = 11;
 
 struct OptimiseStats
 {
+    /** Regular files replaced by a link to a blob file the store held. */
     unsigned long filesLinked = 0;
     uint64_t bytesFreed = 0;
+    /** Regular files that became the store's blob file (a blob the store lacked). */
+    unsigned long filesEntered = 0;
+    /** Rows of an older schema given their object hash by the walk (`nix store migrate`'s work). */
+    unsigned long rowsMigrated = 0;
 };
 
 struct LocalSettings;
@@ -240,7 +252,12 @@ private:
 public:
 
     const std::filesystem::path dbDir;
-    const std::filesystem::path linksDir;
+
+    /**
+     * The store's object store (01 §9.10): the local store's
+     * representation, unconditionally; every path added is entered.
+     */
+    GitObjectStore objects;
     const std::filesystem::path reservedPath;
     const std::filesystem::path schemaPath;
     const std::filesystem::path tempRootsDir;
@@ -275,8 +292,26 @@ public:
 
     StorePathSet queryAllValidPaths() override;
 
+    /**
+     * The row, migrated (`migratedPathInfo`): a schema-10 row is given
+     * its object hash by one walk of the path, outside the database lock,
+     * and returned with `assertedNarHash` set to the NAR hash it held.
+     */
     void queryPathInfoUncached(
         const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override;
+
+    /**
+     * Migrate one row as `queryPathInfoUncached` does, for `nix store
+     * migrate` and `addSignatures`: a row holding a NAR hash is given its
+     * object hash and, when missing, its NAR size, and re-rendered.  A row
+     * already migrated is left alone.
+     *
+     * @throws InvalidPath if the path is not valid.
+     * @throws Error, naming the remedy, if the path's files do not hash to
+     * the NAR hash the row asserts (both hashes named) or are missing
+     * (`walkOldRow`); the row is left as it is.
+     */
+    void migratePathInfo(const StorePath & path);
 
     void queryReferrers(const StorePath & path, StorePathSet & referrers) override;
 
@@ -393,10 +428,94 @@ public:
     void optimiseStore() override;
 
     /**
-     * Optimise a single store path. Optionally, test the encountered
-     * symlinks for corruption.
+     * Remove the `.links` table an older Nix kept: every entry is a hard
+     * link to a file a store path also links, or a dead one, so removing
+     * the whole directory frees the dead entries and loses nothing.  The
+     * one deleter of it, called by the whole-store collection and by
+     * `--optimise`; nothing when the directory does not exist.
      */
-    void optimisePath(const std::filesystem::path & path, RepairFlag repair);
+    void removeLegacyLinks();
+
+    /**
+     * Enter a materialised store path into the object store by one walk
+     * -- after a build, and for a flat file or a plain copy
+     * `addToStoreFromDump` wrote -- and return what that walk computed,
+     * the root's entry and the NAR size, for the caller to register
+     * (`ValidPathInfo::objectHash`, the database's fact).
+     */
+    ObjectHashSink::Result enterPath(const std::filesystem::path & path, RepairFlag repair);
+
+    /**
+     * Restore a NAR into `path` through the store's composite (`08` §1.6;
+     * 01 §9.10, "Ingestion writes only what the store lacks").  The caller
+     * registers the root's object hash.  `hooks->regularFileCreated` fires
+     * only for the files written, not for those linked.
+     */
+    ObjectHashSink::Result restoreThroughObjects(
+        const std::filesystem::path & path,
+        Source & source,
+        bool startFsync,
+        RestoreSinkHooks * hooks,
+        RepairFlag repair = NoRepair);
+
+    /**
+     * What the naming of a source knows about the tree being copied, as
+     * the copy from the store's own objects consults it (01 §9.10, the
+     * second route; `04` §1.7): the entry -- mode and identifier -- of
+     * the node at `path`, relative to the tree's root, when the naming
+     * has one (a memo row), else nullopt.  Consulted for the root and
+     * for directories; never for a file inside a directory the store
+     * lacks, which is read as the one route reads it.  What it answers
+     * is trusted as the naming trusted it: the tree copied is the tree
+     * named, within the memo's own window (01 §2.2).
+     */
+    using TreeNamer = fun<std::optional<merkle::TreeEntry>(const CanonPath & path, const SourceAccessor::Stat & st)>;
+
+    /**
+     * Whether a copy from an accessor may be made from the store's own
+     * objects (01 §9.10, the second route): a store that owns its object
+     * store (`ownsObjectStore`), on a system where the object store
+     * links -- not Windows, where it shares nothing and the `*at` calls
+     * the materialisation rests on have no counterpart.  The one
+     * predicate the route is taken under; `fetchToStore2` asks it.
+     */
+    bool materialisesFromObjects() const;
+
+    /**
+     * Restore the tree at `path` into `dst` from the store's own objects
+     * where it holds them, and through the composite of
+     * `restoreThroughObjects` where it does not (01 §9.10, the second
+     * route; `08` §1.6, `MaterialisingVisitor`): a node `namer` names
+     * whose objects the store holds -- each directory's body in `trees/`,
+     * verified against its identifier as it is read, each blob's file in
+     * `blobs/` -- is made on disk by `mkdirat`, `linkat` and `symlinkat`
+     * without reading the accessor; a node it does not name, or whose
+     * objects the store lacks or holds corrupt, is read from the
+     * accessor and written through the one route's visitor, which links
+     * what the store holds and writes what it lacks.  Same result as
+     * `restoreThroughObjects` on the accessor's NAR (law 2), same
+     * hooks: `hooks->regularFileCreated` fires for the files written and
+     * for none linked.  The caller registers the root's object hash.
+     */
+    ObjectHashSink::Result materialiseThroughObjects(
+        const std::filesystem::path & dst,
+        const SourcePath & path,
+        PathFilter & filter,
+        bool startFsync,
+        RestoreSinkHooks * hooks,
+        RepairFlag repair,
+        TreeNamer namer);
+
+    /**
+     * `Store::addToStore(name, path, Git, …)` by `materialiseThroughObjects`:
+     * the second route of 01 §9.10, with the registration of
+     * `addToStoreFromDump` -- `autoGC` before the restore, a locked
+     * temporary directory in the store, the path locked, moved into
+     * place and registered with the root's object hash and the NAR size
+     * the walk computed.  Only when `materialisesFromObjects()`.
+     */
+    StorePath materialise(
+        std::string_view name, const SourcePath & path, PathFilter & filter, RepairFlag repair, TreeNamer namer);
 
     bool verifyStore(bool checkContents, RepairFlag repair) override;
 
@@ -424,6 +543,25 @@ protected:
      */
     virtual VerificationResult verifyAllValidPaths(RepairFlag repair);
 
+    /**
+     * Whether the object store under `realStoreDir` -- `.objects`, and an
+     * older Nix's `.links` -- is this store's alone.  When it is not (the
+     * overlay store: its store directory is a merged mount, so `.objects`
+     * and `.links` there show the lower store's too, which is read-only
+     * and shared), the collector sweeps no object and removes no `.links`,
+     * and `--verify --check-contents` checks no path's objects and hashes
+     * no object file, since an unlink or a repair through the merged path
+     * would white out or copy up the lower store's files (01 §10, *the
+     * local overlay store's object store is not its own*).  The upper
+     * layer's own objects are then not
+     * reclaimed; a sweep over the upper layer alone is the design owed
+     * for the Linux run.
+     */
+    virtual bool ownsObjectStore() const
+    {
+        return true;
+    }
+
 public:
 
     /**
@@ -431,8 +569,8 @@ public:
      * the paths referenced by it exists, and in the case of an output
      * path of a derivation, that it has been produced by a successful
      * execution of the derivation (or something equivalent).  Also
-     * register the hash of the file system contents of the path.  The
-     * hash must be a SHA-256 hash.
+     * register the object hash of the path's contents, which `info`
+     * must carry: an info without one is refused.
      */
     void registerValidPath(const ValidPathInfo & info);
 
@@ -508,8 +646,86 @@ private:
      */
     void invalidatePathChecked(const StorePath & path);
 
+    /**
+     * The row as it is, under the lock: `objectHash` set when the
+     * column holds one, else `assertedNarHash` set to the NAR hash a
+     * schema-10 row holds.  Never migrates -- `addSignatures` calls
+     * this inside a transaction.
+     */
     std::shared_ptr<const ValidPathInfo> queryPathInfoInternal(State & state, const StorePath & path);
 
+    /**
+     * `queryPathInfoInternal` under the lock it takes: the row as the
+     * database has it, never migrated, null for a path that is not
+     * valid.  For the collector, whose dead set needs a row's references
+     * and deriver alone: migrating a row on its way to deletion would
+     * read and hash every byte of the path first (`walkOldRow`), a cost
+     * proportional to the garbage; the live rows its closure reaches are
+     * migrated by `computeFSClosure`'s queries, which is right, since
+     * they are kept (01 section 10, *the collector reads a dead row
+     * without migrating it*).
+     */
+    std::shared_ptr<const ValidPathInfo> queryPathInfoUnmigrated(const StorePath & path);
+
+    /**
+     * What the walk of a schema-10 row's path found (01 §10, *a schema-10
+     * row's migration checks the NAR hash the row asserts*):
+     * `Migrated` -- the walk's NAR hash is the one the row asserts, the
+     * object hash written; `Modified` -- it is not, nothing written;
+     * `FilesMissing` -- the path's directory, or a file under it, is gone
+     * while the row is valid (what `nix-store --verify` finds and
+     * removes), nothing written.
+     */
+    enum struct OldRowWalk { Migrated, Modified, FilesMissing };
+
+    /**
+     * One walk of the path of a schema-10 row: the object hash and the NAR
+     * size, and on a tee of the same bytes the NAR hash, compared with the
+     * one the row asserts -- as `--load-db` checks a registration
+     * (`nix-store.cc`).  On `Migrated`, `info` carries the object hash (and
+     * the size when the row lacked it) and the column is written
+     * (`recordObjectHash`); on `Modified` the two NAR hashes -- asserted,
+     * walked -- are stored in `narHashes` when given.  No root is taken
+     * (see `migratedPathInfo`).
+     *
+     * @throws InvalidPath if the row was deleted before or during the walk.
+     */
+    OldRowWalk walkOldRow(ValidPathInfo & info, std::optional<std::pair<Hash, Hash>> * narHashes = nullptr);
+
+    /**
+     * The migration behind `queryPathInfoUncached` and `migratePathInfo`
+     * (`08` §1.1): outside the lock, the row re-read before it is written
+     * (`recordObjectHash`), and no root taken -- the caller holds one, or
+     * is the collector.  A row whose path the walk finds modified, or
+     * whose files are missing, is returned as the database has it --
+     * `assertedNarHash` set, no object hash -- so that a query answers as
+     * master's did and the verifiers report what is wrong: the
+     * modification through the NAR hash (`contentMismatch`, `verifyStore
+     * --check-contents`), the missing files by `nix-store --verify`, which
+     * removes the row; nothing writes the column until then.
+     *
+     * @throws InvalidPath if the row was deleted before or during the walk.
+     */
+    std::shared_ptr<const ValidPathInfo> migratedPathInfo(std::shared_ptr<const ValidPathInfo> info);
+
+    /**
+     * The one write of an older row's object hash: the row re-read under
+     * the lock, and written only if it still holds no object hash (another
+     * process may have migrated, signed or deleted it meanwhile).  Nothing
+     * on a read-only store.  Called by `migratedPathInfo` with the walk's
+     * result and by `optimiseStore` with the entering walk's, which is the
+     * same walk.
+     *
+     * @return Whether the row was written.
+     */
+    bool recordObjectHash(const StorePath & path, const ObjectHash & objectHash, uint64_t narSize);
+
+    /**
+     * Write the row from `info`.
+     *
+     * @throws Error if `info` lacks its object hash: nothing stores a NAR
+     * hash any more.
+     */
     void updatePathInfo(State & state, const ValidPathInfo & info);
 
     void findRoots(const std::filesystem::path & path, std::filesystem::file_type type, Roots & roots);
@@ -520,16 +736,38 @@ private:
 
     std::pair<std::filesystem::path, AutoCloseFD> createTempDirInStore();
 
-    typedef boost::unordered_flat_set<ino_t> InodeHash;
+    /**
+     * The object hash of every valid path, from the column, under the
+     * database lock: the sweep's live roots.  A row older than schema 11
+     * is skipped, not migrated (the migration walks), and counted.
+     */
+    uint64_t forEachValidObjectHash(fun<void(const ObjectHash &)> callback);
 
-    InodeHash loadInodeHash();
-    Strings readDirectoryIgnoringInodes(const std::filesystem::path & path, const InodeHash & inodeHash);
-    void optimisePath_(
-        Activity * act,
-        OptimiseStats & stats,
+    /**
+     * The verifier's walk of the path at `realPath` (`VerifyVisitor`; law 4
+     * of 01 §9.10 with law 3's exceptions): its object hash and NAR size,
+     * and every object the walk reached that the object store lacks and
+     * should hold -- each tree on the way, the synthetic root tree of a
+     * bare executable or symlink, each symlink's target blob, and the blob
+     * of each regular file the store places (`placementOf`: none is
+     * expected for a file it leaves as written).  In walk order; the
+     * second is empty when the law holds.
+     */
+    std::pair<ObjectHashSink::Result, std::vector<std::filesystem::path>>
+    verifyObjects(const std::filesystem::path & realPath);
+
+    /**
+     * The walk behind `enterPath` and `optimiseStore` (`EnterVisitor`,
+     * `08` §1.6): a file whose inode is in `blobInodes` (when given) is
+     * not read; `act` and `stats`, when given, count the files entered and
+     * replaced.
+     */
+    ObjectHashSink::Result enterIntoObjects(
         const std::filesystem::path & path,
-        InodeHash & inodeHash,
-        RepairFlag repair);
+        RepairFlag repair,
+        Activity * act = nullptr,
+        OptimiseStats * stats = nullptr,
+        GitObjectStore::BlobInodes * blobInodes = nullptr);
 
     // Internal versions that are not wrapped in retry_sqlite.
     bool isValidPath_(State & state, const StorePath & path);
@@ -541,6 +779,8 @@ private:
     friend struct DerivationGoal;
     /* Only used for createTempDirInStore. */
     friend class DerivationBuilderImpl;
+    /* Drives `enterIntoObjects` alone (src/libstore-tests/local-store.cc). */
+    friend class LocalStoreObjectsTest;
 };
 
 } // namespace nix

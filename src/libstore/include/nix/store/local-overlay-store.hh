@@ -219,6 +219,20 @@ private:
     VerificationResult verifyAllValidPaths(RepairFlag repair) override;
 
     /**
+     * The store directory is the merged mount: `.objects` and `.links`
+     * under it are the union of the upper layer's and the lower store's,
+     * and every write through it lands in the upper layer -- an unlink of
+     * a lower file is a whiteout, a repair of a lower path a copy-up.  So
+     * the collector's sweep, the `.links` removal and the verifier's
+     * object checks are not run for this store (`LocalStore::
+     * ownsObjectStore`); `optimiseStore` above enters nothing either.
+     */
+    bool ownsObjectStore() const override
+    {
+        return false;
+    }
+
+    /**
      * Deletion only effects the upper layer, so we ignore lower-layer referrers.
      */
     void queryGCReferrers(const StorePath & path, StorePathSet & referrers) override;

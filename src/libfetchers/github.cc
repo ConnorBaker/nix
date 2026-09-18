@@ -70,8 +70,8 @@ struct GitArchiveInputScheme : InputScheme
                 attrs.insert_or_assign("ref", value);
             } else if (name == "host")
                 attrs.insert_or_assign("host", value);
-            else if (name == "narHash")
-                attrs.insert_or_assign("narHash", value);
+            else if (name == "narHash" || name == "treeHash")
+                attrs.insert_or_assign(name, value);
             else
                 throw BadURL("URL '%s' contains unknown parameter '%s'", url, name);
         }
@@ -83,7 +83,7 @@ struct GitArchiveInputScheme : InputScheme
         return inputFromAttrs(attrs);
     }
 
-    const std::map<std::string, AttributeInfo> & allowedAttrs() const override
+    const std::map<std::string, AttributeInfo> & schemeAttrs() const override
     {
         static const std::map<std::string, AttributeInfo> attrs = {
             {
@@ -103,19 +103,11 @@ struct GitArchiveInputScheme : InputScheme
                 {},
             },
             {
-                "narHash",
-                {},
-            },
-            {
                 "lastModified",
                 {},
             },
             {
                 "host",
-                {},
-            },
-            {
-                "treeHash",
                 {},
             },
         };
@@ -166,6 +158,8 @@ struct GitArchiveInputScheme : InputScheme
             .scheme = std::string{schemeName()},
             .path = path,
         };
+        if (auto treeHash = input.getTreeHash())
+            url.query.insert_or_assign("treeHash", treeHash->to_string(HashFormat::SRI, true));
         if (auto narHash = input.getNarHash())
             url.query.insert_or_assign("narHash", narHash->to_string(HashFormat::SRI, true));
         auto host = maybeGetStrAttr(input.attrs, "host");
@@ -284,12 +278,20 @@ struct GitArchiveInputScheme : InputScheme
 
         if (auto treeHashAttrs = cache->lookup(treeHashKey)) {
             if (auto lastModifiedAttrs = cache->lookup(lastModifiedKey)) {
-                auto treeHash = getRevAttr(*treeHashAttrs, "treeHash");
+                /* The tarball cache's identifiers are SHA-256 (v3); a row of
+                   the SHA-1 cache reads as absent. */
+                auto treeHashS = getStrAttr(*treeHashAttrs, "treeHash");
                 auto lastModified = getIntAttr(*lastModifiedAttrs, "lastModified");
-                if (settings.getTarballCache()->hasObject(treeHash))
-                    return {std::move(input), TarballInfo{.treeHash = treeHash, .lastModified = (time_t) lastModified}};
-                else
-                    debug("Git tree with hash '%s' has disappeared from the cache, refetching...", treeHash.gitRev());
+                if (treeHashS.size() == 2 * regularHashSize(HashAlgorithm::SHA256)) {
+                    auto treeHash = Hash::parseNonSRIUnprefixed(treeHashS, HashAlgorithm::SHA256);
+                    if (settings.getTarballCache()->hasObject(treeHash))
+                        return {
+                            std::move(input), TarballInfo{.treeHash = treeHash, .lastModified = (time_t) lastModified}};
+                    else
+                        debug(
+                            "Git tree with hash '%s' has disappeared from the cache, refetching...", treeHash.gitRev());
+                } else
+                    debug("Git tree hash '%s' is from an older cache, refetching...", treeHashS);
             }
         }
 
@@ -337,9 +339,13 @@ struct GitArchiveInputScheme : InputScheme
     {
         auto [input, tarballInfo] = downloadArchive(settings, store, _input);
 
-#if 0
-        input.attrs.insert_or_assign("treeHash", tarballInfo.treeHash.gitRev());
-#endif
+        /* The tarball cache's tree hash is the input's name: SHA-256, the
+           object hash of the tree's root (`dereferenceSingletonDirectory`
+           above), as the cache has been since v3. */
+        if (tarballInfo.treeHash.algo != HashAlgorithm::SHA256)
+            throw Error(
+                "tree hash of '%s' is %s, not SHA-256", input.to_string(), printHashAlgo(tarballInfo.treeHash.algo));
+        input.attrs.insert_or_assign("treeHash", tarballInfo.treeHash.to_string(HashFormat::SRI, true));
         input.attrs.insert_or_assign("lastModified", uint64_t(tarballInfo.lastModified));
 
         auto accessor =
@@ -351,10 +357,11 @@ struct GitArchiveInputScheme : InputScheme
     bool isLocked(const Settings & settings, const Input & input) const override
     {
         /* Since we can't verify the integrity of the tarball from the
-           Git revision alone, we also require a NAR hash for
-           locking. FIXME: in the future, we may want to require a Git
-           tree hash instead of a NAR hash. */
-        return input.getRev().has_value() && (settings.trustTarballsFromGitForges || input.getNarHash().has_value());
+           Git revision alone, we also require a tree hash -- or a NAR
+           hash, an old assertion -- for locking. */
+        return input.getRev().has_value()
+               && (settings.trustTarballsFromGitForges || input.getTreeHash().has_value()
+                   || input.getNarHash().has_value());
     }
 
     std::optional<ExperimentalFeature> experimentalFeature() const override

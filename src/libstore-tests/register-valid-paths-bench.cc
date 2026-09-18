@@ -6,6 +6,8 @@
 #include "nix/store/store-open.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/hash.hh"
+#include "nix/util/merkle-hash.hh"
+#include "nix/util/object-hash.hh"
 
 #ifndef _WIN32
 
@@ -55,7 +57,13 @@ static void BM_RegisterValidPathsDerivations(benchmark::State & state)
             if (!out)
                 throw SysError("writing derivation to store");
 
-            ValidPathInfo info{drvPath, UnkeyedValidPathInfo(*localStore, Hash::dummy)};
+            /* Registration requires the object hash: a plain file's blob id. */
+            ValidPathInfo info{
+                drvPath,
+                UnkeyedValidPathInfo(
+                    *localStore,
+                    ObjectHash::of(
+                        merkle::TreeEntry{.mode = merkle::Mode::Regular, .hash = merkle::blobId(drvContents)}))};
             info.narSize = drvContents.size();
 
             infos.emplace(drvPath, std::move(info));

@@ -1,4 +1,6 @@
 #include "nix/expr/value-to-xml.hh"
+
+#include <sstream>
 #include "nix/util/xml-writer.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/util/signals.hh"
@@ -83,8 +85,10 @@ static void printValueAsXML(
 
     case nString:
         /* !!! show the context? */
-        copyContext(v, context);
-        doc.writeEmptyElement("string", singletonAttrs("value", v.string_view()));
+        /* Not a sink: `builtins.toXML` makes a value of the result.  Whoever
+           emits it realises with `context`. */
+        doc.writeEmptyElement(
+            "string", singletonAttrs("value", state.forceString(v, context, pos, "while serialising a string to XML")));
         break;
 
     case nPath:
@@ -104,14 +108,15 @@ static void printValueAsXML(
                 if (strict)
                     state.forceValue(*a->value, a->pos);
                 if (a->value->type() == nString)
-                    xmlAttrs["drvPath"] = drvPath = a->value->string_view();
+                    xmlAttrs["drvPath"] = drvPath =
+                        state.forceString(*a->value, a->pos, "while serialising a derivation to XML");
             }
 
             if (auto a = v.attrs()->get(state.s.outPath)) {
                 if (strict)
                     state.forceValue(*a->value, a->pos);
                 if (a->value->type() == nString)
-                    xmlAttrs["outPath"] = a->value->string_view();
+                    xmlAttrs["outPath"] = state.forceString(*a->value, a->pos, "while serialising a derivation to XML");
             }
 
             XMLOpenElement _(doc, "derivation", xmlAttrs);
@@ -191,19 +196,17 @@ void ExternalValueBase::printValueAsXML(
     doc.writeEmptyElement("unevaluated");
 }
 
-void printValueAsXML(
-    EvalState & state,
-    bool strict,
-    bool location,
-    Value & v,
-    std::ostream & out,
-    NixStringContext & context,
-    const PosIdx pos)
+std::string
+renderValueAsXML(EvalState & state, bool strict, bool location, Value & v, NixStringContext & context, const PosIdx pos)
 {
-    XMLWriter doc(true, out);
-    XMLOpenElement root(doc, "expr");
-    StringSet drvsSeen;
-    printValueAsXML(state, strict, location, v, doc, context, drvsSeen, pos);
+    std::ostringstream out;
+    {
+        XMLWriter doc(true, out);
+        XMLOpenElement root(doc, "expr");
+        StringSet drvsSeen;
+        printValueAsXML(state, strict, location, v, doc, context, drvsSeen, pos);
+    }
+    return out.str();
 }
 
 } // namespace nix

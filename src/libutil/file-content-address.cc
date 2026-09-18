@@ -1,6 +1,7 @@
 #include "nix/util/file-content-address.hh"
 #include "nix/util/archive.hh"
-#include "nix/util/git.hh"
+#include "nix/util/merkle-hash.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/source-path.hh"
 #include "nix/util/fs-sink.hh"
 
@@ -123,9 +124,19 @@ HashResult hashPath(const SourcePath & path, FileSerialisationMethod method, Has
     return sink.finish();
 }
 
+void checkIngestionAlgorithm(FileIngestionMethod method, HashAlgorithm algo)
+{
+    if (method == FileIngestionMethod::Git && algo != merkle::hashAlgo)
+        throw Error(
+            "the git content-address method admits SHA-256 only, not %s; "
+            "compute the SHA-256 address with 'nix hash path --mode git' and use that",
+            printHashAlgo(algo));
+}
+
 std::pair<Hash, std::optional<uint64_t>>
 hashPath(const SourcePath & path, FileIngestionMethod method, HashAlgorithm ht, PathFilter & filter)
 {
+    checkIngestionAlgorithm(method, ht);
     switch (method) {
     case FileIngestionMethod::Flat:
     case FileIngestionMethod::NixArchive: {
@@ -133,7 +144,7 @@ hashPath(const SourcePath & path, FileIngestionMethod method, HashAlgorithm ht, 
         return {res.hash, res.numBytesDigested};
     }
     case FileIngestionMethod::Git:
-        return {git::dumpHash(ht, path, filter).hash, std::nullopt};
+        return {merkle::objectHash(objectHashOf(*path.accessor, path.path, filter).root), std::nullopt};
     }
     assert(false);
 }

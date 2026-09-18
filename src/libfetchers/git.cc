@@ -1,6 +1,7 @@
 #include "nix/util/environment-variables.hh"
 #include "nix/util/error.hh"
 #include "nix/fetchers/fetchers.hh"
+#include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/users.hh"
 #include "nix/fetchers/cache.hh"
 #include "nix/store/store-api.hh"
@@ -162,6 +163,26 @@ std::vector<PublicKey> getPublicKeys(const Attrs & attrs)
 
 static const Hash nullRev{HashAlgorithm::SHA1};
 
+/* Whether the export-ignore filter of the commit `rev` hides anything; when
+   it does not it is the identity and `GitRepo::getAccessor` leaves it out.
+   The commit's own `.gitattributes` files are a function of the commit, so
+   that part of the answer is kept in the fetcher cache; the sources outside
+   the tree are looked at each time. */
+static bool exportIgnoreHidesNothing(const Settings & settings, ref<GitRepo> repo, const Hash & rev)
+{
+    if (repo->attributesOutsideTheTreeMention("export-ignore", rev))
+        return false;
+    Cache::Key key{"treeMentionsAttribute", {{"rev", rev.gitRev()}, {"attribute", "export-ignore"}}};
+    auto cache = cacheIfAvailable(settings);
+    if (cache)
+        if (auto res = cache->lookup(key))
+            return !getBoolAttr(*res, "mentions");
+    auto mentions = repo->treeMentionsAttribute(rev, "export-ignore");
+    if (cache)
+        cache->upsert(key, {{"mentions", Explicit<bool>{mentions}}});
+    return !mentions;
+}
+
 static LazyAttr makeLazyAttr(fun<ResolvedAttr()> compute)
 {
     return make_ref<LazyAttrComputation>(LazyAttrComputation{
@@ -211,7 +232,7 @@ struct GitInputScheme : InputScheme
         )");
     }
 
-    const std::map<std::string, AttributeInfo> & allowedAttrs() const override
+    const std::map<std::string, AttributeInfo> & schemeAttrs() const override
     {
         static const std::map<std::string, AttributeInfo> attrs = {
             {
@@ -329,10 +350,6 @@ struct GitInputScheme : InputScheme
                       Otherwise, generated from the fetched Git tree.
                     )",
                 },
-            },
-            {
-                "narHash",
-                {},
             },
             {
                 "allRefs",
@@ -940,7 +957,11 @@ struct GitInputScheme : InputScheme
         bool exportIgnore = getExportIgnoreAttr(input);
         bool smudgeLfs = getLfsAttr(input);
         auto accessor = repo->getAccessor(
-            rev, {.exportIgnore = exportIgnore, .smudgeLfs = smudgeLfs}, "«" + input.to_string() + "»");
+            rev,
+            {.exportIgnore = exportIgnore,
+             .smudgeLfs = smudgeLfs,
+             .exportIgnoreHidesNothing = exportIgnore && exportIgnoreHidesNothing(settings, repo, rev)},
+            "«" + input.to_string() + "»");
 
         /* If the repo has submodules, fetch them and return a mounted
            input accessor consisting of the accessor for the top-level

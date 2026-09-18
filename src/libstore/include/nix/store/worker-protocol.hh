@@ -6,6 +6,7 @@
 #include <compare>
 
 #include "nix/store/common-protocol.hh"
+#include "nix/util/object-hash.hh"
 #include "nix/store/gc-store.hh"
 
 namespace nix {
@@ -137,6 +138,16 @@ struct WorkerProto
     static constexpr std::string_view featureDeleteDeadSpecificReferrers = "delete-dead-specific-referrers";
 
     /**
+     * Feature under which a path info's hash slot carries the object
+     * hash (`ObjectHash::render()`, or "" when unknown) followed by a
+     * second string, the asserted NAR hash (base-16, or "").  Without
+     * it the slot carries the NAR hash as it always has: the sender
+     * must know one (the daemon walks the path, `narHashOf`) and the
+     * receiver reads it as `assertedNarHash`.
+     */
+    static constexpr std::string_view featureObjectHash = "object-hash";
+
+    /**
      * Feature for disabling SetOptions, which is a no-op in recursive-nix
      */
     static constexpr std::string_view featureDisableSetOptions = "disable-set-options";
@@ -170,6 +181,20 @@ struct WorkerProto
         Sink & to;
         const Version & version;
     };
+
+    /**
+     * The hash slot of a path info, as `featureObjectHash` decides
+     * (see there): the object hash and the asserted NAR hash, either
+     * absent.  Used by the canonical serialiser and by the hand-rolled
+     * `AddToStoreNar` on both sides.
+     */
+    static std::pair<std::optional<ObjectHash>, std::optional<Hash>> readPathInfoHashes(ReadConn conn);
+
+    /**
+     * @throws Error when the peer lacks the feature and `assertedNarHash`
+     * is absent: the old slot needs a NAR hash.
+     */
+    static void writePathInfoHashes(WriteConn conn, const UnkeyedValidPathInfo & info);
 
     /**
      * Stripped down serialization logic suitable for sharing with Hydra.

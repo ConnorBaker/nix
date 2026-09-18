@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include "nix/util/git.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/memory-source-accessor.hh"
+#include "nix/util/archive.hh"
 
 #include "nix/util/tests/characterization.hh"
 
@@ -32,19 +34,6 @@ public:
     std::filesystem::path goldenMaster(std::string_view testStem) const override
     {
         return unitTestData / std::string(testStem);
-    }
-
-    /**
-     * We set these in tests rather than the regular globals so we don't have
-     * to worry about race conditions if the tests run concurrently.
-     */
-    ExperimentalFeatureSettings mockXpSettings;
-
-private:
-
-    void SetUp() override
-    {
-        mockXpSettings.set("experimental-features", "git-hashing");
     }
 };
 
@@ -90,8 +79,8 @@ TEST_F(GitTest, blob_read)
     readTest("hello-world-blob.bin", [&](const auto & encoded) {
         StringSource in{encoded};
         StringSink out;
-        ASSERT_EQ(parseObjectType(in, mockXpSettings), ObjectType::Blob);
-        auto size = parseBlob(in, mockXpSettings);
+        ASSERT_EQ(parseObjectType(in), ObjectType::Blob);
+        auto size = parseBlob(in);
         in.drainInto(out, size);
 
         auto expected = readFile(goldenMaster("hello-world.bin"));
@@ -109,7 +98,7 @@ TEST_F(GitTest, blob_read_large_size)
     blobHeader.push_back('\0'); // null terminator expected by parseBlob
 
     StringSource in{blobHeader};
-    auto size = git::parseBlob(in, mockXpSettings);
+    auto size = git::parseBlob(in);
 
     ASSERT_EQ(size, largeSize);
 }
@@ -120,7 +109,7 @@ TEST_F(GitTest, blob_write)
     writeTest("hello-world-blob.bin", [&]() {
         auto decoded = readFile(goldenMaster("hello-world.bin"));
         StringSink s;
-        dumpBlobPrefix(decoded.size(), s, mockXpSettings);
+        merkle::feedHeader(s, "blob", decoded.size());
         s(decoded);
         return s.s;
     });
@@ -206,14 +195,14 @@ static const git::Tree treeSha256 = {
     },
 };
 
-static auto mkTreeReadTest(HashAlgorithm hashAlgo, git::Tree tree, const ExperimentalFeatureSettings & mockXpSettings)
+static auto mkTreeReadTest(HashAlgorithm hashAlgo, git::Tree tree)
 {
     using namespace git;
-    return [hashAlgo, tree, mockXpSettings](const auto & encoded) {
+    return [hashAlgo, tree](const auto & encoded) {
         StringSource in{encoded};
         TestDirectorySink out;
-        ASSERT_EQ(parseObjectType(in, mockXpSettings), ObjectType::Tree);
-        parseTree(out, in, hashAlgo, mockXpSettings);
+        ASSERT_EQ(parseObjectType(in), ObjectType::Tree);
+        parseTree(out, in, hashAlgo);
 
         ASSERT_EQ(out.entries, tree);
     };
@@ -221,12 +210,12 @@ static auto mkTreeReadTest(HashAlgorithm hashAlgo, git::Tree tree, const Experim
 
 TEST_F(GitTest, tree_sha1_read)
 {
-    readTest("tree-sha1.bin", mkTreeReadTest(HashAlgorithm::SHA1, treeSha1, mockXpSettings));
+    readTest("tree-sha1.bin", mkTreeReadTest(HashAlgorithm::SHA1, treeSha1));
 }
 
 TEST_F(GitTest, tree_sha256_read)
 {
-    readTest("tree-sha256.bin", mkTreeReadTest(HashAlgorithm::SHA256, treeSha256, mockXpSettings));
+    readTest("tree-sha256.bin", mkTreeReadTest(HashAlgorithm::SHA256, treeSha256));
 }
 
 TEST_F(GitTest, tree_sha1_write)
@@ -234,7 +223,9 @@ TEST_F(GitTest, tree_sha1_write)
     using namespace git;
     writeTest("tree-sha1.bin", [&]() {
         StringSink s;
-        dumpTree(treeSha1, s, mockXpSettings);
+        auto body = merkle::serialiseTree(treeSha1);
+        merkle::feedHeader(s, "tree", body.size());
+        s(body);
         return s.s;
     });
 }
@@ -244,7 +235,9 @@ TEST_F(GitTest, tree_sha256_write)
     using namespace git;
     writeTest("tree-sha256.bin", [&]() {
         StringSink s;
-        dumpTree(treeSha256, s, mockXpSettings);
+        auto body = merkle::serialiseTree(treeSha256);
+        merkle::feedHeader(s, "tree", body.size());
+        s(body);
         return s.s;
     });
 }
@@ -260,24 +253,64 @@ TEST_F(GitTest, both_roundrip)
     using namespace git;
     auto files = memory_source_accessor::exampleComplex();
 
-    for (const auto hashAlgo : {HashAlgorithm::SHA1, HashAlgorithm::SHA256}) {
+    {
+        /* The hasher's algorithm; the reader takes it because git has two. */
+        const auto hashAlgo = merkle::hashAlgo;
         std::map<Hash, std::string> cas;
 
-        // Dump phase: serialize files to git objects in cas
-        fun<DumpHook> dumpHook = [&](const SourcePath & path) {
+        // Dump phase: the walk's hooks give each object as it completes;
+        // the bytes are framed as the hasher framed them (`feedHeader`), so
+        // the ids key what `parseObjectType` reads.
+        auto blobObject = [](std::string_view bytes) {
             StringSink s;
-            HashSink hashSink{hashAlgo};
-            TeeSink s2{s, hashSink};
-            auto mode = dump(path, s2, dumpHook, defaultPathFilter, mockXpSettings);
-            auto hash = hashSink.finish().hash;
-            cas.insert_or_assign(hash, std::move(s.s));
-            return TreeEntry{
-                .mode = mode,
-                .hash = hash,
-            };
+            merkle::feedHeader(s, "blob", bytes.size());
+            s(bytes);
+            return s.s;
         };
 
-        auto root = dumpHook(SourcePath{files});
+        struct Collecting : HashingVisitor
+        {
+            std::map<Hash, std::string> & cas;
+            MemorySourceAccessor & files;
+            std::function<std::string(std::string_view)> blobObject;
+
+            Collecting(
+                std::map<Hash, std::string> & cas,
+                MemorySourceAccessor & files,
+                std::function<std::string(std::string_view)> blobObject)
+                : cas(cas)
+                , files(files)
+                , blobObject(std::move(blobObject))
+            {
+            }
+
+            HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+            {
+                auto node = HashingVisitor::regular(path, std::move(read));
+                cas.insert_or_assign(node.entry.hash, blobObject(files.readFile(path)));
+                return node;
+            }
+
+            HashedNode symlink(const CanonPath & path, const std::string & target) override
+            {
+                auto node = HashingVisitor::symlink(path, target);
+                cas.insert_or_assign(node.entry.hash, blobObject(target));
+                return node;
+            }
+
+            HashedNode directory(const CanonPath & path, Children children) override
+            {
+                auto node = HashingVisitor::directory(path, std::move(children));
+                StringSink s;
+                merkle::feedHeader(s, "tree", node.treeBody.size());
+                s(node.treeBody);
+                cas.insert_or_assign(node.entry.hash, std::move(s.s));
+                return node;
+            }
+        } collecting{cas, *files, blobObject};
+
+        auto root = objectHashOf(*files, CanonPath::root, defaultPathFilter, collecting).root;
+        ASSERT_EQ(root.hash.algo, hashAlgo);
 
         // Parse phase: deserialize git objects back to files
         auto files2 = make_ref<MemorySourceAccessor>();
@@ -304,12 +337,12 @@ TEST_F(GitTest, both_roundrip)
 
         parseToFile = [&](merkle::TreeEntry entry) -> MemorySourceAccessor::File {
             StringSource in{cas[entry.hash]};
-            auto type = parseObjectType(in, mockXpSettings);
+            auto type = parseObjectType(in);
 
             switch (type) {
             case ObjectType::Blob: {
                 StringSink content;
-                auto size = parseBlob(in, mockXpSettings);
+                auto size = parseBlob(in);
                 in.drainInto(content, size);
                 if (entry.mode == merkle::Mode::Symlink) {
                     return MemorySourceAccessor::File::Symlink{std::move(content.s)};
@@ -322,7 +355,7 @@ TEST_F(GitTest, both_roundrip)
             }
             case ObjectType::Tree: {
                 RecursiveDirSink dirSink{parseToFile};
-                parseTree(dirSink, in, hashAlgo, mockXpSettings);
+                parseTree(dirSink, in, hashAlgo);
                 return std::move(dirSink.dir);
             }
             default:
@@ -367,6 +400,87 @@ TEST(GitLsRemote, parseObjectRefLine)
     ASSERT_EQ(res->kind, LsRemoteRefLine::Kind::Object);
     ASSERT_EQ(res->target, "abc123");
     ASSERT_EQ(res->reference, "refs/head/main");
+}
+
+} // namespace nix
+
+namespace nix {
+
+/* The compositional (git) encoding is total over store content, `.git`
+   included: `merkle::serialiseTree` writes and `parseTree` reads every entry
+   name verbatim, so the only `.git` rejection anywhere is libgit2's
+   `git_treebuilder` (tree.c:57-61,488), which this path never touches
+   (doc/lazy-store/01-specification.md, section 2.4). */
+TEST_F(GitTest, tree_encoding_round_trips_dot_git)
+{
+    using namespace git;
+    Tree tree{
+        {".git/", {.mode = Mode::Directory, .hash = hashString(HashAlgorithm::SHA1, "d")}},
+        {"README", {.mode = Mode::Regular, .hash = hashString(HashAlgorithm::SHA1, "r")}},
+        {"link", {.mode = Mode::Symlink, .hash = hashString(HashAlgorithm::SHA1, "l")}},
+        {"run", {.mode = Mode::Executable, .hash = hashString(HashAlgorithm::SHA1, "x")}},
+    };
+    StringSink encoded;
+    auto body = merkle::serialiseTree(tree);
+    merkle::feedHeader(encoded, "tree", body.size());
+    encoded(body);
+    /* The name is on the wire verbatim. */
+    ASSERT_NE(encoded.s.find(std::string(".git\0", 5)), std::string::npos);
+
+    StringSource in{encoded.s};
+    TestDirectorySink out;
+    ASSERT_EQ(parseObjectType(in), ObjectType::Tree);
+    parseTree(out, in, HashAlgorithm::SHA1);
+    ASSERT_EQ(out.entries, tree);
+}
+
+/* The NAR half of the bijection over `.git`, and the exact edge of the
+   name domain the parser enforces (archive.cc:275-282): `.git` is an
+   ordinary name and round-trips byte-exactly; `.` and `..` are rejected. */
+TEST_F(GitTest, nar_accepts_dot_git_and_rejects_dot_names)
+{
+    auto roundTrip = [](MemorySourceAccessor & src) {
+        StringSink nar1;
+        src.dumpPath(CanonPath::root, nar1);
+        auto dst = make_ref<MemorySourceAccessor>();
+        MemorySink sink{*dst};
+        StringSource in{nar1.s};
+        parseDump(sink, in);
+        StringSink nar2;
+        dst->dumpPath(CanonPath::root, nar2);
+        return std::pair{nar1.s, nar2.s};
+    };
+
+    /* `.git` accepted, byte-exact. */
+    {
+        auto acc = make_ref<MemorySourceAccessor>();
+        acc->addFile(CanonPath{"/.git/HEAD"}, "ref: refs/heads/main\n");
+        acc->addFile(CanonPath{"/README"}, "r");
+        auto [a, b] = roundTrip(*acc);
+        ASSERT_EQ(a, b);
+        ASSERT_NE(a.find(".git"), std::string::npos);
+    }
+
+    /* `.` and `..` rejected. Substitute the name bytes of a same-length
+       entry whose letter (`z`) occurs nowhere else in the NAR, so the
+       length-prefixed framing is untouched and only the name changes. */
+    auto rejects = [](std::string entryName, std::string badName) {
+        ASSERT_EQ(entryName.size(), badName.size());
+        auto acc = make_ref<MemorySourceAccessor>();
+        acc->addFile(CanonPath{"/" + entryName}, "");
+        StringSink nar;
+        acc->dumpPath(CanonPath::root, nar);
+        auto pos = nar.s.find(entryName);
+        ASSERT_NE(pos, std::string::npos);
+        ASSERT_EQ(nar.s.find(entryName, pos + 1), std::string::npos); /* exactly one occurrence */
+        nar.s.replace(pos, badName.size(), badName);
+        auto dst = make_ref<MemorySourceAccessor>();
+        MemorySink sink{*dst};
+        StringSource in{nar.s};
+        EXPECT_THROW(parseDump(sink, in), Error);
+    };
+    rejects("z", ".");
+    rejects("zz", "..");
 }
 
 } // namespace nix

@@ -27,6 +27,7 @@ const WorkerProto::Version WorkerProto::latest = {
         {
             std::string{WorkerProto::featureRealisationWithPath},
             std::string{WorkerProto::featureDeleteDeadSpecificReferrers},
+            std::string{WorkerProto::featureObjectHash},
         },
 };
 
@@ -418,11 +419,28 @@ void WorkerProto::Serialise<ValidPathInfo>::write(
     WorkerProto::write(store, conn, static_cast<const UnkeyedValidPathInfo &>(pathInfo));
 }
 
+std::pair<std::optional<ObjectHash>, std::optional<Hash>> WorkerProto::readPathInfoHashes(ReadConn conn)
+{
+    return CommonProto::readPathInfoHashes(
+        conn.from, conn.version.features.contains(WorkerProto::featureObjectHash), [](const std::string & s) {
+            return Hash::parseAny(s, HashAlgorithm::SHA256);
+        });
+}
+
+void WorkerProto::writePathInfoHashes(WriteConn conn, const UnkeyedValidPathInfo & info)
+{
+    CommonProto::writePathInfoHashes(
+        conn.to, conn.version.features.contains(WorkerProto::featureObjectHash), info, [](const Hash & h) {
+            return h.to_string(HashFormat::Base16, false);
+        });
+}
+
 UnkeyedValidPathInfo WorkerProto::Serialise<UnkeyedValidPathInfo>::read(const StoreDirConfig & store, ReadConn conn)
 {
     auto deriver = WorkerProto::Serialise<std::optional<StorePath>>::read(store, conn);
-    auto narHash = Hash::parseAny(readString(conn.from), HashAlgorithm::SHA256);
-    UnkeyedValidPathInfo info(store, narHash);
+    auto [objectHash, assertedNarHash] = WorkerProto::readPathInfoHashes(conn);
+    UnkeyedValidPathInfo info(store, std::move(objectHash));
+    info.assertedNarHash = std::move(assertedNarHash);
     info.deriver = std::move(deriver);
     info.references = WorkerProto::Serialise<StorePathSet>::read(store, conn);
     conn.from >> info.registrationTime >> info.narSize;
@@ -438,7 +456,7 @@ void WorkerProto::Serialise<UnkeyedValidPathInfo>::write(
     const StoreDirConfig & store, WriteConn conn, const UnkeyedValidPathInfo & pathInfo)
 {
     WorkerProto::write(store, conn, pathInfo.deriver);
-    conn.to << pathInfo.narHash.to_string(HashFormat::Base16, false);
+    WorkerProto::writePathInfoHashes(conn, pathInfo);
     WorkerProto::write(store, conn, pathInfo.references);
     conn.to << pathInfo.registrationTime << pathInfo.narSize;
     if (conn.version >= WorkerProto::Version{.number = {1, 16}}) {

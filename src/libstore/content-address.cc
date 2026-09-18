@@ -15,7 +15,8 @@ std::string_view makeFileIngestionPrefix(FileIngestionMethod m)
     case FileIngestionMethod::NixArchive:
         return "r:";
     case FileIngestionMethod::Git:
-        experimentalFeatureSettings.require(Xp::GitHashing);
+        /* The git method is the store's own addressing (doc/lazy-store/01-specification.md,
+           section 9.11) and needs no experimental feature. */
         return "git:";
     default:
         assert(false);
@@ -86,7 +87,6 @@ ContentAddressMethod ContentAddressMethod::parsePrefix(std::string_view & m)
     if (splitPrefix(m, "r:")) {
         return ContentAddressMethod::Raw::NixArchive;
     } else if (splitPrefix(m, "git:")) {
-        experimentalFeatureSettings.require(Xp::GitHashing);
         return ContentAddressMethod::Raw::Git;
     } else if (splitPrefix(m, "text:")) {
         return ContentAddressMethod::Raw::Text;
@@ -189,10 +189,8 @@ static std::pair<ContentAddressMethod, HashAlgorithm> parseContentAddressMethodP
         auto method = ContentAddressMethod::Raw::Flat;
         if (splitPrefix(rest, "r:"))
             method = ContentAddressMethod::Raw::NixArchive;
-        else if (splitPrefix(rest, "git:")) {
-            experimentalFeatureSettings.require(Xp::GitHashing);
+        else if (splitPrefix(rest, "git:"))
             method = ContentAddressMethod::Raw::Git;
-        }
         HashAlgorithm hashAlgo = parseHashAlgorithm_();
         return {
             std::move(method),

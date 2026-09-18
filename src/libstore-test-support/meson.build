@@ -34,11 +34,13 @@ deps_public += gtest
 subdir('nix-meson-build-support/common')
 
 sources = files(
+  'derivation.cc',
   'derived-path.cc',
   'https-store.cc',
   'libstore-network.cc',
   'outputs-spec.cc',
   'path.cc',
+  'temp-local-store.cc',
   'test-main.cc',
 )
 

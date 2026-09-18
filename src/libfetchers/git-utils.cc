@@ -1,4 +1,5 @@
 #include "nix/fetchers/git-utils.hh"
+#include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/git-lfs-fetch.hh"
 #include "nix/fetchers/cache.hh"
 #include "nix/fetchers/fetch-settings.hh"
@@ -11,6 +12,9 @@
 #include "nix/util/fs-sink.hh"
 #include "nix/util/sync.hh"
 #include "nix/util/strings.hh"
+#include "nix/util/environment-variables.hh"
+#include "nix/util/git.hh"
+#include "nix/util/merkle-hash.hh"
 #include "nix/util/util.hh"
 #include "nix/util/thread-pool.hh"
 #include "nix/util/pool.hh"
@@ -22,6 +26,7 @@
 #include <git2/branch.h>
 #include <git2/commit.h>
 #include <git2/config.h>
+#include <git2/sys/config.h>
 #include <git2/describe.h>
 #include <git2/errors.h>
 #include <git2/global.h>
@@ -143,6 +148,11 @@ typedef std::unique_ptr<git_describe_result, Deleter<git_describe_result_free>> 
 typedef std::unique_ptr<git_status_list, Deleter<git_status_list_free>> StatusList;
 typedef std::unique_ptr<git_remote, Deleter<git_remote_free>> Remote;
 typedef std::unique_ptr<git_config, Deleter<git_config_free>> GitConfig;
+typedef std::unique_ptr<git_config_backend, decltype([](git_config_backend * backend) {
+                            if (backend)
+                                backend->free(backend);
+                        })>
+    GitConfigBackend;
 typedef std::unique_ptr<git_config_iterator, Deleter<git_config_iterator_free>> ConfigIterator;
 typedef std::unique_ptr<git_odb, Deleter<git_odb_free>> ObjectDb;
 typedef std::unique_ptr<git_packbuilder, Deleter<git_packbuilder_free>> PackBuilder;
@@ -177,6 +187,12 @@ static void initLibGit2()
     std::call_once(initialized, []() {
         if (git_libgit2_init() < 0)
             throw GitError("initialising libgit2");
+
+        /* Nuke the "hashing on all reads" behavior, since that can lead to bad
+           performance https://github.com/libgit2/libgit2/issues/4951. It's a
+           compromise of course, but one that is mostly in line with git cli and
+           like how we don't recalculate narHash when reading from a store. */
+        git_libgit2_opts(GIT_OPT_ENABLE_STRICT_HASH_VERIFICATION, 0);
     });
 }
 
@@ -304,7 +320,15 @@ static void initRepoAtomically(std::filesystem::path & path, GitRepo::Options op
     AutoDelete delTmpDir(tmpDir, true);
     Repository tmpRepo;
 
-    if (git_repository_init(Setter(tmpRepo), tmpDir.string().c_str(), options.bare))
+    git_repository_init_options initOpts = GIT_REPOSITORY_INIT_OPTIONS_INIT;
+    initOpts.flags = GIT_REPOSITORY_INIT_MKPATH | (options.bare ? GIT_REPOSITORY_INIT_BARE : 0);
+#if LIBGIT2_VERSION_CHECK(2, 0, 0)
+    initOpts.oid_type = options.oidType == HashAlgorithm::SHA256 ? GIT_OID_SHA256 : GIT_OID_SHA1;
+#else
+    if (options.oidType != HashAlgorithm::SHA1)
+        throw Error("creating a SHA-256 Git repository requires libgit2 2.0");
+#endif
+    if (git_repository_init_ext(Setter(tmpRepo), tmpDir.string().c_str(), &initOpts))
         throw GitError("creating Git repository %s", PathFmt(path));
     try {
         std::filesystem::rename(tmpDir, path);
@@ -375,6 +399,28 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         initRepoAtomically(path, options);
         if (git_repository_open(Setter(repo), path.string().c_str()))
             throw GitError("opening Git repository %s", PathFmt(path));
+
+        GitConfig config;
+        if (git_repository_config(Setter(config), *this))
+            throw GitError("getting Git repository config");
+
+        /* Create an in-memory configuration so that we can set config options without modifying the
+           config file on-disk. */
+        git_config_backend_memory_options configOpts = GIT_CONFIG_BACKEND_MEMORY_OPTIONS_INIT;
+        configOpts.backend_type = "nix";
+
+        std::vector<const char *> configValues;
+        if (options.dontFindDeltas)
+            configValues.push_back("pack.window=0");
+
+        GitConfigBackend memBackend;
+        if (git_config_backend_from_values(Setter(memBackend), configValues.data(), configValues.size(), &configOpts))
+            throw GitError("creating an in-memory Git config");
+
+        if (git_config_add_backend(config.get(), memBackend.get(), GIT_CONFIG_LEVEL_APP, *this, /*force=*/false))
+            throw GitError("adding the in-memory Git configuration backend");
+
+        memBackend.release();
 
         ObjectDb odb;
         if (options.packfilesOnly) {
@@ -711,6 +757,10 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
      */
     ref<GitSourceAccessor> getRawAccessor(const Hash & rev, const GitAccessorOptions & options);
 
+    bool treeMentionsAttribute(const Hash & rev, std::string_view attribute) override;
+
+    bool attributesOutsideTheTreeMention(std::string_view attribute, std::optional<Hash> rev) override;
+
     ref<SourceAccessor>
     getAccessor(const Hash & rev, const GitAccessorOptions & options, std::string displayPrefix) override;
 
@@ -828,22 +878,6 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
             throw Error("Commit signature verification on commit %s failed: %s", rev.gitRev(), output);
     }
 
-    Hash treeHashToNarHash(const fetchers::Settings & settings, const Hash & treeHash) override
-    {
-        auto accessor = getAccessor(treeHash, {}, "");
-
-        fetchers::Cache::Key cacheKey{"treeHashToNarHash", {{"treeHash", treeHash.gitRev()}}};
-
-        if (auto res = settings.getCache()->lookup(cacheKey))
-            return Hash::parseAny(fetchers::getStrAttr(*res, "narHash"), HashAlgorithm::SHA256);
-
-        auto narHash = accessor->hashPath(CanonPath::root);
-
-        settings.getCache()->upsert(cacheKey, fetchers::Attrs({{"narHash", narHash.to_string(HashFormat::SRI, true)}}));
-
-        return narHash;
-    }
-
     Hash dereferenceSingletonDirectory(const Hash & oid_) override
     {
         auto oid = hashToOID(oid_);
@@ -951,11 +985,17 @@ public:
         if (mode == GIT_FILEMODE_TREE)
             return Stat{.type = tDirectory};
 
-        else if (mode == GIT_FILEMODE_BLOB)
-            return Stat{.type = tRegular};
-
-        else if (mode == GIT_FILEMODE_BLOB_EXECUTABLE)
-            return Stat{.type = tRegular, .isExecutable = true};
+        else if (mode == GIT_FILEMODE_BLOB || mode == GIT_FILEMODE_BLOB_EXECUTABLE) {
+            /* The size from the object's header, without inflating it. */
+            ObjectDb odb;
+            if (git_repository_odb(Setter(odb), *state->repo))
+                throw GitError("getting Git object database");
+            size_t size;
+            git_object_t type;
+            if (git_odb_read_header(&size, &type, odb.get(), git_tree_entry_id(entry)))
+                throw GitError("reading the header of object %s", toHash(*git_tree_entry_id(entry)).gitRev());
+            return Stat{.type = tRegular, .fileSize = size, .isExecutable = mode == GIT_FILEMODE_BLOB_EXECUTABLE};
+        }
 
         else if (mode == GIT_FILEMODE_LINK)
             return Stat{.type = tSymlink};
@@ -966,6 +1006,27 @@ public:
 
         else
             throw Error("file '%s' has an unsupported Git file type");
+    }
+
+    /**
+     * The node type an entry's mode gives, as `maybeLstat` reports it (a
+     * submodule an empty directory); nullopt for a mode neither reads.
+     */
+    static std::optional<Type> typeOfMode(git_filemode_t mode)
+    {
+        switch (mode) {
+        case GIT_FILEMODE_TREE:
+        case GIT_FILEMODE_COMMIT:
+            return tDirectory;
+        case GIT_FILEMODE_BLOB:
+        case GIT_FILEMODE_BLOB_EXECUTABLE:
+            return tRegular;
+        case GIT_FILEMODE_LINK:
+            return tSymlink;
+        case GIT_FILEMODE_UNREADABLE:
+            return std::nullopt;
+        }
+        return std::nullopt;
     }
 
     DirEntries readDirectory(const CanonPath & path) override
@@ -982,7 +1043,12 @@ public:
                     for (size_t n = 0; n < count; ++n) {
                         auto entry = git_tree_entry_byindex(tree.get(), n);
                         // FIXME: add to cache
-                        res.emplace(std::string(git_tree_entry_name(entry)), DirEntry{});
+                        /* Typed from the mode the entry carries, so a
+                           consumer that wants the types (`builtins.readDir`
+                           attaches a `readFileType` lookup to every untyped
+                           entry) looks nothing up. */
+                        res.emplace(
+                            std::string(git_tree_entry_name(entry)), typeOfMode(git_tree_entry_filemode(entry)));
                     }
 
                     return res;
@@ -996,6 +1062,56 @@ public:
         StringSink s;
         readBlob(path, true, s, [&](uint64_t size) { s.s.reserve(size); });
         return std::move(s.s);
+    }
+
+    /**
+     * A subtree is named by its object id and mode, which fix everything
+     * this accessor renders from it (a submodule as an empty directory), so
+     * equal names mean equal NARs; the name is for the subtree exactly,
+     * hence the root path.  Under LFS smudging contents come from elsewhere,
+     * so only a name given for the whole stands; export-ignore is its
+     * wrapper's to name (doc/lazy-store/01-specification.md, section 8.2).
+     */
+    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    {
+        auto state(state_.lock());
+
+        if (state->options.smudgeLfs)
+            return {path, fingerprint};
+
+        /* The version tags the rendering of a Git object as a NAR; a
+           change to that rendering must change it. */
+        auto name = [](std::string_view kind, const git_oid & oid) -> std::optional<std::string> {
+            return fmt("git-object-v1:%s:%s", kind, toHash(oid).gitRev());
+        };
+
+        if (path.isRoot())
+            return {
+                CanonPath::root,
+                name(
+                    git_object_type(state->root.get()) == GIT_OBJECT_TREE ? "tree" : "blob",
+                    *git_object_id(state->root.get()))};
+
+        auto entry = lookup(*state, path);
+        if (!entry)
+            return {path, std::nullopt};
+
+        switch (git_tree_entry_filemode(entry)) {
+        case GIT_FILEMODE_TREE:
+            return {CanonPath::root, name("tree", *git_tree_entry_id(entry))};
+        case GIT_FILEMODE_BLOB:
+            return {CanonPath::root, name("blob", *git_tree_entry_id(entry))};
+        case GIT_FILEMODE_BLOB_EXECUTABLE:
+            return {CanonPath::root, name("blob-executable", *git_tree_entry_id(entry))};
+        case GIT_FILEMODE_LINK:
+            return {CanonPath::root, name("symlink", *git_tree_entry_id(entry))};
+        case GIT_FILEMODE_COMMIT:
+            /* Rendered as an empty directory whatever the commit is. */
+            return {CanonPath::root, std::string("git-object-v1:empty-directory")};
+        case GIT_FILEMODE_UNREADABLE:
+            return {path, std::nullopt};
+        }
+        return {path, std::nullopt};
     }
 
     /**
@@ -1145,6 +1261,298 @@ public:
             throw GitError("looking up file '%s'", showPath(path));
 
         return blob;
+    }
+};
+
+/* Whether a line of an attributes file assigns one of `names` — set,
+   unset (`-name`), unspecified (`!name`) or valued (`name=v`) — or defines
+   a macro (`[attr]m ...`) that does.  Tokenised as libgit2 parses
+   (`attr_file.c`, `git_attr_fnmatch__parse`, `git_attr_assignment__parse`):
+   a line whose first non-blank character is `#` is a comment, blanks are
+   `git__isspace`'s, the first token is the pattern, one `-` or `!` is a
+   prefix.  A `#` token later in a line ends its assignments; this reads
+   on, so a trailing comment naming an attribute counts.  Conservative in
+   that direction only. */
+static bool attributesMention(std::string_view contents, const std::set<std::string> & names)
+{
+    for (auto & line : tokenizeString<std::vector<std::string>>(std::string(contents), "\n")) {
+        auto tokens = tokenizeString<std::vector<std::string>>(line, " \t\r\f\v");
+        if (tokens.empty() || tokens[0][0] == '#')
+            continue;
+        for (size_t i = 1; i < tokens.size(); ++i) {
+            std::string_view attr = tokens[i];
+            if (attr[0] == '-' || attr[0] == '!')
+                attr.remove_prefix(1);
+            attr = attr.substr(0, attr.find('='));
+            if (names.contains(std::string(attr)))
+                return true;
+        }
+    }
+    return false;
+}
+
+static std::string_view blobContents(const Blob & blob)
+{
+    return std::string_view((const char *) git_blob_rawcontent(blob.get()), git_blob_rawsize(blob.get()));
+}
+
+/* Whether the attributes file at `file`, if there is one, mentions one of
+   `names`.  libgit2 treats a file it cannot stat or that is a directory as
+   absent (`attr_file.c`, `GIT_ATTR_FILE_SOURCE_FILE`); one that exists but
+   cannot be read answers yes here, which keeps a filter and so libgit2's
+   own answer. */
+static bool attributesFileMentions(const std::filesystem::path & file, const std::set<std::string> & names)
+{
+    std::error_code ec;
+    auto status = std::filesystem::status(file, ec);
+    if (ec || !std::filesystem::exists(status) || std::filesystem::is_directory(status))
+        return false;
+    try {
+        return attributesMention(readFile(file), names);
+    } catch (SysError &) {
+        return true;
+    }
+}
+
+/* The attributes that could make a working-directory file differ from its
+   blob: a content filter, an end-of-line or encoding conversion, or ident
+   expansion.  Any of these names, however negated or valued, counts. */
+static const std::set<std::string> filteringAttributes{
+    "text", "eol", "crlf", "filter", "ident", "working-tree-encoding"};
+
+/* The directories of one of libgit2's search paths (`git_libgit2_opts`,
+   `GIT_OPT_GET_SEARCH_PATH`), as it resolved them at initialisation or was
+   told since; the same list `git_sysdir_find_in_dirlist` walks. */
+static std::vector<std::filesystem::path> gitSearchPath(git_config_level_t level)
+{
+    std::vector<std::filesystem::path> dirs;
+    git_buf buf = GIT_BUF_INIT;
+    if (git_libgit2_opts(GIT_OPT_GET_SEARCH_PATH, level, &buf) == 0) {
+        for (auto & dir : tokenizeString<std::vector<std::string>>(
+                 std::string_view(buf.ptr, buf.size), std::string(1, GIT_PATH_LIST_SEPARATOR)))
+            dirs.push_back(dir);
+        git_buf_dispose(&buf);
+    }
+    return dirs;
+}
+
+/* The attributes files libgit2 reads for a repository besides the
+   `.gitattributes` of the tree being read (libgit2 `attr.c`, `attr_setup`
+   and `collect_attr_files`): `info/attributes`, in the common directory;
+   `core.attributesFile`, `~/` expanded, or the user's `attributes` along
+   the XDG search path when it is unset; the system's `gitattributes`,
+   whose rules `GIT_ATTR_CHECK_NO_SYSTEM` excludes but whose macro
+   definitions `attr_setup` loads regardless; and, with a working
+   directory, its root `.gitattributes`, likewise loaded for macros
+   whatever the lookup's flags. */
+static std::vector<std::filesystem::path> attributesFilesOutsideTheTree(GitRepoImpl & repo)
+{
+    std::vector<std::filesystem::path> files;
+    git_buf buf = GIT_BUF_INIT;
+    if (git_repository_item_path(&buf, repo, GIT_REPOSITORY_ITEM_INFO) == 0) {
+        files.push_back(std::filesystem::path(buf.ptr) / "attributes");
+        git_buf_dispose(&buf);
+    } else
+        files.push_back(std::filesystem::path(git_repository_path(repo)) / "info" / "attributes");
+    GitConfig config;
+    if (!git_repository_config_snapshot(Setter(config), repo))
+        if (git_config_get_path(&buf, config.get(), "core.attributesfile") == 0) {
+            files.push_back(std::filesystem::path(buf.ptr));
+            git_buf_dispose(&buf);
+        }
+    for (auto & dir : gitSearchPath(GIT_CONFIG_LEVEL_XDG))
+        files.push_back(dir / "attributes");
+    for (auto & dir : gitSearchPath(GIT_CONFIG_LEVEL_SYSTEM))
+        files.push_back(dir / "gitattributes");
+    if (auto workdir = git_repository_workdir(repo))
+        files.push_back(std::filesystem::path(workdir) / ".gitattributes");
+    return files;
+}
+
+/* Walk the tree of `rev` in pre-order; `f` gets each entry's directory
+   within the tree (with a trailing slash, or empty at the root) and the
+   entry, and stops the walk by returning true.  Whether it did, or the walk
+   failed. */
+static bool
+forEachTreeEntry(GitRepoImpl & repo, const Hash & rev, fun<bool(const char * root, const git_tree_entry * entry)> f)
+{
+    Object commit;
+    auto oid = hashToOID(rev);
+    if (git_object_lookup(Setter(commit), repo, &oid, GIT_OBJECT_ANY))
+        return true;
+    Object treeObject;
+    if (git_object_peel(Setter(treeObject), commit.get(), GIT_OBJECT_TREE))
+        return true;
+
+    struct Walk
+    {
+        decltype(f) & visit;
+        bool stopped = false;
+    } walk{f};
+
+    auto callback = [](const char * root, const git_tree_entry * entry, void * payload) -> int {
+        auto & w = *(Walk *) payload;
+        w.stopped = w.visit(root, entry);
+        return w.stopped ? -1 : 0;
+    };
+    return git_tree_walk((git_tree *) treeObject.get(), GIT_TREEWALK_PRE, callback, &walk) || walk.stopped;
+}
+
+bool GitRepoImpl::treeMentionsAttribute(const Hash & rev, std::string_view attribute)
+{
+    std::set<std::string> names{std::string(attribute)};
+    return forEachTreeEntry(*this, rev, [&](const char *, const git_tree_entry * entry) {
+        if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB
+            || std::string_view(git_tree_entry_name(entry)) != ".gitattributes")
+            return false;
+        Blob blob;
+        if (git_blob_lookup(Setter(blob), *this, git_tree_entry_id(entry)))
+            return true;
+        return attributesMention(blobContents(blob), names);
+    });
+}
+
+bool GitRepoImpl::attributesOutsideTheTreeMention(std::string_view attribute, std::optional<Hash> rev)
+{
+    std::set<std::string> names{std::string(attribute)};
+    for (auto & file : attributesFilesOutsideTheTree(*this))
+        if (attributesFileMentions(file, names))
+            return true;
+
+    /* The index's `.gitattributes`, read as blobs (`attr_file.c`,
+       `GIT_ATTR_FILE_SOURCE_INDEX`); a bare repository's index is empty. */
+    Index index;
+    if (git_repository_index(Setter(index), *this))
+        return true;
+    for (size_t i = 0, n = git_index_entrycount(index.get()); i < n; ++i) {
+        auto * entry = git_index_get_byindex(index.get(), i);
+        if (baseNameOf(entry->path) != ".gitattributes")
+            continue;
+        Blob blob;
+        if (git_blob_lookup(Setter(blob), *this, &entry->id))
+            return true;
+        if (attributesMention(blobContents(blob), names))
+            return true;
+    }
+
+    /* The commit accessor's lookup for a path reads `<dir>/.gitattributes`
+       in the working directory for each directory above the path
+       (`attr_decide_sources`, `GIT_ATTR_CHECK_FILE_THEN_INDEX`; the root's
+       file is in the list above), tracked or not, so every directory of the
+       tree is looked at: one stat each. */
+    auto workdir = rev ? git_repository_workdir(*this) : nullptr;
+    if (!workdir)
+        return false;
+    return forEachTreeEntry(*this, *rev, [&](const char * root, const git_tree_entry * entry) {
+        return git_tree_entry_type(entry) == GIT_OBJECT_TREE
+               && attributesFileMentions(
+                   std::filesystem::path(workdir) / root / git_tree_entry_name(entry) / ".gitattributes", names);
+    });
+}
+
+/* Every `.gitattributes` git reads for a working directory, tracked or not:
+   git looks in each directory that holds a tracked file and in each ancestor
+   of one.  `f` gets the path within the tree and stops the walk by returning
+   true; the result is whether it did. */
+static bool forEachWorkdirAttributesFile(const GitRepo::WorkdirInfo & wd, fun<bool(const CanonPath &)> f)
+{
+    std::set<CanonPath> directories;
+    for (auto & p : wd.files) {
+        auto d = p;
+        while (!d.isRoot()) {
+            d.pop();
+            if (!directories.insert(d).second)
+                break;
+        }
+    }
+    for (auto & d : directories)
+        if (f(d / ".gitattributes"))
+            return true;
+    return false;
+}
+
+/* Whether the working directory holds the repository's blobs byte for byte
+   and with their modes: no content filter can apply, and the repository
+   honours file modes and symlinks.  Only then does a clean file's status
+   say that its bytes are its blob's, which is what naming a clean subtree
+   by the commit's object asserts (doc/lazy-store/01-specification.md,
+   section 9.9).  Any doubt, including a configuration that cannot be read,
+   answers no. */
+static bool workdirHoldsTheBlobs(GitRepoImpl & repo, const GitRepo::WorkdirInfo & wd)
+{
+    GitConfig config;
+    if (git_repository_config_snapshot(Setter(config), repo))
+        return false;
+
+    auto boolSetting = [&](const char * key, bool dflt) -> std::optional<bool> {
+        int value;
+        auto err = git_config_get_bool(&value, config.get(), key);
+        if (err == GIT_ENOTFOUND)
+            return dflt;
+        if (err)
+            return std::nullopt; /* a value such as `autocrlf = input`: not a plain boolean */
+        return value != 0;
+    };
+    if (boolSetting("core.autocrlf", false) != std::optional<bool>(false))
+        return false;
+    if (boolSetting("core.filemode", true) != std::optional<bool>(true))
+        return false;
+    if (boolSetting("core.symlinks", true) != std::optional<bool>(true))
+        return false;
+
+    /* The attributes files in the working directory, tracked or not, then
+       the files outside the tree, the system's among them. */
+    if (forEachWorkdirAttributesFile(
+            wd, [&](const CanonPath & p) { return attributesFileMentions(repo.path / p.rel(), filteringAttributes); }))
+        return false;
+    for (auto & file : attributesFilesOutsideTheTree(repo))
+        if (attributesFileMentions(file, filteringAttributes))
+            return false;
+    return true;
+}
+
+/* The working directory of a repository, its clean subtrees named by the
+   commit's tree entries (doc/lazy-store/01-specification.md, section 9.9):
+   a path with no modified, added or deleted file at or below it holds what
+   HEAD holds there, so HEAD's object names it, and the memo rows of the
+   clean commit answer for it.  The root, and every path with a change at or
+   below it, carry the whole tree's name as before.  Sound only when the
+   working directory holds the blobs (`workdirHoldsTheBlobs`), which the
+   constructor's caller checks. */
+struct GitWorkdirSourceAccessor final : FilteringSourceAccessor
+{
+private:
+    void anchor() override {};
+public:
+    ref<GitSourceAccessor> head;
+    /* Every changed path, and every ancestor of one. */
+    std::unordered_set<CanonPath> changedAtOrBelow;
+
+    GitWorkdirSourceAccessor(ref<SourceAccessor> next, ref<GitSourceAccessor> head, const GitRepo::WorkdirInfo & wd)
+        : FilteringSourceAccessor(
+              SourcePath(next),
+              [](const CanonPath & path) { return RestrictedPathError("access to '%s' is forbidden", path); })
+        , head(head)
+    {
+        for (auto * changed : {&wd.dirtyFiles, &wd.deletedFiles})
+            for (auto & p : *changed)
+                for (auto q = p;; q.pop()) {
+                    changedAtOrBelow.insert(q);
+                    if (q.isRoot())
+                        break;
+                }
+    }
+
+    bool isAllowed(const CanonPath & path) override
+    {
+        return true;
+    }
+
+    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    {
+        if (path.isRoot() || changedAtOrBelow.contains(path))
+            return {path, fingerprint};
+        return head->getFingerprint(path);
     }
 };
 
@@ -1340,33 +1748,40 @@ struct GitRegularFileSinkImpl : merkle::RegularFileSinkWithFinalize
     }
 };
 
+/* A tree written raw, in Git's object format, not through libgit2's tree
+   builder: the builder refuses names the format admits (`.git` and its
+   variants, `.`, `..`), and every tree a NAR can carry must have a Git tree
+   with the hash our serialiser gives (`objectHashOf`).  The format's own
+   requirements are kept: a name is non-empty and has no `/` and no NUL. */
 struct GitDirectorySinkImpl : merkle::DirectorySinkWithFinalize
 {
-    TreeBuilder builder;
+    GitRepoImpl & repo;
+    git::Tree entries;
 
     GitDirectorySinkImpl(GitRepoImpl & repo)
+        : repo(repo)
     {
-        if (git_treebuilder_new(Setter(builder), repo, nullptr))
-            throw GitError("creating a tree builder");
     }
 
     void insertChild(std::string_view name, merkle::TreeEntry entry) override
     {
-        auto oid = hashToOID(entry.hash);
-        if (git_treebuilder_insert(
-                nullptr,
-                builder.get(),
-                requireCString(std::string(name)),
-                &oid,
-                static_cast<git_filemode_t>(entry.mode)))
-            throw GitError("adding '%s' to a tree builder", name);
+        if (name.empty() || name.find('/') != name.npos || name.find('\0') != name.npos)
+            throw Error("invalid name '%s' for a Git tree entry", name);
+        auto key = std::string(name);
+        if (entry.mode == merkle::Mode::Directory)
+            key += '/';
+        entries.insert_or_assign(std::move(key), git::TreeEntry{.mode = entry.mode, .hash = entry.hash});
     }
 
     Hash finalize() && override
     {
+        auto body = merkle::serialiseTree(entries);
+        ObjectDb odb;
+        if (git_repository_odb(Setter(odb), repo))
+            throw GitError("getting Git object database");
         git_oid oid;
-        if (git_treebuilder_write(&oid, builder.get()))
-            throw GitError("creating a tree object");
+        if (git_odb_write(&oid, odb.get(), body.data(), body.size(), GIT_OBJECT_TREE))
+            throw GitError("writing a tree object");
         return toHash(oid);
     }
 };
@@ -1396,7 +1811,9 @@ GitRepoImpl::getAccessor(const Hash & rev, const GitAccessorOptions & options, s
     auto self = ref<GitRepoImpl>(shared_from_this());
     ref<GitSourceAccessor> rawGitAccessor = getRawAccessor(rev, options);
     rawGitAccessor->setPathDisplay(std::move(displayPrefix));
-    if (options.exportIgnore)
+    /* When no attributes source names `export-ignore` the filter is the
+       identity: the inner accessor, with its names and no lookup per path. */
+    if (options.exportIgnore && !options.exportIgnoreHidesNothing)
         return make_ref<GitExportIgnoreSourceAccessor>(self, rawGitAccessor, rev);
     else
         return rawGitAccessor;
@@ -1415,7 +1832,16 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
             /*allowedPaths=*/{CanonPath::root},
             std::move(makeNotAllowedError))
             .cast<SourceAccessor>();
-    if (options.exportIgnore)
+    /* Name the clean subtrees by the commit's objects when the working
+       directory holds the blobs.  Under `exportIgnore`, when a source names
+       `export-ignore`, the wrapper below hides these names, since the
+       exported tree is then not the commit's. */
+    if (wd.headRev && workdirHoldsTheBlobs(*this, wd))
+        fileAccessor = make_ref<GitWorkdirSourceAccessor>(fileAccessor, getRawAccessor(*wd.headRev, {}), wd);
+    /* The filter asks with `GIT_ATTR_CHECK_INDEX_ONLY`: the index's
+       `.gitattributes` and the files outside the tree.  When none names
+       `export-ignore` it is the identity and is not applied. */
+    if (options.exportIgnore && attributesOutsideTheTreeMention("export-ignore", std::nullopt))
         fileAccessor = make_ref<GitExportIgnoreSourceAccessor>(self, fileAccessor, std::nullopt);
     return fileAccessor;
 }
@@ -1507,23 +1933,12 @@ struct GitRepoPoolImpl : GitRepoPool
      * Idempotent, and called lazily, so that a caller that only ever
      * writes blobs never pays for it.
      *
-     * TODO: it would be nicer to merge the pool's mempacks, and let
-     * libgit2 decide when to spill to disk, rather than forcing a
-     * packfile per pool member just so the trees can refer to the blobs.
-     * libgit2 1.9 offers no way to do that: `sys/mempack.h` has no merge
-     * operation, and a `git_odb_backend` cannot be added to a second odb
-     * (`add_backend_internal` asserts it is unowned, and there is no
-     * refcount, so sharing one would double-free).
-     *
-     * The ordering requirement is avoidable from the other end, though.
-     * `git_treebuilder_write` validates nothing; it is
-     * `git_treebuilder_insert` that checks that each child exists, via
-     * `git_object__is_valid`, which is a no-op when
-     * `GIT_OPT_ENABLE_STRICT_OBJECT_CREATION` is off. Turning that off
-     * would let the trees be written to any handle, so every handle
-     * could just flush once at the end, and this phase would not need to
-     * exist. It is a process-global setting, however, so we would be
-     * giving up that check everywhere.
+     * Not needed for correctness since trees are written raw
+     * (`GitDirectorySinkImpl` checks nothing about children); kept so that
+     * the directories land in one packfile rather than one per pool member.
+     * TODO: merge the pool's mempacks instead, once libgit2 can: the mempack
+     * API of the pinned 2.0.0-rc.1 (`git2/sys/mempack.h`) is still new,
+     * write_thin_pack, dump, reset and object_count -- no merge.
      */
     void beginDependentPhase()
     {
@@ -1671,20 +2086,33 @@ static std::filesystem::path tarballCacheDir()
      * v2: Must have only packfiles with no loose objects. Should get repacked periodically
      * for optimal packfiles.
      */
-    static auto repoDir = std::filesystem::path(getCacheDir()) / "tarball-cache-v2";
+    /* v3: SHA-256 object identifiers, the store's (doc/lazy-store/01-specification.md, section 9.10). */
+    static auto repoDir = std::filesystem::path(getCacheDir()) / "tarball-cache-v3";
     return repoDir;
 }
 
-static constexpr GitRepo::Options tarballCacheOptions{.create = true, .bare = true, .packfilesOnly = true};
+static GitRepo::Options tarballCacheOptions(const Settings & settings)
+{
+    return GitRepo::Options{
+        .create = true,
+        .bare = true,
+        .packfilesOnly = true,
+        /* Tarball unpacking is not expected to benefit from deltas much,
+           compared to how much CPU times it takes to find. */
+        .dontFindDeltas = true,
+        /* A tarball's tree identifier is then the store's name for it. */
+        .oidType = HashAlgorithm::SHA256,
+    };
+}
 
 ref<GitRepo> Settings::getTarballCache() const
 {
-    return GitRepo::openRepo(tarballCacheDir(), tarballCacheOptions);
+    return GitRepo::openRepo(tarballCacheDir(), tarballCacheOptions(*this));
 }
 
 ref<GitRepoPool> Settings::getTarballWriterPool() const
 {
-    return GitRepoPool::create(tarballCacheDir(), tarballCacheOptions);
+    return GitRepoPool::create(tarballCacheDir(), tarballCacheOptions(*this));
 }
 
 } // namespace fetchers

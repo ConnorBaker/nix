@@ -559,7 +559,10 @@ private:
     InternalType internalType = tUninitialized;
     Payload payload;
 
-protected:
+    /* The payload is `Value`'s alone: a class derived from `Value` must not
+       be able to read a string's bytes past `Value`'s friend list. */
+    friend struct Value;
+
 #define NIX_VALUE_STORAGE_GET_IMPL(K, FIELD_NAME, DISCRIMINATOR) \
     void getStorage(K & val) const noexcept                      \
     {                                                            \
@@ -581,6 +584,7 @@ protected:
 #undef NIX_VALUE_STORAGE_GET_IMPL
 #undef NIX_VALUE_STORAGE_FOR_EACH_FIELD
 
+protected:
     /** Get internal type currently occupying the storage. */
     InternalType getInternalType() const noexcept
     {
@@ -845,6 +849,11 @@ protected:
             nixUnreachableWhenHardened();
         }
     }
+
+private:
+    /* The payload is `Value`'s alone: a class derived from `Value` must not
+       be able to read a string's bytes past `Value`'s friend list. */
+    friend struct Value;
 
 #define NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(TYPE, MEMBER_A, MEMBER_B)                                   \
                                                                                                        \
@@ -1494,6 +1503,19 @@ public:
             ref(pathAccessor()->shared_from_this()), CanonPath(CanonPath::unchecked_t(), std::string(pathStrView())));
     }
 
+private:
+    /* The raw bytes of a string value.  Private, so that outside the
+       evaluator they are reachable only through the doors,
+       `EvalState::realise`/`emit` (01 §3, (C2); 04 §0.1): the compiler holds
+       the boundary.  The friends are the readers of the representation
+       itself, each keeping the bytes inside the evaluator or being a door. */
+    friend class EvalState;   // text extraction, coercion, comparison, and the doors
+    friend class SymbolValue; // attribute names: interned, context-free by construction
+    friend class SymbolStr;
+    friend struct ExprString; // string literals in the AST: the parser and `--parse`
+    friend class ToBeStringyExpr;
+    friend struct RawValueBytes; // tests, which check the invariants by looking at the representation
+
     const StringData & string_data() const noexcept
     {
         return *getStorage<StringWithContext>().str;
@@ -1509,6 +1531,7 @@ public:
         return string_data().view();
     }
 
+public:
     const Value::StringWithContext::Context * context() const noexcept
     {
         return getStorage<StringWithContext>().context;

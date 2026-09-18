@@ -4,8 +4,11 @@
 #include "nix/util/signature/signer.hh"
 #include "nix/store/path.hh"
 #include "nix/util/hash.hh"
+#include "nix/util/object-hash.hh"
+#include "nix/util/fun.hh"
 #include "nix/store/content-address.hh"
 
+#include <functional>
 #include <string>
 #include <optional>
 
@@ -24,6 +27,9 @@ enum class PathInfoJsonFormat {
     V2 = 2,
     /// New format with structured signatures
     V3 = 3,
+    /// Format carrying the object hash (`objectHash`, required) with
+    /// the NAR hash (`narHash`) optional
+    V4 = 4,
 };
 
 /**
@@ -70,9 +76,18 @@ struct UnkeyedValidPathInfo
     std::optional<StorePath> deriver;
 
     /**
-     * \todo document this
+     * The store object's content hash (01 §9.11).  Present for every info
+     * the local store returns or registers; absent for a substituter's or
+     * an old peer's description, which carries `assertedNarHash` alone.
      */
-    Hash narHash;
+    std::optional<ObjectHash> objectHash;
+
+    /**
+     * A NAR hash a sender asserted -- an old peer on the wire, a
+     * `.narinfo`'s `NarHash:`, `--load-db`, path-info JSON before
+     * version 4.  Verified on the receiving tee, never stored.
+     */
+    std::optional<Hash> assertedNarHash;
 
     /**
      * Other store objects this store object refers to.
@@ -117,13 +132,29 @@ struct UnkeyedValidPathInfo
      */
     std::optional<ContentAddress> ca;
 
+    /**
+     * A thunk producing the NAR hash of this object: for the JSON formats
+     * before 4, whose `narHash` is required (`toJSON`), and for
+     * `lazyNarHash` below.
+     */
+    using NarHashThunk = fun<Hash()>;
+
+    /**
+     * The NAR hash an old form may need, computed only when one asks
+     * (01 §9.11: the cost falls on the old peer).  Not part of the
+     * description -- neither compared nor serialised -- and forced by
+     * `CommonProto::writePathInfoHashes` alone, in the old form when
+     * `assertedNarHash` is absent; the new form's slot stays empty.
+     */
+    std::optional<NarHashThunk> lazyNarHash;
+
     UnkeyedValidPathInfo(const UnkeyedValidPathInfo & other) = default;
 
-    UnkeyedValidPathInfo(const StoreDirConfig & store, Hash narHash);
+    UnkeyedValidPathInfo(const StoreDirConfig & store, std::optional<ObjectHash> objectHash);
 
-    UnkeyedValidPathInfo(std::string storeDir, Hash narHash)
+    UnkeyedValidPathInfo(std::string storeDir, std::optional<ObjectHash> objectHash)
         : storeDir(std::move(storeDir))
-        , narHash(std::move(narHash))
+        , objectHash(std::move(objectHash))
     {
     }
 
@@ -143,10 +174,18 @@ struct UnkeyedValidPathInfo
      *                          registration time are included.
      * @param format JSON format version. Version 1 uses string hashes and
      *               string content addresses. Version 2 uses structured
-     *               hashes and structured content addresses.
+     *               hashes and structured content addresses. Version 4
+     *               carries `objectHash` (required) and `narHash` only
+     *               when `assertedNarHash` is present.
+     * @param narHashFor For formats 1 to 3, which require `narHash`:
+     *               used when `assertedNarHash` is absent; without
+     *               either, those formats throw.
      */
-    virtual nlohmann::json
-    toJSON(const StoreDirConfig * store, bool includeImpureInfo, PathInfoJsonFormat format) const;
+    virtual nlohmann::json toJSON(
+        const StoreDirConfig * store,
+        bool includeImpureInfo,
+        PathInfoJsonFormat format,
+        std::optional<NarHashThunk> narHashFor = std::nullopt) const;
     static UnkeyedValidPathInfo fromJSON(const StoreDirConfig * store, const nlohmann::json & json);
 
 private:
@@ -164,16 +203,48 @@ struct ValidPathInfo : virtual UnkeyedValidPathInfo
 
     /**
      * Return a fingerprint of the store path to be used in binary
-     * cache signatures. It contains the store path, the base-32
-     * SHA-256 hash of the NAR serialisation of the path, the size of
-     * the NAR, and the sorted references. The size field is strictly
-     * speaking superfluous, but might prevent endless/excessive data
-     * attacks.
+     * cache signatures, version 2: `2;<path>;<object hash>;<references>`
+     * (`doc/lazy-store/01-specification.md` section 9.11).
+     *
+     * @throws Error if the object hash is not known.
      */
     std::string fingerprint(const StoreDirConfig & store) const;
 
+    /**
+     * The version-1 fingerprint, `1;<path>;<NAR hash>;<NAR size>;<references>`,
+     * over a NAR hash the caller supplies -- the shim under which a
+     * signature made before the object hash is still verified.
+     *
+     * @throws Error if `narSize` is 0.
+     */
+    std::string fingerprintV1(const StoreDirConfig & store, const Hash & narHash) const;
+
+    /**
+     * The object hash, which every info the local store holds carries.
+     *
+     * @throws Error("store path '%s' has no object hash") otherwise: a
+     * description from an old peer or cache that has not yet been
+     * verified against the NAR it names.
+     */
+    const ObjectHash & requireObjectHash(const StoreDirConfig & store) const;
+
+    /**
+     * Sign over the version-2 fingerprint; a signature present is not
+     * added twice.  Signing at registration does this and nothing more
+     * (01 §9.11, "Signatures": no walk per output); `signV1` is for the
+     * places that hold or are asked to walk for the NAR hash.
+     */
     void sign(const Store & store, const Signer & signer);
     void sign(const Store & store, const std::vector<std::unique_ptr<Signer>> & signers);
+
+    /**
+     * Sign over the version-1 fingerprint, for clients that verify only
+     * that form (every Nix before the object hash), given the NAR hash the
+     * caller computed or was asserted.  Deduplicated as `sign` is.
+     *
+     * @throws Error if `narSize` is 0 (`fingerprintV1`).
+     */
+    void signV1(const StoreDirConfig & store, const Hash & narHash, const Signer & signer);
 
     /**
      * @return The `ContentAddressWithReferences` that determines the
@@ -190,16 +261,29 @@ struct ValidPathInfo : virtual UnkeyedValidPathInfo
     static const size_t maxSigs = std::numeric_limits<size_t>::max();
 
     /**
-     * Return the number of signatures on this .narinfo that were
-     * produced by one of the specified keys, or maxSigs if the path
-     * is content-addressed.
+     * Return the number of distinct keys among `publicKeys` that signed
+     * this path, or maxSigs if the path is content-addressed.  A key
+     * counts once if any of its signatures verifies, over either
+     * fingerprint (01 §9.11, "Signatures").  The NAR hash for version 1
+     * is `assertedNarHash`, else `narHashFor`, called at most once and
+     * only for a signature by one of `publicKeys` that does not verify
+     * under version 2; without it such a signature verifies under no
+     * fingerprint.
      */
-    size_t checkSignatures(const StoreDirConfig & store, const PublicKeys & publicKeys) const;
+    size_t checkSignatures(
+        const StoreDirConfig & store,
+        const PublicKeys & publicKeys,
+        std::optional<NarHashThunk> narHashFor = std::nullopt) const;
 
     /**
-     * Verify a single signature.
+     * Verify a single signature, under the same rule; `narHashFor` is
+     * called when the version-1 check needs it and nothing is asserted.
      */
-    bool checkSignature(const StoreDirConfig & store, const PublicKeys & publicKeys, const Signature & sig) const;
+    bool checkSignature(
+        const StoreDirConfig & store,
+        const PublicKeys & publicKeys,
+        const Signature & sig,
+        std::optional<NarHashThunk> narHashFor = std::nullopt) const;
 
     /**
      * References as store path basenames, including a self reference if it has one.
@@ -217,8 +301,11 @@ struct ValidPathInfo : virtual UnkeyedValidPathInfo
     {
     }
 
-    static ValidPathInfo
-    makeFromCA(const StoreDirConfig & store, std::string_view name, ContentAddressWithReferences && ca, Hash narHash);
+    static ValidPathInfo makeFromCA(
+        const StoreDirConfig & store,
+        std::string_view name,
+        ContentAddressWithReferences && ca,
+        std::optional<ObjectHash> objectHash);
 
 private:
     void anchor() override;

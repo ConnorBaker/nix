@@ -156,6 +156,17 @@ EvalCommand::~EvalCommand()
         evalState->maybePrintStats();
 }
 
+void EvalCommand::run(ref<StoreConfig> storeConfig)
+{
+    /* Whatever evaluation created is written before the command's result is
+       reported.  On the error path nothing is needed here: the command is a
+       local of `mainWrapped`, so unwinding destroys the evaluator, whose
+       destructor flushes, before `handleExceptions` prints the error. */
+    StoreCommand::run(storeConfig);
+    if (evalState)
+        evalState->flushPendingWrites();
+}
+
 ref<Store> EvalCommand::getEvalStore()
 {
     if (!evalStore)

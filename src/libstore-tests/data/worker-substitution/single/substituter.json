@@ -16,14 +16,14 @@
           "method": "nar"
         },
         "deriver": null,
-        "narHash": "sha256-KShIJtIwWG1gMSpvPMt5drppc1h5WMwHWzVpNJiVqGI=",
         "narSize": 128,
+        "objectHash": "git:sha256:178b5fbed164aee269fee7323badf7269cca0eed0875717b0d2d4f9819164c3f",
         "references": [],
         "registrationTime": null,
         "signatures": [],
         "storeDir": "/nix/store",
         "ultimate": false,
-        "version": 3
+        "version": 4
       }
     }
   },

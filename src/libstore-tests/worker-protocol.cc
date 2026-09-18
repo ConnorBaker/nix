@@ -11,6 +11,7 @@
 #include "nix/store/build-result.hh"
 #include "nix/store/tests/protocol.hh"
 #include "nix/util/tests/characterization.hh"
+#include "nix/store/tests/path-info-json-v3.hh"
 
 namespace nix {
 
@@ -580,7 +581,7 @@ VERSIONED_CHARACTERIZATION_TEST(
         t;
     }))
 
-VERSIONED_CHARACTERIZATION_TEST(
+VERSIONED_CHARACTERIZATION_TEST_JSON_V3(
     WorkerProtoTest,
     unkeyedValidPathInfo_1_15,
     "unkeyed-valid-path-info-1.15",
@@ -595,16 +596,17 @@ VERSIONED_CHARACTERIZATION_TEST(
         ({
             UnkeyedValidPathInfo info{
                 "/nix/store",
-                Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="),
+                std::nullopt,
             };
             info.registrationTime = 23423;
             info.narSize = 34878;
+            info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
             info;
         }),
         ({
             UnkeyedValidPathInfo info{
                 "/nix/store",
-                Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="),
+                std::nullopt,
             };
             info.deriver = StorePath{
                 "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar.drv",
@@ -616,11 +618,12 @@ VERSIONED_CHARACTERIZATION_TEST(
             };
             info.registrationTime = 23423;
             info.narSize = 34878;
+            info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
             info;
         }),
     }))
 
-VERSIONED_CHARACTERIZATION_TEST(
+VERSIONED_CHARACTERIZATION_TEST_JSON_V3(
     WorkerProtoTest,
     validPathInfo_1_15,
     "valid-path-info-1.15",
@@ -639,11 +642,12 @@ VERSIONED_CHARACTERIZATION_TEST(
                 },
                 UnkeyedValidPathInfo{
                     "/nix/store",
-                    Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="),
+                    std::nullopt,
                 },
             };
             info.registrationTime = 23423;
             info.narSize = 34878;
+            info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
             info;
         }),
         ({
@@ -653,7 +657,7 @@ VERSIONED_CHARACTERIZATION_TEST(
                 },
                 UnkeyedValidPathInfo{
                     "/nix/store",
-                    Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="),
+                    std::nullopt,
                 },
             };
             info.deriver = StorePath{
@@ -671,11 +675,12 @@ VERSIONED_CHARACTERIZATION_TEST(
             };
             info.registrationTime = 23423;
             info.narSize = 34878;
+            info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
             info;
         }),
     }))
 
-VERSIONED_CHARACTERIZATION_TEST(
+VERSIONED_CHARACTERIZATION_TEST_JSON_V3(
     WorkerProtoTest,
     validPathInfo_1_16,
     "valid-path-info-1.16",
@@ -694,11 +699,12 @@ VERSIONED_CHARACTERIZATION_TEST(
                 },
                 UnkeyedValidPathInfo{
                     "/nix/store",
-                    Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="),
+                    std::nullopt,
                 },
             };
             info.registrationTime = 23423;
             info.narSize = 34878;
+            info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
             info.ultimate = true;
             info;
         }),
@@ -709,7 +715,7 @@ VERSIONED_CHARACTERIZATION_TEST(
                 },
                 UnkeyedValidPathInfo{
                     "/nix/store",
-                    Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="),
+                    std::nullopt,
                 },
             };
             info.deriver = StorePath{
@@ -727,6 +733,7 @@ VERSIONED_CHARACTERIZATION_TEST(
             };
             info.registrationTime = 23423;
             info.narSize = 34878;
+            info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
             info.sigs =
                 {
                     Signature{.keyName = "fake-sig-1", .sig = std::string(64, '\0')},
@@ -752,9 +759,10 @@ VERSIONED_CHARACTERIZATION_TEST(
                             .self = true,
                         },
                 },
-                Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="));
+                std::nullopt);
             info.registrationTime = 23423;
             info.narSize = 34878;
+            info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
             info;
         }),
     }))

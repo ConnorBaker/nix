@@ -106,15 +106,6 @@ constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails
         .trackingUrl = "https://github.com/NixOS/nix/milestone/28",
     },
     {
-        .tag = Xp::GitHashing,
-        .name = "git-hashing",
-        .description = R"(
-            Allow creating (content-addressed) store objects which are hashed via Git's hashing algorithm.
-            These store objects aren't understandable by older versions of Nix.
-        )",
-        .trackingUrl = "https://github.com/NixOS/nix/milestone/41",
-    },
-    {
         .tag = Xp::RecursiveNix,
         .name = "recursive-nix",
         .description = R"(

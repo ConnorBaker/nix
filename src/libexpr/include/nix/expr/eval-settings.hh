@@ -224,6 +224,23 @@ public:
           This option has no effect if `allow-import-from-derivation` is disabled.
         )"};
 
+    Setting<uint64_t> deferredStoreWritesMaxPending{
+        this,
+        4096,
+        "deferred-store-writes-max-pending",
+        R"(
+          The largest number of store objects the evaluator's write buffer
+          holds before it writes what it has to the store, which bounds peak
+          memory.  The evaluator always batches the store derivations and
+          `builtins.toFile` files it creates, writing them together when a path
+          first leaves it or when evaluation ends; this caps how many it holds
+          at once.  A larger value keeps more objects in one batch; a smaller
+          value bounds memory more tightly.  The default batches every
+          realistic derivation closure in a single write while bounding a large
+          `nix eval --json`.  The store's contents after a command are the same
+          at any value.
+        )"};
+
     Setting<bool> enableImportFromDerivation{
         this,
         true,

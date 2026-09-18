@@ -40,12 +40,13 @@ class PathInfoTestV3 : public CharacterizationTest, public LibStoreTest
     }
 };
 
+/* The json-1..3 fixtures are the old forms: they carry a NAR hash and no
+   object hash, which reads as `assertedNarHash` (04 section 1.9). */
 static UnkeyedValidPathInfo makeEmpty()
 {
-    return {
-        "/nix/store",
-        Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="),
-    };
+    UnkeyedValidPathInfo info{"/nix/store", std::nullopt};
+    info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
+    return info;
 }
 
 static ValidPathInfo makeFullKeyed(const Store & store, bool includeImpureInfo)
@@ -68,8 +69,9 @@ static ValidPathInfo makeFullKeyed(const Store & store, bool includeImpureInfo)
                     .self = true,
                 },
         },
-        Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="));
+        std::nullopt);
     info.narSize = 34878;
+    info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
     if (includeImpureInfo) {
         info.deriver = StorePath{
             "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar.drv",

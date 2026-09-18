@@ -16,14 +16,14 @@
           "method": "nar"
         },
         "deriver": null,
-        "narHash": "sha256-miJnClL0Ai/HAmX1G/pz7P2TIaeFjP5D/VN1rhYf354=",
         "narSize": 136,
+        "objectHash": "git:sha256:cec9cefbbe7b14bb3a1e2f24a241087954608a1e567f6250a41cdf7ec205f81f",
         "references": [],
         "registrationTime": null,
         "signatures": [],
         "storeDir": "/nix/store",
         "ultimate": false,
-        "version": 3
+        "version": 4
       }
     },
     "k09ldq9fvxb6vfwq0cmv6j1jgqx08y1n-main": {
@@ -38,8 +38,8 @@
           "method": "nar"
         },
         "deriver": null,
-        "narHash": "sha256-CBfMK3HkqiXjpI8HNL1spWD/US4RnQHwI67Ojl50XoQ=",
         "narSize": 184,
+        "objectHash": "git:sha256:9666e3922d52819ab1e9d083bdb6fe99c9a2f88947c23c2ae0550913417ce71f",
         "references": [
           "4k79i02avcckr96r97lqnswn75fi1gv7-dependency"
         ],
@@ -47,7 +47,7 @@
         "signatures": [],
         "storeDir": "/nix/store",
         "ultimate": false,
-        "version": 3
+        "version": 4
       }
     }
   },

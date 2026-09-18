@@ -1,7 +1,7 @@
 create table if not exists ValidPaths (
     id               integer primary key autoincrement not null,
     path             text unique not null,
-    hash             text not null, -- base16 representation
+    hash             text not null, -- object hash, "git:sha256:<base16>"; "sha256:<base16>" in a row not yet migrated
     registrationTime integer not null,
     deriver          text,
     narSize          integer,

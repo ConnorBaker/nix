@@ -299,10 +299,23 @@ ref<SourceAccessor> makeFSSourceAccessor(
     std::filesystem::path root, bool trackLastModified = false, FinalSymlink finalSymlink = FinalSymlink::DontFollow);
 
 /**
- * Construct an accessor that presents a "union" view of a vector of
- * underlying accessors. Earlier accessors take precedence over later.
+ * What the caller of `makeUnionSourceAccessor()` asserts about the children;
+ * it decides only how `getFingerprint()` names subtrees.  `Unknown`: a subtree
+ * is named only where one child alone defines it or every contributing child
+ * has a name (then combined).  `ChildrenAgree`: overlapping subtrees are
+ * equal, so the first child's name serves (the evaluator's impure root: host
+ * filesystem and store view agree at content-addressed store paths).
  */
-ref<SourceAccessor> makeUnionSourceAccessor(std::vector<ref<SourceAccessor>> && accessors);
+enum class UnionCoherence { Unknown, ChildrenAgree };
+
+/**
+ * Return the union of the given accessors.  At each path the first child
+ * that has a node decides: a directory is the merge of the directories
+ * every child has there, earlier children winning name collisions; a
+ * non-directory hides the later children's subtrees at and below it.
+ */
+ref<SourceAccessor> makeUnionSourceAccessor(
+    std::vector<ref<SourceAccessor>> && accessors, UnionCoherence coherence = UnionCoherence::Unknown);
 
 /**
  * Make a wrapper source accessor that caches positive lookup results.

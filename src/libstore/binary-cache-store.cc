@@ -8,6 +8,7 @@
 #include "nix/util/sync.hh"
 #include "nix/store/remote-fs-accessor.hh"
 #include "nix/util/nar-accessor.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/thread-pool.hh"
 #include "nix/util/callback.hh"
 #include "nix/util/signals.hh"
@@ -144,7 +145,8 @@ void BinaryCacheStore::writeNarInfo(ref<NarInfo> narInfo)
             std::shared_ptr<NarInfo>(narInfo));
 }
 
-ref<NarInfo> BinaryCacheStore::uploadData(Source & narSource, RepairFlag repair, fun<ValidPathInfo(HashResult)> mkInfo)
+ref<NarInfo>
+BinaryCacheStore::uploadData(Source & narSource, RepairFlag repair, fun<ValidPathInfo(const UploadedNar &)> mkInfo)
 {
     auto fdTemp = createAnonymousTempFile();
 
@@ -152,10 +154,14 @@ ref<NarInfo> BinaryCacheStore::uploadData(Source & narSource, RepairFlag repair,
 
     /* Read the NAR simultaneously into a CompressionSink+FileSink (to
        write the compressed NAR to disk), into a HashSink (to get the
-       NAR hash), and into a NarAccessor (to get the NAR listing). */
+       NAR hash), and into one parse that feeds both a NarAccessor (the
+       NAR listing) and an ObjectHashSink (the object hash): the NAR
+       delivers each file's executable bit, size and bytes in the order
+       the Merkle hash needs them, so one pass suffices. */
     HashSink fileHashSink{HashAlgorithm::SHA256};
     std::shared_ptr<NarAccessor> narAccessor;
     HashSink narHashSink{HashAlgorithm::SHA256};
+    ObjectHashSink objectSink;
     {
         FdSink fileSink(fdTemp.get());
         TeeSink teeSinkCompressed{fileSink, fileHashSink};
@@ -165,15 +171,51 @@ ref<NarInfo> BinaryCacheStore::uploadData(Source & narSource, RepairFlag repair,
             makeCompressionSink(config.compression, teeSinkCompressed, parallel, config.compressionLevel);
         TeeSink teeSinkUncompressed{*compressionSink, narHashSink};
         TeeSource teeSource{narSource, teeSinkUncompressed};
-        narAccessor = makeNarAccessor(parseNarListing(teeSource));
+        narAccessor = makeNarAccessor(parseNarListing(teeSource, objectSink));
         compressionSink->finish();
         fileSink.flush();
     }
 
     auto now2 = std::chrono::steady_clock::now();
 
-    auto info = mkInfo(narHashSink.finish());
+    UploadedNar uploaded{
+        .nar = narHashSink.finish(),
+        .objectHash = ObjectHash::of(objectSink.finish().root),
+    };
+    auto info = mkInfo(uploaded);
+
+    /* The info describes what was uploaded, or the upload is refused.
+       Master had these checks commented out under a FIXME whose cause is
+       gone since 9fbc31a65. */
+    if (info.objectHash && *info.objectHash != uploaded.objectHash)
+        throw Error(
+            "object hash mismatch uploading path '%s' to '%s': the path info says '%s', the NAR gives '%s'",
+            printStorePath(info.path),
+            config.getHumanReadableURI(),
+            info.objectHash->render(),
+            uploaded.objectHash.render());
+    if (info.assertedNarHash && *info.assertedNarHash != uploaded.nar.hash)
+        throw Error(
+            "NAR hash mismatch uploading path '%s' to '%s': the path info says '%s', the NAR hashes to '%s'",
+            printStorePath(info.path),
+            config.getHumanReadableURI(),
+            info.assertedNarHash->to_string(HashFormat::Nix32, true),
+            uploaded.nar.hash.to_string(HashFormat::Nix32, true));
+    if (info.narSize != 0 && info.narSize != uploaded.nar.numBytesDigested)
+        throw Error(
+            "NAR size mismatch uploading path '%s' to '%s': the path info says %d, the NAR is %d bytes",
+            printStorePath(info.path),
+            config.getHumanReadableURI(),
+            info.narSize,
+            uploaded.nar.numBytesDigested);
+
     auto narInfo = make_ref<NarInfo>(info);
+    /* Both hashes are published: the object hash names the object; the
+       NAR hash costs nothing here and lets an old client consume the
+       cache unchanged. */
+    narInfo->objectHash = uploaded.objectHash;
+    narInfo->assertedNarHash = uploaded.nar.hash;
+    narInfo->narSize = uploaded.nar.numBytesDigested;
     narInfo->compression = config.compression;
     auto [fileHash, fileSize] = fileHashSink.finish();
     narInfo->fileHash = fileHash;
@@ -289,13 +331,19 @@ void BinaryCacheStore::uploadNarInfo(ref<NarInfo> narInfo)
         }
 
     narInfo->sign(*this, signers);
+    /* And over the version-1 fingerprint, the only form clients before the
+       object hash verify; the NAR hash is the upload's own (`uploadData`),
+       so this costs no walk. */
+    if (narInfo->assertedNarHash)
+        for (auto & signer : signers)
+            narInfo->signV1(*this, *narInfo->assertedNarHash, *signer);
 
     /* Atomically write the NAR info file.*/
     writeNarInfo(narInfo);
 }
 
 ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
-    Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(HashResult)> mkInfo)
+    Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(const UploadedNar &)> mkInfo)
 {
     auto narInfo = uploadData(narSource, repair, std::move(mkInfo));
     uploadNarInfo(narInfo);
@@ -308,13 +356,9 @@ void BinaryCacheStore::addToStore(
     if (!repair && isValidPath(info.path))
         return;
 
-    addToStoreCommon(narSource, repair, checkSigs, {[&](HashResult nar) {
-                         /* FIXME reinstate these, once we can correctly do masked hash sink as
-                            needed. We need to throw here in case we uploaded a corrupted store path. */
-                         // assert(info.narHash == nar.first);
-                         // assert(info.narSize == nar.second);
-                         return info;
-                     }});
+    /* `uploadData` checks the info's object hash, asserted NAR hash and
+       size against the stream and throws on a mismatch. */
+    addToStoreCommon(narSource, repair, checkSigs, {[&](const UploadedNar &) { return info; }});
 }
 
 void BinaryCacheStore::addMultipleToStore(
@@ -425,7 +469,7 @@ void BinaryCacheStore::addMultipleToStore(
                         if (repair || !isValidPath(info.path)) {
                             MaintainCount<decltype(nrRunning)> mc(nrRunning);
                             showProgress();
-                            auto narInfo = uploadData(*source, repair, [&](HashResult nar) {
+                            auto narInfo = uploadData(*source, repair, [&](const UploadedNar &) {
                                 auto info2 = info;
                                 info2.ultimate = false;
                                 return info2;
@@ -460,11 +504,11 @@ StorePath BinaryCacheStore::addToStoreFromDump(
     std::optional<Hash> caHash;
     std::string nar;
 
-    // Calculating Git hash from NAR stream not yet implemented. May not
-    // be possible to implement in single-pass if the NAR is in an
-    // inconvenient order. Could fetch after uploading, however.
-    if (hashMethod.getFileIngestionMethod() == FileIngestionMethod::Git)
-        unsupported("addToStoreFromDump");
+    checkIngestionAlgorithm(hashMethod.getFileIngestionMethod(), hashAlgo);
+    /* The git method's hash is the object hash the upload computes from
+       the stream in one pass (the NAR's order is the one the Merkle hash
+       needs). */
+    bool gitFromStream = hashMethod.getFileIngestionMethod() == FileIngestionMethod::Git;
 
     if (auto * dump2p = dynamic_cast<StringSource *>(&dump)) {
         auto & dump2 = *dump2p;
@@ -503,21 +547,23 @@ StorePath BinaryCacheStore::addToStoreFromDump(
                narDump2,
                repair,
                CheckSigs,
-               [&](HashResult nar) {
+               [&](const UploadedNar & uploaded) {
                    auto info = ValidPathInfo::makeFromCA(
                        *this,
                        name,
                        ContentAddressWithReferences::fromParts(
                            hashMethod,
-                           caHash ? *caHash : nar.hash,
+                           gitFromStream ? uploaded.objectHash.hash
+                           : caHash      ? *caHash
+                                         : uploaded.nar.hash,
                            {
                                .others = references,
                                // caller is not capable of creating a self-reference, because this is content-addressed
                                // without modulus
                                .self = false,
                            }),
-                       nar.hash);
-                   info.narSize = nar.numBytesDigested;
+                       uploaded.objectHash);
+                   info.narSize = uploaded.nar.numBytesDigested;
                    return info;
                })
         ->path;
@@ -621,7 +667,7 @@ StorePath BinaryCacheStore::addToStore(
                *source,
                repair,
                CheckSigs,
-               [&](HashResult nar) {
+               [&](const UploadedNar & uploaded) {
                    auto info = ValidPathInfo::makeFromCA(
                        *this,
                        name,
@@ -634,8 +680,8 @@ StorePath BinaryCacheStore::addToStore(
                                // without modulus
                                .self = false,
                            }),
-                       nar.hash);
-                   info.narSize = nar.numBytesDigested;
+                       uploaded.objectHash);
+                   info.narSize = uploaded.nar.numBytesDigested;
                    return info;
                })
         ->path;

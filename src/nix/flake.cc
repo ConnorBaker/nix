@@ -439,22 +439,20 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking app '%s'", attrPath));
                 state->forceAttrs(v, pos, "");
                 if (auto attr = v.attrs()->get(state->symbols.create("type")))
-                    state->forceStringNoCtx(*attr->value, attr->pos, "");
+                    (void) state->realiseNoCtx(*attr->value, attr->pos, "");
                 else
                     throw Error("app '%s' lacks attribute 'type'", attrPath);
 
                 if (auto attr = v.attrs()->get(state->symbols.create("program"))) {
-                    if (attr->name == state->symbols.create("program")) {
-                        NixStringContext context;
-                        state->forceString(*attr->value, context, attr->pos, "");
-                    }
+                    if (attr->name == state->symbols.create("program"))
+                        (void) state->realise(*attr->value, attr->pos, "");
                 } else
                     throw Error("app '%s' lacks attribute 'program'", attrPath);
 
                 if (auto attr = v.attrs()->get(state->symbols.create("meta"))) {
                     state->forceAttrs(*attr->value, attr->pos, "");
                     if (auto dAttr = attr->value->attrs()->get(state->symbols.create("description")))
-                        state->forceStringNoCtx(*dAttr->value, dAttr->pos, "");
+                        (void) state->realiseNoCtx(*dAttr->value, dAttr->pos, "");
                     else
                         logWarning({
                             .msg = HintFmt("app '%s' lacks attribute 'meta.description'", attrPath),
@@ -560,7 +558,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
                     throw Error("template '%s' lacks attribute 'path'", attrPath);
 
                 if (auto attr = v.attrs()->get(state->symbols.create("description")))
-                    state->forceStringNoCtx(*attr->value, attr->pos, "");
+                    (void) state->realiseNoCtx(*attr->value, attr->pos, "");
                 else
                     throw Error("template '%s' lacks attribute 'description'", attrPath);
 
@@ -1528,24 +1526,29 @@ struct CmdFlakePrefetch : FlakeCommand, MixJSON
         auto originalRef = getFlakeRef();
         auto resolvedRef = originalRef.resolve(fetchSettings, *store);
         auto [accessor, lockedRef] = resolvedRef.lazyFetch(getEvalState()->fetchSettings, *store);
-        auto storePath =
-            fetchToStore(getEvalState()->fetchSettings, *store, accessor, FetchMode::Copy, lockedRef.input.getName());
-        auto hash = store->queryPathInfo(storePath)->narHash;
+        /* The copy names the tree; its hash is the tree hash, the `treeHash`
+           the lock file carries (doc/lazy-store/04-derivation.md, section
+           1.9): the output's `hash` and the lock's `treeHash` are one value. */
+        auto [storePath, treeHash] =
+            fetchToStore2(getEvalState()->fetchSettings, *store, accessor, FetchMode::Copy, lockedRef.input.getName());
+        if (auto locked = lockedRef.input.getTreeHash()) {
+            if (*locked != treeHash)
+                throw inputHashMismatch("tree hash", lockedRef.to_string(), *locked, treeHash);
+        } else
+            lockedRef.input.attrs.insert_or_assign("treeHash", treeHash.to_string(HashFormat::SRI, true));
+        auto hash = treeHash.to_string(HashFormat::SRI, true);
 
         if (json) {
             auto res = nlohmann::json::object();
             res["storePath"] = store->printStorePath(storePath);
-            res["hash"] = hash.to_string(HashFormat::SRI, true);
+            res["hash"] = hash;
             res["original"] = fetchers::attrsToJSON(resolvedRef.toAttrs());
             res["locked"] = fetchers::attrsToJSON(lockedRef.toAttrs());
             res["locked"].erase("__final"); // internal for now
             printJSON(res);
         } else {
             notice(
-                "Downloaded '%s' to '%s' (hash '%s').",
-                lockedRef.to_string(),
-                store->printStorePath(storePath),
-                hash.to_string(HashFormat::SRI, true));
+                "Downloaded '%s' to '%s' (hash '%s').", lockedRef.to_string(), store->printStorePath(storePath), hash);
         }
 
         if (outLink) {

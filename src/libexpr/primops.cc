@@ -22,6 +22,7 @@
 #include "nix/expr/value-to-xml.hh"
 #include "nix/expr/primops.hh"
 #include "nix/fetchers/fetch-to-store.hh"
+#include "nix/fetchers/fetch-settings.hh"
 #include "nix/util/sort.hh"
 
 #include <boost/container/small_vector.hpp>
@@ -65,6 +66,9 @@ static inline Value * mkString(EvalState & state, const std::csub_match & match)
 
 std::string EvalState::realiseString(Value & s, StorePathSet * storePathsOutMaybe, bool isIFD, const PosIdx pos)
 {
+    /* The text leaves for a consumer that reads and builds: written totally,
+       whatever the string's own provenance says, as at every door. */
+    flushPendingWrites();
     nix::NixStringContext stringContext;
     auto rawStr = coerceToString(noPos, s, stringContext, "while realising a string").toOwned();
     auto rewrites = realiseContext(stringContext, storePathsOutMaybe, isIFD);
@@ -74,6 +78,11 @@ std::string EvalState::realiseString(Value & s, StorePathSet * storePathsOutMayb
 
 StringMap EvalState::realiseContext(const NixStringContext & context, StorePathSet * maybePathsOut, bool isIFD)
 {
+    /* Realisation reads the store and builds, so everything the context names
+       must be there first; an empty context names nothing. */
+    if (!context.empty())
+        flushPendingWrites();
+
     std::vector<DerivedPath::Built> drvs;
     StringMap res;
 
@@ -181,7 +190,12 @@ SourcePath EvalState::realisePath(
                 ensureLazyPathsCopied(context);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
         }
-        return resolveSymlinks ? path.resolveSymlinks(*resolveSymlinks) : path;
+        if (resolveSymlinks) {
+            /* The target may be another store object, which the read must find as well. */
+            path = path.resolveSymlinks(*resolveSymlinks);
+            writePendingBeforeRead(path);
+        }
+        return path;
     } catch (Error & e) {
         e.addTrace(nullptr, "while realising the context of path '%s'", path);
         throw;
@@ -514,6 +528,9 @@ void prim_exec(EvalState & state, CallSite callSite, Value * const * args, Value
     }
 
     state.ensureLazyPathsCopied(context);
+    /* The program runs outside the evaluator: whatever is pending is written
+       first, as at every door, whatever the strings' own provenance says. */
+    program = state.realise(std::move(program)).toOwned();
     auto output = runProgram(program, true, toOsStrings(std::move(commandArgs)));
     Expr * parsed;
     try {
@@ -750,7 +767,7 @@ struct CompareValues
             case nFloat:
                 return v1->fpoint() < v2->fpoint();
             case nString:
-                return v1->string_view() < v2->string_view();
+                return state.forceString(*v1, pos, errorCtx) < state.forceString(*v2, pos, errorCtx);
             case nPath:
                 // Note: we don't take the accessor into account
                 // since it's not obvious how to compare them in a
@@ -1319,7 +1336,7 @@ static void prim_trace(EvalState & state, CallSite callSite, Value * const * arg
 {
     state.forceValue(*args[0], noPos);
     if (args[0]->type() == nString)
-        printError("trace: %1%", args[0]->string_view());
+        printError("trace: %1%", state.realise(*args[0]));
     else
         printError("trace: %1%", ValuePrinter(state, *args[0]));
     if (state.settings.builtinsTraceDebugger) {
@@ -1350,8 +1367,9 @@ static void prim_warn(EvalState & state, CallSite callSite, Value * const * args
 {
     // We only accept a string argument for now. The use case for pretty printing a value is covered by `trace`.
     // By rejecting non-strings we allow future versions to add more features without breaking existing code.
-    auto msgStr =
-        state.forceString(*args[0], noPos, "while evaluating the first argument; the message passed to builtins.warn");
+    state.forceString(*args[0], noPos, "while evaluating the first argument; the message passed to builtins.warn");
+    auto msg = state.realise(*args[0]);
+    auto msgStr = msg.view();
 
     {
         ErrorInfo info{
@@ -1579,8 +1597,6 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             if (ingestionMethod == ContentAddressMethod::Raw::Text)
                 experimentalFeatureSettings.require(
                     Xp::DynamicDerivations, fmt("text-hashed derivation '%s', outputHashMode = \"text\"", drvName));
-            if (ingestionMethod == ContentAddressMethod::Raw::Git)
-                experimentalFeatureSettings.require(Xp::GitHashing);
         };
 
         auto handleOutputs = [&](const Strings & ss) {
@@ -1793,6 +1809,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                    available when the builder runs. */
                 [&](const NixStringContextElem::DrvDeep & d) {
                     /* !!! This doesn't work if readOnlyMode is set. */
+                    /* The closure is computed from the store, so pending objects must be there. */
+                    state.flushPendingWrites();
                     StorePathSet refs;
                     state.store->computeFSClosure(d.drvPath, refs);
                     for (auto & j : refs) {
@@ -1816,7 +1834,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                         });
                 },
                 [&](const NixStringContextElem::Opaque & o) {
-                    state.ensureLazyPathCopied(o.path);
+                    /* A mounted input is copied when the derivation is written (`flushPendingWrites`). */
                     drv.inputs.insert(SingleDerivedPath::Opaque{o.path});
                 },
             },
@@ -1842,6 +1860,16 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             .debugThrow();
     }
 
+    /* The git method admits SHA-256 only (`checkIngestionAlgorithm`):
+       refused here, at instantiation, at the derivation's position. */
+    auto requireAlgorithm = [&](ContentAddressMethod method, HashAlgorithm algo) {
+        try {
+            checkIngestionAlgorithm(method.getFileIngestionMethod(), algo);
+        } catch (Error & e) {
+            state.error<EvalError>("%s", Uncolored(e.message())).atPos(v).debugThrow();
+        }
+    };
+
     if (outputHash) {
         /* Handle fixed-output derivations.
 
@@ -1855,6 +1883,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
         auto h = newHashAllowEmpty(*outputHash, outputHashAlgo);
 
         auto method = ingestionMethod.value_or(ContentAddressMethod::Raw::Flat);
+        requireAlgorithm(method, h.algo);
 
         DerivationOutput::CAFixed dof{
             .ca =
@@ -1875,6 +1904,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
 
         auto ha = outputHashAlgo.value_or(HashAlgorithm::SHA256);
         auto method = ingestionMethod.value_or(ContentAddressMethod::Raw::NixArchive);
+        requireAlgorithm(method, ha);
 
         for (auto & i : outputs) {
             if (!isSubmittingOutputs)
@@ -1916,8 +1946,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
        Unless we are in read-only mode, that is, in which case we do not
        write anything. Users commonly do this to speed up evaluation in
        contexts where they don't actually want to build anything. */
-    auto drvPath =
-        settings.readOnlyMode ? computeStorePath(*state.store, drv) : state.store->writeDerivation(drv, state.repair);
+    auto drvPath = settings.readOnlyMode ? computeStorePath(*state.store, drv)
+                                         : state.writeBuffer.addDerivation(drv, state.repair);
     auto drvPathS = state.store->printStorePath(drvPath);
 
     printMsg(lvlChatty, "instantiated '%1%' -> '%2%'", drvName, drvPathS);
@@ -2032,6 +2062,9 @@ static void prim_storePath(EvalState & state, CallSite callSite, Value * const *
     if (!state.store->isInStore(sourcePath.path.abs()))
         state.error<EvalError>("path '%1%' is not in the Nix store", sourcePath).atPos(noPos).debugThrow();
     auto storePath = state.store->toStorePath(sourcePath.path.abs()).first;
+    /* A bare store path leaves the evaluator here and is dereferenced by the
+       store: whatever is pending must be there first. */
+    state.flushPendingWrites();
     if (!state.storeFS->getMount(CanonPath(state.store->printStorePath(storePath))) && !settings.readOnlyMode)
         state.store->getBuilder()->ensurePath(storePath);
     context.insert(NixStringContextElem::Opaque{.path = storePath});
@@ -2065,8 +2098,11 @@ static void prim_pathExists(EvalState & state, CallSite callSite, Value * const 
 
         /* SourcePath doesn't know about trailing slash. */
         state.forceValue(arg, noPos);
-        auto mustBeDir =
-            arg.type() == nString && (arg.string_view().ends_with("/") || arg.string_view().ends_with("/."));
+        std::string_view text =
+            arg.type() == nString
+                ? state.forceString(arg, noPos, "while evaluating the argument passed to builtins.pathExists")
+                : std::string_view{};
+        auto mustBeDir = text.ends_with("/") || text.ends_with("/.");
 
         auto symlinkResolution = mustBeDir ? SymlinkResolution::Full : SymlinkResolution::Ancestors;
         auto path = state.realisePath(noPos, arg, symlinkResolution);
@@ -2598,10 +2634,8 @@ static RegisterPrimOp primop_outputOf({
    be sensibly or completely represented (e.g., functions). */
 static void prim_toXML(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
-    std::ostringstream out;
     NixStringContext context;
-    printValueAsXML(state, true, false, *args[0], out, context, noPos);
-    v.mkString(out.view(), context, state.mem);
+    v.mkString(renderValueAsXML(state, true, false, *args[0], context, noPos), context, state.mem);
 }
 
 static RegisterPrimOp primop_toXML({
@@ -2706,10 +2740,8 @@ static RegisterPrimOp primop_toXML({
    represented (e.g., functions). */
 static void prim_toJSON(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
-    std::ostringstream out;
     NixStringContext context;
-    printValueAsJSON(state, true, *args[0], noPos, out, context);
-    v.mkString(out.view(), context, state.mem);
+    v.mkString(renderValueAsJSON(state, true, *args[0], noPos, context), context, state.mem);
 }
 
 static RegisterPrimOp primop_toJSON({
@@ -2767,7 +2799,7 @@ static void prim_toFile(EvalState & state, CallSite callSite, Value * const * ar
 
     for (auto c : context) {
         if (auto p = std::get_if<NixStringContextElem::Opaque>(&c.raw)) {
-            state.ensureLazyPathCopied(p->path);
+            /* A mounted input is copied when the file is written (`flushPendingWrites`). */
             refs.insert(p->path);
         } else
             state
@@ -2786,17 +2818,7 @@ static void prim_toFile(EvalState & state, CallSite callSite, Value * const * ar
                                                      .hash = hashString(HashAlgorithm::SHA256, contents),
                                                      .references = std::move(refs),
                                                  })
-                                           : ({
-                                                 StringSource s{contents};
-                                                 state.store->addToStoreFromDump(
-                                                     s,
-                                                     name,
-                                                     FileSerialisationMethod::Flat,
-                                                     ContentAddressMethod::Raw::Text,
-                                                     HashAlgorithm::SHA256,
-                                                     refs,
-                                                     state.repair);
-                                             });
+                                           : state.writeBuffer.addText(name, std::string(contents), refs, state.repair);
 
     /* Note: we don't need to add `context' to the context of the
        result, since `storePath' itself has references to the paths
@@ -2906,6 +2928,7 @@ static void addPath(
     Value * filterFun,
     ContentAddressMethod method,
     const std::optional<Hash> expectedHash,
+    const std::optional<Hash> expectedTreeHash,
     Value & v,
     const NixStringContext & context)
 {
@@ -2924,6 +2947,19 @@ static void addPath(
             }
         }
 
+        /* Only the NAR method has a path form with references. */
+        if (!refs.empty() && method == ContentAddressMethod::Raw::Git)
+            method = ContentAddressMethod::Raw::NixArchive;
+
+        /* `treeHash` names a tree, which only the git method adds. */
+        if (expectedTreeHash && method != ContentAddressMethod::Raw::Git)
+            state
+                .error<EvalError>(
+                    "'treeHash' cannot be asserted on '%s': it is not added as a tree (recursive = false, or a store path with references)",
+                    path)
+                .atPos(noPos)
+                .debugThrow();
+
         std::unique_ptr<PathFilter> filter;
         if (filterFun)
             filter = std::make_unique<PathFilter>([&](const std::string & p) {
@@ -2931,37 +2967,108 @@ static void addPath(
                 return state.callPathFilter(filterFun, {path.accessor, p2}, noPos);
             });
 
+        /* The fast paths, no walk of the source: a `treeHash` names the tree;
+           a `sha256` on a tree is its NAR hash, known to the `treeAddress`
+           memo once verified; a `sha256` under another method names the path
+           as it always did (doc/lazy-store/04-derivation.md, section 1.9). */
         std::optional<StorePath> expectedStorePath;
-        if (expectedHash)
-            expectedStorePath = state.store->makeFixedOutputPathFromCA(
-                name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
+        if (expectedTreeHash) {
+            auto treePath = gitTreePath(*state.store, name, *expectedTreeHash);
+            if (state.store->isValidPath(treePath)) {
+                /* Both assertions given: the tree is named by `treeHash`; the
+                   `sha256` is verified too, by the shim (the memo answers
+                   first, else a walk of the store object). */
+                if (expectedHash)
+                    assertNarHash(
+                        state.fetchSettings,
+                        *state.store,
+                        SourcePath{state.store->requireStoreObjectAccessor(treePath)},
+                        *expectedTreeHash,
+                        *expectedHash,
+                        path.to_string());
+                state.allowAndSetStorePathString(treePath, v);
+                return;
+            }
+        } else if (expectedHash) {
+            if (method == ContentAddressMethod::Raw::Git) {
+                if (auto hash = lookupTreeAddress(state.fetchSettings, *expectedHash)) {
+                    auto treePath = gitTreePath(*state.store, name, *hash);
+                    if (state.store->isValidPath(treePath)) {
+                        state.allowAndSetStorePathString(treePath, v);
+                        return;
+                    }
+                }
+            } else {
+                expectedStorePath = state.store->makeFixedOutputPathFromCA(
+                    name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
+                if (state.store->isValidPath(*expectedStorePath)) {
+                    state.allowAndSetStorePathString(*expectedStorePath, v);
+                    return;
+                }
+            }
+        }
 
-        if (!expectedHash || !state.store->isValidPath(*expectedStorePath)) {
+        auto srcPath = path.resolveSymlinks();
+
+        /* A filtered tree with a `sha256` is wrapped once, here, so that
+           the tree copied and the tree the `sha256` is checked against are
+           one: a second walk of an impure filter would give another tree
+           (a false mismatch, or a wrong pair in the memo).  Without a
+           `sha256` `fetchToStore2` walks once anyway; a source with
+           references takes the `addToStore` route with the filter. */
+        if (filter && refs.empty() && expectedHash) {
+            srcPath = filteredTree(srcPath, *filter);
+            filter.reset();
+        }
+
+        auto [dstPath, hash] = [&]() -> std::pair<StorePath, std::optional<Hash>> {
+            if (refs.empty()) {
+                auto [p, h] = fetchToStore2(
+                    state.fetchSettings,
+                    *state.store,
+                    srcPath,
+                    settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy,
+                    name,
+                    method,
+                    filter.get(),
+                    state.repair);
+                return {p, h};
+            }
             // FIXME: support refs in fetchToStore()?
-            auto dstPath = refs.empty() ? fetchToStore(
-                                              state.fetchSettings,
-                                              *state.store,
-                                              path.resolveSymlinks(),
-                                              settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy,
-                                              name,
-                                              method,
-                                              filter.get(),
-                                              state.repair)
-                                        : state.store->addToStore(
-                                              name,
-                                              path.resolveSymlinks(),
-                                              method,
-                                              HashAlgorithm::SHA256,
-                                              refs,
-                                              filter ? *filter.get() : defaultPathFilter,
-                                              state.repair);
-            if (expectedHash && expectedStorePath != dstPath)
+            return {
+                state.store->addToStore(
+                    name,
+                    srcPath,
+                    method,
+                    HashAlgorithm::SHA256,
+                    refs,
+                    filter ? *filter.get() : defaultPathFilter,
+                    state.repair),
+                std::nullopt};
+        }();
+
+        if (expectedTreeHash && *hash != *expectedTreeHash)
+            state
+                .error<EvalError>(
+                    "tree hash mismatch in (possibly filtered) path added from '%s':\n  specified: %s\n  got:       %s",
+                    path,
+                    expectedTreeHash->to_string(HashFormat::SRI, true),
+                    hash->to_string(HashFormat::SRI, true))
+                .withExitStatus(102)
+                .atPos(noPos)
+                .debugThrow();
+
+        if (expectedHash) {
+            if (method == ContentAddressMethod::Raw::Git) {
+                /* The `sha256` is the NAR hash of the tree just named: `srcPath`,
+                   which a filter was folded into above. */
+                assertNarHash(state.fetchSettings, *state.store, srcPath, *hash, *expectedHash, path.to_string());
+            } else if (expectedStorePath != dstPath)
                 state.error<EvalError>("store path mismatch in (possibly filtered) path added from '%s'", path)
                     .atPos(noPos)
                     .debugThrow();
-            state.allowAndSetStorePathString(dstPath, v);
-        } else
-            state.allowAndSetStorePathString(*expectedStorePath, v);
+        }
+        state.allowAndSetStorePathString(dstPath, v);
     } catch (Error & e) {
         e.addTrace(nullptr, "while adding path '%s'", path);
         throw;
@@ -2978,7 +3085,8 @@ static void prim_filterSource(EvalState & state, CallSite callSite, Value * cons
         "while evaluating the second argument (the path to filter) passed to 'builtins.filterSource'");
     state.forceFunction(*args[0], noPos, "while evaluating the first argument passed to builtins.filterSource");
 
-    addPath(state, path.baseName(), path, args[0], ContentAddressMethod::Raw::NixArchive, std::nullopt, v, context);
+    addPath(
+        state, path.baseName(), path, args[0], ContentAddressMethod::Raw::Git, std::nullopt, std::nullopt, v, context);
 }
 
 static RegisterPrimOp primop_filterSource({
@@ -3041,8 +3149,9 @@ static void prim_path(EvalState & state, CallSite callSite, Value * const * args
     std::optional<SourcePath> path;
     std::string_view name;
     Value * filterFun = nullptr;
-    auto method = ContentAddressMethod::Raw::NixArchive;
+    ContentAddressMethod method = ContentAddressMethod::Raw::Git;
     std::optional<Hash> expectedHash;
+    std::optional<Hash> expectedTreeHash;
     NixStringContext context;
 
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to 'builtins.path'");
@@ -3061,12 +3170,17 @@ static void prim_path(EvalState & state, CallSite callSite, Value * const * args
         else if (n == "recursive")
             method = state.forceBool(
                          *attr.value, attr.pos, "while evaluating the `recursive` attribute passed to builtins.path")
-                         ? ContentAddressMethod::Raw::NixArchive
+                         ? ContentAddressMethod::Raw::Git
                          : ContentAddressMethod::Raw::Flat;
         else if (n == "sha256")
             expectedHash = newHashAllowEmpty(
                 state.forceStringNoCtx(
                     *attr.value, attr.pos, "while evaluating the `sha256` attribute passed to builtins.path"),
+                HashAlgorithm::SHA256);
+        else if (n == "treeHash")
+            expectedTreeHash = Hash::parseAny(
+                state.forceStringNoCtx(
+                    *attr.value, attr.pos, "while evaluating the `treeHash` attribute passed to builtins.path"),
                 HashAlgorithm::SHA256);
         else
             state.error<EvalError>("unsupported argument '%1%' to 'builtins.path'", state.symbols[attr.name])
@@ -3080,7 +3194,7 @@ static void prim_path(EvalState & state, CallSite callSite, Value * const * args
     if (name.empty())
         name = path->baseName();
 
-    addPath(state, name, *path, filterFun, method, expectedHash, v, context);
+    addPath(state, name, *path, filterFun, method, expectedHash, expectedTreeHash, v, context);
 }
 
 static RegisterPrimOp primop_path({
@@ -3111,11 +3225,24 @@ static RegisterPrimOp primop_path({
           directory. This allows similar behavior to `fetchurl`. Defaults
           to `true`.
 
+        - treeHash\
+          When provided, this is the expected
+          [git tree hash](@docroot@/store/file-system-object/content-address.md#git)
+          (SHA-256, SRI form) of the path, the hash under which the
+          store names it. Evaluation fails if the hash is incorrect;
+          if the store already holds the path, it is not read again.
+          Requires `recursive = true` (the default).
+
         - sha256\
           When provided, this is the expected
           [content hash](@docroot@/store/file-system-object/content-address.md)
-          of the path. Evaluation fails if the hash is incorrect,
-          and providing a hash allows `builtins.path` to be used even
+          of the path: the hash of its
+          [NAR serialisation](@docroot@/store/file-system-object/content-address.md#serial-nix-archive)
+          when `recursive = true`, the flat hash of the file otherwise.
+          Evaluation fails if the hash is incorrect. An older assertion
+          than `treeHash`: the store names the path by its tree hash, so
+          a `sha256` is verified by a walk of the path the first time.
+          Providing either hash allows `builtins.path` to be used even
           when the `pure-eval` nix config option is on.
     )",
     .impl = prim_path,
@@ -3131,12 +3258,18 @@ static void prim_attrNames(EvalState & state, CallSite callSite, Value * const *
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.attrNames");
 
-    auto list = state.buildList(args[0]->attrs()->size());
+    /* Sorted by the names' text, which the symbol table hands out. */
+    boost::container::small_vector<SymbolStr, 64> names;
+    names.reserve(args[0]->attrs()->size());
+    for (auto & i : *args[0]->attrs())
+        names.push_back(state.symbols[i.name]);
+    std::sort(names.begin(), names.end(), [](const SymbolStr & a, const SymbolStr & b) {
+        return std::string_view(a) < std::string_view(b);
+    });
 
-    for (const auto & [n, i] : enumerate(*args[0]->attrs()))
-        list[n] = Value::toPtr(state.symbols[i.name]);
-
-    std::sort(list.begin(), list.end(), [](Value * v1, Value * v2) { return v1->string_view() < v2->string_view(); });
+    auto list = state.buildList(names.size());
+    for (const auto & [n, name] : enumerate(names))
+        list[n] = Value::toPtr(name);
 
     v.mkList(list);
 }
@@ -3339,9 +3472,10 @@ static void prim_removeAttrs(EvalState & state, CallSite callSite, Value * const
     boost::container::small_vector<Attr, 64> names;
     names.reserve(args[1]->listSize());
     for (auto elem : args[1]->listView()) {
-        state.forceStringNoCtx(
-            *elem, noPos, "while evaluating the values of the second argument passed to builtins.removeAttrs");
-        names.emplace_back(state.symbols.create(elem->string_view()), nullptr);
+        names.emplace_back(
+            state.symbols.create(state.forceStringNoCtx(
+                *elem, noPos, "while evaluating the values of the second argument passed to builtins.removeAttrs")),
+            nullptr);
     }
     std::sort(names.begin(), names.end());
 

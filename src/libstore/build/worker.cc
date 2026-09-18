@@ -12,6 +12,8 @@
 #  include "nix/store/build/hook-instance.hh"
 #endif
 #include "nix/util/signals.hh"
+#include "nix/util/object-hash.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/store/globals.hh"
 
 namespace nix {
@@ -557,10 +559,11 @@ bool Worker::pathContentsGood(const StorePath & path)
     printInfo("checking path '%s'...", store.printStorePath(path));
     auto info = store.queryPathInfo(path);
     bool res = false;
-    if (auto accessor = store.getFSAccessor(path, /*requireValidPath=*/false)) {
-        auto current = hashPath({ref{accessor}}, FileIngestionMethod::NixArchive, info->narHash.algo).first;
-        Hash nullHash(HashAlgorithm::SHA256);
-        res = info->narHash == nullHash || info->narHash == current;
+    if (store.getFSAccessor(path, /*requireValidPath=*/false)) {
+        /* The content hash recomputed from the files against the info's;
+           an info with neither hash (a store that could not migrate it) is
+           taken as good, as the null NAR hash was. */
+        res = (!info->objectHash && !info->assertedNarHash) || !store.contentMismatch(*info);
     }
     pathContentsGoodCache.insert_or_assign(path, res);
     if (!res)

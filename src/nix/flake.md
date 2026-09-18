@@ -138,12 +138,21 @@ The following generic flake reference attributes are supported:
   repository or tarball. The default is the root directory of the
   flake.
 
+* `treeHash`: The [git tree hash](@docroot@/store/file-system-object/content-address.md#git)
+  (SHA-256, in [SRI](@docroot@/glossary.md#gloss-sri) format) of the
+  contents of the flake: the hash the store names the flake's source
+  tree by. This is useful for flake types such as tarballs that lack a
+  unique content identifier such as a Git commit hash.
+
 * `narHash`: The hash of the
   [Nix Archive (NAR) serialisation][Nix Archive]
   (in [SRI](@docroot@/glossary.md#gloss-sri) format) of the
-  contents of the flake. This is useful for flake types such as
-  tarballs that lack a unique content identifier such as a Git commit
-  hash.
+  contents of the flake. An older assertion than `treeHash`: it is
+  accepted (in a flake reference URL as `?narHash=`, and in lock files:
+  those of versions 5 to 7, and a version-8 node whose input has not
+  been fetched since it was locked with one) and verified by one walk
+  of the fetched tree, and
+  the locked reference then carries `treeHash` in its place.
 
 In addition, the following attributes are common to several flake
 reference types:
@@ -455,9 +464,14 @@ The following attributes are supported in `flake.nix`:
   * `lastModified`: The commit time of the revision `rev` as an integer
     denoting the number of seconds since 1970.
 
+  * `treeHash`: The SHA-256 (in [SRI](@docroot@/glossary.md#gloss-sri) format)
+    [git tree hash](@docroot@/store/file-system-object/content-address.md#git)
+    of the flake's source tree, the hash its store path is named by.
+
   * `narHash`: The SHA-256 (in [SRI](@docroot@/glossary.md#gloss-sri) format) of the
     [Nix Archive (NAR) serialisation][Nix Archive]
-    NAR serialization of the flake's source tree.
+    of the flake's source tree. It is computed from the tree when a
+    program forces it.
 
   The value returned by the `outputs` function must be an attribute
   set. The attributes can have arbitrary values; however, various
@@ -627,7 +641,7 @@ the resulting lock file might be:
 
 ```json
 {
-  "version": 7,
+  "version": 8,
   "root": "n1",
   "nodes": {
     "n1": {
@@ -645,7 +659,7 @@ the resulting lock file might be:
         "rev": "7f8d4b088e2df7fdb6b513bc2d6941f1d422a013",
         "type": "github",
         "lastModified": 1580555482,
-        "narHash": "sha256-OnpEWzNxF/AU4KlqBXM2s5PWvfI5/BS6xQrPvkF5tO8="
+        "treeHash": "sha256-…"
       },
       "original": {
         "id": "nixpkgs",
@@ -660,7 +674,7 @@ the resulting lock file might be:
         "rev": "8abf7b3a8cbe1c8a885391f826357a74d382a422",
         "type": "github",
         "lastModified": 1567183309,
-        "narHash": "sha256-wIXWOpX9rRjK5NDsL6WzuuBJl2R0kUCnlpZUrASykSc="
+        "treeHash": "sha256-pRXCQsyNvJ66sXIVkURgQ8/WQAj4O9jKxFNcjS1Opp0="
       },
       "original": {
         "owner": "edolstra",
@@ -676,7 +690,7 @@ the resulting lock file might be:
         "rev": "989a84bb29e95e392589c4e73c29189fd69a1d4e",
         "type": "github",
         "lastModified": 1580729070,
-        "narHash": "sha256-235uMxYlHxJ5y92EXZWAYEsEb6mm+b069GAd+BOIOxI="
+        "treeHash": "sha256-KOVJvoG+aYaYqEEdbEnp/RPk2raFbjaV7eMu/wG5kME="
       },
       "original": {
         "owner": "mozilla",
@@ -688,6 +702,10 @@ the resulting lock file might be:
   }
 }
 ```
+
+(The `treeHash` values of `n3` and `n4` are the real tree hashes of the
+revisions shown; `n2` names a revision that no longer exists on GitHub,
+so its hash is elided.)
 
 This graph has 4 nodes: the root flake, and its 3 dependencies. The
 nodes have arbitrary labels (e.g. `n1`). The label of the root node of
@@ -706,14 +724,27 @@ following fields:
   `7f8d4b088e2df7fdb6b513bc2d6941f1d422a013` of the `edolstra/nixpkgs`
   repository on GitHub.
 
-  It also includes the attribute `narHash`, specifying the expected
-  contents of the tree in the Nix store (as computed by `nix
-  hash-path`), and may include input-type-specific attributes such as
-  the `lastModified` or `revCount`. The main reason for these
-  attributes is to allow flake inputs to be substituted from a binary
-  cache: `narHash` allows the store path to be computed, while the
-  other attributes are necessary because they provide information not
-  stored in the store path.
+  It also includes the attribute `treeHash`, the
+  [git tree hash](@docroot@/store/file-system-object/content-address.md#git)
+  (SHA-256, in SRI format) of the input's source tree, which is the
+  hash the store names that tree by, and may include input-type-specific
+  attributes such as the `lastModified` or `revCount`. The main reason
+  for these attributes is to allow flake inputs to be substituted from a
+  binary cache: `treeHash` allows the store path to be computed, while
+  the other attributes are necessary because they provide information
+  not stored in the store path.
+
+  Lock files of versions 5 to 7 record `narHash`, the hash of the
+  input's [Nix Archive (NAR) serialisation][Nix Archive], instead, and
+  a version-8 lock file may still carry a node's `narHash` alone (see
+  below). Such a lock file is still read: the `narHash` is an assertion,
+  verified by one walk of the fetched tree the next time that input is
+  fetched, and the node then carries `treeHash` in its place. A lock
+  file is written as version 8 whenever it is written at all; a lock
+  file whose inputs are all unchanged is not rewritten by itself,
+  since an unchanged input is kept from the old lock without being
+  fetched. Nix versions that only know lock files up to version 7
+  cannot read a version-8 lock file.
 
   The attributes in `locked` are considered "final", meaning that they are the only ones that are passed via the arguments of the `outputs` function of a flake.
   For instance, if `locked` contains a `lastModified` attribute while the fetcher does not return a `lastModified` attribute, then the `lastModified` attribute will be passed to the `outputs` function.

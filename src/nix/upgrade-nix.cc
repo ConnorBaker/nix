@@ -204,8 +204,8 @@ struct CmdUpgradeNix : MixDryRun, StoreCommand
         const Bindings & bindings = Bindings::emptyBindings;
         auto v2 = findAlongAttrPath(*state, settings.thisSystem, bindings, *v).first;
 
-        return store->parseStorePath(
-            state->forceString(*v2, noPos, "while evaluating the path tho latest nix version"));
+        NixStringContext context;
+        return state->coerceToStorePath(noPos, *v2, context, "while evaluating the path tho latest nix version");
     }
 };
 

@@ -58,7 +58,13 @@ pathInfoToJSON(Store & store, const StorePathSet & storePaths, bool showClosureS
             // know the name yet until we've read the NAR info.
             key = makeKey(info->path);
 
-            jsonObject = info->toJSON(format == PathInfoJsonFormat::V1 ? &store : nullptr, true, format);
+            /* Formats before 4 require the NAR hash: the shim's walk supplies
+               it when the description does not assert one. */
+            jsonObject = info->toJSON(
+                format == PathInfoJsonFormat::V1 ? &store : nullptr,
+                true,
+                format,
+                UnkeyedValidPathInfo::NarHashThunk{[&]() { return narHashOf(store, info->path); }});
 
             /* Hack in the store dir for now. TODO update the data type
                instead. */
@@ -144,10 +150,12 @@ struct CmdPathInfo : StorePathsCommand, MixJSON
         addFlag({
             .longName = "json-format",
             .description =
-                "JSON format version of [store object info](@docroot@/protocols/json/store-object-info.md) to use (1, 2, or 3).\n"
+                "JSON format version of [store object info](@docroot@/protocols/json/store-object-info.md) to use (1, 2, 3, or 4).\n"
                 "Version 1 uses string hashes and full store paths.\n"
                 "Version 2 uses structured hashes and [store path base names](@docroot@/store/store-path.md#base-name).\n"
                 "Version 3 uses structured signatures.\n"
+                "Version 4 carries the store object's content hash as `objectHash` (`git:sha256:<hex>`), with `narHash` optional; "
+                "versions 1 to 3 compute the NAR hash by a walk of the path when the store does not record one.\n"
                 "This flag will be required in a future release.",
             .labels = {"version"},
             .handler = {[this](std::string s) {

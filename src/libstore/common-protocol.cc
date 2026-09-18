@@ -5,6 +5,7 @@
 #include "nix/store/common-protocol.hh"
 #include "nix/store/common-protocol-impl.hh"
 #include "nix/store/derivations.hh"
+#include "nix/store/path-info.hh"
 #include "nix/store/store-dir-config.hh"
 #include "nix/util/signature/local-keys.hh"
 
@@ -83,6 +84,40 @@ void CommonProto::Serialise<Signature>::write(
     const StoreDirConfig & store, CommonProto::WriteConn conn, const Signature & sig)
 {
     conn.to << sig.to_string();
+}
+
+std::pair<std::optional<ObjectHash>, std::optional<Hash>> CommonProto::readPathInfoHashes(
+    Source & from, bool objectHashForm, const std::function<Hash(const std::string &)> & parseNarHash)
+{
+    auto narHash = [&](const std::string & s) -> std::optional<Hash> {
+        return s.empty() ? std::nullopt : std::optional{parseNarHash(s)};
+    };
+    if (objectHashForm) {
+        auto objectHashS = readString(from);
+        auto narHashS = readString(from);
+        return {
+            objectHashS.empty() ? std::nullopt : std::optional{ObjectHash::parseOrThrow(objectHashS)},
+            narHash(narHashS),
+        };
+    } else
+        return {std::nullopt, narHash(readString(from))};
+}
+
+void CommonProto::writePathInfoHashes(
+    Sink & to,
+    bool objectHashForm,
+    const UnkeyedValidPathInfo & info,
+    const std::function<std::string(const Hash &)> & renderNarHash)
+{
+    if (objectHashForm)
+        to << (info.objectHash ? info.objectHash->render() : "")
+           << (info.assertedNarHash ? renderNarHash(*info.assertedNarHash) : "");
+    else if (info.assertedNarHash)
+        to << renderNarHash(*info.assertedNarHash);
+    else if (info.lazyNarHash)
+        to << renderNarHash((*info.lazyNarHash)());
+    else
+        throw Error("sending path info to a peer speaking only the old form requires its NAR hash");
 }
 
 /**

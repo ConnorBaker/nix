@@ -46,7 +46,7 @@ struct CacheImpl : Cache
     {
         auto state(_state.lock());
 
-        auto dbPath = getCacheDir() / "fetcher-cache-v4.sqlite";
+        auto dbPath = getCacheDir() / "fetcher-cache-v5.sqlite";
         createDirs(dbPath.parent_path());
 
         state->db = SQLite(dbPath, {.useWAL = nix::settings.useSQLiteWAL});
@@ -64,8 +64,8 @@ struct CacheImpl : Cache
         _state.lock()
             ->upsert.use()
             .apply(key.first)
-            .apply(attrsToJSON(key.second).dump())
-            .apply(attrsToJSON(value).dump())
+            .apply(encodeAttrs(key.second))
+            .apply(encodeAttrs(value))
             .apply(time(nullptr))
             .exec();
     }
@@ -91,22 +91,24 @@ struct CacheImpl : Cache
     {
         auto state(_state.lock());
 
-        auto keyJSON = attrsToJSON(key.second).dump();
-
-        auto stmt(state->lookup.use().apply(key.first).apply(keyJSON));
+        auto stmt(state->lookup.use().apply(key.first).apply(encodeAttrs(key.second)));
         if (!stmt.next()) {
-            debug("did not find cache entry for '%s:%s'", key.first, keyJSON);
+            /* `debug` evaluates its arguments only at that verbosity
+               (`printMsgUsing`, logging.hh), so the JSON rendering costs
+               a lookup nothing. */
+            debug("did not find cache entry for '%s:%s'", key.first, attrsToJSON(key.second).dump());
             return {};
         }
 
-        auto valueJSON = stmt.getStr(0);
+        auto value = decodeAttrs(stmt.getStr(0));
         auto timestamp = stmt.getInt(1);
 
-        debug("using cache entry '%s:%s' -> '%s'", key.first, keyJSON, valueJSON);
+        debug(
+            "using cache entry '%s:%s' -> '%s'", key.first, attrsToJSON(key.second).dump(), attrsToJSON(value).dump());
 
         return Result{
             .expired = settings.tarballTtl.get() == 0 || timestamp + settings.tarballTtl < time(nullptr),
-            .value = jsonToAttrs(nlohmann::json::parse(valueJSON)),
+            .value = std::move(value),
         };
     }
 

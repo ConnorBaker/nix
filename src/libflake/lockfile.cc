@@ -71,9 +71,9 @@ LockedNode::LockedNode(const fetchers::Settings & fetchSettings, const nlohmann:
           json.find("parent") != json.end() ? (std::optional<InputAttrPath>) json["parent"] : std::nullopt)
 {
     if (!lockedRef.input.isLocked(fetchSettings) && !lockedRef.input.isRelative()) {
-        if (lockedRef.input.getNarHash())
+        if (lockedRef.input.getTreeHash() || lockedRef.input.getNarHash())
             warn(
-                "Lock file entry '%s' is unlocked (e.g. lacks a Git revision) but is checked by NAR hash. "
+                "Lock file entry '%s' is unlocked (e.g. lacks a Git revision) but is checked by a content hash. "
                 "This is not reproducible and will break after garbage collection or when shared.",
                 lockedRef.to_string());
         else
@@ -139,8 +139,13 @@ LockFile::LockFile(const fetchers::Settings & fetchSettings, std::string_view co
             throw Error("Could not parse '%s': %s", path, e.what());
         }
     }();
+    /* Versions 5 to 7 lock an input's contents by `narHash`; version 8 by
+       `treeHash`, the hash the store names the tree by.  A `narHash` read
+       from an older file is an assertion, verified when the input is
+       fetched (`Input::getAccessor`), and replaced by `treeHash` there
+       (doc/lazy-store/04-derivation.md, section 1.9). */
     auto version = json.value("version", 0);
-    if (version < 5 || version > 7)
+    if (version < 5 || version > 8)
         throw Error("lock file '%s' has unsupported version %d", path, version);
 
     std::string rootKey = json["root"];
@@ -248,7 +253,7 @@ std::pair<nlohmann::json, LockFile::KeyMap> LockFile::toJSON() const
     };
 
     nlohmann::json json;
-    json["version"] = 7;
+    json["version"] = 8;
     json["root"] = dumpNode("root", root);
     json["nodes"] = std::move(nodes);
 
@@ -280,11 +285,13 @@ std::optional<FlakeRef> LockFile::isUnlocked(const fetchers::Settings & fetchSet
     }(root);
 
     /* Return whether the input is either locked, or, if
-       `allow-dirty-locks` is enabled, it has a NAR hash. In the
-       latter case, we can verify the input but we may not be able to
-       fetch it from anywhere. */
+       `allow-dirty-locks` is enabled, it has a content hash (a tree
+       hash, or an older lock's NAR hash). In the latter case, we can
+       verify the input but we may not be able to fetch it from
+       anywhere. */
     auto isConsideredLocked = [&](const fetchers::Input & input) {
-        return input.isLocked(fetchSettings) || (fetchSettings.allowDirtyLocks && input.getNarHash());
+        return input.isLocked(fetchSettings)
+               || (fetchSettings.allowDirtyLocks && (input.getTreeHash() || input.getNarHash()));
     };
 
     for (auto & i : nodes) {

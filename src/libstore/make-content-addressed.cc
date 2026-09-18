@@ -1,4 +1,5 @@
 #include "nix/store/make-content-addressed.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/store/references.hh"
 
 namespace nix {
@@ -51,7 +52,7 @@ std::map<StorePath, StorePath> makeContentAddressed(Store & srcStore, Store & ds
                 .hash = narMaskedHash,
                 .references = std::move(refs),
             },
-            Hash::dummy);
+            std::nullopt); // set below, from the rewritten NAR
 
         printInfo("rewriting '%s' to '%s'", pathS, dstStore.printStorePath(info.path));
 
@@ -60,8 +61,12 @@ std::map<StorePath, StorePath> makeContentAddressed(Store & srcStore, Store & ds
         rsink2(sink.s);
         rsink2.flush();
 
-        info.narHash = hashString(HashAlgorithm::SHA256, sink2.s);
+        {
+            StringSource rewritten{sink2.s};
+            info.objectHash = ObjectHash::of(objectHashOfNar(rewritten).root);
+        }
         info.narSize = sink.s.size();
+        info.lazyNarHash = [&nar = sink2.s] { return hashString(HashAlgorithm::SHA256, nar); };
 
         StringSource source(sink2.s);
         dstStore.addToStore(info, source);

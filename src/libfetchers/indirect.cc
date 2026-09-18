@@ -66,7 +66,7 @@ struct IndirectInputScheme : InputScheme
         return "";
     }
 
-    const std::map<std::string, AttributeInfo> & allowedAttrs() const override
+    const std::map<std::string, AttributeInfo> & schemeAttrs() const override
     {
         static const std::map<std::string, AttributeInfo> attrs = {
             {
@@ -79,10 +79,6 @@ struct IndirectInputScheme : InputScheme
             },
             {
                 "rev",
-                {},
-            },
-            {
-                "narHash",
                 {},
             },
         };

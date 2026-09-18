@@ -1,13 +1,14 @@
 #include "nix/cmd/command.hh"
 #include "nix/util/hash.hh"
+#include "nix/util/file-content-address.hh"
 #include "nix/cmd/legacy.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/references.hh"
-#include "nix/util/git.hh"
+#include "nix/util/merkle-hash.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/cmd/misc-store-flags.hh"
 #include "man-pages.hh"
-#include "nix/util/fun.hh"
 
 namespace nix {
 
@@ -108,17 +109,13 @@ struct CmdHashBase : Command
                 break;
             }
             case FileIngestionMethod::Git: {
+                /* SHA-256 only: the object hash -- the tree id, the blob
+                   id, or the synthetic one-entry tree for an executable or
+                   symlink root.  (`--modulo` is not offered for this mode;
+                   the flag is disabled below.) */
+                checkIngestionAlgorithm(mode, hashAlgo);
                 auto sourcePath = makeSourcePath();
-                fun<git::DumpHook> hook = [&](const SourcePath & path) -> git::TreeEntry {
-                    auto hashSink = makeSink();
-                    auto mode = git::dump(path, *hashSink, hook);
-                    auto hash = hashSink->finish().hash;
-                    return {
-                        .mode = mode,
-                        .hash = hash,
-                    };
-                };
-                h = hook(sourcePath).hash;
+                h = merkle::objectHash(objectHashOf(*sourcePath.accessor, sourcePath.path).root);
                 break;
             }
             }

@@ -94,7 +94,7 @@ static void parseFlakeInputAttr(EvalState & state, const Attr & attr, fetchers::
 #pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (attr.value->type()) {
     case nString:
-        attrs.emplace(state.symbols[attr.name], std::string(attr.value->string_view()));
+        attrs.emplace(state.symbols[attr.name], state.realise(*attr.value).toOwned());
         break;
     case nBool:
         attrs.emplace(state.symbols[attr.name], Explicit<bool>{attr.value->boolean()});
@@ -150,7 +150,7 @@ static FlakeInput parseFlakeInput(
             if (attr.name == sUrl) {
                 forceTrivialValue(state, *attr.value, pos);
                 if (attr.value->type() == nString)
-                    url = attr.value->string_view();
+                    url = state.realise(*attr.value).toOwned();
                 else if (attr.value->type() == nPath) {
                     auto path = attr.value->path();
                     if (path.accessor != flakeDir.accessor)
@@ -174,7 +174,7 @@ static FlakeInput parseFlakeInput(
                     parseFlakeInputs(state, attr.value, attr.pos, lockRootAttrPath, flakeDir, false).first;
             } else if (attr.name == sFollows) {
                 expectType(state, nString, *attr.value, attr.pos);
-                auto follows(parseInputAttrPath(attr.value->string_view()));
+                auto follows(parseInputAttrPath(state.realise(*attr.value).view()));
                 follows.insert(follows.begin(), lockRootAttrPath.begin(), lockRootAttrPath.end());
                 input.follows = follows;
             } else
@@ -261,7 +261,7 @@ static Flake readFlake(
 
     if (auto description = vInfo.attrs()->get(state.s.description)) {
         expectType(state, nString, *description->value, description->pos);
-        flake.description = description->value->string_view();
+        flake.description = state.realise(*description->value).toOwned();
     }
 
     auto sInputs = state.symbols.create("inputs");
@@ -383,7 +383,8 @@ static Flake getFlake(
 
     if (lockedRef != newLockedRef) {
         debug("refetching input '%s' due to self attribute", newLockedRef);
-        // FIXME: need to remove attrs that are invalidated by the changed input attrs, such as 'narHash'.
+        // FIXME: need to remove attrs that are invalidated by the changed input attrs, such as 'treeHash'.
+        newLockedRef.input.attrs.erase("treeHash");
         newLockedRef.input.attrs.erase("narHash");
         auto cachedInput2 = state.inputCache->getAccessor(
             state.fetchSettings, *state.store, newLockedRef.input, fetchers::UseRegistries::No);
@@ -391,7 +392,7 @@ static Flake getFlake(
         lockedRef = FlakeRef(std::move(cachedInput2.lockedInput), newLockedRef.subdir);
     }
 
-    auto rootDir = state.storePath(state.mountInput(lockedRef.input, originalRef.input, cachedInput.accessor));
+    auto rootDir = state.storePath(state.mountInput(lockedRef.input, cachedInput.accessor));
     // Re-parse flake.nix from the store.
     return readFlake(state, originalRef, resolvedRef, lockedRef, rootDir, lockRootAttrPath);
 }
@@ -749,8 +750,7 @@ LockedFlake lockFlake(
                                     auto lockedRef = FlakeRef(std::move(cachedInput.lockedInput), input.ref->subdir);
 
                                     return {
-                                        state.storePath(
-                                            state.mountInput(lockedRef.input, input.ref->input, cachedInput.accessor)),
+                                        state.storePath(state.mountInput(lockedRef.input, cachedInput.accessor)),
                                         lockedRef};
                                 }
                             }();
@@ -824,7 +824,8 @@ LockedFlake lockFlake(
                                 "flake '%s' requires lock file changes but they're not allowed due to '--no-update-lock-file'",
                                 topRef);
 
-                        auto newLockFileS = fmt("%s\n", newLockFile);
+                        /* Written to disk outside the evaluator: a door. */
+                        auto newLockFileS = state.realise(fmt("%s\n", newLockFile)).toOwned();
 
                         if (lockFlags.outputLockFilePath) {
                             if (lockFlags.commitLockFile)

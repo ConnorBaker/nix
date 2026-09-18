@@ -4,6 +4,8 @@
 #include "nix/fetchers/cache.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/fetch-settings.hh"
+#include "nix/util/object-hash-sink.hh"
+#include "nix/util/merkle-hash.hh"
 
 namespace nix::fetchers {
 
@@ -22,7 +24,7 @@ struct PathInputScheme : InputScheme
         input.attrs.insert_or_assign("path", urlPathToPath(url.path).string());
 
         for (auto & [name, value] : url.query)
-            if (name == "rev" || name == "narHash")
+            if (name == "rev" || name == "narHash" || name == "treeHash")
                 input.attrs.insert_or_assign(name, value);
             else if (name == "revCount" || name == "lastModified") {
                 if (auto n = string2Int<uint64_t>(value))
@@ -46,7 +48,7 @@ struct PathInputScheme : InputScheme
         return "";
     }
 
-    const std::map<std::string, AttributeInfo> & allowedAttrs() const override
+    const std::map<std::string, AttributeInfo> & schemeAttrs() const override
     {
         static const std::map<std::string, AttributeInfo> attrs = {
             {
@@ -68,10 +70,6 @@ struct PathInputScheme : InputScheme
             },
             {
                 "lastModified",
-                {},
-            },
-            {
-                "narHash",
                 {},
             },
         };
@@ -125,7 +123,7 @@ struct PathInputScheme : InputScheme
 
     bool isLocked(const Settings & settings, const Input & input) const override
     {
-        return (bool) input.getNarHash();
+        return input.getTreeHash() || input.getNarHash();
     }
 
     std::filesystem::path getAbsPath(const Input & input) const
@@ -154,23 +152,46 @@ struct PathInputScheme : InputScheme
 
         time_t mtime = 0;
         if (!storePath || storePath->name() != "source" || !store.isValidPath(*storePath)) {
-            Activity act(*logger, lvlTalkative, actUnknown, fmt("copying %s to the store", PathFmt(absPath)));
-            // FIXME: try to substitute storePath.
-            auto src = sinkToSource(
-                [&](Sink & sink) { mtime = dumpPathAndGetMtime(absPath.string(), sink, defaultPathFilter); });
-            storePath = store.addToStoreFromDump(*src, "source");
+            /* Name first, copy only when the store lacks the tree (01
+               section 9.9, the `path` fetcher's door; section 10).  A
+               filesystem path carries no fingerprint, so no memo can
+               answer for it and the naming reads every byte (04 section
+               1.5); what it saves is the dump, the restore and the links
+               of an unchanged tree on every later evaluation.  The window
+               between the naming and the copy is every `builtins.path`'s:
+               a tree edited meanwhile is copied as it then is, and the add
+               computes the address from what it writes.  The mtime is the
+               same tracked walk's as the dump's (`dumpPathAndGetMtime`). */
+            auto accessor = makeFSSourceAccessor(absPath, /*trackLastModified=*/true);
+            auto named =
+                gitTreePath(store, "source", merkle::objectHash(objectHashOf(*accessor, CanonPath::root).root));
+            store.addTempRoot(named);
+            if (store.isValidPath(named)) {
+                storePath = named;
+                mtime = accessor->getLastModified().value();
+            } else {
+                Activity act(*logger, lvlTalkative, actUnknown, fmt("copying %s to the store", PathFmt(absPath)));
+                // FIXME: try to substitute storePath.
+                auto src = sinkToSource(
+                    [&](Sink & sink) { mtime = dumpPathAndGetMtime(absPath.string(), sink, defaultPathFilter); });
+                /* Named by the tree hash; the store computes it as it
+                   restores the NAR. */
+                storePath = store.addToStoreFromDump(
+                    *src, "source", FileSerialisationMethod::NixArchive, ContentAddressMethod::Raw::Git);
+            }
         }
 
         auto accessor = store.requireStoreObjectAccessor(*storePath);
 
         // To prevent `fetchToStore()` copying the path again to Nix
-        // store, pre-create an entry in the fetcher cache.
-        auto narHash = store.queryPathInfo(*storePath)->narHash.to_string(HashFormat::SRI, true);
-        accessor->fingerprint = fmt("path:%s", narHash);
-        settings.getCache()->upsert(
-            makeSourcePathToHashCacheKey(
-                *accessor->fingerprint, ContentAddressMethod::Raw::NixArchive, CanonPath::root),
-            {{"hash", narHash}});
+        // store, pre-create an entry in the fetcher cache: the tree's
+        // name, from the object hash the store holds for the path (the
+        // path may have been valid before this call, so the hash is not
+        // otherwise known here; a daemon without the object hash gets
+        // it computed by one walk, `Store::queryObjectHash`).
+        auto objectHash = store.queryObjectHash(*storePath).hash;
+        accessor->fingerprint = fmt("path:%s", objectHash.to_string(HashFormat::SRI, true));
+        recordRootEntry(settings, SourcePath(accessor), objectHash);
 
         /* Trust the lastModified value supplied by the user, if
            any. It's not a "secure" attribute so we don't care. */

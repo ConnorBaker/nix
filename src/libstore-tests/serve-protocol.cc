@@ -11,6 +11,7 @@
 #include "nix/util/file-descriptor.hh"
 #include "nix/store/tests/protocol.hh"
 #include "nix/util/tests/characterization.hh"
+#include "nix/store/tests/path-info-json-v3.hh"
 
 namespace nix {
 
@@ -313,7 +314,11 @@ VERSIONED_CHARACTERIZATION_TEST(
         t;
     }))
 
-VERSIONED_CHARACTERIZATION_TEST(
+/* Before 2.4 the wire carries no hash at all, so the read form has neither
+   `objectHash` nor `assertedNarHash`; such an info has no JSON form before
+   version 4 (`toJSON` for formats 1-3 needs a NAR hash), hence no JSON
+   golden test here. */
+VERSIONED_CHARACTERIZATION_TEST_NO_JSON(
     ServeProtoTest,
     unkeyedValidPathInfo_2_3,
     "unkeyed-valid-path-info-2.3",
@@ -323,12 +328,12 @@ VERSIONED_CHARACTERIZATION_TEST(
     }),
     (std::tuple<UnkeyedValidPathInfo, UnkeyedValidPathInfo>{
         ({
-            UnkeyedValidPathInfo info{"/nix/store", Hash::dummy};
+            UnkeyedValidPathInfo info{"/nix/store", std::nullopt};
             info.narSize = 34878;
             info;
         }),
         ({
-            UnkeyedValidPathInfo info{"/nix/store", Hash::dummy};
+            UnkeyedValidPathInfo info{"/nix/store", std::nullopt};
             info.deriver = StorePath{
                 "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar.drv",
             };
@@ -342,7 +347,7 @@ VERSIONED_CHARACTERIZATION_TEST(
         }),
     }))
 
-VERSIONED_CHARACTERIZATION_TEST(
+VERSIONED_CHARACTERIZATION_TEST_JSON_V3(
     ServeProtoTest,
     unkeyedValidPathInfo_2_4,
     "unkeyed-valid-path-info-2.4",
@@ -354,7 +359,7 @@ VERSIONED_CHARACTERIZATION_TEST(
         ({
             UnkeyedValidPathInfo info{
                 "/nix/store",
-                Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="),
+                std::nullopt,
             };
             info.deriver = StorePath{
                 "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar.drv",
@@ -365,6 +370,7 @@ VERSIONED_CHARACTERIZATION_TEST(
                 },
             };
             info.narSize = 34878;
+            info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
             info;
         }),
         ({
@@ -385,11 +391,12 @@ VERSIONED_CHARACTERIZATION_TEST(
                             .self = true,
                         },
                 },
-                Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc="));
+                std::nullopt);
             info.deriver = StorePath{
                 "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar.drv",
             };
             info.narSize = 34878;
+            info.assertedNarHash = Hash::parseSRI("sha256-FePFYIlMuycIXPZbWi7LGEiMmZSX9FMbaQenWBzm1Sc=");
             info.sigs =
                 {
                     Signature{.keyName = "fake-sig-1", .sig = std::string(64, '\0')},

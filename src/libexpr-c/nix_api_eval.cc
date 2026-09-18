@@ -23,33 +23,28 @@ extern "C" {
 StorePath *
 nix_get_derivation(nix_c_context * context, EvalState * state, nix_value * value, bool ignoreAssertionFailures)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        auto maybePkg = nix::getDerivation(state->state, v, ignoreAssertionFailures);
-        if (!maybePkg) {
-            return nullptr;
-        }
-        nix::StorePath sp = maybePkg->requireDrvPath();
-        return new StorePath{std::move(sp)};
-    }
-    NIXC_CATCH_ERRS_NULL
+    return nix_c_boundary(
+        context,
+        state,
+        [&]() -> std::optional<nix::StorePath> {
+            auto & v = check_value_in(value);
+            auto maybePkg = nix::getDerivation(state->state, v, ignoreAssertionFailures);
+            if (!maybePkg)
+                return std::nullopt;
+            return maybePkg->requireDrvPath();
+        },
+        [](std::optional<nix::StorePath> sp) -> StorePath * { return sp ? new StorePath{std::move(*sp)} : nullptr; });
 }
 
 nix_err nix_value_auto_call_function(
     nix_c_context * context, EvalState * state, nix_value * auto_args, nix_value * fn_val, nix_value * result)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
+    return nix_c_boundary(context, state, [&] {
         auto & fn = check_value_in(fn_val);
         auto & res = check_value_not_null(result);
-
         auto & b = get_bindings_or_empty(state->state, auto_args);
         state->state.autoCallFunction(b, fn, res);
-    }
-    NIXC_CATCH_ERRS
+    });
 }
 
 } // extern "C"

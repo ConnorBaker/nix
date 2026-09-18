@@ -207,7 +207,12 @@ TEST_F(PureEvalTest, pathExists)
 
         ASSERT_THROW(eval("builtins.readDir /."), RestrictedPathError);
         state.allowPath(path); // FIXME: This shouldn't behave this way.
-        ASSERT_THAT(eval("builtins.readDir /."), IsAttrsOfSize(0));
+        /* Allowing a store path allows the directories leading to it, and the
+           evaluator's root is a tree: the store directory's parents exist and
+           list the way down to it. */
+        ASSERT_THAT(eval("builtins.readDir /."), IsAttrsOfSize(1));
+        ASSERT_THAT(eval("builtins.pathExists /nix"), IsTrue());
+        ASSERT_THAT(eval("builtins.pathExists /nix/store"), IsTrue());
     }
 }
 

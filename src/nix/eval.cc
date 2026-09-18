@@ -5,8 +5,10 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/expr/print.hh"
 
 #include <nlohmann/json.hpp>
+#include <sstream>
 
 namespace nix {
 
@@ -84,8 +86,8 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
             [&](this const auto & recurse, Value & v, const PosIdx pos, const std::filesystem::path & path) -> void {
                 state->forceValue(v, pos);
                 if (v.type() == nString) {
-                    copyContext(v, context);
-                    writeFile(path, v.string_view());
+                    auto bytes = state->emit(v, &context);
+                    writeFile(path, bytes.view());
                 } else if (v.type() == nAttrs) {
                     [[maybe_unused]] bool directoryCreated = std::filesystem::create_directory(path);
                     // Directory should not already exist
@@ -110,20 +112,25 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
 
         else if (raw) {
             logger->stop();
-            auto string = state->coerceToString(noPos, *v, context, "while generating the eval command output");
-            writeFull(getStandardOutput(), *string);
+            auto string = state->coerceAndEmit(noPos, *v, context, "while generating the eval command output");
+            writeFull(getStandardOutput(), string.view());
         }
 
         else if (json) {
-            printJSON(printValueAsJSON(*state, true, *v, pos, context, false));
+            /* As `printJSON`, with the bytes passing through the realising accessor. */
+            auto j = printValueAsJSON(*state, true, *v, pos, context, false);
+            auto suspension = logger->suspend();
+            logger->writeToStdout(state->emit(outputPretty ? j.dump(2) : j.dump(), context).view());
         }
 
         else {
-            ValuePrinter printer(*state, *v, PrintOptions{.force = true, .derivationPaths = true}, &context);
-            logger->cout("%s", printer);
+            /* Rendered first, the printer accumulating the provenance of what
+               it prints; the rendering then leaves through `emit`, which
+               copies the inputs it names before any of it is shown. */
+            std::ostringstream out;
+            printValue(*state, out, *v, PrintOptions{.force = true, .derivationPaths = true}, &context);
+            logger->cout("%s", state->emit(out.str(), context).view());
         }
-
-        state->ensureLazyPathsCopied(context);
     }
 };
 

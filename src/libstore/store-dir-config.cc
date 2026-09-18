@@ -109,10 +109,17 @@ static std::string makeType(const StoreDirConfig & store, std::string && type, c
 
 StorePath StoreDirConfig::makeFixedOutputPath(std::string_view name, const FixedOutputInfo & info) const
 {
+    /* Total over what an older Nix could make: the SHA-1 form of the git
+       method is still named here, so that a row, a derivation or a
+       description carrying it reads (the collector and the verifier read
+       every one they visit).  Creation refuses the form before this
+       (`checkIngestionAlgorithm`); no git-addressed path under another
+       algorithm ever existed. */
     if (info.method == FileIngestionMethod::Git
         && !(info.hash.algo == HashAlgorithm::SHA1 || info.hash.algo == HashAlgorithm::SHA256)) {
         throw Error(
-            "Git file ingestion must use SHA-1 or SHA-256 hash, but instead using: %s", printHashAlgo(info.hash.algo));
+            "the git content-address method names paths under SHA-256 (and, for paths an older Nix made, SHA-1), not %s",
+            printHashAlgo(info.hash.algo));
     }
 
     if (info.hash.algo == HashAlgorithm::SHA256 && info.method == FileIngestionMethod::NixArchive) {

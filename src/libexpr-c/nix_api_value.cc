@@ -21,11 +21,11 @@ static nix::Value & check_value_out(nix_value * value)
     return v;
 }
 
-static nix_value * new_nix_value(nix::Value * v, nix::EvalMemory & mem)
+static nix_value * new_nix_value(nix::Value * v, nix::EvalState & state)
 {
-    nix_value * ret = new (mem.allocBytes(sizeof(nix_value))) nix_value{
+    nix_value * ret = new (state.mem.allocBytes(sizeof(nix_value))) nix_value{
         .value = v,
-        .mem = &mem,
+        .state = &state,
     };
     nix_gc_incref(nullptr, ret);
     return ret;
@@ -59,12 +59,12 @@ static void nix_c_primop_wrapper(
     // ok because we don't see a need for this yet (e.g. inspecting thunks,
     // or maybe something to make blackholes work better; we don't know).
     nix::Value vTmp;
-    nix_value * vTmpPtr = new_nix_value(&vTmp, state.mem);
+    nix_value * vTmpPtr = new_nix_value(&vTmp, state);
 
     std::vector<nix_value *> external_args;
     external_args.reserve(arity);
     for (int i = 0; i < arity; i++) {
-        nix_value * external_arg = new_nix_value(args[i], state.mem);
+        nix_value * external_arg = new_nix_value(args[i], state);
         external_args.push_back(external_arg);
     }
     EvalState wrapper{state};
@@ -144,13 +144,7 @@ nix_err nix_register_primop(nix_c_context * context, PrimOp * primOp)
 
 nix_value * nix_alloc_value(nix_c_context * context, EvalState * state)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        nix_value * res = new_nix_value(state->state.allocValue(), state->state.mem);
-        return res;
-    }
-    NIXC_CATCH_ERRS_NULL
+    return nix_c_boundary(context, state, [&] { return new_nix_value(state->state.allocValue(), state->state); });
 }
 
 ValueType nix_get_type(nix_c_context * context, const nix_value * value)
@@ -221,9 +215,12 @@ nix_get_string(nix_c_context * context, const nix_value * value, nix_get_string_
     if (context)
         context->last_err_code = NIX_OK;
     try {
-        auto & v = check_value_in(value);
+        check_value_in(value);
+        auto & v = *value->value;
         assert(v.type() == nix::nString);
-        call_nix_get_string_callback(v.string_view(), callback, user_data);
+        /* The C API's exit for a string's text is a door: the pending objects
+           the text may name are written before C sees it. */
+        call_nix_get_string_callback(value->state->realise(v).view(), callback, user_data);
     }
     NIXC_CATCH_ERRS
 }
@@ -235,6 +232,9 @@ const char * nix_get_path_string(nix_c_context * context, const nix_value * valu
     try {
         auto & v = check_value_in(value);
         assert(v.type() == nix::nPath);
+        /* A path's text leaves to C: as at every door, whatever is pending is
+           written first, since C may read the path. */
+        value->state->flushPendingWrites();
         // NOTE (from @yorickvP)
         // v._path.path should work but may not be how Eelco intended it.
         // Long-term this function should be rewritten to copy some data into a
@@ -309,96 +309,92 @@ ExternalValue * nix_get_external(nix_c_context * context, nix_value * value)
 
 nix_value * nix_get_list_byidx(nix_c_context * context, const nix_value * value, EvalState * state, unsigned int ix)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        assert(v.type() == nix::nList);
-        if (ix >= v.listSize()) {
-            nix_set_err_msg(context, NIX_ERR_KEY, "list index out of bounds");
-            return nullptr;
-        }
-        auto * p = v.listView()[ix];
-        if (p == nullptr)
-            return nullptr;
-        state->state.forceValue(*p, nix::noPos);
-        return new_nix_value(p, state->state.mem);
-    }
-    NIXC_CATCH_ERRS_NULL
+    return nix_c_boundary(
+        context,
+        state,
+        [&]() -> nix::Value * {
+            auto & v = check_value_in(value);
+            assert(v.type() == nix::nList);
+            if (ix >= v.listSize()) {
+                nix_set_err_msg(context, NIX_ERR_KEY, "list index out of bounds");
+                return nullptr;
+            }
+            auto * p = v.listView()[ix];
+            if (p)
+                state->state.forceValue(*p, nix::noPos);
+            return p;
+        },
+        [&](nix::Value * p) -> nix_value * { return p ? new_nix_value(p, state->state) : nullptr; });
 }
 
 nix_value *
 nix_get_list_byidx_lazy(nix_c_context * context, const nix_value * value, EvalState * state, unsigned int ix)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        assert(v.type() == nix::nList);
-        if (ix >= v.listSize()) {
-            nix_set_err_msg(context, NIX_ERR_KEY, "list index out of bounds");
-            return nullptr;
-        }
-        auto * p = v.listView()[ix];
-        // Note: intentionally NOT calling forceValue() to keep the element lazy
-        return new_nix_value(p, state->state.mem);
-    }
-    NIXC_CATCH_ERRS_NULL
+    return nix_c_boundary(
+        context,
+        state,
+        [&]() -> nix::Value * {
+            auto & v = check_value_in(value);
+            assert(v.type() == nix::nList);
+            if (ix >= v.listSize()) {
+                nix_set_err_msg(context, NIX_ERR_KEY, "list index out of bounds");
+                return nullptr;
+            }
+            // Note: intentionally NOT calling forceValue() to keep the element lazy
+            return v.listView()[ix];
+        },
+        [&](nix::Value * p) -> nix_value * { return p ? new_nix_value(p, state->state) : nullptr; });
 }
 
 nix_value * nix_get_attr_byname(nix_c_context * context, const nix_value * value, EvalState * state, const char * name)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        assert(v.type() == nix::nAttrs);
-        nix::Symbol s = state->state.symbols.create(name);
-        auto attr = v.attrs()->get(s);
-        if (attr) {
+    return nix_c_boundary(
+        context,
+        state,
+        [&]() -> nix::Value * {
+            auto & v = check_value_in(value);
+            assert(v.type() == nix::nAttrs);
+            nix::Symbol s = state->state.symbols.create(name);
+            auto attr = v.attrs()->get(s);
+            if (!attr) {
+                nix_set_err_msg(context, NIX_ERR_KEY, "missing attribute");
+                return nullptr;
+            }
             state->state.forceValue(*attr->value, nix::noPos);
-            return new_nix_value(attr->value, state->state.mem);
-        }
-        nix_set_err_msg(context, NIX_ERR_KEY, "missing attribute");
-        return nullptr;
-    }
-    NIXC_CATCH_ERRS_NULL
+            return attr->value;
+        },
+        [&](nix::Value * p) -> nix_value * { return p ? new_nix_value(p, state->state) : nullptr; });
 }
 
 nix_value *
 nix_get_attr_byname_lazy(nix_c_context * context, const nix_value * value, EvalState * state, const char * name)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        assert(v.type() == nix::nAttrs);
-        nix::Symbol s = state->state.symbols.create(name);
-        auto attr = v.attrs()->get(s);
-        if (attr) {
+    return nix_c_boundary(
+        context,
+        state,
+        [&]() -> nix::Value * {
+            auto & v = check_value_in(value);
+            assert(v.type() == nix::nAttrs);
+            nix::Symbol s = state->state.symbols.create(name);
+            auto attr = v.attrs()->get(s);
+            if (!attr) {
+                nix_set_err_msg(context, NIX_ERR_KEY, "missing attribute");
+                return nullptr;
+            }
             // Note: intentionally NOT calling forceValue() to keep the attribute lazy
-            return new_nix_value(attr->value, state->state.mem);
-        }
-        nix_set_err_msg(context, NIX_ERR_KEY, "missing attribute");
-        return nullptr;
-    }
-    NIXC_CATCH_ERRS_NULL
+            return attr->value;
+        },
+        [&](nix::Value * p) -> nix_value * { return p ? new_nix_value(p, state->state) : nullptr; });
 }
 
 bool nix_has_attr_byname(nix_c_context * context, const nix_value * value, EvalState * state, const char * name)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
+    return nix_c_boundary(context, state, [&] {
         auto & v = check_value_in(value);
         assert(v.type() == nix::nAttrs);
         nix::Symbol s = state->state.symbols.create(name);
-        auto attr = v.attrs()->get(s);
-        if (attr)
-            return true;
-        return false;
-    }
-    NIXC_CATCH_ERRS_RES(false);
+        return v.attrs()->get(s) != nullptr;
+    });
 }
 
 static void collapse_attrset_layer_chain_if_needed(nix::Value & v, EvalState * state)
@@ -414,48 +410,48 @@ static void collapse_attrset_layer_chain_if_needed(nix::Value & v, EvalState * s
 nix_value *
 nix_get_attr_byidx(nix_c_context * context, nix_value * value, EvalState * state, unsigned int i, const char ** name)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        collapse_attrset_layer_chain_if_needed(v, state);
-        if (i >= v.attrs()->size()) {
-            nix_set_err_msg(context, NIX_ERR_KEY, "attribute index out of bounds");
-            return nullptr;
-        }
-        const nix::Attr & a = (*v.attrs())[i];
-        *name = state->state.symbols[a.name].c_str();
-        state->state.forceValue(*a.value, nix::noPos);
-        return new_nix_value(a.value, state->state.mem);
-    }
-    NIXC_CATCH_ERRS_NULL
+    return nix_c_boundary(
+        context,
+        state,
+        [&]() -> nix::Value * {
+            auto & v = check_value_in(value);
+            collapse_attrset_layer_chain_if_needed(v, state);
+            if (i >= v.attrs()->size()) {
+                nix_set_err_msg(context, NIX_ERR_KEY, "attribute index out of bounds");
+                return nullptr;
+            }
+            const nix::Attr & a = (*v.attrs())[i];
+            *name = state->state.symbols[a.name].c_str();
+            state->state.forceValue(*a.value, nix::noPos);
+            return a.value;
+        },
+        [&](nix::Value * p) -> nix_value * { return p ? new_nix_value(p, state->state) : nullptr; });
 }
 
 nix_value * nix_get_attr_byidx_lazy(
     nix_c_context * context, nix_value * value, EvalState * state, unsigned int i, const char ** name)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        collapse_attrset_layer_chain_if_needed(v, state);
-        if (i >= v.attrs()->size()) {
-            nix_set_err_msg(context, NIX_ERR_KEY, "attribute index out of bounds (Nix C API contract violation)");
-            return nullptr;
-        }
-        const nix::Attr & a = (*v.attrs())[i];
-        *name = state->state.symbols[a.name].c_str();
-        // Note: intentionally NOT calling forceValue() to keep the attribute lazy
-        return new_nix_value(a.value, state->state.mem);
-    }
-    NIXC_CATCH_ERRS_NULL
+    return nix_c_boundary(
+        context,
+        state,
+        [&]() -> nix::Value * {
+            auto & v = check_value_in(value);
+            collapse_attrset_layer_chain_if_needed(v, state);
+            if (i >= v.attrs()->size()) {
+                nix_set_err_msg(context, NIX_ERR_KEY, "attribute index out of bounds (Nix C API contract violation)");
+                return nullptr;
+            }
+            const nix::Attr & a = (*v.attrs())[i];
+            *name = state->state.symbols[a.name].c_str();
+            // Note: intentionally NOT calling forceValue() to keep the attribute lazy
+            return a.value;
+        },
+        [&](nix::Value * p) -> nix_value * { return p ? new_nix_value(p, state->state) : nullptr; });
 }
 
 const char * nix_get_attr_name_byidx(nix_c_context * context, nix_value * value, EvalState * state, unsigned int i)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
+    return nix_c_boundary(context, state, [&]() -> const char * {
         auto & v = check_value_in(value);
         collapse_attrset_layer_chain_if_needed(v, state);
         if (i >= v.attrs()->size()) {
@@ -464,8 +460,7 @@ const char * nix_get_attr_name_byidx(nix_c_context * context, nix_value * value,
         }
         const nix::Attr & a = (*v.attrs())[i];
         return state->state.symbols[a.name].c_str();
-    }
-    NIXC_CATCH_ERRS_NULL
+    });
 }
 
 nix_err nix_init_bool(nix_c_context * context, nix_value * value, bool b)
@@ -486,20 +481,17 @@ nix_err nix_init_string(nix_c_context * context, nix_value * value, const char *
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_out(value);
-        v.mkString(std::string_view(str), *value->mem);
+        v.mkString(std::string_view(str), value->state->mem);
     }
     NIXC_CATCH_ERRS
 }
 
 nix_err nix_init_path_string(nix_c_context * context, EvalState * s, nix_value * value, const char * str)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
+    return nix_c_boundary(context, s, [&] {
         auto & v = check_value_out(value);
         v.mkPath(s->state.rootPath(nix::CanonPath(str)), s->state.mem);
-    }
-    NIXC_CATCH_ERRS
+    });
 }
 
 nix_err nix_init_float(nix_c_context * context, nix_value * value, double d)
@@ -562,17 +554,17 @@ nix_err nix_init_external(nix_c_context * context, nix_value * value, ExternalVa
 
 ListBuilder * nix_make_list_builder(nix_c_context * context, EvalState * state, size_t capacity)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto builder = state->state.buildList(capacity);
-        return new
+    return nix_c_boundary(
+        context,
+        state,
+        [&] { return state->state.buildList(capacity); },
+        [](nix::ListBuilder builder) -> ListBuilder * {
+            return new
 #if NIX_USE_BOEHMGC
-            (NoGC)
+                (NoGC)
 #endif
-                ListBuilder{std::move(builder)};
-    }
-    NIXC_CATCH_ERRS_NULL
+                    ListBuilder{std::move(builder)};
+        });
 }
 
 nix_err
@@ -643,17 +635,17 @@ nix_err nix_make_attrs(nix_c_context * context, nix_value * value, BindingsBuild
 
 BindingsBuilder * nix_make_bindings_builder(nix_c_context * context, EvalState * state, size_t capacity)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto bb = state->state.buildBindings(capacity);
-        return new
+    return nix_c_boundary(
+        context,
+        state,
+        [&] { return state->state.buildBindings(capacity); },
+        [](nix::BindingsBuilder bb) -> BindingsBuilder * {
+            return new
 #if NIX_USE_BOEHMGC
-            (NoGC)
+                (NoGC)
 #endif
-                BindingsBuilder{std::move(bb)};
-    }
-    NIXC_CATCH_ERRS_NULL
+                    BindingsBuilder{std::move(bb)};
+        });
 }
 
 nix_err nix_bindings_builder_insert(nix_c_context * context, BindingsBuilder * bb, const char * name, nix_value * value)
@@ -679,22 +671,22 @@ void nix_bindings_builder_free(BindingsBuilder * bb)
 
 nix_realised_string * nix_string_realise(nix_c_context * context, EvalState * state, nix_value * value, bool isIFD)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        auto & v = check_value_in(value);
-        nix::StorePathSet storePaths;
-        auto s = state->state.realiseString(v, &storePaths, isIFD);
-
-        // Convert to the C API StorePath type and convert to vector for index-based access
-        std::vector<StorePath> vec;
-        for (auto & sp : storePaths) {
-            vec.push_back(StorePath{sp});
-        }
-
-        return new nix_realised_string{.str = s, .storePaths = vec};
-    }
-    NIXC_CATCH_ERRS_NULL
+    return nix_c_boundary(
+        context,
+        state,
+        [&] {
+            auto & v = check_value_in(value);
+            nix::StorePathSet storePaths;
+            auto s = state->state.realiseString(v, &storePaths, isIFD);
+            return std::pair{std::move(s), std::move(storePaths)};
+        },
+        [](std::pair<std::string, nix::StorePathSet> realised) -> nix_realised_string * {
+            // Convert to the C API StorePath type and convert to vector for index-based access
+            std::vector<StorePath> vec;
+            for (auto & sp : realised.second)
+                vec.push_back(StorePath{sp});
+            return new nix_realised_string{.str = std::move(realised.first), .storePaths = std::move(vec)};
+        });
 }
 
 void nix_realised_string_free(nix_realised_string * s)

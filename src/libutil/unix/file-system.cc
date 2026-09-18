@@ -182,12 +182,12 @@ static void _deletePath(
         case 1:
             bytesFreed += st.st_size;
             break;
-        /* Maybe: yes, if 'auto-optimise-store' or manual optimisation
-           was performed. Instead of checking for real let's assume
-           it's an optimised file and space will be freed.
+        /* Maybe: yes, if this is one of the object store's hard links
+           (the file and the blob's). Instead of checking for real let's
+           assume it is and space will be freed.
 
            In worst case we will double count on freed space for files
-           with exactly two hardlinks for unoptimised packages.
+           with exactly two hardlinks that are not the object store's.
          */
         case 2:
             bytesFreed += st.st_size;
