@@ -253,10 +253,6 @@ Here is more information on the `output*` attributes, and what values they may b
 
       - [`"git"`](@docroot@/store/store-object/content-address.md#method-git)
 
-        > **Warning**
-        >
-        > This method is part of the [`git-hashing`][xp-feature-git-hashing] experimental feature.
-
     See [content-addressing store objects](@docroot@/store/store-object/content-address.md) for more information about the process this flag controls.
 
   - [`outputHashAlgo`]{#adv-attr-outputHashAlgo}
@@ -268,6 +264,7 @@ Here is more information on the `output*` attributes, and what values they may b
 
     The `outputHashAlgo` attribute specifies the hash algorithm used to compute the hash.
     It can currently be `"blake3"`, `"sha1"`, `"sha256"`, `"sha512"`, or `null`.
+    With `outputHashMode = "git"` it must be `"sha256"` (or `null` with a `sha256-` SRI `outputHash`): the [Git method](@docroot@/store/store-object/content-address.md#method-git) admits no other algorithm, and a derivation declaring another is refused at instantiation.
 
     `outputHashAlgo` can only be `null` when `outputHash` follows the SRI format, because in that case the choice of hash algorithm is determined by `outputHash`.
 
@@ -309,4 +306,3 @@ Here is more information on the `output*` attributes, and what values they may b
 [file system object]: @docroot@/store/file-system-object.md
 [store object]: @docroot@/store/store-object.md
 [xp-feature-dynamic-derivations]: @docroot@/development/experimental-features.md#xp-feature-dynamic-derivations
-[xp-feature-git-hashing]: @docroot@/development/experimental-features.md#xp-feature-git-hashing

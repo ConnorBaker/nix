@@ -188,5 +188,4 @@ For example, for the "fetch URL" example above, making such a note is tantamount
 
 [input addressing]: ./input-address.md
 [xp-feature-ca-derivations]: @docroot@/development/experimental-features.md#xp-feature-ca-derivations
-[xp-feature-git-hashing]: @docroot@/development/experimental-features.md#xp-feature-git-hashing
 [xp-feature-impure-derivations]: @docroot@/development/experimental-features.md#xp-feature-impure-derivations

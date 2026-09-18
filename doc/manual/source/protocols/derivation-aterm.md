@@ -97,6 +97,7 @@ It is taken from the store path of the derivation, and so must be supplied out-o
 > This is a mode, not a choice made afresh at each store path: one of the two holds throughout a given file, and every store path in it is written that way.
 > The mode is not recorded in the file and cannot be recovered from the bytes — a verbatim path is also a well-formed `string` — so it has to be supplied out of band, like the derivation name.
 > Nix takes it from the store it is reading or writing for, defaulting to the platform it was built for, and then holds the parser to it: under a Unix store directory a store path carrying an escape is *rejected* rather than accepted as a second spelling of the same path.
+> The writer is held to it too: asked to write verbatim for a store directory that holds a double quote or a backslash, it refuses rather than write a file no reader could take back, as it refuses a platform holding either.
 > That is what keeps the encoding [canonical](#canonical-form) in either case.
 
 ### Strings
@@ -134,6 +135,7 @@ The `method-prefix` of `hash-algo` is the [content addressing method](@docroot@/
 | `git:` | [Git](@docroot@/store/store-object/content-address.md#method-git) |
 
 `hash` is lowercase, and carries no algorithm prefix of its own — the algorithm is named by `hash-algo`.
+Under the `git:` prefix the algorithm is `sha256`; a derivation an older Nix wrote with `git:sha1` is still read, and refused when it is built.
 
 For a fixed-output derivation the `output-path` is redundant — it is a function of the content address — but it must still agree with it.
 Two derivations that mean the same thing would otherwise have different encodings, and so different store paths.

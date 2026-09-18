@@ -103,18 +103,14 @@ References (to other store objects and self-references alike) are supported so l
 
 ### Git { #method-git }
 
-> **Warning**
->
-> This method is part of the [`git-hashing`][xp-feature-git-hashing] experimental feature.
-
 This uses the corresponding [Git](../file-system-object/content-address.md#git) method of file system object content addressing.
 
 References are not supported.
 
-Only SHA-1 is supported at this time.
-If [SHA-256-based Git](https://git-scm.com/docs/hash-function-transition)
-becomes more widespread, this restriction will be revisited.
+Only SHA-256 is supported: the identifiers are those of [SHA-256-based Git](https://git-scm.com/docs/hash-function-transition), and the method is the one by which the store names every store object.
+A SHA-1 identifier from an ordinary Git repository is not an address under this method; `nix hash path --mode git` gives the address of a tree.
+Nix once admitted SHA-1 here as well, under the former `git-hashing` experimental feature; a fixed-output derivation that still declares `outputHashMode = "git"` with a SHA-1 hash is refused at instantiation, and `nix store add --mode git --hash-algo sha1` and `nix hash path --mode git --algo sha1` are refused, each with the remedy in the message.
+A store object an older Nix addressed under SHA-1 is read as it is (its database row, a `.narinfo` naming it, a derivation naming its output), but cannot be copied into a store of this Nix, whose check of the address it cannot pass.
 
 [fso-ca]: ../file-system-object/content-address.md
 [sp-spec]: @docroot@/protocols/store-path.md
-[xp-feature-git-hashing]: @docroot@/development/experimental-features.md#xp-feature-git-hashing

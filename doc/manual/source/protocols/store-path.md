@@ -120,6 +120,8 @@ where
         algo = "md5" | "sha1" | "sha256"
         ```
 
+        With `rec` = `"git:"`, `algo` is `"sha256"` alone (the [Git method](@docroot@/store/store-object/content-address.md#method-git) admits no other algorithm).
+
       - `hash` = base-16 representation of the path or flat hash of the contents of the path (or expected contents of the path for fixed-output derivations).
 
       Note that `id` = `"out"`, regardless of the name part of the store path.
