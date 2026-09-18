@@ -2,11 +2,7 @@
 
 source ../common.sh
 
-TODO_NixOS # Need to enable git hashing feature and make sure test is ok for store we don't clear
+TODO_NixOS # Need to make sure test is ok for store we don't clear
 
-# Need backend to support git-hashing too
+# Need backend to support the git content-address method too
 requireDaemonNewerThan "2.19"
-
-enableFeatures "git-hashing"
-
-restartDaemon

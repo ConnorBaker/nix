@@ -73,8 +73,8 @@ rec {
   # Can use "nar" instead of "recursive" now.
   nar-not-recursive = f2 "foo" ./fixed.builder2.sh "nar" "md5" "3670af73070fa14077ad74e0f5ea4e42";
 
-  # Experimental feature
-
+  # The git method admits SHA-256 only; this one is refused at instantiation
+  # (git-hashing/fixed.sh, git-hashing/simple-sha1.sh).
   git-sha1 = f2 "foo" ./fixed.builder2.sh "git" "sha1" "cd44baf36915d5dec8374232ea7e2057f3b4494e";
 
   git-sha256 =

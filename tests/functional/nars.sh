@@ -119,11 +119,15 @@ expectStderr 1 nix-store "${opts[@]}" --dump "$TEST_ROOT/case" > /dev/null
 rm -rf "$TEST_ROOT/case"
 expectStderr 1 nix-store "${opts[@]}" --restore "$TEST_ROOT/case/." < case.nar | grepQuiet "ends in '\.'.*not a valid filename"
 
-# Detect NARs that have a directory entry that after case-hacking
-# collides with another entry (e.g. a directory containing 'Test',
-# 'Test~nix~case~hack~1' and 'test').
+# A NAR whose entry name carries the case-hack suffix is refused on every
+# platform, with or without `use-case-hack` (the suffix is the parser's
+# own marker, and such a name would read differently by platform):
+# case-collision.nar holds 'Test', 'Test~nix~case~hack~1' and 'test', and
+# the refusal is at the second entry.
 rm -rf "$TEST_ROOT/case"
-expectStderr 1 nix-store "${opts[@]}" --restore "$TEST_ROOT/case" < case-collision.nar | grepQuiet "NAR contains file name 'test' that collides with case-hacked file name 'Test~nix~case~hack~1'"
+expectStderr 1 nix-store "${opts[@]}" --restore "$TEST_ROOT/case" < case-collision.nar | grepQuiet "NAR contains file name 'Test~nix~case~hack~1' with the case-hack suffix '~nix~case~hack~'"
+rm -rf "$TEST_ROOT/case"
+expectStderr 1 nix-store --option use-case-hack false --restore "$TEST_ROOT/case" < case-collision.nar | grepQuiet "NAR contains file name 'Test~nix~case~hack~1' with the case-hack suffix '~nix~case~hack~'"
 
 # Deserializing a NAR that contains file names that Unicode-normalize to the
 # same name should fail on macOS and specific Linux setups (typically ZFS with

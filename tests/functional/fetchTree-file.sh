@@ -10,12 +10,17 @@ test_fetch_file () {
     echo foo > test_input
 
     input_hash="$(nix hash path test_input)"
+    # The object hash of a flat file is its blob id: sha256 of "blob 4\0foo\n"
+    # (git hash-object --object-format=sha256), as SRI.
+    input_tree_hash=sha256-R9asqCdW/y5h5TUgv98fqmyG2TO+SFTrNIQMV9EuDIU=
 
     nix eval --impure --file - <<EOF
     let
         tree = builtins.fetchTree { type = "file"; url = "file://$PWD/test_input"; };
     in
+    # \`narHash\` is the lazy attribute, computed by a walk when forced; \`treeHash\` is the name's hash.
     assert (tree.narHash == "$input_hash");
+    assert (tree.treeHash == "$input_tree_hash");
     assert builtins.readFile tree == "foo\n";
     tree
 EOF
@@ -35,6 +40,11 @@ test_file_flake_input () {
     cp test_input.tar.gz test_input_no_ext
     input_tarball_hash="$(nix hash path test_input.tar.gz)"
     input_directory_hash="$(nix hash path inputs)"
+    # The SHA-256 git tree id of `inputs` (entries flake.nix, test_input_file,
+    # both 100644), the name the lock carries for the unpacked inputs.  The
+    # tarball's own blob id is not a constant (tar's timestamps), so the
+    # file inputs are compared with the language's `treeHash` below.
+    input_directory_tree_hash=sha256-+MHjp8KPMSRWG7feirfbEjpKBjN52kUUKm0Z10ecd2E=
 
     cat <<EOF > flake.nix
     {
@@ -69,7 +79,9 @@ EOF
     # not be unpacked by default
     assert (nodes.no_ext_default_no_unpack.locked.type == "file");
     assert (nodes.no_ext_default_no_unpack.locked.unpack or false == false);
-    assert (nodes.no_ext_default_no_unpack.locked.narHash == "$input_tarball_hash");
+    # The lock carries the tree hash (version 8), never the NAR hash.
+    assert (nodes.no_ext_default_no_unpack.locked ? treeHash);
+    assert (!(nodes.no_ext_default_no_unpack.locked ? narHash));
 
     # For backwards compatibility, flake inputs that correspond to the
     # old 'tarball' fetcher should still have their type set to 'tarball'
@@ -77,17 +89,25 @@ EOF
     # Unless explicitly specified, the 'unpack' parameter shouldn’t appear here
     # because that would break older Nix versions
     assert (!nodes.tarball_default_unpack.locked ? unpack);
-    assert (nodes.tarball_default_unpack.locked.narHash == "$input_directory_hash");
+    assert (nodes.tarball_default_unpack.locked.treeHash == "$input_directory_tree_hash");
+    assert (!(nodes.tarball_default_unpack.locked ? narHash));
 
     # Explicitly passing the unpack parameter should enforce the desired behavior
-    assert (nodes.no_ext_explicit_unpack.locked.narHash == nodes.tarball_default_unpack.locked.narHash);
-    assert (nodes.tarball_explicit_no_unpack.locked.narHash == nodes.no_ext_default_no_unpack.locked.narHash);
+    assert (nodes.no_ext_explicit_unpack.locked.treeHash == nodes.tarball_default_unpack.locked.treeHash);
+    assert (nodes.tarball_explicit_no_unpack.locked.treeHash == nodes.no_ext_default_no_unpack.locked.treeHash);
 
     # Flake inputs should always be tarballs
     assert (nodes.flake_no_ext.locked.type == "tarball");
 
     true
 EOF
+
+    # The file input's lock entry is the language's `treeHash` for the same
+    # file, and its NAR hash -- the lazy attribute, forced here -- is the
+    # file's, so the version-7 evidence is still checked, through the shim.
+    [[ $(nix eval --impure --raw --expr "(builtins.fetchTree { type = \"file\"; url = \"file://$PWD/test_input_no_ext\"; }).treeHash") == $(jq -r .nodes.no_ext_default_no_unpack.locked.treeHash flake.lock) ]]
+    [[ $(nix eval --impure --raw --expr "(builtins.fetchTree { type = \"file\"; url = \"file://$PWD/test_input_no_ext\"; }).narHash") == "$input_tarball_hash" ]]
+    [[ $(nix eval --impure --raw --expr "(builtins.fetchTree { type = \"tarball\"; url = \"file://$PWD/test_input.tar.gz\"; }).narHash") == "$input_directory_hash" ]]
 
     # Test tarball URLs on the command line.
     [[ $(nix flake metadata --json "file://$PWD/test_input_no_ext" | jq -r .resolved.type) = tarball ]]
@@ -138,6 +158,7 @@ let
     );
 in
   assert tree?narHash; # sanity
+  assert tree?treeHash; # sanity
   assert tree?outPath; # sanity
   assert builtins.all checkAttr (builtins.attrNames tree);
   true

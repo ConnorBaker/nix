@@ -25,7 +25,10 @@ nix-store --delete "$outPath"
 [[ ! -e $outPath/hello ]]
 
 outPath="$(NIX_REMOTE='local?store=/foo&real='"$TEST_ROOT"'/real-store' nix-instantiate --readonly-mode hash-check.nix)"
-if test "$outPath" != "/foo/lfy1s6ca46rm5r6w4gg9hc0axiakjcnm-dependencies.drv"; then
+# The constant changed with the naming of sources by their tree hash
+# (doc/lazy-store/01-specification.md, section 9.11): the derivation's input
+# sources have new store paths, so the derivation does too.
+if test "$outPath" != "/foo/81c48ifgkrwm8mdgh9l9i2961c8pawyk-dependencies.drv"; then
     echo "input-masked hashing appears broken, got $outPath"
     exit 1
 fi

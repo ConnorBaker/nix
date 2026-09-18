@@ -7,12 +7,19 @@ needLocalStore "“min-free” and “max-free” are daemon options"
 
 TODO_NixOS
 
+# Three paths of distinct contents, each over the 1948 bytes one collection
+# round frees before it stops.  Under the object store a path's files are
+# hard links to the store's blobs, and the collector counts a deletion as
+# freeing a file's bytes only when the file has one link or two (its own and
+# the blob's: src/libutil/unix/file-system.cc, `deletePath`); three copies
+# of one script share one blob, so deleting them frees nothing until the
+# last, and one round would take all three.
 # shellcheck disable=SC2034
 garbage1=$(nix store add-path --name garbage1 ./nar-access.sh)
 # shellcheck disable=SC2034
-garbage2=$(nix store add-path --name garbage2 ./nar-access.sh)
+garbage2=$(nix store add-path --name garbage2 ./optimise-store.sh)
 # shellcheck disable=SC2034
-garbage3=$(nix store add-path --name garbage3 ./nar-access.sh)
+garbage3=$(nix store add-path --name garbage3 ./shell.sh)
 
 ls -l "$garbage3"
 POSIXLY_CORRECT=1 du "$garbage3"
