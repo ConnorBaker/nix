@@ -520,14 +520,20 @@ public:
     bool holdTree(const Hash & id, const Hold & hold) const;
     bool holdBlob(const Hash & id, bool executable, const Hold & hold) const;
 
+    /** Auxiliary blob bytes, absent when missing; nonregular occupants are
+     * rejected without following symlinks or waiting for a FIFO writer.
+     * The caller checks the bytes against the expected identifier. */
+    std::optional<std::string> readBlob(const Hash & id, bool executable) const;
+
     /**
      * The entries of the tree `id` for materialising a path from the
      * store's objects (01 §9.10, the second route): the body read and
      * checked against its name, as the sweep checks it (law 4: "a tree
      * body is verified against its identifier when it is read to
      * materialise a path").  Nullopt when the store lacks the tree, and
-     * -- refused, with a warning naming the repair -- when the body does
-     * not hash to its name or does not parse; the body is left for
+     * -- refused, with a warning naming the repair -- when the object is
+     * not a regular file, its body does not hash to its name or does not
+     * parse; the body is left for
      * `--verify --check-contents --repair`, since removing it would let
      * the sweep take what it names (K6).
      */

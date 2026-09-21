@@ -394,6 +394,11 @@ protected:
         return GitObjectStore::parseTreeBody(id, *body);
     }
 
+    static std::optional<std::string> readAuxiliaryObject(GitObjectStore & objects, const Hash & id, unsigned kind)
+    {
+        return kind == 0 ? objects.readTree(id) : objects.readBlob(id, kind == 2);
+    }
+
     static merkle::Tree parseTreeBody(const Hash & id, std::string_view body)
     {
         return GitObjectStore::parseTreeBody(id, body);
@@ -4384,6 +4389,173 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldClaimsDoNotDependOnTheOldInodeKind)
             }
     EXPECT_EQ(cases + devicesUnavailable, 48u);
     EXPECT_GE(cases, 36u);
+    RecordProperty("device_node_cases_unavailable", devicesUnavailable);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryReadersRejectNonregularOccupants)
+{
+    enum class Kind { Missing, Regular, Symlink, DanglingSymlink, Fifo, Socket, Character, Block, Directory };
+    enum class Role {
+        TreeBytes,
+        BlobBytes,
+        ExecutableBlobBytes,
+        VerifiedTree,
+        Sweep,
+        MaterialiseTree,
+        MaterialiseLink
+    };
+    const std::array kinds{
+        Kind::Missing,
+        Kind::Regular,
+        Kind::Symlink,
+        Kind::DanglingSymlink,
+        Kind::Fifo,
+        Kind::Socket,
+        Kind::Character,
+        Kind::Block,
+        Kind::Directory};
+    const std::array roles{
+        Role::TreeBytes,
+        Role::BlobBytes,
+        Role::ExecutableBlobBytes,
+        Role::VerifiedTree,
+        Role::Sweep,
+        Role::MaterialiseTree,
+        Role::MaterialiseLink};
+    auto & objects = store->objects;
+    size_t cases = 0, devicesUnavailable = 0;
+    for (auto role : roles)
+        for (auto kind : kinds) {
+            SCOPED_TRACE(fmt("role=%d kind=%d", static_cast<unsigned>(role), static_cast<unsigned>(kind)));
+            bool tree = role != Role::BlobBytes && role != Role::ExecutableBlobBytes && role != Role::MaterialiseLink;
+            auto target = fmt("auxiliary-reader-target-%d", cases + devicesUnavailable);
+            auto targetId = merkle::blobId(target);
+            auto body = merkle::serialiseTree({{"link", {merkle::Mode::Symlink, targetId}}});
+            auto bytes = tree ? body : target;
+            auto id = tree ? merkle::treeId(body) : targetId;
+            auto file = tree ? objects.treeFile(id) : objects.blobFile(id, role == Role::ExecutableBlobBytes);
+            auto outside = tempStoreDir.path() / "auxiliary-reader-outside";
+            createDirs(file.parent_path());
+            writeFile(outside, bytes);
+            Finally clean{[&] {
+                if (maybeLstat(file))
+                    deletePath(file);
+            }};
+            AutoCloseFD socket;
+            switch (kind) {
+            case Kind::Missing:
+                break;
+            case Kind::Regular:
+                writeFile(file, bytes);
+                break;
+            case Kind::Symlink:
+                createSymlink(outside, file);
+                break;
+            case Kind::DanglingSymlink:
+                createSymlink(outside.string() + "-missing", file);
+                break;
+            case Kind::Fifo:
+                ASSERT_EQ(mkfifo(file.c_str(), 0600), 0) << strerror(errno);
+                break;
+            case Kind::Socket:
+                socket = createUnixDomainSocket(file, 0600);
+                break;
+            case Kind::Character:
+            case Kind::Block:
+                if (mknod(file.c_str(), (kind == Kind::Character ? S_IFCHR : S_IFBLK) | 0600, 0) == -1) {
+                    ASSERT_TRUE(errno == EPERM || errno == EACCES || errno == ENOTSUP) << strerror(errno);
+                    ++devicesUnavailable;
+                    continue;
+                }
+                break;
+            case Kind::Directory:
+                createDir(file);
+                break;
+            }
+            bool malformed = kind != Kind::Missing && kind != Kind::Regular;
+            auto source = treeAccessor({{"link", target, 'l'}});
+            if (role == Role::MaterialiseLink)
+                source->root = MemorySourceAccessor::File{MemorySourceAccessor::File::Symlink{.target = target}};
+            if (role == Role::MaterialiseTree) {
+                auto hold = objects.hold();
+                objects.putBlob(targetId, false, target, hold);
+            }
+            auto spare = objects.blobFile(merkle::blobId("unreachable reader-test sentinel"), false);
+            if (role == Role::Sweep) {
+                createDirs(spare.parent_path());
+                writeFile(spare, "unreachable reader-test sentinel");
+            }
+            auto exercise = [&]() -> bool {
+                switch (role) {
+                case Role::TreeBytes:
+                case Role::BlobBytes:
+                case Role::ExecutableBlobBytes:
+                    try {
+                        auto read = readAuxiliaryObject(objects, id, static_cast<unsigned>(role));
+                        return !malformed && read == (kind == Kind::Missing ? std::nullopt : std::optional{bytes});
+                    } catch (NotARegularFile &) {
+                        return malformed;
+                    }
+                case Role::VerifiedTree: {
+                    auto read = objects.readVerifiedTree(id);
+                    return kind == Kind::Regular ? read && read->at("link").hash == targetId : !read;
+                }
+                case Role::Sweep: {
+                    auto swept = objects.sweep([&](fun<void(const ObjectHash &)> live) {
+                        live(ObjectHash{id});
+                        return uint64_t{0};
+                    });
+                    return swept.corruptTrees == (malformed ? 1u : 0u) && pathExists(spare) == malformed;
+                }
+                case Role::MaterialiseTree:
+                case Role::MaterialiseLink: {
+                    auto dst = config->realStoreDir.get() / fmt("auxiliary-reader-%d", cases + devicesUnavailable);
+                    auto counting = make_ref<CountingAccessor>(source);
+                    auto hold = objects.hold();
+                    try {
+                        auto result = store->materialiseThroughObjects(
+                            dst,
+                            SourcePath(counting),
+                            defaultPathFilter,
+                            false,
+                            nullptr,
+                            NoRepair,
+                            everyNode(source),
+                            hold);
+                        if (kind == Kind::Directory)
+                            return false;
+                        bool fellBack = role == Role::MaterialiseTree ? counting->listings != 0 : counting->links != 0;
+                        StringSink nar;
+                        dumpPath(dst, nar);
+                        return fellBack == (kind != Kind::Regular) && nar.s == narOf(*source)
+                               && result.root == objectHashOf(*source, CanonPath::root).root;
+                    } catch (Error &) {
+                        /* Directories cannot be hard-linked, including by
+                           the fallback's auxiliary publisher. Readers do
+                           not silently repair this existing error case. */
+                        return kind == Kind::Directory;
+                    }
+                }
+                }
+                return false;
+            };
+            if (kind == Kind::Fifo) {
+                /* No writer exists. The old reader blocks in open(); a
+                   child bounds that failure without a timing-dependent
+                   writer or a blocked future on assertion unwinding.
+                   The alarm is a failure watchdog, not synchronization. */
+                Pid child = startProcess([&] {
+                    alarm(5);
+                    _exit(exercise() ? 0 : 1);
+                });
+                EXPECT_EQ(child.wait(), 0) << "auxiliary FIFO read failed or blocked";
+            } else
+                EXPECT_TRUE(exercise());
+            EXPECT_EQ(readFile(outside), bytes);
+            ++cases;
+        }
+    EXPECT_EQ(cases + devicesUnavailable, 63u);
+    EXPECT_GE(cases, 49u);
     RecordProperty("device_node_cases_unavailable", devicesUnavailable);
 }
 

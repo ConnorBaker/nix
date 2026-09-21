@@ -4,7 +4,6 @@
 #include "nix/util/hash.hh"
 
 #include <boost/unordered/concurrent_flat_map.hpp>
-#include <boost/unordered/concurrent_flat_set.hpp>
 #include <iterator>
 #include <nlohmann/json.hpp>
 
@@ -99,8 +98,8 @@ void FilteringSourceAccessor::readDirectoryScoped(
                 {
                     if (p.isRoot())
                         return true;
-                    if (p.parent()->isRoot())
-                        return admitted.contains(std::string(*p.baseName()));
+                    if (p.dirOf()->empty())
+                        return admitted.contains(*p.baseName());
                     return owner->isAllowed(original / p);
                 }
 
@@ -168,7 +167,7 @@ private:
     void anchor() override {};
 public:
     SharedSync<std::set<CanonPath>> allowedPrefixes;
-    boost::concurrent_flat_set<CanonPath> allowedPaths;
+    const std::unordered_set<CanonPath> allowedPaths;
 
     AllowListSourceAccessorImpl(
         ref<SourceAccessor> next,
@@ -177,7 +176,7 @@ public:
         MakeNotAllowedError && makeNotAllowedError)
         : AllowListSourceAccessor(SourcePath(next), std::move(makeNotAllowedError))
         , allowedPrefixes(allowedPrefixes.begin(), allowedPrefixes.end())
-        , allowedPaths(allowedPaths.begin(), allowedPaths.end())
+        , allowedPaths(allowedPaths)
     {
         /* Ancestor prefixes already admit every descendant prefix.  Keep
            just the minimal prefixes; CanonPath orders each subtree
@@ -193,8 +192,14 @@ public:
 
     bool isAllowed(const CanonPath & path) override
     {
-        /* Read lock is held for the duration of the full expression if the || doesn't short-circuit. */
-        return allowedPaths.contains(path) || path.isAllowed(*allowedPrefixes.readLock());
+        if (allowedPaths.contains(path))
+            return true;
+        /* Prefixes are minimal and each subtree is contiguous. The next
+           prefix can be at or below path; only the previous can contain it. */
+        auto prefixes = allowedPrefixes.readLock();
+        auto next = prefixes->lower_bound(path);
+        return (next != prefixes->end() && next->isWithin(path))
+               || (next != prefixes->begin() && path.isWithin(*std::prev(next)));
     }
 
     void allowPrefix(CanonPath prefix) override

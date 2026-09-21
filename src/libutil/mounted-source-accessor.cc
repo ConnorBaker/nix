@@ -47,7 +47,7 @@ public:
         if (auto st = accessor->maybeLstat(subpath))
             return st;
         /* A mount point below `path` implies the directories leading to it. */
-        if (!mountsBelow(path).empty())
+        if (hasMountBelow(path))
             return Stat{.type = tDirectory};
         return std::nullopt;
     }
@@ -55,7 +55,7 @@ public:
     Stat lstat(const CanonPath & path) override
     {
         auto [accessor, subpath] = resolve(path);
-        if (mountsBelow(path).empty())
+        if (!hasMountBelow(path))
             /* The resolved tree answers, and for a missing path raises its own
                error, which may say more than "does not exist" (an access
                control accessor says why). */
@@ -119,6 +119,16 @@ public:
     }
 
     /**
+     * Whether a mount lies strictly below `path`; no ordered list is needed.
+     */
+    bool hasMountBelow(const CanonPath & path)
+    {
+        bool below = false;
+        mounts.visit_all([&](const auto & kv) { below = below || (kv.first != path && kv.first.isWithin(path)); });
+        return below;
+    }
+
+    /**
      * The mounts whose mount point lies strictly below `path`, in path order.
      */
     std::vector<std::pair<CanonPath, ref<SourceAccessor>>> mountsBelow(const CanonPath & path)
@@ -150,7 +160,7 @@ public:
         mounts.emplace(std::move(mountPoint), std::move(accessor));
     }
 
-    std::shared_ptr<SourceAccessor> getMount(CanonPath mountPoint) override
+    std::shared_ptr<SourceAccessor> getMount(const CanonPath & mountPoint) override
     {
         if (auto res = getConcurrent(mounts, mountPoint))
             return *res;
@@ -160,7 +170,7 @@ public:
 
     std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
     {
-        if (!mountsBelow(path).empty())
+        if (hasMountBelow(path))
             return std::nullopt;
         auto [accessor, subpath] = resolve(path);
         return accessor->getKnownEntry(subpath);

@@ -18,6 +18,7 @@
 #include "nix/util/thread-pool.hh"
 
 #include <algorithm>
+#include <type_traits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -456,12 +457,13 @@ static BufferedRegularFile readBufferedRegular(
 
     std::string buffer;
     std::unique_ptr<RegularFileWriter> writer;
-    auto node = HashingVisitor{}.regular(path, [&](CreateRegularFileSink & hashing) {
+    auto readAndBuffer = [&](CreateRegularFileSink & hashing) {
         BufferThenStreamFile file{open, hashing, contents};
         read(file);
         buffer = std::move(file.buffer);
         writer = std::move(file.writer);
-    });
+    };
+    auto node = HashingVisitor{}.regular(path, std::ref(readAndBuffer));
     return {std::move(node), std::move(buffer), std::move(writer)};
 }
 
@@ -504,14 +506,14 @@ struct LinkingVisitor : ObjectStoreVisitor
         Frames saved;
 
         Scope(RestoreSink & sink, std::optional<std::string> diskName)
+            : saved{{&sink}, {}}
         {
-            auto & f = frames();
-            saved = std::move(f);
-            f.open.clear();
-            f.open.push_back(&sink);
-            f.diskNames.clear();
             if (diskName)
-                f.diskNames.push_back(std::move(*diskName));
+                saved.diskNames.push_back(std::move(*diskName));
+            /* Complete every allocating operation before replacing a
+               caller's frames, including when it helps a detached child. */
+            static_assert(std::is_nothrow_swappable_v<Frames>);
+            std::swap(saved, frames());
         }
 
         ~Scope()
@@ -691,9 +693,10 @@ struct MaterialisingVisitor : LinkingVisitor
 
     HashedNode directory(const CanonPath & path, Children children) override
     {
-        return LinkingVisitor::directory(path, [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
+        auto copy = [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
             copyChildren(path, std::move(children), each);
-        });
+        };
+        return LinkingVisitor::directory(path, std::ref(copy));
     }
 
     /* A directory's children visited, its subdirectories on a bounded pool
@@ -918,16 +921,18 @@ struct MaterialisingVisitor : LinkingVisitor
             auto file = objects.blobFile(entry.hash, false);
             if (!objects.holdBlob(entry.hash, false, materialisationHold))
                 return std::nullopt;
-            auto target = readFile(file);
-            if (merkle::blobId(target) != entry.hash) {
+            auto target = objects.readBlob(entry.hash, false);
+            if (!target)
+                return std::nullopt;
+            if (merkle::blobId(*target) != entry.hash) {
                 warn("blob object %s does not hash to its name; not used", PathFmt(file));
                 return std::nullopt;
             }
-            if (::symlinkat(requireCString(target), dirFd, name.rel_c_str()) == -1)
-                throw SysError("creating symlink from %1% -> '%2%'", PathFmt(where), target);
+            if (::symlinkat(requireCString(*target), dirFd, name.rel_c_str()) == -1)
+                throw SysError("creating symlink from %1% -> '%2%'", PathFmt(where), *target);
             if (hooks)
                 hooks->symlinkCreated(dirFd, name);
-            return merkle::nar::symlink(target.size());
+            return merkle::nar::symlink(target->size());
         }
 
         case merkle::Mode::Directory: {

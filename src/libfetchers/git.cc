@@ -568,9 +568,9 @@ struct GitInputScheme : InputScheme
            the URL (which is never a `file` URL). */
         std::variant<std::filesystem::path, ParsedURL> location;
 
-        /* Working directory info: the complete list of files, and
-           whether the working directory is dirty compared to HEAD. */
-        GitRepo::WorkdirInfo workdirInfo;
+        /* The shared membership/status snapshot for a worktree input;
+           absent for a commit input. It does not snapshot file contents. */
+        std::shared_ptr<const GitRepo::WorkdirInfo> workdirInfo;
 
         std::string locationToArg() const
         {
@@ -591,13 +591,11 @@ struct GitInputScheme : InputScheme
 
         void warnDirty(const Settings & settings) const
         {
-            if (workdirInfo.isDirty) {
-                if (!settings.allowDirty)
-                    throw Error("Git tree '%s' is dirty", locationToArg());
+            if (!settings.allowDirty)
+                throw Error("Git tree '%s' is dirty", locationToArg());
 
-                if (settings.warnDirty)
-                    warn("Git tree '%s' is dirty", locationToArg());
-            }
+            if (settings.warnDirty)
+                warn("Git tree '%s' is dirty", locationToArg());
         }
 
         std::string gitDir = ".git";
@@ -829,7 +827,7 @@ struct GitInputScheme : InputScheme
     std::pair<ref<SourceAccessor>, Input>
     getAccessorFromCommit(const Settings & settings, Store & store, RepoInfo & repoInfo, Input && input) const
     {
-        assert(!repoInfo.workdirInfo.isDirty);
+        assert(!repoInfo.workdirInfo);
 
         auto origRev = input.getRev();
 
@@ -1017,26 +1015,34 @@ struct GitInputScheme : InputScheme
     {
         auto repoPath = repoInfo.getPath().value();
 
-        /* Create mountpoints for the submodules. */
-        for (auto & submodule : repoInfo.workdirInfo.submodules)
-            repoInfo.workdirInfo.files.insert(submodule.path);
+        auto workdirInfo = repoInfo.workdirInfo;
+        assert(workdirInfo);
+        /* Only a view with submodules needs a modified membership set.
+           The cache keeps the original immutable status snapshot. */
+        if (!workdirInfo->submodules.empty()) {
+            auto withMounts = std::make_shared<GitRepo::WorkdirInfo>(*workdirInfo);
+            for (auto & submodule : withMounts->submodules)
+                withMounts->files.insert(submodule.path);
+            workdirInfo = std::move(withMounts);
+        }
+        bool isDirty = workdirInfo->isDirty;
 
         auto repo = GitRepo::openRepo(repoPath, {});
 
         auto exportIgnore = getExportIgnoreAttr(input);
 
         ref<SourceAccessor> accessor =
-            repo->getAccessor(repoInfo.workdirInfo, {.exportIgnore = exportIgnore}, makeNotAllowedError(repoPath));
+            repo->getAccessor(*workdirInfo, {.exportIgnore = exportIgnore}, makeNotAllowedError(repoPath));
 
         /* If the repo has submodules, return a mounted input accessor
            consisting of the accessor for the top-level repo and, per
            submodule, either its workdir accessor or an empty directory
            where getAccessorFromCommit() would produce one (submodules
            disabled, or a gitlink without a .gitmodules entry). */
-        if (!repoInfo.workdirInfo.submodules.empty()) {
+        if (!workdirInfo->submodules.empty()) {
             std::map<CanonPath, nix::ref<SourceAccessor>> mounts;
 
-            for (auto & submodule : repoInfo.workdirInfo.submodules) {
+            for (auto & submodule : workdirInfo->submodules) {
                 if (!getSubmodulesAttr(input) || submodule.url.empty()) {
                     mounts.insert_or_assign(submodule.path, makeEmptySourceAccessor());
                     continue;
@@ -1058,7 +1064,7 @@ struct GitInputScheme : InputScheme
                 /* If the submodule is dirty, mark this repo dirty as
                    well. */
                 if (!submoduleInput2.getRev())
-                    repoInfo.workdirInfo.isDirty = true;
+                    isDirty = true;
 
                 mounts.insert_or_assign(submodule.path, submoduleAccessor);
             }
@@ -1067,14 +1073,14 @@ struct GitInputScheme : InputScheme
             accessor = makeMountedSourceAccessor(std::move(mounts));
         }
 
-        if (!repoInfo.workdirInfo.isDirty) {
+        if (!isDirty) {
             auto repo = GitRepo::openRepo(repoPath, {});
 
             if (auto ref = repo->getWorkdirRef())
                 input.attrs.insert_or_assign("ref", *ref);
 
             /* Return a rev of 000... if there are no commits yet. */
-            auto rev = repoInfo.workdirInfo.headRev.value_or(nullRev);
+            auto rev = workdirInfo->headRev.value_or(nullRev);
 
             input.attrs.insert_or_assign("rev", rev.gitRev());
             if (!getShallowAttr(input)) {
@@ -1089,9 +1095,9 @@ struct GitInputScheme : InputScheme
         } else {
             repoInfo.warnDirty(settings);
 
-            if (repoInfo.workdirInfo.headRev) {
-                input.attrs.insert_or_assign("dirtyRev", repoInfo.workdirInfo.headRev->gitRev() + "-dirty");
-                input.attrs.insert_or_assign("dirtyShortRev", repoInfo.workdirInfo.headRev->gitShortRev() + "-dirty");
+            if (workdirInfo->headRev) {
+                input.attrs.insert_or_assign("dirtyRev", workdirInfo->headRev->gitRev() + "-dirty");
+                input.attrs.insert_or_assign("dirtyShortRev", workdirInfo->headRev->gitShortRev() + "-dirty");
             }
 
             verifyCommit(input, nullptr);
@@ -1099,8 +1105,7 @@ struct GitInputScheme : InputScheme
 
         input.attrs.insert_or_assign(
             "lastModified",
-            repoInfo.workdirInfo.headRev ? getLastModified(settings, repoInfo, repoPath, *repoInfo.workdirInfo.headRev)
-                                         : 0);
+            workdirInfo->headRev ? getLastModified(settings, repoInfo, repoPath, *workdirInfo->headRev) : 0);
 
         /* A revision returned as worktree metadata is not an identity for
            its rendered files. Git may ignore changed bytes or normalize

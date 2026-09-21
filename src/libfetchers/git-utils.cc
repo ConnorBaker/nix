@@ -2071,9 +2071,9 @@ ref<GitRepoPool> Settings::getTarballWriterPool() const
 
 } // namespace fetchers
 
-static Sync<std::map<std::filesystem::path, GitRepo::WorkdirInfo>> workdirInfoCache_;
+static Sync<std::map<std::filesystem::path, std::shared_ptr<const GitRepo::WorkdirInfo>>> workdirInfoCache_;
 
-GitRepo::WorkdirInfo GitRepo::getCachedWorkdirInfo(const std::filesystem::path & path)
+std::shared_ptr<const GitRepo::WorkdirInfo> GitRepo::getCachedWorkdirInfo(const std::filesystem::path & path)
 {
     auto & _cache = workdirInfoCache_;
     {
@@ -2082,7 +2082,7 @@ GitRepo::WorkdirInfo GitRepo::getCachedWorkdirInfo(const std::filesystem::path &
         if (i != cache->end())
             return i->second;
     }
-    auto workdirInfo = GitRepo::openRepo(path, {})->getWorkdirInfo();
+    auto workdirInfo = std::make_shared<const WorkdirInfo>(GitRepo::openRepo(path, {})->getWorkdirInfo());
     _cache.lock()->emplace(path, workdirInfo);
     return workdirInfo;
 }

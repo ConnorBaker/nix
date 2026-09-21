@@ -109,12 +109,14 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
 
         auto descend = [&]() -> Result {
             switch (st.type) {
-            case SourceAccessor::tRegular:
-                return v.regular(to, [&](CreateRegularFileSink & crf) {
+            case SourceAccessor::tRegular: {
+                auto read = [&](CreateRegularFileSink & crf) {
                     if (st.isExecutable)
                         crf.isExecutable();
                     acc.readFile(from, crf, [&](uint64_t size) { crf.preallocateContents(size); });
-                });
+                };
+                return v.regular(to, std::ref(read));
+            }
 
             case SourceAccessor::tSymlink:
                 return v.symlink(to, acc.readLink(from));
@@ -133,20 +135,20 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                    the scope must outlive every visit, and the only bound that
                    does is the directory node itself. */
                 std::optional<Result> result;
-                acc.readDirectoryWithEntries(
-                    from,
-                    [&](SourceAccessor & subdirAccessor,
-                        const CanonPath & subdirFrom,
-                        const SourceAccessor::DirEntries & entries) {
-                        auto unhacked = unhackedEntries(entries, acc, from);
-                        result = v.directory(to, [&](fun<void(std::string_view, bool, fun<Result()>)> each) {
-                            for (auto & [name, actual] : unhacked)
-                                if (filter.get_fn().target<AllPaths>() || filter((filterBase / name).abs()))
-                                    each(name, entries.at(actual) == SourceAccessor::tDirectory, [&] {
-                                        return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
-                                    });
-                        });
-                    });
+                auto directory = [&](SourceAccessor & subdirAccessor,
+                                     const CanonPath & subdirFrom,
+                                     const SourceAccessor::DirEntries & entries) {
+                    auto unhacked = unhackedEntries(entries, acc, from);
+                    auto children = [&](fun<void(std::string_view, bool, fun<Result()>)> each) {
+                        for (auto & [name, actual] : unhacked)
+                            if (filter.get_fn().target<AllPaths>() || filter((filterBase / name).abs()))
+                                each(name, entries.at(actual) == SourceAccessor::tDirectory, [&] {
+                                    return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
+                                });
+                    };
+                    result = v.directory(to, std::ref(children));
+                };
+                acc.readDirectoryWithEntries(from, std::ref(directory));
                 assert(result);
                 return std::move(*result);
             }

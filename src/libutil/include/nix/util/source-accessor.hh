@@ -157,7 +157,7 @@ public:
 
     typedef std::optional<Type> DirEntry;
 
-    typedef std::map<std::string, DirEntry> DirEntries;
+    typedef std::map<std::string, DirEntry, std::less<>> DirEntries;
 
     /**
      * @note Like `readFile`, this method should *not* follow symlinks.

@@ -9,6 +9,7 @@
 #include "nix/util/finally.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/signals.hh"
+#include "nix/util/source-accessor.hh"
 #include "nix/util/strings.hh"
 #include "nix/util/util.hh"
 
@@ -147,6 +148,47 @@ static bool isObjectName(std::string_view name)
            && name.find_first_not_of("0123456789abcdef") == std::string_view::npos;
 }
 
+/* An auxiliary address denotes a regular file's bytes. In particular, a
+   corrupt FIFO must neither block the sweep nor turn a source fallback into
+   a read from an unrelated stream; a symlink is not its target's bytes.
+   Size and bytes belong to this same opened inode, including during repair. */
+static std::optional<std::pair<AutoCloseFD, PosixStat>>
+openAuxiliary(const std::filesystem::path & file, std::optional<PosixStat> observed = std::nullopt)
+{
+    auto nonregular = [&] { return NotARegularFile("object %s is not a regular file!", PathFmt(file)); };
+    if (!observed)
+        observed = maybeLstat(file);
+    if (!observed)
+        return std::nullopt;
+    /* Avoid opening existing devices at all. Supported publishers only
+       replace auxiliaries with regular files; the opened-inode check also
+       rejects a nonregular replacement before any read. */
+    if (!S_ISREG(observed->st_mode))
+        throw nonregular();
+#ifdef _WIN32
+    auto fd = openFileReadonly(file, FinalSymlink::DontFollow);
+#else
+    AutoCloseFD fd{open(file.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
+#endif
+    if (!fd) {
+        NativeSysError error("opening object %s", PathFmt(file));
+        if (error.is(std::errc::no_such_file_or_directory) || error.is(std::errc::not_a_directory))
+            return std::nullopt;
+        /* Some nonregular kinds cannot be opened at all (a symlink with
+           O_NOFOLLOW, for example). Preserve other I/O errors. */
+        auto current = maybeLstat(file);
+        if (!current)
+            return std::nullopt;
+        if (!S_ISREG(current->st_mode))
+            throw nonregular();
+        throw error;
+    }
+    auto st = nix::fstat(fd.get());
+    if (!S_ISREG(st.st_mode))
+        throw nonregular();
+    return std::pair{std::move(fd), st};
+}
+
 void GitObjectStore::eachObjectFile(const std::filesystem::path & kindDir, fun<void(const std::filesystem::path &)> f)
 {
     auto kind = maybeLstat(kindDir);
@@ -195,31 +237,20 @@ bool GitObjectStore::verify(RepairFlag repair)
                     return std::nullopt;
                 if (!S_ISREG(st->st_mode))
                     return nonregular();
-#ifdef _WIN32
-                auto fd = openFileReadonly(object, FinalSymlink::DontFollow);
-#else
-                AutoCloseFD fd{open(object.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
-#endif
-                if (!fd) {
-                    NativeSysError error("opening object %s", PathFmt(object));
-                    if (error.is(std::errc::no_such_file_or_directory) || error.is(std::errc::not_a_directory))
-                        return std::nullopt;
-                    /* A nonregular replacement between lstat and open is
-                       corruption too, not an invitation to follow/read it. */
-                    auto current = maybeLstat(object);
-                    if (!current)
-                        return std::nullopt;
-                    if (!S_ISREG(current->st_mode))
-                        return nonregular();
-                    throw error;
-                }
-                auto opened = nix::fstat(fd.get());
-                if (!S_ISREG(opened.st_mode))
+                std::optional<std::pair<AutoCloseFD, PosixStat>> opened;
+                try {
+                    opened = openAuxiliary(object, st);
+                } catch (NotARegularFile &) {
                     return nonregular();
+                }
+                if (!opened)
+                    return std::nullopt;
+                auto & [fd, metadata] = *opened;
                 auto actual = [&] {
                     if (tree)
-                        return merkle::treeId(readFile(fd.get()));
-                    merkle::BlobHasher hasher{static_cast<uint64_t>(opened.st_size)};
+                        return merkle::treeId(
+                            drainFD(fd.get(), {.size = static_cast<size_t>(metadata.st_size), .expected = false}));
+                    merkle::BlobHasher hasher{static_cast<uint64_t>(metadata.st_size)};
                     drainFD(fd.get(), hasher);
                     return hasher.finish();
                 }();
@@ -1275,15 +1306,18 @@ std::optional<std::string> GitObjectStore::readTree(const Hash & id) const
 {
     if (counters)
         counters->treesRead++;
-    auto file = treeFile(id);
-    auto fd = openFileReadonly(file);
-    if (!fd) {
-        NativeSysError error("opening tree object %s", PathFmt(file));
-        if (error.is(std::errc::no_such_file_or_directory) || error.is(std::errc::not_a_directory))
-            return std::nullopt;
-        throw error;
-    }
-    return readFile(fd.get());
+    auto opened = openAuxiliary(treeFile(id));
+    if (!opened)
+        return std::nullopt;
+    return drainFD(opened->first.get(), {.size = static_cast<size_t>(opened->second.st_size), .expected = false});
+}
+
+std::optional<std::string> GitObjectStore::readBlob(const Hash & id, bool executable) const
+{
+    auto opened = openAuxiliary(blobFile(id, executable));
+    if (!opened)
+        return std::nullopt;
+    return drainFD(opened->first.get(), {.size = static_cast<size_t>(opened->second.st_size), .expected = false});
 }
 
 merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view body)
@@ -1317,7 +1351,13 @@ merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view bod
 
 std::optional<merkle::Tree> GitObjectStore::readVerifiedTree(const Hash & id) const
 {
-    auto body = readTree(id);
+    std::optional<std::string> body;
+    try {
+        body = readTree(id);
+    } catch (NotARegularFile & e) {
+        warn("%s; not used\nYou should run `nix-store --verify --check-contents --repair` to fix it", e.msg());
+        return std::nullopt;
+    }
     if (!body)
         return std::nullopt;
     if (merkle::treeId(*body) != id) {
@@ -1510,7 +1550,14 @@ GitObjectStore::sweep(fun<uint64_t(fun<void(const ObjectHash &)>)> forEachLiveOb
             auto key = idString(id);
             if (!reachable.insert(key).second)
                 continue;
-            auto body = readTree(id);
+            std::optional<std::string> body;
+            try {
+                body = readTree(id);
+            } catch (NotARegularFile & e) {
+                warn("%s", e.msg());
+                stats.corruptTrees++;
+                continue;
+            }
             if (!body) {
                 /* No tree of that name.  A tree a present tree names is a
                    missing subtree (`missingSubtrees`).  A plain file's

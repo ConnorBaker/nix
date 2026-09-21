@@ -30,7 +30,6 @@ static void appendDigits(std::string & out, uint64_t value)
 void feedHeader(Sink & sink, std::string_view kind, uint64_t size)
 {
     std::string header;
-    header.reserve(kind.size() + 24);
     header += kind;
     header += ' ';
     appendDigits<10>(header, size);

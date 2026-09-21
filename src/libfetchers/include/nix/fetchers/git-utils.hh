@@ -3,6 +3,8 @@
 #include "nix/fetchers/filtering-source-accessor.hh"
 #include "nix/fetchers/merkle-tar-adapter.hh"
 
+#include <memory>
+
 namespace nix {
 
 namespace fetchers {
@@ -96,7 +98,9 @@ struct GitRepo
 
     virtual WorkdirInfo getWorkdirInfo() = 0;
 
-    static WorkdirInfo getCachedWorkdirInfo(const std::filesystem::path & path);
+    /* Immutable membership/status observation, shared until invalidation.
+       Existing holders retain that observation after the cache is cleared. */
+    static std::shared_ptr<const WorkdirInfo> getCachedWorkdirInfo(const std::filesystem::path & path);
 
     /* Drop all entries from the getCachedWorkdirInfo() cache. */
     static void invalidateWorkdirInfoCache();

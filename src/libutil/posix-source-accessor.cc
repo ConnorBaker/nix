@@ -290,8 +290,6 @@ private:
      */
     OpenedParent openParent(const CanonPath & path);
 
-    std::function<void(AutoCloseFD, CanonPath)> makeDirFdCallback();
-
     AutoCloseFD openSubdirectory(const CanonPath & path);
 
 public:
@@ -369,17 +367,6 @@ public:
     }
 };
 
-std::function<void(AutoCloseFD, CanonPath)> PosixDirectorySourceAccessor::makeDirFdCallback()
-{
-    if (!dirFdCache)
-        return nullptr;
-
-    return [this](AutoCloseFD fd, CanonPath key) {
-        assert(fd);
-        insertIntoDirFdCache(std::move(key), make_ref<AutoCloseFD>(std::move(fd)));
-    };
-}
-
 PosixDirectorySourceAccessor::OpenedParent PosixDirectorySourceAccessor::openParent(const CanonPath & path)
 {
     assert(!path.isRoot());
@@ -417,16 +404,17 @@ PosixDirectorySourceAccessor::OpenedParent PosixDirectorySourceAccessor::openPar
     Descriptor startFd = intermediateParentFd ? intermediateParentFd->get() : dirFd;
     CanonPath relPath = intermediateParentFd ? parent.removePrefix(anchor) : parent;
 
+    /* The fallback reports directories synchronously. Borrow its anchor:
+       openat2 does not use this callback, and needs no copied path or
+       heap-owned closure just to attempt the lookup. */
+    auto cacheDirectory = [&](AutoCloseFD fd, CanonPath relKey) {
+        assert(fd);
+        insertIntoDirFdCache(
+            anchor.isRoot() ? std::move(relKey) : anchor / relKey, make_ref<AutoCloseFD>(std::move(fd)));
+    };
     std::function<void(AutoCloseFD, CanonPath)> cb;
-    if (auto base = makeDirFdCallback()) {
-        if (intermediateParentFd) {
-            cb = [base = std::move(base), prefix = anchor](AutoCloseFD fd, CanonPath relKey) {
-                base(std::move(fd), prefix / relKey);
-            };
-        } else {
-            cb = std::move(base);
-        }
-    }
+    if (dirFdCache)
+        cb = std::ref(cacheDirectory);
 
     try {
         AutoCloseFD parentFdOwning = openFileEnsureBeneathNoSymlinks(
@@ -443,6 +431,10 @@ PosixDirectorySourceAccessor::OpenedParent PosixDirectorySourceAccessor::openPar
                 O_DIRECTORY | O_CLOEXEC,
             0,
             std::move(cb));
+        /* A failed lookup owns no descriptor. Preserve its errno without
+           allocating an owner for the invalid descriptor. */
+        if (!parentFdOwning)
+            return {INVALID_DESCRIPTOR, nullptr, std::move(parent)};
         return {parentFdOwning.get(), make_ref<AutoCloseFD>(std::move(parentFdOwning)), std::move(parent)};
     } catch (SymlinkNotAllowed & e) {
         /* Need to fixup the error message to include the actual path relative to the (possibly) cached fd. */

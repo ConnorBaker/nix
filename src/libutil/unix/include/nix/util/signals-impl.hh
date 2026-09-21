@@ -14,6 +14,7 @@
 #include "nix/util/error.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/ansicolor.hh"
+#include "nix/util/sync.hh"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -25,6 +26,7 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <map>
 #include <sstream>
 #include <optional>
@@ -100,14 +102,37 @@ inline void checkInterrupt()
  */
 struct ReceiveInterrupts
 {
-    pthread_t target;
+    std::shared_ptr<Sync<std::optional<pthread_t>>> target;
     std::unique_ptr<InterruptCallback> callback;
 
+    /* A dispatcher may have copied the callback before unregistration.
+       Its target is usable only while this scope still lends the thread. */
+    fun<void()> makeCallback() const
+    {
+        return [target = target]() {
+            auto thread = target->lock();
+            if (*thread)
+                pthread_kill(**thread, NIX_SIG_MULTI_INT);
+        };
+    }
+
     ReceiveInterrupts()
-        : target(pthread_self())
-        , callback(createInterruptCallback([&]() { pthread_kill(target, NIX_SIG_MULTI_INT); }))
+        : target(std::make_shared<Sync<std::optional<pthread_t>>>(pthread_self()))
+        , callback(createInterruptCallback(makeCallback()))
     {
     }
+
+    ~ReceiveInterrupts()
+    {
+        /* Wait for an in-flight delivery before the target can exit. Drop
+           this lock before callback's destructor takes the registry lock. */
+        target->lock()->reset();
+    }
+
+    ReceiveInterrupts(const ReceiveInterrupts &) = delete;
+    ReceiveInterrupts(ReceiveInterrupts &&) = delete;
+    ReceiveInterrupts & operator=(const ReceiveInterrupts &) = delete;
+    ReceiveInterrupts & operator=(ReceiveInterrupts &&) = delete;
 };
 
 } // namespace nix

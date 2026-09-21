@@ -5,6 +5,7 @@
 #include "nix/util/hash.hh"
 #include "nix/fetchers/cache.hh"
 #include "nix/fetchers/fetch-settings.hh"
+#include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/merkle-files.hh"
 #include "nix/util/nar-accessor.hh"
@@ -1063,6 +1064,146 @@ TEST_F(GitUtilsTest, workdirReadsAndNamesItsFilesystemView)
     write("dirty/c", "C");
     EXPECT_EQ(workdir->readFile(CanonPath("clean/a")), "A");
     EXPECT_EQ(workdir->readFile(CanonPath("dirty/c")), "C");
+}
+
+TEST_F(GitUtilsTest, cachedWorkdirSnapshotsStayImmutableAcrossRenderingAndInvalidation)
+{
+    nix::initLibStore(/*loadConfig=*/false);
+    auto store = openStore("dummy://?read-only=false");
+    Settings settings;
+    settings.warnDirty = false;
+    Finally clearCache{[] { GitRepo::invalidateWorkdirInfoCache(); }};
+    for (bool submodule : {false, true})
+        for (bool initiallyDirty : {false, true}) {
+            SCOPED_TRACE(fmt("submodule=%d initiallyDirty=%d", submodule, initiallyDirty));
+            auto repoPath = tmpDir / fmt("snapshot-%d-%d", submodule, initiallyDirty);
+            GitRepo::openRepo(repoPath, {.create = true});
+            git_repository * rawRepo = nullptr;
+            ASSERT_EQ(git_repository_open(&rawRepo, repoPath.string().c_str()), 0);
+            Finally closeRepo{[&] { git_repository_free(rawRepo); }};
+            writeFile(repoPath / "file", "original");
+            auto rev = commitPaths(rawRepo, {"file"}, "initial");
+            if (submodule) {
+                git_index * index = nullptr;
+                ASSERT_EQ(git_repository_index(&index, rawRepo), 0);
+                Finally closeIndex{[&] { git_index_free(index); }};
+                git_index_entry entry{};
+                entry.mode = GIT_FILEMODE_COMMIT;
+                entry.path = "module";
+                ASSERT_EQ(git_oid_fromstr(&entry.id, rev.gitRev().c_str()), 0);
+                ASSERT_EQ(git_index_add(index, &entry), 0);
+                ASSERT_EQ(git_index_write(index), 0);
+                rev = commitPaths(rawRepo, {}, "gitlink");
+            }
+            if (initiallyDirty)
+                writeFile(repoPath / "file", "changed bytes");
+
+            GitRepo::invalidateWorkdirInfoCache();
+            auto first = GitRepo::getCachedWorkdirInfo(repoPath);
+            EXPECT_EQ(first, GitRepo::getCachedWorkdirInfo(repoPath));
+            EXPECT_EQ(first->isDirty, initiallyDirty);
+            EXPECT_EQ(first->headRev, rev);
+            EXPECT_EQ(first->submodules.size(), submodule ? 1u : 0u);
+            EXPECT_EQ(first->files, (std::set<CanonPath>{CanonPath("file")}));
+
+            auto input = Input::fromAttrs({
+                {"type", "git"},
+                {"url", repoPath.string()},
+                {"shallow", Explicit{true}},
+            });
+            auto [accessor, resolved] = input.getAccessor(settings, *store);
+            EXPECT_EQ(resolved.getRev().has_value(), !initiallyDirty);
+            EXPECT_FALSE(resolved.getFingerprint(*store));
+            if (submodule) {
+                EXPECT_TRUE(accessor->pathExists(CanonPath("module")));
+                EXPECT_TRUE(accessor->readDirectory(CanonPath("module")).empty());
+            }
+            /* Adding mount prefixes belongs to the rendered view, never
+               to the cached status snapshot shared by another caller. */
+            EXPECT_EQ(first->files, (std::set<CanonPath>{CanonPath("file")}));
+            EXPECT_EQ(first, GitRepo::getCachedWorkdirInfo(repoPath));
+
+            auto nextContents = initiallyDirty ? "original" : "changed bytes";
+            writeFile(repoPath / "file", nextContents);
+            EXPECT_EQ(accessor->readFile(CanonPath("file")), nextContents);
+            EXPECT_EQ(GitRepo::getCachedWorkdirInfo(repoPath)->isDirty, initiallyDirty);
+            GitRepo::invalidateWorkdirInfoCache();
+            auto second = GitRepo::getCachedWorkdirInfo(repoPath);
+            EXPECT_NE(second, first);
+            EXPECT_EQ(second, GitRepo::getCachedWorkdirInfo(repoPath));
+            EXPECT_EQ(second->isDirty, !initiallyDirty);
+            EXPECT_EQ(first->isDirty, initiallyDirty);
+            EXPECT_EQ(first->files, second->files);
+            EXPECT_EQ(first->headRev, second->headRev);
+            auto [after, afterInput] = input.getAccessor(settings, *store);
+            EXPECT_EQ(afterInput.getRev().has_value(), initiallyDirty);
+            EXPECT_EQ(after->readFile(CanonPath("file")), nextContents);
+        }
+}
+
+TEST_F(GitUtilsTest, submoduleDirtinessBelongsToTheRenderedWorkdir)
+{
+    nix::initLibStore(/*loadConfig=*/false);
+    auto store = openStore("dummy://?read-only=false");
+    Settings settings;
+    settings.warnDirty = false;
+    Finally clearCache{[] { GitRepo::invalidateWorkdirInfoCache(); }};
+    auto subdir = tmpDir / "module";
+    GitRepo::openRepo(subdir, {.create = true});
+    git_repository * rawChild = nullptr;
+    ASSERT_EQ(git_repository_open(&rawChild, subdir.string().c_str()), 0);
+    Finally closeChild{[&] { git_repository_free(rawChild); }};
+    writeFile(subdir / "file", "original");
+    auto childRev = commitPaths(rawChild, {"file"}, "child");
+
+    git_repository * rawParent = nullptr;
+    ASSERT_EQ(git_repository_open(&rawParent, tmpDir.string().c_str()), 0);
+    Finally closeParent{[&] { git_repository_free(rawParent); }};
+    write("file", "original");
+    write(".gitmodules", "[submodule \"module\"]\npath = module\nurl = ./module\n");
+    git_index * index = nullptr;
+    ASSERT_EQ(git_repository_index(&index, rawParent), 0);
+    Finally closeIndex{[&] { git_index_free(index); }};
+    git_index_entry entry{};
+    entry.mode = GIT_FILEMODE_COMMIT;
+    entry.path = "module";
+    ASSERT_EQ(git_oid_fromstr(&entry.id, childRev.gitRev().c_str()), 0);
+    ASSERT_EQ(git_index_add(index, &entry), 0);
+    ASSERT_EQ(git_index_write(index), 0);
+    commitPaths(rawParent, {"file", ".gitmodules"}, "parent");
+
+    for (bool parentDirty : {false, true})
+        for (bool childDirty : {false, true}) {
+            write("file", parentDirty ? "changed parent" : "original");
+            writeFile(subdir / "file", childDirty ? "changed child" : "original");
+            GitRepo::invalidateWorkdirInfoCache();
+            auto snapshot = GitRepo::getCachedWorkdirInfo(tmpDir);
+            ASSERT_EQ(snapshot->isDirty, parentDirty);
+            ASSERT_EQ(snapshot->submodules.size(), 1u);
+            ASSERT_FALSE(snapshot->files.contains(CanonPath("module")));
+            /* Render the enabled view first: its child's dirtiness must
+               not change the snapshot used by the disabled view. */
+            for (bool enabled : {true, false}) {
+                SCOPED_TRACE(fmt("parent=%d child=%d enabled=%d", parentDirty, childDirty, enabled));
+                auto input = Input::fromAttrs({
+                    {"type", "git"},
+                    {"url", tmpDir.string()},
+                    {"shallow", Explicit{true}},
+                    {"submodules", Explicit{enabled}},
+                });
+                auto [accessor, resolved] = input.getAccessor(settings, *store);
+                EXPECT_EQ(resolved.getRev().has_value(), !(parentDirty || (enabled && childDirty)));
+                EXPECT_FALSE(resolved.getFingerprint(*store));
+                if (enabled) {
+                    EXPECT_EQ(accessor->readFile(CanonPath("module/file")), childDirty ? "changed child" : "original");
+                } else {
+                    EXPECT_TRUE(accessor->readDirectory(CanonPath("module")).empty());
+                }
+                EXPECT_EQ(snapshot, GitRepo::getCachedWorkdirInfo(tmpDir));
+                EXPECT_EQ(snapshot->isDirty, parentDirty);
+                EXPECT_FALSE(snapshot->files.contains(CanonPath("module")));
+            }
+        }
 }
 
 TEST_F(GitUtilsTest, workdirIndexFlagsDoNotChangeItsContents)

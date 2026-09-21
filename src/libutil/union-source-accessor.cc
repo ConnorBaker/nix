@@ -64,25 +64,26 @@ public:
     /**
      * The child whose node `path` denotes in the union, with that node; or
      * nothing if `path` is not in the union.
+     * Children are borrowed from the fixed owning vector during this call.
      */
-    std::optional<std::pair<ref<SourceAccessor>, Stat>> owner(const CanonPath & path)
+    std::optional<std::pair<SourceAccessor *, Stat>> owner(const CanonPath & path)
     {
         for (size_t i = 0; i < accessors.size(); ++i) {
             if (auto st = node(*accessors[i], path)) {
                 if (hides(i, path))
                     return std::nullopt;
-                return std::pair{accessors[i], *st};
+                return std::pair{&*accessors[i], *st};
             }
         }
         return std::nullopt;
     }
 
-    ref<SourceAccessor> requireOwner(const CanonPath & path)
+    SourceAccessor & requireOwner(const CanonPath & path)
     {
         auto o = owner(path);
         if (!o)
             throw FileNotFound("path '%s' does not exist", showPath(path));
-        return o->first;
+        return *o->first;
     }
 
     /**
@@ -92,15 +93,15 @@ public:
      * own it; a later child's non-directory at `path` or at an ancestor is
      * hidden by `own`'s directories.
      */
-    std::vector<ref<SourceAccessor>> laterDirectories(const CanonPath & path, const SourceAccessor & own)
+    std::vector<SourceAccessor *> laterDirectories(const CanonPath & path, const SourceAccessor & own)
     {
-        std::vector<ref<SourceAccessor>> res;
+        std::vector<SourceAccessor *> res;
         bool after = false;
         for (auto & accessor : accessors) {
             if (after) {
                 auto st = node(*accessor, path);
                 if (st && st->type == tDirectory)
-                    res.push_back(accessor);
+                    res.push_back(&*accessor);
             } else if (*accessor == own)
                 after = true;
         }
@@ -109,7 +110,7 @@ public:
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
-        requireOwner(path)->readFile(path, sink, sizeCallback);
+        requireOwner(path).readFile(path, sink, sizeCallback);
     }
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
@@ -137,7 +138,7 @@ public:
 
     std::string readLink(const CanonPath & path) override
     {
-        return requireOwner(path)->readLink(path);
+        return requireOwner(path).readLink(path);
     }
 
     std::string showPath(const CanonPath & path) override
@@ -172,7 +173,7 @@ public:
         if (!o)
             return {path, std::nullopt};
         auto & [own, st] = *o;
-        auto later = st.type == tDirectory ? laterDirectories(path, *own) : std::vector<ref<SourceAccessor>>{};
+        auto later = st.type == tDirectory ? laterDirectories(path, *own) : std::vector<SourceAccessor *>{};
         if (later.empty())
             /* The subtree here is one child's alone. */
             return own->getFingerprint(path);

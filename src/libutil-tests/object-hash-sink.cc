@@ -88,63 +88,89 @@ TEST(ObjectHashSink, complex_tree_matches_reference_and_nar_length)
 
 TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
 {
-    /* Three children: each succeeds, fails while reading, or fails while
-       folding. Enumerate every assignment and every advisory scheduling
-       mask, including unknown directory types (the all-inline mask). */
+    /* Zero through three children: each succeeds, fails while reading, or
+       fails while folding. Enumerate every assignment and every advisory
+       scheduling mask, including unknown types (the all-inline mask). */
     size_t cases = 0;
     for (size_t workers = 1; workers <= 8; ++workers) {
         CopyPool pool(workers);
-        for (unsigned mask = 0; mask < 8; ++mask)
-            for (unsigned outcomes = 0; outcomes < 27; ++outcomes) {
-                SCOPED_TRACE(fmt("workers=%d mask=%d outcomes=%d", workers, mask, outcomes));
-                std::array<unsigned, 3> outcome;
-                auto rest = outcomes;
-                for (auto & value : outcome) {
-                    value = rest % 3;
-                    rest /= 3;
-                }
-                std::atomic<unsigned> active{0}, started{0}, completed{0};
-                std::vector<size_t> consumed;
-                std::string failure;
-                try {
-                    pool.ordered(
-                        3,
-                        [&](size_t i) { return mask & (1u << i); },
-                        [&](size_t i, bool) {
-                            ++active;
-                            ++started;
-                            Finally done{[&] {
-                                --active;
-                                ++completed;
-                            }};
-                            if (outcome[i] == 1)
-                                throw std::runtime_error(fmt("read-%d", i));
-                        },
-                        [&](size_t i) {
-                            if (outcome[i] == 2)
-                                throw std::runtime_error(fmt("fold-%d", i));
-                            consumed.push_back(i);
-                        });
-                } catch (const std::runtime_error & e) {
-                    failure = e.what();
-                }
-                std::vector<size_t> expected;
-                std::string expectedFailure;
-                for (size_t i = 0; i < outcome.size(); ++i) {
-                    if (outcome[i]) {
-                        expectedFailure = fmt("%s-%d", outcome[i] == 1 ? "read" : "fold", i);
-                        break;
+        for (size_t count = 0; count <= 3; ++count)
+            for (unsigned mask = 0; mask < (1u << count); ++mask)
+                for (unsigned outcomes = 0; outcomes < std::array<unsigned, 4>{1, 3, 9, 27}[count]; ++outcomes) {
+                    SCOPED_TRACE(fmt("workers=%d count=%d mask=%d outcomes=%d", workers, count, mask, outcomes));
+                    std::array<unsigned, 3> outcome;
+                    auto rest = outcomes;
+                    for (auto & value : outcome) {
+                        value = rest % 3;
+                        rest /= 3;
                     }
-                    expected.push_back(i);
+                    std::atomic<unsigned> active{0}, started{0}, completed{0};
+                    std::vector<size_t> consumed;
+                    std::vector<std::string> baseCaseTrace;
+                    auto caller = std::this_thread::get_id();
+                    bool baseCaseOnCaller = true;
+                    std::string failure;
+                    try {
+                        pool.ordered(
+                            count,
+                            [&](size_t i) {
+                                if (count < 2)
+                                    baseCaseTrace.push_back("canFork");
+                                return mask & (1u << i);
+                            },
+                            [&](size_t i, bool detached) {
+                                if (count < 2) {
+                                    baseCaseTrace.push_back(detached ? "run-detached" : "run-inline");
+                                    baseCaseOnCaller = std::this_thread::get_id() == caller;
+                                }
+                                ++active;
+                                ++started;
+                                Finally done{[&] {
+                                    --active;
+                                    ++completed;
+                                }};
+                                if (outcome[i] == 1)
+                                    throw std::runtime_error(fmt("read-%d", i));
+                            },
+                            [&](size_t i) {
+                                if (count < 2) {
+                                    baseCaseTrace.push_back("consume");
+                                    baseCaseOnCaller &= std::this_thread::get_id() == caller;
+                                }
+                                if (outcome[i] == 2)
+                                    throw std::runtime_error(fmt("fold-%d", i));
+                                consumed.push_back(i);
+                            });
+                    } catch (const std::runtime_error & e) {
+                        failure = e.what();
+                    }
+                    std::vector<size_t> expected;
+                    std::string expectedFailure;
+                    for (size_t i = 0; i < count; ++i) {
+                        if (outcome[i]) {
+                            expectedFailure = fmt("%s-%d", outcome[i] == 1 ? "read" : "fold", i);
+                            break;
+                        }
+                        expected.push_back(i);
+                    }
+                    EXPECT_EQ(failure, expectedFailure);
+                    EXPECT_EQ(consumed, expected);
+                    EXPECT_EQ(active.load(), 0u);
+                    EXPECT_EQ(started.load(), completed.load());
+                    if (count < 2) {
+                        std::vector<std::string> expectedTrace;
+                        if (count) {
+                            expectedTrace.push_back("run-inline");
+                            if (outcome[0] != 1)
+                                expectedTrace.push_back("consume");
+                        }
+                        EXPECT_EQ(baseCaseTrace, expectedTrace);
+                        EXPECT_TRUE(baseCaseOnCaller);
+                    }
+                    ++cases;
                 }
-                EXPECT_EQ(failure, expectedFailure);
-                EXPECT_EQ(consumed, expected);
-                EXPECT_EQ(active.load(), 0u);
-                EXPECT_EQ(started.load(), completed.load());
-                ++cases;
-            }
     }
-    EXPECT_EQ(cases, 1728u);
+    EXPECT_EQ(cases, 2072u);
 }
 
 TEST(CopyPool, nestedScopesJoinBeforeReturning)

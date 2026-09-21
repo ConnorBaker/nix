@@ -103,6 +103,14 @@ void CopyPool::wait(std::future<void> & result, const void * group)
 
 void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t, bool)> run, fun<void(size_t)> consume)
 {
+    if (count < 2) {
+        if (count) {
+            run(0, false);
+            consume(0);
+        }
+        return;
+    }
+
     struct Child
     {
         std::future<void> running;
@@ -114,7 +122,7 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
     try {
         for (size_t i = 0; i < count; ++i) {
             auto & child = children[i];
-            if (count > 1 && canFork(i))
+            if (canFork(i))
                 child.running = tryAsync(&children, [&, i] { run(i, true); });
             if (!child.running.valid())
                 try {
