@@ -68,7 +68,6 @@ headers = [ config_pub_h ] + files(
   'mounted-source-accessor.hh',
   'muxable-pipe.hh',
   'nar-accessor.hh',
-  'nested-work-pool.hh',
   'nar-cache.hh',
   'nar-listing.hh',
   'object-hash-sink.hh',

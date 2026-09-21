@@ -418,7 +418,7 @@ TEST_F(FetchToStoreLocalTest, pathInputsPreserveTheTreeForEveryStoreStateAndWidt
     auto features = savedFeatures;
     features.insert(Xp::Flakes);
     experimentalFeatureSettings.experimentalFeatures = features;
-    auto inputDir = tempStoreDir.path() / "capture-source";
+    auto inputDir = tempStoreDir.path() / "path-source";
     createDirs(inputDir / "empty");
     for (size_t i = 0; i < 16; ++i) {
         auto dir = inputDir / fmt("nested/d%d", i);

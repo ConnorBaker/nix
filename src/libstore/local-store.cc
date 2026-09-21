@@ -472,31 +472,28 @@ LocalStore::LocalStore(ref<const Config> config)
         blobRows = BlobRows::NoRows;
     blobIndex.lookup = [this](const Hash & id, bool executable) -> std::optional<GitObjectStore::Holder> {
         return retrySQLite<std::optional<GitObjectStore::Holder>>([&]() -> std::optional<GitObjectStore::Holder> {
-            auto query = [&](SQLiteStmt & statement) -> std::optional<GitObjectStore::Holder> {
-                auto use(statement.use());
-                /* The identifier is a 32-byte blob, not its hexadecimal: half
-                   the key bytes, so half the b-tree pages and half the
-                   comparisons (`05` section 6, the scale tables). */
-                use.apply(id.hash, id.hashSize).apply(int64_t(executable ? 1 : 0));
-                if (!use.next())
-                    return std::nullopt;
-                GitObjectStore::Holder holder{
-                    .ino = static_cast<ino_t>(use.getInt(0)),
-                    .dev = static_cast<dev_t>(use.getInt(1)),
-                    .size = static_cast<uint64_t>(use.getInt(2)),
-                    /* The column holds the *logical* store path; the holder is
-                       a file on disk under the real store directory. */
-                    .file = (getRealStoreDir() / std::filesystem::path(use.getStr(3)).filename()).string(),
-                };
-                auto name = use.getStr(4);
-                if (!name.empty()) {
-                    holder.file += '/';
-                    holder.file += name;
-                }
-                return holder;
-            };
             auto state(_state->lock());
-            return query(state->stmts->LookupBlob);
+            auto use(state->stmts->LookupBlob.use());
+            /* The identifier is a 32-byte blob, not its hexadecimal: half
+               the key bytes, so half the b-tree pages and half the
+               comparisons (`05` section 6, the scale tables). */
+            use.apply(id.hash, id.hashSize).apply(int64_t(executable ? 1 : 0));
+            if (!use.next())
+                return std::nullopt;
+            GitObjectStore::Holder holder{
+                .ino = static_cast<ino_t>(use.getInt(0)),
+                .dev = static_cast<dev_t>(use.getInt(1)),
+                .size = static_cast<uint64_t>(use.getInt(2)),
+                /* The column holds the *logical* store path; the holder is
+                   a file on disk under the real store directory. */
+                .file = (getRealStoreDir() / std::filesystem::path(use.getStr(3)).filename()).string(),
+            };
+            auto name = use.getStr(4);
+            if (!name.empty()) {
+                holder.file += '/';
+                holder.file += name;
+            }
+            return holder;
         });
     };
     blobIndex.forget = [this](const Hash & id, bool executable) {

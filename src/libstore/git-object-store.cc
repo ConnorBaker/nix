@@ -544,8 +544,10 @@ std::filesystem::path GitObjectStore::Hold::linkFor(const std::filesystem::path 
     /* Keep the hold's layout sharded too: a full source can hold tens of
        thousands of trees. Its one lock protects the entire hierarchy,
        and both normal release and the stale-hold sweep remove it recursively. */
-    auto shard = object.parent_path().filename();
-    auto kind = object.parent_path().parent_path().filename();
+    auto part = object.end();
+    auto name = *--part;
+    auto shard = *--part;
+    auto kind = *--part;
     auto parent = dir / kind / shard;
     auto shardName = shard.string();
     assert(isShardName(shardName));
@@ -558,7 +560,7 @@ std::filesystem::path GitObjectStore::Hold::linkFor(const std::filesystem::path 
     else
         assert(kind == "blobs");
     std::call_once(pending->auxiliaryShards[n], [&] { createDirs(parent); });
-    return parent / object.filename();
+    return parent / name;
 }
 
 GitObjectStore::Hold GitObjectStore::hold() const
@@ -572,9 +574,9 @@ GitObjectStore::Hold GitObjectStore::hold() const
    directory index) leaves the object unheld and says so: what a
    concurrent sweep may then take, the verifier reports and `--optimise`
    re-enters, as before the hold existed. */
-static bool holdObject(const std::filesystem::path & object, const GitObjectStore::Hold & hold)
+static bool holdObject(const std::filesystem::path & object, const std::filesystem::path & held)
 {
-    auto ec = hardLink(object, hold.linkFor(object));
+    auto ec = hardLink(object, held);
     if (!ec || ec == std::errc::file_exists)
         return true;
     if (ec == std::errc::no_such_file_or_directory)
@@ -583,8 +585,12 @@ static bool holdObject(const std::filesystem::path & object, const GitObjectStor
         printInfo("cannot hold object %s: %s", PathFmt(object), ec.message());
         return true;
     }
-    throw Error(
-        "creating hard link from %1% to %2%: %3%", PathFmt(object), PathFmt(hold.linkFor(object)), ec.message());
+    throw Error("creating hard link from %1% to %2%: %3%", PathFmt(object), PathFmt(held), ec.message());
+}
+
+static bool holdObject(const std::filesystem::path & object, const GitObjectStore::Hold & hold)
+{
+    return holdObject(object, hold.linkFor(object));
 }
 
 #ifndef _WIN32
@@ -869,7 +875,6 @@ void GitObjectStore::enterWritten(
    an existing file is held before it is trusted, and one the sweep took
    between the look and the link is written afresh. */
 static void writeObjectFile(
-    const std::filesystem::path & tmp,
     const std::filesystem::path & dst,
     std::string_view bytes,
     bool executable,
@@ -877,6 +882,14 @@ static void writeObjectFile(
     const GitObjectStore::Hold & hold,
     const std::function<void(const std::filesystem::path &)> & atFsync)
 {
+    auto held = hold.linkFor(dst);
+    /* This name belongs to an already unique, locked hold. Its lifetime
+       is the hold's, so it needs neither the global temporaries' timestamp
+       nor their process ID. Own-row views of a hold share this process-wide
+       sequence. Reuse the resolved hold path throughout publication. */
+    static std::atomic<uint64_t> counter{0};
+    auto tmp = held;
+    tmp += fmt(".tmp-%d", counter.fetch_add(1, std::memory_order_relaxed));
     bool published = false;
     Finally removeTmp{[&] {
         if (published)
@@ -891,7 +904,7 @@ static void writeObjectFile(
        hold it; the sweep taking it between our look and our link, to
        write it. */
     for (int attempt = 0; attempt < 3; attempt++) {
-        if (holdObject(dst, hold))
+        if (holdObject(dst, held))
             return;
         {
             mode_t mode = executable ? 0755 : 0644;
@@ -948,16 +961,12 @@ static void writeObjectFile(
 
 void GitObjectStore::putBlob(const Hash & id, bool executable, std::string_view bytes, const Hold & hold)
 {
-    auto dst = blobFile(id, executable);
-    auto tmp = hold.linkFor(dst).parent_path() / tempPath("object").filename();
-    writeObjectFile(tmp, dst, bytes, executable, fsync, hold, atFsync);
+    writeObjectFile(blobFile(id, executable), bytes, executable, fsync, hold, atFsync);
 }
 
 void GitObjectStore::putTree(const Hash & id, std::string_view body, const Hold & hold)
 {
-    auto dst = treeFile(id);
-    auto tmp = hold.linkFor(dst).parent_path() / tempPath("object").filename();
-    writeObjectFile(tmp, dst, body, false, fsync, hold, atFsync);
+    writeObjectFile(treeFile(id), body, false, fsync, hold, atFsync);
 }
 
 void GitObjectStore::putRootTree(const merkle::TreeEntry & root, const Hold & hold)

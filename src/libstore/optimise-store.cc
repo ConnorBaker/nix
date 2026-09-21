@@ -1,5 +1,4 @@
 #include "nix/util/serialise.hh"
-#include "nix/util/nested-work-pool.hh"
 #include "nix/util/fs-sink.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/object-hash-sink.hh"
@@ -594,6 +593,97 @@ struct LinkingVisitor : ObjectStoreVisitor
 };
 
 #ifndef _WIN32
+/* A bounded pool for nested directory scopes. A full queue makes the
+   caller visit inline. While joining, a caller helps only its own child
+   jobs: nested helping follows the tree's depth, never an unbounded chain
+   of siblings, and waiting parents cannot exhaust all execution slots.
+   The caller counts as one additional worker. */
+class CopyPool
+{
+    std::mutex mutex;
+    std::condition_variable wake;
+
+    struct Job
+    {
+        const void * group;
+        std::packaged_task<void()> run;
+    };
+
+    std::deque<Job> pending;
+    std::vector<std::thread> threads;
+    size_t capacity;
+    bool stopping = false;
+
+    void work()
+    {
+        ReceiveInterrupts receiveInterrupts;
+        while (true) {
+            std::packaged_task<void()> job;
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [&] { return stopping || !pending.empty(); });
+                if (pending.empty())
+                    return;
+                job = std::move(pending.front().run);
+                pending.pop_front();
+            }
+            job(); // The future carries the exception back to its directory.
+        }
+    }
+
+public:
+    explicit CopyPool(size_t workers)
+        : capacity(workers - 1)
+    {
+        threads.reserve(capacity);
+    }
+
+    ~CopyPool()
+    {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+        }
+        wake.notify_all();
+        for (auto & thread : threads)
+            thread.join();
+    }
+
+    std::future<void> tryAsync(const void * group, std::function<void()> run)
+    {
+        std::lock_guard lock(mutex);
+        if (pending.size() == capacity)
+            return {};
+        std::packaged_task<void()> job(std::move(run));
+        auto result = job.get_future();
+        if (threads.size() < capacity)
+            threads.emplace_back([this] { work(); });
+        pending.push_back({group, std::move(job)});
+        wake.notify_one();
+        return result;
+    }
+
+    void wait(std::future<void> & result, const void * group)
+    {
+        while (result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            std::packaged_task<void()> job;
+            {
+                std::lock_guard lock(mutex);
+                auto i = std::find_if(pending.begin(), pending.end(), [&](auto & job) { return job.group == group; });
+                if (i != pending.end()) {
+                    job = std::move(i->run);
+                    pending.erase(i);
+                }
+            }
+            if (!job.valid()) {
+                result.wait();
+                return;
+            }
+            job();
+        }
+    }
+};
+
 /* The second route's visitor (01 §9.10, "One route"; `08` §1.6): the
    pull driver over the source accessor with the one route's
    `LinkingVisitor` beneath, and `known` answering a directory, or the
@@ -624,7 +714,7 @@ struct MaterialisingVisitor : LinkingVisitor
     std::mutex namerLock;
 
     size_t workers;
-    std::unique_ptr<NestedWorkPool> pool;
+    std::unique_ptr<CopyPool> pool;
 
     MaterialisingVisitor(
         GitObjectStore & objects,
@@ -704,7 +794,7 @@ struct MaterialisingVisitor : LinkingVisitor
            also avoids constructing a scheduler for regular-file roots. */
         bool fork = workers > 1 && kids.size() > 1;
         if (fork && !pool && std::any_of(kids.begin(), kids.end(), [](auto & c) { return c.subdirectory; }))
-            pool = std::make_unique<NestedWorkPool>(workers);
+            pool = std::make_unique<CopyPool>(workers);
         auto * sink = frames().open.back();
         for (auto & c : kids) {
             if (fork && c.subdirectory)
@@ -964,7 +1054,7 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
     /* The copy's subdirectories go on a small pool (`copyChildren`): the
        machine's width, capped to bound filesystem and index contention.
        Git repository reads remain serialized by their accessor; filesystem
-       scopes and captured trees permit independent reads.  Not a setting: what the copy makes does not
+       scopes permit independent reads.  Not a setting: what the copy makes does not
        depend on the count (01 §10), so there is nothing for a user to
        decide.  `copyWorkersForTest` is the tests' seam and is zero
        everywhere else; one thread is the sequential walk exactly. */
