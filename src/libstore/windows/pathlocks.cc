@@ -67,51 +67,40 @@ static bool warnOrThrowWine(DWORD lastError, const std::string & fs, Args &&... 
 
 bool lockFile(Descriptor desc, LockType lockType, bool wait)
 {
+    DWORD flags = wait ? 0 : LOCKFILE_FAIL_IMMEDIATELY;
     switch (lockType) {
-    case ltNone: {
-        OVERLAPPED ov = {0};
-        if (!UnlockFileEx(desc, 0, 2, 0, &ov))
-            return warnOrThrowWine(GetLastError(), "Failed to unlock file %s", PathFmt(descriptorToPath(desc)));
-        return true;
-    }
-    case ltRead: {
-        OVERLAPPED ov = {0};
-        if (!LockFileEx(desc, wait ? 0 : LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) {
-            auto lastError = GetLastError();
-            if (lastError == ERROR_LOCK_VIOLATION)
-                return false;
-            return warnOrThrowWine(lastError, "Failed to lock file %s", PathFmt(descriptorToPath(desc)));
-        }
-
-        ov.Offset = 1;
-        if (!UnlockFileEx(desc, 0, 1, 0, &ov)) {
-            auto lastError = GetLastError();
-            if (lastError != ERROR_NOT_LOCKED)
-                return warnOrThrowWine(lastError, "Failed to unlock file %s", PathFmt(descriptorToPath(desc)));
-        }
-        return true;
-    }
-    case ltWrite: {
-        OVERLAPPED ov = {0};
-        ov.Offset = 1;
-        if (!LockFileEx(desc, LOCKFILE_EXCLUSIVE_LOCK | (wait ? 0 : LOCKFILE_FAIL_IMMEDIATELY), 0, 1, 0, &ov)) {
-            auto lastError = GetLastError();
-            if (lastError == ERROR_LOCK_VIOLATION)
-                return false;
-            return warnOrThrowWine(lastError, "Failed to lock file %s", PathFmt(descriptorToPath(desc)));
-        }
-
-        ov.Offset = 0;
-        if (!UnlockFileEx(desc, 0, 1, 0, &ov)) {
-            auto lastError = GetLastError();
-            if (lastError != ERROR_NOT_LOCKED)
-                return warnOrThrowWine(lastError, "Failed to unlock file %s", PathFmt(descriptorToPath(desc)));
-        }
-        return true;
-    }
+    case ltNone:
+    case ltRead:
+        break;
+    case ltWrite:
+        flags |= LOCKFILE_EXCLUSIVE_LOCK;
+        break;
     default:
-        assert(false);
+        unreachable();
     }
+
+    /* Every mode covers the same byte, and UnlockFileEx requires exactly
+       the acquired range. Release this handle's previous lock before a
+       conversion: LockFileEx stacks shared locks and cannot acquire an
+       exclusive lock over an existing lock on the same handle. As with
+       flock conversions, releasing and acquiring are not atomic.
+       ERROR_NOT_LOCKED is the ordinary initially-unlocked case. */
+    OVERLAPPED ov = {0};
+    if (!UnlockFileEx(desc, 0, 1, 0, &ov)) {
+        auto lastError = GetLastError();
+        if (lastError != ERROR_NOT_LOCKED)
+            return warnOrThrowWine(lastError, "Failed to unlock file %s", PathFmt(descriptorToPath(desc)));
+    }
+    if (lockType == ltNone)
+        return true;
+
+    if (!LockFileEx(desc, flags, 0, 1, 0, &ov)) {
+        auto lastError = GetLastError();
+        if (lastError == ERROR_LOCK_VIOLATION)
+            return false;
+        return warnOrThrowWine(lastError, "Failed to lock file %s", PathFmt(descriptorToPath(desc)));
+    }
+    return true;
 }
 
 bool PathLocks::lockPaths(const std::set<std::filesystem::path> & paths, const std::string & waitMsg, bool wait)
@@ -155,13 +144,11 @@ bool PathLocks::lockPaths(const std::set<std::filesystem::path> & paths, const s
 FdLock::FdLock(Descriptor desc, LockType lockType, bool wait, std::string_view waitMsg)
     : desc(desc)
 {
-    if (wait) {
-        if (!lockFile(desc, lockType, false)) {
-            printInfo("%s", waitMsg);
-            acquired = lockFile(desc, lockType, true);
-        }
-    } else
-        acquired = lockFile(desc, lockType, false);
+    acquired = lockFile(desc, lockType, false);
+    if (!acquired && wait) {
+        printInfo("%s", waitMsg);
+        acquired = lockFile(desc, lockType, true);
+    }
 }
 
 } // namespace nix

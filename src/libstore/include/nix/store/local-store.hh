@@ -336,24 +336,21 @@ public:
     void addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override;
 
     /**
-     * One hold for the batch, not one per object: every `addToStore`
-     * below makes a `GitObjectStore::Hold` -- a locked directory and a
-     * link per object written -- and a batch is one ingestion, so one
-     * hold covers it.  It holds each object from its write until the
-     * batch ends, which is no earlier than its own registration, so
-     * `08` K16 reads as before.
+     * Keep a lease on one protecting directory across the batch. Each
+     * path has its own ingestion and each writer retains its own lease,
+     * so overlapping batches or direct adds can finish independently.
+     * The final lease releases the directory, after every writer has
+     * finished publishing its path or failed (`08` K16).
      */
     void
     addMultipleToStore(PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override;
 
 private:
-    /**
-     * The hold `addMultipleToStore` made for the batch its callee is
-     * writing, if it made one; null outside such a batch, and read only
-     * by `addToStore` below.  Set before any worker of the batch starts
-     * and cleared after the last has stopped.
-     */
-    const GitObjectStore::Hold * batchHold = nullptr;
+    /** Concurrent ingestions may share a protecting directory, but each
+     * keeps its own rows and a strong lease until registration completes. */
+    Sync<std::weak_ptr<GitObjectStore::Hold>> ingestionHold;
+
+    std::shared_ptr<GitObjectStore::Hold> acquireIngestionHold();
 
 public:
 
@@ -575,10 +572,11 @@ public:
     /**
      * `Store::addToStore(name, path, Git, …)` by `materialiseThroughObjects`:
      * the second route of 01 §9.10, with the registration of
-     * `addToStoreFromDump` -- `autoGC` before the restore, a locked
-     * temporary directory in the store, the path locked, moved into
-     * place and registered with the root's object hash and the NAR size
-     * the walk computed.  Only when `materialisesFromObjects()`.
+     * `addToStoreFromDump`. A buffered regular root can name and reuse a
+     * valid destination before staging. Otherwise, run `autoGC`, restore
+     * under a locked temporary directory, and move and register the path
+     * under its output lock with the computed object hash and NAR size.
+     * Only when `materialisesFromObjects()`.
      */
     StorePath materialise(
         std::string_view name, const SourcePath & path, PathFilter & filter, RepairFlag repair, TreeNamer namer);
@@ -762,9 +760,9 @@ public:
     void beginIngestion(const GitObjectStore::Hold & hold, const std::filesystem::path & root);
 
     /**
-     * Publish the remaining rows after path registration. An ingestion
-     * that has not flushed yet inserts its rows and path together; one
-     * that flushed during copying also updates its earlier ingestion row.
+     * Finish the path's complete regular-file projection, including an
+     * empty one. Already-valid paths reconcile and publish here; a new
+     * builder output remains private until validity registration.
      */
     void endIngestion(const GitObjectStore::Hold & hold, const StorePath & path);
 
@@ -775,6 +773,36 @@ public:
         std::vector<GitObjectStore::Hold::Row> & batch);
 
 private:
+    struct BlobCoalescing
+    {
+        GitObjectStore::Hold::Row row;
+        std::vector<GitObjectStore::Holder> candidates;
+    };
+
+    struct BlobCoalescingResult
+    {
+        bool modified = false;
+        /** Partial map on collision keys: own, selected donor, or no eligible representative. */
+        std::vector<GitObjectStore::Hold::Row> representatives;
+        std::vector<std::pair<GitObjectStore::Hold::Row, GitObjectStore::Holder>> rejected;
+    };
+
+    /** Filesystem-only reconciliation of candidates whose lifetimes the caller protects. */
+    BlobCoalescingResult coalesceBlobs(
+        const std::filesystem::path & root,
+        const GitObjectStore::Hold & hold,
+        const std::vector<BlobCoalescing> & collisions);
+
+    void insertBlobRows(State & state, uint64_t ingestion, const std::vector<GitObjectStore::Hold::Row> & rows);
+
+    /** Keep rewritten rows across a SQLite retry: filesystem changes survive rollback. */
+    void coalesceBlobRows(
+        State & state,
+        const StorePath & path,
+        const GitObjectStore::Hold & hold,
+        uint64_t ingestion,
+        std::vector<GitObjectStore::Hold::Row> & rows);
+
     /**
      * The index writer's **own connection** to the store's database.
      *

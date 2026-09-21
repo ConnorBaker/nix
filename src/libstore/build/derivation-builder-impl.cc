@@ -681,7 +681,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                possibly quite slow thing it was) doesn't have to be done
                again. */
             if (newInfo.ca)
-                localStore.registerValidPaths({{newInfo.path, newInfo}});
+                localStore.registerValidPaths({{newInfo.path, newInfo}}, &hold);
         }
 
         /* Do this in both the check and non-check cases, because we
@@ -706,7 +706,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         for (auto & [outputName, newInfo] : infos) {
             infos2.insert_or_assign(newInfo.path, newInfo);
         }
-        localStore.registerValidPaths(infos2);
+        localStore.registerValidPaths(infos2, &hold);
     }
 
     /* If we made it this far, we are sure the output matches the

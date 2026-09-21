@@ -1,0 +1,82 @@
+{
+  "sqlite": "3.45.1",
+  "query_provenance": "src/libstore/local-store.cc: QueryBlobInodes and lookupBlobSql, extracted verbatim",
+  "visibility_domain": "3 candidates x 2 executable classes; each absent/unnamed/named-invalid/registered",
+  "visibility_cases": 4096,
+  "physical_class_domain": "2 executable classes x all 13 ordered three-candidate partitions x 64 visibility states; other mode independently present",
+  "physical_class_cases": 1664,
+  "cases": 5760,
+  "failures": 0,
+  "query": "select b.ino, b.id from Blobs b join Ingestions i on i.id = b.ingestion join ValidPaths v on v.path = i.path where not exists (select 1 from Blobs earlier join Ingestions ei on ei.id = earlier.ingestion join ValidPaths ev on ev.path = ei.path where earlier.id = b.id and earlier.exec = b.exec and (earlier.dev, earlier.ino, earlier.ingestion) < (b.dev, b.ino, b.ingestion));",
+  "lookup": "select b.ino, b.dev, b.size, i.path, b.name, b.ingestion from Blobs b join Ingestions i on i.id = b.ingestion join ValidPaths v on v.path = i.path where b.id = ? and b.exec = ? and (b.dev, b.ino, b.ingestion) > (?, ?, ?) order by b.dev, b.ino, b.ingestion limit 1;",
+  "explain": [
+    [
+      4,
+      0,
+      0,
+      "SCAN b"
+    ],
+    [
+      7,
+      0,
+      0,
+      "CORRELATED SCALAR SUBQUERY 1"
+    ],
+    [
+      14,
+      7,
+      0,
+      "SEARCH earlier USING INDEX sqlite_autoindex_Blobs_1 (id=? AND exec=?)"
+    ],
+    [
+      41,
+      7,
+      0,
+      "SEARCH ei USING INTEGER PRIMARY KEY (rowid=?)"
+    ],
+    [
+      44,
+      7,
+      0,
+      "SEARCH ev USING COVERING INDEX sqlite_autoindex_ValidPaths_1 (path=?)"
+    ],
+    [
+      55,
+      0,
+      0,
+      "SEARCH i USING INTEGER PRIMARY KEY (rowid=?)"
+    ],
+    [
+      58,
+      0,
+      0,
+      "SEARCH v USING COVERING INDEX sqlite_autoindex_ValidPaths_1 (path=?)"
+    ]
+  ],
+  "lookup_explain": [
+    [
+      7,
+      0,
+      0,
+      "SEARCH b USING INDEX sqlite_autoindex_Blobs_1 (id=? AND exec=?)"
+    ],
+    [
+      31,
+      0,
+      0,
+      "SEARCH i USING INTEGER PRIMARY KEY (rowid=?)"
+    ],
+    [
+      34,
+      0,
+      0,
+      "SEARCH v USING COVERING INDEX sqlite_autoindex_ValidPaths_1 (path=?)"
+    ],
+    [
+      54,
+      0,
+      0,
+      "USE TEMP B-TREE FOR ORDER BY"
+    ]
+  ]
+}

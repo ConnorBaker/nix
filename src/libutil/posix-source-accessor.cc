@@ -517,9 +517,11 @@ void PosixDirectorySourceAccessor::readFile(const CanonPath & path, Sink & sink,
     auto st = nix::fstat(fileFd.get());
     if (!S_ISREG(st.st_mode))
         throw NotARegularFile("file '%s' is not a regular file", showPath(path));
-    PosixFileSourceAccessor fileAccessor(std::move(fileFd), fsPath / path.rel(), trackLastModified, st);
     maybeUpdateMtime(st.st_mtime);
-    fileAccessor.readFile(CanonPath::root, sink, sizeCallback);
+    /* The open descriptor already identifies the file. Reading it needs
+       no new accessor identity or reconstruction of its display path. */
+    sizeCallback(st.st_size);
+    copyFdRange(fileFd.get(), /*offset=*/0, st.st_size, sink, /*tryCoW=*/true);
 }
 
 AutoCloseFD PosixDirectorySourceAccessor::openSubdirectory(const CanonPath & path)

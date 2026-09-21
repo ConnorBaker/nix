@@ -21,7 +21,8 @@
 # path's own -- a *holder* -- and `.objects/blobs` holds the
 # symlink-target blobs alone, which no path holds.  So: the file counts
 # under `blobs/` are the symlink targets' and the rest are the index's
-# rows, read with `sqlite3`; every link count loses the store's own link;
+# candidate rows, read with `sqlite3`; every ingestion records its own
+# witness, including files linked from another path. Every link count loses the store's own link;
 # and where the script named an object file for a regular file it now
 # names the holder, which the index gives.  `.objects/trees` is
 # unchanged.
@@ -48,17 +49,18 @@ objectFile() { echo "$objects/$1/${2:0:2}/$2"; }
 # The blobs with files of the store's own naming: the symlink targets.
 blobs() { find "$objects/blobs" -mindepth 2 -maxdepth 2 | wc -l | tr -d ' '; }
 trees() { find "$objects/trees" -mindepth 2 -maxdepth 2 | wc -l | tr -d ' '; }
-# The index (doc/lazy-store/06-holder-index.md section 2): a regular-file
-# blob is a row naming the store path that holds it and the name under
+# The index: a candidate is a row naming the store path that holds it and the name under
 # that path ("" for a plain-file root).  A row whose ingestion has no path
-# is not yet (or never will be) true, and neither `link` nor this counts
-# it.
+# is not yet (or never will be) visible. Count named candidates, including
+# stale rows until collection removes them.
 blobRows() { sqlite3 "$db" "select count(*) from Blobs b join Ingestions i on i.id = b.ingestion where b.exec = ${1:-0} and i.path is not null"; }
 # The holder of (identifier, mode): the file the store would link.
 holder() {
     sqlite3 "$db" "select i.path || (case when b.name = '' then '' else '/' || b.name end)
                    from Blobs b join Ingestions i on i.id = b.ingestion
-                   where lower(hex(b.id)) = '$1' and b.exec = ${2:-0} and i.path is not null"
+                   join ValidPaths v on v.path = i.path
+                   where lower(hex(b.id)) = '$1' and b.exec = ${2:-0}
+                   order by b.dev, b.ino, b.ingestion limit 1"
 }
 # The store's root record for a path is the database's object hash.
 objectHash() { nix path-info --json --json-format 4 "$1" | jq -r '.info | to_entries[0].value.objectHash'; }
@@ -78,6 +80,7 @@ corruptFirstByte() {
     local status=0
     chmod u+w "$1" && { printf 'X' | dd of="$1" bs=1 count=1 conv=notrunc status=none; } || status=$?
     chmod u-w "$1"
+    touch -d @1 "$1"
     return "$status"
 }
 
@@ -119,7 +122,7 @@ p1=$(nix store add --mode nar "$src")
 
 # The same bytes executable: one blob per mode, another file, never a link
 # across the bit.  The bit is the holder's own -- the index's key is
-# (identifier, mode), and each mode's row names a file of its own.
+# (identifier, mode, ingestion), and each mode's candidates name files of their own.
 [[ $(inode "$p1/x") != $(inode "$p1/a") ]]
 [[ $(nlink "$p1/x") == 1 ]]
 cmp "$p1/x" "$p1/a"
@@ -140,8 +143,8 @@ rootId=$(nix hash path --mode git --algo sha256 --base16 "$p1")
 echo three > "$src/d/b"
 p2=$(nix store add --mode nar "$src")
 [[ $(blobs) == 1 ]]                         # still the symlink's target alone
-[[ $(blobRows 0) == 3 ]]                    # "one", "two" and the new "three"
-[[ $(blobRows 1) == 1 ]]
+[[ $(blobRows 0) == 4 ]]                    # two candidates from each ingestion
+[[ $(blobRows 1) == 2 ]]
 [[ $(holder "$(gitBlobId "$src/d/b")") == "$p2/d/b" ]]
 [[ $(inode "$p2/a") == $(inode "$p1/a") ]]
 [[ $(inode "$p2/d/e/c") == $(inode "$p1/d/e/c") ]]
@@ -170,7 +173,7 @@ nix store delete --quiet "$p2" 2> "$TEST_ROOT/delete.log"
 grepQuiet "reclaimed at the next \`nix-store --gc\`" "$TEST_ROOT/delete.log"
 [[ $(blobs) == 1 ]]
 [[ $(trees) == 5 ]]
-[[ $(blobRows 0) == 3 ]]                    # p2's row is stale, not yet removed
+[[ $(blobRows 0) == 4 ]]                    # p2's candidates are stale, not yet removed
 nix-store --gc
 [[ ! -e $objects/roots ]]
 [[ -e $(objectFile trees "$rootId") ]]
@@ -192,7 +195,8 @@ p3=$(nix store add --mode nar "$src")
 [[ $(nlink "$p1/a") == 4 ]]
 [[ $(cat "$p3/d/b") == three ]]
 [[ $(blobs) == 1 ]]
-[[ $(blobRows 0) == 3 ]]                    # "three" written again, now p3's
+[[ $(blobRows 0) == 4 ]]                    # p3 records both its linked and written files
+[[ $(blobRows 1) == 2 ]]
 [[ $(holder "$(gitBlobIdOfBytes $'three\n')") == "$p3/d/b" ]]
 [[ $(trees) == 5 ]]
 p3Id=$(nix hash path --mode git --algo sha256 --base16 "$p3")
@@ -203,7 +207,7 @@ p3Id=$(nix hash path --mode git --algo sha256 --base16 "$p3")
 # here there are none, so it links no file, and it removes the legacy
 # `.links` table (planted as an older store would have left it: a hard
 # link to a file, so removing it frees nothing).  Running it again
-# changes nothing.
+# changes no file; each completed ingestion replaces that path's candidates.
 [[ ! -e $NIX_STORE_DIR/.links ]]
 mkdir "$NIX_STORE_DIR/.links"
 ln "$p3/a" "$NIX_STORE_DIR/.links/legacy"
@@ -214,22 +218,20 @@ optimiseLinksNothing
 [[ $(inode "$p3/a") == $(inode "$p1/a") ]]
 [[ -e $(objectFile trees "$p3Id") ]]
 [[ $(blobs) == 1 ]]
-[[ $(blobRows 0) == 3 ]]
+[[ $(blobRows 0) == 4 ]]                    # the same two plain keys in each of two paths
+[[ $(blobRows 1) == 2 ]]
 [[ $(trees) == 5 ]]
 optimiseLinksNothing
 [[ ! -e $NIX_STORE_DIR/.links ]]
 [[ $(nlink "$p1/a") == 4 ]]
 [[ $(blobs) == 1 ]]
-[[ $(blobRows 0) == 3 ]]
+[[ $(blobRows 0) == 4 ]]
+[[ $(blobRows 1) == 2 ]]
 [[ $(trees) == 5 ]]
 
-# `nix-store --optimise` re-enters a holder the collector forgot
-# (doc/lazy-store/06-holder-index.md section 2, *The collector*): the one
-# case the holder representation pays for is a holder's path collected
-# while another path shares its inode -- the blob is still held, but the
-# row that named it went with the path.  The row is forgotten by hand
-# here, as the sweep leaves it; `--optimise` walks every valid path, meets
-# the file with no row for its blob, and enters it.
+# `nix-store --optimise` reconstructs missing cache entries from valid
+# paths. Remove every witness of one blob by hand; the next walk enters
+# that file without rewriting its bytes or inode.
 threeId=$(gitBlobIdOfBytes $'three\n')
 [[ $(holder "$threeId") == "$p3/d/b" ]]
 threeInode=$(inode "$p3/d/b")
@@ -256,25 +258,16 @@ nix store delete "$p1"
 nix copy --from "file://$TEST_ROOT/cache" --no-check-sigs "$p1"
 [[ $(objectHash "$p1") == "git:sha256:$rootId" ]]
 [[ -e $(objectFile trees "$rootId") ]]
-# Law 3's fifth exception, made and then closed
-# (doc/lazy-store/06-holder-index.md section 2, *The collector*): p1 held
-# the blobs of "one" and "one"-executable, and its deletion left their
-# rows naming a path that is gone, so the substitution wrote those files
-# afresh instead of linking p3's -- the bytes are in the store twice.
-# Within the path the sharing still holds, the copy's own pending set
-# standing for the index (law 3 within one path).  `nix-store --optimise`,
-# which is the documented repair, links the inodes that have grown apart
-# back together.  Before, the blob file outlived the path and the
-# substitution linked it straight away.
-[[ $(inode "$p1/a") != $(inode "$p3/a") ]]
+# p3 retained its own witnesses when it linked p1's files. Deleting p1
+# therefore preserves sharing: substitution links the surviving inode
+# immediately, for both executable modes and repeated aliases.
+[[ $(inode "$p1/a") == $(inode "$p3/a") ]]
 [[ $(inode "$p1/d/e/c") == $(inode "$p1/a") ]]
-[[ $(inode "$p1/x") != $(inode "$p3/x") ]]
-NIX_REMOTE="" nix-store --optimise 2> "$TEST_ROOT/optimise-relink.log"
-grepQuietInverse "hard-linking 0 files" "$TEST_ROOT/optimise-relink.log"
+[[ $(inode "$p1/x") == $(inode "$p3/x") ]]
+optimiseLinksNothing
 [[ $(inode "$p1/a") == $(inode "$p3/a") ]]
 [[ $(inode "$p1/d/e/c") == $(inode "$p3/a") ]]
 [[ $(inode "$p1/x") == $(inode "$p3/x") ]]
-optimiseLinksNothing
 [[ $(objectHash "$p1") == "git:sha256:$rootId" ]]
 [[ -e $(objectFile trees "$rootId") ]]
 

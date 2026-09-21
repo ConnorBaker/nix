@@ -283,12 +283,11 @@ EvalState::EvalState(
            instance if we're evaluating a file from the physical
            /nix/store while using a chroot store, and also for lazy
            mounted fetchTree. */
-        auto accessor = settings.pureEval
-                            ? storeFS.cast<SourceAccessor>()
-                            /* The host and the store agree wherever both are defined:
-                               at content-addressed store paths.  So either child's
-                               fingerprint names the union's subtree. */
-                            : makeUnionSourceAccessor({getFSSourceAccessor(), storeFS}, UnionCoherence::ChildrenAgree);
+        auto accessor = settings.pureEval ? storeFS.cast<SourceAccessor>()
+                                          /* A host entry at a mounted input's logical store path
+                                             need not be a complete, valid copy of that input.
+                                             Name the rendered union by the general rule. */
+                                          : makeUnionSourceAccessor({getFSSourceAccessor(), storeFS});
         /* Cache positive lstat/readlink results to speed up resolveSymlinks. */
         accessor = makeCachingSourceAccessor(accessor);
 
@@ -654,6 +653,11 @@ void Value::mkPrimOp(PrimOp * p)
 {
     p->check();
     setStorage(p);
+}
+
+void Value::mkFailed(std::exception_ptr e, Value * recovery, EvalMemory & mem) noexcept
+{
+    setStorage(new Value::Failed(mem.allocException(std::move(e)), recovery));
 }
 
 Value * EvalState::addPrimOp(PrimOp && primOp)
@@ -1228,20 +1232,27 @@ namespace {
  * from a thunk, ensuring that every file is parsed/evaluated only
  * once (via the thunk stored in `EvalState::fileEvalCache`).
  */
-struct ExprParseFile : Expr, gc
+struct ExprParseFile : Expr
 {
-    // FIXME: make this a reference (see below).
-    SourcePath path;
+    SourceAccessor * accessor;
+    std::pmr::string path;
     bool mustBeTrivial;
 
-    ExprParseFile(SourcePath & path, bool mustBeTrivial)
-        : path(path)
+    ExprParseFile(
+        std::pmr::polymorphic_allocator<char> & alloc,
+        SourceAccessor * accessor,
+        std::string_view path,
+        bool mustBeTrivial)
+        : accessor(accessor)
+        , path(path, alloc)
         , mustBeTrivial(mustBeTrivial)
     {
     }
 
     void eval(EvalState & state, Env & env, Value & v) override
     {
+        SourcePath path{
+            ref(accessor->shared_from_this()), CanonPath(CanonPath::unchecked_t(), std::string(this->path))};
         printTalkative("evaluating file '%s'", path);
 
         auto e = state.parseExprFromFile(path);
@@ -1284,11 +1295,10 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
     }
 
     Value * vExpr;
-    // FIXME: put ExprParseFile on the stack instead of the heap once
-    // https://github.com/NixOS/nix/pull/13930 is merged. That will ensure
-    // the post-condition that `expr` is unreachable after
-    // `forceValue()` returns.
-    auto expr = new ExprParseFile{*resolvedPath, mustBeTrivial};
+    /* A cached thunk can retain this expression after forcing fails. Its
+       source and path have the same lifetime as every other expression. */
+    auto expr = mem.exprs.add<ExprParseFile>(
+        mem.exprs.alloc, mem.exprs.ownSource(resolvedPath->accessor), resolvedPath->path.abs(), mustBeTrivial);
 
     fileEvalCache->try_emplace_and_cvisit(
         *resolvedPath,
@@ -2391,7 +2401,7 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
     if (recovery) {
         recovery->mkThunk(env, expr);
     }
-    v.mkFailed(e, recovery);
+    v.mkFailed(e, recovery, mem);
 }
 
 [[gnu::noinline]]
@@ -2410,7 +2420,7 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
     if (recovery) {
         *recovery = savedApp;
     }
-    v.mkFailed(e, recovery);
+    v.mkFailed(e, recovery, mem);
 }
 
 [[gnu::noinline]]

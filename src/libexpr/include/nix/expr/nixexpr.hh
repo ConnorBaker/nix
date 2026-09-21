@@ -2,6 +2,7 @@
 ///@file
 
 #include <map>
+#include <set>
 #include <span>
 #include <memory>
 #include <vector>
@@ -18,6 +19,7 @@
 #include "nix/util/pos-table.hh"
 #include "nix/util/error.hh"
 #include "nix/util/bump-memory-resource.hh"
+#include "nix/util/sync.hh"
 
 namespace nix {
 
@@ -212,13 +214,12 @@ struct ExprString : Expr
 
 struct ExprPath : Expr
 {
-    ref<SourceAccessor> accessor;
     Value v;
 
-    ExprPath(std::pmr::polymorphic_allocator<char> & alloc, ref<SourceAccessor> accessor, std::string_view sv)
-        : accessor(accessor)
+    /* Exprs owns the source for the arena's lifetime. */
+    ExprPath(std::pmr::polymorphic_allocator<char> & alloc, SourceAccessor * accessor, std::string_view sv)
     {
-        v.mkPath(&*accessor, StringData::make(*alloc.resource(), sv));
+        v.mkPath(accessor, StringData::make(*alloc.resource(), sv));
     }
 
     Value * maybeThunk(EvalState & state, Env & env) override;
@@ -408,7 +409,7 @@ struct ExprAttrs : Expr
      * new pmr::map using a different allocator (move assignment will copy into the old allocator)
      */
     std::optional<AttrDefs> attrs;
-    std::unique_ptr<std::pmr::vector<Expr *>> inheritFromExprs;
+    std::optional<std::pmr::vector<Expr *>> inheritFromExprs;
 
     struct DynamicAttrDef
     {
@@ -425,15 +426,15 @@ struct ExprAttrs : Expr
      * dynamicAttrs will never be null. See comment on AttrDefs above.
      */
     std::optional<DynamicAttrDefs> dynamicAttrs;
-    ExprAttrs(const PosIdx & pos)
+    ExprAttrs(std::pmr::polymorphic_allocator<char> & alloc, const PosIdx & pos)
         : recursive(false)
         , pos(pos)
-        , attrs(AttrDefs{})
-        , dynamicAttrs(DynamicAttrDefs{}) {};
-    ExprAttrs()
+        , attrs(std::in_place, alloc)
+        , dynamicAttrs(std::in_place, alloc) {};
+    ExprAttrs(std::pmr::polymorphic_allocator<char> & alloc)
         : recursive(false)
-        , attrs(AttrDefs{})
-        , dynamicAttrs(DynamicAttrDefs{}) {};
+        , attrs(std::in_place, alloc)
+        , dynamicAttrs(std::in_place, alloc) {};
 
     PosIdx getPos() const override
     {
@@ -607,17 +608,23 @@ struct ExprCall : Expr
     PosIdx pos;
     std::optional<PosIdx> cursedOrEndPos; // used during parsing to warn about https://github.com/NixOS/nix/issues/11118
 
-    ExprCall(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args)
+    ExprCall(
+        std::pmr::polymorphic_allocator<char> & alloc, const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args)
         : fun(fun)
-        , args(args)
+        , args(std::in_place, std::move(args), alloc)
         , pos(pos)
         , cursedOrEndPos({})
     {
     }
 
-    ExprCall(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args, PosIdx && cursedOrEndPos)
+    ExprCall(
+        std::pmr::polymorphic_allocator<char> & alloc,
+        const PosIdx & pos,
+        Expr * fun,
+        std::pmr::vector<Expr *> && args,
+        PosIdx && cursedOrEndPos)
         : fun(fun)
-        , args(args)
+        , args(std::in_place, std::move(args), alloc)
         , pos(pos)
         , cursedOrEndPos(cursedOrEndPos)
     {
@@ -834,6 +841,10 @@ extern ExprBlackHole eBlackHole;
 
 class Exprs
 {
+    /* Arena nodes are not individually destroyed. Own each path source
+       once here, so its lifetime ends with the expressions that use it. */
+    Sync<std::set<ref<SourceAccessor>>> pathSources;
+
     /* Thread-safe fallback resource, which might be a bit slower. */
     std::pmr::synchronized_pool_resource fallbackResource;
     BumpMemoryResource buffer{BumpMemoryResource::defaultReserveSize, &fallbackResource};
@@ -841,20 +852,53 @@ class Exprs
 public:
     std::pmr::polymorphic_allocator<char> alloc{&buffer};
 
+    /* Growing parser containers can return superseded blocks to the pool.
+       Even incomplete or merged-away expressions release their remaining
+       storage with Exprs; binding moves completed containers to the arena. */
+    std::pmr::polymorphic_allocator<char> parserAlloc{&fallbackResource};
+
+    SourceAccessor * ownSource(ref<SourceAccessor> accessor)
+    {
+        auto sources = pathSources.lock();
+        return &**sources->insert(std::move(accessor)).first;
+    }
+
     template<class C>
     [[gnu::always_inline]]
     C * add(auto &&... args)
+        requires(!std::same_as<C, ExprPath>)
     {
         return alloc.new_object<C>(std::forward<decltype(args)>(args)...);
     }
 
+    template<class C>
+    C * add(std::pmr::polymorphic_allocator<char> & alloc, ref<SourceAccessor> accessor, std::string_view path)
+        requires(std::same_as<C, ExprPath>)
+    {
+        return alloc.new_object<C>(alloc, ownSource(std::move(accessor)), path);
+    }
+
     // we define some calls to add explicitly so that the argument can be passed in as initializer lists
+    template<class C>
+    C * add(const PosIdx & pos, Expr * fun, std::initializer_list<Expr *> args)
+        requires(std::same_as<C, ExprCall>)
+    {
+        return add<C>(pos, fun, std::pmr::vector<Expr *>{args, parserAlloc});
+    }
+
+    template<class C>
+    C * add(const PosIdx & pos, Expr * fun, std::initializer_list<Expr *> args, PosIdx && cursedOrEndPos)
+        requires(std::same_as<C, ExprCall>)
+    {
+        return add<C>(pos, fun, std::pmr::vector<Expr *>{args, parserAlloc}, std::move(cursedOrEndPos));
+    }
+
     template<class C>
     [[gnu::always_inline]]
     C * add(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args)
         requires(std::same_as<C, ExprCall>)
     {
-        return alloc.new_object<C>(pos, fun, std::move(args));
+        return alloc.new_object<C>(parserAlloc, pos, fun, std::move(args));
     }
 
     template<class C>
@@ -862,7 +906,7 @@ public:
     C * add(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args, PosIdx && cursedOrEndPos)
         requires(std::same_as<C, ExprCall>)
     {
-        return alloc.new_object<C>(pos, fun, std::move(args), std::move(cursedOrEndPos));
+        return alloc.new_object<C>(parserAlloc, pos, fun, std::move(args), std::move(cursedOrEndPos));
     }
 
     template<class C>

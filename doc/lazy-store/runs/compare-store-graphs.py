@@ -7,7 +7,10 @@ The coarse, name-preserving digest only constructs a candidate bijection.
 Verification then rewrites actual addresses, including declared derivation
 outputs, and compares every object's bytes, tree shape and executable bits.
 Ambiguous candidate mappings are refused rather than assumed equivalent.
+Pass --benchmark-output DIR --scheme SCHEME to also compare every paired
+JSON result, binding each returned drvPath to the verified graph mapping.
 """
+import argparse
 import collections
 import contextlib
 import hashlib
@@ -17,13 +20,32 @@ import json
 from pathlib import Path
 import re
 import sqlite3
-import sys
+import stat
 
 spec = importlib.util.spec_from_file_location(
     "snapshot", Path(__file__).resolve().parents[3] / "tests/functional/differential/snapshot.py")
 snapshot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(snapshot)
 snapshot.STRICT = True
+snapshot.STORE = "/nix/store"
+
+
+def executable_modes(path):
+    """NAR executability is the owner's bit, including for parsed derivations."""
+    result = []
+
+    def walk(node, relative):
+        mode = node.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            for child in sorted(node.iterdir()):
+                walk(child, relative / child.name)
+        elif stat.S_ISREG(mode):
+            result.append((str(relative), bool(mode & stat.S_IXUSR)))
+        else:
+            assert stat.S_ISLNK(mode), f"unsupported store node: {node}"
+
+    walk(path, Path("."))
+    return tuple(result)
 
 
 def objects(root, rewrite=None):
@@ -35,7 +57,8 @@ def objects(root, rewrite=None):
     for line in out.getvalue().splitlines():
         path, digest, ca, refs, deriver = line.split("\t")
         assert digest != "<missing>", path
-        result[path] = (path.rsplit("/", 1)[1][33:], digest, ca, deriver)
+        result[path] = (path.rsplit("/", 1)[1][33:], digest, ca, deriver,
+                        executable_modes(root / "nix/store" / Path(path).name))
     return result
 
 
@@ -84,16 +107,19 @@ def compare(base, branch):
     for (drv, output), path in graphs[0][4].items():
         other = graphs[1][4][mapping[drv], output]
         assert addresses.setdefault(path, other) == other
+    assert len(set(addresses.values())) == len(addresses), "declared output addresses are not injective"
     assert {mapping[p]: addresses.get(d, d) for p, d in graphs[0][5].items()} == graphs[1][5]
-    prefixes = {}
     for before, after in addresses.items():
-        a, b = before.rsplit("/", 1)[1], after.rsplit("/", 1)[1]
-        assert a[33:] == b[33:]
-        assert prefixes.setdefault(a[:32].encode(), b[:32].encode()) == b[:32].encode()
-    pattern = re.compile(rb"(/nix/store/)([0-9a-df-np-sv-z]{32})(-)")
+        assert Path(before).name[33:] == Path(after).name[33:]
+    encoded_addresses = {before.encode(): after.encode() for before, after in addresses.items()}
+    # StorePath::checkName permits exactly these name characters. Consume
+    # the complete basename, so a known address never rewrites a differently
+    # named literal sharing its hash, or a longer basename. A path prefix
+    # such as /other/nix/store/... is not this logical store directory.
+    pattern = re.compile(rb"(?<![A-Za-z0-9+._/-])/nix/store/[0-9a-df-np-sv-z]{32}-[A-Za-z0-9+._?=-]+")
 
     def rewrite(data):
-        return pattern.sub(lambda m: m[1] + prefixes.get(m[2], m[2]) + m[3], data)
+        return pattern.sub(lambda m: encoded_addresses.get(m[0], m[0]), data)
 
     exact_base = objects(base, rewrite)
     exact_branch = objects(branch, lambda x: x)
@@ -104,7 +130,40 @@ def compare(base, branch):
                 exact_contents_after_address_rewrite=True, mapping=mapping)
 
 
+def compare_outputs(mapping, directory, scheme):
+    """Check every actual result, including which derivation each attribute returned."""
+    pairs = collections.defaultdict(dict)
+    rows = [json.loads(line) for line in (directory / "samples.jsonl").read_text().splitlines()]
+    for row in rows:
+        if row["scheme"] != scheme:
+            continue
+        assert row["returncode"] == 0, row["id"]
+        assert row["label"] in ("base", "branch"), row["label"]
+        key = row["phase"], row["attributes"], row["trial"]
+        assert row["label"] not in pairs[key], f"duplicate sample: {row['id']}"
+        output = json.loads((directory / "logs" / f"{row['id']}.json").read_text())
+        assert isinstance(output, list) and len(output) == row["attributes"], row["id"]
+        pairs[key][row["label"]] = output
+    assert pairs, f"no samples for {scheme}"
+    for key, pair in pairs.items():
+        assert set(pair) == {"base", "branch"}, f"unpaired sample: {key}"
+        base = [dict(item, drvPath=mapping[item["drvPath"]]) for item in pair["base"]]
+        assert base == pair["branch"], f"evaluation output differs after address rewrite: {scheme} {key}"
+    return dict(pairs=len(pairs), samples=2 * len(pairs), exact_outputs_after_address_rewrite=True)
+
+
 if __name__ == "__main__":
-    result = compare(Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve())
-    Path(sys.argv[3]).write_text(json.dumps(result, indent=2) + "\n")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("base_root", type=Path)
+    parser.add_argument("branch_root", type=Path)
+    parser.add_argument("output_json", type=Path)
+    parser.add_argument("--benchmark-output", type=Path)
+    parser.add_argument("--scheme", choices=("path", "git", "github"))
+    args = parser.parse_args()
+    if bool(args.benchmark_output) != bool(args.scheme):
+        parser.error("--benchmark-output and --scheme must be supplied together")
+    result = compare(args.base_root.resolve(), args.branch_root.resolve())
+    if args.benchmark_output:
+        result["evaluation_outputs"] = compare_outputs(result["mapping"], args.benchmark_output.resolve(), args.scheme)
+    args.output_json.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({k: v for k, v in result.items() if k != "mapping"}))

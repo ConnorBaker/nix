@@ -467,6 +467,15 @@ std::filesystem::path makeTempPath(const std::filesystem::path & root, const std
  */
 typedef fun<bool(const std::string & path)> PathFilter;
 
+/** The identity filter: it admits every path and has no effects. */
+struct AllPaths
+{
+    bool operator()(const std::string &) const
+    {
+        return true;
+    }
+};
+
 extern PathFilter defaultPathFilter;
 
 /**

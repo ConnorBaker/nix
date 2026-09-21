@@ -91,8 +91,8 @@ rc::Gen<CanonPath> genPath()
    it has its own naming rule (the inner name together with the accepted
    set), the filtering accessors live in libfetchers, and the rule is
    property-tested there (`src/libfetchers-tests/fetch-to-store.cc`,
-   `prop_filtered_names_are_sound`).  The coherent union is a separate,
-   targeted test below, since a random pair is almost never coherent. */
+   `prop_filtered_names_are_sound`).  Cross-view checks below compare a
+   union's names against both children, including partial overlap. */
 rc::Gen<Term> genTerm(int depth)
 {
     if (depth == 0)
@@ -163,17 +163,11 @@ RC_GTEST_PROP(SourceAccessorNaming, equalNamesImplyEqualTrees, ())
     }
 }
 
-/* The coherent union (`ChildrenAgree`) names a subtree by the first child
-   that has a name for it, which is sound only because the children agree
-   wherever both have a node: the rule the evaluation root relies on
-   (01-specification.md section 8.4).  A random pair is almost never
-   coherent, so this is a constructed pair that shares a subtree and differs
-   elsewhere; the assertion is the same homomorphism, plus that the name is
-   the first child's. */
-RC_GTEST_PROP(SourceAccessorNaming, coherentUnionNamesByTheFirstChildAndStaysSound, ())
+/* Agreement on overlapping entries does not make either child's root a
+   name for the union: each child can have additional private entries.  Check
+   names across the children and the union, not only within the union. */
+RC_GTEST_PROP(SourceAccessorNaming, unionNamesAreSoundAcrossChildrenAndMergedView, ())
 {
-    /* Two trees that agree on their overlap: both hold the same `shared`,
-       and each holds a private entry. */
     auto shared = *genFile(2, fewNamesSpec());
     auto makeChild = [&](std::string priv) {
         auto mem = make_ref<MemorySourceAccessor>();
@@ -183,27 +177,79 @@ RC_GTEST_PROP(SourceAccessorNaming, coherentUnionNamesByTheFirstChildAndStaysSou
     };
     auto first = makeChild("a");
     auto second = makeChild("b");
-    auto coherent = makeUnionSourceAccessor({first, second}, UnionCoherence::ChildrenAgree);
+    auto merged = makeUnionSourceAccessor({first, second});
 
-    /* At the shared subtree the union's name is the first child's, and both
-       children name it the same (they agree), so the homomorphism holds. */
-    auto atShared = coherent->getFingerprint(CanonPath("shared"));
-    RC_ASSERT(atShared == first->getFingerprint(CanonPath("shared")));
-    RC_ASSERT(atShared.second == second->getFingerprint(CanonPath("shared")).second);
+    RC_ASSERT(merged->getFingerprint(CanonPath::root) != first->getFingerprint(CanonPath::root));
+    RC_ASSERT(merged->getFingerprint(CanonPath::root) != second->getFingerprint(CanonPath::root));
 
-    /* And equal names imply equal NARs across every path of the union. */
-    std::vector<CanonPath> paths;
-    collectPaths(*coherent, CanonPath::root, paths);
     std::map<std::pair<std::string, std::string>, std::string> seen;
-    for (auto & path : paths) {
-        auto [subpath, name] = coherent->getFingerprint(path);
-        if (!name)
-            continue;
-        auto contents = narOf(*coherent, path);
-        auto [it, inserted] = seen.emplace(std::pair{*name, subpath.abs()}, contents);
-        if (!inserted)
-            RC_ASSERT(it->second == contents);
+    for (auto & accessor : {first, second, merged}) {
+        std::vector<CanonPath> paths;
+        collectPaths(*accessor, CanonPath::root, paths);
+        for (auto & path : paths) {
+            auto [subpath, name] = accessor->getFingerprint(path);
+            if (!name)
+                continue;
+            auto contents = narOf(*accessor, path);
+            auto [it, inserted] = seen.emplace(std::pair{*name, subpath.abs()}, contents);
+            if (!inserted)
+                RC_ASSERT(it->second == contents);
+        }
     }
+}
+
+/* Enumerate node shape and naming independently in both children.  The
+   unnamed first child models the host filesystem at a logical store path:
+   an absent, partial or conflicting host copy proves nothing about the
+   complete named input underneath it. */
+TEST(SourceAccessorNaming, unionNamesAcrossEveryNodeAndNamingCase)
+{
+    std::vector<std::optional<File>> nodes{
+        std::nullopt,
+        File{File::Regular{.executable = false, .contents = "file"}},
+        File{File::Regular{.executable = true, .contents = "file"}},
+        File{File::Symlink{.target = "target"}},
+        File{File::Directory{}},
+        File{File::Directory{.entries = {{"child", File{File::Regular{.contents = "child"}}}}}},
+    };
+    std::map<std::pair<std::string, std::string>, std::string> seen;
+    for (size_t firstNode = 0; firstNode < nodes.size(); ++firstNode)
+        for (size_t secondNode = 0; secondNode < nodes.size(); ++secondNode)
+            for (bool firstNamed : {false, true})
+                for (bool secondNamed : {false, true}) {
+                    SCOPED_TRACE(
+                        ::testing::Message()
+                        << firstNode << "/" << secondNode << "/" << firstNamed << "/" << secondNamed);
+                    auto makeChild = [&](size_t node, bool named, std::string priv) {
+                        auto mem = make_ref<MemorySourceAccessor>();
+                        mem->addFile(CanonPath(priv), std::string(priv));
+                        if (nodes[node])
+                            mem->open(CanonPath("input"), *nodes[node]);
+                        return named ? make_ref<ContentNamedAccessor>(mem).cast<SourceAccessor>()
+                                     : mem.cast<SourceAccessor>();
+                    };
+                    auto first = makeChild(firstNode, firstNamed, "a");
+                    auto second = makeChild(secondNode, secondNamed, "b");
+                    auto merged = makeUnionSourceAccessor({first, second});
+                    EXPECT_EQ(bool(merged->getFingerprint(CanonPath::root).second), firstNamed && secondNamed);
+                    for (auto & accessor : {first, second, merged}) {
+                        std::vector<CanonPath> paths;
+                        collectPaths(*accessor, CanonPath::root, paths);
+                        for (auto & path : paths) {
+                            auto [subpath, name] = accessor->getFingerprint(path);
+                            if (!name)
+                                continue;
+                            auto contents = narOf(*accessor, path);
+                            auto [it, inserted] = seen.emplace(std::pair{*name, subpath.abs()}, contents);
+                            if (!inserted)
+                                EXPECT_EQ(it->second, contents) << path.abs();
+                        }
+                    }
+                    if (firstNode > 0 && firstNode < 4 && secondNode == 5) {
+                        EXPECT_FALSE(merged->pathExists(CanonPath("input/child")));
+                        EXPECT_FALSE(merged->getFingerprint(CanonPath("input/child")).second);
+                    }
+                }
 }
 
 } // namespace nix

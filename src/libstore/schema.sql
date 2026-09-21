@@ -42,7 +42,9 @@ create index if not exists IndexDerivationOutputs on DerivationOutputs(path);
 
 -- The blob index (01 section 9.10): a regular-file blob's canonical file is a
 -- store path's own file -- a *holder* -- and this is where it is.  One row per
--- (blob, mode).
+-- (blob, mode, ingestion). Each ingestion owns its candidate until its
+-- registration makes that candidate visible. A failed concurrent ingestion
+-- must not replace a registered holder's record.
 --
 -- The holder's store path is named through `Ingestions`, not by a foreign
 -- key into `ValidPaths`. A large ingestion writes batches during the copy,
@@ -79,7 +81,9 @@ create table if not exists Blobs (
     ingestion integer not null, -- Ingestions.id: which ingestion's path holds it
     name      text    not null, -- the holder's name under that path ("" for a plain-file root)
     size      integer not null,
-    primary key (id, exec)
+    primary key (id, exec, ingestion)
 );
 
 create index if not exists IndexBlobsIngestion on Blobs(ingestion);
+
+create index if not exists IndexIngestionsPath on Ingestions(path, hold);

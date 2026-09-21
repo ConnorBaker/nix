@@ -68,6 +68,7 @@ sources = files(
   'outputs-spec.cc',
   'path-info.cc',
   'path.cc',
+  'pathlocks.cc',
   'realisation.cc',
   'references.cc',
   's3-binary-cache-store.cc',
@@ -131,6 +132,7 @@ if build_unit_tests
     this_exe,
     env : test_env,
     protocol : 'gtest',
+    timeout : 120,
   )
 
   # Build benchmarks if enabled

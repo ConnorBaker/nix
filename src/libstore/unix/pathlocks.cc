@@ -52,8 +52,6 @@ bool lockFile(Descriptor desc, LockType lockType, bool wait)
             checkInterrupt();
             if (errno != EINTR)
                 throw SysError("acquiring/releasing lock");
-            else
-                return false;
         }
     } else {
         while (flock(desc, type | LOCK_NB) != 0) {
@@ -146,13 +144,11 @@ void PathLocks::unlock()
 FdLock::FdLock(Descriptor desc, LockType lockType, bool wait, std::string_view waitMsg)
     : desc(desc)
 {
-    if (wait) {
-        if (!lockFile(desc, lockType, false)) {
-            printInfo("%s", waitMsg);
-            acquired = lockFile(desc, lockType, true);
-        }
-    } else
-        acquired = lockFile(desc, lockType, false);
+    acquired = lockFile(desc, lockType, false);
+    if (!acquired && wait) {
+        printInfo("%s", waitMsg);
+        acquired = lockFile(desc, lockType, true);
+    }
 }
 
 } // namespace nix

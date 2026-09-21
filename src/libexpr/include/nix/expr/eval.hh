@@ -27,6 +27,7 @@
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 
 #include <map>
+#include <deque>
 #include <optional>
 #include <functional>
 #include <span>
@@ -369,6 +370,11 @@ public:
     inline Value * allocValue();
     inline Env & allocEnv(size_t size);
 
+    const std::exception_ptr & allocException(std::exception_ptr exception)
+    {
+        return exceptions.lock()->emplace_back(std::move(exception));
+    }
+
     Bindings * allocBindings(size_t capacity);
 
     BindingsBuilder buildBindings(SymbolTable & symbols, size_t capacity)
@@ -394,6 +400,11 @@ public:
 
 private:
     Statistics stats;
+
+    /* Failed values borrow these exceptions like they borrow expressions.
+       Keep their source positions until evaluator destruction, independently
+       of when the value garbage collector runs. */
+    Sync<std::deque<std::exception_ptr>> exceptions;
 };
 
 /**

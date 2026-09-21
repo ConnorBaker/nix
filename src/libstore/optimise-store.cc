@@ -17,6 +17,7 @@
 #include "nix/util/util.hh"
 
 #include <algorithm>
+#include <map>
 #include <mutex>
 #include <future>
 #include <deque>
@@ -215,7 +216,7 @@ struct ObjectStoreVisitor : HashingVisitor
 };
 
 /* The visitor for a store path already on disk at `root`: a regular file
-   whose inode is a blob's (`inodes`, when given) is not read; every other
+   whose inode is a current holder's (`inodes` supplies hints) is not read; every other
    is hashed and placed, its read-only directory made writable around
    `place` and a writable file left alone as suspicious; `stats` and `act`,
    when given, count the files replaced by the store's. */
@@ -248,20 +249,43 @@ struct EnterVisitor : ObjectStoreVisitor
 
     std::optional<HashedNode> known(const CanonPath & path, const SourceAccessor::Stat & st) override
     {
-        if (!inodes || st.type != SourceAccessor::tRegular)
+        if (!inodes || repair || st.type != SourceAccessor::tRegular)
             return std::nullopt;
-        /* The index is the witness, not the link count: a holder that no
-           second path shares is at one link (design.md section 3, K8).  The
-           `lstat` stays, because `readdir`'s `d_ino` can differ from it. */
-        auto file = lstat(onDisk(root, path));
+        auto where = onDisk(root, path);
+        auto file = lstat(where);
         auto i = inodes->find(file.st_ino);
-        if (i == inodes->end())
+        if (i == inodes->end() || !linkableOnThisSystem(where))
             return std::nullopt;
-        /* The size is the stat's; the NAR size stays exact. */
-        return HashedNode{
+        /* A preloaded inode can have lost its holder, been replaced, or
+           belong to another device. The map only suggests a hash to query;
+           a current canonical holder of this exact inode is the witness. */
+        auto holder = objects.holderOrForget(i->second, st.isExecutable, NoRepair);
+        if (!holder || !GitObjectStore::validHolderMetadata(*holder, st.isExecutable, file))
+            return std::nullopt;
+        auto node = HashedNode{
             .entry = {.mode = st.isExecutable ? merkle::Mode::Executable : merkle::Mode::Regular, .hash = i->second},
-            .narSize = st.fileSize ? std::optional(merkle::nar::regular(*st.fileSize, st.isExecutable)) : std::nullopt,
+            .narSize = merkle::nar::regular(static_cast<uint64_t>(file.st_size), st.isExecutable),
         };
+        /* Keep this path's own witness if the queried donor is collected.
+           If an earlier file won this ingestion's claim, use the existing
+           placement operation to resolve a different inode before return. */
+        if (auto first = hold.addRow({
+                .id = node.entry.hash,
+                .executable = st.isExecutable,
+                .ino = file.st_ino,
+                .dev = file.st_dev,
+                .size = static_cast<uint64_t>(file.st_size),
+                .name = std::string(path.rel()),
+            })) {
+            auto earlier = maybeLstat(std::filesystem::path(*first));
+            if (!earlier || earlier->st_ino != file.st_ino || earlier->st_dev != file.st_dev) {
+                auto parent = where.parent_path();
+                WritableDirectory dir(parent, parent != store.config->realStoreDir.get());
+                auto name = CanonPath::fromFilename(where.filename().string());
+                placeRegularFile(objects, where, node.entry, dir.fd.get(), name, repair, hold, inodes, stats, act);
+            }
+        }
+        return node;
     }
 
     HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
@@ -348,6 +372,94 @@ struct VerifyVisitor : HashingVisitor
 /* A regular file is held in memory up to this many bytes, so that whether
    to write it at all is decided before the disk is touched (01 §9.10). */
 static constexpr uint64_t restoreBufferLimit = 1 << 20;
+
+struct BufferedRegularFile
+{
+    HashedNode node;
+    std::string buffer;
+    std::unique_ptr<RegularFileWriter> writer;
+};
+
+/* Hash one observation and retain its bytes until the existing bound. The
+   destination need not exist until the first streamed write. */
+static BufferedRegularFile readBufferedRegular(
+    const CanonPath & path,
+    fun<void(CreateRegularFileSink &)> read,
+    fun<std::unique_ptr<RegularFileWriter>()> open,
+    Sink * contents = nullptr)
+{
+    struct BufferThenStreamFile : CreateRegularFileSink
+    {
+        const fun<std::unique_ptr<RegularFileWriter>()> & open;
+        CreateRegularFileSink & hashing;
+        Sink * contents;
+        bool executable = false;
+        std::string buffer;
+        std::unique_ptr<RegularFileWriter> writer;
+
+        BufferThenStreamFile(
+            const fun<std::unique_ptr<RegularFileWriter>()> & open, CreateRegularFileSink & hashing, Sink * contents)
+            : open(open)
+            , hashing(hashing)
+            , contents(contents)
+        {
+        }
+
+        void isExecutable() override
+        {
+            executable = true;
+            hashing.isExecutable();
+            if (writer)
+                writer->isExecutable();
+        }
+
+        void preallocateContents(uint64_t size) override
+        {
+            hashing.preallocateContents(size);
+            if (size > restoreBufferLimit)
+                stream();
+            if (writer)
+                writer->preallocateContents(size);
+        }
+
+        /* Open the file and hand it what has arrived so far. */
+        void stream()
+        {
+            if (writer)
+                return;
+            writer = open();
+            if (executable)
+                writer->isExecutable();
+            if (!buffer.empty()) {
+                (*writer)(buffer);
+                buffer.clear();
+            }
+        }
+
+        void operator()(std::string_view data) override
+        {
+            hashing(data);
+            if (contents)
+                (*contents)(data);
+            if (!writer && buffer.size() + data.size() > restoreBufferLimit)
+                stream();
+            if (writer)
+                (*writer)(data);
+            else
+                buffer.append(data);
+        }
+    };
+
+    std::string buffer;
+    std::unique_ptr<RegularFileWriter> writer;
+    auto node = HashingVisitor{}.regular(path, [&](CreateRegularFileSink & hashing) {
+        BufferThenStreamFile file{open, hashing, contents};
+        read(file);
+        buffer = std::move(file.buffer);
+        writer = std::move(file.writer);
+    });
+    return {std::move(node), std::move(buffer), std::move(writer)};
+}
 
 /* The restore route's visitor (01 §9.10, "Ingestion writes only what the
    store lacks"; `08` §1.6): a regular file is held up to
@@ -466,87 +578,22 @@ struct LinkingVisitor : ObjectStoreVisitor
 
     HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
     {
-        /* Receives the file in the order both drivers deliver it -- the
-           executable flag, the size, the bytes -- forwarding all of it to
-           the hasher's file sink and holding the bytes until the limit,
-           from which point the restore sink's file is open and written as
-           they arrive. */
-        struct BufferThenStreamFile : CreateRegularFileSink
-        {
-            RestoreSink & restore;
-            const CanonPath & name;
-            CreateRegularFileSink & hashing;
-            Sink * contents;
-            bool executable = false;
-            std::string buffer;
-            std::unique_ptr<RegularFileWriter> writer;
-
-            BufferThenStreamFile(
-                RestoreSink & restore, const CanonPath & name, CreateRegularFileSink & hashing, Sink * contents)
-                : restore(restore)
-                , name(name)
-                , hashing(hashing)
-                , contents(contents)
-            {
-            }
-
-            void isExecutable() override
-            {
-                executable = true;
-                hashing.isExecutable();
-                if (writer)
-                    writer->isExecutable();
-            }
-
-            void preallocateContents(uint64_t size) override
-            {
-                hashing.preallocateContents(size);
-                if (size > restoreBufferLimit)
-                    stream();
-                if (writer)
-                    writer->preallocateContents(size);
-            }
-
-            /* Open the file and hand it what has arrived so far. */
-            void stream()
-            {
-                if (writer)
-                    return;
-                writer = restore.beginRegularFile(name);
-                if (executable)
-                    writer->isExecutable();
-                if (!buffer.empty()) {
-                    (*writer)(buffer);
-                    buffer.clear();
-                }
-            }
-
-            void operator()(std::string_view data) override
-            {
-                hashing(data);
-                if (contents)
-                    (*contents)(data);
-                if (!writer && buffer.size() + data.size() > restoreBufferLimit)
-                    stream();
-                if (writer)
-                    (*writer)(data);
-                else
-                    buffer.append(data);
-            }
-        };
-
         auto target = at(path);
-        bool executable = false;
-        std::string buffer;
-        std::unique_ptr<RegularFileWriter> writer;
+        return placeRegular(
+            target,
+            readBufferedRegular(
+                path,
+                std::move(read),
+                [&] { return target.sink.beginRegularFile(target.name); },
+                path.isRoot() ? rootContents : nullptr));
+    }
 
-        auto node = HashingVisitor::regular(path, [&](CreateRegularFileSink & hashing) {
-            BufferThenStreamFile file{target.sink, target.name, hashing, path.isRoot() ? rootContents : nullptr};
-            read(file);
-            executable = file.executable;
-            buffer = std::move(file.buffer);
-            writer = std::move(file.writer);
-        });
+    HashedNode placeRegular(const Target & target, BufferedRegularFile file)
+    {
+        auto & node = file.node;
+        auto & buffer = file.buffer;
+        auto & writer = file.writer;
+        bool executable = node.entry.mode == merkle::Mode::Executable;
         auto & entry = node.entry;
 
         bool linkable = linkableOnThisSystem(target.where);
@@ -569,13 +616,13 @@ struct LinkingVisitor : ObjectStoreVisitor
             writer.reset();
             if (linkable)
                 objects.enterWritten(entry.hash, executable, dirFd, name, target.where, repair, hold, /*looked=*/false);
-            return node;
+            return std::move(file.node);
         }
 
         /* The whole file is in memory and its blob known.  A hit: the
            store's valid file linked under the name, nothing written. */
         if (linkable && objects.link(entry.hash, executable, dirFd, name, target.where, buffer.size(), repair, hold))
-            return node;
+            return std::move(file.node);
 
         /* A miss: written from memory, canonicalised by the restore sink's
            hooks, and entered as the store's file -- or, should another
@@ -588,7 +635,7 @@ struct LinkingVisitor : ObjectStoreVisitor
         });
         if (linkable)
             objects.enterWritten(entry.hash, executable, dirFd, name, target.where, repair, hold);
-        return node;
+        return std::move(file.node);
     }
 };
 
@@ -705,6 +752,7 @@ struct MaterialisingVisitor : LinkingVisitor
     const SourcePath & source;
     LocalStore::TreeNamer namer;
     RestoreSinkHooks * hooks;
+    std::function<void(const std::filesystem::path &, const GitObjectStore::Hold &)> commitAttempt;
 
     /* The naming's memo, which the namer closes over, is not made for two
        threads: `MemoVisitor::keyOf` initialises its `Cache` handle lazily
@@ -724,11 +772,13 @@ struct MaterialisingVisitor : LinkingVisitor
         LocalStore::TreeNamer namer,
         RestoreSinkHooks * hooks,
         size_t workers,
-        const SourcePath & source)
+        const SourcePath & source,
+        decltype(commitAttempt) commitAttempt)
         : LinkingVisitor(objects, hold, restore, repair)
         , source(source)
         , namer(std::move(namer))
         , hooks(hooks)
+        , commitAttempt(std::move(commitAttempt))
         , workers(workers)
     {
     }
@@ -759,6 +809,19 @@ struct MaterialisingVisitor : LinkingVisitor
        leave scope. Listing types affect scheduling alone. */
     void copyChildren(const CanonPath &, Children children, fun<void(std::string_view, bool, fun<HashedNode()>)> & each)
     {
+        if (workers == 1) {
+            /* A filter may evaluate Nix or throw. Visit immediately, on
+               the caller's thread, before asking it about the next sibling. */
+            CaseHackNames hack;
+            children([&](std::string_view name, bool isDirectory, fun<HashedNode()> visit) {
+                auto & diskNames = frames().diskNames;
+                diskNames.push_back(hack.diskName(name));
+                Finally pop{[&] { diskNames.pop_back(); }};
+                each(name, isDirectory, std::move(visit));
+            });
+            return;
+        }
+
         struct Child
         {
             std::string name;
@@ -823,32 +886,43 @@ struct MaterialisingVisitor : LinkingVisitor
            bytes are read. Probe the holder first and stream a miss directly
            into its destination, without buffering and hashing it again.
            Mutable worktrees supply no such identity; repair ignores it. */
-        if (!repair && st.type == SourceAccessor::tRegular && st.fileSize)
+        if (!repair && st.type == SourceAccessor::tRegular)
             if (auto entry = source.accessor->getKnownEntry(source.path / path);
                 entry && entry->hash.algo == merkle::hashAlgo
                 && entry->mode == (st.isExecutable ? merkle::Mode::Executable : merkle::Mode::Regular)) {
                 auto target = at(path);
                 auto [owned, dirFd, name] = target.sink.parentOf(target.name);
                 bool linkable = linkableOnThisSystem(target.where);
-                if (!linkable
-                    || !objects.link(
-                        entry->hash, st.isExecutable, dirFd, name, target.where, st.fileSize, repair, hold)) {
-                    auto writer = target.sink.beginRegularFile(target.name);
-                    if (st.isExecutable)
-                        writer->isExecutable();
-                    source.accessor->readFile(source.path / path, *writer, [&](uint64_t size) {
-                        if (size != *st.fileSize)
-                            throw Error("immutable file '%s' changed size while copying", source.path / path);
-                        writer->preallocateContents(size);
-                    });
-                    writer->finish();
-                    if (auto * fdSink = dynamic_cast<FdSink *>(writer.get()); fdSink && fdSink->written != *st.fileSize)
-                        throw Error("immutable file '%s' delivered the wrong number of bytes", source.path / path);
-                    writer.reset();
-                    if (linkable)
-                        objects.enterWritten(entry->hash, st.isExecutable, dirFd, name, target.where, repair, hold);
-                }
-                return HashedNode{.entry = *entry, .narSize = merkle::nar::regular(*st.fileSize, st.isExecutable)};
+                PosixStat linked;
+                if (linkable
+                    && objects.link(
+                        entry->hash, st.isExecutable, dirFd, name, target.where, st.fileSize, repair, hold, &linked))
+                    return HashedNode{
+                        .entry = *entry,
+                        .narSize = merkle::nar::regular(static_cast<uint64_t>(linked.st_size), st.isExecutable)};
+
+                auto writer = target.sink.beginRegularFile(target.name);
+                if (st.isExecutable)
+                    writer->isExecutable();
+                /* Stat need not know a packed blob's size. readFile must
+                   announce it before writing, so the copy obtains it only
+                   when it actually needs the bytes. */
+                std::optional<uint64_t> size;
+                source.accessor->readFile(source.path / path, *writer, [&](uint64_t announced) {
+                    if (st.fileSize && announced != *st.fileSize)
+                        throw Error("immutable file '%s' changed size while copying", source.path / path);
+                    size = announced;
+                    writer->preallocateContents(announced);
+                });
+                if (!size)
+                    throw Error("immutable file '%s' did not announce its size", source.path / path);
+                writer->finish();
+                if (auto * fdSink = dynamic_cast<FdSink *>(writer.get()); fdSink && fdSink->written != *size)
+                    throw Error("immutable file '%s' delivered the wrong number of bytes", source.path / path);
+                writer.reset();
+                if (linkable)
+                    objects.enterWritten(entry->hash, st.isExecutable, dirFd, name, target.where, repair, hold);
+                return HashedNode{.entry = *entry, .narSize = merkle::nar::regular(*size, st.isExecutable)};
             }
         if (!path.isRoot() && st.type != SourceAccessor::tDirectory)
             return std::nullopt;
@@ -860,9 +934,17 @@ struct MaterialisingVisitor : LinkingVisitor
             return std::nullopt;
         auto target = at(path);
         auto [owned, dirFd, name] = target.sink.parentOf(target.name);
+        /* A directory may fail after creating some files. Its names must
+           remain private until the whole attempt succeeds: a sibling cannot
+           borrow a pending holder that fallback would subsequently delete. */
+        std::optional<GitObjectStore::Hold> attempt;
+        if (entry->mode == merkle::Mode::Directory) {
+            attempt.emplace(hold.ownRows());
+            attempt->setRoot(hold.root());
+        }
         std::optional<uint64_t> narSize;
         try {
-            narSize = materialise(*entry, dirFd, name, target.where, path.isRoot() ? 0 : 1);
+            narSize = materialise(*entry, dirFd, name, target.where, path.isRoot() ? 0 : 1, attempt ? *attempt : hold);
         } catch (Error & e) {
             warn(
                 "could not materialise %s from the object store: %s; copying it from the source instead",
@@ -876,6 +958,10 @@ struct MaterialisingVisitor : LinkingVisitor
             debug("%s is not held by the object store; copying it from the source", PathFmt(target.where));
             return std::nullopt;
         }
+        /* Publishing a completed name ends rollback's authority over it.
+           A merge error aborts the ingestion; it never resumes fallback. */
+        if (attempt)
+            commitAttempt(target.where, *attempt);
         return HashedNode{.entry = *entry, .narSize = narSize};
     }
 
@@ -896,7 +982,8 @@ struct MaterialisingVisitor : LinkingVisitor
         Descriptor dirFd,
         const CanonPath & name,
         const std::filesystem::path & where,
-        size_t depth)
+        size_t depth,
+        const GitObjectStore::Hold & materialisationHold)
     {
         switch (entry.mode) {
 
@@ -927,14 +1014,15 @@ struct MaterialisingVisitor : LinkingVisitor
                 return merkle::nar::regular(bytes.size(), executable);
             }
             PosixStat linked;
-            if (!objects.link(entry.hash, executable, dirFd, name, where, std::nullopt, repair, hold, &linked))
+            if (!objects.link(
+                    entry.hash, executable, dirFd, name, where, std::nullopt, repair, materialisationHold, &linked))
                 return std::nullopt;
             return merkle::nar::regular(static_cast<uint64_t>(linked.st_size), executable);
         }
 
         case merkle::Mode::Symlink: {
             auto file = objects.blobFile(entry.hash, false);
-            if (!objects.holdBlob(entry.hash, false, hold))
+            if (!objects.holdBlob(entry.hash, false, materialisationHold))
                 return std::nullopt;
             auto target = readFile(file);
             if (merkle::blobId(target) != entry.hash) {
@@ -951,7 +1039,7 @@ struct MaterialisingVisitor : LinkingVisitor
         case merkle::Mode::Directory: {
             if (depth >= narMaxDepth)
                 throw Error("path %s exceeds maximum NAR directory depth of %d", PathFmt(where), narMaxDepth);
-            if (!objects.holdTree(entry.hash, hold))
+            if (!objects.holdTree(entry.hash, materialisationHold))
                 return std::nullopt;
             auto tree = objects.readVerifiedTree(entry.hash);
             if (!tree)
@@ -984,7 +1072,8 @@ struct MaterialisingVisitor : LinkingVisitor
             CaseHackNames hack;
             for (auto & [childName, child] : entries) {
                 auto disk = hack.diskName(childName);
-                auto sub = materialise(*child, fd.get(), CanonPath::fromFilename(disk), where / disk, depth + 1);
+                auto sub = materialise(
+                    *child, fd.get(), CanonPath::fromFilename(disk), where / disk, depth + 1, materialisationHold);
                 if (!sub)
                     return std::nullopt;
                 size.add(childName, *sub);
@@ -1061,7 +1150,37 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
     size_t workers = copyWorkersForTest.load(std::memory_order_relaxed);
     if (!workers)
         workers = std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
-    MaterialisingVisitor visitor{objects, hold, restore, repair, std::move(namer), hooks, workers, path};
+    /* Only the identity filter proves that reordering or concurrent calls
+       have no effects. Its type survives copies of defaultPathFilter. */
+    if (!filter.get_fn().target<AllPaths>())
+        workers = 1;
+    auto commitAttempt = [&](const std::filesystem::path & subtree, const GitObjectStore::Hold & attempt) {
+        std::vector<BlobCoalescing> collisions;
+        for (auto row : attempt.takeRows()) {
+            auto other = hold.addRow(row);
+            if (!other)
+                continue;
+            auto current = lstat(std::filesystem::path(*other));
+            if (current.st_ino == row.ino && current.st_dev == row.dev)
+                continue;
+            auto own = row.name.empty() ? hold.root() : hold.root() / row.name;
+            row.name = own == subtree ? "" : own.lexically_relative(subtree).string();
+            collisions.push_back({
+                std::move(row),
+                {{current.st_ino, current.st_dev, static_cast<uint64_t>(current.st_size), *other}},
+            });
+        }
+        /* A completed attempt may share several aliases of each losing
+           inode. Reconcile all of them before returning, using the same
+           physical walk as publication; replacing one row is insufficient. */
+        if (!collisions.empty()) {
+            auto result = coalesceBlobs(subtree, hold, collisions);
+            if (!result.rejected.empty())
+                throw Error("a completed ingestion holder changed while materialising %s", PathFmt(subtree));
+        }
+    };
+    MaterialisingVisitor visitor{
+        objects, hold, restore, repair, std::move(namer), hooks, workers, path, std::move(commitAttempt)};
     beginIngestion(hold, dst);
     auto result = objectHashOf(*path.accessor, path.path, filter, visitor);
     /* Every `known` answer carries the size of what it made, so the NAR
@@ -1078,31 +1197,71 @@ StorePath LocalStore::materialise(
     if (!materialisesFromObjects())
         throw Error("this store cannot materialise a path from its object store");
 
-    /* The registration of `addToStoreFromDump`'s spilled route, step for
-       step (local-store.cc): a NAR under the git method is restored into a
-       locked temporary directory in the store, the content address is the
-       root the restore computed, and the path is locked, moved into place
-       and registered; the deferred signature check of `addToStore(info,
-       source)` belongs to a received description and has no analogue
-       here, as it has none there. */
+    /* Name the bytes observed by this copy. An unnamed regular root can
+       remain buffered until its destination is known to need writing;
+       every other copy uses the existing locked temporary. Both register
+       the same Git address, root entry and NAR size through one path. */
     const LocalSettings & localSettings = config->getLocalSettings();
     auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(localSettings.ignoredAcls));
 
-    /* Before the restore, for the reason `addToStore` gives: the objects
-       are written before the path is registered (01 §10, *the
-       ingestion's `autoGC()` runs before the restore*). */
-    autoGC();
+    std::optional<GitObjectStore::Hold> hold;
+    AutoCloseFD tempDirFd;
+    std::optional<AutoDelete> delTempDir;
+    std::filesystem::path tempPath;
+    RestoreSink restore{localSettings.fsyncStorePaths, hooks.get()};
+    auto prepare = [&] {
+        if (hold)
+            return;
+        /* Collection precedes every write; a buffered, already valid
+           root needs neither collection nor an ingestion's hold. */
+        autoGC();
+        hold.emplace(objects.hold());
+        auto [tempDir, fd] = createTempDirInStore();
+        tempDirFd = std::move(fd);
+        delTempDir.emplace(tempDir);
+        tempPath = tempDir / "x";
+        restore.dstPath = tempPath;
+    };
 
-    /* The objects written and reused are held until the registration
-       below (`GitObjectStore::Hold`; `08` K16). */
-    auto hold = objects.hold();
-
-    auto [tempDir, tempDirFd] = createTempDirInStore();
-    AutoDelete delTempDir(tempDir);
-    auto tempPath = tempDir / "x";
-
-    auto result = materialiseThroughObjects(
-        tempPath, path, filter, localSettings.fsyncStorePaths, hooks.get(), repair, std::move(namer), hold);
+    std::optional<BufferedRegularFile> buffered;
+    checkInterrupt();
+    auto st = path.lstat();
+    auto result = [&] {
+        if (st.type == SourceAccessor::tRegular) {
+            auto entry = repair ? std::nullopt : path.accessor->getKnownEntry(path.path);
+            if (entry
+                && (entry->hash.algo != merkle::hashAlgo
+                    || entry->mode != (st.isExecutable ? merkle::Mode::Executable : merkle::Mode::Regular)))
+                entry.reset();
+            if (!entry) {
+                entry = namer(CanonPath::root, st);
+                /* Keep the answer associated with this observation, rather
+                   than asking a mutable source's namer a second time. */
+                if (entry)
+                    namer = [entry, rest = std::move(namer)](const CanonPath & p, const SourceAccessor::Stat & s) {
+                        return p.isRoot() ? entry : rest(p, s);
+                    };
+            }
+            if (!entry) {
+                buffered.emplace(readBufferedRegular(
+                    CanonPath::root,
+                    [&](CreateRegularFileSink & sink) {
+                        if (st.isExecutable)
+                            sink.isExecutable();
+                        path.readFile(sink, [&](uint64_t size) { sink.preallocateContents(size); });
+                    },
+                    [&] {
+                        prepare();
+                        beginIngestion(*hold, tempPath);
+                        return restore.beginRegularFile(CanonPath::root);
+                    }));
+                return ObjectHashSink::Result::of(buffered->node);
+            }
+        }
+        prepare();
+        return materialiseThroughObjects(
+            tempPath, path, filter, localSettings.fsyncStorePaths, hooks.get(), repair, std::move(namer), *hold);
+    }();
 
     if (settings.warnLargePathThreshold && result.narSize >= settings.warnLargePathThreshold)
         warn("copied large path '%s' to the store (%s)", path, renderSize(result.narSize));
@@ -1121,6 +1280,16 @@ StorePath LocalStore::materialise(
         if (repair || !isValidPathUncached(dstPath)) {
             deletePath(realPath);
 
+            if (buffered) {
+                prepare();
+                if (!buffered->writer)
+                    beginIngestion(*hold, tempPath);
+                LinkingVisitor linking{objects, *hold, restore, repair};
+                linking.placeRegular(linking.at(CanonPath::root), std::move(*buffered));
+                buffered.reset();
+                objects.putRootTree(result.root, *hold);
+            }
+
             try {
                 /* movePath and not renameFile because at this point the top-level directory is
                    read-only. */
@@ -1134,8 +1303,8 @@ StorePath LocalStore::materialise(
                 RestoreSink copySink{/*startFsync=*/false, /*hooks=*/hooks.get()};
                 copySink.dstPath = realPath;
                 copyRecursive(*makeFSSourceAccessor(tempPath), CanonPath::root, copySink, CanonPath::root);
-                delTempDir.deletePath();
-                result = enterPath(realPath, repair, hold);
+                delTempDir->deletePath();
+                result = enterPath(realPath, repair, *hold);
             }
 
             if (localSettings.fsyncStorePaths) {
@@ -1145,7 +1314,7 @@ StorePath LocalStore::materialise(
 
             auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
             info.narSize = result.narSize;
-            registerValidPath(info, hold);
+            registerValidPath(info, *hold);
         } else
             // We may have a negative cache entry for this path, so get rid of it.
             invalidatePathInfoCacheFor(dstPath);
@@ -1166,6 +1335,218 @@ LocalStore::verifyObjects(const std::filesystem::path & realPath)
     if (auto body = merkle::syntheticRootTree(result.root))
         verify.expect(objects.treeFile(merkle::treeId(*body)));
     return {result, std::move(verify.missing)};
+}
+
+LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
+    const std::filesystem::path & root,
+    const GitObjectStore::Hold & hold,
+    const std::vector<BlobCoalescing> & collisions)
+{
+#ifdef _WIN32
+    return {};
+#else
+    /* Only overlapping misses need this walk. Publication reserves the
+       database writer before selecting registered donors; speculative-copy
+       completion supplies stable names already owned by its ingestion.
+       Pin first, then validate the pinned inode and its bytes. Nothing here
+       calls the index, takes a temp root, or acquires the auxiliary-object lock. */
+    struct Winner
+    {
+        const GitObjectStore::Hold::Row & row;
+        GitObjectStore::Holder holder;
+        std::filesystem::path pin;
+        AutoDelete cleanup;
+        std::optional<std::filesystem::path> representative;
+    };
+
+    std::vector<Winner> winners;
+    winners.reserve(collisions.size());
+    BlobCoalescingResult result;
+    std::map<std::pair<dev_t, ino_t>, size_t> byInode;
+    std::map<std::pair<dev_t, ino_t>, size_t> byWinnerInode;
+    auto temporary = [&] { return hold.directory() / objects.tempPath("coalesce").filename(); };
+
+    for (auto & collision : collisions) {
+        auto & row = collision.row;
+        bool selected = false;
+        bool refused = false;
+        for (auto & candidate : collision.candidates) {
+            if (candidate.size != row.size) {
+                result.rejected.emplace_back(row, candidate);
+                continue;
+            }
+            auto before = maybeLstat(std::filesystem::path(candidate.file));
+            if (!before || !GitObjectStore::validHolderMetadata(candidate, row.executable, *before)) {
+                result.rejected.emplace_back(row, candidate);
+                continue;
+            }
+            if (candidate.ino == row.ino && candidate.dev == row.dev) {
+                /* The owned target already pins this inode. No additional
+                   link is needed, including at the filesystem's link limit. */
+                auto own = row.name.empty() ? root : root / row.name;
+                auto current = lstat(own);
+                if (!GitObjectStore::validHolderMetadata(candidate, row.executable, current))
+                    throw Error("ingestion holder %s changed before publication", PathFmt(own));
+                auto observed = GitObjectStore::blobIdOfFile(own);
+                if (observed != row.id)
+                    throw Error(
+                        "cannot publish ingestion holder %s: expected blob %s, observed %s",
+                        PathFmt(own),
+                        GitObjectStore::idString(row.id),
+                        GitObjectStore::idString(observed));
+                selected = true;
+                result.representatives.push_back(row);
+                break;
+            }
+            auto pin = temporary();
+            std::error_code ec;
+            if (objects.failPlaceWithNoSpace && objects.failPlaceWithNoSpace(pin))
+                ec = std::make_error_code(std::errc::no_space_on_device);
+            else
+                std::filesystem::create_hard_link(candidate.file, pin, ec);
+            if (ec) {
+                if (ec == std::errc::no_such_file_or_directory) {
+                    result.rejected.emplace_back(row, candidate);
+                    continue;
+                }
+                if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
+                    refused = true;
+                    continue;
+                }
+                /* A replacement by a directory can make link fail with
+                   EPERM. Judge that stale candidate, not the link error. */
+                auto now = maybeLstat(std::filesystem::path(candidate.file));
+                if (!now || !GitObjectStore::validHolderMetadata(candidate, row.executable, *now)) {
+                    result.rejected.emplace_back(row, candidate);
+                    continue;
+                }
+                throw Error(
+                    "pinning blob holder %1% as %2%: %3%",
+                    PathFmt(std::filesystem::path(candidate.file)),
+                    PathFmt(pin),
+                    ec.message());
+            }
+            AutoDelete cleanup(pin, false);
+            auto pinned = lstat(pin);
+            if (!GitObjectStore::validHolderMetadata(candidate, row.executable, pinned)
+                || GitObjectStore::blobIdOfFile(pin) != row.id) {
+                result.rejected.emplace_back(row, candidate);
+                continue;
+            }
+            selected = true;
+            auto [_, inserted] = byInode.emplace(std::pair{row.dev, row.ino}, winners.size());
+            if (!inserted)
+                throw Error("one ingestion records different blobs for the same inode in %s", PathFmt(root));
+            byWinnerInode.emplace(std::pair{candidate.dev, candidate.ino}, winners.size());
+            winners.push_back(Winner{row, candidate, std::move(pin), std::move(cleanup), std::nullopt});
+            break;
+        }
+        /* No usable donor means this file can become the holder. A file
+           refused sharing is an exception, not a new canonical donor. */
+        if (!selected && !refused)
+            result.representatives.push_back(row);
+    }
+    if (winners.empty())
+        return result;
+
+    /* Enumerate physical aliases, not names reconstructed from the Merkle
+       tree. Entered paths can contain noncanonical case-hack suffixes, and
+       (device, inode) already proves which regular files are aliases. The
+       final path is authoritative: hold.root() can name a moved temporary. */
+    auto walk = [&](auto && self, const std::filesystem::path & where, size_t depth) -> void {
+        checkInterrupt();
+        auto st = lstat(where);
+        if (S_ISDIR(st.st_mode)) {
+            if (depth >= narMaxDepth)
+                throw Error("path %s exceeds maximum NAR directory depth of %d", PathFmt(where), narMaxDepth);
+            /* Replacing a directory entry while its iterator is live has
+               unspecified visibility. Finish enumerating before relinking. */
+            std::vector<std::filesystem::path> children;
+            for (auto & entry : DirectoryIterator{where})
+                children.push_back(entry.path());
+            for (auto & child : children)
+                self(self, child, depth + 1);
+            return;
+        }
+        if (!S_ISREG(st.st_mode))
+            return;
+        auto i = byInode.find({st.st_dev, st.st_ino});
+        if (!linkableOnThisSystem(where))
+            return;
+        if (i == byInode.end()) {
+            /* A prior partially completed attempt may already have linked
+               an alias even when the old representative still lost. */
+            auto existing = byWinnerInode.find({st.st_dev, st.st_ino});
+            if (existing != byWinnerInode.end()) {
+                auto & winner = winners[existing->second];
+                if (!winner.representative
+                    && GitObjectStore::validHolderMetadata(winner.holder, winner.row.executable, st))
+                    winner.representative = where;
+            }
+            return;
+        }
+        auto & winner = winners[i->second];
+        auto & row = winner.row;
+        auto expected = GitObjectStore::Holder{row.ino, row.dev, row.size, where.string()};
+        if (!GitObjectStore::validHolderMetadata(expected, row.executable, st))
+            return;
+        if (objects.failPlaceWithNoSpace && objects.failPlaceWithNoSpace(where))
+            return;
+
+        auto parent = where.parent_path();
+        WritableDirectory dir(parent, parent != config->realStoreDir.get());
+        auto name = CanonPath::fromFilename(where.filename().string());
+        /* Re-check after opening the containing directory, so a pathname
+           replaced since enumeration is never intentionally overwritten. */
+        auto before = statIn(dir.fd.get(), name, where);
+        if (!GitObjectStore::validHolderMetadata(expected, row.executable, before))
+            return;
+        auto link = temporary();
+        std::error_code ec;
+        std::filesystem::create_hard_link(winner.pin, link, ec);
+        if (ec) {
+            if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
+                printInfo("cannot share %s: %s; left as written", PathFmt(where), ec.message());
+                return;
+            }
+            throw Error("creating hard link from %1% to %2%: %3%", PathFmt(winner.pin), PathFmt(link), ec.message());
+        }
+        AutoDelete cleanup(link, false);
+        if (::renameat(AT_FDCWD, link.c_str(), dir.fd.get(), name.rel_c_str()) == -1) {
+            auto ec = std::error_code(errno, std::generic_category());
+            if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
+                printInfo("cannot share %s: %s; left as written", PathFmt(where), ec.message());
+                return;
+            }
+            throw Error("replacing %1% by a link to %2%: %3%", PathFmt(where), PathFmt(winner.pin), ec.message());
+        }
+        cleanup.cancel();
+        result.modified = true;
+        if (!winner.representative)
+            winner.representative = where;
+    };
+    walk(walk, root, 0);
+
+    /* A link limit can leave some aliases unchanged. Publish a surviving
+       winning alias, or no representative if every replacement was refused;
+       an exceptional unshared inode must not become a donor for later paths. */
+    for (auto & winner : winners) {
+        auto & row = winner.row;
+        if (!winner.representative)
+            continue;
+        auto st = maybeLstat(*winner.representative);
+        if (!st || !GitObjectStore::validHolderMetadata(winner.holder, row.executable, *st))
+            continue;
+        auto replacement = row;
+        replacement.ino = st->st_ino;
+        replacement.dev = st->st_dev;
+        replacement.size = static_cast<uint64_t>(st->st_size);
+        replacement.name =
+            *winner.representative == root ? "" : winner.representative->lexically_relative(root).string();
+        result.representatives.push_back(std::move(replacement));
+    }
+    return result;
+#endif
 }
 
 ObjectHashSink::Result LocalStore::enterIntoObjects(
@@ -1202,6 +1583,10 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
 
     for (auto & i : paths) {
         addTempRoot(i);
+        auto pathRoot = toRealPath(i);
+        PathLocks outputLock;
+        if (!locksHeld.count(printStorePath(i)))
+            outputLock.lockPaths({pathRoot});
         auto row = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
             [&]() { return queryPathInfoInternal(*_state->lock(), i); });
         if (!row)
@@ -1241,18 +1626,18 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
             }
             stats.rowsMigrated++;
         }
-        /* Every path is walked; a path entered before costs its directory
-           walk and no more, since its files' inodes are in `blobInodes`.
+        /* Every path is walked; an inode hint that still has a canonical
+           holder avoids reading the file's contents.
            On a store this Nix wrote that is every path.  The path is
            valid, so its root is live already; the trees written beneath it
            are held until the root is (`Hold`; `08` K16), since no GC lock
            is taken here and a collection may sweep meanwhile. */
         auto hold = objects.hold();
-        auto pathRoot = config->realStoreDir.get() / i.to_string();
         enterIntoObjects(pathRoot, NoRepair, hold, &act, &stats, &blobInodes);
         /* `nix-store --optimise` is what re-establishes an index a
            collection or an older Nix left incomplete. */
         endIngestion(hold, i);
+        outputLock.setDeletion(true);
         done++;
         act.progress(done, paths.size());
     }

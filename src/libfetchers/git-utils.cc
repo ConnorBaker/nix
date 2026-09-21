@@ -361,6 +361,12 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
      */
     Repository repo;
 
+    /* Attribute lookups refresh shared file stamps and macro definitions
+       outside libgit2's cache locks. All accessors using this repository
+       share this boundary, including the private commit-attribute handles.
+       Raw object reads use libgit2's object/ODB locks instead. */
+    std::mutex attributeMutex;
+
     /**
      * In-memory object store for efficient batched writing to packfiles.
      * Owned by `repo`.
@@ -657,6 +663,9 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 
     WorkdirInfo getWorkdirInfo() override
     {
+        /* Status's content filters also consult the attribute cache. Its
+           callbacks are internal libgit2 operations, not accessor calls. */
+        std::lock_guard attributeLock(attributeMutex);
         WorkdirInfo info;
 
         /* Get the head revision, if any. */
@@ -937,7 +946,13 @@ public:
         const auto blob = getBlob(*state, path, symlink);
 
         if (state->lfsFetch) {
-            if (state->lfsFetch->shouldFetch(path)) {
+            auto shouldFetch = [&] {
+                /* Always take the accessor state before the shared
+                   attribute lock; release it before network transfer. */
+                std::lock_guard attributeLock(state->repo->attributeMutex);
+                return state->lfsFetch->shouldFetch(path);
+            }();
+            if (shouldFetch) {
                 try {
                     // FIXME: do we need to hold the state lock while
                     // doing this?
@@ -1320,12 +1335,6 @@ static bool attributesFileMentions(const std::filesystem::path & file, const std
     }
 }
 
-/* The attributes that could make a working-directory file differ from its
-   blob: a content filter, an end-of-line or encoding conversion, or ident
-   expansion.  Any of these names, however negated or valued, counts. */
-static const std::set<std::string> filteringAttributes{
-    "text", "eol", "crlf", "filter", "ident", "working-tree-encoding"};
-
 /* The directories of one of libgit2's search paths (`git_libgit2_opts`,
    `GIT_OPT_GET_SEARCH_PATH`), as it resolved them at initialisation or was
    told since; the same list `git_sysdir_find_in_dirlist` walks. */
@@ -1453,175 +1462,6 @@ bool GitRepoImpl::attributesOutsideTheTreeMention(std::string_view attribute, st
     return false;
 }
 
-/* Every `.gitattributes` git reads for a working directory, tracked or not:
-   git looks in each directory that holds a tracked file and in each ancestor
-   of one.  `f` gets the path within the tree and stops the walk by returning
-   true; the result is whether it did. */
-static bool forEachWorkdirAttributesFile(const GitRepo::WorkdirInfo & wd, fun<bool(const CanonPath &)> f)
-{
-    std::set<CanonPath> directories;
-    for (auto & p : wd.files) {
-        auto d = p;
-        while (!d.isRoot()) {
-            d.pop();
-            if (!directories.insert(d).second)
-                break;
-        }
-    }
-    for (auto & d : directories)
-        if (f(d / ".gitattributes"))
-            return true;
-    return false;
-}
-
-/* Whether the working directory holds the repository's blobs byte for byte
-   and with their modes: no content filter can apply, and the repository
-   honours file modes and symlinks.  Only then does a clean file's status
-   say that its bytes are its blob's, which is what naming a clean subtree
-   by the commit's object asserts (doc/lazy-store/01-specification.md,
-   section 9.9).  Any doubt, including a configuration that cannot be read,
-   answers no. */
-static bool workdirHoldsTheBlobs(GitRepoImpl & repo, const GitRepo::WorkdirInfo & wd)
-{
-    GitConfig config;
-    if (git_repository_config_snapshot(Setter(config), repo))
-        return false;
-
-    auto boolSetting = [&](const char * key, bool dflt) -> std::optional<bool> {
-        int value;
-        auto err = git_config_get_bool(&value, config.get(), key);
-        if (err == GIT_ENOTFOUND)
-            return dflt;
-        if (err)
-            return std::nullopt; /* a value such as `autocrlf = input`: not a plain boolean */
-        return value != 0;
-    };
-    if (boolSetting("core.autocrlf", false) != std::optional<bool>(false))
-        return false;
-    if (boolSetting("core.filemode", true) != std::optional<bool>(true))
-        return false;
-    if (boolSetting("core.symlinks", true) != std::optional<bool>(true))
-        return false;
-
-    /* The attributes files in the working directory, tracked or not, then
-       the files outside the tree, the system's among them. */
-    if (forEachWorkdirAttributesFile(
-            wd, [&](const CanonPath & p) { return attributesFileMentions(repo.path / p.rel(), filteringAttributes); }))
-        return false;
-    for (auto & file : attributesFilesOutsideTheTree(repo))
-        if (attributesFileMentions(file, filteringAttributes))
-            return false;
-    return true;
-}
-
-/* The working directory of a repository, its clean subtrees named by the
-   commit's tree entries (doc/lazy-store/01-specification.md, section 9.9):
-   a path with no modified, added or deleted file at or below it holds what
-   HEAD holds there, so HEAD's object names it, and the memo rows of the
-   clean commit answer for it.  The root, and every path with a change at or
-   below it, carry the whole tree's name as before.  Sound only when the
-   working directory holds the blobs (`workdirHoldsTheBlobs`), which the
-   constructor's caller checks.
-
-   The same assertion says where a clean file's *bytes* come from, and they
-   come from the object database (01 §9.10, "One route"): the walk reads the
-   commit's blob and never opens the file.  The rule it rests on is exactly
-   the rule the naming already rests on -- `getWorkdirInfo` calls
-   `git_status_foreach_ext` with `GIT_STATUS_OPT_INCLUDE_UNMODIFIED` and
-   `GIT_STATUS_OPT_EXCLUDE_SUBMODULES`, and puts in `dirtyFiles` every
-   tracked path whose status is not `GIT_STATUS_CURRENT`; a path that is
-   neither there nor in `deletedFiles`, and is therefore not in
-   `changedAtOrBelow`, is one git reports equal in HEAD, in the index and in
-   the working tree.  Where git decides that from its stat cache rather than
-   from the bytes -- a working-tree file whose size and timestamps still
-   match the index though its contents do not -- it is git's own answer that
-   is taken, and it is the answer the naming takes: before this, the first
-   entry of such a checkout copied the working tree's bytes under the name of
-   HEAD's, and the second copied HEAD's, since the memo answered the clean
-   subtree.  Now both copy HEAD's.  Every path git does report changed,
-   however it decided, is read from the working directory as before.
-
-   Only regular files are redirected.  A symlink is one `readlinkat` with no
-   open, and a directory's listing must be the working directory's. */
-struct GitWorkdirSourceAccessor final : FilteringSourceAccessor
-{
-private:
-    void anchor() override {};
-public:
-    ref<GitSourceAccessor> head;
-    /* Every changed path, and every ancestor of one. */
-    std::unordered_set<CanonPath> changedAtOrBelow;
-    /* The tests alone turn the redirect off, to measure it and to mutate
-       it (`05` section 4); nothing a user decides is here.  Read once per
-       accessor, so a test may make one either way. */
-    bool fromObjects = getEnv("_NIX_TEST_NO_ODB_READS").value_or("") != "1";
-
-    GitWorkdirSourceAccessor(ref<SourceAccessor> next, ref<GitSourceAccessor> head, const GitRepo::WorkdirInfo & wd)
-        : FilteringSourceAccessor(
-              SourcePath(next),
-              [](const CanonPath & path) { return RestrictedPathError("access to '%s' is forbidden", path); })
-        , head(head)
-    {
-        for (auto * changed : {&wd.dirtyFiles, &wd.deletedFiles})
-            for (auto & p : *changed)
-                for (auto q = p;; q.pop()) {
-                    changedAtOrBelow.insert(q);
-                    if (q.isRoot())
-                        break;
-                }
-    }
-
-    bool isAllowed(const CanonPath & path) override
-    {
-        return true;
-    }
-
-    /* Whether HEAD's object at `path` is what the working directory holds
-       there: the predicate `getFingerprint` names a subtree by and
-       `readFile` reads by. */
-    bool cleanUnderHead(const CanonPath & path) const
-    {
-        return !path.isRoot() && !changedAtOrBelow.contains(path);
-    }
-
-    using FilteringSourceAccessor::readFile;
-
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
-    {
-        if (fromObjects && cleanUnderHead(path)) {
-            bool delivered = false;
-            try {
-                head->readFile(path, sink, [&](uint64_t size) {
-                    delivered = true;
-                    sizeCallback(size);
-                });
-                return;
-            } catch (Error & e) {
-                /* Past the first byte there is no second reader. */
-                if (delivered)
-                    throw;
-                /* HEAD must hold what git reports clean; should it not, the
-                   working directory is still the truth about the tree, and
-                   saying so is better than failing.  As the copy does when
-                   an object it expected is missing. */
-                warn(
-                    "'%s' is unmodified in the working directory but could not be read from the repository: %s; "
-                    "reading the file instead",
-                    path,
-                    e.msg());
-            }
-        }
-        FilteringSourceAccessor::readFile(path, sink, sizeCallback);
-    }
-
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
-    {
-        if (!cleanUnderHead(path))
-            return {path, fingerprint};
-        return head->getFingerprint(path);
-    }
-};
-
 struct GitExportIgnoreSourceAccessor final : CachingFilteringSourceAccessor
 {
 private:
@@ -1700,6 +1540,9 @@ public:
 
     bool isExportIgnored(const CanonPath & path)
     {
+        /* The workdir handle can also belong to another export-ignore or
+           LFS accessor. Keep the returned attribute alive through use. */
+        std::lock_guard attributeLock(repo->attributeMutex);
         const char * exportIgnoreEntry = nullptr;
 
         // GIT_ATTR_CHECK_INDEX_ONLY:
@@ -1937,12 +1780,10 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
             /*allowedPaths=*/{CanonPath::root},
             std::move(makeNotAllowedError))
             .cast<SourceAccessor>();
-    /* Name the clean subtrees by the commit's objects when the working
-       directory holds the blobs.  Under `exportIgnore`, when a source names
-       `export-ignore`, the wrapper below hides these names, since the
-       exported tree is then not the commit's. */
-    if (wd.headRev && workdirHoldsTheBlobs(*this, wd))
-        fileAccessor = make_ref<GitWorkdirSourceAccessor>(fileAccessor, getRawAccessor(*wd.headRev, {}), wd);
+    /* Status determines tracked membership, not filesystem-object identity:
+       index flags can suppress comparisons, and clean filters can equate
+       different bytes. Keep the working tree as the source of its contents
+       and decline to name subtrees by HEAD. */
     /* The filter asks with `GIT_ATTR_CHECK_INDEX_ONLY`: the index's
        `.gitattributes` and the files outside the tree.  When none names
        `export-ignore` it is the identity and is not applied. */

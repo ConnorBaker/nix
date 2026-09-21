@@ -192,7 +192,7 @@ TEST_F(ValuePrintingTests, vFailed)
     try {
         throw Error("nope");
     } catch (...) {
-        v.mkFailed(std::current_exception(), nullptr);
+        v.mkFailed(std::current_exception(), nullptr, state.mem);
     }
 
     // Historically, a tried and then ignored value (e.g. through tryEval) was

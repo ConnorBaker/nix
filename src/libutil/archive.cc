@@ -37,7 +37,7 @@ static ArchiveSettings archiveSettings;
 
 static GlobalConfig::Register rArchiveSettings(&archiveSettings);
 
-PathFilter defaultPathFilter = [](const std::string &) { return true; };
+PathFilter defaultPathFilter = AllPaths{};
 
 std::string_view unhackName(std::string_view name)
 {

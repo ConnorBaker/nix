@@ -49,7 +49,9 @@ db="$stateB/db/db.sqlite"
 holder() {
     sqlite3 "$db" "select i.path || (case when b.name = '' then '' else '/' || b.name end)
                    from Blobs b join Ingestions i on i.id = b.ingestion
-                   where b.id = X'$1' and b.exec = 0 and i.path is not null"
+                   join ValidPaths v on v.path = i.path
+                   where b.id = X'$1' and b.exec = 0
+                   order by b.dev, b.ino, b.ingestion limit 1"
 }
 blobRows() { sqlite3 "$db" "select count(*) from Blobs where id = X'$1' and exec = 0"; }
 ingestions() { sqlite3 "$db" "select count(*) from Ingestions where path = '$1'"; }

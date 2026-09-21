@@ -29,8 +29,8 @@ needLocalStore "the column and the verifier are the local store's"
 # root's blob, it now asks "is the blob's row there?", which is the same
 # question of the same store.
 objectFile() { echo "$NIX_STORE_DIR/.objects/$1/${2:0:2}/$2"; }
-# The index's row for (identifier, mode), counted whether or not its
-# ingestion has a path: the sweep is what removes a stale one.
+# All candidate rows for (identifier, mode), counted whether or not their
+# ingestions have paths: the sweep is what removes stale candidates.
 blobRow() { sqlite3 "$NIX_STATE_DIR/db/db.sqlite" "select count(*) from Blobs where lower(hex(id)) = '$1' and exec = ${2:-0}"; }
 # The whole index, for the "as an older Nix left it" simulations below: an
 # older Nix wrote no rows, so emptying the object directories is not enough.

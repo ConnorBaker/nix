@@ -13,7 +13,6 @@
 #include "nix/util/logging.hh"
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/util/json-utils.hh"
-#include "nix/util/archive.hh"
 #include "nix/util/memo.hh"
 #include "nix/util/mounted-source-accessor.hh"
 
@@ -1103,6 +1102,12 @@ struct GitInputScheme : InputScheme
             repoInfo.workdirInfo.headRev ? getLastModified(settings, repoInfo, repoPath, *repoInfo.workdirInfo.headRev)
                                          : 0);
 
+        /* A revision returned as worktree metadata is not an identity for
+           its rendered files. Git may ignore changed bytes or normalize
+           them; the explicit empty memo prevents Input::getAccessor from
+           deriving a fingerprint from the revision added above. */
+        input.cachedFingerprint = std::optional<std::string>{};
+
         return {accessor, std::move(input)};
     }
 
@@ -1131,33 +1136,12 @@ struct GitInputScheme : InputScheme
 
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
     {
-        auto makeFingerprint = [&](const Hash & rev) {
-            return rev.gitRev() + (getSubmodulesAttr(input) ? ";s" : "") + (getExportIgnoreAttr(input) ? ";e" : "")
-                   + (getLfsAttr(input) ? ";l" : "");
-        };
-
-        if (auto rev = input.getRev())
-            return makeFingerprint(*rev);
-        else {
-            auto repoInfo = getRepoInfo(input);
-            if (auto repoPath = repoInfo.getPath(); repoPath && repoInfo.workdirInfo.submodules.empty()) {
-                /* Calculate a fingerprint that takes into account the
-                   deleted and modified/added files. */
-                HashSink hashSink{HashAlgorithm::SHA512};
-                for (auto & file : repoInfo.workdirInfo.dirtyFiles) {
-                    writeString("modified:", hashSink);
-                    writeString(file.abs(), hashSink);
-                    dumpPath(*repoPath / file.rel(), hashSink);
-                }
-                for (auto & file : repoInfo.workdirInfo.deletedFiles) {
-                    writeString("deleted:", hashSink);
-                    writeString(file.abs(), hashSink);
-                }
-                return makeFingerprint(repoInfo.workdirInfo.headRev.value_or(nullRev))
-                       + ";d=" + hashSink.finish().hash.to_string(HashFormat::Base16, false);
-            }
-            return std::nullopt;
-        }
+        /* A commit names its raw tree. Worktree comparisons do not prove
+           byte equality, and export-ignore/LFS consult attributes outside
+           that tree. Those views must be named from what they render. */
+        if (auto rev = input.getRev(); rev && !getExportIgnoreAttr(input) && !getLfsAttr(input))
+            return rev->gitRev() + (getSubmodulesAttr(input) ? ";s" : "");
+        return std::nullopt;
     }
 
     bool isLocked(const Settings & settings, const Input & input) const override

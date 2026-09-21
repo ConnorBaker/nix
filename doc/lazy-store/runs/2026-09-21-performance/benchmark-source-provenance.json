@@ -1,0 +1,10 @@
+{
+  "revision": "6aefcda9401be8acc2b74244fb3b37520ea1f0a8",
+  "nodes": 89979,
+  "raw_git_tree_sha256": "e056a772df52d4f6565200d6c66b53cd3975e70778c17b99b3ec48e3b33f657f",
+  "index_matches_tree": true,
+  "checked": [
+    "/home/connorbaker/Benchmarks/nix-eval-78c14bf2d/nixpkgs-git",
+    "/home/connorbaker/Benchmarks/nix-eval-78c14bf2d/nixpkgs-path"
+  ]
+}

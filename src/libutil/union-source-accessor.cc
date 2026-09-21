@@ -20,11 +20,9 @@ private:
 
 public:
     std::vector<ref<SourceAccessor>> accessors;
-    UnionCoherence coherence;
 
-    UnionSourceAccessor(std::vector<ref<SourceAccessor>> _accessors, UnionCoherence coherence)
+    UnionSourceAccessor(std::vector<ref<SourceAccessor>> _accessors)
         : accessors(std::move(_accessors))
-        , coherence(coherence)
     {
         displayPrefix.clear();
     }
@@ -66,14 +64,9 @@ public:
     {
         for (size_t i = 0; i < accessors.size(); ++i) {
             if (auto st = node(*accessors[i], path)) {
-                /* Children that agree wherever both have a node cannot
-                   hide one another, so the first node is the answer and
-                   the ancestors need no probing (the evaluation root:
-                   doc/lazy-store/01-specification.md, section 8.4). */
-                if (coherence != UnionCoherence::ChildrenAgree)
-                    for (size_t j = 0; j < i; ++j)
-                        if (hides(*accessors[j], path))
-                            return std::nullopt;
+                for (size_t j = 0; j < i; ++j)
+                    if (hides(*accessors[j], path))
+                        return std::nullopt;
                 return std::pair{accessors[i], *st};
             }
         }
@@ -171,17 +164,6 @@ public:
         if (fingerprint)
             return {path, fingerprint};
 
-        if (coherence == UnionCoherence::ChildrenAgree) {
-            /* Every child's subtree here is the union's subtree, so any
-               child's name for it will do. */
-            for (auto & accessor : accessors) {
-                auto [subpath, fp] = accessor->getFingerprint(path);
-                if (fp)
-                    return {subpath, fp};
-            }
-            return {path, std::nullopt};
-        }
-
         auto o = owner(path);
         if (!o)
             return {path, std::nullopt};
@@ -212,9 +194,9 @@ public:
 
 } // namespace
 
-ref<SourceAccessor> makeUnionSourceAccessor(std::vector<ref<SourceAccessor>> && accessors, UnionCoherence coherence)
+ref<SourceAccessor> makeUnionSourceAccessor(std::vector<ref<SourceAccessor>> && accessors)
 {
-    return make_ref<UnionSourceAccessor>(std::move(accessors), coherence);
+    return make_ref<UnionSourceAccessor>(std::move(accessors));
 }
 
 } // namespace nix

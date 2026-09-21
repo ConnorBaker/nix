@@ -12,8 +12,9 @@
 # canonical file is a store path's own — a *holder*
 # (doc/lazy-store/06-holder-index.md section 2) — so `.objects/blobs`
 # holds no file for one and `blobs()` counts nothing here; what stands
-# where those files stood is a row in the store's own database, which
-# `blobRows()` counts, and the link counts lose the store's own link.
+# where those files stood are per-ingestion candidate rows in the store's
+# database, including witnesses for reused files. `blobRows()` counts
+# those candidates, and the link counts lose the store's own link.
 
 source common.sh
 
@@ -32,7 +33,7 @@ objectFile() { echo "$objects/$1/${2:0:2}/$2"; }
 # The blobs with files of the store's own naming: the symlink targets,
 # of which this tree has none.
 blobs() { find "$objects/blobs" -mindepth 2 -maxdepth 2 | wc -l | tr -d ' '; }
-# The index's rows whose ingestion has a path: a regular file's blob.
+# Every candidate whose ingestion has a path, including reused blobs.
 blobRows() { sqlite3 "$NIX_STATE_DIR/db/db.sqlite" "select count(*) from Blobs b join Ingestions i on i.id = b.ingestion where b.exec = 0 and i.path is not null"; }
 
 src=$TEST_ROOT/src
@@ -87,12 +88,15 @@ echo four > "$src/d/c"
 tar -C "$TEST_ROOT" -cf "$TEST_ROOT/two.tar" src
 p2=$(nix eval --raw --impure --expr "builtins.fetchTarball \"file://$TEST_ROOT/two.tar\"")
 [[ $p2 != "$p1" ]]
-[[ $(blobRows) == 4 ]]
-[[ $(inode "$p2/a") == $(inode "$p1/a") ]]
-[[ $(nlink "$p1/a") == 2 ]]
+[[ $(blobRows) == 6 ]]
+for file in a d/b; do
+    [[ $(inode "$p2/$file") == $(inode "$p1/$file") ]]
+    [[ $(nlink "$p1/$file") == 2 ]]
+done
+[[ $(inode "$p2/d/c") != $(inode "$p1/d/c") ]]
 [[ $(cat "$p2/d/c") == four ]]
 
 # The same tarball again is a cache hit and copies nothing.
 p3=$(nix eval --raw --impure --expr "builtins.fetchTarball \"file://$TEST_ROOT/two.tar\"")
 [[ $p3 == "$p2" ]]
-[[ $(blobRows) == 4 ]]
+[[ $(blobRows) == 6 ]]

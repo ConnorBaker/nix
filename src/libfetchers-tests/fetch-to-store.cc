@@ -21,6 +21,8 @@
 
 #include <atomic>
 #include <functional>
+#include <mutex>
+#include <thread>
 #include <vector>
 #ifndef _WIN32
 #  include <sys/stat.h>
@@ -399,6 +401,134 @@ ref<NamedCountingAccessor> dirtyTree(std::string_view b, std::string_view dName)
 
 } // namespace
 
+TEST_F(FetchToStoreTest, subtreeNamingIsObservedOnceAndRecordedForTheSameNode)
+{
+    struct ObservedNames : NamedCountingAccessor
+    {
+        std::map<CanonPath, size_t> observations;
+
+        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+        {
+            ++observations[path];
+            return NamedCountingAccessor::getFingerprint(path);
+        }
+    };
+
+    auto store = openStore("dummy://?read-only=false");
+    for (bool named : {false, true})
+        for (bool filtered : {false, true}) {
+            SCOPED_TRACE(fmt("named=%d filtered=%d", named, filtered));
+            fetchers::Settings settings;
+            auto tree = make_ref<ObservedNames>();
+            tree->addFile(CanonPath("plain"), "plain");
+            tree->addFile(CanonPath("nested/child"), "child");
+            tree->addFile(CanonPath("nested/drop"), "drop");
+            MemorySink sink{*tree};
+            sink.createDirectory(CanonPath("empty"));
+            sink.createSymlink(CanonPath("link"), "target");
+            sink.createRegularFile(CanonPath("exec"), [](CreateRegularFileSink & file) {
+                file.isExecutable();
+                file("executable");
+            });
+            std::vector<CanonPath> nodes{
+                CanonPath("plain"),
+                CanonPath("exec"),
+                CanonPath("link"),
+                CanonPath("empty"),
+                CanonPath("nested"),
+                CanonPath("nested/child"),
+                CanonPath("nested/drop")};
+            if (named)
+                for (auto & path : nodes)
+                    tree->names.emplace(path, fmt("transient-%d-%s", filtered, path.abs()));
+
+            auto & filter = filtered ? rejectDrop : defaultPathFilter;
+            auto expected = merkle::objectHash(objectHashOf(*tree, CanonPath::root, filter).root);
+            auto actual = fetchToStore2(
+                settings, *store, SourcePath(tree), FetchMode::DryRun, "source", {}, filtered ? &filter : nullptr);
+            EXPECT_EQ(actual.second, expected);
+            for (auto & path : nodes) {
+                SCOPED_TRACE(path.abs());
+                bool omitted = filtered && path == CanonPath("nested/drop");
+                bool directory = tree->lstat(path).type == SourceAccessor::tDirectory;
+                bool recorded = !omitted && !(filtered && directory);
+                EXPECT_EQ(tree->observations[path], recorded ? 1u : 0u);
+                if (named) {
+                    auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(
+                        tree->names.at(path), ContentAddressMethod::Raw::Git, CanonPath::root));
+                    ASSERT_EQ(row.has_value(), recorded);
+                    if (row) {
+                        auto entry = objectHashOf(*tree, path).root;
+                        EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), entry.hash);
+                        EXPECT_EQ(fetchers::getIntAttr(*row, "mode"), static_cast<uint64_t>(entry.mode));
+                    }
+                }
+            }
+            EXPECT_EQ(
+                fetchToStore2(
+                    settings, *store, SourcePath(tree), FetchMode::DryRun, "source", {}, filtered ? &filter : nullptr)
+                    .second,
+                expected);
+        }
+}
+
+TEST_F(FetchToStoreTest, repairDryRunReadsEveryRootKindDespiteNamesAndKnownEntries)
+{
+    auto store = openStore("dummy://?read-only=false");
+    size_t serial = 0;
+    PathFilter admitAll = [](const std::string &) { return true; };
+    for (auto kind : {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink, merkle::Mode::Directory})
+        for (bool known : {false, true})
+            for (bool nested : {false, true})
+                for (bool filtered : {false, true}) {
+                    SCOPED_TRACE(fmt(
+                        "kind=%d known=%d nested=%d filtered=%d", static_cast<RawMode>(kind), known, nested, filtered));
+                    auto makeTree = [&](std::string_view text) {
+                        auto tree = make_ref<MemorySourceAccessor>();
+                        MemorySink sink{*tree};
+                        if (kind == merkle::Mode::Symlink)
+                            sink.createSymlink(CanonPath::root, std::string(text));
+                        else {
+                            if (kind == merkle::Mode::Directory)
+                                sink.createDirectory(CanonPath::root);
+                            sink.createRegularFile(
+                                kind == merkle::Mode::Directory ? CanonPath("child") : CanonPath::root,
+                                [&](CreateRegularFileSink & file) {
+                                    if (kind == merkle::Mode::Executable)
+                                        file.isExecutable();
+                                    file(text);
+                                });
+                        }
+                        return tree;
+                    };
+                    auto before = makeTree("before");
+                    auto after = makeTree("after");
+                    /* Deliberately retain an obsolete claim, as when repair
+                       encounters corrupt bytes behind an immutable name. */
+                    if (known)
+                        before->knownRoot = after->knownRoot = objectHashOf(*before, CanonPath::root).root;
+                    else
+                        before->fingerprint = after->fingerprint = fmt("repair-dry-run-%d", serial++);
+                    auto first = nested ? mountedUnder(before) : SourcePath(before);
+                    auto second = nested ? mountedUnder(after) : SourcePath(after);
+                    fetchers::Settings settings;
+                    auto seed = fetchToStore2(
+                        settings, *store, first, FetchMode::DryRun, "source", {}, filtered ? &admitAll : nullptr);
+                    auto expected = merkle::objectHash(objectHashOf(*second.accessor, second.path).root);
+                    EXPECT_NE(seed.second, expected);
+                    auto repaired = fetchToStore2(
+                        settings,
+                        *store,
+                        second,
+                        FetchMode::DryRun,
+                        "source",
+                        {},
+                        filtered ? &admitAll : nullptr,
+                        Repair);
+                    EXPECT_EQ(repaired.second, expected);
+                }
+}
+
 /* The fetcher cache and a local store of the fixture's own. */
 class FetchToStoreLocalTest : FreshCacheHome, public TempLocalStoreTest
 {
@@ -459,6 +589,112 @@ TEST_F(FetchToStoreLocalTest, cachedNamesAreInterpretedInTheDestinationStore)
                         EXPECT_EQ(destination->isValidPath(after.first), second == FetchMode::Copy);
                     }
     }
+}
+
+TEST_F(FetchToStoreLocalTest, namingFollowsTheCurrentGraftsAndAllowedPrefixes)
+{
+    fetchers::Settings settings;
+    size_t serial = 0;
+    auto check = [&](auto makeView) {
+        /* Directories admit exactly these two methods. Each growth case
+           crosses both naming/copy modes and both output-name relations. */
+        for (auto method : {ContentAddressMethod::Raw::Git, ContentAddressMethod::Raw::NixArchive})
+            for (auto first : {FetchMode::DryRun, FetchMode::Copy})
+                for (auto second : {FetchMode::DryRun, FetchMode::Copy})
+                    for (bool sameName : {false, true}) {
+                        SCOPED_TRACE(
+                            fmt("method=%d first=%d second=%d same-name=%d",
+                                static_cast<int>(method),
+                                static_cast<int>(first),
+                                static_cast<int>(second),
+                                sameName));
+                        auto [accessor, grow] = makeView(++serial);
+                        SourcePath source{accessor};
+                        auto before = fetchToStore2(settings, *store, source, first, "before", method);
+                        EXPECT_EQ(before, store->computeStorePath("before", source, method, HashAlgorithm::SHA256));
+                        grow();
+                        auto name = sameName ? "before" : "after";
+                        auto expected = store->computeStorePath(name, source, method, HashAlgorithm::SHA256);
+                        EXPECT_NE(before.second, expected.second);
+                        auto after = fetchToStore2(settings, *store, source, second, name, method);
+                        EXPECT_EQ(after, expected);
+                        if (second == FetchMode::Copy) {
+                            EXPECT_TRUE(store->isValidPath(after.first));
+                            EXPECT_EQ(narOf(*store->requireStoreObjectAccessor(after.first)), narOf(*accessor));
+                        }
+                    }
+    };
+
+    for (bool namedBase : {false, true})
+        for (bool namedGraft : {false, true}) {
+            SCOPED_TRACE(fmt("mount: named-base=%d named-graft=%d", namedBase, namedGraft));
+            check([&](size_t i) -> std::pair<ref<SourceAccessor>, std::function<void()>> {
+                auto base = make_ref<MemorySourceAccessor>();
+                base->addFile(CanonPath("before"), fmt("before-%d", i));
+                if (namedBase)
+                    base->fingerprint = fmt("growth-base-%d", i);
+                auto graft = make_ref<MemorySourceAccessor>();
+                graft->addFile(CanonPath("after"), fmt("after-%d", i));
+                if (namedGraft)
+                    graft->fingerprint = fmt("growth-graft-%d", i);
+                auto mounted = makeMountedSourceAccessor({{CanonPath::root, base}});
+                return {mounted, [mounted, graft] { mounted->mount(CanonPath("extra"), graft); }};
+            });
+        }
+
+    for (bool namedInner : {false, true})
+        for (bool admitWhole : {false, true}) {
+            SCOPED_TRACE(fmt("allow-list: named-inner=%d admit-whole=%d", namedInner, admitWhole));
+            check([&](size_t i) -> std::pair<ref<SourceAccessor>, std::function<void()>> {
+                auto inner = make_ref<MemorySourceAccessor>();
+                inner->addFile(CanonPath("before"), fmt("before-%d", i));
+                inner->addFile(CanonPath("after"), fmt("after-%d", i));
+                if (namedInner)
+                    inner->fingerprint = fmt("growth-inner-%d", i);
+                auto allowed =
+                    AllowListSourceAccessor::create(inner, {CanonPath("before")}, {}, [](const CanonPath & path) {
+                        return RestrictedPathError("access to '%s' is forbidden", path);
+                    });
+                return {allowed, [allowed, admitWhole] {
+                            allowed->allowPrefix(admitWhole ? CanonPath::root : CanonPath("after"));
+                        }};
+            });
+        }
+}
+
+TEST_F(FetchToStoreLocalTest, anUnnamedAccessorDoesNotPromiseStableContents)
+{
+    fetchers::Settings settings;
+    size_t serial = 0;
+    for (auto method :
+         {ContentAddressMethod::Raw::Flat,
+          ContentAddressMethod::Raw::NixArchive,
+          ContentAddressMethod::Raw::Git,
+          ContentAddressMethod::Raw::Text})
+        for (auto first : {FetchMode::DryRun, FetchMode::Copy})
+            for (auto second : {FetchMode::DryRun, FetchMode::Copy})
+                for (bool sameName : {false, true}) {
+                    SCOPED_TRACE(
+                        fmt("method=%d first=%d second=%d same-name=%d",
+                            static_cast<int>(method),
+                            static_cast<int>(first),
+                            static_cast<int>(second),
+                            sameName));
+                    auto source = make_ref<MemorySourceAccessor>();
+                    source->root = MemorySourceAccessor::File::Regular{.contents = fmt("before-%d", ++serial)};
+                    SourcePath path{source};
+                    auto before = fetchToStore2(settings, *store, path, first, "before", method);
+                    source->root = MemorySourceAccessor::File::Regular{.contents = fmt("after-%d", serial)};
+                    auto name = sameName ? "before" : "after";
+                    auto expected = store->computeStorePath(name, path, method, HashAlgorithm::SHA256);
+                    EXPECT_NE(before.second, expected.second);
+                    auto after = fetchToStore2(settings, *store, path, second, name, method);
+                    EXPECT_EQ(after, expected);
+                    if (second == FetchMode::Copy) {
+                        EXPECT_EQ(
+                            store->requireStoreObjectAccessor(after.first)->readFile(CanonPath::root), path.readFile());
+                    }
+                }
 }
 
 #ifndef _WIN32
@@ -833,5 +1069,97 @@ RC_GTEST_FIXTURE_PROP(FetchToStoreTest, prop_memoRowIsTheEntryHashForEveryRootKi
         symlinks > 0 ? "a symlink" : "",
         plain > 0 ? "a plain file" : "");
 }
+
+#ifndef _WIN32
+TEST_F(FetchToStoreLocalTest, filtersKeepTheirCallerThreadAndDepthFirstEffects)
+{
+    Finally restoreWorkers{
+        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+    const auto caller = std::this_thread::get_id();
+    size_t cases = 0;
+    for (size_t workers = 1; workers <= 8; ++workers)
+        for (bool named : {false, true})
+            for (auto mode : {FetchMode::DryRun, FetchMode::Copy})
+                for (bool prune : {false, true}) {
+                    auto reference = namedTree(std::nullopt);
+                    std::vector<std::string> referenceCalls;
+                    PathFilter referenceFilter = [&](const std::string & path) {
+                        referenceCalls.push_back(path);
+                        return !prune || !hasSuffix(path, "/drop");
+                    };
+                    auto referenceNar = narOf(*reference, CanonPath::root, referenceFilter);
+                    auto expectedOrder =
+                        prune ? std::vector<std::string>{"/drop", "/keep", "/keep/drop", "/keep/x", "/top"}
+                              : std::vector<std::string>{
+                                    "/drop", "/drop/z", "/keep", "/keep/drop", "/keep/drop/y", "/keep/x", "/top"};
+                    EXPECT_EQ(referenceCalls, expectedOrder);
+                    StringSource referenceSource{referenceNar};
+                    auto expectedHash = merkle::objectHash(objectHashOfNar(referenceSource).root);
+
+                    /* Every throwing position, plus normal completion. */
+                    for (size_t stop = 0; stop <= referenceCalls.size(); ++stop) {
+                        SCOPED_TRACE(
+                            fmt("workers=%d named=%d copy=%d prune=%d stop=%d",
+                                workers,
+                                named,
+                                mode == FetchMode::Copy,
+                                prune,
+                                stop));
+                        auto tag = fmt("filter-effects-%d", cases++);
+                        auto source = namedTree(named ? std::optional<std::string>(tag) : std::nullopt);
+                        std::mutex mutex;
+                        std::vector<std::string> calls;
+                        bool wrongThread = false;
+                        PathFilter filter = [&](const std::string & path) {
+                            std::lock_guard lock(mutex);
+                            wrongThread |= std::this_thread::get_id() != caller;
+                            calls.push_back(path);
+                            if (calls.size() - 1 == stop)
+                                throw Error("filter stopped");
+                            return !prune || !hasSuffix(path, "/drop");
+                        };
+                        LocalStore::copyWorkersForTest.store(workers);
+                        fetchers::Settings settings;
+                        auto fetch = [&] {
+                            return fetchToStore2(settings, *store, SourcePath(source), mode, tag, {}, &filter);
+                        };
+                        if (stop < referenceCalls.size())
+                            EXPECT_THROW(fetch(), Error);
+                        else {
+                            auto [path, hash] = fetch();
+                            EXPECT_EQ(hash, expectedHash);
+                            if (mode == FetchMode::Copy)
+                                EXPECT_EQ(narOf(*store->requireStoreObjectAccessor(path)), referenceNar);
+                        }
+                        auto expectedCalls = referenceCalls;
+                        if (stop < referenceCalls.size())
+                            expectedCalls.resize(stop + 1);
+                        EXPECT_EQ(calls, expectedCalls);
+                        EXPECT_FALSE(wrongThread);
+                    }
+                }
+    EXPECT_EQ(cases, 448u);
+}
+
+TEST_F(FetchToStoreLocalTest, copiedIdentityFiltersPreserveTheTreeAtEveryWidth)
+{
+    Finally restoreWorkers{
+        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+    auto source = namedTree(std::nullopt);
+    auto expected = narOf(*source);
+    for (size_t workers = 1; workers <= 8; ++workers) {
+        SCOPED_TRACE(workers);
+        LocalStore::copyWorkersForTest.store(workers);
+        PathFilter copied = defaultPathFilter;
+        auto path = store->materialise(
+            fmt("identity-copy-%d", workers),
+            SourcePath(source),
+            copied,
+            NoRepair,
+            [](const CanonPath &, const SourceAccessor::Stat &) { return std::nullopt; });
+        EXPECT_EQ(narOf(*store->requireStoreObjectAccessor(path)), expected);
+    }
+}
+#endif
 
 } // namespace nix

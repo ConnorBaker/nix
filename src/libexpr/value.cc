@@ -8,8 +8,6 @@
 
 namespace nix {
 
-Value::ExceptionRef::~ExceptionRef() {}
-
 Value Value::vEmptyList = []() {
     Value res;
     res.setStorage(List{.size = 0, .elems = nullptr});

@@ -43,7 +43,10 @@
 #include <rapidcheck/gtest.h>
 #include <exception> // IWYU pragma: keep (rapidcheck on Darwin/FreeBSD)
 #include <functional>
+#include <future>
 #include <iostream>
+#include <latch>
+#include <tuple>
 #include <typeinfo>
 
 namespace nix::fetchers {
@@ -1030,98 +1033,14 @@ TEST_F(GitUtilsTest, peel_reference)
     git_repository_free(rawRepo);
 }
 
-/* A dirty working directory names its clean subtrees by the commit's
-   objects, exactly as the commit's accessor does, and its root and changed
-   paths by the whole tree's name; a configuration under which the working
-   directory may not hold the blobs takes the object names away. */
-TEST_F(GitUtilsTest, workdirNamesCleanSubtreesByTheCommit)
+/* Git status describes tracked membership and changes under Git's comparison
+   rules. It does not identify the filesystem objects a worktree accessor
+   reads, so even paths reported clean retain the whole-view fingerprint. */
+TEST_F(GitUtilsTest, workdirReadsAndNamesItsFilesystemView)
 {
     git_repository * rawRepo = nullptr;
     ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
-    write("clean/a", "a");
-    write("clean/sub/b", "b");
-    write("dirty/c", "c");
-    write("top", "t");
-    commitPaths(rawRepo, {"clean/a", "clean/sub/b", "dirty/c", "top"}, "initial");
-
-    /* One modification: `dirty/c` and its ancestors change, nothing else. */
-    write("dirty/c", "changed");
-
-    auto repo = openRepo();
-    auto wd = repo->getWorkdirInfo();
-    ASSERT_TRUE(wd.isDirty);
-    ASSERT_TRUE(wd.headRev);
-    ASSERT_TRUE(wd.dirtyFiles.contains(CanonPath("dirty/c")));
-
-    auto head = repo->getAccessor(*wd.headRev, {}, "");
-    auto workdir = repo->getAccessor(wd, {}, [](const CanonPath & path) { return RestrictedPathError("no"); });
-    workdir->fingerprint = "whole";
-
-    auto whole = [](const char * p) { return std::pair{CanonPath(p), std::optional<std::string>("whole")}; };
-    EXPECT_EQ(workdir->getFingerprint(CanonPath::root), whole("/"));
-    EXPECT_EQ(workdir->getFingerprint(CanonPath("dirty")), whole("dirty"));
-    EXPECT_EQ(workdir->getFingerprint(CanonPath("dirty/c")), whole("dirty/c"));
-    for (auto p : {"clean", "clean/a", "clean/sub", "clean/sub/b", "top"}) {
-        auto name = head->getFingerprint(CanonPath(p));
-        ASSERT_TRUE(name.second) << p;
-        EXPECT_EQ(workdir->getFingerprint(CanonPath(p)), name) << p;
-    }
-    /* The bytes: a path git reports changed is read from the working
-       directory, one it reports clean from the commit's object.  Both
-       answer the same here, since the working directory does hold the
-       blobs. */
-    EXPECT_EQ(workdir->readFile(CanonPath("dirty/c")), "changed");
-    EXPECT_EQ(workdir->readFile(CanonPath("clean/a")), "a");
-
-    /* An untracked `.gitattributes` below the root that could filter takes
-       the object names away; removed, they return. */
-    write("clean/.gitattributes", "* text=auto\n");
-    auto filtered = repo->getAccessor(wd, {}, [](const CanonPath & path) { return RestrictedPathError("no"); });
-    filtered->fingerprint = "whole";
-    EXPECT_EQ(filtered->getFingerprint(CanonPath("clean")), whole("clean"));
-    EXPECT_EQ(filtered->getFingerprint(CanonPath("top")), whole("top"));
-    deletePath(tmpDir / "clean/.gitattributes");
-    auto again = repo->getAccessor(wd, {}, [](const CanonPath & path) { return RestrictedPathError("no"); });
-    EXPECT_EQ(again->getFingerprint(CanonPath("clean")), head->getFingerprint(CanonPath("clean")));
-
-    /* `core.autocrlf` could make a clean file's bytes differ from its blob:
-       no object names then. */
-    git_config * config = nullptr;
-    ASSERT_EQ(git_repository_config(&config, rawRepo), 0);
-    ASSERT_EQ(git_config_set_bool(config, "core.autocrlf", 1), 0);
-    git_config_free(config);
-    auto repo2 = openRepo();
-    auto workdir2 = repo2->getAccessor(wd, {}, [](const CanonPath & path) { return RestrictedPathError("no"); });
-    workdir2->fingerprint = "whole";
-    EXPECT_EQ(workdir2->getFingerprint(CanonPath("clean")), whole("clean"));
-    EXPECT_EQ(workdir2->getFingerprint(CanonPath("top")), whole("top"));
-
-    git_repository_free(rawRepo);
-}
-
-/* Where a clean file's bytes come from, and the rule that says so (01
-   §9.10, "One route").  `getWorkdirInfo` asks
-   `git_status_foreach_ext` with `GIT_STATUS_OPT_INCLUDE_UNMODIFIED` and
-   `GIT_STATUS_OPT_EXCLUDE_SUBMODULES`; every tracked path whose status is
-   not `GIT_STATUS_CURRENT` goes in `dirtyFiles` (or `deletedFiles`), and a
-   path in neither is one git reports equal in HEAD, in the index and in the
-   working tree.  The accessor reads such a path from the commit's object
-   and never opens the file; it reads every other from the working
-   directory.
-
-   A `WorkdirInfo` is a snapshot, so an edit after it is taken is exactly
-   the case where git's answer no longer holds -- the same case as a stat
-   cache that says clean of a file whose bytes have changed.  What the
-   accessor then gives is HEAD's bytes for the clean path, which is what it
-   *names* that path by, and what the memo of a second entry would give.
-   The name and the bytes agree; before this they could not, since the name
-   came from HEAD and the bytes from the working directory.  A path the
-   snapshot recorded as changed is still read from the working directory,
-   whatever it holds now. */
-TEST_F(GitUtilsTest, aCleanFilesBytesComeFromTheCommit)
-{
-    git_repository * rawRepo = nullptr;
-    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo{[&] { git_repository_free(rawRepo); }};
     write("clean/a", "a");
     write("dirty/c", "c");
     commitPaths(rawRepo, {"clean/a", "dirty/c"}, "initial");
@@ -1129,29 +1048,117 @@ TEST_F(GitUtilsTest, aCleanFilesBytesComeFromTheCommit)
 
     auto repo = openRepo();
     auto wd = repo->getWorkdirInfo();
-    ASSERT_TRUE(wd.headRev);
     ASSERT_TRUE(wd.dirtyFiles.contains(CanonPath("dirty/c")));
     ASSERT_FALSE(wd.dirtyFiles.contains(CanonPath("clean/a")));
+    auto workdir = repo->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("no"); });
+    workdir->fingerprint = "whole";
+    for (auto p : {"", "clean", "clean/a", "dirty", "dirty/c"}) {
+        EXPECT_EQ(
+            workdir->getFingerprint(CanonPath(p)), (std::pair{CanonPath(p), std::optional<std::string>("whole")}));
+        EXPECT_FALSE(workdir->getKnownEntry(CanonPath(p)));
+    }
 
-    auto workdir = repo->getAccessor(wd, {}, [](const CanonPath & path) { return RestrictedPathError("no"); });
-
-    /* The snapshot is now stale: both files are rewritten behind it. */
+    /* The membership snapshot does not turn the filesystem into HEAD. */
     write("clean/a", "A");
     write("dirty/c", "C");
-
-    /* The clean path answers with the commit's blob -- the object its name
-       is, not the file on disk. */
-    EXPECT_EQ(workdir->readFile(CanonPath("clean/a")), "a");
-    /* The changed path answers with the file. */
+    EXPECT_EQ(workdir->readFile(CanonPath("clean/a")), "A");
     EXPECT_EQ(workdir->readFile(CanonPath("dirty/c")), "C");
+}
 
-    /* Off, the working directory answers for both, as it did before. */
-    setenv("_NIX_TEST_NO_ODB_READS", "1", 1);
-    Finally unset{[] { unsetenv("_NIX_TEST_NO_ODB_READS"); }};
-    auto plain = repo->getAccessor(wd, {}, [](const CanonPath & path) { return RestrictedPathError("no"); });
-    EXPECT_EQ(plain->readFile(CanonPath("dirty/c")), "C");
+TEST_F(GitUtilsTest, workdirIndexFlagsDoNotChangeItsContents)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo{[&] { git_repository_free(rawRepo); }};
+    std::vector<std::string> names;
+    for (unsigned flags = 0; flags < 4; ++flags)
+        for (bool changed : {false, true})
+            for (bool executable : {false, true}) {
+                auto name = fmt("file-%d-%d-%d", flags, changed, executable);
+                write(name, "before");
+                names.push_back(std::move(name));
+            }
+    std::vector<const char *> paths;
+    for (auto & name : names)
+        paths.push_back(name.c_str());
+    commitPaths(rawRepo, paths, "initial");
 
-    git_repository_free(rawRepo);
+    git_index * index = nullptr;
+    ASSERT_EQ(git_repository_index(&index, rawRepo), 0);
+    Finally closeIndex{[&] { git_index_free(index); }};
+    for (unsigned flags = 0; flags < 4; ++flags)
+        for (bool changed : {false, true})
+            for (bool executable : {false, true}) {
+                auto name = fmt("file-%d-%d-%d", flags, changed, executable);
+                auto original = git_index_get_bypath(index, name.c_str(), 0);
+                ASSERT_NE(original, nullptr);
+                auto entry = *original;
+                if (flags & 1)
+                    entry.flags |= GIT_INDEX_ENTRY_VALID;
+                if (flags & 2) {
+                    entry.flags |= GIT_INDEX_ENTRY_EXTENDED;
+                    entry.flags_extended |= GIT_INDEX_ENTRY_SKIP_WORKTREE;
+                }
+                ASSERT_EQ(git_index_add(index, &entry), 0);
+                if (changed)
+                    write(name, "after!");
+                if (executable)
+                    std::filesystem::permissions(
+                        tmpDir / name, std::filesystem::perms::owner_exec, std::filesystem::perm_options::add);
+            }
+    ASSERT_EQ(git_index_write(index), 0);
+
+    auto repo = openRepo();
+    auto wd = repo->getWorkdirInfo();
+    auto workdir = repo->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("no"); });
+    workdir->fingerprint = "whole";
+    for (unsigned flags = 0; flags < 4; ++flags)
+        for (bool changed : {false, true})
+            for (bool executable : {false, true}) {
+                auto name = fmt("file-%d-%d-%d", flags, changed, executable);
+                SCOPED_TRACE(name);
+                auto path = CanonPath(name);
+                ASSERT_TRUE(wd.files.contains(path));
+                if (flags)
+                    EXPECT_FALSE(wd.dirtyFiles.contains(path));
+                EXPECT_EQ(workdir->readFile(path), changed ? "after!" : "before");
+                EXPECT_EQ(workdir->lstat(path).isExecutable, executable);
+                EXPECT_EQ(workdir->getFingerprint(path), (std::pair{path, std::optional<std::string>("whole")}));
+            }
+}
+
+TEST_F(GitUtilsTest, workdirAttributesFromTheIndexDoNotReplaceFilesystemBytes)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo{[&] { git_repository_free(rawRepo); }};
+    /* Both per-directory locations, with and without a working-tree copy:
+       libgit2's FILE_THEN_INDEX attribute lookup falls back to the index. */
+    for (bool nested : {false, true}) {
+        auto prefix = nested ? std::string("sub/") : std::string();
+        auto attributes = prefix + ".gitattributes";
+        auto file = prefix + "text";
+        write(attributes, "* text eol=crlf\n");
+        write(file, "line\r\n");
+        auto rev = commitPaths(rawRepo, {attributes.c_str(), file.c_str()}, "attributes");
+        auto head = openRepo()->getAccessor(rev, {}, "");
+        ASSERT_EQ(head->readFile(CanonPath(file)), "line\n");
+        for (bool present : {true, false}) {
+            SCOPED_TRACE(fmt("nested=%d present=%d", nested, present));
+            if (!present)
+                std::filesystem::remove(tmpDir / attributes);
+            auto repo = openRepo();
+            auto wd = repo->getWorkdirInfo();
+            ASSERT_TRUE(wd.files.contains(CanonPath(file)));
+            ASSERT_FALSE(wd.dirtyFiles.contains(CanonPath(file)));
+            auto workdir = repo->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("no"); });
+            workdir->fingerprint = "whole";
+            EXPECT_EQ(workdir->readFile(CanonPath(file)), "line\r\n");
+            EXPECT_EQ(
+                workdir->getFingerprint(CanonPath(file)),
+                (std::pair{CanonPath(file), std::optional<std::string>("whole")}));
+        }
+    }
 }
 
 /* The memo's rows hold ENTRY hashes -- a blob id, a tree id -- never the
@@ -1277,7 +1284,9 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
     auto workdir =
         repo->getAccessor(wd, {.exportIgnore = true}, [](const CanonPath & path) { return RestrictedPathError("no"); });
     workdir->fingerprint = "whole";
-    EXPECT_EQ(workdir->getFingerprint(CanonPath("clean/a")), raw->getFingerprint(CanonPath("clean/a")));
+    EXPECT_EQ(
+        workdir->getFingerprint(CanonPath("clean/a")),
+        (std::pair{CanonPath("clean/a"), std::optional<std::string>("whole")}));
     EXPECT_EQ(
         workdir->getFingerprint(CanonPath("dirty")),
         (std::pair{CanonPath("dirty"), std::optional<std::string>("whole")}));
@@ -1631,43 +1640,94 @@ TEST_F(GitUtilsTest, workdirExportIgnoreSources)
     git_repository_free(rawRepo);
 }
 
-/* An untracked `.gitattributes` naming the `filter` attribute -- a content
-   filter, so a clean file's bytes need not be its blob's -- withdraws the
-   commit's object names from the working-directory accessor, which then
-   names the whole tree (`01` section 9.9, `workdirHoldsTheBlobs`).
-   `workdirNamesCleanSubtreesByTheCommit` drives `* text=auto`; this is the
-   `filter` cell of the same set, and the last of `05` section 7's owed
-   export-ignore rows. */
-TEST_F(GitUtilsTest, untrackedGitattributesInWorkdir)
+TEST_F(GitUtilsTest, sharedRepositoryAttributeReadersAgreeAfterRefresh)
 {
     git_repository * rawRepo = nullptr;
     ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
-    write("clean/a", "a");
-    write("top", "t");
-    commitPaths(rawRepo, {"clean/a", "top"}, "one");
-    git_repository_free(rawRepo);
-
+    Finally closeRepo{[&] { git_repository_free(rawRepo); }};
+    std::vector<std::string> paths;
+    /* Four applicable views, two independent wrappers per view, and two
+       concurrent readers per wrapper. Distinct paths also miss the outer
+       filtering cache after the external attribute file changes. */
+    constexpr size_t readers = 16;
+    for (size_t phase = 0; phase < 2; ++phase)
+        for (size_t reader = 0; reader < readers; ++reader) {
+            auto dir = "phase" + std::to_string(phase) + "/reader" + std::to_string(reader) + "/";
+            for (auto [name, contents] :
+                 {std::pair{".gitattributes", "hide hidden\nkeep filter=lfs\n"},
+                  std::pair{"hide", "hidden contents"},
+                  std::pair{"keep", "ordinary file contents"}}) {
+                paths.push_back(dir + name);
+                write(paths.back(), contents);
+            }
+        }
+    std::vector<const char *> staged;
+    for (auto & path : paths)
+        staged.push_back(path.c_str());
+    auto rev = commitPaths(rawRepo, staged, "attribute readers");
+    auto attributes = tmpDir / ".git/info/attributes";
+    createDirs(attributes.parent_path());
+    writeFile(attributes, "[attr]hidden export-ignore\n");
+    /* Obtain membership on a separate handle so the shared handle's
+       attribute cache is still cold when the concurrent readers start. */
+    auto wd = openRepo()->getWorkdirInfo();
     auto repo = openRepo();
-    auto wd = repo->getWorkdirInfo();
-    ASSERT_TRUE(wd.headRev);
-    auto head = repo->getAccessor(*wd.headRev, {}, "");
-    auto notAllowed = [](const CanonPath & path) { return RestrictedPathError("no"); };
-    auto whole = [](const char * p) { return std::pair{CanonPath(p), std::optional<std::string>("whole")}; };
-
-    /* Without it, the clean subtrees carry the commit's names. */
-    auto named = repo->getAccessor(wd, {}, notAllowed);
-    named->fingerprint = "whole";
-    EXPECT_EQ(named->getFingerprint(CanonPath("clean")), head->getFingerprint(CanonPath("clean")));
-
-    write("clean/.gitattributes", "* filter=crypt\n");
-    auto withdrawn = repo->getAccessor(wd, {}, notAllowed);
-    withdrawn->fingerprint = "whole";
-    EXPECT_EQ(withdrawn->getFingerprint(CanonPath("clean")), whole("clean"));
-    EXPECT_EQ(withdrawn->getFingerprint(CanonPath("top")), whole("top"));
-
-    deletePath(tmpDir / "clean/.gitattributes");
-    auto again = repo->getAccessor(wd, {}, notAllowed);
-    EXPECT_EQ(again->getFingerprint(CanonPath("clean")), head->getFingerprint(CanonPath("clean")));
+    repo->setRemote("origin", "https://example.invalid/attribute-readers");
+    std::vector<std::pair<ref<SourceAccessor>, bool>> views;
+    for (size_t copy = 0; copy < 2; ++copy) {
+        views.emplace_back(
+            repo->getAccessor(wd, {.exportIgnore = true}, [](const CanonPath &) { return RestrictedPathError("no"); }),
+            true);
+        views.emplace_back(repo->getAccessor(rev, {.exportIgnore = true}, ""), true);
+        views.emplace_back(repo->getAccessor(rev, {.smudgeLfs = true}, ""), false);
+        views.emplace_back(repo->getAccessor(rev, {.exportIgnore = true, .smudgeLfs = true}, ""), true);
+    }
+    for (size_t phase = 0; phase < 2; ++phase) {
+        SCOPED_TRACE(phase);
+        if (phase)
+            writeFile(attributes, "[attr]hidden export-ignore\n# changed stamp, same rules\n");
+        std::latch start{1};
+        using Observation = std::tuple<std::set<std::string>, std::string, bool>;
+        std::vector<std::future<Observation>> pending;
+        for (size_t reader = 0; reader < readers; ++reader) {
+            auto accessor = views.at(reader / 2).first;
+            auto path = CanonPath("phase" + std::to_string(phase) + "/reader" + std::to_string(reader));
+            pending.push_back(std::async(std::launch::async, [&, accessor, path] {
+                start.wait();
+                Observation result;
+                accessor->readDirectoryWithEntries(
+                    path,
+                    [&](SourceAccessor & scoped,
+                        const CanonPath & relative,
+                        const SourceAccessor::DirEntries & entries) {
+                        for (auto & [name, type] : entries)
+                            std::get<0>(result).insert(name);
+                        /* The LFS attribute is true but these are ordinary
+                           bytes, so pointer parsing performs no download. */
+                        std::get<1>(result) = scoped.readFile(relative / "keep");
+                        std::get<2>(result) = scoped.pathExists(relative / "hide");
+                    });
+                return result;
+            }));
+        }
+        auto status = std::async(std::launch::async, [&] {
+            start.wait();
+            return repo->getWorkdirInfo();
+        });
+        start.count_down();
+        for (size_t reader = 0; reader < readers; ++reader) {
+            SCOPED_TRACE(reader);
+            auto [entries, contents, hasHidden] = pending.at(reader).get();
+            auto filtered = views.at(reader / 2).second;
+            auto expected = std::set<std::string>{".gitattributes", "keep"};
+            if (!filtered)
+                expected.insert("hide");
+            EXPECT_EQ(entries, expected);
+            EXPECT_EQ(contents, "ordinary file contents");
+            EXPECT_EQ(hasHidden, !filtered);
+        }
+        EXPECT_FALSE(status.get().isDirty);
+    }
 }
 
 /* The pack builder stores what would not shrink and deflates what would

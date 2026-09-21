@@ -72,6 +72,10 @@ StorePath EvalState::mountInput(fetchers::Input & input, ref<SourceAccessor> acc
 
     storeFS->mount(CanonPath(store->printStorePath(storePath)), accessor);
 
+    /* A graft may replace an existing physical-store node. Discard facts
+       observed before the mount, including cached file types and links. */
+    rootFS->invalidateCache();
+
     /* `input` is what `Input::getAccessor` returned: whatever the original
        asserted has been verified there and the `narHash` replaced by
        `treeHash`.  The tree hash is set here too, for an input that asserted

@@ -11,6 +11,7 @@
 #include "nix/util/util.hh"
 #include "nix/store/store-open.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/finally.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/gc-store.hh"
 #include "nix/util/archive.hh"
@@ -25,6 +26,7 @@
 #include <rapidcheck/gtest.h>
 
 #include <limits>
+#include <algorithm>
 #include <sstream>
 #include <streambuf>
 #include <typeinfo>
@@ -822,6 +824,93 @@ RC_GTEST_FIXTURE_PROP(WriteBufferTest, prop_derivations_round_trip_through_the_b
    2, risks and open items. */
 struct WriteBufferLocalStoreTest : LibStoreTest
 {};
+
+/* A write failure has the same meaning with keep-going on or off: no
+   successful flush, no forgotten pending object, and a later retry can
+   complete. The general bulk-copy API's keep-going mode suppresses errors;
+   it cannot provide that contract to the buffer. */
+struct FailingWriteBufferStore : LocalStore
+{
+    explicit FailingWriteBufferStore(ref<const LocalStore::Config> config)
+        : Store{*config}
+        , LocalFSStore{*config}
+        , LocalStore{config}
+    {
+    }
+
+    std::optional<StorePath> failingPath;
+
+    void addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override
+    {
+        if (failingPath == info.path)
+            throw Error("injected write failure for '%s'", printStorePath(info.path));
+        LocalStore::addToStore(info, source, repair, checkSigs);
+    }
+};
+
+TEST_F(WriteBufferLocalStoreTest, failedWritesRemainPendingUnderEveryFlushMode)
+{
+    auto savedKeepGoing = settings.getWorkerSettings().keepGoing.get();
+    Finally restoreKeepGoing{[&] { settings.getWorkerSettings().keepGoing = savedKeepGoing; }};
+
+    /* Both dispatch shapes (one object and a graph), every failure
+       position, both graph shapes, and both flags: 32 cases. */
+    for (bool keepGoing : {false, true})
+        for (auto repair : {NoRepair, Repair})
+            for (bool chain : {false, true})
+                for (size_t count : {1, 3})
+                    for (size_t failure = 0; failure < count; ++failure) {
+                        SCOPED_TRACE(
+                            fmt("keepGoing=%d repair=%d chain=%d count=%d failure=%d",
+                                keepGoing,
+                                repair == Repair,
+                                chain,
+                                count,
+                                failure));
+                        settings.getWorkerSettings().keepGoing = keepGoing;
+                        AutoDelete root{canonPath(createTempDir(), true)};
+                        auto config = make_ref<LocalStoreConfig>(root.path(), StoreConfig::Params{});
+                        auto local = make_ref<FailingWriteBufferStore>(config);
+                        WriteBuffer buffer(*local, neverAutoFlush);
+                        std::vector<StorePath> paths;
+                        for (size_t i = 0; i < count; ++i) {
+                            StorePathSet refs;
+                            if (chain && !paths.empty())
+                                refs.insert(paths.back());
+                            paths.push_back(buffer.addText(fmt("object-%d", i), fmt("contents-%d", i), refs, repair));
+                        }
+                        auto order = paths;
+                        if (!chain)
+                            std::sort(order.begin(), order.end());
+                        local->failingPath = order[failure];
+                        Error expected{"injected write failure for '%s'", local->printStorePath(*local->failingPath)};
+                        try {
+                            buffer.flush();
+                            ADD_FAILURE() << "a failed write was reported as a successful flush";
+                        } catch (Error & error) {
+                            EXPECT_EQ(error.message(), expected.message());
+                        }
+                        EXPECT_EQ(buffer.size(), count);
+                        EXPECT_FALSE(local->isValidPath(*local->failingPath));
+                        for (auto & path : paths)
+                            EXPECT_TRUE(buffer.contains(path));
+
+                        local->failingPath.reset();
+                        buffer.flush();
+                        EXPECT_TRUE(buffer.empty());
+                        for (size_t i = 0; i < count; ++i) {
+                            bool valid = local->isValidPath(paths[i]);
+                            EXPECT_TRUE(valid);
+                            if (!valid)
+                                continue;
+                            EXPECT_EQ(readFile(local->toRealPath(paths[i])), fmt("contents-%d", i));
+                            StorePathSet refs;
+                            if (chain && i)
+                                refs.insert(paths[i - 1]);
+                            EXPECT_EQ(local->queryPathInfo(paths[i])->references, refs);
+                        }
+                    }
+}
 
 TEST_F(WriteBufferLocalStoreTest, repairRewritesAnObjectTheDatabaseStillCallsValid)
 {

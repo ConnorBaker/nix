@@ -8,17 +8,18 @@
 #include "nix/store/local-store.hh"
 
 #include <boost/unordered/concurrent_flat_map.hpp>
-#include <map>
 #include <mutex>
+#include <utility>
 
 namespace nix {
 
 struct SrcToStore
 {
-    /* Source identity determines content, not its name or destination. The
-       accessor's unique number has the same equality as SourcePath without
-       keeping the source (and its store connection) alive. */
-    boost::concurrent_flat_map<std::tuple<size_t, CanonPath, ContentAddressMethod::Raw>, Hash> cache;
+    /* A fingerprint names the current view. Accessor identity does not:
+       grafts and allow lists can grow without replacing their accessor.
+       Names retain neither sources nor claims about a destination store. */
+    using Key = std::tuple<std::string, CanonPath, ContentAddressMethod::Raw>;
+    boost::concurrent_flat_map<Key, Hash> cache;
 };
 
 ref<SrcToStore> fetchers::Settings::createSrcToStore()
@@ -168,10 +169,11 @@ struct MemoVisitor : HashingVisitor
     bool wholeViewFingerprint;
     std::shared_ptr<fetchers::Cache> cache;
 
-    /* A name is computed once per node: the key found at the lookup is
-       kept until the node is recorded (a filtered or grafted tree's name
-       is over its structure, and is not free). */
-    std::map<CanonPath, std::optional<fetchers::Cache::Key>> pending;
+    /* The pull driver calls known immediately before the node action.
+       Keep that observation, including no name, until the action takes
+       it. A directory takes its key before visiting its children. This
+       visitor walks sequentially; the copy route calls lookup alone. */
+    std::optional<fetchers::Cache::Key> nextKey;
 
     /* The rows this walk has named but not yet written.  They go in one
        commit rather than one apiece (`01` section 9.9, the memo's rule says
@@ -244,13 +246,12 @@ struct MemoVisitor : HashingVisitor
 
     std::optional<HashedNode> known(const CanonPath & to, const SourceAccessor::Stat & st) override
     {
-        /* A node the memo is not consulted for leaves no pending key, so
-           that `record` computes its key afresh (a symlink's row is
-           written; a filtered directory's is not, by `directory`). */
+        nextKey.reset();
+        /* Symlinks are named only when recorded; filtered directories
+           are neither answered nor recorded. A hit has no node action. */
         if (!consulted(st))
             return std::nullopt;
-        std::optional<fetchers::Cache::Key> key;
-        if (auto entry = lookup(to, st, &key))
+        if (auto entry = lookup(to, st, &nextKey))
             /* A directory's NAR size is unknown: nothing beneath it is
                seen.  A file's is the stat's. */
             return HashedNode{
@@ -259,8 +260,6 @@ struct MemoVisitor : HashingVisitor
                                ? std::optional(merkle::nar::regular(*st.fileSize, st.isExecutable))
                                : std::nullopt,
             };
-        if (key)
-            pending.insert_or_assign(to, std::move(key));
         return std::nullopt;
     }
 
@@ -273,14 +272,8 @@ struct MemoVisitor : HashingVisitor
         writes.clear();
     }
 
-    HashedNode record(const CanonPath & to, HashedNode node)
+    HashedNode record(std::optional<fetchers::Cache::Key> key, HashedNode node)
     {
-        std::optional<fetchers::Cache::Key> key;
-        if (auto it = pending.find(to); it != pending.end()) {
-            key = std::move(it->second);
-            pending.erase(it);
-        } else
-            key = keyOf(to);
         if (key) {
             writes.emplace_back(std::move(*key), entryRow(node.entry));
             if (writes.size() >= maxPendingWrites)
@@ -291,18 +284,20 @@ struct MemoVisitor : HashingVisitor
 
     HashedNode regular(const CanonPath & to, fun<void(CreateRegularFileSink &)> read) override
     {
-        return record(to, HashingVisitor::regular(to, std::move(read)));
+        auto key = std::exchange(nextKey, std::nullopt);
+        return record(std::move(key), HashingVisitor::regular(to, std::move(read)));
     }
 
     HashedNode symlink(const CanonPath & to, const std::string & target) override
     {
-        return record(to, HashingVisitor::symlink(to, target));
+        return record(keyOf(to), HashingVisitor::symlink(to, target));
     }
 
     HashedNode directory(const CanonPath & to, Children children) override
     {
+        auto key = std::exchange(nextKey, std::nullopt);
         auto node = HashingVisitor::directory(to, std::move(children));
-        return filtered ? node : record(to, std::move(node));
+        return filtered ? node : record(std::move(key), std::move(node));
     }
 };
 
@@ -341,11 +336,23 @@ std::pair<StorePath, Hash> fetchToStore2(
     RepairFlag repair)
 {
     auto method = methodRequested.value_or(ContentAddressMethod::Raw::Git);
-    auto srcToStoreKey = std::make_tuple(srcPath.accessor->number, srcPath.path, method.raw);
 
-    /* The in-memory cache is keyed by the path alone, so it applies only to
-       unfiltered requests. */
-    bool filtered = filter != nullptr;
+    SourcePath path = srcPath;
+
+    /* A filtered tree is named by the inner tree's name and the admitted
+       set (01 §8.2), so both memos below apply to it; when the inner tree
+       has no name the walk would be wasted, and the filter is applied while
+       dumping instead. */
+    if (filter && path.accessor->getFingerprint(path.path).second) {
+        path = filteredTree(path, *filter);
+        filter = nullptr;
+    }
+
+    auto [subpath, fingerprint] = filter ? std::pair<CanonPath, std::optional<std::string>>{path.path, std::nullopt}
+                                         : path.accessor->getFingerprint(path.path);
+    std::optional<SrcToStore::Key> srcToStoreKey;
+    if (fingerprint && !repair)
+        srcToStoreKey.emplace(*fingerprint, subpath, method.raw);
 
     auto useHash = [&](const Hash & hash) -> std::optional<std::pair<StorePath, Hash>> {
         auto storePath =
@@ -357,26 +364,15 @@ std::pair<StorePath, Hash> fetchToStore2(
             if (!store.isValidPath(storePath))
                 return std::nullopt;
         }
-        if (!filtered)
-            settings.srcToStore->cache.insert_or_assign(srcToStoreKey, hash);
+        if (srcToStoreKey)
+            settings.srcToStore->cache.insert_or_assign(*srcToStoreKey, hash);
         return std::make_pair(storePath, hash);
     };
 
-    if (!filtered && !repair)
-        if (auto hash = getConcurrent(settings.srcToStore->cache, srcToStoreKey))
+    if (srcToStoreKey)
+        if (auto hash = getConcurrent(settings.srcToStore->cache, *srcToStoreKey))
             if (auto result = useHash(*hash))
                 return *result;
-
-    SourcePath path = srcPath;
-
-    /* A filtered tree is named by the inner tree's name and the admitted
-       set (01 §8.2), so the memo below applies to it; when the inner tree
-       has no name the walk would be wasted, and the filter is applied while
-       dumping instead. */
-    if (filter && path.accessor->getFingerprint(path.path).second) {
-        path = filteredTree(path, *filter);
-        filter = nullptr;
-    }
 
     std::optional<fetchers::Cache::Key> cacheKey;
 
@@ -384,9 +380,6 @@ std::pair<StorePath, Hash> fetchToStore2(
         if (auto entry = path.accessor->getKnownEntry(path.path))
             if (auto result = useHash(merkle::objectHash(*entry)))
                 return *result;
-
-    auto [subpath, fingerprint] = filter ? std::pair<CanonPath, std::optional<std::string>>{path.path, std::nullopt}
-                                         : path.accessor->getFingerprint(path.path);
 
     if (fingerprint && !repair) {
         cacheKey = makeSourcePathToHashCacheKey(*fingerprint, method, subpath);
@@ -427,8 +420,8 @@ std::pair<StorePath, Hash> fetchToStore2(
         mode == FetchMode::DryRun
             ? [&]() {
                   if (method == ContentAddressMethod::Raw::Git) {
-                      /* The compositional name needs no serialisation: the
-                         tree's hash, memoised subtree by subtree, forms the path. */
+                      /* Repair reads the tree itself, bypassing known entries
+                         and subtree memo rows as well as the root caches. */
                       auto hash = merkle::objectHash(
                           repair ? objectHashOf(*path.accessor, path.path, filter2).root
                                  : gitTreeHashMemoised(settings, path, filter2, filter != nullptr));
@@ -503,8 +496,8 @@ std::pair<StorePath, Hash> fetchToStore2(
             cache->upsert(*cacheKey, {{"hash", hash.to_string(HashFormat::SRI, true)}});
     }
 
-    if (!filtered)
-        settings.srcToStore->cache.insert_or_assign(srcToStoreKey, hash);
+    if (srcToStoreKey)
+        settings.srcToStore->cache.insert_or_assign(*srcToStoreKey, hash);
 
     return {storePath, hash};
 }

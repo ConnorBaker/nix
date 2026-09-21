@@ -1,6 +1,6 @@
 # The blob representation: the link, the holder index, and what decides between them
 
-`01-specification.md` section 9.10 says where a regular file's blob lives: a file
+The design began with a regular file's blob living in a file
 of its own under `.objects/blobs/<xx>/<id>` (0444) or `.objects/blobs-x/<xx>/<id>`
 (0555), and a store path's regular file is a hard link to it. That sentence costs
 one `linkat` per regular file on every first entry of a tree. This document holds
@@ -11,7 +11,18 @@ and section 6 records it with its gate; this document is the design space and
 the measurements, and the invariants and laws as they now stand are
 `08-store-model.md` and `01-specification.md` section 9.10. Where section 2
 below differs from those — it is the proposal as it was put, with a foreign
-key's cascade the shipped code does not have — the proposal is what it records.
+key's cascade the implementation does not have — the proposal is what it records.
+
+The current index retains candidates keyed by `(id, exec, ingestion)`, including
+a path's own witness when its file was linked from another path. Collecting the
+donor therefore leaves the surviving ingestion's witness. A completed ingestion
+replaces that path's previous candidate projection, including an empty projection,
+so repeating optimisation does not accumulate witnesses. Publication also
+coalesces overlapping ingestions' independently written files before their
+candidates become visible; a database key alone never established inode sharing.
+The schema, concurrency claims and deleted-holder exception in the original
+proposal below are historical. Its row-count and database-size measurements
+describe that representation, not the number of retained candidates today.
 
 The measurement drivers are `runs/linux-measure-first-entry-holder.nix` and its
 script `runs/linux-first-entry-holder.sh`,
@@ -651,7 +662,7 @@ Two things decided by the measurements and settled here:
   right about the *writer* and wrong about the probe, and the ablation is what
   distinguishes them.
 
-The costs the representation carries, which the release note states: law 3's
+The costs recorded for the original representation were law 3's
 fifth exception, K2's weaker repair, K8 falsified (the index is the witness, not
 the link count), no cross-layer sharing on the overlay store, and a database of
 1.85 GiB at 10⁷ blobs and about 18 GiB at 10⁸ `[extrapolated]`.
@@ -694,8 +705,8 @@ so its length is the honest measure of what is left.
   (drop the sweep's `pathExists(tmp / held)` test and it fails).
 - *The two repair tests*, rewritten to pin what repair does to a *holder*: the row is forgotten, the freshly written file becomes the holder, and the corrupt file stays where it is, since removing it would damage a valid path.  Each keeps its discriminator in its own no-repair arm — the composite trusts the holder's size and links it, writing nothing — and `repairRelinksAFreshFileOverACorruptBlob` also loses a link, the holder being this path's own file with no second path sharing it yet (`08` K8).
 - *The unit tests and functional scripts that pinned the old representation*, each rewritten to pin the statement that holds with the same discriminating power, none deleted without its replacement named, and one renamed where the rule's domain narrowed (`sweepKeepsASymlinkBlobALiveTreeNamesThoughNothingLinksIt`).  The list of scripts turned out to be **four** and not three: `object-store.sh`, `object-hash.sh`, `optimise-store.sh` and `git-hashing/object-store-fetch.sh`, the last of which the main suite's list had missed and the `git-hashing` gate found.
-- *`nix-store --optimise`'s re-entry of a forgotten holder*, with its test (`optimiseReEntersAForgottenHolder`) and a functional block beside it.  It needed **no new code**: `optimiseStore` already opens an ingestion per path and names it at `endIngestion`, which was simply unpinned.  It is the repair law 3's fifth exception is bounded by.
-- *The invariants, the laws and the tables.*  `08` K1–K4, K8, K9, K11, K13, K16, K17 and sections 1.3, 1.4, 1.5 and X2, each saying what became weaker, stronger or unchanged and citing the function; `01` section 9.10's *Where the objects live*, law 3's fifth exception, law 4 restated over the index, law 5's judgment of rows, and *One route*'s writer; `01` section 10's decision entry with the gate numbers of section 6; `04` section 1.7's composite — the index, the ingestion, the writer, the stale rule — and its verifier paragraph; `07`'s rows for the four defects this work found; `05` section 2's four scripts, section 4's mutation rows, section 5's counts, section 6's scale tables and section 7's `ENOSPC` entry, which the representation closes for a regular file; and the manual's release note and `nix-store --optimise` page.
+- *A surviving ingestion retains its own holder witness*, checked by `sharingWitnessSurvivesDonorCollection`. The earlier `optimiseReEntersAForgottenHolder` test described the superseded single-candidate index: collection removed the only row and optimisation had to recover it. With per-ingestion candidates, collection removes the donor's row alone, and optimisation need not enter the surviving file again.
+- *The invariants, the laws and the tables.*  `08` K1–K4, K8, K9, K11, K13, K16, K17 and sections 1.3, 1.4, 1.5 and X2, each saying what became weaker, stronger or unchanged and citing the function; `01` section 9.10's *Where the objects live*, law 3's sharing law with surviving per-ingestion witnesses, law 4 restated over the index, law 5's judgment of rows, and *One route*'s writer; `01` section 10's decision entry with the gate numbers of section 6; `04` section 1.7's composite — the index, the ingestion, the writer, the stale rule — and its verifier paragraph; `07`'s rows for the four defects this work found; `05` section 2's four scripts, section 4's mutation rows, section 5's counts, section 6's scale tables and section 7's `ENOSPC` entry, which the representation closes for a regular file; and the manual's release note and `nix-store --optimise` page.
 - *The schema convention.*  The index owes no version bump — 11 was bumped because
   an existing column's *meaning* changed, and two new tables change no existing
   column — so it is an additive migration, and because a migration is recorded by

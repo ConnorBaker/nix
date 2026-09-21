@@ -219,8 +219,9 @@ public:
     CanonPath resolveSymlinks(const CanonPath & path, SymlinkResolution mode = SymlinkResolution::Full);
 
     /**
-     * A string that uniquely represents the contents of this
-     * accessor. This is used for caching lookups (see `fetchToStore()`).
+     * An optional name for this accessor's complete rendered tree. Equal
+     * names must identify equal trees; a producer assigning one must keep
+     * it valid for the lifetime of that view, including after mutations.
      */
     std::optional<std::string> fingerprint;
 
@@ -239,20 +240,17 @@ public:
     }
 
     /**
-     * Return the fingerprint for `path`. This is usually the
-     * fingerprint of the current accessor, but for composite
-     * accessors (like `MountedSourceAccessor`), we want to return the
-     * fingerprint of the "inner" accessor if the current one lacks a
-     * fingerprint.
+     * Return a name and relative path identifying the rendered subtree at
+     * `path`. Equal (name, relative path) pairs must identify equal subtrees,
+     * even across different accessors. Returning no name is always valid.
      *
-     * So this method is intended to return the most-outer accessor
-     * that has a fingerprint for `path`. It also returns the path that `path`
-     * corresponds to in that accessor.
+     * A wrapper may forward an inner name only when that inner subtree is
+     * the whole rendered subtree, including its domain. Otherwise it must
+     * derive a name for its transformed view or decline to name it.
      *
-     * For example: in a `MountedSourceAccessor` that has
-     * `/nix/store/foo` mounted,
-     * `getFingerprint("/nix/store/foo/bar")` will return the path
-     * `/bar` and the fingerprint of the `/nix/store/foo` accessor.
+     * For example, below an authoritative mount at `/nix/store/foo`,
+     * `/nix/store/foo/bar` can use the mounted accessor's name with `/bar`.
+     * A union directory with another contributor cannot use that name alone.
      */
     virtual std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path)
     {
@@ -324,23 +322,12 @@ ref<SourceAccessor> makeFSSourceAccessor(
     std::filesystem::path root, bool trackLastModified = false, FinalSymlink finalSymlink = FinalSymlink::DontFollow);
 
 /**
- * What the caller of `makeUnionSourceAccessor()` asserts about the children;
- * it decides only how `getFingerprint()` names subtrees.  `Unknown`: a subtree
- * is named only where one child alone defines it or every contributing child
- * has a name (then combined).  `ChildrenAgree`: overlapping subtrees are
- * equal, so the first child's name serves (the evaluator's impure root: host
- * filesystem and store view agree at content-addressed store paths).
- */
-enum class UnionCoherence { Unknown, ChildrenAgree };
-
-/**
  * Return the union of the given accessors.  At each path the first child
  * that has a node decides: a directory is the merge of the directories
  * every child has there, earlier children winning name collisions; a
  * non-directory hides the later children's subtrees at and below it.
  */
-ref<SourceAccessor> makeUnionSourceAccessor(
-    std::vector<ref<SourceAccessor>> && accessors, UnionCoherence coherence = UnionCoherence::Unknown);
+ref<SourceAccessor> makeUnionSourceAccessor(std::vector<ref<SourceAccessor>> && accessors);
 
 /**
  * Make a wrapper source accessor that caches positive lookup results.

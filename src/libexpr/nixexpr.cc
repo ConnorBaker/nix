@@ -405,8 +405,10 @@ void ExprAttrs::moveDataToAllocator(std::pmr::polymorphic_allocator<char> & allo
     attrs.emplace(std::move(newAttrs), alloc);
     DynamicAttrDefs newDynamicAttrs{std::move(*dynamicAttrs), alloc};
     dynamicAttrs.emplace(std::move(newDynamicAttrs), alloc);
-    if (inheritFromExprs)
-        inheritFromExprs = std::make_unique<std::pmr::vector<Expr *>>(std::move(*inheritFromExprs), alloc);
+    if (inheritFromExprs) {
+        std::pmr::vector<Expr *> newInheritFromExprs{std::move(*inheritFromExprs), alloc};
+        inheritFromExprs.emplace(std::move(newInheritFromExprs), alloc);
+    }
 }
 
 void ExprAttrs::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env)

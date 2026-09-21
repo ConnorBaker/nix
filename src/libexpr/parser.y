@@ -390,7 +390,7 @@ expr_simple
   | '{' binds1 '}'
     { $2->pos = CUR_POS; $$ = $2; }
   | '{' '}'
-    { $$ = state->exprs.add<ExprAttrs>(CUR_POS); }
+    { $$ = state->exprs.add<ExprAttrs>(state->exprs.parserAlloc, CUR_POS); }
   | '[' list ']' { $$ = state->exprs.add<ExprList>(state->exprs.alloc, $2); }
   ;
 
@@ -476,7 +476,7 @@ ind_string_parts
 
 binds
   : binds1
-  | { $$ = state->exprs.add<ExprAttrs>(); }
+  | { $$ = state->exprs.add<ExprAttrs>(state->exprs.parserAlloc); }
   ;
 
 binds1
@@ -497,7 +497,7 @@ binds1
   | binds[accum] INHERIT '(' expr ')' attrs ';'
     { $$ = $accum;
       if (!$accum->inheritFromExprs)
-          $accum->inheritFromExprs = std::make_unique<std::pmr::vector<Expr *>>();
+          $accum->inheritFromExprs.emplace($accum->attrs->get_allocator().resource());
       $accum->inheritFromExprs->push_back($expr);
       auto from = state->exprs.add<ExprInheritFrom>(state->at(@expr), $accum->inheritFromExprs->size() - 1);
       for (auto & [i, iPos] : $attrs) {
@@ -512,7 +512,7 @@ binds1
       }
     }
   | attrpath '=' expr ';'
-    { $$ = state->exprs.add<ExprAttrs>();
+    { $$ = state->exprs.add<ExprAttrs>(state->exprs.parserAlloc);
       state->addAttr($$, std::move($attrpath), @attrpath, $expr, @expr);
     }
   ;

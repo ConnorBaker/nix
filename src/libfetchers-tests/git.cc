@@ -3,6 +3,9 @@
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/git-utils.hh"
+#include "nix/fetchers/fetch-to-store.hh"
+#include "nix/util/object-hash-sink.hh"
+#include "nix/util/tests/setting-scopes.hh"
 #include "nix/util/url.hh"
 
 #include <git2.h>
@@ -101,6 +104,7 @@ namespace nix::fetchers {
 
 class GitTest : public ::testing::Test
 {
+    FreshCacheHome cacheHome;
     std::unique_ptr<AutoDelete> delTmpDir;
 
 protected:
@@ -197,6 +201,101 @@ TEST_F(GitTest, submodulePeriodSupport)
     auto [accessor, i] = input.getAccessor(settings, *store);
 
     ASSERT_EQ(accessor->readFile(CanonPath("deps/sub/lib.txt")), "hello from submodule\n");
+}
+
+TEST_F(GitTest, workdirNamingDoesNotReuseItsReportedRevision)
+{
+    auto store = make_ref<DummyStoreConfig>(StoreReference::Params{})->openStore();
+    Settings settings;
+    settings.warnDirty = false;
+    for (unsigned flags = 0; flags < 4; ++flags) {
+        SCOPED_TRACE(flags);
+        auto repoPath = tmpDir / std::to_string(flags);
+        git_repository * rawRepo = nullptr;
+        CHECK_LIBGIT(git_repository_init(&rawRepo, repoPath.string().c_str(), 0));
+        RepoHandle repo(rawRepo);
+        writeFile(repoPath / "file", "before");
+        commitAll(repo.get(), "initial");
+        auto input = Input::fromAttrs({
+            {"type", "git"},
+            {"url", repoPath.string()},
+            {"shallow", Explicit{true}},
+        });
+        EXPECT_FALSE(input.getFingerprint(*store));
+        auto [first, firstInput] = input.getAccessor(settings, *store);
+        EXPECT_FALSE(firstInput.getFingerprint(*store));
+        auto firstName = fetchToStore2(settings, *store, first, FetchMode::DryRun, "source");
+
+        git_index * rawIndex = nullptr;
+        CHECK_LIBGIT(git_repository_index(&rawIndex, repo.get()));
+        IndexHandle index(rawIndex);
+        auto original = git_index_get_bypath(index.get(), "file", 0);
+        ASSERT_NE(original, nullptr);
+        auto entry = *original;
+        if (flags & 1)
+            entry.flags |= GIT_INDEX_ENTRY_VALID;
+        if (flags & 2) {
+            entry.flags |= GIT_INDEX_ENTRY_EXTENDED;
+            entry.flags_extended |= GIT_INDEX_ENTRY_SKIP_WORKTREE;
+        }
+        CHECK_LIBGIT(git_index_add(index.get(), &entry));
+        CHECK_LIBGIT(git_index_write(index.get()));
+        writeFile(repoPath / "file", "different bytes");
+        GitRepo::invalidateWorkdirInfoCache();
+
+        auto [second, secondInput] = input.getAccessor(settings, *store);
+        EXPECT_FALSE(secondInput.getFingerprint(*store));
+        EXPECT_EQ(second->readFile(CanonPath("file")), "different bytes");
+        auto secondName = fetchToStore2(settings, *store, second, FetchMode::DryRun, "source");
+        EXPECT_NE(secondName, firstName);
+        EXPECT_EQ(secondName.second, objectHashOf(*second, CanonPath::root).root.hash);
+    }
+}
+
+TEST_F(GitTest, commitFiltersAreNotIdentifiedByTheRevision)
+{
+    auto repoPath = tmpDir / "repo";
+    git_repository * rawRepo = nullptr;
+    CHECK_LIBGIT(git_repository_init(&rawRepo, repoPath.string().c_str(), 0));
+    RepoHandle repo(rawRepo);
+    writeFile(repoPath / "first", "first");
+    writeFile(repoPath / "second", "second");
+    commitAll(repo.get(), "initial");
+    git_oid rev;
+    CHECK_LIBGIT(git_reference_name_to_id(&rev, repo.get(), "HEAD"));
+
+    auto store = make_ref<DummyStoreConfig>(StoreReference::Params{})->openStore();
+    Settings settings;
+    auto attrs = Attrs{
+        {"type", "git"},
+        {"url", repoPath.string()},
+        {"rev", std::string(git_oid_tostr_s(&rev))},
+        {"shallow", Explicit{true}},
+    };
+    for (bool exportIgnore : {false, true})
+        for (bool lfs : {false, true}) {
+            auto configured = attrs;
+            configured.insert_or_assign("exportIgnore", Explicit{exportIgnore});
+            configured.insert_or_assign("lfs", Explicit{lfs});
+            EXPECT_EQ(
+                Input::fromAttrs(std::move(configured)).getFingerprint(*store).has_value(), !exportIgnore && !lfs);
+        }
+    attrs.insert_or_assign("exportIgnore", Explicit{true});
+    auto input = Input::fromAttrs(std::move(attrs));
+    auto attributes = repoPath / ".git/info/attributes";
+    writeFile(attributes, "first export-ignore\n");
+    auto [first, firstInput] = input.getAccessor(settings, *store);
+    ASSERT_FALSE(first->pathExists(CanonPath("first")));
+    ASSERT_TRUE(first->pathExists(CanonPath("second")));
+    auto firstName = fetchToStore2(settings, *store, first, FetchMode::DryRun, "source");
+
+    writeFile(attributes, "second export-ignore\n");
+    auto [second, secondInput] = input.getAccessor(settings, *store);
+    ASSERT_TRUE(second->pathExists(CanonPath("first")));
+    ASSERT_FALSE(second->pathExists(CanonPath("second")));
+    auto secondName = fetchToStore2(settings, *store, second, FetchMode::DryRun, "source");
+    EXPECT_NE(secondName, firstName);
+    EXPECT_EQ(secondName.second, objectHashOf(*second, CanonPath::root).root.hash);
 }
 
 } // namespace nix::fetchers

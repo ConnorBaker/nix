@@ -1,6 +1,7 @@
 #include "nix/expr/write-buffer.hh"
 #include "nix/util/merkle-hash.hh"
 #include "nix/store/derivation/aterm.hh"
+#include "nix/store/globals.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/hash.hh"
 #include "nix/util/logging.hh"
@@ -256,16 +257,16 @@ void WriteBuffer::flush()
         batch.emplace_back(infoFor(*entry), std::make_unique<NarOfString>(entry->second.contents));
 
     Activity act(*logger, lvlTalkative, actCopyPaths, fmt("writing %d store objects", order.size()));
-    if (!anyRepair) {
+    if (!anyRepair && !settings.getWorkerSettings().keepGoing) {
         /* The common case: nothing to repair, so one bulk add.  Every path
            in `order` is not yet valid, so the batch writes them all. */
         store.addMultipleToStore(std::move(batch), act, NoRepair, NoCheckSigs);
     } else {
-        /* Repair was asked for at least one object.  `addMultipleToStore`
-           skips every already-valid path regardless of the repair flag
-           (store-api.cc), so it cannot rewrite a corrupt-but-valid object;
-           mirror eager mode instead with one `addToStore` per object, in
-           reference order, each carrying its own repair flag. */
+        /* The bulk operation skips already-valid paths even under repair,
+           and suppresses write errors under keep-going. A flush must write
+           every object before its paths can escape, and must propagate a
+           failed write. Use the eager operation in these cases, in reference
+           order and with each object's own repair flag. */
         for (size_t i = 0; i < batch.size(); ++i) {
             /* The source is destroyed with each object, as it is in the bulk
                add (store-api.cc): a `SinkToSource` holds a coroutine stack

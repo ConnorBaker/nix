@@ -29,7 +29,12 @@ static void canonicaliseTimestampAndPermissions(const std::filesystem::path & pa
     }
 
 #ifndef _WIN32 // TODO implement
-    if (st.st_mtime != mtimeStore) {
+#  ifdef __APPLE__
+    const auto & mtime = st.st_mtimespec;
+#  else
+    const auto & mtime = st.st_mtim;
+#  endif
+    if (mtime.tv_sec != mtimeStore || mtime.tv_nsec != 0) {
         PosixStat st2 = st;
         st2.st_mtime = mtimeStore, setWriteTime(path, st2);
     }

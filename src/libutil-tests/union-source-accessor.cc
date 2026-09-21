@@ -31,8 +31,8 @@ TEST(UnionSourceAccessor, overlaySemantics)
 
 /* The general naming rule: a subtree that is one child's alone gets that
    child's name; a merged directory is named from all its parts or not at
-   all.  A union whose children are asserted to agree names from the first
-   child that can, as the evaluator's impure root does. */
+   all.  Overlap agreement alone cannot justify forwarding a child's name
+   for a directory to which another child contributes additional entries. */
 TEST(UnionSourceAccessor, fingerprints)
 {
     auto a = memoryTree({{"d/x", "ax"}, {"f", "af"}});
@@ -57,12 +57,6 @@ TEST(UnionSourceAccessor, fingerprints)
     EXPECT_FALSE(general->getFingerprint(CanonPath("d")).second);
     EXPECT_EQ(general->getFingerprint(CanonPath("d/x")).second, std::optional<std::string>("A"));
     b->fingerprint = "B";
-
-    auto coherent = makeUnionSourceAccessor({a, b}, UnionCoherence::ChildrenAgree);
-    EXPECT_EQ(coherent->getFingerprint(CanonPath("d")), std::pair(CanonPath("d"), std::optional<std::string>("A")));
-    EXPECT_EQ(coherent->getFingerprint(CanonPath("g")), std::pair(CanonPath("g"), std::optional<std::string>("A")));
-    a->fingerprint = std::nullopt;
-    EXPECT_EQ(coherent->getFingerprint(CanonPath("d")), std::pair(CanonPath("d"), std::optional<std::string>("B")));
 }
 
 } // namespace nix

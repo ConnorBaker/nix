@@ -206,7 +206,7 @@ def renamed(dbpath, realdir, *, include_paths=False, rewrite=None):
                     pos += 2 if text[pos] == "\\" else 1
                 value = text[start:pos]
                 pos += 1
-                return ("s", mask(value.encode("utf-8", "surrogateescape")).decode("utf-8", "surrogateescape"))
+                return ("s", value)
             if c in "[(":
                 close = "]" if c == "[" else ")"
                 pos += 1
@@ -228,14 +228,27 @@ def renamed(dbpath, realdir, *, include_paths=False, rewrite=None):
             tree = parse()
         except (ValueError, IndexError):
             return None
-        if text[pos:].strip():
+        def serialize(node):
+            kind = node[0]
+            if kind == "s":
+                return '"' + node[1] + '"'
+            if kind == "f":
+                return node[1] + serialize(node[2])
+            left, right = ("[", "]") if kind == "l" else ("(", ")")
+            return left + ",".join(serialize(x) for x in node[1]) + right
+
+        # Preserve every byte except the two path-sorted lists below. Parsing
+        # must not silently erase separators or trailing whitespace before
+        # address rewriting; malformed/noncanonical text is compared raw.
+        if pos != len(text) or serialize(tree) != text:
             return None
 
-        def canon(node):
+        def canon(node, root=False):
             kind = node[0]
             if kind == "f":
                 name, args = node[1], node[2]
-                if name == "Derive" and args[0] == "t" and len(args[1]) >= 3:
+                if (root and name == "Derive" and args[0] == "t" and len(args[1]) >= 3
+                        and all(field[0] == "l" for field in args[1][1:3])):
                     fields = list(args[1])
                     fields[1] = ("l", sorted((canon(x) for x in fields[1][1]), key=repr))
                     fields[2] = ("l", sorted((canon(x) for x in fields[2][1]), key=repr))
@@ -243,9 +256,11 @@ def renamed(dbpath, realdir, *, include_paths=False, rewrite=None):
                 return ("f", name, canon(args))
             if kind in "lt":
                 return (kind, [canon(x) for x in node[1]])
+            if kind == "s":
+                return ("s", mask(node[1].encode("utf-8", "surrogateescape")).decode("utf-8", "surrogateescape"))
             return node
 
-        return repr(canon(tree)).encode("utf-8", "surrogateescape")
+        return repr(canon(tree, root=True)).encode("utf-8", "surrogateescape")
 
     def digest(real):
         h = hashlib.sha256()

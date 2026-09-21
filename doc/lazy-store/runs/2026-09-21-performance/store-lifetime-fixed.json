@@ -1,0 +1,77 @@
+{
+  "returncode": 0,
+  "original_before": {
+    "db.sqlite": {
+      "size": 2125824,
+      "inode": 51949264,
+      "sha256": "70ed06d65e5f4f7fd71479dd698be8a211cfb1ee275ab6963426ac1e8dcb632f"
+    },
+    "db.sqlite-wal": {
+      "size": 164808272,
+      "inode": 51949265,
+      "sha256": "f0803ccba2daf844c54343b4cc4802110b1cf211e458b63a3b66b2c6653f62c8"
+    },
+    "db.sqlite-shm": {
+      "size": 294912,
+      "inode": 51949266,
+      "sha256": "30c935986a2bac6e0b096a6284f45e96230fb1015d1209547bf994eb339c0f91"
+    }
+  },
+  "original_after": {
+    "db.sqlite": {
+      "size": 2125824,
+      "inode": 51949264,
+      "sha256": "70ed06d65e5f4f7fd71479dd698be8a211cfb1ee275ab6963426ac1e8dcb632f"
+    },
+    "db.sqlite-wal": {
+      "size": 164808272,
+      "inode": 51949265,
+      "sha256": "f0803ccba2daf844c54343b4cc4802110b1cf211e458b63a3b66b2c6653f62c8"
+    },
+    "db.sqlite-shm": {
+      "size": 294912,
+      "inode": 51949266,
+      "sha256": "30c935986a2bac6e0b096a6284f45e96230fb1015d1209547bf994eb339c0f91"
+    }
+  },
+  "copy_before": {
+    "db.sqlite": {
+      "size": 2125824,
+      "inode": 28100258,
+      "sha256": "70ed06d65e5f4f7fd71479dd698be8a211cfb1ee275ab6963426ac1e8dcb632f"
+    },
+    "db.sqlite-wal": {
+      "size": 164808272,
+      "inode": 28100259,
+      "sha256": "f0803ccba2daf844c54343b4cc4802110b1cf211e458b63a3b66b2c6653f62c8"
+    },
+    "db.sqlite-shm": {
+      "size": 294912,
+      "inode": 28100260,
+      "sha256": "30c935986a2bac6e0b096a6284f45e96230fb1015d1209547bf994eb339c0f91"
+    }
+  },
+  "copy_after": {
+    "db.sqlite": {
+      "size": 4317184,
+      "inode": 28100258,
+      "sha256": "ce38ca3ef34530350822eb1244e9e2198f152b3cc023c424d90da10e5e775013"
+    },
+    "db.sqlite-wal": {
+      "size": 0,
+      "inode": 28100259,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "db.sqlite-shm": {
+      "size": 294912,
+      "inode": 28100260,
+      "sha256": "32cdd4d90be4d61d3e8335e2146e348f3cdc49b20c51f73de9ea37ab65b62d8c"
+    }
+  },
+  "syscalls": {
+    "main_db_checkpoint_writes": 743,
+    "main_db_checkpoint_bytes": 3043328,
+    "wal_truncate_to_zero": true
+  },
+  "all8_output_fields_equal_to_original": true
+}

@@ -432,34 +432,9 @@ struct ValueBase
         Value * const * elems;
     };
 
-    /**
-     * Wrapper that stores a std::exception_ptr on the GC heap with a finaliser
-     * that runs the exception_ptr destructor (which is refcounted internally).
-     * This is not a part of the Failed structure to avoid cycles with finalisers,
-     * which Boehm warns about.
-     */
-    struct ExceptionRef : gc_cleanup
-    {
-        ExceptionRef(std::exception_ptr ex)
-            : ex(std::move(ex))
-        {
-            assert(this->ex);
-        }
-
-        ExceptionRef(ExceptionRef &&) = delete;
-        ExceptionRef(const ExceptionRef &) = delete;
-        ExceptionRef & operator=(ExceptionRef &&) = delete;
-        ExceptionRef & operator=(const ExceptionRef &) = delete;
-
-        /* To appease -Wweak-vtables. */
-        virtual ~ExceptionRef();
-
-        std::exception_ptr ex;
-    };
-
     struct Failed : gc
     {
-        ExceptionRef * exRef;
+        const std::exception_ptr & ex;
 
         /**
          * Optional value for recovering `RecoverableEvalError`
@@ -467,16 +442,17 @@ struct ValueBase
          */
         Value * recoveryValue;
 
-        Failed(std::exception_ptr ex, Value * recoveryValue)
-            : exRef(new /* ExceptionRef : gc_cleanup */ ExceptionRef(ex))
+        Failed(const std::exception_ptr & ex, Value * recoveryValue)
+            : ex(ex)
             , recoveryValue(recoveryValue)
         {
+            assert(ex);
         }
 
         [[noreturn]] void rethrow() const
         {
             try {
-                std::rethrow_exception(exRef->ex);
+                std::rethrow_exception(ex);
             } catch (BaseError & e) {
                 /* Rethrow the copy of the exception - not the original one.
                    Stack tracing mechanisms rely on being able to modify the exceptions
@@ -1468,10 +1444,7 @@ public:
         setStorage(n);
     }
 
-    inline void mkFailed(std::exception_ptr e, Value * recovery) noexcept
-    {
-        setStorage(new Value::Failed(e, recovery));
-    }
+    void mkFailed(std::exception_ptr e, Value * recovery, EvalMemory & mem) noexcept;
 
     bool isList() const noexcept
     {

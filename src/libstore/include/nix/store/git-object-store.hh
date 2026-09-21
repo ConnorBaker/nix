@@ -15,8 +15,10 @@
 
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -35,6 +37,11 @@ namespace nix {
  */
 struct GitObjectStore
 {
+private:
+    struct AuxiliaryLock;
+    std::shared_ptr<AuxiliaryLock> auxiliaryLock;
+
+public:
     static constexpr HashAlgorithm hashAlgo = merkle::hashAlgo;
 
     class Hold;
@@ -42,21 +49,20 @@ struct GitObjectStore
     /**
      * A regular-file blob's canonical file is a *store path's own file* --
      * a **holder** -- and this is the store's record of where it is: one
-     * row per (blob, mode) in the store's own database (`schema.sql`,
-     * `Blobs`).  `.objects/blobs` and `.objects/blobs-x` then hold no
-     * regular-file blob at all: they hold the symlink-target blobs, which
-     * no path holds, and `trees/` is unchanged.  The first entry of a
-     * tree writes each file once and records rows -- no `linkat` a file,
-     * which is the 0.19-0.21 s per 40 000 files of `05-validation.md`
-     * section 6.
+     * candidate row per (blob, mode, ingestion) in the store's database
+     * (`schema.sql`, `Blobs`). Written and reused files both retain a witness.  `.objects/blobs` and `.objects/blobs-x`
+     * then hold no regular-file blob at all: they hold the symlink-target blobs, which no path holds, and `trees/` is
+     * unchanged.  The first entry of a tree writes each file once and records rows -- no `linkat` a file, which is the
+     * 0.19-0.21 s per 40 000 files of `05-validation.md` section 6.
      *
      * When a row is written, when it becomes true, and when it goes.  The
      * rows are written **while the copy runs**, by the index's writer on a
      * connection of its own (`LocalStore::writeBlobRows`), because the
      * copy is where the holders are made; they name an `Ingestions` row
      * rather than a `ValidPaths` one, since the path does not exist yet,
-     * and they become true all at once when that row is given its path at
-     * the registration (`LocalStore::endIngestion`).  There is therefore
+     * and become visible only after publication reconciles overlapping
+     * candidates to one physical inode and names the valid path
+     * (`LocalStore::registerValidPaths`, `LocalStore::endIngestion`).  There is therefore
      * **no foreign key and no cascade**: a row whose ingestion has no
      * path, or whose path is no longer valid, is *stale*, and two things
      * judge it -- `link`, which finds the holder gone or not what the row
@@ -68,11 +74,24 @@ struct GitObjectStore
      */
     struct Holder
     {
+        /** SQLite stores device and inode numbers as signed integers. The
+         * physical class must precede the replaceable ingestion identity. */
+        using Cursor = std::tuple<int64_t, int64_t, uint64_t>;
+        static constexpr Cursor initialCursor{
+            std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::min(), 0};
+
         ino_t ino;
         dev_t dev;
         uint64_t size;
         /** The holder's absolute on-disk path. */
         std::string file;
+        /** The ingestion that owns this candidate, strictly positive. */
+        uint64_t ingestion = 0;
+
+        Cursor cursor() const
+        {
+            return {static_cast<int64_t>(dev), static_cast<int64_t>(ino), ingestion};
+        }
     };
 
     /**
@@ -82,11 +101,13 @@ struct GitObjectStore
      */
     struct Index
     {
-        /** The holder of (id, mode), or nothing. */
-        std::function<std::optional<Holder>(const Hash &, bool)> lookup;
-        /** Forget the row for (id, mode): its holder is gone or is not what it says. */
-        std::function<void(const Hash &, bool)> forget;
-        /** Every row's inode with its identifier (`blobInodes`). */
+        /** The next registered candidate of (id, mode), ordered by physical
+         * class and then ingestion. Its cursor strictly exceeds the input. */
+        std::function<std::optional<Holder>(const Hash &, bool, Holder::Cursor)> lookup;
+        /** Forget this candidate only if it is still the row observed. */
+        std::function<void(const Hash &, bool, const Holder &)> forget;
+        /** The first registered candidate's inode for each (id, mode),
+         * with its identifier, for the optimiser's shortcut (`blobInodes`). */
         std::function<void(boost::unordered_flat_map<ino_t, Hash> &)> inodes;
     };
 
@@ -97,7 +118,10 @@ struct GitObjectStore
     /** Whether object files (and their directory) are fsynced when written. */
     const bool fsync;
 
-    explicit GitObjectStore(std::filesystem::path dir, bool fsync = false);
+    /** All users of this object namespace must use the same lock file.
+     * LocalStore supplies one outside its possibly remounted store directory. */
+    explicit GitObjectStore(
+        std::filesystem::path dir, bool fsync = false, std::filesystem::path auxiliaryLockFile = {});
 
     /**
      * What a collection cost, counted only while a test asks for it
@@ -215,6 +239,9 @@ struct GitObjectStore
      */
     std::optional<Holder> holderOrForget(const Hash & id, bool executable, RepairFlag repair, PosixStat * st = nullptr);
 
+    /** Physical facts required before sharing a recorded regular-file holder. */
+    static bool validHolderMetadata(const Holder & holder, bool executable, const PosixStat & st);
+
     /**
      * A fresh name under `tmp/` for a temporary of the given kind
      * (`link`, `object`), carrying the second it was made, which is the
@@ -226,7 +253,7 @@ struct GitObjectStore
      * Link the store's valid file for the blob under its mode as `name`
      * in the writable directory `dirFd`, where nothing stands yet: true
      * when done, and the file need not be written; false when the store
-     * lacks the blob (or held an invalid file, now removed), when it was
+     * lacks the blob (or its invalid candidate was forgotten), when it was
      * swept meanwhile, or at the filesystem's link limit -- the caller
      * writes the file instead.  `size` is the blob's, for the validity
      * check; without one (a materialisation from the store's objects,
@@ -273,9 +300,9 @@ struct GitObjectStore
     /**
      * The regular file `name` in the writable directory `dirFd` (at
      * `where`), just written because the store had no file for its blob,
-     * entered as that file: one `linkat` and the status of neither file.
-     * Should the store's file have appeared meanwhile the decision is
-     * `place`'s, taken here with the status this then costs; should the
+     * entered as that file: read its status and claim a pending holder.
+     * Another worker's completed file wins an overlapping miss; a streamed
+     * file also probes registered holders through `place`. Should the
      * link be refused for `EMLINK` or a full directory index the file is
      * left as written, as `place` leaves it (01 §9.10 law 3's fourth
      * exception).
@@ -314,15 +341,19 @@ struct GitObjectStore
         friend class LocalStoreObjectsTest;
         std::filesystem::path dir;
         AutoCloseFD fd;
+        std::shared_ptr<AuxiliaryLock> auxiliaryLock;
     public:
         /* Behind a pointer so that `Hold` stays movable with a mutex in it. */
         struct Pending;
 
     private:
         std::unique_ptr<Pending> pending;
-        Hold(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade);
+        Hold(
+            const std::filesystem::path & tmp,
+            const std::function<void()> & atHoldMade,
+            std::shared_ptr<AuxiliaryLock> auxiliaryLock);
         /* The `ownRows` form: the same directory, no lock of its own. */
-        explicit Hold(const std::filesystem::path & shared, int);
+        explicit Hold(const std::filesystem::path & shared, std::shared_ptr<AuxiliaryLock> auxiliaryLock);
 
     public:
         /**
@@ -349,7 +380,7 @@ struct GitObjectStore
         Hold ownRows() const;
 
         /**
-         * A pending index row: a regular file this ingestion wrote, which
+         * A pending index row: a regular file this ingestion wrote or linked, which
          * becomes the blob's holder when the path is registered
          * (`LocalStore::recordBlobs`).  Kept here because the hold is
          * already the object whose life is "from the first write to the
@@ -418,12 +449,12 @@ struct GitObjectStore
         const std::filesystem::path & directory() const;
 
         /** Claim a completed file as this ingestion's holder. Return the
-         * existing holder if another worker published first. Replacement
-         * is reserved for a holder the caller found unusable. */
-        std::optional<std::string> addRow(Row row, bool replace = false) const;
+         * existing holder if another worker published first. The claim
+         * remains stable until the ingestion finishes. */
+        std::optional<std::string> addRow(Row row) const;
 
         /**
-         * The file this ingestion already wrote for (id, mode), if any:
+         * The completed file this ingestion owns for (id, mode), if any:
          * the in-flight half of the index, without which two identical
          * files of one tree would both be written (law 3 within a path).
          */
@@ -565,6 +596,9 @@ struct GitObjectStore
      * tree or blob with a second link is held -- by a path's file or by an
      * ingestion's `Hold` -- and kept; a hold whose lock is free is a dead
      * ingestion's and goes first, with its links.
+     * Publication, acquisition and release of auxiliary links cannot
+     * overlap this sweep. In particular, a hold whose path registers
+     * after the root snapshot keeps its links until the sweep finishes.
      *
      * `owned`, when given, is the part of the object store this sweep may
      * remove from; reachability is computed over the whole of it either

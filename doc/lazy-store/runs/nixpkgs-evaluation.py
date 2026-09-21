@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import random
 import statistics
+import stat
 import subprocess
 import time
 
@@ -119,8 +120,64 @@ def metadata():
                attributes=ATTRS, cpu_affinity=CPUS, config=CONFIG,
                started=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                kernel=os.uname().release,
-               versions={k: subprocess.check_output([v, "--version"], text=True).strip() for k, v in BINS.items()})
+               versions={k: subprocess.check_output([v, "--version"], text=True).strip() for k, v in BINS.items()},
+               source_provenance=source_provenance())
     (BASE / "metadata.json").write_text(json.dumps(obj, indent=2) + "\n")
+
+
+def source_provenance():
+    """Check every local node against the pinned raw Git tree, ignoring no flags or filters."""
+    repo = args.git_source.resolve()
+    revision = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    assert revision == REV, (revision, REV)
+    tree = subprocess.check_output(["git", "-C", str(repo), "ls-tree", "-rz", "--full-tree", REV])
+    leaves, directories = {}, {""}
+    for record in tree.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_name = record.split(b"\t", 1)
+        mode, kind, oid = metadata.decode().split()
+        assert kind == "blob" and mode in ("100644", "100755", "120000"), (metadata, raw_name)
+        name = os.fsdecode(raw_name)
+        leaves[name] = (mode, oid)
+        directories.update(str(p) for p in Path(name).parents if str(p) != ".")
+    index = subprocess.check_output(["git", "-C", str(repo), "ls-files", "--stage", "-z"])
+    indexed = {}
+    for record in index.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_name = record.split(b"\t", 1)
+        mode, oid, stage = metadata.decode().split()
+        name = os.fsdecode(raw_name)
+        assert stage == "0" and name not in indexed, (metadata, raw_name)
+        indexed[name] = mode, oid
+    assert indexed == leaves, f"index differs from pinned raw tree in {repo}"
+    for source in (repo, args.path_source.resolve()):
+        observed = {""}
+        for parent, dirs, files in os.walk(source, followlinks=False):
+            if source == repo and Path(parent) == repo:
+                dirs[:] = [name for name in dirs if name != ".git"]
+                files = [name for name in files if name != ".git"]
+            for name in dirs + files:
+                observed.add(str((Path(parent) / name).relative_to(source)))
+        assert observed == directories | leaves.keys(), f"unexpected or missing nodes in {source}"
+        for name in directories:
+            assert stat.S_ISDIR((source / name).lstat().st_mode), (source, name)
+        for name, (mode, oid) in leaves.items():
+            path = source / name
+            actual = path.lstat().st_mode
+            if mode == "120000":
+                assert stat.S_ISLNK(actual), path
+                contents = os.fsencode(os.readlink(path))
+            else:
+                assert stat.S_ISREG(actual) and bool(actual & stat.S_IXUSR) == (mode == "100755"), path
+                contents = path.read_bytes()
+            digest = hashlib.sha1(f"blob {len(contents)}\0".encode() + contents).hexdigest()
+            assert digest == oid, f"raw contents differ from {REV}: {path}"
+    return dict(revision=revision, nodes=len(directories) + len(leaves),
+                raw_git_tree_sha256=hashlib.sha256(tree).hexdigest(),
+                index_matches_tree=True,
+                checked=[str(repo), str(args.path_source.resolve())])
 
 
 def summarize():
@@ -147,6 +204,17 @@ def summarize():
                                     rss_median_mib=statistics.median(r["rss_kib"]/1024 for r in part))
             if all(label in entry for label in BINS):
                 entry["branch_over_base"] = entry["branch"]["wall_median_s"] / entry["base"]["wall_median_s"]
+                by_trial = {label: {r["trial"]: r for r in both if r["label"] == label} for label in BINS}
+                assert by_trial["base"].keys() == by_trial["branch"].keys()
+                pairs = [(by_trial["base"][t], by_trial["branch"][t]) for t in sorted(by_trial["base"])]
+                deltas = [branch["wall_s"] - base["wall_s"] for base, branch in pairs]
+                entry["paired"] = dict(n=len(pairs), branch_faster=sum(delta < 0 for delta in deltas),
+                                       wall_delta_median_s=statistics.median(deltas),
+                                       wall_ratio_median=statistics.median(branch["wall_s"] / base["wall_s"]
+                                                                          for base, branch in pairs),
+                                       cpu_delta_median_s=statistics.median(
+                                           branch["user_s"] + branch["system_s"] - base["user_s"] - base["system_s"]
+                                           for base, branch in pairs))
             summary.append(entry)
     (BASE / "summary.json").write_text(json.dumps(summary, indent=2)+"\n")
     print(json.dumps(summary, indent=2))
@@ -193,11 +261,13 @@ if __name__ == "__main__":
             for label in BINS:
                 run(label, scheme, 32, "seed", 0)
         rng = random.Random(20260921)
+        cases = [(s, n) for s in URIS for n in [8, 32]]
+        case_order = {case: i for i, case in enumerate(cases)}
         for trial in range(args.warm_trials):
-            jobs = [(s, n) for s in URIS for n in [8, 32]]
+            jobs = cases.copy()
             rng.shuffle(jobs)
-            for i, (scheme, count) in enumerate(jobs):
-                labels = list(BINS) if (trial+i)%2 == 0 else list(reversed(BINS))
+            for scheme, count in jobs:
+                labels = list(BINS) if (trial+case_order[scheme, count])%2 == 0 else list(reversed(BINS))
                 for label in labels:
                     run(label, scheme, count, "warm", trial)
         summarize()
