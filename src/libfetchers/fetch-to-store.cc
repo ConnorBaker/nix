@@ -15,10 +15,10 @@ namespace nix {
 
 struct SrcToStore
 {
-    boost::concurrent_flat_map<
-        std::tuple<SourcePath, ContentAddressMethod::Raw, std::string>,
-        std::tuple<StorePath, Hash, FetchMode>>
-        cache;
+    /* Source identity determines content, not its name or destination. The
+       accessor's unique number has the same equality as SourcePath without
+       keeping the source (and its store connection) alive. */
+    boost::concurrent_flat_map<std::tuple<size_t, CanonPath, ContentAddressMethod::Raw>, Hash> cache;
 };
 
 ref<SrcToStore> fetchers::Settings::createSrcToStore()
@@ -341,17 +341,31 @@ std::pair<StorePath, Hash> fetchToStore2(
     RepairFlag repair)
 {
     auto method = methodRequested.value_or(ContentAddressMethod::Raw::Git);
-    auto srcToStoreKey = std::make_tuple(srcPath, method.raw, std::string(name));
+    auto srcToStoreKey = std::make_tuple(srcPath.accessor->number, srcPath.path, method.raw);
 
     /* The in-memory cache is keyed by the path alone, so it applies only to
        unfiltered requests. */
     bool filtered = filter != nullptr;
 
-    if (!filtered && !repair) {
-        auto dstPathCached = getConcurrent(settings.srcToStore->cache, srcToStoreKey);
-        if (dstPathCached && (mode == FetchMode::DryRun || std::get<2>(*dstPathCached) == FetchMode::Copy))
-            return std::make_pair(std::get<0>(*dstPathCached), std::get<1>(*dstPathCached));
-    }
+    auto useHash = [&](const Hash & hash) -> std::optional<std::pair<StorePath, Hash>> {
+        auto storePath =
+            store.makeFixedOutputPathFromCA(name, ContentAddressWithReferences::fromParts(method, hash, {}));
+        if (mode != FetchMode::DryRun) {
+            /* Root before checking validity: a cached name does not establish
+               existence in this store, nor protect it against collection. */
+            store.addTempRoot(storePath);
+            if (!store.isValidPath(storePath))
+                return std::nullopt;
+        }
+        if (!filtered)
+            settings.srcToStore->cache.insert_or_assign(srcToStoreKey, hash);
+        return std::make_pair(storePath, hash);
+    };
+
+    if (!filtered && !repair)
+        if (auto hash = getConcurrent(settings.srcToStore->cache, srcToStoreKey))
+            if (auto result = useHash(*hash))
+                return *result;
 
     SourcePath path = srcPath;
 
@@ -367,17 +381,9 @@ std::pair<StorePath, Hash> fetchToStore2(
     std::optional<fetchers::Cache::Key> cacheKey;
 
     if (!filter && !repair && method == ContentAddressMethod::Raw::Git)
-        if (auto entry = path.accessor->getKnownEntry(path.path)) {
-            auto hash = merkle::objectHash(*entry);
-            auto storePath = gitTreePath(store, name, hash);
-            if (mode != FetchMode::DryRun)
-                store.addTempRoot(storePath);
-            if (mode == FetchMode::DryRun || store.isValidPath(storePath)) {
-                if (!filtered)
-                    settings.srcToStore->cache.insert_or_assign(srcToStoreKey, std::make_tuple(storePath, hash, mode));
-                return {storePath, hash};
-            }
-        }
+        if (auto entry = path.accessor->getKnownEntry(path.path))
+            if (auto result = useHash(merkle::objectHash(*entry)))
+                return *result;
 
     auto [subpath, fingerprint] = filter ? std::pair<CanonPath, std::optional<std::string>>{path.path, std::nullopt}
                                          : path.accessor->getFingerprint(path.path);
@@ -391,24 +397,13 @@ std::pair<StorePath, Hash> fetchToStore2(
                 auto hash = method == ContentAddressMethod::Raw::Git
                                 ? merkle::objectHash(rowEntry(*res))
                                 : Hash::parseSRI(fetchers::getStrAttr(*res, "hash"));
-                auto storePath =
-                    store.makeFixedOutputPathFromCA(name, ContentAddressWithReferences::fromParts(method, hash, {}));
-
-                /* Add a temproot before the call to isValidPath to prevent accidental GC in case the
-                   input is cached. Note that this must be done before to avoid races. */
-                if (mode != FetchMode::DryRun)
-                    store.addTempRoot(storePath);
-
-                if (mode == FetchMode::DryRun || store.isValidPath(storePath)) {
+                if (auto result = useHash(hash)) {
                     debug(
                         "source path '%s' cache hit in '%s' (hash '%s')",
                         path,
-                        store.printStorePath(storePath),
+                        store.printStorePath(result->first),
                         hash.to_string(HashFormat::SRI, true));
-                    if (!filtered)
-                        settings.srcToStore->cache.insert_or_assign(
-                            srcToStoreKey, std::make_tuple(storePath, hash, mode));
-                    return {storePath, hash};
+                    return *result;
                 }
                 debug("source path '%s' not in store", path);
             }
@@ -509,7 +504,7 @@ std::pair<StorePath, Hash> fetchToStore2(
     }
 
     if (!filtered)
-        settings.srcToStore->cache.insert_or_assign(srcToStoreKey, std::make_tuple(storePath, hash, mode));
+        settings.srcToStore->cache.insert_or_assign(srcToStoreKey, hash);
 
     return {storePath, hash};
 }

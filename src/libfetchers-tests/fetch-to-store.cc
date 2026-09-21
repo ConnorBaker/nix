@@ -410,6 +410,57 @@ protected:
     }
 };
 
+TEST_F(FetchToStoreLocalTest, namingCacheDoesNotOwnItsSource)
+{
+    fetchers::Settings fetchSettings;
+    std::weak_ptr<SourceAccessor> weak;
+    {
+        auto source = namedTree("cache-source-lifetime");
+        weak = source.get_ptr();
+        fetchToStore2(fetchSettings, *store, SourcePath(source), FetchMode::DryRun, "source");
+    }
+    EXPECT_TRUE(weak.expired());
+}
+
+TEST_F(FetchToStoreLocalTest, cachedNamesAreInterpretedInTheDestinationStore)
+{
+    fetchers::Settings fetchSettings;
+    size_t serial = 0;
+    for (bool sameDirectory : {false, true}) {
+        auto destinationConfig = std::make_shared<LocalStoreConfig>(
+            tempStoreDir.path() / (sameDirectory ? "same-dir" : "other-dir"),
+            StoreConfig::Params{{"store", store->storeDir + (sameDirectory ? "" : "-other")}});
+        auto destination = std::make_shared<LocalStore>(ref{destinationConfig});
+        for (auto method :
+             {ContentAddressMethod::Raw::Flat,
+              ContentAddressMethod::Raw::NixArchive,
+              ContentAddressMethod::Raw::Git,
+              ContentAddressMethod::Raw::Text})
+            for (auto first : {FetchMode::DryRun, FetchMode::Copy})
+                for (auto second : {FetchMode::DryRun, FetchMode::Copy})
+                    for (bool sameName : {false, true}) {
+                        SCOPED_TRACE(
+                            fmt("directory=%d method=%d first=%d second=%d name=%d",
+                                sameDirectory,
+                                static_cast<int>(method),
+                                static_cast<int>(first),
+                                static_cast<int>(second),
+                                sameName));
+                        auto source = make_ref<MemorySourceAccessor>();
+                        source->root = MemorySourceAccessor::File::Regular{.contents = fmt("case-%d", serial++)};
+                        source->fingerprint = fmt("destination-case-%d", serial);
+                        SourcePath path{source};
+                        auto before = fetchToStore2(fetchSettings, *store, path, first, "first", method);
+                        auto name = sameName ? "first" : "second";
+                        auto expected = destination->computeStorePath(name, path, method, HashAlgorithm::SHA256);
+                        auto after = fetchToStore2(fetchSettings, *destination, path, second, name, method);
+                        EXPECT_EQ(after, expected);
+                        EXPECT_EQ(after.second, before.second);
+                        EXPECT_EQ(destination->isValidPath(after.first), second == FetchMode::Copy);
+                    }
+    }
+}
+
 #ifndef _WIN32
 TEST_F(FetchToStoreLocalTest, pathInputsPreserveTheTreeForEveryStoreStateAndWidth)
 {
