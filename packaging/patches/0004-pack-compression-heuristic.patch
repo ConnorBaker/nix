@@ -1,0 +1,156 @@
+--- a/src/libgit2/pack-objects.c
++++ b/src/libgit2/pack-objects.c
+@@ -151,6 +151,8 @@
+ 
+ 	if (git_hash_ctx_init(&pb->ctx, hash_algorithm) < 0 ||
+ 		git_zstream_init(&pb->zstream, GIT_ZSTREAM_DEFLATE) < 0 ||
++		git_zstream_init(&pb->zprobe, GIT_ZSTREAM_DEFLATE) < 0 ||
++		git_zstream_set_level(&pb->zprobe, Z_BEST_SPEED) < 0 ||
+ 		git_repository_odb(&pb->odb, repo) < 0 ||
+ 		packbuilder_config(pb) < 0)
+ 		goto on_error;
+@@ -374,7 +376,15 @@
+ 
+ 		git_zstream_reset(&pb->zstream);
+ 
+-		if ((error = git_zstream_set_input(&pb->zstream, data, data_len)) < 0)
++		/*
++		 * Store what would not shrink, deflate what would (see
++		 * git_zstream_worth_deflating): zlib at any level above 0 does
++		 * the full work on incompressible data and then stores it anyway.
++		 */
++		if ((error = git_zstream_set_level(&pb->zstream,
++				git_zstream_worth_deflating(&pb->zprobe, data, data_len) ?
++				Z_DEFAULT_COMPRESSION : Z_NO_COMPRESSION)) < 0 ||
++		    (error = git_zstream_set_input(&pb->zstream, data, data_len)) < 0)
+ 			goto done;
+ 
+ 		while (!git_zstream_done(&pb->zstream)) {
+@@ -1856,6 +1866,7 @@
+ 
+ 	git_hash_ctx_cleanup(&pb->ctx);
+ 	git_zstream_free(&pb->zstream);
++	git_zstream_free(&pb->zprobe);
+ 
+ 	git__free(pb->pack_name);
+ 
+--- a/src/libgit2/pack-objects.h
++++ b/src/libgit2/pack-objects.h
+@@ -64,6 +64,7 @@
+ 
+ 	git_hash_ctx ctx;
+ 	git_zstream zstream;
++	git_zstream zprobe; /* fastest level; decides per object whether zstream compresses or stores */
+ 
+ 	uint32_t nr_objects,
+ 		nr_deltified,
+--- a/src/util/zstream.c
++++ b/src/util/zstream.c
+@@ -35,6 +35,7 @@
+ int git_zstream_init(git_zstream *zstream, git_zstream_t type)
+ {
+ 	zstream->type = type;
++	zstream->level = Z_DEFAULT_COMPRESSION;
+ 
+ 	if (zstream->type == GIT_ZSTREAM_INFLATE)
+ 		zstream->zerr = GIT_ZLIB_SYMBOL(inflateInit)(&zstream->z);
+@@ -49,6 +50,56 @@
+ 		GIT_ZLIB_SYMBOL(inflateEnd)(&zstream->z);
+ 	else
+ 		GIT_ZLIB_SYMBOL(deflateEnd)(&zstream->z);
++}
++
++int git_zstream_set_level(git_zstream *zstream, int level)
++{
++	if (zstream->type != GIT_ZSTREAM_DEFLATE || zstream->level == level)
++		return 0;
++
++	zstream->zerr = GIT_ZLIB_SYMBOL(deflateParams)(&zstream->z, level, Z_DEFAULT_STRATEGY);
++	if (zstream_seterr(zstream) < 0)
++		return -1;
++
++	zstream->level = level;
++	return 0;
++}
++
++bool git_zstream_worth_deflating(git_zstream *probe, const void *in, size_t in_len)
++{
++	unsigned char sample[GIT_ZSTREAM_PROBE_LEN];
++	unsigned char out[GIT_ZSTREAM_PROBE_LEN];
++	size_t i, stride, out_len = sizeof(out);
++
++	if (in_len <= GIT_ZSTREAM_PROBE_LEN)
++		return true;
++
++	/*
++	 * Slice i begins at i * stride: the first slice at the start of the
++	 * input, the last ending at its end, the rest evenly between.  A
++	 * sample from the start alone would misjudge data that opens with a
++	 * compressible header and continues with what is not.
++	 */
++	stride = (in_len - GIT_ZSTREAM_PROBE_SLICE_LEN) / (GIT_ZSTREAM_PROBE_SLICES - 1);
++	for (i = 0; i < GIT_ZSTREAM_PROBE_SLICES; i++)
++		memcpy(sample + i * GIT_ZSTREAM_PROBE_SLICE_LEN,
++		       (const unsigned char *)in + i * stride,
++		       GIT_ZSTREAM_PROBE_SLICE_LEN);
++
++	/*
++	 * One deflate call over the whole sample, with an output buffer of the
++	 * sample's own size: output that does not fit ends the call short of
++	 * the stream's end (Z_OK or Z_BUF_ERROR, neither fatal) and reads as
++	 * "did not shrink".  A zlib error answers yes, so that the write goes
++	 * on as it always has and reports the error there if it persists.
++	 */
++	git_zstream_reset(probe);
++	if (git_zstream_set_input(probe, sample, sizeof(sample)) < 0 ||
++	    git_zstream_get_output_chunk(out, &out_len, probe) < 0)
++		return true;
++
++	return git_zstream_eos(probe) &&
++	       out_len * 100 <= sizeof(sample) * (100 - GIT_ZSTREAM_PROBE_MIN_GAIN);
+ }
+ 
+ void git_zstream_reset(git_zstream *zstream)
+--- a/src/util/zstream.h
++++ b/src/util/zstream.h
+@@ -33,6 +33,7 @@
+ 	size_t in_len;
+ 	int flush;
+ 	int zerr;
++	int level; /* deflate: the level in force, Z_DEFAULT_COMPRESSION at init */
+ } git_zstream;
+ 
+ #define GIT_ZSTREAM_INIT {{0}}
+@@ -55,6 +56,32 @@
+ bool git_zstream_eos(git_zstream *zstream);
+ 
+ void git_zstream_reset(git_zstream *zstream);
++
++/*
++ * Set the deflate level (Z_NO_COMPRESSION .. Z_BEST_COMPRESSION, or
++ * Z_DEFAULT_COMPRESSION).  Call it between an init or reset and the first
++ * input; a no-op when the stream already has that level.
++ */
++int git_zstream_set_level(git_zstream *zstream, int level);
++
++/*
++ * Whether deflating `in` is worth the work.  deflate has no early exit: at
++ * any level above 0 it runs its match finder over every byte and only then
++ * emits a stored block for what did not shrink, so incompressible input
++ * costs the full effort and saves nothing.  This samples GIT_ZSTREAM_PROBE_LEN
++ * bytes of `in` in GIT_ZSTREAM_PROBE_SLICES equal slices spread from its
++ * start to its end, deflates them at the fastest level through `probe` (a
++ * deflate stream the caller keeps for the purpose), and answers yes when the
++ * sample shrinks by at least GIT_ZSTREAM_PROBE_MIN_GAIN percent.  Input no
++ * longer than the sample is always worth it: the probe would cost as much as
++ * the deflation it decides, and deflate's stored-block fallback bounds the
++ * loss to a few bytes.
++ */
++#define GIT_ZSTREAM_PROBE_SLICES 8
++#define GIT_ZSTREAM_PROBE_SLICE_LEN 512
++#define GIT_ZSTREAM_PROBE_LEN (GIT_ZSTREAM_PROBE_SLICES * GIT_ZSTREAM_PROBE_SLICE_LEN)
++#define GIT_ZSTREAM_PROBE_MIN_GAIN 5
++bool git_zstream_worth_deflating(git_zstream *probe, const void *in, size_t in_len);
+ 
+ int git_zstream_deflatebuf(git_str *out, const void *in, size_t in_len);
+ int git_zstream_inflatebuf(git_str *out, const void *in, size_t in_len);
