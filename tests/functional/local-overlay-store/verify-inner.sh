@@ -59,7 +59,7 @@ remountOverlayfs
 # Verify overlay store without attempting to repair it
 verifyOutput=$(expectStderr 1 nix-store --store "$storeB" --verify --check-contents)
 <<<"$verifyOutput" grepQuiet "path '$inputDrvPath' disappeared, but it still has valid referrers!"
-<<<"$verifyOutput" grepQuiet "path '$dummyPath' was modified! expected hash"
+<<<"$verifyOutput" grepQuiet "path '$dummyPath' was modified! expected object hash"
 <<<"$verifyOutput" expectStderr 1 grepQuiet "$lowerOnlyPath"  # Expect no error for corrupted lower-only path
 
 # Attempt to repair using backup
@@ -67,3 +67,16 @@ addConfig "substituters = $backupStore"
 repairOutput=$(nix-store --store "$storeB" --verify --check-contents --repair 2>&1)
 <<<"$repairOutput" grepQuiet "copying path '$inputDrvPath'"
 <<<"$repairOutput" grepQuiet "copying path '$dummyPath'"
+
+remountOverlayfs
+nix-store --store "$storeB" --verify --check-contents
+cmp "$backupStore/$inputDrvPath" "$(toRealPath "$storeBRoot/nix/store" "$inputDrvPath")"
+cmp ../dummy "$(toRealPath "$storeBRoot/nix/store" "$dummyPath")"
+test -f "$storeBTop/${inputDrvPath##*/}"
+test -f "$storeBTop/${dummyPath##*/}"
+expect 1 test -e "$inputDrvFullPath"
+test -f "$storeA/$dummyPath"
+expect 1 test -s "$storeA/$dummyPath"
+test -f "$storeA/$lowerOnlyPath"
+expect 1 test -s "$storeA/$lowerOnlyPath"
+expect 1 test -e "$storeBTop/${lowerOnlyPath##*/}"
