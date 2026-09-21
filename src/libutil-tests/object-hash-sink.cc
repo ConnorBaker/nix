@@ -13,6 +13,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/merkle-hash.hh"
@@ -80,6 +84,238 @@ ref<MemorySourceAccessor> complexTree()
 TEST(ObjectHashSink, complex_tree_matches_reference_and_nar_length)
 {
     checkBothRoutes(complexTree());
+}
+
+TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
+{
+    /* Three children: each succeeds, fails while reading, or fails while
+       folding. Enumerate every assignment and every advisory scheduling
+       mask, including unknown directory types (the all-inline mask). */
+    size_t cases = 0;
+    for (size_t workers = 1; workers <= 8; ++workers) {
+        CopyPool pool(workers);
+        for (unsigned mask = 0; mask < 8; ++mask)
+            for (unsigned outcomes = 0; outcomes < 27; ++outcomes) {
+                SCOPED_TRACE(fmt("workers=%d mask=%d outcomes=%d", workers, mask, outcomes));
+                std::array<unsigned, 3> outcome;
+                auto rest = outcomes;
+                for (auto & value : outcome) {
+                    value = rest % 3;
+                    rest /= 3;
+                }
+                std::atomic<unsigned> active{0}, started{0}, completed{0};
+                std::vector<size_t> consumed;
+                std::string failure;
+                try {
+                    pool.ordered(
+                        3,
+                        [&](size_t i) { return mask & (1u << i); },
+                        [&](size_t i, bool) {
+                            ++active;
+                            ++started;
+                            Finally done{[&] {
+                                --active;
+                                ++completed;
+                            }};
+                            if (outcome[i] == 1)
+                                throw std::runtime_error(fmt("read-%d", i));
+                        },
+                        [&](size_t i) {
+                            if (outcome[i] == 2)
+                                throw std::runtime_error(fmt("fold-%d", i));
+                            consumed.push_back(i);
+                        });
+                } catch (const std::runtime_error & e) {
+                    failure = e.what();
+                }
+                std::vector<size_t> expected;
+                std::string expectedFailure;
+                for (size_t i = 0; i < outcome.size(); ++i) {
+                    if (outcome[i]) {
+                        expectedFailure = fmt("%s-%d", outcome[i] == 1 ? "read" : "fold", i);
+                        break;
+                    }
+                    expected.push_back(i);
+                }
+                EXPECT_EQ(failure, expectedFailure);
+                EXPECT_EQ(consumed, expected);
+                EXPECT_EQ(active.load(), 0u);
+                EXPECT_EQ(started.load(), completed.load());
+                ++cases;
+            }
+    }
+    EXPECT_EQ(cases, 1728u);
+}
+
+TEST(CopyPool, nestedScopesJoinBeforeReturning)
+{
+    for (size_t workers = 1; workers <= 8; ++workers) {
+        CopyPool pool(workers);
+        for (unsigned depth = 0; depth <= 3; ++depth) {
+            SCOPED_TRACE(fmt("workers=%d depth=%d", workers, depth));
+            auto count = [&](this const auto & recurse, unsigned remaining) -> size_t {
+                if (!remaining)
+                    return 1;
+                std::array<size_t, 3> children{};
+                size_t result = 1;
+                pool.ordered(
+                    3,
+                    [](size_t) { return true; },
+                    [&](size_t i, bool) { children[i] = recurse(remaining - 1); },
+                    [&](size_t i) { result += children[i]; });
+                return result;
+            };
+            EXPECT_EQ(count(depth), (std::array<size_t, 4>{1, 4, 13, 40}[depth]));
+        }
+    }
+}
+
+TEST(ObjectHashSink, permittedPullFoldMatchesSerialAndNarAcrossTheFiniteMetadataDomain)
+{
+    struct Source final : MemorySourceAccessor
+    {
+        bool typed = true, sized = true;
+
+        bool allowsConcurrentTraversal() override
+        {
+            return true;
+        }
+
+        DirEntries readDirectory(const CanonPath & path) override
+        {
+            auto entries = MemorySourceAccessor::readDirectory(path);
+            if (!typed)
+                for (auto & [name, type] : entries)
+                    type.reset();
+            return entries;
+        }
+
+        std::optional<Stat> maybeLstat(const CanonPath & path) override
+        {
+            auto st = MemorySourceAccessor::maybeLstat(path);
+            if (st && !sized)
+                st->fileSize.reset();
+            return st;
+        }
+    };
+
+    Finally restoreWorkers{
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
+    size_t cases = 0;
+    for (size_t workers = 1; workers <= 8; ++workers)
+        for (bool typed : {false, true})
+            for (bool sized : {false, true})
+                for (bool hacked : {false, true}) {
+                    WithCaseHack hack{hacked};
+                    auto source = make_ref<Source>();
+                    source->typed = typed;
+                    source->sized = sized;
+                    source->addFile(CanonPath("a/x"), "plain");
+                    source->addFile(CanonPath("b/y"), "second");
+                    source->addFile(CanonPath("Foo"), "upper");
+                    source->addFile(
+                        CanonPath::root / (hacked ? "foo" + std::string(caseHackSuffix) + "1" : "foo"), "lower");
+                    MemorySink sink{*source};
+                    sink.createDirectory(CanonPath("empty"));
+                    sink.createRegularFile(CanonPath("exec"), [](CreateRegularFileSink & file) {
+                        file.isExecutable();
+                        file("executable");
+                    });
+                    sink.createSymlink(CanonPath("link"), "a/x");
+                    for (auto root : {CanonPath::root, CanonPath("a/x"), CanonPath("exec"), CanonPath("link")}) {
+                        SCOPED_TRACE(
+                            fmt("workers=%d typed=%d sized=%d hack=%d root=%s", workers, typed, sized, hacked, root));
+                        auto nar = narOf(*source, root);
+                        StringSource input{nar};
+                        auto pushed = objectHashOfNar(input);
+                        HashingVisitor serial;
+                        auto reference = objectHashOf(*source, root, defaultPathFilter, serial);
+                        HashingVisitor::workersForTest.store(workers);
+                        PathFilter copied = defaultPathFilter;
+                        auto actual = objectHashOf(*source, root, copied);
+                        EXPECT_EQ(actual.root, reference.root);
+                        EXPECT_EQ(actual.root, pushed.root);
+                        EXPECT_TRUE(actual.narSizeExact);
+                        EXPECT_EQ(actual.narSize, nar.size());
+                        ++cases;
+                    }
+                }
+    EXPECT_EQ(cases, 256u);
+}
+
+TEST(ObjectHashSink, permittedPullUsesWorkersButAnExplicitVisitorKeepsItsCallerThread)
+{
+    struct Source final : MemorySourceAccessor
+    {
+        bool gate = false;
+        std::mutex mutex;
+        std::condition_variable wake;
+        bool first = false, second = false;
+        std::thread::id caller;
+        bool workerObserved = false;
+
+        bool allowsConcurrentTraversal() override
+        {
+            return true;
+        }
+
+        void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            if (gate) {
+                std::unique_lock lock(mutex);
+                if (path == CanonPath("a/x")) {
+                    workerObserved = std::this_thread::get_id() != caller;
+                    first = true;
+                    wake.notify_all();
+                    if (!wake.wait_for(lock, std::chrono::seconds(5), [&] { return second; }))
+                        throw Error("parallel first child was not joined by its sibling");
+                } else {
+                    second = true;
+                    wake.notify_all();
+                    if (!wake.wait_for(lock, std::chrono::seconds(5), [&] { return first; }))
+                        throw Error("parallel first child did not start");
+                }
+            }
+            MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
+        }
+    };
+
+    struct EffectfulVisitor : HashingVisitor
+    {
+        std::mutex mutex;
+        std::thread::id caller = std::this_thread::get_id();
+        bool wrongThread = false;
+        std::vector<CanonPath> calls;
+
+        HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+        {
+            {
+                std::lock_guard lock(mutex);
+                wrongThread |= std::this_thread::get_id() != caller;
+                calls.push_back(path);
+            }
+            return HashingVisitor::regular(path, std::move(read));
+        }
+    };
+
+    Finally restoreWorkers{
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
+    for (size_t workers = 1; workers <= 8; ++workers) {
+        SCOPED_TRACE(workers);
+        HashingVisitor::workersForTest.store(workers);
+        auto source = make_ref<Source>();
+        source->addFile(CanonPath("a/x"), "first");
+        source->addFile(CanonPath("b"), "second");
+        source->caller = std::this_thread::get_id();
+        EffectfulVisitor visitor;
+        auto reference = objectHashOf(*source, CanonPath::root, defaultPathFilter, visitor);
+        EXPECT_FALSE(visitor.wrongThread);
+        EXPECT_EQ(visitor.calls, (std::vector<CanonPath>{CanonPath("a/x"), CanonPath("b")}));
+        source->gate = workers > 1;
+        auto actual = objectHashOf(*source, CanonPath::root);
+        EXPECT_EQ(actual.root, reference.root);
+        EXPECT_EQ(source->workerObserved, workers > 1);
+    }
 }
 
 /* (3) The case hack (01 section 9.11, "The names the hash is over").  The
@@ -485,14 +721,14 @@ TEST(ObjectHashSink, known_answers_without_reading)
         std::vector<CanonPath> asked;
         std::vector<CanonPath> finished;
 
-        std::optional<HashedNode> known(const CanonPath & p, const SourceAccessor::Stat & st) override
+        HashedNode node(const CanonPath & p, const SourceAccessor::Stat & st, fun<HashedNode()> descend) override
         {
             if (st.type != SourceAccessor::tDirectory)
-                return std::nullopt;
+                return descend();
             asked.push_back(p);
             if (auto id = answer(p))
                 return HashedNode{.entry = {.mode = merkle::Mode::Directory, .hash = *id}};
-            return std::nullopt;
+            return descend();
         }
 
         HashedNode directory(const CanonPath & p, Children children) override
@@ -561,10 +797,10 @@ TEST(ObjectHashSink, known_answers_without_reading)
         {
         }
 
-        std::optional<HashedNode> known(const CanonPath & p, const SourceAccessor::Stat & st) override
+        HashedNode node(const CanonPath & p, const SourceAccessor::Stat & st, fun<HashedNode()> descend) override
         {
             if (st.type != SourceAccessor::tRegular)
-                return std::nullopt;
+                return descend();
             EXPECT_TRUE(st.fileSize.has_value());
             return HashedNode{
                 .entry = referenceObjectEntry(plain, p),

@@ -15,14 +15,11 @@
 #include "nix/util/logging.hh"
 #include "nix/util/strings.hh"
 #include "nix/util/util.hh"
+#include "nix/util/thread-pool.hh"
 
 #include <algorithm>
 #include <map>
 #include <mutex>
-#include <future>
-#include <deque>
-#include <condition_variable>
-#include <thread>
 #include <set>
 #include <fcntl.h>
 #include <regex>
@@ -247,7 +244,14 @@ struct EnterVisitor : ObjectStoreVisitor
     {
     }
 
-    std::optional<HashedNode> known(const CanonPath & path, const SourceAccessor::Stat & st) override
+    HashedNode node(const CanonPath & path, const SourceAccessor::Stat & st, fun<HashedNode()> descend) override
+    {
+        if (auto result = tryKnown(path, st))
+            return std::move(*result);
+        return descend();
+    }
+
+    std::optional<HashedNode> tryKnown(const CanonPath & path, const SourceAccessor::Stat & st)
     {
         if (!inodes || repair || st.type != SourceAccessor::tRegular)
             return std::nullopt;
@@ -640,113 +644,12 @@ struct LinkingVisitor : ObjectStoreVisitor
 };
 
 #ifndef _WIN32
-/* A bounded pool for nested directory scopes. A full queue makes the
-   caller visit inline. While joining, a caller helps only its own child
-   jobs: nested helping follows the tree's depth, never an unbounded chain
-   of siblings, and waiting parents cannot exhaust all execution slots.
-   The caller counts as one additional worker. */
-class CopyPool
-{
-    std::mutex mutex;
-    std::condition_variable wake;
-
-    struct Job
-    {
-        const void * group;
-        std::packaged_task<void()> run;
-    };
-
-    std::deque<Job> pending;
-    std::vector<std::thread> threads;
-    size_t capacity;
-    bool stopping = false;
-
-    void work()
-    {
-        ReceiveInterrupts receiveInterrupts;
-        while (true) {
-            std::packaged_task<void()> job;
-            {
-                std::unique_lock lock(mutex);
-                wake.wait(lock, [&] { return stopping || !pending.empty(); });
-                if (pending.empty())
-                    return;
-                job = std::move(pending.front().run);
-                pending.pop_front();
-            }
-            job(); // The future carries the exception back to its directory.
-        }
-    }
-
-public:
-    explicit CopyPool(size_t workers)
-        : capacity(workers - 1)
-    {
-        threads.reserve(capacity);
-    }
-
-    ~CopyPool()
-    {
-        {
-            std::lock_guard lock(mutex);
-            stopping = true;
-        }
-        wake.notify_all();
-        for (auto & thread : threads)
-            thread.join();
-    }
-
-    std::future<void> tryAsync(const void * group, std::function<void()> run)
-    {
-        std::lock_guard lock(mutex);
-        if (pending.size() == capacity)
-            return {};
-        std::packaged_task<void()> job(std::move(run));
-        auto result = job.get_future();
-        if (threads.size() < capacity)
-            threads.emplace_back([this] { work(); });
-        pending.push_back({group, std::move(job)});
-        wake.notify_one();
-        return result;
-    }
-
-    void wait(std::future<void> & result, const void * group)
-    {
-        while (result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-            std::packaged_task<void()> job;
-            {
-                std::lock_guard lock(mutex);
-                auto i = std::find_if(pending.begin(), pending.end(), [&](auto & job) { return job.group == group; });
-                if (i != pending.end()) {
-                    job = std::move(i->run);
-                    pending.erase(i);
-                }
-            }
-            if (!job.valid()) {
-                result.wait();
-                return;
-            }
-            job();
-        }
-    }
-};
-
-/* The second route's visitor (01 §9.10, "One route"; `08` §1.6): the
-   pull driver over the source accessor with the one route's
-   `LinkingVisitor` beneath, and `known` answering a directory, or the
-   root, from the store's own objects -- when the naming names it
-   (`namer`) and the store holds it, the subtree is made from `trees/` and
-   `blobs/` by `mkdirat`, `linkat` and `symlinkat`, and nothing beneath it
-   is read from the source; else the driver descends as it would, and
-   what it reaches is linked or written as the one route links or writes
-   it.  Per unchanged regular file: one `fstatat` of the blob's file and
-   one `linkat`, no read, no hash.  `known` is asked for directories and
-   the root alone: a file inside a directory the store lacks is read, so
-   that a fresh tree costs one memo lookup per directory and not one per
-   file.  Names: the driver hands the accessor's, the tree's own is what
-   `directory` receives per child, and its on-disk form is the case hack's
-   (`CaseHackNames`, the NAR restorer's rule), kept on `diskNames` around
-   each child's visit for `at` to read. */
+/* The accessor copy (01 §9.10; 08 §1.6). A node either makes a
+   verified immutable file or named subtree from existing objects, or
+   descends through LinkingVisitor. The namer is consulted for the root
+   and directories only; raw unnamed files are read and hashed. Directory
+   entries carry tree names, while diskNames retains the case-hacked name
+   around each child for destination placement. */
 struct MaterialisingVisitor : LinkingVisitor
 {
     const SourcePath & source;
@@ -754,11 +657,8 @@ struct MaterialisingVisitor : LinkingVisitor
     RestoreSinkHooks * hooks;
     std::function<void(const std::filesystem::path &, const GitObjectStore::Hold &)> commitAttempt;
 
-    /* The naming's memo, which the namer closes over, is not made for two
-       threads: `MemoVisitor::keyOf` initialises its `Cache` handle lazily
-       and `getFingerprint` goes to the accessor. Calls are serialized;
-       the directory walk and holder writes run outside this lock.
-     */
+    /* A caller-supplied naming callback need not permit simultaneous
+       calls. The directory walk and holder writes run outside this lock. */
     std::mutex namerLock;
 
     size_t workers;
@@ -829,58 +729,52 @@ struct MaterialisingVisitor : LinkingVisitor
             fun<HashedNode()> visit;
             bool subdirectory;
             std::optional<HashedNode> node;
-            std::future<void> running;
         };
 
         std::vector<Child> kids;
         CaseHackNames hack;
         children([&](std::string_view name, bool isDirectory, fun<HashedNode()> visit) {
-            kids.push_back({std::string(name), hack.diskName(name), std::move(visit), isDirectory, std::nullopt, {}});
+            kids.push_back({std::string(name), hack.diskName(name), std::move(visit), isDirectory, std::nullopt});
         });
-        /* Futures from packaged tasks do not join in their destructor.
-           Keep every captured directory alive on both success and failure. */
-        Finally join{[&] {
-            for (auto & child : kids)
-                if (child.running.valid())
-                    pool->wait(child.running, &kids);
-        }};
-
-        auto here = [&](Child & c) {
-            auto & diskNames = frames().diskNames;
-            diskNames.push_back(c.disk);
-            Finally pop{[&] { diskNames.pop_back(); }};
-            c.node = c.visit();
-        };
-
-        /* A singleton has no sibling work to overlap. Its visit can still
-           use the pool below, when it reaches a branching directory. This
-           also avoids constructing a scheduler for regular-file roots. */
-        bool fork = workers > 1 && kids.size() > 1;
-        if (fork && !pool && std::any_of(kids.begin(), kids.end(), [](auto & c) { return c.subdirectory; }))
+        /* A singleton can still find parallel work below it. Construct
+           the shared scheduler only at the first branching directory. */
+        if (!pool && kids.size() > 1 && std::any_of(kids.begin(), kids.end(), [](auto & c) { return c.subdirectory; }))
             pool = std::make_unique<CopyPool>(workers);
         auto * sink = frames().open.back();
-        for (auto & c : kids) {
-            if (fork && c.subdirectory)
-                c.running = pool->tryAsync(&kids, [&c, sink] {
-                    Scope scope{*sink, c.disk};
-                    c.node = c.visit();
-                });
-            if (!c.running.valid())
-                here(c);
-        }
-        for (auto & c : kids)
-            if (c.running.valid()) {
-                pool->wait(c.running, &kids);
-                c.running.get();
+        auto run = [&](size_t i, bool detached) {
+            auto & c = kids[i];
+            if (detached) {
+                Scope scope{*sink, c.disk};
+                c.node = c.visit();
+            } else {
+                auto & diskNames = frames().diskNames;
+                diskNames.push_back(c.disk);
+                Finally pop{[&] { diskNames.pop_back(); }};
+                c.node = c.visit();
             }
-
-        for (auto & c : kids) {
+        };
+        auto consume = [&](size_t i) {
+            auto & c = kids[i];
             assert(c.node);
             each(c.name, c.subdirectory, [&] { return std::move(*c.node); });
-        }
+        };
+        if (pool)
+            pool->ordered(kids.size(), [&](size_t i) { return kids[i].subdirectory; }, run, consume);
+        else
+            for (size_t i = 0; i < kids.size(); ++i) {
+                run(i, false);
+                consume(i);
+            }
     }
 
-    std::optional<HashedNode> known(const CanonPath & path, const SourceAccessor::Stat & st) override
+    HashedNode node(const CanonPath & path, const SourceAccessor::Stat & st, fun<HashedNode()> descend) override
+    {
+        if (auto result = tryKnown(path, st))
+            return std::move(*result);
+        return descend();
+    }
+
+    std::optional<HashedNode> tryKnown(const CanonPath & path, const SourceAccessor::Stat & st)
     {
         /* A verified immutable blob already has an identity before any
            bytes are read. Probe the holder first and stream a miss directly
@@ -1133,7 +1027,8 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
     RestoreSinkHooks * hooks,
     RepairFlag repair,
     TreeNamer namer,
-    const GitObjectStore::Hold & hold)
+    const GitObjectStore::Hold & hold,
+    bool callbacksPermitParallelism)
 {
 #ifdef _WIN32
     throw Error("materialising a path from the object store is not supported on this system");
@@ -1149,10 +1044,11 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
        everywhere else; one thread is the sequential walk exactly. */
     size_t workers = copyWorkersForTest.load(std::memory_order_relaxed);
     if (!workers)
-        workers = std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
-    /* Only the identity filter proves that reordering or concurrent calls
-       have no effects. Its type survives copies of defaultPathFilter. */
-    if (!filter.get_fn().target<AllPaths>())
+        workers = CopyPool::defaultWorkers();
+    /* Callbacks, filter and source must all permit reordered observations.
+       The AllPaths type survives copies of defaultPathFilter. */
+    if (!callbacksPermitParallelism || !filter.get_fn().target<AllPaths>()
+        || !path.accessor->allowsConcurrentTraversal())
         workers = 1;
     auto commitAttempt = [&](const std::filesystem::path & subtree, const GitObjectStore::Hold & attempt) {
         std::vector<BlobCoalescing> collisions;
@@ -1183,7 +1079,7 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
         objects, hold, restore, repair, std::move(namer), hooks, workers, path, std::move(commitAttempt)};
     beginIngestion(hold, dst);
     auto result = objectHashOf(*path.accessor, path.path, filter, visitor);
-    /* Every `known` answer carries the size of what it made, so the NAR
+    /* Every reused node carries the size of what it made, so the NAR
        size is exact, as the one route's is. */
     assert(result.narSizeExact);
     objects.putRootTree(result.root, hold);
@@ -1192,7 +1088,12 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
 }
 
 StorePath LocalStore::materialise(
-    std::string_view name, const SourcePath & path, PathFilter & filter, RepairFlag repair, TreeNamer namer)
+    std::string_view name,
+    const SourcePath & path,
+    PathFilter & filter,
+    RepairFlag repair,
+    TreeNamer namer,
+    bool callbacksPermitParallelism)
 {
     if (!materialisesFromObjects())
         throw Error("this store cannot materialise a path from its object store");
@@ -1260,7 +1161,15 @@ StorePath LocalStore::materialise(
         }
         prepare();
         return materialiseThroughObjects(
-            tempPath, path, filter, localSettings.fsyncStorePaths, hooks.get(), repair, std::move(namer), *hold);
+            tempPath,
+            path,
+            filter,
+            localSettings.fsyncStorePaths,
+            hooks.get(),
+            repair,
+            std::move(namer),
+            *hold,
+            callbacksPermitParallelism);
     }();
 
     if (settings.warnLargePathThreshold && result.narSize >= settings.warnLargePathThreshold)

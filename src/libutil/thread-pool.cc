@@ -2,7 +2,152 @@
 #include "nix/util/signals.hh"
 #include "nix/util/util.hh"
 
+#include <algorithm>
+#include <cassert>
+#include <optional>
+
 namespace nix {
+
+CopyPool::CopyPool(size_t workers)
+    : capacity(workers - 1)
+{
+    assert(workers >= 1);
+    threads.reserve(capacity);
+}
+
+CopyPool::~CopyPool()
+{
+    {
+        std::lock_guard lock(mutex);
+        stopping = true;
+    }
+    wake.notify_all();
+    for (auto & thread : threads)
+        thread.join();
+}
+
+size_t CopyPool::defaultWorkers()
+{
+    return std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
+}
+
+void CopyPool::work(std::promise<void> ready)
+{
+    /* Registration allocates. Report failure before accepting any work
+       on this thread, rather than letting it escape the thread entry. */
+    std::optional<ReceiveInterrupts> receiveInterrupts;
+    try {
+        receiveInterrupts.emplace();
+    } catch (...) {
+        ready.set_exception(std::current_exception());
+        return;
+    }
+    ready.set_value();
+    while (true) {
+        std::packaged_task<void()> job;
+        {
+            std::unique_lock lock(mutex);
+            wake.wait(lock, [&] { return stopping || !pending.empty(); });
+            if (pending.empty())
+                return;
+            job = std::move(pending.front().run);
+            pending.pop_front();
+        }
+        job();
+    }
+}
+
+std::future<void> CopyPool::tryAsync(const void * group, std::function<void()> run)
+{
+    std::lock_guard lock(mutex);
+    if (pending.size() == capacity)
+        return {};
+    std::packaged_task<void()> job(std::move(run));
+    auto result = job.get_future();
+    if (threads.size() < capacity) {
+        std::promise<void> ready;
+        auto started = ready.get_future();
+        threads.emplace_back([this, ready = std::move(ready)]() mutable { work(std::move(ready)); });
+        try {
+            started.get();
+        } catch (...) {
+            threads.back().join();
+            threads.pop_back();
+            throw;
+        }
+    }
+    pending.push_back({group, std::move(job)});
+    wake.notify_one();
+    return result;
+}
+
+void CopyPool::wait(std::future<void> & result, const void * group)
+{
+    while (result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        std::packaged_task<void()> job;
+        {
+            std::lock_guard lock(mutex);
+            auto i = std::find_if(pending.begin(), pending.end(), [&](auto & job) { return job.group == group; });
+            if (i != pending.end()) {
+                job = std::move(i->run);
+                pending.erase(i);
+            }
+        }
+        if (!job.valid()) {
+            result.wait();
+            return;
+        }
+        job();
+    }
+}
+
+void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t, bool)> run, fun<void(size_t)> consume)
+{
+    struct Child
+    {
+        std::future<void> running;
+        std::exception_ptr error;
+    };
+
+    std::vector<Child> children(count);
+    std::exception_ptr failure;
+    try {
+        for (size_t i = 0; i < count; ++i) {
+            auto & child = children[i];
+            if (count > 1 && canFork(i))
+                child.running = tryAsync(&children, [&, i] { run(i, true); });
+            if (!child.running.valid())
+                try {
+                    run(i, false);
+                } catch (...) {
+                    child.error = std::current_exception();
+                    /* No later work is needed. Earlier jobs still determine
+                       which error the ordered fold reports. */
+                    count = i + 1;
+                    break;
+                }
+        }
+        for (size_t i = 0; i < count; ++i) {
+            auto & child = children[i];
+            if (child.running.valid()) {
+                wait(child.running, &children);
+                child.running.get();
+            }
+            if (child.error)
+                std::rethrow_exception(child.error);
+            consume(i);
+        }
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    /* Join outside exception unwinding: helped jobs must still observe
+       interrupts, which are suppressed while a destructor is unwinding. */
+    for (auto & child : children)
+        if (child.running.valid())
+            wait(child.running, &children);
+    if (failure)
+        std::rethrow_exception(failure);
+}
 
 void ThreadPoolShutDown::anchor() {}
 

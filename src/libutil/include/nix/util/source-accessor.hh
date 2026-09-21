@@ -59,6 +59,18 @@ public:
 
     virtual ~SourceAccessor() {}
 
+    /** Whether sibling traversal reads and naming observations may run
+     * concurrently and out of order. This permits neither retaining a
+     * scoped accessor nor assuming an immutable filesystem snapshot.
+     * Unknown implementations, including wrappers with arbitrary policy
+     * callbacks, keep the sequential traversal. Permission covers the
+     * accessor's directory scopes as well. Configuration must remain
+     * stable during a traversal. */
+    virtual bool allowsConcurrentTraversal()
+    {
+        return false;
+    }
+
     /**
      * Return the contents of a file as a string.
      *

@@ -41,17 +41,22 @@ public:
     }
 
     /**
-     * Whether `accessor` hides `path`: it has a non-directory node at a
-     * proper ancestor of `path`, so nothing below that node exists in the
-     * union, whatever later children contain.
+     * Whether an earlier layer hides the candidate owner's node at `path`.
+     * A directory in layer j hides later layers' non-directories at every
+     * ancestor above it. Only layers before j can still hide this path.
      */
-    static bool hides(SourceAccessor & accessor, const CanonPath & path)
+    bool hides(size_t before, const CanonPath & path)
     {
         auto p = path;
-        while (!p.isRoot()) {
+        while (before && !p.isRoot()) {
             p.pop();
-            if (auto st = node(accessor, p))
-                return st->type != tDirectory;
+            for (size_t j = 0; j < before; ++j)
+                if (auto st = node(*accessors[j], p)) {
+                    if (st->type != tDirectory)
+                        return true;
+                    before = j;
+                    break;
+                }
         }
         return false;
     }
@@ -64,9 +69,8 @@ public:
     {
         for (size_t i = 0; i < accessors.size(); ++i) {
             if (auto st = node(*accessors[i], path)) {
-                for (size_t j = 0; j < i; ++j)
-                    if (hides(*accessors[j], path))
-                        return std::nullopt;
+                if (hides(i, path))
+                    return std::nullopt;
                 return std::pair{accessors[i], *st};
             }
         }

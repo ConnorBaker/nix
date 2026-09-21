@@ -207,10 +207,21 @@ public:
      * directories, and any file lying directly in it -- the flat layout an
      * earlier, unreleased build of this branch wrote, enumerated so that
      * the sweep and the verifier judge it as they judge a sharded one (01
-     * §9.10, *Where the objects live*).  An absent `kindDir` is empty; an
-     * entry that is neither a shard directory nor a file is passed over.
+     * §9.10, *Where the objects live*). An absent `kindDir` is empty; an
+     * existing one must be a real directory. Shard symlinks are leaves,
+     * never traversed. A directory occupying a flat object identifier is
+     * also a leaf for verification; unrelated directories are passed over.
      */
     static void eachObjectFile(const std::filesystem::path & kindDir, fun<void(const std::filesystem::path &)> f);
+
+    /**
+     * Check the auxiliary regular-byte files against their names. Repair
+     * rechecks each mismatch under the exclusive namespace lock before
+     * removing it, so a concurrent sound replacement is preserved. Returns
+     * whether an unrepaired error remains. Store paths are checked by the
+     * caller, which also determines whether this object store is its own.
+     */
+    bool verify(RepairFlag repair);
 
     /** The identifier of the blob a regular file's bytes are. */
     static Hash blobIdOfFile(const std::filesystem::path & path);
@@ -602,7 +613,9 @@ public:
      * temporary files go.  A live root whose object is missing is counted
      * (`SweepStats::unentered`) and does not stop the removal phase.  A
      * live hold keeps the auxiliary addresses encoded in its link names,
-     * including a replacement inode published by repair. Additional links
+     * including a replacement inode published by repair. The typed names
+     * are claims independently of their inode kind, bytes or metadata;
+     * only the fixed kind and shard directories are traversed. Additional links
      * also keep files from older layouts. A hold whose lock is free is a
      * dead ingestion's and goes first, with its links.
      * Publication, acquisition and release of auxiliary links cannot

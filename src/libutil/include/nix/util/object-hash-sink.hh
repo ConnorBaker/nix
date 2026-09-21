@@ -6,6 +6,7 @@
 #include "nix/util/source-accessor.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/tree-traversal.hh"
+#include "nix/util/thread-pool.hh"
 
 #include <optional>
 #include <string>
@@ -16,7 +17,7 @@ namespace nix {
 /**
  * What the object hasher records for one node of a tree (01 §9.11): its
  * entry (mode and identifier), its length in the NAR when every size
- * beneath it was seen -- a node a visitor's `known` answered without its
+ * beneath it was seen -- a node a visitor's `node` answered without its
  * subtree's sizes has none -- and, for a directory, the tree body its
  * identifier is the hash of, which an object store writes as it is.
  */
@@ -35,13 +36,31 @@ struct HashedNode
  */
 struct HashingVisitor : NodeVisitor<HashedNode>
 {
+private:
+    size_t workers;
+    std::unique_ptr<CopyPool> pool;
+
+public:
+    /* The default, including the push driver and arbitrary subclasses,
+       consumes every child immediately. Only audited pull consumers
+       permit more than one worker. */
+    explicit HashingVisitor(size_t workers = 1)
+        : workers(workers)
+    {
+    }
+
+    /** Zero selects the bounded machine width; tests enumerate 1..8. */
+    static std::atomic<size_t> workersForTest;
+
+    static size_t workerCountFor(SourceAccessor & accessor, PathFilter & filter);
+
     HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override;
 
     HashedNode symlink(const CanonPath & path, const std::string & target) override;
 
     /**
      * @throws Error if a child's identifier is under another algorithm than
-     * `merkle::hashAlgo` (a `known` answer from a wrong table), or two
+     * `merkle::hashAlgo` (a node answer from a wrong table), or two
      * children share a name.
      */
     HashedNode directory(const CanonPath & path, Children children) override;
@@ -50,7 +69,7 @@ struct HashingVisitor : NodeVisitor<HashedNode>
 /**
  * The push driver of a `NodeVisitor<HashedNode>`: the sink protocol
  * (`parseDump`) adapted to the visitor (`08` §1.6).  Children are
- * recorded under the tree's own name (`unhackName`); `known` is never
+ * recorded under the tree's own name (`unhackName`); `node` is never
  * consulted, since a NAR's bytes cannot be skipped.  Without a visitor
  * of its own it hashes with a `HashingVisitor`.
  */
@@ -71,7 +90,7 @@ struct ObjectHashSink : FileSystemObjectSink
         uint64_t narSize;
 
         /**
-         * False when a node was answered by a visitor's `known` without
+         * False when a node was answered by a visitor's `node` without
          * its size (a directory from the fetchers' memo).  No store route
          * does that; the memo reads the root alone.  Read by the tests
          * alone (`libutil-tests/object-hash-sink.cc`), as the invariant's
@@ -169,7 +188,7 @@ ObjectHashSink::Result objectHashOfNar(Source & source);
 
 /**
  * Of a tree behind an accessor: `traverse` with `visitor`, a
- * `HashingVisitor` or a consumer derived from one, whose `known` may
+ * `HashingVisitor` or a consumer derived from one, whose `node` may
  * answer a node without reading it.  `merkle::objectHash(result.root)` is
  * then the git content address of the tree.
  */

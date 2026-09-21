@@ -1577,7 +1577,20 @@ bool LocalStore::isValidPath_(State & state, const StorePath & path)
 
 bool LocalStore::isValidPathUncached(const StorePath & path)
 {
-    return retrySQLite<bool>([&]() { return isValidPath_(*_state->lock(), path); });
+    return retrySQLite<bool>([&]() {
+        auto state(_state->lock());
+        bool valid = isValidPath_(*state, path);
+        if (valid && pathInfoCache) {
+            /* Publish under the same database lock as invalidation, so a
+               completed invalidation cannot be followed by an older hit.
+               Preserve any fresh description already in the cache. */
+            auto cache(pathInfoCache->lock());
+            auto previous = cache->getOrNullptr(path);
+            if (!previous || !previous->didExist() || !previous->isKnownNow(settings.getNarInfoDiskCacheSettings()))
+                cache->upsert(path, PathInfoCacheValue{.value = PathInfoCacheValue::ValidWithoutInfo{}});
+        }
+        return valid;
+    });
 }
 
 StorePathSet LocalStore::queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
@@ -2518,52 +2531,8 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
         if (!ownObjects)
             printInfo("the object store is shared with the lower store: its objects are not checked here");
 
-        std::vector<std::string> blobDirs;
-        if (ownObjects) {
-            printInfo("checking object hashes...");
-            blobDirs = {"blobs", "blobs-x"};
-        }
-
-        /* The object files under each kind, in its shards
-           (`GitObjectStore::eachObjectFile`); the name a file is judged
-           against is the file's own, wherever it lies. */
-        for (auto & sub : blobDirs) {
-            GitObjectStore::eachObjectFile(objects.dir / sub, [&](const std::filesystem::path & object) {
-                checkInterrupt();
-                auto name = object.filename().string();
-                printMsg(lvlTalkative, "checking contents of %s", PathFmt(object));
-                auto id = GitObjectStore::idString(GitObjectStore::blobIdOfFile(object));
-                if (id != name) {
-                    printError("object %s was modified! expected identifier %s, got '%s'", PathFmt(object), name, id);
-                    if (repair) {
-                        if (::unlink(object.c_str()) == 0)
-                            printInfo("removed object %s", PathFmt(object));
-                        else
-                            throw SysError("removing corrupt object %s", PathFmt(object));
-                    } else
-                        errors = true;
-                }
-            });
-        }
-
-        if (ownObjects) {
-            GitObjectStore::eachObjectFile(objects.dir / "trees", [&](const std::filesystem::path & object) {
-                checkInterrupt();
-                auto name = object.filename().string();
-                auto id = GitObjectStore::idString(merkle::treeId(readFile(object)));
-                if (id != name) {
-                    printError(
-                        "tree object %s was modified! expected identifier %s, got '%s'", PathFmt(object), name, id);
-                    if (repair) {
-                        if (::unlink(object.c_str()) == 0)
-                            printInfo("removed tree object %s", PathFmt(object));
-                        else
-                            throw SysError("removing corrupt tree object %s", PathFmt(object));
-                    } else
-                        errors = true;
-                }
-            });
-        }
+        if (ownObjects)
+            errors = objects.verify(repair) || errors;
 
         printInfo("checking store hashes...");
 

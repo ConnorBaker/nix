@@ -60,7 +60,7 @@ void FilteringSourceAccessor::readDirectoryScoped(
                 if (isAllowed(path / entry.first))
                     admitted.insert(entry);
 
-            struct Scoped : FilteringSourceAccessor
+            struct Scoped final : FilteringSourceAccessor
             {
                 void anchor() override {}
 
@@ -102,6 +102,11 @@ void FilteringSourceAccessor::readDirectoryScoped(
                     if (p.parent()->isRoot())
                         return admitted.contains(std::string(*p.baseName()));
                     return owner->isAllowed(original / p);
+                }
+
+                bool allowsConcurrentTraversal() override
+                {
+                    return owner->allowsConcurrentTraversal() && next->allowsConcurrentTraversal();
                 }
 
                 std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & p) override
@@ -146,8 +151,13 @@ void FilteringSourceAccessor::checkAccess(const CanonPath & path)
         throw makeNotAllowedError(path);
 }
 
-struct AllowListSourceAccessorImpl : AllowListSourceAccessor
+struct AllowListSourceAccessorImpl final : AllowListSourceAccessor
 {
+    bool allowsConcurrentTraversal() override
+    {
+        return next->allowsConcurrentTraversal();
+    }
+
     void readDirectoryWithEntries(
         const CanonPath & path,
         std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override

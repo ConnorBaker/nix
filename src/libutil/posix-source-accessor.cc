@@ -186,9 +186,14 @@ static unsigned getGlobalDirFdCacheLimit()
     return std::min<rlim_t>(4096, lim.rlim_cur / 8);
 }
 
-class PosixDirectorySourceAccessor : public PosixSourceAccessorBase
+class PosixDirectorySourceAccessor final : public PosixSourceAccessorBase
 {
 public:
+    bool allowsConcurrentTraversal() override
+    {
+        return true;
+    }
+
     static unsigned getGlobalFdLimit()
     {
         static auto res = getGlobalDirFdCacheLimit();
@@ -391,11 +396,11 @@ PosixDirectorySourceAccessor::OpenedParent PosixDirectorySourceAccessor::openPar
         auto cache = dirFdCache->lock();
         auto p = parent;
         while (true) {
-            if (auto intermediateDirFdHit = cache->get(p)) {
+            if (auto intermediateDirFdHit = cache->getOrNullptr(p)) {
                 if (p == parent)
                     return {
                         .fd = (*intermediateDirFdHit)->get(),
-                        .fdOwning = *intermediateDirFdHit,
+                        .fdOwning = intermediateDirFdHit->get_ptr(),
                         .parent = std::move(parent),
                         .fromCache = true,
                     };
@@ -473,6 +478,10 @@ std::optional<SourceAccessor::Stat> PosixDirectorySourceAccessor::maybeLstat(con
     PosixStat st;
 
     if (path.isRoot()) {
+        /* The live directory descriptor already proves its kind. Only
+           mtime tracking needs any other field of its stat. */
+        if (!trackLastModified)
+            return Stat{.type = tDirectory};
         /* Must never fail - we already have the file descriptor for the directory. */
         st = nix::fstat(dirFd);
     } else {

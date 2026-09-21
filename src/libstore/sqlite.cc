@@ -175,13 +175,14 @@ SQLiteStmt::Use::Use(SQLiteStmt & stmt)
     : stmt(stmt)
 {
     assert(stmt.stmt);
-    /* Note: sqlite3_reset() returns the error code for the most
-       recent call to sqlite3_step().  So ignore it. */
-    sqlite3_reset(stmt);
+    /* A newly prepared statement is ready; every previous Use resets it
+       on destruction, including when binding or stepping throws. */
 }
 
 SQLiteStmt::Use::~Use()
 {
+    /* Release any active reader and leave the statement ready for reuse.
+       reset returns the preceding step's error, which was handled there. */
     sqlite3_reset(stmt);
 }
 

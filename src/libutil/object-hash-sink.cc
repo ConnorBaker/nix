@@ -3,7 +3,21 @@
 #include "nix/util/error.hh"
 #include "nix/util/finally.hh"
 
+#include <algorithm>
+
 namespace nix {
+
+std::atomic<size_t> HashingVisitor::workersForTest{0};
+
+size_t HashingVisitor::workerCountFor(SourceAccessor & accessor, PathFilter & filter)
+{
+    if (!filter.get_fn().target<AllPaths>() || !accessor.allowsConcurrentTraversal())
+        return 1;
+    auto workers = workersForTest.load(std::memory_order_relaxed);
+    if (!workers)
+        workers = CopyPool::defaultWorkers();
+    return workers;
+}
 
 HashedNode HashingVisitor::regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read)
 {
@@ -88,8 +102,7 @@ HashedNode HashingVisitor::directory(const CanonPath & path, Children children)
     merkle::Tree tree;
     merkle::nar::Directory size;
     bool sizeExact = true;
-    children([&](std::string_view name, bool, fun<HashedNode()> visit) {
-        auto child = visit();
+    auto consume = [&](std::string_view name, HashedNode child) {
         if (child.entry.hash.algo != merkle::hashAlgo)
             throw Error(
                 "object hash: '%s' was answered with a %s identifier, but the tree is hashed with %s",
@@ -101,7 +114,35 @@ HashedNode HashingVisitor::directory(const CanonPath & path, Children children)
             size.add(name, *child.narSize);
         else
             sizeExact = false;
-    });
+    };
+    if (workers == 1)
+        children([&](std::string_view name, bool, fun<HashedNode()> visit) { consume(name, visit()); });
+    else {
+        struct Child
+        {
+            std::string name;
+            bool subdirectory;
+            fun<HashedNode()> visit;
+            std::optional<HashedNode> node;
+        };
+
+        std::vector<Child> kids;
+        children([&](std::string_view name, bool subdirectory, fun<HashedNode()> visit) {
+            kids.push_back({std::string(name), subdirectory, std::move(visit), std::nullopt});
+        });
+        if (!pool && kids.size() > 1
+            && std::any_of(kids.begin(), kids.end(), [](auto & child) { return child.subdirectory; }))
+            pool = std::make_unique<CopyPool>(workers);
+        if (pool)
+            pool->ordered(
+                kids.size(),
+                [&](size_t i) { return kids[i].subdirectory; },
+                [&](size_t i, bool) { kids[i].node = kids[i].visit(); },
+                [&](size_t i) { consume(kids[i].name, std::move(*kids[i].node)); });
+        else
+            for (auto & child : kids)
+                consume(child.name, child.visit());
+    }
 
     auto body = merkle::serialiseTree(tree);
     return {
@@ -258,7 +299,7 @@ objectHashOf(SourceAccessor & accessor, const CanonPath & path, PathFilter & fil
 
 ObjectHashSink::Result objectHashOf(SourceAccessor & accessor, const CanonPath & path, PathFilter & filter)
 {
-    HashingVisitor hasher;
+    HashingVisitor hasher{HashingVisitor::workerCountFor(accessor, filter)};
     return objectHashOf(accessor, path, filter, hasher);
 }
 

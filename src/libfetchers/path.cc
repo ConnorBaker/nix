@@ -180,7 +180,8 @@ struct PathInputScheme : InputScheme
                                         SourcePath(accessor),
                                         defaultPathFilter,
                                         NoRepair,
-                                        [](const CanonPath &, const SourceAccessor::Stat &) { return std::nullopt; })
+                                        [](const CanonPath &, const SourceAccessor::Stat &) { return std::nullopt; },
+                                        /*callbacksPermitParallelism=*/true)
                                   : store.addToStore("source", SourcePath(accessor), ContentAddressMethod::Raw::Git);
                 mtime = accessor->getLastModified().value();
                 return copied;

@@ -3,6 +3,7 @@
 
 #include "nix/util/error.hh"
 #include "nix/util/sync.hh"
+#include "nix/util/fun.hh"
 
 #include <boost/compat/move_only_function.hpp>
 
@@ -11,6 +12,8 @@
 #include <thread>
 #include <map>
 #include <atomic>
+#include <deque>
+#include <future>
 
 namespace nix {
 
@@ -82,6 +85,44 @@ private:
     std::condition_variable work;
 
     void doWork(bool mainThread);
+};
+
+/** A bounded pool whose nested directory scopes join their own children.
+ * A full queue leaves work on the caller; a waiting caller may help only
+ * its own group, so waiting parents do not exhaust the pool. */
+class CopyPool
+{
+    std::mutex mutex;
+    std::condition_variable wake;
+
+    struct Job
+    {
+        const void * group;
+        std::packaged_task<void()> run;
+    };
+
+    std::deque<Job> pending;
+    std::vector<std::thread> threads;
+    size_t capacity;
+    bool stopping = false;
+
+    void work(std::promise<void> ready);
+    std::future<void> tryAsync(const void * group, std::function<void()> run);
+    void wait(std::future<void> & result, const void * group);
+
+public:
+    explicit CopyPool(size_t workers);
+    ~CopyPool();
+
+    static size_t defaultWorkers();
+
+    /** Evaluate a finite sequence, then consume its results in order.
+     * `run` receives whether it needs a detached traversal scope. Every
+     * submitted job is joined before return, including on failure. Child
+     * and consume failures are reported in traversal order, independently
+     * of completion order. Callbacks and their captured state must outlive
+     * this call; each child owns its result storage. */
+    void ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t, bool)> run, fun<void(size_t)> consume);
 };
 
 /**

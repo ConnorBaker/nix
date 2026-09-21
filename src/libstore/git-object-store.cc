@@ -4,6 +4,7 @@
 #include "nix/util/base-n.hh"
 #include "nix/util/git.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/file-system-at.hh"
 #include "nix/util/file-descriptor.hh"
 #include "nix/util/finally.hh"
 #include "nix/util/logging.hh"
@@ -140,20 +141,125 @@ static bool isShardName(std::string_view name)
     return name.size() == 2 && name.find_first_not_of("0123456789abcdef") == std::string_view::npos;
 }
 
+static bool isObjectName(std::string_view name)
+{
+    return name.size() == 2 * regularHashSize(GitObjectStore::hashAlgo)
+           && name.find_first_not_of("0123456789abcdef") == std::string_view::npos;
+}
+
 void GitObjectStore::eachObjectFile(const std::filesystem::path & kindDir, fun<void(const std::filesystem::path &)> f)
 {
-    if (!pathExists(kindDir))
+    auto kind = maybeLstat(kindDir);
+    if (!kind)
         return;
+    if (!S_ISDIR(kind->st_mode))
+        throw Error("object namespace %s is not a directory", PathFmt(kindDir));
     for (auto & entry : DirectoryIterator{kindDir}) {
         std::error_code isDir;
-        if (entry.is_directory(isDir)) {
-            if (!isShardName(entry.path().filename().string()))
-                continue;
-            for (auto & object : DirectoryIterator{entry.path()})
-                f(object.path());
+        if (std::filesystem::is_directory(entry.symlink_status(isDir))) {
+            auto name = entry.path().filename().string();
+            if (isShardName(name)) {
+                for (auto & object : DirectoryIterator{entry.path()})
+                    f(object.path());
+            } else if (isObjectName(name))
+                f(entry.path());
         } else
             f(entry.path());
     }
+}
+
+bool GitObjectStore::verify(RepairFlag repair)
+{
+    printInfo("checking object hashes...");
+    bool errors = false;
+    for (auto kind : {"blobs", "blobs-x", "trees"}) {
+        bool tree = std::string_view{kind} == "trees";
+        eachObjectFile(dir / kind, [&](const std::filesystem::path & object) {
+            checkInterrupt();
+            auto name = object.filename().string();
+            auto what = tree ? "tree object" : "object";
+            printMsg(lvlTalkative, "checking contents of %s", PathFmt(object));
+
+            /* Size and bytes come from one open inode. Close it before
+               diagnostics or removal: Windows retains a deleted name until
+               the last handle closes. The repair reservation, rather than
+               an inode comparison, excludes replacement before removal. */
+            auto inspect = [&]() -> std::optional<std::string> {
+                auto nonregular = [&] { return fmt("%s %s is not a regular file!", what, PathFmt(object)); };
+                auto st = maybeLstat(object);
+                if (!st)
+                    return std::nullopt;
+                /* A corrupt shard symlink may have been replaced with the
+                   real shard directory by a concurrent repair and writer. */
+                if (S_ISDIR(st->st_mode) && object.parent_path() == dir / kind && isShardName(name))
+                    return std::nullopt;
+                if (!S_ISREG(st->st_mode))
+                    return nonregular();
+#ifdef _WIN32
+                auto fd = openFileReadonly(object, FinalSymlink::DontFollow);
+#else
+                AutoCloseFD fd{open(object.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
+#endif
+                if (!fd) {
+                    NativeSysError error("opening object %s", PathFmt(object));
+                    if (error.is(std::errc::no_such_file_or_directory) || error.is(std::errc::not_a_directory))
+                        return std::nullopt;
+                    /* A nonregular replacement between lstat and open is
+                       corruption too, not an invitation to follow/read it. */
+                    auto current = maybeLstat(object);
+                    if (!current)
+                        return std::nullopt;
+                    if (!S_ISREG(current->st_mode))
+                        return nonregular();
+                    throw error;
+                }
+                auto opened = nix::fstat(fd.get());
+                if (!S_ISREG(opened.st_mode))
+                    return nonregular();
+                auto actual = [&] {
+                    if (tree)
+                        return merkle::treeId(readFile(fd.get()));
+                    merkle::BlobHasher hasher{static_cast<uint64_t>(opened.st_size)};
+                    drainFD(fd.get(), hasher);
+                    return hasher.finish();
+                }();
+                auto id = idString(actual);
+                if (id != name)
+                    return fmt("%s %s was modified! expected identifier %s, got '%s'", what, PathFmt(object), name, id);
+                return std::nullopt;
+            };
+
+            auto observed = inspect();
+            if (!observed)
+                return;
+            printError("%s", *observed);
+            if (!repair) {
+                errors = true;
+                return;
+            }
+
+            bool removed = false;
+            {
+                /* Another verifier may have removed the corrupt inode and
+                   an ingestion published its replacement since inspection.
+                   Recheck only mismatches, with publication excluded; never
+                   remove a sound replacement on the old observation. */
+                auto lock = auxiliaryLock->lockExclusive();
+                auto current = inspect();
+                if (current) {
+                    std::error_code ec;
+                    removed = std::filesystem::remove(object, ec);
+                    if (ec && ec != std::errc::no_such_file_or_directory && ec != std::errc::not_a_directory)
+                        throw SystemError(ec, "removing corrupt %s %s", what, PathFmt(object));
+                }
+            }
+            /* Logging may invoke other store operations; it is never part
+               of the exclusive namespace reservation. */
+            if (removed)
+                printInfo("removed %s %s", what, PathFmt(object));
+        });
+    }
+    return errors;
 }
 
 std::string GitObjectStore::blobFileName(const Hash & id, bool executable) const
@@ -1289,13 +1395,10 @@ GitObjectStore::sweep(fun<uint64_t(fun<void(const ObjectHash &)>)> forEachLiveOb
             if (!st || !S_ISDIR(st->st_mode))
                 continue;
             auto mark = [&](const std::filesystem::directory_entry & entry, std::string_view shard) {
-                if (!std::filesystem::is_regular_file(entry.symlink_status()))
-                    return;
                 auto name = entry.path().filename().string();
                 constexpr auto length = 2 * regularHashSize(hashAlgo);
                 std::string_view id{name.data(), std::min(name.size(), length)};
-                if (id.size() != length || id.find_first_not_of("0123456789abcdef") != id.npos
-                    || (!shard.empty() && !id.starts_with(shard)))
+                if (!isObjectName(id) || (!shard.empty() && !id.starts_with(shard)))
                     return;
                 auto suffix = std::string_view(name).substr(length);
                 if (!suffix.empty()
@@ -1305,13 +1408,14 @@ GitObjectStore::sweep(fun<uint64_t(fun<void(const ObjectHash &)>)> forEachLiveOb
                 heldObjects[kind].emplace(id);
             };
             for (const auto & entry : DirectoryIterator{directory}) {
-                if (std::filesystem::is_directory(entry.symlink_status())) {
-                    auto shard = entry.path().filename().string();
-                    if (isShardName(shard))
-                        for (const auto & file : DirectoryIterator{entry.path()})
-                            mark(file, shard);
+                auto shard = entry.path().filename().string();
+                if (isShardName(shard) && std::filesystem::is_directory(entry.symlink_status())) {
+                    for (const auto & file : DirectoryIterator{entry.path()})
+                        mark(file, shard);
                 } else
-                    /* Earlier holders used <kind>/<id> without shards. */
+                    /* Earlier holders used <kind>/<id> without shards.
+                       A claim is its name, regardless of its inode kind;
+                       even a directory with that name is not descended. */
                     mark(entry, {});
             }
         }
@@ -1486,7 +1590,7 @@ GitObjectStore::sweep(fun<uint64_t(fun<void(const ObjectHash &)>)> forEachLiveOb
                     auto st = maybeLstat(file);
                     if (!st)
                         return;
-                    if (st->st_nlink != 1) {
+                    if (S_ISDIR(st->st_mode) || st->st_nlink != 1) {
                         stats.treesHeld++;
                         return;
                     }
@@ -1507,7 +1611,8 @@ GitObjectStore::sweep(fun<uint64_t(fun<void(const ObjectHash &)>)> forEachLiveOb
                     auto st = maybeLstat(file);
                     if (!st)
                         return;
-                    if (st->st_nlink != 1 || heldObjects[kind].contains(file.filename().string())) {
+                    if (S_ISDIR(st->st_mode) || st->st_nlink != 1
+                        || heldObjects[kind].contains(file.filename().string())) {
                         stats.blobsKept++;
                         if (st->st_nlink > 1)
                             stats.sharedBytes +=

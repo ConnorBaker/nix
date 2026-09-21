@@ -570,6 +570,12 @@ public:
      * `hold` keeps the objects written, and the store's objects the copy
      * is made from, from a concurrent sweep until then
      * (`GitObjectStore::Hold`; `08` K16).
+     *
+     * Callbacks run sequentially on the caller thread unless
+     * `callbacksPermitParallelism` is true. Opting in permits hooks to run
+     * concurrently on sibling nodes and naming calls to run on worker
+     * threads in any sibling order (naming calls remain serialized).
+     * The source and filter must independently permit parallel traversal.
      */
     ObjectHashSink::Result materialiseThroughObjects(
         const std::filesystem::path & dst,
@@ -579,7 +585,8 @@ public:
         RestoreSinkHooks * hooks,
         RepairFlag repair,
         TreeNamer namer,
-        const GitObjectStore::Hold & hold);
+        const GitObjectStore::Hold & hold,
+        bool callbacksPermitParallelism = false);
 
     /**
      * `Store::addToStore(name, path, Git, …)` by `materialiseThroughObjects`:
@@ -588,10 +595,17 @@ public:
      * valid destination before staging. Otherwise, run `autoGC`, restore
      * under a locked temporary directory, and move and register the path
      * under its output lock with the computed object hash and NAR size.
-     * Only when `materialisesFromObjects()`.
+     * Only when `materialisesFromObjects()`. The callback permission is
+     * the same as in `materialiseThroughObjects`; this entry point owns
+     * the canonicalising hooks, so the caller need only audit its namer.
      */
     StorePath materialise(
-        std::string_view name, const SourcePath & path, PathFilter & filter, RepairFlag repair, TreeNamer namer);
+        std::string_view name,
+        const SourcePath & path,
+        PathFilter & filter,
+        RepairFlag repair,
+        TreeNamer namer,
+        bool callbacksPermitParallelism = false);
 
     bool verifyStore(bool checkContents, RepairFlag repair) override;
 

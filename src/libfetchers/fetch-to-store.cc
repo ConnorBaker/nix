@@ -160,8 +160,8 @@ void assertNarHash(
         throw inputHashMismatch("NAR hash", inputDescription, asserted, narHash);
 }
 
-/* The subtree memo of 01 §9.9 as a visitor: `known` answers a named node
-   from its row, the actions record the entry (mode and hash; doc/lazy-store/01-specification.md, the memo's rule).
+/* The subtree memo of 01 §9.9 as a visitor: each node either answers from
+   its named row or records the descended entry (mode and hash).
    While a filter is in force a directory's name is neither used nor
    recorded, since the filter decides its entries; a symlink is read
    without a lookup, which would cost the same. */
@@ -176,11 +176,9 @@ struct MemoVisitor : HashingVisitor
     bool wholeViewFingerprint;
     std::shared_ptr<fetchers::Cache> cache;
 
-    /* The pull driver calls known immediately before the node action.
-       Keep that observation, including no name, until the action takes
-       it. A directory takes its key before visiting its children. This
-       visitor walks sequentially; the copy route calls lookup alone. */
-    std::optional<fetchers::Cache::Key> nextKey;
+    /* Only named facts need synchronization. Once initialized, `cache`
+       never changes; unnamed worktree observations take no memo lock. */
+    std::mutex mutex;
 
     /* The rows this walk has named but not yet written.  They go in one
        commit rather than one apiece (`01` section 9.9, the memo's rule says
@@ -196,8 +194,10 @@ struct MemoVisitor : HashingVisitor
         const fetchers::Settings & settings,
         const SourcePath & root,
         bool filtered,
-        const std::pair<CanonPath, std::optional<std::string>> & rootName)
-        : settings(settings)
+        const std::pair<CanonPath, std::optional<std::string>> & rootName,
+        size_t workers = 1)
+        : HashingVisitor(workers)
+        , settings(settings)
         , root(root)
         , rootName(rootName)
         , filtered(filtered)
@@ -219,6 +219,7 @@ struct MemoVisitor : HashingVisitor
             const auto & [subpath, fingerprint] = name;
             if (!fingerprint)
                 return std::nullopt;
+            std::lock_guard lock(mutex);
             if (!cache && !(cache = cacheIfAvailable(settings)))
                 return std::nullopt;
             return makeSourcePathToHashCacheKey(*fingerprint, ContentAddressMethod::Raw::Git, subpath);
@@ -259,14 +260,12 @@ struct MemoVisitor : HashingVisitor
         return entry;
     }
 
-    std::optional<HashedNode> known(const CanonPath & to, const SourceAccessor::Stat & st) override
+    HashedNode node(const CanonPath & to, const SourceAccessor::Stat & st, fun<HashedNode()> descend) override
     {
-        nextKey.reset();
+        std::optional<fetchers::Cache::Key> key;
         /* Symlinks are named only when recorded; filtered directories
            are neither answered nor recorded. A hit has no node action. */
-        if (!consulted(st))
-            return std::nullopt;
-        if (auto entry = lookup(to, st, &nextKey))
+        if (auto entry = lookup(to, st, &key))
             /* A directory's NAR size is unknown: nothing beneath it is
                seen.  A file's is the stat's. */
             return HashedNode{
@@ -275,11 +274,14 @@ struct MemoVisitor : HashingVisitor
                                ? std::optional(merkle::nar::regular(*st.fileSize, st.isExecutable))
                                : std::nullopt,
             };
-        return std::nullopt;
+        auto result = descend();
+        if (st.type == SourceAccessor::tSymlink)
+            key = keyOf(to);
+        return record(std::move(key), std::move(result));
     }
 
-    /* Hand the rows named so far to the cache, in one commit. */
-    void flush()
+    /* The caller holds mutex. */
+    void flushLocked()
     {
         if (writes.empty())
             return;
@@ -287,32 +289,22 @@ struct MemoVisitor : HashingVisitor
         writes.clear();
     }
 
+    /* Hand the rows named so far to the cache, in one commit. */
+    void flush()
+    {
+        std::lock_guard lock(mutex);
+        flushLocked();
+    }
+
     HashedNode record(std::optional<fetchers::Cache::Key> key, HashedNode node)
     {
         if (key) {
+            std::lock_guard lock(mutex);
             writes.emplace_back(std::move(*key), entryRow(node.entry));
             if (writes.size() >= maxPendingWrites)
-                flush();
+                flushLocked();
         }
         return node;
-    }
-
-    HashedNode regular(const CanonPath & to, fun<void(CreateRegularFileSink &)> read) override
-    {
-        auto key = std::exchange(nextKey, std::nullopt);
-        return record(std::move(key), HashingVisitor::regular(to, std::move(read)));
-    }
-
-    HashedNode symlink(const CanonPath & to, const std::string & target) override
-    {
-        return record(keyOf(to), HashingVisitor::symlink(to, target));
-    }
-
-    HashedNode directory(const CanonPath & to, Children children) override
-    {
-        auto key = std::exchange(nextKey, std::nullopt);
-        auto node = HashingVisitor::directory(to, std::move(children));
-        return filtered ? node : record(std::move(key), std::move(node));
     }
 };
 
@@ -326,7 +318,7 @@ gitTreeHashMemoised(
     bool filtered,
     const std::pair<CanonPath, std::optional<std::string>> & rootName)
 {
-    MemoVisitor memo{settings, root, filtered, rootName};
+    MemoVisitor memo{settings, root, filtered, rootName, HashingVisitor::workerCountFor(*root.accessor, filter)};
     auto root2 = objectHashOf(*root.accessor, root.path, filter, memo).root;
     memo.flush();
     return root2;
@@ -491,7 +483,8 @@ std::pair<StorePath, Hash> fetchToStore2(
                                   repair,
                                   [&](const CanonPath & to, const SourceAccessor::Stat & st) {
                                       return repair ? std::nullopt : memo.lookup(to, st);
-                                  });
+                                  },
+                                  /*callbacksPermitParallelism=*/true);
                           }
                       return store.addToStore(name, path, method, HashAlgorithm::SHA256, {}, filter2, repair);
                   }();

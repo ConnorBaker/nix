@@ -52,6 +52,15 @@ ref<MemorySourceAccessor> namedTree(std::optional<std::string> name)
 PathFilter rejectDrop = [](const std::string & path) { return !hasSuffix(path, "/drop"); };
 PathFilter rejectTop = [](const std::string & path) { return !hasSuffix(path, "/top"); };
 
+/* Fixtures are populated before traversal and never mutated during it. */
+struct ConcurrentMemorySource final : MemorySourceAccessor
+{
+    bool allowsConcurrentTraversal() override
+    {
+        return true;
+    }
+};
+
 } // namespace
 
 TEST(FixedSetFilter, namesByTheInnerNameAndTheAdmittedSet)
@@ -1272,6 +1281,8 @@ TEST_F(FetchToStoreLocalTest, filtersKeepTheirCallerThreadAndDepthFirstEffects)
 {
     Finally restoreWorkers{
         [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+    Finally restoreHashWorkers{
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
     const auto caller = std::this_thread::get_id();
     size_t cases = 0;
     for (size_t workers = 1; workers <= 8; ++workers)
@@ -1303,7 +1314,9 @@ TEST_F(FetchToStoreLocalTest, filtersKeepTheirCallerThreadAndDepthFirstEffects)
                                 prune,
                                 stop));
                         auto tag = fmt("filter-effects-%d", cases++);
-                        auto source = namedTree(named ? std::optional<std::string>(tag) : std::nullopt);
+                        auto source = make_ref<ConcurrentMemorySource>();
+                        source->root = namedTree(std::nullopt)->root;
+                        source->fingerprint = named ? std::optional<std::string>(tag) : std::nullopt;
                         std::mutex mutex;
                         std::vector<std::string> calls;
                         bool wrongThread = false;
@@ -1316,6 +1329,7 @@ TEST_F(FetchToStoreLocalTest, filtersKeepTheirCallerThreadAndDepthFirstEffects)
                             return !prune || !hasSuffix(path, "/drop");
                         };
                         LocalStore::copyWorkersForTest.store(workers);
+                        HashingVisitor::workersForTest.store(workers);
                         fetchers::Settings settings;
                         auto fetch = [&] {
                             return fetchToStore2(settings, *store, SourcePath(source), mode, tag, {}, &filter);
@@ -1342,7 +1356,8 @@ TEST_F(FetchToStoreLocalTest, copiedIdentityFiltersPreserveTheTreeAtEveryWidth)
 {
     Finally restoreWorkers{
         [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
-    auto source = namedTree(std::nullopt);
+    auto source = make_ref<ConcurrentMemorySource>();
+    source->root = namedTree(std::nullopt)->root;
     auto expected = narOf(*source);
     for (size_t workers = 1; workers <= 8; ++workers) {
         SCOPED_TRACE(workers);
@@ -1353,7 +1368,8 @@ TEST_F(FetchToStoreLocalTest, copiedIdentityFiltersPreserveTheTreeAtEveryWidth)
             SourcePath(source),
             copied,
             NoRepair,
-            [](const CanonPath &, const SourceAccessor::Stat &) { return std::nullopt; });
+            [](const CanonPath &, const SourceAccessor::Stat &) { return std::nullopt; },
+            /*callbacksPermitParallelism=*/true);
         EXPECT_EQ(narOf(*store->requireStoreObjectAccessor(path)), expected);
     }
 }
@@ -1669,5 +1685,221 @@ TEST(ScopedFilter, nestedScopesKeepTheListedPhysicalDirectoryAfterRename)
     EXPECT_EQ(readFile(before / "child/file"), "replacement");
 }
 #endif
+
+TEST(ScopedFilter, concurrencyPermissionRequiresBothThePolicyAndPhysicalAccessor)
+{
+    struct Inner final : MemorySourceAccessor
+    {
+        bool permission = false;
+
+        bool allowsConcurrentTraversal() override
+        {
+            return permission;
+        }
+    };
+
+    struct Policy final : FilteringSourceAccessor
+    {
+        void anchor() override {}
+
+        bool permission;
+
+        Policy(ref<SourceAccessor> inner, bool permission)
+            : FilteringSourceAccessor(
+                  SourcePath(inner), [](const CanonPath &) { return RestrictedPathError("denied"); })
+            , permission(permission)
+        {
+        }
+
+        bool isAllowed(const CanonPath &) override
+        {
+            return true;
+        }
+
+        bool allowsConcurrentTraversal() override
+        {
+            return permission;
+        }
+
+        void readDirectoryWithEntries(
+            const CanonPath & path,
+            std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+        {
+            readDirectoryScoped(path, std::move(callback));
+        }
+    };
+
+    size_t cases = 0;
+    for (bool physical : {false, true})
+        for (bool policy : {false, true}) {
+            auto inner = make_ref<Inner>();
+            inner->permission = physical;
+            inner->addFile(CanonPath("a/a/a/file"), "bytes");
+            Policy owner{inner, policy};
+            auto inspect = [&](this const auto & recurse,
+                               SourceAccessor & accessor,
+                               const CanonPath & path,
+                               unsigned depth) -> void {
+                accessor.readDirectoryWithEntries(
+                    path, [&](SourceAccessor & scoped, const CanonPath & relative, const auto &) {
+                        SCOPED_TRACE(fmt("physical=%d policy=%d depth=%d", physical, policy, depth));
+                        EXPECT_EQ(scoped.allowsConcurrentTraversal(), physical && policy);
+                        ++cases;
+                        if (depth < 3)
+                            recurse(scoped, relative / "a", depth + 1);
+                    });
+            };
+            inspect(owner, CanonPath::root, 0);
+            auto allowed = AllowListSourceAccessor::create(
+                inner, {CanonPath::root}, {}, [](const CanonPath &) { return RestrictedPathError("denied"); });
+            EXPECT_EQ(allowed->allowsConcurrentTraversal(), physical);
+        }
+    EXPECT_EQ(cases, 16u);
+}
+
+TEST_F(FetchToStoreTest, parallelMemoKeepsEachNamedFactWithItsNode)
+{
+    struct Source final : MemorySourceAccessor
+    {
+        std::map<CanonPath, std::string> names;
+        std::mutex mutex;
+        std::map<CanonPath, size_t> observations, reads;
+        bool symlinkNamedBeforeRead = false;
+
+        bool allowsConcurrentTraversal() override
+        {
+            return true;
+        }
+
+        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+        {
+            std::lock_guard lock(mutex);
+            ++observations[path];
+            auto i = names.find(path);
+            return {CanonPath::root, i == names.end() ? std::nullopt : std::optional(i->second)};
+        }
+
+        void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            {
+                std::lock_guard lock(mutex);
+                ++reads[path];
+            }
+            MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
+        }
+
+        std::string readLink(const CanonPath & path) override
+        {
+            {
+                std::lock_guard lock(mutex);
+                symlinkNamedBeforeRead |= observations[path] != 0;
+                ++reads[path];
+            }
+            return MemorySourceAccessor::readLink(path);
+        }
+    };
+
+    auto store = openStore("dummy://?read-only=false");
+    auto cacheHome = getEnv("NIX_CACHE_HOME").value();
+    auto unavailable = createTempDir();
+    AutoDelete cleanup(unavailable, true);
+    auto blocked = unavailable / "file";
+    writeFile(blocked, "not a directory");
+    Finally restoreCache{[&] { setEnv("NIX_CACHE_HOME", cacheHome.c_str()); }};
+    Finally restoreWorkers{
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
+    size_t cases = 0;
+    for (size_t workers = 1; workers <= 8; ++workers)
+        for (bool available : {false, true})
+            for (unsigned named = 0; named < 5; ++named) {
+                bool hit = named == 2 || named == 4;
+                if (!available && hit)
+                    continue; // A hit requires an available cache.
+                SCOPED_TRACE(fmt("workers=%d available=%d named=%d", workers, available, named));
+                setEnv("NIX_CACHE_HOME", (available ? cacheHome : blocked.string()).c_str());
+                fetchers::Settings settings;
+                auto source = make_ref<Source>();
+                source->addFile(CanonPath("a/plain"), "plain");
+                source->addFile(CanonPath("b/plain"), "different");
+                MemorySink sink{*source};
+                sink.createRegularFile(CanonPath("a/exec"), [](CreateRegularFileSink & file) {
+                    file.isExecutable();
+                    file("executable");
+                });
+                sink.createSymlink(CanonPath("b/link"), "a/plain");
+                const std::vector<CanonPath> leaves{
+                    CanonPath("a/plain"), CanonPath("a/exec"), CanonPath("b/plain"), CanonPath("b/link")};
+                auto nodes = leaves;
+                nodes.insert(nodes.end(), {CanonPath("a"), CanonPath("b")});
+                std::map<CanonPath, merkle::TreeEntry> entries;
+                for (auto & path : nodes)
+                    entries.emplace(path, referenceObjectEntry(*source, path));
+                auto expected = referenceObjectEntry(*source, CanonPath::root);
+                source->observations.clear();
+                source->reads.clear();
+                source->symlinkNamedBeforeRead = false;
+                if (named)
+                    for (auto & path : nodes) {
+                        if (named < 3 && entries.at(path).mode == merkle::Mode::Directory)
+                            continue;
+                        auto name = fmt("parallel-memo-%d-%s", cases, path);
+                        source->names.emplace(path, name);
+                        if (hit) {
+                            auto & entry = entries.at(path);
+                            settings.getCache()->upsert(
+                                makeSourcePathToHashCacheKey(name, ContentAddressMethod::Raw::Git, CanonPath::root),
+                                {{"hash", entry.hash.to_string(HashFormat::SRI, true)},
+                                 {"mode", uint64_t(entry.mode)}});
+                        }
+                    }
+                HashingVisitor::workersForTest.store(workers);
+                auto actual = fetchToStore2(settings, *store, SourcePath(source), FetchMode::DryRun, "source");
+                EXPECT_EQ(actual.second, merkle::objectHash(expected));
+                EXPECT_EQ(source->observations[CanonPath::root], 1u);
+                EXPECT_EQ(source->observations[CanonPath("a")], 1u);
+                EXPECT_EQ(source->observations[CanonPath("b")], 1u);
+                EXPECT_FALSE(source->symlinkNamedBeforeRead);
+                for (auto & path : leaves) {
+                    EXPECT_EQ(source->observations[path], named == 4 ? 0u : 1u);
+                    EXPECT_EQ(source->reads[path], named == 4 || (hit && path != CanonPath("b/link")) ? 0u : 1u);
+                }
+                if (named && available)
+                    for (auto & [path, name] : source->names) {
+                        auto row = settings.getCache()->lookup(
+                            makeSourcePathToHashCacheKey(name, ContentAddressMethod::Raw::Git, CanonPath::root));
+                        ASSERT_TRUE(row);
+                        EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), entries.at(path).hash);
+                        EXPECT_EQ(fetchers::getIntAttr(*row, "mode"), uint64_t(entries.at(path).mode));
+                    }
+                ++cases;
+            }
+    EXPECT_EQ(cases, 64u);
+
+    /* Cross the memo's 16,384-row flush boundary with named siblings on
+       different workers. Check every persisted binding, not a sample. */
+    setEnv("NIX_CACHE_HOME", cacheHome.c_str());
+    fetchers::Settings settings;
+    auto source = make_ref<Source>();
+    std::map<CanonPath, Hash> expected;
+    for (size_t i = 0; i < 16385; ++i) {
+        auto path = CanonPath(i % 2 ? "a" : "b") / fmt("file-%d", i);
+        auto bytes = fmt("contents-%d", i);
+        expected.emplace(path, merkle::blobId(bytes));
+        source->addFile(path, std::move(bytes));
+        source->names.emplace(path, fmt("parallel-flush-%d", i));
+    }
+    auto root = referenceObjectEntry(*source, CanonPath::root);
+    HashingVisitor::workersForTest.store(8);
+    auto actual = fetchToStore2(settings, *store, SourcePath(source), FetchMode::DryRun, "flush");
+    EXPECT_EQ(actual.second, merkle::objectHash(root));
+    for (auto & [path, hash] : expected) {
+        SCOPED_TRACE(path.abs());
+        auto row = settings.getCache()->lookup(
+            makeSourcePathToHashCacheKey(source->names.at(path), ContentAddressMethod::Raw::Git, CanonPath::root));
+        ASSERT_TRUE(row);
+        EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), hash);
+        EXPECT_EQ(fetchers::getIntAttr(*row, "mode"), uint64_t(merkle::Mode::Regular));
+    }
+}
 
 } // namespace nix

@@ -243,11 +243,16 @@ void LocalStore::findTempRoots(Roots & tempRoots, bool censor)
         if (lockFile(fd.get(), ltWrite, false)) {
             /* An earlier collector or the owner may already have removed
                this inode. It no longer owns whatever this name denotes. */
-            if (fstat(fd.get()).st_nlink == 0)
+            auto st = fstat(fd.get());
+            if (st.st_nlink == 0)
                 continue;
             printInfo("removing stale temporary roots file %1%", PathFmt(path));
             tryUnlink(path);
-            writeFull(fd.get(), "d");
+            /* A nonempty file already tells older creators it is stale.
+               Preserve its records for a concurrent scanner that opened
+               this inode and mistook our lock for a live owner's lock. */
+            if (st.st_size == 0)
+                writeFull(fd.get(), "d");
             continue;
         }
 

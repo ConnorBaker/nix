@@ -219,8 +219,16 @@ std::unique_ptr<InterruptCallback> createSignalCallback(SignalType type, fun<voi
 {
     auto signalCallbacks(getSignalCallbacks().lock());
     auto token = signalCallbacks->nextToken++;
-    signalCallbacks->callbacks[type].emplace(token, callback);
-    return std::make_unique<InterruptCallbackImpl>(type, token);
+    auto & callbacks = signalCallbacks->callbacks[type];
+    callbacks.emplace(token, callback);
+    try {
+        return std::make_unique<InterruptCallbackImpl>(type, token);
+    } catch (...) {
+        /* No owner exists to unregister this callback if allocation
+           failed. Its captures may already be unwinding. */
+        callbacks.erase(token);
+        throw;
+    }
 }
 
 std::unique_ptr<InterruptCallback> createInterruptCallback(fun<void()> callback)

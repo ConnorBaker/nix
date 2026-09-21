@@ -9,9 +9,12 @@
 #include "nix/store/globals.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/gc-store.hh"
+#include "nix/store/nar-info-disk-cache.hh"
+#include "nix/store/nar-info.hh"
 #include "nix/store/tests/temp-local-store.hh"
 
 #include "nix/util/archive.hh"
+#include "nix/util/callback.hh"
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/object-hash.hh"
 #include "nix/util/finally.hh"
@@ -23,6 +26,7 @@
 #include "nix/store/pathlocks.hh"
 #include "nix/store/content-address.hh"
 #include "nix/util/tests/setting-scopes.hh"
+#include "nix/util/tests/capture-logging.hh"
 #include "nix/util/tests/source-accessor-gen.hh"
 #include "nix/util/signature/local-keys.hh"
 #include "nix/util/signature/signer.hh"
@@ -251,7 +255,7 @@ struct CountingRestoreHooks : RestoreSinkHooks
 
 /* An accessor that counts what is asked of it: the second route's promise
    is that nothing beneath a subtree the store holds is read (01 §9.10). */
-struct CountingAccessor : SourceAccessor
+struct CountingAccessor final : SourceAccessor
 {
 private:
     void anchor() override {}
@@ -265,6 +269,11 @@ public:
     explicit CountingAccessor(ref<SourceAccessor> inner)
         : inner(inner)
     {
+    }
+
+    bool allowsConcurrentTraversal() override
+    {
+        return inner->allowsConcurrentTraversal();
     }
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
@@ -289,6 +298,16 @@ public:
     {
         links++;
         return inner->readLink(path);
+    }
+};
+
+/* These parallel-copy fixtures finish constructing the tree before a
+   traversal and do not mutate it until that traversal has joined. */
+struct ConcurrentMemorySourceAccessor final : MemorySourceAccessor
+{
+    bool allowsConcurrentTraversal() override
+    {
+        return true;
     }
 };
 
@@ -491,12 +510,14 @@ protected:
         const SourcePath & src,
         LocalStore::TreeNamer namer,
         RepairFlag repair = NoRepair,
-        PathFilter & filter = defaultPathFilter)
+        PathFilter & filter = defaultPathFilter,
+        bool callbacksPermitParallelism = false)
     {
         CountingRestoreHooks hooks{
             makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
         auto hold = store->objects.hold();
-        auto r = store->materialiseThroughObjects(dst, src, filter, /*startFsync=*/false, &hooks, repair, namer, hold);
+        auto r = store->materialiseThroughObjects(
+            dst, src, filter, /*startFsync=*/false, &hooks, repair, namer, hold, callbacksPermitParallelism);
         /* As `restore`: the second route writes rows too, and they become
            true when its path is registered.  These tests materialise into
            `<store>/m1` and the like, which no registration covers, so the
@@ -2801,7 +2822,8 @@ TEST_F(LocalStoreObjectsTest, interruptedOptimisePreservesPathsAndRetryRestoresI
             if (i == 0)
                 nodes.emplace_back("z", later, 'f');
             StringSource source{treeNar(nodes)};
-            auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+            auto hooks =
+                makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
             auto result = store->restoreThroughObjects(roots[i], source, false, hooks.get(), holds[i], NoRepair);
             infos.back().objectHash = ObjectHash::of(result.root);
             infos.back().narSize = result.narSize;
@@ -4185,6 +4207,299 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldNamesDenoteExactlyTheirKindAndIdentif
     EXPECT_EQ(cases, 48u);
 }
 
+namespace {
+struct OnAuxiliaryCorruption : testing::CaptureLogger
+{
+    std::function<void()> replace;
+    std::exception_ptr failure;
+    bool observed = false;
+
+    void log(Verbosity, std::string_view message) noexcept override
+    {
+        if (observed
+            || (message.find("was modified! expected identifier") == message.npos
+                && message.find("is not a regular file!") == message.npos))
+            return;
+        observed = true;
+        try {
+            replace();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    }
+};
+
+} // namespace
+
+TEST_F(LocalStoreObjectsTest, auxiliaryRepairPreservesAConcurrentReplacement)
+{
+    auto & objects = store->objects;
+    size_t cases = 0;
+    /* After the first observation, another verifier removes that inode.
+       The address can then be absent, sound, or still corrupt. The first
+       verifier must decide from that current state under its reservation. */
+    for (unsigned kind = 0; kind < 3; ++kind)
+        for (unsigned replacement = 0; replacement < 3; ++replacement) {
+            SCOPED_TRACE(fmt("kind=%d replacement=%d", kind, replacement));
+            auto bytes = kind == 0 ? std::string{} : fmt("sound-replacement-%d", cases);
+            auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
+            auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
+            createDirs(file.parent_path());
+            writeFile(file, "corrupt old incarnation");
+            auto old = st(file);
+            /* Pin solely to distinguish the test's two incarnations. The
+               verifier keeps a descriptor only while reading each inode. */
+            auto oldInode = openFileReadonly(file);
+            ASSERT_TRUE(oldInode);
+            auto hold = objects.hold();
+            bool nestedErrors = true;
+            OnAuxiliaryCorruption mismatch;
+            mismatch.replace = [&] {
+                /* This is the real verifier's diagnostic boundary, after
+                   hashing but before removal, with no scheduling or seam. */
+                nestedErrors = store->verifyStore(true, Repair);
+                if (replacement == 1) {
+                    if (kind == 0)
+                        objects.putTree(id, bytes, hold);
+                    else
+                        objects.putBlob(id, kind == 2, bytes, hold);
+                } else if (replacement == 2)
+                    writeFile(file, "a different corrupt replacement with a different size");
+            };
+            auto oldLogger = std::exchange(logger, &mismatch);
+            auto oldVerbosity = std::exchange(verbosity, lvlInfo);
+            Finally restore{[&] {
+                logger = oldLogger;
+                verbosity = oldVerbosity;
+            }};
+            EXPECT_FALSE(store->verifyStore(true, Repair));
+            if (mismatch.failure)
+                std::rethrow_exception(mismatch.failure);
+            ASSERT_TRUE(mismatch.observed);
+            EXPECT_FALSE(nestedErrors);
+            EXPECT_EQ(pathExists(file), replacement == 1);
+            if (replacement == 1) {
+                ASSERT_TRUE(pathExists(file));
+                EXPECT_EQ(readFile(file), bytes);
+                EXPECT_NE(st(file).st_ino, old.st_ino);
+                unlinkIfExists(file);
+            }
+            ++cases;
+        }
+    EXPECT_EQ(cases, 9u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryHoldClaimsDoNotDependOnTheOldInodeKind)
+{
+    enum class Kind { Regular, Symlink, DanglingSymlink, Fifo, Socket, Character, Block, Directory };
+    const std::array kinds{
+        Kind::Regular,
+        Kind::Symlink,
+        Kind::DanglingSymlink,
+        Kind::Fifo,
+        Kind::Socket,
+        Kind::Character,
+        Kind::Block,
+        Kind::Directory};
+    const std::array<std::string_view, 3> namespaces{"trees", "blobs", "blobs-x"};
+    auto & objects = store->objects;
+    size_t cases = 0, devicesUnavailable = 0;
+    for (unsigned space = 0; space < namespaces.size(); ++space)
+        for (bool flat : {false, true})
+            for (auto kind : kinds) {
+                SCOPED_TRACE(fmt("space=%d flat=%d kind=%d", space, flat, static_cast<unsigned>(kind)));
+                auto bytes = space == 0 ? std::string{} : fmt("replacement-%d", cases);
+                auto id = space == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
+                auto file = space == 0 ? objects.treeFile(id) : objects.blobFile(id, space == 2);
+                createDirs(file.parent_path());
+                auto outside = tempStoreDir.path() / "outside-auxiliary-claim";
+                writeFile(outside, bytes);
+                AutoCloseFD socket;
+                switch (kind) {
+                case Kind::Regular:
+                case Kind::Directory:
+                    writeFile(file, "corrupt incarnation");
+                    break;
+                case Kind::Symlink:
+                    createSymlink(outside, file);
+                    break;
+                case Kind::DanglingSymlink:
+                    createSymlink(outside.string() + "-missing", file);
+                    break;
+                case Kind::Fifo:
+                    ASSERT_EQ(mkfifo(file.c_str(), 0600), 0) << strerror(errno);
+                    break;
+                case Kind::Socket:
+                    socket = createUnixDomainSocket(file, 0600);
+                    break;
+                case Kind::Character:
+                case Kind::Block:
+                    if (mknod(file.c_str(), (kind == Kind::Character ? S_IFCHR : S_IFBLK) | 0600, 0) == -1) {
+                        /* Device nodes complete the POSIX kind domain but
+                           require privileges unavailable in ordinary and
+                           sandboxed test runs. No leaf-type predicate is
+                           used by the claim decoder for any of these kinds. */
+                        ASSERT_TRUE(errno == EPERM || errno == EACCES || errno == ENOTSUP) << strerror(errno);
+                        ++devicesUnavailable;
+                        continue;
+                    }
+                    break;
+                }
+
+                std::optional<GitObjectStore::Hold> hold{objects.hold()};
+                auto claim =
+                    flat ? hold->directory() / namespaces[space] / GitObjectStore::idString(id) : hold->linkFor(file);
+                createDirs(claim.parent_path());
+                if (kind == Kind::Directory) {
+                    /* Directories cannot be hard-linked, but a corrupted
+                       claim with this shape conservatively denotes the same
+                       address, without granting a traversal into it. */
+                    createDir(claim);
+                    writeFile(claim / "not-an-auxiliary-claim", "untouched until hold release");
+                } else {
+                    ASSERT_TRUE(space == 0 ? objects.holdTree(id, *hold) : objects.holdBlob(id, space == 2, *hold));
+                    if (flat)
+                        std::filesystem::rename(hold->linkFor(file), claim);
+                    EXPECT_EQ(st(claim).st_ino, st(file).st_ino);
+                }
+                EXPECT_TRUE(store->verifyStore(true, NoRepair));
+                EXPECT_FALSE(store->verifyStore(true, Repair));
+                EXPECT_FALSE(maybeLstat(file));
+                EXPECT_EQ(readFile(outside), bytes) << "a corrupt symlink is never followed";
+                {
+                    auto replacement = objects.hold();
+                    if (space == 0)
+                        objects.putTree(id, bytes, replacement);
+                    else
+                        objects.putBlob(id, space == 2, bytes, replacement);
+                }
+                ASSERT_EQ(st(file).st_nlink, 1u);
+                objects.sweep([](fun<void(const ObjectHash &)>) { return uint64_t{0}; });
+                ASSERT_TRUE(pathExists(file)) << "the typed address survives its linked incarnation";
+                EXPECT_EQ(readFile(file), bytes);
+                hold.reset();
+                objects.sweep([](fun<void(const ObjectHash &)>) { return uint64_t{0}; });
+                EXPECT_FALSE(pathExists(file));
+                ++cases;
+            }
+    EXPECT_EQ(cases + devicesUnavailable, 48u);
+    EXPECT_GE(cases, 36u);
+    RecordProperty("device_node_cases_unavailable", devicesUnavailable);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryVerificationDoesNotFollowNamespaceSymlinks)
+{
+    for (auto kind : {"blobs", "blobs-x", "trees"})
+        for (bool atKind : {false, true}) {
+            SCOPED_TRACE(fmt("kind=%s atKind=%d", kind, atKind));
+            GitObjectStore objects{tempStoreDir.path() / fmt("namespace-symlink-%s-%d", kind, atKind)};
+            objects.createDirectories();
+            auto outside = tempStoreDir.path() / fmt("outside-namespace-%s-%d", kind, atKind);
+            createDirs(outside);
+            auto file = outside / GitObjectStore::idString(merkle::blobId("expected"));
+            writeFile(file, "external bytes are not an auxiliary object");
+            auto node = objects.dir / kind;
+            if (atKind)
+                ASSERT_TRUE(std::filesystem::remove(node));
+            else
+                node /= "ab";
+            createSymlink(outside, node);
+            if (atKind) {
+                /* A fixed kind must be a directory. Namespace corruption
+                   is diagnosed without following or rewriting that link. */
+                EXPECT_THROW(objects.verify(NoRepair), Error);
+                EXPECT_THROW(objects.verify(Repair), Error);
+                EXPECT_TRUE(S_ISLNK(st(node).st_mode));
+            } else {
+                EXPECT_TRUE(objects.verify(NoRepair));
+                EXPECT_FALSE(objects.verify(Repair));
+                EXPECT_FALSE(maybeLstat(node));
+            }
+            EXPECT_EQ(readFile(file), "external bytes are not an auxiliary object");
+        }
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryRepairRecognizesARestoredShardDirectory)
+{
+    for (unsigned kind = 0; kind < 3; ++kind)
+        for (bool populated : {false, true}) {
+            SCOPED_TRACE(fmt("kind=%d populated=%d", kind, populated));
+            GitObjectStore objects{tempStoreDir.path() / fmt("restored-shard-%d-%d", kind, populated)};
+            objects.createDirectories();
+            auto bytes = kind == 0 ? std::string{} : std::string{"restored shard bytes"};
+            auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
+            auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
+            auto shard = file.parent_path();
+            auto outside = tempStoreDir.path() / fmt("outside-restored-shard-%d-%d", kind, populated);
+            createDirs(outside);
+            writeFile(outside / "untouched", "external bytes");
+            createSymlink(outside, shard);
+            auto hold = objects.hold();
+            bool nestedErrors = true;
+            OnAuxiliaryCorruption mismatch;
+            mismatch.replace = [&] {
+                nestedErrors = objects.verify(Repair);
+                if (!populated)
+                    createDirs(shard);
+                else if (kind == 0)
+                    objects.putTree(id, bytes, hold);
+                else
+                    objects.putBlob(id, kind == 2, bytes, hold);
+            };
+            auto oldLogger = std::exchange(logger, &mismatch);
+            auto oldVerbosity = std::exchange(verbosity, lvlInfo);
+            Finally restore{[&] {
+                logger = oldLogger;
+                verbosity = oldVerbosity;
+            }};
+            EXPECT_FALSE(objects.verify(Repair));
+            if (mismatch.failure)
+                std::rethrow_exception(mismatch.failure);
+            EXPECT_TRUE(mismatch.observed);
+            EXPECT_FALSE(nestedErrors);
+            ASSERT_TRUE(S_ISDIR(st(shard).st_mode));
+            EXPECT_EQ(pathExists(file), populated);
+            if (populated)
+                EXPECT_EQ(readFile(file), bytes);
+            EXPECT_EQ(readFile(outside / "untouched"), "external bytes");
+        }
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryDirectoryLeavesAreDiagnosedInBothLayouts)
+{
+    for (auto kind : {"blobs", "blobs-x", "trees"})
+        for (bool flat : {false, true})
+            for (bool populated : {false, true}) {
+                SCOPED_TRACE(fmt("kind=%s flat=%d populated=%d", kind, flat, populated));
+                GitObjectStore objects{tempStoreDir.path() / fmt("directory-leaf-%s-%d-%d", kind, flat, populated)};
+                objects.createDirectories();
+                auto name = GitObjectStore::idString(merkle::blobId("directory occupant"));
+                auto file = objects.dir / kind;
+                if (!flat)
+                    file /= name.substr(0, 2);
+                file /= name;
+                createDirs(file);
+                if (populated)
+                    writeFile(file / "child", "not recursively removed");
+                /* Junk directories are not object identifiers in the flat
+                   compatibility layout and retain their existing meaning. */
+                auto junk = objects.dir / kind / "not-an-object";
+                createDirs(junk);
+                writeFile(junk / "keep", "untouched");
+                objects.sweep([](fun<void(const ObjectHash &)>) { return uint64_t{0}; });
+                ASSERT_TRUE(pathExists(file));
+                EXPECT_TRUE(objects.verify(NoRepair));
+                if (populated) {
+                    EXPECT_THROW(objects.verify(Repair), Error);
+                    EXPECT_EQ(readFile(file / "child"), "not recursively removed");
+                } else {
+                    EXPECT_FALSE(objects.verify(Repair));
+                    EXPECT_FALSE(pathExists(file));
+                }
+                EXPECT_EQ(readFile(junk / "keep"), "untouched");
+            }
+}
+
 TEST_F(LocalStoreObjectsTest, releasingAHoldDoesNotFollowSymlinks)
 {
     auto outside = tempStoreDir.path() / "outside";
@@ -5542,6 +5857,84 @@ TEST_F(LocalStoreObjectsTest, deletesEverythingNotAllowListedInTheStoreDir)
     EXPECT_FALSE(store->isValidPath(dead));
 }
 
+TEST_F(LocalStoreObjectsTest, staleTemporaryRootCleanupPreservesEveryRecordShapeForAnOverlappingReader)
+{
+    setenv("_NIX_TEST_NO_LSOF", "1", 1);
+    Finally unset{[] { unsetenv("_NIX_TEST_NO_LSOF"); }};
+
+    struct ObserveRemoval : testing::CaptureLogger
+    {
+        std::function<void()> observe;
+        std::exception_ptr failure;
+
+        void log(Verbosity, std::string_view message) noexcept override
+        {
+            if (!message.starts_with("removing stale temporary roots file "))
+                return;
+            try {
+                observe();
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        }
+    };
+
+    auto first = store->makeStorePath("source", hashString(HashAlgorithm::SHA256, "first-stale-root"), "root");
+    auto second = store->makeStorePath("source", hashString(HashAlgorithm::SHA256, "second-stale-root"), "root");
+    auto firstName = store->printStorePath(first);
+    auto secondName = store->printStorePath(second);
+    /* The finite record domain: complete records absent/present, crossed
+       with an incomplete trailing record absent/present. */
+    for (bool complete : {false, true})
+        for (bool incomplete : {false, true}) {
+            SCOPED_TRACE(fmt("complete=%d incomplete=%d", complete, incomplete));
+            auto contents = complete ? firstName + '\0' + secondName + '\0' : std::string{};
+            if (incomplete)
+                contents += firstName.substr(0, firstName.size() - 1);
+            auto path = store->tempRootsDir / "12345.stale-reader";
+            writeFile(path, contents);
+            AutoCloseFD reader;
+            size_t observations = 0;
+            bool lockRefused = false;
+            ObserveRemoval removal;
+            removal.observe = [&] {
+                ++observations;
+                reader = openLockFile(path, false);
+                if (!reader)
+                    throw Error("stale root file disappeared before the overlapping reader opened it");
+                lockRefused = !lockFile(reader.get(), ltWrite, false);
+            };
+            auto oldLogger = std::exchange(logger, &removal);
+            auto oldVerbosity = std::exchange(verbosity, lvlInfo);
+            Finally restore{[&] {
+                logger = oldLogger;
+                verbosity = oldVerbosity;
+            }};
+
+            /* The existing message is emitted with the cleanup lock held,
+               before unlink/mark. This reader opens and loses its lock at
+               that point, then reads after cleanup, with no scheduler race. */
+            store->findRoots(true);
+            if (removal.failure)
+                std::rethrow_exception(removal.failure);
+            ASSERT_EQ(observations, 1u);
+            ASSERT_TRUE(lockRefused);
+            EXPECT_FALSE(pathExists(path));
+            auto observed = readFile(reader.get());
+            EXPECT_EQ(observed, contents.empty() ? "d" : contents);
+
+            StorePathSet decoded;
+            size_t begin = 0, end;
+            EXPECT_NO_THROW({
+                while ((end = observed.find('\0', begin)) != std::string::npos) {
+                    decoded.insert(store->parseStorePath(std::string_view(observed).substr(begin, end - begin)));
+                    begin = end + 1;
+                }
+            });
+            EXPECT_EQ(decoded, complete ? (StorePathSet{first, second}) : StorePathSet{});
+        }
+}
+
 TEST_F(LocalStoreObjectsTest, temporaryRootsBelongToEachStoreHandle)
 {
     setenv("_NIX_TEST_NO_LSOF", "1", 1);
@@ -5560,18 +5953,22 @@ TEST_F(LocalStoreObjectsTest, temporaryRootsBelongToEachStoreHandle)
             || std::find(order.begin(), order.end(), 2) > std::find(order.begin(), order.end(), 3))
             continue;
         for (size_t firstDestroyed : {0u, 1u}) {
-            SCOPED_TRACE(fmt(
-                "order=%d%d%d%d firstDestroyed=%d", order[0], order[1], order[2], order[3], firstDestroyed));
+            SCOPED_TRACE(
+                fmt("order=%d%d%d%d firstDestroyed=%d", order[0], order[1], order[2], order[3], firstDestroyed));
             ++cases;
             std::array<StorePath, 2> paths{
                 store
                     ->addToStoreSlow(
-                        "first-root", {treeAccessor({{"a", "first", 'f'}})}, ContentAddressMethod::Raw::Git,
+                        "first-root",
+                        {treeAccessor({{"a", "first", 'f'}})},
+                        ContentAddressMethod::Raw::Git,
                         HashAlgorithm::SHA256)
                     .path,
                 store
                     ->addToStoreSlow(
-                        "second-root", {treeAccessor({{"a", "second", 'f'}})}, ContentAddressMethod::Raw::Git,
+                        "second-root",
+                        {treeAccessor({{"a", "second", 'f'}})},
+                        ContentAddressMethod::Raw::Git,
                         HashAlgorithm::SHA256)
                     .path};
             /* The collecting handle itself must retain neither path. */
@@ -6317,9 +6714,15 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsFallsBackOnAMissingOrCorrupt
    writes. Neither mode may lose the sibling's physical sharing witness. */
 TEST_F(LocalStoreObjectsTest, speculativeSubtreeRollbackCannotInvalidateSiblingHolders)
 {
-    struct Source : MemorySourceAccessor
+    struct Source final : MemorySourceAccessor
     {
+        /* Fixed during traversal; its two gates use promises/futures. */
         std::function<void(const CanonPath &)> beforeRead;
+
+        bool allowsConcurrentTraversal() override
+        {
+            return true;
+        }
 
         void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
         {
@@ -6396,7 +6799,15 @@ TEST_F(LocalStoreObjectsTest, speculativeSubtreeRollbackCannotInvalidateSiblingH
                 makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
             auto hold = store->objects.hold();
             auto copied = store->materialiseThroughObjects(
-                dst, SourcePath(source), defaultPathFilter, false, &hooks, NoRepair, namer, hold);
+                dst,
+                SourcePath(source),
+                defaultPathFilter,
+                false,
+                &hooks,
+                NoRepair,
+                namer,
+                hold,
+                /*callbacksPermitParallelism=*/true);
             EXPECT_TRUE(paused);
             EXPECT_EQ(copied.root, result.root);
             EXPECT_EQ(st(dst / "p/a").st_ino, st(dst / "q/a").st_ino);
@@ -6623,6 +7034,158 @@ RC_GTEST_FIXTURE_PROP(LocalStoreObjectsTest, prop_materialised_path_is_the_resto
     }
 }
 
+TEST_F(LocalStoreObjectsTest, concurrentCopyRequiresSourceAndCallbackPermissionAtEveryWidth)
+{
+    struct ObservedSource : MemorySourceAccessor
+    {
+        const std::thread::id caller = std::this_thread::get_id();
+        std::array<std::atomic<bool>, 9> offCaller{};
+        std::array<std::atomic<size_t>, 9> calls{};
+        size_t gateWidth = 0, arrived = 0;
+        std::mutex mutex;
+        std::condition_variable ready;
+
+        void observe(size_t operation)
+        {
+            ++calls[operation];
+            if (std::this_thread::get_id() != caller)
+                offCaller[operation] = true;
+        }
+
+        std::optional<Stat> maybeLstat(const CanonPath & path) override
+        {
+            observe(0);
+            return MemorySourceAccessor::maybeLstat(path);
+        }
+
+        DirEntries readDirectory(const CanonPath & path) override
+        {
+            observe(1);
+            return MemorySourceAccessor::readDirectory(path);
+        }
+
+        void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            observe(2);
+            if (gateWidth) {
+                std::unique_lock lock(mutex);
+                if (arrived < gateWidth) {
+                    ++arrived;
+                    ready.notify_all();
+                    if (!ready.wait_for(lock, std::chrono::seconds(5), [&] { return arrived == gateWidth; }))
+                        throw Error("permitted copy did not exercise its requested worker width");
+                }
+            }
+            MemorySourceAccessor::readFile(path, sink, sizeCallback);
+        }
+
+        std::string readLink(const CanonPath & path) override
+        {
+            observe(3);
+            return MemorySourceAccessor::readLink(path);
+        }
+
+        std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
+        {
+            observe(4);
+            return MemorySourceAccessor::getKnownEntry(path);
+        }
+    };
+
+    struct PermittedSource final : ObservedSource
+    {
+        bool allowsConcurrentTraversal() override
+        {
+            return true;
+        }
+    };
+
+    struct ObservedHooks : CountingRestoreHooks
+    {
+        ObservedSource & observations;
+
+        ObservedHooks(ObservedSource & observations, std::unique_ptr<RestoreSinkHooks> inner)
+            : CountingRestoreHooks(std::move(inner))
+            , observations(observations)
+        {
+        }
+
+        void directoryDone(Descriptor dirFd) override
+        {
+            observations.observe(6);
+            CountingRestoreHooks::directoryDone(dirFd);
+        }
+
+        void regularFileCreated(Descriptor fd, bool executable) override
+        {
+            observations.observe(7);
+            CountingRestoreHooks::regularFileCreated(fd, executable);
+        }
+
+        void symlinkCreated(Descriptor parentFd, const CanonPath & name) override
+        {
+            observations.observe(8);
+            CountingRestoreHooks::symlinkCreated(parentFd, name);
+        }
+    };
+
+    Nodes nodes;
+    for (size_t i = 0; i < 16; ++i) {
+        auto dir = fmt("d%02d/", i);
+        nodes.emplace_back(dir + "file", "ordinary", 'f');
+        nodes.emplace_back(dir + "exec", "executable", 'x');
+        nodes.emplace_back(dir + "link", "file", 'l');
+        nodes.emplace_back(dir + "nested/file", "nested", 'f');
+    }
+    PathFilter all = AllPaths{};
+    Finally restoreWorkers{
+        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+    for (bool sourcePermitted : {false, true})
+        for (bool callbacksPermitted : {false, true})
+            for (size_t workers = 1; workers <= 8; ++workers) {
+                auto label = fmt("source-%d-callbacks-%d-w%d", sourcePermitted, callbacksPermitted, workers);
+                SCOPED_TRACE(label);
+                std::shared_ptr<ObservedSource> source =
+                    sourcePermitted ? std::make_shared<PermittedSource>() : std::make_shared<ObservedSource>();
+                auto caseNodes = nodes;
+                for (auto & [path, bytes, kind] : caseNodes)
+                    if (kind != 'l')
+                        bytes += label + path; // Every worker must create files and exercise that hook.
+                source->root = std::move(treeAccessor(caseNodes)->root);
+                ASSERT_EQ(source->allowsConcurrentTraversal(), sourcePermitted);
+                bool parallel = sourcePermitted && callbacksPermitted;
+                /* The first wave cannot complete until this many distinct
+                   executing threads have entered a read. All waits are bounded. */
+                source->gateWidth = parallel ? workers : 0;
+                LocalStore::copyWorkersForTest.store(workers);
+                auto dst = config->realStoreDir.get() / label;
+                ObservedHooks hooks{
+                    *source,
+                    makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
+                auto namer = [&](const CanonPath &, const SourceAccessor::Stat &) -> std::optional<merkle::TreeEntry> {
+                    source->observe(5);
+                    return std::nullopt;
+                };
+                auto hold = store->objects.hold();
+                if (callbacksPermitted)
+                    store->materialiseThroughObjects(
+                        dst, SourcePath(ref{source}), all, false, &hooks, NoRepair, namer, hold, true);
+                else
+                    /* Exercise the public API's default without supplying a flag. */
+                    store->materialiseThroughObjects(
+                        dst, SourcePath(ref{source}), all, false, &hooks, NoRepair, namer, hold);
+                EXPECT_EQ(source->arrived, source->gateWidth);
+                for (size_t operation = 0; operation < source->calls.size(); ++operation) {
+                    SCOPED_TRACE(fmt("operation=%d", operation));
+                    EXPECT_GT(source->calls[operation].load(), 0u);
+                    EXPECT_EQ(source->offCaller[operation].load(), parallel && workers > 1);
+                }
+                StringSink actual;
+                dumpPath(dst, actual);
+                EXPECT_EQ(actual.s, treeNar(caseNodes));
+            }
+}
+
 /* The parallel copy is the sequential copy (`01` §9.10, *One route*;
    `MaterialisingVisitor::copyChildren`): the second route walks a
    directory's *subdirectories* on a bounded pool, and what it makes must
@@ -6650,7 +7213,8 @@ TEST_F(LocalStoreObjectsTest, parallelCopyIsTheSequentialCopy)
         nodes.emplace_back(dir + "/l", fmt("f%d", d % 5), 'l');
         nodes.emplace_back(dir + "/x", fmt("exec %d", d), 'x');
     }
-    auto tree = treeAccessor(nodes);
+    auto tree = make_ref<ConcurrentMemorySourceAccessor>();
+    tree->root = std::move(treeAccessor(nodes)->root);
     auto nar = narOf(*tree);
 
     /* The store holds every object of the tree: both copies link. */
@@ -6682,7 +7246,7 @@ TEST_F(LocalStoreObjectsTest, parallelCopyIsTheSequentialCopy)
         for (size_t workers = 1; workers <= 8; ++workers) {
             LocalStore::copyWorkersForTest.store(workers);
             auto dst = realStoreDir / fmt("%s-w%d", label, workers);
-            auto r = materialise(dst, src, noNode());
+            auto r = materialise(dst, src, noNode(), NoRepair, defaultPathFilter, /*callbacksPermitParallelism=*/true);
             copies.push_back({dst, r, filesCreated});
         }
 
@@ -6728,9 +7292,10 @@ TEST_F(LocalStoreObjectsTest, freshParallelCopySharesDuplicatesAtEveryWidth)
         for (size_t dir = 0; dir < 16; ++dir)
             for (auto kind : {'f', 'x'})
                 nodes.emplace_back(fmt("d%d/%c", dir, kind), bytes, kind);
-        auto src = treeAccessor(nodes);
+        auto src = make_ref<ConcurrentMemorySourceAccessor>();
+        src->root = std::move(treeAccessor(nodes)->root);
         auto dst = std::filesystem::path{config->realStoreDir.get()} / fmt("fresh-w%d", workers);
-        materialise(dst, SourcePath(src), noNode());
+        materialise(dst, SourcePath(src), noNode(), NoRepair, defaultPathFilter, /*callbacksPermitParallelism=*/true);
         for (size_t dir = 0; dir < 16; ++dir)
             for (auto kind : {'f', 'x'})
                 EXPECT_EQ(st(dst / fmt("d%d/%c", dir, kind)).st_ino, st(dst / fmt("d0/%c", kind)).st_ino)
@@ -6744,8 +7309,14 @@ TEST_F(LocalStoreObjectsTest, freshParallelCopySharesDuplicatesAtEveryWidth)
    the pool width; a later successful copy also detects abandoned work. */
 TEST_F(LocalStoreObjectsTest, nestedParallelCopyJoinsOnFailure)
 {
-    struct Source : MemorySourceAccessor
+    struct Source final : MemorySourceAccessor
     {
+        /* The tree and failure flag change only after every child joins. */
+        bool allowsConcurrentTraversal() override
+        {
+            return true;
+        }
+
         std::atomic<size_t> active{0};
         std::atomic<size_t> peak{0};
         bool fail = true;
@@ -6779,13 +7350,17 @@ TEST_F(LocalStoreObjectsTest, nestedParallelCopyJoinsOnFailure)
         LocalStore::copyWorkersForTest.store(workers);
         source->fail = true;
         auto dst = std::filesystem::path{config->realStoreDir.get()} / fmt("failure-%d", workers);
-        EXPECT_THROW(materialise(dst, SourcePath(source), noNode()), Error);
+        EXPECT_THROW(
+            materialise(
+                dst, SourcePath(source), noNode(), NoRepair, defaultPathFilter, /*callbacksPermitParallelism=*/true),
+            Error);
         EXPECT_EQ(source->active, 0u);
         EXPECT_LE(source->peak, workers);
         source->peak = 0;
         source->fail = false;
         auto good = std::filesystem::path{config->realStoreDir.get()} / fmt("success-%d", workers);
-        materialise(good, SourcePath(source), noNode());
+        materialise(
+            good, SourcePath(source), noNode(), NoRepair, defaultPathFilter, /*callbacksPermitParallelism=*/true);
         EXPECT_EQ(source->active, 0u);
         EXPECT_LE(source->peak, workers);
         source->peak = 0;
@@ -6807,7 +7382,7 @@ RC_GTEST_FIXTURE_PROP(LocalStoreObjectsTest, prop_parallel_copy_is_the_sequentia
         .contents = rc::gen::element(std::string(""), std::string("x"), std::string("yy"), std::string(9, 'q')),
         .targets = rc::gen::element(std::string("t"), std::string("t/uv")),
     };
-    auto tree = make_ref<MemorySourceAccessor>();
+    auto tree = make_ref<ConcurrentMemorySourceAccessor>();
     tree->root = *genFile(3, spec);
     auto nar = narOf(*tree);
     auto realStoreDir = std::filesystem::path{config->realStoreDir.get()};
@@ -6825,7 +7400,8 @@ RC_GTEST_FIXTURE_PROP(LocalStoreObjectsTest, prop_parallel_copy_is_the_sequentia
         for (size_t workers : {size_t(1), size_t(8)}) {
             LocalStore::copyWorkersForTest.store(workers);
             auto dst = realStoreDir / (label + fmt("-w%d", workers));
-            results.push_back(materialise(dst, SourcePath(tree), namer));
+            results.push_back(materialise(
+                dst, SourcePath(tree), namer, NoRepair, defaultPathFilter, /*callbacksPermitParallelism=*/true));
             RC_ASSERT(filesCreated == 0u);
             dsts.push_back(dst);
         }
@@ -7267,6 +7843,287 @@ INSTANTIATE_TEST_SUITE_P(
     [](const ::testing::TestParamInfo<LocalStoreCanonicalisationTest::ParamType> & info) {
         return std::string(printHashAlgo(std::get<HashAlgorithm>(info.param)));
     });
+
+namespace {
+
+/* Expose the existing cache for its finite state checks, and observe the
+   backend boundary without adding a production test hook. */
+struct ValidityObservedStore : LocalStore
+{
+    using CacheValue = PathInfoCacheValue;
+    std::atomic<unsigned> validityQueries = 0;
+    unsigned infoQueries = 0;
+    std::function<void()> afterValidityQuery;
+
+    explicit ValidityObservedStore(ref<const LocalStore::Config> config)
+        : Store{*config}
+        , LocalFSStore{*config}
+        , LocalStore{config}
+    {
+    }
+
+    bool isValidPathUncached(const StorePath & path) override
+    {
+        validityQueries++;
+        auto valid = LocalStore::isValidPathUncached(path);
+        if (afterValidityQuery)
+            afterValidityQuery();
+        return valid;
+    }
+
+    void queryPathInfoUncached(
+        const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override
+    {
+        infoQueries++;
+        LocalStore::queryPathInfoUncached(path, std::move(callback));
+    }
+
+    void seed(const StorePath & path, CacheValue value)
+    {
+        pathInfoCache->lock()->upsert(path, std::move(value));
+    }
+
+    std::optional<CacheValue> cached(const StorePath & path)
+    {
+        if (pathInfoCache)
+            return pathInfoCache->lock()->get(path);
+        return std::nullopt;
+    }
+
+    void useDiskCache(ref<NarInfoDiskCache> cache)
+    {
+        diskCache = cache.get_ptr();
+    }
+};
+
+} // namespace
+
+TEST_F(TempLocalStoreTest, validityCacheKeepsExistenceSeparateFromDescriptions)
+{
+    StringSource source{std::string_view{"validity cache"}};
+    auto present = store->addToStoreFromDump(
+        source,
+        "present",
+        FileSerialisationMethod::Flat,
+        ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256,
+        {},
+        NoRepair);
+    auto missing = store->makeStorePath("source", hashString(HashAlgorithm::SHA256, "missing"), "missing");
+    auto full = store->queryPathInfo(present).get_ptr();
+    auto & ttl = settings.getNarInfoDiskCacheSettings();
+    auto oldPositive = ttl.ttlPositive.get(), oldNegative = ttl.ttlNegative.get();
+    Finally restore{[&] {
+        ttl.ttlPositive = oldPositive;
+        ttl.ttlNegative = oldNegative;
+    }};
+    ttl.ttlNegative = 600;
+    enum class Initial { Absent, Missing, ValidOnly, Full };
+    const std::array initialStates{
+        std::pair{Initial::Absent, false},
+        std::pair{Initial::Missing, false},
+        std::pair{Initial::Missing, true},
+        std::pair{Initial::ValidOnly, false},
+        std::pair{Initial::ValidOnly, true},
+        std::pair{Initial::Full, false},
+        std::pair{Initial::Full, true}};
+    unsigned cells = 0;
+    for (bool enabled : {false, true})
+        for (bool exists : {false, true})
+            for (unsigned positiveTtl : {0u, 600u})
+                for (auto [initial, expired] : initialStates) {
+                    if (!enabled && initial != Initial::Absent)
+                        continue;
+                    ++cells;
+                    SCOPED_TRACE(
+                        fmt("enabled=%d exists=%d ttl=%u initial=%d expired=%d",
+                            enabled,
+                            exists,
+                            positiveTtl,
+                            static_cast<int>(initial),
+                            expired));
+                    config->pathInfoCacheSize = enabled ? 8 : 0;
+                    ttl.ttlPositive = positiveTtl;
+                    auto observed = std::make_shared<ValidityObservedStore>(ref{config});
+                    const auto & path = exists ? present : missing;
+                    if (initial != Initial::Absent) {
+                        ValidityObservedStore::CacheValue value;
+                        if (initial == Initial::ValidOnly)
+                            value.value = ValidityObservedStore::CacheValue::ValidWithoutInfo{};
+                        if (initial == Initial::Full) {
+                            auto description = std::make_shared<ValidPathInfo>(*full);
+                            description->path = path;
+                            value.value = std::shared_ptr<const ValidPathInfo>{description};
+                        }
+                        if (expired)
+                            value.time_point -= std::chrono::hours(1);
+                        observed->seed(path, std::move(value));
+                    }
+                    auto before = observed->cached(path);
+                    EXPECT_EQ(observed->isValidPathUncached(path), exists);
+                    auto after = observed->cached(path);
+                    if (!exists || !enabled) {
+                        /* A SQL miss adds no negative observation. */
+                        ASSERT_EQ(after.has_value(), before.has_value());
+                        if (before) {
+                            EXPECT_EQ(after->time_point, before->time_point);
+                            EXPECT_EQ(after->value.index(), before->value.index());
+                            if (auto info = std::get_if<std::shared_ptr<const ValidPathInfo>>(&before->value)) {
+                                EXPECT_EQ(std::get<std::shared_ptr<const ValidPathInfo>>(after->value), *info);
+                            }
+                        }
+                    } else {
+                        ASSERT_TRUE(after);
+                        EXPECT_TRUE(after->didExist());
+                        auto metadata = observed->queryPathInfoFromClientCache(path);
+                        if (initial == Initial::Full && !expired && positiveTtl) {
+                            ASSERT_TRUE(metadata);
+                            EXPECT_EQ(*metadata, std::get<std::shared_ptr<const ValidPathInfo>>(before->value));
+                            EXPECT_EQ(after->time_point, before->time_point);
+                        } else {
+                            EXPECT_TRUE(
+                                std::holds_alternative<ValidityObservedStore::CacheValue::ValidWithoutInfo>(
+                                    after->value));
+                            EXPECT_FALSE(metadata.has_value());
+                        }
+                    }
+                    if (exists) {
+                        EXPECT_TRUE(observed->isValidPath(path));
+                        EXPECT_EQ(observed->validityQueries.load(), enabled && positiveTtl ? 1u : 2u);
+                        auto description = observed->queryPathInfo(path);
+                        EXPECT_EQ(description->path, present);
+                        EXPECT_EQ(description->objectHash, full->objectHash);
+                        EXPECT_EQ(
+                            observed->infoQueries,
+                            enabled && initial == Initial::Full && !expired && positiveTtl ? 0u : 1u);
+                    }
+                }
+    EXPECT_EQ(cells, 32u);
+}
+
+TEST_F(TempLocalStoreTest, validityOnlyCacheDoesNotMigrateOrReplacePathInfo)
+{
+    for (bool filesPresent : {false, true}) {
+        SCOPED_TRACE(filesPresent);
+        StringSource source{std::string_view{"old validity row"}};
+        auto path = store->addToStoreFromDump(
+            source,
+            filesPresent ? "present-old" : "missing-old",
+            FileSerialisationMethod::Flat,
+            ContentAddressMethod::Raw::Flat,
+            HashAlgorithm::SHA256,
+            {},
+            NoRepair);
+        auto full = store->queryPathInfo(path);
+        StringSink nar;
+        dumpString("old validity row", nar);
+        auto narHash = hashString(HashAlgorithm::SHA256, nar.s);
+        auto narColumn = narHash.to_string(HashFormat::Base16, true);
+        plantSchema10Row(*store, path, narHash, nar.s.size());
+        if (!filesPresent)
+            deletePath(store->toRealPath(path));
+        auto observed = std::make_shared<ValidityObservedStore>(ref{config});
+        ASSERT_TRUE(observed->isValidPath(path));
+        ASSERT_TRUE(observed->isValidPath(path));
+        EXPECT_EQ(observed->validityQueries.load(), 1u);
+        EXPECT_EQ(observed->infoQueries, 0u);
+        EXPECT_EQ(readHashColumn(*observed, path), narColumn);
+        auto description = observed->queryPathInfo(path);
+        EXPECT_EQ(observed->infoQueries, 1u);
+        EXPECT_EQ(description->assertedNarHash, narHash);
+        EXPECT_EQ(description->narSize, nar.s.size());
+        if (filesPresent) {
+            EXPECT_EQ(description->objectHash, full->objectHash);
+            EXPECT_NE(readHashColumn(*observed, path), narColumn);
+        } else {
+            EXPECT_FALSE(description->objectHash);
+            EXPECT_EQ(readHashColumn(*observed, path), narColumn);
+        }
+    }
+}
+
+TEST_F(TempLocalStoreTest, diskValidityWorksWithDisabledMemoryCache)
+{
+    StringSource source{std::string_view{"disk validity"}};
+    auto path = store->addToStoreFromDump(
+        source,
+        "disk-validity",
+        FileSerialisationMethod::Flat,
+        ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256,
+        {},
+        NoRepair);
+    auto full = std::make_shared<NarInfo>(*store->queryPathInfo(path));
+    full->url = "nar/test.nar";
+    full->compression = CompressionAlgo::none;
+    auto disk = NarInfoDiskCache::getTest(
+        settings.getNarInfoDiskCacheSettings(),
+        {.useWAL = settings.useSQLiteWAL},
+        tempStoreDir.path() / "narinfo.sqlite");
+    auto uri = config->getReference().render(false);
+    disk->createCache(uri, store->storeDir, {});
+    for (bool enabled : {false, true})
+        for (bool exists : {false, true}) {
+            SCOPED_TRACE(fmt("enabled=%d exists=%d", enabled, exists));
+            config->pathInfoCacheSize = enabled ? 8 : 0;
+            auto observed = std::make_shared<ValidityObservedStore>(ref{config});
+            observed->useDiskCache(disk);
+            disk->upsertNarInfo(uri, std::string(path.hashPart()), exists ? full : nullptr);
+            EXPECT_EQ(observed->isValidPath(path), exists);
+            EXPECT_EQ(observed->validityQueries.load(), 0u);
+            if (exists) {
+                EXPECT_EQ(observed->queryPathInfo(path)->objectHash, full->objectHash);
+                /* The hash-only lookup still obtains its actual name from
+                   the complete disk description, never from a bool hit. */
+                auto unnamed = StorePath(std::string(path.hashPart()) + '-' + Store::MissingName);
+                if (enabled)
+                    observed->seed(unnamed, {.value = ValidityObservedStore::CacheValue::ValidWithoutInfo{}});
+                EXPECT_EQ(observed->queryPathInfo(unnamed)->path, path);
+            } else
+                EXPECT_THROW(observed->queryPathInfo(path), InvalidPath);
+            EXPECT_EQ(observed->infoQueries, 0u);
+        }
+}
+
+TEST_F(TempLocalStoreTest, invalidationAfterValidityBackendCannotBeUndoneByItsReturn)
+{
+    StringSource source{std::string_view{"invalidate observed validity"}};
+    auto path = store->addToStoreFromDump(
+        source,
+        "validity-race",
+        FileSerialisationMethod::Flat,
+        ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256,
+        {},
+        NoRepair);
+    auto observed = std::make_shared<ValidityObservedStore>(ref{config});
+    std::promise<void> queried, resume;
+    auto queriedFuture = queried.get_future();
+    auto resumeFuture = resume.get_future().share();
+    std::atomic<bool> first = true;
+    observed->afterValidityQuery = [&] {
+        if (first.exchange(false)) {
+            queried.set_value();
+            resumeFuture.wait();
+        }
+    };
+    auto result = std::async(std::launch::async, [&] { return observed->isValidPath(path); });
+    bool released = false;
+    auto release = [&] {
+        if (!released) {
+            released = true;
+            resume.set_value();
+        }
+    };
+    Finally unblock{release};
+    ASSERT_EQ(queriedFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    observed->invalidatePathChecked(path);
+    release();
+    EXPECT_TRUE(result.get()); /* It observed the row before invalidation. */
+    EXPECT_FALSE(observed->isValidPath(path));
+    EXPECT_FALSE(observed->cached(path).has_value());
+    EXPECT_THROW(observed->queryPathInfo(path), InvalidPath);
+}
 
 #endif
 

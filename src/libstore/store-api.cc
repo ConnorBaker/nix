@@ -539,7 +539,7 @@ bool StoreConfig::getReadOnly() const
     return settings.readOnlyMode;
 }
 
-bool Store::PathInfoCacheValue::isKnownNow(const NarInfoDiskCacheSettings & settings)
+bool Store::PathInfoCacheValue::isKnownNow(const NarInfoDiskCacheSettings & settings) const
 {
     std::chrono::duration ttl =
         didExist() ? std::chrono::seconds(settings.ttlPositive) : std::chrono::seconds(settings.ttlNegative);
@@ -658,10 +658,11 @@ bool Store::isValidPath(const StorePath & storePath)
         auto res = diskCache->lookupNarInfo(
             config.getReference().render(/*FIXME withParams=*/false), std::string(storePath.hashPart()));
         if (res.first != NarInfoDiskCache::oUnknown) {
-            pathInfoCache->lock()->upsert(
-                storePath,
-                res.first == NarInfoDiskCache::oInvalid ? PathInfoCacheValue{}
-                                                        : PathInfoCacheValue{.value = res.second});
+            if (pathInfoCache)
+                pathInfoCache->lock()->upsert(
+                    storePath,
+                    res.first == NarInfoDiskCache::oInvalid ? PathInfoCacheValue{}
+                                                            : PathInfoCacheValue{.value = res.second});
             return res.first == NarInfoDiskCache::oValid;
         }
     }
@@ -715,12 +716,10 @@ std::optional<std::shared_ptr<const ValidPathInfo>> Store::queryPathInfoFromClie
 
     if (pathInfoCache) {
         auto res = pathInfoCache->lock()->get(storePath);
-        if (res && res->isKnownNow(settings.getNarInfoDiskCacheSettings())) {
-            if (res->didExist())
-                return std::make_optional(res->value);
-            else
-                return std::make_optional(nullptr);
-        }
+        if (res && res->isKnownNow(settings.getNarInfoDiskCacheSettings()))
+            if (auto info = std::get_if<std::shared_ptr<const ValidPathInfo>>(&res->value))
+                return *info;
+        /* Validity without a description cannot answer this query. */
     }
 
     if (diskCache) {

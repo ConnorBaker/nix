@@ -24,6 +24,7 @@
 #include <memory>
 #include <string>
 #include <chrono>
+#include <variant>
 
 namespace nix {
 
@@ -450,6 +451,8 @@ protected:
 
     struct PathInfoCacheValue
     {
+        struct ValidWithoutInfo
+        {};
 
         /**
          * Time of cache entry creation or update
@@ -457,23 +460,25 @@ protected:
         std::chrono::time_point<std::chrono::steady_clock> time_point = std::chrono::steady_clock::now();
 
         /**
-         * Null if missing
+         * A missing path (null), a complete description, or an observed
+         * valid path whose description has not been queried.
          */
-        std::shared_ptr<const ValidPathInfo> value;
+        std::variant<std::shared_ptr<const ValidPathInfo>, ValidWithoutInfo> value;
 
         /**
          * Whether the value is valid as a cache entry. The path may not
          * exist.
          */
-        bool isKnownNow(const NarInfoDiskCacheSettings & settings);
+        bool isKnownNow(const NarInfoDiskCacheSettings & settings) const;
 
         /**
          * Past tense, because a path can only be assumed to exists when
          * isKnownNow() && didExist()
          */
-        inline bool didExist()
+        inline bool didExist() const
         {
-            return value != nullptr;
+            auto info = std::get_if<std::shared_ptr<const ValidPathInfo>>(&value);
+            return !info || *info != nullptr;
         }
     };
 

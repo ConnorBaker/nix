@@ -92,11 +92,12 @@ std::set<CanonPath> filteredPaths(SourceAccessor & accessor, const CanonPath & p
         {
         }
 
-        std::optional<std::monostate> known(const CanonPath & path, const SourceAccessor::Stat & st) override
+        std::monostate
+        node(const CanonPath & path, const SourceAccessor::Stat & st, fun<std::monostate()> descend) override
         {
             paths.insert(root / path);
             if (st.type == SourceAccessor::tDirectory)
-                return std::nullopt;
+                return descend();
             return std::monostate{};
         }
 

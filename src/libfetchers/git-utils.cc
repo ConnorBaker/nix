@@ -929,6 +929,13 @@ public:
 
     Sync<State> state_;
 
+    bool allowsConcurrentTraversal() override
+    {
+        /* Object reads hold state_. LFS smudging additionally has ordered
+           external effects (network and cache writes), so stays serial. */
+        return !state_.lock()->options.smudgeLfs;
+    }
+
     GitSourceAccessor(ref<GitRepoImpl> repo_, const Hash & rev, const GitAccessorOptions & options)
         : state_{State{
               .repo = repo_,

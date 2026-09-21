@@ -45,25 +45,25 @@ struct NodeVisitor
      * them are worth one (`MaterialisingVisitor::copyChildren`,
      * `01` §9.10), without a `lstat` a child.
      *
-     * A visitor may hold a child's `visit` and call it after the entries
-     * have all been offered -- the accessor stays scoped around the whole
-     * of `directory` for exactly that (below) -- but it must call every
-     * one, and call `each` for every entry, before it returns.
+     * The pull driver permits holding a child's `visit` until later in
+     * this directory's scope; all accepted visits must finish before the
+     * directory returns. The push driver requires immediate consumption:
+     * its child's bytes and callback captures exist only during `each`.
      */
     using Children = fun<void(fun<void(std::string_view name, bool isDirectory, fun<Result()> visit)>)>;
 
     virtual ~NodeVisitor() = default;
 
     /**
-     * Before any node is read, the root included: a summary the visitor
-     * already knows (a memo row, an inode that is a blob's), or nullopt to
-     * visit it.  What is returned is recorded and nothing at or beneath the
-     * node is read.  Never consulted by the push driver, which cannot skip
-     * a NAR's bytes.
+     * Around one node, after its stat and before its contents are read.
+     * Return an already known summary or call `descend` exactly once and
+     * return its result. The continuation is synchronous and must not be
+     * retained. Its scope can carry a memo key without shared visitor state.
+     * Never called by the push driver, which cannot skip a NAR's bytes.
      */
-    virtual std::optional<Result> known(const CanonPath & path, const SourceAccessor::Stat & st)
+    virtual Result node(const CanonPath & path, const SourceAccessor::Stat & st, fun<Result()> descend)
     {
-        return std::nullopt;
+        return descend();
     }
 
     /**
@@ -107,60 +107,60 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
 
         auto st = acc.lstat(from);
 
-        if (auto r = v.known(to, st))
-            return std::move(*r);
-
-        switch (st.type) {
-        case SourceAccessor::tRegular:
-            return v.regular(to, [&](CreateRegularFileSink & crf) {
-                if (st.isExecutable)
-                    crf.isExecutable();
-                acc.readFile(from, crf, [&](uint64_t size) { crf.preallocateContents(size); });
-            });
-
-        case SourceAccessor::tSymlink:
-            return v.symlink(to, acc.readLink(from));
-
-        case SourceAccessor::tDirectory: {
-            /* The entries and, from the same listing, which of them the
-               accessor typed as directories -- advisory, and read by a
-               visitor that may walk siblings on a pool (`Children`). */
-            auto filterBase = path / to;
-            /* The accessor is scoped around the *whole* of `v.directory`,
-               not around the loop alone: an accessor's scoped form may be
-               a stack object of its own (`PosixDirectorySourceAccessor`
-               makes one and hands it to the callback), and a visitor is
-               allowed to hold a child's `visit` and call it after the loop
-               has ended -- which the parallel copy does (`01` §9.10). So
-               the scope must outlive every visit, and the only bound that
-               does is the directory node itself. */
-            std::optional<Result> result;
-            acc.readDirectoryWithEntries(
-                from,
-                [&](SourceAccessor & subdirAccessor,
-                    const CanonPath & subdirFrom,
-                    const SourceAccessor::DirEntries & entries) {
-                    auto unhacked = unhackedEntries(entries, acc, from);
-                    result = v.directory(to, [&](fun<void(std::string_view, bool, fun<Result()>)> each) {
-                        for (auto & [name, actual] : unhacked)
-                            if (filter.get_fn().target<AllPaths>() || filter((filterBase / name).abs()))
-                                each(name, entries.at(actual) == SourceAccessor::tDirectory, [&] {
-                                    return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
-                                });
-                    });
+        auto descend = [&]() -> Result {
+            switch (st.type) {
+            case SourceAccessor::tRegular:
+                return v.regular(to, [&](CreateRegularFileSink & crf) {
+                    if (st.isExecutable)
+                        crf.isExecutable();
+                    acc.readFile(from, crf, [&](uint64_t size) { crf.preallocateContents(size); });
                 });
-            assert(result);
-            return std::move(*result);
-        }
 
-        case SourceAccessor::tChar:
-        case SourceAccessor::tBlock:
-        case SourceAccessor::tSocket:
-        case SourceAccessor::tFifo:
-        case SourceAccessor::tUnknown:
-        default:
-            throw Error("file '%1%' has an unsupported type of %2%", from, st.typeString());
-        }
+            case SourceAccessor::tSymlink:
+                return v.symlink(to, acc.readLink(from));
+
+            case SourceAccessor::tDirectory: {
+                /* The entries and, from the same listing, which of them the
+                   accessor typed as directories -- advisory, and read by a
+                   visitor that may walk siblings on a pool (`Children`). */
+                auto filterBase = path / to;
+                /* The accessor is scoped around the *whole* of `v.directory`,
+                   not around the loop alone: an accessor's scoped form may be
+                   a stack object of its own (`PosixDirectorySourceAccessor`
+                   makes one and hands it to the callback), and a visitor is
+                   allowed to hold a child's `visit` and call it after the loop
+                   has ended -- which the parallel copy does (`01` §9.10). So
+                   the scope must outlive every visit, and the only bound that
+                   does is the directory node itself. */
+                std::optional<Result> result;
+                acc.readDirectoryWithEntries(
+                    from,
+                    [&](SourceAccessor & subdirAccessor,
+                        const CanonPath & subdirFrom,
+                        const SourceAccessor::DirEntries & entries) {
+                        auto unhacked = unhackedEntries(entries, acc, from);
+                        result = v.directory(to, [&](fun<void(std::string_view, bool, fun<Result()>)> each) {
+                            for (auto & [name, actual] : unhacked)
+                                if (filter.get_fn().target<AllPaths>() || filter((filterBase / name).abs()))
+                                    each(name, entries.at(actual) == SourceAccessor::tDirectory, [&] {
+                                        return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
+                                    });
+                        });
+                    });
+                assert(result);
+                return std::move(*result);
+            }
+
+            case SourceAccessor::tChar:
+            case SourceAccessor::tBlock:
+            case SourceAccessor::tSocket:
+            case SourceAccessor::tFifo:
+            case SourceAccessor::tUnknown:
+            default:
+                throw Error("file '%1%' has an unsupported type of %2%", from, st.typeString());
+            }
+        };
+        return v.node(to, st, std::ref(descend));
     }(accessor, path, CanonPath::root, 0);
 }
 
