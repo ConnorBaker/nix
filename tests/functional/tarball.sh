@@ -24,7 +24,12 @@ test_tarball() {
     nix-build -o "$TEST_ROOT"/result '<foo>' -I foo=file://"$tarball"
 
     nix-build -o "$TEST_ROOT"/result -E "import (fetchTarball \"file://$tarball\")"
-    # Do not re-fetch paths already present
+    # Do not re-fetch paths already present.  A tree is named by its tree
+    # hash; a NAR-hash pin finds a present tree through the memoised pair,
+    # which exists once the tree's NAR hash has been computed -- here by
+    # forcing the lazy `narHash` of the fetched tree (doc/lazy-store/04,
+    # section 1.9, the fetchers' and the language's representation).
+    nix eval --impure --raw --expr "(builtins.fetchTree { type = \"tarball\"; url = \"file://$tarball\"; }).narHash" > /dev/null
     nix-build  -o "$TEST_ROOT"/result -E "import (fetchTarball { url = \"file:///does-not-exist/must-remain-unused/$tarball\"; sha256 = \"$hash\"; })"
 
     nix-build  -o "$TEST_ROOT"/result -E "import (fetchTree \"file://$tarball\")"
@@ -69,7 +74,13 @@ test_tarball .gz gzip
 # We don't preserve the hard links, because that's an optimization we think is not worth the complexity,
 # so we only make sure that the contents are copied correctly.
 json=$(nix flake prefetch --json "tarball+file://$(pwd)/tree.tar.gz" --out-link "$TEST_ROOT/result")
-[[ $json =~ ^'{"hash":"sha256-'.*'","locked":{"lastModified":'.*',"narHash":"sha256-'.*'","type":"tarball","url":"file:///'.*'/tree.tar.gz"},"original":{"type":"tarball","url":"file:///'.*'/tree.tar.gz"},"storePath":"'.*'/store/'.*'-source"}'$ ]]
+[[ $json =~ ^'{"hash":"sha256-'.*'","locked":{"lastModified":'.*',"treeHash":"sha256-'.*'","type":"tarball","url":"file:///'.*'/tree.tar.gz"},"original":{"type":"tarball","url":"file:///'.*'/tree.tar.gz"},"storePath":"'.*'/store/'.*'-source"}'$ ]]
+# The hash printed is the tree hash the lock carries: the SHA-256 git tree
+# id of tree.tar.gz's one top-level directory (its hard links are plain
+# files, all "bar"), computed from the extracted fixture with git's object
+# format.
+[[ $(jq -r .hash <<< "$json") == "$(jq -r .locked.treeHash <<< "$json")" ]]
+[[ $(jq -r .hash <<< "$json") == sha256-brzLKkeQe3eeaRXOxtNkDAYY760uCB7SR930+ucfBwo= ]]
 [[ $(cat "$TEST_ROOT/result/a/b/foo") = bar ]]
 [[ $(cat "$TEST_ROOT/result/a/b/xyzzy") = bar ]]
 [[ $(cat "$TEST_ROOT/result/a/yyy") = bar ]]

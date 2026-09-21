@@ -36,6 +36,7 @@ suites += {
     'trace-ifd.sh',
     'get-flake.sh',
     'type-error-fallback.sh',
+    'path-input-copies-once.sh',
   ],
   'workdir' : meson.current_source_dir(),
 }

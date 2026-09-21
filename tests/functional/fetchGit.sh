@@ -285,7 +285,9 @@ path11=$(nix eval --impure --raw --expr "(builtins.fetchGit ./.).outPath")
 empty="$TEST_ROOT/empty"
 createGitRepo "$empty"
 
-emptyAttrs="{ lastModified = 0; lastModifiedDate = \"19700101000000\"; narHash = \"sha256-pQpattmS9VmO3ZIQUFn66az8GSmB4IvYhTTCFn6SUmo=\"; rev = \"0000000000000000000000000000000000000000\"; revCount = 0; shortRev = \"0000000\"; submodules = false; }"
+# `treeHash` is the tree's SHA-256 git id: here the empty tree's
+# (sha256 of "tree 0\0", 6ef19b41...), the name the store gives the tree.
+emptyAttrs="{ lastModified = 0; lastModifiedDate = \"19700101000000\"; narHash = \"sha256-pQpattmS9VmO3ZIQUFn66az8GSmB4IvYhTTCFn6SUmo=\"; rev = \"0000000000000000000000000000000000000000\"; revCount = 0; shortRev = \"0000000\"; submodules = false; treeHash = \"sha256-bvGbQSJcU2nxwQTUXY2F76mwV7U7FLS5uTnddN7MUyE=\"; }"
 result=$(nix eval --impure --expr "builtins.removeAttrs (builtins.fetchGit $empty) [\"outPath\"]")
 [[ "$result" = "$emptyAttrs" ]]
 
@@ -296,7 +298,8 @@ result=$(nix eval --impure --expr "builtins.removeAttrs (builtins.fetchGit $empt
 
 git -C "$empty" add x
 
-expected_attrs="{ lastModified = 0; lastModifiedDate = \"19700101000000\"; narHash = \"sha256-wzlAGjxKxpaWdqVhlq55q5Gxo4Bf860+kLeEa/v02As=\"; rev = \"0000000000000000000000000000000000000000\"; revCount = 0; shortRev = \"0000000\"; submodules = false; }"
+# The tree { x = "foo\n" } under SHA-256 (blob 100644 "x", 82cfb663...).
+expected_attrs="{ lastModified = 0; lastModifiedDate = \"19700101000000\"; narHash = \"sha256-wzlAGjxKxpaWdqVhlq55q5Gxo4Bf860+kLeEa/v02As=\"; rev = \"0000000000000000000000000000000000000000\"; revCount = 0; shortRev = \"0000000\"; submodules = false; treeHash = \"sha256-gs+2Y8e5MDWk+yel7we1fV0Kyg6KfQF/jjO9T3EIuF0=\"; }"
 result=$(nix eval --impure --expr "builtins.removeAttrs (builtins.fetchGit $empty) [\"outPath\"]")
 [[ "$result" = "$expected_attrs" ]]
 

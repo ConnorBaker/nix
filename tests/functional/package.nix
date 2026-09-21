@@ -10,6 +10,7 @@
   jq,
   git,
   mercurial,
+  sqlite,
   unixtools,
   util-linux,
 
@@ -54,6 +55,8 @@ mkMesonDerivation (
       jq
       git
       mercurial
+      # `sqlite3`: object-hash.sh plants a schema-10 database row.
+      sqlite
       unixtools.script
 
       # Explicitly splice the hostHost variant to fix LLVM tests. The nix-cli

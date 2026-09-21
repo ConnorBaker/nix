@@ -106,5 +106,7 @@ echo "collecting garbage..."
 rm "$TEST_ROOT"/result*
 nix-store --gc --keep-derivations --keep-outputs
 nix-store --gc --print-roots
-rm -rf "$NIX_STORE_DIR"/.links
+# The object store holds no blob and no tree once nothing refers to them.
+[[ -z "$(find "$NIX_STORE_DIR/.objects" -type f)" ]]
+rm -r "$NIX_STORE_DIR"/.objects
 rmdir "$NIX_STORE_DIR"

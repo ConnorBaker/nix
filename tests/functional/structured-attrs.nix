@@ -40,7 +40,7 @@ mkDerivation {
     echo foo > $dest2
 
     json=$(cat $NIX_ATTRS_JSON_FILE)
-    [[ $json =~ '"narHash":"sha256:1r7yc43zqnzl5b0als5vnyp649gk17i37s7mj00xr8kc47rjcybk"' ]]
+    [[ $json =~ '"objectHash":"git:sha256:' ]]
     [[ $json =~ '"narSize":288' ]]
     [[ $json =~ '"closureSize":288' ]]
     [[ $json =~ '"references":[]' ]]

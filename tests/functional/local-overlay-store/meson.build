@@ -10,6 +10,7 @@ suites += {
     'delete-refs.sh',
     'delete-duplicate.sh',
     'gc.sh',
+    'gc-objects.sh',
     'verify.sh',
     'optimise.sh',
     'stale-file-handle.sh',

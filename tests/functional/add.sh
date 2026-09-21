@@ -24,10 +24,12 @@ test "$path1" != "$path4" || exit 1
 hash1=$(nix-store -q --hash "$path1")
 echo "$hash1"
 
-hash2=$(nix-hash --type sha256 --base32 ./dummy)
+# `--query --hash` is the object hash (doc/lazy-store/01-specification.md,
+# section 9.11), the same value `nix hash path --mode git` computes.
+hash2=$(nix hash path --mode git --algo sha256 --format base16 ./dummy)
 echo "$hash2"
 
-test "$hash1" = "sha256:$hash2"
+test "$hash1" = "git:sha256:$hash2"
 
 # The contents can be accessed through a symlink, and this symlink has no effect on the hash
 # https://github.com/NixOS/nix/issues/11941

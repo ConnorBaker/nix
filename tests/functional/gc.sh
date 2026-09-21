@@ -49,6 +49,8 @@ nix-collect-garbage
 # Check that the output has been GC'd.
 if test -e "$outPath/foobar"; then false; fi
 
-# Check that the store is empty.
-rmdir "$NIX_STORE_DIR/.links"
+# Check that the store is empty: no path, and the object store holds no
+# blob and no tree once nothing refers to them.
+[[ -z "$(find "$NIX_STORE_DIR/.objects" -type f)" ]]
+rm -r "$NIX_STORE_DIR/.objects"
 rmdir "$NIX_STORE_DIR"
