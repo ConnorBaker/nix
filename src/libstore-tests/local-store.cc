@@ -3501,7 +3501,7 @@ TEST_F(LocalStoreObjectsTest, optimiserInodeHintsRequireACurrentHolder)
                     chmod(file, 0644);
                     writeFile(file, changedBytes);
                     auto mode = executable ? 0555 : 0444;
-                    chmod(file, mode | (hint == Hint::Writable ? S_IWUSR : hint == Hint::Mode ? S_ISUID : 0));
+                    chmod(file, mode | (hint == Hint::Writable ? S_IWUSR : hint == Hint::Mode ? S_ISVTX : 0));
                     timespec times[2]{
                         {0, UTIME_OMIT}, {hint == Hint::Seconds ? 2 : 1, hint == Hint::Nanoseconds ? 1 : 0}};
                     ASSERT_EQ(::utimensat(AT_FDCWD, file.c_str(), times, 0), 0);
@@ -4042,13 +4042,22 @@ TEST_F(LocalStoreObjectsTest, holderReusePreservesCanonicalMetadata)
             SCOPED_TRACE(requestedExecutable);
             /* Exposing the source tree as a store path also promises
                canonical metadata: exactly 0444/0555 and epoch + 1s.
-               Enumerate every portable permission pattern, including
-               setuid, setgid and sticky. A link would preserve all bits. */
+               Enumerate all 07777 patterns through the metadata predicate.
+               The physical holder checks cover 0..01777, including sticky:
+               Nix's build sandbox prohibits chmod with setuid/setgid bits. */
             mode_t expectedMode = requestedExecutable ? 0555 : 0444;
             candidate = regular;
             setWriteTime(regular, 1, 1);
+            auto metadata = st(regular);
+            GitObjectStore::Holder row{
+                metadata.st_ino, metadata.st_dev, static_cast<uint64_t>(metadata.st_size), regular.string(), 1};
             for (mode_t mode = 0; mode <= 07777; ++mode) {
                 SCOPED_TRACE(fmt("mode=%o", mode));
+                metadata.st_mode = S_IFREG | mode;
+                EXPECT_EQ(
+                    GitObjectStore::validHolderMetadata(row, requestedExecutable, metadata), mode == expectedMode);
+                if (mode & (S_ISUID | S_ISGID))
+                    continue;
                 chmod(regular, mode);
                 forgotten = false;
                 auto holder = objects.holderOrForget(id, requestedExecutable, repair);
