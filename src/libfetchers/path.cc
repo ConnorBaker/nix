@@ -425,6 +425,7 @@ struct PathInputScheme : InputScheme
                        without retaining and replaying all input bytes. This
                        is only a choice of route: a concurrent registration
                        is handled by materialise's ordinary final check. */
+                    Activity act(*logger, lvlTalkative, actUnknown, fmt("copying %s to the store", PathFmt(absPath)));
                     auto copied = local->materialise(
                         "source",
                         SourcePath(accessor),
