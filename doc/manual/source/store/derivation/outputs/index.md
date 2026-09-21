@@ -170,5 +170,4 @@ The rules for this are fairly concise:
      > The sole purpose of an output's store path being fixed is to support the derivation being impure.
 
 [xp-feature-ca-derivations]: @docroot@/development/experimental-features.md#xp-feature-ca-derivations
-[xp-feature-git-hashing]: @docroot@/development/experimental-features.md#xp-feature-git-hashing
 [xp-feature-impure-derivations]: @docroot@/development/experimental-features.md#xp-feature-impure-derivations

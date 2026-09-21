@@ -17,7 +17,7 @@ Each record has the following format:
 
 ```
 path
-nar-hash    (only with --hash-given)
+hash        (only with --hash-given)
 nar-size    (only with --hash-given)
 deriver
 number-of-references
@@ -27,8 +27,10 @@ reference-n
 ```
 
 Here, *path* is the [store path] of the store object to register.
-*nar-hash* is the base-16 SHA-256 hash of the path’s [NAR][Nix Archive] serialisation, and *nar-size* is the size of the NAR in bytes.
-These two lines are only present when `--hash-given` is specified; otherwise they must be omitted, and Nix computes the NAR hash and size from the store object instead.
+*hash* is the path’s [object hash](@docroot@/store/file-system-object/content-address.md#git), rendered `git:sha256:<64 hex digits>`, as `nix-store --dump-db` writes it.
+A record written by an older Nix carries the base-16 SHA-256 hash of the path’s [NAR][Nix Archive] serialisation there instead, and is accepted: the object hash is then computed by one walk of the path, which also checks that NAR hash and the size; a record whose path does not match them is reported and not registered, the other records are, and the exit status is 1 when any record was skipped.
+*nar-size* is the size of the NAR in bytes.
+These two lines are only present when `--hash-given` is specified; otherwise they must be omitted, and Nix computes the object hash and the NAR size from the store object instead.
 *deriver* is the [store path] of the [deriver], the derivation that produced this path, or an empty line if unknown.
 *number-of-references* specifies how many [reference] paths follow, which are listed on the subsequent lines.
 
@@ -49,7 +51,7 @@ Its main use is registering the closure of a system inside an image or chroot be
 
 - `--hash-given`
 
-  Expect the NAR hash and size in the input, as described above, instead of computing them from the store objects.
+  Expect the hash line and the NAR size in the input, as described above, instead of computing them from the store objects.
 
 {{#include ./opt-common.md}}
 

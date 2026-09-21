@@ -19,6 +19,10 @@ those store paths is dumped. As with `--export`, the user is responsible
 for passing all the store paths for a closure. See `--export` for an
 example.
 
+Each record carries the path's object hash, rendered `git:sha256:…`, on
+the line where earlier versions wrote the NAR hash; an older Nix cannot
+load such a dump (see [`--load-db`](./load-db.md)).
+
 {{#include ./opt-common.md}}
 
 {{#include ../opt-common.md}}

@@ -144,10 +144,15 @@ symlink.
 
 - `--hash`
 
-  Prints the SHA-256 hash of the contents of the store paths *paths*
-  (that is, the hash of the output of `nix-store --dump` on the given
-  paths). Since the hash is stored in the Nix database, this is a fast
-  operation.
+  Prints the content hash of the store paths *paths*: their
+  [object hash](@docroot@/store/file-system-object/content-address.md#git),
+  the git tree hash of their contents under SHA-256, rendered
+  `git:sha256:<hex>`. Since the hash is stored in the Nix database,
+  this is a fast operation, except the first query of a path registered
+  by an older Nix, which walks it once to compute the hash and records
+  it. (For a path described only by a peer
+  that carried no object hash, the NAR hash it asserted is printed
+  instead, in its own `sha256:` rendering.)
 
 - `--size`
 

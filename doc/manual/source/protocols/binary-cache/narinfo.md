@@ -15,7 +15,8 @@ The fields correspond to those documented in the [store object info](@docroot@/p
 | `Compression` | [`compression`](@docroot@/protocols/json/store-object-info.md#oneOf_i2_compression) | Defaults to `bzip2` if omitted |
 | `FileHash` | [`downloadHash`](@docroot@/protocols/json/store-object-info.md#oneOf_i2_downloadHash) | String-encoded hash rather than structured |
 | `FileSize` | [`downloadSize`](@docroot@/protocols/json/store-object-info.md#oneOf_i2_downloadSize) | |
-| `NarHash` | [`narHash`](@docroot@/protocols/json/store-object-info.md#oneOf_i2_narHash) | String-encoded hash rather than structured |
+| `ObjectHash` | [`objectHash`](@docroot@/protocols/json/store-object-info.md#oneOf_i2_objectHash) | The store object's [object hash](@docroot@/store/file-system-object/content-address.md#git), `git:sha256:<hex>`. Written when known (a narinfo re-serialised from an older cache may lack it); optional when reading, provided `NarHash` is present |
+| `NarHash` | [`narHash`](@docroot@/protocols/json/store-object-info.md#oneOf_i2_narHash) | String-encoded hash rather than structured. Always written, for clients that do not read `ObjectHash`; optional when reading, provided `ObjectHash` is present |
 | `NarSize` | [`narSize`](@docroot@/protocols/json/store-object-info.md#oneOf_i2_narSize) | |
 | `References` | [`references`](@docroot@/protocols/json/store-object-info.md#oneOf_i2_references) | Space-separated [store path base names](@docroot@/store/store-path.md#base-name) rather than a JSON array |
 | `Deriver` | [`deriver`](@docroot@/protocols/json/store-object-info.md#oneOf_i2_deriver) | [Store path base name](@docroot@/store/store-path.md#base-name); `unknown-deriver` instead of `null` |
@@ -24,7 +25,9 @@ The fields correspond to those documented in the [store object info](@docroot@/p
 
 ## Example
 
-<!-- TODO make this include a test file instead of being manually written once we have one -->
+<!-- TODO make this include a test file instead of being manually written once we have one.
+     `ObjectHash`, `NarHash` and `NarSize` below are from one run (`nix store add --mode nar` of a
+     two-file tree, `bin/hello` executable and `README`); the other fields are illustrative. -->
 
 ```
 StorePath: /nix/store/n5wkd9frr45pa74if5gpz9j7mifg27fh-foo
@@ -32,8 +35,9 @@ URL: nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.xz?sha256=1w1f
 Compression: xz
 FileHash: sha256:09ymwqf5i9q7d4dm7x4pjjcqqj0qrcp5lnznbh42gfsci5hcbqqm
 FileSize: 4029176
-NarHash: sha256:09ymwqf5i9q7d4dm7x4pjjcqqj0qrcp5lnznbh42gfsci5hcbqqm
-NarSize: 34878
+ObjectHash: git:sha256:6409658000128fb07ae366e26fd3cf0fdb1bb1a316ca964ad8b190d7851a5a46
+NarHash: sha256:1s7vki0nc946s5lwr0zm7a0xr7r1axfj9yf606rc8ps2i9288dqk
+NarSize: 704
 References: g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar n5wkd9frr45pa74if5gpz9j7mifg27fh-foo
 Deriver: g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar.drv
 Sig: asdf:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==

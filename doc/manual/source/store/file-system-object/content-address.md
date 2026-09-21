@@ -58,29 +58,28 @@ we can first hash (serialised) child file system objects, and then hash parent o
 
 Currently, there is one such Merkle DAG content addressing method supported.
 
-### Git ([experimental][xp-feature-git-hashing]) { #git }
+### Git { #git }
 
-> **Warning**
->
-> This method is part of the [`git-hashing`][xp-feature-git-hashing] experimental feature.
+This method needs no experimental feature: it is the method by which the store identifies every store object and by which sources are named.
+It is likewise available, with no feature, to derivations with `outputHashMode = "git"` and to the reading of Git object streams (blobs and trees).
 
 Git's file system model is very close to Nix's, and so Git's content addressing method is a pretty good fit.
 Just as with regular Git, files and symlinks are hashed as git "blobs", and directories are hashed as git "trees".
+The identifiers are SHA-256, as in a Git repository made with `--object-format=sha256`; SHA-1, the algorithm of most repositories today, is not used (see the [store object method](../store-object/content-address.md#method-git)).
 
 However, one difference between Nix's and Git's file system model needs special treatment.
 Plain files, executable files, and symlinks are not differentiated as distinctly addressable objects, but by their context: by the directory entry that refers to them.
 That means so long as the root object is a directory, there is no problem:
 every non-directory object is owned by a parent directory, and the entry that refers to it provides the missing information.
-However, if the root object is not a directory, then we have no way of knowing which one of an executable file, non-executable file, or symlink it is supposed to be.
+However, if the root object is not a directory, then git's blob identifier alone does not say which one of an executable file, non-executable file, or symlink it is supposed to be.
 
-In response to this, we have decided to treat a bare file as non-executable file.
-This is similar to do what we do with [flat serialisation](#serial-flat), which also lacks this information.
-To avoid an address collision, attempts to hash a bare executable file or symlink will result in an error (just as would happen for flat serialisation also).
-Thus, Git can encode some, but not all of Nix's "File System Objects", and this sort of content-addressing is likewise partial.
+The root is therefore addressed as follows:
 
-In the future, we may support a Git-like hash for such file system objects, or we may adopt another Merkle DAG format which is capable of representing all Nix file system objects.
+- A directory is addressed by its git "tree" identifier, and a bare non-executable file by its git "blob" identifier: git's own identifier wherever git has one.
+- A bare executable file or a bare symlink is addressed by the identifier of the one-entry git "tree" whose single entry, named `.`, carries the mode (executable or symlink) and the blob.
+
+The name `.` is chosen because no Nix file system object can contain an entry of that name (a directory's entry names are never `.` or `..`), so this synthetic tree never coincides with the tree of a real directory, and the address is injective: a non-executable file, an executable file, and a symlink with the same contents are three distinct addresses, and every Nix file system object has exactly one.
 
 
 [file system object]: ../file-system-object.md
 [store object]: ../store-object.md
-[xp-feature-git-hashing]: @docroot@/development/experimental-features.md#xp-feature-git-hashing
