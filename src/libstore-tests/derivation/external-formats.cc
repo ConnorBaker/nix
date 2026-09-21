@@ -393,15 +393,16 @@ struct WindowsStoreDirTest : DerivationTest
 };
 
 /**
- * Without the support the store paths are written verbatim, so the `\n`
- * of `\nix` is read back as a newline and the derivation no longer says
- * what it was written to say. This is the state Windows was in.
+ * Without the support the store paths would be written verbatim, so the
+ * `\n` of `\nix` would be read back as a newline and the derivation no
+ * longer say what it was written to say -- the state Windows was in. The
+ * writer now refuses a store directory the verbatim form cannot carry,
+ * before anything is written (`DerivationAtermTest.
+ * storeDirOutsideTheVerbatimFormIsRefused` has the Unix case).
  */
-TEST_F(WindowsStoreDirTest, unsupportedIsUnreadable)
+TEST_F(WindowsStoreDirTest, unsupportedIsRefusedAtTheWriter)
 {
-    auto aterm = derivation::unparse(testCase.drv, store, false);
-
-    ASSERT_THROW(derivation::parse(store, std::move(aterm), testCase.drv.name, false, mockXpSettings), FormatError);
+    ASSERT_THROW(derivation::unparse(testCase.drv, store, false), FormatError);
 }
 
 /**

@@ -6,9 +6,9 @@ R""(
 
   ```console
   # nix flake prefetch https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.10.5.tar.xz --out-link ./result
-  Downloaded 'https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.10.5.tar.xz?narHash=sha256-3XYHZANT6AFBV0BqegkAZHbba6oeDkIUCDwbATLMhAY='
-  to '/nix/store/sl5vvk8mb4ma1sjyy03kwpvkz50hd22d-source' (hash
-  'sha256-3XYHZANT6AFBV0BqegkAZHbba6oeDkIUCDwbATLMhAY=').
+  Downloaded 'https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.10.5.tar.xz?treeHash=sha256-0bQZ/PkmPEdd0UfrTebgKhSiyamuXLQ%2BUpQtfdWmX/k%3D'
+  to '/nix/store/w4dwngn0cp5rfgk95v2j1ycwglcpmvll-source' (hash
+  'sha256-0bQZ/PkmPEdd0UfrTebgKhSiyamuXLQ+UpQtfdWmX/k=').
 
   # cat ./result/README
   Linux kernel
@@ -19,8 +19,8 @@ R""(
 
   ```console
   # nix flake prefetch dwarffs --json
-  {"hash":"sha256-VHg3MYVgQ12LeRSU2PSoDeKlSPD8PYYEFxxwkVVDRd0="
-  ,"storePath":"/nix/store/l06r23gw4psl1f547il2hbnwnxaplbaz-source"}
+  {"hash":"sha256-IjFBbAAu9cCMmlpnVX1Vv73aACKrZ0ZTt9JFQRdNLvQ="
+  ,"storePath":"/nix/store/rma6brjxd5cwsbxhqinhm39xpglq9260-source"}
   ```
 
 # Description

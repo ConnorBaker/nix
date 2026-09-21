@@ -1,0 +1,7 @@
+StorePath: /nix/store/n5wkd9frr45pa74if5gpz9j7mifg27fh-foo
+URL: nar/1w1fff338fvdw53sqgamddn1b2xgds473pv6y13gizdbqjv4i5p3.nar.xz
+Compression: xz
+FileHash: sha256:09ymwqf5i9q7d4dm7x4pjjcqqj0qrcp5lnznbh42gfsci5hcbqqm
+FileSize: 4029176
+NarSize: 34878
+References: g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar n5wkd9frr45pa74if5gpz9j7mifg27fh-foo

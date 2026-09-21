@@ -2,7 +2,11 @@
 ///@file
 
 #include "nix/util/serialise.hh"
+#include "nix/util/object-hash.hh"
 
+#include <functional>
+#include <optional>
+#include <utility>
 #include <variant>
 
 namespace nix {
@@ -16,6 +20,7 @@ struct ContentAddress;
 struct DrvOutput;
 struct Realisation;
 struct Signature;
+struct UnkeyedValidPathInfo;
 enum struct BuildResultSuccessStatus : uint8_t;
 enum struct BuildResultFailureStatus : uint8_t;
 
@@ -58,6 +63,30 @@ struct CommonProto
     {
         CommonProto::Serialise<T>::write(store, conn, t);
     }
+
+    /**
+     * The hash slot of a path info, shared by the worker and serve
+     * protocols.  In the object-hash form (worker `featureObjectHash`,
+     * serve >= 2.9) it is two strings, the rendered object hash and the
+     * NAR hash, either empty for absent; in the old form one string, the
+     * NAR hash the sender asserts, empty for absent.  The NAR hash's text
+     * differs between the protocols (and, in serve, between operations),
+     * so its parse and render are the caller's.
+     */
+    static std::pair<std::optional<ObjectHash>, std::optional<Hash>> readPathInfoHashes(
+        Source & from, bool objectHashForm, const std::function<Hash(const std::string &)> & parseNarHash);
+
+    /**
+     * In the old form the slot is `assertedNarHash`, else `lazyNarHash`
+     * forced here -- the one place a peer's version costs anything.
+     *
+     * @throws Error in the old form when the info has neither.
+     */
+    static void writePathInfoHashes(
+        Sink & to,
+        bool objectHashForm,
+        const UnkeyedValidPathInfo & info,
+        const std::function<std::string(const Hash &)> & renderNarHash);
 };
 
 #define DECLARE_COMMON_SERIALISER(T)                                                                 \

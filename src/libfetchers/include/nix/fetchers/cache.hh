@@ -4,6 +4,9 @@
 #include "nix/fetchers/fetchers.hh"
 #include "nix/store/path.hh"
 
+#include <utility>
+#include <vector>
+
 namespace nix::fetchers {
 
 /**
@@ -34,6 +37,17 @@ public:
      * Add a key/value pair to the cache.
      */
     virtual void upsert(const Key & key, const Attrs & value) = 0;
+
+    /**
+     * The same for many pairs at once, as one commit rather than one per
+     * pair.  The rows a walk writes are a memo (`01` section 9.9): each is
+     * worth only the work a later walk would repeat without it, so a batch
+     * that is lost -- by a crash before it is handed over, or by the
+     * rollback of a batch a later pair in it fails -- costs nothing but
+     * that work.  What it buys is measured in `05` section 6: the memo's
+     * per-row commit was 15 syscalls a file of the 38 a first entry paid.
+     */
+    virtual void upsert(const std::vector<std::pair<Key, Attrs>> & rows);
 
     /**
      * Look up a key with infinite TTL.

@@ -96,21 +96,14 @@ struct CmdVerify : StorePathsCommand
                 Activity act2(*logger, lvlInfo, actUnknown, fmt("checking '%s'", store->printStorePath(info->path)));
 
                 if (!noContents) {
-
-                    auto hashSink = HashSink(info->narHash.algo);
-
-                    store->narFromPath(info->path, hashSink);
-
-                    auto hash = hashSink.finish();
-
-                    if (hash.hash != info->narHash) {
+                    if (auto mismatch = store->contentMismatch(*info)) {
                         corrupted++;
                         act2.result(resCorruptedPath, store->printStorePath(info->path));
                         printError(
                             "path '%s' was modified! expected hash '%s', got '%s'",
                             store->printStorePath(info->path),
-                            info->narHash.to_string(HashFormat::Nix32, true),
-                            hash.hash.to_string(HashFormat::Nix32, true));
+                            mismatch->first,
+                            mismatch->second);
                     }
                 }
 
@@ -123,16 +116,35 @@ struct CmdVerify : StorePathsCommand
 
                     else {
 
-                        std::set<Signature> sigsSeen;
+                        /* `validSigs` counts distinct keys, not signatures:
+                           one key may have signed both fingerprint versions
+                           (`nix store sign` does), and `--sigs-needed` asks
+                           for keys. */
+                        std::set<std::string> keysGood; /* the form `checkSignatures` uses too */
                         size_t actualSigsNeeded = std::max(sigsNeeded, (size_t) 1);
                         size_t validSigs = 0;
 
+                        /* A version-1 signature on a description that
+                           asserts no NAR hash (a locally held path whose
+                           row holds the object hash alone) is verified
+                           against one walk of the path, made at most once
+                           per path and only when such a signature by a
+                           trusted key is met (`checkSignature`). */
+                        std::optional<Hash> walkedNarHash;
+                        UnkeyedValidPathInfo::NarHashThunk narHashOnce{[&]() -> Hash {
+                            if (!walkedNarHash)
+                                walkedNarHash = narHashOf(*store, info->path);
+                            return *walkedNarHash;
+                        }};
+
                         auto doSigs = [&](std::set<Signature> sigs) {
                             for (const auto & sig : sigs) {
-                                if (!sigsSeen.insert(sig).second)
+                                if (validSigs >= ValidPathInfo::maxSigs || keysGood.count(sig.keyName))
                                     continue;
-                                if (validSigs < ValidPathInfo::maxSigs && info->checkSignature(*store, publicKeys, sig))
+                                if (info->checkSignature(*store, publicKeys, sig, narHashOnce)) {
+                                    keysGood.insert(sig.keyName);
                                     validSigs++;
+                                }
                             }
                         };
 

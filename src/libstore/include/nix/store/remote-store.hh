@@ -1,6 +1,7 @@
 #pragma once
 ///@file
 
+#include <atomic>
 #include <limits>
 #include <set>
 #include <string>

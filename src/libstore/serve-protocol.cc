@@ -112,9 +112,9 @@ void ServeProto::Serialise<BuildResult>::write(
 
 UnkeyedValidPathInfo ServeProto::Serialise<UnkeyedValidPathInfo>::read(const StoreDirConfig & store, ReadConn conn)
 {
-    /* Hash should be set below unless very old `nix-store --serve`.
-       Caller should assert that it did set it. */
-    UnkeyedValidPathInfo info{store, Hash::dummy};
+    /* A hash should be set below unless very old `nix-store --serve`.
+       Caller should assert that one was. */
+    UnkeyedValidPathInfo info{store, std::nullopt};
 
     auto deriver = readString(conn.from);
     if (deriver != "")
@@ -125,9 +125,12 @@ UnkeyedValidPathInfo ServeProto::Serialise<UnkeyedValidPathInfo>::read(const Sto
     info.narSize = readLongLong(conn.from);
 
     if (conn.version >= ServeProto::Version{2, 4}) {
-        auto s = readString(conn.from);
-        if (!s.empty())
-            info.narHash = Hash::parseAnyPrefixed(s);
+        auto [objectHash, assertedNarHash] = CommonProto::readPathInfoHashes(
+            conn.from, conn.version >= ServeProto::objectHashSince, [](const std::string & s) {
+                return Hash::parseAnyPrefixed(s);
+            });
+        info.objectHash = std::move(objectHash);
+        info.assertedNarHash = std::move(assertedNarHash);
         info.ca = ContentAddress::parseOpt(readString(conn.from));
         info.sigs = ServeProto::Serialise<std::set<Signature>>::read(store, conn);
     }
@@ -145,7 +148,11 @@ void ServeProto::Serialise<UnkeyedValidPathInfo>::write(
     conn.to << info.narSize // downloadSize, lie a little
             << info.narSize;
     if (conn.version >= ServeProto::Version{2, 4}) {
-        conn.to << info.narHash.to_string(HashFormat::Nix32, true) << renderContentAddress(info.ca);
+        CommonProto::writePathInfoHashes(
+            conn.to, conn.version >= ServeProto::objectHashSince, info, [](const Hash & h) {
+                return h.to_string(HashFormat::Nix32, true);
+            });
+        conn.to << renderContentAddress(info.ca);
         ServeProto::write(store, conn, info.sigs);
     }
 }

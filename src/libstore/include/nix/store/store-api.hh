@@ -15,8 +15,10 @@
 #include "nix/store/store-dir-config.hh"
 #include "nix/store/store-reference.hh"
 #include "nix/util/source-path.hh"
+#include "nix/util/fun.hh"
 
 #include <nlohmann/json_fwd.hpp>
+#include <array>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -58,6 +60,36 @@ enum CheckSigsFlag : bool { NoCheckSigs = false, CheckSigs = true };
 enum SubstituteFlag : bool { NoSubstitute = false, Substitute = true };
 
 enum BuildMode : uint8_t { bmNormal, bmRepair, bmCheck };
+
+/**
+ * Every build mode, in the enumerators' order: the domain a check over the
+ * modes iterates (`05-validation.md` section 8, rule 1).
+ */
+inline constexpr std::array<BuildMode, 3> buildModes{bmNormal, bmRepair, bmCheck};
+
+/**
+ * The repair flag the after-build walk enters an output under (01 §9.11,
+ * "The names the hash is over"; `LocalStore::enterPath`): under `--repair`
+ * the walk checks every blob's bytes, so a corrupt blob the store holds is
+ * not linked over the fresh output; the other modes trust the store's
+ * blobs.  `--check` does not enter its output at all -- it is hashed where
+ * it stands and not registered -- and so has no flag of its own; the value
+ * here is what it would enter under.
+ *
+ * A `switch` without a `default`, so that a mode added to `BuildMode`
+ * does not compile until it says which flag it enters under.
+ */
+inline RepairFlag enterRepairFlagOf(BuildMode buildMode)
+{
+    switch (buildMode) {
+    case bmRepair:
+        return Repair;
+    case bmNormal:
+    case bmCheck:
+        return NoRepair;
+    }
+    unreachable();
+}
 
 enum TrustedFlag : bool { NotTrusted = false, Trusted = true };
 
@@ -447,6 +479,8 @@ protected:
 
     void invalidatePathInfoCacheFor(const StorePath & path);
 
+protected:
+
     // Note: this is a `shared_ptr` to avoid false sharing with immutable
     // bits of `Store`.
     std::shared_ptr<SharedSync<LRUCache<StorePath, PathInfoCacheValue>>> pathInfoCache;
@@ -769,6 +803,17 @@ public:
     virtual void narFromPath(const StorePath & path, Sink & sink);
 
     /**
+     * Recompute the content hash of `info.path` as stored and compare it
+     * with the hash `info` carries: the object hash when present, else
+     * the asserted NAR hash (a substituter's description).
+     *
+     * @return The expected and the recomputed renderings when they
+     * differ; nullopt when the content matches.
+     * @throws Error if `info` carries neither hash.
+     */
+    std::optional<std::pair<std::string, std::string>> contentMismatch(const ValidPathInfo & info);
+
+    /**
      * Add a store path as a temporary root of the garbage collector.
      * The root disappears as soon as we exit.
      * Before exiting, if you want to avoid the path being GC'ed, you either have to make it a permanent root using
@@ -875,6 +920,16 @@ public:
     }
 
     /**
+     * The object hash of the valid path `path`: the one its description
+     * carries, else -- for a peer that describes paths by their NAR hash
+     * alone -- computed by one walk of the object, which for a
+     * remote store reads its whole NAR.
+     *
+     * @throws InvalidPath if the path is not valid.
+     */
+    ObjectHash queryObjectHash(const StorePath & path);
+
+    /**
      * Add signatures to the specified store path. The signatures are
      * not verified.
      */
@@ -955,6 +1010,15 @@ public:
     virtual StorePaths topoSortPaths(const StorePathSet & paths);
 
     /**
+     * `topoSortPaths` under a caller-supplied references function (a
+     * path's references; empty for a path that is not valid), with the
+     * same cycle report.  `topoSortPaths` is this over `queryPathInfo`;
+     * the collector sorts its dead set by a read of the rows that does
+     * not migrate them (`LocalStore::collectGarbage`).
+     */
+    StorePaths topoSortPathsBy(const StorePathSet & paths, fun<StorePathSet(const StorePath &)> getReferences);
+
+    /**
      * Computes the full closure of of a set of store-paths for e.g.
      * derivations that need this information for `exportReferencesGraph`.
      */
@@ -1026,6 +1090,15 @@ protected:
         throw Unsupported("operation '%s' is not supported by store '%s'", op, config.getHumanReadableURI());
     }
 };
+
+/**
+ * The shim of `doc/lazy-store/01-specification.md` section 9.11: the NAR
+ * hash of a store object, by one walk -- `narFromPath` into a SHA-256
+ * `HashSink`.  For the old forms only (a peer without the object-hash
+ * feature, path-info JSON before version 4, `--dump-db`); never the name
+ * of anything new.
+ */
+Hash narHashOf(Store & store, const StorePath & path);
 
 /**
  * Copy a path from one store to another.

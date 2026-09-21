@@ -1,4 +1,5 @@
 #include "nix/fetchers/tarball.hh"
+#include "nix/util/merkle-hash.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/cache.hh"
 #include "nix/store/filetransfer.hh"
@@ -74,6 +75,7 @@ DownloadFileResult downloadFile(
         StringSink sink;
         dumpString(res.data, sink);
         auto hash = hashString(HashAlgorithm::SHA256, res.data);
+        /* A plain file's object hash is its blob id. */
         auto info = ValidPathInfo::makeFromCA(
             store,
             name,
@@ -82,8 +84,9 @@ DownloadFileResult downloadFile(
                 .hash = hash,
                 .references = {},
             },
-            hashString(HashAlgorithm::SHA256, sink.s));
+            ObjectHash{.hash = merkle::blobId(res.data)});
         info.narSize = sink.s.size();
+        info.lazyNarHash = [&nar = sink.s] { return hashString(HashAlgorithm::SHA256, nar); };
         auto source = StringSource{sink.s};
         store.addToStore(info, source, NoRepair, NoCheckSigs);
         storePath = std::move(info.path);
@@ -138,8 +141,17 @@ static DownloadTarballResult downloadTarball_(
 
     auto cached = settings.getCache()->lookupExpired(cacheKey);
 
+    /* The tree identifier, SHA-256 since the cache became one (v3); a row
+       of the SHA-1 cache reads as absent. */
+    auto treeHashAttr = [&](const Attrs & attrs) -> std::optional<Hash> {
+        auto s = getStrAttr(attrs, "treeHash");
+        if (s.size() != 2 * regularHashSize(HashAlgorithm::SHA256))
+            return std::nullopt;
+        return Hash::parseNonSRIUnprefixed(s, HashAlgorithm::SHA256);
+    };
+
     auto attrsToResult = [&](const Attrs & infoAttrs) {
-        auto treeHash = getRevAttr(infoAttrs, "treeHash");
+        auto treeHash = *treeHashAttr(infoAttrs);
         return DownloadTarballResult{
             .treeHash = treeHash,
             .lastModified = (time_t) getIntAttr(infoAttrs, "lastModified"),
@@ -148,8 +160,11 @@ static DownloadTarballResult downloadTarball_(
         };
     };
 
-    if (cached && !settings.getTarballCache()->hasObject(getRevAttr(cached->value, "treeHash")))
-        cached.reset();
+    if (cached) {
+        auto treeHash = treeHashAttr(cached->value);
+        if (!treeHash || !settings.getTarballCache()->hasObject(*treeHash))
+            cached.reset();
+    }
 
     if (cached && !cached->expired)
         /* We previously downloaded this tarball and it's younger than
@@ -267,9 +282,11 @@ struct CurlInputScheme : InputScheme
 
         url.scheme = parseUrlScheme(url.scheme).transport;
 
-        auto narHash = url.query.find("narHash");
-        if (narHash != url.query.end())
-            input.attrs.insert_or_assign("narHash", narHash->second);
+        if (auto i = get(url.query, "treeHash"))
+            input.attrs.insert_or_assign("treeHash", *i);
+
+        if (auto i = get(url.query, "narHash"))
+            input.attrs.insert_or_assign("narHash", *i);
 
         if (auto i = get(url.query, "rev"))
             input.attrs.insert_or_assign("rev", *i);
@@ -342,10 +359,6 @@ struct CurlInputScheme : InputScheme
                 },
             },
             {
-                "narHash",
-                {},
-            },
-            {
                 "name",
                 {},
             },
@@ -369,7 +382,7 @@ struct CurlInputScheme : InputScheme
         return attrs;
     }
 
-    const std::map<std::string, AttributeInfo> & allowedAttrs() const override
+    const std::map<std::string, AttributeInfo> & schemeAttrs() const override
     {
         return allowedAttrsImpl();
     }
@@ -386,8 +399,11 @@ struct CurlInputScheme : InputScheme
     ParsedURL toURL(const Input & input) const override
     {
         auto url = parseURL(getStrAttr(input.attrs, "url"));
-        // NAR hashes are preferred over file hashes since tar/zip
-        // files don't have a canonical representation.
+        // Tree hashes are preferred over file hashes since tar/zip
+        // files don't have a canonical representation.  A NAR hash is
+        // an old assertion, emitted only when the input carries one.
+        if (auto treeHash = input.getTreeHash())
+            url.query.insert_or_assign("treeHash", treeHash->to_string(HashFormat::SRI, true));
         if (auto narHash = input.getNarHash())
             url.query.insert_or_assign("narHash", narHash->to_string(HashFormat::SRI, true));
         return url;
@@ -395,7 +411,7 @@ struct CurlInputScheme : InputScheme
 
     bool isLocked(const Settings & settings, const Input & input) const override
     {
-        return (bool) input.getNarHash();
+        return input.getTreeHash() || input.getNarHash();
     }
 };
 
@@ -433,8 +449,12 @@ struct FileInputScheme : CurlInputScheme
            tarballs. */
         auto file = downloadFile(store, settings, getStrAttr(input.attrs, "url"), input.getName());
 
-        auto narHash = store.queryPathInfo(file.storePath)->narHash;
-        input.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
+        /* Named by the object hash of the flat file, which the store holds
+           (the file may have come from the download cache, so the hash is
+           not otherwise known here; a daemon without the object hash gets
+           it computed by one walk, `Store::queryObjectHash`). */
+        input.attrs.insert_or_assign(
+            "treeHash", store.queryObjectHash(file.storePath).hash.to_string(HashFormat::SRI, true));
 
         auto accessor = ref{store.getFSAccessor(file.storePath)};
 
@@ -459,7 +479,7 @@ struct TarballInputScheme : CurlInputScheme
         )");
     }
 
-    const std::map<std::string, AttributeInfo> & allowedAttrs() const override
+    const std::map<std::string, AttributeInfo> & schemeAttrs() const override
     {
         static const std::map<std::string, AttributeInfo> attrs = [] {
             auto attrs = CurlInputScheme::allowedAttrsImpl();
@@ -507,16 +527,21 @@ struct TarballInputScheme : CurlInputScheme
         if (result.lastModified && !input.attrs.contains("lastModified"))
             input.attrs.insert_or_assign("lastModified", uint64_t(result.lastModified));
 
-        input.attrs.insert_or_assign(
-            "narHash",
-            settings.getTarballCache()->treeHashToNarHash(settings, result.treeHash).to_string(HashFormat::SRI, true));
+        /* Named by the cache's tree hash, SHA-256 since the cache became
+           one (v3); no NAR walk. */
+        if (result.treeHash.algo != HashAlgorithm::SHA256)
+            throw Error(
+                "tree hash of tarball '%s' is %s, not SHA-256", input.to_string(), printHashAlgo(result.treeHash.algo));
+        input.attrs.insert_or_assign("treeHash", result.treeHash.to_string(HashFormat::SRI, true));
 
         return {result.accessor, input};
     }
 
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override
     {
-        if (auto narHash = input.getNarHash())
+        if (auto treeHash = input.getTreeHash())
+            return treeHash->to_string(HashFormat::SRI, true);
+        else if (auto narHash = input.getNarHash())
             return narHash->to_string(HashFormat::SRI, true);
         else if (auto rev = input.getRev())
             return rev->gitRev();

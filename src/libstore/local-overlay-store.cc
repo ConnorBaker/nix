@@ -2,6 +2,7 @@
 
 #include "nix/store/local-overlay-store.hh"
 #include "nix/util/callback.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/os-string.hh"
 #include "nix/store/realisation.hh"
 #include "nix/util/processes.hh"
@@ -103,7 +104,9 @@ void LocalOverlayStore::queryPathInfoUncached(
             } catch (...) {
                 return callbackPtr->rethrow();
             }
-            // If we don't have it, check lower store
+            // If we don't have it, check lower store.  Its info arrives with
+            // its object hash: the lower store migrates an old row on read,
+            // in memory when it is read-only.
             lowerStore->queryPathInfo(path, {[path, callbackPtr](std::future<ref<const ValidPathInfo>> fut) {
                                           try {
                                               (*callbackPtr)(fut.get().get_ptr());
@@ -140,6 +143,26 @@ void LocalOverlayStore::queryRealisationUncached(
         }});
 }
 
+/**
+ * The lower store's description of `path` with its object hash, as
+ * `registerValidPath` requires.  A local lower store has it (migrated on
+ * read); a lower store that is a daemon without
+ * `WorkerProto::featureObjectHash` describes the path by its NAR hash
+ * alone, so the object hash is computed by a walk of its object then.
+ */
+static ValidPathInfo lowerPathInfo(Store & lower, const StorePath & path)
+{
+    auto info = lower.queryPathInfo(path);
+    if (info->objectHash)
+        return *info;
+    ValidPathInfo res{*info};
+    auto object = objectHashOf(*lower.requireStoreObjectAccessor(path), CanonPath::root);
+    res.objectHash = ObjectHash::of(object.root);
+    if (!res.narSize)
+        res.narSize = object.narSize;
+    return res;
+}
+
 bool LocalOverlayStore::isValidPathUncached(const StorePath & path)
 {
     auto res = LocalStore::isValidPathUncached(path);
@@ -148,12 +171,12 @@ bool LocalOverlayStore::isValidPathUncached(const StorePath & path)
     res = lowerStore->isValidPath(path);
     if (res) {
         // Get path info from lower store so upper DB genuinely has it.
-        auto p = lowerStore->queryPathInfo(path);
+        auto p = lowerPathInfo(*lowerStore, path);
         // recur on references, syncing entire closure.
-        for (auto & r : p->references)
+        for (auto & r : p.references)
             if (r != path)
                 isValidPath(r);
-        LocalStore::registerValidPath(*p);
+        LocalStore::registerValidPath(p);
     }
     return res;
 }
@@ -197,7 +220,7 @@ void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos)
         auto pathsInLower = lowerStore->queryValidPaths(notInUpper);
         ValidPathInfos inLower;
         for (auto & p : pathsInLower)
-            inLower.insert_or_assign(p, *lowerStore->queryPathInfo(p));
+            inLower.insert_or_assign(p, lowerPathInfo(*lowerStore, p));
         LocalStore::registerValidPaths(inLower);
     }
     // Then do original request
@@ -209,6 +232,52 @@ void LocalOverlayStore::collectGarbage(const GCOptions & options, GCResults & re
     LocalStore::collectGarbage(options, results);
 
     remountIfNecessary();
+}
+
+void LocalOverlayStore::sweepObjectStore()
+{
+    /* The objects this store owns are the upper layer's: `.objects` under
+       the merged store directory is the union of the two layers', and
+       every object this store writes lands in the upper one (the one
+       route's `putTree`, `putBlob` and `place`/`link` all go through the
+       merged directory).  A blob of the lower store's that an ingestion
+       here hard-linked was copied up by overlayfs -- a link never crosses
+       layers -- so the upper layer also holds copies of lower blobs; each
+       carries the link of the store path that caused it while that path
+       lives, and the sweep takes it when it does not.
+
+       The upper layer is read directly, not through the mount, so the
+       lower store's objects are neither enumerated nor judged.  The trees
+       are read through the mount, which is what this store reads to
+       materialise and verify: a tree the lower store holds keeps every
+       blob it names, whichever layer that blob's file is in. */
+    auto upperObjects = config->upperLayer.get() / ".objects";
+    auto lowerObjects = lowerStore->config.realStoreDir.get() / ".objects";
+
+    GitObjectStore::Owned owned{
+        .dir = upperObjects,
+        .remove =
+            [&](const std::filesystem::path & file) {
+                auto rel = std::filesystem::relative(file, upperObjects);
+                if (pathExists(lowerObjects / rel)) {
+                    /* The lower store has a file of that name as well: an
+                       unlink through the mount would be a whiteout of it,
+                       so the upper layer's file goes directly and the mount
+                       is left to be remounted -- `deleteStorePath`'s rule
+                       for a store path in both layers, object file for
+                       object file. */
+                    unlinkIfExists(file);
+                    _remountRequired = true;
+                } else
+                    /* Only the upper layer has it: the unlink through the
+                       mount leaves no whiteout, there being no lower entry
+                       of that name to hide, and needs no remount. */
+                    unlinkIfExists(objects.dir / rel);
+            },
+    };
+
+    reportSweep(objects.sweep(
+        [&](fun<void(const ObjectHash &)> live) { return forEachValidObjectHash(std::move(live)); }, &owned));
 }
 
 void LocalOverlayStore::deleteStorePath(const std::filesystem::path & path, uint64_t & bytesFreed, bool isKnownPath)

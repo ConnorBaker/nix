@@ -44,63 +44,42 @@ nix_err nix_libexpr_init(nix_c_context * context)
 nix_err nix_expr_eval_from_string(
     nix_c_context * context, EvalState * state, const char * expr, const char * path, nix_value * value)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
+    return nix_c_boundary(context, state, [&] {
         nix::Expr * parsedExpr = state->state.parseExprFromString(expr, state->state.rootPath(nix::CanonPath(path)));
         state->state.eval(parsedExpr, *value->value);
         state->state.forceValue(*value->value, nix::noPos);
-    }
-    NIXC_CATCH_ERRS
+    });
 }
 
 nix_err nix_value_call(nix_c_context * context, EvalState * state, Value * fn, nix_value * arg, nix_value * value)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
+    return nix_c_boundary(context, state, [&] {
         state->state.callFunction(*fn->value, *arg->value, *value->value, nix::noPos);
         state->state.forceValue(*value->value, nix::noPos);
-    }
-    NIXC_CATCH_ERRS
+    });
 }
 
 nix_err nix_value_call_multi(
     nix_c_context * context, EvalState * state, nix_value * fn, size_t nargs, nix_value ** args, nix_value * value)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-
-    std::vector<nix::Value *> internal_args;
-    internal_args.reserve(nargs);
-    for (size_t i = 0; i < nargs; i++)
-        internal_args.push_back(args[i]->value);
-
-    try {
+    return nix_c_boundary(context, state, [&] {
+        std::vector<nix::Value *> internal_args;
+        internal_args.reserve(nargs);
+        for (size_t i = 0; i < nargs; i++)
+            internal_args.push_back(args[i]->value);
         state->state.callFunction(*fn->value, {internal_args.data(), nargs}, *value->value, nix::noPos);
         state->state.forceValue(*value->value, nix::noPos);
-    }
-    NIXC_CATCH_ERRS
+    });
 }
 
 nix_err nix_value_force(nix_c_context * context, EvalState * state, nix_value * value)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        state->state.forceValue(*value->value, nix::noPos);
-    }
-    NIXC_CATCH_ERRS
+    return nix_c_boundary(context, state, [&] { state->state.forceValue(*value->value, nix::noPos); });
 }
 
 nix_err nix_value_force_deep(nix_c_context * context, EvalState * state, nix_value * value)
 {
-    if (context)
-        context->last_err_code = NIX_OK;
-    try {
-        state->state.forceValueDeep(*value->value);
-    }
-    NIXC_CATCH_ERRS
+    return nix_c_boundary(context, state, [&] { state->state.forceValueDeep(*value->value); });
 }
 
 nix_eval_state_builder * nix_eval_state_builder_new(nix_c_context * context, Store * store)

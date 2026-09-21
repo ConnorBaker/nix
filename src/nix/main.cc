@@ -290,10 +290,10 @@ static void showHelp(std::vector<std::string> subcommand, NixArgs & toplevel)
     if (!attr)
         throw UsageError("Nix has no subcommand '%s'", concatStringsSep("", subcommand));
 
-    auto markdown = state.forceString(*attr->value, noPos, "while evaluating the lowdown help text");
+    auto markdown = state.realise(*attr->value, noPos, "while evaluating the lowdown help text");
 
     RunPager pager;
-    std::cout << renderMarkdownToTerminal(markdown) << "\n";
+    std::cout << renderMarkdownToTerminal(markdown.view()) << "\n";
 }
 
 static NixArgs & getNixArgs(Command & cmd)
@@ -399,6 +399,13 @@ void mainWrapped(int argc, char ** argv)
             "__build-remote",
         });
 
+    /* The build hook's child re-reads the configuration its parent read
+       and diagnosed; a removed setting is the parent's to warn about
+       (`Settings::configurationDiagnosedByParent`). */
+    bool buildRemote = argc > 1 && std::string_view(argv[1]) == "__build-remote";
+    if (buildRemote)
+        settings.configurationDiagnosedByParent = true;
+
     initNix();
     initGC();
     flakeSettings.configureEvalSettings(evalSettings);
@@ -415,7 +422,7 @@ void mainWrapped(int argc, char ** argv)
     if (extensionPos != std::string::npos)
         programName.erase(extensionPos);
 
-    if (argc > 1 && std::string_view(argv[1]) == "__build-remote") {
+    if (buildRemote) {
         programName = "build-remote";
         argv++;
         argc--;

@@ -167,7 +167,7 @@ PackageInfo::Outputs PackageInfo::queryOutputs(bool withPaths, bool onlyOutputsT
         for (auto elem : outTI->listView()) {
             if (elem->type() != nString)
                 throw std::move(errMsg);
-            auto out = outputs.find(elem->string_view());
+            auto out = outputs.find(state->forceString(*elem, noPos, "while evaluating an output name"));
             if (out == outputs.end())
                 throw std::move(errMsg);
             result.insert(*out);
@@ -246,7 +246,8 @@ std::string PackageInfo::queryMetaString(const std::string & name)
     Value * v = queryMeta(name);
     if (!v || v->type() != nString)
         return "";
-    return std::string{v->string_view()};
+    /* Text handed to a command: a door. */
+    return state->realise(*v).toOwned();
 }
 
 NixInt PackageInfo::queryMetaInt(const std::string & name, NixInt def)
@@ -259,7 +260,7 @@ NixInt PackageInfo::queryMetaInt(const std::string & name, NixInt def)
     if (v->type() == nString) {
         /* Backwards compatibility with before we had support for
            integer meta fields. */
-        if (auto n = string2Int<NixInt::Inner>(v->string_view()))
+        if (auto n = string2Int<NixInt::Inner>(state->forceString(*v, noPos, "while evaluating a meta attribute")))
             return NixInt{*n};
     }
     return def;
@@ -275,7 +276,7 @@ NixFloat PackageInfo::queryMetaFloat(const std::string & name, NixFloat def)
     if (v->type() == nString) {
         /* Backwards compatibility with before we had support for
            float meta fields. */
-        if (auto n = string2Float<NixFloat>(v->string_view()))
+        if (auto n = string2Float<NixFloat>(state->forceString(*v, noPos, "while evaluating a meta attribute")))
             return *n;
     }
     return def;
@@ -291,9 +292,10 @@ bool PackageInfo::queryMetaBool(const std::string & name, bool def)
     if (v->type() == nString) {
         /* Backwards compatibility with before we had support for
            Boolean meta fields. */
-        if (v->string_view() == "true")
+        auto text = state->forceString(*v, noPos, "while evaluating a meta attribute");
+        if (text == "true")
             return true;
-        if (v->string_view() == "false")
+        if (text == "false")
             return false;
     }
     return def;

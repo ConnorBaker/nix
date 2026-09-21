@@ -1,4 +1,5 @@
 #include "nix/util/json-utils.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/cmd/command.hh"
 #include "nix/cmd/installable-flake.hh"
 #include "nix/main/common-args.hh"
@@ -258,6 +259,8 @@ struct ProfileManifest
         dumpPath(tempDir, sink);
 
         auto narHash = hashString(HashAlgorithm::SHA256, sink.s);
+        StringSource narSource{sink.s};
+        auto object = objectHashOfNar(narSource);
 
         auto info = ValidPathInfo::makeFromCA(
             *store,
@@ -272,8 +275,9 @@ struct ProfileManifest
                         .self = false,
                     },
             },
-            narHash);
+            ObjectHash::of(object.root));
         info.narSize = sink.s.size();
+        info.lazyNarHash = [narHash] { return narHash; };
 
         StringSource source(sink.s);
         store->addToStore(info, source);

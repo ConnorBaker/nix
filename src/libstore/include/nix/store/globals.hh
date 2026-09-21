@@ -208,6 +208,16 @@ public:
      */
     bool readOnlyMode = false;
 
+    /**
+     * This process is the build hook's child (`nix __build-remote`),
+     * which re-reads the configuration its parent has read and
+     * diagnosed.  Set by `main.cc` before the configuration is loaded;
+     * `RemovedSetting::assign` warns only when it is false, so a removed
+     * setting is reported once per top-level process (01 §10,
+     * *`auto-optimise-store` is accepted and ignored with one warning*).
+     */
+    bool configurationDiagnosedByParent = false;
+
     Setting<std::string> thisSystem{
         this,
         NIX_LOCAL_SYSTEM,

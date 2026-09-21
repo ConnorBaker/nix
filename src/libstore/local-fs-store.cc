@@ -106,6 +106,25 @@ public:
 
     DirEntries readDirectory(const CanonPath & path) override
     {
+        if (path.isRoot()) {
+            /* The store directory itself is a directory of store objects
+               (see `maybeLstat`), so its listing is the entries that are
+               store objects, valid ones if validity is required, and not
+               whatever else the directory holds (`.links`, temporary
+               directories).  Before this, listing the root threw. */
+            DirEntries res;
+            std::optional<StorePathSet> valid;
+            if (requireValidPath)
+                /* One query for the whole listing, not one per entry. */
+                valid = store->queryAllValidPaths();
+            for (auto & [name, type] : accessor->readDirectory(path)) {
+                auto storePath = maybeGetStoreObjectPath(CanonPath(name));
+                if (!storePath || (valid && !valid->contains(*storePath)))
+                    continue;
+                res.insert_or_assign(name, type);
+            }
+            return res;
+        }
         requireStoreObject(path);
         return accessor->readDirectory(path);
     }
@@ -114,6 +133,11 @@ public:
         const CanonPath & dirPath,
         std::function<void(SourceAccessor & subdirAccessor, const CanonPath & subdirRelPath)> callback) override
     {
+        if (dirPath.isRoot()) {
+            /* Traverse through this accessor, so that the root listing above applies. */
+            callback(*this, dirPath);
+            return;
+        }
         requireStoreObject(dirPath);
         return accessor->readDirectory(dirPath, std::move(callback));
     }

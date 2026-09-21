@@ -8,6 +8,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <tuple>
+
 namespace nix::fetchers {
 
 static const char * schema = R"sql(
@@ -46,11 +49,19 @@ struct CacheImpl : Cache
     {
         auto state(_state.lock());
 
-        auto dbPath = getCacheDir() / "fetcher-cache-v4.sqlite";
+        auto dbPath = getCacheDir() / "fetcher-cache-v5.sqlite";
         createDirs(dbPath.parent_path());
 
         state->db = SQLite(dbPath, {.useWAL = nix::settings.useSQLiteWAL});
         state->db.isCache();
+        /* Room to hold a naming walk's rows while it writes them.  The keys
+           are content addresses, so the probes and the inserts of one walk
+           are scattered over the whole of the walk's own part of the index;
+           under SQLite's default two megabytes a walk of a large tree reads
+           back and writes out the same pages many times over (`05` section
+           6 counts them).  A maximum, not a reservation: a process that
+           touches a handful of rows still holds a handful of pages. */
+        state->db.exec("pragma cache_size = -16000");
         state->db.exec(schema);
 
         state->upsert.create(
@@ -64,10 +75,39 @@ struct CacheImpl : Cache
         _state.lock()
             ->upsert.use()
             .apply(key.first)
-            .apply(attrsToJSON(key.second).dump())
-            .apply(attrsToJSON(value).dump())
+            .apply(encodeAttrs(key.second))
+            .apply(encodeAttrs(value))
             .apply(time(nullptr))
             .exec();
+    }
+
+    /* One transaction, so that the pages the rows share are written once at
+       its commit and not once per row; and the rows inserted **in key
+       order**, since the primary key is `(domain, key)` and a memo's keys
+       are content addresses, which arrive in no order at all.  Inserted as
+       they arrive, a batch walks the index at random and every leaf it
+       touches must stay dirty until the commit, so a batch larger than the
+       page cache spills its pages to the write-ahead log again and again;
+       in key order each leaf is filled and finished with.  `05` section 6
+       measures both.  The sort is stable, so a key that appears twice in a
+       batch is still last-one-wins. */
+    void upsert(const std::vector<std::pair<Key, Attrs>> & rows) override
+    {
+        if (rows.empty())
+            return;
+        std::vector<std::tuple<Domain, std::string, std::string>> encoded;
+        encoded.reserve(rows.size());
+        for (auto & [key, value] : rows)
+            encoded.emplace_back(key.first, encodeAttrs(key.second), encodeAttrs(value));
+        std::stable_sort(encoded.begin(), encoded.end(), [](auto & a, auto & b) {
+            return std::tie(std::get<0>(a), std::get<1>(a)) < std::tie(std::get<0>(b), std::get<1>(b));
+        });
+        auto state(_state.lock());
+        SQLiteTxn txn(state->db);
+        auto now = time(nullptr);
+        for (auto & [domain, key, value] : encoded)
+            state->upsert.use().apply(domain).apply(key).apply(value).apply(now).exec();
+        txn.commit();
     }
 
     std::optional<Attrs> lookup(const Key & key) override
@@ -91,22 +131,24 @@ struct CacheImpl : Cache
     {
         auto state(_state.lock());
 
-        auto keyJSON = attrsToJSON(key.second).dump();
-
-        auto stmt(state->lookup.use().apply(key.first).apply(keyJSON));
+        auto stmt(state->lookup.use().apply(key.first).apply(encodeAttrs(key.second)));
         if (!stmt.next()) {
-            debug("did not find cache entry for '%s:%s'", key.first, keyJSON);
+            /* `debug` evaluates its arguments only at that verbosity
+               (`printMsgUsing`, logging.hh), so the JSON rendering costs
+               a lookup nothing. */
+            debug("did not find cache entry for '%s:%s'", key.first, attrsToJSON(key.second).dump());
             return {};
         }
 
-        auto valueJSON = stmt.getStr(0);
+        auto value = decodeAttrs(stmt.getStr(0));
         auto timestamp = stmt.getInt(1);
 
-        debug("using cache entry '%s:%s' -> '%s'", key.first, keyJSON, valueJSON);
+        debug(
+            "using cache entry '%s:%s' -> '%s'", key.first, attrsToJSON(key.second).dump(), attrsToJSON(value).dump());
 
         return Result{
             .expired = settings.tarballTtl.get() == 0 || timestamp + settings.tarballTtl < time(nullptr),
-            .value = jsonToAttrs(nlohmann::json::parse(valueJSON)),
+            .value = std::move(value),
         };
     }
 
@@ -163,6 +205,12 @@ struct CacheImpl : Cache
 };
 
 void Cache::anchor() {}
+
+void Cache::upsert(const std::vector<std::pair<Key, Attrs>> & rows)
+{
+    for (auto & [key, value] : rows)
+        upsert(key, value);
+}
 
 void CacheImpl::anchor() {}
 

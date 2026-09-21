@@ -294,6 +294,7 @@ sources = files(
   'export-import.cc',
   'filetransfer.cc',
   'gc.cc',
+  'git-object-store.cc',
   'globals.cc',
   'http-binary-cache-store.cc',
   'indirect-root-store.cc',

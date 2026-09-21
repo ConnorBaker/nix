@@ -52,9 +52,9 @@ struct ContentAddressMethod
 
         /**
          * Calculate a store path using the `FileIngestionMethod::Git`
-         * hash of the file system objects, and references.
-         *
-         * Part of `ExperimentalFeature::GitHashing`.
+         * hash of the file system objects, and references.  SHA-256
+         * only (`checkIngestionAlgorithm`); the SHA-1 form an older Nix
+         * made is read, never created.
          *
          * See `store-object/content-address.md#method-git` in the
          * manual.

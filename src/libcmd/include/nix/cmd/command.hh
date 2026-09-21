@@ -112,6 +112,12 @@ struct EvalCommand : virtual StoreCommand, MixEvalArgs
 
     ~EvalCommand();
 
+    /**
+     * Runs the command, then writes whatever evaluation created and did not
+     * hand out, where a failure is still an error of the command.
+     */
+    void run(ref<StoreConfig>) override;
+
     ref<Store> getEvalStore();
 
     ref<EvalState> getEvalState();

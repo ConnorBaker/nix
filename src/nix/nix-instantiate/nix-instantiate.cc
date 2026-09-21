@@ -14,6 +14,7 @@
 #include "man-pages.hh"
 
 #include <iostream>
+#include <sstream>
 
 namespace nix {
 
@@ -53,28 +54,35 @@ void processExpr(
                 vRes = v;
             else
                 state.autoCallFunction(autoArgs, v, vRes);
-            if (output == okRaw)
-                std::cout << *state.coerceToString(noPos, vRes, context, "while generating the nix-instantiate output");
-            // We intentionally don't output a newline here. The default PS1 for Bash in NixOS starts with a newline
-            // and other interactive shells like Zsh are smart enough to print a missing newline before the prompt.
-            else if (output == okXML)
-                printValueAsXML(state, strict, location, vRes, std::cout, context, noPos);
-            else if (output == okJSON) {
-                printValueAsJSON(state, strict, vRes, v.determinePos(noPos), std::cout, context);
-                std::cout << std::endl;
+            /* In every mode the bytes leave through `emit`, which writes what
+               is pending and copies the inputs the value names before they
+               leave (specification, (C2)); with --read-write-mode there may
+               be something to copy. */
+            if (output == okRaw) {
+                auto string = state.coerceAndEmit(noPos, vRes, context, "while generating the nix-instantiate output");
+                // We intentionally don't output a newline here. The default PS1 for Bash in NixOS starts with a
+                // newline and other interactive shells like Zsh are smart enough to print a missing newline before
+                // the prompt.
+                std::cout << string;
+            } else if (output == okXML) {
+                std::cout << state.emit(renderValueAsXML(state, strict, location, vRes, context, noPos), context);
+            } else if (output == okJSON) {
+                std::cout << state.emit(renderValueAsJSON(state, strict, vRes, v.determinePos(noPos), context), context)
+                          << std::endl;
             } else {
                 if (strict)
                     state.forceValueDeep(vRes);
                 std::set<const void *> seen;
-                printAmbiguous(state, vRes, std::cout, &seen, &context);
-                std::cout << std::endl;
+                std::ostringstream out;
+                printAmbiguous(state, vRes, out, &seen, &context);
+                std::cout << state.emit(out.str(), context) << std::endl;
             }
         } else {
             PackageInfos drvs;
             getDerivations(state, v, "", autoArgs, drvs, false);
             for (auto & i : drvs) {
                 auto drvPath = i.requireDrvPath();
-                auto drvPathS = state.store->printStorePath(drvPath);
+                auto drvPathS = state.realise(drvPath).toOwned();
 
                 /* What output do we want? */
                 std::string outputName = i.queryOutputName();
@@ -95,7 +103,7 @@ void processExpr(
             }
         }
 
-        state.ensureLazyPathsCopied(context);
+        state.flushPendingWrites();
     }
 }
 

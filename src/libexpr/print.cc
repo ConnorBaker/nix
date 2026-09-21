@@ -250,14 +250,14 @@ private:
 
     void printString(Value & v)
     {
-        printLiteralString(output, v.string_view(), options.maxStringLength, options.ansiColors);
+        printLiteralString(output, state.realise(v, context).view(), options.maxStringLength, options.ansiColors);
     }
 
     void printPath(Value & v)
     {
         if (options.ansiColors)
             output << ANSI_GREEN;
-        output << v.path().to_string(); // !!! escaping?
+        output << state.realise(v.path().to_string()); // !!! escaping?
         if (options.ansiColors)
             output << ANSI_NORMAL;
     }
@@ -294,7 +294,7 @@ private:
             output << ANSI_GREEN;
         output << "«derivation";
         if (storePath) {
-            output << " " << state.store->printStorePath(*storePath);
+            output << " " << state.realise(*storePath);
         }
         output << "»";
         if (options.ansiColors)
@@ -539,7 +539,7 @@ private:
     {
         if (options.ansiColors)
             output << ANSI_RED;
-        output << "«error: " << filterANSIEscapes(e.info().msg.str(), true) << "»";
+        output << "«error: " << filterANSIEscapes(state.realise(e.info().msg.str()).toOwned(), true) << "»";
         if (options.ansiColors)
             output << ANSI_NORMAL;
     }
@@ -578,12 +578,9 @@ private:
                 printBool(v);
                 break;
 
-            case nString: {
+            case nString:
                 printString(v);
-                if (context)
-                    copyContext(v, *context);
                 break;
-            }
 
             case nPath:
                 printPath(v);

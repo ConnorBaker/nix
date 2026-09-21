@@ -28,18 +28,26 @@ This command verifies the integrity of the store paths [*installables*](./nix.md
 or, if `--all` is given, the entire Nix store. For each path, it
 checks that
 
-* its contents match the NAR hash recorded in the Nix database; and
+* its contents match the [object hash](@docroot@/store/file-system-object/content-address.md#git)
+  recorded for it (or, for a path described by an older binary cache
+  or peer that asserts only a [Nix Archive][] hash, that NAR hash); and
 
 * it is *trusted*, that is, it is signed by at least one trusted
   signing key, is content-addressed, or is built locally ("ultimately
-  trusted").
+  trusted"). A version-1 signature (over the NAR hash) is checked
+  against the NAR hash the path's description asserts or, for a
+  locally held path whose database row holds the object hash alone,
+  against one walk of the path, made at most once per path and only
+  for a signature by a trusted key; so the version-1 signatures a
+  `--substituter` from an older cache offers are usable, at the cost
+  of that walk.
 
 # Exit status
 
 The exit status of this command is the sum of the following values:
 
 * **1** if any path is corrupted (i.e. its contents don't match the
-  recorded NAR hash).
+  recorded hash).
 
 * **2** if any path is untrusted.
 

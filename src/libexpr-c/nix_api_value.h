@@ -300,6 +300,10 @@ bool nix_get_bool(nix_c_context * context, const nix_value * value);
  * @param[in] callback Called with the string value.
  * @param[in] user_data optional, arbitrary data, passed to the callback when it's called.
  * @return error code, NIX_OK on success.
+ *
+ * The value's evaluator must still be alive: a value handle is invalid after
+ * nix_state_free, since reading it may first write the store objects the text
+ * names.
  */
 nix_err
 nix_get_string(nix_c_context * context, const nix_value * value, nix_get_string_callback callback, void * user_data);
@@ -309,6 +313,10 @@ nix_get_string(nix_c_context * context, const nix_value * value, nix_get_string_
  * @param[out] context Optional, stores error information
  * @param[in] value Nix value to inspect
  * @return string valid while value is valid, NULL in case of error
+ *
+ * The value's evaluator must still be alive: a value handle is invalid after
+ * nix_state_free, since reading it may first write the store objects the text
+ * names.
  */
 const char * nix_get_path_string(nix_c_context * context, const nix_value * value);
 

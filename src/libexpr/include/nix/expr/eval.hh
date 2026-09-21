@@ -4,6 +4,8 @@
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-profiler.hh"
+#include "nix/expr/write-buffer.hh"
+#include "nix/expr/realised-string.hh"
 #include "nix/util/types.hh"
 #include "nix/expr/value.hh"
 #include "nix/expr/nixexpr.hh"
@@ -394,6 +396,27 @@ private:
     Statistics stats;
 };
 
+/**
+ * Exists only after some `EvalState::finish()` has returned -- its caches
+ * released and its pending store objects written -- because `finish` alone
+ * constructs one and it cannot be copied.  The exec helpers take one, so an
+ * exec compiles only after a finish; the type does not order evaluation
+ * between the two, so callers pass `finish()` inside the exec call itself.
+ */
+class FinishedEvaluation
+{
+    friend class EvalState;
+
+    FinishedEvaluation() = default;
+
+public:
+    /* User-provided, so the type is not trivially copyable and no cast
+       conjures one. */
+    FinishedEvaluation(FinishedEvaluation &&) noexcept {}
+
+    FinishedEvaluation(const FinishedEvaluation &) = delete;
+};
+
 class EvalState : public std::enable_shared_from_this<EvalState>
 {
 public:
@@ -446,6 +469,14 @@ public:
      * Store used to build stuff.
      */
     const ref<Store> buildStore;
+
+    /**
+     * Store objects created by evaluation and not yet written.  The evaluator
+     * always defers its store writes here and flushes them in batches; there
+     * is no eager alternative.  Written by `flushPendingWrites()`, which every
+     * operation that lets a store path leave the evaluator calls first.
+     */
+    WriteBuffer writeBuffer;
 
     const ref<fetchers::InputCache> inputCache;
 
@@ -618,8 +649,11 @@ public:
 
     /**
      * Mount an input on the Nix store.
+     *
+     * @param input The locked input `Input::getAccessor` returned with
+     * `accessor`: verified, carrying no `narHash`.  Its `treeHash` is set.
      */
-    StorePath mountInput(fetchers::Input & input, const fetchers::Input & originalInput, ref<SourceAccessor> accessor);
+    StorePath mountInput(fetchers::Input & input, ref<SourceAccessor> accessor);
 
     /**
      * Parse a Nix expression from the specified file.
@@ -820,6 +854,80 @@ public:
     void ensureLazyPathsCopied(const NixStringContext & context);
 
     /**
+     * Write every pending store object (see `writeBuffer`).  Called where a
+     * store path leaves the evaluator: coercion to a bare path or derived
+     * path, realisation of a context, context removal, the accessors below
+     * that produce bytes for output, the debugger, and teardown.
+     */
+    void flushPendingWrites();
+
+    /**
+     * The evaluator's last act before the process image is replaced: the
+     * eval caches are released, so that they persist, and every pending
+     * store object is written, loudly.  After a successful exec no
+     * destructor runs to do either, so the exec helpers (`src/nix/run.hh`)
+     * demand the result, which nothing else constructs.  Nothing may be
+     * evaluated afterwards.
+     */
+    [[nodiscard]] FinishedEvaluation finish();
+
+    /**
+     * A door: bytes leave the evaluator only through `realise` or `emit`
+     * (doc/lazy-store/01-specification.md, section 3); both write everything
+     * pending first, whatever the string's own context says (C2), and only
+     * `emit` copies mounted inputs (C1).  Neither builds (`realiseString`).
+     *
+     * @pre `v` is a string.  If `context` is given, the string's context is
+     * added to it.
+     */
+    [[nodiscard]] RealisedString realise(Value & v, NixStringContext * context = nullptr);
+
+    /**
+     * `forceString` and then `realise`: the value is forced, must be a string,
+     * and its text is let out.  Code outside the evaluator, which may not read
+     * bytes any other way, forces through these.
+     */
+    [[nodiscard]] RealisedString realise(Value & v, const PosIdx pos, std::string_view errorCtx);
+
+    /**
+     * `forceStringNoCtx` and then `realise`.
+     */
+    [[nodiscard]] RealisedString realiseNoCtx(Value & v, const PosIdx pos, std::string_view errorCtx);
+
+    /**
+     * Bytes rendered from values, for a diagnostic or a further rendering.
+     */
+    [[nodiscard]] RealisedString realise(std::string bytes);
+
+    /**
+     * The text of a store path that came from a value.
+     */
+    [[nodiscard]] RealisedString realise(const StorePath & path);
+
+    /**
+     * A string value leaving through a command's output: written, and the
+     * mounted inputs its provenance names copied.
+     */
+    [[nodiscard]] RealisedString emit(Value & v, NixStringContext * context = nullptr);
+
+    /**
+     * A rendered document leaving through a command's output, with the
+     * provenance accumulated while rendering it.
+     */
+    [[nodiscard]] RealisedString emit(std::string bytes, const NixStringContext & context);
+
+    /**
+     * `coerceToString` followed by `emit`.
+     */
+    [[nodiscard]] RealisedString coerceAndEmit(
+        const PosIdx pos,
+        Value & v,
+        NixStringContext & context,
+        std::string_view errorCtx,
+        bool coerceMore = false,
+        bool copyToStore = true);
+
+    /**
      * String coercion.
      *
      * Converts strings, paths and derivations to a
@@ -846,6 +954,21 @@ public:
      * path.  Nothing is copied to the store.
      */
     SourcePath coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx);
+
+    /**
+     * A dereference: `path` is about to be read.  If it names a pending
+     * object, everything pending is written first (the second write rule,
+     * 01 §10, *Two write rules*); for any other path nothing is, which keeps the
+     * batch intact across an evaluation's imports.  `coerceToPath` calls it.
+     */
+    void writePendingBeforeRead(const SourcePath & path);
+
+    /**
+     * The same rule for a store path about to be handed to a consumer that
+     * will dereference it: the builder, a root, `ensurePath`.  Written iff
+     * pending; the write is total once it happens.
+     */
+    void writePendingBeforeRead(const StorePath & path);
 
     /**
      * Like coerceToPath, but the result must be a store path.

@@ -73,10 +73,13 @@ std::string Hash::to_string(HashFormat hashFormat, bool includeAlgo) const
         s += hashFormat == HashFormat::SRI ? '-' : ':';
     }
     const auto bytes = std::as_bytes(std::span<const uint8_t>{&hash[0], hashSize});
+    /* Encoded into `s` itself: a hash is rendered per node of every walk that
+       names or enters a tree, and the string the encoder would return is one
+       allocation and one copy each time (`05` section 6). */
     switch (hashFormat) {
     case HashFormat::Base16:
         assert(hashSize);
-        s += base16::encode(bytes);
+        base16::encodeTo(s, bytes);
         break;
     case HashFormat::Nix32:
         assert(hashSize);
@@ -85,7 +88,7 @@ std::string Hash::to_string(HashFormat hashFormat, bool includeAlgo) const
     case HashFormat::Base64:
     case HashFormat::SRI:
         assert(hashSize);
-        s += base64::encode(bytes);
+        base64::encodeTo(s, bytes);
         break;
     }
     return s;

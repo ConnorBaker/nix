@@ -2,8 +2,9 @@
 #include "nix/store/build.hh"
 #include "nix/store/globals.hh"
 #include "nix/store/path-references.hh"
-#include "nix/util/git.hh"
 #include "nix/util/archive.hh"
+#include "nix/util/object-hash.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/store/pathlocks.hh"
 #include "nix/store/worker-protocol.hh"
 #include "nix/store/derivations.hh"
@@ -101,6 +102,18 @@ bool LocalStoreConfig::getDefaultRequireSigs()
     return settings.requireSigs;
 }
 
+/* The object store's index keys the blob by its identifier's 32 bytes, not by
+   the hexadecimal of them: half the key, so half the b-tree pages and half the
+   comparison work at a real store's size (`05` section 6). */
+static Hash blobIdOf(std::string_view bytes)
+{
+    Hash id(GitObjectStore::hashAlgo);
+    if (bytes.size() != id.hashSize)
+        throw Error("blob index row holds a %d-byte identifier, not %d", bytes.size(), id.hashSize);
+    memcpy(id.hash, bytes.data(), id.hashSize);
+    return id;
+}
+
 struct LocalStore::State::Stmts
 {
     /* Some precompiled SQLite statements. */
@@ -120,6 +133,17 @@ struct LocalStore::State::Stmts
     SQLiteStmt QueryRealisedOutput;
     SQLiteStmt QueryPathFromHashPart;
     SQLiteStmt QueryValidPaths;
+    SQLiteStmt QueryValidObjectHashes;
+    /* The blob index (`06-holder-index.md`). */
+    SQLiteStmt LookupBlob;
+    SQLiteStmt InsertBlob;
+    SQLiteStmt DeleteBlob;
+    SQLiteStmt QueryBlobInodes;
+    SQLiteStmt NewIngestion;
+    SQLiteStmt SetIngestionPath;
+    SQLiteStmt QueryStaleIngestions;
+    SQLiteStmt DeleteBlobsOf;
+    SQLiteStmt DeleteIngestion;
 };
 
 LocalStore::LocalStore(ref<const Config> config)
@@ -128,7 +152,7 @@ LocalStore::LocalStore(ref<const Config> config)
     , config{config}
     , _state(make_ref<Sync<State>>())
     , dbDir(config->stateDir.get() / "db")
-    , linksDir(config->realStoreDir.get() / ".links")
+    , objects(config->realStoreDir.get() / ".objects", config->getLocalSettings().fsyncStorePaths.get())
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
@@ -143,8 +167,10 @@ LocalStore::LocalStore(ref<const Config> config)
         experimentalFeatureSettings.require(Xp::ReadOnlyLocalStore);
     } else {
         makeStoreWritable();
+        /* The object store is the store's representation: every path added
+           is entered, so its directories exist from the start. */
+        objects.createDirectories();
     }
-    createDirs(linksDir);
     auto profilesDir = config->stateDir.get() / "profiles";
     createDirs(profilesDir);
     createDirs(tempRootsDir);
@@ -259,7 +285,9 @@ LocalStore::LocalStore(ref<const Config> config)
     /* Check the current database schema and if necessary do an
        upgrade.  */
     int curSchema = getSchema();
-    if (config->readOnly && curSchema < nixSchemaVersion) {
+    /* A schema-10 store is readable as it is (`nixSchemaVersion`). */
+    const int oldestReadOnlySchema = 10;
+    if (config->readOnly && curSchema < oldestReadOnlySchema) {
         debug("current schema version: %d", curSchema);
         debug("supported schema version: %d", nixSchemaVersion);
         throw Error(
@@ -287,7 +315,7 @@ LocalStore::LocalStore(ref<const Config> config)
         writeFile(schemaPath, fmt("%1%", curSchema), 0666, FsSync::Yes);
     }
 
-    else if (curSchema < nixSchemaVersion) {
+    else if (curSchema < nixSchemaVersion && !config->readOnly) {
         if (curSchema < 5)
             throw Error(
                 "Your Nix store has a database in Berkeley DB format,\n"
@@ -310,7 +338,8 @@ LocalStore::LocalStore(ref<const Config> config)
 
         /* Legacy database schema migrations. Don't bump 'schema' for
            new migrations; instead, add a migration to
-           upgradeDBSchema(). */
+           upgradeDBSchema().  Schema 11 is the exception, and runs no
+           statement here (`nixSchemaVersion`). */
 
         if (curSchema < 8) {
             SQLiteTxn txn(state->db);
@@ -374,6 +403,30 @@ LocalStore::LocalStore(ref<const Config> config)
     // ensure efficient lookup.
     state->stmts->QueryPathFromHashPart.create(state->db, "select path from ValidPaths where path >= ? limit 1;");
     state->stmts->QueryValidPaths.create(state->db, "select path from ValidPaths");
+    state->stmts->QueryValidObjectHashes.create(state->db, "select hash from ValidPaths");
+    state->stmts->LookupBlob.create(
+        state->db,
+        "select b.ino, b.dev, b.size, i.path, b.name from Blobs b join Ingestions i on i.id = b.ingestion"
+        " where b.id = ? and b.exec = ? and i.path is not null;");
+    state->stmts->InsertBlob.create(
+        state->db,
+        "insert or replace into Blobs (id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);");
+    state->stmts->DeleteBlob.create(state->db, "delete from Blobs where id = ? and exec = ?;");
+    state->stmts->QueryBlobInodes.create(
+        state->db, "select b.ino, b.id from Blobs b join Ingestions i on i.id = b.ingestion where i.path is not null;");
+    state->stmts->NewIngestion.create(state->db, "insert into Ingestions (path, hold) values (null, ?);");
+    state->stmts->SetIngestionPath.create(state->db, "update Ingestions set path = ? where id = ?;");
+    /* The sweep's stale-row rule (schema.sql): a row whose ingestion never
+       got its path, or whose path is no longer valid, names no holder. */
+    /* An ingestion still in flight -- no path yet, its hold directory still
+       under `tmp/` -- is not stale: its rows must survive a collection running
+       beside it as its objects do (`08` K16).  The sweep has already removed
+       the holds of dead ingestions before this runs, so a hold that is still
+       there is a live one.  `?` is the object store's `tmp` directory. */
+    state->stmts->QueryStaleIngestions.create(
+        state->db, "select id, hold from Ingestions where path is null or path not in (select path from ValidPaths);");
+    state->stmts->DeleteBlobsOf.create(state->db, "delete from Blobs where ingestion = ?;");
+    state->stmts->DeleteIngestion.create(state->db, "delete from Ingestions where id = ?;");
     if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
         state->stmts->RegisterRealisedOutput.create(
             state->db,
@@ -409,6 +462,234 @@ LocalStore::LocalStore(ref<const Config> config)
                     ;
             )");
     }
+
+    /* The object store's index of
+       blob to holder.  Installed here, after the statements exist; a bare
+       `GitObjectStore` (a test's) has none and misses every lookup. */
+    /* The ablation, test-only (`local-store.hh`, `BlobRows`). */
+    if (auto v = getEnv("_NIX_TEST_HOLDER_NO_ROWS"); v && *v == "1")
+        blobRows = BlobRows::NoRows;
+    blobIndex.lookup = [this](const Hash & id, bool executable) -> std::optional<GitObjectStore::Holder> {
+        return retrySQLite<std::optional<GitObjectStore::Holder>>([&]() -> std::optional<GitObjectStore::Holder> {
+            auto state(_state->lock());
+            auto use(state->stmts->LookupBlob.use());
+            /* The identifier is a 32-byte blob, not its hexadecimal: half
+               the key bytes, so half the b-tree pages and half the
+               comparisons (`05` section 6, the scale tables). */
+            use.apply(id.hash, id.hashSize).apply(int64_t(executable ? 1 : 0));
+            if (!use.next())
+                return std::nullopt;
+            GitObjectStore::Holder holder{
+                .ino = static_cast<ino_t>(use.getInt(0)),
+                .dev = static_cast<dev_t>(use.getInt(1)),
+                .size = static_cast<uint64_t>(use.getInt(2)),
+                /* The column holds the *logical* store path; the holder is
+                   a file on disk under the real store directory. */
+                .file = (getRealStoreDir() / std::filesystem::path(use.getStr(3)).filename()).string(),
+            };
+            auto name = use.getStr(4);
+            if (!name.empty()) {
+                holder.file += '/';
+                holder.file += name;
+            }
+            return holder;
+        });
+    };
+    blobIndex.forget = [this](const Hash & id, bool executable) {
+        if (this->config->readOnly)
+            return;
+        retrySQLite<void>([&]() {
+            auto state(_state->lock());
+            auto use(state->stmts->DeleteBlob.use());
+            use.apply(id.hash, id.hashSize).apply(int64_t(executable ? 1 : 0)).exec();
+        });
+    };
+    blobIndex.inodes = [this](boost::unordered_flat_map<ino_t, Hash> & inodes) {
+        retrySQLite<void>([&]() {
+            auto state(_state->lock());
+            auto use(state->stmts->QueryBlobInodes.use());
+            while (use.next())
+                inodes.insert_or_assign(static_cast<ino_t>(use.getInt(0)), blobIdOf(use.getBlobStr(1)));
+        });
+    };
+    objects.index = &blobIndex;
+}
+
+void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::filesystem::path & root)
+{
+    if (config->readOnly || blobRows == BlobRows::NoRows)
+        return;
+    hold.setRoot(root);
+    /* The ingestion's row, with no path: the path does not exist yet, and
+       that is the whole reason the index does not hang off a foreign key
+       into `ValidPaths` (schema.sql).  Until `endIngestion` names it, every
+       row written against it is stale -- invisible to `link` (which joins
+       on a path that is not null) and removed by the sweep. */
+    auto holdName = hold.directory().filename().string();
+    uint64_t ingestion = retrySQLite<uint64_t>([&]() -> uint64_t {
+        auto state(_state->lock());
+        auto use(state->stmts->NewIngestion.use());
+        use.apply(holdName).exec();
+        return static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
+    });
+    hold.ingestion = ingestion;
+    /* The copy's workers hand their batches here as they fill, so the index
+       write overlaps the copy as the object store's links used to (`05`
+       section 6, the twenty-trial table). */
+    hold.setSink(
+        [this, ingestion](std::vector<GitObjectStore::Hold::Row> && batch) { writeBlobRows(ingestion, batch); });
+}
+
+void LocalStore::openBlobWriter()
+{
+    if (blobWriterDb)
+        return;
+    /* The same database file, a second connection: WAL admits one writer
+       beside its readers, so the index's writes and the copy's probes stop
+       excluding each other (`local-store.hh`, `blobWriterDb`).  `synchronous`
+       and the journal are the store's own; the connection is this process's
+       and is closed with the store. */
+    blobWriterDb = std::make_unique<SQLite>(
+        dbDir / "db.sqlite", SQLiteSettings{.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL});
+    /* The index is a cache -- every row is derivable from the store's own
+       paths, and `nix-store --optimise` rebuilds it -- so its writes need not
+       be synchronous, which is what `isCache` says of a connection. */
+    blobWriterDb->isCache();
+    blobWriterInsert = std::make_unique<SQLiteStmt>();
+    blobWriterInsert->create(
+        *blobWriterDb,
+        "insert or replace into Blobs (id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);");
+}
+
+void LocalStore::writeBlobRows(uint64_t ingestion, std::vector<GitObjectStore::Hold::Row> & batch)
+{
+    if (batch.empty())
+        return;
+    /* In key order: a b-tree takes sorted inserts far better than random
+       ones, and an identifier is a hash (`05` section 6, the memo's rows). */
+    std::sort(batch.begin(), batch.end(), [](const auto & a, const auto & b) {
+        auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
+        return c != 0 ? c < 0 : a.executable < b.executable;
+    });
+    auto lock = std::lock_guard{blobWriterMutex};
+    openBlobWriter();
+    retrySQLite<void>([&]() {
+        SQLiteTxn txn(*blobWriterDb);
+        for (auto & row : batch) {
+            auto use(blobWriterInsert->use());
+            use.apply(row.id.hash, row.id.hashSize)
+                .apply(int64_t(row.executable ? 1 : 0))
+                .apply(static_cast<int64_t>(row.ino))
+                .apply(static_cast<int64_t>(row.dev))
+                .apply(static_cast<int64_t>(ingestion))
+                .apply(row.name)
+                .apply(static_cast<int64_t>(row.size))
+                .exec();
+        }
+        txn.commit();
+    });
+}
+
+void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath & path)
+{
+    if (config->readOnly || blobRows == BlobRows::NoRows || !hold.ingestion)
+        return;
+    /* What the walk has not handed over yet, and then the one update that
+       makes every one of this ingestion's rows true at once: the
+       registration pays no per-blob work at all. */
+    hold.flush();
+    auto logical = printStorePath(path);
+    auto ingestion = *hold.ingestion;
+    retrySQLite<void>([&]() {
+        auto state(_state->lock());
+        auto use(state->stmts->SetIngestionPath.use());
+        use.apply(logical).apply(static_cast<int64_t>(ingestion)).exec();
+    });
+}
+
+void LocalStore::recordBlobsAtPath(const GitObjectStore::Hold & hold, const std::filesystem::path & root)
+{
+    /* Tests only.  A tree written at `root` under the store directory that is
+       not a store path: a `ValidPaths` row is made for it under its own name,
+       so that the sweep's stale-row rule judges this ingestion as it judges a
+       real one, and the ingestion is given that path. */
+    hold.flush();
+    if (!hold.ingestion)
+        return;
+    auto logical = std::filesystem::path(config->storeDir) / root.filename();
+    auto ingestion = *hold.ingestion;
+    retrySQLite<void>([&]() {
+        auto state(_state->lock());
+        SQLiteTxn txn(state->db);
+        {
+            auto use(state->stmts->RegisterValidPath.use());
+            use.apply(logical.string())
+                .apply("git:sha256:0000000000000000000000000000000000000000000000000000000000000000")
+                .apply(int64_t(time(nullptr)))
+                .apply("", false)
+                .apply(int64_t(0))
+                .apply(int64_t(0), false)
+                .apply("", false)
+                .apply("", false)
+                .exec();
+        }
+        {
+            auto use(state->stmts->SetIngestionPath.use());
+            use.apply(logical.string()).apply(static_cast<int64_t>(ingestion)).exec();
+        }
+        txn.commit();
+    });
+}
+
+/* The index's own sweep (schema.sql): a row whose ingestion never got its
+   path -- a copy that crashed or failed between its writes and its
+   registration -- or whose path is no longer valid, names no holder.  Two
+   statements under the GC lock, where the collector already is, and the one
+   place the cascade a foreign key would have given is replaced.  `link`
+   covers the window until this runs: it finds no file at the holder's name
+   and forgets the row. */
+void LocalStore::sweepStaleBlobRows()
+{
+    if (config->readOnly)
+        return;
+    auto tmp = objects.dir / "tmp";
+    retrySQLite<void>([&]() {
+        auto state(_state->lock());
+        SQLiteTxn txn(state->db);
+        std::vector<uint64_t> stale;
+        {
+            auto use(state->stmts->QueryStaleIngestions.use());
+            while (use.next()) {
+                auto id = static_cast<uint64_t>(use.getInt(0));
+                auto held = use.isNull(1) ? std::string() : use.getStr(1);
+                /* In flight: the sweep removed the holds of dead ingestions
+                   before this ran, so a hold still there is a live one and
+                   its rows are kept, as its objects are (`08` K16). */
+                if (!held.empty() && pathExists(tmp / held))
+                    continue;
+                stale.push_back(id);
+            }
+        }
+        for (auto id : stale) {
+            state->stmts->DeleteBlobsOf.use().apply(static_cast<int64_t>(id)).exec();
+            state->stmts->DeleteIngestion.use().apply(static_cast<int64_t>(id)).exec();
+        }
+        txn.commit();
+    });
+}
+
+uint64_t LocalStore::blobRowCount(bool executable)
+{
+    return retrySQLite<uint64_t>([&]() -> uint64_t {
+        auto state(_state->lock());
+        SQLiteStmt stmt;
+        stmt.create(state->db, "select count(*) from Blobs where exec = ?;");
+        auto use(stmt.use());
+        use.apply(int64_t(executable ? 1 : 0));
+        if (!use.next())
+            return 0;
+        return static_cast<uint64_t>(use.getInt(0));
+    });
 }
 
 AutoCloseFD LocalStore::openGCLock()
@@ -650,6 +931,36 @@ bool LocalStore::upgradeDBSchema(State & state, bool dryRun)
 
     maybeUpgrade("20260309-drop-redundant-indexreferrer", "drop index if exists IndexReferrer");
 
+    /* The blob index (`schema.sql`, 01 section 9.10): where a regular-file
+       blob's holder is.  **Additive, so it belongs here and not in a schema
+       bump**, which is the convention the comment above states and which
+       `nixSchemaVersion` 11 is the stated exception to: 11 was bumped because
+       an existing column's *meaning* changed (`ValidPaths.hash` went from the
+       NAR hash to the object hash), so an older Nix reading such a store would
+       misread it.  Two new tables and an index change no existing column, and
+       an older Nix simply does not look at them, so no bump is owed.
+
+       The index is a *cache*: every row in it is derivable from the store's own
+       paths, and `nix-store --optimise` rebuilds it by walking them.  So a
+       migration that changes its shape may drop it and make it again rather
+       than alter it in place -- which is what this one does, under a name of
+       its own, because a store made by an earlier build of this work has the
+       tables in an older shape and `create table if not exists` would leave
+       them so.  Sharing is not lost by it: the paths keep their files, and the
+       next ingestion or `nix-store --optimise` records the rows again. */
+    maybeUpgrade(
+        "20260919-blob-index-holders",
+        "drop table if exists Blobs;"
+        "\ndrop table if exists Ingestions;"
+        "\ncreate table Ingestions ("
+        " id integer primary key autoincrement not null,"
+        " path text, hold text);"
+        "\ncreate table Blobs ("
+        " id blob not null, exec integer not null, ino integer not null, dev integer not null,"
+        " ingestion integer not null, name text not null, size integer not null,"
+        " primary key (id, exec));"
+        "\ncreate index IndexBlobsIngestion on Blobs(ingestion)");
+
     return ret;
 }
 
@@ -737,9 +1048,13 @@ uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info)
             "cannot add path '%s' to the Nix store because it claims to be content-addressed but isn't",
             printStorePath(info.path));
 
+    /* The column holds the object hash and nothing else: an info that
+       carries only a NAR hash (an old peer's, an old cache's) is
+       registered by the ingestion that verified it and computed the
+       object hash from its sink, never directly. */
     state.stmts->RegisterValidPath.use()
         .apply(printStorePath(info.path))
-        .apply(info.narHash.to_string(HashFormat::Base16, true))
+        .apply(info.requireObjectHash(*this).render())
         .apply(info.registrationTime == 0 ? time(nullptr) : info.registrationTime)
         .apply(info.deriver ? printStorePath(*info.deriver) : "", (bool) info.deriver)
         .apply(info.narSize, info.narSize != 0)
@@ -782,13 +1097,167 @@ void LocalStore::queryPathInfoUncached(
     const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept
 {
     try {
-        callback(retrySQLite<std::shared_ptr<const ValidPathInfo>>([&]() {
-            return queryPathInfoInternal(*_state->lock(), path);
-        }));
+        auto info = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+            [&]() { return queryPathInfoInternal(*_state->lock(), path); });
+
+        /* Outside the lock: a schema-10 row's migration may walk the path. */
+        if (info)
+            info = migratedPathInfo(std::move(info));
+
+        callback(std::move(info));
 
     } catch (...) {
         callback.rethrow();
     }
+}
+
+std::shared_ptr<const ValidPathInfo> LocalStore::queryPathInfoUnmigrated(const StorePath & path)
+{
+    return retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+        [&]() { return queryPathInfoInternal(*_state->lock(), path); });
+}
+
+void LocalStore::migratePathInfo(const StorePath & path)
+{
+    auto info = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+        [&]() { return queryPathInfoInternal(*_state->lock(), path); });
+
+    if (!info)
+        throw InvalidPath("path '%s' is not valid", printStorePath(path));
+    if (info->objectHash)
+        return;
+
+    ValidPathInfo row(*info);
+    std::optional<std::pair<Hash, Hash>> narHashes;
+    switch (walkOldRow(row, &narHashes)) {
+    case OldRowWalk::Migrated:
+        return;
+    case OldRowWalk::Modified:
+        throw Error(
+            "path '%s' was modified! expected hash '%s', got '%s'; its row is left as it is -- run `nix-store --verify --check-contents --repair`",
+            printStorePath(path),
+            narHashes->first.to_string(HashFormat::Nix32, true),
+            narHashes->second.to_string(HashFormat::Nix32, true));
+    case OldRowWalk::FilesMissing:
+        throw Error(
+            "path '%s' is registered but its files are missing; run `nix-store --verify` to remove the row",
+            printStorePath(path));
+    }
+    unreachable();
+}
+
+LocalStore::OldRowWalk LocalStore::walkOldRow(ValidPathInfo & info, std::optional<std::pair<Hash, Hash>> * narHashes)
+{
+    auto & path = info.path;
+
+    /* One read of the bytes, two hashes: the object hash from the NAR
+       stream (law 2 of 01 section 9.10: the same value the accessor walk
+       gives) and the NAR hash from a tee of it, under the algorithm the row
+       asserts.  A path the collector took meanwhile is reported as
+       invalid, the caller's contract. */
+    HashSink narSink{info.assertedNarHash ? info.assertedNarHash->algo : HashAlgorithm::SHA256};
+    /* Gone under a valid row -- the directory (`requireStoreObjectAccessor`
+       finds none) or a file of it (`ENOENT` in the walk) -- is the state
+       master's `nix-store --verify` finds and removes; a row that is gone
+       is the collector's doing and the caller's `InvalidPath`. */
+    auto rowValid = [&] { return isValidPathUncached(path); };
+    std::optional<ObjectHashSink::Result> object;
+    try {
+        auto accessor = requireStoreObjectAccessor(path, /*requireValidPath=*/false);
+        auto source = sinkToSource([&](Sink & sink) { accessor->dumpPath(CanonPath::root, sink); });
+        TeeSource tee{*source, narSink};
+        object = objectHashOfNar(tee);
+    } catch (InvalidPath &) {
+        if (!rowValid())
+            throw;
+        return OldRowWalk::FilesMissing;
+    } catch (SysError & e) {
+        if (!rowValid())
+            throw InvalidPath("path '%s' is not valid", printStorePath(path));
+        if (e.errNo == ENOENT)
+            return OldRowWalk::FilesMissing;
+        throw;
+    }
+    auto narHash = narSink.finish().hash;
+
+    /* The row's assertion checked before anything is written, as master's
+       verifier checked it and `--load-db` still does.  (The NAR size need
+       not be compared: the hash is over the whole serialisation.) */
+    if (info.assertedNarHash && *info.assertedNarHash != narHash) {
+        if (narHashes)
+            *narHashes = {*info.assertedNarHash, narHash};
+        return OldRowWalk::Modified;
+    }
+
+    info.objectHash = ObjectHash::of(object->root);
+    if (info.narSize == 0)
+        info.narSize = object->narSize;
+    recordObjectHash(path, *info.objectHash, object->narSize);
+    return OldRowWalk::Migrated;
+}
+
+std::shared_ptr<const ValidPathInfo> LocalStore::migratedPathInfo(std::shared_ptr<const ValidPathInfo> info)
+{
+    if (info->objectHash)
+        return info;
+
+    /* A schema-10 row (01 section 9.11, "The database"): its NAR hash
+       stays as `assertedNarHash`; one walk of the path gives the object
+       hash and the NAR size and checks that NAR hash (`walkOldRow`).  No
+       root is taken here: the collector itself queries infos under its
+       exclusive lock (`keep-derivations`), and a root registered then
+       would keep a dead path alive; every other caller holds a root or a
+       shared lock already. */
+    auto migrated = std::make_shared<ValidPathInfo>(*info);
+
+    switch (walkOldRow(*migrated)) {
+    case OldRowWalk::Migrated:
+        return migrated;
+    case OldRowWalk::Modified:
+        /* The row as the database has it (01 section 10, *a schema-10 row's
+           migration checks the NAR hash the row asserts*): the
+           query answers, as master's did; `contentMismatch` and
+           `verifyStore --check-contents` find the modification through the
+           NAR hash and `--repair` restores the path, after which the next
+           walk migrates the row.  Writing the walk's object hash here
+           would bless the modified bytes for every later check. */
+        debug(
+            "path '%s' does not hash to the NAR hash its row asserts; row left unmigrated", printStorePath(info->path));
+        return info;
+    case OldRowWalk::FilesMissing:
+        /* Likewise: master answered a query of such a row from the
+           database, and `nix-store --verify` is what removes the row. */
+        debug("path '%s' is registered but its files are missing; row left unmigrated", printStorePath(info->path));
+        return info;
+    }
+    unreachable();
+}
+
+bool LocalStore::recordObjectHash(const StorePath & path, const ObjectHash & objectHash, uint64_t narSize)
+{
+    if (config->readOnly)
+        return false;
+    return retrySQLite<bool>([&]() {
+        auto state(_state->lock());
+
+        SQLiteTxn txn(state->db);
+
+        /* Re-read under the lock: another process may have migrated the
+           row, signed it, or deleted the path meanwhile.  Only the hash
+           and a missing size are ours to write. */
+        auto current = queryPathInfoInternal(*state, path);
+        bool written = current && !current->objectHash;
+        if (written) {
+            ValidPathInfo row(*current);
+            row.objectHash = objectHash;
+            if (row.narSize == 0)
+                row.narSize = narSize;
+            updatePathInfo(*state, row);
+        }
+
+        txn.commit();
+        return written;
+    });
 }
 
 std::shared_ptr<const ValidPathInfo> LocalStore::queryPathInfoInternal(State & state, const StorePath & path)
@@ -801,14 +1270,26 @@ std::shared_ptr<const ValidPathInfo> LocalStore::queryPathInfoInternal(State & s
 
     auto id = useQueryPathInfo.getInt(0);
 
-    auto narHash = Hash::dummy;
-    try {
-        narHash = Hash::parseAnyPrefixed(useQueryPathInfo.getStr(1));
-    } catch (BadHash & e) {
-        throw Error("invalid-path entry for '%s': %s", printStorePath(path), e.what());
-    }
+    auto info = std::make_shared<ValidPathInfo>(path, UnkeyedValidPathInfo(*this, std::nullopt));
 
-    auto info = std::make_shared<ValidPathInfo>(path, UnkeyedValidPathInfo(*this, narHash));
+    /* The column: an object hash rendered `git:sha256:<base16>`, or a
+       schema-10 row's NAR hash rendered `sha256:<base16>`, told apart by
+       prefix *before* the old parser runs -- for the `git` prefix
+       `parseHashAlgo` raises `UsageError`, not the `BadHash` caught
+       below.  The old branch keeps its error for a row that parses as
+       neither. */
+    {
+        auto hashColumn = useQueryPathInfo.getStr(1);
+        if (auto oh = ObjectHash::parse(hashColumn))
+            info->objectHash = *oh;
+        else {
+            try {
+                info->assertedNarHash = Hash::parseAnyPrefixed(hashColumn);
+            } catch (BadHash & e) {
+                throw Error("invalid-path entry for '%s': %s", printStorePath(path), e.what());
+            }
+        }
+    }
 
     info->registrationTime = useQueryPathInfo.getInt(2);
 
@@ -843,7 +1324,7 @@ void LocalStore::updatePathInfo(State & state, const ValidPathInfo & info)
 {
     state.stmts->UpdatePathInfo.use()
         .apply(info.narSize, info.narSize != 0)
-        .apply(info.narHash.to_string(HashFormat::Base16, true))
+        .apply(info.requireObjectHash(*this).render())
         .apply(info.ultimate ? 1 : 0, info.ultimate)
         .apply(concatStringsSep(" ", Signature::toStrings(info.sigs)), !info.sigs.empty())
         .apply(renderContentAddress(info.ca), (bool) info.ca)
@@ -887,6 +1368,25 @@ StorePathSet LocalStore::queryAllValidPaths()
         while (use.next())
             res.insert(parseStorePath(use.getStr(0)));
         return res;
+    });
+}
+
+uint64_t LocalStore::forEachValidObjectHash(fun<void(const ObjectHash &)> callback)
+{
+    return retrySQLite<uint64_t>([&]() {
+        auto state(_state->lock());
+        auto use(state->stmts->QueryValidObjectHashes.use());
+        uint64_t unmigrated = 0;
+        while (use.next()) {
+            /* A row older than schema 11 holds a NAR hash, which `parse`
+               refuses; it is counted, not migrated, since the migration
+               walks the path and this runs under the database lock. */
+            if (auto hash = ObjectHash::parse(use.getStr(0)))
+                callback(*hash);
+            else
+                unmigrated++;
+        }
+        return unmigrated;
     });
 }
 
@@ -1000,7 +1500,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
         StorePathSet paths;
 
         for (auto & [_, i] : infos) {
-            assert(i.narHash.algo == HashAlgorithm::SHA256);
+            i.requireObjectHash(*this);
             if (isValidPath_(*state, i.path))
                 updatePathInfo(*state, i);
             else
@@ -1071,10 +1571,50 @@ bool LocalStore::realisationIsUntrusted(const Realisation & realisation)
     return config->requireSigs && !realisation.checkSignatures(realisation.id, getPublicKeys());
 }
 
+void LocalStore::addMultipleToStore(
+    PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs)
+{
+    /* One ingestion, one hold: `addToStore` below takes `batchHold` when
+       there is one instead of making its own, so a batch pays for one
+       locked directory rather than one per object.  A batch with nothing
+       to write makes none, as it made none before, so a copy of what the
+       store already has writes nothing anywhere; and a path that is
+       valid here and swept before its `addToStore` finds no batch hold
+       and makes its own, so nothing is ever written unheld. */
+    std::optional<GitObjectStore::Hold> hold;
+    for (auto & [info, _] : pathsToCopy)
+        if (repair || !isValidPath(info.path)) {
+            hold.emplace(objects.hold());
+            batchHold = &*hold;
+            break;
+        }
+    Finally release([&] { batchHold = nullptr; });
+    Store::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs);
+}
+
 void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs)
 {
-    if (checkSigs && pathInfoIsUntrusted(info))
-        throw Error("cannot add path '%s' because it lacks a signature by a trusted key", printStorePath(info.path));
+    /* Something must name the content, or nothing below verifies it: the
+       path's own content address, the sender's object hash, or its NAR
+       hash (an old peer's).  An input-addressed path with neither would be
+       registered as whatever arrived. */
+    if (!info.ca && !info.objectHash && !info.assertedNarHash)
+        throw Error("path info for '%s' carries no content hash to verify", printStorePath(info.path));
+
+    /* Signatures are checked before the stream is read, except a version-1
+       signature on a description that asserts no NAR hash (01 §10, *a
+       version-1 signature is checked on the stream*): that check needs
+       the stream's NAR hash, so it
+       is made after the restore, on the tee below, and the restored path
+       is removed when it fails.  Nothing is registered before the check. */
+    bool checkSigsAfterRestore = false;
+    if (checkSigs && pathInfoIsUntrusted(info)) {
+        if (!info.assertedNarHash && !info.sigs.empty())
+            checkSigsAfterRestore = true;
+        else
+            throw Error(
+                "cannot add path '%s' because it lacks a signature by a trusted key", printStorePath(info.path));
+    }
 
     {
         addTempRoot(info.path);
@@ -1096,36 +1636,69 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
 
                 deletePath(realPath);
 
-                /* While restoring the path from the NAR, compute the hash
-                   of the NAR. */
-                HashSink hashSink(HashAlgorithm::SHA256);
+                /* Before the restore: a collection completing between the
+                   restore and the registration would sweep the objects the
+                   restore writes, this path's root not yet in the column
+                   (01 section 9.10, "Collection"; section 10, *the ingestion's
+                   `autoGC()` runs before the restore*). */
+                autoGC();
 
-                TeeSource wrapperSource{source, hashSink};
+                /* The objects the restore writes are held until the
+                   registration below, against a collection running
+                   meanwhile (`GitObjectStore::Hold`; `08` K16).
+                   A batch brings its own directory, which covers every
+                   object it writes; this path's *rows*, though, are its
+                   own, since it registers on its own and is its own
+                   ingestion (`Hold::ownRows`): the batch's paths are
+                   copied on a thread pool, and one hold's row machinery
+                   cannot carry several ingestions at once. */
+                auto ownHold = batchHold ? batchHold->ownRows() : objects.hold();
+                const GitObjectStore::Hold & hold = ownHold;
+
+                /* A NAR hash the sender asserted is verified on a tee of
+                   the stream and never stored (01 section 9.11); the same
+                   tee gives the hash a deferred version-1 signature check
+                   needs (SHA-256, the algorithm of every version-1
+                   fingerprint made by a Nix that signs). */
+                std::optional<HashSink> narHashSink;
+                std::optional<TeeSource> teeSource;
+                Source * restoreSource = &source;
+                if (info.assertedNarHash || checkSigsAfterRestore) {
+                    narHashSink.emplace(info.assertedNarHash ? info.assertedNarHash->algo : HashAlgorithm::SHA256);
+                    teeSource.emplace(source, *narHashSink);
+                    restoreSource = &*teeSource;
+                }
                 auto canonicalisingRestoreHooks =
                     makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(config->getLocalSettings().ignoredAcls));
 
-                restorePath(
+                auto restored = restoreThroughObjects(
                     realPath,
-                    wrapperSource,
+                    *restoreSource,
                     config->getLocalSettings().fsyncStorePaths,
-                    canonicalisingRestoreHooks.get());
+                    canonicalisingRestoreHooks.get(),
+                    hold,
+                    repair);
 
-                auto hashResult = hashSink.finish();
+                /* The info to register: `info` with the object hash and NAR
+                   size the sink computed, and without the sender's NAR-hash
+                   assertion, which is checked against the tee below. */
+                ValidPathInfo toRegister{info};
+                /* The sender's thunk may hold the object's bytes -- the
+                   evaluator's write buffer builds one over the text it
+                   still has (`write-buffer.cc`, `infoFor`) -- and the
+                   path-info cache keeps every description registered, so
+                   those bytes would stay resident for the life of the
+                   process.  The object is in the store now, so the walk
+                   names it: the same hash, holding nothing (01 §9.11, the
+                   cost falls on the old peer). */
+                toRegister.lazyNarHash = [this, path = info.path] { return narHashOf(*this, path); };
+                toRegister.objectHash = ObjectHash::of(restored.root);
+                toRegister.narSize = restored.narSize;
+                toRegister.assertedNarHash = std::nullopt;
 
-                if (hashResult.hash != info.narHash)
-                    throw Error(
-                        "hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
-                        printStorePath(info.path),
-                        info.narHash.to_string(HashFormat::SRI, true),
-                        hashResult.hash.to_string(HashFormat::SRI, true));
-
-                if (hashResult.numBytesDigested != info.narSize)
-                    throw Error(
-                        "size mismatch importing path '%s';\n  specified: %s\n  got:       %s",
-                        printStorePath(info.path),
-                        info.narSize,
-                        hashResult.numBytesDigested);
-
+                /* The content address first, then the sender's object hash,
+                   NAR hash and size (01 section 9.10, "The content address
+                   is checked first"). */
                 if (info.ca) {
                     auto & specified = *info.ca;
                     auto actualHash = ({
@@ -1144,7 +1717,28 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                             break;
                         }
                         case FileIngestionMethod::Git:
-                            h = git::dumpHash(specified.hash.algo, sourcePath).hash;
+                            /* The sink's root is this identifier.  The SHA-1
+                               form an older Nix made cannot be checked here
+                               and is refused, the restored bytes removed as
+                               the signature check below removes them; the
+                               blobs and trees the restore entered stay in
+                               `.objects` until the next whole-store
+                               collection sweeps them (01 §10, *a version-1
+                               signature is checked on the stream*: the same
+                               cost as the signature refusal's). */
+                            if (specified.hash.algo != merkle::hashAlgo) {
+                                deletePath(realPath);
+                                throw Error(
+                                    "cannot import path '%s': its content address '%s' is under %s, and the git "
+                                    "content-address method admits SHA-256 only; re-add the source with this Nix "
+                                    "('nix store add --mode git'), or carry the path with 'nix-store --export | "
+                                    "nix-store --import', which asserts no content address (the path's files were "
+                                    "removed; the objects its restore entered go at the next 'nix-store --gc')",
+                                    printStorePath(info.path),
+                                    specified.render(),
+                                    printHashAlgo(specified.hash.algo));
+                            }
+                            h = merkle::objectHash(restored.root);
                             break;
                         }
                         ContentAddress{
@@ -1161,19 +1755,69 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                     }
                 }
 
-                autoGC();
+                if (info.objectHash && *info.objectHash != *toRegister.objectHash)
+                    throw Error(
+                        "object hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
+                        printStorePath(info.path),
+                        info.objectHash->render(),
+                        toRegister.objectHash->render());
 
-                optimisePath(realPath, repair); // FIXME: combine with hashPath()
+                std::optional<Hash> streamNarHash;
+                if (narHashSink)
+                    streamNarHash = narHashSink->finish().hash;
+
+                if (info.assertedNarHash && *streamNarHash != *info.assertedNarHash)
+                    throw Error(
+                        "hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
+                        printStorePath(info.path),
+                        info.assertedNarHash->to_string(HashFormat::SRI, true),
+                        streamNarHash->to_string(HashFormat::SRI, true));
+
+                /* The sink's size is the NAR's length (`merkle::nar`, pinned
+                   against `dumpPath`), so no tee is needed for this check. */
+                if (info.narSize != 0 && restored.narSize != info.narSize)
+                    throw Error(
+                        "size mismatch importing path '%s';\n  specified: %s\n  got:       %s",
+                        printStorePath(info.path),
+                        info.narSize,
+                        restored.narSize);
+
+                /* The deferred signature check: the description with the
+                   stream's NAR hash and size in place of the assertion it
+                   lacked, under the same rule as before the stream. */
+                if (checkSigsAfterRestore) {
+                    ValidPathInfo described{info};
+                    described.assertedNarHash = streamNarHash;
+                    described.narSize = restored.narSize;
+                    if (pathInfoIsUntrusted(described)) {
+                        deletePath(realPath);
+                        throw Error(
+                            "cannot add path '%s' because it lacks a signature by a trusted key",
+                            printStorePath(info.path));
+                    }
+                }
 
                 if (config->getLocalSettings().fsyncStorePaths) {
                     recursiveSync(realPath);
                     syncParent(realPath);
                 }
 
-                registerValidPath(info);
-            } else
+                registerValidPath(toRegister);
+
+                /* The holders this restore wrote are this ingestion's, and
+                   naming its path is what makes them true (schema.sql). */
+                endIngestion(hold, toRegister.path);
+            } else {
+                /* Nothing restored, so a deferred signature check has no
+                   stream to check against: refused, as every untrusted
+                   description was before the deferral. */
+                if (checkSigsAfterRestore)
+                    throw Error(
+                        "cannot add path '%s' because it lacks a signature by a trusted key",
+                        printStorePath(info.path));
                 // We may have a negative cache entry for this path, so get rid of it.
                 invalidatePathInfoCacheFor(info.path);
+            }
 
             outputLock.setDeletion(true);
         }
@@ -1202,16 +1846,26 @@ StorePath LocalStore::addToStoreFromDump(
     RepairFlag repair,
     bool filterReferences)
 {
-    /* For computing the store path. */
-    auto hashSink = std::make_shared<HashSink>(hashAlgo);
-    std::shared_ptr<Sink> sink = hashSink;
-    std::optional<PathRefScanSink> refSink = std::nullopt;
-    if (filterReferences) {
+    checkIngestionAlgorithm(hashMethod.getFileIngestionMethod(), hashAlgo);
+
+    bool methodsMatch = static_cast<FileIngestionMethod>(dumpMethod) == hashMethod.getFileIngestionMethod();
+
+    /* The dump's hash is the content address only when the methods match;
+       under the git method the sink's root is, and the dump is not hashed. */
+    std::optional<HashSink> hashSink;
+    if (methodsMatch)
+        hashSink.emplace(hashAlgo);
+    std::optional<PathRefScanSink> refSink;
+    if (filterReferences)
         // Only scan if we really need to, since it's slower.
         refSink = PathRefScanSink::fromPaths(originalReferences);
-        sink = std::make_shared<TeeSink>(*hashSink, *refSink);
-    }
-    TeeSource source{source0, *sink};
+    LambdaSink tap{[&](std::string_view data) {
+        if (hashSink)
+            (*hashSink)(data);
+        if (refSink)
+            (*refSink)(data);
+    }};
+    TeeSource source{source0, tap};
     const LocalSettings & localSettings = config->getLocalSettings();
 
     /* Read the source path into memory, but only if it's up to
@@ -1257,8 +1911,9 @@ StorePath LocalStore::addToStoreFromDump(
     std::filesystem::path tempPath;
     std::filesystem::path tempDir;
     AutoCloseFD tempDirFd;
-
-    bool methodsMatch = static_cast<FileIngestionMethod>(dumpMethod) == hashMethod.getFileIngestionMethod();
+    /* The sink's result when a NAR was restored through it; a flat file
+       or a plain copy is entered by one walk below instead. */
+    std::optional<ObjectHashSink::Result> restored;
 
     /* If the methods don't match, our streaming hash of the dump is the
        wrong sort, and we need to rehash.
@@ -1267,7 +1922,22 @@ StorePath LocalStore::addToStoreFromDump(
     auto canonicalisingRestoreHooks =
         makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(config->getLocalSettings().ignoredAcls));
 
+    /* The ingestion's hold on the objects it writes, made before its first
+       write and released after the registration below, against a
+       collection running meanwhile (`GitObjectStore::Hold`; `08` K16).
+       Made at the restore, on either route, so that an add whose path is
+       valid already makes none. */
+    std::optional<GitObjectStore::Hold> hold;
+
     if (!inMemoryAndDontNeedRestore) {
+        /* Before the restore, for the reason `addToStore` gives: the spilled
+           restore below writes objects into the store before the path is
+           registered, and whether the path is valid already is known only
+           from the restored tree, so this route pays the free-space check
+           whatever the outcome (01 section 10, *the ingestion's `autoGC()`
+           runs before the restore*). */
+        autoGC();
+
         /* Drain what we pulled so far, and then keep on pulling */
         StringSource dumpSource{dump};
         ChainSource bothSource{dumpSource, source};
@@ -1275,13 +1945,17 @@ StorePath LocalStore::addToStoreFromDump(
         std::tie(tempDir, tempDirFd) = createTempDirInStore();
         delTempDir = std::make_unique<AutoDelete>(tempDir);
         tempPath = tempDir / "x";
+        hold.emplace(objects.hold());
 
-        restorePath(tempPath, bothSource, dumpMethod, localSettings.fsyncStorePaths, canonicalisingRestoreHooks.get());
+        if (dumpMethod == FileSerialisationMethod::NixArchive)
+            restored = restoreThroughObjects(
+                tempPath, bothSource, localSettings.fsyncStorePaths, canonicalisingRestoreHooks.get(), *hold, repair);
+        else
+            restorePath(
+                tempPath, bothSource, dumpMethod, localSettings.fsyncStorePaths, canonicalisingRestoreHooks.get());
 
         std::string().swap(dump);
     }
-
-    auto [dumpHash, size] = hashSink->finish();
 
     StorePathSet references;
     if (refSink.has_value()) {
@@ -1290,10 +1964,14 @@ StorePath LocalStore::addToStoreFromDump(
         references = originalReferences;
     }
 
+    /* The content address: the dump's own hash when the methods match; the
+       sink's root for the git method; else a read of the restored tree. */
     auto desc = ContentAddressWithReferences::fromParts(
         hashMethod,
-        methodsMatch ? dumpHash
-                     : hashPath(makeFSSourceAccessor(tempPath), hashMethod.getFileIngestionMethod(), hashAlgo).first,
+        methodsMatch ? hashSink->finish().hash
+        : (restored && hashMethod.getFileIngestionMethod() == FileIngestionMethod::Git)
+            ? merkle::objectHash(restored->root)
+            : hashPath(makeFSSourceAccessor(tempPath), hashMethod.getFileIngestionMethod(), hashAlgo).first,
         {
             .others = references,
             // caller is not capable of creating a self-reference, because this is content-addressed without modulus
@@ -1318,15 +1996,28 @@ StorePath LocalStore::addToStoreFromDump(
 
             deletePath(realPath);
 
-            autoGC();
-
             if (inMemoryAndDontNeedRestore) {
+                /* Before the restore, for the same reason, and after the
+                   validity check: an add whose path is valid already
+                   restores nothing and runs no collection (master's
+                   order; `LocalStoreAutoGCTest`). */
+                autoGC();
+                hold.emplace(objects.hold());
+
                 StringSource dumpSource{dump};
                 /* Restore from the buffer in memory. */
                 auto fim = hashMethod.getFileIngestionMethod();
                 switch (fim) {
-                case FileIngestionMethod::Flat:
                 case FileIngestionMethod::NixArchive:
+                    restored = restoreThroughObjects(
+                        realPath,
+                        dumpSource,
+                        localSettings.fsyncStorePaths,
+                        canonicalisingRestoreHooks.get(),
+                        *hold,
+                        repair);
+                    break;
+                case FileIngestionMethod::Flat:
                     restorePath(
                         realPath,
                         dumpSource,
@@ -1335,8 +2026,7 @@ StorePath LocalStore::addToStoreFromDump(
                         canonicalisingRestoreHooks.get());
                     break;
                 case FileIngestionMethod::Git:
-                    // doesn't correspond to serialization method, so
-                    // this should be unreachable
+                    // not a serialisation method: unreachable
                     assert(false);
                 }
             } else {
@@ -1357,28 +2047,27 @@ StorePath LocalStore::addToStoreFromDump(
                     copySink.dstPath = realPath;
                     copyRecursive(*makeFSSourceAccessor(tempPath), CanonPath::root, copySink, CanonPath::root);
                     delTempDir->deletePath();
+                    /* Copied plainly: not in the object store; the walk below enters it. */
+                    restored = std::nullopt;
                 }
             }
 
-            /* For computing the nar hash. In recursive SHA-256 mode, this
-               is the same as the store hash, so no need to do it again. */
-            HashResult narHash = {dumpHash, size};
-            if (dumpMethod != FileSerialisationMethod::NixArchive || hashAlgo != HashAlgorithm::SHA256) {
-                HashSink narSink{HashAlgorithm::SHA256};
-                dumpPath(realPath, narSink);
-                narHash = narSink.finish();
-            }
-
-            optimisePath(realPath, repair);
+            /* A NAR went through the sink, which entered the object store
+               and computed the root; a flat file or a plain copy is entered
+               now, by the one walk that also computes it. */
+            auto result = restored ? *restored : enterPath(realPath, repair, *hold);
 
             if (localSettings.fsyncStorePaths) {
                 recursiveSync(realPath);
                 syncParent(realPath);
             }
 
-            auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), narHash.hash);
-            info.narSize = narHash.numBytesDigested;
+            auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
+            info.narSize = result.narSize;
             registerValidPath(info);
+
+            if (hold)
+                endIngestion(*hold, info.path);
         } else
             // We may have a negative cache entry for this path, so get rid of it.
             invalidatePathInfoCacheFor(dstPath);
@@ -1450,74 +2139,169 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
     /* Optionally, check the content hashes (slow). */
     if (checkContents) {
 
-        printInfo("checking link hashes...");
+        /* The object files and law 4 are checked for a store whose object
+           store is its own (`ownsObjectStore`); on the overlay store the
+           merged `.objects` shows the lower store's files, which a repair
+           would unlink (a whiteout) or copy up. */
+        bool ownObjects = ownsObjectStore();
+        if (!ownObjects)
+            printInfo("the object store is shared with the lower store: its objects are not checked here");
 
-        for (auto & link : DirectoryIterator{linksDir}) {
-            checkInterrupt();
-            auto name = link.path().filename();
-            printMsg(lvlTalkative, "checking contents of %s", PathFmt(name));
-            std::string hash =
-                hashPath(makeFSSourceAccessor(link.path()), FileIngestionMethod::NixArchive, HashAlgorithm::SHA256)
-                    .first.to_string(HashFormat::Nix32, false);
-            if (hash != name.string()) {
-                printError(
-                    "link %s was modified! expected hash %s, got '%s'", PathFmt(link.path()), name.string(), hash);
-                if (repair) {
-                    unlinkIfExists(link.path());
-                    printInfo("removed link %s", PathFmt(link.path()));
-                } else {
-                    errors = true;
+        std::vector<std::string> blobDirs;
+        if (ownObjects) {
+            printInfo("checking object hashes...");
+            blobDirs = {"blobs", "blobs-x"};
+        }
+
+        /* The object files under each kind, in its shards
+           (`GitObjectStore::eachObjectFile`); the name a file is judged
+           against is the file's own, wherever it lies. */
+        for (auto & sub : blobDirs) {
+            GitObjectStore::eachObjectFile(objects.dir / sub, [&](const std::filesystem::path & object) {
+                checkInterrupt();
+                auto name = object.filename().string();
+                printMsg(lvlTalkative, "checking contents of %s", PathFmt(object));
+                auto id = GitObjectStore::idString(GitObjectStore::blobIdOfFile(object));
+                if (id != name) {
+                    printError("object %s was modified! expected identifier %s, got '%s'", PathFmt(object), name, id);
+                    if (repair) {
+                        if (::unlink(object.c_str()) == 0)
+                            printInfo("removed object %s", PathFmt(object));
+                        else
+                            throw SysError("removing corrupt object %s", PathFmt(object));
+                    } else
+                        errors = true;
                 }
-            }
+            });
+        }
+
+        if (ownObjects) {
+            GitObjectStore::eachObjectFile(objects.dir / "trees", [&](const std::filesystem::path & object) {
+                checkInterrupt();
+                auto name = object.filename().string();
+                auto id = GitObjectStore::idString(merkle::treeId(readFile(object)));
+                if (id != name) {
+                    printError(
+                        "tree object %s was modified! expected identifier %s, got '%s'", PathFmt(object), name, id);
+                    if (repair) {
+                        if (::unlink(object.c_str()) == 0)
+                            printInfo("removed tree object %s", PathFmt(object));
+                        else
+                            throw SysError("removing corrupt tree object %s", PathFmt(object));
+                    } else
+                        errors = true;
+                }
+            });
         }
 
         printInfo("checking store hashes...");
 
-        Hash nullHash(HashAlgorithm::SHA256);
-
         for (auto & i : validPaths) {
             try {
+                /* Migrated by `queryPathInfoUncached` if the row was old. */
                 auto info =
                     std::const_pointer_cast<ValidPathInfo>(std::shared_ptr<const ValidPathInfo>(queryPathInfo(i)));
 
                 /* Check the content hash (optionally - slow). */
                 printMsg(lvlTalkative, "checking contents of '%s'", printStorePath(i));
 
-                auto hashSink = HashSink(info->narHash.algo);
+                /* The object hash recomputed from the files, the names
+                   unhacked as the serialiser unhacks them, and by the same
+                   walk every object the path reaches that the object store
+                   lacks (law 4 of 01 section 9.10, with law 3's exceptions:
+                   `verifyObjects`). */
+                auto realPath = toRealPath(i);
 
-                dumpPath(toRealPath(i), hashSink);
-                auto current = hashSink.finish();
+                if (!info->objectHash) {
+                    /* A schema-10 row the migration left as read: the walk's
+                       NAR hash was not the one the row asserts (`walkOldRow`,
+                       01 section 10, *a schema-10 row's migration checks the
+                       NAR hash the row asserts*).  Master's check, made here
+                       with master's report and remedy: "was modified!", and
+                       under --repair the path is fetched again; the row is
+                       migrated by the next query once the bytes are right. */
+                    if (!info->assertedNarHash)
+                        throw Error("path '%s' has neither an object hash nor a NAR hash to check", printStorePath(i));
+                    HashSink narSink{info->assertedNarHash->algo};
+                    dumpPath(realPath, narSink);
+                    auto current = narSink.finish().hash;
+                    if (current != *info->assertedNarHash) {
+                        printError(
+                            "path '%s' was modified! expected hash '%s', got '%s'",
+                            printStorePath(i),
+                            info->assertedNarHash->to_string(HashFormat::Nix32, true),
+                            current.to_string(HashFormat::Nix32, true));
+                        if (repair)
+                            getBuilder()->repairPath(i);
+                        else
+                            errors = true;
+                    } else
+                        /* Sound now (repaired since the row was read): the
+                           next query migrates it. */
+                        printInfo("path '%s' is not yet migrated to the object hash", printStorePath(i));
+                    continue;
+                }
 
-                if (info->narHash != nullHash && info->narHash != current.hash) {
+                auto [current, missing] = verifyObjects(realPath);
+                auto currentHash = ObjectHash::of(current.root);
+                if (!ownObjects)
+                    /* Law 4 is not this store's to check or repair. */
+                    missing.clear();
+
+                if (*info->objectHash != currentHash) {
                     printError(
-                        "path '%s' was modified! expected hash '%s', got '%s'",
+                        "path '%s' was modified! expected object hash '%s', got '%s'",
                         printStorePath(i),
-                        info->narHash.to_string(HashFormat::Nix32, true),
-                        current.hash.to_string(HashFormat::Nix32, true));
+                        info->objectHash->render(),
+                        currentHash.render());
                     if (repair)
                         getBuilder()->repairPath(i);
                     else
                         errors = true;
                 } else {
 
-                    bool update = false;
-
-                    /* Fill in missing hashes. */
-                    if (info->narHash == nullHash) {
-                        printInfo("fixing missing hash on '%s'", printStorePath(i));
-                        info->narHash = current.hash;
-                        update = true;
-                    }
-
                     /* Fill in missing narSize fields (from old stores). */
                     if (info->narSize == 0) {
-                        printInfo("updating size field on '%s' to %s", printStorePath(i), current.numBytesDigested);
-                        info->narSize = current.numBytesDigested;
-                        update = true;
+                        printInfo("updating size field on '%s' to %s", printStorePath(i), current.narSize);
+                        info->narSize = current.narSize;
+                        updatePathInfo(*_state->lock(), *info);
                     }
 
-                    if (update)
-                        updatePathInfo(*_state->lock(), *info);
+                    /* Law 4 (01 section 9.10): every object the path's hash
+                       reaches is in the object store.  A path that was
+                       never entered (an older Nix wrote it; the shim
+                       migrated its row without entering), or whose objects
+                       a full directory index or an interrupted repair left
+                       missing, is re-entered under --repair by the walk
+                       that enters a built output, and "entered" is said
+                       only once the same check finds nothing missing.  The
+                       hold is the type's demand; no collection runs beside
+                       this verifier, which holds the GC lock shared. */
+                    if (!missing.empty()) {
+                        printError(
+                            "path '%s' reaches %d objects the object store lacks (first: %s)",
+                            printStorePath(i),
+                            missing.size(),
+                            PathFmt(missing.front()));
+                        if (repair) {
+                            auto hold = objects.hold();
+                            enterPath(realPath, Repair, hold);
+                            /* The rows the re-entry made. */
+                            endIngestion(hold, i);
+                            auto still = verifyObjects(realPath).second;
+                            if (still.empty())
+                                printInfo("entered '%s' into the object store", printStorePath(i));
+                            else {
+                                printError(
+                                    "could not enter '%s' into the object store: %d objects still missing (first: %s)",
+                                    printStorePath(i),
+                                    still.size(),
+                                    PathFmt(still.front()));
+                                errors = true;
+                            }
+                        } else
+                            errors = true;
+                    }
                 }
 
             } catch (Error & e) {
@@ -1641,6 +2425,11 @@ void LocalStore::vacuumDB()
 
 void LocalStore::addSignatures(const StorePath & storePath, const std::set<Signature> & sigs)
 {
+    /* The transaction below re-writes the row from `queryPathInfoInternal`,
+       which does not migrate; a schema-10 row is migrated first, outside
+       the lock, so that the row written holds its object hash. */
+    migratePathInfo(storePath);
+
     retrySQLite<void>([&]() {
         auto state(_state->lock());
 

@@ -40,6 +40,14 @@ using ShallowNarListing = fso::VariantT<NarListingRegularFile, false>;
 NarListing parseNarListing(Source & source);
 
 /**
+ * As above, and deliver the same parse to `also` -- for example an
+ * `ObjectHashSink`, so that one pass over an uploaded NAR yields both
+ * its listing and its object hash.  File contents flow to `also` (the
+ * indexer itself skips them).
+ */
+NarListing parseNarListing(Source & source, FileSystemObjectSink & also);
+
+/**
  * Return a deep structured representation of the contents of a NAR (except file
  * contents), recursively listing all children.
  */

@@ -8,7 +8,7 @@ namespace nix {
 void NarInfo::anchor() {}
 
 NarInfo::NarInfo(const StoreDirConfig & store, const std::string & s, const std::string & whence)
-    : UnkeyedValidPathInfo(store, Hash::dummy)                                          // FIXME: hack
+    : UnkeyedValidPathInfo(store, std::nullopt)                                         // FIXME: hack
     , ValidPathInfo(StorePath::dummy, static_cast<const UnkeyedValidPathInfo &>(*this)) // FIXME: hack
     , UnkeyedNarInfo(static_cast<const UnkeyedValidPathInfo &>(*this))
 {
@@ -30,7 +30,6 @@ NarInfo::NarInfo(const StoreDirConfig & store, const std::string & s, const std:
     };
 
     bool havePath = false;
-    bool haveNarHash = false;
 
     size_t pos = 0;
     while (pos < s.size()) {
@@ -67,8 +66,11 @@ NarInfo::NarInfo(const StoreDirConfig & store, const std::string & s, const std:
                 throw corrupt("invalid FileSize");
             fileSize = *n;
         } else if (name == "NarHash") {
-            narHash = parseHashField(value);
-            haveNarHash = true;
+            assertedNarHash = parseHashField(value);
+        } else if (name == "ObjectHash") {
+            objectHash = ObjectHash::parse(value);
+            if (!objectHash)
+                throw corrupt("bad ObjectHash");
         } else if (name == "NarSize") {
             auto n = string2Int<decltype(narSize)>(value);
             if (!n)
@@ -99,11 +101,13 @@ NarInfo::NarInfo(const StoreDirConfig & store, const std::string & s, const std:
     if (!compression)
         compression = CompressionAlgo::bzip2;
 
-    if (!havePath || !haveNarHash || url.empty() || narSize == 0) {
+    bool haveHash = objectHash || assertedNarHash;
+
+    if (!havePath || !haveHash || url.empty() || narSize == 0) {
         line = 0; // don't include line information in the error
         throw corrupt(
             !havePath      ? "StorePath missing"
-            : !haveNarHash ? "NarHash missing"
+            : !haveHash    ? "ObjectHash and NarHash both missing"
             : url.empty()  ? "URL missing"
             : narSize == 0 ? "NarSize missing or zero"
                            : "?");
@@ -123,8 +127,12 @@ std::string NarInfo::to_string(const StoreDirConfig & store) const
     }
     if (fileSize)
         res += "FileSize: " + std::to_string(fileSize) + "\n";
-    assert(narHash.algo == HashAlgorithm::SHA256);
-    res += "NarHash: " + narHash.to_string(HashFormat::Nix32, true) + "\n";
+    if (objectHash)
+        res += "ObjectHash: " + objectHash->render() + "\n";
+    if (assertedNarHash) {
+        assert(assertedNarHash->algo == HashAlgorithm::SHA256);
+        res += "NarHash: " + assertedNarHash->to_string(HashFormat::Nix32, true) + "\n";
+    }
     res += "NarSize: " + std::to_string(narSize) + "\n";
 
     res += "References: " + concatStringsSep(" ", shortRefs()) + "\n";
@@ -141,12 +149,15 @@ std::string NarInfo::to_string(const StoreDirConfig & store) const
     return res;
 }
 
-nlohmann::json
-UnkeyedNarInfo::toJSON(const StoreDirConfig * store, bool includeImpureInfo, PathInfoJsonFormat format) const
+nlohmann::json UnkeyedNarInfo::toJSON(
+    const StoreDirConfig * store,
+    bool includeImpureInfo,
+    PathInfoJsonFormat format,
+    std::optional<NarHashThunk> narHashFor) const
 {
     using nlohmann::json;
 
-    auto jsonObject = UnkeyedValidPathInfo::toJSON(store, includeImpureInfo, format);
+    auto jsonObject = UnkeyedValidPathInfo::toJSON(store, includeImpureInfo, format, std::move(narHashFor));
 
     if (includeImpureInfo) {
         if (!url.empty())
@@ -209,7 +220,7 @@ nix::UnkeyedNarInfo adl_serializer<nix::UnkeyedNarInfo>::from_json(const json & 
 
 void adl_serializer<nix::UnkeyedNarInfo>::to_json(json & json, const nix::UnkeyedNarInfo & c)
 {
-    json = c.toJSON(nullptr, true, nix::PathInfoJsonFormat::V2);
+    json = c.toJSON(nullptr, true, nix::PathInfoJsonFormat::V4);
 }
 
 } // namespace nlohmann

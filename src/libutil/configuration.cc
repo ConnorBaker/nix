@@ -440,6 +440,8 @@ std::set<ExperimentalFeature> BaseSetting<std::set<ExperimentalFeature>>::parse(
             warn(
                 "experimental feature '%s' has been stabilized and renamed; use 'lint-url-literals = fatal' setting instead",
                 s);
+        else if (s == "git-hashing")
+            warn("experimental feature '%s' has been stabilized; the git content-address method needs no feature", s);
         else
             warn("unknown experimental feature '%s'", s);
     }

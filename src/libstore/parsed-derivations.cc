@@ -88,7 +88,12 @@ static nlohmann::json pathInfoToJSON(Store & store, const StorePathSet & storePa
 
         auto & jsonPath = jsonList.emplace_back(json::object());
 
-        jsonPath["narHash"] = info->narHash.to_string(HashFormat::Nix32, true);
+        /* The store's content hash and the serialisation's size; builder-
+           visible, as `doc/lazy-store/01-specification.md` section 9.11
+           states.  `nix-shell` prepares this against whatever store it
+           was given, a daemon without the object hash included, whose
+           description is completed by one walk (`Store::queryObjectHash`). */
+        jsonPath["objectHash"] = store.queryObjectHash(storePath).render();
         jsonPath["narSize"] = info->narSize;
 
         {

@@ -1,5 +1,13 @@
 #pragma once
 ///@file
+/**
+ * Readers of git's object encoding (`parseObjectType`, `parseBlob`,
+ * `parseTree`) and the `git ls-remote` line parser.  No hashing or
+ * writing lives here: the one tree walker is `objectHashOf`
+ * (`object-hash-sink.hh`), under SHA-256, over the hasher core of
+ * `merkle-hash.hh`.  The readers take the algorithm because git's format
+ * has two, and a tree object is read under the one its repository uses.
+ */
 
 #include <string>
 #include <string_view>
@@ -11,6 +19,7 @@
 #include "nix/util/source-path.hh"
 #include "nix/util/fs-sink.hh"
 #include "nix/util/merkle-files.hh"
+#include "nix/util/merkle-hash.hh"
 
 namespace nix::git {
 
@@ -32,7 +41,7 @@ using nix::RawMode;
  * Directory names must end in a `/` for sake of sorting. See
  * https://github.com/mirage/irmin/issues/352
  */
-using Tree = std::map<std::string, TreeEntry>;
+using merkle::Tree;
 
 inline std::optional<Mode> decodeMode(RawMode m)
 {
@@ -44,8 +53,7 @@ inline std::optional<Mode> decodeMode(RawMode m)
  *
  * @throws if prefix not recognized
  */
-ObjectType
-parseObjectType(Source & source, const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings);
+ObjectType parseObjectType(Source & source);
 
 /**
  * Read the size of the blob
@@ -53,60 +61,14 @@ parseObjectType(Source & source, const ExperimentalFeatureSettings & xpSettings 
  * The caller should then call `Source::drainInto` or similar with that
  * size.
  */
-uint64_t parseBlob(Source & source, const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings);
+uint64_t parseBlob(Source & source);
 
 /**
- * @param hashAlgo must be `HashAlgo::SHA1` or `HashAlgo::SHA256` for now.
+ * @param hashAlgo the repository's: `HashAlgorithm::SHA1` or
+ * `HashAlgorithm::SHA256`, the two git has.  The store's own trees are
+ * read under `merkle::hashAlgo`.
  */
-void parseTree(
-    merkle::DirectorySink & sink,
-    Source & source,
-    HashAlgorithm hashAlgo,
-    const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings);
-
-/**
- * Convert a `SourceAccessor::Type` to a `Mode`.
- */
-std::optional<Mode> convertMode(SourceAccessor::Type type);
-
-/**
- * Dumps a single file to a sink
- *
- * @param xpSettings for testing purposes
- */
-void dumpBlobPrefix(
-    uint64_t size, Sink & sink, const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings);
-
-/**
- * Dumps a representation of a git tree to a sink
- */
-void dumpTree(
-    const Tree & entries, Sink & sink, const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings);
-
-/**
- * Callback for processing a child with `dump`
- *
- * The function should return the Git hash and mode of the file at the
- * given path in the accessor passed to `dump`.
- *
- * Note that if the child is a directory, its child in must also be so
- * processed in order to compute this information.
- */
-using DumpHook = TreeEntry(const SourcePath & path);
-
-Mode dump(
-    const SourcePath & path,
-    Sink & sink,
-    fun<DumpHook> hook,
-    PathFilter & filter = defaultPathFilter,
-    const ExperimentalFeatureSettings & xpSettings = experimentalFeatureSettings);
-
-/**
- * Recursively dumps path, hashing as we go.
- *
- * A smaller wrapper around `dump`.
- */
-TreeEntry dumpHash(HashAlgorithm ha, const SourcePath & path, PathFilter & filter = defaultPathFilter);
+void parseTree(merkle::DirectorySink & sink, Source & source, HashAlgorithm hashAlgo);
 
 /**
  * A line from the output of `git ls-remote --symref`.

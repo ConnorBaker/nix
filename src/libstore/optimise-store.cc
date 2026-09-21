@@ -1,44 +1,111 @@
+#include "nix/util/serialise.hh"
+#include "nix/util/fs-sink.hh"
+#include "nix/util/archive.hh"
+#include "nix/util/object-hash-sink.hh"
+#include "nix/store/git-object-store.hh"
 #include "nix/store/local-store.hh"
 #include "nix/store/local-settings.hh"
+#include "nix/store/globals.hh"
+#include "nix/store/pathlocks.hh"
 #include "nix/util/signals.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
-#include "nix/util/source-accessor.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/file-system-at.hh"
+#include "nix/util/finally.hh"
+#include "nix/util/logging.hh"
+#include "nix/util/strings.hh"
+#include "nix/util/thread-pool.hh"
+#include "nix/util/util.hh"
 
-#include <cstdlib>
-#include <cstring>
-#ifdef __APPLE__
-#  include <regex>
-#endif
+#include <algorithm>
+#include <mutex>
+#include <thread>
+#include <set>
+#include <fcntl.h>
+#include <regex>
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <errno.h>
-
-#include "store-config-private.hh"
 
 namespace nix {
 
-static void makeWritable(const std::filesystem::path & path)
+/* The object store's visitors and their two drivers, a NAR being restored
+   and a path already on disk (`08` §1.6). */
+
+#ifdef __APPLE__
+/* HFS/macOS has some undocumented security feature disabling hardlinking for
+   special files within .app dirs. Known affected paths include
+   *.app/Contents/{PkgInfo,Resources/\*.lproj,_CodeSignature} and .DS_Store.
+   See https://github.com/NixOS/nix/issues/1443 and
+   https://github.com/NixOS/nix/pull/2230 for more discussion. */
+static bool linkableOnThisSystem(const std::filesystem::path & path)
 {
-    auto st = lstat(path);
-    chmod(path, st.st_mode | S_IWUSR);
+    static const std::regex appContents("\\.app/Contents/.+$");
+    return !std::regex_search(path.string(), appContents);
+}
+#else
+static bool linkableOnThisSystem(const std::filesystem::path &)
+{
+    return true;
+}
+#endif
+
+/* Whether the store places the regular file already on disk at `where`
+   -- gives it a blob and links it -- or leaves it as written, and why:
+   the exceptions of 01 §9.10 law 3 that can be read off the file.  Decided
+   here alone: the on-disk walk skips such a file, and the
+   verifier expects no blob for it.  (The restore route asks
+   `linkableOnThisSystem` before the file exists; its files are never
+   writable, having been canonicalised.)  Law 3's fourth exception -- a
+   file `place` could not enter for `ENOSPC` on a full directory index, or
+   `EMLINK` -- leaves no mark on the file, so it is not decided here: the
+   verifier reports such a file as missing and `--repair` tries again. */
+enum struct Placement { Placed, LeftWritable, NotLinkable };
+
+static Placement placementOf(const std::filesystem::path & where)
+{
+#ifdef _WIN32
+    /* The object store shares nothing there (git-object-store.hh). */
+    return Placement::NotLinkable;
+#else
+    /* A file the store marks writable was modified in place (a SNAFU,
+       e.g. a fontconfig cache under a root that ran programs); it is
+       named by what it holds now and not shared, as optimisation left it. */
+    if (lstat(where).st_mode & S_IWUSR)
+        return Placement::LeftWritable;
+    return linkableOnThisSystem(where) ? Placement::Placed : Placement::NotLinkable;
+#endif
 }
 
-struct MakeReadOnly
+/* A directory made writable for the duration, and canonical again after.
+   Opened before it is touched, so that a directory that cannot be opened
+   is not left writable. */
+struct WritableDirectory
 {
     std::filesystem::path path;
+    AutoCloseFD fd;
 
-    MakeReadOnly(std::filesystem::path path)
-        : path(std::move(path))
+    WritableDirectory(const std::filesystem::path & path, bool toggle)
+        : fd(openDirectory(path))
     {
+        if (!fd)
+            throw SysError("opening directory %1%", PathFmt(path));
+        if (toggle) {
+#ifndef _WIN32
+            if (fchmod(fd.get(), nix::fstat(fd.get()).st_mode | S_IWUSR) == -1)
+                throw SysError("making directory %1% writable", PathFmt(path));
+#else
+            chmod(path, lstat(path).st_mode | S_IWUSR);
+#endif
+            this->path = path;
+        }
     }
 
-    ~MakeReadOnly()
+    ~WritableDirectory()
     {
         try {
-            /* This will make the path read-only. */
+            /* Read-only again, and its timestamp back to 0. */
             if (!path.empty())
                 canonicaliseTimestampAndPermissions(path.string());
         } catch (...) {
@@ -47,252 +114,959 @@ struct MakeReadOnly
     }
 };
 
-LocalStore::InodeHash LocalStore::loadInodeHash()
+/* The on-disk path of the node at `path` under `root`: the on-disk walks'
+   paths carry the on-disk names, so this opens the right file on a
+   case-insensitive filesystem. */
+static std::filesystem::path onDisk(const std::filesystem::path & root, const CanonPath & path)
 {
-    debug("loading hash inodes in memory");
-    InodeHash inodeHash;
-
-    AutoCloseDir dir(opendir(linksDir.string().c_str()));
-    if (!dir)
-        throw SysError("opening directory %1%", PathFmt(linksDir));
-
-    struct dirent * dirent;
-    while (errno = 0, dirent = readdir(dir.get())) { /* sic */
-        checkInterrupt();
-        // We don't care if we hit non-hash files, anything goes
-        inodeHash.insert(dirent->d_ino);
-    }
-    if (errno)
-        throw SysError("reading directory %1%", PathFmt(linksDir));
-
-    printMsg(lvlTalkative, "loaded %1% hash inodes", inodeHash.size());
-
-    return inodeHash;
+    return path.isRoot() ? root : root / path.rel();
 }
 
-Strings LocalStore::readDirectoryIgnoringInodes(const std::filesystem::path & path, const InodeHash & inodeHash)
+/* The status of `name` in `dirFd`, at `where`, without following a symlink. */
+static PosixStat statIn(Descriptor dirFd, const CanonPath & name, const std::filesystem::path & where)
 {
-    Strings names;
-
-    AutoCloseDir dir(opendir(path.string().c_str()));
-    if (!dir)
-        throw SysError("opening directory %s", PathFmt(path));
-
-    struct dirent * dirent;
-    while (errno = 0, dirent = readdir(dir.get())) { /* sic */
-        checkInterrupt();
-
-        if (inodeHash.count(dirent->d_ino)) {
-            debug("'%1%' is already linked", dirent->d_name);
-            continue;
-        }
-
-        std::string name = dirent->d_name;
-        if (name == "." || name == "..")
-            continue;
-        names.push_back(name);
-    }
-    if (errno)
-        throw SysError("reading directory %s", PathFmt(path));
-
-    return names;
+#ifdef _WIN32
+    return lstat(where);
+#else
+    PosixStat st;
+    if (fstatat(dirFd, name.rel_c_str(), &st, AT_SYMLINK_NOFOLLOW) == -1)
+        throw SysError("getting status of %1%", PathFmt(where));
+    return st;
+#endif
 }
 
-void LocalStore::optimisePath_(
-    Activity * act, OptimiseStats & stats, const std::filesystem::path & path, InodeHash & inodeHash, RepairFlag repair)
+/* `GitObjectStore::place` for the written, canonicalised regular file `name` in the writable directory `dirFd`
+   (at `where`); the walk's `inodes`, `stats` and `act`, when given, record the inode, a file entered as the store's
+   and a file replaced by it. */
+static void placeRegularFile(
+    GitObjectStore & objects,
+    const std::filesystem::path & where,
+    const merkle::TreeEntry & entry,
+    Descriptor dirFd,
+    const CanonPath & name,
+    RepairFlag repair,
+    const GitObjectStore::Hold & hold,
+    GitObjectStore::BlobInodes * inodes = nullptr,
+    OptimiseStats * stats = nullptr,
+    Activity * act = nullptr)
 {
-    checkInterrupt();
+    bool executable = entry.mode == merkle::Mode::Executable;
 
-    auto st = lstat(path);
+    auto before = statIn(dirFd, name, where);
 
-#ifdef __APPLE__
-    /* HFS/macOS has some undocumented security feature disabling hardlinking for
-       special files within .app dirs. Known affected paths include
-       *.app/Contents/{PkgInfo,Resources/\*.lproj,_CodeSignature} and .DS_Store.
-       See https://github.com/NixOS/nix/issues/1443 and
-       https://github.com/NixOS/nix/pull/2230 for more discussion. */
-
-    if (std::regex_search(path.string(), std::regex("\\.app/Contents/.+$"))) {
-        debug("%s is not allowed to be linked in macOS", PathFmt(path));
+    auto after = objects.place(entry.hash, executable, dirFd, name, where, before, repair, hold);
+    if (!after)
         return;
-    }
-#endif
-
-    if (S_ISDIR(st.st_mode)) {
-        Strings names = readDirectoryIgnoringInodes(path, inodeHash);
-        for (auto & i : names)
-            optimisePath_(act, stats, path / i, inodeHash, repair);
-        return;
-    }
-
-    /* We can hard link regular files and maybe symlinks. */
-    if (!S_ISREG(st.st_mode)
-#if CAN_LINK_SYMLINK
-        && !S_ISLNK(st.st_mode)
-#endif
-    )
-        return;
-
-    /* Sometimes SNAFUs can cause files in the Nix store to be
-       modified, in particular when running programs as root under
-       NixOS (example: $fontconfig/var/cache being modified).  Skip
-       those files.  FIXME: check the modification time. */
-    if (S_ISREG(st.st_mode) && (st.st_mode & S_IWUSR)) {
-        warn("skipping suspicious writable file '%s'", PathFmt(path));
-        return;
-    }
-
-    /* This can still happen on top-level files. */
-    if (st.st_nlink > 1 && inodeHash.count(st.st_ino)) {
-        debug("%s is already linked, with %d other file(s)", PathFmt(path), st.st_nlink - 2);
-        return;
-    }
-
-    /* Hash the file.  Note that hashPath() returns the hash over the
-       NAR serialisation, which includes the execute bit on the file.
-       Thus, executable and non-executable files with the same
-       contents *won't* be linked (which is good because otherwise the
-       permissions would be screwed up).
-
-       Also note that if `path' is a symlink, then we're hashing the
-       contents of the symlink (i.e. the result of readlink()), not
-       the contents of the target (which may not even exist). */
-    Hash hash = hashPath(makeFSSourceAccessor(path), FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256).hash;
-    debug("%s has hash '%s'", PathFmt(path), hash.to_string(HashFormat::Nix32, true));
-
-    /* Check if this is a known hash. */
-    std::filesystem::path linkPath = std::filesystem::path{linksDir} / hash.to_string(HashFormat::Nix32, false);
-
-    /* Maybe delete the link, if it has been corrupted. */
-    if (pathExists(linkPath)) {
-        auto stLink = lstat(linkPath);
-        if (st.st_size != stLink.st_size || (repair && hash != ({
-                                                           hashPath(
-                                                               makeFSSourceAccessor(linkPath),
-                                                               FileSerialisationMethod::NixArchive,
-                                                               HashAlgorithm::SHA256)
-                                                               .hash;
-                                                       }))) {
-            // XXX: Consider overwriting linkPath with our valid version.
-            warn("removing corrupted link %s", PathFmt(linkPath));
-            warn(
-                "There may be more corrupted paths."
-                "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
-            unlinkIfExists(linkPath);
-        }
-    }
-
-    if (!pathExists(linkPath)) {
-        /* Nope, create a hard link in the links directory. */
-        try {
-            std::filesystem::create_hard_link(path, linkPath);
-            inodeHash.insert(st.st_ino);
-        } catch (std::filesystem::filesystem_error & e) {
-            if (e.code() == std::errc::file_exists) {
-                /* Fall through if another process created ‘linkPath’ before
-                   we did. */
-            }
-
-            else if (e.code() == std::errc::no_space_on_device) {
-                /* On ext4, that probably means the directory index is
-                   full.  When that happens, it's fine to ignore it: we
-                   just effectively disable deduplication of this
-                   file.
-                   */
-                printInfo("cannot link %s to '%s': %s", PathFmt(linkPath), PathFmt(path), e.code().message());
-                return;
-            }
-
-            else
-                throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(linkPath), PathFmt(path));
-        }
-    }
-
-    /* Yes!  We've seen a file with the same contents.  Replace the
-       current file with a hard link to that file. */
-    auto stLink = maybeLstat(linkPath);
-
-    /* A concurrent garbage collection may have removed the link in the
-       links directory between the existence check above and now. Skip
-       optimising this path; a later pass will dedup it. */
-    if (!stLink)
-        return;
-
-    if (st.st_ino == stLink->st_ino) {
-        debug("%1% is already linked to %2%", PathFmt(path), PathFmt(linkPath));
-        return;
-    }
-
-    printMsg(lvlTalkative, "linking %1% to %2%", PathFmt(path), PathFmt(linkPath));
-
-    /* Make the containing directory writable, but only if it's not
-       the store itself (we don't want or need to mess with its
-       permissions). */
-    const auto dirOfPath = path.parent_path();
-    bool mustToggle = dirOfPath != config->realStoreDir.get();
-    if (mustToggle)
-        makeWritable(dirOfPath);
-
-    /* When we're done, make the directory read-only again and reset
-       its timestamp back to 0. */
-    MakeReadOnly makeReadOnly(mustToggle ? dirOfPath : std::filesystem::path{});
-
-    std::filesystem::path tempLink = makeTempPath(config->realStoreDir.get(), ".tmp-link");
-
-    try {
-        std::filesystem::create_hard_link(linkPath, tempLink);
-        inodeHash.insert(st.st_ino);
-    } catch (std::filesystem::filesystem_error & e) {
-        if (e.code() == std::errc::too_many_links) {
-            /* Too many links to the same file (>= 32000 on most file
-               systems).  This is likely to happen with empty files.
-               Just shrug and ignore. */
-            if (st.st_size)
-                printInfo("%1% has maximum number of links", PathFmt(linkPath));
-            return;
-        }
-        if (e.code() == std::errc::no_such_file_or_directory) {
-            /* A concurrent garbage collection removed the link in the
-               links directory. Skip optimising this path; a later pass
-               will dedup it. */
-            return;
-        }
-        throw SystemError(e.code(), "creating hard link from %1% to %2%", PathFmt(linkPath), PathFmt(tempLink));
-    }
-
-    /* Atomically replace the old file with the new hard link. */
-    try {
-        std::filesystem::rename(tempLink, path);
-    } catch (std::filesystem::filesystem_error & e) {
-        {
-            std::error_code ec;
-            remove(tempLink, ec); /* Clean up after ourselves. */
-            if (ec)
-                printError("unable to unlink %1%: %2%", PathFmt(tempLink), ec.message());
-        }
-        if (e.code() == std::errc::too_many_links) {
-            /* Some filesystems generate too many links on the rename,
-               rather than on the original link.  (Probably it
-               temporarily increases the st_nlink field before
-               decreasing it again.) */
-            debug("%s has reached maximum number of links", PathFmt(linkPath));
-            return;
-        }
-        throw SystemError(e.code(), "renaming %1% to %2%", PathFmt(tempLink), PathFmt(path));
-    }
-
-    stats.filesLinked++;
-    stats.bytesFreed += st.st_size;
-
-    if (act)
-        act->result(
-            resFileLinked,
-            st.st_size
+    if (inodes)
+        inodes->insert_or_assign(after->ino, entry.hash);
+    if (after->entered && stats)
+        stats->filesEntered++;
+    if (after->ino != before.st_ino && stats) {
+        /* Replaced by the store's file: the bytes of this one are freed. */
+        printMsg(lvlTalkative, "linked %1% to the blob's holder", PathFmt(where));
+        stats->filesLinked++;
+        stats->bytesFreed += static_cast<uint64_t>(before.st_size);
+        if (act)
+            act->result(
+                resFileLinked,
+                before.st_size
 #ifndef _WIN32
-            ,
-            st.st_blocks
+                ,
+                before.st_blocks
 #endif
-        );
+            );
+    }
+}
+
+namespace {
+
+/* The object store's side of the hasher for what is not a regular file:
+   each directory's tree and each symlink's target written as hashed.
+   Regular files are the drivers' business (below): placed after they are
+   on disk, or linked instead of written. */
+struct ObjectStoreVisitor : HashingVisitor
+{
+    GitObjectStore & objects;
+    /* The ingestion's hold on what it writes (`08` K16), the caller's, so
+       that it outlives the walk up to the registration. */
+    const GitObjectStore::Hold & hold;
+
+    ObjectStoreVisitor(GitObjectStore & objects, const GitObjectStore::Hold & hold)
+        : objects(objects)
+        , hold(hold)
+    {
+    }
+
+    HashedNode symlink(const CanonPath & path, const std::string & target) override
+    {
+        auto node = HashingVisitor::symlink(path, target);
+        objects.putBlob(node.entry.hash, false, target, hold);
+        return node;
+    }
+
+    HashedNode directory(const CanonPath & path, Children children) override
+    {
+        auto node = HashingVisitor::directory(path, std::move(children));
+        objects.putTree(node.entry.hash, node.treeBody, hold);
+        return node;
+    }
+};
+
+/* The visitor for a store path already on disk at `root`: a regular file
+   whose inode is a blob's (`inodes`, when given) is not read; every other
+   is hashed and placed, its read-only directory made writable around
+   `place` and a writable file left alone as suspicious; `stats` and `act`,
+   when given, count the files replaced by the store's. */
+struct EnterVisitor : ObjectStoreVisitor
+{
+    LocalStore & store;
+    const std::filesystem::path root;
+    RepairFlag repair;
+    GitObjectStore::BlobInodes * inodes;
+    OptimiseStats * stats;
+    Activity * act;
+
+    EnterVisitor(
+        LocalStore & store,
+        const GitObjectStore::Hold & hold,
+        std::filesystem::path root,
+        RepairFlag repair,
+        GitObjectStore::BlobInodes * inodes,
+        OptimiseStats * stats,
+        Activity * act)
+        : ObjectStoreVisitor(store.objects, hold)
+        , store(store)
+        , root(std::move(root))
+        , repair(repair)
+        , inodes(inodes)
+        , stats(stats)
+        , act(act)
+    {
+    }
+
+    std::optional<HashedNode> known(const CanonPath & path, const SourceAccessor::Stat & st) override
+    {
+        if (!inodes || st.type != SourceAccessor::tRegular)
+            return std::nullopt;
+        /* The index is the witness, not the link count: a holder that no
+           second path shares is at one link (design.md section 3, K8).  The
+           `lstat` stays, because `readdir`'s `d_ino` can differ from it. */
+        auto file = lstat(onDisk(root, path));
+        auto i = inodes->find(file.st_ino);
+        if (i == inodes->end())
+            return std::nullopt;
+        /* The size is the stat's; the NAR size stays exact. */
+        return HashedNode{
+            .entry = {.mode = st.isExecutable ? merkle::Mode::Executable : merkle::Mode::Regular, .hash = i->second},
+            .narSize = st.fileSize ? std::optional(merkle::nar::regular(*st.fileSize, st.isExecutable)) : std::nullopt,
+        };
+    }
+
+    HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+    {
+        auto node = HashingVisitor::regular(path, std::move(read));
+        auto where = onDisk(root, path);
+
+        switch (placementOf(where)) {
+        case Placement::LeftWritable:
+            warn("skipping suspicious writable file '%s'", PathFmt(where));
+            return node;
+        case Placement::NotLinkable:
+            debug("%s is left as written: this system does not link it", PathFmt(where));
+            return node;
+        case Placement::Placed:
+            break;
+        }
+
+        /* The containing directory writable, unless it is the store itself. */
+        auto parent = where.parent_path();
+        WritableDirectory dir(parent, parent != store.config->realStoreDir.get());
+        auto name = CanonPath::fromFilename(where.filename().string());
+
+        placeRegularFile(objects, where, node.entry, dir.fd.get(), name, repair, hold, inodes, stats, act);
+        return node;
+    }
+};
+
+/* The verifier's visitor (`LocalStore::verifyObjects`): law 4 of 01 §9.10
+   for one path as it stands on disk, with law 3's exceptions -- every
+   tree on the way and every symlink's target blob must be present, and
+   the blob of every regular file the store places (`placementOf`).  The
+   paths are the on-disk ones, so a case-hacked name is looked at where it
+   is; the entry names are the tree's own, as the hasher's are. */
+struct VerifyVisitor : HashingVisitor
+{
+    GitObjectStore & objects;
+    const std::filesystem::path root;
+    std::vector<std::filesystem::path> missing;
+
+    VerifyVisitor(GitObjectStore & objects, std::filesystem::path root)
+        : objects(objects)
+        , root(std::move(root))
+    {
+    }
+
+    void expect(const std::filesystem::path & object)
+    {
+        if (!pathExists(object))
+            missing.push_back(object);
+    }
+
+    HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+    {
+        auto node = HashingVisitor::regular(path, std::move(read));
+        if (placementOf(onDisk(root, path)) == Placement::Placed) {
+            /* Law 4 for a regular-file blob: the index knows the identifier
+               with a holder that is still what the row says.  The bytes are
+               under the verifier's own hands -- this very file -- so there
+               is nothing else to check; what the row adds is that the store
+               will not write the blob again (design.md section 2.3). */
+            bool executable = node.entry.mode == merkle::Mode::Executable;
+            if (!objects.holderOrForget(node.entry.hash, executable, NoRepair))
+                missing.push_back(onDisk(root, path));
+        }
+        return node;
+    }
+
+    HashedNode symlink(const CanonPath & path, const std::string & target) override
+    {
+        auto node = HashingVisitor::symlink(path, target);
+        expect(objects.blobFile(node.entry.hash, false));
+        return node;
+    }
+
+    HashedNode directory(const CanonPath & path, Children children) override
+    {
+        auto node = HashingVisitor::directory(path, std::move(children));
+        expect(objects.treeFile(node.entry.hash));
+        return node;
+    }
+};
+
+/* A regular file is held in memory up to this many bytes, so that whether
+   to write it at all is decided before the disk is touched (01 §9.10). */
+static constexpr uint64_t restoreBufferLimit = 1 << 20;
+
+/* The restore route's visitor (01 §9.10, "Ingestion writes only what the
+   store lacks"; `08` §1.6): a regular file is held up to
+   `restoreBufferLimit` and, with its entry in hand, linked from the store's
+   file -- never written, so `regularFileCreated` does not fire for it --
+   or written and placed; above the limit it is streamed and placed.  The
+   children are created inside `children`, through the sink the
+   `RestoreSink`'s directory callback handed back, so that its
+   `directoryDone` canonicalises the directory when the scope closes. */
+struct LinkingVisitor : ObjectStoreVisitor
+{
+    RepairFlag repair;
+
+    /* The stacks a copy carries down its recursion: the sink a node's
+       children are created on -- the enclosing directory's own, innermost
+       last, the root's being the caller's `RestoreSink` -- and, under the
+       second route, the case-hacked on-disk names around each child's
+       visit.  They are *per thread*: the parallel copy below walks
+       sibling directories on a pool, and the traversal hands every worker
+       the same visitor object, so a worker seeds its own stacks with the
+       directory it starts at and unwinds them alone.  `Scope` saves and
+       restores, so the seeding nests. */
+    struct Frames
+    {
+        std::vector<RestoreSink *> open;
+        std::vector<std::string> diskNames;
+        /* Set while this thread is a pool worker, so that a subtree
+           beneath a parallel directory is walked sequentially and the
+           number of threads is the pool's, not the tree's depth. */
+        bool inWorker = false;
+    };
+
+    static Frames & frames()
+    {
+        static thread_local Frames f;
+        return f;
+    }
+
+    struct Scope
+    {
+        Frames saved;
+
+        Scope(RestoreSink & sink, std::optional<std::string> diskName, bool inWorker)
+        {
+            auto & f = frames();
+            saved = std::move(f);
+            f.open.clear();
+            f.open.push_back(&sink);
+            f.diskNames.clear();
+            if (diskName)
+                f.diskNames.push_back(std::move(*diskName));
+            f.inWorker = inWorker;
+        }
+
+        ~Scope()
+        {
+            frames() = std::move(saved);
+        }
+    };
+
+    /* The walking thread's seed, for this visitor's whole life. */
+    Scope scope;
+
+    LinkingVisitor(
+        GitObjectStore & objects, const GitObjectStore::Hold & hold, RestoreSink & restore, RepairFlag repair)
+        : ObjectStoreVisitor(objects, hold)
+        , repair(repair)
+        , scope(restore, std::nullopt, false)
+    {
+    }
+
+    /* Where the node at `path` goes: the innermost open sink, under `/name`
+       (the root node under `/`), and the path on disk. */
+    struct Target
+    {
+        RestoreSink & sink;
+        CanonPath name;
+        std::filesystem::path where;
+    };
+
+    /* The on-disk name of the node at `path`: under the push driver the
+       NAR restorer's, case hack applied, which `path` carries already. */
+    virtual std::string diskName(const CanonPath & path)
+    {
+        return std::string(*path.baseName());
+    }
+
+    Target at(const CanonPath & path)
+    {
+        auto & sink = *frames().open.back();
+        auto name = path.isRoot() ? path : CanonPath::root / diskName(path);
+        return {sink, name, name.isRoot() ? sink.dstPath : sink.dstPath / name.rel()};
+    }
+
+    HashedNode directory(const CanonPath & path, Children children) override
+    {
+        auto target = at(path);
+        return ObjectStoreVisitor::directory(path, [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
+            target.sink.createSubdirectory(target.name, [&](RestoreSink & sub, const CanonPath & rel) {
+                assert(rel.isRoot());
+                auto & open = frames().open;
+                open.push_back(&sub);
+                Finally close{[&] { open.pop_back(); }};
+                children(std::move(each));
+            });
+        });
+    }
+
+    HashedNode symlink(const CanonPath & path, const std::string & target) override
+    {
+        auto t = at(path);
+        t.sink.createSymlink(t.name, target);
+        return ObjectStoreVisitor::symlink(path, target);
+    }
+
+    HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+    {
+        /* Receives the file in the order both drivers deliver it -- the
+           executable flag, the size, the bytes -- forwarding all of it to
+           the hasher's file sink and holding the bytes until the limit,
+           from which point the restore sink's file is open and written as
+           they arrive. */
+        struct BufferThenStreamFile : CreateRegularFileSink
+        {
+            RestoreSink & restore;
+            const CanonPath & name;
+            CreateRegularFileSink & hashing;
+            bool executable = false;
+            std::string buffer;
+            std::unique_ptr<RegularFileWriter> writer;
+
+            BufferThenStreamFile(RestoreSink & restore, const CanonPath & name, CreateRegularFileSink & hashing)
+                : restore(restore)
+                , name(name)
+                , hashing(hashing)
+            {
+            }
+
+            void isExecutable() override
+            {
+                executable = true;
+                hashing.isExecutable();
+                if (writer)
+                    writer->isExecutable();
+            }
+
+            void preallocateContents(uint64_t size) override
+            {
+                hashing.preallocateContents(size);
+                if (size > restoreBufferLimit)
+                    stream();
+                if (writer)
+                    writer->preallocateContents(size);
+            }
+
+            /* Open the file and hand it what has arrived so far. */
+            void stream()
+            {
+                if (writer)
+                    return;
+                writer = restore.beginRegularFile(name);
+                if (executable)
+                    writer->isExecutable();
+                if (!buffer.empty()) {
+                    (*writer)(buffer);
+                    buffer.clear();
+                }
+            }
+
+            void operator()(std::string_view data) override
+            {
+                hashing(data);
+                if (!writer && buffer.size() + data.size() > restoreBufferLimit)
+                    stream();
+                if (writer)
+                    (*writer)(data);
+                else
+                    buffer.append(data);
+            }
+        };
+
+        auto target = at(path);
+        bool executable = false;
+        std::string buffer;
+        std::unique_ptr<RegularFileWriter> writer;
+
+        auto node = HashingVisitor::regular(path, [&](CreateRegularFileSink & hashing) {
+            BufferThenStreamFile file{target.sink, target.name, hashing};
+            read(file);
+            executable = file.executable;
+            buffer = std::move(file.buffer);
+            writer = std::move(file.writer);
+        });
+        auto & entry = node.entry;
+
+        bool linkable = linkableOnThisSystem(target.where);
+        if (!linkable)
+            debug("%s is not allowed to be linked in macOS", PathFmt(target.where));
+
+#ifdef _WIN32
+        /* Nothing is linked or placed there (git-object-store.hh). */
+        AutoCloseFD owned;
+        Descriptor dirFd = INVALID_DESCRIPTOR;
+        CanonPath name = CanonPath::fromFilename(target.where.filename().string());
+#else
+        auto [owned, dirFd, name] = target.sink.parentOf(target.name);
+#endif
+
+        if (writer) {
+            /* Streamed: written as received, then entered as the store's
+               file -- or, should the store hold one, replaced by it. */
+            writer->finish();
+            writer.reset();
+            if (linkable)
+                objects.enterWritten(entry.hash, executable, dirFd, name, target.where, repair, hold, /*looked=*/false);
+            return node;
+        }
+
+        /* The whole file is in memory and its blob known.  A hit: the
+           store's valid file linked under the name, nothing written. */
+        if (linkable && objects.link(entry.hash, executable, dirFd, name, target.where, buffer.size(), repair, hold))
+            return node;
+
+        /* A miss: written from memory, canonicalised by the restore sink's
+           hooks, and entered as the store's file -- or, should another
+           writer have entered the blob meanwhile, replaced by its file. */
+        target.sink.createRegularFile(target.name, [&](CreateRegularFileSink & crf) {
+            if (executable)
+                crf.isExecutable();
+            crf.preallocateContents(buffer.size());
+            crf(buffer);
+        });
+        if (linkable)
+            objects.enterWritten(entry.hash, executable, dirFd, name, target.where, repair, hold);
+        return node;
+    }
+};
+
+#ifndef _WIN32
+/* The second route's visitor (01 §9.10, "One route"; `08` §1.6): the
+   pull driver over the source accessor with the one route's
+   `LinkingVisitor` beneath, and `known` answering a directory, or the
+   root, from the store's own objects -- when the naming names it
+   (`namer`) and the store holds it, the subtree is made from `trees/` and
+   `blobs/` by `mkdirat`, `linkat` and `symlinkat`, and nothing beneath it
+   is read from the source; else the driver descends as it would, and
+   what it reaches is linked or written as the one route links or writes
+   it.  Per unchanged regular file: one `fstatat` of the blob's file and
+   one `linkat`, no read, no hash.  `known` is asked for directories and
+   the root alone: a file inside a directory the store lacks is read, so
+   that a fresh tree costs one memo lookup per directory and not one per
+   file.  Names: the driver hands the accessor's, the tree's own is what
+   `directory` receives per child, and its on-disk form is the case hack's
+   (`CaseHackNames`, the NAR restorer's rule), kept on `diskNames` around
+   each child's visit for `at` to read. */
+struct MaterialisingVisitor : LinkingVisitor
+{
+    LocalStore::TreeNamer namer;
+    RestoreSinkHooks * hooks;
+
+    /* The naming's memo, which the namer closes over, is not made for two
+       threads: `MemoVisitor::keyOf` initialises its `Cache` handle lazily
+       and `getFingerprint` goes to the accessor.  It is asked once per
+       directory and once for the root -- forty times for a tree of forty
+       thousand files -- so it is asked under a lock and nothing is lost.
+     */
+    std::mutex namerLock;
+
+    /* How many threads a directory's subdirectories may go on, and the
+       switch that turns the parallel copy off.  Bounded well below the
+       machine's width: the source accessor serialises every read and hash
+       behind its own lock (libgit2 forbids sharing one `git_repository`
+       across threads), so only the writing overlaps, and past a handful of
+       threads the directories contend for nothing left to win (`05`
+       section 6). */
+    size_t workers;
+
+    MaterialisingVisitor(
+        GitObjectStore & objects,
+        const GitObjectStore::Hold & hold,
+        RestoreSink & restore,
+        RepairFlag repair,
+        LocalStore::TreeNamer namer,
+        RestoreSinkHooks * hooks,
+        size_t workers)
+        : LinkingVisitor(objects, hold, restore, repair)
+        , namer(std::move(namer))
+        , hooks(hooks)
+        , workers(workers)
+    {
+    }
+
+    std::string diskName(const CanonPath & path) override
+    {
+        auto & diskNames = frames().diskNames;
+        return diskNames.empty() ? std::string(*path.baseName()) : diskNames.back();
+    }
+
+    HashedNode directory(const CanonPath & path, Children children) override
+    {
+        return LinkingVisitor::directory(path, [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
+            copyChildren(path, std::move(children), each);
+        });
+    }
+
+    /* A directory's children visited, its subdirectories on a bounded pool
+       and everything else on this thread, and the results handed to `each`
+       in the order the traversal offered them -- so the tree body, the NAR
+       size and the case hack are exactly what the sequential walk gives
+       (`01` §9.10; the property test `prop_materialised_path_is_the_restored_path`).
+       The on-disk names are the case hack's and are computed here, in that
+       same order, on this thread.
+
+       Only a directory that is not already inside a worker parallelises,
+       so the number of threads is the pool's and not the tree's depth.
+       Which children are directories is what the traversal says from the
+       listing it already made (`Children`, advisory): nothing but *which
+       thread* a child is walked on depends on it, so a child the listing
+       did not type is simply walked here. */
+    void
+    copyChildren(const CanonPath & path, Children children, fun<void(std::string_view, bool, fun<HashedNode()>)> & each)
+    {
+        struct Child
+        {
+            std::string name;
+            std::string disk;
+            fun<HashedNode()> visit;
+            bool subdirectory;
+            std::optional<HashedNode> node;
+        };
+
+        bool mayFork = workers > 1 && !frames().inWorker;
+
+        std::vector<Child> kids;
+        CaseHackNames hack;
+        size_t forkable = 0;
+        children([&](std::string_view name, bool isDirectory, fun<HashedNode()> visit) {
+            bool sub = mayFork && isDirectory;
+            forkable += sub;
+            kids.push_back({std::string(name), hack.diskName(name), std::move(visit), sub, std::nullopt});
+        });
+
+        auto here = [&](Child & c) {
+            auto & diskNames = frames().diskNames;
+            diskNames.push_back(c.disk);
+            Finally pop{[&] { diskNames.pop_back(); }};
+            c.node = c.visit();
+        };
+
+        if (forkable >= 2) {
+            auto * sink = frames().open.back();
+            ThreadPool pool{workers};
+            for (auto & c : kids)
+                if (c.subdirectory)
+                    pool.enqueue([&c, sink] {
+                        /* The worker's own stacks, seeded with this
+                           directory's sink and the child's on-disk name;
+                           `Scope` restores them, and the pool propagates
+                           what this throws and fires `checkInterrupt`
+                           through its own `ReceiveInterrupts`. */
+                        Scope scope{*sink, c.disk, true};
+                        c.node = c.visit();
+                    });
+            /* The files of this directory on this thread while the pool
+               takes the subdirectories; `process()` then works the queue
+               here too until it is empty. */
+            for (auto & c : kids)
+                if (!c.subdirectory)
+                    here(c);
+            pool.process();
+        } else
+            for (auto & c : kids)
+                here(c);
+
+        for (auto & c : kids) {
+            assert(c.node);
+            each(c.name, c.subdirectory, [&] { return std::move(*c.node); });
+        }
+    }
+
+    std::optional<HashedNode> known(const CanonPath & path, const SourceAccessor::Stat & st) override
+    {
+        if (!path.isRoot() && st.type != SourceAccessor::tDirectory)
+            return std::nullopt;
+        auto entry = [&] {
+            std::lock_guard<std::mutex> lock(namerLock);
+            return namer(path, st);
+        }();
+        if (!entry)
+            return std::nullopt;
+        auto target = at(path);
+        auto [owned, dirFd, name] = target.sink.parentOf(target.name);
+        std::optional<uint64_t> narSize;
+        try {
+            narSize = materialise(*entry, dirFd, name, target.where, path.isRoot() ? 0 : 1);
+        } catch (Error & e) {
+            warn(
+                "could not materialise %s from the object store: %s; copying it from the source instead",
+                PathFmt(target.where),
+                e.msg());
+        }
+        if (!narSize) {
+            /* Whatever was made goes, and the driver reads the subtree. */
+            if (maybeLstat(target.where))
+                deletePath(target.where);
+            debug("%s is not held by the object store; copying it from the source", PathFmt(target.where));
+            return std::nullopt;
+        }
+        return HashedNode{.entry = *entry, .narSize = narSize};
+    }
+
+    /* The node `entry` made as `name` in the directory `dirFd` (at `where`)
+       from the store's objects alone, and its NAR size; nullopt when an
+       object it needs is missing or corrupt, or a file cannot be linked --
+       what was made so far is the caller's to remove.  A tree body is
+       verified against its identifier as it is read
+       (`readVerifiedTree`); a blob's file is trusted as the on-disk walk
+       trusts an inode that is a blob's (`08` K8), its bytes re-hashed
+       under repair alone (K2); a symlink's target blob, a few bytes, is
+       checked always.  A tree body and a symlink's blob the copy is made
+       from are held first (`Hold`; `08` K16): the store's object is
+       reachable from the path that entered it, which a collection running
+       beside this copy may delete, and the path made here names it. */
+    std::optional<uint64_t> materialise(
+        const merkle::TreeEntry & entry,
+        Descriptor dirFd,
+        const CanonPath & name,
+        const std::filesystem::path & where,
+        size_t depth)
+    {
+        switch (entry.mode) {
+
+        case merkle::Mode::Regular:
+        case merkle::Mode::Executable: {
+            bool executable = entry.mode == merkle::Mode::Executable;
+            if (!linkableOnThisSystem(where)) {
+                /* Left as written and not placed, as the one route leaves
+                   it (`placementOf`): the blob's bytes, checked, written
+                   plainly. */
+                auto holder = objects.holderOrForget(entry.hash, executable, repair);
+                if (!holder)
+                    holder = objects.holderOrForget(entry.hash, !executable, repair);
+                if (!holder)
+                    return std::nullopt;
+                auto file = std::filesystem::path(holder->file);
+                auto bytes = readFile(file);
+                if (merkle::blobId(bytes) != entry.hash) {
+                    warn("blob object %s does not hash to its name; not used", PathFmt(file));
+                    return std::nullopt;
+                }
+                auto fd = openFileEnsureBeneathNoSymlinks(dirFd, name, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0666);
+                if (!fd)
+                    throw SysError("creating file %1%", PathFmt(where));
+                writeFull(fd.get(), bytes);
+                if (hooks)
+                    hooks->regularFileCreated(fd.get(), executable);
+                return merkle::nar::regular(bytes.size(), executable);
+            }
+            PosixStat linked;
+            if (!objects.link(entry.hash, executable, dirFd, name, where, std::nullopt, repair, hold, &linked))
+                return std::nullopt;
+            return merkle::nar::regular(static_cast<uint64_t>(linked.st_size), executable);
+        }
+
+        case merkle::Mode::Symlink: {
+            auto file = objects.blobFile(entry.hash, false);
+            if (!objects.holdBlob(entry.hash, false, hold))
+                return std::nullopt;
+            auto target = readFile(file);
+            if (merkle::blobId(target) != entry.hash) {
+                warn("blob object %s does not hash to its name; not used", PathFmt(file));
+                return std::nullopt;
+            }
+            if (::symlinkat(requireCString(target), dirFd, name.rel_c_str()) == -1)
+                throw SysError("creating symlink from %1% -> '%2%'", PathFmt(where), target);
+            if (hooks)
+                hooks->symlinkCreated(dirFd, name);
+            return merkle::nar::symlink(target.size());
+        }
+
+        case merkle::Mode::Directory: {
+            if (depth >= narMaxDepth)
+                throw Error("path %s exceeds maximum NAR directory depth of %d", PathFmt(where), narMaxDepth);
+            if (!objects.holdTree(entry.hash, hold))
+                return std::nullopt;
+            auto tree = objects.readVerifiedTree(entry.hash);
+            if (!tree)
+                return std::nullopt;
+            if (::mkdirat(dirFd, name.rel_c_str(), 0777) == -1)
+                throw SysError("creating directory %s", PathFmt(where));
+            auto fd = openFileEnsureBeneathNoSymlinks(dirFd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+            if (!fd)
+                throw SysError("opening directory %s", PathFmt(where));
+            /* In the NAR's order, by the tree's names (a directory's key
+               carries a trailing slash), so that the case hack numbers a
+               colliding name as the NAR restorer numbers it. */
+            std::vector<std::pair<std::string_view, const merkle::TreeEntry *>> entries;
+            for (auto & [key, child] : *tree) {
+                std::string_view childName{key};
+                if (child.mode == merkle::Mode::Directory)
+                    childName.remove_suffix(1);
+                if (childName.empty() || childName == "." || childName == ".."
+                    || childName.find_first_of(std::string_view("/\0", 2)) != std::string_view::npos) {
+                    warn(
+                        "tree object %s names an entry '%s'; not used",
+                        PathFmt(objects.treeFile(entry.hash)),
+                        childName);
+                    return std::nullopt;
+                }
+                entries.emplace_back(childName, &child);
+            }
+            std::sort(entries.begin(), entries.end(), [](auto & a, auto & b) { return a.first < b.first; });
+            merkle::nar::Directory size;
+            CaseHackNames hack;
+            for (auto & [childName, child] : entries) {
+                auto disk = hack.diskName(childName);
+                auto sub = materialise(*child, fd.get(), CanonPath::fromFilename(disk), where / disk, depth + 1);
+                if (!sub)
+                    return std::nullopt;
+                size.add(childName, *sub);
+            }
+            if (hooks)
+                hooks->directoryDone(fd.get());
+            return size.finish();
+        }
+        }
+        throw Error("tree object names an entry of unknown mode %o", static_cast<RawMode>(entry.mode));
+    }
+};
+#endif
+
+} // namespace
+
+ObjectHashSink::Result LocalStore::restoreThroughObjects(
+    const std::filesystem::path & path,
+    Source & source,
+    bool startFsync,
+    RestoreSinkHooks * hooks,
+    const GitObjectStore::Hold & hold,
+    RepairFlag repair)
+{
+    RestoreSink restore{startFsync, hooks};
+    restore.dstPath = path;
+    LinkingVisitor linking{objects, hold, restore, repair};
+    ObjectHashSink adapter{linking};
+    beginIngestion(hold, path);
+    parseDump(adapter, source);
+    auto result = adapter.finish();
+    objects.putRootTree(result.root, hold);
+    return result;
+}
+
+/* Test-only; zero means the fixed pool size computed in
+   `materialiseThroughObjects` (local-store.hh). */
+std::atomic<size_t> LocalStore::copyWorkersForTest{0};
+
+bool LocalStore::materialisesFromObjects() const
+{
+#ifdef _WIN32
+    /* The object store shares nothing there (git-object-store.hh), and
+       the `*at` calls have no counterpart. */
+    return false;
+#else
+    return ownsObjectStore();
+#endif
+}
+
+ObjectHashSink::Result LocalStore::materialiseThroughObjects(
+    const std::filesystem::path & dst,
+    const SourcePath & path,
+    PathFilter & filter,
+    bool startFsync,
+    RestoreSinkHooks * hooks,
+    RepairFlag repair,
+    TreeNamer namer,
+    const GitObjectStore::Hold & hold)
+{
+#ifdef _WIN32
+    throw Error("materialising a path from the object store is not supported on this system");
+#else
+    RestoreSink restore{startFsync, hooks};
+    restore.dstPath = dst;
+    /* The copy's subdirectories go on a small pool (`copyChildren`): the
+       machine's width, capped, since the source accessor serialises every
+       read and hash behind its own lock and only the writing overlaps
+       (`05` section 6).  Not a setting: what the copy makes does not
+       depend on the count (01 §10), so there is nothing for a user to
+       decide.  `copyWorkersForTest` is the tests' seam and is zero
+       everywhere else; one thread is the sequential walk exactly. */
+    size_t workers = copyWorkersForTest.load(std::memory_order_relaxed);
+    if (!workers)
+        workers = std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
+    MaterialisingVisitor visitor{objects, hold, restore, repair, std::move(namer), hooks, workers};
+    beginIngestion(hold, dst);
+    auto result = objectHashOf(*path.accessor, path.path, filter, visitor);
+    /* Every `known` answer carries the size of what it made, so the NAR
+       size is exact, as the one route's is. */
+    assert(result.narSizeExact);
+    objects.putRootTree(result.root, hold);
+    return result;
+#endif
+}
+
+StorePath LocalStore::materialise(
+    std::string_view name, const SourcePath & path, PathFilter & filter, RepairFlag repair, TreeNamer namer)
+{
+    if (!materialisesFromObjects())
+        throw Error("this store cannot materialise a path from its object store");
+
+    /* The registration of `addToStoreFromDump`'s spilled route, step for
+       step (local-store.cc): a NAR under the git method is restored into a
+       locked temporary directory in the store, the content address is the
+       root the restore computed, and the path is locked, moved into place
+       and registered; the deferred signature check of `addToStore(info,
+       source)` belongs to a received description and has no analogue
+       here, as it has none there. */
+    const LocalSettings & localSettings = config->getLocalSettings();
+    auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(localSettings.ignoredAcls));
+
+    /* Before the restore, for the reason `addToStore` gives: the objects
+       are written before the path is registered (01 §10, *the
+       ingestion's `autoGC()` runs before the restore*). */
+    autoGC();
+
+    /* The objects written and reused are held until the registration
+       below (`GitObjectStore::Hold`; `08` K16). */
+    auto hold = objects.hold();
+
+    auto [tempDir, tempDirFd] = createTempDirInStore();
+    AutoDelete delTempDir(tempDir);
+    auto tempPath = tempDir / "x";
+
+    auto result = materialiseThroughObjects(
+        tempPath, path, filter, localSettings.fsyncStorePaths, hooks.get(), repair, std::move(namer), hold);
+
+    if (settings.warnLargePathThreshold && result.narSize >= settings.warnLargePathThreshold)
+        warn("copied large path '%s' to the store (%s)", path, renderSize(result.narSize));
+
+    auto desc = ContentAddressWithReferences::fromParts(
+        ContentAddressMethod::Raw::Git, merkle::objectHash(result.root), {.others = {}, .self = false});
+    auto dstPath = makeFixedOutputPathFromCA(name, desc);
+
+    addTempRoot(dstPath);
+
+    if (repair || !isValidPath(dstPath)) {
+        auto realPath = toRealPath(dstPath);
+        PathLocks outputLock({realPath});
+
+        /* The path may have been created by another process in the meantime, so check again. */
+        if (repair || !isValidPathUncached(dstPath)) {
+            deletePath(realPath);
+
+            try {
+                /* movePath and not renameFile because at this point the top-level directory is
+                   read-only. */
+                movePath(tempPath, realPath);
+            } catch (const SystemError & e) {
+                if (!e.is(std::errc::cross_device_link))
+                    throw;
+                /* As `addToStoreFromDump`: copied plainly, then entered by
+                   the one walk. */
+                warn("can't rename %s as %s, copying instead", PathFmt(tempPath), PathFmt(realPath));
+                RestoreSink copySink{/*startFsync=*/false, /*hooks=*/hooks.get()};
+                copySink.dstPath = realPath;
+                copyRecursive(*makeFSSourceAccessor(tempPath), CanonPath::root, copySink, CanonPath::root);
+                delTempDir.deletePath();
+                result = enterPath(realPath, repair, hold);
+            }
+
+            if (localSettings.fsyncStorePaths) {
+                recursiveSync(realPath);
+                syncParent(realPath);
+            }
+
+            auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
+            info.narSize = result.narSize;
+            registerValidPath(info);
+
+            /* Naming this ingestion's path makes its rows true. */
+            endIngestion(hold, info.path);
+        } else
+            // We may have a negative cache entry for this path, so get rid of it.
+            invalidatePathInfoCacheFor(dstPath);
+
+        outputLock.setDeletion(true);
+    }
+
+    return dstPath;
+}
+
+std::pair<ObjectHashSink::Result, std::vector<std::filesystem::path>>
+LocalStore::verifyObjects(const std::filesystem::path & realPath)
+{
+    VerifyVisitor verify{objects, realPath};
+    auto result = objectHashOf(*makeFSSourceAccessor(realPath), CanonPath::root, defaultPathFilter, verify);
+    /* The synthetic root tree of a bare executable or symlink, through
+       which its blob is reachable (`putRootTree`). */
+    if (auto body = merkle::syntheticRootTree(result.root))
+        verify.expect(objects.treeFile(merkle::treeId(*body)));
+    return {result, std::move(verify.missing)};
+}
+
+ObjectHashSink::Result LocalStore::enterIntoObjects(
+    const std::filesystem::path & path,
+    RepairFlag repair,
+    const GitObjectStore::Hold & hold,
+    Activity * act,
+    OptimiseStats * stats,
+    GitObjectStore::BlobInodes * blobInodes)
+{
+    /* The on-disk walk is an ingestion too -- the flat add, the `EXDEV`
+       copy, the after-build walk, `nix-store --optimise`'s re-entry -- and it
+       records the same rows, so it opens the same ingestion: the root is the
+       path it walks, and the caller names it when the path is registered
+       (`endIngestion`).  Each call opens its own, so a hold shared by several
+       outputs does not attribute one output's holders to another's path. */
+    beginIngestion(hold, path);
+    EnterVisitor enter{*this, hold, path, repair, blobInodes, stats, act};
+    auto result = objectHashOf(*makeFSSourceAccessor(path), CanonPath::root, defaultPathFilter, enter);
+    objects.putRootTree(result.root, hold);
+    return result;
 }
 
 void LocalStore::optimiseStore(OptimiseStats & stats)
@@ -300,7 +1074,7 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
     Activity act(*logger, actOptimiseStore);
 
     auto paths = queryAllValidPaths();
-    InodeHash inodeHash = loadInodeHash();
+    auto blobInodes = objects.blobInodes();
 
     act.progress(0, paths.size());
 
@@ -308,15 +1082,71 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
 
     for (auto & i : paths) {
         addTempRoot(i);
-        if (!isValidPath(i))
+        auto row = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+            [&]() { return queryPathInfoInternal(*_state->lock(), i); });
+        if (!row)
             continue; /* path was GC'ed, probably */
-        {
-            Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));
-            optimisePath_(&act, stats, config->realStoreDir.get() / i.to_string(), inodeHash, NoRepair);
+        Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));
+        /* A row an older Nix wrote (01 §9.11, "The database") is migrated
+           first, by the walk `nix store migrate` makes: the NAR hash it
+           asserts is checked on the tee before its column is written
+           (`walkOldRow`; 01 §10, *a schema-10 row's migration checks the NAR
+           hash the row asserts*), so a path modified since is
+           neither blessed nor entered -- it is reported as the verifier
+           reports it and left to `--verify --check-contents --repair`.  Such
+           a path is read twice here, once to migrate and once to enter; a
+           store this Nix wrote has no such row. */
+        if (!row->objectHash) {
+            ValidPathInfo old(*row);
+            std::optional<std::pair<Hash, Hash>> narHashes;
+            try {
+                switch (walkOldRow(old, &narHashes)) {
+                case OldRowWalk::Migrated:
+                    break;
+                case OldRowWalk::Modified:
+                    printError(
+                        "path '%s' was modified! expected hash '%s', got '%s'; not entered -- run `nix-store --verify --check-contents --repair`",
+                        printStorePath(i),
+                        narHashes->first.to_string(HashFormat::Nix32, true),
+                        narHashes->second.to_string(HashFormat::Nix32, true));
+                    continue;
+                case OldRowWalk::FilesMissing:
+                    printError(
+                        "path '%s' is registered but its files are missing; run `nix-store --verify` to remove the row",
+                        printStorePath(i));
+                    continue;
+                }
+            } catch (InvalidPath &) {
+                continue; /* collected meanwhile */
+            }
+            stats.rowsMigrated++;
         }
+        /* Every path is walked; a path entered before costs its directory
+           walk and no more, since its files' inodes are in `blobInodes`.
+           On a store this Nix wrote that is every path.  The path is
+           valid, so its root is live already; the trees written beneath it
+           are held until the root is (`Hold`; `08` K16), since no GC lock
+           is taken here and a collection may sweep meanwhile. */
+        auto hold = objects.hold();
+        auto pathRoot = config->realStoreDir.get() / i.to_string();
+        enterIntoObjects(pathRoot, NoRepair, hold, &act, &stats, &blobInodes);
+        /* `nix-store --optimise` is what re-establishes an index a
+           collection or an older Nix left incomplete. */
+        endIngestion(hold, i);
         done++;
         act.progress(done, paths.size());
     }
+
+    removeLegacyLinks();
+}
+
+void LocalStore::removeLegacyLinks()
+{
+    auto links = config->realStoreDir.get() / ".links";
+    if (!pathExists(links))
+        return;
+    printInfo("removing the legacy '.links' directory");
+    deletePath(links);
 }
 
 void LocalStore::optimiseStore()
@@ -325,16 +1155,19 @@ void LocalStore::optimiseStore()
 
     optimiseStore(stats);
 
-    printInfo("%s freed by hard-linking %d files", renderSize(stats.bytesFreed), stats.filesLinked);
+    /* A no-op reads all zeros; a migration says what it entered and wrote. */
+    printInfo(
+        "%s freed by hard-linking %d files; %d files entered as new objects; %d paths migrated to the object hash",
+        renderSize(stats.bytesFreed),
+        stats.filesLinked,
+        stats.filesEntered,
+        stats.rowsMigrated);
 }
 
-void LocalStore::optimisePath(const std::filesystem::path & path, RepairFlag repair)
+ObjectHashSink::Result
+LocalStore::enterPath(const std::filesystem::path & path, RepairFlag repair, const GitObjectStore::Hold & hold)
 {
-    OptimiseStats stats;
-    InodeHash inodeHash;
-
-    if (config->getLocalSettings().autoOptimiseStore)
-        optimisePath_(nullptr, stats, path, inodeHash, repair);
+    return enterIntoObjects(path, repair, hold);
 }
 
 } // namespace nix

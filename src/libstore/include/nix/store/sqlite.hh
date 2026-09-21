@@ -140,6 +140,8 @@ struct SQLiteStmt
         bool next();
 
         std::string getStr(int col);
+        /** The column's bytes, for a `blob` column (`getStr` would convert it). */
+        std::string getBlobStr(int col);
         int64_t getInt(int col);
         bool isNull(int col);
     };

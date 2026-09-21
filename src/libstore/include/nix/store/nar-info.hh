@@ -26,8 +26,11 @@ struct UnkeyedNarInfo : virtual UnkeyedValidPathInfo
     // TODO libc++ 16 (used by darwin) missing `std::optional::operator <=>`, can't do yet
     // auto operator <=>(const NarInfo &) const = default;
 
-    nlohmann::json
-    toJSON(const StoreDirConfig * store, bool includeImpureInfo, PathInfoJsonFormat format) const override;
+    nlohmann::json toJSON(
+        const StoreDirConfig * store,
+        bool includeImpureInfo,
+        PathInfoJsonFormat format,
+        std::optional<NarHashThunk> narHashFor = std::nullopt) const override;
     static UnkeyedNarInfo fromJSON(const StoreDirConfig * store, const nlohmann::json & json);
 };
 
@@ -54,22 +57,29 @@ public:
     {
     }
 
-    NarInfo(const StoreDirConfig & store, StorePath path, Hash narHash)
-        : NarInfo{ValidPathInfo{std::move(path), UnkeyedValidPathInfo{store, narHash}}}
+    NarInfo(const StoreDirConfig & store, StorePath path, std::optional<ObjectHash> objectHash)
+        : NarInfo{ValidPathInfo{std::move(path), UnkeyedValidPathInfo{store, std::move(objectHash)}}}
     {
     }
 
-    NarInfo(std::string storeDir, StorePath path, Hash narHash)
-        : NarInfo{ValidPathInfo{std::move(path), UnkeyedValidPathInfo{std::move(storeDir), narHash}}}
+    NarInfo(std::string storeDir, StorePath path, std::optional<ObjectHash> objectHash)
+        : NarInfo{ValidPathInfo{std::move(path), UnkeyedValidPathInfo{std::move(storeDir), std::move(objectHash)}}}
     {
     }
 
-    static NarInfo
-    makeFromCA(const StoreDirConfig & store, std::string_view name, ContentAddressWithReferences ca, Hash narHash)
+    static NarInfo makeFromCA(
+        const StoreDirConfig & store,
+        std::string_view name,
+        ContentAddressWithReferences ca,
+        std::optional<ObjectHash> objectHash)
     {
-        return ValidPathInfo::makeFromCA(store, std::move(name), std::move(ca), narHash);
+        return ValidPathInfo::makeFromCA(store, std::move(name), std::move(ca), std::move(objectHash));
     }
 
+    /**
+     * Parse a `.narinfo`.  `ObjectHash:` is read into `objectHash` and
+     * `NarHash:` into `assertedNarHash`; at least one must be present.
+     */
     NarInfo(const StoreDirConfig & store, const std::string & s, const std::string & whence);
 
     bool operator==(const NarInfo &) const = default;

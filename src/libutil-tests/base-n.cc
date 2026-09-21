@@ -12,6 +12,36 @@ static const std::span<const std::byte> stringToByteSpan(const std::string_view 
 }
 
 /* ----------------------------------------------------------------------------
+ * encodeTo: the same characters, appended to what the caller already has
+ * --------------------------------------------------------------------------*/
+
+TEST(encodeTo, appendsWhatEncodeReturns)
+{
+    for (auto s : {"", "q", "qu", "quo", "quod erat demonstrandum"}) {
+        auto bytes = stringToByteSpan(s);
+        std::string out = "prefix";
+        base16::encodeTo(out, bytes);
+        EXPECT_EQ(out, "prefix" + base16::encode(bytes)) << s;
+        out = "prefix";
+        base64::encodeTo(out, bytes);
+        EXPECT_EQ(out, "prefix" + base64::encode(bytes)) << s;
+    }
+}
+
+/* The padding counts the bytes this call wrote, not the length of the
+   string it wrote them into: a prefix of a length not a multiple of four
+   would otherwise pad to the wrong place. */
+TEST(encodeTo, base64PadsByWhatItWrote)
+{
+    auto bytes = stringToByteSpan("q");
+    for (auto prefix : {"", "a", "ab", "abc", "abcd", "abcde"}) {
+        std::string out = prefix;
+        base64::encodeTo(out, bytes);
+        EXPECT_EQ(out, prefix + base64::encode(bytes)) << prefix;
+    }
+}
+
+/* ----------------------------------------------------------------------------
  * base64::encode
  * --------------------------------------------------------------------------*/
 

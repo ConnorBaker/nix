@@ -5,6 +5,8 @@
 #include "nix/util/source-accessor.hh"
 #include "nix/util/file-system.hh"
 
+#include <memory>
+
 namespace nix {
 
 /**
@@ -73,12 +75,6 @@ public:
 };
 
 /**
- * Recursively copy file system objects from the source into the sink.
- */
-void copyRecursive(
-    SourceAccessor & accessor, const CanonPath & sourcePath, FileSystemObjectSink & sink, const CanonPath & destPath);
-
-/**
  * Ignore everything and do nothing
  */
 struct NullFileSystemObjectSink : FileSystemObjectSink
@@ -95,6 +91,28 @@ public:
 };
 
 class RestoreSinkHooks;
+
+/**
+ * A regular file `RestoreSink` is creating, open in two phases: returned
+ * by `RestoreSink::beginRegularFile`, fed as any `CreateRegularFileSink`,
+ * and completed by `finish()`, which flushes and runs the sink's hooks
+ * (`08` §1.6: the composite opens a file lazily through this).  The
+ * descriptor closes with the object.
+ */
+struct RegularFileWriter : CreateRegularFileSink
+{
+private:
+    void anchor() override;
+
+public:
+    virtual ~RegularFileWriter() = default;
+
+    /**
+     * Flush the bytes written and run `RestoreSinkHooks::regularFileCreated`.
+     * Once.
+     */
+    virtual void finish() = 0;
+};
 
 /**
  * Write files at the given path
@@ -133,9 +151,38 @@ public:
 
     void createDirectory(const CanonPath & path, DirectoryCreatedCallback callback) override;
 
+    using SubdirectoryCallback = fun<void(RestoreSink & subSink, const CanonPath & dirRelPath)>;
+
+    /**
+     * The typed form of the callback `createDirectory`: the callback is
+     * handed the subdirectory's own `RestoreSink` (its `dirFd` open on the
+     * directory, `dstPath` the directory's) under the name `/`, so that a
+     * composer can hold it without a cast.  The generic override calls this.
+     */
+    void createSubdirectory(const CanonPath & path, SubdirectoryCallback callback);
+
     void createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)>) override;
 
+    /**
+     * Open the regular file at `path` for writing, without writing it:
+     * `createRegularFile(path, f)` is `auto w = beginRegularFile(path);
+     * f(*w); w->finish();`.
+     */
+    std::unique_ptr<RegularFileWriter> beginRegularFile(const CanonPath & path);
+
     void createSymlink(const CanonPath & path, const std::string & target) override;
+
+#ifndef _WIN32
+    /**
+     * Where `path` goes, for `*at` operations: the descriptor of its
+     * parent directory and its single-component name in it.  The
+     * `AutoCloseFD` owns the descriptor when it was opened for this call
+     * (a multi-component `path`, or the root of a sink without `dirFd`,
+     * whose parent is opened); otherwise it is empty and the descriptor
+     * borrows from `dirFd`.
+     */
+    std::tuple<AutoCloseFD, Descriptor, CanonPath> parentOf(const CanonPath & path) const;
+#endif
 };
 
 /**

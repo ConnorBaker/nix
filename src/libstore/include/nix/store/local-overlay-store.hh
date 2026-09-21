@@ -219,6 +219,35 @@ private:
     VerificationResult verifyAllValidPaths(RepairFlag repair) override;
 
     /**
+     * The store directory is the merged mount: `.objects` and `.links`
+     * under it are the union of the upper layer's and the lower store's,
+     * and every write through it lands in the upper layer -- an unlink of
+     * a lower file is a whiteout, a repair of a lower path a copy-up.  So
+     * the `.links` removal and the verifier's object checks are not run
+     * for this store (`LocalStore::ownsObjectStore`); `optimiseStore`
+     * above enters nothing either.  The sweep is not gated on this: it
+     * runs over the upper layer alone (`sweepObjectStore`).
+     */
+    bool ownsObjectStore() const override
+    {
+        return false;
+    }
+
+    /**
+     * Law 5 over the upper layer alone.  The objects this store owns are
+     * the ones under `upper-layer/.objects`; the lower store's are its
+     * own, read-only and shared, and are never removed.  Reachability is
+     * computed over the merged object store, which is what this store
+     * reads: an object the lower layer holds keeps what it reaches.
+     *
+     * The index's stale rows are *not* this method's business and are not
+     * narrowed by the layer: they are the upper store's own database's,
+     * and `LocalStore::sweepObjects`, which is not virtual, removes them
+     * beside this.
+     */
+    void sweepObjectStore() override;
+
+    /**
      * Deletion only effects the upper layer, so we ignore lower-layer referrers.
      */
     void queryGCReferrers(const StorePath & path, StorePathSet & referrers) override;

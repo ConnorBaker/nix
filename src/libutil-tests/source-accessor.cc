@@ -108,6 +108,66 @@ TEST_F(FSSourceAccessorTest, invalidateCacheDropsStaleDirFds)
 }
 
 /* ----------------------------------------------------------------------------
+ * The destination computed for `CanonPath::root`
+ * --------------------------------------------------------------------------*/
+
+/* A root that is not a directory is restored *at* `dstPath`, so the
+   destination computed for `CanonPath::root` must be the target exactly:
+   `std::filesystem::path / ""` appends a separator, and a destination
+   ending in one has an empty `filename()`, which is not a name any `*at`
+   call can take.  `append` (fs-sink.cc) is where the guard is; it is
+   file-local, so the three root kinds are restored here and the text of
+   the error that names the destination is checked, since that text is the
+   computed path itself.  The restore of a one-file NAR at its destination
+   is exercised inside `LocalStoreObjectsTest.restoreThroughObjects`. */
+TEST_F(FSSourceAccessorTest, singleFileRootDestinationHasNoTrailingSlash)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "Broken on Windows";
+#endif
+    /* A regular file. */
+    auto file = tmpDir / "one-file";
+    {
+        RestoreSink sink(/*startFsync=*/false);
+        sink.dstPath = file;
+        sink.createRegularFile(CanonPath::root, [](CreateRegularFileSink & crf) { crf("bytes"); });
+    }
+    EXPECT_TRUE(std::filesystem::is_regular_file(std::filesystem::symlink_status(file)))
+        << "the file is at the destination, not below it";
+    EXPECT_EQ(readFile(file), "bytes");
+
+    /* A symlink. */
+    auto link = tmpDir / "one-link";
+    {
+        RestoreSink sink(/*startFsync=*/false);
+        sink.dstPath = link;
+        sink.createSymlink(CanonPath::root, "somewhere");
+    }
+    EXPECT_TRUE(std::filesystem::is_symlink(std::filesystem::symlink_status(link)));
+    EXPECT_EQ(std::filesystem::read_symlink(link), std::filesystem::path("somewhere"));
+
+    /* A directory, whose own `dirFd` is opened from the same computed
+       destination. */
+    auto dir = tmpDir / "one-dir";
+    {
+        RestoreSink sink(/*startFsync=*/false);
+        sink.dstPath = dir;
+        sink.createDirectory(CanonPath::root);
+        EXPECT_TRUE(sink.dirFd);
+    }
+    EXPECT_TRUE(std::filesystem::is_directory(std::filesystem::symlink_status(dir)));
+
+    /* And the destination as the error names it: `PathFmt` puts it between
+       quotes, so a separator after it would show. */
+    auto missing = tmpDir / "no-such-directory" / "x";
+    RestoreSink bad(/*startFsync=*/false);
+    bad.dstPath = missing;
+    EXPECT_THAT(
+        [&] { bad.createRegularFile(CanonPath::root, [](CreateRegularFileSink &) {}); },
+        ::testing::ThrowsMessage<SysError>(testing::HasSubstrIgnoreANSIMatcher("\"" + missing.string() + "\"")));
+}
+
+/* ----------------------------------------------------------------------------
  * RestoreSink non-directory at root (no dirFd)
  * --------------------------------------------------------------------------*/
 

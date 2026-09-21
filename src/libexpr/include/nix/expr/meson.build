@@ -31,6 +31,7 @@ headers = [ config_pub_h ] + files(
   'print-ambiguous.hh',
   'print-options.hh',
   'print.hh',
+  'realised-string.hh',
   'repl-exit-status.hh',
   'search-path.hh',
   'static-string-data.hh',
@@ -39,4 +40,5 @@ headers = [ config_pub_h ] + files(
   'value-to-xml.hh',
   'value.hh',
   'value/context.hh',
+  'write-buffer.hh',
 )

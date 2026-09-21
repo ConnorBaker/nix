@@ -166,6 +166,36 @@ schemas += [
 
 # Store object info
 schemas += [
+  # Version 4: `objectHash` required, `narHash` optional
+  {
+    'stem' : 'store-object-info',
+    'schema' : schema_dir / 'store-object-info-v4.yaml',
+    'files' : [
+      'json-4' / 'pure.json',
+      'json-4' / 'pure_asserted.json',
+      'json-4' / 'impure.json',
+      'json-4' / 'empty_pure.json',
+      'json-4' / 'empty_impure.json',
+    ],
+  },
+  {
+    'stem' : 'store-object-info',
+    'schema' : schema_dir / 'store-object-info-v4.yaml#/$defs/base',
+    'files' : [
+      'json-4' / 'pure.json',
+      'json-4' / 'pure_asserted.json',
+      'json-4' / 'empty_pure.json',
+    ],
+  },
+  {
+    'stem' : 'store-object-info',
+    'schema' : schema_dir / 'store-object-info-v4.yaml#/$defs/impure',
+    'files' : [
+      'json-4' / 'impure.json',
+      'json-4' / 'empty_impure.json',
+    ],
+  },
+  # Version 3, still written for older readers
   # Match overall
   {
     'stem' : 'store-object-info',

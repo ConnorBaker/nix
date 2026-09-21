@@ -444,7 +444,7 @@ void RemoteStore::addToStore(const ValidPathInfo & info, Source & source, Repair
     conn->to << WorkerProto::Op::AddToStoreNar;
     WorkerProto::write(*this, *conn, info.path);
     WorkerProto::write(*this, *conn, info.deriver);
-    conn->to << info.narHash.to_string(HashFormat::Base16, false);
+    WorkerProto::writePathInfoHashes(*conn, info);
     WorkerProto::write(*this, *conn, info.references);
     conn->to << info.registrationTime << info.narSize << info.ultimate;
     WorkerProto::write(*this, *conn, info.sigs);
@@ -458,6 +458,9 @@ void RemoteStore::addToStore(const ValidPathInfo & info, Source & source, Repair
         copyNAR(source, conn->to);
         conn.processStderr(0, nullptr);
     }
+
+    /* The daemon has the object now; a cached negative answer about it is stale. */
+    invalidatePathInfoCacheFor(info.path);
 }
 
 void RemoteStore::addMultipleToStore(
@@ -472,8 +475,10 @@ void RemoteStore::addMultipleToStore(
 
     // `addMultipleToStore` is single threaded
     size_t bytesExpected = 0;
+    StorePathSet added;
     for (auto & [pathInfo, _] : pathsToCopy) {
         bytesExpected += pathInfo.narSize;
+        added.insert(pathInfo.path);
     }
     act.setExpected(actCopyPath, bytesExpected);
 
@@ -486,11 +491,15 @@ void RemoteStore::addMultipleToStore(
             act.progress(nrTotal - pathsToCopy.size(), nrTotal, size_t(1), size_t(0));
 
             auto & [pathInfo, pathSource] = pathsToCopy.back();
+            /* A fixed version number, under the connection's negotiated
+               features: the hash slot is the feature's form. */
+            WorkerProto::Version multiVersion{
+                .number = {.major = 1, .minor = 16}, .features = conn->protoVersion.features};
             WorkerProto::Serialise<ValidPathInfo>::write(
                 *this,
                 WorkerProto::WriteConn{
                     .to = sink,
-                    .version = {.number = {.major = 1, .minor = 16}},
+                    .version = multiVersion,
                 },
                 pathInfo);
             pathSource->drainInto(sink);
@@ -500,6 +509,10 @@ void RemoteStore::addMultipleToStore(
 
     conn->to << WorkerProto::Op::AddMultipleToStore << repair << !checkSigs;
     conn.withFramedSink([&](Sink & sink) { source->drainInto(sink); });
+
+    /* The daemon has the objects now; cached negative answers about them are stale. */
+    for (auto & path : added)
+        invalidatePathInfoCacheFor(path);
 }
 
 void RemoteStore::registerDrvOutputUnchecked(const Realisation & info)

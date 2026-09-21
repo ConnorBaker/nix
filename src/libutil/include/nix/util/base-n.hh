@@ -17,6 +17,14 @@ namespace base16 {
 }
 
 /**
+ * Encode arbitrary bytes as Base16, appending to `out`.  The same characters
+ * `encode` returns; the caller's buffer spares the string `encode` makes,
+ * which every name of an object file and every fingerprint of a Git node
+ * would otherwise allocate and copy (`05` section 6).
+ */
+void encodeTo(std::string & out, std::span<const std::byte> b);
+
+/**
  * Encode arbitrary bytes as Base16.
  */
 std::string encode(std::span<const std::byte> b);
@@ -37,6 +45,11 @@ namespace base64 {
 {
     return ((4 * origSize / 3) + 3) & ~3;
 }
+
+/**
+ * Encode arbitrary bytes as Base64, appending to `out`.
+ */
+void encodeTo(std::string & out, std::span<const std::byte> b);
 
 /**
  * Encode arbitrary bytes as Base64.

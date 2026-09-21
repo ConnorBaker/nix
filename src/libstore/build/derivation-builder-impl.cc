@@ -8,7 +8,8 @@
 #include "nix/util/archive.hh"
 #include "nix/util/file-content-address.hh"
 #include "nix/util/file-system.hh"
-#include "nix/util/git.hh"
+#include "nix/util/object-hash.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/topo-sort.hh"
@@ -104,6 +105,12 @@ static void replaceValidPath(const std::filesystem::path & storePath, const std:
 SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
 {
     std::map<std::string, ValidPathInfo> infos;
+
+    /* The build's hold on the objects `enterPath` writes for its outputs,
+       until they are registered below (`GitObjectStore::Hold`; `08` K16):
+       the builder's own `autoGC(false)` collects on another thread while
+       this runs. */
+    auto hold = localStore.objects.hold();
 
     /* Set of inodes seen during calls to canonicalisePathMetaData()
        for this build's outputs.  This needs to be shared between
@@ -404,7 +411,11 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                     return caSink.finish().hash;
                 }
                 case FileIngestionMethod::Git: {
-                    return git::dumpHash(outputHash.hashAlgo, {makeFSSourceAccessor(actualPath), CanonPath::root}).hash;
+                    /* A derivation naming the SHA-1 form (written by an older
+                       Nix, or added as JSON) is read but not built: the
+                       address it declares cannot be checked. */
+                    checkIngestionAlgorithm(fim, outputHash.hashAlgo);
+                    return merkle::objectHash(objectHashOf(*makeFSSourceAccessor(actualPath), CanonPath::root).root);
                 }
                 }
                 assert(false);
@@ -414,7 +425,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                 *store,
                 outputPathName(drv.name, outputName),
                 ContentAddressWithReferences::fromParts(outputHash.method, std::move(got), rewriteRefs()),
-                Hash::dummy);
+                std::nullopt);
             if (*scratchPath != newInfo0.path) {
                 // If the path has some self-references, we need to rewrite
                 // them.
@@ -424,15 +435,8 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                 rewriteOutput(StringMap{{oldHashPart, std::string(newInfo0.path.hashPart())}});
             }
 
-            {
-                HashResult narHashAndSize = hashPath(
-                    {makeFSSourceAccessor(actualPath), CanonPath::root},
-                    FileSerialisationMethod::NixArchive,
-                    HashAlgorithm::SHA256);
-                newInfo0.narHash = narHashAndSize.hash;
-                newInfo0.narSize = narHashAndSize.numBytesDigested;
-            }
-
+            /* The object hash and the NAR size are computed once the output
+               stands in place, below. */
             assert(newInfo0.ca);
             return newInfo0;
         };
@@ -468,12 +472,9 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                         outputRewrites.insert_or_assign(
                             std::string{scratchPath->hashPart()}, std::string{requiredFinalPath.hashPart()});
                     rewriteOutput(outputRewrites);
-                    HashResult narHashAndSize = hashPath(
-                        {makeFSSourceAccessor(actualPath), CanonPath::root},
-                        FileSerialisationMethod::NixArchive,
-                        HashAlgorithm::SHA256);
-                    ValidPathInfo newInfo0{requiredFinalPath, {*store, narHashAndSize.hash}};
-                    newInfo0.narSize = narHashAndSize.numBytesDigested;
+                    /* The object hash and the NAR size are computed once the
+                       output stands in place, below. */
+                    ValidPathInfo newInfo0{requiredFinalPath, {*store, std::nullopt}};
                     auto refs = rewriteRefs();
                     newInfo0.references = std::move(refs.others);
                     if (refs.self)
@@ -556,6 +557,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         }
 
         /* Move files, if needed */
+        bool keptExisting = false;
         if (store->toRealPath(newInfo.path) != actualPath) {
             if (buildMode == bmRepair) {
                 /* Path already exists, need to replace it */
@@ -569,6 +571,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                 assert(newInfo.ca);
                 /* Can delete our scratch copy now. */
                 deletePath(actualPath);
+                keptExisting = true;
             } else {
                 auto destPath = store->toRealPath(newInfo.path);
                 deletePath(destPath);
@@ -576,12 +579,41 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
             }
         }
 
+        /* The object hash and the NAR size of the output as it stands (01
+           section 9.11, "The after-build walk"): under `--check`, one hashing
+           walk of the copy left in place, which is not registered; otherwise
+           the one walk that also enters the output into the object store; for
+           a content-addressed output another build had registered already,
+           the row's own values. */
+        if (buildMode == bmCheck) {
+            auto r = objectHashOf(*makeFSSourceAccessor(actualPath), CanonPath::root);
+            newInfo.objectHash = ObjectHash::of(r.root);
+            newInfo.narSize = r.narSize;
+        } else if (keptExisting) {
+            auto existing = localStore.queryPathInfo(newInfo.path);
+            newInfo.objectHash = existing->objectHash;
+            newInfo.narSize = existing->narSize;
+        } else {
+            /* Under `--repair` a corrupt blob the store holds must not be
+               linked over the fresh output: the walk checks each blob's
+               bytes and replaces a bad one by the output's file. */
+            auto r = localStore.enterPath(store->toRealPath(newInfo.path), enterRepairFlagOf(buildMode), hold);
+            /* This output's ingestion is this output's path: named here,
+               while the walk that made its rows is the last one to have run
+               (one hold covers every output, `08` K16). */
+            localStore.endIngestion(hold, newInfo.path);
+            newInfo.objectHash = ObjectHash::of(r.root);
+            newInfo.narSize = r.narSize;
+        }
+
         if (buildMode == bmCheck) {
             /* Check against already registered outputs */
 
             if (localStore.isValidPath(newInfo.path)) {
+                /* `queryPathInfo` migrates an old row, so `oldInfo` has its
+                   object hash whatever the row held. */
                 ValidPathInfo oldInfo(*localStore.queryPathInfo(newInfo.path));
-                if (newInfo.narHash != oldInfo.narHash) {
+                if (newInfo.objectHash != oldInfo.objectHash) {
                     auto * diffHook = localSettings.getDiffHook();
                     if (diffHook || settings.keepFailed) {
                         auto dst = store->toRealPath(newInfo.path);
@@ -631,10 +663,6 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                 else
                     debug("unreferenced input: '%1%'", store->printStorePath(i));
             }
-
-            if (!localStore.isValidPath(newInfo.path))
-                localStore.optimisePath(
-                    store->toRealPath(newInfo.path), NoRepair); // FIXME: combine with scanForReferences()
 
             newInfo.deriver = drvPath;
             newInfo.ultimate = true;

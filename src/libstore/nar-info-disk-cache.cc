@@ -31,6 +31,7 @@ create table if not exists NARs (
     fileHash         text,
     fileSize         integer,
     narHash          text,
+    objectHash       text,
     narSize          integer,
     refs             text,
     deriver          text,
@@ -91,7 +92,7 @@ public:
     NarInfoDiskCacheImpl(
         const Settings & settings,
         SQLiteSettings sqliteSettings,
-        std::filesystem::path dbPath = getCacheDir() / "binary-cache-v8.sqlite")
+        std::filesystem::path dbPath = getCacheDir() / "binary-cache-v9.sqlite")
         : NarInfoDiskCache{settings}
     {
         auto state(_state.lock());
@@ -115,14 +116,14 @@ public:
         state->insertNAR.create(
             state->db,
             "insert or replace into NARs(cache, hashPart, namePart, url, compression, fileHash, fileSize, narHash, "
-            "narSize, refs, deriver, sigs, ca, timestamp, present) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)");
+            "objectHash, narSize, refs, deriver, sigs, ca, timestamp, present) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)");
 
         state->insertMissingNAR.create(
             state->db, "insert or replace into NARs(cache, hashPart, timestamp, present) values (?, ?, ?, 0)");
 
         state->queryNAR.create(
             state->db,
-            "select present, namePart, url, compression, fileHash, fileSize, narHash, narSize, refs, deriver, sigs, ca from NARs where cache = ? and hashPart = ? and ((present = 0 and timestamp > ?) or (present = 1 and timestamp > ?))");
+            "select present, namePart, url, compression, fileHash, fileSize, narHash, narSize, refs, deriver, sigs, ca, objectHash from NARs where cache = ? and hashPart = ? and ((present = 0 and timestamp > ?) or (present = 1 and timestamp > ?))");
 
         state->insertRealisation.create(
             state->db,
@@ -280,7 +281,11 @@ public:
 
                 auto namePart = queryNAR.getStr(1);
                 auto narInfo = make_ref<NarInfo>(
-                    cache.storeDir, StorePath(hashPart + "-" + namePart), Hash::parseAnyPrefixed(queryNAR.getStr(6)));
+                    cache.storeDir,
+                    StorePath(hashPart + "-" + namePart),
+                    queryNAR.isNull(12) ? std::nullopt : std::optional{ObjectHash::parseOrThrow(queryNAR.getStr(12))});
+                if (!queryNAR.isNull(6))
+                    narInfo->assertedNarHash = Hash::parseAnyPrefixed(queryNAR.getStr(6));
                 narInfo->url = queryNAR.getStr(2);
                 narInfo->compression = parseCompressionAlgo(queryNAR.getStr(3));
                 if (!queryNAR.isNull(4))
@@ -368,7 +373,10 @@ public:
                         narInfo && narInfo->fileHash ? narInfo->fileHash->to_string(HashFormat::Nix32, true) : "",
                         narInfo && narInfo->fileHash)
                     .apply(narInfo ? narInfo->fileSize : 0, narInfo != 0 && narInfo->fileSize)
-                    .apply(info->narHash.to_string(HashFormat::Nix32, true))
+                    .apply(
+                        info->assertedNarHash ? info->assertedNarHash->to_string(HashFormat::Nix32, true) : "",
+                        (bool) info->assertedNarHash)
+                    .apply(info->objectHash ? info->objectHash->render() : "", (bool) info->objectHash)
                     .apply(info->narSize)
                     .apply(concatStringsSep(" ", info->shortRefs()))
                     .apply(info->deriver ? std::string(info->deriver->to_string()) : "", (bool) info->deriver)

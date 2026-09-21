@@ -181,14 +181,17 @@ nix_locked_flake * nix_flake_lock(
     nix_flake_lock_flags * flags,
     nix_flake_reference * flakeReference)
 {
-    nix_clear_err(context);
-    try {
-        eval_state->state.resetFileCache();
-        auto lockedFlake = nix::make_ref<nix::flake::LockedFlake>(nix::flake::lockFlake(
-            *flakeSettings->settings, eval_state->state, *flakeReference->flakeRef, *flags->lockFlags));
-        return new nix_locked_flake{lockedFlake};
-    }
-    NIXC_CATCH_ERRS_NULL
+    return nix_c_boundary(
+        context,
+        eval_state,
+        [&] {
+            eval_state->state.resetFileCache();
+            return nix::make_ref<nix::flake::LockedFlake>(nix::flake::lockFlake(
+                *flakeSettings->settings, eval_state->state, *flakeReference->flakeRef, *flags->lockFlags));
+        },
+        [](nix::ref<nix::flake::LockedFlake> lockedFlake) -> nix_locked_flake * {
+            return new nix_locked_flake{lockedFlake};
+        });
 }
 
 void nix_locked_flake_free(nix_locked_flake * lockedFlake)
@@ -199,13 +202,20 @@ void nix_locked_flake_free(nix_locked_flake * lockedFlake)
 nix_value * nix_locked_flake_get_output_attrs(
     nix_c_context * context, nix_flake_settings * settings, EvalState * evalState, nix_locked_flake * lockedFlake)
 {
-    nix_clear_err(context);
-    try {
-        auto v = nix_alloc_value(context, evalState);
-        nix::flake::callFlake(evalState->state, *lockedFlake->lockedFlake, *v->value);
-        return v;
-    }
-    NIXC_CATCH_ERRS_NULL
+    return nix_c_boundary(
+        context,
+        evalState,
+        [&] {
+            auto * v = evalState->state.allocValue();
+            nix::flake::callFlake(evalState->state, *lockedFlake->lockedFlake, *v);
+            return v;
+        },
+        [&](nix::Value * v) -> nix_value * {
+            auto * handle = nix_alloc_value(context, evalState);
+            if (handle)
+                *handle->value = *v;
+            return handle;
+        });
 }
 
 } // extern "C"

@@ -29,14 +29,14 @@
           "method": "nar"
         },
         "deriver": null,
-        "narHash": "sha256-0mlhg9y1FGb7YsHAsNOmtuW44b8TfoPaNPK6SjVYe5s=",
         "narSize": 232,
+        "objectHash": "git:sha256:2a3037d472afbda335ed9299680775b7ab9999aa56c2690e5abe63b34ec24f23",
         "references": [],
         "registrationTime": null,
         "signatures": [],
         "storeDir": "/nix/store",
         "ultimate": false,
-        "version": 3
+        "version": 4
       }
     },
     "w0yjpwh59kpbyc7hz9jgmi44r9br908i-dep-drv-out": {
@@ -51,14 +51,14 @@
           "method": "nar"
         },
         "deriver": null,
-        "narHash": "sha256-HK2LBzSTtwuRjc44PH3Ac1JHHPKmfnAgNxz6I5mVgL8=",
         "narSize": 144,
+        "objectHash": "git:sha256:780f8a23b8f3e50df8e5af0ab7c248f6454e8817940dfbcd675d3dfd7aef9082",
         "references": [],
         "registrationTime": null,
         "signatures": [],
         "storeDir": "/nix/store",
         "ultimate": false,
-        "version": 3
+        "version": 4
       }
     }
   },

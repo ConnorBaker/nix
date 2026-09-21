@@ -1,12 +1,12 @@
 #include "nix/fetchers/fetchers.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/fs-sink.hh"
+#include "nix/util/tree-traversal.hh"
 #include "nix/store/build.hh"
 #include "nix/util/source-path.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/json-utils.hh"
 #include "nix/fetchers/fetch-settings.hh"
-#include "nix/fetchers/fetch-to-store.hh"
 #include "nix/util/url.hh"
 #include "nix/util/users.hh"
 #include "nix/store/pathlocks.hh"
@@ -159,6 +159,13 @@ bool Input::isDirect() const
     return !scheme || scheme->isDirect(*this);
 }
 
+std::map<std::string, InputScheme::AttributeInfo> InputScheme::allowedAttrs() const
+{
+    auto attrs = schemeAttrs();
+    attrs.insert({{"narHash", {}}, {"treeHash", {}}});
+    return attrs;
+}
+
 bool Input::isLocked(const Settings & settings) const
 {
     return scheme && scheme->isLocked(settings, *this);
@@ -202,30 +209,27 @@ std::pair<StorePath, Input> Input::fetchToStore(const Settings & settings, Store
     if (!scheme)
         throw Error("cannot fetch unsupported input '%s'", attrsToJSON(toAttrs()));
 
-    auto [storePath, input] = [&]() -> std::pair<StorePath, Input> {
-        try {
-            auto [accessor, result] = getAccessorUnchecked(settings, store);
+    /* Verified and locked as `getAccessor` leaves it (an asserted
+       `treeHash` compared, a `narHash` checked by the shim).  The copy
+       names the object by its tree hash, which under the git method is the
+       hash `fetchToStore2` returns: computed here, not read back from the
+       store, since a daemon of an older version answers `queryPathInfo`
+       without an object hash. */
+    auto [accessor, result] = getAccessor(settings, store);
 
-            auto storePath =
-                nix::fetchToStore(settings, store, SourcePath(accessor), FetchMode::Copy, result.getName());
+    try {
+        auto [storePath, treeHash] =
+            nix::fetchToStore2(settings, store, SourcePath(accessor), FetchMode::Copy, result.getName());
 
-            auto narHash = store.queryPathInfo(storePath)->narHash;
-            result.attrs.insert_or_assign("narHash", narHash.to_string(HashFormat::SRI, true));
+        result.attrs.insert_or_assign("treeHash", treeHash.to_string(HashFormat::SRI, true));
 
-            result.attrs.insert_or_assign("__final", Explicit<bool>(true));
+        assert(result.isFinal());
 
-            assert(result.isFinal());
-
-            checkLocks(*this, result);
-
-            return {storePath, result};
-        } catch (Error & e) {
-            e.addTrace({}, "while fetching the input '%s'", to_string());
-            throw;
-        }
-    }();
-
-    return {std::move(storePath), input};
+        return {storePath, result};
+    } catch (Error & e) {
+        e.addTrace({}, "while fetching the input '%s'", to_string());
+        throw;
+    }
 }
 
 void Input::checkLocks(Input specified, Input & result)
@@ -236,15 +240,14 @@ void Input::checkLocks(Input specified, Input & result)
        result input must be identical. */
     if (specified.isFinal()) {
 
-        /* Backwards compatibility hack: we had some lock files in the
-           past that 'narHash' fields with incorrect base-64
-           formatting (lacking the trailing '=', e.g. 'sha256-ri...Mw'
-           instead of ''sha256-ri...Mw='). So fix that. */
-        if (auto prevNarHash = specified.getNarHash())
-            specified.attrs.insert_or_assign("narHash", prevNarHash->to_string(HashFormat::SRI, true));
+        /* Compared as hashes, not as a lock spelled them.  A `narHash` is
+           not compared here: `getAccessor` verifies it through the shim and
+           replaces it by `treeHash`, the one mutation the copy below admits. */
+        if (auto prevTreeHash = specified.getTreeHash())
+            specified.attrs.insert_or_assign("treeHash", prevTreeHash->to_string(HashFormat::SRI, true));
 
-        if (auto narHash = result.getNarHash())
-            result.attrs.insert_or_assign("narHash", narHash->to_string(HashFormat::SRI, true));
+        if (auto treeHash = result.getTreeHash())
+            result.attrs.insert_or_assign("treeHash", treeHash->to_string(HashFormat::SRI, true));
 
         for (auto & field : specified.attrs) {
             auto field2 = result.attrs.find(field.first);
@@ -261,22 +264,11 @@ void Input::checkLocks(Input specified, Input & result)
         return;
     }
 
-    if (auto prevNarHash = specified.getNarHash()) {
-        if (result.getNarHash() != prevNarHash) {
-            if (result.getNarHash())
-                throw Error(
-                    (unsigned int) 102,
-                    "NAR hash mismatch in input '%s', expected '%s' but got '%s'",
-                    specified.to_string(),
-                    prevNarHash->to_string(HashFormat::SRI, true),
-                    result.getNarHash()->to_string(HashFormat::SRI, true));
-            else
-                throw Error(
-                    (unsigned int) 102,
-                    "NAR hash mismatch in input '%s', expected '%s' but got none",
-                    specified.to_string(),
-                    prevNarHash->to_string(HashFormat::SRI, true));
-        }
+    /* The tree hash, when both name one; a `narHash` is verified against
+       the tree by the shim in `getAccessor`, not compared here. */
+    if (auto prevTreeHash = specified.getTreeHash()) {
+        if (auto treeHash = result.getTreeHash(); treeHash && *treeHash != *prevTreeHash)
+            throw inputHashMismatch("tree hash", specified.to_string(), *prevTreeHash, *treeHash);
     }
 
     if (auto prevRev = specified.getRev()) {
@@ -293,6 +285,21 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessor(const Settings & settin
         result.attrs.insert_or_assign("__final", Explicit<bool>(true));
 
         checkLocks(*this, result);
+
+        /* Every assertion is verified here against the tree, named by the
+           memoised dry run `mountInput` repeats for free: a `treeHash` by
+           equality, a `narHash` through the shim.  The name then replaces
+           the `narHash`, so no result carries one (`mountInput` refuses it). */
+        if (getTreeHash() || getNarHash()) {
+            auto treeHash =
+                fetchToStore2(settings, store, SourcePath(accessor), FetchMode::DryRun, result.getName()).second;
+            if (auto locked = getTreeHash(); locked && *locked != treeHash)
+                throw inputHashMismatch("tree hash", to_string(), *locked, treeHash);
+            if (auto asserted = getNarHash())
+                assertNarHash(settings, store, SourcePath(accessor), treeHash, *asserted, to_string());
+            result.attrs.erase("narHash");
+            result.attrs.insert_or_assign("treeHash", treeHash.to_string(HashFormat::SRI, true));
+        }
 
         return {accessor, std::move(result)};
     } catch (Error & e) {
@@ -319,35 +326,52 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
        FIXME: substituting may be slower than fetching normally,
        e.g. for fetchers like Git that are incremental!
     */
-    if (isFinal() && getNarHash()) {
-        try {
-            auto storePath = computeStorePath(store);
+    if (isFinal()) {
+        /* One candidate: the tree's name from its `treeHash`; for an old
+           lock that asserts only a `narHash`, the name the `treeAddress`
+           memo pairs with it, once the shim has paired the two.  There is
+           no flat candidate: nothing is named by the NAR hash any more
+           (doc/lazy-store/01-specification.md, section 9.11). */
+        std::optional<StorePath> candidate;
+        if (getTreeHash())
+            candidate = computeStorePath(store);
+        else if (auto narHash = getNarHash())
+            if (auto treeHash = lookupTreeAddress(settings, *narHash))
+                candidate = gitTreePath(store, getName(), *treeHash);
 
-            store.addTempRoot(storePath);
+        if (candidate) {
+            auto & storePath = *candidate;
+            try {
+                store.addTempRoot(storePath);
 
-            store.getBuilder()->ensurePath(storePath);
+                store.getBuilder()->ensurePath(storePath);
 
-            debug("using substituted/cached input '%s' in '%s'", to_string(), store.printStorePath(storePath));
+                debug("using substituted/cached input '%s' in '%s'", to_string(), store.printStorePath(storePath));
 
-            auto accessor = store.requireStoreObjectAccessor(storePath);
+                auto accessor = store.requireStoreObjectAccessor(storePath);
 
-            accessor->fingerprint = getFingerprint(store);
+                accessor->fingerprint = getFingerprint(store);
 
-            // Store a cache entry for the substituted tree so later fetches
-            // can reuse the existing nar instead of copying the unpacked
-            // input back into the store on every evaluation.
-            if (accessor->fingerprint) {
-                settings.getCache()->upsert(
-                    makeSourcePathToHashCacheKey(
-                        *accessor->fingerprint, ContentAddressMethod::Raw::NixArchive, CanonPath::root),
-                    {{"hash", store.queryPathInfo(storePath)->narHash.to_string(HashFormat::SRI, true)}});
+                // Store a cache entry for the substituted tree so later fetches
+                // can reuse the existing object instead of copying the unpacked
+                // input back into the store on every evaluation.  The object's
+                // own hash seeds the tree's name; the bijection only when the
+                // info carries an asserted NAR hash, which it may not.
+                if (accessor->fingerprint) {
+                    auto info = store.queryPathInfo(storePath);
+                    if (info->objectHash) {
+                        recordRootEntry(settings, SourcePath(accessor), info->objectHash->hash);
+                        if (info->assertedNarHash)
+                            recordTreeAddress(settings, *info->assertedNarHash, info->objectHash->hash);
+                    }
+                }
+
+                accessor->setPathDisplay("«" + to_string() + "»");
+
+                return {accessor, *this};
+            } catch (Error & e) {
+                debug("substitution of input '%s' failed: %s", to_string(), e.what());
             }
-
-            accessor->setPathDisplay("«" + to_string() + "»");
-
-            return {accessor, *this};
-        } catch (Error & e) {
-            debug("substitution of input '%s' failed: %s", to_string(), e.what());
         }
     }
 
@@ -409,21 +433,26 @@ std::string Input::getName() const
 
 StorePath Input::computeStorePath(Store & store) const
 {
-    auto narHash = getNarHash();
-    if (!narHash)
-        throw Error("cannot compute store path for unlocked input '%s'", to_string());
-    return store.makeFixedOutputPath(
-        getName(),
-        FixedOutputInfo{
-            .method = FileIngestionMethod::NixArchive,
-            .hash = *narHash,
-            .references = {},
-        });
+    auto treeHash = getTreeHash();
+    if (!treeHash)
+        throw Error("cannot compute store path for input '%s' without a 'treeHash'", to_string());
+    return gitTreePath(store, getName(), *treeHash);
 }
 
 std::string Input::getType() const
 {
     return getStrAttr(attrs, "type");
+}
+
+std::optional<Hash> Input::getTreeHash() const
+{
+    if (auto s = maybeGetStrAttr(attrs, "treeHash")) {
+        auto hash = Hash::parseSRI(*s);
+        if (hash.algo != HashAlgorithm::SHA256)
+            throw UsageError("treeHash must use SHA-256");
+        return hash;
+    }
+    return {};
 }
 
 std::optional<Hash> Input::getNarHash() const

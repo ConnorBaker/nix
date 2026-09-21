@@ -36,16 +36,19 @@ struct StringViewStream
 {
     std::string_view remaining;
 
+    /* Bytes are returned as non-negative values so that none of them is
+       mistaken for `EOF`: with a signed `char`, byte 0xFF was, and a
+       derivation containing it could be written and not read back. */
     int peek() const
     {
-        return remaining.empty() ? EOF : remaining[0];
+        return remaining.empty() ? EOF : (unsigned char) remaining[0];
     }
 
     int get()
     {
         if (remaining.empty())
             return EOF;
-        char c = remaining[0];
+        unsigned char c = remaining[0];
         remaining.remove_prefix(1);
         return c;
     }
@@ -172,7 +175,7 @@ static BackedStringView parseUnquotedString(StringViewStream & str)
     // Already know that it ends in an endquote from the find, no need to check again
     str.remaining.remove_prefix(end + 1);
     if (content.find('\\') != std::string_view::npos)
-        throw FormatError("unexected escape sequence in unquoted string");
+        throw FormatError("unexpected escape sequence in unquoted string");
 
     return content;
 }
@@ -799,6 +802,19 @@ std::string unparse(const Derivation<Inputs, Out> & drv, const StoreDirConfig & 
        `Xp::DynamicDerivations`. (The masked hash intermediate form
        never has dynamic inputs; they are resolved away before it is
        constructed.) */
+    /* A store path is written verbatim unless `supportWindowsStoreDir` asks
+       for the escaped form (`printStorePathString`); a store directory
+       holding a double quote or a backslash written verbatim cannot be read
+       back (`WindowsStoreDirTest`), so under the verbatim mode such a
+       directory is refused here, as the platform is below, rather than
+       written into a `.drv` nothing can read
+       (doc/manual/source/protocols/derivation-aterm.md). */
+    if (!supportWindowsStoreDir && store.storeDir.find_first_of("\"\\") != std::string::npos)
+        throw FormatError(
+            "the store directory '%s' contains a double quote or a backslash, which the derivation format writes verbatim under a Unix store directory, so derivation '%s' cannot be written for it",
+            store.storeDir,
+            drv.name);
+
     bool dynDrvDep = false;
     if constexpr (std::is_same_v<Inputs, FullInputs>)
         dynDrvDep = hasDynamicDrvDep(drv.inputs);
@@ -830,6 +846,18 @@ std::string unparse(const Derivation<Inputs, Out> & drv, const StoreDirConfig & 
     printStorePaths(store, s, drv.inputs.srcs, supportWindowsStoreDir);
 
     s += ',';
+    /* Unlike a store path, which can be written as an escaped `string` under
+       a store directory that needs it (`printStorePathString`), the platform
+       is always written verbatim and the format gives it no escaped form.
+       So a platform containing a double quote or a backslash cannot be
+       represented, and is refused here rather than written into a `.drv`
+       nothing can read back (doc/manual/source/protocols/derivation-aterm.md;
+       doc/lazy-store/04-derivation.md, section 4, defects of master found by this work). */
+    if (drv.platform.find_first_of("\"\\") != std::string::npos)
+        throw FormatError(
+            "the platform '%s' of derivation '%s' contains a double quote or a backslash, which the derivation format cannot represent",
+            drv.platform,
+            drv.name);
     printUnquotedString(s, drv.platform);
     s += ',';
     printString(s, drv.builder);

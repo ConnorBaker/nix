@@ -1,4 +1,5 @@
 #include "nix/util/archive.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/derivation/aterm.hh"
 #include "nix/store/outputs-query.hh"
@@ -456,8 +457,16 @@ static void opQuery(Strings opFlags, Strings opArgs)
             for (auto & j : maybeUseOutputs(store->followLinksToStorePath(i), useOutput, forceRealise)) {
                 auto info = store->queryPathInfo(j);
                 if (query == qHash) {
-                    assert(info->narHash.algo == HashAlgorithm::SHA256);
-                    std::cout << fmt("%s\n", info->narHash.to_string(HashFormat::Nix32, true));
+                    /* The object hash's rendering; for a description
+                       without one (an old peer's, a substituter's), the
+                       NAR hash it asserted, in its own self-describing
+                       rendering. */
+                    if (info->objectHash)
+                        std::cout << fmt("%s\n", info->objectHash->render());
+                    else if (info->assertedNarHash)
+                        std::cout << fmt("%s\n", info->assertedNarHash->to_string(HashFormat::Nix32, true));
+                    else
+                        throw Error("path '%s' has neither an object hash nor a NAR hash", store->printStorePath(j));
                 } else if (query == qSize)
                     std::cout << fmt("%d\n", info->narSize);
             }
@@ -570,10 +579,53 @@ static void opDumpDB(Strings opFlags, Strings opArgs)
     }
 }
 
+/* A record an older Nix wrote carries a NAR hash and no object hash.  One
+   walk of the path gives the object hash the row needs and checks that
+   NAR hash and the size on the way, as `walkOldRow` checks a schema-10
+   row.  False when the path does not hash to the record: reported with
+   both hashes, as the verifier reports a modified path, and not
+   registered -- per record, as `nix store migrate` reports; a mismatch
+   used to abort the whole load before anything was registered. */
+static bool walkOldRecord(ValidPathInfo & info)
+{
+    try {
+        auto accessor = store->requireStoreObjectAccessor(info.path, /*requireValidPath=*/false);
+        HashSink narSink{info.assertedNarHash ? info.assertedNarHash->algo : HashAlgorithm::SHA256};
+        auto source = sinkToSource([&](Sink & sink) { accessor->dumpPath(CanonPath::root, sink); });
+        TeeSource tee{*source, narSink};
+        auto object = objectHashOfNar(tee);
+        auto narHash = narSink.finish().hash;
+        if (info.assertedNarHash && *info.assertedNarHash != narHash) {
+            printError(
+                "path '%s' was modified! expected hash '%s', got '%s'; not registered",
+                store->printStorePath(info.path),
+                info.assertedNarHash->to_string(HashFormat::Nix32, true),
+                narHash.to_string(HashFormat::Nix32, true));
+            return false;
+        }
+        if (info.narSize != object.narSize) {
+            printError(
+                "path '%s' was modified! expected NAR size %d, got %d; not registered",
+                store->printStorePath(info.path),
+                info.narSize,
+                object.narSize);
+            return false;
+        }
+        info.objectHash = ObjectHash::of(object.root);
+        return true;
+    } catch (Error & e) {
+        /* The path's files are gone or unreadable. */
+        e.addTrace({}, "while checking path '%s' for registration; not registered", store->printStorePath(info.path));
+        logError(e.info());
+        return false;
+    }
+}
+
 static void registerValidity(bool reregister, bool hashGiven, bool canonicalise)
 {
     auto localStore = ensureLocalStore();
     ValidPathInfos infos;
+    size_t notRegistered = 0;
 
     while (1) {
         // We use a dummy value because we'll set it below. FIXME be correct by
@@ -592,19 +644,32 @@ static void registerValidity(bool reregister, bool hashGiven, bool canonicalise)
                 canonicalisePathMetaData(
                     localStore->toRealPath(info->path),
                     {NIX_WHEN_SUPPORT_ACLS(settings.getLocalSettings().ignoredAcls)});
+            /* One walk of the path yields the object hash the row needs and
+               the NAR size; when the registration asserted a NAR hash, the
+               same walk verifies it (`walkOldRecord`).  A registration
+               carrying the object hash itself is trusted as `--load-db`
+               always trusted its input: no walk. */
             if (!hashGiven) {
-                HashResult hash = hashPath(
-                    {store->requireStoreObjectAccessor(info->path, /*requireValidPath=*/false)},
-                    FileSerialisationMethod::NixArchive,
-                    HashAlgorithm::SHA256);
-                info->narHash = hash.hash;
-                info->narSize = hash.numBytesDigested;
+                /* The dummy hash the decoder was given is no assertion. */
+                info->assertedNarHash.reset();
+                auto accessor = store->requireStoreObjectAccessor(info->path, /*requireValidPath=*/false);
+                auto object = objectHashOf(*accessor, CanonPath::root);
+                info->objectHash = ObjectHash::of(object.root);
+                info->narSize = object.narSize;
+            } else if (!info->objectHash && !walkOldRecord(*info)) {
+                notRegistered++;
+                continue;
             }
             infos.insert_or_assign(info->path, *info);
         }
     }
 
     localStore->registerValidPaths(infos);
+
+    if (notRegistered) {
+        printError("%d %s not registered", notRegistered, notRegistered == 1 ? "path was" : "paths were");
+        throw Exit(1);
+    }
 }
 
 static void opLoadDB(Strings opFlags, Strings opArgs)
@@ -840,15 +905,12 @@ static void opVerifyPath(Strings opFlags, Strings opArgs)
         auto path = store->followLinksToStorePath(i);
         printMsg(lvlTalkative, "checking path '%s'...", store->printStorePath(path));
         auto info = store->queryPathInfo(path);
-        HashSink sink(info->narHash.algo);
-        store->narFromPath(path, sink);
-        auto current = sink.finish();
-        if (current.hash != info->narHash) {
+        if (auto mismatch = store->contentMismatch(*info)) {
             printError(
                 "path '%s' was modified! expected hash '%s', got '%s'",
                 store->printStorePath(path),
-                info->narHash.to_string(HashFormat::Nix32, true),
-                current.hash.to_string(HashFormat::Nix32, true));
+                mismatch->first,
+                mismatch->second);
             status = 1;
         }
     }
@@ -974,7 +1036,12 @@ static void opServe(Strings opFlags, Strings opArgs)
                 try {
                     auto info = store->queryPathInfo(i);
                     out << store->printStorePath(info->path);
-                    ServeProto::write(*store, wconn, static_cast<const UnkeyedValidPathInfo &>(*info));
+                    /* A client below 2.9 reads the hash slot as a NAR hash:
+                       the shim's walk supplies one. */
+                    UnkeyedValidPathInfo unkeyed{static_cast<const UnkeyedValidPathInfo &>(*info)};
+                    if (clientVersion < ServeProto::Version{2, 9} && !unkeyed.assertedNarHash)
+                        unkeyed.assertedNarHash = narHashOf(*store, info->path);
+                    ServeProto::write(*store, wconn, unkeyed);
                 } catch (InvalidPath &) {
                 }
             }
@@ -1055,13 +1122,18 @@ static void opServe(Strings opFlags, Strings opArgs)
 
             auto path = readString(in);
             auto deriver = readString(in);
+            auto [objectHash, assertedNarHash] = CommonProto::readPathInfoHashes(
+                in, rconn.version >= ServeProto::objectHashSince, [](const std::string & s) {
+                    return Hash::parseAny(s, HashAlgorithm::SHA256);
+                });
             ValidPathInfo info{
                 store->parseStorePath(path),
                 {
                     *store,
-                    Hash::parseAny(readString(in), HashAlgorithm::SHA256),
+                    std::move(objectHash),
                 },
             };
+            info.assertedNarHash = std::move(assertedNarHash);
             if (deriver != "")
                 info.deriver = store->parseStorePath(deriver);
             info.references = ServeProto::Serialise<StorePathSet>::read(*store, rconn);

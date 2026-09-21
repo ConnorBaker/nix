@@ -1,0 +1,1166 @@
+#include "nix/store/git-object-store.hh"
+#include "nix/store/pathlocks.hh"
+#include "nix/store/posix-fs-canonicalise.hh"
+#include "nix/util/base-n.hh"
+#include "nix/util/git.hh"
+#include "nix/util/file-system.hh"
+#include "nix/util/file-descriptor.hh"
+#include "nix/util/finally.hh"
+#include "nix/util/logging.hh"
+#include "nix/util/signals.hh"
+#include "nix/util/strings.hh"
+#include "nix/util/util.hh"
+
+#include <boost/unordered/unordered_flat_set.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <mutex>
+#include <array>
+
+#include <atomic>
+#include <thread>
+#include <condition_variable>
+#include <cstring>
+#include <functional>
+#include <random>
+#include <span>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace nix {
+
+GitObjectStore::GitObjectStore(std::filesystem::path dir, bool fsync)
+    : dir(std::move(dir))
+    , fsync(fsync)
+    , blobsDir((this->dir / "blobs").string())
+    , blobsXDir((this->dir / "blobs-x").string())
+    , treesDir((this->dir / "trees").string())
+{
+}
+
+void GitObjectStore::createDirectories() const
+{
+    createDirs(dir / "blobs");
+    createDirs(dir / "blobs-x");
+    createDirs(dir / "trees");
+    createDirs(dir / "tmp");
+}
+
+Hash GitObjectStore::blobIdOfFile(const std::filesystem::path & path)
+{
+    merkle::BlobHasher hasher{static_cast<uint64_t>(lstat(path).st_size)};
+    readFile(path, hasher);
+    return hasher.finish();
+}
+
+std::string GitObjectStore::idString(const Hash & id)
+{
+    return id.to_string(HashFormat::Base16, false);
+}
+
+/* `<subdirectory>/<xx>/<identifier>` appended, without
+   `std::filesystem::path`: the class splits and reallocates its components
+   at every `/`, and the object store names a file three times for every
+   regular file it enters.  `<xx>` is the identifier's first byte in
+   hexadecimal, git's own shard (01 §9.10). */
+static std::string nameUnder(const std::string & subdir, const Hash & id)
+{
+    auto bytes = std::as_bytes(std::span<const uint8_t>{&id.hash[0], id.hashSize});
+    std::string s;
+    s.reserve(subdir.size() + 1 + 2 + 1 + base16::encodedLength(id.hashSize));
+    s += subdir;
+    s += '/';
+    /* The identifier encoded into `s`, not into a string of its own: this
+       names a blob's file once or twice for every regular file entered
+       (`05` section 6).  The shard is the same encoding of the first byte. */
+    base16::encodeTo(s, bytes.first(1));
+    s += '/';
+    base16::encodeTo(s, bytes);
+    return s;
+}
+
+/* Whether `name` is a shard directory's: two lowercase hexadecimal digits,
+   as `nameUnder` writes them. */
+static bool isShardName(std::string_view name)
+{
+    return name.size() == 2 && name.find_first_not_of("0123456789abcdef") == std::string_view::npos;
+}
+
+void GitObjectStore::eachObjectFile(const std::filesystem::path & kindDir, fun<void(const std::filesystem::path &)> f)
+{
+    if (!pathExists(kindDir))
+        return;
+    for (auto & entry : DirectoryIterator{kindDir}) {
+        std::error_code isDir;
+        if (entry.is_directory(isDir)) {
+            if (!isShardName(entry.path().filename().string()))
+                continue;
+            for (auto & object : DirectoryIterator{entry.path()})
+                f(object.path());
+        } else
+            f(entry.path());
+    }
+}
+
+std::string GitObjectStore::blobFileName(const Hash & id, bool executable) const
+{
+    return nameUnder(executable ? blobsXDir : blobsDir, id);
+}
+
+std::string GitObjectStore::treeFileName(const Hash & id) const
+{
+    return nameUnder(treesDir, id);
+}
+
+std::filesystem::path GitObjectStore::blobFile(const Hash & id, bool executable) const
+{
+    return blobFileName(id, executable);
+}
+
+std::filesystem::path GitObjectStore::treeFile(const Hash & id) const
+{
+    return treeFileName(id);
+}
+
+std::filesystem::path GitObjectStore::tempPath(std::string_view kind) const
+{
+    /* The second is in the name because a temporary that is a hard link to
+       a blob (`place`) shares the blob's inode, whose change time every
+       later link of the blob advances: by the inode such a leftover would
+       never be an hour old, and would keep the blob's link count above one
+       for ever.  The counter starts at a random value, as `makeTempPath`'s
+       does, against names an earlier process left. */
+    static std::atomic<uint32_t> counter(std::random_device{}());
+    return dir / "tmp"
+           / fmt("%s-%d-%d-%d", kind, static_cast<long long>(time(nullptr)), getpid(), counter.fetch_add(1));
+}
+
+/* The second a temporary file's name carries (`tempPath`), if it does. */
+static std::optional<time_t> tempTime(std::string_view name)
+{
+    auto parts = tokenizeString<std::vector<std::string>>(std::string{name}, "-");
+    if (parts.size() != 4)
+        return std::nullopt;
+    if (auto t = string2Int<long long>(parts[1]))
+        return static_cast<time_t>(*t);
+    return std::nullopt;
+}
+
+/* A hard link `to` for the file `from`, by full paths; the error, empty
+   on success, compares to `std::errc` on every platform. */
+static std::error_code hardLink(const std::filesystem::path & from, const std::filesystem::path & to)
+{
+    std::error_code ec;
+    std::filesystem::create_hard_link(from, to, ec);
+    return ec;
+}
+
+/* The ingestion's pending index rows, **sharded 256 ways by the identifier's
+   first byte** -- the object store's own layout, for the same reason.  The
+   copy writes a directory's files on the walking thread and its
+   subdirectories on a pool (`08` K17), so every worker records a row for
+   every regular file it writes: one mutex over the whole set is a lock taken
+   forty thousand times by eight threads, and it was the first reason the
+   parallel copy was slower than the route it replaces.
+
+   A **writer thread** drains the shards continuously into the store's index
+   while the copy runs, so that the registration has nothing left to do.  Two
+   things make that cheap.  A shard's queue is taken by *swap* under its lock,
+   so a drain copies no rows; and what a later `link` needs -- the file this
+   ingestion already wrote for a blob (law 3 within one path) -- is kept in
+   `byKey`, which maps the blob to its name and does not index into the queue,
+   so the queue may be emptied under it.
+
+   The threshold is small (1 024 rows, about forty transactions in a
+   forty-thousand-file copy) because the cost is per *transaction*, not per
+   row: three transactions cost 0.042-0.060 s and five hundred cost most of a
+   second, so forty is where the write overlaps the copy without the
+   transaction count mattering. */
+struct GitObjectStore::Hold::Pending
+{
+    struct Shard
+    {
+        std::mutex mutex;
+        /** Rows not yet handed to the sink; taken by swap. */
+        std::vector<Row> queue;
+        /** (id, mode) -> the holder's name, kept after the row is written. */
+        boost::unordered_flat_map<std::string, std::string> byKey;
+    };
+
+    std::array<Shard, 256> shards;
+    std::atomic<size_t> queued{0};
+
+    std::mutex wake;
+    std::condition_variable ready;
+    bool stopping = false;
+    std::thread writer;
+
+    std::filesystem::path root;
+    std::function<void(std::vector<Row> &&)> sink;
+};
+
+/* Rows queued before the writer is woken.  Small: the drain is meant to run
+   beside the copy and keep up with it, not to batch it. */
+static size_t holdBatchSize()
+{
+    /* Settable for the measurement alone (`NIX_HOLDER_BATCH`); the default is
+       what measured best. */
+    static size_t n = [] {
+        if (auto * v = getenv("NIX_HOLDER_BATCH")) {
+            auto k = strtoull(v, nullptr, 10);
+            if (k > 0)
+                return size_t(k);
+        }
+        return size_t(16384);
+    }();
+    return n;
+}
+
+static std::string pendingKey(const Hash & id, bool executable)
+{
+    std::string key(reinterpret_cast<const char *>(id.hash), id.hashSize);
+    key += executable ? 'x' : ' ';
+    return key;
+}
+
+/* The shard an identifier falls in: its first byte, as `nameUnder` shards the
+   object store's directories. */
+static size_t shardOf(const Hash & id)
+{
+    return id.hashSize ? id.hash[0] : 0;
+}
+
+/* Every queued row, from every shard, as one batch: each shard's queue taken
+   by swap under its lock and none held while the sink runs, since the sink
+   takes the database's lock and nothing that waits on that may hold a
+   shard's.  Over the `Pending` and not the `Hold`, because a `Hold` is moved
+   -- into an `optional`, out of `hold()` -- and the writer thread must not
+   hold a pointer to one. */
+static void drainPending(GitObjectStore::Hold::Pending & pending)
+{
+    std::vector<GitObjectStore::Hold::Row> batch;
+    for (auto & shard : pending.shards) {
+        std::vector<GitObjectStore::Hold::Row> taken;
+        {
+            auto lock = std::lock_guard{shard.mutex};
+            if (shard.queue.empty())
+                continue;
+            taken.swap(shard.queue);
+        }
+        if (batch.empty())
+            batch = std::move(taken);
+        else
+            batch.insert(batch.end(), std::make_move_iterator(taken.begin()), std::make_move_iterator(taken.end()));
+    }
+    if (batch.empty())
+        return;
+    pending.queued.fetch_sub(batch.size());
+    pending.sink(std::move(batch));
+}
+
+const std::filesystem::path & GitObjectStore::Hold::directory() const
+{
+    return dir;
+}
+
+void GitObjectStore::Hold::setRoot(std::filesystem::path root) const
+{
+    pending->root = std::move(root);
+}
+
+const std::filesystem::path & GitObjectStore::Hold::root() const
+{
+    return pending->root;
+}
+
+void GitObjectStore::Hold::setSink(std::function<void(std::vector<Row> &&)> sink) const
+{
+    /* One hold may carry several ingestions in turn -- `optimiseStore` walks
+       every valid path under one, the verifier's repair re-enters a path
+       under one, the builder enters each output under one -- so a sink may
+       replace a sink.  The writer of the ingestion that is ending is stopped
+       and its rows drained *before* the next one's starts: assigning over a
+       joinable `std::thread` terminates the process, which is how the unit
+       suite found this. */
+    if (pending->writer.joinable()) {
+        {
+            auto lock = std::lock_guard{pending->wake};
+            pending->stopping = true;
+        }
+        pending->ready.notify_all();
+        pending->writer.join();
+        drain();
+        auto lock = std::lock_guard{pending->wake};
+        pending->stopping = false;
+    }
+    pending->sink = std::move(sink);
+    auto * p = pending.get();
+    pending->writer = std::thread([p] {
+        while (true) {
+            {
+                auto lock = std::unique_lock{p->wake};
+                p->ready.wait(lock, [&] { return p->stopping || p->queued.load() >= holdBatchSize(); });
+                if (p->stopping)
+                    return;
+            }
+            drainPending(*p);
+        }
+    });
+}
+
+void GitObjectStore::Hold::addRow(Row row) const
+{
+    auto key = pendingKey(row.id, row.executable);
+    {
+        auto & shard = pending->shards[shardOf(row.id)];
+        auto lock = std::lock_guard{shard.mutex};
+        shard.byKey.insert_or_assign(std::move(key), row.name);
+        shard.queue.push_back(std::move(row));
+    }
+    if (!pending->sink)
+        return;
+    if (pending->queued.fetch_add(1) + 1 >= holdBatchSize())
+        pending->ready.notify_one();
+}
+
+void GitObjectStore::Hold::drain() const
+{
+    drainPending(*pending);
+}
+
+void GitObjectStore::Hold::flush() const
+{
+    if (!pending->sink)
+        return;
+    if (pending->writer.joinable()) {
+        {
+            auto lock = std::lock_guard{pending->wake};
+            pending->stopping = true;
+        }
+        pending->ready.notify_all();
+        pending->writer.join();
+    }
+    /* Only what arrived after the writer's last drain: tens of rows. */
+    drain();
+}
+
+std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, bool executable) const
+{
+    auto & shard = pending->shards[shardOf(id)];
+    auto lock = std::lock_guard{shard.mutex};
+    auto i = shard.byKey.find(pendingKey(id, executable));
+    if (i == shard.byKey.end())
+        return std::nullopt;
+    return i->second.empty() ? pending->root.string() : (pending->root / i->second).string();
+}
+
+/* The holder's name under the ingestion's root, made on the worker that wrote
+   the file.  With no root set -- a caller that drives the object store
+   directly, as the unit tests do -- the absolute path is kept instead and the
+   registration relativises it; a name under a root never begins with a
+   separator, so the two are told apart. */
+static std::string nameUnderRoot(const std::filesystem::path & where, const std::filesystem::path & root)
+{
+    auto & r = root.native();
+    auto & w = where.native();
+    if (r.empty() || w.size() < r.size() || w.compare(0, r.size(), r) != 0)
+        return w;
+    return w.size() == r.size() ? std::string() : w.substr(r.size() + 1);
+}
+
+GitObjectStore::Hold::Hold(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade)
+{
+    /* As `createTempDirInStore` (local-store.cc): the sweep may remove the
+       directory between its making and the lock -- it removes a hold it
+       can lock -- so both are repeated until the directory exists locked.
+       The name is unique to this process and this hold, so the lock is
+       never contended by another maker; the sweep only tries it.
+
+       The directory is made *empty* and its three kind directories made
+       under the lock, so that a hold under `tmp/` whose lock is free is
+       either empty -- its maker between this `mkdir` and this `flock` --
+       or a dead ingestion's, and the sweep's rule, "remove a hold you can
+       lock, with its links", is right for both: it takes an empty
+       directory from a maker that then finds it gone and makes another,
+       and it takes a dead one's links.  Made before the lock, the kinds
+       would be the maker's own second window: the sweep removing the
+       directory partway through them left the maker's remaining
+       `createDirs` to remake it *without* the kinds already made -- a
+       hold that links nothing, every `holdObject` into a missing kind
+       reading `ENOENT` as "no such object" -- and the sweep's own
+       `deletePath` racing those `mkdir`s failed with `ENOTEMPTY` and
+       abandoned the collection (`08` 1.5; `07`). */
+    static std::atomic<uint32_t> counter(0);
+    pending = std::make_unique<Pending>();
+    while (true) {
+        dir = tmp / fmt("hold-%d-%d", getpid(), counter.fetch_add(1));
+        createDirs(dir);
+        fd = openDirectory(dir, FinalSymlink::DontFollow);
+        if (!fd) {
+            if (errno == ENOENT)
+                continue;
+            throw SysError("opening %s", PathFmt(dir));
+        }
+        if (atHoldMade)
+            atHoldMade();
+        if (!lockFile(fd.get(), ltWrite, true) || !pathExists(dir))
+            continue;
+        for (auto & sub : {"blobs", "blobs-x", "trees"})
+            createDirs(dir / sub);
+        return;
+    }
+}
+
+GitObjectStore::Hold::Hold(const std::filesystem::path & shared, int)
+    : dir(shared)
+{
+    /* No `fd`: the lock, and the directory, belong to the hold that made
+       them, and the destructor's `if (!fd) return` is what keeps this one
+       from removing either.  A `Pending` of its own is the whole point. */
+    pending = std::make_unique<Pending>();
+}
+
+GitObjectStore::Hold GitObjectStore::Hold::ownRows() const
+{
+    return Hold(dir, 0);
+}
+
+GitObjectStore::Hold::Hold(Hold &&) = default;
+
+GitObjectStore::Hold::~Hold()
+{
+    /* An ingestion that failed never flushed: the writer is stopped here, so
+       nothing outlives the hold.  Its rows stay in the index against an
+       ingestion that never got a path, which the sweep removes and `link`
+       forgets (schema.sql). */
+    if (pending && pending->writer.joinable()) {
+        {
+            auto lock = std::lock_guard{pending->wake};
+            pending->stopping = true;
+        }
+        pending->ready.notify_all();
+        try {
+            pending->writer.join();
+        } catch (...) {
+            ignoreExceptionInDestructor();
+        }
+    }
+    if (!fd)
+        return;
+    try {
+        deletePath(dir);
+    } catch (...) {
+        ignoreExceptionInDestructor();
+    }
+}
+
+std::filesystem::path GitObjectStore::Hold::linkFor(const std::filesystem::path & object) const
+{
+    /* `<kind>/<shard>/<id>`: the kind is two components up, and the hold
+       itself is flat under the kind (it never holds many links). */
+    return dir / object.parent_path().parent_path().filename() / object.filename();
+}
+
+GitObjectStore::Hold GitObjectStore::hold() const
+{
+    return Hold(dir / "tmp", atHoldMade);
+}
+
+/* Hold the object file `object`, if it exists: a link to it from the hold.
+   True when it is held (or was already); false when there is no such
+   object.  A hold the filesystem refuses (its link limit, a full
+   directory index) leaves the object unheld and says so: what a
+   concurrent sweep may then take, the verifier reports and `--optimise`
+   re-enters, as before the hold existed. */
+static bool holdObject(const std::filesystem::path & object, const GitObjectStore::Hold & hold)
+{
+    auto ec = hardLink(object, hold.linkFor(object));
+    if (!ec || ec == std::errc::file_exists)
+        return true;
+    if (ec == std::errc::no_such_file_or_directory)
+        return false;
+    if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
+        printInfo("cannot hold object %s: %s", PathFmt(object), ec.message());
+        return true;
+    }
+    throw Error(
+        "creating hard link from %1% to %2%: %3%", PathFmt(object), PathFmt(hold.linkFor(object)), ec.message());
+}
+
+#ifndef _WIN32
+/* The status of a file by name, without following a symlink; nothing when
+   there is no such file.  As `nix::maybeLstat`, but over a string, so that
+   the object store's names need not be `std::filesystem::path`s. */
+static std::optional<PosixStat> maybeLstatOf(const std::string & path)
+{
+    std::optional<PosixStat> st{std::in_place};
+    if (::lstat(path.c_str(), &*st)) {
+        if (errno == ENOENT || errno == ENOTDIR)
+            return std::nullopt;
+        throw SysError("getting status of %s", PathFmt(std::filesystem::path(path)));
+    }
+    return st;
+}
+
+/* A hard link `name` in the directory `dirFd` for the file `from`: the
+   directory resolved once is the directory written. */
+static std::error_code linkPathIntoDir(const std::string & from, Descriptor dirFd, const CanonPath & name)
+{
+    if (linkat(AT_FDCWD, from.c_str(), dirFd, name.rel_c_str(), 0) == -1)
+        return {errno, std::generic_category()};
+    return {};
+}
+
+/* Rename `from`, by full path, over `name` in `dirFd`. */
+static std::error_code renameInto(const std::filesystem::path & from, Descriptor dirFd, const CanonPath & name)
+{
+    if (renameat(AT_FDCWD, from.c_str(), dirFd, name.rel_c_str()) == -1)
+        return {errno, std::generic_category()};
+    return {};
+}
+#endif
+
+std::optional<PosixStat> GitObjectStore::blobFileOrRemove(
+    const std::string & file, const Hash & id, std::optional<uint64_t> size, RepairFlag repair)
+{
+#ifdef _WIN32
+    return std::nullopt;
+#else
+    if (counters)
+        counters->blobsStatted++;
+    auto st = maybeLstatOf(file);
+    if (!st)
+        return std::nullopt;
+    if ((size && static_cast<uint64_t>(st->st_size) != *size) || (repair && blobIdOfFile(file) != id)) {
+        warn("removing corrupt object %s", PathFmt(std::filesystem::path(file)));
+        warn(
+            "There may be more corrupted paths."
+            "\nYou should run `nix-store --verify --check-contents --repair` to fix them all");
+        unlinkIfExists(file);
+        return std::nullopt;
+    }
+    return st;
+#endif
+}
+
+std::optional<GitObjectStore::Holder>
+GitObjectStore::holderOrForget(const Hash & id, bool executable, RepairFlag repair, PosixStat * stOut)
+{
+#ifdef _WIN32
+    return std::nullopt;
+#else
+    if (!index || !index->lookup)
+        return std::nullopt;
+    auto row = index->lookup(id, executable);
+    if (!row)
+        return std::nullopt;
+    if (counters)
+        counters->blobsStatted++;
+    auto st = maybeLstatOf(row->file);
+    /* The holder is a valid store path's own file.  A row that is not what
+       it says -- the path collected, the file replaced, a size or (under
+       repair) bytes that are not the blob's -- is *forgotten*; the file is
+       never removed here, as a blob file was, because it belongs to a path
+       (design.md section 3, K2).  The caller writes the file and its own
+       registration makes it the holder. */
+    if (!st || static_cast<ino_t>(row->ino) != st->st_ino || static_cast<dev_t>(row->dev) != st->st_dev
+        || static_cast<uint64_t>(st->st_size) != row->size || (repair && blobIdOfFile(row->file) != id)) {
+        if (index->forget)
+            index->forget(id, executable);
+        return std::nullopt;
+    }
+    if (stOut)
+        *stOut = *st;
+    return row;
+#endif
+}
+
+bool GitObjectStore::link(
+    const Hash & id,
+    bool executable,
+    Descriptor dirFd,
+    const CanonPath & name,
+    const std::filesystem::path & where,
+    std::optional<uint64_t> size,
+    RepairFlag repair,
+    const Hold & hold,
+    PosixStat * linked)
+{
+#ifdef _WIN32
+    return false;
+#else
+    /* The holder: a file this ingestion already wrote for the blob (law 3
+       within one path, before any row is committed), else the index's. */
+    std::string file;
+    std::optional<PosixStat> st;
+    if (auto mine = hold.pendingHolder(id, executable)) {
+        file = *mine;
+        st = maybeLstatOf(file);
+        if (st && size && static_cast<uint64_t>(st->st_size) != *size)
+            st = std::nullopt;
+    } else {
+        PosixStat found;
+        if (auto holder = holderOrForget(id, executable, repair, &found)) {
+            if (size && holder->size != *size)
+                return false;
+            file = holder->file;
+            st = found;
+        }
+    }
+    if (!st)
+        return false;
+    if (auto ec = linkPathIntoDir(file, dirFd, name)) {
+        /* Swept meanwhile, or at the filesystem's link limit: the caller
+           writes the file instead. */
+        if (ec == std::errc::no_such_file_or_directory || ec == std::errc::too_many_links)
+            return false;
+        throw Error(
+            "creating hard link from %1% to %2%: %3%",
+            PathFmt(std::filesystem::path(file)),
+            PathFmt(where),
+            ec.message());
+    }
+    if (linked)
+        *linked = *st;
+    return true;
+#endif
+}
+
+std::optional<GitObjectStore::Placed> GitObjectStore::place(
+    const Hash & id,
+    bool executable,
+    Descriptor dirFd,
+    const CanonPath & name,
+    const std::filesystem::path & where,
+    const PosixStat & before,
+    RepairFlag repair,
+    const Hold & hold)
+{
+#ifdef _WIN32
+    return std::nullopt;
+#else
+    /* The file is written and canonicalised.  Either the store already has
+       a holder for its blob -- then this file is replaced by a link to it,
+       exactly as before -- or it becomes the holder itself, which costs a
+       row and no filesystem call at all. */
+    auto linkOver = [&](const std::string & file) -> std::optional<Placed> {
+        auto filePath = [&] { return PathFmt(std::filesystem::path(file)); };
+        auto tempLink = tempPath("link");
+        if (auto ec = hardLink(file, tempLink)) {
+            if (ec == std::errc::too_many_links) {
+                printInfo("%1% has maximum number of links; %2% is left as it is", filePath(), PathFmt(where));
+                return std::nullopt;
+            }
+            if (ec == std::errc::no_such_file_or_directory)
+                return std::nullopt;
+            throw Error("creating hard link from %1% to %2%: %3%", filePath(), PathFmt(tempLink), ec.message());
+        }
+        if (auto ec = renameInto(tempLink, dirFd, name)) {
+            unlinkIfExists(tempLink);
+            if (ec == std::errc::too_many_links) {
+                printInfo("%1% has maximum number of links; %2% is left as it is", filePath(), PathFmt(where));
+                return std::nullopt;
+            }
+            throw Error("replacing %1% by a link to %2%: %3%", PathFmt(where), filePath(), ec.message());
+        }
+        PosixStat placed;
+        if (fstatat(dirFd, name.rel_c_str(), &placed, AT_SYMLINK_NOFOLLOW) == -1)
+            throw SysError("getting status of %1%", PathFmt(where));
+        return Placed{placed.st_ino, false};
+    };
+
+    /* This ingestion's own earlier file for the blob comes first (law 3
+       within one path), then the index's holder. */
+    if (auto mine = hold.pendingHolder(id, executable)) {
+        if (auto st = maybeLstatOf(*mine)) {
+            if (st->st_ino == before.st_ino)
+                return Placed{before.st_ino, false};
+            if (auto placed = linkOver(*mine))
+                return placed;
+        }
+    } else if (auto holder = holderOrForget(id, executable, repair)) {
+        if (holder->ino == before.st_ino)
+            return Placed{before.st_ino, false};
+        if (holder->size == static_cast<uint64_t>(before.st_size))
+            if (auto placed = linkOver(holder->file))
+                return placed;
+    }
+
+    /* A miss: this file becomes the blob's holder.  The row is pending
+       until the path is registered (`LocalStore::recordBlobs`); a full
+       directory index cannot be met, there being no directory to fill, so
+       law 3's fourth exception does not arise for a regular file
+       (design.md section 3, K11). */
+    if (failPlaceWithNoSpace && failPlaceWithNoSpace(where)) {
+        printInfo("cannot enter %s: %s", PathFmt(where), std::make_error_code(std::errc::no_space_on_device).message());
+        return std::nullopt;
+    }
+    hold.addRow(
+        Hold::Row{
+            .id = id,
+            .executable = executable,
+            .ino = before.st_ino,
+            .dev = before.st_dev,
+            .size = static_cast<uint64_t>(before.st_size),
+            .name = nameUnderRoot(where, hold.root()),
+        });
+    return Placed{before.st_ino, true};
+#endif
+}
+
+void GitObjectStore::enterWritten(
+    const Hash & id,
+    bool executable,
+    Descriptor dirFd,
+    const CanonPath & name,
+    const std::filesystem::path & where,
+    RepairFlag repair,
+    const Hold & hold,
+    bool looked)
+{
+#ifndef _WIN32
+    /* The file was written because the store had no holder for its blob.
+       It becomes the holder: one `fstatat` for its inode and a pending
+       row, and *no* `linkat` -- which is the 0.19-0.21 s per 40 000 files
+       this design removes (design.md section 0).  Should a holder have
+       appeared meanwhile the decision is `place`'s; it is taken when the
+       row is written, since a later row for one key wins and the file
+       that stands is this one either way. */
+    PosixStat st;
+    if (fstatat(dirFd, name.rel_c_str(), &st, AT_SYMLINK_NOFOLLOW) == -1)
+        throw SysError("getting status of %1%", PathFmt(where));
+    /* A file streamed past the buffer was written without a look, so the
+       decision is taken here and it is `place`'s: a holder the store
+       already has is linked over this file.  A file written after `link`
+       missed needs no second look (`looked`), which is what keeps the
+       first entry of a fresh tree at one index probe a file. */
+    if (!looked && place(id, executable, dirFd, name, where, st, repair, hold))
+        return;
+    hold.addRow(
+        Hold::Row{
+            .id = id,
+            .executable = executable,
+            .ino = st.st_ino,
+            .dev = st.st_dev,
+            .size = static_cast<uint64_t>(st.st_size),
+            .name = nameUnderRoot(where, hold.root()),
+        });
+#endif
+}
+
+/* Write a file's bytes to the fresh temporary file `tmp`, canonicalised,
+   link it into place and hold it; an entry that appeared meanwhile stands,
+   and is held instead.  The temporary file is removed however this ends.
+   Under `fsync` the file -- its bytes and its canonical mode and
+   timestamp, which are set first so that the flush covers them (fsync(2)
+   flushes the file's data and metadata) -- is flushed before it is
+   linked, and its directory after.
+
+   The invariant (`08` K16): the object file is never at one link without
+   a hold while its ingestion is in flight.  It is linked into place while
+   the temporary still links the same inode, so it has two links from its
+   first instant, and the hold's link is made before the temporary goes;
+   an existing file is held before it is trusted, and one the sweep took
+   between the look and the link is written afresh. */
+static void writeObjectFile(
+    const std::filesystem::path & tmp,
+    const std::filesystem::path & dst,
+    std::string_view bytes,
+    bool executable,
+    bool fsync,
+    const GitObjectStore::Hold & hold,
+    const std::function<void(const std::filesystem::path &)> & atFsync)
+{
+    Finally removeTmp{[&] {
+        try {
+            unlinkIfExists(tmp);
+        } catch (...) {
+            ignoreExceptionExceptInterrupt();
+        }
+    }};
+    /* Thrice at most: another writer's file appearing sends us round to
+       hold it; the sweep taking it between our look and our link, to
+       write it. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (holdObject(dst, hold))
+            return;
+        {
+            mode_t mode = executable ? 0755 : 0644;
+#ifdef _WIN32
+            AutoCloseFD fd = openNewFileForWrite(tmp, mode, {.writeOnly = true});
+#else
+            AutoCloseFD fd{open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, mode)};
+#endif
+            if (!fd)
+                throw SysError("creating file %1%", PathFmt(tmp));
+            writeFull(fd.get(), bytes);
+            canonicaliseTimestampAndPermissions(tmp);
+            if (fsync) {
+                if (atFsync)
+                    atFsync(tmp);
+                fd.fsync();
+            }
+        }
+        auto link = [&] {
+            auto ec = hardLink(tmp, dst);
+            if (ec == std::errc::no_such_file_or_directory) {
+                /* The first object of this shard (`createDirectories`). */
+                createDirs(dst.parent_path());
+                ec = hardLink(tmp, dst);
+            }
+            return ec;
+        };
+        if (auto ec = link()) {
+            unlinkIfExists(tmp);
+            if (ec == std::errc::file_exists)
+                continue;
+            if (ec == std::errc::no_space_on_device) {
+                /* The object is not kept; every reader tolerates its absence. */
+                printInfo("cannot write object %s: %s", PathFmt(dst), ec.message());
+                return;
+            }
+            throw Error("creating hard link from %1% to %2%: %3%", PathFmt(tmp), PathFmt(dst), ec.message());
+        }
+        /* Two links now (`tmp` and `dst`); the hold's makes it three
+           before `tmp` goes. */
+        holdObject(dst, hold);
+        if (fsync)
+            syncParent(dst);
+        return;
+    }
+    throw Error("object %s appeared and disappeared repeatedly; not written", PathFmt(dst));
+}
+
+void GitObjectStore::putBlob(const Hash & id, bool executable, std::string_view bytes, const Hold & hold)
+{
+    writeObjectFile(tempPath("object"), blobFile(id, executable), bytes, executable, fsync, hold, atFsync);
+}
+
+void GitObjectStore::putTree(const Hash & id, std::string_view body, const Hold & hold)
+{
+    writeObjectFile(tempPath("object"), treeFile(id), body, false, fsync, hold, atFsync);
+}
+
+void GitObjectStore::putRootTree(const merkle::TreeEntry & root, const Hold & hold)
+{
+    if (auto body = merkle::syntheticRootTree(root))
+        putTree(merkle::treeId(*body), *body, hold);
+}
+
+bool GitObjectStore::holdTree(const Hash & id, const Hold & hold) const
+{
+    return holdObject(treeFile(id), hold);
+}
+
+bool GitObjectStore::holdBlob(const Hash & id, bool executable, const Hold & hold) const
+{
+    return holdObject(blobFile(id, executable), hold);
+}
+
+std::optional<std::string> GitObjectStore::readTree(const Hash & id) const
+{
+    if (counters)
+        counters->treesRead++;
+    auto file = treeFile(id);
+    if (!pathExists(file))
+        return std::nullopt;
+    return readFile(file);
+}
+
+merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view body)
+{
+    struct Into : merkle::DirectorySink
+    {
+        merkle::Tree tree;
+
+        /* As `merkle::Tree` keys entries, and not through `insertEntry`,
+           which refuses the name `.` that the synthetic root tree of a
+           bare executable or symlink carries (`merkle::syntheticRootTree`). */
+        void insertChild(std::string_view name, merkle::TreeEntry entry) override
+        {
+            std::string key(name);
+            if (entry.mode == merkle::Mode::Directory)
+                key += '/';
+            tree.insert_or_assign(std::move(key), entry);
+        }
+    } into;
+
+    /* The file holds the entries alone; the parser reads the size git's
+       header puts before them. */
+    StringSource source{std::to_string(body.size()) + '\0' + std::string(body)};
+    try {
+        git::parseTree(into, source, hashAlgo);
+    } catch (Error & e) {
+        throw Error("malformed tree object %s: %s", idString(id), e.msg());
+    }
+    return std::move(into.tree);
+}
+
+std::optional<merkle::Tree> GitObjectStore::readVerifiedTree(const Hash & id) const
+{
+    auto body = readTree(id);
+    if (!body)
+        return std::nullopt;
+    if (merkle::treeId(*body) != id) {
+        warn(
+            "tree object %s does not hash to its name; not used"
+            "\nYou should run `nix-store --verify --check-contents --repair` to fix it",
+            PathFmt(treeFile(id)));
+        return std::nullopt;
+    }
+    try {
+        return parseTreeBody(id, *body);
+    } catch (Error & e) {
+        warn("%s; not used\nYou should run `nix-store --verify --check-contents --repair` to fix it", e.msg());
+        return std::nullopt;
+    }
+}
+
+GitObjectStore::BlobInodes GitObjectStore::blobInodes() const
+{
+    BlobInodes inodes;
+#ifndef _WIN32
+    createDirectories();
+    /* The index, not a walk of `.objects/blobs`: one query over the rows
+       the store wrote, which is both cheaper and more complete than the
+       walk it replaces (design.md section 5).  The symlink-target blobs
+       under `blobs/` are not a path's file and are not in the table, which
+       is right: `known` answers regular files alone. */
+    if (index && index->inodes)
+        index->inodes(inodes);
+#endif
+    return inodes;
+}
+
+GitObjectStore::SweepStats
+GitObjectStore::sweep(fun<uint64_t(fun<void(const ObjectHash &)>)> forEachLiveObjectHash, const Owned * owned)
+{
+    SweepStats stats;
+    createDirectories();
+
+    /* The files this sweep enumerates and removes: the whole object store,
+       or the part of it the caller owns (`Owned`).  Reachability below is
+       computed over the object store itself either way -- `readTree` and
+       `blobFile` are its own -- so an object a part this sweep may not
+       touch reaches is kept. */
+    const auto & sweptDir = owned ? owned->dir : dir;
+    auto remove = [&](const std::filesystem::path & file) {
+        if (owned)
+            owned->remove(file);
+        else
+            unlinkIfExists(file);
+    };
+    /* The store's own four directories are made before they are iterated
+       (`08` K12); a part of it the caller owns is read as it is -- an
+       absent directory there is empty, and the sweep writes nothing into
+       it, only unlinks.  (On the overlay store the upper layer holds no
+       `.objects/blobs` until something has been written into it.) */
+    auto sweptSub = [&](std::string_view sub) -> std::optional<std::filesystem::path> {
+        auto sub_ = sweptDir / sub;
+        if (owned && !pathExists(sub_))
+            return std::nullopt;
+        return sub_;
+    };
+
+    /* Temporary files a crash left behind: none lives an hour.  First,
+       before the blobs are looked at, so that a leftover link to a blob --
+       which holds the blob's link count above one -- goes before the blob
+       is judged.  The age is the name's when the name carries one
+       (`tempPath`: a link's inode is the blob's, and its change time the
+       blob's), else the inode's change time (a name an earlier build
+       made). */
+    auto now = time(nullptr);
+    if (auto tmpDir = sweptSub("tmp"))
+        for (auto & entry : DirectoryIterator{*tmpDir}) {
+            checkInterrupt();
+            std::error_code isDir;
+            if (entry.is_directory(isDir)) {
+                /* An ingestion's hold (`Hold`).  Locked: the ingestion is in
+                   flight, and its links keep its objects below.  Free: its
+                   process is gone; the directory goes now, with its links, so
+                   that the objects it held are judged in this sweep -- as the
+                   collector removes a `tmp-*` directory it can lock (gc.cc).
+                   The lock is taken, and the directory removed, through the
+                   object store's own path: on a part the caller owns (the
+                   overlay store's upper layer) the file the ingestion locked
+                   is the merged view's, not the layer's, and a hold is never
+                   the lower store's, so the removal whites nothing out. */
+                auto held = dir / "tmp" / entry.path().filename();
+                auto fd = openDirectory(held, FinalSymlink::DontFollow);
+                if (!fd || !lockFile(fd.get(), ltWrite, false)) {
+                    stats.holds++;
+                    continue;
+                }
+                /* A removal that fails is a hold this sweep does not take,
+                   not the end of the collection (01 section 9.10 law 5, which
+                   sweeps on): a hold an older Nix is filling before its
+                   lock answers `ENOTEMPTY`, one another sweep took first
+                   `ENOENT`, and either way the objects below are judged at
+                   their link counts, which the hold's links still carry. */
+                try {
+                    if (failHoldRemoval && failHoldRemoval(held))
+                        throw SysError(ENOTEMPTY, "cannot unlink %s", PathFmt(held));
+                    deletePath(held);
+                } catch (SysError & e) {
+                    printInfo("cannot remove the hold %s: %s", PathFmt(held), e.msg());
+                    stats.holds++;
+                }
+                continue;
+            }
+            auto made = tempTime(entry.path().filename().string());
+            if (!made)
+                if (auto st = maybeLstat(entry.path()))
+                    made = st->st_ctime;
+            if (made && now - *made > 3600)
+                remove(entry.path());
+        }
+
+    /* The live roots: the object hash of every valid path -- a tree id,
+       or a plain file's blob id, which names no tree.  A root is told from
+       a tree a reachable tree names, so that the two are counted apart
+       when missing. */
+    struct Live
+    {
+        Hash id;
+        bool root;
+    };
+
+    std::vector<Live> live;
+    stats.unmigrated = forEachLiveObjectHash([&](const ObjectHash & hash) { live.push_back({hash.hash, true}); });
+
+    /* A valid path whose object hash is not yet known (a row older than
+       schema 11) is a root this sweep cannot see: while any remains
+       nothing but the temporary files is removed. */
+    if (stats.unmigrated == 0) {
+        /* Trees reachable from a live root stay, and every blob such a tree
+           names is kept whatever its link count (law 4).  A tree whose body
+           is not its name's abandons the removal phase (`corruptTrees`); a
+           tree a root names but the store lacks is counted and keeps
+           nothing (`unentered`). */
+        boost::unordered_flat_set<std::string> reachable;
+        boost::unordered_flat_set<std::string> named;
+        while (!live.empty()) {
+            auto [id, root] = live.back();
+            live.pop_back();
+            auto key = idString(id);
+            if (!reachable.insert(key).second)
+                continue;
+            auto body = readTree(id);
+            if (!body) {
+                /* No tree of that name.  A tree a present tree names is a
+                   missing subtree (`missingSubtrees`).  A plain file's
+                   object hash is its blob's id, which names no tree; the
+                   blob is what the root reaches, kept (law 4) whatever its
+                   link count.  Anything else is a live root whose object
+                   the store lacks (`SweepStats::unentered`): nothing
+                   beneath it is kept, and the sweep goes on. */
+                if (!root)
+                    stats.missingSubtrees++;
+                else if (
+                    (index && index->lookup && (index->lookup(id, false) || index->lookup(id, true)))
+                    || pathExists(blobFile(id, false)))
+                    /* A plain-file root: its object hash is its blob's id,
+                       and the path *is* the holder.  (The `blobFile` arm is
+                       for a symlink-target blob that is also a root's id.) */
+                    named.insert(key);
+                else
+                    stats.unentered++;
+                continue;
+            }
+            std::optional<merkle::Tree> entries;
+            if (merkle::treeId(*body) == id)
+                try {
+                    entries = parseTreeBody(id, *body);
+                } catch (Error & e) {
+                    warn("tree object %s does not parse: %s", PathFmt(treeFile(id)), e.msg());
+                }
+            else
+                warn("tree object %s does not hash to its name", PathFmt(treeFile(id)));
+            if (!entries) {
+                stats.corruptTrees++;
+                continue;
+            }
+            for (auto & [name, entry] : *entries) {
+                if (entry.mode == merkle::Mode::Directory)
+                    live.push_back({entry.hash, false});
+                else
+                    named.insert(idString(entry.hash));
+            }
+        }
+        if (stats.corruptTrees)
+            warn(
+                "%d corrupt tree objects; the object store was not swept."
+                "\nYou should run `nix-store --verify --check-contents --repair` to fix them",
+                stats.corruptTrees);
+        if (stats.unentered || stats.missingSubtrees) {
+            /* Roots and subtrees apart: a valid path without its object,
+               and a tree a present tree names. */
+            std::string what;
+            if (stats.unentered)
+                what = fmt("%d valid paths have no object in the object store", stats.unentered);
+            if (stats.missingSubtrees)
+                what +=
+                    fmt("%s%d trees named by a present tree are missing",
+                        what.empty() ? "" : ", and ",
+                        stats.missingSubtrees);
+            warn(
+                "%s (written by an older Nix, or being entered by `nix-store --optimise` now); nothing is kept for them."
+                "\nRun `nix-store --optimise` to enter them (or `nix-store --verify --check-contents --repair`)",
+                what);
+        }
+        if (!stats.corruptTrees) {
+            /* Trees: reachable from a live root, or held by an ingestion
+               in flight (a second link, `Hold`; K16), stay.  The blob
+               rule below, made the tree rule. */
+            if (auto treesDir = sweptSub("trees"))
+                eachObjectFile(*treesDir, [&](const std::filesystem::path & file) {
+                    checkInterrupt();
+                    if (reachable.count(file.filename().string()))
+                        return;
+                    auto st = maybeLstat(file);
+                    if (!st)
+                        return;
+                    if (st->st_nlink != 1) {
+                        stats.treesHeld++;
+                        return;
+                    }
+                    remove(file);
+                    stats.treesRemoved++;
+                });
+
+            /* Blobs: a file with no link but the store's own -- no path's
+               file, no ingestion's hold -- that no reachable tree names,
+               is unreferenced. */
+            for (auto & sub : {"blobs", "blobs-x"}) {
+                auto blobsDir = sweptSub(sub);
+                if (!blobsDir)
+                    continue;
+                eachObjectFile(*blobsDir, [&](const std::filesystem::path & file) {
+                    checkInterrupt();
+                    if (counters)
+                        counters->blobsStatted++;
+                    auto st = maybeLstat(file);
+                    if (!st)
+                        return;
+                    if (st->st_nlink != 1) {
+                        stats.blobsKept++;
+                        stats.sharedBytes +=
+                            static_cast<uint64_t>(st->st_nlink - 2) * static_cast<uint64_t>(st->st_size);
+                        return;
+                    }
+                    if (named.count(file.filename().string())) {
+                        stats.blobsKept++;
+                        return;
+                    }
+                    printMsg(lvlTalkative, "deleting unreferenced object %1%", PathFmt(file));
+                    remove(file);
+                    stats.blobsRemoved++;
+                });
+            }
+        }
+    }
+
+    return stats;
+}
+
+} // namespace nix

@@ -167,8 +167,8 @@ std::map<StorePath, UnkeyedValidPathInfo> LegacySSHStore::queryPathInfosUncached
     auto infos = conn->queryPathInfos(*this, paths);
 
     for (const auto & [_, info] : infos) {
-        if (info.narHash == Hash::dummy)
-            throw Error("NAR hash is now mandatory");
+        if (!info.objectHash && !info.assertedNarHash)
+            throw Error("a path info without an object hash or a NAR hash is not accepted");
     }
 
     return infos;
@@ -204,8 +204,11 @@ void LegacySSHStore::addToStore(const ValidPathInfo & info, Source & source, Rep
     auto conn(connections->get());
 
     conn->to << ServeProto::Command::AddToStoreNar << printStorePath(info.path)
-             << (info.deriver ? printStorePath(*info.deriver) : "")
-             << info.narHash.to_string(HashFormat::Base16, false);
+             << (info.deriver ? printStorePath(*info.deriver) : "");
+    CommonProto::writePathInfoHashes(
+        conn->to, conn->remoteVersion >= ServeProto::objectHashSince, info, [](const Hash & h) {
+            return h.to_string(HashFormat::Base16, false);
+        });
     ServeProto::write(*this, *conn, info.references);
     conn->to << info.registrationTime << info.narSize << info.ultimate;
     ServeProto::write(*this, *conn, info.sigs);

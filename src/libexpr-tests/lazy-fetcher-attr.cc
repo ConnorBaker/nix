@@ -97,4 +97,32 @@ TEST_F(LazyFetcherAttrTest, lazyFunctionOnlyCalledOnAccess)
     EXPECT_EQ(calls, 1);
 }
 
+/* 04 section 1.9, the fetchers' and the language's representation: a fetched tree's attributes
+   carry `treeHash`, the name's hash, as a string, and `narHash` as a lazy
+   attribute built through the shim, which building the set does not force.
+   The input itself carries no `narHash`, lazy or not.  `emitTreeAttrs`
+   (fetchTree.cc) emits `narHash` as a thunk when the input has `treeHash`
+   and no `narHash`; the thunk is not forced here, the dummy path having no
+   tree to walk. */
+TEST_F(LazyFetcherAttrTest, treeHashIsAStringAndNarHashIsNotForced)
+{
+    fetchers::Input input;
+    input.attrs.insert_or_assign("type", std::string("git"));
+    /* The SHA-256 git id of the empty tree, as SRI. */
+    auto treeHash = std::string("sha256-bvGbQSJcU2nxwQTUXY2F76mwV7U7FLS5uTnddN7MUyE=");
+    input.attrs.insert_or_assign("treeHash", treeHash);
+
+    Value v;
+    emitTreeAttrs(state, noPos, dummyPath(), input, v, false, false);
+    state.forceValue(v, noPos);
+
+    auto * thAttr = v.attrs()->get(state.symbols.create("treeHash"));
+    ASSERT_NE(thAttr, nullptr);
+    EXPECT_EQ(std::string(state.forceStringNoCtx(*thAttr->value, noPos, "while reading treeHash")), treeHash);
+
+    EXPECT_NE(v.attrs()->get(state.symbols.create("narHash")), nullptr);
+
+    EXPECT_FALSE(input.getNarHash());
+}
+
 } // namespace nix

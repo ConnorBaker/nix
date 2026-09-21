@@ -5,6 +5,7 @@
 #include "nix/util/current-process.hh"
 #include "nix/util/executable-path.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/logging.hh"
 #include "nix/util/args.hh"
 #include "nix/util/abstract-setting-to-json.hh"
 #include "nix/util/compute-levels.hh"
@@ -305,6 +306,33 @@ NLOHMANN_JSON_SERIALIZE_ENUM(
         {SandboxMode::smRelaxed, "relaxed"},
         {SandboxMode::smDisabled, false},
     });
+
+void RemovedSetting::assign(const bool & v)
+{
+    /* Only a request for the behaviour that no longer exists is worth a
+       warning.  `false` asks for nothing, and it is what a parent process
+       hands a child when it serialises every setting's rendering (the
+       build hook: hook-instance.cc, build-remote.cc `settings.set`) --
+       `false` because the value is deliberately not stored here, so
+       `to_string` renders the default.  The child also
+       re-reads the configuration itself, where `true` may stand; that
+       warning is the parent's, given once per top-level process
+       (`Settings::configurationDiagnosedByParent`, main.cc). */
+    if (v && !settings.configurationDiagnosedByParent)
+        warn("setting '%s' is ignored: %s", name, why);
+}
+
+void RemovedSetting::appendOrSet(bool newValue, bool append)
+{
+    assert(!append);
+    assign(newValue);
+}
+
+void RemovedSetting::override(const bool & v)
+{
+    overridden = true;
+    assign(v);
+}
 
 template<>
 SandboxMode BaseSetting<SandboxMode>::parse(const std::string & str) const

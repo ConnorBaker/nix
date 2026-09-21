@@ -37,6 +37,26 @@
               fi
             ''}";
           };
+          # The lazy store's string kernel (doc/lazy-store/04-derivation.md,
+          # section 0.1): outside libexpr and libflake a value's text comes only
+          # through the doors.  The compiler holds that on `Value`; this holds it
+          # on the evaluator's byte accessors, which C++ cannot scope to a library.
+          check-string-kernel = {
+            enable = true;
+            pass_filenames = false;
+            entry = "${pkgs.runtimeShell} maintainers/check-string-kernel.sh";
+          };
+          # The fetcher cache's domains and the consumers of their rows
+          # (doc/lazy-store/01-specification.md, sections 9.9 and 9.11): a
+          # domain is a bare string literal and there is no enum, constexpr
+          # array or switch over them, so neither the compiler nor a unit
+          # test can enumerate them; the script holds the list and checks it
+          # against the tree.
+          check-cache-domains = {
+            enable = true;
+            pass_filenames = false;
+            entry = "${pkgs.runtimeShell} maintainers/check-cache-domains.sh";
+          };
           meson-format = {
             enable = true;
             files = "(meson.build|meson.options)$";

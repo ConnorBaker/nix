@@ -101,13 +101,31 @@ MATCHER(IsAttrs, "")
     return arg.type() == nAttrs;
 }
 
+/**
+ * A test's view of a string value's representation, bypassing the doors
+ * (`EvalState::realise`/`emit`): tests check the door invariants by looking at
+ * what a pending text is before anything is written.  A friend of `Value`.
+ */
+struct RawValueBytes
+{
+    static std::string_view view(const Value & v) noexcept
+    {
+        return v.string_view();
+    }
+
+    static const StringData & data(const Value & v) noexcept
+    {
+        return v.string_data();
+    }
+};
+
 MATCHER_P(IsStringEq, s, fmt("The string is equal to \"%1%\"", s))
 {
     if (arg.type() != nString) {
         *result_listener << "Expected a string got " << arg.type();
         return false;
     }
-    return arg.string_view() == s;
+    return RawValueBytes::view(arg) == s;
 }
 
 MATCHER_P(IsIntEq, v, fmt("The string is equal to \"%1%\"", v))

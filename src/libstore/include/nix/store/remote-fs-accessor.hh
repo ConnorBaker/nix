@@ -15,11 +15,12 @@ class RemoteFSAccessor : public SourceAccessor
     ref<Store> store;
 
     /**
-     * Map from store path hash part to NAR hash. Used to then look up
-     * in the NAR cache. The indirection allows avoiding opening multiple
-     * redundant NAR accessors for the same NAR.
+     * Map from store path hash part to the NAR cache's key: the object
+     * hash, or the NAR hash a description asserted. The indirection
+     * allows avoiding opening multiple redundant NAR accessors for the
+     * same NAR.
      */
-    std::map<std::string, Hash, std::less<>> narHashes;
+    std::map<std::string, Hash, std::less<>> hashes;
 
     NarCache narCache;
 

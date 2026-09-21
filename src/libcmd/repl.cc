@@ -232,9 +232,9 @@ ReplExitStatus NixRepl::mainLoop()
         } catch (IncompleteReplExpr &) {
             continue;
         } catch (Error & e) {
-            printMsg(lvlError, e.msg());
+            printMsg(lvlError, state->realise(e.msg()).toOwned());
         } catch (Interrupted & e) {
-            printMsg(lvlError, e.msg());
+            printMsg(lvlError, state->realise(e.msg()).toOwned());
         }
 
         // We handled the current input fully, so we should clear it
@@ -585,7 +585,7 @@ ProcessLineResult NixRepl::processLine(std::string line)
         evalString(arg, v);
         auto suspension = logger->suspend();
         if (v.type() == nString) {
-            std::cout << v.string_view();
+            std::cout << state->realise(v);
         } else {
             printValue(std::cout, v);
         }
@@ -801,7 +801,7 @@ void NixRepl::loadFiles()
             loadFile(i);
         } catch (Error & e) {
             loadedFiles.push_back(i);
-            printMsg(lvlError, e.msg());
+            printMsg(lvlError, state->realise(e.msg()).toOwned());
         }
     }
 
@@ -810,7 +810,7 @@ void NixRepl::loadFiles()
         try {
             addAttrsToScope(*i);
         } catch (Error & e) {
-            printMsg(lvlError, e.msg());
+            printMsg(lvlError, state->realise(e.msg()).toOwned());
         }
     }
 }
@@ -827,7 +827,7 @@ void NixRepl::loadFlakes()
             loadFlake(i);
         } catch (Error & e) {
             loadedFlakes.push_back(i);
-            printMsg(lvlError, e.msg());
+            printMsg(lvlError, state->realise(e.msg()).toOwned());
         }
     }
 }

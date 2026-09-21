@@ -2,13 +2,16 @@
 ///@file
 
 #include "nix/store/common-protocol.hh"
+#include "nix/util/object-hash.hh"
+
+#include <functional>
 
 namespace nix {
 
 #define SERVE_MAGIC_1 0x390c9deb
 #define SERVE_MAGIC_2 0x5452eecb
 
-#define SERVE_PROTOCOL_VERSION (2 << 8 | 8)
+#define SERVE_PROTOCOL_VERSION (2 << 8 | 9)
 #define GET_PROTOCOL_MAJOR(x) ((x) & 0xff00)
 #define GET_PROTOCOL_MINOR(x) ((x) & 0x00ff)
 struct StoreDirConfig;
@@ -67,10 +70,18 @@ struct ServeProto
         }
     };
 
+    /**
+     * 2.9: the path-info hash slot (`QueryPathInfos`, `AddToStoreNar`)
+     * carries the object hash (`ObjectHash::render()`, or "") followed
+     * by the asserted NAR hash (or ""); below it, the NAR hash alone.
+     */
     static constexpr Version latest = {
         .major = 2,
-        .minor = 8,
+        .minor = 9,
     };
+
+    /** The first version whose hash slot carries the object hash (`CommonProto::readPathInfoHashes`). */
+    static constexpr Version objectHashSince{2, 9};
 
     /**
      * A unidirectional read connection, to be used by the read half of the

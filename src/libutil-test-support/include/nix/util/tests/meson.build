@@ -10,6 +10,8 @@ headers = files(
   'hash.hh',
   'json-characterization.hh',
   'nix_api_util.hh',
+  'setting-scopes.hh',
+  'source-accessor-gen.hh',
   'string_callback.hh',
   'test-data.hh',
 )

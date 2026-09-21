@@ -2,6 +2,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <charconv>
+#include <limits>
+
 namespace nix::fetchers {
 
 ResolvedAttr forceAttr(const Attr & attr)
@@ -49,6 +52,168 @@ nlohmann::json attrsToJSON(const Attrs & attrs)
             unreachable();
     }
     return json;
+}
+
+/* A decimal number appended without a string of its own. */
+static void appendDecimal(std::string & out, uint64_t n)
+{
+    char buf[20];
+    auto end = std::to_chars(buf, buf + sizeof buf, n).ptr;
+    out.append(buf, end - buf);
+}
+
+static void appendLengthPrefixed(std::string & out, std::string_view bytes)
+{
+    appendDecimal(out, bytes.size());
+    out += ':';
+    out += bytes;
+}
+
+std::string encodeAttrs(const Attrs & attrs)
+{
+    std::string out;
+    /* Room for the whole encoding before a byte of it is written: the
+       memo's key and row are encoded once per node of a naming walk, and a
+       string that grows from nothing reallocates four times over the
+       hundred bytes a key takes (`05` section 6).  The estimate is an upper
+       bound for strings and a generous one for the rest; a wrong guess
+       costs only what the growth would have cost anyway. */
+    size_t room = 0;
+    for (auto & [name, attr] : attrs)
+        room += name.size() + 24;
+    for (auto & [name, attr] : attrs)
+        if (auto s = std::get_if<std::string>(&attr))
+            room += s->size();
+    out.reserve(room);
+    for (auto & [name, attr] : attrs) {
+        auto resolved = forceAttr(attr);
+        std::visit(
+            overloaded{
+                [&](const std::string & v) {
+                    out += 's';
+                    appendLengthPrefixed(out, name);
+                    appendLengthPrefixed(out, v);
+                },
+                [&](uint64_t v) {
+                    out += 'i';
+                    appendLengthPrefixed(out, name);
+                    appendDecimal(out, v);
+                    out += ';';
+                },
+                [&](const Explicit<bool> & v) {
+                    out += 'b';
+                    appendLengthPrefixed(out, name);
+                    out += v.t ? '1' : '0';
+                },
+            },
+            resolved);
+    }
+    return out;
+}
+
+namespace {
+
+/**
+ * A cursor over an encoding; every read checks the end first.
+ */
+struct AttrsDecoder
+{
+    std::string_view rest;
+
+    [[noreturn]] void fail(const char * what)
+    {
+        throw Error("malformed attribute encoding: %s", what);
+    }
+
+    char byte()
+    {
+        if (rest.empty())
+            fail("unexpected end");
+        char c = rest.front();
+        rest.remove_prefix(1);
+        return c;
+    }
+
+    /**
+     * A canonical decimal number up to and including `terminator`: at
+     * least one digit, no leading zero unless the number is zero, and
+     * fitting a `uint64_t`.
+     */
+    uint64_t decimal(char terminator)
+    {
+        uint64_t value = 0;
+        size_t digits = 0;
+        for (;;) {
+            char c = byte();
+            if (c == terminator)
+                break;
+            if (c < '0' || c > '9')
+                fail("expected a digit");
+            if (digits == 1 && value == 0)
+                fail("a number with a leading zero");
+            uint64_t digit = c - '0';
+            if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10)
+                fail("a number too large");
+            value = value * 10 + digit;
+            digits++;
+        }
+        if (digits == 0)
+            fail("expected a number");
+        return value;
+    }
+
+    std::string_view bytes(uint64_t length)
+    {
+        if (length > rest.size())
+            fail("a length past the end");
+        auto result = rest.substr(0, length);
+        rest.remove_prefix(length);
+        return result;
+    }
+
+    std::string_view lengthPrefixed()
+    {
+        return bytes(decimal(':'));
+    }
+};
+
+} // namespace
+
+Attrs decodeAttrs(std::string_view encoded)
+{
+    AttrsDecoder in{encoded};
+    Attrs attrs;
+    std::optional<std::string_view> previousName;
+    while (!in.rest.empty()) {
+        char tag = in.byte();
+        auto name = in.lengthPrefixed();
+        if (previousName && !(*previousName < name))
+            in.fail("attribute names out of order");
+        Attr value;
+        switch (tag) {
+        case 's':
+            value = std::string(in.lengthPrefixed());
+            break;
+        case 'i':
+            value = in.decimal(';');
+            break;
+        case 'b': {
+            char c = in.byte();
+            if (c == '0')
+                value = Explicit<bool>{false};
+            else if (c == '1')
+                value = Explicit<bool>{true};
+            else
+                in.fail("expected '0' or '1' for a Boolean");
+            break;
+        }
+        default:
+            in.fail("unknown type tag");
+        }
+        attrs.emplace_hint(attrs.end(), std::string(name), std::move(value));
+        previousName = name;
+    }
+    return attrs;
 }
 
 std::optional<LazyAttr> maybeGetLazyAttr(const Attrs & attrs, const std::string & name)

@@ -54,6 +54,25 @@ Attrs jsonToAttrs(const nlohmann::json & json);
 
 nlohmann::json attrsToJSON(const Attrs & attrs);
 
+/**
+ * A compact, canonical encoding of `Attrs`, the fetcher cache's row
+ * form.  For each attribute in map order: a type tag (`s`, `i`, `b`),
+ * the name as `<decimal length>:<bytes>`, then the value — a string as
+ * `<decimal length>:<bytes>`, an integer as its decimal digits followed
+ * by `;`, a Boolean as `0` or `1`.  Length prefixes make the encoding
+ * total over any bytes (a NUL included) and injective; the map order
+ * makes it canonical, so equal `Attrs` encode to one string.  A lazy
+ * attribute is forced, as `attrsToJSON` forces it.
+ */
+std::string encodeAttrs(const Attrs & attrs);
+
+/**
+ * The inverse of `encodeAttrs`.  Accepts exactly the strings
+ * `encodeAttrs` produces: a malformed or truncated encoding, a
+ * non-canonical number or names out of order throw an `Error`.
+ */
+Attrs decodeAttrs(std::string_view encoded);
+
 std::optional<std::string> maybeGetStrAttr(const Attrs & attrs, const std::string & name);
 
 std::string getStrAttr(const Attrs & attrs, const std::string & name);

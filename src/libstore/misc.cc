@@ -334,13 +334,18 @@ MissingPaths Store::queryMissing(const std::vector<DerivedPath> & targets)
 
 StorePaths Store::topoSortPaths(const StorePathSet & paths)
 {
-    auto result = topoSort(paths, [&](const StorePath & path) {
+    return topoSortPathsBy(paths, [&](const StorePath & path) {
         try {
             return queryPathInfo(path)->references;
         } catch (InvalidPath &) {
             return StorePathSet();
         }
     });
+}
+
+StorePaths Store::topoSortPathsBy(const StorePathSet & paths, fun<StorePathSet(const StorePath &)> getReferences)
+{
+    auto result = topoSort(paths, [&](const StorePath & path) -> StorePathSet { return getReferences(path); });
 
     return std::visit(
         overloaded{
