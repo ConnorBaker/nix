@@ -11,6 +11,7 @@
 #include "nix/util/serialise.hh"
 #include "nix/util/util.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/file-system-at.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
 
 #include "store-config-private.hh"
@@ -51,29 +52,29 @@ void LocalStore::addIndirectRoot(const std::filesystem::path & path)
     makeSymlink(realRoot, path);
 }
 
-void LocalStore::createTempRootsFile()
+void LocalStore::createTempRootsFile(TempRoots & roots)
 {
-    auto fdTempRoots(_fdTempRoots.lock());
-
-    /* Create the temporary roots file for this process. */
-    if (*fdTempRoots)
+    /* Each store handle owns a distinct file, even within one process. */
+    if (roots.fd)
         return;
 
     while (1) {
-        if (pathExists(fnTempRoots))
-            /* It *must* be stale, since there can be no two
-               processes with the same pid. */
-            tryUnlink(fnTempRoots);
+        /* Exclusive creation never replaces a name a collector may have
+           opened already. The numeric prefix also works with older
+           collectors, which read it as a PID for their root descriptions. */
+        auto [fd, path] = createTempFile(tempRootsDir, std::to_string(getpid()));
 
-        *fdTempRoots = openLockFile(fnTempRoots, true);
+        debug("acquiring write lock on %s", PathFmt(path));
+        lockFile(fd.get(), ltWrite, true);
 
-        debug("acquiring write lock on %s", PathFmt(fnTempRoots));
-        lockFile(fdTempRoots->get(), ltWrite, true);
-
-        /* Check whether the garbage collector didn't get in our
-           way. */
-        if (getFileSize(fdTempRoots->get()) == 0)
+        /* A collector may have unlinked the file before this lock. Its
+           marker alone is insufficient: it could die before writing it. */
+        auto st = fstat(fd.get());
+        if (st.st_nlink != 0 && st.st_size == 0) {
+            fnTempRoots = std::move(path);
+            roots.fd = std::move(fd);
             break;
+        }
 
         /* The garbage collector deleted this file before we could get
            a lock.  (It won't delete the file after we get a lock.)
@@ -89,7 +90,48 @@ void LocalStore::addTempRoot(const StorePath & path)
         return;
     }
 
-    createTempRootsFile();
+    /* Registration is set insertion for this locked file's lifetime.
+       Serialize the complete protocol, including the shared GC descriptor's
+       flock operations; no other caller may use an unfinished registration. */
+    auto roots(_fdTempRoots.lock());
+    checkInterrupt();
+    if (roots->paths.contains(path))
+        return;
+    createTempRootsFile(*roots);
+
+    /* Publish the complete record before synchronizing with the collector.
+       A collector that already read the file must acknowledge the socket
+       request below; every later collector sees the record in its file scan. */
+    auto s = printStorePath(path) + '\0';
+    auto finishRecord = [&](size_t offset) {
+        auto suffix = std::string_view(roots->pending).substr(offset);
+        if (!suffix.empty()) {
+            if (writeTempRootForTest)
+                writeTempRootForTest(roots->fd.get(), suffix);
+            else
+                writeFull(roots->fd.get(), suffix);
+        }
+        roots->completedBytes += roots->pending.size();
+        roots->pending.clear();
+    };
+    bool alreadyWritten = false;
+    if (!roots->pending.empty()) {
+        /* A failed write may have appended any prefix, including the whole
+           record. Finish that same record before appending another one.
+           Never truncate or overwrite: a collector may be reading this file. */
+        auto offset = lseek(roots->fd.get(), 0, SEEK_CUR);
+        if (offset == -1)
+            throw SysError("finding temporary-root append position");
+        if (offset < roots->completedBytes
+            || static_cast<uint64_t>(offset - roots->completedBytes) > roots->pending.size())
+            throw Error("temporary-root append position is outside the unfinished record");
+        alreadyWritten = roots->pending == s;
+        finishRecord(offset - roots->completedBytes);
+    }
+    if (!alreadyWritten) {
+        roots->pending = std::move(s);
+        finishRecord(0);
+    }
 
     /* Open/create the global GC lock file. */
     {
@@ -109,6 +151,12 @@ restart:
            collector is running. So we have to connect to the garbage
            collector and inform it about our root. */
         auto fdRootsSocket(_fdRootsSocket.lock());
+        bool acknowledged = false;
+        Finally resetFailedSocket{[&] {
+            if (!acknowledged) {
+                AutoCloseFD failed{fdRootsSocket->release()};
+            }
+        }};
 
         if (!*fdRootsSocket) {
             auto socketPath = config->stateDir.get() / gcSocketPath;
@@ -134,7 +182,9 @@ restart:
             writeFull(fdRootsSocket->get(), printStorePath(path) + "\n", false);
             char c;
             readFull(fdRootsSocket->get(), &c, 1);
-            assert(c == '1');
+            if (c != '1')
+                throw Error("unexpected garbage collector acknowledgement");
+            acknowledged = true;
             debug("got ack for GC root '%s'", printStorePath(path));
         } catch (SystemError & e) {
             /* The garbage collector may have exited, so we need to
@@ -152,17 +202,15 @@ restart:
         }
     }
 
-    /* Record the store path in the temporary roots file so it will be
-       seen by a future run of the garbage collector. */
-    auto s = printStorePath(path) + '\0';
-    writeFull(_fdTempRoots.lock()->get(), s);
+    /* Both the file and any current collector now know the root. */
+    roots->paths.insert(path);
 }
 
 static std::string censored = "{censored}";
 
 void LocalStore::findTempRoots(Roots & tempRoots, bool censor)
 {
-    /* Read the `temproots' directory for per-process temporary root
+    /* Read the `temproots' directory for per-handle temporary root
        files. */
     for (auto & i : DirectoryIterator{tempRootsDir}) {
         checkInterrupt();
@@ -190,9 +238,13 @@ void LocalStore::findTempRoots(Roots & tempRoots, bool censor)
         }
 
         /* Try to acquire a write lock without blocking.  This can
-           only succeed if the owning process has died.  In that case
+           only succeed if no owning store handle holds it. In that case
            we don't care about its temporary roots. */
         if (lockFile(fd.get(), ltWrite, false)) {
+            /* An earlier collector or the owner may already have removed
+               this inode. It no longer owns whatever this name denotes. */
+            if (fstat(fd.get()).st_nlink == 0)
+                continue;
             printInfo("removing stale temporary roots file %1%", PathFmt(path));
             tryUnlink(path);
             writeFull(fd.get(), "d");
@@ -421,11 +473,18 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
             debug("GC roots server shutting down");
             fdServer.close();
             while (true) {
-                auto item = remove_begin(*connections.lock());
-                if (!item)
-                    break;
-                auto & [fd, thread] = *item;
-                shutdown(fd, SHUT_RDWR);
+                std::thread thread;
+                {
+                    auto connectionsGuard(connections.lock());
+                    if (connectionsGuard->empty())
+                        break;
+                    auto i = connectionsGuard->begin();
+                    /* A mapped worker cannot finish its cleanup and close
+                       this descriptor while we hold the map lock. */
+                    shutdown(i->first, SHUT_RDWR);
+                    thread = std::move(i->second);
+                    connectionsGuard->erase(i);
+                }
                 thread.join();
             }
         });
@@ -450,57 +509,70 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
                 debug("GC roots server accepted new client");
 
-                /* Process the connection in a separate thread. */
-                auto fdClient_ = fdClient.get();
-                std::thread clientThread([&, fdClient = std::move(fdClient)]() {
-                    Finally cleanup([&]() {
-                        auto conn(connections.lock());
-                        auto i = conn->find(fdClient.get());
-                        if (i != conn->end()) {
-                            i->second.detach();
-                            conn->erase(i);
-                        }
-                    });
-
-                    /* On macOS, accepted sockets inherit the
-                       non-blocking flag from the server socket, so
-                       explicitly make it blocking. */
-                    if (fcntl(fdClient.get(), F_SETFL, fcntl(fdClient.get(), F_GETFL) & ~O_NONBLOCK) == -1)
-                        panic("Could not set non-blocking flag on client socket");
-
-                    FdSource source(fdClient.get());
-                    while (true) {
-                        try {
-                            auto path = source.readLine();
-                            auto storePath = maybeParseStorePath(path);
-                            if (storePath) {
-                                debug("got new GC root '%s'", path);
-                                auto hashPart = storePath->hashPart();
-                                auto shared(_shared.lock());
-                                shared->tempRoots.emplace(hashPart);
-                                /* If this path is currently being
-                                   deleted, then we have to wait until
-                                   deletion is finished to ensure that
-                                   the client doesn't start
-                                   re-creating it before we're
-                                   done. FIXME: ideally we would use a
-                                   FD for this so we don't block the
-                                   poll loop. */
-                                while (shared->pending == hashPart) {
-                                    debug("synchronising with deletion of path '%s'", path);
-                                    shared.wait(wakeup);
+                /* Publish ownership before the worker can finish. Allocate
+                   its empty slot before creating a joinable thread. */
+                try {
+                    auto connectionsGuard(connections.lock());
+                    auto [slot, inserted] = connectionsGuard->try_emplace(fdClient.get());
+                    if (!inserted)
+                        throw Error("garbage collector client descriptor already registered");
+                    try {
+                        slot->second = std::thread([&, fdClient = std::move(fdClient)]() {
+                            Finally cleanup([&]() {
+                                auto conn(connections.lock());
+                                auto i = conn->find(fdClient.get());
+                                if (i != conn->end()) {
+                                    i->second.detach();
+                                    conn->erase(i);
                                 }
-                            } else
-                                printError("received garbage instead of a root from client");
-                            writeFull(fdClient.get(), "1", false);
-                        } catch (BaseError & e) {
-                            debug("reading GC root from client: %s", e.msg());
-                            break;
-                        }
-                    }
-                });
+                            });
 
-                connections.lock()->insert({fdClient_, std::move(clientThread)});
+                            /* On macOS, accepted sockets inherit the
+                               non-blocking flag from the server socket, so
+                               explicitly make it blocking. */
+                            if (fcntl(fdClient.get(), F_SETFL, fcntl(fdClient.get(), F_GETFL) & ~O_NONBLOCK) == -1)
+                                panic("Could not set non-blocking flag on client socket");
+
+                            FdSource source(fdClient.get());
+                            while (true) {
+                                try {
+                                    auto path = source.readLine();
+                                    auto storePath = maybeParseStorePath(path);
+                                    if (storePath) {
+                                        debug("got new GC root '%s'", path);
+                                        auto hashPart = storePath->hashPart();
+                                        auto shared(_shared.lock());
+                                        shared->tempRoots.emplace(hashPart);
+                                        /* If this path is currently being
+                                           deleted, then we have to wait until
+                                           deletion is finished to ensure that
+                                           the client doesn't start
+                                           re-creating it before we're
+                                           done. FIXME: ideally we would use a
+                                           FD for this so we don't block the
+                                           poll loop. */
+                                        while (shared->pending == hashPart) {
+                                            debug("synchronising with deletion of path '%s'", path);
+                                            shared.wait(wakeup);
+                                        }
+                                    } else
+                                        printError("received garbage instead of a root from client");
+                                    writeFull(fdClient.get(), "1", false);
+                                } catch (BaseError & e) {
+                                    debug("reading GC root from client: %s", e.msg());
+                                    break;
+                                }
+                            }
+                        });
+                    } catch (...) {
+                        connectionsGuard->erase(slot);
+                        throw;
+                    }
+                } catch (const std::exception & e) {
+                    /* No worker owns this rejected connection. Its client
+                       observes EOF and retries the existing GC protocol. */
+                    debug("cannot create garbage collector client thread: %s", e.what());
+                }
             }
         }
     });

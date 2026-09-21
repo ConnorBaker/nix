@@ -52,19 +52,15 @@ std::string_view unhackName(std::string_view name)
     return name.substr(0, pos);
 }
 
-StringMap unhackedEntries(
-    SourceAccessor & accessor,
-    const CanonPath & path,
-    const std::function<void(const std::string & name, bool isDirectory)> & typed)
+StringMap unhackedEntries(SourceAccessor & accessor, const CanonPath & path)
 {
-    return unhackedEntries(accessor.readDirectory(path), accessor, path, typed);
+    return unhackedEntries(accessor.readDirectory(path), accessor, path);
 }
 
 StringMap unhackedEntries(
     const SourceAccessor::DirEntries & entries,
     SourceAccessor & accessor,
-    const CanonPath & path,
-    const std::function<void(const std::string & name, bool isDirectory)> & typed)
+    const CanonPath & path)
 {
     StringMap unhacked;
     for (auto & i : entries) {
@@ -78,11 +74,6 @@ StringMap unhackedEntries(
             debug("removing case hack suffix from '%s'", path / i.first);
         if (!unhacked.emplace(name, i.first).second)
             throw Error("file name collision between '%s' and '%s'", (path / unhacked[name]), (path / i.first));
-        /* The type the listing gave, under the name that is written: a
-           listing that gives none says "not a directory", which is only
-           ever advisory (`tree-traversal.hh`, `Children`). */
-        if (typed)
-            typed(name, i.second == SourceAccessor::tDirectory);
     }
     return unhacked;
 }

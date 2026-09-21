@@ -262,7 +262,8 @@ public:
     const std::filesystem::path reservedPath;
     const std::filesystem::path schemaPath;
     const std::filesystem::path tempRootsDir;
-    const std::filesystem::path fnTempRoots;
+    /** Assigned with the first locked roots file, under `_fdTempRoots`. */
+    std::filesystem::path fnTempRoots;
 
 private:
 
@@ -378,14 +379,25 @@ public:
 
     void addTempRoot(const StorePath & path) override;
 
+    /** Override the temporary-root append for fault-injection tests. */
+    std::function<void(Descriptor, std::string_view)> writeTempRootForTest;
+
 private:
 
-    void createTempRootsFile();
+    struct TempRoots
+    {
+        AutoCloseFD fd;
+        StorePathSet paths;
+        off_t completedBytes = 0;
+        std::string pending;
+    };
+
+    void createTempRootsFile(TempRoots & roots);
 
     /**
-     * The file to which we write our temporary roots.
+     * The locked file and the paths successfully registered for its lifetime.
      */
-    Sync<AutoCloseFD> _fdTempRoots;
+    Sync<TempRoots> _fdTempRoots;
 
     /**
      * The global GC lock.

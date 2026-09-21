@@ -19,6 +19,7 @@
 #include "nix/util/tests/source-accessor-gen.hh"
 #include "nix/util/tests/setting-scopes.hh"
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -89,6 +90,132 @@ TEST(FixedSetFilter, namesByTheInnerNameAndTheAdmittedSet)
     /* A whole-tree name, when given, wins. */
     w5->fingerprint = "whole";
     EXPECT_EQ(w5->getFingerprint(CanonPath("keep")).second, std::optional<std::string>("whole"));
+}
+
+TEST(AllowListFilter, admissionAndNamingMatchEveryPrefixSubsetAndGrowth)
+{
+    using Components = std::vector<std::string>;
+    const std::vector<Components> domain{{}, {"a"}, {"a", "b"}, {"a", "b", "c"}, {"a!"}, {"a\xc3\xa9"}, {"z"}};
+    auto queries = domain;
+    queries.insert(queries.end(), {{"a", "d"}, {"a!", "b"}, {"outside"}});
+    auto isPrefix = [](const Components & a, const Components & b) {
+        return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin());
+    };
+    auto canon = [](const Components & components) {
+        auto path = CanonPath::root;
+        for (auto & component : components)
+            path.push(component);
+        return path;
+    };
+
+    struct Observed : MemorySourceAccessor
+    {
+        enum Outcome { Named, Unnamed, Missing, Throwing } outcome;
+        size_t names = 0, stats = 0;
+        std::optional<CanonPath> requested;
+
+        std::optional<Stat> maybeLstat(const CanonPath & path) override
+        {
+            ++stats;
+            return MemorySourceAccessor::maybeLstat(path);
+        }
+
+        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+        {
+            ++names;
+            requested = path;
+            if (outcome == Missing)
+                lstat(path); // The empty memory accessor has no root.
+            if (outcome == Throwing)
+                throw Error("inner naming failed");
+            if (outcome == Named)
+                return {CanonPath("relative"), "inner"};
+            return {path, std::nullopt};
+        }
+    };
+    auto inner = make_ref<Observed>();
+
+    /* The oracle compares component lists, independently of CanonPath's
+       ordering and of the representation chosen for admitted prefixes. */
+    for (size_t subset = 0; subset < (size_t{1} << domain.size()); ++subset) {
+        std::set<CanonPath> initial;
+        for (size_t i = 0; i < domain.size(); ++i)
+            if (subset & (size_t{1} << i))
+                initial.insert(canon(domain[i]));
+        for (size_t added = 0; added <= domain.size(); ++added) {
+            SCOPED_TRACE(fmt("subset %d, added %d", subset, added));
+            auto accessor = AllowListSourceAccessor::create(inner, initial, {}, [](const CanonPath & path) {
+                return RestrictedPathError("denied '%s'", path);
+            });
+            if (added < domain.size())
+                accessor->allowPrefix(canon(domain[added]));
+            for (auto & query : queries) {
+                auto path = canon(query);
+                SCOPED_TRACE(path.abs());
+                bool covered = false, admitted = false;
+                for (size_t i = 0; i < domain.size(); ++i)
+                    if ((subset & (size_t{1} << i)) || i == added) {
+                        covered |= isPrefix(domain[i], query);
+                        admitted |= isPrefix(domain[i], query) || isPrefix(query, domain[i]);
+                    }
+                EXPECT_EQ(accessor->isAllowed(path), admitted);
+                for (auto outcome : {Observed::Named, Observed::Unnamed, Observed::Missing, Observed::Throwing}) {
+                    SCOPED_TRACE(outcome);
+                    inner->outcome = outcome;
+                    inner->names = inner->stats = 0;
+                    inner->requested.reset();
+                    if (covered && outcome == Observed::Missing)
+                        EXPECT_THROW(accessor->getFingerprint(path), FileNotFound);
+                    else if (covered && outcome == Observed::Throwing)
+                        EXPECT_THROW(accessor->getFingerprint(path), Error);
+                    else {
+                        auto result = accessor->getFingerprint(path);
+                        EXPECT_EQ(result.first, covered && outcome == Observed::Named ? CanonPath("relative") : path);
+                        EXPECT_EQ(result.second, covered && outcome == Observed::Named ? std::optional<std::string>("inner") : std::nullopt);
+                    }
+                    EXPECT_EQ(inner->names, covered ? 1 : 0);
+                    EXPECT_EQ(inner->stats, covered && outcome == Observed::Missing ? 1 : 0);
+                    EXPECT_EQ(inner->requested, covered ? std::optional<CanonPath>(path) : std::nullopt);
+                }
+            }
+        }
+    }
+}
+
+TEST(AllowListFilter, exactPathsDoNotAdmitOrNameTheirRelatives)
+{
+    struct NoNaming : MemorySourceAccessor
+    {
+        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath &) override
+        {
+            ADD_FAILURE() << "exact admission must not consult inner naming";
+            throw Error("unexpected inner naming");
+        }
+    };
+    size_t errors = 0;
+    const auto exact = CanonPath("a/b");
+    auto accessor = AllowListSourceAccessor::create(make_ref<NoNaming>(), {}, {exact}, [&](const CanonPath &) {
+        ++errors;
+        return RestrictedPathError("denied");
+    });
+    for (auto & path : {CanonPath::root, CanonPath("a"), exact, CanonPath("a/b/c"), CanonPath("a!"), CanonPath("other")}) {
+        EXPECT_EQ(accessor->isAllowed(path), path == exact);
+        if (path == exact)
+            EXPECT_NO_THROW(accessor->checkAccess(path));
+        else
+            EXPECT_THROW(accessor->checkAccess(path), RestrictedPathError);
+        auto result = accessor->getFingerprint(path);
+        EXPECT_EQ(result.first, path);
+        EXPECT_FALSE(result.second);
+    }
+    EXPECT_EQ(errors, 5);
+    accessor->allowPrefix(CanonPath("a"));
+    accessor->fingerprint = "whole";
+    for (auto & path : {CanonPath::root, exact, CanonPath("other")}) {
+        auto result = accessor->getFingerprint(path);
+        EXPECT_EQ(result.first, path);
+        EXPECT_EQ(result.second, std::optional<std::string>("whole"));
+    }
 }
 
 /* The fetcher cache under a directory of the fixture's own (`FreshCacheHome`):
@@ -447,6 +574,7 @@ TEST_F(FetchToStoreTest, subtreeNamingIsObservedOnceAndRecordedForTheSameNode)
             auto actual = fetchToStore2(
                 settings, *store, SourcePath(tree), FetchMode::DryRun, "source", {}, filtered ? &filter : nullptr);
             EXPECT_EQ(actual.second, expected);
+            EXPECT_EQ(tree->observations[CanonPath::root], 1u);
             for (auto & path : nodes) {
                 SCOPED_TRACE(path.abs());
                 bool omitted = filtered && path == CanonPath("nested/drop");
@@ -469,6 +597,7 @@ TEST_F(FetchToStoreTest, subtreeNamingIsObservedOnceAndRecordedForTheSameNode)
                     settings, *store, SourcePath(tree), FetchMode::DryRun, "source", {}, filtered ? &filter : nullptr)
                     .second,
                 expected);
+            EXPECT_EQ(tree->observations[CanonPath::root], 2u);
         }
 }
 
@@ -539,6 +668,74 @@ protected:
         TempLocalStoreTest::SetUp();
     }
 };
+
+TEST_F(FetchToStoreLocalTest, positiveRootNamingIsObservedOnceForEveryRootKindAndMode)
+{
+    struct ObservedNames : MemorySourceAccessor
+    {
+        std::string name;
+        std::map<CanonPath, size_t> observations;
+
+        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+        {
+            ++observations[path];
+            return {path, name};
+        }
+    };
+
+    size_t serial = 0;
+    const CanonPath root("view");
+    for (auto kind : {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink, merkle::Mode::Directory})
+        for (auto mode : {FetchMode::DryRun, FetchMode::Copy})
+            /* The whole-view assertion is absent, equal to the returned
+               name, or another name for the same tree. Only equality
+               chooses the root-only memo scope. */
+            for (size_t state = 0; state < 3; ++state) {
+                SCOPED_TRACE(fmt("kind=%d copy=%d state=%d", static_cast<RawMode>(kind), mode == FetchMode::Copy, state));
+                fetchers::Settings settings;
+                auto tree = make_ref<ObservedNames>();
+                tree->name = fmt("observed-positive-root-%d", serial++);
+                if (state != 0)
+                    tree->fingerprint = state == 1 ? tree->name : "another-" + tree->name;
+                MemorySink sink{*tree};
+                sink.createDirectory(CanonPath::root);
+                if (kind == merkle::Mode::Directory)
+                    tree->addFile(root / CanonPath("nested/child"), "contents");
+                else if (kind == merkle::Mode::Symlink)
+                    sink.createSymlink(root, "target");
+                else
+                    sink.createRegularFile(root, [&](CreateRegularFileSink & file) {
+                        if (kind == merkle::Mode::Executable)
+                            file.isExecutable();
+                        file("contents");
+                    });
+                SourcePath source{tree, root};
+                auto entry = objectHashOf(*tree, root).root;
+                auto result = fetchToStore2(settings, *store, source, mode);
+                EXPECT_EQ(result.second, merkle::objectHash(entry));
+                EXPECT_EQ(tree->observations[root], 1u);
+                if (kind == merkle::Mode::Directory) {
+                    EXPECT_EQ(
+                        tree->observations[root / "nested"],
+                        state != 1 && (mode == FetchMode::DryRun || store->materialisesFromObjects()) ? 1u : 0u);
+                    EXPECT_EQ(
+                        tree->observations[root / CanonPath("nested/child")],
+                        state != 1 && mode == FetchMode::DryRun ? 1u : 0u);
+                }
+                /* A dry run records the exact entry. Copy has only the
+                   object hash, which recovers plain-file/directory entries. */
+                auto row = settings.getCache()->lookup(
+                    makeSourcePathToHashCacheKey(tree->name, ContentAddressMethod::Raw::Git, root));
+                bool recorded = mode == FetchMode::DryRun || kind == merkle::Mode::Regular || kind == merkle::Mode::Directory;
+                ASSERT_EQ(row.has_value(), recorded);
+                if (row) {
+                    EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), entry.hash);
+                    EXPECT_EQ(fetchers::getIntAttr(*row, "mode"), static_cast<uint64_t>(entry.mode));
+                }
+                EXPECT_EQ(fetchToStore2(settings, *store, source, mode), result);
+                EXPECT_EQ(tree->observations[root], 2u);
+            }
+}
 
 TEST_F(FetchToStoreLocalTest, namingCacheDoesNotOwnItsSource)
 {
@@ -1159,6 +1356,317 @@ TEST_F(FetchToStoreLocalTest, copiedIdentityFiltersPreserveTheTreeAtEveryWidth)
             [](const CanonPath &, const SourceAccessor::Stat &) { return std::nullopt; });
         EXPECT_EQ(narOf(*store->requireStoreObjectAccessor(path)), expected);
     }
+}
+#endif
+
+TEST(ScopedFilter, nestedScopesPreservePolicyCoordinatesSnapshotsAndInnerOperations)
+{
+    struct Inner : MemorySourceAccessor
+    {
+        std::vector<CanonPath> stats, reads;
+        size_t active = 0, opened = 0;
+
+        std::optional<Stat> maybeLstat(const CanonPath & path) override
+        {
+            EXPECT_GT(active, 0u);
+            stats.push_back(path);
+            return MemorySourceAccessor::maybeLstat(path);
+        }
+
+        void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            EXPECT_GT(active, 0u);
+            reads.push_back(path);
+            MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
+        }
+
+        void readDirectoryWithEntries(
+            const CanonPath & path,
+            std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+        {
+            ++active;
+            ++opened;
+            Finally close{[&] { --active; }};
+            SourceAccessor::readDirectoryWithEntries(path, std::move(callback));
+        }
+    };
+
+    struct Policy : FilteringSourceAccessor
+    {
+        void anchor() override {}
+
+        unsigned outcome = 0;
+        std::optional<CanonPath> initiallyDenied;
+        std::optional<CanonPath> throwsAt;
+        std::vector<CanonPath> admissions, names, errors;
+
+        Policy(const SourcePath & source)
+            : FilteringSourceAccessor(source, [this](const CanonPath & path) {
+                errors.push_back(path);
+                return RestrictedPathError("denied '%s'", path);
+            })
+        {
+        }
+
+        bool isAllowed(const CanonPath & path) override
+        {
+            admissions.push_back(path);
+            if (outcome == 2 || throwsAt == path)
+                throw Error("admission failed");
+            return outcome == 0 && initiallyDenied != path;
+        }
+
+        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+        {
+            names.push_back(path);
+            if (outcome == 2)
+                throw Error("naming failed");
+            /* A custom policy's naming operation must survive scoping;
+               it is not interchangeable with the inner accessor's. */
+            return {path, outcome == 1 ? std::optional("policy:" + path.abs()) : std::nullopt};
+        }
+
+        void readDirectoryWithEntries(
+            const CanonPath & path,
+            std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+        {
+            readDirectoryScoped(path, std::move(callback));
+        }
+    };
+
+    auto inner = make_ref<Inner>();
+    const CanonPath physical("physical");
+    for (auto initial : {CanonPath::root, CanonPath("start")}) {
+        auto at = physical / initial;
+        for (unsigned depth = 0; depth <= 3; ++depth) {
+            for (auto base : {at, at / "deep"}) {
+                inner->addFile(base / "plain", "bytes:" + (base / "plain").abs());
+                MemorySink sink{*inner};
+                sink.createRegularFile(base / "exec", [&](CreateRegularFileSink & file) {
+                    file.isExecutable();
+                    file("bytes:" + (base / "exec").abs());
+                });
+                sink.createDirectory(base / "dir");
+                sink.createSymlink(base / "link", "target");
+            }
+            at.push("a");
+        }
+    }
+
+    std::vector<CanonPath> queries{CanonPath::root};
+    for (auto base : {CanonPath::root, CanonPath("deep")})
+        for (auto name : {"plain", "exec", "dir", "link", "missing"})
+            queries.push_back(base / name);
+
+    size_t cases = 0;
+    /* Every sequence of root/child scopes up to three nested scopes,
+       both initial coordinate origins, every represented node kind and
+       absence at both query depths, both initial admissions and all later
+       policy outcomes. The scope root was already admitted. */
+    for (auto initial : {CanonPath::root, CanonPath("start")})
+        for (unsigned depth = 0; depth <= 3; ++depth)
+            for (unsigned steps = 0; steps < (1u << depth); ++steps)
+                for (const auto & query : queries)
+                    for (bool initiallyAllowed : {false, true})
+                        for (unsigned outcome = 0; outcome < 3; ++outcome) {
+                            if (query.isRoot() && !initiallyAllowed)
+                                continue;
+                            SCOPED_TRACE(
+                                fmt("initial=%s depth=%d steps=%d query=%s initiallyAllowed=%d outcome=%d",
+                                    initial.abs(),
+                                    depth,
+                                    steps,
+                                    query.abs(),
+                                    initiallyAllowed,
+                                    outcome));
+                            Policy policy{SourcePath(inner, physical)};
+                            auto final = initial;
+                            for (unsigned level = 0; level < depth; ++level)
+                                if (steps & (1u << level))
+                                    final.push("a");
+                            if (!initiallyAllowed)
+                                policy.initiallyDenied = final / query;
+                            inner->opened = 0;
+                            std::vector<CanonPath> expectedAdmissions{initial};
+                            auto listed = [&](const CanonPath & at) {
+                                auto entries = inner->MemorySourceAccessor::readDirectory(physical / at);
+                                for (auto & [name, type] : entries)
+                                    expectedAdmissions.push_back(at / name);
+                            };
+                            listed(initial);
+                            auto inspect = [&](this const auto & descend,
+                                               SourceAccessor & scoped,
+                                               const CanonPath & relative,
+                                               const CanonPath & at,
+                                               unsigned level) -> void {
+                                EXPECT_EQ(relative, CanonPath::root);
+                                /* Once only root re-scopes remain, change the
+                                   policy before entering them. Each must retain
+                                   the already captured immediate-child set. */
+                                if ((steps >> level) == 0) {
+                                    policy.initiallyDenied.reset();
+                                    policy.outcome = outcome;
+                                }
+                                if (level < depth) {
+                                    CanonPath step{(steps & (1u << level)) ? "a" : "/"};
+                                    auto child = at / step;
+                                    /* A root scope reuses its admission snapshot;
+                                       a deeper listing asks the policy once per entry. */
+                                    if (!step.isRoot())
+                                        listed(child);
+                                    scoped.readDirectoryWithEntries(
+                                        step, [&](SourceAccessor & next, const CanonPath & rel, const auto &) {
+                                            descend(next, rel, child, level + 1);
+                                        });
+                                    return;
+                                }
+                                EXPECT_EQ(policy.admissions, expectedAdmissions);
+                                policy.admissions.clear();
+                                policy.outcome = outcome;
+                                inner->stats.clear();
+                                inner->reads.clear();
+                                auto full = at / query;
+                                auto physicalPath = physical / full;
+                                auto expected = inner->MemorySourceAccessor::maybeLstat(physicalPath);
+                                bool immediate = !query.isRoot() && query.parent()->isRoot();
+                                bool consultsPolicy = !query.isRoot() && !immediate;
+                                bool admitted =
+                                    query.isRoot()
+                                    || (immediate ? initiallyAllowed && expected.has_value() : outcome == 0);
+                                if (consultsPolicy && outcome == 2)
+                                    EXPECT_THROW(scoped.maybeLstat(query), Error);
+                                else {
+                                    auto actual = scoped.maybeLstat(query);
+                                    EXPECT_EQ(actual.has_value(), admitted && expected.has_value());
+                                    if (actual && expected) {
+                                        EXPECT_EQ(actual->type, expected->type);
+                                        EXPECT_EQ(actual->isExecutable, expected->isExecutable);
+                                        EXPECT_EQ(actual->fileSize, expected->fileSize);
+                                    }
+                                }
+                                EXPECT_EQ(
+                                    policy.admissions, consultsPolicy ? std::vector{full} : std::vector<CanonPath>{});
+                                EXPECT_EQ(
+                                    inner->stats, admitted ? std::vector{physicalPath} : std::vector<CanonPath>{});
+
+                                policy.admissions.clear();
+                                if (admitted && expected && expected->type == SourceAccessor::tRegular) {
+                                    EXPECT_EQ(scoped.readFile(query), "bytes:" + physicalPath.abs());
+                                    EXPECT_EQ(inner->reads, std::vector{physicalPath});
+                                    EXPECT_EQ(
+                                        policy.admissions,
+                                        consultsPolicy ? std::vector{full} : std::vector<CanonPath>{});
+                                } else if (!admitted && !(consultsPolicy && outcome == 2)) {
+                                    EXPECT_THROW(scoped.readFile(query), RestrictedPathError);
+                                    EXPECT_EQ(policy.errors, std::vector{full});
+                                    EXPECT_TRUE(inner->reads.empty());
+                                    EXPECT_EQ(
+                                        policy.admissions,
+                                        consultsPolicy ? std::vector{full} : std::vector<CanonPath>{});
+                                }
+
+                                if (outcome == 2)
+                                    EXPECT_THROW(scoped.getFingerprint(query), Error);
+                                else {
+                                    auto named = scoped.getFingerprint(query);
+                                    EXPECT_EQ(named.first, full);
+                                    EXPECT_EQ(
+                                        named.second,
+                                        outcome == 1 ? std::optional("policy:" + full.abs()) : std::nullopt);
+                                }
+                                EXPECT_EQ(policy.names, std::vector{full});
+                            };
+                            policy.readDirectoryWithEntries(
+                                initial, [&](SourceAccessor & scoped, const CanonPath & relative, const auto &) {
+                                    inspect(scoped, relative, initial, 0);
+                                });
+                            EXPECT_EQ(inner->active, 0u);
+                            EXPECT_EQ(inner->opened, depth + 1);
+                            ++cases;
+                        }
+    EXPECT_EQ(cases, 1890u);
+
+    /* These exceptions leave the callback stack, unlike the operation
+       checks above: every opened inner scope must unwind with them. */
+    enum class Failure { RootAdmission, ChildAdmission, DeepAdmission, Naming, Callback };
+    size_t escaped = 0;
+    for (auto failure :
+         {Failure::RootAdmission, Failure::ChildAdmission, Failure::DeepAdmission, Failure::Naming, Failure::Callback})
+        for (unsigned depth = 0; depth <= 3; ++depth) {
+            SCOPED_TRACE(fmt("failure=%d depth=%d", static_cast<unsigned>(failure), depth));
+            Policy policy{SourcePath(inner, physical)};
+            const CanonPath initial("start");
+            inner->opened = 0;
+            bool callbackEntered = false;
+            if (failure == Failure::RootAdmission)
+                policy.throwsAt = initial;
+            else if (failure == Failure::ChildAdmission)
+                policy.throwsAt = initial / "plain";
+            auto descend = [&](this const auto & self, SourceAccessor & scoped, unsigned level) -> void {
+                if (level < depth) {
+                    scoped.readDirectoryWithEntries(
+                        CanonPath("a"), [&](auto & next, const auto &, const auto &) { self(next, level + 1); });
+                    return;
+                }
+                if (failure == Failure::DeepAdmission) {
+                    policy.outcome = 2;
+                    scoped.maybeLstat(CanonPath("deep/plain"));
+                } else if (failure == Failure::Naming) {
+                    policy.outcome = 2;
+                    scoped.getFingerprint(CanonPath::root);
+                } else
+                    throw Error("callback failed");
+            };
+            EXPECT_THROW(
+                policy.readDirectoryWithEntries(
+                    initial,
+                    [&](auto & scoped, const auto &, const auto &) {
+                        callbackEntered = true;
+                        descend(scoped, 0);
+                    }),
+                Error);
+            EXPECT_EQ(inner->active, 0u);
+            EXPECT_EQ(callbackEntered, failure != Failure::RootAdmission && failure != Failure::ChildAdmission);
+            EXPECT_EQ(
+                inner->opened,
+                failure == Failure::RootAdmission    ? 0u
+                : failure == Failure::ChildAdmission ? 1u
+                                                     : depth + 1);
+            ++escaped;
+        }
+    EXPECT_EQ(escaped, 20u);
+}
+
+#ifndef _WIN32
+TEST(ScopedFilter, nestedScopesKeepTheListedPhysicalDirectoryAfterRename)
+{
+    AutoDelete directory{createTempDir()};
+    auto before = directory.path() / "before";
+    auto moved = directory.path() / "moved";
+    createDirs(before / "child");
+    writeFile(before / "child/file", "observed");
+    createSymlink("file", before / "child/link");
+    auto accessor = AllowListSourceAccessor::create(
+        makeFSSourceAccessor(directory.path()), {CanonPath("before")}, {}, [](const CanonPath & path) {
+            return RestrictedPathError("denied '%s'", path);
+        });
+    accessor->readDirectoryWithEntries(CanonPath("before"), [&](auto & outer, const auto &, const auto &) {
+        outer.readDirectoryWithEntries(CanonPath("child"), [&](auto & inner, const auto &, const auto & entries) {
+            ASSERT_EQ(entries.size(), 2u);
+            std::filesystem::rename(before, moved);
+            createDirs(before / "child");
+            writeFile(before / "child/file", "replacement");
+            EXPECT_EQ(inner.readFile(CanonPath("file")), "observed");
+            EXPECT_EQ(inner.readLink(CanonPath("link")), "file");
+            inner.readDirectoryWithEntries(CanonPath::root, [&](auto & repeated, const auto &, const auto &) {
+                EXPECT_EQ(repeated.readFile(CanonPath("file")), "observed");
+                EXPECT_THROW(
+                    repeated.readDirectoryWithEntries(CanonPath("link"), [](auto &, const auto &, const auto &) {}),
+                    SymlinkNotAllowed);
+            });
+        });
+    });
+    EXPECT_EQ(readFile(before / "child/file"), "replacement");
 }
 #endif
 

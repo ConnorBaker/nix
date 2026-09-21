@@ -17,9 +17,12 @@ struct SrcToStore
 {
     /* A fingerprint names the current view. Accessor identity does not:
        grafts and allow lists can grow without replacing their accessor.
-       Names retain neither sources nor claims about a destination store. */
-    using Key = std::tuple<std::string, CanonPath, ContentAddressMethod::Raw>;
-    boost::concurrent_flat_map<Key, Hash> cache;
+       The address also depends on the logical store directory and output
+       name. This memo retains neither sources nor stores, and an address
+       makes no claim about its presence in the requested store. */
+    using Key = std::tuple<std::string, CanonPath, ContentAddressMethod::Raw, std::string, std::string>;
+    using Result = std::pair<StorePath, Hash>;
+    boost::concurrent_flat_map<Key, Result> cache;
 };
 
 ref<SrcToStore> fetchers::Settings::createSrcToStore()
@@ -92,12 +95,9 @@ SourcePath filteredTree(const SourcePath & tree, PathFilter & filter)
     return SourcePath(makeFixedSetFilteringSourceAccessor(tree, filteredPaths(*tree.accessor, tree.path, filter)));
 }
 
-void recordRootEntry(const fetchers::Settings & settings, const SourcePath & root, const Hash & objectHash)
+static void recordRootEntry(
+    fetchers::Cache & cache, const fetchers::Cache::Key & key, const SourcePath & root, const Hash & objectHash)
 {
-    auto [subpath, fingerprint] = root.accessor->getFingerprint(root.path);
-    auto cache = fingerprint ? cacheIfAvailable(settings) : nullptr;
-    if (!cache)
-        return;
     auto st = root.lstat();
     std::optional<merkle::Mode> mode;
     if (st.type == SourceAccessor::tDirectory)
@@ -105,9 +105,15 @@ void recordRootEntry(const fetchers::Settings & settings, const SourcePath & roo
     else if (st.type == SourceAccessor::tRegular && !st.isExecutable)
         mode = merkle::Mode::Regular;
     if (mode)
-        cache->upsert(
-            makeSourcePathToHashCacheKey(*fingerprint, ContentAddressMethod::Raw::Git, subpath),
-            entryRow({.mode = *mode, .hash = objectHash}));
+        cache.upsert(key, entryRow({.mode = *mode, .hash = objectHash}));
+}
+
+void recordRootEntry(const fetchers::Settings & settings, const SourcePath & root, const Hash & objectHash)
+{
+    auto [subpath, fingerprint] = root.accessor->getFingerprint(root.path);
+    if (auto cache = fingerprint ? cacheIfAvailable(settings) : nullptr)
+        recordRootEntry(
+            *cache, makeSourcePathToHashCacheKey(*fingerprint, ContentAddressMethod::Raw::Git, subpath), root, objectHash);
 }
 
 Hash narHashOf(const fetchers::Settings & settings, Store & store, const SourcePath & tree, const Hash & treeHash)
@@ -165,6 +171,7 @@ struct MemoVisitor : HashingVisitor
 {
     const fetchers::Settings & settings;
     const SourcePath & root;
+    const std::pair<CanonPath, std::optional<std::string>> & rootName;
     bool filtered;
     bool wholeViewFingerprint;
     std::shared_ptr<fetchers::Cache> cache;
@@ -185,13 +192,16 @@ struct MemoVisitor : HashingVisitor
     static constexpr size_t maxPendingWrites = 16384;
     std::vector<std::pair<fetchers::Cache::Key, fetchers::Attrs>> writes;
 
-    MemoVisitor(const fetchers::Settings & settings, const SourcePath & root, bool filtered)
+    MemoVisitor(
+        const fetchers::Settings & settings,
+        const SourcePath & root,
+        bool filtered,
+        const std::pair<CanonPath, std::optional<std::string>> & rootName)
         : settings(settings)
         , root(root)
+        , rootName(rootName)
         , filtered(filtered)
-        , wholeViewFingerprint(
-              root.accessor->fingerprint
-              && root.accessor->getFingerprint(root.path).second == root.accessor->fingerprint)
+        , wholeViewFingerprint(rootName.second && rootName.second == root.accessor->fingerprint)
     {
     }
 
@@ -205,12 +215,17 @@ struct MemoVisitor : HashingVisitor
            names (e.g. SHA-1 Git entries) still reuse their subtree rows. */
         if (wholeViewFingerprint && !to.isRoot())
             return std::nullopt;
-        auto [subpath, fingerprint] = root.accessor->getFingerprint(root.path / to);
-        if (!fingerprint)
-            return std::nullopt;
-        if (!cache && !(cache = cacheIfAvailable(settings)))
-            return std::nullopt;
-        return makeSourcePathToHashCacheKey(*fingerprint, ContentAddressMethod::Raw::Git, subpath);
+        auto keyFor = [&](const auto & name) -> std::optional<fetchers::Cache::Key> {
+            const auto & [subpath, fingerprint] = name;
+            if (!fingerprint)
+                return std::nullopt;
+            if (!cache && !(cache = cacheIfAvailable(settings)))
+                return std::nullopt;
+            return makeSourcePathToHashCacheKey(*fingerprint, ContentAddressMethod::Raw::Git, subpath);
+        };
+        /* Reuse this operation's root observation, including no name.
+           Descendants have their own names, independent of the root's. */
+        return to.isRoot() ? keyFor(rootName) : keyFor(root.accessor->getFingerprint(root.path / to));
     }
 
     /* The memo's answer for the node at `to`: its entry when the memo has
@@ -304,9 +319,14 @@ struct MemoVisitor : HashingVisitor
 } // namespace
 
 static merkle::TreeEntry
-gitTreeHashMemoised(const fetchers::Settings & settings, const SourcePath & root, PathFilter & filter, bool filtered)
+gitTreeHashMemoised(
+    const fetchers::Settings & settings,
+    const SourcePath & root,
+    PathFilter & filter,
+    bool filtered,
+    const std::pair<CanonPath, std::optional<std::string>> & rootName)
 {
-    MemoVisitor memo{settings, root, filtered};
+    MemoVisitor memo{settings, root, filtered, rootName};
     auto root2 = objectHashOf(*root.accessor, root.path, filter, memo).root;
     memo.flush();
     return root2;
@@ -348,38 +368,43 @@ std::pair<StorePath, Hash> fetchToStore2(
         filter = nullptr;
     }
 
-    auto [subpath, fingerprint] = filter ? std::pair<CanonPath, std::optional<std::string>>{path.path, std::nullopt}
-                                         : path.accessor->getFingerprint(path.path);
+    const auto rootName = filter ? std::pair<CanonPath, std::optional<std::string>>{path.path, std::nullopt}
+                                 : path.accessor->getFingerprint(path.path);
+    const auto & [subpath, fingerprint] = rootName;
     std::optional<SrcToStore::Key> srcToStoreKey;
     if (fingerprint && !repair)
-        srcToStoreKey.emplace(*fingerprint, subpath, method.raw);
+        srcToStoreKey.emplace(*fingerprint, subpath, method.raw, store.storeDir, name);
 
-    auto useHash = [&](const Hash & hash) -> std::optional<std::pair<StorePath, Hash>> {
-        auto storePath =
-            store.makeFixedOutputPathFromCA(name, ContentAddressWithReferences::fromParts(method, hash, {}));
+    auto useResult = [&](SrcToStore::Result result) -> std::optional<SrcToStore::Result> {
         if (mode != FetchMode::DryRun) {
             /* Root before checking validity: a cached name does not establish
                existence in this store, nor protect it against collection. */
-            store.addTempRoot(storePath);
-            if (!store.isValidPath(storePath))
+            store.addTempRoot(result.first);
+            if (!store.isValidPath(result.first))
                 return std::nullopt;
         }
-        if (srcToStoreKey)
-            settings.srcToStore->cache.insert_or_assign(*srcToStoreKey, hash);
-        return std::make_pair(storePath, hash);
+        return result;
     };
 
     if (srcToStoreKey)
-        if (auto hash = getConcurrent(settings.srcToStore->cache, *srcToStoreKey))
-            if (auto result = useHash(*hash))
-                return *result;
+        if (auto cached = getConcurrent(settings.srcToStore->cache, *srcToStoreKey))
+            if (auto result = useResult(std::move(*cached)))
+                return std::move(*result);
+
+    auto useHash = [&](const Hash & hash) {
+        SrcToStore::Result result{
+            store.makeFixedOutputPathFromCA(name, ContentAddressWithReferences::fromParts(method, hash, {})), hash};
+        if (srcToStoreKey)
+            settings.srcToStore->cache.emplace(*srcToStoreKey, result);
+        return useResult(std::move(result));
+    };
 
     std::optional<fetchers::Cache::Key> cacheKey;
 
     if (!filter && !repair && method == ContentAddressMethod::Raw::Git)
         if (auto entry = path.accessor->getKnownEntry(path.path))
             if (auto result = useHash(merkle::objectHash(*entry)))
-                return *result;
+                return std::move(*result);
 
     if (fingerprint && !repair) {
         cacheKey = makeSourcePathToHashCacheKey(*fingerprint, method, subpath);
@@ -396,7 +421,7 @@ std::pair<StorePath, Hash> fetchToStore2(
                         path,
                         store.printStorePath(result->first),
                         hash.to_string(HashFormat::SRI, true));
-                    return *result;
+                    return std::move(*result);
                 }
                 debug("source path '%s' not in store", path);
             }
@@ -424,7 +449,7 @@ std::pair<StorePath, Hash> fetchToStore2(
                          and subtree memo rows as well as the root caches. */
                       auto hash = merkle::objectHash(
                           repair ? objectHashOf(*path.accessor, path.path, filter2).root
-                                 : gitTreeHashMemoised(settings, path, filter2, filter != nullptr));
+                                 : gitTreeHashMemoised(settings, path, filter2, filter != nullptr, rootName));
                       auto storePath = gitTreePath(store, name, hash);
                       debug(
                           "named '%s' as '%s' (tree hash '%s')",
@@ -458,7 +483,7 @@ std::pair<StorePath, Hash> fetchToStore2(
                       if (method == ContentAddressMethod::Raw::Git)
                           if (auto local = dynamic_cast<LocalStore *>(&store);
                               local && local->materialisesFromObjects()) {
-                              MemoVisitor memo{settings, path, filter != nullptr};
+                              MemoVisitor memo{settings, path, filter != nullptr, rootName};
                               return local->materialise(
                                   name,
                                   path,
@@ -490,14 +515,16 @@ std::pair<StorePath, Hash> fetchToStore2(
        (the dry run's visitor wrote it already; the copy route has the hash
        alone), the hash itself under the NAR method. */
     if (cacheKey) {
-        if (method == ContentAddressMethod::Raw::Git)
-            recordRootEntry(settings, path, hash);
-        else if (auto cache = cacheIfAvailable(settings))
+        if (method == ContentAddressMethod::Raw::Git) {
+            if (mode == FetchMode::Copy)
+                if (auto cache = cacheIfAvailable(settings))
+                    recordRootEntry(*cache, *cacheKey, path, hash);
+        } else if (auto cache = cacheIfAvailable(settings))
             cache->upsert(*cacheKey, {{"hash", hash.to_string(HashFormat::SRI, true)}});
     }
 
     if (srcToStoreKey)
-        settings.srcToStore->cache.insert_or_assign(*srcToStoreKey, hash);
+        settings.srcToStore->cache.emplace(*srcToStoreKey, SrcToStore::Result{storePath, hash});
 
     return {storePath, hash};
 }

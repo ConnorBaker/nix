@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 #include <rapidcheck/gtest.h>
+#include <sqlite3.h>
 
 #include "nix/store/local-store.hh"
 #include "nix/store/store-open.hh"
@@ -25,6 +26,8 @@
 #include "nix/util/tests/source-accessor-gen.hh"
 #include "nix/util/signature/local-keys.hh"
 #include "nix/util/signature/signer.hh"
+#include "nix/util/unix-domain-socket.hh"
+#include "nix/util/signals.hh"
 // Needed for template specialisations. This is not good! When we
 // overhaul how store configs work, this should be fixed.
 #include "nix/util/args.hh"
@@ -37,6 +40,10 @@
 #include <cerrno>
 #include <cstring>
 #include <future>
+#ifndef _WIN32
+#  include <poll.h>
+#  include <sys/socket.h>
+#endif
 
 namespace nix {
 
@@ -69,6 +76,24 @@ TEST(LocalStore, storeDir_relativePath_rejected)
 TEST(LocalStore, storeDir_empty_rejected)
 {
     EXPECT_THROW(LocalStoreConfig("", {{"store", ""}}), UsageError);
+}
+
+TEST(SQLite, externallySynchronizedConnectionOmitsOnlyItsOwnMutex)
+{
+    AutoDelete dir{createTempDir()};
+    SQLite ordinary{dir.path() / "ordinary.sqlite", {.useWAL = true}};
+    SQLite external{dir.path() / "external.sqlite", {.useWAL = true, .externalSynchronization = true}};
+    EXPECT_EQ(sqlite3_db_mutex(external), nullptr);
+    /* This test process leaves SQLite's configured default unchanged. */
+    if (sqlite3_threadsafe() == 1) {
+        EXPECT_NE(sqlite3_db_mutex(ordinary), nullptr);
+    }
+    external.exec("create table value (n integer)");
+    external.exec("insert into value values (1)");
+    SQLiteStmt query{external, "select n from value"};
+    auto use = query.use();
+    ASSERT_TRUE(use.next());
+    EXPECT_EQ(use.getInt(0), 1);
 }
 
 #ifndef _WIN32
@@ -2756,6 +2781,114 @@ TEST_F(LocalStoreObjectsTest, optimiseCoalescesConcurrentCandidates)
     EXPECT_EQ(cases, 120u);
 }
 
+TEST_F(LocalStoreObjectsTest, interruptedOptimisePreservesPathsAndRetryRestoresItsIndex)
+{
+    for (bool executable : {false, true}) {
+        SCOPED_TRACE(executable);
+        auto bytes = fmt("interrupted-optimise-shared-%d", executable);
+        auto later = fmt("interrupted-optimise-later-%d", executable);
+        auto id = merkle::blobId(bytes);
+        auto laterId = merkle::blobId(later);
+        std::array holds{store->objects.hold(), store->objects.hold()};
+        std::vector<ValidPathInfo> infos;
+        std::array<std::filesystem::path, 2> roots;
+        for (unsigned i = 0; i < 2; ++i) {
+            infos.emplace_back(
+                StorePath{fmt("%032d-interrupted-optimise-%d-%d", 2 * unsigned(executable) + i, executable, i)},
+                UnkeyedValidPathInfo{*store, std::nullopt});
+            roots[i] = store->toRealPath(infos.back().path);
+            Nodes nodes{{"a", bytes, executable ? 'x' : 'f'}};
+            if (i == 0)
+                nodes.emplace_back("z", later, 'f');
+            StringSource source{treeNar(nodes)};
+            auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+            auto result = store->restoreThroughObjects(roots[i], source, false, hooks.get(), holds[i], NoRepair);
+            infos.back().objectHash = ObjectHash::of(result.root);
+            infos.back().narSize = result.narSize;
+            store->registerValidPath(infos.back(), holds[i]);
+        }
+        /* A supported legacy store may have two physical representatives.
+           Make the first path noncanonical regardless of allocation order. */
+        std::array<std::filesystem::path, 2> allocated{
+            tempStoreDir.path() / fmt("interrupted-inode-a-%d", executable),
+            tempStoreDir.path() / fmt("interrupted-inode-b-%d", executable)};
+        for (auto & file : allocated) {
+            writeFile(file, bytes);
+            chmod(file, executable ? 0555 : 0444);
+            canonicaliseTimestampAndPermissions(file);
+        }
+        auto physicalClass = [&](const auto & file) {
+            auto status = st(file);
+            return std::pair{static_cast<int64_t>(status.st_dev), static_cast<int64_t>(status.st_ino)};
+        };
+        if (physicalClass(allocated[1]) < physicalClass(allocated[0]))
+            std::swap(allocated[0], allocated[1]);
+        for (unsigned i = 0; i < 2; ++i) {
+            chmod(roots[i], 0755);
+            std::filesystem::remove(roots[i] / "a");
+            std::filesystem::create_hard_link(allocated[1 - i], roots[i] / "a");
+            canonicaliseTimestampAndPermissions(roots[i]);
+        }
+        for (auto & file : allocated)
+            std::filesystem::remove(file);
+        {
+            SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+            SQLiteStmt update{db, "update Blobs set ino = ?, dev = ? where ingestion = ? and id = ?;"};
+            for (unsigned i = 0; i < 2; ++i) {
+                auto status = st(roots[i] / "a");
+                update.use()
+                    .apply(static_cast<int64_t>(status.st_ino))
+                    .apply(static_cast<int64_t>(status.st_dev))
+                    .apply(static_cast<int64_t>(*holds[i].ingestion->id))
+                    .apply(id.hash, id.hashSize)
+                    .exec();
+            }
+        }
+        auto originalIndex = store->objects.index;
+        auto index = *originalIndex;
+        index.lookup = [&, lookup = originalIndex->lookup](const Hash & queried, bool mode, auto cursor) {
+            if (queried == laterId)
+                throw Error("interrupted optimisation after the first file");
+            return lookup(queried, mode, cursor);
+        };
+        store->objects.index = &index;
+        Finally restoreIndex{[&] { store->objects.index = originalIndex; }};
+        OptimiseStats stats;
+        EXPECT_THROW(store->optimiseStore(stats), Error);
+        store->objects.index = originalIndex;
+        ASSERT_EQ(stats.filesLinked, 1u);
+        ASSERT_EQ(physicalClass(roots[0] / "a"), physicalClass(roots[1] / "a"));
+
+        GCOptions options;
+        options.action = GCOptions::gcDeleteSpecific;
+        options.pathsToDelete = GCOptions::SpecificPaths{.paths = {infos[1].path}};
+        GCResults collected;
+        store->collectGarbage(options, collected);
+        ASSERT_FALSE(store->isValidPath(infos[1].path));
+        ASSERT_TRUE(store->isValidPath(infos[0].path));
+        ASSERT_EQ(readFile(roots[0] / "a"), bytes);
+        EXPECT_EQ(readFile(roots[0] / "z"), later);
+        EXPECT_EQ(st(roots[0] / "a").st_mode & ~S_IFMT, executable ? 0555u : 0444u);
+        EXPECT_EQ(st(roots[0] / "z").st_mode & ~S_IFMT, 0444u);
+        auto surviving = store->queryPathInfo(infos[0].path);
+        EXPECT_EQ(surviving->objectHash, infos[0].objectHash);
+        EXPECT_EQ(surviving->references, infos[0].references);
+        /* C1' in doc/lazy-store/01-specification.md preserves valid content
+           and reference closure on failure, not cache completeness after
+           interrupted optimisation. A remaining witness must still be sound. */
+        if (auto holder = store->objects.holderOrForget(id, executable, NoRepair)) {
+            EXPECT_TRUE(GitObjectStore::validHolderMetadata(*holder, executable, st(holder->file)));
+            EXPECT_EQ(GitObjectStore::blobIdOfFile(holder->file), id);
+        }
+        OptimiseStats retried;
+        ASSERT_NO_THROW(store->optimiseStore(retried));
+        auto holder = store->objects.holderOrForget(id, executable, Repair);
+        ASSERT_TRUE(holder);
+        EXPECT_EQ(physicalClass(holder->file), physicalClass(roots[0] / "a"));
+        EXPECT_TRUE(store->verifyObjects(roots[0]).second.empty());
+    }
+}
+
 TEST_F(LocalStoreObjectsTest, optimiseKeepsTheCanonicalInodeWhenItsFirstHolderIsCollected)
 {
     for (bool executable : {false, true}) {
@@ -3410,26 +3543,6 @@ TEST_F(LocalStoreObjectsTest, sweepWritesNothingIntoAnOwnedPart)
 }
 
 /* A malformed tree body is reported with the tree's identifier. */
-/* What a crash between an object file's write and its link would leave on
-   the disk: the file is canonicalised -- mode 0444, or 0555 for an
-   executable blob, and mtime 1 -- *before* the fsync that makes it
-   durable, so the flush covers the metadata too (`writeObjectFile`,
-   git-object-store.cc).  The observable is the moment of the fsync, which
-   the hook `GitObjectStore::atFsync` is the only way to reach: straight
-   after it the file is linked into place and its temporary name is gone.
-   What this pinned before and what it pins now.  Before, `writeObjectFile`
-   wrote *three* kinds of object file and this checked each: a plain blob
-   (0444), an executable blob (0555) and a tree body (0444).  A
-   regular-file blob has no file of the store's own naming, so no route
-   writes an executable blob file any more -- `putBlob`'s one caller is the
-   symlink's target (`ObjectStoreVisitor::symlink`, optimise-store.cc) and
-   a symlink's target is never executable.  The two kinds that are still
-   written are checked here, each written once; the executable case's
-   counterpart -- the bit on a store path's own file, which is what the
-   holder carries -- is `executableHolderCarriesItsBitOnThePathsOwnFile`
-   below.  The object store here is a bare one with no index, so its files
-   are named through it and not through the fixture's `blobFileOf`, which
-   resolves against the store under test. */
 TEST_F(LocalStoreObjectsTest, smallIngestionsFlushOnTheCallerAndResetTheirHolderNames)
 {
     auto hold = store->objects.hold();
@@ -3929,6 +4042,149 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldsCoverEveryKindAndIdentifierShard)
     }
 }
 
+TEST_F(LocalStoreObjectsTest, auxiliaryHoldsKeepTheirAddressesAcrossRepair)
+{
+    size_t cases = 0;
+    auto & objects = store->objects;
+    for (unsigned kind = 0; kind < 3; ++kind)
+        for (unsigned spelling = 0; spelling < 3; ++spelling)
+            for (bool ownRows : {false, true})
+                for (bool reacquire : {false, true}) {
+                    SCOPED_TRACE(
+                        fmt("kind=%d spelling=%d ownRows=%d reacquire=%d", kind, spelling, ownRows, reacquire));
+                    auto bytes = kind == 0 ? std::string{} : fmt("repaired-auxiliary-%d", cases);
+                    auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
+                    auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
+                    auto put = [&](const GitObjectStore::Hold & hold) {
+                        if (kind == 0)
+                            objects.putTree(id, bytes, hold);
+                        else
+                            objects.putBlob(id, kind == 2, bytes, hold);
+                    };
+                    auto acquire = [&](const GitObjectStore::Hold & hold) {
+                        return kind == 0 ? objects.holdTree(id, hold) : objects.holdBlob(id, kind == 2, hold);
+                    };
+                    if (spelling != 0) {
+                        auto seed = objects.hold();
+                        put(seed);
+                    }
+                    std::optional<GitObjectStore::Hold> owner{objects.hold()};
+                    std::optional<GitObjectStore::Hold> view;
+                    if (ownRows)
+                        view.emplace(owner->ownRows());
+                    const auto & hold = view ? *view : *owner;
+                    if (spelling == 0)
+                        put(hold); // The published temporary remains <id>.tmp-<counter>.
+                    else {
+                        ASSERT_TRUE(acquire(hold));
+                        if (spelling == 2) {
+                            auto name = hold.linkFor(file);
+                            std::filesystem::rename(name, name.parent_path().parent_path() / name.filename());
+                        }
+                    }
+                    auto oldInode = st(file).st_ino;
+                    chmod(file, 0644);
+                    writeFile(file, "corrupt auxiliary bytes");
+                    chmod(file, kind == 2 ? 0555 : 0444);
+                    EXPECT_FALSE(store->verifyStore(true, Repair));
+                    ASSERT_FALSE(pathExists(file));
+                    {
+                        auto repair = objects.hold();
+                        put(repair);
+                    }
+                    ASSERT_NE(st(file).st_ino, oldInode);
+                    ASSERT_EQ(st(file).st_nlink, 1u);
+                    if (reacquire)
+                        ASSERT_TRUE(acquire(hold));
+                    /* An ownRows view may finish before the directory's
+                       last owner. Its auxiliary obligations still exist. */
+                    view.reset();
+                    auto noRoots = [](fun<void(const ObjectHash &)>) { return uint64_t{0}; };
+                    auto kept = objects.sweep(noRoots);
+                    EXPECT_TRUE(pathExists(file));
+                    EXPECT_EQ(kept.treesRemoved + kept.blobsRemoved, 0u);
+                    owner.reset();
+                    auto removed = objects.sweep(noRoots);
+                    EXPECT_FALSE(pathExists(file));
+                    EXPECT_EQ(removed.treesRemoved + removed.blobsRemoved, 1u);
+                    ++cases;
+                }
+    EXPECT_EQ(cases, 36u);
+}
+
+TEST_F(LocalStoreObjectsTest, heldTreeAddressesDoNotReplaceReachabilityTraversal)
+{
+    for (bool reachable : {false, true})
+        for (bool childHeld : {false, true}) {
+            SCOPED_TRACE(fmt("reachable=%d childHeld=%d", reachable, childHeld));
+            GitObjectStore objects{tempStoreDir.path() / fmt("held-reachability-%d-%d", reachable, childHeld)};
+            objects.createDirectories();
+            auto blob = merkle::blobId("target");
+            auto body = merkle::serialiseTree({{"link", {merkle::Mode::Symlink, blob}}});
+            auto tree = merkle::treeId(body);
+            {
+                auto seed = objects.hold();
+                objects.putBlob(blob, false, "target", seed);
+                objects.putTree(tree, body, seed);
+            }
+            auto hold = objects.hold();
+            ASSERT_TRUE(objects.holdTree(tree, hold));
+            if (childHeld)
+                ASSERT_TRUE(objects.holdBlob(blob, false, hold));
+            objects.sweep([&](fun<void(const ObjectHash &)> live) {
+                if (reachable)
+                    live(ObjectHash::of({merkle::Mode::Directory, tree}));
+                return uint64_t{0};
+            });
+            EXPECT_TRUE(pathExists(objects.treeFile(tree)));
+            EXPECT_EQ(pathExists(objects.blobFile(blob, false)), reachable || childHeld);
+        }
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryHoldNamesDenoteExactlyTheirKindAndIdentifier)
+{
+    const std::array<std::string_view, 3> kinds{"blobs", "blobs-x", "trees"};
+    const std::vector<std::pair<std::string, bool>> suffixes{
+        {"", true},
+        {".tmp-0", true},
+        {".tmp-18446744073709551615", true},
+        {".tmp-", false},
+        {".tmp--1", false},
+        {".tmp-1x", false},
+        {".tmp-1.extra", false},
+        {".old", false},
+    };
+    size_t cases = 0;
+    for (size_t kind = 0; kind < kinds.size(); ++kind)
+        for (bool sharded : {false, true})
+            for (auto & [suffix, accepted] : suffixes) {
+                SCOPED_TRACE(fmt("kind=%d sharded=%d suffix=%s", kind, sharded, suffix));
+                GitObjectStore objects{tempStoreDir.path() / fmt("hold-name-%d", cases)};
+                objects.createDirectories();
+                auto id = merkle::blobId("held address");
+                auto name = GitObjectStore::idString(id);
+                auto hold = objects.hold();
+                auto claim = hold.directory() / kinds[kind];
+                if (sharded)
+                    claim /= name.substr(0, 2);
+                createDirs(claim);
+                /* A surviving old incarnation is independent of the newly
+                   published inode and may have corrupt bytes or metadata. */
+                writeFile(claim / (name + suffix), "old incarnation");
+                std::array files{objects.blobFile(id, false), objects.blobFile(id, true), objects.treeFile(id)};
+                for (auto & file : files) {
+                    createDirs(file.parent_path());
+                    writeFile(file, "new incarnation");
+                    ASSERT_EQ(st(file).st_nlink, 1u);
+                }
+                objects.sweep([](fun<void(const ObjectHash &)>) { return uint64_t{0}; });
+                for (size_t other = 0; other < kinds.size(); ++other)
+                    EXPECT_EQ(pathExists(files[other]), accepted && other == kind);
+                ++cases;
+            }
+    EXPECT_EQ(cases, 48u);
+}
+
 TEST_F(LocalStoreObjectsTest, releasingAHoldDoesNotFollowSymlinks)
 {
     auto outside = tempStoreDir.path() / "outside";
@@ -3948,7 +4204,10 @@ TEST_F(LocalStoreObjectsTest, releasingAHoldDoesNotFollowSymlinks)
     EXPECT_EQ(readFile(store->objects.treeFile(merkle::treeId(""))), "");
 }
 
-TEST_F(LocalStoreObjectsTest, writeObjectFileIsCanonicalBeforeFsync)
+/* Auxiliary bytes and read permissions must be complete before the
+   durability boundary. Their mtime is not part of the represented tree;
+   regular-file holders retain their independent canonical-time contract. */
+TEST_F(LocalStoreObjectsTest, writeAuxiliaryBytesAndModeBeforeFsync)
 {
     GitObjectStore objects{tempStoreDir.path() / "fsynced", /*fsync=*/true};
     objects.createDirectories();
@@ -3957,14 +4216,14 @@ TEST_F(LocalStoreObjectsTest, writeObjectFileIsCanonicalBeforeFsync)
     {
         std::string what;
         mode_t mode;
-        time_t mtime;
+        std::string bytes;
     };
 
     std::vector<Seen> seen;
     std::string what;
     objects.atFsync = [&](const std::filesystem::path & tmp) {
         auto s = lstat(tmp);
-        seen.push_back({what, static_cast<mode_t>(s.st_mode & ~S_IFMT), s.st_mtime});
+        seen.push_back({what, static_cast<mode_t>(s.st_mode & ~S_IFMT), readFile(tmp)});
     };
 
     auto hold = objects.hold();
@@ -3977,15 +4236,16 @@ TEST_F(LocalStoreObjectsTest, writeObjectFileIsCanonicalBeforeFsync)
     ASSERT_EQ(seen.size(), 2u);
     EXPECT_EQ(seen[0].mode, 0444u) << seen[0].what;
     EXPECT_EQ(seen[1].mode, 0444u) << seen[1].what;
-    for (auto & s : seen)
-        EXPECT_EQ(s.mtime, 1) << s.what << ": the store's mtime";
+    EXPECT_EQ(seen[0].bytes, "one");
 
     /* And that is what stands afterwards: the link carries the inode. */
     EXPECT_EQ(st(objects.blobFile(merkle::blobId("one"), false)).st_mode & ~S_IFMT, 0444u);
     auto body = merkle::syntheticRootTree(root);
     ASSERT_TRUE(body.has_value());
+    EXPECT_EQ(seen[1].bytes, *body);
     EXPECT_EQ(st(objects.treeFile(merkle::treeId(*body))).st_mode & ~S_IFMT, 0444u);
-    EXPECT_EQ(st(objects.blobFile(merkle::blobId("one"), false)).st_mtime, 1);
+    EXPECT_EQ(readFile(objects.blobFile(merkle::blobId("one"), false)), "one");
+    EXPECT_EQ(readFile(objects.treeFile(merkle::treeId(*body))), *body);
     /* And nothing under `blobs-x`: a bare object store holds no
        regular-file blob, and a symlink's target is never executable. */
     EXPECT_FALSE(pathExists(objects.blobFile(merkle::blobId("one"), true)));
@@ -4002,7 +4262,34 @@ TEST_F(LocalStoreObjectsTest, writeObjectFileIsCanonicalBeforeFsync)
     EXPECT_EQ(calls, 0u);
 }
 
-/* The counterpart of the executable-blob arm `writeObjectFileIsCanonicalBeforeFsync`
+TEST_F(LocalStoreObjectsTest, auxiliaryReadPermissionsAreIndependentOfEveryUmask)
+{
+    GitObjectStore objects{tempStoreDir.path() / "auxiliary-umasks"};
+    objects.createDirectories();
+    auto hold = objects.hold();
+    const std::string bytes = "auxiliary bytes";
+    auto id = merkle::blobId(bytes);
+    for (bool executable : {false, true}) {
+        auto file = objects.blobFile(id, executable);
+        /* The finite domain here is creation of the auxiliary file, not
+           directory creation, which has its own permission semantics. */
+        createDirs(file.parent_path());
+        hold.linkFor(file);
+        for (mode_t mask = 0; mask <= 0777; ++mask) {
+            SCOPED_TRACE(fmt("executable=%d umask=%o", executable, mask));
+            {
+                auto previous = ::umask(mask);
+                Finally restoreUmask{[&] { ::umask(previous); }};
+                objects.putBlob(id, executable, bytes, hold);
+            }
+            EXPECT_EQ(st(file).st_mode & 07777, executable ? 0555u : 0444u);
+            EXPECT_EQ(readFile(file), bytes);
+            unlinkIfExists(file);
+        }
+    }
+}
+
+/* The counterpart of the executable-blob arm `writeAuxiliaryBytesAndModeBeforeFsync`
    lost.  An executable regular file's blob has no file under `blobs-x`: its
    canonical file is the store path's own, and the bit the object store used
    to carry by *which directory the file lay in* is now carried by the
@@ -5253,6 +5540,418 @@ TEST_F(LocalStoreObjectsTest, deletesEverythingNotAllowListedInTheStoreDir)
     EXPECT_EQ(left, (std::set<std::string>{store->objects.dir.filename().string(), std::string(live.to_string())}))
         << "exactly the object store's directory and the live path";
     EXPECT_FALSE(store->isValidPath(dead));
+}
+
+TEST_F(LocalStoreObjectsTest, temporaryRootsBelongToEachStoreHandle)
+{
+    setenv("_NIX_TEST_NO_LSOF", "1", 1);
+    Finally unset{[] { unsetenv("_NIX_TEST_NO_LSOF"); }};
+    auto modeFile = tempStoreDir.path() / "roots-mode-reference";
+    auto modeFd = openLockFile(modeFile, true);
+    auto expectedMode = st(modeFile).st_mode & 0777;
+
+    /* All six interleavings of create/register for two handles, followed
+       by either destruction order. Creation may precede or follow the
+       other handle's first root; neither operation may replace its file. */
+    std::array<unsigned, 4> order{0, 1, 2, 3};
+    size_t cases = 0;
+    do {
+        if (std::find(order.begin(), order.end(), 0) > std::find(order.begin(), order.end(), 1)
+            || std::find(order.begin(), order.end(), 2) > std::find(order.begin(), order.end(), 3))
+            continue;
+        for (size_t firstDestroyed : {0u, 1u}) {
+            SCOPED_TRACE(fmt(
+                "order=%d%d%d%d firstDestroyed=%d", order[0], order[1], order[2], order[3], firstDestroyed));
+            ++cases;
+            std::array<StorePath, 2> paths{
+                store
+                    ->addToStoreSlow(
+                        "first-root", {treeAccessor({{"a", "first", 'f'}})}, ContentAddressMethod::Raw::Git,
+                        HashAlgorithm::SHA256)
+                    .path,
+                store
+                    ->addToStoreSlow(
+                        "second-root", {treeAccessor({{"a", "second", 'f'}})}, ContentAddressMethod::Raw::Git,
+                        HashAlgorithm::SHA256)
+                    .path};
+            /* The collecting handle itself must retain neither path. */
+            store.reset();
+            store = std::make_shared<LocalStore>(ref{config});
+            std::array<std::shared_ptr<LocalStore>, 2> handles;
+            for (auto event : order) {
+                auto i = event / 2;
+                if (event % 2 == 0)
+                    handles[i] = std::make_shared<LocalStore>(ref{config});
+                else
+                    handles[i]->addTempRoot(paths[i]);
+            }
+            std::array rootFiles{handles[0]->fnTempRoots, handles[1]->fnTempRoots};
+            EXPECT_NE(rootFiles[0], rootFiles[1]);
+            for (size_t i = 0; i < 2; ++i) {
+                EXPECT_EQ(std::stoi(rootFiles[i].filename().string()), getpid())
+                    << "older collectors parse the numeric prefix";
+                EXPECT_EQ(st(rootFiles[i]).st_mode & 0777, expectedMode);
+                EXPECT_EQ(readFile(rootFiles[i]), store->printStorePath(paths[i]) + '\0');
+            }
+            auto collect = [&] {
+                GCOptions options;
+                options.action = GCOptions::gcDeleteDead;
+                GCResults results;
+                store->collectGarbage(options, results);
+            };
+            collect();
+            for (auto & path : paths) {
+                EXPECT_TRUE(store->isValidPathUncached(path));
+                EXPECT_TRUE(pathExists(store->toRealPath(path)));
+            }
+
+            handles[firstDestroyed].reset();
+            EXPECT_FALSE(pathExists(rootFiles[firstDestroyed]));
+            EXPECT_TRUE(pathExists(rootFiles[1 - firstDestroyed]));
+            collect();
+            EXPECT_FALSE(store->isValidPathUncached(paths[firstDestroyed]));
+            EXPECT_FALSE(pathExists(store->toRealPath(paths[firstDestroyed])));
+            EXPECT_TRUE(store->isValidPathUncached(paths[1 - firstDestroyed]));
+            EXPECT_TRUE(pathExists(store->toRealPath(paths[1 - firstDestroyed])));
+
+            handles[1 - firstDestroyed].reset();
+            EXPECT_FALSE(pathExists(rootFiles[1 - firstDestroyed]));
+            collect();
+            EXPECT_FALSE(store->isValidPathUncached(paths[1 - firstDestroyed]));
+            EXPECT_FALSE(pathExists(store->toRealPath(paths[1 - firstDestroyed])));
+        }
+    } while (std::next_permutation(order.begin(), order.end()));
+    EXPECT_EQ(cases, 12u);
+}
+
+TEST_F(LocalStoreObjectsTest, temporaryRootsAreASetForOneDescriptorLifetime)
+{
+    auto savedFeatures = experimentalFeatureSettings.experimentalFeatures.get();
+    Finally restoreFeatures{[&] { experimentalFeatureSettings.experimentalFeatures = savedFeatures; }};
+    experimentalFeatureSettings.experimentalFeatures.get().insert(Xp::ReadOnlyLocalStore);
+    std::vector<StorePath> paths;
+    for (size_t i = 0; i < 4; ++i)
+        paths.push_back(store->makeStorePath("source", hashString(HashAlgorithm::SHA256, fmt("root-%d", i)), "root"));
+
+    for (size_t writers : {1u, 8u})
+        for (bool distinct : {false, true}) {
+            SCOPED_TRACE(fmt("writers=%d distinct=%d", writers, distinct));
+            store.reset();
+            store = std::make_shared<LocalStore>(ref{config});
+            ASSERT_FALSE(pathExists(store->fnTempRoots));
+            std::promise<void> start;
+            auto ready = start.get_future().share();
+            bool started = false;
+            std::atomic<bool> failed = false;
+            std::vector<std::thread> threads;
+            Finally join{[&] {
+                if (!started)
+                    start.set_value();
+                for (auto & thread : threads)
+                    if (thread.joinable())
+                        thread.join();
+            }};
+            for (size_t writer = 0; writer < writers; ++writer)
+                threads.emplace_back([&, writer] {
+                    ready.wait();
+                    try {
+                        for (size_t i = 0; i < 16; ++i)
+                            store->addTempRoot(paths[distinct ? (writer + i) % paths.size() : 0]);
+                    } catch (...) {
+                        failed = true;
+                    }
+                });
+            start.set_value();
+            started = true;
+            for (auto & thread : threads)
+                thread.join();
+            EXPECT_FALSE(failed);
+
+            auto contents = readFile(store->fnTempRoots);
+            StringSet actual, expected;
+            size_t records = 0;
+            for (size_t pos = 0; pos < contents.size();) {
+                auto end = contents.find('\0', pos);
+                ASSERT_NE(end, std::string::npos);
+                actual.insert(contents.substr(pos, end - pos));
+                ++records;
+                pos = end + 1;
+            }
+            for (size_t i = 0; i < (distinct ? paths.size() : 1); ++i)
+                expected.insert(store->printStorePath(paths[i]));
+            EXPECT_EQ(actual, expected);
+            EXPECT_EQ(records, expected.size());
+        }
+
+    store.reset();
+    auto readOnlyConfig = make_ref<LocalStoreConfig>(tempStoreDir.path(), StoreConfig::Params{{"read-only", "true"}});
+    store = std::make_shared<LocalStore>(readOnlyConfig);
+    for (auto & path : paths)
+        store->addTempRoot(path);
+    EXPECT_FALSE(pathExists(store->fnTempRoots));
+}
+
+TEST_F(LocalStoreObjectsTest, failedTemporaryRootAppendsRemainOneMonotoneStream)
+{
+    std::string expected;
+    size_t serial = 0;
+    for (bool interrupted : {false, true})
+        for (bool same : {false, true}) {
+            auto sample = store->makeStorePath("source", hashString(HashAlgorithm::SHA256, "sample"), "first");
+            auto length = store->printStorePath(sample).size() + 1;
+            for (size_t prefix = 0; prefix <= length; ++prefix) {
+                SCOPED_TRACE(fmt("interrupted=%d same=%d prefix=%d", interrupted, same, prefix));
+                auto hash = hashString(HashAlgorithm::SHA256, fmt("failed-root-%d", serial++));
+                auto first = store->makeStorePath("source", hash, "first");
+                auto next = same ? first : store->makeStorePath("source", hash, "other");
+                auto record = store->printStorePath(first) + '\0';
+                ASSERT_EQ(record.size(), length);
+                size_t writes = 0;
+                auto failAfter = [&](size_t count) {
+                    store->writeTempRootForTest = [&, count](Descriptor fd, std::string_view bytes) {
+                        ++writes;
+                        writeFull(fd, bytes.substr(0, count), false);
+                        if (interrupted)
+                            throw Interrupted("injected temporary-root interruption");
+                        throw SysError(EIO, "injected temporary-root write failure");
+                    };
+                };
+                Finally clearHook{[&] { store->writeTempRootForTest = {}; }};
+                failAfter(prefix);
+                EXPECT_THROW(store->addTempRoot(first), BaseError);
+                EXPECT_EQ(readFile(store->fnTempRoots), expected + record.substr(0, prefix));
+
+                /* Read-only calls must neither finish the old record nor
+                   manufacture a successful registration for the new path. */
+                config->readOnly = true;
+                {
+                    Finally writable{[&] { config->readOnly = false; }};
+                    EXPECT_NO_THROW(store->addTempRoot(next));
+                    EXPECT_EQ(writes, 1u);
+                }
+
+                if (prefix < length) {
+                    /* Recovery itself can fail after making more progress. */
+                    failAfter(1);
+                    EXPECT_THROW(store->addTempRoot(next), BaseError);
+                    EXPECT_EQ(readFile(store->fnTempRoots), expected + record.substr(0, prefix + 1));
+                }
+                store->writeTempRootForTest = {};
+                store->addTempRoot(next);
+                expected += record;
+                if (!same)
+                    expected += store->printStorePath(next) + '\0';
+                EXPECT_EQ(readFile(store->fnTempRoots), expected);
+                store->writeTempRootForTest = [&](Descriptor, std::string_view) {
+                    FAIL() << "a completed registration was appended again";
+                };
+                store->addTempRoot(next);
+            }
+        }
+}
+
+TEST_F(LocalStoreObjectsTest, failedTemporaryRootPositionChecksNeverAppend)
+{
+    auto first = store->makeStorePath("source", hashString(HashAlgorithm::SHA256, "old-root"), "first");
+    store->addTempRoot(first);
+    auto expected = readFile(store->fnTempRoots);
+    auto next = store->makeStorePath("source", hashString(HashAlgorithm::SHA256, "new-root"), "other");
+    auto record = store->printStorePath(next) + '\0';
+    Descriptor fd = INVALID_DESCRIPTOR;
+    store->writeTempRootForTest = [&](Descriptor target, std::string_view bytes) {
+        fd = target;
+        writeFull(fd, bytes.substr(0, 1), false);
+        throw SysError(EIO, "injected temporary-root write failure");
+    };
+    Finally clearHook{[&] { store->writeTempRootForTest = {}; }};
+    EXPECT_THROW(store->addTempRoot(next), SysError);
+    ASSERT_NE(fd, INVALID_DESCRIPTOR);
+    auto position = lseek(fd, 0, SEEK_CUR);
+    auto backup = dupDescriptor(fd);
+    bool restored = false;
+    Finally restoreDescriptor{[&] {
+        if (!restored) {
+            if (dup2(backup.get(), fd) == -1)
+                std::terminate();
+            lseek(fd, position, SEEK_SET);
+        }
+    }};
+    size_t writes = 0;
+    store->writeTempRootForTest = [&](Descriptor, std::string_view) { ++writes; };
+    for (auto badOffset : {off_t(0), off_t(expected.size() + record.size() + 1)}) {
+        ASSERT_NE(lseek(fd, badOffset, SEEK_SET), -1);
+        EXPECT_THROW(store->addTempRoot(next), Error);
+        EXPECT_EQ(writes, 0u);
+    }
+    ASSERT_EQ(close(fd), 0);
+    EXPECT_THROW(store->addTempRoot(next), SysError);
+    EXPECT_EQ(writes, 0u);
+    ASSERT_NE(dup2(backup.get(), fd), -1);
+    ASSERT_NE(lseek(fd, position, SEEK_SET), -1);
+    restored = true;
+    store->writeTempRootForTest = {};
+    store->addTempRoot(next);
+    EXPECT_EQ(readFile(store->fnTempRoots), expected + record);
+}
+
+TEST_F(LocalStoreObjectsTest, temporaryRootFilePrecedesCollectorAcknowledgement)
+{
+    enum class Failure { None, Disconnect, BadAcknowledgement };
+    for (auto failure : {Failure::None, Failure::Disconnect, Failure::BadAcknowledgement}) {
+        SCOPED_TRACE(fmt("failure=%d", static_cast<int>(failure)));
+        store.reset();
+        store = std::make_shared<LocalStore>(ref{config});
+        auto path = store->makeStorePath("source", hashString(HashAlgorithm::SHA256, "socket-root"), "root");
+        auto next = failure == Failure::BadAcknowledgement
+                        ? store->makeStorePath("source", hashString(HashAlgorithm::SHA256, "next-root"), "root")
+                        : path;
+        auto gcFd = openLockFile(config->stateDir.get() / "gc.lock", true);
+        lockFile(gcFd.get(), ltWrite, true);
+        auto socketPath = config->stateDir.get() / "gc-socket/socket";
+        createDirs(socketPath.parent_path());
+        auto server = createUnixDomainSocket(socketPath, 0600);
+        AutoCloseFD client;
+        std::promise<void> finished;
+        auto done = finished.get_future();
+        std::thread writer([&] {
+            try {
+                if (failure == Failure::BadAcknowledgement) {
+                    bool refused = false;
+                    try {
+                        store->addTempRoot(path);
+                    } catch (Error &) {
+                        refused = true;
+                    }
+                    if (!refused)
+                        throw Error("invalid collector acknowledgement was accepted");
+                } else
+                    store->addTempRoot(path);
+                store->addTempRoot(next);
+                store->addTempRoot(next);
+                finished.set_value();
+            } catch (...) {
+                finished.set_exception(std::current_exception());
+            }
+        });
+        Finally join{[&] {
+            /* Release every possible wait before joining, also on a failed
+               assertion: a closed peer makes the client retry the GC lock. */
+            lockFile(gcFd.get(), ltNone, false);
+            if (client)
+                shutdown(client.get(), SHUT_RDWR);
+            server.close();
+            writer.join();
+        }};
+        auto readable = [](int fd) {
+            pollfd pfd{.fd = fd, .events = POLLIN};
+            if (poll(&pfd, 1, 5000) != 1)
+                throw Error("temporary-root protocol test timed out");
+        };
+        auto expected = store->printStorePath(path) + '\0';
+        auto request = [&](const StorePath & requested) {
+            readable(server.get());
+            client = accept(server.get(), nullptr, nullptr);
+            if (!client)
+                throw SysError("accepting temporary-root test client");
+            std::string line;
+            while (!line.ends_with('\n')) {
+                readable(client.get());
+                char byte;
+                if (recv(client.get(), &byte, 1, MSG_DONTWAIT) != 1)
+                    throw Error("temporary-root protocol test lost its client");
+                line += byte;
+            }
+            EXPECT_EQ(line, store->printStorePath(requested) + '\n');
+            /* A later collector must already see this record, even if this
+               collector finishes immediately after sending its ACK. Discover
+               the file without reading the writer's mutable fnTempRoots. */
+            std::vector<std::filesystem::path> rootFiles;
+            for (auto & entry : DirectoryIterator{store->tempRootsDir})
+                rootFiles.push_back(entry.path());
+            ASSERT_EQ(rootFiles.size(), 1u);
+            EXPECT_EQ(readFile(rootFiles.front()), expected);
+        };
+        request(path);
+        if (failure == Failure::Disconnect) {
+            shutdown(client.get(), SHUT_RDWR);
+            client.close();
+            request(path);
+        } else if (failure == Failure::BadAcknowledgement) {
+            /* A failed exchange must discard even a queued valid byte:
+               it acknowledges the old request, never the next root. */
+            writeFull(client.get(), "01", false);
+            expected += store->printStorePath(next) + '\0';
+            request(next);
+        }
+        writeFull(client.get(), "1", false);
+        ASSERT_EQ(done.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        EXPECT_NO_THROW(done.get());
+        EXPECT_EQ(readFile(store->fnTempRoots), expected);
+    }
+}
+
+TEST_F(LocalStoreObjectsTest, garbageCollectorClientsCompleteOrJoinAtShutdown)
+{
+    setenv("_NIX_TEST_NO_LSOF", "1", 1);
+    Finally unset{[] { unsetenv("_NIX_TEST_NO_LSOF"); }};
+
+    enum class Input { Empty, Malformed, Root };
+    for (auto input : {Input::Empty, Input::Malformed, Input::Root})
+        for (bool finishFirst : {false, true}) {
+            SCOPED_TRACE(fmt("input=%d finishFirst=%d", static_cast<int>(input), finishFirst));
+            auto candidate = store
+                                 ->addToStoreSlow(
+                                     "client-lifecycle",
+                                     {treeAccessor({{"a", std::string("garbage"), 'f'}})},
+                                     ContentAddressMethod::Raw::Git,
+                                     HashAlgorithm::SHA256)
+                                 .path;
+            store.reset();
+            store = std::make_shared<LocalStore>(ref{config});
+            auto root = store->makeStorePath("source", hashString(HashAlgorithm::SHA256, "client-root"), "root");
+            AutoCloseFD client;
+            bool visited = false;
+            auto receive = [&](bool eof) {
+                pollfd pfd{.fd = client.get(), .events = POLLIN};
+                if (poll(&pfd, 1, 5000) != 1)
+                    throw Error("garbage collector client lifecycle test timed out");
+                char byte;
+                auto count = recv(client.get(), &byte, 1, MSG_DONTWAIT);
+                if (eof ? count != 0 : count != 1 || byte != '1')
+                    throw Error("unexpected garbage collector client lifecycle response");
+            };
+            store->whileDeletionPending = [&](const StorePath & path) {
+                if (path != candidate || visited)
+                    return;
+                visited = true;
+                client = createUnixDomainSocket();
+                nix::connect(toSocket(client.get()), config->stateDir.get() / "gc-socket/socket");
+                if (input != Input::Empty || !finishFirst) {
+                    /* For an idle connection that the server will close,
+                       first confirm acceptance through an ordinary ACK. */
+                    auto message =
+                        input == Input::Malformed ? std::string("malformed\n") : store->printStorePath(root) + '\n';
+                    writeFull(client.get(), message, false);
+                    receive(false);
+                }
+                if (finishFirst) {
+                    if (shutdown(client.get(), SHUT_WR) != 0)
+                        throw SysError("ending garbage collector test client input");
+                    receive(true);
+                }
+            };
+
+            GCOptions options;
+            options.action = GCOptions::gcDeleteDead;
+            options.pathsToDelete = GCOptions::SpecificPaths{.paths = {candidate}};
+            GCResults results;
+            store->collectGarbage(options, results);
+            store->whileDeletionPending = {};
+            EXPECT_TRUE(visited);
+            EXPECT_FALSE(store->isValidPath(candidate));
+            if (!finishFirst)
+                receive(true);
+        }
 }
 
 /* A temporary root registered while a collection runs reaches the

@@ -100,16 +100,12 @@ std::string_view unhackName(std::string_view name);
  * @throws Error when two on-disk names unhack to one, or, with the hack
  * off, when a name carries `caseHackSuffix`.
  */
-StringMap unhackedEntries(
-    SourceAccessor & accessor,
-    const CanonPath & path,
-    const std::function<void(const std::string & name, bool isDirectory)> & typed = {});
+StringMap unhackedEntries(SourceAccessor & accessor, const CanonPath & path);
 
 StringMap unhackedEntries(
     const SourceAccessor::DirEntries & entries,
     SourceAccessor & accessor,
-    const CanonPath & path,
-    const std::function<void(const std::string & name, bool isDirectory)> & typed = {});
+    const CanonPath & path);
 
 /**
  * Dump an archive with a single file with these contents.

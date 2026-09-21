@@ -5,6 +5,7 @@
 
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/unordered/concurrent_flat_set.hpp>
+#include <iterator>
 #include <nlohmann/json.hpp>
 
 namespace nix {
@@ -63,8 +64,8 @@ void FilteringSourceAccessor::readDirectoryScoped(
             {
                 void anchor() override {}
 
-                FilteringSourceAccessor & owner;
-                const CanonPath & original;
+                FilteringSourceAccessor * owner;
+                CanonPath original;
                 const DirEntries & admitted;
 
                 Scoped(
@@ -79,10 +80,19 @@ void FilteringSourceAccessor::readDirectoryScoped(
                           SourcePath(
                               ref<SourceAccessor>(std::shared_ptr<SourceAccessor>(&inner, [](auto *) {})), relative),
                           [&owner, original](const CanonPath & p) { return owner.makeNotAllowedError(original / p); })
-                    , owner(owner)
+                    , owner(&owner)
                     , original(original)
                     , admitted(admitted)
                 {
+                    /* Nested scopes change coordinates, not the admission
+                       policy. Compose those coordinates once instead of
+                       rebuilding the path through every enclosing scope
+                       for each descendant. The physical accessor remains
+                       the innermost borrowed directory above. */
+                    if (auto parent = dynamic_cast<Scoped *>(&owner)) {
+                        this->original = parent->original / original;
+                        this->owner = parent->owner;
+                    }
                 }
 
                 bool isAllowed(const CanonPath & p) override
@@ -91,12 +101,12 @@ void FilteringSourceAccessor::readDirectoryScoped(
                         return true;
                     if (p.parent()->isRoot())
                         return admitted.contains(std::string(*p.baseName()));
-                    return owner.isAllowed(original / p);
+                    return owner->isAllowed(original / p);
                 }
 
                 std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & p) override
                 {
-                    return owner.getFingerprint(original / p);
+                    return owner->getFingerprint(original / p);
                 }
 
                 void readDirectoryWithEntries(
@@ -159,6 +169,16 @@ public:
         , allowedPrefixes(allowedPrefixes.begin(), allowedPrefixes.end())
         , allowedPaths(allowedPaths.begin(), allowedPaths.end())
     {
+        /* Ancestor prefixes already admit every descendant prefix.  Keep
+           just the minimal prefixes; CanonPath orders each subtree
+           contiguously, so covered entries immediately follow its root. */
+        auto prefixes = this->allowedPrefixes.lock();
+        for (auto i = prefixes->begin(); i != prefixes->end();) {
+            auto next = std::next(i);
+            while (next != prefixes->end() && next->isWithin(*i))
+                next = prefixes->erase(next);
+            i = next;
+        }
     }
 
     bool isAllowed(const CanonPath & path) override
@@ -169,7 +189,15 @@ public:
 
     void allowPrefix(CanonPath prefix) override
     {
-        allowedPrefixes.lock()->insert(std::move(prefix));
+        auto prefixes = allowedPrefixes.lock();
+        auto after = prefixes->upper_bound(prefix);
+        if (after != prefixes->begin() && prefix.isWithin(*std::prev(after)))
+            return;
+        auto inserted = prefixes->emplace_hint(after, std::move(prefix));
+        auto first = after;
+        while (after != prefixes->end() && after->isWithin(*inserted))
+            ++after;
+        prefixes->erase(first, after);
     }
 
     std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
@@ -181,12 +209,10 @@ public:
            ancestor of a prefix for instance, entries are hidden, and the
            subtree has no name. */
         auto prefixes(allowedPrefixes.readLock());
-        for (auto p = path;; p.pop()) {
-            if (prefixes->contains(p))
-                return next->getFingerprint(prefix / path);
-            if (p.isRoot())
-                return {path, std::nullopt};
-        }
+        auto after = prefixes->upper_bound(path);
+        if (after != prefixes->begin() && path.isWithin(*std::prev(after)))
+            return next->getFingerprint(prefix / path);
+        return {path, std::nullopt};
     }
 };
 

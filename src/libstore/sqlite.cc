@@ -100,6 +100,8 @@ SQLite::SQLite(const std::filesystem::path & path, Settings && settings)
     const char * vfs = settings.useWAL ? 0 : "unix-dotfile";
     bool immutable = settings.mode == SQLiteOpenMode::Immutable;
     int flags = immutable ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE;
+    if (settings.externalSynchronization)
+        flags |= SQLITE_OPEN_NOMUTEX;
     if (settings.mode == SQLiteOpenMode::Normal)
         flags |= SQLITE_OPEN_CREATE;
     auto uri = "file:" + percentEncode(path.string()) + "?immutable=" + (immutable ? "1" : "0");

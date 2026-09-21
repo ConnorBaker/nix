@@ -1,5 +1,6 @@
 #include "nix/util/canon-path.hh"
 
+#include <algorithm>
 #include <gtest/gtest.h>
 
 namespace nix {
@@ -198,6 +199,70 @@ TEST(CanonPath, allowed)
     ASSERT_FALSE(CanonPath("aaa").isAllowed(allowed));
     ASSERT_FALSE(CanonPath("zzz").isAllowed(allowed));
     ASSERT_TRUE(CanonPath("/").isAllowed(allowed));
+}
+
+TEST(CanonPath, separatorsSortBeforeEveryFilenameByte)
+{
+    const CanonPath parent("a");
+    const CanonPath child("a/child");
+    EXPECT_LT(parent, child);
+    /* NUL and '/' cannot occur within a filename. Every other byte can,
+       including UTF-8 bytes that plain char makes negative on some hosts. */
+    for (unsigned int byte = 1; byte <= 255; ++byte) {
+        if (byte == '/')
+            continue;
+        SCOPED_TRACE(byte);
+        const CanonPath neighbour(std::string("a") + static_cast<char>(byte));
+        EXPECT_LT(child, neighbour);
+        EXPECT_TRUE(parent.isAllowed({child, neighbour}));
+    }
+}
+
+TEST(CanonPath, allowedMatchesComponentPrefixesForEverySubset)
+{
+    using Components = std::vector<std::string>;
+    const std::vector<Components> nodes{
+        {},
+        {"a"},
+        {"a", "b"},
+        {"a", "b", "c"},
+        {"a", "c"},
+        {"a!"},
+        {"a!", "b"},
+        {"a."},
+        {"a0"},
+        {"aa"},
+        {"a\xc3\xa9"},
+        {"b"},
+    };
+    auto queries = nodes;
+    queries.insert(queries.end(), {{"a", "missing"}, {"a!", "missing"}, {"b", "nested"}, {"missing"}});
+
+    auto prefixOf = [](const Components & prefix, const Components & path) {
+        return prefix.size() <= path.size() && std::equal(prefix.begin(), prefix.end(), path.begin());
+    };
+    std::vector<CanonPath> paths;
+    for (auto & node : nodes)
+        paths.emplace_back(node);
+    std::vector<CanonPath> queryPaths;
+    for (auto & query : queries)
+        queryPaths.emplace_back(query);
+
+    /* All 4096 sets, including empty/root-containing sets, nested and
+       disjoint prefixes, and neighbours on either side of a separator. */
+    for (size_t subset = 0; subset < (size_t{1} << nodes.size()); ++subset) {
+        std::set<CanonPath> allowed;
+        for (size_t i = 0; i < nodes.size(); ++i)
+            if (subset & (size_t{1} << i))
+                allowed.insert(paths[i]);
+        for (size_t q = 0; q < queries.size(); ++q) {
+            bool expected = false;
+            for (size_t i = 0; i < nodes.size(); ++i)
+                if (subset & (size_t{1} << i))
+                    expected |= prefixOf(nodes[i], queries[q]) || prefixOf(queries[q], nodes[i]);
+            EXPECT_EQ(queryPaths[q].isAllowed(allowed), expected) << "subset " << subset << ", path " << queryPaths[q];
+        }
+    }
 }
 
 TEST(CanonPath, makeRelative)

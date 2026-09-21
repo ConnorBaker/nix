@@ -170,7 +170,6 @@ LocalStore::LocalStore(ref<const Config> config)
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
-    , fnTempRoots(tempRootsDir / std::to_string(getpid()))
 {
     auto state(_state->lock());
     state->stmts = std::make_unique<State::Stmts>();
@@ -954,9 +953,14 @@ LocalStore::~LocalStore()
 
     try {
         auto fdTempRoots(_fdTempRoots.lock());
-        if (*fdTempRoots) {
-            fdTempRoots->close();
+        if (fdTempRoots->fd) {
+#ifdef _WIN32
+            fdTempRoots->fd.close();
+#endif
+            /* Keep the POSIX lock until the name is gone, so a collector
+               cannot acquire this inode before its owner unlinks it. */
             tryUnlink(fnTempRoots);
+            fdTempRoots->fd.close();
         }
     } catch (...) {
         ignoreExceptionInDestructor();
@@ -1018,7 +1022,10 @@ void LocalStore::openDB(State & state, bool create)
     auto openMode = config->readOnly ? SQLiteOpenMode::Immutable
                     : create         ? SQLiteOpenMode::Normal
                                      : SQLiteOpenMode::NoCreate;
-    state.db = SQLite(dbDir / "db.sqlite", {.mode = openMode, .useWAL = settings.useSQLiteWAL});
+    /* State owns this connection and all its statements; every access is
+       serialized by _state, including callbacks and schema setup. */
+    state.db = SQLite(
+        dbDir / "db.sqlite", {.mode = openMode, .useWAL = settings.useSQLiteWAL, .externalSynchronization = true});
 
 #ifdef __CYGWIN__
     /* The cygwin version of sqlite3 has a patch which calls
@@ -1781,6 +1788,9 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         SQLiteTxn txn(state->db);
         StorePathSet paths;
         StorePathSet updated;
+        /* Within this transaction, the finite path/reference domain has
+           stable row ids. Retain each lookup through reference insertion. */
+        std::map<StorePath, uint64_t> pathIds;
         std::vector<uint64_t> ingestionIds;
         for (auto & publication : publications) {
             auto id = publication.ingestion;
@@ -1795,12 +1805,17 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
 
         for (auto & [_, i] : infos) {
             i.requireObjectHash(*this);
-            if (isValidPath_(*state, i.path))
-                updated.insert(i.path);
+            {
+                auto use(state->stmts->QueryValidPathId.use().apply(printStorePath(i.path)));
+                if (use.next()) {
+                    updated.insert(i.path);
+                    pathIds.emplace(i.path, static_cast<uint64_t>(use.getInt(0)));
+                }
+            }
             paths.insert(i.path);
             for (auto & reference : i.references)
-                if (!infos.contains(reference))
-                    queryValidPathId(*state, reference);
+                if (!infos.contains(reference) && !pathIds.contains(reference))
+                    pathIds.emplace(reference, queryValidPathId(*state, reference));
         }
 
         /* Do a topological sort of the paths.  This will throw an
@@ -1855,12 +1870,12 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                         .apply(static_cast<int64_t>(ingestionIds[n]))
                         .exec();
                 }
-            addValidPath(*state, info);
+            pathIds.emplace(path, addValidPath(*state, info));
         }
         for (auto & [_, info] : infos) {
-            auto referrer = queryValidPathId(*state, info.path);
+            auto referrer = pathIds.at(info.path);
             for (auto & reference : info.references)
-                state->stmts->AddReference.use().apply(referrer).apply(queryValidPathId(*state, reference)).exec();
+                state->stmts->AddReference.use().apply(referrer).apply(pathIds.at(reference)).exec();
         }
         txn.commit();
         if (ingestion && !ingestion->path && !publications.empty())

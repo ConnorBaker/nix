@@ -53,6 +53,7 @@ with tempfile.TemporaryDirectory(prefix='nix-methodology-') as directory:
     changed = root / 'branch/nix/store' / Path(branch_drvs[0]).name
     original = changed.read_text()
     for label, mutate in [
+        ('ordinary-content', lambda text: text.replace('case-0', 'case-wrong')),
         ('trailing-newline', lambda text: text + '\n'),
         ('trailing-comma', lambda text: text.replace('["case-0",""]', '["case-0","",]')),
         ('missing-comma', lambda text: text.replace('["case-0",""]', '["case-0"""]')),
@@ -92,8 +93,10 @@ with tempfile.TemporaryDirectory(prefix='nix-methodology-') as directory:
     for label, literal, allowed in [
         ('different-basename', lambda p: p.rsplit('-', 1)[0] + '-unrelated', False),
         ('longer-basename', lambda p: p + '-extra', False),
-        ('different-store-prefix', lambda p: '/other' + p, False),
-        ('ascii-prefix', lambda p: 'prefix' + p, False),
+        ('unmapped-address', lambda p: p[:11] + '0' + p[12:], False),
+        ('different-store-prefix', lambda p: '/other' + p, True),
+        ('ascii-prefix', lambda p: 'prefix' + p, True),
+        ('attached-compiler-option', lambda p: '-L' + p + '/lib', True),
         ('subpath', lambda p: p + '/subdirectory/file', True),
         ('assignment', lambda p: 'key=' + p, True),
     ]:
@@ -108,6 +111,20 @@ with tempfile.TemporaryDirectory(prefix='nix-methodology-') as directory:
         else:
             assert allowed, label + ' unexpectedly rewritten'
             print(label + ' rewrite: PASS')
+
+    # Exhaust the byte contexts independently of compiler/shell syntax.
+    # Left context never changes substitution; a valid name character on
+    # the right extends the basename and therefore denotes another literal.
+    before, after = base_outputs[0].encode(), branch_outputs[0].encode()
+    rewrite = checker.address_rewriter({base_outputs[0]: branch_outputs[0]})
+    name_bytes = set(b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-._?=')
+    for byte in range(256):
+        context = bytes([byte])
+        assert rewrite(context + before) == context + after, byte
+        expected = before if byte in name_bytes else after
+        assert rewrite(before + context) == expected + context, byte
+    assert rewrite(b'prefix' + before) != b'changed-prefix' + after
+    print('all 512 left/right byte contexts and changed surrounding literal: PASS')
 
     store(root / 'collapsed', branch_drvs, [branch_outputs[0]] * 2)
     try:
@@ -138,6 +155,32 @@ with tempfile.TemporaryDirectory(prefix='nix-methodology-') as directory:
     (root / 'samples.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
     assert checker.compare_outputs(mapping, root, 'git')['samples'] == 2
     print('positive full output mapping: PASS')
+
+    # A graph's mapping only verifies results produced with that store.
+    # Swapping two same-name derivations in another store must not be
+    # excused by applying the first store's correct mapping to its results.
+    warm_roots = {label: root / ('warm-' + label) for label in ('base', 'branch')}
+    cold_roots = {label: root / ('cold-' + label) for label in ('base', 'branch')}
+    separate = []
+    for row in rows:
+        label = row['label']
+        separate.append(dict(row, command=['nix', '--store', f'local?root={warm_roots[label]}']))
+        cold = dict(row, id='cold-' + label, phase='cold',
+                    command=['nix', '--store', f'local?root={cold_roots[label]}'])
+        separate.append(cold)
+        (logs / f"{cold['id']}.json").write_bytes((logs / f"{row['id']}.json").read_bytes())
+    (root / 'samples.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in separate))
+    assert checker.compare_outputs(mapping, root, 'git', roots=warm_roots)['samples'] == 2
+    swapped_mapping = dict(zip(base_drvs, branch_drvs[::-1]))
+    try:
+        checker.compare_outputs(swapped_mapping, root, 'git', roots=cold_roots)
+    except AssertionError as error:
+        assert 'output differs' in str(error), str(error)
+        print('different-store derivation permutation: REJECTED')
+    else:
+        raise AssertionError('another store mapping accepted for cold outputs')
+    (root / 'samples.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+
     branch = json.loads((logs / 'branch.json').read_text())
     branch[0]['drvPath'], branch[1]['drvPath'] = branch[1]['drvPath'], branch[0]['drvPath']
     (logs / 'branch.json').write_text(json.dumps(branch))

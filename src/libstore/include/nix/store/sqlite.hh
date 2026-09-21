@@ -37,6 +37,8 @@ struct SQLiteSettings
 {
     SQLiteOpenMode mode = SQLiteOpenMode::Normal;
     bool useWAL;
+    /** The caller serializes all use of this connection and its statements. */
+    bool externalSynchronization = false;
 };
 
 /**

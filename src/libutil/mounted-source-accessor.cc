@@ -105,19 +105,16 @@ public:
         return displayPrefix + accessor->showPath(subpath) + displaySuffix;
     }
 
-    std::pair<ref<SourceAccessor>, CanonPath> resolve(CanonPath path)
+    std::pair<ref<SourceAccessor>, CanonPath> resolve(const CanonPath & path)
     {
         // Find the nearest parent of `path` that is a mount point.
-        std::vector<std::string> subpath;
+        auto prefix = path;
         while (true) {
-            if (auto mount = getMount(path)) {
-                std::reverse(subpath.begin(), subpath.end());
-                return {ref(mount), CanonPath(subpath)};
-            }
+            if (auto mount = getMount(prefix))
+                return {ref(mount), path.removePrefix(prefix)};
 
-            assert(!path.isRoot());
-            subpath.push_back(std::string(*path.baseName()));
-            path.pop();
+            assert(!prefix.isRoot());
+            prefix.pop();
         }
     }
 

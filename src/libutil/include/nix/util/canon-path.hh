@@ -255,7 +255,7 @@ public:
     }
 
     /**
-     * Compare paths lexicographically except that path separators
+     * Compare paths lexicographically by unsigned byte, except that path separators
      * are sorted before any other character. That is, in the sorted order
      * a directory is always followed directly by its children. For
      * instance, 'foo' < 'foo/bar' < 'foo!'.
@@ -265,10 +265,10 @@ public:
         auto i = path.begin();
         auto j = x.path.begin();
         for (; i != path.end() && j != x.path.end(); ++i, ++j) {
-            auto c_i = *i;
+            auto c_i = static_cast<unsigned char>(*i);
             if (c_i == '/')
                 c_i = 0;
-            auto c_j = *j;
+            auto c_j = static_cast<unsigned char>(*j);
             if (c_j == '/')
                 c_j = 0;
             if (auto cmp = c_i <=> c_j; cmp != 0)

@@ -13,7 +13,6 @@
 #include "nix/util/source-accessor.hh"
 
 #include <optional>
-#include <set>
 #include <string>
 #include <utility>
 
@@ -141,16 +140,11 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                 [&](SourceAccessor & subdirAccessor,
                     const CanonPath & subdirFrom,
                     const SourceAccessor::DirEntries & entries) {
-                    std::set<std::string, std::less<>> subdirs;
-                    auto unhacked =
-                        unhackedEntries(entries, acc, from, [&](const std::string & name, bool isDirectory) {
-                            if (isDirectory)
-                                subdirs.insert(name);
-                        });
+                    auto unhacked = unhackedEntries(entries, acc, from);
                     result = v.directory(to, [&](fun<void(std::string_view, bool, fun<Result()>)> each) {
                         for (auto & [name, actual] : unhacked)
-                            if (filter((filterBase / name).abs()))
-                                each(name, subdirs.contains(name), [&] {
+                            if (filter.get_fn().target<AllPaths>() || filter((filterBase / name).abs()))
+                                each(name, entries.at(actual) == SourceAccessor::tDirectory, [&] {
                                     return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
                                 });
                     });

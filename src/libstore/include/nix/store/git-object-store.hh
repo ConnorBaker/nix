@@ -13,6 +13,7 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
+#include <array>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -135,7 +136,7 @@ public:
     {
         /** Tree bodies read (`readTree`: the sweep, `readVerifiedTree`). */
         uint64_t treesRead = 0;
-        /** Blob files `lstat`ed (the sweep's blob pass, `blobInodes`, `blobFileOrRemove`). */
+        /** Blob files `lstat`ed (the sweep's blob pass). */
         uint64_t blobsStatted = 0;
     };
 
@@ -148,8 +149,8 @@ public:
     /**
      * Called with an object file's temporary path at the moment of its
      * fsync, before it is linked into place, so that what a crash would
-     * leave -- the canonical mode and timestamp, set before the flush
-     * covers them -- can be observed there (`05-validation.md` section 7).
+     * leave -- the completed bytes and exact read-only mode before the
+     * flush covers them -- can be observed there (`05-validation.md` section 7).
      * Empty in every build but a test's; checked for emptiness, so it
      * costs nothing unset.
      */
@@ -196,7 +197,7 @@ public:
      * `putTree`, each on the `ENOENT` its link then gets), so that opening
      * a writable store costs four `mkdir`s and not 772, and a store holds
      * only the shards it has used.  The other readers (`link`, `place`,
-     * `readTree`, `blobFileOrRemove`) treat their absence as emptiness.
+     * `readTree`) treat their absence as emptiness.
      */
     void createDirectories() const;
 
@@ -322,9 +323,9 @@ public:
      * "Collection"; `08` K16): a locked directory under `tmp/` with one
      * hard link per object, from the object's write until the hold is
      * released -- after the path's registration, or on the ingestion's
-     * failure, when it goes out of scope.  The sweep removes a tree or a
-     * blob at one link only, so what a hold links is kept though no live
-     * root reaches it yet; a hold whose lock is free is either empty --
+     * failure, when it goes out of scope.  The link's name records the
+     * auxiliary address, so repair may replace its inode without losing
+     * the hold's protection. A hold whose lock is free is either empty --
      * its maker between the `mkdir` and the `flock`, which is why the
      * directory is made empty and filled under its lock -- or a dead
      * process's, and the sweep removes it with its links before it judges
@@ -342,6 +343,10 @@ public:
         std::filesystem::path dir;
         AutoCloseFD fd;
         std::shared_ptr<AuxiliaryLock> auxiliaryLock;
+        /* Row views share one physical directory, whose kind/shard
+           directories survive until the owning hold releases it. */
+        using AuxiliaryShards = std::array<std::once_flag, 3 * 256>;
+        std::shared_ptr<AuxiliaryShards> auxiliaryShards;
     public:
         /* Behind a pointer so that `Hold` stays movable with a mutex in it. */
         struct Pending;
@@ -353,7 +358,10 @@ public:
             const std::function<void()> & atHoldMade,
             std::shared_ptr<AuxiliaryLock> auxiliaryLock);
         /* The `ownRows` form: the same directory, no lock of its own. */
-        explicit Hold(const std::filesystem::path & shared, std::shared_ptr<AuxiliaryLock> auxiliaryLock);
+        explicit Hold(
+            const std::filesystem::path & shared,
+            std::shared_ptr<AuxiliaryLock> auxiliaryLock,
+            std::shared_ptr<AuxiliaryShards> auxiliaryShards);
 
     public:
         /**
@@ -561,7 +569,7 @@ public:
         uint64_t missingSubtrees = 0;
         /**
          * Trees no live root reaches that an ingestion in flight holds
-         * (`Hold`: a second link), kept; and the holds whose lock was
+         * (`Hold`: its auxiliary addresses), kept; and the holds whose lock was
          * taken, so left.  Both are the sweep's view of ingestions it ran
          * beside.
          */
@@ -593,9 +601,10 @@ public:
      * not give; when that is non-zero, or a tree is corrupt, only the
      * temporary files go.  A live root whose object is missing is counted
      * (`SweepStats::unentered`) and does not stop the removal phase.  A
-     * tree or blob with a second link is held -- by a path's file or by an
-     * ingestion's `Hold` -- and kept; a hold whose lock is free is a dead
-     * ingestion's and goes first, with its links.
+     * live hold keeps the auxiliary addresses encoded in its link names,
+     * including a replacement inode published by repair. Additional links
+     * also keep files from older layouts. A hold whose lock is free is a
+     * dead ingestion's and goes first, with its links.
      * Publication, acquisition and release of auxiliary links cannot
      * overlap this sweep. In particular, a hold whose path registers
      * after the root snapshot keeps its links until the sweep finishes.
@@ -618,14 +627,6 @@ private:
      * @throws Error naming `id` if the body is not a tree object.
      */
     static merkle::Tree parseTreeBody(const Hash & id, std::string_view body);
-
-    /**
-     * The store's file for the blob under a mode when valid (of the given
-     * size, and under repair of the identifier's bytes); an invalid one is
-     * removed and nullopt returned.
-     */
-    std::optional<PosixStat>
-    blobFileOrRemove(const std::string & file, const Hash & id, std::optional<uint64_t> size, RepairFlag repair);
 
     const std::string blobsDir, blobsXDir, treesDir;
 
