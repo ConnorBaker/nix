@@ -2,7 +2,8 @@
 
 source ../common.sh
 
-export _NIX_TEST_BARF_ON_UNCACHEABLE=1
+# Mutable working trees have no stable source identity. Cacheability is
+# asserted for immutable commit inputs in eval-cache.sh.
 
 # shellcheck disable=SC2034 # this variable is used by tests that source this file
 registry=$TEST_ROOT/registry.json

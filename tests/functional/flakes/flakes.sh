@@ -68,12 +68,24 @@ json=$(nix flake metadata flake1 --json | jq .)
 [[ $(echo "$json" | jq -r .description) = 'Bla bla' ]]
 [[ $(echo "$json" | jq -r .lastModified) = $(git -C "$flake1Dir" log -n1 --format=%ct) ]]
 hash1=$(echo "$json" | jq -r .revision)
-[[ -n $(echo "$json" | jq -r .fingerprint) ]]
+# A clean working tree is still mutable; its observed content hash does
+# not supply a reusable fingerprint for future working-tree reads.
+echo "$json" | jq -e 'has("fingerprint") | not' > /dev/null
+treeHash1=$(echo "$json" | jq -er '.locked.treeHash | select(type == "string" and length > 0)')
 
 echo foo > "$flake1Dir/foo"
 git -C "$flake1Dir" add "$flake1Dir"/foo
-[[ $(nix flake metadata flake1 --json --refresh | jq -r .dirtyRevision) == "$hash1-dirty" ]]
-[[ "$(nix flake metadata flake1 --json | jq -r .fingerprint)" != null ]]
+dirtyJson=$(nix flake metadata flake1 --json --refresh)
+[[ $(echo "$dirtyJson" | jq -r .dirtyRevision) == "$hash1-dirty" ]]
+echo "$dirtyJson" | jq -e 'has("fingerprint") | not' > /dev/null
+treeHash2=$(echo "$dirtyJson" | jq -er '.locked.treeHash | select(type == "string" and length > 0)')
+[[ "$treeHash1" != "$treeHash2" ]]
+
+# An explicit commit supplies an immutable fingerprint and retains its
+# original tree even after the working directory changes.
+pinnedJson=$(nix flake metadata "git+file://$flake1Dir?rev=$hash1" --json)
+echo "$pinnedJson" | jq -e '.fingerprint | type == "string" and length > 0' > /dev/null
+[[ $(echo "$pinnedJson" | jq -r .locked.treeHash) == "$treeHash1" ]]
 
 echo -n '# foo' >> "$flake1Dir/flake.nix"
 flake1OriginalCommit=$(git -C "$flake1Dir" rev-parse HEAD)
