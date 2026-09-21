@@ -4,6 +4,8 @@ These documents specify the lazy-store work of this branch and say how it is che
 
 ## The documents
 
+[Performance fixes and their semantic boundaries](09-performance.md) describe the Nixpkgs regression work and its reproducible benchmark.
+
 | Document | What it holds | Read it when |
 |---|---|---|
 | `00-status.md` | **The single entry point.** Where the branch stands and how to verify it, what is decided, what is open and on what evidence, what is in flight and how to resume it, how to operate the gates, the builder and the measurements | First, always; before resuming any work |

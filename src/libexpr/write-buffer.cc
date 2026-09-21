@@ -106,7 +106,7 @@ ValidPathInfo WriteBuffer::infoFor(const Entry & entry) const
             .hash = p.textHash,
             .references = p.references,
         },
-        p.objectHash);
+        ObjectHash{.hash = merkle::blobId(*p.contents)});
     assert(info.path == path);
     info.narSize = merkle::nar::root(merkle::nar::regular(p.contents->size(), false));
     info.lazyNarHash = [contents = p.contents] {
@@ -122,12 +122,12 @@ StorePath
 WriteBuffer::addText(std::string_view name, std::string_view contents, StorePathSet references, RepairFlag repair)
 {
     auto textHash = hashString(HashAlgorithm::SHA256, contents);
-    auto path = store.makeFixedOutputPathFromCA(
-        name,
-        TextInfo{
-            .hash = textHash,
-            .references = references,
-        });
+    ContentAddressWithReferences address = TextInfo{
+        .hash = textHash,
+        .references = std::move(references),
+    };
+    auto path = store.makeFixedOutputPathFromCA(name, address);
+    references = std::move(std::get<TextInfo>(address.raw).references);
 
     if (auto it = pending.find(path); it != pending.end()) {
         if (repair)
@@ -147,14 +147,12 @@ WriteBuffer::addText(std::string_view name, std::string_view contents, StorePath
 
     accounted += contents.size() + perObjectOverhead + references.size() * perReferenceOverhead;
 
-    auto objectHash = ObjectHash{.hash = merkle::blobId(contents)};
     pending.emplace(
         path,
         Pending{
             .contents = std::make_shared<const std::string>(contents),
             .references = std::move(references),
             .textHash = textHash,
-            .objectHash = objectHash,
             .repair = repair == Repair,
             .emitted = false,
         });
@@ -227,12 +225,15 @@ void WriteBuffer::flush()
         if (p.emitted)
             return;
         p.emitted = true;
+        /* A valid object needs no write, so neither its blob hash nor its
+           reference order is needed. The outer loop still visits every
+           pending object, including references of this one (C1). */
+        if (valid.contains(path) && !p.repair)
+            return;
         for (auto & ref : p.references)
             if (ref != path)
                 if (auto it = pending.find(ref); it != pending.end())
                     emit(*it);
-        if (valid.contains(path) && !p.repair)
-            return;
         anyRepair = anyRepair || p.repair;
         order.push_back(&entry);
     };

@@ -765,6 +765,39 @@ TEST_F(GitUtilsTest, sha256IdentifiersAgreeWithLibgit2)
     EXPECT_EQ(nar0.s, nar1.s);
 }
 
+TEST_F(GitUtilsTest, canonicalEntriesRequireProvenanceAndPreserveEveryMode)
+{
+    auto dir = createTempDir();
+    AutoDelete cleanup(dir, true);
+    GitRepo::Options options{.create = true, .bare = true, .oidType = HashAlgorithm::SHA256, .canonicalObjects = true};
+    auto repo = GitRepo::openRepo(dir / "objects", options);
+    auto pool = GitRepoPool::create(dir / "objects", options);
+    auto memory = make_ref<MemorySourceAccessor>();
+    MemorySink sink{*memory};
+    sink.createDirectory(CanonPath::root);
+    sink.createDirectory(CanonPath("directory"));
+    sink.createRegularFile(CanonPath("regular"), [](auto & file) { file("same"); });
+    sink.createRegularFile(CanonPath("executable"), [](auto & file) {
+        file.isExecutable();
+        file("same");
+    });
+    sink.createSymlink(CanonPath("symlink"), "same");
+    auto tree = ingestAccessorToTree(*memory, CanonPath::root, *pool);
+    pool->flush();
+    auto canonical = repo->getAccessor(tree.hash, {}, "canonical");
+    options.canonicalObjects = false;
+    auto ordinary = GitRepo::openRepo(dir / "objects", options)->getAccessor(tree.hash, {}, "ordinary");
+    for (auto path : {"/", "/regular", "/executable", "/symlink", "/directory"}) {
+        SCOPED_TRACE(path);
+        auto expected = objectHashOf(*memory, CanonPath(path)).root;
+        EXPECT_EQ(canonical->getKnownEntry(CanonPath(path)), expected);
+        EXPECT_FALSE(ordinary->getKnownEntry(CanonPath(path))) << "SHA-256 alone is not canonical-tree provenance";
+        EXPECT_EQ(objectHashOf(*ordinary, CanonPath(path)).root, expected);
+    }
+    EXPECT_FALSE(canonical->maybeLstat(CanonPath("regular"))->fileSize);
+    EXPECT_EQ(canonical->readFile(CanonPath("regular")), "same");
+}
+
 /* A forwarding accessor that counts the files read through it: the
    discriminator for "no walk" (01 section 9.11, "The cost property"). */
 struct CountingAccessor : SourceAccessor
@@ -931,6 +964,20 @@ TEST_F(GitUtilsTest, readDirectoryReturnsTypedEntries)
         EXPECT_EQ(type, std::optional(acc->lstat(CanonPath(name)).type)) << name << " typed as the lookup types it";
     }
     EXPECT_EQ(lookups, 0u) << "a typed listing costs no lookup";
+
+    /* Listing retains tree ownership; cached entry pointers and negative
+       lookups survive further listings and lookups in other directories. */
+    for (size_t pass = 0; pass < 2; ++pass) {
+        EXPECT_EQ(acc->readDirectory(CanonPath("dir")).size(), 1u);
+        EXPECT_EQ(acc->readDirectory(CanonPath("submodule")).size(), 0u);
+        EXPECT_FALSE(acc->maybeLstat(CanonPath("missing")));
+        EXPECT_FALSE(acc->maybeLstat(CanonPath("dir/missing")));
+        EXPECT_EQ(acc->readFile(CanonPath("dir/inner")), "x");
+        EXPECT_EQ(acc->readFile(CanonPath("file")), "x");
+        EXPECT_EQ(acc->readFile(CanonPath("exe")), "x");
+        EXPECT_EQ(acc->readLink(CanonPath("link")), "x");
+        EXPECT_EQ(acc->readDirectory(CanonPath::root), entries);
+    }
 }
 
 TEST_F(GitUtilsTest, peel_reference)

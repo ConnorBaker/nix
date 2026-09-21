@@ -146,6 +146,10 @@ struct LocalStore::State::Stmts
     SQLiteStmt DeleteIngestion;
 };
 
+static constexpr auto lookupBlobSql =
+    "select b.ino, b.dev, b.size, i.path, b.name from Blobs b join Ingestions i on i.id = b.ingestion"
+    " where b.id = ? and b.exec = ? and i.path is not null;";
+
 LocalStore::LocalStore(ref<const Config> config)
     : Store{*config}
     , LocalFSStore{*config}
@@ -404,17 +408,14 @@ LocalStore::LocalStore(ref<const Config> config)
     state->stmts->QueryPathFromHashPart.create(state->db, "select path from ValidPaths where path >= ? limit 1;");
     state->stmts->QueryValidPaths.create(state->db, "select path from ValidPaths");
     state->stmts->QueryValidObjectHashes.create(state->db, "select hash from ValidPaths");
-    state->stmts->LookupBlob.create(
-        state->db,
-        "select b.ino, b.dev, b.size, i.path, b.name from Blobs b join Ingestions i on i.id = b.ingestion"
-        " where b.id = ? and b.exec = ? and i.path is not null;");
+    state->stmts->LookupBlob.create(state->db, lookupBlobSql);
     state->stmts->InsertBlob.create(
         state->db,
         "insert or replace into Blobs (id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);");
     state->stmts->DeleteBlob.create(state->db, "delete from Blobs where id = ? and exec = ?;");
     state->stmts->QueryBlobInodes.create(
         state->db, "select b.ino, b.id from Blobs b join Ingestions i on i.id = b.ingestion where i.path is not null;");
-    state->stmts->NewIngestion.create(state->db, "insert into Ingestions (path, hold) values (null, ?);");
+    state->stmts->NewIngestion.create(state->db, "insert into Ingestions (path, hold) values (?, ?);");
     state->stmts->SetIngestionPath.create(state->db, "update Ingestions set path = ? where id = ?;");
     /* The sweep's stale-row rule (schema.sql): a row whose ingestion never
        got its path, or whose path is no longer valid, names no holder. */
@@ -471,28 +472,31 @@ LocalStore::LocalStore(ref<const Config> config)
         blobRows = BlobRows::NoRows;
     blobIndex.lookup = [this](const Hash & id, bool executable) -> std::optional<GitObjectStore::Holder> {
         return retrySQLite<std::optional<GitObjectStore::Holder>>([&]() -> std::optional<GitObjectStore::Holder> {
-            auto state(_state->lock());
-            auto use(state->stmts->LookupBlob.use());
-            /* The identifier is a 32-byte blob, not its hexadecimal: half
-               the key bytes, so half the b-tree pages and half the
-               comparisons (`05` section 6, the scale tables). */
-            use.apply(id.hash, id.hashSize).apply(int64_t(executable ? 1 : 0));
-            if (!use.next())
-                return std::nullopt;
-            GitObjectStore::Holder holder{
-                .ino = static_cast<ino_t>(use.getInt(0)),
-                .dev = static_cast<dev_t>(use.getInt(1)),
-                .size = static_cast<uint64_t>(use.getInt(2)),
-                /* The column holds the *logical* store path; the holder is
-                   a file on disk under the real store directory. */
-                .file = (getRealStoreDir() / std::filesystem::path(use.getStr(3)).filename()).string(),
+            auto query = [&](SQLiteStmt & statement) -> std::optional<GitObjectStore::Holder> {
+                auto use(statement.use());
+                /* The identifier is a 32-byte blob, not its hexadecimal: half
+                   the key bytes, so half the b-tree pages and half the
+                   comparisons (`05` section 6, the scale tables). */
+                use.apply(id.hash, id.hashSize).apply(int64_t(executable ? 1 : 0));
+                if (!use.next())
+                    return std::nullopt;
+                GitObjectStore::Holder holder{
+                    .ino = static_cast<ino_t>(use.getInt(0)),
+                    .dev = static_cast<dev_t>(use.getInt(1)),
+                    .size = static_cast<uint64_t>(use.getInt(2)),
+                    /* The column holds the *logical* store path; the holder is
+                       a file on disk under the real store directory. */
+                    .file = (getRealStoreDir() / std::filesystem::path(use.getStr(3)).filename()).string(),
+                };
+                auto name = use.getStr(4);
+                if (!name.empty()) {
+                    holder.file += '/';
+                    holder.file += name;
+                }
+                return holder;
             };
-            auto name = use.getStr(4);
-            if (!name.empty()) {
-                holder.file += '/';
-                holder.file += name;
-            }
-            return holder;
+            auto state(_state->lock());
+            return query(state->stmts->LookupBlob);
         });
     };
     blobIndex.forget = [this](const Hash & id, bool executable) {
@@ -520,24 +524,19 @@ void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::fi
     if (config->readOnly || blobRows == BlobRows::NoRows)
         return;
     hold.setRoot(root);
-    /* The ingestion's row, with no path: the path does not exist yet, and
-       that is the whole reason the index does not hang off a foreign key
-       into `ValidPaths` (schema.sql).  Until `endIngestion` names it, every
-       row written against it is stale -- invisible to `link` (which joins
-       on a path that is not null) and removed by the sweep. */
+    /* An ingestion needs a database identity only when it has rows to
+       publish. Small objects finish before that happens; their rows can
+       be inserted with the already registered path in one transaction.
+       Large copies still flush incrementally under an unnamed ingestion. */
     auto holdName = hold.directory().filename().string();
-    uint64_t ingestion = retrySQLite<uint64_t>([&]() -> uint64_t {
-        auto state(_state->lock());
-        auto use(state->stmts->NewIngestion.use());
-        use.apply(holdName).exec();
-        return static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
-    });
-    hold.ingestion = ingestion;
+    auto ingestion = std::make_shared<GitObjectStore::Hold::Ingestion>();
     /* The copy's workers hand their batches here as they fill, so the index
        write overlaps the copy as the object store's links used to (`05`
        section 6, the twenty-trial table). */
-    hold.setSink(
-        [this, ingestion](std::vector<GitObjectStore::Hold::Row> && batch) { writeBlobRows(ingestion, batch); });
+    hold.setSink([this, ingestion, holdName](std::vector<GitObjectStore::Hold::Row> && batch) {
+        writeBlobRows(*ingestion, holdName, batch);
+    });
+    hold.ingestion = std::move(ingestion);
 }
 
 void LocalStore::openBlobWriter()
@@ -553,15 +552,21 @@ void LocalStore::openBlobWriter()
         dbDir / "db.sqlite", SQLiteSettings{.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL});
     /* The index is a cache -- every row is derivable from the store's own
        paths, and `nix-store --optimise` rebuilds it -- so its writes need not
-       be synchronous, which is what `isCache` says of a connection. */
-    blobWriterDb->isCache();
+       be synchronous. Keep the store's journal mode: `isCache()` would
+       force WAL even when useSQLiteWAL is false. */
+    blobWriterDb->exec("pragma synchronous = off");
     blobWriterInsert = std::make_unique<SQLiteStmt>();
     blobWriterInsert->create(
         *blobWriterDb,
         "insert or replace into Blobs (id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);");
+    blobWriterNewIngestion = std::make_unique<SQLiteStmt>();
+    blobWriterNewIngestion->create(*blobWriterDb, "insert into Ingestions (path, hold) values (?, ?);");
 }
 
-void LocalStore::writeBlobRows(uint64_t ingestion, std::vector<GitObjectStore::Hold::Row> & batch)
+void LocalStore::writeBlobRows(
+    GitObjectStore::Hold::Ingestion & ingestion,
+    const std::string & holdName,
+    std::vector<GitObjectStore::Hold::Row> & batch)
 {
     if (batch.empty())
         return;
@@ -575,18 +580,25 @@ void LocalStore::writeBlobRows(uint64_t ingestion, std::vector<GitObjectStore::H
     openBlobWriter();
     retrySQLite<void>([&]() {
         SQLiteTxn txn(*blobWriterDb);
+        auto id = ingestion.id;
+        if (!id) {
+            auto use(blobWriterNewIngestion->use());
+            use.apply(ingestion.path.value_or(""), ingestion.path.has_value()).apply(holdName).exec();
+            id = static_cast<uint64_t>(sqlite3_last_insert_rowid(*blobWriterDb));
+        }
         for (auto & row : batch) {
             auto use(blobWriterInsert->use());
             use.apply(row.id.hash, row.id.hashSize)
                 .apply(int64_t(row.executable ? 1 : 0))
                 .apply(static_cast<int64_t>(row.ino))
                 .apply(static_cast<int64_t>(row.dev))
-                .apply(static_cast<int64_t>(ingestion))
+                .apply(static_cast<int64_t>(*id))
                 .apply(row.name)
                 .apply(static_cast<int64_t>(row.size))
                 .exec();
         }
         txn.commit();
+        ingestion.id = id;
     });
 }
 
@@ -594,12 +606,17 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
 {
     if (config->readOnly || blobRows == BlobRows::NoRows || !hold.ingestion)
         return;
-    /* What the walk has not handed over yet, and then the one update that
-       makes every one of this ingestion's rows true at once: the
-       registration pays no per-blob work at all. */
-    hold.flush();
     auto logical = printStorePath(path);
-    auto ingestion = *hold.ingestion;
+    bool needsUpdate;
+    {
+        auto lock = std::lock_guard{blobWriterMutex};
+        hold.ingestion->path = logical;
+        needsUpdate = hold.ingestion->id.has_value();
+    }
+    hold.flush();
+    if (!needsUpdate)
+        return;
+    auto ingestion = *hold.ingestion->id;
     retrySQLite<void>([&]() {
         auto state(_state->lock());
         auto use(state->stmts->SetIngestionPath.use());
@@ -614,10 +631,10 @@ void LocalStore::recordBlobsAtPath(const GitObjectStore::Hold & hold, const std:
        so that the sweep's stale-row rule judges this ingestion as it judges a
        real one, and the ingestion is given that path. */
     hold.flush();
-    if (!hold.ingestion)
+    if (!hold.ingestion || !hold.ingestion->id)
         return;
     auto logical = std::filesystem::path(config->storeDir) / root.filename();
-    auto ingestion = *hold.ingestion;
+    auto ingestion = *hold.ingestion->id;
     retrySQLite<void>([&]() {
         auto state(_state->lock());
         SQLiteTxn txn(state->db);
@@ -1086,10 +1103,6 @@ uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info)
         }
     }
 
-    if (pathInfoCache)
-        pathInfoCache->lock()->upsert(
-            info.path, PathInfoCacheValue{.value = std::make_shared<const ValidPathInfo>(info)});
-
     return id;
 }
 
@@ -1371,6 +1384,14 @@ StorePathSet LocalStore::queryAllValidPaths()
     });
 }
 
+bool LocalStore::hasValidPaths()
+{
+    return retrySQLite<bool>([&] {
+        auto state(_state->lock());
+        return state->stmts->QueryValidPaths.use().next();
+    });
+}
+
 uint64_t LocalStore::forEachValidObjectHash(fun<void(const ObjectHash &)> callback)
 {
     return retrySQLite<uint64_t>([&]() {
@@ -1484,6 +1505,26 @@ void LocalStore::registerValidPath(const ValidPathInfo & info)
 
 void LocalStore::registerValidPaths(const ValidPathInfos & infos)
 {
+    registerValidPaths(infos, nullptr);
+}
+
+void LocalStore::registerValidPath(const ValidPathInfo & info, const GitObjectStore::Hold & hold)
+{
+    registerValidPaths({{info.path, info}}, &hold);
+}
+
+void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold)
+{
+    /* Finish the ingestion before taking the database lock: a large copy's
+       writer may still be committing a batch. The usual single-file object
+       has never started that writer and publishes all of its rows here,
+       with its path, through the one connection and transaction. */
+    auto ingestion = hold ? hold->ingestion : nullptr;
+    auto rows = ingestion ? hold->takeRows() : std::vector<GitObjectStore::Hold::Row>{};
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+        auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
+        return c != 0 ? c < 0 : a.executable < b.executable;
+    });
 #ifndef _WIN32
     /* SQLite will fsync by default, but the new valid paths may not
        be fsync-ed.  So some may want to fsync them before registering
@@ -1498,12 +1539,14 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
 
         SQLiteTxn txn(state->db);
         StorePathSet paths;
+        StorePathSet updated;
 
         for (auto & [_, i] : infos) {
             i.requireObjectHash(*this);
-            if (isValidPath_(*state, i.path))
+            if (isValidPath_(*state, i.path)) {
                 updatePathInfo(*state, i);
-            else
+                updated.insert(i.path);
+            } else
                 addValidPath(*state, i);
             paths.insert(i.path);
         }
@@ -1535,7 +1578,40 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos)
                 [](auto &) { /* Success, continue */ }},
             topoSortResult);
 
+        auto ingestionId = ingestion ? ingestion->id : std::nullopt;
+        if (ingestion && (ingestionId || !rows.empty())) {
+            assert(infos.size() == 1);
+            auto logical = printStorePath(infos.begin()->first);
+            if (!ingestionId) {
+                state->stmts->NewIngestion.use().apply(logical).apply(hold->directory().filename().string()).exec();
+                ingestionId = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
+            } else
+                state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(*ingestionId)).exec();
+            for (auto & row : rows)
+                state->stmts->InsertBlob.use()
+                    .apply(row.id.hash, row.id.hashSize)
+                    .apply(int64_t(row.executable ? 1 : 0))
+                    .apply(static_cast<int64_t>(row.ino))
+                    .apply(static_cast<int64_t>(row.dev))
+                    .apply(static_cast<int64_t>(*ingestionId))
+                    .apply(row.name)
+                    .apply(static_cast<int64_t>(row.size))
+                    .exec();
+        }
         txn.commit();
+        if (ingestion)
+            ingestion->id = ingestionId;
+        /* A description becomes cacheable only with the committed path
+           and references. A rejected reference or cycle rolls the SQL
+           back; publishing earlier would leave a false validity hit. */
+        if (pathInfoCache) {
+            auto cache = pathInfoCache->lock();
+            for (auto & [path, info] : infos)
+                if (updated.contains(path))
+                    cache->erase(path);
+                else
+                    cache->upsert(path, PathInfoCacheValue{.value = std::make_shared<const ValidPathInfo>(info)});
+        }
     });
 }
 
@@ -1589,7 +1665,15 @@ void LocalStore::addMultipleToStore(
             break;
         }
     Finally release([&] { batchHold = nullptr; });
-    Store::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs);
+    /* Small local objects spend their time in pathname operations and the
+       same registration connection. Spreading them over a CPU-sized pool
+       serialises on that lock anyway, with a handoff for each lookup.
+       Large streams still overlap their reads and writes. This changes no
+       graph ordering, error handling or registration boundary. */
+    bool small = std::all_of(pathsToCopy.begin(), pathsToCopy.end(), [](const auto & p) {
+        return p.second->isInMemory() && p.first.narSize && p.first.narSize <= (1 << 20);
+    });
+    Store::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs, small ? 1 : 0);
 }
 
 void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs)
@@ -1668,6 +1752,22 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                     teeSource.emplace(source, *narHashSink);
                     restoreSource = &*teeSource;
                 }
+                /* Verify the content address on the bytes already being
+                   consumed. parseDump accepts only canonical NARs (tag
+                   order, sorted entries, zero padding), so its stream is
+                   also the NAR the restored tree would dump. Flat/text
+                   addresses see only the root regular file's contents. */
+                std::optional<MaskedHashSink> caSink;
+                std::optional<TeeSource> caSource;
+                Sink * rootContents = nullptr;
+                if (info.ca && info.ca->method.getFileIngestionMethod() != FileIngestionMethod::Git) {
+                    caSink.emplace(info.ca->hash.algo, std::string(info.path.hashPart()));
+                    if (info.ca->method.getFileIngestionMethod() == FileIngestionMethod::NixArchive) {
+                        caSource.emplace(*restoreSource, *caSink);
+                        restoreSource = &*caSource;
+                    } else
+                        rootContents = &*caSink;
+                }
                 auto canonicalisingRestoreHooks =
                     makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(config->getLocalSettings().ignoredAcls));
 
@@ -1677,7 +1777,8 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                     config->getLocalSettings().fsyncStorePaths,
                     canonicalisingRestoreHooks.get(),
                     hold,
-                    repair);
+                    repair,
+                    rootContents);
 
                 /* The info to register: `info` with the object hash and NAR
                    size the sink computed, and without the sender's NAR-hash
@@ -1702,18 +1803,17 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                 if (info.ca) {
                     auto & specified = *info.ca;
                     auto actualHash = ({
-                        SourcePath sourcePath = requireStoreObjectAccessor(info.path, /*requireValidPath=*/false);
                         Hash h{HashAlgorithm::SHA256}; // throwaway def to appease C++
                         auto fim = specified.method.getFileIngestionMethod();
                         switch (fim) {
                         case FileIngestionMethod::Flat:
+                            if (restored.root.mode != merkle::Mode::Regular
+                                && restored.root.mode != merkle::Mode::Executable)
+                                throw Error(
+                                    "flat content address requires a regular file at '%s'", printStorePath(info.path));
+                            [[fallthrough]];
                         case FileIngestionMethod::NixArchive: {
-                            MaskedHashSink caSink{
-                                specified.hash.algo,
-                                std::string{info.path.hashPart()},
-                            };
-                            dumpPath(sourcePath, caSink, (FileSerialisationMethod) fim);
-                            h = caSink.finish().hash;
+                            h = caSink->finish().hash;
                             break;
                         }
                         case FileIngestionMethod::Git:
@@ -1802,11 +1902,7 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                     syncParent(realPath);
                 }
 
-                registerValidPath(toRegister);
-
-                /* The holders this restore wrote are this ingestion's, and
-                   naming its path is what makes them true (schema.sql). */
-                endIngestion(hold, toRegister.path);
+                registerValidPath(toRegister, hold);
             } else {
                 /* Nothing restored, so a deferred signature check has no
                    stream to check against: refused, as every untrusted
@@ -2064,10 +2160,7 @@ StorePath LocalStore::addToStoreFromDump(
 
             auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
             info.narSize = result.narSize;
-            registerValidPath(info);
-
-            if (hold)
-                endIngestion(*hold, info.path);
+            registerValidPath(info, *hold);
         } else
             // We may have a negative cache entry for this path, so get rid of it.
             invalidatePathInfoCacheFor(dstPath);

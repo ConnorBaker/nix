@@ -395,23 +395,32 @@ struct GitObjectStore
         /** Hand every row not yet given to the sink to it. */
         void flush() const;
 
-    private:
-        void drain() const;
-
-    public:
+        /** Stop the writer and take the rows it has not published. The
+         * caller may include them in the path's registration transaction. */
+        std::vector<Row> takeRows() const;
 
         /**
          * The ingestion this hold's rows are written against
          * (`Ingestions.id`), set by `LocalStore::beginIngestion`; unset
          * when nothing writes an index.
          */
-        mutable std::optional<uint64_t> ingestion;
+        struct Ingestion
+        {
+            std::optional<uint64_t> id;
+            std::optional<std::string> path;
+        };
+
+        /* Shared with the row sink so moving a hold cannot invalidate it.
+           LocalStore serialises access with its blob-writer mutex. */
+        mutable std::shared_ptr<Ingestion> ingestion;
 
         /** The hold's own directory under `tmp/`: its name is what says this ingestion is in flight. */
         const std::filesystem::path & directory() const;
 
-        /** Record a file this ingestion wrote as the pending holder of its blob. */
-        void addRow(Row row) const;
+        /** Claim a completed file as this ingestion's holder. Return the
+         * existing holder if another worker published first. Replacement
+         * is reserved for a holder the caller found unusable. */
+        std::optional<std::string> addRow(Row row, bool replace = false) const;
 
         /**
          * The file this ingestion already wrote for (id, mode), if any:
@@ -426,18 +435,17 @@ struct GitObjectStore
         /**
          * Where the link to the object file `object` (under
          * `<kind>/<shard>/`, `<kind>` one of `blobs`, `blobs-x`, `trees`)
-         * goes: `<hold>/<kind>/<id>`.  The hold is not sharded -- it takes
-         * one link per tree and per symlink's blob of the ingestion in
-         * flight and none for a regular file, whose own store path's link
-         * holds its blob, so it never holds a large directory's worth.
+         * goes: `<hold>/<kind>/<shard>/<id>`. The hold takes one link per
+         * tree and symlink blob, and none for a regular file, whose own
+         * store path's link holds its blob. Shards are made on demand.
          */
         std::filesystem::path linkFor(const std::filesystem::path & object) const;
     };
 
     /**
-     * A fresh hold: the directory made empty, locked, and only then given
-     * its three kind directories, retried under a new name if the sweep
-     * removed it before the lock was taken.
+     * A fresh hold: the directory made empty and locked, retried under a
+     * new name if the sweep removed it before the lock was taken. Auxiliary
+     * kind/shard directories are made only when an object needs them.
      */
     Hold hold() const;
 

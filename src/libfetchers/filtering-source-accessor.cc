@@ -48,6 +48,68 @@ SourceAccessor::DirEntries FilteringSourceAccessor::readDirectory(const CanonPat
     return entries;
 }
 
+void FilteringSourceAccessor::readDirectoryScoped(
+    const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback)
+{
+    checkAccess(path);
+    next->readDirectoryWithEntries(
+        prefix / path, [&](SourceAccessor & inner, const CanonPath & relative, const DirEntries & entries) {
+            DirEntries admitted;
+            for (auto & entry : entries)
+                if (isAllowed(path / entry.first))
+                    admitted.insert(entry);
+
+            struct Scoped : FilteringSourceAccessor
+            {
+                void anchor() override {}
+
+                FilteringSourceAccessor & owner;
+                const CanonPath & original;
+                const DirEntries & admitted;
+
+                Scoped(
+                    SourceAccessor & inner,
+                    const CanonPath & relative,
+                    FilteringSourceAccessor & owner,
+                    const CanonPath & original,
+                    const DirEntries & admitted)
+                    /* Borrowed only during readDirectoryWithEntries's scope.
+                       No accessor or visitor may retain it after callback. */
+                    : FilteringSourceAccessor(
+                          SourcePath(
+                              ref<SourceAccessor>(std::shared_ptr<SourceAccessor>(&inner, [](auto *) {})), relative),
+                          [&owner, original](const CanonPath & p) { return owner.makeNotAllowedError(original / p); })
+                    , owner(owner)
+                    , original(original)
+                    , admitted(admitted)
+                {
+                }
+
+                bool isAllowed(const CanonPath & p) override
+                {
+                    if (p.isRoot())
+                        return true;
+                    if (p.parent()->isRoot())
+                        return admitted.contains(std::string(*p.baseName()));
+                    return owner.isAllowed(original / p);
+                }
+
+                std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & p) override
+                {
+                    return owner.getFingerprint(original / p);
+                }
+
+                void readDirectoryWithEntries(
+                    const CanonPath & p,
+                    std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+                {
+                    readDirectoryScoped(p, std::move(callback));
+                }
+            } scoped{inner, relative, *this, path, admitted};
+            callback(scoped, CanonPath::root, admitted);
+        });
+}
+
 std::string FilteringSourceAccessor::readLink(const CanonPath & path)
 {
     checkAccess(path);
@@ -76,6 +138,12 @@ void FilteringSourceAccessor::checkAccess(const CanonPath & path)
 
 struct AllowListSourceAccessorImpl : AllowListSourceAccessor
 {
+    void readDirectoryWithEntries(
+        const CanonPath & path,
+        std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+    {
+        readDirectoryScoped(path, std::move(callback));
+    }
 private:
     void anchor() override {};
 public:
@@ -124,6 +192,12 @@ public:
 
 struct FixedSetFilteringSourceAccessor : FilteringSourceAccessor
 {
+    void readDirectoryWithEntries(
+        const CanonPath & path,
+        std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+    {
+        readDirectoryScoped(path, std::move(callback));
+    }
 private:
     void anchor() override {};
 public:

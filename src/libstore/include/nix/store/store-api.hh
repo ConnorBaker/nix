@@ -720,6 +720,10 @@ public:
     virtual void addMultipleToStore(
         PathsSource && pathsToCopy, Activity & act, RepairFlag repair = NoRepair, CheckSigsFlag checkSigs = CheckSigs);
 
+    /** The same dependency graph with a caller-selected worker bound. */
+    void addMultipleToStore(
+        PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, size_t maxThreads);
+
     /**
      * Copy the contents of a path to the store and register the
      * validity the resulting path.

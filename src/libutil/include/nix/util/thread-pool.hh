@@ -90,7 +90,11 @@ private:
  * its dependencies have been processed.
  */
 template<typename T>
-void processGraph(const std::set<T> & nodes, fun<std::set<T>(const T &)> getEdges, fun<void(const T &)> processNode)
+void processGraph(
+    const std::set<T> & nodes,
+    fun<std::set<T>(const T &)> getEdges,
+    fun<void(const T &)> processNode,
+    size_t maxThreads = 0)
 {
     struct Graph
     {
@@ -104,7 +108,7 @@ void processGraph(const std::set<T> & nodes, fun<std::set<T>(const T &)> getEdge
 
     /* Create pool last to ensure threads are stopped before other destructors
      * run */
-    ThreadPool pool;
+    ThreadPool pool{maxThreads};
 
     worker = [&](const T & node) {
         {

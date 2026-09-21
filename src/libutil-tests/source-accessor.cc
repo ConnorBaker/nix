@@ -81,6 +81,30 @@ TEST_F(FSSourceAccessorTest, works)
     }
 }
 
+TEST_F(FSSourceAccessorTest, listingAndScopeUseTheSameOpenedDirectory)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "fd-based accessor is Unix-only";
+#endif
+    createDirs(tmpDir / "old");
+    writeFile(tmpDir / "old" / "file", "observed");
+    createSymlink("file", tmpDir / "old" / "link");
+    auto accessor = makeFSSourceAccessor(tmpDir, true);
+    accessor->readDirectoryWithEntries(
+        CanonPath("old"),
+        [&](SourceAccessor & scoped, const CanonPath & root, const SourceAccessor::DirEntries & entries) {
+            ASSERT_EQ(entries.size(), 2u);
+            std::filesystem::rename(tmpDir / "old", tmpDir / "moved");
+            createDirs(tmpDir / "old");
+            writeFile(tmpDir / "old" / "file", "replacement");
+            EXPECT_EQ(scoped.readFile(root / "file"), "observed");
+            EXPECT_EQ(scoped.readLink(root / "link"), "file");
+            EXPECT_THROW(
+                scoped.readDirectoryWithEntries(root / "link", [](auto &, auto &, auto &) {}), SymlinkNotAllowed);
+        });
+    EXPECT_GT(accessor->getLastModified(), 0);
+}
+
 TEST_F(FSSourceAccessorTest, invalidateCacheDropsStaleDirFds)
 {
 #ifdef _WIN32

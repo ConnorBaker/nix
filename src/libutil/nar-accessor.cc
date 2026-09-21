@@ -114,7 +114,15 @@ public:
 
         DirEntries res;
         for (const auto & [name, child] : dir->entries)
-            res.insert_or_assign(name, std::nullopt);
+            res.insert_or_assign(
+                name,
+                std::visit(
+                    overloaded{
+                        [](const NarListing::Regular &) { return tRegular; },
+                        [](const NarListing::Directory &) { return tDirectory; },
+                        [](const NarListing::Symlink &) { return tSymlink; },
+                    },
+                    child.raw));
 
         return res;
     }

@@ -148,7 +148,7 @@ def listing(dbpath, realdir):
         print(line)
 
 
-def renamed(dbpath, realdir):
+def renamed(dbpath, realdir, *, include_paths=False, rewrite=None):
     """One line per valid store object, sorted: the object's name, a digest of
     its tree in which the hash part of every embedded store path is masked,
     whether it is content-addressed, its references' names and its deriver's
@@ -181,7 +181,7 @@ def renamed(dbpath, realdir):
     hashre = re.compile(re.escape(storeb) + rb"/[0-9a-df-np-sv-z]{32}-")
 
     def mask(data):
-        return hashre.sub(storeb + b"/<hash>-", data)
+        return rewrite(data) if rewrite is not None else hashre.sub(storeb + b"/<hash>-", data)
 
     def name_of(p):
         base = os.path.basename(p)
@@ -285,7 +285,7 @@ def renamed(dbpath, realdir):
         else:
             d = digest(real)
         lines.append("\t".join([
-            name_of(path), d, "ca" if ca else "output",
+            path if include_paths else name_of(path), d, "ca" if ca else "output",
             ",".join(sorted(name_of(r) for r in refs[id_])) or "-",
             name_of(deriver) if deriver else "-"]))
     for line in sorted(lines):

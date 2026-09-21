@@ -148,6 +148,19 @@ public:
         return accessor->readFile(path, sink, sizeCallback);
     }
 
+    void readDirectoryWithEntries(
+        const CanonPath & path,
+        std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+    {
+        if (path.isRoot()) {
+            auto entries = readDirectory(path);
+            callback(*this, path, entries);
+        } else {
+            requireStoreObject(path);
+            accessor->readDirectoryWithEntries(path, std::move(callback));
+        }
+    }
+
     std::string readLink(const CanonPath & path) override
     {
         requireStoreObject(path);
@@ -166,7 +179,31 @@ public:
 
     std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
     {
-        return accessor->getFingerprint(path);
+        auto object = maybeGetStoreObjectPath(path);
+        if (!requireValidPath || !object)
+            return {path, std::nullopt};
+        auto info = store->queryPathInfo(*object);
+        if (!info->objectHash)
+            return {path, std::nullopt};
+        return {path.removePrefix(CanonPath(object->to_string())), info->objectHash->render()};
+    }
+
+    std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
+    {
+        auto object = maybeGetStoreObjectPath(path);
+        if (!requireValidPath || !object || path != CanonPath(object->to_string()))
+            return std::nullopt;
+        auto info = store->queryPathInfo(*object);
+        if (!info->objectHash)
+            return std::nullopt;
+        auto st = accessor->lstat(path);
+        /* Executables and symlinks have synthetic object roots: their
+           entry hash cannot be recovered from the object hash alone. */
+        if (st.type == tDirectory)
+            return merkle::TreeEntry{.mode = merkle::Mode::Directory, .hash = info->objectHash->hash};
+        if (st.type == tRegular && !st.isExecutable)
+            return merkle::TreeEntry{.mode = merkle::Mode::Regular, .hash = info->objectHash->hash};
+        return std::nullopt;
     }
 
     std::optional<time_t> getLastModified() override
@@ -197,7 +234,19 @@ std::shared_ptr<SourceAccessor> LocalFSStore::getFSAccessor(const StorePath & pa
         if (!pathExists(absPath))
             return nullptr;
     }
-    return makeFSSourceAccessor(std::move(absPath));
+    auto accessor = makeFSSourceAccessor(std::move(absPath));
+    if (requireValidPath) {
+        auto info = queryPathInfo(path);
+        if (info->objectHash) {
+            accessor->fingerprint = info->objectHash->render();
+            auto st = accessor->lstat(CanonPath::root);
+            if (st.type == SourceAccessor::tDirectory)
+                accessor->knownRoot = {.mode = merkle::Mode::Directory, .hash = info->objectHash->hash};
+            else if (st.type == SourceAccessor::tRegular && !st.isExecutable)
+                accessor->knownRoot = {.mode = merkle::Mode::Regular, .hash = info->objectHash->hash};
+        }
+    }
+    return accessor;
 }
 
 const std::filesystem::path LocalFSStore::drvsLogDir = "drvs";

@@ -201,6 +201,13 @@ static void setStoreWriteTime(Descriptor fd)
             return HintFmt("changing modification time of %s (using `futimens`)", PathFmt(descriptorToPath(fd)));
         });
 }
+
+void canonicaliseTimestampAndPermissions(Descriptor fd, bool executable)
+{
+    if (::fchmod(fd, executable ? 0555 : 0444) == -1)
+        throw SysError("changing permissions of open store file");
+    setStoreWriteTime(fd);
+}
 #endif
 
 /* These hooks are supposed to be used only for freshly created files, not
@@ -219,9 +226,7 @@ class CanonicalisingRestoreHooks : public RestoreSinkHooks
 #  if NIX_SUPPORT_ACL
         stripXAttrs(fd, ignoredAcls);
 #  endif
-        if (::fchmod(fd, mode) == -1)
-            throw SysError([&]() { return HintFmt("setting permissions on %s", PathFmt(descriptorToPath(fd))); });
-        setStoreWriteTime(fd);
+        nix::canonicaliseTimestampAndPermissions(fd, mode == 0555);
 #endif
     }
 

@@ -47,6 +47,8 @@ struct GitRepo
          * its own.
          */
         HashAlgorithm oidType = HashAlgorithm::SHA1;
+        /** All objects were written by our canonical SHA-256 tree writer. */
+        bool canonicalObjects = false;
     };
 
     static ref<GitRepo> openRepo(const std::filesystem::path & path, Options options);

@@ -44,8 +44,6 @@ TEST_F(nix_api_expr_test, nix_eval_state_lookup_path)
     nix_expr_eval_from_string(ctx, state, "builtins.seq <nixos-config> <nixpkgs>", ".", value);
     assert_ctx_ok();
 
-    nix_state_free(state);
-
     ASSERT_EQ(nix_get_type(ctx, value), NIX_TYPE_PATH);
     assert_ctx_ok();
 
@@ -54,6 +52,9 @@ TEST_F(nix_api_expr_test, nix_eval_state_lookup_path)
     ASSERT_EQ(0, strcmp(pathStr, nixpkgs.string().c_str()));
 
     nix_gc_decref(nullptr, value);
+    /* Text extraction is a realisation boundary and requires the
+       evaluator to remain alive (nix_get_path_string's contract). */
+    nix_state_free(state);
 }
 
 TEST_F(nix_api_expr_test, nix_eval_state_builder_set_setting)

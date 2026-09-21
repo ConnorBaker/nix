@@ -161,6 +161,14 @@ public:
             return nullptr;
     }
 
+    std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
+    {
+        if (!mountsBelow(path).empty())
+            return std::nullopt;
+        auto [accessor, subpath] = resolve(path);
+        return accessor->getKnownEntry(subpath);
+    }
+
     std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
     {
         if (fingerprint)

@@ -1,0 +1,23 @@
+{
+  "raw_domain": 65536,
+  "normalized_counts": {
+    "100644": 26624,
+    "100755": 30720,
+    "040000": 4096,
+    "120000": 2048,
+    "160000": 2048
+  },
+  "fixed_points": [
+    "040000",
+    "100644",
+    "100755",
+    "120000",
+    "160000"
+  ],
+  "example": {
+    "raw_mode": "100664",
+    "normalized_mode": "100644",
+    "raw_sha256_tree": "043e614a71621b3b871abcacaa832a5d1e68126520ba254b08c1c4df5a289b29",
+    "canonical_sha256_tree": "001cc91be706c78c4f70ff2e0d4034fb366e9742e04bcd0754666eeb9687b95a"
+  }
+}

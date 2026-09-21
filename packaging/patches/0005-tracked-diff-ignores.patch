@@ -1,0 +1,66 @@
+--- a/src/libgit2/iterator.h
++++ b/src/libgit2/iterator.h
+@@ -42,7 +42,9 @@
+ 	/** descend into symlinked directories */
+ 	GIT_ITERATOR_DESCEND_SYMLINKS = (1u << 7),
+ 	/** hash files in workdir or filesystem iterators */
+-	GIT_ITERATOR_INCLUDE_HASH = (1u << 8)
++	GIT_ITERATOR_INCLUDE_HASH = (1u << 8),
++	/** tracked-only diff: ignore rules cannot affect its output */
++	GIT_ITERATOR_DONT_HONOR_IGNORES = (1u << 9)
+ } git_iterator_flag_t;
+ 
+ typedef enum {
+--- a/src/libgit2/iterator.c
++++ b/src/libgit2/iterator.c
+@@ -1749,6 +1749,9 @@
+ GIT_INLINE(bool) filesystem_iterator_current_is_ignored(
+ 	filesystem_iterator *iter)
+ {
++	if (!iterator__honor_ignores(&iter->base))
++		return false;
++
+ 	if (iter->current_is_ignored == GIT_IGNORE_UNCHECKED)
+ 		filesystem_iterator_update_ignored(iter);
+ 
+@@ -2036,8 +2039,9 @@
+ 	if (given_opts)
+ 		memcpy(&options, given_opts, sizeof(git_iterator_options));
+ 
+-	options.flags |= GIT_ITERATOR_HONOR_IGNORES |
+-		GIT_ITERATOR_IGNORE_DOT_GIT;
++	options.flags |= GIT_ITERATOR_IGNORE_DOT_GIT;
++	if (!(options.flags & GIT_ITERATOR_DONT_HONOR_IGNORES))
++		options.flags |= GIT_ITERATOR_HONOR_IGNORES;
+ 
+ 	if (!options.oid_type)
+ 		options.oid_type = repo->oid_type;
+--- a/src/libgit2/diff_generate.c
++++ b/src/libgit2/diff_generate.c
+@@ -1479,6 +1479,7 @@
+ 	git_diff *diff = NULL;
+ 	char *prefix = NULL;
+ 	int error = 0;
++	unsigned int workdir_flags = GIT_ITERATOR_DONT_AUTOEXPAND;
+ 
+ 	GIT_ASSERT_ARG(out);
+ 	GIT_ASSERT_ARG(repo);
+@@ -1488,8 +1489,17 @@
+ 	if (!index && (error = diff_load_index(&index, repo)) < 0)
+ 		return error;
+ 
++	/* Ignore rules only classify entries absent from the index. When
++	 * neither ignored nor untracked (including unreadable) entries are
++	 * requested, reading .gitignore in every directory serves no result.
++	 * Keep normal workdir traversal and content/filter/stat comparisons. */
++	if (!opts || !(opts->flags & (GIT_DIFF_INCLUDE_UNTRACKED |
++		GIT_DIFF_INCLUDE_IGNORED | GIT_DIFF_SHOW_UNTRACKED_CONTENT |
++		GIT_DIFF_INCLUDE_UNREADABLE | GIT_DIFF_INCLUDE_UNREADABLE_AS_UNTRACKED)))
++		workdir_flags |= GIT_ITERATOR_DONT_HONOR_IGNORES;
++
+ 	if ((error = diff_prepare_iterator_opts(&prefix, &a_opts, GIT_ITERATOR_INCLUDE_CONFLICTS,
+-						&b_opts, GIT_ITERATOR_DONT_AUTOEXPAND, opts)) < 0 ||
++						&b_opts, workdir_flags, opts)) < 0 ||
+ 	    (error = git_iterator_for_index(&a, repo, index, &a_opts)) < 0 ||
+ 	    (error = git_iterator_for_workdir(&b, repo, index, NULL, &b_opts)) < 0 ||
+ 	    (error = git_diff__from_iterators(&diff, repo, a, b, opts)) < 0)

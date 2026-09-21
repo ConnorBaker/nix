@@ -17,6 +17,7 @@
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/processes.hh"
 #include "nix/store/git-object-store.hh"
 #include "nix/store/content-address.hh"
 #include "nix/util/tests/setting-scopes.hh"
@@ -67,6 +68,46 @@ TEST(LocalStore, storeDir_empty_rejected)
 {
     EXPECT_THROW(LocalStoreConfig("", {{"store", ""}}), UsageError);
 }
+
+#ifndef _WIN32
+TEST(SQLite, openingAnotherConnectionPreservesWalLocks)
+{
+    AutoDelete dir{createTempDir()};
+    auto path = dir.path() / "test.sqlite";
+    SQLite first{path, {.useWAL = true}};
+    first.isCache();
+    first.exec("create table test (value integer)");
+    auto shm = path.string() + "-shm";
+    auto parent = getpid();
+
+    /* A different process must observe the first connection's locks.
+       Inspecting them in this process would both hide our own locks and,
+       on close(), release them. Do not depend on SQLite's lock offsets. */
+    auto locksHeld = [&] {
+        Pid child = startProcess([&] {
+            AutoCloseFD fd = open(shm.c_str(), O_RDWR | O_CLOEXEC);
+            if (!fd)
+                _exit(2);
+            struct flock lock{};
+            lock.l_type = F_WRLCK;
+            lock.l_whence = SEEK_SET;
+            if (fcntl(fd.get(), F_GETLK, &lock) == -1)
+                _exit(3);
+            _exit(lock.l_type != F_UNLCK && lock.l_pid == parent ? 0 : 4);
+        });
+        return child.wait() == 0;
+    };
+
+    ASSERT_TRUE(locksHeld());
+    {
+        SQLite second{path, {.mode = SQLiteOpenMode::NoCreate, .useWAL = true}};
+        EXPECT_TRUE(locksHeld());
+        second.exec("insert into test values (1)");
+        EXPECT_TRUE(locksHeld());
+    }
+    EXPECT_TRUE(locksHeld());
+}
+#endif
 
 TEST(LocalStore, constructConfig_rootQueryParam)
 {
@@ -370,8 +411,12 @@ protected:
         auto mode = lstat(p).st_mode & ~S_IFMT;
         auto dir = p.parent_path();
         chmod(dir, 0755);
-        std::filesystem::remove(p);
-        writeFile(p, bytes);
+        /* Allocate the replacement before releasing the original inode;
+           unlink-then-create may reuse it and does not test a stale row. */
+        auto replacement = p;
+        replacement += ".replacement";
+        writeFile(replacement, bytes);
+        std::filesystem::rename(replacement, p);
         chmod(p, mode);
         canonicaliseTimestampAndPermissions(p);
         canonicaliseTimestampAndPermissions(dir);
@@ -469,6 +514,69 @@ protected:
         return treeNar({{"a", "one", 'f'}, {"d/b", "two", 'f'}, {"d/l", "b", 'l'}});
     }
 };
+
+TEST_F(LocalStoreObjectsTest, materialisationUsesImmutableBlobIdentityButRepairRehashes)
+{
+    for (char kind : {'f', 'x'}) {
+        auto source = treeAccessor({{"/file", "before", kind}});
+        auto file = CanonPath{"/file"};
+        auto entry = objectHashOf(*source, file).root;
+        auto leaf = make_ref<MemorySourceAccessor>();
+        leaf->root = *source->open(file, std::nullopt);
+        leaf->knownRoot = entry;
+        auto dst = config->realStoreDir.get() / std::string{kind};
+        auto copied = materialise(dst, SourcePath(leaf), noNode());
+        EXPECT_EQ(copied.root, entry);
+        EXPECT_EQ(readFile(dst), "before");
+        auto reused = materialise(dst.string() + "-again", SourcePath(leaf), noNode());
+        EXPECT_EQ(reused.root, entry);
+        EXPECT_EQ(filesCreated, 0u);
+        EXPECT_EQ(st(dst).st_ino, st(dst.string() + "-again").st_ino);
+
+        /* Repair must not trust even an advertised immutable identity:
+           deliberately corrupt this accessor's bytes behind its name. */
+        std::get<MemorySourceAccessor::File::Regular>(leaf->root->raw).contents = "after!";
+        auto expected = objectHashOf(*leaf, CanonPath::root).root;
+        auto repaired = materialise(dst.string() + "-repair", SourcePath(leaf), noNode(), Repair);
+        EXPECT_NE(expected, entry);
+        EXPECT_EQ(repaired.root, expected);
+        EXPECT_EQ(readFile(dst.string() + "-repair"), "after!");
+    }
+}
+
+TEST_F(LocalStoreObjectsTest, knownBlobChecksAnnouncedAndDeliveredSizes)
+{
+    struct Source : MemorySourceAccessor
+    {
+        size_t announced;
+        size_t delivered;
+
+        Source(size_t announced, size_t delivered)
+            : announced(announced)
+            , delivered(delivered)
+        {
+            std::string bytes(1, 'a' + announced * 3 + delivered);
+            knownRoot = merkle::TreeEntry{.mode = merkle::Mode::Regular, .hash = merkle::blobId(bytes)};
+            root = File::Regular{.contents = std::move(bytes)};
+        }
+
+        void readFile(const CanonPath &, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            sizeCallback(announced);
+            sink(std::string(delivered, 'a' + announced * 3 + delivered));
+        }
+    };
+
+    for (size_t announced : {0u, 1u, 2u})
+        for (size_t delivered : {0u, 1u, 2u}) {
+            auto source = make_ref<Source>(announced, delivered);
+            auto dst = config->realStoreDir.get() / fmt("size-%d-%d", announced, delivered);
+            if (announced == 1 && delivered == 1)
+                EXPECT_NO_THROW(materialise(dst, SourcePath(source), noNode()));
+            else
+                EXPECT_THROW(materialise(dst, SourcePath(source), noNode()), Error);
+        }
+}
 
 TEST_F(LocalStoreObjectsTest, restoreThroughObjects)
 {
@@ -2029,6 +2137,33 @@ TEST_F(LocalStoreObjectsTest, verifyExpectsNoBlobForAFileTheStoreDoesNotPlace)
    link a file the store never promised -- and the sweep must remove them.
    (`schema.sql`, the stale-row rule; it is what replaces the cascade a foreign
    key into `ValidPaths` would have given.) */
+TEST_F(LocalStoreObjectsTest, blobWriterRespectsBothJournalModes)
+{
+    bool saved = settings.useSQLiteWAL;
+    Finally restoreSetting{[&] { settings.useSQLiteWAL = saved; }};
+    for (bool wal : {false, true}) {
+        SCOPED_TRACE(wal);
+        store.reset();
+        settings.useSQLiteWAL = wal;
+        config =
+            std::make_shared<LocalStoreConfig>(tempStoreDir.path() / (wal ? "wal" : "rollback"), StoreConfig::Params{});
+        store = std::make_shared<LocalStore>(ref{config});
+        auto hold = store->objects.hold();
+        auto dst = config->realStoreDir.get() / (wal ? "wal-copy" : "rollback-copy");
+        store->beginIngestion(hold, dst);
+        StringSource source{treeNar({{"a", wal ? "wal" : "rollback", 'f'}})};
+        auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+        store->restoreThroughObjects(dst, source, false, hooks.get(), hold, NoRepair);
+        hold.flush();
+        EXPECT_GT(store->blobRowCount(false), 0u);
+        SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
+        SQLiteStmt mode{db, "pragma journal_mode"};
+        auto query = mode.use();
+        ASSERT_TRUE(query.next());
+        EXPECT_EQ(query.getStr(0) == "wal", wal);
+    }
+}
+
 TEST_F(LocalStoreObjectsTest, aCrashBeforeRegistrationLeavesNoRowThatMisleadsLink)
 {
     auto realStoreDir = std::filesystem::path{config->realStoreDir.get()};
@@ -2166,7 +2301,9 @@ TEST_F(LocalStoreObjectsTest, everyPathOfABatchIsItsOwnIngestion)
             UnkeyedValidPathInfo{*store, std::nullopt},
         };
         info.assertedNarHash = hashString(HashAlgorithm::SHA256, nar);
-        info.narSize = nar.size();
+        /* An unannounced length keeps this fixture on the parallel
+           streaming route even though StringSource itself is in memory. */
+        info.narSize = 0;
         paths.push_back(info.path);
         batch.emplace_back(std::move(info), std::make_unique<StringSource>(nar));
     }
@@ -2183,6 +2320,31 @@ TEST_F(LocalStoreObjectsTest, everyPathOfABatchIsItsOwnIngestion)
         EXPECT_EQ(blobFileOf(id, false), store->toRealPath(paths[i]) / "a") << i;
         EXPECT_EQ(readFile(blobFileOf(id, false)), fmt("byte-%d", i)) << i;
     }
+}
+
+TEST_F(LocalStoreObjectsTest, failedRegistrationPublishesNeitherPathNorPendingHolders)
+{
+    auto nar = treeNar({{"a", "uncommitted-holder", 'f'}});
+    ValidPathInfo info{
+        StorePath{"n5wkd9frr45pa74if5gpz9j7mifg27fh-atomic-registration"},
+        UnkeyedValidPathInfo{*store, std::nullopt},
+    };
+    info.assertedNarHash = hashString(HashAlgorithm::SHA256, nar);
+    info.narSize = nar.size();
+    info.references.emplace("n5wkd9frr45pa74if5gpz9j7mifg27fh-missing-reference");
+    auto before = store->blobRowCount(false);
+    StringSource failed{nar};
+    EXPECT_THROW(store->addToStore(info, failed, NoRepair, NoCheckSigs), Error);
+    EXPECT_FALSE(store->isValidPath(info.path));
+    EXPECT_EQ(store->blobRowCount(false), before);
+    EXPECT_FALSE(store->objects.holderOrForget(merkle::blobId("uncommitted-holder"), false, NoRepair));
+
+    info.references.clear();
+    StringSource retry{nar};
+    store->addToStore(info, retry, NoRepair, NoCheckSigs);
+    EXPECT_TRUE(store->isValidPath(info.path));
+    EXPECT_EQ(store->blobRowCount(false), before + 1);
+    EXPECT_EQ(blobFileOf(merkle::blobId("uncommitted-holder"), false), store->toRealPath(info.path) / "a");
 }
 
 /* The other half of the rule, driven directly: a row against an ingestion with
@@ -2444,6 +2606,96 @@ TEST_F(LocalStoreObjectsTest, sweepWritesNothingIntoAnOwnedPart)
    below.  The object store here is a bare one with no index, so its files
    are named through it and not through the fixture's `blobFileOf`, which
    resolves against the store under test. */
+TEST_F(LocalStoreObjectsTest, smallIngestionsFlushOnTheCallerAndResetTheirHolderNames)
+{
+    auto hold = store->objects.hold();
+    auto caller = std::this_thread::get_id();
+    size_t rows = 0;
+    auto id = merkle::blobId("one");
+    hold.setRoot("/first");
+    hold.setSink([&](std::vector<GitObjectStore::Hold::Row> && batch) {
+        EXPECT_EQ(std::this_thread::get_id(), caller);
+        rows += batch.size();
+    });
+    hold.addRow({.id = id, .executable = false, .name = "a"});
+    EXPECT_EQ(rows, 0u);
+    EXPECT_EQ(hold.pendingHolder(id, false), "/first/a");
+    hold.flush();
+    EXPECT_EQ(rows, 1u);
+    hold.setRoot("/second");
+    hold.setSink([&](auto && batch) { rows += batch.size(); });
+    EXPECT_FALSE(hold.pendingHolder(id, false)) << "names belong to one ingestion, not its reused hold";
+    hold.addRow({.id = id, .executable = true, .name = "b"});
+    hold.flush();
+    EXPECT_EQ(rows, 2u);
+    EXPECT_EQ(hold.pendingHolder(id, true), "/second/b");
+}
+
+TEST_F(LocalStoreObjectsTest, publishedAuxiliaryObjectRetainsItsOriginalHoldLink)
+{
+    auto & objects = store->objects;
+    auto body = std::string{};
+    auto id = merkle::treeId(body);
+    auto file = objects.treeFile(id);
+    {
+        auto hold = objects.hold();
+        objects.putTree(id, body, hold);
+        auto published = st(file);
+        EXPECT_EQ(published.st_nlink, 2u);
+        bool found = false;
+        for (auto & entry : DirectoryIterator{hold.linkFor(file).parent_path()}) {
+            EXPECT_EQ(st(entry.path()).st_ino, published.st_ino);
+            found = true;
+        }
+        EXPECT_TRUE(found);
+        /* A second writer must hold the completed global object. */
+        auto other = objects.hold();
+        objects.putTree(id, body, other);
+        EXPECT_EQ(st(file).st_ino, published.st_ino);
+        EXPECT_EQ(st(file).st_nlink, 3u);
+    }
+    EXPECT_EQ(st(file).st_nlink, 1u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryHoldsCoverEveryKindAndIdentifierShard)
+{
+    auto & objects = store->objects;
+    auto hold = objects.hold();
+    auto shared = hold.ownRows();
+    EXPECT_TRUE(std::filesystem::is_empty(hold.directory()));
+    for (unsigned int byte = 0; byte < 256; ++byte) {
+        Hash id{HashAlgorithm::SHA256};
+        id.hash[0] = byte;
+        for (auto object : {objects.blobFile(id, false), objects.blobFile(id, true), objects.treeFile(id)}) {
+            auto relative = object.lexically_relative(objects.dir);
+            auto expected = hold.directory() / relative;
+            EXPECT_EQ(hold.linkFor(object), expected);
+            EXPECT_TRUE(std::filesystem::is_directory(expected.parent_path()));
+            EXPECT_EQ(shared.linkFor(object), expected);
+            EXPECT_EQ(hold.linkFor(object), expected);
+        }
+    }
+}
+
+TEST_F(LocalStoreObjectsTest, releasingAHoldDoesNotFollowSymlinks)
+{
+    auto outside = tempStoreDir.path() / "outside";
+    createDirs(outside);
+    writeFile(outside / "keep", "untouched");
+    std::filesystem::path dir;
+    {
+        auto hold = store->objects.hold();
+        dir = hold.directory();
+        createSymlink(outside, dir / "outside-link");
+        std::filesystem::create_hard_link(outside / "keep", dir / "extra-link");
+        store->objects.putTree(merkle::treeId(""), "", hold);
+    }
+    EXPECT_FALSE(pathExists(dir));
+    EXPECT_EQ(readFile(outside / "keep"), "untouched");
+    EXPECT_EQ(st(outside / "keep").st_nlink, 1u);
+    EXPECT_EQ(readFile(store->objects.treeFile(merkle::treeId(""))), "");
+}
+
 TEST_F(LocalStoreObjectsTest, writeObjectFileIsCanonicalBeforeFsync)
 {
     GitObjectStore objects{tempStoreDir.path() / "fsynced", /*fsync=*/true};
@@ -2538,6 +2790,36 @@ TEST_F(LocalStoreObjectsTest, executableHolderCarriesItsBitOnThePathsOwnFile)
     EXPECT_EQ(st(t2 / "p").st_ino, st(t / "p").st_ino);
     EXPECT_EQ(st(t2 / "x").st_ino, st(t / "x").st_ino);
     EXPECT_EQ(st(t2 / "x").st_mode & ~S_IFMT, 0555u);
+}
+
+/* Enumerate the publication orders after two probes miss. No scheduler
+   timing is needed to reproduce the parallel copy's critical interleaving. */
+TEST_F(LocalStoreObjectsTest, concurrentMissesShareTheFirstCompletedHolder)
+{
+    auto & objects = store->objects;
+    for (bool executable : {false, true})
+        for (bool reverse : {false, true})
+            for (bool looked : {false, true}) {
+                auto dir = tempStoreDir.path() / fmt("race-%d-%d-%d", executable, reverse, looked);
+                createDirs(dir);
+                auto fd = openDirectory(dir);
+                auto hold = objects.hold();
+                hold.setRoot(dir);
+                auto bytes = dir.filename().string();
+                auto id = merkle::blobId(bytes);
+                auto a = CanonPath::fromFilename("a"), b = CanonPath::fromFilename("b");
+                EXPECT_FALSE(objects.link(id, executable, fd.get(), a, dir / "a", bytes.size(), NoRepair, hold));
+                EXPECT_FALSE(objects.link(id, executable, fd.get(), b, dir / "b", bytes.size(), NoRepair, hold));
+                for (auto name : {"a", "b"}) {
+                    writeFile(dir / name, bytes);
+                    chmod(dir / name, executable ? 0555 : 0444);
+                }
+                auto first = reverse ? b : a, second = reverse ? a : b;
+                objects.enterWritten(id, executable, fd.get(), first, dir / first.rel(), NoRepair, hold, looked);
+                objects.enterWritten(id, executable, fd.get(), second, dir / second.rel(), NoRepair, hold, looked);
+                EXPECT_EQ(st(dir / "a").st_ino, st(dir / "b").st_ino)
+                    << "executable=" << executable << " reverse=" << reverse << " looked=" << looked;
+            }
 }
 
 /* Law 4 of 01 section 9.10 over a whole store rather than one path: for
@@ -3877,8 +4159,7 @@ RC_GTEST_FIXTURE_PROP(LocalStoreObjectsTest, prop_materialised_path_is_the_resto
 
    The tree is wide on purpose -- eight sibling directories under the root,
    each with files and a subdirectory of its own -- so that the pool is
-   actually used: it runs only where a directory has two or more
-   subdirectories. */
+   actually used, including nested directory scopes. */
 TEST_F(LocalStoreObjectsTest, parallelCopyIsTheSequentialCopy)
 {
     auto realStoreDir = std::filesystem::path{config->realStoreDir.get()};
@@ -3921,7 +4202,7 @@ TEST_F(LocalStoreObjectsTest, parallelCopyIsTheSequentialCopy)
 
     for (auto & [label, src] : sources) {
         std::vector<Copy> copies;
-        for (size_t workers : {size_t(1), size_t(8)}) {
+        for (size_t workers = 1; workers <= 8; ++workers) {
             LocalStore::copyWorkersForTest.store(workers);
             auto dst = realStoreDir / fmt("%s-w%d", label, workers);
             auto r = materialise(dst, src, noNode());
@@ -3929,34 +4210,111 @@ TEST_F(LocalStoreObjectsTest, parallelCopyIsTheSequentialCopy)
         }
 
         auto & one = copies[0];
-        auto & many = copies[1];
+        for (auto & many : copies) {
 
-        /* The summary the copy returns. */
-        EXPECT_EQ(many.result.root, one.result.root) << label;
-        EXPECT_EQ(many.result.narSize, one.result.narSize) << label;
-        EXPECT_EQ(many.result.narSizeExact, one.result.narSizeExact) << label;
-        EXPECT_EQ(many.created, one.created) << label;
-        EXPECT_EQ(one.result.root, r0.root) << label;
+            /* The summary the copy returns. */
+            EXPECT_EQ(many.result.root, one.result.root) << label;
+            EXPECT_EQ(many.result.narSize, one.result.narSize) << label;
+            EXPECT_EQ(many.result.narSizeExact, one.result.narSizeExact) << label;
+            EXPECT_EQ(many.created, one.created) << label;
+            EXPECT_EQ(one.result.root, r0.root) << label;
 
-        /* Byte for byte, against the one route's NAR. */
-        for (auto & c : {one, many}) {
+            /* Byte for byte, against the one route's NAR. */
             StringSink again;
-            dumpPath(c.dst, again);
-            EXPECT_EQ(again.s, nar) << label << " " << c.dst;
-        }
+            dumpPath(many.dst, again);
+            EXPECT_EQ(again.s, nar) << label << " " << many.dst;
 
-        /* Link for link: the same files, each the same inode -- the store's
-           blob -- and at the same link count. */
-        auto files = regularFilesUnder(reference);
-        ASSERT_FALSE(files.empty());
-        EXPECT_EQ(regularFilesUnder(one.dst), files) << label;
-        EXPECT_EQ(regularFilesUnder(many.dst), files) << label;
-        for (auto & f : files) {
-            auto under = [&](const std::filesystem::path & p) { return f.empty() ? p : p / f; };
-            EXPECT_EQ(st(under(many.dst)).st_ino, st(under(one.dst)).st_ino) << label << " " << f;
-            EXPECT_EQ(st(under(many.dst)).st_nlink, st(under(one.dst)).st_nlink) << label << " " << f;
-            EXPECT_EQ(st(under(many.dst)).st_mode, st(under(one.dst)).st_mode) << label << " " << f;
+            /* Link for link: the same files, each the same inode -- the store's
+               blob -- and at the same link count. */
+            auto files = regularFilesUnder(reference);
+            ASSERT_FALSE(files.empty());
+            EXPECT_EQ(regularFilesUnder(one.dst), files) << label;
+            EXPECT_EQ(regularFilesUnder(many.dst), files) << label;
+            for (auto & f : files) {
+                auto under = [&](const std::filesystem::path & p) { return f.empty() ? p : p / f; };
+                EXPECT_EQ(st(under(many.dst)).st_ino, st(under(one.dst)).st_ino) << label << " " << f;
+                EXPECT_EQ(st(under(many.dst)).st_nlink, st(under(one.dst)).st_nlink) << label << " " << f;
+                EXPECT_EQ(st(under(many.dst)).st_mode, st(under(one.dst)).st_mode) << label << " " << f;
+            }
         }
+    }
+}
+
+TEST_F(LocalStoreObjectsTest, freshParallelCopySharesDuplicatesAtEveryWidth)
+{
+    Finally restoreWorkers{
+        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+    for (size_t workers = 1; workers <= 8; ++workers) {
+        LocalStore::copyWorkersForTest.store(workers);
+        Nodes nodes;
+        auto bytes = fmt("width %d ", workers) + std::string(65536, 'x');
+        for (size_t dir = 0; dir < 16; ++dir)
+            for (auto kind : {'f', 'x'})
+                nodes.emplace_back(fmt("d%d/%c", dir, kind), bytes, kind);
+        auto src = treeAccessor(nodes);
+        auto dst = std::filesystem::path{config->realStoreDir.get()} / fmt("fresh-w%d", workers);
+        materialise(dst, SourcePath(src), noNode());
+        for (size_t dir = 0; dir < 16; ++dir)
+            for (auto kind : {'f', 'x'})
+                EXPECT_EQ(st(dst / fmt("d%d/%c", dir, kind)).st_ino, st(dst / fmt("d0/%c", kind)).st_ino)
+                    << "workers=" << workers << " dir=" << dir << " mode=" << kind;
+        EXPECT_NE(st(dst / "d0/f").st_ino, st(dst / "d0/x").st_ino);
+    }
+}
+
+/* Every supported worker count must join nested children before an
+   exception leaves the source scope. A skewed tree reaches well beyond
+   the pool width; a later successful copy also detects abandoned work. */
+TEST_F(LocalStoreObjectsTest, nestedParallelCopyJoinsOnFailure)
+{
+    struct Source : MemorySourceAccessor
+    {
+        std::atomic<size_t> active{0};
+        std::atomic<size_t> peak{0};
+        bool fail = true;
+
+        void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            auto count = ++active;
+            auto before = peak.load();
+            while (before < count && !peak.compare_exchange_weak(before, count)) {
+            }
+            Finally done{[&] { --active; }};
+            if (fail && path.baseName() == "fail")
+                throw Error("injected source failure");
+            MemorySourceAccessor::readFile(path, sink, sizeCallback);
+        }
+    };
+
+    Nodes nodes;
+    for (size_t i = 0; i < 24; ++i) {
+        auto prefix = fmt("large/a/b/c/d%02d/e/f/g/h/", i);
+        nodes.emplace_back(prefix + "ok", std::string(4096, 'x'), 'f');
+        nodes.emplace_back(prefix + "fail", "failure", 'f');
+    }
+    nodes.emplace_back("small/ok", "small", 'f');
+    auto source = make_ref<Source>();
+    source->root = std::move(treeAccessor(nodes)->root);
+    auto expected = narOf(*treeAccessor(nodes));
+    Finally restoreWorkers{
+        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+    for (size_t workers = 1; workers <= 8; ++workers) {
+        LocalStore::copyWorkersForTest.store(workers);
+        source->fail = true;
+        auto dst = std::filesystem::path{config->realStoreDir.get()} / fmt("failure-%d", workers);
+        EXPECT_THROW(materialise(dst, SourcePath(source), noNode()), Error);
+        EXPECT_EQ(source->active, 0u);
+        EXPECT_LE(source->peak, workers);
+        source->peak = 0;
+        source->fail = false;
+        auto good = std::filesystem::path{config->realStoreDir.get()} / fmt("success-%d", workers);
+        materialise(good, SourcePath(source), noNode());
+        EXPECT_EQ(source->active, 0u);
+        EXPECT_LE(source->peak, workers);
+        source->peak = 0;
+        StringSink actual;
+        dumpPath(good, actual);
+        EXPECT_EQ(actual.s, expected);
     }
 }
 

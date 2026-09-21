@@ -1,0 +1,27 @@
+{
+  "trees": {
+    "files": 37104,
+    "bytes": 4616089,
+    "allocated_bytes": 153141248,
+    "size_bins": {
+      "<=64": 30004,
+      "<=256": 5686,
+      "<=4096": 1318,
+      ">4096": 96
+    }
+  },
+  "blobs": {
+    "files": 3,
+    "bytes": 75,
+    "allocated_bytes": 12288,
+    "size_bins": {
+      "<=64": 3
+    }
+  },
+  "blobs-x": {
+    "files": 0,
+    "bytes": 0,
+    "allocated_bytes": 0,
+    "size_bins": {}
+  }
+}

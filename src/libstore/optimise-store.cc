@@ -1,4 +1,5 @@
 #include "nix/util/serialise.hh"
+#include "nix/util/nested-work-pool.hh"
 #include "nix/util/fs-sink.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/object-hash-sink.hh"
@@ -14,11 +15,13 @@
 #include "nix/util/finally.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/strings.hh"
-#include "nix/util/thread-pool.hh"
 #include "nix/util/util.hh"
 
 #include <algorithm>
 #include <mutex>
+#include <future>
+#include <deque>
+#include <condition_variable>
 #include <thread>
 #include <set>
 #include <fcntl.h>
@@ -358,6 +361,7 @@ static constexpr uint64_t restoreBufferLimit = 1 << 20;
 struct LinkingVisitor : ObjectStoreVisitor
 {
     RepairFlag repair;
+    Sink * rootContents;
 
     /* The stacks a copy carries down its recursion: the sink a node's
        children are created on -- the enclosing directory's own, innermost
@@ -372,10 +376,6 @@ struct LinkingVisitor : ObjectStoreVisitor
     {
         std::vector<RestoreSink *> open;
         std::vector<std::string> diskNames;
-        /* Set while this thread is a pool worker, so that a subtree
-           beneath a parallel directory is walked sequentially and the
-           number of threads is the pool's, not the tree's depth. */
-        bool inWorker = false;
     };
 
     static Frames & frames()
@@ -388,7 +388,7 @@ struct LinkingVisitor : ObjectStoreVisitor
     {
         Frames saved;
 
-        Scope(RestoreSink & sink, std::optional<std::string> diskName, bool inWorker)
+        Scope(RestoreSink & sink, std::optional<std::string> diskName)
         {
             auto & f = frames();
             saved = std::move(f);
@@ -397,7 +397,6 @@ struct LinkingVisitor : ObjectStoreVisitor
             f.diskNames.clear();
             if (diskName)
                 f.diskNames.push_back(std::move(*diskName));
-            f.inWorker = inWorker;
         }
 
         ~Scope()
@@ -410,10 +409,15 @@ struct LinkingVisitor : ObjectStoreVisitor
     Scope scope;
 
     LinkingVisitor(
-        GitObjectStore & objects, const GitObjectStore::Hold & hold, RestoreSink & restore, RepairFlag repair)
+        GitObjectStore & objects,
+        const GitObjectStore::Hold & hold,
+        RestoreSink & restore,
+        RepairFlag repair,
+        Sink * rootContents = nullptr)
         : ObjectStoreVisitor(objects, hold)
         , repair(repair)
-        , scope(restore, std::nullopt, false)
+        , rootContents(rootContents)
+        , scope(restore, std::nullopt)
     {
     }
 
@@ -473,14 +477,17 @@ struct LinkingVisitor : ObjectStoreVisitor
             RestoreSink & restore;
             const CanonPath & name;
             CreateRegularFileSink & hashing;
+            Sink * contents;
             bool executable = false;
             std::string buffer;
             std::unique_ptr<RegularFileWriter> writer;
 
-            BufferThenStreamFile(RestoreSink & restore, const CanonPath & name, CreateRegularFileSink & hashing)
+            BufferThenStreamFile(
+                RestoreSink & restore, const CanonPath & name, CreateRegularFileSink & hashing, Sink * contents)
                 : restore(restore)
                 , name(name)
                 , hashing(hashing)
+                , contents(contents)
             {
             }
 
@@ -518,6 +525,8 @@ struct LinkingVisitor : ObjectStoreVisitor
             void operator()(std::string_view data) override
             {
                 hashing(data);
+                if (contents)
+                    (*contents)(data);
                 if (!writer && buffer.size() + data.size() > restoreBufferLimit)
                     stream();
                 if (writer)
@@ -533,7 +542,7 @@ struct LinkingVisitor : ObjectStoreVisitor
         std::unique_ptr<RegularFileWriter> writer;
 
         auto node = HashingVisitor::regular(path, [&](CreateRegularFileSink & hashing) {
-            BufferThenStreamFile file{target.sink, target.name, hashing};
+            BufferThenStreamFile file{target.sink, target.name, hashing, path.isRoot() ? rootContents : nullptr};
             read(file);
             executable = file.executable;
             buffer = std::move(file.buffer);
@@ -603,25 +612,19 @@ struct LinkingVisitor : ObjectStoreVisitor
    each child's visit for `at` to read. */
 struct MaterialisingVisitor : LinkingVisitor
 {
+    const SourcePath & source;
     LocalStore::TreeNamer namer;
     RestoreSinkHooks * hooks;
 
     /* The naming's memo, which the namer closes over, is not made for two
        threads: `MemoVisitor::keyOf` initialises its `Cache` handle lazily
-       and `getFingerprint` goes to the accessor.  It is asked once per
-       directory and once for the root -- forty times for a tree of forty
-       thousand files -- so it is asked under a lock and nothing is lost.
+       and `getFingerprint` goes to the accessor. Calls are serialized;
+       the directory walk and holder writes run outside this lock.
      */
     std::mutex namerLock;
 
-    /* How many threads a directory's subdirectories may go on, and the
-       switch that turns the parallel copy off.  Bounded well below the
-       machine's width: the source accessor serialises every read and hash
-       behind its own lock (libgit2 forbids sharing one `git_repository`
-       across threads), so only the writing overlaps, and past a handful of
-       threads the directories contend for nothing left to win (`05`
-       section 6). */
     size_t workers;
+    std::unique_ptr<NestedWorkPool> pool;
 
     MaterialisingVisitor(
         GitObjectStore & objects,
@@ -630,8 +633,10 @@ struct MaterialisingVisitor : LinkingVisitor
         RepairFlag repair,
         LocalStore::TreeNamer namer,
         RestoreSinkHooks * hooks,
-        size_t workers)
+        size_t workers,
+        const SourcePath & source)
         : LinkingVisitor(objects, hold, restore, repair)
+        , source(source)
         , namer(std::move(namer))
         , hooks(hooks)
         , workers(workers)
@@ -659,14 +664,10 @@ struct MaterialisingVisitor : LinkingVisitor
        The on-disk names are the case hack's and are computed here, in that
        same order, on this thread.
 
-       Only a directory that is not already inside a worker parallelises,
-       so the number of threads is the pool's and not the tree's depth.
-       Which children are directories is what the traversal says from the
-       listing it already made (`Children`, advisory): nothing but *which
-       thread* a child is walked on depends on it, so a child the listing
-       did not type is simply walked here. */
-    void
-    copyChildren(const CanonPath & path, Children children, fun<void(std::string_view, bool, fun<HashedNode()>)> & each)
+       Nested directories may use an idle pool slot. Every child is joined
+       even if another child fails, before its directory's accessor and sink
+       leave scope. Listing types affect scheduling alone. */
+    void copyChildren(const CanonPath &, Children children, fun<void(std::string_view, bool, fun<HashedNode()>)> & each)
     {
         struct Child
         {
@@ -675,18 +676,21 @@ struct MaterialisingVisitor : LinkingVisitor
             fun<HashedNode()> visit;
             bool subdirectory;
             std::optional<HashedNode> node;
+            std::future<void> running;
         };
-
-        bool mayFork = workers > 1 && !frames().inWorker;
 
         std::vector<Child> kids;
         CaseHackNames hack;
-        size_t forkable = 0;
         children([&](std::string_view name, bool isDirectory, fun<HashedNode()> visit) {
-            bool sub = mayFork && isDirectory;
-            forkable += sub;
-            kids.push_back({std::string(name), hack.diskName(name), std::move(visit), sub, std::nullopt});
+            kids.push_back({std::string(name), hack.diskName(name), std::move(visit), isDirectory, std::nullopt, {}});
         });
+        /* Futures from packaged tasks do not join in their destructor.
+           Keep every captured directory alive on both success and failure. */
+        Finally join{[&] {
+            for (auto & child : kids)
+                if (child.running.valid())
+                    pool->wait(child.running, &kids);
+        }};
 
         auto here = [&](Child & c) {
             auto & diskNames = frames().diskNames;
@@ -695,30 +699,27 @@ struct MaterialisingVisitor : LinkingVisitor
             c.node = c.visit();
         };
 
-        if (forkable >= 2) {
-            auto * sink = frames().open.back();
-            ThreadPool pool{workers};
-            for (auto & c : kids)
-                if (c.subdirectory)
-                    pool.enqueue([&c, sink] {
-                        /* The worker's own stacks, seeded with this
-                           directory's sink and the child's on-disk name;
-                           `Scope` restores them, and the pool propagates
-                           what this throws and fires `checkInterrupt`
-                           through its own `ReceiveInterrupts`. */
-                        Scope scope{*sink, c.disk, true};
-                        c.node = c.visit();
-                    });
-            /* The files of this directory on this thread while the pool
-               takes the subdirectories; `process()` then works the queue
-               here too until it is empty. */
-            for (auto & c : kids)
-                if (!c.subdirectory)
-                    here(c);
-            pool.process();
-        } else
-            for (auto & c : kids)
+        /* A singleton has no sibling work to overlap. Its visit can still
+           use the pool below, when it reaches a branching directory. This
+           also avoids constructing a scheduler for regular-file roots. */
+        bool fork = workers > 1 && kids.size() > 1;
+        if (fork && !pool && std::any_of(kids.begin(), kids.end(), [](auto & c) { return c.subdirectory; }))
+            pool = std::make_unique<NestedWorkPool>(workers);
+        auto * sink = frames().open.back();
+        for (auto & c : kids) {
+            if (fork && c.subdirectory)
+                c.running = pool->tryAsync(&kids, [&c, sink] {
+                    Scope scope{*sink, c.disk};
+                    c.node = c.visit();
+                });
+            if (!c.running.valid())
                 here(c);
+        }
+        for (auto & c : kids)
+            if (c.running.valid()) {
+                pool->wait(c.running, &kids);
+                c.running.get();
+            }
 
         for (auto & c : kids) {
             assert(c.node);
@@ -728,6 +729,37 @@ struct MaterialisingVisitor : LinkingVisitor
 
     std::optional<HashedNode> known(const CanonPath & path, const SourceAccessor::Stat & st) override
     {
+        /* A verified immutable blob already has an identity before any
+           bytes are read. Probe the holder first and stream a miss directly
+           into its destination, without buffering and hashing it again.
+           Mutable worktrees supply no such identity; repair ignores it. */
+        if (!repair && st.type == SourceAccessor::tRegular && st.fileSize)
+            if (auto entry = source.accessor->getKnownEntry(source.path / path);
+                entry && entry->hash.algo == merkle::hashAlgo
+                && entry->mode == (st.isExecutable ? merkle::Mode::Executable : merkle::Mode::Regular)) {
+                auto target = at(path);
+                auto [owned, dirFd, name] = target.sink.parentOf(target.name);
+                bool linkable = linkableOnThisSystem(target.where);
+                if (!linkable
+                    || !objects.link(
+                        entry->hash, st.isExecutable, dirFd, name, target.where, st.fileSize, repair, hold)) {
+                    auto writer = target.sink.beginRegularFile(target.name);
+                    if (st.isExecutable)
+                        writer->isExecutable();
+                    source.accessor->readFile(source.path / path, *writer, [&](uint64_t size) {
+                        if (size != *st.fileSize)
+                            throw Error("immutable file '%s' changed size while copying", source.path / path);
+                        writer->preallocateContents(size);
+                    });
+                    writer->finish();
+                    if (auto * fdSink = dynamic_cast<FdSink *>(writer.get()); fdSink && fdSink->written != *st.fileSize)
+                        throw Error("immutable file '%s' delivered the wrong number of bytes", source.path / path);
+                    writer.reset();
+                    if (linkable)
+                        objects.enterWritten(entry->hash, st.isExecutable, dirFd, name, target.where, repair, hold);
+                }
+                return HashedNode{.entry = *entry, .narSize = merkle::nar::regular(*st.fileSize, st.isExecutable)};
+            }
         if (!path.isRoot() && st.type != SourceAccessor::tDirectory)
             return std::nullopt;
         auto entry = [&] {
@@ -885,11 +917,12 @@ ObjectHashSink::Result LocalStore::restoreThroughObjects(
     bool startFsync,
     RestoreSinkHooks * hooks,
     const GitObjectStore::Hold & hold,
-    RepairFlag repair)
+    RepairFlag repair,
+    Sink * rootContents)
 {
     RestoreSink restore{startFsync, hooks};
     restore.dstPath = path;
-    LinkingVisitor linking{objects, hold, restore, repair};
+    LinkingVisitor linking{objects, hold, restore, repair, rootContents};
     ObjectHashSink adapter{linking};
     beginIngestion(hold, path);
     parseDump(adapter, source);
@@ -929,16 +962,16 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
     RestoreSink restore{startFsync, hooks};
     restore.dstPath = dst;
     /* The copy's subdirectories go on a small pool (`copyChildren`): the
-       machine's width, capped, since the source accessor serialises every
-       read and hash behind its own lock and only the writing overlaps
-       (`05` section 6).  Not a setting: what the copy makes does not
+       machine's width, capped to bound filesystem and index contention.
+       Git repository reads remain serialized by their accessor; filesystem
+       scopes and captured trees permit independent reads.  Not a setting: what the copy makes does not
        depend on the count (01 §10), so there is nothing for a user to
        decide.  `copyWorkersForTest` is the tests' seam and is zero
        everywhere else; one thread is the sequential walk exactly. */
     size_t workers = copyWorkersForTest.load(std::memory_order_relaxed);
     if (!workers)
         workers = std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
-    MaterialisingVisitor visitor{objects, hold, restore, repair, std::move(namer), hooks, workers};
+    MaterialisingVisitor visitor{objects, hold, restore, repair, std::move(namer), hooks, workers, path};
     beginIngestion(hold, dst);
     auto result = objectHashOf(*path.accessor, path.path, filter, visitor);
     /* Every `known` answer carries the size of what it made, so the NAR
@@ -1022,10 +1055,7 @@ StorePath LocalStore::materialise(
 
             auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
             info.narSize = result.narSize;
-            registerValidPath(info);
-
-            /* Naming this ingestion's path makes its rows true. */
-            endIngestion(hold, info.path);
+            registerValidPath(info, hold);
         } else
             // We may have a negative cache entry for this path, so get rid of it.
             invalidatePathInfoCacheFor(dstPath);

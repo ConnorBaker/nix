@@ -57,8 +57,17 @@ StringMap unhackedEntries(
     const CanonPath & path,
     const std::function<void(const std::string & name, bool isDirectory)> & typed)
 {
+    return unhackedEntries(accessor.readDirectory(path), accessor, path, typed);
+}
+
+StringMap unhackedEntries(
+    const SourceAccessor::DirEntries & entries,
+    SourceAccessor & accessor,
+    const CanonPath & path,
+    const std::function<void(const std::string & name, bool isDirectory)> & typed)
+{
     StringMap unhacked;
-    for (auto & i : accessor.readDirectory(path)) {
+    for (auto & i : entries) {
         if (!archiveSettings.useCaseHack && i.first.find(caseHackSuffix) != std::string::npos)
             throw Error(
                 "cannot serialise '%s': entry '%s' carries the case-hack suffix, which the NAR format reserves",

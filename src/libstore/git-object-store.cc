@@ -163,19 +163,16 @@ static std::error_code hardLink(const std::filesystem::path & from, const std::f
    forty thousand times by eight threads, and it was the first reason the
    parallel copy was slower than the route it replaces.
 
-   A **writer thread** drains the shards continuously into the store's index
-   while the copy runs, so that the registration has nothing left to do.  Two
+   A writer thread drains a large ingestion into the store's index while
+   the copy runs. A small ingestion drains on the registering thread. Two
    things make that cheap.  A shard's queue is taken by *swap* under its lock,
    so a drain copies no rows; and what a later `link` needs -- the file this
    ingestion already wrote for a blob (law 3 within one path) -- is kept in
    `byKey`, which maps the blob to its name and does not index into the queue,
    so the queue may be emptied under it.
 
-   The threshold is small (1 024 rows, about forty transactions in a
-   forty-thousand-file copy) because the cost is per *transaction*, not per
-   row: three transactions cost 0.042-0.060 s and five hundred cost most of a
-   second, so forty is where the write overlaps the copy without the
-   transaction count mattering. */
+   Neither a writer nor unused shards are allocated for the common case
+   of a store object containing one regular file. */
 struct GitObjectStore::Hold::Pending
 {
     struct Shard
@@ -187,20 +184,45 @@ struct GitObjectStore::Hold::Pending
         boost::unordered_flat_map<std::string, std::string> byKey;
     };
 
-    std::array<Shard, 256> shards;
+    /* A one-file ingestion occupies one shard. Allocate the others only
+       when their identifier domain is actually used. Readers publish and
+       acquire pointers because directory workers share this Pending. */
+    std::array<std::atomic<Shard *>, 256> shards{};
     std::atomic<size_t> queued{0};
+
+    /* Auxiliary objects are protected under the same first-byte shards
+       as their published names. Independent directory workers must not
+       create every temporary in one shared directory. */
+    std::array<std::once_flag, 3 * 256> auxiliaryShards;
 
     std::mutex wake;
     std::condition_variable ready;
     bool stopping = false;
     std::thread writer;
+    std::exception_ptr error;
 
     std::filesystem::path root;
     std::function<void(std::vector<Row> &&)> sink;
+
+    Shard & shard(size_t n)
+    {
+        auto * p = shards[n].load(std::memory_order_acquire);
+        if (!p) {
+            auto made = std::make_unique<Shard>();
+            if (shards[n].compare_exchange_strong(p, made.get(), std::memory_order_acq_rel))
+                p = made.release();
+        }
+        return *p;
+    }
+
+    ~Pending()
+    {
+        for (auto & shard : shards)
+            delete shard.load();
+    }
 };
 
-/* Rows queued before the writer is woken.  Small: the drain is meant to run
-   beside the copy and keep up with it, not to batch it. */
+/* Rows queued before a background writer is needed. */
 static size_t holdBatchSize()
 {
     /* Settable for the measurement alone (`NIX_HOLDER_BATCH`); the default is
@@ -236,26 +258,27 @@ static size_t shardOf(const Hash & id)
    shard's.  Over the `Pending` and not the `Hold`, because a `Hold` is moved
    -- into an `optional`, out of `hold()` -- and the writer thread must not
    hold a pointer to one. */
-static void drainPending(GitObjectStore::Hold::Pending & pending)
+static std::vector<GitObjectStore::Hold::Row> takePending(GitObjectStore::Hold::Pending & pending)
 {
     std::vector<GitObjectStore::Hold::Row> batch;
-    for (auto & shard : pending.shards) {
+    for (auto & slot : pending.shards) {
+        auto * shard = slot.load(std::memory_order_acquire);
+        if (!shard)
+            continue;
         std::vector<GitObjectStore::Hold::Row> taken;
         {
-            auto lock = std::lock_guard{shard.mutex};
-            if (shard.queue.empty())
+            auto lock = std::lock_guard{shard->mutex};
+            if (shard->queue.empty())
                 continue;
-            taken.swap(shard.queue);
+            taken.swap(shard->queue);
         }
         if (batch.empty())
             batch = std::move(taken);
         else
             batch.insert(batch.end(), std::make_move_iterator(taken.begin()), std::make_move_iterator(taken.end()));
     }
-    if (batch.empty())
-        return;
     pending.queued.fetch_sub(batch.size());
-    pending.sink(std::move(batch));
+    return batch;
 }
 
 const std::filesystem::path & GitObjectStore::Hold::directory() const
@@ -282,56 +305,75 @@ void GitObjectStore::Hold::setSink(std::function<void(std::vector<Row> &&)> sink
        and its rows drained *before* the next one's starts: assigning over a
        joinable `std::thread` terminates the process, which is how the unit
        suite found this. */
-    if (pending->writer.joinable()) {
-        {
-            auto lock = std::lock_guard{pending->wake};
-            pending->stopping = true;
-        }
-        pending->ready.notify_all();
-        pending->writer.join();
-        drain();
-        auto lock = std::lock_guard{pending->wake};
-        pending->stopping = false;
-    }
+    flush();
+    pending->stopping = false;
+    for (auto & slot : pending->shards)
+        delete slot.exchange(nullptr);
+    pending->queued = 0;
     pending->sink = std::move(sink);
-    auto * p = pending.get();
-    pending->writer = std::thread([p] {
-        while (true) {
-            {
-                auto lock = std::unique_lock{p->wake};
-                p->ready.wait(lock, [&] { return p->stopping || p->queued.load() >= holdBatchSize(); });
-                if (p->stopping)
-                    return;
-            }
-            drainPending(*p);
-        }
-    });
 }
 
-void GitObjectStore::Hold::addRow(Row row) const
+std::optional<std::string> GitObjectStore::Hold::addRow(Row row, bool replace) const
 {
     auto key = pendingKey(row.id, row.executable);
+    size_t queued;
     {
-        auto & shard = pending->shards[shardOf(row.id)];
+        auto & shard = pending->shard(shardOf(row.id));
         auto lock = std::lock_guard{shard.mutex};
-        shard.byKey.insert_or_assign(std::move(key), row.name);
+        auto [i, inserted] = shard.byKey.try_emplace(std::move(key), row.name);
+        if (!inserted) {
+            if (!replace)
+                return i->second.empty() ? pending->root.string() : (pending->root / i->second).string();
+            i->second = row.name;
+        }
         shard.queue.push_back(std::move(row));
+        /* Publish the count before a drain can take this row. */
+        queued = pending->queued.fetch_add(1) + 1;
     }
-    if (!pending->sink)
-        return;
-    if (pending->queued.fetch_add(1) + 1 >= holdBatchSize())
+    if (queued >= holdBatchSize() && pending->sink) {
+        /* Background work only exists when there is a batch to overlap
+           with a continuing copy. A single-file store object drains on
+           the registering thread and never starts another thread. */
+        auto lock = std::lock_guard{pending->wake};
+        if (pending->error)
+            std::rethrow_exception(pending->error);
+        if (!pending->writer.joinable()) {
+            auto * p = pending.get();
+            pending->writer = std::thread([p] {
+                try {
+                    while (true) {
+                        {
+                            auto lock = std::unique_lock{p->wake};
+                            p->ready.wait(lock, [&] { return p->stopping || p->queued.load() >= holdBatchSize(); });
+                            if (p->stopping)
+                                return;
+                        }
+                        auto batch = takePending(*p);
+                        if (!batch.empty())
+                            p->sink(std::move(batch));
+                    }
+                } catch (...) {
+                    auto lock = std::lock_guard{p->wake};
+                    p->error = std::current_exception();
+                }
+            });
+        }
         pending->ready.notify_one();
-}
-
-void GitObjectStore::Hold::drain() const
-{
-    drainPending(*pending);
+    }
+    return std::nullopt;
 }
 
 void GitObjectStore::Hold::flush() const
 {
     if (!pending->sink)
         return;
+    auto batch = takeRows();
+    if (!batch.empty())
+        pending->sink(std::move(batch));
+}
+
+std::vector<GitObjectStore::Hold::Row> GitObjectStore::Hold::takeRows() const
+{
     if (pending->writer.joinable()) {
         {
             auto lock = std::lock_guard{pending->wake};
@@ -340,16 +382,19 @@ void GitObjectStore::Hold::flush() const
         pending->ready.notify_all();
         pending->writer.join();
     }
-    /* Only what arrived after the writer's last drain: tens of rows. */
-    drain();
+    if (pending->error)
+        std::rethrow_exception(pending->error);
+    return takePending(*pending);
 }
 
 std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, bool executable) const
 {
-    auto & shard = pending->shards[shardOf(id)];
-    auto lock = std::lock_guard{shard.mutex};
-    auto i = shard.byKey.find(pendingKey(id, executable));
-    if (i == shard.byKey.end())
+    auto * shard = pending->shards[shardOf(id)].load(std::memory_order_acquire);
+    if (!shard)
+        return std::nullopt;
+    auto lock = std::lock_guard{shard->mutex};
+    auto i = shard->byKey.find(pendingKey(id, executable));
+    if (i == shard->byKey.end())
         return std::nullopt;
     return i->second.empty() ? pending->root.string() : (pending->root / i->second).string();
 }
@@ -376,8 +421,8 @@ GitObjectStore::Hold::Hold(const std::filesystem::path & tmp, const std::functio
        The name is unique to this process and this hold, so the lock is
        never contended by another maker; the sweep only tries it.
 
-       The directory is made *empty* and its three kind directories made
-       under the lock, so that a hold under `tmp/` whose lock is free is
+       The directory is made empty and its kind/shard directories made
+       on demand under the lock, so that a hold under `tmp/` whose lock is free is
        either empty -- its maker between this `mkdir` and this `flock` --
        or a dead ingestion's, and the sweep's rule, "remove a hold you can
        lock, with its links", is right for both: it takes an empty
@@ -405,8 +450,6 @@ GitObjectStore::Hold::Hold(const std::filesystem::path & tmp, const std::functio
             atHoldMade();
         if (!lockFile(fd.get(), ltWrite, true) || !pathExists(dir))
             continue;
-        for (auto & sub : {"blobs", "blobs-x", "trees"})
-            createDirs(dir / sub);
         return;
     }
 }
@@ -426,6 +469,42 @@ GitObjectStore::Hold GitObjectStore::Hold::ownRows() const
 }
 
 GitObjectStore::Hold::Hold(Hold &&) = default;
+
+#ifndef _WIN32
+/* A live hold's writers have joined before release. Its directories are
+   writable and its files are auxiliary hard links: no permission changes
+   or estimate of freed bytes is needed. Generic deletePath stats every
+   link for those purposes. Unlink directly, opening only directories and
+   never following symlinks. Dead or partially removed holds still use the
+   collector's general deletion path. */
+static void releaseHoldContents(Descriptor fd)
+{
+    AutoCloseFD scan{dup(fd)};
+    if (!scan)
+        throw SysError("duplicating hold directory descriptor");
+    AutoCloseDir entries{fdopendir(scan.get())};
+    if (!entries)
+        throw SysError("reading hold directory");
+    scan.release();
+    struct dirent * entry;
+    while (errno = 0, entry = readdir(entries.get())) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+            continue;
+        if (unlinkat(fd, entry->d_name, 0) == 0 || errno == ENOENT)
+            continue;
+        if (errno != EISDIR && errno != EPERM)
+            throw SysError("unlinking hold entry '%s'", entry->d_name);
+        AutoCloseFD child{openat(fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
+        if (!child)
+            throw SysError("opening hold directory '%s'", entry->d_name);
+        releaseHoldContents(child.get());
+        if (unlinkat(fd, entry->d_name, AT_REMOVEDIR) == -1 && errno != ENOENT)
+            throw SysError("removing hold directory '%s'", entry->d_name);
+    }
+    if (errno)
+        throw SysError("reading hold directory");
+}
+#endif
 
 GitObjectStore::Hold::~Hold()
 {
@@ -448,7 +527,13 @@ GitObjectStore::Hold::~Hold()
     if (!fd)
         return;
     try {
+#ifndef _WIN32
+        releaseHoldContents(fd.get());
+        if (::rmdir(dir.c_str()) == -1 && errno != ENOENT)
+            throw SysError("removing hold %s", PathFmt(dir));
+#else
         deletePath(dir);
+#endif
     } catch (...) {
         ignoreExceptionInDestructor();
     }
@@ -456,9 +541,24 @@ GitObjectStore::Hold::~Hold()
 
 std::filesystem::path GitObjectStore::Hold::linkFor(const std::filesystem::path & object) const
 {
-    /* `<kind>/<shard>/<id>`: the kind is two components up, and the hold
-       itself is flat under the kind (it never holds many links). */
-    return dir / object.parent_path().parent_path().filename() / object.filename();
+    /* Keep the hold's layout sharded too: a full source can hold tens of
+       thousands of trees. Its one lock protects the entire hierarchy,
+       and both normal release and the stale-hold sweep remove it recursively. */
+    auto shard = object.parent_path().filename();
+    auto kind = object.parent_path().parent_path().filename();
+    auto parent = dir / kind / shard;
+    auto shardName = shard.string();
+    assert(isShardName(shardName));
+    auto digit = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+    size_t n = digit(shardName[0]) * 16 + digit(shardName[1]);
+    if (kind == "blobs-x")
+        n += 256;
+    else if (kind == "trees")
+        n += 512;
+    else
+        assert(kind == "blobs");
+    std::call_once(pending->auxiliaryShards[n], [&] { createDirs(parent); });
+    return parent / object.filename();
 }
 
 GitObjectStore::Hold GitObjectStore::hold() const
@@ -671,6 +771,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
 
     /* This ingestion's own earlier file for the blob comes first (law 3
        within one path), then the index's holder. */
+    bool replace = false;
     if (auto mine = hold.pendingHolder(id, executable)) {
         if (auto st = maybeLstatOf(*mine)) {
             if (st->st_ino == before.st_ino)
@@ -678,6 +779,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
             if (auto placed = linkOver(*mine))
                 return placed;
         }
+        replace = true;
     } else if (auto holder = holderOrForget(id, executable, repair)) {
         if (holder->ino == before.st_ino)
             return Placed{before.st_ino, false};
@@ -695,7 +797,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
         printInfo("cannot enter %s: %s", PathFmt(where), std::make_error_code(std::errc::no_space_on_device).message());
         return std::nullopt;
     }
-    hold.addRow(
+    auto other = hold.addRow(
         Hold::Row{
             .id = id,
             .executable = executable,
@@ -703,7 +805,10 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
             .dev = before.st_dev,
             .size = static_cast<uint64_t>(before.st_size),
             .name = nameUnderRoot(where, hold.root()),
-        });
+        },
+        replace);
+    if (other)
+        return linkOver(*other);
     return Placed{before.st_ino, true};
 #endif
 }
@@ -721,11 +826,9 @@ void GitObjectStore::enterWritten(
 #ifndef _WIN32
     /* The file was written because the store had no holder for its blob.
        It becomes the holder: one `fstatat` for its inode and a pending
-       row, and *no* `linkat` -- which is the 0.19-0.21 s per 40 000 files
-       this design removes (design.md section 0).  Should a holder have
-       appeared meanwhile the decision is `place`'s; it is taken when the
-       row is written, since a later row for one key wins and the file
-       that stands is this one either way. */
+       row, and no `linkat` on a miss. Publication into the pending set is
+       atomic: an earlier lookup miss cannot rule out another worker
+       completing the same blob before this file was written. */
     PosixStat st;
     if (fstatat(dirFd, name.rel_c_str(), &st, AT_SYMLINK_NOFOLLOW) == -1)
         throw SysError("getting status of %1%", PathFmt(where));
@@ -736,7 +839,7 @@ void GitObjectStore::enterWritten(
        first entry of a fresh tree at one index probe a file. */
     if (!looked && place(id, executable, dirFd, name, where, st, repair, hold))
         return;
-    hold.addRow(
+    auto other = hold.addRow(
         Hold::Row{
             .id = id,
             .executable = executable,
@@ -745,12 +848,15 @@ void GitObjectStore::enterWritten(
             .size = static_cast<uint64_t>(st.st_size),
             .name = nameUnderRoot(where, hold.root()),
         });
+    if (other)
+        place(id, executable, dirFd, name, where, st, repair, hold);
 #endif
 }
 
 /* Write a file's bytes to the fresh temporary file `tmp`, canonicalised,
    link it into place and hold it; an entry that appeared meanwhile stands,
-   and is held instead.  The temporary file is removed however this ends.
+   and is held instead. A successfully published temporary stays in the
+   hold as its protecting link; every unsuccessful one is removed.
    Under `fsync` the file -- its bytes and its canonical mode and
    timestamp, which are set first so that the flush covers them (fsync(2)
    flushes the file's data and metadata) -- is flushed before it is
@@ -759,7 +865,7 @@ void GitObjectStore::enterWritten(
    The invariant (`08` K16): the object file is never at one link without
    a hold while its ingestion is in flight.  It is linked into place while
    the temporary still links the same inode, so it has two links from its
-   first instant, and the hold's link is made before the temporary goes;
+   first instant, and the temporary itself is the hold's link;
    an existing file is held before it is trusted, and one the sweep took
    between the look and the link is written afresh. */
 static void writeObjectFile(
@@ -771,7 +877,10 @@ static void writeObjectFile(
     const GitObjectStore::Hold & hold,
     const std::function<void(const std::filesystem::path &)> & atFsync)
 {
+    bool published = false;
     Finally removeTmp{[&] {
+        if (published)
+            return;
         try {
             unlinkIfExists(tmp);
         } catch (...) {
@@ -794,7 +903,11 @@ static void writeObjectFile(
             if (!fd)
                 throw SysError("creating file %1%", PathFmt(tmp));
             writeFull(fd.get(), bytes);
+#ifdef _WIN32
             canonicaliseTimestampAndPermissions(tmp);
+#else
+            canonicaliseTimestampAndPermissions(fd.get(), executable);
+#endif
             if (fsync) {
                 if (atFsync)
                     atFsync(tmp);
@@ -821,9 +934,11 @@ static void writeObjectFile(
             }
             throw Error("creating hard link from %1% to %2%: %3%", PathFmt(tmp), PathFmt(dst), ec.message());
         }
-        /* Two links now (`tmp` and `dst`); the hold's makes it three
-           before `tmp` goes. */
-        holdObject(dst, hold);
+        /* The temporary is inside the locked hold. Keep it as the
+           protecting link: publication already leaves two links, with
+           no interval in which GC can take the object. A unique name
+           also keeps concurrent writers from reading a partial file. */
+        published = true;
         if (fsync)
             syncParent(dst);
         return;
@@ -833,12 +948,16 @@ static void writeObjectFile(
 
 void GitObjectStore::putBlob(const Hash & id, bool executable, std::string_view bytes, const Hold & hold)
 {
-    writeObjectFile(tempPath("object"), blobFile(id, executable), bytes, executable, fsync, hold, atFsync);
+    auto dst = blobFile(id, executable);
+    auto tmp = hold.linkFor(dst).parent_path() / tempPath("object").filename();
+    writeObjectFile(tmp, dst, bytes, executable, fsync, hold, atFsync);
 }
 
 void GitObjectStore::putTree(const Hash & id, std::string_view body, const Hold & hold)
 {
-    writeObjectFile(tempPath("object"), treeFile(id), body, false, fsync, hold, atFsync);
+    auto dst = treeFile(id);
+    auto tmp = hold.linkFor(dst).parent_path() / tempPath("object").filename();
+    writeObjectFile(tmp, dst, body, false, fsync, hold, atFsync);
 }
 
 void GitObjectStore::putRootTree(const merkle::TreeEntry & root, const Hold & hold)

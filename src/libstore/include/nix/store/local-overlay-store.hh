@@ -175,6 +175,8 @@ private:
      */
     void registerValidPaths(const ValidPathInfos & infos) override;
 
+    void registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold) override;
+
     /**
      * Check lower store if upper DB does not have.
      */

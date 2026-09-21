@@ -293,6 +293,10 @@ public:
 
     StorePathSet queryAllValidPaths() override;
 
+    /** Whether any path is registered, without enumerating the set.
+     * A false answer is not retained across another store operation. */
+    bool hasValidPaths();
+
     /**
      * The row, migrated (`migratedPathInfo`): a schema-10 row is given
      * its object hash by one walk of the path, outside the database lock,
@@ -497,7 +501,8 @@ public:
         bool startFsync,
         RestoreSinkHooks * hooks,
         const GitObjectStore::Hold & hold,
-        RepairFlag repair = NoRepair);
+        RepairFlag repair = NoRepair,
+        Sink * rootContents = nullptr);
 
     /**
      * What the naming of a source knows about the tree being copied, as
@@ -680,6 +685,11 @@ public:
      */
     void registerValidPath(const ValidPathInfo & info);
 
+    /** Register a path and its remaining holder rows atomically. */
+    void registerValidPath(const ValidPathInfo & info, const GitObjectStore::Hold & hold);
+
+    virtual void registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold);
+
     virtual void registerValidPaths(const ValidPathInfos & infos);
 
     unsigned int getProtocol() override;
@@ -745,23 +755,24 @@ private:
 
 public:
     /**
-     * The ingestion's row in `Ingestions`, made with no path, and the sink
-     * the copy's workers hand their batches of index rows to: called before
-     * the walk, with the directory the ingestion writes under.  Until
-     * `endIngestion` names the path, every row written against it is stale
-     * -- invisible to `link`, removed by the sweep (`schema.sql`).
+     * Prepare the sink the copy's workers hand index rows to. The first
+     * flush creates its `Ingestions` row. Before registration it has no
+     * path, so its rows remain invisible to `link` (`schema.sql`).
      */
     void beginIngestion(const GitObjectStore::Hold & hold, const std::filesystem::path & root);
 
     /**
-     * The rows the walk has not handed over yet, and then the one update
-     * that gives this ingestion its path -- which makes every one of its
-     * rows true at once, so the registration pays no per-blob work.
+     * Publish the remaining rows after path registration. An ingestion
+     * that has not flushed yet inserts its rows and path together; one
+     * that flushed during copying also updates its earlier ingestion row.
      */
     void endIngestion(const GitObjectStore::Hold & hold, const StorePath & path);
 
     /** One batch of index rows, in key order.  The sink `beginIngestion` installs. */
-    void writeBlobRows(uint64_t ingestion, std::vector<GitObjectStore::Hold::Row> & batch);
+    void writeBlobRows(
+        GitObjectStore::Hold::Ingestion & ingestion,
+        const std::string & holdName,
+        std::vector<GitObjectStore::Hold::Row> & batch);
 
 private:
     /**
@@ -783,6 +794,7 @@ private:
     std::mutex blobWriterMutex;
     std::unique_ptr<SQLite> blobWriterDb;
     std::unique_ptr<SQLiteStmt> blobWriterInsert;
+    std::unique_ptr<SQLiteStmt> blobWriterNewIngestion;
 
     /** The writer's connection, opened if it is not open yet. */
     void openBlobWriter();

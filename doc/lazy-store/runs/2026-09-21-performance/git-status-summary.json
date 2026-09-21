@@ -1,0 +1,8 @@
+{
+  "cases": 15552,
+  "elapsed_s": 489.4131759130396,
+  "all_equal": true,
+  "sha256_complete_records": "b199da91d6c22f35d09b5d15562f62510e37d7ace020f45451074278f648094c",
+  "all_returncodes_zero": true,
+  "worktree_gitlinks": "initialized nested repositories"
+}

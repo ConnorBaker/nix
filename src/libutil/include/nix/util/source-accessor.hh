@@ -5,6 +5,7 @@
 #include "nix/util/canon-path.hh"
 #include "nix/util/fun.hh"
 #include "nix/util/hash.hh"
+#include "nix/util/merkle-files.hh"
 #include "nix/util/ref.hh"
 
 namespace nix {
@@ -167,6 +168,16 @@ public:
         callback(*this, dirPath);
     }
 
+    /** List and scope the same opened directory for a recursive walk. */
+    virtual void readDirectoryWithEntries(
+        const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback)
+    {
+        auto entries = readDirectory(path);
+        readDirectory(path, [&](SourceAccessor & accessor, const CanonPath & relative) {
+            callback(accessor, relative, entries);
+        });
+    }
+
     virtual std::string readLink(const CanonPath & path) = 0;
 
     virtual void dumpPath(const CanonPath & path, Sink & sink, PathFilter & filter = defaultPathFilter);
@@ -212,6 +223,20 @@ public:
      * accessor. This is used for caching lookups (see `fetchToStore()`).
      */
     std::optional<std::string> fingerprint;
+
+    /**
+     * A canonical SHA-256 entry established by the producer of this view.
+     * This is a fact about the bytes, not a hash asserted by an input or a
+     * Git object ID whose modes/rendering have not been canonicalised.
+     * Wrappers may forward it only when they preserve the entire subtree.
+     * Verification and repair must still read the bytes.
+     */
+    std::optional<merkle::TreeEntry> knownRoot;
+
+    virtual std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path)
+    {
+        return path.isRoot() ? knownRoot : std::nullopt;
+    }
 
     /**
      * Return the fingerprint for `path`. This is usually the

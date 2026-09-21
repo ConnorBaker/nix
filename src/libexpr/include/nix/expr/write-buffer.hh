@@ -31,6 +31,11 @@ namespace nix {
  */
 struct NarOfString : Source
 {
+    bool isInMemory() const override
+    {
+        return true;
+    }
+
     explicit NarOfString(std::shared_ptr<const std::string> contents);
 
     size_t read(char * data, size_t len) override;
@@ -167,7 +172,8 @@ public:
 private:
     /**
      * What is kept for one object between its creation and its write: its
-     * bytes, its references, and the two hashes computed to name it.  The
+     * bytes, its references, and the text hash computed to name it. The
+     * blob hash is needed only when a missing object is flushed. The
      * `ValidPathInfo` an eager write registers is built from these at the
      * flush, by the call that named the path, so that the description and
      * the name are one equation (`04-derivation.md` 1.1).
@@ -182,8 +188,6 @@ private:
         StorePathSet references;
         /** `hashString(SHA256, *contents)`: the text content address. */
         Hash textHash;
-        /** `merkle::blobId(*contents)`: a flat file's object hash. */
-        ObjectHash objectHash;
         bool repair;
         /** Scratch for the flush's reference-order walk. */
         bool emitted;

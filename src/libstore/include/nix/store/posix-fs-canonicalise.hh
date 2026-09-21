@@ -8,6 +8,7 @@
 #include <memory>
 
 #include "nix/util/types.hh"
+#include "nix/util/file-descriptor.hh"
 #include "nix/util/error.hh"
 #include "nix/store/config.hh"
 
@@ -71,6 +72,11 @@ void canonicalisePathMetaData(
 void canonicalisePathMetaData(const std::filesystem::path & path, CanonicalizePathMetadataOptions options);
 
 void canonicaliseTimestampAndPermissions(const std::filesystem::path & path);
+
+#ifndef _WIN32
+/** Canonicalise an already-open regular file or directory of known mode. */
+void canonicaliseTimestampAndPermissions(Descriptor fd, bool executable);
+#endif
 
 class RestoreSinkHooks;
 

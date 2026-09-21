@@ -5,6 +5,7 @@
 #include "nix/util/signals.hh"
 
 #ifdef __linux__
+#  include "nix/util/processes.hh"
 #  include <sys/vfs.h>
 #endif
 
@@ -73,19 +74,23 @@ SQLite::SQLite(const std::filesystem::path & path, Settings && settings)
     // Remove this workaround when a fix is widely installed, perhaps 2027? Candidate:
     // https://github.com/search?q=repo%3Aopenzfs%2Fzfs+%22Linux%3A+zfs_putpage%3A+complete+async+page+writeback+immediately%22&type=commits
 #ifdef __linux__
-    try {
-        auto shmFile = path;
-        shmFile += "-shm";
-        AutoCloseFD fd = open(shmFile.string().c_str(), O_RDWR | O_CLOEXEC);
-        if (fd) {
-            struct statfs fs;
-            if (fstatfs(fd.get(), &fs))
-                throw SysError("statfs() on %s", PathFmt(shmFile));
-            if (fs.f_type == /* ZFS_SUPER_MAGIC */ 801189825 && fdatasync(fd.get()) != 0)
-                throw SysError("fsync() on %s", PathFmt(shmFile));
-        }
-    } catch (...) {
-        throw;
+    auto shmFile = path.string() + "-shm";
+    struct statfs fs;
+    if (statfs(shmFile.c_str(), &fs) == 0 && fs.f_type == /* ZFS_SUPER_MAGIC */ 801189825) {
+        /* Never open and close this inode in the SQLite process: POSIX
+           close() releases ALL of its fcntl locks on that inode, including
+           another connection's WAL locks. Another process could then
+           truncate shared memory still mapped here, causing SIGBUS.
+           A child does not inherit those locks, so its close is harmless.
+           https://sqlite.org/howtocorrupt.html#posix_advisory_locks_canceled_by_a_separate_thread_doing_close_ */
+        Pid child = startProcess([&] {
+            AutoCloseFD fd = open(shmFile.c_str(), O_RDWR | O_CLOEXEC);
+            if (fd && fdatasync(fd.get()) != 0)
+                _exit(1);
+            _exit(0);
+        });
+        if (child.wait() != 0)
+            throw Error("syncing SQLite shared memory '%s'", shmFile);
     }
 #endif
 

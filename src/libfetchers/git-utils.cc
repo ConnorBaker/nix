@@ -985,17 +985,11 @@ public:
         if (mode == GIT_FILEMODE_TREE)
             return Stat{.type = tDirectory};
 
-        else if (mode == GIT_FILEMODE_BLOB || mode == GIT_FILEMODE_BLOB_EXECUTABLE) {
-            /* The size from the object's header, without inflating it. */
-            ObjectDb odb;
-            if (git_repository_odb(Setter(odb), *state->repo))
-                throw GitError("getting Git object database");
-            size_t size;
-            git_object_t type;
-            if (git_odb_read_header(&size, &type, odb.get(), git_tree_entry_id(entry)))
-                throw GitError("reading the header of object %s", toHash(*git_tree_entry_id(entry)).gitRev());
-            return Stat{.type = tRegular, .fileSize = size, .isExecutable = mode == GIT_FILEMODE_BLOB_EXECUTABLE};
-        }
+        else if (mode == GIT_FILEMODE_BLOB || mode == GIT_FILEMODE_BLOB_EXECUTABLE)
+            /* Size is optional in Stat. Reading a packed delta's header
+               can inflate its delta chain; readFile announces the size
+               when the caller actually needs the contents. */
+            return Stat{.type = tRegular, .isExecutable = mode == GIT_FILEMODE_BLOB_EXECUTABLE};
 
         else if (mode == GIT_FILEMODE_LINK)
             return Stat{.type = tSymlink};
@@ -1042,7 +1036,6 @@ public:
 
                     for (size_t n = 0; n < count; ++n) {
                         auto entry = git_tree_entry_byindex(tree.get(), n);
-                        // FIXME: add to cache
                         /* Typed from the mode the entry carries, so a
                            consumer that wants the types (`builtins.readDir`
                            attaches a `readFileType` lookup to every untyped
@@ -1062,6 +1055,27 @@ public:
         StringSink s;
         readBlob(path, true, s, [&](uint64_t size) { s.s.reserve(size); });
         return std::move(s.s);
+    }
+
+    std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
+    {
+        auto state(state_.lock());
+        if (!state->repo->options.canonicalObjects || state->options.smudgeLfs
+            || git_object_id(state->root.get())->type != GIT_OID_SHA256)
+            return std::nullopt;
+        if (path.isRoot())
+            return merkle::TreeEntry{
+                .mode = git_object_type(state->root.get()) == GIT_OBJECT_TREE ? merkle::Mode::Directory
+                                                                              : merkle::Mode::Regular,
+                .hash = toHash(*git_object_id(state->root.get())),
+            };
+        auto entry = lookup(*state, path);
+        if (!entry)
+            return std::nullopt;
+        auto mode = merkle::decodeMode(git_tree_entry_filemode_raw(entry));
+        if (!mode)
+            return std::nullopt;
+        return merkle::TreeEntry{.mode = *mode, .hash = toHash(*git_tree_entry_id(entry))};
     }
 
     /**
@@ -1140,14 +1154,18 @@ public:
         return toHash(*git_tree_entry_id(entry));
     }
 
-    boost::unordered_flat_map<CanonPath, TreeEntry> lookupCache;
+    /* Entries borrow from the immutable trees retained here (or root).
+       Listing a directory retains its parsed tree, not a duplicate of
+       every child entry. A later lookup uses libgit2's name search. */
+    boost::unordered_flat_map<CanonPath, Tree> treeCache;
+    boost::unordered_flat_map<CanonPath, const git_tree_entry *> lookupCache;
 
     /* Recursively look up 'path' relative to the root. */
-    git_tree_entry * lookup(State & state, const CanonPath & path)
+    const git_tree_entry * lookup(State & state, const CanonPath & path)
     {
         auto i = lookupCache.find(path);
         if (i != lookupCache.end())
-            return i->second.get();
+            return i->second;
 
         auto parent = path.parent();
         if (!parent)
@@ -1159,34 +1177,15 @@ public:
         if (!parentTree)
             return nullptr;
 
-        auto count = git_tree_entrycount(parentTree->get());
-
-        git_tree_entry * res = nullptr;
-
-        /* Add all the tree entries to the cache to speed up
-           subsequent lookups. */
-        for (size_t n = 0; n < count; ++n) {
-            auto entry = git_tree_entry_byindex(parentTree->get(), n);
-
-            TreeEntry copy;
-            if (git_tree_entry_dup(Setter(copy), entry))
-                throw GitError("dupping tree entry");
-
-            auto entryName = std::string_view(git_tree_entry_name(entry));
-
-            if (entryName == name)
-                res = copy.get();
-
-            auto path2 = *parent;
-            path2.push(entryName);
-            lookupCache.emplace(path2, std::move(copy));
-        }
-
+        auto res = git_tree_entry_byname(parentTree->get(), std::string(name).c_str());
+        lookupCache.emplace(path, res);
         return res;
     }
 
     std::optional<Tree> lookupTree(State & state, const CanonPath & path)
     {
+        if (auto i = treeCache.find(path); i != treeCache.end())
+            return dupObject<Tree>(i->second.get());
         if (path.isRoot()) {
             if (git_object_type(state.root.get()) == GIT_OBJECT_TREE)
                 return dupObject<Tree>((git_tree *) &*state.root);
@@ -1202,10 +1201,11 @@ public:
         if (git_tree_entry_to_object((git_object **) (git_tree **) Setter(tree), *state.repo, entry))
             throw GitError("looking up directory '%s'", showPath(path));
 
+        treeCache.emplace(path, dupObject<Tree>(tree.get()));
         return tree;
     }
 
-    git_tree_entry * need(State & state, const CanonPath & path)
+    const git_tree_entry * need(State & state, const CanonPath & path)
     {
         auto entry = lookup(state, path);
         if (!entry)
@@ -1233,11 +1233,7 @@ public:
         if (git_tree_entry_type(entry) != GIT_OBJECT_TREE)
             throw Error("'%s' is not a directory", showPath(path));
 
-        Tree tree;
-        if (git_tree_entry_to_object((git_object **) (git_tree **) Setter(tree), *state.repo, entry))
-            throw GitError("looking up directory '%s'", showPath(path));
-
-        return tree;
+        return std::move(*lookupTree(state, path));
     }
 
     Blob getBlob(State & state, const CanonPath & path, bool expectSymlink)
@@ -2211,6 +2207,7 @@ static GitRepo::Options tarballCacheOptions(const Settings & settings)
         .dontFindDeltas = true,
         /* A tarball's tree identifier is then the store's name for it. */
         .oidType = HashAlgorithm::SHA256,
+        .canonicalObjects = true,
     };
 }
 

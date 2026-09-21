@@ -105,6 +105,12 @@ StringMap unhackedEntries(
     const CanonPath & path,
     const std::function<void(const std::string & name, bool isDirectory)> & typed = {});
 
+StringMap unhackedEntries(
+    const SourceAccessor::DirEntries & entries,
+    SourceAccessor & accessor,
+    const CanonPath & path,
+    const std::function<void(const std::string & name, bool isDirectory)> & typed = {});
+
 /**
  * Dump an archive with a single file with these contents.
  *

@@ -75,6 +75,13 @@ public:
         return target;
     }
 
+    void readDirectoryWithEntries(
+        const CanonPath & path,
+        std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+    {
+        next->readDirectoryWithEntries(path, std::move(callback));
+    }
+
     std::string showPath(const CanonPath & path) override
     {
         return next->showPath(path);
@@ -95,6 +102,11 @@ public:
     std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
     {
         return next->getFingerprint(path);
+    }
+
+    std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
+    {
+        return next->getKnownEntry(path);
     }
 };
 

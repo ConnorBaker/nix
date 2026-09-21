@@ -1,4 +1,5 @@
 #include "nix/fetchers/fetch-to-store.hh"
+#include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/fetchers/filtering-source-accessor.hh"
 #include "nix/fetchers/cache.hh"
@@ -21,6 +22,9 @@
 #include <atomic>
 #include <functional>
 #include <vector>
+#ifndef _WIN32
+#  include <sys/stat.h>
+#endif
 
 #include <exception> // IWYU pragma: keep (Needed by rapidcheck on Darwin and FreeBSD)
 #include <gtest/gtest.h>
@@ -217,13 +221,10 @@ RC_GTEST_PROP(FetchToStore, prop_filtered_names_are_sound, ())
     RC_ASSERT(full->getFingerprint(CanonPath::root).second != name1.second);
 }
 
-/* The memo's rows are the naming walk's own, held and handed to the cache
-   in batches (`01` section 10, *A memo row's rule says what it means, not
-   when it is written*).  What the rule requires of the batching is that
-   when the walk returns, every node it named is readable -- not the root
-   alone, whose row `recordRootEntry` writes by itself, so the node checked
-   here is a subtree. */
-TEST_F(FetchToStoreTest, everyNamedNodeIsReadableWhenTheWalkReturns)
+/* Whole-view fingerprints cache each requested subtree. Descendants are
+   not independently reusable across revisions of that view, so merely
+   visiting one no longer eagerly constructs its persistent cache row. */
+TEST_F(FetchToStoreTest, everyRequestedSubtreeIsReadableWhenTheWalkReturns)
 {
     auto store = openStore("dummy://?read-only=false");
     fetchers::Settings settings;
@@ -235,6 +236,9 @@ TEST_F(FetchToStoreTest, everyNamedNodeIsReadableWhenTheWalkReturns)
     auto [subpath, name] = tree->getFingerprint(CanonPath("keep"));
     ASSERT_TRUE(name);
     auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(*name, git, subpath));
+    EXPECT_FALSE(row);
+    fetchToStore2(settings, *store, SourcePath(tree, CanonPath("keep")), FetchMode::DryRun, "src", git);
+    row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(*name, git, subpath));
     ASSERT_TRUE(row);
     EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), objectHashOf(*tree, CanonPath("keep")).root.hash);
 
@@ -405,6 +409,132 @@ protected:
         TempLocalStoreTest::SetUp();
     }
 };
+
+#ifndef _WIN32
+TEST_F(FetchToStoreLocalTest, pathInputsPreserveTheTreeForEveryStoreStateAndWidth)
+{
+    auto savedFeatures = experimentalFeatureSettings.experimentalFeatures.get();
+    Finally restoreFeatures{[&] { experimentalFeatureSettings.experimentalFeatures = savedFeatures; }};
+    auto features = savedFeatures;
+    features.insert(Xp::Flakes);
+    experimentalFeatureSettings.experimentalFeatures = features;
+    auto inputDir = tempStoreDir.path() / "capture-source";
+    createDirs(inputDir / "empty");
+    for (size_t i = 0; i < 16; ++i) {
+        auto dir = inputDir / fmt("nested/d%d", i);
+        createDirs(dir);
+        writeFile(dir / "plain", fmt("file %d", i));
+        writeFile(dir / "exec", "executable");
+        chmod(dir / "exec", 0755);
+        createSymlink("plain", dir / "link");
+    }
+    auto input = fetchers::Input::fromAttrs({{"type", "path"}, {"path", inputDir.string()}});
+    fetchers::Settings fetchSettings;
+    Finally restoreWorkers{
+        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+    for (size_t size : {size_t(4096), size_t(65 * 1024 * 1024)}) {
+        writeFile(inputDir / "large", std::string(size, 'q'));
+        for (size_t workers = 1; workers <= 8; ++workers) {
+            SCOPED_TRACE(fmt("size=%d workers=%d", size, workers));
+            LocalStore::copyWorkersForTest.store(workers);
+            auto destinationConfig = std::make_shared<LocalStoreConfig>(
+                tempStoreDir.path() / fmt("destination-%d-%d", size, workers), StoreConfig::Params{});
+            auto destination = std::make_shared<LocalStore>(ref{destinationConfig});
+            ASSERT_FALSE(destination->hasValidPaths());
+            for (size_t state = 0; state < 3; ++state) {
+                SCOPED_TRACE(fmt("state=%d (empty miss, populated hit, populated miss)", state));
+                if (state == 2)
+                    writeFile(inputDir / "nested/d0/plain", fmt("changed-%d-%d", size, workers));
+                if (size == 4096) {
+                    auto bad = inputDir / "nested/d7/unsupported";
+                    ASSERT_EQ(mkfifo(bad.c_str(), 0600), 0);
+                    EXPECT_THROW(input.getAccessor(fetchSettings, *destination), Error);
+                    EXPECT_EQ(destination->hasValidPaths(), state != 0);
+                    std::filesystem::remove(bad);
+                }
+                HashSink expected{HashAlgorithm::SHA256};
+                makeFSSourceAccessor(inputDir)->dumpPath(CanonPath::root, expected);
+                auto [accessor, fetched] = input.getAccessor(fetchSettings, *destination);
+                HashSink actual{HashAlgorithm::SHA256};
+                accessor->dumpPath(CanonPath::root, actual);
+                EXPECT_EQ(actual.finish().hash, expected.finish().hash);
+                EXPECT_TRUE(destination->hasValidPaths());
+            }
+        }
+    }
+}
+#endif
+
+TEST_F(FetchToStoreLocalTest, knownEntriesPreserveEveryRootKindAndRepairReadsTheSource)
+{
+    for (auto kind :
+         {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink, merkle::Mode::Directory}) {
+        SCOPED_TRACE(static_cast<RawMode>(kind));
+        auto tree = make_ref<NamedCountingAccessor>();
+        MemorySink sink{*tree};
+        if (kind == merkle::Mode::Symlink)
+            sink.createSymlink(CanonPath::root, "target");
+        else {
+            if (kind == merkle::Mode::Directory)
+                sink.createDirectory(CanonPath::root);
+            sink.createRegularFile(
+                kind == merkle::Mode::Directory ? CanonPath("child") : CanonPath::root,
+                [&](CreateRegularFileSink & file) {
+                    if (kind == merkle::Mode::Executable)
+                        file.isExecutable();
+                    file("contents");
+                });
+        }
+        auto entry = objectHashOf(*tree, CanonPath::root).root;
+        tree->knownRoot = entry;
+        tree->reads = 0;
+        fetchers::Settings settings;
+        auto named = fetchToStore2(settings, *store, SourcePath(tree), FetchMode::DryRun, "known");
+        EXPECT_EQ(named.second, merkle::objectHash(entry));
+        EXPECT_EQ(tree->reads, 0u);
+        auto copied = fetchToStore2(settings, *store, SourcePath(tree), FetchMode::Copy, "known");
+        EXPECT_EQ(copied, named);
+        auto stored = store->requireStoreObjectAccessor(copied.first);
+        EXPECT_TRUE(stored->getFingerprint(CanonPath::root).second);
+        EXPECT_EQ(objectHashOf(*stored, CanonPath::root).root, entry);
+        tree->reads = 0;
+        fetchers::Settings fresh;
+        EXPECT_EQ(fetchToStore2(fresh, *store, SourcePath(tree), FetchMode::Copy, "known"), named);
+        EXPECT_EQ(tree->reads, 0u);
+
+        /* A repair must bypass both the process cache and the known entry.
+           Changing a regular holder in place also tests repair's refusal
+           to relink its corrupt bytes over the fresh source. */
+        if (kind != merkle::Mode::Symlink) {
+            auto physical = store->toRealPath(copied.first);
+            if (kind == merkle::Mode::Directory)
+                physical /= "child";
+            std::filesystem::permissions(
+                physical, std::filesystem::perms::owner_write, std::filesystem::perm_options::add);
+            writeFile(physical, "corrupt!");
+        }
+        EXPECT_EQ(fetchToStore2(fresh, *store, SourcePath(tree), FetchMode::Copy, "known", {}, nullptr, Repair), named);
+        if (kind != merkle::Mode::Symlink)
+            EXPECT_GT(tree->reads, 0u);
+        EXPECT_EQ(objectHashOf(*store->requireStoreObjectAccessor(copied.first), CanonPath::root).root, entry);
+    }
+}
+
+TEST_F(FetchToStoreTest, filteringAndGraftsInvalidateKnownDirectoryEntries)
+{
+    auto store = openStore("dummy://?read-only=false");
+    auto tree = namedTree("known-filter-root");
+    tree->knownRoot = objectHashOf(*tree, CanonPath::root).root;
+    fetchers::Settings settings;
+    auto filtered = fetchToStore2(settings, *store, SourcePath(tree), FetchMode::DryRun, "filtered", {}, &rejectDrop);
+    EXPECT_EQ(filtered.second, merkle::objectHash(objectHashOf(*tree, CanonPath::root, rejectDrop).root));
+    EXPECT_NE(filtered.second, merkle::objectHash(*tree->knownRoot));
+    auto graft = namedTree("graft");
+    auto mounted = makeMountedSourceAccessor({{CanonPath::root, tree}, {CanonPath("keep"), graft}});
+    EXPECT_FALSE(mounted->getKnownEntry(CanonPath::root));
+    auto result = fetchToStore2(settings, *store, SourcePath(mounted), FetchMode::DryRun, "grafted");
+    EXPECT_EQ(result.second, merkle::objectHash(objectHashOf(*mounted, CanonPath::root).root));
+}
 
 /* The second route of 01 §9.10 through `fetchToStore2`: a copy into a
    local store under the git method is made from the store's own objects

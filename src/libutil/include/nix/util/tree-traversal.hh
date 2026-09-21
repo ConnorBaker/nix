@@ -126,11 +126,6 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
             /* The entries and, from the same listing, which of them the
                accessor typed as directories -- advisory, and read by a
                visitor that may walk siblings on a pool (`Children`). */
-            std::set<std::string, std::less<>> subdirs;
-            auto unhacked = unhackedEntries(acc, from, [&](const std::string & name, bool isDirectory) {
-                if (isDirectory)
-                    subdirs.insert(name);
-            });
             auto filterBase = path / to;
             /* The accessor is scoped around the *whole* of `v.directory`,
                not around the loop alone: an accessor's scoped form may be
@@ -141,15 +136,25 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                the scope must outlive every visit, and the only bound that
                does is the directory node itself. */
             std::optional<Result> result;
-            acc.readDirectory(from, [&](SourceAccessor & subdirAccessor, const CanonPath & subdirFrom) {
-                result = v.directory(to, [&](fun<void(std::string_view, bool, fun<Result()>)> each) {
-                    for (auto & [name, actual] : unhacked)
-                        if (filter((filterBase / name).abs()))
-                            each(name, subdirs.contains(name), [&] {
-                                return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
-                            });
+            acc.readDirectoryWithEntries(
+                from,
+                [&](SourceAccessor & subdirAccessor,
+                    const CanonPath & subdirFrom,
+                    const SourceAccessor::DirEntries & entries) {
+                    std::set<std::string, std::less<>> subdirs;
+                    auto unhacked =
+                        unhackedEntries(entries, acc, from, [&](const std::string & name, bool isDirectory) {
+                            if (isDirectory)
+                                subdirs.insert(name);
+                        });
+                    result = v.directory(to, [&](fun<void(std::string_view, bool, fun<Result()>)> each) {
+                        for (auto & [name, actual] : unhacked)
+                            if (filter((filterBase / name).abs()))
+                                each(name, subdirs.contains(name), [&] {
+                                    return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
+                                });
+                    });
                 });
-            });
             assert(result);
             return std::move(*result);
         }

@@ -223,6 +223,12 @@ StorePath Store::addToStore(
 
 void Store::addMultipleToStore(PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs)
 {
+    addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs, 0);
+}
+
+void Store::addMultipleToStore(
+    PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, size_t maxThreads)
+{
     /* A batch of one has no order to find and nothing to run in parallel,
        and `processGraph` below would build a thread pool and a graph for
        it: an evaluation that emits each derivation as it names it flushes
@@ -321,7 +327,8 @@ void Store::addMultipleToStore(PathsSource && pathsToCopy, Activity & act, Repai
 
             nrDone++;
             showProgress();
-        });
+        },
+        maxThreads);
 }
 
 /*

@@ -44,13 +44,12 @@ create index if not exists IndexDerivationOutputs on DerivationOutputs(path);
 -- store path's own file -- a *holder* -- and this is where it is.  One row per
 -- (blob, mode).
 --
--- The holder's store path is named through `Ingestions` and *not* by a foreign
--- key into `ValidPaths`, because an ingestion's rows are written while its copy
--- runs, before its path exists: the copy's workers write their batches as they
--- fill, so the index write overlaps the copy as the object store's links used
--- to.  An `Ingestions` row is made with a null path when the copy starts and
--- given its path when the path is registered -- one update of one row, so the
--- registration pays no per-blob work at all.
+-- The holder's store path is named through `Ingestions`, not by a foreign
+-- key into `ValidPaths`. A large ingestion writes batches during the copy,
+-- creating its `Ingestions` row lazily at the first flush with a null path.
+-- Registration assigns that path and publishes the remaining rows. Small
+-- ingestions publish all their rows in the path-registration transaction,
+-- through its connection, without a background writer or separate commit.
 --
 -- An ingestion still in flight has no path yet, and its rows must survive a
 -- collection that runs beside it exactly as its objects do (08 K16): the row

@@ -211,6 +211,11 @@ std::optional<StorePath> LocalOverlayStore::queryPathFromHashPart(const std::str
 
 void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos)
 {
+    registerValidPaths(infos, nullptr);
+}
+
+void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold)
+{
     // First, get any from lower store so we merge
     {
         StorePathSet notInUpper;
@@ -221,10 +226,10 @@ void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos)
         ValidPathInfos inLower;
         for (auto & p : pathsInLower)
             inLower.insert_or_assign(p, lowerPathInfo(*lowerStore, p));
-        LocalStore::registerValidPaths(inLower);
+        LocalStore::registerValidPaths(inLower, nullptr);
     }
     // Then do original request
-    LocalStore::registerValidPaths(infos);
+    LocalStore::registerValidPaths(infos, hold);
 }
 
 void LocalOverlayStore::collectGarbage(const GCOptions & options, GCResults & results)
