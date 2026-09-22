@@ -251,45 +251,42 @@ EvalState::EvalState(
     , settings{settings}
     , symbols(StaticEvalSymbols::staticSymbolTable())
     , repair(NoRepair)
-    , storeFS(makeMountedSourceAccessor({
-          {CanonPath::root, makeEmptySourceAccessor()},
-          /* In the pure eval case, we can simply require
-             valid paths. However, in the *impure* eval
-             case this gets in the way of the union
-             mechanism, because an invalid access in the
-             upper layer will *not* be caught by the union
-             source accessor, but instead abort the entire
-             lookup.
+    , storeFS([&] {
+        auto base = makeMountedSourceAccessor({
+            {CanonPath::root, makeEmptySourceAccessor()},
+            /* In the pure eval case, we can simply require
+               valid paths. However, in the *impure* eval
+               case this gets in the way of the union
+               mechanism, because an invalid access in the
+               upper layer will *not* be caught by the union
+               source accessor, but instead abort the entire
+               lookup.
 
-             This happens when the store dir in the
-             ambient file system has a path (e.g. because
-             another Nix store there), but the relocated
-             store does not.
+               This happens when the store dir in the
+               ambient file system has a path (e.g. because
+               another Nix store there), but the relocated
+               store does not.
 
-             TODO make the various source accessors doing
-             access control all throw the same type of
-             exception, and make union source accessor
-             catch it, so we don't need to do this hack.
-           */
-          {CanonPath(store->storeDir), store->getFSAccessor(settings.pureEval)},
-      }))
+               TODO make the various source accessors doing
+               access control all throw the same type of
+               exception, and make union source accessor
+               catch it, so we don't need to do this hack.
+             */
+            {CanonPath(store->storeDir), store->getFSAccessor(settings.pureEval)},
+        });
+        if (settings.pureEval)
+            return base;
+        /* Keep the host/store union for unmounted paths, including imports
+           from the ambient store when this store is relocated. Fetched
+           inputs are grafted above that fallback: their outPath denotes
+           the fetched tree, not a merge with an unrelated host occupant. */
+        return makeMountedSourceAccessor({
+            {CanonPath::root, makeUnionSourceAccessor({getFSSourceAccessor(), base})},
+        });
+    }())
     , rootFS([&] {
-        /* In pure eval mode, we provide a filesystem that only
-           contains the Nix store.
-
-           Otherwise, use a union accessor to make the augmented store
-           available at its logical location while still having the
-           underlying directory available. This is necessary for
-           instance if we're evaluating a file from the physical
-           /nix/store while using a chroot store, and also for lazy
-           mounted fetchTree. */
-        auto accessor = settings.pureEval ? storeFS.cast<SourceAccessor>()
-                                          /* A host entry at a mounted input's logical store path
-                                             need not be a complete, valid copy of that input.
-                                             Name the rendered union by the general rule. */
-                                          : makeUnionSourceAccessor({getFSSourceAccessor(), storeFS});
         /* Cache positive lstat/readlink results to speed up resolveSymlinks. */
-        accessor = makeCachingSourceAccessor(accessor);
+        auto accessor = makeCachingSourceAccessor(storeFS);
 
         /* Apply access control if needed. */
         if (settings.restrictEval || settings.pureEval)

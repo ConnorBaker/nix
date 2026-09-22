@@ -1,6 +1,7 @@
 #include "nix/util/mounted-source-accessor.hh"
 
 #include <algorithm>
+#include <tuple>
 
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <nlohmann/json.hpp>
@@ -13,7 +14,7 @@ namespace {
  * A tree with other trees grafted onto it at mount points.  A graft is
  * authoritative: below a mount point only the mounted tree is consulted.
  * A mount point is listed in its parent directory, and the directories
- * leading to it exist even where the underlying tree lacks them, so the
+ * leading to it replace absent or non-directory ancestors, so the
  * result is a tree.
  */
 struct MountedSourceAccessorImpl : MountedSourceAccessor
@@ -37,97 +38,148 @@ public:
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
-        auto [accessor, subpath] = resolve(path);
-        return accessor->readFile(subpath, sink, sizeCallback);
+        auto keepAlive = weak_from_this().lock();
+        auto view = resolveTree(path);
+        if (!view.below.empty())
+            throw NotARegularFile("file '%s' is not a regular file", path.abs());
+        if (view.hidden)
+            throw FileNotFound("file '%s' does not exist", path.abs());
+        return view.accessor->readFile(view.subpath, sink, sizeCallback);
     }
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
     {
         auto keepAlive = weak_from_this().lock();
-        auto [accessor, subpath] = resolve(path);
-        if (auto st = accessor->maybeLstat(subpath))
-            return st;
-        /* A mount point below `path` implies the directories leading to it. */
-        if (hasMountBelow(path))
+        auto view = resolveTree(path);
+        if (!view.below.empty())
             return Stat{.type = tDirectory};
-        return std::nullopt;
+        if (view.hidden)
+            return std::nullopt;
+        return view.accessor->maybeLstat(view.subpath);
     }
 
     Stat lstat(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
-        if (!hasMountBelow(path))
-            /* The resolved tree answers, and for a missing path raises its own
-               error, which may say more than "does not exist" (an access
-               control accessor says why). */
-            return accessor->lstat(subpath);
-        if (auto st = accessor->maybeLstat(subpath))
-            return *st;
-        return Stat{.type = tDirectory};
+        auto keepAlive = weak_from_this().lock();
+        auto view = resolveTree(path);
+        if (!view.below.empty())
+            return Stat{.type = tDirectory};
+        if (view.hidden)
+            throw FileNotFound("file '%s' does not exist", path.abs());
+        /* Unchanged subtrees retain their own errors, including explanations
+           from access-control accessors. */
+        return view.accessor->lstat(view.subpath);
     }
 
     DirEntries readDirectory(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
-        auto below = mountsBelow(path);
-        auto st = accessor->maybeLstat(subpath);
-        if (below.empty() || (st && st->type != tDirectory))
-            /* Nothing grafted below: the resolved tree's listing, or its
-               error for a non-directory or a missing path. */
-            return accessor->readDirectory(subpath);
+        auto keepAlive = weak_from_this().lock();
+        auto view = resolveTree(path, /*needDirectoryContents=*/true);
+        if (view.below.empty()) {
+            if (view.hidden)
+                throw FileNotFound("directory '%s' does not exist", path.abs());
+            return view.accessor->readDirectory(view.subpath);
+        }
         DirEntries result;
-        if (st)
-            result = accessor->readDirectory(subpath);
-        for (auto & [mountPoint, mounted] : below) {
+        if (!view.hidden)
+            result = view.accessor->readDirectory(view.subpath);
+        /* Resolve child shapes before asking for mounted root types. A
+           deeper binding already proves its first component is a directory,
+           even if a direct mount at that component cannot be inspected. */
+        for (auto & [mountPoint, mounted] : view.below) {
             auto rel = mountPoint.removePrefix(path);
             std::string name(*rel.begin());
+            if (rel.parent()->isRoot())
+                result.erase(name);
+            else
+                result.insert_or_assign(name, tDirectory);
+        }
+        for (auto & [mountPoint, mounted] : view.below) {
+            auto rel = mountPoint.removePrefix(path);
             if (rel.parent()->isRoot()) {
-                /* A direct child: the mounted tree replaces whatever the
-                   resolved tree has there, so its root's type is the entry's. */
-                auto mst = mounted->maybeLstat(CanonPath::root);
-                result.insert_or_assign(name, mst ? std::optional{mst->type} : std::nullopt);
-            } else
-                /* A directory on the way to a deeper mount point; the resolved
-                   tree's own entry, a directory by the graft precondition, is kept. */
-                result.emplace(name, tDirectory);
+                std::string name(*rel.begin());
+                if (!result.contains(name))
+                    if (auto st = mounted->maybeLstat(CanonPath::root))
+                        result.emplace(name, st->type);
+            }
         }
         return result;
     }
 
     std::string readLink(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
-        return accessor->readLink(subpath);
+        auto keepAlive = weak_from_this().lock();
+        auto view = resolveTree(path);
+        if (!view.below.empty())
+            throw NotASymlink("file '%s' is not a symbolic link", path.abs());
+        if (view.hidden)
+            throw FileNotFound("file '%s' does not exist", path.abs());
+        return view.accessor->readLink(view.subpath);
     }
 
     std::string showPath(const CanonPath & path) override
     {
         auto keepAlive = weak_from_this().lock();
-        auto [accessor, subpath] = resolve(path);
+        auto [accessor, subpath, mountPoint] = resolve(path);
         return displayPrefix + accessor->showPath(subpath) + displaySuffix;
     }
 
-    std::pair<ref<SourceAccessor>, CanonPath> resolve(const CanonPath & path)
+    std::tuple<ref<SourceAccessor>, CanonPath, CanonPath> resolve(const CanonPath & path)
     {
         // Find the nearest parent of `path` that is a mount point.
         auto prefix = path;
         while (true) {
             if (auto mount = getConcurrent(mounts, prefix))
-                return {std::move(*mount), path.removePrefix(prefix)};
+                return {std::move(*mount), path.removePrefix(prefix), std::move(prefix)};
 
             assert(!prefix.isRoot());
             prefix.pop();
         }
     }
 
-    /**
-     * Whether a mount lies strictly below `path`; no ordered list is needed.
-     */
-    bool hasMountBelow(const CanonPath & path)
+    struct ResolvedTree
     {
-        bool below = false;
-        mounts.visit_all([&](const auto & kv) { below = below || (kv.first != path && kv.first.isWithin(path)); });
-        return below;
+        ref<SourceAccessor> accessor;
+        CanonPath subpath;
+        std::vector<std::pair<CanonPath, ref<SourceAccessor>>> below;
+        bool hidden = false;
+    };
+
+    ResolvedTree resolveTree(const CanonPath & path, bool needDirectoryContents = false)
+    {
+        auto [accessor, subpath, mountPoint] = resolve(path);
+        auto nested = mountsBelow(mountPoint);
+        ResolvedTree result{std::move(accessor), std::move(subpath), {}};
+        if (nested.empty())
+            return result;
+        for (auto & binding : nested)
+            if (binding.first != path && binding.first.isWithin(path))
+                result.below.push_back(binding);
+
+        /* A descendant binding proves the directory's shape without forcing
+           the fallback. Only listing and naming need its surviving contents. */
+        if (!result.below.empty() && !needDirectoryContents)
+            return result;
+
+        /* Grafting through a non-directory discards its old subtree. Inspect
+           only prefixes required by an explicit descendant; once our path
+           diverges, the remaining original subtree can be delegated whole.
+           The owning snapshot is complete before invoking any child. */
+        auto prefix = mountPoint;
+        auto component = result.subpath.begin();
+        while (std::any_of(nested.begin(), nested.end(), [&](auto & binding) {
+            return binding.first != prefix && binding.first.isWithin(prefix);
+        })) {
+            auto st = result.accessor->maybeLstat(prefix.removePrefix(mountPoint));
+            if (!st || st->type != tDirectory) {
+                result.hidden = true;
+                break;
+            }
+            if (prefix == path)
+                break;
+            prefix.push(*component++);
+        }
+        return result;
     }
 
     /**
@@ -156,8 +208,11 @@ public:
 
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
     {
-        auto [accessor, subpath] = resolve(path);
-        return accessor->getPhysicalPath(subpath);
+        auto keepAlive = weak_from_this().lock();
+        auto view = resolveTree(path);
+        if (view.hidden || !view.below.empty())
+            return std::nullopt;
+        return view.accessor->getPhysicalPath(view.subpath);
     }
 
     void mount(CanonPath mountPoint, ref<SourceAccessor> accessor) override
@@ -177,38 +232,45 @@ public:
 
     std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
     {
-        if (hasMountBelow(path))
+        auto keepAlive = weak_from_this().lock();
+        auto view = resolveTree(path);
+        if (view.hidden || !view.below.empty())
             return std::nullopt;
-        auto [accessor, subpath] = resolve(path);
-        return accessor->getKnownEntry(subpath);
+        return view.accessor->getKnownEntry(view.subpath);
     }
 
     std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
+        auto keepAlive = weak_from_this().lock();
         if (fingerprint)
             return std::pair{path, *fingerprint};
-        auto [accessor, subpath] = resolve(path);
-        auto below = mountsBelow(path);
-        if (below.empty())
-            /* Below a mount point, or away from all of them: the resolved
-               tree's subtree is the subtree here. */
-            return accessor->getFingerprint(subpath);
-        /* Above a mount point the subtree is the resolved tree's subtree
-           with the mounted trees grafted on.  It is named by the names of
-           all of them, or not at all; the name is for this subtree exactly,
-           hence the root path. */
-        auto tree = accessor->getFingerprint(subpath);
-        if (!tree)
-            return std::nullopt;
-        const auto & [tSub, tFp] = *tree;
+        auto view = resolveTree(path, /*needDirectoryContents=*/true);
+        if (view.below.empty()) {
+            if (view.hidden)
+                return std::nullopt;
+            return view.accessor->getFingerprint(view.subpath);
+        }
+        /* A promoted ancestor contributes an empty directory, independent of
+           the discarded source node. Surviving fallback contents must be
+           named, as must every explicit graft. */
+        nlohmann::json tree = nullptr;
+        if (!view.hidden) {
+            auto name = view.accessor->getFingerprint(view.subpath);
+            if (!name)
+                return std::nullopt;
+            tree = {name->second, name->first.abs()};
+        }
         auto grafts = nlohmann::json::array();
-        for (auto & [mountPoint, mounted] : below) {
+        for (auto & [mountPoint, mounted] : view.below) {
             auto graft = mounted->getFingerprint(CanonPath::root);
             if (!graft)
                 return std::nullopt;
             grafts.push_back({mountPoint.removePrefix(path).abs(), graft->second, graft->first.abs()});
         }
-        return std::pair{CanonPath::root, nlohmann::json::array({"graft", tFp, tSub.abs(), std::move(grafts)}).dump()};
+        /* v1 assumed directory ancestors and could name a file even when a
+           descendant was mounted. Its names cannot identify this total graft. */
+        return std::pair{
+            CanonPath::root, nlohmann::json::array({"graft-v2", std::move(tree), std::move(grafts)}).dump()};
     }
 };
 

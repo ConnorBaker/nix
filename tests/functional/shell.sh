@@ -71,3 +71,69 @@ path2=$(nix shell --sandbox-paths '/nix? /bin? /lib? /lib64? /usr?' --store "$TE
 [[ "$path/bin/hello" = "$path2" ]]
 
 [[ -e $TEST_ROOT/store0/nix/store/$(basename "$path")/bin/hello ]]
+
+# Shell metadata comes from the execution store, even when evaluation sees
+# an unrelated ambient occupant or uses a different store altogether.
+shellStore="$TEST_ROOT/shell-store?store=$NIX_STORE_DIR"
+shellEvalStore="$TEST_ROOT/shell-eval-store?store=$NIX_STORE_DIR"
+shellSource="$TEST_ROOT/shell-source"
+mkdir -p "$shellSource/bin-target/bin" "$shellSource/propagated/bin" "$shellSource/package/nix-support"
+binTarget=$(nix store add-path --store "$shellStore" "$shellSource/bin-target")
+propagated=$(nix store add-path --store "$shellStore" "$shellSource/propagated")
+printf '%s\n' "$propagated" > "$shellSource/propagation"
+propagation=$(nix store add-file --store "$shellStore" "$shellSource/propagation")
+ln -s "$binTarget/bin" "$shellSource/package/bin"
+ln -s "$propagation" "$shellSource/package/nix-support/propagated-user-env-packages"
+package=$(nix store add-path --store "$shellStore" "$shellSource/package")
+requireGit
+initGitRepo "$shellSource/package"
+
+for evalMode in execution separate; do
+    evalFlags=()
+    if [[ $evalMode == separate ]]; then
+        evalFlags=(--eval-store "$shellEvalStore")
+    fi
+    for purity in impure pure; do
+        purityFlags=(--option pure-eval true)
+        if [[ $purity == impure ]]; then
+            purityFlags=(--impure)
+        fi
+        for shadow in absent bin propagation; do
+            if [[ $shadow != absent ]]; then
+                mkdir -p "$package/nix-support"
+                if [[ $shadow == bin ]]; then
+                    ln -s "$TEST_ROOT/outside-the-store" "$package/bin"
+                else
+                    ln -s "$binTarget/bin" "$package/bin"
+                    echo not-a-store-path > "$package/nix-support/propagated-user-env-packages"
+                fi
+            fi
+            shellPath=$(nix shell --store "$shellStore" "${evalFlags[@]}" "${purityFlags[@]}" "$package" \
+                -c "$SHELL" -c 'printf "%s" "$PATH"')
+            [[ $shellPath == "$binTarget/bin:$propagated/bin:"* ]]
+            rm -rf "$package"
+        done
+    done
+
+    # A fetched outPath is initially only mounted in the evaluator. The
+    # installable must realise it before the shell reads execution-store bytes.
+    # A separate eval store transfers opaque inputs through its substituter.
+    printf '%s\n' "$evalMode" > "$shellSource/package/marker"
+    git -C "$shellSource/package" add -A
+    git -C "$shellSource/package" commit -q -m "$evalMode"
+    fetch="(builtins.fetchTree { type = \"git\"; url = \"file://$shellSource/package\"; })"
+    # Printing only the basename drops the store-path context, so this fetch
+    # leaves the Git input mounted but unmaterialised in both stores.
+    sourceName=$(nix eval --store "$shellStore" "${evalFlags[@]}" --impure --raw --expr \
+        "builtins.unsafeDiscardStringContext (baseNameOf $fetch.outPath)")
+    [[ $sourceName == *-source ]]
+    [[ ! -e $TEST_ROOT/shell-store/nix/store/$sourceName ]]
+    [[ ! -e $TEST_ROOT/shell-eval-store/nix/store/$sourceName ]]
+    shellPath=$(nix shell --store "$shellStore" "${evalFlags[@]}" \
+        --substituters "$shellEvalStore" --impure --expr \
+        "$fetch.outPath" \
+        -c "$SHELL" -c 'printf "%s" "$PATH"')
+    [[ $shellPath == "$binTarget/bin:$propagated/bin:"* ]]
+    nix path-info --store "$shellStore" "$NIX_STORE_DIR/$sourceName" > /dev/null
+    [[ $(cat "$TEST_ROOT/shell-store/nix/store/$sourceName/marker") == "$evalMode" ]]
+done

@@ -3,6 +3,7 @@
 
 #include "nix/expr/eval.hh"
 #include "nix/util/memory-source-accessor.hh"
+#include "nix/util/mounted-source-accessor.hh"
 #include "nix/expr/tests/libexpr.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/fetchers.hh"
@@ -258,73 +259,335 @@ TEST_F(EvalStateTest, parserContainersReleaseAllStorageWithTheEvaluator)
     }
 }
 
+/* A mount replaces the selected store or ambient host node; it never unions
+   their private children into the fetched value. The ambient store case
+   intentionally has the same logical and physical directory. */
 TEST_F(EvalStateTest, mountInputInvalidatesPreviouslyObservedStoreNodes)
 {
     using File = MemorySourceAccessor::File;
-    AutoDelete root{canonPath(createTempDir(), true)};
-    auto config = make_ref<LocalStoreConfig>(
-        root.path() / "physical-root", StoreConfig::Params{{"store", (root.path() / "logical-store").string()}});
-    auto local = make_ref<LocalStore>(config);
-    auto nodes = [](std::string contents) {
+    enum class Occupant { SelectedStore, AmbientStore, RelocatedHost };
+    enum class Mode { Impure, Restricted, Pure };
+    auto nodes = [](std::string contents, std::string privateName) {
         return std::vector<File>{
             File{File::Regular{.executable = false, .contents = contents}},
             File{File::Regular{.executable = true, .contents = contents}},
             File{File::Symlink{.target = contents}},
-            File{File::Directory{.entries = {{"child", File{File::Regular{.contents = contents}}}}}},
+            File{File::Directory{
+                .entries =
+                    {
+                        {"child", File{File::Regular{.contents = contents}}},
+                        {privateName, File{File::Regular{.contents = contents}}},
+                    }}},
         };
     };
-    auto before = nodes("before");
-    auto after = nodes("after-longer");
+    auto before = nodes("before", "old-only");
+    auto after = nodes("after-longer", "mounted-only");
     size_t serial = 0;
-    /* Every old node kind, absence included, crossed with every mounted
-       node kind; repeat through the restricted evaluator's allow list. */
-    for (bool restricted : {false, true})
-        for (size_t oldNode = 0; oldNode <= before.size(); ++oldNode)
-            for (size_t newNode = 0; newNode < after.size(); ++newNode) {
-                SCOPED_TRACE(fmt("restricted=%d old=%d new=%d", restricted, oldNode, newNode));
-                EvalSettings nestedSettings{readOnlyMode};
+    /* 3 locations × 3 access modes × 5 old kinds × 4 fetched kinds. */
+    for (auto occupant : {Occupant::SelectedStore, Occupant::AmbientStore, Occupant::RelocatedHost}) {
+        AutoDelete root{canonPath(createTempDir(), true)};
+        auto physicalRoot = root.path() / "physical-root";
+        auto logicalDir =
+            occupant == Occupant::AmbientStore ? physicalRoot / "nix/store" : root.path() / "logical-store";
+        auto local = make_ref<LocalStore>(
+            make_ref<LocalStoreConfig>(physicalRoot, StoreConfig::Params{{"store", logicalDir.string()}}));
+        createDirs(logicalDir);
+        for (auto mode : {Mode::Impure, Mode::Restricted, Mode::Pure})
+            for (size_t oldNode = 0; oldNode <= before.size(); ++oldNode)
+                for (size_t newNode = 0; newNode < after.size(); ++newNode) {
+                    SCOPED_TRACE(fmt("location=%d mode=%d old=%d new=%d", int(occupant), int(mode), oldNode, newNode));
+                    EvalSettings nestedSettings{readOnlyMode};
+                    nestedSettings.nixPath = {};
+                    nestedSettings.pureEval = mode == Mode::Pure;
+                    nestedSettings.restrictEval = mode == Mode::Restricted;
+                    EvalState nested({}, local, fetchSettings, nestedSettings);
+                    auto mounted = make_ref<MemorySourceAccessor>();
+                    mounted->root = after[newNode];
+                    fetchers::Input input;
+                    input.attrs.insert_or_assign("name", fmt("mount-cache-%d", serial++));
+                    auto [storePath, hash] =
+                        fetchToStore2(fetchSettings, *local, SourcePath{mounted}, FetchMode::DryRun, input.getName());
+                    mounted->fingerprint = "mount-cache:" + hash.to_string(HashFormat::SRI, true);
+                    auto logical = CanonPath(local->printStorePath(storePath));
+                    ASSERT_FALSE(local->isValidPath(storePath));
+                    if (oldNode < before.size()) {
+                        auto old = make_ref<MemorySourceAccessor>();
+                        old->root = before[oldNode];
+                        StringSink dump;
+                        old->dumpPath(CanonPath::root, dump);
+                        StringSource source{dump.s};
+                        restorePath(
+                            occupant == Occupant::SelectedStore ? local->toRealPath(storePath)
+                                                                : std::filesystem::path(logical.abs()),
+                            source);
+                    }
+                    nested.allowPath(storePath);
+                    if (mode == Mode::Pure)
+                        EXPECT_THROW(nested.rootFS->maybeLstat(logical), InvalidPath);
+                    else {
+                        auto observed = nested.rootFS->maybeLstat(logical);
+                        EXPECT_EQ(bool(observed), oldNode < before.size());
+                        if (observed && observed->type == SourceAccessor::tSymlink) {
+                            EXPECT_EQ(nested.rootFS->readLink(logical), "before");
+                        }
+                        /* A declined name is cached too, and must be discarded. */
+                        EXPECT_FALSE(nested.rootFS->getFingerprint(logical));
+                        EXPECT_FALSE(nested.rootFS->getFingerprint(logical));
+                    }
+                    EXPECT_EQ(nested.mountInput(input, mounted), storePath);
+                    EXPECT_EQ(nested.rootFS->getFingerprint(logical), mounted->getFingerprint(CanonPath::root));
+                    auto expectedStat = mounted->lstat(CanonPath::root);
+                    auto actualStat = nested.rootFS->lstat(logical);
+                    EXPECT_EQ(actualStat.type, expectedStat.type);
+                    EXPECT_EQ(actualStat.isExecutable, expectedStat.isExecutable);
+                    StringSink actual, expected;
+                    nested.rootFS->dumpPath(logical, actual);
+                    mounted->dumpPath(CanonPath::root, expected);
+                    EXPECT_EQ(actual.s, expected.s);
+                    if (newNode == 3) {
+                        EXPECT_FALSE(nested.rootFS->pathExists(logical / "old-only"));
+                        EXPECT_EQ(nested.rootFS->readDirectory(logical), mounted->readDirectory(CanonPath::root));
+                    }
+                    /* The public fetch route also preserves the first mount. */
+                    auto repeated = make_ref<MemorySourceAccessor>();
+                    repeated->root = mounted->root;
+                    EXPECT_EQ(nested.mountInput(input, repeated), storePath);
+                    EXPECT_EQ(nested.storeFS->getMount(logical).get(), mounted.get_ptr().get());
+                }
+    }
+}
+
+/* Registration and physical presence are separate from input selection.
+   A valid row does not imply that its physical bytes still exist or agree. */
+TEST_F(EvalStateTest, mountedReadsAndCopiesUseTheSameInputDespitePhysicalOccupants)
+{
+    enum class Physical { Missing, Same, Different };
+    size_t serial = 0;
+    for (bool relocated : {false, true}) {
+        AutoDelete root{canonPath(createTempDir(), true)};
+        auto physicalRoot = root.path() / "physical-root";
+        auto logicalDir = relocated ? root.path() / "logical-store" : physicalRoot / "nix/store";
+        auto local = make_ref<LocalStore>(
+            make_ref<LocalStoreConfig>(physicalRoot, StoreConfig::Params{{"store", logicalDir.string()}}));
+        createDirs(logicalDir);
+        auto writeTree = [](ref<MemorySourceAccessor> tree, const std::filesystem::path & path) {
+            StringSink dump;
+            tree->dumpPath(CanonPath::root, dump);
+            StringSource source{dump.s};
+            restorePath(path, source);
+        };
+        for (bool registered : {false, true})
+            for (auto physical : {Physical::Missing, Physical::Same, Physical::Different}) {
+                SCOPED_TRACE(fmt("relocated=%d registered=%d physical=%d", relocated, registered, int(physical)));
+                bool readOnly = false;
+                EvalSettings nestedSettings{readOnly};
                 nestedSettings.nixPath = {};
                 nestedSettings.pureEval = false;
-                nestedSettings.restrictEval = restricted;
                 EvalState nested({}, local, fetchSettings, nestedSettings);
-                auto mounted = make_ref<MemorySourceAccessor>();
-                mounted->root = after[newNode];
+                auto tree = make_ref<MemorySourceAccessor>();
+                tree->addFile(CanonPath("default.nix"), "42");
+                auto other = make_ref<MemorySourceAccessor>();
+                other->addFile(CanonPath("default.nix"), "7");
+                other->addFile(CanonPath("host-only"), "not part of the input");
                 fetchers::Input input;
-                input.attrs.insert_or_assign("name", fmt("mount-cache-%d", serial++));
-                auto [storePath, hash] =
-                    fetchToStore2(fetchSettings, *local, SourcePath{mounted}, FetchMode::DryRun, input.getName());
-                mounted->fingerprint = "mount-cache:" + hash.to_string(HashFormat::SRI, true);
-                auto logical = CanonPath(local->printStorePath(storePath));
-                ASSERT_FALSE(getFSSourceAccessor()->pathExists(logical));
-                ASSERT_FALSE(local->isValidPath(storePath));
-                if (oldNode < before.size()) {
-                    auto old = make_ref<MemorySourceAccessor>();
-                    old->root = before[oldNode];
-                    StringSink dump;
-                    old->dumpPath(CanonPath::root, dump);
-                    StringSource source{dump.s};
-                    restorePath(local->toRealPath(storePath), source);
+                input.attrs.insert_or_assign("name", fmt("mount-physical-%d", serial++));
+                auto path =
+                    fetchToStore2(fetchSettings, *local, SourcePath{tree}, FetchMode::DryRun, input.getName()).first;
+                auto real = local->toRealPath(path);
+                auto logical = CanonPath(local->printStorePath(path));
+                if (registered) {
+                    EXPECT_EQ(
+                        nested.store->addToStore(input.getName(), SourcePath{tree}, ContentAddressMethod::Raw::Git),
+                        path);
+                    if (physical != Physical::Same)
+                        deletePath(real);
                 }
-                nested.allowPath(storePath);
-                auto observed = nested.rootFS->maybeLstat(logical);
-                EXPECT_EQ(bool(observed), oldNode < before.size());
-                if (observed && observed->type == SourceAccessor::tSymlink)
-                    EXPECT_EQ(nested.rootFS->readLink(logical), "before");
+                if (physical == Physical::Different)
+                    writeTree(other, real);
+                else if (!registered && physical == Physical::Same)
+                    writeTree(tree, real);
+                if (relocated)
+                    writeTree(other, std::filesystem::path(logical.abs()));
 
-                /* No identity is an observation too; mounting must discard it. */
-                EXPECT_FALSE(nested.rootFS->getFingerprint(logical));
-                EXPECT_FALSE(nested.rootFS->getFingerprint(logical));
-                EXPECT_EQ(nested.mountInput(input, mounted), storePath);
-                EXPECT_EQ(nested.rootFS->getFingerprint(logical), mounted->getFingerprint(CanonPath::root));
-                auto expectedStat = mounted->lstat(CanonPath::root);
-                auto actualStat = nested.rootFS->lstat(logical);
-                EXPECT_EQ(actualStat.type, expectedStat.type);
-                EXPECT_EQ(actualStat.isExecutable, expectedStat.isExecutable);
-                StringSink actual, expected;
-                nested.rootFS->dumpPath(logical, actual);
-                mounted->dumpPath(CanonPath::root, expected);
-                EXPECT_EQ(actual.s, expected.s);
+                EXPECT_EQ(nested.mountInput(input, tree), path);
+                Value value;
+                nested.evalFile(nested.storePath(path) / "default.nix", value);
+                nested.forceValue(value, noPos);
+                EXPECT_THAT(value, IsIntEq(42));
+                EXPECT_FALSE(nested.rootFS->pathExists(logical / "host-only"));
+                NixStringContext context;
+                auto copied = nested.copyPathToStore(context, nested.storePath(path) / "default.nix");
+                EXPECT_EQ(readFile(local->toRealPath(copied)), "42");
+                EXPECT_NO_THROW(nested.ensureLazyPathCopied(path));
+                EXPECT_TRUE(local->isValidPath(path));
+                /* Ordinary copy does not repair an already-valid corrupt or
+                   missing destination. Selecting the input is no repair claim. */
+                if (registered && physical == Physical::Missing)
+                    EXPECT_FALSE(pathExists(real));
+                else
+                    EXPECT_EQ(
+                        readFile(real / "default.nix"), registered && physical == Physical::Different ? "7" : "42");
+
+                /* Mounting fixes an expected address, not mutable source bytes.
+                   A valid old destination must not suppress the later check. */
+                tree->addFile(CanonPath("default.nix"), "99");
+                EXPECT_EQ(nested.rootFS->readFile(logical / "default.nix"), "99");
+                try {
+                    nested.ensureLazyPathCopied(path);
+                    ADD_FAILURE() << "a mounted input changed without the address check failing";
+                } catch (Error & error) {
+                    EXPECT_EQ(error.info().status, 102u);
+                    EXPECT_NE(error.message().find("contents have changed"), std::string::npos);
+                }
             }
+    }
+}
+
+/* Away from grafts and their constructed ancestors, the previous host/store
+   union still applies. A fetched file without a deeper explicit graft is
+   a blocker, not an invitation to expose the fallback's descendants. */
+TEST_F(EvalStateTest, mountedInputsPreserveFallbackBoundariesAndSymlinkEscapes)
+{
+    for (bool restricted : {false, true}) {
+        SCOPED_TRACE(restricted);
+        AutoDelete root{canonPath(createTempDir(), true)};
+        auto logicalDir = root.path() / "logical-store";
+        auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(
+            root.path() / "physical-root", StoreConfig::Params{{"store", logicalDir.string()}}));
+        EvalSettings nestedSettings{readOnlyMode};
+        nestedSettings.nixPath = {};
+        nestedSettings.pureEval = false;
+        nestedSettings.restrictEval = restricted;
+        EvalState nested({}, local, fetchSettings, nestedSettings);
+        StorePath ambient{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ambient"};
+        StorePath blocked{"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-blocked"};
+        auto ambientPath = CanonPath(local->printStorePath(ambient));
+        auto blockedPath = CanonPath(local->printStorePath(blocked));
+        createDirs(std::filesystem::path(ambientPath.abs()));
+        writeFile(std::filesystem::path(ambientPath.abs()) / "default.nix", "7");
+        createDirs(local->toRealPath(ambient));
+        writeFile(local->toRealPath(ambient) / "default.nix", "9");
+        writeFile(std::filesystem::path(blockedPath.abs()), "host file blocks the lower directory");
+        createDirs(local->toRealPath(blocked));
+        writeFile(local->toRealPath(blocked) / "hidden", "lower-only");
+        nested.allowPath(blocked);
+        auto fallback = [&] {
+            EXPECT_EQ(nested.rootFS->readFile(blockedPath), "host file blocks the lower directory");
+            EXPECT_FALSE(nested.rootFS->pathExists(blockedPath / "hidden"));
+        };
+        fallback();
+
+        auto tree = make_ref<MemorySourceAccessor>();
+        tree->addFile(CanonPath("default.nix"), "42");
+        tree->addFile(CanonPath("blocked"), "input file");
+        tree->addFile(CanonPath("nested/old"), "original nested tree");
+        MemorySink sink{*tree};
+        sink.createSymlink(CanonPath("escape"), "../" + ambient.to_string() + "/default.nix");
+        fetchers::Input input;
+        input.attrs.insert_or_assign("name", "mount-boundaries");
+        auto path = fetchToStore2(fetchSettings, *local, SourcePath{tree}, FetchMode::DryRun, input.getName()).first;
+        auto logical = CanonPath(local->printStorePath(path));
+        createDirs(std::filesystem::path(logical.abs()) / "blocked");
+        writeFile(std::filesystem::path(logical.abs()) / "blocked/hidden", "host-only");
+        EXPECT_EQ(nested.mountInput(input, tree), path);
+        EXPECT_FALSE(nested.rootFS->pathExists(logical / CanonPath("blocked/hidden")));
+        fallback();
+
+        auto escape = nested.storePath(path) / "escape";
+        if (restricted) {
+            EXPECT_THROW(escape.resolveSymlinks().readFile(), RestrictedPathError);
+        }
+        nested.allowPath(ambient);
+        EXPECT_EQ(escape.resolveSymlinks().readFile(), "7");
+        EXPECT_EQ(nested.rootFS->readFile(ambientPath / "default.nix"), "7");
+
+        /* This graft preserves its fetched directory ancestors. The file
+           above has no deeper graft, so it must keep hiding host children. */
+        auto replacement = make_ref<MemorySourceAccessor>();
+        replacement->addFile(CanonPath("new"), "new nested tree");
+        nested.storeFS->mount(logical / "nested", replacement);
+        nested.rootFS->invalidateCache();
+        EXPECT_FALSE(nested.rootFS->pathExists(logical / CanonPath("nested/old")));
+        EXPECT_EQ(nested.rootFS->readFile(logical / CanonPath("nested/new")), "new nested tree");
+        fallback();
+    }
+}
+
+/* A relocated store's logical ancestors are independent of its real store
+   directory. Explicit input descendants promote host blockers to directories;
+   the replaced symlink's physical target must not leak sibling entries. */
+TEST_F(EvalStateTest, mountedInputsPromoteEveryLogicalAncestorKind)
+{
+    using File = MemorySourceAccessor::File;
+    enum class Mode { Impure, Restricted, Pure };
+    size_t serial = 0;
+    for (bool atStoreDir : {false, true})
+        for (unsigned kind = 0; kind != 5; ++kind) {
+            SCOPED_TRACE(fmt("storeDir=%d kind=%d", atStoreDir, kind));
+            AutoDelete root{canonPath(createTempDir(), true)};
+            auto logicalDir = root.path() / "logical-parent/store";
+            auto blocker = atStoreDir ? logicalDir : logicalDir.parent_path();
+            auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(
+                root.path() / "physical-root", StoreConfig::Params{{"store", logicalDir.string()}}));
+            createDirs(blocker.parent_path());
+            auto target = root.path() / "symlink-target";
+            createDirs(target);
+            writeFile(target / "outside", "must not leak through a promoted symlink");
+            if (kind != 0) {
+                auto host = make_ref<MemorySourceAccessor>();
+                if (kind == 1 || kind == 2)
+                    host->root = File{File::Regular{.executable = kind == 2, .contents = "old blocker"}};
+                else if (kind == 3)
+                    host->root = File{File::Symlink{.target = target.string()}};
+                else
+                    host->addFile(CanonPath("outside"), "surviving directory sibling");
+                StringSink dump;
+                host->dumpPath(CanonPath::root, dump);
+                StringSource source{dump.s};
+                restorePath(blocker, source);
+            }
+            for (auto mode : {Mode::Impure, Mode::Restricted, Mode::Pure}) {
+                SCOPED_TRACE(int(mode));
+                EvalSettings nestedSettings{readOnlyMode};
+                nestedSettings.nixPath = {};
+                nestedSettings.pureEval = mode == Mode::Pure;
+                nestedSettings.restrictEval = mode == Mode::Restricted;
+                EvalState nested({}, local, fetchSettings, nestedSettings);
+                /* Admission is separate from whether the composed tree has
+                   the node; permit siblings so absence cannot be a policy hit. */
+                nested.allowPathLegacy(blocker.string());
+                auto tree = make_ref<MemorySourceAccessor>();
+                tree->addFile(CanonPath("default.nix"), "42");
+                fetchers::Input input;
+                input.attrs.insert_or_assign("name", fmt("mount-ancestor-%d", serial++));
+                auto path = nested.mountInput(input, tree);
+                auto logical = CanonPath(local->printStorePath(path));
+                auto ancestor = CanonPath(blocker.string());
+                EXPECT_EQ(nested.rootFS->lstat(ancestor).type, SourceAccessor::tDirectory);
+                ASSERT_TRUE(nested.rootFS->maybeLstat(ancestor));
+                EXPECT_EQ(nested.rootFS->maybeLstat(ancestor)->type, SourceAccessor::tDirectory);
+                auto entries = nested.rootFS->readDirectory(ancestor);
+                EXPECT_TRUE(entries.contains(atStoreDir ? path.to_string() : "store"));
+                bool keepsSibling = kind == 4 && mode != Mode::Pure;
+                EXPECT_EQ(entries.contains("outside"), keepsSibling);
+                EXPECT_EQ(nested.rootFS->pathExists(ancestor / "outside"), keepsSibling);
+                if (keepsSibling) {
+                    EXPECT_EQ(nested.rootFS->readFile(ancestor / "outside"), "surviving directory sibling");
+                }
+                EXPECT_THROW(nested.rootFS->readFile(ancestor), Error);
+                EXPECT_THROW(nested.rootFS->readLink(ancestor), Error);
+                EXPECT_FALSE(nested.rootFS->getPhysicalPath(ancestor));
+                EXPECT_FALSE(nested.rootFS->getKnownEntry(ancestor));
+                EXPECT_FALSE(nested.rootFS->getFingerprint(ancestor));
+                auto expression = nested.storePath(path) / "default.nix";
+                EXPECT_EQ(expression.resolveSymlinks().path, logical / "default.nix");
+                EXPECT_EQ(expression.resolveSymlinks().readFile(), "42");
+                Value value;
+                nested.evalFile(expression, value);
+                nested.forceValue(value, noPos);
+                EXPECT_THAT(value, IsIntEq(42));
+            }
+        }
 }
 
 TEST_F(EvalStateTest, parsedFilesReleaseTheirSourceWithTheEvaluator)
@@ -456,6 +719,79 @@ TEST_F(PureEvalTest, pathExists)
         ASSERT_THAT(eval("builtins.readDir /."), IsAttrsOfSize(1));
         ASSERT_THAT(eval("builtins.pathExists /nix"), IsTrue());
         ASSERT_THAT(eval("builtins.pathExists /nix/store"), IsTrue());
+    }
+}
+
+/* Input selection changes the accessor view, not values and search results
+   already memoized in this evaluation. Explicit reset starts a fresh epoch. */
+TEST_F(EvalStateTest, mountingPreservesEvaluationMemoizationUntilExplicitReset)
+{
+    enum class Observation { FileImport, SymlinkImport, MissingLookupRoot, MissingLookupChild };
+    for (auto observation :
+         {Observation::FileImport,
+          Observation::SymlinkImport,
+          Observation::MissingLookupRoot,
+          Observation::MissingLookupChild}) {
+        SCOPED_TRACE(int(observation));
+        AutoDelete root{canonPath(createTempDir(), true)};
+        auto logicalDir = root.path() / "logical-store";
+        auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(
+            root.path() / "physical-root", StoreConfig::Params{{"store", logicalDir.string()}}));
+        createDirs(logicalDir);
+        auto tree = make_ref<MemorySourceAccessor>();
+        tree->addFile(CanonPath("default.nix"), "42");
+        fetchers::Input input;
+        input.attrs.insert_or_assign("name", "mount-evaluation-epoch");
+        auto path = fetchToStore2(fetchSettings, *local, SourcePath{tree}, FetchMode::DryRun, input.getName()).first;
+        auto logical = CanonPath(local->printStorePath(path));
+        auto host = std::filesystem::path(logical.abs());
+        const bool lookup =
+            observation == Observation::MissingLookupRoot || observation == Observation::MissingLookupChild;
+        if (observation != Observation::MissingLookupRoot)
+            createDirs(host);
+        if (observation == Observation::FileImport)
+            writeFile(host / "default.nix", "7");
+        else if (observation == Observation::SymlinkImport) {
+            auto target = root.path() / "previous-target.nix";
+            writeFile(target, "7");
+            createSymlink(target, host / "default.nix");
+        }
+
+        EvalSettings nestedSettings{readOnlyMode};
+        nestedSettings.nixPath = {};
+        nestedSettings.pureEval = false;
+        nestedSettings.restrictEval = true;
+        auto search = lookup ? LookupPath::parse({"mounted=" + logical.abs()}) : LookupPath{};
+        EvalState nested(search, local, fetchSettings, nestedSettings);
+        nested.allowPathLegacy(root.path().string());
+        auto imported = [&] {
+            Value value;
+            nested.evalFile(nested.storePath(path) / "default.nix", value);
+            nested.forceValue(value, noPos);
+            return value;
+        };
+        Value earlier;
+        if (lookup)
+            EXPECT_THROW(nested.findFile("mounted/default.nix"), ThrownError);
+        else {
+            earlier = imported();
+            EXPECT_THAT(earlier, IsIntEq(7));
+        }
+
+        EXPECT_EQ(nested.mountInput(input, tree), path);
+        EXPECT_EQ(nested.rootFS->readFile(logical / "default.nix"), "42");
+        if (lookup)
+            EXPECT_THROW(nested.findFile("mounted/default.nix"), ThrownError);
+        else
+            EXPECT_THAT(imported(), IsIntEq(7));
+
+        nested.resetFileCache();
+        if (lookup)
+            EXPECT_EQ(nested.findFile("mounted/default.nix").readFile(), "42");
+        else {
+            EXPECT_THAT(imported(), IsIntEq(42));
+            EXPECT_THAT(earlier, IsIntEq(7));
+        }
     }
 }
 

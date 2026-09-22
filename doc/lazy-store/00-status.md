@@ -1,6 +1,6 @@
 # Lazy-store status
 
-The current source passes the validation below, but the requirement that **every benchmark case beat the branch base remains open**. The comparison uses branch base `8aad447`, not a moving `master`. The latest measured revision, `16ed142be`, records eight lower medians and one regression in its [optimized comparison](runs/2026-09-21-performance/paired-16ed142be.json). Warm 32-attribute Git remains 8.53% slower; the small warm eight-attribute Git improvement has weak paired evidence.
+The fetched-input mount correction passes the debug validation below; its optimized measurements remain pending. The requirement that **every benchmark case beat the branch base remains open**. The comparison uses branch base `8aad447`, not a moving `master`. The latest measured revision, `22dc0f4ae`, records eight lower medians and one regression in its [optimized comparison](runs/2026-09-21-performance/paired-22dc0f4ae.json). Warm 32-attribute Git remains 7.38% slower; the small warm eight-attribute Git improvement has weak paired evidence.
 
 ## Semantic model
 
@@ -14,13 +14,13 @@ The [specification](01-specification.md), [implementation derivation](04-derivat
 
 ## Completed validation and limits
 
-The completed debug checks report **2,474 passing unit tests and two existing runtime skips**: 439 evaluator, 159 fetcher, 889 utility and 987 store tests. Three disabled tests remain excluded. All 889 utility tests also pass with newer syscalls disabled. Seven targeted functional tests and **all twelve real overlay tests pass**; three additional remote-build tests skip their namespace probe. The `7b026f744` optimized checks exposed a remote binary-cache publication regression, now corrected and passing in debug. The earlier `16ed142be` optimized release passed 207 packaged tests with 36 skips. A new optimized validation and comparison are pending. Overlay-specific limits, including no cross-layer regular-holder sharing and the disabled auxiliary verification/materialisation routes, remain explicit in the store model.
+The completed debug checks report **2,483 passing unit tests and two existing runtime skips**: 443 evaluator, 159 fetcher, 894 utility and 987 store tests. Three disabled tests remain excluded. All 894 utility tests also pass with newer syscalls disabled. Seven targeted functional tests pass, including fourteen execution-store shell cases, and **all twelve real overlay tests pass on the corrected source**. Three additional remote-build tests skipped their namespace probe in the preceding audit. The `22dc0f4ae` optimized release passes 207 packaged tests with 36 skips, and its full comparison is complete. Overlay-specific limits, including no cross-layer regular-holder sharing and the disabled auxiliary verification/materialisation routes, remain explicit in the store model.
 
 The [performance and verification report](09-performance.md#verification) records the finite-domain checks, negative controls, syscall evidence and source-review limits. The latest optimized comparison additionally passes all eighteen complete store-graph comparisons and binds all 156 evaluation outputs to their actual store pairs. These checks compare exact contents, modes, references and outputs under an injective substitution of store addresses. They do not establish equivalence of arbitrary embedded programs.
 
-These results apply to aarch64 Linux. **Windows has not been runtime-verified.** The two unit-test runtime skips belong to the fetcher and utility suites. Older platform counts and experiments in [validation](05-validation.md) and the [holder-index investigation](06-holder-index.md) are evidence for their recorded implementations, not current cross-platform gates. The current source checks include the subsequent cache-identity, workdir-policy, canonical-name and publication audits; the latest completed optimized measurements belong to `16ed142be`. Older profiles remain explicitly attributed to their revisions.
+These results apply to aarch64 Linux. **Windows has not been runtime-verified.** The two unit-test runtime skips belong to the fetcher and utility suites. Older platform counts and experiments in [validation](05-validation.md) and the [holder-index investigation](06-holder-index.md) are evidence for their recorded implementations, not current cross-platform gates. The `22dc0f4ae` source checks include the cache-identity, workdir-policy, canonical-name and publication audits; its optimized measurements are complete. Older profiles remain explicitly attributed to their revisions.
 
-The [current source audit](09-performance.md#current-source-validation) checks cache identity and publication, rejects malformed registration maps before effects, expresses fixed workdir membership directly, and separates physical name decoding from canonical logical names. The preceding `16ed142be` audit includes 6,663 canonical-tree cases and eight failing faulty variants with passing restorations; those earlier changes are included in the completed optimized comparison below. Performance of the subsequent changes remains to be measured.
+The [current source audit](09-performance.md#current-source-validation) makes fetched inputs authoritative and derives every accessor operation from a total tree graft. It preserves evaluation memoization and reads shell metadata from the execution store. Earlier audits check cache identity and publication, registration domains, workdir membership and canonical names. Their optimized comparison is complete; measurements of the mount correction remain pending.
 
 ## Remaining performance work
 
@@ -28,13 +28,13 @@ The latest report uses pinned Nixpkgs, five paired cold trials and ten paired wa
 
 | Warm workload | Base median | Branch median | Change in median elapsed time |
 | --- | ---: | ---: | ---: |
-| `git+file:` · 32 attributes | 1.403 s | 1.523 s | +8.53% |
+| `git+file:` · 32 attributes | 1.410 s | 1.513 s | +7.38% |
 
-The percentage uses the report's unrounded median ratio; the branch loses all ten pairs. The other eight cases have lower medians. Warm eight-attribute Git is 2.33% lower by ratio of medians, but wins only five of ten pairs and has a median paired ratio of 0.999: weak evidence, not a robust win. The all-cases-faster requirement remains unmet. Further work must preserve raw worktree observations, source ownership and GC protection while removing unnecessary work.
+The percentage uses the report's unrounded median ratio; the branch loses all ten pairs. The other eight cases have lower medians. Warm eight-attribute Git is 0.77% lower by ratio of medians, wins seven of ten pairs and has a median paired ratio of 0.9945: a small improvement, not a robust margin. The all-cases-faster requirement remains unmet. Further work must preserve raw worktree observations, source ownership and GC protection while removing unnecessary work.
 
 ## Evidence and reproduction
 
-- [Performance report](09-performance.md) and [latest sample record](runs/2026-09-21-performance/paired-16ed142be.json): exact revisions, binaries, input provenance, raw samples, commands, resource usage and graph-check results.
+- [Performance report](09-performance.md) and [latest sample record](runs/2026-09-21-performance/paired-22dc0f4ae.json): exact revisions, binaries, input provenance, raw samples, commands, resource usage and graph-check results.
 - [Nixpkgs evaluation driver](runs/nixpkgs-evaluation.py): all three URI schemes, cold 32-attribute and warm 8-/32-attribute cases, balanced executable order and explicit CPU affinity. Builds and profiles run separately from timing.
 - [Complete store comparison](runs/compare-store-graphs.py) and [methodology counterchecks](runs/check-benchmark-methodology.py): graph/content/output equivalence and planted failures. Each cold store requires its own comparison; copying an indexed store changes holder inodes and is not a representative warm fixture.
 - [Validation commands](05-validation.md) and [overlay host driver](runs/overlay-suite-on-host.sh): reproduce the applicable gates. Overlay tests must actually mount overlayfs; a skipped namespace probe is not a passing test.

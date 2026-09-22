@@ -448,7 +448,9 @@ public:
     RepairFlag repair;
 
     /**
-     * The accessor corresponding to `store`.
+     * The evaluator's input mounts, over the selected store in pure mode
+     * and the host/store fallback in impure mode. A fetched input owns its
+     * whole mounted prefix, independently of physical store registration.
      */
     const ref<MountedSourceAccessor> storeFS;
 

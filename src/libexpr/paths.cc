@@ -72,8 +72,9 @@ StorePath EvalState::mountInput(fetchers::Input & input, ref<SourceAccessor> acc
 
     storeFS->mount(CanonPath(store->printStorePath(storePath)), accessor);
 
-    /* A graft may replace an existing physical-store node. Discard facts
-       observed before the mount, including cached file types and links. */
+    /* The fetched tree owns this prefix, including over an ambient host
+       occupant. Discard facts observed before the graft, including cached
+       file types, links and naming decisions. */
     rootFS->invalidateCache();
 
     /* `input` is what `Input::getAccessor` returned: whatever the original
