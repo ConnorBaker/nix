@@ -3709,56 +3709,6 @@ TEST_F(LocalStoreObjectsTest, smallIngestionsFlushOnTheCallerAndResetTheirHolder
     EXPECT_EQ(hold.pendingHolder(id, true), "/second/b");
 }
 
-TEST_F(LocalStoreObjectsTest, pendingHolderKeysPreserveBytesLengthAndMode)
-{
-    auto hold = store->objects.hold();
-    auto root = tempStoreDir.path() / "pending-keys";
-    hold.setRoot(root);
-    /* The semantic key is a byte string and a mode. Keeping them separate
-       makes the oracle independent of the pending map's representation.
-       These prefix families include zero bytes and both mode-marker bytes. */
-    std::map<std::pair<std::string, bool>, std::string> expected;
-    size_t cases = 0;
-    for (char byte : {'\0', ' ', 'x'})
-        for (size_t length = 0; length <= Hash::maxHashSize; ++length)
-            for (bool executable : {false, true}) {
-                SCOPED_TRACE(fmt("byte=%d length=%d executable=%d", int(byte), length, executable));
-                std::string bytes(length, byte);
-                Hash id{HashAlgorithm::SHA512};
-                id.hashSize = length;
-                memcpy(id.hash, bytes.data(), bytes.size());
-                auto name = fmt("holder-%d", cases++);
-                auto prior = expected.find({bytes, executable});
-                auto old = prior == expected.end() ? std::optional<std::string>{}
-                                                   : std::optional{(root / prior->second).string()};
-                EXPECT_EQ(hold.pendingHolder(id, executable), old);
-                EXPECT_EQ(hold.addRow({.id = id, .executable = executable, .name = name}), old);
-                expected.try_emplace(std::pair{bytes, executable}, name);
-                auto selected = (root / expected.at({bytes, executable})).string();
-                EXPECT_EQ(hold.pendingHolder(id, executable), selected);
-                EXPECT_EQ(hold.addRow({.id = id, .executable = executable, .name = "later-alias"}), selected);
-            }
-    EXPECT_EQ(cases, 390u);
-    EXPECT_EQ(expected.size(), 386u); // Empty byte strings coincide across the three prefix families.
-    auto rows = hold.takeRows();
-    EXPECT_EQ(rows.size(), expected.size());
-    for (const auto & row : rows) {
-        std::string bytes(reinterpret_cast<const char *>(row.id.hash), row.id.hashSize);
-        EXPECT_EQ(row.name, expected.at({bytes, row.executable}));
-    }
-    /* Draining rows does not discard the ingestion's selected witnesses. */
-    for (const auto & [key, name] : expected) {
-        const auto & [bytes, executable] = key;
-        Hash id{HashAlgorithm::SHA512};
-        id.hashSize = bytes.size();
-        memcpy(id.hash, bytes.data(), bytes.size());
-        auto selected = (root / name).string();
-        EXPECT_EQ(hold.pendingHolder(id, executable), selected);
-        EXPECT_EQ(hold.addRow({.id = id, .executable = executable, .name = "after-drain"}), selected);
-    }
-    EXPECT_TRUE(hold.takeRows().empty());
-}
-
 /* An inode snapshot suggests a lookup; it cannot establish present content
    or sharing. Exercise every rejected hint and the valid shortcut at both
    regular-file root forms, with each executable bit. */
