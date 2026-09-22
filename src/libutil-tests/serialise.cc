@@ -5,7 +5,9 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
+#include <array>
 #include <limits>
+#include <utility>
 
 namespace nix {
 
@@ -14,6 +16,115 @@ template<typename T>
 auto makeNumSource(T num)
 {
     return sinkToSource([num](Sink & writer) { writer << num; });
+}
+
+TEST(BufferedSink, finiteChunkSequencesPreserveWriteBoundaries)
+{
+    struct Failure
+    {};
+
+    struct Record
+    {
+        std::vector<std::string> calls;
+        std::string bytes;
+        size_t failAt = 0;
+
+        void write(std::string_view data)
+        {
+            calls.emplace_back(data);
+            if (calls.size() == failAt)
+                throw Failure{};
+            bytes += data;
+        }
+    };
+
+    struct Observed : BufferedSink
+    {
+        Record record;
+        using BufferedSink::BufferedSink;
+
+        void writeUnbuffered(std::string_view data) override
+        {
+            record.write(data);
+        }
+    };
+
+    for (size_t capacity = 0; capacity <= 4; ++capacity) {
+        /* Every reachable pending length, plus an allocated but empty
+           buffer where the capacity admits a buffered write. */
+        auto states = std::max(capacity, size_t{1}) + (capacity > 1);
+        for (size_t state = 0; state < states; ++state)
+            for (size_t length = 0, combinations = 1; length <= 3; ++length, combinations *= 4)
+                for (size_t sequence = 0; sequence < combinations; ++sequence) {
+                    std::vector<std::string> chunks;
+                    const std::array<size_t, 4> sizes{0, 1, capacity, capacity + 1};
+                    for (size_t i = 0, code = sequence; i < length; ++i, code /= 4)
+                        chunks.emplace_back(sizes[code % 4], static_cast<char>(i));
+
+                    /* At most two callbacks per chunk and one final
+                       flush. Inject a failure at every possible call. */
+                    for (size_t failAt = 0; failAt <= 2 * length + 1; ++failAt) {
+                        SCOPED_TRACE(
+                            (::testing::Message()
+                             << capacity << ':' << state << ':' << length << ':' << sequence << ':' << failAt));
+                        Observed actual{capacity};
+                        Record expected;
+                        if (capacity > 1 && state == capacity) {
+                            actual("p");
+                            actual.flush();
+                            actual.record = {};
+                        }
+                        std::string pending(state < capacity ? state : 0, 'p');
+                        actual(pending);
+                        actual.record.failAt = expected.failAt = failAt;
+                        auto flushExpected = [&] {
+                            if (!pending.empty()) {
+                                auto bytes = std::exchange(pending, {});
+                                expected.write(bytes);
+                            }
+                        };
+                        auto feedExpected = [&](std::string_view chunk) {
+                            if (chunk.empty())
+                                return;
+                            /* Buffering retains a chunk only while the
+                               accumulated bytes remain below capacity. */
+                            if (pending.size() + chunk.size() < capacity)
+                                pending += chunk;
+                            else {
+                                flushExpected();
+                                expected.write(chunk);
+                            }
+                        };
+                        auto run = [&](auto feed, auto flush) {
+                            size_t operation = 0;
+                            try {
+                                for (auto & chunk : chunks) {
+                                    feed(chunk);
+                                    ++operation;
+                                }
+                                flush();
+                                ++operation;
+                            } catch (Failure &) {
+                            }
+                            return operation;
+                        };
+                        EXPECT_EQ(
+                            run([&](auto chunk) { actual(chunk); }, [&] { actual.flush(); }),
+                            run(feedExpected, flushExpected));
+                        EXPECT_EQ(actual.bufPos, pending.size());
+                        EXPECT_EQ(actual.hasData(), !pending.empty());
+                        EXPECT_EQ(actual.record.calls, expected.calls);
+                        EXPECT_EQ(actual.record.bytes, expected.bytes);
+                        /* A failed flush has consumed its pending bytes;
+                           recovery must neither repeat nor lose others. */
+                        actual.record.failAt = expected.failAt = 0;
+                        actual.flush();
+                        flushExpected();
+                        EXPECT_EQ(actual.record.calls, expected.calls);
+                        EXPECT_EQ(actual.record.bytes, expected.bytes);
+                    }
+                }
+    }
 }
 
 TEST(readNum, negativeValuesSerialiseWellDefined)

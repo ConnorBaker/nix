@@ -372,7 +372,7 @@ struct GitObjectStore::Hold::Pending
         /** Rows not yet handed to the sink; taken by swap. */
         std::vector<Row> queue;
         /** (id, mode) -> the holder's name, kept after the row is written. */
-        boost::unordered_flat_map<std::string, std::string> byKey;
+        boost::unordered_flat_map<std::array<uint8_t, Hash::maxHashSize + 1>, std::string> byKey;
     };
 
     /* A one-file ingestion occupies one shard. Allocate the others only
@@ -424,11 +424,14 @@ static size_t holdBatchSize()
     return n;
 }
 
-static std::string pendingKey(const Hash & id, bool executable)
+static auto pendingKey(const Hash & id, bool executable)
 {
-    std::string key(id.hashSize + 1, '\0');
+    /* The nonzero mode terminates the hash bytes; zero padding preserves
+       distinct lengths without allocating, including hashes beyond SHA256. */
+    std::array<uint8_t, Hash::maxHashSize + 1> key{};
+    assert(id.hashSize <= Hash::maxHashSize);
     memcpy(key.data(), id.hash, id.hashSize);
-    key.back() = executable ? 'x' : ' ';
+    key[id.hashSize] = executable ? 'x' : ' ';
     return key;
 }
 

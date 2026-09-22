@@ -610,8 +610,11 @@ void LocalStore::openBlobWriter()
        excluding each other (`local-store.hh`, `blobWriterDb`).  `synchronous`
        and the journal are the store's own; the connection is this process's
        and is closed with the store. */
+    /* Every use of this connection and its statements holds blobWriterMutex. */
     blobWriterDb = std::make_unique<SQLite>(
-        dbDir / "db.sqlite", SQLiteSettings{.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL});
+        dbDir / "db.sqlite",
+        SQLiteSettings{
+            .mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL, .externalSynchronization = true});
     /* The index is a cache -- every row is derivable from the store's own
        paths, and `nix-store --optimise` rebuilds it -- so its writes need not
        be synchronous. Keep the store's journal mode: `isCache()` would

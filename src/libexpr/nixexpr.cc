@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <sstream>
+#include <type_traits>
 
 #include "nix/util/strings-inline.hh"
 
@@ -407,7 +408,9 @@ void ExprAttrs::moveDataToAllocator(std::pmr::polymorphic_allocator<char> & allo
     dynamicAttrs.emplace(std::move(newDynamicAttrs), alloc);
     if (inheritFromExprs) {
         std::pmr::vector<Expr *> newInheritFromExprs{std::move(*inheritFromExprs), alloc};
-        inheritFromExprs.emplace(std::move(newInheritFromExprs), alloc);
+        static_assert(std::is_nothrow_move_constructible_v<std::pmr::vector<Expr *>>);
+        std::destroy_at(inheritFromExprs);
+        std::construct_at(inheritFromExprs, std::move(newInheritFromExprs));
     }
 }
 

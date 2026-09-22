@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <iterator>
+#include <openssl/sha.h>
 
 #include "nix/util/merkle-hash.hh"
 #include "nix/util/archive.hh"
@@ -85,11 +86,15 @@ std::string serialiseTree(const Tree & tree)
 
 Hash treeId(std::string_view body)
 {
-    HashSink sink(hashAlgo);
-    LambdaSink direct{[&](std::string_view chunk) { sink.writeUnbuffered(chunk); }};
+    static_assert(hashAlgo == HashAlgorithm::SHA256);
+    SHA256_CTX context;
+    SHA256_Init(&context);
+    LambdaSink direct{[&](std::string_view chunk) { SHA256_Update(&context, chunk.data(), chunk.size()); }};
     feedHeader(direct, "tree", body.size());
     direct(body);
-    return sink.finish().hash;
+    Hash hash(hashAlgo);
+    SHA256_Final(hash.hash, &context);
+    return hash;
 }
 
 void insertEntry(Tree & tree, std::string_view name, const TreeEntry & entry)

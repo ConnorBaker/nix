@@ -67,26 +67,21 @@ void SizedSource::anchor() {}
 
 void BufferedSink::operator()(std::string_view data)
 {
+    if (data.empty())
+        return;
+
+    /* Bypass the buffer when the data would fill its remaining space. */
+    if (data.size() >= bufSize - bufPos) {
+        flush();
+        writeUnbuffered(data);
+        return;
+    }
+
+    /* The whole chunk fits, leaving space in the buffer. */
     if (!buffer)
         buffer = decltype(buffer)(new char[bufSize]);
-
-    while (!data.empty()) {
-        /* Optimisation: bypass the buffer if the data exceeds the
-           buffer size. */
-        if (data.size() >= bufSize - bufPos) {
-            flush();
-            writeUnbuffered(data);
-            break;
-        }
-        /* Otherwise, copy the bytes to the buffer.  Flush the buffer
-           when it's full. */
-        size_t n = data.size() > bufSize - bufPos ? bufSize - bufPos : data.size();
-        memcpy(buffer.get() + bufPos, data.data(), n);
-        data.remove_prefix(n);
-        bufPos += n;
-        if (bufPos == bufSize)
-            flush();
-    }
+    memcpy(buffer.get() + bufPos, data.data(), data.size());
+    bufPos += data.size();
 }
 
 void BufferedSink::flush()

@@ -148,15 +148,18 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                             return entry.first.find(caseHackSuffix) != std::string::npos;
                         }))
                         unhacked = unhackedEntries(entries, acc, from);
+                    auto visitChild = [&](const std::string & actual) {
+                        return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
+                    };
                     auto children = [&](fun<void(std::string_view, bool, fun<Result()>)> each) {
                         auto child =
-                            [&](std::string_view name, std::string_view actual, SourceAccessor::DirEntry type) {
+                            [&](std::string_view name, const std::string & actual, SourceAccessor::DirEntry type) {
                                 if (filter.get_fn().target<AllPaths>() || filter((filterBase / name).abs()))
-                                    /* Keep the view itself in a deferred visit;
-                                       its string belongs to entries or unhacked,
-                                       both live for the whole directory scope. */
-                                    each(name, type == SourceAccessor::tDirectory, [&, actual] {
-                                        return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
+                                    /* The context and name both live for this
+                                       directory scope; each deferred visit only
+                                       borrows those two existing objects. */
+                                    each(name, type == SourceAccessor::tDirectory, [&visitChild, &actual] {
+                                        return visitChild(actual);
                                     });
                             };
                         if (unhacked)

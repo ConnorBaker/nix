@@ -148,8 +148,9 @@ struct GitRepo
     virtual ref<SourceAccessor>
     getAccessor(const Hash & rev, const GitAccessorOptions & options, std::string displayPrefix) = 0;
 
+    /** Retains a fixed workdir observation; callers must not mutate it through another alias. */
     virtual ref<SourceAccessor> getAccessor(
-        const WorkdirInfo & wd, const GitAccessorOptions & options, MakeNotAllowedError makeNotAllowedError) = 0;
+        ref<const WorkdirInfo> wd, const GitAccessorOptions & options, MakeNotAllowedError makeNotAllowedError) = 0;
 
     virtual void flush() = 0;
 

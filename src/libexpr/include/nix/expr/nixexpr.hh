@@ -409,7 +409,8 @@ struct ExprAttrs : Expr
      * new pmr::map using a different allocator (move assignment will copy into the old allocator)
      */
     std::optional<AttrDefs> attrs;
-    std::optional<std::pmr::vector<Expr *>> inheritFromExprs;
+    /* Only allocated when present, in the parser pool owned by Exprs. */
+    std::pmr::vector<Expr *> * inheritFromExprs = nullptr;
 
     struct DynamicAttrDef
     {

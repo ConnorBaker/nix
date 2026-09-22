@@ -1261,7 +1261,8 @@ TEST_F(GitUtilsTest, workdirReadsAndNamesItsFilesystemView)
     auto wd = repo->getWorkdirInfo();
     ASSERT_TRUE(wd.dirtyFiles.contains(CanonPath("dirty/c")));
     ASSERT_FALSE(wd.dirtyFiles.contains(CanonPath("clean/a")));
-    auto workdir = repo->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("no"); });
+    auto workdir = repo->getAccessor(
+        make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) { return RestrictedPathError("no"); });
     workdir->fingerprint = "whole";
     for (auto p : {"", "clean", "clean/a", "dirty", "dirty/c"}) {
         EXPECT_EQ(workdir->getFingerprint(CanonPath(p)), (std::pair{CanonPath(p), std::string("whole")}));
@@ -1321,7 +1322,9 @@ TEST_F(GitUtilsTest, workdirDomainIsTheFixedTrackedPrefixesAndTheirAncestors)
                        return prefixOf(p, q) || prefixOf(q, p);
                    });
         };
-        auto workdir = repo->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("untracked"); });
+        auto workdir = repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) {
+            return RestrictedPathError("untracked");
+        });
         EXPECT_EQ(workdir->allowsConcurrentTraversal(), physical->allowsConcurrentTraversal());
         for (const auto & q : queries) {
             SCOPED_TRACE(q.abs());
@@ -1371,7 +1374,9 @@ TEST_F(GitUtilsTest, workdirTrackedPrefixStillAdmitsAReplacementDirectory)
     write("tracked", "before");
     GitRepo::WorkdirInfo wd;
     wd.files.insert(CanonPath("tracked"));
-    auto workdir = openRepo()->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("untracked"); });
+    auto workdir = openRepo()->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) {
+        return RestrictedPathError("untracked");
+    });
     EXPECT_EQ(workdir->readFile(CanonPath("tracked")), "before");
     EXPECT_FALSE(workdir->getFingerprint(CanonPath("tracked")));
 
@@ -1571,7 +1576,8 @@ TEST_F(GitUtilsTest, workdirIndexFlagsDoNotChangeItsContents)
 
     auto repo = openRepo();
     auto wd = repo->getWorkdirInfo();
-    auto workdir = repo->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("no"); });
+    auto workdir = repo->getAccessor(
+        make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) { return RestrictedPathError("no"); });
     workdir->fingerprint = "whole";
     for (unsigned flags = 0; flags < 4; ++flags)
         for (bool changed : {false, true})
@@ -1612,7 +1618,9 @@ TEST_F(GitUtilsTest, workdirAttributesFromTheIndexDoNotReplaceFilesystemBytes)
             auto wd = repo->getWorkdirInfo();
             ASSERT_TRUE(wd.files.contains(CanonPath(file)));
             ASSERT_FALSE(wd.dirtyFiles.contains(CanonPath(file)));
-            auto workdir = repo->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("no"); });
+            auto workdir = repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) {
+                return RestrictedPathError("no");
+            });
             workdir->fingerprint = "whole";
             EXPECT_EQ(workdir->readFile(CanonPath(file)), "line\r\n");
             EXPECT_EQ(workdir->getFingerprint(CanonPath(file)), (std::pair{CanonPath(file), std::string("whole")}));
@@ -1740,7 +1748,9 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
     auto wd = repo->getWorkdirInfo();
     ASSERT_TRUE(wd.isDirty);
     auto workdir =
-        repo->getAccessor(wd, {.exportIgnore = true}, [](const CanonPath & path) { return RestrictedPathError("no"); });
+        repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {.exportIgnore = true}, [](const CanonPath & path) {
+            return RestrictedPathError("no");
+        });
     workdir->fingerprint = "whole";
     EXPECT_EQ(workdir->getFingerprint(CanonPath("clean/a")), (std::pair{CanonPath("clean/a"), std::string("whole")}));
     EXPECT_EQ(workdir->getFingerprint(CanonPath("dirty")), (std::pair{CanonPath("dirty"), std::string("whole")}));
@@ -1757,7 +1767,9 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
     EXPECT_EQ(wrapped2->getFingerprint(CanonPath("clean/a")), (std::pair{CanonPath("clean/a"), std::string("whole")}));
     auto wd2 = repo2->getWorkdirInfo();
     auto workdir2 = repo2->getAccessor(
-        wd2, {.exportIgnore = true}, [](const CanonPath & path) { return RestrictedPathError("no"); });
+        make_ref<const GitRepo::WorkdirInfo>(wd2), {.exportIgnore = true}, [](const CanonPath & path) {
+            return RestrictedPathError("no");
+        });
     workdir2->fingerprint = "whole";
     EXPECT_EQ(workdir2->getFingerprint(CanonPath("clean/a")), (std::pair{CanonPath("clean/a"), std::string("whole")}));
 
@@ -1789,8 +1801,10 @@ TEST_F(GitUtilsTest, exportIgnoreFilterIsLeftOutWhenNoSourceNamesIt)
 
     auto wd = repo->getWorkdirInfo();
     auto notAllowed = [](const CanonPath & path) { return RestrictedPathError("no"); };
-    auto workdir = repo->getAccessor(wd, {.exportIgnore = true}, notAllowed);
-    EXPECT_TRUE(typeid(*workdir) == typeid(*repo->getAccessor(wd, {}, notAllowed))) << typeid(*workdir).name();
+    auto workdir = repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {.exportIgnore = true}, notAllowed);
+    EXPECT_TRUE(
+        typeid(*workdir) == typeid(*repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {}, notAllowed)))
+        << typeid(*workdir).name();
 
     /* The same tree, the same name and path. */
     nix::initLibStore(/*loadConfig=*/false);
@@ -2052,7 +2066,7 @@ TEST_F(GitUtilsTest, workdirExportIgnoreSources)
         auto wd = repo->getWorkdirInfo();
         return std::pair{
             repo->attributesOutsideTheTreeMention("export-ignore", std::nullopt),
-            repo->getAccessor(wd, {.exportIgnore = true}, notAllowed)};
+            repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {.exportIgnore = true}, notAllowed)};
     };
 
     /* info/attributes. */
@@ -2126,7 +2140,10 @@ TEST_F(GitUtilsTest, sharedRepositoryAttributeReadersAgreeAfterRefresh)
     std::vector<std::pair<ref<SourceAccessor>, bool>> views;
     for (size_t copy = 0; copy < 2; ++copy) {
         views.emplace_back(
-            repo->getAccessor(wd, {.exportIgnore = true}, [](const CanonPath &) { return RestrictedPathError("no"); }),
+            repo->getAccessor(
+                make_ref<const GitRepo::WorkdirInfo>(wd),
+                {.exportIgnore = true},
+                [](const CanonPath &) { return RestrictedPathError("no"); }),
             true);
         views.emplace_back(repo->getAccessor(rev, {.exportIgnore = true}, ""), true);
         views.emplace_back(repo->getAccessor(rev, {.smudgeLfs = true}, ""), false);

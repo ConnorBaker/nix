@@ -228,9 +228,15 @@ TEST_F(EvalStateTest, parserContainersReleaseAllStorageWithTheEvaluator)
         {"attrs-bind-failure",
          R"(missing { static = 1; ${"dynamic"} = 2; inherit ({ inherited = 3; }) inherited; })",
          Failure::Bind},
+        {"attrs-bind-failure-after-migration",
+         R"({ static = 1; ${"dynamic"} = 2; inherit (missing) inherited; })",
+         Failure::Bind},
         {"attrs-merged-discard",
          R"({ a = {}; a = { static = 1; ${"dynamic"} = 2; inherit ({ inherited = 3; }) inherited; }; })",
          Failure::None},
+        {"attrs-merge-conflict",
+         R"({ a = { inherit ({ same = 1; }) same; }; a = { inherit ({ same = 2; }) same; }; })",
+         Failure::Parse},
         {"call-success", "(x: y: x) 1 2", Failure::None},
         {"call-parse-failure", "{ a = (x: x) 1;", Failure::Parse},
         {"call-bind-failure", "missing ((x: x) 1)", Failure::Bind},
@@ -258,6 +264,19 @@ TEST_F(EvalStateTest, parserContainersReleaseAllStorageWithTheEvaluator)
         EXPECT_GT(resource.allocations.load(), 0u);
         EXPECT_EQ(resource.outstanding.load(), 0u);
     }
+}
+
+TEST_F(EvalStateTest, mergingAttributeSetsPreservesEveryInheritedSourceCombination)
+{
+    for (bool leftInherited : {false, true})
+        for (bool rightInherited : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << leftInherited << " " << rightInherited);
+            auto left = leftInherited ? "inherit ({ one = 1; }) one;" : "one = 1;";
+            auto right = rightInherited ? "inherit ({ two = 2; }) two;" : "two = 2;";
+            EXPECT_THAT(
+                eval(fmt("let merged = { a = { %s }; a = { %s }; }; in merged.a.one * 10 + merged.a.two", left, right)),
+                IsIntEq(12));
+        }
 }
 
 /* A mount replaces the selected store or ambient host node; it never unions

@@ -497,7 +497,7 @@ binds1
   | binds[accum] INHERIT '(' expr ')' attrs ';'
     { $$ = $accum;
       if (!$accum->inheritFromExprs)
-          $accum->inheritFromExprs.emplace($accum->attrs->get_allocator().resource());
+          $accum->inheritFromExprs = $accum->attrs->get_allocator().new_object<std::pmr::vector<Expr *>>();
       $accum->inheritFromExprs->push_back($expr);
       auto from = state->exprs.add<ExprInheritFrom>(state->at(@expr), $accum->inheritFromExprs->size() - 1);
       for (auto & [i, iPos] : $attrs) {

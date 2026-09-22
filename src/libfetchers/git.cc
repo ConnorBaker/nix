@@ -1032,7 +1032,7 @@ struct GitInputScheme : InputScheme
         auto exportIgnore = getExportIgnoreAttr(input);
 
         ref<SourceAccessor> accessor =
-            repo->getAccessor(*workdirInfo, {.exportIgnore = exportIgnore}, makeNotAllowedError(repoPath));
+            repo->getAccessor(ref(workdirInfo), {.exportIgnore = exportIgnore}, makeNotAllowedError(repoPath));
 
         /* If the repo has submodules, return a mounted input accessor
            consisting of the accessor for the top-level repo and, per

@@ -788,7 +788,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
     getAccessor(const Hash & rev, const GitAccessorOptions & options, std::string displayPrefix) override;
 
     ref<SourceAccessor>
-    getAccessor(const WorkdirInfo & wd, const GitAccessorOptions & options, MakeNotAllowedError e) override;
+    getAccessor(ref<const WorkdirInfo> wd, const GitAccessorOptions & options, MakeNotAllowedError e) override;
 
     void fetch(const std::string & url, const std::string & refspec, bool shallow) override
     {
@@ -1796,32 +1796,30 @@ GitRepoImpl::getAccessor(const Hash & rev, const GitAccessorOptions & options, s
 }
 
 ref<SourceAccessor> GitRepoImpl::getAccessor(
-    const WorkdirInfo & wd, const GitAccessorOptions & options, MakeNotAllowedError makeNotAllowedError)
+    ref<const WorkdirInfo> wd, const GitAccessorOptions & options, MakeNotAllowedError makeNotAllowedError)
 {
     /* A working tree has fixed tracked membership and mutable filesystem
        contents. It needs neither a growing allow list nor names from a
        child: this constructor supplies the raw filesystem itself. */
     struct WorkdirSourceAccessor final : FilteringSourceAccessor
     {
-        const std::set<CanonPath> tracked;
+        const ref<const WorkdirInfo> wd;
 
         void anchor() override {}
 
         WorkdirSourceAccessor(
-            const std::filesystem::path & path,
-            const std::set<CanonPath> & tracked,
-            MakeNotAllowedError makeNotAllowedError)
+            const std::filesystem::path & path, ref<const WorkdirInfo> wd, MakeNotAllowedError makeNotAllowedError)
             : FilteringSourceAccessor(
                   // Older Nix versions followed the final symlink to the repo.
                   SourcePath(makeFSSourceAccessor(path, /*trackLastModified=*/false, FinalSymlink::Follow)),
                   std::move(makeNotAllowedError))
-            , tracked(tracked)
+            , wd(std::move(wd))
         {
         }
 
         bool isAllowed(const CanonPath & path) override
         {
-            return path.isRoot() || path.isAllowed(tracked);
+            return path.isRoot() || path.isAllowed(wd->files);
         }
 
         bool allowsConcurrentTraversal() override
@@ -1839,7 +1837,8 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
     };
 
     auto self = ref<GitRepoImpl>(shared_from_this());
-    ref<SourceAccessor> fileAccessor = make_ref<WorkdirSourceAccessor>(path, wd.files, std::move(makeNotAllowedError));
+    ref<SourceAccessor> fileAccessor =
+        make_ref<WorkdirSourceAccessor>(path, std::move(wd), std::move(makeNotAllowedError));
     /* Status determines tracked membership, not filesystem-object identity:
        index flags can suppress comparisons, and clean filters can equate
        different bytes. Keep the working tree as the source of its contents

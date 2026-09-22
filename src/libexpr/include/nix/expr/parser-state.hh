@@ -2,6 +2,7 @@
 ///@file
 
 #include <limits>
+#include <utility>
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/value.hh"
@@ -263,7 +264,7 @@ ParserState::addAttr(ExprAttrs * attrs, AttrSelectionPath & attrPath, const Symb
         // See https://github.com/NixOS/nix/issues/9020.
         if (jAttrs && ae) {
             if (ae->inheritFromExprs && !jAttrs->inheritFromExprs)
-                jAttrs->inheritFromExprs.emplace(jAttrs->attrs->get_allocator().resource());
+                jAttrs->inheritFromExprs = jAttrs->attrs->get_allocator().new_object<std::pmr::vector<Expr *>>();
             for (auto & ad : *ae->attrs) {
                 if (ad.second.kind == ExprAttrs::AttrDef::Kind::InheritedFrom) {
                     auto & sel = dynamic_cast<ExprSelect &>(*ad.second.e);
@@ -285,7 +286,7 @@ ParserState::addAttr(ExprAttrs * attrs, AttrSelectionPath & attrPath, const Symb
                     jAttrs->inheritFromExprs->end(),
                     std::make_move_iterator(ae->inheritFromExprs->begin()),
                     std::make_move_iterator(ae->inheritFromExprs->end()));
-                ae->inheritFromExprs.reset();
+                ae->attrs->get_allocator().delete_object(std::exchange(ae->inheritFromExprs, nullptr));
             }
         } else {
             dupAttr(attrPath, def.pos, j->second.pos);
