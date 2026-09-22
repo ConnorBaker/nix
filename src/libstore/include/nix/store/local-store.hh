@@ -783,24 +783,19 @@ private:
 
 public:
     /**
-     * Prepare the sink the copy's workers hand index rows to. The first
-     * flush creates its `Ingestions` row. Before registration it has no
-     * path, so its rows remain invisible to `link` (`schema.sql`).
+     * Start a path's private regular-file projection. Its rows enter the
+     * database only at completion, and become available to other ingestions
+     * only when their path is valid (`schema.sql`).
      */
     void beginIngestion(const GitObjectStore::Hold & hold, const std::filesystem::path & root);
 
     /**
      * Finish the path's complete regular-file projection, including an
      * empty one. Already-valid paths reconcile and publish here; a new
-     * builder output remains private until validity registration.
+     * builder output is persisted but remains invisible to holder lookup
+     * until validity registration.
      */
     void endIngestion(const GitObjectStore::Hold & hold, const StorePath & path);
-
-    /** One batch of index rows, in key order.  The sink `beginIngestion` installs. */
-    void writeBlobRows(
-        GitObjectStore::Hold::Ingestion & ingestion,
-        const std::string & holdName,
-        std::vector<GitObjectStore::Hold::Row> & batch);
 
 private:
     struct BlobCoalescing
@@ -833,30 +828,6 @@ private:
         uint64_t ingestion,
         std::vector<GitObjectStore::Hold::Row> & rows);
 
-    /**
-     * The index writer's **own connection** to the store's database.
-     *
-     * The measurement that forces it (`05` section 6, the h-round): the copy
-     * probes the index once per regular file from each of its workers, and
-     * every one of those takes the store's `_state` lock; a writer that takes
-     * the same lock for a transaction of a thousand rows stops all of them for
-     * its duration, so making the write *more* continuous made the parallel
-     * first entry worse, not better -- 1.25 s against 0.93 where the same
-     * work batched twice had been 0.925.  SQLite in WAL admits one writer
-     * beside its readers, so the index's writer takes a connection of its own
-     * and the two no longer exclude each other.
-     *
-     * Opened on first use and closed with the store.  Its own mutex, since
-     * the copy's workers drain into it.
-     */
-    std::mutex blobWriterMutex;
-    std::unique_ptr<SQLite> blobWriterDb;
-    std::unique_ptr<SQLiteStmt> blobWriterInsert;
-    std::unique_ptr<SQLiteStmt> blobWriterNewIngestion;
-
-    /** The writer's connection, opened if it is not open yet. */
-    void openBlobWriter();
-
 public:
 
     void recordBlobsAtPath(const GitObjectStore::Hold & hold, const std::filesystem::path & root);
@@ -873,9 +844,8 @@ public:
      * Whether an ingestion writes the index at all.  The *only* value
      * anything but a test may run under is `Write`; `NoRows` is the
      * ablation that separates what writing the index costs from what
-     * everything else does, which is what located the one lock the writer
-     * and the copy's probes used to share (`06-holder-index.md` sections 4.8
-     * and 5), and which would catch a regression in either.  A store left
+     * everything else does. The earlier writer/probe lock experiment is
+     * recorded in `06-holder-index.md` sections 4.8 and 5. A store left
      * under `NoRows` has no index and shares nothing afterwards, so it is
      * reachable by `_NIX_TEST_HOLDER_NO_ROWS` alone.
      */

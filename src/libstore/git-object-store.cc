@@ -20,11 +20,10 @@
 #include <array>
 
 #include <atomic>
-#include <thread>
-#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <random>
+#include <type_traits>
 #include <span>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -354,24 +353,17 @@ static std::error_code hardLink(const std::filesystem::path & from, const std::f
    forty thousand times by eight threads, and it was the first reason the
    parallel copy was slower than the route it replaces.
 
-   A writer thread drains a large ingestion into the store's index while
-   the copy runs. A small ingestion drains on the registering thread. Two
-   things make that cheap.  A shard's queue is taken by *swap* under its lock,
-   so a drain copies no rows; and what a later `link` needs -- the file this
-   ingestion already wrote for a blob (law 3 within one path) -- is kept in
-   `byKey`, which maps the blob to its name and does not index into the queue,
-   so the queue may be emptied under it.
-
-   Neither a writer nor unused shards are allocated for the common case
-   of a store object containing one regular file. */
+   Rows stay private until the completed path is handed to the store.
+   Moving the completed queues copies no rows and retires their pending
+   witnesses. Unused shards are never allocated. */
 struct GitObjectStore::Hold::Pending
 {
     struct Shard
     {
         std::mutex mutex;
-        /** Rows not yet handed to the sink; taken by swap. */
+        /** Rows not yet handed to the store. */
         std::vector<Row> queue;
-        /** (id, mode) -> the holder's name, kept after the row is written. */
+        /** (id, mode) -> the holder's name during the walk. */
         boost::unordered_flat_map<std::string, std::string> byKey;
     };
 
@@ -379,16 +371,7 @@ struct GitObjectStore::Hold::Pending
        when their identifier domain is actually used. Readers publish and
        acquire pointers because directory workers share this Pending. */
     std::array<std::atomic<Shard *>, 256> shards{};
-    std::atomic<size_t> queued{0};
-
-    std::mutex wake;
-    std::condition_variable ready;
-    bool stopping = false;
-    std::thread writer;
-    std::exception_ptr error;
-
     std::filesystem::path root;
-    std::function<void(std::vector<Row> &&)> sink;
 
     Shard & shard(size_t n)
     {
@@ -408,22 +391,6 @@ struct GitObjectStore::Hold::Pending
     }
 };
 
-/* Rows queued before a background writer is needed. */
-static size_t holdBatchSize()
-{
-    /* Settable for the measurement alone (`NIX_HOLDER_BATCH`); the default is
-       what measured best. */
-    static size_t n = [] {
-        if (auto * v = getenv("NIX_HOLDER_BATCH")) {
-            auto k = strtoull(v, nullptr, 10);
-            if (k > 0)
-                return size_t(k);
-        }
-        return size_t(16384);
-    }();
-    return n;
-}
-
 static std::string pendingKey(const Hash & id, bool executable)
 {
     std::string key(id.hashSize + 1, '\0');
@@ -439,35 +406,6 @@ static size_t shardOf(const Hash & id)
     return id.hashSize ? id.hash[0] : 0;
 }
 
-/* Every queued row, from every shard, as one batch: each shard's queue taken
-   by swap under its lock and none held while the sink runs, since the sink
-   takes the database's lock and nothing that waits on that may hold a
-   shard's.  Over the `Pending` and not the `Hold`, because a `Hold` is moved
-   -- into an `optional`, out of `hold()` -- and the writer thread must not
-   hold a pointer to one. */
-static std::vector<GitObjectStore::Hold::Row> takePending(GitObjectStore::Hold::Pending & pending)
-{
-    std::vector<GitObjectStore::Hold::Row> batch;
-    for (auto & slot : pending.shards) {
-        auto * shard = slot.load(std::memory_order_acquire);
-        if (!shard)
-            continue;
-        std::vector<GitObjectStore::Hold::Row> taken;
-        {
-            auto lock = std::lock_guard{shard->mutex};
-            if (shard->queue.empty())
-                continue;
-            taken.swap(shard->queue);
-        }
-        if (batch.empty())
-            batch = std::move(taken);
-        else
-            batch.insert(batch.end(), std::make_move_iterator(taken.begin()), std::make_move_iterator(taken.end()));
-    }
-    pending.queued.fetch_sub(batch.size());
-    return batch;
-}
-
 const std::filesystem::path & GitObjectStore::Hold::directory() const
 {
     return dir;
@@ -475,6 +413,11 @@ const std::filesystem::path & GitObjectStore::Hold::directory() const
 
 void GitObjectStore::Hold::setRoot(std::filesystem::path root) const
 {
+    /* A reused hold starts a new path projection. Its previous completed
+       rows have already been handed to the store; abandoned rows need no
+       publication. No walking worker may outlive this boundary. */
+    for (auto & slot : pending->shards)
+        delete slot.exchange(nullptr);
     pending->root = std::move(root);
 }
 
@@ -483,92 +426,42 @@ const std::filesystem::path & GitObjectStore::Hold::root() const
     return pending->root;
 }
 
-void GitObjectStore::Hold::setSink(std::function<void(std::vector<Row> &&)> sink) const
-{
-    /* One hold may carry several ingestions in turn -- `optimiseStore` walks
-       every valid path under one, the verifier's repair re-enters a path
-       under one, the builder enters each output under one -- so a sink may
-       replace a sink.  The writer of the ingestion that is ending is stopped
-       and its rows drained *before* the next one's starts: assigning over a
-       joinable `std::thread` terminates the process, which is how the unit
-       suite found this. */
-    flush();
-    pending->stopping = false;
-    for (auto & slot : pending->shards)
-        delete slot.exchange(nullptr);
-    pending->queued = 0;
-    pending->sink = std::move(sink);
-}
-
 std::optional<std::string> GitObjectStore::Hold::addRow(Row row) const
 {
     auto key = pendingKey(row.id, row.executable);
-    size_t queued;
-    {
-        auto & shard = pending->shard(shardOf(row.id));
-        auto lock = std::lock_guard{shard.mutex};
-        auto [i, inserted] = shard.byKey.try_emplace(std::move(key), row.name);
-        if (!inserted)
-            return i->second.empty() ? pending->root.string() : (pending->root / i->second).string();
-        shard.queue.push_back(std::move(row));
-        /* Publish the count before a drain can take this row. */
-        queued = pending->queued.fetch_add(1) + 1;
-    }
-    if (queued >= holdBatchSize() && pending->sink) {
-        /* Background work only exists when there is a batch to overlap
-           with a continuing copy. A single-file store object drains on
-           the registering thread and never starts another thread. */
-        auto lock = std::lock_guard{pending->wake};
-        if (pending->error)
-            std::rethrow_exception(pending->error);
-        if (!pending->writer.joinable()) {
-            auto * p = pending.get();
-            pending->writer = std::thread([p] {
-                try {
-                    while (true) {
-                        {
-                            auto lock = std::unique_lock{p->wake};
-                            p->ready.wait(lock, [&] { return p->stopping || p->queued.load() >= holdBatchSize(); });
-                            if (p->stopping)
-                                return;
-                        }
-                        auto batch = takePending(*p);
-                        if (!batch.empty())
-                            p->sink(std::move(batch));
-                    }
-                } catch (...) {
-                    auto lock = std::lock_guard{p->wake};
-                    p->error = std::current_exception();
-                }
-            });
-        }
-        pending->ready.notify_one();
-    }
+    auto & shard = pending->shard(shardOf(row.id));
+    auto lock = std::lock_guard{shard.mutex};
+    auto [i, inserted] = shard.byKey.try_emplace(std::move(key), row.name);
+    if (!inserted)
+        return i->second.empty() ? pending->root.string() : (pending->root / i->second).string();
+    shard.queue.push_back(std::move(row));
     return std::nullopt;
-}
-
-void GitObjectStore::Hold::flush() const
-{
-    if (!pending->sink)
-        return;
-    auto batch = takeRows();
-    if (!batch.empty())
-        pending->sink(std::move(batch));
 }
 
 std::vector<GitObjectStore::Hold::Row> GitObjectStore::Hold::takeRows() const
 {
-    if (pending->writer.joinable()) {
-        {
-            auto lock = std::lock_guard{pending->wake};
-            pending->stopping = true;
+    /* The caller owns a completed walk. Reserve before consuming any rows,
+       reusing the first queue so a single occupied shard needs no allocation.
+       Publication owns the returned rows; no pending witness survives. */
+    static_assert(std::is_nothrow_move_constructible_v<Row>);
+    Pending::Shard * first = nullptr;
+    size_t count = 0;
+    for (auto & slot : pending->shards)
+        if (auto * shard = slot.load(std::memory_order_acquire); shard && !shard->queue.empty()) {
+            if (!first)
+                first = shard;
+            count += shard->queue.size();
         }
-        pending->ready.notify_all();
-        pending->writer.join();
+    std::vector<Row> rows;
+    if (first) {
+        first->queue.reserve(count);
+        rows.swap(first->queue);
     }
-    if (pending->error)
-        std::rethrow_exception(pending->error);
-    return takePending(*pending);
+    for (auto & slot : pending->shards)
+        if (std::unique_ptr<Pending::Shard> shard{slot.exchange(nullptr)}; shard)
+            rows.insert(
+                rows.end(), std::make_move_iterator(shard->queue.begin()), std::make_move_iterator(shard->queue.end()));
+    return rows;
 }
 
 std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, bool executable) const
@@ -681,12 +574,10 @@ GitObjectStore::Hold::Hold(Hold &&) = default;
    link for those purposes. Unlink directly, opening only directories and
    never following symlinks. Dead or partially removed holds still use the
    collector's general deletion path. */
-static void releaseHoldContents(Descriptor fd)
+static void releaseHoldContents(AutoCloseFD scan)
 {
-    AutoCloseFD scan{dup(fd)};
-    if (!scan)
-        throw SysError("duplicating hold directory descriptor");
-    AutoCloseDir entries{fdopendir(scan.get())};
+    auto fd = scan.get();
+    AutoCloseDir entries{fdopendir(fd)};
     if (!entries)
         throw SysError("reading hold directory");
     scan.release();
@@ -701,7 +592,7 @@ static void releaseHoldContents(Descriptor fd)
         AutoCloseFD child{openat(fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
         if (!child)
             throw SysError("opening hold directory '%s'", entry->d_name);
-        releaseHoldContents(child.get());
+        releaseHoldContents(std::move(child));
         if (unlinkat(fd, entry->d_name, AT_REMOVEDIR) == -1 && errno != ENOENT)
             throw SysError("removing hold directory '%s'", entry->d_name);
     }
@@ -712,28 +603,16 @@ static void releaseHoldContents(Descriptor fd)
 
 GitObjectStore::Hold::~Hold()
 {
-    /* An ingestion that failed never flushed: the writer is stopped here, so
-       nothing outlives the hold.  Its rows stay in the index against an
-       ingestion that never got a path, which the sweep removes and `link`
-       forgets (schema.sql). */
-    if (pending && pending->writer.joinable()) {
-        {
-            auto lock = std::lock_guard{pending->wake};
-            pending->stopping = true;
-        }
-        pending->ready.notify_all();
-        try {
-            pending->writer.join();
-        } catch (...) {
-            ignoreExceptionInDestructor();
-        }
-    }
     if (!fd)
         return;
     try {
         auto lock = std::shared_lock{*auxiliaryLock};
 #ifndef _WIN32
-        releaseHoldContents(fd.get());
+        /* Keep the root's lock descriptor until the hold is released. */
+        AutoCloseFD scan{dup(fd.get())};
+        if (!scan)
+            throw SysError("duplicating hold directory descriptor");
+        releaseHoldContents(std::move(scan));
         if (::rmdir(dir.c_str()) == -1 && errno != ENOENT)
             throw SysError("removing hold %s", PathFmt(dir));
 #else

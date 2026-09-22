@@ -326,6 +326,35 @@ protected:
        counted them; a file linked from the object store is not one. */
     unsigned filesCreated = 0;
 
+    /* Older or concurrent writers may have persisted an unnamed projection.
+       Construct that compatibility state explicitly: current ingestion keeps
+       these rows in memory until its completed-path boundary. */
+    void stageLegacyUnregisteredRows(const GitObjectStore::Hold & hold)
+    {
+        ASSERT_TRUE(hold.ingestion);
+        ASSERT_FALSE(hold.ingestion->id);
+        auto rows = hold.takeRows();
+        SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+        SQLiteTxn txn(db);
+        SQLiteStmt ingestion{db, "insert into Ingestions(path, hold) values (null, ?);"};
+        ingestion.use().apply(hold.directory().filename().string()).exec();
+        auto id = static_cast<uint64_t>(sqlite3_last_insert_rowid(db));
+        SQLiteStmt insert{
+            db, "insert into Blobs(id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);"};
+        for (auto & row : rows)
+            insert.use()
+                .apply(row.id.hash, row.id.hashSize)
+                .apply(int64_t(row.executable))
+                .apply(static_cast<int64_t>(row.ino))
+                .apply(static_cast<int64_t>(row.dev))
+                .apply(static_cast<int64_t>(id))
+                .apply(row.name)
+                .apply(static_cast<int64_t>(row.size))
+                .exec();
+        txn.commit();
+        hold.ingestion->id = id;
+    }
+
     ObjectHashSink::Result
     restore(const std::filesystem::path & dst, std::string_view nar, RepairFlag repair = NoRepair)
     {
@@ -2311,13 +2340,8 @@ TEST_F(LocalStoreObjectsTest, verifyExpectsNoBlobForAFileTheStoreDoesNotPlace)
     EXPECT_TRUE(hasBlob(merkle::blobId("readme"), false));
 }
 
-/* A copy that dies between its writes and its registration leaves index rows
-   naming an ingestion that never got a path.  The two things that must hold of
-   them: `link` must not be misled by one -- it must write the blob afresh, not
-   link a file the store never promised -- and the sweep must remove them.
-   (`schema.sql`, the stale-row rule; it is what replaces the cascade a foreign
-   key into `ValidPaths` would have given.) */
-TEST_F(LocalStoreObjectsTest, blobWriterRespectsBothJournalModes)
+/* Completed paths retain the configured SQLite journal mode. */
+TEST_F(LocalStoreObjectsTest, completedIngestionsRespectBothJournalModes)
 {
     bool saved = settings.useSQLiteWAL;
     Finally restoreSetting{[&] { settings.useSQLiteWAL = saved; }};
@@ -2329,12 +2353,14 @@ TEST_F(LocalStoreObjectsTest, blobWriterRespectsBothJournalModes)
             std::make_shared<LocalStoreConfig>(tempStoreDir.path() / (wal ? "wal" : "rollback"), StoreConfig::Params{});
         store = std::make_shared<LocalStore>(ref{config});
         auto hold = store->objects.hold();
-        auto dst = config->realStoreDir.get() / (wal ? "wal-copy" : "rollback-copy");
+        auto path = StorePath::random(wal ? "wal-copy" : "rollback-copy");
+        auto dst = store->toRealPath(path);
         store->beginIngestion(hold, dst);
         StringSource source{treeNar({{"a", wal ? "wal" : "rollback", 'f'}})};
         auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
         store->restoreThroughObjects(dst, source, false, hooks.get(), hold, NoRepair);
-        hold.flush();
+        EXPECT_EQ(store->blobRowCount(false), 0u);
+        store->endIngestion(hold, path);
         EXPECT_GT(store->blobRowCount(false), 0u);
         SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
         SQLiteStmt mode{db, "pragma journal_mode"};
@@ -2349,8 +2375,9 @@ TEST_F(LocalStoreObjectsTest, aCrashBeforeRegistrationLeavesNoRowThatMisleadsLin
     auto realStoreDir = std::filesystem::path{config->realStoreDir.get()};
     auto one = merkle::blobId("one");
 
-    /* An ingestion that writes its rows and never registers: the hold goes out
-       of scope without `endIngestion`, exactly as a crashed copy leaves it. */
+    /* An older writer persisted rows and crashed before naming the path.
+       Current ingestions keep their rows private until completion, but the
+       existing unnamed-row domain must remain safe to read and collect. */
     auto dead = realStoreDir / "crash1";
     {
         auto hold = store->objects.hold();
@@ -2358,7 +2385,7 @@ TEST_F(LocalStoreObjectsTest, aCrashBeforeRegistrationLeavesNoRowThatMisleadsLin
         StringSource source{treeNar({{"a", "one", 'f'}, {"z", "only-dead", 'f'}})};
         auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
         store->restoreThroughObjects(dead, source, /*startFsync=*/false, hooks.get(), hold, NoRepair);
-        hold.flush();
+        stageLegacyUnregisteredRows(hold);
     }
 
     /* The rows are there and they name no path. */
@@ -2427,7 +2454,7 @@ TEST_F(LocalStoreObjectsTest, aStoreThatSweepsItsOwnObjectsStillSweepsItsStaleRo
 {
     auto realStoreDir = std::filesystem::path{config->realStoreDir.get()};
 
-    /* An ingestion that writes its rows and never registers. */
+    /* Persisted unnamed rows from an older writer that never registered. */
     auto dead = realStoreDir / "own-sweep";
     {
         auto hold = store->objects.hold();
@@ -2435,7 +2462,7 @@ TEST_F(LocalStoreObjectsTest, aStoreThatSweepsItsOwnObjectsStillSweepsItsStaleRo
         StringSource source{treeNar({{"a", "one", 'f'}})};
         auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
         store->restoreThroughObjects(dead, source, /*startFsync=*/false, hooks.get(), hold, NoRepair);
-        hold.flush();
+        stageLegacyUnregisteredRows(hold);
     }
     ASSERT_GT(store->blobRowCount(false), 0u);
 
@@ -2452,14 +2479,9 @@ TEST_F(LocalStoreObjectsTest, aStoreThatSweepsItsOwnObjectsStillSweepsItsStaleRo
    `addMultipleToStore` (`08` K16) -- but each of its paths registers on its
    own and is therefore its own ingestion: its own `Ingestions` row, its own
    root (a row's name is relative to the path that holds it, `schema.sql`) and
-   its own writer.  Before: the batch's hold carried the rows, so
-   `beginIngestion` ran on one hold once per path -- and from several threads
-   at once, the batch being copied on a pool (`Store::addMultipleToStore`'s
-   `processGraph`), which assigned over a joinable writer and terminated the
-   process (`std::terminate() called without exception ... nix::GitObjectStore
-   ::Hold::setSink`, four of the named functional tests).  What this pins is
-   the statement underneath the crash, which is deterministic: every path's
-   blob is held by *that* path's own file.  The two blobs are the same length,
+   its own pending projection. Every path's blob is held by that path's own
+   file, even when the batch's paths are copied concurrently. The two blobs
+   are the same length,
    so a row written against the wrong ingestion resolves to a file that exists
    and passes the size check -- the store would hand out the wrong bytes. */
 TEST_F(LocalStoreObjectsTest, everyPathOfABatchIsItsOwnIngestion)
@@ -2615,8 +2637,9 @@ TEST_F(LocalStoreObjectsTest, failedRegistrationPublishesNeitherPathNorPendingHo
 
 TEST_F(LocalStoreObjectsTest, everyCandidatePublicationOrderKeepsRegisteredHolders)
 {
-    /* All six orders respecting insertion before completion. For small
-       ingestions, remove the separate insertion and deduplicate orders. */
+    /* All six orders respecting legacy insertion before completion. Each
+       ingestion is either wholly pending (current writers) or has rows
+       persisted by an older concurrent writer. Deduplicate absent stages. */
     const std::array<std::array<unsigned, 4>, 6> interleavings{{
         {0, 1, 2, 3},
         {0, 2, 1, 3},
@@ -2626,18 +2649,18 @@ TEST_F(LocalStoreObjectsTest, everyCandidatePublicationOrderKeepsRegisteredHolde
         {2, 0, 1, 3},
     }};
     size_t cases = 0;
-    for (unsigned large = 0; large < 4; ++large) {
+    for (unsigned staged = 0; staged < 4; ++staged) {
         std::set<std::vector<unsigned>> orders;
         for (auto & interleaving : interleavings) {
             std::vector<unsigned> order;
             for (auto event : interleaving)
-                if ((event & 1) || (large & (1 << (event / 2))))
+                if ((event & 1) || (staged & (1 << (event / 2))))
                     order.push_back(event);
             orders.insert(std::move(order));
         }
         for (unsigned success = 0; success < 4; ++success)
             for (auto & order : orders) {
-                SCOPED_TRACE(fmt("large=%d success=%d case=%d", large, success, cases));
+                SCOPED_TRACE(fmt("staged=%d success=%d case=%d", staged, success, cases));
                 auto contents = fmt("candidate-case-%d", cases++);
                 auto nar = treeNar(
                     {{"file", contents, 'f'},
@@ -2663,7 +2686,7 @@ TEST_F(LocalStoreObjectsTest, everyCandidatePublicationOrderKeepsRegisteredHolde
                 for (auto event : order) {
                     auto i = event / 2;
                     if (!(event & 1)) {
-                        holds[i].flush();
+                        stageLegacyUnregisteredRows(holds[i]);
                     } else if (success & (1 << i)) {
                         store->registerValidPath(infos[i], holds[i]);
                         registered[i] = true;
@@ -3077,8 +3100,6 @@ TEST_F(LocalStoreObjectsTest, everyWriterReconcilesBeforeEveryPublicationBoundar
                             infos.back().narSize = result.narSize;
                             if (boundary == 1)
                                 store->endIngestion(hold, infos.back().path);
-                            else
-                                hold.flush();
                         }
                         EXPECT_FALSE(store->objects.holderOrForget(id, kind == 1, NoRepair));
                         ValidPathInfos all{{infos[0].path, infos[0]}, {infos[1].path, infos[1]}};
@@ -3135,7 +3156,7 @@ TEST_F(LocalStoreObjectsTest, refusedPublicationDoesNotPromoteAnExceptionalInode
                     infos.back().narSize = result.narSize;
                 }
                 if (earlierId)
-                    holds[0].flush();
+                    stageLegacyUnregisteredRows(holds[0]);
                 store->registerValidPath(infos[1], holds[1]);
                 auto target = store->toRealPath(infos[0].path);
                 auto canonical = store->toRealPath(infos[1].path) / "a";
@@ -3466,7 +3487,7 @@ TEST_F(LocalStoreObjectsTest, theSweepJudgesARowByItsIngestionsPath)
     StringSource source{treeNar({{"b", "two", 'f'}})};
     auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
     store->restoreThroughObjects(flying, source, /*startFsync=*/false, hooks.get(), hold, NoRepair);
-    hold.flush();
+    stageLegacyUnregisteredRows(hold);
     auto withFlying = store->blobRowCount(false);
     ASSERT_GT(withFlying, kept);
 
@@ -3683,30 +3704,29 @@ TEST_F(LocalStoreObjectsTest, sweepWritesNothingIntoAnOwnedPart)
     EXPECT_TRUE(hasTree(r.root.hash));
 }
 
-/* A malformed tree body is reported with the tree's identifier. */
-TEST_F(LocalStoreObjectsTest, smallIngestionsFlushOnTheCallerAndResetTheirHolderNames)
+/* Completed rows own their names; pending witnesses retire at handoff. */
+TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
 {
     auto hold = store->objects.hold();
-    auto caller = std::this_thread::get_id();
-    size_t rows = 0;
     auto id = merkle::blobId("one");
-    hold.setRoot("/first");
-    hold.setSink([&](std::vector<GitObjectStore::Hold::Row> && batch) {
-        EXPECT_EQ(std::this_thread::get_id(), caller);
-        rows += batch.size();
-    });
+    store->beginIngestion(hold, "/first");
     hold.addRow({.id = id, .executable = false, .name = "a"});
-    EXPECT_EQ(rows, 0u);
+    EXPECT_EQ(store->blobRowCount(false), 0u);
     EXPECT_EQ(hold.pendingHolder(id, false), "/first/a");
-    hold.flush();
-    EXPECT_EQ(rows, 1u);
-    hold.setRoot("/second");
-    hold.setSink([&](auto && batch) { rows += batch.size(); });
+    auto first = hold.takeRows();
+    ASSERT_EQ(first.size(), 1u);
+    EXPECT_EQ(first.front().name, "a");
+    EXPECT_FALSE(hold.pendingHolder(id, false)) << "handoff retires pending witnesses";
+    EXPECT_TRUE(hold.takeRows().empty());
+    store->beginIngestion(hold, "/second");
     EXPECT_FALSE(hold.pendingHolder(id, false)) << "names belong to one ingestion, not its reused hold";
     hold.addRow({.id = id, .executable = true, .name = "b"});
-    hold.flush();
-    EXPECT_EQ(rows, 2u);
-    EXPECT_EQ(hold.pendingHolder(id, true), "/second/b");
+    auto second = hold.takeRows();
+    ASSERT_EQ(second.size(), 1u);
+    EXPECT_EQ(second.front().name, "b");
+    EXPECT_FALSE(hold.pendingHolder(id, true));
+    EXPECT_EQ(first.front().name, "a") << "completed rows do not borrow the reused hold";
+    EXPECT_EQ(store->blobRowCount(true), 0u);
 }
 
 /* An inode snapshot suggests a lookup; it cannot establish present content

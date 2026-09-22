@@ -586,85 +586,9 @@ void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::fi
     if (config->readOnly || blobRows == BlobRows::NoRows)
         return;
     hold.setRoot(root);
-    /* During copying an ingestion needs a database identity only when
-       rows flush. Small copies stage their rows in the final transaction.
-       Completion also names an empty projection, so replacing a path with
-       no eligible regular files retires its previous candidate rows. */
-    auto holdName = hold.directory().filename().string();
-    auto ingestion = std::make_shared<GitObjectStore::Hold::Ingestion>();
-    /* The copy's workers hand their batches here as they fill, so the index
-       write overlaps the copy as the object store's links used to (`05`
-       section 6, the twenty-trial table). */
-    hold.setSink([this, ingestion, holdName](std::vector<GitObjectStore::Hold::Row> && batch) {
-        writeBlobRows(*ingestion, holdName, batch);
-    });
-    hold.ingestion = std::move(ingestion);
-}
-
-void LocalStore::openBlobWriter()
-{
-    if (blobWriterDb)
-        return;
-    /* The same database file, a second connection: WAL admits one writer
-       beside its readers, so the index's writes and the copy's probes stop
-       excluding each other (`local-store.hh`, `blobWriterDb`).  `synchronous`
-       and the journal are the store's own; the connection is this process's
-       and is closed with the store. */
-    /* Every use of this connection and its statements holds blobWriterMutex. */
-    blobWriterDb = std::make_unique<SQLite>(
-        dbDir / "db.sqlite",
-        SQLiteSettings{
-            .mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL, .externalSynchronization = true});
-    /* The index is a cache -- every row is derivable from the store's own
-       paths, and `nix-store --optimise` rebuilds it -- so its writes need not
-       be synchronous. Keep the store's journal mode: `isCache()` would
-       force WAL even when useSQLiteWAL is false. */
-    blobWriterDb->exec("pragma synchronous = off");
-    blobWriterInsert = std::make_unique<SQLiteStmt>();
-    blobWriterInsert->create(
-        *blobWriterDb,
-        "insert or replace into Blobs (id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);");
-    blobWriterNewIngestion = std::make_unique<SQLiteStmt>();
-    blobWriterNewIngestion->create(*blobWriterDb, "insert into Ingestions (path, hold) values (?, ?);");
-}
-
-void LocalStore::writeBlobRows(
-    GitObjectStore::Hold::Ingestion & ingestion,
-    const std::string & holdName,
-    std::vector<GitObjectStore::Hold::Row> & batch)
-{
-    if (batch.empty())
-        return;
-    /* In key order: a b-tree takes sorted inserts far better than random
-       ones, and an identifier is a hash (`05` section 6, the memo's rows). */
-    std::sort(batch.begin(), batch.end(), [](const auto & a, const auto & b) {
-        auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
-        return c != 0 ? c < 0 : a.executable < b.executable;
-    });
-    auto lock = std::lock_guard{blobWriterMutex};
-    openBlobWriter();
-    retrySQLite<void>([&]() {
-        SQLiteTxn txn(*blobWriterDb);
-        auto id = ingestion.id;
-        if (!id) {
-            auto use(blobWriterNewIngestion->use());
-            use.apply(ingestion.path.value_or(""), ingestion.path.has_value()).apply(holdName).exec();
-            id = static_cast<uint64_t>(sqlite3_last_insert_rowid(*blobWriterDb));
-        }
-        for (auto & row : batch) {
-            auto use(blobWriterInsert->use());
-            use.apply(row.id.hash, row.id.hashSize)
-                .apply(int64_t(row.executable ? 1 : 0))
-                .apply(static_cast<int64_t>(row.ino))
-                .apply(static_cast<int64_t>(row.dev))
-                .apply(static_cast<int64_t>(*id))
-                .apply(row.name)
-                .apply(static_cast<int64_t>(row.size))
-                .exec();
-        }
-        txn.commit();
-        ingestion.id = id;
-    });
+    /* Rows are inserted only when this path is completed. An empty
+       projection also replaces the path's preceding candidate rows. */
+    hold.ingestion.emplace();
 }
 
 void LocalStore::insertBlobRows(State & state, uint64_t ingestion, const std::vector<GitObjectStore::Hold::Row> & rows)
@@ -793,10 +717,14 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
 {
     if (config->readOnly || blobRows == BlobRows::NoRows || !hold.ingestion)
         return;
-    /* Join the background writer while rows are still unnamed. An already
-       valid repair/optimisation path must not expose unreconciled batches. */
-    auto ingestion = hold.ingestion;
+    /* An already-valid repair/optimisation path must not expose its new
+       candidates before reconciling the complete projection. */
+    auto * ingestion = &*hold.ingestion;
     auto rows = hold.takeRows();
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+        auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
+        return c != 0 ? c < 0 : a.executable < b.executable;
+    });
     auto logical = printStorePath(path);
     retrySQLite<void>([&]() {
         auto state(_state->lock());
@@ -827,9 +755,9 @@ void LocalStore::recordBlobsAtPath(const GitObjectStore::Hold & hold, const std:
        not a store path: a `ValidPaths` row is made for it under its own name,
        so that the sweep's stale-row rule judges this ingestion as it judges a
        real one, and the ingestion is given that path. */
-    hold.flush();
     if (!hold.ingestion)
         return;
+    auto rows = hold.takeRows();
     auto logical = std::filesystem::path(config->storeDir) / root.filename();
     auto ingestion = hold.ingestion->id;
     retrySQLite<void>([&]() {
@@ -841,6 +769,7 @@ void LocalStore::recordBlobsAtPath(const GitObjectStore::Hold & hold, const std:
             id = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
         } else
             state->stmts->SetIngestionPath.use().apply("", false).apply(static_cast<int64_t>(*id)).exec();
+        insertBlobRows(*state, *id, rows);
         auto valid = state->stmts->QueryValidPathId.use().apply(logical.string()).next();
         if (!valid) {
             auto use(state->stmts->RegisterValidPath.use());
@@ -1765,11 +1694,9 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
 {
     validatePathInfoKeys(infos);
 
-    /* Finish the ingestion before taking the database lock: a large copy's
-       writer may still be committing a batch. The usual single-file object
-       has never started that writer and publishes all of its rows here,
-       with its path, through the one connection and transaction. */
-    auto ingestion = hold ? hold->ingestion : nullptr;
+    /* Take the completed ingestion before locking the database. Its rows
+       and validity are published through one connection and transaction. */
+    auto * ingestion = hold && hold->ingestion ? &*hold->ingestion : nullptr;
 
     struct Publication
     {

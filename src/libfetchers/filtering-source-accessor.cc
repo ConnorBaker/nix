@@ -50,11 +50,8 @@ SourceAccessor::DirEntries FilteringSourceAccessor::readDirectory(const CanonPat
 {
     auto owner = weak_from_this().lock();
     checkAccess(path);
-    DirEntries entries;
-    for (auto & entry : next->readDirectory(prefix / path)) {
-        if (isAllowed(path / entry.first))
-            entries.insert(std::move(entry));
-    }
+    auto entries = next->readDirectory(prefix / path);
+    std::erase_if(entries, [&](const auto & entry) { return !isAllowed(path / entry.first); });
     return entries;
 }
 

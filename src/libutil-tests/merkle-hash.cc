@@ -131,6 +131,7 @@ TEST(MerkleHash, blobHasherMatchesOneShotAcrossPartitionsAndBoundaries)
 
     const std::string small{char(0), char(1), char(0x7f), char(0x80), char(0xff), 'x'};
     auto smallHash = expected(small);
+    EXPECT_EQ(merkle::blobId(small), smallHash);
     size_t partitions = 0;
     for (unsigned cuts = 0; cuts < (1u << (small.size() - 1)); ++cuts) {
         std::vector<std::string_view> chunks;
@@ -169,6 +170,7 @@ TEST(MerkleHash, blobHasherMatchesOneShotAcrossPartitionsAndBoundaries)
         for (size_t i = 0; i < length; ++i)
             bytes[i] = char(i % 256);
         auto hash = expected(bytes);
+        EXPECT_EQ(merkle::blobId(bytes), hash);
         for (size_t width : {1u, 55u, 56u, 57u, 63u, 64u, 65u, 32756u, 32757u, 32758u, 32767u, 32768u, 32769u})
             for (bool empty : {false, true}) {
                 SCOPED_TRACE(fmt("length=%d width=%d empty=%d", length, width, empty));

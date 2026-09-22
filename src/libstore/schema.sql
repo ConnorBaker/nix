@@ -47,29 +47,27 @@ create index if not exists IndexDerivationOutputs on DerivationOutputs(path);
 -- must not replace a registered holder's record.
 --
 -- The holder's store path is named through `Ingestions`, not by a foreign
--- key into `ValidPaths`. A large ingestion writes batches during the copy,
--- creating its `Ingestions` row lazily at the first flush with a null path.
--- Registration assigns that path and publishes the remaining rows. Small
--- ingestions publish all their rows in the path-registration transaction,
--- through its connection, without a background writer or separate commit.
+-- key into `ValidPaths`. Rows stay private in the hold until the path is
+-- complete. Ordinary registration inserts them with validity in one transaction.
+-- `endIngestion` can persist a completed builder output before bulk validity
+-- registration, allowing its hold to begin the next output. It publishes an
+-- already-valid repair/optimisation path itself. Both publication routes reserve
+-- SQLite's writer and reconcile candidates before exposing the complete projection.
 --
--- An ingestion still in flight has no path yet, and its rows must survive a
--- collection that runs beside it exactly as its objects do (08 K16): the row
--- carries its hold's name, and the sweep -- which has already removed the holds
--- of dead ingestions before it judges anything -- keeps the rows of an
--- ingestion whose hold is still there.
+-- Completed builder projections, and failed or legacy rows, must survive a
+-- collection while their hold remains (08 K16). The ingestion records that hold's
+-- name. The sweep removes dead holds before judging rows and keeps rows whose
+-- hold still exists. Private pending rows need no database cleanup.
 --
 -- What that costs, and where it is paid: a row whose ingestion has no path, or
 -- whose path is no longer valid (the path was collected), is *stale*.  Two
--- things judge it: `GitObjectStore::link` finds no file at the holder's name
--- and forgets the row, writing the blob afresh; and the sweep removes every row
--- whose ingestion names no valid path, under the GC lock, as it removes a tree
--- no live root reaches.  This is the same discipline the trees and the symlink
--- blobs are already collected by, and it replaces the cascade a foreign key
--- would have given.
+-- rules apply: holder lookup requires a valid named path and conditionally
+-- forgets an observed candidate whose file is missing or invalid; the sweep
+-- removes stale rows under the GC lock once their holds are gone. This replaces
+-- the cascade a foreign key would have given.
 create table if not exists Ingestions (
     id   integer primary key autoincrement not null,
-    path text, -- the store path of the ingestion's holders; null until it is registered
+    path text, -- completed holder path; null while staged before naming
     hold text  -- the name of its hold directory under .objects/tmp while it is in flight
 );
 

@@ -56,11 +56,22 @@ Hash BlobHasher::finish()
     return sink.finish().hash;
 }
 
+static Hash hashObject(std::string_view kind, std::string_view body)
+{
+    static_assert(hashAlgo == HashAlgorithm::SHA256);
+    SHA256_CTX context;
+    SHA256_Init(&context);
+    LambdaSink direct{[&](std::string_view chunk) { SHA256_Update(&context, chunk.data(), chunk.size()); }};
+    feedHeader(direct, kind, body.size());
+    direct(body);
+    Hash hash(hashAlgo);
+    SHA256_Final(hash.hash, &context);
+    return hash;
+}
+
 Hash blobId(std::string_view bytes)
 {
-    BlobHasher h{bytes.size()};
-    h(bytes);
-    return h.finish();
+    return hashObject("blob", bytes);
 }
 
 std::string serialiseTree(const Tree & tree)
@@ -86,15 +97,7 @@ std::string serialiseTree(const Tree & tree)
 
 Hash treeId(std::string_view body)
 {
-    static_assert(hashAlgo == HashAlgorithm::SHA256);
-    SHA256_CTX context;
-    SHA256_Init(&context);
-    LambdaSink direct{[&](std::string_view chunk) { SHA256_Update(&context, chunk.data(), chunk.size()); }};
-    feedHeader(direct, "tree", body.size());
-    direct(body);
-    Hash hash(hashAlgo);
-    SHA256_Final(hash.hash, &context);
-    return hash;
+    return hashObject("tree", body);
 }
 
 void insertEntry(Tree & tree, std::string_view name, const TreeEntry & entry)

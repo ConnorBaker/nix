@@ -1057,7 +1057,7 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
         workers = 1;
     auto commitAttempt = [&](const std::filesystem::path & subtree, const GitObjectStore::Hold & attempt) {
         std::vector<BlobCoalescing> collisions;
-        for (auto row : attempt.takeRows()) {
+        for (auto & row : attempt.takeRows()) {
             auto other = hold.addRow(row);
             if (!other)
                 continue;
@@ -1267,7 +1267,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
     struct Winner
     {
         const GitObjectStore::Hold::Row & row;
-        GitObjectStore::Holder holder;
+        const GitObjectStore::Holder & holder;
         std::filesystem::path pin;
         AutoDelete cleanup;
         std::optional<std::filesystem::path> representative;

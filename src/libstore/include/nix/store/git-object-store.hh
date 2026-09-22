@@ -54,13 +54,12 @@ public:
      * (`schema.sql`, `Blobs`). Written and reused files both retain a witness.  `.objects/blobs` and `.objects/blobs-x`
      * then hold no regular-file blob at all: they hold the symlink-target blobs, which no path holds, and `trees/` is
      * unchanged.  The first entry of a tree writes each file once and records rows -- no `linkat` a file, which is the
-     * 0.19-0.21 s per 40 000 files of `05-validation.md` section 6.
+     * historical 0.19-0.21 s per 40 000 files in `05-validation.md` section 6.
      *
      * When a row is written, when it becomes true, and when it goes.  The
-     * rows are written **while the copy runs**, by the index's writer on a
-     * connection of its own (`LocalStore::writeBlobRows`), because the
-     * copy is where the holders are made; they name an `Ingestions` row
-     * rather than a `ValidPaths` one, since the path does not exist yet,
+     * rows are staged in the hold while copying and inserted when the path
+     * completes. They name an `Ingestions` row rather than a `ValidPaths`
+     * one, since a completed builder output is not necessarily valid yet,
      * and become visible only after publication reconciles overlapping
      * candidates to one physical inode and names the valid path
      * (`LocalStore::registerValidPaths`, `LocalStore::endIngestion`).  There is therefore
@@ -382,15 +381,11 @@ public:
          * whole of `addMultipleToStore` (K16) -- but each of its paths
          * registers separately and is therefore its own ingestion: its own
          * `Ingestions` row, its own root (a row's name is relative to the
-         * path that holds it, `schema.sql`), and its own writer.  Sharing
-         * one hold's row machinery across a batch is doubly wrong: the
-         * batch's paths are copied on a thread pool
-         * (`Store::addMultipleToStore`'s `processGraph`), so
-         * `LocalStore::beginIngestion` ran from several threads at once and
-         * assigned over a joinable writer, which terminates the process;
-         * and a row written against another path's ingestion names a file
-         * that does not exist, or -- the sizes agreeing -- one with the
-         * wrong bytes.
+         * path that holds it, `schema.sql`), and its own pending projection.
+         * The batch's paths can be copied concurrently by
+         * `Store::addMultipleToStore`. A row written against another path's
+         * ingestion names a file that does not exist, or -- the sizes
+         * agreeing -- one with the wrong bytes.
          *
          * The directory belongs to the hold that locked it and is not
          * removed by this one, so the objects stay held until the batch is
@@ -400,8 +395,8 @@ public:
 
         /**
          * A pending index row: a regular file this ingestion wrote or linked, which
-         * becomes the blob's holder when the path is registered
-         * (`LocalStore::recordBlobs`).  Kept here because the hold is
+         * becomes eligible through `LocalStore::registerValidPaths` or
+         * `LocalStore::endIngestion`. Kept here because the hold is
          * already the object whose life is "from the first write to the
          * registration", and every route already has one.
          */
@@ -427,32 +422,23 @@ public:
          * The directory this ingestion writes under, set before the walk:
          * a locked temporary in the store for a route that moves its path
          * into place, the real path for one that writes there.  `addRow`
-         * makes each row's name relative to it.
+         * makes each row's name relative to it. Clears the preceding path's
+         * pending rows and holders; no walking worker may still use them.
          */
         void setRoot(std::filesystem::path root) const;
 
         /** The root, for turning a row's name back into a path to link from. */
         const std::filesystem::path & root() const;
 
-        /**
-         * Where a filled batch of rows goes: the store's index writer,
-         * set before the walk.  The copy's workers call it as their
-         * batches fill, so the index write overlaps the copy.  Unset, the
-         * rows stay in the hold and nothing writes an index.
-         */
-        void setSink(std::function<void(std::vector<Row> &&)> sink) const;
-
-        /** Hand every row not yet given to the sink to it. */
-        void flush() const;
-
-        /** Stop the writer and take the rows it has not published. The
-         * caller may include them in the path's registration transaction. */
+        /** Take the completed path's rows for its publication transaction.
+         * All workers using these rows must have completed. This retires the
+         * pending-holder map; the returned rows own their names. */
         std::vector<Row> takeRows() const;
 
         /**
-         * The ingestion this hold's rows are written against
-         * (`Ingestions.id`), set by `LocalStore::beginIngestion`; unset
-         * when nothing writes an index.
+         * Per-path state created by `LocalStore::beginIngestion`; absent
+         * when nothing writes an index. Completion assigns `Ingestions.id`;
+         * the path identifies a completed builder output at bulk registration.
          */
         struct Ingestion
         {
@@ -460,9 +446,8 @@ public:
             std::optional<std::string> path;
         };
 
-        /* Shared with the row sink so moving a hold cannot invalidate it.
-           LocalStore serialises access with its blob-writer mutex. */
-        mutable std::shared_ptr<Ingestion> ingestion;
+        /* Accessed only before or after the path's walking workers run. */
+        mutable std::optional<Ingestion> ingestion;
 
         /** The hold's own directory under `tmp/`: its name is what says this ingestion is in flight. */
         const std::filesystem::path & directory() const;
