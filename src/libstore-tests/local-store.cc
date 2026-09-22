@@ -3704,28 +3704,96 @@ TEST_F(LocalStoreObjectsTest, sweepWritesNothingIntoAnOwnedPart)
     EXPECT_TRUE(hasTree(r.root.hash));
 }
 
-/* Completed rows own their names; pending witnesses retire at handoff. */
+/* Completed rows denote the input relation independently of shard occupancy,
+   duplicate claims, handoff order, or later reuse of their hold. */
 TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
 {
+    using Row = GitObjectStore::Hold::Row;
+    using Key = std::pair<Hash, bool>;
+    using Fields = std::tuple<ino_t, dev_t, uint64_t, std::string>;
     auto hold = store->objects.hold();
-    auto id = merkle::blobId("one");
+    auto input = [](unsigned byte, bool executable, std::string_view generation) {
+        /* These are opaque identifiers, not hashes sampled from file contents.
+           The handoff accepts every byte and never opens a holder's pathname. */
+        Hash id{HashAlgorithm::SHA256};
+        id.hash[0] = static_cast<uint8_t>(byte);
+        auto ordinal = 2 * byte + unsigned(executable) + 1;
+        return Row{
+            .id = id,
+            .executable = executable,
+            .ino = static_cast<ino_t>(ordinal),
+            .dev = static_cast<dev_t>(17),
+            .size = 3 * ordinal,
+            .name = std::string(generation) + "/" + std::to_string(ordinal) + "-" + std::string(64, 'n')};
+    };
+    auto relation = [](const std::vector<Row> & rows) {
+        std::map<Key, Fields> result;
+        for (auto & row : rows)
+            EXPECT_TRUE(
+                result.emplace(Key{row.id, row.executable}, Fields{row.ino, row.dev, row.size, row.name}).second)
+                << "handoff must contain exactly one row per claimed key";
+        return result;
+    };
+    auto claim = [&](const Row & row, const std::filesystem::path & expectedRoot) {
+        EXPECT_FALSE(hold.addRow(row));
+        EXPECT_EQ(hold.root(), expectedRoot);
+        auto expected = (expectedRoot / row.name).string();
+        auto duplicate = row;
+        duplicate.name += "-rejected";
+        ++duplicate.ino;
+        ++duplicate.size;
+        EXPECT_EQ(hold.addRow(std::move(duplicate)), expected);
+        EXPECT_EQ(hold.pendingHolder(row.id, row.executable), expected);
+    };
+    auto complete = [&](const std::vector<Row> & expected) {
+        auto actual = hold.takeRows();
+        EXPECT_EQ(relation(actual), relation(expected));
+        for (auto & row : expected)
+            EXPECT_FALSE(hold.pendingHolder(row.id, row.executable));
+        EXPECT_TRUE(hold.takeRows().empty());
+        return actual;
+    };
+
+    store->beginIngestion(hold, "/empty");
+    complete({});
+    /* Every singleton shard address and both regular-file modes. */
+    for (unsigned byte = 0; byte < 256; ++byte)
+        for (bool executable : {false, true}) {
+            SCOPED_TRACE(fmt("byte=%d executable=%d", byte, executable));
+            store->beginIngestion(hold, "/single");
+            auto row = input(byte, executable, "single");
+            claim(row, "/single");
+            complete({row});
+        }
+
+    /* All shards occupied together, with both keys in every shard. */
+    std::vector<Row> firstExpected, secondExpected;
+    for (unsigned byte = 0; byte < 256; ++byte)
+        for (bool executable : {false, true}) {
+            firstExpected.push_back(input(byte, executable, "first"));
+            secondExpected.push_back(input(byte, executable, "second"));
+        }
     store->beginIngestion(hold, "/first");
-    hold.addRow({.id = id, .executable = false, .name = "a"});
-    EXPECT_EQ(store->blobRowCount(false), 0u);
-    EXPECT_EQ(hold.pendingHolder(id, false), "/first/a");
-    auto first = hold.takeRows();
-    ASSERT_EQ(first.size(), 1u);
-    EXPECT_EQ(first.front().name, "a");
-    EXPECT_FALSE(hold.pendingHolder(id, false)) << "handoff retires pending witnesses";
-    EXPECT_TRUE(hold.takeRows().empty());
+    for (auto & row : firstExpected)
+        claim(row, "/first");
+    auto first = complete(firstExpected);
     store->beginIngestion(hold, "/second");
-    EXPECT_FALSE(hold.pendingHolder(id, false)) << "names belong to one ingestion, not its reused hold";
-    hold.addRow({.id = id, .executable = true, .name = "b"});
-    auto second = hold.takeRows();
-    ASSERT_EQ(second.size(), 1u);
-    EXPECT_EQ(second.front().name, "b");
-    EXPECT_FALSE(hold.pendingHolder(id, true));
-    EXPECT_EQ(first.front().name, "a") << "completed rows do not borrow the reused hold";
+    for (auto i = secondExpected.rbegin(); i != secondExpected.rend(); ++i)
+        claim(*i, "/second");
+    auto second = complete(secondExpected);
+
+    /* Reset also abandons an unconsumed projection. Returned rows remain
+       independently owned through destruction and reuse of every shard. */
+    store->beginIngestion(hold, "/abandoned");
+    for (auto & row : firstExpected)
+        claim(row, "/abandoned");
+    store->beginIngestion(hold, "/reset");
+    complete({});
+    for (auto & row : firstExpected)
+        EXPECT_FALSE(hold.pendingHolder(row.id, row.executable));
+    EXPECT_EQ(relation(first), relation(firstExpected));
+    EXPECT_EQ(relation(second), relation(secondExpected));
+    EXPECT_EQ(store->blobRowCount(false), 0u);
     EXPECT_EQ(store->blobRowCount(true), 0u);
 }
 
