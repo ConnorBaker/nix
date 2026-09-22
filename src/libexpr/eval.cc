@@ -423,11 +423,6 @@ void EvalState::flushPendingWrites()
 {
     if (writeBuffer.empty())
         return;
-    /* A pending object's mounted inputs are written with it: a reference must
-       be valid when its referrer is registered, and a mounted input enters Δ
-       when an object that names it does. */
-    for (auto & ref : writeBuffer.pendingReferences())
-        ensureLazyPathCopied(ref);
     writeBuffer.flush();
 }
 

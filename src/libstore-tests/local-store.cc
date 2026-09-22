@@ -8297,6 +8297,80 @@ TEST_F(TempLocalStoreTest, invalidationAfterValidityBackendCannotBeUndoneByItsRe
     EXPECT_THROW(observed->queryPathInfo(path), InvalidPath);
 }
 
+/* Public callback behavior when the caller releases the store-wide wrapper.
+   Its physical child is private, so this is behavior coverage, not a weak
+   ownership observation or a deterministic negative control. Directory
+   accessors are borrowed only during their callback's dynamic extent. */
+TEST_F(TempLocalStoreTest, storeAccessorDelegationSurvivesReleasingTheWrapperInCallbacks)
+{
+    auto tree = make_ref<MemorySourceAccessor>();
+    const std::string expected = "physical callback bytes";
+    tree->addFile(CanonPath("file"), std::string(expected));
+    auto object = static_cast<Store &>(*store).addToStore("callback-tree", SourcePath{tree});
+    CanonPath directory{object.to_string()};
+
+    struct CallbackStopped
+    {};
+
+    for (unsigned operation = 0; operation != 4; ++operation)
+        for (bool release : {false, true})
+            for (bool stop : {false, true}) {
+                SCOPED_TRACE(fmt("operation=%d release=%d stop=%d", operation, release, stop));
+                auto view = store->getFSAccessor().get_ptr();
+                std::weak_ptr<SourceAccessor> outer = view;
+                unsigned entered = 0;
+                auto callback = [&] {
+                    ++entered;
+                    if (release)
+                        view.reset();
+                    if (stop)
+                        throw CallbackStopped{};
+                };
+                std::string bytes;
+                LambdaSink sink{[&](std::string_view data) {
+                    if (operation == 1)
+                        callback();
+                    bytes += data;
+                }};
+                bool stopped = false;
+                try {
+                    if (operation < 2)
+                        view->readFile(directory / "file", sink, [&](uint64_t size) {
+                            EXPECT_EQ(size, expected.size());
+                            if (operation == 0)
+                                callback();
+                        });
+                    else if (operation == 2)
+                        view->readDirectory(directory, [&](SourceAccessor & child, const CanonPath & relative) {
+                            callback();
+                            auto entries = child.readDirectory(relative);
+                            EXPECT_EQ(entries.size(), 1u);
+                            EXPECT_TRUE(entries.contains("file"));
+                            bytes = child.readFile(relative / "file");
+                        });
+                    else
+                        view->readDirectoryWithEntries(
+                            directory,
+                            [&](SourceAccessor & child,
+                                const CanonPath & relative,
+                                const SourceAccessor::DirEntries & entries) {
+                                callback();
+                                EXPECT_EQ(entries.size(), 1u);
+                                EXPECT_TRUE(entries.contains("file"));
+                                bytes = child.readFile(relative / "file");
+                            });
+                } catch (CallbackStopped &) {
+                    stopped = true;
+                }
+                EXPECT_EQ(entered, 1u);
+                EXPECT_EQ(stopped, stop);
+                if (!stop)
+                    EXPECT_EQ(bytes, expected);
+                view.reset();
+                EXPECT_TRUE(outer.expired());
+            }
+}
+
 #endif
 
 } // namespace nix

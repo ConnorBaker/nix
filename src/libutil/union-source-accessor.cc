@@ -81,6 +81,7 @@ public:
 
     ref<SourceAccessor> requireOwner(const CanonPath & path)
     {
+        auto keepAlive = weak_from_this().lock();
         auto o = owner(path);
         if (!o)
             throw FileNotFound("path '%s' does not exist", showPath(path));
@@ -116,12 +117,22 @@ public:
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
     {
+        auto keepAlive = weak_from_this().lock();
         auto o = owner(path);
         return o ? std::optional{o->second} : std::nullopt;
     }
 
+    Stat lstat(const CanonPath & path) override
+    {
+        auto keepAlive = weak_from_this().lock();
+        if (auto o = owner(path))
+            return o->second;
+        throw FileNotFound("path '%s' does not exist", showPath(path));
+    }
+
     DirEntries readDirectory(const CanonPath & path) override
     {
+        auto keepAlive = weak_from_this().lock();
         auto o = owner(path);
         if (!o)
             throw FileNotFound("path '%s' does not exist", showPath(path));
@@ -144,19 +155,22 @@ public:
 
     std::string showPath(const CanonPath & path) override
     {
-        for (auto & accessor : accessors)
-            return accessor->showPath(path);
-        return SourceAccessor::showPath(path);
+        if (accessors.empty())
+            return SourceAccessor::showPath(path);
+        auto first = accessors.front();
+        return first->showPath(path);
     }
 
     void invalidateCache() override
     {
+        auto keepAlive = weak_from_this().lock();
         for (auto & accessor : accessors)
             accessor->invalidateCache();
     }
 
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
     {
+        auto keepAlive = weak_from_this().lock();
         for (auto & accessor : accessors) {
             auto p = accessor->getPhysicalPath(path);
             if (p)
@@ -170,11 +184,14 @@ public:
         if (fingerprint)
             return std::pair{path, *fingerprint};
 
+        auto keepAlive = weak_from_this().lock();
         auto o = owner(path);
         if (!o)
             return std::nullopt;
         auto & [own, st] = *o;
         auto later = st.type == tDirectory ? laterDirectories(path, *own) : std::vector<ref<SourceAccessor>>{};
+        /* Selection borrows the layers; naming now owns every part. */
+        keepAlive.reset();
         if (later.empty())
             /* The subtree here is one child's alone. */
             return own->getFingerprint(path);

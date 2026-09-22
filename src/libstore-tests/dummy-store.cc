@@ -2,6 +2,7 @@
 #include <nlohmann/json.hpp>
 
 #include "nix/util/memory-source-accessor.hh"
+#include "nix/util/serialise.hh"
 #include "nix/store/dummy-store-impl.hh"
 #include "nix/store/globals.hh"
 #include "nix/store/realisation.hh"
@@ -180,5 +181,83 @@ INSTANTIATE_TEST_SUITE_P(DummyStoreJSON, DummyStoreJsonTest, [] {
             }(),
         });
 }());
+
+/* A whole-store read borrows a selected memory object through callbacks.
+   The callback may release both owners; the selected object must remain
+   alive until delegation ends. A weak observation catches the old raw
+   borrow before MemorySourceAccessor can resume on freed contents. */
+TEST(DummyStore, wholeStoreReadOwnsItsSelectedChildAcrossCallbacks)
+{
+    initLibStore(false);
+
+    struct CallbackStopped
+    {};
+
+    struct LostChild
+    {};
+
+    for (bool atSize : {false, true})
+        for (bool release : {false, true})
+            for (bool stop : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "size=" << atSize << " release=" << release << " stop=" << stop);
+                auto config = make_ref<DummyStoreConfig>(StoreReference::Params{});
+                config->readOnly = false;
+                auto store = config->openDummyStore().get_ptr();
+                const std::string expected = "owned callback bytes";
+                StringSource source{expected};
+                auto path = store->addToStoreFromDump(
+                    source,
+                    "callback-child",
+                    FileSerialisationMethod::Flat,
+                    ContentAddressMethod::Raw::Flat,
+                    HashAlgorithm::SHA256,
+                    {},
+                    NoRepair);
+                std::weak_ptr<SourceAccessor> child = store->getFSAccessor(path);
+                auto view = store->getFSAccessor().get_ptr();
+                std::weak_ptr<SourceAccessor> outer = view;
+                unsigned entered = 0;
+                auto callback = [&] {
+                    ++entered;
+                    if (release) {
+                        store.reset();
+                        view.reset();
+                    }
+                    bool alive = !child.expired();
+                    EXPECT_TRUE(alive) << "the selected child must outlive the callback";
+                    if (!alive)
+                        throw LostChild{};
+                    if (stop)
+                        throw CallbackStopped{};
+                };
+                std::string bytes;
+                LambdaSink sink{[&](std::string_view data) {
+                    if (!atSize)
+                        callback();
+                    bytes += data;
+                }};
+                bool stopped = false;
+                try {
+                    view->readFile(CanonPath(path.to_string()), sink, [&](uint64_t size) {
+                        EXPECT_EQ(size, expected.size());
+                        if (atSize)
+                            callback();
+                    });
+                } catch (CallbackStopped &) {
+                    stopped = true;
+                } catch (LostChild &) {
+                    /* The assertion above is the negative-control failure;
+                       do not resume the old implementation's dangling read. */
+                }
+                EXPECT_EQ(entered, 1u);
+                EXPECT_EQ(stopped, stop);
+                if (!stop)
+                    EXPECT_EQ(bytes, expected);
+                store.reset();
+                view.reset();
+                EXPECT_TRUE(outer.expired());
+                EXPECT_TRUE(child.expired());
+            }
+}
 
 } // namespace nix

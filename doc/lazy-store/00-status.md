@@ -1,6 +1,6 @@
 # Lazy-store status
 
-The correctness fixes have passed the checks below, but the requirement that **every benchmark case beat the branch base remains open**. The comparison uses branch base `8aad447`, not a moving `master`. The latest [optimized comparison](runs/2026-09-21-performance/paired-e6d34dfdc.json) records six faster cases and three regressions. Subsequent audit changes have passed correctness checks but are not covered by those performance measurements.
+The correctness fixes have passed the checks below, but the requirement that **every benchmark case beat the branch base remains open**. The comparison uses branch base `8aad447`, not a moving `master`. The latest [optimized comparison](runs/2026-09-21-performance/paired-efe2ca8ee.json) records six faster cases and three regressions. The optimized build passes its packaged checks; subsequent audit work remains separate from this measured revision.
 
 ## Semantic model
 
@@ -14,11 +14,11 @@ The [specification](01-specification.md), [implementation derivation](04-derivat
 
 ## Completed validation and limits
 
-The latest completed debug checks report **2,425 passing unit tests and two existing skips**: 435 evaluator, 146 fetcher, 872 utility and 972 store tests. The utility suite also passes with newer syscalls disabled. Five targeted object-store/hash/optimisation/GC functional tests and **all twelve real overlay tests pass**. The previously failing overlay assertions and registration dispatch are resolved. Overlay-specific limits, including no cross-layer regular-holder sharing and the disabled auxiliary verification/materialisation routes, remain explicit in the store model.
+The latest completed debug checks report **2,443 passing unit tests and two existing runtime skips**: 439 evaluator, 149 fetcher, 881 utility and 974 store tests. Three pre-existing disabled tests remain excluded. The utility suite also passes with newer syscalls disabled. Five targeted object-store/hash/optimisation/GC functional tests and **all twelve real overlay tests pass**. The previously failing overlay assertions and registration dispatch are resolved. Overlay-specific limits, including no cross-layer regular-holder sharing and the disabled auxiliary verification/materialisation routes, remain explicit in the store model.
 
 The [performance and verification report](09-performance.md#verification) records the finite-domain checks, negative controls, syscall evidence and source-review limits. The latest optimized comparison additionally passes all eighteen complete store-graph comparisons and binds all 156 evaluation outputs to their actual store pairs. These checks compare exact contents, modes, references and outputs under an injective substitution of store addresses. They do not establish equivalence of arbitrary embedded programs.
 
-These results apply to aarch64 Linux. **Windows has not been runtime-verified.** Older platform counts and experiments in [validation](05-validation.md) and the [holder-index investigation](06-holder-index.md) are evidence for their recorded implementations, not current cross-platform gates. Pending changes need their own checks; a passing earlier binary is not evidence for an edited source tree.
+These results apply to aarch64 Linux. **Windows has not been runtime-verified.** Older platform counts and experiments in [validation](05-validation.md) and the [holder-index investigation](06-holder-index.md) are evidence for their recorded implementations, not current cross-platform gates. The subsequent source audit passes all eighteen new regressions and ten independently restored negative controls. Its optimized measurements are pending; a passing earlier binary is not evidence for an edited source tree.
 
 ## Remaining performance work
 
@@ -26,15 +26,15 @@ The latest report uses pinned Nixpkgs, five paired cold trials and ten paired wa
 
 | Warm workload | Base median | Branch median | Change in median elapsed time |
 | --- | ---: | ---: | ---: |
-| `git+file:` · 8 attributes | 0.815 s | 0.895 s | +9.7% |
-| `git+file:` · 32 attributes | 1.366 s | 1.600 s | +17.2% |
-| `github:` · 32 attributes | 0.840 s | 0.876 s | +4.2% |
+| `git+file:` · 8 attributes | 0.825 s | 0.864 s | +4.8% |
+| `git+file:` · 32 attributes | 1.384 s | 1.624 s | +17.3% |
+| `github:` · 32 attributes | 0.861 s | 0.900 s | +4.5% |
 
 The percentages are derived from the report's unrounded median ratios. All three cold cases, both warm `path:` cases and warm eight-attribute GitHub improve by median elapsed time. This does not satisfy the all-cases-faster requirement. Current profiling and implementation work must preserve raw worktree observations, source ownership and GC protection while removing unnecessary work.
 
 ## Evidence and reproduction
 
-- [Performance report](09-performance.md) and [latest sample record](runs/2026-09-21-performance/paired-e6d34dfdc.json): exact revisions, binaries, input provenance, raw samples, commands, resource usage and graph-check results.
+- [Performance report](09-performance.md) and [latest sample record](runs/2026-09-21-performance/paired-efe2ca8ee.json): exact revisions, binaries, input provenance, raw samples, commands, resource usage and graph-check results.
 - [Nixpkgs evaluation driver](runs/nixpkgs-evaluation.py): all three URI schemes, cold 32-attribute and warm 8-/32-attribute cases, balanced executable order and explicit CPU affinity. Builds and profiles run separately from timing.
 - [Complete store comparison](runs/compare-store-graphs.py) and [methodology counterchecks](runs/check-benchmark-methodology.py): graph/content/output equivalence and planted failures. Each cold store requires its own comparison; copying an indexed store changes holder inodes and is not a representative warm fixture.
 - [Validation commands](05-validation.md) and [overlay host driver](runs/overlay-suite-on-host.sh): reproduce the applicable gates. Overlay tests must actually mount overlayfs; a skipped namespace probe is not a passing test.

@@ -6,6 +6,10 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#ifndef _WIN32
+#  include <unistd.h>
+#endif
+
 namespace nix {
 
 /* A mount point is listed in its parent, the directories leading to it
@@ -129,6 +133,243 @@ TEST(MountedSourceAccessor, fingerprints)
     root->fingerprint = std::nullopt;
     EXPECT_FALSE(accessor->getFingerprint(CanonPath("m")));
     EXPECT_EQ(accessor->getFingerprint(CanonPath("m/n/y")).value().second, std::string("U"));
+}
+
+namespace {
+
+struct MountedCallbackException
+{};
+
+struct MountedOwnershipLost
+{};
+
+struct MountedOwnershipProbe : MemorySourceAccessor
+{
+    std::function<void()> callback;
+    bool present = false;
+
+    void anchor() override {}
+
+    std::optional<Stat> maybeLstat(const CanonPath &) override
+    {
+        auto result = present ? std::optional<Stat>{Stat{.type = tDirectory}} : std::nullopt;
+        auto invoke = callback;
+        invoke();
+        return result;
+    }
+
+    std::string showPath(const CanonPath &) override
+    {
+        auto invoke = callback;
+        invoke();
+        return "child";
+    }
+
+    void invalidateCache() override
+    {
+        auto invoke = callback;
+        invoke();
+    }
+};
+
+/* No probe member is accessed after its copied callback. Invalidation
+   ownership cells exercise the fixed snapshot; the old locked-map body
+   is counterchecked only by the separate, retained-owner reentry test. */
+void checkMountedInvalidation(unsigned releaseAt, bool release, bool throwing, bool reenter)
+{
+    std::shared_ptr<MountedSourceAccessor> owner;
+    std::vector<std::weak_ptr<SourceAccessor>> children;
+    unsigned calls = 0, addedCalls = 0;
+    {
+        std::map<CanonPath, ref<SourceAccessor>> mounts;
+        for (auto path : {CanonPath::root, CanonPath("first"), CanonPath("second")}) {
+            auto child = make_ref<MountedOwnershipProbe>();
+            children.push_back(child.get_ptr());
+            child->callback = [&, path] {
+                ++calls;
+                if (reenter) {
+                    /* Reentry is exercised with a retained wrapper. The
+                       selected key is precisely the key a map visitor
+                       would still hold while invoking this callback. */
+                    auto selected = owner->getMount(path);
+                    ASSERT_TRUE(selected);
+                    owner->mount(path, ref<SourceAccessor>(selected));
+                    if (calls == 1) {
+                        auto added = make_ref<MountedOwnershipProbe>();
+                        added->callback = [&] { ++addedCalls; };
+                        owner->mount(CanonPath("added"), added);
+                    }
+                }
+                if (calls == releaseAt && release)
+                    owner.reset();
+                for (auto & child : children) {
+                    auto alive = !child.expired();
+                    EXPECT_TRUE(alive);
+                    if (!alive)
+                        throw MountedOwnershipLost{};
+                }
+                if (calls == releaseAt && throwing)
+                    throw MountedCallbackException{};
+            };
+            mounts.emplace(path, child);
+        }
+        owner = makeMountedSourceAccessor(std::move(mounts)).get_ptr();
+    }
+    std::weak_ptr<SourceAccessor> weakOwner = owner;
+    auto * accessor = owner.get();
+    if (throwing)
+        EXPECT_THROW(accessor->invalidateCache(), MountedCallbackException);
+    else
+        EXPECT_NO_THROW(accessor->invalidateCache());
+    EXPECT_EQ(calls, throwing ? releaseAt : 3u);
+    EXPECT_EQ(weakOwner.expired(), release);
+    for (auto & child : children)
+        EXPECT_EQ(child.expired(), release);
+    if (reenter) {
+        /* A new mount is outside the already collected snapshot. It is
+           included by the next invalidation, even after an exception. */
+        EXPECT_EQ(addedCalls, 0u);
+        calls = 0;
+        releaseAt = 0;
+        EXPECT_NO_THROW(owner->invalidateCache());
+        EXPECT_EQ(calls, 3u);
+        EXPECT_EQ(addedCalls, 1u);
+    }
+    owner.reset();
+    EXPECT_TRUE(weakOwner.expired());
+    for (auto & child : children)
+        EXPECT_TRUE(child.expired());
+}
+
+} // namespace
+
+TEST(MountedSourceAccessor, statCallbacksRetainTheFallbackOwner)
+{
+    for (bool present : {false, true})
+        for (bool descendant : {false, true})
+            for (bool release : {false, true})
+                for (bool throwing : {false, true}) {
+                    SCOPED_TRACE(
+                        ::testing::Message() << "present=" << present << " descendant=" << descendant
+                                             << " release=" << release << " throwing=" << throwing);
+                    auto child = std::make_shared<MountedOwnershipProbe>();
+                    child->present = present;
+                    std::weak_ptr<SourceAccessor> weakChild = child;
+                    std::shared_ptr<MountedSourceAccessor> owner =
+                        makeMountedSourceAccessor({{CanonPath::root, ref<SourceAccessor>(child)}}).get_ptr();
+                    if (descendant)
+                        owner->mount(CanonPath("missing/mounted"), makeEmptySourceAccessor());
+                    std::weak_ptr<SourceAccessor> weakOwner = owner;
+                    unsigned calls = 0;
+                    child->callback = [&] {
+                        ++calls;
+                        if (release)
+                            owner.reset();
+                        auto childAlive = !weakChild.expired();
+                        auto ownerAlive = !weakOwner.expired();
+                        EXPECT_TRUE(childAlive);
+                        if (!present)
+                            EXPECT_TRUE(ownerAlive);
+                        if (!childAlive || (!present && !ownerAlive))
+                            throw MountedOwnershipLost{};
+                        if (throwing)
+                            throw MountedCallbackException{};
+                    };
+                    child.reset();
+                    auto * accessor = owner.get();
+                    auto run = [&] {
+                        auto result = accessor->maybeLstat(CanonPath("missing"));
+                        EXPECT_EQ(result.has_value(), present || descendant);
+                        if (result)
+                            EXPECT_EQ(result->type, SourceAccessor::tDirectory);
+                    };
+                    if (throwing)
+                        EXPECT_THROW(run(), MountedCallbackException);
+                    else
+                        EXPECT_NO_THROW(run());
+                    EXPECT_EQ(calls, 1u);
+                    EXPECT_EQ(weakOwner.expired(), release);
+                    EXPECT_EQ(weakChild.expired(), release);
+                    owner.reset();
+                    EXPECT_TRUE(weakOwner.expired());
+                    EXPECT_TRUE(weakChild.expired());
+                }
+}
+
+TEST(MountedSourceAccessor, displayCallbacksRetainTheDisplayOwner)
+{
+    for (bool release : {false, true})
+        for (bool throwing : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "release=" << release << " throwing=" << throwing);
+            auto child = std::make_shared<MountedOwnershipProbe>();
+            std::weak_ptr<SourceAccessor> weakChild = child;
+            std::shared_ptr<MountedSourceAccessor> owner =
+                makeMountedSourceAccessor({{CanonPath::root, ref<SourceAccessor>(child)}}).get_ptr();
+            owner->setPathDisplay("prefix<", ">suffix");
+            std::weak_ptr<SourceAccessor> weakOwner = owner;
+            unsigned calls = 0;
+            child->callback = [&] {
+                ++calls;
+                if (release)
+                    owner.reset();
+                auto childAlive = !weakChild.expired();
+                auto ownerAlive = !weakOwner.expired();
+                EXPECT_TRUE(childAlive);
+                EXPECT_TRUE(ownerAlive);
+                if (!childAlive || !ownerAlive)
+                    throw MountedOwnershipLost{};
+                if (throwing)
+                    throw MountedCallbackException{};
+            };
+            child.reset();
+            auto * accessor = owner.get();
+            if (throwing)
+                EXPECT_THROW(accessor->showPath(CanonPath::root), MountedCallbackException);
+            else
+                EXPECT_EQ(accessor->showPath(CanonPath::root), "prefix<child>suffix");
+            EXPECT_EQ(calls, 1u);
+            EXPECT_EQ(weakOwner.expired(), release);
+            EXPECT_EQ(weakChild.expired(), release);
+            owner.reset();
+            EXPECT_TRUE(weakOwner.expired());
+            EXPECT_TRUE(weakChild.expired());
+        }
+}
+
+TEST(MountedSourceAccessor, invalidationRetainsTheCollectedChildren)
+{
+    /* Child order is unspecified: first and last refer to callback order,
+       not hash-table iteration order. Each initial child remains owned. */
+    for (unsigned releaseAt : {1u, 3u})
+        for (bool release : {false, true})
+            for (bool throwing : {false, true}) {
+                SCOPED_TRACE(
+                    ::testing::Message() << "at=" << releaseAt << " release=" << release << " throwing=" << throwing);
+                checkMountedInvalidation(releaseAt, release, throwing, false);
+            }
+}
+
+TEST(MountedSourceAccessor, invalidationAllowsReentryAfterTheSnapshot)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "The negative map-lock control requires a bounded Unix subprocess";
+#else
+    /* Keep the wrapper alive in this separate countercheck. Restoring
+       locked visitation may block reentry, but cannot destroy a locked
+       map. The alarm bounds that regression without sleeping. */
+    for (unsigned callbackAt : {1u, 3u})
+        for (bool throwing : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "at=" << callbackAt << " throwing=" << throwing);
+            EXPECT_EXIT(
+                {
+                    alarm(5);
+                    checkMountedInvalidation(callbackAt, false, throwing, true);
+                    _exit(::testing::Test::HasFailure() ? 1 : 0);
+                },
+                ::testing::ExitedWithCode(0),
+                "");
+        }
+#endif
 }
 
 } // namespace nix

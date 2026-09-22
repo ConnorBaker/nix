@@ -139,13 +139,15 @@ public:
             return;
         }
         requireStoreObject(dirPath);
-        return accessor->readDirectory(dirPath, std::move(callback));
+        auto inner = accessor;
+        return inner->readDirectory(dirPath, std::move(callback));
     }
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
         requireStoreObject(path);
-        return accessor->readFile(path, sink, sizeCallback);
+        auto inner = accessor;
+        return inner->readFile(path, sink, sizeCallback);
     }
 
     void readDirectoryWithEntries(
@@ -157,7 +159,8 @@ public:
             callback(*this, path, entries);
         } else {
             requireStoreObject(path);
-            accessor->readDirectoryWithEntries(path, std::move(callback));
+            auto inner = accessor;
+            inner->readDirectoryWithEntries(path, std::move(callback));
         }
     }
 

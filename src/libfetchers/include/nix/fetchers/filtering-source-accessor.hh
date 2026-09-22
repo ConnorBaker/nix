@@ -62,7 +62,8 @@ struct FilteringSourceAccessor : SourceAccessor
 
     void invalidateCache() override
     {
-        next->invalidateCache();
+        auto inner = next;
+        inner->invalidateCache();
     }
 
     /**

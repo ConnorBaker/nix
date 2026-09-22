@@ -63,17 +63,17 @@ class WholeStoreViewAccessor : public SourceAccessor
             return callback(rootPathAccessor, path);
 
         BaseName baseName(*path.begin());
-        MemorySourceAccessor * res = nullptr;
+        std::shared_ptr<MemorySourceAccessor> res;
 
         subdirs.cvisit(baseName, [&](const auto & kv) {
             path = path.removePrefix(CanonPath{baseName});
-            res = &*kv.second;
+            res = kv.second.get_ptr();
         });
 
         if (!res)
             /* The accessor is truly empty, i.e. without any file at root so
                any subsequent operation with it will fail. */
-            res = &emptyAccessor;
+            return callback(emptyAccessor, path);
 
         return callback(*res, path);
     }

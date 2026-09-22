@@ -18,6 +18,10 @@
 #include "nix/util/hash.hh"
 #include "nix/util/merkle-hash.hh"
 #include "nix/util/object-hash.hh"
+#include "nix/util/object-hash-sink.hh"
+#include "nix/util/memory-source-accessor.hh"
+#include "nix/util/mounted-source-accessor.hh"
+#include "nix/fetchers/fetch-to-store.hh"
 
 #include <exception> // IWYU pragma: keep (Needed by rapidcheck on Darwin and FreeBSD)
 /* gtest first: <rapidcheck/gtest.h> names `::testing` and `FAIL` without
@@ -803,9 +807,11 @@ TEST_F(WriteBufferTest, dereferencingBuiltinsWriteFirst)
 RC_GTEST_FIXTURE_PROP(WriteBufferTest, prop_derivations_round_trip_through_the_buffer, (const Derivation & drv))
 {
     WriteBuffer buffer(*state.store, neverAutoFlush);
+    auto expected = computeStorePath(*state.store, drv);
+    bool previouslyValid = state.store->isValidPath(expected);
     auto path = buffer.addDerivation(drv);
-    RC_ASSERT(path == computeStorePath(*state.store, drv));
-    RC_ASSERT(buffer.contains(path));
+    RC_ASSERT(path == expected);
+    RC_ASSERT(buffer.contains(path) == !previouslyValid);
     buffer.flush();
     RC_ASSERT(state.store->isValidPath(path));
     try {
@@ -1002,6 +1008,194 @@ TEST_F(WriteBufferLocalStoreTest, gcKeepsTheExistingReferencesOfPendingObjects)
     buffer.flush();
     ASSERT_TRUE(store->isValidPath(d));
     EXPECT_EQ(store->queryPathInfo(d)->references, StorePathSet{referenced});
+}
+
+/* A valid text has no remaining write obligation. Enumerate pending
+   absence/plain/repair, actual registration and the new repair request:
+   twelve states. Missing physical bytes behind a valid row distinguish a
+   required repair from a redundant NoRepair write. */
+TEST_F(WriteBufferLocalStoreTest, validObjectsDischargeBufferingWithoutLosingPendingRepairs)
+{
+    struct ObservedStore : LocalStore
+    {
+        std::vector<RepairFlag> writes;
+
+        explicit ObservedStore(ref<const LocalStore::Config> config)
+            : Store{*config}
+            , LocalFSStore{*config}
+            , LocalStore{config}
+        {
+        }
+
+        void
+        addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override
+        {
+            writes.push_back(repair);
+            LocalStore::addToStore(info, source, repair, checkSigs);
+        }
+    };
+
+    for (unsigned pending = 0; pending != 3; ++pending)
+        for (bool registered : {false, true})
+            for (auto repair : {NoRepair, Repair}) {
+                SCOPED_TRACE(fmt("pending=%d registered=%d repair=%d", pending, registered, repair == Repair));
+                AutoDelete root{canonPath(createTempDir(), true)};
+                auto local = make_ref<ObservedStore>(make_ref<LocalStoreConfig>(root.path(), StoreConfig::Params{}));
+                WriteBuffer buffer(*local, neverAutoFlush);
+                std::optional<StorePath> first;
+                if (pending)
+                    first = buffer.addText("observed", "original", {}, pending == 2 ? Repair : NoRepair);
+                if (registered) {
+                    WriteBuffer seed(*local, neverAutoFlush);
+                    auto path = seed.addText("observed", "original", {});
+                    seed.flush();
+                    deletePath(local->toRealPath(path));
+                }
+                local->writes.clear();
+
+                auto path = buffer.addText("observed", "original", {}, repair);
+                if (first)
+                    EXPECT_EQ(path, *first);
+                bool mustRemainPending = pending || !registered || repair == Repair;
+                EXPECT_EQ(buffer.contains(path), mustRemainPending);
+                EXPECT_EQ(buffer.footprint() != 0, mustRemainPending);
+                EXPECT_TRUE(local->writes.empty());
+                buffer.flush();
+
+                bool mustWrite = !registered || pending == 2 || repair == Repair;
+                ASSERT_EQ(local->writes.size(), mustWrite ? 1u : 0u);
+                if (mustWrite) {
+                    EXPECT_EQ(local->writes.front(), pending == 2 || repair == Repair ? Repair : NoRepair);
+                    EXPECT_EQ(readFile(local->toRealPath(path)), "original");
+                } else
+                    EXPECT_FALSE(pathExists(local->toRealPath(path)));
+                EXPECT_TRUE(local->isValidPath(path));
+                EXPECT_TRUE(buffer.empty());
+            }
+}
+
+/* The valid referrer's root protects its recorded closure; an unrelated
+   pending object's obligation remains independent of that discharge. */
+TEST_F(WriteBufferLocalStoreTest, dischargingAValidObjectKeepsItsClosureAndIndependentPendingObjects)
+{
+    AutoDelete root{canonPath(createTempDir(), true)};
+    auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(root.path(), StoreConfig::Params{}));
+    auto addUnrooted = [&](std::string_view name, const std::string & contents, StorePathSet refs) {
+        auto info = ValidPathInfo::makeFromCA(
+            *local,
+            name,
+            TextInfo{.hash = hashString(HashAlgorithm::SHA256, contents), .references = std::move(refs)},
+            ObjectHash{.hash = merkle::blobId(contents)});
+        info.narSize = merkle::nar::root(merkle::nar::regular(contents.size(), false));
+        auto path = info.path;
+        writeFile(local->toRealPath(path), contents);
+        local->registerValidPaths({{path, std::move(info)}});
+        return path;
+    };
+    auto ref = addUnrooted("reference", "reference", {});
+    auto top = addUnrooted("valid", "valid", {ref});
+    auto dead = addUnrooted("dead", "dead", {});
+    WriteBuffer buffer(*local, neverAutoFlush);
+    auto independent = buffer.addText("independent", "independent", {});
+    auto footprint = buffer.footprint();
+    EXPECT_EQ(buffer.addText("valid", "valid", {ref}), top);
+    EXPECT_FALSE(buffer.contains(top));
+    EXPECT_TRUE(buffer.contains(independent));
+    EXPECT_EQ(buffer.footprint(), footprint);
+
+    GCOptions options;
+    GCResults results;
+    local->collectGarbage(options, results);
+    EXPECT_TRUE(local->isValidPath(top));
+    EXPECT_TRUE(local->isValidPath(ref));
+    EXPECT_FALSE(local->isValidPath(dead));
+    EXPECT_FALSE(local->isValidPath(independent));
+    buffer.flush();
+    EXPECT_EQ(readFile(local->toRealPath(independent)), "independent");
+    EXPECT_EQ(local->queryPathInfo(top)->references, StorePathSet{ref});
+}
+
+/* Both production writers must settle a mounted input before enqueueing:
+   the memory bound invokes WriteBuffer::flush directly. Cross the actual
+   32 MiB bound as well as the one-object test bound, without an escape or
+   EvalState::flushPendingWrites to hide a missing reference. */
+TEST_F(WriteBufferTest, mountedReferencesPrecedeThresholdFlushForBothTextWriters)
+{
+    for (bool derivation : {false, true})
+        for (bool defaultBound : {false, true}) {
+            SCOPED_TRACE(fmt("derivation=%d defaultBound=%d", derivation, defaultBound));
+            AutoDelete root{canonPath(createTempDir(), true)};
+            auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(root.path(), StoreConfig::Params{}));
+            EvalState nested({}, local, fetchSettings, evalSettings);
+            nested.writeBuffer.setFlushThreshold(defaultBound ? WriteBuffer::defaultFlushThreshold : 1);
+            auto tree = make_ref<MemorySourceAccessor>();
+            tree->addFile(CanonPath("file"), "mounted source");
+            auto source = gitTreePath(*local, "mounted", merkle::objectHash(objectHashOf(*tree, CanonPath::root).root));
+            nested.storeFS->mount(CanonPath(local->printStorePath(source)), tree);
+            ASSERT_FALSE(local->isValidPath(source));
+            auto expr = derivation ? "input: (derivation { name = \"mounted-drv\"; system = \"x86_64-linux\"; "
+                                     "builder = \"/bin/sh\"; inherit input; }).drvPath"
+                                   : "input: builtins.toFile \"mounted-text\" input";
+            Value function, argument, value;
+            nested.eval(nested.parseExprFromString(expr, nested.rootPath(CanonPath::root)), function);
+            /* Supply the same opaque context fetchTree exposes, without
+               appendContext's independent ensurePath operation. */
+            argument.mkString(
+                std::string(defaultBound ? WriteBuffer::defaultFlushThreshold : 5, 'x'),
+                NixStringContext{NixStringContextElem::Opaque{.path = source}},
+                nested.mem);
+            nested.callFunction(function, argument, value, noPos);
+            nested.forceValue(value, noPos);
+            auto path = local->parseStorePath(RawValueBytes::view(value));
+            EXPECT_TRUE(nested.writeBuffer.empty());
+            ASSERT_TRUE(local->isValidPath(path));
+            EXPECT_TRUE(local->isValidPath(source));
+            EXPECT_EQ(local->queryPathInfo(path)->references, StorePathSet{source});
+        }
+}
+
+/* A registered referrer's closure does not prove that the current mounted
+   source still agrees with its name. Both writers must retain error 102
+   even when their text itself can take the valid-object early return. */
+TEST_F(WriteBufferTest, validReferrersStillCheckTheirMountedSourcesBeforeDischarge)
+{
+    for (bool derivation : {false, true})
+        for (bool immediateFlush : {false, true}) {
+            SCOPED_TRACE(fmt("derivation=%d immediateFlush=%d", derivation, immediateFlush));
+            AutoDelete root{canonPath(createTempDir(), true)};
+            auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(root.path(), StoreConfig::Params{}));
+            EvalState nested({}, local, fetchSettings, evalSettings);
+            nested.writeBuffer.setFlushThreshold(immediateFlush ? 1 : neverAutoFlush);
+            auto tree = make_ref<MemorySourceAccessor>();
+            tree->addFile(CanonPath("file"), "before");
+            auto source = gitTreePath(*local, "mounted", merkle::objectHash(objectHashOf(*tree, CanonPath::root).root));
+            nested.storeFS->mount(CanonPath(local->printStorePath(source)), tree);
+            auto expr = derivation ? "input: (derivation { name = \"valid-drv\"; system = \"x86_64-linux\"; "
+                                     "builder = \"/bin/sh\"; inherit input; }).drvPath"
+                                   : "input: builtins.toFile \"valid-text\" input";
+            Value function, argument;
+            nested.eval(nested.parseExprFromString(expr, nested.rootPath(CanonPath::root)), function);
+            argument.mkString("same text", NixStringContext{NixStringContextElem::Opaque{.path = source}}, nested.mem);
+            auto evaluate = [&] {
+                Value value;
+                nested.callFunction(function, argument, value, noPos);
+                nested.forceValue(value, noPos);
+                return local->parseStorePath(RawValueBytes::view(value));
+            };
+            auto path = evaluate();
+            nested.flushPendingWrites();
+            ASSERT_TRUE(local->isValidPath(path));
+            tree->addFile(CanonPath("file"), "after");
+            try {
+                evaluate();
+                ADD_FAILURE() << "a valid referrer suppressed the changed mounted-source error";
+            } catch (Error & error) {
+                EXPECT_EQ(error.info().status, 102u);
+                EXPECT_NE(error.message().find("contents have changed"), std::string::npos);
+            }
+            EXPECT_TRUE(local->isValidPath(path));
+            EXPECT_TRUE(nested.writeBuffer.empty());
+        }
 }
 
 } // namespace nix

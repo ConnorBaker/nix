@@ -211,7 +211,7 @@ struct MemoVisitor : HashingVisitor
 
     /* The walk's paths are relative to `root` and carry the on-disk names;
        the accessor is asked about `root.path / to`. */
-    std::optional<fetchers::Cache::Key> keyOf(const CanonPath & to)
+    std::optional<fetchers::Cache::Key> keyOf(const CanonPath & to, const CanonPath & sourcePath)
     {
         /* A name for the entire view does not identify unchanged children
            across revisions. Memoise the requested subtree, without eagerly
@@ -230,7 +230,7 @@ struct MemoVisitor : HashingVisitor
         };
         /* Reuse this operation's root observation, including no name.
            Descendants have their own names, independent of the root's. */
-        return to.isRoot() ? keyFor(rootName) : keyFor(root.accessor->getFingerprint(root.path / to));
+        return to.isRoot() ? keyFor(rootName) : keyFor(root.accessor->getFingerprint(sourcePath));
     }
 
     /* The memo's answer for the node at `to`: its entry when the memo has
@@ -252,9 +252,10 @@ struct MemoVisitor : HashingVisitor
     {
         if (!consulted(st))
             return std::nullopt;
-        if (auto entry = root.accessor->getKnownEntry(root.path / to))
+        const auto sourcePath = root.path / to;
+        if (auto entry = root.accessor->getKnownEntry(sourcePath))
             return entry;
-        auto k = keyOf(to);
+        auto k = keyOf(to, sourcePath);
         std::optional<merkle::TreeEntry> entry;
         if (k)
             if (auto res = cache->lookup(*k))
@@ -280,7 +281,7 @@ struct MemoVisitor : HashingVisitor
             };
         auto result = descend();
         if (st.type == SourceAccessor::tSymlink)
-            key = keyOf(to);
+            key = keyOf(to, root.path / to);
         return record(std::move(key), std::move(result));
     }
 

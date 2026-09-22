@@ -1834,7 +1834,10 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                         });
                 },
                 [&](const NixStringContextElem::Opaque & o) {
-                    /* A mounted input is copied when the derivation is written (`flushPendingWrites`). */
+                    /* Enqueueing may flush at the memory bound, or return
+                       an already-valid derivation. In both cases the
+                       mounted view must first agree with its stored name. */
+                    state.ensureLazyPathCopied(o.path);
                     drv.inputs.insert(SingleDerivedPath::Opaque{o.path});
                 },
             },
@@ -2799,7 +2802,9 @@ static void prim_toFile(EvalState & state, CallSite callSite, Value * const * ar
 
     for (auto c : context) {
         if (auto p = std::get_if<NixStringContextElem::Opaque>(&c.raw)) {
-            /* A mounted input is copied when the file is written (`flushPendingWrites`). */
+            /* Discharge the mounted reference before a threshold flush or
+               an already-valid result can discharge this text's write. */
+            state.ensureLazyPathCopied(p->path);
             refs.insert(p->path);
         } else
             state

@@ -140,6 +140,13 @@ WriteBuffer::addText(std::string_view name, std::string_view contents, StorePath
        on, in case it already exists. */
     store.addTempRoot(path);
 
+    /* A rooted valid object already discharges the write obligation, as
+       in Store::writeDerivation. Its recorded closure needs no additional
+       roots or retained text. Repair and pending repair upgrades still
+       pass through the buffer. */
+    if (!repair && store.isValidPath(path))
+        return path;
+
     /* Its references that are not themselves pending must survive until the
        flush registers this object as their referrer. */
     for (auto & ref : references)
@@ -175,16 +182,6 @@ StorePath WriteBuffer::addDerivation(const Derivation & drv, RepairFlag repair)
     /* Note that the outputs of a derivation are *not* references. */
     auto text = unparse(drv, store);
     return addText(std::string(drv.name) + drvExtension, text, std::move(references), repair);
-}
-
-StorePathSet WriteBuffer::pendingReferences() const
-{
-    StorePathSet refs;
-    for (auto & [path, p] : pending)
-        for (auto & ref : p.references)
-            if (ref != path)
-                refs.insert(ref);
-    return refs;
 }
 
 void WriteBuffer::flush()

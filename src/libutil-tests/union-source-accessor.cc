@@ -402,7 +402,6 @@ TEST(UnionSourceAccessor, resolvedChildSurvivesReentrantCallerRelease)
                 release = [&] {
                     ++releases;
                     source.accessor = replacement;
-                    EXPECT_TRUE(parent.expired());
                     EXPECT_FALSE(child.expired());
                     EXPECT_EQ(destroyed, 0);
                 };
@@ -429,6 +428,7 @@ TEST(UnionSourceAccessor, resolvedChildSurvivesReentrantCallerRelease)
                 EXPECT_EQ(releases, 1u);
                 EXPECT_EQ(destroyed, 1);
                 EXPECT_TRUE(child.expired());
+                EXPECT_TRUE(parent.expired());
                 ++cases;
             }
     EXPECT_EQ(cases, 16u);
@@ -455,7 +455,6 @@ TEST(UnionSourceAccessor, mergedNamingRetainsEveryChildAcrossCallerRelease)
         release = [&] {
             if (++calls == releaseAt) {
                 source.accessor = replacement;
-                EXPECT_TRUE(parent.expired());
             }
             EXPECT_EQ(destroyed, 0);
             for (auto & child : children)
@@ -464,8 +463,256 @@ TEST(UnionSourceAccessor, mergedNamingRetainsEveryChildAcrossCallerRelease)
         EXPECT_TRUE(source.accessor->getFingerprint(source.path));
         EXPECT_EQ(calls, 2u);
         EXPECT_EQ(destroyed, 2);
+        EXPECT_TRUE(parent.expired());
         for (auto & child : children)
             EXPECT_TRUE(child.expired());
+    }
+}
+
+namespace {
+
+enum class UnionCall { Stat, File, Link, Directory, Name, Physical, Invalidate, Display };
+
+struct UnionOwnershipProbe : MemorySourceAccessor
+{
+    unsigned layer;
+    std::function<void(unsigned, UnionCall)> & observe;
+
+    UnionOwnershipProbe(unsigned layer, decltype(observe) observe)
+        : layer(layer)
+        , observe(observe)
+    {
+    }
+
+    void notify(UnionCall call)
+    {
+        auto callback = observe;
+        auto index = layer;
+        callback(index, call);
+    }
+
+    std::optional<Stat> maybeLstat(const CanonPath & path) override
+    {
+        auto result = MemorySourceAccessor::maybeLstat(path);
+        notify(UnionCall::Stat);
+        return result;
+    }
+
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    {
+        StringSink bytes;
+        MemorySourceAccessor::readFile(path, bytes, [](uint64_t) {});
+        notify(UnionCall::File);
+        sizeCallback(bytes.s.size());
+        sink(bytes.s);
+    }
+
+    std::string readLink(const CanonPath & path) override
+    {
+        auto result = MemorySourceAccessor::readLink(path);
+        notify(UnionCall::Link);
+        return result;
+    }
+
+    DirEntries readDirectory(const CanonPath & path) override
+    {
+        auto result = MemorySourceAccessor::readDirectory(path);
+        notify(UnionCall::Directory);
+        return result;
+    }
+
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
+    {
+        auto result = std::pair{path, fmt("layer-%d", layer)};
+        notify(UnionCall::Name);
+        return result;
+    }
+
+    std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
+    {
+        bool available = path == CanonPath("first") ? !layer : layer && path != CanonPath("missing");
+        auto result = available ? std::optional{std::filesystem::path("physical")} : std::nullopt;
+        notify(UnionCall::Physical);
+        return result;
+    }
+
+    void invalidateCache() override
+    {
+        notify(UnionCall::Invalidate);
+    }
+
+    std::string showPath(const CanonPath & path) override
+    {
+        auto result = "shown:" + path.abs();
+        notify(UnionCall::Display);
+        return result;
+    }
+};
+
+struct UnionOwnershipLost
+{};
+
+struct UnionCallbackStopped
+{};
+
+} // namespace
+
+TEST(UnionSourceAccessor, everyDelegatedBoundaryPreservesItsRequiredOwners)
+{
+    enum class Operation { Exists, MaybeStat, Stat, File, Link, Directory, Name, Physical, Invalidate, Display };
+
+    struct Case
+    {
+        Operation operation;
+        const char * path;
+        const char * expected;
+    };
+
+    /* These paths cover first/later selection, ancestor rejection, absence,
+       merged directories and a single owner. Existing finite-tree tests
+       independently check the overlay's tree and naming meanings. */
+    const Case cases[]{
+        {Operation::Exists, "lower", "yes"},
+        {Operation::Exists, "missing", "no"},
+        {Operation::MaybeStat, "lower", "regular"},
+        {Operation::MaybeStat, "missing", "absent"},
+        {Operation::MaybeStat, "blocked/hidden", "absent"},
+        {Operation::Stat, "lower", "regular"},
+        {Operation::Stat, "missing", "error"},
+        {Operation::File, "lower", "contents"},
+        {Operation::File, "missing", "error"},
+        {Operation::File, "blocked/hidden", "error"},
+        {Operation::Link, "link", "target"},
+        {Operation::Link, "missing", "error"},
+        {Operation::Directory, "shared", "a,b,"},
+        {Operation::Directory, "lower", "error"},
+        {Operation::Directory, "missing", "error"},
+        {Operation::Name, "shared", "named"},
+        {Operation::Name, "lower", "named"},
+        {Operation::Name, "missing", "unnamed"},
+        {Operation::Name, "blocked/hidden", "unnamed"},
+        {Operation::Physical, "first", "physical"},
+        {Operation::Physical, "upper", "physical"},
+        {Operation::Physical, "missing", "absent"},
+        {Operation::Invalidate, "", "invalidated"},
+        {Operation::Display, "upper", "shown:/upper"},
+    };
+    for (const auto & test : cases) {
+        CanonPath path(test.path);
+        using Event = std::pair<unsigned, UnionCall>;
+        auto run = [&](std::optional<size_t> at, bool release, bool stop) {
+            std::vector<Event> observed;
+            std::vector<std::weak_ptr<SourceAccessor>> children;
+            std::shared_ptr<SourceAccessor> owner;
+            std::weak_ptr<SourceAccessor> parent;
+            std::function<void(unsigned, UnionCall)> observe = [&](unsigned layer, UnionCall call) {
+                observed.emplace_back(layer, call);
+                if (at == observed.size() - 1) {
+                    if (release)
+                        owner.reset();
+                    /* Selection/continuation still borrows wrapper state;
+                       completed selection delegates using owned children. */
+                    bool needsParent = call == UnionCall::Stat || call == UnionCall::Invalidate
+                                       || (call == UnionCall::Directory && path == CanonPath("shared"))
+                                       || (call == UnionCall::Physical && layer == 0 && path != CanonPath("first"));
+                    bool childAlive = !children.at(layer).expired();
+                    EXPECT_TRUE(childAlive);
+                    if (needsParent)
+                        EXPECT_FALSE(parent.expired());
+                    /* No probe accesses itself after notify. Throw before
+                       returning to a dead wrapper in a negative control. */
+                    if (!childAlive || (needsParent && parent.expired()))
+                        throw UnionOwnershipLost{};
+                    if (stop)
+                        throw UnionCallbackStopped{};
+                }
+            };
+            std::vector<ref<SourceAccessor>> layers;
+            for (unsigned layer = 0; layer < 2; ++layer) {
+                auto child = make_ref<UnionOwnershipProbe>(layer, observe);
+                child->addFile(CanonPath(layer ? "lower" : "upper"), "contents");
+                child->addFile(CanonPath(layer ? "shared/b" : "shared/a"), "contents");
+                child->addFile(CanonPath(layer ? "blocked/hidden" : "blocked"), "contents");
+                if (!layer)
+                    MemorySink{*child}.createSymlink(CanonPath("link"), "target");
+                children.push_back(child.get_ptr());
+                layers.push_back(child);
+            }
+            owner = makeUnionSourceAccessor(std::move(layers)).get_ptr();
+            parent = owner;
+            auto invoke = [&]() -> std::string {
+                try {
+                    switch (test.operation) {
+                    case Operation::Exists:
+                        return owner->pathExists(path) ? "yes" : "no";
+                    case Operation::MaybeStat: {
+                        auto stat = owner->maybeLstat(path);
+                        return stat ? stat->typeString() : "absent";
+                    }
+                    case Operation::Stat:
+                        return owner->lstat(path).typeString();
+                    case Operation::File:
+                        return owner->readFile(path);
+                    case Operation::Link:
+                        return owner->readLink(path);
+                    case Operation::Directory: {
+                        std::string names;
+                        for (auto & [name, type] : owner->readDirectory(path))
+                            names += name + ",";
+                        return names;
+                    }
+                    case Operation::Name:
+                        return owner->getFingerprint(path) ? "named" : "unnamed";
+                    case Operation::Physical: {
+                        auto physical = owner->getPhysicalPath(path);
+                        return physical ? physical->string() : "absent";
+                    }
+                    case Operation::Invalidate:
+                        owner->invalidateCache();
+                        return "invalidated";
+                    case Operation::Display:
+                        return owner->showPath(path);
+                    }
+                } catch (SourceAccessorError &) {
+                    return "error";
+                }
+                throw Error("unhandled operation");
+            };
+            if (stop)
+                EXPECT_THROW(invoke(), UnionCallbackStopped);
+            else
+                EXPECT_NO_THROW(EXPECT_EQ(invoke(), test.expected));
+            EXPECT_EQ(parent.expired(), release);
+            if (release)
+                for (auto & child : children)
+                    EXPECT_TRUE(child.expired());
+            owner.reset();
+            EXPECT_TRUE(parent.expired());
+            for (auto & child : children)
+                EXPECT_TRUE(child.expired());
+            return observed;
+        };
+        /* Enumerate every virtual-call position, not a sample of them.
+           The baseline establishes the finite boundary count only; the
+           result oracle above is independent of that trace. */
+        auto baseline = run(std::nullopt, false, false);
+        ASSERT_FALSE(baseline.empty());
+        for (size_t at = 0; at < baseline.size(); ++at)
+            for (bool release : {false, true})
+                for (bool stop : {false, true}) {
+                    SCOPED_TRACE(
+                        fmt("operation=%d path=%s at=%d release=%d stop=%d",
+                            unsigned(test.operation),
+                            path,
+                            at,
+                            release,
+                            stop));
+                    auto observed = run(at, release, stop);
+                    auto expected = baseline;
+                    if (stop)
+                        expected.resize(at + 1);
+                    EXPECT_EQ(observed, expected);
+                }
     }
 }
 

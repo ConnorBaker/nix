@@ -218,6 +218,54 @@ TEST(CanonPath, separatorsSortBeforeEveryFilenameByte)
     }
 }
 
+TEST(CanonPath, orderingAcrossWordBoundaries)
+{
+    /* Every possible first differing filename byte at every offset across
+       two word boundaries. The oppositely ordered next byte also rejects
+       ordering by a whole integer word. The suffix keeps every component
+       valid and leaves a complete word containing the differing byte. */
+    for (size_t offset = 1; offset <= 18; ++offset) {
+        const std::string prefix(offset - 1, 'q');
+        std::vector<std::pair<unsigned int, CanonPath>> paths;
+        for (unsigned int byte = 1; byte <= 255; ++byte)
+            if (byte != '/')
+                paths.emplace_back(
+                    byte,
+                    CanonPath(
+                        "/" + prefix + static_cast<char>(byte) + static_cast<char>(256 - byte) + "suffix-of-name"));
+        for (auto & [a, x] : paths)
+            for (auto & [b, y] : paths)
+                if ((x <=> y) != (a <=> b))
+                    FAIL() << "offset " << offset << ", bytes " << a << ", " << b;
+    }
+
+    /* A separator is below every admitted byte, including control bytes
+       below '/' in ordinary byte order. Neither side is normalised away. */
+    for (size_t offset = 2; offset <= 18; ++offset) {
+        const std::string prefix(offset - 1, 'q');
+        const CanonPath parent("/" + prefix);
+        const CanonPath child("/" + prefix + "/child-suffix");
+        ASSERT_LT(parent, child);
+        for (unsigned int byte = 1; byte <= 255; ++byte) {
+            if (byte == '/')
+                continue;
+            const CanonPath neighbour("/" + prefix + static_cast<char>(byte) + "suffix-of-name");
+            if (!(child < neighbour && neighbour > child && parent < neighbour))
+                FAIL() << "separator offset " << offset << ", byte " << byte;
+        }
+    }
+
+    /* Empty root, equal paths, and either exhausted side at every length
+       through three word boundaries, including incomplete final words. */
+    std::vector<CanonPath> prefixes;
+    for (size_t length = 0; length <= 24; ++length)
+        prefixes.emplace_back("/" + std::string(length, 'q'));
+    for (size_t a = 0; a < prefixes.size(); ++a)
+        for (size_t b = 0; b < prefixes.size(); ++b)
+            if ((prefixes[a] <=> prefixes[b]) != (a <=> b))
+                FAIL() << "prefix lengths " << a << ", " << b;
+}
+
 TEST(CanonPath, allowedMatchesComponentPrefixesForEverySubset)
 {
     using Components = std::vector<std::string>;

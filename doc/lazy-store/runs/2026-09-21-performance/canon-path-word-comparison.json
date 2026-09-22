@@ -1,0 +1,29 @@
+{
+  "scope": "Isolated in-memory comparator evidence, not complete Nix evaluation speed.",
+  "branch_context": "efe2ca8eed26604914733e5087a065cd1834c343",
+  "nixpkgs_revision": "6aefcda9401be8acc2b74244fb3b37520ea1f0a8",
+  "archive": "/home/connorbaker/Benchmarks/nix-performance-fixes/canon-path-efe2ca8ee",
+  "manifest": {"path": "/home/connorbaker/Benchmarks/nix-performance-fixes/canon-path-efe2ca8ee/manifest.json", "sha256": "f2e73dc2a31a5cc14e281e45398498a25ad097b86c01b16590f2643ab2fd7f03"},
+  "input": {"path": "/home/connorbaker/Benchmarks/nix-performance-fixes/canon-path-efe2ca8ee/nix-canon-compare-tree.z", "sha256": "0f614c00568e0465bcdf54b2d8f5b06efe311afee775d64954be40bc11cb3eff", "nodes_including_root": 89979, "leaf_grants": 52859},
+  "environment": {"compiler": "GCC 15.2.0", "flags": ["-std=c++23", "-O3", "-DNDEBUG"], "build": "nix develop --offline", "architecture": "aarch64", "cpu_affinity": [0]},
+  "commands": "/home/connorbaker/Benchmarks/nix-performance-fixes/canon-path-efe2ca8ee/commands.json",
+  "compiler_and_elf_evidence": "/home/connorbaker/Benchmarks/nix-performance-fixes/canon-path-efe2ca8ee/compiler.txt",
+  "raw_samples": ["/home/connorbaker/Benchmarks/nix-performance-fixes/canon-path-efe2ca8ee/nix-canon-compare.csv", "/home/connorbaker/Benchmarks/nix-performance-fixes/canon-path-efe2ca8ee/nix-canon-compare-word.csv"],
+  "summaries": ["/home/connorbaker/Benchmarks/nix-performance-fixes/canon-path-efe2ca8ee/nix-canon-compare-summary.json", "/home/connorbaker/Benchmarks/nix-performance-fixes/canon-path-efe2ca8ee/nix-canon-compare-word-summary.json"],
+  "method": "Eight balanced scalar/candidate passes per case; all passes retained. Each row times set construction and four complete 89,979-query traversals, recording their average lookup time. Git order and fixed seed 1729 shuffled order. Equivalence validation precedes timing; no cache eviction. Source, binaries, logs, input and SHA-256 manifest archived read-only without rerunning timing.",
+  "retained_raw_rows": 128,
+  "case_columns": ["candidate", "order", "set_size", "scalar_construct_ms", "candidate_construct_ms", "scalar_lookup_ms", "candidate_lookup_ms", "lookup_ratio"],
+  "complete_cases": [
+    ["component", "git", 89979, 14.85415, 22.60815, 41.97415, 75.58250000000001, 1.8006916161494635],
+    ["component", "git", 52859, 10.13335, 15.21695, 41.2284, 72.2432, 1.752267854197592],
+    ["component", "shuffled", 89979, 157.53, 213.06099999999998, 173.4395, 235.10649999999998, 1.3555533774024946],
+    ["component", "shuffled", 52859, 79.5959, 108.07849999999999, 150.9975, 205.696, 1.3622477193331015],
+    ["word", "git", 89979, 14.8797, 9.013580000000001, 41.996449999999996, 20.12125, 0.47911787782062537],
+    ["word", "git", 52859, 10.191600000000001, 6.73065, 41.258750000000006, 19.6736, 0.47683461084012474],
+    ["word", "shuffled", 89979, 152.36, 108.169, 167.702, 113.4435, 0.6764588377002063],
+    ["word", "shuffled", 52859, 75.7755, 54.56625, 144.281, 93.97025, 0.6513002405029075]
+  ],
+  "validation": {"both_candidates": {"actual_path_sorted_sequences": "exact element-by-element equality for both set sizes", "actual_path_lower_bound_results": "exact equality for all89979 queries at both set sizes", "finite_byte_pairs": 594441, "timed_output_checksums": "order and lookup checksums agree in every recorded case"}, "word_only": {"byte_pairs_at_offsets_0_through_17": 1170450, "prefix_direction_checks": 648}, "limits": "Standalone finite byte fixtures include some noncanonical strings; they verify the scalar transformation on a wider byte-string domain. Production CanonPath tests are separate and are not claimed by these archived runs."},
+  "decisions": {"component_lexicographic": "rejected because every measured case is slower", "equal_uint64_prefix_skip": "accepted as an integration candidate because every measured case is faster; only equality skips words, scalar separator-first order decides inequalities"},
+  "limits": ["This isolates in-memory set construction and lookup, not Nix evaluation, raw filesystem traversal, store effects, or any complete URI benchmark.", "One architecture, compiler and CPU were measured; there is no cold-cache or cross-machine inference.", "The benchmark uses a standalone Path representation and copies of the comparator/Iterator, not the linked Nix CanonPath implementation.", "Raw CSV lookup values aggregate four inner iterations; individual inner-iteration times were not captured.", "All measured cases and passes are retained; timing was not rerun during archival."]
+}

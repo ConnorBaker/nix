@@ -130,16 +130,12 @@ public:
     }
 
     /**
-     * The references of every pending object: what must be valid before the
-     * flush registers the objects that name them.
-     */
-    StorePathSet pendingReferences() const;
-
-    /**
      * Enqueue a text object: a flat file, content-addressed over its text
      * and references, exactly what `Store::addToStoreFromDump` with the
      * `Text` method registers.  Returns its store path.  Idempotent in the
-     * path.
+     * path. A rooted, already-valid object needs no pending write unless
+     * repair was requested. The caller must realise any mounted references
+     * before enqueueing, since reaching the memory bound can flush here.
      *
      * The text is a view, not a string to take over: what the buffer keeps
      * is the bytes and not the buffer they were built in.  `unparse`

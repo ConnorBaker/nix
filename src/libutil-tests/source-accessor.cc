@@ -224,4 +224,268 @@ TEST_F(FSSourceAccessorTest, RestoreSinkSymlinkAtRoot)
     EXPECT_THAT(makeFSSourceAccessor(linkPath), testing::HasSymlink(CanonPath::root, "symlink_target"));
 }
 
+namespace {
+
+/* Each probe copies its callback before invoking user code and does not
+   access itself afterward. Thus an ownership failure is reported through
+   weak pointers without continuing through a destroyed probe or cache. */
+struct CachingOwnershipProbe : SourceAccessor
+{
+    std::function<void()> onCall;
+    bool absent = false;
+
+    void anchor() override {}
+
+    void call()
+    {
+        auto callback = onCall;
+        callback();
+    }
+
+    void readFile(const CanonPath &, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    {
+        sizeCallback(5);
+        sink("bytes");
+    }
+
+    std::optional<Stat> maybeLstat(const CanonPath &) override
+    {
+        auto missing = absent;
+        call();
+        if (missing)
+            return std::nullopt;
+        return Stat{.type = tRegular, .fileSize = 5};
+    }
+
+    Stat lstat(const CanonPath &) override
+    {
+        call();
+        return {.type = tRegular, .fileSize = 5};
+    }
+
+    DirEntries readDirectory(const CanonPath &) override
+    {
+        call();
+        return {{"entry", tRegular}};
+    }
+
+    void
+    readDirectory(const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &)> callback) override
+    {
+        callback(*this, path);
+    }
+
+    void readDirectoryWithEntries(
+        const CanonPath & path,
+        std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+    {
+        DirEntries entries{{"entry", tRegular}};
+        callback(*this, path, entries);
+    }
+
+    std::string readLink(const CanonPath &) override
+    {
+        call();
+        return "target";
+    }
+
+    std::string showPath(const CanonPath &) override
+    {
+        call();
+        return "shown";
+    }
+
+    void invalidateCache() override
+    {
+        call();
+    }
+
+    std::optional<std::filesystem::path> getPhysicalPath(const CanonPath &) override
+    {
+        call();
+        return std::filesystem::path("physical");
+    }
+
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
+    {
+        call();
+        return std::pair{path, std::string("fingerprint")};
+    }
+
+    std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath &) override
+    {
+        call();
+        return merkle::TreeEntry{merkle::Mode::Regular, hashString(HashAlgorithm::SHA256, "bytes")};
+    }
+};
+
+struct CachingCallbackException
+{};
+
+struct CachingOwnershipLost
+{};
+
+} // namespace
+
+TEST(CachingSourceAccessor, delegatedCallbacksKeepSelectedOwnersAlive)
+{
+    enum class Point {
+        Size,
+        Sink,
+        MaybeStat,
+        MissingStat,
+        Stat,
+        Directory,
+        DirectoryScope,
+        DirectoryEntries,
+        Link,
+        Display,
+        Invalidate,
+        Physical,
+        Fingerprint,
+        KnownEntry,
+    };
+    constexpr Point points[]{
+        Point::Size,
+        Point::Sink,
+        Point::MaybeStat,
+        Point::MissingStat,
+        Point::Stat,
+        Point::Directory,
+        Point::DirectoryScope,
+        Point::DirectoryEntries,
+        Point::Link,
+        Point::Display,
+        Point::Invalidate,
+        Point::Physical,
+        Point::Fingerprint,
+        Point::KnownEntry,
+    };
+
+    /* Fourteen callback points × caller retains/releases its owner ×
+       normal/exceptional return. A cache miss also needs the wrapper to
+       survive its child call; a tail delegation only needs the child. */
+    for (auto point : points)
+        for (bool release : {false, true})
+            for (bool throwing : {false, true}) {
+                SCOPED_TRACE(
+                    ::testing::Message() << "point=" << static_cast<int>(point) << " release=" << release
+                                         << " throwing=" << throwing);
+                auto child = std::make_shared<CachingOwnershipProbe>();
+                child->absent = point == Point::MissingStat;
+                std::weak_ptr<SourceAccessor> weakChild = child;
+                auto childNumber = child->number;
+                std::shared_ptr<SourceAccessor> owner = makeCachingSourceAccessor(ref<SourceAccessor>(child)).get_ptr();
+                std::weak_ptr<SourceAccessor> weakOwner = owner;
+                auto * accessor = owner.get();
+                unsigned calls = 0;
+                auto callback = [&] {
+                    ++calls;
+                    if (release)
+                        owner.reset();
+                    auto childAlive = !weakChild.expired();
+                    bool needsWrapper = point == Point::MaybeStat || point == Point::MissingStat || point == Point::Stat
+                                        || point == Point::Link;
+                    auto ownerAlive = !weakOwner.expired();
+                    EXPECT_TRUE(childAlive);
+                    if (needsWrapper)
+                        EXPECT_TRUE(ownerAlive);
+                    /* Stop before returning into a dead wrapper in the
+                       negative control, even if the intended result was
+                       a normal callback return. */
+                    if (!childAlive || (needsWrapper && !ownerAlive))
+                        throw CachingOwnershipLost{};
+                    if (throwing)
+                        throw CachingCallbackException{};
+                };
+                child->onCall = callback;
+                child.reset();
+                CanonPath path("entry");
+
+                auto run = [&] {
+                    switch (point) {
+                    case Point::Size:
+                    case Point::Sink: {
+                        std::string bytes;
+                        LambdaSink sink([&](std::string_view data) {
+                            if (point == Point::Sink)
+                                callback();
+                            bytes += data;
+                        });
+                        accessor->readFile(path, sink, [&](uint64_t size) {
+                            EXPECT_EQ(size, 5u);
+                            if (point == Point::Size)
+                                callback();
+                        });
+                        EXPECT_EQ(bytes, "bytes");
+                        break;
+                    }
+                    case Point::MaybeStat:
+                        EXPECT_EQ(accessor->maybeLstat(path)->fileSize, 5u);
+                        break;
+                    case Point::MissingStat:
+                        EXPECT_FALSE(accessor->maybeLstat(path));
+                        break;
+                    case Point::Stat:
+                        EXPECT_EQ(accessor->lstat(path).fileSize, 5u);
+                        break;
+                    case Point::Directory:
+                        EXPECT_EQ(
+                            accessor->readDirectory(path),
+                            (SourceAccessor::DirEntries{{"entry", SourceAccessor::tRegular}}));
+                        break;
+                    case Point::DirectoryScope:
+                        accessor->readDirectory(path, [&](SourceAccessor & scoped, const CanonPath & relative) {
+                            callback();
+                            EXPECT_EQ(scoped.number, childNumber);
+                            EXPECT_EQ(relative, path);
+                        });
+                        break;
+                    case Point::DirectoryEntries:
+                        accessor->readDirectoryWithEntries(
+                            path,
+                            [&](SourceAccessor & scoped,
+                                const CanonPath & relative,
+                                const SourceAccessor::DirEntries & entries) {
+                                callback();
+                                EXPECT_EQ(scoped.number, childNumber);
+                                EXPECT_EQ(relative, path);
+                                EXPECT_EQ(entries, (SourceAccessor::DirEntries{{"entry", SourceAccessor::tRegular}}));
+                            });
+                        break;
+                    case Point::Link:
+                        EXPECT_EQ(accessor->readLink(path), "target");
+                        break;
+                    case Point::Display:
+                        EXPECT_EQ(accessor->showPath(path), "shown");
+                        break;
+                    case Point::Invalidate:
+                        accessor->invalidateCache();
+                        break;
+                    case Point::Physical:
+                        EXPECT_EQ(accessor->getPhysicalPath(path), std::filesystem::path("physical"));
+                        break;
+                    case Point::Fingerprint:
+                        EXPECT_EQ(accessor->getFingerprint(path), (std::pair{path, std::string("fingerprint")}));
+                        break;
+                    case Point::KnownEntry:
+                        EXPECT_EQ(
+                            accessor->getKnownEntry(path),
+                            (merkle::TreeEntry{merkle::Mode::Regular, hashString(HashAlgorithm::SHA256, "bytes")}));
+                        break;
+                    }
+                };
+                if (throwing)
+                    EXPECT_THROW(run(), CachingCallbackException);
+                else
+                    EXPECT_NO_THROW(run());
+                EXPECT_EQ(calls, 1u);
+                EXPECT_EQ(weakOwner.expired(), release);
+                EXPECT_EQ(weakChild.expired(), release);
+                owner.reset();
+                EXPECT_TRUE(weakOwner.expired());
+                EXPECT_TRUE(weakChild.expired());
+            }
+}
+
 } // namespace nix

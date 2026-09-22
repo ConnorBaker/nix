@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 #ifndef _WIN32
+#  include "nix/util/processes.hh"
 #  include <sys/stat.h>
 #endif
 
@@ -227,6 +228,111 @@ TEST(AllowListFilter, exactPathsDoNotAdmitOrNameTheirRelatives)
         ASSERT_TRUE(result);
         EXPECT_EQ(*result, (std::pair{path, std::string("whole")}));
     }
+}
+
+TEST(AllowListFilter, namingMayGrowPermissionsAndReleaseItsWrapper)
+{
+    enum class Outcome { Named, Unnamed, Throwing };
+
+    struct Inner final : MemorySourceAccessor
+    {
+        Outcome outcome;
+        std::function<void()> callback;
+        size_t & destroyed;
+
+        Inner(Outcome outcome, std::function<void()> callback, size_t & destroyed)
+            : outcome(outcome)
+            , callback(std::move(callback))
+            , destroyed(destroyed)
+        {
+        }
+
+        ~Inner() override
+        {
+            ++destroyed;
+        }
+
+        std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
+        {
+            /* Keep the detector itself valid even if the wrapper fails
+               to keep its child alive through the callback. */
+            auto action = callback;
+            auto result = outcome;
+            auto relative = path;
+            action();
+            if (result == Outcome::Throwing)
+                throw Error("inner naming failed");
+            if (result == Outcome::Named)
+                return std::pair{std::move(relative), std::string("inner")};
+            return std::nullopt;
+        }
+    };
+
+    auto exercise = [&] {
+        size_t cases = 0;
+        const CanonPath path("a/b");
+        for (auto admitted : {CanonPath::root, CanonPath("a"), path})
+            for (auto added : {path, CanonPath("other"), CanonPath::root})
+                for (auto outcome : {Outcome::Named, Outcome::Unnamed, Outcome::Throwing})
+                    for (bool release : {false, true}) {
+                        SCOPED_TRACE(
+                            fmt("admitted=%s added=%s outcome=%d release=%d", admitted, added, int(outcome), release));
+                        size_t calls = 0, destroyed = 0;
+                        std::shared_ptr<AllowListSourceAccessor> accessor;
+                        std::weak_ptr<SourceAccessor> child;
+                        std::weak_ptr<AllowListSourceAccessor> wrapper;
+                        {
+                            auto inner = make_ref<Inner>(
+                                outcome,
+                                [&] {
+                                    ++calls;
+                                    accessor->allowPrefix(added);
+                                    if (release)
+                                        accessor.reset();
+                                    EXPECT_FALSE(child.expired());
+                                    EXPECT_EQ(destroyed, 0u);
+                                },
+                                destroyed);
+                            child = inner.get_ptr();
+                            accessor = AllowListSourceAccessor::create(inner, {admitted}, {}, [](const CanonPath &) {
+                                           return RestrictedPathError("denied");
+                                       }).get_ptr();
+                            wrapper = accessor;
+                        }
+                        if (outcome == Outcome::Throwing)
+                            EXPECT_THROW(accessor->getFingerprint(path), Error);
+                        else {
+                            auto result = accessor->getFingerprint(path);
+                            if (outcome == Outcome::Named) {
+                                ASSERT_TRUE(result);
+                                EXPECT_EQ(*result, (std::pair{path, std::string("inner")}));
+                            } else
+                                EXPECT_FALSE(result);
+                        }
+                        EXPECT_EQ(calls, 1u);
+                        EXPECT_EQ(child.expired(), release);
+                        EXPECT_EQ(destroyed, release ? 1u : 0u);
+                        if (!release)
+                            EXPECT_TRUE(accessor->isAllowed(added));
+                        accessor.reset();
+                        EXPECT_TRUE(wrapper.expired());
+                        EXPECT_EQ(destroyed, 1u);
+                        ++cases;
+                    }
+        EXPECT_EQ(cases, 54u);
+    };
+#ifndef _WIN32
+    /* A synchronous reentrant write deadlocks if naming keeps its read
+       lock. The child bounds that failure; the alarm is no scheduling aid. */
+    Pid child = startProcess([&] {
+        alarm(5);
+        exercise();
+        _exit(::testing::Test::HasFailure() ? 1 : 0);
+    });
+    EXPECT_EQ(child.wait(), 0) << "allow-list naming failed or deadlocked";
+#else
+    exercise();
+#endif
 }
 
 /* The fetcher cache under a directory of the fixture's own (`FreshCacheHome`):
@@ -1936,6 +2042,372 @@ TEST_F(FetchToStoreTest, parallelMemoKeepsEachNamedFactWithItsNode)
         EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), hash);
         EXPECT_EQ(fetchers::getIntAttr(*row, "mode"), uint64_t(merkle::Mode::Regular));
     }
+}
+
+/* A wrapper selects an owned child; a directory view also borrows its
+   filtering policy for the callback's dynamic extent. This does not permit
+   retaining the view or deleting a directly borrowed leaf during a call. */
+TEST(FilteringSourceAccessor, forwardingRetainsTheSelectedChildAndScopedPolicy)
+{
+    enum class Call { Size, Sink, Directory, Fingerprint, Permission };
+
+    struct Source final : MemorySourceAccessor
+    {
+        bool named;
+        std::function<void()> & observeName;
+
+        Source(bool named, std::function<void()> & observeName)
+            : named(named)
+            , observeName(observeName)
+        {
+        }
+
+        void readFile(const CanonPath &, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            /* No member access follows a callback, even in the negative
+               control where the callback observes a destroyed child. */
+            const std::string bytes = "contents";
+            sizeCallback(bytes.size());
+            sink(bytes);
+        }
+
+        std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
+        {
+            auto result = named ? std::optional{std::pair{path, std::string("inner")}} : std::nullopt;
+            auto callback = observeName;
+            callback();
+            return result;
+        }
+
+        bool allowsConcurrentTraversal() override
+        {
+            auto callback = observeName;
+            callback();
+            return true;
+        }
+    };
+
+    size_t cases = 0;
+    for (bool fixed : {false, true})
+        for (auto call : {Call::Size, Call::Sink, Call::Directory, Call::Fingerprint, Call::Permission})
+            for (bool release : {false, true})
+                for (bool fail : {false, true})
+                    for (bool named : {false, true}) {
+                        if (call != Call::Fingerprint && !named)
+                            continue;
+                        if (call == Call::Permission && fixed)
+                            continue;
+                        SCOPED_TRACE(
+                            fmt("fixed=%d call=%d release=%d fail=%d named=%d",
+                                fixed,
+                                unsigned(call),
+                                release,
+                                fail,
+                                named));
+                        std::function<void()> observeName = [] {};
+                        std::weak_ptr<SourceAccessor> child;
+                        std::shared_ptr<SourceAccessor> source = [&]() -> ref<SourceAccessor> {
+                            auto inner = make_ref<Source>(named, observeName);
+                            inner->addFile(CanonPath("base/dir/f"), "contents");
+                            inner->addFile(CanonPath("base/dir/sub/g"), "contents");
+                            inner->addFile(CanonPath("base/dir/denied/nope"), "hidden");
+                            child = inner.get_ptr();
+                            if (fixed)
+                                return makeFixedSetFilteringSourceAccessor(
+                                    SourcePath(inner),
+                                    {CanonPath::root,
+                                     CanonPath("base"),
+                                     CanonPath("base/dir"),
+                                     CanonPath("base/dir/f"),
+                                     CanonPath("base/dir/sub"),
+                                     CanonPath("base/dir/sub/g")});
+                            return AllowListSourceAccessor::create(
+                                inner,
+                                {CanonPath("base/dir/sub")},
+                                {CanonPath("base/dir/f")},
+                                [](const CanonPath & path) { return RestrictedPathError("denied '%s'", path); });
+                        }();
+                        std::weak_ptr<SourceAccessor> parent = source;
+                        const CanonPath directory("base/dir");
+                        const auto namePath = directory / "sub";
+                        const auto expectedName = source->getFingerprint(namePath);
+                        const bool needsPolicy = call == Call::Directory || (call == Call::Fingerprint && fixed);
+                        unsigned callbacks = 0;
+                        auto observe = [&] {
+                            ++callbacks;
+                            if (release)
+                                source.reset();
+                            if (needsPolicy)
+                                EXPECT_FALSE(parent.expired());
+                            EXPECT_FALSE(child.expired());
+                            /* Stop before any borrowed access or post-call
+                               cache/policy use if a negative control loses it. */
+                            if (child.expired() || (needsPolicy && parent.expired()))
+                                throw Error("lost delegated accessor or borrowed policy");
+                            if (fail)
+                                throw Error("callback failure");
+                        };
+                        if (call == Call::Fingerprint || call == Call::Permission)
+                            observeName = observe;
+                        auto invoke = [&] {
+                            if (call == Call::Permission) {
+                                EXPECT_TRUE(source->allowsConcurrentTraversal());
+                            } else if (call == Call::Fingerprint) {
+                                EXPECT_EQ(source->getFingerprint(namePath), expectedName);
+                            } else if (call == Call::Directory) {
+                                source->readDirectoryWithEntries(
+                                    directory,
+                                    [&](SourceAccessor & scoped, const CanonPath & relative, const auto & entries) {
+                                        observe();
+                                        EXPECT_EQ(entries.size(), 2u);
+                                        EXPECT_TRUE(scoped.pathExists(relative / CanonPath("sub/g")));
+                                        EXPECT_FALSE(scoped.pathExists(relative / CanonPath("denied/nope")));
+                                        EXPECT_EQ(scoped.getFingerprint(relative / "sub"), expectedName);
+                                        EXPECT_THROW(
+                                            scoped.readFile(relative / CanonPath("denied/nope")), RestrictedPathError);
+                                        scoped.readDirectoryWithEntries(
+                                            relative / "sub",
+                                            [&](SourceAccessor & nested,
+                                                const CanonPath & root,
+                                                const auto & nestedEntries) {
+                                                EXPECT_EQ(nestedEntries.size(), 1u);
+                                                EXPECT_EQ(nested.readFile(root / "g"), "contents");
+                                            });
+                                    });
+                            } else {
+                                std::string contents;
+                                LambdaSink sink{[&](std::string_view bytes) {
+                                    if (call == Call::Sink)
+                                        observe();
+                                    contents += bytes;
+                                }};
+                                source->readFile(directory / "f", sink, [&](uint64_t size) {
+                                    EXPECT_EQ(size, 8u);
+                                    if (call == Call::Size)
+                                        observe();
+                                });
+                                EXPECT_EQ(contents, "contents");
+                            }
+                        };
+                        if (fail)
+                            EXPECT_THROW(invoke(), Error);
+                        else
+                            EXPECT_NO_THROW(invoke());
+                        EXPECT_EQ(callbacks, 1u);
+                        EXPECT_EQ(parent.expired(), release);
+                        EXPECT_EQ(child.expired(), release);
+                        source.reset();
+                        EXPECT_TRUE(parent.expired());
+                        EXPECT_TRUE(child.expired());
+                        ++cases;
+                    }
+    EXPECT_EQ(cases, 44u);
+}
+
+TEST(FilteringSourceAccessor, admissionCallbacksKeepTheirRequiredPolicyAlive)
+{
+    enum class Operation { Physical, File, Exists, MaybeStat, Stat, Directory, ScopedDirectory, Link, Check, Allowed };
+    enum class Cache { None, Miss, Hit };
+    enum class Outcome { Admit, Deny, Throw };
+
+    struct CallbackFailure
+    {};
+
+    struct OwnershipLost
+    {};
+
+    struct Plain final : FilteringSourceAccessor
+    {
+        void anchor() override {}
+
+        std::function<bool()> & decide;
+
+        Plain(ref<SourceAccessor> inner, MakeNotAllowedError error, std::function<bool()> & decide)
+            : FilteringSourceAccessor(SourcePath(inner), std::move(error))
+            , decide(decide)
+        {
+        }
+
+        bool isAllowed(const CanonPath &) override
+        {
+            /* The direct virtual policy call is itself a leaf operation;
+               its detector must remain valid after caller release. */
+            auto callback = decide;
+            return callback();
+        }
+    };
+
+    struct Cached final : CachingFilteringSourceAccessor
+    {
+        void anchor() override {}
+
+        std::function<bool()> & decide;
+
+        Cached(ref<SourceAccessor> inner, MakeNotAllowedError error, std::function<bool()> & decide)
+            : CachingFilteringSourceAccessor(SourcePath(inner), std::move(error))
+            , decide(decide)
+        {
+        }
+
+        bool isAllowedUncached(const CanonPath &) override
+        {
+            auto callback = decide;
+            return callback();
+        }
+    };
+
+    const Operation operations[]{
+        Operation::Physical,
+        Operation::File,
+        Operation::Exists,
+        Operation::MaybeStat,
+        Operation::Stat,
+        Operation::Directory,
+        Operation::ScopedDirectory,
+        Operation::Link,
+        Operation::Check,
+        Operation::Allowed};
+    auto throwsOnDenial = [](Operation operation) {
+        return operation != Operation::Exists && operation != Operation::MaybeStat && operation != Operation::Allowed;
+    };
+    size_t cases = 0;
+    auto exercise =
+        [&](Operation operation, Cache cache, Outcome outcome, bool release, bool atError, bool errorThrows) {
+            SCOPED_TRACE(
+                fmt("operation=%d cache=%d outcome=%d release=%d atError=%d errorThrows=%d",
+                    unsigned(operation),
+                    unsigned(cache),
+                    unsigned(outcome),
+                    release,
+                    atError,
+                    errorThrows));
+            std::shared_ptr<FilteringSourceAccessor> source;
+            std::weak_ptr<SourceAccessor> parent, child;
+            unsigned decisions = 0, errors = 0, callbacks = 0;
+            bool armed = false;
+            auto observe = [&] {
+                ++callbacks;
+                if (release)
+                    source.reset();
+                /* Only a direct, uncached policy leaf needs no continuation
+                   in the wrapper. Every other entry point still uses it. */
+                if (operation != Operation::Allowed || cache != Cache::None) {
+                    EXPECT_FALSE(parent.expired());
+                    EXPECT_FALSE(child.expired());
+                    if (parent.expired() || child.expired())
+                        throw OwnershipLost{};
+                }
+            };
+            std::function<bool()> decide = [&] {
+                ++decisions;
+                if (armed && !atError)
+                    observe();
+                if (outcome == Outcome::Throw)
+                    throw CallbackFailure{};
+                return outcome == Outcome::Admit;
+            };
+            MakeNotAllowedError error = [&](const CanonPath &) {
+                ++errors;
+                if (atError)
+                    observe();
+                if (errorThrows)
+                    throw CallbackFailure{};
+                return RestrictedPathError("denied");
+            };
+            {
+                auto inner = make_ref<MemorySourceAccessor>();
+                inner->addFile(CanonPath("file"), "bytes");
+                inner->addFile(CanonPath("dir/file"), "bytes");
+                MemorySink{*inner}.createSymlink(CanonPath("link"), "target");
+                child = inner.get_ptr();
+                if (cache == Cache::None)
+                    source = std::make_shared<Plain>(inner, error, decide);
+                else
+                    source = std::make_shared<Cached>(inner, error, decide);
+                parent = source;
+            }
+            CanonPath path(
+                operation == Operation::Directory || operation == Operation::ScopedDirectory ? "dir"
+                : operation == Operation::Link                                               ? "link"
+                                                                                             : "file");
+            if (cache == Cache::Hit) {
+                EXPECT_EQ(source->isAllowed(path), outcome == Outcome::Admit);
+                decisions = 0;
+            }
+            armed = true;
+            auto invoke = [&] {
+                switch (operation) {
+                case Operation::Physical:
+                    EXPECT_FALSE(source->getPhysicalPath(path));
+                    break;
+                case Operation::File:
+                    EXPECT_EQ(source->readFile(path), "bytes");
+                    break;
+                case Operation::Exists:
+                    EXPECT_EQ(source->pathExists(path), outcome == Outcome::Admit);
+                    break;
+                case Operation::MaybeStat:
+                    EXPECT_EQ(source->maybeLstat(path).has_value(), outcome == Outcome::Admit);
+                    break;
+                case Operation::Stat:
+                    EXPECT_EQ(source->lstat(path).type, SourceAccessor::tRegular);
+                    break;
+                case Operation::Directory:
+                    EXPECT_EQ(source->readDirectory(path).size(), 1u);
+                    break;
+                case Operation::ScopedDirectory:
+                    source->readDirectoryScoped(path, [](SourceAccessor &, const CanonPath &, const auto & entries) {
+                        EXPECT_EQ(entries.size(), 1u);
+                    });
+                    break;
+                case Operation::Link:
+                    EXPECT_EQ(source->readLink(path), "target");
+                    break;
+                case Operation::Check:
+                    source->checkAccess(path);
+                    break;
+                case Operation::Allowed:
+                    EXPECT_EQ(source->isAllowed(path), outcome == Outcome::Admit);
+                    break;
+                }
+            };
+            if (outcome == Outcome::Throw || errorThrows)
+                EXPECT_THROW(invoke(), CallbackFailure);
+            else if (outcome == Outcome::Deny && throwsOnDenial(operation))
+                EXPECT_THROW(invoke(), RestrictedPathError);
+            else
+                EXPECT_NO_THROW(invoke());
+            /* A directory additionally checks its one child's admission. That
+               policy call happens after successful root admission. */
+            const bool directory = operation == Operation::Directory || operation == Operation::ScopedDirectory;
+            const unsigned expectedDecisions =
+                (cache == Cache::Hit ? 0 : 1) + (directory && outcome == Outcome::Admit ? 1 : 0);
+            EXPECT_EQ(decisions, expectedDecisions);
+            EXPECT_EQ(errors, outcome == Outcome::Deny && throwsOnDenial(operation) ? 1u : 0u);
+            EXPECT_EQ(callbacks, atError ? 1u : expectedDecisions);
+            EXPECT_EQ(parent.expired(), release && callbacks);
+            EXPECT_EQ(child.expired(), release && callbacks);
+            source.reset();
+            EXPECT_TRUE(parent.expired());
+            EXPECT_TRUE(child.expired());
+            ++cases;
+        };
+    /* This domain changes caller ownership, not the public next/prefix
+       fields. Cache hits cannot contain an exception: those are not stored. */
+    for (auto operation : operations)
+        for (auto cache : {Cache::None, Cache::Miss, Cache::Hit}) {
+            for (auto outcome : {Outcome::Admit, Outcome::Deny, Outcome::Throw}) {
+                if (cache == Cache::Hit && outcome == Outcome::Throw)
+                    continue;
+                for (bool release : {false, true})
+                    exercise(operation, cache, outcome, release, false, false);
+            }
+            if (throwsOnDenial(operation))
+                for (bool release : {false, true})
+                    for (bool errorThrows : {false, true})
+                        exercise(operation, cache, Outcome::Deny, release, true, errorThrows);
+        }
+    EXPECT_EQ(cases, 244u);
 }
 
 } // namespace nix

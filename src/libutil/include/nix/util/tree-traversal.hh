@@ -12,6 +12,7 @@
 #include "nix/util/signals.hh"
 #include "nix/util/source-accessor.hh"
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <utility>
@@ -138,13 +139,32 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                 auto directory = [&](SourceAccessor & subdirAccessor,
                                      const CanonPath & subdirFrom,
                                      const SourceAccessor::DirEntries & entries) {
-                    auto unhacked = unhackedEntries(entries, acc, from);
+                    /* Without a suffix the listing already has the tree's
+                       unique names in its order, under either case-hack
+                       setting. Otherwise validate and reorder every name
+                       before exposing any directory or child callbacks. */
+                    std::optional<StringMap> unhacked;
+                    if (std::any_of(entries.begin(), entries.end(), [](const auto & entry) {
+                            return entry.first.find(caseHackSuffix) != std::string::npos;
+                        }))
+                        unhacked = unhackedEntries(entries, acc, from);
                     auto children = [&](fun<void(std::string_view, bool, fun<Result()>)> each) {
-                        for (auto & [name, actual] : unhacked)
-                            if (filter.get_fn().target<AllPaths>() || filter((filterBase / name).abs()))
-                                each(name, entries.at(actual) == SourceAccessor::tDirectory, [&] {
-                                    return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
-                                });
+                        auto child =
+                            [&](std::string_view name, std::string_view actual, SourceAccessor::DirEntry type) {
+                                if (filter.get_fn().target<AllPaths>() || filter((filterBase / name).abs()))
+                                    /* Keep the view itself in a deferred visit;
+                                       its string belongs to entries or unhacked,
+                                       both live for the whole directory scope. */
+                                    each(name, type == SourceAccessor::tDirectory, [&, actual] {
+                                        return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
+                                    });
+                            };
+                        if (unhacked)
+                            for (auto & [name, actual] : *unhacked)
+                                child(name, actual, entries.at(actual));
+                        else
+                            for (auto & [name, type] : entries)
+                                child(name, name, type);
                     };
                     result = v.directory(to, std::ref(children));
                 };

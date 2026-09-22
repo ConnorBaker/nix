@@ -2,6 +2,9 @@
 ///@file
 
 #include "nix/util/error.hh"
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <optional>
 #include <cassert>
@@ -262,8 +265,19 @@ public:
      */
     auto operator<=>(const CanonPath & x) const
     {
-        auto i = path.begin();
-        auto j = x.path.begin();
+        /* Equal words need no separator handling. Resume byte comparison
+           at the first unequal word; its numeric order is irrelevant. */
+        size_t offset = 0, size = std::min(path.size(), x.path.size());
+        while (size - offset >= sizeof(std::uint64_t)) {
+            std::uint64_t a, b;
+            std::memcpy(&a, path.data() + offset, sizeof(a));
+            std::memcpy(&b, x.path.data() + offset, sizeof(b));
+            if (a != b)
+                break;
+            offset += sizeof(a);
+        }
+        auto i = path.begin() + offset;
+        auto j = x.path.begin() + offset;
         for (; i != path.end() && j != x.path.end(); ++i, ++j) {
             auto c_i = static_cast<unsigned char>(*i);
             if (c_i == '/')

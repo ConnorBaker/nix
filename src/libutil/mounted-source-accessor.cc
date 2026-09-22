@@ -43,6 +43,7 @@ public:
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
     {
+        auto keepAlive = weak_from_this().lock();
         auto [accessor, subpath] = resolve(path);
         if (auto st = accessor->maybeLstat(subpath))
             return st;
@@ -101,6 +102,7 @@ public:
 
     std::string showPath(const CanonPath & path) override
     {
+        auto keepAlive = weak_from_this().lock();
         auto [accessor, subpath] = resolve(path);
         return displayPrefix + accessor->showPath(subpath) + displaySuffix;
     }
@@ -144,7 +146,12 @@ public:
 
     void invalidateCache() override
     {
-        mounts.visit_all([](auto & kv) { kv.second->invalidateCache(); });
+        /* This call invalidates the observed mounts. A reentrant mount is
+           for the next call; no child callback runs under the map's lock. */
+        std::vector<ref<SourceAccessor>> children;
+        mounts.visit_all([&](auto & kv) { children.push_back(kv.second); });
+        for (auto & child : children)
+            child->invalidateCache();
     }
 
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override

@@ -11,34 +11,49 @@ namespace nix {
 
 std::optional<std::filesystem::path> FilteringSourceAccessor::getPhysicalPath(const CanonPath & path)
 {
+    auto owner = weak_from_this().lock();
     checkAccess(path);
-    return next->getPhysicalPath(prefix / path);
+    auto inner = next;
+    return inner->getPhysicalPath(prefix / path);
 }
 
 void FilteringSourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
 {
+    auto owner = weak_from_this().lock();
     checkAccess(path);
-    return next->readFile(prefix / path, sink, sizeCallback);
+    auto inner = next;
+    return inner->readFile(prefix / path, sink, sizeCallback);
 }
 
 bool FilteringSourceAccessor::pathExists(const CanonPath & path)
 {
-    return isAllowed(path) && next->pathExists(prefix / path);
+    auto owner = weak_from_this().lock();
+    if (!isAllowed(path))
+        return false;
+    auto inner = next;
+    return inner->pathExists(prefix / path);
 }
 
 std::optional<SourceAccessor::Stat> FilteringSourceAccessor::maybeLstat(const CanonPath & path)
 {
-    return isAllowed(path) ? next->maybeLstat(prefix / path) : std::nullopt;
+    auto owner = weak_from_this().lock();
+    if (!isAllowed(path))
+        return std::nullopt;
+    auto inner = next;
+    return inner->maybeLstat(prefix / path);
 }
 
 SourceAccessor::Stat FilteringSourceAccessor::lstat(const CanonPath & path)
 {
+    auto owner = weak_from_this().lock();
     checkAccess(path);
-    return next->lstat(prefix / path);
+    auto inner = next;
+    return inner->lstat(prefix / path);
 }
 
 SourceAccessor::DirEntries FilteringSourceAccessor::readDirectory(const CanonPath & path)
 {
+    auto owner = weak_from_this().lock();
     checkAccess(path);
     DirEntries entries;
     for (auto & entry : next->readDirectory(prefix / path)) {
@@ -51,6 +66,9 @@ SourceAccessor::DirEntries FilteringSourceAccessor::readDirectory(const CanonPat
 void FilteringSourceAccessor::readDirectoryScoped(
     const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback)
 {
+    /* The scoped view borrows this policy throughout the callback. Stack
+       scopes are already kept alive by their enclosing directory call. */
+    auto owner = weak_from_this().lock();
     checkAccess(path);
     next->readDirectoryWithEntries(
         prefix / path, [&](SourceAccessor & inner, const CanonPath & relative, const DirEntries & entries) {
@@ -126,12 +144,15 @@ void FilteringSourceAccessor::readDirectoryScoped(
 
 std::string FilteringSourceAccessor::readLink(const CanonPath & path)
 {
+    auto owner = weak_from_this().lock();
     checkAccess(path);
-    return next->readLink(prefix / path);
+    auto inner = next;
+    return inner->readLink(prefix / path);
 }
 
 std::string FilteringSourceAccessor::showPath(const CanonPath & path)
 {
+    auto owner = weak_from_this().lock();
     return displayPrefix + next->showPath(prefix / path) + displaySuffix;
 }
 
@@ -148,6 +169,7 @@ std::optional<std::pair<CanonPath, std::string>> FilteringSourceAccessor::getFin
 
 void FilteringSourceAccessor::checkAccess(const CanonPath & path)
 {
+    auto owner = weak_from_this().lock();
     if (!isAllowed(path))
         throw makeNotAllowedError(path);
 }
@@ -156,7 +178,8 @@ struct AllowListSourceAccessorImpl final : AllowListSourceAccessor
 {
     bool allowsConcurrentTraversal() override
     {
-        return next->allowsConcurrentTraversal();
+        auto inner = next;
+        return inner->allowsConcurrentTraversal();
     }
 
     void readDirectoryWithEntries(
@@ -225,11 +248,17 @@ public:
            subtree is the inner one and carries its name.  Elsewhere, at an
            ancestor of a prefix for instance, entries are hidden, and the
            subtree has no name. */
-        auto prefixes(allowedPrefixes.readLock());
-        auto after = prefixes->upper_bound(path);
-        if (after != prefixes->begin() && path.isWithin(*std::prev(after)))
-            return next->getFingerprint(prefix / path);
-        return std::nullopt;
+        {
+            auto prefixes(allowedPrefixes.readLock());
+            auto after = prefixes->upper_bound(path);
+            if (after == prefixes->begin() || !path.isWithin(*std::prev(after)))
+                return std::nullopt;
+        }
+        /* Admission only grows, so this subtree remains fully admitted
+           after unlocking. The child may reenter allowPrefix, or release
+           the last owner of this wrapper, while providing its name. */
+        auto inner = next;
+        return inner->getFingerprint(prefix / path);
     }
 };
 
@@ -278,6 +307,7 @@ public:
     {
         if (fingerprint)
             return std::pair{path, *fingerprint};
+        auto owner = weak_from_this().lock();
         auto inner = next->getFingerprint(prefix / path);
         if (!inner)
             return std::nullopt;
@@ -327,6 +357,7 @@ bool CachingFilteringSourceAccessor::isAllowed(const CanonPath & path)
 {
     if (auto allowed = getConcurrent(*cache, path))
         return *allowed;
+    auto owner = weak_from_this().lock();
     auto res = isAllowedUncached(path);
     cache->emplace(path, res);
     return res;

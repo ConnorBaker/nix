@@ -86,6 +86,175 @@ TEST(ObjectHashSink, complex_tree_matches_reference_and_nar_length)
     checkBothRoutes(complexTree());
 }
 
+TEST(TreeTraversal, directoryNamesMatchIndependentlyFramedNarBytes)
+{
+    struct Source : MemorySourceAccessor
+    {
+        bool typed;
+
+        DirEntries readDirectory(const CanonPath & path) override
+        {
+            auto entries = MemorySourceAccessor::readDirectory(path);
+            if (!typed)
+                for (auto & [name, type] : entries)
+                    type.reset();
+            return entries;
+        }
+    };
+
+    /* All name outcomes: identity, a remapping that reverses physical
+       order, and a collision. Cross the case-hack setting, all four NAR
+       node forms, known/unknown listing types, and all/accept/reject/throw
+       filters. The oracle writes NAR framing without walking an accessor. */
+    size_t cases = 0;
+    for (bool hack : {false, true})
+        for (unsigned spelling = 0; spelling != 3; ++spelling)
+            for (unsigned kind = 0; kind != 4; ++kind)
+                for (bool typed : {false, true})
+                    for (unsigned filtering = 0; filtering != 4; ++filtering) {
+                        SCOPED_TRACE(fmt(
+                            "hack=%d spelling=%d kind=%d typed=%d filter=%d", hack, spelling, kind, typed, filtering));
+                        WithCaseHack scope{hack};
+                        auto source = make_ref<Source>();
+                        source->root = File{File::Directory{}};
+                        source->typed = typed;
+                        auto actual = spelling ? "a" + std::string(caseHackSuffix) + "1" : "a";
+                        File node = kind == 3   ? File{File::Directory{}}
+                                    : kind == 2 ? File{File::Symlink{.target = "target"}}
+                                                : File{File::Regular{.executable = kind == 1, .contents = "one"}};
+                        source->open(CanonPath::root / actual, std::move(node));
+                        source->addFile(CanonPath("a.b"), "two");
+                        if (spelling == 2)
+                            source->addFile(CanonPath("a"), "collision");
+
+                        auto expected = [&](bool reverse) {
+                            StringSink nar;
+                            nar << narVersionMagic1 << "(" << "type" << "directory";
+                            auto entry = [&](bool first) {
+                                if (first && filtering == 2)
+                                    return;
+                                nar << "entry" << "(" << "name" << (first ? "a" : "a.b") << "node" << "(" << "type";
+                                if (first && kind == 3)
+                                    nar << "directory";
+                                else if (first && kind == 2)
+                                    nar << "symlink" << "target" << "target";
+                                else {
+                                    nar << "regular";
+                                    if (first && kind == 1)
+                                        nar << "executable" << "";
+                                    nar << "contents" << (first ? "one" : "two");
+                                }
+                                nar << ")" << ")";
+                            };
+                            entry(!reverse);
+                            entry(reverse);
+                            nar << ")";
+                            return std::move(nar.s);
+                        };
+                        std::vector<std::string> filtered;
+                        PathFilter filter = defaultPathFilter;
+                        if (filtering)
+                            filter = [&](const std::string & path) {
+                                filtered.push_back(path);
+                                if (filtering == 3)
+                                    throw std::runtime_error("filter failure");
+                                return filtering != 2 || path != "/a";
+                            };
+                        StringSink nar;
+                        if (spelling && (!hack || spelling == 2)) {
+                            EXPECT_THROW(source->dumpPath(CanonPath::root, nar, filter), Error);
+                            EXPECT_TRUE(filtered.empty());
+                            StringSink header;
+                            header << narVersionMagic1;
+                            EXPECT_EQ(nar.s, header.s) << "invalid names fail before the directory callback";
+                        } else if (filtering == 3) {
+                            EXPECT_THROW(source->dumpPath(CanonPath::root, nar, filter), std::runtime_error);
+                            EXPECT_EQ(filtered, (std::vector<std::string>{"/a"}));
+                        } else {
+                            source->dumpPath(CanonPath::root, nar, filter);
+                            EXPECT_EQ(nar.s, expected(false));
+                            EXPECT_EQ(
+                                filtered,
+                                filtering ? (std::vector<std::string>{"/a", "/a.b"}) : std::vector<std::string>{});
+                            if (filtering != 2)
+                                EXPECT_NE(nar.s, expected(true)) << "the byte oracle distinguishes reversed entries";
+                        }
+                        ++cases;
+                    }
+    EXPECT_EQ(cases, 192u);
+}
+
+TEST(TreeTraversal, deferredVisitsKeepBothNameRepresentationsAlive)
+{
+    struct Source : MemorySourceAccessor
+    {
+        DirEntry hint;
+
+        DirEntries readDirectory(const CanonPath & path) override
+        {
+            auto entries = MemorySourceAccessor::readDirectory(path);
+            for (auto & [name, type] : entries)
+                type = hint;
+            return entries;
+        }
+    };
+
+    struct Visitor : NodeVisitor<std::string>
+    {
+        bool directories;
+
+        std::string regular(const CanonPath & path, fun<void(CreateRegularFileSink &)>) override
+        {
+            return path.abs();
+        }
+
+        std::string symlink(const CanonPath &, const std::string &) override
+        {
+            ADD_FAILURE() << "fixture has no symlinks";
+            return {};
+        }
+
+        std::string directory(const CanonPath &, Children children) override
+        {
+            std::vector<std::pair<std::string, fun<std::string()>>> pending;
+            children([&](std::string_view name, bool isDirectory, fun<std::string()> visit) {
+                EXPECT_EQ(isDirectory, directories);
+                pending.emplace_back(name, std::move(visit));
+            });
+            std::string result;
+            /* Every enumeration/emitter stack frame has returned. */
+            for (auto & [name, visit] : pending)
+                result += name + ":" + visit() + "|";
+            return result;
+        }
+    };
+
+    WithCaseHack scope{true};
+    size_t cases = 0;
+    for (bool suffix : {false, true})
+        for (auto hint : std::array<SourceAccessor::DirEntry, 9>{
+                 std::nullopt,
+                 SourceAccessor::tRegular,
+                 SourceAccessor::tSymlink,
+                 SourceAccessor::tDirectory,
+                 SourceAccessor::tChar,
+                 SourceAccessor::tBlock,
+                 SourceAccessor::tSocket,
+                 SourceAccessor::tFifo,
+                 SourceAccessor::tUnknown}) {
+            auto source = make_ref<Source>();
+            source->hint = hint;
+            auto actual = suffix ? "a" + std::string(caseHackSuffix) + "1" : "a";
+            source->addFile(CanonPath::root / actual, "one");
+            source->addFile(CanonPath("a.b"), "two");
+            Visitor visitor;
+            visitor.directories = hint == SourceAccessor::tDirectory;
+            EXPECT_EQ(traverse(*source, CanonPath::root, defaultPathFilter, visitor), "a:/" + actual + "|a.b:/a.b|");
+            ++cases;
+        }
+    EXPECT_EQ(cases, 18u);
+}
+
 TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
 {
     /* Zero through three children: each succeeds, fails while reading, or
