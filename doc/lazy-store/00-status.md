@@ -1,6 +1,6 @@
 # Lazy-store status
 
-The optimized revision `d600a9662` has lower median wall time in **all nine benchmark cases** against branch base `8aad447`, with 73 of 75 paired trials faster. Its [complete comparison](runs/2026-09-21-performance/paired-d600a9662.json) includes the fetched-input mount correction, completed evaluator-request memo and holder-selection minimum fold. CPU and memory costs do not improve uniformly; the result is specific to the measured workload.
+The optimized revision `58a7bb613` has lower median wall time and lower median paired ratios in **all nine benchmark cases** against branch base `8aad447`, with 71 of 75 pairs faster. Its [complete comparison](runs/2026-09-21-performance/paired-58a7bb613.json) passes all 156 output checks and eighteen complete store comparisons. CPU rises in four cases and peak RSS in six. A separate direct comparison against `d600a9662` is mixed: the resource simplifications do not uniformly improve CPU, memory or elapsed time.
 
 ## Semantic model
 
@@ -16,7 +16,7 @@ The [specification](01-specification.md), [implementation derivation](04-derivat
 
 ## Completed validation and limits
 
-The current debug source, including the resource simplifications, passes **2,496 unit tests with two existing runtime skips**: 453 evaluator, 159 fetcher, 895 utility and 989 store tests. Three disabled tests remain excluded. All 895 utility tests also pass with newer syscalls disabled. Eight targeted functional tests pass, including the language suite and fourteen execution-store shell cases, and **all twelve real overlay tests pass on the corrected source**. Three additional remote-build tests skipped their namespace probe in the preceding audit. The `d600a9662` optimized release passes 207 packaged tests with 36 skips. Overlay-specific limits, including no cross-layer regular-holder sharing and the disabled auxiliary verification/materialisation routes, remain explicit in the store model.
+The [archived debug source](/home/connorbaker/Benchmarks/nix-performance-fixes/resource-final-validation/README.md) passes **2,496 unit tests with two existing runtime skips**: 453 evaluator, 159 fetcher, 895 utility and 989 store tests. Three disabled tests remain excluded. All 895 utility tests also pass with newer syscalls disabled. Eight targeted functional tests pass, including the language suite and fourteen execution-store shell cases, and **all twelve real overlay tests pass on actual mounts**. The exact `58a7bb613` optimized release passes 207 packaged tests, with zero failures and 36 skips. The archive retains the initial property failure and the corrected exact-token replay's diagnostic failure; the positive original-seed replay passes all 989 store tests. Overlay-specific limits, including no cross-layer regular-holder sharing and the disabled auxiliary verification/materialisation routes, remain explicit in the store model.
 
 The [performance and verification report](09-performance.md#verification) records the finite-domain checks, negative controls, syscall evidence and source-review limits. The latest optimized comparison additionally passes all eighteen complete store-graph comparisons and binds all 156 evaluation outputs to their actual store pairs. These checks compare exact contents, modes, references and outputs under an injective substitution of store addresses. They do not establish equivalence of arbitrary embedded programs.
 
@@ -28,21 +28,25 @@ A generic regular-entry cache was rejected: a synchronous same-size source mutat
 
 ## Performance and remaining costs
 
-The current resource pass removes duplicated workdir membership, unused buffering and hashing allocations, repeated closure captures and inline parser storage. Its correctness gates pass; optimized CPU, RSS and elapsed-time comparisons are pending. The following measurements belong to `d600a9662`, before these changes.
+The measured resource pass removes duplicated workdir membership, unused buffering and hashing allocations, repeated closure captures, inline parser storage and the asynchronous holder-index writer. Candidate rows now remain private until each completed-path boundary, preserving reconciliation and holder visibility. The following results measure the complete `58a7bb613` bundle, not the separate effect of any one simplification.
 
-The latest report uses pinned Nixpkgs, five paired cold trials and ten paired warm trials per case. Cold means a fresh private store and fetcher cache, with warm operating-system caches; GitHub cold timings include network access. Median elapsed-time reductions are:
+The pinned Nixpkgs workload uses five paired cold trials and ten paired warm trials per case. Cold means a fresh private store and fetcher cache, with warm operating-system caches; GitHub cold timings include network access. Reductions in the median paired wall-time ratio against branch base are:
 
 | Workload | `path:` | `git+file:` | `github:` |
 | --- | ---: | ---: | ---: |
-| Cold · 32 attributes | 7.26% | 18.33% | 24.32% |
-| Warm · 8 attributes | 86.86% | 6.47% | 13.34% |
-| Warm · 32 attributes | 73.36% | 4.02% | 7.99% |
+| Cold · 32 attributes | 3.22% | 16.94% | 27.40% |
+| Warm · 8 attributes | 86.92% | 5.70% | 12.81% |
+| Warm · 32 attributes | 72.88% | 3.98% | 7.72% |
 
-All nine median paired ratios also improve. Cold path wins four of five pairs; warm GitHub32 wins nine of ten; every other retained pair is faster. Cold path CPU rises from 3.11 to 6.12 s; warm Git CPU rises from 0.795 to 1.315 s at eight attributes and from 1.36 to 1.875 s at 32. RSS rises in seven cases. The [exact-release phase measurement](09-performance.md#remaining-cost-measured-separately) confirms reduced copy-call counts while retaining raw worktree naming. Earlier complete syscall evidence distinguishes necessary destination witnesses and auxiliary publication from source traversal; its counts are not elapsed-time estimates.
+Cold path wins four of five pairs, warm Git8 nine of ten and warm Git32 eight of ten; all other retained pairs are faster. These wall-time gains retain resource costs: cold-path CPU rises from 3.15 to 6.40 s and peak RSS from 445.11 to 500.52 MiB against branch base. CPU is also higher for cold Git and both warm Git cases.
+
+The [direct resource comparison against `d600a9662`](09-performance.md#measurements) retains every case and all 156 outputs. Cold-path CPU medians fall 6.55→6.26 s and peak RSS 517.09→498.77 MiB, but paired wall time rises 98.7 ms (+3.09%; only 1/5 pairs faster). Warm Git32 has lower peak RSS but paired wall time rises 24.1 ms and CPU 0.02 s. Other cases are mixed or have small differences relative to observed run variation. Paired differences and differences of separate medians are distinct statistics; neither identifies allocation ownership or the cause of a bundle's resource change. Supplemental stores were not independently graph-walked.
+
+Earlier exact-`d600a9662` phase and user-cycle profiles remain attributed to that revision in the [remaining-cost analysis](09-performance.md#remaining-cost-measured-separately). They expose raw worktree naming, materialisation and SQLite routes; user-cycle samples do not attribute kernel time or peak RSS.
 
 ## Evidence and reproduction
 
-- [Performance report](09-performance.md) and [latest sample record](runs/2026-09-21-performance/paired-d600a9662.json): exact revisions, binaries, input provenance, raw samples, commands, resource usage and graph-check results.
+- [Performance report](09-performance.md) and [latest sample record](runs/2026-09-21-performance/paired-58a7bb613.json): exact revisions, binaries, input provenance, raw samples, commands, resource usage and graph-check results.
 - [Nixpkgs evaluation driver](runs/nixpkgs-evaluation.py): all three URI schemes, cold 32-attribute and warm 8-/32-attribute cases, balanced executable order and explicit CPU affinity. Builds and profiles run separately from timing.
 - [Complete store comparison](runs/compare-store-graphs.py) and [methodology counterchecks](runs/check-benchmark-methodology.py): graph/content/output equivalence and planted failures. Each cold store requires its own comparison; copying an indexed store changes holder inodes and is not a representative warm fixture.
 - [Validation commands](05-validation.md) and [overlay host driver](runs/overlay-suite-on-host.sh): reproduce the applicable gates. Overlay tests must actually mount overlayfs; a skipped namespace probe is not a passing test.
