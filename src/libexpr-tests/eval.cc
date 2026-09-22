@@ -11,6 +11,7 @@
 #include "nix/util/archive.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/finally.hh"
+#include "nix/expr/value-to-json.hh"
 
 namespace nix {
 
@@ -792,6 +793,402 @@ TEST_F(EvalStateTest, mountingPreservesEvaluationMemoizationUntilExplicitReset)
             EXPECT_THAT(imported(), IsIntEq(42));
             EXPECT_THAT(earlier, IsIntEq(7));
         }
+    }
+}
+
+namespace {
+
+struct CopyRequestSource : MemorySourceAccessor
+{
+    size_t reads = 0;
+    std::function<void()> afterRead, afterReadLink, onInvalidate;
+
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    {
+        auto callback = afterRead;
+        ++reads;
+        MemorySourceAccessor::readFile(path, sink, sizeCallback);
+        if (callback)
+            callback();
+    }
+
+    void invalidateCache() override
+    {
+        auto callback = onInvalidate;
+        if (callback)
+            callback();
+    }
+
+    std::string readLink(const CanonPath & path) override
+    {
+        auto target = MemorySourceAccessor::readLink(path);
+        auto callback = afterReadLink;
+        if (callback)
+            callback();
+        return target;
+    }
+};
+
+static StorePath evalCopiedPath(EvalState & state, std::string expression)
+{
+    Value value;
+    state.eval(state.parseExprFromString(std::move(expression), state.rootPath(CanonPath::root)), value);
+    NixStringContext context;
+    return state.store->parseStorePath(state.forceString(value, context, noPos, "copy request test"));
+}
+
+} // namespace
+
+TEST_F(EvalStateTest, sourceCopyRequestsRespectModesRepairAndDestinationPresence)
+{
+    AutoDelete root{createTempDir()};
+    auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(root.path(), StoreConfig::Params{}));
+    for (bool executable : {false, true})
+        for (auto firstMode : {FetchMode::DryRun, FetchMode::Copy})
+            for (auto nextMode : {FetchMode::DryRun, FetchMode::Copy})
+                for (bool present : {false, true})
+                    for (bool repair : {false, true}) {
+                        SCOPED_TRACE(
+                            ::testing::Message() << executable << " " << int(firstMode) << " " << int(nextMode) << " "
+                                                 << present << " " << repair);
+                        EvalSettings settings{readOnlyMode};
+                        settings.pureEval = false;
+                        settings.nixPath = {};
+                        EvalState nested({}, local, fetchSettings, settings);
+                        auto source = make_ref<CopyRequestSource>();
+                        source->root = MemorySourceAccessor::File::Regular{executable, "AAA"};
+                        auto path = SourcePath{source};
+                        auto name =
+                            fmt("request-%d-%d-%d-%d-%d", executable, int(firstMode), int(nextMode), present, repair);
+                        auto first = nested.copySourceToStore(path, firstMode, name, ContentAddressMethod::Raw::Git);
+                        if (present && firstMode == FetchMode::DryRun)
+                            EXPECT_EQ(fetchToStore(fetchSettings, *local, path, FetchMode::Copy, name), first);
+                        if (!present && firstMode == FetchMode::Copy) {
+                            local->invalidatePathChecked(first);
+                            deletePath(local->toRealPath(first));
+                        }
+                        source->root = MemorySourceAccessor::File::Regular{executable, "BBB"};
+                        auto oracle = make_ref<MemorySourceAccessor>();
+                        oracle->root = source->root;
+                        auto fresh = fetchToStore(fetchSettings, *local, SourcePath{oracle}, FetchMode::DryRun, name);
+                        auto before = source->reads;
+                        nested.repair = repair ? Repair : NoRepair;
+                        auto next = nested.copySourceToStore(path, nextMode, name, ContentAddressMethod::Raw::Git);
+                        bool reuse =
+                            !repair && (nextMode == FetchMode::DryRun || (firstMode == FetchMode::Copy && present));
+                        EXPECT_EQ(next, reuse ? first : fresh);
+                        EXPECT_EQ(source->reads, before + (reuse ? 0 : 1));
+                        if (nextMode == FetchMode::Copy)
+                            EXPECT_EQ(
+                                local->requireStoreObjectAccessor(next)->readFile(CanonPath::root),
+                                reuse ? "AAA" : "BBB");
+                    }
+}
+
+TEST_F(EvalStateTest, sourceCopyRequestKeysSeparateEveryArgument)
+{
+    for (auto firstMethod :
+         {ContentAddressMethod::Raw::Flat,
+          ContentAddressMethod::Raw::Text,
+          ContentAddressMethod::Raw::NixArchive,
+          ContentAddressMethod::Raw::Git})
+        for (auto nextMethod :
+             {ContentAddressMethod::Raw::Flat,
+              ContentAddressMethod::Raw::Text,
+              ContentAddressMethod::Raw::NixArchive,
+              ContentAddressMethod::Raw::Git})
+            for (unsigned changed = 0; changed < 8; ++changed) {
+                SCOPED_TRACE(::testing::Message() << int(firstMethod) << " " << int(nextMethod) << " " << changed);
+                auto source = make_ref<CopyRequestSource>();
+                source->addFile(CanonPath("a"), "AAA");
+                source->addFile(CanonPath("b"), "BBB");
+                auto first = state.copySourceToStore(
+                    SourcePath{source, CanonPath("a")}, FetchMode::DryRun, "request", firstMethod);
+                source->addFile(CanonPath("a"), "BBB");
+                auto other = make_ref<CopyRequestSource>();
+                other->root = source->root;
+                SourcePath nextPath{changed & 1 ? other : source, CanonPath(changed & 2 ? "b" : "a")};
+                auto name = changed & 4 ? "another-request" : "request";
+                auto next = state.copySourceToStore(nextPath, FetchMode::DryRun, name, nextMethod);
+                auto oracle = make_ref<MemorySourceAccessor>();
+                oracle->root = MemorySourceAccessor::File::Regular{false, "BBB"};
+                auto fresh =
+                    fetchToStore(fetchSettings, *store, SourcePath{oracle}, FetchMode::DryRun, name, nextMethod);
+                bool reuse = !changed && firstMethod == nextMethod;
+                EXPECT_EQ(next, reuse ? first : fresh);
+                EXPECT_EQ(source->reads, 1u + (!reuse && !(changed & 1)));
+                EXPECT_EQ(other->reads, bool(changed & 1));
+            }
+}
+
+TEST_F(EvalStateTest, coercionJsonAndUnassertedPathsShareOnlyTheSameRequest)
+{
+    auto previousMode = std::exchange(nix::settings.readOnlyMode, true);
+    Finally restoreMode{[&] { nix::settings.readOnlyMode = previousMode; }};
+    for (int firstCall : {0, 1, 2})
+        for (int nextCall : {0, 1, 2}) {
+            SCOPED_TRACE(::testing::Message() << firstCall << " " << nextCall);
+            EvalSettings settings{readOnlyMode};
+            settings.pureEval = false;
+            settings.nixPath = {};
+            EvalState nested({}, store, fetchSettings, settings);
+            auto source = make_ref<CopyRequestSource>();
+            source->addFile(CanonPath("file"), "AAA");
+            nested.storeFS->mount(CanonPath("/copy-request"), source);
+            auto call = [&](int kind) {
+                if (kind == 2)
+                    return evalCopiedPath(nested, "builtins.path { path = /copy-request/file; name = \"file\"; }");
+                Value value;
+                value.mkPath(nested.rootPath(CanonPath("/copy-request/file")), nested.mem);
+                NixStringContext context;
+                auto result = kind == 0 ? nested.coerceToString(noPos, value, context, "copy request test").toOwned()
+                                        : renderValueAsJSON(nested, true, value, noPos, context);
+                if (kind == 1)
+                    result = result.substr(1, result.size() - 2);
+                auto path = store->parseStorePath(result);
+                EXPECT_TRUE(context.contains(NixStringContextElem::Opaque{.path = path}));
+                return path;
+            };
+            auto first = call(firstCall);
+            source->addFile(CanonPath("file"), "BBB");
+            EXPECT_EQ(call(nextCall), first);
+            EXPECT_EQ(source->reads, 1u);
+            EXPECT_EQ(nested.rootFS->readFile(CanonPath("/copy-request/file")), "BBB");
+        }
+}
+
+TEST_F(EvalStateTest, filteredNamedAndAssertedCopiesObserveTheNewSource)
+{
+    /* addPath uses the process mode; keep it aligned with this read-only
+       evaluator so asserted destinations remain absent in the dummy store. */
+    auto previousMode = std::exchange(nix::settings.readOnlyMode, true);
+    Finally restoreMode{[&] { nix::settings.readOnlyMode = previousMode; }};
+    for (int request : {0, 1, 2, 3, 4, 5}) {
+        SCOPED_TRACE(request);
+        EvalSettings settings{readOnlyMode};
+        settings.pureEval = false;
+        settings.nixPath = {};
+        EvalState nested({}, store, fetchSettings, settings);
+        auto source = make_ref<CopyRequestSource>();
+        source->addFile(CanonPath("file"), "AAA");
+        nested.storeFS->mount(CanonPath("/copy-request"), source);
+        NixStringContext context;
+        auto first = nested.copyPathToStore(context, nested.rootPath(CanonPath("/copy-request/file")));
+        source->addFile(CanonPath("file"), "BBB");
+        auto oracle = make_ref<MemorySourceAccessor>();
+        oracle->root = MemorySourceAccessor::File::Regular{false, "BBB"};
+        auto tree = fetchToStore2(fetchSettings, *store, SourcePath{oracle}, FetchMode::DryRun, "file");
+        auto nar = fetchToStore2(
+            fetchSettings,
+            *store,
+            SourcePath{oracle},
+            FetchMode::DryRun,
+            "file",
+            ContentAddressMethod::Raw::NixArchive);
+        std::string attrs;
+        if (request == 0)
+            attrs = "name = \"renamed\";";
+        if (request == 1 || request == 5)
+            attrs += "filter = path: type: true;";
+        if (request == 2 || request == 5)
+            attrs += fmt("sha256 = \"%s\";", nar.second.to_string(HashFormat::SRI, true));
+        if (request == 3)
+            attrs = fmt("treeHash = \"%s\";", tree.second.to_string(HashFormat::SRI, true));
+        if (request == 4)
+            attrs = "recursive = false;";
+        auto result = evalCopiedPath(nested, fmt("builtins.path { path = /copy-request/file; %s }", attrs));
+        auto expected = fetchToStore2(
+            fetchSettings,
+            *store,
+            SourcePath{oracle},
+            FetchMode::DryRun,
+            request == 0 ? "renamed" : "file",
+            request == 4 ? ContentAddressMethod::Raw::Flat : ContentAddressMethod::Raw::Git);
+        EXPECT_EQ(result, expected.first);
+        EXPECT_NE(result, first);
+        EXPECT_GT(source->reads, 1u);
+    }
+}
+
+TEST_F(EvalStateTest, sourceCopyRequestsRetireOnMountAndResetCompletion)
+{
+    for (bool mount : {false, true})
+        for (bool nestedInvalidation : {false, true})
+            for (bool fail : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << mount << " " << nestedInvalidation << " " << fail);
+                EvalSettings settings{readOnlyMode};
+                settings.pureEval = false;
+                settings.nixPath = {};
+                EvalState nested({}, store, fetchSettings, settings);
+                auto source = make_ref<CopyRequestSource>();
+                source->root = MemorySourceAccessor::File::Regular{false, "AAA"};
+                nested.storeFS->mount(CanonPath("/invalidation-callback"), source);
+                auto path = SourcePath{source};
+                auto copy = [&] {
+                    return nested.copySourceToStore(path, FetchMode::DryRun, "request", ContentAddressMethod::Raw::Git);
+                };
+                auto invalidate = [&] {
+                    if (!mount)
+                        return nested.resetFileCache();
+                    auto tree = make_ref<MemorySourceAccessor>();
+                    tree->addFile(CanonPath("value"), "input");
+                    fetchers::Input input;
+                    input.attrs.insert_or_assign("name", "copy-request-mount");
+                    nested.mountInput(input, tree);
+                };
+                source->afterRead = [&] {
+                    source->afterRead = {};
+                    source->root = MemorySourceAccessor::File::Regular{false, "BBB"};
+                    invalidate();
+                };
+                source->onInvalidate = [&] {
+                    source->onInvalidate = {};
+                    if (nestedInvalidation) {
+                        nested.resetFileCache();
+                        copy();
+                    }
+                    if (fail)
+                        throw Error("copy request invalidation failed");
+                };
+                if (fail)
+                    EXPECT_THROW(copy(), Error);
+                else
+                    copy();
+                auto before = source->reads;
+                auto fresh = copy();
+                EXPECT_EQ(source->reads, before + 1);
+                auto oracle = make_ref<MemorySourceAccessor>();
+                oracle->root = source->root;
+                EXPECT_EQ(fresh, fetchToStore(fetchSettings, *store, SourcePath{oracle}, FetchMode::DryRun, "request"));
+                EXPECT_EQ(copy(), fresh);
+                EXPECT_EQ(source->reads, before + 1);
+            }
+}
+
+TEST_F(EvalStateTest, onlyCompletedSourceRequestsRetainTheirSources)
+{
+    for (int completion : {0, 1, 2}) {
+        SCOPED_TRACE(completion);
+        std::weak_ptr<SourceAccessor> retained;
+        {
+            auto source = make_ref<CopyRequestSource>();
+            retained = source.get_ptr();
+            source->root = MemorySourceAccessor::File::Regular{false, "AAA"};
+            if (completion)
+                source->afterRead = [] { throw Error("source request failed"); };
+            auto copy = [&] {
+                return state.copySourceToStore(
+                    SourcePath{source}, FetchMode::DryRun, "request", ContentAddressMethod::Raw::Git);
+            };
+            if (completion) {
+                EXPECT_THROW(copy(), Error);
+                source->afterRead = {};
+                EXPECT_EQ(source->reads, 1u);
+                if (completion == 2) {
+                    auto retried = copy();
+                    EXPECT_EQ(copy(), retried);
+                    EXPECT_EQ(source->reads, 2u);
+                }
+            } else {
+                copy();
+                copy();
+                EXPECT_EQ(source->reads, 1u);
+            }
+        }
+        EXPECT_EQ(retained.expired(), completion == 1);
+        state.resetFileCache();
+        EXPECT_TRUE(retained.expired());
+    }
+}
+
+TEST_F(EvalStateTest, repairCopiesNeitherUseNorReplaceCompletedRequests)
+{
+    auto source = make_ref<CopyRequestSource>();
+    source->root = MemorySourceAccessor::File::Regular{false, "AAA"};
+    auto copy = [&] {
+        return state.copySourceToStore(
+            SourcePath{source}, FetchMode::DryRun, "request", ContentAddressMethod::Raw::Git);
+    };
+    auto first = copy();
+    source->root = MemorySourceAccessor::File::Regular{false, "BBB"};
+    state.repair = Repair;
+    EXPECT_NE(copy(), first);
+    state.repair = NoRepair;
+    EXPECT_EQ(copy(), first);
+    EXPECT_EQ(source->reads, 2u);
+}
+
+TEST_F(EvalStateTest, admissionGrowthRetainsARequestButDoesNotNameTheChangedTree)
+{
+    auto previousMode = std::exchange(nix::settings.readOnlyMode, true);
+    Finally restoreMode{[&] { nix::settings.readOnlyMode = previousMode; }};
+    EvalSettings settings{readOnlyMode};
+    settings.pureEval = false;
+    settings.restrictEval = true;
+    settings.nixPath = {};
+    EvalState nested({}, store, fetchSettings, settings);
+    auto source = make_ref<CopyRequestSource>();
+    source->addFile(CanonPath("a"), "a");
+    source->addFile(CanonPath("b"), "b");
+    nested.storeFS->mount(CanonPath("/copy-request"), source);
+    nested.allowPathLegacy("/copy-request/a");
+    NixStringContext context;
+    auto path = nested.rootPath(CanonPath("/copy-request"));
+    auto first = nested.copyPathToStore(context, path);
+    auto before = source->reads;
+    nested.allowPathLegacy("/copy-request/b");
+    EXPECT_EQ(nested.copyPathToStore(context, path), first);
+    EXPECT_EQ(source->reads, before);
+    auto full = fetchToStore(fetchSettings, *store, SourcePath{source}, FetchMode::DryRun, "copy-request");
+    EXPECT_NE(full, first);
+    EXPECT_EQ(evalCopiedPath(nested, "builtins.path { path = /copy-request; filter = path: type: true; }"), full);
+    auto renamed = evalCopiedPath(nested, "builtins.path { path = /copy-request; name = \"expanded\"; }");
+    EXPECT_EQ(renamed, fetchToStore(fetchSettings, *store, SourcePath{source}, FetchMode::DryRun, "expanded"));
+    nested.resetFileCache();
+    EXPECT_EQ(nested.copyPathToStore(context, path), full);
+}
+
+TEST_F(EvalStateTest, resolutionCallbacksPrecedeTheResolvedCopyRequest)
+{
+    for (bool mount : {false, true}) {
+        SCOPED_TRACE(mount);
+        EvalSettings settings{readOnlyMode};
+        settings.pureEval = false;
+        settings.nixPath = {};
+        EvalState nested({}, store, fetchSettings, settings);
+        auto source = make_ref<CopyRequestSource>();
+        source->addFile(CanonPath("old/file"), "AAA");
+        source->addFile(CanonPath("new/file"), "BBB");
+        MemorySink sink{*source};
+        sink.createSymlink(CanonPath("link"), "old");
+        nested.storeFS->mount(CanonPath("/copy-request"), source);
+        source->afterReadLink = [&] {
+            source->afterReadLink = {};
+            source->open(CanonPath("link"), std::nullopt)->raw = MemorySourceAccessor::File::Symlink{"new"};
+            if (!mount)
+                nested.resetFileCache();
+            else {
+                auto inputTree = make_ref<MemorySourceAccessor>();
+                inputTree->addFile(CanonPath("value"), "input");
+                fetchers::Input input;
+                input.attrs.insert_or_assign("name", "resolution-mount");
+                nested.mountInput(input, inputTree);
+            }
+        };
+        NixStringContext context;
+        auto alias = nested.rootPath(CanonPath("/copy-request/link/file"));
+        auto old = nested.copyPathToStore(context, alias);
+        auto current = nested.copyPathToStore(context, alias);
+        EXPECT_NE(old, current);
+        EXPECT_EQ(
+            old,
+            fetchToStore(fetchSettings, *store, SourcePath{source, CanonPath("old/file")}, FetchMode::DryRun, "file"));
+        EXPECT_EQ(
+            current,
+            fetchToStore(fetchSettings, *store, SourcePath{source, CanonPath("new/file")}, FetchMode::DryRun, "file"));
+        auto before = source->reads;
+        EXPECT_EQ(nested.copyPathToStore(context, alias), current);
+        EXPECT_EQ(source->reads, before);
     }
 }
 

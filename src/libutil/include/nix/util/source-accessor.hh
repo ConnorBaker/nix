@@ -351,11 +351,12 @@ ref<SourceAccessor> makeFSSourceAccessor(
 ref<SourceAccessor> makeUnionSourceAccessor(std::vector<ref<SourceAccessor>> && accessors);
 
 /**
- * Cache positive metadata/link facts and optional naming observations for a
- * view that remains stable until invalidateCache(). Invalidate after changing
- * that view. An absent name does not assert that a filesystem node is absent;
- * failed existence lookups are never cached. The evaluator supplies this
- * boundary when mounting inputs or explicitly refreshing external sources.
+ * Retain positive metadata/link facts and optional naming observations until
+ * invalidateCache(). File reads and directory listings still reach the child;
+ * retaining these observations does not freeze its bytes. An absent name does
+ * not assert that a filesystem node is absent; failed existence lookups are
+ * never cached. The evaluator invalidates after mounting inputs or explicitly
+ * refreshing external sources.
  */
 ref<SourceAccessor> makeCachingSourceAccessor(ref<SourceAccessor> next);
 

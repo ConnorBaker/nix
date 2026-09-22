@@ -75,7 +75,7 @@ StorePath EvalState::mountInput(fetchers::Input & input, ref<SourceAccessor> acc
     /* The fetched tree owns this prefix, including over an ambient host
        occupant. Discard facts observed before the graft, including cached
        file types, links and naming decisions. */
-    rootFS->invalidateCache();
+    invalidateSourceCaches();
 
     /* `input` is what `Input::getAccessor` returned: whatever the original
        asserted has been verified there and the `narHash` replaced by

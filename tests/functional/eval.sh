@@ -88,3 +88,94 @@ out="$(expectStderr 0 nix eval --option foobar baz --expr '""' --raw)"
 # Test flag alias
 out="$(nix eval --expr '{}' --build-cores 1)"
 [[ "$(echo "$out" | wc -l)" = 1 ]]
+
+# Repeating a completed copy request preserves its result. Changing the
+# request, or reading the source itself, must still observe changed bytes.
+copyRoot="$TEST_ROOT/copy-requests"
+mkdir -p "$copyRoot/original" "$copyRoot/other"
+ln -s original "$copyRoot/alias"
+ln -s original/input "$copyRoot/link"
+cat > "$copyRoot/requests.nix" <<'EOF'
+{ source, other, alias, shell, first, second, hash ? "", typeOnly ? false }:
+let
+  p = /. + source;
+  requests = {
+    interpolation = p: "${p}";
+    json = p: builtins.fromJSON (builtins.unsafeDiscardStringContext (builtins.toJSON p));
+    path = p: builtins.path { path = p; };
+    before = p: builtins.path { path = p; name = "before"; };
+    renamed = p: builtins.path { path = p; name = "after"; };
+    flat = p: builtins.path { path = p; recursive = false; };
+    filtered = p: builtins.path { path = p; filter = _: _: true; };
+    other = _: "${/. + other}";
+    ancestor = _: "${/. + alias}";
+    raw = p: p;
+    nar = p: builtins.path { path = p; sha256 = hash; };
+    tree = p: builtins.path { path = p; treeHash = hash; };
+    badNar = p: builtins.path { path = p; name = "rejected-${builtins.baseNameOf p}"; sha256 = hash; };
+    badTree = p: builtins.path { path = p; name = "rejected-${builtins.baseNameOf p}"; treeHash = hash; };
+  };
+  firstCopy = requests.${first} p;
+  changed = builtins.seq firstCopy (builtins.exec [
+    shell "-c" ''printf BBB > "$1"; printf BBB > "$2"; printf null''
+    "copy-request" source other
+  ]);
+  secondCopy = builtins.seq changed (requests.${second} p);
+in { result = if typeOnly then builtins.readFileType secondCopy else builtins.readFile secondCopy; }
+EOF
+copyArgs=(--impure --raw --file "$copyRoot/requests.nix" result
+    --option allow-unsafe-native-code-during-evaluation true
+    --argstr shell "$SHELL" --argstr other "$copyRoot/other/input"
+    --argstr alias "$copyRoot/alias/input")
+
+# All nine entry-point pairs denote the same unfiltered default-name request.
+for first in interpolation json path; do
+    for second in interpolation json path; do
+        printf AAA > "$copyRoot/original/input"
+        [[ $(nix eval "${copyArgs[@]}" --argstr source "$copyRoot/original/input" \
+            --argstr first "$first" --argstr second "$second") == AAA ]]
+    done
+done
+
+# Distinct name, method, filter or source, and raw reads, observe the rewrite.
+for second in renamed flat filtered other raw; do
+    printf AAA > "$copyRoot/original/input"
+    printf AAA > "$copyRoot/other/input"
+    [[ $(nix eval "${copyArgs[@]}" --argstr source "$copyRoot/original/input" \
+        --argstr first interpolation --argstr second "$second") == BBB ]]
+done
+
+# Preserve the public counterexample that rejected caching a source's bytes:
+# a copy named "before" cannot determine a later copy named "after".
+printf AAA > "$copyRoot/original/input"
+[[ $(nix eval "${copyArgs[@]}" --argstr source "$copyRoot/original/input" \
+    --argstr first before --argstr second renamed) == BBB ]]
+
+# Ancestor aliases resolve to the same request. A final symlink is preserved
+# by coercion but followed by builtins.path, so those requests differ.
+printf AAA > "$copyRoot/original/input"
+[[ $(nix eval "${copyArgs[@]}" --argstr source "$copyRoot/original/input" \
+    --argstr first interpolation --argstr second ancestor) == AAA ]]
+printf AAA > "$copyRoot/original/input"
+[[ $(nix eval "${copyArgs[@]}" --argstr source "$copyRoot/link" \
+    --argstr first interpolation --argstr second path --arg typeOnly true) == regular ]]
+
+# Assertions describe the current source, rather than an earlier unasserted
+# request. Give each assertion its own name so no valid destination can skip
+# the read; the rejected addresses have never been copied either.
+for mode in nar tree; do
+    printf BBB > "$copyRoot/expected"
+    hashMode=$mode
+    if [[ $mode == tree ]]; then hashMode=git; fi
+    goodHash=$(nix hash path --mode "$hashMode" --algo sha256 --format sri "$copyRoot/expected")
+    printf CCC > "$copyRoot/expected"
+    badHash=$(nix hash path --mode "$hashMode" --algo sha256 --format sri "$copyRoot/expected")
+    assertInput=$(mktemp "$copyRoot/assert-$mode-XXXXXX")
+    printf AAA > "$assertInput"
+    [[ $(nix eval "${copyArgs[@]}" --argstr source "$assertInput" \
+        --argstr first interpolation --argstr second "$mode" --argstr hash "$goodHash") == BBB ]]
+    printf AAA > "$assertInput"
+    if [[ $mode == nar ]]; then rejected=badNar; else rejected=badTree; fi
+    expect 102 nix eval "${copyArgs[@]}" --argstr source "$assertInput" \
+        --argstr first interpolation --argstr second "$rejected" --argstr hash "$badHash"
+done

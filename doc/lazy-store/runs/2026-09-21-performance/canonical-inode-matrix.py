@@ -1,4 +1,7 @@
-"""Finite candidate selection check using the production SQL verbatim."""
+"""Finite relational check of the production SQL plus its minimum fold.
+
+The C++ lookup tests separately exercise the implementation of that fold.
+"""
 import ast
 import itertools
 import json
@@ -54,7 +57,8 @@ def check(states, ranks):
     for executable in range(2):
         cursor = initial
         observed = []
-        while row := c.execute(lookup, (b"blob", executable, *cursor)).fetchone():
+        while row := min(c.execute(lookup, (b"blob", executable, *cursor)),
+                         key=lambda row: (row[1], row[0], row[5]), default=None):
             next_cursor = (row[1], row[0], row[5])
             assert next_cursor > cursor
             observed.append(next_cursor)
@@ -83,7 +87,7 @@ def main():
                 class_cases += 1
     print(json.dumps({
         "sqlite": sqlite3.sqlite_version,
-        "query_provenance": "src/libstore/local-store.cc: QueryBlobInodes and lookupBlobSql, extracted verbatim",
+        "query_provenance": "src/libstore/local-store.cc: QueryBlobInodes and lookupBlobSql, extracted verbatim; streamed lookup rows reduced to their signed (dev, ino, ingestion) minimum",
         "visibility_domain": "3 candidates x 2 executable classes; each absent/unnamed/named-invalid/registered",
         "visibility_cases": visibility_cases,
         "physical_class_domain": "2 executable classes x all 13 ordered three-candidate partitions x 64 visibility states; other mode independently present",

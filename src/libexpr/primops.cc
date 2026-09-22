@@ -3028,6 +3028,14 @@ static void addPath(
 
         auto [dstPath, hash] = [&]() -> std::pair<StorePath, std::optional<Hash>> {
             if (refs.empty()) {
+                /* An asserted hash must describe the tree just observed,
+                   not an earlier request's result. Keep the original filter
+                   eligibility even when preprocessing wrapped that filter. */
+                if (!filterFun && !expectedHash && !expectedTreeHash)
+                    return {
+                        state.copySourceToStore(
+                            srcPath, settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy, name, method),
+                        std::nullopt};
                 auto [p, h] = fetchToStore2(
                     state.fetchSettings,
                     *state.store,

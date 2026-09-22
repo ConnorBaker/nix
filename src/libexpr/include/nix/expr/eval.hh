@@ -42,6 +42,7 @@ namespace nix {
 constexpr size_t maxPrimOpArity = 8;
 
 class Store;
+enum struct FetchMode;
 
 namespace fetchers {
 struct Settings;
@@ -542,6 +543,17 @@ public:
 
 private:
 
+    /* Completed evaluator requests, not facts about the source's current
+       bytes. As in the original source-copy memo, a repeated request keeps
+       its result across exec, IFD and admission growth. Mounting or explicit
+       reset starts a new view; filtered/asserted requests never enter here. */
+    using SourceCopyKey = std::tuple<SourcePath, ContentAddressMethod::Raw, std::string>;
+    using SourceCopyResult = std::pair<StorePath, FetchMode>;
+    using SourceCopies = boost::unordered_flat_map<SourceCopyKey, SourceCopyResult>;
+    Sync<std::shared_ptr<SourceCopies>> sourceCopies{std::make_shared<SourceCopies>()};
+
+    void invalidateSourceCaches();
+
     /**
      * A cache that maps paths to "resolved" paths for importing Nix
      * expressions, i.e. `/foo` to `/foo/default.nix`.
@@ -958,6 +970,11 @@ public:
         bool canonicalizePath = true);
 
     StorePath copyPathToStore(NixStringContext & context, const SourcePath & path);
+
+    /** Complete an unfiltered, unasserted, reference-free evaluator copy
+     * request. The caller supplies its already-resolved source path. */
+    StorePath
+    copySourceToStore(const SourcePath & path, FetchMode mode, std::string_view name, ContentAddressMethod method);
 
     /**
      * Path coercion.

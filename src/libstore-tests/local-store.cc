@@ -3269,6 +3269,119 @@ TEST_F(LocalStoreObjectsTest, completedIngestionReplacesThePathsEntireCandidateP
             }
 }
 
+TEST_F(LocalStoreObjectsTest, candidateLookupReturnsTheLeastEligibleSignedPhysicalCursor)
+{
+    using Cursor = GitObjectStore::Holder::Cursor;
+    constexpr auto low = std::numeric_limits<int64_t>::min();
+    constexpr auto high = std::numeric_limits<int64_t>::max();
+    const std::array<std::pair<int64_t, int64_t>, 4> physical{{
+        {low, low},
+        {low, high},
+        {high, low},
+        {high, high},
+    }};
+    const std::array<int64_t, 2> ingestions{1, high};
+    const std::array<std::string, 2> paths{
+        store->printStorePath(StorePath::random("cursor-root")),
+        store->printStorePath(StorePath::random("cursor-tree")),
+    };
+    const std::array<std::string, 2> names{"", "nested/leaf"};
+    auto id = merkle::blobId("cursor-candidate");
+    auto otherId = merkle::blobId("different-cursor-candidate");
+    SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+    SQLiteStmt valid{db, "insert into ValidPaths(path, hash, registrationTime) values (?, '', 0);"};
+    for (const auto & path : paths)
+        valid.use().apply(path).exec();
+    SQLiteStmt ingestion{db, "insert into Ingestions(id, path) values (?, ?);"};
+    SQLiteStmt blob{db, "insert into Blobs(id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);"};
+
+    size_t cases = 0;
+    for (bool executable : {false, true})
+        for (const auto & first : physical)
+            for (const auto & second : physical)
+                /* Each candidate is absent, unnamed, named-invalid, or registered. */
+                for (unsigned firstState = 0; firstState != 4; ++firstState)
+                    for (unsigned secondState = 0; secondState != 4; ++secondState) {
+                        SCOPED_TRACE(
+                            fmt("case=%d executable=%d states=%d,%d", cases++, executable, firstState, secondState));
+                        std::array<Cursor, 2> keys{
+                            Cursor{first.first, first.second, static_cast<uint64_t>(ingestions[0])},
+                            Cursor{second.first, second.second, static_cast<uint64_t>(ingestions[1])},
+                        };
+                        std::array states{firstState, secondState};
+                        std::vector<size_t> eligible;
+                        {
+                            SQLiteTxn txn{db};
+                            db.exec("delete from Blobs; delete from Ingestions;");
+                            for (size_t i = 0; i < keys.size(); ++i) {
+                                if (states[i] == 0)
+                                    continue;
+                                ingestion.use()
+                                    .apply(ingestions[i])
+                                    .apply(states[i] == 2 ? paths[i] + "-invalid" : paths[i], states[i] != 1)
+                                    .exec();
+                                blob.use()
+                                    .apply(id.hash, id.hashSize)
+                                    .apply(int64_t(executable))
+                                    .apply(std::get<1>(keys[i]))
+                                    .apply(std::get<0>(keys[i]))
+                                    .apply(ingestions[i])
+                                    .apply(names[i])
+                                    .apply(int64_t(i + 1))
+                                    .exec();
+                                if (states[i] == 3)
+                                    eligible.push_back(i);
+                            }
+                            /* A different address or mode must never supply the minimum. */
+                            ingestion.use().apply(2).apply(paths[0]).exec();
+                            ingestion.use().apply(3).apply(paths[0]).exec();
+                            blob.use()
+                                .apply(id.hash, id.hashSize)
+                                .apply(int64_t(!executable))
+                                .apply(low)
+                                .apply(low)
+                                .apply(2)
+                                .apply("")
+                                .apply(1)
+                                .exec();
+                            blob.use()
+                                .apply(otherId.hash, otherId.hashSize)
+                                .apply(int64_t(executable))
+                                .apply(low)
+                                .apply(low)
+                                .apply(3)
+                                .apply("")
+                                .apply(1)
+                                .exec();
+                            txn.commit();
+                        }
+                        std::sort(
+                            eligible.begin(), eligible.end(), [&](size_t a, size_t b) { return keys[a] < keys[b]; });
+                        for (const auto & cursor :
+                             {GitObjectStore::Holder::initialCursor,
+                              keys[0],
+                              keys[1],
+                              Cursor{high, high, static_cast<uint64_t>(high)}}) {
+                            auto expected = std::find_if(
+                                eligible.begin(), eligible.end(), [&](size_t i) { return keys[i] > cursor; });
+                            auto actual = store->objects.index->lookup(id, executable, cursor);
+                            ASSERT_EQ(actual.has_value(), expected != eligible.end());
+                            if (!actual)
+                                continue;
+                            auto i = *expected;
+                            EXPECT_EQ(actual->ingestion, static_cast<uint64_t>(ingestions[i]));
+                            EXPECT_EQ(actual->dev, static_cast<dev_t>(std::get<0>(keys[i])));
+                            EXPECT_EQ(actual->ino, static_cast<ino_t>(std::get<1>(keys[i])));
+                            EXPECT_EQ(actual->size, i + 1);
+                            auto file = store->getRealStoreDir() / std::filesystem::path(paths[i]).filename();
+                            if (!names[i].empty())
+                                file /= names[i];
+                            EXPECT_EQ(actual->file, file.string());
+                        }
+                    }
+    EXPECT_EQ(cases, 512u);
+}
+
 TEST_F(LocalStoreObjectsTest, candidateMigrationPreservesOldHoldersAndReadOnlyAccess)
 {
     auto nar = treeNar({{"file", "migration-holder", 'f'}});

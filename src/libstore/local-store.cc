@@ -154,8 +154,7 @@ struct LocalStore::State::Stmts
 static constexpr auto lookupBlobSql =
     "select b.ino, b.dev, b.size, i.path, b.name, b.ingestion from Blobs b"
     " join Ingestions i on i.id = b.ingestion join ValidPaths v on v.path = i.path"
-    " where b.id = ? and b.exec = ? and (b.dev, b.ino, b.ingestion) > (?, ?, ?)"
-    " order by b.dev, b.ino, b.ingestion limit 1;";
+    " where b.id = ? and b.exec = ? and (b.dev, b.ino, b.ingestion) > (?, ?, ?);";
 
 LocalStore::LocalStore(ref<const Config> config)
     : Store{*config}
@@ -521,21 +520,30 @@ LocalStore::LocalStore(ref<const Config> config)
                 .apply(std::get<0>(cursor))
                 .apply(std::get<1>(cursor))
                 .apply(static_cast<int64_t>(std::get<2>(cursor)));
-            if (!use.next())
-                return std::nullopt;
-            GitObjectStore::Holder holder{
-                .ino = static_cast<ino_t>(use.getInt(0)),
-                .dev = static_cast<dev_t>(use.getInt(1)),
-                .size = static_cast<uint64_t>(use.getInt(2)),
-                /* The column holds the *logical* store path; the holder is
-                   a file on disk under the real store directory. */
-                .file = (getRealStoreDir() / std::filesystem::path(use.getStr(3)).filename()).string(),
-                .ingestion = static_cast<uint64_t>(use.getInt(5)),
-            };
-            auto name = use.getStr(4);
-            if (!name.empty()) {
-                holder.file += '/';
-                holder.file += name;
+            std::optional<GitObjectStore::Holder> holder;
+            std::tuple<int64_t, int64_t, int64_t> minimum;
+            /* Select the same physical minimum without opening SQLite's
+               temporary sorter on every miss. Compare signed database
+               coordinates before converting to platform inode types. */
+            while (use.next()) {
+                auto candidate = std::tuple{use.getInt(1), use.getInt(0), use.getInt(5)};
+                if (holder && candidate >= minimum)
+                    continue;
+                minimum = candidate;
+                holder = GitObjectStore::Holder{
+                    .ino = static_cast<ino_t>(std::get<1>(candidate)),
+                    .dev = static_cast<dev_t>(std::get<0>(candidate)),
+                    .size = static_cast<uint64_t>(use.getInt(2)),
+                    /* The column holds the *logical* store path; the holder is
+                       a file on disk under the real store directory. */
+                    .file = (getRealStoreDir() / std::filesystem::path(use.getStr(3)).filename()).string(),
+                    .ingestion = static_cast<uint64_t>(std::get<2>(candidate)),
+                };
+                auto name = use.getStr(4);
+                if (!name.empty()) {
+                    holder->file += '/';
+                    holder->file += name;
+                }
             }
             return holder;
         });

@@ -6,6 +6,7 @@
 #include "nix/expr/symbol-table.hh"
 #include "nix/expr/value.hh"
 #include "nix/util/exit.hh"
+#include "nix/util/finally.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/types.hh"
 #include "nix/util/util.hh"
@@ -1313,6 +1314,16 @@ void EvalState::resetFileCache()
     fileEvalCache->clear();
     inputCache->clear();
     lookupPathResolved->clear();
+    invalidateSourceCaches();
+}
+
+void EvalState::invalidateSourceCaches()
+{
+    auto replacement = std::make_shared<SourceCopies>();
+    Finally publish{[&] {
+        auto current = sourceCopies.lock();
+        current->swap(replacement);
+    }};
     rootFS->invalidateCache();
 }
 
@@ -2753,19 +2764,49 @@ StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePat
     /* A source is named by its tree hash: the git method
        (doc/lazy-store/04-derivation.md, section 1.9, the fetchers'
        and the language's representation). */
-    auto dstPath = fetchToStore(
-        fetchSettings,
-        *store,
+    auto dstPath = copySourceToStore(
         path.resolveSymlinks(SymlinkResolution::Ancestors),
         settings.isReadOnly() ? FetchMode::DryRun : FetchMode::Copy,
         path.baseName(),
-        ContentAddressMethod::Raw::Git,
-        nullptr,
-        repair);
+        ContentAddressMethod::Raw::Git);
     allowPath(dstPath);
 
     context.insert(NixStringContextElem::Opaque{.path = dstPath});
     return dstPath;
+}
+
+StorePath EvalState::copySourceToStore(
+    const SourcePath & path, FetchMode mode, std::string_view name, ContentAddressMethod method)
+{
+    if (repair)
+        return fetchToStore(fetchSettings, *store, path, mode, name, method, nullptr, repair);
+
+    auto key = SourceCopyKey{path, method.raw, std::string(name)};
+    std::shared_ptr<SourceCopies> observed;
+    std::optional<SourceCopyResult> cached;
+    {
+        auto current = sourceCopies.lock();
+        observed = *current;
+        if (auto i = observed->find(key); i != observed->end())
+            cached = i->second;
+    }
+    if (cached && (mode == FetchMode::DryRun || cached->second == FetchMode::Copy)) {
+        auto & dst = cached->first;
+        if (mode == FetchMode::DryRun)
+            return dst;
+        store->addTempRoot(dst);
+        if (store->isValidPath(dst))
+            return dst;
+    }
+
+    auto result = fetchToStore(fetchSettings, *store, path, mode, name, method);
+    {
+        auto current = sourceCopies.lock();
+        /* A callback may have mounted an input or reset evaluation. Only
+           the generation that began this request receives its result. */
+        observed->insert_or_assign(std::move(key), SourceCopyResult{result, mode});
+    }
+    return result;
 }
 
 SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)
