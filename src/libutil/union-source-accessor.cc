@@ -122,14 +122,6 @@ public:
         return o ? std::optional{o->second} : std::nullopt;
     }
 
-    Stat lstat(const CanonPath & path) override
-    {
-        auto keepAlive = weak_from_this().lock();
-        if (auto o = owner(path))
-            return o->second;
-        throw FileNotFound("path '%s' does not exist", showPath(path));
-    }
-
     DirEntries readDirectory(const CanonPath & path) override
     {
         auto keepAlive = weak_from_this().lock();

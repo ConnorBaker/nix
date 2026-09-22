@@ -135,8 +135,7 @@ public:
     {
         if (dirPath.isRoot()) {
             /* Traverse through this accessor, so that the root listing above applies. */
-            callback(*this, dirPath);
-            return;
+            return SourceAccessor::readDirectory(dirPath, std::move(callback));
         }
         requireStoreObject(dirPath);
         auto inner = accessor;
@@ -155,8 +154,7 @@ public:
         std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
     {
         if (path.isRoot()) {
-            auto entries = readDirectory(path);
-            callback(*this, path, entries);
+            return SourceAccessor::readDirectoryWithEntries(path, std::move(callback));
         } else {
             requireStoreObject(path);
             auto inner = accessor;

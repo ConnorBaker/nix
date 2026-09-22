@@ -1326,15 +1326,18 @@ merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view bod
     {
         merkle::Tree tree;
 
-        /* As `merkle::Tree` keys entries, and not through `insertEntry`,
-           which refuses the name `.` that the synthetic root tree of a
-           bare executable or symlink carries (`merkle::syntheticRootTree`). */
         void insertChild(std::string_view name, merkle::TreeEntry entry) override
         {
-            std::string key(name);
-            if (entry.mode == merkle::Mode::Directory)
-                key += '/';
-            tree.insert_or_assign(std::move(key), entry);
+            /* A bare executable or symlink has a singleton synthetic
+               root. Every other tree is an ordinary directory map. */
+            if (name == "." && tree.empty()
+                && (entry.mode == merkle::Mode::Executable || entry.mode == merkle::Mode::Symlink)) {
+                tree.emplace(".", std::move(entry));
+                return;
+            }
+            if (!tree.empty() && tree.begin()->first == ".")
+                throw Error("synthetic root tree has more than one entry");
+            merkle::insertEntry(tree, name, entry);
         }
     } into;
 
@@ -1343,6 +1346,10 @@ merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view bod
     StringSource source{std::to_string(body.size()) + '\0' + std::string(body)};
     try {
         git::parseTree(into, source, hashAlgo);
+        /* The identifier names the canonical encoding of this map, not
+           another spelling or ordering that the raw Git parser accepts. */
+        if (merkle::serialiseTree(into.tree) != body)
+            throw Error("tree body is not its canonical encoding");
     } catch (Error & e) {
         throw Error("malformed tree object %s: %s", idString(id), e.msg());
     }

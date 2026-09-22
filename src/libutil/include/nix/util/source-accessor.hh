@@ -43,6 +43,10 @@ MakeError(NotARegularFile, SourceAccessorError);
  * evaluator and elsewhere for accessing sources in various
  * filesystem-like entities (such as the real filesystem, tarballs or
  * Git repositories).
+ *
+ * Defaults that continue using or borrowing the accessor across callbacks
+ * retain its shared owner. Accessors without shared ownership remain
+ * borrowed and must outlive the operation.
  */
 struct SourceAccessor : std::enable_shared_from_this<SourceAccessor>
 {
@@ -177,6 +181,7 @@ public:
         const CanonPath & dirPath,
         std::function<void(SourceAccessor & subdirAccessor, const CanonPath & subdirRelPath)> callback)
     {
+        auto keepAlive = weak_from_this().lock();
         callback(*this, dirPath);
     }
 
@@ -184,6 +189,7 @@ public:
     virtual void readDirectoryWithEntries(
         const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback)
     {
+        auto keepAlive = weak_from_this().lock();
         auto entries = readDirectory(path);
         readDirectory(path, [&](SourceAccessor & accessor, const CanonPath & relative) {
             callback(accessor, relative, entries);
@@ -345,8 +351,11 @@ ref<SourceAccessor> makeFSSourceAccessor(
 ref<SourceAccessor> makeUnionSourceAccessor(std::vector<ref<SourceAccessor>> && accessors);
 
 /**
- * Make a wrapper source accessor that caches positive lookup results.
- * Useful for the evaluator which already assumes a mostly immutable view of the filesystem.
+ * Cache positive metadata/link facts and optional naming observations for a
+ * view that remains stable until invalidateCache(). Invalidate after changing
+ * that view. An absent name does not assert that a filesystem node is absent;
+ * failed existence lookups are never cached. The evaluator supplies this
+ * boundary when mounting inputs or explicitly refreshing external sources.
  */
 ref<SourceAccessor> makeCachingSourceAccessor(ref<SourceAccessor> next);
 

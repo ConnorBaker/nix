@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <rapidcheck/gtest.h>
 
+#include <array>
+
 #include "nix/util/merkle-hash.hh"
 #include "nix/util/git.hh"
 #include "nix/util/object-hash-sink.hh"
@@ -218,6 +220,72 @@ TEST(MerkleHash, serialiseTreeIsGitsBody)
     /* Names that merely begin with a dot are names. */
     EXPECT_NO_THROW(merkle::insertEntry(t, ".git", {.mode = Mode::Directory, .hash = hD}));
     EXPECT_NO_THROW(merkle::insertEntry(t, "...", {.mode = Mode::Regular, .hash = hA}));
+}
+
+TEST(MerkleHash, insertEntryRequiresUniqueLogicalNamesInEveryModePair)
+{
+    const std::array modes{Mode::Directory, Mode::Regular, Mode::Executable, Mode::Symlink};
+    const auto firstHash = merkle::blobId("first");
+    const auto secondHash = merkle::blobId("second");
+    size_t cases = 0;
+    for (auto firstMode : modes)
+        for (auto secondMode : modes)
+            for (bool sameName : {false, true}) {
+                SCOPED_TRACE(fmt("first=%o second=%o same=%d", (RawMode) firstMode, (RawMode) secondMode, sameName));
+                merkle::Tree tree;
+                merkle::insertEntry(tree, "entry", {firstMode, firstHash});
+                /* This sorts between the two encodings "entry" and
+                   "entry/": duplicate detection cannot be adjacency. */
+                merkle::insertEntry(tree, "entry.", {Mode::Regular, firstHash});
+                const auto before = tree;
+                if (sameName) {
+                    EXPECT_THROW(merkle::insertEntry(tree, "entry", {secondMode, secondHash}), Error);
+                    EXPECT_EQ(tree, before) << "a rejected insertion preserves every original entry";
+                } else {
+                    merkle::insertEntry(tree, "entry0", {secondMode, secondHash});
+                    EXPECT_EQ(tree.size(), 3u);
+                    EXPECT_EQ(
+                        tree.at(firstMode == Mode::Directory ? "entry/" : "entry"), (TreeEntry{firstMode, firstHash}));
+                    EXPECT_EQ(
+                        tree.at(secondMode == Mode::Directory ? "entry0/" : "entry0"),
+                        (TreeEntry{secondMode, secondHash}));
+                }
+                ++cases;
+            }
+    EXPECT_EQ(cases, 32u);
+}
+
+TEST(MerkleHash, everyLegalNameBytePreservesGitDirectoryOrderingAndModeBytes)
+{
+    const std::array modes{Mode::Directory, Mode::Regular, Mode::Executable, Mode::Symlink};
+    const std::array<std::string_view, 4> modeBytes{"40000", "100644", "100755", "120000"};
+    const auto firstHash = merkle::blobId("first");
+    const auto secondHash = merkle::blobId("second");
+    auto record = [](std::string_view mode, std::string_view name, const Hash & hash) {
+        return std::string(mode) + ' ' + std::string(name) + '\0'
+               + std::string(reinterpret_cast<const char *>(hash.hash), hash.hashSize);
+    };
+    size_t cases = 0;
+    for (size_t first = 0; first < modes.size(); ++first)
+        for (size_t second = 0; second < modes.size(); ++second)
+            for (unsigned byte = 1; byte <= 255; ++byte) {
+                if (byte == '/')
+                    continue;
+                SCOPED_TRACE(fmt("first=%d second=%d byte=%d", first, second, byte));
+                const auto longerName = std::string("x") + static_cast<char>(byte);
+                merkle::Tree tree;
+                merkle::insertEntry(tree, longerName, {modes[second], secondHash});
+                merkle::insertEntry(tree, "x", {modes[first], firstHash});
+                auto shortRecord = record(modeBytes[first], "x", firstHash);
+                auto longRecord = record(modeBytes[second], longerName, secondHash);
+                /* Git compares the next byte with '/' for a directory,
+                   and with the end of the name for every other mode. */
+                auto expected =
+                    modes[first] == Mode::Directory && byte < '/' ? longRecord + shortRecord : shortRecord + longRecord;
+                EXPECT_EQ(merkle::serialiseTree(tree), expected);
+                ++cases;
+            }
+    EXPECT_EQ(cases, 4064u);
 }
 
 /* (2) The object hash: a directory's tree id, a plain file's blob id, and

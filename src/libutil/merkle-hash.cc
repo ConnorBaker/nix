@@ -98,8 +98,14 @@ void insertEntry(Tree & tree, std::string_view name, const TreeEntry & entry)
         || name.find('\0') != std::string_view::npos)
         throw Error("invalid tree entry name '%s'", name);
     std::string key(name);
-    if (entry.mode == Mode::Directory)
+    /* The trailing slash orders directories; it does not make a second
+       child name. Reject either encoding of an existing logical name. */
+    if (entry.mode == Mode::Directory) {
+        if (tree.contains(key))
+            throw Error("duplicate tree entry name '%s'", name);
         key += '/';
+    } else if (tree.contains(key + '/'))
+        throw Error("duplicate tree entry name '%s'", name);
     if (!tree.emplace(std::move(key), entry).second)
         throw Error("duplicate tree entry name '%s'", name);
 }

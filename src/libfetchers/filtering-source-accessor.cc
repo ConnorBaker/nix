@@ -13,16 +13,14 @@ std::optional<std::filesystem::path> FilteringSourceAccessor::getPhysicalPath(co
 {
     auto owner = weak_from_this().lock();
     checkAccess(path);
-    auto inner = next;
-    return inner->getPhysicalPath(prefix / path);
+    return next->getPhysicalPath(prefix / path);
 }
 
 void FilteringSourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
 {
     auto owner = weak_from_this().lock();
     checkAccess(path);
-    auto inner = next;
-    return inner->readFile(prefix / path, sink, sizeCallback);
+    return next->readFile(prefix / path, sink, sizeCallback);
 }
 
 bool FilteringSourceAccessor::pathExists(const CanonPath & path)
@@ -30,8 +28,7 @@ bool FilteringSourceAccessor::pathExists(const CanonPath & path)
     auto owner = weak_from_this().lock();
     if (!isAllowed(path))
         return false;
-    auto inner = next;
-    return inner->pathExists(prefix / path);
+    return next->pathExists(prefix / path);
 }
 
 std::optional<SourceAccessor::Stat> FilteringSourceAccessor::maybeLstat(const CanonPath & path)
@@ -39,16 +36,14 @@ std::optional<SourceAccessor::Stat> FilteringSourceAccessor::maybeLstat(const Ca
     auto owner = weak_from_this().lock();
     if (!isAllowed(path))
         return std::nullopt;
-    auto inner = next;
-    return inner->maybeLstat(prefix / path);
+    return next->maybeLstat(prefix / path);
 }
 
 SourceAccessor::Stat FilteringSourceAccessor::lstat(const CanonPath & path)
 {
     auto owner = weak_from_this().lock();
     checkAccess(path);
-    auto inner = next;
-    return inner->lstat(prefix / path);
+    return next->lstat(prefix / path);
 }
 
 SourceAccessor::DirEntries FilteringSourceAccessor::readDirectory(const CanonPath & path)
@@ -146,8 +141,7 @@ std::string FilteringSourceAccessor::readLink(const CanonPath & path)
 {
     auto owner = weak_from_this().lock();
     checkAccess(path);
-    auto inner = next;
-    return inner->readLink(prefix / path);
+    return next->readLink(prefix / path);
 }
 
 std::string FilteringSourceAccessor::showPath(const CanonPath & path)

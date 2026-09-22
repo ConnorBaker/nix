@@ -1,6 +1,8 @@
 #include "nix/util/source-accessor.hh"
+#include "nix/util/finally.hh"
+#include "nix/util/sync.hh"
 
-#include <boost/unordered/concurrent_flat_map.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
 
 namespace nix {
 
@@ -10,8 +12,17 @@ class CachingSourceAccessor : public SourceAccessor
 {
     ref<SourceAccessor> next;
 
-    boost::concurrent_flat_map<CanonPath, Stat> lstatCache;
-    boost::concurrent_flat_map<CanonPath, std::string> readLinkCache;
+    struct Caches
+    {
+        boost::unordered_flat_map<CanonPath, Stat> lstat;
+        boost::unordered_flat_map<CanonPath, std::string> readLink;
+        boost::unordered_flat_map<CanonPath, std::optional<std::pair<CanonPath, std::string>>> fingerprint;
+    };
+
+    /* A miss retains the observed state while calling the child. If that
+       call invalidates this view, its answer only populates the retired
+       state, never the new view's cache. No child runs under the lock. */
+    Sync<std::shared_ptr<Caches>> caches{std::make_shared<Caches>()};
 
     void anchor() override {};
 
@@ -30,8 +41,13 @@ public:
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
     {
-        if (auto res = getConcurrent(lstatCache, path))
-            return *res;
+        std::shared_ptr<Caches> observed;
+        {
+            auto state = caches.lock();
+            if (auto i = (*state)->lstat.find(path); i != (*state)->lstat.end())
+                return i->second;
+            observed = *state;
+        }
 
         auto owner = weak_from_this().lock();
         auto st = next->maybeLstat(path);
@@ -39,19 +55,30 @@ public:
             return std::nullopt;
 
         /* Never evict, the evaluator better keep positive lookups cached. */
-        lstatCache.emplace(path, *st);
+        {
+            auto state = caches.lock();
+            observed->lstat.emplace(path, *st);
+        }
         return st;
     }
 
     Stat lstat(const CanonPath & path) override
     {
-        if (auto res = getConcurrent(lstatCache, path))
-            return *res;
+        std::shared_ptr<Caches> observed;
+        {
+            auto state = caches.lock();
+            if (auto i = (*state)->lstat.find(path); i != (*state)->lstat.end())
+                return i->second;
+            observed = *state;
+        }
 
         auto owner = weak_from_this().lock();
         auto st = next->lstat(path);
         /* Never evict, the evaluator better keep positive lookups cached. */
-        lstatCache.emplace(path, st);
+        {
+            auto state = caches.lock();
+            observed->lstat.emplace(path, st);
+        }
         return st;
     }
 
@@ -71,13 +98,21 @@ public:
 
     std::string readLink(const CanonPath & path) override
     {
-        if (auto res = getConcurrent(readLinkCache, path))
-            return *res;
+        std::shared_ptr<Caches> observed;
+        {
+            auto state = caches.lock();
+            if (auto i = (*state)->readLink.find(path); i != (*state)->readLink.end())
+                return i->second;
+            observed = *state;
+        }
 
         auto owner = weak_from_this().lock();
         auto target = next->readLink(path);
         /* Never evict, the evaluator better keep positive lookups cached. */
-        readLinkCache.emplace(path, target);
+        {
+            auto state = caches.lock();
+            observed->readLink.emplace(path, target);
+        }
         return target;
     }
 
@@ -97,10 +132,16 @@ public:
 
     void invalidateCache() override
     {
-        lstatCache.clear();
-        readLinkCache.clear();
-        auto inner = next;
-        inner->invalidateCache();
+        auto owner = weak_from_this().lock();
+        auto replacement = std::make_shared<Caches>();
+        /* Observations made while the child invalidates still belong to
+           the old view. Publish the empty cache on completion, including
+           exceptional completion, after those child caches are dropped. */
+        Finally publish{[&] {
+            auto state = caches.lock();
+            state->swap(replacement);
+        }};
+        next->invalidateCache();
     }
 
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
@@ -111,8 +152,22 @@ public:
 
     std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
-        auto inner = next;
-        return inner->getFingerprint(path);
+        std::shared_ptr<Caches> observed;
+        {
+            auto state = caches.lock();
+            if (auto i = (*state)->fingerprint.find(path); i != (*state)->fingerprint.end())
+                return i->second;
+            observed = *state;
+        }
+
+        auto owner = weak_from_this().lock();
+        auto identity = next->getFingerprint(path);
+        {
+            auto state = caches.lock();
+            /* No identity is not a claim that the node is absent. */
+            observed->fingerprint.emplace(path, identity);
+        }
+        return identity;
     }
 
     std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override

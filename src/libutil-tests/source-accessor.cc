@@ -1,4 +1,6 @@
 #include "nix/util/fs-sink.hh"
+#include "nix/util/archive.hh"
+#include "nix/util/memory-source-accessor.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/processes.hh"
 #include "nix/util/tests/gmock-matchers.hh"
@@ -325,7 +327,244 @@ struct CachingCallbackException
 struct CachingOwnershipLost
 {};
 
+struct CachingObservationProbe : CachingOwnershipProbe
+{
+    unsigned observations = 0;
+    unsigned value = 1;
+    std::optional<std::string> name = "first";
+    std::function<void()> onInvalidate;
+
+    template<typename T>
+    T observe(T result)
+    {
+        ++observations;
+        auto callback = onCall;
+        if (callback)
+            callback();
+        return result;
+    }
+
+    std::optional<Stat> maybeLstat(const CanonPath &) override
+    {
+        return observe(absent ? std::nullopt : std::optional{Stat{.type = tRegular, .fileSize = value}});
+    }
+
+    Stat lstat(const CanonPath &) override
+    {
+        return observe(Stat{.type = tRegular, .fileSize = value});
+    }
+
+    std::string readLink(const CanonPath &) override
+    {
+        return observe(fmt("target-%d", value));
+    }
+
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
+    {
+        return observe(name ? std::optional{std::pair{path, *name}} : std::nullopt);
+    }
+
+    void invalidateCache() override
+    {
+        auto callback = onInvalidate;
+        if (callback)
+            callback();
+    }
+};
+
 } // namespace
+
+TEST(CachingSourceAccessor, optionalNamesAreObservationsOfTheCurrentView)
+{
+    const std::optional<std::string> names[]{std::nullopt, "", "named"};
+    for (const auto & path : {CanonPath::root, CanonPath("sub/file")})
+        for (const auto & before : names)
+            for (const auto & after : names) {
+                SCOPED_TRACE(
+                    ::testing::Message() << "path=" << path << " before=" << before.value_or("<none>")
+                                         << " after=" << after.value_or("<none>"));
+                auto child = make_ref<CachingObservationProbe>();
+                auto cached = makeCachingSourceAccessor(child);
+                auto expected = [&](const auto & name) {
+                    return name ? std::optional{std::pair{path, *name}} : std::nullopt;
+                };
+                child->name = before;
+                EXPECT_EQ(cached->getFingerprint(path), expected(before));
+                EXPECT_EQ(cached->getFingerprint(path), expected(before));
+                EXPECT_EQ(child->observations, 1u);
+
+                child->name = after;
+                cached->invalidateCache();
+                EXPECT_EQ(cached->getFingerprint(path), expected(after));
+                EXPECT_EQ(cached->getFingerprint(path), expected(after));
+                EXPECT_EQ(child->observations, 2u);
+            }
+}
+
+TEST(CachingSourceAccessor, anUnnamedNodeIsNotAnAbsentNode)
+{
+    auto child = make_ref<CachingObservationProbe>();
+    child->name = std::nullopt;
+    child->absent = true;
+    auto cached = makeCachingSourceAccessor(child);
+    CanonPath path("entry");
+
+    EXPECT_FALSE(cached->getFingerprint(path));
+    EXPECT_FALSE(cached->getFingerprint(path));
+    EXPECT_EQ(child->observations, 1u);
+    EXPECT_FALSE(cached->maybeLstat(path));
+    EXPECT_FALSE(cached->maybeLstat(path));
+    EXPECT_EQ(child->observations, 3u);
+
+    /* Positive lookup caching permits previously absent nodes to appear. */
+    child->absent = false;
+    EXPECT_EQ(cached->maybeLstat(path)->fileSize, 1u);
+    EXPECT_EQ(cached->maybeLstat(path)->fileSize, 1u);
+    EXPECT_FALSE(cached->getFingerprint(path));
+    EXPECT_EQ(child->observations, 4u);
+}
+
+TEST(CachingSourceAccessor, invalidationDoesNotResurrectAnInFlightObservation)
+{
+    enum class Point { MaybeStat, MissingStat, Stat, Link, Named, Unnamed, EmptyName };
+    constexpr Point points[]{
+        Point::MaybeStat, Point::MissingStat, Point::Stat, Point::Link, Point::Named, Point::Unnamed, Point::EmptyName};
+
+    /* Seven successful result shapes × three invalidation schedules ×
+       normal/exceptional completion of the original observation. */
+    for (auto point : points)
+        for (unsigned schedule = 0; schedule != 3; ++schedule)
+            for (bool throwing : {false, true}) {
+                SCOPED_TRACE(
+                    ::testing::Message() << "point=" << static_cast<int>(point) << " schedule=" << schedule
+                                         << " throwing=" << throwing);
+                auto child = make_ref<CachingObservationProbe>();
+                child->absent = point == Point::MissingStat;
+                child->name = point == Point::Unnamed     ? std::nullopt
+                              : point == Point::EmptyName ? std::optional<std::string>("")
+                                                          : std::optional<std::string>("first");
+                auto cached = makeCachingSourceAccessor(child);
+                CanonPath path("entry");
+                auto read = [&]() -> std::string {
+                    switch (point) {
+                    case Point::MaybeStat:
+                    case Point::MissingStat:
+                        if (auto st = cached->maybeLstat(path))
+                            return std::to_string(*st->fileSize);
+                        return "missing";
+                    case Point::Stat:
+                        return std::to_string(*cached->lstat(path).fileSize);
+                    case Point::Link:
+                        return cached->readLink(path);
+                    case Point::Named:
+                    case Point::Unnamed:
+                    case Point::EmptyName:
+                        if (auto identity = cached->getFingerprint(path)) {
+                            EXPECT_EQ(identity->first, path);
+                            return "named:" + identity->second;
+                        }
+                        return "unnamed";
+                    }
+                    std::abort();
+                };
+                auto expected = [&](unsigned value) {
+                    if (point == Point::Link)
+                        return fmt("target-%d", value);
+                    if (point == Point::Named || point == Point::Unnamed || point == Point::EmptyName)
+                        return fmt("named:version-%d", value);
+                    return std::to_string(value);
+                };
+
+                child->onCall = [&] {
+                    /* Clear the callback before any nested observation. */
+                    child->onCall = {};
+                    child->value = 2;
+                    child->name = "version-2";
+                    child->absent = false;
+                    if (schedule) {
+                        child->onInvalidate = [&] {
+                            child->onInvalidate = {};
+                            if (schedule == 2)
+                                EXPECT_EQ(read(), expected(2));
+                            child->value = 3;
+                            child->name = "version-3";
+                            cached->invalidateCache();
+                        };
+                    }
+                    cached->invalidateCache();
+                    if (throwing)
+                        throw CachingCallbackException{};
+                };
+
+                if (throwing)
+                    EXPECT_THROW(read(), CachingCallbackException);
+                else
+                    EXPECT_NO_THROW(read());
+                EXPECT_EQ(read(), expected(schedule ? 3 : 2));
+                EXPECT_EQ(read(), expected(schedule ? 3 : 2));
+                EXPECT_EQ(child->observations, schedule == 2 ? 3u : 2u);
+            }
+}
+
+TEST(CachingSourceAccessor, invalidationPublishesAfterTheChildDropsItsStaleFacts)
+{
+    enum class Point { MaybeStat, Stat, Link, Named, Unnamed, EmptyName };
+    constexpr Point points[]{
+        Point::MaybeStat, Point::Stat, Point::Link, Point::Named, Point::Unnamed, Point::EmptyName};
+    for (auto point : points)
+        for (bool throwing : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "point=" << static_cast<int>(point) << " throwing=" << throwing);
+            auto child = make_ref<CachingObservationProbe>();
+            if (point == Point::Unnamed)
+                child->name = std::nullopt;
+            else if (point == Point::EmptyName)
+                child->name = "";
+            auto cached = makeCachingSourceAccessor(child);
+            auto read = [&](const CanonPath & path) -> std::string {
+                switch (point) {
+                case Point::MaybeStat:
+                    return std::to_string(*cached->maybeLstat(path)->fileSize);
+                case Point::Stat:
+                    return std::to_string(*cached->lstat(path).fileSize);
+                case Point::Link:
+                    return cached->readLink(path);
+                case Point::Named:
+                case Point::Unnamed:
+                case Point::EmptyName:
+                    if (auto identity = cached->getFingerprint(path)) {
+                        EXPECT_EQ(identity->first, path);
+                        return "named:" + identity->second;
+                    }
+                    return "unnamed";
+                }
+                std::abort();
+            };
+            CanonPath existing("existing"), fresh("fresh");
+            auto before = read(existing);
+            child->onInvalidate = [&] {
+                /* Both an existing cache hit and a fresh observation can
+                   still see stale child data during its invalidation. */
+                EXPECT_EQ(read(existing), before);
+                EXPECT_EQ(read(fresh), before);
+                child->value = 2;
+                child->name = "second";
+                if (throwing)
+                    throw CachingCallbackException{};
+            };
+            if (throwing)
+                EXPECT_THROW(cached->invalidateCache(), CachingCallbackException);
+            else
+                EXPECT_NO_THROW(cached->invalidateCache());
+            auto after = point == Point::Link                                ? "target-2"
+                         : point == Point::MaybeStat || point == Point::Stat ? "2"
+                                                                             : "named:second";
+            for (const auto & path : {existing, fresh}) {
+                EXPECT_EQ(read(path), after);
+                EXPECT_EQ(read(path), after);
+            }
+            EXPECT_EQ(child->observations, 4u);
+        }
+}
 
 TEST(CachingSourceAccessor, delegatedCallbacksKeepSelectedOwnersAlive)
 {
@@ -385,7 +624,8 @@ TEST(CachingSourceAccessor, delegatedCallbacksKeepSelectedOwnersAlive)
                         owner.reset();
                     auto childAlive = !weakChild.expired();
                     bool needsWrapper = point == Point::MaybeStat || point == Point::MissingStat || point == Point::Stat
-                                        || point == Point::Link;
+                                        || point == Point::Link || point == Point::Fingerprint
+                                        || point == Point::Invalidate;
                     auto ownerAlive = !weakOwner.expired();
                     EXPECT_TRUE(childAlive);
                     if (needsWrapper)
@@ -486,6 +726,221 @@ TEST(CachingSourceAccessor, delegatedCallbacksKeepSelectedOwnersAlive)
                 EXPECT_TRUE(weakOwner.expired());
                 EXPECT_TRUE(weakChild.expired());
             }
+}
+
+TEST(SourceAccessor, compoundDefaultsOwnTheirCallbackContinuations)
+{
+    enum class Event { Stat, Directory, Read, Link, Display, Scope, Sink, Filter };
+    enum class Operation { Stat, Scope, Entries, Resolve, Dump };
+    enum class Ownership { Borrowed, Retained, Released };
+
+    struct CallbackStopped
+    {};
+
+    struct OwnershipLost
+    {};
+
+    struct Probe : MemorySourceAccessor
+    {
+        std::function<void(Event)> observe;
+
+        void notify(Event event)
+        {
+            auto callback = observe;
+            callback(event);
+        }
+
+        std::optional<Stat> maybeLstat(const CanonPath & path) override
+        {
+            auto result = MemorySourceAccessor::maybeLstat(path);
+            notify(Event::Stat);
+            return result;
+        }
+
+        /* Traversal gets a primitive stat with no nested lifetime guard;
+           the stat case below invokes the base composition explicitly. */
+        Stat lstat(const CanonPath & path) override
+        {
+            auto result = MemorySourceAccessor::maybeLstat(path).value();
+            notify(Event::Stat);
+            return result;
+        }
+
+        DirEntries readDirectory(const CanonPath & path) override
+        {
+            auto result = MemorySourceAccessor::readDirectory(path);
+            notify(Event::Directory);
+            return result;
+        }
+
+        void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            StringSink result;
+            MemorySourceAccessor::readFile(path, result, [](uint64_t) {});
+            notify(Event::Read);
+            sizeCallback(result.s.size());
+            sink(result.s);
+        }
+
+        std::string readLink(const CanonPath & path) override
+        {
+            auto result = MemorySourceAccessor::readLink(path);
+            notify(Event::Link);
+            return result;
+        }
+
+        std::string showPath(const CanonPath & path) override
+        {
+            auto result = "shown:" + path.abs();
+            notify(Event::Display);
+            return result;
+        }
+    };
+
+    auto reference = make_ref<MemorySourceAccessor>();
+    reference->addFile(CanonPath("plain"), "bytes");
+    reference->addFile(CanonPath("dir/file"), "bytes");
+    MemorySink memory{*reference};
+    memory.createSymlink(CanonPath("dir/link"), "file");
+    memory.createSymlink(CanonPath("relative"), "dir");
+    memory.createSymlink(CanonPath("absolute"), "/dir");
+    auto dumpedTree = *reference->open(CanonPath("dir"), std::nullopt);
+
+    struct Case
+    {
+        Operation operation;
+        const char * path;
+        const char * expected;
+        SymlinkResolution mode = SymlinkResolution::Full;
+    };
+
+    const Case cases[]{
+        {Operation::Stat, "plain", "regular"},
+        {Operation::Stat, "missing", "missing"},
+        {Operation::Scope, "dir", "scope"},
+        {Operation::Entries, "dir", "file,link,"},
+        {Operation::Resolve, "dir/file", "/dir/file"},
+        {Operation::Resolve, "missing/file", "/missing/file"},
+        {Operation::Resolve, "relative/file", "/dir/file"},
+        {Operation::Resolve, "absolute/file", "/dir/file"},
+        {Operation::Resolve, "relative", "/dir"},
+        {Operation::Resolve, "relative/file", "/dir/file", SymlinkResolution::Ancestors},
+        {Operation::Resolve, "relative", "/relative", SymlinkResolution::Ancestors},
+        {Operation::Dump, "dir", "dumped"},
+    };
+    for (const auto & test : cases) {
+        CanonPath path(test.path);
+        auto run = [&](std::optional<size_t> at, Ownership ownership, bool stop) {
+            std::vector<Event> observed;
+            std::shared_ptr<Probe> owner;
+            std::unique_ptr<Probe> borrowed;
+            if (ownership == Ownership::Borrowed)
+                borrowed = std::make_unique<Probe>();
+            else
+                owner = std::make_shared<Probe>();
+            std::weak_ptr<SourceAccessor> weakOwner = owner;
+            SourceAccessor * accessor = owner ? owner.get() : borrowed.get();
+            auto * probe = owner ? owner.get() : borrowed.get();
+            probe->root = reference->root;
+            auto observe = [&](Event event) {
+                observed.push_back(event);
+                if (at != observed.size() - 1)
+                    return;
+                if (ownership == Ownership::Released)
+                    owner.reset();
+                if (ownership != Ownership::Borrowed) {
+                    auto alive = !weakOwner.expired();
+                    EXPECT_TRUE(alive);
+                    /* The probe copied all results and its callback before
+                       notification. Abort before a removed base guard could
+                       resume through a destroyed accessor. */
+                    if (!alive)
+                        throw OwnershipLost{};
+                }
+                if (stop)
+                    throw CallbackStopped{};
+            };
+            probe->observe = observe;
+            auto invoke = [&]() -> std::string {
+                switch (test.operation) {
+                case Operation::Stat:
+                    try {
+                        return accessor->SourceAccessor::lstat(path).typeString();
+                    } catch (FileNotFound &) {
+                        return "missing";
+                    }
+                case Operation::Scope:
+                    accessor->readDirectory(path, [&](SourceAccessor & scoped, const CanonPath & relative) {
+                        observe(Event::Scope);
+                        EXPECT_EQ(&scoped, accessor);
+                        EXPECT_EQ(relative, path);
+                    });
+                    return "scope";
+                case Operation::Entries: {
+                    std::string names;
+                    accessor->readDirectoryWithEntries(
+                        path,
+                        [&](SourceAccessor & scoped,
+                            const CanonPath & relative,
+                            const SourceAccessor::DirEntries & entries) {
+                            observe(Event::Scope);
+                            EXPECT_EQ(&scoped, accessor);
+                            EXPECT_EQ(relative, path);
+                            for (const auto & [name, type] : entries)
+                                names += name + ",";
+                        });
+                    return names;
+                }
+                case Operation::Resolve:
+                    return accessor->resolveSymlinks(path, test.mode).abs();
+                case Operation::Dump: {
+                    std::string nar;
+                    LambdaSink sink{[&](std::string_view bytes) {
+                        observe(Event::Sink);
+                        nar += bytes;
+                    }};
+                    PathFilter filter = [&](const std::string &) {
+                        observe(Event::Filter);
+                        return true;
+                    };
+                    accessor->dumpPath(path, sink, filter);
+                    MemorySourceAccessor restored;
+                    MemorySink destination{restored};
+                    StringSource source{nar};
+                    parseDump(destination, source);
+                    EXPECT_EQ(restored.root, dumpedTree);
+                    return "dumped";
+                }
+                }
+                throw Error("unhandled compound accessor operation");
+            };
+            if (stop)
+                EXPECT_THROW(invoke(), CallbackStopped);
+            else
+                EXPECT_NO_THROW(EXPECT_EQ(invoke(), test.expected));
+            if (ownership != Ownership::Borrowed)
+                EXPECT_EQ(weakOwner.expired(), ownership == Ownership::Released && at.has_value());
+            owner.reset();
+            EXPECT_TRUE(weakOwner.expired());
+            return observed;
+        };
+        /* Results come from the explicit tree above, including an independent
+           NAR parse. The baseline counts callback boundaries only: exercise
+           every boundary with shared or borrowed lifetime and both outcomes. */
+        auto baseline = run(std::nullopt, Ownership::Retained, false);
+        for (size_t at = 0; at < baseline.size(); ++at)
+            for (auto ownership : {Ownership::Borrowed, Ownership::Retained, Ownership::Released})
+                for (bool stop : {false, true}) {
+                    SCOPED_TRACE(
+                        ::testing::Message() << "operation=" << int(test.operation) << " path=" << path.abs()
+                                             << " at=" << at << " ownership=" << int(ownership) << " stop=" << stop);
+                    auto observed = run(at, ownership, stop);
+                    auto expected = baseline;
+                    if (stop)
+                        expected.resize(at + 1);
+                    EXPECT_EQ(observed, expected);
+                }
+    }
 }
 
 } // namespace nix

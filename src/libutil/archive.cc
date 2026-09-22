@@ -198,6 +198,7 @@ struct NarWriter : NodeVisitor<std::monostate>
 
 void SourceAccessor::dumpPath(const CanonPath & path, Sink & sink, PathFilter & filter)
 {
+    auto keepAlive = weak_from_this().lock();
     sink << narVersionMagic1;
     NarWriter writer{sink};
     traverse(*this, path, filter, writer);

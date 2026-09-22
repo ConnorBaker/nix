@@ -5317,6 +5317,237 @@ TEST_F(LocalStoreObjectsTest, parseTreeBodyErrorsNameTheTree)
     EXPECT_THAT([&] { parseTreeBody(id, std::string("777777 name\0", 12) + std::string(32, 'h')); }, named);
 }
 
+static std::string rawObjectTreeEntry(merkle::Mode mode, std::string_view name, const Hash & hash)
+{
+    return fmt("%o %s", static_cast<RawMode>(mode), name) + '\0'
+           + std::string(reinterpret_cast<const char *>(hash.hash), hash.hashSize);
+}
+
+TEST_F(LocalStoreObjectsTest, parseTreeBodyRequiresUniqueLogicalNamesInEveryModePair)
+{
+    using merkle::Mode;
+    const std::array modes{Mode::Directory, Mode::Regular, Mode::Executable, Mode::Symlink};
+    const auto firstHash = merkle::blobId("first");
+    const auto secondHash = merkle::blobId("second");
+    size_t cases = 0;
+    for (auto firstMode : modes)
+        for (auto secondMode : modes)
+            for (bool sameName : {false, true}) {
+                SCOPED_TRACE(fmt("first=%o second=%o same=%d", (RawMode) firstMode, (RawMode) secondMode, sameName));
+                std::string secondName = sameName ? "entry" : "other";
+                const auto body = rawObjectTreeEntry(firstMode, "entry", firstHash)
+                                  + rawObjectTreeEntry(secondMode, secondName, secondHash);
+                const auto id = merkle::treeId(body);
+                if (sameName) {
+                    EXPECT_THAT(
+                        [&] { parseTreeBody(id, body); },
+                        ::testing::ThrowsMessage<Error>(::testing::HasSubstr(GitObjectStore::idString(id))));
+                } else {
+                    auto tree = parseTreeBody(id, body);
+                    EXPECT_EQ(tree.size(), 2u);
+                    EXPECT_EQ(merkle::serialiseTree(tree), body);
+                    EXPECT_EQ(
+                        tree.at(firstMode == Mode::Directory ? "entry/" : "entry"),
+                        (merkle::TreeEntry{firstMode, firstHash}));
+                    EXPECT_EQ(
+                        tree.at(secondName + (secondMode == Mode::Directory ? "/" : "")),
+                        (merkle::TreeEntry{secondMode, secondHash}));
+                }
+                ++cases;
+            }
+    EXPECT_EQ(cases, 32u);
+}
+
+TEST_F(LocalStoreObjectsTest, parseTreeBodyAdmitsOnlyTheTwoSingletonSyntheticRootForms)
+{
+    using merkle::Mode;
+    const std::array modes{Mode::Directory, Mode::Regular, Mode::Executable, Mode::Symlink};
+    const auto hash = merkle::blobId("root");
+    size_t cases = 0;
+    for (auto rootMode : modes) {
+        const auto root = rawObjectTreeEntry(rootMode, ".", hash);
+        const auto id = merkle::treeId(root);
+        if (rootMode == Mode::Executable || rootMode == Mode::Symlink) {
+            auto tree = parseTreeBody(id, root);
+            ASSERT_EQ(tree.size(), 1u);
+            EXPECT_EQ(tree.at("."), (merkle::TreeEntry{rootMode, hash}));
+        } else
+            EXPECT_THROW(parseTreeBody(id, root), Error);
+        ++cases;
+        for (auto otherMode : modes)
+            for (bool duplicate : {false, true})
+                for (bool rootFirst : {false, true}) {
+                    SCOPED_TRACE(
+                        fmt("root=%o other=%o duplicate=%d rootFirst=%d",
+                            (RawMode) rootMode,
+                            (RawMode) otherMode,
+                            duplicate,
+                            rootFirst));
+                    const auto other = rawObjectTreeEntry(otherMode, duplicate ? "." : "child", hash);
+                    const auto body = rootFirst ? root + other : other + root;
+                    EXPECT_THROW(parseTreeBody(merkle::treeId(body), body), Error);
+                    ++cases;
+                }
+    }
+    EXPECT_EQ(cases, 68u);
+}
+
+TEST_F(LocalStoreObjectsTest, parseTreeBodyRequiresCanonicalModeSpellings)
+{
+    const std::array<std::string_view, 4> modes{"40000", "100644", "100755", "120000"};
+    const auto hash = merkle::blobId("canonical mode");
+    const auto rawHash = std::string(reinterpret_cast<const char *>(hash.hash), hash.hashSize);
+    size_t cases = 0;
+    for (size_t mode = 0; mode < modes.size(); ++mode) {
+        std::vector<std::string> spellings{
+            std::string(modes[mode]), "0" + std::string(modes[mode]), "00" + std::string(modes[mode])};
+        /* Space terminates the mode field. Every other byte is tested as
+           a suffix, including NUL, octal/non-octal digits and high bytes. */
+        for (unsigned byte = 0; byte <= 255; ++byte)
+            if (byte != ' ')
+                spellings.push_back(std::string(modes[mode]) + static_cast<char>(byte));
+        for (size_t spelling = 0; spelling < spellings.size(); ++spelling)
+            for (const auto name : {"child", "."}) {
+                SCOPED_TRACE(fmt("mode=%d spelling=%d name=%s", mode, spelling, name));
+                const auto body = spellings[spelling] + ' ' + name + '\0' + rawHash;
+                const auto id = merkle::treeId(body);
+                if (spelling == 0 && (std::string_view{name} != "." || mode >= 2)) {
+                    const auto tree = parseTreeBody(id, body);
+                    EXPECT_EQ(merkle::serialiseTree(tree), body);
+                } else {
+                    EXPECT_THAT(
+                        [&] { parseTreeBody(id, body); },
+                        ::testing::ThrowsMessage<Error>(::testing::HasSubstr(GitObjectStore::idString(id))));
+                }
+                ++cases;
+            }
+    }
+    EXPECT_EQ(cases, 2064u);
+}
+
+TEST_F(LocalStoreObjectsTest, parseTreeBodyRequiresCanonicalGitEntryOrder)
+{
+    const std::array<std::string_view, 4> modes{"40000", "100644", "100755", "120000"};
+    const std::array<std::string_view, 3> names{"a", "a.", "b"};
+    const auto hash = merkle::blobId("canonical order");
+    const auto rawHash = std::string(reinterpret_cast<const char *>(hash.hash), hash.hashSize);
+    size_t cases = 0;
+    for (size_t first = 0; first < modes.size(); ++first)
+        for (size_t second = 0; second < modes.size(); ++second)
+            for (size_t third = 0; third < modes.size(); ++third) {
+                const std::array selected{first, second, third};
+                std::array<unsigned, 3> order{0, 1, 2};
+                /* The first name is a prefix of the second. Git places
+                   directory a/ after a., and every other a before a.. */
+                const std::array<unsigned, 3> canonical = first == 0 ? std::array{1u, 0u, 2u} : std::array{0u, 1u, 2u};
+                do {
+                    SCOPED_TRACE(
+                        fmt("modes=%d,%d,%d order=%d%d%d", first, second, third, order[0], order[1], order[2]));
+                    std::string body;
+                    for (auto child : order)
+                        body += std::string(modes[selected[child]]) + ' ' + std::string(names[child]) + '\0' + rawHash;
+                    const auto id = merkle::treeId(body);
+                    if (order == canonical) {
+                        const auto tree = parseTreeBody(id, body);
+                        EXPECT_EQ(merkle::serialiseTree(tree), body);
+                    } else {
+                        EXPECT_THAT(
+                            [&] { parseTreeBody(id, body); },
+                            ::testing::ThrowsMessage<Error>(::testing::HasSubstr(GitObjectStore::idString(id))));
+                    }
+                    ++cases;
+                } while (std::next_permutation(order.begin(), order.end()));
+            }
+    EXPECT_EQ(cases, 384u);
+}
+
+TEST_F(LocalStoreObjectsTest, noncanonicalTreeBodiesCannotSupplyAKnownMaterialisedRoot)
+{
+    using merkle::Mode;
+    auto source = treeAccessor({{"a", "first", 'l'}, {"b", "second", 'l'}});
+    const auto expected = objectHashOf(*source, CanonPath::root).root;
+    const auto firstBlob = merkle::blobId("first");
+    const auto secondBlob = merkle::blobId("second");
+    const auto first = rawObjectTreeEntry(Mode::Symlink, "a", firstBlob);
+    const auto second = rawObjectTreeEntry(Mode::Symlink, "b", secondBlob);
+    const std::array bodies{"0" + first + second, std::string("1200008") + first.substr(6) + second, second + first};
+    auto & objects = store->objects;
+    size_t cases = 0;
+    for (const auto & body : bodies) {
+        SCOPED_TRACE(fmt("case=%d", cases));
+        const auto id = merkle::treeId(body);
+        ASSERT_NE(id, expected.hash);
+        {
+            auto hold = objects.hold();
+            objects.putTree(id, body, hold);
+            objects.putBlob(firstBlob, false, "first", hold);
+            objects.putBlob(secondBlob, false, "second", hold);
+        }
+        EXPECT_EQ(objects.readVerifiedTree(id), std::nullopt);
+        auto counted = make_ref<CountingAccessor>(source);
+        auto destination = config->realStoreDir.get() / fmt("noncanonical-tree-%d", cases);
+        auto result = materialise(
+            destination,
+            SourcePath(counted),
+            [&](const CanonPath & path, const SourceAccessor::Stat &) -> std::optional<merkle::TreeEntry> {
+                if (path.isRoot())
+                    return merkle::TreeEntry{Mode::Directory, id};
+                return std::nullopt;
+            });
+        EXPECT_EQ(result.root, expected);
+        EXPECT_EQ(gitHash(destination), expected);
+        EXPECT_EQ(result.root, gitHash(destination)) << "the returned address must describe the materialised tree";
+        EXPECT_EQ(counted->links, 2u) << "an unusable known object falls back to the source";
+        ++cases;
+    }
+    EXPECT_EQ(cases, 3u);
+}
+
+TEST_F(LocalStoreObjectsTest, duplicateTreeRecordsAreUnusableAndPreventDestructiveSweep)
+{
+    using merkle::Mode;
+    const std::array modes{Mode::Directory, Mode::Regular, Mode::Executable, Mode::Symlink};
+    auto & objects = store->objects;
+    const auto emptyTree = merkle::treeId("");
+    const auto firstBlob = merkle::blobId("first");
+    const auto secondBlob = merkle::blobId("second");
+    const auto spareBlob = merkle::blobId("unreachable sentinel");
+    size_t cases = 0;
+    for (auto firstMode : modes)
+        for (auto secondMode : modes) {
+            SCOPED_TRACE(fmt("first=%o second=%o", (RawMode) firstMode, (RawMode) secondMode));
+            const auto firstHash = firstMode == Mode::Directory ? emptyTree : firstBlob;
+            const auto secondHash = secondMode == Mode::Directory ? emptyTree : secondBlob;
+            const auto body =
+                rawObjectTreeEntry(firstMode, "entry", firstHash) + rawObjectTreeEntry(secondMode, "entry", secondHash);
+            const auto id = merkle::treeId(body);
+            {
+                auto hold = objects.hold();
+                objects.putTree(emptyTree, "", hold);
+                objects.putTree(id, body, hold);
+                objects.putBlob(firstBlob, false, "first", hold);
+                objects.putBlob(secondBlob, false, "second", hold);
+                objects.putBlob(spareBlob, false, "unreachable sentinel", hold);
+            }
+            /* Hash verification alone cannot establish a directory map.
+               Readers decline it, and GC cannot use a collapsed map as
+               evidence that an omitted child or any other object is dead. */
+            EXPECT_EQ(objects.readVerifiedTree(id), std::nullopt);
+            const auto swept = objects.sweep([&](fun<void(const ObjectHash &)> live) {
+                live(ObjectHash{id});
+                return uint64_t{0};
+            });
+            EXPECT_EQ(swept.corruptTrees, 1u);
+            EXPECT_EQ(swept.treesRemoved, 0u);
+            EXPECT_EQ(swept.blobsRemoved, 0u);
+            EXPECT_TRUE(pathExists(objects.blobFile(firstBlob, false)));
+            EXPECT_TRUE(pathExists(objects.blobFile(secondBlob, false)));
+            EXPECT_TRUE(pathExists(objects.blobFile(spareBlob, false)));
+            ++cases;
+        }
+    EXPECT_EQ(cases, 16u);
+}
+
 /* An info naming no content -- no content address, no object hash, no
    asserted NAR hash -- is refused before anything is written: nothing
    below could verify what arrives.  With the NAR hash asserted the same
@@ -8299,8 +8530,9 @@ TEST_F(TempLocalStoreTest, invalidationAfterValidityBackendCannotBeUndoneByItsRe
 
 /* Public callback behavior when the caller releases the store-wide wrapper.
    Its physical child is private, so this is behavior coverage, not a weak
-   ownership observation or a deterministic negative control. Directory
-   accessors are borrowed only during their callback's dynamic extent. */
+   ownership observation or a deterministic negative control for the child.
+   The root scope borrows the wrapper itself and checks its owner before use.
+   Directory accessors are borrowed only during the callback's dynamic extent. */
 TEST_F(TempLocalStoreTest, storeAccessorDelegationSurvivesReleasingTheWrapperInCallbacks)
 {
     auto tree = make_ref<MemorySourceAccessor>();
@@ -8312,19 +8544,40 @@ TEST_F(TempLocalStoreTest, storeAccessorDelegationSurvivesReleasingTheWrapperInC
     struct CallbackStopped
     {};
 
-    for (unsigned operation = 0; operation != 4; ++operation)
+    struct RootBorrowLost
+    {};
+
+    for (unsigned operation = 0; operation != 6; ++operation)
         for (bool release : {false, true})
             for (bool stop : {false, true}) {
                 SCOPED_TRACE(fmt("operation=%d release=%d stop=%d", operation, release, stop));
                 auto view = store->getFSAccessor().get_ptr();
                 std::weak_ptr<SourceAccessor> outer = view;
+                bool rootScope = operation >= 4;
+                auto scopedPath = rootScope ? CanonPath::root : directory;
                 unsigned entered = 0;
                 auto callback = [&] {
                     ++entered;
                     if (release)
                         view.reset();
+                    if (rootScope) {
+                        EXPECT_FALSE(outer.expired());
+                        if (outer.expired())
+                            throw RootBorrowLost{}; // Do not resume through a dead borrowed accessor.
+                    }
                     if (stop)
                         throw CallbackStopped{};
+                };
+                auto checkEntries = [&](const SourceAccessor::DirEntries & entries) {
+                    if (rootScope)
+                        EXPECT_TRUE(entries.contains(object.to_string()));
+                    else {
+                        EXPECT_EQ(entries.size(), 1u);
+                        EXPECT_TRUE(entries.contains("file"));
+                    }
+                };
+                auto scopedFile = [&](const CanonPath & relative) {
+                    return (rootScope ? relative / directory : relative) / "file";
                 };
                 std::string bytes;
                 LambdaSink sink{[&](std::string_view data) {
@@ -8340,27 +8593,27 @@ TEST_F(TempLocalStoreTest, storeAccessorDelegationSurvivesReleasingTheWrapperInC
                             if (operation == 0)
                                 callback();
                         });
-                    else if (operation == 2)
-                        view->readDirectory(directory, [&](SourceAccessor & child, const CanonPath & relative) {
+                    else if (operation % 2 == 0)
+                        view->readDirectory(scopedPath, [&](SourceAccessor & child, const CanonPath & relative) {
                             callback();
                             auto entries = child.readDirectory(relative);
-                            EXPECT_EQ(entries.size(), 1u);
-                            EXPECT_TRUE(entries.contains("file"));
-                            bytes = child.readFile(relative / "file");
+                            checkEntries(entries);
+                            bytes = child.readFile(scopedFile(relative));
                         });
                     else
                         view->readDirectoryWithEntries(
-                            directory,
+                            scopedPath,
                             [&](SourceAccessor & child,
                                 const CanonPath & relative,
                                 const SourceAccessor::DirEntries & entries) {
                                 callback();
-                                EXPECT_EQ(entries.size(), 1u);
-                                EXPECT_TRUE(entries.contains("file"));
-                                bytes = child.readFile(relative / "file");
+                                checkEntries(entries);
+                                bytes = child.readFile(scopedFile(relative));
                             });
                 } catch (CallbackStopped &) {
                     stopped = true;
+                } catch (RootBorrowLost &) {
+                    // The failed ownership expectation is the safe negative-control verdict.
                 }
                 EXPECT_EQ(entered, 1u);
                 EXPECT_EQ(stopped, stop);

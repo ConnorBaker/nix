@@ -80,6 +80,7 @@ Hash SourceAccessor::hashPath(const CanonPath & path, PathFilter & filter, HashA
 
 SourceAccessor::Stat SourceAccessor::lstat(const CanonPath & path)
 {
+    auto keepAlive = weak_from_this().lock();
     if (auto st = maybeLstat(path))
         return *st;
     else
@@ -99,6 +100,7 @@ std::string SourceAccessor::showPath(const CanonPath & path)
 
 CanonPath SourceAccessor::resolveSymlinks(const CanonPath & path, SymlinkResolution mode)
 {
+    auto keepAlive = weak_from_this().lock();
     auto res = CanonPath::root;
 
     int linksAllowed = 1024;

@@ -293,6 +293,7 @@ TEST_F(EvalStateTest, mountInputInvalidatesPreviouslyObservedStoreNodes)
                 input.attrs.insert_or_assign("name", fmt("mount-cache-%d", serial++));
                 auto [storePath, hash] =
                     fetchToStore2(fetchSettings, *local, SourcePath{mounted}, FetchMode::DryRun, input.getName());
+                mounted->fingerprint = "mount-cache:" + hash.to_string(HashFormat::SRI, true);
                 auto logical = CanonPath(local->printStorePath(storePath));
                 ASSERT_FALSE(getFSSourceAccessor()->pathExists(logical));
                 ASSERT_FALSE(local->isValidPath(storePath));
@@ -310,7 +311,11 @@ TEST_F(EvalStateTest, mountInputInvalidatesPreviouslyObservedStoreNodes)
                 if (observed && observed->type == SourceAccessor::tSymlink)
                     EXPECT_EQ(nested.rootFS->readLink(logical), "before");
 
+                /* No identity is an observation too; mounting must discard it. */
+                EXPECT_FALSE(nested.rootFS->getFingerprint(logical));
+                EXPECT_FALSE(nested.rootFS->getFingerprint(logical));
                 EXPECT_EQ(nested.mountInput(input, mounted), storePath);
+                EXPECT_EQ(nested.rootFS->getFingerprint(logical), mounted->getFingerprint(CanonPath::root));
                 auto expectedStat = mounted->lstat(CanonPath::root);
                 auto actualStat = nested.rootFS->lstat(logical);
                 EXPECT_EQ(actualStat.type, expectedStat.type);

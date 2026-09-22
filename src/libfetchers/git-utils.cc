@@ -655,12 +655,6 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         return result;
     }
 
-    // Helper for statusCallback below.
-    static int statusCallbackTrampoline(const char * path, unsigned int statusFlags, void * payload)
-    {
-        return (*((std::function<int(const char * path, unsigned int statusFlags)> *) payload))(path, statusFlags);
-    }
-
     WorkdirInfo getWorkdirInfo() override
     {
         /* Status's content filters also consult the attribute cache. Its
@@ -678,23 +672,43 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 
         /* Get all tracked files and determine whether the working
            directory is dirty. */
-        std::function<int(const char * path, unsigned int statusFlags)> statusCallback = [&](const char * path,
-                                                                                             unsigned int statusFlags) {
-            if (!(statusFlags & GIT_STATUS_INDEX_DELETED) && !(statusFlags & GIT_STATUS_WT_DELETED)) {
-                info.files.insert(CanonPath(path));
+        struct StatusPayload
+        {
+            WorkdirInfo & info;
+            std::exception_ptr exception;
+        } payload{info, {}};
+
+        auto statusCallback = [](const char * path, unsigned int statusFlags, void * opaque) -> int {
+            auto & payload = *static_cast<StatusPayload *>(opaque);
+            try {
+                auto & info = payload.info;
+                /* The hint is advisory: case folding and conflict entries
+                   need not arrive in CanonPath order. Sorted runs need no
+                   logarithmic search; every other order keeps the same set. */
+                if (!(statusFlags & GIT_STATUS_INDEX_DELETED) && !(statusFlags & GIT_STATUS_WT_DELETED)) {
+                    info.files.insert(info.files.end(), CanonPath(path));
+                    if (statusFlags != GIT_STATUS_CURRENT)
+                        info.dirtyFiles.insert(info.dirtyFiles.end(), CanonPath(path));
+                } else
+                    info.deletedFiles.insert(info.deletedFiles.end(), CanonPath(path));
                 if (statusFlags != GIT_STATUS_CURRENT)
-                    info.dirtyFiles.insert(CanonPath(path));
-            } else
-                info.deletedFiles.insert(CanonPath(path));
-            if (statusFlags != GIT_STATUS_CURRENT)
-                info.isDirty = true;
-            return 0;
+                    info.isDirty = true;
+                return 0;
+            } catch (...) {
+                /* Let libgit2 free its status list before the original C++
+                   exception leaves this operation. */
+                payload.exception = std::current_exception();
+                return GIT_EUSER;
+            }
         };
 
         git_status_options options = GIT_STATUS_OPTIONS_INIT;
         options.flags |= GIT_STATUS_OPT_INCLUDE_UNMODIFIED;
         options.flags |= GIT_STATUS_OPT_EXCLUDE_SUBMODULES;
-        if (git_status_foreach_ext(*this, &options, &statusCallbackTrampoline, &statusCallback))
+        auto statusError = git_status_foreach_ext(*this, &options, statusCallback, &payload);
+        if (payload.exception)
+            std::rethrow_exception(payload.exception);
+        if (statusError)
             throw GitError("getting working directory status");
 
         /* Gitlinks in the index are the submodules; .gitmodules only
