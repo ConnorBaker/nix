@@ -1794,16 +1794,48 @@ GitRepoImpl::getAccessor(const Hash & rev, const GitAccessorOptions & options, s
 ref<SourceAccessor> GitRepoImpl::getAccessor(
     const WorkdirInfo & wd, const GitAccessorOptions & options, MakeNotAllowedError makeNotAllowedError)
 {
+    /* A working tree has fixed tracked membership and mutable filesystem
+       contents. It needs neither a growing allow list nor names from a
+       child: this constructor supplies the raw filesystem itself. */
+    struct WorkdirSourceAccessor final : FilteringSourceAccessor
+    {
+        const std::set<CanonPath> tracked;
+
+        void anchor() override {}
+
+        WorkdirSourceAccessor(
+            const std::filesystem::path & path,
+            const std::set<CanonPath> & tracked,
+            MakeNotAllowedError makeNotAllowedError)
+            : FilteringSourceAccessor(
+                  // Older Nix versions followed the final symlink to the repo.
+                  SourcePath(makeFSSourceAccessor(path, /*trackLastModified=*/false, FinalSymlink::Follow)),
+                  std::move(makeNotAllowedError))
+            , tracked(tracked)
+        {
+        }
+
+        bool isAllowed(const CanonPath & path) override
+        {
+            return path.isRoot() || path.isAllowed(tracked);
+        }
+
+        bool allowsConcurrentTraversal() override
+        {
+            auto inner = next;
+            return inner->allowsConcurrentTraversal();
+        }
+
+        void readDirectoryWithEntries(
+            const CanonPath & path,
+            std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+        {
+            readDirectoryScoped(path, std::move(callback));
+        }
+    };
+
     auto self = ref<GitRepoImpl>(shared_from_this());
-    ref<SourceAccessor> fileAccessor =
-        AllowListSourceAccessor::create(
-            // Follow the final symlink to the repo. Older nix versions used to do this (maybe somewhat accidentally).
-            makeFSSourceAccessor(path, /*trackLastModified=*/false, FinalSymlink::Follow),
-            /*allowedPrefixes=*/wd.files,
-            // Always allow access to the root, but not its children.
-            /*allowedPaths=*/{CanonPath::root},
-            std::move(makeNotAllowedError))
-            .cast<SourceAccessor>();
+    ref<SourceAccessor> fileAccessor = make_ref<WorkdirSourceAccessor>(path, wd.files, std::move(makeNotAllowedError));
     /* Status determines tracked membership, not filesystem-object identity:
        index flags can suppress comparisons, and clean filters can equate
        different bytes. Keep the working tree as the source of its contents

@@ -569,14 +569,6 @@ StorePath BinaryCacheStore::addToStoreFromDump(
         ->path;
 }
 
-bool BinaryCacheStore::isValidPathUncached(const StorePath & storePath)
-{
-    // FIXME: this only checks whether a .narinfo with a matching hash
-    // part exists. So ‘f4kb...-foo’ matches ‘f4kb...-bar’, even
-    // though they shouldn't. Not easily fixed.
-    return fileExists(narInfoFileFor(storePath));
-}
-
 std::optional<StorePath> BinaryCacheStore::queryPathFromHashPart(const std::string & hashPart)
 {
     auto pseudoPath = StorePath(hashPart + "-" + MissingName);
@@ -631,8 +623,13 @@ void BinaryCacheStore::queryPathInfoUncached(
                     try {
                         auto data = fut.get();
 
-                        if (!data)
+                        if (!data) {
+                            /* This lookup addressed hash.narinfo, so absence
+                               applies to every requested name for the hash. */
+                            if (diskCache)
+                                diskCache->upsertNarInfo(uri, std::string(storePath.hashPart()), nullptr);
                             return (*callbackPtr)({});
+                        }
 
                         (*callbackPtr)(
                             (std::shared_ptr<ValidPathInfo>) std::make_shared<NarInfo>(*this, *data, narInfoFile));

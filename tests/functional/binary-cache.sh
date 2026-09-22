@@ -85,6 +85,20 @@ basicDownloadTests
 export _NIX_FORCE_HTTP=1
 basicDownloadTests
 
+# A missing hash.narinfo is a hash-wide negative, reused across processes
+# and names until refresh. Use a separate URI so prior positives cannot hide it.
+negativeCacheDir=$(mktemp -d "$TEST_ROOT/negative-narinfo-cache.XXXXXXXX")
+cp "$cacheDir/nix-cache-info" "$negativeCacheDir/"
+negativeHash=${outPath##*/}
+negativeHash=${negativeHash:0:32}
+negativeWildcard="${outPath%/*}/$negativeHash-x"
+expect 1 nix path-info --store "file://$negativeCacheDir" \
+    --option narinfo-cache-negative-ttl 600 "$outPath"
+cp "$cacheDir/$negativeHash.narinfo" "$negativeCacheDir/"
+expect 1 nix path-info --store "file://$negativeCacheDir" \
+    --option narinfo-cache-negative-ttl 600 "$negativeWildcard"
+nix path-info --store "file://$negativeCacheDir" --refresh "$negativeWildcard" | grepQuiet -Fx "$outPath"
+
 
 # Test that multiple concurrent substitutions do only one download.
 clearStore

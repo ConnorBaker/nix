@@ -697,6 +697,9 @@ protected:
     /** What a sweep did, said once, wherever it swept. */
     void reportSweep(const GitObjectStore::SweepStats & swept);
 
+    /** Reject descriptions under another path before registration effects. */
+    static void validatePathInfoKeys(const ValidPathInfos & infos);
+
 public:
 
     /**
@@ -712,6 +715,7 @@ public:
     /** Register a path and its remaining holder rows atomically. */
     void registerValidPath(const ValidPathInfo & info, const GitObjectStore::Hold & hold);
 
+    /** Every map key must equal its description's path. */
     virtual void registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold);
 
     virtual void registerValidPaths(const ValidPathInfos & infos);

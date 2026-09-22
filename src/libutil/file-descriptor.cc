@@ -212,7 +212,7 @@ void copyFdRange(Descriptor fd, off_t offset, size_t nbytes, Sink & sink, bool t
 
     static constexpr size_t copyBufferSize = 64 * 1024;
 
-    if (tryCoW) {
+    if (tryCoW && nbytes > copyBufferSize) {
         /* dynamic_cast here is slightly annoying, but it's much cheaper than
            doing I/O so it doesn't really matter. */
         FdSink * fdSink = dynamic_cast<FdSink *>(&sink);
@@ -220,7 +220,7 @@ void copyFdRange(Descriptor fd, off_t offset, size_t nbytes, Sink & sink, bool t
            been hinted that we should try block cloning. Try it and in case we
            can't do block cloning then fall back to the loop below. Also, don't
            bother with files smaller than the copy buffer. */
-        if (fdSink && !fdSink->hasData() && fdSink->written == 0 && fdSink->isRegularFile && nbytes > copyBufferSize
+        if (fdSink && !fdSink->hasData() && fdSink->written == 0 && fdSink->isRegularFile
             && tryCopyFdRangeFast(fd, fdSink->fd, offset, nbytes, fdSink->written)) {
             return;
         }

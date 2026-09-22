@@ -646,6 +646,14 @@ StorePathSet Store::querySubstitutablePaths(const StorePathSet & paths)
     return res;
 }
 
+/* A memory-cache description must answer its full path key. The disk cache
+   is keyed only by hash; its canonical name still needs admission here. */
+static bool goodStorePath(const StorePath & expected, const StorePath & actual)
+{
+    return expected.hashPart() == actual.hashPart()
+           && (expected.name() == Store::MissingName || expected.name() == actual.name());
+}
+
 bool Store::isValidPath(const StorePath & storePath)
 {
     if (pathInfoCache) {
@@ -658,23 +666,17 @@ bool Store::isValidPath(const StorePath & storePath)
         auto res = diskCache->lookupNarInfo(
             config.getReference().render(/*FIXME withParams=*/false), std::string(storePath.hashPart()));
         if (res.first != NarInfoDiskCache::oUnknown) {
+            bool valid = res.first == NarInfoDiskCache::oValid && goodStorePath(storePath, res.second->path);
             if (pathInfoCache)
                 pathInfoCache->lock()->upsert(
-                    storePath,
-                    res.first == NarInfoDiskCache::oInvalid ? PathInfoCacheValue{}
-                                                            : PathInfoCacheValue{.value = res.second});
-            return res.first == NarInfoDiskCache::oValid;
+                    storePath, valid ? PathInfoCacheValue{.value = res.second} : PathInfoCacheValue{});
+            return valid;
         }
     }
 
-    bool valid = isValidPathUncached(storePath);
-
-    if (diskCache && !valid)
-        // FIXME: handle valid = true case.
-        diskCache->upsertNarInfo(
-            config.getReference().render(/*FIXME withParams=*/false), std::string(storePath.hashPart()), 0);
-
-    return valid;
+    /* A full-path miss need not mean its hash is absent: another name may
+       be valid. Hash-indexed backends cache their metadata misses themselves. */
+    return isValidPathUncached(storePath);
 }
 
 /* Default implementation for stores that only implement
@@ -691,23 +693,24 @@ bool Store::isValidPathUncached(const StorePath & path)
 
 ref<const ValidPathInfo> Store::queryPathInfo(const StorePath & storePath)
 {
+    /* A cached description is already a synchronous result. */
+    if (auto info = queryPathInfoFromClientCache(storePath); info.has_value()) {
+        if (*info)
+            return ref(*info);
+        throw InvalidPath("path '%s' is not valid", printStorePath(storePath));
+    }
+
     std::promise<ref<const ValidPathInfo>> promise;
 
-    queryPathInfo(storePath, {[&](std::future<ref<const ValidPathInfo>> result) {
-                      try {
-                          promise.set_value(result.get());
-                      } catch (...) {
-                          promise.set_exception(std::current_exception());
-                      }
-                  }});
+    queryPathInfoAfterCacheMiss(storePath, {[&](std::future<ref<const ValidPathInfo>> result) {
+                                    try {
+                                        promise.set_value(result.get());
+                                    } catch (...) {
+                                        promise.set_exception(std::current_exception());
+                                    }
+                                }});
 
     return promise.get_future().get();
-}
-
-static bool goodStorePath(const StorePath & expected, const StorePath & actual)
-{
-    return expected.hashPart() == actual.hashPart()
-           && (expected.name() == Store::MissingName || expected.name() == actual.name());
 }
 
 std::optional<std::shared_ptr<const ValidPathInfo>> Store::queryPathInfoFromClientCache(const StorePath & storePath)
@@ -724,16 +727,11 @@ std::optional<std::shared_ptr<const ValidPathInfo>> Store::queryPathInfoFromClie
         auto hashPart = std::string(storePath.hashPart());
         auto res = diskCache->lookupNarInfo(config.getReference().render(/*FIXME withParams=*/false), hashPart);
         if (res.first != NarInfoDiskCache::oUnknown) {
+            bool valid = res.first == NarInfoDiskCache::oValid && goodStorePath(storePath, res.second->path);
+            std::shared_ptr<const ValidPathInfo> info = valid ? res.second : nullptr;
             if (pathInfoCache)
-                pathInfoCache->lock()->upsert(
-                    storePath,
-                    res.first == NarInfoDiskCache::oInvalid ? PathInfoCacheValue{}
-                                                            : PathInfoCacheValue{.value = res.second});
-
-            if (res.first == NarInfoDiskCache::oInvalid || !goodStorePath(storePath, res.second->path))
-                return std::make_optional(nullptr);
-            assert(res.second);
-            return std::make_optional(res.second);
+                pathInfoCache->lock()->upsert(storePath, PathInfoCacheValue{.value = info});
+            return std::make_optional(std::move(info));
         }
     }
 
@@ -755,23 +753,35 @@ void Store::queryPathInfo(const StorePath & storePath, Callback<ref<const ValidP
         return callback.rethrow();
     }
 
-    auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
+    queryPathInfoAfterCacheMiss(storePath, std::move(callback));
+}
+
+void Store::queryPathInfoAfterCacheMiss(
+    const StorePath & storePath, Callback<ref<const ValidPathInfo>> && callback) noexcept
+{
+    auto callbackPtr = std::make_shared<Callback<ref<const ValidPathInfo>>>(std::move(callback));
 
     queryPathInfoUncached(
         storePath, {[this, storePath, callbackPtr](std::future<std::shared_ptr<const ValidPathInfo>> fut) {
             try {
                 auto info = fut.get();
+                bool valid = info && goodStorePath(storePath, info->path);
 
-                if (diskCache)
+                /* A matching hash describes its canonical name even if this
+                   request rejected it. A null result only proves this full
+                   path absent; hash-indexed backends publish their own misses. */
+                if (diskCache && info && storePath.hashPart() == info->path.hashPart())
                     diskCache->upsertNarInfo(
                         config.getReference().render(/*FIXME withParams=*/false),
                         std::string(storePath.hashPart()),
                         info);
 
+                if (!valid)
+                    info.reset();
                 if (pathInfoCache)
                     pathInfoCache->lock()->upsert(storePath, PathInfoCacheValue{.value = info});
 
-                if (!info || !goodStorePath(storePath, info->path))
+                if (!info)
                     throw InvalidPath("path '%s' is not valid", printStorePath(storePath));
 
                 (*callbackPtr)(ref<const ValidPathInfo>(info));

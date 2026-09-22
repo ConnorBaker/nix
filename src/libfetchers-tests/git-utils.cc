@@ -42,6 +42,7 @@
 #include <git2/tree.h>
 
 #include <rapidcheck/gtest.h>
+#include <algorithm>
 #include <exception> // IWYU pragma: keep (rapidcheck on Darwin/FreeBSD)
 #include <functional>
 #include <future>
@@ -1063,6 +1064,117 @@ TEST_F(GitUtilsTest, workdirReadsAndNamesItsFilesystemView)
     write("dirty/c", "C");
     EXPECT_EQ(workdir->readFile(CanonPath("clean/a")), "A");
     EXPECT_EQ(workdir->readFile(CanonPath("dirty/c")), "C");
+}
+
+TEST_F(GitUtilsTest, workdirDomainIsTheFixedTrackedPrefixesAndTheirAncestors)
+{
+    write("a/x/z", "plain");
+    write("a/extra", "other");
+    write("a!", "executable");
+    std::filesystem::permissions(tmpDir / "a!", std::filesystem::perms::owner_exec, std::filesystem::perm_options::add);
+    createDirs(tmpDir / "ab");
+    std::filesystem::create_symlink("../a/x/z", tmpDir / "ab/link");
+    write("hidden", "untracked");
+
+    const std::vector<CanonPath> domain{
+        CanonPath::root,
+        CanonPath("a"),
+        CanonPath("a/x"),
+        CanonPath("a/x/z"),
+        CanonPath("a!"),
+        CanonPath("ab/link"),
+        CanonPath("missing")};
+    const std::vector<CanonPath> queries{
+        CanonPath::root,
+        CanonPath("a"),
+        CanonPath("a/x"),
+        CanonPath("a/x/z"),
+        CanonPath("a/extra"),
+        CanonPath("a!"),
+        CanonPath("ab"),
+        CanonPath("ab/link"),
+        CanonPath("missing"),
+        CanonPath("missing/child"),
+        CanonPath("hidden")};
+    auto prefixOf = [](const CanonPath & a, const CanonPath & b) {
+        return a.isRoot() || a.abs() == b.abs() || b.abs().starts_with(a.abs() + "/");
+    };
+    auto physical = makeFSSourceAccessor(tmpDir);
+    auto repo = openRepo();
+    for (unsigned subset = 0; subset < (1u << domain.size()); ++subset) {
+        SCOPED_TRACE(subset);
+        GitRepo::WorkdirInfo wd;
+        for (size_t i = 0; i < domain.size(); ++i)
+            if (subset & (1u << i))
+                wd.files.insert(domain[i]);
+        auto admitted = [&](const CanonPath & q) {
+            return q.isRoot() || std::any_of(wd.files.begin(), wd.files.end(), [&](const auto & p) {
+                       return prefixOf(p, q) || prefixOf(q, p);
+                   });
+        };
+        auto workdir = repo->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("untracked"); });
+        EXPECT_EQ(workdir->allowsConcurrentTraversal(), physical->allowsConcurrentTraversal());
+        for (const auto & q : queries) {
+            SCOPED_TRACE(q.abs());
+            auto expected = admitted(q) ? physical->maybeLstat(q) : std::nullopt;
+            auto actual = workdir->maybeLstat(q);
+            EXPECT_EQ(bool(actual), bool(expected));
+            EXPECT_EQ(workdir->pathExists(q), bool(expected));
+            EXPECT_FALSE(workdir->getFingerprint(q));
+            EXPECT_FALSE(workdir->getKnownEntry(q));
+            if (!admitted(q)) {
+                EXPECT_THROW(workdir->lstat(q), RestrictedPathError);
+            } else if (!expected) {
+                EXPECT_THROW(workdir->lstat(q), Error);
+            } else if (actual && expected) {
+                EXPECT_EQ(actual->type, expected->type);
+                EXPECT_EQ(actual->isExecutable, expected->isExecutable);
+                if (expected->type == SourceAccessor::tRegular)
+                    EXPECT_EQ(workdir->readFile(q), physical->readFile(q));
+                else if (expected->type == SourceAccessor::tSymlink)
+                    EXPECT_EQ(workdir->readLink(q), physical->readLink(q));
+                else if (expected->type == SourceAccessor::tDirectory) {
+                    SourceAccessor::DirEntries entries;
+                    for (const auto & entry : physical->readDirectory(q))
+                        if (admitted(q / entry.first))
+                            entries.insert(entry);
+                    EXPECT_EQ(workdir->readDirectory(q), entries);
+                    workdir->readDirectoryWithEntries(
+                        q, [&](SourceAccessor & scoped, const CanonPath & relative, const auto & observed) {
+                            EXPECT_EQ(observed, entries);
+                            for (const auto & entry : observed)
+                                EXPECT_EQ(
+                                    scoped.lstat(relative / entry.first).type, physical->lstat(q / entry.first).type);
+                        });
+                }
+            }
+        }
+        for (auto name : {"", "whole"}) {
+            workdir->fingerprint = name;
+            for (const auto & q : queries)
+                EXPECT_EQ(workdir->getFingerprint(q), (std::pair{q, std::string(name)}));
+        }
+    }
+}
+
+TEST_F(GitUtilsTest, workdirTrackedPrefixStillAdmitsAReplacementDirectory)
+{
+    write("tracked", "before");
+    GitRepo::WorkdirInfo wd;
+    wd.files.insert(CanonPath("tracked"));
+    auto workdir = openRepo()->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("untracked"); });
+    EXPECT_EQ(workdir->readFile(CanonPath("tracked")), "before");
+    EXPECT_FALSE(workdir->getFingerprint(CanonPath("tracked")));
+
+    std::filesystem::remove(tmpDir / "tracked");
+    write("tracked/sub/child", "after");
+    write("untracked", "hidden");
+    wd.files.insert(CanonPath("untracked"));
+    EXPECT_EQ(workdir->lstat(CanonPath("tracked")).type, SourceAccessor::tDirectory);
+    EXPECT_EQ(workdir->readFile(CanonPath("tracked/sub/child")), "after");
+    EXPECT_FALSE(workdir->getFingerprint(CanonPath("tracked/sub/child")));
+    EXPECT_FALSE(workdir->pathExists(CanonPath("untracked")));
+    EXPECT_THROW(workdir->readFile(CanonPath("untracked")), RestrictedPathError);
 }
 
 TEST_F(GitUtilsTest, cachedWorkdirSnapshotsStayImmutableAcrossRenderingAndInvalidation)

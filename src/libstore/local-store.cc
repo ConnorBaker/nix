@@ -1743,8 +1743,17 @@ void LocalStore::registerValidPath(const ValidPathInfo & info, const GitObjectSt
     registerValidPaths({{info.path, info}}, &hold);
 }
 
+void LocalStore::validatePathInfoKeys(const ValidPathInfos & infos)
+{
+    for (auto & [path, info] : infos)
+        if (path != info.path)
+            throw Error("cannot register path info for '%s' under '%s'", info.path.to_string(), path.to_string());
+}
+
 void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold)
 {
+    validatePathInfoKeys(infos);
+
     /* Finish the ingestion before taking the database lock: a large copy's
        writer may still be committing a batch. The usual single-file object
        has never started that writer and publishes all of its rows here,

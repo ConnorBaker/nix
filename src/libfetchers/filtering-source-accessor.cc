@@ -90,7 +90,9 @@ void FilteringSourceAccessor::readDirectoryScoped(
                        No accessor or visitor may retain it after callback. */
                     : FilteringSourceAccessor(
                           SourcePath(
-                              ref<SourceAccessor>(std::shared_ptr<SourceAccessor>(&inner, [](auto *) {})), relative),
+                              ref<SourceAccessor>(
+                                  std::shared_ptr<SourceAccessor>(std::shared_ptr<SourceAccessor>{}, &inner)),
+                              relative),
                           [&owner, original](const CanonPath & p) { return owner.makeNotAllowedError(original / p); })
                     , owner(&owner)
                     , original(original)

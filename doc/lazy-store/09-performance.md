@@ -90,7 +90,7 @@ All eighteen new targeted tests pass. Ten isolated negative controls restore the
 The complete rebuilt debug source passes 2,443 unit tests (439 evaluator, 149 fetcher, 881 utility and 974 store), with two existing runtime skips and three pre-existing disabled tests. Utility tests also pass with newer syscalls disabled. All five targeted functional tests and all twelve real overlay tests pass. The negative-control sources, drivers, results and restoration hashes are retained under `/home/connorbaker/Benchmarks/nix-performance-fixes/audit-sixth-controls`. Windows remains untested. These checks belong to revision `0fa877d6e`; current validation follows.
 
 
-## Current source validation
+## Earlier source validation at `16ed142be`
 
 Revision `16ed142be` includes the following changes after `0fa877d6e`. Both its source validation and its optimized release comparison are complete; the remaining performance regression is recorded below.
 
@@ -104,6 +104,18 @@ Revision `16ed142be` includes the following changes after `0fa877d6e`. Both its 
 The complete current debug source passes **2,456 unit tests**: 439 evaluator, 149 fetcher, 888 utility and 980 store tests, with two existing runtime skips (fetcher and utility) and three pre-existing disabled tests. All 888 utility tests also pass with newer syscalls disabled. The five targeted functional tests and all twelve real overlay tests pass. Optimized release checks report 207 passes and 36 skips out of 243 packaged tests, plus all twelve real overlay tests on the host. Windows remains untested.
 
 Eight isolated negative controls cover compound and local-root ownership, cache-state isolation, completion-time publication, optional-name memoization, logical-name uniqueness, synthetic-root shape and canonical stored-tree encoding. Every faulty variant fails and every exact restoration passes. The canonical-encoding mutant falsely accepts the predicted 1,494 mode-spelling and 320 entry-order cells; all three actual materialisation cases also fail. The first five controls are retained in `/home/connorbaker/Benchmarks/nix-performance-fixes/audit-seventh-controls`; the three tree controls are retained in `/home/connorbaker/Benchmarks/nix-performance-fixes/audit-seventh-tree-controls`. These checks establish source validation; performance is measured separately below.
+
+## Current source validation
+
+The subsequent audit restores one identity rule across cache and registration boundaries: a full-path description must name its key; a hash-indexed cache may reuse a canonical description, but an exact-path miss does not establish hash-wide absence. Binary-cache validity now reads and validates metadata through the existing query operation instead of accepting a hash-only file-existence check. Cold HTTP validity therefore requires GET and parsing, and malformed metadata raises an error. Only a missing `hash.narinfo` publishes a hash-wide negative. Local and overlay registration reject mismatched map keys before consuming ingestion rows or importing lower-store metadata.
+
+The tests enumerate 54 description-admission cases, twelve exact-path-null cases, 100 real file-cache validity observations, all 64 three-key registration maps for each store route, and twelve pending-holder rejection cases. The HTTP-over-file functional test checks negative reuse across processes and names, followed by refresh. These cases pass, including first and repeated queries; corruption propagation is checked separately.
+
+The workdir factory now expresses fixed tracked membership directly with the existing canonical-path prefix predicate. Its bytes remain live; it needs neither a growing admission set nor attempts to borrow a raw filesystem fingerprint. All 128 subsets of seven prefixes are checked against eleven queries (1,408 admission cells), plus a tracked file's replacement by a directory. Scoped traversal borrows its already-bounded child without allocating an ownership control block. Synchronous path-info cache hits return the existing result without constructing futures, and small file copies avoid a CoW type check whose size condition already excludes them. These reductions add no source-content cache.
+
+The rebuilt debug source passes **2,463 unit tests**: 439 evaluator, 151 fetcher, 888 utility and 985 store tests, with two existing runtime skips and three pre-existing disabled tests. All 888 utility tests also pass with newer syscalls disabled. Six targeted functional tests and all twelve real overlay tests pass. These source checks do not establish a performance improvement; the latest completed optimized measurements still belong to `16ed142be` below. Windows remains untested.
+
+Six isolated faulty variants fail their intended assertions: unsafe positive-cache admission, generic hash-wide negative publication, binary hash-only validity, each registration guard's removal, and missing binary negative publication. Every exact restoration passes; final binaries match the initial fixed binaries. The independently checked archive contains source snapshots, mutation patches, commands, library hashes and sanitized results at `/home/connorbaker/Benchmarks/nix-performance-fixes/audit-eighth-controls` (manifest SHA-256 `10db43899d132884c1e964ad36a326b24162890f04508db23a5ae1b862fd9bc7`).
 
 ## Measurements
 
@@ -129,6 +141,17 @@ Earlier complete comparisons remain available for [742ba6764](runs/2026-09-21-pe
 
 ## Remaining cost, measured separately
 
+A direct phase measurement of `16ed142be` locates the remaining Git cost. Five retained warm 32-attribute rounds follow one seed for each binary and direct/pass-through/timed variant. All 42 outputs and dynamic bindings pass verification. Median inclusive envelopes are:
+
+| Phase | Base wall ms | Branch wall ms |
+| --- | ---: | ---: |
+| Git status | 481.915 | 349.845 |
+| Initial root naming | 0.034 | 117.102 |
+| Later `fetchToStore(Copy)` calls | 19.644 | 191.416 |
+| Direct `fetchToStore2(Copy)` calls | — | 2.149 |
+
+The branch's two copy envelopes contain 13,794 and 59 calls; base has 13,853 calls through the former. These are calls, not file reads. Envelopes did not nest, but independent medians do not partition a whole run. Timer-control differences were 21.7 ms for base and 11.7 ms for branch, limiting small-duration interpretation. Base and branch use libgit2 1.9.7 and 2.0.0-rc.1 respectively, so the status difference is not attributable solely to the Nix changes. Sources, pinned headers, binaries, bindings, every sample and the independent verifier are in `/home/connorbaker/Benchmarks/nix-performance-fixes/phase-timing-16ed142be`.
+
 The following profiles and first two counterfactuals use the older revision `0fa877d6e`; these profiles have not been rerun for `16ed142be`. Twenty warm 32-attribute evaluations per executable and Git/GitHub scheme were captured with `armv8_pmuv3_1/cycles/u`, period 10,000,000, 65,528-byte DWARF stacks and a 1,024-frame decode limit. Git has 6,701/8,951 base/branch samples; GitHub has 5,368/5,323. All four decodes have no lost records, empty stacks, unparsed lines or zero instruction pointers. Median stack depths are 88/88/96/97. They remain incomplete: `copyFdRange` has a 65,536-byte automatic buffer, larger than the captured stack, so caller counts are lower bounds. Unknown leaves do not identify kernel time.
 
 | Observed Git phase | Base samples | Branch samples |
@@ -150,3 +173,5 @@ A bounded counterfactual declined all derived Union names while retaining explic
 A second rejected counterfactual allowed every child kind onto the pure hashing pool, retaining its permission gate, width, ordered fold and joins. Only `HashingVisitor::directory` was interposed; dynamic binding was checked. All 48 warm Git observations are retained: direct, original-method, all-child and combined cache/all-child variants, with one seed and five retained rounds at both attribute counts. All outputs equal the prior release outputs. Original-method versus all-child medians are 0.8639 versus 0.8825 s for eight attributes (+2.16%) and 1.6208 versus 1.6260 s for 32 (+0.32%), so the scheduling change was not adopted. The faster combined variant has no corresponding cache-only control and cannot establish a scheduling gain. Sources, binaries, binding logs, raw outputs, timings and reproduction constraints are archived with a SHA-256 manifest in `/home/connorbaker/Benchmarks/nix-performance-fixes/hashing-concurrency-counterfactual-0fa877d6e`. This isolated experiment does not replace the release comparison.
 
 A frozen-fixture experiment on `16ed142be` retained Git's comparisons but omitted unmodified status records and reconstructed membership from the index. It retained 36 observations across direct execution, the original method and the reconstructed method: one seed and five measured rounds at both attribute counts. Binding, output and count checks pass. Original/reconstructed medians are 0.8054/0.8028 s for eight attributes (−0.32%) and 1.4806/1.4636 s for 32 (−1.15%). These small gains do not close the regression. Index-flag and case-pairing counterexamples disprove the general membership reconstruction; callback-visible state also lacks an equivalence proof. No production change was adopted. Evidence is retained in `/home/connorbaker/Benchmarks/nix-performance-fixes/status-unmodified-counterfactual-16ed142be`.
+
+Replacing the hashing fold's child vector with a one-element inline vector also failed to show a useful improvement. The same 36-observation design and binding/output checks give original/changed medians of 0.8341/0.8363 s for eight attributes (+0.27%) and 1.5551/1.5449 s for 32 (−0.65%). The mixed differences are comparable to control variation; the change was rejected. Evidence is in `/home/connorbaker/Benchmarks/nix-performance-fixes/hashing-small-vector-counterfactual-16ed142be`.

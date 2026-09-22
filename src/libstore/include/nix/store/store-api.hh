@@ -433,6 +433,9 @@ class Store : public std::enable_shared_from_this<Store>, public StoreDirConfig
        dynamic_cast across shared libraries on Darwin. */
     virtual void anchor() = 0;
 
+    /** Both query forms share the backend lookup and cache publication. */
+    void queryPathInfoAfterCacheMiss(const StorePath & path, Callback<ref<const ValidPathInfo>> && callback) noexcept;
+
 public:
 
     using Config = StoreConfig;

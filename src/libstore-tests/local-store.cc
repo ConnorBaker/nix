@@ -4,6 +4,7 @@
 #include <sqlite3.h>
 
 #include "nix/store/local-store.hh"
+#include "nix/store/local-overlay-store.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/store/globals.hh"
@@ -8257,6 +8258,7 @@ struct ValidityObservedStore : LocalStore
     std::atomic<unsigned> validityQueries = 0;
     unsigned infoQueries = 0;
     std::function<void()> afterValidityQuery;
+    std::optional<std::shared_ptr<const ValidPathInfo>> infoResult;
 
     explicit ValidityObservedStore(ref<const LocalStore::Config> config)
         : Store{*config}
@@ -8268,6 +8270,8 @@ struct ValidityObservedStore : LocalStore
     bool isValidPathUncached(const StorePath & path) override
     {
         validityQueries++;
+        if (infoResult)
+            return Store::isValidPathUncached(path);
         auto valid = LocalStore::isValidPathUncached(path);
         if (afterValidityQuery)
             afterValidityQuery();
@@ -8278,6 +8282,8 @@ struct ValidityObservedStore : LocalStore
         const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override
     {
         infoQueries++;
+        if (infoResult)
+            return callback(std::shared_ptr<const ValidPathInfo>{*infoResult});
         LocalStore::queryPathInfoUncached(path, std::move(callback));
     }
 
@@ -8300,6 +8306,350 @@ struct ValidityObservedStore : LocalStore
 };
 
 } // namespace
+
+TEST_F(TempLocalStoreTest, pathInfoCacheAdmitsOnlyTheRequestedIdentity)
+{
+    /* A controlled hash-indexed disk description also permits a wrong-hash
+       answer. SQLite reconstructs the answer's hash from its lookup key, so
+       the real disk implementation cannot produce that particular cell. */
+    struct DescriptionCache : NarInfoDiskCache
+    {
+        std::map<std::string, std::shared_ptr<NarInfo>> rows;
+        unsigned publications = 0;
+
+        DescriptionCache(const Settings & settings)
+            : NarInfoDiskCache(settings)
+        {
+        }
+
+        int createCache(const std::string &, const std::string &, const CacheInfo &) override
+        {
+            return 1;
+        }
+
+        std::optional<CacheInfo> upToDateCacheExists(const std::string &) override
+        {
+            return CacheInfo{};
+        }
+
+        std::pair<Outcome, std::shared_ptr<NarInfo>>
+        lookupNarInfo(const std::string &, const std::string & hash) override
+        {
+            auto it = rows.find(hash);
+            return it == rows.end() ? std::pair<Outcome, std::shared_ptr<NarInfo>>{oUnknown, nullptr}
+                                    : std::pair{it->second ? oValid : oInvalid, it->second};
+        }
+
+        void
+        upsertNarInfo(const std::string &, const std::string & hash, std::shared_ptr<const ValidPathInfo> info) override
+        {
+            ++publications;
+            rows.insert_or_assign(hash, info ? std::make_shared<NarInfo>(*info) : nullptr);
+        }
+
+        void upsertRealisation(const std::string &, const Realisation &) override
+        {
+            ADD_FAILURE();
+        }
+
+        void upsertAbsentRealisation(const std::string &, const DrvOutput &) override
+        {
+            ADD_FAILURE();
+        }
+
+        std::pair<Outcome, std::shared_ptr<Realisation>>
+        lookupRealisation(const std::string &, const DrvOutput &) override
+        {
+            ADD_FAILURE();
+            return {oUnknown, nullptr};
+        }
+    };
+
+    StringSource source{std::string_view{"one canonical store-path description"}};
+    auto canonical = store->addToStoreFromDump(
+        source,
+        "canonical",
+        FileSerialisationMethod::Flat,
+        ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256,
+        {},
+        NoRepair);
+    auto full = std::make_shared<NarInfo>(*store->queryPathInfo(canonical));
+    auto otherHash = store->makeStorePath("source", hashString(HashAlgorithm::SHA256, "another hash"), "canonical");
+    ASSERT_NE(canonical.hashPart(), otherHash.hashPart());
+    auto & ttl = settings.getNarInfoDiskCacheSettings();
+    auto oldPositive = ttl.ttlPositive.get(), oldNegative = ttl.ttlNegative.get();
+    Finally restore{[&] {
+        ttl.ttlPositive = oldPositive;
+        ttl.ttlNegative = oldNegative;
+    }};
+    ttl.ttlPositive = 600;
+    ttl.ttlNegative = 600;
+    config->pathInfoCacheSize = 8;
+
+    enum class Origin { Backend, Disk, Memory };
+    enum class Name { Canonical, Missing, Wrong };
+    enum class Query { Synchronous, Callback, Validity };
+    unsigned cells = 0;
+    for (auto origin : {Origin::Backend, Origin::Disk, Origin::Memory})
+        for (bool sameHash : {false, true})
+            for (auto name : {Name::Canonical, Name::Missing, Name::Wrong})
+                for (auto query : {Query::Synchronous, Query::Callback, Query::Validity}) {
+                    ++cells;
+                    SCOPED_TRACE(
+                        fmt("origin=%d sameHash=%d name=%d query=%d",
+                            static_cast<int>(origin),
+                            sameHash,
+                            static_cast<int>(name),
+                            static_cast<int>(query)));
+                    std::string requestedName = name == Name::Canonical ? "canonical"
+                                                : name == Name::Missing ? Store::MissingName
+                                                                        : "wrong";
+                    StorePath requested(
+                        std::string((sameHash ? canonical : otherHash).hashPart()) + '-' + requestedName);
+                    /* The oracle is the declared identity domain, independent
+                       of cache keys, publication, and goodStorePath(). */
+                    bool accepted = sameHash && name != Name::Wrong;
+                    auto observed = std::make_shared<ValidityObservedStore>(ref{config});
+                    observed->infoResult = full;
+                    auto disk = make_ref<DescriptionCache>(ttl);
+                    observed->useDiskCache(disk);
+                    if (origin == Origin::Disk) {
+                        disk->rows.emplace(std::string(canonical.hashPart()), full);
+                        disk->rows.insert_or_assign(std::string(requested.hashPart()), full);
+                    }
+
+                    auto check = [&] {
+                        if (query == Query::Validity) {
+                            EXPECT_EQ(observed->isValidPath(requested), accepted);
+                            return;
+                        }
+                        auto lookup = [&]() -> ref<const ValidPathInfo> {
+                            if (query == Query::Synchronous)
+                                return observed->queryPathInfo(requested);
+                            std::promise<ref<const ValidPathInfo>> promise;
+                            observed->queryPathInfo(requested, {[&](std::future<ref<const ValidPathInfo>> result) {
+                                                        try {
+                                                            promise.set_value(result.get());
+                                                        } catch (...) {
+                                                            promise.set_exception(std::current_exception());
+                                                        }
+                                                    }});
+                            return promise.get_future().get();
+                        };
+                        if (accepted) {
+                            EXPECT_NO_THROW({
+                                auto info = lookup();
+                                EXPECT_EQ(info->path, canonical);
+                                EXPECT_EQ(info->objectHash, full->objectHash);
+                            });
+                        } else
+                            EXPECT_THROW(lookup(), InvalidPath);
+                    };
+                    /* Populate the memory origin through the public API, not
+                       by fabricating an entry that violates its invariant. */
+                    if (origin == Origin::Memory)
+                        check();
+                    for (unsigned repeat = 0; repeat < 2; ++repeat) {
+                        SCOPED_TRACE(repeat);
+                        check();
+                    }
+                    EXPECT_EQ(observed->infoQueries, origin == Origin::Disk ? 0u : 1u);
+                    EXPECT_EQ(disk->publications, origin != Origin::Disk && sameHash ? 1u : 0u);
+                    EXPECT_EQ(observed->isValidPath(requested), accepted);
+                    /* Rejecting one full path must not invalidate a different
+                       name at the same hash, or publish data for another hash. */
+                    EXPECT_NO_THROW(EXPECT_EQ(observed->queryPathInfo(canonical)->path, canonical));
+                    EXPECT_EQ(observed->infoQueries, origin == Origin::Disk ? 0u : sameHash ? 1u : 2u);
+                }
+    EXPECT_EQ(cells, 54u);
+}
+
+TEST_F(TempLocalStoreTest, exactPathAbsenceDoesNotInvalidateAnotherNameAtTheSameHash)
+{
+    StringSource source{std::string_view{"exact-path backend result"}};
+    auto canonical = store->addToStoreFromDump(
+        source,
+        "canonical",
+        FileSerialisationMethod::Flat,
+        ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256,
+        {},
+        NoRepair);
+    auto full = std::make_shared<NarInfo>(*store->queryPathInfo(canonical));
+    full->url = "nar/exact-path.nar";
+    full->compression = CompressionAlgo::none;
+    auto & ttl = settings.getNarInfoDiskCacheSettings();
+    auto oldPositive = ttl.ttlPositive.get(), oldNegative = ttl.ttlNegative.get();
+    Finally restore{[&] {
+        ttl.ttlPositive = oldPositive;
+        ttl.ttlNegative = oldNegative;
+    }};
+    ttl.ttlPositive = 600;
+    ttl.ttlNegative = 600;
+    unsigned cells = 0;
+    for (bool memory : {false, true})
+        for (auto name : {"wrong", Store::MissingName})
+            for (unsigned query = 0; query < 3; ++query) {
+                SCOPED_TRACE(fmt("memory=%d name=%s query=%u", memory, name, query));
+                config->pathInfoCacheSize = memory ? 8 : 0;
+                auto observed = std::make_shared<ValidityObservedStore>(ref{config});
+                observed->infoResult = std::shared_ptr<const ValidPathInfo>{};
+                auto disk = NarInfoDiskCache::getTest(
+                    ttl, {.useWAL = settings.useSQLiteWAL}, tempStoreDir.path() / fmt("exact-null-%u.sqlite", cells++));
+                auto uri = config->getReference().render(false);
+                disk->createCache(uri, store->storeDir, {});
+                observed->useDiskCache(disk);
+                auto hash = std::string(canonical.hashPart());
+                StorePath requested(hash + '-' + name);
+                auto metadata = [&]() -> ref<const ValidPathInfo> {
+                    if (query == 0)
+                        return observed->queryPathInfo(requested);
+                    std::promise<ref<const ValidPathInfo>> promise;
+                    observed->queryPathInfo(requested, {[&](std::future<ref<const ValidPathInfo>> result) {
+                                                try {
+                                                    promise.set_value(result.get());
+                                                } catch (...) {
+                                                    promise.set_exception(std::current_exception());
+                                                }
+                                            }});
+                    return promise.get_future().get();
+                };
+                for (unsigned repeat = 0; repeat < 2; ++repeat) {
+                    if (query == 2)
+                        EXPECT_FALSE(observed->isValidPath(requested));
+                    else
+                        EXPECT_THROW(metadata(), InvalidPath);
+                    EXPECT_EQ(disk->lookupNarInfo(uri, hash).first, NarInfoDiskCache::oUnknown);
+                }
+                EXPECT_EQ(observed->infoQueries, memory ? 1u : 2u);
+                /* The null response described only `requested`. This distinct
+                   full path is valid even though its hash part is identical. */
+                observed->infoResult = full;
+                EXPECT_NO_THROW(EXPECT_EQ(observed->queryPathInfo(canonical)->path, canonical));
+                EXPECT_EQ(observed->infoQueries, memory ? 2u : 3u);
+                auto description = disk->lookupNarInfo(uri, hash);
+                EXPECT_EQ(description.first, NarInfoDiskCache::oValid);
+                if (description.second)
+                    EXPECT_EQ(description.second->path, canonical);
+            }
+    EXPECT_EQ(cells, 12u);
+}
+
+TEST_F(TempLocalStoreTest, registrationRejectsEveryMismatchedKeyBeforeEffects)
+{
+    const std::string bytes = "registration identity";
+    StringSource source{bytes};
+    auto original = store->addToStoreFromDump(
+        source,
+        "registration-source",
+        FileSerialisationMethod::Flat,
+        ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256,
+        {},
+        NoRepair);
+    auto description = *store->queryPathInfo(original);
+    description.ca.reset();
+    auto lowerReference = config->getReference();
+    lowerReference.params.insert_or_assign("root", tempStoreDir.path().string());
+    unsigned maps = 0, rejected = 0, held = 0;
+    for (bool overlay : {false, true}) {
+        /* Only metadata registration is exercised. These real files provide
+           the merged view, without needing an OverlayFS mount in unit tests. */
+        auto root = tempStoreDir.path() / (overlay ? "overlay-registration" : "local-registration");
+        std::shared_ptr<LocalStore> target;
+        if (overlay) {
+            auto targetConfig = std::make_shared<LocalOverlayStoreConfig>(
+                root,
+                StoreConfig::Params{
+                    {"lower-store", lowerReference.render(true)},
+                    {"upper-layer", (root / "upper").string()},
+                    {"check-mount", "false"}});
+            target = std::make_shared<LocalOverlayStore>(ref{targetConfig});
+        } else {
+            auto targetConfig = std::make_shared<LocalStoreConfig>(root, StoreConfig::Params{});
+            target = std::make_shared<LocalStore>(ref{targetConfig});
+        }
+        for (unsigned assignment = 0; assignment < 64; ++assignment) {
+            ++maps;
+            SCOPED_TRACE(fmt("overlay=%d assignment=%u", overlay, assignment));
+            std::vector<ValidPathInfo> descriptions(3, description);
+            ValidPathInfos lower;
+            for (unsigned n = 0; n < 3; ++n) {
+                auto & info = descriptions[n];
+                info.path = StorePath::random(fmt("registration-%d-%u-%u", overlay, assignment, n));
+                writeFile(target->toRealPath(info.path), bytes);
+                canonicalisePathMetaData(target->toRealPath(info.path), {NIX_WHEN_SUPPORT_ACLS(noAclsToIgnore)});
+                if (overlay) {
+                    writeFile(store->toRealPath(info.path), bytes);
+                    canonicalisePathMetaData(store->toRealPath(info.path), {NIX_WHEN_SUPPORT_ACLS(noAclsToIgnore)});
+                    lower.emplace(info.path, info);
+                }
+            }
+            if (overlay)
+                store->registerValidPaths(lower);
+            ValidPathInfos input;
+            bool accepted = true;
+            auto choices = assignment;
+            for (unsigned key = 0; key < 3; ++key, choices /= 4) {
+                auto choice = choices % 4;
+                if (choice) {
+                    input.emplace(descriptions[key].path, descriptions[choice - 1]);
+                    accepted &= choice == key + 1;
+                }
+            }
+            auto before = target->queryAllValidPaths();
+            auto expected = before;
+            if (accepted) {
+                for (auto & [path, _] : input)
+                    expected.insert(path);
+                EXPECT_NO_THROW(target->registerValidPaths(input));
+            } else {
+                ++rejected;
+                EXPECT_THROW(target->registerValidPaths(input), Error);
+            }
+            EXPECT_EQ(target->queryAllValidPaths(), expected);
+            for (auto & info : descriptions) {
+                auto cached = target->queryPathInfoFromClientCache(info.path);
+                if (!accepted)
+                    EXPECT_FALSE(cached.has_value()) << info.path.to_string();
+                else if (cached && *cached)
+                    EXPECT_EQ((*cached)->path, info.path);
+            }
+            if (!accepted && input.size() == 1) {
+                ++held;
+                /* A singleton is also in the old implementation's ingestion
+                   domain, so the negative control fails without its size assert. */
+                auto hold = target->objects.hold();
+                auto file = target->toRealPath(input.begin()->first);
+                target->beginIngestion(hold, file);
+                ASSERT_TRUE(hold.ingestion);
+                auto status = lstat(file);
+                auto id = merkle::blobId(bytes);
+                hold.addRow(
+                    {.id = id,
+                     .executable = false,
+                     .ino = status.st_ino,
+                     .dev = status.st_dev,
+                     .size = bytes.size(),
+                     .name = ""});
+                auto rowsBefore = target->blobRowCount(false);
+                EXPECT_THROW(target->registerValidPaths(input, &hold), Error);
+                EXPECT_EQ(target->queryAllValidPaths(), before);
+                EXPECT_EQ(target->blobRowCount(false), rowsBefore);
+                auto rows = hold.takeRows();
+                EXPECT_EQ(rows.size(), 1u);
+                if (rows.size() == 1)
+                    EXPECT_EQ(rows.front().id, id);
+                EXPECT_FALSE(hold.ingestion->id.has_value());
+                EXPECT_FALSE(hold.ingestion->path.has_value());
+            }
+        }
+    }
+    EXPECT_EQ(maps, 128u);
+    EXPECT_EQ(rejected, 112u);
+    EXPECT_EQ(held, 12u);
+}
 
 TEST_F(TempLocalStoreTest, validityCacheKeepsExistenceSeparateFromDescriptions)
 {

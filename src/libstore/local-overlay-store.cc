@@ -216,6 +216,8 @@ void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos)
 
 void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold)
 {
+    validatePathInfoKeys(infos);
+
     // First, get any from lower store so we merge
     {
         StorePathSet notInUpper;
