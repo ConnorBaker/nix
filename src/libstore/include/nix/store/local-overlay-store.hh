@@ -1,3 +1,5 @@
+#pragma once
+
 #include "nix/store/local-store.hh"
 
 namespace nix {
