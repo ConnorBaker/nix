@@ -176,11 +176,29 @@ RC_GTEST_FIXTURE_PROP(StorePathTest, prop_check_regex_eq_parse, ())
     std::string path = store->storeDir + "/575s52sh487i0ylmbs9pvi606ljdszr0-" + name;
     bool parsed = false;
     try {
-        store->parseStorePath(path);
+        /* The regex describes a name, before any path normalization. */
+        store->parseStorePathCanonical(path);
         parsed = true;
     } catch (const BadStorePath &) {
     }
-    RC_ASSERT(parsed == std::regex_match(std::string{name}, nameRegex));
+    RC_ASSERT(parsed == (name.size() <= StorePath::MaxPathLen && std::regex_match(std::string{name}, nameRegex)));
+}
+
+TEST_F(StorePathTest, nameLengthBoundary)
+{
+    for (size_t length : {StorePath::MaxPathLen - 1, StorePath::MaxPathLen, StorePath::MaxPathLen + 1}) {
+        SCOPED_TRACE(length);
+        std::string name(length, 'A');
+        auto path = store->storeDir + "/" HASH_PART "-" + name;
+        EXPECT_TRUE(std::regex_match(name, nameRegex));
+        if (length <= StorePath::MaxPathLen) {
+            EXPECT_NO_THROW(checkName(name));
+            EXPECT_EQ(store->parseStorePathCanonical(path).name(), name);
+        } else {
+            EXPECT_THROW(checkName(name), BadStorePathName);
+            EXPECT_THROW(store->parseStorePathCanonical(path), BadStorePath);
+        }
+    }
 }
 
 TEST_F(StorePathTest, mustBeDashAfterHashPart)
