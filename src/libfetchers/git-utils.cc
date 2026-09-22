@@ -1737,6 +1737,10 @@ struct GitDirectorySinkImpl : merkle::DirectorySinkWithFinalize
 
     void insertChild(std::string_view name, merkle::TreeEntry entry) override
     {
+        if (repo.options.canonicalObjects) {
+            merkle::insertEntry(entries, name, entry);
+            return;
+        }
         if (name.empty() || name.find('/') != name.npos || name.find('\0') != name.npos)
             throw Error("invalid name '%s' for a Git tree entry", name);
         auto key = std::string(name);
@@ -2088,8 +2092,11 @@ static std::filesystem::path tarballCacheDir()
      * v2: Must have only packfiles with no loose objects. Should get repacked periodically
      * for optimal packfiles.
      */
-    /* v3: SHA-256 object identifiers, the store's (doc/lazy-store/01-specification.md, section 9.10). */
-    static auto repoDir = std::filesystem::path(getCacheDir()) / "tarball-cache-v3";
+    /* v3: SHA-256 object identifiers, the store's (doc/lazy-store/01-specification.md, section 9.10).
+     * v4: Every written directory has canonical logical names. The v3
+     * writer admitted the reserved case-hack marker, so its objects cannot
+     * establish the canonical provenance required by getKnownEntry. */
+    static auto repoDir = std::filesystem::path(getCacheDir()) / "tarball-cache-v4";
     return repoDir;
 }
 

@@ -70,6 +70,9 @@ time_t dumpPathAndGetMtime(const std::filesystem::path & path, Sink & sink, Path
 
 struct SourceAccessor;
 
+/** Whether filesystem directory names use the case-collision encoding. */
+bool isCaseHackEnabled();
+
 /**
  * The set of paths that `SourceAccessor::dumpPath(path, sink, filter)`
  * would serialise: `path` itself and, below each directory in the set,

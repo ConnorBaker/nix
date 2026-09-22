@@ -39,6 +39,11 @@ static GlobalConfig::Register rArchiveSettings(&archiveSettings);
 
 PathFilter defaultPathFilter = AllPaths{};
 
+bool isCaseHackEnabled()
+{
+    return archiveSettings.useCaseHack;
+}
+
 std::string_view unhackName(std::string_view name)
 {
     size_t pos = name.find(caseHackSuffix);

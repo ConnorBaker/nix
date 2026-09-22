@@ -75,7 +75,11 @@ struct FileSinkBuilder
  */
 struct TarAdapter : TarSink
 {
-    virtual merkle::TreeEntry flush() = 0;
+    /**
+     * When requested, require a directory root and remove its single
+     * enclosing directory, if any, before writing.
+     */
+    virtual merkle::TreeEntry flush(bool stripSingletonRootDirectory = false) = 0;
 };
 
 /**

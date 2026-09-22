@@ -13,6 +13,7 @@
 #include "nix/util/git.hh"
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/terminal.hh"
+#include "nix/util/users.hh"
 #include "nix/util/object-hash.hh"
 #include "nix/util/source-path.hh"
 #include "nix/util/archive.hh"
@@ -43,6 +44,7 @@
 
 #include <rapidcheck/gtest.h>
 #include <algorithm>
+#include <array>
 #include <exception> // IWYU pragma: keep (rapidcheck on Darwin/FreeBSD)
 #include <functional>
 #include <future>
@@ -803,6 +805,133 @@ TEST_F(GitUtilsTest, canonicalEntriesRequireProvenanceAndPreserveEveryMode)
     EXPECT_EQ(canonical->readFile(CanonPath("regular")), "same");
 }
 
+TEST_F(GitUtilsTest, canonicalWriterRequiresLogicalNamesInEveryMode)
+{
+    using merkle::Mode;
+
+    struct Name
+    {
+        std::string value;
+        bool raw;
+        bool canonical;
+    };
+
+    const std::string marker(caseHackSuffix);
+    const std::array names{
+        Name{"", false, false},
+        Name{".", true, false},
+        Name{"..", true, false},
+        Name{"a/b", false, false},
+        Name{std::string("a\0b", 3), false, false},
+        Name{marker, true, false},
+        Name{marker + "x", true, false},
+        Name{"x" + marker + "y", true, false},
+        Name{"x" + marker, true, false},
+        Name{"entry", true, true},
+        Name{".git", true, true},
+        Name{"...", true, true},
+        Name{"x~NIX~CASE~HACK~1", true, true},
+    };
+    const std::array modes{Mode::Regular, Mode::Executable, Mode::Symlink, Mode::Directory};
+    size_t cases = 0;
+    for (bool canonical : {false, true}) {
+        GitRepo::Options options{
+            .create = true, .bare = true, .oidType = HashAlgorithm::SHA256, .canonicalObjects = canonical};
+        auto path = tmpDir / (canonical ? "canonical-names" : "raw-names");
+        auto repo = GitRepo::openRepo(path, options);
+        auto pool = GitRepoPool::create(path, options);
+        auto blob = pool->makeRegularFileSink();
+        (*blob)("contents");
+        const auto blobHash = std::move(*blob).finalize();
+        const auto emptyHash = std::move(*pool->makeDirectorySink()).finalize();
+        for (bool caseHack : {false, true}) {
+            WithCaseHack policy(caseHack);
+            for (size_t n = 0; n != names.size(); ++n)
+                for (auto mode : modes) {
+                    SCOPED_TRACE(
+                        fmt("canonical=%d caseHack=%d name=%d mode=%o", canonical, caseHack, n, (RawMode) mode));
+                    auto sink = pool->makeDirectorySink();
+                    const auto hash = mode == Mode::Directory ? emptyHash : blobHash;
+                    const merkle::TreeEntry entry{mode, hash};
+                    if (canonical ? names[n].canonical : names[n].raw) {
+                        sink->insertChild(names[n].value, entry);
+                        auto tree = std::move(*sink).finalize();
+                        const auto body = fmt("%o ", (RawMode) mode) + names[n].value + '\0'
+                                          + std::string(reinterpret_cast<const char *>(hash.hash), hash.hashSize);
+                        EXPECT_EQ(tree, merkle::treeId(body));
+                        pool->flush();
+                        auto accessor = repo->getAccessor(tree, {}, "name-domain");
+                        if (canonical)
+                            EXPECT_EQ(
+                                accessor->getKnownEntry(CanonPath::root), (merkle::TreeEntry{Mode::Directory, tree}));
+                        else
+                            EXPECT_FALSE(accessor->getKnownEntry(CanonPath::root));
+                    } else
+                        EXPECT_THROW(sink->insertChild(names[n].value, entry), Error);
+                    ++cases;
+                }
+        }
+    }
+    EXPECT_EQ(cases, 208u);
+}
+
+TEST_F(GitUtilsTest, canonicalWriterRequiresOneChildPerLogicalName)
+{
+    using merkle::Mode;
+    const std::array modes{Mode::Regular, Mode::Executable, Mode::Symlink, Mode::Directory};
+    size_t cases = 0;
+    for (bool canonical : {false, true}) {
+        GitRepo::Options options{
+            .create = true, .bare = true, .oidType = HashAlgorithm::SHA256, .canonicalObjects = canonical};
+        auto pool = GitRepoPool::create(tmpDir / (canonical ? "canonical-duplicates" : "raw-duplicates"), options);
+        auto file = pool->makeRegularFileSink();
+        (*file)("value");
+        auto blob = std::move(*file).finalize();
+        auto directory = std::move(*pool->makeDirectorySink()).finalize();
+        for (auto first : modes)
+            for (auto second : modes) {
+                SCOPED_TRACE(fmt("canonical=%d first=%o second=%o", canonical, (RawMode) first, (RawMode) second));
+                auto sink = pool->makeDirectorySink();
+                const merkle::TreeEntry a{first, first == Mode::Directory ? directory : blob};
+                const merkle::TreeEntry b{second, second == Mode::Directory ? directory : blob};
+                sink->insertChild("child", a);
+                merkle::Tree expected{{first == Mode::Directory ? "child/" : "child", a}};
+                if (canonical)
+                    EXPECT_THROW(sink->insertChild("child", b), Error);
+                else {
+                    sink->insertChild("child", b);
+                    expected.insert_or_assign(second == Mode::Directory ? "child/" : "child", b);
+                }
+                EXPECT_EQ(std::move(*sink).finalize(), merkle::treeId(merkle::serialiseTree(expected)));
+                ++cases;
+            }
+    }
+    EXPECT_EQ(cases, 32u);
+}
+
+TEST_F(GitUtilsTest, canonicalTarballCacheDoesNotTrustTheOldNameDomain)
+{
+    GitRepo::Options oldOptions{.create = true, .bare = true, .oidType = HashAlgorithm::SHA256};
+    auto oldPath = getCacheDir() / "tarball-cache-v3";
+    auto oldRepo = GitRepo::openRepo(oldPath, oldOptions);
+    auto oldPool = GitRepoPool::create(oldPath, oldOptions);
+    auto file = oldPool->makeRegularFileSink();
+    (*file)(tmpDir.string());
+    const auto blob = std::move(*file).finalize();
+    auto tree = oldPool->makeDirectorySink();
+    tree->insertChild("entry~nix~case~hack~1", {merkle::Mode::Regular, blob});
+    const auto oldHash = std::move(*tree).finalize();
+    oldPool->flush();
+    ASSERT_TRUE(oldRepo->hasObject(oldHash));
+
+    Settings settings;
+    auto current = settings.getTarballCache();
+    EXPECT_FALSE(current->hasObject(oldHash)) << "v3 writer provenance cannot justify canonical entries";
+    auto currentPool = settings.getTarballWriterPool();
+    auto writer = currentPool->makeDirectorySink();
+    EXPECT_THROW(writer->insertChild("entry~nix~case~hack~1", {merkle::Mode::Regular, blob}), Error);
+}
+
 /* A forwarding accessor that counts the files read through it: the
    discriminator for "no walk" (01 section 9.11, "The cost property"). */
 struct CountingAccessor : SourceAccessor
@@ -848,6 +977,86 @@ struct CountingAccessor : SourceAccessor
         return inner->getFingerprint(path);
     }
 };
+
+/* A source name identifies the physical tree; the directory-name decoding
+   policy is a separate argument to its Git/NAR fold. Reusing a successful
+   fold must not turn a later reserved-name error into a cached success. */
+TEST_F(GitUtilsTest, namedMemoIncludesDirectoryNameDecoding)
+{
+    nix::initLibStore(/*loadConfig=*/false);
+    auto store = make_ref<DummyStoreConfig>(StoreReference::Params{})->openStore();
+    auto repo = openRepo();
+    auto pool = openWriterPool();
+    size_t serial = 0;
+    for (bool firstHack : {false, true})
+        for (bool secondHack : {false, true})
+            for (auto method : {ContentAddressMethod::Raw::Git, ContentAddressMethod::Raw::NixArchive})
+                for (bool persistent : {false, true})
+                    for (bool suffixed : {false, true}) {
+                        SCOPED_TRACE(
+                            fmt("first=%d second=%d method=%d persistent=%d suffix=%d",
+                                firstHack,
+                                secondHack,
+                                static_cast<int>(method),
+                                persistent,
+                                suffixed));
+                        const auto contents = fmt("decoding-cell-%d", serial++);
+                        const auto physical = suffixed ? "file" + std::string(caseHackSuffix) + "7" : "file";
+                        auto directory = pool->makeDirectorySink();
+                        directory->insertChild(physical, writeString(*pool, contents));
+                        auto tree = std::move(*directory).finalize();
+                        pool->flush();
+                        auto source = make_ref<CountingAccessor>(repo->getAccessor(tree, {}, "decoding"));
+                        ASSERT_TRUE(source->getFingerprint(CanonPath::root));
+
+                        /* The independent expected tree has the logical name,
+                           with neither source naming nor memoisation. */
+                        auto logical = make_ref<MemorySourceAccessor>();
+                        MemorySink sink{*logical};
+                        sink.createDirectory(CanonPath::root);
+                        sink.createRegularFile(CanonPath("file"), [&](auto & file) { file(contents); });
+                        auto expected =
+                            store->computeStorePath("source", SourcePath(logical), method, HashAlgorithm::SHA256);
+
+                        Settings firstSettings;
+                        {
+                            WithCaseHack setting(firstHack);
+                            auto fetch = [&] {
+                                return fetchToStore2(
+                                    firstSettings, *store, SourcePath(source), FetchMode::DryRun, "source", method);
+                            };
+                            if (suffixed && !firstHack)
+                                EXPECT_THROW(fetch(), Error);
+                            else
+                                EXPECT_EQ(fetch(), expected);
+                        }
+
+                        /* A fresh Settings has no in-process memo, but shares
+                           this fixture's persistent fetcher cache. */
+                        Settings nextSettings;
+                        source->reads = 0;
+                        {
+                            WithCaseHack setting(secondHack);
+                            auto fetch = [&] {
+                                return fetchToStore2(
+                                    persistent ? nextSettings : firstSettings,
+                                    *store,
+                                    SourcePath(source),
+                                    FetchMode::DryRun,
+                                    "source",
+                                    method);
+                            };
+                            if (suffixed && !secondHack)
+                                EXPECT_THROW(fetch(), Error);
+                            else {
+                                EXPECT_EQ(fetch(), expected);
+                                if (firstHack == secondHack)
+                                    EXPECT_EQ(source->reads, 0u);
+                            }
+                        }
+                    }
+    EXPECT_EQ(serial, 32u);
+}
 
 /* The shim (01 section 9.11; 04 section 1.9, the fetchers' and the language's representation):
    `narHashOf(settings, store, tree, treeHash)` is the NAR hash of a tree the

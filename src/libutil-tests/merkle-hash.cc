@@ -222,6 +222,23 @@ TEST(MerkleHash, serialiseTreeIsGitsBody)
     EXPECT_NO_THROW(merkle::insertEntry(t, "...", {.mode = Mode::Regular, .hash = hA}));
 }
 
+TEST(MerkleHash, logicalNamesNeverContainThePhysicalCaseHackMarker)
+{
+    const std::array modes{Mode::Directory, Mode::Regular, Mode::Executable, Mode::Symlink};
+    const std::string marker(caseHackSuffix);
+    const std::array names{marker, marker + "x", "x" + marker + "y", "x" + marker};
+    const auto hash = merkle::blobId("contents");
+    for (bool caseHack : {false, true}) {
+        WithCaseHack policy(caseHack);
+        for (auto mode : modes)
+            for (auto & name : names) {
+                merkle::Tree tree;
+                EXPECT_THROW(merkle::insertEntry(tree, name, {mode, hash}), Error);
+                EXPECT_TRUE(tree.empty());
+            }
+    }
+}
+
 TEST(MerkleHash, insertEntryRequiresUniqueLogicalNamesInEveryModePair)
 {
     const std::array modes{Mode::Directory, Mode::Regular, Mode::Executable, Mode::Symlink};

@@ -104,4 +104,65 @@ TEST(LocalBinaryCacheStore, validityCachesTheReadMetadataAndPropagatesCorruption
     }
 }
 
+TEST(LocalBinaryCacheStore, publicationInvalidatesTheHashOnlyName)
+{
+    initLibStore(false);
+    auto tmpDir = createTempDir();
+    AutoDelete cleanup{tmpDir};
+    const std::string contents = "published after an absent-path observation";
+    enum class Query { Validity, Description, Hash };
+    unsigned cells = 0;
+    for (bool memoryCache : {false, true})
+        for (auto name : {"canonical", Store::MissingName})
+            for (auto query : {Query::Validity, Query::Description, Query::Hash})
+                for (unsigned requested = 0; requested < (query == Query::Hash ? 1u : 3u); ++requested) {
+                    SCOPED_TRACE(
+                        fmt("memory=%d name=%s query=%d requested=%d", memoryCache, name, int(query), requested));
+                    auto store = make_ref<LocalBinaryCacheStoreConfig>(
+                                     tmpDir / std::to_string(cells++),
+                                     StoreConfig::Params{
+                                         {"path-info-cache-size", memoryCache ? "16" : "0"}, {"compression", "none"}})
+                                     ->openStore();
+                    auto expected = store->makeFixedOutputPath(
+                        name,
+                        FixedOutputInfo{
+                            .method = FileIngestionMethod::Flat,
+                            .hash = hashString(HashAlgorithm::SHA256, contents),
+                            .references = {},
+                        });
+                    auto hash = std::string(expected.hashPart());
+                    auto wildcard = StorePath(hash + '-' + Store::MissingName);
+                    auto wrong = StorePath(hash + "-wrong-name");
+                    auto before = requested == 0 ? expected : requested == 1 ? wrong : wildcard;
+                    switch (query) {
+                    case Query::Validity:
+                        EXPECT_FALSE(store->isValidPath(before));
+                        break;
+                    case Query::Description:
+                        EXPECT_THROW(store->queryPathInfo(before), InvalidPath);
+                        break;
+                    case Query::Hash:
+                        EXPECT_FALSE(store->queryPathFromHashPart(hash));
+                        break;
+                    }
+
+                    StringSource source{contents};
+                    auto published = store->addToStoreFromDump(
+                        source, name, FileSerialisationMethod::Flat, ContentAddressMethod::Raw::Flat);
+                    EXPECT_EQ(published, expected);
+                    EXPECT_TRUE(store->isValidPath(published));
+                    EXPECT_TRUE(store->isValidPath(wildcard));
+                    EXPECT_FALSE(store->isValidPath(wrong));
+                    EXPECT_NO_THROW(EXPECT_EQ(store->queryPathInfo(wildcard)->path, published));
+                    EXPECT_EQ(store->queryPathFromHashPart(hash), published);
+
+                    /* A hash-only positive is also a description of this
+                       publication, not of every later metadata update. */
+                    Signature signature{.keyName = "new-signature", .sig = std::string(64, '\0')};
+                    store->addSignatures(published, {signature});
+                    EXPECT_NO_THROW(EXPECT_TRUE(store->queryPathInfo(wildcard)->sigs.contains(signature)));
+                }
+    EXPECT_EQ(cells, 28u);
+}
+
 } // namespace nix

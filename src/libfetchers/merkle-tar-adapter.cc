@@ -294,14 +294,26 @@ struct TarAdapterImpl : merkle::TarAdapter
         throw;
     }
 
-    merkle::TreeEntry flush() override
+    merkle::TreeEntry flush(bool stripSingletonRootDirectory) override
     {
         /* Wait for the files to be written. An exception in a worker is
            propagated here, so every hash below is filled in. */
         workers.process();
 
-        /* Write the directories, children before parents, which the
-           recursion gives us for free. */
+        /* Fetchers discard one enclosing directory. Do that projection
+           before writing: the discarded archive name is not a name in
+           the rendered tree, and need not be a canonical logical name. */
+        const Child * projected = &root;
+        if (stripSingletonRootDirectory) {
+            auto * directory = std::get_if<Directory>(&root);
+            if (!directory)
+                throw Error("tarball root is not a directory");
+            if (directory->children.size() == 1)
+                if (auto & child = directory->children.begin()->second; std::holds_alternative<Directory>(child))
+                    projected = &child;
+        }
+
+        /* Write the directories, children before parents. */
         auto entry = [&store = store](this const auto & write, const Child & child) -> merkle::TreeEntry {
             return {
                 .mode = std::visit([](const auto & sub) { return sub.mode(); }, child),
@@ -322,7 +334,7 @@ struct TarAdapterImpl : merkle::TarAdapter
                     },
                     child),
             };
-        }(root);
+        }(*projected);
 
         store.flush();
 

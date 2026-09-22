@@ -42,6 +42,8 @@ std::pair<StorePath, Hash> fetchToStore2(
  * the NAR method the row is `{hash}`; under the git method it is the
  * node's entry, `{hash, mode}` (01 §9.9, §9.11), and the key carries
  * `version = 2` so that the hash-only rows of the earlier form are misses.
+ * Git and NAR keys also carry the directory-name decoding policy; older
+ * rows that omitted this argument are misses.
  */
 fetchers::Cache::Key
 makeSourcePathToHashCacheKey(std::string_view fingerprint, ContentAddressMethod method, const CanonPath & path);

@@ -95,7 +95,7 @@ Hash treeId(std::string_view body)
 void insertEntry(Tree & tree, std::string_view name, const TreeEntry & entry)
 {
     if (name.empty() || name == "." || name == ".." || name.find('/') != std::string_view::npos
-        || name.find('\0') != std::string_view::npos)
+        || name.find('\0') != std::string_view::npos || name.find(caseHackSuffix) != std::string_view::npos)
         throw Error("invalid tree entry name '%s'", name);
     std::string key(name);
     /* The trailing slash orders directories; it does not make a second

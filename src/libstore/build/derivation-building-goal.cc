@@ -602,9 +602,12 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
 #else
     std::unique_ptr<HookInstance> hook = std::move(worker.hook);
 
-    /* Set up callback so childTerminated is called if the hook is
-       destroyed (e.g., during failure cascades). */
-    hook->onKillChild = [this]() { worker.childTerminated(this, JobCategory::Build); };
+    /* A terminated hook may have published outputs through another Store,
+       including when it is destroyed during a failure cascade. */
+    hook->onKillChild = [this]() {
+        worker.childTerminated(this, JobCategory::Build);
+        worker.store.clearPathInfoCache();
+    };
 
     std::string machineName = [&hook]() {
         try {
@@ -740,8 +743,10 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
     buildResult.timesBuilt++;
     buildResult.stopTime = time(nullptr);
 
-    /* So the child is gone now. */
+    /* The hook published through a separate Store instance. Discard our
+       pre-build observations before querying its outputs. */
     worker.childTerminated(this);
+    worker.store.clearPathInfoCache();
 
     /* Close the read side of the logger pipe. */
     hook->builderOut.readSide.close();

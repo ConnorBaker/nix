@@ -135,14 +135,20 @@ void BinaryCacheStore::writeNarInfo(ref<NarInfo> narInfo)
 
     upsertFile(narInfoFile, narInfo->to_string(*this), "text/x-nix-narinfo");
 
-    if (pathInfoCache)
-        pathInfoCache->lock()->upsert(narInfo->path, PathInfoCacheValue{.value = std::shared_ptr<NarInfo>(narInfo)});
-
     if (diskCache)
         diskCache->upsertNarInfo(
             config.getReference().render(/*FIXME withParams=*/false),
             std::string(narInfo->path.hashPart()),
             std::shared_ptr<NarInfo>(narInfo));
+
+    if (pathInfoCache) {
+        auto cache = pathInfoCache->lock();
+        /* The hash-only name may hold an earlier absence or description.
+           Replace it after disk publication, then seed the actual path;
+           that path may itself have the placeholder name. */
+        cache->erase(StorePath(std::string(narInfo->path.hashPart()) + '-' + MissingName));
+        cache->upsert(narInfo->path, PathInfoCacheValue{.value = std::shared_ptr<NarInfo>(narInfo)});
+    }
 }
 
 ref<NarInfo>

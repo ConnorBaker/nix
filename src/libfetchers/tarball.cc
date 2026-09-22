@@ -203,11 +203,10 @@ static DownloadTarballResult downloadTarball_(
         TarArchive{path};
     })
                                                                                     : TarArchive{*source};
-    auto tarballCache = settings.getTarballCache();
     auto writerPool = settings.getTarballWriterPool();
     auto parseSink = merkle::makeTarSink(*writerPool);
     auto lastModified = unpackTarfileToSink(archive, *parseSink);
-    auto tree = parseSink->flush();
+    auto tree = parseSink->flush(/*stripSingletonRootDirectory=*/true);
 
     act.reset();
 
@@ -221,7 +220,7 @@ static DownloadTarballResult downloadTarball_(
         infoAttrs = cached->value;
     } else {
         infoAttrs.insert_or_assign("etag", res->etag);
-        infoAttrs.insert_or_assign("treeHash", tarballCache->dereferenceSingletonDirectory(tree.hash).gitRev());
+        infoAttrs.insert_or_assign("treeHash", tree.hash.gitRev());
         infoAttrs.insert_or_assign("lastModified", uint64_t(lastModified));
         if (res->immutableUrl)
             infoAttrs.insert_or_assign("immutableUrl", *res->immutableUrl);

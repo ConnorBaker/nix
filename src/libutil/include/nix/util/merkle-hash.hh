@@ -78,7 +78,8 @@ Hash treeId(std::string_view body);
  * Insert under the "/" convention: the key is the name, with "/" appended
  * when the entry is a directory.
  *
- * @throws Error if the name is empty, "." or "..", or contains '/' or NUL,
+ * @throws Error if the name is empty, "." or "..", or contains '/', NUL,
+ * or the reserved case-hack marker,
  * or if the tree already has an entry of that name — each is a bug in the
  * caller, since no directory yields such a name or a name twice.
  */

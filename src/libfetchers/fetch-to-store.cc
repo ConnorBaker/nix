@@ -18,9 +18,10 @@ struct SrcToStore
     /* A fingerprint names the current view. Accessor identity does not:
        grafts and allow lists can grow without replacing their accessor.
        The address also depends on the logical store directory and output
-       name. This memo retains neither sources nor stores, and an address
+       name, and directory folds depend on the name-decoding policy.
+       This memo retains neither sources nor stores, and an address
        makes no claim about its presence in the requested store. */
-    using Key = std::tuple<std::string, CanonPath, ContentAddressMethod::Raw, std::string, std::string>;
+    using Key = std::tuple<std::string, CanonPath, ContentAddressMethod::Raw, std::string, std::string, bool>;
     using Result = std::pair<StorePath, Hash>;
     boost::concurrent_flat_map<Key, Result> cache;
 };
@@ -30,6 +31,21 @@ ref<SrcToStore> fetchers::Settings::createSrcToStore()
     return make_ref<SrcToStore>();
 }
 
+/* Flat and text methods read only root bytes. Git and NAR also interpret
+   directory names, so their memo keys must include that interpretation. */
+static bool decodesDirectoryNames(ContentAddressMethod method)
+{
+    switch (method.raw) {
+    case ContentAddressMethod::Raw::Flat:
+    case ContentAddressMethod::Raw::Text:
+        return false;
+    case ContentAddressMethod::Raw::Git:
+    case ContentAddressMethod::Raw::NixArchive:
+        return true;
+    }
+    unreachable();
+}
+
 fetchers::Cache::Key
 makeSourcePathToHashCacheKey(std::string_view fingerprint, ContentAddressMethod method, const CanonPath & path)
 {
@@ -37,6 +53,8 @@ makeSourcePathToHashCacheKey(std::string_view fingerprint, ContentAddressMethod 
         {"fingerprint", std::string(fingerprint)}, {"method", std::string{method.render()}}, {"path", path.abs()}};
     if (method == ContentAddressMethod::Raw::Git)
         attrs.insert_or_assign("version", uint64_t(2));
+    if (decodesDirectoryNames(method))
+        attrs.insert_or_assign("caseHack", uint64_t(isCaseHackEnabled()));
     return fetchers::Cache::Key{"sourcePathToHash", std::move(attrs)};
 }
 
@@ -367,7 +385,13 @@ std::pair<StorePath, Hash> fetchToStore2(
     const auto rootName = filter ? std::nullopt : path.accessor->getFingerprint(path.path);
     std::optional<SrcToStore::Key> srcToStoreKey;
     if (rootName && !repair)
-        srcToStoreKey.emplace(rootName->second, rootName->first, method.raw, store.storeDir, name);
+        srcToStoreKey.emplace(
+            rootName->second,
+            rootName->first,
+            method.raw,
+            store.storeDir,
+            name,
+            decodesDirectoryNames(method) && isCaseHackEnabled());
 
     auto useResult = [&](SrcToStore::Result result) -> std::optional<SrcToStore::Result> {
         if (mode != FetchMode::DryRun) {

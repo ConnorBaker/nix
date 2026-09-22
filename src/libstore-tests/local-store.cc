@@ -5324,6 +5324,29 @@ static std::string rawObjectTreeEntry(merkle::Mode mode, std::string_view name, 
            + std::string(reinterpret_cast<const char *>(hash.hash), hash.hashSize);
 }
 
+TEST_F(LocalStoreObjectsTest, canonicalTreeBodiesRejectReservedPhysicalNames)
+{
+    using merkle::Mode;
+    const std::array modes{Mode::Regular, Mode::Executable, Mode::Symlink, Mode::Directory};
+    const std::string marker(caseHackSuffix);
+    const std::array names{marker, marker + "x", "x" + marker + "y", "x" + marker};
+    const auto hash = merkle::blobId("child");
+    size_t cases = 0;
+    for (bool caseHack : {false, true}) {
+        WithCaseHack policy(caseHack);
+        for (auto mode : modes)
+            for (auto & name : names) {
+                const auto body = rawObjectTreeEntry(mode, name, hash);
+                const auto id = merkle::treeId(body);
+                EXPECT_THAT(
+                    [&] { parseTreeBody(id, body); },
+                    ::testing::ThrowsMessage<Error>(::testing::HasSubstr(GitObjectStore::idString(id))));
+                ++cases;
+            }
+    }
+    EXPECT_EQ(cases, 32u);
+}
+
 TEST_F(LocalStoreObjectsTest, parseTreeBodyRequiresUniqueLogicalNamesInEveryModePair)
 {
     using merkle::Mode;

@@ -2,6 +2,8 @@
 #include "nix/fetchers/merkle-tar-adapter.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/memory-source-accessor.hh"
+#include "nix/util/object-hash-sink.hh"
+#include "nix/util/tests/setting-scopes.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/tests/capture-logging.hh"
 #include "nix/util/tests/gmock-matchers.hh"
@@ -9,6 +11,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <rapidcheck/gtest.h>
+#include <array>
 
 namespace nix {
 
@@ -814,6 +817,164 @@ TEST_F(MerkleTarAdapterTest, last_wins_at_root)
     pool->flush();
     auto accessor = getAccessor(dirHash);
     ASSERT_THAT(accessor, testing::HasSymlink(CanonPath("link"), "second-target"));
+}
+
+TEST_F(MerkleTarAdapterTest, canonicalNamesApplyAfterTheRequestedRootProjection)
+{
+    using merkle::Mode;
+    const std::array modes{Mode::Regular, Mode::Executable, Mode::Symlink, Mode::Directory};
+    GitRepo::Options options{.create = true, .bare = true, .oidType = HashAlgorithm::SHA256, .canonicalObjects = true};
+    auto path = tmpDir / "canonical-projection";
+    auto repo = GitRepo::openRepo(path, options);
+    auto pool = GitRepoPool::create(path, options);
+    size_t cases = 0;
+    for (bool strip : {false, true})
+        for (bool singleton : {false, true})
+            for (bool reserved : {false, true})
+                for (auto mode : modes) {
+                    SCOPED_TRACE(
+                        fmt("strip=%d singleton=%d reserved=%d mode=%o", strip, singleton, reserved, (RawMode) mode));
+                    auto sink = merkle::makeTarSink(*pool);
+                    const auto name = reserved ? "entry~nix~case~hack~1" : "entry";
+                    const auto entry = CanonPath(name);
+                    if (mode == Mode::Directory) {
+                        sink->createDirectory(entry);
+                        sink->createRegularFile(entry / "leaf", false, [](Sink & bytes) { bytes("contents"); });
+                    } else if (mode == Mode::Symlink)
+                        sink->createSymlink(entry, "target");
+                    else
+                        sink->createRegularFile(
+                            entry, mode == Mode::Executable, [](Sink & bytes) { bytes("contents"); });
+                    if (!singleton)
+                        sink->createRegularFile(CanonPath("sibling"), false, [](Sink & bytes) { bytes("sibling"); });
+                    const bool discarded = strip && singleton && mode == Mode::Directory;
+                    if (reserved && !discarded) {
+                        EXPECT_THROW(sink->flush(strip), Error);
+                        pool->flush();
+                    } else {
+                        auto tree = sink->flush(strip);
+                        auto view = repo->getAccessor(tree.hash, {}, "projected");
+                        EXPECT_EQ(view->getKnownEntry(CanonPath::root), objectHashOf(*view, CanonPath::root).root);
+                        if (discarded) {
+                            EXPECT_EQ(view->readDirectory(CanonPath::root).size(), 1u);
+                            EXPECT_EQ(view->readFile(CanonPath("leaf")), "contents");
+                        } else {
+                            EXPECT_EQ(view->readDirectory(CanonPath::root).size(), singleton ? 1u : 2u);
+                            EXPECT_TRUE(view->pathExists(entry));
+                            if (!singleton)
+                                EXPECT_EQ(view->readFile(CanonPath("sibling")), "sibling");
+                        }
+                    }
+                    ++cases;
+                }
+    EXPECT_EQ(cases, 32u);
+}
+
+TEST_F(MerkleTarAdapterTest, rootProjectionRequiresADirectoryAndGenericFlushRetainsEveryMode)
+{
+    using merkle::Mode;
+    const std::array modes{Mode::Regular, Mode::Executable, Mode::Symlink, Mode::Directory};
+    auto pool = openWriterPool();
+    for (bool strip : {false, true})
+        for (auto mode : modes) {
+            SCOPED_TRACE(fmt("strip=%d mode=%o", strip, (RawMode) mode));
+            auto sink = merkle::makeTarSink(*pool);
+            if (mode == Mode::Directory)
+                sink->createDirectory(CanonPath::root);
+            else if (mode == Mode::Symlink)
+                sink->createSymlink(CanonPath::root, "target");
+            else
+                sink->createRegularFile(
+                    CanonPath::root, mode == Mode::Executable, [](Sink & bytes) { bytes("contents"); });
+            if (strip && mode != Mode::Directory)
+                EXPECT_THROW(sink->flush(strip), Error);
+            else
+                EXPECT_EQ(sink->flush(strip).mode, mode);
+        }
+}
+
+TEST_F(MerkleTarAdapterTest, projectedWrapperNamesDoNotRewriteLinkTargetsOrAliases)
+{
+    GitRepo::Options options{.create = true, .bare = true, .oidType = HashAlgorithm::SHA256, .canonicalObjects = true};
+    auto path = tmpDir / "canonical-links";
+    auto repo = GitRepo::openRepo(path, options);
+    auto pool = GitRepoPool::create(path, options);
+    for (bool executable : {false, true}) {
+        auto sink = merkle::makeTarSink(*pool);
+        const auto root = CanonPath("wrapper~nix~case~hack~1");
+        sink->createRegularFile(root / "file", executable, [](Sink & bytes) { bytes("contents"); });
+        /* CanonPath resolves spelling aliases before the tar map's
+           existing last-entry and hard-link rules are applied. */
+        sink->createRegularFile(
+            CanonPath(root.abs() + "/./dir/../file"), executable, [](Sink & bytes) { bytes("last"); });
+        sink->createHardlink(root / "alias", CanonPath(root.abs() + "//./file"));
+        const std::string target = "../wrapper~nix~case~hack~1/file";
+        sink->createSymlink(root / "link", target);
+        auto tree = sink->flush(/*stripSingletonRootDirectory=*/true);
+        auto view = repo->getAccessor(tree.hash, {}, "projected-links");
+        EXPECT_EQ(view->readFile(CanonPath("file")), "last");
+        EXPECT_EQ(view->readFile(CanonPath("alias")), "last");
+        EXPECT_EQ(view->lstat(CanonPath("alias")).isExecutable, executable);
+        EXPECT_EQ(view->readLink(CanonPath("link")), target);
+        EXPECT_EQ(view->getKnownEntry(CanonPath("alias")), view->getKnownEntry(CanonPath("file")));
+        EXPECT_EQ(view->getKnownEntry(CanonPath::root), objectHashOf(*view, CanonPath::root).root);
+    }
+}
+
+/* An independent one-member ustar encoding: the parser, not a direct
+   TarSink call, supplies the tested path and file type. */
+static std::string oneMemberTar(std::string_view name)
+{
+    std::string header(512, '\0');
+    header.replace(0, name.size(), name);
+    header.replace(100, 8, std::string("0000644", 7) + '\0');
+    header.replace(108, 8, std::string("0000000", 7) + '\0');
+    header.replace(116, 8, std::string("0000000", 7) + '\0');
+    header.replace(124, 12, std::string("00000000001", 11) + '\0');
+    header.replace(136, 12, std::string("00000000000", 11) + '\0');
+    header.replace(148, 8, 8, ' ');
+    header[156] = '0';
+    header.replace(257, 6, std::string("ustar\0", 6));
+    header.replace(263, 2, "00");
+    unsigned checksum = 0;
+    for (unsigned char c : header)
+        checksum += c;
+    header.replace(148, 8, fmt("%06o", checksum) + '\0' + ' ');
+    return header + "x" + std::string(511 + 1024, '\0');
+}
+
+TEST_F(MerkleTarAdapterTest, tarImportRejectsRetainedReservedNamesButAllowsDiscardedWrappers)
+{
+    GitRepo::Options options{.create = true, .bare = true, .oidType = HashAlgorithm::SHA256, .canonicalObjects = true};
+    auto path = tmpDir / "canonical-tar";
+    auto repo = GitRepo::openRepo(path, options);
+    auto pool = GitRepoPool::create(path, options);
+    size_t cases = 0;
+    for (bool caseHack : {false, true}) {
+        WithCaseHack policy(caseHack);
+        for (bool reservedWrapper : {false, true})
+            for (bool reservedLeaf : {false, true}) {
+                SCOPED_TRACE(fmt("caseHack=%d wrapper=%d leaf=%d", caseHack, reservedWrapper, reservedLeaf));
+                const std::string wrapper = reservedWrapper ? "wrapper~nix~case~hack~1" : "wrapper";
+                const std::string leaf = reservedLeaf ? "leaf~nix~case~hack~1" : "leaf";
+                const auto bytes = oneMemberTar(wrapper + "/" + leaf);
+                StringSource source(bytes);
+                TarArchive archive(source);
+                auto sink = merkle::makeTarSink(*pool);
+                unpackTarfileToSink(archive, *sink);
+                if (reservedLeaf) {
+                    EXPECT_THROW(sink->flush(/*stripSingletonRootDirectory=*/true), Error);
+                    pool->flush();
+                } else {
+                    auto tree = sink->flush(/*stripSingletonRootDirectory=*/true);
+                    auto view = repo->getAccessor(tree.hash, {}, "tar-import");
+                    EXPECT_EQ(view->readFile(CanonPath("leaf")), "x");
+                    EXPECT_EQ(view->getKnownEntry(CanonPath::root), objectHashOf(*view, CanonPath::root).root);
+                }
+                ++cases;
+            }
+    }
+    EXPECT_EQ(cases, 8u);
 }
 
 // Property-based test: last entry for each path wins

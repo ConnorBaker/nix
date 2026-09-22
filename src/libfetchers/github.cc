@@ -308,16 +308,14 @@ struct GitArchiveInputScheme : InputScheme
             *logger, lvlInfo, actUnknown, fmt("unpacking '%s' into the Git cache", input.to_string()));
 
         TarArchive archive{*source};
-        auto tarballCache = settings.getTarballCache();
         auto writerPool = settings.getTarballWriterPool();
         auto parseSink = merkle::makeTarSink(*writerPool);
         auto lastModified = unpackTarfileToSink(archive, *parseSink);
-        auto tree = parseSink->flush();
+        auto tree = parseSink->flush(/*stripSingletonRootDirectory=*/true);
 
         act.reset();
 
-        TarballInfo tarballInfo{
-            .treeHash = tarballCache->dereferenceSingletonDirectory(tree.hash), .lastModified = lastModified};
+        TarballInfo tarballInfo{.treeHash = tree.hash, .lastModified = lastModified};
 
         cache->upsert(treeHashKey, Attrs{{"treeHash", tarballInfo.treeHash.gitRev()}});
         cache->upsert(lastModifiedKey, Attrs{{"lastModified", (uint64_t) tarballInfo.lastModified}});
