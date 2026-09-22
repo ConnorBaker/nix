@@ -108,7 +108,7 @@ void FilteringSourceAccessor::readDirectoryScoped(
                     return owner->allowsConcurrentTraversal() && next->allowsConcurrentTraversal();
                 }
 
-                std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & p) override
+                std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & p) override
                 {
                     return owner->getFingerprint(original / p);
                 }
@@ -135,13 +135,15 @@ std::string FilteringSourceAccessor::showPath(const CanonPath & path)
     return displayPrefix + next->showPath(prefix / path) + displaySuffix;
 }
 
-std::pair<CanonPath, std::optional<std::string>> FilteringSourceAccessor::getFingerprint(const CanonPath & path)
+std::optional<std::pair<CanonPath, std::string>> FilteringSourceAccessor::getFingerprint(const CanonPath & path)
 {
     /* A filtered subtree is not the inner subtree, so the inner name does
        not name it.  A subclass that knows what it admits below `path`
        names the subtree (the fixed-set accessor below, the allow list
        under an allowed prefix); the rest give no name. */
-    return {path, fingerprint};
+    if (fingerprint)
+        return std::pair{path, *fingerprint};
+    return std::nullopt;
 }
 
 void FilteringSourceAccessor::checkAccess(const CanonPath & path)
@@ -215,10 +217,10 @@ public:
         prefixes->erase(first, after);
     }
 
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
         if (fingerprint)
-            return {path, fingerprint};
+            return std::pair{path, *fingerprint};
         /* At or under an allowed prefix everything is admitted, so the
            subtree is the inner one and carries its name.  Elsewhere, at an
            ancestor of a prefix for instance, entries are hidden, and the
@@ -227,7 +229,7 @@ public:
         auto after = prefixes->upper_bound(path);
         if (after != prefixes->begin() && path.isWithin(*std::prev(after)))
             return next->getFingerprint(prefix / path);
-        return {path, std::nullopt};
+        return std::nullopt;
     }
 };
 
@@ -272,13 +274,14 @@ public:
         return accepted.contains(path);
     }
 
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
         if (fingerprint)
-            return {path, fingerprint};
-        auto [innerPath, innerName] = next->getFingerprint(prefix / path);
-        if (!innerName)
-            return {path, std::nullopt};
+            return std::pair{path, *fingerprint};
+        auto inner = next->getFingerprint(prefix / path);
+        if (!inner)
+            return std::nullopt;
+        const auto & [innerPath, innerName] = *inner;
         /* The admitted set below `path`, relative to it, in canonical form:
            the NAR of the filtered subtree depends on nothing else beyond
            the inner subtree.  The name is for this subtree exactly, hence
@@ -289,10 +292,10 @@ public:
                 below += p.removePrefix(path).abs();
                 below += '\0';
             }
-        return {
+        return std::pair{
             CanonPath::root,
             nlohmann::json::array({"filter",
-                                   *innerName,
+                                   innerName,
                                    innerPath.abs(),
                                    hashString(HashAlgorithm::SHA256, below).to_string(HashFormat::Nix32, false)})
                 .dump()};

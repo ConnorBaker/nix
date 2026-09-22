@@ -1108,19 +1108,22 @@ public:
      * so only a name given for the whole stands; export-ignore is its
      * wrapper's to name (doc/lazy-store/01-specification.md, section 8.2).
      */
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
         auto state(state_.lock());
 
-        if (state->options.smudgeLfs)
-            return {path, fingerprint};
+        if (state->options.smudgeLfs) {
+            if (fingerprint)
+                return std::pair{path, *fingerprint};
+            return std::nullopt;
+        }
 
         /* The version tags the rendering of a Git object as a NAR; a
            change to that rendering must change it.  Built by appending, not
            by `fmt`: this runs once per node of a naming walk, and the
            formatter and the hexadecimal string it is handed are two thirds
            of what naming a node costs (`05` section 6). */
-        auto name = [](std::string_view kind, const git_oid & oid) -> std::optional<std::string> {
+        auto name = [](std::string_view kind, const git_oid & oid) -> std::string {
             auto hash = toHash(oid);
             std::string s;
             s.reserve(sizeof("git-object-v1:") + kind.size() + base16::encodedLength(hash.hashSize));
@@ -1132,7 +1135,7 @@ public:
         };
 
         if (path.isRoot())
-            return {
+            return std::pair{
                 CanonPath::root,
                 name(
                     git_object_type(state->root.get()) == GIT_OBJECT_TREE ? "tree" : "blob",
@@ -1140,24 +1143,24 @@ public:
 
         auto entry = lookup(*state, path);
         if (!entry)
-            return {path, std::nullopt};
+            return std::nullopt;
 
         switch (git_tree_entry_filemode(entry)) {
         case GIT_FILEMODE_TREE:
-            return {CanonPath::root, name("tree", *git_tree_entry_id(entry))};
+            return std::pair{CanonPath::root, name("tree", *git_tree_entry_id(entry))};
         case GIT_FILEMODE_BLOB:
-            return {CanonPath::root, name("blob", *git_tree_entry_id(entry))};
+            return std::pair{CanonPath::root, name("blob", *git_tree_entry_id(entry))};
         case GIT_FILEMODE_BLOB_EXECUTABLE:
-            return {CanonPath::root, name("blob-executable", *git_tree_entry_id(entry))};
+            return std::pair{CanonPath::root, name("blob-executable", *git_tree_entry_id(entry))};
         case GIT_FILEMODE_LINK:
-            return {CanonPath::root, name("symlink", *git_tree_entry_id(entry))};
+            return std::pair{CanonPath::root, name("symlink", *git_tree_entry_id(entry))};
         case GIT_FILEMODE_COMMIT:
             /* Rendered as an empty directory whatever the commit is. */
-            return {CanonPath::root, std::string("git-object-v1:empty-directory")};
+            return std::pair{CanonPath::root, std::string("git-object-v1:empty-directory")};
         case GIT_FILEMODE_UNREADABLE:
-            return {path, std::nullopt};
+            return std::nullopt;
         }
-        return {path, std::nullopt};
+        return std::nullopt;
     }
 
     /**

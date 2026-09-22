@@ -71,34 +71,34 @@ TEST(FixedSetFilter, namesByTheInnerNameAndTheAdmittedSet)
     auto w1 = makeFixedSetFilteringSourceAccessor(SourcePath(inner), set);
     auto w2 = makeFixedSetFilteringSourceAccessor(SourcePath(namedTree("T")), set);
     auto name1 = w1->getFingerprint(CanonPath::root);
-    ASSERT_TRUE(name1.second);
-    EXPECT_EQ(name1.first, CanonPath::root);
+    ASSERT_TRUE(name1);
+    EXPECT_EQ(name1->first, CanonPath::root);
     /* Same inner name, same set: same name. */
     EXPECT_EQ(name1, w2->getFingerprint(CanonPath::root));
 
     /* Another set, another name. */
     auto w3 = makeFixedSetFilteringSourceAccessor(SourcePath(inner), filteredPaths(*inner, CanonPath::root, rejectTop));
-    EXPECT_NE(name1.second, w3->getFingerprint(CanonPath::root).second);
+    EXPECT_NE(name1->second, w3->getFingerprint(CanonPath::root).value().second);
 
     /* Another inner name, another name. */
     auto w4 = makeFixedSetFilteringSourceAccessor(SourcePath(namedTree("U")), set);
-    EXPECT_NE(name1.second, w4->getFingerprint(CanonPath::root).second);
+    EXPECT_NE(name1->second, w4->getFingerprint(CanonPath::root).value().second);
 
     /* A subtree is named by the set below it; at a subtree the filter
        does not touch, the name still differs from the inner name, since
        it says the set is the whole. */
     auto atKeep = w1->getFingerprint(CanonPath("keep"));
-    ASSERT_TRUE(atKeep.second);
-    EXPECT_EQ(atKeep.first, CanonPath::root);
-    EXPECT_NE(atKeep.second, name1.second);
+    ASSERT_TRUE(atKeep);
+    EXPECT_EQ(atKeep->first, CanonPath::root);
+    EXPECT_NE(atKeep->second, name1->second);
 
     /* An unnamed inner tree gives an unnamed filtered tree. */
     auto w5 = makeFixedSetFilteringSourceAccessor(SourcePath(namedTree(std::nullopt)), set);
-    EXPECT_FALSE(w5->getFingerprint(CanonPath::root).second);
+    EXPECT_FALSE(w5->getFingerprint(CanonPath::root));
 
     /* A whole-tree name, when given, wins. */
     w5->fingerprint = "whole";
-    EXPECT_EQ(w5->getFingerprint(CanonPath("keep")).second, std::optional<std::string>("whole"));
+    EXPECT_EQ(w5->getFingerprint(CanonPath("keep")).value().second, std::string("whole"));
 }
 
 TEST(AllowListFilter, admissionAndNamingMatchEveryPrefixSubsetAndGrowth)
@@ -129,7 +129,7 @@ TEST(AllowListFilter, admissionAndNamingMatchEveryPrefixSubsetAndGrowth)
             return MemorySourceAccessor::maybeLstat(path);
         }
 
-        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+        std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
         {
             ++names;
             requested = path;
@@ -138,8 +138,8 @@ TEST(AllowListFilter, admissionAndNamingMatchEveryPrefixSubsetAndGrowth)
             if (outcome == Throwing)
                 throw Error("inner naming failed");
             if (outcome == Named)
-                return {CanonPath("relative"), "inner"};
-            return {path, std::nullopt};
+                return std::pair{CanonPath("relative"), std::string("inner")};
+            return std::nullopt;
         }
     };
     auto inner = make_ref<Observed>();
@@ -179,8 +179,11 @@ TEST(AllowListFilter, admissionAndNamingMatchEveryPrefixSubsetAndGrowth)
                         EXPECT_THROW(accessor->getFingerprint(path), Error);
                     else {
                         auto result = accessor->getFingerprint(path);
-                        EXPECT_EQ(result.first, covered && outcome == Observed::Named ? CanonPath("relative") : path);
-                        EXPECT_EQ(result.second, covered && outcome == Observed::Named ? std::optional<std::string>("inner") : std::nullopt);
+                        if (covered && outcome == Observed::Named) {
+                            ASSERT_TRUE(result);
+                            EXPECT_EQ(*result, (std::pair{CanonPath("relative"), std::string("inner")}));
+                        } else
+                            EXPECT_FALSE(result);
                     }
                     EXPECT_EQ(inner->names, covered ? 1 : 0);
                     EXPECT_EQ(inner->stats, covered && outcome == Observed::Missing ? 1 : 0);
@@ -195,7 +198,7 @@ TEST(AllowListFilter, exactPathsDoNotAdmitOrNameTheirRelatives)
 {
     struct NoNaming : MemorySourceAccessor
     {
-        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath &) override
+        std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath &) override
         {
             ADD_FAILURE() << "exact admission must not consult inner naming";
             throw Error("unexpected inner naming");
@@ -214,16 +217,15 @@ TEST(AllowListFilter, exactPathsDoNotAdmitOrNameTheirRelatives)
         else
             EXPECT_THROW(accessor->checkAccess(path), RestrictedPathError);
         auto result = accessor->getFingerprint(path);
-        EXPECT_EQ(result.first, path);
-        EXPECT_FALSE(result.second);
+        EXPECT_FALSE(result);
     }
     EXPECT_EQ(errors, 5);
     accessor->allowPrefix(CanonPath("a"));
     accessor->fingerprint = "whole";
     for (auto & path : {CanonPath::root, exact, CanonPath("other")}) {
         auto result = accessor->getFingerprint(path);
-        EXPECT_EQ(result.first, path);
-        EXPECT_EQ(result.second, std::optional<std::string>("whole"));
+        ASSERT_TRUE(result);
+        EXPECT_EQ(*result, (std::pair{path, std::string("whole")}));
     }
 }
 
@@ -237,6 +239,31 @@ protected:
         nix::initLibStore(/*loadConfig=*/false);
     }
 };
+
+TEST_F(FetchToStoreTest, emptyFingerprintIsPresentAndMemoised)
+{
+    auto tree = namedTree(std::nullopt);
+    EXPECT_FALSE(tree->getFingerprint(CanonPath::root));
+    tree->fingerprint = "";
+    auto identity = tree->getFingerprint(CanonPath("keep"));
+    ASSERT_TRUE(identity);
+    EXPECT_EQ(*identity, (std::pair{CanonPath("keep"), std::string()}));
+    auto allowed = AllowListSourceAccessor::create(
+        tree, {CanonPath::root}, {}, [](const CanonPath &) { return RestrictedPathError("denied"); });
+    EXPECT_EQ(allowed->getFingerprint(CanonPath("keep")), identity);
+    auto filtered =
+        makeFixedSetFilteringSourceAccessor(SourcePath(tree), filteredPaths(*tree, CanonPath::root, rejectDrop));
+    EXPECT_TRUE(filtered->getFingerprint(CanonPath::root));
+
+    auto store = openStore("dummy://?read-only=false");
+    fetchers::Settings settings;
+    auto result = fetchToStore2(settings, *store, SourcePath(tree), FetchMode::DryRun, "source");
+    auto row =
+        settings.getCache()->lookup(makeSourcePathToHashCacheKey("", ContentAddressMethod::Raw::Git, CanonPath::root));
+    ASSERT_TRUE(row);
+    EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), result.second);
+    EXPECT_EQ(fetchToStore2(settings, *store, SourcePath(tree), FetchMode::DryRun, "source"), result);
+}
 
 TEST_F(FetchToStoreTest, filteredNamedTreesAreMemoised)
 {
@@ -258,9 +285,10 @@ TEST_F(FetchToStoreTest, filteredNamedTreesAreMemoised)
     /* And the memo now has it under the filtered tree's name. */
     auto wrapped =
         makeFixedSetFilteringSourceAccessor(SourcePath(inner), filteredPaths(*inner, CanonPath::root, rejectDrop));
-    auto [subpath, name] = wrapped->getFingerprint(CanonPath::root);
-    ASSERT_TRUE(name);
-    auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(*name, method, subpath));
+    auto identity = wrapped->getFingerprint(CanonPath::root);
+    ASSERT_TRUE(identity);
+    const auto & [subpath, name] = *identity;
+    auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(name, method, subpath));
     ASSERT_TRUE(row);
     EXPECT_EQ(fetchers::getStrAttr(*row, "hash"), hash.to_string(HashFormat::SRI, true));
 
@@ -350,13 +378,13 @@ RC_GTEST_PROP(FetchToStore, prop_filtered_names_are_sound, ())
         SourcePath(t2, CanonPath("shared")), filteredPaths(*t2, CanonPath("shared"), keepOnly));
 
     auto name1 = w1->getFingerprint(CanonPath::root);
-    RC_ASSERT(name1.second);
+    RC_ASSERT(name1);
     RC_ASSERT(name1 == w2->getFingerprint(CanonPath::root));
     RC_ASSERT(narOf(*w1, CanonPath::root) == narOf(*w2, CanonPath::root));
 
     auto full = makeFixedSetFilteringSourceAccessor(
         SourcePath(t1, CanonPath("shared")), filteredPaths(*t1, CanonPath("shared"), defaultPathFilter));
-    RC_ASSERT(full->getFingerprint(CanonPath::root).second != name1.second);
+    RC_ASSERT(full->getFingerprint(CanonPath::root).value().second != name1->second);
 }
 
 /* Whole-view fingerprints cache each requested subtree. Descendants are
@@ -371,12 +399,13 @@ TEST_F(FetchToStoreTest, everyRequestedSubtreeIsReadableWhenTheWalkReturns)
         "fetch-to-store-test-batch-" + Hash::random(HashAlgorithm::SHA256).to_string(HashFormat::Nix32, false));
     fetchToStore2(settings, *store, SourcePath(tree), FetchMode::DryRun, "src", git);
 
-    auto [subpath, name] = tree->getFingerprint(CanonPath("keep"));
-    ASSERT_TRUE(name);
-    auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(*name, git, subpath));
+    auto identity = tree->getFingerprint(CanonPath("keep"));
+    ASSERT_TRUE(identity);
+    const auto & [subpath, name] = *identity;
+    auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(name, git, subpath));
     EXPECT_FALSE(row);
     fetchToStore2(settings, *store, SourcePath(tree, CanonPath("keep")), FetchMode::DryRun, "src", git);
-    row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(*name, git, subpath));
+    row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(name, git, subpath));
     ASSERT_TRUE(row);
     EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), objectHashOf(*tree, CanonPath("keep")).root.hash);
 
@@ -464,15 +493,16 @@ TEST_F(FetchToStoreTest, oldFormGitRowIsAMissAndTheRowIsTheEntry)
     auto git = ContentAddressMethod::Raw::Git;
     auto tree = namedTree("fetch-to-store-test-V");
     auto expected = objectHashOf(*tree, CanonPath::root).root;
-    auto [subpath, name] = tree->getFingerprint(CanonPath::root);
-    ASSERT_TRUE(name);
+    auto identity = tree->getFingerprint(CanonPath::root);
+    ASSERT_TRUE(identity);
+    const auto & [subpath, name] = *identity;
 
     fetchers::Settings settings;
     auto wrong = merkle::treeId("");
     settings.getCache()->upsert(
         fetchers::Cache::Key{
             "sourcePathToHash",
-            {{"fingerprint", *name},
+            {{"fingerprint", name},
              {"method", std::string{ContentAddressMethod(git).render()}},
              {"path", subpath.abs()}}},
         {{"hash", wrong.to_string(HashFormat::SRI, true)}});
@@ -481,12 +511,12 @@ TEST_F(FetchToStoreTest, oldFormGitRowIsAMissAndTheRowIsTheEntry)
     EXPECT_NE(h, wrong);
 
     /* The row written is the entry, and it answers the next naming. */
-    auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(*name, git, subpath));
+    auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(name, git, subpath));
     ASSERT_TRUE(row);
     EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), expected.hash);
     EXPECT_EQ(fetchers::getIntAttr(*row, "mode"), uint64_t(merkle::Mode::Directory));
     fetchers::Settings settings2;
-    settings2.getCache()->upsert(makeSourcePathToHashCacheKey(*name, git, subpath), *row);
+    settings2.getCache()->upsert(makeSourcePathToHashCacheKey(name, git, subpath), *row);
     auto [p2, h2] = fetchToStore2(settings2, *store, SourcePath(tree), FetchMode::DryRun, "src");
     EXPECT_EQ(p2, p);
     EXPECT_EQ(h2, h);
@@ -512,11 +542,11 @@ struct NamedCountingAccessor : MemorySourceAccessor
         MemorySourceAccessor::readFile(path, sink, sizeCallback);
     }
 
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
         if (auto i = names.find(path); i != names.end())
-            return {CanonPath::root, i->second};
-        return {path, std::nullopt};
+            return std::pair{CanonPath::root, i->second};
+        return std::nullopt;
     }
 };
 
@@ -543,7 +573,7 @@ TEST_F(FetchToStoreTest, subtreeNamingIsObservedOnceAndRecordedForTheSameNode)
     {
         std::map<CanonPath, size_t> observations;
 
-        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+        std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
         {
             ++observations[path];
             return NamedCountingAccessor::getFingerprint(path);
@@ -685,10 +715,10 @@ TEST_F(FetchToStoreLocalTest, positiveRootNamingIsObservedOnceForEveryRootKindAn
         std::string name;
         std::map<CanonPath, size_t> observations;
 
-        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+        std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
         {
             ++observations[path];
-            return {path, name};
+            return std::pair{path, name};
         }
     };
 
@@ -988,7 +1018,7 @@ TEST_F(FetchToStoreLocalTest, knownEntriesPreserveEveryRootKindAndRepairReadsThe
         auto copied = fetchToStore2(settings, *store, SourcePath(tree), FetchMode::Copy, "known");
         EXPECT_EQ(copied, named);
         auto stored = store->requireStoreObjectAccessor(copied.first);
-        EXPECT_TRUE(stored->getFingerprint(CanonPath::root).second);
+        EXPECT_TRUE(stored->getFingerprint(CanonPath::root));
         EXPECT_EQ(objectHashOf(*stored, CanonPath::root).root, entry);
         tree->reads = 0;
         fetchers::Settings fresh;
@@ -1248,9 +1278,10 @@ RC_GTEST_FIXTURE_PROP(FetchToStoreTest, prop_memoRowIsTheEntryHashForEveryRootKi
         RC_ASSERT(path == gitTreePath(*store, "x", merkle::objectHash(entry)));
 
         /* Its row holds the entry, not the address. */
-        auto [subpath, fingerprint] = acc->getFingerprint(node);
-        RC_ASSERT(fingerprint.has_value());
-        auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(*fingerprint, git, subpath));
+        auto identity = acc->getFingerprint(node);
+        RC_ASSERT(identity);
+        const auto & [subpath, fingerprint] = *identity;
+        auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(fingerprint, git, subpath));
         RC_ASSERT(row.has_value());
         RC_ASSERT(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")) == entry.hash);
         RC_ASSERT(fetchers::getIntAttr(*row, "mode") == uint64_t(entry.mode));
@@ -1432,14 +1463,16 @@ TEST(ScopedFilter, nestedScopesPreservePolicyCoordinatesSnapshotsAndInnerOperati
             return outcome == 0 && initiallyDenied != path;
         }
 
-        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+        std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
         {
             names.push_back(path);
             if (outcome == 2)
                 throw Error("naming failed");
             /* A custom policy's naming operation must survive scoping;
                it is not interchangeable with the inner accessor's. */
-            return {path, outcome == 1 ? std::optional("policy:" + path.abs()) : std::nullopt};
+            if (outcome == 1)
+                return std::pair{path, "policy:" + path.abs()};
+            return std::nullopt;
         }
 
         void readDirectoryWithEntries(
@@ -1585,10 +1618,11 @@ TEST(ScopedFilter, nestedScopesPreservePolicyCoordinatesSnapshotsAndInnerOperati
                                     EXPECT_THROW(scoped.getFingerprint(query), Error);
                                 else {
                                     auto named = scoped.getFingerprint(query);
-                                    EXPECT_EQ(named.first, full);
-                                    EXPECT_EQ(
-                                        named.second,
-                                        outcome == 1 ? std::optional("policy:" + full.abs()) : std::nullopt);
+                                    if (outcome == 1) {
+                                        ASSERT_TRUE(named);
+                                        EXPECT_EQ(*named, (std::pair{full, "policy:" + full.abs()}));
+                                    } else
+                                        EXPECT_FALSE(named);
                                 }
                                 EXPECT_EQ(policy.names, std::vector{full});
                             };
@@ -1771,12 +1805,14 @@ TEST_F(FetchToStoreTest, parallelMemoKeepsEachNamedFactWithItsNode)
             return true;
         }
 
-        std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+        std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
         {
             std::lock_guard lock(mutex);
             ++observations[path];
             auto i = names.find(path);
-            return {CanonPath::root, i == names.end() ? std::nullopt : std::optional(i->second)};
+            if (i == names.end())
+                return std::nullopt;
+            return std::pair{CanonPath::root, i->second};
         }
 
         void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override

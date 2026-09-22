@@ -104,11 +104,11 @@ std::string ContentNamedAccessor::readLink(const CanonPath & path)
     return inner->readLink(path);
 }
 
-std::pair<CanonPath, std::optional<std::string>> ContentNamedAccessor::getFingerprint(const CanonPath & path)
+std::optional<std::pair<CanonPath, std::string>> ContentNamedAccessor::getFingerprint(const CanonPath & path)
 {
     if (!inner->maybeLstat(path))
-        return {path, std::nullopt};
-    return {CanonPath::root, "nar:" + inner->hashPath(path).to_string(HashFormat::Nix32, false)};
+        return std::nullopt;
+    return std::pair{CanonPath::root, "nar:" + inner->hashPath(path).to_string(HashFormat::Nix32, false)};
 }
 
 } // namespace nix

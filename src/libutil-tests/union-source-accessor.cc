@@ -1,5 +1,7 @@
 #include "nix/util/source-accessor.hh"
 #include "nix/util/memory-source-accessor.hh"
+#include "nix/util/mounted-source-accessor.hh"
+#include "nix/util/serialise.hh"
 #include "nix/util/tests/gmock-matchers.hh"
 #include "nix/util/tests/source-accessor-gen.hh"
 
@@ -43,21 +45,21 @@ TEST(UnionSourceAccessor, fingerprints)
     b->fingerprint = "B";
 
     auto general = makeUnionSourceAccessor({a, b});
-    EXPECT_EQ(general->getFingerprint(CanonPath("d/x")), std::pair(CanonPath("d/x"), std::optional<std::string>("A")));
-    EXPECT_EQ(general->getFingerprint(CanonPath("d/y")), std::pair(CanonPath("d/y"), std::optional<std::string>("B")));
-    EXPECT_EQ(general->getFingerprint(CanonPath("g")), std::pair(CanonPath("g"), std::optional<std::string>("B")));
-    EXPECT_EQ(general->getFingerprint(CanonPath("f")), std::pair(CanonPath("f"), std::optional<std::string>("A")));
-    EXPECT_FALSE(general->getFingerprint(CanonPath("f/z")).second);
+    EXPECT_EQ(general->getFingerprint(CanonPath("d/x")), std::pair(CanonPath("d/x"), std::string("A")));
+    EXPECT_EQ(general->getFingerprint(CanonPath("d/y")), std::pair(CanonPath("d/y"), std::string("B")));
+    EXPECT_EQ(general->getFingerprint(CanonPath("g")), std::pair(CanonPath("g"), std::string("B")));
+    EXPECT_EQ(general->getFingerprint(CanonPath("f")), std::pair(CanonPath("f"), std::string("A")));
+    EXPECT_FALSE(general->getFingerprint(CanonPath("f/z")));
     auto atD = general->getFingerprint(CanonPath("d"));
-    ASSERT_TRUE(atD.second);
-    EXPECT_EQ(atD.first, CanonPath::root);
-    EXPECT_NE(*atD.second, "A");
-    EXPECT_NE(*atD.second, "B");
-    EXPECT_NE(general->getFingerprint(CanonPath::root).second, atD.second);
+    ASSERT_TRUE(atD);
+    EXPECT_EQ(atD->first, CanonPath::root);
+    EXPECT_NE(atD->second, "A");
+    EXPECT_NE(atD->second, "B");
+    EXPECT_NE(general->getFingerprint(CanonPath::root).value().second, atD->second);
 
     b->fingerprint = std::nullopt;
-    EXPECT_FALSE(general->getFingerprint(CanonPath("d")).second);
-    EXPECT_EQ(general->getFingerprint(CanonPath("d/x")).second, std::optional<std::string>("A"));
+    EXPECT_FALSE(general->getFingerprint(CanonPath("d")));
+    EXPECT_EQ(general->getFingerprint(CanonPath("d/x")).value().second, std::string("A"));
     b->fingerprint = "B";
 }
 
@@ -217,9 +219,9 @@ TEST(UnionSourceAccessor, everySmallTreeAndNamingCombinationThroughThreeLayers)
                     auto expected = renderOverlay(candidates);
                     auto observed = actual->maybeLstat(path);
                     ASSERT_EQ(observed.has_value(), expected.has_value());
-                    auto [relative, name] = actual->getFingerprint(path);
+                    auto identity = actual->getFingerprint(path);
                     if (!expected) {
-                        EXPECT_FALSE(name);
+                        EXPECT_FALSE(identity);
                         continue;
                     }
                     auto expectedStat = expected->lstat();
@@ -246,11 +248,12 @@ TEST(UnionSourceAccessor, everySmallTreeAndNamingCombinationThroughThreeLayers)
                             if (std::holds_alternative<OverlayFile::Directory>(node->raw))
                                 shouldName &= bool(named & (size_t{1} << layer));
                         }
-                    EXPECT_EQ(name.has_value(), shouldName);
+                    EXPECT_EQ(identity.has_value(), shouldName);
                     auto expectedNar = overlayNar(*expected);
                     EXPECT_EQ(narOf(*actual, path), expectedNar);
-                    if (name) {
-                        auto entry = namedTrees.emplace(std::pair{*name, relative.abs()}, expectedNar).first;
+                    if (identity) {
+                        auto entry =
+                            namedTrees.emplace(std::pair{identity->second, identity->first.abs()}, expectedNar).first;
                         EXPECT_EQ(entry->second, expectedNar);
                     }
                 }
@@ -317,6 +320,153 @@ TEST(UnionSourceAccessor, twoLayersKeepTheSamePathProbeOrder)
             }
             EXPECT_EQ(calls, expected);
         }
+}
+
+namespace {
+
+struct CallbackLifetimeAccessor : MemorySourceAccessor
+{
+    int & destroyed;
+    std::function<void()> & release;
+
+    CallbackLifetimeAccessor(int & destroyed, std::function<void()> & release)
+        : destroyed(destroyed)
+        , release(release)
+    {
+    }
+
+    ~CallbackLifetimeAccessor() override
+    {
+        ++destroyed;
+    }
+
+    void readFile(const CanonPath &, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    {
+        /* A failing ownership implementation may destroy this accessor in
+           either callback. Keep the test itself defined: after calling out,
+           use only locals and caller-owned state, never members of this. */
+        const std::string bytes = "contents";
+        sizeCallback(bytes.size());
+        sink(bytes);
+    }
+
+    std::string readLink(const CanonPath &) override
+    {
+        auto callback = release;
+        callback();
+        return "target";
+    }
+
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
+    {
+        auto result = std::pair{path, fmt("lifetime-child-%d", number)};
+        auto callback = release;
+        callback();
+        return result;
+    }
+};
+
+} // namespace
+
+TEST(UnionSourceAccessor, resolvedChildSurvivesReentrantCallerRelease)
+{
+    enum class Call { SizeCallback, SinkCallback, ReadLink, Fingerprint };
+    size_t cases = 0;
+    for (bool mounted : {false, true})
+        for (bool nested : {false, true})
+            for (auto call : {Call::SizeCallback, Call::SinkCallback, Call::ReadLink, Call::Fingerprint}) {
+                SCOPED_TRACE(fmt("mounted=%d nested=%d call=%d", mounted, nested, static_cast<unsigned>(call)));
+                int destroyed = 0;
+                std::function<void()> release;
+                std::weak_ptr<SourceAccessor> child;
+                SourcePath source{
+                    [&]() -> ref<SourceAccessor> {
+                        auto leaf = make_ref<CallbackLifetimeAccessor>(destroyed, release);
+                        leaf->addFile(CanonPath("f"), "contents");
+                        if (call == Call::ReadLink)
+                            leaf->root->raw = MemorySourceAccessor::File::Directory{
+                                {{"f", MemorySourceAccessor::File::Symlink{.target = "target"}}}};
+                        child = leaf.get_ptr();
+                        auto empty = make_ref<MemorySourceAccessor>();
+                        if (mounted) {
+                            if (nested)
+                                return makeMountedSourceAccessor({{CanonPath::root, empty}, {CanonPath("m/n"), leaf}});
+                            return makeMountedSourceAccessor({{CanonPath::root, leaf}});
+                        }
+                        return nested ? makeUnionSourceAccessor({empty, leaf}) : makeUnionSourceAccessor({leaf, empty});
+                    }(),
+                    CanonPath(mounted && nested ? "m/n/f" : "f")};
+                std::weak_ptr<SourceAccessor> parent = source.accessor.get_ptr();
+                auto replacement = make_ref<MemorySourceAccessor>();
+                unsigned releases = 0;
+                release = [&] {
+                    ++releases;
+                    source.accessor = replacement;
+                    EXPECT_TRUE(parent.expired());
+                    EXPECT_FALSE(child.expired());
+                    EXPECT_EQ(destroyed, 0);
+                };
+                if (call == Call::ReadLink)
+                    EXPECT_EQ(source.readLink(), "target");
+                else if (call == Call::Fingerprint) {
+                    auto name = source.accessor->getFingerprint(source.path);
+                    ASSERT_TRUE(name);
+                    EXPECT_TRUE(name->second.starts_with("lifetime-child-"));
+                } else {
+                    std::string contents;
+                    LambdaSink sink{[&](std::string_view bytes) {
+                        if (call == Call::SinkCallback)
+                            release();
+                        contents += bytes;
+                    }};
+                    source.readFile(sink, [&](uint64_t size) {
+                        EXPECT_EQ(size, 8u);
+                        if (call == Call::SizeCallback)
+                            release();
+                    });
+                    EXPECT_EQ(contents, "contents");
+                }
+                EXPECT_EQ(releases, 1u);
+                EXPECT_EQ(destroyed, 1);
+                EXPECT_TRUE(child.expired());
+                ++cases;
+            }
+    EXPECT_EQ(cases, 16u);
+}
+
+TEST(UnionSourceAccessor, mergedNamingRetainsEveryChildAcrossCallerRelease)
+{
+    for (unsigned releaseAt : {1u, 2u}) {
+        SCOPED_TRACE(releaseAt);
+        int destroyed = 0;
+        std::function<void()> release;
+        std::vector<std::weak_ptr<SourceAccessor>> children;
+        SourcePath source{[&]() -> ref<SourceAccessor> {
+            auto first = make_ref<CallbackLifetimeAccessor>(destroyed, release);
+            auto last = make_ref<CallbackLifetimeAccessor>(destroyed, release);
+            first->addFile(CanonPath("a"), "contents");
+            last->addFile(CanonPath("b"), "contents");
+            children = {first.get_ptr(), last.get_ptr()};
+            return makeUnionSourceAccessor({first, last});
+        }()};
+        std::weak_ptr<SourceAccessor> parent = source.accessor.get_ptr();
+        auto replacement = make_ref<MemorySourceAccessor>();
+        unsigned calls = 0;
+        release = [&] {
+            if (++calls == releaseAt) {
+                source.accessor = replacement;
+                EXPECT_TRUE(parent.expired());
+            }
+            EXPECT_EQ(destroyed, 0);
+            for (auto & child : children)
+                EXPECT_FALSE(child.expired());
+        };
+        EXPECT_TRUE(source.accessor->getFingerprint(source.path));
+        EXPECT_EQ(calls, 2u);
+        EXPECT_EQ(destroyed, 2);
+        for (auto & child : children)
+            EXPECT_TRUE(child.expired());
+    }
 }
 
 } // namespace nix

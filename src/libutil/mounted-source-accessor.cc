@@ -110,8 +110,8 @@ public:
         // Find the nearest parent of `path` that is a mount point.
         auto prefix = path;
         while (true) {
-            if (auto mount = getMount(prefix))
-                return {ref(mount), path.removePrefix(prefix)};
+            if (auto mount = getConcurrent(mounts, prefix))
+                return {std::move(*mount), path.removePrefix(prefix)};
 
             assert(!prefix.isRoot());
             prefix.pop();
@@ -176,10 +176,10 @@ public:
         return accessor->getKnownEntry(subpath);
     }
 
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
         if (fingerprint)
-            return {path, fingerprint};
+            return std::pair{path, *fingerprint};
         auto [accessor, subpath] = resolve(path);
         auto below = mountsBelow(path);
         if (below.empty())
@@ -190,17 +190,18 @@ public:
            with the mounted trees grafted on.  It is named by the names of
            all of them, or not at all; the name is for this subtree exactly,
            hence the root path. */
-        auto [tSub, tFp] = accessor->getFingerprint(subpath);
-        if (!tFp)
-            return {path, std::nullopt};
+        auto tree = accessor->getFingerprint(subpath);
+        if (!tree)
+            return std::nullopt;
+        const auto & [tSub, tFp] = *tree;
         auto grafts = nlohmann::json::array();
         for (auto & [mountPoint, mounted] : below) {
-            auto [uSub, uFp] = mounted->getFingerprint(CanonPath::root);
-            if (!uFp)
-                return {path, std::nullopt};
-            grafts.push_back({mountPoint.removePrefix(path).abs(), *uFp, uSub.abs()});
+            auto graft = mounted->getFingerprint(CanonPath::root);
+            if (!graft)
+                return std::nullopt;
+            grafts.push_back({mountPoint.removePrefix(path).abs(), graft->second, graft->first.abs()});
         }
-        return {CanonPath::root, nlohmann::json::array({"graft", *tFp, tSub.abs(), std::move(grafts)}).dump()};
+        return std::pair{CanonPath::root, nlohmann::json::array({"graft", tFp, tSub.abs(), std::move(grafts)}).dump()};
     }
 };
 

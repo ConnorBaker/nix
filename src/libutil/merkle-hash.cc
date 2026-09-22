@@ -40,12 +40,14 @@ void feedHeader(Sink & sink, std::string_view kind, uint64_t size)
 BlobHasher::BlobHasher(uint64_t size)
     : sink(hashAlgo)
 {
-    feedHeader(sink, "blob", size);
+    /* Header and body use the same unbuffered stream, leaving HashSink's
+       buffer empty for the whole blob. */
+    feedHeader(*this, "blob", size);
 }
 
 void BlobHasher::operator()(std::string_view chunk)
 {
-    sink(chunk);
+    sink.writeUnbuffered(chunk);
 }
 
 Hash BlobHasher::finish()
@@ -84,8 +86,9 @@ std::string serialiseTree(const Tree & tree)
 Hash treeId(std::string_view body)
 {
     HashSink sink(hashAlgo);
-    feedHeader(sink, "tree", body.size());
-    sink(body);
+    LambdaSink direct{[&](std::string_view chunk) { sink.writeUnbuffered(chunk); }};
+    feedHeader(direct, "tree", body.size());
+    direct(body);
     return sink.finish().hash;
 }
 

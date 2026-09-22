@@ -1,6 +1,6 @@
 # Lazy-store status
 
-The correctness fixes have passed the checks below, but the requirement that **every benchmark case beat the branch base remains open**. The comparison uses branch base `8aad447`, not a moving `master`. The latest [optimized comparison](runs/2026-09-21-performance/paired-e6d34dfdc.json) records six faster cases and three regressions. The subsequent fourth-pass changes have passed correctness checks but are not covered by those performance measurements.
+The correctness fixes have passed the checks below, but the requirement that **every benchmark case beat the branch base remains open**. The comparison uses branch base `8aad447`, not a moving `master`. The latest [optimized comparison](runs/2026-09-21-performance/paired-e6d34dfdc.json) records six faster cases and three regressions. Subsequent audit changes have passed correctness checks but are not covered by those performance measurements.
 
 ## Semantic model
 
@@ -14,7 +14,7 @@ The [specification](01-specification.md), [implementation derivation](04-derivat
 
 ## Completed validation and limits
 
-The latest completed debug checks report **2,421 passing unit tests and two existing skips**: 435 evaluator, 145 fetcher, 869 utility and 972 store tests. The utility suite also passes with newer syscalls disabled. Five targeted object-store/hash/optimisation/GC functional tests and **all twelve real overlay tests pass**. The previously failing overlay assertions and registration dispatch are resolved. Overlay-specific limits, including no cross-layer regular-holder sharing and the disabled auxiliary verification/materialisation routes, remain explicit in the store model.
+The latest completed debug checks report **2,425 passing unit tests and two existing skips**: 435 evaluator, 146 fetcher, 872 utility and 972 store tests. The utility suite also passes with newer syscalls disabled. Five targeted object-store/hash/optimisation/GC functional tests and **all twelve real overlay tests pass**. The previously failing overlay assertions and registration dispatch are resolved. Overlay-specific limits, including no cross-layer regular-holder sharing and the disabled auxiliary verification/materialisation routes, remain explicit in the store model.
 
 The [performance and verification report](09-performance.md#verification) records the finite-domain checks, negative controls, syscall evidence and source-review limits. The latest optimized comparison additionally passes all eighteen complete store-graph comparisons and binds all 156 evaluation outputs to their actual store pairs. These checks compare exact contents, modes, references and outputs under an injective substitution of store addresses. They do not establish equivalence of arbitrary embedded programs.
 

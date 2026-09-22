@@ -177,15 +177,15 @@ public:
         return accessor->getPhysicalPath(path);
     }
 
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
         auto object = maybeGetStoreObjectPath(path);
         if (!requireValidPath || !object)
-            return {path, std::nullopt};
+            return std::nullopt;
         auto info = store->queryPathInfo(*object);
         if (!info->objectHash)
-            return {path, std::nullopt};
-        return {path.removePrefix(CanonPath(object->to_string())), info->objectHash->render()};
+            return std::nullopt;
+        return std::pair{path.removePrefix(CanonPath(object->to_string())), info->objectHash->render()};
     }
 
     std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override

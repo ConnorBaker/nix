@@ -75,7 +75,7 @@ public:
     std::optional<Stat> maybeLstat(const CanonPath & path) override;
     DirEntries readDirectory(const CanonPath & path) override;
     std::string readLink(const CanonPath & path) override;
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override;
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override;
 };
 
 } // namespace nix

@@ -712,8 +712,6 @@ static bool goodStorePath(const StorePath & expected, const StorePath & actual)
 
 std::optional<std::shared_ptr<const ValidPathInfo>> Store::queryPathInfoFromClientCache(const StorePath & storePath)
 {
-    auto hashPart = std::string(storePath.hashPart());
-
     if (pathInfoCache) {
         auto res = pathInfoCache->lock()->get(storePath);
         if (res && res->isKnownNow(settings.getNarInfoDiskCacheSettings()))
@@ -723,6 +721,7 @@ std::optional<std::shared_ptr<const ValidPathInfo>> Store::queryPathInfoFromClie
     }
 
     if (diskCache) {
+        auto hashPart = std::string(storePath.hashPart());
         auto res = diskCache->lookupNarInfo(config.getReference().render(/*FIXME withParams=*/false), hashPart);
         if (res.first != NarInfoDiskCache::oUnknown) {
             if (pathInfoCache)
@@ -743,8 +742,6 @@ std::optional<std::shared_ptr<const ValidPathInfo>> Store::queryPathInfoFromClie
 
 void Store::queryPathInfo(const StorePath & storePath, Callback<ref<const ValidPathInfo>> callback) noexcept
 {
-    auto hashPart = std::string(storePath.hashPart());
-
     try {
         auto r = queryPathInfoFromClientCache(storePath);
         if (r.has_value()) {
@@ -761,12 +758,15 @@ void Store::queryPathInfo(const StorePath & storePath, Callback<ref<const ValidP
     auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
 
     queryPathInfoUncached(
-        storePath, {[this, storePath, hashPart, callbackPtr](std::future<std::shared_ptr<const ValidPathInfo>> fut) {
+        storePath, {[this, storePath, callbackPtr](std::future<std::shared_ptr<const ValidPathInfo>> fut) {
             try {
                 auto info = fut.get();
 
                 if (diskCache)
-                    diskCache->upsertNarInfo(config.getReference().render(/*FIXME withParams=*/false), hashPart, info);
+                    diskCache->upsertNarInfo(
+                        config.getReference().render(/*FIXME withParams=*/false),
+                        std::string(storePath.hashPart()),
+                        info);
 
                 if (pathInfoCache)
                     pathInfoCache->lock()->upsert(storePath, PathInfoCacheValue{.value = info});

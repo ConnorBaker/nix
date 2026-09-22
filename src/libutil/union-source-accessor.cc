@@ -47,6 +47,8 @@ public:
      */
     bool hides(size_t before, const CanonPath & path)
     {
+        if (!before || path.isRoot())
+            return false;
         auto p = path;
         while (before && !p.isRoot()) {
             p.pop();
@@ -64,26 +66,25 @@ public:
     /**
      * The child whose node `path` denotes in the union, with that node; or
      * nothing if `path` is not in the union.
-     * Children are borrowed from the fixed owning vector during this call.
      */
-    std::optional<std::pair<SourceAccessor *, Stat>> owner(const CanonPath & path)
+    std::optional<std::pair<ref<SourceAccessor>, Stat>> owner(const CanonPath & path)
     {
         for (size_t i = 0; i < accessors.size(); ++i) {
             if (auto st = node(*accessors[i], path)) {
                 if (hides(i, path))
                     return std::nullopt;
-                return std::pair{&*accessors[i], *st};
+                return std::pair{accessors[i], *st};
             }
         }
         return std::nullopt;
     }
 
-    SourceAccessor & requireOwner(const CanonPath & path)
+    ref<SourceAccessor> requireOwner(const CanonPath & path)
     {
         auto o = owner(path);
         if (!o)
             throw FileNotFound("path '%s' does not exist", showPath(path));
-        return *o->first;
+        return std::move(o->first);
     }
 
     /**
@@ -93,15 +94,15 @@ public:
      * own it; a later child's non-directory at `path` or at an ancestor is
      * hidden by `own`'s directories.
      */
-    std::vector<SourceAccessor *> laterDirectories(const CanonPath & path, const SourceAccessor & own)
+    std::vector<ref<SourceAccessor>> laterDirectories(const CanonPath & path, const SourceAccessor & own)
     {
-        std::vector<SourceAccessor *> res;
+        std::vector<ref<SourceAccessor>> res;
         bool after = false;
         for (auto & accessor : accessors) {
             if (after) {
                 auto st = node(*accessor, path);
                 if (st && st->type == tDirectory)
-                    res.push_back(&*accessor);
+                    res.push_back(accessor);
             } else if (*accessor == own)
                 after = true;
         }
@@ -110,7 +111,7 @@ public:
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
-        requireOwner(path).readFile(path, sink, sizeCallback);
+        requireOwner(path)->readFile(path, sink, sizeCallback);
     }
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
@@ -138,7 +139,7 @@ public:
 
     std::string readLink(const CanonPath & path) override
     {
-        return requireOwner(path).readLink(path);
+        return requireOwner(path)->readLink(path);
     }
 
     std::string showPath(const CanonPath & path) override
@@ -164,16 +165,16 @@ public:
         return std::nullopt;
     }
 
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
         if (fingerprint)
-            return {path, fingerprint};
+            return std::pair{path, *fingerprint};
 
         auto o = owner(path);
         if (!o)
-            return {path, std::nullopt};
+            return std::nullopt;
         auto & [own, st] = *o;
-        auto later = st.type == tDirectory ? laterDirectories(path, *own) : std::vector<SourceAccessor *>{};
+        auto later = st.type == tDirectory ? laterDirectories(path, *own) : std::vector<ref<SourceAccessor>>{};
         if (later.empty())
             /* The subtree here is one child's alone. */
             return own->getFingerprint(path);
@@ -182,18 +183,18 @@ public:
            all.  The name is for this subtree exactly, hence the root path. */
         auto parts = nlohmann::json::array();
         auto add = [&](SourceAccessor & accessor) {
-            auto [subpath, fp] = accessor.getFingerprint(path);
-            if (!fp)
+            auto identity = accessor.getFingerprint(path);
+            if (!identity)
                 return false;
-            parts.push_back({*fp, subpath.abs()});
+            parts.push_back({identity->second, identity->first.abs()});
             return true;
         };
         if (!add(*own))
-            return {path, std::nullopt};
+            return std::nullopt;
         for (auto & accessor : later)
             if (!add(*accessor))
-                return {path, std::nullopt};
-        return {CanonPath::root, nlohmann::json::array({"union", std::move(parts)}).dump()};
+                return std::nullopt;
+        return std::pair{CanonPath::root, nlohmann::json::array({"union", std::move(parts)}).dump()};
     }
 };
 

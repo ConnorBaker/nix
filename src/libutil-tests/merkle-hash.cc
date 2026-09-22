@@ -116,6 +116,75 @@ TEST(MerkleHash, blobHeaderAndIncrementalHasher)
     EXPECT_EQ(merkle::blobId(bytes).algo, HashAlgorithm::SHA256);
 }
 
+TEST(MerkleHash, blobHasherMatchesOneShotAcrossPartitionsAndBoundaries)
+{
+    /* The oracle constructs the entire Git byte sequence independently of
+       feedHeader and BlobHasher, then hashes it with one update. */
+    auto expected = [](std::string_view bytes) {
+        auto message = "blob " + std::to_string(bytes.size());
+        message += '\0';
+        message += bytes;
+        return hashString(HashAlgorithm::SHA256, message);
+    };
+
+    const std::string small{char(0), char(1), char(0x7f), char(0x80), char(0xff), 'x'};
+    auto smallHash = expected(small);
+    size_t partitions = 0;
+    for (unsigned cuts = 0; cuts < (1u << (small.size() - 1)); ++cuts) {
+        std::vector<std::string_view> chunks;
+        size_t start = 0;
+        for (size_t end = 1; end <= small.size(); ++end)
+            if (end == small.size() || (cuts & (1u << (end - 1)))) {
+                chunks.push_back(std::string_view(small).substr(start, end - start));
+                start = end;
+            }
+        /* Every partition, with every subset of its before/between/after
+           boundaries receiving an empty update. */
+        for (unsigned empty = 0; empty < (1u << (chunks.size() + 1)); ++empty) {
+            SCOPED_TRACE(fmt("cuts=%d empty=%d", cuts, empty));
+            merkle::BlobHasher hasher{small.size()};
+            for (size_t i = 0; i <= chunks.size(); ++i) {
+                if (empty & (1u << i))
+                    hasher(std::string_view{});
+                if (i < chunks.size())
+                    hasher(chunks[i]);
+            }
+            EXPECT_EQ(hasher.finish(), smallHash);
+            ++partitions;
+        }
+    }
+    EXPECT_EQ(partitions, 972u);
+
+    /* Two-digit sizes have an eight-byte header: body lengths 47/48/49
+       cross SHA-256's 56-byte padding boundary, and 55/56/57 cross its
+       64-byte block boundary. Five-digit sizes have an eleven-byte header:
+       32756/32757/32758 cross the former 32 KiB buffered-stream boundary.
+       Also cross decimal-width changes and the body-chunk buffer boundary. */
+    size_t boundaries = 0;
+    for (size_t length :
+         {0u, 1u, 9u, 10u, 47u, 48u, 49u, 55u, 56u, 57u, 99u, 100u, 32756u, 32757u, 32758u, 32767u, 32768u, 32769u}) {
+        std::string bytes(length, '\0');
+        for (size_t i = 0; i < length; ++i)
+            bytes[i] = char(i % 256);
+        auto hash = expected(bytes);
+        for (size_t width : {1u, 55u, 56u, 57u, 63u, 64u, 65u, 32756u, 32757u, 32758u, 32767u, 32768u, 32769u})
+            for (bool empty : {false, true}) {
+                SCOPED_TRACE(fmt("length=%d width=%d empty=%d", length, width, empty));
+                merkle::BlobHasher hasher{length};
+                for (size_t offset = 0; offset < length; offset += width) {
+                    if (empty)
+                        hasher(std::string_view{});
+                    hasher(std::string_view(bytes).substr(offset, width));
+                }
+                if (empty)
+                    hasher(std::string_view{});
+                EXPECT_EQ(hasher.finish(), hash);
+                ++boundaries;
+            }
+    }
+    EXPECT_EQ(boundaries, 468u);
+}
+
 TEST(MerkleHash, serialiseTreeIsGitsBody)
 {
     auto hA = merkle::blobId("a");

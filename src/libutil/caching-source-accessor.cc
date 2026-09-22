@@ -99,7 +99,7 @@ public:
         return next->getPhysicalPath(path);
     }
 
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
         return next->getFingerprint(path);
     }

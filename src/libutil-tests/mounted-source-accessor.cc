@@ -102,17 +102,17 @@ TEST(MountedSourceAccessor, fingerprints)
     mounted->fingerprint = "U";
     auto accessor = makeMountedSourceAccessor({{CanonPath::root, root}, {CanonPath("m/n"), mounted}});
 
-    EXPECT_EQ(accessor->getFingerprint(CanonPath("a/x")), std::pair(CanonPath("a/x"), std::optional<std::string>("R")));
-    EXPECT_EQ(accessor->getFingerprint(CanonPath("m/n/y")), std::pair(CanonPath("y"), std::optional<std::string>("U")));
-    EXPECT_EQ(accessor->getFingerprint(CanonPath("m/n")), std::pair(CanonPath::root, std::optional<std::string>("U")));
+    EXPECT_EQ(accessor->getFingerprint(CanonPath("a/x")), std::pair(CanonPath("a/x"), std::string("R")));
+    EXPECT_EQ(accessor->getFingerprint(CanonPath("m/n/y")), std::pair(CanonPath("y"), std::string("U")));
+    EXPECT_EQ(accessor->getFingerprint(CanonPath("m/n")), std::pair(CanonPath::root, std::string("U")));
 
     auto atM = accessor->getFingerprint(CanonPath("m"));
     auto atRoot = accessor->getFingerprint(CanonPath::root);
-    ASSERT_TRUE(atM.second);
-    ASSERT_TRUE(atRoot.second);
-    EXPECT_EQ(atM.first, CanonPath::root);
-    EXPECT_NE(*atM.second, "R");
-    EXPECT_NE(*atM.second, *atRoot.second);
+    ASSERT_TRUE(atM);
+    ASSERT_TRUE(atRoot);
+    EXPECT_EQ(atM->first, CanonPath::root);
+    EXPECT_NE(atM->second, "R");
+    EXPECT_NE(atM->second, atRoot->second);
 
     /* The same parts give the same name; a different mounted tree a different one. */
     auto again = makeMountedSourceAccessor({{CanonPath::root, root}, {CanonPath("m/n"), mounted}});
@@ -120,15 +120,15 @@ TEST(MountedSourceAccessor, fingerprints)
     auto other = memoryTree({{"z", "z"}});
     other->fingerprint = "V";
     auto different = makeMountedSourceAccessor({{CanonPath::root, root}, {CanonPath("m/n"), other}});
-    EXPECT_NE(different->getFingerprint(CanonPath("m")).second, atM.second);
+    EXPECT_NE(different->getFingerprint(CanonPath("m")).value().second, atM->second);
 
     /* An unnamed part leaves the composite unnamed. */
     mounted->fingerprint = std::nullopt;
-    EXPECT_FALSE(accessor->getFingerprint(CanonPath("m")).second);
+    EXPECT_FALSE(accessor->getFingerprint(CanonPath("m")));
     mounted->fingerprint = "U";
     root->fingerprint = std::nullopt;
-    EXPECT_FALSE(accessor->getFingerprint(CanonPath("m")).second);
-    EXPECT_EQ(accessor->getFingerprint(CanonPath("m/n/y")).second, std::optional<std::string>("U"));
+    EXPECT_FALSE(accessor->getFingerprint(CanonPath("m")));
+    EXPECT_EQ(accessor->getFingerprint(CanonPath("m/n/y")).value().second, std::string("U"));
 }
 
 } // namespace nix

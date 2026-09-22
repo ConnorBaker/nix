@@ -110,10 +110,13 @@ static void recordRootEntry(
 
 void recordRootEntry(const fetchers::Settings & settings, const SourcePath & root, const Hash & objectHash)
 {
-    auto [subpath, fingerprint] = root.accessor->getFingerprint(root.path);
-    if (auto cache = fingerprint ? cacheIfAvailable(settings) : nullptr)
+    auto identity = root.accessor->getFingerprint(root.path);
+    if (auto cache = identity ? cacheIfAvailable(settings) : nullptr)
         recordRootEntry(
-            *cache, makeSourcePathToHashCacheKey(*fingerprint, ContentAddressMethod::Raw::Git, subpath), root, objectHash);
+            *cache,
+            makeSourcePathToHashCacheKey(identity->second, ContentAddressMethod::Raw::Git, identity->first),
+            root,
+            objectHash);
 }
 
 Hash narHashOf(const fetchers::Settings & settings, Store & store, const SourcePath & tree, const Hash & treeHash)
@@ -127,7 +130,7 @@ Hash narHashOf(const fetchers::Settings & settings, Store & store, const SourceP
     /* The pair is recorded only for a named tree, since then both hashes
        came from the memo of that name; an unnamed tree could change between
        the two walks, and the row would outlive the mistake. */
-    if (tree.accessor->getFingerprint(tree.path).second)
+    if (tree.accessor->getFingerprint(tree.path))
         recordTreeAddress(settings, narHash, treeHash);
     return narHash;
 }
@@ -171,7 +174,7 @@ struct MemoVisitor : HashingVisitor
 {
     const fetchers::Settings & settings;
     const SourcePath & root;
-    const std::pair<CanonPath, std::optional<std::string>> & rootName;
+    const std::optional<std::pair<CanonPath, std::string>> & rootName;
     bool filtered;
     bool wholeViewFingerprint;
     std::shared_ptr<fetchers::Cache> cache;
@@ -194,14 +197,15 @@ struct MemoVisitor : HashingVisitor
         const fetchers::Settings & settings,
         const SourcePath & root,
         bool filtered,
-        const std::pair<CanonPath, std::optional<std::string>> & rootName,
+        const std::optional<std::pair<CanonPath, std::string>> & rootName,
         size_t workers = 1)
         : HashingVisitor(workers)
         , settings(settings)
         , root(root)
         , rootName(rootName)
         , filtered(filtered)
-        , wholeViewFingerprint(rootName.second && rootName.second == root.accessor->fingerprint)
+        , wholeViewFingerprint(
+              rootName && root.accessor->fingerprint && rootName->second == *root.accessor->fingerprint)
     {
     }
 
@@ -216,13 +220,13 @@ struct MemoVisitor : HashingVisitor
         if (wholeViewFingerprint && !to.isRoot())
             return std::nullopt;
         auto keyFor = [&](const auto & name) -> std::optional<fetchers::Cache::Key> {
-            const auto & [subpath, fingerprint] = name;
-            if (!fingerprint)
+            if (!name)
                 return std::nullopt;
+            const auto & [subpath, fingerprint] = *name;
             std::lock_guard lock(mutex);
             if (!cache && !(cache = cacheIfAvailable(settings)))
                 return std::nullopt;
-            return makeSourcePathToHashCacheKey(*fingerprint, ContentAddressMethod::Raw::Git, subpath);
+            return makeSourcePathToHashCacheKey(fingerprint, ContentAddressMethod::Raw::Git, subpath);
         };
         /* Reuse this operation's root observation, including no name.
            Descendants have their own names, independent of the root's. */
@@ -310,13 +314,12 @@ struct MemoVisitor : HashingVisitor
 
 } // namespace
 
-static merkle::TreeEntry
-gitTreeHashMemoised(
+static merkle::TreeEntry gitTreeHashMemoised(
     const fetchers::Settings & settings,
     const SourcePath & root,
     PathFilter & filter,
     bool filtered,
-    const std::pair<CanonPath, std::optional<std::string>> & rootName)
+    const std::optional<std::pair<CanonPath, std::string>> & rootName)
 {
     MemoVisitor memo{settings, root, filtered, rootName, HashingVisitor::workerCountFor(*root.accessor, filter)};
     auto root2 = objectHashOf(*root.accessor, root.path, filter, memo).root;
@@ -355,17 +358,15 @@ std::pair<StorePath, Hash> fetchToStore2(
        set (01 §8.2), so both memos below apply to it; when the inner tree
        has no name the walk would be wasted, and the filter is applied while
        dumping instead. */
-    if (filter && path.accessor->getFingerprint(path.path).second) {
+    if (filter && path.accessor->getFingerprint(path.path)) {
         path = filteredTree(path, *filter);
         filter = nullptr;
     }
 
-    const auto rootName = filter ? std::pair<CanonPath, std::optional<std::string>>{path.path, std::nullopt}
-                                 : path.accessor->getFingerprint(path.path);
-    const auto & [subpath, fingerprint] = rootName;
+    const auto rootName = filter ? std::nullopt : path.accessor->getFingerprint(path.path);
     std::optional<SrcToStore::Key> srcToStoreKey;
-    if (fingerprint && !repair)
-        srcToStoreKey.emplace(*fingerprint, subpath, method.raw, store.storeDir, name);
+    if (rootName && !repair)
+        srcToStoreKey.emplace(rootName->second, rootName->first, method.raw, store.storeDir, name);
 
     auto useResult = [&](SrcToStore::Result result) -> std::optional<SrcToStore::Result> {
         if (mode != FetchMode::DryRun) {
@@ -398,8 +399,8 @@ std::pair<StorePath, Hash> fetchToStore2(
             if (auto result = useHash(merkle::objectHash(*entry)))
                 return std::move(*result);
 
-    if (fingerprint && !repair) {
-        cacheKey = makeSourcePathToHashCacheKey(*fingerprint, method, subpath);
+    if (rootName && !repair) {
+        cacheKey = makeSourcePathToHashCacheKey(rootName->second, method, rootName->first);
         if (auto cache = cacheIfAvailable(settings); cache)
             if (auto res = cache->lookup(*cacheKey)) {
                 /* Under the git method the row is the root's entry and the

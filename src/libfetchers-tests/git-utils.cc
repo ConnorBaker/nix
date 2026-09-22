@@ -247,9 +247,9 @@ TEST_F(GitUtilsTest, namesFollowTheTreeObjects)
        roots, and the name is for the subtree exactly. */
     auto shared1 = acc1->getFingerprint(CanonPath("shared"));
     auto shared2 = acc2->getFingerprint(CanonPath("shared"));
-    ASSERT_TRUE(shared1.second);
+    ASSERT_TRUE(shared1);
     EXPECT_EQ(shared1, shared2);
-    EXPECT_EQ(shared1.first, CanonPath::root);
+    EXPECT_EQ(shared1->first, CanonPath::root);
     EXPECT_EQ(acc1->getFingerprint(CanonPath("shared/a")), acc2->getFingerprint(CanonPath("shared/a")));
 
     /* The law: equal names, equal NARs. */
@@ -261,27 +261,27 @@ TEST_F(GitUtilsTest, namesFollowTheTreeObjects)
     /* Different roots, different names; both named. */
     auto rootName1 = acc1->getFingerprint(CanonPath::root);
     auto rootName2 = acc2->getFingerprint(CanonPath::root);
-    ASSERT_TRUE(rootName1.second);
-    ASSERT_TRUE(rootName2.second);
-    EXPECT_NE(rootName1.second, rootName2.second);
+    ASSERT_TRUE(rootName1);
+    ASSERT_TRUE(rootName2);
+    EXPECT_NE(rootName1->second, rootName2->second);
 
     /* The mode is part of the NAR, so it is part of the name: same
        contents, different executable bit, different names and NARs. */
     auto exe = acc2->getFingerprint(CanonPath("exe"));
     auto plain = acc2->getFingerprint(CanonPath("plain"));
-    ASSERT_TRUE(exe.second);
-    ASSERT_TRUE(plain.second);
-    EXPECT_NE(exe.second, plain.second);
+    ASSERT_TRUE(exe);
+    ASSERT_TRUE(plain);
+    EXPECT_NE(exe->second, plain->second);
     StringSink narExe, narPlain;
     acc2->dumpPath(CanonPath("exe"), narExe);
     acc2->dumpPath(CanonPath("plain"), narPlain);
     EXPECT_NE(narExe.s, narPlain.s);
     auto link = acc2->getFingerprint(CanonPath("link"));
-    ASSERT_TRUE(link.second);
-    EXPECT_NE(link.second, plain.second);
+    ASSERT_TRUE(link);
+    EXPECT_NE(link->second, plain->second);
 
     /* A path that is not there has no name. */
-    EXPECT_FALSE(acc1->getFingerprint(CanonPath("nope")).second);
+    EXPECT_FALSE(acc1->getFingerprint(CanonPath("nope")));
 
     /* A name given to the whole does not displace the finer subtree names. */
     acc1->fingerprint = "input-level";
@@ -338,7 +338,7 @@ RC_GTEST_PROP(GitUtils, prop_sharedSubtreesNameAndRenderAlike, ())
     std::function<void(const CanonPath &)> check = [&](const CanonPath & q) {
         auto f1 = acc1->getFingerprint(q);
         auto f2 = acc2->getFingerprint(q);
-        RC_ASSERT(f1.second);
+        RC_ASSERT(f1);
         RC_ASSERT(f1 == f2);
         StringSink n1, n2;
         acc1->dumpPath(q, n1);
@@ -842,7 +842,7 @@ struct CountingAccessor : SourceAccessor
         return inner->readLink(path);
     }
 
-    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
         return inner->getFingerprint(path);
     }
@@ -882,7 +882,7 @@ TEST_F(GitUtilsTest, narHashOfIsTheMemoisedShim)
 
     /* One walk: both files read once; the hash is the serialisation's. */
     auto first = make_ref<CountingAccessor>(repo->getAccessor(tree.hash, {}, "shim"));
-    ASSERT_TRUE(first->getFingerprint(CanonPath::root).second);
+    ASSERT_TRUE(first->getFingerprint(CanonPath::root));
     auto narHash = narHashOf(settings, *store, SourcePath(first), tree.hash);
     EXPECT_EQ(first->reads, 2u);
     StringSink nar;
@@ -1054,8 +1054,7 @@ TEST_F(GitUtilsTest, workdirReadsAndNamesItsFilesystemView)
     auto workdir = repo->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("no"); });
     workdir->fingerprint = "whole";
     for (auto p : {"", "clean", "clean/a", "dirty", "dirty/c"}) {
-        EXPECT_EQ(
-            workdir->getFingerprint(CanonPath(p)), (std::pair{CanonPath(p), std::optional<std::string>("whole")}));
+        EXPECT_EQ(workdir->getFingerprint(CanonPath(p)), (std::pair{CanonPath(p), std::string("whole")}));
         EXPECT_FALSE(workdir->getKnownEntry(CanonPath(p)));
     }
 
@@ -1264,7 +1263,7 @@ TEST_F(GitUtilsTest, workdirIndexFlagsDoNotChangeItsContents)
                     EXPECT_FALSE(wd.dirtyFiles.contains(path));
                 EXPECT_EQ(workdir->readFile(path), changed ? "after!" : "before");
                 EXPECT_EQ(workdir->lstat(path).isExecutable, executable);
-                EXPECT_EQ(workdir->getFingerprint(path), (std::pair{path, std::optional<std::string>("whole")}));
+                EXPECT_EQ(workdir->getFingerprint(path), (std::pair{path, std::string("whole")}));
             }
 }
 
@@ -1295,9 +1294,7 @@ TEST_F(GitUtilsTest, workdirAttributesFromTheIndexDoNotReplaceFilesystemBytes)
             auto workdir = repo->getAccessor(wd, {}, [](const CanonPath &) { return RestrictedPathError("no"); });
             workdir->fingerprint = "whole";
             EXPECT_EQ(workdir->readFile(CanonPath(file)), "line\r\n");
-            EXPECT_EQ(
-                workdir->getFingerprint(CanonPath(file)),
-                (std::pair{CanonPath(file), std::optional<std::string>("whole")}));
+            EXPECT_EQ(workdir->getFingerprint(CanonPath(file)), (std::pair{CanonPath(file), std::string("whole")}));
         }
     }
 }
@@ -1337,7 +1334,7 @@ TEST_F(GitUtilsTest, memoRowsHoldEntryHashesForBareExecutableAndSymlinkRoots)
     /* The commit recorded the modes this test is about. */
     ASSERT_TRUE(acc->lstat(CanonPath("x")).isExecutable);
     ASSERT_EQ(acc->lstat(CanonPath("l")).type, SourceAccessor::tSymlink);
-    ASSERT_TRUE(acc->getFingerprint(CanonPath("x")).second);
+    ASSERT_TRUE(acc->getFingerprint(CanonPath("x")));
 
     auto store = openStore("dummy://?read-only=false");
     fetchers::Settings settings;
@@ -1359,9 +1356,10 @@ TEST_F(GitUtilsTest, memoRowsHoldEntryHashesForBareExecutableAndSymlinkRoots)
         EXPECT_EQ(pLeaf, gitTreePath(*store, leaf, merkle::objectHash(entry))) << leaf;
 
         /* Its row holds the entry hash, the blob id. */
-        auto [subpath, name] = acc->getFingerprint(leafPath);
-        ASSERT_TRUE(name) << leaf;
-        auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(*name, git, subpath));
+        auto identity = acc->getFingerprint(leafPath);
+        ASSERT_TRUE(identity) << leaf;
+        const auto & [subpath, name] = *identity;
+        auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(name, git, subpath));
         ASSERT_TRUE(row) << leaf;
         EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), entry.hash) << leaf;
         EXPECT_EQ(fetchers::getIntAttr(*row, "mode"), uint64_t(entry.mode)) << leaf;
@@ -1414,9 +1412,7 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
     /* Not asked to name subtrees: the whole tree's name, as before. */
     auto unnamed = repo->getAccessor(rev1, {.exportIgnore = true}, "");
     unnamed->fingerprint = "whole";
-    EXPECT_EQ(
-        unnamed->getFingerprint(CanonPath("clean")),
-        (std::pair{CanonPath("clean"), std::optional<std::string>("whole")}));
+    EXPECT_EQ(unnamed->getFingerprint(CanonPath("clean")), (std::pair{CanonPath("clean"), std::string("whole")}));
 
     /* The working directory, dirty in one file, under the same wrapper. */
     write("dirty/c", "changed");
@@ -1425,12 +1421,8 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
     auto workdir =
         repo->getAccessor(wd, {.exportIgnore = true}, [](const CanonPath & path) { return RestrictedPathError("no"); });
     workdir->fingerprint = "whole";
-    EXPECT_EQ(
-        workdir->getFingerprint(CanonPath("clean/a")),
-        (std::pair{CanonPath("clean/a"), std::optional<std::string>("whole")}));
-    EXPECT_EQ(
-        workdir->getFingerprint(CanonPath("dirty")),
-        (std::pair{CanonPath("dirty"), std::optional<std::string>("whole")}));
+    EXPECT_EQ(workdir->getFingerprint(CanonPath("clean/a")), (std::pair{CanonPath("clean/a"), std::string("whole")}));
+    EXPECT_EQ(workdir->getFingerprint(CanonPath("dirty")), (std::pair{CanonPath("dirty"), std::string("whole")}));
 
     /* A committed `.gitattributes` naming export-ignore, anywhere in the tree, takes the names away. */
     write("clean/.gitattributes", "top export-ignore\n");
@@ -1441,16 +1433,12 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
     auto wrapped2 =
         repo2->getAccessor(rev2, {.exportIgnore = true, .exportIgnoreHidesNothing = hidesNothing(repo2, rev2)}, "");
     wrapped2->fingerprint = "whole";
-    EXPECT_EQ(
-        wrapped2->getFingerprint(CanonPath("clean/a")),
-        (std::pair{CanonPath("clean/a"), std::optional<std::string>("whole")}));
+    EXPECT_EQ(wrapped2->getFingerprint(CanonPath("clean/a")), (std::pair{CanonPath("clean/a"), std::string("whole")}));
     auto wd2 = repo2->getWorkdirInfo();
     auto workdir2 = repo2->getAccessor(
         wd2, {.exportIgnore = true}, [](const CanonPath & path) { return RestrictedPathError("no"); });
     workdir2->fingerprint = "whole";
-    EXPECT_EQ(
-        workdir2->getFingerprint(CanonPath("clean/a")),
-        (std::pair{CanonPath("clean/a"), std::optional<std::string>("whole")}));
+    EXPECT_EQ(workdir2->getFingerprint(CanonPath("clean/a")), (std::pair{CanonPath("clean/a"), std::string("whole")}));
 
     git_repository_free(rawRepo);
 }

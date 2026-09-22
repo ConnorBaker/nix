@@ -148,10 +148,11 @@ RC_GTEST_PROP(SourceAccessorNaming, equalNamesImplyEqualTrees, ())
         collectPaths(*term.accessor, CanonPath::root, paths);
         for (auto & path : paths) {
             try {
-                auto [subpath, name] = term.accessor->getFingerprint(path);
-                if (!name)
+                auto identity = term.accessor->getFingerprint(path);
+                if (!identity)
                     continue;
-                auto key = std::pair{*name, subpath.abs()};
+                const auto & [subpath, name] = *identity;
+                auto key = std::pair{name, subpath.abs()};
                 auto contents = narOf(*term.accessor, path);
                 auto [it, inserted] = seen.emplace(key, contents);
                 if (!inserted)
@@ -187,11 +188,12 @@ RC_GTEST_PROP(SourceAccessorNaming, unionNamesAreSoundAcrossChildrenAndMergedVie
         std::vector<CanonPath> paths;
         collectPaths(*accessor, CanonPath::root, paths);
         for (auto & path : paths) {
-            auto [subpath, name] = accessor->getFingerprint(path);
-            if (!name)
+            auto identity = accessor->getFingerprint(path);
+            if (!identity)
                 continue;
+            const auto & [subpath, name] = *identity;
             auto contents = narOf(*accessor, path);
-            auto [it, inserted] = seen.emplace(std::pair{*name, subpath.abs()}, contents);
+            auto [it, inserted] = seen.emplace(std::pair{name, subpath.abs()}, contents);
             if (!inserted)
                 RC_ASSERT(it->second == contents);
         }
@@ -231,23 +233,24 @@ TEST(SourceAccessorNaming, unionNamesAcrossEveryNodeAndNamingCase)
                     auto first = makeChild(firstNode, firstNamed, "a");
                     auto second = makeChild(secondNode, secondNamed, "b");
                     auto merged = makeUnionSourceAccessor({first, second});
-                    EXPECT_EQ(bool(merged->getFingerprint(CanonPath::root).second), firstNamed && secondNamed);
+                    EXPECT_EQ(bool(merged->getFingerprint(CanonPath::root)), firstNamed && secondNamed);
                     for (auto & accessor : {first, second, merged}) {
                         std::vector<CanonPath> paths;
                         collectPaths(*accessor, CanonPath::root, paths);
                         for (auto & path : paths) {
-                            auto [subpath, name] = accessor->getFingerprint(path);
-                            if (!name)
+                            auto identity = accessor->getFingerprint(path);
+                            if (!identity)
                                 continue;
+                            const auto & [subpath, name] = *identity;
                             auto contents = narOf(*accessor, path);
-                            auto [it, inserted] = seen.emplace(std::pair{*name, subpath.abs()}, contents);
+                            auto [it, inserted] = seen.emplace(std::pair{name, subpath.abs()}, contents);
                             if (!inserted)
                                 EXPECT_EQ(it->second, contents) << path.abs();
                         }
                     }
                     if (firstNode > 0 && firstNode < 4 && secondNode == 5) {
                         EXPECT_FALSE(merged->pathExists(CanonPath("input/child")));
-                        EXPECT_FALSE(merged->getFingerprint(CanonPath("input/child")).second);
+                        EXPECT_FALSE(merged->getFingerprint(CanonPath("input/child")));
                     }
                 }
 }

@@ -252,9 +252,10 @@ public:
     }
 
     /**
-     * Return a name and relative path identifying the rendered subtree at
-     * `path`. Equal (name, relative path) pairs must identify equal subtrees,
-     * even across different accessors. Returning no name is always valid.
+     * Optionally identify the rendered subtree at `path` by a relative
+     * path and name. Equal (name, relative path) pairs must identify equal
+     * subtrees, even across different accessors. Returning no identity is
+     * always valid and carries no relative path. An empty name is present.
      *
      * A wrapper may forward an inner name only when that inner subtree is
      * the whole rendered subtree, including its domain. Otherwise it must
@@ -264,9 +265,11 @@ public:
      * `/nix/store/foo/bar` can use the mounted accessor's name with `/bar`.
      * A union directory with another contributor cannot use that name alone.
      */
-    virtual std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path)
+    virtual std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path)
     {
-        return {path, fingerprint};
+        if (fingerprint)
+            return std::pair{path, *fingerprint};
+        return std::nullopt;
     }
 
     /**
