@@ -14,7 +14,7 @@
 #include "nix/util/util.hh"
 
 #include <boost/unordered/unordered_flat_set.hpp>
-#include <boost/unordered/unordered_flat_map.hpp>
+#include <unordered_map>
 #include <mutex>
 #include <shared_mutex>
 #include <array>
@@ -362,7 +362,7 @@ struct GitObjectStore::Hold::Pending
     {
         std::mutex mutex;
         /** (id, mode) -> the first completed file's row. */
-        boost::unordered_flat_map<std::string, Row> byKey;
+        std::unordered_map<std::string, Row> byKey;
     };
 
     /* A one-file ingestion occupies one shard. Allocate the others only
