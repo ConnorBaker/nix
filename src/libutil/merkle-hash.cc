@@ -38,22 +38,31 @@ void feedHeader(Sink & sink, std::string_view kind, uint64_t size)
     sink(header);
 }
 
-BlobHasher::BlobHasher(uint64_t size)
-    : sink(hashAlgo)
+struct BlobHasher::Context
 {
-    /* Header and body use the same unbuffered stream, leaving HashSink's
-       buffer empty for the whole blob. */
+    SHA256_CTX sha256;
+};
+
+BlobHasher::BlobHasher(uint64_t size)
+    : context(new Context)
+{
+    static_assert(hashAlgo == HashAlgorithm::SHA256);
+    SHA256_Init(&context->sha256);
     feedHeader(*this, "blob", size);
 }
 
+BlobHasher::~BlobHasher() = default;
+
 void BlobHasher::operator()(std::string_view chunk)
 {
-    sink.writeUnbuffered(chunk);
+    SHA256_Update(&context->sha256, chunk.data(), chunk.size());
 }
 
 Hash BlobHasher::finish()
 {
-    return sink.finish().hash;
+    Hash hash(hashAlgo);
+    SHA256_Final(hash.hash, &context->sha256);
+    return hash;
 }
 
 static Hash hashObject(std::string_view kind, std::string_view body)

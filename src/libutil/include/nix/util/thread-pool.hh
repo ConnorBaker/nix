@@ -107,7 +107,7 @@ class CopyPool
     bool stopping = false;
 
     void work(std::promise<void> ready);
-    std::future<void> tryAsync(const void * group, std::function<void()> run);
+    std::future<void> tryAsync(const void * group, const fun<void(size_t, bool)> & run, size_t i);
     void wait(std::future<void> & result, const void * group);
 
 public:

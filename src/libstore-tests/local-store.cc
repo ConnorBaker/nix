@@ -7610,6 +7610,114 @@ TEST_F(LocalStoreObjectsTest, materialiseAppliesTheCaseHackAsTheRestorerDoes)
     }
 }
 
+/* A callback may enter another copy on the same thread. Each copy owns its
+   destination even while the other is suspended, and unwinding the inner
+   copy leaves the outer siblings in their original directory. The NARs
+   below are produced directly from memory, independently of either writer. */
+TEST_F(LocalStoreObjectsTest, reentrantCopiesRestoreTheirDestinationAfterReturnAndThrow)
+{
+    struct NestedFailure
+    {};
+
+    struct Hooks : CountingRestoreHooks
+    {
+        using CountingRestoreHooks::CountingRestoreHooks;
+        std::function<void(const CanonPath &)> onSymlink;
+
+        void symlinkCreated(Descriptor fd, const CanonPath & name) override
+        {
+            CountingRestoreHooks::symlinkCreated(fd, name);
+            onSymlink(name);
+        }
+    };
+
+    WithCaseHack on{true};
+    auto outer = treeAccessor({
+        {"Dir/A", "outer-upper", 'l'},
+        {"Dir/a", "outer-lower", 'l'},
+        {"Dir/z", "outer-after", 'f'},
+        {"dir/tail", "outer-tail", 'l'},
+    });
+    auto inner = treeAccessor({
+        {"Inner/A", "inner-upper", 'l'},
+        {"Inner/a", "inner-lower", 'l'},
+        {"Inner/z", "inner-after", 'x'},
+    });
+    auto outerNar = narOf(*outer);
+    auto innerNar = narOf(*inner);
+    auto outerHash = objectHashOf(*outer, CanonPath::root).root;
+    auto hacked = std::string("a") + std::string(caseHackSuffix) + "1";
+    auto realStoreDir = std::filesystem::path{config->realStoreDir.get()};
+    auto copy = [&](bool pull,
+                    const std::filesystem::path & dst,
+                    const ref<MemorySourceAccessor> & tree,
+                    const std::string & nar,
+                    Hooks & hooks) {
+        auto hold = store->objects.hold();
+        if (pull)
+            return store->materialiseThroughObjects(
+                dst, SourcePath(tree), defaultPathFilter, false, &hooks, NoRepair, noNode(), hold);
+        StringSource source{nar};
+        return store->restoreThroughObjects(dst, source, false, &hooks, hold, NoRepair);
+    };
+
+    for (bool outerPull : {false, true})
+        for (bool innerPull : {false, true})
+            for (bool fail : {false, true}) {
+                SCOPED_TRACE(fmt("outer-pull=%d inner-pull=%d fail=%d", outerPull, innerPull, fail));
+                auto label = fmt("reentrant-%d-%d-%d", outerPull, innerPull, fail);
+                auto outerDst = realStoreDir / (label + "-outer");
+                auto innerDst = realStoreDir / (label + "-inner");
+                Hooks outerHooks{
+                    makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
+                Hooks innerHooks{
+                    makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
+                std::vector<std::string> trace;
+                innerHooks.onSymlink = [&](const CanonPath & name) {
+                    trace.push_back(fmt("inner:%s", name.rel()));
+                    if (fail && name.rel() == hacked)
+                        throw NestedFailure{};
+                };
+                bool entered = false;
+                outerHooks.onSymlink = [&](const CanonPath & name) {
+                    trace.push_back(fmt("outer:%s", name.rel()));
+                    if (name.rel() != hacked)
+                        return;
+                    EXPECT_FALSE(entered);
+                    entered = true;
+                    bool failed = false;
+                    try {
+                        copy(innerPull, innerDst, inner, innerNar, innerHooks);
+                    } catch (const NestedFailure &) {
+                        failed = true;
+                    }
+                    EXPECT_EQ(failed, fail);
+                    trace.push_back(failed ? "inner-failed" : "inner-completed");
+                };
+                auto result = copy(outerPull, outerDst, outer, outerNar, outerHooks);
+                EXPECT_TRUE(entered);
+                EXPECT_EQ(result.root, outerHash);
+                EXPECT_EQ(result.narSize, outerNar.size());
+                StringSink actual;
+                dumpPath(outerDst, actual);
+                EXPECT_EQ(actual.s, outerNar);
+                if (!fail) {
+                    StringSink nested;
+                    dumpPath(innerDst, nested);
+                    EXPECT_EQ(nested.s, innerNar);
+                }
+                EXPECT_EQ(
+                    trace,
+                    (std::vector<std::string>{
+                        "outer:A",
+                        "outer:" + hacked,
+                        "inner:A",
+                        "inner:" + hacked,
+                        fail ? "inner-failed" : "inner-completed",
+                        "outer:tail"}));
+            }
+}
+
 /* Law 2 of 01 §9.10 over the second route, on generated trees: whatever
    the naming names -- everything, nothing, or some directories -- the
    materialised path dumps to the one route's NAR byte for byte, its root
@@ -7996,6 +8104,79 @@ TEST_F(LocalStoreObjectsTest, nestedParallelCopyJoinsOnFailure)
         dumpPath(good, actual);
         EXPECT_EQ(actual.s, expected);
     }
+}
+
+/* The logical name survives collection, vector relocation, and a case-hack
+   suffix on the separately owned physical name. All four node forms occur
+   under both short and long case-colliding names; eight more directories
+   make every supported worker width available. The oracles read only the
+   in-memory source, not another materialisation. */
+TEST_F(LocalStoreObjectsTest, parallelCopyPreservesLogicalAndPhysicalChildNames)
+{
+    Nodes nodes;
+    std::set<std::string> logicalNames;
+    for (bool longName : {false, true})
+        for (char kind : {'f', 'x', 'l', 'd'})
+            for (bool upper : {false, true}) {
+                auto name = std::string(1, upper ? char(kind - 'a' + 'A') : kind);
+                if (longName)
+                    name += std::string(96, 'n');
+                logicalNames.insert(name);
+                if (kind == 'd')
+                    nodes.emplace_back(name + "/payload", name, 'f');
+                else
+                    nodes.emplace_back(name, name, kind);
+            }
+    for (size_t i = 0; i < 8; ++i) {
+        auto name = fmt("scope%d", i);
+        logicalNames.insert(name);
+        nodes.emplace_back(name + "/child", name, 'f');
+    }
+    auto tree = make_ref<ConcurrentMemorySourceAccessor>();
+    tree->root = std::move(treeAccessor(nodes)->root);
+    ASSERT_EQ(logicalNames.size(), 24u);
+
+    /* Without the hack a case-insensitive backend cannot represent these
+       sibling names. Keep the hacked cells on that backend as well. */
+    writeFile(tempStoreDir.path() / "CaseSensitiveProbe", "");
+    bool caseSensitive = !pathExists(tempStoreDir.path() / "casesensitiveprobe");
+    Finally restoreWorkers{
+        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+    size_t cases = 0;
+    for (bool caseHack : {false, true}) {
+        if (!caseHack && !caseSensitive)
+            continue;
+        WithCaseHack policy{caseHack};
+        auto expectedNar = narOf(*tree);
+        auto expectedRoot = referenceObjectEntry(*tree, CanonPath::root);
+        std::set<std::string> expectedNames;
+        for (auto & name : logicalNames) {
+            bool secondOfPair =
+                name.front() == 'f' || name.front() == 'x' || name.front() == 'l' || name.front() == 'd';
+            expectedNames.insert(caseHack && secondOfPair ? name + std::string(caseHackSuffix) + "1" : name);
+        }
+        for (size_t workers = 1; workers <= 8; ++workers) {
+            SCOPED_TRACE(fmt("caseHack=%d workers=%d", caseHack, workers));
+            LocalStore::copyWorkersForTest.store(workers);
+            auto dst = config->realStoreDir.get() / fmt("names-h%d-w%d", caseHack, workers);
+            auto result = materialise(
+                dst, SourcePath(tree), noNode(), NoRepair, defaultPathFilter, /*callbacksPermitParallelism=*/true);
+            EXPECT_EQ(result.root, expectedRoot);
+            EXPECT_EQ(result.narSize, expectedNar.size());
+            EXPECT_TRUE(result.narSizeExact);
+            StringSink actualNar;
+            dumpPath(dst, actualNar);
+            EXPECT_EQ(actualNar.s, expectedNar);
+            /* Check real directory spellings; resolving a path can conceal
+               a wrong-case name on a case-insensitive filesystem. */
+            std::set<std::string> actualNames;
+            for (auto & entry : DirectoryIterator{dst})
+                actualNames.insert(entry.path().filename().string());
+            EXPECT_EQ(actualNames, expectedNames);
+            ++cases;
+        }
+    }
+    EXPECT_EQ(cases, caseSensitive ? 16u : 8u);
 }
 
 /* The same law over generated trees, the namers of
@@ -8866,7 +9047,7 @@ TEST_F(TempLocalStoreTest, registrationRejectsEveryMismatchedKeyBeforeEffects)
                 if (rows.size() == 1)
                     EXPECT_EQ(rows.front().id, id);
                 EXPECT_FALSE(hold.ingestion->id.has_value());
-                EXPECT_FALSE(hold.ingestion->path.has_value());
+                EXPECT_FALSE(hold.ingestion->completed);
             }
         }
     }

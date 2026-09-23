@@ -438,12 +438,12 @@ public:
         /**
          * Per-path state created by `LocalStore::beginIngestion`; absent
          * when nothing writes an index. Completion assigns `Ingestions.id`;
-         * the path identifies a completed builder output at bulk registration.
+         * completion selects stored builder projections at bulk registration.
          */
         struct Ingestion
         {
             std::optional<uint64_t> id;
-            std::optional<std::string> path;
+            bool completed = false;
         };
 
         /* Accessed only before or after the path's walking workers run. */

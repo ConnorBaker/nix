@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -50,12 +51,15 @@ struct BlobHasher : Sink
 {
     explicit BlobHasher(uint64_t size);
 
+    ~BlobHasher() override;
+
     void operator()(std::string_view chunk) override;
 
     Hash finish();
 
 private:
-    HashSink sink;
+    struct Context;
+    std::unique_ptr<Context> context;
 };
 
 Hash blobId(std::string_view bytes);

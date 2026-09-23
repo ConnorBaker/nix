@@ -57,12 +57,12 @@ void CopyPool::work(std::promise<void> ready)
     }
 }
 
-std::future<void> CopyPool::tryAsync(const void * group, std::function<void()> run)
+std::future<void> CopyPool::tryAsync(const void * group, const fun<void(size_t, bool)> & run, size_t i)
 {
     std::lock_guard lock(mutex);
     if (pending.size() == capacity)
         return {};
-    std::packaged_task<void()> job(std::move(run));
+    std::packaged_task<void()> job([&run, i] { run(i, true); });
     auto result = job.get_future();
     if (threads.size() < capacity) {
         std::promise<void> ready;
@@ -111,48 +111,45 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
         return;
     }
 
-    struct Child
-    {
-        std::future<void> running;
-        std::exception_ptr error;
-    };
-
-    std::vector<Child> children(count);
+    /* Launch stops at the first inline failure. Retain that exception
+       through every join, even if an earlier child or fold fails. */
+    std::exception_ptr inlineFailure;
+    std::vector<std::future<void>> children(count);
     std::exception_ptr failure;
     try {
         for (size_t i = 0; i < count; ++i) {
-            auto & child = children[i];
+            auto & running = children[i];
             if (canFork(i))
-                child.running = tryAsync(&children, [&, i] { run(i, true); });
-            if (!child.running.valid())
+                running = tryAsync(&children, run, i);
+            if (!running.valid())
                 try {
                     run(i, false);
                 } catch (...) {
-                    child.error = std::current_exception();
-                    /* No later work is needed. Earlier jobs still determine
-                       which error the ordered fold reports. */
-                    count = i + 1;
+                    inlineFailure = std::current_exception();
+                    /* Fold the preceding prefix first: its failures take
+                       precedence over this child's failed visit. */
+                    count = i;
                     break;
                 }
         }
         for (size_t i = 0; i < count; ++i) {
-            auto & child = children[i];
-            if (child.running.valid()) {
-                wait(child.running, &children);
-                child.running.get();
+            auto & running = children[i];
+            if (running.valid()) {
+                wait(running, &children);
+                running.get();
             }
-            if (child.error)
-                std::rethrow_exception(child.error);
             consume(i);
         }
+        if (inlineFailure)
+            std::rethrow_exception(inlineFailure);
     } catch (...) {
         failure = std::current_exception();
     }
     /* Join outside exception unwinding: helped jobs must still observe
        interrupts, which are suppressed while a destructor is unwinding. */
-    for (auto & child : children)
-        if (child.running.valid())
-            wait(child.running, &children);
+    for (auto & running : children)
+        if (running.valid())
+            wait(running, &children);
     if (failure)
         std::rethrow_exception(failure);
 }

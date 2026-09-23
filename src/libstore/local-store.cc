@@ -745,7 +745,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
         state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(*id)).exec();
         txn.commit();
         ingestion->id = id;
-        ingestion->path = logical;
+        ingestion->completed = true;
     });
 }
 
@@ -1708,7 +1708,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
     std::vector<Publication> publications;
     if (ingestion) {
         auto rows = hold->takeRows();
-        if (!ingestion->path) {
+        if (!ingestion->completed) {
             assert(infos.size() == 1);
             publications.push_back({infos.begin()->first, ingestion->id, std::move(rows)});
         } else {
@@ -1838,7 +1838,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                 state->stmts->AddReference.use().apply(referrer).apply(pathIds.at(reference)).exec();
         }
         txn.commit();
-        if (ingestion && !ingestion->path && !publications.empty())
+        if (ingestion && !ingestion->completed && !publications.empty())
             ingestion->id = ingestionIds.front();
         /* A description becomes cacheable only with the committed path
            and references. A rejected reference or cycle rolls the SQL

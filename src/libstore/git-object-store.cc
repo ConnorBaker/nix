@@ -353,18 +353,16 @@ static std::error_code hardLink(const std::filesystem::path & from, const std::f
    forty thousand times by eight threads, and it was the first reason the
    parallel copy was slower than the route it replaces.
 
-   Rows stay private until the completed path is handed to the store.
-   Moving the completed queues copies no rows and retires their pending
-   witnesses. Unused shards are never allocated. */
+   The finite map associates each (id, mode) with its first completed row.
+   Rows stay private until the completed path is handed to the store;
+   handing them over retires the pending map. Unused shards are never allocated. */
 struct GitObjectStore::Hold::Pending
 {
     struct Shard
     {
         std::mutex mutex;
-        /** Rows not yet handed to the store. */
-        std::vector<Row> queue;
-        /** (id, mode) -> the holder's name during the walk. */
-        boost::unordered_flat_map<std::string, std::string> byKey;
+        /** (id, mode) -> the first completed file's row. */
+        boost::unordered_flat_map<std::string, Row> byKey;
     };
 
     /* A one-file ingestion occupies one shard. Allocate the others only
@@ -431,36 +429,29 @@ std::optional<std::string> GitObjectStore::Hold::addRow(Row row) const
     auto key = pendingKey(row.id, row.executable);
     auto & shard = pending->shard(shardOf(row.id));
     auto lock = std::lock_guard{shard.mutex};
-    auto [i, inserted] = shard.byKey.try_emplace(std::move(key), row.name);
-    if (!inserted)
-        return i->second.empty() ? pending->root.string() : (pending->root / i->second).string();
-    shard.queue.push_back(std::move(row));
-    return std::nullopt;
+    auto [i, inserted] = shard.byKey.try_emplace(std::move(key), std::move(row));
+    if (inserted)
+        return std::nullopt;
+    auto & name = i->second.name;
+    return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 
 std::vector<GitObjectStore::Hold::Row> GitObjectStore::Hold::takeRows() const
 {
     /* The caller owns a completed walk. Reserve before consuming any rows,
-       reusing the first queue so a single occupied shard needs no allocation.
+       so allocation failure leaves the complete pending relation intact.
        Publication owns the returned rows; no pending witness survives. */
     static_assert(std::is_nothrow_move_constructible_v<Row>);
-    Pending::Shard * first = nullptr;
     size_t count = 0;
     for (auto & slot : pending->shards)
-        if (auto * shard = slot.load(std::memory_order_acquire); shard && !shard->queue.empty()) {
-            if (!first)
-                first = shard;
-            count += shard->queue.size();
-        }
+        if (auto * shard = slot.load(std::memory_order_acquire))
+            count += shard->byKey.size();
     std::vector<Row> rows;
-    if (first) {
-        first->queue.reserve(count);
-        rows.swap(first->queue);
-    }
+    rows.reserve(count);
     for (auto & slot : pending->shards)
         if (std::unique_ptr<Pending::Shard> shard{slot.exchange(nullptr)}; shard)
-            rows.insert(
-                rows.end(), std::make_move_iterator(shard->queue.begin()), std::make_move_iterator(shard->queue.end()));
+            for (auto & [_, row] : shard->byKey)
+                rows.push_back(std::move(row));
     return rows;
 }
 
@@ -473,7 +464,8 @@ std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, 
     auto i = shard->byKey.find(pendingKey(id, executable));
     if (i == shard->byKey.end())
         return std::nullopt;
-    return i->second.empty() ? pending->root.string() : (pending->root / i->second).string();
+    auto & name = i->second.name;
+    return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 
 /* The holder's name under the ingestion's root, made on the worker that wrote
@@ -628,32 +620,31 @@ std::filesystem::path GitObjectStore::Hold::linkFor(const std::filesystem::path 
     /* Keep the hold's layout sharded too: a full source can hold tens of
        thousands of trees. Its one lock protects the entire hierarchy,
        and both normal release and the stale-hold sweep remove it recursively. */
-    auto part = object.end();
-    auto name = *--part;
-    auto shard = *--part;
-    auto kind = *--part;
+    auto name = std::prev(object.end());
+    auto shard = std::prev(name);
+    auto kind = std::prev(shard);
     /* These are already path components. Assemble their native spelling
        once; operator/ would split and copy the whole path at each step. */
     std::filesystem::path::string_type parent;
-    parent.reserve(dir.native().size() + kind.native().size() + shard.native().size() + name.native().size() + 3);
+    parent.reserve(dir.native().size() + kind->native().size() + shard->native().size() + name->native().size() + 3);
     parent += dir.native();
     parent += std::filesystem::path::preferred_separator;
-    parent += kind.native();
+    parent += kind->native();
     parent += std::filesystem::path::preferred_separator;
-    parent += shard.native();
-    auto shardName = shard.string();
+    parent += shard->native();
+    auto shardName = shard->string();
     assert(isShardName(shardName));
     auto digit = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
     size_t n = digit(shardName[0]) * 16 + digit(shardName[1]);
-    if (kind == "blobs-x")
+    if (*kind == "blobs-x")
         n += 256;
-    else if (kind == "trees")
+    else if (*kind == "trees")
         n += 512;
     else
-        assert(kind == "blobs");
+        assert(*kind == "blobs");
     std::call_once((*auxiliaryShards)[n], [&] { createDirs(parent); });
     parent += std::filesystem::path::preferred_separator;
-    parent += name.native();
+    parent += name->native();
     return std::filesystem::path(std::move(parent));
 }
 
@@ -1070,6 +1061,8 @@ static void writeObjectFile(
     const std::function<void(const std::filesystem::path &)> & atFsync)
 {
     auto held = hold.linkFor(dst);
+    if (holdObject(dst, held))
+        return;
     /* This name belongs to an already unique, locked hold. Its lifetime
        is the hold's, so it needs neither the global temporaries' timestamp
        nor their process ID. Own-row views of a hold share this process-wide
@@ -1091,7 +1084,7 @@ static void writeObjectFile(
        hold it; the sweep taking it between our look and our link, to
        write it. */
     for (int attempt = 0; attempt < 3; attempt++) {
-        if (holdObject(dst, held))
+        if (attempt && holdObject(dst, held))
             return;
         {
             mode_t mode = executable ? 0755 : 0644;

@@ -18,7 +18,6 @@
 #include "nix/util/thread-pool.hh"
 
 #include <algorithm>
-#include <type_traits>
 #include <map>
 #include <mutex>
 #include <set>
@@ -480,45 +479,35 @@ struct LinkingVisitor : ObjectStoreVisitor
     RepairFlag repair;
     Sink * rootContents;
 
-    /* The stacks a copy carries down its recursion: the sink a node's
-       children are created on -- the enclosing directory's own, innermost
-       last, the root's being the caller's `RestoreSink` -- and, under the
-       second route, the case-hacked on-disk names around each child's
-       visit.  They are *per thread*: the parallel copy below walks
-       sibling directories on a pool, and the traversal hands every worker
-       the same visitor object, so a worker seeds its own stacks with the
-       directory it starts at and unwinds them alone.  `Scope` saves and
-       restores, so the seeding nests. */
-    struct Frames
+    /* Only the current sink and optional physical child name are needed.
+       Their owners enclose every accepted visit, including pool joins.
+       C++ scopes restore the previous pair for recursion, helped jobs and
+       reentrant visitors; each thread has its own current pair. */
+    struct Frame
     {
-        std::vector<RestoreSink *> open;
-        std::vector<std::string> diskNames;
+        RestoreSink * sink = nullptr;
+        const std::string * diskName = nullptr;
     };
 
-    static Frames & frames()
+    static Frame & currentFrame() noexcept
     {
-        static thread_local Frames f;
+        static thread_local Frame f;
         return f;
     }
 
     struct Scope
     {
-        Frames saved;
+        Frame saved;
 
-        Scope(RestoreSink & sink, std::optional<std::string> diskName)
-            : saved{{&sink}, {}}
+        Scope(RestoreSink & sink, const std::string * diskName) noexcept
+            : saved(currentFrame())
         {
-            if (diskName)
-                saved.diskNames.push_back(std::move(*diskName));
-            /* Complete every allocating operation before replacing a
-               caller's frames, including when it helps a detached child. */
-            static_assert(std::is_nothrow_swappable_v<Frames>);
-            std::swap(saved, frames());
+            currentFrame() = {&sink, diskName};
         }
 
         ~Scope()
         {
-            frames() = std::move(saved);
+            currentFrame() = saved;
         }
     };
 
@@ -534,7 +523,7 @@ struct LinkingVisitor : ObjectStoreVisitor
         : ObjectStoreVisitor(objects, hold)
         , repair(repair)
         , rootContents(rootContents)
-        , scope(restore, std::nullopt)
+        , scope(restore, nullptr)
     {
     }
 
@@ -547,17 +536,15 @@ struct LinkingVisitor : ObjectStoreVisitor
         std::filesystem::path where;
     };
 
-    /* The on-disk name of the node at `path`: under the push driver the
-       NAR restorer's, case hack applied, which `path` carries already. */
-    virtual std::string diskName(const CanonPath & path)
-    {
-        return std::string(*path.baseName());
-    }
-
     Target at(const CanonPath & path)
     {
-        auto & sink = *frames().open.back();
-        auto name = path.isRoot() ? path : CanonPath::root / diskName(path);
+        auto & frame = currentFrame();
+        auto & sink = *frame.sink;
+        /* Pull children supply their case-hacked name; push paths already
+           carry the NAR restorer's physical spelling. */
+        auto name = path.isRoot()
+                        ? path
+                        : CanonPath::root / (frame.diskName ? std::string_view(*frame.diskName) : *path.baseName());
         return {sink, name, name.isRoot() ? sink.dstPath : sink.dstPath / name.rel()};
     }
 
@@ -567,9 +554,7 @@ struct LinkingVisitor : ObjectStoreVisitor
         return ObjectStoreVisitor::directory(path, [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
             target.sink.createSubdirectory(target.name, [&](RestoreSink & sub, const CanonPath & rel) {
                 assert(rel.isRoot());
-                auto & open = frames().open;
-                open.push_back(&sub);
-                Finally close{[&] { open.pop_back(); }};
+                Scope scope{sub, currentFrame().diskName};
                 children(std::move(each));
             });
         });
@@ -650,8 +635,8 @@ struct LinkingVisitor : ObjectStoreVisitor
    verified immutable file or named subtree from existing objects, or
    descends through LinkingVisitor. The namer is consulted for the root
    and directories only; raw unnamed files are read and hashed. Directory
-   entries carry tree names, while diskNames retains the case-hacked name
-   around each child for destination placement. */
+   entries carry tree names, while the child scope borrows its case-hacked
+   name for destination placement. */
 struct MaterialisingVisitor : LinkingVisitor
 {
     const SourcePath & source;
@@ -685,12 +670,6 @@ struct MaterialisingVisitor : LinkingVisitor
     {
     }
 
-    std::string diskName(const CanonPath & path) override
-    {
-        auto & diskNames = frames().diskNames;
-        return diskNames.empty() ? std::string(*path.baseName()) : diskNames.back();
-    }
-
     HashedNode directory(const CanonPath & path, Children children) override
     {
         auto copy = [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
@@ -717,9 +696,8 @@ struct MaterialisingVisitor : LinkingVisitor
                the caller's thread, before asking it about the next sibling. */
             CaseHackNames hack;
             children([&](std::string_view name, bool isDirectory, fun<HashedNode()> visit) {
-                auto & diskNames = frames().diskNames;
-                diskNames.push_back(hack.diskName(name));
-                Finally pop{[&] { diskNames.pop_back(); }};
+                auto disk = hack.diskName(name);
+                Scope scope{*currentFrame().sink, &disk};
                 each(name, isDirectory, std::move(visit));
             });
             return;
@@ -727,8 +705,8 @@ struct MaterialisingVisitor : LinkingVisitor
 
         struct Child
         {
-            std::string name;
             std::string disk;
+            size_t nameSize;
             fun<HashedNode()> visit;
             bool subdirectory;
             std::optional<HashedNode> node;
@@ -737,29 +715,23 @@ struct MaterialisingVisitor : LinkingVisitor
         std::vector<Child> kids;
         CaseHackNames hack;
         children([&](std::string_view name, bool isDirectory, fun<HashedNode()> visit) {
-            kids.push_back({std::string(name), hack.diskName(name), std::move(visit), isDirectory, std::nullopt});
+            /* The disk name is the tree name plus an optional suffix. */
+            kids.push_back({hack.diskName(name), name.size(), std::move(visit), isDirectory, std::nullopt});
         });
         /* A singleton can still find parallel work below it. Construct
            the shared scheduler only at the first branching directory. */
         if (!pool && kids.size() > 1 && std::any_of(kids.begin(), kids.end(), [](auto & c) { return c.subdirectory; }))
             pool = std::make_unique<CopyPool>(workers);
-        auto * sink = frames().open.back();
-        auto run = [&](size_t i, bool detached) {
+        auto * sink = currentFrame().sink;
+        auto run = [&](size_t i, bool) {
             auto & c = kids[i];
-            if (detached) {
-                Scope scope{*sink, c.disk};
-                c.node = c.visit();
-            } else {
-                auto & diskNames = frames().diskNames;
-                diskNames.push_back(c.disk);
-                Finally pop{[&] { diskNames.pop_back(); }};
-                c.node = c.visit();
-            }
+            Scope scope{*sink, &c.disk};
+            c.node = c.visit();
         };
         auto consume = [&](size_t i) {
             auto & c = kids[i];
             assert(c.node);
-            each(c.name, c.subdirectory, [&] { return std::move(*c.node); });
+            each(std::string_view(c.disk).substr(0, c.nameSize), c.subdirectory, [&] { return std::move(*c.node); });
         };
         if (pool)
             pool->ordered(kids.size(), [&](size_t i) { return kids[i].subdirectory; }, run, consume);
