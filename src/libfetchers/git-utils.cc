@@ -958,6 +958,7 @@ public:
 
     void readBlob(const CanonPath & path, bool symlink, Sink & sink, std::function<void(uint64_t)> sizeCallback)
     {
+        auto keepAlive = weak_from_this().lock();
         auto state(state_.lock());
 
         const auto blob = getBlob(*state, path, symlink);
@@ -986,8 +987,8 @@ public:
 
         auto view = std::string_view((const char *) git_blob_rawcontent(blob.get()), git_blob_rawsize(blob.get()));
         sizeCallback(view.size());
-        StringSource source{view};
-        source.drainInto(sink);
+        if (!view.empty())
+            sink(view);
     }
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override

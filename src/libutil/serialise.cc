@@ -136,12 +136,13 @@ void Source::drainInto(Sink & sink)
 {
     std::array<char, 8192> buf;
     while (true) {
+        size_t n;
         try {
-            auto n = read(buf.data(), buf.size());
-            sink({buf.data(), n});
+            n = read(buf.data(), buf.size());
         } catch (EndOfFile &) {
             break;
         }
+        sink({buf.data(), n});
     }
 }
 

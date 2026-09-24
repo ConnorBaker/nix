@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 #include <rapidcheck/gtest.h>
+#include <algorithm>
 
 namespace nix {
 
@@ -940,6 +941,27 @@ TEST(SourceAccessor, compoundDefaultsOwnTheirCallbackContinuations)
                         expected.resize(at + 1);
                     EXPECT_EQ(observed, expected);
                 }
+    }
+}
+
+/* MemorySourceAccessor remains a mutable source. A sink may overwrite the
+   source while consuming the bytes already delivered to this callback. */
+TEST(MemorySourceAccessor, reentrantSinkConsumesDeliveredBytesBeforeLaterMutation)
+{
+    for (size_t length : {1u, 8192u}) {
+        SCOPED_TRACE(length);
+        auto accessor = make_ref<MemorySourceAccessor>();
+        const CanonPath file("file");
+        accessor->addFile(file, std::string(length, 'A'));
+        std::string received;
+        LambdaSink sink([&](std::string_view bytes) {
+            auto & current = std::get<MemorySourceAccessor::File::Regular>(accessor->open(file, std::nullopt)->raw);
+            std::fill(current.contents.begin(), current.contents.end(), 'B');
+            received.append(bytes);
+        });
+        accessor->readFile(file, sink, [&](uint64_t size) { EXPECT_EQ(size, length); });
+        EXPECT_EQ(received, std::string(length, 'A'));
+        EXPECT_EQ(accessor->readFile(file), std::string(length, 'B'));
     }
 }
 

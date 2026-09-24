@@ -51,6 +51,7 @@
 #include <future>
 #include <iostream>
 #include <latch>
+#include <stdexcept>
 #include <tuple>
 #include <typeinfo>
 
@@ -2334,6 +2335,115 @@ TEST(GitUtils, isLegalRefName)
     ASSERT_FALSE(isLegalRefName("*/foo/*"));
     ASSERT_FALSE(isLegalRefName("/foo"));
     ASSERT_FALSE(isLegalRefName(""));
+}
+
+/* These accessors already own the complete immutable bytes. Their stream
+   contract concerns bytes, callback order and failure, not chunk boundaries. */
+TEST_F(GitUtilsTest, immutableReadsPreserveBytesFailuresAndCallbackLifetime)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo{[&] { git_repository_free(rawRepo); }};
+    auto repo = openRepo();
+    repo->setRemote("origin", "https://example.invalid/immutable-byte-delivery");
+    const CanonPath file("file");
+    enum class Producer { Nar, Git, GitLfsUnselected };
+    enum class Release { Never, Size, Sink };
+    enum class Failure { None, SizeError, SizeEof, SinkError, SinkEof };
+
+    struct ConsumerError : Error
+    {
+        using Error::Error;
+    };
+
+    size_t cases = 0;
+
+    for (size_t length : {0u, 1u, 8191u, 8192u, 8193u, 24577u}) {
+        std::string contents(length, '\0');
+        for (size_t i = 0; i < length; ++i)
+            contents[i] = static_cast<char>(i % 256);
+        write("file", contents);
+        auto rev = commitPaths(rawRepo, {"file"}, "immutable byte delivery");
+        auto memory = make_ref<MemorySourceAccessor>();
+        memory->addFile(file, std::string(contents));
+        StringSink nar;
+        memory->dumpPath(CanonPath::root, nar);
+
+        for (auto producer : {Producer::Nar, Producer::Git, Producer::GitLfsUnselected})
+            for (auto release : {Release::Never, Release::Size, Release::Sink})
+                for (auto failure :
+                     {Failure::None, Failure::SizeError, Failure::SizeEof, Failure::SinkError, Failure::SinkEof}) {
+                    SCOPED_TRACE(
+                        ::testing::Message() << "length=" << length << " producer=" << int(producer)
+                                             << " release=" << int(release) << " failure=" << int(failure));
+                    std::shared_ptr<SourceAccessor> accessor =
+                        producer == Producer::Nar
+                            ? makeNarAccessor(std::string(nar.s)).get_ptr()
+                            : repo->getAccessor(rev, {.smudgeLfs = producer == Producer::GitLfsUnselected}, "")
+                                  .get_ptr();
+                    std::weak_ptr<SourceAccessor> weak = accessor;
+                    bool released = false, sawSize = false;
+                    size_t sinkCalls = 0;
+                    std::string received;
+                    auto releaseAt = [&](Release at) {
+                        if (release != at || released)
+                            return;
+                        /* A negative control without the guard must fail before
+                           destroying a Git accessor whose mutex is still held. */
+                        if (weak.use_count() < 2)
+                            throw std::logic_error("reader has no owner across its callback");
+                        accessor.reset();
+                        released = true;
+                    };
+                    LambdaSink sink([&](std::string_view bytes) {
+                        ++sinkCalls;
+                        EXPECT_TRUE(sawSize);
+                        EXPECT_FALSE(bytes.empty());
+                        releaseAt(Release::Sink);
+                        if (failure == Failure::SinkError)
+                            throw ConsumerError("sink callback failure");
+                        if (failure == Failure::SinkEof)
+                            throw EndOfFile("sink callback failure");
+                        received.append(bytes);
+                    });
+                    auto read = [&] {
+                        accessor->readFile(file, sink, [&](uint64_t size) {
+                            EXPECT_FALSE(sawSize);
+                            sawSize = true;
+                            EXPECT_EQ(size, contents.size());
+                            releaseAt(Release::Size);
+                            if (failure == Failure::SizeError)
+                                throw ConsumerError("size callback failure");
+                            if (failure == Failure::SizeEof)
+                                throw EndOfFile("size callback failure");
+                        });
+                    };
+                    bool sizeFailure = failure == Failure::SizeError || failure == Failure::SizeEof;
+                    bool sinkFailure = length && (failure == Failure::SinkError || failure == Failure::SinkEof);
+                    if (failure == Failure::SizeError || (length && failure == Failure::SinkError))
+                        EXPECT_THROW(read(), ConsumerError);
+                    else if (failure == Failure::SizeEof || (length && failure == Failure::SinkEof))
+                        EXPECT_THROW(read(), EndOfFile);
+                    else
+                        EXPECT_NO_THROW(read());
+                    EXPECT_TRUE(sawSize);
+                    EXPECT_EQ(sinkCalls == 0, sizeFailure || !length);
+                    EXPECT_EQ(received, sizeFailure || sinkFailure ? std::string{} : contents);
+                    EXPECT_EQ(weak.expired(), released);
+                    ++cases;
+                }
+    }
+    EXPECT_EQ(cases, 270u);
+
+    auto pool = openWriterPool();
+    auto links = pool->makeDirectorySink();
+    links->insertChild("empty-link", pool->makeSymlink(""));
+    links->insertChild("link", pool->makeSymlink("target"));
+    auto tree = std::move(*links).finalize();
+    pool->flush();
+    auto accessor = repo->getAccessor(tree, {}, "");
+    EXPECT_EQ(accessor->readLink(CanonPath("empty-link")), "");
+    EXPECT_EQ(accessor->readLink(CanonPath("link")), "target");
 }
 
 } // namespace nix::fetchers

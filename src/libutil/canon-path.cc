@@ -27,12 +27,10 @@ static void ensureNoNullBytes(std::string_view s)
 
 CanonPath CanonPath::fromFilename(std::string_view segment)
 {
-    auto res = CanonPath(segment);
-    /* Use existing canonicalisation logic for CanonPath to check that the segment
-       is already a valid filename. */
-    if (segment != res.rel() || std::ranges::distance(res) != 1)
+    ensureNoNullBytes(segment);
+    if (segment.empty() || segment == "." || segment == ".." || segment.find('/') != segment.npos)
         throw BadCanonPath("invalid filename '%s'", segment);
-    return res;
+    return CanonPath(unchecked_t(), concatStrings("/", segment));
 }
 
 CanonPath::CanonPath(std::string_view raw)

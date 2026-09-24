@@ -65,6 +65,74 @@ TEST(CanonPath, fromFilename)
     ASSERT_EQ(CanonPath::fromFilename("abc").rel(), "abc");
 }
 
+TEST(CanonPath, fromFilenameMatchesTheCompleteShortByteDomain)
+{
+    size_t cases = 0, accepted = 0;
+    auto check = [&](std::string_view word) {
+        ++cases;
+        SCOPED_TRACE(::testing::Message() << "case=" << cases << " length=" << word.size());
+        bool hasNull = std::any_of(word.begin(), word.end(), [](char c) { return c == '\0'; });
+        bool permitted = !word.empty() && word != "." && word != ".."
+                         && std::all_of(word.begin(), word.end(), [](char c) { return c != '\0' && c != '/'; });
+        accepted += permitted;
+        try {
+            auto result = CanonPath::fromFilename(word);
+            if (!permitted) {
+                ADD_FAILURE() << "accepted an invalid filename";
+                return;
+            }
+            EXPECT_EQ(result.abs(), "/" + std::string(word));
+            EXPECT_EQ(result.rel(), word);
+            EXPECT_EQ(result.baseName(), std::optional{word});
+            EXPECT_EQ(result.parent(), CanonPath::root);
+            EXPECT_EQ(std::ranges::distance(result), 1);
+            EXPECT_EQ(CanonPath(result.abs()), result);
+        } catch (const BadCanonPath & error) {
+            EXPECT_FALSE(permitted);
+            EXPECT_NE(
+                std::string(error.what()).find(hasNull ? "must not contain null" : "invalid filename"),
+                std::string::npos);
+        } catch (const std::exception & error) {
+            ADD_FAILURE() << "wrong exception class: " << error.what();
+        }
+    };
+
+    check("");
+    for (unsigned int first = 0; first < 256; ++first) {
+        std::string word(1, static_cast<char>(first));
+        check(word);
+        for (unsigned int second = 0; second < 256; ++second)
+            check(word + static_cast<char>(second));
+    }
+    EXPECT_EQ(cases, 65793u);
+    EXPECT_EQ(accepted, 64768u);
+
+    std::string filenameBytes;
+    for (unsigned int byte = 1; byte < 256; ++byte)
+        if (byte != '/')
+            filenameBytes += static_cast<char>(byte);
+    for (size_t length : {3u, 15u, 16u, 255u, 256u, 257u, 513u}) {
+        /* Include longer dot-only names, every other legal byte, the old
+           reserve boundary, and each invalid byte at every position. */
+        for (char byte : filenameBytes)
+            check(std::string(length, byte));
+        std::string word(length, '\0');
+        for (size_t i = 0; i < length; ++i)
+            word[i] = filenameBytes[i % filenameBytes.size()];
+        check(word);
+        for (size_t i = 0; i < length; ++i) {
+            char previous = word[i];
+            for (char invalid : {'\0', '/'}) {
+                word[i] = invalid;
+                check(word);
+            }
+            word[i] = previous;
+        }
+    }
+    EXPECT_EQ(cases, 70208u);
+    EXPECT_EQ(accepted, 66553u);
+}
+
 TEST(CanonPath, from_existing)
 {
     CanonPath p0("foo//bar/");

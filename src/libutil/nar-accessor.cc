@@ -33,8 +33,8 @@ public:
                     length,
                     offset,
                     nar.size());
-            StringSource source(std::string_view(nar.data() + offset, length));
-            source.drainInto(sink);
+            if (length)
+                sink(std::string_view(nar.data() + offset, length));
         }}
     {
     }
@@ -124,6 +124,7 @@ public:
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
+        auto keepAlive = weak_from_this().lock();
         auto & i = get(path);
         auto * reg = std::get_if<NarListing::Regular>(&i.raw);
         if (!reg)

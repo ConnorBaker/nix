@@ -18,6 +18,70 @@ auto makeNumSource(T num)
     return sinkToSource([num](Sink & writer) { writer << num; });
 }
 
+TEST(Source, drainDistinguishesProducerCompletionFromConsumerFailure)
+{
+    struct Failure
+    {};
+
+    /* Completion belongs to the producer; any consumer exception is a
+       failed delivery, even when its type is EndOfFile. */
+    for (bool producer : {false, true})
+        for (bool eof : {false, true})
+            for (size_t delivered : {0u, 1u}) {
+                SCOPED_TRACE((::testing::Message() << producer << ':' << eof << ':' << delivered));
+                size_t reads = 0, writes = 0;
+                std::string received;
+                auto fail = [&] {
+                    if (eof)
+                        throw EndOfFile("selected stream boundary");
+                    throw Failure{};
+                };
+                LambdaSource source{[&](char * data, size_t) {
+                    auto call = reads++;
+                    if (producer && call == delivered)
+                        fail();
+                    data[0] = 'x';
+                    return size_t{1};
+                }};
+                LambdaSink sink{[&](std::string_view data) {
+                    auto call = writes++;
+                    if (!producer && call == delivered)
+                        fail();
+                    received += data;
+                }};
+
+                if (producer && eof) {
+                    EXPECT_NO_THROW(source.drainInto(sink));
+                } else if (eof) {
+                    EXPECT_THROW(source.drainInto(sink), EndOfFile);
+                } else {
+                    EXPECT_THROW(source.drainInto(sink), Failure);
+                }
+                EXPECT_EQ(received, std::string(delivered, 'x'));
+                EXPECT_EQ(reads, delivered + 1);
+                EXPECT_EQ(writes, delivered + (producer ? 0 : 1));
+            }
+}
+
+TEST(Source, drainPreservesAnEmptyDeliveryBeforeProducerCompletion)
+{
+    size_t reads = 0;
+    LambdaSource source{[&](char * data, size_t) -> size_t {
+        if (reads++ == 0)
+            return 0;
+        if (reads == 2) {
+            data[0] = 'x';
+            return 1;
+        }
+        throw EndOfFile("producer complete");
+    }};
+    std::vector<std::string> received;
+    LambdaSink sink{[&](std::string_view data) { received.emplace_back(data); }};
+    EXPECT_NO_THROW(source.drainInto(sink));
+    EXPECT_EQ(received, (std::vector<std::string>{"", "x"}));
+    EXPECT_EQ(reads, 3u);
+}
+
 TEST(BufferedSink, finiteChunkSequencesPreserveWriteBoundaries)
 {
     struct Failure
