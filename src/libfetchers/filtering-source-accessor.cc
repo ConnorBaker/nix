@@ -62,78 +62,78 @@ void FilteringSourceAccessor::readDirectoryScoped(
        scopes are already kept alive by their enclosing directory call. */
     auto owner = weak_from_this().lock();
     checkAccess(path);
-    next->readDirectoryWithEntries(
-        prefix / path, [&](SourceAccessor & inner, const CanonPath & relative, const DirEntries & entries) {
-            DirEntries admitted;
-            for (auto & entry : entries)
-                if (isAllowed(path / entry.first))
-                    admitted.insert(entry);
+    auto handler = [&](SourceAccessor & inner, const CanonPath & relative, const DirEntries & entries) {
+        DirEntries admitted;
+        for (auto & entry : entries)
+            if (isAllowed(path / entry.first))
+                admitted.insert(entry);
 
-            struct Scoped final : FilteringSourceAccessor
+        struct Scoped final : FilteringSourceAccessor
+        {
+            void anchor() override {}
+
+            FilteringSourceAccessor * owner;
+            CanonPath original;
+            const DirEntries & admitted;
+
+            Scoped(
+                SourceAccessor & inner,
+                const CanonPath & relative,
+                FilteringSourceAccessor & owner,
+                const CanonPath & original,
+                const DirEntries & admitted)
+                /* Borrowed only during readDirectoryWithEntries's scope.
+                   No accessor or visitor may retain it after callback. */
+                : FilteringSourceAccessor(
+                      SourcePath(
+                          ref<SourceAccessor>(
+                              std::shared_ptr<SourceAccessor>(std::shared_ptr<SourceAccessor>{}, &inner)),
+                          relative),
+                      [&owner, original](const CanonPath & p) { return owner.makeNotAllowedError(original / p); })
+                , owner(&owner)
+                , original(original)
+                , admitted(admitted)
             {
-                void anchor() override {}
-
-                FilteringSourceAccessor * owner;
-                CanonPath original;
-                const DirEntries & admitted;
-
-                Scoped(
-                    SourceAccessor & inner,
-                    const CanonPath & relative,
-                    FilteringSourceAccessor & owner,
-                    const CanonPath & original,
-                    const DirEntries & admitted)
-                    /* Borrowed only during readDirectoryWithEntries's scope.
-                       No accessor or visitor may retain it after callback. */
-                    : FilteringSourceAccessor(
-                          SourcePath(
-                              ref<SourceAccessor>(
-                                  std::shared_ptr<SourceAccessor>(std::shared_ptr<SourceAccessor>{}, &inner)),
-                              relative),
-                          [&owner, original](const CanonPath & p) { return owner.makeNotAllowedError(original / p); })
-                    , owner(&owner)
-                    , original(original)
-                    , admitted(admitted)
-                {
-                    /* Nested scopes change coordinates, not the admission
-                       policy. Compose those coordinates once instead of
-                       rebuilding the path through every enclosing scope
-                       for each descendant. The physical accessor remains
-                       the innermost borrowed directory above. */
-                    if (auto parent = dynamic_cast<Scoped *>(&owner)) {
-                        this->original = parent->original / original;
-                        this->owner = parent->owner;
-                    }
+                /* Nested scopes change coordinates, not the admission
+                   policy. Compose those coordinates once instead of
+                   rebuilding the path through every enclosing scope
+                   for each descendant. The physical accessor remains
+                   the innermost borrowed directory above. */
+                if (auto parent = dynamic_cast<Scoped *>(&owner)) {
+                    this->original = parent->original / original;
+                    this->owner = parent->owner;
                 }
+            }
 
-                bool isAllowed(const CanonPath & p) override
-                {
-                    if (p.isRoot())
-                        return true;
-                    if (p.dirOf()->empty())
-                        return admitted.contains(*p.baseName());
-                    return owner->isAllowed(original / p);
-                }
+            bool isAllowed(const CanonPath & p) override
+            {
+                if (p.isRoot())
+                    return true;
+                if (p.dirOf()->empty())
+                    return admitted.contains(*p.baseName());
+                return owner->isAllowed(original / p);
+            }
 
-                bool allowsConcurrentTraversal() override
-                {
-                    return owner->allowsConcurrentTraversal() && next->allowsConcurrentTraversal();
-                }
+            bool allowsConcurrentTraversal() override
+            {
+                return owner->allowsConcurrentTraversal() && next->allowsConcurrentTraversal();
+            }
 
-                std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & p) override
-                {
-                    return owner->getFingerprint(original / p);
-                }
+            std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & p) override
+            {
+                return owner->getFingerprint(original / p);
+            }
 
-                void readDirectoryWithEntries(
-                    const CanonPath & p,
-                    std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
-                {
-                    readDirectoryScoped(p, std::move(callback));
-                }
-            } scoped{inner, relative, *this, path, admitted};
-            callback(scoped, CanonPath::root, admitted);
-        });
+            void readDirectoryWithEntries(
+                const CanonPath & p,
+                std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+            {
+                readDirectoryScoped(p, std::move(callback));
+            }
+        } scoped{inner, relative, *this, path, admitted};
+        callback(scoped, CanonPath::root, admitted);
+    };
+    next->readDirectoryWithEntries(prefix / path, std::ref(handler));
 }
 
 std::string FilteringSourceAccessor::readLink(const CanonPath & path)

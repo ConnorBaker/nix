@@ -29,6 +29,7 @@
 #include <git2/global.h>
 #include <git2/repository.h>
 #include <git2/signature.h>
+#include <git2/status.h>
 #include <git2/types.h>
 #include <git2/object.h>
 #include <git2/tag.h>
@@ -1259,8 +1260,13 @@ TEST_F(GitUtilsTest, workdirReadsAndNamesItsFilesystemView)
 
     auto repo = openRepo();
     auto wd = repo->getWorkdirInfo();
-    ASSERT_TRUE(wd.dirtyFiles.contains(CanonPath("dirty/c")));
-    ASSERT_FALSE(wd.dirtyFiles.contains(CanonPath("clean/a")));
+    ASSERT_TRUE(wd.isDirty);
+    ASSERT_EQ(wd.files, (std::set<CanonPath>{CanonPath("clean/a"), CanonPath("dirty/c")}));
+    unsigned int cleanStatus = 0, dirtyStatus = 0;
+    ASSERT_EQ(git_status_file(&cleanStatus, rawRepo, "clean/a"), 0);
+    ASSERT_EQ(git_status_file(&dirtyStatus, rawRepo, "dirty/c"), 0);
+    EXPECT_EQ(cleanStatus, GIT_STATUS_CURRENT);
+    EXPECT_EQ(dirtyStatus, GIT_STATUS_WT_MODIFIED);
     auto workdir = repo->getAccessor(
         make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) { return RestrictedPathError("no"); });
     workdir->fingerprint = "whole";
@@ -1566,31 +1572,36 @@ TEST_F(GitUtilsTest, workdirIndexFlagsDoNotChangeItsContents)
                     entry.flags_extended |= GIT_INDEX_ENTRY_SKIP_WORKTREE;
                 }
                 ASSERT_EQ(git_index_add(index, &entry), 0);
-                if (changed)
-                    write(name, "after!");
-                if (executable)
-                    std::filesystem::permissions(
-                        tmpDir / name, std::filesystem::perms::owner_exec, std::filesystem::perm_options::add);
             }
     ASSERT_EQ(git_index_write(index), 0);
 
     auto repo = openRepo();
-    auto wd = repo->getWorkdirInfo();
-    auto workdir = repo->getAccessor(
-        make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) { return RestrictedPathError("no"); });
-    workdir->fingerprint = "whole";
+    /* One changed file per observation: the boolean must witness whether
+       these index flags suppress comparison, independently of other cells. */
     for (unsigned flags = 0; flags < 4; ++flags)
         for (bool changed : {false, true})
             for (bool executable : {false, true}) {
                 auto name = fmt("file-%d-%d-%d", flags, changed, executable);
                 SCOPED_TRACE(name);
                 auto path = CanonPath(name);
+                if (changed)
+                    write(name, "after!");
+                if (executable)
+                    std::filesystem::permissions(
+                        tmpDir / name, std::filesystem::perms::owner_exec, std::filesystem::perm_options::add);
+                auto wd = repo->getWorkdirInfo();
                 ASSERT_TRUE(wd.files.contains(path));
-                if (flags)
-                    EXPECT_FALSE(wd.dirtyFiles.contains(path));
+                EXPECT_EQ(wd.isDirty, !flags && (changed || executable));
+                auto workdir = repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) {
+                    return RestrictedPathError("no");
+                });
+                workdir->fingerprint = "whole";
                 EXPECT_EQ(workdir->readFile(path), changed ? "after!" : "before");
                 EXPECT_EQ(workdir->lstat(path).isExecutable, executable);
                 EXPECT_EQ(workdir->getFingerprint(path), (std::pair{path, std::string("whole")}));
+                write(name, "before");
+                std::filesystem::permissions(
+                    tmpDir / name, std::filesystem::perms::owner_exec, std::filesystem::perm_options::remove);
             }
 }
 
@@ -1617,7 +1628,11 @@ TEST_F(GitUtilsTest, workdirAttributesFromTheIndexDoNotReplaceFilesystemBytes)
             auto repo = openRepo();
             auto wd = repo->getWorkdirInfo();
             ASSERT_TRUE(wd.files.contains(CanonPath(file)));
-            ASSERT_FALSE(wd.dirtyFiles.contains(CanonPath(file)));
+            EXPECT_EQ(wd.isDirty, !present);
+            EXPECT_EQ(wd.files.contains(CanonPath(attributes)), present);
+            unsigned int status = 0;
+            ASSERT_EQ(git_status_file(&status, rawRepo, file.c_str()), 0);
+            EXPECT_EQ(status, GIT_STATUS_CURRENT);
             auto workdir = repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) {
                 return RestrictedPathError("no");
             });
@@ -1625,6 +1640,8 @@ TEST_F(GitUtilsTest, workdirAttributesFromTheIndexDoNotReplaceFilesystemBytes)
             EXPECT_EQ(workdir->readFile(CanonPath(file)), "line\r\n");
             EXPECT_EQ(workdir->getFingerprint(CanonPath(file)), (std::pair{CanonPath(file), std::string("whole")}));
         }
+        /* Restore the first directory's attributes before the next case. */
+        write(attributes, "* text eol=crlf\n");
     }
 }
 

@@ -685,12 +685,8 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
                 /* The hint is advisory: case folding and conflict entries
                    need not arrive in CanonPath order. Sorted runs need no
                    logarithmic search; every other order keeps the same set. */
-                if (!(statusFlags & GIT_STATUS_INDEX_DELETED) && !(statusFlags & GIT_STATUS_WT_DELETED)) {
+                if (!(statusFlags & GIT_STATUS_INDEX_DELETED) && !(statusFlags & GIT_STATUS_WT_DELETED))
                     info.files.insert(info.files.end(), CanonPath(path));
-                    if (statusFlags != GIT_STATUS_CURRENT)
-                        info.dirtyFiles.insert(info.dirtyFiles.end(), CanonPath(path));
-                } else
-                    info.deletedFiles.insert(info.deletedFiles.end(), CanonPath(path));
                 if (statusFlags != GIT_STATUS_CURRENT)
                     info.isDirty = true;
                 return 0;

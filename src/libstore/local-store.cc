@@ -1793,9 +1793,8 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
            error if a cycle is detected and roll back the
            transaction.  Cycles can only occur when a derivation
            has multiple outputs. */
-        auto topoSortResult = topoSort(paths, [&](const StorePath & path) {
-            auto i = infos.find(path);
-            return i == infos.end() ? StorePathSet() : i->second.references;
+        auto topoSortResult = topoSort(std::move(paths), [&](const StorePath & path) -> const StorePathSet & {
+            return infos.at(path).references;
         });
 
         std::visit(

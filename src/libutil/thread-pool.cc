@@ -59,7 +59,7 @@ void CopyPool::work(std::promise<void> ready)
 
 std::future<void> CopyPool::tryAsync(const void * group, const fun<void(size_t, bool)> & run, size_t i)
 {
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     if (pending.size() == capacity)
         return {};
     std::packaged_task<void()> job([&run, i] { run(i, true); });
@@ -77,6 +77,7 @@ std::future<void> CopyPool::tryAsync(const void * group, const fun<void(size_t, 
         }
     }
     pending.push_back({group, std::move(job)});
+    lock.unlock();
     wake.notify_one();
     return result;
 }
