@@ -181,7 +181,7 @@ lookupInRegistries(const Settings & settings, Store & store, const Input & _inpu
     Input input(_input);
 
     if (useRegistries == UseRegistries::No)
-        return {input, extraAttrs};
+        return {std::move(input), std::move(extraAttrs)};
 
 restart:
 
@@ -220,7 +220,7 @@ restart:
 
     debug("looked up '%s' -> '%s'", _input.to_string(), input.to_string());
 
-    return {input, extraAttrs};
+    return {std::move(input), std::move(extraAttrs)};
 }
 
 } // namespace nix::fetchers

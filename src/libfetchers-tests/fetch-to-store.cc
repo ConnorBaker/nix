@@ -15,6 +15,9 @@
 #include "nix/store/store-open.hh"
 #include "nix/store/globals.hh"
 #include "nix/store/local-store.hh"
+#include "nix/store/remote-fs-accessor.hh"
+#include "nix/store/tests/libstore.hh"
+#include "nix/util/callback.hh"
 #include "nix/store/tests/temp-local-store.hh"
 #include "nix/util/tests/source-accessor-gen.hh"
 #include "nix/util/tests/setting-scopes.hh"
@@ -2408,6 +2411,148 @@ TEST(FilteringSourceAccessor, admissionCallbacksKeepTheirRequiredPolicyAlive)
                         exercise(operation, cache, Outcome::Deny, release, true, errorThrows);
         }
     EXPECT_EQ(cases, 244u);
+}
+
+TEST_F(FetchToStoreLocalTest, storedInputsReuseTheAcquiredNar)
+{
+    /* The real remote accessor constructs a fresh NarCache per acquisition.
+       Supply its NAR from this test rather than starting a daemon. */
+    struct ObservedStore : LocalStore
+    {
+        std::shared_ptr<const ValidPathInfo> description;
+        std::string nar;
+        size_t acquisitions = 0;
+        bool returnNullAccessor = false;
+
+        ObservedStore(ref<const Config> config, std::shared_ptr<const ValidPathInfo> description, std::string nar)
+            : Store{*config}
+            , LocalFSStore{*config}
+            , LocalStore{config}
+            , description(std::move(description))
+            , nar(std::move(nar))
+        {
+        }
+
+        void queryPathInfoUncached(
+            const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override
+        {
+            EXPECT_EQ(path, description->path);
+            callback(std::shared_ptr<const ValidPathInfo>{description});
+        }
+
+        std::shared_ptr<SourceAccessor> getFSAccessor(const StorePath & path, bool requireValidPath = true) override
+        {
+            EXPECT_EQ(path, description->path);
+            if (returnNullAccessor)
+                return nullptr;
+            return make_ref<RemoteFSAccessor>(ref<Store>{shared_from_this()}, requireValidPath)->accessObject(path);
+        }
+
+        void narFromPath(const StorePath & path, Sink & sink) override
+        {
+            EXPECT_EQ(path, description->path);
+            ++acquisitions;
+            sink(nar);
+        }
+    };
+
+    EnableExperimentalFeature enableFlakes("flakes");
+    using File = MemorySourceAccessor::File;
+    const std::string bytes("raw\0bytes", 9);
+    auto blob = merkle::blobId(bytes);
+    auto link = merkle::blobId("plain");
+    auto empty = merkle::treeId("");
+    const merkle::Tree entries{
+        {"empty/", {.mode = merkle::Mode::Directory, .hash = empty}},
+        {"exec", {.mode = merkle::Mode::Executable, .hash = blob}},
+        {"link", {.mode = merkle::Mode::Symlink, .hash = link}},
+        {"plain", {.mode = merkle::Mode::Regular, .hash = blob}}};
+    size_t cases = 0;
+    for (auto mode :
+         {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink, merkle::Mode::Directory}) {
+        auto tree = make_ref<MemorySourceAccessor>();
+        if (mode == merkle::Mode::Directory)
+            tree->root = File::Directory{
+                .entries = {
+                    {"empty", File::Directory{}},
+                    {"exec", File::Regular{.executable = true, .contents = bytes}},
+                    {"link", File::Symlink{.target = "plain"}},
+                    {"plain", File::Regular{.contents = bytes}}}};
+        else if (mode == merkle::Mode::Symlink)
+            tree->root = File::Symlink{.target = "plain"};
+        else
+            tree->root = File::Regular{.executable = mode == merkle::Mode::Executable, .contents = bytes};
+        auto expectedHash = merkle::objectHash(
+            {.mode = mode,
+             .hash = mode == merkle::Mode::Directory ? merkle::treeId(merkle::serialiseTree(entries))
+                     : mode == merkle::Mode::Symlink ? link
+                                                     : blob});
+        StringSink nar;
+        tree->dumpPath(CanonPath::root, nar);
+        /* Match the file downloader's flat address for its plain root. */
+        bool plain = mode == merkle::Mode::Regular;
+        StringSource source{plain ? bytes : nar.s};
+        auto path = store->addToStoreFromDump(
+            source,
+            "source",
+            plain ? FileSerialisationMethod::Flat : FileSerialisationMethod::NixArchive,
+            plain ? ContentAddressMethod::Raw::Flat : ContentAddressMethod::Raw::NixArchive,
+            HashAlgorithm::SHA256,
+            {},
+            NoRepair);
+        auto original = store->queryPathInfo(path);
+        ASSERT_TRUE(original->objectHash);
+        ASSERT_EQ(original->objectHash->hash, expectedHash);
+        for (bool legacy : {false, true})
+            for (bool fileInput : {false, true}) {
+                if (fileInput && mode != merkle::Mode::Regular)
+                    continue; // A file input downloads a plain file, never another root kind.
+                SCOPED_TRACE(fmt("mode=%d legacy=%d file-input=%d", static_cast<RawMode>(mode), legacy, fileInput));
+                auto description = std::make_shared<ValidPathInfo>(*original);
+                if (legacy) {
+                    description->objectHash.reset();
+                    description->assertedNarHash = hashString(HashAlgorithm::SHA256, nar.s);
+                }
+                auto observed = make_ref<ObservedStore>(ref<const LocalStore::Config>{config}, description, nar.s);
+                fetchers::Settings settings;
+                settings.tarballTtl = 3600;
+                fetchers::Attrs attrs{{"type", "path"}, {"path", store->printStorePath(path)}};
+                if (fileInput) {
+                    auto url = fmt("file:///nix-test-stored-input-%d", cases);
+                    settings.getCache()->upsert(
+                        {"file", {{"url", url}, {"name", "source"}}}, *observed, {{"etag", ""}, {"url", url}}, path);
+                    attrs = {{"type", "file"}, {"url", url}, {"name", "source"}};
+                }
+                auto input = fetchers::Input::fromAttrs(std::move(attrs));
+                auto [accessor, fetched] = input.getAccessor(settings, *observed);
+                auto acquired = observed->acquisitions;
+                auto st = accessor->lstat(CanonPath::root);
+                EXPECT_EQ(st.type, tree->lstat(CanonPath::root).type);
+                if (st.type == SourceAccessor::tRegular)
+                    EXPECT_EQ(st.isExecutable, mode == merkle::Mode::Executable);
+                StringSink actual;
+                accessor->dumpPath(CanonPath::root, actual);
+                EXPECT_EQ(actual.s, nar.s);
+                auto named = fetchToStore2(settings, *observed, SourcePath(accessor), FetchMode::DryRun, "source");
+                EXPECT_EQ(named.second, expectedHash);
+                if (fileInput)
+                    EXPECT_EQ(fetched.getTreeHash(), expectedHash);
+                else
+                    EXPECT_EQ(
+                        accessor->fingerprint, std::optional("path:" + expectedHash.to_string(HashFormat::SRI, true)));
+                EXPECT_EQ(observed->acquisitions, acquired);
+                EXPECT_EQ(acquired, 1u);
+                if (fileInput) {
+                    /* Metadata can outlive successful accessor acquisition.
+                       Both descriptions must report the domain error. */
+                    observed->returnNullAccessor = true;
+                    EXPECT_THROW(input.getAccessor(settings, *observed), InvalidPath);
+                    EXPECT_EQ(observed->acquisitions, acquired);
+                }
+                ++cases;
+            }
+    }
+    EXPECT_EQ(cases, 10u);
 }
 
 } // namespace nix

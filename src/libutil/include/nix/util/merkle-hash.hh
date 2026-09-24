@@ -93,10 +93,11 @@ Hash treeId(std::string_view body);
 void insertEntry(Tree & tree, std::string name, const TreeEntry & entry);
 
 /**
- * The object hash of a store object from its root entry (01 §9.11, which
- * shows it total and injective): the tree id of a directory, the blob id
- * of a plain file, and for an executable file or a symlink the id of the
- * one-entry tree `{"." -> entry}`.
+ * The object hash of a store object from its root entry (01 §9.11),
+ * total over root kinds and distinguishing their contents under §2.4's
+ * collision assumption: the tree id of a directory, the blob id of a plain
+ * file, and for an executable file or a symlink the id of the one-entry
+ * tree `{"." -> entry}`.
  */
 Hash objectHash(const TreeEntry & root);
 

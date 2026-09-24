@@ -400,7 +400,7 @@ struct MercurialInputScheme : InputScheme
 
         accessor->setPathDisplay("«" + input.to_string() + "»");
 
-        return {accessor, input};
+        return {accessor, std::move(input)};
     }
 
     bool isLocked(const Settings & settings, const Input & input) const override

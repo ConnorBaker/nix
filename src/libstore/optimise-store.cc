@@ -52,10 +52,10 @@ static bool linkableOnThisSystem(const std::filesystem::path &)
 #endif
 
 /* Whether the store places the regular file already on disk at `where`
-   -- gives it a blob and links it -- or leaves it as written, and why:
+   -- records a holder or shares an existing one -- or leaves it as written, and why:
    the exceptions of 01 §9.10 law 3 that can be read off the file.  Decided
    here alone: the on-disk walk skips such a file, and the
-   verifier expects no blob for it.  (The restore route asks
+   verifier expects no holder for it. (The restore route asks
    `linkableOnThisSystem` before the file exists; its files are never
    writable, having been canonicalised.)  Law 3's fourth exception -- a
    file `place` could not enter for `ENOSPC` on a full directory index, or
@@ -1515,10 +1515,9 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
             }
             stats.rowsMigrated++;
         }
-        /* Every path is walked; an inode hint that still has a canonical
-           holder avoids reading the file's contents.
-           On a store this Nix wrote that is every path.  The path is
-           valid, so its root is live already; the trees written beneath it
+        /* Every path is walked; an inode hint that still has a matching
+           canonical holder avoids reading that regular file's contents.
+           The path is valid, so its root is live already; the trees written beneath it
            are held until the root is (`Hold`; `08` K16), since no GC lock
            is taken here and a collection may sweep meanwhile. */
         auto hold = objects.hold();

@@ -1,5 +1,6 @@
 #include "nix/fetchers/tarball.hh"
 #include "nix/util/merkle-hash.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/cache.hh"
 #include "nix/store/filetransfer.hh"
@@ -448,18 +449,18 @@ struct FileInputScheme : CurlInputScheme
            tarballs. */
         auto file = downloadFile(store, settings, getStrAttr(input.attrs, "url"), input.getName());
 
-        /* Named by the object hash of the flat file, which the store holds
-           (the file may have come from the download cache, so the hash is
-           not otherwise known here; a daemon without the object hash gets
-           it computed by one walk, `Store::queryObjectHash`). */
-        input.attrs.insert_or_assign(
-            "treeHash", store.queryObjectHash(file.storePath).hash.to_string(HashFormat::SRI, true));
-
-        auto accessor = ref{store.getFSAccessor(file.storePath)};
+        /* The file may have come from the download cache. Use its stored
+           object hash, or hash the acquired object if an old peer describes
+           it by its NAR hash alone. The same accessor is returned below. */
+        auto info = store.queryPathInfo(file.storePath);
+        auto accessor = store.requireStoreObjectAccessor(file.storePath);
+        auto objectHash = info->objectHash ? info->objectHash->hash
+                                           : merkle::objectHash(objectHashOf(*accessor, CanonPath::root).root);
+        input.attrs.insert_or_assign("treeHash", objectHash.to_string(HashFormat::SRI, true));
 
         accessor->setPathDisplay("«" + input.to_string() + "»");
 
-        return {accessor, input};
+        return {accessor, std::move(input)};
     }
 };
 
@@ -533,7 +534,7 @@ struct TarballInputScheme : CurlInputScheme
                 "tree hash of tarball '%s' is %s, not SHA-256", input.to_string(), printHashAlgo(result.treeHash.algo));
         input.attrs.insert_or_assign("treeHash", result.treeHash.to_string(HashFormat::SRI, true));
 
-        return {result.accessor, input};
+        return {result.accessor, std::move(input)};
     }
 
     std::optional<std::string> getFingerprint(Store & store, const Input & input) const override

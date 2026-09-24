@@ -14,7 +14,7 @@ InputCache::CachedResult InputCache::getAccessor(
     if (!fetched) {
         if (originalInput.isDirect()) {
             auto [accessor, lockedInput] = originalInput.getAccessor(settings, store);
-            fetched.emplace(CachedInput{.lockedInput = lockedInput, .accessor = accessor});
+            fetched.emplace(CachedInput{.lockedInput = std::move(lockedInput), .accessor = accessor});
         } else {
             if (useRegistries != UseRegistries::No) {
                 auto [res, extraAttrs] = lookupInRegistries(settings, store, originalInput, useRegistries);
@@ -23,7 +23,10 @@ InputCache::CachedResult InputCache::getAccessor(
                 if (!fetched) {
                     auto [accessor, lockedInput] = resolvedInput.getAccessor(settings, store);
                     fetched.emplace(
-                        CachedInput{.lockedInput = lockedInput, .accessor = accessor, .extraAttrs = extraAttrs});
+                        CachedInput{
+                            .lockedInput = std::move(lockedInput),
+                            .accessor = accessor,
+                            .extraAttrs = std::move(extraAttrs)});
                 }
                 upsert(resolvedInput, *fetched);
             } else {
@@ -37,7 +40,8 @@ InputCache::CachedResult InputCache::getAccessor(
 
     debug("got tree '%s' from '%s'", fetched->accessor, fetched->lockedInput.to_string());
 
-    return {fetched->accessor, resolvedInput, fetched->lockedInput, fetched->extraAttrs};
+    return {
+        fetched->accessor, std::move(resolvedInput), std::move(fetched->lockedInput), std::move(fetched->extraAttrs)};
 }
 
 struct InputCacheImpl : InputCache

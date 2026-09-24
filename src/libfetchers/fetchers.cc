@@ -225,7 +225,7 @@ std::pair<StorePath, Input> Input::fetchToStore(const Settings & settings, Store
 
         assert(result.isFinal());
 
-        return {storePath, result};
+        return {std::move(storePath), std::move(result)};
     } catch (Error & e) {
         e.addTrace({}, "while fetching the input '%s'", to_string());
         throw;
@@ -355,8 +355,8 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
                 // Store a cache entry for the substituted tree so later fetches
                 // can reuse the existing object instead of copying the unpacked
                 // input back into the store on every evaluation.  The object's
-                // own hash seeds the tree's name; the bijection only when the
-                // info carries an asserted NAR hash, which it may not.
+                // own hash seeds the tree's name; record the hash correspondence
+                // only when the info carries an asserted NAR hash, which it may not.
                 if (accessor->fingerprint) {
                     auto info = store.queryPathInfo(storePath);
                     if (info->objectHash) {

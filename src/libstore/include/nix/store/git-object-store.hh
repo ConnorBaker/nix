@@ -29,9 +29,10 @@
 namespace nix {
 
 /**
- * The local store's object store (doc/lazy-store/01-specification.md, section 9.10) under `dir`:
- * `blobs/<xx>/<id>` (0444) and `blobs-x/<xx>/<id>` (0555), never linked across the bit;
- * `trees/<xx>/<id>`; `tmp/`.  `<xx>` is the identifier's first byte in hexadecimal -- git's own
+ * The local store's object store (doc/lazy-store/01-specification.md, section 9.10):
+ * regular-file contents live in indexed store-path holders. Auxiliary bodies live under `dir`:
+ * `blobs/<xx>/<id>` (0444), `blobs-x/<xx>/<id>` (0555), `trees/<xx>/<id>`; `tmp/` holds leases and temporaries.
+ * `<xx>` is the identifier's first byte in hexadecimal -- git's own
  * layout, 256 shards under each kind -- so that no one directory holds every object of a large
  * store and writes into different shards do not contend for one directory's lock.
  * Under `_WIN32` the object store shares nothing: `link` is false, `place` nullopt, `blobInodes()` empty.
@@ -51,10 +52,13 @@ public:
      * A regular-file blob's canonical file is a *store path's own file* --
      * a **holder** -- and this is the store's record of where it is: one
      * candidate row per (blob, mode, ingestion) in the store's database
-     * (`schema.sql`, `Blobs`). Written and reused files both retain a witness.  `.objects/blobs` and `.objects/blobs-x`
-     * then hold no regular-file blob at all: they hold the symlink-target blobs, which no path holds, and `trees/` is
-     * unchanged.  The first entry of a tree writes each file once and records rows -- no `linkat` a file, which is the
-     * historical 0.19-0.21 s per 40 000 files in `05-validation.md` section 6.
+     * (`schema.sql`, `Blobs`). Written and reused files both retain a witness.
+     * Regular-file ingestion publishes no auxiliary blob copy; symlink-target
+     * blobs and tree bodies still need auxiliary files. Earlier layouts may
+     * leave regular blobs there. Claiming a first holder needs a row, not an
+     * auxiliary `linkat`; repeated occurrences reuse the holder. The removed
+     * auxiliary links cost the historical 0.19-0.21 s per 40 000 files in
+     * `05-validation.md` section 6.
      *
      * When a row is written, when it becomes true, and when it goes.  The
      * rows are staged in the hold while copying and inserted when the path
@@ -124,9 +128,9 @@ public:
         std::filesystem::path dir, bool fsync = false, std::filesystem::path auxiliaryLockFile = {});
 
     /**
-     * What a collection cost, counted only while a test asks for it
-     * (`05-validation.md` section 7): the tree bodies read and the blob
-     * files `lstat`ed.  A specific delete must pay neither (01 §10, *The
+     * Object-store work, counted only while a test asks for it
+     * (`05-validation.md` section 7): tree-body reads and blob/holder
+     * metadata probes. A specific delete must pay neither (01 §10, *The
      * object store is swept on whole-store collections only*), and a
      * per-path sweep, were one written, must pay the deleted path's trees
      * and no more.
@@ -135,7 +139,7 @@ public:
     {
         /** Tree bodies read (`readTree`: the sweep, `readVerifiedTree`). */
         uint64_t treesRead = 0;
-        /** Blob files `lstat`ed (the sweep's blob pass). */
+        /** Metadata probes of holder candidates, acquired links and swept auxiliary blobs. */
         uint64_t blobsStatted = 0;
     };
 
@@ -156,14 +160,12 @@ public:
     std::function<void(const std::filesystem::path &)> atFsync;
 
     /**
-     * When set and true for the file at `where`, `place` behaves as it does
-     * on a filesystem whose directory index is full: the link into the
-     * directory fails with `ENOSPC`, the file is left as written and
-     * nothing on it says so (`05-validation.md` section 7; law 3's fourth
-     * exception, 01 §9.10).  A full index cannot be made without a
-     * filesystem of its own, and on APFS there is none to fill; this is the
-     * condition, injected at the one call it reaches.  Empty in every build
-     * but a test's.
+     * When set and true for the file at `where`, `place` declines a new
+     * holder claim with `ENOSPC`, leaving the file as written and without a
+     * row (`05-validation.md` section 7; law 3's fourth exception, 01 §9.10).
+     * This preserves the old full-directory failure seam; an ordinary
+     * holder miss now records a row and creates no auxiliary directory entry.
+     * Empty in every build but a test's.
      */
     std::function<bool(const std::filesystem::path &)> failPlaceWithNoSpace;
 
@@ -188,15 +190,16 @@ public:
     std::function<bool(const std::filesystem::path &)> failHoldRemoval;
 
     /**
-     * Make the four directories: at a writable store's open, and at the
-     * start of `sweep` and `blobInodes`, which iterate them (a directory
-     * removed after the open must not abort a collection).  The 256 shards
+     * Make the four directories: at a writable store's open and at the
+     * start of `sweep` and `blobInodes`. The sweep enumerates them; the
+     * inode query uses the database. A directory removed after the open
+     * must not abort a collection. The 256 shards
      * under each of the three kinds are *not* made here: a shard is made
-     * by the first write into it (`place`, `enterWritten`, `putBlob`,
-     * `putTree`, each on the `ENOENT` its link then gets), so that opening
+     * by the first auxiliary write into it (`putBlob` or `putTree`, on
+     * the `ENOENT` its publication link gets), so that opening
      * a writable store costs four `mkdir`s and not 772, and a store holds
-     * only the shards it has used.  The other readers (`link`, `place`,
-     * `readTree`) treat their absence as emptiness.
+     * only the shards it has used. Auxiliary readers treat their absence
+     * as emptiness; regular-file sharing consults the holder index.
      */
     void createDirectories() const;
 
@@ -232,9 +235,9 @@ public:
     std::filesystem::path treeFile(const Hash & id) const;
 
     /**
-     * The same names as plain strings.  Every operation on a node needs
-     * one, and `std::filesystem::path`'s `operator/` splits and reallocates
-     * its components: a callgrind profile of a first entry put the path
+     * The same auxiliary names as plain strings. Regular-file holder
+     * lookup needs neither name. `std::filesystem::path`'s `operator/` splits
+     * and reallocates its components: a historical first-entry profile put the path
      * class at about a twentieth of all instructions, three names a file.
      */
     std::string blobFileName(const Hash & id, bool executable) const;
@@ -329,9 +332,9 @@ public:
         bool looked = true);
 
     /**
-     * An ingestion's hold on the objects it writes or reuses (01 §9.10,
-     * "Collection"; `08` K16): a locked directory under `tmp/` with one
-     * hard link per object, from the object's write until the hold is
+     * An ingestion's hold on auxiliary objects it writes or reuses (01 §9.10,
+     * "Collection"; `08` K16): a locked directory under `tmp/` with
+     * protecting links, from the object's write until the hold is
      * released -- after the path's registration, or on the ingestion's
      * failure, when it goes out of scope.  The link's name records the
      * auxiliary address, so repair may replace its inode without losing
@@ -409,7 +412,7 @@ public:
             uint64_t size;
             /**
              * The holder's name under the ingestion's root -- the store
-             * path's own name for it, empty for a plain-file root.  It is
+             * path's own name for it, empty for a regular-file root. It is
              * made *here*, on the worker that wrote the file, and not at
              * the registration: forty thousand relative names built on one
              * thread after the copy is forty thousand strings on the
@@ -470,9 +473,10 @@ public:
         /**
          * Where the link to the object file `object` (under
          * `<kind>/<shard>/`, `<kind>` one of `blobs`, `blobs-x`, `trees`)
-         * goes: `<hold>/<kind>/<shard>/<id>`. The hold takes one link per
-         * tree and symlink blob, and none for a regular file, whose own
-         * store path's link holds its blob. Shards are made on demand.
+         * goes: `<hold>/<kind>/<shard>/<id>`. A newly published object can
+         * instead be protected by its retained `<id>.tmp-*` link. Regular
+         * files use their store-path holders, not these auxiliary links.
+         * Shards are made on demand.
          */
         std::filesystem::path linkFor(const std::filesystem::path & object) const;
     };
@@ -525,9 +529,9 @@ public:
     std::optional<merkle::Tree> readVerifiedTree(const Hash & id) const;
 
     /**
-     * The inode of every blob file (by `lstat`, as `knownRegularFile`
-     * looks it up), with its identifier: a file already a blob's need not
-     * be hashed again.
+     * Inode-to-identifier hints from registered holder rows. Before skipping
+     * a file's bytes, the on-disk visitor checks a current holder against the
+     * file's full physical metadata; an inode hint alone is insufficient.
      */
     using BlobInodes = boost::unordered_flat_map<ino_t, Hash>;
 
@@ -536,7 +540,7 @@ public:
     struct SweepStats
     {
         uint64_t treesRemoved = 0, blobsRemoved = 0, blobsKept = 0;
-        /** The bytes the kept blobs' links beyond the first would otherwise occupy. */
+        /** Sum of size * (nlink - 2) for kept auxiliary blobs with at least two links. */
         uint64_t sharedBytes = 0;
         /**
          * Valid paths whose object hash the enumeration could not give
@@ -570,10 +574,9 @@ public:
          */
         uint64_t missingSubtrees = 0;
         /**
-         * Trees no live root reaches that an ingestion in flight holds
-         * (`Hold`: its auxiliary addresses), kept; and the holds whose lock was
-         * taken, so left.  Both are the sweep's view of ingestions it ran
-         * beside.
+         * Unreachable tree entries kept because held, multiply linked, or
+         * occupied by a directory; and holds whose lock was busy or whose
+         * removal failed.
          */
         uint64_t treesHeld = 0, holds = 0;
     };

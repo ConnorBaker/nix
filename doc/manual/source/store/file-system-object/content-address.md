@@ -78,7 +78,7 @@ The root is therefore addressed as follows:
 - A directory is addressed by its git "tree" identifier, and a bare non-executable file by its git "blob" identifier: git's own identifier wherever git has one.
 - A bare executable file or a bare symlink is addressed by the identifier of the one-entry git "tree" whose single entry, named `.`, carries the mode (executable or symlink) and the blob.
 
-The name `.` is chosen because no Nix file system object can contain an entry of that name (a directory's entry names are never `.` or `..`), so this synthetic tree never coincides with the tree of a real directory, and the address is injective: a non-executable file, an executable file, and a symlink with the same contents are three distinct addresses, and every Nix file system object has exactly one.
+The name `.` is chosen because no Nix file system object can contain an entry of that name (a directory's entry names are never `.` or `..`), so this synthetic tree cannot be the encoding of a real directory. Assuming no relevant SHA-256 collision, a non-executable file, an executable file, and a symlink with the same contents have distinct addresses. Every Nix file system object has one address; the fixed-length hash is not mathematically injective over all objects.
 
 
 [file system object]: ../file-system-object.md

@@ -619,7 +619,7 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
     // early exit if pinned and already in the store (doc/lazy-store/04-derivation.md,
     // section 1.9, the fetchers' and the language's representation): an unpacked tree is named by
     // its tree hash -- given as `treeHash`, or known to the memoised
-    // bijection from a `sha256` (its NAR hash) it verified before; a flat
+    // correspondence from a `sha256` (its NAR hash) it verified before; a flat
     // file is named by its `sha256`.
     {
         std::optional<StorePath> expectedPath;

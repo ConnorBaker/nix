@@ -75,11 +75,8 @@ public:
         return *result;
     }
 
-    std::optional<Stat> maybeLstat(const CanonPath & path) override
+    static Stat statOf(const NarListing & listing)
     {
-        auto i = find(path);
-        if (!i)
-            return std::nullopt;
         return std::visit(
             overloaded{
                 [](const NarListing::Regular & r) -> Stat {
@@ -101,7 +98,13 @@ public:
                     };
                 },
             },
-            i->raw);
+            listing.raw);
+    }
+
+    std::optional<Stat> maybeLstat(const CanonPath & path) override
+    {
+        auto i = find(path);
+        return i ? std::optional{statOf(*i)} : std::nullopt;
     }
 
     DirEntries readDirectory(const CanonPath & path) override
@@ -114,7 +117,7 @@ public:
 
         DirEntries res;
         for (const auto & [name, child] : dir->entries)
-            res.insert_or_assign(name, std::nullopt);
+            res.insert_or_assign(name, statOf(child).type);
 
         return res;
     }

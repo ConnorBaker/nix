@@ -193,10 +193,11 @@ struct PathInputScheme : InputScheme
         // To prevent `fetchToStore()` copying the path again to Nix
         // store, pre-create an entry in the fetcher cache: the tree's
         // name, from the object hash the store holds for the path (the
-        // path may have been valid before this call, so the hash is not
-        // otherwise known here; a daemon without the object hash gets
-        // it computed by one walk, `Store::queryObjectHash`).
-        auto objectHash = store.queryObjectHash(*storePath).hash;
+        // path may have been valid before this call). For an old peer,
+        // hash the already acquired object instead of acquiring it again.
+        auto info = store.queryPathInfo(*storePath);
+        auto objectHash = info->objectHash ? info->objectHash->hash
+                                           : merkle::objectHash(objectHashOf(*accessor, CanonPath::root).root);
         accessor->fingerprint = fmt("path:%s", objectHash.to_string(HashFormat::SRI, true));
         recordRootEntry(settings, SourcePath(accessor), objectHash);
 
