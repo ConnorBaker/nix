@@ -109,22 +109,24 @@ Hash treeId(std::string_view body)
     return hashObject("tree", body);
 }
 
-void insertEntry(Tree & tree, std::string_view name, const TreeEntry & entry)
+void insertEntry(Tree & tree, std::string name, const TreeEntry & entry)
 {
     if (name.empty() || name == "." || name == ".." || name.find('/') != std::string_view::npos
         || name.find('\0') != std::string_view::npos || name.find(caseHackSuffix) != std::string_view::npos)
         throw Error("invalid tree entry name '%s'", name);
-    std::string key(name);
     /* The trailing slash orders directories; it does not make a second
        child name. Reject either encoding of an existing logical name. */
     if (entry.mode == Mode::Directory) {
-        if (tree.contains(key))
+        if (tree.contains(name))
             throw Error("duplicate tree entry name '%s'", name);
-        key += '/';
-    } else if (tree.contains(key + '/'))
+        name += '/';
+    } else if (tree.contains(name + '/'))
         throw Error("duplicate tree entry name '%s'", name);
-    if (!tree.emplace(std::move(key), entry).second)
+    if (!tree.try_emplace(std::move(name), entry).second) {
+        if (entry.mode == Mode::Directory)
+            name.pop_back();
         throw Error("duplicate tree entry name '%s'", name);
+    }
 }
 
 /* The one-entry tree an executable or a symlink root is addressed by.  Its

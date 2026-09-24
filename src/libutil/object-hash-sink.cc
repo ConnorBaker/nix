@@ -107,21 +107,25 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
     merkle::Tree tree;
     merkle::nar::Directory size;
     bool sizeExact = true;
-    auto consume = [&](std::string_view name, HashedNode child) {
+    auto consume = [&](std::string name, HashedNode child) {
         if (child.entry.hash.algo != merkle::hashAlgo)
             throw Error(
                 "object hash: '%s' was answered with a %s identifier, but the tree is hashed with %s",
                 path / name,
                 printHashAlgo(child.entry.hash.algo),
                 printHashAlgo(merkle::hashAlgo));
-        merkle::insertEntry(tree, name, child.entry);
+        auto nextSize = size;
         if (child.narSize)
-            size.add(name, *child.narSize);
-        else
-            sizeExact = false;
+            nextSize.add(name, *child.narSize);
+        merkle::insertEntry(tree, std::move(name), child.entry);
+        size = nextSize;
+        sizeExact &= child.narSize.has_value();
     };
     if (workers == 1)
-        children([&](std::string_view name, bool, fun<HashedNode()> visit) { consume(name, visit()); });
+        children([&](std::string_view name, bool, fun<HashedNode()> visit) {
+            auto child = visit();
+            consume(std::string(name), std::move(child));
+        });
     else {
         struct Child
         {
@@ -143,10 +147,12 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
                 kids.size(),
                 [&](size_t i) { return kids[i].subdirectory; },
                 [&](size_t i, bool) { kids[i].node = kids[i].visit(); },
-                [&](size_t i) { consume(kids[i].name, std::move(*kids[i].node)); });
+                [&](size_t i) { consume(std::move(kids[i].name), std::move(*kids[i].node)); });
         else
-            for (auto & child : kids)
-                consume(child.name, child.visit());
+            for (auto & child : kids) {
+                auto node = child.visit();
+                consume(std::move(child.name), std::move(node));
+            }
     }
 
     auto body = merkle::serialiseTree(tree);
@@ -184,7 +190,7 @@ void ObjectHashSink::deliver(const CanonPath & path, fun<HashedNode()> visit)
        so the hash and the NAR size are over the name without it. */
     /* The push driver has no listing to type a child by, and never
        needs one: only a visitor that may split its children reads it. */
-    open.back()(unhackName(*path.baseName()), false, std::move(visit));
+    (*open.back())(unhackName(*path.baseName()), false, std::move(visit));
 }
 
 void ObjectHashSink::createDirectory(const CanonPath & path)
@@ -196,7 +202,7 @@ void ObjectHashSink::createDirectory(const CanonPath & path, DirectoryCreatedCal
 {
     deliver(path, [&] {
         return visitor.directory(path, [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
-            open.push_back(std::move(each));
+            open.push_back(&each);
             Finally close{[&] { open.pop_back(); }};
             /* As the base class's default: the same sink, the same path, so
                the children arrive at `path / name`. */

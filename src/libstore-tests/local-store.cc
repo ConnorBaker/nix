@@ -3406,65 +3406,212 @@ TEST_F(LocalStoreObjectsTest, candidateLookupReturnsTheLeastEligibleSignedPhysic
 
 TEST_F(LocalStoreObjectsTest, candidateMigrationPreservesOldHoldersAndReadOnlyAccess)
 {
-    auto nar = treeNar({{"file", "migration-holder", 'f'}});
-    StringSource source{nar};
-    auto path = store->addToStoreFromDump(
-        source,
-        "candidate-migration",
-        FileSerialisationMethod::NixArchive,
-        ContentAddressMethod::Raw::NixArchive,
-        HashAlgorithm::SHA256,
-        {},
-        NoRepair);
-    auto id = merkle::blobId("migration-holder");
-    auto before = store->objects.holderOrForget(id, false, NoRepair);
-    ASSERT_TRUE(before);
-    auto dbPath = store->dbDir / "db.sqlite";
-    store.reset();
-    {
-        SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
-        db.exec(
-            "create table OldBlobs (id blob not null, exec integer not null, ino integer not null, dev integer not null,"
-            " ingestion integer not null, name text not null, size integer not null, primary key (id, exec));"
-            "insert into OldBlobs select id, exec, ino, dev, ingestion, name, size from Blobs;"
-            "drop table Blobs; alter table OldBlobs rename to Blobs;"
-            "create index IndexBlobsIngestion on Blobs(ingestion);"
-            "delete from SchemaMigrations where migration = '20260921-blob-holder-candidates';");
-    }
-
+    bool savedWAL = settings.useSQLiteWAL;
+    Finally restoreSetting{[&] {
+        store.reset();
+        settings.useSQLiteWAL = savedWAL;
+    }};
     auto savedFeatures = experimentalFeatureSettings.experimentalFeatures.get();
     Finally restoreFeatures{[&] { experimentalFeatureSettings.experimentalFeatures = savedFeatures; }};
     experimentalFeatureSettings.experimentalFeatures.get().insert(Xp::ReadOnlyLocalStore);
-    {
-        auto roConfig = make_ref<LocalStoreConfig>(tempStoreDir.path(), StoreConfig::Params{{"read-only", "true"}});
-        auto ro = make_ref<LocalStore>(roConfig);
-        auto holder = ro->objects.holderOrForget(id, false, NoRepair);
-        ASSERT_TRUE(holder);
-        EXPECT_EQ(holder->ingestion, before->ingestion);
-        EXPECT_EQ(holder->ino, before->ino);
-        /* A read-only invalid candidate cannot be removed, but the cursor
-           still reaches the end instead of repeatedly selecting it. */
-        chmod(holder->file, 0644);
-        EXPECT_FALSE(ro->objects.holderOrForget(id, false, NoRepair));
-        canonicaliseTimestampAndPermissions(holder->file);
-    }
-    store = std::make_shared<LocalStore>(ref{config});
-    auto after = store->objects.holderOrForget(id, false, NoRepair);
-    ASSERT_TRUE(after);
-    EXPECT_EQ(after->ingestion, before->ingestion);
-    EXPECT_EQ(after->ino, before->ino);
-    EXPECT_EQ(after->file, before->file);
-    EXPECT_TRUE(store->isValidPath(path));
-    SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
-    SQLiteStmt columns{db, "pragma table_info(Blobs)"};
-    auto use = columns.use();
-    bool checked = false;
-    while (use.next())
-        if (use.getStr(1) == "ingestion") {
-            EXPECT_EQ(use.getInt(5), 3);
-            checked = true;
+
+    for (bool wal : {false, true})
+        for (bool candidates : {false, true}) {
+            SCOPED_TRACE(fmt("wal=%d candidates=%d", wal, candidates));
+            store.reset();
+            settings.useSQLiteWAL = wal;
+            auto root = tempStoreDir.path() / fmt("migration-%d-%d", wal, candidates);
+            config = std::make_shared<LocalStoreConfig>(root, StoreConfig::Params{});
+            store = std::make_shared<LocalStore>(ref{config});
+            StringSource source{treeNar({{"file", "migration-holder", 'f'}, {"nested/exec", "migration-holder", 'x'}})};
+            auto path = store->addToStoreFromDump(
+                source,
+                "candidate-migration",
+                FileSerialisationMethod::NixArchive,
+                ContentAddressMethod::Raw::NixArchive,
+                HashAlgorithm::SHA256,
+                {},
+                NoRepair);
+            auto id = merkle::blobId("migration-holder");
+            std::vector<GitObjectStore::Holder> before;
+            for (bool executable : {false, true}) {
+                auto holder = store->objects.holderOrForget(id, executable, NoRepair);
+                ASSERT_TRUE(holder);
+                before.push_back(*holder);
+            }
+            auto namedPath = store->printStorePath(path);
+            auto dbPath = store->dbDir / "db.sqlite";
+            store.reset();
+
+            using Row = std::tuple<std::string, int64_t, int64_t, int64_t, int64_t, std::string, int64_t>;
+            auto readRows = [](SQLite & db) {
+                std::vector<Row> rows;
+                SQLiteStmt query{
+                    db, "select id, exec, ino, dev, ingestion, name, size from Blobs order by id, exec, ingestion"};
+                auto use = query.use();
+                while (use.next())
+                    rows.emplace_back(
+                        use.getBlobStr(0),
+                        use.getInt(1),
+                        use.getInt(2),
+                        use.getInt(3),
+                        use.getInt(4),
+                        use.getStr(5),
+                        use.getInt(6));
+                return rows;
+            };
+            auto checkLayout = [&](SQLite & db, bool withoutRowid, int ingestionKey) {
+                SQLiteStmt columns{db, "pragma table_info(Blobs)"};
+                auto use = columns.use();
+                bool checked = false;
+                while (use.next())
+                    if (use.getStr(1) == "ingestion") {
+                        EXPECT_EQ(use.getInt(5), ingestionKey);
+                        checked = true;
+                    }
+                EXPECT_TRUE(checked);
+                if (withoutRowid)
+                    EXPECT_THROW((SQLiteStmt{db, "select rowid from Blobs"}), SQLiteError);
+                else
+                    EXPECT_NO_THROW((SQLiteStmt{db, "select rowid from Blobs"}));
+                SQLiteStmt index{db, "pragma index_info(IndexBlobsIngestion)"};
+                auto entry = index.use();
+                ASSERT_TRUE(entry.next());
+                EXPECT_EQ(entry.getStr(2), "ingestion");
+                EXPECT_FALSE(entry.next());
+                SQLiteStmt mode{db, "pragma journal_mode"};
+                auto journal = mode.use();
+                ASSERT_TRUE(journal.next());
+                EXPECT_EQ(journal.getStr(0) == "wal", wal);
+            };
+            auto unnamedId = merkle::blobId("migration-unnamed");
+            unnamedId.hash[0] = 0;
+            auto invalidId = merkle::blobId("migration-unregistered");
+            std::vector<Row> expected;
+            {
+                SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
+                checkLayout(db, true, 3);
+                SQLiteTxn txn(db);
+                SQLiteStmt ingestion{db, "insert into Ingestions(path, hold) values (?, 'old-writer')"};
+                auto addIngestion = [&](std::string_view name, bool named) {
+                    ingestion.use().apply(name, named).exec();
+                    return static_cast<int64_t>(db.getLastInsertedRowId());
+                };
+                auto unnamed = addIngestion("", false);
+                auto invalid = addIngestion(namedPath + "-unregistered", true);
+                SQLiteStmt insert{
+                    db, "insert into Blobs(id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?)"};
+                auto addRow = [&](const Hash & hash,
+                                  bool executable,
+                                  int64_t ino,
+                                  int64_t dev,
+                                  int64_t owner,
+                                  std::string_view name,
+                                  int64_t size) {
+                    insert.use()
+                        .apply(hash.hash, hash.hashSize)
+                        .apply(int64_t(executable))
+                        .apply(ino)
+                        .apply(dev)
+                        .apply(owner)
+                        .apply(name)
+                        .apply(size)
+                        .exec();
+                };
+                /* These rows are part of the relation even though lookup cannot use them. */
+                auto low = std::numeric_limits<int64_t>::min();
+                auto high = std::numeric_limits<int64_t>::max();
+                addRow(unnamedId, false, low, high, unnamed, "", 0);
+                std::string longName = "nested";
+                for (unsigned i = 0; i < 6; ++i)
+                    longName += "/" + std::string(200, 'n');
+                addRow(invalidId, true, high, low, invalid, longName, high);
+                if (candidates) {
+                    auto duplicate = addIngestion(namedPath, true);
+                    addRow(id, false, before[0].ino, before[0].dev, duplicate, "file", before[0].size);
+                    addRow(id, false, 0, 0, unnamed, "not-visible", 1);
+                }
+                db.exec(fmt(
+                    "create table OldBlobs (id blob not null, exec integer not null, ino integer not null, dev integer not null,"
+                    " ingestion integer not null, name text not null, size integer not null, primary key (%s));"
+                    "insert into OldBlobs select id, exec, ino, dev, ingestion, name, size from Blobs;"
+                    "drop table Blobs; alter table OldBlobs rename to Blobs;"
+                    "create index IndexBlobsIngestion on Blobs(ingestion);"
+                    "delete from SchemaMigrations where migration = '20260924-blob-holder-without-rowid';",
+                    candidates ? "id, exec, ingestion" : "id, exec"));
+                if (!candidates)
+                    db.exec("delete from SchemaMigrations where migration = '20260921-blob-holder-candidates'");
+                expected = readRows(db);
+                ASSERT_EQ(expected.size(), candidates ? 6u : 4u);
+                txn.commit();
+                checkLayout(db, false, candidates ? 3 : 0);
+            }
+            auto checkHolders = [&](LocalStore & current) {
+                for (bool executable : {false, true}) {
+                    auto holder = current.objects.holderOrForget(id, executable, NoRepair);
+                    ASSERT_TRUE(holder);
+                    const auto & old = before[executable];
+                    EXPECT_EQ(holder->ingestion, old.ingestion);
+                    EXPECT_EQ(holder->ino, old.ino);
+                    EXPECT_EQ(holder->dev, old.dev);
+                    EXPECT_EQ(holder->size, old.size);
+                    EXPECT_EQ(holder->file, old.file);
+                }
+                EXPECT_FALSE(current.objects.holderOrForget(unnamedId, false, NoRepair));
+                EXPECT_FALSE(current.objects.holderOrForget(invalidId, true, NoRepair));
+                EXPECT_TRUE(current.isValidPath(path));
+            };
+            auto roConfig = make_ref<LocalStoreConfig>(root, StoreConfig::Params{{"read-only", "true"}});
+            {
+                auto ro = make_ref<LocalStore>(roConfig);
+                checkHolders(*ro);
+                /* Read-only rejection cannot remove a row, but must exhaust its candidates. */
+                chmod(before[0].file, 0644);
+                Finally restoreMode{[&] { canonicaliseTimestampAndPermissions(before[0].file); }};
+                EXPECT_FALSE(ro->objects.holderOrForget(id, false, NoRepair));
+            }
+            {
+                SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
+                EXPECT_EQ(readRows(db), expected);
+                checkLayout(db, false, candidates ? 3 : 0);
+                /* Fail the real migration after copy, replacement and index creation.
+                   Earlier named migrations may already have committed separately. */
+                db.exec(
+                    "create trigger RefuseBlobMigration before insert on SchemaMigrations "
+                    "when new.migration = '20260924-blob-holder-without-rowid' "
+                    "begin select raise(abort, 'test refuses blob migration marker'); end");
+            }
+            EXPECT_THROW((std::make_shared<LocalStore>(ref{config})), SQLiteError);
+            {
+                SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
+                EXPECT_EQ(readRows(db), expected);
+                checkLayout(db, false, 3);
+                SQLiteStmt marker{
+                    db, "select 1 from SchemaMigrations where migration = '20260924-blob-holder-without-rowid'"};
+                EXPECT_FALSE(marker.use().next());
+                SQLiteStmt temporary{
+                    db, "select 1 from sqlite_master where type = 'table' and name = 'BlobsWithoutRowid'"};
+                EXPECT_FALSE(temporary.use().next());
+                db.exec("drop trigger RefuseBlobMigration");
+            }
+            for (unsigned reopen = 0; reopen < 2; ++reopen) {
+                store = std::make_shared<LocalStore>(ref{config});
+                checkHolders(*store);
+                store.reset();
+                {
+                    auto ro = make_ref<LocalStore>(roConfig);
+                    checkHolders(*ro);
+                }
+                SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
+                EXPECT_EQ(readRows(db), expected);
+                checkLayout(db, true, 3);
+                SQLiteStmt marker{
+                    db, "select count(*) from SchemaMigrations where migration = '20260924-blob-holder-without-rowid'"};
+                auto use = marker.use();
+                ASSERT_TRUE(use.next());
+                EXPECT_EQ(use.getInt(0), 1);
+            }
         }
-    EXPECT_TRUE(checked);
 }
 
 /* The other half of the rule, driven directly: a row against an ingestion with
@@ -3796,6 +3943,128 @@ TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
     EXPECT_EQ(relation(second), relation(secondExpected));
     EXPECT_EQ(store->blobRowCount(false), 0u);
     EXPECT_EQ(store->blobRowCount(true), 0u);
+}
+
+/* Pending identity is the active byte string and executable bit. Algorithm
+   tags and unused array bytes are retained row data, not additional keys. */
+TEST_F(LocalStoreObjectsTest, pendingRowsProjectExactlyTheActiveHashBytesAndMode)
+{
+    using Row = GitObjectStore::Hold::Row;
+    using Key = std::pair<std::string, bool>;
+    using Relation = std::map<Key, Row>;
+    const std::array tags{
+        HashAlgorithm::MD5, HashAlgorithm::SHA1, HashAlgorithm::SHA256, HashAlgorithm::SHA512, HashAlgorithm::BLAKE3};
+    const std::filesystem::path root = "/pending-key-domain";
+    auto hold = store->objects.hold();
+    unsigned serial = 0;
+    auto key = [](const Hash & id, bool executable) -> Key {
+        return {std::string(reinterpret_cast<const char *>(id.hash), id.hashSize), executable};
+    };
+    auto makeRow = [&](size_t length, HashAlgorithm tag, bool executable) {
+        Hash id{HashAlgorithm::SHA256};
+        id.hashSize = length;
+        id.algo = tag;
+        std::fill(id.hash + length, id.hash + Hash::maxHashSize, uint8_t{0xa5});
+        auto ordinal = ++serial;
+        return Row{
+            .id = id,
+            .executable = executable,
+            .ino = static_cast<ino_t>(ordinal),
+            .dev = static_cast<dev_t>(17 + ordinal),
+            .size = 3 * ordinal,
+            .name = "first-" + std::to_string(ordinal)};
+    };
+    auto holder = [&](const Row & row) -> std::optional<std::string> { return (root / row.name).string(); };
+    auto checkRows = [&](const Relation & expected) {
+        auto rows = hold.takeRows();
+        ASSERT_EQ(rows.size(), expected.size());
+        std::set<Key> seen;
+        for (auto & row : rows) {
+            auto k = key(row.id, row.executable);
+            ASSERT_TRUE(seen.insert(k).second);
+            auto i = expected.find(k);
+            ASSERT_NE(i, expected.end());
+            const auto & first = i->second;
+            EXPECT_EQ(row.id.hashSize, first.id.hashSize);
+            EXPECT_EQ(row.id.algo, first.id.algo);
+            EXPECT_TRUE(std::equal(row.id.hash, row.id.hash + Hash::maxHashSize, first.id.hash));
+            EXPECT_EQ(row.executable, first.executable);
+            EXPECT_EQ(row.ino, first.ino);
+            EXPECT_EQ(row.dev, first.dev);
+            EXPECT_EQ(row.size, first.size);
+            EXPECT_EQ(row.name, first.name);
+            EXPECT_FALSE(hold.pendingHolder(row.id, row.executable));
+        }
+        EXPECT_TRUE(hold.takeRows().empty());
+    };
+
+    /* All lengths and both bits coexist, so common zero prefixes cannot
+       collapse different lengths. First-row tails deliberately differ from
+       their active bytes. No content hashing or filesystem reads are needed. */
+    hold.setRoot(root);
+    Relation expected;
+    for (size_t length = 0; length <= Hash::maxHashSize; ++length)
+        for (bool executable : {false, true}) {
+            auto row = makeRow(length, HashAlgorithm::SHA256, executable);
+            ASSERT_FALSE(hold.addRow(row));
+            ASSERT_TRUE(expected.emplace(key(row.id, executable), row).second);
+            ASSERT_EQ(hold.pendingHolder(row.id, executable), holder(row));
+        }
+
+    /* Exhaust length x array position x byte value. These are the included
+       and ignored positions of one byte-string equality; bit and tag factors
+       are checked separately instead of repeating this million-case domain. */
+    size_t included = 0, ignored = 0;
+    for (size_t length = 0; length <= Hash::maxHashSize; ++length) {
+        const auto & first = expected.at(Key{std::string(length, '\0'), false});
+        for (size_t position = 0; position < Hash::maxHashSize; ++position) {
+            auto probe = first.id;
+            for (unsigned byte = 0; byte < 256; ++byte) {
+                probe.hash[position] = static_cast<uint8_t>(byte);
+                auto i = expected.find(key(probe, false));
+                auto want = i == expected.end() ? std::nullopt : holder(i->second);
+                ASSERT_EQ(hold.pendingHolder(probe, false), want)
+                    << "length=" << length << " position=" << position << " byte=" << byte;
+                if (position < length)
+                    ++included;
+                else
+                    ++ignored;
+            }
+        }
+    }
+    EXPECT_EQ(included, 532480u);
+    EXPECT_EQ(ignored, 532480u);
+    checkRows(expected);
+    ASSERT_FALSE(HasFatalFailure());
+
+    /* Every tag can be the first row's retained tag. Every other tag and
+       changed unused bytes still address that same row, under either bit.
+       Duplicate metadata must never replace any field of the first claim. */
+    size_t duplicates = 0;
+    for (auto firstTag : tags) {
+        hold.setRoot(root);
+        Relation firstRows;
+        for (bool executable : {false, true}) {
+            auto first = makeRow(32, firstTag, executable);
+            ASSERT_FALSE(hold.addRow(first));
+            ASSERT_TRUE(firstRows.emplace(key(first.id, executable), first).second);
+            for (auto tag : tags) {
+                auto duplicate = first;
+                duplicate.id.algo = tag;
+                std::fill(duplicate.id.hash + 32, duplicate.id.hash + Hash::maxHashSize, uint8_t{0x5a});
+                ++duplicate.ino;
+                ++duplicate.dev;
+                ++duplicate.size;
+                duplicate.name = "rejected";
+                ASSERT_EQ(hold.pendingHolder(duplicate.id, executable), holder(first));
+                ASSERT_EQ(hold.addRow(std::move(duplicate)), holder(first));
+                ++duplicates;
+            }
+        }
+        checkRows(firstRows);
+        ASSERT_FALSE(HasFatalFailure());
+    }
+    EXPECT_EQ(duplicates, 50u);
 }
 
 /* An inode snapshot suggests a lookup; it cannot establish present content

@@ -1738,7 +1738,7 @@ struct GitDirectorySinkImpl : merkle::DirectorySinkWithFinalize
     void insertChild(std::string_view name, merkle::TreeEntry entry) override
     {
         if (repo.options.canonicalObjects) {
-            merkle::insertEntry(entries, name, entry);
+            merkle::insertEntry(entries, std::string(name), entry);
             return;
         }
         if (name.empty() || name.find('/') != name.npos || name.find('\0') != name.npos)

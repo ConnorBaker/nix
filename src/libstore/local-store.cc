@@ -103,8 +103,7 @@ bool LocalStoreConfig::getDefaultRequireSigs()
 }
 
 /* The object store's index keys the blob by its identifier's 32 bytes, not by
-   the hexadecimal of them: half the key, so half the b-tree pages and half the
-   comparison work at a real store's size (`05` section 6). */
+   their hexadecimal encoding: this halves the identifier bytes. */
 static Hash blobIdOf(std::string_view bytes)
 {
     Hash id(GitObjectStore::hashAlgo);
@@ -512,9 +511,7 @@ LocalStore::LocalStore(ref<const Config> config)
         return retrySQLite<std::optional<GitObjectStore::Holder>>([&]() -> std::optional<GitObjectStore::Holder> {
             auto state(_state->lock());
             auto use(state->stmts->LookupBlob.use());
-            /* The identifier is a 32-byte blob, not its hexadecimal: half
-               the key bytes, so half the b-tree pages and half the
-               comparisons (`05` section 6, the scale tables). */
+            /* Bind the identifier bytes directly, without hexadecimal encoding. */
             use.apply(id.hash, id.hashSize)
                 .apply(int64_t(executable ? 1 : 0))
                 .apply(std::get<0>(cursor))
@@ -1134,6 +1131,20 @@ bool LocalStore::upgradeDBSchema(State & state, bool dryRun)
 
     maybeUpgrade(
         "20260921-ingestion-paths", "create index if not exists IndexIngestionsPath on Ingestions(path, hold)");
+
+    /* A candidate is identified by its complete key; no consumer uses a
+       separate rowid. Preserve every candidate while removing that B-tree. */
+    maybeUpgrade(
+        "20260924-blob-holder-without-rowid",
+        "create table BlobsWithoutRowid ("
+        " id blob not null, exec integer not null, ino integer not null, dev integer not null,"
+        " ingestion integer not null, name text not null, size integer not null,"
+        " primary key (id, exec, ingestion)) without rowid;"
+        "\ninsert into BlobsWithoutRowid (id, exec, ino, dev, ingestion, name, size)"
+        " select id, exec, ino, dev, ingestion, name, size from Blobs;"
+        "\ndrop table Blobs;"
+        "\nalter table BlobsWithoutRowid rename to Blobs;"
+        "\ncreate index IndexBlobsIngestion on Blobs(ingestion)");
 
     return ret;
 }

@@ -86,6 +86,104 @@ TEST(ObjectHashSink, complex_tree_matches_reference_and_nar_length)
     checkBothRoutes(complexTree());
 }
 
+/* A visitor may use its callback's owned state after a recursive visit.
+   Every directory keeps that same callback for its later siblings. */
+TEST(ObjectHashSink, recursivePushPreservesOwnedCallbackState)
+{
+    struct Visitor : HashingVisitor
+    {
+        size_t completed = 0;
+
+        HashedNode directory(const CanonPath & path, Children children) override
+        {
+            return HashingVisitor::directory(path, [&](auto each) {
+                struct Context
+                {
+                    decltype(each) & consume;
+                    size_t & completed;
+                    size_t ordinal = 0;
+                } context{each, completed};
+                children([context = &context, ordinal = size_t{0}](
+                             std::string_view name, bool isDirectory, fun<HashedNode()> visit) mutable {
+                    auto child = visit();
+                    /* Both captures must remain valid after nested directory
+                       callbacks, and the owned ordinal must persist. */
+                    EXPECT_EQ(++ordinal, ++context->ordinal);
+                    ++context->completed;
+                    context->consume(name, isDirectory, [&] { return child; });
+                });
+            });
+        }
+    } visitor;
+
+    auto source = complexTree();
+    auto expected = referenceObjectEntry(*source, CanonPath::root);
+    auto nar = narOf(*source);
+    StringSource input{nar};
+    ObjectHashSink sink{visitor};
+    parseDump(sink, input);
+    auto actual = sink.finish();
+    EXPECT_EQ(actual.root, expected);
+    EXPECT_TRUE(actual.narSizeExact);
+    EXPECT_EQ(actual.narSize, nar.size());
+    EXPECT_EQ(visitor.completed, 10u);
+}
+
+TEST(ObjectHashSink, recoveredChildInsertionDoesNotContributeToTheDirectory)
+{
+    const merkle::TreeEntry keep{merkle::Mode::Regular, merkle::blobId("first")};
+    const merkle::TreeEntry tail{merkle::Mode::Regular, merkle::blobId("last")};
+    const merkle::Tree expected{{"keep", keep}, {"tail", tail}};
+    const auto expectedId = merkle::treeId(merkle::serialiseTree(expected));
+    auto source = make_ref<MemorySourceAccessor>();
+    source->addFile(CanonPath("keep"), "first");
+    source->addFile(CanonPath("tail"), "last");
+    const auto expectedNarSize = narOf(*source).size();
+    size_t cases = 0;
+    for (bool duplicate : {false, true})
+        for (bool rejectedSize : {false, true})
+            for (bool acceptedSize : {false, true}) {
+                SCOPED_TRACE(
+                    fmt("duplicate=%d rejectedSize=%d acceptedSize=%d", duplicate, rejectedSize, acceptedSize));
+                HashingVisitor visitor;
+                const HashedNode first{keep, merkle::nar::regular(5, false)};
+                const HashedNode rejected{
+                    {merkle::Mode::Regular, merkle::blobId("rejected")},
+                    rejectedSize ? std::optional(merkle::nar::regular(8, false)) : std::nullopt};
+                const HashedNode last{
+                    tail, acceptedSize ? std::optional(merkle::nar::regular(4, false)) : std::nullopt};
+                std::vector<std::string> visits;
+                auto actual = visitor.directory(CanonPath::root, [&](auto each) {
+                    each("keep", false, [&] {
+                        visits.push_back("first");
+                        return first;
+                    });
+                    /* Recovery belongs to the child producer: a refused
+                       insertion must leave both the map and its size alone. */
+                    EXPECT_THROW(
+                        each(
+                            duplicate ? "keep" : "bad/name",
+                            false,
+                            [&] {
+                                visits.push_back("rejected");
+                                return rejected;
+                            }),
+                        Error);
+                    each("tail", false, [&] {
+                        visits.push_back("last");
+                        return last;
+                    });
+                });
+                EXPECT_EQ(visits, (std::vector<std::string>{"first", "rejected", "last"}));
+                EXPECT_EQ(actual.entry, (merkle::TreeEntry{merkle::Mode::Directory, expectedId}));
+                EXPECT_EQ(actual.narSize.has_value(), acceptedSize);
+                if (actual.narSize)
+                    EXPECT_EQ(merkle::nar::root(*actual.narSize), expectedNarSize);
+                ++cases;
+            }
+    EXPECT_EQ(cases, 8u);
+}
+
 TEST(TreeTraversal, directoryNamesMatchIndependentlyFramedNarBytes)
 {
     struct Source : MemorySourceAccessor

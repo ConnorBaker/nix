@@ -87,7 +87,7 @@ Hash treeId(std::string_view body);
  * or if the tree already has an entry of that name — each is a bug in the
  * caller, since no directory yields such a name or a name twice.
  */
-void insertEntry(Tree & tree, std::string_view name, const TreeEntry & entry);
+void insertEntry(Tree & tree, std::string name, const TreeEntry & entry);
 
 /**
  * The object hash of a store object from its root entry (01 §9.11, which

@@ -14,7 +14,7 @@
 #include "nix/util/util.hh"
 
 #include <boost/unordered/unordered_flat_set.hpp>
-#include <unordered_map>
+#include <unordered_set>
 #include <mutex>
 #include <shared_mutex>
 #include <array>
@@ -358,11 +358,51 @@ static std::error_code hardLink(const std::filesystem::path & from, const std::f
    handing them over retires the pending map. Unused shards are never allocated. */
 struct GitObjectStore::Hold::Pending
 {
+    /* Borrow the row's existing identity. Like the old binary key, Hash
+       equality uses length and bytes, without an algorithm tag. */
+    struct Key
+    {
+        const Hash & id;
+        bool executable;
+
+        Key(const Hash & id, bool executable) noexcept
+            : id(id)
+            , executable(executable)
+        {
+        }
+
+        Key(const Row & row) noexcept
+            : Key(row.id, row.executable)
+        {
+        }
+    };
+
+    struct KeyHash
+    {
+        using is_transparent = void;
+
+        size_t operator()(Key key) const noexcept
+        {
+            return std::hash<std::string_view>{}({reinterpret_cast<const char *>(key.id.hash), key.id.hashSize})
+                   ^ key.executable;
+        }
+    };
+
+    struct KeyEqual
+    {
+        using is_transparent = void;
+
+        bool operator()(Key a, Key b) const noexcept
+        {
+            return a.executable == b.executable && a.id == b.id;
+        }
+    };
+
     struct Shard
     {
         std::mutex mutex;
         /** (id, mode) -> the first completed file's row. */
-        std::unordered_map<std::string, Row> byKey;
+        std::unordered_set<Row, KeyHash, KeyEqual> byKey;
     };
 
     /* A one-file ingestion occupies one shard. Allocate the others only
@@ -388,14 +428,6 @@ struct GitObjectStore::Hold::Pending
             delete shard.load();
     }
 };
-
-static std::string pendingKey(const Hash & id, bool executable)
-{
-    std::string key(id.hashSize + 1, '\0');
-    memcpy(key.data(), id.hash, id.hashSize);
-    key.back() = executable ? 'x' : ' ';
-    return key;
-}
 
 /* The shard an identifier falls in: its first byte, as `nameUnder` shards the
    object store's directories. */
@@ -426,13 +458,12 @@ const std::filesystem::path & GitObjectStore::Hold::root() const
 
 std::optional<std::string> GitObjectStore::Hold::addRow(Row row) const
 {
-    auto key = pendingKey(row.id, row.executable);
     auto & shard = pending->shard(shardOf(row.id));
     auto lock = std::lock_guard{shard.mutex};
-    auto [i, inserted] = shard.byKey.try_emplace(std::move(key), std::move(row));
+    auto [i, inserted] = shard.byKey.insert(std::move(row));
     if (inserted)
         return std::nullopt;
-    auto & name = i->second.name;
+    auto & name = i->name;
     return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 
@@ -450,8 +481,11 @@ std::vector<GitObjectStore::Hold::Row> GitObjectStore::Hold::takeRows() const
     rows.reserve(count);
     for (auto & slot : pending->shards)
         if (std::unique_ptr<Pending::Shard> shard{slot.exchange(nullptr)}; shard)
-            for (auto & [_, row] : shard->byKey)
-                rows.push_back(std::move(row));
+            while (!shard->byKey.empty()) {
+                /* Extract before moving: entries in a set are const. */
+                auto node = shard->byKey.extract(shard->byKey.begin());
+                rows.push_back(std::move(node.value()));
+            }
     return rows;
 }
 
@@ -461,10 +495,10 @@ std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, 
     if (!shard)
         return std::nullopt;
     auto lock = std::lock_guard{shard->mutex};
-    auto i = shard->byKey.find(pendingKey(id, executable));
+    auto i = shard->byKey.find(Pending::Key{id, executable});
     if (i == shard->byKey.end())
         return std::nullopt;
-    auto & name = i->second.name;
+    auto & name = i->name;
     return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 
@@ -600,11 +634,9 @@ GitObjectStore::Hold::~Hold()
     try {
         auto lock = std::shared_lock{*auxiliaryLock};
 #ifndef _WIN32
-        /* Keep the root's lock descriptor until the hold is released. */
-        AutoCloseFD scan{dup(fd.get())};
-        if (!scan)
-            throw SysError("duplicating hold directory descriptor");
-        releaseHoldContents(std::move(scan));
+        /* Namespace exclusion lasts through rmdir, so cleanup can consume
+           the root descriptor along with the directory stream. */
+        releaseHoldContents(std::move(fd));
         if (::rmdir(dir.c_str()) == -1 && errno != ENOENT)
             throw SysError("removing hold %s", PathFmt(dir));
 #else
@@ -1209,15 +1241,19 @@ merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view bod
             }
             if (!tree.empty() && tree.begin()->first == ".")
                 throw Error("synthetic root tree has more than one entry");
-            merkle::insertEntry(tree, name, entry);
+            merkle::insertEntry(tree, std::string(name), entry);
         }
     } into;
 
     /* The file holds the entries alone; the parser reads the size git's
        header puts before them. */
-    StringSource source{std::to_string(body.size()) + '\0' + std::string(body)};
     try {
-        git::parseTree(into, source, hashAlgo);
+        {
+            auto framed = std::to_string(body.size()) + '\0';
+            framed.append(body);
+            StringSource source{framed};
+            git::parseTree(into, source, hashAlgo);
+        }
         /* The identifier names the canonical encoding of this map, not
            another spelling or ordering that the raw Git parser accepts. */
         if (merkle::serialiseTree(into.tree) != body)

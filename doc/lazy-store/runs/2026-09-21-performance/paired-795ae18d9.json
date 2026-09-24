@@ -1,0 +1,6004 @@
+{
+  "status": "completed optimized comparison; performance outcomes are recorded without excluding regressions",
+  "resolved_branch_revision": "795ae18d90de918b9e4746575f92cfaa8a707fd6",
+  "raw_results": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+  "metadata": {
+    "branch_revision": "795ae18d90de918b9e4746575f92cfaa8a707fd6",
+    "base_revision": "8aad447f0bace6be413963e897ad690247ad6aa2",
+    "nixpkgs_revision": "6aefcda9401be8acc2b74244fb3b37520ea1f0a8",
+    "system": "aarch64-linux",
+    "bins": {
+      "base": "/nix/store/g87ir6441xvkv322jsrjj8l5spypns8d-nix-2.36.0pre20260910_8aad447/bin/nix",
+      "branch": "/nix/store/hx4v215ra4ajwqrs3j112xnxw9qnvk4c-nix-2.36.0pre20260924_795ae18/bin/nix"
+    },
+    "uris": {
+      "path": "path:/home/connorbaker/Benchmarks/nix-eval-78c14bf2d/nixpkgs-path",
+      "git": "git+file:///home/connorbaker/Benchmarks/nix-eval-78c14bf2d/nixpkgs-git?shallow=1",
+      "github": "github:NixOS/nixpkgs/6aefcda9401be8acc2b74244fb3b37520ea1f0a8"
+    },
+    "attributes": [
+      "hello",
+      "jq",
+      "git",
+      "openssl",
+      "curl",
+      "zlib",
+      "bash",
+      "coreutils",
+      "python3",
+      "nodejs",
+      "rustc",
+      "cargo",
+      "gcc",
+      "clang",
+      "cmake",
+      "ninja",
+      "pkg-config",
+      "gnumake",
+      "ripgrep",
+      "fd",
+      "sqlite",
+      "postgresql",
+      "valkey",
+      "nginx",
+      "openssh",
+      "systemd",
+      "neovim",
+      "emacs",
+      "ffmpeg",
+      "imagemagick",
+      "gimp",
+      "firefox"
+    ],
+    "cpu_affinity": "5-9,15-19",
+    "config": "experimental-features = nix-command flakes git-hashing\nsandbox = false\nsubstituters =\nbuild-users-group =\neval-cache = false\nflake-registry =\naccept-flake-config = false\nallow-import-from-derivation = false\ngc-reserved-space = 0\n",
+    "started": "2026-09-24T15:25:27.785806+00:00",
+    "kernel": "6.17.0-1029-nvidia",
+    "versions": {
+      "base": "nix (Nix) 2.36.0pre20260910_8aad447",
+      "branch": "nix (Nix) 2.36.0pre20260924_795ae18"
+    },
+    "source_provenance": {
+      "revision": "6aefcda9401be8acc2b74244fb3b37520ea1f0a8",
+      "nodes": 89979,
+      "raw_git_tree_sha256": "e056a772df52d4f6565200d6c66b53cd3975e70778c17b99b3ec48e3b33f657f",
+      "index_matches_tree": true,
+      "checked": [
+        "/home/connorbaker/Benchmarks/nix-eval-78c14bf2d/nixpkgs-git",
+        "/home/connorbaker/Benchmarks/nix-eval-78c14bf2d/nixpkgs-path"
+      ]
+    }
+  },
+  "summary": [
+    {
+      "phase": "cold",
+      "attributes": 32,
+      "scheme": "path",
+      "base": {
+        "n": 5,
+        "wall_median_s": 3.6766795250587165,
+        "wall_mad_s": 0.06802411144599319,
+        "wall_min_s": 3.6086554136127234,
+        "wall_max_s": 3.8732314319349825,
+        "cpu_median_s": 3.43,
+        "rss_median_mib": 445.17578125
+      },
+      "branch": {
+        "n": 5,
+        "wall_median_s": 3.226349195931107,
+        "wall_mad_s": 0.04949044203385711,
+        "wall_min_s": 2.9843313577584922,
+        "wall_max_s": 3.3067701580002904,
+        "cpu_median_s": 6.72,
+        "rss_median_mib": 474.48828125
+      },
+      "branch_over_base": 0.8775171112797986,
+      "paired": {
+        "n": 5,
+        "branch_faster": 5,
+        "wall_delta_median_s": -0.5664612739346921,
+        "wall_ratio_median": 0.8537496961157055,
+        "cpu_delta_median_s": 3.17
+      }
+    },
+    {
+      "phase": "cold",
+      "attributes": 32,
+      "scheme": "git",
+      "base": {
+        "n": 5,
+        "wall_median_s": 2.7849361882545054,
+        "wall_mad_s": 0.11187987867742777,
+        "wall_min_s": 2.656188021879643,
+        "wall_max_s": 2.896816066931933,
+        "cpu_median_s": 2.63,
+        "rss_median_mib": 479.5703125
+      },
+      "branch": {
+        "n": 5,
+        "wall_median_s": 2.2133976058103144,
+        "wall_mad_s": 0.02159243170171976,
+        "wall_min_s": 2.1638531698845327,
+        "wall_max_s": 2.2898127771914005,
+        "cpu_median_s": 2.62,
+        "rss_median_mib": 482.48046875
+      },
+      "branch_over_base": 0.7947749808937596,
+      "paired": {
+        "n": 5,
+        "branch_faster": 5,
+        "wall_delta_median_s": -0.5796392448246479,
+        "wall_ratio_median": 0.7979965371864279,
+        "cpu_delta_median_s": -0.050000000000000044
+      }
+    },
+    {
+      "phase": "cold",
+      "attributes": 32,
+      "scheme": "github",
+      "base": {
+        "n": 5,
+        "wall_median_s": 6.917877391912043,
+        "wall_mad_s": 0.8482345710508525,
+        "wall_min_s": 5.670107059646398,
+        "wall_max_s": 13.549520904198289,
+        "cpu_median_s": 16.39,
+        "rss_median_mib": 1018.20703125
+      },
+      "branch": {
+        "n": 5,
+        "wall_median_s": 3.6114391228184104,
+        "wall_mad_s": 0.24284730711951852,
+        "wall_min_s": 3.326071009039879,
+        "wall_max_s": 9.142993988003582,
+        "cpu_median_s": 5.300000000000001,
+        "rss_median_mib": 956.98046875
+      },
+      "branch_over_base": 0.5220443957333911,
+      "paired": {
+        "n": 5,
+        "branch_faster": 5,
+        "wall_delta_median_s": -3.3064382690936327,
+        "wall_ratio_median": 0.5549901229972112,
+        "cpu_delta_median_s": -11.049999999999999
+      }
+    },
+    {
+      "phase": "warm",
+      "attributes": 8,
+      "scheme": "path",
+      "base": {
+        "n": 10,
+        "wall_median_s": 3.2846476801205426,
+        "wall_mad_s": 0.07431140169501305,
+        "wall_min_s": 3.0938450121320784,
+        "wall_max_s": 3.516879342030734,
+        "cpu_median_s": 3.12,
+        "rss_median_mib": 224.23046875
+      },
+      "branch": {
+        "n": 10,
+        "wall_median_s": 0.3891442809253931,
+        "wall_mad_s": 0.017228567274287343,
+        "wall_min_s": 0.36924254475161433,
+        "wall_max_s": 0.41664990363642573,
+        "cpu_median_s": 0.86,
+        "rss_median_mib": 208.244140625
+      },
+      "branch_over_base": 0.11847367475074586,
+      "paired": {
+        "n": 10,
+        "branch_faster": 10,
+        "wall_delta_median_s": -2.8838922341819853,
+        "wall_ratio_median": 0.11647233837291114,
+        "cpu_delta_median_s": -2.255
+      }
+    },
+    {
+      "phase": "warm",
+      "attributes": 8,
+      "scheme": "git",
+      "base": {
+        "n": 10,
+        "wall_median_s": 0.830006712814793,
+        "wall_mad_s": 0.021807866636663675,
+        "wall_min_s": 0.7974689570255578,
+        "wall_max_s": 0.9753968669101596,
+        "cpu_median_s": 0.78,
+        "rss_median_mib": 254.72265625
+      },
+      "branch": {
+        "n": 10,
+        "wall_median_s": 0.7800316195935011,
+        "wall_mad_s": 0.02153285499662161,
+        "wall_min_s": 0.7511459300294518,
+        "wall_max_s": 0.8763065049424767,
+        "cpu_median_s": 1.2999999999999998,
+        "rss_median_mib": 261.50390625
+      },
+      "branch_over_base": 0.9397895312776304,
+      "paired": {
+        "n": 10,
+        "branch_faster": 8,
+        "wall_delta_median_s": -0.04595817835070193,
+        "wall_ratio_median": 0.9453978593907673,
+        "cpu_delta_median_s": 0.51
+      }
+    },
+    {
+      "phase": "warm",
+      "attributes": 8,
+      "scheme": "github",
+      "base": {
+        "n": 10,
+        "wall_median_s": 0.2903245456982404,
+        "wall_mad_s": 0.0049581886269152164,
+        "wall_min_s": 0.28453500801697373,
+        "wall_max_s": 0.30581726785749197,
+        "cpu_median_s": 0.28,
+        "rss_median_mib": 197.2265625
+      },
+      "branch": {
+        "n": 10,
+        "wall_median_s": 0.2629035343416035,
+        "wall_mad_s": 0.005444981157779694,
+        "wall_min_s": 0.24765205522999167,
+        "wall_max_s": 0.2720589693635702,
+        "cpu_median_s": 0.25,
+        "rss_median_mib": 200.95703125
+      },
+      "branch_over_base": 0.9055504890546253,
+      "paired": {
+        "n": 10,
+        "branch_faster": 10,
+        "wall_delta_median_s": -0.034147333819419146,
+        "wall_ratio_median": 0.8828041720578846,
+        "cpu_delta_median_s": -0.034999999999999996
+      }
+    },
+    {
+      "phase": "warm",
+      "attributes": 32,
+      "scheme": "path",
+      "base": {
+        "n": 10,
+        "wall_median_s": 3.9194149470422417,
+        "wall_mad_s": 0.14638599939644337,
+        "wall_min_s": 3.7186043630354106,
+        "wall_max_s": 4.28282655403018,
+        "cpu_median_s": 3.75,
+        "rss_median_mib": 444.86328125
+      },
+      "branch": {
+        "n": 10,
+        "wall_median_s": 0.9503704193048179,
+        "wall_mad_s": 0.026996462605893612,
+        "wall_min_s": 0.9175201831385493,
+        "wall_max_s": 1.0294160596095026,
+        "cpu_median_s": 1.405,
+        "rss_median_mib": 426.0703125
+      },
+      "branch_over_base": 0.24247762284572807,
+      "paired": {
+        "n": 10,
+        "branch_faster": 10,
+        "wall_delta_median_s": -2.9456434664316475,
+        "wall_ratio_median": 0.24306671333129032,
+        "cpu_delta_median_s": -2.3400000000000003
+      }
+    },
+    {
+      "phase": "warm",
+      "attributes": 32,
+      "scheme": "git",
+      "base": {
+        "n": 10,
+        "wall_median_s": 1.4097499453928322,
+        "wall_mad_s": 0.016422754852101207,
+        "wall_min_s": 1.3616630337201059,
+        "wall_max_s": 1.609668442979455,
+        "cpu_median_s": 1.3599999999999999,
+        "rss_median_mib": 479.3046875
+      },
+      "branch": {
+        "n": 10,
+        "wall_median_s": 1.3206225279718637,
+        "wall_mad_s": 0.04260557983070612,
+        "wall_min_s": 1.2764580161310732,
+        "wall_max_s": 1.5185143030248582,
+        "cpu_median_s": 1.825,
+        "rss_median_mib": 482.44140625
+      },
+      "branch_over_base": 0.9367778536099658,
+      "paired": {
+        "n": 10,
+        "branch_faster": 8,
+        "wall_delta_median_s": -0.07699084863997996,
+        "wall_ratio_median": 0.9487175976484725,
+        "cpu_delta_median_s": 0.5049999999999998
+      }
+    },
+    {
+      "phase": "warm",
+      "attributes": 32,
+      "scheme": "github",
+      "base": {
+        "n": 10,
+        "wall_median_s": 0.8476556243840605,
+        "wall_mad_s": 0.021555124782025814,
+        "wall_min_s": 0.8106022588908672,
+        "wall_max_s": 0.896553625818342,
+        "cpu_median_s": 0.8300000000000001,
+        "rss_median_mib": 443.72265625
+      },
+      "branch": {
+        "n": 10,
+        "wall_median_s": 0.7825879328884184,
+        "wall_mad_s": 0.01689718826673925,
+        "wall_min_s": 0.7597314431332052,
+        "wall_max_s": 0.9253173489123583,
+        "cpu_median_s": 0.77,
+        "rss_median_mib": 447.189453125
+      },
+      "branch_over_base": 0.9232380584474706,
+      "paired": {
+        "n": 10,
+        "branch_faster": 9,
+        "wall_delta_median_s": -0.053995508467778563,
+        "wall_ratio_median": 0.9350553688751058,
+        "cpu_delta_median_s": -0.05499999999999999
+      }
+    }
+  ],
+  "binary_sha256": {
+    "base": "9182ff0ae1d20c053e809e7a4babbc0f16fcbecf2e9095f785a3595ceb71de30",
+    "branch": "28637c240c9b80e42ec79a3f9543ad5e948cb68214dba3f269ee39f2c1aebe00"
+  },
+  "actual_binary_versions": {
+    "base": "nix (Nix) 2.36.0pre20260910_8aad447",
+    "branch": "nix (Nix) 2.36.0pre20260924_795ae18"
+  },
+  "branch_version_inputs": {
+    "base_version": "2.36.0",
+    "commit_timestamp": 1790262380,
+    "utc_commit_date": "20260924",
+    "short_revision": "795ae18"
+  },
+  "resolved_binaries": {
+    "base": "/nix/store/g87ir6441xvkv322jsrjj8l5spypns8d-nix-2.36.0pre20260910_8aad447/bin/nix",
+    "branch": "/nix/store/8sd4pmsg53c9azckd578dkarp42d9w56-nix-2.36.0pre20260924_795ae18/bin/nix"
+  },
+  "verification_source_sha256": {
+    "runner": "7caedd2d387e2ff05c0093424afe6944cabe1306e551fcfaeb39cb1210710bf1",
+    "graph_checker": "ab6accc31481fe407753f8b37ac1ea5f931ae8733a8b0f8a900dbf9d82167c78",
+    "snapshot": "048a184950a20e379333de550b3b35dbdef18c2b55e33727171ab8d62c33c001",
+    "driver": "89f06c08c9a08a6dccf2121f84770a503d97baecd0fc4c2d742f9b108f0efa44"
+  },
+  "benchmark_artifact_sha256": {
+    "metadata.json": "53000afe7b83eea7f02b45c3db6a9fc96cfcc2dbf4b2b25a8520696192516109",
+    "summary.json": "8379cb507f27122a71cfbac138a286421cc0526e26e34512ff16ee6c5ccb032a",
+    "samples.jsonl": "5d1db61282de9fee2e4feb0fc6658ec44ebfe8b510d4b81e2d17f816dad2c074"
+  },
+  "commands": {
+    "omitted_from_tracked_samples": true,
+    "raw_samples_artifact": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/samples.jsonl",
+    "raw_samples_sha256": "5d1db61282de9fee2e4feb0fc6658ec44ebfe8b510d4b81e2d17f816dad2c074",
+    "validation": "Every full command was checked against its exact binary, store root, phase, scheme, attribute count, and runner expression before omission. Full commands remain in the raw samples artifact; runner and expression sources are bound above."
+  },
+  "samples": [
+    {
+      "id": "cold-32-path-base-00",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 0,
+      "started": "2026-09-24T15:25:41.484349+00:00",
+      "load_before": [
+        4.2568359375,
+        4.24462890625,
+        3.28369140625
+      ],
+      "load_after": [
+        4.31640625,
+        4.25732421875,
+        3.29296875
+      ],
+      "wall_s": 3.8732314319349825,
+      "returncode": 0,
+      "user_s": 1.39,
+      "system_s": 2.25,
+      "rss_kib": 455672.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1196032.0,
+      "voluntary_switches": 246.0,
+      "involuntary_switches": 66.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-path-branch-00",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 0,
+      "started": "2026-09-24T15:25:45.367246+00:00",
+      "load_before": [
+        4.31640625,
+        4.25732421875,
+        3.29296875
+      ],
+      "load_after": [
+        4.130859375,
+        4.2197265625,
+        3.28564453125
+      ],
+      "wall_s": 3.3067701580002904,
+      "returncode": 0,
+      "user_s": 1.76,
+      "system_s": 5.18,
+      "rss_kib": 490160.0,
+      "fs_inputs": 10784.0,
+      "fs_outputs": 1746584.0,
+      "voluntary_switches": 10305.0,
+      "involuntary_switches": 114.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-git-branch-00",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 0,
+      "started": "2026-09-24T15:25:48.683409+00:00",
+      "load_before": [
+        4.130859375,
+        4.2197265625,
+        3.28564453125
+      ],
+      "load_after": [
+        4.130859375,
+        4.2197265625,
+        3.28564453125
+      ],
+      "wall_s": 2.224936689250171,
+      "returncode": 0,
+      "user_s": 1.39,
+      "system_s": 1.29,
+      "rss_kib": 494356.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 753280.0,
+      "voluntary_switches": 1169.0,
+      "involuntary_switches": 97.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-git-base-00",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 0,
+      "started": "2026-09-24T15:25:50.918008+00:00",
+      "load_before": [
+        4.130859375,
+        4.2197265625,
+        3.28564453125
+      ],
+      "load_after": [
+        4.1201171875,
+        4.2158203125,
+        3.28955078125
+      ],
+      "wall_s": 2.896816066931933,
+      "returncode": 0,
+      "user_s": 1.62,
+      "system_s": 1.18,
+      "rss_kib": 491080.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 533896.0,
+      "voluntary_switches": 222.0,
+      "involuntary_switches": 50.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-github-base-00",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 0,
+      "started": "2026-09-24T15:25:53.824364+00:00",
+      "load_before": [
+        4.1201171875,
+        4.2158203125,
+        3.28955078125
+      ],
+      "load_after": [
+        6.30810546875,
+        4.69482421875,
+        3.46044921875
+      ],
+      "wall_s": 13.549520904198289,
+      "returncode": 0,
+      "user_s": 15.95,
+      "system_s": 10.88,
+      "rss_kib": 1034868.0,
+      "fs_inputs": 16.0,
+      "fs_outputs": 754432.0,
+      "voluntary_switches": 52811.0,
+      "involuntary_switches": 6053.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-github-branch-00",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 0,
+      "started": "2026-09-24T15:26:07.383146+00:00",
+      "load_before": [
+        6.30810546875,
+        4.69482421875,
+        3.46044921875
+      ],
+      "load_after": [
+        5.802734375,
+        4.61669921875,
+        3.44140625
+      ],
+      "wall_s": 9.142993988003582,
+      "returncode": 0,
+      "user_s": 4.42,
+      "system_s": 0.97,
+      "rss_kib": 873488.0,
+      "fs_inputs": 24.0,
+      "fs_outputs": 988280.0,
+      "voluntary_switches": 41081.0,
+      "involuntary_switches": 575.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-path-branch-01",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 1,
+      "started": "2026-09-24T15:26:16.535597+00:00",
+      "load_before": [
+        5.802734375,
+        4.61669921875,
+        3.44140625
+      ],
+      "load_after": [
+        6.05908203125,
+        4.68994140625,
+        3.4716796875
+      ],
+      "wall_s": 2.9843313577584922,
+      "returncode": 0,
+      "user_s": 1.66,
+      "system_s": 4.16,
+      "rss_kib": 485876.0,
+      "fs_inputs": 2000.0,
+      "fs_outputs": 1746536.0,
+      "voluntary_switches": 10550.0,
+      "involuntary_switches": 144.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-path-base-01",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 1,
+      "started": "2026-09-24T15:26:19.529217+00:00",
+      "load_before": [
+        6.05908203125,
+        4.68994140625,
+        3.4716796875
+      ],
+      "load_after": [
+        5.65380859375,
+        4.62841796875,
+        3.4580078125
+      ],
+      "wall_s": 3.668633002322167,
+      "returncode": 0,
+      "user_s": 1.26,
+      "system_s": 2.1,
+      "rss_kib": 455860.0,
+      "fs_inputs": 64.0,
+      "fs_outputs": 1196032.0,
+      "voluntary_switches": 239.0,
+      "involuntary_switches": 70.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-git-base-01",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 1,
+      "started": "2026-09-24T15:26:23.207223+00:00",
+      "load_before": [
+        5.65380859375,
+        4.62841796875,
+        3.4580078125
+      ],
+      "load_after": [
+        5.65380859375,
+        4.62841796875,
+        3.4580078125
+      ],
+      "wall_s": 2.6614349777810276,
+      "returncode": 0,
+      "user_s": 1.55,
+      "system_s": 1.0,
+      "rss_kib": 491080.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 533896.0,
+      "voluntary_switches": 181.0,
+      "involuntary_switches": 70.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-git-branch-01",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 1,
+      "started": "2026-09-24T15:26:25.877952+00:00",
+      "load_before": [
+        5.65380859375,
+        4.62841796875,
+        3.4580078125
+      ],
+      "load_after": [
+        5.28076171875,
+        4.56787109375,
+        3.4443359375
+      ],
+      "wall_s": 2.2133976058103144,
+      "returncode": 0,
+      "user_s": 1.35,
+      "system_s": 1.27,
+      "rss_kib": 494060.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 753280.0,
+      "voluntary_switches": 1265.0,
+      "involuntary_switches": 94.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-github-branch-01",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 1,
+      "started": "2026-09-24T15:26:28.100601+00:00",
+      "load_before": [
+        5.28076171875,
+        4.56787109375,
+        3.4443359375
+      ],
+      "load_after": [
+        4.9375,
+        4.50830078125,
+        3.43115234375
+      ],
+      "wall_s": 3.6114391228184104,
+      "returncode": 0,
+      "user_s": 4.41,
+      "system_s": 0.95,
+      "rss_kib": 966700.0,
+      "fs_inputs": 80.0,
+      "fs_outputs": 988216.0,
+      "voluntary_switches": 79400.0,
+      "involuntary_switches": 193.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-github-base-01",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 1,
+      "started": "2026-09-24T15:26:31.721253+00:00",
+      "load_before": [
+        4.9375,
+        4.50830078125,
+        3.43115234375
+      ],
+      "load_after": [
+        4.6220703125,
+        4.44970703125,
+        3.41796875
+      ],
+      "wall_s": 6.917877391912043,
+      "returncode": 0,
+      "user_s": 15.4,
+      "system_s": 0.99,
+      "rss_kib": 1007300.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 754448.0,
+      "voluntary_switches": 69287.0,
+      "involuntary_switches": 2685.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-path-base-02",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 2,
+      "started": "2026-09-24T15:26:38.648393+00:00",
+      "load_before": [
+        4.6220703125,
+        4.44970703125,
+        3.41796875
+      ],
+      "load_after": [
+        4.33154296875,
+        4.39208984375,
+        3.40478515625
+      ],
+      "wall_s": 3.6766795250587165,
+      "returncode": 0,
+      "user_s": 1.33,
+      "system_s": 2.1,
+      "rss_kib": 455864.0,
+      "fs_inputs": 304.0,
+      "fs_outputs": 1196032.0,
+      "voluntary_switches": 228.0,
+      "involuntary_switches": 71.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-path-branch-02",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 2,
+      "started": "2026-09-24T15:26:42.334300+00:00",
+      "load_before": [
+        4.33154296875,
+        4.39208984375,
+        3.40478515625
+      ],
+      "load_after": [
+        4.33154296875,
+        4.39208984375,
+        3.40478515625
+      ],
+      "wall_s": 3.239906173199415,
+      "returncode": 0,
+      "user_s": 1.78,
+      "system_s": 4.7,
+      "rss_kib": 471536.0,
+      "fs_inputs": 6400.0,
+      "fs_outputs": 1746528.0,
+      "voluntary_switches": 11679.0,
+      "involuntary_switches": 128.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-git-branch-02",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 2,
+      "started": "2026-09-24T15:26:45.583543+00:00",
+      "load_before": [
+        4.33154296875,
+        4.39208984375,
+        3.40478515625
+      ],
+      "load_after": [
+        4.064453125,
+        4.33544921875,
+        3.3916015625
+      ],
+      "wall_s": 2.1638531698845327,
+      "returncode": 0,
+      "user_s": 1.37,
+      "system_s": 1.21,
+      "rss_kib": 496076.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 753280.0,
+      "voluntary_switches": 970.0,
+      "involuntary_switches": 100.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-git-base-02",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 2,
+      "started": "2026-09-24T15:26:47.756816+00:00",
+      "load_before": [
+        4.064453125,
+        4.33544921875,
+        3.3916015625
+      ],
+      "load_after": [
+        4.064453125,
+        4.33544921875,
+        3.3916015625
+      ],
+      "wall_s": 2.7849361882545054,
+      "returncode": 0,
+      "user_s": 1.55,
+      "system_s": 1.08,
+      "rss_kib": 491088.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 533896.0,
+      "voluntary_switches": 228.0,
+      "involuntary_switches": 73.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-github-base-02",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 2,
+      "started": "2026-09-24T15:26:50.551062+00:00",
+      "load_before": [
+        4.064453125,
+        4.33544921875,
+        3.3916015625
+      ],
+      "load_after": [
+        14.3896484375,
+        6.4716796875,
+        4.087890625
+      ],
+      "wall_s": 5.670107059646398,
+      "returncode": 0,
+      "user_s": 15.09,
+      "system_s": 0.86,
+      "rss_kib": 1064108.0,
+      "fs_inputs": 16.0,
+      "fs_outputs": 754544.0,
+      "voluntary_switches": 74982.0,
+      "involuntary_switches": 2597.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-github-branch-02",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 2,
+      "started": "2026-09-24T15:26:56.230575+00:00",
+      "load_before": [
+        14.3896484375,
+        6.4716796875,
+        4.087890625
+      ],
+      "load_after": [
+        13.3974609375,
+        6.39697265625,
+        4.07666015625
+      ],
+      "wall_s": 3.751183243934065,
+      "returncode": 0,
+      "user_s": 4.3,
+      "system_s": 0.93,
+      "rss_kib": 983732.0,
+      "fs_inputs": 24.0,
+      "fs_outputs": 988192.0,
+      "voluntary_switches": 68044.0,
+      "involuntary_switches": 291.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-path-branch-03",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 3,
+      "started": "2026-09-24T15:26:59.991235+00:00",
+      "load_before": [
+        13.3974609375,
+        6.39697265625,
+        4.07666015625
+      ],
+      "load_after": [
+        12.564453125,
+        6.34033203125,
+        4.07080078125
+      ],
+      "wall_s": 3.226349195931107,
+      "returncode": 0,
+      "user_s": 1.8,
+      "system_s": 4.92,
+      "rss_kib": 484008.0,
+      "fs_inputs": 6256.0,
+      "fs_outputs": 1746560.0,
+      "voluntary_switches": 17504.0,
+      "involuntary_switches": 125.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-path-base-03",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 3,
+      "started": "2026-09-24T15:27:03.226982+00:00",
+      "load_before": [
+        12.564453125,
+        6.34033203125,
+        4.07080078125
+      ],
+      "load_after": [
+        11.63818359375,
+        6.25146484375,
+        4.05419921875
+      ],
+      "wall_s": 3.82816612534225,
+      "returncode": 0,
+      "user_s": 1.38,
+      "system_s": 2.17,
+      "rss_kib": 455852.0,
+      "fs_inputs": 488.0,
+      "fs_outputs": 1196032.0,
+      "voluntary_switches": 638.0,
+      "involuntary_switches": 79.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-git-base-03",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 3,
+      "started": "2026-09-24T15:27:07.064460+00:00",
+      "load_before": [
+        11.63818359375,
+        6.25146484375,
+        4.05419921875
+      ],
+      "load_after": [
+        11.63818359375,
+        6.25146484375,
+        4.05419921875
+      ],
+      "wall_s": 2.656188021879643,
+      "returncode": 0,
+      "user_s": 1.57,
+      "system_s": 0.98,
+      "rss_kib": 491072.0,
+      "fs_inputs": 24.0,
+      "fs_outputs": 533896.0,
+      "voluntary_switches": 273.0,
+      "involuntary_switches": 83.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-git-branch-03",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 3,
+      "started": "2026-09-24T15:27:09.729861+00:00",
+      "load_before": [
+        11.63818359375,
+        6.25146484375,
+        4.05419921875
+      ],
+      "load_after": [
+        10.7861328125,
+        6.1640625,
+        4.03759765625
+      ],
+      "wall_s": 2.1918051741085947,
+      "returncode": 0,
+      "user_s": 1.36,
+      "system_s": 1.22,
+      "rss_kib": 492052.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 753280.0,
+      "voluntary_switches": 713.0,
+      "involuntary_switches": 102.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-github-branch-03",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 3,
+      "started": "2026-09-24T15:27:11.930945+00:00",
+      "load_before": [
+        10.7861328125,
+        6.1640625,
+        4.03759765625
+      ],
+      "load_after": [
+        10.7861328125,
+        6.1640625,
+        4.03759765625
+      ],
+      "wall_s": 3.326071009039879,
+      "returncode": 0,
+      "user_s": 4.34,
+      "system_s": 0.91,
+      "rss_kib": 979948.0,
+      "fs_inputs": 24.0,
+      "fs_outputs": 988200.0,
+      "voluntary_switches": 80582.0,
+      "involuntary_switches": 233.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-github-base-03",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 3,
+      "started": "2026-09-24T15:27:15.266486+00:00",
+      "load_before": [
+        10.7861328125,
+        6.1640625,
+        4.03759765625
+      ],
+      "load_after": [
+        9.20751953125,
+        5.97705078125,
+        3.9990234375
+      ],
+      "wall_s": 6.9642617693170905,
+      "returncode": 0,
+      "user_s": 15.57,
+      "system_s": 0.86,
+      "rss_kib": 1085692.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 754328.0,
+      "voluntary_switches": 55128.0,
+      "involuntary_switches": 2707.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-path-base-04",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 4,
+      "started": "2026-09-24T15:27:22.240098+00:00",
+      "load_before": [
+        9.20751953125,
+        5.97705078125,
+        3.9990234375
+      ],
+      "load_after": [
+        9.20751953125,
+        5.97705078125,
+        3.9990234375
+      ],
+      "wall_s": 3.6086554136127234,
+      "returncode": 0,
+      "user_s": 1.24,
+      "system_s": 1.99,
+      "rss_kib": 455860.0,
+      "fs_inputs": 184.0,
+      "fs_outputs": 1196032.0,
+      "voluntary_switches": 661.0,
+      "involuntary_switches": 84.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-path-branch-04",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 4,
+      "started": "2026-09-24T15:27:25.858150+00:00",
+      "load_before": [
+        9.20751953125,
+        5.97705078125,
+        3.9990234375
+      ],
+      "load_after": [
+        8.8701171875,
+        5.96044921875,
+        4.0048828125
+      ],
+      "wall_s": 3.1768587538972497,
+      "returncode": 0,
+      "user_s": 1.8,
+      "system_s": 5.23,
+      "rss_kib": 489816.0,
+      "fs_inputs": 9168.0,
+      "fs_outputs": 1746528.0,
+      "voluntary_switches": 14257.0,
+      "involuntary_switches": 146.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-git-branch-04",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 4,
+      "started": "2026-09-24T15:27:29.044359+00:00",
+      "load_before": [
+        8.8701171875,
+        5.96044921875,
+        4.0048828125
+      ],
+      "load_after": [
+        8.8701171875,
+        5.96044921875,
+        4.0048828125
+      ],
+      "wall_s": 2.2898127771914005,
+      "returncode": 0,
+      "user_s": 1.45,
+      "system_s": 1.25,
+      "rss_kib": 492024.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 753280.0,
+      "voluntary_switches": 1856.0,
+      "involuntary_switches": 92.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-git-base-04",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 4,
+      "started": "2026-09-24T15:27:31.343502+00:00",
+      "load_before": [
+        8.8701171875,
+        5.96044921875,
+        4.0048828125
+      ],
+      "load_after": [
+        8.23974609375,
+        5.8779296875,
+        3.98828125
+      ],
+      "wall_s": 2.8694520220160484,
+      "returncode": 0,
+      "user_s": 1.62,
+      "system_s": 1.15,
+      "rss_kib": 491080.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 533896.0,
+      "voluntary_switches": 701.0,
+      "involuntary_switches": 74.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-github-base-04",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 4,
+      "started": "2026-09-24T15:27:34.222213+00:00",
+      "load_before": [
+        8.23974609375,
+        5.8779296875,
+        3.98828125
+      ],
+      "load_after": [
+        7.73974609375,
+        5.8134765625,
+        3.9775390625
+      ],
+      "wall_s": 6.069642820861191,
+      "returncode": 0,
+      "user_s": 15.58,
+      "system_s": 0.77,
+      "rss_kib": 1042644.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 754248.0,
+      "voluntary_switches": 84226.0,
+      "involuntary_switches": 2740.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "cold-32-github-branch-04",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "cold",
+      "trial": 4,
+      "started": "2026-09-24T15:27:40.301058+00:00",
+      "load_before": [
+        7.73974609375,
+        5.8134765625,
+        3.9775390625
+      ],
+      "load_after": [
+        7.27978515625,
+        5.75,
+        3.966796875
+      ],
+      "wall_s": 3.368591815698892,
+      "returncode": 0,
+      "user_s": 4.36,
+      "system_s": 0.94,
+      "rss_kib": 989880.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 988192.0,
+      "voluntary_switches": 89888.0,
+      "involuntary_switches": 250.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "seed-32-path-base-00",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "seed",
+      "trial": 0,
+      "started": "2026-09-24T15:27:43.678861+00:00",
+      "load_before": [
+        7.27978515625,
+        5.75,
+        3.966796875
+      ],
+      "load_after": [
+        6.85693359375,
+        5.6875,
+        3.9560546875
+      ],
+      "wall_s": 3.685264789033681,
+      "returncode": 0,
+      "user_s": 1.27,
+      "system_s": 1.95,
+      "rss_kib": 455852.0,
+      "fs_inputs": 80.0,
+      "fs_outputs": 1196032.0,
+      "voluntary_switches": 487.0,
+      "involuntary_switches": 80.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "seed-32-path-branch-00",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "seed",
+      "trial": 0,
+      "started": "2026-09-24T15:27:47.373298+00:00",
+      "load_before": [
+        6.85693359375,
+        5.6875,
+        3.9560546875
+      ],
+      "load_after": [
+        6.85693359375,
+        5.6875,
+        3.9560546875
+      ],
+      "wall_s": 2.891615211032331,
+      "returncode": 0,
+      "user_s": 1.71,
+      "system_s": 4.51,
+      "rss_kib": 484004.0,
+      "fs_inputs": 3160.0,
+      "fs_outputs": 1746544.0,
+      "voluntary_switches": 13519.0,
+      "involuntary_switches": 116.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "seed-32-git-base-00",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "seed",
+      "trial": 0,
+      "started": "2026-09-24T15:27:50.274105+00:00",
+      "load_before": [
+        6.85693359375,
+        5.6875,
+        3.9560546875
+      ],
+      "load_after": [
+        6.4677734375,
+        5.6259765625,
+        3.9453125
+      ],
+      "wall_s": 2.7841815343126655,
+      "returncode": 0,
+      "user_s": 1.63,
+      "system_s": 1.06,
+      "rss_kib": 493060.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 533896.0,
+      "voluntary_switches": 636.0,
+      "involuntary_switches": 65.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "seed-32-git-branch-00",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "seed",
+      "trial": 0,
+      "started": "2026-09-24T15:27:53.067642+00:00",
+      "load_before": [
+        6.4677734375,
+        5.6259765625,
+        3.9453125
+      ],
+      "load_after": [
+        6.4677734375,
+        5.6259765625,
+        3.9453125
+      ],
+      "wall_s": 2.2649054368957877,
+      "returncode": 0,
+      "user_s": 1.42,
+      "system_s": 1.25,
+      "rss_kib": 494132.0,
+      "fs_inputs": 16.0,
+      "fs_outputs": 753280.0,
+      "voluntary_switches": 2099.0,
+      "involuntary_switches": 79.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "seed-32-github-base-00",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "seed",
+      "trial": 0,
+      "started": "2026-09-24T15:27:55.341841+00:00",
+      "load_before": [
+        6.4677734375,
+        5.6259765625,
+        3.9453125
+      ],
+      "load_after": [
+        6.00048828125,
+        5.56201171875,
+        3.9521484375
+      ],
+      "wall_s": 12.934518832713366,
+      "returncode": 0,
+      "user_s": 16.09,
+      "system_s": 2.89,
+      "rss_kib": 1007084.0,
+      "fs_inputs": 16.0,
+      "fs_outputs": 754288.0,
+      "voluntary_switches": 82076.0,
+      "involuntary_switches": 3320.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "seed-32-github-branch-00",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "seed",
+      "trial": 0,
+      "started": "2026-09-24T15:28:08.285753+00:00",
+      "load_before": [
+        6.00048828125,
+        5.56201171875,
+        3.9521484375
+      ],
+      "load_after": [
+        5.6123046875,
+        5.4931640625,
+        3.947265625
+      ],
+      "wall_s": 9.452808997128159,
+      "returncode": 0,
+      "user_s": 4.44,
+      "system_s": 0.95,
+      "rss_kib": 806464.0,
+      "fs_inputs": 16.0,
+      "fs_outputs": 988232.0,
+      "voluntary_switches": 81254.0,
+      "involuntary_switches": 1698.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-branch-00",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:17.747617+00:00",
+      "load_before": [
+        5.6123046875,
+        5.4931640625,
+        3.947265625
+      ],
+      "load_after": [
+        5.6123046875,
+        5.4931640625,
+        3.947265625
+      ],
+      "wall_s": 1.4642945313826203,
+      "returncode": 0,
+      "user_s": 1.1,
+      "system_s": 0.84,
+      "rss_kib": 497656.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 656.0,
+      "voluntary_switches": 1139.0,
+      "involuntary_switches": 30.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-base-00",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:19.221210+00:00",
+      "load_before": [
+        5.6123046875,
+        5.4931640625,
+        3.947265625
+      ],
+      "load_after": [
+        5.6123046875,
+        5.4931640625,
+        3.947265625
+      ],
+      "wall_s": 1.4218164831399918,
+      "returncode": 0,
+      "user_s": 0.9,
+      "system_s": 0.46,
+      "rss_kib": 490804.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1168.0,
+      "voluntary_switches": 23.0,
+      "involuntary_switches": 8.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-base-00",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:20.651923+00:00",
+      "load_before": [
+        5.6123046875,
+        5.4931640625,
+        3.947265625
+      ],
+      "load_after": [
+        5.6123046875,
+        5.4931640625,
+        3.947265625
+      ],
+      "wall_s": 0.8087130226194859,
+      "returncode": 0,
+      "user_s": 0.4,
+      "system_s": 0.37,
+      "rss_kib": 260836.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 528.0,
+      "voluntary_switches": 25.0,
+      "involuntary_switches": 7.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-branch-00",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:21.469410+00:00",
+      "load_before": [
+        5.6123046875,
+        5.4931640625,
+        3.947265625
+      ],
+      "load_after": [
+        5.40283203125,
+        5.45166015625,
+        3.94189453125
+      ],
+      "wall_s": 0.7511459300294518,
+      "returncode": 0,
+      "user_s": 0.58,
+      "system_s": 0.71,
+      "rss_kib": 265688.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 288.0,
+      "voluntary_switches": 990.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-base-00",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:22.229358+00:00",
+      "load_before": [
+        5.40283203125,
+        5.45166015625,
+        3.94189453125
+      ],
+      "load_after": [
+        5.40283203125,
+        5.45166015625,
+        3.94189453125
+      ],
+      "wall_s": 0.28453500801697373,
+      "returncode": 0,
+      "user_s": 0.23,
+      "system_s": 0.05,
+      "rss_kib": 201868.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 528.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 5.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-branch-00",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:22.522759+00:00",
+      "load_before": [
+        5.40283203125,
+        5.45166015625,
+        3.94189453125
+      ],
+      "load_after": [
+        5.40283203125,
+        5.45166015625,
+        3.94189453125
+      ],
+      "wall_s": 0.24810682283714414,
+      "returncode": 0,
+      "user_s": 0.21,
+      "system_s": 0.03,
+      "rss_kib": 205768.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 288.0,
+      "voluntary_switches": 25.0,
+      "involuntary_switches": 3.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-branch-00",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:22.779640+00:00",
+      "load_before": [
+        5.40283203125,
+        5.45166015625,
+        3.94189453125
+      ],
+      "load_after": [
+        5.40283203125,
+        5.45166015625,
+        3.94189453125
+      ],
+      "wall_s": 0.7597314431332052,
+      "returncode": 0,
+      "user_s": 0.65,
+      "system_s": 0.1,
+      "rss_kib": 457924.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 656.0,
+      "voluntary_switches": 27.0,
+      "involuntary_switches": 11.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-base-00",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:23.548283+00:00",
+      "load_before": [
+        5.40283203125,
+        5.45166015625,
+        3.94189453125
+      ],
+      "load_after": [
+        5.40283203125,
+        5.45166015625,
+        3.94189453125
+      ],
+      "wall_s": 0.8363633998669684,
+      "returncode": 0,
+      "user_s": 0.7,
+      "system_s": 0.12,
+      "rss_kib": 454372.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1168.0,
+      "voluntary_switches": 24.0,
+      "involuntary_switches": 2.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-base-00",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:24.393674+00:00",
+      "load_before": [
+        5.40283203125,
+        5.45166015625,
+        3.94189453125
+      ],
+      "load_after": [
+        5.2099609375,
+        5.41064453125,
+        3.9365234375
+      ],
+      "wall_s": 3.516879342030734,
+      "returncode": 0,
+      "user_s": 0.57,
+      "system_s": 2.77,
+      "rss_kib": 229608.0,
+      "fs_inputs": 248.0,
+      "fs_outputs": 662560.0,
+      "voluntary_switches": 60.0,
+      "involuntary_switches": 79.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-branch-00",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:27.919636+00:00",
+      "load_before": [
+        5.2099609375,
+        5.41064453125,
+        3.9365234375
+      ],
+      "load_after": [
+        5.2099609375,
+        5.41064453125,
+        3.9365234375
+      ],
+      "wall_s": 0.40639929194003344,
+      "returncode": 0,
+      "user_s": 0.38,
+      "system_s": 0.5,
+      "rss_kib": 214376.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 352.0,
+      "voluntary_switches": 670.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-branch-00",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:28.335176+00:00",
+      "load_before": [
+        5.2099609375,
+        5.41064453125,
+        3.9365234375
+      ],
+      "load_after": [
+        5.2099609375,
+        5.41064453125,
+        3.9365234375
+      ],
+      "wall_s": 0.953429538756609,
+      "returncode": 0,
+      "user_s": 0.84,
+      "system_s": 0.59,
+      "rss_kib": 444740.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 680.0,
+      "voluntary_switches": 599.0,
+      "involuntary_switches": 14.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-base-00",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 0,
+      "started": "2026-09-24T15:28:29.297689+00:00",
+      "load_before": [
+        5.2099609375,
+        5.41064453125,
+        3.9365234375
+      ],
+      "load_after": [
+        4.95263671875,
+        5.35400390625,
+        3.92578125
+      ],
+      "wall_s": 3.9448567894287407,
+      "returncode": 0,
+      "user_s": 0.98,
+      "system_s": 2.77,
+      "rss_kib": 455544.0,
+      "fs_inputs": 24.0,
+      "fs_outputs": 663168.0,
+      "voluntary_switches": 30.0,
+      "involuntary_switches": 69.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-branch-01",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:33.251778+00:00",
+      "load_before": [
+        4.95263671875,
+        5.35400390625,
+        3.92578125
+      ],
+      "load_after": [
+        4.95263671875,
+        5.35400390625,
+        3.92578125
+      ],
+      "wall_s": 0.8023771340958774,
+      "returncode": 0,
+      "user_s": 0.57,
+      "system_s": 0.74,
+      "rss_kib": 267692.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 705.0,
+      "involuntary_switches": 10.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-base-01",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:34.063222+00:00",
+      "load_before": [
+        4.95263671875,
+        5.35400390625,
+        3.92578125
+      ],
+      "load_after": [
+        4.95263671875,
+        5.35400390625,
+        3.92578125
+      ],
+      "wall_s": 0.8523287558928132,
+      "returncode": 0,
+      "user_s": 0.45,
+      "system_s": 0.36,
+      "rss_kib": 260836.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 29.0,
+      "involuntary_switches": 8.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-branch-01",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:34.924664+00:00",
+      "load_before": [
+        4.95263671875,
+        5.35400390625,
+        3.92578125
+      ],
+      "load_after": [
+        4.95263671875,
+        5.35400390625,
+        3.92578125
+      ],
+      "wall_s": 0.3892274061217904,
+      "returncode": 0,
+      "user_s": 0.37,
+      "system_s": 0.5,
+      "rss_kib": 214544.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 320.0,
+      "voluntary_switches": 603.0,
+      "involuntary_switches": 5.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-base-01",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:35.322882+00:00",
+      "load_before": [
+        4.95263671875,
+        5.35400390625,
+        3.92578125
+      ],
+      "load_after": [
+        4.7158203125,
+        5.2978515625,
+        3.9150390625
+      ],
+      "wall_s": 3.4052492599003017,
+      "returncode": 0,
+      "user_s": 0.58,
+      "system_s": 2.66,
+      "rss_kib": 229612.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 662528.0,
+      "voluntary_switches": 111.0,
+      "involuntary_switches": 73.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-branch-01",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:38.737041+00:00",
+      "load_before": [
+        4.7158203125,
+        5.2978515625,
+        3.9150390625
+      ],
+      "load_after": [
+        4.7158203125,
+        5.2978515625,
+        3.9150390625
+      ],
+      "wall_s": 0.2625504583120346,
+      "returncode": 0,
+      "user_s": 0.21,
+      "system_s": 0.04,
+      "rss_kib": 205912.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 288.0,
+      "voluntary_switches": 24.0,
+      "involuntary_switches": 5.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-base-01",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:39.008477+00:00",
+      "load_before": [
+        4.7158203125,
+        5.2978515625,
+        3.9150390625
+      ],
+      "load_after": [
+        4.7158203125,
+        5.2978515625,
+        3.9150390625
+      ],
+      "wall_s": 0.3024231120944023,
+      "returncode": 0,
+      "user_s": 0.24,
+      "system_s": 0.05,
+      "rss_kib": 201860.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 22.0,
+      "involuntary_switches": 7.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-base-01",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:39.319832+00:00",
+      "load_before": [
+        4.7158203125,
+        5.2978515625,
+        3.9150390625
+      ],
+      "load_after": [
+        4.7158203125,
+        5.2978515625,
+        3.9150390625
+      ],
+      "wall_s": 1.4066243851557374,
+      "returncode": 0,
+      "user_s": 0.88,
+      "system_s": 0.47,
+      "rss_kib": 490796.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 23.0,
+      "involuntary_switches": 7.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-branch-01",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:40.735508+00:00",
+      "load_before": [
+        4.7158203125,
+        5.2978515625,
+        3.9150390625
+      ],
+      "load_after": [
+        4.81884765625,
+        5.3095703125,
+        3.92626953125
+      ],
+      "wall_s": 1.4121962930075824,
+      "returncode": 0,
+      "user_s": 1.06,
+      "system_s": 0.85,
+      "rss_kib": 493896.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 806.0,
+      "involuntary_switches": 13.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-base-01",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:42.156990+00:00",
+      "load_before": [
+        4.81884765625,
+        5.3095703125,
+        3.92626953125
+      ],
+      "load_after": [
+        4.81884765625,
+        5.3095703125,
+        3.92626953125
+      ],
+      "wall_s": 4.28282655403018,
+      "returncode": 0,
+      "user_s": 1.06,
+      "system_s": 3.07,
+      "rss_kib": 400344.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 663168.0,
+      "voluntary_switches": 54.0,
+      "involuntary_switches": 90.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-branch-01",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:46.449172+00:00",
+      "load_before": [
+        4.81884765625,
+        5.3095703125,
+        3.92626953125
+      ],
+      "load_after": [
+        4.5927734375,
+        5.25439453125,
+        3.91552734375
+      ],
+      "wall_s": 0.9775109058246017,
+      "returncode": 0,
+      "user_s": 0.84,
+      "system_s": 0.58,
+      "rss_kib": 434404.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 688.0,
+      "voluntary_switches": 1294.0,
+      "involuntary_switches": 15.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-base-01",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:47.435862+00:00",
+      "load_before": [
+        4.5927734375,
+        5.25439453125,
+        3.91552734375
+      ],
+      "load_after": [
+        4.5927734375,
+        5.25439453125,
+        3.91552734375
+      ],
+      "wall_s": 0.8388171656988561,
+      "returncode": 0,
+      "user_s": 0.68,
+      "system_s": 0.15,
+      "rss_kib": 454372.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 19.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-branch-01",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 1,
+      "started": "2026-09-24T15:28:48.283840+00:00",
+      "load_before": [
+        4.5927734375,
+        5.25439453125,
+        3.91552734375
+      ],
+      "load_after": [
+        4.5927734375,
+        5.25439453125,
+        3.91552734375
+      ],
+      "wall_s": 0.7827218919992447,
+      "returncode": 0,
+      "user_s": 0.64,
+      "system_s": 0.13,
+      "rss_kib": 457868.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 25.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-branch-02",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:28:49.075834+00:00",
+      "load_before": [
+        4.5927734375,
+        5.25439453125,
+        3.91552734375
+      ],
+      "load_after": [
+        4.5927734375,
+        5.25439453125,
+        3.91552734375
+      ],
+      "wall_s": 1.306986405979842,
+      "returncode": 0,
+      "user_s": 0.97,
+      "system_s": 0.85,
+      "rss_kib": 494056.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 921.0,
+      "involuntary_switches": 15.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-base-02",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:28:50.392013+00:00",
+      "load_before": [
+        4.5927734375,
+        5.25439453125,
+        3.91552734375
+      ],
+      "load_after": [
+        4.384765625,
+        5.2001953125,
+        3.90478515625
+      ],
+      "wall_s": 1.3616630337201059,
+      "returncode": 0,
+      "user_s": 0.88,
+      "system_s": 0.44,
+      "rss_kib": 490792.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 23.0,
+      "involuntary_switches": 10.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-branch-02",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:28:51.762903+00:00",
+      "load_before": [
+        4.384765625,
+        5.2001953125,
+        3.90478515625
+      ],
+      "load_after": [
+        4.384765625,
+        5.2001953125,
+        3.90478515625
+      ],
+      "wall_s": 0.9190189489163458,
+      "returncode": 0,
+      "user_s": 0.81,
+      "system_s": 0.59,
+      "rss_kib": 440528.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 688.0,
+      "voluntary_switches": 795.0,
+      "involuntary_switches": 8.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-base-02",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:28:52.691255+00:00",
+      "load_before": [
+        4.384765625,
+        5.2001953125,
+        3.90478515625
+      ],
+      "load_after": [
+        4.43408203125,
+        5.19677734375,
+        3.9111328125
+      ],
+      "wall_s": 4.19560207799077,
+      "returncode": 0,
+      "user_s": 1.07,
+      "system_s": 2.93,
+      "rss_kib": 430696.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 663168.0,
+      "voluntary_switches": 29.0,
+      "involuntary_switches": 78.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-base-02",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:28:56.896174+00:00",
+      "load_before": [
+        4.43408203125,
+        5.19677734375,
+        3.9111328125
+      ],
+      "load_after": [
+        4.43408203125,
+        5.19677734375,
+        3.9111328125
+      ],
+      "wall_s": 3.342753479257226,
+      "returncode": 0,
+      "user_s": 0.54,
+      "system_s": 2.58,
+      "rss_kib": 229612.0,
+      "fs_inputs": 16.0,
+      "fs_outputs": 662544.0,
+      "voluntary_switches": 51.0,
+      "involuntary_switches": 78.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-branch-02",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:29:00.247810+00:00",
+      "load_before": [
+        4.43408203125,
+        5.19677734375,
+        3.9111328125
+      ],
+      "load_after": [
+        4.43408203125,
+        5.19677734375,
+        3.9111328125
+      ],
+      "wall_s": 0.3796366499736905,
+      "returncode": 0,
+      "user_s": 0.37,
+      "system_s": 0.49,
+      "rss_kib": 206348.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 336.0,
+      "voluntary_switches": 923.0,
+      "involuntary_switches": 7.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-base-02",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:29:00.636489+00:00",
+      "load_before": [
+        4.43408203125,
+        5.19677734375,
+        3.9111328125
+      ],
+      "load_after": [
+        4.43408203125,
+        5.19677734375,
+        3.9111328125
+      ],
+      "wall_s": 0.2993399421684444,
+      "returncode": 0,
+      "user_s": 0.23,
+      "system_s": 0.05,
+      "rss_kib": 201928.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 30.0,
+      "involuntary_switches": 4.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-branch-02",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:29:00.944663+00:00",
+      "load_before": [
+        4.43408203125,
+        5.19677734375,
+        3.9111328125
+      ],
+      "load_after": [
+        4.43408203125,
+        5.19677734375,
+        3.9111328125
+      ],
+      "wall_s": 0.24765205522999167,
+      "returncode": 0,
+      "user_s": 0.19,
+      "system_s": 0.05,
+      "rss_kib": 205908.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 3.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-base-02",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:29:01.201351+00:00",
+      "load_before": [
+        4.43408203125,
+        5.19677734375,
+        3.9111328125
+      ],
+      "load_after": [
+        4.23876953125,
+        5.1435546875,
+        3.900390625
+      ],
+      "wall_s": 0.9753968669101596,
+      "returncode": 0,
+      "user_s": 0.43,
+      "system_s": 0.35,
+      "rss_kib": 260596.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 22.0,
+      "involuntary_switches": 7.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-branch-02",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:29:02.185902+00:00",
+      "load_before": [
+        4.23876953125,
+        5.1435546875,
+        3.900390625
+      ],
+      "load_after": [
+        4.23876953125,
+        5.1435546875,
+        3.900390625
+      ],
+      "wall_s": 0.8187483032234013,
+      "returncode": 0,
+      "user_s": 0.58,
+      "system_s": 0.72,
+      "rss_kib": 267784.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 649.0,
+      "involuntary_switches": 15.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-branch-02",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:29:03.013597+00:00",
+      "load_before": [
+        4.23876953125,
+        5.1435546875,
+        3.900390625
+      ],
+      "load_after": [
+        4.23876953125,
+        5.1435546875,
+        3.900390625
+      ],
+      "wall_s": 0.8079357529059052,
+      "returncode": 0,
+      "user_s": 0.66,
+      "system_s": 0.13,
+      "rss_kib": 457932.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 656.0,
+      "voluntary_switches": 23.0,
+      "involuntary_switches": 8.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-base-02",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 2,
+      "started": "2026-09-24T15:29:03.830399+00:00",
+      "load_before": [
+        4.23876953125,
+        5.1435546875,
+        3.900390625
+      ],
+      "load_after": [
+        4.23876953125,
+        5.1435546875,
+        3.900390625
+      ],
+      "wall_s": 0.8564940830692649,
+      "returncode": 0,
+      "user_s": 0.7,
+      "system_s": 0.14,
+      "rss_kib": 454376.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1168.0,
+      "voluntary_switches": 22.0,
+      "involuntary_switches": 11.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-base-03",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:04.695821+00:00",
+      "load_before": [
+        4.23876953125,
+        5.1435546875,
+        3.900390625
+      ],
+      "load_after": [
+        4.05908203125,
+        5.09130859375,
+        3.89013671875
+      ],
+      "wall_s": 3.9022096158005297,
+      "returncode": 0,
+      "user_s": 0.96,
+      "system_s": 2.79,
+      "rss_kib": 455544.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 663168.0,
+      "voluntary_switches": 49.0,
+      "involuntary_switches": 28.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-branch-03",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:08.606911+00:00",
+      "load_before": [
+        4.05908203125,
+        5.09130859375,
+        3.89013671875
+      ],
+      "load_after": [
+        4.05908203125,
+        5.09130859375,
+        3.89013671875
+      ],
+      "wall_s": 0.9772228579968214,
+      "returncode": 0,
+      "user_s": 0.84,
+      "system_s": 0.58,
+      "rss_kib": 442356.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 688.0,
+      "voluntary_switches": 583.0,
+      "involuntary_switches": 10.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-branch-03",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:09.592985+00:00",
+      "load_before": [
+        4.05908203125,
+        5.09130859375,
+        3.89013671875
+      ],
+      "load_after": [
+        4.05908203125,
+        5.09130859375,
+        3.89013671875
+      ],
+      "wall_s": 0.2720589693635702,
+      "returncode": 0,
+      "user_s": 0.2,
+      "system_s": 0.06,
+      "rss_kib": 205776.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 19.0,
+      "involuntary_switches": 1.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-base-03",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:09.873814+00:00",
+      "load_before": [
+        4.05908203125,
+        5.09130859375,
+        3.89013671875
+      ],
+      "load_after": [
+        4.05908203125,
+        5.09130859375,
+        3.89013671875
+      ],
+      "wall_s": 0.30581726785749197,
+      "returncode": 0,
+      "user_s": 0.24,
+      "system_s": 0.06,
+      "rss_kib": 201868.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 20.0,
+      "involuntary_switches": 3.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-base-03",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:10.188427+00:00",
+      "load_before": [
+        4.05908203125,
+        5.09130859375,
+        3.89013671875
+      ],
+      "load_after": [
+        4.05908203125,
+        5.09130859375,
+        3.89013671875
+      ],
+      "wall_s": 0.896553625818342,
+      "returncode": 0,
+      "user_s": 0.73,
+      "system_s": 0.15,
+      "rss_kib": 454368.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1168.0,
+      "voluntary_switches": 19.0,
+      "involuntary_switches": 4.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-branch-03",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:11.093947+00:00",
+      "load_before": [
+        4.05908203125,
+        5.09130859375,
+        3.89013671875
+      ],
+      "load_after": [
+        4.21484375,
+        5.1064453125,
+        3.90185546875
+      ],
+      "wall_s": 0.9253173489123583,
+      "returncode": 0,
+      "user_s": 0.68,
+      "system_s": 0.15,
+      "rss_kib": 457784.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 656.0,
+      "voluntary_switches": 30.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-base-03",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:12.028203+00:00",
+      "load_before": [
+        4.21484375,
+        5.1064453125,
+        3.90185546875
+      ],
+      "load_after": [
+        4.21484375,
+        5.1064453125,
+        3.90185546875
+      ],
+      "wall_s": 1.4552425919100642,
+      "returncode": 0,
+      "user_s": 0.93,
+      "system_s": 0.47,
+      "rss_kib": 490832.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 25.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-branch-03",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:13.492583+00:00",
+      "load_before": [
+        4.21484375,
+        5.1064453125,
+        3.90185546875
+      ],
+      "load_after": [
+        4.21484375,
+        5.1064453125,
+        3.90185546875
+      ],
+      "wall_s": 1.3342586499638855,
+      "returncode": 0,
+      "user_s": 1.01,
+      "system_s": 0.82,
+      "rss_kib": 495880.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 787.0,
+      "involuntary_switches": 12.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-branch-03",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:14.835812+00:00",
+      "load_before": [
+        4.21484375,
+        5.1064453125,
+        3.90185546875
+      ],
+      "load_after": [
+        4.21484375,
+        5.1064453125,
+        3.90185546875
+      ],
+      "wall_s": 0.3719210550189018,
+      "returncode": 0,
+      "user_s": 0.38,
+      "system_s": 0.49,
+      "rss_kib": 214656.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 320.0,
+      "voluntary_switches": 775.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-base-03",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:15.216619+00:00",
+      "load_before": [
+        4.21484375,
+        5.1064453125,
+        3.90185546875
+      ],
+      "load_after": [
+        3.95703125,
+        5.0380859375,
+        3.88623046875
+      ],
+      "wall_s": 3.2591363033279777,
+      "returncode": 0,
+      "user_s": 0.51,
+      "system_s": 2.62,
+      "rss_kib": 229612.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 662528.0,
+      "voluntary_switches": 73.0,
+      "involuntary_switches": 77.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-branch-03",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:18.484542+00:00",
+      "load_before": [
+        3.95703125,
+        5.0380859375,
+        3.88623046875
+      ],
+      "load_after": [
+        3.95703125,
+        5.0380859375,
+        3.88623046875
+      ],
+      "wall_s": 0.7593114241026342,
+      "returncode": 0,
+      "user_s": 0.53,
+      "system_s": 0.72,
+      "rss_kib": 273840.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 640.0,
+      "involuntary_switches": 11.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-base-03",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 3,
+      "started": "2026-09-24T15:29:19.252682+00:00",
+      "load_before": [
+        3.95703125,
+        5.0380859375,
+        3.88623046875
+      ],
+      "load_after": [
+        3.95703125,
+        5.0380859375,
+        3.88623046875
+      ],
+      "wall_s": 0.8935746899805963,
+      "returncode": 0,
+      "user_s": 0.41,
+      "system_s": 0.37,
+      "rss_kib": 260852.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 27.0,
+      "involuntary_switches": 5.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-branch-04",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:20.155100+00:00",
+      "load_before": [
+        3.95703125,
+        5.0380859375,
+        3.88623046875
+      ],
+      "load_after": [
+        3.95703125,
+        5.0380859375,
+        3.88623046875
+      ],
+      "wall_s": 0.8090067910961807,
+      "returncode": 0,
+      "user_s": 0.66,
+      "system_s": 0.14,
+      "rss_kib": 457860.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 22.0,
+      "involuntary_switches": 5.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-base-04",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:20.973100+00:00",
+      "load_before": [
+        3.95703125,
+        5.0380859375,
+        3.88623046875
+      ],
+      "load_after": [
+        3.72021484375,
+        4.970703125,
+        3.87060546875
+      ],
+      "wall_s": 0.8106022588908672,
+      "returncode": 0,
+      "user_s": 0.67,
+      "system_s": 0.13,
+      "rss_kib": 454368.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 20.0,
+      "involuntary_switches": 17.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-branch-04",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:21.792745+00:00",
+      "load_before": [
+        3.72021484375,
+        4.970703125,
+        3.87060546875
+      ],
+      "load_after": [
+        3.72021484375,
+        4.970703125,
+        3.87060546875
+      ],
+      "wall_s": 1.2764580161310732,
+      "returncode": 0,
+      "user_s": 0.98,
+      "system_s": 0.8,
+      "rss_kib": 495804.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 656.0,
+      "voluntary_switches": 751.0,
+      "involuntary_switches": 14.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-base-04",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:23.078222+00:00",
+      "load_before": [
+        3.72021484375,
+        4.970703125,
+        3.87060546875
+      ],
+      "load_after": [
+        3.72021484375,
+        4.970703125,
+        3.87060546875
+      ],
+      "wall_s": 1.4115791851654649,
+      "returncode": 0,
+      "user_s": 0.88,
+      "system_s": 0.49,
+      "rss_kib": 490808.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 26.0,
+      "involuntary_switches": 17.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-base-04",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:24.498761+00:00",
+      "load_before": [
+        3.72021484375,
+        4.970703125,
+        3.87060546875
+      ],
+      "load_after": [
+        3.72021484375,
+        4.970703125,
+        3.87060546875
+      ],
+      "wall_s": 0.7974689570255578,
+      "returncode": 0,
+      "user_s": 0.41,
+      "system_s": 0.35,
+      "rss_kib": 260824.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 23.0,
+      "involuntary_switches": 8.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-branch-04",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:25.305058+00:00",
+      "load_before": [
+        3.72021484375,
+        4.970703125,
+        3.87060546875
+      ],
+      "load_after": [
+        3.72021484375,
+        4.970703125,
+        3.87060546875
+      ],
+      "wall_s": 0.772656393237412,
+      "returncode": 0,
+      "user_s": 0.53,
+      "system_s": 0.78,
+      "rss_kib": 267944.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 995.0,
+      "involuntary_switches": 11.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-branch-04",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:26.086547+00:00",
+      "load_before": [
+        3.72021484375,
+        4.970703125,
+        3.87060546875
+      ],
+      "load_after": [
+        3.74267578125,
+        4.9541015625,
+        3.87158203125
+      ],
+      "wall_s": 0.9504699436947703,
+      "returncode": 0,
+      "user_s": 0.81,
+      "system_s": 0.6,
+      "rss_kib": 432264.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 688.0,
+      "voluntary_switches": 1071.0,
+      "involuntary_switches": 7.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-base-04",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:27.045949+00:00",
+      "load_before": [
+        3.74267578125,
+        4.9541015625,
+        3.87158203125
+      ],
+      "load_after": [
+        3.74267578125,
+        4.9541015625,
+        3.87158203125
+      ],
+      "wall_s": 3.7186043630354106,
+      "returncode": 0,
+      "user_s": 1.0,
+      "system_s": 2.6,
+      "rss_kib": 455540.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 663168.0,
+      "voluntary_switches": 36.0,
+      "involuntary_switches": 48.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-base-04",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:30.773529+00:00",
+      "load_before": [
+        3.74267578125,
+        4.9541015625,
+        3.87158203125
+      ],
+      "load_after": [
+        3.74267578125,
+        4.9541015625,
+        3.87158203125
+      ],
+      "wall_s": 0.28619770612567663,
+      "returncode": 0,
+      "user_s": 0.21,
+      "system_s": 0.06,
+      "rss_kib": 202004.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 19.0,
+      "involuntary_switches": 5.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-branch-04",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:31.068494+00:00",
+      "load_before": [
+        3.74267578125,
+        4.9541015625,
+        3.87158203125
+      ],
+      "load_after": [
+        3.74267578125,
+        4.9541015625,
+        3.87158203125
+      ],
+      "wall_s": 0.2516613369807601,
+      "returncode": 0,
+      "user_s": 0.19,
+      "system_s": 0.05,
+      "rss_kib": 205780.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 5.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-base-04",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:31.328896+00:00",
+      "load_before": [
+        3.74267578125,
+        4.9541015625,
+        3.87158203125
+      ],
+      "load_after": [
+        3.52294921875,
+        4.88818359375,
+        3.85595703125
+      ],
+      "wall_s": 3.1692157108336687,
+      "returncode": 0,
+      "user_s": 0.53,
+      "system_s": 2.48,
+      "rss_kib": 229612.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 662544.0,
+      "voluntary_switches": 35.0,
+      "involuntary_switches": 75.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-branch-04",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 4,
+      "started": "2026-09-24T15:29:34.506876+00:00",
+      "load_before": [
+        3.52294921875,
+        4.88818359375,
+        3.85595703125
+      ],
+      "load_after": [
+        3.52294921875,
+        4.88818359375,
+        3.85595703125
+      ],
+      "wall_s": 0.36924254475161433,
+      "returncode": 0,
+      "user_s": 0.37,
+      "system_s": 0.48,
+      "rss_kib": 214608.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 336.0,
+      "voluntary_switches": 655.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-base-05",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:34.884981+00:00",
+      "load_before": [
+        3.52294921875,
+        4.88818359375,
+        3.85595703125
+      ],
+      "load_after": [
+        3.52294921875,
+        4.88818359375,
+        3.85595703125
+      ],
+      "wall_s": 0.8801990100182593,
+      "returncode": 0,
+      "user_s": 0.73,
+      "system_s": 0.14,
+      "rss_kib": 454372.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 12.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-branch-05",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:35.774179+00:00",
+      "load_before": [
+        3.52294921875,
+        4.88818359375,
+        3.85595703125
+      ],
+      "load_after": [
+        3.52294921875,
+        4.88818359375,
+        3.85595703125
+      ],
+      "wall_s": 0.7803835817612708,
+      "returncode": 0,
+      "user_s": 0.62,
+      "system_s": 0.14,
+      "rss_kib": 457920.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-branch-05",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:36.563485+00:00",
+      "load_before": [
+        3.52294921875,
+        4.88818359375,
+        3.85595703125
+      ],
+      "load_after": [
+        3.32080078125,
+        4.8232421875,
+        3.84033203125
+      ],
+      "wall_s": 0.26325661037117243,
+      "returncode": 0,
+      "user_s": 0.2,
+      "system_s": 0.05,
+      "rss_kib": 205892.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 288.0,
+      "voluntary_switches": 26.0,
+      "involuntary_switches": 7.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-base-05",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:36.835608+00:00",
+      "load_before": [
+        3.32080078125,
+        4.8232421875,
+        3.84033203125
+      ],
+      "load_after": [
+        3.32080078125,
+        4.8232421875,
+        3.84033203125
+      ],
+      "wall_s": 0.2866663420572877,
+      "returncode": 0,
+      "user_s": 0.22,
+      "system_s": 0.05,
+      "rss_kib": 201920.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 528.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 5.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-branch-05",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:37.131088+00:00",
+      "load_before": [
+        3.32080078125,
+        4.8232421875,
+        3.84033203125
+      ],
+      "load_after": [
+        3.32080078125,
+        4.8232421875,
+        3.84033203125
+      ],
+      "wall_s": 0.3719103722833097,
+      "returncode": 0,
+      "user_s": 0.36,
+      "system_s": 0.49,
+      "rss_kib": 212432.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 312.0,
+      "voluntary_switches": 702.0,
+      "involuntary_switches": 13.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-base-05",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:37.511856+00:00",
+      "load_before": [
+        3.32080078125,
+        4.8232421875,
+        3.84033203125
+      ],
+      "load_after": [
+        3.32080078125,
+        4.8232421875,
+        3.84033203125
+      ],
+      "wall_s": 3.1941306758672,
+      "returncode": 0,
+      "user_s": 0.47,
+      "system_s": 2.48,
+      "rss_kib": 229604.0,
+      "fs_inputs": 16.0,
+      "fs_outputs": 662528.0,
+      "voluntary_switches": 68.0,
+      "involuntary_switches": 70.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-base-05",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:40.714758+00:00",
+      "load_before": [
+        3.32080078125,
+        4.8232421875,
+        3.84033203125
+      ],
+      "load_after": [
+        3.134765625,
+        4.759765625,
+        3.82470703125
+      ],
+      "wall_s": 3.767970364075154,
+      "returncode": 0,
+      "user_s": 1.01,
+      "system_s": 2.62,
+      "rss_kib": 455540.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 663168.0,
+      "voluntary_switches": 43.0,
+      "involuntary_switches": 88.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-branch-05",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:44.491576+00:00",
+      "load_before": [
+        3.134765625,
+        4.759765625,
+        3.82470703125
+      ],
+      "load_after": [
+        3.134765625,
+        4.759765625,
+        3.82470703125
+      ],
+      "wall_s": 0.9175201831385493,
+      "returncode": 0,
+      "user_s": 0.8,
+      "system_s": 0.6,
+      "rss_kib": 428208.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 688.0,
+      "voluntary_switches": 598.0,
+      "involuntary_switches": 14.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-base-05",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:45.418104+00:00",
+      "load_before": [
+        3.134765625,
+        4.759765625,
+        3.82470703125
+      ],
+      "load_after": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "wall_s": 1.367729367222637,
+      "returncode": 0,
+      "user_s": 0.85,
+      "system_s": 0.46,
+      "rss_kib": 490804.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 41.0,
+      "involuntary_switches": 16.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-branch-05",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:46.794888+00:00",
+      "load_before": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "load_after": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "wall_s": 1.3049018098972738,
+      "returncode": 0,
+      "user_s": 1.0,
+      "system_s": 0.82,
+      "rss_kib": 491748.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 725.0,
+      "involuntary_switches": 12.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-branch-05",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:48.108820+00:00",
+      "load_before": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "load_after": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "wall_s": 0.8105110032483935,
+      "returncode": 0,
+      "user_s": 0.57,
+      "system_s": 0.75,
+      "rss_kib": 267956.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 288.0,
+      "voluntary_switches": 727.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-base-05",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 5,
+      "started": "2026-09-24T15:29:48.928135+00:00",
+      "load_before": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "load_after": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "wall_s": 0.8074146090075374,
+      "returncode": 0,
+      "user_s": 0.41,
+      "system_s": 0.36,
+      "rss_kib": 260828.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 26.0,
+      "involuntary_switches": 9.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-branch-06",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:29:49.744381+00:00",
+      "load_before": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "load_after": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "wall_s": 0.7794092278927565,
+      "returncode": 0,
+      "user_s": 0.63,
+      "system_s": 0.14,
+      "rss_kib": 457868.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 19.0,
+      "involuntary_switches": 8.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-base-06",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:29:50.532814+00:00",
+      "load_before": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "load_after": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "wall_s": 0.8371891789138317,
+      "returncode": 0,
+      "user_s": 0.69,
+      "system_s": 0.14,
+      "rss_kib": 454372.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 22.0,
+      "involuntary_switches": 10.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-branch-06",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:29:51.378994+00:00",
+      "load_before": [
+        3.04345703125,
+        4.7138671875,
+        3.814453125
+      ],
+      "load_after": [
+        2.87939453125,
+        4.65185546875,
+        3.79931640625
+      ],
+      "wall_s": 1.2912870505824685,
+      "returncode": 0,
+      "user_s": 0.96,
+      "system_s": 0.84,
+      "rss_kib": 493956.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 655.0,
+      "involuntary_switches": 21.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-base-06",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:29:52.679290+00:00",
+      "load_before": [
+        2.87939453125,
+        4.65185546875,
+        3.79931640625
+      ],
+      "load_after": [
+        2.87939453125,
+        4.65185546875,
+        3.79931640625
+      ],
+      "wall_s": 1.4079207056201994,
+      "returncode": 0,
+      "user_s": 0.89,
+      "system_s": 0.47,
+      "rss_kib": 490812.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 24.0,
+      "involuntary_switches": 19.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-base-06",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:29:54.096209+00:00",
+      "load_before": [
+        2.87939453125,
+        4.65185546875,
+        3.79931640625
+      ],
+      "load_after": [
+        2.87939453125,
+        4.65185546875,
+        3.79931640625
+      ],
+      "wall_s": 0.2911747773177922,
+      "returncode": 0,
+      "user_s": 0.23,
+      "system_s": 0.05,
+      "rss_kib": 201992.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 19.0,
+      "involuntary_switches": 2.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-branch-06",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:29:54.396210+00:00",
+      "load_before": [
+        2.87939453125,
+        4.65185546875,
+        3.79931640625
+      ],
+      "load_after": [
+        2.87939453125,
+        4.65185546875,
+        3.79931640625
+      ],
+      "wall_s": 0.26364820823073387,
+      "returncode": 0,
+      "user_s": 0.2,
+      "system_s": 0.05,
+      "rss_kib": 205776.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 22.0,
+      "involuntary_switches": 3.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-branch-06",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:29:54.668726+00:00",
+      "load_before": [
+        2.87939453125,
+        4.65185546875,
+        3.79931640625
+      ],
+      "load_after": [
+        2.87939453125,
+        4.65185546875,
+        3.79931640625
+      ],
+      "wall_s": 0.9502708949148655,
+      "returncode": 0,
+      "user_s": 0.81,
+      "system_s": 0.59,
+      "rss_kib": 432416.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 688.0,
+      "voluntary_switches": 642.0,
+      "involuntary_switches": 22.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-base-06",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:29:55.628562+00:00",
+      "load_before": [
+        2.87939453125,
+        4.65185546875,
+        3.79931640625
+      ],
+      "load_after": [
+        2.80859375,
+        4.607421875,
+        3.78955078125
+      ],
+      "wall_s": 3.9165710699744523,
+      "returncode": 0,
+      "user_s": 1.01,
+      "system_s": 2.76,
+      "rss_kib": 455536.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 663168.0,
+      "voluntary_switches": 40.0,
+      "involuntary_switches": 93.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-base-06",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:29:59.554019+00:00",
+      "load_before": [
+        2.80859375,
+        4.607421875,
+        3.78955078125
+      ],
+      "load_after": [
+        2.80859375,
+        4.607421875,
+        3.78955078125
+      ],
+      "wall_s": 0.8503045463003218,
+      "returncode": 0,
+      "user_s": 0.43,
+      "system_s": 0.38,
+      "rss_kib": 260832.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 33.0,
+      "involuntary_switches": 10.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-branch-06",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:30:00.413325+00:00",
+      "load_before": [
+        2.80859375,
+        4.607421875,
+        3.78955078125
+      ],
+      "load_after": [
+        2.80859375,
+        4.607421875,
+        3.78955078125
+      ],
+      "wall_s": 0.8763065049424767,
+      "returncode": 0,
+      "user_s": 0.58,
+      "system_s": 0.71,
+      "rss_kib": 267820.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 701.0,
+      "involuntary_switches": 8.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-base-06",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:30:01.298493+00:00",
+      "load_before": [
+        2.80859375,
+        4.607421875,
+        3.78955078125
+      ],
+      "load_after": [
+        2.82421875,
+        4.58056640625,
+        3.78515625
+      ],
+      "wall_s": 3.281226897146553,
+      "returncode": 0,
+      "user_s": 0.56,
+      "system_s": 2.53,
+      "rss_kib": 229396.0,
+      "fs_inputs": 8.0,
+      "fs_outputs": 662528.0,
+      "voluntary_switches": 33.0,
+      "involuntary_switches": 59.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-branch-06",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 6,
+      "started": "2026-09-24T15:30:04.588623+00:00",
+      "load_before": [
+        2.82421875,
+        4.58056640625,
+        3.78515625
+      ],
+      "load_after": [
+        2.82421875,
+        4.58056640625,
+        3.78515625
+      ],
+      "wall_s": 0.39949044305831194,
+      "returncode": 0,
+      "user_s": 0.39,
+      "system_s": 0.47,
+      "rss_kib": 214052.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 320.0,
+      "voluntary_switches": 615.0,
+      "involuntary_switches": 8.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-base-07",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:04.997207+00:00",
+      "load_before": [
+        2.82421875,
+        4.58056640625,
+        3.78515625
+      ],
+      "load_after": [
+        2.99853515625,
+        4.587890625,
+        3.7919921875
+      ],
+      "wall_s": 4.084906774107367,
+      "returncode": 0,
+      "user_s": 1.02,
+      "system_s": 2.85,
+      "rss_kib": 452468.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 663184.0,
+      "voluntary_switches": 39.0,
+      "involuntary_switches": 89.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-branch-07",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:09.091095+00:00",
+      "load_before": [
+        2.99853515625,
+        4.587890625,
+        3.7919921875
+      ],
+      "load_after": [
+        2.99853515625,
+        4.587890625,
+        3.7919921875
+      ],
+      "wall_s": 0.9467422892339528,
+      "returncode": 0,
+      "user_s": 0.82,
+      "system_s": 0.62,
+      "rss_kib": 434388.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 704.0,
+      "voluntary_switches": 1502.0,
+      "involuntary_switches": 26.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-branch-07",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:10.046939+00:00",
+      "load_before": [
+        2.99853515625,
+        4.587890625,
+        3.7919921875
+      ],
+      "load_after": [
+        2.99853515625,
+        4.587890625,
+        3.7919921875
+      ],
+      "wall_s": 0.7874068459495902,
+      "returncode": 0,
+      "user_s": 0.61,
+      "system_s": 0.69,
+      "rss_kib": 267776.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 783.0,
+      "involuntary_switches": 14.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-base-07",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:10.843249+00:00",
+      "load_before": [
+        2.99853515625,
+        4.587890625,
+        3.7919921875
+      ],
+      "load_after": [
+        2.99853515625,
+        4.587890625,
+        3.7919921875
+      ],
+      "wall_s": 0.8293715808540583,
+      "returncode": 0,
+      "user_s": 0.45,
+      "system_s": 0.35,
+      "rss_kib": 260844.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 22.0,
+      "involuntary_switches": 9.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-branch-07",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:11.681599+00:00",
+      "load_before": [
+        2.99853515625,
+        4.587890625,
+        3.7919921875
+      ],
+      "load_after": [
+        3.2392578125,
+        4.61181640625,
+        3.80419921875
+      ],
+      "wall_s": 0.41327399434521794,
+      "returncode": 0,
+      "user_s": 0.38,
+      "system_s": 0.48,
+      "rss_kib": 204304.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 312.0,
+      "voluntary_switches": 528.0,
+      "involuntary_switches": 4.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-base-07",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:12.103792+00:00",
+      "load_before": [
+        3.2392578125,
+        4.61181640625,
+        3.80419921875
+      ],
+      "load_after": [
+        3.2392578125,
+        4.61181640625,
+        3.80419921875
+      ],
+      "wall_s": 3.2880684630945325,
+      "returncode": 0,
+      "user_s": 0.54,
+      "system_s": 2.62,
+      "rss_kib": 229420.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 662528.0,
+      "voluntary_switches": 66.0,
+      "involuntary_switches": 82.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-base-07",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:15.400883+00:00",
+      "load_before": [
+        3.2392578125,
+        4.61181640625,
+        3.80419921875
+      ],
+      "load_after": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "wall_s": 1.395064757205546,
+      "returncode": 0,
+      "user_s": 0.89,
+      "system_s": 0.46,
+      "rss_kib": 490812.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 23.0,
+      "involuntary_switches": 17.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-branch-07",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:16.805001+00:00",
+      "load_before": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "load_after": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "wall_s": 1.279575880151242,
+      "returncode": 0,
+      "user_s": 0.97,
+      "system_s": 0.82,
+      "rss_kib": 498124.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 645.0,
+      "involuntary_switches": 10.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-branch-07",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:18.093758+00:00",
+      "load_before": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "load_after": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "wall_s": 0.2565557179041207,
+      "returncode": 0,
+      "user_s": 0.19,
+      "system_s": 0.05,
+      "rss_kib": 205892.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 22.0,
+      "involuntary_switches": 1.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-base-07",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:18.359239+00:00",
+      "load_before": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "load_after": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "wall_s": 0.2894743140786886,
+      "returncode": 0,
+      "user_s": 0.22,
+      "system_s": 0.06,
+      "rss_kib": 202004.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-base-07",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:18.657662+00:00",
+      "load_before": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "load_after": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "wall_s": 0.881895903032273,
+      "returncode": 0,
+      "user_s": 0.67,
+      "system_s": 0.14,
+      "rss_kib": 454372.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1168.0,
+      "voluntary_switches": 28.0,
+      "involuntary_switches": 12.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-branch-07",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 7,
+      "started": "2026-09-24T15:30:19.548624+00:00",
+      "load_before": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "load_after": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "wall_s": 0.8310226062312722,
+      "returncode": 0,
+      "user_s": 0.67,
+      "system_s": 0.15,
+      "rss_kib": 457924.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 8.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-branch-08",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:20.388701+00:00",
+      "load_before": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "load_after": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "wall_s": 0.7824539737775922,
+      "returncode": 0,
+      "user_s": 0.62,
+      "system_s": 0.15,
+      "rss_kib": 457932.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 656.0,
+      "voluntary_switches": 29.0,
+      "involuntary_switches": 12.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-base-08",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:21.180273+00:00",
+      "load_before": [
+        3.0595703125,
+        4.5517578125,
+        3.7890625
+      ],
+      "load_after": [
+        2.89453125,
+        4.49267578125,
+        3.77392578125
+      ],
+      "wall_s": 0.8666560389101505,
+      "returncode": 0,
+      "user_s": 0.69,
+      "system_s": 0.16,
+      "rss_kib": 454364.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 20.0,
+      "involuntary_switches": 15.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-branch-08",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:22.055951+00:00",
+      "load_before": [
+        2.89453125,
+        4.49267578125,
+        3.77392578125
+      ],
+      "load_after": [
+        2.89453125,
+        4.49267578125,
+        3.77392578125
+      ],
+      "wall_s": 1.3675599503330886,
+      "returncode": 0,
+      "user_s": 1.06,
+      "system_s": 0.82,
+      "rss_kib": 492004.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 1200.0,
+      "involuntary_switches": 15.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-base-08",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:23.432606+00:00",
+      "load_before": [
+        2.89453125,
+        4.49267578125,
+        3.77392578125
+      ],
+      "load_after": [
+        2.89453125,
+        4.49267578125,
+        3.77392578125
+      ],
+      "wall_s": 1.4279102669097483,
+      "returncode": 0,
+      "user_s": 0.9,
+      "system_s": 0.47,
+      "rss_kib": 490808.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 23.0,
+      "involuntary_switches": 12.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-base-08",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:24.869550+00:00",
+      "load_before": [
+        2.89453125,
+        4.49267578125,
+        3.77392578125
+      ],
+      "load_after": [
+        2.89453125,
+        4.49267578125,
+        3.77392578125
+      ],
+      "wall_s": 0.8306418447755277,
+      "returncode": 0,
+      "user_s": 0.42,
+      "system_s": 0.37,
+      "rss_kib": 260840.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 528.0,
+      "voluntary_switches": 22.0,
+      "involuntary_switches": 12.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-branch-08",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:25.709057+00:00",
+      "load_before": [
+        2.89453125,
+        4.49267578125,
+        3.77392578125
+      ],
+      "load_after": [
+        2.89453125,
+        4.49267578125,
+        3.77392578125
+      ],
+      "wall_s": 0.7657289621420205,
+      "returncode": 0,
+      "user_s": 0.55,
+      "system_s": 0.73,
+      "rss_kib": 265708.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 288.0,
+      "voluntary_switches": 722.0,
+      "involuntary_switches": 4.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-base-08",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:26.483714+00:00",
+      "load_before": [
+        2.89453125,
+        4.49267578125,
+        3.77392578125
+      ],
+      "load_after": [
+        2.74267578125,
+        4.4345703125,
+        3.7587890625
+      ],
+      "wall_s": 3.0938450121320784,
+      "returncode": 0,
+      "user_s": 0.5,
+      "system_s": 2.47,
+      "rss_kib": 229612.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 662528.0,
+      "voluntary_switches": 39.0,
+      "involuntary_switches": 74.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-branch-08",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:29.586505+00:00",
+      "load_before": [
+        2.74267578125,
+        4.4345703125,
+        3.7587890625
+      ],
+      "load_after": [
+        2.74267578125,
+        4.4345703125,
+        3.7587890625
+      ],
+      "wall_s": 0.3890611557289958,
+      "returncode": 0,
+      "user_s": 0.38,
+      "system_s": 0.47,
+      "rss_kib": 206408.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 320.0,
+      "voluntary_switches": 688.0,
+      "involuntary_switches": 6.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-branch-08",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:29.984519+00:00",
+      "load_before": [
+        2.74267578125,
+        4.4345703125,
+        3.7587890625
+      ],
+      "load_after": [
+        2.74267578125,
+        4.4345703125,
+        3.7587890625
+      ],
+      "wall_s": 1.0294160596095026,
+      "returncode": 0,
+      "user_s": 0.79,
+      "system_s": 0.57,
+      "rss_kib": 440792.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 680.0,
+      "voluntary_switches": 782.0,
+      "involuntary_switches": 13.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-base-08",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:31.023093+00:00",
+      "load_before": [
+        2.74267578125,
+        4.4345703125,
+        3.7587890625
+      ],
+      "load_after": [
+        2.60302734375,
+        4.37744140625,
+        3.74365234375
+      ],
+      "wall_s": 3.922258824110031,
+      "returncode": 0,
+      "user_s": 0.99,
+      "system_s": 2.72,
+      "rss_kib": 455540.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 663168.0,
+      "voluntary_switches": 44.0,
+      "involuntary_switches": 91.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-base-08",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:34.954430+00:00",
+      "load_before": [
+        2.60302734375,
+        4.37744140625,
+        3.74365234375
+      ],
+      "load_after": [
+        2.60302734375,
+        4.37744140625,
+        3.74365234375
+      ],
+      "wall_s": 0.2879008469171822,
+      "returncode": 0,
+      "user_s": 0.22,
+      "system_s": 0.05,
+      "rss_kib": 202004.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 1.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-branch-08",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 8,
+      "started": "2026-09-24T15:30:35.251226+00:00",
+      "load_before": [
+        2.60302734375,
+        4.37744140625,
+        3.74365234375
+      ],
+      "load_after": [
+        2.60302734375,
+        4.37744140625,
+        3.74365234375
+      ],
+      "wall_s": 0.26744568021968007,
+      "returncode": 0,
+      "user_s": 0.2,
+      "system_s": 0.06,
+      "rss_kib": 205776.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 4.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-branch-09",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:35.527707+00:00",
+      "load_before": [
+        2.60302734375,
+        4.37744140625,
+        3.74365234375
+      ],
+      "load_after": [
+        2.60302734375,
+        4.37744140625,
+        3.74365234375
+      ],
+      "wall_s": 0.41664990363642573,
+      "returncode": 0,
+      "user_s": 0.38,
+      "system_s": 0.49,
+      "rss_kib": 210424.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 320.0,
+      "voluntary_switches": 676.0,
+      "involuntary_switches": 10.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-path-base-09",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:35.953282+00:00",
+      "load_before": [
+        2.60302734375,
+        4.37744140625,
+        3.74365234375
+      ],
+      "load_after": [
+        2.5546875,
+        4.337890625,
+        3.73388671875
+      ],
+      "wall_s": 3.3026979179121554,
+      "returncode": 0,
+      "user_s": 0.56,
+      "system_s": 2.56,
+      "rss_kib": 229696.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 662528.0,
+      "voluntary_switches": 37.0,
+      "involuntary_switches": 91.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-base-09",
+      "label": "base",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:39.264897+00:00",
+      "load_before": [
+        2.5546875,
+        4.337890625,
+        3.73388671875
+      ],
+      "load_after": [
+        2.43017578125,
+        4.2822265625,
+        3.71875
+      ],
+      "wall_s": 3.7780875312164426,
+      "returncode": 0,
+      "user_s": 0.96,
+      "system_s": 2.62,
+      "rss_kib": 455540.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 663184.0,
+      "voluntary_switches": 39.0,
+      "involuntary_switches": 89.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-path-branch-09",
+      "label": "branch",
+      "scheme": "path",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:43.052040+00:00",
+      "load_before": [
+        2.43017578125,
+        4.2822265625,
+        3.71875
+      ],
+      "load_after": [
+        2.43017578125,
+        4.2822265625,
+        3.71875
+      ],
+      "wall_s": 0.9210935668088496,
+      "returncode": 0,
+      "user_s": 0.8,
+      "system_s": 0.57,
+      "rss_kib": 438188.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 704.0,
+      "voluntary_switches": 606.0,
+      "involuntary_switches": 13.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-base-09",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:43.982343+00:00",
+      "load_before": [
+        2.43017578125,
+        4.2822265625,
+        3.71875
+      ],
+      "load_after": [
+        2.43017578125,
+        4.2822265625,
+        3.71875
+      ],
+      "wall_s": 0.8235457893460989,
+      "returncode": 0,
+      "user_s": 0.67,
+      "system_s": 0.14,
+      "rss_kib": 454368.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 20.0,
+      "involuntary_switches": 9.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-github-branch-09",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:44.814907+00:00",
+      "load_before": [
+        2.43017578125,
+        4.2822265625,
+        3.71875
+      ],
+      "load_after": [
+        2.43017578125,
+        4.2822265625,
+        3.71875
+      ],
+      "wall_s": 0.7716500461101532,
+      "returncode": 0,
+      "user_s": 0.65,
+      "system_s": 0.11,
+      "rss_kib": 457940.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 24.0,
+      "involuntary_switches": 14.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-base-09",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:45.595740+00:00",
+      "load_before": [
+        2.43017578125,
+        4.2822265625,
+        3.71875
+      ],
+      "load_after": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "wall_s": 1.609668442979455,
+      "returncode": 0,
+      "user_s": 0.87,
+      "system_s": 0.5,
+      "rss_kib": 490816.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 1176.0,
+      "voluntary_switches": 29.0,
+      "involuntary_switches": 11.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "ce497e198296ab425c03144dec8f2fca9029f0d5d2df3970dea7f3334be210a0",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-32-git-branch-09",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 32,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:47.214386+00:00",
+      "load_before": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "load_after": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "wall_s": 1.5185143030248582,
+      "returncode": 0,
+      "user_s": 1.05,
+      "system_s": 0.83,
+      "rss_kib": 493984.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 664.0,
+      "voluntary_switches": 847.0,
+      "involuntary_switches": 11.0,
+      "semantic_sha256": "b0309d89d5799a991c5489550f7a05bc1e98b8ca846c41fe240668e6ee9f5529",
+      "output_sha256": "a6d9f532302261947a34527a42e97636939a2e3062d725a22d9fde273468ffb2",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-branch-09",
+      "label": "branch",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:48.741922+00:00",
+      "load_before": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "load_after": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "wall_s": 0.7724172179587185,
+      "returncode": 0,
+      "user_s": 0.56,
+      "system_s": 0.76,
+      "rss_kib": 265720.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 288.0,
+      "voluntary_switches": 1009.0,
+      "involuntary_switches": 11.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-git-base-09",
+      "label": "base",
+      "scheme": "git",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:49.523311+00:00",
+      "load_before": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "load_after": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "wall_s": 0.8130247709341347,
+      "returncode": 0,
+      "user_s": 0.41,
+      "system_s": 0.36,
+      "rss_kib": 260836.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 25.0,
+      "involuntary_switches": 9.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-branch-09",
+      "label": "branch",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:50.345202+00:00",
+      "load_before": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "load_after": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "wall_s": 0.26552308490499854,
+      "returncode": 0,
+      "user_s": 0.21,
+      "system_s": 0.05,
+      "rss_kib": 205780.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 296.0,
+      "voluntary_switches": 24.0,
+      "involuntary_switches": 4.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "d1496e456ff1c453dbee384a1325de3a84eafd3fc6a86c4f061fc2fccaf30a15",
+      "derivation_files": 3140
+    },
+    {
+      "id": "warm-8-github-base-09",
+      "label": "base",
+      "scheme": "github",
+      "attributes": 8,
+      "phase": "warm",
+      "trial": 9,
+      "started": "2026-09-24T15:30:50.619605+00:00",
+      "load_before": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "load_after": [
+        2.3955078125,
+        4.244140625,
+        3.70947265625
+      ],
+      "wall_s": 0.30382276931777596,
+      "returncode": 0,
+      "user_s": 0.23,
+      "system_s": 0.06,
+      "rss_kib": 201996.0,
+      "fs_inputs": 0.0,
+      "fs_outputs": 536.0,
+      "voluntary_switches": 21.0,
+      "involuntary_switches": 4.0,
+      "semantic_sha256": "2ba6657332f9af9f591b08c5efac28bf7455f3cf279d8c81718161677ec72276",
+      "output_sha256": "bc65ed0809f231e8c5292295803111af4fdd483d510fdc981cfc4880433a4b64",
+      "derivation_files": 3140
+    }
+  ],
+  "store_graph_validation": {
+    "started": "2026-09-24T15:30:51.007026+00:00",
+    "finished": "2026-09-24T15:32:45.593764+00:00",
+    "checker_sha256": "ab6accc31481fe407753f8b37ac1ea5f931ae8733a8b0f8a900dbf9d82167c78",
+    "snapshot_sha256": "048a184950a20e379333de550b3b35dbdef18c2b55e33727171ab8d62c33c001",
+    "store_pairs": 18,
+    "timing_samples": 156,
+    "results": [
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-branch-00/root",
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-base-00/root"
+          },
+          "sample_ids": [
+            "cold-32-git-branch-00",
+            "cold-32-git-base-00"
+          ]
+        },
+        "case": "cold-32-git-00",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-base-00/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-branch-00/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-git-00.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "git"
+        ],
+        "mapping_artifact_sha256": "edba7b48431816382b6e96aa59eed9d811b0454d0fd95e4878c1b7617b4f0e01"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-base-01/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-branch-01/root"
+          },
+          "sample_ids": [
+            "cold-32-git-base-01",
+            "cold-32-git-branch-01"
+          ]
+        },
+        "case": "cold-32-git-01",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-base-01/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-branch-01/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-git-01.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "git"
+        ],
+        "mapping_artifact_sha256": "edba7b48431816382b6e96aa59eed9d811b0454d0fd95e4878c1b7617b4f0e01"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-branch-02/root",
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-base-02/root"
+          },
+          "sample_ids": [
+            "cold-32-git-branch-02",
+            "cold-32-git-base-02"
+          ]
+        },
+        "case": "cold-32-git-02",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-base-02/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-branch-02/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-git-02.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "git"
+        ],
+        "mapping_artifact_sha256": "edba7b48431816382b6e96aa59eed9d811b0454d0fd95e4878c1b7617b4f0e01"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-base-03/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-branch-03/root"
+          },
+          "sample_ids": [
+            "cold-32-git-base-03",
+            "cold-32-git-branch-03"
+          ]
+        },
+        "case": "cold-32-git-03",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-base-03/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-branch-03/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-git-03.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "git"
+        ],
+        "mapping_artifact_sha256": "edba7b48431816382b6e96aa59eed9d811b0454d0fd95e4878c1b7617b4f0e01"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-branch-04/root",
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-base-04/root"
+          },
+          "sample_ids": [
+            "cold-32-git-branch-04",
+            "cold-32-git-base-04"
+          ]
+        },
+        "case": "cold-32-git-04",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-base-04/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-git-branch-04/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-git-04.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "git"
+        ],
+        "mapping_artifact_sha256": "edba7b48431816382b6e96aa59eed9d811b0454d0fd95e4878c1b7617b4f0e01"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-base-00/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-branch-00/root"
+          },
+          "sample_ids": [
+            "cold-32-github-base-00",
+            "cold-32-github-branch-00"
+          ]
+        },
+        "case": "cold-32-github-00",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-base-00/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-branch-00/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-github-00.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "github"
+        ],
+        "mapping_artifact_sha256": "edba7b48431816382b6e96aa59eed9d811b0454d0fd95e4878c1b7617b4f0e01"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-branch-01/root",
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-base-01/root"
+          },
+          "sample_ids": [
+            "cold-32-github-branch-01",
+            "cold-32-github-base-01"
+          ]
+        },
+        "case": "cold-32-github-01",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-base-01/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-branch-01/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-github-01.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "github"
+        ],
+        "mapping_artifact_sha256": "edba7b48431816382b6e96aa59eed9d811b0454d0fd95e4878c1b7617b4f0e01"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-base-02/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-branch-02/root"
+          },
+          "sample_ids": [
+            "cold-32-github-base-02",
+            "cold-32-github-branch-02"
+          ]
+        },
+        "case": "cold-32-github-02",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-base-02/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-branch-02/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-github-02.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "github"
+        ],
+        "mapping_artifact_sha256": "edba7b48431816382b6e96aa59eed9d811b0454d0fd95e4878c1b7617b4f0e01"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-branch-03/root",
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-base-03/root"
+          },
+          "sample_ids": [
+            "cold-32-github-branch-03",
+            "cold-32-github-base-03"
+          ]
+        },
+        "case": "cold-32-github-03",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-base-03/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-branch-03/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-github-03.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "github"
+        ],
+        "mapping_artifact_sha256": "edba7b48431816382b6e96aa59eed9d811b0454d0fd95e4878c1b7617b4f0e01"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-base-04/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-branch-04/root"
+          },
+          "sample_ids": [
+            "cold-32-github-base-04",
+            "cold-32-github-branch-04"
+          ]
+        },
+        "case": "cold-32-github-04",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-base-04/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-github-branch-04/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-github-04.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "github"
+        ],
+        "mapping_artifact_sha256": "edba7b48431816382b6e96aa59eed9d811b0454d0fd95e4878c1b7617b4f0e01"
+      },
+      {
+        "paths": 3694,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-base-00/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-branch-00/root"
+          },
+          "sample_ids": [
+            "cold-32-path-base-00",
+            "cold-32-path-branch-00"
+          ]
+        },
+        "case": "cold-32-path-00",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-base-00/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-branch-00/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-path-00.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "path"
+        ],
+        "mapping_artifact_sha256": "9b5d7dffa7578ee11feef39ff4e645c8b0140cca1ba5a838cbd7275d76dfeb8f"
+      },
+      {
+        "paths": 3694,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-branch-01/root",
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-base-01/root"
+          },
+          "sample_ids": [
+            "cold-32-path-branch-01",
+            "cold-32-path-base-01"
+          ]
+        },
+        "case": "cold-32-path-01",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-base-01/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-branch-01/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-path-01.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "path"
+        ],
+        "mapping_artifact_sha256": "9b5d7dffa7578ee11feef39ff4e645c8b0140cca1ba5a838cbd7275d76dfeb8f"
+      },
+      {
+        "paths": 3694,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-base-02/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-branch-02/root"
+          },
+          "sample_ids": [
+            "cold-32-path-base-02",
+            "cold-32-path-branch-02"
+          ]
+        },
+        "case": "cold-32-path-02",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-base-02/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-branch-02/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-path-02.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "path"
+        ],
+        "mapping_artifact_sha256": "9b5d7dffa7578ee11feef39ff4e645c8b0140cca1ba5a838cbd7275d76dfeb8f"
+      },
+      {
+        "paths": 3694,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-branch-03/root",
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-base-03/root"
+          },
+          "sample_ids": [
+            "cold-32-path-branch-03",
+            "cold-32-path-base-03"
+          ]
+        },
+        "case": "cold-32-path-03",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-base-03/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-branch-03/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-path-03.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "path"
+        ],
+        "mapping_artifact_sha256": "9b5d7dffa7578ee11feef39ff4e645c8b0140cca1ba5a838cbd7275d76dfeb8f"
+      },
+      {
+        "paths": 3694,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 1,
+          "samples": 2,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-base-04/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-branch-04/root"
+          },
+          "sample_ids": [
+            "cold-32-path-base-04",
+            "cold-32-path-branch-04"
+          ]
+        },
+        "case": "cold-32-path-04",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-base-04/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/cold-32-path-branch-04/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/cold-32-path-04.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "path"
+        ],
+        "mapping_artifact_sha256": "9b5d7dffa7578ee11feef39ff4e645c8b0140cca1ba5a838cbd7275d76dfeb8f"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 21,
+          "samples": 42,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-git-base/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-git-branch/root"
+          },
+          "sample_ids": [
+            "seed-32-git-base-00",
+            "seed-32-git-branch-00",
+            "warm-32-git-branch-00",
+            "warm-32-git-base-00",
+            "warm-8-git-base-00",
+            "warm-8-git-branch-00",
+            "warm-8-git-branch-01",
+            "warm-8-git-base-01",
+            "warm-32-git-base-01",
+            "warm-32-git-branch-01",
+            "warm-32-git-branch-02",
+            "warm-32-git-base-02",
+            "warm-8-git-base-02",
+            "warm-8-git-branch-02",
+            "warm-32-git-base-03",
+            "warm-32-git-branch-03",
+            "warm-8-git-branch-03",
+            "warm-8-git-base-03",
+            "warm-32-git-branch-04",
+            "warm-32-git-base-04",
+            "warm-8-git-base-04",
+            "warm-8-git-branch-04",
+            "warm-32-git-base-05",
+            "warm-32-git-branch-05",
+            "warm-8-git-branch-05",
+            "warm-8-git-base-05",
+            "warm-32-git-branch-06",
+            "warm-32-git-base-06",
+            "warm-8-git-base-06",
+            "warm-8-git-branch-06",
+            "warm-8-git-branch-07",
+            "warm-8-git-base-07",
+            "warm-32-git-base-07",
+            "warm-32-git-branch-07",
+            "warm-32-git-branch-08",
+            "warm-32-git-base-08",
+            "warm-8-git-base-08",
+            "warm-8-git-branch-08",
+            "warm-32-git-base-09",
+            "warm-32-git-branch-09",
+            "warm-8-git-branch-09",
+            "warm-8-git-base-09"
+          ]
+        },
+        "case": "warm-git",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-git-base/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-git-branch/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/warm-git.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "git"
+        ],
+        "mapping_artifact_sha256": "b8145d7c65c55b35d986fd567cfb76ec4f937de2140fe1011138401d1fac0625"
+      },
+      {
+        "paths": 3693,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 21,
+          "samples": 42,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-github-base/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-github-branch/root"
+          },
+          "sample_ids": [
+            "seed-32-github-base-00",
+            "seed-32-github-branch-00",
+            "warm-8-github-base-00",
+            "warm-8-github-branch-00",
+            "warm-32-github-branch-00",
+            "warm-32-github-base-00",
+            "warm-8-github-branch-01",
+            "warm-8-github-base-01",
+            "warm-32-github-base-01",
+            "warm-32-github-branch-01",
+            "warm-8-github-base-02",
+            "warm-8-github-branch-02",
+            "warm-32-github-branch-02",
+            "warm-32-github-base-02",
+            "warm-8-github-branch-03",
+            "warm-8-github-base-03",
+            "warm-32-github-base-03",
+            "warm-32-github-branch-03",
+            "warm-32-github-branch-04",
+            "warm-32-github-base-04",
+            "warm-8-github-base-04",
+            "warm-8-github-branch-04",
+            "warm-32-github-base-05",
+            "warm-32-github-branch-05",
+            "warm-8-github-branch-05",
+            "warm-8-github-base-05",
+            "warm-32-github-branch-06",
+            "warm-32-github-base-06",
+            "warm-8-github-base-06",
+            "warm-8-github-branch-06",
+            "warm-8-github-branch-07",
+            "warm-8-github-base-07",
+            "warm-32-github-base-07",
+            "warm-32-github-branch-07",
+            "warm-32-github-branch-08",
+            "warm-32-github-base-08",
+            "warm-8-github-base-08",
+            "warm-8-github-branch-08",
+            "warm-32-github-base-09",
+            "warm-32-github-branch-09",
+            "warm-8-github-branch-09",
+            "warm-8-github-base-09"
+          ]
+        },
+        "case": "warm-github",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-github-base/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-github-branch/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/warm-github.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "github"
+        ],
+        "mapping_artifact_sha256": "b8145d7c65c55b35d986fd567cfb76ec4f937de2140fe1011138401d1fac0625"
+      },
+      {
+        "paths": 3694,
+        "edges": 27517,
+        "derivation_outputs": 4505,
+        "exact_contents_after_address_rewrite": true,
+        "evaluation_outputs": {
+          "pairs": 21,
+          "samples": 42,
+          "exact_outputs_after_address_rewrite": true,
+          "store_roots": {
+            "base": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-path-base/root",
+            "branch": "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-path-branch/root"
+          },
+          "sample_ids": [
+            "seed-32-path-base-00",
+            "seed-32-path-branch-00",
+            "warm-8-path-base-00",
+            "warm-8-path-branch-00",
+            "warm-32-path-branch-00",
+            "warm-32-path-base-00",
+            "warm-8-path-branch-01",
+            "warm-8-path-base-01",
+            "warm-32-path-base-01",
+            "warm-32-path-branch-01",
+            "warm-32-path-branch-02",
+            "warm-32-path-base-02",
+            "warm-8-path-base-02",
+            "warm-8-path-branch-02",
+            "warm-32-path-base-03",
+            "warm-32-path-branch-03",
+            "warm-8-path-branch-03",
+            "warm-8-path-base-03",
+            "warm-32-path-branch-04",
+            "warm-32-path-base-04",
+            "warm-8-path-base-04",
+            "warm-8-path-branch-04",
+            "warm-8-path-branch-05",
+            "warm-8-path-base-05",
+            "warm-32-path-base-05",
+            "warm-32-path-branch-05",
+            "warm-32-path-branch-06",
+            "warm-32-path-base-06",
+            "warm-8-path-base-06",
+            "warm-8-path-branch-06",
+            "warm-32-path-base-07",
+            "warm-32-path-branch-07",
+            "warm-8-path-branch-07",
+            "warm-8-path-base-07",
+            "warm-8-path-base-08",
+            "warm-8-path-branch-08",
+            "warm-32-path-branch-08",
+            "warm-32-path-base-08",
+            "warm-8-path-branch-09",
+            "warm-8-path-base-09",
+            "warm-32-path-base-09",
+            "warm-32-path-branch-09"
+          ]
+        },
+        "case": "warm-path",
+        "checker_command": [
+          "taskset",
+          "-c",
+          "0-4,10-14",
+          "/usr/bin/python3",
+          "-I",
+          "/home/connorbaker/Packages/nix/doc/lazy-store/runs/compare-store-graphs.py",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-path-base/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/states/warm-path-branch/root",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9/graphs-alpha-v1/warm-path.json",
+          "--benchmark-output",
+          "/home/connorbaker/Benchmarks/nix-performance-fixes/paired-795ae18d9",
+          "--scheme",
+          "path"
+        ],
+        "mapping_artifact_sha256": "b8d7004d9bb2607bb71e67e33764235969d9c3b6e127f971ffba4dbf57756cc8"
+      }
+    ]
+  }
+}

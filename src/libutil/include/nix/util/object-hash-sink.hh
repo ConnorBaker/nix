@@ -143,9 +143,10 @@ private:
     /**
      * For each directory whose callback is running, innermost last, the
      * visitor's per-entry function: each child delivered is handed to it
-     * under the tree's own name.
+     * under the tree's own name. The active directory call owns the function;
+     * recursive stack growth must not move a callback being invoked.
      */
-    std::vector<fun<void(std::string_view, bool, fun<HashedNode()>)>> open;
+    std::vector<fun<void(std::string_view, bool, fun<HashedNode()>)> *> open;
 
     std::optional<HashedNode> root;
 

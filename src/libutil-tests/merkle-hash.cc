@@ -211,7 +211,7 @@ TEST(MerkleHash, serialiseTreeIsGitsBody)
 
     EXPECT_THROW(merkle::insertEntry(t, "", {.mode = Mode::Regular, .hash = hA}), Error);
     EXPECT_THROW(merkle::insertEntry(t, "a/b", {.mode = Mode::Regular, .hash = hA}), Error);
-    EXPECT_THROW(merkle::insertEntry(t, std::string_view("a\0", 2), {.mode = Mode::Regular, .hash = hA}), Error);
+    EXPECT_THROW(merkle::insertEntry(t, std::string("a\0", 2), {.mode = Mode::Regular, .hash = hA}), Error);
     EXPECT_THROW(merkle::insertEntry(t, "a", {.mode = Mode::Regular, .hash = hA}), Error);
     /* "." and "..", which no directory has: the injectivity of `objectHash`
        rests on no real tree holding the synthetic root's one entry. */

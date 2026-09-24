@@ -80,7 +80,7 @@ create table if not exists Blobs (
     name      text    not null, -- the holder's name under that path ("" for a plain-file root)
     size      integer not null,
     primary key (id, exec, ingestion)
-);
+) without rowid;
 
 create index if not exists IndexBlobsIngestion on Blobs(ingestion);
 
