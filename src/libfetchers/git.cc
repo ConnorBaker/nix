@@ -1074,8 +1074,6 @@ struct GitInputScheme : InputScheme
         }
 
         if (!isDirty) {
-            auto repo = GitRepo::openRepo(repoPath, {});
-
             if (auto ref = repo->getWorkdirRef())
                 input.attrs.insert_or_assign("ref", *ref);
 
