@@ -300,10 +300,10 @@ TEST_F(GitTest, both_roundrip)
 
             HashedNode directory(const CanonPath & path, Children children) override
             {
-                auto node = HashingVisitor::directory(path, std::move(children));
+                auto [node, body] = hashDirectory(path, std::move(children));
                 StringSink s;
-                merkle::feedHeader(s, "tree", node.treeBody.size());
-                s(node.treeBody);
+                merkle::feedHeader(s, "tree", body.size());
+                s(body);
                 cas.insert_or_assign(node.entry.hash, std::move(s.s));
                 return node;
             }

@@ -10,6 +10,7 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace nix {
@@ -18,14 +19,13 @@ namespace nix {
  * What the object hasher records for one node of a tree (01 §9.11): its
  * entry (mode and identifier), its length in the NAR when every size
  * beneath it was seen -- a node a visitor's `node` answered without its
- * subtree's sizes has none -- and, for a directory, the tree body its
- * identifier is the hash of, which an object store writes as it is.
+ * subtree's sizes has none. A directory's encoded body is needed only
+ * while hashing and publishing that directory, not by its parent.
  */
 struct HashedNode
 {
     merkle::TreeEntry entry;
     std::optional<uint64_t> narSize;
-    std::string treeBody;
 };
 
 /**
@@ -64,6 +64,10 @@ public:
      * children share a name.
      */
     HashedNode directory(const CanonPath & path, Children children) override;
+
+protected:
+    /** The directory summary and its encoding, for a consumer that publishes the body. */
+    std::pair<HashedNode, std::string> hashDirectory(const CanonPath & path, Children children);
 };
 
 /**

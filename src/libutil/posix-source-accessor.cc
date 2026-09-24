@@ -503,7 +503,8 @@ void PosixDirectorySourceAccessor::readFile(const CanonPath & path, Sink & sink,
     AutoCloseFD fileFd;
 
     try {
-        fileFd = openFileEnsureBeneathNoSymlinks(parentFd, path.baseName().value(), O_RDONLY | O_CLOEXEC);
+        fileFd =
+            openFileEnsureBeneathNoSymlinks(parentFd, CanonPath::root / path.baseName().value(), O_RDONLY | O_CLOEXEC);
     } catch (SymlinkNotAllowed & e) {
         auto parent = path.parent().value();
         throw SymlinkNotAllowed(parent / e.path, "path '%s' is a symlink", showPath(parent / e.path));
@@ -539,8 +540,8 @@ AutoCloseFD PosixDirectorySourceAccessor::openSubdirectory(const CanonPath & pat
         auto [parentFd, parentFdOwning] = openParentAndUpsert(path, /*ignoreMissing=*/false);
 
         try {
-            dirFdOwning =
-                openFileEnsureBeneathNoSymlinks(parentFd, path.baseName().value(), O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+            dirFdOwning = openFileEnsureBeneathNoSymlinks(
+                parentFd, CanonPath::root / path.baseName().value(), O_DIRECTORY | O_RDONLY | O_CLOEXEC);
         } catch (SymlinkNotAllowed & e) {
             auto parent = path.parent().value();
             throw SymlinkNotAllowed(parent / e.path, "path '%s' is a symlink", showPath(parent / e.path));
@@ -643,7 +644,7 @@ try {
     auto [parentFd, parentFdOwning] = openParentAndUpsert(path, /*ignoreMissing=*/false);
 
     try {
-        return readLinkAt(parentFd, CanonPath(path.baseName().value()));
+        return readLinkAt(parentFd, CanonPath::root / path.baseName().value());
     } catch (SysError & e) {
         if (e.errNo == EINVAL)
             throw NotASymlink("file '%s' is not a symlink", showPath(path));

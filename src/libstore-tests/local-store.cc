@@ -22,6 +22,7 @@
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/store/posix-fs-canonicalise.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/file-system-at.hh"
 #include "nix/util/processes.hh"
 #include "nix/store/git-object-store.hh"
 #include "nix/store/pathlocks.hh"
@@ -7612,8 +7613,9 @@ TEST_F(LocalStoreObjectsTest, materialiseAppliesTheCaseHackAsTheRestorerDoes)
 
 /* A callback may enter another copy on the same thread. Each copy owns its
    destination even while the other is suspended, and unwinding the inner
-   copy leaves the outer siblings in their original directory. The NARs
-   below are produced directly from memory, independently of either writer. */
+   copy leaves the outer siblings in their original directory. Regular-file
+   hooks see complete bytes and canonical metadata before entering the inner
+   copy. The NARs are produced from memory, independently of either writer. */
 TEST_F(LocalStoreObjectsTest, reentrantCopiesRestoreTheirDestinationAfterReturnAndThrow)
 {
     struct NestedFailure
@@ -7622,100 +7624,155 @@ TEST_F(LocalStoreObjectsTest, reentrantCopiesRestoreTheirDestinationAfterReturnA
     struct Hooks : CountingRestoreHooks
     {
         using CountingRestoreHooks::CountingRestoreHooks;
-        std::function<void(const CanonPath &)> onSymlink;
+        std::function<void(const CanonPath &)> onNode;
+        std::function<void(Descriptor, bool)> onRegular;
 
         void symlinkCreated(Descriptor fd, const CanonPath & name) override
         {
             CountingRestoreHooks::symlinkCreated(fd, name);
-            onSymlink(name);
+            onNode(name);
+        }
+
+        void regularFileCreated(Descriptor fd, bool executable) override
+        {
+            CountingRestoreHooks::regularFileCreated(fd, executable);
+            onRegular(fd, executable);
         }
     };
 
     WithCaseHack on{true};
-    auto outer = treeAccessor({
-        {"Dir/A", "outer-upper", 'l'},
-        {"Dir/a", "outer-lower", 'l'},
-        {"Dir/z", "outer-after", 'f'},
-        {"dir/tail", "outer-tail", 'l'},
-    });
-    auto inner = treeAccessor({
-        {"Inner/A", "inner-upper", 'l'},
-        {"Inner/a", "inner-lower", 'l'},
-        {"Inner/z", "inner-after", 'x'},
-    });
-    auto outerNar = narOf(*outer);
-    auto innerNar = narOf(*inner);
-    auto outerHash = objectHashOf(*outer, CanonPath::root).root;
     auto hacked = std::string("a") + std::string(caseHackSuffix) + "1";
     auto realStoreDir = std::filesystem::path{config->realStoreDir.get()};
     auto copy = [&](bool pull,
                     const std::filesystem::path & dst,
                     const ref<MemorySourceAccessor> & tree,
                     const std::string & nar,
-                    Hooks & hooks) {
+                    Hooks & hooks,
+                    RepairFlag repair) {
         auto hold = store->objects.hold();
         if (pull)
             return store->materialiseThroughObjects(
-                dst, SourcePath(tree), defaultPathFilter, false, &hooks, NoRepair, noNode(), hold);
+                dst, SourcePath(tree), defaultPathFilter, false, &hooks, repair, noNode(), hold);
         StringSource source{nar};
-        return store->restoreThroughObjects(dst, source, false, &hooks, hold, NoRepair);
+        return store->restoreThroughObjects(dst, source, false, &hooks, hold, repair);
     };
 
-    for (bool outerPull : {false, true})
-        for (bool innerPull : {false, true})
-            for (bool fail : {false, true}) {
-                SCOPED_TRACE(fmt("outer-pull=%d inner-pull=%d fail=%d", outerPull, innerPull, fail));
-                auto label = fmt("reentrant-%d-%d-%d", outerPull, innerPull, fail);
-                auto outerDst = realStoreDir / (label + "-outer");
-                auto innerDst = realStoreDir / (label + "-inner");
-                Hooks outerHooks{
-                    makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
-                Hooks innerHooks{
-                    makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
-                std::vector<std::string> trace;
-                innerHooks.onSymlink = [&](const CanonPath & name) {
-                    trace.push_back(fmt("inner:%s", name.rel()));
-                    if (fail && name.rel() == hacked)
-                        throw NestedFailure{};
-                };
-                bool entered = false;
-                outerHooks.onSymlink = [&](const CanonPath & name) {
-                    trace.push_back(fmt("outer:%s", name.rel()));
-                    if (name.rel() != hacked)
-                        return;
-                    EXPECT_FALSE(entered);
-                    entered = true;
-                    bool failed = false;
-                    try {
-                        copy(innerPull, innerDst, inner, innerNar, innerHooks);
-                    } catch (const NestedFailure &) {
-                        failed = true;
-                    }
-                    EXPECT_EQ(failed, fail);
-                    trace.push_back(failed ? "inner-failed" : "inner-completed");
-                };
-                auto result = copy(outerPull, outerDst, outer, outerNar, outerHooks);
-                EXPECT_TRUE(entered);
-                EXPECT_EQ(result.root, outerHash);
-                EXPECT_EQ(result.narSize, outerNar.size());
-                StringSink actual;
-                dumpPath(outerDst, actual);
-                EXPECT_EQ(actual.s, outerNar);
-                if (!fail) {
-                    StringSink nested;
-                    dumpPath(innerDst, nested);
-                    EXPECT_EQ(nested.s, innerNar);
-                }
-                EXPECT_EQ(
-                    trace,
-                    (std::vector<std::string>{
-                        "outer:A",
-                        "outer:" + hacked,
-                        "inner:A",
-                        "inner:" + hacked,
-                        fail ? "inner-failed" : "inner-completed",
-                        "outer:tail"}));
-            }
+    constexpr size_t limit = 1 << 20;
+    for (char kind : {'l', 'f', 'x'})
+        for (size_t size : {size_t{0}, size_t{1}, size_t{32767}, size_t{32768}, size_t{32769}, limit, limit + 1}) {
+            if (kind == 'l' && size != 0)
+                continue;
+            auto outerBytes = kind == 'l' ? std::string("outer-lower") : std::string(size, 'o');
+            auto innerBytes = kind == 'l' ? std::string("inner-lower") : std::string(size, 'i');
+            auto outer = treeAccessor({
+                {"Dir/A", "outer-upper", 'l'},
+                {"Dir/a", outerBytes, kind},
+                {"Dir/z", "outer-after", 'f'},
+                {"dir/tail", "outer-tail", 'l'},
+            });
+            auto inner = treeAccessor({
+                {"Inner/A", "inner-upper", 'l'},
+                {"Inner/a", innerBytes, kind},
+                {"Inner/z", "inner-after", 'x'},
+            });
+            auto outerNar = narOf(*outer);
+            auto innerNar = narOf(*inner);
+            auto outerHash = referenceObjectEntry(*outer, CanonPath::root);
+            for (auto repair : {NoRepair, Repair})
+                for (bool outerPull : {false, true})
+                    for (bool innerPull : {false, true})
+                        for (bool fail : {false, true}) {
+                            auto label =
+                                fmt("reentrant-%c-%d-%d-%d-%d-%d", kind, size, repair, outerPull, innerPull, fail);
+                            SCOPED_TRACE(label);
+                            auto outerDst = realStoreDir / (label + "-outer");
+                            auto innerDst = realStoreDir / (label + "-inner");
+                            Hooks outerHooks{makeCanonicalisingRestoreHooks(
+                                NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
+                            Hooks innerHooks{makeCanonicalisingRestoreHooks(
+                                NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
+                            std::vector<std::string> trace;
+                            innerHooks.onNode = [&](const CanonPath & name) {
+                                trace.push_back(fmt("inner:%s", name.rel()));
+                                if (fail && name.rel() == hacked)
+                                    throw NestedFailure{};
+                            };
+                            bool entered = false;
+                            outerHooks.onNode = [&](const CanonPath & name) {
+                                trace.push_back(fmt("outer:%s", name.rel()));
+                                if (name.rel() != hacked)
+                                    return;
+                                EXPECT_FALSE(entered);
+                                entered = true;
+                                bool failed = false;
+                                try {
+                                    copy(innerPull, innerDst, inner, innerNar, innerHooks, repair);
+                                } catch (const NestedFailure &) {
+                                    failed = true;
+                                }
+                                EXPECT_EQ(failed, fail);
+                                trace.push_back(failed ? "inner-failed" : "inner-completed");
+                            };
+                            auto completedRegular = [&](bool nested, Hooks & hooks, Descriptor fd, bool executable) {
+                                /* Only 'a' triggers reentry. Keeping the other trigger nodes
+                                   symlinks also makes the empty regular file a fresh write. */
+                                bool trigger = kind != 'l' && hooks.regularFilesCreated.load() == 1;
+                                auto name = trigger ? hacked : std::string("z");
+                                auto path = (nested ? innerDst / "Inner" : outerDst / "Dir") / name;
+                                auto bytes = trigger ? (nested ? innerBytes : outerBytes)
+                                                     : std::string(nested ? "inner-after" : "outer-after");
+                                bool expectedExecutable = trigger ? kind == 'x' : nested;
+                                auto metadata = nix::fstat(fd);
+                                auto named = st(path);
+                                EXPECT_EQ(metadata.st_dev, named.st_dev);
+                                EXPECT_EQ(metadata.st_ino, named.st_ino);
+                                EXPECT_EQ(metadata.st_size, bytes.size());
+                                EXPECT_EQ(executable, expectedExecutable);
+                                EXPECT_EQ(metadata.st_mode & ~S_IFMT, expectedExecutable ? 0555 : 0444);
+                                EXPECT_EQ(metadata.st_uid, geteuid());
+                                EXPECT_EQ(metadata.st_mtime, 1);
+#  ifdef __APPLE__
+                                EXPECT_EQ(metadata.st_mtimespec.tv_nsec, 0);
+#  else
+                                EXPECT_EQ(metadata.st_mtim.tv_nsec, 0);
+#  endif
+                                EXPECT_EQ(readFile(path), bytes);
+                                if (trigger)
+                                    hooks.onNode(CanonPath(name));
+                                EXPECT_EQ(nix::fstat(fd).st_ino, metadata.st_ino);
+                                EXPECT_EQ(readFile(path), bytes);
+                            };
+                            outerHooks.onRegular = [&](Descriptor fd, bool executable) {
+                                completedRegular(false, outerHooks, fd, executable);
+                            };
+                            innerHooks.onRegular = [&](Descriptor fd, bool executable) {
+                                completedRegular(true, innerHooks, fd, executable);
+                            };
+                            auto result = copy(outerPull, outerDst, outer, outerNar, outerHooks, repair);
+                            EXPECT_TRUE(entered);
+                            EXPECT_EQ(result.root, outerHash);
+                            EXPECT_EQ(result.narSize, outerNar.size());
+                            EXPECT_EQ(outerHooks.regularFilesCreated, kind == 'l' ? 1u : 2u);
+                            EXPECT_EQ(innerHooks.regularFilesCreated, (kind == 'l' ? 0u : 1u) + (fail ? 0u : 1u));
+                            StringSink actual;
+                            dumpPath(outerDst, actual);
+                            EXPECT_EQ(actual.s, outerNar);
+                            if (!fail) {
+                                StringSink nested;
+                                dumpPath(innerDst, nested);
+                                EXPECT_EQ(nested.s, innerNar);
+                            }
+                            EXPECT_EQ(
+                                trace,
+                                (std::vector<std::string>{
+                                    "outer:A",
+                                    "outer:" + hacked,
+                                    "inner:A",
+                                    "inner:" + hacked,
+                                    fail ? "inner-failed" : "inner-completed",
+                                    "outer:tail"}));
+                        }
+        }
 }
 
 /* Law 2 of 01 §9.10 over the second route, on generated trees: whatever
@@ -8405,7 +8462,7 @@ TEST_F(LocalStoreObjectsTest, unnamedRegularCopyStagesOnlyWhenItsDestinationNeed
 {
     constexpr size_t limit = 1 << 20;
     unsigned int serial = 0;
-    for (size_t size : {size_t{0}, limit, limit + 1})
+    for (size_t size : {size_t{0}, size_t{1}, size_t{32767}, size_t{32768}, size_t{32769}, limit, limit + 1})
         for (bool sizeKnown : {false, true})
             for (bool announces : {false, true})
                 for (bool executable : {false, true})
@@ -8424,6 +8481,9 @@ TEST_F(LocalStoreObjectsTest, unnamedRegularCopyStagesOnlyWhenItsDestinationNeed
                             std::string bytes(size, 'b');
                             auto source = make_ref<UnnamedRegularSource>(
                                 bytes, executable, sizeKnown, announces ? std::optional<uint64_t>(size) : std::nullopt);
+                            auto oracle = make_ref<MemorySourceAccessor>();
+                            oracle->root = source->root;
+                            auto expectedNar = narOf(*oracle);
                             auto expectedRoot = merkle::TreeEntry{
                                 .mode = executable ? merkle::Mode::Executable : merkle::Mode::Regular,
                                 .hash = merkle::blobId(bytes)};
@@ -8446,13 +8506,22 @@ TEST_F(LocalStoreObjectsTest, unnamedRegularCopyStagesOnlyWhenItsDestinationNeed
                             EXPECT_EQ(source->reads, 1u);
                             EXPECT_EQ(holds, valid && !repair && size <= limit ? 0u : 1u);
                             EXPECT_EQ(readFile(store->toRealPath(actual)), bytes);
-                            EXPECT_EQ(bool(st(store->toRealPath(actual)).st_mode & S_IXUSR), executable);
+                            auto metadata = st(store->toRealPath(actual));
+                            EXPECT_EQ(metadata.st_mode & ~S_IFMT, executable ? 0555 : 0444);
+                            EXPECT_EQ(metadata.st_uid, geteuid());
+                            EXPECT_EQ(metadata.st_mtime, 1);
+#  ifdef __APPLE__
+                            EXPECT_EQ(metadata.st_mtimespec.tv_nsec, 0);
+#  else
+                            EXPECT_EQ(metadata.st_mtim.tv_nsec, 0);
+#  endif
                             auto info = store->queryPathInfo(actual);
                             ASSERT_TRUE(info->objectHash);
                             EXPECT_EQ(*info->objectHash, ObjectHash::of(expectedRoot));
                             StringSink nar;
                             dumpPath(store->toRealPath(actual), nar);
-                            EXPECT_EQ(info->narSize, nar.s.size());
+                            EXPECT_EQ(nar.s, expectedNar);
+                            EXPECT_EQ(info->narSize, expectedNar.size());
                             for (auto & entry : DirectoryIterator{config->realStoreDir.get()})
                                 EXPECT_FALSE(hasPrefix(entry.path().filename().string(), "tmp-"));
                         }

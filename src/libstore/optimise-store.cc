@@ -206,8 +206,8 @@ struct ObjectStoreVisitor : HashingVisitor
 
     HashedNode directory(const CanonPath & path, Children children) override
     {
-        auto node = HashingVisitor::directory(path, std::move(children));
-        objects.putTree(node.entry.hash, node.treeBody, hold);
+        auto [node, body] = hashDirectory(path, std::move(children));
+        objects.putTree(node.entry.hash, body, hold);
         return node;
     }
 };
@@ -622,7 +622,10 @@ struct LinkingVisitor : ObjectStoreVisitor
             if (executable)
                 crf.isExecutable();
             crf.preallocateContents(buffer.size());
-            crf(buffer);
+            /* The complete file is already buffered, and this writer is fresh. */
+            auto & sink = dynamic_cast<FdSink &>(crf);
+            assert(!sink.hasData());
+            sink.writeUnbuffered(buffer);
         });
         if (linkable)
             objects.enterWritten(entry.hash, executable, dirFd, name, target.where, repair, hold);

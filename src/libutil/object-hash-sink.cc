@@ -99,6 +99,11 @@ HashedNode HashingVisitor::symlink(const CanonPath &, const std::string & target
 
 HashedNode HashingVisitor::directory(const CanonPath & path, Children children)
 {
+    return hashDirectory(path, std::move(children)).first;
+}
+
+std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath & path, Children children)
+{
     merkle::Tree tree;
     merkle::nar::Directory size;
     bool sizeExact = true;
@@ -146,9 +151,11 @@ HashedNode HashingVisitor::directory(const CanonPath & path, Children children)
 
     auto body = merkle::serialiseTree(tree);
     return {
-        .entry = {.mode = merkle::Mode::Directory, .hash = merkle::treeId(body)},
-        .narSize = sizeExact ? std::optional(size.finish()) : std::nullopt,
-        .treeBody = std::move(body),
+        HashedNode{
+            .entry = {.mode = merkle::Mode::Directory, .hash = merkle::treeId(body)},
+            .narSize = sizeExact ? std::optional(size.finish()) : std::nullopt,
+        },
+        std::move(body),
     };
 }
 
