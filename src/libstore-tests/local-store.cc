@@ -4480,6 +4480,127 @@ TEST_F(LocalStoreObjectsTest, publishedAuxiliaryObjectRetainsItsOriginalHoldLink
     EXPECT_EQ(st(file).st_nlink, 1u);
 }
 
+/* An already-open first temporary loses publication to a second writer.
+   The fsync hook fixes this interleaving without threads or new production
+   hooks. The losing writer must hold the winner before returning. */
+TEST_F(LocalStoreObjectsTest, competingAuxiliaryPublicationHoldsTheWinner)
+{
+    size_t cases = 0;
+    for (unsigned kind = 0; kind < 3; ++kind)
+        for (bool shardPresent : {false, true})
+            for (bool separate : {false, true}) {
+                SCOPED_TRACE(fmt("kind=%d shard=%d separate=%d", kind, shardPresent, separate));
+                GitObjectStore objects{tempStoreDir.path() / fmt("competing-auxiliary-%d", cases), true};
+                objects.createDirectories();
+                GitObjectStore other{objects.dir, true};
+                auto & winnerObjects = separate ? other : objects;
+                auto bytes = kind == 0 ? std::string{} : std::string{"competing auxiliary bytes"};
+                auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
+                auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
+                mode_t expectedMode = kind == 2 ? 0555 : 0444;
+                if (shardPresent)
+                    createDirs(file.parent_path());
+                std::optional<GitObjectStore::Hold> first{objects.hold()};
+                std::optional<GitObjectStore::Hold> second{winnerObjects.hold()};
+                auto firstDir = first->directory(), secondDir = second->directory();
+                auto firstClaim = first->linkFor(file);
+                auto secondClaim = second->linkFor(file);
+                std::filesystem::path firstTemporary, winningTemporary;
+                std::optional<PosixStat> winner;
+                size_t firstWrites = 0, secondWrites = 0;
+                bool publishingWinner = false;
+                auto publish = [&](GitObjectStore & into, const GitObjectStore::Hold & hold) {
+                    if (kind == 0)
+                        into.putTree(id, bytes, hold);
+                    else
+                        into.putBlob(id, kind == 2, bytes, hold);
+                };
+                auto checkTemporary = [&](const std::filesystem::path & tmp) {
+                    auto metadata = st(tmp);
+                    EXPECT_TRUE(S_ISREG(metadata.st_mode));
+                    EXPECT_EQ(metadata.st_mode & 07777, expectedMode);
+                    EXPECT_EQ(static_cast<uint64_t>(metadata.st_size), bytes.size());
+                    EXPECT_EQ(readFile(tmp), bytes);
+                };
+                auto secondWrite = [&](const std::filesystem::path & tmp) {
+                    ++secondWrites;
+                    winningTemporary = tmp;
+                    checkTemporary(tmp);
+                };
+                other.atFsync = secondWrite;
+                objects.atFsync = [&](const std::filesystem::path & tmp) {
+                    if (publishingWinner) {
+                        secondWrite(tmp);
+                        return;
+                    }
+                    ++firstWrites;
+                    firstTemporary = tmp;
+                    checkTemporary(tmp);
+                    EXPECT_FALSE(maybeLstat(file));
+                    EXPECT_EQ(pathExists(file.parent_path()), shardPresent);
+                    auto losingInode = st(tmp);
+                    publishingWinner = true;
+                    publish(winnerObjects, *second);
+                    publishingWinner = false;
+                    winner = st(file);
+                    EXPECT_EQ(readFile(file), bytes);
+                    EXPECT_EQ(winner->st_mode & 07777, expectedMode);
+                    EXPECT_EQ(winner->st_dev, losingInode.st_dev);
+                    EXPECT_NE(winner->st_ino, losingInode.st_ino);
+                    EXPECT_EQ(winner->st_nlink, 2u);
+                };
+
+                publish(objects, *first);
+                EXPECT_EQ(firstWrites, 1u);
+                EXPECT_EQ(secondWrites, 1u);
+                ASSERT_TRUE(winner);
+                EXPECT_FALSE(maybeLstat(firstTemporary)) << "the unpublished losing temporary is removed";
+                EXPECT_EQ(winningTemporary.parent_path(), secondClaim.parent_path());
+                EXPECT_EQ(st(winningTemporary).st_ino, winner->st_ino);
+                EXPECT_EQ(st(file).st_ino, winner->st_ino);
+                EXPECT_EQ(st(file).st_nlink, 3u);
+                if (auto claim = maybeLstat(firstClaim)) {
+                    EXPECT_TRUE(S_ISREG(claim->st_mode));
+                    EXPECT_EQ(claim->st_dev, winner->st_dev);
+                    EXPECT_EQ(claim->st_ino, winner->st_ino);
+                    EXPECT_EQ(claim->st_mode & 07777, expectedMode);
+                    EXPECT_EQ(readFile(firstClaim), bytes);
+                } else
+                    ADD_FAILURE() << "the losing publisher did not acquire the winner";
+                size_t firstClaims = 0;
+                for (auto & entry : DirectoryIterator{firstClaim.parent_path()}) {
+                    EXPECT_EQ(entry.path(), firstClaim);
+                    ++firstClaims;
+                }
+                EXPECT_EQ(firstClaims, 1u);
+
+                second.reset();
+                EXPECT_FALSE(pathExists(secondDir));
+                EXPECT_FALSE(maybeLstat(winningTemporary));
+                EXPECT_EQ(st(file).st_nlink, 2u);
+                auto noRoots = [](fun<void(const ObjectHash &)>) { return uint64_t{0}; };
+                auto held = objects.sweep(noRoots);
+                EXPECT_EQ(held.holds, 1u);
+                EXPECT_EQ(held.treesRemoved, 0u);
+                EXPECT_EQ(held.blobsRemoved, 0u);
+                ASSERT_TRUE(maybeLstat(file)) << "the first hold must retain the competing winner";
+                EXPECT_EQ(st(file).st_ino, winner->st_ino);
+                EXPECT_EQ(st(file).st_mode & 07777, expectedMode);
+                EXPECT_EQ(readFile(file), bytes);
+
+                first.reset();
+                EXPECT_FALSE(pathExists(firstDir));
+                EXPECT_EQ(st(file).st_nlink, 1u);
+                auto released = objects.sweep(noRoots);
+                EXPECT_EQ(released.holds, 0u);
+                EXPECT_EQ(released.treesRemoved, kind == 0 ? 1u : 0u);
+                EXPECT_EQ(released.blobsRemoved, kind == 0 ? 0u : 1u);
+                EXPECT_FALSE(maybeLstat(file));
+                ++cases;
+            }
+    EXPECT_EQ(cases, 12u);
+}
+
 TEST_F(LocalStoreObjectsTest, holdsNeverReuseAnExistingName)
 {
     auto & objects = store->objects;

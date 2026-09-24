@@ -1,6 +1,6 @@
 # Lazy-store status
 
-Measured revision `6739a4955` has lower separate wall medians and median paired wall-time ratios in **all nine cases** against branch base `8aad447`, with **66/75 pairs faster**. All 156 output checks and eighteen complete store comparisons pass. CPU medians remain higher in three cases and peak RSS in seven; resource reduction remains unresolved.
+Measured revision `dbc65fd81` has lower separate wall medians and median paired wall-time ratios in **all nine cases** against branch base `8aad447`, with **70/75 pairs faster**. All 156 output checks and eighteen complete store comparisons pass. CPU medians remain higher in four cases and peak RSS in seven; resource reduction remains unresolved.
 
 ## Semantic model
 
@@ -16,7 +16,7 @@ The [specification](01-specification.md), [implementation derivation](04-derivat
 
 ## Current validation
 
-6739 reuses an acquired stored accessor for legacy hash computation, exposes known NAR listing types and transfers owned fetcher results. Its [targeted source gates](/home/connorbaker/Benchmarks/nix-performance-fixes/source-projections-final-validation-3fedcc95f/README.md) pass **five GTests and six functional targets, with no skips**. The exact optimized release passes **207 packaged tests, zero failures and 36 skips**.
+dbc delivers owned immutable Git/NAR bytes directly, retains callback owners, propagates consumer `EndOfFile` and validates filenames as unchanged single components. Its [source gates](/home/connorbaker/Benchmarks/nix-performance-fixes/byte-filename-validation-6739a4955/README.md) pass **2,055 unit tests** (two skips, two disabled) and **eight functional targets without skips**; the old-production negative phase remains separate. The exact optimized release passes **207 packaged tests, zero failures and 36 skips**.
 
 [Earlier full-suite and overlay gates](09-performance.md#current-source-validation) remain bound to their historical sources; they were not rerun as current full gates. Windows remains unverified. Overlay's regular-holder sharing and auxiliary-operation limits remain explicit in the store model.
 
@@ -26,12 +26,12 @@ The pinned workload retains five cold and ten warm pairs per case. Cold means fr
 
 | Workload | `path:` | `git+file:` | `github:` |
 | --- | ---: | ---: | ---: |
-| Cold · 32 attributes | 16.17% | 19.14% | 49.05% |
-| Warm · 8 attributes | 87.98% | 9.62% | 13.94% |
-| Warm · 32 attributes | 77.98% | 3.33% | 6.89% |
+| Cold · 32 attributes | 11.97% | 16.30% | 27.84% |
+| Warm · 8 attributes | 87.81% | 4.37% | 11.82% |
+| Warm · 32 attributes | 75.32% | 4.46% | 6.58% |
 
-Cold-path CPU rises **3.77→6.82 s** and RSS **444.88→484.35 MiB**, both higher in every pair. Both warm Git cases also use more CPU. Lower wall time has not resolved these resource costs.
+Cold-path CPU rises **3.32→6.39 s** and RSS **445.21→470.71 MiB**, both higher in every pair. Cold Git and both warm Git cases also use more CPU. Lower wall time has not resolved these resource costs.
 
-The [direct comparison with 3fed](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-6739a4955-vs-3fedcc95f-audit/README.md) passes another 156 exact output checks but has only **30/75 faster wall pairs**, five higher median paired wall ratios, five higher CPU medians and six higher RSS medians. The mixed results do not establish a general improvement over 3fed or isolate any individual change's effect.
+The [direct comparison with 6739](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-dbc65fd81-vs-6739a4955-audit/README.md) passes another 156 exact output checks, with **41/75 faster wall pairs**, six lower and three higher median paired wall ratios. CPU medians rise in three cases and RSS in four; cold-path paired CPU/RSS rise 0.08 s/1.81 MiB despite lower wall time. These mixed results establish no all-metric improvement or individual-change effect.
 
-The [performance report](09-performance.md), [current samples](runs/2026-09-21-performance/paired-6739a4955.json), [independent main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-6739a4955-audit/README.md) and [release provenance](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-6739a4955.json) retain exact source/binary bindings, checks and limits. Earlier comparisons, the retained interference/repetition incident and historical profiles remain in that report; they do not measure later source changes.
+The [performance report](09-performance.md), [current samples](runs/2026-09-21-performance/paired-dbc65fd81.json), [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-dbc65fd81-audit/README.md) and [release provenance](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-dbc65fd81.json) retain exact source/binary bindings, checks and limits. Earlier comparisons, the retained interference/repetition incident and historical profiles remain in that report; they do not measure later source changes.

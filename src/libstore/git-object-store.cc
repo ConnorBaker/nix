@@ -611,13 +611,20 @@ static void releaseHoldContents(AutoCloseFD scan)
     while (errno = 0, entry = readdir(entries.get())) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
             continue;
-        if (unlinkat(fd, entry->d_name, 0) == 0 || errno == ENOENT)
-            continue;
-        if (errno != EISDIR && errno != EPERM)
-            throw SysError("unlinking hold entry '%s'", entry->d_name);
+        /* Joined writers leave this entry stable. A known directory cannot
+           be unlinked as a file; unknown types retain the syscall fallback. */
+        if (entry->d_type != DT_DIR) {
+            if (unlinkat(fd, entry->d_name, 0) == 0 || errno == ENOENT)
+                continue;
+            if (errno != EISDIR && errno != EPERM)
+                throw SysError("unlinking hold entry '%s'", entry->d_name);
+        }
         AutoCloseFD child{openat(fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
-        if (!child)
+        if (!child) {
+            if (entry->d_type == DT_DIR && errno == ENOENT)
+                continue;
             throw SysError("opening hold directory '%s'", entry->d_name);
+        }
         releaseHoldContents(std::move(child));
         if (unlinkat(fd, entry->d_name, AT_REMOVEDIR) == -1 && errno != ENOENT)
             throw SysError("removing hold directory '%s'", entry->d_name);
@@ -1082,8 +1089,7 @@ void GitObjectStore::enterWritten(
    a hold while its ingestion is in flight.  It is linked into place while
    the temporary still links the same inode, so it has two links from its
    first instant, and the temporary itself is the hold's link;
-   an existing file is held before it is trusted, and one the sweep took
-   between the look and the link is written afresh. */
+   an existing file or a competing publisher's object is held instead. */
 static void writeObjectFile(
     const std::filesystem::path & dst,
     std::string_view bytes,
@@ -1102,9 +1108,9 @@ static void writeObjectFile(
     static std::atomic<uint64_t> counter{0};
     auto tmp = held;
     tmp += fmt(".tmp-%d", counter.fetch_add(1, std::memory_order_relaxed));
-    bool published = false;
+    bool removeTemporary = true;
     Finally removeTmp{[&] {
-        if (published)
+        if (!removeTemporary)
             return;
         try {
             unlinkIfExists(tmp);
@@ -1112,68 +1118,65 @@ static void writeObjectFile(
             ignoreExceptionExceptInterrupt();
         }
     }};
-    /* Thrice at most: another writer's file appearing sends us round to
-       hold it; the sweep taking it between our look and our link, to
-       write it. */
-    for (int attempt = 0; attempt < 3; attempt++) {
-        if (attempt && holdObject(dst, held))
-            return;
-        {
-            mode_t mode = executable ? 0755 : 0644;
+    /* The caller holds the auxiliary namespace shared throughout. Other
+       publishers may win this address, but sweep and repair cannot remove it. */
+    {
+        mode_t mode = executable ? 0755 : 0644;
 #ifdef _WIN32
-            AutoCloseFD fd = openNewFileForWrite(tmp, mode, {.writeOnly = true});
+        AutoCloseFD fd = openNewFileForWrite(tmp, mode, {.writeOnly = true});
 #else
-            AutoCloseFD fd{open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, mode)};
+        AutoCloseFD fd{open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, mode)};
 #endif
-            if (!fd)
-                throw SysError("creating file %1%", PathFmt(tmp));
-            writeFull(fd.get(), bytes);
+        if (!fd)
+            throw SysError("creating file %1%", PathFmt(tmp));
+        writeFull(fd.get(), bytes);
 #ifdef _WIN32
-            /* Keep the existing Windows metadata implementation until an
-               equivalent permission-only operation is provided there. */
-            canonicaliseTimestampAndPermissions(tmp);
+        /* Keep the existing Windows metadata implementation until an
+           equivalent permission-only operation is provided there. */
+        canonicaliseTimestampAndPermissions(tmp);
 #else
-            /* Creation's mode is filtered by the caller's umask. Set the
-               exact readable mode before flushing, independently of it. */
-            if (::fchmod(fd.get(), executable ? 0555 : 0444) == -1)
-                throw SysError("changing permissions of auxiliary object");
+        /* Creation's mode is filtered by the caller's umask. Set the
+           exact readable mode before flushing, independently of it. */
+        if (::fchmod(fd.get(), executable ? 0555 : 0444) == -1)
+            throw SysError("changing permissions of auxiliary object");
 #endif
-            if (fsync) {
-                if (atFsync)
-                    atFsync(tmp);
-                fd.fsync();
-            }
+        if (fsync) {
+            if (atFsync)
+                atFsync(tmp);
+            fd.fsync();
         }
-        auto link = [&] {
-            auto ec = hardLink(tmp, dst);
-            if (ec == std::errc::no_such_file_or_directory) {
-                /* The first object of this shard (`createDirectories`). */
-                createDirs(dst.parent_path());
-                ec = hardLink(tmp, dst);
-            }
-            return ec;
-        };
-        if (auto ec = link()) {
-            unlinkIfExists(tmp);
-            if (ec == std::errc::file_exists)
-                continue;
-            if (ec == std::errc::no_space_on_device) {
-                /* The object is not kept; every reader tolerates its absence. */
-                printInfo("cannot write object %s: %s", PathFmt(dst), ec.message());
-                return;
-            }
-            throw Error("creating hard link from %1% to %2%: %3%", PathFmt(tmp), PathFmt(dst), ec.message());
-        }
-        /* The temporary is inside the locked hold. Keep it as the
-           protecting link: publication already leaves two links, with
-           no interval in which GC can take the object. A unique name
-           also keeps concurrent writers from reading a partial file. */
-        published = true;
-        if (fsync)
-            syncParent(dst);
-        return;
     }
-    throw Error("object %s appeared and disappeared repeatedly; not written", PathFmt(dst));
+    auto link = [&] {
+        auto ec = hardLink(tmp, dst);
+        if (ec == std::errc::no_such_file_or_directory) {
+            /* The first object of this shard (`createDirectories`). */
+            createDirs(dst.parent_path());
+            ec = hardLink(tmp, dst);
+        }
+        return ec;
+    };
+    if (auto ec = link()) {
+        unlinkIfExists(tmp);
+        removeTemporary = false;
+        if (ec == std::errc::file_exists) {
+            if (!holdObject(dst, held))
+                throw Error("object %s disappeared during publication", PathFmt(dst));
+            return;
+        }
+        if (ec == std::errc::no_space_on_device) {
+            /* The object is not kept; every reader tolerates its absence. */
+            printInfo("cannot write object %s: %s", PathFmt(dst), ec.message());
+            return;
+        }
+        throw Error("creating hard link from %1% to %2%: %3%", PathFmt(tmp), PathFmt(dst), ec.message());
+    }
+    /* The temporary is inside the locked hold. Keep it as the
+       protecting link: publication already leaves two links, with
+       no interval in which GC can take the object. A unique name
+       also keeps concurrent writers from reading a partial file. */
+    removeTemporary = false;
+    if (fsync)
+        syncParent(dst);
 }
 
 void GitObjectStore::putBlob(const Hash & id, bool executable, std::string_view bytes, const Hold & hold)

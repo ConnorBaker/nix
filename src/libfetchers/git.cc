@@ -722,11 +722,7 @@ struct GitInputScheme : InputScheme
         return repoInfo;
     }
 
-    uint64_t getLastModified(
-        const Settings & settings,
-        const RepoInfo & repoInfo,
-        const std::filesystem::path & repoDir,
-        const Hash & rev) const
+    uint64_t getLastModified(const Settings & settings, GitRepo & repo, const Hash & rev) const
     {
         Cache::Key key{"gitLastModified", {{"rev", rev.gitRev()}}};
 
@@ -735,7 +731,7 @@ struct GitInputScheme : InputScheme
         if (auto res = cache->lookup(key))
             return getIntAttr(*res, "lastModified");
 
-        auto lastModified = GitRepo::openRepo(repoDir, {})->getLastModified(rev);
+        auto lastModified = repo.getLastModified(rev);
 
         cache->upsert(key, {{"lastModified", lastModified}});
 
@@ -939,7 +935,7 @@ struct GitInputScheme : InputScheme
            We don't care if they specify an incorrect value; it doesn't
            matter for security, unlike narHash. */
         if (!input.attrs.contains("lastModified"))
-            input.attrs.insert_or_assign("lastModified", getLastModified(settings, repoInfo, repoDir, rev));
+            input.attrs.insert_or_assign("lastModified", getLastModified(settings, *repo, rev));
 
         if (!getShallowAttr(input)) {
             /* Like lastModified, skip revCount if supplied by the caller. */
@@ -1102,8 +1098,7 @@ struct GitInputScheme : InputScheme
         }
 
         input.attrs.insert_or_assign(
-            "lastModified",
-            workdirInfo->headRev ? getLastModified(settings, repoInfo, repoPath, *workdirInfo->headRev) : 0);
+            "lastModified", workdirInfo->headRev ? getLastModified(settings, *repo, *workdirInfo->headRev) : 0);
 
         /* A revision returned as worktree metadata is not an identity for
            its rendered files. Git may ignore changed bytes or normalize
