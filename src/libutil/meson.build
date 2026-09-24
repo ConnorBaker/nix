@@ -101,7 +101,7 @@ openssl = dependency(
   'openssl',
   version : '>= 1.1.1',
 )
-deps_private += openssl
+deps_public += openssl
 
 libarchive = dependency('libarchive', version : '>= 3.1.2')
 deps_public += libarchive

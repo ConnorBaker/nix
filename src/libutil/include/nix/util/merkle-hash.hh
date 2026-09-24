@@ -10,10 +10,11 @@
 
 #include <cstdint>
 #include <map>
-#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+
+#include <openssl/sha.h>
 
 #include "nix/util/merkle-files.hh"
 #include "nix/util/hash.hh"
@@ -53,13 +54,15 @@ struct BlobHasher : Sink
 
     ~BlobHasher() override;
 
+    BlobHasher(const BlobHasher &) = delete;
+    BlobHasher & operator=(const BlobHasher &) = delete;
+
     void operator()(std::string_view chunk) override;
 
     Hash finish();
 
 private:
-    struct Context;
-    std::unique_ptr<Context> context;
+    SHA256_CTX context;
 };
 
 Hash blobId(std::string_view bytes);

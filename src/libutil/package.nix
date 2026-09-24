@@ -52,7 +52,6 @@ mkMesonLibrary (finalAttrs: {
     brotli
     libblake3
     libsodium
-    openssl
     zstd
   ]
   ++ lib.optional stdenv.hostPlatform.isx86_64 libcpuid;
@@ -61,6 +60,7 @@ mkMesonLibrary (finalAttrs: {
     boost
     libarchive
     nlohmann_json
+    openssl
   ];
 
   mesonFlags = [

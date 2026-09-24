@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <iterator>
-#include <openssl/sha.h>
 
 #include "nix/util/merkle-hash.hh"
 #include "nix/util/archive.hh"
@@ -38,16 +37,10 @@ void feedHeader(Sink & sink, std::string_view kind, uint64_t size)
     sink(header);
 }
 
-struct BlobHasher::Context
-{
-    SHA256_CTX sha256;
-};
-
 BlobHasher::BlobHasher(uint64_t size)
-    : context(new Context)
 {
     static_assert(hashAlgo == HashAlgorithm::SHA256);
-    SHA256_Init(&context->sha256);
+    SHA256_Init(&context);
     feedHeader(*this, "blob", size);
 }
 
@@ -55,13 +48,13 @@ BlobHasher::~BlobHasher() = default;
 
 void BlobHasher::operator()(std::string_view chunk)
 {
-    SHA256_Update(&context->sha256, chunk.data(), chunk.size());
+    SHA256_Update(&context, chunk.data(), chunk.size());
 }
 
 Hash BlobHasher::finish()
 {
     Hash hash(hashAlgo);
-    SHA256_Final(hash.hash, &context->sha256);
+    SHA256_Final(hash.hash, &context);
     return hash;
 }
 
