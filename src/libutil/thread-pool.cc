@@ -44,26 +44,41 @@ void CopyPool::work(std::promise<void> ready)
     }
     ready.set_value();
     while (true) {
-        std::packaged_task<void()> job;
+        Job job;
         {
             std::unique_lock lock(mutex);
             wake.wait(lock, [&] { return stopping || !pending.empty(); });
             if (pending.empty())
                 return;
-            job = std::move(pending.front().run);
+            job = pending.front();
             pending.pop_front();
         }
-        job();
+        execute(job);
     }
 }
 
-std::future<void> CopyPool::tryAsync(const void * group, const fun<void(size_t, bool)> & run, size_t i)
+void CopyPool::execute(const Job & job)
+{
+    std::exception_ptr failure;
+    try {
+        job.group->run(job.index, true);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    std::lock_guard lock(mutex);
+    auto & result = job.group->children[job.index];
+    result.failure = std::move(failure);
+    result.completed = true;
+    /* Notify before unlocking: the waiter may destroy this group as soon
+       as it observes completion under the same mutex. */
+    job.group->done.notify_one();
+}
+
+void CopyPool::tryAsync(Group & group, size_t i)
 {
     std::unique_lock lock(mutex);
     if (pending.size() == capacity)
-        return {};
-    std::packaged_task<void()> job([&run, i] { run(i, true); });
-    auto result = job.get_future();
+        return;
     if (threads.size() < capacity) {
         std::promise<void> ready;
         auto started = ready.get_future();
@@ -76,30 +91,28 @@ std::future<void> CopyPool::tryAsync(const void * group, const fun<void(size_t, 
             throw;
         }
     }
-    pending.push_back({group, std::move(job)});
+    pending.push_back({&group, i});
+    group.children[i].submitted = true;
     lock.unlock();
     wake.notify_one();
-    return result;
 }
 
-void CopyPool::wait(std::future<void> & result, const void * group)
+void CopyPool::wait(Group & group, Result & result)
 {
-    while (result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-        std::packaged_task<void()> job;
-        {
-            std::lock_guard lock(mutex);
-            auto i = std::find_if(pending.begin(), pending.end(), [&](auto & job) { return job.group == group; });
-            if (i != pending.end()) {
-                job = std::move(i->run);
-                pending.erase(i);
-            }
+    std::unique_lock lock(mutex);
+    while (!result.completed) {
+        auto i = std::find_if(pending.begin(), pending.end(), [&](auto & job) { return job.group == &group; });
+        if (i == pending.end()) {
+            group.done.wait(lock, [&] { return result.completed; });
+        } else {
+            auto job = *i;
+            pending.erase(i);
+            lock.unlock();
+            execute(job);
+            lock.lock();
         }
-        if (!job.valid()) {
-            result.wait();
-            return;
-        }
-        job();
     }
+    result.submitted = false;
 }
 
 void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t, bool)> run, fun<void(size_t)> consume)
@@ -115,14 +128,14 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
     /* Launch stops at the first inline failure. Retain that exception
        through every join, even if an earlier child or fold fails. */
     std::exception_ptr inlineFailure;
-    std::vector<std::future<void>> children(count);
+    Group group{run, std::vector<Result>(count), {}};
     std::exception_ptr failure;
     try {
         for (size_t i = 0; i < count; ++i) {
-            auto & running = children[i];
+            auto & running = group.children[i];
             if (canFork(i))
-                running = tryAsync(&children, run, i);
-            if (!running.valid())
+                tryAsync(group, i);
+            if (!running.submitted)
                 try {
                     run(i, false);
                 } catch (...) {
@@ -134,10 +147,11 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
                 }
         }
         for (size_t i = 0; i < count; ++i) {
-            auto & running = children[i];
-            if (running.valid()) {
-                wait(running, &children);
-                running.get();
+            auto & running = group.children[i];
+            if (running.submitted) {
+                wait(group, running);
+                if (auto childFailure = std::move(running.failure))
+                    std::rethrow_exception(childFailure);
             }
             consume(i);
         }
@@ -148,9 +162,9 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
     }
     /* Join outside exception unwinding: helped jobs must still observe
        interrupts, which are suppressed while a destructor is unwinding. */
-    for (auto & running : children)
-        if (running.valid())
-            wait(running, &children);
+    for (auto & running : group.children)
+        if (running.submitted)
+            wait(group, running);
     if (failure)
         std::rethrow_exception(failure);
 }

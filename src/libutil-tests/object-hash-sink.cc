@@ -440,6 +440,55 @@ TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
     EXPECT_EQ(cases, 2072u);
 }
 
+TEST(CopyPool, predicateFailureJoinsTheLaunchedPrefixWithoutConsumingIt)
+{
+    /* Predicate failure interrupts launch, before any ordered consumption.
+       Already launched visits must finish before their captures can expire. */
+    size_t cases = 0;
+    for (size_t workers = 1; workers <= 8; ++workers) {
+        CopyPool pool(workers);
+        for (size_t count = 2; count <= 4; ++count)
+            for (size_t throwIndex = 0; throwIndex < count; ++throwIndex) {
+                SCOPED_TRACE(fmt("workers=%d count=%d throwIndex=%d", workers, count, throwIndex));
+                std::atomic<size_t> active{0}, started{0}, completed{0};
+                std::vector<size_t> predicates, consumed;
+                std::string failure;
+                try {
+                    pool.ordered(
+                        count,
+                        [&](size_t i) {
+                            predicates.push_back(i);
+                            if (i == throwIndex)
+                                throw std::runtime_error("predicate");
+                            return true;
+                        },
+                        [&](size_t, bool) {
+                            ++active;
+                            ++started;
+                            Finally done{[&] {
+                                --active;
+                                ++completed;
+                            }};
+                        },
+                        [&](size_t i) { consumed.push_back(i); });
+                } catch (const std::runtime_error & e) {
+                    failure = e.what();
+                }
+                std::vector<size_t> expectedPredicates;
+                for (size_t i = 0; i <= throwIndex; ++i)
+                    expectedPredicates.push_back(i);
+                EXPECT_EQ(failure, "predicate");
+                EXPECT_EQ(predicates, expectedPredicates);
+                EXPECT_TRUE(consumed.empty());
+                EXPECT_EQ(active.load(), 0u);
+                EXPECT_EQ(started.load(), throwIndex);
+                EXPECT_EQ(completed.load(), throwIndex);
+                ++cases;
+            }
+    }
+    EXPECT_EQ(cases, 72u);
+}
+
 TEST(CopyPool, nestedScopesJoinBeforeReturning)
 {
     for (size_t workers = 1; workers <= 8; ++workers) {

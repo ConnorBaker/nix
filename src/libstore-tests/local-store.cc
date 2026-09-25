@@ -403,7 +403,7 @@ protected:
        (private to `Hold`; this fixture is its friend). */
     static void dropLock(GitObjectStore::Hold & hold)
     {
-        hold.fd.close();
+        hold.lease->fd.close();
     }
 
     /* The object store's tree readers (private to it; this fixture is its friend). */
@@ -4660,6 +4660,67 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldsCoverEveryKindAndIdentifierShard)
             EXPECT_EQ(hold.linkFor(object), expected);
         }
     }
+}
+
+/* A row view owns the same physical lease, including after its creator is
+   released or moved. Every release order leaves one lock until the last
+   view, while publication and later acquisition use surviving views. */
+TEST_F(LocalStoreObjectsTest, auxiliaryLeaseSurvivesEveryViewReleaseOrder)
+{
+    size_t cases = 0;
+    for (unsigned kind = 0; kind < 3; ++kind)
+        for (unsigned moved = 0; moved < 4; ++moved) {
+            std::array<unsigned, 3> order{0, 1, 2};
+            do {
+                SCOPED_TRACE(fmt("kind=%d moved=%d order=%d%d%d", kind, moved, order[0], order[1], order[2]));
+                GitObjectStore objects{tempStoreDir.path() / fmt("lease-lifetime-%d", cases)};
+                objects.createDirectories();
+                std::array<std::optional<GitObjectStore::Hold>, 3> views;
+                views[0].emplace(objects.hold());
+                views[1].emplace(views[0]->ownRows());
+                views[2].emplace(views[1]->ownRows());
+                auto directory = views[0]->directory();
+                if (moved < views.size()) {
+                    auto transferred = std::move(*views[moved]);
+                    views[moved].reset();
+                    views[moved].emplace(std::move(transferred));
+                }
+                auto bytes = kind == 0 ? std::string{} : std::string{"leased auxiliary bytes"};
+                auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
+                auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
+                auto noRoots = [](fun<void(const ObjectHash &)>) { return uint64_t{0}; };
+                for (size_t step = 0; step < 2; ++step) {
+                    views[order[step]].reset();
+                    ASSERT_TRUE(pathExists(directory));
+                    auto & survivor = *views[order[step + 1]];
+                    EXPECT_EQ(survivor.directory(), directory);
+                    if (step == 0) {
+                        if (kind == 0)
+                            objects.putTree(id, bytes, survivor);
+                        else
+                            objects.putBlob(id, kind == 2, bytes, survivor);
+                    } else
+                        ASSERT_TRUE(
+                            kind == 0 ? objects.holdTree(id, survivor) : objects.holdBlob(id, kind == 2, survivor));
+                    auto swept = objects.sweep(noRoots);
+                    EXPECT_EQ(swept.holds, 1u);
+                    EXPECT_EQ(swept.treesRemoved + swept.blobsRemoved, 0u);
+                    EXPECT_EQ(readFile(file), bytes);
+                    EXPECT_EQ(st(file).st_mode & 07777, kind == 2 ? 0555u : 0444u);
+                    EXPECT_GE(st(file).st_nlink, 2u);
+                }
+                views[order[2]].reset();
+                EXPECT_FALSE(pathExists(directory));
+                EXPECT_EQ(st(file).st_nlink, 1u);
+                auto swept = objects.sweep(noRoots);
+                EXPECT_EQ(swept.holds, 0u);
+                EXPECT_EQ(swept.treesRemoved, kind == 0 ? 1u : 0u);
+                EXPECT_EQ(swept.blobsRemoved, kind == 0 ? 0u : 1u);
+                EXPECT_FALSE(pathExists(file));
+                ++cases;
+            } while (std::next_permutation(order.begin(), order.end()));
+        }
+    EXPECT_EQ(cases, 72u);
 }
 
 TEST_F(LocalStoreObjectsTest, auxiliaryHoldsKeepTheirAddressesAcrossRepair)

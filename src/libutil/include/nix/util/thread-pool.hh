@@ -95,10 +95,24 @@ class CopyPool
     std::mutex mutex;
     std::condition_variable wake;
 
+    struct Result
+    {
+        bool submitted = false; // Only the enclosing ordered() call accesses this.
+        bool completed = false; // Completion and failure are published under mutex.
+        std::exception_ptr failure;
+    };
+
+    struct Group
+    {
+        const fun<void(size_t, bool)> & run;
+        std::vector<Result> children;
+        std::condition_variable done;
+    };
+
     struct Job
     {
-        const void * group;
-        std::packaged_task<void()> run;
+        Group * group;
+        size_t index;
     };
 
     std::deque<Job> pending;
@@ -107,8 +121,9 @@ class CopyPool
     bool stopping = false;
 
     void work(std::promise<void> ready);
-    std::future<void> tryAsync(const void * group, const fun<void(size_t, bool)> & run, size_t i);
-    void wait(std::future<void> & result, const void * group);
+    void execute(const Job & job);
+    void tryAsync(Group & group, size_t i);
+    void wait(Group & group, Result & result);
 
 public:
     explicit CopyPool(size_t workers);

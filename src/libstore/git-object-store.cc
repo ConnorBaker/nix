@@ -438,7 +438,7 @@ static size_t shardOf(const Hash & id)
 
 const std::filesystem::path & GitObjectStore::Hold::directory() const
 {
-    return dir;
+    return lease->dir;
 }
 
 void GitObjectStore::Hold::setRoot(std::filesystem::path root) const
@@ -520,8 +520,16 @@ GitObjectStore::Hold::Hold(
     const std::filesystem::path & tmp,
     const std::function<void()> & atHoldMade,
     std::shared_ptr<AuxiliaryLock> auxiliaryLock)
+    : pending(std::make_unique<Pending>())
+    , lease(std::make_shared<Lease>(tmp, atHoldMade, std::move(auxiliaryLock)))
+{
+}
+
+GitObjectStore::Hold::Lease::Lease(
+    const std::filesystem::path & tmp,
+    const std::function<void()> & atHoldMade,
+    std::shared_ptr<AuxiliaryLock> auxiliaryLock)
     : auxiliaryLock(std::move(auxiliaryLock))
-    , auxiliaryShards(std::make_shared<AuxiliaryShards>())
 {
     /* As `createTempDirInStore` (local-store.cc): the sweep may remove the
        directory between its making and the lock -- it removes a hold it
@@ -544,7 +552,6 @@ GitObjectStore::Hold::Hold(
        `deletePath` racing those `mkdir`s failed with `ENOTEMPTY` and
        abandoned the collection (`08` 1.5; `07`). */
     static std::atomic<uint32_t> counter(0);
-    pending = std::make_unique<Pending>();
     createDirs(tmp);
     while (true) {
         dir = tmp / fmt("hold-%d-%d", getpid(), counter.fetch_add(1));
@@ -572,26 +579,19 @@ GitObjectStore::Hold::Hold(
     }
 }
 
-GitObjectStore::Hold::Hold(
-    const std::filesystem::path & shared,
-    std::shared_ptr<AuxiliaryLock> auxiliaryLock,
-    std::shared_ptr<AuxiliaryShards> auxiliaryShards)
-    : dir(shared)
-    , auxiliaryLock(std::move(auxiliaryLock))
-    , auxiliaryShards(std::move(auxiliaryShards))
+GitObjectStore::Hold::Hold(std::shared_ptr<Lease> lease)
+    : pending(std::make_unique<Pending>())
+    , lease(std::move(lease))
 {
-    /* No `fd`: the lock, and the directory, belong to the hold that made
-       them, and the destructor's `if (!fd) return` is what keeps this one
-       from removing either.  A `Pending` of its own is the whole point. */
-    pending = std::make_unique<Pending>();
 }
 
 GitObjectStore::Hold GitObjectStore::Hold::ownRows() const
 {
-    return Hold(dir, auxiliaryLock, auxiliaryShards);
+    return Hold(lease);
 }
 
 GitObjectStore::Hold::Hold(Hold &&) = default;
+GitObjectStore::Hold::~Hold() = default;
 
 #ifndef _WIN32
 /* A live hold's writers have joined before release. Its directories are
@@ -634,7 +634,7 @@ static void releaseHoldContents(AutoCloseFD scan)
 }
 #endif
 
-GitObjectStore::Hold::~Hold()
+GitObjectStore::Hold::Lease::~Lease()
 {
     if (!fd)
         return;
@@ -654,7 +654,7 @@ GitObjectStore::Hold::~Hold()
     }
 }
 
-std::filesystem::path GitObjectStore::Hold::linkFor(const std::filesystem::path & object) const
+std::filesystem::path::string_type GitObjectStore::Hold::linkNameFor(const std::filesystem::path & object) const
 {
     /* Keep the hold's layout sharded too: a full source can hold tens of
        thousands of trees. Its one lock protects the entire hierarchy,
@@ -665,9 +665,7 @@ std::filesystem::path GitObjectStore::Hold::linkFor(const std::filesystem::path 
     /* These are already path components. Assemble their native spelling
        once; operator/ would split and copy the whole path at each step. */
     std::filesystem::path::string_type parent;
-    parent.reserve(dir.native().size() + kind->native().size() + shard->native().size() + name->native().size() + 3);
-    parent += dir.native();
-    parent += std::filesystem::path::preferred_separator;
+    parent.reserve(kind->native().size() + shard->native().size() + name->native().size() + 2);
     parent += kind->native();
     parent += std::filesystem::path::preferred_separator;
     parent += shard->native();
@@ -681,10 +679,15 @@ std::filesystem::path GitObjectStore::Hold::linkFor(const std::filesystem::path 
         n += 512;
     else
         assert(*kind == "blobs");
-    std::call_once((*auxiliaryShards)[n], [&] { createDirs(parent); });
+    std::call_once(lease->shards[n], [&] { createDirs(lease->dir / parent); });
     parent += std::filesystem::path::preferred_separator;
     parent += name->native();
-    return std::filesystem::path(std::move(parent));
+    return parent;
+}
+
+std::filesystem::path GitObjectStore::Hold::linkFor(const std::filesystem::path & object) const
+{
+    return lease->dir / linkNameFor(object);
 }
 
 GitObjectStore::Hold GitObjectStore::hold() const
@@ -698,9 +701,16 @@ GitObjectStore::Hold GitObjectStore::hold() const
    directory index) leaves the object unheld and says so: what a
    concurrent sweep may then take, the verifier reports and `--optimise`
    re-enters, as before the hold existed. */
-static bool holdObject(const std::filesystem::path & object, const std::filesystem::path & held)
+bool GitObjectStore::Hold::holdObject(
+    const std::filesystem::path & object, const std::filesystem::path::string_type & held) const
 {
-    auto ec = hardLink(object, held);
+#ifdef _WIN32
+    auto ec = hardLink(object, lease->dir / held);
+#else
+    std::error_code ec;
+    if (::linkat(AT_FDCWD, object.c_str(), lease->fd.get(), held.c_str(), 0) == -1)
+        ec = {errno, std::generic_category()};
+#endif
     if (!ec || ec == std::errc::file_exists)
         return true;
     if (ec == std::errc::no_such_file_or_directory)
@@ -709,12 +719,12 @@ static bool holdObject(const std::filesystem::path & object, const std::filesyst
         printInfo("cannot hold object %s: %s", PathFmt(object), ec.message());
         return true;
     }
-    throw Error("creating hard link from %1% to %2%: %3%", PathFmt(object), PathFmt(held), ec.message());
+    throw Error("creating hard link from %1% to %2%: %3%", PathFmt(object), PathFmt(lease->dir / held), ec.message());
 }
 
-static bool holdObject(const std::filesystem::path & object, const GitObjectStore::Hold & hold)
+bool GitObjectStore::Hold::holdObject(const std::filesystem::path & object) const
 {
-    return holdObject(object, hold.linkFor(object));
+    return holdObject(object, linkNameFor(object));
 }
 
 #ifndef _WIN32
@@ -1090,30 +1100,40 @@ void GitObjectStore::enterWritten(
    the temporary still links the same inode, so it has two links from its
    first instant, and the temporary itself is the hold's link;
    an existing file or a competing publisher's object is held instead. */
-static void writeObjectFile(
+void GitObjectStore::Hold::writeObjectFile(
     const std::filesystem::path & dst,
     std::string_view bytes,
     bool executable,
     bool fsync,
-    const GitObjectStore::Hold & hold,
-    const std::function<void(const std::filesystem::path &)> & atFsync)
+    const std::function<void(const std::filesystem::path &)> & atFsync) const
 {
-    auto held = hold.linkFor(dst);
+    auto held = linkNameFor(dst);
     if (holdObject(dst, held))
         return;
     /* This name belongs to an already unique, locked hold. Its lifetime
        is the hold's, so it needs neither the global temporaries' timestamp
        nor their process ID. Own-row views of a hold share this process-wide
-       sequence. Reuse the resolved hold path throughout publication. */
+       sequence. The lease owns the directory resolved by every relative
+       operation; full paths are needed only for Windows and diagnostics. */
     static std::atomic<uint64_t> counter{0};
     auto tmp = held;
-    tmp += fmt(".tmp-%d", counter.fetch_add(1, std::memory_order_relaxed));
+    auto suffix = fmt(".tmp-%d", counter.fetch_add(1, std::memory_order_relaxed));
+    tmp.append(suffix.begin(), suffix.end()); // The suffix is ASCII on every platform.
+    auto tmpPath = [&] { return lease->dir / tmp; };
+    auto unlinkTemporary = [&] {
+#ifdef _WIN32
+        unlinkIfExists(tmpPath());
+#else
+        if (::unlinkat(lease->fd.get(), tmp.c_str(), 0) == -1 && errno != ENOENT)
+            throw SysError("removing %s", PathFmt(tmpPath()));
+#endif
+    };
     bool removeTemporary = true;
     Finally removeTmp{[&] {
         if (!removeTemporary)
             return;
         try {
-            unlinkIfExists(tmp);
+            unlinkTemporary();
         } catch (...) {
             ignoreExceptionExceptInterrupt();
         }
@@ -1123,17 +1143,17 @@ static void writeObjectFile(
     {
         mode_t mode = executable ? 0755 : 0644;
 #ifdef _WIN32
-        AutoCloseFD fd = openNewFileForWrite(tmp, mode, {.writeOnly = true});
+        AutoCloseFD fd = openNewFileForWrite(tmpPath(), mode, {.writeOnly = true});
 #else
-        AutoCloseFD fd{open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, mode)};
+        AutoCloseFD fd{openat(lease->fd.get(), tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, mode)};
 #endif
         if (!fd)
-            throw SysError("creating file %1%", PathFmt(tmp));
+            throw SysError("creating file %1%", PathFmt(tmpPath()));
         writeFull(fd.get(), bytes);
 #ifdef _WIN32
         /* Keep the existing Windows metadata implementation until an
            equivalent permission-only operation is provided there. */
-        canonicaliseTimestampAndPermissions(tmp);
+        canonicaliseTimestampAndPermissions(tmpPath());
 #else
         /* Creation's mode is filtered by the caller's umask. Set the
            exact readable mode before flushing, independently of it. */
@@ -1142,21 +1162,27 @@ static void writeObjectFile(
 #endif
         if (fsync) {
             if (atFsync)
-                atFsync(tmp);
+                atFsync(tmpPath());
             fd.fsync();
         }
     }
-    auto link = [&] {
-        auto ec = hardLink(tmp, dst);
-        if (ec == std::errc::no_such_file_or_directory) {
-            /* The first object of this shard (`createDirectories`). */
-            createDirs(dst.parent_path());
-            ec = hardLink(tmp, dst);
-        }
-        return ec;
+    auto publish = [&] {
+#ifdef _WIN32
+        return hardLink(tmpPath(), dst);
+#else
+        return ::linkat(lease->fd.get(), tmp.c_str(), AT_FDCWD, dst.c_str(), 0) == -1
+                   ? std::error_code{errno, std::generic_category()}
+                   : std::error_code{};
+#endif
     };
-    if (auto ec = link()) {
-        unlinkIfExists(tmp);
+    auto ec = publish();
+    if (ec == std::errc::no_such_file_or_directory) {
+        /* The first object of this shard (`createDirectories`). */
+        createDirs(dst.parent_path());
+        ec = publish();
+    }
+    if (ec) {
+        unlinkTemporary();
         removeTemporary = false;
         if (ec == std::errc::file_exists) {
             if (!holdObject(dst, held))
@@ -1168,7 +1194,7 @@ static void writeObjectFile(
             printInfo("cannot write object %s: %s", PathFmt(dst), ec.message());
             return;
         }
-        throw Error("creating hard link from %1% to %2%: %3%", PathFmt(tmp), PathFmt(dst), ec.message());
+        throw Error("creating hard link from %1% to %2%: %3%", PathFmt(tmpPath()), PathFmt(dst), ec.message());
     }
     /* The temporary is inside the locked hold. Keep it as the
        protecting link: publication already leaves two links, with
@@ -1182,13 +1208,13 @@ static void writeObjectFile(
 void GitObjectStore::putBlob(const Hash & id, bool executable, std::string_view bytes, const Hold & hold)
 {
     auto lock = std::shared_lock{*auxiliaryLock};
-    writeObjectFile(blobFile(id, executable), bytes, executable, fsync, hold, atFsync);
+    hold.writeObjectFile(blobFile(id, executable), bytes, executable, fsync, atFsync);
 }
 
 void GitObjectStore::putTree(const Hash & id, std::string_view body, const Hold & hold)
 {
     auto lock = std::shared_lock{*auxiliaryLock};
-    writeObjectFile(treeFile(id), body, false, fsync, hold, atFsync);
+    hold.writeObjectFile(treeFile(id), body, false, fsync, atFsync);
 }
 
 void GitObjectStore::putRootTree(const merkle::TreeEntry & root, const Hold & hold)
@@ -1200,13 +1226,13 @@ void GitObjectStore::putRootTree(const merkle::TreeEntry & root, const Hold & ho
 bool GitObjectStore::holdTree(const Hash & id, const Hold & hold) const
 {
     auto lock = std::shared_lock{*auxiliaryLock};
-    return holdObject(treeFile(id), hold);
+    return hold.holdObject(treeFile(id));
 }
 
 bool GitObjectStore::holdBlob(const Hash & id, bool executable, const Hold & hold) const
 {
     auto lock = std::shared_lock{*auxiliaryLock};
-    return holdObject(blobFile(id, executable), hold);
+    return hold.holdObject(blobFile(id, executable));
 }
 
 std::optional<std::string> GitObjectStore::readTree(const Hash & id) const

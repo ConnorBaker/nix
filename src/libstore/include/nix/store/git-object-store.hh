@@ -346,35 +346,50 @@ public:
      * store has for files not yet at their name (`createTempDirInStore`,
      * `gc.cc`), and a temp root for a path -- a temp root protects no
      * object; this does.  Nothing waits on a hold: the sweep only tries
-     * its lock.  Move-only; the directory is removed by the destructor.
+     * its lock. Move-only; the last view releases the physical hold.
      */
     class Hold
     {
         friend struct GitObjectStore;
         /* Drops the lock as a crash would (src/libstore-tests/local-store.cc). */
         friend class LocalStoreObjectsTest;
-        std::filesystem::path dir;
-        AutoCloseFD fd;
-        std::shared_ptr<AuxiliaryLock> auxiliaryLock;
-        /* Row views share one physical directory, whose kind/shard
-           directories survive until the owning hold releases it. */
-        using AuxiliaryShards = std::array<std::once_flag, 3 * 256>;
-        std::shared_ptr<AuxiliaryShards> auxiliaryShards;
+
+        /* The physical hold is shared; pending rows belong to each view. */
+        struct Lease
+        {
+            std::filesystem::path dir;
+            AutoCloseFD fd;
+            std::shared_ptr<AuxiliaryLock> auxiliaryLock;
+            std::array<std::once_flag, 3 * 256> shards;
+
+            Lease(
+                const std::filesystem::path & tmp,
+                const std::function<void()> & atHoldMade,
+                std::shared_ptr<AuxiliaryLock> auxiliaryLock);
+            ~Lease();
+        };
     public:
         /* Behind a pointer so that `Hold` stays movable with a mutex in it. */
         struct Pending;
 
     private:
         std::unique_ptr<Pending> pending;
+        std::shared_ptr<Lease> lease;
         Hold(
             const std::filesystem::path & tmp,
             const std::function<void()> & atHoldMade,
             std::shared_ptr<AuxiliaryLock> auxiliaryLock);
-        /* The `ownRows` form: the same directory, no lock of its own. */
-        explicit Hold(
-            const std::filesystem::path & shared,
-            std::shared_ptr<AuxiliaryLock> auxiliaryLock,
-            std::shared_ptr<AuxiliaryShards> auxiliaryShards);
+        explicit Hold(std::shared_ptr<Lease> lease);
+
+        std::filesystem::path::string_type linkNameFor(const std::filesystem::path & object) const;
+        bool holdObject(const std::filesystem::path & object, const std::filesystem::path::string_type & held) const;
+        bool holdObject(const std::filesystem::path & object) const;
+        void writeObjectFile(
+            const std::filesystem::path & dst,
+            std::string_view bytes,
+            bool executable,
+            bool fsync,
+            const std::function<void(const std::filesystem::path &)> & atFsync) const;
 
     public:
         /**
@@ -390,9 +405,8 @@ public:
          * ingestion names a file that does not exist, or -- the sizes
          * agreeing -- one with the wrong bytes.
          *
-         * The directory belongs to the hold that locked it and is not
-         * removed by this one, so the objects stay held until the batch is
-         * done, which is what K16 asks.
+         * The directory and its lock survive until the last view is
+         * released. Rows and ingestion identity remain private to each view.
          */
         Hold ownRows() const;
 
