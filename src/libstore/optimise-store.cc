@@ -18,6 +18,7 @@
 #include "nix/util/thread-pool.hh"
 
 #include <algorithm>
+#include <boost/container/small_vector.hpp>
 #include <map>
 #include <mutex>
 #include <set>
@@ -715,7 +716,13 @@ struct MaterialisingVisitor : LinkingVisitor
             std::optional<HashedNode> node;
         };
 
-        std::vector<Child> kids;
+        boost::container::small_vector<
+            Child,
+            1,
+            void,
+            boost::container::small_vector_options_t<
+                boost::container::growth_factor<boost::container::growth_factor_100>>>
+            kids;
         CaseHackNames hack;
         children([&](std::string_view name, bool isDirectory, fun<HashedNode()> visit) {
             /* The disk name is the tree name plus an optional suffix. */

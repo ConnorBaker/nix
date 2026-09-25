@@ -4,6 +4,7 @@
 #include "nix/util/finally.hh"
 
 #include <algorithm>
+#include <boost/container/small_vector.hpp>
 
 namespace nix {
 
@@ -135,7 +136,13 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
             std::optional<HashedNode> node;
         };
 
-        std::vector<Child> kids;
+        boost::container::small_vector<
+            Child,
+            1,
+            void,
+            boost::container::small_vector_options_t<
+                boost::container::growth_factor<boost::container::growth_factor_100>>>
+            kids;
         children([&](std::string_view name, bool subdirectory, fun<HashedNode()> visit) {
             kids.push_back({std::string(name), subdirectory, std::move(visit), std::nullopt});
         });
