@@ -66,19 +66,18 @@ void CopyPool::execute(const Job & job)
         failure = std::current_exception();
     }
     std::lock_guard lock(mutex);
-    auto & result = job.group->children[job.index];
-    result.failure = std::move(failure);
-    result.completed = true;
+    job.group->failures[job.index] = std::move(failure);
     /* Notify before unlocking: the waiter may destroy this group as soon
        as it observes completion under the same mutex. */
-    job.group->done.notify_one();
+    if (!--job.group->remaining)
+        job.group->done.notify_one();
 }
 
-void CopyPool::tryAsync(Group & group, size_t i)
+bool CopyPool::tryAsync(Group & group, size_t i)
 {
     std::unique_lock lock(mutex);
     if (pending.size() == capacity)
-        return;
+        return false;
     if (threads.size() < capacity) {
         std::promise<void> ready;
         auto started = ready.get_future();
@@ -92,18 +91,19 @@ void CopyPool::tryAsync(Group & group, size_t i)
         }
     }
     pending.push_back({&group, i});
-    group.children[i].submitted = true;
+    ++group.remaining;
     lock.unlock();
     wake.notify_one();
+    return true;
 }
 
-void CopyPool::wait(Group & group, Result & result)
+void CopyPool::wait(Group & group)
 {
     std::unique_lock lock(mutex);
-    while (!result.completed) {
+    while (group.remaining) {
         auto i = std::find_if(pending.begin(), pending.end(), [&](auto & job) { return job.group == &group; });
         if (i == pending.end()) {
-            group.done.wait(lock, [&] { return result.completed; });
+            group.done.wait(lock, [&] { return !group.remaining; });
         } else {
             auto job = *i;
             pending.erase(i);
@@ -112,7 +112,6 @@ void CopyPool::wait(Group & group, Result & result)
             lock.lock();
         }
     }
-    result.submitted = false;
 }
 
 void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t, bool)> run, fun<void(size_t)> consume)
@@ -125,48 +124,35 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
         return;
     }
 
-    /* Launch stops at the first inline failure. Retain that exception
-       through every join, even if an earlier child or fold fails. */
-    std::exception_ptr inlineFailure;
-    Group group{run, std::vector<Result>(count), {}};
+    Group group{run, std::vector<std::exception_ptr>(count), 0, {}};
     std::exception_ptr failure;
     try {
         for (size_t i = 0; i < count; ++i) {
-            auto & running = group.children[i];
-            if (canFork(i))
-                tryAsync(group, i);
-            if (!running.submitted)
-                try {
-                    run(i, false);
-                } catch (...) {
-                    inlineFailure = std::current_exception();
-                    /* Fold the preceding prefix first: its failures take
-                       precedence over this child's failed visit. */
-                    count = i;
-                    break;
-                }
-        }
-        for (size_t i = 0; i < count; ++i) {
-            auto & running = group.children[i];
-            if (running.submitted) {
-                wait(group, running);
-                if (auto childFailure = std::move(running.failure))
-                    std::rethrow_exception(childFailure);
+            if (canFork(i) && tryAsync(group, i))
+                continue;
+            try {
+                run(i, false);
+            } catch (...) {
+                group.failures[i] = std::current_exception();
+                /* Stop launching, but let the ordered fold choose between
+                   this visit's failure and the preceding prefix. */
+                count = i + 1;
+                break;
             }
-            consume(i);
         }
-        if (inlineFailure)
-            std::rethrow_exception(inlineFailure);
     } catch (...) {
         failure = std::current_exception();
     }
     /* Join outside exception unwinding: helped jobs must still observe
        interrupts, which are suppressed while a destructor is unwinding. */
-    for (auto & running : group.children)
-        if (running.submitted)
-            wait(group, running);
+    wait(group);
     if (failure)
         std::rethrow_exception(failure);
+    for (size_t i = 0; i < count; ++i) {
+        if (auto & childFailure = group.failures[i])
+            std::rethrow_exception(childFailure);
+        consume(i);
+    }
 }
 
 void ThreadPoolShutDown::anchor() {}

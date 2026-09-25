@@ -95,17 +95,11 @@ class CopyPool
     std::mutex mutex;
     std::condition_variable wake;
 
-    struct Result
-    {
-        bool submitted = false; // Only the enclosing ordered() call accesses this.
-        bool completed = false; // Completion and failure are published under mutex.
-        std::exception_ptr failure;
-    };
-
     struct Group
     {
         const fun<void(size_t, bool)> & run;
-        std::vector<Result> children;
+        std::vector<std::exception_ptr> failures;
+        size_t remaining = 0;
         std::condition_variable done;
     };
 
@@ -122,8 +116,8 @@ class CopyPool
 
     void work(std::promise<void> ready);
     void execute(const Job & job);
-    void tryAsync(Group & group, size_t i);
-    void wait(Group & group, Result & result);
+    bool tryAsync(Group & group, size_t i);
+    void wait(Group & group);
 
 public:
     explicit CopyPool(size_t workers);
@@ -132,6 +126,7 @@ public:
     static size_t defaultWorkers();
 
     /** Evaluate a finite sequence, then consume its results in order.
+     * Visits and their results must be independent of consuming this sequence.
      * `run` receives whether it needs a detached traversal scope. Every
      * submitted job is joined before return, including on failure. Child
      * and consume failures are reported in traversal order, independently
