@@ -9,6 +9,11 @@
 #include <gmock/gmock.h>
 #include <rapidcheck/gtest.h>
 #include <algorithm>
+#include <cerrno>
+
+#if !defined(_WIN32) && !defined(__CYGWIN__)
+#  include "nix/util/unix-domain-socket.hh"
+#endif
 
 namespace nix {
 
@@ -82,6 +87,195 @@ TEST_F(FSSourceAccessorTest, works)
         accessor->maybeLstat(CanonPath("file1"));
         EXPECT_GT(accessor->getLastModified(), 0);
     }
+}
+
+/* Fourteen reads and twenty-seven exclusive creates. Reads cover seven
+   terminal kinds through immediate/nested parents; creation also covers
+   FIFO/socket entries and a root destination with a separately opened parent. */
+TEST_F(FSSourceAccessorTest, terminalFileOperationsPreserveKindsAndExclusiveCreation)
+{
+#if defined(_WIN32) || defined(__CYGWIN__)
+    GTEST_SKIP() << "POSIX terminal-open matrix excludes Windows and Cygwin";
+#else
+    enum class Layout { Immediate, Nested, RootDestination };
+    enum class Kind { Absent, Regular, Executable, Directory, Symlink, Dangling, Loop, Fifo, Socket };
+    const std::string original("before\0after", 12);
+    const std::string created("created\0bytes", 13);
+    for (auto layout : {Layout::Immediate, Layout::Nested, Layout::RootDestination})
+        for (auto kind :
+             {Kind::Absent,
+              Kind::Regular,
+              Kind::Executable,
+              Kind::Directory,
+              Kind::Symlink,
+              Kind::Dangling,
+              Kind::Loop,
+              Kind::Fifo,
+              Kind::Socket}) {
+            SCOPED_TRACE(::testing::Message() << "layout=" << int(layout) << " kind=" << int(kind));
+            auto base = tmpDir / (std::to_string(int(layout)) + "-" + std::to_string(int(kind)));
+            const CanonPath path(layout == Layout::Nested ? "nested/leaf" : "leaf");
+            auto terminal = base / path.rel();
+            auto parent = terminal.parent_path();
+            createDirs(parent);
+            writeFile(parent / "target", "target bytes");
+            AutoCloseFD socket;
+            switch (kind) {
+            case Kind::Absent:
+                break;
+            case Kind::Regular:
+            case Kind::Executable:
+                writeFile(terminal, original);
+                ASSERT_EQ(::chmod(terminal.c_str(), kind == Kind::Executable ? 0755 : 0644), 0);
+                break;
+            case Kind::Directory:
+                createDirs(terminal);
+                writeFile(terminal / "marker", original);
+                break;
+            case Kind::Symlink:
+                createSymlink("target", terminal);
+                break;
+            case Kind::Dangling:
+                createSymlink("missing", terminal);
+                break;
+            case Kind::Loop:
+                createSymlink("leaf", terminal);
+                break;
+            case Kind::Fifo:
+                ASSERT_EQ(::mkfifo(terminal.c_str(), 0600), 0);
+                break;
+            case Kind::Socket:
+                socket = createUnixDomainSocket(terminal, 0600);
+                break;
+            }
+            auto before = nix::maybeLstat(terminal);
+            ASSERT_EQ(before.has_value(), kind != Kind::Absent);
+            if (kind == Kind::Fifo)
+                ASSERT_TRUE(S_ISFIFO(before->st_mode));
+            if (kind == Kind::Socket)
+                ASSERT_TRUE(S_ISSOCK(before->st_mode));
+
+            if (layout != Layout::RootDestination && kind != Kind::Fifo && kind != Kind::Socket) {
+                auto accessor = makeFSSourceAccessor(base);
+                size_t sizes = 0, chunks = 0;
+                std::string received;
+                LambdaSink sink([&](std::string_view bytes) {
+                    EXPECT_EQ(sizes, 1u);
+                    ++chunks;
+                    received.append(bytes);
+                });
+                auto read = [&] {
+                    accessor->readFile(path, sink, [&](uint64_t size) {
+                        EXPECT_EQ(sizes, 0u);
+                        EXPECT_EQ(chunks, 0u);
+                        ++sizes;
+                        EXPECT_EQ(size, original.size());
+                    });
+                };
+                if (kind == Kind::Regular || kind == Kind::Executable) {
+                    EXPECT_NO_THROW(read());
+                    EXPECT_EQ(sizes, 1u);
+                    EXPECT_EQ(received, original);
+                } else {
+                    if (kind == Kind::Absent)
+                        EXPECT_THAT(
+                            read,
+                            ::testing::ThrowsMessage<FileNotFound>(
+                                testing::HasSubstrIgnoreANSIMatcher(terminal.string())));
+                    else if (kind == Kind::Directory)
+                        EXPECT_THAT(
+                            read,
+                            ::testing::ThrowsMessage<NotARegularFile>(
+                                testing::HasSubstrIgnoreANSIMatcher(terminal.string())));
+                    else {
+                        try {
+                            read();
+                            ADD_FAILURE() << "reading a terminal symlink succeeded";
+                        } catch (const SymlinkNotAllowed & error) {
+                            EXPECT_EQ(error.path, path);
+                            EXPECT_THAT(error.what(), testing::HasSubstrIgnoreANSIMatcher(terminal.string()));
+                        }
+                    }
+                    EXPECT_EQ(sizes, 0u);
+                    EXPECT_EQ(chunks, 0u);
+                    EXPECT_TRUE(received.empty());
+                }
+            }
+
+            RestoreSink destination(/*startFsync=*/false);
+            destination.dstPath = layout == Layout::RootDestination ? terminal : base;
+            if (layout != Layout::RootDestination)
+                destination.dirFd = openDirectory(base, FinalSymlink::Follow);
+            auto destinationPath = layout == Layout::RootDestination ? CanonPath::root : path;
+            bool called = false;
+            auto create = [&] {
+                destination.createRegularFile(destinationPath, [&](CreateRegularFileSink & file) {
+                    called = true;
+                    file(created);
+                });
+            };
+            if (kind == Kind::Absent) {
+                EXPECT_NO_THROW(create());
+                EXPECT_TRUE(called);
+                EXPECT_TRUE(S_ISREG(nix::lstat(terminal).st_mode));
+                EXPECT_EQ(nix::readFile(terminal), created);
+            } else {
+                try {
+                    create();
+                    ADD_FAILURE() << "exclusive creation replaced an existing entry";
+                } catch (const SysError & error) {
+                    EXPECT_EQ(error.errNo, EEXIST);
+                    EXPECT_THAT(error.what(), testing::HasSubstrIgnoreANSIMatcher(terminal.string()));
+                }
+                EXPECT_FALSE(called);
+                auto after = nix::lstat(terminal);
+                EXPECT_EQ(after.st_dev, before->st_dev);
+                EXPECT_EQ(after.st_ino, before->st_ino);
+                EXPECT_EQ(after.st_mode, before->st_mode);
+                if (kind == Kind::Regular || kind == Kind::Executable)
+                    EXPECT_EQ(nix::readFile(terminal), original);
+                else if (kind == Kind::Directory)
+                    EXPECT_EQ(nix::readFile(terminal / "marker"), original);
+                else if (kind == Kind::Symlink || kind == Kind::Dangling || kind == Kind::Loop)
+                    EXPECT_EQ(
+                        std::filesystem::read_symlink(terminal),
+                        std::filesystem::path(
+                            kind == Kind::Symlink    ? "target"
+                            : kind == Kind::Dangling ? "missing"
+                                                     : "leaf"));
+            }
+            EXPECT_EQ(nix::readFile(parent / "target"), "target bytes");
+            EXPECT_FALSE(nix::pathExists(parent / "missing"));
+        }
+#endif
+}
+
+TEST_F(FSSourceAccessorTest, readFileRejectsTerminalProcFdMagicLink)
+{
+#ifndef __linux__
+    GTEST_SKIP() << "procfs magic links are Linux-specific";
+#else
+    if (!std::filesystem::is_directory("/proc/self/fd"))
+        GTEST_SKIP() << "procfs fd directory is unavailable";
+    auto target = tmpDir / "target";
+    writeFile(target, "target bytes");
+    auto fd = openFileReadonly(target);
+    auto accessor = makeFSSourceAccessor("/proc/self/fd");
+    const auto path = CanonPath::fromFilename(std::to_string(fd.get()));
+    bool sizeCalled = false, dataCalled = false;
+    LambdaSink sink([&](std::string_view) { dataCalled = true; });
+    try {
+        accessor->readFile(path, sink, [&](uint64_t) { sizeCalled = true; });
+        ADD_FAILURE() << "reading a terminal procfs magic link succeeded";
+    } catch (const SymlinkNotAllowed & error) {
+        EXPECT_EQ(error.path, path);
+        EXPECT_THAT(
+            error.what(), testing::HasSubstrIgnoreANSIMatcher(std::string("/proc/self/fd/") + std::string(path.rel())));
+    }
+    EXPECT_FALSE(sizeCalled);
+    EXPECT_FALSE(dataCalled);
+    EXPECT_EQ(nix::readFile(target), "target bytes");
+#endif
 }
 
 TEST_F(FSSourceAccessorTest, listingAndScopeUseTheSameOpenedDirectory)

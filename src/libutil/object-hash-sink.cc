@@ -207,25 +207,29 @@ void ObjectHashSink::createDirectory(const CanonPath & path)
 
 void ObjectHashSink::createDirectory(const CanonPath & path, DirectoryCreatedCallback callback)
 {
-    deliver(path, [&] {
-        return visitor.directory(path, [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
+    auto visit = [&] {
+        auto children = [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
             open.push_back(&each);
             Finally close{[&] { open.pop_back(); }};
             /* As the base class's default: the same sink, the same path, so
                the children arrive at `path / name`. */
             callback(*this, path);
-        });
-    });
+        };
+        return visitor.directory(path, std::ref(children));
+    };
+    deliver(path, std::ref(visit));
 }
 
 void ObjectHashSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
 {
-    deliver(path, [&] { return visitor.regular(path, func); });
+    auto visit = [&] { return visitor.regular(path, func); };
+    deliver(path, std::ref(visit));
 }
 
 void ObjectHashSink::createSymlink(const CanonPath & path, const std::string & target)
 {
-    deliver(path, [&] { return visitor.symlink(path, target); });
+    auto visit = [&] { return visitor.symlink(path, target); };
+    deliver(path, std::ref(visit));
 }
 
 ObjectHashSink::Result ObjectHashSink::finish()

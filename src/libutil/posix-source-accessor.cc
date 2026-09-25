@@ -498,19 +498,14 @@ void PosixDirectorySourceAccessor::readFile(const CanonPath & path, Sink & sink,
     if (path.isRoot())
         throw NotARegularFile("'%s' is not a regular file", showPath(path));
 
-    /* TODO: We can do better when we have openat2. */
     auto [parentFd, parentFdOwning] = openParentAndUpsert(path, /*ignoreMissing=*/false);
-    AutoCloseFD fileFd;
-
-    try {
-        fileFd =
-            openFileEnsureBeneathNoSymlinks(parentFd, CanonPath::root / path.baseName().value(), O_RDONLY | O_CLOEXEC);
-    } catch (SymlinkNotAllowed & e) {
-        auto parent = path.parent().value();
-        throw SymlinkNotAllowed(parent / e.path, "path '%s' is a symlink", showPath(parent / e.path));
-    }
+    /* The parent is already open; the canonical basename is one
+       NUL-terminated component, so only its final symlink must be refused. */
+    AutoCloseFD fileFd{::openat(parentFd, path.baseName()->data(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
 
     if (!fileFd) {
+        if (errno == NIX_ERR_OPEN_SYMLINK)
+            throw SymlinkNotAllowed(path, "path '%s' is a symlink", showPath(path));
         if (errno == ENOENT)
             throw FileNotFound("file '%s' does not exist", showPath(path));
         throw SysError("opening '%s'", showPath(path));

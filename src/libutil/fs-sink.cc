@@ -255,7 +255,12 @@ std::unique_ptr<RegularFileWriter> RestoreSink::beginRegularFile(const CanonPath
                component are not followed. */
             constexpr int flags = O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC;
             auto [_parentFd, fd, name] = getParentFdAndName(dirFd.get(), dstPath, path);
-            return openFileEnsureBeneathNoSymlinks(fd, name, flags, 0666);
+            /* The parent is already resolved and name is one validated component.
+               O_CREAT | O_EXCL refuses an existing final symlink. */
+            AutoCloseFD file{::openat(fd, name.rel_c_str(), flags, 0666)};
+            if (!file && errno == NIX_ERR_OPEN_SYMLINK)
+                throw SymlinkNotAllowed(name);
+            return file;
         }()
 #endif
     );
