@@ -12,7 +12,7 @@
 #include <thread>
 #include <map>
 #include <atomic>
-#include <deque>
+#include <vector>
 #include <future>
 
 namespace nix {
@@ -109,7 +109,7 @@ class CopyPool
         size_t index;
     };
 
-    std::deque<Job> pending;
+    std::vector<Job> pending;
     std::vector<std::thread> threads;
     size_t capacity;
     bool stopping = false;

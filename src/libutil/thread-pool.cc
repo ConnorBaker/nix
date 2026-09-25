@@ -13,6 +13,7 @@ CopyPool::CopyPool(size_t workers)
 {
     assert(workers >= 1);
     threads.reserve(capacity);
+    pending.reserve(capacity);
 }
 
 CopyPool::~CopyPool()
@@ -51,7 +52,7 @@ void CopyPool::work(std::promise<void> ready)
             if (pending.empty())
                 return;
             job = pending.front();
-            pending.pop_front();
+            pending.erase(pending.begin());
         }
         execute(job);
     }
