@@ -1433,14 +1433,15 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
         auto st = maybeLstat(*winner.representative);
         if (!st || !GitObjectStore::validHolderMetadata(winner.holder, row.executable, *st))
             continue;
-        result.representatives.push_back({
+        GitObjectStore::Hold::Row replacement{
             .id = row.id,
             .executable = row.executable,
             .ino = st->st_ino,
             .dev = st->st_dev,
             .size = static_cast<uint64_t>(st->st_size),
             .name = *winner.representative == root ? "" : winner.representative->lexically_relative(root).string(),
-        });
+        };
+        result.representatives.push_back(std::move(replacement));
     }
     return result;
 #endif
