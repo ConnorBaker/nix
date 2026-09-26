@@ -1,6 +1,6 @@
 # Lazy-store status
 
-Measured revision `7a6fb248d` has lower separate wall medians and median paired wall-time ratios in **all nine cases** against branch base `8aad447`, with **70/75 pairs faster**. All 156 output checks and eighteen complete store comparisons pass. CPU medians remain higher in three cases and peak RSS in seven; resource reduction remains unresolved.
+Measured revision `ad86c3f39` is faster in eight of nine cases against fixed base `8aad447`, with **69/75 wall pairs faster**. **The all-cases-faster goal is not met:** cold-path separate and paired wall statistics are higher. All 156 outputs and eighteen store comparisons pass, but CPU medians are higher in three cases and RSS in six.
 
 ## Semantic model
 
@@ -16,24 +16,24 @@ The [specification](01-specification.md), [implementation derivation](04-derivat
 
 ## Current validation
 
-Validated source `7a6fb248d` carries the observed parent name directly and projects recorded logical store-path basenames in both holder lookup and coalescing, preserving descriptor ownership and native physical joins. Its [whole-checkout gates](/home/connorbaker/Benchmarks/nix-performance-fixes/holder-projection-completion-validation/README.md) pass **2,514 utility/store/fetcher/expression cases**, with **zero failures, two skips and three disabled cases**, including all 23 required cases; **sixteen functional and twelve real-overlay targets pass without skips**. The exact optimized release passes **207 packaged tests, zero failures and 36 skips**. This two-file cleanup adds no tests.
+The one-file status change traverses an owned libgit2 list directly, retaining flags, entry/path order, membership, dirtiness and cleanup before submodule discovery. Other pack callbacks retain exception relays; raw-tree naming remains separate. [Current gates](/home/connorbaker/Benchmarks/nix-performance-fixes/status-list-validation-ad86c3f39/README.md) pass **614 unit cases, zero failures, one skip and one disabled case**, including seven required Git cases, plus **five Git functional targets without skips**. The optimized release passes **207 packaged tests, zero failures and 36 skips**. No tests were added; the initial formatting failure remains archived.
 
-[Source domains and compiled limits](09-performance.md#current-source-validation) remain explicit. Windows runtime remains unverified. Tests check documented behavior and lifetimes, not exact internal allocations or stack frames; numerical and profile evidence remains bound to the revisions it names.
+[Source and compiled limits](09-performance.md#current-source-validation) distinguish these gates from earlier full-checkout/overlay validation. Tests do not measure exact allocations or stack frames; Windows remains unverified.
 
 ## Performance
 
-The workload retains five cold and ten warm pairs per case. Cold means fresh private application state with warm OS caches; GitHub cold timings include network access. Reductions in **median paired wall-time ratio against branch base** are:
+Five cold and ten warm pairs per case retain every observation. Cold means fresh private application state with warm OS caches; GitHub cold includes network access. Median paired wall change against fixed base (negative means lower):
 
 | Workload | `path:` | `git+file:` | `github:` |
 | --- | ---: | ---: | ---: |
-| Cold · 32 attributes | 1.28% | 20.20% | 29.52% |
-| Warm · 8 attributes | 87.17% | 7.31% | 14.55% |
-| Warm · 32 attributes | 73.71% | 4.36% | 9.00% |
+| Cold · 32 attributes | +3.48% | -19.48% | -32.49% |
+| Warm · 8 attributes | -87.31% | -5.94% | -12.90% |
+| Warm · 32 attributes | -73.13% | -3.59% | -9.07% |
 
-Cold-path CPU rises **3.10→6.37 s** and RSS **445.21→486.76 MiB**, both higher in every pair. Both warm Git cases also use more CPU. Lower wall time has not resolved these resource costs.
+Cold-path CPU rises **3.16→6.70 s** and RSS **445.22→476.50 MiB**, both higher in every pair. Warm Git8/Git32 CPU is also higher in every pair. Resource reduction remains unresolved.
 
-The [direct 7a817 comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-7a6fb248d-vs-7a817d25e-audit/README.md) passes another 156 exact outputs but has only **33/75 faster wall pairs**: seven lower separate wall medians versus five lower paired ratios. Cold and warm-32 GitHub reverse from lower separate wall medians to higher paired ratios. Cold-path paired wall/CPU rise **119.69 ms/0.58 s**, while RSS falls **14.07 MiB**. Paired CPU has three lower, three tied and three higher cases; RSS has five lower and four higher. No overall direct resource benefit is established.
+The [direct 7a6 comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-ad86c3f39-vs-7a6fb248d-audit/README.md) passes another 156 outputs but has only **36/75 wall wins**: four lower separate medians, three lower paired ratios and two lower paired differences. Paired CPU has seven higher cases. Cold-path paired wall/CPU rise **103.45 ms/0.15 s** despite slightly lower RSS. Warm Git8’s paired wall ratio is lower but its paired difference higher. No overall direct benefit or causal status-edit effect is established.
 
-The current [7a6 user-cycle profiles](09-performance.md#current-7a6base-user-cycle-profiles) cover all nine cases in eighteen captures, six warm seeds and 24 exact outputs. They retain one empty stack, unknown frames and incomplete callers; overlapping user routes cannot attribute system CPU, allocated bytes or peak RSS. Historical syscall and PMU observations retain their own revision boundaries.
+Historical [7a6 user](09-performance.md#historical-7a6base-user-cycle-profiles) and [kernel](09-performance.md#historical-7a6base-kernel-profiles) profiles cover all nine cases separately. Empty/unknown frames, incomplete callers, differing environments and overlapping routes prevent exact allocation, system-seconds or RSS attribution; neither collection measures ad86.
 
-The [performance report](09-performance.md), [current samples](runs/2026-09-21-performance/paired-7a6fb248d.json), [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-7a6fb248d-audit/README.md) and [release provenance](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-7a6fb248d.json) retain exact bindings and limits. Historical comparisons and the retained interference/repetition incident remain linked there; separate series are not pooled.
+The [performance report](09-performance.md), [current samples](runs/2026-09-21-performance/paired-ad86c3f39.json), [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-ad86c3f39-audit/README.md) and [provenance](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-ad86c3f39.json) retain bindings and limits. Historical adverse comparisons, corrections and interference/repetition records remain linked there; series are not pooled.
