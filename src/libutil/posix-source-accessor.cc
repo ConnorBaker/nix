@@ -277,7 +277,7 @@ private:
         /**
          * `path.parent()`, so that callers don't recompute it (which copies a string).
          */
-        std::optional<CanonPath> parent;
+        CanonPath parent;
 
         /**
          * Whether `fdOwning` came out of `dirFdCache` under exactly `parent`.
@@ -453,13 +453,13 @@ PosixDirectorySourceAccessor::openParentAndUpsert(const CanonPath & path, bool i
             else
                 throw FileNotFound("path '%s' does not exist", showPath(path));
         }
-        throw SysError("opening directory '%1%'", showPath(*parent));
+        throw SysError("opening directory '%1%'", showPath(parent));
     }
 
     /* A cached fd needs no upsert: `LRUCache::get()` has already promoted it. */
     if (dirFdCache && parentFdOwning && !fromCache) {
         assert(*parentFdOwning);
-        insertIntoDirFdCache(*parent, ref<AutoCloseFD>(parentFdOwning));
+        insertIntoDirFdCache(parent, ref<AutoCloseFD>(parentFdOwning));
     }
 
     return {parentFd, std::move(parentFdOwning)};

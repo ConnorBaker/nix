@@ -534,7 +534,7 @@ LocalStore::LocalStore(ref<const Config> config)
                     .size = static_cast<uint64_t>(use.getInt(2)),
                     /* The column holds the *logical* store path; the holder is
                        a file on disk under the real store directory. */
-                    .file = (getRealStoreDir() / std::filesystem::path(use.getStr(3)).filename()).string(),
+                    .file = (getRealStoreDir() / baseNameOf(use.getStr(3))).string(),
                     .ingestion = static_cast<uint64_t>(std::get<2>(candidate)),
                 };
                 auto name = use.getStr(4);
