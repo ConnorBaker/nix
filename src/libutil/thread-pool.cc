@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <optional>
+#include <utility>
 
 namespace nix {
 
@@ -51,8 +52,8 @@ void CopyPool::work(std::promise<void> ready)
             wake.wait(lock, [&] { return stopping || !pending.empty(); });
             if (pending.empty())
                 return;
-            job = pending.front();
-            pending.erase(pending.begin());
+            job = pending.back();
+            pending.pop_back();
         }
         execute(job);
     }
@@ -106,8 +107,8 @@ void CopyPool::wait(Group & group)
         if (i == pending.end()) {
             group.done.wait(lock, [&] { return !group.remaining; });
         } else {
-            auto job = *i;
-            pending.erase(i);
+            auto job = std::exchange(*i, pending.back());
+            pending.pop_back();
             lock.unlock();
             execute(job);
             lock.lock();
