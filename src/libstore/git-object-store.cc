@@ -655,40 +655,34 @@ GitObjectStore::Hold::Lease::~Lease()
     }
 }
 
-std::filesystem::path::string_type GitObjectStore::Hold::linkNameFor(const std::filesystem::path & object) const
+std::pair<std::filesystem::path, std::filesystem::path::string_type>
+GitObjectStore::Hold::namesFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const
 {
-    /* Keep the hold's layout sharded too: a full source can hold tens of
-       thousands of trees. Its one lock protects the entire hierarchy,
-       and both normal release and the stale-hold sweep remove it recursively. */
-    auto name = std::prev(object.end());
-    auto shard = std::prev(name);
-    auto kind = std::prev(shard);
-    /* These are already path components. Assemble their native spelling
-       once; operator/ would split and copy the whole path at each step. */
-    std::filesystem::path::string_type parent;
-    parent.reserve(kind->native().size() + shard->native().size() + name->native().size() + 2);
-    parent += kind->native();
-    parent += std::filesystem::path::preferred_separator;
-    parent += shard->native();
-    auto shardName = shard->string();
-    assert(isShardName(shardName));
-    auto digit = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
-    size_t n = digit(shardName[0]) * 16 + digit(shardName[1]);
-    if (kind->native() == OS_STR("blobs-x"))
-        n += 256;
-    else if (kind->native() == OS_STR("trees"))
-        n += 512;
-    else
-        assert(kind->native() == OS_STR("blobs"));
-    std::call_once(lease->shards[n], [&] { createDirs(lease->dir / parent); });
-    parent += std::filesystem::path::preferred_separator;
-    parent += name->native();
-    return parent;
+    /* The caller owns the public namespace; the lease owns only the hold.
+       Keep the existing global spelling and native conversion before any
+       held shard is created. The generated suffix is ASCII at every width. */
+    size_t kind = object.mode == merkle::Mode::Directory ? 2 : object.mode == merkle::Mode::Executable ? 1 : 0;
+    const std::array<const std::string *, 3> prefixes{&objects.blobsDir, &objects.blobsXDir, &objects.treesDir};
+    constexpr std::array<OsStringView, 3> kinds{OS_STR("blobs"), OS_STR("blobs-x"), OS_STR("trees")};
+    std::filesystem::path dst = nameUnder(*prefixes[kind], object.hash);
+    auto idSize = base16::encodedLength(object.hash.hashSize);
+    auto name = dst.native().end() - idSize;
+    auto shard = name - 3; // Two shard digits and the following separator.
+    std::filesystem::path::string_type held;
+    held.reserve(kinds[kind].size() + idSize + 4);
+    held += kinds[kind];
+    held += std::filesystem::path::preferred_separator;
+    held.append(shard, shard + 2);
+    std::call_once(lease->shards[kind * 256 + object.hash.hash[0]], [&] { createDirs(lease->dir / held); });
+    held += std::filesystem::path::preferred_separator;
+    held.append(name, dst.native().end());
+    return {std::move(dst), std::move(held)};
 }
 
-std::filesystem::path GitObjectStore::Hold::linkFor(const std::filesystem::path & object) const
+std::filesystem::path
+GitObjectStore::Hold::linkFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const
 {
-    return lease->dir / linkNameFor(object);
+    return lease->dir / namesFor(objects, object).second;
 }
 
 GitObjectStore::Hold GitObjectStore::hold() const
@@ -702,7 +696,7 @@ GitObjectStore::Hold GitObjectStore::hold() const
    directory index) leaves the object unheld and says so: what a
    concurrent sweep may then take, the verifier reports and `--optimise`
    re-enters, as before the hold existed. */
-bool GitObjectStore::Hold::holdObject(
+bool GitObjectStore::Hold::linkObject(
     const std::filesystem::path & object, const std::filesystem::path::string_type & held) const
 {
 #ifdef _WIN32
@@ -723,9 +717,10 @@ bool GitObjectStore::Hold::holdObject(
     throw Error("creating hard link from %1% to %2%: %3%", PathFmt(object), PathFmt(lease->dir / held), ec.message());
 }
 
-bool GitObjectStore::Hold::holdObject(const std::filesystem::path & object) const
+bool GitObjectStore::Hold::holdObject(const GitObjectStore & objects, const merkle::TreeEntry & object) const
 {
-    return holdObject(object, linkNameFor(object));
+    auto [file, held] = namesFor(objects, object);
+    return linkObject(file, held);
 }
 
 #ifndef _WIN32
@@ -1102,14 +1097,13 @@ void GitObjectStore::enterWritten(
    first instant, and the temporary itself is the hold's link;
    an existing file or a competing publisher's object is held instead. */
 void GitObjectStore::Hold::writeObjectFile(
-    const std::filesystem::path & dst,
-    std::string_view bytes,
-    bool executable,
-    bool fsync,
-    const std::function<void(const std::filesystem::path &)> & atFsync) const
+    const GitObjectStore & objects, const merkle::TreeEntry & object, std::string_view bytes) const
 {
-    auto tmp = linkNameFor(dst);
-    if (holdObject(dst, tmp))
+    bool executable = object.mode == merkle::Mode::Executable;
+    bool fsync = objects.fsync;
+    const auto & atFsync = objects.atFsync;
+    auto [dst, tmp] = namesFor(objects, object);
+    if (linkObject(dst, tmp))
         return;
     /* This name belongs to an already unique, locked hold. Its lifetime
        is the hold's, so it needs neither the global temporaries' timestamp
@@ -1188,7 +1182,7 @@ void GitObjectStore::Hold::writeObjectFile(
         if (ec == std::errc::file_exists) {
             /* The losing temporary is gone; reuse its name to hold the winner. */
             tmp.resize(heldSize);
-            if (!holdObject(dst, tmp))
+            if (!linkObject(dst, tmp))
                 throw Error("object %s disappeared during publication", PathFmt(dst));
             return;
         }
@@ -1208,34 +1202,22 @@ void GitObjectStore::Hold::writeObjectFile(
         syncParent(dst);
 }
 
-void GitObjectStore::putBlob(const Hash & id, bool executable, std::string_view bytes, const Hold & hold)
+void GitObjectStore::putObject(const merkle::TreeEntry & object, std::string_view bytes, const Hold & hold)
 {
     auto lock = std::shared_lock{*auxiliaryLock};
-    hold.writeObjectFile(blobFile(id, executable), bytes, executable, fsync, atFsync);
-}
-
-void GitObjectStore::putTree(const Hash & id, std::string_view body, const Hold & hold)
-{
-    auto lock = std::shared_lock{*auxiliaryLock};
-    hold.writeObjectFile(treeFile(id), body, false, fsync, atFsync);
+    hold.writeObjectFile(*this, object, bytes);
 }
 
 void GitObjectStore::putRootTree(const merkle::TreeEntry & root, const Hold & hold)
 {
     if (auto body = merkle::syntheticRootTree(root))
-        putTree(merkle::treeId(*body), *body, hold);
+        putObject({merkle::Mode::Directory, merkle::treeId(*body)}, *body, hold);
 }
 
-bool GitObjectStore::holdTree(const Hash & id, const Hold & hold) const
+bool GitObjectStore::holdObject(const merkle::TreeEntry & object, const Hold & hold) const
 {
     auto lock = std::shared_lock{*auxiliaryLock};
-    return hold.holdObject(treeFile(id));
-}
-
-bool GitObjectStore::holdBlob(const Hash & id, bool executable, const Hold & hold) const
-{
-    auto lock = std::shared_lock{*auxiliaryLock};
-    return hold.holdObject(blobFile(id, executable));
+    return hold.holdObject(*this, object);
 }
 
 std::optional<std::string> GitObjectStore::readTree(const Hash & id) const

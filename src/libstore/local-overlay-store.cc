@@ -246,7 +246,7 @@ void LocalOverlayStore::sweepObjectStore()
     /* The objects this store owns are the upper layer's: `.objects` under
        the merged store directory is the union of the two layers', and
        every object this store writes lands in the upper one (the one
-       route's `putTree`, `putBlob` and `place`/`link` all go through the
+       route's `putObject` and `place`/`link` all go through the
        merged directory).  A blob of the lower store's that an ingestion
        here hard-linked was copied up by overlayfs -- a link never crosses
        layers -- so the upper layer also holds copies of lower blobs; each

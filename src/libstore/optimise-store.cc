@@ -201,14 +201,14 @@ struct ObjectStoreVisitor : HashingVisitor
     HashedNode symlink(const CanonPath & path, const std::string & target) override
     {
         auto node = HashingVisitor::symlink(path, target);
-        objects.putBlob(node.entry.hash, false, target, hold);
+        objects.putObject(node.entry, target, hold);
         return node;
     }
 
     HashedNode directory(const CanonPath & path, Children children) override
     {
         auto [node, body] = hashDirectory(path, std::move(children));
-        objects.putTree(node.entry.hash, body, hold);
+        objects.putObject(node.entry, body, hold);
         return node;
     }
 };
@@ -907,7 +907,7 @@ struct MaterialisingVisitor : LinkingVisitor
 
         case merkle::Mode::Symlink: {
             auto file = objects.blobFile(entry.hash, false);
-            if (!objects.holdBlob(entry.hash, false, materialisationHold))
+            if (!objects.holdObject(entry, materialisationHold))
                 return std::nullopt;
             auto target = objects.readBlob(entry.hash, false);
             if (!target)
@@ -926,7 +926,7 @@ struct MaterialisingVisitor : LinkingVisitor
         case merkle::Mode::Directory: {
             if (depth >= narMaxDepth)
                 throw Error("path %s exceeds maximum NAR directory depth of %d", PathFmt(where), narMaxDepth);
-            if (!objects.holdTree(entry.hash, materialisationHold))
+            if (!objects.holdObject(entry, materialisationHold))
                 return std::nullopt;
             auto tree = objects.readVerifiedTree(entry.hash);
             if (!tree)

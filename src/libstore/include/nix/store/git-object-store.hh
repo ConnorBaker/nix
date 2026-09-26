@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 #include <memory>
 #include <mutex>
@@ -195,7 +196,7 @@ public:
      * inode query uses the database. A directory removed after the open
      * must not abort a collection. The 256 shards
      * under each of the three kinds are *not* made here: a shard is made
-     * by the first auxiliary write into it (`putBlob` or `putTree`, on
+     * by the first auxiliary write into it (`putObject`, on
      * the `ENOENT` its publication link gets), so that opening
      * a writable store costs four `mkdir`s and not 772, and a store holds
      * only the shards it has used. Auxiliary readers treat their absence
@@ -381,15 +382,12 @@ public:
             std::shared_ptr<AuxiliaryLock> auxiliaryLock);
         explicit Hold(std::shared_ptr<Lease> lease);
 
-        std::filesystem::path::string_type linkNameFor(const std::filesystem::path & object) const;
-        bool holdObject(const std::filesystem::path & object, const std::filesystem::path::string_type & held) const;
-        bool holdObject(const std::filesystem::path & object) const;
-        void writeObjectFile(
-            const std::filesystem::path & dst,
-            std::string_view bytes,
-            bool executable,
-            bool fsync,
-            const std::function<void(const std::filesystem::path &)> & atFsync) const;
+        std::pair<std::filesystem::path, std::filesystem::path::string_type>
+        namesFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
+        bool linkObject(const std::filesystem::path & object, const std::filesystem::path::string_type & held) const;
+        bool holdObject(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
+        void
+        writeObjectFile(const GitObjectStore & objects, const merkle::TreeEntry & object, std::string_view bytes) const;
 
     public:
         /**
@@ -485,14 +483,15 @@ public:
         Hold & operator=(Hold &&) = delete;
         ~Hold();
         /**
-         * Where the link to the object file `object` (under
-         * `<kind>/<shard>/`, `<kind>` one of `blobs`, `blobs-x`, `trees`)
-         * goes: `<hold>/<kind>/<shard>/<id>`. A newly published object can
+         * Where this hold claims `object` in `objects`: directory entries
+         * use `trees`, executable entries use `blobs-x`, and regular or
+         * symlink entries use `blobs`. The name is
+         * `<hold>/<kind>/<shard>/<id>`. A newly published object can
          * instead be protected by its retained `<id>.tmp-*` link. Regular
          * files use their store-path holders, not these auxiliary links.
          * Shards are made on demand.
          */
-        std::filesystem::path linkFor(const std::filesystem::path & object) const;
+        std::filesystem::path linkFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
     };
 
     /**
@@ -502,11 +501,8 @@ public:
      */
     Hold hold() const;
 
-    /** Write the blob's file for a mode from bytes, when absent, and hold it. */
-    void putBlob(const Hash & id, bool executable, std::string_view bytes, const Hold & hold);
-
-    /** Write the tree's body, when absent, and hold it. */
-    void putTree(const Hash & id, std::string_view body, const Hold & hold);
+    /** Write the auxiliary entry's bytes, when absent, and hold its address. */
+    void putObject(const merkle::TreeEntry & object, std::string_view bytes, const Hold & hold);
 
     /**
      * Write the synthetic root tree of an executable or symlink root
@@ -520,8 +516,7 @@ public:
      * second route): false when the store lacks it -- swept meanwhile, or
      * never there -- and the caller falls back.
      */
-    bool holdTree(const Hash & id, const Hold & hold) const;
-    bool holdBlob(const Hash & id, bool executable, const Hold & hold) const;
+    bool holdObject(const merkle::TreeEntry & object, const Hold & hold) const;
 
     /** Auxiliary blob bytes, absent when missing; nonregular occupants are
      * rejected without following symlinks or waiting for a FIFO writer.

@@ -531,15 +531,12 @@ AutoCloseFD PosixDirectorySourceAccessor::openSubdirectory(const CanonPath & pat
         if (!dirFdOwning)
             throw SysError("opening directory '%s'", showPath(path));
     } else {
-        /* TODO: We can do better when we have openat2. */
         auto [parentFd, parentFdOwning] = openParentAndUpsert(path, /*ignoreMissing=*/false);
 
         try {
-            dirFdOwning = openFileEnsureBeneathNoSymlinks(
-                parentFd, CanonPath::root / path.baseName().value(), O_DIRECTORY | O_RDONLY | O_CLOEXEC);
-        } catch (SymlinkNotAllowed & e) {
-            auto parent = path.parent().value();
-            throw SymlinkNotAllowed(parent / e.path, "path '%s' is a symlink", showPath(parent / e.path));
+            dirFdOwning = unix::openFileFinalComponentNoSymlinks(parentFd, path, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+        } catch (SymlinkNotAllowed &) {
+            throw SymlinkNotAllowed(path, "path '%s' is a symlink", showPath(path));
         }
 
         if (!dirFdOwning) {

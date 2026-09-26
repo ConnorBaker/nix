@@ -149,6 +149,28 @@ openat2(Descriptor dirFd, const char * path, uint64_t flags, uint64_t mode, uint
 namespace unix {
 
 /**
+ * Open only the final component of @p path relative to its already resolved
+ * @p parentFd. Earlier components of @p path are diagnostic context, not lookup
+ * operands; SymlinkNotAllowed carries the full @p path.
+ *
+ * The caller resolves the parent with the required ancestor policy and keeps
+ * it alive for this call. The returned descriptor owns the opened object.
+ *
+ * This is the final-component operation used by the iterative
+ * openFileEnsureBeneathNoSymlinks implementation, with the same flag and error
+ * policy: O_PATH without O_DIRECTORY permits a final symlink descriptor;
+ * O_CREAT | O_EXCL reports EEXIST for an existing final symlink. ENOTDIR is
+ * disambiguated by a separate no-follow status observation, which can itself
+ * throw or observe a concurrently replaced entry.
+ *
+ * @pre path.isRoot() is false; flags must not include O_NOFOLLOW.
+ * @return An owned descriptor, or an invalid descriptor with errno set.
+ * @throws SymlinkNotAllowed for a rejected final symlink.
+ * @throws SysError if the no-follow status observation fails.
+ */
+AutoCloseFD openFileFinalComponentNoSymlinks(Descriptor parentFd, const CanonPath & path, int flags, mode_t mode = 0);
+
+/**
  * Try to change the mode of file named by @p path relative to the parent directory denoted by @p dirFd.
  *
  * @note When on linux without fchmodat2 support and without procfs mounted falls back to fchmodat without

@@ -140,6 +140,41 @@ void unix::fchmodatTryNoFollow(Descriptor dirFd, const CanonPath & path, mode_t 
     }
 }
 
+AutoCloseFD unix::openFileFinalComponentNoSymlinks(Descriptor parentFd, const CanonPath & path, int flags, mode_t mode)
+{
+    assert(!path.isRoot());
+    assert(!(flags & O_NOFOLLOW));
+
+    auto lastComponent = path.baseName().value();
+    AutoCloseFD res = ::openat(parentFd, lastComponent.data(), flags | O_NOFOLLOW, mode);
+
+    if (!res) {
+        if (errno == NIX_ERR_OPEN_SYMLINK)
+            throw SymlinkNotAllowed(path);
+        /* `O_DIRECTORY | O_NOFOLLOW` on a trailing symlink returns
+           `ENOTDIR` rather than `ELOOP`. Post-check via `fstatat` to
+           disambiguate — only on the error path, so the common
+           successful-directory-open case pays no extra syscall. */
+        if (errno == ENOTDIR) {
+            if (auto st = maybeFstatat(parentFd, lastComponent); st && S_ISLNK(st->st_mode))
+                throw SymlinkNotAllowed(path);
+            /* Put back errno so the caller will get the original
+               error. */
+            errno = ENOTDIR;
+        }
+        return res;
+    }
+
+    /* For `O_PATH`, the defensive `| O_NOFOLLOW` we added above
+       means a trailing symlink silently succeeds with an fd to the
+       symlink itself (`O_PATH | O_NOFOLLOW` is the idiomatic way to
+       obtain a symlink fd). This is intentional — `O_PATH` callers
+       are asking for a path reference, and interior symlinks are
+       the responsibility of the caller that resolved the parent. */
+
+    return res;
+}
+
 static AutoCloseFD openFileEnsureBeneathNoSymlinksIterative(
     Descriptor dirFd,
     const CanonPath & path,
@@ -201,34 +236,7 @@ static AutoCloseFD openFileEnsureBeneathNoSymlinksIterative(
         parentFd = std::move(parentFd2);
     }
 
-    auto lastComponent = std::string(path.baseName().value());
-    AutoCloseFD res = ::openat(getParentFd(), lastComponent.c_str(), flags | O_NOFOLLOW, mode);
-
-    if (!res) {
-        if (errno == NIX_ERR_OPEN_SYMLINK)
-            throw SymlinkNotAllowed(path);
-        /* `O_DIRECTORY | O_NOFOLLOW` on a trailing symlink returns
-           `ENOTDIR` rather than `ELOOP`. Post-check via `fstatat` to
-           disambiguate — only on the error path, so the common
-           successful-directory-open case pays no extra syscall. */
-        if (errno == ENOTDIR) {
-            if (auto st = maybeFstatat(getParentFd(), lastComponent); st && S_ISLNK(st->st_mode))
-                throw SymlinkNotAllowed(path);
-            /* Put back errno so the caller will get the original
-               error. */
-            errno = ENOTDIR;
-        }
-        return res;
-    }
-
-    /* For `O_PATH`, the defensive `| O_NOFOLLOW` we added above
-       means a trailing symlink silently succeeds with an fd to the
-       symlink itself (`O_PATH | O_NOFOLLOW` is the idiomatic way to
-       obtain a symlink fd). This is intentional — `O_PATH` callers
-       are asking for a path reference, and interior symlinks are
-       already guarded by the component-by-component walk above. */
-
-    return res;
+    return unix::openFileFinalComponentNoSymlinks(getParentFd(), path, flags, mode);
 }
 
 AutoCloseFD openFileEnsureBeneathNoSymlinks(

@@ -1724,7 +1724,7 @@ TEST_F(LocalStoreObjectsTest, sweepAbortsOnACorruptTree)
 }
 
 /* Laws 4 and 5 under a lost window (01 section 9.10, "Collection"): a
-   valid path whose root tree a collection took between `putTree` and its
+   valid path whose root tree a collection took between `putObject` and its
    registration.  The next sweep, with that path live, counts the root as
    unentered and keeps nothing beneath it -- the orphaned `d/` tree goes,
    and with it the symlink's blob, held by nothing but the tree that named
@@ -4265,11 +4265,13 @@ TEST_F(LocalStoreObjectsTest, auxiliaryPublicationCannotRaceSweepDeletion)
                 auto bytes = kind == 0 ? std::string{} : std::string{"target"};
                 auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
                 auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
+                merkle::TreeEntry address{
+                    kind == 0   ? merkle::Mode::Directory
+                    : kind == 2 ? merkle::Mode::Executable
+                                : merkle::Mode::Regular,
+                    id};
                 auto publish = [&](GitObjectStore & into, const GitObjectStore::Hold & hold) {
-                    if (kind == 0)
-                        into.putTree(id, bytes, hold);
-                    else
-                        into.putBlob(id, kind == 2, bytes, hold);
+                    into.putObject(address, bytes, hold);
                 };
                 {
                     auto initial = objects.hold();
@@ -4297,8 +4299,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryPublicationCannotRaceSweepDeletion)
                                             publish(writerObjects, hold);
                                             return true;
                                         }
-                                        return kind == 0 ? writerObjects.holdTree(id, hold)
-                                                         : writerObjects.holdBlob(id, kind == 2, hold);
+                                        return writerObjects.holdObject(address, hold);
                                     };
                                     if (allowed) {
                                         auto result = acquire();
@@ -4352,11 +4353,10 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldReleaseWaitsForTheRootSnapshotSweep)
             auto mode = kind == 0   ? merkle::Mode::Directory
                         : kind == 1 ? merkle::Mode::Symlink
                                     : merkle::Mode::Executable;
+            writerObjects.putObject({mode, id}, bytes, *hold);
             if (kind == 0) {
-                writerObjects.putTree(id, bytes, *hold);
                 createDir(realPath / childName);
             } else {
-                writerObjects.putBlob(id, kind == 2, bytes, *hold);
                 if (kind == 1)
                     createSymlink(bytes, realPath / childName);
                 else {
@@ -4366,7 +4366,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldReleaseWaitsForTheRootSnapshotSweep)
             }
             auto body = merkle::serialiseTree({{kind == 0 ? childName + "/" : childName, {mode, id}}});
             auto root = merkle::treeId(body);
-            writerObjects.putTree(root, body, *hold);
+            writerObjects.putObject({merkle::Mode::Directory, root}, body, *hold);
             ValidPathInfo info{path, UnkeyedValidPathInfo{*store, ObjectHash{root}}};
             std::future<void> writer;
             objects.sweep([&](fun<void(const ObjectHash &)> live) {
@@ -4425,7 +4425,7 @@ TEST_F(LocalStoreObjectsTest, overlappingAuxiliaryReadersKeepTheLockUntilBothFin
     };
     auto first = std::async(std::launch::async, [&] {
         try {
-            objects.putBlob(merkle::blobId("first"), false, "first", firstHold);
+            objects.putObject({merkle::Mode::Regular, merkle::blobId("first")}, "first", firstHold);
         } catch (...) {
             if (!notified)
                 entered.set_exception(std::current_exception());
@@ -4445,7 +4445,7 @@ TEST_F(LocalStoreObjectsTest, overlappingAuxiliaryReadersKeepTheLockUntilBothFin
             first.wait();
     }};
     enteredFuture.get();
-    objects.putBlob(merkle::blobId("second"), false, "second", secondHold);
+    objects.putObject({merkle::Mode::Regular, merkle::blobId("second")}, "second", secondHold);
     auto probe = openLockFile(objects.dir / "gc.lock", true);
     EXPECT_FALSE(lockFile(probe.get(), ltWrite, false)) << "one reader is still publishing";
     release();
@@ -4462,18 +4462,18 @@ TEST_F(LocalStoreObjectsTest, publishedAuxiliaryObjectRetainsItsOriginalHoldLink
     auto file = objects.treeFile(id);
     {
         auto hold = objects.hold();
-        objects.putTree(id, body, hold);
+        objects.putObject({merkle::Mode::Directory, id}, body, hold);
         auto published = st(file);
         EXPECT_EQ(published.st_nlink, 2u);
         bool found = false;
-        for (auto & entry : DirectoryIterator{hold.linkFor(file).parent_path()}) {
+        for (auto & entry : DirectoryIterator{hold.linkFor(objects, {merkle::Mode::Directory, id}).parent_path()}) {
             EXPECT_EQ(st(entry.path()).st_ino, published.st_ino);
             found = true;
         }
         EXPECT_TRUE(found);
         /* A second writer must hold the completed global object. */
         auto other = objects.hold();
-        objects.putTree(id, body, other);
+        objects.putObject({merkle::Mode::Directory, id}, body, other);
         EXPECT_EQ(st(file).st_ino, published.st_ino);
         EXPECT_EQ(st(file).st_nlink, 3u);
     }
@@ -4503,17 +4503,19 @@ TEST_F(LocalStoreObjectsTest, competingAuxiliaryPublicationHoldsTheWinner)
                 std::optional<GitObjectStore::Hold> first{objects.hold()};
                 std::optional<GitObjectStore::Hold> second{winnerObjects.hold()};
                 auto firstDir = first->directory(), secondDir = second->directory();
-                auto firstClaim = first->linkFor(file);
-                auto secondClaim = second->linkFor(file);
+                merkle::TreeEntry address{
+                    kind == 0   ? merkle::Mode::Directory
+                    : kind == 2 ? merkle::Mode::Executable
+                                : merkle::Mode::Regular,
+                    id};
+                auto firstClaim = first->linkFor(objects, address);
+                auto secondClaim = second->linkFor(winnerObjects, address);
                 std::filesystem::path firstTemporary, winningTemporary;
                 std::optional<PosixStat> winner;
                 size_t firstWrites = 0, secondWrites = 0;
                 bool publishingWinner = false;
                 auto publish = [&](GitObjectStore & into, const GitObjectStore::Hold & hold) {
-                    if (kind == 0)
-                        into.putTree(id, bytes, hold);
-                    else
-                        into.putBlob(id, kind == 2, bytes, hold);
+                    into.putObject(address, bytes, hold);
                 };
                 auto checkTemporary = [&](const std::filesystem::path & tmp) {
                     auto metadata = st(tmp);
@@ -4632,7 +4634,7 @@ TEST_F(LocalStoreObjectsTest, holdsNeverReuseAnExistingName)
         auto fresh = objects.hold();
         EXPECT_EQ(fresh.directory(), expected);
         EXPECT_TRUE(std::filesystem::is_empty(fresh.directory()));
-        objects.putTree(merkle::treeId(""), "", fresh);
+        objects.putObject({merkle::Mode::Directory, merkle::treeId("")}, "", fresh);
     }
     EXPECT_FALSE(pathExists(expected));
     EXPECT_EQ(readFile(partial / "unfinished.tmp-0"), "old ingestion");
@@ -4651,13 +4653,16 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldsCoverEveryKindAndIdentifierShard)
     for (unsigned int byte = 0; byte < 256; ++byte) {
         Hash id{HashAlgorithm::SHA256};
         id.hash[0] = byte;
-        for (auto object : {objects.blobFile(id, false), objects.blobFile(id, true), objects.treeFile(id)}) {
+        for (auto mode : {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Directory}) {
+            auto object = mode == merkle::Mode::Directory ? objects.treeFile(id)
+                                                          : objects.blobFile(id, mode == merkle::Mode::Executable);
             auto relative = object.lexically_relative(objects.dir);
             auto expected = hold.directory() / relative;
-            EXPECT_EQ(hold.linkFor(object), expected);
+            merkle::TreeEntry address{mode, id};
+            EXPECT_EQ(hold.linkFor(objects, address), expected);
             EXPECT_TRUE(std::filesystem::is_directory(expected.parent_path()));
-            EXPECT_EQ(shared.linkFor(object), expected);
-            EXPECT_EQ(hold.linkFor(object), expected);
+            EXPECT_EQ(shared.linkFor(objects, address), expected);
+            EXPECT_EQ(hold.linkFor(objects, address), expected);
         }
     }
 }
@@ -4688,20 +4693,21 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLeaseSurvivesEveryViewReleaseOrder)
                 auto bytes = kind == 0 ? std::string{} : std::string{"leased auxiliary bytes"};
                 auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
                 auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
+                merkle::TreeEntry address{
+                    kind == 0   ? merkle::Mode::Directory
+                    : kind == 2 ? merkle::Mode::Executable
+                                : merkle::Mode::Regular,
+                    id};
                 auto noRoots = [](fun<void(const ObjectHash &)>) { return uint64_t{0}; };
                 for (size_t step = 0; step < 2; ++step) {
                     views[order[step]].reset();
                     ASSERT_TRUE(pathExists(directory));
                     auto & survivor = *views[order[step + 1]];
                     EXPECT_EQ(survivor.directory(), directory);
-                    if (step == 0) {
-                        if (kind == 0)
-                            objects.putTree(id, bytes, survivor);
-                        else
-                            objects.putBlob(id, kind == 2, bytes, survivor);
-                    } else
-                        ASSERT_TRUE(
-                            kind == 0 ? objects.holdTree(id, survivor) : objects.holdBlob(id, kind == 2, survivor));
+                    if (step == 0)
+                        objects.putObject(address, bytes, survivor);
+                    else
+                        ASSERT_TRUE(objects.holdObject(address, survivor));
                     auto swept = objects.sweep(noRoots);
                     EXPECT_EQ(swept.holds, 1u);
                     EXPECT_EQ(swept.treesRemoved + swept.blobsRemoved, 0u);
@@ -4736,15 +4742,13 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldsKeepTheirAddressesAcrossRepair)
                     auto bytes = kind == 0 ? std::string{} : fmt("repaired-auxiliary-%d", cases);
                     auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
                     auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
-                    auto put = [&](const GitObjectStore::Hold & hold) {
-                        if (kind == 0)
-                            objects.putTree(id, bytes, hold);
-                        else
-                            objects.putBlob(id, kind == 2, bytes, hold);
-                    };
-                    auto acquire = [&](const GitObjectStore::Hold & hold) {
-                        return kind == 0 ? objects.holdTree(id, hold) : objects.holdBlob(id, kind == 2, hold);
-                    };
+                    merkle::TreeEntry address{
+                        kind == 0   ? merkle::Mode::Directory
+                        : kind == 2 ? merkle::Mode::Executable
+                                    : merkle::Mode::Regular,
+                        id};
+                    auto put = [&](const GitObjectStore::Hold & hold) { objects.putObject(address, bytes, hold); };
+                    auto acquire = [&](const GitObjectStore::Hold & hold) { return objects.holdObject(address, hold); };
                     if (spelling != 0) {
                         auto seed = objects.hold();
                         put(seed);
@@ -4759,7 +4763,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldsKeepTheirAddressesAcrossRepair)
                     else {
                         ASSERT_TRUE(acquire(hold));
                         if (spelling == 2) {
-                            auto name = hold.linkFor(file);
+                            auto name = hold.linkFor(objects, address);
                             std::filesystem::rename(name, name.parent_path().parent_path() / name.filename());
                         }
                     }
@@ -4805,13 +4809,13 @@ TEST_F(LocalStoreObjectsTest, heldTreeAddressesDoNotReplaceReachabilityTraversal
             auto tree = merkle::treeId(body);
             {
                 auto seed = objects.hold();
-                objects.putBlob(blob, false, "target", seed);
-                objects.putTree(tree, body, seed);
+                objects.putObject({merkle::Mode::Regular, blob}, "target", seed);
+                objects.putObject({merkle::Mode::Directory, tree}, body, seed);
             }
             auto hold = objects.hold();
-            ASSERT_TRUE(objects.holdTree(tree, hold));
+            ASSERT_TRUE(objects.holdObject({merkle::Mode::Directory, tree}, hold));
             if (childHeld)
-                ASSERT_TRUE(objects.holdBlob(blob, false, hold));
+                ASSERT_TRUE(objects.holdObject({merkle::Mode::Regular, blob}, hold));
             objects.sweep([&](fun<void(const ObjectHash &)> live) {
                 if (reachable)
                     live(ObjectHash::of({merkle::Mode::Directory, tree}));
@@ -4903,6 +4907,11 @@ TEST_F(LocalStoreObjectsTest, auxiliaryRepairPreservesAConcurrentReplacement)
             auto bytes = kind == 0 ? std::string{} : fmt("sound-replacement-%d", cases);
             auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
             auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
+            merkle::TreeEntry address{
+                kind == 0   ? merkle::Mode::Directory
+                : kind == 2 ? merkle::Mode::Executable
+                            : merkle::Mode::Regular,
+                id};
             createDirs(file.parent_path());
             writeFile(file, "corrupt old incarnation");
             auto old = st(file);
@@ -4917,12 +4926,9 @@ TEST_F(LocalStoreObjectsTest, auxiliaryRepairPreservesAConcurrentReplacement)
                 /* This is the real verifier's diagnostic boundary, after
                    hashing but before removal, with no scheduling or seam. */
                 nestedErrors = store->verifyStore(true, Repair);
-                if (replacement == 1) {
-                    if (kind == 0)
-                        objects.putTree(id, bytes, hold);
-                    else
-                        objects.putBlob(id, kind == 2, bytes, hold);
-                } else if (replacement == 2)
+                if (replacement == 1)
+                    objects.putObject(address, bytes, hold);
+                else if (replacement == 2)
                     writeFile(file, "a different corrupt replacement with a different size");
             };
             auto oldLogger = std::exchange(logger, &mismatch);
@@ -5006,8 +5012,13 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldClaimsDoNotDependOnTheOldInodeKind)
                 }
 
                 std::optional<GitObjectStore::Hold> hold{objects.hold()};
-                auto claim =
-                    flat ? hold->directory() / namespaces[space] / GitObjectStore::idString(id) : hold->linkFor(file);
+                merkle::TreeEntry address{
+                    space == 0   ? merkle::Mode::Directory
+                    : space == 2 ? merkle::Mode::Executable
+                                 : merkle::Mode::Regular,
+                    id};
+                auto claim = flat ? hold->directory() / namespaces[space] / GitObjectStore::idString(id)
+                                  : hold->linkFor(objects, address);
                 createDirs(claim.parent_path());
                 if (kind == Kind::Directory) {
                     /* Directories cannot be hard-linked, but a corrupted
@@ -5016,9 +5027,9 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldClaimsDoNotDependOnTheOldInodeKind)
                     createDir(claim);
                     writeFile(claim / "not-an-auxiliary-claim", "untouched until hold release");
                 } else {
-                    ASSERT_TRUE(space == 0 ? objects.holdTree(id, *hold) : objects.holdBlob(id, space == 2, *hold));
+                    ASSERT_TRUE(objects.holdObject(address, *hold));
                     if (flat)
-                        std::filesystem::rename(hold->linkFor(file), claim);
+                        std::filesystem::rename(hold->linkFor(objects, address), claim);
                     EXPECT_EQ(st(claim).st_ino, st(file).st_ino);
                 }
                 EXPECT_TRUE(store->verifyStore(true, NoRepair));
@@ -5027,10 +5038,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryHoldClaimsDoNotDependOnTheOldInodeKind)
                 EXPECT_EQ(readFile(outside), bytes) << "a corrupt symlink is never followed";
                 {
                     auto replacement = objects.hold();
-                    if (space == 0)
-                        objects.putTree(id, bytes, replacement);
-                    else
-                        objects.putBlob(id, space == 2, bytes, replacement);
+                    objects.putObject(address, bytes, replacement);
                 }
                 ASSERT_EQ(st(file).st_nlink, 1u);
                 objects.sweep([](fun<void(const ObjectHash &)>) { return uint64_t{0}; });
@@ -5132,7 +5140,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryReadersRejectNonregularOccupants)
                 source->root = MemorySourceAccessor::File{MemorySourceAccessor::File::Symlink{.target = target}};
             if (role == Role::MaterialiseTree) {
                 auto hold = objects.hold();
-                objects.putBlob(targetId, false, target, hold);
+                objects.putObject({merkle::Mode::Regular, targetId}, target, hold);
             }
             auto spare = objects.blobFile(merkle::blobId("unreachable reader-test sentinel"), false);
             if (role == Role::Sweep) {
@@ -5255,6 +5263,11 @@ TEST_F(LocalStoreObjectsTest, auxiliaryRepairRecognizesARestoredShardDirectory)
             auto bytes = kind == 0 ? std::string{} : std::string{"restored shard bytes"};
             auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
             auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
+            merkle::TreeEntry address{
+                kind == 0   ? merkle::Mode::Directory
+                : kind == 2 ? merkle::Mode::Executable
+                            : merkle::Mode::Regular,
+                id};
             auto shard = file.parent_path();
             auto outside = tempStoreDir.path() / fmt("outside-restored-shard-%d-%d", kind, populated);
             createDirs(outside);
@@ -5267,10 +5280,8 @@ TEST_F(LocalStoreObjectsTest, auxiliaryRepairRecognizesARestoredShardDirectory)
                 nestedErrors = objects.verify(Repair);
                 if (!populated)
                     createDirs(shard);
-                else if (kind == 0)
-                    objects.putTree(id, bytes, hold);
                 else
-                    objects.putBlob(id, kind == 2, bytes, hold);
+                    objects.putObject(address, bytes, hold);
             };
             auto oldLogger = std::exchange(logger, &mismatch);
             auto oldVerbosity = std::exchange(verbosity, lvlInfo);
@@ -5337,7 +5348,7 @@ TEST_F(LocalStoreObjectsTest, releasingAHoldDoesNotFollowSymlinks)
         dir = hold.directory();
         createSymlink(outside, dir / "outside-link");
         std::filesystem::create_hard_link(outside / "keep", dir / "extra-link");
-        store->objects.putTree(merkle::treeId(""), "", hold);
+        store->objects.putObject({merkle::Mode::Directory, merkle::treeId("")}, "", hold);
     }
     EXPECT_FALSE(pathExists(dir));
     EXPECT_EQ(readFile(outside / "keep"), "untouched");
@@ -5369,7 +5380,7 @@ TEST_F(LocalStoreObjectsTest, writeAuxiliaryBytesAndModeBeforeFsync)
 
     auto hold = objects.hold();
     what = "a symlink's target blob";
-    objects.putBlob(merkle::blobId("one"), false, "one", hold);
+    objects.putObject({merkle::Mode::Regular, merkle::blobId("one")}, "one", hold);
     what = "a tree body";
     auto root = merkle::TreeEntry{merkle::Mode::Executable, merkle::blobId("one")};
     objects.putRootTree(root, hold);
@@ -5399,7 +5410,7 @@ TEST_F(LocalStoreObjectsTest, writeAuxiliaryBytesAndModeBeforeFsync)
     size_t calls = 0;
     unsynced.atFsync = [&](const std::filesystem::path &) { calls++; };
     auto unsyncedHold = unsynced.hold();
-    unsynced.putBlob(merkle::blobId("one"), false, "one", unsyncedHold);
+    unsynced.putObject({merkle::Mode::Regular, merkle::blobId("one")}, "one", unsyncedHold);
     EXPECT_EQ(calls, 0u);
 }
 
@@ -5412,16 +5423,17 @@ TEST_F(LocalStoreObjectsTest, auxiliaryReadPermissionsAreIndependentOfEveryUmask
     auto id = merkle::blobId(bytes);
     for (bool executable : {false, true}) {
         auto file = objects.blobFile(id, executable);
+        merkle::TreeEntry address{executable ? merkle::Mode::Executable : merkle::Mode::Regular, id};
         /* The finite domain here is creation of the auxiliary file, not
            directory creation, which has its own permission semantics. */
         createDirs(file.parent_path());
-        hold.linkFor(file);
+        hold.linkFor(objects, address);
         for (mode_t mask = 0; mask <= 0777; ++mask) {
             SCOPED_TRACE(fmt("executable=%d umask=%o", executable, mask));
             {
                 auto previous = ::umask(mask);
                 Finally restoreUmask{[&] { ::umask(previous); }};
-                objects.putBlob(id, executable, bytes, hold);
+                objects.putObject(address, bytes, hold);
             }
             EXPECT_EQ(st(file).st_mode & 07777, executable ? 0555u : 0444u);
             EXPECT_EQ(readFile(file), bytes);
@@ -5658,7 +5670,7 @@ TEST_F(LocalStoreObjectsTest, reusedBlobsRetainAWitnessWhenTheirDonorIsCollected
                 auto treeBody = pending ? merkle::serialiseTree({{"a", {mode, id}}, {"seed", {mode, id}}})
                                         : merkle::serialiseTree({{"a", {mode, id}}});
                 auto tree = merkle::treeId(treeBody);
-                objects.putTree(tree, treeBody, hold);
+                objects.putObject({merkle::Mode::Directory, tree}, treeBody, hold);
                 chmod(root, 0555);
                 setWriteTime(root, 1, 1);
 
@@ -6156,9 +6168,9 @@ TEST_F(LocalStoreObjectsTest, noncanonicalTreeBodiesCannotSupplyAKnownMaterialis
         ASSERT_NE(id, expected.hash);
         {
             auto hold = objects.hold();
-            objects.putTree(id, body, hold);
-            objects.putBlob(firstBlob, false, "first", hold);
-            objects.putBlob(secondBlob, false, "second", hold);
+            objects.putObject({merkle::Mode::Directory, id}, body, hold);
+            objects.putObject({merkle::Mode::Regular, firstBlob}, "first", hold);
+            objects.putObject({merkle::Mode::Regular, secondBlob}, "second", hold);
         }
         EXPECT_EQ(objects.readVerifiedTree(id), std::nullopt);
         auto counted = make_ref<CountingAccessor>(source);
@@ -6200,11 +6212,11 @@ TEST_F(LocalStoreObjectsTest, duplicateTreeRecordsAreUnusableAndPreventDestructi
             const auto id = merkle::treeId(body);
             {
                 auto hold = objects.hold();
-                objects.putTree(emptyTree, "", hold);
-                objects.putTree(id, body, hold);
-                objects.putBlob(firstBlob, false, "first", hold);
-                objects.putBlob(secondBlob, false, "second", hold);
-                objects.putBlob(spareBlob, false, "unreachable sentinel", hold);
+                objects.putObject({merkle::Mode::Directory, emptyTree}, "", hold);
+                objects.putObject({merkle::Mode::Directory, id}, body, hold);
+                objects.putObject({merkle::Mode::Regular, firstBlob}, "first", hold);
+                objects.putObject({merkle::Mode::Regular, secondBlob}, "second", hold);
+                objects.putObject({merkle::Mode::Regular, spareBlob}, "unreachable sentinel", hold);
             }
             /* Hash verification alone cannot establish a directory map.
                Readers decline it, and GC cannot use a collapsed map as
