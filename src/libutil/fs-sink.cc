@@ -81,9 +81,9 @@ getParentFdAndName(Descriptor dirFd, const std::filesystem::path & dstPath, cons
     /* Without dirFd, we're creating the root entry itself, so path
        must be root. If it's not, someone forgot to create the root
        directory first. */
-    auto p = append(dstPath, path);
-    if (!path.isRoot())
-        throw Error("cannot create non-root path %s without a root directory", PathFmt(p));
+    if (!path.rel().empty())
+        throw Error("cannot create non-root path %s without a root directory", PathFmt(append(dstPath, path)));
+    const auto & p = dstPath;
     if (p.empty())
         throw Error("restore destination path is empty");
     auto filename = p.filename();
