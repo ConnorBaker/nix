@@ -631,7 +631,7 @@ void LocalStore::coalesceBlobRows(
                          use.getStr(5)},
                     .candidates = {},
                 });
-            auto file = getRealStoreDir() / std::filesystem::path(use.getStr(9)).filename();
+            auto file = getRealStoreDir() / baseNameOf(use.getStr(9));
             auto name = use.getStr(10);
             if (!name.empty())
                 file /= name;
