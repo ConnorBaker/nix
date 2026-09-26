@@ -1,6 +1,6 @@
 # Lazy-store status
 
-Measured revision `b7dd176b8` has lower separate wall medians and median paired wall-time ratios in **all nine cases** against branch base `8aad447`, with **70/75 pairs faster**. All 156 output checks and eighteen complete store comparisons pass. CPU medians remain higher in three cases and peak RSS in seven; resource reduction remains unresolved.
+Measured revision `7a6fb248d` has lower separate wall medians and median paired wall-time ratios in **all nine cases** against branch base `8aad447`, with **70/75 pairs faster**. All 156 output checks and eighteen complete store comparisons pass. CPU medians remain higher in three cases and peak RSS in seven; resource reduction remains unresolved.
 
 ## Semantic model
 
@@ -16,24 +16,24 @@ The [specification](01-specification.md), [implementation derivation](04-derivat
 
 ## Current validation
 
-b7dd keeps the filtering accessor's owner guard local to six forwarding methods and the public admission method and factors permission checking into a private `void` helper. Its [source gates](/home/connorbaker/Benchmarks/nix-performance-fixes/filter-local-owner-validation/README.md) pass **614 fetchers/expression unit tests** (one skip, one disabled), **sixteen functional targets** and **twelve real overlay targets without skips**. The exact optimized release passes **207 packaged tests, zero failures and 36 skips**. No tests were added; other unit suites were not rerun. The tests check documented lifetime guarantees, not exact internal reference counts or stack-frame identity.
+Validated source `7a6fb248d` carries the observed parent name directly and projects recorded logical store-path basenames in both holder lookup and coalescing, preserving descriptor ownership and native physical joins. Its [whole-checkout gates](/home/connorbaker/Benchmarks/nix-performance-fixes/holder-projection-completion-validation/README.md) pass **2,514 utility/store/fetcher/expression cases**, with **zero failures, two skips and three disabled cases**, including all 23 required cases; **sixteen functional and twelve real-overlay targets pass without skips**. The exact optimized release passes **207 packaged tests, zero failures and 36 skips**. This two-file cleanup adds no tests.
 
-[Earlier broader unit gates](09-performance.md#current-source-validation) remain bound to their historical sources. Windows remains unverified. Overlay's regular-holder sharing and auxiliary-operation limits remain explicit in the store model. Any subsequent source changes remain outside these b7dd performance measurements.
+[Source domains and compiled limits](09-performance.md#current-source-validation) remain explicit. Windows runtime remains unverified. Tests check documented behavior and lifetimes, not exact internal allocations or stack frames; numerical and profile evidence remains bound to the revisions it names.
 
 ## Performance
 
-The pinned workload retains five cold and ten warm pairs per case. Cold means fresh private state with warm operating-system caches; GitHub cold timings include network access. Reductions in **median paired wall-time ratio against branch base** are:
+The workload retains five cold and ten warm pairs per case. Cold means fresh private application state with warm OS caches; GitHub cold timings include network access. Reductions in **median paired wall-time ratio against branch base** are:
 
 | Workload | `path:` | `git+file:` | `github:` |
 | --- | ---: | ---: | ---: |
-| Cold · 32 attributes | 1.32% | 19.77% | 49.36% |
-| Warm · 8 attributes | 87.16% | 6.46% | 14.65% |
-| Warm · 32 attributes | 73.69% | 4.93% | 8.63% |
+| Cold · 32 attributes | 1.28% | 20.20% | 29.52% |
+| Warm · 8 attributes | 87.17% | 7.31% | 14.55% |
+| Warm · 32 attributes | 73.71% | 4.36% | 9.00% |
 
-Cold-path CPU rises **3.24→6.59 s** and RSS **445.22→480.74 MiB**, both higher in every pair. Both warm Git cases also use more CPU. Lower wall time has not resolved these resource costs.
+Cold-path CPU rises **3.10→6.37 s** and RSS **445.21→486.76 MiB**, both higher in every pair. Both warm Git cases also use more CPU. Lower wall time has not resolved these resource costs.
 
-The [direct comparison with cc59](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-b7dd176b8-vs-cc59f1bf9-audit/README.md) passes another 156 exact output checks but has only **43/75 faster wall pairs** and four higher median paired wall ratios. Four cases reverse direction between separate and paired wall statistics. CPU has four higher separate medians but six higher paired medians; RSS has seven higher separately and five higher paired. Cold-path paired wall/CPU rise **153.56 ms/0.58 s**, with CPU higher in every pair, while paired RSS falls 3.82 MiB despite a higher separate median. These mixed results establish no overall direct resource benefit or individual causal saving.
+The [direct 7a817 comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-7a6fb248d-vs-7a817d25e-audit/README.md) passes another 156 exact outputs but has only **33/75 faster wall pairs**: seven lower separate wall medians versus five lower paired ratios. Cold and warm-32 GitHub reverse from lower separate wall medians to higher paired ratios. Cold-path paired wall/CPU rise **119.69 ms/0.58 s**, while RSS falls **14.07 MiB**. Paired CPU has three lower, three tied and three higher cases; RSS has five lower and four higher. No overall direct resource benefit is established.
 
-The current [user-cycle profiles](09-performance.md#current-b7ddbase-user-cycle-profiles) cover all nine cases in eighteen captures with six seeds and 24 exact outputs. They retain user-space routes, unknown/clipped caller limits and one pair per case; they cannot attribute system CPU, allocated bytes or peak RSS. Older syscall and PMU diagnostics remain historical.
+The current [7a6 user-cycle profiles](09-performance.md#current-7a6base-user-cycle-profiles) cover all nine cases in eighteen captures, six warm seeds and 24 exact outputs. They retain one empty stack, unknown frames and incomplete callers; overlapping user routes cannot attribute system CPU, allocated bytes or peak RSS. Historical syscall and PMU observations retain their own revision boundaries.
 
-The [performance report](09-performance.md), [current samples](runs/2026-09-21-performance/paired-b7dd176b8.json), [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-b7dd176b8-audit/README.md) and [release provenance](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-b7dd176b8.json) retain exact source/binary bindings, checks and limits. Earlier comparisons and the retained interference/repetition incident remain linked there; they do not measure later source changes.
+The [performance report](09-performance.md), [current samples](runs/2026-09-21-performance/paired-7a6fb248d.json), [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-7a6fb248d-audit/README.md) and [release provenance](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-7a6fb248d.json) retain exact bindings and limits. Historical comparisons and the retained interference/repetition incident remain linked there; separate series are not pooled.
