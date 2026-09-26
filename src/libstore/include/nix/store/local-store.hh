@@ -810,7 +810,8 @@ private:
         bool modified = false;
         /** Partial map on collision keys: own, selected donor, or no eligible representative. */
         std::vector<GitObjectStore::Hold::Row> representatives;
-        std::vector<std::pair<GitObjectStore::Hold::Row, GitObjectStore::Holder>> rejected;
+        /** Borrows the caller's collision set, which outlives this result. */
+        std::vector<std::pair<const GitObjectStore::Hold::Row &, const GitObjectStore::Holder &>> rejected;
     };
 
     /** Filesystem-only reconciliation of candidates whose lifetimes the caller protects. */

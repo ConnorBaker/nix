@@ -270,20 +270,19 @@ struct MemoVisitor : HashingVisitor
     {
         if (!consulted(st))
             return std::nullopt;
-        auto lookupAt = [&](const CanonPath & sourcePath) -> std::optional<merkle::TreeEntry> {
-            if (auto entry = root.accessor->getKnownEntry(sourcePath))
-                return entry;
-            auto k = keyOf(to, sourcePath);
-            std::optional<merkle::TreeEntry> entry;
-            if (k)
-                if (auto res = cache->lookup(*k))
-                    entry = rowEntry(*res);
-            if (key)
-                *key = std::move(k);
-            return entry;
-        };
+        std::optional<CanonPath> joinedPath;
         /* At the accessor root the walk already owns the source path. */
-        return root.path.isRoot() ? lookupAt(to) : lookupAt(root.path / to);
+        const auto & sourcePath = root.path.isRoot() ? to : joinedPath.emplace(root.path / to);
+        if (auto entry = root.accessor->getKnownEntry(sourcePath))
+            return entry;
+        auto k = keyOf(to, sourcePath);
+        std::optional<merkle::TreeEntry> entry;
+        if (k)
+            if (auto res = cache->lookup(*k))
+                entry = rowEntry(*res);
+        if (key)
+            *key = std::move(k);
+        return entry;
     }
 
     HashedNode node(const CanonPath & to, const SourceAccessor::Stat & st, fun<HashedNode()> descend) override
@@ -475,7 +474,7 @@ std::pair<StorePath, Hash> fetchToStore2(
                           path,
                           store.printStorePath(storePath),
                           hash.to_string(HashFormat::SRI, true));
-                      return std::make_pair(storePath, hash);
+                      return std::make_pair(std::move(storePath), hash);
                   }
                   // FIXME: we may have already computed this above.
                   auto [storePath, hash] =
@@ -485,7 +484,7 @@ std::pair<StorePath, Hash> fetchToStore2(
                       path,
                       store.printStorePath(storePath),
                       hash.to_string(HashFormat::SRI, true));
-                  return std::make_pair(storePath, hash);
+                  return std::make_pair(std::move(storePath), hash);
               }()
             : [&]() {
                   // FIXME: ideally addToStore() would return the hash
@@ -526,7 +525,7 @@ std::pair<StorePath, Hash> fetchToStore2(
                       path,
                       store.printStorePath(storePath),
                       hash.to_string(HashFormat::SRI, true));
-                  return std::make_pair(storePath, hash);
+                  return std::make_pair(std::move(storePath), hash);
               }();
 
     act.result(resFetchToStore, store.printStorePath(storePath));
@@ -546,7 +545,7 @@ std::pair<StorePath, Hash> fetchToStore2(
     if (srcToStoreKey)
         settings.srcToStore->cache.emplace(*srcToStoreKey, SrcToStore::Result{storePath, hash});
 
-    return {storePath, hash};
+    return {std::move(storePath), hash};
 }
 
 } // namespace nix
