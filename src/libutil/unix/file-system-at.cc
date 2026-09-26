@@ -192,15 +192,13 @@ static AutoCloseFD openFileEnsureBeneathNoSymlinksIterative(
     /* This rather convoluted loop is necessary to avoid TOCTOU when validating that
        no inner path component is a symlink. */
     for (auto it = components.begin(); it != components.end(); ++it) {
-        auto component = std::string(*it);                        /* Copy into a string to make NUL terminated. */
-        assert(component != ".." && !component.starts_with('/')); /* In case invariant is broken somehow.. */
-        auto prevRelPath = currentRelPath;
-        currentRelPath = currentRelPath / *it;
+        auto prevRelPath = std::move(currentRelPath);
+        currentRelPath = prevRelPath / *it;
 
-        AutoCloseFD parentFd2 = ::openat(
+        AutoCloseFD parentFd2 = unix::openFileFinalComponentNoSymlinks(
             getParentFd(), /* First iteration uses dirFd. */
-            component.c_str(),
-            O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            currentRelPath,
+            O_DIRECTORY | O_CLOEXEC
 #ifdef __linux__
                 | O_PATH /* Linux-specific optimization. Files are open only for path resolution purposes. */
 #endif
@@ -209,26 +207,8 @@ static AutoCloseFD openFileEnsureBeneathNoSymlinksIterative(
 #endif
         );
 
-        if (!parentFd2) {
-            /* Construct the CanonPath for error message. */
-            auto path2 = std::ranges::fold_left(components.begin(), ++it, CanonPath::root, [](auto lhs, auto rhs) {
-                lhs.push(rhs);
-                return lhs;
-            });
-
-            if (errno == ENOTDIR) /* Path component might be a symlink. */ {
-                /* Does not follow final symlink. We know `component` is a
-                   single component so we don't have to worry about intermediate
-                   symlinks either. */
-                if (auto st = maybeFstatat(getParentFd(), component); st && S_ISLNK(st->st_mode))
-                    throw SymlinkNotAllowed(path2);
-                errno = ENOTDIR; /* Restore the errno. */
-            } else if (errno == NIX_ERR_OPEN_SYMLINK) {
-                throw SymlinkNotAllowed(path2);
-            }
-
+        if (!parentFd2)
             return AutoCloseFD{};
-        }
 
         if (dirFdCallback && parentFd)
             dirFdCallback(std::move(parentFd), std::move(prevRelPath));

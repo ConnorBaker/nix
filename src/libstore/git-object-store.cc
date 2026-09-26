@@ -664,11 +664,12 @@ GitObjectStore::Hold::namesFor(const GitObjectStore & objects, const merkle::Tre
     size_t kind = object.mode == merkle::Mode::Directory ? 2 : object.mode == merkle::Mode::Executable ? 1 : 0;
     const std::array<const std::string *, 3> prefixes{&objects.blobsDir, &objects.blobsXDir, &objects.treesDir};
     constexpr std::array<OsStringView, 3> kinds{OS_STR("blobs"), OS_STR("blobs-x"), OS_STR("trees")};
-    std::filesystem::path dst = nameUnder(*prefixes[kind], object.hash);
+    std::pair<std::filesystem::path, std::filesystem::path::string_type> result{
+        nameUnder(*prefixes[kind], object.hash), std::filesystem::path::string_type{}};
+    auto & [dst, held] = result;
     auto idSize = base16::encodedLength(object.hash.hashSize);
     auto name = dst.native().end() - idSize;
     auto shard = name - 3; // Two shard digits and the following separator.
-    std::filesystem::path::string_type held;
     held.reserve(kinds[kind].size() + idSize + 4);
     held += kinds[kind];
     held += std::filesystem::path::preferred_separator;
@@ -676,7 +677,7 @@ GitObjectStore::Hold::namesFor(const GitObjectStore & objects, const merkle::Tre
     std::call_once(lease->shards[kind * 256 + object.hash.hash[0]], [&] { createDirs(lease->dir / held); });
     held += std::filesystem::path::preferred_separator;
     held.append(name, dst.native().end());
-    return {std::move(dst), std::move(held)};
+    return result;
 }
 
 std::filesystem::path

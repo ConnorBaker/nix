@@ -270,17 +270,20 @@ struct MemoVisitor : HashingVisitor
     {
         if (!consulted(st))
             return std::nullopt;
-        const auto sourcePath = root.path / to;
-        if (auto entry = root.accessor->getKnownEntry(sourcePath))
+        auto lookupAt = [&](const CanonPath & sourcePath) -> std::optional<merkle::TreeEntry> {
+            if (auto entry = root.accessor->getKnownEntry(sourcePath))
+                return entry;
+            auto k = keyOf(to, sourcePath);
+            std::optional<merkle::TreeEntry> entry;
+            if (k)
+                if (auto res = cache->lookup(*k))
+                    entry = rowEntry(*res);
+            if (key)
+                *key = std::move(k);
             return entry;
-        auto k = keyOf(to, sourcePath);
-        std::optional<merkle::TreeEntry> entry;
-        if (k)
-            if (auto res = cache->lookup(*k))
-                entry = rowEntry(*res);
-        if (key)
-            *key = std::move(k);
-        return entry;
+        };
+        /* At the accessor root the walk already owns the source path. */
+        return root.path.isRoot() ? lookupAt(to) : lookupAt(root.path / to);
     }
 
     HashedNode node(const CanonPath & to, const SourceAccessor::Stat & st, fun<HashedNode()> descend) override
