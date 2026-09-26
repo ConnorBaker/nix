@@ -288,23 +288,26 @@ struct MemoVisitor : HashingVisitor
         std::optional<fetchers::Cache::Key> key;
         /* Symlinks are named only when recorded; filtered directories
            are neither answered nor recorded. A hit has no node action. */
-        if (auto entry = lookup(to, st, &key))
-            /* A directory's NAR size is unknown: nothing beneath it is
-               seen.  A file's is the stat's. */
-            return HashedNode{
-                .entry = *entry,
-                .narSize = st.type == SourceAccessor::tRegular && st.fileSize
-                               ? std::optional(merkle::nar::regular(*st.fileSize, st.isExecutable))
-                               : std::nullopt,
-            };
-        auto result = descend();
-        if (st.type == SourceAccessor::tSymlink)
-            key = keyOf(to, root.path / to);
-        if (key) {
-            std::lock_guard lock(mutex);
-            writes.emplace_back(std::move(*key), entryRow(result.entry));
-            if (writes.size() >= maxPendingWrites)
-                flushLocked();
+        auto entry = lookup(to, st, &key);
+        /* A directory's NAR size is unknown: nothing beneath it is
+           seen. A file's is the stat's. */
+        auto result = entry
+                          ? HashedNode{
+                                .entry = *entry,
+                                .narSize = st.type == SourceAccessor::tRegular && st.fileSize
+                                               ? std::optional(merkle::nar::regular(*st.fileSize, st.isExecutable))
+                                               : std::nullopt,
+                            }
+                          : descend();
+        if (!entry) {
+            if (st.type == SourceAccessor::tSymlink)
+                key = keyOf(to, root.path / to);
+            if (key) {
+                std::lock_guard lock(mutex);
+                writes.emplace_back(std::move(*key), entryRow(result.entry));
+                if (writes.size() >= maxPendingWrites)
+                    flushLocked();
+            }
         }
         return result;
     }
