@@ -1,6 +1,6 @@
 # Lazy-store status
 
-Measured revision `86080dfb7` has lower separate wall medians and median paired wall-time ratios in **all nine cases** against branch base `8aad447`, with **74/75 pairs faster**. All 156 output checks and eighteen complete store comparisons pass. CPU medians remain higher in three cases and peak RSS in seven; resource reduction remains unresolved.
+Measured revision `b7dd176b8` has lower separate wall medians and median paired wall-time ratios in **all nine cases** against branch base `8aad447`, with **70/75 pairs faster**. All 156 output checks and eighteen complete store comparisons pass. CPU medians remain higher in three cases and peak RSS in seven; resource reduction remains unresolved.
 
 ## Semantic model
 
@@ -16,9 +16,9 @@ The [specification](01-specification.md), [implementation derivation](04-derivat
 
 ## Current validation
 
-86080 removes excluded auxiliary publication retries, repeated temporary cleanup and known-directory file-unlink attempts, and reuses the acquired repository for timestamps. Its [source gates](/home/connorbaker/Benchmarks/nix-performance-fixes/auxiliary-timestamp-validation-dbc65fd81/archive/README.md) pass **1,154 store/fetcher unit tests** (one skip, one disabled), **14 functional targets** and **12 real overlay targets without skips**. The exact optimized release passes **207 packaged tests, zero failures and 36 skips**.
+b7dd keeps the filtering accessor's owner guard local to six forwarding methods and the public admission method and factors permission checking into a private `void` helper. Its [source gates](/home/connorbaker/Benchmarks/nix-performance-fixes/filter-local-owner-validation/README.md) pass **614 fetchers/expression unit tests** (one skip, one disabled), **sixteen functional targets** and **twelve real overlay targets without skips**. The exact optimized release passes **207 packaged tests, zero failures and 36 skips**. No tests were added; other unit suites were not rerun. The tests check documented lifetime guarantees, not exact internal reference counts or stack-frame identity.
 
-[Earlier broader unit gates](09-performance.md#current-source-validation) remain bound to their historical sources. Windows remains unverified. Overlay's regular-holder sharing and auxiliary-operation limits remain explicit in the store model.
+[Earlier broader unit gates](09-performance.md#current-source-validation) remain bound to their historical sources. Windows remains unverified. Overlay's regular-holder sharing and auxiliary-operation limits remain explicit in the store model. Any subsequent source changes remain outside these b7dd performance measurements.
 
 ## Performance
 
@@ -26,12 +26,14 @@ The pinned workload retains five cold and ten warm pairs per case. Cold means fr
 
 | Workload | `path:` | `git+file:` | `github:` |
 | --- | ---: | ---: | ---: |
-| Cold · 32 attributes | 10.44% | 20.79% | 31.56% |
-| Warm · 8 attributes | 87.66% | 7.48% | 13.41% |
-| Warm · 32 attributes | 74.72% | 4.10% | 8.14% |
+| Cold · 32 attributes | 1.32% | 19.77% | 49.36% |
+| Warm · 8 attributes | 87.16% | 6.46% | 14.65% |
+| Warm · 32 attributes | 73.69% | 4.93% | 8.63% |
 
-Cold-path CPU rises **3.29→6.75 s** and RSS **445.21→478.77 MiB**, both higher in every pair. Both warm Git cases also use more CPU. Lower wall time has not resolved these resource costs.
+Cold-path CPU rises **3.24→6.59 s** and RSS **445.22→480.74 MiB**, both higher in every pair. Both warm Git cases also use more CPU. Lower wall time has not resolved these resource costs.
 
-The [direct comparison with dbc](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-86080dfb7-vs-dbc65fd81-audit/README.md) passes another 156 exact output checks but has only **33/75 faster wall pairs**, five higher median paired wall ratios, five higher CPU medians and six higher RSS medians. Cold-path paired wall/CPU rise **135.73 ms/0.25 s**, with CPU higher in every pair, while RSS falls 2.43 MiB. These results do not establish an improvement over dbc or isolate individual changes.
+The [direct comparison with cc59](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-b7dd176b8-vs-cc59f1bf9-audit/README.md) passes another 156 exact output checks but has only **43/75 faster wall pairs** and four higher median paired wall ratios. Four cases reverse direction between separate and paired wall statistics. CPU has four higher separate medians but six higher paired medians; RSS has seven higher separately and five higher paired. Cold-path paired wall/CPU rise **153.56 ms/0.58 s**, with CPU higher in every pair, while paired RSS falls 3.82 MiB despite a higher separate median. These mixed results establish no overall direct resource benefit or individual causal saving.
 
-The [performance report](09-performance.md), [current samples](runs/2026-09-21-performance/paired-86080dfb7.json), [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-86080dfb7-audit/README.md) and [release provenance](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-86080dfb7.json) retain exact source/binary bindings, checks and limits. Earlier comparisons, the retained interference/repetition incident and historical profiles remain in that report; they do not measure later source changes.
+The current [user-cycle profiles](09-performance.md#current-b7ddbase-user-cycle-profiles) cover all nine cases in eighteen captures with six seeds and 24 exact outputs. They retain user-space routes, unknown/clipped caller limits and one pair per case; they cannot attribute system CPU, allocated bytes or peak RSS. Older syscall and PMU diagnostics remain historical.
+
+The [performance report](09-performance.md), [current samples](runs/2026-09-21-performance/paired-b7dd176b8.json), [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-b7dd176b8-audit/README.md) and [release provenance](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-b7dd176b8.json) retain exact source/binary bindings, checks and limits. Earlier comparisons and the retained interference/repetition incident remain linked there; they do not measure later source changes.
