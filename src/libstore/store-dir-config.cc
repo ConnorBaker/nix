@@ -55,7 +55,9 @@ bool StoreDirConfig::isStorePath(std::string_view path) const
 
 std::string StoreDirConfig::printStorePath(const StorePath & path) const
 {
-    return (storeDir + "/").append(path.to_string());
+    auto result = storeDir + "/";
+    result.append(path.to_string());
+    return result;
 }
 
 StringSet StoreDirConfig::printStorePathSet(const StorePathSet & paths) const

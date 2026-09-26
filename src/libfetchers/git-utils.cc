@@ -981,7 +981,7 @@ public:
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
-        return readBlob(path, false, sink, sizeCallback);
+        return readBlob(path, false, sink, sizeCallback.get_fn());
     }
 
     bool pathExists(const CanonPath & path) override
@@ -1061,8 +1061,7 @@ public:
                            consumer that wants the types (`builtins.readDir`
                            attaches a `readFileType` lookup to every untyped
                            entry) looks nothing up. */
-                        res.emplace(
-                            std::string(git_tree_entry_name(entry)), typeOfMode(git_tree_entry_filemode(entry)));
+                        res.emplace(git_tree_entry_name(entry), typeOfMode(git_tree_entry_filemode(entry)));
                     }
 
                     return res;

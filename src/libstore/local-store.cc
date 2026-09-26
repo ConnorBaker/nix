@@ -1837,10 +1837,11 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
             for (size_t n = 0; n < publications.size(); ++n)
                 if (publications[n].path == path) {
                     coalesceBlobRows(*state, path, *hold, ingestionIds[n], publications[n].rows);
-                    state->stmts->DeletePathBlobs.use().apply(printStorePath(path)).exec();
-                    state->stmts->DeletePathIngestions.use().apply(printStorePath(path)).exec();
+                    auto logical = printStorePath(path);
+                    state->stmts->DeletePathBlobs.use().apply(logical).exec();
+                    state->stmts->DeletePathIngestions.use().apply(logical).exec();
                     state->stmts->SetIngestionPath.use()
-                        .apply(printStorePath(path))
+                        .apply(logical)
                         .apply(static_cast<int64_t>(ingestionIds[n]))
                         .exec();
                 }
