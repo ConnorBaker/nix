@@ -772,7 +772,8 @@ struct MaterialisingVisitor : LinkingVisitor
            into its destination, without buffering and hashing it again.
            Mutable worktrees supply no such identity; repair ignores it. */
         if (!repair && st.type == SourceAccessor::tRegular)
-            if (auto entry = source.accessor->getKnownEntry(source.path / path);
+            if (auto entry = source.path.isRoot() ? source.accessor->getKnownEntry(path)
+                                                  : source.accessor->getKnownEntry(source.path / path);
                 entry && entry->hash.algo == merkle::hashAlgo
                 && entry->mode == (st.isExecutable ? merkle::Mode::Executable : merkle::Mode::Regular)) {
                 auto target = at(path);

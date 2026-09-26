@@ -66,7 +66,7 @@ void FilteringSourceAccessor::readDirectoryScoped(
         DirEntries admitted;
         for (auto & entry : entries)
             if (isAllowed(path / entry.first))
-                admitted.insert(entry);
+                admitted.insert(admitted.end(), entry);
 
         struct Scoped final : FilteringSourceAccessor
         {

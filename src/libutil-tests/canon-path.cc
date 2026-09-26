@@ -221,6 +221,29 @@ TEST(CanonPath, concat)
         CanonPath p("/");
         ASSERT_EQ((p / "foo" / "bar").abs(), "/foo/bar");
     }
+
+    const std::vector<std::vector<std::string>> components{
+        {},
+        {"a"},
+        {"nested", "leaf"},
+        {std::string(13, 'x')},
+        {std::string(14, 'x')},
+        {std::string(15, 'x')},
+        {std::string(16, 'x')},
+    };
+    for (const auto & leftComponents : components)
+        for (const auto & rightComponents : components) {
+            const CanonPath left(leftComponents), right(rightComponents);
+            auto combined = leftComponents;
+            combined.insert(combined.end(), rightComponents.begin(), rightComponents.end());
+            const CanonPath expected(combined);
+            SCOPED_TRACE(::testing::Message() << left.abs() << " / " << right.abs());
+            EXPECT_EQ((left / right).abs(), expected.abs());
+            if (&leftComponents == &rightComponents)
+                EXPECT_EQ((left / left).abs(), expected.abs());
+            EXPECT_EQ(left.abs(), CanonPath(leftComponents).abs());
+            EXPECT_EQ(right.abs(), CanonPath(rightComponents).abs());
+        }
 }
 
 TEST(CanonPath, within)

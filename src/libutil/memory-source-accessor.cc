@@ -134,7 +134,7 @@ MemorySourceAccessor::DirEntries MemorySourceAccessor::readDirectory(const Canon
             [&](const File::Directory & d) {
                 DirEntries res;
                 for (auto & [name, file] : d.entries)
-                    res.insert_or_assign(name, file.lstat().type);
+                    res.emplace_hint(res.end(), name, file.lstat().type);
                 return res;
             },
             [&](const File::Regular &) -> DirEntries {

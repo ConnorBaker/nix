@@ -117,7 +117,7 @@ public:
 
         DirEntries res;
         for (const auto & [name, child] : dir->entries)
-            res.insert_or_assign(name, statOf(child).type);
+            res.emplace_hint(res.end(), name, statOf(child).type);
 
         return res;
     }

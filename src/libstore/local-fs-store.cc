@@ -121,7 +121,7 @@ public:
                 auto storePath = maybeGetStoreObjectPath(CanonPath(name));
                 if (!storePath || (valid && !valid->contains(*storePath)))
                     continue;
-                res.insert_or_assign(name, type);
+                res.emplace_hint(res.end(), name, type);
             }
             return res;
         }
