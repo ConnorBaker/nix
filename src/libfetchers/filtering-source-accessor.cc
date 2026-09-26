@@ -109,8 +109,9 @@ void FilteringSourceAccessor::readDirectoryScoped(
             {
                 if (p.isRoot())
                     return true;
-                if (p.dirOf()->empty())
-                    return admitted.contains(*p.baseName());
+                auto relative = p.rel();
+                if (relative.find('/') == std::string_view::npos)
+                    return admitted.contains(relative);
                 return owner->isAllowed(original / p);
             }
 
