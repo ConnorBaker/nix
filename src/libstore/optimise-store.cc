@@ -533,8 +533,8 @@ struct LinkingVisitor : ObjectStoreVisitor
     struct Target
     {
         RestoreSink & sink;
-        CanonPath name;
         std::filesystem::path where;
+        CanonPath name;
     };
 
     Target at(const CanonPath & path)
@@ -546,7 +546,7 @@ struct LinkingVisitor : ObjectStoreVisitor
         auto name = path.isRoot()
                         ? path
                         : CanonPath::root / (frame.diskName ? std::string_view(*frame.diskName) : *path.baseName());
-        return {sink, name, name.isRoot() ? sink.dstPath : sink.dstPath / name.rel()};
+        return {sink, name.isRoot() ? sink.dstPath : sink.dstPath / name.rel(), std::move(name)};
     }
 
     HashedNode directory(const CanonPath & path, Children children) override

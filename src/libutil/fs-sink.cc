@@ -101,7 +101,7 @@ getParentFdAndName(Descriptor dirFd, const std::filesystem::path & dstPath, cons
     if (!parentFd)
         throw SysError("opening parent directory of %s", PathFmt(p));
     auto fd = parentFd.get();
-    return {std::move(parentFd), fd, CanonPath::fromFilename(p.filename().native())};
+    return {std::move(parentFd), fd, CanonPath::fromFilename(filename.native())};
 }
 
 std::tuple<AutoCloseFD, Descriptor, CanonPath> RestoreSink::parentOf(const CanonPath & path) const

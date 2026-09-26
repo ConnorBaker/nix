@@ -99,13 +99,9 @@ void CanonPath::extend(const CanonPath & x)
 
 CanonPath CanonPath::operator/(const CanonPath & x) const
 {
-    return CanonPath(
-        unchecked_t(),
-        concatStrings(
-            path,
-            x.isRoot() ? std::string_view{}
-            : isRoot() ? x.rel()
-                       : std::string_view(x.path)));
+    if (x.isRoot())
+        return *this;
+    return CanonPath(unchecked_t(), concatStrings(path, isRoot() ? x.rel() : std::string_view(x.path)));
 }
 
 void CanonPath::push(std::string_view c)

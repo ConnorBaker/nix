@@ -1050,13 +1050,13 @@ public:
 
         return std::visit(
             overloaded{
-                [&](Tree tree) {
+                [&](const git_tree * tree) {
                     DirEntries res;
 
-                    auto count = git_tree_entrycount(tree.get());
+                    auto count = git_tree_entrycount(tree);
 
                     for (size_t n = 0; n < count; ++n) {
-                        auto entry = git_tree_entry_byindex(tree.get(), n);
+                        auto entry = git_tree_entry_byindex(tree, n);
                         /* Typed from the mode the entry carries, so a
                            consumer that wants the types (`builtins.readDir`
                            attaches a `readFileType` lookup to every untyped
@@ -1201,32 +1201,33 @@ public:
         if (!parentTree)
             return nullptr;
 
-        auto res = git_tree_entry_byname(parentTree->get(), std::string(name).c_str());
+        /* baseName() is a suffix of path's NUL-terminated string. */
+        auto res = git_tree_entry_byname(parentTree, name.data());
         lookupCache.emplace(path, res);
         return res;
     }
 
-    std::optional<Tree> lookupTree(State & state, const CanonPath & path)
+    /* Borrow from root or treeCache while the caller holds state_. */
+    const git_tree * lookupTree(State & state, const CanonPath & path)
     {
         if (auto i = treeCache.find(path); i != treeCache.end())
-            return dupObject<Tree>(i->second.get());
+            return i->second.get();
         if (path.isRoot()) {
             if (git_object_type(state.root.get()) == GIT_OBJECT_TREE)
-                return dupObject<Tree>((git_tree *) &*state.root);
+                return (const git_tree *) &*state.root;
             else
-                return std::nullopt;
+                return nullptr;
         }
 
         auto entry = lookup(state, path);
         if (!entry || git_tree_entry_type(entry) != GIT_OBJECT_TREE)
-            return std::nullopt;
+            return nullptr;
 
         Tree tree;
         if (git_tree_entry_to_object((git_object **) (git_tree **) Setter(tree), *state.repo, entry))
             throw GitError("looking up directory '%s'", showPath(path));
 
-        treeCache.emplace(path, dupObject<Tree>(tree.get()));
-        return tree;
+        return treeCache.emplace(path, std::move(tree)).first->second.get();
     }
 
     const git_tree_entry * need(State & state, const CanonPath & path)
@@ -1240,11 +1241,11 @@ public:
     struct Submodule
     {};
 
-    std::variant<Tree, Submodule> getTree(State & state, const CanonPath & path)
+    std::variant<const git_tree *, Submodule> getTree(State & state, const CanonPath & path)
     {
         if (path.isRoot()) {
             if (git_object_type(state.root.get()) == GIT_OBJECT_TREE)
-                return dupObject<Tree>((git_tree *) &*state.root);
+                return (const git_tree *) &*state.root;
             else
                 throw Error("Git root object '%s' is not a directory", *git_object_id(state.root.get()));
         }
@@ -1257,7 +1258,7 @@ public:
         if (git_tree_entry_type(entry) != GIT_OBJECT_TREE)
             throw Error("'%s' is not a directory", showPath(path));
 
-        return std::move(*lookupTree(state, path));
+        return lookupTree(state, path);
     }
 
     Blob getBlob(State & state, const CanonPath & path, bool expectSymlink)
