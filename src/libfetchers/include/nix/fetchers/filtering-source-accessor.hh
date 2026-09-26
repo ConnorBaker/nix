@@ -78,8 +78,8 @@ struct FilteringSourceAccessor : SourceAccessor
     virtual bool isAllowed(const CanonPath & path) = 0;
 
 private:
-    /* Borrowed receivers return no owner and remain caller-owned. */
-    std::shared_ptr<SourceAccessor> checkAccessAndKeepAlive(const CanonPath & path);
+    /* Callers keep the receiver alive across policy callbacks. */
+    void checkAllowed(const CanonPath & path);
 };
 
 /**
