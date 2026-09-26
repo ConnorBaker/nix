@@ -672,16 +672,19 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 
         /* Get all tracked files and determine whether the working
            directory is dirty. */
-        struct StatusPayload
         {
-            WorkdirInfo & info;
-            std::exception_ptr exception;
-        } payload{info, {}};
+            git_status_options options = GIT_STATUS_OPTIONS_INIT;
+            options.flags |= GIT_STATUS_OPT_INCLUDE_UNMODIFIED;
+            options.flags |= GIT_STATUS_OPT_EXCLUDE_SUBMODULES;
+            StatusList status;
+            if (git_status_list_new(Setter(status), *this, &options))
+                throw GitError("getting working directory status");
 
-        auto statusCallback = [](const char * path, unsigned int statusFlags, void * opaque) -> int {
-            auto & payload = *static_cast<StatusPayload *>(opaque);
-            try {
-                auto & info = payload.info;
+            for (size_t n = 0, count = git_status_list_entrycount(status.get()); n < count; ++n) {
+                auto entry = git_status_byindex(status.get(), n);
+                const char * path =
+                    entry->head_to_index ? entry->head_to_index->old_file.path : entry->index_to_workdir->old_file.path;
+                auto statusFlags = entry->status;
                 /* The hint is advisory: case folding and conflict entries
                    need not arrive in CanonPath order. Sorted runs need no
                    logarithmic search; every other order keeps the same set. */
@@ -689,23 +692,8 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
                     info.files.insert(info.files.end(), CanonPath(path));
                 if (statusFlags != GIT_STATUS_CURRENT)
                     info.isDirty = true;
-                return 0;
-            } catch (...) {
-                /* Let libgit2 free its status list before the original C++
-                   exception leaves this operation. */
-                payload.exception = std::current_exception();
-                return GIT_EUSER;
             }
-        };
-
-        git_status_options options = GIT_STATUS_OPTIONS_INIT;
-        options.flags |= GIT_STATUS_OPT_INCLUDE_UNMODIFIED;
-        options.flags |= GIT_STATUS_OPT_EXCLUDE_SUBMODULES;
-        auto statusError = git_status_foreach_ext(*this, &options, statusCallback, &payload);
-        if (payload.exception)
-            std::rethrow_exception(payload.exception);
-        if (statusError)
-            throw GitError("getting working directory status");
+        }
 
         /* Gitlinks in the index are the submodules; .gitmodules only
            supplies their URLs. */
