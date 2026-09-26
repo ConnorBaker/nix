@@ -132,13 +132,6 @@ void insertEntry(Tree & tree, std::string name, const TreeEntry & entry)
     }
 }
 
-/* The one-entry tree an executable or a symlink root is addressed by.  Its
-   key is "." itself: neither mode is a directory, so no "/" follows. */
-static Tree syntheticTree(const TreeEntry & root)
-{
-    return Tree{{".", root}};
-}
-
 std::optional<std::string> syntheticRootTree(const TreeEntry & root)
 {
     switch (root.mode) {
@@ -146,8 +139,13 @@ std::optional<std::string> syntheticRootTree(const TreeEntry & root)
     case Mode::Regular:
         return std::nullopt;
     case Mode::Executable:
-    case Mode::Symlink:
-        return serialiseTree(syntheticTree(root));
+    case Mode::Symlink: {
+        /* The one-entry tree {"." -> root}: six octal mode bytes, a space,
+           the name ".", and NUL, followed by the active hash bytes. */
+        std::string body(root.mode == Mode::Executable ? "100755 .\0" : "120000 .\0", 9);
+        body.append(reinterpret_cast<const char *>(root.hash.hash), root.hash.hashSize);
+        return body;
+    }
     }
     unreachable();
 }

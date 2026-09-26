@@ -652,7 +652,7 @@ GitObjectStore::Hold::Lease::~Lease()
     }
 }
 
-std::array<std::filesystem::path::string_type, 2>
+GitObjectStore::Hold::Names
 GitObjectStore::Hold::namesFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const
 {
     /* The caller owns the public namespace; the lease owns only the hold.
@@ -661,7 +661,7 @@ GitObjectStore::Hold::namesFor(const GitObjectStore & objects, const merkle::Tre
     size_t kind = object.mode == merkle::Mode::Directory ? 2 : object.mode == merkle::Mode::Executable ? 1 : 0;
     const std::array<const std::string *, 3> prefixes{&objects.blobsDir, &objects.blobsXDir, &objects.treesDir};
     constexpr std::array<OsStringView, 3> kinds{OS_STR("blobs"), OS_STR("blobs-x"), OS_STR("trees")};
-    std::array<std::filesystem::path::string_type, 2> result{
+    Names result{
 #ifdef _WIN32
         std::filesystem::path(nameUnder(*prefixes[kind], object.hash)).native(),
 #else
@@ -685,7 +685,7 @@ GitObjectStore::Hold::namesFor(const GitObjectStore & objects, const merkle::Tre
 std::filesystem::path
 GitObjectStore::Hold::linkFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const
 {
-    return lease->dir / std::get<1>(namesFor(objects, object));
+    return lease->dir / namesFor(objects, object).held;
 }
 
 GitObjectStore::Hold GitObjectStore::hold() const

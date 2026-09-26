@@ -378,8 +378,13 @@ public:
             std::shared_ptr<AuxiliaryLock> auxiliaryLock);
         explicit Hold(std::shared_ptr<Lease> lease);
 
-        std::array<std::filesystem::path::string_type, 2>
-        namesFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
+        struct Names
+        {
+            std::filesystem::path::string_type object;
+            std::filesystem::path::string_type held;
+        };
+
+        Names namesFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
         bool linkObject(
             const std::filesystem::path::string_type & object, const std::filesystem::path::string_type & held) const;
         bool holdObject(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
