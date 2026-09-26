@@ -1,6 +1,6 @@
 # Preserving identities and reducing ingestion work
 
-The measured runtime is `7394cebfe4740c4aff340d904cef16491629b15c`. Its optimized comparison against branch base `8aad447f0bace6be413963e897ad690247ad6aa2` passes all 156 outputs and eighteen complete store comparisons. All nine separate wall medians and median paired ratios are lower, with 72/75 faster pairs, but CPU medians rise in four cases and RSS in six. Directly against 0bf, only three separate wall medians and three paired ratios are lower, with 36/75 faster pairs; warm GitHub8 and Git32 reverse signs between those statistics. These mixed results establish no overall direct resource benefit from the Row simplification. The 0bf counters and 342 profiles retain their earlier revision boundaries.
+The measured runtime is `cc59f1bf9a98cac754ca35eba3ecc480125a0807`. Its optimized comparison against branch base `8aad447f0bace6be413963e897ad690247ad6aa2` passes all 156 outputs and eighteen complete store comparisons. Eight separate wall medians and all nine median paired ratios are lower, with 68/75 faster pairs; cold path rises 1.97% separately but falls 1.90% paired. CPU medians rise in four cases and RSS in seven. Directly against 7394, only three separate wall medians and three paired ratios are lower, with 35/75 faster pairs. These mixed results establish no overall direct resource benefit from consolidating the filtering admission guard. The 0bf counters and 342 profiles retain their earlier revision boundaries.
 
 The pinned input is Nixpkgs `6aefcda9401be8acc2b74244fb3b37520ea1f0a8`, on aarch64 Linux. The [driver](runs/nixpkgs-evaluation.py) records commands, binaries, environment, resources and every sample. Cold means fresh private stores and fetcher caches, with warm operating-system caches; GitHub cold timings include network access. Before timing, every local source node is checked against the pinned raw Git tree for bytes, executable bits, symlink targets and complete membership. Git status flags and attribute-normalized comparisons cannot substitute for that check.
 
@@ -82,9 +82,9 @@ Negative controls deliberately restore faulty behavior, require the intended fai
 
 ## Current source validation
 
-Source `7394cebfe4740c4aff340d904cef16491629b15c` constructs surviving reconciliation Rows from their final fields, avoiding an unused old-name copy. The temporary relative path is destroyed before the named Row moves into the vector. The [affected validation](/home/connorbaker/Benchmarks/nix-performance-fixes/final-row-lifetime-validation/README.md) passes **994 store tests, zero failures, zero skips and one disabled test**, including all ten mandatory cases. All **sixteen functional and twelve real overlay targets** pass without skips. No test was added; these gates do not rerun utility/fetcher/expression/fallback suites. The completed optimized package gate reports **207 passes, zero failures and 36 skips**, separately from debug validation. Validation manifest: `a451462294afd83a35ab99afe0f391ba708367832e80f218c44ad9dd2be84339`.
+Source `cc59f1bf9a98cac754ca35eba3ecc480125a0807` retains one accessor owner through admission and six forwarding methods. Public `void checkAccess` still releases its guard before returning; borrowed receivers remain caller-owned. The [affected validation](/home/connorbaker/Benchmarks/nix-performance-fixes/filtering-guard-validation/README.md) passes **614 fetchers/expression tests, zero failures, one skip and one disabled test**, including all eight required cases. Their 244 admission, 44 forwarding and 1,890 nested-scope cells plus 20 escaped errors are internal test domains, not additional GTests. All **sixteen functional and twelve real overlay targets** pass without skips. No tests were added; other unit suites were not rerun. These tests check the documented lifetime guarantees; they do not prove equivalence of exact internal reference-count observations. The completed optimized package gate reports **207 passes, zero failures and 36 skips**, separately from debug validation. The completed resource comparisons follow below. Manifest: `281dfde1413471712a91d3cc4c06525254d4ee89919305660c499218ca064f26`.
 
-[Intermediate 034 assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/winning-row-assembly-034c6851d/README.md) exposed a legal but unwanted relative-path temporary surviving vector insertion; the named-Row correction restores earlier cleanup with all six final fields unchanged. Its [benchmark was intentionally interrupted](/home/connorbaker/Benchmarks/nix-performance-fixes/interrupted-benchmark-034c6851d/README.md) before main checking/direct comparison, preserving partial data without a completed result; **034 is the source base, 0bf the complete performance prior**.
+Historical [7394 validation](/home/connorbaker/Benchmarks/nix-performance-fixes/final-row-lifetime-validation/README.md) covers direct final-field Row construction and relative-path cleanup before insertion. [Intermediate 034 assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/winning-row-assembly-034c6851d/README.md) found the longer temporary lifetime; its [interrupted benchmark](/home/connorbaker/Benchmarks/nix-performance-fixes/interrupted-benchmark-034c6851d/README.md) supplies no completed comparison. The separate 7394 zero-tail diagnostic below does not count executions in its earlier timed runs.
 
 The preceding [0bf Memo validation](/home/connorbaker/Benchmarks/nix-performance-fixes/memo-single-result-validation/README.md) and [ec653 validation](/home/connorbaker/Benchmarks/nix-performance-fixes/source-value-simplification-validation/README.md) retain their broader suite domains. Their counts are not added to current gates. Collision, callback/error, publication, retry and overlay obligations remain; no content cache or clean-worktree identity is introduced. The [store model](08-store-model.md) retains the live-byte, filter and lifetime boundaries.
 
@@ -96,57 +96,65 @@ The [SHA-state gates](/home/connorbaker/Benchmarks/nix-performance-fixes/blob-ha
 
 ## Measurements
 
-### Current revision: 7394cebfe
+### Current revision: cc59f1bf9
 
-The [complete report](runs/2026-09-21-performance/paired-7394cebfe.json) and [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-7394cebfe-audit/README.md) check all **156 outputs and eighteen complete store comparisons**. Graph checks cover contents, modes, references and outputs under injective address mappings, not arbitrary embedded-program equivalence. All nine separate wall medians and median paired ratios are lower, with **72/75 faster pairs**. Cold path falls **2.78%** by separate medians and **4.47%** by paired ratio. CPU medians rise in four cases and RSS in six.
+The [complete report](runs/2026-09-21-performance/paired-cc59f1bf9.json) and [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-cc59f1bf9-audit/README.md) check all **156 outputs and eighteen complete store comparisons**. Graph checks cover contents, modes, references and outputs under injective address mappings, not arbitrary embedded-program equivalence. Eight separate wall medians and all nine median paired ratios are lower, with **68/75 faster pairs**. Cold path reverses direction: **+1.9721%** separately, **−1.9008%** paired (**−64.78 ms**, 3/5 faster).
 
-| Case | Wall medians, base→7394 s | Median paired wall ratio / faster pairs | CPU medians, base→7394 s | RSS medians, base→7394 MiB |
+| Case | Wall medians, base→cc59 s | Median paired wall ratio / faster pairs | CPU medians, base→cc59 s | RSS medians, base→cc59 MiB |
 | --- | ---: | ---: | ---: | ---: |
-| cold 32 path | 3.536→3.438 | 0.955342 / 4/5 | 3.260→6.510 | 445.20→476.71 |
-| cold 32 git | 2.687→2.200 | 0.813126 / 5/5 | 2.590→2.610 | 479.59→482.47 |
-| cold 32 github | 6.714→3.546 | 0.556126 / 5/5 | 17.690→5.250 | 973.55→968.66 |
-| warm 8 path | 3.075→0.390 | 0.124614 / 10/10 | 2.900→0.845 | 224.27→206.60 |
-| warm 8 git | 0.857→0.790 | 0.921892 / 10/10 | 0.810→1.310 | 254.76→261.61 |
-| warm 8 github | 0.294→0.253 | 0.860317 / 10/10 | 0.280→0.240 | 197.07→201.80 |
-| warm 32 path | 3.611→0.916 | 0.257889 / 10/10 | 3.440→1.380 | 444.90→426.33 |
-| warm 32 git | 1.417→1.359 | 0.968204 / 8/10 | 1.340→1.825 | 479.35→482.33 |
-| warm 32 github | 0.864→0.808 | 0.934963 / 10/10 | 0.850→0.800 | 445.29→447.70 |
+| cold 32 path | 3.408157→3.475369 | 0.980992 / 3/5 | 3.170→6.830 | 445.21→478.76 |
+| cold 32 git | 2.728324→2.329397 | 0.827904 / 5/5 | 2.610→2.710 | 479.59→482.39 |
+| cold 32 github | 11.093137→8.566731 | 0.691595 / 5/5 | 18.270→5.280 | 939.51→957.22 |
+| warm 8 path | 3.102466→0.392923 | 0.126456 / 10/10 | 2.930→0.865 | 224.27→203.57 |
+| warm 8 git | 0.854330→0.783475 | 0.925709 / 10/10 | 0.815→1.305 | 254.77→260.60 |
+| warm 8 github | 0.302541→0.260856 | 0.861757 / 10/10 | 0.290→0.250 | 196.89→201.39 |
+| warm 32 path | 3.631341→0.922459 | 0.253138 / 10/10 | 3.485→1.385 | 444.91→425.18 |
+| warm 32 git | 1.393431→1.354270 | 0.972117 / 6/10 | 1.345→1.830 | 479.34→482.39 |
+| warm 32 github | 0.865482→0.793810 | 0.915134 / 9/10 | 0.850→0.780 | 443.27→447.03 |
 
-Cold-path CPU rises **3.26→6.51 s** and RSS **445.20→476.71 MiB**; paired changes are **+3.26 s/+31.70 MiB**, higher in every pair. Warm Git8/Git32 paired CPU rises **0.50/0.505 s**, also higher in every pair. Cold Git's CPU rises **0.02 s**, with three of five higher pairs. CPU separate/paired medians are five lower/four higher and RSS three lower/six higher; pair counts are **47 lower/28 higher** and **26 lower/49 higher**. User CPU cases are six lower/three higher and system CPU five lower/four higher, for both separate and paired medians; their pairs are **48/2/25** and **40/2/33** lower/tied/higher. Component medians need not add.
+Cold-path CPU rises **3.17→6.83 s** and RSS **445.21→478.76 MiB**; paired changes are **+3.72 s/+33.55 MiB**, higher in every pair. Warm Git8/Git32 paired CPU rises **0.495/0.50 s**, also higher in every pair. Cold Git's paired CPU rises **0.04 s** (one lower, one tied and three higher pairs). No other main case changes direction between separate and paired medians.
 
-The [release provenance](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-7394cebfe.json) binds the installed source and binary. Main manifest: `a8d5d51b416abe1f4673f0fa08eb70ae7f52b6b5cd688b7c896d7a8452641c26`. Separate release/base series use different observations; subtracting candidate medians would not isolate the source change.
-
-### Direct comparison with 0bf
-
-The [7394/0bf audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-7394cebfe-vs-0bfba7882-audit/README.md) checks another **156 outputs**, each exactly equal to its own-release and corresponding 0bf reference, including `drvPath`. All nine five-metric cases are recomputed; supplemental stores are not graph-walked. Manifest: `d11a01b9aee237024bf9cfe1359e973bf2496ad7e5102e70616fd0a62f8f0977`. The separate [numeric review](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-7394cebfe/README.md) checks 312 raw records, 150 retained pairs, 90 metric cells and 1,481 serialized fields independently of the benchmark auditors' arithmetic functions.
-
-| Case | Wall medians, 0bf→7394 s | Median paired wall ratio / faster pairs | CPU medians, 0bf→7394 s | RSS medians, 0bf→7394 MiB |
-| --- | ---: | ---: | ---: | ---: |
-| cold 32 path | 3.476701→3.500029 | 1.025774 / 2/5 | 6.670→6.860 | 480.73→476.61 |
-| cold 32 git | 2.171314→2.313962 | 1.077750 / 1/5 | 2.590→2.730 | 480.62→480.67 |
-| cold 32 github | 3.912855→3.588738 | 0.968034 / 3/5 | 5.440→5.420 | 960.81→970.64 |
-| warm 8 path | 0.376925→0.392400 | 1.017673 / 2/10 | 0.855→0.860 | 202.41→201.53 |
-| warm 8 git | 0.780400→0.781517 | 1.003434 / 5/10 | 1.300→1.305 | 259.62→260.62 |
-| warm 8 github | 0.262239→0.261185 | 1.005543 / 4/10 | 0.250→0.250 | 201.95→201.43 |
-| warm 32 path | 0.939435→0.912484 | 0.963049 / 8/10 | 1.400→1.375 | 426.21→425.24 |
-| warm 32 git | 1.349349→1.357344 | 0.995322 / 6/10 | 1.850→1.850 | 480.27→480.40 |
-| warm 32 github | 0.784953→0.802824 | 1.009768 / 5/10 | 0.775→0.790 | 446.61→447.35 |
-
-Only **36/75 wall pairs** are faster. Separate and paired wall statistics each have three lower/six higher cases, but warm GitHub8 falls **0.40%** separately and rises **0.55%** paired (**+1.46 ms**, 4/10 faster); warm Git32 rises **0.59%** separately and falls **0.47%** paired (**−6.27 ms**, 6/10 faster). Cold-path paired wall rises **89.61 ms** (2/5 faster) and cold Git **165.00 ms** (1/5).
-
-All five metrics retain their lower/tied/higher counts below. Paired differences and ratios have the same case classifications here; separate and paired medians are not interchangeable.
+Counts below are lower/tied/higher (L/T/H). Paired differences and ratios have the same classifications in every current metric cell; no ratio is undefined. CPU uses exact recorded centiseconds before display rounding, and component medians need not add.
 
 | Metric | Separate cases L/T/H | Paired cases L/T/H | Pairs L/T/H |
 | --- | ---: | ---: | ---: |
-| Wall | 3/0/6 | 3/0/6 | 36/0/39 |
-| CPU | 2/2/5 | 3/2/4 | 30/12/33 |
-| User CPU | 3/2/4 | 2/4/3 | 29/18/28 |
-| System CPU | 2/2/5 | 3/1/5 | 27/17/31 |
-| RSS | 4/0/5 | 3/0/6 | 36/0/39 |
+| Wall | 8/0/1 | 9/0/0 | 68/0/7 |
+| CPU | 5/0/4 | 5/0/4 | 46/1/28 |
+| User CPU | 6/0/3 | 6/0/3 | 50/0/25 |
+| System CPU | 5/0/4 | 5/0/4 | 40/4/31 |
+| RSS | 2/0/7 | 2/0/7 | 22/0/53 |
 
-Cold-path paired CPU rises **0.23 s** while RSS falls **5.87 MiB**; cold Git rises **0.14 s/+2.01 MiB**. Cold GitHub reverses both separate resource signs: paired CPU **+0.05 s**, RSS **−2.54 MiB**. Warm Git8 CPU rises separately but falls **0.01 s** paired; Git32 ties separately but falls **0.005 s** paired; GitHub32 rises separately but ties paired. Warm path8/path32 RSS falls separately but rises **0.95/1.01 MiB** paired; GitHub8 RSS falls in all ten pairs.
+The [release provenance](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-cc59f1bf9.json) binds the installed source and binary. Main manifest: `27b1068e0725370c9665d5e421e68602cbbbe6c07631d2ace2ddc4fd70ee2908`. Separate release/base series use different observations; subtracting candidate medians would not isolate the source change.
 
-Warm path8 user CPU falls separately but rises **0.005 s** paired; Git8/GitHub32 user CPU rises separately but ties paired. Warm GitHub8 system CPU ties separately but falls **0.005 s** paired. These mixed results establish no overall direct resource benefit or causal saving from the removed copy. A separate [execution-count diagnostic](/home/connorbaker/Benchmarks/nix-performance-fixes/final-row-count-7394cebfe/README.md) subsequently observed zero entries to the changed tail in each of the nine cases; its positive control observed 192. These captures cannot attribute a saving to executed work in that tail.
+### Direct comparison with 7394
+
+The [cc59/7394 audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-cc59f1bf9-vs-7394cebfe-audit/README.md) checks another **156 outputs**, each exactly equal to its own-release and corresponding 7394 reference, including `drvPath`. Supplemental stores are not graph-walked. Manifest: `9cc6e4f4b34eb13fb67a8380c5564638fc3e2db9d292be7e02e85941b12c63fe`. The separate [numeric review](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-cc59f1bf9/README.md) checks all 312 raw records, 150 retained pairs, 90 metric cells and 1,481 serialized fields independently of the benchmark auditors' arithmetic functions; its manifest is `8e0b5523c69cefa018b4eba6c9ec2c23373dfd94570c61961c8a1c2881ceaabe`.
+
+| Case | Wall medians, 7394→cc59 s | Median paired wall ratio / faster pairs | CPU medians, 7394→cc59 s | RSS medians, 7394→cc59 MiB |
+| --- | ---: | ---: | ---: | ---: |
+| cold 32 path | 3.344438→3.445300 | 1.020256 / 2/5 | 6.450→6.700 | 490.72→478.72 |
+| cold 32 git | 2.191181→2.189729 | 1.003921 / 2/5 | 2.620→2.600 | 480.75→480.58 |
+| cold 32 github | 4.383926→4.628565 | 0.934830 / 3/5 | 7.510→6.950 | 951.35→948.59 |
+| warm 8 path | 0.389416→0.387911 | 1.009423 / 4/10 | 0.855→0.860 | 205.67→203.61 |
+| warm 8 git | 0.794897→0.799069 | 1.016208 / 5/10 | 1.300→1.305 | 259.66→259.80 |
+| warm 8 github | 0.255178→0.258364 | 0.989068 / 7/10 | 0.245→0.245 | 201.95→201.80 |
+| warm 32 path | 0.937500→0.924853 | 0.990631 / 7/10 | 1.385→1.380 | 426.22→426.30 |
+| warm 32 git | 1.309359→1.341539 | 1.015375 / 3/10 | 1.830→1.850 | 482.34→480.31 |
+| warm 32 github | 0.772682→0.806420 | 1.006406 / 2/10 | 0.760→0.790 | 447.18→446.41 |
+
+Only **35/75 wall pairs** are faster. Separate and paired wall statistics each have three lower/six higher cases, but four cases reverse signs: cold Git **−0.07%/+0.39%**, cold GitHub **+5.58%/−6.52%**, warm path8 **−0.39%/+0.94%**, and warm GitHub8 **+1.25%/−1.09%** (separate/paired). Cold-path paired wall rises **71.24 ms** (2/5 faster), CPU **0.30 s** (4/5 higher), user/system CPU **0.04/0.26 s**, while RSS falls **16.0625 MiB** (3/5 lower).
+
+| Metric | Separate cases L/T/H | Paired cases L/T/H | Pairs L/T/H |
+| --- | ---: | ---: | ---: |
+| Wall | 3/0/6 | 3/0/6 | 35/0/40 |
+| CPU | 3/1/5 | 1/2/6 | 27/10/38 |
+| User CPU | 3/2/4 | 1/3/5 | 25/14/36 |
+| System CPU | 5/1/3 | 2/3/4 | 29/11/35 |
+| RSS | 7/0/2 | 7/0/2 | 49/0/26 |
+
+Cold Git/GitHub CPU falls separately but rises **0.01/0.08 s** paired; warm path8 rises separately but falls **0.005 s** paired, while path32 falls separately but ties paired. User CPU ties separately but rises paired for cold GitHub and warm path8; warm Git8 rises separately but ties paired, and warm GitHub8/path32 falls separately but ties paired. System CPU ties separately but falls paired for cold Git; cold GitHub and warm Git32 fall separately but rise paired; warm GitHub8 rises separately but ties paired; warm path32/GitHub32 falls separately but ties paired. No RSS case reverses: seven are lower under both statistics, with warm Git8/path32 higher. All ten warm GitHub32 RSS pairs are lower. These mixed results establish no overall direct resource benefit or causal saving from the guard consolidation.
+
+The historical [7394/base report](runs/2026-09-21-performance/paired-7394cebfe.json)/[main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-7394cebfe-audit/README.md) retain 72/75 wall wins with four higher CPU and six higher RSS medians. Its [direct 0bf audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-7394cebfe-vs-0bfba7882-audit/README.md) has only 36/75 wins and three lower paired wall ratios; the [numeric review](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-7394cebfe/README.md) retains all reversals.
 
 The prior [0bf/base report](runs/2026-09-21-performance/paired-0bfba7882.json) and [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-0bfba7882-audit/README.md) retain **74/75 wall wins**, with three higher CPU and seven higher RSS medians. Its [direct ec653 audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-0bfba7882-vs-ec65372c5-audit/README.md) had only **30/75 wins**, three lower separate wall medians but two lower paired ratios, including cold-path paired wall **+3.92%**. The [independent arithmetic review](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-0bfba7882/README.md) preserves every metric/sign reversal. Those observations are not pooled with this comparison.
 
@@ -186,15 +194,13 @@ The initial fold follows the current address representation: the tested URI asse
 
 ### Current compiled boundaries
 
-The [7394/0bf assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/winning-row-assembly-7394cebfe/README.md) binds the inspected store component to the completed release and later startup selection, preserving its provisional record. The selected `coalesceBlobs` body omits the old-name copy/replacement and destroys the relative-path temporary before either insertion route. Final-name construction, the Row move, vector growth and relocation remain. The body shrinks **11,636→11,500 bytes**; its fixed frame remains **1,248 bytes**. These are static sites, not executed counts: the tail can run zero times and yields at most one Row per selected different-donor `(id, mode)` collision key with a surviving validated alias in each call. No workload frequency, CPU/RSS saving or whole-DSO equivalence follows. Later startup dependency selection is not a benchmark loaded-map trace. Manifest: `a6ac70cb86e27c67e910baae9fcc519516aacd060154afbfb0de98753b5fc5af`.
+The release-bound [cc59/7394 assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/filtering-owner-assembly-cc59f1bf9/README.md) covers all six forwarders, public adapter and private helper: affected bodies total **4,072→3,472 bytes**. Each of these six forwarded operations on a shared receiver now uses one accessor guard instead of two; the helper returns it directly into caller storage. Borrowed Scoped receivers execute none of these guard atomics; enclosing policy ownership is a separate boundary. Three forwarding frames shrink 16 bytes and three grow 16. The standalone public adapter/helper adds a call boundary and grows **592→940 bytes**; the ELF itself grows 112 bytes. These static observations establish no frequency, CPU/RSS saving or whole-DSO equivalence. Later startup selection is not a benchmark loaded-map trace. Manifest: `d4e1fe490417d720b8f96f7da347f8e47e3c270703d033d30842c77629f9f1c7`.
 
-The separate 7394 execution-count diagnostic instruments `coalesceBlobs+0x2bc`, after final winner validation and before either name/insertion branch, in that exact release DSO. All nine counts are zero: one cold32 capture and warm8/warm32 captures for each scheme, using fresh private states and three warm seeds. All twelve evaluation outputs exactly match their completed own-release references, including `drvPath`; the complete local source censuses agree before and after. The existing 144-cell reconciliation test supplies a passing, unskipped positive control with **192 tail entries**. Every counter reports 100% running. The collector restores normal-user execution context, attaches only to its launched command tree, and removes its uniquely named probe. This is one capture per case, not a count of the earlier timed runs; probe execution perturbs cost, and entries are not completed insertions. No timing, CPU or RSS benefit is inferred.
+Historical [7394/0bf assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/winning-row-assembly-7394cebfe/README.md) removes the old-name copy/replacement and restores path-temporary cleanup before insertion: `coalesceBlobs` shrinks **11,636→11,500 bytes**, with a **1,248-byte** frame. Final-name construction, Row movement and vector growth/relocation remain. Its tail permits at most one Row per selected different-donor `(id, mode)` collision key with a surviving validated alias.
 
-The historical [0bf Memo assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/memo-assembly-0bfba7882/README.md) and [fetchers census](/home/connorbaker/Benchmarks/nix-performance-fixes/fetchers-codegen-census-ec653-0bfba/README.md) retain the removed 104-byte return copy and all 1,666 function names. Four changed-size names cover three bodies; the two beyond Memo differ only in NOP placement, corresponding moved references and an assertion diagnostic. Same-size bodies were not checked for instruction identity, and padding can execute. These are 0bf/ec653 observations, not 7394 codegen or causal counter attribution.
+The separate [7394 execution-count diagnostic](/home/connorbaker/Benchmarks/nix-performance-fixes/final-row-count-7394cebfe/README.md) observes **zero tail entries in all nine cases**; its passing 144-cell positive control observes **192**. All twelve outputs exactly match completed references, source censuses agree, and every counter reports 100% running. Private states and three warm seeds support one capture per case, not counts of earlier timed runs. The collector restores normal-user context, follows only its launched command tree and removes its probe. Probe execution perturbs cost; entries are not completed insertions, and no timing/CPU/RSS benefit follows.
 
-Earlier [ec653/342c assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/ownership-assembly-ec65372c5/README.md) retains removed child-argument copies, one memo transfer and hold-name/formatting work. Its [remaining ownership analysis](/home/connorbaker/Benchmarks/nix-performance-fixes/remaining-ownership-assembly-ec65372c5/README.md) retains opposing costs: union transfer avoids node/name copies but adds source-tree erase/rebalancing; row moves transfer external buffers but still copy/reset short names, including `memcpy(1)` for empty names, and add span arithmetic. Vector growth/relocation and SQL operations remain.
-
-These are named static sites, not executed allocation counts or CPU/RSS estimates. Earlier [342c assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/boundary-assembly-342c0a9b5/README.md) retains the four borrowed push closures and direct final-component opens, with cancellation/syscall-policy limits. The 342c profiles and syscall counts below measure **342c versus base, not ec653, 0bf or 7394**; they cannot establish the later ownership changes' effect.
+Historical [0bf Memo assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/memo-assembly-0bfba7882/README.md) and its [fetchers census](/home/connorbaker/Benchmarks/nix-performance-fixes/fetchers-codegen-census-ec653-0bfba/README.md) retain the removed 104-byte copy, 1,666 names and three changed-size bodies. Other changes are NOPs, moved references and an assertion diagnostic; same-size bodies were not checked for instruction identity, and padding can execute. [ec653/342c assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/ownership-assembly-ec65372c5/README.md) and [remaining ownership costs](/home/connorbaker/Benchmarks/nix-performance-fixes/remaining-ownership-assembly-ec65372c5/README.md) retain copy reductions alongside tree rebalancing, short-name copying, span arithmetic, vector relocation and SQL work. [342c assembly](/home/connorbaker/Benchmarks/nix-performance-fixes/boundary-assembly-342c0a9b5/README.md) retains borrowed closures/direct opens and cancellation/syscall-policy limits. None measures executed allocations. These revision-specific records cannot attribute later performance; the profiles and syscall counts below remain **342c versus base**, and the counter diagnostics remain **0bf versus ec653**.
 
 ### 0bf/ec653 warm counter diagnostics
 
