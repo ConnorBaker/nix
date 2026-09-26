@@ -57,9 +57,7 @@ public:
      * Regular-file ingestion publishes no auxiliary blob copy; symlink-target
      * blobs and tree bodies still need auxiliary files. Earlier layouts may
      * leave regular blobs there. Claiming a first holder needs a row, not an
-     * auxiliary `linkat`; repeated occurrences reuse the holder. The removed
-     * auxiliary links cost the historical 0.19-0.21 s per 40 000 files in
-     * `05-validation.md` section 6.
+     * auxiliary `linkat`; repeated occurrences reuse the holder.
      *
      * When a row is written, when it becomes true, and when it goes.  The
      * rows are staged in the hold while copying and inserted when the path
@@ -236,10 +234,8 @@ public:
     std::filesystem::path treeFile(const Hash & id) const;
 
     /**
-     * The same auxiliary names as plain strings. Regular-file holder
-     * lookup needs neither name. `std::filesystem::path`'s `operator/` splits
-     * and reallocates its components: a historical first-entry profile put the path
-     * class at about a twentieth of all instructions, three names a file.
+     * The same auxiliary names as owned strings. Regular-file holder
+     * lookup needs neither name.
      */
     std::string blobFileName(const Hash & id, bool executable) const;
 
@@ -382,9 +378,10 @@ public:
             std::shared_ptr<AuxiliaryLock> auxiliaryLock);
         explicit Hold(std::shared_ptr<Lease> lease);
 
-        std::pair<std::filesystem::path, std::filesystem::path::string_type>
+        std::pair<std::filesystem::path::string_type, std::filesystem::path::string_type>
         namesFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
-        bool linkObject(const std::filesystem::path & object, const std::filesystem::path::string_type & held) const;
+        bool linkObject(
+            const std::filesystem::path::string_type & object, const std::filesystem::path::string_type & held) const;
         bool holdObject(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
         void
         writeObjectFile(const GitObjectStore & objects, const merkle::TreeEntry & object, std::string_view bytes) const;

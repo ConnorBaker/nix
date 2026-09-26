@@ -114,11 +114,9 @@ std::string GitObjectStore::idString(const Hash & id)
     return id.to_string(HashFormat::Base16, false);
 }
 
-/* `<subdirectory>/<xx>/<identifier>` appended, without
-   `std::filesystem::path`: the class splits and reallocates its components
-   at every `/`, and the object store names a file three times for every
-   regular file it enters.  `<xx>` is the identifier's first byte in
-   hexadecimal, git's own shard (01 §9.10). */
+/* The owned spelling `<subdirectory>/<xx>/<identifier>`. Both the shard
+   `<xx>` and identifier use lowercase hexadecimal; the shard encodes the
+   identifier's first byte (01 §9.10). */
 static std::string nameUnder(const std::string & subdir, const Hash & id)
 {
     auto bytes = std::as_bytes(std::span<const uint8_t>{&id.hash[0], id.hashSize});
@@ -126,9 +124,8 @@ static std::string nameUnder(const std::string & subdir, const Hash & id)
     s.reserve(subdir.size() + 1 + 2 + 1 + base16::encodedLength(id.hashSize));
     s += subdir;
     s += '/';
-    /* The identifier encoded into `s`, not into a string of its own: this
-       names a blob's file once or twice for every regular file entered
-       (`05` section 6).  The shard is the same encoding of the first byte. */
+    /* Encode the shard and identifier directly into the result, without
+       a separate identifier string. */
     base16::encodeTo(s, bytes.first(1));
     s += '/';
     base16::encodeTo(s, bytes);
@@ -655,20 +652,25 @@ GitObjectStore::Hold::Lease::~Lease()
     }
 }
 
-std::pair<std::filesystem::path, std::filesystem::path::string_type>
+std::pair<std::filesystem::path::string_type, std::filesystem::path::string_type>
 GitObjectStore::Hold::namesFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const
 {
     /* The caller owns the public namespace; the lease owns only the hold.
-       Keep the existing global spelling and native conversion before any
+       Keep the global spelling and Windows native conversion before any
        held shard is created. The generated suffix is ASCII at every width. */
     size_t kind = object.mode == merkle::Mode::Directory ? 2 : object.mode == merkle::Mode::Executable ? 1 : 0;
     const std::array<const std::string *, 3> prefixes{&objects.blobsDir, &objects.blobsXDir, &objects.treesDir};
     constexpr std::array<OsStringView, 3> kinds{OS_STR("blobs"), OS_STR("blobs-x"), OS_STR("trees")};
-    std::pair<std::filesystem::path, std::filesystem::path::string_type> result{
-        nameUnder(*prefixes[kind], object.hash), std::filesystem::path::string_type{}};
+    std::pair<std::filesystem::path::string_type, std::filesystem::path::string_type> result{
+#ifdef _WIN32
+        std::filesystem::path(nameUnder(*prefixes[kind], object.hash)).native(),
+#else
+        nameUnder(*prefixes[kind], object.hash),
+#endif
+        std::filesystem::path::string_type{}};
     auto & [dst, held] = result;
     auto idSize = base16::encodedLength(object.hash.hashSize);
-    auto name = dst.native().end() - idSize;
+    auto name = dst.end() - idSize;
     auto shard = name - 3; // Two shard digits and the following separator.
     held.reserve(kinds[kind].size() + idSize + 4);
     held += kinds[kind];
@@ -676,7 +678,7 @@ GitObjectStore::Hold::namesFor(const GitObjectStore & objects, const merkle::Tre
     held.append(shard, shard + 2);
     std::call_once(lease->shards[kind * 256 + object.hash.hash[0]], [&] { createDirs(lease->dir / held); });
     held += std::filesystem::path::preferred_separator;
-    held.append(name, dst.native().end());
+    held.append(name, dst.end());
     return result;
 }
 
@@ -698,7 +700,7 @@ GitObjectStore::Hold GitObjectStore::hold() const
    concurrent sweep may then take, the verifier reports and `--optimise`
    re-enters, as before the hold existed. */
 bool GitObjectStore::Hold::linkObject(
-    const std::filesystem::path & object, const std::filesystem::path::string_type & held) const
+    const std::filesystem::path::string_type & object, const std::filesystem::path::string_type & held) const
 {
 #ifdef _WIN32
     auto ec = hardLink(object, lease->dir / held);
@@ -1174,7 +1176,7 @@ void GitObjectStore::Hold::writeObjectFile(
     auto ec = publish();
     if (ec == std::errc::no_such_file_or_directory) {
         /* The first object of this shard (`createDirectories`). */
-        createDirs(dst.parent_path());
+        createDirs(std::filesystem::path(dst).parent_path());
         ec = publish();
     }
     if (ec) {
