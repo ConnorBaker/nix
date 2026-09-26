@@ -462,7 +462,7 @@ PosixDirectorySourceAccessor::openParentAndUpsert(const CanonPath & path, bool i
         insertIntoDirFdCache(*parent, ref<AutoCloseFD>(parentFdOwning));
     }
 
-    return {parentFd, parentFdOwning};
+    return {parentFd, std::move(parentFdOwning)};
 }
 
 std::optional<SourceAccessor::Stat> PosixDirectorySourceAccessor::maybeLstat(const CanonPath & path)

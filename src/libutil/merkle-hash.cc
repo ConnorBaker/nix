@@ -74,6 +74,7 @@ Hash blobId(std::string_view bytes)
 
 std::string serialiseTree(const Tree & tree)
 {
+    using namespace std::string_view_literals;
     std::string body;
 
     for (auto & [key, entry] : tree) {
@@ -83,16 +84,16 @@ std::string serialiseTree(const Tree & tree)
             assert(!name.empty());
             assert(name.back() == '/');
             name.remove_suffix(1);
-            body += "40000 ";
+            body += "40000 "sv;
             break;
         case Mode::Regular:
-            body += "100644 ";
+            body += "100644 "sv;
             break;
         case Mode::Executable:
-            body += "100755 ";
+            body += "100755 "sv;
             break;
         case Mode::Symlink:
-            body += "120000 ";
+            body += "120000 "sv;
             break;
         default:
             appendDigits<8>(body, static_cast<RawMode>(entry.mode));

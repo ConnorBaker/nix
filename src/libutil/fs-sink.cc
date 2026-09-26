@@ -263,7 +263,7 @@ std::unique_ptr<RegularFileWriter> RestoreSink::beginRegularFile(const CanonPath
 std::unique_ptr<RegularFileWriter>
 RestoreSink::beginRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name)
 {
-    assert(!name.isRoot() && name.parent()->isRoot());
+    assert(!name.isRoot() && name.rel().find('/') == std::string_view::npos);
     /* The parent and validated name are the same ones used for placement.
        O_CREAT | O_EXCL refuses an existing final symlink. */
     constexpr int flags = O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC;
