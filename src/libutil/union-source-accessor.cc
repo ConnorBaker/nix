@@ -134,9 +134,8 @@ public:
             return own->readDirectory(path);
         DirEntries result = own->readDirectory(path);
         for (auto & accessor : laterDirectories(path, *own))
-            for (auto & entry : accessor->readDirectory(path))
-                /* Earlier children win name collisions. */
-                result.insert(entry);
+            /* Transfer owned entries; earlier children win name collisions. */
+            result.merge(accessor->readDirectory(path));
         return result;
     }
 

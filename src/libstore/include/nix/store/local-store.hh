@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <span>
 #include <string>
 #include <boost/unordered/unordered_flat_set.hpp>
 
@@ -818,7 +819,7 @@ private:
         const GitObjectStore::Hold & hold,
         const std::vector<BlobCoalescing> & collisions);
 
-    void insertBlobRows(State & state, uint64_t ingestion, const std::vector<GitObjectStore::Hold::Row> & rows);
+    void insertBlobRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Hold::Row> rows);
 
     /** Keep rewritten rows across a SQLite retry: filesystem changes survive rollback. */
     void coalesceBlobRows(

@@ -8,6 +8,7 @@
 #include "nix/util/file-descriptor.hh"
 #include "nix/util/finally.hh"
 #include "nix/util/logging.hh"
+#include "nix/util/os-string.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/strings.hh"
@@ -673,12 +674,12 @@ std::filesystem::path::string_type GitObjectStore::Hold::linkNameFor(const std::
     assert(isShardName(shardName));
     auto digit = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
     size_t n = digit(shardName[0]) * 16 + digit(shardName[1]);
-    if (*kind == "blobs-x")
+    if (kind->native() == OS_STR("blobs-x"))
         n += 256;
-    else if (*kind == "trees")
+    else if (kind->native() == OS_STR("trees"))
         n += 512;
     else
-        assert(*kind == "blobs");
+        assert(kind->native() == OS_STR("blobs"));
     std::call_once(lease->shards[n], [&] { createDirs(lease->dir / parent); });
     parent += std::filesystem::path::preferred_separator;
     parent += name->native();
@@ -1107,8 +1108,8 @@ void GitObjectStore::Hold::writeObjectFile(
     bool fsync,
     const std::function<void(const std::filesystem::path &)> & atFsync) const
 {
-    auto held = linkNameFor(dst);
-    if (holdObject(dst, held))
+    auto tmp = linkNameFor(dst);
+    if (holdObject(dst, tmp))
         return;
     /* This name belongs to an already unique, locked hold. Its lifetime
        is the hold's, so it needs neither the global temporaries' timestamp
@@ -1116,8 +1117,8 @@ void GitObjectStore::Hold::writeObjectFile(
        sequence. The lease owns the directory resolved by every relative
        operation; full paths are needed only for Windows and diagnostics. */
     static std::atomic<uint64_t> counter{0};
-    auto tmp = held;
-    auto suffix = fmt(".tmp-%d", counter.fetch_add(1, std::memory_order_relaxed));
+    auto heldSize = tmp.size();
+    auto suffix = ".tmp-" + std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
     tmp.append(suffix.begin(), suffix.end()); // The suffix is ASCII on every platform.
     auto tmpPath = [&] { return lease->dir / tmp; };
     auto unlinkTemporary = [&] {
@@ -1185,7 +1186,9 @@ void GitObjectStore::Hold::writeObjectFile(
         unlinkTemporary();
         removeTemporary = false;
         if (ec == std::errc::file_exists) {
-            if (!holdObject(dst, held))
+            /* The losing temporary is gone; reuse its name to hold the winner. */
+            tmp.resize(heldSize);
+            if (!holdObject(dst, tmp))
                 throw Error("object %s disappeared during publication", PathFmt(dst));
             return;
         }

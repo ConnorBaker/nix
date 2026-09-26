@@ -108,7 +108,7 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
     merkle::Tree tree;
     merkle::nar::Directory size;
     bool sizeExact = true;
-    auto consume = [&](std::string name, HashedNode child) {
+    auto consume = [&](std::string && name, const HashedNode & child) {
         if (child.entry.hash.algo != merkle::hashAlgo)
             throw Error(
                 "object hash: '%s' was answered with a %s identifier, but the tree is hashed with %s",
@@ -125,7 +125,7 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
     if (workers == 1)
         children([&](std::string_view name, bool, fun<HashedNode()> visit) {
             auto child = visit();
-            consume(std::string(name), std::move(child));
+            consume(std::string(name), child);
         });
     else {
         struct Child
@@ -154,11 +154,11 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
                 kids.size(),
                 [&](size_t i) { return kids[i].subdirectory; },
                 [&](size_t i, bool) { kids[i].node = kids[i].visit(); },
-                [&](size_t i) { consume(std::move(kids[i].name), std::move(*kids[i].node)); });
+                [&](size_t i) { consume(std::move(kids[i].name), *kids[i].node); });
         else
             for (auto & child : kids) {
                 auto node = child.visit();
-                consume(std::move(child.name), std::move(node));
+                consume(std::move(child.name), node);
             }
     }
 

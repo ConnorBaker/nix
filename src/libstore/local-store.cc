@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 
 #include <memory>
 #include <new>
@@ -588,7 +589,7 @@ void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::fi
     hold.ingestion.emplace();
 }
 
-void LocalStore::insertBlobRows(State & state, uint64_t ingestion, const std::vector<GitObjectStore::Hold::Row> & rows)
+void LocalStore::insertBlobRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Hold::Row> rows)
 {
     for (auto & row : rows)
         state.stmts->InsertBlob.use()
@@ -656,9 +657,6 @@ void LocalStore::coalesceBlobRows(
         return c != 0 ? c < 0 : a.executable < b.executable;
     };
     std::sort(representatives.begin(), representatives.end(), keyLess);
-    auto represented = [&](const auto & row) {
-        return std::binary_search(representatives.begin(), representatives.end(), row, keyLess);
-    };
     std::erase_if(rows, [&](const auto & row) {
         auto collision =
             std::lower_bound(collisions.begin(), collisions.end(), row, [&](const auto & c, const auto & r) {
@@ -666,7 +664,13 @@ void LocalStore::coalesceBlobRows(
             });
         return collision != collisions.end() && !keyLess(row, collision->row);
     });
-    rows.insert(rows.end(), representatives.begin(), representatives.end());
+    rows.insert(
+        rows.end(), std::make_move_iterator(representatives.begin()), std::make_move_iterator(representatives.end()));
+    /* Retry-owned rows now own the selected names; SQL borrows that range. */
+    auto selected = std::span<const GitObjectStore::Hold::Row>(rows).last(representatives.size());
+    auto represented = [&](const auto & row) {
+        return std::binary_search(selected.begin(), selected.end(), row, keyLess);
+    };
     /* Preserve the physical facts first, then finish their durability
        before any SQL can retry. A retry may already see the winning inode
        and therefore make no further filesystem changes. */
@@ -707,7 +711,7 @@ void LocalStore::coalesceBlobRows(
             .apply(name.string())
             .exec();
     }
-    insertBlobRows(state, ingestion, representatives);
+    insertBlobRows(state, ingestion, selected);
 }
 
 void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath & path)

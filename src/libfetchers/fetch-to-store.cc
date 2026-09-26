@@ -254,7 +254,7 @@ struct MemoVisitor : HashingVisitor
     /* The memo's answer for the node at `to`: its entry when the memo has
        a row under the node's name, under the memo's rule (a symlink is
        read without a lookup; a directory under a filter is never
-       answered).  The key found is returned through `key`, for `record`.
+       answered). The key found is returned through `key`, for recording.
        Also the copy route's `TreeNamer` (01 §9.10, the second route): the
        copy trusts what the naming trusted. */
     /* Whether the memo is consulted for a node of this kind at all: a
@@ -300,7 +300,13 @@ struct MemoVisitor : HashingVisitor
         auto result = descend();
         if (st.type == SourceAccessor::tSymlink)
             key = keyOf(to, root.path / to);
-        return record(std::move(key), std::move(result));
+        if (key) {
+            std::lock_guard lock(mutex);
+            writes.emplace_back(std::move(*key), entryRow(result.entry));
+            if (writes.size() >= maxPendingWrites)
+                flushLocked();
+        }
+        return result;
     }
 
     /* The caller holds mutex. */
@@ -317,17 +323,6 @@ struct MemoVisitor : HashingVisitor
     {
         std::lock_guard lock(mutex);
         flushLocked();
-    }
-
-    HashedNode record(std::optional<fetchers::Cache::Key> key, HashedNode node)
-    {
-        if (key) {
-            std::lock_guard lock(mutex);
-            writes.emplace_back(std::move(*key), entryRow(node.entry));
-            if (writes.size() >= maxPendingWrites)
-                flushLocked();
-        }
-        return node;
     }
 };
 
