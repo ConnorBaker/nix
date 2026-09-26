@@ -235,12 +235,12 @@ struct RestoreRegularFile : RegularFileWriter, FdSink
 
 void RestoreRegularFile::anchor() {}
 
+#ifdef _WIN32
 std::unique_ptr<RegularFileWriter> RestoreSink::beginRegularFile(const CanonPath & path)
 {
     auto crf = std::make_unique<RestoreRegularFile>(
         startFsync,
         hooks,
-#ifdef _WIN32
         CreateFileW(
             append(dstPath, path).c_str(),
             GENERIC_READ | GENERIC_WRITE,
@@ -248,26 +248,34 @@ std::unique_ptr<RegularFileWriter> RestoreSink::beginRegularFile(const CanonPath
             NULL,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL,
-            NULL)
-#else
-        [&]() {
-            /* O_EXCL together with O_CREAT ensures symbolic links in the last
-               component are not followed. */
-            constexpr int flags = O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC;
-            auto [_parentFd, fd, name] = getParentFdAndName(dirFd.get(), dstPath, path);
-            /* The parent is already resolved and name is one validated component.
-               O_CREAT | O_EXCL refuses an existing final symlink. */
-            AutoCloseFD file{::openat(fd, name.rel_c_str(), flags, 0666)};
-            if (!file && errno == NIX_ERR_OPEN_SYMLINK)
-                throw SymlinkNotAllowed(name);
-            return file;
-        }()
-#endif
-    );
+            NULL));
     if (!crf->fd)
         throw NativeSysError("creating file %1%", PathFmt(append(dstPath, path)));
     return crf;
 }
+#else
+std::unique_ptr<RegularFileWriter> RestoreSink::beginRegularFile(const CanonPath & path)
+{
+    auto [owned, parentFd, name] = parentOf(path);
+    return beginRegularFileAt(path, parentFd, name);
+}
+
+std::unique_ptr<RegularFileWriter>
+RestoreSink::beginRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name)
+{
+    assert(!name.isRoot() && name.parent()->isRoot());
+    /* The parent and validated name are the same ones used for placement.
+       O_CREAT | O_EXCL refuses an existing final symlink. */
+    constexpr int flags = O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC;
+    AutoCloseFD file{::openat(parentFd, name.rel_c_str(), flags, 0666)};
+    if (!file && errno == NIX_ERR_OPEN_SYMLINK)
+        throw SymlinkNotAllowed(name);
+    auto crf = std::make_unique<RestoreRegularFile>(startFsync, hooks, std::move(file));
+    if (!crf->fd)
+        throw NativeSysError("creating file %1%", PathFmt(append(dstPath, path)));
+    return crf;
+}
+#endif
 
 void RestoreSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
 {

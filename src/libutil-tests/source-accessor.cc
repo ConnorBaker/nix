@@ -388,6 +388,55 @@ TEST_F(FSSourceAccessorTest, singleFileRootDestinationHasNoTrailingSlash)
         ::testing::ThrowsMessage<SysError>(testing::HasSubstrIgnoreANSIMatcher("\"" + missing.string() + "\"")));
 }
 
+/* Both parent ownership routes retain the selected directory across rename.
+   Once creation returns, the writer no longer needs the parent descriptor. */
+TEST_F(FSSourceAccessorTest, regularFileAtRetainsItsSelectedParentAndOwnsItsFile)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "descriptor-relative creation is Unix-only";
+#else
+    const std::string contents("before\0after", 12);
+    for (bool borrowed : {false, true})
+        for (bool executable : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "borrowed=" << borrowed << " executable=" << executable);
+            auto base = tmpDir / (std::to_string(borrowed) + "-" + std::to_string(executable));
+            auto parent = base / "parent";
+            auto moved = base / "moved";
+            createDirs(parent);
+            /* An independent creation in the same directory observes the
+               current umask/default ACL without changing process-wide state. */
+            writeFile(parent / "reference", contents);
+            auto expectedMode = (nix::lstat(parent / "reference").st_mode & 07777) | (executable ? 0111 : 0);
+
+            RestoreSink sink(/*startFsync=*/false);
+            sink.dstPath = borrowed ? parent : parent / "leaf";
+            if (borrowed)
+                sink.dirFd = openDirectory(parent, FinalSymlink::Follow);
+            auto path = borrowed ? CanonPath("leaf") : CanonPath::root;
+            auto [owned, parentFd, name] = sink.parentOf(path);
+            ASSERT_EQ(bool(owned), !borrowed);
+            std::filesystem::rename(parent, moved);
+            createDirs(parent);
+
+            auto writer = sink.beginRegularFileAt(path, parentFd, name);
+            owned.close();
+            sink.dirFd.close();
+            if (executable)
+                writer->isExecutable();
+            (*writer)(contents);
+            writer->finish();
+            writer.reset();
+
+            auto result = nix::lstat(moved / "leaf");
+            EXPECT_TRUE(S_ISREG(result.st_mode));
+            EXPECT_EQ(result.st_mode & 07777, expectedMode);
+            EXPECT_EQ(nix::readFile(moved / "leaf"), contents);
+            EXPECT_EQ(nix::readFile(moved / "reference"), contents);
+            EXPECT_FALSE(nix::pathExists(parent / "leaf"));
+        }
+#endif
+}
+
 /* ----------------------------------------------------------------------------
  * RestoreSink non-directory at root (no dirFd)
  * --------------------------------------------------------------------------*/

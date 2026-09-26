@@ -619,15 +619,21 @@ struct LinkingVisitor : ObjectStoreVisitor
         /* A miss: written from memory, canonicalised by the restore sink's
            hooks, and entered as the store's file -- or, should another
            writer have entered the blob meanwhile, replaced by its file. */
-        target.sink.createRegularFile(target.name, [&](CreateRegularFileSink & crf) {
+        {
+#ifdef _WIN32
+            auto written = target.sink.beginRegularFile(target.name);
+#else
+            auto written = target.sink.beginRegularFileAt(target.name, dirFd, name);
+#endif
             if (executable)
-                crf.isExecutable();
-            crf.preallocateContents(buffer.size());
+                written->isExecutable();
+            written->preallocateContents(buffer.size());
             /* The complete file is already buffered, and this writer is fresh. */
-            auto & sink = dynamic_cast<FdSink &>(crf);
+            auto & sink = dynamic_cast<FdSink &>(*written);
             assert(!sink.hasData());
             sink.writeUnbuffered(buffer);
-        });
+            written->finish();
+        }
         if (linkable)
             objects.enterWritten(entry.hash, executable, dirFd, name, target.where, repair, hold);
         return std::move(file.node);
@@ -780,7 +786,7 @@ struct MaterialisingVisitor : LinkingVisitor
                         .entry = *entry,
                         .narSize = merkle::nar::regular(static_cast<uint64_t>(linked.st_size), st.isExecutable)};
 
-                auto writer = target.sink.beginRegularFile(target.name);
+                auto writer = target.sink.beginRegularFileAt(target.name, dirFd, name);
                 if (st.isExecutable)
                     writer->isExecutable();
                 /* Stat need not know a packed blob's size. readFile must

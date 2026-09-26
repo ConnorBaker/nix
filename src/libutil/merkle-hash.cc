@@ -10,11 +10,7 @@ namespace nix::merkle {
 
 void DirectorySink::anchor() {}
 
-/* A non-negative integer in base `base`, appended.  `nix::fmt` is
-   `boost::format`, which costs some thousands of instructions a call; the
-   header of every blob and the mode of every tree entry pass through here
-   once per node per walk, which made it a fifth of the object store's own
-   instructions on a first entry. */
+/* Append a non-negative integer in base `base` without generic formatting. */
 template<unsigned base>
 static void appendDigits(std::string & out, uint64_t value)
 {
@@ -82,13 +78,26 @@ std::string serialiseTree(const Tree & tree)
 
     for (auto & [key, entry] : tree) {
         std::string_view name = key;
-        if (entry.mode == Mode::Directory) {
+        switch (entry.mode) {
+        case Mode::Directory:
             assert(!name.empty());
             assert(name.back() == '/');
             name.remove_suffix(1);
+            body += "40000 ";
+            break;
+        case Mode::Regular:
+            body += "100644 ";
+            break;
+        case Mode::Executable:
+            body += "100755 ";
+            break;
+        case Mode::Symlink:
+            body += "120000 ";
+            break;
+        default:
+            appendDigits<8>(body, static_cast<RawMode>(entry.mode));
+            body += ' ';
         }
-        appendDigits<8>(body, static_cast<RawMode>(entry.mode));
-        body += ' ';
         body += name;
         body += '\0';
         body.append(reinterpret_cast<const char *>(entry.hash.hash), entry.hash.hashSize);

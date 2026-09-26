@@ -182,6 +182,15 @@ public:
      * borrows from `dirFd`.
      */
     std::tuple<AutoCloseFD, Descriptor, CanonPath> parentOf(const CanonPath & path) const;
+
+    /**
+     * Begin a regular file using the descriptor and single-component name
+     * returned by parentOf(path). The caller keeps that parent alive through
+     * this call; the writer owns only the newly opened file. `path` retains
+     * the original sink-relative spelling for diagnostics.
+     */
+    std::unique_ptr<RegularFileWriter>
+    beginRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name);
 #endif
 };
 
