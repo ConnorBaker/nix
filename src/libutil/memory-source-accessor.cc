@@ -71,6 +71,7 @@ MemorySourceAccessor::File * MemorySourceAccessor::open(const CanonPath & path, 
 
 void MemorySourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
 {
+    auto keepAlive = weak_from_this().lock();
     auto * f = open(path, std::nullopt);
     if (!f)
         throw FileNotFound("file '%s' does not exist", showPath(path));

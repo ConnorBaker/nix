@@ -44,7 +44,7 @@ MakeError(NotARegularFile, SourceAccessorError);
  * filesystem-like entities (such as the real filesystem, tarballs or
  * Git repositories).
  *
- * Defaults that continue using or borrowing the accessor across callbacks
+ * Operations that continue using or borrowing the accessor across callbacks
  * retain its shared owner. Accessors without shared ownership remain
  * borrowed and must outlive the operation.
  */

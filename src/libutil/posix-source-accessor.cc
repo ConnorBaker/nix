@@ -142,6 +142,7 @@ public:
 
 void PosixFileSourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
 {
+    auto keepAlive = weak_from_this().lock();
     if (!path.isRoot()) /* We are the parent and also a regular file. */
         throw NotADirectory("reading file '%1%': %2%", showPath(path), "Not a directory");
 
@@ -291,6 +292,8 @@ private:
     OpenedParent openParent(const CanonPath & path);
 
     AutoCloseFD openSubdirectory(const CanonPath & path);
+
+    std::pair<AutoCloseDir, DirEntries> openDirectoryWithEntries(const CanonPath & path);
 
 public:
     PosixDirectorySourceAccessor(
@@ -549,24 +552,17 @@ AutoCloseFD PosixDirectorySourceAccessor::openSubdirectory(const CanonPath & pat
     return dirFdOwning;
 }
 
-SourceAccessor::DirEntries PosixDirectorySourceAccessor::readDirectory(const CanonPath & path)
+std::pair<AutoCloseDir, SourceAccessor::DirEntries>
+PosixDirectorySourceAccessor::openDirectoryWithEntries(const CanonPath & path)
 {
-    DirEntries result;
-    readDirectoryWithEntries(
-        path, [&](SourceAccessor &, const CanonPath &, const DirEntries & entries) { result = entries; });
-    return result;
-}
-
-void PosixDirectorySourceAccessor::readDirectoryWithEntries(
-    const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback)
-try {
     AutoCloseFD dirFdOwning = openSubdirectory(path);
-    AutoCloseDir dir(::fdopendir(dirFdOwning.get()));
+    std::pair<AutoCloseDir, DirEntries> result;
+    auto & [dir, entries] = result;
+    dir.reset(::fdopendir(dirFdOwning.get()));
     if (!dir)
         throw SysError("reading directory '%s'", showPath(path));
     dirFdOwning.release();
 
-    DirEntries entries;
     const ::dirent * dirent = nullptr;
 
     while (errno = 0, dirent = ::readdir(dir.get())) {
@@ -608,19 +604,41 @@ try {
     if (errno)
         throw SysError("reading directory '%1%'", showPath(path));
 
-    /* fdopendir owns the descriptor for the whole callback. The scoped
-       accessor borrows it, including while directory workers run. */
-    PosixDirectorySourceAccessor accessor{::dirfd(dir.get()), fsPath / path.rel(), trackLastModified};
-    callback(accessor, CanonPath::root, entries);
-    PosixSourceAccessorBase::maybeUpdateMtime(accessor.mtime);
+    return result;
+}
+
+SourceAccessor::DirEntries PosixDirectorySourceAccessor::readDirectory(const CanonPath & path)
+try {
+    auto [dir, entries] = openDirectoryWithEntries(path);
+    /* Preserve relative-path validation before returning the entries. */
+    (void) path.rel();
+    return std::move(entries);
 } catch (SymlinkNotAllowed & e) {
     throw SymlinkNotAllowed(e.path, "path '%s' is a symlink", showPath(e.path));
+}
+
+void PosixDirectorySourceAccessor::readDirectoryWithEntries(
+    const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback)
+{
+    auto keepAlive = weak_from_this().lock();
+    try {
+        auto [dir, entries] = openDirectoryWithEntries(path);
+
+        /* fdopendir owns the descriptor for the whole callback. The scoped
+           accessor borrows it, including while directory workers run. */
+        PosixDirectorySourceAccessor accessor{::dirfd(dir.get()), fsPath / path.rel(), trackLastModified};
+        callback(accessor, CanonPath::root, entries);
+        PosixSourceAccessorBase::maybeUpdateMtime(accessor.mtime);
+    } catch (SymlinkNotAllowed & e) {
+        throw SymlinkNotAllowed(e.path, "path '%s' is a symlink", showPath(e.path));
+    }
 }
 
 void PosixDirectorySourceAccessor::readDirectory(
     const CanonPath & dirPath,
     std::function<void(SourceAccessor & subdirAccessor, const CanonPath & subdirRelPath)> callback)
 {
+    auto keepAlive = weak_from_this().lock();
     auto fd = openSubdirectory(dirPath);
     PosixDirectorySourceAccessor accessor{
         std::move(fd), fsPath / dirPath.rel(), trackLastModified, /*dirFdCacheSize=*/0};

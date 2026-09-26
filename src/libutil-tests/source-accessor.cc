@@ -89,6 +89,206 @@ TEST_F(FSSourceAccessorTest, works)
     }
 }
 
+/* The sentinel stops an unfixed implementation before it can return into a
+   receiver destroyed by its own callback. It is distinct from the intended
+   callback exception, so an early ownership failure cannot satisfy the test. */
+TEST_F(FSSourceAccessorTest, scopedDirectoryCallbacksRetainTheirReceiver)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "POSIX directory receiver lifetime";
+#else
+    struct ReceiverReleased
+    {};
+
+    struct CallbackException
+    {};
+    enum class Ending { Return, Exception, Symlink };
+    const std::string contents = "scoped bytes";
+    auto base = tmpDir / "callback-source";
+    createDirs(base / "sub");
+    writeFile(base / "leaf", contents);
+    writeFile(base / "sub" / "leaf", contents);
+    unsigned cells = 0, allBorrowedCalls = 0;
+    for (bool withEntries : {false, true})
+        for (bool nested : {false, true})
+            for (auto ending : {Ending::Return, Ending::Exception, Ending::Symlink})
+                for (bool releaseOwner : {false, true})
+                    for (bool track : {false, true}) {
+                        ++cells;
+                        SCOPED_TRACE(
+                            ::testing::Message() << withEntries << ' ' << nested << ' ' << int(ending) << ' '
+                                                 << releaseOwner << ' ' << track);
+                        std::shared_ptr<SourceAccessor> owner = makeFSSourceAccessor(base, track).get_ptr();
+                        std::weak_ptr<SourceAccessor> weakOwner = owner;
+                        auto * accessor = owner.get();
+                        accessor->setPathDisplay("outer-display");
+                        const CanonPath path(nested ? "/sub" : "/");
+                        unsigned calls = 0, borrowedCalls = 0;
+                        auto callback = [&](SourceAccessor & scoped, const CanonPath & relative) {
+                            ++calls;
+                            if (releaseOwner)
+                                owner.reset();
+                            bool alive = !weakOwner.expired();
+                            EXPECT_TRUE(alive);
+                            if (!alive)
+                                throw ReceiverReleased{};
+                            EXPECT_EQ(relative, CanonPath::root);
+                            EXPECT_TRUE(scoped.weak_from_this().expired());
+                            EXPECT_EQ(scoped.readFile(relative / "leaf"), contents);
+                            EXPECT_EQ(scoped.getLastModified().has_value(), track);
+                            /* Both POSIX directory operations must also accept the borrowed
+                               stack receivers they themselves supply to callbacks. */
+                            scoped.readDirectory(relative, [&](SourceAccessor & inner, const CanonPath & root) {
+                                ++borrowedCalls;
+                                EXPECT_TRUE(inner.weak_from_this().expired());
+                                EXPECT_EQ(inner.readFile(root / "leaf"), contents);
+                            });
+                            scoped.readDirectoryWithEntries(
+                                relative,
+                                [&](SourceAccessor & inner,
+                                    const CanonPath & root,
+                                    const SourceAccessor::DirEntries & entries) {
+                                    ++borrowedCalls;
+                                    EXPECT_TRUE(inner.weak_from_this().expired());
+                                    EXPECT_EQ(entries.at("leaf"), SourceAccessor::tRegular);
+                                    EXPECT_EQ(inner.readFile(root / "leaf"), contents);
+                                });
+                            if (ending == Ending::Exception)
+                                throw CallbackException{};
+                            if (ending == Ending::Symlink)
+                                throw SymlinkNotAllowed(CanonPath("/link"), "callback-marker");
+                        };
+                        auto run = [&] {
+                            if (withEntries)
+                                accessor->readDirectoryWithEntries(
+                                    path,
+                                    [&](SourceAccessor & scoped,
+                                        const CanonPath & relative,
+                                        const SourceAccessor::DirEntries & entries) {
+                                        EXPECT_EQ(entries.at("leaf"), SourceAccessor::tRegular);
+                                        callback(scoped, relative);
+                                    });
+                            else
+                                accessor->readDirectory(path, callback);
+                        };
+                        if (ending == Ending::Exception)
+                            EXPECT_THROW(run(), CallbackException);
+                        else if (ending == Ending::Symlink) {
+                            try {
+                                run();
+                                ADD_FAILURE() << "expected callback symlink exception";
+                            } catch (SymlinkNotAllowed & error) {
+                                EXPECT_EQ(error.path, CanonPath("/link"));
+                                if (withEntries) {
+                                    EXPECT_THAT(error.what(), ::testing::HasSubstr("outer-display/link"));
+                                    EXPECT_THAT(error.what(), ::testing::Not(::testing::HasSubstr("callback-marker")));
+                                } else
+                                    EXPECT_THAT(error.what(), ::testing::HasSubstr("callback-marker"));
+                            } catch (...) {
+                                ADD_FAILURE() << "unexpected callback exception";
+                            }
+                        } else
+                            EXPECT_NO_THROW(run());
+                        EXPECT_EQ(calls, 1u);
+                        EXPECT_EQ(borrowedCalls, 2u);
+                        allBorrowedCalls += borrowedCalls;
+                        EXPECT_EQ(weakOwner.expired(), releaseOwner);
+                        owner.reset();
+                        EXPECT_TRUE(weakOwner.expired());
+                    }
+    EXPECT_EQ(cells, 48u);
+    EXPECT_EQ(allBorrowedCalls, 96u);
+    RecordProperty("directory_cells", cells);
+    RecordProperty("borrowed_scope_calls", allBorrowedCalls);
+#endif
+}
+
+TEST_F(FSSourceAccessorTest, fileCallbacksPreserveTheOpenedFileAfterOwnerRelease)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "POSIX file receiver lifetime";
+#else
+    struct ReceiverReleased
+    {};
+
+    struct CallbackException
+    {};
+    enum class Point { Size, Sink };
+    enum class Kind { Directory, File, Memory };
+    /* More than one generic copy buffer: closing the root-file descriptor at
+       the first sink callback must not be hidden by already-buffered bytes. */
+    const std::string contents(64 * 1024 + 7, 'x');
+    writeFile(tmpDir / "file", contents);
+    unsigned cells = 0;
+    for (auto kind : {Kind::Directory, Kind::File, Kind::Memory})
+        for (auto point : {Point::Size, Point::Sink})
+            for (bool throwing : {false, true})
+                for (bool releaseOwner : {false, true}) {
+                    ++cells;
+                    SCOPED_TRACE(
+                        ::testing::Message()
+                        << int(kind) << ' ' << int(point) << ' ' << throwing << ' ' << releaseOwner);
+                    std::shared_ptr<SourceAccessor> owner;
+                    if (kind == Kind::Memory) {
+                        auto memory = std::make_shared<MemorySourceAccessor>();
+                        memory->root = MemorySourceAccessor::File::Regular{.contents = contents};
+                        owner = std::move(memory);
+                    } else
+                        owner = makeFSSourceAccessor(kind == Kind::File ? tmpDir / "file" : tmpDir).get_ptr();
+                    std::weak_ptr<SourceAccessor> weakOwner = owner;
+                    auto * accessor = owner.get();
+                    unsigned callbackCalls = 0, writes = 0;
+                    bool announced = false;
+                    std::string output;
+                    auto release = [&] {
+                        ++callbackCalls;
+                        if (releaseOwner)
+                            owner.reset();
+                        /* Directory reads already own an independent local fd.
+                           File-root reads borrow a member fd; memory reads borrow contents. */
+                        if (kind != Kind::Directory) {
+                            bool alive = !weakOwner.expired();
+                            EXPECT_TRUE(alive);
+                            if (!alive)
+                                throw ReceiverReleased{};
+                        }
+                        if (throwing)
+                            throw CallbackException{};
+                    };
+                    LambdaSink sink([&](std::string_view bytes) {
+                        EXPECT_TRUE(announced);
+                        ++writes;
+                        if (point == Point::Sink && writes == 1)
+                            release();
+                        output += bytes;
+                    });
+                    auto run = [&] {
+                        accessor->readFile(
+                            CanonPath(kind == Kind::Directory ? "/file" : "/"), sink, [&](uint64_t size) {
+                                EXPECT_EQ(size, contents.size());
+                                EXPECT_FALSE(announced);
+                                announced = true;
+                                if (point == Point::Size)
+                                    release();
+                            });
+                    };
+                    if (throwing)
+                        EXPECT_THROW(run(), CallbackException);
+                    else {
+                        EXPECT_NO_THROW(run());
+                        EXPECT_EQ(output, contents);
+                    }
+                    EXPECT_TRUE(announced);
+                    EXPECT_EQ(callbackCalls, 1u);
+                    EXPECT_EQ(weakOwner.expired(), releaseOwner);
+                    owner.reset();
+                    EXPECT_TRUE(weakOwner.expired());
+                }
+    EXPECT_EQ(cells, 24u);
+    RecordProperty("file_cells", cells);
+#endif
+}
+
 /* Fourteen reads and twenty-seven exclusive creates. Reads cover seven
    terminal kinds through immediate/nested parents; creation also covers
    FIFO/socket entries and a root destination with a separately opened parent. */
