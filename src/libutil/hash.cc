@@ -39,7 +39,6 @@ Hash::Hash(HashAlgorithm algo, const ExperimentalFeatureSettings & xpSettings)
     }
     hashSize = regularHashSize(algo);
     assert(hashSize <= maxHashSize);
-    memset(hash, 0, maxHashSize);
 }
 
 bool Hash::operator==(const Hash & h2) const noexcept

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -443,50 +444,117 @@ TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
 TEST(CopyPool, predicateFailureJoinsTheLaunchedPrefixWithoutConsumingIt)
 {
     /* Predicate failure interrupts launch, before any ordered consumption.
-       Already launched visits must finish before their captures can expire. */
+       Already launched visits must finish before their captures can expire.
+       Their failures must not replace the launch failure. */
     size_t cases = 0;
     for (size_t workers = 1; workers <= 8; ++workers) {
         CopyPool pool(workers);
-        for (size_t count = 2; count <= 4; ++count)
-            for (size_t throwIndex = 0; throwIndex < count; ++throwIndex) {
-                SCOPED_TRACE(fmt("workers=%d count=%d throwIndex=%d", workers, count, throwIndex));
-                std::atomic<size_t> active{0}, started{0}, completed{0};
-                std::vector<size_t> predicates, consumed;
-                std::string failure;
-                try {
-                    pool.ordered(
-                        count,
-                        [&](size_t i) {
-                            predicates.push_back(i);
-                            if (i == throwIndex)
-                                throw std::runtime_error("predicate");
-                            return true;
-                        },
-                        [&](size_t, bool) {
-                            ++active;
-                            ++started;
-                            Finally done{[&] {
-                                --active;
-                                ++completed;
-                            }};
-                        },
-                        [&](size_t i) { consumed.push_back(i); });
-                } catch (const std::runtime_error & e) {
-                    failure = e.what();
+        for (bool failDetached : {false, true})
+            for (size_t count = 2; count <= 4; ++count)
+                for (size_t throwIndex = 0; throwIndex < count; ++throwIndex) {
+                    SCOPED_TRACE(fmt(
+                        "workers=%d count=%d throwIndex=%d failDetached=%d", workers, count, throwIndex, failDetached));
+                    std::atomic<size_t> active{0}, started{0}, completed{0}, detachedFailures{0};
+                    std::vector<size_t> predicates, consumed;
+                    std::string failure;
+                    try {
+                        pool.ordered(
+                            count,
+                            [&](size_t i) {
+                                predicates.push_back(i);
+                                if (i == throwIndex)
+                                    throw std::runtime_error("predicate");
+                                return true;
+                            },
+                            [&](size_t, bool detached) {
+                                ++active;
+                                ++started;
+                                Finally done{[&] {
+                                    --active;
+                                    ++completed;
+                                }};
+                                if (failDetached && detached) {
+                                    ++detachedFailures;
+                                    throw std::runtime_error("child");
+                                }
+                            },
+                            [&](size_t i) { consumed.push_back(i); });
+                    } catch (const std::runtime_error & e) {
+                        failure = e.what();
+                    }
+                    std::vector<size_t> expectedPredicates;
+                    for (size_t i = 0; i <= throwIndex; ++i)
+                        expectedPredicates.push_back(i);
+                    EXPECT_EQ(failure, "predicate");
+                    EXPECT_EQ(predicates, expectedPredicates);
+                    EXPECT_TRUE(consumed.empty());
+                    EXPECT_EQ(active.load(), 0u);
+                    EXPECT_EQ(started.load(), throwIndex);
+                    EXPECT_EQ(completed.load(), throwIndex);
+                    if (failDetached && workers > 1 && throwIndex)
+                        EXPECT_GT(detachedFailures.load(), 0u);
+                    else
+                        EXPECT_EQ(detachedFailures.load(), 0u);
+                    ++cases;
                 }
-                std::vector<size_t> expectedPredicates;
-                for (size_t i = 0; i <= throwIndex; ++i)
-                    expectedPredicates.push_back(i);
-                EXPECT_EQ(failure, "predicate");
-                EXPECT_EQ(predicates, expectedPredicates);
-                EXPECT_TRUE(consumed.empty());
-                EXPECT_EQ(active.load(), 0u);
-                EXPECT_EQ(started.load(), throwIndex);
-                EXPECT_EQ(completed.load(), throwIndex);
-                ++cases;
-            }
     }
-    EXPECT_EQ(cases, 72u);
+    EXPECT_EQ(cases, 144u);
+}
+
+TEST(CopyPool, failureObjectsMayReenterThePoolDuringCleanup)
+{
+    /* An exception can own cleanup which itself visits children. Discarding
+       a non-winning error must neither hold the pool lock nor outlive the
+       joined child scope. Sharing the cleanup tolerates exception copies. */
+    struct Cleanup
+    {
+        CopyPool & pool;
+        std::atomic<size_t> & released;
+        std::atomic<size_t> & visits;
+        std::atomic<size_t> & folds;
+
+        ~Cleanup()
+        {
+            pool.ordered(2, [](size_t) { return false; }, [&](size_t, bool) { ++visits; }, [&](size_t) { ++folds; });
+            ++released;
+        }
+    };
+
+    struct Failure
+    {
+        size_t index;
+        std::shared_ptr<Cleanup> cleanup;
+    };
+
+    size_t cases = 0;
+    for (size_t workers = 1; workers <= 8; ++workers) {
+        CopyPool pool(workers);
+        for (size_t count : {2u, 3u}) {
+            SCOPED_TRACE(fmt("workers=%d count=%d", workers, count));
+            std::atomic<size_t> started{0}, released{0}, visits{0}, folds{0};
+            size_t failureIndex = count, consumed = 0;
+            try {
+                pool.ordered(
+                    count,
+                    [](size_t) { return true; },
+                    [&](size_t i, bool) {
+                        ++started;
+                        throw Failure{i, std::make_shared<Cleanup>(pool, released, visits, folds)};
+                    },
+                    [&](size_t) { ++consumed; });
+            } catch (const Failure & failure) {
+                failureIndex = failure.index;
+            }
+            EXPECT_EQ(failureIndex, 0u);
+            EXPECT_EQ(consumed, 0u);
+            EXPECT_GE(started.load(), workers > 1 ? 2u : 1u);
+            EXPECT_EQ(released.load(), started.load());
+            EXPECT_EQ(visits.load(), 2 * started.load());
+            EXPECT_EQ(folds.load(), 2 * started.load());
+            ++cases;
+        }
+    }
+    EXPECT_EQ(cases, 16u);
 }
 
 TEST(CopyPool, nestedScopesJoinBeforeReturning)

@@ -735,12 +735,9 @@ void LocalStore::insertAuxiliaryRows(
 {
     for (auto & value : values) {
         auto & entry = value.entry;
-        if ((entry.mode != merkle::Mode::Directory && entry.mode != merkle::Mode::Symlink)
-            || entry.hash.algo != GitObjectStore::hashAlgo
-            || entry.hash.hashSize != regularHashSize(GitObjectStore::hashAlgo))
-            throw Error("invalid auxiliary object key");
-        /* Nonempty production projections belong to a fresh ingestion;
-           a retry rolled its previous inserts back. No value is overwritten. */
+        /* Hold::addAuxiliary validated these keys before staging. Nonempty
+           production projections belong to a fresh ingestion; a retry rolled
+           its previous inserts back. No value is overwritten. */
         size_t offset = 0;
         int64_t ordinal = 0;
         do {

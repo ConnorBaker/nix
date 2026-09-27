@@ -183,7 +183,7 @@ struct TarAdapterImpl : merkle::TarAdapter
                 auto * dir = std::get_if<Directory>(cur);
                 if (!dir)
                     throw Error("parent of '%s' is not a directory", path);
-                cur = &dir->children.emplace(std::string(name), Directory{}).first->second;
+                cur = &dir->children.try_emplace(std::string(name)).first->second;
             }
 
             auto * dir = std::get_if<Directory>(cur);

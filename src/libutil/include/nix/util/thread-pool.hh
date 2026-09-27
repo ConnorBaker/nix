@@ -98,7 +98,8 @@ class CopyPool
     struct Group
     {
         const fun<void(size_t, bool)> & run;
-        std::vector<std::exception_ptr> failures;
+        size_t failedIndex;
+        std::exception_ptr failure;
         size_t remaining = 0;
         std::condition_variable done;
     };

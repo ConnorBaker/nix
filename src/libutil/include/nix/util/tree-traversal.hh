@@ -126,7 +126,9 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                 /* The entries and, from the same listing, which of them the
                    accessor typed as directories -- advisory, and read by a
                    visitor that may walk siblings on a pool (`Children`). */
-                auto filterBase = path / to;
+                /* At the accessor root, the walk already owns this prefix. */
+                std::optional<CanonPath> joinedFilterBase;
+                const auto & filterBase = path == CanonPath::root ? to : joinedFilterBase.emplace(path / to);
                 /* The accessor is scoped around the *whole* of `v.directory`,
                    not around the loop alone: an accessor's scoped form may be
                    a stack object of its own (`PosixDirectorySourceAccessor`

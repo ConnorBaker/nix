@@ -67,8 +67,18 @@ void CopyPool::execute(const Job & job)
     } catch (...) {
         failure = std::current_exception();
     }
-    std::lock_guard lock(mutex);
-    job.group->failures[job.index] = std::move(failure);
+    std::unique_lock lock(mutex);
+    if (failure && job.index < job.group->failedIndex) {
+        job.group->failedIndex = job.index;
+        job.group->failure.swap(failure);
+    }
+    if (failure) {
+        /* A discarded exception's destructor may reenter the pool. Release
+           it outside the mutex, but before this job is observed as joined. */
+        lock.unlock();
+        failure = nullptr;
+        lock.lock();
+    }
     /* Notify before unlocking: the waiter may destroy this group as soon
        as it observes completion under the same mutex. */
     if (!--job.group->remaining)
@@ -126,7 +136,7 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
         return;
     }
 
-    Group group{run, std::vector<std::exception_ptr>(count), 0, {}};
+    Group group{run, count, {}, 0, {}};
     std::exception_ptr failure;
     try {
         for (size_t i = 0; i < count; ++i) {
@@ -135,10 +145,16 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
             try {
                 run(i, false);
             } catch (...) {
-                group.failures[i] = std::current_exception();
+                auto childFailure = std::current_exception();
+                {
+                    std::lock_guard lock(mutex);
+                    if (i < group.failedIndex) {
+                        group.failedIndex = i;
+                        group.failure.swap(childFailure);
+                    }
+                }
                 /* Stop launching, but let the ordered fold choose between
                    this visit's failure and the preceding prefix. */
-                count = i + 1;
                 break;
             }
         }
@@ -150,11 +166,10 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
     wait(group);
     if (failure)
         std::rethrow_exception(failure);
-    for (size_t i = 0; i < count; ++i) {
-        if (auto & childFailure = group.failures[i])
-            std::rethrow_exception(childFailure);
+    for (size_t i = 0; i < group.failedIndex; ++i)
         consume(i);
-    }
+    if (group.failure)
+        std::rethrow_exception(group.failure);
 }
 
 void ThreadPoolShutDown::anchor() {}
