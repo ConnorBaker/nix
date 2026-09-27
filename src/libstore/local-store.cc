@@ -826,8 +826,6 @@ void LocalStore::coalesceBlobRows(
     /* The caller has already written and keeps this ingestion unnamed.
        Therefore every donor is published, and GC cannot invalidate one
        between this query and pinning its file. No collision means no walk. */
-    if (!state.stmts->QueryValidPaths.use().next())
-        return;
     std::vector<BlobCoalescing> collisions;
     {
         auto use(state.stmts->QueryBlobCollisions.use());
@@ -2061,7 +2059,8 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                are reconciled. Later outputs may share this finished one. */
             for (size_t n = 0; n < publications.size(); ++n)
                 if (publications[n].path == path) {
-                    coalesceBlobRows(*state, path, *hold, ingestionIds[n], publications[n].projection.regular);
+                    if (state->stmts->QueryValidPaths.use().next())
+                        coalesceBlobRows(*state, path, *hold, ingestionIds[n], publications[n].projection.regular);
                     auto logical = printStorePath(path);
                     state->stmts->DeletePathBlobs.use().apply(logical).exec();
                     state->stmts->DeletePathIngestions.use().apply(logical).exec();

@@ -533,12 +533,16 @@ struct LinkingVisitor : ObjectStoreVisitor
     }
 
     /* Where the node at `path` goes: the innermost open sink, under `/name`
-       (the root node under `/`), and the path on disk. */
+       (the root node under `/`). */
     struct Target
     {
         RestoreSink & sink;
-        std::filesystem::path where;
         CanonPath name;
+
+        std::filesystem::path path() const
+        {
+            return name.isRoot() ? sink.dstPath : sink.dstPath / name.rel();
+        }
     };
 
     Target at(const CanonPath & path)
@@ -550,7 +554,7 @@ struct LinkingVisitor : ObjectStoreVisitor
         auto name = path.isRoot()
                         ? path
                         : CanonPath::root / (frame.diskName ? std::string_view(*frame.diskName) : *path.baseName());
-        return {sink, name.isRoot() ? sink.dstPath : sink.dstPath / name.rel(), std::move(name)};
+        return {sink, std::move(name)};
     }
 
     HashedNode directory(const CanonPath & path, Children children) override
@@ -575,8 +579,10 @@ struct LinkingVisitor : ObjectStoreVisitor
     HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
     {
         auto target = at(path);
+        auto where = target.path();
         return placeRegular(
             target,
+            where,
             readBufferedRegular(
                 path,
                 std::move(read),
@@ -584,7 +590,7 @@ struct LinkingVisitor : ObjectStoreVisitor
                 path.isRoot() ? rootContents : nullptr));
     }
 
-    HashedNode placeRegular(const Target & target, BufferedRegularFile file)
+    HashedNode placeRegular(const Target & target, const std::filesystem::path & where, BufferedRegularFile file)
     {
         auto & node = file.node;
         auto & buffer = file.buffer;
@@ -592,15 +598,15 @@ struct LinkingVisitor : ObjectStoreVisitor
         bool executable = node.entry.mode == merkle::Mode::Executable;
         auto & entry = node.entry;
 
-        bool linkable = linkableOnThisSystem(target.where);
+        bool linkable = linkableOnThisSystem(where);
         if (!linkable)
-            debug("%s is not allowed to be linked in macOS", PathFmt(target.where));
+            debug("%s is not allowed to be linked in macOS", PathFmt(where));
 
 #ifdef _WIN32
         /* Nothing is linked or placed there (git-object-store.hh). */
         AutoCloseFD owned;
         Descriptor dirFd = INVALID_DESCRIPTOR;
-        CanonPath name = CanonPath::fromFilename(target.where.filename().string());
+        CanonPath name = CanonPath::fromFilename(where.filename().string());
 #else
         auto [owned, dirFd, name] = target.sink.parentOf(target.name);
 #endif
@@ -611,13 +617,13 @@ struct LinkingVisitor : ObjectStoreVisitor
             writer->finish();
             writer.reset();
             if (linkable)
-                objects.enterWritten(entry.hash, executable, dirFd, name, target.where, repair, hold, /*looked=*/false);
+                objects.enterWritten(entry.hash, executable, dirFd, name, where, repair, hold, /*looked=*/false);
             return std::move(file.node);
         }
 
         /* The whole file is in memory and its blob known.  A hit: the
            store's valid file linked under the name, nothing written. */
-        if (linkable && objects.link(entry.hash, executable, dirFd, name, target.where, buffer.size(), repair, hold))
+        if (linkable && objects.link(entry.hash, executable, dirFd, name, where, buffer.size(), repair, hold))
             return std::move(file.node);
 
         /* A miss: written from memory, canonicalised by the restore sink's
@@ -639,7 +645,7 @@ struct LinkingVisitor : ObjectStoreVisitor
             written->finish();
         }
         if (linkable)
-            objects.enterWritten(entry.hash, executable, dirFd, name, target.where, repair, hold);
+            objects.enterWritten(entry.hash, executable, dirFd, name, where, repair, hold);
         return std::move(file.node);
     }
 };
@@ -783,12 +789,13 @@ struct MaterialisingVisitor : LinkingVisitor
                 entry && entry->hash.algo == merkle::hashAlgo
                 && entry->mode == (st.isExecutable ? merkle::Mode::Executable : merkle::Mode::Regular)) {
                 auto target = at(path);
+                auto where = target.path();
                 auto [owned, dirFd, name] = target.sink.parentOf(target.name);
-                bool linkable = linkableOnThisSystem(target.where);
+                bool linkable = linkableOnThisSystem(where);
                 PosixStat linked;
                 if (linkable
                     && objects.link(
-                        entry->hash, st.isExecutable, dirFd, name, target.where, st.fileSize, repair, hold, &linked))
+                        entry->hash, st.isExecutable, dirFd, name, where, st.fileSize, repair, hold, &linked))
                     return HashedNode{
                         .entry = *entry,
                         .narSize = merkle::nar::regular(static_cast<uint64_t>(linked.st_size), st.isExecutable)};
@@ -813,7 +820,7 @@ struct MaterialisingVisitor : LinkingVisitor
                     throw Error("immutable file '%s' delivered the wrong number of bytes", source.path / path);
                 writer.reset();
                 if (linkable)
-                    objects.enterWritten(entry->hash, st.isExecutable, dirFd, name, target.where, repair, hold);
+                    objects.enterWritten(entry->hash, st.isExecutable, dirFd, name, where, repair, hold);
                 return HashedNode{.entry = *entry, .narSize = merkle::nar::regular(*size, st.isExecutable)};
             }
         if (!path.isRoot() && st.type != SourceAccessor::tDirectory)
@@ -825,6 +832,7 @@ struct MaterialisingVisitor : LinkingVisitor
         if (!entry)
             return std::nullopt;
         auto target = at(path);
+        auto where = target.path();
         auto [owned, dirFd, name] = target.sink.parentOf(target.name);
         /* A directory may fail after creating some files. Its names must
            remain private until the whole attempt succeeds: a sibling cannot
@@ -836,24 +844,24 @@ struct MaterialisingVisitor : LinkingVisitor
         }
         std::optional<uint64_t> narSize;
         try {
-            narSize = materialise(*entry, dirFd, name, target.where, path.isRoot() ? 0 : 1, attempt ? *attempt : hold);
+            narSize = materialise(*entry, dirFd, name, where, path.isRoot() ? 0 : 1, attempt ? *attempt : hold);
         } catch (Error & e) {
             warn(
                 "could not materialise %s from the object store: %s; copying it from the source instead",
-                PathFmt(target.where),
+                PathFmt(where),
                 e.msg());
         }
         if (!narSize) {
             /* Whatever was made goes, and the driver reads the subtree. */
-            if (maybeLstat(target.where))
-                deletePath(target.where);
-            debug("%s is not held by the object store; copying it from the source", PathFmt(target.where));
+            if (maybeLstat(where))
+                deletePath(where);
+            debug("%s is not held by the object store; copying it from the source", PathFmt(where));
             return std::nullopt;
         }
         /* Publishing a completed name ends rollback's authority over it.
            A merge error aborts the ingestion; it never resumes fallback. */
         if (attempt)
-            commitAttempt(target.where, *attempt);
+            commitAttempt(where, *attempt);
         return HashedNode{.entry = *entry, .narSize = narSize};
     }
 
@@ -1196,7 +1204,8 @@ StorePath LocalStore::materialise(
                 if (!buffered->writer)
                     beginIngestion(*hold, tempPath);
                 LinkingVisitor linking{objects, *hold, restore, repair};
-                linking.placeRegular(linking.at(CanonPath::root), std::move(*buffered));
+                auto target = linking.at(CanonPath::root);
+                linking.placeRegular(target, target.path(), std::move(*buffered));
                 buffered.reset();
                 objects.putRootTree(result.root, *hold);
             }
