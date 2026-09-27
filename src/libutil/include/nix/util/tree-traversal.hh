@@ -178,7 +178,7 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                     return std::move(*result);
                 };
                 /* At the accessor root, the walk already owns this prefix. */
-                return path.abs() == std::string_view{"/"} ? visitDirectory(to) : visitDirectory(path / to);
+                return path.abs().size() == 1 && path.abs()[0] == '/' ? visitDirectory(to) : visitDirectory(path / to);
             }
 
             case SourceAccessor::tChar:

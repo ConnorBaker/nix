@@ -45,29 +45,27 @@ void CopyPool::work(std::promise<void> ready)
         return;
     }
     ready.set_value();
+    std::unique_lock lock(mutex);
     while (true) {
-        Job job;
-        {
-            std::unique_lock lock(mutex);
-            wake.wait(lock, [&] { return stopping || !pending.empty(); });
-            if (pending.empty())
-                return;
-            job = pending.back();
-            pending.pop_back();
-        }
-        execute(job);
+        wake.wait(lock, [&] { return stopping || !pending.empty(); });
+        if (pending.empty())
+            return;
+        auto job = pending.back();
+        pending.pop_back();
+        execute(job, lock);
     }
 }
 
-void CopyPool::execute(const Job & job)
+void CopyPool::execute(const Job & job, std::unique_lock<std::mutex> & lock)
 {
+    lock.unlock();
     std::exception_ptr failure;
     try {
         job.group->run(job.index, true);
     } catch (...) {
         failure = std::current_exception();
     }
-    std::unique_lock lock(mutex);
+    lock.lock();
     if (failure && job.index < job.group->failedIndex) {
         job.group->failedIndex = job.index;
         job.group->failure.swap(failure);
@@ -119,9 +117,7 @@ void CopyPool::wait(Group & group)
         } else {
             auto job = std::exchange(*i, pending.back());
             pending.pop_back();
-            lock.unlock();
-            execute(job);
-            lock.lock();
+            execute(job, lock);
         }
     }
 }

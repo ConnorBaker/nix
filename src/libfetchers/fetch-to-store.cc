@@ -270,7 +270,7 @@ struct MemoVisitor : HashingVisitor
     {
         if (!consulted(st))
             return std::nullopt;
-        auto lookupAt = [&](const CanonPath & sourcePath) -> std::optional<merkle::TreeEntry> {
+        auto lookupAt = [this, &to, key](const CanonPath & sourcePath) -> std::optional<merkle::TreeEntry> {
             if (auto entry = root.accessor->getKnownEntry(sourcePath))
                 return entry;
             auto k = keyOf(to, sourcePath);
