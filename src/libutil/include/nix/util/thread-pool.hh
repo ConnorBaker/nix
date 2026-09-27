@@ -117,7 +117,7 @@ class CopyPool
 
     void work(std::promise<void> ready);
     /** Runs a removed job with the lock released, returning with it held. */
-    void execute(const Job & job, std::unique_lock<std::mutex> & lock);
+    static void execute(const Job & job, std::unique_lock<std::mutex> & lock);
     bool tryAsync(Group & group, size_t i);
     void wait(Group & group);
 
