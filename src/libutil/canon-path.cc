@@ -116,7 +116,9 @@ void CanonPath::push(std::string_view c)
 
 CanonPath CanonPath::operator/(std::string_view c) const
 {
-    auto res = *this;
+    CanonPath res(unchecked_t(), std::string{});
+    res.path.reserve(path.size() + !isRoot() + c.size());
+    res.path = path;
     res.push(c);
     return res;
 }

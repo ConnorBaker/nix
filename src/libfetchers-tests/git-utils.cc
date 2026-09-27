@@ -32,6 +32,7 @@
 #include <git2/status.h>
 #include <git2/types.h>
 #include <git2/object.h>
+#include <git2/odb.h>
 #include <git2/tag.h>
 #include <gtest/gtest.h>
 #include "nix/util/serialise.hh"
@@ -1195,6 +1196,106 @@ TEST_F(GitUtilsTest, readDirectoryReturnsTypedEntries)
         EXPECT_EQ(acc->readLink(CanonPath("link")), "x");
         EXPECT_EQ(acc->readDirectory(CanonPath::root), entries);
     }
+}
+
+/* The entry mode selects an operation; the ODB object must also have the
+   required type. Raw tree bodies deliberately bypass treebuilder's checks. */
+TEST_F(GitUtilsTest, entryReadsRequireMatchingObjectTypes)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo{[&] { git_repository_free(rawRepo); }};
+    git_odb * odb = nullptr;
+    ASSERT_EQ(git_repository_odb(&odb, rawRepo), 0);
+    Finally closeOdb{[&] { git_odb_free(odb); }};
+
+    auto treeBody = [](std::string_view mode, const git_oid & oid) {
+        auto body = std::string(mode) + " node";
+        body += '\0';
+        body.append(reinterpret_cast<const char *>(oid.id), GIT_OID_SHA1_SIZE);
+        return body;
+    };
+
+    std::array<git_oid, 5> objects{};
+    ASSERT_EQ(git_odb_write(&objects[0], odb, "x", 1, GIT_OBJECT_BLOB), 0);
+    auto body = treeBody("100644", objects[0]);
+    ASSERT_EQ(git_odb_write(&objects[1], odb, body.data(), body.size(), GIT_OBJECT_TREE), 0);
+    body = std::string("tree ") + git_oid_tostr_s(&objects[1])
+           + "\nauthor Nix <nix@example.com> 0 +0000\ncommitter Nix <nix@example.com> 0 +0000\n\ncommit\n";
+    ASSERT_EQ(git_odb_write(&objects[2], odb, body.data(), body.size(), GIT_OBJECT_COMMIT), 0);
+    body = std::string("object ") + git_oid_tostr_s(&objects[2])
+           + "\ntype commit\ntag test\ntagger Nix <nix@example.com> 0 +0000\n\ntag\n";
+    ASSERT_EQ(git_odb_write(&objects[3], odb, body.data(), body.size(), GIT_OBJECT_TAG), 0);
+    ASSERT_EQ(git_oid_fromstr(&objects[4], "ffffffffffffffffffffffffffffffffffffffff"), 0);
+    ASSERT_EQ(git_odb_exists(odb, &objects[4]), 0);
+
+    const std::array types{GIT_OBJECT_BLOB, GIT_OBJECT_TREE, GIT_OBJECT_COMMIT, GIT_OBJECT_TAG};
+    for (size_t i = 0; i < types.size(); ++i) {
+        git_object * object = nullptr;
+        ASSERT_EQ(git_object_lookup(&object, rawRepo, &objects[i], GIT_OBJECT_ANY), 0);
+        Finally closeObject{[&] { git_object_free(object); }};
+        ASSERT_EQ(git_object_type(object), types[i]);
+    }
+
+    const std::array modes{
+        std::pair{"100644", GIT_FILEMODE_BLOB},
+        std::pair{"100755", GIT_FILEMODE_BLOB_EXECUTABLE},
+        std::pair{"120000", GIT_FILEMODE_LINK},
+        std::pair{"40000", GIT_FILEMODE_TREE},
+        std::pair{"160000", GIT_FILEMODE_COMMIT},
+        /* Raw type precedes normalized mode: 0160100 is a gitlink even
+           though git_tree_entry_filemode reports executable. */
+        std::pair{"160100", GIT_FILEMODE_COMMIT},
+    };
+    const std::array names{"blob", "tree", "commit", "tag", "missing"};
+    const CanonPath node("node");
+    for (auto [modeString, readerKind] : modes)
+        for (size_t actual = 0; actual < objects.size(); ++actual) {
+            auto body = treeBody(modeString, objects[actual]);
+            git_oid root;
+            ASSERT_EQ(git_odb_write(&root, odb, body.data(), body.size(), GIT_OBJECT_TREE), 0);
+            for (bool primeObject : {false, true}) {
+                /* Priming parses existing objects; whether they stay in
+                   libgit2's cache depends on its object-cache policy. */
+                if (primeObject && actual == 4)
+                    continue;
+                for (bool entryCached : {false, true}) {
+                    SCOPED_TRACE(
+                        ::testing::Message()
+                        << modeString << "/" << names[actual] << "/" << primeObject << "/" << entryCached);
+                    auto repo = openRepo();
+                    if (primeObject)
+                        (void) repo->getAccessor(
+                            Hash::parseAny(git_oid_tostr_s(&objects[actual]), HashAlgorithm::SHA1), {}, "prime");
+                    auto acc =
+                        repo->getAccessor(Hash::parseAny(git_oid_tostr_s(&root), HashAlgorithm::SHA1), {}, "types");
+                    if (entryCached)
+                        ASSERT_TRUE(acc->maybeLstat(node));
+                    for (unsigned pass = 0; pass < 2; ++pass) {
+                        SCOPED_TRACE(pass);
+                        if (readerKind == GIT_FILEMODE_TREE && actual == 1) {
+                            auto entries = acc->readDirectory(node);
+                            ASSERT_EQ(entries.size(), 1u);
+                            EXPECT_EQ(entries.at("node"), std::optional(SourceAccessor::tRegular));
+                        } else if (readerKind == GIT_FILEMODE_COMMIT)
+                            EXPECT_TRUE(acc->readDirectory(node).empty());
+                        else
+                            EXPECT_THROW(acc->readDirectory(node), Error);
+
+                        if ((readerKind == GIT_FILEMODE_BLOB || readerKind == GIT_FILEMODE_BLOB_EXECUTABLE)
+                            && actual == 0)
+                            EXPECT_EQ(acc->readFile(node), "x");
+                        else
+                            EXPECT_THROW(acc->readFile(node), Error);
+
+                        if (readerKind == GIT_FILEMODE_LINK && actual == 0)
+                            EXPECT_EQ(acc->readLink(node), "x");
+                        else
+                            EXPECT_THROW(acc->readLink(node), Error);
+                    }
+                }
+            }
+        }
 }
 
 TEST_F(GitUtilsTest, peel_reference)

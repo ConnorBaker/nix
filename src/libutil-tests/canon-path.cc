@@ -1,6 +1,7 @@
 #include "nix/util/canon-path.hh"
 
 #include <algorithm>
+#include <array>
 #include <gtest/gtest.h>
 
 namespace nix {
@@ -244,6 +245,54 @@ TEST(CanonPath, concat)
             EXPECT_EQ(left.abs(), CanonPath(leftComponents).abs());
             EXPECT_EQ(right.abs(), CanonPath(rightComponents).abs());
         }
+}
+
+TEST(CanonPath, componentConcatPreservesBytesAndAliases)
+{
+    const std::array parents{CanonPath{"/"}, CanonPath{"/" + std::string(40, 'p')}};
+    const std::array prefixes{std::string{"/"}, parents[1].abs() + "/"};
+    size_t cases = 0, nulls = 0;
+    auto check = [&](std::string_view component) {
+        // Slash and exact dot/dotdot are unchanged assertion preconditions.
+        if (component.find('/') != component.npos || component == "." || component == "..")
+            return;
+        ++cases;
+        bool hasNull = component.find('\0') != component.npos;
+        nulls += hasNull;
+        for (size_t i = 0; i < parents.size(); ++i) {
+            const auto before = parents[i].abs();
+            if (hasNull)
+                EXPECT_THROW((void) (parents[i] / component), BadCanonPath);
+            else
+                EXPECT_EQ((parents[i] / component).abs(), prefixes[i] + std::string(component));
+            EXPECT_EQ(parents[i].abs(), before);
+        }
+    };
+    check("");
+    for (unsigned first = 0; first < 256; ++first) {
+        std::string word(1, static_cast<char>(first));
+        check(word);
+        for (unsigned second = 0; second < 256; ++second)
+            check(word + static_cast<char>(second));
+    }
+    EXPECT_EQ(cases, 65279u);
+    EXPECT_EQ(nulls, 510u);
+    for (size_t length = 1; length <= 64; ++length) {
+        const std::string name(length, 'q');
+        check(name);
+        const CanonPath parent{"/" + name};
+        EXPECT_EQ((parent / "").abs(), "/" + name + "/");
+        EXPECT_EQ((parent / "x").abs(), "/" + name + "/x");
+    }
+    for (const auto & parent : parents) {
+        auto name = std::string_view(parent.abs()).substr(1);
+        check(name);
+        if (!name.empty())
+            check(name.substr(1));
+    }
+    EXPECT_EQ((CanonPath(CanonPath::unchecked_t{}, "") / "x").abs(), "x");
+    EXPECT_EQ((CanonPath(CanonPath::unchecked_t{}, "q") / "x").abs(), "qx");
+    EXPECT_EQ((CanonPath(CanonPath::unchecked_t{}, std::string("a\0b", 3)) / "x").abs(), std::string("a\0b/x", 5));
 }
 
 TEST(CanonPath, within)

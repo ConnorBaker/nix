@@ -1225,7 +1225,7 @@ public:
             return nullptr;
 
         Tree tree;
-        if (git_tree_entry_to_object((git_object **) (git_tree **) Setter(tree), *state.repo, entry))
+        if (git_tree_lookup(Setter(tree), *state.repo, git_tree_entry_id(entry)))
             throw GitError("looking up directory '%s'", showPath(path));
 
         return treeCache.emplace(path, std::move(tree)).first->second.get();
@@ -1251,15 +1251,14 @@ public:
                 throw Error("Git root object '%s' is not a directory", *git_object_id(state.root.get()));
         }
 
-        auto entry = need(state, path);
+        if (auto tree = lookupTree(state, path))
+            return tree;
 
+        auto entry = need(state, path);
         if (git_tree_entry_type(entry) == GIT_OBJECT_COMMIT)
             return Submodule();
 
-        if (git_tree_entry_type(entry) != GIT_OBJECT_TREE)
-            throw Error("'%s' is not a directory", showPath(path));
-
-        return lookupTree(state, path);
+        throw Error("'%s' is not a directory", showPath(path));
     }
 
     Blob getBlob(State & state, const CanonPath & path, bool expectSymlink)
@@ -1289,7 +1288,7 @@ public:
         }
 
         Blob blob;
-        if (git_tree_entry_to_object((git_object **) (git_blob **) Setter(blob), *state.repo, entry))
+        if (git_blob_lookup(Setter(blob), *state.repo, git_tree_entry_id(entry)))
             throw GitError("looking up file '%s'", showPath(path));
 
         return blob;
