@@ -10,7 +10,7 @@
 #include "nix/util/strings.hh"
 #include "nix/util/util.hh"
 
-#include <unordered_set>
+#include <boost/unordered/unordered_flat_set.hpp>
 #include <mutex>
 #include <array>
 #include <variant>
@@ -157,7 +157,7 @@ struct GitObjectStore::Hold::Pending
     {
         std::mutex mutex;
         /** (mode, id) -> one regular witness or owned auxiliary body. */
-        std::unordered_set<Value, KeyHash, KeyEqual> byKey;
+        boost::unordered_flat_set<Value, KeyHash, KeyEqual> byKey;
     };
 
     /* A one-file ingestion occupies one shard. Allocate the others only
