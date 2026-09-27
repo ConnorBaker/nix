@@ -182,7 +182,7 @@ static void placeRegularFile(
 namespace {
 
 /* The object store's side of the hasher for what is not a regular file:
-   each directory's tree and each symlink's target written as hashed.
+   each directory's tree and each symlink's target staged as hashed.
    Regular files are the drivers' business (below): placed after they are
    on disk, or linked instead of written. */
 struct ObjectStoreVisitor : HashingVisitor
@@ -201,14 +201,14 @@ struct ObjectStoreVisitor : HashingVisitor
     HashedNode symlink(const CanonPath & path, const std::string & target) override
     {
         auto node = HashingVisitor::symlink(path, target);
-        objects.putObject(node.entry, target, hold);
+        hold.addAuxiliary({node.entry, target});
         return node;
     }
 
     HashedNode directory(const CanonPath & path, Children children) override
     {
         auto [node, body] = hashDirectory(path, std::move(children));
-        objects.putObject(node.entry, body, hold);
+        hold.addAuxiliary({node.entry, std::move(body)});
         return node;
     }
 };
@@ -337,10 +337,14 @@ struct VerifyVisitor : HashingVisitor
     {
     }
 
-    void expect(const std::filesystem::path & object)
+    void expect(const merkle::TreeEntry & entry, const std::filesystem::path & path)
     {
-        if (!pathExists(object))
-            missing.push_back(object);
+        /* The provider returns owned bytes checked against this typed hash.
+           Older read-only stores may have no auxiliary reader. The physical
+           path is still hashed; only auxiliary availability is then skipped.
+           Report the store node whose metadata is missing, not a cache file. */
+        if (objects.index && objects.index->readAuxiliary && !objects.readAuxiliary(entry))
+            missing.push_back(path);
     }
 
     HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
@@ -362,14 +366,14 @@ struct VerifyVisitor : HashingVisitor
     HashedNode symlink(const CanonPath & path, const std::string & target) override
     {
         auto node = HashingVisitor::symlink(path, target);
-        expect(objects.blobFile(node.entry.hash, false));
+        expect(node.entry, onDisk(root, path));
         return node;
     }
 
     HashedNode directory(const CanonPath & path, Children children) override
     {
         auto node = HashingVisitor::directory(path, std::move(children));
-        expect(objects.treeFile(node.entry.hash));
+        expect(node.entry, onDisk(root, path));
         return node;
     }
 };
@@ -855,14 +859,13 @@ struct MaterialisingVisitor : LinkingVisitor
        from the store's objects alone, and its NAR size; nullopt when an
        object it needs is missing or corrupt, or a file cannot be linked --
        what was made so far is the caller's to remove.  A tree body is
-       verified against its identifier as it is read
-       (`readVerifiedTree`); a blob's file is trusted as the on-disk walk
+       verified against its identifier as it is read and parsed in its
+       canonical form; a blob's file is trusted as the on-disk walk
        trusts an inode that is a blob's (`08` K8), its bytes re-hashed
-       under repair alone (K2); a symlink's target blob, a few bytes, is
-       checked always.  A tree body and a symlink's blob the copy is made
-       from are held first (`Hold`; `08` K16): the store's object is
-       reachable from the path that entered it, which a collection running
-       beside this copy may delete, and the path made here names it. */
+       under repair alone (K2). Auxiliary reads return owned, hash-checked
+       bytes before any destination callback. Each consumed body is staged
+       in this attempt's projection so its completed path is independent of
+       the donating ingestion. An unacquired child may still miss. */
     std::optional<uint64_t> materialise(
         const merkle::TreeEntry & entry,
         Descriptor dirFd,
@@ -907,31 +910,32 @@ struct MaterialisingVisitor : LinkingVisitor
         }
 
         case merkle::Mode::Symlink: {
-            auto file = objects.blobFile(entry.hash, false);
-            if (!objects.holdObject(entry, materialisationHold))
-                return std::nullopt;
-            auto target = objects.readBlob(entry.hash, false);
+            auto target = objects.readAuxiliary(entry);
             if (!target)
                 return std::nullopt;
-            if (merkle::blobId(*target) != entry.hash) {
-                warn("blob object %s does not hash to its name; not used", PathFmt(file));
-                return std::nullopt;
-            }
+            auto size = merkle::nar::symlink(target->size());
             if (::symlinkat(requireCString(*target), dirFd, name.rel_c_str()) == -1)
                 throw SysError("creating symlink from %1% -> '%2%'", PathFmt(where), *target);
+            materialisationHold.addAuxiliary({entry, std::move(*target)});
             if (hooks)
                 hooks->symlinkCreated(dirFd, name);
-            return merkle::nar::symlink(target->size());
+            return size;
         }
 
         case merkle::Mode::Directory: {
             if (depth >= narMaxDepth)
                 throw Error("path %s exceeds maximum NAR directory depth of %d", PathFmt(where), narMaxDepth);
-            if (!objects.holdObject(entry, materialisationHold))
+            auto body = objects.readAuxiliary(entry);
+            if (!body)
                 return std::nullopt;
-            auto tree = objects.readVerifiedTree(entry.hash);
-            if (!tree)
+            merkle::Tree tree;
+            try {
+                tree = GitObjectStore::parseTreeBody(entry.hash, *body);
+            } catch (Error & e) {
+                warn("%s; not used\nYou should run `nix-store --verify --check-contents --repair` to fix it", e.msg());
                 return std::nullopt;
+            }
+            materialisationHold.addAuxiliary({entry, std::move(*body)});
             if (::mkdirat(dirFd, name.rel_c_str(), 0777) == -1)
                 throw SysError("creating directory %s", PathFmt(where));
             auto fd = openFileEnsureBeneathNoSymlinks(dirFd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
@@ -941,7 +945,7 @@ struct MaterialisingVisitor : LinkingVisitor
                carries a trailing slash), so that the case hack numbers a
                colliding name as the NAR restorer numbers it. */
             std::vector<std::pair<std::string_view, const merkle::TreeEntry *>> entries;
-            for (auto & [key, child] : *tree) {
+            for (auto & [key, child] : tree) {
                 std::string_view childName{key};
                 if (child.mode == merkle::Mode::Directory)
                     childName.remove_suffix(1);
@@ -949,7 +953,7 @@ struct MaterialisingVisitor : LinkingVisitor
                     || childName.find_first_of(std::string_view("/\0", 2)) != std::string_view::npos) {
                     warn(
                         "tree object %s names an entry '%s'; not used",
-                        PathFmt(objects.treeFile(entry.hash)),
+                        GitObjectStore::idString(entry.hash),
                         childName);
                     return std::nullopt;
                 }
@@ -1045,8 +1049,9 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
         || !path.accessor->allowsConcurrentTraversal())
         workers = 1;
     auto commitAttempt = [&](const std::filesystem::path & subtree, const GitObjectStore::Hold & attempt) {
+        auto projection = attempt.takeProjection();
         std::vector<BlobCoalescing> collisions;
-        for (auto & row : attempt.takeRows()) {
+        for (auto & row : projection.regular) {
             auto other = hold.addRow(row);
             if (!other)
                 continue;
@@ -1068,6 +1073,8 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
             if (!result.rejected.empty())
                 throw Error("a completed ingestion holder changed while materialising %s", PathFmt(subtree));
         }
+        for (auto & auxiliary : projection.auxiliary)
+            hold.addAuxiliary(std::move(auxiliary));
     };
     MaterialisingVisitor visitor{
         objects, hold, restore, repair, std::move(namer), hooks, workers, path, std::move(commitAttempt)};
@@ -1236,7 +1243,7 @@ LocalStore::verifyObjects(const std::filesystem::path & realPath)
     /* The synthetic root tree of a bare executable or symlink, through
        which its blob is reachable (`putRootTree`). */
     if (auto body = merkle::syntheticRootTree(result.root))
-        verify.expect(objects.treeFile(merkle::treeId(*body)));
+        verify.expect({merkle::Mode::Directory, merkle::treeId(*body)}, realPath);
     return {result, std::move(verify.missing)};
 }
 
@@ -1533,9 +1540,8 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         }
         /* Every path is walked; an inode hint that still has a matching
            canonical holder avoids reading that regular file's contents.
-           The path is valid, so its root is live already; the trees written beneath it
-           are held until the root is (`Hold`; `08` K16), since no GC lock
-           is taken here and a collection may sweep meanwhile. */
+           Its auxiliary values stay owned by the hold until the complete
+           ingestion projection is published below. */
         auto hold = objects.hold();
         enterIntoObjects(pathRoot, NoRepair, hold, &act, &stats, &blobInodes);
         /* `nix-store --optimise` is what re-establishes an index a

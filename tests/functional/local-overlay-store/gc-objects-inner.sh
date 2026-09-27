@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 
-# The collector's sweep of the object store on the overlay store
-# (doc/lazy-store/01-specification.md, section 9.10, "Collection"; section
-# 10, *the local overlay store's object store is not its own*): the store
-# owns the upper layer's objects and sweeps those alone.  A path added
-# through the overlay writes its objects into the upper layer; when it dies
-# they go, while the lower store's objects are neither enumerated nor
-# touched, no whiteout is made under `.objects`, the legacy `.links`
-# directory is left to the lower store, and a live path's objects stay.
+# The overlay owns its database's auxiliary values and only the upper
+# layer's legacy cache files. Collection drops dead projections without
+# touching lower files, hiding them with whiteouts, or changing live bytes.
 
 set -eu -o pipefail
 
@@ -23,21 +18,26 @@ setupStoreDirs
 
 initLowerStore
 
-mountOverlayfs
-
 lowerObjects="$storeA/nix/store/.objects"
 upperObjects="$storeBTop/.objects"
 mergedObjects="$storeBRoot/nix/store/.objects"
+
+# New ingestions no longer create loose auxiliary files. Plant a malformed
+# legacy lower tree explicitly: upper cleanup must neither parse nor remove
+# it, and removing a duplicate upper file must reveal this lower file.
+legacyId=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+upperOnlyId=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+duplicateRelative="trees/aa/$legacyId"
+upperOnlyRelative="blobs/cc/$upperOnlyId"
+mkdir -p "$(dirname "$lowerObjects/$duplicateRelative")" "$storeA/nix/store/.links"
+printf 'malformed legacy tree\n' > "$lowerObjects/$duplicateRelative"
+printf 'lower legacy link fixture\n' > "$storeA/nix/store/.links/legacy"
+mountOverlayfs
 
 # Git's blob identifier under SHA-256, computed outside Nix: the hash of
 # `blob <size>\0` followed by the bytes.
 gitBlobId() { { printf 'blob %d\0' "$(stat --format=%s "$1")"; cat "$1"; } | sha256sum | cut -c1-64; }
 gitBlobIdOfBytes() { { printf 'blob %d\0' "${#1}"; printf '%s' "$1"; } | sha256sum | cut -c1-64; }
-
-# The object store's file for an identifier: git's own layout, the
-# identifier's first two hexadecimal digits a shard directory
-# (doc/lazy-store/01-specification.md section 9.10).
-objectFile() { echo "$1/$2/${3:0:2}/$3"; }
 
 listObjects() { ( cd "$1" && find . -type f | sort ); }
 hashObjects() { ( cd "$1" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum ); }
@@ -55,10 +55,9 @@ holder() {
 }
 blobRows() { sqlite3 "$db" "select count(*) from Blobs where id = X'$1' and exec = 0"; }
 ingestions() { sqlite3 "$db" "select count(*) from Ingestions where path = '$1'"; }
+hasAuxiliary() { sqlite3 "$db" "select exists(select 1 from AuxValues where kind = $1 and id = X'$2')"; }
 
-# Two trees added through the overlay.  Their bytes are this store's alone,
-# so the merged object store lacked every object of them and each write
-# landed in the upper layer.
+# Two trees added through the overlay publish into its own database.
 deadSrc="$TEST_ROOT/dead-src"
 mkdir -p "$deadSrc"
 echo "content only the upper layer has, dead" > "$deadSrc/f"
@@ -81,29 +80,28 @@ liveBlob=$(gitBlobId "$liveSrc/g")
 deadLink=$(gitBlobIdOfBytes "$(readlink "$deadSrc/link")")
 liveLink=$(gitBlobIdOfBytes "$(readlink "$liveSrc/link")")
 
-# Both paths' objects are the upper layer's, and none of them the lower
-# store's.
-test -e "$(objectFile "$upperObjects" trees "$deadTree")"
-test -e "$(objectFile "$upperObjects" trees "$liveTree")"
-test -e "$(objectFile "$upperObjects" blobs "$deadLink")"
-test -e "$(objectFile "$upperObjects" blobs "$liveLink")"
+# Both typed projections are in the upper store's database; regular rows
+# still name the actual destination files.
+[[ $(hasAuxiliary 16384 "$deadTree") == 1 ]]
+[[ $(hasAuxiliary 16384 "$liveTree") == 1 ]]
+[[ $(hasAuxiliary 40960 "$deadLink") == 1 ]]
+[[ $(hasAuxiliary 40960 "$liveLink") == 1 ]]
 [[ $(holder "$deadBlob") == "$deadPath/f" ]]
 [[ $(holder "$liveBlob") == "$livePath/g" ]]
 [[ $(ingestions "$deadPath") == 1 ]]
 [[ $(ingestions "$livePath") == 1 ]]
-expect 1 test -e "$(objectFile "$lowerObjects" trees "$deadTree")"
-expect 1 test -e "$(objectFile "$lowerObjects" blobs "$deadLink")"
+liveUpper=$(toRealPath "$storeBTop" "$livePath")
+liveInode=$(stat --format=%i "$liveUpper/g")
 
-duplicate=$(find "$lowerObjects/trees" -type f -print -quit)
-test -n "$duplicate"
-duplicateRelative=${duplicate#"$lowerObjects/"}
-mkdir -p "$(dirname "$upperObjects/$duplicateRelative")"
-cp "$duplicate" "$upperObjects/$duplicateRelative"
+mkdir -p "$(dirname "$upperObjects/$duplicateRelative")" "$(dirname "$upperObjects/$upperOnlyRelative")"
+cp "$lowerObjects/$duplicateRelative" "$upperObjects/$duplicateRelative"
+printf 'upper-only legacy target\n' > "$upperObjects/$upperOnlyRelative"
 remountOverlayfs
-cmp "$duplicate" "$upperObjects/$duplicateRelative"
+cmp "$lowerObjects/$duplicateRelative" "$upperObjects/$duplicateRelative"
+test -e "$mergedObjects/$upperOnlyRelative"
 
-# The lower store's objects as they stand.  The comparison after the
-# collection is not vacuous: `initLowerStore` built that store.
+# Snapshot the lower legacy fixture and any retained lease files. The
+# explicit malformed tree makes the preservation checks non-vacuous.
 lowerBefore="$TEST_ROOT/lower-objects-before"
 listObjects "$lowerObjects" > "$lowerBefore"
 test -s "$lowerBefore"
@@ -116,24 +114,26 @@ nix-collect-garbage
 
 remountOverlayfs
 
-# The dead path is gone, and so are its objects in the upper layer.
+# The dead path and both projections are gone.
 expect 1 test -e "$(toRealPath "$storeBRoot/nix/store" "$deadPath")"
-expect 1 test -e "$(objectFile "$upperObjects" trees "$deadTree")"
-expect 1 test -e "$(objectFile "$upperObjects" blobs "$deadLink")"
+[[ $(hasAuxiliary 16384 "$deadTree") == 0 ]]
+[[ $(hasAuxiliary 40960 "$deadLink") == 0 ]]
 [[ $(blobRows "$deadBlob") == 0 ]]
 [[ $(ingestions "$deadPath") == 0 ]]
 
-# The live path's objects are kept: the sweep takes only what nothing
-# reaches.
+# The live path retains both projections, bytes, symlink target and inode.
 test -e "$(toRealPath "$storeBRoot/nix/store" "$livePath")"
-test -e "$(objectFile "$upperObjects" trees "$liveTree")"
-test -e "$(objectFile "$upperObjects" blobs "$liveLink")"
+[[ $(hasAuxiliary 16384 "$liveTree") == 1 ]]
+[[ $(hasAuxiliary 40960 "$liveLink") == 1 ]]
 [[ $(holder "$liveBlob") == "$livePath/g" ]]
 [[ $(ingestions "$livePath") == 1 ]]
 cmp "$liveSrc/g" "$(toRealPath "$storeBRoot/nix/store" "$livePath")/g"
+[[ $(stat --format=%i "$liveUpper/g") == "$liveInode" ]]
 [[ $(readlink "$(toRealPath "$storeBRoot/nix/store" "$livePath")/link") == unique-live-target ]]
 
 expect 1 test -e "$upperObjects/$duplicateRelative"
+expect 1 test -e "$upperObjects/$upperOnlyRelative"
+expect 1 test -e "$mergedObjects/$upperOnlyRelative"
 test -e "$mergedObjects/$duplicateRelative"
 
 # No whiteout under `.objects`: a whiteout is a character device in the
@@ -144,6 +144,8 @@ test -e "$mergedObjects/$duplicateRelative"
 # Nor a whited-out `.links`: the legacy directory under the merged store
 # directory is the lower store's, and this store removes none.
 [ "$(find "$storeBTop" -maxdepth 1 -name .links | wc -l)" = 0 ]
+[[ $(cat "$storeA/nix/store/.links/legacy") == 'lower legacy link fixture' ]]
+cmp "$storeA/nix/store/.links/legacy" "$storeBRoot/nix/store/.links/legacy"
 
 # The lower store's objects are untouched, and still visible through the
 # merged mount.

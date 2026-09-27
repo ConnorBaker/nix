@@ -12,29 +12,20 @@
 # key signs both fingerprints, so an old client verifies a path the new
 # Nix signed and uploaded, under version 1.  An old client against the new
 # daemon still gets a NAR hash.  A schema-10 row is migrated by `nix store
-# migrate` and by a query, and ungates the collector's sweep; a cache
+# migrate` and by a query; a cache
 # without `ObjectHash:` is signed under version 1 and verifies.
 
 source common.sh
 
 needLocalStore "the column and the verifier are the local store's"
 
-# The object store's file for an identifier: git's own layout, the
-# identifier's first two hexadecimal digits a shard directory
-# (doc/lazy-store/01-specification.md section 9.10).  Trees and the
-# symlink-target blobs have one; a regular file's blob does not -- its
-# canonical file is a store path's own (a *holder*), and the store's record
-# of where it is is a row (doc/lazy-store/06-holder-index.md section 2).
-# So where this script asked "is the blob's file there?" of a plain-file
-# root's blob, it now asks "is the blob's row there?", which is the same
-# question of the same store.
-objectFile() { echo "$NIX_STORE_DIR/.objects/$1/${2:0:2}/$2"; }
+# Auxiliary availability is a typed database value, not a loose file.
+hasTree() { sqlite3 "$NIX_STATE_DIR/db/db.sqlite" "select exists(select 1 from AuxValues where kind = 16384 and id = X'$1')"; }
 # All candidate rows for (identifier, mode), counted whether or not their
 # ingestions have paths: the sweep is what removes stale candidates.
 blobRow() { sqlite3 "$NIX_STATE_DIR/db/db.sqlite" "select count(*) from Blobs where lower(hex(id)) = '$1' and exec = ${2:-0}"; }
-# The whole index, for the "as an older Nix left it" simulations below: an
-# older Nix wrote no rows, so emptying the object directories is not enough.
-forgetEveryBlobRow() { sqlite3 "$NIX_STATE_DIR/db/db.sqlite" "delete from Blobs; delete from Ingestions"; }
+# Simulate an older store with neither regular nor auxiliary projections.
+forgetEveryProjection() { sqlite3 "$NIX_STATE_DIR/db/db.sqlite" "delete from AuxValues; delete from Blobs; delete from Ingestions"; }
 
 clearStore
 
@@ -71,8 +62,7 @@ nix path-info --json --json-format 2 "$p" | jq -e --arg b "$pBase" '.info[$b] | 
 # `ValidPaths.hash` holding `sha256:<NAR hash>` as an older Nix wrote it, is
 # given its object hash by one walk of the path -- by `nix store migrate`,
 # or by the first query.  The row is planted through SQLite, the one
-# writer of that form left; until it is migrated the collector's sweep of
-# the object store is gated (gc.cc), and afterwards it is not.
+# writer of that form left. Cache cleanup is independent of the hash rendering.
 if type -p sqlite3 > /dev/null; then
     db=$NIX_STATE_DIR/db/db.sqlite
     hashColumn() { sqlite3 "$db" "select hash from ValidPaths where path = '$1'"; }
@@ -83,15 +73,8 @@ if type -p sqlite3 > /dev/null; then
     sqlite3 "$db" "update ValidPaths set hash = 'sha256:$narHex' where path = '$p'"
     [[ $(hashColumn "$p") == "sha256:$narHex" ]]
 
-    # A path deleted leaves its blob behind: `nix store delete` sweeps
-    # nothing (gc.cc, only a whole-store collection pays the sweep), and it
-    # queries no row but the victim's, so `$p`'s row stays old.  (The gate
-    # on an old row -- "paths not yet migrated", the sweep removing nothing
-    # -- cannot be observed from here any more: a whole-store collection
-    # visits every rooted path and queries its info (`computeFSClosure`,
-    # `topoSortPaths`), which migrates the row on the way; the gate is
-    # checked where it can be driven directly, `LocalStoreObjectsTest`'s
-    # sweeps with an enumeration that returns an unmigrated count.)
+    # Specific deletion leaves a stale regular witness until collection and
+    # does not query or migrate an unrelated valid path's old hash row.
     nix-store --add-root "$TEST_ROOT/root-p" --indirect -r "$p" > /dev/null
     echo "collect me $RANDOM$RANDOM" > "$TEST_ROOT/victim"
     victim=$(nix store add --mode nar "$TEST_ROOT/victim")
@@ -113,12 +96,10 @@ if type -p sqlite3 > /dev/null; then
     nix store migrate 2> "$TEST_ROOT/migrate-again.log"
     grepQuiet "1 store paths checked, 0 skipped (collected meanwhile), 0 failed" "$TEST_ROOT/migrate-again.log"
     [[ $(hashColumn "$p") == "git:sha256:$gitHex" ]]
-    # (d) Ungated, every row migrated: the collection's sweep removes the
-    # deleted path's blob and keeps `$p`'s.
+    # Collection removes the deleted path's projection and keeps `$p`'s.
     nix-store --gc 2> "$TEST_ROOT/gc-swept.log"
-    grepQuietInverse "not yet migrated" "$TEST_ROOT/gc-swept.log"
     [[ $(blobRow "$victimBlob") == 0 ]]
-    [[ -e $(objectFile trees "$gitHex") ]]
+    [[ $(hasTree "$gitHex") == 1 ]]
     [[ $(cat "$p/a") == one ]]
 
     # The lazy route: the old row again, in the other rendering the old
@@ -130,25 +111,14 @@ if type -p sqlite3 > /dev/null; then
     [[ $(nix path-info --json --json-format 4 "$p" | jq -r --arg b "$pBase" '.info[$b].objectHash') == "git:sha256:$gitHex" ]]
     [[ $(hashColumn "$p") == "git:sha256:$gitHex" ]]
 
-    # The store an older Nix left, simulated (01 section 10, "a live root
-    # without an object keeps nothing beneath it"): a schema-10 row and no
-    # objects at all -- the path's files plain,
-    # the object store empty.  The first collection migrates the row by its
-    # walk and finds a live root with no tree; it says so, names `nix-store
-    # --optimise`, and sweeps all the same: a live root without an object
-    # keeps nothing beneath it (01 section 9.10 law 5).  A path added and
-    # deleted afterwards loses its blob at the next collection.  Before:
-    # "the object store was not swept", and the victim's blob survived every
-    # collection until `--optimise` (doc/lazy-store/08-store-model.md, the collector;
-    # E1 B).
+    # An older store has physical files and a schema-10 hash, but no cache
+    # projection. Collection still migrates queried path metadata and removes
+    # unrelated stale rows; it does not reconstruct auxiliary bodies.
     sqlite3 "$db" "update ValidPaths set hash = 'sha256:$narHex' where path = '$p'"
-    find "$NIX_STORE_DIR/.objects/blobs" "$NIX_STORE_DIR/.objects/blobs-x" "$NIX_STORE_DIR/.objects/trees" -mindepth 1 -delete
-    forgetEveryBlobRow
+    forgetEveryProjection
     [[ $(stat --format=%h "$p/d/b") == 1 ]]
     nix-store --gc 2> "$TEST_ROOT/gc-upgraded.log"
-    grepQuiet "1 valid paths have no object in the object store" "$TEST_ROOT/gc-upgraded.log"
-    grepQuiet "nix-store --optimise" "$TEST_ROOT/gc-upgraded.log"
-    grepQuietInverse "was not swept" "$TEST_ROOT/gc-upgraded.log"
+    [[ $(hasTree "$gitHex") == 0 ]]
     [[ $(hashColumn "$p") == "git:sha256:$gitHex" ]]
     echo "collect me too $RANDOM$RANDOM" > "$TEST_ROOT/victim2"
     victim2=$(nix store add --mode nar "$TEST_ROOT/victim2")
@@ -157,19 +127,19 @@ if type -p sqlite3 > /dev/null; then
     nix store delete "$victim2"
     [[ $(blobRow "$victim2Blob") == 1 ]]
     nix-store --gc 2> "$TEST_ROOT/gc-upgraded-2.log"
-    grepQuiet "1 valid paths have no object in the object store" "$TEST_ROOT/gc-upgraded-2.log"
+    [[ $(hasTree "$gitHex") == 0 ]]
     [[ $(blobRow "$victim2Blob") == 0 ]]
     [[ $(cat "$p/a") == one ]]
-    # `nix-store --optimise` is the remedy the warning names: the path is
-    # entered again, and the next collection has nothing to report.
+    # `nix-store --optimise` reconstructs the missing projection without
+    # rewriting the path or adding an extra regular-file link.
     nix-store --optimise
-    [[ -e $(objectFile trees "$gitHex") ]]
+    [[ $(hasTree "$gitHex") == 1 ]]
     # Entered: the path's own file is the blob's holder, so the witness is
     # the row and not a second link (`08` K8).
     [[ $(stat --format=%h "$p/d/b") == 1 ]]
     [[ $(blobRow "$(nix hash path --mode git --algo sha256 --format base16 "$p/d/b")") == 1 ]]
     nix-store --gc 2> "$TEST_ROOT/gc-entered.log"
-    grepQuietInverse "have no object" "$TEST_ROOT/gc-entered.log"
+    [[ $(hasTree "$gitHex") == 1 ]]
 
     # `--optimise` on an unmigrated row writes the column as `nix store
     # migrate` does -- the walk that enters the path is the walk the
@@ -178,14 +148,13 @@ if type -p sqlite3 > /dev/null; then
     # Before: the column stayed `sha256:` and the report read "hard-linking
     # 0 files" (doc/lazy-store/08-store-model.md, the migration).
     sqlite3 "$db" "update ValidPaths set hash = 'sha256:$narHex' where path = '$p'"
-    find "$NIX_STORE_DIR/.objects/blobs" "$NIX_STORE_DIR/.objects/blobs-x" "$NIX_STORE_DIR/.objects/trees" -mindepth 1 -delete
-    forgetEveryBlobRow
+    forgetEveryProjection
     nix-store --optimise 2> "$TEST_ROOT/optimise-migrate.log"
     [[ $(hashColumn "$p") == "git:sha256:$gitHex" ]]
     grepQuiet "1 paths migrated to the object hash" "$TEST_ROOT/optimise-migrate.log"
     grepQuiet "files entered as new objects" "$TEST_ROOT/optimise-migrate.log"
     grepQuietInverse "0 files entered as new objects" "$TEST_ROOT/optimise-migrate.log"
-    [[ -e $(objectFile trees "$gitHex") ]]
+    [[ $(hasTree "$gitHex") == 1 ]]
     nix-store --optimise 2> "$TEST_ROOT/optimise-noop.log"
     grepQuiet "0.0 KiB freed by hard-linking 0 files; 0 files entered as new objects; 0 paths migrated to the object hash" "$TEST_ROOT/optimise-noop.log"
 
@@ -193,12 +162,9 @@ if type -p sqlite3 > /dev/null; then
     # whose files are gone is answered from the database"): the
     # row is valid and master answered from it; here too -- `nix path-info`
     # and `--query --references` answer, `nix store migrate` counts the path
-    # failed and names `nix-store --verify`, and the collector's note, whose
-    # sweep the row gates, names it as well.  `nix-store --verify` removes
-    # the row and the next collection sweeps.  Before: the query threw
-    # "does not exist", `nix store migrate` said "skipped (collected
-    # meanwhile), 0 failed" and exited 0, and the note named only `nix store
-    # migrate`, which could not help.
+    # failed and names `nix-store --verify`. Collection retains its projection
+    # while ValidPaths still names it; verification removes the invalid row,
+    # and the following collection removes the stale projection.
     echo "gone $RANDOM$RANDOM" > "$TEST_ROOT/gone"
     q=$(nix store add --mode nar "$TEST_ROOT/gone")
     qBlob=$(nix hash path --mode git --algo sha256 --format base16 "$TEST_ROOT/gone")
@@ -216,14 +182,11 @@ if type -p sqlite3 > /dev/null; then
     grepQuiet "1 failed" "$TEST_ROOT/migrate-missing.log"
     grepQuietInverse "1 skipped" "$TEST_ROOT/migrate-missing.log"
     nix-store --gc 2> "$TEST_ROOT/gc-missing.log"
-    grepQuiet "1 paths not yet migrated" "$TEST_ROOT/gc-missing.log"
-    grepQuiet "nix-store --verify" "$TEST_ROOT/gc-missing.log"
     [[ $(blobRow "$qBlob") == 1 ]]
     nix-store --verify 2> "$TEST_ROOT/verify-missing.log"
     grepQuiet "disappeared, removing from database" "$TEST_ROOT/verify-missing.log"
     expect 1 nix-store --check-validity "$q"
     nix-store --gc 2> "$TEST_ROOT/gc-after-missing.log"
-    grepQuietInverse "not yet migrated" "$TEST_ROOT/gc-after-missing.log"
     [[ $(blobRow "$qBlob") == 0 ]]
 else
     echo "sqlite3 not on PATH; skipping the schema-10 row checks" >&2
@@ -322,8 +285,7 @@ if type -p sqlite3 > /dev/null; then
     sqlite3 "$db" "update ValidPaths set hash = 'sha256:$narHex' where path = '$p'"
     # The path's files as an older store holds them: not the object store's,
     # and with no row to say where a blob is.
-    find "$NIX_STORE_DIR/.objects/blobs" "$NIX_STORE_DIR/.objects/blobs-x" "$NIX_STORE_DIR/.objects/trees" -mindepth 1 -delete
-    forgetEveryBlobRow
+    forgetEveryProjection
     [[ $(stat --format=%h "$p/d/b") == 1 ]]
     chmod u+w "$p/d/b"
     printf 'xwo\n' > "$p/d/b"

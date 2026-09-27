@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
+#include <limits>
 
 #include <memory>
 #include <new>
@@ -134,7 +135,13 @@ struct LocalStore::State::Stmts
     SQLiteStmt QueryRealisedOutput;
     SQLiteStmt QueryPathFromHashPart;
     SQLiteStmt QueryValidPaths;
-    SQLiteStmt QueryValidObjectHashes;
+    bool hasBlobIndex = false;
+    bool hasAuxiliary = false;
+    SQLiteStmt ReadAuxiliary;
+    SQLiteStmt ReadAuxiliaryExact;
+    SQLiteStmt QueryAuxiliaryKeys;
+    SQLiteStmt InsertAuxiliary;
+    SQLiteStmt DeleteAuxiliary;
     /* The blob index (`06-holder-index.md`). */
     SQLiteStmt LookupBlob;
     SQLiteStmt InsertBlob;
@@ -162,10 +169,7 @@ LocalStore::LocalStore(ref<const Config> config)
     , config{config}
     , _state(make_ref<Sync<State>>())
     , dbDir(config->stateDir.get() / "db")
-    , objects(
-          config->realStoreDir.get() / ".objects",
-          config->getLocalSettings().fsyncStorePaths.get(),
-          config->stateDir.get() / "object-gc.lock")
+    , objects(config->realStoreDir.get() / ".objects")
     , reservedPath(dbDir / "reserved")
     , schemaPath(dbDir / "schema")
     , tempRootsDir(config->stateDir.get() / "temproots")
@@ -418,53 +422,81 @@ LocalStore::LocalStore(ref<const Config> config)
     // ensure efficient lookup.
     state->stmts->QueryPathFromHashPart.create(state->db, "select path from ValidPaths where path >= ? limit 1;");
     state->stmts->QueryValidPaths.create(state->db, "select path from ValidPaths");
-    state->stmts->QueryValidObjectHashes.create(state->db, "select hash from ValidPaths");
-    state->stmts->LookupBlob.create(state->db, lookupBlobSql);
-    state->stmts->InsertBlob.create(
-        state->db,
-        "insert or replace into Blobs (id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);");
-    state->stmts->DeleteBlob.create(
-        state->db,
-        "delete from Blobs where id = ? and exec = ? and ingestion = ? and ino = ? and dev = ? and size = ? and name = ?;");
-    /* Only the first registered candidate is canonical to the optimiser's
-       inode shortcut. Other candidates must reach place() to coalesce. */
-    state->stmts->QueryBlobInodes.create(
-        state->db,
-        "select b.ino, b.id from Blobs b join Ingestions i on i.id = b.ingestion "
-        "join ValidPaths v on v.path = i.path where not exists ("
-        "select 1 from Blobs earlier join Ingestions ei on ei.id = earlier.ingestion "
-        "join ValidPaths ev on ev.path = ei.path "
-        "where earlier.id = b.id and earlier.exec = b.exec"
-        " and (earlier.dev, earlier.ino, earlier.ingestion) < (b.dev, b.ino, b.ingestion));");
-    state->stmts->QueryBlobCollisions.create(
-        state->db,
-        "select own.id, own.exec, own.ino, own.dev, own.size, own.name,"
-        " donor.ino, donor.dev, donor.size, i.path, donor.name, donor.ingestion"
-        " from Blobs own join Blobs donor on donor.id = own.id and donor.exec = own.exec"
-        " join Ingestions i on i.id = donor.ingestion join ValidPaths v on v.path = i.path"
-        " where own.ingestion = ? and donor.ingestion != own.ingestion"
-        " and exists (select 1 from Blobs other join Ingestions oi on oi.id = other.ingestion"
-        " join ValidPaths ov on ov.path = oi.path where other.id = own.id and other.exec = own.exec"
-        " and (other.ino != own.ino or other.dev != own.dev))"
-        " order by own.id, own.exec, donor.dev, donor.ino, donor.ingestion;");
-    state->stmts->QueryHoldIngestions.create(
-        state->db, "select id from Ingestions where path = ? and hold = ? order by id desc limit 1;");
-    state->stmts->DeletePathBlobs.create(
-        state->db, "delete from Blobs where ingestion in (select id from Ingestions where path = ?);");
-    state->stmts->DeletePathIngestions.create(state->db, "delete from Ingestions where path = ?;");
-    state->stmts->NewIngestion.create(state->db, "insert into Ingestions (path, hold) values (?, ?);");
-    state->stmts->SetIngestionPath.create(state->db, "update Ingestions set path = ? where id = ?;");
-    /* The sweep's stale-row rule (schema.sql): a row whose ingestion never
-       got its path, or whose path is no longer valid, names no holder. */
-    /* An ingestion still in flight -- no path yet, its hold directory still
-       under `tmp/` -- is not stale: its rows must survive a collection running
-       beside it as its objects do (`08` K16).  The sweep has already removed
-       the holds of dead ingestions before this runs, so a hold that is still
-       there is a live one.  `?` is the object store's `tmp` directory. */
-    state->stmts->QueryStaleIngestions.create(
-        state->db, "select id, hold from Ingestions where path is null or path not in (select path from ValidPaths);");
-    state->stmts->DeleteBlobsOf.create(state->db, "delete from Blobs where ingestion = ?;");
-    state->stmts->DeleteIngestion.create(state->db, "delete from Ingestions where id = ?;");
+    /* Cache tables are optional in an older read-only store. Its valid
+       paths and their hashes remain readable without migrating a cache. */
+    auto hasTable = [&](std::string_view name) {
+        SQLiteStmt query(state->db, "select 1 from sqlite_master where type = 'table' and name = ?;");
+        return query.use().apply(name).next();
+    };
+    state->stmts->hasBlobIndex = hasTable("Blobs") && hasTable("Ingestions");
+    state->stmts->hasAuxiliary = hasTable("AuxValues");
+    if (state->stmts->hasAuxiliary) {
+        state->stmts->ReadAuxiliary.create(
+            state->db,
+            "select a.ingestion, a.chunk, a.body from AuxValues a"
+            " where a.kind = ?1 and a.id = ?2 and a.ingestion = ("
+            " select min(c.ingestion) from AuxValues c join Ingestions i on i.id = c.ingestion"
+            " where c.kind = ?1 and c.id = ?2 and (?3 is null or c.ingestion > ?3))"
+            " order by a.chunk;");
+        state->stmts->ReadAuxiliaryExact.create(
+            state->db,
+            "select ingestion, chunk, body from AuxValues"
+            " where kind = ? and id = ? and ingestion = ? order by chunk;");
+        state->stmts->QueryAuxiliaryKeys.create(state->db, "select distinct kind, id, ingestion from AuxValues;");
+        state->stmts->InsertAuxiliary.create(
+            state->db, "insert into AuxValues (kind, id, ingestion, chunk, body) values (?, ?, ?, ?, ?);");
+        state->stmts->DeleteAuxiliary.create(
+            state->db, "delete from AuxValues where kind = ? and id = ? and ingestion = ?;");
+    }
+    if (state->stmts->hasBlobIndex) {
+        state->stmts->LookupBlob.create(state->db, lookupBlobSql);
+        state->stmts->InsertBlob.create(
+            state->db,
+            "insert or replace into Blobs (id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);");
+        state->stmts->DeleteBlob.create(
+            state->db,
+            "delete from Blobs where id = ? and exec = ? and ingestion = ? and ino = ? and dev = ? and size = ? and name = ?;");
+        /* Only the first registered candidate is canonical to the optimiser's
+           inode shortcut. Other candidates must reach place() to coalesce. */
+        state->stmts->QueryBlobInodes.create(
+            state->db,
+            "select b.ino, b.id from Blobs b join Ingestions i on i.id = b.ingestion "
+            "join ValidPaths v on v.path = i.path where not exists ("
+            "select 1 from Blobs earlier join Ingestions ei on ei.id = earlier.ingestion "
+            "join ValidPaths ev on ev.path = ei.path "
+            "where earlier.id = b.id and earlier.exec = b.exec"
+            " and (earlier.dev, earlier.ino, earlier.ingestion) < (b.dev, b.ino, b.ingestion));");
+        state->stmts->QueryBlobCollisions.create(
+            state->db,
+            "select own.id, own.exec, own.ino, own.dev, own.size, own.name,"
+            " donor.ino, donor.dev, donor.size, i.path, donor.name, donor.ingestion"
+            " from Blobs own join Blobs donor on donor.id = own.id and donor.exec = own.exec"
+            " join Ingestions i on i.id = donor.ingestion join ValidPaths v on v.path = i.path"
+            " where own.ingestion = ? and donor.ingestion != own.ingestion"
+            " and exists (select 1 from Blobs other join Ingestions oi on oi.id = other.ingestion"
+            " join ValidPaths ov on ov.path = oi.path where other.id = own.id and other.exec = own.exec"
+            " and (other.ino != own.ino or other.dev != own.dev))"
+            " order by own.id, own.exec, donor.dev, donor.ino, donor.ingestion;");
+        state->stmts->QueryHoldIngestions.create(
+            state->db, "select id from Ingestions where path = ? and hold = ? order by id desc limit 1;");
+        state->stmts->DeletePathBlobs.create(
+            state->db, "delete from Blobs where ingestion in (select id from Ingestions where path = ?);");
+        state->stmts->DeletePathIngestions.create(state->db, "delete from Ingestions where path = ?;");
+        state->stmts->NewIngestion.create(state->db, "insert into Ingestions (path, hold) values (?, ?);");
+        state->stmts->SetIngestionPath.create(state->db, "update Ingestions set path = ? where id = ?;");
+        /* The sweep's stale-row rule (schema.sql): a row whose ingestion never
+           got its path, or whose path is no longer valid, names no holder. */
+        /* An ingestion still in flight -- no path yet, its hold directory still
+           under `tmp/` -- is not stale: its rows must survive a collection running
+           beside it as its objects do (`08` K16).  The sweep has already removed
+           the holds of dead ingestions before this runs, so a hold that is still
+           there is a live one.  `?` is the object store's `tmp` directory. */
+        state->stmts->QueryStaleIngestions.create(
+            state->db,
+            "select id, hold from Ingestions where path is null or path not in (select path from ValidPaths);");
+        state->stmts->DeleteBlobsOf.create(state->db, "delete from Blobs where ingestion = ?;");
+        state->stmts->DeleteIngestion.create(state->db, "delete from Ingestions where id = ?;");
+    }
     if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
         state->stmts->RegisterRealisedOutput.create(
             state->db,
@@ -507,81 +539,85 @@ LocalStore::LocalStore(ref<const Config> config)
     /* The ablation, test-only (`local-store.hh`, `BlobRows`). */
     if (auto v = getEnv("_NIX_TEST_HOLDER_NO_ROWS"); v && *v == "1")
         blobRows = BlobRows::NoRows;
-    blobIndex.lookup = [this](const Hash & id, bool executable, GitObjectStore::Holder::Cursor cursor)
-        -> std::optional<GitObjectStore::Holder> {
-        return retrySQLite<std::optional<GitObjectStore::Holder>>([&]() -> std::optional<GitObjectStore::Holder> {
-            auto state(_state->lock());
-            auto use(state->stmts->LookupBlob.use());
-            /* Bind the identifier bytes directly, without hexadecimal encoding. */
-            use.apply(id.hash, id.hashSize)
-                .apply(int64_t(executable ? 1 : 0))
-                .apply(std::get<0>(cursor))
-                .apply(std::get<1>(cursor))
-                .apply(static_cast<int64_t>(std::get<2>(cursor)));
-            std::optional<GitObjectStore::Holder> holder;
-            std::tuple<int64_t, int64_t, int64_t> minimum;
-            /* Select the same physical minimum without opening SQLite's
-               temporary sorter on every miss. Compare signed database
-               coordinates before converting to platform inode types. */
-            while (use.next()) {
-                auto candidate = std::tuple{use.getInt(1), use.getInt(0), use.getInt(5)};
-                if (holder && candidate >= minimum)
-                    continue;
-                minimum = candidate;
-                holder = GitObjectStore::Holder{
-                    .ino = static_cast<ino_t>(std::get<1>(candidate)),
-                    .dev = static_cast<dev_t>(std::get<0>(candidate)),
-                    .size = static_cast<uint64_t>(use.getInt(2)),
-                    /* The column holds the *logical* store path; the holder is
-                       a file on disk under the real store directory. */
-                    .file = (getRealStoreDir() / baseNameOf(use.getStr(3))).string(),
-                    .ingestion = static_cast<uint64_t>(std::get<2>(candidate)),
-                };
-                auto name = use.getStr(4);
-                if (!name.empty()) {
-                    holder->file += '/';
-                    holder->file += name;
+    if (state->stmts->hasBlobIndex) {
+        blobIndex.lookup = [this](const Hash & id, bool executable, GitObjectStore::Holder::Cursor cursor)
+            -> std::optional<GitObjectStore::Holder> {
+            return retrySQLite<std::optional<GitObjectStore::Holder>>([&]() -> std::optional<GitObjectStore::Holder> {
+                auto state(_state->lock());
+                auto use(state->stmts->LookupBlob.use());
+                /* Bind the identifier bytes directly, without hexadecimal encoding. */
+                use.apply(id.hash, id.hashSize)
+                    .apply(int64_t(executable ? 1 : 0))
+                    .apply(std::get<0>(cursor))
+                    .apply(std::get<1>(cursor))
+                    .apply(static_cast<int64_t>(std::get<2>(cursor)));
+                std::optional<GitObjectStore::Holder> holder;
+                std::tuple<int64_t, int64_t, int64_t> minimum;
+                /* Select the same physical minimum without opening SQLite's
+                   temporary sorter on every miss. Compare signed database
+                   coordinates before converting to platform inode types. */
+                while (use.next()) {
+                    auto candidate = std::tuple{use.getInt(1), use.getInt(0), use.getInt(5)};
+                    if (holder && candidate >= minimum)
+                        continue;
+                    minimum = candidate;
+                    holder = GitObjectStore::Holder{
+                        .ino = static_cast<ino_t>(std::get<1>(candidate)),
+                        .dev = static_cast<dev_t>(std::get<0>(candidate)),
+                        .size = static_cast<uint64_t>(use.getInt(2)),
+                        /* The column holds the *logical* store path; the holder is
+                           a file on disk under the real store directory. */
+                        .file = (getRealStoreDir() / baseNameOf(use.getStr(3))).string(),
+                        .ingestion = static_cast<uint64_t>(std::get<2>(candidate)),
+                    };
+                    auto name = use.getStr(4);
+                    if (!name.empty()) {
+                        holder->file += '/';
+                        holder->file += name;
+                    }
                 }
-            }
-            return holder;
-        });
-    };
-    blobIndex.forget = [this](const Hash & id, bool executable, const GitObjectStore::Holder & holder) {
-        if (this->config->readOnly)
-            return;
-        /* Recover the recorded name from the physical holder path, dropping
-           the store directory and its first component (the store path). */
-        auto relative = std::filesystem::path(holder.file).lexically_relative(getRealStoreDir());
-        std::filesystem::path name;
-        for (auto i = ++relative.begin(); i != relative.end(); ++i)
-            name /= *i;
-        retrySQLite<void>([&]() {
-            auto state(_state->lock());
-            auto use(state->stmts->DeleteBlob.use());
-            use.apply(id.hash, id.hashSize)
-                .apply(int64_t(executable ? 1 : 0))
-                .apply(static_cast<int64_t>(holder.ingestion))
-                .apply(static_cast<int64_t>(holder.ino))
-                .apply(static_cast<int64_t>(holder.dev))
-                .apply(static_cast<int64_t>(holder.size))
-                .apply(name.string())
-                .exec();
-        });
-    };
-    blobIndex.inodes = [this](boost::unordered_flat_map<ino_t, Hash> & inodes) {
-        retrySQLite<void>([&]() {
-            auto state(_state->lock());
-            auto use(state->stmts->QueryBlobInodes.use());
-            while (use.next())
-                inodes.insert_or_assign(static_cast<ino_t>(use.getInt(0)), blobIdOf(use.getBlobStr(1)));
-        });
-    };
+                return holder;
+            });
+        };
+        blobIndex.forget = [this](const Hash & id, bool executable, const GitObjectStore::Holder & holder) {
+            if (this->config->readOnly)
+                return;
+            /* Recover the recorded name from the physical holder path, dropping
+               the store directory and its first component (the store path). */
+            auto relative = std::filesystem::path(holder.file).lexically_relative(getRealStoreDir());
+            std::filesystem::path name;
+            for (auto i = ++relative.begin(); i != relative.end(); ++i)
+                name /= *i;
+            retrySQLite<void>([&]() {
+                auto state(_state->lock());
+                auto use(state->stmts->DeleteBlob.use());
+                use.apply(id.hash, id.hashSize)
+                    .apply(int64_t(executable ? 1 : 0))
+                    .apply(static_cast<int64_t>(holder.ingestion))
+                    .apply(static_cast<int64_t>(holder.ino))
+                    .apply(static_cast<int64_t>(holder.dev))
+                    .apply(static_cast<int64_t>(holder.size))
+                    .apply(name.string())
+                    .exec();
+            });
+        };
+        blobIndex.inodes = [this](boost::unordered_flat_map<ino_t, Hash> & inodes) {
+            retrySQLite<void>([&]() {
+                auto state(_state->lock());
+                auto use(state->stmts->QueryBlobInodes.use());
+                while (use.next())
+                    inodes.insert_or_assign(static_cast<ino_t>(use.getInt(0)), blobIdOf(use.getBlobStr(1)));
+            });
+        };
+    }
+    if (state->stmts->hasAuxiliary)
+        blobIndex.readAuxiliary = [this](const merkle::TreeEntry & entry) { return readAuxiliary(entry); };
     objects.index = &blobIndex;
 }
 
 void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::filesystem::path & root)
 {
-    if (config->readOnly || blobRows == BlobRows::NoRows)
+    if (config->readOnly)
         return;
     hold.setRoot(root);
     /* Rows are inserted only when this path is completed. An empty
@@ -591,6 +627,8 @@ void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::fi
 
 void LocalStore::insertBlobRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Hold::Row> rows)
 {
+    if (blobRows == BlobRows::NoRows)
+        return;
     for (auto & row : rows)
         state.stmts->InsertBlob.use()
             .apply(row.id.hash, row.id.hashSize)
@@ -601,6 +639,185 @@ void LocalStore::insertBlobRows(State & state, uint64_t ingestion, std::span<con
             .apply(row.name)
             .apply(static_cast<int64_t>(row.size))
             .exec();
+}
+
+/* SQLite's selected 1,000,000,000-byte row limit and bind_blob's signed
+   length are both larger than this complete row. Chunk ordinals, not byte
+   offsets, also fit int64_t for every supported size_t/string domain. */
+static constexpr size_t auxiliaryChunkSize = 1 << 20;
+static_assert(std::numeric_limits<size_t>::digits <= 64);
+static_assert(auxiliaryChunkSize <= std::numeric_limits<int>::max());
+
+struct AuxiliaryCandidate
+{
+    int64_t ingestion;
+    std::optional<std::string> body;
+};
+
+/* Both queries select one incarnation in ordinal order. Keep the statement
+   active until every chunk is owned: no body can mix two SQLite snapshots. */
+static std::optional<AuxiliaryCandidate> readAuxiliaryChunks(SQLiteStmt & stmt, SQLiteStmt::Use & use)
+{
+    std::optional<AuxiliaryCandidate> result;
+    uint64_t ordinal = 0;
+    size_t previousSize = auxiliaryChunkSize;
+    while (use.next()) {
+        if (!result)
+            result.emplace(use.getInt(0), std::string());
+        if (!result->body)
+            continue;
+        if (sqlite3_column_type(stmt, 1) != SQLITE_INTEGER || sqlite3_column_type(stmt, 2) != SQLITE_BLOB) {
+            result->body.reset();
+            continue;
+        }
+        auto * data = sqlite3_column_blob(stmt, 2);
+        if (!data && sqlite3_errcode(stmt.db) == SQLITE_NOMEM)
+            SQLiteError::throw_(stmt.db, "reading auxiliary body chunk");
+        auto size = static_cast<size_t>(sqlite3_column_bytes(stmt, 2));
+        if (ordinal > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+            || use.getInt(1) != static_cast<int64_t>(ordinal) || size > auxiliaryChunkSize
+            || previousSize != auxiliaryChunkSize || (size == 0 && ordinal != 0)
+            || size > result->body->max_size() - result->body->size()) {
+            result->body.reset();
+            continue;
+        }
+        if (size)
+            result->body->append(static_cast<const char *>(data), size);
+        previousSize = size;
+        ++ordinal;
+    }
+    return result;
+}
+
+static bool auxiliaryBodyMatches(int64_t kind, std::string_view id, const std::optional<std::string> & body)
+{
+    if (!body || id.size() != regularHashSize(GitObjectStore::hashAlgo))
+        return false;
+    if (kind == static_cast<int64_t>(merkle::Mode::Directory))
+        return merkle::treeId(*body) == blobIdOf(id);
+    if (kind == static_cast<int64_t>(merkle::Mode::Symlink))
+        return merkle::blobId(*body) == blobIdOf(id);
+    return false;
+}
+
+std::optional<std::string> LocalStore::readAuxiliary(const merkle::TreeEntry & entry)
+{
+    if ((entry.mode != merkle::Mode::Directory && entry.mode != merkle::Mode::Symlink)
+        || entry.hash.algo != GitObjectStore::hashAlgo
+        || entry.hash.hashSize != regularHashSize(GitObjectStore::hashAlgo))
+        throw Error("invalid auxiliary object key");
+    std::optional<int64_t> cursor;
+    while (true) {
+        auto candidate = retrySQLite<std::optional<AuxiliaryCandidate>>([&] {
+            auto state(_state->lock());
+            auto & stmt = state->stmts->ReadAuxiliary;
+            auto use(stmt.use());
+            use.apply(static_cast<int64_t>(entry.mode))
+                .apply(entry.hash.hash, entry.hash.hashSize)
+                .apply(cursor.value_or(0), cursor.has_value());
+            return readAuxiliaryChunks(stmt, use);
+        });
+        if (!candidate)
+            return std::nullopt;
+        /* Hash outside the database scope. An old corrupt incarnation must
+           not hide a later sound copy; NULL, not zero, is the first cursor. */
+        if (auxiliaryBodyMatches(
+                static_cast<int64_t>(entry.mode),
+                {reinterpret_cast<const char *>(entry.hash.hash), entry.hash.hashSize},
+                candidate->body))
+            return std::move(candidate->body);
+        cursor = candidate->ingestion;
+    }
+}
+
+void LocalStore::insertAuxiliaryRows(
+    State & state, uint64_t ingestion, std::span<const GitObjectStore::Auxiliary> values)
+{
+    for (auto & value : values) {
+        auto & entry = value.entry;
+        if ((entry.mode != merkle::Mode::Directory && entry.mode != merkle::Mode::Symlink)
+            || entry.hash.algo != GitObjectStore::hashAlgo
+            || entry.hash.hashSize != regularHashSize(GitObjectStore::hashAlgo))
+            throw Error("invalid auxiliary object key");
+        /* Nonempty production projections belong to a fresh ingestion;
+           a retry rolled its previous inserts back. No value is overwritten. */
+        size_t offset = 0;
+        int64_t ordinal = 0;
+        do {
+            auto size = std::min(auxiliaryChunkSize, value.body.size() - offset);
+            state.stmts->InsertAuxiliary.use()
+                .apply(static_cast<int64_t>(entry.mode))
+                .apply(entry.hash.hash, entry.hash.hashSize)
+                .apply(static_cast<int64_t>(ingestion))
+                .apply(ordinal++)
+                /* string::data is non-null even for the one empty chunk. */
+                .apply(reinterpret_cast<const unsigned char *>(value.body.data() + offset), size)
+                .exec();
+            offset += size;
+        } while (offset != value.body.size());
+    }
+}
+
+bool LocalStore::verifyAuxiliary(RepairFlag repair)
+{
+    struct Key
+    {
+        int64_t kind;
+        std::string id;
+        int64_t ingestion;
+    };
+
+    auto keys = retrySQLite<std::vector<Key>>([&] {
+        auto state(_state->lock());
+        std::vector<Key> keys;
+        if (!state->stmts->hasAuxiliary)
+            return keys;
+        auto use(state->stmts->QueryAuxiliaryKeys.use());
+        while (use.next())
+            keys.push_back({use.getInt(0), use.getBlobStr(1), use.getInt(2)});
+        return keys;
+    });
+    auto inspect = [&](State & state, const Key & key) {
+        auto & stmt = state.stmts->ReadAuxiliaryExact;
+        auto use(stmt.use());
+        use.apply(key.kind)
+            .apply(reinterpret_cast<const unsigned char *>(key.id.data()), key.id.size())
+            .apply(key.ingestion);
+        return readAuxiliaryChunks(stmt, use);
+    };
+    auto bad = [&](const Key & key, const std::optional<AuxiliaryCandidate> & candidate) {
+        return candidate && !auxiliaryBodyMatches(key.kind, key.id, candidate->body);
+    };
+    bool errors = false;
+    for (auto & key : keys) {
+        auto candidate = retrySQLite<std::optional<AuxiliaryCandidate>>([&] {
+            auto state(_state->lock());
+            return inspect(*state, key);
+        });
+        if (!bad(key, candidate))
+            continue;
+        /* The transactional recheck cannot delete a sound replacement on an
+           old snapshot: a conflicting writer makes the upgrade busy and
+           retrySQLite repeats the complete read/hash/delete after rollback.
+           Hashing here has no callbacks; diagnostics follow lock release. */
+        if (repair && !config->readOnly)
+            retrySQLite<void>([&] {
+                auto state(_state->lock());
+                SQLiteTxn txn(state->db);
+                if (bad(key, inspect(*state, key)))
+                    state->stmts->DeleteAuxiliary.use()
+                        .apply(key.kind)
+                        .apply(reinterpret_cast<const unsigned char *>(key.id.data()), key.id.size())
+                        .apply(key.ingestion)
+                        .exec();
+                txn.commit();
+            });
+        else
+            errors = true;
+        printError(
+            "auxiliary cache body in ingestion %d was modified or has an incomplete chunk sequence", key.ingestion);
+    }
+    return errors;
 }
 
 void LocalStore::coalesceBlobRows(
@@ -716,12 +933,13 @@ void LocalStore::coalesceBlobRows(
 
 void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath & path)
 {
-    if (config->readOnly || blobRows == BlobRows::NoRows || !hold.ingestion)
+    if (config->readOnly || !hold.ingestion)
         return;
     /* An already-valid repair/optimisation path must not expose its new
        candidates before reconciling the complete projection. */
     auto * ingestion = &*hold.ingestion;
-    auto rows = hold.takeRows();
+    auto projection = hold.takeProjection();
+    auto & rows = projection.regular;
     std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
         auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
         return c != 0 ? c < 0 : a.executable < b.executable;
@@ -737,6 +955,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
         } else
             state->stmts->SetIngestionPath.use().apply("", false).apply(static_cast<int64_t>(*id)).exec();
         insertBlobRows(*state, *id, rows);
+        insertAuxiliaryRows(*state, *id, projection.auxiliary);
         /* This naming is itself publication for a path already valid.
            Builder outputs are reconciled when their validity is committed. */
         if (isValidPath_(*state, path))
@@ -758,7 +977,8 @@ void LocalStore::recordBlobsAtPath(const GitObjectStore::Hold & hold, const std:
        real one, and the ingestion is given that path. */
     if (!hold.ingestion)
         return;
-    auto rows = hold.takeRows();
+    auto projection = hold.takeProjection();
+    auto & rows = projection.regular;
     auto logical = std::filesystem::path(config->storeDir) / root.filename();
     auto ingestion = hold.ingestion->id;
     retrySQLite<void>([&]() {
@@ -771,6 +991,7 @@ void LocalStore::recordBlobsAtPath(const GitObjectStore::Hold & hold, const std:
         } else
             state->stmts->SetIngestionPath.use().apply("", false).apply(static_cast<int64_t>(*id)).exec();
         insertBlobRows(*state, *id, rows);
+        insertAuxiliaryRows(*state, *id, projection.auxiliary);
         auto valid = state->stmts->QueryValidPathId.use().apply(logical.string()).next();
         if (!valid) {
             auto use(state->stmts->RegisterValidPath.use());
@@ -1149,6 +1370,18 @@ bool LocalStore::upgradeDBSchema(State & state, bool dryRun)
         "\ndrop table Blobs;"
         "\nalter table BlobsWithoutRowid rename to Blobs;"
         "\ncreate index IndexBlobsIngestion on Blobs(ingestion)");
+
+    /* Additive cache storage. The foreign key also lets an older writer's
+       existing ingestion deletion remove these derived values. */
+    maybeUpgrade(
+        "20260927-auxiliary-ingestion-values",
+        "create table if not exists AuxValues ("
+        " kind integer not null check(kind in (16384, 40960)),"
+        " id blob not null check(typeof(id) = 'blob' and length(id) = 32),"
+        " ingestion integer not null references Ingestions(id) on delete cascade,"
+        " chunk integer not null check(chunk >= 0), body blob not null,"
+        " primary key(kind, id, ingestion, chunk)) without rowid;"
+        "\ncreate index if not exists IndexAuxValuesIngestion on AuxValues(ingestion)");
 
     return ret;
 }
@@ -1577,25 +1810,6 @@ bool LocalStore::hasValidPaths()
     });
 }
 
-uint64_t LocalStore::forEachValidObjectHash(fun<void(const ObjectHash &)> callback)
-{
-    return retrySQLite<uint64_t>([&]() {
-        auto state(_state->lock());
-        auto use(state->stmts->QueryValidObjectHashes.use());
-        uint64_t unmigrated = 0;
-        while (use.next()) {
-            /* A row older than schema 11 holds a NAR hash, which `parse`
-               refuses; it is counted, not migrated, since the migration
-               walks the path and this runs under the database lock. */
-            if (auto hash = ObjectHash::parse(use.getStr(0)))
-                callback(*hash);
-            else
-                unmigrated++;
-        }
-        return unmigrated;
-    });
-}
-
 void LocalStore::queryReferrers(State & state, const StorePath & path, StorePathSet & referrers)
 {
     auto useQueryReferrers(state.stmts->QueryReferrers.use().apply(printStorePath(path)));
@@ -1717,20 +1931,20 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
     {
         StorePath path;
         std::optional<uint64_t> ingestion;
-        std::vector<GitObjectStore::Hold::Row> rows;
+        GitObjectStore::Hold::Projection projection;
     };
 
     std::vector<Publication> publications;
     if (ingestion) {
-        auto rows = hold->takeRows();
+        auto projection = hold->takeProjection();
         if (!ingestion->completed) {
             assert(infos.size() == 1);
-            publications.push_back({infos.begin()->first, ingestion->id, std::move(rows)});
+            publications.push_back({infos.begin()->first, ingestion->id, std::move(projection)});
         } else {
             /* A builder uses one hold for several completed outputs. Their
                individually named ingestions remain private until this
                transaction publishes the corresponding valid paths. */
-            assert(rows.empty());
+            assert(projection.regular.empty() && projection.auxiliary.empty());
             retrySQLite<void>([&] {
                 publications.clear();
                 auto state(_state->lock());
@@ -1743,10 +1957,13 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
             });
         }
         for (auto & publication : publications)
-            std::sort(publication.rows.begin(), publication.rows.end(), [](const auto & a, const auto & b) {
-                auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
-                return c != 0 ? c < 0 : a.executable < b.executable;
-            });
+            std::sort(
+                publication.projection.regular.begin(),
+                publication.projection.regular.end(),
+                [](const auto & a, const auto & b) {
+                    auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
+                    return c != 0 ? c < 0 : a.executable < b.executable;
+                });
     }
 #ifndef _WIN32
     /* SQLite will fsync by default, but the new valid paths may not
@@ -1775,7 +1992,8 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
             } else
                 state->stmts->SetIngestionPath.use().apply("", false).apply(static_cast<int64_t>(*id)).exec();
             ingestionIds.push_back(*id);
-            insertBlobRows(*state, *id, publication.rows);
+            insertBlobRows(*state, *id, publication.projection.regular);
+            insertAuxiliaryRows(*state, *id, publication.projection.auxiliary);
         }
 
         for (auto & [_, i] : infos) {
@@ -1818,7 +2036,8 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
            before exposing any of their new candidate rows. */
         for (size_t n = 0; n < publications.size(); ++n)
             if (updated.contains(publications[n].path))
-                coalesceBlobRows(*state, publications[n].path, *hold, ingestionIds[n], publications[n].rows);
+                coalesceBlobRows(
+                    *state, publications[n].path, *hold, ingestionIds[n], publications[n].projection.regular);
         for (size_t n = 0; n < publications.size(); ++n)
             if (updated.contains(publications[n].path)) {
                 auto logical = printStorePath(publications[n].path);
@@ -1836,7 +2055,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                are reconciled. Later outputs may share this finished one. */
             for (size_t n = 0; n < publications.size(); ++n)
                 if (publications[n].path == path) {
-                    coalesceBlobRows(*state, path, *hold, ingestionIds[n], publications[n].rows);
+                    coalesceBlobRows(*state, path, *hold, ingestionIds[n], publications[n].projection.regular);
                     auto logical = printStorePath(path);
                     state->stmts->DeletePathBlobs.use().apply(logical).exec();
                     state->stmts->DeletePathIngestions.use().apply(logical).exec();
@@ -2485,16 +2704,15 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
     /* Optionally, check the content hashes (slow). */
     if (checkContents) {
 
-        /* The object files and law 4 are checked for a store whose object
-           store is its own (`ownsObjectStore`); on the overlay store the
-           merged `.objects` shows the lower store's files, which a repair
-           would unlink (a whiteout) or copy up. */
+        /* Metadata completeness is checked only where this store owns the
+           object-provider domain. An overlay may have lower paths without
+           a projection in this upper database. */
         bool ownObjects = ownsObjectStore();
         if (!ownObjects)
             printInfo("the object store is shared with the lower store: its objects are not checked here");
 
         if (ownObjects)
-            errors = objects.verify(repair) || errors;
+            errors = verifyAuxiliary(repair) || errors;
 
         printInfo("checking store hashes...");
 

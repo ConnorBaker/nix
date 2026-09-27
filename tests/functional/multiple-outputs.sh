@@ -106,7 +106,7 @@ echo "collecting garbage..."
 rm "$TEST_ROOT"/result*
 nix-store --gc --keep-derivations --keep-outputs
 nix-store --gc --print-roots
-# The object store holds no blob and no tree once nothing refers to them.
+# No ingestion lease files remain after the last path is collected.
 [[ -z "$(find "$NIX_STORE_DIR/.objects" -type f)" ]]
 rm -r "$NIX_STORE_DIR"/.objects
 rmdir "$NIX_STORE_DIR"

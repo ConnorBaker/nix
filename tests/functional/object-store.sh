@@ -13,23 +13,13 @@
 # and under --repair a corrupt object is removed and its path repaired
 # from a substituter.
 #
-# What this script asserted before and what it asserts now.  A
-# regular-file blob used to have a canonical file of the store's own
-# naming under `.objects/blobs/<xx>/<id>`, so the assertions were "the
-# file is there" and "the path's file has one link more than the paths
-# that share it".  A regular-file blob's canonical file is now a store
-# path's own -- a *holder* -- and `.objects/blobs` holds the
-# symlink-target blobs alone, which no path holds.  So: the file counts
-# under `blobs/` are the symlink targets' and the rest are the index's
-# candidate rows, read with `sqlite3`; every ingestion records its own
-# witness, including files linked from another path. Every link count loses the store's own link;
-# and where the script named an object file for a regular file it now
-# names the holder, which the index gives.  `.objects/trees` is
-# unchanged.
+# Regular bytes are held by immutable store-path files. Directory bodies and
+# symlink targets are typed, ingestion-owned AuxValues rows; distinct IDs
+# count shared values, while each receiving ingestion retains its own copy.
 
 source common.sh
 
-needLocalStore "the object store is the local store's directory"
+needLocalStore "the holder and auxiliary indexes are the local store's"
 # The index is read straight out of the store's database; `package.nix`
 # already carries `sqlite3` for `object-hash.sh`'s planted rows.
 requireSqlite3() { type -p sqlite3 > /dev/null || skipTest "sqlite3 is not on PATH"; }
@@ -37,18 +27,12 @@ requireSqlite3
 
 clearStore
 
-objects=$NIX_STORE_DIR/.objects
 db=$NIX_STATE_DIR/db/db.sqlite
 inode() { stat --format=%i "$1"; }
 nlink() { stat --format=%h "$1"; }
-# The object store's file for an identifier: git's own layout, the
-# identifier's first two hexadecimal digits a shard directory
-# (doc/lazy-store/01-specification.md section 9.10).  Only trees and the
-# symlink-target blobs have one.
-objectFile() { echo "$objects/$1/${2:0:2}/$2"; }
-# The blobs with files of the store's own naming: the symlink targets.
-blobs() { find "$objects/blobs" -mindepth 2 -maxdepth 2 | wc -l | tr -d ' '; }
-trees() { find "$objects/trees" -mindepth 2 -maxdepth 2 | wc -l | tr -d ' '; }
+# Count distinct typed values, independently of chunks and donor copies.
+auxCount() { sqlite3 "$db" "select count(distinct id) from AuxValues where kind = $1"; }
+hasAuxiliary() { sqlite3 "$db" "select exists(select 1 from AuxValues where kind = $1 and id = X'$2')"; }
 # The index: a candidate is a row naming the store path that holds it and the name under
 # that path ("" for a plain-file root).  A row whose ingestion has no path
 # is not yet (or never will be) visible. Count named candidates, including
@@ -97,21 +81,20 @@ ln -s b "$src/d/l"
 # A tree added: its files are the object store's as soon as the add
 # returns, at the root and two directories below it.
 p1=$(nix store add --mode nar "$src")
-[[ $(blobs) == 1 ]]                         # the symlink's "b" alone has a file
-[[ $(find "$objects/blobs-x" -mindepth 2 -maxdepth 2 | wc -l | tr -d ' ') == 0 ]]
+[[ $(auxCount 40960) == 1 ]]               # the symlink's "b" alone has an auxiliary value
 [[ $(blobRows 0) == 2 ]]                    # "one" and "two", held by the path's files
 [[ $(blobRows 1) == 1 ]]                    # "one" under the executable bit
 # The blobs are named by git's identifiers of the source's bytes, the
 # symlink's by its target's.  The shell computation agrees with Nix's git
 # hashing once, so the two oracles are tied.  A regular file's blob is
-# named by the index, which gives the holder; the symlink's target has a
-# file of the store's own naming.
+# named by the index, which gives the holder; the symlink target has its
+# own typed auxiliary value.
 [[ $(gitBlobId "$src/a") == "$(nix hash path --mode git --algo sha256 --base16 "$src/a")" ]]
 [[ $(holder "$(gitBlobId "$src/a")") == "$p1/a" ]]
 [[ $(holder "$(gitBlobId "$src/d/b")") == "$p1/d/b" ]]
-[[ -e $(objectFile blobs "$(gitBlobIdOfBytes b)") ]]
+[[ $(hasAuxiliary 40960 "$(gitBlobIdOfBytes b)") == 1 ]]
 [[ $(holder "$(gitBlobId "$src/x")" 1) == "$p1/x" ]]
-[[ $(trees) == 3 ]]
+[[ $(auxCount 16384) == 3 ]]
 [[ $(nlink "$p1/a") == 2 ]]                 # a and d/e/c; the holder is a itself
 [[ $(inode "$p1/d/e/c") == $(inode "$p1/a") ]]
 [[ $(nlink "$p1/d/b") == 1 ]]
@@ -130,19 +113,18 @@ cmp "$p1/x" "$p1/a"
 [[ ! -x "$p1/a" ]]
 [[ $(stat --format=%a "$p1/x") == 555 ]]
 [[ $(stat --format=%a "$p1/a") == 444 ]]
-for f in "$objects/blobs/"*/*; do [[ $(stat --format=%a "$f") == 444 ]]; done
 
 # The identifiers are git's under SHA-256: a directory's object hash is
 # its tree's, and the object store holds that tree.
 rootId=$(nix hash path --mode git --algo sha256 --base16 "$p1")
 [[ $(objectHash "$p1") == "git:sha256:$rootId" ]]
-[[ -e $(objectFile trees "$rootId") ]]
+[[ $(hasAuxiliary 16384 "$rootId") == 1 ]]
 
 # A changed tree: only the changed file's blob is added; the rest share
 # the first tree's inodes, two directories down among them.
 echo three > "$src/d/b"
 p2=$(nix store add --mode nar "$src")
-[[ $(blobs) == 1 ]]                         # still the symlink's target alone
+[[ $(auxCount 40960) == 1 ]]               # still one distinct symlink target
 [[ $(blobRows 0) == 4 ]]                    # two candidates from each ingestion
 [[ $(blobRows 1) == 2 ]]
 [[ $(holder "$(gitBlobId "$src/d/b")") == "$p2/d/b" ]]
@@ -152,33 +134,25 @@ p2=$(nix store add --mode nar "$src")
 [[ $(nlink "$p2/a") == 4 ]]
 [[ $(nlink "$p2/d/b") == 1 ]]
 [[ $(cat "$p2/d/b") == three ]]
-[[ $(trees) == 5 ]]                         # p2's root and d differ, e is shared
+[[ $(auxCount 16384) == 5 ]]               # p2's root and d differ, e is shared
+# Each ingestion owns all three tree bodies and the symlink target,
+# including the unchanged subtree, independently of the other donor.
+for path in "$p1" "$p2"; do
+    [[ $(sqlite3 "$db" "select count(*) from AuxValues a join Ingestions i on i.id = a.ingestion where i.path = '$path' and a.chunk = 0") == 4 ]]
+done
 
-# The collector frees a deleted path's objects and no others: the blobs
-# with files of their own by their link count, the trees by reachability
-# from the valid paths' object hashes, and a regular-file blob with its
-# holder's path -- its row is stale once that path is invalid, and the
-# stale-row sweep removes it (schema.sql).  No roots directory: the
-# database is the root record.  `nix store delete` alone sweeps nothing
-# (gc.cc: only a whole-store collection pays the pass over the object
-# store); the objects and the rows go at the collection.
+# A whole-store collection removes stale ingestion projections; each live
+# path retains its own regular witnesses and auxiliary bodies. Specific
+# deletion leaves those rows until collection, without scanning all rows.
 nix-store --add-root "$TEST_ROOT/root1" --indirect -r "$p1" > /dev/null
-# `--quiet` takes the new CLI from `info` (stderr a file) to `notice`, the
-# level it runs at on a terminal (main.cc), where the note must reach the
-# interactive user it is for (before, it was printed at
-# `info` and only a redirected stderr showed it).
 nix store delete --quiet "$p2" 2> "$TEST_ROOT/delete.log"
-# The freed figure counts p2's files whether or not the blob still holds
-# them (physical accounting, 01 section 10); the report says when they go.
-grepQuiet "reclaimed at the next \`nix-store --gc\`" "$TEST_ROOT/delete.log"
-[[ $(blobs) == 1 ]]
-[[ $(trees) == 5 ]]
+[[ $(auxCount 40960) == 1 ]]
+[[ $(auxCount 16384) == 5 ]]
 [[ $(blobRows 0) == 4 ]]                    # p2's candidates are stale, not yet removed
 nix-store --gc
-[[ ! -e $objects/roots ]]
-[[ -e $(objectFile trees "$rootId") ]]
-[[ $(blobs) == 1 ]]
-[[ $(trees) == 3 ]]
+[[ $(hasAuxiliary 16384 "$rootId") == 1 ]]
+[[ $(auxCount 40960) == 1 ]]
+[[ $(auxCount 16384) == 3 ]]
 # "three" went with the path that held it; "one" and "two" are p1's own
 # files and their rows name p1.
 [[ $(blobRows 0) == 2 ]]
@@ -194,14 +168,14 @@ p3=$(nix store add --mode nar "$src")
 [[ $(inode "$p3/a") == $(inode "$p1/a") ]]
 [[ $(nlink "$p1/a") == 4 ]]
 [[ $(cat "$p3/d/b") == three ]]
-[[ $(blobs) == 1 ]]
+[[ $(auxCount 40960) == 1 ]]
 [[ $(blobRows 0) == 4 ]]                    # p3 records both its linked and written files
 [[ $(blobRows 1) == 2 ]]
 [[ $(holder "$(gitBlobIdOfBytes $'three\n')") == "$p3/d/b" ]]
-[[ $(trees) == 5 ]]
+[[ $(auxCount 16384) == 5 ]]
 p3Id=$(nix hash path --mode git --algo sha256 --base16 "$p3")
 [[ $(objectHash "$p3") == "git:sha256:$p3Id" ]]
-[[ -e $(objectFile trees "$p3Id") ]]
+[[ $(hasAuxiliary 16384 "$p3Id") == 1 ]]
 
 # `nix-store --optimise` is the migration of paths an older Nix wrote:
 # here there are none, so it links no file, and it removes the legacy
@@ -216,18 +190,18 @@ optimiseLinksNothing
 [[ ! -e $NIX_STORE_DIR/.links ]]
 [[ $(nlink "$p1/a") == 4 ]]
 [[ $(inode "$p3/a") == $(inode "$p1/a") ]]
-[[ -e $(objectFile trees "$p3Id") ]]
-[[ $(blobs) == 1 ]]
+[[ $(hasAuxiliary 16384 "$p3Id") == 1 ]]
+[[ $(auxCount 40960) == 1 ]]
 [[ $(blobRows 0) == 4 ]]                    # the same two plain keys in each of two paths
 [[ $(blobRows 1) == 2 ]]
-[[ $(trees) == 5 ]]
+[[ $(auxCount 16384) == 5 ]]
 optimiseLinksNothing
 [[ ! -e $NIX_STORE_DIR/.links ]]
 [[ $(nlink "$p1/a") == 4 ]]
-[[ $(blobs) == 1 ]]
+[[ $(auxCount 40960) == 1 ]]
 [[ $(blobRows 0) == 4 ]]
 [[ $(blobRows 1) == 2 ]]
-[[ $(trees) == 5 ]]
+[[ $(auxCount 16384) == 5 ]]
 
 # `nix-store --optimise` reconstructs missing cache entries from valid
 # paths. Remove every witness of one blob by hand; the next walk enters
@@ -248,7 +222,7 @@ optimiseLinksNothing
 echo five > "$src/d/b"
 p4=$(nix store add --mode nar --option nar-buffer-size 0 "$src")
 [[ $(inode "$p4/a") == $(inode "$p3/a") ]]
-[[ -e $(objectFile trees "$(nix hash path --mode git --algo sha256 --base16 "$p4")") ]]
+[[ $(hasAuxiliary 16384 "$(nix hash path --mode git --algo sha256 --base16 "$p4")") == 1 ]]
 
 # Substitution from a binary cache comes back through the object store.
 nix copy --to "file://$TEST_ROOT/cache" "$p1"
@@ -257,7 +231,7 @@ nix store delete "$p1"
 [[ ! -e $p1 ]]
 nix copy --from "file://$TEST_ROOT/cache" --no-check-sigs "$p1"
 [[ $(objectHash "$p1") == "git:sha256:$rootId" ]]
-[[ -e $(objectFile trees "$rootId") ]]
+[[ $(hasAuxiliary 16384 "$rootId") == 1 ]]
 # p3 retained its own witnesses when it linked p1's files. Deleting p1
 # therefore preserves sharing: substitution links the surviving inode
 # immediately, for both executable modes and repeated aliases.
@@ -269,17 +243,12 @@ optimiseLinksNothing
 [[ $(inode "$p1/d/e/c") == $(inode "$p3/a") ]]
 [[ $(inode "$p1/x") == $(inode "$p3/x") ]]
 [[ $(objectHash "$p1") == "git:sha256:$rootId" ]]
-[[ -e $(objectFile trees "$rootId") ]]
+[[ $(hasAuxiliary 16384 "$rootId") == 1 ]]
 
-# Verification checks the objects' bytes against their identifiers and a
-# path's files against its object hash.  One corruption of each kind that
-# still exists: p1's `d/b` ("two"), which is that blob's *holder* -- a
-# valid path's own file, so its corruption is the path's and the verifier
-# reports the path and repairs it from a substituter, never unlinking the
-# file itself (`08` K2); the symlink's target blob, which has a file of
-# the store's own naming and is reported and removed as an object; and
-# p1's root tree.  Before, "two" was an object file of the store's naming
-# and the first case was the second's.
+# Verification checks physical bytes and typed auxiliary bodies. Corrupt
+# p1's regular holder without unlinking it, and corrupt every incarnation
+# of one symlink target and one tree. Reporting preserves the bad rows;
+# repair discards them and reconstructs the values from valid paths.
 twoId=$(gitBlobIdOfBytes $'two\n')
 bId=$(gitBlobIdOfBytes b)
 [[ $(holder "$twoId") == "$p1/d/b" ]]
@@ -287,25 +256,26 @@ bId=$(gitBlobIdOfBytes b)
 nix-store --verify --check-contents
 corruptFirstByte "$p1/d/b"
 [[ $(cat "$p1/d/b") == Xwo ]]               # the corruption is the path's
-corruptFirstByte "$(objectFile blobs "$bId")"
-corruptFirstByte "$(objectFile trees "$rootId")"
+sqlite3 "$db" "update AuxValues set body = cast(X'58' || substr(body, 2) as blob)
+    where chunk = 0 and ((kind = 40960 and id = X'$bId') or (kind = 16384 and id = X'$rootId'))"
 verifyOut=$(expectStderr 1 nix-store --verify --check-contents)
-echo "$verifyOut" | grepQuiet "object \".*/blobs/.*/$bId\" was modified"
-echo "$verifyOut" | grepQuiet "tree object \".*/trees/.*/$rootId\" was modified"
+echo "$verifyOut" | grepQuiet "auxiliary cache body in ingestion .* was modified or has an incomplete chunk sequence"
 echo "$verifyOut" | grepQuiet -F "path '$p1' was modified"
-[[ -e $(objectFile blobs "$bId") ]]                # reported, not removed, without --repair
-[[ -e $(objectFile trees "$rootId") ]]
+# Both corrupted typed keys remain present after reporting.
+for key in "40960 $bId" "16384 $rootId"; do
+    read -r kind id <<< "$key"
+    [[ $(sqlite3 "$db" "select count(*) from AuxValues where kind = $kind and id = X'$id' and chunk = 0 and substr(body, 1, 1) = X'58'") -gt 0 ]]
+done
 [[ $(cat "$p1/d/b") == Xwo ]]
 nix-store --verify --check-contents --repair \
     --substituters "file://$TEST_ROOT/cache" --no-require-sigs 2> "$TEST_ROOT/repair.log"
-grepQuiet "removed object \".*/blobs/.*/$bId\"" "$TEST_ROOT/repair.log"
-grepQuiet "removed tree object \".*/trees/.*/$rootId\"" "$TEST_ROOT/repair.log"
+grepQuiet "auxiliary cache body in ingestion .* was modified or has an incomplete chunk sequence" "$TEST_ROOT/repair.log"
 nix-store --verify --check-contents
 [[ $(cat "$p1/d/b") == two ]]
 [[ $(holder "$twoId") == "$p1/d/b" ]]       # the repaired file is the blob's holder
 [[ $(nlink "$p1/d/b") == 1 ]]
-[[ -e $(objectFile blobs "$bId") ]]
-[[ -e $(objectFile trees "$rootId") ]]
+[[ $(hasAuxiliary 40960 "$bId") == 1 ]]
+[[ $(hasAuxiliary 16384 "$rootId") == 1 ]]
 [[ $(objectHash "$p1") == "git:sha256:$rootId" ]]
 
 # The boundaries of a regular file: an empty file and a one-byte executable

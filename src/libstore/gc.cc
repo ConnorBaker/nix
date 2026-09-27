@@ -936,19 +936,6 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         return;
     }
 
-    /* The figure a specific delete reports counts a file at two links as
-       freed on the assumption that the other link is the object store's
-       (`deletePath`, unix/file-system.cc); no sweep follows here (01 §10,
-       *The object store is swept on whole-store collections only*), so
-       those bytes are freed at the next whole-store collection.  The
-       accounting stays physical (01 §10, *`max-free` counts the bytes a
-       deletion frees on the disk*); the report says when the bytes go. */
-    if (options.action == GCOptions::gcDeleteSpecific && results.bytesFreed)
-        /* At `notice`: the new CLI runs at that level on a terminal
-           (main.cc), and the note is for the interactive user who reads
-           the freed figure `printFreed` writes to stdout. */
-        notice("note: bytes the deleted paths shared with the object store are reclaimed at the next `nix-store --gc`");
-
     if (options.action == GCOptions::gcDeleteDead) {
         /* An older Nix's `.links` (01 §10, *the collector removes a legacy
            `.links` directory*): master unlinked its dead entries on every
@@ -960,11 +947,9 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         if (ownsObjectStore())
             removeLegacyLinks();
 
-        /* The object store's sweep (01 §9.10, "Collection"; `sweep` in
-           git-object-store.hh), on a whole-store collection alone (01 §10,
-           *The object store is swept on whole-store collections only*): its
-           cost is the store's, which `nix store delete` of one path must not
-           pay. */
+        /* Clean dead ingestion leases, legacy auxiliary files and stale
+           candidate/value rows on whole-store collections alone. Deleting
+           one path does not scan this store-wide representation. */
         sweepObjects();
     }
 
@@ -975,39 +960,25 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 void LocalStore::sweepObjects()
 {
     sweepObjectStore();
-    /* After the objects' sweep, not before: that sweep removes the holds of
-       dead ingestions first, and the stale-row rule reads a surviving hold
-       as a live ingestion (schema.sql).  Here and not in
-       `sweepObjectStore`, which subclasses override: the rows are this
-       store's own database's whatever its object store is, so a store that
-       owns a part of an object store (the overlay's upper layer) sweeps
-       exactly the same rows as one that owns the whole of it. */
+    /* Cleanup removes dead ingestion leases first: a surviving lease keeps
+       its projection alive. Rows belong to this store's database, including
+       the overlay's, so the nonvirtual operation cleans both regular
+       candidates and auxiliary values after the layer-specific cleanup. */
     sweepStaleBlobRows();
 }
 
 void LocalStore::sweepObjectStore()
 {
-    reportSweep(
-        objects.sweep([&](fun<void(const ObjectHash &)> live) { return forEachValidObjectHash(std::move(live)); }));
+    reportSweep(objects.sweep());
 }
 
 void LocalStore::reportSweep(const GitObjectStore::SweepStats & swept)
 {
-    /* Two commands migrate rows (`nix store migrate`, and `--optimise`,
-       which enters the paths too); a row neither can migrate -- its
-       path modified or its files missing (`walkOldRow`) -- needs the
-       verifier: `--check-contents --repair` for the former, plain
-       `--verify`, which removes the row, for the latter. */
-    if (swept.unmigrated)
-        printInfo(
-            "note: %d paths not yet migrated to the object hash; the object store was not swept. "
-            "Run `nix store migrate` or `nix-store --optimise`; a path they report as modified needs "
-            "`nix-store --verify --check-contents --repair`, one whose files are missing `nix-store --verify`.",
-            swept.unmigrated);
     if (swept.treesRemoved || swept.blobsRemoved)
-        printInfo("removed %d unreferenced objects (%d trees)", swept.blobsRemoved, swept.treesRemoved);
-    if (swept.blobsKept)
-        printInfo("note: the object store is currently saving %s", renderSize(swept.sharedBytes));
+        printInfo(
+            "removed %d legacy auxiliary files (%d trees)",
+            swept.treesRemoved + swept.blobsRemoved,
+            swept.treesRemoved);
 }
 
 void LocalStore::autoGC(bool sync)

@@ -174,30 +174,6 @@ static void _deletePath(
         return;
     auto & st = *st_;
 
-    if (!S_ISDIR(st.st_mode)) {
-        /* We are about to delete a file. Will it likely free space? */
-
-        switch (st.st_nlink) {
-        /* Yes: last link. */
-        case 1:
-            bytesFreed += st.st_size;
-            break;
-        /* Maybe: yes, if this is one of the object store's hard links
-           (the file and the blob's). Instead of checking for real let's
-           assume it is and space will be freed.
-
-           In worst case we will double count on freed space for files
-           with exactly two hardlinks that are not the object store's.
-         */
-        case 2:
-            bytesFreed += st.st_size;
-            break;
-        /* No: 3+ links. */
-        default:
-            break;
-        }
-    }
-
     if (S_ISDIR(st.st_mode)) {
         /* Make the directory accessible. */
         const auto PERM_MASK = S_IRUSR | S_IWUSR | S_IXUSR;
@@ -242,7 +218,11 @@ static void _deletePath(
             else
                 ignoreExceptionExceptInterrupt();
         }
-    }
+    } else if (!S_ISDIR(st.st_mode) && st.st_nlink == 1)
+        /* Estimate bytes removed at the observed last link. Open descriptors
+           and concurrent changes can delay reclamation; this is not an exact
+           measure of freed disk space. */
+        bytesFreed += st.st_size;
 }
 
 static void _deletePath(const std::filesystem::path & path, uint64_t & bytesFreed MOUNTEDPATHS_PARAM)

@@ -85,3 +85,21 @@ create table if not exists Blobs (
 create index if not exists IndexBlobsIngestion on Blobs(ingestion);
 
 create index if not exists IndexIngestionsPath on Ingestions(path, hold);
+
+-- Derived directory bodies and symlink targets, owned by the same completed
+-- ingestion as its regular-holder projection. A body is the concatenation of
+-- contiguous zero-based chunks; the empty value has one empty chunk. Reads
+-- acquire one incarnation in one statement before any destination callback.
+-- A reused value is copied into the receiving projection, so removing its
+-- donor never removes the receiver's value. Unlike a physical holder, bytes
+-- are independently verified and eligible before ValidPaths publication.
+create table if not exists AuxValues (
+    kind      integer not null check(kind in (16384, 40960)), -- Directory or Symlink
+    id        blob not null check(typeof(id) = 'blob' and length(id) = 32),
+    ingestion integer not null references Ingestions(id) on delete cascade,
+    chunk     integer not null check(chunk >= 0),
+    body      blob not null,
+    primary key(kind, id, ingestion, chunk)
+) without rowid;
+
+create index if not exists IndexAuxValuesIngestion on AuxValues(ingestion);

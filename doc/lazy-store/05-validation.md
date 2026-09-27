@@ -1,6 +1,6 @@
 # How this branch is validated
 
-The measurements below retain the history of earlier revisions. The current Linux implementation, finite-domain checks and Nixpkgs comparison are recorded in [09-performance.md](09-performance.md). The overlay failures described in the earlier record are resolved: all twelve tests passed on 2026-09-21 with real overlay mounts.
+The commands, measurements, negative controls and representation-specific test names below retain their tested revisions. In particular, loose auxiliary files and mark-graph tests describe the former representation, not validation of ingestion-owned SQL values. Current laws and representation obligations are in `01` §9.10 and `08`; completed gates and performance are recorded in [09-performance.md](09-performance.md). Historical overlay failures and subsequent real-mount passes remain evidence for those revisions only.
 
 What the checks are for, which suites exist and how each is run, what the differential harness compares against master, which mutations must make which tests fail, what each of the two platforms finds, which measurements stand and by what command, and what is owed. A number here carries its command; a claim without a test that pins it is marked so.
 

@@ -13,7 +13,6 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
-#include <array>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -23,27 +22,20 @@
 #include <utility>
 #include <vector>
 #include <memory>
-#include <mutex>
 
 #include <sys/stat.h>
 
 namespace nix {
 
 /**
- * The local store's object store (doc/lazy-store/01-specification.md, section 9.10):
- * regular-file contents live in indexed store-path holders. Auxiliary bodies live under `dir`:
- * `blobs/<xx>/<id>` (0444), `blobs-x/<xx>/<id>` (0555), `trees/<xx>/<id>`; `tmp/` holds leases and temporaries.
- * `<xx>` is the identifier's first byte in hexadecimal -- git's own
- * layout, 256 shards under each kind -- so that no one directory holds every object of a large
- * store and writes into different shards do not contend for one directory's lock.
- * Under `_WIN32` the object store shares nothing: `link` is false, `place` nullopt, `blobInodes()` empty.
+ * Regular bytes are represented by indexed files in store-path holders.
+ * Directory bodies and symlink targets are owned bytes in an ingestion's
+ * projection, published with that projection in the local-store database.
+ * `dir/tmp` contains leases and temporary regular-file links only. Old
+ * auxiliary files are ignored by readers and removed by a bounded sweep.
  */
 struct GitObjectStore
 {
-private:
-    struct AuxiliaryLock;
-    std::shared_ptr<AuxiliaryLock> auxiliaryLock;
-
 public:
     static constexpr HashAlgorithm hashAlgo = merkle::hashAlgo;
 
@@ -54,10 +46,8 @@ public:
      * a **holder** -- and this is the store's record of where it is: one
      * candidate row per (blob, mode, ingestion) in the store's database
      * (`schema.sql`, `Blobs`). Written and reused files both retain a witness.
-     * Regular-file ingestion publishes no auxiliary blob copy; symlink-target
-     * blobs and tree bodies still need auxiliary files. Earlier layouts may
-     * leave regular blobs there. Claiming a first holder needs a row, not an
-     * auxiliary `linkat`; repeated occurrences reuse the holder.
+     * Regular-file ingestion publishes no auxiliary blob copy. Claiming a
+     * first holder needs a row; repeated occurrences reuse the holder.
      *
      * When a row is written, when it becomes true, and when it goes.  The
      * rows are staged in the hold while copying and inserted when the path
@@ -71,9 +61,8 @@ public:
      * judge it -- `link`, which finds the holder gone or not what the row
      * says and forgets the row, and `LocalStore::sweepStaleBlobRows`,
      * which removes every stale row under the GC lock with the sweep,
-     * keeping the rows of an ingestion still in flight (its hold still
-     * under `tmp/`) exactly as the sweep keeps that ingestion's objects
-     * (`08` K16).
+     * keeping the projection of an ingestion still in flight (its lease
+     * still under `tmp/`).
      */
     struct Holder
     {
@@ -97,10 +86,17 @@ public:
         }
     };
 
+    /** One owned auxiliary value, addressed by a full SHA-256 Directory or Symlink hash. */
+    struct Auxiliary
+    {
+        merkle::TreeEntry entry;
+        std::string body;
+    };
+
     /**
      * The index, supplied by the `LocalStore` that owns this object store
-     * (null in a bare object store, which then holds no regular-file blob
-     * and misses every lookup).
+     * (null in a bare object store, which stages pending projections but
+     * has no committed values and misses every lookup).
      */
     struct Index
     {
@@ -112,19 +108,17 @@ public:
         /** The first registered candidate's inode for each (id, mode),
          * with its identifier, for the optimiser's shortcut (`blobInodes`). */
         std::function<void(boost::unordered_flat_map<ino_t, Hash> &)> inodes;
+        /** A committed owned body whose framed hash matches the typed address.
+         * The provider releases its statement/transaction before returning;
+         * missing or corrupt candidates do not escape as usable bytes. */
+        std::function<std::optional<std::string>(const merkle::TreeEntry &)> readAuxiliary;
     };
 
     const Index * index = nullptr;
 
     const std::filesystem::path dir;
 
-    /** Whether object files (and their directory) are fsynced when written. */
-    const bool fsync;
-
-    /** All users of this object namespace must use the same lock file.
-     * LocalStore supplies one outside its possibly remounted store directory. */
-    explicit GitObjectStore(
-        std::filesystem::path dir, bool fsync = false, std::filesystem::path auxiliaryLockFile = {});
+    explicit GitObjectStore(std::filesystem::path dir);
 
     /**
      * Object-store work, counted only while a test asks for it
@@ -136,9 +130,9 @@ public:
      */
     struct Counters
     {
-        /** Tree bodies read (`readTree`: the sweep, `readVerifiedTree`). */
+        /** Committed directory bodies requested. */
         uint64_t treesRead = 0;
-        /** Metadata probes of holder candidates, acquired links and swept auxiliary blobs. */
+        /** Metadata probes of holder candidates and acquired regular-file links. */
         uint64_t blobsStatted = 0;
     };
 
@@ -147,16 +141,6 @@ public:
      * so that the counting costs one null check per object touched.
      */
     Counters * counters = nullptr;
-
-    /**
-     * Called with an object file's temporary path at the moment of its
-     * fsync, before it is linked into place, so that what a crash would
-     * leave -- the completed bytes and exact read-only mode before the
-     * flush covers them -- can be observed there (`05-validation.md` section 7).
-     * Empty in every build but a test's; checked for emptiness, so it
-     * costs nothing unset.
-     */
-    std::function<void(const std::filesystem::path &)> atFsync;
 
     /**
      * When set and true for the file at `where`, `place` declines a new
@@ -188,58 +172,13 @@ public:
      */
     std::function<bool(const std::filesystem::path &)> failHoldRemoval;
 
-    /**
-     * Make the four directories: at a writable store's open and at the
-     * start of `sweep` and `blobInodes`. The sweep enumerates them; the
-     * inode query uses the database. A directory removed after the open
-     * must not abort a collection. The 256 shards
-     * under each of the three kinds are *not* made here: a shard is made
-     * by the first auxiliary write into it (`putObject`, on
-     * the `ENOENT` its publication link gets), so that opening
-     * a writable store costs four `mkdir`s and not 772, and a store holds
-     * only the shards it has used. Auxiliary readers treat their absence
-     * as emptiness; regular-file sharing consults the holder index.
-     */
+    /** Ensure the temporary regular-link and ingestion-lease namespace exists. */
     void createDirectories() const;
-
-    /**
-     * Every object file under a kind's directory `kindDir` (`blobs`,
-     * `blobs-x` or `trees` of some object store): the files in its shard
-     * directories, and any file lying directly in it -- the flat layout an
-     * earlier, unreleased build of this branch wrote, enumerated so that
-     * the sweep and the verifier judge it as they judge a sharded one (01
-     * §9.10, *Where the objects live*). An absent `kindDir` is empty; an
-     * existing one must be a real directory. Shard symlinks are leaves,
-     * never traversed. A directory occupying a flat object identifier is
-     * also a leaf for verification; unrelated directories are passed over.
-     */
-    static void eachObjectFile(const std::filesystem::path & kindDir, fun<void(const std::filesystem::path &)> f);
-
-    /**
-     * Check the auxiliary regular-byte files against their names. Repair
-     * rechecks each mismatch under the exclusive namespace lock before
-     * removing it, so a concurrent sound replacement is preserved. Returns
-     * whether an unrepaired error remains. Store paths are checked by the
-     * caller, which also determines whether this object store is its own.
-     */
-    bool verify(RepairFlag repair);
 
     /** The identifier of the blob a regular file's bytes are. */
     static Hash blobIdOfFile(const std::filesystem::path & path);
 
     static std::string idString(const Hash & id);
-
-    std::filesystem::path blobFile(const Hash & id, bool executable) const;
-
-    std::filesystem::path treeFile(const Hash & id) const;
-
-    /**
-     * The same auxiliary names as owned strings. Regular-file holder
-     * lookup needs neither name.
-     */
-    std::string blobFileName(const Hash & id, bool executable) const;
-
-    std::string treeFileName(const Hash & id) const;
 
     /**
      * The index's holder for the blob under a mode when it is still what
@@ -255,7 +194,7 @@ public:
 
     /**
      * A fresh name under `tmp/` for a temporary of the given kind
-     * (`link`, `object`), carrying the second it was made, which is the
+     * (`link`, `coalesce`), carrying the second it was made, which is the
      * age the sweep goes by: a temporary link's inode is a blob's.
      */
     std::filesystem::path tempPath(std::string_view kind) const;
@@ -329,21 +268,12 @@ public:
         bool looked = true);
 
     /**
-     * An ingestion's hold on auxiliary objects it writes or reuses (01 §9.10,
-     * "Collection"; `08` K16): a locked directory under `tmp/` with
-     * protecting links, from the object's write until the hold is
-     * released -- after the path's registration, or on the ingestion's
-     * failure, when it goes out of scope.  The link's name records the
-     * auxiliary address, so repair may replace its inode without losing
-     * the hold's protection. A hold whose lock is free is either empty --
-     * its maker between the `mkdir` and the `flock`, which is why the
-     * directory is made empty and filled under its lock -- or a dead
-     * process's, and the sweep removes it with its links before it judges
-     * the objects, counting one it cannot remove and going on.  The same meaning a locked `tmp-*` directory in the
-     * store has for files not yet at their name (`createTempDirInStore`,
-     * `gc.cc`), and a temp root for a path -- a temp root protects no
-     * object; this does.  Nothing waits on a hold: the sweep only tries
-     * its lock. Move-only; the last view releases the physical hold.
+     * A private pending projection and a shared ingestion lease. The lease
+     * directory's lock tells GC that completed-but-unpublished SQL rows still
+     * belong to an in-flight ingestion. Its lifetime also covers regular-file
+     * coalescing pins. Auxiliary bytes are owned in memory, not by hard links.
+     * Nothing waits on a lease: GC only tries its lock. Own-row views share
+     * the physical lease but never pending values or ingestion identity.
      */
     class Hold
     {
@@ -351,18 +281,13 @@ public:
         /* Drops the lock as a crash would (src/libstore-tests/local-store.cc). */
         friend class LocalStoreObjectsTest;
 
-        /* The physical hold is shared; pending rows belong to each view. */
+        /* The physical lease is shared; pending values belong to each view. */
         struct Lease
         {
             std::filesystem::path dir;
             AutoCloseFD fd;
-            std::shared_ptr<AuxiliaryLock> auxiliaryLock;
-            std::array<std::once_flag, 3 * 256> shards;
 
-            Lease(
-                const std::filesystem::path & tmp,
-                const std::function<void()> & atHoldMade,
-                std::shared_ptr<AuxiliaryLock> auxiliaryLock);
+            Lease(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade);
             ~Lease();
         };
     public:
@@ -372,31 +297,15 @@ public:
     private:
         std::unique_ptr<Pending> pending;
         std::shared_ptr<Lease> lease;
-        Hold(
-            const std::filesystem::path & tmp,
-            const std::function<void()> & atHoldMade,
-            std::shared_ptr<AuxiliaryLock> auxiliaryLock);
+        Hold(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade);
         explicit Hold(std::shared_ptr<Lease> lease);
-
-        struct Names
-        {
-            std::filesystem::path::string_type object;
-            std::filesystem::path::string_type held;
-        };
-
-        Names namesFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
-        bool linkObject(
-            const std::filesystem::path::string_type & object, const std::filesystem::path::string_type & held) const;
-        bool holdObject(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
-        void
-        writeObjectFile(const GitObjectStore & objects, const merkle::TreeEntry & object, std::string_view bytes) const;
 
     public:
         /**
-         * A hold over the same directory with **rows of its own**.
+         * A hold over the same directory with a projection of its own.
          *
-         * A batch holds its objects once -- one locked directory for the
-         * whole of `addMultipleToStore` (K16) -- but each of its paths
+         * A batch shares one locked lease directory for the whole of
+         * `addMultipleToStore` (K16), but each of its paths
          * registers separately and is therefore its own ingestion: its own
          * `Ingestions` row, its own root (a row's name is relative to the
          * path that holds it, `schema.sql`), and its own pending projection.
@@ -406,7 +315,8 @@ public:
          * agreeing -- one with the wrong bytes.
          *
          * The directory and its lock survive until the last view is
-         * released. Rows and ingestion identity remain private to each view.
+         * released. Regular witnesses, auxiliary bytes and ingestion identity
+         * remain private to each view.
          */
         Hold ownRows() const;
 
@@ -440,17 +350,28 @@ public:
          * a locked temporary in the store for a route that moves its path
          * into place, the real path for one that writes there.  `addRow`
          * makes each row's name relative to it. Clears the preceding path's
-         * pending rows and holders; no walking worker may still use them.
+         * pending projection; no walking worker may still use it.
          */
         void setRoot(std::filesystem::path root) const;
 
         /** The root, for turning a row's name back into a path to link from. */
         const std::filesystem::path & root() const;
 
-        /** Take the completed path's rows for its publication transaction.
-         * All workers using these rows must have completed. This retires the
-         * pending-holder map; the returned rows own their names. */
-        std::vector<Row> takeRows() const;
+        /** The complete projection transferred to one publication transaction. */
+        struct Projection
+        {
+            std::vector<Row> regular;
+            std::vector<Auxiliary> auxiliary;
+        };
+
+        /** All walking workers have joined. Reserve both result vectors before
+         * consuming the pending relation; allocation failure leaves it intact. */
+        Projection takeProjection() const;
+
+        /** Stage an owned directory body or symlink target. Concurrent duplicate
+         * typed addresses retain the first completed value. Noncanonical modes,
+         * algorithms and hash widths are rejected before touching the map. */
+        void addAuxiliary(Auxiliary object) const;
 
         /**
          * Per-path state created by `LocalStore::beginIngestion`; absent
@@ -484,60 +405,21 @@ public:
         Hold(Hold &&);
         Hold & operator=(Hold &&) = delete;
         ~Hold();
-        /**
-         * Where this hold claims `object` in `objects`: directory entries
-         * use `trees`, executable entries use `blobs-x`, and regular or
-         * symlink entries use `blobs`. The name is
-         * `<hold>/<kind>/<shard>/<id>`. A newly published object can
-         * instead be protected by its retained `<id>.tmp-*` link. Regular
-         * files use their store-path holders, not these auxiliary links.
-         * Shards are made on demand.
-         */
-        std::filesystem::path linkFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const;
     };
 
-    /**
-     * A fresh hold: the directory made empty and locked, retried under a
-     * new name if the sweep removed it before the lock was taken. Auxiliary
-     * kind/shard directories are made only when an object needs them.
-     */
+    /** A fresh empty locked lease, retried if GC removed it before locking. */
     Hold hold() const;
 
-    /** Write the auxiliary entry's bytes, when absent, and hold its address. */
-    void putObject(const merkle::TreeEntry & object, std::string_view bytes, const Hold & hold);
-
-    /**
-     * Write the synthetic root tree of an executable or symlink root
-     * (`merkle::syntheticRootTree`), through which its blob is reachable,
-     * and hold it; nothing for a directory or a plain file.
-     */
+    /** Stage the synthetic directory body of an executable or symlink root. */
     void putRootTree(const merkle::TreeEntry & root, const Hold & hold);
 
-    /**
-     * Hold an object the store already has, for a path made from it (the
-     * second route): false when the store lacks it -- swept meanwhile, or
-     * never there -- and the caller falls back.
-     */
-    bool holdObject(const merkle::TreeEntry & object, const Hold & hold) const;
+    /** Read an owned, framed-hash-verified committed Directory/Symlink body.
+     * The body remains owned by the caller across source callbacks and GC. */
+    std::optional<std::string> readAuxiliary(const merkle::TreeEntry & entry) const;
 
-    /** Auxiliary blob bytes, absent when missing; nonregular occupants are
-     * rejected without following symlinks or waiting for a FIFO writer.
-     * The caller checks the bytes against the expected identifier. */
-    std::optional<std::string> readBlob(const Hash & id, bool executable) const;
-
-    /**
-     * The entries of the tree `id` for materialising a path from the
-     * store's objects (01 §9.10, the second route): the body read and
-     * checked against its name, as the sweep checks it (law 4: "a tree
-     * body is verified against its identifier when it is read to
-     * materialise a path").  Nullopt when the store lacks the tree, and
-     * -- refused, with a warning naming the repair -- when the object is
-     * not a regular file, its body does not hash to its name or does not
-     * parse; the body is left for
-     * `--verify --check-contents --repair`, since removing it would let
-     * the sweep take what it names (K6).
-     */
-    std::optional<merkle::Tree> readVerifiedTree(const Hash & id) const;
+    /** Parse and check canonical tree encoding. The caller has already checked
+     * the framed hash. Throws Error naming the address for a malformed body. */
+    static merkle::Tree parseTreeBody(const Hash & id, std::string_view body);
 
     /**
      * Inode-to-identifier hints from registered holder rows. Before skipping
@@ -550,105 +432,25 @@ public:
 
     struct SweepStats
     {
-        uint64_t treesRemoved = 0, blobsRemoved = 0, blobsKept = 0;
-        /** Sum of size * (nlink - 2) for kept auxiliary blobs with at least two links. */
-        uint64_t sharedBytes = 0;
-        /**
-         * Valid paths whose object hash the enumeration could not give
-         * (rows older than schema 11); when non-zero the sweep removed no
-         * tree and no blob.
-         */
-        uint64_t unmigrated = 0;
-        /**
-         * Tree files whose body does not hash to their name or does not
-         * parse (a crash left them short); when non-zero the sweep
-         * removed no tree and no blob, and said to run
-         * `nix-store --verify --check-contents --repair`.
-         */
-        uint64_t corruptTrees = 0;
-        /**
-         * Live roots -- valid paths -- whose object the store lacks: a row
-         * migrated by the walk or by `--load-db`, or a path `nix-store
-         * --optimise` is entering while this sweep runs (its root live
-         * before its trees, which its hold keeps).  Such a root keeps
-         * nothing beneath it -- trees are written bottom-up and swept as a
-         * set, and a path's regular-file blobs are held by its own links --
-         * so the removal phase runs; the count is reported with
-         * `nix-store --optimise` named.  Trees a present tree names are
-         * counted apart (`missingSubtrees`).
-         */
-        uint64_t unentered = 0;
-        /**
-         * Trees a present tree names that the store lacks (an interrupted
-         * repair, `ENOSPC` on one tree): counted apart from the roots, and
-         * reported with them.
-         */
-        uint64_t missingSubtrees = 0;
-        /**
-         * Unreachable tree entries kept because held, multiply linked, or
-         * occupied by a directory; and holds whose lock was busy or whose
-         * removal failed.
-         */
-        uint64_t treesHeld = 0, holds = 0;
+        uint64_t treesRemoved = 0, blobsRemoved = 0, holds = 0;
     };
 
-    /**
-     * The part of an object store a sweep may remove, when that is not
-     * the whole of it: the local overlay store reads through the merged
-     * mount -- which is this object store -- and owns its upper layer
-     * alone (01 §10, *the local overlay store's object store is not its
-     * own*).  `dir` is a directory of the same shape whose files are the
-     * ones enumerated and removed; the trees are still read, and a
-     * root's blob still looked for, through the object store itself, so
-     * that what a lower layer holds keeps what it reaches.  `remove`
-     * takes one file under `dir` away -- the caller's, since on the
-     * overlay an unlink through the mount of a file the lower layer also
-     * has would white it out.
-     */
+    /** The physical namespace this store owns, e.g. an overlay's upper layer.
+     * `removed` is notified after an actual removal so an overlay can
+     * request a remount. Deletion stays inside the opened owned namespace. */
     struct Owned
     {
         std::filesystem::path dir;
-        fun<void(const std::filesystem::path & file)> remove;
+        fun<void()> removed;
     };
 
-    /**
-     * Law 5 of 01 §9.10.  `forEachLiveObjectHash` yields the live roots
-     * (the valid paths' object hashes) and returns the number it could
-     * not give; when that is non-zero, or a tree is corrupt, only the
-     * temporary files go.  A live root whose object is missing is counted
-     * (`SweepStats::unentered`) and does not stop the removal phase.  A
-     * live hold keeps the auxiliary addresses encoded in its link names,
-     * including a replacement inode published by repair. The typed names
-     * are claims independently of their inode kind, bytes or metadata;
-     * only the fixed kind and shard directories are traversed. Additional links
-     * also keep files from older layouts. A hold whose lock is free is a
-     * dead ingestion's and goes first, with its links.
-     * Publication, acquisition and release of auxiliary links cannot
-     * overlap this sweep. In particular, a hold whose path registers
-     * after the root snapshot keeps its links until the sweep finishes.
-     *
-     * `owned`, when given, is the part of the object store this sweep may
-     * remove from; reachability is computed over the whole of it either
-     * way, and a hold is locked and removed through the object store's own
-     * directory, which is what the ingestion holding it locked.
-     */
-    SweepStats sweep(fun<uint64_t(fun<void(const ObjectHash &)>)> forEachLiveObjectHash, const Owned * owned = nullptr);
+    /** Reap dead leases and obsolete auxiliary cache files. Only fixed kinds
+     * and two-digit shard directories are descended, never symbolic links.
+     * The live representation and its GC are the indexed projections, so
+     * this cleanup reads no body and computes no graph reachability. */
+    SweepStats sweep(const Owned * owned = nullptr);
 
 private:
-    std::optional<std::string> readTree(const Hash & id) const;
-
-    /**
-     * The entries of the tree `id` from its raw body (`git::parseTree`
-     * over the body behind the size git's header gives); directory names
-     * carry a trailing slash, as `merkle::Tree` keys them.
-     *
-     * @throws Error naming `id` if the body is not a tree object.
-     */
-    static merkle::Tree parseTreeBody(const Hash & id, std::string_view body);
-
-    const std::string blobsDir, blobsXDir, treesDir;
-
-    /* Reads trees and drives `enterIntoObjects` alone (src/libstore-tests/local-store.cc). */
     friend class LocalStoreObjectsTest;
 };
 

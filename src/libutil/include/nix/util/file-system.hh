@@ -276,7 +276,10 @@ void recursiveSync(const std::filesystem::path & path);
 /**
  * Delete a path; i.e., in the case of a directory, it is deleted
  * recursively. It's not an error if the path does not exist. The
- * second variant returns the number of bytes and blocks freed.
+ * second variant sets bytesFreed to an estimate for successfully removed
+ * non-directory entries observed at their last link on POSIX, or zero on
+ * Windows. This is not a measure of allocated blocks or immediately reclaimed
+ * space.
  */
 void deletePath(const std::filesystem::path & path);
 

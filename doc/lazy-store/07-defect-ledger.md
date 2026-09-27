@@ -1,6 +1,6 @@
 # Defects pinned by a named test
 
-The lazy-store work kept a ledger of every defect the branch introduced and found later, each with its root cause. What has lasting value from it is the table below: each defect the branch had, in one line, and the test that fails on the code that had it. Rows whose fix has no discriminating test are not listed; the tests still owed are `05-validation.md` section 7, and the facts the defects taught about the local store are `08-store-model.md`. The rule the table enforces is that a fix carries a test that failed first (`05-validation.md` section 4).
+The lazy-store work kept a ledger of every defect the branch introduced and found later, each with its root cause. What has lasting value from it is the table below: each defect the branch had, in one line, and the test that failed on the code that had it. Representation-specific tests may be replaced when their implementation is retired; these historical names do not establish coverage of the SQL auxiliary representation. Its obligations are `01` §9.10 and `08`, and current executed gates are in `09-performance.md`. Rows whose fix has no discriminating test are not listed; the tests still owed are `05-validation.md` section 7, and the facts the defects taught about the local store are `08-store-model.md`. The rule the table enforces is that a fix carries a test that failed first (`05-validation.md` section 4).
 
 | defect | pinned by |
 |---|---|

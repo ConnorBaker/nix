@@ -653,16 +653,9 @@ protected:
     }
 
     /**
-     * The object hash of every valid path, from the column, under the
-     * database lock: the sweep's live roots.  A row older than schema 11
-     * is skipped, not migrated (the migration walks), and counted.
-     */
-    uint64_t forEachValidObjectHash(fun<void(const ObjectHash &)> callback);
-
-    /**
      * The collector's sweep on a whole-store collection (01 §9.10,
      * "Collection"; 01 §10, *The object store is swept on whole-store
-     * collections only*): the object files, and then the index's stale
+     * collections only*): legacy cache files, and then the ingestion's stale
      * rows.  **Not virtual**, and that is the point.  The rows are the
      * store's *own database's* whatever its object store is -- the
      * overlay store's index is the upper store's, holding no row for a
@@ -675,14 +668,14 @@ protected:
     void sweepObjects();
 
     /**
-     * Law 5 over the object files this store owns, reported by
+     * Bounded legacy-cache cleanup over the files this store owns, reported by
      * `reportSweep`.  The local overlay store owns its upper layer alone
      * and overrides this.
      */
     virtual void sweepObjectStore();
 
     /**
-     * Remove every index row whose ingestion names no valid path (an
+     * Remove every holder and auxiliary row whose ingestion names no valid path (an
      * ingestion that never registered, or a path since collected).  Under
      * the GC lock, with the sweep; it is what replaces the cascade a
      * foreign key into `ValidPaths` would have given (`schema.sql`).
@@ -713,7 +706,7 @@ public:
      */
     void registerValidPath(const ValidPathInfo & info);
 
-    /** Register a path and its remaining holder rows atomically. */
+    /** Register a path and its remaining ingestion projection atomically. */
     void registerValidPath(const ValidPathInfo & info, const GitObjectStore::Hold & hold);
 
     /** Every map key must equal its description's path. */
@@ -784,17 +777,17 @@ private:
 
 public:
     /**
-     * Start a path's private regular-file projection. Its rows enter the
-     * database only at completion, and become available to other ingestions
-     * only when their path is valid (`schema.sql`).
+     * Start a fresh path projection of regular holders and auxiliary values.
+     * Completion publishes owned auxiliary bytes; regular holders additionally
+     * require path validity. A new entry always begins a new ingestion.
      */
     void beginIngestion(const GitObjectStore::Hold & hold, const std::filesystem::path & root);
 
     /**
-     * Finish the path's complete regular-file projection, including an
-     * empty one. Already-valid paths reconcile and publish here; a new
-     * builder output is persisted but remains invisible to holder lookup
-     * until validity registration.
+     * Finish the complete fresh projection, including an empty one.
+     * Already-valid paths reconcile and publish here. A builder output's
+     * auxiliary bytes become available now; its regular holders remain
+     * unavailable until validity registration. Further entry starts anew.
      */
     void endIngestion(const GitObjectStore::Hold & hold, const StorePath & path);
 
@@ -822,6 +815,14 @@ private:
 
     void insertBlobRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Hold::Row> rows);
 
+    void insertAuxiliaryRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Auxiliary> values);
+
+    /** Own one complete, framed-hash-verified body before leaving the provider. */
+    std::optional<std::string> readAuxiliary(const merkle::TreeEntry & entry);
+
+    /** Verify every persisted cache incarnation; repair rechecks before deletion. */
+    bool verifyAuxiliary(RepairFlag repair);
+
     /** Keep rewritten rows across a SQLite retry: filesystem changes survive rollback. */
     void coalesceBlobRows(
         State & state,
@@ -843,12 +844,12 @@ private:
 
 public:
     /**
-     * Whether an ingestion writes the index at all.  The *only* value
+     * Whether an ingestion writes regular-holder rows.  The *only* value
      * anything but a test may run under is `Write`; `NoRows` is the
      * ablation that separates what writing the index costs from what
      * everything else does. The earlier writer/probe lock experiment is
      * recorded in `06-holder-index.md` sections 4.8 and 5. A store left
-     * under `NoRows` has no index and shares nothing afterwards, so it is
+     * under `NoRows` retains auxiliary metadata but writes no regular holders, so it is
      * reachable by `_NIX_TEST_HOLDER_NO_ROWS` alone.
      */
     enum struct BlobRows { Write, NoRows };

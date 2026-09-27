@@ -223,14 +223,10 @@ private:
     VerificationResult verifyAllValidPaths(RepairFlag repair) override;
 
     /**
-     * The store directory is the merged mount: `.objects` and `.links`
-     * under it are the union of the upper layer's and the lower store's,
-     * and every write through it lands in the upper layer -- an unlink of
-     * a lower file is a whiteout, a repair of a lower path a copy-up.  So
-     * the `.links` removal and the verifier's object checks are not run
-     * for this store (`LocalStore::ownsObjectStore`); `optimiseStore`
-     * above enters nothing either.  The sweep is not gated on this: it
-     * runs over the upper layer alone (`sweepObjectStore`).
+     * The merged directory includes lower-store data. Object materialisation,
+     * cross-layer regular sharing, legacy `.links` removal and object verification
+     * therefore remain disabled here; none may copy up or modify lower data.
+     * The upper database owns its auxiliary values and candidate rows.
      */
     bool ownsObjectStore() const override
     {
@@ -238,16 +234,15 @@ private:
     }
 
     /**
-     * Law 5 over the upper layer alone.  The objects this store owns are
-     * the ones under `upper-layer/.objects`; the lower store's are its
-     * own, read-only and shared, and are never removed.  Reachability is
-     * computed over the merged object store, which is what this store
-     * reads: an object the lower layer holds keeps what it reaches.
+     * Clean legacy auxiliary entries and dead ingestion leases in
+     * `upper-layer/.objects` alone, without reading a merged reachability
+     * graph or inspecting the lower cache. Nonrecursive physical removal
+     * cannot white out the lower layer; an actual removal requests a remount
+     * of the merged view.
      *
-     * The index's stale rows are *not* this method's business and are not
-     * narrowed by the layer: they are the upper store's own database's,
-     * and `LocalStore::sweepObjects`, which is not virtual, removes them
-     * beside this.
+     * Stale regular and auxiliary rows belong to this store's own database.
+     * The nonvirtual `LocalStore::sweepObjects` removes those after lease
+     * cleanup, independently of this filesystem ownership boundary.
      */
     void sweepObjectStore() override;
 

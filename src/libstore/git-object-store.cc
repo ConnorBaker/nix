@@ -1,104 +1,38 @@
 #include "nix/store/git-object-store.hh"
 #include "nix/store/pathlocks.hh"
-#include "nix/store/posix-fs-canonicalise.hh"
-#include "nix/util/base-n.hh"
 #include "nix/util/git.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/file-system-at.hh"
 #include "nix/util/file-descriptor.hh"
-#include "nix/util/finally.hh"
 #include "nix/util/logging.hh"
-#include "nix/util/os-string.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/strings.hh"
 #include "nix/util/util.hh"
 
-#include <boost/unordered/unordered_flat_set.hpp>
 #include <unordered_set>
 #include <mutex>
-#include <shared_mutex>
 #include <array>
+#include <variant>
 
 #include <atomic>
 #include <cstring>
 #include <functional>
 #include <random>
 #include <type_traits>
-#include <span>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 namespace nix {
 
-/* The link count and the valid-root snapshot are meaningful together only
-   while auxiliary links cannot be acquired or released. Use one ordinary
-   file lock for that namespace, independent of the whole-store GC lock:
-   evaluation must still progress while path collection is running.
-
-   Concurrent readers of this instance share one open file description and
-   one flock. Its last reader unlocks; another instance has its own open
-   description and therefore participates in the same kernel lock normally.
-   The descriptor stays open between operations, avoiding an open/close per
-   auxiliary object. Holds retain this state for their eventual cleanup. */
-struct GitObjectStore::AuxiliaryLock
-{
-    const std::filesystem::path file;
-    std::mutex mutex;
-    AutoCloseFD fd;
-    size_t readers = 0;
-
-    explicit AuxiliaryLock(std::filesystem::path file)
-        : file(std::move(file))
-    {
-    }
-
-    void lock_shared()
-    {
-        auto lock = std::lock_guard{mutex};
-        if (!readers) {
-            if (!fd)
-                fd = openLockFile(file, true);
-            while (!lockFile(fd.get(), ltRead, true))
-                checkInterrupt();
-        }
-        ++readers;
-    }
-
-    void unlock_shared()
-    {
-        auto lock = std::lock_guard{mutex};
-        assert(readers);
-        if (!--readers)
-            lockFile(fd.get(), ltNone, false);
-    }
-
-    AutoCloseFD lockExclusive() const
-    {
-        auto exclusive = openLockFile(file, true);
-        while (!lockFile(exclusive.get(), ltWrite, true))
-            checkInterrupt();
-        return exclusive;
-    }
-};
-
-GitObjectStore::GitObjectStore(std::filesystem::path dir, bool fsync, std::filesystem::path auxiliaryLockFile)
-    : auxiliaryLock(
-          std::make_shared<AuxiliaryLock>(auxiliaryLockFile.empty() ? dir / "gc.lock" : std::move(auxiliaryLockFile)))
-    , dir(std::move(dir))
-    , fsync(fsync)
-    , blobsDir((this->dir / "blobs").string())
-    , blobsXDir((this->dir / "blobs-x").string())
-    , treesDir((this->dir / "trees").string())
+GitObjectStore::GitObjectStore(std::filesystem::path dir)
+    : dir(std::move(dir))
 {
 }
 
 void GitObjectStore::createDirectories() const
 {
-    createDirs(dir / "blobs");
-    createDirs(dir / "blobs-x");
-    createDirs(dir / "trees");
     createDirs(dir / "tmp");
 }
 
@@ -112,202 +46,6 @@ Hash GitObjectStore::blobIdOfFile(const std::filesystem::path & path)
 std::string GitObjectStore::idString(const Hash & id)
 {
     return id.to_string(HashFormat::Base16, false);
-}
-
-/* The owned spelling `<subdirectory>/<xx>/<identifier>`. Both the shard
-   `<xx>` and identifier use lowercase hexadecimal; the shard encodes the
-   identifier's first byte (01 §9.10). */
-static std::string nameUnder(const std::string & subdir, const Hash & id)
-{
-    auto bytes = std::as_bytes(std::span<const uint8_t>{&id.hash[0], id.hashSize});
-    std::string s;
-    s.reserve(subdir.size() + 1 + 2 + 1 + base16::encodedLength(id.hashSize));
-    s += subdir;
-    s += '/';
-    /* Encode the shard and identifier directly into the result, without
-       a separate identifier string. */
-    base16::encodeTo(s, bytes.first(1));
-    s += '/';
-    base16::encodeTo(s, bytes);
-    return s;
-}
-
-/* Whether `name` is a shard directory's: two lowercase hexadecimal digits,
-   as `nameUnder` writes them. */
-static bool isShardName(std::string_view name)
-{
-    return name.size() == 2 && name.find_first_not_of("0123456789abcdef") == std::string_view::npos;
-}
-
-static bool isObjectName(std::string_view name)
-{
-    return name.size() == 2 * regularHashSize(GitObjectStore::hashAlgo)
-           && name.find_first_not_of("0123456789abcdef") == std::string_view::npos;
-}
-
-/* An auxiliary address denotes a regular file's bytes. In particular, a
-   corrupt FIFO must neither block the sweep nor turn a source fallback into
-   a read from an unrelated stream; a symlink is not its target's bytes.
-   Size and bytes belong to this same opened inode, including during repair. */
-static std::optional<std::pair<AutoCloseFD, PosixStat>>
-openAuxiliary(const std::filesystem::path & file, std::optional<PosixStat> observed = std::nullopt)
-{
-    auto nonregular = [&] { return NotARegularFile("object %s is not a regular file!", PathFmt(file)); };
-    if (!observed)
-        observed = maybeLstat(file);
-    if (!observed)
-        return std::nullopt;
-    /* Avoid opening existing devices at all. Supported publishers only
-       replace auxiliaries with regular files; the opened-inode check also
-       rejects a nonregular replacement before any read. */
-    if (!S_ISREG(observed->st_mode))
-        throw nonregular();
-#ifdef _WIN32
-    auto fd = openFileReadonly(file, FinalSymlink::DontFollow);
-#else
-    AutoCloseFD fd{open(file.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)};
-#endif
-    if (!fd) {
-        NativeSysError error("opening object %s", PathFmt(file));
-        if (error.is(std::errc::no_such_file_or_directory) || error.is(std::errc::not_a_directory))
-            return std::nullopt;
-        /* Some nonregular kinds cannot be opened at all (a symlink with
-           O_NOFOLLOW, for example). Preserve other I/O errors. */
-        auto current = maybeLstat(file);
-        if (!current)
-            return std::nullopt;
-        if (!S_ISREG(current->st_mode))
-            throw nonregular();
-        throw error;
-    }
-    auto st = nix::fstat(fd.get());
-    if (!S_ISREG(st.st_mode))
-        throw nonregular();
-    return std::pair{std::move(fd), st};
-}
-
-void GitObjectStore::eachObjectFile(const std::filesystem::path & kindDir, fun<void(const std::filesystem::path &)> f)
-{
-    auto kind = maybeLstat(kindDir);
-    if (!kind)
-        return;
-    if (!S_ISDIR(kind->st_mode))
-        throw Error("object namespace %s is not a directory", PathFmt(kindDir));
-    for (auto & entry : DirectoryIterator{kindDir}) {
-        std::error_code isDir;
-        if (std::filesystem::is_directory(entry.symlink_status(isDir))) {
-            auto name = entry.path().filename().string();
-            if (isShardName(name)) {
-                for (auto & object : DirectoryIterator{entry.path()})
-                    f(object.path());
-            } else if (isObjectName(name))
-                f(entry.path());
-        } else
-            f(entry.path());
-    }
-}
-
-bool GitObjectStore::verify(RepairFlag repair)
-{
-    printInfo("checking object hashes...");
-    bool errors = false;
-    for (auto kind : {"blobs", "blobs-x", "trees"}) {
-        bool tree = std::string_view{kind} == "trees";
-        eachObjectFile(dir / kind, [&](const std::filesystem::path & object) {
-            checkInterrupt();
-            auto name = object.filename().string();
-            auto what = tree ? "tree object" : "object";
-            printMsg(lvlTalkative, "checking contents of %s", PathFmt(object));
-
-            /* Size and bytes come from one open inode. Close it before
-               diagnostics or removal: Windows retains a deleted name until
-               the last handle closes. The repair reservation, rather than
-               an inode comparison, excludes replacement before removal. */
-            auto inspect = [&]() -> std::optional<std::string> {
-                auto nonregular = [&] { return fmt("%s %s is not a regular file!", what, PathFmt(object)); };
-                auto st = maybeLstat(object);
-                if (!st)
-                    return std::nullopt;
-                /* A corrupt shard symlink may have been replaced with the
-                   real shard directory by a concurrent repair and writer. */
-                if (S_ISDIR(st->st_mode) && object.parent_path() == dir / kind && isShardName(name))
-                    return std::nullopt;
-                if (!S_ISREG(st->st_mode))
-                    return nonregular();
-                std::optional<std::pair<AutoCloseFD, PosixStat>> opened;
-                try {
-                    opened = openAuxiliary(object, st);
-                } catch (NotARegularFile &) {
-                    return nonregular();
-                }
-                if (!opened)
-                    return std::nullopt;
-                auto & [fd, metadata] = *opened;
-                auto actual = [&] {
-                    if (tree)
-                        return merkle::treeId(
-                            drainFD(fd.get(), {.size = static_cast<size_t>(metadata.st_size), .expected = false}));
-                    merkle::ObjectHasher hasher{"blob", static_cast<uint64_t>(metadata.st_size)};
-                    drainFD(fd.get(), hasher);
-                    return hasher.finish();
-                }();
-                auto id = idString(actual);
-                if (id != name)
-                    return fmt("%s %s was modified! expected identifier %s, got '%s'", what, PathFmt(object), name, id);
-                return std::nullopt;
-            };
-
-            auto observed = inspect();
-            if (!observed)
-                return;
-            printError("%s", *observed);
-            if (!repair) {
-                errors = true;
-                return;
-            }
-
-            bool removed = false;
-            {
-                /* Another verifier may have removed the corrupt inode and
-                   an ingestion published its replacement since inspection.
-                   Recheck only mismatches, with publication excluded; never
-                   remove a sound replacement on the old observation. */
-                auto lock = auxiliaryLock->lockExclusive();
-                auto current = inspect();
-                if (current) {
-                    std::error_code ec;
-                    removed = std::filesystem::remove(object, ec);
-                    if (ec && ec != std::errc::no_such_file_or_directory && ec != std::errc::not_a_directory)
-                        throw SystemError(ec, "removing corrupt %s %s", what, PathFmt(object));
-                }
-            }
-            /* Logging may invoke other store operations; it is never part
-               of the exclusive namespace reservation. */
-            if (removed)
-                printInfo("removed %s %s", what, PathFmt(object));
-        });
-    }
-    return errors;
-}
-
-std::string GitObjectStore::blobFileName(const Hash & id, bool executable) const
-{
-    return nameUnder(executable ? blobsXDir : blobsDir, id);
-}
-
-std::string GitObjectStore::treeFileName(const Hash & id) const
-{
-    return nameUnder(treesDir, id);
-}
-
-std::filesystem::path GitObjectStore::blobFile(const Hash & id, bool executable) const
-{
-    return blobFileName(id, executable);
-}
-
-std::filesystem::path GitObjectStore::treeFile(const Hash & id) const
-{
-    return treeFileName(id);
 }
 
 std::filesystem::path GitObjectStore::tempPath(std::string_view kind) const
@@ -343,34 +81,53 @@ static std::error_code hardLink(const std::filesystem::path & from, const std::f
     return ec;
 }
 
-/* The ingestion's pending index rows, **sharded 256 ways by the identifier's
-   first byte** -- the object store's own layout, for the same reason.  The
+static void checkAuxiliaryEntry(const merkle::TreeEntry & entry)
+{
+    if ((entry.mode != merkle::Mode::Directory && entry.mode != merkle::Mode::Symlink)
+        || entry.hash.algo != GitObjectStore::hashAlgo
+        || entry.hash.hashSize != regularHashSize(GitObjectStore::hashAlgo))
+        throw Error("an auxiliary address must be a SHA-256 directory or symlink identifier");
+}
+
+/* One finite pending projection, sharded by the identifier's first byte.  The
    copy writes a directory's files on the walking thread and its
    subdirectories on a pool (`08` K17), so every worker records a row for
    every regular file it writes: one mutex over the whole set is a lock taken
    forty thousand times by eight threads, and it was the first reason the
    parallel copy was slower than the route it replaces.
 
-   The finite map associates each (id, mode) with its first completed row.
-   Rows stay private until the completed path is handed to the store;
-   handing them over retires the pending map. Unused shards are never allocated. */
+   The finite map associates each typed (mode, id) with its first completed
+   regular witness or owned auxiliary body. Values stay private until the
+   completed path is handed to the store; handing them over retires the map. Unused shards are never allocated. */
 struct GitObjectStore::Hold::Pending
 {
-    /* Borrow the row's existing identity. Like the old binary key, Hash
+    using Value = std::variant<Row, Auxiliary>;
+
+    /* Borrow the value's existing identity. Like the old binary key, Hash
        equality uses length and bytes, without an algorithm tag. */
     struct Key
     {
         const Hash & id;
-        bool executable;
+        merkle::Mode mode;
 
-        Key(const Hash & id, bool executable) noexcept
+        Key(const Hash & id, merkle::Mode mode) noexcept
             : id(id)
-            , executable(executable)
+            , mode(mode)
         {
         }
 
         Key(const Row & row) noexcept
-            : Key(row.id, row.executable)
+            : Key(row.id, row.executable ? merkle::Mode::Executable : merkle::Mode::Regular)
+        {
+        }
+
+        Key(const Auxiliary & object) noexcept
+            : Key(object.entry.hash, object.entry.mode)
+        {
+        }
+
+        Key(const Value & value) noexcept
+            : Key(std::visit([](const auto & value) { return Key(value); }, value))
         {
         }
     };
@@ -382,7 +139,7 @@ struct GitObjectStore::Hold::Pending
         size_t operator()(Key key) const noexcept
         {
             return std::hash<std::string_view>{}({reinterpret_cast<const char *>(key.id.hash), key.id.hashSize})
-                   ^ key.executable;
+                   ^ static_cast<RawMode>(key.mode);
         }
     };
 
@@ -392,15 +149,15 @@ struct GitObjectStore::Hold::Pending
 
         bool operator()(Key a, Key b) const noexcept
         {
-            return a.executable == b.executable && a.id == b.id;
+            return a.mode == b.mode && a.id == b.id;
         }
     };
 
     struct Shard
     {
         std::mutex mutex;
-        /** (id, mode) -> the first completed file's row. */
-        std::unordered_set<Row, KeyHash, KeyEqual> byKey;
+        /** (mode, id) -> one regular witness or owned auxiliary body. */
+        std::unordered_set<Value, KeyHash, KeyEqual> byKey;
     };
 
     /* A one-file ingestion occupies one shard. Allocate the others only
@@ -427,8 +184,7 @@ struct GitObjectStore::Hold::Pending
     }
 };
 
-/* The shard an identifier falls in: its first byte, as `nameUnder` shards the
-   object store's directories. */
+/* The pending shard an identifier falls in; the empty active hash uses zero. */
 static size_t shardOf(const Hash & id)
 {
     return id.hashSize ? id.hash[0] : 0;
@@ -458,33 +214,48 @@ std::optional<std::string> GitObjectStore::Hold::addRow(Row row) const
 {
     auto & shard = pending->shard(shardOf(row.id));
     auto lock = std::lock_guard{shard.mutex};
-    auto [i, inserted] = shard.byKey.insert(std::move(row));
+    auto [i, inserted] = shard.byKey.emplace(std::in_place_type<Row>, std::move(row));
     if (inserted)
         return std::nullopt;
-    auto & name = i->name;
+    auto & name = std::get<Row>(*i).name;
     return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 
-std::vector<GitObjectStore::Hold::Row> GitObjectStore::Hold::takeRows() const
+void GitObjectStore::Hold::addAuxiliary(Auxiliary object) const
 {
-    /* The caller owns a completed walk. Reserve before consuming any rows,
-       so allocation failure leaves the complete pending relation intact.
-       Publication owns the returned rows; no pending witness survives. */
+    checkAuxiliaryEntry(object.entry);
+    auto & shard = pending->shard(shardOf(object.entry.hash));
+    auto lock = std::lock_guard{shard.mutex};
+    shard.byKey.emplace(std::in_place_type<Auxiliary>, std::move(object));
+}
+
+GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
+{
     static_assert(std::is_nothrow_move_constructible_v<Row>);
-    size_t count = 0;
+    static_assert(std::is_nothrow_move_constructible_v<Auxiliary>);
+    size_t regular = 0, auxiliary = 0;
     for (auto & slot : pending->shards)
         if (auto * shard = slot.load(std::memory_order_acquire))
-            count += shard->byKey.size();
-    std::vector<Row> rows;
-    rows.reserve(count);
+            for (const auto & value : shard->byKey)
+                if (std::holds_alternative<Row>(value))
+                    ++regular;
+                else
+                    ++auxiliary;
+    Projection projection;
+    /* Reserve both before extracting: failure leaves the complete relation intact. */
+    projection.regular.reserve(regular);
+    projection.auxiliary.reserve(auxiliary);
     for (auto & slot : pending->shards)
         if (std::unique_ptr<Pending::Shard> shard{slot.exchange(nullptr)}; shard)
             while (!shard->byKey.empty()) {
-                /* Extract before moving: entries in a set are const. */
                 auto node = shard->byKey.extract(shard->byKey.begin());
-                rows.push_back(std::move(node.value()));
+                auto & value = node.value();
+                if (auto * row = std::get_if<Row>(&value))
+                    projection.regular.push_back(std::move(*row));
+                else
+                    projection.auxiliary.push_back(std::move(std::get<Auxiliary>(value)));
             }
-    return rows;
+    return projection;
 }
 
 std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, bool executable) const
@@ -493,10 +264,10 @@ std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, 
     if (!shard)
         return std::nullopt;
     auto lock = std::lock_guard{shard->mutex};
-    auto i = shard->byKey.find(Pending::Key{id, executable});
+    auto i = shard->byKey.find(Pending::Key{id, executable ? merkle::Mode::Executable : merkle::Mode::Regular});
     if (i == shard->byKey.end())
         return std::nullopt;
-    auto & name = i->name;
+    auto & name = std::get<Row>(*i).name;
     return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 
@@ -514,41 +285,17 @@ static std::string nameUnderRoot(const std::filesystem::path & where, const std:
     return w.size() == r.size() ? std::string() : w.substr(r.size() + 1);
 }
 
-GitObjectStore::Hold::Hold(
-    const std::filesystem::path & tmp,
-    const std::function<void()> & atHoldMade,
-    std::shared_ptr<AuxiliaryLock> auxiliaryLock)
+GitObjectStore::Hold::Hold(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade)
     : pending(std::make_unique<Pending>())
-    , lease(std::make_shared<Lease>(tmp, atHoldMade, std::move(auxiliaryLock)))
+    , lease(std::make_shared<Lease>(tmp, atHoldMade))
 {
 }
 
-GitObjectStore::Hold::Lease::Lease(
-    const std::filesystem::path & tmp,
-    const std::function<void()> & atHoldMade,
-    std::shared_ptr<AuxiliaryLock> auxiliaryLock)
-    : auxiliaryLock(std::move(auxiliaryLock))
+GitObjectStore::Hold::Lease::Lease(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade)
 {
-    /* As `createTempDirInStore` (local-store.cc): the sweep may remove the
-       directory between its making and the lock -- it removes a hold it
-       can lock -- so both are repeated until the directory exists locked.
-       The name is unique to this process and this hold, so the lock is
-       never contended by another maker; the sweep only tries it.
-
-       The directory is made empty and its kind/shard directories made
-       on demand under the lock, so that a hold under `tmp/` whose lock is free is
-       either empty -- its maker between this `mkdir` and this `flock` --
-       or a dead ingestion's, and the sweep's rule, "remove a hold you can
-       lock, with its links", is right for both: it takes an empty
-       directory from a maker that then finds it gone and makes another,
-       and it takes a dead one's links.  Made before the lock, the kinds
-       would be the maker's own second window: the sweep removing the
-       directory partway through them left the maker's remaining
-       `createDirs` to remake it *without* the kinds already made -- a
-       hold that links nothing, every `holdObject` into a missing kind
-       reading `ENOENT` as "no such object" -- and the sweep's own
-       `deletePath` racing those `mkdir`s failed with `ENOTEMPTY` and
-       abandoned the collection (`08` 1.5; `07`). */
+    /* GC may remove the empty directory before its lock is acquired.
+       Retry under a fresh name until the lease exists while locked. A
+       reused PID must not adopt a previous ingestion's directory. */
     static std::atomic<uint32_t> counter(0);
     createDirs(tmp);
     while (true) {
@@ -592,43 +339,24 @@ GitObjectStore::Hold::Hold(Hold &&) = default;
 GitObjectStore::Hold::~Hold() = default;
 
 #ifndef _WIN32
-/* A live hold's writers have joined before release. Its directories are
-   writable and its files are auxiliary hard links: no permission changes
-   or estimate of freed bytes is needed. Generic deletePath stats every
-   link for those purposes. Unlink directly, opening only directories and
-   never following symlinks. Dead or partially removed holds still use the
-   collector's general deletion path. */
+/* New leases contain only this ingestion's flat regular-file pins. Joined
+   workers cannot add entries. Never descend a surprising directory. */
 static void releaseHoldContents(AutoCloseFD scan)
 {
     auto fd = scan.get();
     AutoCloseDir entries{fdopendir(fd)};
     if (!entries)
-        throw SysError("reading hold directory");
+        throw SysError("reading ingestion lease");
     scan.release();
     struct dirent * entry;
     while (errno = 0, entry = readdir(entries.get())) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
             continue;
-        /* Joined writers leave this entry stable. A known directory cannot
-           be unlinked as a file; unknown types retain the syscall fallback. */
-        if (entry->d_type != DT_DIR) {
-            if (unlinkat(fd, entry->d_name, 0) == 0 || errno == ENOENT)
-                continue;
-            if (errno != EISDIR && errno != EPERM)
-                throw SysError("unlinking hold entry '%s'", entry->d_name);
-        }
-        AutoCloseFD child{openat(fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
-        if (!child) {
-            if (entry->d_type == DT_DIR && errno == ENOENT)
-                continue;
-            throw SysError("opening hold directory '%s'", entry->d_name);
-        }
-        releaseHoldContents(std::move(child));
-        if (unlinkat(fd, entry->d_name, AT_REMOVEDIR) == -1 && errno != ENOENT)
-            throw SysError("removing hold directory '%s'", entry->d_name);
+        if (unlinkat(fd, entry->d_name, 0) == -1 && errno != ENOENT)
+            throw SysError("unlinking ingestion pin '%s'", entry->d_name);
     }
     if (errno)
-        throw SysError("reading hold directory");
+        throw SysError("reading ingestion lease");
 }
 #endif
 
@@ -637,93 +365,29 @@ GitObjectStore::Hold::Lease::~Lease()
     if (!fd)
         return;
     try {
-        auto lock = std::shared_lock{*auxiliaryLock};
 #ifndef _WIN32
-        /* Namespace exclusion lasts through rmdir, so cleanup can consume
-           the root descriptor along with the directory stream. */
+        /* The descriptor retains the lease lock throughout pin removal. */
         releaseHoldContents(std::move(fd));
         if (::rmdir(dir.c_str()) == -1 && errno != ENOENT)
             throw SysError("removing hold %s", PathFmt(dir));
 #else
-        deletePath(dir);
+        for (auto & entry : DirectoryIterator{dir}) {
+            auto st = maybeLstat(entry.path());
+            if (st && S_ISDIR(st->st_mode))
+                throw Error("unexpected directory in ingestion lease %s", PathFmt(entry.path()));
+            unlinkIfExists(entry.path());
+        }
+        fd.close();
+        std::filesystem::remove(dir);
 #endif
     } catch (...) {
         ignoreExceptionInDestructor();
     }
 }
 
-GitObjectStore::Hold::Names
-GitObjectStore::Hold::namesFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const
-{
-    /* The caller owns the public namespace; the lease owns only the hold.
-       Keep the global spelling and Windows native conversion before any
-       held shard is created. The generated suffix is ASCII at every width. */
-    size_t kind = object.mode == merkle::Mode::Directory ? 2 : object.mode == merkle::Mode::Executable ? 1 : 0;
-    const std::array<const std::string *, 3> prefixes{&objects.blobsDir, &objects.blobsXDir, &objects.treesDir};
-    constexpr std::array<OsStringView, 3> kinds{OS_STR("blobs"), OS_STR("blobs-x"), OS_STR("trees")};
-    Names result{
-#ifdef _WIN32
-        std::filesystem::path(nameUnder(*prefixes[kind], object.hash)).native(),
-#else
-        nameUnder(*prefixes[kind], object.hash),
-#endif
-        std::filesystem::path::string_type{}};
-    auto & [dst, held] = result;
-    auto idSize = base16::encodedLength(object.hash.hashSize);
-    auto name = dst.end() - idSize;
-    auto shard = name - 3; // Two shard digits and the following separator.
-    held.reserve(kinds[kind].size() + idSize + 4);
-    held += kinds[kind];
-    held += std::filesystem::path::preferred_separator;
-    held.append(shard, shard + 2);
-    std::call_once(lease->shards[kind * 256 + object.hash.hash[0]], [&] { createDirs(lease->dir / held); });
-    held += std::filesystem::path::preferred_separator;
-    held.append(name, dst.end());
-    return result;
-}
-
-std::filesystem::path
-GitObjectStore::Hold::linkFor(const GitObjectStore & objects, const merkle::TreeEntry & object) const
-{
-    return lease->dir / namesFor(objects, object).held;
-}
-
 GitObjectStore::Hold GitObjectStore::hold() const
 {
-    return Hold(dir / "tmp", atHoldMade, auxiliaryLock);
-}
-
-/* Hold the object file `object`, if it exists: a link to it from the hold.
-   True when it is held (or was already); false when there is no such
-   object.  A hold the filesystem refuses (its link limit, a full
-   directory index) leaves the object unheld and says so: what a
-   concurrent sweep may then take, the verifier reports and `--optimise`
-   re-enters, as before the hold existed. */
-bool GitObjectStore::Hold::linkObject(
-    const std::filesystem::path::string_type & object, const std::filesystem::path::string_type & held) const
-{
-#ifdef _WIN32
-    auto ec = hardLink(object, lease->dir / held);
-#else
-    if (::linkat(AT_FDCWD, object.c_str(), lease->fd.get(), held.c_str(), 0) != -1)
-        return true;
-    std::error_code ec{errno, std::generic_category()};
-#endif
-    if (!ec || ec == std::errc::file_exists)
-        return true;
-    if (ec == std::errc::no_such_file_or_directory)
-        return false;
-    if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
-        printInfo("cannot hold object %s: %s", PathFmt(object), ec.message());
-        return true;
-    }
-    throw Error("creating hard link from %1% to %2%: %3%", PathFmt(object), PathFmt(lease->dir / held), ec.message());
-}
-
-bool GitObjectStore::Hold::holdObject(const GitObjectStore & objects, const merkle::TreeEntry & object) const
-{
-    auto [file, held] = namesFor(objects, object);
-    return linkObject(file, held);
+    return Hold(dir / "tmp", atHoldMade);
 }
 
 #ifndef _WIN32
@@ -1085,160 +749,22 @@ void GitObjectStore::enterWritten(
 #endif
 }
 
-/* Write auxiliary bytes to the fresh temporary file `tmp`, made read-only,
-   link it into place and hold it; an entry that appeared meanwhile stands,
-   and is held instead. A successfully published temporary stays in the
-   hold as its protecting link; every unsuccessful one is removed.
-   Under `fsync` the bytes and final mode are flushed before publication,
-   and the directory afterward. Auxiliary modification times are not tree
-   metadata: no reader uses them, and these files never become regular-file
-   holders. Those holders retain the store's canonical timestamp.
-
-   The invariant (`08` K16): the object file is never at one link without
-   a hold while its ingestion is in flight.  It is linked into place while
-   the temporary still links the same inode, so it has two links from its
-   first instant, and the temporary itself is the hold's link;
-   an existing file or a competing publisher's object is held instead. */
-void GitObjectStore::Hold::writeObjectFile(
-    const GitObjectStore & objects, const merkle::TreeEntry & object, std::string_view bytes) const
-{
-    bool executable = object.mode == merkle::Mode::Executable;
-    bool fsync = objects.fsync;
-    const auto & atFsync = objects.atFsync;
-    auto [dst, tmp] = namesFor(objects, object);
-    if (linkObject(dst, tmp))
-        return;
-    /* This name belongs to an already unique, locked hold. Its lifetime
-       is the hold's, so it needs neither the global temporaries' timestamp
-       nor their process ID. Own-row views of a hold share this process-wide
-       sequence. The lease owns the directory resolved by every relative
-       operation; full paths are needed only for Windows and diagnostics. */
-    static std::atomic<uint64_t> counter{0};
-    auto heldSize = tmp.size();
-    auto suffix = ".tmp-" + std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
-    tmp.append(suffix.begin(), suffix.end()); // The suffix is ASCII on every platform.
-    auto tmpPath = [&] { return lease->dir / tmp; };
-    auto unlinkTemporary = [&] {
-#ifdef _WIN32
-        unlinkIfExists(tmpPath());
-#else
-        if (::unlinkat(lease->fd.get(), tmp.c_str(), 0) == -1 && errno != ENOENT)
-            throw SysError("removing %s", PathFmt(tmpPath()));
-#endif
-    };
-    bool removeTemporary = true;
-    Finally removeTmp{[&] {
-        if (!removeTemporary)
-            return;
-        try {
-            unlinkTemporary();
-        } catch (...) {
-            ignoreExceptionExceptInterrupt();
-        }
-    }};
-    /* The caller holds the auxiliary namespace shared throughout. Other
-       publishers may win this address, but sweep and repair cannot remove it. */
-    {
-        mode_t mode = executable ? 0755 : 0644;
-#ifdef _WIN32
-        AutoCloseFD fd = openNewFileForWrite(tmpPath(), mode, {.writeOnly = true});
-#else
-        AutoCloseFD fd{openat(lease->fd.get(), tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, mode)};
-#endif
-        if (!fd)
-            throw SysError("creating file %1%", PathFmt(tmpPath()));
-        writeFull(fd.get(), bytes);
-#ifdef _WIN32
-        /* Keep the existing Windows metadata implementation until an
-           equivalent permission-only operation is provided there. */
-        canonicaliseTimestampAndPermissions(tmpPath());
-#else
-        /* Creation's mode is filtered by the caller's umask. Set the
-           exact readable mode before flushing, independently of it. */
-        if (::fchmod(fd.get(), executable ? 0555 : 0444) == -1)
-            throw SysError("changing permissions of auxiliary object");
-#endif
-        if (fsync) {
-            if (atFsync)
-                atFsync(tmpPath());
-            fd.fsync();
-        }
-    }
-    auto publish = [&] {
-#ifdef _WIN32
-        return hardLink(tmpPath(), dst);
-#else
-        return ::linkat(lease->fd.get(), tmp.c_str(), AT_FDCWD, dst.c_str(), 0) == -1
-                   ? std::error_code{errno, std::generic_category()}
-                   : std::error_code{};
-#endif
-    };
-    auto ec = publish();
-    if (ec == std::errc::no_such_file_or_directory) {
-        /* The first object of this shard (`createDirectories`). */
-        createDirs(std::filesystem::path(dst).parent_path());
-        ec = publish();
-    }
-    if (ec) {
-        unlinkTemporary();
-        removeTemporary = false;
-        if (ec == std::errc::file_exists) {
-            /* The losing temporary is gone; reuse its name to hold the winner. */
-            tmp.resize(heldSize);
-            if (!linkObject(dst, tmp))
-                throw Error("object %s disappeared during publication", PathFmt(dst));
-            return;
-        }
-        if (ec == std::errc::no_space_on_device) {
-            /* The object is not kept; every reader tolerates its absence. */
-            printInfo("cannot write object %s: %s", PathFmt(dst), ec.message());
-            return;
-        }
-        throw Error("creating hard link from %1% to %2%: %3%", PathFmt(tmpPath()), PathFmt(dst), ec.message());
-    }
-    /* The temporary is inside the locked hold. Keep it as the
-       protecting link: publication already leaves two links, with
-       no interval in which GC can take the object. A unique name
-       also keeps concurrent writers from reading a partial file. */
-    removeTemporary = false;
-    if (fsync)
-        syncParent(dst);
-}
-
-void GitObjectStore::putObject(const merkle::TreeEntry & object, std::string_view bytes, const Hold & hold)
-{
-    auto lock = std::shared_lock{*auxiliaryLock};
-    hold.writeObjectFile(*this, object, bytes);
-}
-
 void GitObjectStore::putRootTree(const merkle::TreeEntry & root, const Hold & hold)
 {
-    if (auto body = merkle::syntheticRootTree(root))
-        putObject({merkle::Mode::Directory, merkle::treeId(*body)}, *body, hold);
+    if (auto body = merkle::syntheticRootTree(root)) {
+        auto id = merkle::treeId(*body);
+        hold.addAuxiliary({{merkle::Mode::Directory, std::move(id)}, std::move(*body)});
+    }
 }
 
-bool GitObjectStore::holdObject(const merkle::TreeEntry & object, const Hold & hold) const
+std::optional<std::string> GitObjectStore::readAuxiliary(const merkle::TreeEntry & entry) const
 {
-    auto lock = std::shared_lock{*auxiliaryLock};
-    return hold.holdObject(*this, object);
-}
-
-std::optional<std::string> GitObjectStore::readTree(const Hash & id) const
-{
-    if (counters)
-        counters->treesRead++;
-    auto opened = openAuxiliary(treeFile(id));
-    if (!opened)
-        return std::nullopt;
-    return drainFD(opened->first.get(), {.size = static_cast<size_t>(opened->second.st_size), .expected = false});
-}
-
-std::optional<std::string> GitObjectStore::readBlob(const Hash & id, bool executable) const
-{
-    auto opened = openAuxiliary(blobFile(id, executable));
-    if (!opened)
-        return std::nullopt;
-    return drainFD(opened->first.get(), {.size = static_cast<size_t>(opened->second.st_size), .expected = false});
+    checkAuxiliaryEntry(entry);
+    if (counters && entry.mode == merkle::Mode::Directory)
+        ++counters->treesRead;
+    if (index && index->readAuxiliary)
+        return index->readAuxiliary(entry);
+    return std::nullopt;
 }
 
 merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view body)
@@ -1262,7 +788,7 @@ merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view bod
         }
     } into;
 
-    /* The file holds the entries alone; the parser reads the size git's
+    /* The owned body holds entries alone; the parser reads the size git's
        header puts before them. */
     try {
         {
@@ -1281,335 +807,262 @@ merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view bod
     return std::move(into.tree);
 }
 
-std::optional<merkle::Tree> GitObjectStore::readVerifiedTree(const Hash & id) const
-{
-    std::optional<std::string> body;
-    try {
-        body = readTree(id);
-    } catch (NotARegularFile & e) {
-        warn("%s; not used\nYou should run `nix-store --verify --check-contents --repair` to fix it", e.msg());
-        return std::nullopt;
-    }
-    if (!body)
-        return std::nullopt;
-    if (merkle::treeId(*body) != id) {
-        warn(
-            "tree object %s does not hash to its name; not used"
-            "\nYou should run `nix-store --verify --check-contents --repair` to fix it",
-            PathFmt(treeFile(id)));
-        return std::nullopt;
-    }
-    try {
-        return parseTreeBody(id, *body);
-    } catch (Error & e) {
-        warn("%s; not used\nYou should run `nix-store --verify --check-contents --repair` to fix it", e.msg());
-        return std::nullopt;
-    }
-}
-
 GitObjectStore::BlobInodes GitObjectStore::blobInodes() const
 {
     BlobInodes inodes;
 #ifndef _WIN32
-    createDirectories();
     /* The index, not a walk of `.objects/blobs`: one query over the rows
        the store wrote, which is both cheaper and more complete than the
-       walk it replaces (design.md section 5).  The symlink-target blobs
-       under `blobs/` are not a path's file and are not in the table, which
-       is right: `known` answers regular files alone. */
+       walk it replaces (design.md section 5). Auxiliary values have no
+       regular-file inode: `known` answers regular files alone. */
     if (index && index->inodes)
         index->inodes(inodes);
 #endif
     return inodes;
 }
 
-GitObjectStore::SweepStats
-GitObjectStore::sweep(fun<uint64_t(fun<void(const ObjectHash &)>)> forEachLiveObjectHash, const Owned * owned)
+/* Legacy caches are no longer a readable representation. Descend only the
+   fixed kind/shard shape; an unexpected directory is an opaque occupant. */
+static bool isShardName(std::string_view name)
+{
+    return name.size() == 2 && name.find_first_not_of("0123456789abcdef") == name.npos;
+}
+
+static bool isHoldName(std::string_view name)
+{
+    if (!name.starts_with("hold-"))
+        return false;
+    name.remove_prefix(5);
+    auto split = name.find('-');
+    return split != name.npos && split && split + 1 < name.size()
+           && name.substr(0, split).find_first_not_of("0123456789") == name.npos
+           && name.substr(split + 1).find_first_not_of("0123456789") == name.npos;
+}
+
+GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
 {
     SweepStats stats;
-    createDirectories();
-    auto lock = auxiliaryLock->lockExclusive();
-
-    /* The files this sweep enumerates and removes: the whole object store,
-       or the part of it the caller owns (`Owned`).  Reachability below is
-       computed over the object store itself either way -- `readTree` and
-       `blobFile` are its own -- so an object a part this sweep may not
-       touch reaches is kept. */
     const auto & sweptDir = owned ? owned->dir : dir;
-    auto remove = [&](const std::filesystem::path & file) {
-        if (owned)
-            owned->remove(file);
-        else
-            unlinkIfExists(file);
-    };
-    /* The store's own four directories are made before they are iterated
-       (`08` K12); a part of it the caller owns is read as it is -- an
-       absent directory there is empty, and the sweep writes nothing into
-       it, only unlinks.  (On the overlay store the upper layer holds no
-       `.objects/blobs` until something has been written into it.) */
-    auto sweptSub = [&](std::string_view sub) -> std::optional<std::filesystem::path> {
-        auto sub_ = sweptDir / sub;
-        if (owned && !pathExists(sub_))
-            return std::nullopt;
-        return sub_;
-    };
-
-    /* A hold promises an object address, not a particular inode: repair
-       can replace a corrupt published inode while the old link survives.
-       The namespace lock keeps live holds stable throughout this scan.
-       Rows and coalescing pins at a hold's root are not auxiliary claims. */
     constexpr std::array<std::string_view, 3> kinds{"blobs", "blobs-x", "trees"};
-    std::array<boost::unordered_flat_set<std::string>, 3> heldObjects;
-    auto markHeld = [&](const std::filesystem::path & held) {
-        for (size_t kind = 0; kind < kinds.size(); ++kind) {
-            auto directory = held / kinds[kind];
-            auto st = maybeLstat(directory);
-            if (!st || !S_ISDIR(st->st_mode))
-                continue;
-            auto mark = [&](const std::filesystem::directory_entry & entry, std::string_view shard) {
-                auto name = entry.path().filename().string();
-                constexpr auto length = 2 * regularHashSize(hashAlgo);
-                std::string_view id{name.data(), std::min(name.size(), length)};
-                if (!isObjectName(id) || (!shard.empty() && !id.starts_with(shard)))
-                    return;
-                auto suffix = std::string_view(name).substr(length);
-                if (!suffix.empty()
-                    && (!suffix.starts_with(".tmp-") || suffix.size() == 5
-                        || suffix.substr(5).find_first_not_of("0123456789") != suffix.npos))
-                    return;
-                heldObjects[kind].emplace(id);
-            };
-            for (const auto & entry : DirectoryIterator{directory}) {
-                auto shard = entry.path().filename().string();
-                if (isShardName(shard) && std::filesystem::is_directory(entry.symlink_status())) {
-                    for (const auto & file : DirectoryIterator{entry.path()})
-                        mark(file, shard);
-                } else
-                    /* Earlier holders used <kind>/<id> without shards.
-                       A claim is its name, regardless of its inode kind;
-                       even a directory with that name is not descended. */
-                    mark(entry, {});
-            }
-        }
+    auto removed = [&] {
+        if (owned)
+            owned->removed();
     };
-
-    /* Temporary files a crash left behind: none lives an hour.  First,
-       before the blobs are looked at, so that a leftover link to a blob --
-       which holds the blob's link count above one -- goes before the blob
-       is judged.  The age is the name's when the name carries one
-       (`tempPath`: a link's inode is the blob's, and its change time the
-       blob's), else the inode's change time (a name an earlier build
-       made). */
-    auto now = time(nullptr);
-    if (auto tmpDir = sweptSub("tmp"))
-        for (auto & entry : DirectoryIterator{*tmpDir}) {
-            checkInterrupt();
-            if (std::filesystem::is_directory(entry.symlink_status())) {
-                /* An ingestion's hold (`Hold`).  Locked: the ingestion is in
-                   flight, and its link names keep its object addresses. Free: its
-                   process is gone; the directory goes now, with its links, so
-                   that the objects it held are judged in this sweep -- as the
-                   collector removes a `tmp-*` directory it can lock (gc.cc).
-                   The lock is taken, and the directory removed, through the
-                   object store's own path: on a part the caller owns (the
-                   overlay store's upper layer) the file the ingestion locked
-                   is the merged view's, not the layer's, and a hold is never
-                   the lower store's, so the removal whites nothing out. */
-                auto held = dir / "tmp" / entry.path().filename();
-                auto fd = openDirectory(held, FinalSymlink::DontFollow);
-                if (!fd) {
-                    if (errno == ENOENT)
-                        continue;
-                    throw SysError("opening hold %s", PathFmt(held));
-                }
-                if (!lockFile(fd.get(), ltWrite, false)) {
-                    stats.holds++;
-                    markHeld(held);
-                    continue;
-                }
-                /* A removal that fails is a hold this sweep does not take,
-                   not the end of the collection (01 section 9.10 law 5, which
-                   sweeps on): a hold an older Nix is filling before its
-                   lock answers `ENOTEMPTY`, one another sweep took first
-                   `ENOENT`. The surviving link names still keep their object
-                   addresses, even when repair replaced the linked inode. */
-                try {
-                    if (failHoldRemoval && failHoldRemoval(held))
-                        throw SysError(ENOTEMPTY, "cannot unlink %s", PathFmt(held));
-                    deletePath(held);
-                } catch (SysError & e) {
-                    printInfo("cannot remove the hold %s: %s", PathFmt(held), e.msg());
-                    stats.holds++;
-                    markHeld(held);
-                }
-                continue;
-            }
-            auto made = tempTime(entry.path().filename().string());
-            if (!made)
-                if (auto st = maybeLstat(entry.path()))
-                    made = st->st_ctime;
-            if (made && now - *made > 3600)
-                remove(entry.path());
-        }
-
-    /* The live roots: the object hash of every valid path -- a tree id,
-       or a plain file's blob id, which names no tree.  A root is told from
-       a tree a reachable tree names, so that the two are counted apart
-       when missing. */
-    struct Live
-    {
-        Hash id;
-        bool root;
-    };
-
-    std::vector<Live> live;
-    stats.unmigrated = forEachLiveObjectHash([&](const ObjectHash & hash) { live.push_back({hash.hash, true}); });
-
-    /* A valid path whose object hash is not yet known (a row older than
-       schema 11) is a root this sweep cannot see: while any remains
-       nothing but the temporary files is removed. */
-    if (stats.unmigrated == 0) {
-        /* Trees reachable from a live root stay, and every blob such a tree
-           names is kept whatever its link count (law 4).  A tree whose body
-           is not its name's abandons the removal phase (`corruptTrees`); a
-           tree a root names but the store lacks is counted and keeps
-           nothing (`unentered`). */
-        boost::unordered_flat_set<std::string> reachable;
-        boost::unordered_flat_set<std::string> named;
-        while (!live.empty()) {
-            auto [id, root] = live.back();
-            live.pop_back();
-            auto key = idString(id);
-            if (!reachable.insert(key).second)
-                continue;
-            std::optional<std::string> body;
-            try {
-                body = readTree(id);
-            } catch (NotARegularFile & e) {
-                warn("%s", e.msg());
-                stats.corruptTrees++;
-                continue;
-            }
-            if (!body) {
-                /* No tree of that name.  A tree a present tree names is a
-                   missing subtree (`missingSubtrees`).  A plain file's
-                   object hash is its blob's id, which names no tree; the
-                   blob is what the root reaches, kept (law 4) whatever its
-                   link count.  Anything else is a live root whose object
-                   the store lacks (`SweepStats::unentered`): nothing
-                   beneath it is kept, and the sweep goes on. */
-                if (!root)
-                    stats.missingSubtrees++;
-                else if (
-                    (index && index->lookup
-                     && (index->lookup(id, false, Holder::initialCursor)
-                         || index->lookup(id, true, Holder::initialCursor)))
-                    || pathExists(blobFile(id, false)))
-                    /* A plain-file root: its object hash is its blob's id,
-                       and the path *is* the holder.  (The `blobFile` arm is
-                       for a symlink-target blob that is also a root's id.) */
-                    named.insert(key);
-                else
-                    stats.unentered++;
-                continue;
-            }
-            std::optional<merkle::Tree> entries;
-            if (merkle::treeId(*body) == id)
-                try {
-                    entries = parseTreeBody(id, *body);
-                } catch (Error & e) {
-                    warn("tree object %s does not parse: %s", PathFmt(treeFile(id)), e.msg());
-                }
-            else
-                warn("tree object %s does not hash to its name", PathFmt(treeFile(id)));
-            if (!entries) {
-                stats.corruptTrees++;
-                continue;
-            }
-            for (auto & [name, entry] : *entries) {
-                if (entry.mode == merkle::Mode::Directory)
-                    live.push_back({entry.hash, false});
-                else
-                    named.insert(idString(entry.hash));
-            }
-        }
-        if (stats.corruptTrees)
-            warn(
-                "%d corrupt tree objects; the object store was not swept."
-                "\nYou should run `nix-store --verify --check-contents --repair` to fix them",
-                stats.corruptTrees);
-        if (stats.unentered || stats.missingSubtrees) {
-            /* Roots and subtrees apart: a valid path without its object,
-               and a tree a present tree names. */
-            std::string what;
-            if (stats.unentered)
-                what = fmt("%d valid paths have no object in the object store", stats.unentered);
-            if (stats.missingSubtrees)
-                what +=
-                    fmt("%s%d trees named by a present tree are missing",
-                        what.empty() ? "" : ", and ",
-                        stats.missingSubtrees);
-            warn(
-                "%s (written by an older Nix, or being entered by `nix-store --optimise` now); nothing is kept for them."
-                "\nRun `nix-store --optimise` to enter them (or `nix-store --verify --check-contents --repair`)",
-                what);
-        }
-        if (!stats.corruptTrees) {
-            /* Trees reachable from a live root, or whose address a live
-               ingestion holds, stay. Additional links keep older layouts. */
-            if (auto treesDir = sweptSub("trees"))
-                eachObjectFile(*treesDir, [&](const std::filesystem::path & file) {
-                    checkInterrupt();
-                    if (reachable.count(file.filename().string()))
-                        return;
-                    if (heldObjects[2].contains(file.filename().string())) {
-                        stats.treesHeld++;
-                        return;
-                    }
-                    auto st = maybeLstat(file);
-                    if (!st)
-                        return;
-                    if (S_ISDIR(st->st_mode) || st->st_nlink != 1) {
-                        stats.treesHeld++;
-                        return;
-                    }
-                    remove(file);
-                    stats.treesRemoved++;
-                });
-
-            /* Blobs: an address neither reachable nor held, with no link
-               but the store's own, is unreferenced. */
-            for (size_t kind = 0; kind < 2; ++kind) {
-                auto blobsDir = sweptSub(kinds[kind]);
-                if (!blobsDir)
-                    continue;
-                eachObjectFile(*blobsDir, [&](const std::filesystem::path & file) {
-                    checkInterrupt();
-                    if (counters)
-                        counters->blobsStatted++;
-                    auto st = maybeLstat(file);
-                    if (!st)
-                        return;
-                    if (S_ISDIR(st->st_mode) || st->st_nlink != 1
-                        || heldObjects[kind].contains(file.filename().string())) {
-                        stats.blobsKept++;
-                        if (st->st_nlink > 1)
-                            stats.sharedBytes +=
-                                static_cast<uint64_t>(st->st_nlink - 2) * static_cast<uint64_t>(st->st_size);
-                        return;
-                    }
-                    if (named.count(file.filename().string())) {
-                        stats.blobsKept++;
-                        return;
-                    }
-                    printMsg(lvlTalkative, "deleting unreferenced object %1%", PathFmt(file));
-                    remove(file);
-                    stats.blobsRemoved++;
-                });
-            }
-        }
+#ifndef _WIN32
+    auto root = openDirectory(sweptDir, FinalSymlink::DontFollow);
+    if (!root) {
+        if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP)
+            return stats;
+        throw SysError("opening legacy object namespace %s", PathFmt(sweptDir));
     }
-
+    auto openChild = [&](Descriptor parent, const char * name) {
+        AutoCloseFD fd{openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
+        if (!fd && errno != ENOENT && errno != ENOTDIR && errno != ELOOP)
+            throw SysError("opening legacy object directory '%s'", name);
+        return fd;
+    };
+    auto status = [&](Descriptor parent, const char * name) -> std::optional<PosixStat> {
+        PosixStat st;
+        if (fstatat(parent, name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
+            if (errno == ENOENT || errno == ENOTDIR)
+                return std::nullopt;
+            throw SysError("getting status of legacy object '%s'", name);
+        }
+        return st;
+    };
+    auto remove = [&](Descriptor parent, const char * name, bool directory) {
+        if (unlinkat(parent, name, directory ? AT_REMOVEDIR : 0) == 0) {
+            removed();
+            return true;
+        }
+        if (errno == ENOENT || errno == ENOTDIR)
+            return false;
+        if (directory && (errno == ENOTEMPTY || errno == EEXIST))
+            return false;
+        throw SysError("removing legacy object '%s'", name);
+    };
+    auto scan = [&](AutoCloseFD fd, auto && visit) {
+        auto parent = fd.get();
+        AutoCloseDir stream{fdopendir(parent)};
+        if (!stream)
+            throw SysError("reading legacy object directory");
+        fd.release();
+        struct dirent * entry;
+        while (errno = 0, entry = readdir(stream.get())) {
+            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+                continue;
+            checkInterrupt();
+            visit(parent, entry->d_name);
+        }
+        if (errno)
+            throw SysError("reading legacy object directory");
+    };
+    auto cleanKind = [&](Descriptor parent, const char * kind, uint64_t * count) {
+        auto fd = openChild(parent, kind);
+        if (!fd)
+            return;
+        scan(std::move(fd), [&](Descriptor kindFd, const char * name) {
+            auto st = status(kindFd, name);
+            if (!st)
+                return;
+            if (S_ISDIR(st->st_mode)) {
+                if (!isShardName(name))
+                    return;
+                auto shard = openChild(kindFd, name);
+                if (!shard)
+                    return;
+                scan(std::move(shard), [&](Descriptor shardFd, const char * leaf) {
+                    auto leafSt = status(shardFd, leaf);
+                    if (leafSt && !S_ISDIR(leafSt->st_mode) && remove(shardFd, leaf, false) && count)
+                        ++*count;
+                });
+                remove(kindFd, name, true);
+            } else if (remove(kindFd, name, false) && count)
+                ++*count;
+        });
+        remove(parent, kind, true);
+    };
+    auto tmp = openChild(root.get(), "tmp");
+    if (tmp) {
+        AutoCloseFD mergedRoot, mergedTmp;
+        if (owned) {
+            mergedRoot = openDirectory(dir, FinalSymlink::DontFollow);
+            if (mergedRoot)
+                mergedTmp = openChild(mergedRoot.get(), "tmp");
+        }
+        auto now = time(nullptr);
+        scan(std::move(tmp), [&](Descriptor tmpFd, const char * name) {
+            auto st = status(tmpFd, name);
+            if (!st)
+                return;
+            if (!S_ISDIR(st->st_mode)) {
+                auto made = tempTime(name).value_or(st->st_ctime);
+                if (now - made > 3600)
+                    remove(tmpFd, name, false);
+                return;
+            }
+            if (!isHoldName(name))
+                return;
+            auto held = openChild(tmpFd, name);
+            if (!held)
+                return;
+            /* The overlay ingestion locks the merged name. Removal stays
+               under the independently opened upper directory throughout. */
+            AutoCloseFD merged;
+            if (owned && mergedTmp)
+                merged = openChild(mergedTmp.get(), name);
+            auto lockFd = owned ? (merged ? merged.get() : -1) : held.get();
+            if (lockFd == -1 || !lockFile(lockFd, ltWrite, false)) {
+                ++stats.holds;
+                return;
+            }
+            auto heldStat = nix::fstat(held.get());
+            auto current = status(tmpFd, name);
+            if (!current || current->st_ino != heldStat.st_ino || current->st_dev != heldStat.st_dev)
+                return;
+            try {
+                if (failHoldRemoval && failHoldRemoval(dir / "tmp" / name))
+                    throw SysError(ENOTEMPTY, "cannot remove ingestion lease '%s'", name);
+                for (auto kind : kinds)
+                    cleanKind(held.get(), kind.data(), nullptr);
+                /* Regular coalescing pins and old flat temporary links are
+                   leaves. Unknown directories are retained, not recursed. */
+                scan(dupDescriptor(held.get()), [&](Descriptor holdFd, const char * leaf) {
+                    auto leafSt = status(holdFd, leaf);
+                    if (leafSt && !S_ISDIR(leafSt->st_mode))
+                        remove(holdFd, leaf, false);
+                });
+                if (!remove(tmpFd, name, true) && status(tmpFd, name))
+                    ++stats.holds;
+            } catch (SystemError & e) {
+                printInfo("cannot remove the ingestion lease '%s': %s", name, e.msg());
+                ++stats.holds;
+            }
+        });
+    }
+    for (auto kind : kinds)
+        cleanKind(root.get(), kind.data(), kind == "trees" ? &stats.treesRemoved : &stats.blobsRemoved);
+#else
+    /* Keep the existing portable no-follow metadata/directory operations on
+       Windows. No publisher uses these legacy names after the transition. */
+    auto root = maybeLstat(sweptDir);
+    if (!root || !S_ISDIR(root->st_mode))
+        return stats;
+    auto remove = [&](const std::filesystem::path & path) {
+        std::error_code ec;
+        bool didRemove = std::filesystem::remove(path, ec);
+        if (ec && ec != std::errc::no_such_file_or_directory && ec != std::errc::not_a_directory
+            && ec != std::errc::directory_not_empty)
+            throw SystemError(ec, "removing legacy object %s", PathFmt(path));
+        if (didRemove)
+            removed();
+        return didRemove;
+    };
+    auto cleanKind = [&](const std::filesystem::path & path, uint64_t * count) {
+        auto st = maybeLstat(path);
+        if (!st || !S_ISDIR(st->st_mode))
+            return;
+        for (auto & entry : DirectoryIterator{path}) {
+            checkInterrupt();
+            auto observed = maybeLstat(entry.path());
+            if (!observed)
+                continue;
+            if (S_ISDIR(observed->st_mode)) {
+                if (!isShardName(entry.path().filename().string()))
+                    continue;
+                for (auto & leaf : DirectoryIterator{entry.path()}) {
+                    checkInterrupt();
+                    auto leafSt = maybeLstat(leaf.path());
+                    if (leafSt && !S_ISDIR(leafSt->st_mode) && remove(leaf.path()) && count)
+                        ++*count;
+                }
+                remove(entry.path());
+            } else if (remove(entry.path()) && count)
+                ++*count;
+        }
+        remove(path);
+    };
+    auto tmp = sweptDir / "tmp";
+    if (auto st = maybeLstat(tmp); st && S_ISDIR(st->st_mode))
+        for (auto & entry : DirectoryIterator{tmp}) {
+            checkInterrupt();
+            auto st = maybeLstat(entry.path());
+            if (!st)
+                continue;
+            auto name = entry.path().filename().string();
+            if (!S_ISDIR(st->st_mode)) {
+                if (time(nullptr) - tempTime(name).value_or(st->st_ctime) > 3600)
+                    remove(entry.path());
+                continue;
+            }
+            if (!isHoldName(name))
+                continue;
+            auto held = openDirectory(dir / "tmp" / name, FinalSymlink::DontFollow);
+            if (!held || !lockFile(held.get(), ltWrite, false)) {
+                ++stats.holds;
+                continue;
+            }
+            try {
+                if (failHoldRemoval && failHoldRemoval(dir / "tmp" / name))
+                    throw SysError(ENOTEMPTY, "cannot remove ingestion lease '%s'", name);
+                for (auto kind : kinds)
+                    cleanKind(entry.path() / kind, nullptr);
+                for (auto & leaf : DirectoryIterator{entry.path()}) {
+                    checkInterrupt();
+                    auto leafSt = maybeLstat(leaf.path());
+                    if (leafSt && !S_ISDIR(leafSt->st_mode))
+                        remove(leaf.path());
+                }
+                if (!remove(entry.path()) && maybeLstat(entry.path()))
+                    ++stats.holds;
+            } catch (SystemError & e) {
+                printInfo("cannot remove the ingestion lease '%s': %s", name, e.msg());
+                ++stats.holds;
+            }
+        }
+    for (auto kind : kinds)
+        cleanKind(sweptDir / kind, kind == "trees" ? &stats.treesRemoved : &stats.blobsRemoved);
+#endif
     return stats;
 }
 

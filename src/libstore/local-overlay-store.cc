@@ -243,48 +243,17 @@ void LocalOverlayStore::collectGarbage(const GCOptions & options, GCResults & re
 
 void LocalOverlayStore::sweepObjectStore()
 {
-    /* The objects this store owns are the upper layer's: `.objects` under
-       the merged store directory is the union of the two layers', and
-       every object this store writes lands in the upper one (the one
-       route's `putObject` and `place`/`link` all go through the
-       merged directory).  A blob of the lower store's that an ingestion
-       here hard-linked was copied up by overlayfs -- a link never crosses
-       layers -- so the upper layer also holds copies of lower blobs; each
-       carries the link of the store path that caused it while that path
-       lives, and the sweep takes it when it does not.
-
-       The upper layer is read directly, not through the mount, so the
-       lower store's objects are neither enumerated nor judged.  The trees
-       are read through the mount, which is what this store reads to
-       materialise and verify: a tree the lower store holds keeps every
-       blob it names, whichever layer that blob's file is in. */
-    auto upperObjects = config->upperLayer.get() / ".objects";
-    auto lowerObjects = lowerStore->config.realStoreDir.get() / ".objects";
-
+    /* Auxiliary values belong to this store's database. Only legacy cache
+       entries and ingestion temporaries remain under `.objects`; the merged
+       mount also shows the lower store's, which this cleanup does not own. */
     GitObjectStore::Owned owned{
-        .dir = upperObjects,
-        .remove =
-            [&](const std::filesystem::path & file) {
-                auto rel = std::filesystem::relative(file, upperObjects);
-                if (pathExists(lowerObjects / rel)) {
-                    /* The lower store has a file of that name as well: an
-                       unlink through the mount would be a whiteout of it,
-                       so the upper layer's file goes directly and the mount
-                       is left to be remounted -- `deleteStorePath`'s rule
-                       for a store path in both layers, object file for
-                       object file. */
-                    unlinkIfExists(file);
-                    _remountRequired = true;
-                } else
-                    /* Only the upper layer has it: the unlink through the
-                       mount leaves no whiteout, there being no lower entry
-                       of that name to hide, and needs no remount. */
-                    unlinkIfExists(objects.dir / rel);
-            },
+        .dir = config->upperLayer.get() / ".objects",
+        /* The cleaner removes through descriptors opened in the upper
+           layer. Refresh the merged view after any actual removal. */
+        .removed = [&] { _remountRequired = true; },
     };
 
-    reportSweep(objects.sweep(
-        [&](fun<void(const ObjectHash &)> live) { return forEachValidObjectHash(std::move(live)); }, &owned));
+    reportSweep(objects.sweep(&owned));
 }
 
 void LocalOverlayStore::deleteStorePath(const std::filesystem::path & path, uint64_t & bytesFreed, bool isKnownPath)

@@ -435,6 +435,42 @@ TEST_F(MovePathTest, symlinkReplacesRegular)
     ASSERT_EQ(readLink(dst), "hello");
 }
 
+TEST_F(MovePathTest, deletePathCountsOnlyLastHardLink)
+{
+    const std::string contents = "one shared file";
+    for (unsigned int links : {1, 2, 3, 4}) {
+        SCOPED_TRACE(links);
+        auto dir = tmpDir / std::to_string(links);
+        createDir(dir);
+        auto first = dir / "0";
+        writeFile(first, contents);
+        for (unsigned int i = 1; i < links; ++i)
+            std::filesystem::create_hard_link(first, dir / std::to_string(i));
+
+        for (unsigned int i = 0; i < links; ++i) {
+            SCOPED_TRACE(i);
+            auto path = dir / std::to_string(i);
+            ASSERT_EQ(lstat(path).st_nlink, links - i);
+            uint64_t bytesFreed = 123;
+            deletePath(path, bytesFreed);
+            EXPECT_FALSE(pathExists(path));
+            EXPECT_EQ(bytesFreed, i + 1 == links ? contents.size() : 0);
+            for (unsigned int j = i + 1; j < links; ++j)
+                EXPECT_EQ(readFile(dir / std::to_string(j)), contents);
+        }
+    }
+
+    // Removing several aliases inside one tree counts their contents once.
+    auto dir = tmpDir / "recursive";
+    createDir(dir);
+    writeFile(dir / "first", contents);
+    std::filesystem::create_hard_link(dir / "first", dir / "second");
+    uint64_t bytesFreed = 123;
+    deletePath(dir, bytesFreed);
+    EXPECT_FALSE(pathExists(dir));
+    EXPECT_EQ(bytesFreed, contents.size());
+}
+
 #endif
 
 } // namespace nix

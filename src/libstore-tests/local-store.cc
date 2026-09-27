@@ -334,7 +334,8 @@ protected:
     {
         ASSERT_TRUE(hold.ingestion);
         ASSERT_FALSE(hold.ingestion->id);
-        auto rows = hold.takeRows();
+        auto projection = hold.takeProjection();
+        auto & rows = projection.regular;
         SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
         SQLiteTxn txn(db);
         SQLiteStmt ingestion{db, "insert into Ingestions(path, hold) values (null, ?);"};
@@ -352,6 +353,14 @@ protected:
                 .apply(row.name)
                 .apply(static_cast<int64_t>(row.size))
                 .exec();
+        SQLiteStmt auxiliary{db, "insert into AuxValues(kind, id, ingestion, chunk, body) values (?, ?, ?, 0, ?);"};
+        for (auto & value : projection.auxiliary)
+            auxiliary.use()
+                .apply(static_cast<int64_t>(value.entry.mode))
+                .apply(value.entry.hash.hash, value.entry.hash.hashSize)
+                .apply(static_cast<int64_t>(id))
+                .apply(reinterpret_cast<const unsigned char *>(value.body.data()), value.body.size())
+                .exec();
         txn.commit();
         hold.ingestion->id = id;
     }
@@ -362,9 +371,9 @@ protected:
         StringSource source{nar};
         CountingRestoreHooks hooks{
             makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
-        /* The ingestion's hold lasts the call: what these tests write is
-           unheld afterwards, as a registered path's objects are, so the
-           sweep tests below judge it by reachability alone. */
+        /* The ingestion's hold lasts the call. Afterwards, the fixture's
+           registration keeps its projection alive through path validity
+           and ingestion ownership. */
         auto hold = store->objects.hold();
         auto r = store->restoreThroughObjects(dst, source, /*startFsync=*/false, &hooks, hold, repair);
         /* The index rows an
@@ -383,51 +392,40 @@ protected:
         return lstat(p);
     }
 
-    /* A blob is held either by a store path (the index: every
-       regular file's) or by a file under `blobs/` (a symlink's target). */
     bool hasBlob(const Hash & id, bool executable)
     {
-        return store->objects.holderOrForget(id, executable, NoRepair).has_value()
-               || pathExists(store->objects.blobFile(id, executable));
+        return store->objects.holderOrForget(id, executable, NoRepair).has_value();
     }
 
-    /* The blob's canonical file: its holder, or the object store's file. */
+    bool hasAuxiliary(const Hash & id, merkle::Mode mode)
+    {
+        return store->objects.readAuxiliary({mode, id}).has_value();
+    }
+
     std::filesystem::path blobFileOf(const Hash & id, bool executable)
     {
-        if (auto holder = store->objects.holderOrForget(id, executable, NoRepair))
-            return std::filesystem::path(holder->file);
-        return store->objects.blobFile(id, executable);
+        auto holder = store->objects.holderOrForget(id, executable, NoRepair);
+        if (!holder)
+            throw Error("no regular-file holder %s", GitObjectStore::idString(id));
+        return holder->file;
     }
 
-    /* A crash's effect on a hold: the lock released, the directory left
-       (private to `Hold`; this fixture is its friend). */
     static void dropLock(GitObjectStore::Hold & hold)
     {
         hold.lease->fd.close();
     }
 
-    /* The object store's tree readers (private to it; this fixture is its friend). */
-    std::filesystem::path treeFile(const Hash & id)
-    {
-        return store->objects.treeFile(id);
-    }
-
     bool hasTree(const Hash & id)
     {
-        return pathExists(treeFile(id));
+        return hasAuxiliary(id, merkle::Mode::Directory);
     }
 
     merkle::Tree readTree(const Hash & id)
     {
-        auto body = store->objects.readTree(id);
+        auto body = store->objects.readAuxiliary({merkle::Mode::Directory, id});
         if (!body)
             throw Error("no tree %s", GitObjectStore::idString(id));
         return GitObjectStore::parseTreeBody(id, *body);
-    }
-
-    static std::optional<std::string> readAuxiliaryObject(GitObjectStore & objects, const Hash & id, unsigned kind)
-    {
-        return kind == 0 ? objects.readTree(id) : objects.readBlob(id, kind == 2);
     }
 
     static merkle::Tree parseTreeBody(const Hash & id, std::string_view body)
@@ -435,32 +433,133 @@ protected:
         return GitObjectStore::parseTreeBody(id, body);
     }
 
-    /* The object files under a kind, through its shards
-       (`GitObjectStore::eachObjectFile`); `tmp`, which is not sharded and
-       holds the ingestions' hold directories, is counted as it lies. */
+    void eraseAuxiliary(const merkle::TreeEntry & entry)
+    {
+        auto state = store->_state->lock();
+        SQLiteStmt remove{state->db, "delete from AuxValues where kind = ? and id = ?;"};
+        remove.use().apply(static_cast<int64_t>(entry.mode)).apply(entry.hash.hash, entry.hash.hashSize).exec();
+    }
+
+    void corruptAuxiliary(const merkle::TreeEntry & entry, std::string_view body)
+    {
+        auto state = store->_state->lock();
+        SQLiteStmt update{state->db, "update AuxValues set body = ? where kind = ? and id = ? and chunk = 0;"};
+        update.use()
+            .apply(reinterpret_cast<const unsigned char *>(body.data()), body.size())
+            .apply(static_cast<int64_t>(entry.mode))
+            .apply(entry.hash.hash, entry.hash.hashSize)
+            .exec();
+    }
+
+    bool verifyAuxiliaryForTest(RepairFlag repair)
+    {
+        return store->verifyAuxiliary(repair);
+    }
+
+    int64_t metadataSynchronousMode()
+    {
+        auto state = store->_state->lock();
+        SQLiteStmt query{state->db, "pragma synchronous;"};
+        auto use = query.use();
+        if (!use.next())
+            throw Error("missing synchronous mode");
+        return use.getInt(0);
+    }
+
+    std::string metadataJournalMode()
+    {
+        auto state = store->_state->lock();
+        SQLiteStmt query{state->db, "pragma journal_mode;"};
+        auto use = query.use();
+        if (!use.next())
+            throw Error("missing journal mode");
+        return use.getStr(0);
+    }
+
+    /* SQLite's own row trace gives a snapshot boundary without adding an
+       implementation hook. Exceptions cannot cross the C callback boundary. */
+    void withAuxiliaryRowTrace(std::function<void()> callback, std::function<void()> action)
+    {
+        struct Trace
+        {
+            std::function<void()> callback;
+            std::exception_ptr failure;
+        } trace{std::move(callback), {}};
+
+        {
+            auto state = store->_state->lock();
+            sqlite3_trace_v2(
+                state->db,
+                SQLITE_TRACE_ROW,
+                [](unsigned, void * context, void *, void *) -> int {
+                    auto & trace = *static_cast<Trace *>(context);
+                    if (!trace.failure)
+                        try {
+                            trace.callback();
+                        } catch (...) {
+                            trace.failure = std::current_exception();
+                        }
+                    return 0;
+                },
+                &trace);
+        }
+        Finally clear{[&] {
+            auto state = store->_state->lock();
+            sqlite3_trace_v2(state->db, 0, nullptr, nullptr);
+        }};
+        action();
+        if (trace.failure)
+            std::rethrow_exception(trace.failure);
+    }
+
+    uint64_t auxiliaryRowCount()
+    {
+        auto state = store->_state->lock();
+        SQLiteStmt query{state->db, "select count(*) from AuxValues;"};
+        auto use = query.use();
+        if (!use.next())
+            throw Error("missing count");
+        return use.getInt(0);
+    }
+
+    uint64_t publishAuxiliary(const std::filesystem::path & path, std::vector<GitObjectStore::Auxiliary> values)
+    {
+        auto hold = store->objects.hold();
+        store->beginIngestion(hold, path);
+        for (auto & value : values)
+            hold.addAuxiliary(std::move(value));
+        store->recordBlobsAtPath(hold, path);
+        return *hold.ingestion->id;
+    }
+
+    void forgetFixturePath(const std::filesystem::path & path)
+    {
+        auto logical = std::filesystem::path(config->storeDir) / path.filename();
+        auto state = store->_state->lock();
+        SQLiteStmt remove{state->db, "delete from ValidPaths where path = ?;"};
+        remove.use().apply(logical.string()).exec();
+    }
+
+    /* Logical values, rather than their SQL chunk count. Regular and symlink
+       values with equal bytes remain distinct, as do the two regular modes. */
     size_t count(std::string_view sub)
     {
-        size_t n = 0;
         if (sub == "tmp") {
-            for ([[maybe_unused]] auto & e : DirectoryIterator{store->objects.dir / std::string(sub)})
-                n++;
+            size_t n = 0;
+            for ([[maybe_unused]] auto & e : DirectoryIterator{store->objects.dir / "tmp"})
+                ++n;
             return n;
         }
-        GitObjectStore::eachObjectFile(
-            store->objects.dir / std::string(sub), [&](const std::filesystem::path &) { n++; });
-        /* Count auxiliary files plus distinct regular-file blob keys for
-           this mode. A symlink target and regular file can contribute
-           separately even with equal bytes. Raw candidate counts use
-           blobRowCount, since each ingestion retains its own witness. */
-        if (sub == "blobs" || sub == "blobs-x") {
-            auto state = store->_state->lock();
-            SQLiteStmt stmt{state->db, "select count(distinct id) from Blobs where exec = ?;"};
-            auto use = stmt.use();
-            use.apply(int64_t(sub == "blobs-x"));
-            if (use.next())
-                n += use.getInt(0);
-        }
-        return n;
+        auto state = store->_state->lock();
+        const auto sql = sub == "trees"   ? "select count(distinct id) from AuxValues where kind = 16384;"
+                         : sub == "blobs" ? "select (select count(distinct id) from Blobs where exec = 0) + "
+                                            "(select count(distinct id) from AuxValues where kind = 40960);"
+                                          : "select count(distinct id) from Blobs where exec = 1;";
+        SQLiteStmt query{state->db, sql};
+        auto use = query.use();
+        if (!use.next())
+            throw Error("missing count");
+        return use.getInt(0);
     }
 
     /* The walk over the path as written, without hooks: the independent
@@ -896,50 +995,21 @@ TEST_F(LocalStoreObjectsTest, restoreThroughObjects)
     EXPECT_EQ(count("blobs"), 4u);
     EXPECT_EQ(store->blobRowCount(false), 7u);
 
-    /* The sweep, over the live roots the caller yields (the object hashes
-       of the valid paths, in the store the database's column): the trees
-       nothing reaches go, then the blob files nothing links.  A plain
-       file's object hash (`r3`'s) names no tree and is simply no root of
-       any tree; its blob is held by its links. */
-    auto swept = objects.sweep([&](fun<void(const ObjectHash &)> live) {
-        live(ObjectHash::of(root1));
-        live(ObjectHash::of(r3.root));
-        return 0;
-    });
-    EXPECT_EQ(swept.unmigrated, 0u);
-    EXPECT_EQ(swept.treesRemoved, 0u);
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    /* The sweep's blob pass judges the symlink-target blob
-       alone; the regular files' blobs have no file under `blobs/` to
-       judge, being held by the paths themselves (design.md section 2.2). */
-    EXPECT_EQ(swept.blobsKept, 1u);
-    /* A root the enumeration cannot give (an unmigrated row) stops the
-       sweep from removing anything but temporary files. */
-    swept = objects.sweep([](fun<void(const ObjectHash &)>) { return 1; });
-    EXPECT_EQ(swept.unmigrated, 1u);
-    EXPECT_EQ(swept.treesRemoved, 0u);
-    EXPECT_EQ(swept.blobsRemoved, 0u);
+    /* Each registered projection owns its auxiliary values. Removing one
+       donor cannot revoke another donor's values; the last invalidation can. */
+    objects.sweep();
     EXPECT_EQ(count("trees"), 3u);
-    EXPECT_EQ(count("blobs"), 4u);
-    swept = objects.sweep([](fun<void(const ObjectHash &)>) { return 0; });
-    EXPECT_EQ(swept.treesRemoved, 3u);
-    /* The symlink's blob, linked by nothing, goes with the trees that named it. */
-    EXPECT_EQ(swept.blobsRemoved, 1u);
-    EXPECT_FALSE(hasBlob(merkle::blobId("b"), false));
-    EXPECT_EQ(count("trees"), 0u);
-    deletePath(t1);
-    deletePath(t2);
-    deletePath(t3);
-    swept = objects.sweep([](fun<void(const ObjectHash &)>) { return 0; });
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(count("blobs"), 3u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(count("blobs-x"), 1u);
+    forgetFixturePath(t1);
+    store->sweepStaleBlobRows();
+    EXPECT_TRUE(hasTree(root1.hash));
+    EXPECT_TRUE(hasAuxiliary(merkle::blobId("b"), merkle::Mode::Symlink));
+    forgetFixturePath(t2);
+    forgetFixturePath(t3);
+    store->sweepStaleBlobRows();
+    EXPECT_EQ(auxiliaryRowCount(), 0u);
+    EXPECT_EQ(store->blobRowCount(false), 0u);
+    EXPECT_EQ(store->blobRowCount(true), 0u);
+    EXPECT_EQ(readFile(t1 / "a"), "one") << "metadata collection does not remove the path's bytes";
 }
 
 /* A tree differing from one the store holds in one file: that file is
@@ -1053,14 +1123,6 @@ TEST_F(LocalStoreObjectsTest, executableFirst)
     EXPECT_NE(st(t / "a-x").st_ino, st(t / "b").st_ino);
 }
 
-/* An executable or symlink root (01 section 9.11, the review): its object
-   hash is the id of the synthetic tree `{"." -> root}`, and when entering
-   the sink writes that tree, so that the root's blob is reachable from
-   the tree its object hash names as a directory's blobs are from its
-   trees.  A sweep that keeps the path removes nothing; one that drops it
-   removes the synthetic tree, and with it the symlink's blob (linked by
-   nothing) but not the executable's while the store path's link holds
-   it -- the link-count rule for blobs. */
 TEST_F(LocalStoreObjectsTest, syntheticRootTreeIsWrittenAndKeepsItsBlob)
 {
     auto & objects = store->objects;
@@ -1088,8 +1150,7 @@ TEST_F(LocalStoreObjectsTest, syntheticRootTreeIsWrittenAndKeepsItsBlob)
     EXPECT_EQ(ObjectHash::of(rl.root).hash, linkTree);
     EXPECT_TRUE(hasTree(linkTree));
     EXPECT_EQ(readTree(linkTree).at("."), (merkle::TreeEntry{merkle::Mode::Symlink, merkle::blobId("target")}));
-    EXPECT_TRUE(hasBlob(merkle::blobId("target"), false));
-    EXPECT_EQ(st(blobFileOf(merkle::blobId("target"), false)).st_nlink, 1u);
+    EXPECT_TRUE(hasAuxiliary(merkle::blobId("target"), merkle::Mode::Symlink));
 
     auto x = realStoreDir / "x";
     auto rx = restore(x, execNar.s);
@@ -1110,49 +1171,20 @@ TEST_F(LocalStoreObjectsTest, syntheticRootTreeIsWrittenAndKeepsItsBlob)
     EXPECT_EQ(count("blobs"), 1u);
     EXPECT_EQ(count("blobs-x"), 1u);
 
-    /* Both live: nothing goes; the symlink's blob is kept through its tree. */
-    auto swept = objects.sweep([&](fun<void(const ObjectHash &)> live) {
-        live(ObjectHash::of(rl.root));
-        live(ObjectHash::of(rx.root));
-        return 0;
-    });
-    EXPECT_EQ(swept.treesRemoved, 0u);
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsKept, 1u);
-
-    /* The symlink dropped: its synthetic tree, and then its blob, go. */
-    swept = objects.sweep([&](fun<void(const ObjectHash &)> live) {
-        live(ObjectHash::of(rx.root));
-        return 0;
-    });
-    EXPECT_EQ(swept.treesRemoved, 1u);
-    EXPECT_EQ(swept.blobsRemoved, 1u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsKept, 0u);
-    EXPECT_FALSE(hasBlob(merkle::blobId("target"), false));
+    objects.sweep();
+    EXPECT_TRUE(hasTree(linkTree));
     EXPECT_TRUE(hasTree(execTree));
-
-    /* The executable dropped while its file stands: the tree goes, the
-       blob stays by its link; once the file is gone, the blob goes too. */
-    swept = objects.sweep([](fun<void(const ObjectHash &)>) { return 0; });
-    EXPECT_EQ(swept.treesRemoved, 1u);
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsKept, 0u);
+    forgetFixturePath(l);
+    store->sweepStaleBlobRows();
+    EXPECT_FALSE(hasTree(linkTree));
+    EXPECT_FALSE(hasAuxiliary(merkle::blobId("target"), merkle::Mode::Symlink));
+    EXPECT_TRUE(hasTree(execTree));
     EXPECT_TRUE(hasBlob(merkle::blobId("run"), true));
+    forgetFixturePath(x);
+    store->sweepStaleBlobRows();
     EXPECT_EQ(count("trees"), 0u);
-    deletePath(x);
-    swept = objects.sweep([](fun<void(const ObjectHash &)>) { return 0; });
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(count("blobs-x"), 1u);
+    EXPECT_EQ(auxiliaryRowCount(), 0u);
+    EXPECT_EQ(readFile(x), "run");
 }
 
 /* Repair: a blob's *holder* corrupted in place, same length, is not linked
@@ -1386,8 +1418,7 @@ TEST_F(LocalStoreObjectsTest, enterIntoObjectsAndMigrate)
      * no link into `.objects/blobs` beside it (K8) */
     EXPECT_EQ(st(p / "d/x").st_nlink, 1u);
     EXPECT_NE(st(p / "d/x").st_ino, st(p / "a").st_ino);
-    /* The symlink's target is an auxiliary file; the regular-file blobs
-       have published witnesses in the path itself. */
+    /* The symlink target is an auxiliary value; regular bytes have physical witnesses. */
     EXPECT_EQ(count("blobs"), 2u); /* the symlink's "a" and the plain "one" */
     EXPECT_EQ(count("blobs-x"), 1u);
     EXPECT_EQ(count("trees"), 2u);
@@ -1427,9 +1458,11 @@ TEST_F(LocalStoreObjectsTest, optimiseStoreMigratesAnOldRowAndEntersNoModifiedPa
             NoRepair);
         auto narHash = hashString(HashAlgorithm::SHA256, nar);
         plantSchema10Row(*store, p, narHash, nar.size());
-        /* As an older store holds the path: its file plain, no blob. */
+        /* Replacing the inode makes the current holder row stale while
+           preserving the older store's physical file and bytes. */
         unlinkInPlace(store->toRealPath(p) / "a");
-        std::filesystem::remove(blobFileOf(merkle::blobId(bytes), false));
+        EXPECT_FALSE(hasBlob(merkle::blobId(bytes), false));
+        EXPECT_EQ(readFile(store->toRealPath(p) / "a"), bytes);
         return std::pair{p, narHash.to_string(HashFormat::Base16, true)};
     };
     auto [sound, soundColumn] = add("sound", "one\n");
@@ -1604,145 +1637,6 @@ TEST_F(LocalStoreObjectsTest, caseHackSuffixIsNotHashed)
     EXPECT_EQ(tree.at("foo"), (merkle::TreeEntry{merkle::Mode::Regular, merkle::blobId("2")}));
 }
 
-/* Law 4 of 01 section 9.10 against the sweep: a blob a live tree names is
-   kept whatever its link count.  A file the store could not link -- here
-   made so by hand, under both modes -- leaves its blob with the store's
-   link alone, and the sweep must not take it while the path is valid. */
-/* A blob file no path links -- one the store's own naming holds -- is kept
-   while a live tree names it and goes when none does.
-   What this pinned before and what it pins now.  Before, the two blobs
-   were a *regular* file's and an executable's, each with a file under
-   `.objects/blobs`, and the test broke the paths' links (`unlinkInPlace`)
-   so that the files stood at one link and only the tree kept them.  A
-   regular-file blob has no file of the store's own any more -- its
-   canonical file is the store path's own, and what stands where the file
-   stood is the row -- so the blobs this rule still has a domain over are
-   the **symlink targets**, which no path holds and which are therefore at
-   one link from their first instant (`01` §9.10: "kept for the encoding's
-   completeness and linked by nothing").  The two regular files stay in the
-   tree to say what the sweep's blob pass now does *not* judge: their blobs
-   are rows, owned by the path, and neither is counted here. */
-TEST_F(LocalStoreObjectsTest, sweepKeepsASymlinkBlobALiveTreeNamesThoughNothingLinksIt)
-{
-    auto nar = treeNar({{"a", "kept", 'f'}, {"l", "kept alone", 'l'}, {"x", "kept too", 'x'}});
-    auto & objects = store->objects;
-    auto t = std::filesystem::path{config->realStoreDir.get()} / "unlinked";
-    auto r = restore(t, nar);
-
-    auto plain = merkle::blobId("kept");
-    auto exec = merkle::blobId("kept too");
-    auto target = merkle::blobId("kept alone");
-
-    /* The symlink's target is the one blob here with a file of the store's
-       own naming, and nothing links it. */
-    ASSERT_EQ(blobFileOf(target, false), objects.blobFile(target, false));
-    ASSERT_EQ(st(blobFileOf(target, false)).st_nlink, 1u);
-    /* The two regular files' blobs have no file under `blobs/` at all:
-       their holders are this path's own files, at one link apiece, the
-       index and not the link count being the witness (`08` K8). */
-    ASSERT_EQ(blobFileOf(plain, false), t / "a");
-    ASSERT_EQ(blobFileOf(exec, true), t / "x");
-    ASSERT_FALSE(pathExists(objects.blobFile(plain, false)));
-    ASSERT_FALSE(pathExists(objects.blobFile(exec, true)));
-    ASSERT_EQ(st(t / "a").st_nlink, 1u);
-    ASSERT_EQ(st(t / "x").st_nlink, 1u);
-    ASSERT_EQ(st(t / "x").st_mode & ~S_IFMT, 0555u);
-
-    /* The path live: the tree names the symlink's blob, so it stays. */
-    auto swept = objects.sweep([&](fun<void(const ObjectHash &)> live) {
-        live(ObjectHash::of(r.root));
-        return 0;
-    });
-    EXPECT_EQ(swept.treesRemoved, 0u);
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    EXPECT_EQ(swept.blobsKept, 1u) << "the symlink's target, kept by the tree that names it";
-    EXPECT_TRUE(hasBlob(target, false));
-    EXPECT_TRUE(hasBlob(plain, false));
-    EXPECT_TRUE(hasBlob(exec, true));
-
-    /* The path dropped: the tree goes, and with it the symlink's blob.
-       The regular files' rows are not this sweep's business -- they go
-       with their path, by the stale-row rule
-       (`theSweepJudgesARowByItsIngestionsPath`). */
-    swept = objects.sweep([](fun<void(const ObjectHash &)>) { return 0; });
-    EXPECT_EQ(swept.treesRemoved, 1u);
-    EXPECT_EQ(swept.blobsRemoved, 1u);
-    EXPECT_EQ(swept.blobsKept, 0u);
-    EXPECT_FALSE(hasBlob(target, false));
-}
-
-/* A tree file whose body is not its name's -- empty after a crash, or
-   short -- is not trusted by the sweep: an empty body parses as an empty
-   tree, under which nothing beneath the root would be reachable, and a
-   partial body does not parse.  On either the sweep warns and removes
-   nothing; once the tree is whole again, the same sweep removes nothing
-   because everything is live.  The discriminator: before, the empty body
-   was an empty tree and the subtree and its blob went. */
-TEST_F(LocalStoreObjectsTest, sweepAbortsOnACorruptTree)
-{
-    auto nar = treeWithSymlink();
-    auto & objects = store->objects;
-    auto t = std::filesystem::path{config->realStoreDir.get()} / "corrupt-tree";
-    auto r = restore(t, nar);
-    auto rootFile = treeFile(r.root.hash);
-    auto body = readFile(rootFile);
-    ASSERT_EQ(count("trees"), 2u);
-    ASSERT_EQ(count("blobs"), 3u); /* "one", "two", the symlink's "b" */
-    auto live = [&](fun<void(const ObjectHash &)> f) {
-        f(ObjectHash::of(r.root));
-        return 0;
-    };
-
-    /* Empty: hashes to the empty tree, not to its name. */
-    chmod(rootFile, 0644);
-    writeFile(rootFile, "");
-    auto swept = objects.sweep(live);
-    EXPECT_EQ(swept.corruptTrees, 1u);
-    EXPECT_EQ(swept.treesRemoved, 0u);
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    EXPECT_EQ(count("trees"), 2u);
-    EXPECT_EQ(count("blobs"), 3u);
-
-    /* Short: the right prefix, which does not parse. */
-    writeFile(rootFile, body.substr(0, body.size() / 2));
-    swept = objects.sweep(live);
-    EXPECT_EQ(swept.corruptTrees, 1u);
-    EXPECT_EQ(swept.treesRemoved, 0u);
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    EXPECT_EQ(count("trees"), 2u);
-    EXPECT_EQ(count("blobs"), 3u);
-
-    /* Whole again: live, so nothing goes, and nothing is reported. */
-    writeFile(rootFile, body);
-    swept = objects.sweep(live);
-    EXPECT_EQ(swept.corruptTrees, 0u);
-    EXPECT_EQ(swept.treesRemoved, 0u);
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsKept, 1u);
-}
-
-/* Laws 4 and 5 under a lost window (01 section 9.10, "Collection"): a
-   valid path whose root tree a collection took between `putObject` and its
-   registration.  The next sweep, with that path live, counts the root as
-   unentered and keeps nothing beneath it -- the orphaned `d/` tree goes,
-   and with it the symlink's blob, held by nothing but the tree that named
-   it -- and removes what else is dead (before, the removal phase was
-   abandoned and every later collection reclaimed nothing).  `verifyStore
-   --check-contents` reports the path, re-entering it under --repair, after
-   which the trees and blobs are back and the sweep keeps everything.
-
-   What changed under the holder representation.  The unlinked file's blob
-   used to be a second thing this sweep removed: a file under
-   `.objects/blobs` that only the lost tree named.  A regular-file blob has
-   no such file, so `unlinkInPlace` no longer strands a blob file -- it
-   makes the *row* untrue, and the store forgets it (`08` K2, which never
-   removes the file, a valid path owning it).  The statement about the
-   verifier is therefore stronger than it was: law 4 for a regular file is
-   now "the index knows the blob with a holder that is still what the row
-   says", and it is the missing *row*, not a missing file, that
-   `--check-contents` reports and `--repair` puts back. */
 TEST_F(LocalStoreObjectsTest, sweepAndVerifyOnALiveRootWhoseTreeIsMissing)
 {
     auto nar = treeWithSymlink();
@@ -1764,11 +1658,9 @@ TEST_F(LocalStoreObjectsTest, sweepAndVerifyOnALiveRootWhoseTreeIsMissing)
     auto dTree = readTree(rootTree).at("d/").hash;
     ASSERT_TRUE(hasTree(dTree));
     auto symlinkBlob = merkle::blobId("b");
-    ASSERT_TRUE(hasBlob(symlinkBlob, false));
-    ASSERT_EQ(st(blobFileOf(symlinkBlob, false)).st_nlink, 1u);
+    ASSERT_TRUE(hasAuxiliary(symlinkBlob, merkle::Mode::Symlink));
     ASSERT_EQ(count("trees"), 2u);
-    /* One file under `blobs/` -- the symlink's target -- and two rows, for
-       `a` and `d/b`, whose holders are this path's own files. */
+    /* One symlink value and two regular-holder keys. */
     ASSERT_EQ(count("blobs"), 3u);
     ASSERT_EQ(store->blobRowCount(false), 2u);
     /* `a` left as the store leaves a file it could not link.  Before, that
@@ -1783,21 +1675,15 @@ TEST_F(LocalStoreObjectsTest, sweepAndVerifyOnALiveRootWhoseTreeIsMissing)
     ASSERT_EQ(count("blobs"), 2u);
 
     /* The race lost: the root tree is gone. */
-    std::filesystem::remove(treeFile(rootTree));
+    eraseAuxiliary({merkle::Mode::Directory, rootTree});
     ASSERT_FALSE(hasTree(rootTree));
-    auto live = [&](fun<void(const ObjectHash &)> f) {
-        f(*row->objectHash);
-        return 0;
-    };
-
-    auto swept = objects.sweep(live);
-    EXPECT_EQ(swept.unentered, 1u);
-    EXPECT_EQ(swept.treesRemoved, 1u) << "the orphaned d/ tree";
-    EXPECT_EQ(swept.blobsRemoved, 1u) << "the symlink's blob, the one blob here with a file of its own";
-    EXPECT_FALSE(hasTree(dTree));
-    EXPECT_FALSE(hasBlob(symlinkBlob, false));
+    auto swept = objects.sweep();
+    EXPECT_EQ(swept.treesRemoved, 0u);
+    EXPECT_EQ(swept.blobsRemoved, 0u);
+    EXPECT_TRUE(hasTree(dTree)) << "a missing root cannot revoke independently owned child values";
+    EXPECT_TRUE(hasAuxiliary(symlinkBlob, merkle::Mode::Symlink));
     EXPECT_FALSE(hasBlob(merkle::blobId("one"), false));
-    EXPECT_EQ(count("blobs"), 1u) << "the row for \"two\", whose holder is d/b";
+    EXPECT_EQ(count("blobs"), 2u);
     EXPECT_EQ(readFile(store->toRealPath(info.path) / "a"), "one") << "the path's bytes are its own";
 
     /* The verifier: the path reaches objects the store lacks. */
@@ -1807,7 +1693,7 @@ TEST_F(LocalStoreObjectsTest, sweepAndVerifyOnALiveRootWhoseTreeIsMissing)
     EXPECT_TRUE(hasTree(rootTree));
     EXPECT_TRUE(hasTree(dTree));
     EXPECT_EQ(readTree(rootTree).at("d/").hash, dTree);
-    EXPECT_TRUE(hasBlob(symlinkBlob, false));
+    EXPECT_TRUE(hasAuxiliary(symlinkBlob, merkle::Mode::Symlink));
     EXPECT_TRUE(hasBlob(merkle::blobId("one"), false));
     /* Re-entered: the row is back and names this path's own file, which is
        at one link, the holder being the file itself (`08` K8). */
@@ -1816,11 +1702,10 @@ TEST_F(LocalStoreObjectsTest, sweepAndVerifyOnALiveRootWhoseTreeIsMissing)
     EXPECT_EQ(store->blobRowCount(false), 2u) << "repair replaces the path's previous projection";
     EXPECT_FALSE(store->verifyStore(/*checkContents=*/true, NoRepair));
 
-    swept = objects.sweep(live);
-    EXPECT_EQ(swept.unentered, 0u);
+    swept = objects.sweep();
     EXPECT_EQ(swept.treesRemoved, 0u);
     EXPECT_EQ(swept.blobsRemoved, 0u);
-    EXPECT_EQ(swept.blobsKept, 1u) << "the symlink's blob; the other two are rows";
+    EXPECT_TRUE(hasAuxiliary(symlinkBlob, merkle::Mode::Symlink));
 }
 
 /* Delivers `s` but for its last `tail` bytes, then runs `atPause` once,
@@ -1855,22 +1740,6 @@ struct PausingSource : Source
     }
 };
 
-/* The concurrent window (01 §9.10, "Collection"; 08 §1.5): a whole-store
-   collection that runs while an ingestion is between its object writes
-   and its registration.  The ingestion is the real `addToStore(info,
-   source)`; the pause is the source's own -- it delivers the NAR up to
-   the closing of its last directory, so that every subtree and every
-   symlink's blob is written and the root tree is not (trees are written
-   bottom-up, K10) -- and at the pause the collector runs, on this store,
-   as the builder's `autoGC(false)` thread or another process's
-   `nix-store --gc` would; the sweep is the same code whichever process
-   runs it, and a hold's lock conflicts across descriptors within one
-   process as across processes (`createTempDirInStore` rests on the
-   same).  Afterwards the registered path must reach every object its
-   hash names (law 4), the verifier must find nothing, and a later sweep
-   must count nothing missing.  Before the hold: the collection took the
-   subtree and the symlink's blob, and the path was registered naming
-   them. */
 TEST_F(LocalStoreObjectsTest, ingestionTreesSurviveAConcurrentSweep)
 {
     /* lsof is slow and not needed here (local-gc.cc). */
@@ -1898,9 +1767,9 @@ TEST_F(LocalStoreObjectsTest, ingestionTreesSurviveAConcurrentSweep)
        unwritten. */
     bool collected = false;
     PausingSource source{nar, 32, [&] {
-                             EXPECT_TRUE(hasTree(dTree)) << "the subtree is written before the pause";
+                             EXPECT_FALSE(hasTree(dTree)) << "staged values are private until publication";
                              EXPECT_FALSE(hasTree(rootTree)) << "the root is written after it";
-                             EXPECT_TRUE(hasBlob(symlinkBlob, false));
+                             EXPECT_FALSE(hasAuxiliary(symlinkBlob, merkle::Mode::Symlink));
                              EXPECT_FALSE(store->isValidPath(info.path));
                              GCOptions options;
                              options.action = GCOptions::gcDeleteDead;
@@ -1917,40 +1786,16 @@ TEST_F(LocalStoreObjectsTest, ingestionTreesSurviveAConcurrentSweep)
     EXPECT_EQ(row->objectHash->hash, rootTree);
     EXPECT_TRUE(hasTree(rootTree));
     EXPECT_TRUE(hasTree(dTree)) << "the subtree written before the collection survived it";
-    EXPECT_TRUE(hasBlob(symlinkBlob, false)) << "the symlink's blob survived it";
+    EXPECT_TRUE(hasAuxiliary(symlinkBlob, merkle::Mode::Symlink)) << "the symlink's blob survived it";
     EXPECT_EQ(count("trees"), 2u);
     EXPECT_FALSE(store->verifyStore(/*checkContents=*/true, NoRepair)) << "law 4 holds for the path";
 
-    auto swept = objects.sweep([&](fun<void(const ObjectHash &)> f) {
-        f(*row->objectHash);
-        return 0;
-    });
-    EXPECT_EQ(swept.unentered, 0u);
-    EXPECT_EQ(swept.missingSubtrees, 0u);
+    auto swept = objects.sweep();
     EXPECT_EQ(swept.treesRemoved, 0u);
     EXPECT_EQ(swept.blobsRemoved, 0u);
     EXPECT_EQ(count("trees"), 2u);
 }
 
-/* The window inside a hold's own making (`08` section 1.5, K16): a
-   collection whose sweep reaches an ingestion's hold after the directory
-   is visible under `.objects/tmp` and before its lock is taken.  The
-   hold's lock is free at that instant, which is what the sweep reads as
-   "a dead ingestion's", so it removes the directory -- and the maker
-   must come out of the window with a hold that is whole or with none at
-   all.  It is whole because the directory is made empty and its three
-   kind directories are made under the lock: the sweep takes an empty
-   directory, the maker finds it gone and makes another.  Were the kinds
-   made before the lock, the maker's remaining `createDirs` would remake
-   the directory *without* the kinds already made, and every `holdObject`
-   into a missing kind would read `ENOENT` as "no such object" and hold
-   nothing -- silently, since `writeObjectFile` ignores the second hold's
-   answer.  So the check is the composition of the two windows: one
-   collection while the hold is made, a second at the ingestion's pause,
-   between its symlink blob and its root tree, where only the hold can
-   keep that blob.  The collector met the other half of the same window
-   as `ENOTEMPTY` out of the sweep's own `deletePath`, racing the maker's
-   `mkdir` (`tests/functional/gc-non-blocking.sh`; `07`). */
 TEST_F(LocalStoreObjectsTest, ingestionSurvivesASweepWhileItsHoldIsMade)
 {
     /* lsof is slow and not needed here (local-gc.cc). */
@@ -1998,9 +1843,9 @@ TEST_F(LocalStoreObjectsTest, ingestionSurvivesASweepWhileItsHoldIsMade)
     /* The second, at the pause: `d`'s tree and the symlink's blob written,
        the root tree not (as `ingestionTreesSurviveAConcurrentSweep`). */
     PausingSource source{nar, 32, [&] {
-                             EXPECT_TRUE(hasTree(dTree));
+                             EXPECT_FALSE(hasTree(dTree));
                              EXPECT_FALSE(hasTree(rootTree));
-                             EXPECT_TRUE(hasBlob(symlinkBlob, false));
+                             EXPECT_FALSE(hasAuxiliary(symlinkBlob, merkle::Mode::Symlink));
                              collect();
                          }};
     store->addToStore(info, source, NoRepair, NoCheckSigs);
@@ -2013,268 +1858,98 @@ TEST_F(LocalStoreObjectsTest, ingestionSurvivesASweepWhileItsHoldIsMade)
     EXPECT_EQ(row->objectHash->hash, rootTree);
     EXPECT_TRUE(hasTree(rootTree));
     EXPECT_TRUE(hasTree(dTree)) << "held under `trees`";
-    EXPECT_TRUE(hasBlob(symlinkBlob, false)) << "held under `blobs`, which the remade hold lacked";
+    EXPECT_TRUE(hasAuxiliary(symlinkBlob, merkle::Mode::Symlink)) << "held under `blobs`, which the remade hold lacked";
     EXPECT_EQ(count("tmp"), 0u) << "the hold was released";
     EXPECT_FALSE(store->verifyStore(/*checkContents=*/true, NoRepair)) << "law 4 holds for the path";
 
-    auto swept = objects.sweep([&](fun<void(const ObjectHash &)> f) {
-        f(*row->objectHash);
-        return 0;
-    });
-    EXPECT_EQ(swept.unentered, 0u);
-    EXPECT_EQ(swept.missingSubtrees, 0u);
+    auto swept = objects.sweep();
     EXPECT_EQ(swept.treesRemoved, 0u);
     EXPECT_EQ(swept.blobsRemoved, 0u);
     EXPECT_EQ(count("trees"), 2u);
 }
 
-/* A hold's other half (`GitObjectStore::Hold`; `08` K16): what an
-   ingestion holds is kept only while its process lives.  A hold whose
-   lock is free -- the process died with the objects written and the path
-   unregistered -- is removed by the sweep's temporary pass with its
-   links, and the objects it held, reachable from nothing, go in the same
-   sweep; a locked one is left and keeps them.  The hold is that of the
-   ingestion's `restoreThroughObjects` itself, its lock dropped as a
-   crash drops it, the directory left standing. */
 TEST_F(LocalStoreObjectsTest, deadHoldIsReleasedBySweep)
 {
-    auto nar = treeWithSymlink();
     auto & objects = store->objects;
-    auto dead = std::filesystem::path{config->realStoreDir.get()} / "dead";
+    auto dead = config->realStoreDir.get() / "dead";
     auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
-    StringSource source{nar};
+    StringSource source{treeWithSymlink()};
     std::optional<GitObjectStore::Hold> hold{objects.hold()};
-    auto r = store->restoreThroughObjects(dead, source, /*startFsync=*/false, hooks.get(), *hold);
-    auto dTree = readTree(r.root.hash).at("d/").hash;
-    auto symlinkBlob = merkle::blobId("b");
-    ASSERT_EQ(count("tmp"), 1u) << "the hold's directory";
-    ASSERT_EQ(st(treeFile(r.root.hash)).st_nlink, 2u) << "held";
-    ASSERT_EQ(st(treeFile(dTree)).st_nlink, 2u);
-    ASSERT_EQ(st(blobFileOf(symlinkBlob, false)).st_nlink, 2u);
-    deletePath(dead);
-    auto none = [](fun<void(const ObjectHash &)>) { return 0; };
-
-    /* In flight: nothing reachable; the trees and the symlink's blob held.
-       The files' blobs were held by the path's links alone (K4), which
-       went with it. */
-    auto swept = objects.sweep(none);
+    auto r = store->restoreThroughObjects(dead, source, false, hooks.get(), *hold);
+    stageLegacyUnregisteredRows(*hold);
+    ASSERT_EQ(count("tmp"), 1u);
+    auto rows = auxiliaryRowCount();
+    ASSERT_GT(rows, 0u);
+    EXPECT_TRUE(hasTree(r.root.hash)) << "authenticated owned bytes do not require a valid physical donor";
+    auto swept = objects.sweep();
+    store->sweepStaleBlobRows();
     EXPECT_EQ(swept.holds, 1u);
-    EXPECT_EQ(swept.treesHeld, 2u);
-    EXPECT_EQ(swept.treesRemoved, 0u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsRemoved, 0u) << "the files' blobs went with the path, not with the sweep";
-    EXPECT_EQ(count("trees"), 2u);
-    EXPECT_TRUE(hasBlob(symlinkBlob, false));
-
-    /* The crash: the lock is released, the directory stays. */
+    EXPECT_EQ(auxiliaryRowCount(), rows);
+    EXPECT_GT(store->blobRowCount(false), 0u);
     dropLock(*hold);
-    swept = objects.sweep(none);
+    swept = objects.sweep();
+    store->sweepStaleBlobRows();
     EXPECT_EQ(swept.holds, 0u);
-    EXPECT_EQ(swept.treesHeld, 0u);
-    EXPECT_EQ(swept.treesRemoved, 2u);
-    EXPECT_EQ(swept.blobsRemoved, 1u) << "the symlink's blob";
-    EXPECT_EQ(count("tmp"), 0u) << "the dead hold went first";
-    EXPECT_EQ(count("trees"), 0u);
-    EXPECT_FALSE(hasBlob(symlinkBlob, false));
-    /* The destructor of a hold whose directory is gone does nothing. */
+    EXPECT_EQ(count("tmp"), 0u);
+    EXPECT_EQ(auxiliaryRowCount(), 0u);
+    EXPECT_FALSE(hasTree(r.root.hash));
+    EXPECT_EQ(store->blobRowCount(false), 0u);
+    EXPECT_EQ(readFile(dead / "a"), "one");
     hold.reset();
 }
 
-/* Law 5 sweeps on (01 section 9.10): a hold the sweep locked and could
-   not remove is counted and passed over, never the end of the
-   collection.  A maker of this Nix leaves the window between its `mkdir`
-   and its `flock` empty, so the `ENOTEMPTY` the collector met -- the
-   sweep's `deletePath` racing an older maker's `mkdir` of the kind
-   directories -- cannot be made in one process; it is injected here at
-   the one call it reaches (`failHoldRemoval`, as
-   `enospcLeftFileIsReportedNotRepairedForever` injects a full directory
-   index).  What the sweep must still do is judge the objects below: the
-   hold's links keep its trees and its symlink's blob, and everything
-   else dead goes in the same sweep. */
 TEST_F(LocalStoreObjectsTest, sweepGoesOnPastAHoldItCannotRemove)
 {
-    auto nar = treeWithSymlink();
     auto & objects = store->objects;
-    auto dead = std::filesystem::path{config->realStoreDir.get()} / "dead";
+    auto dead = config->realStoreDir.get() / "dead";
     auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
-    StringSource source{nar};
+    StringSource source{treeWithSymlink()};
     std::optional<GitObjectStore::Hold> hold{objects.hold()};
-    auto r = store->restoreThroughObjects(dead, source, /*startFsync=*/false, hooks.get(), *hold);
-    auto symlinkBlob = merkle::blobId("b");
-    deletePath(dead);
-    /* The crash: the lock is released, the directory left. */
+    store->restoreThroughObjects(dead, source, false, hooks.get(), *hold);
+    stageLegacyUnregisteredRows(*hold);
+    auto rows = auxiliaryRowCount();
     dropLock(*hold);
-
-    /* A second ingestion, finished and its path gone: its tree and its
-       symlink's blob are dead and held by nothing, and they are what says
-       this sweep went on past the hold it could not remove.  Before, the
-       dead ingestion's *own* regular files' blobs were files under
-       `blobs/` that its hold did not keep; a regular-file blob has no file
-       of the store's own any more, so the dead thing this sweep must still
-       take has to be brought by another ingestion. */
-    auto other = std::filesystem::path{config->realStoreDir.get()} / "other";
-    restore(other, treeNar({{"a", "one", 'f'}, {"l", "a", 'l'}}));
-    auto otherBlob = merkle::blobId("a");
-    ASSERT_TRUE(hasBlob(otherBlob, false));
-    deletePath(other);
-
-    auto none = [](fun<void(const ObjectHash &)>) { return 0; };
-
+    auto legacy = objects.dir / "trees" / "obsolete";
+    createDirs(legacy.parent_path());
+    writeFile(legacy, "old cache");
     objects.failHoldRemoval = [](const std::filesystem::path &) { return true; };
     Finally disarm{[&] { objects.failHoldRemoval = nullptr; }};
-    auto swept = objects.sweep(none);
-    EXPECT_EQ(swept.holds, 1u) << "counted, not removed";
-    EXPECT_EQ(swept.treesHeld, 2u) << "its links still keep them";
-    EXPECT_EQ(swept.treesRemoved, 1u) << "the other ingestion's root tree: the sweep went on past the hold";
-    EXPECT_EQ(swept.blobsRemoved, 1u) << "and its symlink's blob with it";
-    EXPECT_EQ(swept.blobsKept, 1u) << "the held ingestion's symlink blob, at a second link";
-    EXPECT_FALSE(hasBlob(otherBlob, false));
-    EXPECT_EQ(count("tmp"), 1u) << "the hold stands";
-    EXPECT_TRUE(hasBlob(symlinkBlob, false));
-
-    /* The next sweep, the removal succeeding, is `deadHoldIsReleasedBySweep`. */
+    auto swept = objects.sweep();
+    store->sweepStaleBlobRows();
+    EXPECT_EQ(swept.holds, 1u);
+    EXPECT_EQ(swept.treesRemoved, 1u) << "an unremovable lease does not stop bounded legacy cleanup";
+    EXPECT_FALSE(pathExists(legacy));
+    EXPECT_EQ(auxiliaryRowCount(), rows);
+    EXPECT_GT(store->blobRowCount(false), 0u);
     objects.failHoldRemoval = nullptr;
-    swept = objects.sweep(none);
+    swept = objects.sweep();
+    store->sweepStaleBlobRows();
     EXPECT_EQ(swept.holds, 0u);
-    EXPECT_EQ(swept.treesRemoved, 2u);
-    EXPECT_EQ(swept.blobsRemoved, 1u) << "the held ingestion's symlink blob";
     EXPECT_EQ(count("tmp"), 0u);
+    EXPECT_EQ(auxiliaryRowCount(), 0u);
+    EXPECT_EQ(store->blobRowCount(false), 0u);
     hold.reset();
 }
 
-/* A live root the store has no object for -- a row migrated by the walk
-   (an upgraded or `--load-db` store), a plain-file root whose blob was
-   never entered (a full directory index, Windows) -- keeps
-   nothing and does not stop the sweep: a dead tree beside it goes, with
-   the symlink blob it named.  Before: the root abandoned the removal phase
-   and the dead objects stayed until `nix-store --optimise`. */
-TEST_F(LocalStoreObjectsTest, sweepTolerantOfAnUnenteredRoot)
-{
-    auto nar = treeNar({{"a", "one", 'f'}, {"l", "a", 'l'}});
-    auto & objects = store->objects;
-    auto dead = std::filesystem::path{config->realStoreDir.get()} / "dead";
-    auto r = restore(dead, nar);
-    deletePath(dead);
-    ASSERT_EQ(count("trees"), 1u);
-    ASSERT_EQ(count("blobs"), 2u); /* "one" (now the store's link alone), the symlink's "a" */
-
-    /* Two live roots without an object: a directory's tree never written,
-       a plain file's blob never entered. */
-    auto dirRoot = ObjectHash::of(merkle::TreeEntry{merkle::Mode::Directory, merkle::treeId("")});
-    auto fileRoot = ObjectHash::of(merkle::TreeEntry{merkle::Mode::Regular, merkle::blobId("never entered")});
-    ASSERT_FALSE(hasTree(dirRoot.hash));
-    ASSERT_FALSE(hasBlob(fileRoot.hash, false));
-
-    auto swept = objects.sweep([&](fun<void(const ObjectHash &)> live) {
-        live(dirRoot);
-        live(fileRoot);
-        return 0;
-    });
-    EXPECT_EQ(swept.unentered, 2u);
-    EXPECT_EQ(swept.corruptTrees, 0u);
-    EXPECT_EQ(swept.treesRemoved, 1u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsRemoved, 1u);
-    EXPECT_FALSE(hasTree(r.root.hash));
-    EXPECT_EQ(count("trees"), 0u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(count("blobs"), 1u);
-}
-
-/* The sweep's count of live roots without an object (`SweepStats::
-   unentered`) is of roots -- valid paths -- alone; a tree a present tree
-   names that the store lacks (an interrupted repair, `ENOSPC` on one tree)
-   is counted apart (`missingSubtrees`), and the warning says which.
-   Before, both landed in one count rendered as "N valid paths have no
-   tree". */
-TEST_F(LocalStoreObjectsTest, sweepCountsRootsApartFromMissingSubtrees)
-{
-    auto nar = treeNar({{"a", "one", 'f'}, {"d/b", "two", 'f'}});
-    auto & objects = store->objects;
-    auto p = std::filesystem::path{config->realStoreDir.get()} / "two-level";
-    auto r = restore(p, nar);
-    auto rootTree = r.root.hash;
-    auto dTree = readTree(rootTree).at("d/").hash;
-    ASSERT_TRUE(hasTree(dTree));
-    auto live = [&](fun<void(const ObjectHash &)> f) {
-        f(ObjectHash::of(r.root));
-        return 0;
-    };
-
-    /* The subtree gone, the root present: no path is without its object. */
-    std::filesystem::remove(treeFile(dTree));
-    auto swept = objects.sweep(live);
-    EXPECT_EQ(swept.unentered, 0u);
-    EXPECT_EQ(swept.missingSubtrees, 1u);
-    EXPECT_EQ(swept.treesRemoved, 0u);
-    EXPECT_TRUE(hasTree(rootTree));
-    EXPECT_EQ(count("blobs"), 2u) << "held by the path's links";
-
-    /* The root gone too: one path without its object, and nothing beneath
-       it is looked at. */
-    std::filesystem::remove(treeFile(rootTree));
-    swept = objects.sweep(live);
-    EXPECT_EQ(swept.unentered, 1u);
-    EXPECT_EQ(swept.missingSubtrees, 0u);
-}
-
-/* A temporary link `place` leaves behind on a crash between its `link`
-   and its `rename` is a hard link to a blob file: it ages by the second
-   in its name, not by the inode's change time, which every later link of
-   that blob advances; and the temporary pass runs before the blob pass,
-   so the blob the leftover pinned (link count two) goes in the same
-   sweep.  A leftover with no time in its name (an earlier build's) still
-   ages by the inode.  Before, such a leftover was never an hour old and
-   kept its blob for ever.
-
-   What this pinned before and what it pins now.  Before, the blob was a
-   plain file's, with a file under `.objects/blobs` of the store's own
-   naming.  A regular-file blob has no such file: its holder is a store
-   path's own file, and a temporary link to *that* pins nothing of the
-   object store's.  The blobs a leftover can still pin are the ones with
-   files -- the **symlink targets** -- so the tree here is a symlink whose
-   target is the pinned bytes, and the rule (the name's second, not the
-   inode's change time; the temporary pass before the blob pass) is
-   unchanged in words and narrower in domain (`08` K4). */
 TEST_F(LocalStoreObjectsTest, staleTemporaryLinkGoesWithTheBlobItPinned)
 {
     auto & objects = store->objects;
-    auto nar = treeNar({{"l", "pinned", 'l'}});
-    auto p = std::filesystem::path{config->realStoreDir.get()} / "dead";
-    restore(p, nar);
-    deletePath(p);
+    auto path = config->realStoreDir.get() / "temporary-link-holder";
+    restore(path, treeNar({{"file", "pinned", 'f'}}));
     auto blob = blobFileOf(merkle::blobId("pinned"), false);
-    ASSERT_EQ(blob, objects.blobFile(merkle::blobId("pinned"), false)) << "a symlink's target has a file of its own";
-    ASSERT_TRUE(pathExists(blob));
-    ASSERT_EQ(st(blob).st_nlink, 1u);
-
     auto now = time(nullptr);
     auto stale = objects.dir / "tmp" / fmt("link-%d-%d-0", now - 7200, getpid());
-    std::filesystem::create_hard_link(blob, stale);
-    ASSERT_EQ(st(blob).st_nlink, 2u);
-
-    auto swept = objects.sweep([](fun<void(const ObjectHash &)>) { return 0; });
-    EXPECT_FALSE(pathExists(stale)) << "two hours old by its name";
-    EXPECT_FALSE(pathExists(blob)) << "unpinned, unnamed: gone in the same sweep";
-    EXPECT_EQ(swept.blobsRemoved, 1u);
-
-    /* One made a moment ago -- another process's `place` between its two
-       steps -- stays, and so does what it links.  Under a second
-       destination, the fixture's `restore` registering the first under its
-       own name. */
-    auto p2 = std::filesystem::path{config->realStoreDir.get()} / "dead2";
-    restore(p2, nar);
-    deletePath(p2);
     auto fresh = objects.dir / "tmp" / fmt("link-%d-%d-1", now, getpid());
+    std::filesystem::create_hard_link(blob, stale);
     std::filesystem::create_hard_link(blob, fresh);
-    swept = objects.sweep([](fun<void(const ObjectHash &)>) { return 0; });
+    auto before = st(blob);
+    objects.sweep();
+    EXPECT_FALSE(pathExists(stale));
     EXPECT_TRUE(pathExists(fresh));
-    EXPECT_TRUE(pathExists(blob));
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    std::filesystem::remove(fresh);
+    EXPECT_EQ(st(blob).st_ino, before.st_ino);
+    EXPECT_EQ(st(blob).st_nlink, before.st_nlink - 1);
+    EXPECT_EQ(readFile(blob), "pinned");
+    EXPECT_TRUE(hasBlob(merkle::blobId("pinned"), false));
 }
 
 /* The verifier expects a blob for every regular file the store places and
@@ -2316,11 +1991,18 @@ TEST_F(LocalStoreObjectsTest, verifyExpectsNoBlobForAFileTheStoreDoesNotPlace)
     EXPECT_FALSE(store->verifyStore(/*checkContents=*/true, NoRepair))
         << "clean: no blob is expected for a file the store does not place";
 
-    /* A blob a live tree names, really missing: the symlink's target. */
-    std::filesystem::remove(blobFileOf(merkle::blobId("README"), false));
+    /* A live tree's symlink target is missing from the auxiliary relation;
+       the physical symlink and regular file remain intact. */
+    auto target = merkle::blobId("README");
+    ASSERT_TRUE(hasAuxiliary(target, merkle::Mode::Symlink));
+    eraseAuxiliary({merkle::Mode::Symlink, target});
+    ASSERT_FALSE(hasAuxiliary(target, merkle::Mode::Symlink));
+    EXPECT_EQ(readLink(real / "l"), "README");
+    EXPECT_EQ(readFile(real / "README"), "readme");
     EXPECT_TRUE(store->verifyStore(/*checkContents=*/true, NoRepair)) << "reported";
     EXPECT_FALSE(store->verifyStore(/*checkContents=*/true, Repair)) << "re-entered";
-    EXPECT_TRUE(hasBlob(merkle::blobId("README"), false));
+    EXPECT_TRUE(hasAuxiliary(target, merkle::Mode::Symlink));
+    EXPECT_EQ(readLink(real / "l"), "README");
     EXPECT_FALSE(store->verifyStore(/*checkContents=*/true, NoRepair));
 
     /* The writable-file exception, on every platform: a
@@ -2329,8 +2011,8 @@ TEST_F(LocalStoreObjectsTest, verifyExpectsNoBlobForAFileTheStoreDoesNotPlace)
        holds none.  Its own bytes, and its blob's, are one inode here, so
        the file is first made its own again. */
     unlinkInPlace(real / "README");
-    std::filesystem::remove(blobFileOf(merkle::blobId("readme"), false));
     ASSERT_FALSE(hasBlob(merkle::blobId("readme"), false));
+    EXPECT_EQ(readFile(real / "README"), "readme");
     chmod(real / "README", 0644);
     EXPECT_FALSE(store->verifyStore(/*checkContents=*/true, NoRepair))
         << "clean: a writable file is left as written, and no blob is expected";
@@ -2344,31 +2026,55 @@ TEST_F(LocalStoreObjectsTest, verifyExpectsNoBlobForAFileTheStoreDoesNotPlace)
 /* Completed paths retain the configured SQLite journal mode. */
 TEST_F(LocalStoreObjectsTest, completedIngestionsRespectBothJournalModes)
 {
-    bool saved = settings.useSQLiteWAL;
-    Finally restoreSetting{[&] { settings.useSQLiteWAL = saved; }};
-    for (bool wal : {false, true}) {
-        SCOPED_TRACE(wal);
+    bool savedWAL = settings.useSQLiteWAL;
+    bool savedSync = settings.getLocalSettings().fsyncMetadata;
+    Finally restoreSettings{[&] {
         store.reset();
-        settings.useSQLiteWAL = wal;
-        config =
-            std::make_shared<LocalStoreConfig>(tempStoreDir.path() / (wal ? "wal" : "rollback"), StoreConfig::Params{});
-        store = std::make_shared<LocalStore>(ref{config});
-        auto hold = store->objects.hold();
-        auto path = StorePath::random(wal ? "wal-copy" : "rollback-copy");
-        auto dst = store->toRealPath(path);
-        store->beginIngestion(hold, dst);
-        StringSource source{treeNar({{"a", wal ? "wal" : "rollback", 'f'}})};
-        auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
-        store->restoreThroughObjects(dst, source, false, hooks.get(), hold, NoRepair);
-        EXPECT_EQ(store->blobRowCount(false), 0u);
-        store->endIngestion(hold, path);
-        EXPECT_GT(store->blobRowCount(false), 0u);
-        SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
-        SQLiteStmt mode{db, "pragma journal_mode"};
-        auto query = mode.use();
-        ASSERT_TRUE(query.next());
-        EXPECT_EQ(query.getStr(0) == "wal", wal);
-    }
+        settings.useSQLiteWAL = savedWAL;
+        settings.getLocalSettings().fsyncMetadata = savedSync;
+    }};
+    for (bool wal : {false, true})
+        for (bool sync : {false, true}) {
+            SCOPED_TRACE(fmt("wal=%d sync=%d", wal, sync));
+            store.reset();
+            settings.useSQLiteWAL = wal;
+            settings.getLocalSettings().fsyncMetadata = sync;
+            config = std::make_shared<LocalStoreConfig>(
+                tempStoreDir.path() / fmt("journal-%d-%d", wal, sync), StoreConfig::Params{});
+            store = std::make_shared<LocalStore>(ref{config});
+            EXPECT_EQ(metadataSynchronousMode(), sync ? 1 : 0);
+            EXPECT_EQ(metadataJournalMode(), wal ? "wal" : "truncate");
+            auto hold = store->objects.hold();
+            auto path = StorePath::random("completed-projection");
+            auto dst = store->toRealPath(path);
+            store->beginIngestion(hold, dst);
+            auto nar = treeNar({{"a", "journal data", 'f'}, {"l", "journal target", 'l'}});
+            StringSource source{nar};
+            auto hooks =
+                makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+            auto result = store->restoreThroughObjects(dst, source, false, hooks.get(), hold, NoRepair);
+            EXPECT_EQ(store->blobRowCount(false), 0u);
+            EXPECT_EQ(auxiliaryRowCount(), 0u);
+            store->endIngestion(hold, path);
+            EXPECT_GT(store->blobRowCount(false), 0u);
+            EXPECT_GT(auxiliaryRowCount(), 0u);
+            EXPECT_TRUE(hasTree(result.root.hash))
+                << "completed builder bytes are authenticated without physical-holder validity";
+            ValidPathInfo info{path, UnkeyedValidPathInfo{*store, ObjectHash::of(result.root)}};
+            info.narSize = result.narSize;
+            store->registerValidPath(info);
+            EXPECT_TRUE(hasTree(result.root.hash));
+            EXPECT_TRUE(hasAuxiliary(merkle::blobId("journal target"), merkle::Mode::Symlink));
+            EXPECT_EQ(metadataJournalMode(), wal ? "wal" : "truncate");
+            EXPECT_EQ(metadataSynchronousMode(), sync ? 1 : 0);
+            store.reset();
+            store = std::make_shared<LocalStore>(ref{config});
+            EXPECT_EQ(metadataJournalMode(), wal ? "wal" : "truncate");
+            EXPECT_EQ(metadataSynchronousMode(), sync ? 1 : 0);
+            EXPECT_TRUE(hasTree(result.root.hash));
+            EXPECT_TRUE(hasAuxiliary(merkle::blobId("journal target"), merkle::Mode::Symlink));
+            EXPECT_FALSE(store->verifyStore(true, NoRepair));
+        }
 }
 
 TEST_F(LocalStoreObjectsTest, aCrashBeforeRegistrationLeavesNoRowThatMisleadsLink)
@@ -2595,18 +2301,20 @@ TEST_F(LocalStoreObjectsTest, overlappingAddsKeepEachOthersObjectsHeld)
                 release(finishesFirst);
                 jobs[finishesFirst].get();
                 auto stillWriting = 1 - finishesFirst;
-                EXPECT_TRUE(hasTree(subtrees[stillWriting]));
-                auto swept = store->objects.sweep([&](fun<void(const ObjectHash &)> live) {
-                    for (auto & path : store->queryAllValidPaths())
-                        live(*store->queryPathInfo(path)->objectHash);
-                    return 0;
-                });
-                EXPECT_TRUE(hasTree(subtrees[stillWriting])) << "one add released another add's protection";
+                EXPECT_FALSE(hasTree(subtrees[stillWriting])) << "unfinished values stay private";
+                EXPECT_TRUE(hasTree(subtrees[finishesFirst]));
+                auto swept = store->objects.sweep();
+                store->sweepStaleBlobRows();
+                EXPECT_FALSE(hasTree(subtrees[stillWriting]));
+                EXPECT_TRUE(hasTree(subtrees[finishesFirst]));
                 EXPECT_EQ(swept.treesRemoved, 0u);
                 release(stillWriting);
                 jobs[stillWriting].get();
-                for (auto & info : infos)
-                    EXPECT_TRUE(store->isValidPath(info.path));
+                for (size_t i = 0; i < infos.size(); ++i) {
+                    EXPECT_TRUE(store->isValidPath(infos[i].path));
+                    EXPECT_TRUE(hasTree(subtrees[i]));
+                    EXPECT_TRUE(store->verifyObjects(store->toRealPath(infos[i].path)).second.empty());
+                }
                 EXPECT_EQ(count("tmp"), 0u) << "the final user releases the shared directory";
             }
 }
@@ -2622,10 +2330,12 @@ TEST_F(LocalStoreObjectsTest, failedRegistrationPublishesNeitherPathNorPendingHo
     info.narSize = nar.size();
     info.references.emplace("n5wkd9frr45pa74if5gpz9j7mifg27fh-missing-reference");
     auto before = store->blobRowCount(false);
+    auto auxiliaryBefore = auxiliaryRowCount();
     StringSource failed{nar};
     EXPECT_THROW(store->addToStore(info, failed, NoRepair, NoCheckSigs), Error);
     EXPECT_FALSE(store->isValidPath(info.path));
     EXPECT_EQ(store->blobRowCount(false), before);
+    EXPECT_EQ(auxiliaryRowCount(), auxiliaryBefore);
     EXPECT_FALSE(store->objects.holderOrForget(merkle::blobId("uncommitted-holder"), false, NoRepair));
 
     info.references.clear();
@@ -2633,6 +2343,7 @@ TEST_F(LocalStoreObjectsTest, failedRegistrationPublishesNeitherPathNorPendingHo
     store->addToStore(info, retry, NoRepair, NoCheckSigs);
     EXPECT_TRUE(store->isValidPath(info.path));
     EXPECT_EQ(store->blobRowCount(false), before + 1);
+    EXPECT_GT(auxiliaryRowCount(), auxiliaryBefore);
     EXPECT_EQ(blobFileOf(merkle::blobId("uncommitted-holder"), false), store->toRealPath(info.path) / "a");
 }
 
@@ -2683,18 +2394,22 @@ TEST_F(LocalStoreObjectsTest, everyCandidatePublicationOrderKeepsRegisteredHolde
                     infos.back().objectHash = ObjectHash::of(result.root);
                     infos.back().narSize = result.narSize;
                 }
-                std::array<bool, 2> registered{};
+                std::array<bool, 2> registered{}, auxiliaryPersisted{};
                 for (auto event : order) {
                     auto i = event / 2;
                     if (!(event & 1)) {
                         stageLegacyUnregisteredRows(holds[i]);
+                        auxiliaryPersisted[i] = true;
                     } else if (success & (1 << i)) {
                         store->registerValidPath(infos[i], holds[i]);
                         registered[i] = true;
+                        auxiliaryPersisted[i] = true;
                     } else {
                         infos[i].references.insert(StorePath::random("missing-reference"));
                         EXPECT_THROW(store->registerValidPath(infos[i], holds[i]), InvalidPath);
                     }
+                    EXPECT_EQ(hasTree(infos[0].objectHash->hash), auxiliaryPersisted[0] || auxiliaryPersisted[1])
+                        << "auxiliary publication event " << event;
                     for (bool executable : {false, true}) {
                         auto holder = store->objects.holderOrForget(id, executable, NoRepair);
                         EXPECT_EQ(holder.has_value(), registered[0] || registered[1]) << "publication event " << event;
@@ -3654,18 +3369,6 @@ TEST_F(LocalStoreObjectsTest, theSweepJudgesARowByItsIngestionsPath)
     EXPECT_FALSE(store->objects.holderOrForget(merkle::blobId("two"), false, NoRepair).has_value());
 }
 
-/* A plain file's object hash is its blob id, which names no tree, and the
-   path *is* the blob's holder: a row whose name is empty (`schema.sql`).
-   What this pinned before and what it pins now.  Before, the root's blob
-   had a file under `.objects/blobs`, and the sweep -- which recognises
-   such a root by `pathExists(blobFile(id, false))` -- kept that file while
-   the root was live and removed it when the root was dropped.  There is no
-   such file now, so what the sweep must do with a plain-file root is not
-   keep a file but *not count it among the roots whose object the store
-   lacks*, and the branch that answers that is the index's own lookup (the
-   sweep's root case, git-object-store.cc).  With the row gone -- the
-   file replaced, the row forgotten -- the same live root is `unentered`,
-   which is the discriminator. */
 TEST_F(LocalStoreObjectsTest, sweepKeepsAPlainFileRootsBlob)
 {
     auto & objects = store->objects;
@@ -3681,17 +3384,11 @@ TEST_F(LocalStoreObjectsTest, sweepKeepsAPlainFileRootsBlob)
     /* The root is the holder: one row, no file under `blobs/`, one link. */
     ASSERT_EQ(store->blobRowCount(false), 1u);
     ASSERT_EQ(blobFileOf(blob, false), t);
-    ASSERT_FALSE(pathExists(objects.blobFile(blob, false)));
+    ASSERT_FALSE(pathExists(objects.dir / "blobs"));
     ASSERT_EQ(st(t).st_nlink, 1u);
 
-    auto live = [&](fun<void(const ObjectHash &)> f) {
-        f(ObjectHash::of(r.root));
-        return 0;
-    };
-    auto swept = objects.sweep(live);
-    EXPECT_EQ(swept.unentered, 0u) << "a plain-file root is known by its row";
+    auto swept = objects.sweep();
     EXPECT_EQ(swept.blobsRemoved, 0u);
-    EXPECT_EQ(swept.blobsKept, 0u) << "there is no file under `blobs/` to keep";
     EXPECT_TRUE(hasBlob(blob, false));
 
     /* The file replaced, as the store leaves one it could not link: the
@@ -3700,130 +3397,53 @@ TEST_F(LocalStoreObjectsTest, sweepKeepsAPlainFileRootsBlob)
     unlinkInPlace(t);
     EXPECT_FALSE(hasBlob(blob, false));
     EXPECT_EQ(store->blobRowCount(false), 0u);
-    swept = objects.sweep(live);
-    EXPECT_EQ(swept.unentered, 1u) << "no row, no object: the root is unentered";
+    swept = objects.sweep();
+    EXPECT_EQ(auxiliaryRowCount(), 0u) << "a plain root has no auxiliary value";
     EXPECT_EQ(swept.blobsRemoved, 0u);
 }
 
-/* A collection must not abort on a missing object-store subdirectory (a
-   user removed one after the store was opened; a crash between the four
-   `createDirs` at open): the sweep and the inode table make what they
-   iterate.  A fresh process would re-create them at open, so
-   this drives the sweep in an open store.  Before: `DirectoryIterator`
-   threw on the missing directory and the collection failed. */
 TEST_F(LocalStoreObjectsTest, sweepMakesAMissingObjectDirectory)
 {
     auto & objects = store->objects;
-    auto nar = treeNar({{"a", "one", 'f'}});
-    auto r = restore(std::filesystem::path{config->realStoreDir.get()} / "dirs", nar);
-
-    deletePath(objects.dir / "blobs-x");
+    auto result = restore(config->realStoreDir.get() / "dirs", treeNar({{"a", "one", 'f'}}));
     deletePath(objects.dir / "tmp");
-    ASSERT_FALSE(pathExists(objects.dir / "blobs-x"));
-    auto swept = objects.sweep([&](fun<void(const ObjectHash &)> live) {
-        live(ObjectHash::of(r.root));
-        return 0;
-    });
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsKept, 0u);
-    EXPECT_TRUE(pathExists(objects.dir / "blobs-x"));
-    EXPECT_TRUE(pathExists(objects.dir / "tmp"));
-
-    deletePath(objects.dir / "blobs");
-    /* The inode table is the index's rows, which survive the removal of
-     * `blobs/` -- the index is the witness, not the directory (K8) */
+    auto swept = objects.sweep();
+    EXPECT_EQ(swept.treesRemoved + swept.blobsRemoved + swept.holds, 0u);
+    EXPECT_FALSE(pathExists(objects.dir / "trees"));
+    EXPECT_FALSE(pathExists(objects.dir / "blobs"));
+    EXPECT_FALSE(pathExists(objects.dir / "blobs-x"));
+    EXPECT_TRUE(hasTree(result.root.hash));
     EXPECT_FALSE(objects.blobInodes().empty());
-    EXPECT_TRUE(pathExists(objects.dir / "blobs"));
+    auto hold = objects.hold();
+    EXPECT_TRUE(pathExists(hold.directory())) << "the next lease recreates only its temporary namespace";
 }
 
-/* The sweep over a part of the object store the caller owns
-   (`GitObjectStore::Owned`; the local overlay store's upper layer, which
-   it reads through the merged mount and owns alone): the files enumerated
-   and removed are that part's, while the trees are read -- and so
-   reachability computed -- over the whole object store, which is what the
-   store reads.  Here the part is a directory beside the object store
-   holding a copy of a blob a live tree names and one nothing names; the
-   object store's own files must not be touched, whatever the roots. */
 TEST_F(LocalStoreObjectsTest, sweepOfAnOwnedPartRemovesOnlyItsFiles)
 {
     auto & objects = store->objects;
-    auto nar = treeNar({{"a", "one", 'f'}, {"d/b", "two", 'f'}});
-    auto r = restore(std::filesystem::path{config->realStoreDir.get()} / "owned-part", nar);
-
-    auto one = merkle::blobId("one");
-    auto two = merkle::blobId("two");
-    auto stray = merkle::blobId("stray");
-
-    auto part = std::filesystem::path{config->realStoreDir.get()}.parent_path() / "owned-objects";
-    for (auto & sub : {"blobs", "blobs-x", "trees", "tmp"})
-        createDirs(part / sub);
-    /* `one` where the sharded layout puts it (the part has the object
-       store's shape), and `stray` flat in `blobs/`, where an earlier,
-       unreleased build of this branch put it: both are enumerated and
-       judged (01 §9.10, *Where the objects live*). */
-    auto inPart = [&](const Hash & id) { return part / std::filesystem::relative(blobFileOf(id, false), objects.dir); };
-    createDirs(inPart(one).parent_path());
-    writeFile(inPart(one), "one");
-    writeFile(part / "blobs" / GitObjectStore::idString(stray), "stray");
-
-    std::vector<std::filesystem::path> removed;
-    GitObjectStore::Owned owned{
-        .dir = part,
-        .remove =
-            [&](const std::filesystem::path & file) {
-                removed.push_back(file);
-                unlinkIfExists(file);
-            },
-    };
-
-    /* The path live: the tree the object store holds names `one`, so the
-       part's copy of it stays; the stray, which no reachable tree names
-       and nothing links, goes. */
-    auto swept = objects.sweep(
-        [&](fun<void(const ObjectHash &)> live) {
-            live(ObjectHash::of(r.root));
-            return 0;
-        },
-        &owned);
+    auto result =
+        restore(config->realStoreDir.get() / "owned-part", treeNar({{"a", "one", 'f'}, {"l", "target", 'l'}}));
+    auto part = tempStoreDir.path() / "owned-objects";
+    createDirs(part / "blobs" / "00");
+    writeFile(part / "blobs" / "00" / "old", "old sharded value");
+    writeFile(part / "blobs" / "flat", "old flat value");
+    createDirs(objects.dir / "blobs");
+    auto outside = objects.dir / "blobs" / "outside-owned-part";
+    writeFile(outside, "untouched");
+    size_t removals = 0;
+    GitObjectStore::Owned owned{.dir = part, .removed = [&] { ++removals; }};
+    auto swept = objects.sweep(&owned);
+    EXPECT_EQ(swept.blobsRemoved, 2u);
     EXPECT_EQ(swept.treesRemoved, 0u);
-    EXPECT_EQ(swept.blobsRemoved, 1u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsKept, 0u);
-    EXPECT_TRUE(pathExists(inPart(one)));
-    EXPECT_FALSE(pathExists(part / "blobs" / GitObjectStore::idString(stray)));
-
-    /* Nothing outside the part was removed, and the object store still has
-       every object of the live path. */
-    for (auto & file : removed)
-        EXPECT_TRUE(std::filesystem::relative(file, part).native().starts_with("blobs"))
-            << "removed outside the owned part: " << file;
-    EXPECT_TRUE(hasBlob(one, false));
-    EXPECT_TRUE(hasBlob(two, false));
-    EXPECT_TRUE(hasTree(r.root.hash));
-
-    /* The path dropped: the part's remaining blob goes with it, and the
-       object store's own files still stand -- this sweep may not take
-       them, however dead they are. */
-    swept = objects.sweep([](fun<void(const ObjectHash &)>) { return 0; }, &owned);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_EQ(swept.blobsRemoved, 0u);
-    EXPECT_EQ(swept.treesRemoved, 0u);
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_TRUE(pathExists(inPart(one)));
-    EXPECT_TRUE(hasBlob(one, false));
-    EXPECT_TRUE(hasBlob(two, false));
-    EXPECT_TRUE(hasTree(r.root.hash));
+    EXPECT_EQ(removals, 4u) << "two leaves, one shard and one empty kind directory";
+    EXPECT_FALSE(pathExists(part / "blobs"));
+    EXPECT_EQ(readFile(outside), "untouched");
+    EXPECT_TRUE(hasTree(result.root.hash));
+    EXPECT_TRUE(hasBlob(merkle::blobId("one"), false));
+    EXPECT_TRUE(hasAuxiliary(merkle::blobId("target"), merkle::Mode::Symlink));
+    EXPECT_EQ(objects.sweep(&owned).blobsRemoved, 0u);
 }
 
-/* The four directories are made for the store's own object store (above)
-   and never for a part the caller owns: the sweep only unlinks there, so
-   an absent directory is empty.  (On the overlay store a directory made
-   straight in the upper layer would go behind the mount's back, and the
-   upper layer holds no `.objects/blobs` until something is written.) */
 TEST_F(LocalStoreObjectsTest, sweepWritesNothingIntoAnOwnedPart)
 {
     auto & objects = store->objects;
@@ -3835,18 +3455,12 @@ TEST_F(LocalStoreObjectsTest, sweepWritesNothingIntoAnOwnedPart)
 
     GitObjectStore::Owned owned{
         .dir = part,
-        .remove = [](const std::filesystem::path & file) { unlinkIfExists(file); },
+        .removed = [] { FAIL() << "an absent owned namespace has nothing to remove"; },
     };
 
-    auto swept = objects.sweep(
-        [&](fun<void(const ObjectHash &)> live) {
-            live(ObjectHash::of(r.root));
-            return 0;
-        },
-        &owned);
+    auto swept = objects.sweep(&owned);
     EXPECT_EQ(swept.treesRemoved, 0u);
     EXPECT_EQ(swept.blobsRemoved, 0u);
-    EXPECT_EQ(swept.blobsKept, 0u);
     EXPECT_FALSE(pathExists(part));
     EXPECT_TRUE(hasBlob(merkle::blobId("one"), false));
     EXPECT_TRUE(hasTree(r.root.hash));
@@ -3894,11 +3508,11 @@ TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
         EXPECT_EQ(hold.pendingHolder(row.id, row.executable), expected);
     };
     auto complete = [&](const std::vector<Row> & expected) {
-        auto actual = hold.takeRows();
+        auto actual = hold.takeProjection().regular;
         EXPECT_EQ(relation(actual), relation(expected));
         for (auto & row : expected)
             EXPECT_FALSE(hold.pendingHolder(row.id, row.executable));
-        EXPECT_TRUE(hold.takeRows().empty());
+        EXPECT_TRUE(hold.takeProjection().regular.empty());
         return actual;
     };
 
@@ -3976,7 +3590,7 @@ TEST_F(LocalStoreObjectsTest, pendingRowsProjectExactlyTheActiveHashBytesAndMode
     };
     auto holder = [&](const Row & row) -> std::optional<std::string> { return (root / row.name).string(); };
     auto checkRows = [&](const Relation & expected) {
-        auto rows = hold.takeRows();
+        auto rows = hold.takeProjection().regular;
         ASSERT_EQ(rows.size(), expected.size());
         std::set<Key> seen;
         for (auto & row : rows) {
@@ -3995,7 +3609,7 @@ TEST_F(LocalStoreObjectsTest, pendingRowsProjectExactlyTheActiveHashBytesAndMode
             EXPECT_EQ(row.name, first.name);
             EXPECT_FALSE(hold.pendingHolder(row.id, row.executable));
         }
-        EXPECT_TRUE(hold.takeRows().empty());
+        EXPECT_TRUE(hold.takeProjection().regular.empty());
     };
 
     /* All lengths and both bits coexist, so common zero prefixes cannot
@@ -4147,7 +3761,7 @@ TEST_F(LocalStoreObjectsTest, optimiserInodeHintsRequireACurrentHolder)
                 auto result = store->enterIntoObjects(
                     target, hint == Hint::Repair ? Repair : NoRepair, hold, nullptr, &stats, &hints);
                 EXPECT_EQ(result.root, expected);
-                auto rows = hold.takeRows();
+                auto rows = hold.takeProjection().regular;
                 if (hint == Hint::Writable)
                     EXPECT_TRUE(rows.empty());
                 else {
@@ -4229,378 +3843,20 @@ TEST_F(LocalStoreObjectsTest, verifierReentryDoesNotWaitForAnOutputLock)
         StringSource source{nar};
         store->addToStore(info, source, NoRepair, NoCheckSigs);
         auto real = store->toRealPath(info.path);
-        auto missing = store->objects.blobFile(merkle::blobId(target), false);
-        std::filesystem::remove(missing);
+        auto missing = merkle::TreeEntry{merkle::Mode::Symlink, merkle::blobId(target)};
+        eraseAuxiliary(missing);
         auto before = st(real / "file");
         PathLocks blocker;
         if (busy)
             ASSERT_TRUE(blocker.lockPaths({real}, "", false));
         EXPECT_EQ(store->verifyStore(/*checkContents=*/true, Repair), busy);
-        EXPECT_EQ(pathExists(missing), !busy);
+        EXPECT_EQ(store->objects.readAuxiliary(missing).has_value(), !busy);
         EXPECT_EQ(st(real / "file").st_ino, before.st_ino);
         EXPECT_EQ(readFile(real / "file"), "unchanged");
         blocker.unlock();
         EXPECT_FALSE(store->verifyStore(/*checkContents=*/true, Repair));
-        EXPECT_TRUE(pathExists(missing));
+        EXPECT_TRUE(store->objects.readAuxiliary(missing).has_value());
     }
-}
-
-/* Exercise the two orders at the sweep's actual unlink boundary. The
-   nonblocking lock probe makes the old implementation's counterexample
-   deterministic: if no sweep lock exists, finish publication before the
-   unlink. With the lock, publication resumes after that unlink instead.
-   All three auxiliary kinds, both acquisition APIs and same/distinct
-   object-store instances are covered. */
-TEST_F(LocalStoreObjectsTest, auxiliaryPublicationCannotRaceSweepDeletion)
-{
-    unsigned serial = 0;
-    for (unsigned kind = 0; kind < 3; ++kind)
-        for (bool put : {false, true})
-            for (bool separate : {false, true}) {
-                SCOPED_TRACE(fmt("kind=%d put=%d separate=%d", kind, put, separate));
-                GitObjectStore objects{tempStoreDir.path() / fmt("auxiliary-publication-%d", serial++)};
-                objects.createDirectories();
-                GitObjectStore other{objects.dir};
-                auto & writerObjects = separate ? other : objects;
-                auto bytes = kind == 0 ? std::string{} : std::string{"target"};
-                auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
-                auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
-                merkle::TreeEntry address{
-                    kind == 0   ? merkle::Mode::Directory
-                    : kind == 2 ? merkle::Mode::Executable
-                                : merkle::Mode::Regular,
-                    id};
-                auto publish = [&](GitObjectStore & into, const GitObjectStore::Hold & hold) {
-                    into.putObject(address, bytes, hold);
-                };
-                {
-                    auto initial = objects.hold();
-                    publish(objects, initial);
-                }
-                ASSERT_EQ(st(file).st_nlink, 1u);
-                auto hold = writerObjects.hold();
-                std::future<bool> writer;
-                bool removed = false;
-                GitObjectStore::Owned owned{
-                    .dir = objects.dir,
-                    .remove =
-                        [&](const std::filesystem::path & candidate) {
-                            EXPECT_EQ(candidate, file);
-                            std::promise<bool> acquired;
-                            auto ready = acquired.get_future();
-                            writer = std::async(std::launch::async, [&, acquired = std::move(acquired)]() mutable {
-                                bool notified = false;
-                                try {
-                                    auto probe = openLockFile(objects.dir / "gc.lock", true);
-                                    bool allowed = lockFile(probe.get(), ltRead, false);
-                                    probe.close();
-                                    auto acquire = [&] {
-                                        if (put) {
-                                            publish(writerObjects, hold);
-                                            return true;
-                                        }
-                                        return writerObjects.holdObject(address, hold);
-                                    };
-                                    if (allowed) {
-                                        auto result = acquire();
-                                        acquired.set_value(true);
-                                        notified = true;
-                                        return result;
-                                    }
-                                    acquired.set_value(false);
-                                    notified = true;
-                                    return acquire();
-                                } catch (...) {
-                                    if (!notified)
-                                        acquired.set_exception(std::current_exception());
-                                    throw;
-                                }
-                            });
-                            EXPECT_FALSE(ready.get()) << "the sweep excludes new auxiliary links";
-                            unlinkIfExists(candidate);
-                            removed = true;
-                        },
-                };
-                objects.sweep([](fun<void(const ObjectHash &)>) { return 0; }, &owned);
-                ASSERT_TRUE(removed);
-                auto acquired = writer.get();
-                EXPECT_EQ(acquired, put) << "a pure acquisition misses after collection";
-                EXPECT_EQ(pathExists(file), put);
-                if (acquired)
-                    EXPECT_EQ(readFile(file), bytes);
-            }
-}
-
-/* A committed root that was absent from the snapshot is protected by its
-   ingestion until the sweep ends. Releasing that ingestion immediately
-   after the snapshot used to turn its objects into one-link garbage. */
-TEST_F(LocalStoreObjectsTest, auxiliaryHoldReleaseWaitsForTheRootSnapshotSweep)
-{
-    auto lockFilePath = config->stateDir.get() / "object-gc.lock";
-    for (unsigned kind = 0; kind < 3; ++kind)
-        for (bool separate : {false, true}) {
-            SCOPED_TRACE(fmt("kind=%d separate=%d", kind, separate));
-            auto & objects = store->objects;
-            GitObjectStore other{objects.dir, false, lockFilePath};
-            auto & writerObjects = separate ? other : objects;
-            auto path = StorePath::random(fmt("late-root-%d-%d", kind, separate));
-            auto realPath = store->toRealPath(path);
-            createDir(realPath);
-            std::string childName{path.to_string()};
-            auto bytes = kind == 0 ? std::string{} : std::string{path.to_string()};
-            auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
-            std::optional<GitObjectStore::Hold> hold{writerObjects.hold()};
-            auto mode = kind == 0   ? merkle::Mode::Directory
-                        : kind == 1 ? merkle::Mode::Symlink
-                                    : merkle::Mode::Executable;
-            writerObjects.putObject({mode, id}, bytes, *hold);
-            if (kind == 0) {
-                createDir(realPath / childName);
-            } else {
-                if (kind == 1)
-                    createSymlink(bytes, realPath / childName);
-                else {
-                    writeFile(realPath / childName, bytes);
-                    chmod(realPath / childName, 0555);
-                }
-            }
-            auto body = merkle::serialiseTree({{kind == 0 ? childName + "/" : childName, {mode, id}}});
-            auto root = merkle::treeId(body);
-            writerObjects.putObject({merkle::Mode::Directory, root}, body, *hold);
-            ValidPathInfo info{path, UnkeyedValidPathInfo{*store, ObjectHash{root}}};
-            std::future<void> writer;
-            objects.sweep([&](fun<void(const ObjectHash &)> live) {
-                for (auto & path : store->queryAllValidPaths())
-                    live(*store->queryPathInfo(path)->objectHash);
-                std::promise<bool> released;
-                auto ready = released.get_future();
-                writer = std::async(std::launch::async, [&, released = std::move(released)]() mutable {
-                    bool notified = false;
-                    try {
-                        store->registerValidPath(info);
-                        auto probe = openLockFile(lockFilePath, true);
-                        bool allowed = lockFile(probe.get(), ltRead, false);
-                        probe.close();
-                        if (allowed)
-                            hold.reset();
-                        released.set_value(allowed);
-                        notified = true;
-                        hold.reset();
-                    } catch (...) {
-                        if (!notified)
-                            released.set_exception(std::current_exception());
-                        throw;
-                    }
-                });
-                EXPECT_FALSE(ready.get()) << "registration does not release protection during the sweep";
-                return 0;
-            });
-            writer.get();
-            EXPECT_TRUE(store->isValidPath(path));
-            EXPECT_TRUE(pathExists(objects.treeFile(root)));
-            auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
-            ASSERT_TRUE(pathExists(file));
-            EXPECT_EQ(readFile(file), bytes);
-            EXPECT_EQ(st(file).st_nlink, 1u) << "the hold releases after the sweep";
-        }
-}
-
-TEST_F(LocalStoreObjectsTest, overlappingAuxiliaryReadersKeepTheLockUntilBothFinish)
-{
-    GitObjectStore objects{tempStoreDir.path() / "overlapping-auxiliary-readers", true};
-    objects.createDirectories();
-    auto firstHold = objects.hold();
-    auto secondHold = objects.hold();
-    std::promise<void> entered, resume;
-    auto enteredFuture = entered.get_future();
-    auto resumeFuture = resume.get_future();
-    std::atomic<unsigned> calls{0};
-    bool notified = false;
-    objects.atFsync = [&](const auto &) {
-        if (calls.fetch_add(1) == 0) {
-            entered.set_value();
-            notified = true;
-            resumeFuture.get();
-        }
-    };
-    auto first = std::async(std::launch::async, [&] {
-        try {
-            objects.putObject({merkle::Mode::Regular, merkle::blobId("first")}, "first", firstHold);
-        } catch (...) {
-            if (!notified)
-                entered.set_exception(std::current_exception());
-            throw;
-        }
-    });
-    bool resumed = false;
-    auto release = [&] {
-        if (!resumed) {
-            resume.set_value();
-            resumed = true;
-        }
-    };
-    Finally finish{[&] {
-        release();
-        if (first.valid())
-            first.wait();
-    }};
-    enteredFuture.get();
-    objects.putObject({merkle::Mode::Regular, merkle::blobId("second")}, "second", secondHold);
-    auto probe = openLockFile(objects.dir / "gc.lock", true);
-    EXPECT_FALSE(lockFile(probe.get(), ltWrite, false)) << "one reader is still publishing";
-    release();
-    first.get();
-    EXPECT_TRUE(lockFile(probe.get(), ltWrite, false));
-    probe.close();
-}
-
-TEST_F(LocalStoreObjectsTest, publishedAuxiliaryObjectRetainsItsOriginalHoldLink)
-{
-    auto & objects = store->objects;
-    auto body = std::string{};
-    auto id = merkle::treeId(body);
-    auto file = objects.treeFile(id);
-    {
-        auto hold = objects.hold();
-        objects.putObject({merkle::Mode::Directory, id}, body, hold);
-        auto published = st(file);
-        EXPECT_EQ(published.st_nlink, 2u);
-        bool found = false;
-        for (auto & entry : DirectoryIterator{hold.linkFor(objects, {merkle::Mode::Directory, id}).parent_path()}) {
-            EXPECT_EQ(st(entry.path()).st_ino, published.st_ino);
-            found = true;
-        }
-        EXPECT_TRUE(found);
-        /* A second writer must hold the completed global object. */
-        auto other = objects.hold();
-        objects.putObject({merkle::Mode::Directory, id}, body, other);
-        EXPECT_EQ(st(file).st_ino, published.st_ino);
-        EXPECT_EQ(st(file).st_nlink, 3u);
-    }
-    EXPECT_EQ(st(file).st_nlink, 1u);
-}
-
-/* An already-open first temporary loses publication to a second writer.
-   The fsync hook fixes this interleaving without threads or new production
-   hooks. The losing writer must hold the winner before returning. */
-TEST_F(LocalStoreObjectsTest, competingAuxiliaryPublicationHoldsTheWinner)
-{
-    size_t cases = 0;
-    for (unsigned kind = 0; kind < 3; ++kind)
-        for (bool shardPresent : {false, true})
-            for (bool separate : {false, true}) {
-                SCOPED_TRACE(fmt("kind=%d shard=%d separate=%d", kind, shardPresent, separate));
-                GitObjectStore objects{tempStoreDir.path() / fmt("competing-auxiliary-%d", cases), true};
-                objects.createDirectories();
-                GitObjectStore other{objects.dir, true};
-                auto & winnerObjects = separate ? other : objects;
-                auto bytes = kind == 0 ? std::string{} : std::string{"competing auxiliary bytes"};
-                auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
-                auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
-                mode_t expectedMode = kind == 2 ? 0555 : 0444;
-                if (shardPresent)
-                    createDirs(file.parent_path());
-                std::optional<GitObjectStore::Hold> first{objects.hold()};
-                std::optional<GitObjectStore::Hold> second{winnerObjects.hold()};
-                auto firstDir = first->directory(), secondDir = second->directory();
-                merkle::TreeEntry address{
-                    kind == 0   ? merkle::Mode::Directory
-                    : kind == 2 ? merkle::Mode::Executable
-                                : merkle::Mode::Regular,
-                    id};
-                auto firstClaim = first->linkFor(objects, address);
-                auto secondClaim = second->linkFor(winnerObjects, address);
-                std::filesystem::path firstTemporary, winningTemporary;
-                std::optional<PosixStat> winner;
-                size_t firstWrites = 0, secondWrites = 0;
-                bool publishingWinner = false;
-                auto publish = [&](GitObjectStore & into, const GitObjectStore::Hold & hold) {
-                    into.putObject(address, bytes, hold);
-                };
-                auto checkTemporary = [&](const std::filesystem::path & tmp) {
-                    auto metadata = st(tmp);
-                    EXPECT_TRUE(S_ISREG(metadata.st_mode));
-                    EXPECT_EQ(metadata.st_mode & 07777, expectedMode);
-                    EXPECT_EQ(static_cast<uint64_t>(metadata.st_size), bytes.size());
-                    EXPECT_EQ(readFile(tmp), bytes);
-                };
-                auto secondWrite = [&](const std::filesystem::path & tmp) {
-                    ++secondWrites;
-                    winningTemporary = tmp;
-                    checkTemporary(tmp);
-                };
-                other.atFsync = secondWrite;
-                objects.atFsync = [&](const std::filesystem::path & tmp) {
-                    if (publishingWinner) {
-                        secondWrite(tmp);
-                        return;
-                    }
-                    ++firstWrites;
-                    firstTemporary = tmp;
-                    checkTemporary(tmp);
-                    EXPECT_FALSE(maybeLstat(file));
-                    EXPECT_EQ(pathExists(file.parent_path()), shardPresent);
-                    auto losingInode = st(tmp);
-                    publishingWinner = true;
-                    publish(winnerObjects, *second);
-                    publishingWinner = false;
-                    winner = st(file);
-                    EXPECT_EQ(readFile(file), bytes);
-                    EXPECT_EQ(winner->st_mode & 07777, expectedMode);
-                    EXPECT_EQ(winner->st_dev, losingInode.st_dev);
-                    EXPECT_NE(winner->st_ino, losingInode.st_ino);
-                    EXPECT_EQ(winner->st_nlink, 2u);
-                };
-
-                publish(objects, *first);
-                EXPECT_EQ(firstWrites, 1u);
-                EXPECT_EQ(secondWrites, 1u);
-                ASSERT_TRUE(winner);
-                EXPECT_FALSE(maybeLstat(firstTemporary)) << "the unpublished losing temporary is removed";
-                EXPECT_EQ(winningTemporary.parent_path(), secondClaim.parent_path());
-                EXPECT_EQ(st(winningTemporary).st_ino, winner->st_ino);
-                EXPECT_EQ(st(file).st_ino, winner->st_ino);
-                EXPECT_EQ(st(file).st_nlink, 3u);
-                if (auto claim = maybeLstat(firstClaim)) {
-                    EXPECT_TRUE(S_ISREG(claim->st_mode));
-                    EXPECT_EQ(claim->st_dev, winner->st_dev);
-                    EXPECT_EQ(claim->st_ino, winner->st_ino);
-                    EXPECT_EQ(claim->st_mode & 07777, expectedMode);
-                    EXPECT_EQ(readFile(firstClaim), bytes);
-                } else
-                    ADD_FAILURE() << "the losing publisher did not acquire the winner";
-                size_t firstClaims = 0;
-                for (auto & entry : DirectoryIterator{firstClaim.parent_path()}) {
-                    EXPECT_EQ(entry.path(), firstClaim);
-                    ++firstClaims;
-                }
-                EXPECT_EQ(firstClaims, 1u);
-
-                second.reset();
-                EXPECT_FALSE(pathExists(secondDir));
-                EXPECT_FALSE(maybeLstat(winningTemporary));
-                EXPECT_EQ(st(file).st_nlink, 2u);
-                auto noRoots = [](fun<void(const ObjectHash &)>) { return uint64_t{0}; };
-                auto held = objects.sweep(noRoots);
-                EXPECT_EQ(held.holds, 1u);
-                EXPECT_EQ(held.treesRemoved, 0u);
-                EXPECT_EQ(held.blobsRemoved, 0u);
-                ASSERT_TRUE(maybeLstat(file)) << "the first hold must retain the competing winner";
-                EXPECT_EQ(st(file).st_ino, winner->st_ino);
-                EXPECT_EQ(st(file).st_mode & 07777, expectedMode);
-                EXPECT_EQ(readFile(file), bytes);
-
-                first.reset();
-                EXPECT_FALSE(pathExists(firstDir));
-                EXPECT_EQ(st(file).st_nlink, 1u);
-                auto released = objects.sweep(noRoots);
-                EXPECT_EQ(released.holds, 0u);
-                EXPECT_EQ(released.treesRemoved, kind == 0 ? 1u : 0u);
-                EXPECT_EQ(released.blobsRemoved, kind == 0 ? 0u : 1u);
-                EXPECT_FALSE(maybeLstat(file));
-                ++cases;
-            }
-    EXPECT_EQ(cases, 12u);
 }
 
 TEST_F(LocalStoreObjectsTest, holdsNeverReuseAnExistingName)
@@ -4634,7 +3890,7 @@ TEST_F(LocalStoreObjectsTest, holdsNeverReuseAnExistingName)
         auto fresh = objects.hold();
         EXPECT_EQ(fresh.directory(), expected);
         EXPECT_TRUE(std::filesystem::is_empty(fresh.directory()));
-        objects.putObject({merkle::Mode::Directory, merkle::treeId("")}, "", fresh);
+        fresh.addAuxiliary({{merkle::Mode::Directory, merkle::treeId("")}, ""});
     }
     EXPECT_FALSE(pathExists(expected));
     EXPECT_EQ(readFile(partial / "unfinished.tmp-0"), "old ingestion");
@@ -4644,40 +3900,14 @@ TEST_F(LocalStoreObjectsTest, holdsNeverReuseAnExistingName)
     EXPECT_EQ(readLink(dangling), objects.dir / "absent");
 }
 
-TEST_F(LocalStoreObjectsTest, auxiliaryHoldsCoverEveryKindAndIdentifierShard)
-{
-    auto & objects = store->objects;
-    auto hold = objects.hold();
-    auto shared = hold.ownRows();
-    EXPECT_TRUE(std::filesystem::is_empty(hold.directory()));
-    for (unsigned int byte = 0; byte < 256; ++byte) {
-        Hash id{HashAlgorithm::SHA256};
-        id.hash[0] = byte;
-        for (auto mode : {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Directory}) {
-            auto object = mode == merkle::Mode::Directory ? objects.treeFile(id)
-                                                          : objects.blobFile(id, mode == merkle::Mode::Executable);
-            auto relative = object.lexically_relative(objects.dir);
-            auto expected = hold.directory() / relative;
-            merkle::TreeEntry address{mode, id};
-            EXPECT_EQ(hold.linkFor(objects, address), expected);
-            EXPECT_TRUE(std::filesystem::is_directory(expected.parent_path()));
-            EXPECT_EQ(shared.linkFor(objects, address), expected);
-            EXPECT_EQ(hold.linkFor(objects, address), expected);
-        }
-    }
-}
-
-/* A row view owns the same physical lease, including after its creator is
-   released or moved. Every release order leaves one lock until the last
-   view, while publication and later acquisition use surviving views. */
 TEST_F(LocalStoreObjectsTest, auxiliaryLeaseSurvivesEveryViewReleaseOrder)
 {
     size_t cases = 0;
-    for (unsigned kind = 0; kind < 3; ++kind)
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
         for (unsigned moved = 0; moved < 4; ++moved) {
             std::array<unsigned, 3> order{0, 1, 2};
             do {
-                SCOPED_TRACE(fmt("kind=%d moved=%d order=%d%d%d", kind, moved, order[0], order[1], order[2]));
+                SCOPED_TRACE(fmt("mode=%o moved=%d order=%d%d%d", (RawMode) mode, moved, order[0], order[1], order[2]));
                 GitObjectStore objects{tempStoreDir.path() / fmt("lease-lifetime-%d", cases)};
                 objects.createDirectories();
                 std::array<std::optional<GitObjectStore::Hold>, 3> views;
@@ -4690,183 +3920,29 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLeaseSurvivesEveryViewReleaseOrder)
                     views[moved].reset();
                     views[moved].emplace(std::move(transferred));
                 }
-                auto bytes = kind == 0 ? std::string{} : std::string{"leased auxiliary bytes"};
-                auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
-                auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
-                merkle::TreeEntry address{
-                    kind == 0   ? merkle::Mode::Directory
-                    : kind == 2 ? merkle::Mode::Executable
-                                : merkle::Mode::Regular,
-                    id};
-                auto noRoots = [](fun<void(const ObjectHash &)>) { return uint64_t{0}; };
+                auto bytes = mode == merkle::Mode::Directory ? std::string{} : std::string{"leased bytes"};
+                auto id = mode == merkle::Mode::Directory ? merkle::treeId(bytes) : merkle::blobId(bytes);
+                for (auto & view : views)
+                    view->addAuxiliary({{mode, id}, bytes});
                 for (size_t step = 0; step < 2; ++step) {
                     views[order[step]].reset();
                     ASSERT_TRUE(pathExists(directory));
                     auto & survivor = *views[order[step + 1]];
                     EXPECT_EQ(survivor.directory(), directory);
-                    if (step == 0)
-                        objects.putObject(address, bytes, survivor);
-                    else
-                        ASSERT_TRUE(objects.holdObject(address, survivor));
-                    auto swept = objects.sweep(noRoots);
-                    EXPECT_EQ(swept.holds, 1u);
-                    EXPECT_EQ(swept.treesRemoved + swept.blobsRemoved, 0u);
-                    EXPECT_EQ(readFile(file), bytes);
-                    EXPECT_EQ(st(file).st_mode & 07777, kind == 2 ? 0555u : 0444u);
-                    EXPECT_GE(st(file).st_nlink, 2u);
+                    EXPECT_EQ(objects.sweep().holds, 1u);
+                    EXPECT_FALSE(objects.readAuxiliary({mode, id})) << "a bare store has no committed index";
                 }
+                auto values = views[order[2]]->takeProjection();
+                ASSERT_EQ(values.auxiliary.size(), 1u);
+                EXPECT_EQ(values.auxiliary[0].entry, (merkle::TreeEntry{mode, id}));
+                EXPECT_EQ(values.auxiliary[0].body, bytes);
                 views[order[2]].reset();
                 EXPECT_FALSE(pathExists(directory));
-                EXPECT_EQ(st(file).st_nlink, 1u);
-                auto swept = objects.sweep(noRoots);
-                EXPECT_EQ(swept.holds, 0u);
-                EXPECT_EQ(swept.treesRemoved, kind == 0 ? 1u : 0u);
-                EXPECT_EQ(swept.blobsRemoved, kind == 0 ? 0u : 1u);
-                EXPECT_FALSE(pathExists(file));
+                EXPECT_EQ(objects.sweep().holds, 0u);
+                EXPECT_EQ(values.auxiliary[0].body, bytes) << "projection ownership survives every lease";
                 ++cases;
             } while (std::next_permutation(order.begin(), order.end()));
         }
-    EXPECT_EQ(cases, 72u);
-}
-
-TEST_F(LocalStoreObjectsTest, auxiliaryHoldsKeepTheirAddressesAcrossRepair)
-{
-    size_t cases = 0;
-    auto & objects = store->objects;
-    for (unsigned kind = 0; kind < 3; ++kind)
-        for (unsigned spelling = 0; spelling < 3; ++spelling)
-            for (bool ownRows : {false, true})
-                for (bool reacquire : {false, true}) {
-                    SCOPED_TRACE(
-                        fmt("kind=%d spelling=%d ownRows=%d reacquire=%d", kind, spelling, ownRows, reacquire));
-                    auto bytes = kind == 0 ? std::string{} : fmt("repaired-auxiliary-%d", cases);
-                    auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
-                    auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
-                    merkle::TreeEntry address{
-                        kind == 0   ? merkle::Mode::Directory
-                        : kind == 2 ? merkle::Mode::Executable
-                                    : merkle::Mode::Regular,
-                        id};
-                    auto put = [&](const GitObjectStore::Hold & hold) { objects.putObject(address, bytes, hold); };
-                    auto acquire = [&](const GitObjectStore::Hold & hold) { return objects.holdObject(address, hold); };
-                    if (spelling != 0) {
-                        auto seed = objects.hold();
-                        put(seed);
-                    }
-                    std::optional<GitObjectStore::Hold> owner{objects.hold()};
-                    std::optional<GitObjectStore::Hold> view;
-                    if (ownRows)
-                        view.emplace(owner->ownRows());
-                    const auto & hold = view ? *view : *owner;
-                    if (spelling == 0)
-                        put(hold); // The published temporary remains <id>.tmp-<counter>.
-                    else {
-                        ASSERT_TRUE(acquire(hold));
-                        if (spelling == 2) {
-                            auto name = hold.linkFor(objects, address);
-                            std::filesystem::rename(name, name.parent_path().parent_path() / name.filename());
-                        }
-                    }
-                    auto oldInode = st(file).st_ino;
-                    chmod(file, 0644);
-                    writeFile(file, "corrupt auxiliary bytes");
-                    chmod(file, kind == 2 ? 0555 : 0444);
-                    EXPECT_FALSE(store->verifyStore(true, Repair));
-                    ASSERT_FALSE(pathExists(file));
-                    {
-                        auto repair = objects.hold();
-                        put(repair);
-                    }
-                    ASSERT_NE(st(file).st_ino, oldInode);
-                    ASSERT_EQ(st(file).st_nlink, 1u);
-                    if (reacquire)
-                        ASSERT_TRUE(acquire(hold));
-                    /* An ownRows view may finish before the directory's
-                       last owner. Its auxiliary obligations still exist. */
-                    view.reset();
-                    auto noRoots = [](fun<void(const ObjectHash &)>) { return uint64_t{0}; };
-                    auto kept = objects.sweep(noRoots);
-                    EXPECT_TRUE(pathExists(file));
-                    EXPECT_EQ(kept.treesRemoved + kept.blobsRemoved, 0u);
-                    owner.reset();
-                    auto removed = objects.sweep(noRoots);
-                    EXPECT_FALSE(pathExists(file));
-                    EXPECT_EQ(removed.treesRemoved + removed.blobsRemoved, 1u);
-                    ++cases;
-                }
-    EXPECT_EQ(cases, 36u);
-}
-
-TEST_F(LocalStoreObjectsTest, heldTreeAddressesDoNotReplaceReachabilityTraversal)
-{
-    for (bool reachable : {false, true})
-        for (bool childHeld : {false, true}) {
-            SCOPED_TRACE(fmt("reachable=%d childHeld=%d", reachable, childHeld));
-            GitObjectStore objects{tempStoreDir.path() / fmt("held-reachability-%d-%d", reachable, childHeld)};
-            objects.createDirectories();
-            auto blob = merkle::blobId("target");
-            auto body = merkle::serialiseTree({{"link", {merkle::Mode::Symlink, blob}}});
-            auto tree = merkle::treeId(body);
-            {
-                auto seed = objects.hold();
-                objects.putObject({merkle::Mode::Regular, blob}, "target", seed);
-                objects.putObject({merkle::Mode::Directory, tree}, body, seed);
-            }
-            auto hold = objects.hold();
-            ASSERT_TRUE(objects.holdObject({merkle::Mode::Directory, tree}, hold));
-            if (childHeld)
-                ASSERT_TRUE(objects.holdObject({merkle::Mode::Regular, blob}, hold));
-            objects.sweep([&](fun<void(const ObjectHash &)> live) {
-                if (reachable)
-                    live(ObjectHash::of({merkle::Mode::Directory, tree}));
-                return uint64_t{0};
-            });
-            EXPECT_TRUE(pathExists(objects.treeFile(tree)));
-            EXPECT_EQ(pathExists(objects.blobFile(blob, false)), reachable || childHeld);
-        }
-}
-
-TEST_F(LocalStoreObjectsTest, auxiliaryHoldNamesDenoteExactlyTheirKindAndIdentifier)
-{
-    const std::array<std::string_view, 3> kinds{"blobs", "blobs-x", "trees"};
-    const std::vector<std::pair<std::string, bool>> suffixes{
-        {"", true},
-        {".tmp-0", true},
-        {".tmp-18446744073709551615", true},
-        {".tmp-", false},
-        {".tmp--1", false},
-        {".tmp-1x", false},
-        {".tmp-1.extra", false},
-        {".old", false},
-    };
-    size_t cases = 0;
-    for (size_t kind = 0; kind < kinds.size(); ++kind)
-        for (bool sharded : {false, true})
-            for (auto & [suffix, accepted] : suffixes) {
-                SCOPED_TRACE(fmt("kind=%d sharded=%d suffix=%s", kind, sharded, suffix));
-                GitObjectStore objects{tempStoreDir.path() / fmt("hold-name-%d", cases)};
-                objects.createDirectories();
-                auto id = merkle::blobId("held address");
-                auto name = GitObjectStore::idString(id);
-                auto hold = objects.hold();
-                auto claim = hold.directory() / kinds[kind];
-                if (sharded)
-                    claim /= name.substr(0, 2);
-                createDirs(claim);
-                /* A surviving old incarnation is independent of the newly
-                   published inode and may have corrupt bytes or metadata. */
-                writeFile(claim / (name + suffix), "old incarnation");
-                std::array files{objects.blobFile(id, false), objects.blobFile(id, true), objects.treeFile(id)};
-                for (auto & file : files) {
-                    createDirs(file.parent_path());
-                    writeFile(file, "new incarnation");
-                    ASSERT_EQ(st(file).st_nlink, 1u);
-                }
-                objects.sweep([](fun<void(const ObjectHash &)>) { return uint64_t{0}; });
-                for (size_t other = 0; other < kinds.size(); ++other)
-                    EXPECT_EQ(pathExists(files[other]), accepted && other == kind);
-                ++cases;
-            }
     EXPECT_EQ(cases, 48u);
 }
 
@@ -4894,449 +3970,6 @@ struct OnAuxiliaryCorruption : testing::CaptureLogger
 
 } // namespace
 
-TEST_F(LocalStoreObjectsTest, auxiliaryRepairPreservesAConcurrentReplacement)
-{
-    auto & objects = store->objects;
-    size_t cases = 0;
-    /* After the first observation, another verifier removes that inode.
-       The address can then be absent, sound, or still corrupt. The first
-       verifier must decide from that current state under its reservation. */
-    for (unsigned kind = 0; kind < 3; ++kind)
-        for (unsigned replacement = 0; replacement < 3; ++replacement) {
-            SCOPED_TRACE(fmt("kind=%d replacement=%d", kind, replacement));
-            auto bytes = kind == 0 ? std::string{} : fmt("sound-replacement-%d", cases);
-            auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
-            auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
-            merkle::TreeEntry address{
-                kind == 0   ? merkle::Mode::Directory
-                : kind == 2 ? merkle::Mode::Executable
-                            : merkle::Mode::Regular,
-                id};
-            createDirs(file.parent_path());
-            writeFile(file, "corrupt old incarnation");
-            auto old = st(file);
-            /* Pin solely to distinguish the test's two incarnations. The
-               verifier keeps a descriptor only while reading each inode. */
-            auto oldInode = openFileReadonly(file);
-            ASSERT_TRUE(oldInode);
-            auto hold = objects.hold();
-            bool nestedErrors = true;
-            OnAuxiliaryCorruption mismatch;
-            mismatch.replace = [&] {
-                /* This is the real verifier's diagnostic boundary, after
-                   hashing but before removal, with no scheduling or seam. */
-                nestedErrors = store->verifyStore(true, Repair);
-                if (replacement == 1)
-                    objects.putObject(address, bytes, hold);
-                else if (replacement == 2)
-                    writeFile(file, "a different corrupt replacement with a different size");
-            };
-            auto oldLogger = std::exchange(logger, &mismatch);
-            auto oldVerbosity = std::exchange(verbosity, lvlInfo);
-            Finally restore{[&] {
-                logger = oldLogger;
-                verbosity = oldVerbosity;
-            }};
-            EXPECT_FALSE(store->verifyStore(true, Repair));
-            if (mismatch.failure)
-                std::rethrow_exception(mismatch.failure);
-            ASSERT_TRUE(mismatch.observed);
-            EXPECT_FALSE(nestedErrors);
-            EXPECT_EQ(pathExists(file), replacement == 1);
-            if (replacement == 1) {
-                ASSERT_TRUE(pathExists(file));
-                EXPECT_EQ(readFile(file), bytes);
-                EXPECT_NE(st(file).st_ino, old.st_ino);
-                unlinkIfExists(file);
-            }
-            ++cases;
-        }
-    EXPECT_EQ(cases, 9u);
-}
-
-TEST_F(LocalStoreObjectsTest, auxiliaryHoldClaimsDoNotDependOnTheOldInodeKind)
-{
-    enum class Kind { Regular, Symlink, DanglingSymlink, Fifo, Socket, Character, Block, Directory };
-    const std::array kinds{
-        Kind::Regular,
-        Kind::Symlink,
-        Kind::DanglingSymlink,
-        Kind::Fifo,
-        Kind::Socket,
-        Kind::Character,
-        Kind::Block,
-        Kind::Directory};
-    const std::array<std::string_view, 3> namespaces{"trees", "blobs", "blobs-x"};
-    auto & objects = store->objects;
-    size_t cases = 0, devicesUnavailable = 0;
-    for (unsigned space = 0; space < namespaces.size(); ++space)
-        for (bool flat : {false, true})
-            for (auto kind : kinds) {
-                SCOPED_TRACE(fmt("space=%d flat=%d kind=%d", space, flat, static_cast<unsigned>(kind)));
-                auto bytes = space == 0 ? std::string{} : fmt("replacement-%d", cases);
-                auto id = space == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
-                auto file = space == 0 ? objects.treeFile(id) : objects.blobFile(id, space == 2);
-                createDirs(file.parent_path());
-                auto outside = tempStoreDir.path() / "outside-auxiliary-claim";
-                writeFile(outside, bytes);
-                AutoCloseFD socket;
-                switch (kind) {
-                case Kind::Regular:
-                case Kind::Directory:
-                    writeFile(file, "corrupt incarnation");
-                    break;
-                case Kind::Symlink:
-                    createSymlink(outside, file);
-                    break;
-                case Kind::DanglingSymlink:
-                    createSymlink(outside.string() + "-missing", file);
-                    break;
-                case Kind::Fifo:
-                    ASSERT_EQ(mkfifo(file.c_str(), 0600), 0) << strerror(errno);
-                    break;
-                case Kind::Socket:
-                    socket = createUnixDomainSocket(file, 0600);
-                    break;
-                case Kind::Character:
-                case Kind::Block:
-                    if (mknod(file.c_str(), (kind == Kind::Character ? S_IFCHR : S_IFBLK) | 0600, 0) == -1) {
-                        /* Device nodes complete the POSIX kind domain but
-                           require privileges unavailable in ordinary and
-                           sandboxed test runs. No leaf-type predicate is
-                           used by the claim decoder for any of these kinds. */
-                        ASSERT_TRUE(errno == EPERM || errno == EACCES || errno == ENOTSUP) << strerror(errno);
-                        ++devicesUnavailable;
-                        continue;
-                    }
-                    break;
-                }
-
-                std::optional<GitObjectStore::Hold> hold{objects.hold()};
-                merkle::TreeEntry address{
-                    space == 0   ? merkle::Mode::Directory
-                    : space == 2 ? merkle::Mode::Executable
-                                 : merkle::Mode::Regular,
-                    id};
-                auto claim = flat ? hold->directory() / namespaces[space] / GitObjectStore::idString(id)
-                                  : hold->linkFor(objects, address);
-                createDirs(claim.parent_path());
-                if (kind == Kind::Directory) {
-                    /* Directories cannot be hard-linked, but a corrupted
-                       claim with this shape conservatively denotes the same
-                       address, without granting a traversal into it. */
-                    createDir(claim);
-                    writeFile(claim / "not-an-auxiliary-claim", "untouched until hold release");
-                } else {
-                    ASSERT_TRUE(objects.holdObject(address, *hold));
-                    if (flat)
-                        std::filesystem::rename(hold->linkFor(objects, address), claim);
-                    EXPECT_EQ(st(claim).st_ino, st(file).st_ino);
-                }
-                EXPECT_TRUE(store->verifyStore(true, NoRepair));
-                EXPECT_FALSE(store->verifyStore(true, Repair));
-                EXPECT_FALSE(maybeLstat(file));
-                EXPECT_EQ(readFile(outside), bytes) << "a corrupt symlink is never followed";
-                {
-                    auto replacement = objects.hold();
-                    objects.putObject(address, bytes, replacement);
-                }
-                ASSERT_EQ(st(file).st_nlink, 1u);
-                objects.sweep([](fun<void(const ObjectHash &)>) { return uint64_t{0}; });
-                ASSERT_TRUE(pathExists(file)) << "the typed address survives its linked incarnation";
-                EXPECT_EQ(readFile(file), bytes);
-                hold.reset();
-                objects.sweep([](fun<void(const ObjectHash &)>) { return uint64_t{0}; });
-                EXPECT_FALSE(pathExists(file));
-                ++cases;
-            }
-    EXPECT_EQ(cases + devicesUnavailable, 48u);
-    EXPECT_GE(cases, 36u);
-    RecordProperty("device_node_cases_unavailable", devicesUnavailable);
-}
-
-TEST_F(LocalStoreObjectsTest, auxiliaryReadersRejectNonregularOccupants)
-{
-    enum class Kind { Missing, Regular, Symlink, DanglingSymlink, Fifo, Socket, Character, Block, Directory };
-    enum class Role {
-        TreeBytes,
-        BlobBytes,
-        ExecutableBlobBytes,
-        VerifiedTree,
-        Sweep,
-        MaterialiseTree,
-        MaterialiseLink
-    };
-    const std::array kinds{
-        Kind::Missing,
-        Kind::Regular,
-        Kind::Symlink,
-        Kind::DanglingSymlink,
-        Kind::Fifo,
-        Kind::Socket,
-        Kind::Character,
-        Kind::Block,
-        Kind::Directory};
-    const std::array roles{
-        Role::TreeBytes,
-        Role::BlobBytes,
-        Role::ExecutableBlobBytes,
-        Role::VerifiedTree,
-        Role::Sweep,
-        Role::MaterialiseTree,
-        Role::MaterialiseLink};
-    auto & objects = store->objects;
-    size_t cases = 0, devicesUnavailable = 0;
-    for (auto role : roles)
-        for (auto kind : kinds) {
-            SCOPED_TRACE(fmt("role=%d kind=%d", static_cast<unsigned>(role), static_cast<unsigned>(kind)));
-            bool tree = role != Role::BlobBytes && role != Role::ExecutableBlobBytes && role != Role::MaterialiseLink;
-            auto target = fmt("auxiliary-reader-target-%d", cases + devicesUnavailable);
-            auto targetId = merkle::blobId(target);
-            auto body = merkle::serialiseTree({{"link", {merkle::Mode::Symlink, targetId}}});
-            auto bytes = tree ? body : target;
-            auto id = tree ? merkle::treeId(body) : targetId;
-            auto file = tree ? objects.treeFile(id) : objects.blobFile(id, role == Role::ExecutableBlobBytes);
-            auto outside = tempStoreDir.path() / "auxiliary-reader-outside";
-            createDirs(file.parent_path());
-            writeFile(outside, bytes);
-            Finally clean{[&] {
-                if (maybeLstat(file))
-                    deletePath(file);
-            }};
-            AutoCloseFD socket;
-            switch (kind) {
-            case Kind::Missing:
-                break;
-            case Kind::Regular:
-                writeFile(file, bytes);
-                break;
-            case Kind::Symlink:
-                createSymlink(outside, file);
-                break;
-            case Kind::DanglingSymlink:
-                createSymlink(outside.string() + "-missing", file);
-                break;
-            case Kind::Fifo:
-                ASSERT_EQ(mkfifo(file.c_str(), 0600), 0) << strerror(errno);
-                break;
-            case Kind::Socket:
-                socket = createUnixDomainSocket(file, 0600);
-                break;
-            case Kind::Character:
-            case Kind::Block:
-                if (mknod(file.c_str(), (kind == Kind::Character ? S_IFCHR : S_IFBLK) | 0600, 0) == -1) {
-                    ASSERT_TRUE(errno == EPERM || errno == EACCES || errno == ENOTSUP) << strerror(errno);
-                    ++devicesUnavailable;
-                    continue;
-                }
-                break;
-            case Kind::Directory:
-                createDir(file);
-                break;
-            }
-            bool malformed = kind != Kind::Missing && kind != Kind::Regular;
-            auto source = treeAccessor({{"link", target, 'l'}});
-            if (role == Role::MaterialiseLink)
-                source->root = MemorySourceAccessor::File{MemorySourceAccessor::File::Symlink{.target = target}};
-            if (role == Role::MaterialiseTree) {
-                auto hold = objects.hold();
-                objects.putObject({merkle::Mode::Regular, targetId}, target, hold);
-            }
-            auto spare = objects.blobFile(merkle::blobId("unreachable reader-test sentinel"), false);
-            if (role == Role::Sweep) {
-                createDirs(spare.parent_path());
-                writeFile(spare, "unreachable reader-test sentinel");
-            }
-            auto exercise = [&]() -> bool {
-                switch (role) {
-                case Role::TreeBytes:
-                case Role::BlobBytes:
-                case Role::ExecutableBlobBytes:
-                    try {
-                        auto read = readAuxiliaryObject(objects, id, static_cast<unsigned>(role));
-                        return !malformed && read == (kind == Kind::Missing ? std::nullopt : std::optional{bytes});
-                    } catch (NotARegularFile &) {
-                        return malformed;
-                    }
-                case Role::VerifiedTree: {
-                    auto read = objects.readVerifiedTree(id);
-                    return kind == Kind::Regular ? read && read->at("link").hash == targetId : !read;
-                }
-                case Role::Sweep: {
-                    auto swept = objects.sweep([&](fun<void(const ObjectHash &)> live) {
-                        live(ObjectHash{id});
-                        return uint64_t{0};
-                    });
-                    return swept.corruptTrees == (malformed ? 1u : 0u) && pathExists(spare) == malformed;
-                }
-                case Role::MaterialiseTree:
-                case Role::MaterialiseLink: {
-                    auto dst = config->realStoreDir.get() / fmt("auxiliary-reader-%d", cases + devicesUnavailable);
-                    auto counting = make_ref<CountingAccessor>(source);
-                    auto hold = objects.hold();
-                    try {
-                        auto result = store->materialiseThroughObjects(
-                            dst,
-                            SourcePath(counting),
-                            defaultPathFilter,
-                            false,
-                            nullptr,
-                            NoRepair,
-                            everyNode(source),
-                            hold);
-                        if (kind == Kind::Directory)
-                            return false;
-                        bool fellBack = role == Role::MaterialiseTree ? counting->listings != 0 : counting->links != 0;
-                        StringSink nar;
-                        dumpPath(dst, nar);
-                        return fellBack == (kind != Kind::Regular) && nar.s == narOf(*source)
-                               && result.root == objectHashOf(*source, CanonPath::root).root;
-                    } catch (Error &) {
-                        /* Directories cannot be hard-linked, including by
-                           the fallback's auxiliary publisher. Readers do
-                           not silently repair this existing error case. */
-                        return kind == Kind::Directory;
-                    }
-                }
-                }
-                return false;
-            };
-            if (kind == Kind::Fifo) {
-                /* No writer exists. The old reader blocks in open(); a
-                   child bounds that failure without a timing-dependent
-                   writer or a blocked future on assertion unwinding.
-                   The alarm is a failure watchdog, not synchronization. */
-                Pid child = startProcess([&] {
-                    alarm(5);
-                    _exit(exercise() ? 0 : 1);
-                });
-                EXPECT_EQ(child.wait(), 0) << "auxiliary FIFO read failed or blocked";
-            } else
-                EXPECT_TRUE(exercise());
-            EXPECT_EQ(readFile(outside), bytes);
-            ++cases;
-        }
-    EXPECT_EQ(cases + devicesUnavailable, 63u);
-    EXPECT_GE(cases, 49u);
-    RecordProperty("device_node_cases_unavailable", devicesUnavailable);
-}
-
-TEST_F(LocalStoreObjectsTest, auxiliaryVerificationDoesNotFollowNamespaceSymlinks)
-{
-    for (auto kind : {"blobs", "blobs-x", "trees"})
-        for (bool atKind : {false, true}) {
-            SCOPED_TRACE(fmt("kind=%s atKind=%d", kind, atKind));
-            GitObjectStore objects{tempStoreDir.path() / fmt("namespace-symlink-%s-%d", kind, atKind)};
-            objects.createDirectories();
-            auto outside = tempStoreDir.path() / fmt("outside-namespace-%s-%d", kind, atKind);
-            createDirs(outside);
-            auto file = outside / GitObjectStore::idString(merkle::blobId("expected"));
-            writeFile(file, "external bytes are not an auxiliary object");
-            auto node = objects.dir / kind;
-            if (atKind)
-                ASSERT_TRUE(std::filesystem::remove(node));
-            else
-                node /= "ab";
-            createSymlink(outside, node);
-            if (atKind) {
-                /* A fixed kind must be a directory. Namespace corruption
-                   is diagnosed without following or rewriting that link. */
-                EXPECT_THROW(objects.verify(NoRepair), Error);
-                EXPECT_THROW(objects.verify(Repair), Error);
-                EXPECT_TRUE(S_ISLNK(st(node).st_mode));
-            } else {
-                EXPECT_TRUE(objects.verify(NoRepair));
-                EXPECT_FALSE(objects.verify(Repair));
-                EXPECT_FALSE(maybeLstat(node));
-            }
-            EXPECT_EQ(readFile(file), "external bytes are not an auxiliary object");
-        }
-}
-
-TEST_F(LocalStoreObjectsTest, auxiliaryRepairRecognizesARestoredShardDirectory)
-{
-    for (unsigned kind = 0; kind < 3; ++kind)
-        for (bool populated : {false, true}) {
-            SCOPED_TRACE(fmt("kind=%d populated=%d", kind, populated));
-            GitObjectStore objects{tempStoreDir.path() / fmt("restored-shard-%d-%d", kind, populated)};
-            objects.createDirectories();
-            auto bytes = kind == 0 ? std::string{} : std::string{"restored shard bytes"};
-            auto id = kind == 0 ? merkle::treeId(bytes) : merkle::blobId(bytes);
-            auto file = kind == 0 ? objects.treeFile(id) : objects.blobFile(id, kind == 2);
-            merkle::TreeEntry address{
-                kind == 0   ? merkle::Mode::Directory
-                : kind == 2 ? merkle::Mode::Executable
-                            : merkle::Mode::Regular,
-                id};
-            auto shard = file.parent_path();
-            auto outside = tempStoreDir.path() / fmt("outside-restored-shard-%d-%d", kind, populated);
-            createDirs(outside);
-            writeFile(outside / "untouched", "external bytes");
-            createSymlink(outside, shard);
-            auto hold = objects.hold();
-            bool nestedErrors = true;
-            OnAuxiliaryCorruption mismatch;
-            mismatch.replace = [&] {
-                nestedErrors = objects.verify(Repair);
-                if (!populated)
-                    createDirs(shard);
-                else
-                    objects.putObject(address, bytes, hold);
-            };
-            auto oldLogger = std::exchange(logger, &mismatch);
-            auto oldVerbosity = std::exchange(verbosity, lvlInfo);
-            Finally restore{[&] {
-                logger = oldLogger;
-                verbosity = oldVerbosity;
-            }};
-            EXPECT_FALSE(objects.verify(Repair));
-            if (mismatch.failure)
-                std::rethrow_exception(mismatch.failure);
-            EXPECT_TRUE(mismatch.observed);
-            EXPECT_FALSE(nestedErrors);
-            ASSERT_TRUE(S_ISDIR(st(shard).st_mode));
-            EXPECT_EQ(pathExists(file), populated);
-            if (populated)
-                EXPECT_EQ(readFile(file), bytes);
-            EXPECT_EQ(readFile(outside / "untouched"), "external bytes");
-        }
-}
-
-TEST_F(LocalStoreObjectsTest, auxiliaryDirectoryLeavesAreDiagnosedInBothLayouts)
-{
-    for (auto kind : {"blobs", "blobs-x", "trees"})
-        for (bool flat : {false, true})
-            for (bool populated : {false, true}) {
-                SCOPED_TRACE(fmt("kind=%s flat=%d populated=%d", kind, flat, populated));
-                GitObjectStore objects{tempStoreDir.path() / fmt("directory-leaf-%s-%d-%d", kind, flat, populated)};
-                objects.createDirectories();
-                auto name = GitObjectStore::idString(merkle::blobId("directory occupant"));
-                auto file = objects.dir / kind;
-                if (!flat)
-                    file /= name.substr(0, 2);
-                file /= name;
-                createDirs(file);
-                if (populated)
-                    writeFile(file / "child", "not recursively removed");
-                /* Junk directories are not object identifiers in the flat
-                   compatibility layout and retain their existing meaning. */
-                auto junk = objects.dir / kind / "not-an-object";
-                createDirs(junk);
-                writeFile(junk / "keep", "untouched");
-                objects.sweep([](fun<void(const ObjectHash &)>) { return uint64_t{0}; });
-                ASSERT_TRUE(pathExists(file));
-                EXPECT_TRUE(objects.verify(NoRepair));
-                if (populated) {
-                    EXPECT_THROW(objects.verify(Repair), Error);
-                    EXPECT_EQ(readFile(file / "child"), "not recursively removed");
-                } else {
-                    EXPECT_FALSE(objects.verify(Repair));
-                    EXPECT_FALSE(pathExists(file));
-                }
-                EXPECT_EQ(readFile(junk / "keep"), "untouched");
-            }
-}
-
 TEST_F(LocalStoreObjectsTest, releasingAHoldDoesNotFollowSymlinks)
 {
     auto outside = tempStoreDir.path() / "outside";
@@ -5348,98 +3981,12 @@ TEST_F(LocalStoreObjectsTest, releasingAHoldDoesNotFollowSymlinks)
         dir = hold.directory();
         createSymlink(outside, dir / "outside-link");
         std::filesystem::create_hard_link(outside / "keep", dir / "extra-link");
-        store->objects.putObject({merkle::Mode::Directory, merkle::treeId("")}, "", hold);
+        hold.addAuxiliary({{merkle::Mode::Directory, merkle::treeId("")}, ""});
     }
     EXPECT_FALSE(pathExists(dir));
     EXPECT_EQ(readFile(outside / "keep"), "untouched");
     EXPECT_EQ(st(outside / "keep").st_nlink, 1u);
-    EXPECT_EQ(readFile(store->objects.treeFile(merkle::treeId(""))), "");
-}
-
-/* Auxiliary bytes and read permissions must be complete before the
-   durability boundary. Their mtime is not part of the represented tree;
-   regular-file holders retain their independent canonical-time contract. */
-TEST_F(LocalStoreObjectsTest, writeAuxiliaryBytesAndModeBeforeFsync)
-{
-    GitObjectStore objects{tempStoreDir.path() / "fsynced", /*fsync=*/true};
-    objects.createDirectories();
-
-    struct Seen
-    {
-        std::string what;
-        mode_t mode;
-        std::string bytes;
-    };
-
-    std::vector<Seen> seen;
-    std::string what;
-    objects.atFsync = [&](const std::filesystem::path & tmp) {
-        auto s = lstat(tmp);
-        seen.push_back({what, static_cast<mode_t>(s.st_mode & ~S_IFMT), readFile(tmp)});
-    };
-
-    auto hold = objects.hold();
-    what = "a symlink's target blob";
-    objects.putObject({merkle::Mode::Regular, merkle::blobId("one")}, "one", hold);
-    what = "a tree body";
-    auto root = merkle::TreeEntry{merkle::Mode::Executable, merkle::blobId("one")};
-    objects.putRootTree(root, hold);
-
-    ASSERT_EQ(seen.size(), 2u);
-    EXPECT_EQ(seen[0].mode, 0444u) << seen[0].what;
-    EXPECT_EQ(seen[1].mode, 0444u) << seen[1].what;
-    EXPECT_EQ(seen[0].bytes, "one");
-
-    /* And that is what stands afterwards: the link carries the inode. */
-    EXPECT_EQ(st(objects.blobFile(merkle::blobId("one"), false)).st_mode & ~S_IFMT, 0444u);
-    auto body = merkle::syntheticRootTree(root);
-    ASSERT_TRUE(body.has_value());
-    EXPECT_EQ(seen[1].bytes, *body);
-    EXPECT_EQ(st(objects.treeFile(merkle::treeId(*body))).st_mode & ~S_IFMT, 0444u);
-    EXPECT_EQ(readFile(objects.blobFile(merkle::blobId("one"), false)), "one");
-    EXPECT_EQ(readFile(objects.treeFile(merkle::treeId(*body))), *body);
-    /* And nothing under `blobs-x`: a bare object store holds no
-       regular-file blob, and a symlink's target is never executable. */
-    EXPECT_FALSE(pathExists(objects.blobFile(merkle::blobId("one"), true)));
-
-    /* The hook is the fsync's: a store that does not flush does not reach
-       it, which is why the canonicalisation must precede the flush and not
-       merely the link. */
-    GitObjectStore unsynced{tempStoreDir.path() / "unsynced", /*fsync=*/false};
-    unsynced.createDirectories();
-    size_t calls = 0;
-    unsynced.atFsync = [&](const std::filesystem::path &) { calls++; };
-    auto unsyncedHold = unsynced.hold();
-    unsynced.putObject({merkle::Mode::Regular, merkle::blobId("one")}, "one", unsyncedHold);
-    EXPECT_EQ(calls, 0u);
-}
-
-TEST_F(LocalStoreObjectsTest, auxiliaryReadPermissionsAreIndependentOfEveryUmask)
-{
-    GitObjectStore objects{tempStoreDir.path() / "auxiliary-umasks"};
-    objects.createDirectories();
-    auto hold = objects.hold();
-    const std::string bytes = "auxiliary bytes";
-    auto id = merkle::blobId(bytes);
-    for (bool executable : {false, true}) {
-        auto file = objects.blobFile(id, executable);
-        merkle::TreeEntry address{executable ? merkle::Mode::Executable : merkle::Mode::Regular, id};
-        /* The finite domain here is creation of the auxiliary file, not
-           directory creation, which has its own permission semantics. */
-        createDirs(file.parent_path());
-        hold.linkFor(objects, address);
-        for (mode_t mask = 0; mask <= 0777; ++mask) {
-            SCOPED_TRACE(fmt("executable=%d umask=%o", executable, mask));
-            {
-                auto previous = ::umask(mask);
-                Finally restoreUmask{[&] { ::umask(previous); }};
-                objects.putObject(address, bytes, hold);
-            }
-            EXPECT_EQ(st(file).st_mode & 07777, executable ? 0555u : 0444u);
-            EXPECT_EQ(readFile(file), bytes);
-            unlinkIfExists(file);
-        }
-    }
+    EXPECT_FALSE(hasTree(merkle::treeId(""))) << "unpublished values were private to the destroyed hold";
 }
 
 /* The counterpart of the executable-blob arm `writeAuxiliaryBytesAndModeBeforeFsync`
@@ -5451,6 +3998,646 @@ TEST_F(LocalStoreObjectsTest, auxiliaryReadPermissionsAreIndependentOfEveryUmask
    §9.10, "one such file per (blob, mode) in use and never one for both" --
    because the index's key is (id, mode, ingestion): the same bytes under the two bits
    are two rows naming two files, never one file linked across the bit. */
+/* One completed ingestion owns a map of typed auxiliary values. SQL chunks
+   encode one value; an incomplete prefix is never independently publishable. */
+TEST_F(LocalStoreObjectsTest, pendingAuxiliaryAndRegularValuesKeepAllTypedKeys)
+{
+    auto hold = store->objects.hold();
+    store->beginIngestion(hold, "/typed-pending");
+    using Key = std::pair<std::string, merkle::Mode>;
+    std::map<Key, std::string> expected;
+    for (size_t position = 0; position < 32; ++position)
+        for (unsigned byte = 0; byte < 256; ++byte) {
+            Hash id{HashAlgorithm::SHA256};
+            id.hash[position] = byte;
+            for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink}) {
+                auto body = fmt("first-%d-%d-%o", position, byte, (RawMode) mode);
+                expected.emplace(Key{std::string(reinterpret_cast<const char *>(id.hash), 32), mode}, body);
+                hold.addAuxiliary({{mode, id}, body});
+                hold.addAuxiliary({{mode, id}, "rejected duplicate"});
+            }
+            for (bool executable : {false, true}) {
+                GitObjectStore::Hold::Row row{
+                    .id = id,
+                    .executable = executable,
+                    .ino = 1,
+                    .dev = 2,
+                    .size = 3,
+                    .name = fmt("holder-%d-%d-%d", position, byte, executable)};
+                auto prior = hold.addRow(row);
+                if (position == 0 || byte != 0)
+                    EXPECT_FALSE(prior);
+                else
+                    EXPECT_EQ(prior, fmt("/typed-pending/holder-0-0-%d", executable));
+            }
+        }
+    /* Every unused byte is ignored, but retained in the first owned value. */
+    for (size_t position = 32; position < Hash::maxHashSize; ++position)
+        for (unsigned byte = 0; byte < 256; ++byte)
+            for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink}) {
+                Hash id{HashAlgorithm::SHA256};
+                id.hash[position] = byte;
+                hold.addAuxiliary({{mode, id}, "rejected tail duplicate"});
+            }
+    auto privateAttempt = hold.ownRows();
+    EXPECT_TRUE(privateAttempt.takeProjection().auxiliary.empty());
+    EXPECT_TRUE(privateAttempt.takeProjection().regular.empty());
+    auto extra = merkle::blobId("private attempt");
+    privateAttempt.addAuxiliary({{merkle::Mode::Symlink, extra}, "private attempt"});
+    auto projection = hold.takeProjection();
+    ASSERT_EQ(projection.auxiliary.size(), 2u * (1 + 32 * 255));
+    ASSERT_EQ(projection.regular.size(), projection.auxiliary.size());
+    std::set<Key> seen;
+    for (auto & value : projection.auxiliary) {
+        Key key{std::string(reinterpret_cast<const char *>(value.entry.hash.hash), 32), value.entry.mode};
+        EXPECT_TRUE(seen.insert(key).second);
+        EXPECT_EQ(value.body, expected.at(key));
+    }
+    auto isolated = privateAttempt.takeProjection();
+    ASSERT_EQ(isolated.auxiliary.size(), 1u);
+    EXPECT_EQ(isolated.auxiliary[0].entry, (merkle::TreeEntry{merkle::Mode::Symlink, extra}));
+    EXPECT_TRUE(hold.takeProjection().auxiliary.empty());
+    EXPECT_TRUE(hold.takeProjection().regular.empty());
+    EXPECT_EQ(auxiliaryRowCount(), 0u);
+    for (auto & value : projection.auxiliary)
+        hold.addAuxiliary(value);
+    store->beginIngestion(hold, "/reset");
+    EXPECT_TRUE(hold.takeProjection().auxiliary.empty());
+    EXPECT_EQ(projection.auxiliary.size(), expected.size());
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryKeysAdmitExactlyCanonicalProducerIdentities)
+{
+    const std::array modes{
+        merkle::Mode::Directory,
+        merkle::Mode::Regular,
+        merkle::Mode::Executable,
+        merkle::Mode::Symlink,
+        static_cast<merkle::Mode>(0),
+        static_cast<merkle::Mode>(0xffffffffu)};
+    const std::array algorithms{
+        HashAlgorithm::MD5, HashAlgorithm::SHA1, HashAlgorithm::SHA256, HashAlgorithm::SHA512, HashAlgorithm::BLAKE3};
+    auto hold = store->objects.hold();
+    size_t accepted = 0, rejected = 0;
+    for (auto mode : modes)
+        for (auto algorithm : algorithms)
+            for (size_t width = 0; width <= Hash::maxHashSize; ++width) {
+                SCOPED_TRACE(fmt("mode=%o algorithm=%d width=%d", (RawMode) mode, int(algorithm), width));
+                Hash id{HashAlgorithm::SHA256};
+                id.algo = algorithm;
+                id.hashSize = width;
+                merkle::TreeEntry entry{mode, id};
+                bool valid = (mode == merkle::Mode::Directory || mode == merkle::Mode::Symlink)
+                             && algorithm == HashAlgorithm::SHA256 && width == 32;
+                if (valid) {
+                    EXPECT_NO_THROW(hold.addAuxiliary({entry, ""}));
+                    EXPECT_FALSE(store->objects.readAuxiliary(entry));
+                    ++accepted;
+                } else {
+                    EXPECT_THROW(hold.addAuxiliary({entry, ""}), Error);
+                    EXPECT_THROW(store->objects.readAuxiliary(entry), Error);
+                    ++rejected;
+                }
+            }
+    EXPECT_EQ(accepted, 2u);
+    EXPECT_EQ(accepted + rejected, modes.size() * algorithms.size() * (Hash::maxHashSize + 1));
+    EXPECT_EQ(hold.takeProjection().auxiliary.size(), 2u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryValuesPublishOnlyCompleteChunkSequences)
+{
+    constexpr size_t chunkSize = 1 << 20;
+    size_t cases = 0;
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
+        for (size_t size :
+             {size_t{0}, size_t{1}, chunkSize - 1, chunkSize, chunkSize + 1, 2 * chunkSize, 2 * chunkSize + 1}) {
+            SCOPED_TRACE(fmt("mode=%o size=%d", (RawMode) mode, size));
+            std::string body(size, 'a');
+            for (size_t i = 0; i < size; ++i)
+                body[i] = static_cast<char>(i % 251);
+            auto id = mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body);
+            merkle::TreeEntry entry{mode, id};
+            auto hold = store->objects.hold();
+            auto path = config->realStoreDir.get() / fmt("chunk-value-%d", cases);
+            store->beginIngestion(hold, path);
+            auto before = auxiliaryRowCount();
+            hold.addAuxiliary({entry, body});
+            EXPECT_FALSE(store->objects.readAuxiliary(entry));
+            EXPECT_EQ(auxiliaryRowCount(), before);
+            store->recordBlobsAtPath(hold, path);
+            EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+            SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+            SQLiteStmt query{db, "select chunk, typeof(body), body from AuxValues where ingestion = ? order by chunk;"};
+            auto use = query.use();
+            use.apply(static_cast<int64_t>(*hold.ingestion->id));
+            size_t ordinal = 0, offset = 0;
+            while (use.next()) {
+                EXPECT_EQ(use.getInt(0), static_cast<int64_t>(ordinal));
+                EXPECT_EQ(use.getStr(1), "blob");
+                auto bytes = use.getBlobStr(2);
+                EXPECT_EQ(bytes, body.substr(offset, std::min(chunkSize, size - offset)));
+                offset += bytes.size();
+                ++ordinal;
+            }
+            EXPECT_EQ(ordinal, std::max(size_t{1}, (size + chunkSize - 1) / chunkSize));
+            EXPECT_EQ(offset, size);
+            EXPECT_FALSE(pathExists(store->objects.dir / "trees"));
+            EXPECT_FALSE(pathExists(store->objects.dir / "blobs"));
+            EXPECT_FALSE(pathExists(store->objects.dir / "blobs-x"));
+            ++cases;
+        }
+    EXPECT_EQ(cases, 14u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
+{
+    enum class Fault { MissingFirst, Gap, TrailingEmpty, ShortNonfinal, Oversized, Text, WrongHash, Truncated };
+    constexpr size_t chunkSize = 1 << 20;
+    const std::array faults{
+        Fault::MissingFirst,
+        Fault::Gap,
+        Fault::TrailingEmpty,
+        Fault::ShortNonfinal,
+        Fault::Oversized,
+        Fault::Text,
+        Fault::WrongHash,
+        Fault::Truncated};
+    size_t cases = 0;
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
+        for (auto fault : faults) {
+            SCOPED_TRACE(fmt("mode=%o fault=%d", (RawMode) mode, int(fault)));
+            auto body = fmt("candidate-%d-", cases) + std::string(2 * chunkSize, 'x');
+            auto id = mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body);
+            merkle::TreeEntry entry{mode, id};
+            auto first = publishAuxiliary(config->realStoreDir.get() / fmt("bad-chunks-%d", cases), {{entry, body}});
+            SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+            auto mutate = [&](const char * sql) {
+                SQLiteStmt stmt{db, sql};
+                stmt.use().apply(static_cast<int64_t>(first)).exec();
+            };
+            auto repartition = [&](size_t firstSize) {
+                mutate("delete from AuxValues where ingestion = ?;");
+                SQLiteStmt insert{
+                    db, "insert into AuxValues(kind, id, ingestion, chunk, body) values (?, ?, ?, ?, ?);"};
+                size_t offset = 0;
+                int64_t ordinal = 0;
+                while (offset < body.size()) {
+                    auto size = std::min(ordinal == 0 ? firstSize : chunkSize, body.size() - offset);
+                    insert.use()
+                        .apply(static_cast<int64_t>(mode))
+                        .apply(id.hash, id.hashSize)
+                        .apply(static_cast<int64_t>(first))
+                        .apply(ordinal++)
+                        .apply(reinterpret_cast<const unsigned char *>(body.data() + offset), size)
+                        .exec();
+                    offset += size;
+                }
+            };
+            switch (fault) {
+            case Fault::MissingFirst:
+                mutate("update AuxValues set chunk = 3 where ingestion = ? and chunk = 2;");
+                mutate("update AuxValues set chunk = 2 where ingestion = ? and chunk = 1;");
+                mutate("update AuxValues set chunk = 1 where ingestion = ? and chunk = 0;");
+                break;
+            case Fault::Gap:
+                mutate("update AuxValues set chunk = 3 where ingestion = ? and chunk = 2;");
+                mutate("update AuxValues set chunk = 2 where ingestion = ? and chunk = 1;");
+                break;
+            case Fault::TrailingEmpty:
+                mutate(
+                    "insert into AuxValues select kind, id, ingestion, 3, zeroblob(0) from AuxValues where ingestion = ? and chunk = 2;");
+                break;
+            case Fault::ShortNonfinal:
+                repartition(chunkSize - 1);
+                break;
+            case Fault::Oversized:
+                repartition(chunkSize + 1);
+                break;
+            case Fault::Text:
+                mutate("update AuxValues set body = cast(body as text) where ingestion = ? and chunk = 0;");
+                break;
+            case Fault::WrongHash:
+                mutate("update AuxValues set body = zeroblob(length(body)) where ingestion = ? and chunk = 0;");
+                break;
+            case Fault::Truncated:
+                mutate("delete from AuxValues where ingestion = ? and chunk = 2;");
+                break;
+            }
+            if (fault != Fault::WrongHash && fault != Fault::Truncated) {
+                SQLiteStmt pieces{db, "select body from AuxValues where ingestion = ? order by chunk;"};
+                auto use = pieces.use();
+                use.apply(static_cast<int64_t>(first));
+                std::string joined;
+                while (use.next())
+                    joined += use.getBlobStr(0);
+                EXPECT_EQ(joined, body)
+                    << "this malformed encoding is rejected independently of its correct framed hash";
+            }
+            auto before = auxiliaryRowCount();
+            EXPECT_FALSE(store->objects.readAuxiliary(entry));
+            EXPECT_EQ(auxiliaryRowCount(), before) << "ordinary lookup does not mutate a corrupt incarnation";
+            publishAuxiliary(config->realStoreDir.get() / fmt("sound-chunks-%d", cases), {{entry, body}});
+            EXPECT_EQ(store->objects.readAuxiliary(entry), body) << "a corrupt older donor cannot hide a sound donor";
+            ++cases;
+        }
+    EXPECT_EQ(cases, 16u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryLookupEnumeratesTheFullSignedIngestionCursor)
+{
+    const std::array<int64_t, 4> ids{std::numeric_limits<int64_t>::min(), -1, 0, std::numeric_limits<int64_t>::max()};
+    size_t cases = 0;
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
+        for (size_t sound = 0; sound <= ids.size(); ++sound) {
+            SCOPED_TRACE(fmt("mode=%o sound=%d", (RawMode) mode, sound));
+            std::string body = fmt("signed-cursor-%d", cases);
+            auto hash = mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body);
+            merkle::TreeEntry entry{mode, hash};
+            auto path = config->realStoreDir.get() / fmt("signed-owner-%d", cases);
+            auto initial = publishAuxiliary(path, {{entry, body}});
+            SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+            auto logical = (std::filesystem::path(config->storeDir) / path.filename()).string();
+            {
+                SQLiteTxn txn{db};
+                SQLiteStmt clear{db, "delete from AuxValues where ingestion = ?;"};
+                clear.use().apply(static_cast<int64_t>(initial)).exec();
+                SQLiteStmt owner{db, "insert or replace into Ingestions(id, path, hold) values (?, ?, null);"};
+                SQLiteStmt value{db, "insert into AuxValues(kind, id, ingestion, chunk, body) values (?, ?, ?, 0, ?);"};
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    owner.use().apply(ids[i]).apply(logical).exec();
+                    std::string bytes = i == sound ? body : "corrupt";
+                    value.use()
+                        .apply(static_cast<int64_t>(mode))
+                        .apply(hash.hash, hash.hashSize)
+                        .apply(ids[i])
+                        .apply(reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size())
+                        .exec();
+                }
+                txn.commit();
+            }
+            auto read = store->objects.readAuxiliary(entry);
+            if (sound < ids.size())
+                EXPECT_EQ(read, body);
+            else
+                EXPECT_FALSE(read);
+            db.exec("delete from AuxValues where ingestion in (-9223372036854775808, -1, 0, 9223372036854775807);");
+            db.exec("delete from Ingestions where id in (-9223372036854775808, -1, 0, 9223372036854775807);");
+            db.exec(
+                "update sqlite_sequence set seq = (select coalesce(max(id), 0) from Ingestions) where name = 'Ingestions';");
+            ++cases;
+        }
+    EXPECT_EQ(cases, 10u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryValuesBelongToEveryPublishingIngestion)
+{
+    size_t cases = 0;
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
+        for (bool firstCollected : {false, true}) {
+            auto body = fmt("shared-value-%d", cases);
+            merkle::TreeEntry entry{
+                mode, mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body)};
+            std::array<std::filesystem::path, 2> owners{
+                config->realStoreDir.get() / fmt("owner-a-%d", cases),
+                config->realStoreDir.get() / fmt("owner-b-%d", cases)};
+            std::optional<GitObjectStore::Hold> hold{store->objects.hold()};
+            store->beginIngestion(*hold, owners[0]);
+            hold->addAuxiliary({entry, body});
+            EXPECT_FALSE(store->objects.readAuxiliary(entry));
+            store->recordBlobsAtPath(*hold, owners[0]);
+            publishAuxiliary(owners[1], {{entry, body}});
+            EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+            auto first = firstCollected ? 0 : 1;
+            forgetFixturePath(owners[first]);
+            store->objects.sweep();
+            store->sweepStaleBlobRows();
+            EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+            forgetFixturePath(owners[1 - first]);
+            store->objects.sweep();
+            store->sweepStaleBlobRows();
+            EXPECT_EQ(store->objects.readAuxiliary(entry), body)
+                << "authenticated owned bytes remain usable while their persisted ingestion is protected";
+            EXPECT_TRUE(pathExists(hold->directory()));
+            hold.reset();
+            store->objects.sweep();
+            store->sweepStaleBlobRows();
+            EXPECT_FALSE(store->objects.readAuxiliary(entry));
+            ++cases;
+        }
+    EXPECT_EQ(cases, 4u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryReadOwnsItsCompleteSnapshot)
+{
+    bool saved = settings.useSQLiteWAL;
+    Finally restoreSetting{[&] {
+        store.reset();
+        settings.useSQLiteWAL = saved;
+    }};
+    store.reset();
+    settings.useSQLiteWAL = true;
+    config = std::make_shared<LocalStoreConfig>(tempStoreDir.path() / "snapshot-wal", StoreConfig::Params{});
+    store = std::make_shared<LocalStore>(ref{config});
+    size_t cases = 0;
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
+        for (bool replace : {false, true}) {
+            auto body = fmt("snapshot-%d-", cases) + std::string((1 << 20) + 17, 's');
+            merkle::TreeEntry entry{
+                mode, mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body)};
+            auto ingestion = publishAuxiliary(config->realStoreDir.get() / fmt("snapshot-%d", cases), {{entry, body}});
+            bool changed = false;
+            withAuxiliaryRowTrace(
+                [&] {
+                    if (changed)
+                        return;
+                    changed = true;
+                    SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = true}};
+                    SQLiteStmt mutation{
+                        db,
+                        replace ? "update AuxValues set body = zeroblob(length(body)) where ingestion = ?;"
+                                : "delete from AuxValues where ingestion = ?;"};
+                    mutation.use().apply(static_cast<int64_t>(ingestion)).exec();
+                },
+                [&] {
+                    auto read = store->objects.readAuxiliary(entry);
+                    EXPECT_TRUE(changed);
+                    EXPECT_EQ(read, body) << "every chunk comes from the original statement snapshot";
+                    store->objects.sweep();
+                    EXPECT_EQ(read, body) << "returned bytes remain owned after deletion or replacement";
+                });
+            EXPECT_FALSE(store->objects.readAuxiliary(entry));
+            ++cases;
+        }
+    EXPECT_EQ(cases, 4u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryVerificationRepairsOnlyCorruptIncarnations)
+{
+    size_t cases = 0;
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink}) {
+        auto body = fmt("repair-incarnation-%d", cases);
+        merkle::TreeEntry entry{mode, mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body)};
+        auto first = publishAuxiliary(config->realStoreDir.get() / fmt("repair-first-%d", cases), {{entry, body}});
+        auto pending = store->objects.hold();
+        auto target = config->realStoreDir.get() / fmt("repair-pending-%d", cases);
+        store->beginIngestion(pending, target);
+        pending.addAuxiliary({entry, *store->objects.readAuxiliary(entry)});
+        corruptAuxiliary(entry, "corrupt");
+        auto second = publishAuxiliary(config->realStoreDir.get() / fmt("repair-second-%d", cases), {{entry, body}});
+        EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+        EXPECT_TRUE(verifyAuxiliaryForTest(NoRepair));
+        EXPECT_FALSE(verifyAuxiliaryForTest(Repair));
+        EXPECT_FALSE(verifyAuxiliaryForTest(NoRepair));
+        SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+        SQLiteStmt count{db, "select count(*) from AuxValues where ingestion = ?;"};
+        {
+            auto use = count.use();
+            use.apply(static_cast<int64_t>(first));
+            ASSERT_TRUE(use.next());
+            EXPECT_EQ(use.getInt(0), 0);
+        }
+        {
+            auto use = count.use();
+            use.apply(static_cast<int64_t>(second));
+            ASSERT_TRUE(use.next());
+            EXPECT_EQ(use.getInt(0), 1);
+        }
+        eraseAuxiliary(entry);
+        EXPECT_FALSE(store->objects.readAuxiliary(entry));
+        store->recordBlobsAtPath(pending, target);
+        EXPECT_EQ(store->objects.readAuxiliary(entry), body)
+            << "a surviving attempt can publish its owned value after every prior incarnation was removed";
+        ++cases;
+    }
+    EXPECT_EQ(cases, 2u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryPublicationDoesNotCreateFilesForAnyUmask)
+{
+    auto path = config->realStoreDir.get() / "all-umasks";
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
+        for (mode_t mask = 0; mask <= 0777; ++mask) {
+            SCOPED_TRACE(fmt("mode=%o umask=%o", (RawMode) mode, mask));
+            auto body = fmt("mask-%o-mode-%o", mask, (RawMode) mode);
+            merkle::TreeEntry entry{
+                mode, mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body)};
+            auto hold = store->objects.hold();
+            store->beginIngestion(hold, path);
+            {
+                auto old = ::umask(mask);
+                Finally restoreMask{[&] { ::umask(old); }};
+                hold.addAuxiliary({entry, body});
+                store->recordBlobsAtPath(hold, path);
+            }
+            EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+            EXPECT_TRUE(std::filesystem::is_empty(hold.directory()));
+            EXPECT_FALSE(pathExists(store->objects.dir / "trees"));
+            EXPECT_FALSE(pathExists(store->objects.dir / "blobs"));
+            EXPECT_FALSE(pathExists(store->objects.dir / "blobs-x"));
+        }
+}
+
+TEST_F(LocalStoreObjectsTest, legacyAuxiliaryCleanupIsBoundedAndDoesNotFollowSymlinks)
+{
+    size_t cases = 0, devicesUnavailable = 0;
+    for (auto kind : {"trees", "blobs", "blobs-x"})
+        for (bool sharded : {false, true}) {
+            SCOPED_TRACE(fmt("kind=%s sharded=%d", kind, sharded));
+            GitObjectStore objects{tempStoreDir.path() / fmt("legacy-bounds-%d", cases)};
+            objects.createDirectories();
+            auto outside = tempStoreDir.path() / fmt("legacy-outside-%d", cases);
+            createDirs(outside);
+            writeFile(outside / "keep", "untouched");
+            auto base = objects.dir / kind;
+            if (sharded)
+                base /= "aa";
+            createDirs(base);
+            writeFile(base / "regular", "obsolete");
+            createSymlink(outside / "keep", base / "file-link");
+            createSymlink(outside / "absent", base / "dangling-link");
+            createSymlink(outside, base / "directory-link");
+            ASSERT_EQ(mkfifo((base / "fifo").c_str(), 0600), 0);
+            auto socket = createUnixDomainSocket(base / "socket", 0600);
+            size_t removable = 6;
+            for (auto [name, type] : {std::pair{"character", S_IFCHR}, std::pair{"block", S_IFBLK}}) {
+                if (mknod((base / name).c_str(), type | 0600, 0) == -1) {
+                    ASSERT_TRUE(errno == EPERM || errno == EACCES || errno == ENOTSUP) << strerror(errno);
+                    ++devicesUnavailable;
+                } else
+                    ++removable;
+            }
+            createDirs(base / "nested-directory");
+            writeFile(base / "nested-directory" / "keep", "nested untouched");
+            auto swept = objects.sweep();
+            EXPECT_EQ(swept.treesRemoved + swept.blobsRemoved, removable);
+            EXPECT_FALSE(maybeLstat(base / "regular"));
+            EXPECT_FALSE(maybeLstat(base / "file-link"));
+            EXPECT_FALSE(maybeLstat(base / "dangling-link"));
+            EXPECT_FALSE(maybeLstat(base / "directory-link"));
+            EXPECT_FALSE(maybeLstat(base / "fifo"));
+            EXPECT_FALSE(maybeLstat(base / "socket"));
+            EXPECT_FALSE(maybeLstat(base / "character"));
+            EXPECT_FALSE(maybeLstat(base / "block"));
+            EXPECT_EQ(readFile(base / "nested-directory" / "keep"), "nested untouched");
+            EXPECT_EQ(readFile(outside / "keep"), "untouched");
+            ++cases;
+        }
+    EXPECT_EQ(cases, 6u);
+    RecordProperty("device_node_cases_unavailable", devicesUnavailable);
+}
+
+TEST_F(LocalStoreObjectsTest, legacyAuxiliaryCleanupDoesNotFollowNamespaceSymlinks)
+{
+    size_t cases = 0;
+    for (auto kind : {"trees", "blobs", "blobs-x"})
+        for (unsigned level = 0; level < 3; ++level) {
+            SCOPED_TRACE(fmt("kind=%s level=%d", kind, level));
+            auto root = tempStoreDir.path() / fmt("legacy-namespace-%d", cases);
+            auto outside = tempStoreDir.path() / fmt("legacy-external-%d", cases);
+            createDirs(outside);
+            writeFile(outside / "keep", "external");
+            std::filesystem::path name;
+            if (level == 0)
+                name = root;
+            else if (level == 1) {
+                createDirs(root);
+                name = root / kind;
+            } else {
+                createDirs(root / kind);
+                name = root / kind / "ab";
+            }
+            createSymlink(outside, name);
+            GitObjectStore objects{root};
+            objects.sweep();
+            EXPECT_EQ(readFile(outside / "keep"), "external");
+            if (level < 2)
+                EXPECT_EQ(readLink(name), outside);
+            else
+                EXPECT_FALSE(maybeLstat(name)) << "a shard symlink may be unlinked but never traversed";
+            ++cases;
+        }
+    EXPECT_EQ(cases, 9u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliarySQLStorageClassesAreCheckedAtTheirBoundary)
+{
+    const std::array<const char *, 5> bodyExpressions{"body", "cast(body as text)", "42", "1.5", "null"};
+    const std::array<const char *, 5> chunkExpressions{"0", "'ordinal'", "x'00'", "0.5", "null"};
+    size_t cases = 0;
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
+        for (bool bodyColumn : {false, true})
+            for (size_t storage = 0; storage < 5; ++storage) {
+                auto body = fmt("storage-class-%d", cases);
+                merkle::TreeEntry entry{
+                    mode, mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body)};
+                auto ingestion =
+                    publishAuxiliary(config->realStoreDir.get() / fmt("storage-%d", cases), {{entry, body}});
+                SQLite db{
+                    store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+                auto sql =
+                    fmt("update AuxValues set %s = %s where ingestion = ?;",
+                        bodyColumn ? "body" : "chunk",
+                        bodyColumn ? bodyExpressions[storage] : chunkExpressions[storage]);
+                SQLiteStmt change{db, sql};
+                if (storage == 4) {
+                    EXPECT_THROW(change.use().apply(static_cast<int64_t>(ingestion)).exec(), SQLiteError);
+                    EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+                } else {
+                    change.use().apply(static_cast<int64_t>(ingestion)).exec();
+                    if (storage == 0)
+                        EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+                    else
+                        EXPECT_FALSE(store->objects.readAuxiliary(entry));
+                }
+                ++cases;
+            }
+    EXPECT_EQ(cases, 20u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliarySchemaRejectsIncompleteOwnershipAndDuplicateChunks)
+{
+    size_t cases = 0;
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
+        for (unsigned fault = 0; fault < 3; ++fault) {
+            auto body = fmt("schema-boundary-%d", cases);
+            merkle::TreeEntry entry{
+                mode, mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body)};
+            auto ingestion = publishAuxiliary(config->realStoreDir.get() / fmt("schema-%d", cases), {{entry, body}});
+            SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+            db.exec("pragma foreign_keys = on;");
+            const std::array statements{
+                "update AuxValues set chunk = -1 where ingestion = ?;",
+                "insert into AuxValues select * from AuxValues where ingestion = ?;",
+                "update AuxValues set ingestion = -9223372036854775808 where ingestion = ?;"};
+            SQLiteStmt rejected{db, statements[fault]};
+            EXPECT_THROW(rejected.use().apply(static_cast<int64_t>(ingestion)).exec(), SQLiteError);
+            EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+            ++cases;
+        }
+    EXPECT_EQ(cases, 6u);
+}
+
+TEST_F(LocalStoreObjectsTest, readOnlyOldStoresVerifyPhysicalValuesWithoutAuxiliaryRows)
+{
+    auto savedFeatures = experimentalFeatureSettings.experimentalFeatures.get();
+    Finally restoreFeatures{[&] { experimentalFeatureSettings.experimentalFeatures = savedFeatures; }};
+    experimentalFeatureSettings.experimentalFeatures.get().insert(Xp::ReadOnlyLocalStore);
+    size_t cases = 0;
+    for (bool hasTable : {false, true})
+        for (bool corrupt : {false, true}) {
+            SCOPED_TRACE(fmt("hasTable=%d corrupt=%d", hasTable, corrupt));
+            store.reset();
+            auto root = tempStoreDir.path() / fmt("read-only-auxiliary-%d", cases);
+            config = std::make_shared<LocalStoreConfig>(root, StoreConfig::Params{});
+            store = std::make_shared<LocalStore>(ref{config});
+            auto source = treeAccessor({{"file", "sound bytes", 'f'}, {"link", "file", 'l'}});
+            auto info = store->addToStoreSlow(
+                "read-only-value", {source}, ContentAddressMethod::Raw::Git, HashAlgorithm::SHA256);
+            auto real = store->toRealPath(info.path);
+            auto database = store->dbDir / "db.sqlite";
+            auto entry = gitHash(real);
+            store.reset();
+            if (!hasTable) {
+                SQLite db{database, {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+                db.exec("drop table AuxValues;");
+            }
+            if (corrupt) {
+                chmod(real / "file", 0644);
+                writeFile(real / "file", "wrong bytes");
+                chmod(real / "file", 0444);
+                setWriteTime(real / "file", 1, 1);
+            }
+            config = std::make_shared<LocalStoreConfig>(root, StoreConfig::Params{{"read-only", "true"}});
+            store = std::make_shared<LocalStore>(ref{config});
+            EXPECT_EQ(store->objects.readAuxiliary(entry).has_value(), hasTable);
+            EXPECT_EQ(store->verifyStore(true, NoRepair), corrupt)
+                << "missing optional cache storage cannot suppress physical hash verification";
+            ++cases;
+        }
+    EXPECT_EQ(cases, 4u);
+}
+
+TEST_F(LocalStoreObjectsTest, legacyAuxiliaryCleanupNeverTraversesStoreTrees)
+{
+    auto result = restore(config->realStoreDir.get() / "legacy-independent", treeWithSymlink());
+    auto body = *store->objects.readAuxiliary({merkle::Mode::Directory, result.root.hash});
+    auto & objects = store->objects;
+    for (auto kind : {"trees", "blobs", "blobs-x"}) {
+        createDirs(objects.dir / kind / "ff");
+        writeFile(objects.dir / kind / "flat", "corrupt legacy bytes");
+        writeFile(objects.dir / kind / "ff" / "sharded", "other corrupt legacy bytes");
+    }
+    GitObjectStore::Counters counters;
+    objects.counters = &counters;
+    Finally unhook{[&] { objects.counters = nullptr; }};
+    auto swept = objects.sweep();
+    EXPECT_EQ(swept.treesRemoved, 2u);
+    EXPECT_EQ(swept.blobsRemoved, 4u);
+    EXPECT_EQ(counters.treesRead, 0u);
+    EXPECT_EQ(counters.blobsStatted, 0u);
+    EXPECT_EQ(objects.readAuxiliary({merkle::Mode::Directory, result.root.hash}), body);
+}
+
 TEST_F(LocalStoreObjectsTest, holderReusePreservesCanonicalMetadata)
 {
     GitObjectStore objects{tempStoreDir.path() / "holder-metadata"};
@@ -5554,8 +4741,8 @@ TEST_F(LocalStoreObjectsTest, executableHolderCarriesItsBitOnThePathsOwnFile)
     /* Two rows, one per mode; no file under either kind's directory. */
     EXPECT_EQ(store->blobRowCount(false), 1u);
     EXPECT_EQ(store->blobRowCount(true), 1u);
-    EXPECT_FALSE(pathExists(objects.blobFile(id, false)));
-    EXPECT_FALSE(pathExists(objects.blobFile(id, true)));
+    EXPECT_FALSE(pathExists(objects.dir / "blobs"));
+    EXPECT_FALSE(pathExists(objects.dir / "blobs-x"));
 
     /* Each mode's holder is the path's own file, carrying its own bit and
        the store's mtime, and the two are different inodes. */
@@ -5670,7 +4857,7 @@ TEST_F(LocalStoreObjectsTest, reusedBlobsRetainAWitnessWhenTheirDonorIsCollected
                 auto treeBody = pending ? merkle::serialiseTree({{"a", {mode, id}}, {"seed", {mode, id}}})
                                         : merkle::serialiseTree({{"a", {mode, id}}});
                 auto tree = merkle::treeId(treeBody);
-                objects.putObject({merkle::Mode::Directory, tree}, treeBody, hold);
+                hold.addAuxiliary({{merkle::Mode::Directory, tree}, treeBody});
                 chmod(root, 0555);
                 setWriteTime(root, 1, 1);
 
@@ -5904,7 +5091,8 @@ TEST_F(LocalStoreObjectsTest, lawFourHoldsForEveryValidPath)
                 bool executable = entry.mode == merkle::Mode::Executable;
                 blobsNamed++;
                 blobUses[GitObjectStore::idString(entry.hash)]++;
-                if (!hasBlob(entry.hash, executable))
+                if (entry.mode == merkle::Mode::Symlink ? !hasAuxiliary(entry.hash, merkle::Mode::Symlink)
+                                                        : !hasBlob(entry.hash, executable))
                     missing.push_back(fmt("%s: no blob for %s%s", name, entryName, executable ? " (executable)" : ""));
             }
         }
@@ -6166,13 +5354,12 @@ TEST_F(LocalStoreObjectsTest, noncanonicalTreeBodiesCannotSupplyAKnownMaterialis
         SCOPED_TRACE(fmt("case=%d", cases));
         const auto id = merkle::treeId(body);
         ASSERT_NE(id, expected.hash);
-        {
-            auto hold = objects.hold();
-            objects.putObject({merkle::Mode::Directory, id}, body, hold);
-            objects.putObject({merkle::Mode::Regular, firstBlob}, "first", hold);
-            objects.putObject({merkle::Mode::Regular, secondBlob}, "second", hold);
-        }
-        EXPECT_EQ(objects.readVerifiedTree(id), std::nullopt);
+        publishAuxiliary(
+            config->realStoreDir.get() / fmt("noncanonical-donor-%d", cases),
+            {{{merkle::Mode::Directory, id}, body},
+             {{merkle::Mode::Symlink, firstBlob}, "first"},
+             {{merkle::Mode::Symlink, secondBlob}, "second"}});
+        EXPECT_THROW(parseTreeBody(id, body), Error);
         auto counted = make_ref<CountingAccessor>(source);
         auto destination = config->realStoreDir.get() / fmt("noncanonical-tree-%d", cases);
         auto result = materialise(
@@ -6196,42 +5383,34 @@ TEST_F(LocalStoreObjectsTest, duplicateTreeRecordsAreUnusableAndPreventDestructi
 {
     using merkle::Mode;
     const std::array modes{Mode::Directory, Mode::Regular, Mode::Executable, Mode::Symlink};
-    auto & objects = store->objects;
-    const auto emptyTree = merkle::treeId("");
-    const auto firstBlob = merkle::blobId("first");
-    const auto secondBlob = merkle::blobId("second");
-    const auto spareBlob = merkle::blobId("unreachable sentinel");
+    auto source = treeAccessor({{"a", "source target", 'l'}});
+    auto expected = objectHashOf(*source, CanonPath::root).root;
     size_t cases = 0;
     for (auto firstMode : modes)
         for (auto secondMode : modes) {
             SCOPED_TRACE(fmt("first=%o second=%o", (RawMode) firstMode, (RawMode) secondMode));
-            const auto firstHash = firstMode == Mode::Directory ? emptyTree : firstBlob;
-            const auto secondHash = secondMode == Mode::Directory ? emptyTree : secondBlob;
+            const auto first = firstMode == Mode::Directory ? merkle::treeId("") : merkle::blobId("first");
+            const auto second = secondMode == Mode::Directory ? merkle::treeId("") : merkle::blobId("second");
             const auto body =
-                rawObjectTreeEntry(firstMode, "entry", firstHash) + rawObjectTreeEntry(secondMode, "entry", secondHash);
+                rawObjectTreeEntry(firstMode, "entry", first) + rawObjectTreeEntry(secondMode, "entry", second);
             const auto id = merkle::treeId(body);
-            {
-                auto hold = objects.hold();
-                objects.putObject({merkle::Mode::Directory, emptyTree}, "", hold);
-                objects.putObject({merkle::Mode::Directory, id}, body, hold);
-                objects.putObject({merkle::Mode::Regular, firstBlob}, "first", hold);
-                objects.putObject({merkle::Mode::Regular, secondBlob}, "second", hold);
-                objects.putObject({merkle::Mode::Regular, spareBlob}, "unreachable sentinel", hold);
-            }
-            /* Hash verification alone cannot establish a directory map.
-               Readers decline it, and GC cannot use a collapsed map as
-               evidence that an omitted child or any other object is dead. */
-            EXPECT_EQ(objects.readVerifiedTree(id), std::nullopt);
-            const auto swept = objects.sweep([&](fun<void(const ObjectHash &)> live) {
-                live(ObjectHash{id});
-                return uint64_t{0};
-            });
-            EXPECT_EQ(swept.corruptTrees, 1u);
-            EXPECT_EQ(swept.treesRemoved, 0u);
-            EXPECT_EQ(swept.blobsRemoved, 0u);
-            EXPECT_TRUE(pathExists(objects.blobFile(firstBlob, false)));
-            EXPECT_TRUE(pathExists(objects.blobFile(secondBlob, false)));
-            EXPECT_TRUE(pathExists(objects.blobFile(spareBlob, false)));
+            publishAuxiliary(
+                config->realStoreDir.get() / fmt("duplicate-donor-%d", cases), {{{Mode::Directory, id}, body}});
+            EXPECT_THROW(parseTreeBody(id, body), Error);
+            auto counted = make_ref<CountingAccessor>(source);
+            auto destination = config->realStoreDir.get() / fmt("duplicate-result-%d", cases);
+            auto result = materialise(
+                destination,
+                SourcePath(counted),
+                [&](const CanonPath & path, const SourceAccessor::Stat &) -> std::optional<merkle::TreeEntry> {
+                    return path.isRoot() ? std::optional(merkle::TreeEntry{Mode::Directory, id}) : std::nullopt;
+                });
+            EXPECT_EQ(result.root, expected);
+            EXPECT_EQ(gitHash(destination), expected);
+            EXPECT_EQ(counted->links, 1u);
+            store->objects.sweep();
+            EXPECT_EQ(store->objects.readAuxiliary({Mode::Directory, id}), body)
+                << "GC never interprets a malformed tree as authority over any other value";
             ++cases;
         }
     EXPECT_EQ(cases, 16u);
@@ -6876,11 +6055,9 @@ TEST_F(LocalStoreObjectsTest, deleteSpecificReadsOnlyTheDeletedPathsTrees)
     EXPECT_FALSE(store->isValidPath(paths[0]));
     EXPECT_TRUE(store->isValidPath(paths[1]));
     EXPECT_EQ(counters.treesRead, 0u) << "a specific delete reads no tree body";
-    EXPECT_EQ(counters.blobsStatted, 0u) << "a specific delete stats no blob file";
+    EXPECT_EQ(counters.blobsStatted, 0u) << "a specific delete reads no auxiliary body";
 
-    /* The whole-store collection, whose cost is the store's: every tree
-       from every live root, and every blob file.  One path is rooted, so
-       the sweep has a root to walk. */
+    /* Whole-store collection follows path ownership too; it reads no auxiliary body. */
     store->addPermRoot(paths[1], tempStoreDir.path() / "root");
     counters = {};
     {
@@ -6889,10 +6066,8 @@ TEST_F(LocalStoreObjectsTest, deleteSpecificReadsOnlyTheDeletedPathsTrees)
         GCResults results;
         store->collectGarbage(options, results);
     }
-    EXPECT_GE(counters.treesRead, 2u) << "the live root's tree and its subtree";
-    /* The sweep's blob pass judges the symlink-target blobs alone; a regular
-     * file's blob has no file under `blobs/` (design.md section 2.2) */
-    EXPECT_GE(counters.blobsStatted, 0u) << "there is no blob file per regular file to stat";
+    EXPECT_EQ(counters.treesRead, 0u) << "whole-store collection also reads no tree body";
+    EXPECT_EQ(counters.blobsStatted, 0u) << "collection does not inspect holder candidates";
 }
 
 /* The collector's allow-list in the store directory (`gc.cc`, the `readdir`
@@ -7645,29 +6820,6 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsReadsOnlyWhatTheStoreLacks)
     EXPECT_EQ(again3.s, treeNar(nodes("TWO")));
 }
 
-/* The fallbacks, each planted.  The unit that falls back is the subtree
-   the naming named and the store could not complete: here the root is
-   named and held, so a missing object anywhere beneath it sends the driver
-   into the source from the root, where each directory is tried again on
-   its own -- bounded by one read of the tree, the one route's cost.  A
-   tree body the store lacks is entered again by the fallback; a body that
-   does not hash to its name is refused and left for `--verify
-   --check-contents --repair`; a blob whose holder's bytes are not its
-   identifier's is refused under repair (`link` re-hashes it, K2) and the
-   file written from the source, and without repair trusted as the on-disk
-   walk trusts an inode the index maps (K8): the route has no measure of
-   the file but the store's own.  Every case ends in the same bytes.
-
-   What the blob half pinned before and what it pins now.  Before, the
-   corrupt file was a blob file of the store's own naming, and repair
-   *removed* it and wrote the blob anew, so the same file afterwards held
-   the right bytes.  A regular-file blob's file is a valid store path's, so
-   repair forgets the row and leaves the file (`08` K2): the corrupt path
-   keeps its corrupt bytes, and the freshly written file becomes the
-   holder, which is what the next materialisation links.  The no-repair
-   half therefore corrupts the *holder as it then stands* -- re-resolved,
-   not the handle taken before the repair -- so that "the store's file is
-   trusted, corrupt bytes and all" is still the thing being said. */
 TEST_F(LocalStoreObjectsTest, materialiseFromObjectsFallsBackOnAMissingOrCorruptObject)
 {
     Nodes nodes{{"a", "one", 'f'}, {"d/b", "two", 'f'}, {"d/c", "three", 'x'}, {"e/y", "four", 'f'}};
@@ -7699,7 +6851,7 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsFallsBackOnAMissingOrCorrupt
        driver lists the root and `d` and reads their files -- linked, every
        blob being held -- while `e` is made from its objects; `d`'s body
        comes back. */
-    std::filesystem::remove(treeFile(dId));
+    eraseAuxiliary({merkle::Mode::Directory, dId});
     {
         auto counting = make_ref<CountingAccessor>(tree);
         auto r = materialise(realStoreDir / "f2", SourcePath(counting), everyNode(tree));
@@ -7720,12 +6872,8 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsFallsBackOnAMissingOrCorrupt
        check alone: trusted, it would link `e/y` to the wrong bytes under
        the right name.  Not removed; the subtree is read from the source.
        Then a body that does not parse, refused as well. */
-    auto eBody = readFile(treeFile(eId));
-    auto plant = [&](const std::string & body) {
-        chmod(treeFile(eId), 0644);
-        writeFile(treeFile(eId), body);
-        chmod(treeFile(eId), 0444);
-    };
+    auto eBody = *store->objects.readAuxiliary({merkle::Mode::Directory, eId});
+    auto plant = [&](const std::string & body) { corruptAuxiliary({merkle::Mode::Directory, eId}, body); };
     auto misnaming = readTree(eId);
     misnaming.at("y") = {merkle::Mode::Regular, merkle::blobId("one")};
     auto misnamingBody = merkle::serialiseTree(misnaming);
@@ -7747,7 +6895,8 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsFallsBackOnAMissingOrCorrupt
         StringSink again;
         dumpPath(dst, again);
         EXPECT_EQ(again.s, nar);
-        EXPECT_EQ(readFile(treeFile(eId)), corrupt);
+        EXPECT_EQ(store->objects.readAuxiliary({merkle::Mode::Directory, eId}), eBody)
+            << "the newly completed projection supplies a sound candidate without editing the corrupt donor";
         expectWitnesses(dst);
     }
     plant(eBody);
@@ -7800,10 +6949,6 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsFallsBackOnAMissingOrCorrupt
     }
 }
 
-/* A speculative directory must not lend names that its rollback can
-   delete. The sibling finishes its shared file before the donor disappears;
-   then the failed directory falls back through both buffered and streamed
-   writes. Neither mode may lose the sibling's physical sharing witness. */
 TEST_F(LocalStoreObjectsTest, speculativeSubtreeRollbackCannotInvalidateSiblingHolders)
 {
     struct Source final : MemorySourceAccessor
@@ -7842,7 +6987,7 @@ TEST_F(LocalStoreObjectsTest, speculativeSubtreeRollbackCannotInvalidateSiblingH
             auto donor = config->realStoreDir.get() / (label + "-donor");
             auto result = restore(donor, treeNar(nodes));
             auto pTree = readTree(result.root.hash).at("p/").hash;
-            std::filesystem::remove(treeFile(readTree(pTree).at("z/").hash));
+            eraseAuxiliary({merkle::Mode::Directory, readTree(pTree).at("z/").hash});
             auto id = merkle::blobId(bytes);
             auto original = store->objects.holderOrForget(id, executable, NoRepair);
             ASSERT_TRUE(original);
@@ -8817,7 +7962,7 @@ TEST_F(LocalStoreAutoGCTest, addToStoresOwnCollectionKeepsItsObjects)
     auto row = store->queryPathInfo(info.path);
     ASSERT_TRUE(row->objectHash.has_value());
     EXPECT_TRUE(hasTree(row->objectHash->hash)) << "the root tree survived the add's own collection";
-    EXPECT_TRUE(hasBlob(merkle::blobId("b"), false)) << "the symlink's blob survived it";
+    EXPECT_TRUE(hasAuxiliary(merkle::blobId("b"), merkle::Mode::Symlink)) << "the symlink's blob survived it";
     EXPECT_EQ(count("trees"), 2u);
 }
 
@@ -8843,7 +7988,7 @@ TEST_F(LocalStoreAutoGCTest, spilledAddToStoreFromDumpsOwnCollectionKeepsItsObje
     auto row = store->queryPathInfo(p);
     ASSERT_TRUE(row->objectHash.has_value());
     EXPECT_TRUE(hasTree(row->objectHash->hash)) << "the root tree survived the add's own collection";
-    EXPECT_TRUE(hasBlob(merkle::blobId("b"), false)) << "the symlink's blob survived it";
+    EXPECT_TRUE(hasAuxiliary(merkle::blobId("b"), merkle::Mode::Symlink)) << "the symlink's blob survived it";
     EXPECT_EQ(count("trees"), 2u);
 }
 
@@ -9574,7 +8719,7 @@ TEST_F(TempLocalStoreTest, registrationRejectsEveryMismatchedKeyBeforeEffects)
                 EXPECT_THROW(target->registerValidPaths(input, &hold), Error);
                 EXPECT_EQ(target->queryAllValidPaths(), before);
                 EXPECT_EQ(target->blobRowCount(false), rowsBefore);
-                auto rows = hold.takeRows();
+                auto rows = hold.takeProjection().regular;
                 EXPECT_EQ(rows.size(), 1u);
                 if (rows.size() == 1)
                     EXPECT_EQ(rows.front().id, id);
