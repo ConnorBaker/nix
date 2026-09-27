@@ -97,7 +97,7 @@ class CopyPool
 
     struct Group
     {
-        const fun<void(size_t, bool)> & run;
+        const fun<void(size_t)> & run;
         size_t failedIndex;
         std::exception_ptr failure;
         size_t remaining = 0;
@@ -117,7 +117,7 @@ class CopyPool
 
     void work(std::promise<void> ready);
     /** Runs a removed job with the lock released, returning with it held. */
-    static void execute(Job job, std::unique_lock<std::mutex> & lock);
+    static void execute(const Job & job, std::unique_lock<std::mutex> & lock);
     bool tryAsync(Group & group, size_t i);
     void wait(Group & group);
 
@@ -129,12 +129,11 @@ public:
 
     /** Evaluate a finite sequence, then consume its results in order.
      * Visits and their results must be independent of consuming this sequence.
-     * `run` receives whether it needs a detached traversal scope. Every
-     * submitted job is joined before return, including on failure. Child
+     * Every submitted job is joined before return, including on failure. Child
      * and consume failures are reported in traversal order, independently
      * of completion order. Callbacks and their captured state must outlive
      * this call; each child owns its result storage. */
-    void ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t, bool)> run, fun<void(size_t)> consume);
+    void ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t)> run, fun<void(size_t)> consume);
 };
 
 /**

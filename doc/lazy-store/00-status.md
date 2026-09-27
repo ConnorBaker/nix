@@ -1,6 +1,6 @@
 # Lazy-store status
 
-Latest measured runtime **daa1ff079** lowers all nine wall medians against fixed branch base **8aad447**, with **69/75 faster pairs**, while **three CPU medians and seven peak-RSS medians rise**. Directly against **0871ab183**, three separate wall medians and three paired ratios are lower, with **29/75 faster pairs**; the lower-case sets differ. Cold-path wall is higher in all five direct pairs. These changes establish no universal resource improvement.
+Latest measured runtime **a2077a82a** lowers all nine wall medians against fixed base **8aad447**, with **71/75 faster pairs**; **three CPU and six peak-RSS medians rise**. Directly against **f8f029117**, three separate wall medians and four paired ratios are lower, with **39/75 faster pairs**. Direct CPU medians are three lower/three equal/three higher, and two RSS medians rise. These observations establish no universal resource improvement.
 
 ## Semantic model
 
@@ -14,28 +14,12 @@ Completed evaluator requests are a separate kind of fact: the result of an earli
 
 The [specification](01-specification.md), [implementation derivation](04-derivation.md) and [store model](08-store-model.md) define these contracts. Changes are vetted against the [reasoning and design guidance](/home/connorbaker/ExtPackages/denotational-design/reasoning-and-design-guidance.md): enumerate finite domains, derive operations from their meanings, and retain external checks that can reject the implementation.
 
-## Current validation
+## Current validation and performance
 
-[Current validation](/home/connorbaker/Benchmarks/nix-performance-fixes/empty-copy-groups-validation/README.md) passes **2,516 primary / 911 fallback tests**, zero failures, with skips 2/1 and disabled 3/1. All **99/32 required cases**, **17 functionals** and **12 real overlays** pass. The new 72-case oracle checks first-child read/fold failure selection; existing header, advisory-flag, listing, SQL and ownership cases remain. The packaged release passes 207 tests, zero failures and 36 skips. Skipped/disabled/device-unavailable and Windows cases are not executed coverage; debug allocator observations do not measure release resources.
+[Actual validation](/home/connorbaker/Benchmarks/nix-performance-fixes/job-permission-cloexec-validation/validation/independent-review.json) passes **2,518 primary / 913 fallback tests**, zero failures, skips **2/1**, disabled **3/1**; all **104/37 mandatory cases**, **17 functionals** and **12 real overlays** pass. All seven stages of each validation and postrelease pipeline finish successfully. The packaged functional suite passes **207 tests**, with zero failures and **36 skips**. Skipped/disabled/device-unavailable and unexecuted platforms are not coverage; debug allocator observations do not measure release resources.
 
-The measured four-file change uses scheduler groups only with more than one worker, more than one child and at least one directory hint; other groups read/fold inline even with an existing pool. It also uses bounded backward decimal-header conversion. First failing child/read-before-own-fold selection is preserved. Later unstarted effects and resource failure traces are not asserted identical.
+The measured changes pass each accepted scheduler Job by value, defer default-worker discovery until concurrency is permitted, and omit redundant close-on-exec setup when Unix socket creation already sets it atomically. The existing scheduler ownership/failure order and the no-flag socket fallback remain. The [actual compiled comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/assembly-job-permission-cloexec-a2077a82a-vs-f8/assembly/comparison/ROUTES.md) finds pool/socket families 16/112 bytes smaller and the worker query restricted to permitted routes, with countervailing frame/inlining growth and unchanged whole DSO sizes.
 
-## Latest completed performance
+The [performance report](09-performance.md) keeps all eighteen latest rows. Against fixed base, cold-path CPU/RSS rise **3.150→5.500 s / 444.55→500.51 MiB**, both higher in every pair; both warm Git cases also have higher CPU in every pair. Direct cold-path wall rises **2.513%** with **0/5 faster pairs**; all three cold wall cases worsen by separate and paired reductions. Warm path8/GitHub8/GitHub32 reverse between reductions. The [complete ninety-cell review](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-a2077a82a/COMPLETED-REVIEW.md) preserves every adverse result and tie; independent output/order checks cover all **312 outputs** and both schedules.
 
-Each independent series retains five cold and ten warm pairs per case. Cold means fresh private application state, not evicted OS caches; GitHub cold includes network access. Median paired wall changes against fixed base (negative means lower):
-
-| Workload | `path:` | `git+file:` | `github:` |
-| --- | ---: | ---: | ---: |
-| Cold · 32 attributes | -6.538% | -20.022% | -40.703% |
-| Warm · 8 attributes | -87.082% | -6.244% | -10.745% |
-| Warm · 32 attributes | -73.745% | -3.690% | -8.047% |
-
-Cold-path CPU rises **3.190→5.630 s** and peak RSS **445.22→484.70 MiB**, both higher in every pair. Both warm Git cases also have higher CPU in every pair.
-
-Direct cold-path wall worsens **1.093% separately / 2.809% paired**, with **0/5 faster pairs**, CPU **5.750→5.500 s**, and RSS **492.72→502.74 MiB**. Cold GitHub wall worsens **19.796% / 14.120%**. Warm Git8 and GitHub8 reverse in opposite directions between separate and paired wall summaries. Direct CPU/RSS remain mixed.
-
-The [performance report](09-performance.md) retains all eighteen rows and limits. The [complete numeric review](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-daa1ff079/README.md) preserves all ninety metric cells, ties, reversals and ranges. The [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-daa1ff079-audit/README.md) checks 156 outputs and eighteen store graphs; the [direct audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-daa1ff079-vs-0871ab183-audit/README.md) checks another 156 outputs without supplemental graph walks. The [release proof](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-daa1ff079.json) binds measured sources/outputs. Separate series are not pooled and do not isolate individual edits.
-
-Fresh [daa1 user-FP findings](/home/connorbaker/Benchmarks/nix-performance-fixes/resource-profile-user-fp-daa1ff079/independent-review/interpretation/README.md) retain all nine cases, 26,518 samples, incomplete callers, 2,530 unknown leaves and two zero-IP observations. Hashing, CopyPool and SQL publication remain visible; sampled shares do not isolate the direct regressions. The [completed compiled comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/assembly-empty-groups-header-daa1ff079-vs-0871/comparison/ROUTES.md) finds header bytes 724→304 and frame bytes 320→64; both consumer frames remain 592. Selected instruction bytes fall 756 while the store ELF grows 80 bytes. For at least two children with all-false hints, the warmed-pool bypass adds a hint scan and avoids empty group machinery; no dynamic benefit follows from those static facts. Earlier 6043 kernel/syscall observations remain separately identified in the report.
-
-Base libgit2 1.9.7 versus branch 2.0.0-rc1 plus patches is a dependency confound; the direct comparison controls these versions while retaining the combined edits/layout. Base Git revision-keyed reuse also differs from the branch's absence of a worktree fingerprint: clean revision metadata does not name live/rendered bytes.
+Five cold and ten warm pairs per case are separate finite series. Cold means private application state, not evicted pages; GitHub acquisition includes network work. Affinity does not isolate the host. Fixed-base comparisons also differ in libgit2 version and live-worktree identity policy. Direct comparisons retain the dependency but do not establish significance or a causal speed effect. Historical **8eae FD/IP**, **8db syscall**, **daa1 user-FP** and **6043 kernel** findings remain separately linked in the report, including the 8eae strict pure-user quality failure.

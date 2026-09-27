@@ -386,9 +386,9 @@ TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
                                     baseCaseTrace.push_back("canFork");
                                 return mask & (1u << i);
                             },
-                            [&](size_t i, bool detached) {
+                            [&](size_t i) {
                                 if (count < 2) {
-                                    baseCaseTrace.push_back(detached ? "run-detached" : "run-inline");
+                                    baseCaseTrace.push_back("run");
                                     baseCaseOnCaller = std::this_thread::get_id() == caller;
                                 }
                                 ++active;
@@ -428,7 +428,7 @@ TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
                     if (count < 2) {
                         std::vector<std::string> expectedTrace;
                         if (count) {
-                            expectedTrace.push_back("run-inline");
+                            expectedTrace.push_back("run");
                             if (outcome[0] != 1)
                                 expectedTrace.push_back("consume");
                         }
@@ -443,18 +443,19 @@ TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
 
 TEST(CopyPool, predicateFailureJoinsTheLaunchedPrefixWithoutConsumingIt)
 {
-    /* Predicate failure interrupts launch, before any ordered consumption.
-       Already launched visits must finish before their captures can expire.
-       Their failures must not replace the launch failure. */
+    /* The first workers - 1 visits are admitted from an empty queue, so
+       their failures cannot stop launch or replace a reached predicate failure.
+       With one worker, the first visit fails inline and stops launch instead.
+       Every launched visit must finish before its captures can expire. */
     size_t cases = 0;
     for (size_t workers = 1; workers <= 8; ++workers) {
         CopyPool pool(workers);
-        for (bool failDetached : {false, true})
+        for (bool failPrefix : {false, true})
             for (size_t count = 2; count <= 4; ++count)
                 for (size_t throwIndex = 0; throwIndex < count; ++throwIndex) {
                     SCOPED_TRACE(fmt(
-                        "workers=%d count=%d throwIndex=%d failDetached=%d", workers, count, throwIndex, failDetached));
-                    std::atomic<size_t> active{0}, started{0}, completed{0}, detachedFailures{0};
+                        "workers=%d count=%d throwIndex=%d failPrefix=%d", workers, count, throwIndex, failPrefix));
+                    std::atomic<size_t> active{0}, started{0}, completed{0}, childFailures{0};
                     std::vector<size_t> predicates, consumed;
                     std::string failure;
                     try {
@@ -466,15 +467,15 @@ TEST(CopyPool, predicateFailureJoinsTheLaunchedPrefixWithoutConsumingIt)
                                     throw std::runtime_error("predicate");
                                 return true;
                             },
-                            [&](size_t, bool detached) {
+                            [&](size_t i) {
                                 ++active;
                                 ++started;
                                 Finally done{[&] {
                                     --active;
                                     ++completed;
                                 }};
-                                if (failDetached && detached) {
-                                    ++detachedFailures;
+                                if (failPrefix && i < std::max<size_t>(workers - 1, 1)) {
+                                    ++childFailures;
                                     throw std::runtime_error("child");
                                 }
                             },
@@ -482,19 +483,19 @@ TEST(CopyPool, predicateFailureJoinsTheLaunchedPrefixWithoutConsumingIt)
                     } catch (const std::runtime_error & e) {
                         failure = e.what();
                     }
+                    bool inlineFailure = failPrefix && workers == 1 && throwIndex != 0;
                     std::vector<size_t> expectedPredicates;
-                    for (size_t i = 0; i <= throwIndex; ++i)
+                    for (size_t i = 0; i <= (inlineFailure ? 0 : throwIndex); ++i)
                         expectedPredicates.push_back(i);
-                    EXPECT_EQ(failure, "predicate");
+                    EXPECT_EQ(failure, inlineFailure ? "child" : "predicate");
                     EXPECT_EQ(predicates, expectedPredicates);
                     EXPECT_TRUE(consumed.empty());
                     EXPECT_EQ(active.load(), 0u);
-                    EXPECT_EQ(started.load(), throwIndex);
-                    EXPECT_EQ(completed.load(), throwIndex);
-                    if (failDetached && workers > 1 && throwIndex)
-                        EXPECT_GT(detachedFailures.load(), 0u);
-                    else
-                        EXPECT_EQ(detachedFailures.load(), 0u);
+                    EXPECT_EQ(started.load(), inlineFailure ? 1 : throwIndex);
+                    EXPECT_EQ(completed.load(), inlineFailure ? 1 : throwIndex);
+                    EXPECT_EQ(
+                        childFailures.load(),
+                        failPrefix ? std::min(throwIndex, std::max<size_t>(workers - 1, 1)) : 0u);
                     ++cases;
                 }
     }
@@ -515,7 +516,7 @@ TEST(CopyPool, failureObjectsMayReenterThePoolDuringCleanup)
 
         ~Cleanup()
         {
-            pool.ordered(2, [](size_t) { return false; }, [&](size_t, bool) { ++visits; }, [&](size_t) { ++folds; });
+            pool.ordered(2, [](size_t) { return false; }, [&](size_t) { ++visits; }, [&](size_t) { ++folds; });
             ++released;
         }
     };
@@ -537,7 +538,7 @@ TEST(CopyPool, failureObjectsMayReenterThePoolDuringCleanup)
                 pool.ordered(
                     count,
                     [](size_t) { return true; },
-                    [&](size_t i, bool) {
+                    [&](size_t i) {
                         ++started;
                         throw Failure{i, std::make_shared<Cleanup>(pool, released, visits, folds)};
                     },
@@ -571,7 +572,7 @@ TEST(CopyPool, nestedScopesJoinBeforeReturning)
                 pool.ordered(
                     3,
                     [](size_t) { return true; },
-                    [&](size_t i, bool) { children[i] = recurse(remaining - 1); },
+                    [&](size_t i) { children[i] = recurse(remaining - 1); },
                     [&](size_t i) { result += children[i]; });
                 return result;
             };

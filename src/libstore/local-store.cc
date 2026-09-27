@@ -691,13 +691,15 @@ static std::optional<AuxiliaryCandidate> readAuxiliaryChunks(SQLiteStmt & stmt, 
 
 static bool auxiliaryBodyMatches(int64_t kind, std::string_view id, const std::optional<std::string> & body)
 {
-    if (!body || id.size() != regularHashSize(GitObjectStore::hashAlgo))
+    if (!body || id.size() != regularHashSize(GitObjectStore::hashAlgo)
+        || (kind != static_cast<int64_t>(merkle::Mode::Directory)
+            && kind != static_cast<int64_t>(merkle::Mode::Symlink)))
         return false;
-    if (kind == static_cast<int64_t>(merkle::Mode::Directory))
-        return merkle::treeId(*body) == blobIdOf(id);
-    if (kind == static_cast<int64_t>(merkle::Mode::Symlink))
-        return merkle::blobId(*body) == blobIdOf(id);
-    return false;
+    auto actual = kind == static_cast<int64_t>(merkle::Mode::Directory) ? merkle::treeId(*body) : merkle::blobId(*body);
+    for (size_t i = 0; i < actual.hashSize; ++i)
+        if (actual.hash[i] != static_cast<unsigned char>(id[i]))
+            return false;
+    return true;
 }
 
 std::optional<std::string> LocalStore::readAuxiliary(const merkle::TreeEntry & entry)

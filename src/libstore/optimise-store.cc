@@ -745,7 +745,7 @@ struct MaterialisingVisitor : LinkingVisitor
         if (!pool && canFork)
             pool = std::make_unique<CopyPool>(workers);
         auto * sink = currentFrame().sink;
-        auto run = [&](size_t i, bool) {
+        auto run = [&](size_t i) {
             auto & c = kids[i];
             Scope scope{*sink, &c.disk};
             c.node = c.visit();
@@ -759,7 +759,7 @@ struct MaterialisingVisitor : LinkingVisitor
             pool->ordered(kids.size(), [&](size_t i) { return kids[i].subdirectory; }, run, consume);
         else
             for (size_t i = 0; i < kids.size(); ++i) {
-                run(i, false);
+                run(i);
                 consume(i);
             }
     }

@@ -154,7 +154,7 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
             pool->ordered(
                 kids.size(),
                 [&](size_t i) { return kids[i].subdirectory; },
-                [&](size_t i, bool) { kids[i].node = kids[i].visit(); },
+                [&](size_t i) { kids[i].node = kids[i].visit(); },
                 [&](size_t i) { consume(std::move(kids[i].name), *kids[i].node); });
         else
             for (auto & child : kids) {

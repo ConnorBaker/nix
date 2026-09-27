@@ -1,9 +1,11 @@
+#include <algorithm>
 #include <gtest/gtest.h>
 
 #include "nix/util/git.hh"
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/util/archive.hh"
+#include "nix/util/terminal.hh"
 
 #include "nix/util/tests/characterization.hh"
 
@@ -240,6 +242,96 @@ TEST_F(GitTest, tree_sha256_write)
         s(body);
         return s.s;
     });
+}
+
+/* Tree digests have an algorithm-defined width even when Git does not
+   support that algorithm. A source failure must precede its rejection. */
+TEST_F(GitTest, tree_digest_read_boundaries)
+{
+    struct ChunkedSource : Source
+    {
+        std::string_view bytes;
+        size_t pos = 0;
+
+        explicit ChunkedSource(std::string_view bytes)
+            : bytes(bytes)
+        {
+        }
+
+        size_t read(char * data, size_t len) override
+        {
+            if (pos == bytes.size())
+                throw EndOfFile("tree digest source exhausted");
+            auto n = bytes.copy(data, std::min(len, size_t{3}), pos);
+            pos += n;
+            return n;
+        }
+    };
+    struct Case
+    {
+        HashAlgorithm algorithm;
+        size_t width;
+        bool supported;
+        const char * name;
+    };
+    const Case cases[] = {
+        {HashAlgorithm::MD5, 16, false, "md5"},
+        {HashAlgorithm::SHA1, 20, true, "sha1"},
+        {HashAlgorithm::SHA256, 32, true, "sha256"},
+        {HashAlgorithm::SHA512, 64, false, "sha512"},
+        {HashAlgorithm::BLAKE3, 32, false, "blake3"},
+    };
+    size_t checked = 0;
+    for (auto c : cases) {
+        SCOPED_TRACE(c.name);
+        {
+            ChunkedSource source{std::string_view{"0\0", 2}};
+            TestDirectorySink sink;
+            EXPECT_NO_THROW(git::parseTree(sink, source, c.algorithm));
+            EXPECT_EQ(source.pos, 2u);
+            EXPECT_TRUE(sink.entries.empty());
+            ++checked;
+        }
+
+        std::string digest(c.width, '\0');
+        for (size_t i = 0; i < c.width; ++i)
+            digest[i] = static_cast<char>(i * 37);
+        const std::string prefix = std::to_string(13 + c.width) + '\0' + std::string("100644 child\0", 13);
+        for (size_t available = 0; available <= c.width; ++available) {
+            SCOPED_TRACE(available);
+            auto wire = prefix + digest.substr(0, available);
+            if (available == c.width)
+                wire += '!'; // A complete entry must leave the next byte unread.
+            ChunkedSource source{wire};
+            TestDirectorySink sink;
+            if (available < c.width) {
+                EXPECT_THROW(git::parseTree(sink, source, c.algorithm), EndOfFile);
+                EXPECT_EQ(source.pos, wire.size());
+                EXPECT_TRUE(sink.entries.empty());
+            } else if (c.supported) {
+                git::parseTree(sink, source, c.algorithm);
+                ASSERT_EQ(sink.entries.size(), 1u);
+                const auto & entry = sink.entries.at("child");
+                EXPECT_EQ(entry.mode, merkle::Mode::Regular);
+                EXPECT_EQ(entry.hash.algo, c.algorithm);
+                ASSERT_EQ(entry.hash.hashSize, c.width);
+                EXPECT_EQ(std::string(reinterpret_cast<const char *>(entry.hash.hash), c.width), digest);
+            } else {
+                try {
+                    git::parseTree(sink, source, c.algorithm);
+                    FAIL() << "expected unsupported Git tree algorithm";
+                } catch (const Error & e) {
+                    EXPECT_EQ(
+                        filterANSIEscapes(e.message(), true),
+                        std::string("Unsupported hash algorithm for git trees: ") + c.name);
+                }
+                EXPECT_TRUE(sink.entries.empty());
+            }
+            EXPECT_EQ(source.pos, prefix.size() + available);
+            ++checked;
+        }
+    }
+    EXPECT_EQ(checked, 174u); // Five empty, five complete, and every 164 short prefixes.
 }
 
 namespace memory_source_accessor {

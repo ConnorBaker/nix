@@ -56,12 +56,12 @@ void CopyPool::work(std::promise<void> ready)
     }
 }
 
-void CopyPool::execute(Job job, std::unique_lock<std::mutex> & lock)
+void CopyPool::execute(const Job & job, std::unique_lock<std::mutex> & lock)
 {
     lock.unlock();
     std::exception_ptr failure;
     try {
-        job.group->run(job.index, true);
+        job.group->run(job.index);
     } catch (...) {
         failure = std::current_exception();
     }
@@ -122,11 +122,11 @@ void CopyPool::wait(Group & group)
     }
 }
 
-void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t, bool)> run, fun<void(size_t)> consume)
+void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t)> run, fun<void(size_t)> consume)
 {
     if (count < 2) {
         if (count) {
-            run(0, false);
+            run(0);
             consume(0);
         }
         return;
@@ -139,7 +139,7 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
             if (canFork(i) && tryAsync(group, i))
                 continue;
             try {
-                run(i, false);
+                run(i);
             } catch (...) {
                 auto childFailure = std::current_exception();
                 {
