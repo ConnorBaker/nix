@@ -696,7 +696,7 @@ static bool auxiliaryBodyMatches(int64_t kind, std::string_view id, const std::o
             && kind != static_cast<int64_t>(merkle::Mode::Symlink)))
         return false;
     auto actual = kind == static_cast<int64_t>(merkle::Mode::Directory) ? merkle::treeId(*body) : merkle::blobId(*body);
-    for (size_t i = 0; i < actual.hashSize; ++i)
+    for (size_t i = 0; i < id.size(); ++i)
         if (actual.hash[i] != static_cast<unsigned char>(id[i]))
             return false;
     return true;
