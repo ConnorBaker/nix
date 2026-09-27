@@ -32,7 +32,7 @@ AutoCloseFD createUnixDomainSocket()
         0));
     if (!fdSocket)
         throw NativeSysError("cannot create Unix domain socket");
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(SOCK_CLOEXEC)
     unix::closeOnExec(fdSocket.get());
 #endif
     return fdSocket;

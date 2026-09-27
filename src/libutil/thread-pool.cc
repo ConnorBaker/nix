@@ -56,7 +56,7 @@ void CopyPool::work(std::promise<void> ready)
     }
 }
 
-void CopyPool::execute(const Job & job, std::unique_lock<std::mutex> & lock)
+void CopyPool::execute(Job job, std::unique_lock<std::mutex> & lock)
 {
     lock.unlock();
     std::exception_ptr failure;

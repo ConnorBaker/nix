@@ -6,6 +6,7 @@
 #include "nix/util/unix-domain-socket.hh"
 
 #include <algorithm>
+#include <fcntl.h>
 #include <filesystem>
 #include <poll.h>
 #include <span>
@@ -15,6 +16,14 @@
 #include <unistd.h>
 
 namespace nix {
+
+TEST(UnixDomainSocket, closeOnExec)
+{
+    auto fd = createUnixDomainSocket();
+    int flags = fcntl(fd.get(), F_GETFD);
+    ASSERT_NE(flags, -1);
+    EXPECT_NE(flags & FD_CLOEXEC, 0);
+}
 
 /* ----------------------------------------------------------------------------
  * sendMessageWithFds / receiveMessageWithFds

@@ -1042,13 +1042,13 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
        decide.  `copyWorkersForTest` is the tests' seam and is zero
        everywhere else; one thread is the sequential walk exactly. */
     size_t workers = copyWorkersForTest.load(std::memory_order_relaxed);
-    if (!workers)
-        workers = CopyPool::defaultWorkers();
     /* Callbacks, filter and source must all permit reordered observations.
        The AllPaths type survives copies of defaultPathFilter. */
     if (!callbacksPermitParallelism || !filter.get_fn().target<AllPaths>()
         || !path.accessor->allowsConcurrentTraversal())
         workers = 1;
+    else if (!workers)
+        workers = CopyPool::defaultWorkers();
     auto commitAttempt = [&](const std::filesystem::path & subtree, const GitObjectStore::Hold & attempt) {
         auto projection = attempt.takeProjection();
         std::vector<BlobCoalescing> collisions;
